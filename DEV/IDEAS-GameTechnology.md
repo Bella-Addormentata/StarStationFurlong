@@ -21,6 +21,27 @@
 * Trade
 ** Chia wallet integration for currency and special inventory items
 ** Currency handled by chia
-** Spacefuel acts as game's House Edge
+** Spacefuel and basic inventory items act as game's House Edge
 *** Can set prices for transport and give out awards for different gameplay tasks
 *** Incentivize different actions with spacefuel proceeds
+
+* Markets
+** Possible for company stocks to be traded on market
+** Bank Loads to buy ships and equipment
+** SpaceTrader-ish with House Edge funded trade routes
+** Companies can found markets and banks , transport companies etc
+
+* Crafting
+** Everquest style crafting?
+** Can incrase production with tools / machine shops
+
+* Skill Tree slots
+** Craft furniture etc from different materials
+** Stores can sell items
+** Users can have a few skill slots that earn ranks the more they are used
+*** sims style career
+
+* Ownership
+** Spacestations should be able to be owned by individuals and comapnies
+** Can Leaseout space or rooms or machines
+** House will provide first infrastructure of spacestation etc
