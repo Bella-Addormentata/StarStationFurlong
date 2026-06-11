@@ -13,4 +13,5 @@ Powered by opensource tech:
 * https://github.com/cabal-club
 * https://retroshare.cc/
 * https://github.com/Chia-Network/chia-gaming
+* https://github.com/mrdoob/three.js/
 * https://github.com/Kaetram
