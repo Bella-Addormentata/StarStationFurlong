@@ -7,6 +7,7 @@
 
 * Trade
   * Chia coins and 
+  * In Game ATMs? can be owned by whoever, placed in own room or station.
 
 * Transportation
   * Spacefuel costs money to make travel friction and make natural moats to different locations
