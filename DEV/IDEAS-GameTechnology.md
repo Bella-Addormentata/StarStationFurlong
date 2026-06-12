@@ -24,6 +24,9 @@
 ** Spacefuel and basic inventory items act as game's House Edge
 *** Can set prices for transport and give out awards for different gameplay tasks
 *** Incentivize different actions with spacefuel proceeds
+*** Orbital maintinance spacefuel could be used as a property tax
+**** Docking or parking at other space stations could move oribital maintinance to a rental agreement with main station
+**** large stations could be more efficient with maitinaance cost, incentive for group dynamics 
 
 * Markets
 ** Possible for company stocks to be traded on market
