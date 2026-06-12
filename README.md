@@ -5,10 +5,13 @@ Inspired by:
 * Habbo Hotel
 * Workadventure
 * Star Craft
+* EverQuest
 * Space Trader - https://en.wikipedia.org/wiki/Space_Trader_(Palm_OS)
 * Second Life
 * Minecraft
 * https://en.wikipedia.org/wiki/Star_Wars_Galaxies
+* OpenTTD
+* Mystical Ninja SNES https://en.wikipedia.org/wiki/The_Legend_of_the_Mystical_Ninja
 
 
 Powered by opensource tech:
