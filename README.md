@@ -8,6 +8,7 @@ Inspired by:
 * Space Trader - https://en.wikipedia.org/wiki/Space_Trader_(Palm_OS)
 * Second Life
 * Minecraft
+* https://en.wikipedia.org/wiki/Star_Wars_Galaxies
 
 
 Powered by opensource tech:
