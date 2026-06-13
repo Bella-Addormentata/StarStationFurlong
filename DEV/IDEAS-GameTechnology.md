@@ -11,6 +11,12 @@
 * Physical Mechanics
   * Cabal club for short term user position tracking
 
+* Community Bulletin Boards
+  * Players should be able to read and edit bulletin boards by physically walking up to them and interacting with them in-world.
+  * Bulletin boards can also exist as online or room-based boards, letting users post notices, jobs, trade offers, or station alerts.
+  * These boards could be powered by Cabal technology so posts are local, persistent, and shared across related rooms or stations.
+  * Important messages might appear in both physical station spaces and digital chat rooms, creating a shared public communication layer.
+
 * Map-Embedded Network Data
   * WebRTC magnet links, Cabal keys, and other connection metadata could be hidden or encoded inside the game world map itself.
   * Players might discover access routes, chat rooms, or peer-to-peer channels by exploring map nodes, terminals, or station systems.
