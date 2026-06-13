@@ -11,6 +11,7 @@ Inspired by:
 * Minecraft
 * https://en.wikipedia.org/wiki/Star_Wars_Galaxies
 * OpenTTD
+* Outpost - https://en.wikipedia.org/wiki/Outpost_(1994_video_game)
 * Mystical Ninja SNES https://en.wikipedia.org/wiki/The_Legend_of_the_Mystical_Ninja
 
 
