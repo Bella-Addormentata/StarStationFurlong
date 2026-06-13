@@ -33,6 +33,9 @@
   * Bank Loads to buy ships and equipment
   * SpaceTrader-ish with House Edge funded trade routes
   * Companies can found markets and banks , transport companies etc
+  * Default Station Furlong has a small automated market that prices items based on scarcity
+    * Will buy supplies from freighter traders at market rates
+    * Stored in space warehouse
 
 * Crafting
   * Everquest style crafting?
