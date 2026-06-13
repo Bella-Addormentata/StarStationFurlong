@@ -11,6 +11,11 @@
 * Physical Mechanics
   * Cabal club for short term user position tracking
 
+* Map-Embedded Network Data
+  * WebRTC magnet links, Cabal keys, and other connection metadata could be hidden or encoded inside the game world map itself.
+  * Players might discover access routes, chat rooms, or peer-to-peer channels by exploring map nodes, terminals, or station systems.
+  * This makes the map feel like both a navigation tool and a secret technology layer for communication and coordination.
+
 * Pixel Rendering
   * Game elements in 3D with Three.js, but represented as 2D parralel projection
   * When interacting with game elements, zoom in to view through 3d space.
