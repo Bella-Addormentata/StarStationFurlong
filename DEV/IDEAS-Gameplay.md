@@ -24,3 +24,28 @@
   * Players should be able to interact with maps physically by walking up to a desk, console, or map device, or digitally through a station terminal or wearable display.
   * If a map system is damaged, loses power, or is cut off from the network, players may be forced to rely on older printed maps or local knowledge.
   * Printed maps could preserve a digital version in a simplified, low-tech form, making navigation possible even when the electronic system fails.
+
+* Rooms and Gravity
+  * Room modules can follow CubeSat-inspired size classes to keep construction readable and scalable.
+    * U1 starter room: compact 3x3 square.
+    * U2 room: extended 3x6 rectangle.
+  * In artificial-gravity zones, players can move across walls and ceilings as navigable surfaces.
+  * Large hexagonal rooms can visually fade or remap distant floor planes as players move toward "upside-down" segments.
+
+* Station Logistics
+  * Space truckers can dock to room modules, move them between stations, and redeploy them at destination ports.
+
+* Market Safeguards
+  * Default station markets should enforce purchase limits to prevent unlimited buyouts by very wealthy players.
+  * Station warehouse inventory should mainly be restocked by player supply chains.
+  * If stock falls critically low, an emergency strategic reserve can refill essentials slowly.
+
+* Corporate Infrastructure
+  * Large companies can host capsule-room blocks for players, either charging rent/fees or monetizing nearby station commerce.
+  * Large companies can own spaceports and charge docking, refueling, and ship-service fees.
+  * Stations can host billboard surfaces where companies advertise local services, rival stations, or trade routes.
+
+* Company Shares and Exchanges
+  * Companies can issue shares that are tradable like currency, through direct private sales or open markets.
+  * Furlong station can offer a small barter/trading floor as an early exchange.
+  * Major corporate stations can run dedicated live exchanges for shares, commodities, and currencies.

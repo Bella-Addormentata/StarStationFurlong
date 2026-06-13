@@ -86,3 +86,8 @@
   * Starting station for users
   * Guided "Cloning" process on first start
   * New users get bunk bed in capsule with 12 others
+
+* Blockchain Room Records
+  * Room ownership and placement history can be anchored on-chain for tamper-resistant tracking.
+  * When a module is loaded onto a freighter and later unloaded at a station, transfer records can be appended as ownership/location events.
+  * This allows coins, shares, and room assets to share a common custody trail across station economies.
