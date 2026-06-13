@@ -11,3 +11,6 @@
 
 * Transportation
   * Spacefuel costs money to make travel friction and make natural moats to different locations
+  * Possible to make/buy robotic starship captain that can drive trade and mining ships
+    * Give freetime for other activities
+    * Companies/Users can hire other users to drive ship

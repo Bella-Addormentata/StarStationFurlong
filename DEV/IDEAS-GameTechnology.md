@@ -51,3 +51,27 @@
   * Spacestations should be able to be owned by individuals and comapnies
   * Can Leaseout space or rooms or machines
   * House will provide first infrastructure of spacestation etc
+
+* Schools
+  * Can speed up skill progress when taking a class from highly skilled user or AI robot teacher
+  * Can be passively taught and learned when user is AFK
+  * Only requires chairs, but white board and projector add speed
+
+* AFK Activities
+  * Sleep in bed
+  * Sit at desk
+  * Learn
+  * Drive spaceship in autopilot
+  * Craft repeatitive items
+
+* Cloning
+  * As a save point in case user dies
+  * Users and companies can buy cloning machines
+  * If users is out of money and has no credits with other cloning machines, get sent to Furlong
+  * Users keep there assets after death
+  * Partly lose their skill progress and memory
+
+* Default Star Station Furlong
+  * Starting station for users
+  * Guided "Cloning" process on first start
+  * New users get bunk bed in capsule with 12 others
