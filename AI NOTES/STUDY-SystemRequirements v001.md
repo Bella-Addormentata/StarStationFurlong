@@ -519,4 +519,56 @@ In a client-run peer-to-peer game, players can effortlessly hack their client co
 * **The Solution**: We utilize a **deterministic spatial loop library** (such as **Rapier Physics** compiled natively in our Rust layer). If a player is playing a multiplayer casino mini-game or spaceship route, nearby peers run identical, background local simulations verifying the raw movement vectors of their neighbors. If a target player coordinates violate basic laws of movement acceleration or collision walls, they are immediately flagged, and their peer signature is dropped/blocked by the localized swarm.
 
 ---
+
+## 16. Extreme Sovereignty: Zero-Website Installer Distribution & Bootstrap Loop
+
+Yes, **absolutely!** Your technical intuition is spot-on:
+
+Under this hybrid P2P/Blockchain architecture, **it is entirely possible for a player to download the Tauri installer via a magnet link, install it, bootstrap, and play the game without ever visiting a centralized webpage or server.**
+
+This represents the pinnacle of "Unstoppable Software" (Censorship Resistant & Sovereign Distribution).
+
+```
+         SHARING THE MAGNET LINK
+         (Shared on Nostr, IPFS, Chat, or SMS)
+                    │
+                    ▼
+          P2P BITTORRENT ENGINE
+         (Downloads Tauri Installer)
+                    │
+                    ▼
+          LAUNCH TAURI CLIENT
+                    │
+                    ▼
+     CHIA CHIEF PEER DISCOVERY HANDSHAKE
+     - Queries local Chia config SSL directory
+     - Automatically scans Chia L1 block history
+     - Obtains peer coordinates under 20 seconds
+                    │
+                    ▼
+                GAMEPLAY
+     - Renders WebGL canvas locally
+     - Connects directly to active Tauri players
+```
+
+### The Website-Less Entry & Bootstrap Sequence
+
+1. **Magnet Link Sharing**:
+   * The community publishes the game's actual installer (e.g. `StarStationFurlong_Installer.msi` or `.dmg`) as a torrent.
+   * The associated **Torrent Magnet Link** is shared completely serverless: over Nostr, encrypted P2P chats (Simple-peer / RetroShare), printed on physical flyers, or text messaged.
+2. **P2P Software Acquisition**:
+   * The player inputs the magnet link into any standardBitTorrent client (or their existing browser-based WebTorrent client).
+   * They download the complete native Tauri client directly from other seeding players, with **zero developer hosting footprint**.
+3. **No-DNS Bootstrap Launch**:
+   * When they open the client, the Tauri-Rust backend checks the local host filesystem for their default Chia wallet configuration.
+   * Rather than attempting to connect to a website URL to look up servers, the Rust engine queries public **Chia Net peer nodes** directly via DNS seed lists built natively into standard Chia wallets, bypassing our game domain names altogether.
+   * It scans the Chia blockchain transactions to find state singletons or DIDs associated with the game's official creator.
+   * From this on-chain ledger history, it immediately extracts the most recently published active IP addresses of other players running active space stations.
+4. **Complete Local Execution**:
+   * All graphic layout assets, sprite files, 3D station rooms, and script systems are fetched instantly via standard WebTorrent WebRTC nodes running inside their local Tauri container.
+   * The game's spatial voice, coordinate system, and bulletin boards synchronize via direct UDP connections established over `rust-libp2p`.
+
+This means **the only way to take StarStationFurlong down is to take the entire Internet (and the Chia blockchain network consensus) down**.
+
+---
 *For details on game influences and lore design, refer to [AI NOTES/IDEAS-INSPIRATION v001.md](AI%20NOTES/IDEAS-INSPIRATION%20v001.md) and technical ideas in [DEV/IDEAS-GameTechnology.md](DEV/IDEAS-GameTechnology.md).*
