@@ -6,48 +6,47 @@ This roadmap outlines the milestones from initial prototyping to a fully playabl
 
 ```mermaid
 flowchart TB
-    classDef phase1 fill:#1e3745,stroke:#00b894,stroke-width:2px,color:#fff
-    classDef phase2 fill:#2d3436,stroke:#74b9ff,stroke-width:2px,color:#fff
-    classDef item fill:#0984e3,stroke:#fff,stroke-width:0px,color:#fff,rx:5px,ry:5px
-    classDef current fill:#e84393,stroke:#fff,stroke-width:2px,color:#fff,rx:5px,ry:5px
-    classDef milestone fill:#fdcb6e,stroke:#fff,stroke-width:3px,color:#2d3436,rx:15px,ry:15px
+    %% Color Palette & Styles
+    classDef default fill:#f8f9fa,stroke:#dfe6e9,stroke-width:2px,color:#2d3436
+    classDef currentPhase fill:#e1f5fe,stroke:#0984e3,stroke-width:3px,stroke-dasharray: 5 5
+    classDef futurePhase fill:#f5f6fa,stroke:#b2bec3,stroke-width:2px
+    classDef statusDoing fill:#fd79a8,stroke:#e84393,stroke-width:2px,color:#fff,rx:8px,ry:8px
+    classDef statusTodo fill:#ffffff,stroke:#74b9ff,stroke-width:2px,color:#0984e3,rx:8px,ry:8px
+    classDef statusGoal fill:#ffeaa7,stroke:#fdcb6e,stroke-width:4px,color:#d35400,rx:20px,ry:20px
 
-    subgraph P1 [Phase 1: Foundation & Prototyping]
-        direction TB
-        A1[Tech Scaffold]:::current --> A2[P2P Networking]:::item
-        A2 --> A3[Basic Movement]:::item
-        A3 --> A4[Chat Prototype]:::item
+    subgraph Phase1 [🚀 Phase 1: Foundation & Prototyping]
+        A1([🛠️ Tech Scaffold]):::statusDoing --> A2([🌐 P2P Networking]):::statusTodo
+        A2 --> A3([🏃 Basic Movement]):::statusTodo
+        A3 --> A4([💬 Chat Prototype]):::statusTodo
     end
+    class Phase1 currentPhase
 
-    subgraph P2 [Phase 2: Core Loop & Spatial Expansion]
-        direction TB
-        B1[Map System V1]:::item --> B2[Elements System]:::item
-        B2 --> B3[Tech Trees]:::item
-        B3 --> B4[Fog of War]:::item
+    subgraph Phase2 [🌍 Phase 2: Core Loop & Spatial Expansion]
+        B1([📍 Map System V1]):::statusTodo --> B2([📦 Elements System]):::statusTodo
+        B2 --> B3([🔬 Tech Trees]):::statusTodo
+        B3 --> B4([🌫️ Fog of War]):::statusTodo
     end
+    class Phase2 futurePhase
 
-    subgraph P3 [Phase 3: Economy & Social]
-        direction TB
-        C1[SpacePhone & Voice]:::item --> C2[Economy & Spacefuel]:::item
-        C2 --> C3[Crypto/Chia Integrations]:::item
+    subgraph Phase3 [💎 Phase 3: Economy & Social]
+        C1([📞 SpacePhone & Voice]):::statusTodo --> C2([⛽ Economy & Spacefuel]):::statusTodo
+        C2 --> C3([🪙 Crypto/Chia]):::statusTodo
     end
-    
-    subgraph P4 [Phase 4: Grand Strategy]
-        direction TB
-        D1[AI Starships]:::item --> D2[Contract System]:::item
-        D2 --> D3[Damage & Map Disruptions]:::item
-    end
+    class Phase3 futurePhase
 
-    subgraph P5 [Phase 5: Launch]
-        direction TB
-        E1[Balance Economy]:::item --> E2[UI/UX Polish]:::item
-        E2 --> E3((V1.0 Release!)):::milestone
+    subgraph Phase4 [🌌 Phase 4: Grand Strategy]
+        D1([🤖 AI Starships]):::statusTodo --> D2([📜 Contract System]):::statusTodo
+        D2 --> D3([⚠️ Map Disruptions]):::statusTodo
     end
+    class Phase4 futurePhase
 
-    P1 == Next ==> P2 == Next ==> P3 == Next ==> P4 == Next ==> P5
-    
-    class P1 phase1
-    class P2,P3,P4,P5 phase2
+    subgraph Phase5 [🎉 Phase 5: Launch]
+        E1([⚖️ Balance Economy]):::statusTodo --> E2([✨ UI/UX Polish]):::statusTodo
+        E2 --> E3(((🏆 V1.0 Release!))):::statusGoal
+    end
+    class Phase5 futurePhase
+
+    Phase1 ===> Phase2 ===> Phase3 ===> Phase4 ===> Phase5
 ```
 
 ## Phase 1: Foundation & Prototyping (Current)
