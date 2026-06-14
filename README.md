@@ -15,7 +15,7 @@ Inspired by:
 * Mystical Ninja SNES https://en.wikipedia.org/wiki/The_Legend_of_the_Mystical_Ninja
 
 
-Powered by opensource tech:
+opensource tech:
 * https://github.com/feross/simple-peer
 * https://github.com/webtorrent/webtorrent
 * https://github.com/cabal-club
@@ -23,3 +23,4 @@ Powered by opensource tech:
 * https://github.com/Chia-Network/chia-gaming
 * https://github.com/mrdoob/three.js/
 * https://github.com/Kaetram
+* https://github.com/Tribler/tribler
