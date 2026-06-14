@@ -12,7 +12,7 @@ flowchart TB
     classDef futurePhase fill:#f5f6fa,stroke:#b2bec3,stroke-width:2px
     classDef statusDoing fill:#fd79a8,stroke:#e84393,stroke-width:2px,color:#fff,rx:8px,ry:8px
     classDef statusTodo fill:#ffffff,stroke:#74b9ff,stroke-width:2px,color:#0984e3,rx:8px,ry:8px
-    classDef statusGoal fill:#ffeaa7,stroke:#fdcb6e,stroke-width:4px,color:#d35400,rx:20px,ry:20px
+    classDef statusGoal fill:#cce4ff,stroke:#74b9ff,stroke-width:4px,color:#0984e3,rx:20px,ry:20px
 
     subgraph Phase1 [🚀 Phase 1: Foundation & Prototyping]
         A1([🛠️ Tech Scaffold]):::statusDoing --> A2([🌐 P2P Networking]):::statusTodo
