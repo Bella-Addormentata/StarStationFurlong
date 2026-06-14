@@ -18,6 +18,9 @@
 * Maps
   * Different scales of maps for different gameplay layers: local rooms, stations, planets, solar systems, galaxies, and the wider universe.
   * Planet and solar system maps could work like an OpenTTD-style strategic map, while galaxy and universe maps could use unique point-cloud or starfield views.
+  * Solar-system trade routes could borrow from OpenTTD-style airport and airplane flow, with predictable lanes between planets, stations, and logistics hubs.
+  * On a solar-system map, planets can appear as static anchor points, while stations can be shown in orbit, at Lagrange points, or along other fixed local routes.
+  * When players zoom in over a planet, moon, or major base, the display can transition into the relevant station map or a dedicated planet/moon local map.
   * The universe map should feel endless, growing as players travel farther and as telescopes reveal more regions.
   * Fog-of-war should hide unknown or inaccessible areas until a player or station has the right map access, sensor range, or technical authority.
   * Map access could depend on tech tree progress, such as basic printed charts, station terminals, hologram projectors, or advanced sensor arrays.
