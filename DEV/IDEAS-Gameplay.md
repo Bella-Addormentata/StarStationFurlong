@@ -57,3 +57,6 @@
   * Standard crafting uses specific ingredients placed into a designated container (for example: Forge, Loom, or Oven) followed by a "Combine" action.
   * Successful experimental combines should automatically register newly discovered recipes in the Recipe Book.
   * Small handmade items can be crafted directly without a container.
+  * Players can expand their known recipes through station libraries (limited public selection), paid classes, or purchased Recipe Books.
+  * Reading Recipe Books can be done as an AFK activity.
+  * Practicing crafting should raise crafting skill level over time and reduce the chance of failed combines.
