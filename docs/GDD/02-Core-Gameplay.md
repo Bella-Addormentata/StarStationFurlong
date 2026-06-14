@@ -9,6 +9,11 @@
   * Chia coins and 
   * In Game ATMs? can be owned by whoever, placed in own room or station.
 
+* Market Safeguards
+  * Default station markets should enforce purchase limits to prevent unlimited buyouts by very wealthy players.
+  * Station warehouse inventory should mainly be restocked by player supply chains.
+  * If stock falls critically low, an emergency strategic reserve can refill essentials slowly.
+
 * Player Companies
   * Players can found and register a company to run a business across the frontier.
   * Transportation companies:
@@ -40,11 +45,24 @@
   * Contracts can have time limits, quantity requirements, and reputation prerequisites to add variety and prevent abuse.
   * Completing contracts earns credits and can contribute toward career progression and company standing.
 
+* Corporate Infrastructure
+  * Large companies can host capsule-room blocks for players, either charging rent/fees or monetizing nearby station commerce.
+  * Large companies can own spaceports and charge docking, refueling, and ship-service fees.
+  * Stations can host billboard surfaces where companies advertise local services, rival stations, or trade routes.
+
+* Company Shares and Exchanges
+  * Companies can issue shares that are tradable like currency, through direct private sales or open markets.
+  * Furlong station can offer a small barter/trading floor as an early exchange.
+  * Major corporate stations can run dedicated live exchanges for shares, commodities, and currencies.
+
 * Transportation
   * Spacefuel costs money to make travel friction and make natural moats to different locations
   * Possible to make/buy robotic starship captain that can drive trade and mining ships
     * Give freetime for other activities
     * Companies/Users can hire other users to drive ship
+
+* Station Logistics
+  * Space truckers can dock to room modules, move them between stations, and redeploy them at destination ports.
 
 * Furlong Station — New Player Hub
   * Furlong Station is the default starting station: relatively safe, social, and designed to let new clones get oriented and have fun before striking out into the frontier.
@@ -61,9 +79,23 @@
     * This rent pressure is the primary mechanism that pushes graduating players off the starter station and into the wider colony network.
   * The fun of settling, exploring, and thriving across the frontier — not station upkeep — is the game's core promise. Survival systems add texture and challenge for players who seek them, but never block others from enjoying the social and exploration layers.
 
+* Rooms and Gravity
+  * Room modules can follow CubeSat-inspired size classes to keep construction readable and scalable.
+    * U1 starter room: compact 3x3 square.
+    * U2 room: extended 3x6 rectangle.
+  * Capsule-room owners can install additional docking-port doors to create more docking and expansion points.
+    * Basic doors are open to everyone and allow anyone to dock against them.
+    * Mid-range doors can use a physical key or combo lock.
+    * Advanced doors expose a control panel for managing room access and docking permissions.
+  * In artificial-gravity zones, players can move across walls and ceilings as navigable surfaces.
+  * Large hexagonal rooms can visually fade or remap distant floor planes as players move toward "upside-down" segments.
+
 * Maps
   * Different scales of maps for different gameplay layers: local rooms, stations, planets, solar systems, galaxies, and the wider universe.
   * Planet and solar system maps could work like an OpenTTD-style strategic map, while galaxy and universe maps could use unique point-cloud or starfield views.
+  * Solar-system trade routes could borrow from OpenTTD-style airport and airplane flow, with predictable lanes between planets, stations, and logistics hubs.
+  * On a solar-system map, planets can appear as static anchor points, while stations can be shown in orbit, at Lagrange points, or along other fixed local routes.
+  * When players zoom in over a planet, moon, or major base, the display can transition into the relevant station map or a dedicated planet/moon local map.
   * The universe map should feel endless, growing as players travel farther and as telescopes reveal more regions.
   * Fog-of-war should hide unknown or inaccessible areas until a player or station has the right map access, sensor range, or technical authority.
   * Map access could depend on tech tree progress, such as basic printed charts, station terminals, hologram projectors, or advanced sensor arrays.

@@ -31,3 +31,14 @@
   * Crafted items can be sold, traded, leased, or used to upgrade stations and outposts.
   * Players should be able to specialize in producing high-demand goods for the colony economy.
   * Crafting should connect naturally to the tech tree, markets, and station ownership systems.
+
+* Crafting Recipe Discovery
+  * Crafting can follow an EverQuest-like model centered on a permanent player Recipe Book.
+  * Players can drop unlisted item combinations into a crafting container and experiment.
+  * If an experimental combine yields a viable output, the player discovers the recipe and keeps that knowledge permanently.
+  * Standard crafting uses specific ingredients placed into a designated container (for example: Forge, Loom, or Oven) followed by a "Combine" action.
+  * Successful experimental combines should automatically register newly discovered recipes in the Recipe Book.
+  * Small handmade items can be crafted directly without a container.
+  * Players can expand their known recipes through station libraries (limited public selection), paid classes, or purchased Recipe Books.
+  * Reading Recipe Books can be done as an AFK activity.
+  * Practicing crafting should raise crafting skill level over time and reduce the chance of failed combines.
