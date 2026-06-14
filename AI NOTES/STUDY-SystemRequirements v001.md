@@ -307,7 +307,54 @@ This approach delivers the absolute highest network robustness and zero setup fr
 
 ---
 
-## 11. Chia Blockchain: Storage, Tokenomics, & Transaction Routing
+## 11. Empowering the Pure Web Client (Option A) + Wallet Before Tauri Install
+
+Historically, pure-web sandbox requirements forced developers to host massive fallback proxy complexes. By pairing a **Pure Browser + Injected Wallet Extension** (such as Goby/Pawket) with the **Chia Blockchain**, we can achieve remarkable feature parity *even before* the player downloads the Tauri desktop client.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    PURE BROWSER CLIENT (Goby Extension)                 │
+└────────────────────────────────────┬────────────────────────────────────┘
+                                     │
+                     ┌───────────────┴───────────────┐
+                     ▼                               ▼
+       ┌───────────────────────────┐   ┌───────────────────────────┐
+       │   Query Chia L1 / DIDs    │   │  WebRTC Signaling Memos   │
+       │   - Finds Active host IPs │   │  - Swaps SDP data via     │
+       │   - Resolves model hashes │   │    on-chain transactions  │
+       └─────────────┬─────────────┘   └─────────────┬─────────────┘
+                     │                               │
+                     └───────────────┬───────────────┘
+                                     ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │        DIRECT CONNECTION TO TAURI HOST'S PORTS          │
+        │ - Browser establishes Secure WebSockets / WebRTC        │
+        │ - Complete multiplayer access with zero dev servers     │
+        └─────────────────────────────────────────────────────────┘
+```
+
+### I. Serverless Discovery via Injected Browser Wallet
+* **The Traditional Block**: Browsers cannot query active player IPs directly.
+* **The Chia Workaround**: The browser game reads the transaction ledger directly through Goby Wallet's injected node access or public gateway APIs. The browser player parses the metadata of the registered StarStationFurlong hosts.
+* **The Result**: The browser **immediately learns the IP addresses and ports** of all active, community-run Tauri game servers. They don't need us to host a server directory.
+
+### II. Directly Connecting Browser to Native Tauri Players (Bypassing Developer CDNs)
+* **The Traditional Block**: Standard browsers cannot speak raw TCP/UDP to other players' custom sockets.
+* **The WebRTC / WebSocket Gateway Solution**: When Tauri-Rust players launch their launcher, their Rust engine spins up a localized **Secure WebSocket Server (WSS port)** or coordinates native WebRTC listening loops mapped dynamically over UPnP.
+* **The Result**: A pure-browser player, having discovered a Tauri host's active IP on the Chia blockchain, can open a direct **WebRTC data stream** or **WebSocket pipeline** straight to that player's laptop! 
+* The pure-browser player can stream 3D station models (WebTorrent), chat logs, and spatial player coordinates directly from other players' native nodes, entirely bypassing centralized developer servers.
+
+### III. On-Chain WebRTC Signaling (Zero Developer Signaling Servers)
+* **The Traditional Block**: Two browser-based players behind firewalls require a dedicated signaling WebSocket to broker SDP connection descriptions before they can establish WebRTC peer feeds.
+* **The Chia Workaround**: If Goby wallets are active, the two players can exchange connection metadata securely by writing and reading **encrypted micro-transaction memos** directly to each other's addresses on the Chia L1 ledger. 
+* **The Result**: While slow (~18-second block settlement speed), they can configure their initial WebRTC coordinates and handshake successfully with **zero centralized signaling servers**.
+
+### IV. Safe, Atomic Web Trades Prior to Installation
+Since Goby Wallet executes Chialisp spends seamlessly within standard web tabs, a pure-browser player can execute secure, decentralized smart contracts (atomic swaps, cargo listings, and station property leases) natively. They can establish economic footprints in the Furlong universe with perfect cryptographically secure assets *before* ever deciding to install the high-performance Tauri desktop launcher.
+
+---
+
+## 12. Chia Blockchain: Storage, Tokenomics, & Transaction Routing
 
 To integrate the Chia Blockchain smoothly into our decentralized universe, we must address three architectural criteria: data storage, token structures, and transaction flexibility for users.
 
