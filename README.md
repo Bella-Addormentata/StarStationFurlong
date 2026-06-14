@@ -25,3 +25,14 @@ opensource tech:
 * https://github.com/Kaetram
 * https://github.com/Tribler/tribler
 * https://worldofclaudecraft.com/
+
+## Repository Structure
+
+The project is structured according to game development industry standards to maintain a clean separation between design, technical architecture, and implementation:
+
+* **`docs/GDD/` (Game Design Document)**: Contains all high-level game design concepts, storylines, core gameplay loops, crafting systems, and economy balance.
+* **`docs/TDD/` (Technical Design Document)**: Contains system architecture, data structures, and technical specifications for how the game operates under the hood.
+* **`docs/API/`**: External code references, code links, and API standards.
+* **`brainstorming/`**: Unstructured ideation, AI notes, and raw concepts before they are formalized into the GDD or TDD.
+* **`src/`**: Source code for the actual game client and server (to be populated).
+* **`prototypes/`**: Quick throwaway code, proof-of-concepts, and playable demos to test game mechanics and technical feasibility.
