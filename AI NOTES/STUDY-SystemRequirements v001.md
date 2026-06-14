@@ -264,6 +264,32 @@ To avoid sacrificing these rich systems while keeping entry friction incredibly 
 
 ---
 
+## 10. Web Hosting Paradigms: Static, Decentralized, & Darknet Deployments
+
+If we proceed with the Dual-Delivery Hybrid Strategy, our frontend is built as a **static single-page application (SPA)** (using standard WebGL/Three.js compile outputs with no Node.js/PHP runtime servers). This provides highly versatile options for hosting the main landing page and web sandbox client:
+
+### I. GitHub Pages (Free, Built-In Static Hosting)
+We can host the landing page and the playable Casual Web Client (Option A) **completely free** on GitHub Pages.
+* **Why it works**: Since the Web Core does not require server-side databases (delegating P2P connections to WebRTC/WebTorrent and blockchain state queries to Goby Wallet), a static HTML5 build compiles cleanly into a small `/dist` pack that GitHub serves directly over HTTPS.
+* **Friction**: $0 hosting costs. Seamlessly integrates with continuous integration (GitHub Actions automatically recompiled and deployed on every push to our repository).
+* **Limitations**: Highly vulnerable to domain-level ISP blocks or platform censorship if a central host suspends our repository.
+
+### II. Decentralized Static Web Hosts (The Sovereign Path)
+For absolute serverless independence, we can mirror our compiled WebGL client files over decentralized, permanent hosting layers:
+1. **IPFS (InterPlanetary File System)**: Our compiled static website folder can be uploaded to IPFS. Players can access the sandbox via a permanent, immutable IPFS CID (Content Identifier) gateway like `ipfs.io/ipfs/CID` or any public gateway.
+2. **Fleek**: Integrates IPFS/Arweave with custom domain setups (such as `furlong.eth` via ENS - Ethereum Name Service, or IPFS links) to deliver cloud-scale static speeds directly via decentralized storage backends.
+3. **The Chia Datalayer / Web Store**: We can host our static page directory directly inside a **Chia Datalayer** instance. Anyone running a full node automatically subscribes to and replicates the site files, ensuring we cannot be de-platformed.
+
+### III. Tor Browser Hosting (.onion Darknet Gateway)
+To appeal to hardcore security communities and bypass global internet censorship firewalls (creating a true offline "darknet lounge"), we can run our static client directory as a **Tor Hidden Service**.
+* **How it works**: A simple local web server (or a Tauri host running the game engine) can expose the static single-page folder over a standard Onion address (e.g. `furlongspacexxxxxxxx.onion`).
+* **WebRTC Restrictions inside Tor Browser**: 
+  * *Important Warning*: Tor Browser by default **disables WebRTC** to prevent real-time client IP leakage.
+  * *The Consequence*: Players visiting the `.onion` site inside the official Tor Browser can still utilize trading features (if local wallet RPCs can route via Socks5) and play single-player sandboxes, but **proximity spatial voice calls and real-time multiplayer movement coordinates over WebRTC will fail**.
+  * *Tor Workaround*: We can configure our native **Tauri Client** (Option B) to tunnel its background `rust-libp2p` UDP socket communication over Tor circuits (using native Rust SOCKS5 routing dependencies), enjoying complete network anonymity without breaking multiplayer.
+
+---
+
 ### Key Next Steps & Architecture Questions
 1. Do we want to develop the initial tech proof-of-concept (POC) as a pure web mock-up so we can easily test visual assets?
 2. Which aspects of the smart ledger are considered immediate launches—should currency and assets run on Testnet before committing to mainnet pools?
@@ -271,7 +297,7 @@ To avoid sacrificing these rich systems while keeping entry friction incredibly 
 
 ---
 
-## 10. Ultimate Recommendation: The Custom Rust & Tauri Path
+## 11. Ultimate Recommendation: The Custom Rust & Tauri Path
 
 Given the willingness to execute custom Rust systems programming, **the ultimate recommended path is a Custom Rust-Backed Tauri Client supporting a lightweight HTML5/Three.js frontend.**
 
@@ -307,7 +333,7 @@ This approach delivers the absolute highest network robustness and zero setup fr
 
 ---
 
-## 11. Empowering the Pure Web Client (Option A) + Wallet Before Tauri Install
+## 12. Empowering the Pure Web Client (Option A) + Wallet Before Tauri Install
 
 Historically, pure-web sandbox requirements forced developers to host massive fallback proxy complexes. By pairing a **Pure Browser + Injected Wallet Extension** (such as Goby/Pawket) with the **Chia Blockchain**, we can achieve remarkable feature parity *even before* the player downloads the Tauri desktop client.
 
@@ -354,7 +380,7 @@ Since Goby Wallet executes Chialisp spends seamlessly within standard web tabs, 
 
 ---
 
-## 12. Chia Blockchain: Storage, Tokenomics, & Transaction Routing
+## 13. Chia Blockchain: Storage, Tokenomics, & Transaction Routing
 
 To integrate the Chia Blockchain smoothly into our decentralized universe, we must address three architectural criteria: data storage, token structures, and transaction flexibility for users.
 
@@ -413,7 +439,7 @@ We can exploit Chia's globally distributed ledger infrastructure to replace mult
 
 ---
 
-## 12. Engineering Path: Porting vs. Replacing Software with Native Rust
+## 14. Engineering Path: Porting vs. Replacing Software with Native Rust
 
 When incorporating decentralized protocols into our stack, we must decide whether to **write/port everything to custom Rust** (e.g., rewriting Cabal Club or WebTorrent) or **leverage native replacements and smart wrapping** to minimize technical debt.
 
@@ -448,7 +474,7 @@ To build StarStationFurlong efficiently without reinventing the wheel, we should
 
 ---
 
-## 13. Hardening the Stack: Addressing Overlooked Game Architecture Gaps
+## 15. Hardening the Stack: Addressing Overlooked Game Architecture Gaps
 
 While we have detailed the core transport and blockchain layers, an organic self-hosted multiplayer game requires solving a few critical, often-overlooked peripheral modules to resist security threats, lag, and data corruption.
 
