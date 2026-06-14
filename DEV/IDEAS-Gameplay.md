@@ -29,6 +29,10 @@
   * Room modules can follow CubeSat-inspired size classes to keep construction readable and scalable.
     * U1 starter room: compact 3x3 square.
     * U2 room: extended 3x6 rectangle.
+  * Capsule-room owners can install additional docking-port doors to create more docking and expansion points.
+    * Basic doors are open to everyone and allow anyone to dock against them.
+    * Mid-range doors can use a physical key or combo lock.
+    * Advanced doors expose a control panel for managing room access and docking permissions.
   * In artificial-gravity zones, players can move across walls and ceilings as navigable surfaces.
   * Large hexagonal rooms can visually fade or remap distant floor planes as players move toward "upside-down" segments.
 
