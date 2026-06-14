@@ -22,6 +22,13 @@
   * Players without a company can work as employees or contractors for existing companies, earning pay for flying, hauling, mining, or staffing.
   * Companies can be as small as a single owner-operator with one ship or as large as a player-group corporation with stations, fleets, and trade networks.
 
+* Community Bulletin Boards
+  * Physical bulletin boards can be placed at stations and outposts. Any player in the same room can walk up to a board, read its contents, and post or edit entries.
+  * Boards support any kind of community posting: job offers, item requests, announcements, social events, trade offers, lost-and-found notices, or freeform messages — similar to a physical Craigslist pinboard.
+  * Physical bulletin board data is strictly local: it is stored at the board's location and is only readable by a player standing in front of it. The data does not sync to remote stations or a central server.
+  * At larger, more developed stations players can also interact with computer terminal listing boards. Terminal boards aggregate postings and can be browsed from any connected terminal on that station.
+  * The distinction creates a natural information gradient: small outposts rely on word-of-mouth and local boards, while established hubs have searchable digital listings that attract more trade and foot traffic.
+
 * Gig Work and Contracts
   * Any entity — a warehouse, station, company, or individual player — can post a contract job with a fixed payout price.
   * Example contracts:

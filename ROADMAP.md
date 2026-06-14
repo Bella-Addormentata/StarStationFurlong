@@ -145,6 +145,8 @@ graph LR
 * [ ] **Player Company System:** Allow players to found and register companies — transportation, mining, retail, logistics — and hire other players as employees or contractors.
 * [ ] **Transportation Companies:** Support airline-style operators running scheduled flights between stations, solo owner-operator truckers, and everything in between; let passengers buy tickets or hitch rides.
 * [ ] **Mining and Retail Companies:** Extend the company framework to resource extraction and player-run storefronts and marketplaces at stations.
+* [ ] **Community Bulletin Boards:** Place physical bulletin boards in station rooms and outposts; any nearby player can walk up, read, and post freeform entries (job offers, item requests, announcements, trade notices). Board data is stored locally and is only visible to players physically present at the board.
+* [ ] **Station Terminal Listings:** At larger stations, provide computer terminal listing boards that aggregate postings and can be browsed from any connected terminal on the station — rewarding hub development with a searchable information advantage over small outposts.
 * [ ] **Gig Work / Contract Board:** Let any player, company, or station post a fixed-price contract job (delivery, hauling, mining order, supply run); other players can browse, accept, and complete jobs for credits.
 * [ ] **Spacefuel Cost Estimates in Bid Window:** Display an estimated fuel cost based on the accepting player's ship specs and route distance so players can evaluate contract profitability before committing.
 * [ ] **Furlong Station Rent Model:** Implement the capsule-rent system — first month free, then high recurring rent — to create natural pressure for players to graduate to private stations nearby.
