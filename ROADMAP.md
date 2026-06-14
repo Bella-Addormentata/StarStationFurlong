@@ -1,16 +1,16 @@
 # 🚀 StarStationFurlong — Development Roadmap
 
-> **From clone-born survival to colony network mastery**  
-> A decentralized frontier hangout where you wake up as a clone citizen, learn to keep a struggling station alive, specialize in careers, expand fragile outposts, and automate at scale.
+> **From clone-born newcomer to frontier legend**  
+> A decentralized space hangout where you wake up as a clone citizen at Furlong Station, find your feet, then venture out to settle, explore, and thrive across a living frontier. Hang out with friends, build your own corner of space, or dive deep into trade, crafting, and colony-building — the survival challenge is there if you want it, but the frontier is yours to enjoy on your own terms.
 
 ## 🎯 Core Design Pillars
 
 | Pillar | What it means |
 |--------|---------------|
-| **🏠 Social Hangout** | Proximity chat, SpacePhone, room presence, player-run spaces |
-| **⚙️ Station Survival** | Power, repairs, food, fuel, medicine — always one failure away from collapse |
+| **🏠 Social Hangout** | Proximity chat, SpacePhone, room presence, player-run spaces — fun without needing to touch survival |
+| **⚙️ Station Survival** | Power, repairs, food, fuel, medicine — optional depth for players who want the frontier challenge |
 | **👷 Player Careers** | Engineering, trade, crafting, exploration — practical skill paths, not stat grinds |
-| **🌌 Colony Expansion** | Outposts, supply lines, multi-scale maps, automation, frontier growth |
+| **🌌 Frontier Adventure** | Settle new stations, run supply lines, discover uncharted space, and build your own corner of the galaxy |
 
 ## 📋 GDD Coverage Status
 
@@ -26,13 +26,13 @@ The remaining work is **execution priority**, not idea discovery.
 
 | 🏷️ Phase | 🎮 Player Experience | 🛠️ Team Deliverables | 📊 Status |
 |----------|---------------------|----------------------|----------|
-| **Phase 1**<br/>*First Playable Slice* | "I was born into a struggling station.<br/>I can move, chat, and help keep it alive." | Prototype client, P2P multiplayer,<br/>onboarding, first chores | 🔵 **Current** |
+| **Phase 1**<br/>*First Playable Slice* | "I arrived at Furlong Station as a new clone.<br/>I can explore, chat, and start making my mark." | Prototype client, P2P multiplayer,<br/>onboarding, first chores | 🔵 **Current** |
 | **Phase 2**<br/>*Survival Core* | "I can survive, craft, learn a job,<br/>and keep the station functioning." | Materials, recipes, tools,<br/>survival pressure, local maps | ⚪ Planned |
 | **Phase 3**<br/>*Economy & Social* | "I can trade, specialize, socialize,<br/>and build status through work and spaces." | Economy, ATMs, roles, SpacePhone,<br/>room identity, market loops | ⚪ Planned |
 | **Phase 4**<br/>*Frontier Expansion* | "I can explore farther, run supply lines,<br/>and grow fragile outposts." | Multi-scale maps, contracts,<br/>logistics, expansion systems | ⚪ Planned |
 | **Phase 5**<br/>*Automation & Launch* | "I can automate at scale and shape<br/>the colony's long-term future." | AI captains, balance, anti-cheat,<br/>endgame careers, polish | ⚪ Planned |
 
-**Priority flow:** `learn the station → keep it alive → trade & specialize → expand frontier → automate at scale`
+**Priority flow:** `get oriented at Furlong → hang out & find your role → trade & specialize → strike out to the frontier → automate at scale`
 
 ## 🗺️ Visual Development Timeline
 

@@ -16,16 +16,19 @@
     * Companies/Users can hire other users to drive ship
 
 * Furlong Station — New Player Hub
-  * Furlong Station is the default starting station: relatively safe, staffed, and designed to orient new clones before they move on.
-  * Development at Furlong Station is intentionally limited to encourage players to graduate to private stations nearby once they are ready.
+  * Furlong Station is the default starting station: relatively safe, social, and designed to let new clones get oriented and have fun before striking out into the frontier.
+  * The station is a great place to hang out, chat, and socialize without ever needing to engage with survival mechanics — players who just want to be present and enjoy the atmosphere should always feel welcome.
+  * Development at Furlong Station is intentionally limited to encourage players to graduate to private stations and frontier destinations once they are ready.
   * Housing tiers at Furlong Station:
     * Tier 1 — Shared Dormitory (free): All newly cloned players are assigned a bunk bed in a shared room. No privacy, no storage beyond a small locker.
     * Tier 2 — Private Space Capsule (earned): After completing basic resource-gathering tasks and earning enough points, a player may build and attach a small personal capsule room to the station.
+    * Tier 3 — Premium Capsule (high rent): Enterprising players with enough credits can lease or own a larger, fancier capsule attached to Furlong Station. These are coveted because of their location, but carrying a significant ongoing cost.
   * Capsule rent model:
     * The first month of capsule rent at Furlong Station is free to give new players time to get established.
     * After the free period, capsule rent is set at a deliberately high rate compared to private stations in the surrounding area.
     * Players who cannot or choose not to pay the high rent must vacate and move their capsule to a cheaper private station nearby.
     * This rent pressure is the primary mechanism that pushes graduating players off the starter station and into the wider colony network.
+  * The fun of settling, exploring, and thriving across the frontier — not station upkeep — is the game's core promise. Survival systems add texture and challenge for players who seek them, but never block others from enjoying the social and exploration layers.
 
 * Maps
   * Different scales of maps for different gameplay layers: local rooms, stations, planets, solar systems, galaxies, and the wider universe.
