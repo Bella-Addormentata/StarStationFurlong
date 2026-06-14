@@ -21,12 +21,24 @@ This roadmap now explicitly incorporates the major idea groups from the GDD:
 * `Craft System`: core materials, multi-stage processing, quality tiers, habitat furniture, ship parts, consumables, and trade goods.
 * `Tech Tree`: practical skill careers, use-based progression, specialization slots, cooperative roles, and long-term paths like shipbuilding or station leadership.
 
+Coverage check: no major GDD pillar is missing from the roadmap now. The remaining work is prioritization and implementation order, not idea discovery.
+
 ## Design Pillars
 
 * `Social Hangout`: proximity chat, SpacePhone, room presence, player-run spaces.
 * `Station Survival`: maintenance, scarcity, fuel, crafting, medical and food support.
 * `Player Careers`: engineering, trade, crafting, exploration, station jobs.
 * `Colony Expansion`: maps, outposts, logistics, automation, frontier growth.
+
+## At A Glance
+
+| Phase | What the player feels | What the team builds |
+| --- | --- | --- |
+| `Phase 1` | I was born into a struggling station and can move, chat, and help. | Prototype client, room multiplayer, onboarding slice, first chores. |
+| `Phase 2` | I can survive, craft, learn a job, and keep the station functioning. | Materials, recipes, tools, survival pressure, local maps, skill gain. |
+| `Phase 3` | I can trade, specialize, socialize, and build status through spaces and work. | Economy, ATMs, roles, SpacePhone, room identity, market loops. |
+| `Phase 4` | I can explore farther, run supply lines, and grow fragile outposts. | Multi-scale maps, map hardware, contracts, logistics, expansion systems. |
+| `Phase 5` | I can automate at scale and shape the colony's long-term future. | AI captains, balance, anti-cheat, endgame careers, release polish. |
 
 ## 🗺️ Visual Roadmap Tracker
 
@@ -64,6 +76,7 @@ flowchart LR
 * [ ] **Station Chores Tutorial Slice:** Add one short loop where a new player completes a simple delivery, repair, food-production, or maintenance task.
 * [ ] **Communication Prototype:** Add proximity-based text chat before voice and SpacePhone features.
 * [ ] **Narrative Tone Test:** Validate the battered, salvage-built frontier mood through one room, one job loop, and one clear human-survival hook.
+* [ ] **Identity Friction Setup:** Seed how other settlers react with curiosity, suspicion, or hope so the clone identity matters from the start.
 
 ## Phase 2: Core Loop & Spatial Expansion (Pre-Alpha)
 **Goal:** Establish the station survival loop and the player's first career progression.
@@ -81,12 +94,14 @@ flowchart LR
 * [ ] **Core Material Economy:** Establish metal, fuel, plastic, fabric, food, and rare salvaged components as the main crafting inputs.
 * [ ] **Crafting & Processing:** Support refining, workbench use, machine-shop processing, and multi-stage item assembly.
 * [ ] **Crafting Categories V1:** Include basic tools, habitat furniture, station parts, consumables, and a first set of trade goods.
+* [ ] **Recipe Clarity:** Show required inputs, tools, and station facilities clearly in recipe and work-order flows.
 * [ ] **Quality and Scarcity:** Let material quality, scarcity, time, energy, and station capacity affect outputs and durability.
 * [ ] **Skill Progression:** Add early specialization tracks in survival, engineering, crafting, trade, and exploration.
 * [ ] **Use-Based Advancement:** Reward real actions such as fixing, hauling, crafting, and system operation rather than abstract grinding.
 * [ ] **Station Survival Systems:** Model power, food, fuel, medicine, shelter, and repairs at a simple but playable level.
 * [ ] **Local Maps & Fog of War:** Implement station or room-scale map access, visibility limits, and traversal between connected spaces.
 * [ ] **Physical Map Interaction:** Test map use through terminals, consoles, desks, or wearable displays rather than menu-only interaction.
+* [ ] **Advanced Tools Unlocks:** Let better tools and higher ranks improve yield, reduce waste, and unlock stronger recipes.
 
 ## Phase 3: Trade, Economy & Advanced Communication (Alpha)
 **Goal:** Turn the station into a social economy with meaningful player roles and trade friction.
@@ -106,6 +121,7 @@ flowchart LR
 * [ ] **Station Identity:** Add clearer ownership, room personalization, furniture, storage, and visible social status through spaces and equipment.
 * [ ] **Crafting Economy Integration:** Allow crafted goods to be sold, traded, leased, or used to upgrade rooms, stations, and outposts.
 * [ ] **Specialization Slots:** Introduce a limited career-shaping specialization model so players cannot master everything at once.
+* [ ] **Advanced Job Access:** Tie better stations, stronger tools, and higher-value work to progression so careers feel practical.
 * [ ] **Crypto / Decentralized Tie-Ins:** Integrate experimental Chia or decentralized persistence only after the core economy feels good without it.
 
 ## Phase 4: Automation & Grand Strategy (Beta)
@@ -122,11 +138,13 @@ flowchart LR
 
 * [ ] **Macro Maps:** Implement station, planet, system, galaxy, and wider-universe map layers with different interaction styles.
 * [ ] **Map Identity by Scale:** Use room or station layouts locally, OpenTTD-like strategic views for planets and systems, and starfield or point-cloud views for the wider frontier.
+* [ ] **Discovery Systems:** Let telescopes, sensors, and travel reveal new regions so the universe grows as players push farther out.
 * [ ] **Outposts and Supply Lines:** Let players establish or support remote settlements that depend on logistics, food, medicine, fuel, and maintenance.
 * [ ] **Contract System:** Allow users to hire real players to pilot ships, move cargo, or maintain remote locations.
 * [ ] **Advanced Map Mechanics:** Support damageable map systems, sensor authority, tech-gated access, hologram projectors, and physical printed fallback maps.
 * [ ] **Exploration Career Path:** Expand navigation, scouting, and outpost deployment into a distinct late-midgame specialization.
 * [ ] **Cooperative Colony Growth:** Let advanced roles increase outpost efficiency, reduce waste, and improve colony output through coordinated play.
+* [ ] **Scarcity and Danger:** Add frontier risk so outposts need defense, upkeep, and coordinated response rather than acting as free expansion.
 * [ ] **Performance & P2P Scaling:** Stabilize networking and discovery for larger sectors of the frontier.
 
 ## Phase 5: Polish, Balance & V1.0 Launch
