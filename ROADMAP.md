@@ -115,6 +115,8 @@ graph LR
 * [ ] **Skill Progression:** Add early specialization tracks in survival, engineering, crafting, trade, and exploration.
 * [ ] **Use-Based Advancement:** Reward real actions such as fixing, hauling, crafting, and system operation rather than abstract grinding.
 * [ ] **Station Survival Systems:** Model power, food, fuel, medicine, shelter, and repairs at a simple but playable level.
+* [ ] **Housing Tiers — Starter Dormitory:** Assign new clones to shared bunk-bed rooms at Furlong Station as the default free housing tier.
+* [ ] **Housing Tiers — Capsule Rooms:** Let players earn a private capsule room by completing basic resource-gathering tasks and accumulating enough points.
 * [ ] **Local Maps & Fog of War:** Implement station or room-scale map access, visibility limits, and traversal between connected spaces.
 * [ ] **Physical Map Interaction:** Test map use through terminals, consoles, desks, or wearable displays rather than menu-only interaction.
 * [ ] **Advanced Tools Unlocks:** Let better tools and higher ranks improve yield, reduce waste, and unlock stronger recipes.
@@ -140,6 +142,8 @@ graph LR
 ```
 
 * [ ] **In-Game Economy:** Introduce trade systems, pricing pressure, Spacefuel constraints, player-run or deployable ATMs, and visible market demand.
+* [ ] **Furlong Station Rent Model:** Implement the capsule-rent system — first month free, then high recurring rent — to create natural pressure for players to graduate to private stations nearby.
+* [ ] **Starter Station Development Cap:** Enforce Furlong Station's intentional development ceiling so players cannot fully settle there and are pushed toward the wider colony network.
 * [ ] **Player Jobs and Roles:** Add repeatable station work, hauling, repair, medical, trade, cargo handling, and inventory-management responsibilities.
 * [ ] **Advanced Communication:** Implement voice chat and the SpacePhone concept with pixelated live-avatar identity.
 * [ ] **Station Identity:** Add clearer ownership, room personalization, furniture, storage, and visible social status through spaces and equipment.

@@ -15,6 +15,18 @@
     * Give freetime for other activities
     * Companies/Users can hire other users to drive ship
 
+* Furlong Station — New Player Hub
+  * Furlong Station is the default starting station: relatively safe, staffed, and designed to orient new clones before they move on.
+  * Development at Furlong Station is intentionally limited to encourage players to graduate to private stations nearby once they are ready.
+  * Housing tiers at Furlong Station:
+    * Tier 1 — Shared Dormitory (free): All newly cloned players are assigned a bunk bed in a shared room. No privacy, no storage beyond a small locker.
+    * Tier 2 — Private Space Capsule (earned): After completing basic resource-gathering tasks and earning enough points, a player may build and attach a small personal capsule room to the station.
+  * Capsule rent model:
+    * The first month of capsule rent at Furlong Station is free to give new players time to get established.
+    * After the free period, capsule rent is set at a deliberately high rate compared to private stations in the surrounding area.
+    * Players who cannot or choose not to pay the high rent must vacate and move their capsule to a cheaper private station nearby.
+    * This rent pressure is the primary mechanism that pushes graduating players off the starter station and into the wider colony network.
+
 * Maps
   * Different scales of maps for different gameplay layers: local rooms, stations, planets, solar systems, galaxies, and the wider universe.
   * Planet and solar system maps could work like an OpenTTD-style strategic map, while galaxy and universe maps could use unique point-cloud or starfield views.

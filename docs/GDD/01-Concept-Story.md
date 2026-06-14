@@ -19,6 +19,8 @@
   * The player learns by helping with station maintenance, food production, repairs, and simple trade tasks.
   * Small missions teach the basics of movement, crafting, resource gathering, and cooperation.
   * Each success strengthens the station and gives the player a reason to keep growing.
+  * New clones begin in a shared dormitory — bunk beds, communal space, no privacy — reflecting their low standing as unproven citizens.
+  * Furlong Station is safe enough to learn the ropes, but its development ceiling and high capsule rent are designed to push capable players toward private stations and the wider frontier.
 
 * Civilization and Survival
   * The colony must build outposts, secure supply lines, and defend fragile settlements from scarcity and danger.
