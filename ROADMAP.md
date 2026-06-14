@@ -23,59 +23,31 @@ The roadmap below adds those missing beats so the game grows from a strong first
 
 ```mermaid
 flowchart LR
-    classDef current fill:#dff4ff,stroke:#1d70b8,stroke-width:3px,color:#12344d,rx:10px,ry:10px
-    classDef future fill:#f7fbff,stroke:#9bb8d3,stroke-width:2px,color:#234,rx:10px,ry:10px
+    classDef current fill:#dff4ff,stroke:#1d70b8,stroke-width:3px,color:#12344d,rx:12px,ry:12px
+    classDef future fill:#f7fbff,stroke:#9bb8d3,stroke-width:2px,color:#234,rx:12px,ry:12px
     classDef milestone fill:#cce4ff,stroke:#4a90e2,stroke-width:4px,color:#12344d,rx:18px,ry:18px
-    classDef note fill:#f4f7fb,stroke:#c7d4e2,stroke-width:1px,color:#4a5568,rx:8px,ry:8px
 
-    Start([Clone-born arrival<br/>first room, first tasks]):::current --> P1
-    P1 --> P2 --> P3 --> P4 --> P5 --> Launch
-
-    subgraph P1[Phase 1 · First Playable Slice]
-        direction TB
-        P1A[Movement + room feel]:::current
-        P1B[Small-room multiplayer<br/>text chat + P2P sync]:::current
-        P1C[Station chores tutorial<br/>repair, delivery, upkeep]:::current
-    end
-
-    subgraph P2[Phase 2 · Survival Core]
-        direction TB
-        P2A[Inventory + element system]:::future
-        P2B[Crafting + skill progression]:::future
-        P2C[Power, food, fuel,<br/>medicine, repairs]:::future
-        P2D[Local map + fog of war]:::future
-    end
-
-    subgraph P3[Phase 3 · Economy And Social Depth]
-        direction TB
-        P3A[Trade, markets, ATMs]:::future
-        P3B[SpacePhone + voice]:::future
-        P3C[Player roles and jobs]:::future
-        P3D[Station ownership signals]:::future
-    end
-
-    subgraph P4[Phase 4 · Frontier Expansion]
-        direction TB
-        P4A[Outposts + supply lines]:::future
-        P4B[System and galaxy maps]:::future
-        P4C[Map hardware, failures,<br/>printed fallback]:::future
-        P4D[Contracts + shared logistics]:::future
-    end
-
-    subgraph P5[Phase 5 · Automation And Launch]
-        direction TB
-        P5A[AI captains + ship automation]:::future
-        P5B[P2P scale + anti-cheat]:::future
-        P5C[Balance, UX polish,<br/>public onboarding]:::future
-    end
-
-    Launch(((V1.0 Colony Network))):::milestone
-    Note[Priority order:<br/>learn the station -> keep it alive -> trade and specialize -> expand the frontier -> automate at scale]:::note
-    Start -. fantasy .-> Note
+    A([Phase 1<br/>First Playable Slice]):::current --> B([Phase 2<br/>Survival Core]):::future
+    B --> C([Phase 3<br/>Economy + Social]):::future
+    C --> D([Phase 4<br/>Frontier Expansion]):::future
+    D --> E([Phase 5<br/>Automation + Launch]):::future
+    E --> F(((V1.0))):::milestone
 ```
+
+Priority flow: `learn the station -> keep it alive -> trade and specialize -> expand the frontier -> automate at scale`
 
 ## Phase 1: Foundation & Prototyping (Current)
 **Goal:** Prove the technical viability of a decentralized, browser-based spatial environment.
+
+```mermaid
+flowchart LR
+    classDef current fill:#dff4ff,stroke:#1d70b8,stroke-width:3px,color:#12344d,rx:10px,ry:10px
+    A([Tech Scaffold]):::current --> B([Small-Room Multiplayer]):::current
+    B --> C([Basic Movement and Presence]):::current
+    C --> D([Station Chores Tutorial Slice]):::current
+    D --> E([Communication Prototype]):::current
+```
+
 * [ ] **Tech Scaffold:** Initialize the prototype stack in `prototypes/` with a web client, rendering layer, and simple world state.
 * [ ] **Small-Room Multiplayer:** Prototype WebRTC or equivalent P2P connectivity for 2-4 players in a single room.
 * [ ] **Basic Movement and Presence:** Implement avatar rendering, movement, and clear nearby player presence.
@@ -84,6 +56,16 @@ flowchart LR
 
 ## Phase 2: Core Loop & Spatial Expansion (Pre-Alpha)
 **Goal:** Establish the station survival loop and the player's first career progression.
+
+```mermaid
+flowchart LR
+    classDef future fill:#f7fbff,stroke:#9bb8d3,stroke-width:2px,color:#234,rx:10px,ry:10px
+    A([Inventory and Elements]):::future --> B([Crafting and Processing]):::future
+    B --> C([Skill Progression]):::future
+    C --> D([Station Survival Systems]):::future
+    D --> E([Local Maps and Fog of War]):::future
+```
+
 * [ ] **Inventory & Elements:** Implement the foundational Element System from the TDD as the basis for items, materials, and resources.
 * [ ] **Crafting & Processing:** Support basic refining, workbench crafting, and multi-stage item assembly.
 * [ ] **Skill Progression:** Add early specialization tracks such as survival, engineering, crafting, trade, or exploration.
@@ -92,6 +74,16 @@ flowchart LR
 
 ## Phase 3: Trade, Economy & Advanced Communication (Alpha)
 **Goal:** Turn the station into a social economy with meaningful player roles and trade friction.
+
+```mermaid
+flowchart LR
+    classDef future fill:#f7fbff,stroke:#9bb8d3,stroke-width:2px,color:#234,rx:10px,ry:10px
+    A([In-Game Economy]):::future --> B([Player Jobs and Roles]):::future
+    B --> C([Advanced Communication]):::future
+    C --> D([Station Identity]):::future
+    D --> E([Crypto and Decentralized Tie-Ins]):::future
+```
+
 * [ ] **In-Game Economy:** Introduce trade systems, pricing pressure, Spacefuel constraints, and deployable ATMs.
 * [ ] **Player Jobs and Roles:** Add repeatable station work, hauling, repair, medical, trade, or admin-like responsibilities.
 * [ ] **Advanced Communication:** Implement voice chat and the SpacePhone concept with pixelated live-avatar identity.
@@ -100,6 +92,16 @@ flowchart LR
 
 ## Phase 4: Automation & Grand Strategy (Beta)
 **Goal:** Expand beyond a single station into a fragile network of outposts, routes, and shared infrastructure.
+
+```mermaid
+flowchart LR
+    classDef future fill:#f7fbff,stroke:#9bb8d3,stroke-width:2px,color:#234,rx:10px,ry:10px
+    A([Macro Maps]):::future --> B([Outposts and Supply Lines]):::future
+    B --> C([Contract System]):::future
+    C --> D([Advanced Map Mechanics]):::future
+    D --> E([Performance and P2P Scaling]):::future
+```
+
 * [ ] **Macro Maps:** Implement planet, system, and galaxy map layers with different interaction styles.
 * [ ] **Outposts and Supply Lines:** Let players establish or support remote settlements that depend on logistics.
 * [ ] **Contract System:** Allow users to hire real players to pilot ships, move cargo, or maintain remote locations.
@@ -108,6 +110,17 @@ flowchart LR
 
 ## Phase 5: Polish, Balance & V1.0 Launch
 **Goal:** Make the expanding colony stable, readable, and worth returning to.
+
+```mermaid
+flowchart LR
+    classDef future fill:#f7fbff,stroke:#9bb8d3,stroke-width:2px,color:#234,rx:10px,ry:10px
+    classDef milestone fill:#cce4ff,stroke:#4a90e2,stroke-width:4px,color:#12344d,rx:18px,ry:18px
+    A([Automation Systems]):::future --> B([Economy Balancing]):::future
+    B --> C([UX and UI Polish]):::future
+    C --> D([Security and Trust]):::future
+    D --> E(((Public Release))):::milestone
+```
+
 * [ ] **Automation Systems:** Add robotic starships and AI captains to scale trade and mining without pure grind.
 * [ ] **Economy Balancing:** Tune scarcity, route profitability, fuel costs, item quality, and crafting times.
 * [ ] **UX/UI Polish:** Refine spatial UI, terminals, maps, console interactions, and onboarding clarity.
