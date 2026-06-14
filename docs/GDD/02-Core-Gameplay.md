@@ -9,6 +9,19 @@
   * Chia coins and 
   * In Game ATMs? can be owned by whoever, placed in own room or station.
 
+* Player Companies
+  * Players can found and register a company to run a business across the frontier.
+  * Transportation companies:
+    * A group of players can form an airline-style company, purchase or build spaceships, and operate scheduled flights between stations.
+    * Other players can buy a ticket for a named flight, or hitch a ride with a solo owner-operator working a route like a trucker.
+    * Companies can grow from a single ship to a large fleet with multiple routes, crews, and timetables.
+  * The same company structure applies to other business types:
+    * Mining companies: own ships and equipment, contract crews, sell extracted resources.
+    * Retail and marketplace companies: own storefronts at stations, set prices, manage inventory, and hire staff.
+    * Logistics and hauling: run cargo between stations on contract or speculative runs.
+  * Players without a company can work as employees or contractors for existing companies, earning pay for flying, hauling, mining, or staffing.
+  * Companies can be as small as a single owner-operator with one ship or as large as a player-group corporation with stations, fleets, and trade networks.
+
 * Transportation
   * Spacefuel costs money to make travel friction and make natural moats to different locations
   * Possible to make/buy robotic starship captain that can drive trade and mining ships
