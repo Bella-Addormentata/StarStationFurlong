@@ -22,6 +22,17 @@
   * Players without a company can work as employees or contractors for existing companies, earning pay for flying, hauling, mining, or staffing.
   * Companies can be as small as a single owner-operator with one ship or as large as a player-group corporation with stations, fleets, and trade networks.
 
+* Gig Work and Contracts
+  * Any entity — a warehouse, station, company, or individual player — can post a contract job with a fixed payout price.
+  * Example contracts:
+    * A warehouse orders a set quantity of minerals from a mine and posts a delivery contract with a fixed fee.
+    * A remote outpost needs a specific cargo drop and lists a one-off delivery job at a set price.
+    * A station needs a repair crew or medical supplies ferried in urgently.
+  * Any eligible player can browse open contracts, review the payout, and accept the job.
+  * The contract bid window should show an estimated spacefuel cost based on the player's current ship specs and the route distance, so players can judge profitability before accepting.
+  * Contracts can have time limits, quantity requirements, and reputation prerequisites to add variety and prevent abuse.
+  * Completing contracts earns credits and can contribute toward career progression and company standing.
+
 * Transportation
   * Spacefuel costs money to make travel friction and make natural moats to different locations
   * Possible to make/buy robotic starship captain that can drive trade and mining ships
