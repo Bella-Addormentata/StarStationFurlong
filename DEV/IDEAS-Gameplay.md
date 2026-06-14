@@ -49,3 +49,11 @@
   * Companies can issue shares that are tradable like currency, through direct private sales or open markets.
   * Furlong station can offer a small barter/trading floor as an early exchange.
   * Major corporate stations can run dedicated live exchanges for shares, commodities, and currencies.
+
+* Crafting Recipe Discovery
+  * Crafting can follow an EverQuest-like model centered on a permanent player Recipe Book.
+  * Players can drop unlisted item combinations into a crafting container and experiment.
+  * If an experimental combine yields a viable output, the player discovers the recipe and keeps that knowledge permanently.
+  * Standard crafting uses specific ingredients placed into a designated container (for example: Forge, Loom, or Oven) followed by a "Combine" action.
+  * Successful experimental combines should automatically register newly discovered recipes in the Recipe Book.
+  * Small handmade items can be crafted directly without a container.
