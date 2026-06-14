@@ -24,3 +24,4 @@ opensource tech:
 * https://github.com/mrdoob/three.js/
 * https://github.com/Kaetram
 * https://github.com/Tribler/tribler
+* https://worldofclaudecraft.com/
