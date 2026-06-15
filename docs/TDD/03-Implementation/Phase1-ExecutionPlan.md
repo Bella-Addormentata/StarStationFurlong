@@ -2,8 +2,9 @@
 
 > **Maps to ROADMAP:** Phase 1 - Foundation & Prototyping  
 > **Product Goal:** "I arrived at Furlong Station as a new clone. I can explore, chat, and start making my mark."  
-> **Technical Goal:** Deliver first multiplayer playable prototype in 6-8 weeks  
+> **Technical Goal:** Deliver first multiplayer playable prototype in 6-8 weeks using the sovereign tech path  
 > **Status:** 🔵 In Progress
+> **Architecture Reference:** [STUDY-Architecture v002](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v002.md) — the sovereignty blueprint this plan implements
 
 ---
 
@@ -39,31 +40,36 @@ By end of Phase 1, we must deliver:
 
 ## 🛠️ Tech Stack Selection
 
-### Frontend Stack
+> **Sovereignty constraint:** nothing on the critical path may depend on infrastructure we do not control. Every technology choice below must pass the Sovereignty Test: *"If the dev team disappeared tomorrow, could a player's Tauri node keep the game running?"*
+
+### Shared Game Core (TypeScript, runs in browser and Tauri webview)
 
 | Category | Technology | Version | Rationale |
 |----------|-----------|---------|-----------|
 | **Build Tool** | Vite | 5.x | Fast dev server, smooth HMR |
 | **Rendering Engine** | Three.js | r167+ | Mature WebGL library, rich documentation |
-| **State Management** | Zustand | 4.x | Lightweight (< 1KB), simpler than Redux |
-| **Networking** | Socket.io-client | 4.x | Easy to debug, good for Phase 1 |
-| **UI Framework** | Vanilla HTML/CSS | - | Keep Phase 1 simple, can migrate to React later |
+| **Room State / Chat** | Yjs | 13.x | CRDT — offline-first, conflict-free sync over *our own* transport; replaces Zustand + any server-relay |
+| **P2P Transport** | simple-peer | 9.x | WebRTC data channels in-browser; stays in the TS layer per Architecture §14 |
+| **Serialization** | msgpackr | 1.x | MessagePack for all non-hot-path messages (chat, CRDT updates, interactions) |
+| **UI Framework** | Vanilla HTML/CSS | — | Keep Phase 1 simple, can migrate to React later |
 
-### Backend Stack (Temporary)
+### Tauri Client Shell (Rust — the sovereign backbone)
 
 | Category | Technology | Version | Rationale |
 |----------|-----------|---------|-----------|
-| **Runtime** | Node.js | 20 LTS | Stable, shares JavaScript with frontend |
-| **Web Framework** | Express | 4.x | Lightweight, basic HTTP suffices |
-| **WebSocket** | Socket.io | 4.x | Auto-fallback, easy to use |
-| **Deployment** | Railway/Render | - | Free tier sufficient, simple deployment |
+| **App Shell** | Tauri | 2.x | ~12 MB installer; native webview runs the shared TS game core |
+| **Async Runtime** | Tokio | 1.x | Powers embedded signaling server and future `libp2p` integration |
+| **Embedded Signaler** | axum + tokio-tungstenite | 0.7.x / 0.23.x | ~small Rust file; WSS WebRTC broker running *inside* every Tauri node — no third-party server needed |
+| **Native P2P** | rust-libp2p | 0.54.x | QUIC + gossipsub + Kademlia DHT; native swarm needs zero external servers |
+
+> **No Socket.io. No Railway/Render. No public STUN/TURN.** The Tauri node IS the signaling/STUN/relay server. See Architecture STUDY v002 §6 and §9.2.
 
 ### Development Tools
 
 - **Editor:** VS Code + recommended extensions
 - **Version Control:** Git + GitHub
-- **Package Manager:** npm
-- **Code Standards:** ESLint + Prettier
+- **Package Manager:** npm (frontend) + cargo (Rust)
+- **Code Standards:** ESLint + Prettier (TS) + clippy (Rust)
 
 ---
 
@@ -83,17 +89,25 @@ By end of Phase 1, we must deliver:
 **File Structure:**
 ```
 prototypes/01-core-loop-demo/
-├── src/
-│   ├── main.js           # Entry point
-│   ├── renderer.js       # Three.js renderer initialization
-│   ├── world.js          # World/room management
-│   ├── player.js         # Player entity
-│   ├── input.js          # Input controls
-│   └── utils.js          # Utility functions
+├── src/                          # Shared TS game core (runs in browser + Tauri webview)
+│   ├── main.ts                   # Entry point
+│   ├── renderer.ts               # Three.js renderer initialization
+│   ├── world.ts                  # World/room management
+│   ├── player.ts                 # Player entity
+│   ├── input.ts                  # Input controls
+│   ├── network/
+│   │   ├── NetworkProvider.ts    # WebRTC via simple-peer
+│   │   └── YjsSync.ts            # Yjs CRDT room-state sync
+│   └── utils.ts                  # Utility functions
+├── src-tauri/                    # Tauri shell (Rust — the sovereign backbone)
+│   ├── src/
+│   │   ├── main.rs               # Tauri entry point
+│   │   └── signaling.rs          # Embedded WSS WebRTC signaler (~small file)
+│   └── Cargo.toml
 ├── public/
-│   └── assets/           # Textures, sounds
+│   └── assets/                   # Textures, sounds
 ├── package.json
-└── vite.config.js
+└── vite.config.ts
 ```
 
 **Acceptance Criteria:**
@@ -357,102 +371,122 @@ prototypes/01-core-loop-demo/
 
 ### 🌐 Sprint 3: Multiplayer Networking (Week 5-6)
 
-**Goal:** Implement 2-4 player concurrent online, see each other's movement.
+**Goal:** Implement 2-4 player concurrent online via WebRTC P2P, brokered by the embedded Tauri signaler. No third-party server required.
 
-#### Technical Decision: WebSocket vs WebRTC
+#### Architecture: Sovereign Networking
 
-**Phase 1 Decision: Use Socket.io (WebSocket)**
+> From Architecture STUDY v002 §5-6: the Tauri client is the sovereign backbone. Every player running the native client optionally contributes signaling, STUN reflection, and NAT relay — so the browser client is sovereign-by-proxy, depending only on *a player's* Tauri node, never on a company or third-party service.
 
-**Rationale:**
-| Criteria | Socket.io | WebRTC P2P |
-|----------|-----------|------------|
-| **Implementation Speed** | ✅ 1-2 days | ❌ 1-2 weeks |
-| **Debugging** | ✅ Simple (see all messages) | ❌ Complex (P2P connection issues) |
-| **Suitable Scale** | ✅ < 50 players | ✅ > 50 players |
-| **Server Cost** | ⚠️ Requires server (free tier sufficient) | ✅ Serverless |
-| **Decentralization** | ❌ Centralized | ✅ Decentralized |
+```
+  Browser (web)                        Player-run TAURI NODE
+  ┌─────────────────────┐              ┌──────────────────────────────┐
+  │ Three.js + Yjs      │  WebRTC DC   │ Three.js + Yjs               │
+  │ simple-peer         │◄────────────►│ simple-peer (in webview)     │
+  │                     │              │                              │
+  │                     │  WSS signal  │ signaling.rs (embedded WSS)  │
+  │                     │◄────────────►│ STUN reflection              │
+  └─────────────────────┘              │ NAT relay (app-layer)        │
+                                       └──────────────────────────────┘
+```
 
-**Phase 1 Priority:** Fast gameplay validation > Decentralization ideal
-
-**Future Migration Path:**
-- Phase 2-3: Continue Socket.io
-- Phase 4: Evaluate migration when players > 50
-- Option: Hybrid architecture (Socket.io signaling + WebRTC data)
+**No Socket.io. No hosted server. No public STUN.** Phase 1 uses a baked-in seed address (localhost Tauri node during dev) for first contact; Chia on-chain host registry is added in Phase 3+ for production bootstrap.
 
 ---
 
-#### Task 3.1: Build WebSocket Server
+#### Task 3.1: Embed Sovereign Signaling Server in Tauri Node
 
-**Server Responsibilities:**
-- Accept client connections
-- Track player states (position, room, name)
-- Broadcast player movements
-- Handle player join/leave events
+**Responsibility:** Every Tauri client runs a tiny WebSocket broker that facilitates WebRTC SDP/ICE exchange between peers. No external signaling service.
 
-**Server Architecture:**
-- Express for HTTP server
-- Socket.io for WebSocket layer
-- In-memory Map for player storage (no DB in Phase 1)
-- CORS configuration for local development
+**Implementation (Rust — `src-tauri/src/signaling.rs`):**
+- `axum` WebSocket upgrade handler
+- In-memory `HashMap<RoomId, Vec<PeerId>>` — no DB
+- Relay SDP `offer`/`answer` and ICE candidates between peers in the same room
+- Emit `peer:joined` / `peer:left` events
+- Bind on `127.0.0.1:3000` for dev; expose on LAN for other players
 
-**Network Events:**
-- `player:join` - New player connects
-- `player:move` - Player position update
-- `players:init` - Send all existing players to new joiner
-- `player:joined` - Broadcast new player to others
-- `player:moved` - Broadcast movement to others
-- `player:left` - Player disconnected
-
-**Deployment:**
-- Local development: `localhost:3000`
-- Production: Railway/Render free tier
-- Environment variables for configuration
+**Key Events (over WSS):**
+- `join` — browser registers itself for a room
+- `offer` / `answer` — relay SDP between two peers
+- `ice` — relay ICE candidate
+- `peer:joined` / `peer:left` — roster notifications
 
 **Acceptance Criteria:**
-- [ ] Server starts successfully
-- [ ] Client can connect
-- [ ] Console logs connection events
+- [ ] `cargo tauri dev` starts Tauri app with embedded signaler on port 3000
+- [ ] Two browser windows served by the Tauri webview can connect to the signaler
+- [ ] Signaler logs SDP relay events in the Tauri console
 
-**Estimated Time:** 3 hours
+**Estimated Time:** 4 hours
 
 ---
 
-#### Task 3.2: Client Network Integration
+#### Task 3.2: WebRTC P2P via `simple-peer` (Client)
 
-**Network Manager Responsibilities:**
-- Connect to WebSocket server
-- Send local player position updates
-- Receive remote player updates
-- Handle connection/disconnection
+**Responsibilities:**
+- Connect to the Tauri-node signaler via WebSocket
+- Exchange SDP offer/answer and ICE candidates
+- Open a WebRTC data channel per peer pair
+- Send local player position ticks (unreliable channel)
+- Sync Yjs CRDT state updates (reliable channel)
+
+**Two-channel design:**
+| Channel | Mode | Content |
+|---------|------|---------|
+| `movement` | unreliable, ordered | 13-byte hand-packed `DataView` position tick |
+| `sync` | reliable, ordered | MessagePack messages (CRDT updates, chat, interactions) |
 
 **Player Synchronization:**
-- Local player: Immediate response (client-side prediction)
-- Remote players: Position updates from server
-- Update frequency: 50ms (20 updates/second)
+- Local player: immediate response (client-side prediction)
+- Remote players: position updates from WebRTC unreliable channel at 20 Hz
+- Room state (furniture, bulletin boards): Yjs CRDT synced on connect and on change
+- Update frequency: 50 ms (20 updates/second) on movement channel
 - Only send when position changes
 
 **Remote Player Management:**
-- Create/destroy remote player entities
-- Update positions from network
+- Create/destroy remote player entities on `peer:joined` / `peer:left`
+- Update positions from WebRTC data channel
 - Different visual representation (red vs green)
-- Room-based visibility (only show players in same room)
+- Room-based visibility (only connect to peers in the same room)
 
 **Acceptance Criteria:**
-- [ ] Two browser windows can see each other
-- [ ] Movement syncs smoothly (< 100ms latency)
+- [ ] Two Tauri windows (or browser tabs served by Tauri) can see each other move
+- [ ] Movement syncs smoothly (< 100 ms latency, LAN)
 - [ ] Player disconnect removes entity correctly
+- [ ] No public internet dependency — works on a LAN with no internet access
 
 **Estimated Time:** 5 hours
 
 ---
 
-#### Task 3.3: Network Performance Optimization
+#### Task 3.3: Yjs CRDT Room State
+
+**Purpose:** Bulletin boards, furniture placement, and persistent chat history are shared documents — not server-relayed events. Yjs handles merging offline edits and reconnect sync automatically.
+
+**Yjs document structure:**
+```typescript
+const roomDoc = new Y.Doc()
+const chat    = roomDoc.getArray<ChatMessage>('chat')   // append-only log
+const objects = roomDoc.getMap<ObjectState>('objects')  // furniture / interactables
+const players = roomDoc.getMap<PlayerPresence>('players') // online presence
+```
+
+**Sync provider:** custom `WebrtcProvider`-equivalent that uses the `sync` data channel (reliable) instead of `y-webrtc`'s public signaling server. No third-party signaling.
+
+**Acceptance Criteria:**
+- [ ] Two peers share the same `chat` array in real time
+- [ ] Quest object state (picked up, repaired) is CRDT-synced
+- [ ] Reconnecting peer receives full room state without a server
+
+**Estimated Time:** 4 hours
+
+---
+
+#### Task 3.4: Network Performance Optimization
 
 **Optimization Strategies:**
 
 1. **Client-Side Prediction**
    - Local player responds immediately
-   - Don't wait for server confirmation
+   - No round-trip confirmation needed (P2P, no authoritative server in Phase 1)
    - Reduces perceived input lag
 
 2. **Position Interpolation**
@@ -461,24 +495,18 @@ prototypes/01-core-loop-demo/
    - Avoid jerky/teleporting appearance
 
 3. **Bandwidth Optimization**
-   - Only send position when changed
-   - Compress position data (round to 2 decimals)
-   - Delta compression (future optimization)
+   - 13-byte hand-packed `DataView` for movement ticks (no JSON, no MessagePack on hot path)
+   - MessagePack for all other messages (chat, interactions, CRDT sync)
+   - Only send position when changed; delta-compress if unchanged
 
 4. **Room-Based Filtering**
-   - Only send updates to players in same room
-   - Server-side filtering reduces bandwidth
-   - Client-side culling for safety
-
-**Interpolation Algorithm:**
-- Linear interpolation (lerp) between positions
-- Interpolation speed: 5.0 (tunable parameter)
-- Smooth player movement over network jitter
+   - WebRTC connections only created between peers in the same room
+   - Yjs doc per room — don't sync unrelated rooms
 
 **Acceptance Criteria:**
-- [ ] Network latency < 100ms (LAN)
+- [ ] Network latency < 100 ms (LAN)
 - [ ] Movement appears smooth, no stuttering
-- [ ] Server CPU usage < 20%
+- [ ] Tauri node CPU usage < 20 % during 4-player session
 
 **Estimated Time:** 3 hours
 
@@ -487,16 +515,17 @@ prototypes/01-core-loop-demo/
 #### Sprint 3 Summary
 
 **Deliverables:**
-- ✅ Working WebSocket server
-- ✅ 2-4 player multiplayer
-- ✅ Smooth network synchronization
+- ✅ Embedded sovereign WebSocket signaler in Tauri node (Rust)
+- ✅ WebRTC P2P connections brokered without any third-party service
+- ✅ 2-4 player multiplayer with movement and Yjs room-state sync
 
-**Demo Milestone:** Demo with 2 physical devices simultaneously
+**Demo Milestone:** Demo with 2 physical devices on a LAN — no internet required
 
 **Technical Validation:**
-- Latency: < 100ms (local), < 200ms (remote)
-- Frame rate: 60fps maintained
+- Latency: < 100 ms (LAN), < 200 ms (remote)
+- Frame rate: 60 fps maintained
 - Connection stability: No unexpected disconnects
+- Sovereignty check: Disconnect the dev's server — game still connects and plays ✅
 
 ---
 
@@ -533,9 +562,9 @@ prototypes/01-core-loop-demo/
 - Mode toggle button (Global/Proximity)
 
 **Server-Side:**
-- `chat:send` - Client sends message
-- `chat:message` - Server broadcasts message
-- Room-based filtering for proximity mode
+- Chat messages are appended to the Yjs `chat` array in the room document
+- Yjs CRDT sync propagates messages to all peers over the WebRTC reliable channel
+- No Socket.io server, no hosted relay — history persists in the CRDT and is replayed on reconnect
 
 **Message Format:**
 - Sender name (colored by mode)
@@ -659,29 +688,36 @@ prototypes/01-core-loop-demo/
 
 ## 🔧 Key Technical Decisions
 
-### Decision 1: Network Architecture - Socket.io vs WebRTC
+### Decision 1: Network Architecture — Sovereign WebRTC vs Socket.io
 
-**Problem:** Which networking solution for Phase 1?
+**Problem:** Which networking solution aligns with both Phase 1 speed and the project's sovereignty requirement?
 
-**Decision:** Socket.io (WebSocket)
+**Decision:** WebRTC P2P brokered by an embedded Tauri signaling server
+
+**The Sovereignty Test (from Architecture STUDY v002 §3):**
+> *"If GitHub, Cloudflare, and the dev team all disappeared tomorrow, could a player's Tauri node bootstrap the game?"*
+
+Socket.io requires a hosted server on Railway/Render — a third party we do not control. It fails the Sovereignty Test immediately. The embedded Tauri signaler passes it: the infrastructure is the player base.
 
 **Rationale:**
-- **Speed:** Can implement in 1-2 days vs 1-2 weeks for WebRTC
-- **Debugging:** Simple message inspection, clear client-server flow
-- **Scale:** Sufficient for < 50 concurrent players
-- **Cost:** Free tier (Railway/Render) handles Phase 1 needs
-- **Learning Curve:** Lower, more documentation available
+| Criteria | Socket.io + Railway/Render | WebRTC + Embedded Tauri Signaler |
+|----------|---------------------------|----------------------------------|
+| **Sovereignty** | ❌ Fails — third-party server | ✅ Passes — player-run infra |
+| **Implementation Speed** | ✅ 1-2 days | ✅ 1-2 days (signaler is ~small Rust file) |
+| **Debugging** | ✅ Simple message inspection | ✅ Tauri console + `simple-peer` event log |
+| **P2P Scale** | ❌ Server bottleneck | ✅ Mesh up to ~12-15 peers; host authority beyond |
+| **Offline / LAN play** | ❌ Requires internet + server | ✅ Works on LAN with zero internet |
+| **Cost** | ⚠️ Requires free/paid hosting | ✅ Zero infra cost |
+| **Alignment with Phase 2+** | ❌ Must be ripped out | ✅ Grows into Chia registry + libp2p DHT |
 
-**Trade-offs:**
-- ❌ Requires centralized server (not P2P)
-- ❌ Higher latency than optimized WebRTC (but < 100ms acceptable)
-- ✅ Easier to implement authority server (anti-cheat)
-- ✅ Simpler state synchronization
+**Trade-offs accepted:**
+- WebRTC NAT traversal adds complexity → mitigated by baked-in seed list and Tauri-embedded STUN reflection
+- `simple-peer` ICE negotiation takes ~1-2 s on first connect → acceptable for Phase 1
 
 **Future Path:**
-- Phase 2-3: Continue Socket.io
-- Phase 4: Re-evaluate when scaling beyond 50 players
-- Consider hybrid: Socket.io signaling + WebRTC data channels
+- Phase 2: LAN-local Tauri nodes auto-discover via mDNS (zero config)
+- Phase 3: Chia on-chain host registry as the production bootstrap (no seed list needed)
+- Phase 4+: `rust-libp2p` QUIC + gossipsub replaces signaler for native swarm
 
 ---
 
@@ -710,27 +746,21 @@ prototypes/01-core-loop-demo/
 
 ---
 
-### Decision 3: State Management - Zustand vs Redux
+### Decision 3: State Management — Yjs CRDT vs Zustand
 
-**Decision:** Zustand
+**Decision:** Yjs (CRDT) for all shared room state; lightweight local signals for UI-only state
 
 **Rationale:**
-- **Size:** < 1KB minified vs Redux ~10KB+
-- **Simplicity:** No boilerplate, direct state updates
-- **No Provider:** Works without React context wrapping
-- **TypeScript:** Excellent type inference
-- **Learning Curve:** Minimal, API is intuitive
 
-**Usage Pattern:**
-- Centralized game state store
-- Player inventory
-- Current quest
-- UI state (chat visibility, etc.)
+| Criteria | Zustand | Yjs CRDT |
+|----------|---------|----------|
+| **Distributed sync** | ❌ Local only; needs server relay | ✅ Built-in P2P merge, conflict-free |
+| **Offline / reconnect** | ❌ State lost on disconnect | ✅ Automatic catchup on reconnect |
+| **Chat history** | ❌ Needs server persistence | ✅ `Y.Array` is the persistent log |
+| **Furniture / objects** | ❌ Needs authoritative server | ✅ `Y.Map` CRDT, any peer can edit |
+| **Sovereignty** | ❌ Implies a sync server | ✅ Syncs over our own WebRTC transport |
 
-**Trade-offs:**
-- Less ecosystem/middleware than Redux
-- Fewer debugging tools
-- For Phase 1 scope, these trade-offs acceptable
+Zustand is useful for *purely local* UI state (chat panel open/closed, graphics settings). Yjs owns everything that crosses the network.
 
 ---
 
@@ -804,20 +834,20 @@ prototypes/01-core-loop-demo/
 
 ---
 
-### Risk 2: WebSocket Server Stability
+### Risk 2: WebRTC NAT Traversal Failures
 
-**Description:** Free tier servers may be unstable or have concurrency limits
+**Description:** Some network configurations (symmetric NAT, corporate firewalls) can block WebRTC peer-to-peer connections even with STUN
 
-**Impact:** Medium - May affect playtesting
+**Impact:** Medium — affects players on restrictive networks
 
-**Likelihood:** Low-Medium - Free tiers usually reliable for low traffic
+**Likelihood:** Low-Medium — most home/mobile networks work fine with STUN
 
 **Mitigation:**
-1. **Multiple Platforms:** Have Railway, Render, Fly.io as backups
-2. **Auto-Reconnect:** Client automatically reconnects on disconnect
-3. **Local Development:** Use localhost during development
+1. **Embedded Tauri STUN:** Tauri node reflects ICE candidates itself — no Google STUN dependency
+2. **App-Layer Relay:** Tauri node acts as relay of last resort for peers that can't connect directly
+3. **Baked-in seed list:** Multiple community Tauri nodes in the build reduce single-point failure
 
-**Contingency:** Upgrade to paid tier (~$5/month) if needed
+**Contingency:** Display connection quality indicator; guide players to run a Tauri node for better connectivity
 
 ---
 
@@ -838,20 +868,20 @@ prototypes/01-core-loop-demo/
 
 ---
 
-### Risk 4: Network Sync Lag
+### Risk 4: First-Contact Bootstrap (Cold Start)
 
-**Description:** Cross-region connections may have > 300ms latency
+**Description:** A new player with a fresh install needs to find at least one live Tauri node to connect. If the baked-in seed list is stale, they can't reach the network.
 
-**Impact:** Medium - Affects international player experience
+**Impact:** Medium — affects new player onboarding
 
-**Likelihood:** Medium - Depends on player locations
+**Likelihood:** Low during Phase 1 (dev machines always online); increases in production
 
 **Mitigation:**
-1. **Client Prediction:** Local player responds immediately
-2. **Interpolation:** Smooth remote player movement
-3. **Regional Servers:** Consider multi-region deployment (Phase 2+)
+1. **Seed list:** Ship 3-5 always-on community Tauri node addresses in the build
+2. **LAN mDNS:** Tauri nodes on the same LAN discover each other automatically (zero config, Phase 2)
+3. **Chia registry (Phase 3+):** On-chain host list is the censorship-proof bootstrap — no stale seed list
 
-**Contingency:** Display latency indicator, allow region selection
+**Contingency:** Allow players to manually enter a known Tauri node address
 
 ---
 
@@ -945,14 +975,25 @@ prototypes/01-core-loop-demo/
 
 ### Official Documentation
 - [Three.js Documentation](https://threejs.org/docs/)
-- [Socket.io Documentation](https://socket.io/docs/v4/)
+- [Tauri Documentation](https://tauri.app/v2/guide/)
+- [Yjs Documentation](https://docs.yjs.dev/)
+- [simple-peer Documentation](https://github.com/feross/simple-peer)
 - [Vite Documentation](https://vitejs.dev/)
-- [Zustand Documentation](https://github.com/pmndrs/zustand)
+- [rust-libp2p Documentation](https://docs.rs/libp2p/latest/libp2p/)
+- [msgpackr Documentation](https://github.com/kriszyp/msgpackr)
 
 ### Tutorials and Examples
 - [Three.js Journey](https://threejs-journey.com/) - Excellent Three.js tutorials
-- [Socket.io Chat App](https://socket.io/get-started/chat) - WebSocket intro
+- [Tauri Getting Started](https://tauri.app/v2/guide/create/) - Tauri project setup
+- [Yjs Shared Editing](https://docs.yjs.dev/getting-started/a-collaborative-editor) - CRDT intro
+- [simple-peer Examples](https://github.com/feross/simple-peer/tree/master/example) - WebRTC data channels
 - [Multiplayer Game Architecture](https://www.gabrielgambetta.com/client-server-game-architecture.html)
+
+### Architecture References
+- [Architecture STUDY v002](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v002.md) — the sovereign tech path this plan implements
+- §5 "Web-First, Tauri-Best" delivery model
+- §6 Sovereign Discovery & Signaling Layer
+- §9.2 The sovereign signaler (embedded Rust WSS broker)
 
 ### Inspiration References
 - **Habbo Hotel** - Isometric social game
@@ -963,6 +1004,7 @@ prototypes/01-core-loop-demo/
 - [WebGL Performance Best Practices](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices)
 - [Client-Server Game Architecture](https://gafferongames.com/post/what_every_programmer_needs_to_know_about_game_networking/)
 - [Three.js Performance Tips](https://discoverthreejs.com/tips-and-tricks/)
+- [WebRTC for the Curious](https://webrtcforthecurious.com/) — NAT traversal, STUN/TURN deep dive
 
 ---
 
