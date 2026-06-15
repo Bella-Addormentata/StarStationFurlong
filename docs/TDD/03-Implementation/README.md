@@ -6,10 +6,10 @@ This directory contains detailed technical execution plans for each development 
 
 ### Execution Plan Documents
 - **[Phase 1: First Playable Slice](Phase1-ExecutionPlan.md)** - Technical implementation plan for the first playable prototype
-- **Phase 2: Survival Core** *(To be created)*
-- **Phase 3: Economy & Social** *(To be created)*
-- **Phase 4: Frontier Expansion** *(To be created)*
-- **Phase 5: Automation & Launch** *(To be created)*
+- **[Phase 2: Survival Core](Phase2-ExecutionPlan.md)** *(To be created)*
+- **[Phase 3: Economy & Social](Phase3-ExecutionPlan.md)** *(To be created)*
+- **[Phase 4: Frontier Expansion](Phase4-ExecutionPlan.md)** *(To be created)*
+- **[Phase 5: Automation & Launch](Phase5-ExecutionPlan.md)** *(To be created)*
 
 ## 🎯 Relationship with Other Documents
 
