@@ -1,7 +1,7 @@
 # Phase 1: First Playable Slice - Technical Execution Plan
 
 > **Maps to ROADMAP:** Phase 1 - Foundation & Prototyping  
-> **Product Goal:** "I arrived at Furlong Station as a new clone. I can explore, chat, and start making my mark."  
+> **Product Goal:** "I arrived at Furlong Station. I can explore public rooms, chat with others, and claim my own capsule."  
 > **Technical Goal:** Deliver first multiplayer playable prototype in 6-8 weeks using the sovereign tech path  
 > **Status:** 🔵 In Progress
 > **Architecture Reference:** [STUDY-Architecture v002](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v002.md) — the sovereignty blueprint this plan implements
@@ -14,9 +14,9 @@
 - [Tech Stack Selection](#️-tech-stack-selection)
 - [Sprint Breakdown](#-sprint-breakdown)
   - [Sprint 1: Local Rendering Foundation](#-sprint-1-local-rendering-foundation-week-1-2)
-  - [Sprint 2: Interaction & Quest System](#-sprint-2-interaction--quest-system-week-3-4)
+  - [Sprint 2: Room Interaction & Station Map](#-sprint-2-room-interaction--station-map-week-3-4)
   - [Sprint 3: Multiplayer Networking](#-sprint-3-multiplayer-networking-week-5-6)
-  - [Sprint 4: Social & Polish](#-sprint-4-social--polish-week-7-8)
+  - [Sprint 4: Chat, Lobby & Room Ownership](#-sprint-4-chat-lobby--room-ownership-week-7-8)
 - [Key Technical Decisions](#-key-technical-decisions)
 - [Performance Targets](#-performance-targets)
 - [Known Technical Risks](#-known-technical-risks)
@@ -31,10 +31,11 @@ By end of Phase 1, we must deliver:
 - [ ] **3D Rendering** - Smoothly render space station rooms in browser (60fps)
 - [ ] **Player Movement** - WASD controls, collision detection, smooth animations
 - [ ] **Multiplayer Sync** - Support 2-4 concurrent players with < 150ms latency
-- [ ] **Room System** - At least 3 interconnected rooms (Dormitory, Corridor, Cargo Bay)
-- [ ] **Quest Loop** - Complete "Repair Air Filter" quest flow
+- [ ] **Room System** - StarStation public lobby plus at least 2 additional interconnected rooms
+- [ ] **Room Navigation** - Door/transition system with station mini-map
 - [ ] **Text Chat** - Global and proximity-based chat functionality
-- [ ] **Clone Narrative** - Onboarding sequence and identity setup
+- [ ] **Room Ownership** - Players can claim and enter their own private capsule rooms
+- [ ] **Capsule Demo** - Show the public station lobby connected to player-owned capsule rooms
 
 ---
 
@@ -228,26 +229,29 @@ prototypes/01-core-loop-demo/
 - Input latency: < 16ms
 - Memory usage: < 100MB
 
-**Next Step:** Sprint 2 - Add multi-room and interaction system
+**Next Step:** Sprint 2 - Add multi-room navigation and interactable objects
 
 ---
 
-### 🏃 Sprint 2: Interaction & Quest System (Week 3-4)
+### 🏃 Sprint 2: Room Interaction & Station Map (Week 3-4)
 
-**Goal:** Implement room switching, object interaction, and first complete quest.
+**Goal:** Implement the StarStation public lobby layout, room switching, interactable objects, and a station mini-map.
 
 #### Task 2.1: Multi-Room System
 
 **Room Layout Design:**
 ```
-[Dormitory] <--Door--> [Corridor] <--Door--> [Cargo Bay]
-   10x10m                 6x12m                  12x12m
+[Capsule Row A] <--Airlock--> [StarStation Lobby] <--Airlock--> [Capsule Row B]
+   10x10m (private)              20x20m (public)                  10x10m (private)
+                                       |
+                               [Corridor / Promenade]
+                                    6x24m
 ```
 
 **Room Specifications:**
-- **Dormitory:** Player spawn location, 10x10m
-- **Corridor:** Connecting passage, 6x12m (narrow and long)
-- **Cargo Bay:** Quest location, 12x12m (large space)
+- **StarStation Lobby:** Main public gathering space, 20x20m — the heart of the station
+- **Corridor / Promenade:** Connecting passage with bulletin boards and signage, 6x24m
+- **Capsule Row A/B:** Rows of private capsule rooms accessible off the lobby (placeholder geometry in Phase 1)
 
 **Door System Design:**
 - Doors represented as trigger zones (invisible colliders)
@@ -280,15 +284,15 @@ prototypes/01-core-loop-demo/
 #### Task 2.2: Interactable Object System
 
 **Object Types:**
-- **Crate:** Storage container, pickup items
-- **Terminal:** Information display panel
-- **Repair Panel:** Quest objective target
+- **Bulletin Board:** Station-wide announcements and player messages
+- **Terminal:** Station directory, room map display
+- **Airlock / Door Panel:** Controls room transitions and capsule access
 
 **Object Properties:**
 - Position (Vector3)
 - Type (string identifier)
 - Interaction range (default 1.5m)
-- Data payload (quest items, messages, etc.)
+- Data payload (messages, room links, ownership data)
 - Visual feedback (highlight on hover)
 
 **Interaction System:**
@@ -298,74 +302,76 @@ prototypes/01-core-loop-demo/
 - Callback system for different object types
 
 **Visual Design:**
-- **Crate:** Brown box (0.8x0.8x0.8m), wooden material
+- **Bulletin Board:** Light gray panel (1.2x0.8x0.1m), emissive display surface
 - **Terminal:** Cyan glowing panel (0.5x1.0x0.3m), emissive material
-- **Repair Panel:** Orange panel (0.6x0.8x0.2m), warning color
+- **Airlock / Door Panel:** Orange panel (0.6x0.8x0.2m), status indicator light
 
 **Acceptance Criteria:**
-- [ ] Multiple interactable objects in rooms
+- [ ] Multiple interactable objects in lobby and corridor
 - [ ] Objects highlight when player approaches
 - [ ] E key triggers interaction
-- [ ] Console logs interaction data
+- [ ] Bulletin board displays a static station notice
 
 **Estimated Time:** 3 hours
 
 ---
 
-#### Task 2.3: First Quest - "Repair Air Filter"
+#### Task 2.3: Station Mini-Map
 
-**Quest Flow:**
+**Purpose:** Give players spatial awareness of the StarStation layout — which rooms are public, which are private capsules, and where they currently are.
+
+**Mini-Map Design:**
 ```
-1. Player wakes in Dormitory
-2. Quest UI appears: "Air purification system malfunction - replace filter"
-3. Navigate to Corridor storage crate
-4. Press E to pickup "Air Filter" item
-5. Navigate to Cargo Bay repair panel
-6. Press E to install filter
-7. Quest complete: "Credits +50, Private Capsule Room Unlocked"
+┌─────────────────────┐
+│  StarStation Map    │
+│  ┌─────┐            │
+│  │ Cap │            │
+│  └──┬──┘            │
+│  ┌──┴───────────┐   │
+│  │  Lobby  [★] │   │
+│  └──┬───────────┘   │
+│     │  Promenade    │
+│  ┌──┴──┐            │
+│  │ Cap │            │
+│  └─────┘            │
+│  [you are here ●]   │
+└─────────────────────┘
 ```
 
-**Quest System Design:**
-- Quest data structure (title, description, objectives, rewards)
-- Inventory system (simple array of items)
-- Quest UI (fixed position, semi-transparent)
-- Objective tracking (checkboxes)
+**Features:**
+- Fixed overlay (top-right corner)
+- Highlight current room
+- Show room type icons (public 🌐 / private capsule 🔒)
+- Click a room to see its name and owner (Phase 1: static data)
 
-**Quest UI Components:**
-- Title (green text)
-- Description (white text)
-- Objectives list (○ incomplete, ✓ complete)
-- Auto-update on progress
-
-**Quest State Management:**
-- Current active quest
-- Objective completion tracking
-- Inventory management
-- Reward distribution
+**Technical Implementation:**
+- SVG or Canvas 2D overlay (no Three.js overhead)
+- Room registry object maps room IDs to map positions
+- Update highlighted room on room transition event
 
 **Acceptance Criteria:**
-- [ ] Quest UI displays on screen (top-right corner)
-- [ ] Player can complete full quest flow
-- [ ] Quest objectives update in real-time
-- [ ] Completion shows reward message
+- [ ] Mini-map visible in top-right corner
+- [ ] Current room highlighted on transition
+- [ ] Room names shown on hover
+- [ ] Public lobby clearly distinguishable from capsule rows
 
-**Estimated Time:** 5 hours
+**Estimated Time:** 3 hours
 
 ---
 
 #### Sprint 2 Summary
 
 **Deliverables:**
-- ✅ 3 interconnected rooms
-- ✅ Interactable object system
-- ✅ Complete first quest loop
+- ✅ StarStation lobby + capsule row rooms
+- ✅ Interactable objects (bulletin board, terminal, airlock panels)
+- ✅ Station mini-map overlay
 
-**Demo Milestone:** Record full quest completion video (wake to finish)
+**Demo Milestone:** Record walkthrough of lobby → corridor → capsule entrance with mini-map visible
 
 **Technical Validation:**
 - Room transitions: < 500ms
 - Object interaction: Responsive
-- Quest system: Stable, no bugs
+- Mini-map: Updates correctly on room change
 
 ---
 
@@ -473,7 +479,7 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 
 **Acceptance Criteria:**
 - [ ] Two peers share the same `chat` array in real time
-- [ ] Quest object state (picked up, repaired) is CRDT-synced
+- [ ] Capsule ownership state is CRDT-synced across peers
 - [ ] Reconnecting peer receives full room state without a server
 
 **Estimated Time:** 4 hours
@@ -529,9 +535,9 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 
 ---
 
-### 💬 Sprint 4: Social & Polish (Week 7-8)
+### 💬 Sprint 4: Chat, Lobby & Room Ownership (Week 7-8)
 
-**Goal:** Add chat system, onboarding, and experience polish.
+**Goal:** Add text chat, station onboarding, and the first version of room ownership — players can claim a capsule and others can see it as theirs.
 
 #### Task 4.1: Text Chat System
 
@@ -542,7 +548,7 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 ├─────────────────────────────────┤
 │ Player1: Hello!                  │
 │ Player2: Hi there                │
-│ [You]: How do I complete quest?  │
+│ [You]: Which capsule did you get?│
 │ ...                              │
 ├─────────────────────────────────┤
 │ [Type message...] [Send] [Tab]  │
@@ -581,15 +587,15 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 
 ---
 
-#### Task 4.2: Clone Onboarding Sequence
+#### Task 4.2: Station Onboarding Sequence
 
 **Onboarding Flow:**
 ```
-1. Black screen fade-in, text: "Furlong Station - Clone Facility"
-2. Player wakes in clone pod
-3. AI voice: "Welcome, citizen. You are clone #[ID]. Proceed to orientation."
-4. Arrow guides player to door
-5. Enter corridor to begin first quest
+1. Black screen fade-in, text: "Furlong Station"
+2. Player spawns in the StarStation Lobby
+3. Brief welcome overlay: "You've arrived at Furlong Station. Explore, chat, and find your capsule."
+4. Arrow nudges player toward the Promenade
+5. Dismiss overlay to begin exploring freely
 ```
 
 **Onboarding Components:**
@@ -599,7 +605,7 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 - Fade out transition
 
 **Narrative Elements:**
-- Clone ID assignment (random 4-digit number)
+- Player name/handle assignment
 - Station name and sector display
 - Welcome message
 - Atmospheric text styling
@@ -616,11 +622,43 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 - [ ] Transitions are smooth
 - [ ] Player can skip (optional)
 
-**Estimated Time:** 3 hours
+**Estimated Time:** 2 hours
 
 ---
 
-#### Task 4.3: Experience Polish
+#### Task 4.3: Room Ownership — Capsule Claiming
+
+**Purpose:** Players can claim one of the capsule rooms off the lobby as their own. Other players see who owns each capsule. This is the foundation for the full ownership and editing system in Phase 2.
+
+**Ownership Model (Phase 1 — local/CRDT only):**
+- Each capsule slot has an `owner` field in the Yjs `objects` map
+- A player can claim an unclaimed capsule by pressing E at its door panel
+- Owner's name displayed above the capsule door
+- Owner can enter their capsule; others see a "Private — [Owner]" prompt
+
+**Yjs Data Structure:**
+```typescript
+// Capsule slot in the station objects map
+capsules: Y.Map<CapsuleState>
+// CapsuleState { id, owner: string | null, label: string }
+```
+
+**UI:**
+- Door panel shows: `[Unclaimed — Press E to claim]` or `[Owned by: PlayerName]`
+- Owned capsule interior is a basic empty room (full editing deferred to Phase 2)
+- Mini-map icons update to show claimed vs unclaimed capsules
+
+**Acceptance Criteria:**
+- [ ] Player can claim an unclaimed capsule
+- [ ] Claimed capsule shows owner name above door
+- [ ] Capsule ownership persists in Yjs CRDT across reconnects
+- [ ] Other players see the correct owner in real time
+
+**Estimated Time:** 4 hours
+
+---
+
+#### Task 4.4: Experience Polish
 
 **Polish Items:**
 
@@ -638,8 +676,8 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 
 3. **Visual Effects**
    - Shadow improvements (if performance allows)
-   - Particle effects for quest completion (optional)
    - UI animations (fade in/out)
+   - Capsule ownership highlight on door panel
 
 4. **Performance Optimization**
    - Profile and identify bottlenecks
@@ -672,11 +710,12 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 #### Sprint 4 Summary
 
 **Deliverables:**
-- ✅ Complete chat system
-- ✅ Onboarding animation
+- ✅ Complete chat system (global + proximity)
+- ✅ Station onboarding sequence
+- ✅ Capsule room ownership (claim, display owner, persist via Yjs)
 - ✅ Audio and polish
 
-**Final Demo:** Invite 10+ external playtesters
+**Final Demo:** Live demo showing: players arrive in public lobby, chat, navigate the station, and each claims a capsule room visible to others
 
 **Technical Validation:**
 - All systems integrated and working
@@ -916,25 +955,28 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 
 - [ ] **3D Rendering:** Smoothly render station rooms
 - [ ] **Movement System:** WASD controls + collision detection
-- [ ] **Multi-Room:** At least 3 interconnected rooms
-- [ ] **Quest System:** Complete "Repair Filter" quest
+- [ ] **Multi-Room:** StarStation lobby, promenade, and capsule row rooms
+- [ ] **Station Map:** Mini-map overlay shows current room and room types
 - [ ] **Multiplayer:** 2-4 players can see each other
 - [ ] **Chat System:** Global and proximity chat working
-- [ ] **Onboarding:** Clone opening animation
+- [ ] **Room Ownership:** Players can claim capsule rooms; ownership visible to all
+- [ ] **Onboarding:** Lobby entry welcome sequence
 
 ### Usability Metrics
 
 - [ ] **External Testing:** 10+ external playtesters successfully enter game
 - [ ] **Session Length:** Average playtime > 15 minutes
-- [ ] **Quest Completion:** > 80% of players complete first quest
+- [ ] **Social Engagement:** > 50% of players use chat during their session
 - [ ] **Crash Rate:** < 5% of players encounter critical bugs
 
 ### Feedback Collection
 
 - [ ] **Survey:** Collect at least 10 valid feedback responses
 - [ ] **Key Questions:**
-  - "Is the core gameplay fun?"
+  - "Is navigating the station fun and intuitive?"
   - "How was the multiplayer social experience?"
+  - "Did you use chat? Was it easy to find?"
+  - "Would you want to personalise your capsule room?"
   - "What technical issues did you encounter?"
   - "Would you continue playing?"
 
@@ -955,9 +997,9 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 - **Showcase:** WASD movement, FPS counter, collision
 
 ### Sprint 2 Demo
-- **What:** Complete quest playthrough
+- **What:** Station layout walkthrough with mini-map
 - **Format:** 2-minute video walkthrough
-- **Showcase:** Room navigation, interactions, quest completion
+- **Showcase:** Lobby → promenade → capsule entrance, interactable objects, mini-map
 
 ### Sprint 3 Demo
 - **What:** 2-player simultaneous gameplay
@@ -965,9 +1007,9 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 - **Showcase:** Player synchronization, movement, latency
 
 ### Sprint 4 Demo (Final)
-- **What:** Full experience with 4+ players
+- **What:** Full social experience — lobby, chat, capsule claiming
 - **Format:** Live playtest session with external users
-- **Showcase:** All features integrated, polished experience
+- **Showcase:** Public lobby demo, players chatting, each player claiming a capsule room
 
 ---
 
