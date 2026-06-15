@@ -11,6 +11,7 @@
 
 - [ ] **Solar System Map** — 2.5D top-down system map showing the star, planets, asteroid belts, and player locations
 - [ ] **Map Navigation** — Players can travel between locations (station orbit, asteroid fields, planet approaches)
+- [ ] **Station Placement** — Stations can occupy circular/elliptical orbits, Lagrange points (L1–L5), or free-floating positions; placement stored in CRDT
 - [ ] **Minable Resources** — Asteroid fields contain node clusters; players can interact with nodes to collect raw materials
 - [ ] **Room Editing** — Capsule owners can place, move, and remove objects in their own capsule room
 - [ ] **Snap-On Modules** — Modular components that attach to capsule rooms or station sections to transform or extend them
@@ -69,7 +70,98 @@
 
 ---
 
-## 🔩 Feature 3: Snap-On Module System
+## 🛰️ Feature 3: Space Station Placement & Orbital Mechanics
+
+### Station Placement Options
+
+Stations can occupy one of three placement categories, each with its own data model and visual behaviour on the solar system map:
+
+| Placement Type | Description | Examples |
+|----------------|-------------|---------|
+| **Circular / Elliptical Orbit** | Station locked to a Keplerian orbit around a body | Low planet orbit, asteroid-belt ring |
+| **Lagrange Point** | Gravitationally stable co-orbital position relative to two bodies | L4/L5 of a planet–star pair (stable), L1/L2 (unstable — periodic station-keeping required) |
+| **Free-Floating** | Not bound to any body; drifts on a manually set trajectory or is anchored at an interstellar waypoint | Deep-space outpost, cross-system relay |
+
+### Lagrange Points
+
+Lagrange points are calculated from the two parent bodies (primary + secondary) at well-known ratios of the orbital radius:
+
+```
+L1 — Between primary and secondary (unstable)
+L2 — Behind secondary (unstable)
+L3 — Opposite secondary across the primary (unstable)
+L4 — 60° ahead of secondary in its orbit (stable ✅ recommended for player stations)
+L5 — 60° behind secondary in its orbit (stable ✅ recommended for player stations)
+```
+
+On the 2D map canvas, L4/L5 positions are derived at runtime from the parent planet's current angle so no additional position data needs to be stored — only the point label and the parent body IDs.
+
+### Orbital Data Schema
+
+All station placements are stored in the solar system's top-level `Y.Map<StationOrbit>` (key = station ID):
+
+```typescript
+type OrbitType = 'circular' | 'elliptical' | 'lagrange' | 'free-floating';
+
+interface StationOrbit {
+  stationId:     string;       // matches capsule / station entity ID
+  orbitType:     OrbitType;
+
+  // Keplerian orbit (circular or elliptical)
+  parentBodyId?: string;       // star or planet ID
+  semiMajorAxis?: number;      // AU or arbitrary map units
+  eccentricity?:  number;      // 0 = circular, 0–1 = elliptical
+  inclination?:   number;      // degrees from ecliptic (2D map: always 0)
+  anomaly?:       number;      // current true anomaly (radians); updated each tick
+
+  // Lagrange point
+  lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
+  primaryBodyId?: string;      // e.g. the star
+  secondaryBodyId?: string;    // e.g. the planet
+
+  // Free-floating
+  position?:     { x: number; y: number }; // fixed map coordinates
+  velocity?:     { dx: number; dy: number }; // optional drift vector per tick
+}
+```
+
+Only the relevant fields for the chosen `orbitType` are populated. The map renderer reads `StationOrbit` to compute the station's canvas position each frame.
+
+### Station-Keeping & Stability
+
+- **Stable Lagrange (L4/L5):** No periodic correction needed; position is computed from the parent planet's angle.
+- **Unstable Lagrange (L1/L2/L3):** Station slowly drifts — players must occasionally activate a "station-keeping burn" (consumes fuel from a docked fuel-tank module). Drift accumulates in the CRDT `anomaly` field.
+- **Free-floating:** Station holds its `position` until a player triggers a course correction or docking event.
+
+### CRDT Sync
+
+```typescript
+// Solar-system-level Yjs doc (shared across all peers in a system)
+const solarDoc = new Y.Doc();
+const stationOrbits = solarDoc.getMap<StationOrbit>('stationOrbits');
+
+// Place a station at L4 of the first planet
+stationOrbits.set('furlong-station', {
+  stationId: 'furlong-station',
+  orbitType: 'lagrange',
+  lagrangePoint: 'L4',
+  primaryBodyId: 'sol',
+  secondaryBodyId: 'planet-1',
+});
+
+// Move a free-floating outpost
+stationOrbits.set('deep-relay', {
+  stationId: 'deep-relay',
+  orbitType: 'free-floating',
+  position: { x: 420, y: -310 },
+});
+```
+
+Because `stationOrbits` is a CRDT `Y.Map`, concurrent placement updates (two players repositioning the same station simultaneously) resolve deterministically without a server.
+
+---
+
+## 🔩 Feature 4: Snap-On Module System
 
 ### Design Principle
 
@@ -116,7 +208,7 @@ function deriveRoomType(modules: Map<string, ModuleState>): RoomType { ... }
 
 ---
 
-## 🏠 Feature 4: Room Editing
+## 🏠 Feature 5: Room Editing
 
 Building on the capsule ownership established in Phase 1, owners can now rearrange furniture and place objects:
 
@@ -131,6 +223,7 @@ Building on the capsule ownership established in Phase 1, owners can now rearran
 ## 📊 Performance Targets
 
 - Solar system map render: < 5ms per frame (2D canvas, no WebGL)
+- Lagrange point position computation (per-frame, per-station): < 0.1ms
 - Asteroid field (50 nodes): stable 60fps in Three.js
 - Module snap animation: < 200ms
 - Room edit latency (local → peer): < 100ms
@@ -141,6 +234,8 @@ Building on the capsule ownership established in Phase 1, owners can now rearran
 
 - [ ] Solar system map renders with star, planets, asteroid belts, and station position
 - [ ] Players can travel between zones; room context switches correctly
+- [ ] Stations can be placed in orbits, at Lagrange points, or free-floating; placement persists in `stationOrbits` CRDT map
+- [ ] L4/L5 station positions update correctly as parent planet orbits; unstable Lagrange drift accumulates without station-keeping
 - [ ] Asteroid nodes deplete on extraction and are CRDT-synced across peers
 - [ ] Capsule room owner can place and remove snap-on modules
 - [ ] Attaching rocket engine + fuel tank + flight deck flags capsule as spaceship
