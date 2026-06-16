@@ -4,7 +4,7 @@
  */
 
 import './style.css';
-import { initRenderer } from './renderer';
+import { initRenderer, startCameraZoomIn, startFinalZoom, updateCameraAnimation } from './renderer';
 import { World } from './world';
 import { InputManager } from './input';
 
@@ -14,6 +14,10 @@ let inputManager: InputManager;
 let lastTime = performance.now();
 let frameCount = 0;
 let fpsUpdateTime = 0;
+let hasZoomedIn = false;
+let hasExpanded = false;
+let welcomeShown = false;
+let controlsHintShown = false;
 
 /**
  * Initialize the game
@@ -22,7 +26,7 @@ async function init() {
   console.log('🚀 StarStation Furlong - Initializing...');
   
   // Initialize renderer
-  const { renderer, camera, scene } = initRenderer();
+  const { scene } = initRenderer();
   
   // Create world
   world = new World(scene);
@@ -30,10 +34,67 @@ async function init() {
   // Initialize input manager
   inputManager = new InputManager();
   
+  // Setup click-to-zoom interaction
+  setupClickToZoom();
+  
   console.log('✅ Initialization complete');
+  console.log('👆 Click to Enter');
   
   // Start game loop
   animate();
+}
+
+/**
+ * Setup click-to-zoom interaction
+ */
+function setupClickToZoom() {
+  const handleClick = () => {
+    // First click: Zoom into the station planet
+    if (!hasZoomedIn) {
+      hasZoomedIn = true;
+      const { camera } = window.gameRenderer;
+      
+      // Start camera zoom animation only
+      startCameraZoomIn(camera);
+      
+      // Hide welcome message
+      const welcome = document.getElementById('welcome');
+      if (welcome) {
+        welcome.style.opacity = '0';
+        setTimeout(() => {
+          welcome.style.display = 'none';
+        }, 500);
+      }
+      
+      return;
+    }
+    
+    // Second click: Expand platform
+    if (!hasExpanded) {
+      hasExpanded = true;
+      const { camera } = window.gameRenderer;
+      
+      // Start final zoom to gameplay view
+      startFinalZoom(camera);
+      
+      // Start planet-to-platform morph
+      world.startMorph();
+      
+      // Hide expand hint
+      const welcome = document.getElementById('welcome');
+      if (welcome) {
+        welcome.style.opacity = '0';
+        setTimeout(() => {
+          welcome.style.display = 'none';
+        }, 500);
+      }
+      
+      // Remove click handler after expansion
+      window.removeEventListener('click', handleClick);
+    }
+  };
+  
+  window.addEventListener('click', handleClick);
 }
 
 /**
@@ -56,14 +117,52 @@ function animate() {
     fpsUpdateTime = 0;
   }
   
+  // Get renderer state
+  const { renderer, camera, scene } = window.gameRenderer;
+  
+  // Update camera animation if active
+  const isCameraAnimating = updateCameraAnimation(camera, deltaTime);
+  
   // Update game systems
   if (world) {
     world.update(deltaTime, inputManager);
   }
+
+  if (hasZoomedIn && !hasExpanded && !isCameraAnimating && !welcomeShown) {
+    showWelcomeOverlay();
+    welcomeShown = true;
+  }
+
+  if (hasExpanded && !controlsHintShown && world.isPlayerActive()) {
+    const controls = document.getElementById('controls');
+    if (controls) {
+      controls.style.animation = 'pulse 1s ease-in-out 3';
+    }
+    controlsHintShown = true;
+  }
   
   // Render
-  const { renderer, camera, scene } = window.gameRenderer;
   renderer.render(scene, camera);
+}
+
+function showWelcomeOverlay() {
+  const welcome = document.getElementById('welcome');
+  if (!welcome) {
+    return;
+  }
+
+  welcome.innerHTML = `
+    <div id="welcome-content">
+      <div class="hint" style="font-size: 18px; animation: pulse 2s ease-in-out infinite;">
+        ✨ Welcome
+      </div>
+    </div>
+  `;
+  welcome.style.background = 'rgba(10, 15, 25, 0.2)';
+  welcome.style.backdropFilter = 'blur(3px)';
+  welcome.style.display = 'flex';
+  welcome.style.opacity = '1';
+  welcome.style.cursor = 'pointer';
 }
 
 /**

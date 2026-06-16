@@ -80,7 +80,9 @@ By end of Phase 1, we must deliver:
 
 **Goal:** Establish development environment, implement single-player basic rendering and movement.
 
-#### Task 1.1: Project Initialization
+#### Task 1.1: Project Initialization — ✅ COMPLETED (2026-06-15)
+
+> **Completion notes:** Vite + Three.js prototype running at `prototypes/01-core-loop-demo/`. Dev server verified, HMR working, production build passing (`npm run build` clean). Visual prototype includes orthographic camera, Mars-textured station planet with cinematic intro flow, WASD player movement, FPS/position debug HUD, and NASA galaxy background. `src-tauri` scaffold deferred to Sprint 2 (browser-only prototype sufficient for Sprint 1 validation).
 
 **Deliverables:**
 - Vite project setup with Three.js
@@ -112,9 +114,9 @@ prototypes/01-core-loop-demo/
 ```
 
 **Acceptance Criteria:**
-- [ ] `npm run dev` starts successfully
-- [ ] Browser opens to `http://localhost:5173` with default page
-- [ ] Code changes trigger auto-refresh
+- [x] `npm run dev` starts successfully
+- [x] Browser opens to `http://localhost:5173` with default page
+- [x] Code changes trigger auto-refresh
 
 **Estimated Time:** 30 minutes
 
@@ -140,9 +142,9 @@ prototypes/01-core-loop-demo/
 - **Position:** (5, 10, 5) for natural shadows
 
 **Acceptance Criteria:**
-- [ ] Browser displays black background 3D scene
-- [ ] Window resize maintains proper aspect ratio
-- [ ] No console errors
+- [x] Browser displays black background 3D scene
+- [x] Window resize maintains proper aspect ratio
+- [x] No console errors
 
 **Estimated Time:** 2 hours
 
@@ -168,9 +170,9 @@ prototypes/01-core-loop-demo/
 - Enable shadow casting/receiving
 
 **Acceptance Criteria:**
-- [ ] Display 10x10m room with floor and walls
-- [ ] Grid lines visible for spatial awareness
-- [ ] Natural lighting effects
+- [x] Display 10x10m room with floor and walls
+- [x] Grid lines visible for spatial awareness
+- [x] Natural lighting effects
 
 **Estimated Time:** 3 hours
 
@@ -205,10 +207,10 @@ prototypes/01-core-loop-demo/
 - Position: Top-left corner, semi-transparent background
 
 **Acceptance Criteria:**
-- [ ] WASD controls work smoothly
-- [ ] Player doesn't pass through walls
-- [ ] FPS counter displays in top-left
-- [ ] Stable 60fps on mid-range hardware
+- [x] WASD controls work smoothly
+- [x] Player doesn't pass through walls
+- [x] FPS counter displays in top-left
+- [x] Stable 60fps on mid-range hardware
 
 **Estimated Time:** 4 hours
 
