@@ -114,15 +114,15 @@ prototypes/01-core-loop-demo/
 ```
 
 **Acceptance Criteria:**
-- [x] `npm run dev` starts successfully
-- [x] Browser opens to `http://localhost:5173` with default page
-- [x] Code changes trigger auto-refresh
+- ✅ `npm run dev` starts successfully
+- ✅ Browser opens to `http://localhost:5173` with default page
+- ✅ Code changes trigger auto-refresh
 
 **Estimated Time:** 30 minutes
 
 ---
 
-#### Task 1.2: Basic Three.js Scene
+#### Task 1.2: Basic Three.js Scene — ✅ COMPLETED (2026-06-15)
 
 **Technical Design:**
 - Set up orthographic camera for 2.5D isometric view
@@ -142,15 +142,15 @@ prototypes/01-core-loop-demo/
 - **Position:** (5, 10, 5) for natural shadows
 
 **Acceptance Criteria:**
-- [x] Browser displays black background 3D scene
-- [x] Window resize maintains proper aspect ratio
-- [x] No console errors
+- ✅ Browser displays black background 3D scene
+- ✅ Window resize maintains proper aspect ratio
+- ✅ No console errors
 
 **Estimated Time:** 2 hours
 
 ---
 
-#### Task 1.3: Create Station Room
+#### Task 1.3: Create Station Room — 🔄 IN PROGRESS
 
 **Room Specifications:**
 - **Size:** 10x10 meters (adjustable per room type)
@@ -170,15 +170,15 @@ prototypes/01-core-loop-demo/
 - Enable shadow casting/receiving
 
 **Acceptance Criteria:**
-- [x] Display 10x10m room with floor and walls
-- [x] Grid lines visible for spatial awareness
-- [x] Natural lighting effects
+- [ ] Display 10x10m room with floor and walls
+- [ ] Grid lines visible for spatial awareness
+- [ ] Natural lighting effects
 
 **Estimated Time:** 3 hours
 
 ---
 
-#### Task 1.4: Player Entity and Movement Control
+#### Task 1.4: Player Entity and Movement Control — 🔄 IN PROGRESS
 
 **Player Representation:**
 - **Model:** Simple capsule geometry (0.3m radius, 1.0m height)
@@ -207,10 +207,10 @@ prototypes/01-core-loop-demo/
 - Position: Top-left corner, semi-transparent background
 
 **Acceptance Criteria:**
-- [x] WASD controls work smoothly
-- [x] Player doesn't pass through walls
-- [x] FPS counter displays in top-left
-- [x] Stable 60fps on mid-range hardware
+- [ ] WASD controls work smoothly
+- [ ] Player doesn't pass through walls
+- [ ] FPS counter displays in top-left
+- [ ] Stable 60fps on mid-range hardware
 
 **Estimated Time:** 4 hours
 
@@ -220,9 +220,9 @@ prototypes/01-core-loop-demo/
 
 **Deliverables:**
 - ✅ Complete development environment
-- ✅ Moveable 3D player character
+- 🔄 Moveable 3D player character
 - ✅ One complete station room
-- ✅ Basic game loop
+- 🔄 Basic game loop
 
 **Demo Milestone:** Record 30-second video showing player movement in room
 
