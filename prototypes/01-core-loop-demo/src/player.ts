@@ -11,9 +11,6 @@ export class Player {
   public mesh: THREE.Group;
   private planet: THREE.Mesh;
   private glow: THREE.Mesh;
-  private velocity = new THREE.Vector3();
-  private readonly moveSpeed = 3.0; // meters per second
-  private readonly roomBounds = 5.5; // Keep 0.5m buffer from 12m platform edges
   private time = 0; // Elapsed time for animations (seconds)
   
   constructor(scene: THREE.Scene) {
@@ -24,7 +21,7 @@ export class Player {
     const textureLoader = new THREE.TextureLoader();
     
     // Create the main planet sphere (Mars-style)
-    const planetGeometry = new THREE.SphereGeometry(0.6, 64, 64);
+    const planetGeometry = new THREE.SphereGeometry(0.9, 64, 64);
     
     // Create planet material (Mars colors)
     const planetMaterial = new THREE.MeshStandardMaterial({ 
@@ -51,13 +48,12 @@ export class Player {
     );
     
     this.planet = new THREE.Mesh(planetGeometry, planetMaterial);
-    this.planet.castShadow = true;
     
     // Add surface details with a simple shader-like effect
     this.addPlanetDetails();
     
     // Create outer glow effect (Mars-like atmosphere)
-    const glowGeometry = new THREE.SphereGeometry(0.7, 32, 32);
+    const glowGeometry = new THREE.SphereGeometry(1.05, 32, 32);
     const glowMaterial = new THREE.MeshBasicMaterial({
       color: 0xff6644,
       transparent: true,
@@ -87,7 +83,7 @@ export class Player {
     this.mesh.add(ring);
     this.mesh.add(planetLight);
     
-    this.mesh.position.set(0, 1.0, 0); // Hover higher above ground
+    this.mesh.position.set(0, 7.5, 0); // Float above the room walls
     
     scene.add(this.mesh);
     
@@ -114,7 +110,7 @@ export class Player {
       // Random position on sphere surface
       const phi = Math.random() * Math.PI * 2;
       const theta = Math.random() * Math.PI;
-      const radius = 0.38;
+      const radius = 0.58;
       
       detail.position.set(
         radius * Math.sin(theta) * Math.cos(phi),
@@ -129,47 +125,22 @@ export class Player {
   /**
    * Update player state each frame
    */
-  update(deltaTime: number, inputManager: InputManager) {
+  update(deltaTime: number, _inputManager: InputManager) {
     this.time += deltaTime;
 
-    // Rotate planet for animation
-    this.planet.rotation.y += deltaTime * 0.5; // Slow rotation
-    this.glow.rotation.y -= deltaTime * 0.3; // Counter-rotate glow
-    
-    // Gentle floating animation (use accumulated time, consistent with rest of codebase)
-    this.mesh.position.y = 1.0 + Math.sin(this.time * 2) * 0.08;
-    
-    // Get input direction
-    const moveDir = inputManager.getMoveDirection();
-    
-    // Calculate velocity
-    this.velocity.set(moveDir.x, 0, moveDir.z);
-    
-    // Normalize diagonal movement to prevent speed boost
-    if (this.velocity.length() > 0) {
-      this.velocity.normalize();
-      this.velocity.multiplyScalar(this.moveSpeed * deltaTime);
-      
-      // Apply movement
-      this.mesh.position.x += this.velocity.x;
-      this.mesh.position.z += this.velocity.z;
-      
-      // Tilt planet in movement direction for dynamic feel
-      this.planet.rotation.z = -moveDir.x * 0.3;
-      this.planet.rotation.x = moveDir.z * 0.3;
-      
-      // Apply boundary constraints
-      this.mesh.position.x = Math.max(-this.roomBounds, Math.min(this.roomBounds, this.mesh.position.x));
-      this.mesh.position.z = Math.max(-this.roomBounds, Math.min(this.roomBounds, this.mesh.position.z));
-    } else {
-      // Return to neutral rotation when not moving
-      this.planet.rotation.z *= 0.9;
-      this.planet.rotation.x *= 0.9;
-    }
-    
-    // Update debug HUD with position
-    const pos = this.mesh.position;
-    updateDebugHUD('position', `${pos.x.toFixed(1)}, ${pos.z.toFixed(1)}`);
+    // Slow self-rotation — stays fixed in the sky
+    this.planet.rotation.y += deltaTime * 0.5;
+    this.glow.rotation.y   -= deltaTime * 0.3;
+
+    // Gentle floating bob, fixed position above the room
+    this.mesh.position.set(
+      0,
+      7.5 + Math.sin(this.time * 2) * 0.08,
+      0
+    );
+
+    // Update debug HUD with NPC position placeholder
+    updateDebugHUD('position', `sky`);
   }
   
   /**

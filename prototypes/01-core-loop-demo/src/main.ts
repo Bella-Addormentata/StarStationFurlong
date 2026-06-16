@@ -4,13 +4,15 @@
  */
 
 import './style.css';
-import { initRenderer, startCameraZoomIn, startFinalZoom, updateCameraAnimation } from './renderer';
-import { World } from './world';
-import { InputManager } from './input';
+import type { World } from './world';
+import type { InputManager } from './input';
+
+type RendererModule = typeof import('./renderer');
 
 // Game state
 let world: World;
 let inputManager: InputManager;
+let rendererApi: RendererModule | null = null;
 let lastTime = performance.now();
 let frameCount = 0;
 let fpsUpdateTime = 0;
@@ -24,15 +26,22 @@ let controlsHintShown = false;
  */
 async function init() {
   console.log('🚀 StarStation Furlong - Initializing...');
+
+  const [rendererModule, worldModule, inputModule] = await Promise.all([
+    import('./renderer'),
+    import('./world'),
+    import('./input'),
+  ]);
+  rendererApi = rendererModule;
   
   // Initialize renderer
-  const { scene } = initRenderer();
+  const { scene } = rendererModule.initRenderer();
   
   // Create world
-  world = new World(scene);
+  world = new worldModule.World(scene);
   
   // Initialize input manager
-  inputManager = new InputManager();
+  inputManager = new inputModule.InputManager();
   
   // Setup click-to-zoom interaction
   setupClickToZoom();
@@ -49,13 +58,17 @@ async function init() {
  */
 function setupClickToZoom() {
   const handleClick = () => {
+    if (!rendererApi) {
+      return;
+    }
+
     // First click: Zoom into the station planet
     if (!hasZoomedIn) {
       hasZoomedIn = true;
       const { camera } = window.gameRenderer;
       
       // Start camera zoom animation only
-      startCameraZoomIn(camera);
+      rendererApi.startCameraZoomIn(camera);
       
       // Hide welcome message
       const welcome = document.getElementById('welcome');
@@ -75,7 +88,7 @@ function setupClickToZoom() {
       const { camera } = window.gameRenderer;
       
       // Start final zoom to gameplay view
-      startFinalZoom(camera);
+      rendererApi.startFinalZoom(camera);
       
       // Start planet-to-platform morph
       world.startMorph();
@@ -102,6 +115,10 @@ function setupClickToZoom() {
  */
 function animate() {
   requestAnimationFrame(animate);
+
+  if (!rendererApi) {
+    return;
+  }
   
   const currentTime = performance.now();
   const deltaTime = (currentTime - lastTime) / 1000; // Convert to seconds
@@ -119,9 +136,12 @@ function animate() {
   
   // Get renderer state
   const { renderer, camera, scene } = window.gameRenderer;
-  
+
+  // Animate the nebula skysphere
+  rendererApi.updateNebulaBackground(currentTime / 1000);
+
   // Update camera animation if active
-  const isCameraAnimating = updateCameraAnimation(camera, deltaTime);
+  const isCameraAnimating = rendererApi.updateCameraAnimation(camera, deltaTime);
   
   // Update game systems
   if (world) {
@@ -154,7 +174,7 @@ function showWelcomeOverlay() {
   welcome.innerHTML = `
     <div id="welcome-content">
       <div class="hint" style="font-size: 18px; animation: pulse 2s ease-in-out infinite;">
-        ✨ Welcome
+        ✨ LOBBY
       </div>
     </div>
   `;

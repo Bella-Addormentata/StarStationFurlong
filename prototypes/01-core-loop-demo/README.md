@@ -6,8 +6,8 @@ It includes:
 - Vite + TypeScript project setup
 - Three.js rendering
 - A cinematic intro flow
-- A Mars-themed station planet and player planet
-- WASD movement on the platform after the station opens
+- A Mars-themed station planet, sky planet, and lobby scene
+- WASD-controlled NPC movement with collision and sit/stand behavior
 
 ## 1. Prerequisites
 
@@ -103,8 +103,9 @@ After the page loads:
 
 1. The station appears as a Mars-like planet suspended in space.
 2. Click `Click to Enter` to approach the station.
-3. Click `Welcome` to open the platform.
-4. Use `W`, `A`, `S`, `D` to move the player planet.
+3. Click the lobby overlay to open the platform view.
+4. Use `W`, `A`, `S`, `D` to move the NPC around the lounge.
+5. Stop near a sofa or chair for about 1.2 seconds to trigger the sit animation.
 
 ## 6. Build the Project
 
@@ -146,7 +147,8 @@ Key files and folders:
 │   ├── main.ts          # Entry point and intro flow
 │   ├── renderer.ts      # Three.js renderer, camera, lighting
 │   ├── world.ts         # Station planet, platform morph, world logic
-│   ├── player.ts        # Player planet and movement
+│   ├── player.ts        # Mars-like sky planet shown above the lobby
+│   ├── npc.ts           # NPC movement, collision, and sitting behavior
 │   ├── input.ts         # Keyboard input handling
 │   └── network/         # Placeholder networking files for later phases
 ├── index.html           # Main page shell and UI overlay
@@ -184,7 +186,7 @@ This demo currently covers the local rendering foundation for early Phase 1 work
 Included now:
 - Local rendering
 - Intro animation flow
-- Single-player movement
+- NPC movement, collision, and sit/stand interaction
 - HUD and visual prototype work
 
 Not included yet:
