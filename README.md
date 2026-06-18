@@ -26,6 +26,20 @@ opensource tech:
 * https://github.com/Tribler/tribler
 * https://worldofclaudecraft.com/
 
+## Quickstart: Try the Playable Demo
+
+The current playable prototype is the Phase 1 core loop demo.
+
+```bash
+cd prototypes/01-core-loop-demo
+npm install
+npm run dev
+```
+
+Full setup instructions: [prototypes/01-core-loop-demo/README.md](prototypes/01-core-loop-demo/README.md)
+
+---
+
 ## Repository Structure
 
 The project is structured according to game development industry standards to maintain a clean separation between design, technical architecture, and implementation:

@@ -80,7 +80,9 @@ By end of Phase 1, we must deliver:
 
 **Goal:** Establish development environment, implement single-player basic rendering and movement.
 
-#### Task 1.1: Project Initialization
+#### Task 1.1: Project Initialization — ✅ COMPLETED (2026-06-15)
+
+> **Completion notes:** Vite + Three.js prototype running at `prototypes/01-core-loop-demo/`. Dev server verified, HMR working, production build passing (`npm run build` clean). Visual prototype includes orthographic camera, Mars-textured station planet with cinematic intro flow, WASD player movement, FPS/position debug HUD, and NASA galaxy background. `src-tauri` scaffold deferred to Sprint 2 (browser-only prototype sufficient for Sprint 1 validation).
 
 **Deliverables:**
 - Vite project setup with Three.js
@@ -112,15 +114,15 @@ prototypes/01-core-loop-demo/
 ```
 
 **Acceptance Criteria:**
-- [ ] `npm run dev` starts successfully
-- [ ] Browser opens to `http://localhost:5173` with default page
-- [ ] Code changes trigger auto-refresh
+- ✅ `npm run dev` starts successfully
+- ✅ Browser opens to `http://localhost:5173` with default page
+- ✅ Code changes trigger auto-refresh
 
 **Estimated Time:** 30 minutes
 
 ---
 
-#### Task 1.2: Basic Three.js Scene
+#### Task 1.2: Basic Three.js Scene — ✅ COMPLETED (2026-06-15)
 
 **Technical Design:**
 - Set up orthographic camera for 2.5D isometric view
@@ -140,15 +142,15 @@ prototypes/01-core-loop-demo/
 - **Position:** (5, 10, 5) for natural shadows
 
 **Acceptance Criteria:**
-- [ ] Browser displays black background 3D scene
-- [ ] Window resize maintains proper aspect ratio
-- [ ] No console errors
+- ✅ Browser displays black background 3D scene
+- ✅ Window resize maintains proper aspect ratio
+- ✅ No console errors
 
 **Estimated Time:** 2 hours
 
 ---
 
-#### Task 1.3: Create Station Room
+#### Task 1.3: Create Station Room — 🔄 IN PROGRESS
 
 **Room Specifications:**
 - **Size:** 10x10 meters (adjustable per room type)
@@ -176,7 +178,7 @@ prototypes/01-core-loop-demo/
 
 ---
 
-#### Task 1.4: Player Entity and Movement Control
+#### Task 1.4: Player Entity and Movement Control — 🔄 IN PROGRESS
 
 **Player Representation:**
 - **Model:** Simple capsule geometry (0.3m radius, 1.0m height)
@@ -218,9 +220,9 @@ prototypes/01-core-loop-demo/
 
 **Deliverables:**
 - ✅ Complete development environment
-- ✅ Moveable 3D player character
+- 🔄 Moveable 3D player character
 - ✅ One complete station room
-- ✅ Basic game loop
+- 🔄 Basic game loop
 
 **Demo Milestone:** Record 30-second video showing player movement in room
 
