@@ -46,6 +46,18 @@ const OBSTACLES: Box[] = [
   { x0:  4.42, z0: -5.48, x1:  5.38, z1: -4.52 },
 ];
 
+// ── 8-way directional snap ───────────────────────────────────────────────────
+// Locks visual facing to the 8 cardinal/diagonal directions (every 45°).
+const SNAP_INCREMENT = Math.PI / 4;
+
+/**
+ * Snap a continuous angle to the nearest of 8 equally-spaced directions.
+ * θ_snapped = round(θ / (π/4)) × (π/4)
+ */
+function snapTo8Ways(angle: number): number {
+  return Math.round(angle / SNAP_INCREMENT) * SNAP_INCREMENT;
+}
+
 /**
  * Inflate each obstacle by NPC_R, then check if point (x,z) is inside.
  * Returns the push-out position (minimum-penetration axis).
@@ -153,9 +165,16 @@ export class NPC {
 
       const len = Math.sqrt(dir.x * dir.x + dir.z * dir.z);
       const nx = dir.x / len, nz = dir.z / len;
-      if (Math.abs(nx) > 0.06) this.facing = nx > 0 ? 1 : -1;
-      const adx = Math.abs(nx), adz = Math.abs(nz);
-      this.view = adz > adx * 1.2 ? (nz < 0 ? 'back' : 'front') : 'side';
+
+      // Snap movement angle to nearest 45° for visual facing.
+      // Actual position movement continues to use the raw nx/nz so movement
+      // stays fluid and responsive regardless of the snapped facing.
+      const snappedAngle = snapTo8Ways(Math.atan2(nx, nz));
+      const snappedNx = Math.sin(snappedAngle);
+      const snappedNz = Math.cos(snappedAngle);
+      if (Math.abs(snappedNx) > 0.06) this.facing = snappedNx > 0 ? 1 : -1;
+      const adx = Math.abs(snappedNx), adz = Math.abs(snappedNz);
+      this.view = adz > adx * 1.2 ? (snappedNz < 0 ? 'back' : 'front') : 'side';
 
       const candX = Math.max(-this.BOUND, Math.min(this.BOUND, pos.x + nx * this.SPEED * dt));
       const r1 = resolveObstacles(candX, pos.z);
