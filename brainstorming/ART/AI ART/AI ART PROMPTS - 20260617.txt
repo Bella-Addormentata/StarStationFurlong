@@ -1,0 +1,9 @@
+ Isometric 2D pixel art of a 6x6 square room inside a gritty, industrial space station. The camera angle is a fixed diagonal parallel projection. The color palette features industrial grays, olive drab, matte black, and high-visibility yellow-and-black hazard stripes. The back two walls are solid metal panels with exposed cabling and conduits, while the front two walls are cut away for visibility. Inside the room, there is a heavy 2x2 multi-tier steel bunk bed structure with lockers underneath. On the left wall, there is a physical, wall-mounted interactive bulletin board. On the right wall, there is a heavy modular hydraulic docking door with an illuminated control panel. The floor consists of heavy steel plating with visible rivet details and grated floor vents emitting faint ambient light. High-fidelity retro strategy game aesthetic.
+
+---
+
+now please try this: First-person view sitting close up at a retro-futuristic CRT computer terminal inside a dark, industrial space station. The background of the room is visible but blurred with a soft-focus depth of field. The main focus is the heavy CRT monitor screen glowing with a monochrome green pixelated interface. On the screen, there is a low-fidelity, highly pixelated video chat window of a person wearing a faded orange flight suit. The monitor is framed by physical, chunky mechanical keyboards, manual toggle switches, and a dial interface. Small digital HUD elements on the physical bezel display "SFUEL RES: 12.4L" and "SYS ALERT: FUEL LOW". The aesthetic is gritty, lived-in, and mechanical, reminiscent of 1990s sci-fi interfaces and classic PC strategy games.
+
+try again but make it pixelated and less 3d
+
+great, can you make it a little more cartoonish
