@@ -69,6 +69,10 @@ export class World {
     textureLoader.load(
       '/assets/mars.png',
       (texture) => {
+        // Nearest-neighbour keeps the texture crisp in the pixelated renderer.
+        texture.minFilter = THREE.NearestFilter;
+        texture.magFilter = THREE.NearestFilter;
+        texture.generateMipmaps = false;
         planetMaterial.map = texture;
         planetMaterial.needsUpdate = true;
         console.log('✅ Mars texture loaded');
@@ -194,6 +198,11 @@ export class World {
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
       tex.repeat.set(3.5, 3.5);
+      // Point (nearest-neighbour) sampling — preserves sharp pixel edges when
+      // the low-res framebuffer is scaled up by the pixelation pass.
+      tex.minFilter = THREE.NearestFilter;
+      tex.magFilter = THREE.NearestFilter;
+      tex.generateMipmaps = false;
       return tex;
     };
 
@@ -277,6 +286,10 @@ export class World {
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
       tex.repeat.set(12 / ((BW + MO) * 0.023), 4 / ((BH + MO) * 0.023));
+      // Nearest-neighbour — keeps brick edges sharp in the pixelated renderer.
+      tex.minFilter = THREE.NearestFilter;
+      tex.magFilter = THREE.NearestFilter;
+      tex.generateMipmaps = false;
       return tex;
     };
 
@@ -680,7 +693,12 @@ export class World {
         gr.addColorStop(1, 'rgba(0,0,0,0)');
         ctx.fillStyle = gr; ctx.fillRect(0, 0, 256, 192);
       }
-      return new THREE.CanvasTexture(cv);
+      const starTex = new THREE.CanvasTexture(cv);
+      // Nearest-neighbour keeps the tiny pixel stars crisply rendered.
+      starTex.minFilter = THREE.NearestFilter;
+      starTex.magFilter = THREE.NearestFilter;
+      starTex.generateMipmaps = false;
+      return starTex;
     };
 
     const winGeo = new THREE.PlaneGeometry(2.2, 1.65);

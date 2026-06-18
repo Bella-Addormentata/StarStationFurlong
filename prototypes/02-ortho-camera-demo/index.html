@@ -22,6 +22,16 @@
         height: 100vh;
         position: relative;
       }
+
+      /* Scale the low-res render buffer to fill the screen without blurring.
+         image-rendering: pixelated  — Chromium / Safari
+         image-rendering: crisp-edges — Firefox fallback                    */
+      #app canvas {
+        width: 100vw !important;
+        height: 100vh !important;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
       
       /* Subtle vignette to blend edges */
       #app::after {

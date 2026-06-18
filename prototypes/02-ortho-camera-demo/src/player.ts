@@ -36,6 +36,10 @@ export class Player {
     textureLoader.load(
       '/assets/mars.png',
       (texture) => {
+        // Nearest-neighbour keeps the texture crisp in the pixelated renderer.
+        texture.minFilter = THREE.NearestFilter;
+        texture.magFilter = THREE.NearestFilter;
+        texture.generateMipmaps = false;
         planetMaterial.map = texture;
         planetMaterial.needsUpdate = true;
         console.log('✅ Player Mars texture loaded');

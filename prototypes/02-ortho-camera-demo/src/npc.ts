@@ -116,6 +116,11 @@ export class NPC {
     this.cv.width = W; this.cv.height = H;
     this.cx = this.cv.getContext('2d')!;
     this.tex = new THREE.CanvasTexture(this.cv);
+    // Nearest-neighbour keeps the hand-drawn pixel sprite sharp when the
+    // low-res framebuffer is scaled up by the pixelation renderer.
+    this.tex.minFilter = THREE.NearestFilter;
+    this.tex.magFilter = THREE.NearestFilter;
+    this.tex.generateMipmaps = false;
     this.mesh = new THREE.Sprite(
       new THREE.SpriteMaterial({ map: this.tex, transparent: true, alphaTest: 0.04 })
     );

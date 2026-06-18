@@ -68,10 +68,19 @@ export function initRenderer() {
   camera.lookAt(0, 0, 0);
   camera.updateProjectionMatrix();
 
-  // Create WebGL renderer
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(window.devicePixelRatio);
+  // ── Pixelated retro renderer ──────────────────────────────────────────────
+  // Render the 3D world at a fixed low internal resolution (640×360) and let
+  // the browser scale the canvas up to fill the viewport using nearest-neighbor
+  // (pixelated) filtering.  antialias is disabled so geometry edges stay hard
+  // and chunky — matching the gritty 32-bit isometric aesthetic.
+  const RENDER_W = 640;
+  const RENDER_H = 360;
+
+  const renderer = new THREE.WebGLRenderer({ antialias: false });
+  // Pass `false` as the third argument so Three.js does NOT set the canvas CSS
+  // width/height — the CSS rule below stretches the small buffer to full-screen.
+  renderer.setSize(RENDER_W, RENDER_H, false);
+  renderer.setPixelRatio(1); // always 1:1 — no HiDPI upsampling
   renderer.shadowMap.enabled = false;
 
   container.appendChild(renderer.domElement);
@@ -82,7 +91,8 @@ export function initRenderer() {
   // Procedural warm-nebula background (skysphere + star field)
   buildNebulaBackground(scene);
 
-  // Handle window resize — update frustum bounds, not camera position
+  // Handle window resize — update frustum bounds only; render resolution stays
+  // locked at RENDER_W × RENDER_H so the pixelated look is preserved.
   window.addEventListener('resize', () => {
     const a = window.innerWidth / window.innerHeight;
     const nf = orthoFrustum(a);
@@ -91,7 +101,6 @@ export function initRenderer() {
     camera.top    = nf.top;
     camera.bottom = nf.bottom;
     camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
   // Store globally for access from main loop
