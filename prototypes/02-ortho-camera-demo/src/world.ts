@@ -311,12 +311,7 @@ export class World {
     this.platformGroup.add(leftWall);
     this.sideWalls.push(leftWall);
 
-    const rightWall = new THREE.Mesh(wallGeo.clone(), makeMat());
-    rightWall.position.set(6, wallY, 0);
-    this.platformGroup.add(rightWall);
-    this.sideWalls.push(rightWall);
-
-    // Subtle top-edge coping strip (cool pale stone)
+    // Subtle top-edge coping strip for left wall only
     const edgeGeo = new THREE.BoxGeometry(wallThick + 0.06, 0.10, wallDepth + 0.06);
     const edgeMat = new THREE.MeshStandardMaterial({
       color: 0xB8C8D8,
@@ -325,12 +320,10 @@ export class World {
       transparent: true,
       opacity: 0,
     });
-    [-6, 6].forEach(x => {
-      const strip = new THREE.Mesh(edgeGeo, edgeMat.clone());
-      strip.position.set(x, wallHeight + 0.05, 0);
-      this.platformGroup.add(strip);
-      this.platformElements.push(strip);
-    });
+    const strip = new THREE.Mesh(edgeGeo, edgeMat.clone());
+    strip.position.set(-6, wallHeight + 0.05, 0);
+    this.platformGroup.add(strip);
+    this.platformElements.push(strip);
   }
 
   /**
@@ -715,17 +708,7 @@ export class World {
       place(new THREE.BoxGeometry(0.06, 1.85, 2.42), m(0x8899AA, 0.48, 0.62), -5.84, 2.1, wz);
       addLight(new THREE.PointLight(0x3388FF, 0, 4.5), -5.5, 2.1, wz, 0.5);
 
-      // Right wall — warm amber tint (skip z=0.6 where bar stools are)
-      if (wz < 0) {
-        const winR = new THREE.Mesh(winGeo.clone(),
-          new THREE.MeshBasicMaterial({ map: makeStarTex('#140a02','#201204'),
-            transparent: true, opacity: 0, side: THREE.DoubleSide })
-        );
-        winR.rotation.y = -Math.PI / 2; winR.position.set(5.81, 2.1, wz);
-        this.platformGroup.add(winR); this.furnitureMeshes.push(winR);
-        place(new THREE.BoxGeometry(0.06, 1.85, 2.42), m(0x8A7A6A, 0.48, 0.62), 5.84, 2.1, wz);
-        addLight(new THREE.PointLight(0xFF8844, 0, 4.5), 5.5, 2.1, wz, 0.45);
-      }
+      // Right wall removed — no paintings or frames on that side
     });
 
     // ── COLORED THROW CUSHIONS ────────────────────────────────────────────────
@@ -742,9 +725,7 @@ export class World {
     const stripMat = (col: number) =>
       new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0 });
     place(new THREE.BoxGeometry(0.04, 0.06, 10.8), stripMat(0x2266CC), -5.76, 3.92, 0); // left  — blue
-    place(new THREE.BoxGeometry(0.04, 0.06, 10.8), stripMat(0xFF7722), +5.76, 3.92, 0); // right — amber
     addLight(new THREE.PointLight(0x1155BB, 0, 14), -5.5, 3.8,  0, 0.55);
-    addLight(new THREE.PointLight(0xFF6611, 0, 14), +5.5, 3.8,  0, 0.50);
 
     // ── FLOATING DUST MOTES ───────────────────────────────────────────────────
     const COUNT = 220;
@@ -842,11 +823,6 @@ export class World {
     this.platformElements.push(southEdge);
 
     const eastEdgeGeometry = new THREE.BoxGeometry(0.1, 0.05, 12);
-    const eastEdge = new THREE.Mesh(eastEdgeGeometry, edgeMaterial.clone());
-    eastEdge.position.set(6, 0.03, 0);
-    this.platformGroup.add(eastEdge);
-    this.platformElements.push(eastEdge);
-
     const westEdge = new THREE.Mesh(eastEdgeGeometry, edgeMaterial.clone());
     westEdge.position.set(-6, 0.03, 0);
     this.platformGroup.add(westEdge);

@@ -11,6 +11,8 @@ export class Player {
   public mesh: THREE.Group;
   private planet: THREE.Mesh;
   private glow: THREE.Mesh;
+  private ringOuter: THREE.Mesh | null = null;
+  private ringInner: THREE.Mesh | null = null;
   private time = 0; // Elapsed time for animations (seconds)
   
   constructor(scene: THREE.Scene) {
@@ -66,25 +68,31 @@ export class Player {
     });
     this.glow = new THREE.Mesh(glowGeometry, glowMaterial);
     
-    // Create atmosphere ring (station orbit ring)
-    const ringGeometry = new THREE.RingGeometry(0.75, 0.85, 32);
-    const ringMaterial = new THREE.MeshBasicMaterial({
-      color: 0x00aaff,
-      transparent: true,
-      opacity: 0.4,
-      side: THREE.DoubleSide
-    });
-    const ring = new THREE.Mesh(ringGeometry, ringMaterial);
-    ring.rotation.x = Math.PI / 2; // Make it horizontal
-    
+    // Outer orbital ring — tilted like a Saturn-style orbit
+    this.ringOuter = new THREE.Mesh(
+      new THREE.TorusGeometry(1.6, 0.10, 20, 80),
+      new THREE.MeshStandardMaterial({ color: 0xdd8844, roughness: 0.6, metalness: 0.3,
+        transparent: true, opacity: 0.85 })
+    );
+    this.ringOuter.rotation.x = Math.PI * 0.28;
+
+    // Inner orbital ring — opposite tilt
+    this.ringInner = new THREE.Mesh(
+      new THREE.TorusGeometry(1.2, 0.07, 20, 80),
+      new THREE.MeshStandardMaterial({ color: 0x4488ff, roughness: 0.5, metalness: 0.4,
+        transparent: true, opacity: 0.75 })
+    );
+    this.ringInner.rotation.x = -Math.PI * 0.18;
+
     // Add point light for planet glow (Mars-style)
     const planetLight = new THREE.PointLight(0xff6633, 0.3, 3);
     planetLight.position.set(0, 0, 0);
-    
+
     // Assemble the player
     this.mesh.add(this.planet);
     this.mesh.add(this.glow);
-    this.mesh.add(ring);
+    this.mesh.add(this.ringOuter);
+    this.mesh.add(this.ringInner);
     this.mesh.add(planetLight);
     
     this.mesh.position.set(0, 7.5, 0); // Float above the room walls
@@ -135,6 +143,8 @@ export class Player {
     // Slow self-rotation — stays fixed in the sky
     this.planet.rotation.y += deltaTime * 0.5;
     this.glow.rotation.y   -= deltaTime * 0.3;
+    if (this.ringOuter) this.ringOuter.rotation.z += deltaTime * 0.2;
+    if (this.ringInner) this.ringInner.rotation.z -= deltaTime * 0.3;
 
     // Gentle floating bob, fixed position above the room
     this.mesh.position.set(
