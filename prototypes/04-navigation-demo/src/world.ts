@@ -7,7 +7,6 @@
 import * as THREE from 'three';
 import { Player } from './player';
 import { InputManager } from './input';
-import { NPC } from './npc';
 
 export class World {
   private scene: THREE.Scene;
@@ -18,7 +17,6 @@ export class World {
   private platformGrid: THREE.GridHelper | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
-  private npc: NPC | null = null;
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -859,7 +857,6 @@ export class World {
       this.isMorphing = false;
       this.player.mesh.visible = true;
       this.platformGroup.position.set(0, 0, 0);
-      this.npc = new NPC(this.scene);
       console.log('✅ Morph complete - Platform active');
     }
 
@@ -942,8 +939,6 @@ export class World {
     if (this.player.mesh.visible) {
       this.player.update(deltaTime, inputManager);
     }
-
-    this.npc?.update(deltaTime, inputManager);
 
     // Float dust motes upward, reset at ceiling
     if (this.particlePositions && this.particleGeo) {

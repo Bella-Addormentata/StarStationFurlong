@@ -31,6 +31,24 @@ const STATES: Record<CharacterState, PoseState> = {
   sit_ground: { rootY: -0.2, legRotX: -Math.PI / 2,  armRotX: 0             },
 };
 
+type CharacterGender = 'male' | 'female';
+
+// Current request: blue translucent parts mean male.
+// Reserved: pink translucent parts mean female.
+const CHARACTER_GENDER: CharacterGender = 'male';
+const GENDER_THEME: Record<CharacterGender, { translucent: number; face: number; accent: number }> = {
+  male: {
+    translucent: 0x66c7ff,
+    face: 0x113356,
+    accent: 0x8bd9ff,
+  },
+  female: {
+    translucent: 0xff9ac5,
+    face: 0x6b1f46,
+    accent: 0xffb6d8,
+  },
+};
+
 export class VoxelCharacter {
   /** The logical root — attach physics / camera here. */
   public masterGroup: THREE.Group;
@@ -45,6 +63,14 @@ export class VoxelCharacter {
   private rightArm: THREE.Group;
   private leftLeg:  THREE.Group;
   private rightLeg: THREE.Group;
+
+  // ── Face voxels (generated as part of the robot head) ────────────────────
+  private leftEye: THREE.Mesh | null = null;
+  private rightEye: THREE.Mesh | null = null;
+  private mouthMid: THREE.Mesh | null = null;
+  private mouthLeft: THREE.Mesh | null = null;
+  private mouthRight: THREE.Mesh | null = null;
+  private smileAmount = 0;
 
   // ── State ──────────────────────────────────────────────────────────────────
   private currentState: CharacterState = 'idle';
@@ -103,19 +129,37 @@ export class VoxelCharacter {
    * joint (shoulder / hip) rather than spinning around its own centre.
    */
   private _buildLimbVoxels(): void {
+    const theme = GENDER_THEME[CHARACTER_GENDER];
+
     const bodyMat = new THREE.MeshStandardMaterial({
       color: 0xc86428,   // warm orange suit
       roughness: 0.8,
       metalness: 0.1,
     });
     const skinMat = new THREE.MeshStandardMaterial({
-      color: 0xf4c090,   // skin tone
-      roughness: 0.9,
-      metalness: 0.0,
+      color: theme.translucent,
+      emissive: theme.translucent,
+      emissiveIntensity: 0.12,
+      transparent: false,
+      opacity: 1.0,
+      roughness: 0.35,
+      metalness: 0.05,
     });
     const darkMat = new THREE.MeshStandardMaterial({
       color: 0x3a2010,   // dark boots / belt
       roughness: 0.9,
+      metalness: 0.0,
+    });
+    const faceMat = new THREE.MeshStandardMaterial({
+      color: theme.face,
+      emissive: theme.face,
+      emissiveIntensity: 0.35,
+      roughness: 0.6,
+      metalness: 0.1,
+    });
+    const blushMat = new THREE.MeshStandardMaterial({
+      color: theme.accent,
+      roughness: 0.8,
       metalness: 0.0,
     });
 
@@ -123,19 +167,48 @@ export class VoxelCharacter {
     const torsoGeo = new THREE.BoxGeometry(0.8, 0.9, 0.4);
     this.torso.add(new THREE.Mesh(torsoGeo, bodyMat));
 
-    // ── Head (offset upward so it sits above the neck joint) ─────────────────
-    const headGeo = new THREE.BoxGeometry(0.6, 0.6, 0.6);
-    headGeo.translate(0, 0.3, 0);
+    // ── Head (oval) — softer silhouette than the original cube ──────────────
+    const headGeo = new THREE.SphereGeometry(0.34, 20, 16);
+    headGeo.scale(1.0, 1.12, 0.9); // vertical oval
+    headGeo.translate(0, 0.31, 0);
     this.head.add(new THREE.Mesh(headGeo, skinMat));
 
-    // ── Arms — shift down so rotation pivots from shoulder ───────────────────
-    const armGeo = new THREE.BoxGeometry(0.3, 0.8, 0.3);
+    // Face voxels are part of the head geometry hierarchy (not a canvas overlay).
+    const eyeGeo = new THREE.BoxGeometry(0.09, 0.1, 0.03);
+    this.leftEye = new THREE.Mesh(eyeGeo, faceMat);
+    this.rightEye = new THREE.Mesh(eyeGeo, faceMat);
+    this.leftEye.position.set(-0.125, 0.45, 0.302);
+    this.rightEye.position.set(0.125, 0.45, 0.302);
+    this.head.add(this.leftEye);
+    this.head.add(this.rightEye);
+
+    const mouthGeo = new THREE.BoxGeometry(0.14, 0.035, 0.03);
+    const mouthCornerGeo = new THREE.BoxGeometry(0.05, 0.03, 0.03);
+    this.mouthMid = new THREE.Mesh(mouthGeo, faceMat);
+    this.mouthLeft = new THREE.Mesh(mouthCornerGeo, faceMat);
+    this.mouthRight = new THREE.Mesh(mouthCornerGeo, faceMat);
+    this.head.add(this.mouthMid);
+    this.head.add(this.mouthLeft);
+    this.head.add(this.mouthRight);
+
+    // Add tiny blush plates so the robot reads as friendlier.
+    const blushGeo = new THREE.BoxGeometry(0.07, 0.05, 0.02);
+    const blushL = new THREE.Mesh(blushGeo, blushMat);
+    const blushR = new THREE.Mesh(blushGeo, blushMat);
+    blushL.position.set(-0.215, 0.315, 0.298);
+    blushR.position.set(0.215, 0.315, 0.298);
+    this.head.add(blushL);
+    this.head.add(blushR);
+    this._updateFaceRig(0, 0);
+
+    // ── Arms (rounded) — shift down so rotation pivots from shoulder ───────
+    const armGeo = new THREE.CylinderGeometry(0.16, 0.16, 0.8, 12);
     armGeo.translate(0, -0.4, 0);   // hang below shoulder pivot
     this.leftArm.add(new THREE.Mesh(armGeo, bodyMat));
     this.rightArm.add(new THREE.Mesh(armGeo, bodyMat));
 
-    // ── Legs — shift down so rotation pivots from hip ────────────────────────
-    const legGeo = new THREE.BoxGeometry(0.4, 0.9, 0.4);
+    // ── Legs (rounded) — shift down so rotation pivots from hip ─────────────
+    const legGeo = new THREE.CylinderGeometry(0.2, 0.2, 0.9, 12);
     legGeo.translate(0, -0.45, 0);  // hang below hip pivot
     this.leftLeg.add(new THREE.Mesh(legGeo, bodyMat));
     this.rightLeg.add(new THREE.Mesh(legGeo, bodyMat));
@@ -205,6 +278,12 @@ export class VoxelCharacter {
       this.rightArm.rotation.x = THREE.MathUtils.lerp(this.rightArm.rotation.x, armTarget, lerpSpeed);
     }
 
+    // Face expression animation (blink + smile) built into voxel rig.
+    const blinkPulse = Math.pow(Math.max(0, Math.sin(time * 2.7)), 20);
+    const smileTarget = this.currentState === 'walk' ? 1.0 : 0.65;
+    this.smileAmount = THREE.MathUtils.lerp(this.smileAmount, smileTarget, 8 * delta);
+    this._updateFaceRig(blinkPulse, this.smileAmount);
+
     // ── 3. 8-way decoupled snapping ───────────────────────────────────────────
     // masterGroup tracks the exact continuous angle → correct for physics/camera
     this.masterGroup.rotation.y = this.logicalRotation;
@@ -216,5 +295,24 @@ export class VoxelCharacter {
     const PI_4         = Math.PI / 4;
     const snappedAngle = Math.round(this.logicalRotation / PI_4) * PI_4;
     this.visualGroup.rotation.y += snappedAngle;
+  }
+
+  private _updateFaceRig(blink: number, smile: number): void {
+    if (!this.leftEye || !this.rightEye || !this.mouthMid || !this.mouthLeft || !this.mouthRight) return;
+
+    const eyeScaleY = THREE.MathUtils.lerp(1.0, 0.12, blink);
+    this.leftEye.scale.y = eyeScaleY;
+    this.rightEye.scale.y = eyeScaleY;
+
+    // Keep the mouth as an upturned arc even at idle.
+    const mouthMidY = 0.236 + smile * 0.016;
+    const cornerRise = 0.022 + smile * 0.028;
+    this.mouthMid.position.set(0, mouthMidY, 0.302);
+    this.mouthMid.scale.x = 1.25 + smile * 0.55;
+
+    this.mouthLeft.position.set(-0.11, mouthMidY + cornerRise, 0.302);
+    this.mouthRight.position.set(0.11, mouthMidY + cornerRise, 0.302);
+    this.mouthLeft.rotation.z = 0.55 + smile * 0.35;
+    this.mouthRight.rotation.z = -(0.55 + smile * 0.35);
   }
 }
