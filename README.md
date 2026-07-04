@@ -46,6 +46,7 @@ Full setup instructions: [prototypes/01-core-loop-demo/README.md](prototypes/01-
 
 The project is structured according to game development industry standards to maintain a clean separation between design, technical architecture, and implementation:
 
+* **[`TODO.md`](TODO.md)**: The live work tracker — critical path, spike backlog, and a dated Done log.
 * **`docs/GDD/` (Game Design Document)**: Contains all high-level game design concepts, storylines, core gameplay loops, crafting systems, and economy balance.
 * **`docs/TDD/` (Technical Design Document)**: Contains system architecture, data structures, and technical specifications for how the game operates under the hood.
 * **`docs/API/`**: External code references, code links, and API standards.

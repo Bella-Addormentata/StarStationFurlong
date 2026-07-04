@@ -1,0 +1,79 @@
+# 📋 StarStationFurlong — TODO
+
+> **How to use this file:** work items live in the sections below, roughly in priority order. When something finishes, **move it to [✅ Done](#-done) with the date** — don't delete it. Deep context for every item lives in [STUDY-Architecture v006](brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) (§ references below) and the [Phase execution plans](docs/TDD/03-Implementation/README.md). Spike numbers = v006 §15.1; pitfall numbers (P‑x) = v006 §13.
+
+---
+
+## 🎯 Now — the critical path (in order)
+
+- [ ] **B‑1 · Five-crate build gate** — run [spikes/b1-five-crate-build](spikes/b1-five-crate-build/README.md) for desktop **and** `aarch64-linux-android`; fill in the results table; commit the generated `Cargo.lock`. **GO → everything below proceeds. NO‑GO → invoke the SsfLog-only path (v006 §5.4) and escalate to a v007 note.** *Gates the entire all-Rust node thesis.*
+- [ ] **Spike #2 · WebTransport certhash dial matrix** — Chrome/Firefox/Safari 26.4, desktop + mobile, IP-literal vs LAN (record the Chrome 142/147 LNA prompt), UDP 443 masquerade, IPv6 lane, `reload_config` cert rotation under live sessions. First real-world test of the primary transport.
+- [ ] **Spike #5 · yrs ⇄ Yjs conformance** — browser `y-protocols` vs node `yrs::sync`: sync steps, Awareness churn, subdocs, v1/v2 update formats, epoch snapshot/restore.
+- [ ] **Sprint 3 implementation** ([Phase 1 plan](docs/TDD/03-Implementation/Phase1-ExecutionPlan.md#-sprint-3-multiplayer-networking-week-5-6)) — the typed seams in [prototypes/01-core-loop-demo/src/network/](prototypes/01-core-loop-demo/src/network/protocol.ts) are ready to fill:
+  - [ ] Task 3.1 — `wt_listener.rs` in the Tauri node (self-signed ≤14-day ECDSA identity, hot rotation, session routing)
+  - [ ] Task 3.2 — browser certhash dial implementing `NetworkProviderPort` (datagram ticks, ping/pong stats, `TransportMode`)
+  - [ ] Task 3.3 — `YjsSync` with state-vector re-handshake, signed-envelope seam, awareness-as-presence-only
+  - [ ] Task 3.4 — interpolation, bandwidth budget, comms-weather HUD seed
+- [ ] **Trust & Safety design note** (spike #12, P‑15) — flows, room-class defaults, denylist governance, legal review. **Hard gate: RoomLog cannot leave stub / no UGC ships without it** (v006 §7).
+- [ ] **Spike #3 · RoomLog substrate bakeoff** — same chat/board workload on p2panda vs `SsfLog` (spec: v006 §12.3); 3 co-hosts + flapping phone; pruning behind a fake seal; Android SQLite behavior (P‑17). Decides the P‑2′ headline bet.
+
+## 🧪 Spike backlog (v006 §15.1 — after the critical path)
+
+- [ ] **#4 · Station Seals v2 mini-spec + prototype** — FROST t-of-n, equivocation/liveness/prune-then-need property tests, soft→anchored flow on testnet11 (Phase 3 protocol, de-risk earlier)
+- [ ] **#6 · iroh sovereignty gate** — self-hosted-relay-only drill (kill DNS / relay / DHT, record survival); iroh-WASM fallback-lane maturity vs the 1.0 JS bindings (P‑3, P‑4)
+- [ ] **#7 (B‑7) · chia-wallet-sdk WASM audit** — per-driver browser surface (Offers, Vaults/MIPS, Bulletin, XCHandles) vs the ~6-months-stale bindings (P‑19); go/no-go on browser light-verification (P‑9)
+- [ ] **#8 · Market floor prototype** — host-sequenced matched book + two-taker race on testnet11: one settles, one fails cleanly, UI shows stale/filled/cancelled (v006 §5.3)
+- [ ] **#9 · Station-in-a-Box trust decision** — test the four §5.2 lanes (native-first / baked DNS‑01 cert / local CA / IWA) with real phones; pick the playtest default
+- [ ] **#10 · Voice mesh pre-work** — 4-way WebRTC mesh brokered over the node pipe + `PannerNode` spatialization (v006 §9; Phase 2 pre-work)
+- [ ] **#11 · ECH relay spike** — self-hosted iroh-relay behind Encrypted Client Hello vs an SNI-filtering test network (v006 §11)
+
+## 🛠️ Phase 1 gameplay work (besides Sprint 3)
+
+- [ ] Sprint 1 · Task 1.3 — station room geometry (🔄 in progress)
+- [ ] Sprint 1 · Task 1.4 — player entity + WASD movement/collision (🔄 in progress)
+- [ ] Sprint 2 — multi-room system, interactable objects, station mini-map ([plan](docs/TDD/03-Implementation/Phase1-ExecutionPlan.md#-sprint-2-room-interaction--station-map-week-3-4))
+- [ ] Sprint 4 — chat UI (`ChatProvider`, session-capped demo), onboarding sequence, **host-sequenced** capsule claiming, polish/audio
+- [ ] [Issue #8](https://github.com/Bella-Addormentata/StarStationFurlong/issues/8) — character model demo
+- [ ] [Issue #10](https://github.com/Bella-Addormentata/StarStationFurlong/issues/10) — room navigation demo (A*/waypoint movement)
+- [ ] [Issue #12](https://github.com/Bella-Addormentata/StarStationFurlong/issues/12) — QR phone chat: capability skeleton early (challenge-bound QR, zxing-wasm decode), full UI later
+
+## 📐 Design artifacts owed
+
+- [ ] **Market engine spec** — price-time priority, TTLs, cancels, partial fills, whale/strategic-reserve rules (v006 §5.3/§12.4 is a sketch; Issue #1 economics)
+- [ ] **F-Droid + asset/dependency license audit** — before art/audio sprawl corners the sovereign-Android distribution (GPT‑5.5 v005 §4.11)
+- [ ] **Key-loss / social recovery UX** — FROST recovery-council flow tested with non-technical users; mandatory-export-before-sole-custody onboarding (v006 §10.3)
+- [ ] **Topic-secret re-key procedure** — epochal rotation implementation notes (v006 §7.4, P‑18)
+- [ ] **Malicious-host / anti-cheat note** — deterministic-replay adjudication from signed intents (v006 §10.3; Phase 3+)
+
+## 🔁 Recurring / process
+
+- [ ] **Hand off v006 + plans to the reviewer panel** for the implementation-readiness pass (impending)
+- [ ] **Re-verify [BrowserSupportMatrix.md](docs/TDD/BrowserSupportMatrix.md) before every networking sprint** and stamp the `Checked` column (P‑11 — the LNA row rotted in one day once already)
+- [ ] After B‑1: keep `Cargo.lock` committed; consider `cargo vendor` for F-Droid reproducibility (P‑2′)
+- [ ] Sprint retrospectives update the Phase plans (per [03-Implementation/README](docs/TDD/03-Implementation/README.md) workflow)
+
+## ⏳ Phase 2 horizon (gated — don't start early)
+
+- [ ] RoomLog minimal for boards/contracts — **gated on spike #3 + the T&S note** ([Phase 2 plan](docs/TDD/03-Implementation/Phase2-ExecutionPlan.md))
+- [ ] iroh backbone adoption — gated on B‑1 + spike #6
+- [ ] Proximity voice (mesh ≤6) — gated on spike #10
+- [ ] Solar-system map with derive-don't-tick orbital schema (already specified in the Phase 2 plan)
+- [ ] Chia custody path for modules/deeds (Issue #1 lineage; chia-wallet-sdk vaults)
+
+---
+
+## ✅ Done
+
+*Move finished items here with a date — newest first.*
+
+- **2026‑07‑04** — Root repo cleanup: README tech list split current-vs-superseded; [docs/API/01-CodeReferences.md](docs/API/01-CodeReferences.md) turned into the real dependency table; TDD implementation README repointed to v006; prototype 02 `simple-peer` purged; ROADMAP networking line updated.
+- **2026‑07‑04** — Code scaffolding: [protocol.ts](prototypes/01-core-loop-demo/src/network/protocol.ts) (v006 contracts as compile-checked TS + working 13-byte tick codec), typed `NetworkProvider`/`YjsSync`/`RoomLog` skeletons, [spike B‑1 project](spikes/b1-five-crate-build/README.md) scaffolded and runnable, `y-protocols`/`y-indexeddb` added, `simple-peer` removed from prototype 01.
+- **2026‑07‑04** — Handoff pass on the execution plans: B‑1 + renumbered spikes in Sprint‑3 pre-work, [BrowserSupportMatrix.md](docs/TDD/BrowserSupportMatrix.md) created and wired in, RoomLog promoted to a Phase‑2 objective (T&S-gated), voice-mesh pre-work added, zxing-wasm QR decision recorded, superseded banners on [01-Architecture.md](docs/TDD/01-Architecture.md) + [CoreTechnology.md](docs/TDD/02-Systems/CoreTechnology.md).
+- **2026‑07‑04** — **[STUDY-Architecture v006](brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md)**: adjudicated all four v005 reviews; verified iroh 1.0 + the noq fact (port-split ruled final); resolved the four blockers (UDP‑443, Station-in-a-Box secure context, ticking-CRDT state, two-tier markets); added Trust & Safety + voice subsystems; Station Seals v2 threat model; fixed the positions-through-Awareness and orbital-anomaly bugs in the Phase 1/2 plans.
+- **2026‑07‑04** — Four independent reviews of v005 received (GPT‑5.5, Gemini 3.1 Pro, Gemini 3.5 Flash, Opus 4.8) in [brainstorming/REVIEWS](brainstorming/REVIEWS/).
+- **2026‑07‑04** — **[STUDY-Architecture v005](brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v005.md)**: found the Runtime Gap (Cabal/Autobase stack is JS-only), proposed the all-Rust node (iroh + p2panda + yrs + wtransport + chia-wallet-sdk), Station Seals, Chia-offer markets; Phase 1/2 plans moved off `simple-peer`/WSS-signaler onto WebTransport certhash; `RoomLog.ts` port stub created.
+- **2026‑07‑03** — **STUDY-Architecture v004** (platform verification pass: WebTransport Baseline 2026 incl. Safari 26.4, two trust lanes, Tauri-Android sovereign path) + four reviews; v003 (cert-hash pinning discovery) + three reviews.
+- **2026‑06‑20** — Prototype [02-ortho-camera-demo](prototypes/02-ortho-camera-demo/) (orthographic locked camera) — [Issue #6](https://github.com/Bella-Addormentata/StarStationFurlong/issues/6) closed.
+- **2026‑06‑15** — Sprint 1 Tasks 1.1–1.2: Vite + Three.js project init, orthographic scene, cinematic intro, WASD movement, debug HUD ([01-core-loop-demo](prototypes/01-core-loop-demo/)).
+- **2026‑06‑14** — [Issue #1](https://github.com/Bella-Addormentata/StarStationFurlong/issues/1) ideas (CubeSat room classes, module custody, markets/shares, whale safeguards) researched and integrated into the GDD/TDD — closed.
+- **2026‑06 (early)** — Repo professionalization: ROADMAP, GDD/TDD structure, Phase 1–5 execution plans, STUDY-Architecture v002 (the sovereignty-first layered blueprint).
