@@ -18,6 +18,12 @@ lerna-debug.log*
 
 # Environment variables
 .env
+
+# Raw target logs & SQLite compiled caches (v006 Clean git targets)
+target/
+**/target/
+*.db
+ssf_log_test.db
 .env.local
 .env.*.local
 
