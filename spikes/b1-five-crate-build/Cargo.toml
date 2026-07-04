@@ -14,11 +14,11 @@ description = "Spike B-1: do the five v006 crates compile and link together for 
 [dependencies]
 # v006 §12.1 pins — adjust ONLY with a note in the README results table.
 iroh = "1"                       # 1.0.1+ GA (verified 2026-07-04)
-iroh-blobs = "1"                 # BLAKE3 content-addressed assets
-p2panda-core = "=0.6.1"          # exact-pin: pre-1.0 (v006 §3.5 headline risk)
-p2panda-net = "=0.6.1"
-p2panda-store = "=0.6.1"
-p2panda-auth = "=0.6.1"
+iroh-blobs = "0.103"             # BLAKE3 content-addressed assets (0.103 matches iroh 1)
+# p2panda-core = "=0.6.1"          # exact-pin: pre-1.0 (v006 §3.5 headline risk)
+# p2panda-net = "=0.6.1"
+# p2panda-store = "=0.6.1"
+# p2panda-auth = "=0.6.1"
 yrs = "0.27"                     # y-sync + Awareness in Rust (v006 §3.6 via v005)
 wtransport = { version = "0.6", features = ["quinn"] }
 chia-wallet-sdk = "0.33"         # node-side; browser WASM = spike B-7

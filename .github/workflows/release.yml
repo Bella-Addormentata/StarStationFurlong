@@ -1,0 +1,77 @@
+name: "🚀 Publish Sovereign Releases"
+
+on:
+  push:
+    # Trigger ONLY when tags matching vX.Y.0 are pushed (supporting multi-digit places, e.g. v10.20.0)
+    # (e.g., v0.1.0, v1.12.0, v10.20.0)
+    # This precisely handles minor/major bumps while leaving X.Y.1+ for local/dev use.
+    # Uses standard GitHub Action glob filter syntax: [0-9]* matches any number of digits starting with a digit.
+    tags:
+      - 'v[0-9]*.[0-9]*.0'
+
+jobs:
+  publish-tauri-binaries:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest' # Apple Silicon & Intel macOS Universal
+            args: ''
+          - platform: 'ubuntu-22.04' # Ubuntu Debian & AppImage
+            args: ''
+          - platform: 'windows-latest' # Windows MSI and NSIS installers
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. Setup Node.js runtimes for Vite/Three.js frontend compilations
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: 'prototypes/01-core-loop-demo/package-lock.json'
+
+      # 2. Setup stable Rust toolchains for our sovereign backbones
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      # Rust cache to drastically improve consecutive build durations
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'prototypes/01-core-loop-demo/src-tauri -> target'
+
+      # 3. Install platform-specific compiler dependencies (Webkit/GTK libraries for Linux)
+      - name: 🔧 Install System Dependencies (Linux only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      # 4. Install npm packages for Vite
+      - name: 📦 Install Frontend Dependencies
+        run: |
+          cd prototypes/01-core-loop-demo
+          npm ci
+
+      # 5. Compile the frontend & run Rust Cargo builds via Tauri official action
+      - name: 🛠️ Build & Package Tauri Application
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "StarStation Furlong ${{ github.ref_name }}"
+          releaseBody: "Sovereign P2P Space MMO - Production build stable release ${{ github.ref_name }}."
+          releaseDraft: true # Leaves as draft so developers can review release files before publishing!
+          prerelease: false
+          projectPath: "prototypes/01-core-loop-demo"
+          args: ${{ matrix.args }}

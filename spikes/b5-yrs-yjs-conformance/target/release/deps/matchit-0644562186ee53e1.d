@@ -1,0 +1,11 @@
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\deps\matchit-0644562186ee53e1.d: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\error.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\params.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\router.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\tree.rs
+
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\deps\libmatchit-0644562186ee53e1.rlib: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\error.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\params.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\router.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\tree.rs
+
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\deps\libmatchit-0644562186ee53e1.rmeta: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\error.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\params.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\router.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\tree.rs
+
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\lib.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\error.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\params.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\router.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\matchit-0.7.3\src\tree.rs:

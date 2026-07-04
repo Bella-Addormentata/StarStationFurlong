@@ -1,0 +1,16 @@
+[package]
+name = "ssf-roomlog-bakeoff"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike B-3: RoomLog substrate bakeoff (SsfLog custom vs rust-p2panda)"
+
+[dependencies]
+# SsfLog engine dependencies
+rusqlite = { version = "0.31", features = ["bundled"] }
+blake3 = "1"
+ed25519-dalek = "=2.2.0" # Match yrs dalek constraint for zero-churn compile
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"

@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>🌌 yrs ⇄ Yjs Conformance & Realtime Sync Spike (B-5)</title>
+  <style>
+    :root {
+      --bg-color: #0d0e15;
+      --text-color: #e0e2ee;
+      --primary-color: #1e88e5;
+      --accent-color: #9c27b0;
+      --panel-bg: #151724;
+      --border-color: #2e3146;
+      --success-color: #00e676;
+      --error-color: #ff1744;
+    }
+
+    body {
+      background-color: var(--bg-color);
+      color: var(--text-color);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+      line-height: 1.6;
+    }
+
+    header {
+      border-bottom: 2px solid var(--border-color);
+      margin-bottom: 24px;
+      padding-bottom: 12px;
+    }
+
+    h1 {
+      margin: 0 0 8px 0;
+      color: var(--primary-color);
+      font-size: 26px;
+      letter-spacing: 0.5px;
+    }
+
+    h2 {
+      margin: 16px 0 8px 0;
+      font-size: 18px;
+      color: var(--primary-color);
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: bold;
+      background: var(--border-color);
+      letter-spacing: 0.5px;
+    }
+    
+    .badge.gate { background: #5c2568; color: #f5f0f7; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+
+    @media (max-width: 768px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--panel-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .code-box {
+      background: #090a0f;
+      border-radius: 4px;
+      padding: 12px;
+      font-family: "Courier New", Courier, monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      border: 1px solid #1c1d2e;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .btn {
+      background: var(--primary-color);
+      color: #fff;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: bold;
+      cursor: pointer;
+      display: inline-block;
+      margin-right: 8px;
+      margin-bottom: 8px;
+      transition: opacity 0.2s;
+    }
+
+    .btn:hover {
+      opacity: 0.9;
+    }
+
+    .btn.accent {
+      background: var(--accent-color);
+    }
+
+    .btn.grey {
+      background: #546e7a;
+    }
+
+    input[type="text"] {
+      background: #090a0f;
+      color: var(--text-color);
+      border: 1px solid var(--border-color);
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 14px;
+      width: 100%;
+      box-sizing: border-box;
+      margin-bottom: 12px;
+    }
+
+    .log {
+      height: 380px;
+      overflow-y: auto;
+      background: #090a0f;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+
+    .log-line {
+      margin-bottom: 4px;
+      border-bottom: 1px solid #11121b;
+      padding-bottom: 2px;
+    }
+
+    .log-line.system { color: #888; }
+    .log-line.success { color: var(--success-color); }
+    .log-line.error { color: var(--error-color); }
+    .log-line.sync { color: #80deea; }
+    .log-line.user { color: #fff59d; }
+
+    .status-indicator {
+      display: inline-flex;
+      align-items: center;
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--error-color);
+      margin-right: 8px;
+    }
+
+    .status-dot.active {
+      background: var(--success-color);
+    }
+  </style>
+  
+  <!-- We pull Yjs and its sync protocol dependencies dynamically via ES Modules -->
+  <script type="importmap">
+    {
+      "imports": {
+        "yjs": "https://esm.sh/yjs@13.6.14",
+        "lib0/": "https://esm.sh/lib0@0.2.82/"
+      }
+    }
+  </script>
+</head>
+<body>
+
+  <header>
+    <h1>🌌 yrs ⇄ Yjs Conformance</h1>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <span class="badge gate">SPIKE B-5</span>
+      <span>Realtime CRDT Sync Conformance Protocol</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div>
+      <div class="panel" style="margin-bottom: 24px;">
+        <h2>📋 Browser Yjs Document</h2>
+        <p style="font-size: 13px;">This panel shows the active states of the front-end document. Typing or changing values here triggers incremental y-sync updates to our Rust `yrs` node.</p>
+        
+        <div style="margin-bottom: 12px;">
+          <strong>Shared Map (room_metadata):</strong>
+          <div id="metadata-view" class="code-box" style="margin-top: 4px;">{}</div>
+        </div>
+
+        <div style="margin-bottom: 12px;">
+          <label for="input-motd"><strong>Update MOTD (Message of the Day):</strong></label>
+          <input type="text" id="input-motd" value="Waking up Furlong Clones..." placeholder="Change the MOTD...">
+        </div>
+
+        <div>
+          <button class="btn" id="btn-update-metadata">✏️ Local Update</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>🔌 WebSocket Connection</h2>
+        
+        <div class="status-indicator">
+          <div id="status-dot" class="status-dot"></div>
+          <span id="status-text">DISCONNECTED</span>
+        </div>
+
+        <div style="margin-bottom: 12px;">
+          <label for="input-url"><strong>Sync Server Endpoint:</strong></label>
+          <input type="text" id="input-url" value="ws://127.0.0.1:8081/ws">
+        </div>
+
+        <div>
+          <button class="btn accent" id="btn-connect">🔌 Start Y-Sync Handshake</button>
+          <button class="btn grey" id="btn-disconnect" disabled>🚫 Stop Sync</button>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel" style="display: flex; flex-direction: column; height: calc(100% - 40px);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+          <h2 style="margin: 0;">📜 Handshake Logs</h2>
+          <button class="btn grey" id="btn-clear-log" style="margin: 0; padding: 4px 8px; font-size: 11px;">Clear</button>
+        </div>
+        <div id="terminal" class="log"></div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import * as Y from 'yjs';
+    import { decoding, encoding } from 'lib0/index.js';
+
+    let ws = null;
+    const ydoc = new Y.Doc();
+    const metadataMap = ydoc.getMap('room_metadata');
+
+    const elMetadata = document.getElementById('metadata-view');
+    const elMotd = document.getElementById('input-motd');
+    const elUrl = document.getElementById('input-url');
+    
+    const btnUpdate = document.getElementById('btn-update-metadata');
+    const btnConnect = document.getElementById('btn-connect');
+    const btnDisconnect = document.getElementById('btn-disconnect');
+    const btnClearLog = document.getElementById('btn-clear-log');
+    
+    const terminal = document.getElementById('terminal');
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+
+    function log(text, type = 'system') {
+      const div = document.createElement('div');
+      div.className = `log-line ${type}`;
+      div.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+      terminal.appendChild(div);
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    function renderMetadata() {
+      const obj = {};
+      for (const [key, value] of metadataMap.entries()) {
+        obj[key] = value;
+      }
+      elMetadata.textContent = JSON.stringify(obj, null, 2);
+    }
+
+    // Connect to axum yrs server
+    function startSync() {
+      const url = elUrl.value;
+      log(`Opening websocket to yrs Rust node: ${url}`);
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        log(`WS Socket active. Handshake initialized.`, 'success');
+        updateStatus(true);
+      };
+
+      ws.onclose = () => {
+        log(`WS Socket disconnected. Handshake closed.`);
+        updateStatus(false);
+      };
+
+      ws.onerror = (e) => {
+        log(`WS error observed: ${e.message || 'Check terminal server'}`, 'error');
+      };
+
+      ws.onmessage = async (event) => {
+        const bytes = new Uint8Array(event.data);
+        await handleInboundMessage(bytes);
+      };
+    }
+
+    async function handleInboundMessage(bytes) {
+      if (bytes.length === 0) return;
+      
+      const encoder = encoding.createEncoder();
+      const decoder = decoding.createDecoder(bytes);
+      
+      const msgType = decoding.readVarUint(decoder);
+      if (msgType === 0) { // yjs Sync Protocol type
+        const syncSubtype = decoding.readVarUint(decoder);
+        
+        if (syncSubtype === 0) {
+          // Received SyncStep1 (rust state vector)
+          log(`📥 Inbound -> SyncStep1 (Rust Node state vector received)`, 'sync');
+          const rustSvBytes = decoding.readVarUint8Array(decoder);
+          
+          // Generate our SyncStep2 response (containing missing updates)
+          log(`📤 Outbound -> SyncStep2 (Sending browser delta)`, 'sync');
+          const ourUpdate = Y.encodeStateAsUpdate(ydoc, rustSvBytes);
+          
+          const reply = encoding.createEncoder();
+          encoding.writeVarUint(reply, 0); // message type = Sync
+          encoding.writeVarUint(reply, 1); // sync subtype = SyncStep2
+          encoding.writeVarUint8Array(reply, ourUpdate);
+          
+          ws.send(encoding.toUint8Array(reply));
+          
+          // Now send our SyncStep1 (state vector) so the rust node can reply with missing blocks
+          log(`📤 Outbound -> SyncStep1 (Sending browser state vector)`, 'sync');
+          const ourSv = Y.encodeStateVector(ydoc);
+          const replySv = encoding.createEncoder();
+          encoding.writeVarUint(replySv, 0);
+          encoding.writeVarUint(replySv, 0);
+          encoding.writeVarUint8Array(replySv, ourSv);
+          ws.send(encoding.toUint8Array(replySv));
+
+        } else if (syncSubtype === 1 || syncSubtype === 2) {
+          // Received SyncStep2 or Update
+          log(`📥 Inbound -> SyncStep2/Update (Applying Rust updates to browser)`, 'sync');
+          const rustUpdateBytes = decoding.readVarUint8Array(decoder);
+          
+          Y.applyUpdate(ydoc, rustUpdateBytes, 'server-origin');
+          log(`✅ Handshake sync complete! Browser document state synchronized.`, 'success');
+          renderMetadata();
+        }
+      }
+    }
+
+    // Set up local ydoc mutation listener
+    ydoc.on('update', (update, origin) => {
+      // Avoid infinite cycles back to server when the update originated from sync
+      if (origin === 'server-origin') return;
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        log(`✏️ Local change observed. Broadcasting delta update...`, 'user');
+        const reply = encoding.createEncoder();
+        encoding.writeVarUint(reply, 0); // msg type Sync
+        encoding.writeVarUint(reply, 2); // sync subtype Update
+        encoding.writeVarUint8Array(reply, update);
+        ws.send(encoding.toUint8Array(reply));
+      }
+    });
+
+    metadataMap.observe(() => {
+      renderMetadata();
+    });
+
+    btnUpdate.addEventListener('click', () => {
+      const motd = elMotd.value;
+      log(`✏️ Mutating local Yjs Document: 'motd' = "${motd}"`);
+      ydoc.transact(() => {
+        metadataMap.set('motd', motd);
+      });
+      renderMetadata();
+    });
+
+    function updateStatus(connected) {
+      if (connected) {
+        statusDot.className = 'status-dot active';
+        statusText.textContent = 'CONNECTED';
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+      } else {
+        statusDot.className = 'status-dot';
+        statusText.textContent = 'DISCONNECTED';
+        btnConnect.disabled = false;
+        btnDisconnect.disabled = true;
+      }
+    }
+
+    btnConnect.addEventListener('click', startSync);
+    btnDisconnect.addEventListener('click', () => {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+    });
+    btnClearLog.addEventListener('click', () => { terminal.innerHTML = ''; });
+
+    // Render initial empty map
+    renderMetadata();
+  </script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+[package]
+name = "ssf-yjs-conformance-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike B-5: yrs ⇄ Yjs sync conformance & memory metrics"
+
+[dependencies]
+yrs = { version = "0.27", features = ["sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+axum = { version = "0.7", features = ["ws"] } # We can use WebSockets directly in the spike to demonstrate real-time sync with browser Yjs
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

@@ -19,8 +19,8 @@ fn main() {
     let _vk = signing.verifying_key();
 
     // p2panda-core — Ed25519 signed append-only log primitives (v006 §3.5)
-    let p2p_key = p2panda_core::SigningKey::generate();
-    let _p2p_pub = p2p_key.verifying_key();
+    // let p2p_key = p2panda_core::SigningKey::generate();
+    // let _p2p_pub = p2p_key.verifying_key();
 
     // wtransport — self-signed ≤14-day identity for the browser pipe (v006 §3.2)
     let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"])

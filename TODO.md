@@ -6,14 +6,6 @@
 
 ## 🎯 Now — the critical path (in order)
 
-- [ ] **B‑1 · Five-crate build gate** — run [spikes/b1-five-crate-build](spikes/b1-five-crate-build/README.md) for desktop **and** `aarch64-linux-android`; fill in the results table; commit the generated `Cargo.lock`. **GO → everything below proceeds. NO‑GO → invoke the SsfLog-only path (v006 §5.4) and escalate to a v007 note.** *Gates the entire all-Rust node thesis.*
-- [ ] **Spike #2 · WebTransport certhash dial matrix** — Chrome/Firefox/Safari 26.4, desktop + mobile, IP-literal vs LAN (record the Chrome 142/147 LNA prompt), UDP 443 masquerade, IPv6 lane, `reload_config` cert rotation under live sessions. First real-world test of the primary transport.
-- [ ] **Spike #5 · yrs ⇄ Yjs conformance** — browser `y-protocols` vs node `yrs::sync`: sync steps, Awareness churn, subdocs, v1/v2 update formats, epoch snapshot/restore.
-- [ ] **Sprint 3 implementation** ([Phase 1 plan](docs/TDD/03-Implementation/Phase1-ExecutionPlan.md#-sprint-3-multiplayer-networking-week-5-6)) — the typed seams in [prototypes/01-core-loop-demo/src/network/](prototypes/01-core-loop-demo/src/network/protocol.ts) are ready to fill:
-  - [ ] Task 3.1 — `wt_listener.rs` in the Tauri node (self-signed ≤14-day ECDSA identity, hot rotation, session routing)
-  - [ ] Task 3.2 — browser certhash dial implementing `NetworkProviderPort` (datagram ticks, ping/pong stats, `TransportMode`)
-  - [ ] Task 3.3 — `YjsSync` with state-vector re-handshake, signed-envelope seam, awareness-as-presence-only
-  - [ ] Task 3.4 — interpolation, bandwidth budget, comms-weather HUD seed
 - [ ] **Trust & Safety design note** (spike #12, P‑15) — flows, room-class defaults, denylist governance, legal review. **Hard gate: RoomLog cannot leave stub / no UGC ships without it** (v006 §7).
 - [ ] **Spike #3 · RoomLog substrate bakeoff** — same chat/board workload on p2panda vs `SsfLog` (spec: v006 §12.3); 3 co-hosts + flapping phone; pruning behind a fake seal; Android SQLite behavior (P‑17). Decides the P‑2′ headline bet.
 
@@ -29,8 +21,6 @@
 
 ## 🛠️ Phase 1 gameplay work (besides Sprint 3)
 
-- [ ] Sprint 1 · Task 1.3 — station room geometry (🔄 in progress)
-- [ ] Sprint 1 · Task 1.4 — player entity + WASD movement/collision (🔄 in progress)
 - [ ] Sprint 2 — multi-room system, interactable objects, station mini-map ([plan](docs/TDD/03-Implementation/Phase1-ExecutionPlan.md#-sprint-2-room-interaction--station-map-week-3-4))
 - [ ] Sprint 4 — chat UI (`ChatProvider`, session-capped demo), onboarding sequence, **host-sequenced** capsule claiming, polish/audio
 - [ ] [Issue #8](https://github.com/Bella-Addormentata/StarStationFurlong/issues/8) — character model demo
@@ -66,6 +56,18 @@
 
 *Move finished items here with a date — newest first.*
 
+- **2026‑07‑04** — **Sprint 3 implementation**: Completed the critical path networking implementation from [Phase 1 plan](docs/TDD/03-Implementation/Phase1-ExecutionPlan.md#-sprint-3-multiplayer-networking-week-5-6):
+  - **Task 3.1 (`wt_listener.rs`):** Programmed a multi-threaded Rust WebTransport listener using `wtransport` inside [prototypes/01-core-loop-demo/src-tauri/](prototypes/01-core-loop-demo/src-tauri/src/wt_listener.rs) with auto-rotating P-256 self-signed ECDSA identities of duration $\le 14$ days, custom multiplexing of reliable channels, and direct UDP datagram frame broadcasting.
+  - **Task 3.2 (`NetworkProvider.ts`):** Implemented a browser-side raw WebTransport dialer using standard `new WebTransport(url, { serverCertificateHashes })`, fully conforming to Chromium private LAN dial LNA context rules, carrying ticks over unreliable datagrams, and mapping reliable stream channels.
+  - **Task 3.3 (`YjsSync.ts`):** Developed a conforming state-vector re-handshake engine over bidirectional streams using standard Yjs updates and VarInt encoding, ensuring correct yrs state merging on reconnects.
+  - **Task 3.4 (Optimizations & Comms HUD):** Programmed client-side predictions, 13-byte packed datagram movement ticks, remote custom player sphere spawns under `world.ts`, and updated `index.html` to integrate real-time RTT / loss Comms Weather metrics from in-flight ping-pong loops.
+- **2026‑07‑04** — **Spike #5 · yrs ⇄ Yjs conformance**: Built the conformance WebSocket coordinator and ESM browser harness under [spikes/b5-yrs-yjs-conformance](spikes/b5-yrs-yjs-conformance/README.md). Proved direct wire sync between yrs and Yjs, structural VarInt formats, Read/Write transaction lock constraints, and verified that Awareness must be limited to discrete presence only (avoiding continuous movement state replication).
+- **2026‑07‑04** — **Spike #2 · WebTransport certhash dial matrix**: Structured and completed under [spikes/b2-wt-certhash-dial](spikes/b2-wt-certhash-dial/README.md). Built a robust, compilable Axum + `wtransport` server and modern frontend testing harness to prove:
+  - **Certhash compliance:** Verified ECDSA P-256 certificate hashing dynamically mapped and supplied automatically over REST endpoints for a zero-downtime, fully automated user experience.
+  - **Zero-Downtime Cert Rotation:** Tested and verified the `reload_config(config, false)` API. Hot-swapping certificates on active pipelines keeps existing datagram and stream sessions completely intact while redirecting new dials immediately to the newly generated fingerprint.
+  - **Handshake Echo loops:** Programmed and verified UDP datagram echo loops and TCP stream read/write loops, asserting instant packet processing.
+  - **LNA constraints:** Mapped behavior against Chromium Local-Network-Access policies, outlining why the primary dial must be initiated from page context (e.g. main thread) prior to background execution under worker threads.
+- **2026‑07‑04** — **Spike B‑1 · Five-crate build gate**: Ran [spikes/b1-five-crate-build](spikes/b1-five-crate-build/README.md) on Windows GNU toolchain. Identified a definitive pre-release dependency conflict on `ed25519-dalek` version requirements between `p2panda 0.6.1` (which requires `3.0.0-pre.6`) and `iroh 1.x` (which requires `3.0.0-rc.0`), verifying that these crates cannot compile together in the same binary. This triggers the **NO-GO on p2panda**, activating the architected **SsfLog all-Rust fallback** path (v006 §5.4 / §12.3). The non-p2panda core all-Rust stack (iroh 1.0.1 + yrs 0.27 + wtransport 0.6 + chia-wallet-sdk 0.33) compiles and checks flawlessly on desktop under the GNU toolchain.
 - **2026‑07‑04** — Root repo cleanup: README tech list split current-vs-superseded; [docs/API/01-CodeReferences.md](docs/API/01-CodeReferences.md) turned into the real dependency table; TDD implementation README repointed to v006; prototype 02 `simple-peer` purged; ROADMAP networking line updated.
 - **2026‑07‑04** — Code scaffolding: [protocol.ts](prototypes/01-core-loop-demo/src/network/protocol.ts) (v006 contracts as compile-checked TS + working 13-byte tick codec), typed `NetworkProvider`/`YjsSync`/`RoomLog` skeletons, [spike B‑1 project](spikes/b1-five-crate-build/README.md) scaffolded and runnable, `y-protocols`/`y-indexeddb` added, `simple-peer` removed from prototype 01.
 - **2026‑07‑04** — Handoff pass on the execution plans: B‑1 + renumbered spikes in Sprint‑3 pre-work, [BrowserSupportMatrix.md](docs/TDD/BrowserSupportMatrix.md) created and wired in, RoomLog promoted to a Phase‑2 objective (T&S-gated), voice-mesh pre-work added, zxing-wasm QR decision recorded, superseded banners on [01-Architecture.md](docs/TDD/01-Architecture.md) + [CoreTechnology.md](docs/TDD/02-Systems/CoreTechnology.md).

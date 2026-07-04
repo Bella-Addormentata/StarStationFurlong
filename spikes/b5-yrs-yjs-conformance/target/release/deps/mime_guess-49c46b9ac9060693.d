@@ -1,0 +1,12 @@
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\deps\mime_guess-49c46b9ac9060693.d: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\impl_bin_search.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\mime_types.rs C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\build\mime_guess-069b3aa468cc6377\out\mime_types_generated.rs
+
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\deps\libmime_guess-49c46b9ac9060693.rlib: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\impl_bin_search.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\mime_types.rs C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\build\mime_guess-069b3aa468cc6377\out\mime_types_generated.rs
+
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\deps\libmime_guess-49c46b9ac9060693.rmeta: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\impl_bin_search.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\mime_types.rs C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\build\mime_guess-069b3aa468cc6377\out\mime_types_generated.rs
+
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\lib.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\impl_bin_search.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\mime_guess-2.0.5\src\mime_types.rs:
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b5-yrs-yjs-conformance\target\release\build\mime_guess-069b3aa468cc6377\out\mime_types_generated.rs:
+
+# env-dep:MIME_TYPES_GENERATED_PATH=C:\\Users\\dorkm\\Documents\\GitHub\\StarStationFurlong\\spikes\\b5-yrs-yjs-conformance\\target\\release\\build\\mime_guess-069b3aa468cc6377\\out\\mime_types_generated.rs

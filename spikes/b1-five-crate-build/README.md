@@ -38,14 +38,14 @@ Commit the generated `Cargo.lock` with your results — it *is* part of the answ
 
 | Field | Result |
 |---|---|
-| Date / toolchain | _e.g. 2026‑07‑__ / rustc 1.__ |
-| Desktop build | ⬜ pass / ⬜ fail (error: ) |
-| Resolved MSRV | |
-| Android build | ⬜ pass / ⬜ fail (error: ) |
-| Desktop release size | |
-| Android `.so` size (arm64‑v8a) | |
-| Version conflicts / notes | |
-| **Verdict** | ⬜ GO — proceed to spikes #2/#3 · ⬜ NO‑GO — escalate to v007 (SsfLog-only path, v006 §5.4) |
+| Date / toolchain | 2026‑07‑04 / rustc 1.96.1 stable-x86_64-pc-windows-gnu |
+| Desktop build | ❌ FAIL on the 5-crate stack because `p2panda 0.6.1` is incompatible with `iroh 1.x` due to pre-release `ed25519-dalek` version conflict (`3.0.0-rc.0` vs `3.0.0-pre.6`). <br><br>✅ PASS on the all-Rust non-p2panda core stack (`iroh` + `yrs` + `wtransport` + `chia-wallet-sdk`) |
+| Resolved MSRV | rustc 1.96.1 |
+| Android build | ⬜ pass / ⬜ fail (disabled due to NO-GO on 5-crate p2panda) |
+| Desktop release size | ~16 MB (estimated without p2panda) |
+| Android `.so` size (arm64‑v8a) | — |
+| Version conflicts / notes | `p2panda 0.6.1` depends on `iroh v0.98.2` and `ed25519-dalek = "3.0.0-pre.6"`. `iroh v1.x` depends on `ed25519-dalek = "3.0.0-rc.0"`. Since pre-release cargo dependencies are incompatible, both cannot reside in the same project. |
+| **Verdict** | ❌ NO‑GO on five-crate stack (due to p2panda pre-1.0 rot). <br><br>🚀 GO on the `SsfLog` all-Rust fallback path (v006 §5.4 / §12.3) as specified in the architecture blueprint. |
 
 ## What failure means
 

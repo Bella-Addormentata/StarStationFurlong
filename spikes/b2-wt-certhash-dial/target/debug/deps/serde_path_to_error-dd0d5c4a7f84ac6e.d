@@ -1,0 +1,9 @@
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b2-wt-certhash-dial\target\debug\deps\serde_path_to_error-dd0d5c4a7f84ac6e.d: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\de.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\path.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\ser.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\wrap.rs
+
+C:\Users\dorkm\Documents\GitHub\StarStationFurlong\spikes\b2-wt-certhash-dial\target\debug\deps\libserde_path_to_error-dd0d5c4a7f84ac6e.rmeta: C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\lib.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\de.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\path.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\ser.rs C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\wrap.rs
+
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\lib.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\de.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\path.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\ser.rs:
+C:\Users\dorkm\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde_path_to_error-0.1.20\src\wrap.rs:
