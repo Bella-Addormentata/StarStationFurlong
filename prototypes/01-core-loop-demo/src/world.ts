@@ -32,6 +32,7 @@ export class World {
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
   private particleMat: THREE.PointsMaterial | null = null;
+  private clickPlane: THREE.Mesh | null = null;
   
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -207,6 +208,14 @@ export class World {
     this.platformFloor = new THREE.Mesh(floorGeometry, floorMaterial);
     this.platformFloor.rotation.x = -Math.PI / 2;
     this.platformGroup.add(this.platformFloor);
+
+    // Click plane for raycasted point-and-click pathfinding (Task Issue 10)
+    const clickGeo = new THREE.PlaneGeometry(platformSize, platformSize);
+    this.clickPlane = new THREE.Mesh(clickGeo, new THREE.MeshBasicMaterial({ visible: false }));
+    this.clickPlane.rotation.x = -Math.PI / 2;
+    this.clickPlane.position.y = 0.005; // slightly above floor
+    this.clickPlane.userData.isTile = true;
+    this.platformGroup.add(this.clickPlane);
 
     // Grid helper
     this.platformGrid = new THREE.GridHelper(platformSize, 12, 0x1E88E5, 0x0A1E3A);
@@ -951,6 +960,47 @@ export class World {
     // Spin the orbital rings above the platform
     if (this.orbitRingOuter) this.orbitRingOuter.rotation.y += 0.004;
     if (this.orbitRingInner) this.orbitRingInner.rotation.y -= 0.006;
+  }
+
+  public remotePlayers: Map<string, THREE.Mesh> = new Map();
+
+  public updateRemotePlayer(id: string, x: number, z: number) {
+    let mesh = this.remotePlayers.get(id);
+    if (!mesh) {
+      console.log(`🤖 Spawning remote player node replica: ${id}`);
+      // Create a cute red/amber orbital sphere representing a remote clone peer (Task 3.2 red vs green form)
+      const geo = new THREE.SphereGeometry(0.8, 32, 32);
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xff4433,
+        roughness: 0.8,
+        metalness: 0.1,
+        emissive: 0x330502,
+        emissiveIntensity: 0.3
+      });
+      mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x, 1.0, z);
+      this.platformGroup.add(mesh);
+      this.remotePlayers.set(id, mesh);
+    } else {
+      // Smoothly lerp towards position (Task 3.4 interpolation)
+      mesh.position.x = THREE.MathUtils.lerp(mesh.position.x, x, 0.28);
+      mesh.position.z = THREE.MathUtils.lerp(mesh.position.z, z, 0.28);
+      mesh.position.y = 1.0 + Math.sin(this.time * 2.2) * 0.015;
+    }
+  }
+
+  public getPlayer(): Player {
+    return this.player;
+  }
+
+  public getClickPlane(): THREE.Mesh | null {
+    return this.clickPlane;
+  }
+
+  public navigateTo(x: number, z: number) {
+    if (this.isPlayerActive()) {
+      this.player.navigateTo(x, z);
+    }
   }
 
   isPlayerActive(): boolean {
