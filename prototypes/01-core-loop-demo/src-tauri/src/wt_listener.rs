@@ -120,7 +120,7 @@ pub async fn run_wt_listener(
 
 async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()> {
     let remote_addr = connection.remote_address();
-    let mut chosen_room: Option<String> = None;
+    let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     loop {
         tokio::select! {
@@ -129,7 +129,8 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
                 let datagram = dg?;
                 if datagram.len() == 13 {
                     // This is a raw movement tick. Broadcast directly to all other peers in the room.
-                    if let Some(ref room_id) = chosen_room {
+                    let room_id_snapshot = chosen_room.lock().unwrap().clone();
+                    if let Some(ref room_id) = room_id_snapshot {
                         let rooms = hub.rooms.lock().unwrap();
                         if let Some(room) = rooms.get(room_id) {
                             for (&addr, peer_conn) in &room.connections {
@@ -153,8 +154,9 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
                 let (mut send, mut recv) = stream?;
                 let hub_clone = hub.clone();
                 let remote_addr_inner = remote_addr;
-                let mut room_id_inner = chosen_room.clone();
+                let mut room_id_inner = chosen_room.lock().unwrap().clone();
                 let connection_clone = connection.clone();
+                let chosen_room_inner = chosen_room.clone();
                 
                 tokio::spawn(async move {
                     let mut length_buf = [0u8; 4];
@@ -185,6 +187,7 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
                         // Register the player room binding on first message routing
                         if room_id_inner.is_none() {
                             room_id_inner = Some(envelope.room.clone());
+                            *chosen_room_inner.lock().unwrap() = room_id_inner.clone();
                             // Create room document state natively using yrs (Task 3.3)
                             let mut rooms = hub_clone.rooms.lock().unwrap();
                             let room = rooms.entry(envelope.room.clone()).or_insert_with(|| {
