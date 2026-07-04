@@ -63,3 +63,6 @@ coverage/
 # Misc
 *.tsbuildinfo
 .cache/
+
+# Tauri generated schemas
+src-tauri/gen/schemas/
