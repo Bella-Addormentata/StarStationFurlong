@@ -1,0 +1,32 @@
+[package]
+name = "ssf-node-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike B-1: do the five v006 crates compile and link together for desktop AND aarch64-linux-android, and at what size? (STUDY-Architecture v006 §15.1 #1)"
+
+# ⚠️ THIS PROJECT IS A GATE, NOT A PRODUCT.
+# Its job is to fail loudly and cheaply if the five-crate stack has
+# MSRV/version/linker conflicts — BEFORE any subsystem code is written.
+# Expected outcomes to record in README.md: resolved versions (Cargo.lock),
+# MSRV required, desktop binary size, Android .so size per ABI.
+
+[dependencies]
+# v006 §12.1 pins — adjust ONLY with a note in the README results table.
+iroh = "1"                       # 1.0.1+ GA (verified 2026-07-04)
+iroh-blobs = "1"                 # BLAKE3 content-addressed assets
+p2panda-core = "=0.6.1"          # exact-pin: pre-1.0 (v006 §3.5 headline risk)
+p2panda-net = "=0.6.1"
+p2panda-store = "=0.6.1"
+p2panda-auth = "=0.6.1"
+yrs = "0.27"                     # y-sync + Awareness in Rust (v006 §3.6 via v005)
+wtransport = { version = "0.6", features = ["quinn"] }
+chia-wallet-sdk = "0.33"         # node-side; browser WASM = spike B-7
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+blake3 = "1"
+ed25519-dalek = "2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

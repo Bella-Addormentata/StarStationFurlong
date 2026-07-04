@@ -1,6 +1,8 @@
 # STUDY - System Requirements & Software Form Options v001
 *Analyzing Native Desktop vs. Pure Web Architectures, Protocol Limitations, and Gameplay Tradeoffs for StarStationFurlong*
 
+> ⚠️ **Historical document — superseded.** This v001 study is preserved for context; its protocol assumptions (`simple-peer`, WebTorrent-as-canonical, Cabal-as-stack) are obsolete. The architecture of record is [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md); implementers should start from v006 and the [Phase execution plans](03-Implementation/README.md).
+
 ---
 
 ## 1. Executive Summary

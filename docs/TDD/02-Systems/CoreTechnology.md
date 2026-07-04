@@ -1,5 +1,7 @@
 # IDEAS Game Technology
 
+> ⚠️ **Status note (2026-07-04):** original idea file, preserved as-is. The Cabal items below are realized as **RoomLog** — the Cabal *model* on Rust-native crates, not the Cabal stack ([STUDY-Architecture v006](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) §5.4/§7). **"Cabal club for short term user position tracking" is formally deprecated** — positions are never written to logs or CRDTs (v006 §8.1 three-lane rule). The map-embedded network data idea lives on as room topic secrets (v005 §14). `simple-peer`/WebTorrent references are superseded by WebTransport + iroh-blobs (v006 §1).
+
 * Communication
   * Cabal Club for short term chat message
   * Different physical game rooms saved as seperate chats

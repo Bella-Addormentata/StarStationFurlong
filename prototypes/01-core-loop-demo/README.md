@@ -75,9 +75,10 @@ This installs the project dependencies defined in `package.json`, including:
 - `three`
 - `vite`
 - `typescript`
-- `yjs`
-- `simple-peer`
+- `yjs` (+ `y-protocols`, `y-indexeddb` — Sprint 3 sync/awareness)
 - `msgpackr`
+
+> Networking note: the transport is **raw WebTransport with `serverCertificateHashes`** per [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — `simple-peer` was removed with the v005/v006 revisions. The typed port seams live in `src/network/` (`protocol.ts` defines the contracts; Sprint 3 implements them).
 
 ## 4. Run the Demo in Development Mode
 

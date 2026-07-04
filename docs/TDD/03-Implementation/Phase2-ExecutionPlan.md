@@ -3,6 +3,7 @@
 > **Maps to ROADMAP:** Phase 2 - Exploration & Ownership  
 > **Product Goal:** "I can navigate the solar system, discover minable asteroid fields, and snap modules onto my capsule to build a spaceship or expand my station."  
 > **Prerequisite:** Phase 1 complete — public lobby, P2P networking, capsule room ownership working  
+> **Architecture Reference:** [STUDY-Architecture v006](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — transport, CRDT, storage-split, and derive-don't-tick rules  
 > **Status:** 🔲 Planned
 
 ---
@@ -15,6 +16,9 @@
 - [ ] **Minable Resources** — Asteroid fields contain node clusters; players can interact with nodes to collect raw materials
 - [ ] **Room Editing** — Capsule owners can place, move, and remove objects in their own capsule room
 - [ ] **Snap-On Modules** — Modular components that attach to capsule rooms or station sections to transform or extend them
+- [ ] **RoomLog (minimal)** — Bulletin boards + contract/gig postings move from Yjs demo storage to the append-only `RoomLog` port; chat swaps behind the `ChatProvider` seam (promoted from Phase 3 — v006 §8.4; **gated on the v006 §15.1 #3 substrate bakeoff and the §7 Trust & Safety design note**)
+
+> **Phase 2 pre-work spikes (v006 §15.1):** review **B‑1** five-crate build results (go/no-go for iroh + p2panda adoption); **#3** RoomLog bakeoff (p2panda vs `SsfLog`); **#6** iroh sovereignty gate (self-hosted-relay-only drill); **#10** voice-mesh pre-work (4-way WebRTC brokered over the node pipe + `PannerNode` spatialization — proximity voice lands Phase 2/3 per v006 §9); **#9** Station-in-a-Box trust decision if box demos are planned.
 
 ---
 
@@ -39,9 +43,9 @@
 
 ### Travel System
 
-- Travel between zones takes time (progress indicator or fast-travel toggle in dev mode)
+- Travel between zones takes time — progress is **derived** from `departureTick + speed` vs the current simulation tick (derive-don't-tick, v006 §8.2), never a synced countdown; fast-travel toggle in dev mode
 - Players in the same zone are in the same P2P room; crossing zones creates a new room context
-- Yjs doc per zone — state is isolated; reconnect replays zone state
+- Yjs doc per zone — state is isolated; reconnect replays zone state (sharding rules: v006 §8.2)
 
 ---
 
@@ -52,7 +56,7 @@
 - Asteroid fields rendered as clusters of simple icosahedron geometries in Three.js
 - Each asteroid node has a `resourceType` (iron, silica, rare-mineral) and a `yield` value stored in the zone's Yjs map
 - Players interact (E key) to extract — yield decreases; node disappears when depleted
-- Nodes regenerate on a timer (configurable per resource rarity)
+- Regeneration is **derived, not timed**: nodes store `depletedAtTick` + a regen-rate parameter; clients compute current yield from the simulation tick (derive-don't-tick, v006 §8.2)
 
 ### Resource Types (Phase 2)
 
@@ -65,8 +69,8 @@
 ### Resource Sync
 
 - Node yield values stored in zone's `Y.Map<AsteroidState>` — all players see the same depletion
-- Extraction events sent over the reliable WebRTC channel (MessagePack)
-- No authoritative server needed — CRDT handles concurrent extraction conflicts
+- Extraction events sent over the reliable sync stream of the active transport (`SsfEnvelope`, v005 §12.2; MessagePack payload)
+- CRDT merge handles concurrent extraction for common nodes; **scarce/rare nodes must be host-sequenced** — concurrent CRDT decrements can over-extract under partition (v005 §10, pitfall P‑10)
 
 ---
 
@@ -98,7 +102,9 @@ On the 2D map canvas, L4/L5 positions are derived at runtime from the parent pla
 
 ### Orbital Data Schema
 
-All station placements are stored in the solar system's top-level `Y.Map<StationOrbit>` (key = station ID):
+All station placements are stored in the solar system's top-level `Y.Map<StationOrbit>` (key = station ID).
+
+> **Derive-don't-tick (v006 §8.2):** the CRDT stores only **static orbital elements + an epoch tick**. The current position/anomaly is *computed* every frame from `(nowTick − epochTick)` — it is never written back. A continuously-updated CRDT field bloats Yjs history without bound and was removed from this schema (flagged by all four v005 reviews).
 
 ```typescript
 type OrbitType = 'circular' | 'elliptical' | 'lagrange' | 'free-floating';
@@ -107,12 +113,14 @@ interface StationOrbit {
   stationId:     string;       // matches capsule / station entity ID
   orbitType:     OrbitType;
 
-  // Keplerian orbit (circular or elliptical)
+  // Keplerian orbit (circular or elliptical) — static elements only
   parentBodyId?: string;       // star or planet ID
   semiMajorAxis?: number;      // AU or arbitrary map units
   eccentricity?:  number;      // 0 = circular, 0–1 = elliptical
   inclination?:   number;      // degrees from ecliptic (2D map: always 0)
-  anomaly?:       number;      // current true anomaly (radians); updated each tick
+  epochTick:      number;      // simulation tick when these elements were set
+  anomalyAtEpoch?: number;     // true anomaly (radians) AT epochTick — set once, never ticked
+  meanMotion?:    number;      // rad/tick — current anomaly = anomalyAtEpoch + meanMotion × (nowTick − epochTick)
 
   // Lagrange point
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
@@ -120,8 +128,11 @@ interface StationOrbit {
   secondaryBodyId?: string;    // e.g. the planet
 
   // Free-floating
-  position?:     { x: number; y: number }; // fixed map coordinates
-  velocity?:     { dx: number; dy: number }; // optional drift vector per tick
+  position?:     { x: number; y: number }; // static anchor coordinates
+  driftPerTick?: { dx: number; dy: number }; // static drift RATE — displacement is derived
+
+  // Station-keeping — the ONLY field discrete events mutate
+  lastStationKeepingTick?: number;
 }
 ```
 
@@ -130,8 +141,10 @@ Only the relevant fields for the chosen `orbitType` are populated. The map rende
 ### Station-Keeping & Stability
 
 - **Stable Lagrange (L4/L5):** No periodic correction needed; position is computed from the parent planet's angle.
-- **Unstable Lagrange (L1/L2/L3):** Station slowly drifts — players must occasionally activate a "station-keeping burn" (consumes fuel from a docked fuel-tank module). Drift accumulates in the CRDT `anomaly` field.
-- **Free-floating:** Station holds its `position` until a player triggers a course correction or docking event.
+- **Unstable Lagrange (L1/L2/L3):** Drift is **computed** as `driftPerTick × (nowTick − lastStationKeepingTick)` — nothing ticks in the CRDT. A "station-keeping burn" (consumes fuel from a docked fuel-tank module) is a **discrete, host-sequenced event** that updates `lastStationKeepingTick`, the only CRDT mutation in the loop.
+- **Free-floating:** Station holds its `position` until a player triggers a course correction or docking event (also discrete, host-sequenced).
+
+> **Determinism contract (v006 §8.3):** all derived positions compute from the shared integer **simulation tick** (epoch + fixed tick length, synced via the ping probe), never from local wall-clock, using a specified float profile — so every peer renders each station in the same place. Freight and docking depend on this agreement.
 
 ### CRDT Sync
 
@@ -157,7 +170,7 @@ stationOrbits.set('deep-relay', {
 });
 ```
 
-Because `stationOrbits` is a CRDT `Y.Map`, concurrent placement updates (two players repositioning the same station simultaneously) resolve deterministically without a server.
+Because `stationOrbits` is a CRDT `Y.Map`, concurrent *cosmetic* edits resolve deterministically without a server. However (v006 §5.3/§8.4): **station placement, module attachment/removal, and any ownership-sensitive or scarce-resource change is host-sequenced** — a signed intent to the zone host, a signed result into the doc — so "who placed first" is never decided by CRDT merge order. The solar system is also **sharded** (v006 §8.2): a slim `solar-index` doc for stable summaries, per-zone docs for local state, RoomLog topics for durable posts/contracts — no monolithic solar doc.
 
 ---
 
@@ -241,4 +254,5 @@ Building on the capsule ownership established in Phase 1, owners can now rearran
 - [ ] Attaching rocket engine + fuel tank + flight deck flags capsule as spaceship
 - [ ] Station snap-on modules (gravity machine, gyroscope) render correctly
 - [ ] Room editing works: drag objects, persist via Yjs, undo/redo
+- [ ] **RoomLog minimal:** a bulletin-board post survives full peer churn (poster and all readers disconnect/reconnect); contract postings replicate to zone co-hosts; chat swaps `ChatProvider` from `yjs-demo` to `roomlog` without UI changes; **T&S gate satisfied** (co-host refusal + node denylist wired, v006 §7)
 - [ ] Sovereignty check: all of the above work on a LAN with no internet access

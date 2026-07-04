@@ -4,7 +4,7 @@
 > **Product Goal:** "I arrived at Furlong Station. I can explore public rooms, chat with others, and claim my own capsule."  
 > **Technical Goal:** Deliver first multiplayer playable prototype in 6-8 weeks using the sovereign tech path  
 > **Status:** 🔵 In Progress
-> **Architecture Reference:** [STUDY-Architecture v002](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v002.md) — the sovereignty blueprint this plan implements
+> **Architecture Reference:** [STUDY-Architecture v006](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — the verified sovereignty blueprint this plan implements (supersedes v005/v002; spike-gated items are explicitly marked)
 
 ---
 
@@ -49,8 +49,8 @@ By end of Phase 1, we must deliver:
 |----------|-----------|---------|-----------|
 | **Build Tool** | Vite | 5.x | Fast dev server, smooth HMR |
 | **Rendering Engine** | Three.js | r167+ | Mature WebGL library, rich documentation |
-| **Room State / Chat** | Yjs | 13.x | CRDT — offline-first, conflict-free sync over *our own* transport; replaces Zustand + any server-relay |
-| **P2P Transport** | simple-peer | 9.x | WebRTC data channels in-browser; stays in the TS layer per Architecture §14 |
+| **Room State / Chat** | Yjs + y-protocols + y-indexeddb | 13.x | CRDT — offline-first, conflict-free sync over *our own* transport; Awareness = **discrete presence only** — positions ride the datagram ticks, never Awareness or the persisted doc (v006 §8.1) |
+| **P2P Transport** | **WebTransport (browser API)** | Baseline 2026 | Raw WT + `serverCertificateHashes` dial to a player node — no CA, no signaling; datagrams (ticks) + streams (sync). Replaces `simple-peer` (v005 §6) |
 | **Serialization** | msgpackr | 1.x | MessagePack for all non-hot-path messages (chat, CRDT updates, interactions) |
 | **UI Framework** | Vanilla HTML/CSS | — | Keep Phase 1 simple, can migrate to React later |
 
@@ -59,11 +59,12 @@ By end of Phase 1, we must deliver:
 | Category | Technology | Version | Rationale |
 |----------|-----------|---------|-----------|
 | **App Shell** | Tauri | 2.x | ~12 MB installer; native webview runs the shared TS game core |
-| **Async Runtime** | Tokio | 1.x | Powers embedded signaling server and future `libp2p` integration |
-| **Embedded Signaler** | axum + tokio-tungstenite | 0.7.x / 0.23.x | ~small Rust file; WSS WebRTC broker running *inside* every Tauri node — no third-party server needed |
-| **Native P2P** | rust-libp2p | 0.54.x | QUIC + gossipsub + Kademlia DHT; native swarm needs zero external servers |
+| **Async Runtime** | Tokio | 1.x | Powers the WebTransport listener and future node subsystems |
+| **Browser Pipe** | wtransport | 0.6.x | WebTransport server *inside* every Tauri node — self-signed ≤14-day ECDSA cert, hash-pinned by clients; no signaling service at all |
+| **CRDT Host** | yrs | 0.2x | Rust port of Yjs (y-sync protocol + Awareness) — the node hosts room docs natively (v005 §3.6) |
+| **Native P2P (Phase 2+)** | iroh *(spike-gated)* | 1.x | QUIC hole-punching + self-hosted relays + blobs; replaces the v002 `rust-libp2p` plan pending v006 spikes #1 (five-crate build) and #6 (sovereignty gate). **Own UDP socket — never shares 443 with wtransport (v006 §5.1 port split)** |
 
-> **No Socket.io. No Railway/Render. No public STUN/TURN.** The Tauri node IS the signaling/STUN/relay server. See Architecture STUDY v002 §6 and §9.2.
+> **No Socket.io. No Railway/Render. No STUN/TURN. No signaling server at all.** WebTransport needs no SDP exchange — the browser dials the Tauri node directly and pins its certificate hash. See Architecture STUDY v005 §6 and §12.
 
 ### Development Tools
 
@@ -99,13 +100,14 @@ prototypes/01-core-loop-demo/
 │   ├── player.ts                 # Player entity
 │   ├── input.ts                  # Input controls
 │   ├── network/
-│   │   ├── NetworkProvider.ts    # WebRTC via simple-peer
-│   │   └── YjsSync.ts            # Yjs CRDT room-state sync
+│   │   ├── NetworkProvider.ts    # Transport port — raw WebTransport certhash dial (v005 §12.2)
+│   │   ├── YjsSync.ts            # Yjs CRDT room-state sync (y-sync + awareness handshake)
+│   │   └── RoomLog.ts            # Append-only social-log port (Phase 1: stub seam, v005 §7)
 │   └── utils.ts                  # Utility functions
 ├── src-tauri/                    # Tauri shell (Rust — the sovereign backbone)
 │   ├── src/
 │   │   ├── main.rs               # Tauri entry point
-│   │   └── signaling.rs          # Embedded WSS WebRTC signaler (~small file)
+│   │   └── wt_listener.rs        # wtransport server: certhash TLS, datagram + stream routing
 │   └── Cargo.toml
 ├── public/
 │   └── assets/                   # Textures, sounds
@@ -379,112 +381,118 @@ prototypes/01-core-loop-demo/
 
 ### 🌐 Sprint 3: Multiplayer Networking (Week 5-6)
 
-**Goal:** Implement 2-4 player concurrent online via WebRTC P2P, brokered by the embedded Tauri signaler. No third-party server required.
+**Goal:** Implement 2-4 player concurrent online via **raw WebTransport** (datagrams + streams) direct to a player-run Tauri node. No third-party server, no CA, no signaling service.
 
 #### Architecture: Sovereign Networking
 
-> From Architecture STUDY v002 §5-6: the Tauri client is the sovereign backbone. Every player running the native client optionally contributes signaling, STUN reflection, and NAT relay — so the browser client is sovereign-by-proxy, depending only on *a player's* Tauri node, never on a company or third-party service.
+> From Architecture STUDY v005 §5–§6 (two trust lanes): the Tauri node is the sovereign backbone. The browser dials the node with `serverCertificateHashes` — trusting a specific self-signed certificate by SHA-256 hash — so *node-transport trust* needs no Web PKI and no SDP/ICE signaling at all. The browser client is sovereign-by-proxy, depending only on *a player's* Tauri node, never on a company or third-party service.
 
 ```
-  Browser (web)                        Player-run TAURI NODE
-  ┌─────────────────────┐              ┌──────────────────────────────┐
-  │ Three.js + Yjs      │  WebRTC DC   │ Three.js + Yjs               │
-  │ simple-peer         │◄────────────►│ simple-peer (in webview)     │
-  │                     │              │                              │
-  │                     │  WSS signal  │ signaling.rs (embedded WSS)  │
-  │                     │◄────────────►│ STUN reflection              │
-  └─────────────────────┘              │ NAT relay (app-layer)        │
-                                       └──────────────────────────────┘
+  Browser (web)                          Player-run TAURI NODE (room host)
+  ┌─────────────────────┐                ┌──────────────────────────────┐
+  │ Three.js + Yjs      │  WT datagrams  │ wtransport server (Rust)     │
+  │ y-protocols         │◄──────────────►│  ├ ticks / awareness / ping  │
+  │ WebTransport API    │  WT streams    │  ├ y-sync doc host (yrs)     │
+  │ (certhash dial)     │◄──────────────►│  ├ chat / RoomLog (stub)     │
+  └─────────────────────┘                │  └ capability check          │
+                                         └──────────────────────────────┘
 ```
 
-**No Socket.io. No hosted server. No public STUN.** Phase 1 uses a baked-in seed address (localhost Tauri node during dev) for first contact; Chia on-chain host registry is added in Phase 3+ for production bootstrap.
+**No Socket.io. No hosted server. No STUN/TURN. No signaling.** Phase 1 uses a baked-in seed address (localhost Tauri node during dev) for first contact; the join string is `URL + certhash`. The Chia on-chain host registry is added in Phase 3+ for production bootstrap.
+
+> **Sprint 3 pre-work (spikes, v006 §15.1):** **B‑1 five-crate build gate** — runs in parallel, gates the Phase-2+ stack (iroh 1 + p2panda 0.6.1 + yrs 0.27 + wtransport 0.6 + chia-wallet-sdk for desktop **and `aarch64-linux-android`**, report APK size); **#2 certhash dial matrix** — Chrome/Firefox/Safari 26.4, IP-literal vs LAN, **UDP 443**, IPv6, the Chrome 142/147 **Local Network Access prompt** on LAN dials, and `reload_config` cert rotation under live sessions; **#5 yrs⇄Yjs conformance** — sync + Awareness churn + update formats. The ping/pong comms probe is an in-sprint implementation detail of Tasks 3.2/3.4 (Chrome has no `WebTransport.getStats()`).
+>
+> **Sprint 3 also delivers [docs/TDD/BrowserSupportMatrix.md](../BrowserSupportMatrix.md)** — the date-stamped platform table (v006 P‑11: re-verified before every networking sprint; the LNA row flipped within one day of v004).
+>
+> **Explicitly *not* in Sprint 3 (spike-gated, v006 §5):** the iroh native backbone, the iroh-WASM fallback lane, and p2panda RoomLog — only the `RoomLog.ts` port *stub* is created so the seam exists.
 
 ---
 
-#### Task 3.1: Embed Sovereign Signaling Server in Tauri Node
+#### Task 3.1: WebTransport Listener in the Tauri Node
 
-**Responsibility:** Every Tauri client runs a tiny WebSocket broker that facilitates WebRTC SDP/ICE exchange between peers. No external signaling service.
+**Responsibility:** Every Tauri node runs a `wtransport` server that browser clients dial directly. No external service of any kind.
 
-**Implementation (Rust — `src-tauri/src/signaling.rs`):**
-- `axum` WebSocket upgrade handler
-- In-memory `HashMap<RoomId, Vec<PeerId>>` — no DB
-- Relay SDP `offer`/`answer` and ICE candidates between peers in the same room
-- Emit `peer:joined` / `peer:left` events
-- Bind on `127.0.0.1:3000` for dev; expose on LAN for other players
-
-**Key Events (over WSS):**
-- `join` — browser registers itself for a room
-- `offer` / `answer` — relay SDP between two peers
-- `ice` — relay ICE candidate
-- `peer:joined` / `peer:left` — roster notifications
+**Implementation (Rust — `src-tauri/src/wt_listener.rs`):**
+- `wtransport` server with a **self-signed ECDSA P-256 certificate, ≤ 14-day validity** (WebTransport spec requirement), auto-rotating with staged `current`/`next` hashes via `Endpoint::reload_config(cfg, rebind=false)` — hot swap without dropping sessions (verified API, v006 §3.2)
+- Surface the active cert's SHA-256 hash in the Tauri UI and in the join URL/QR payload; join-string format = `URL + certhash + challenge` (v006 §12.2 `ClientHello`); when the phone-join UI lands, QR decoding uses a **bundled WASM decoder (zxing-wasm)** — `BarcodeDetector` is not cross-browser (v004 §6.4 decision)
+- Accept session → read `Hello { roomId, capability }` → route **datagrams** (movement ticks, awareness, ping/pong) and **bidi streams** (y-sync, chat) per the `SsfEnvelope` framing (v005 §12.2)
+- In-memory room roster — no DB
+- Bind `127.0.0.1:4443` for dev; LAN + UDP 443 for the reachability spike
 
 **Acceptance Criteria:**
-- [ ] `cargo tauri dev` starts Tauri app with embedded signaler on port 3000
-- [ ] Two browser windows served by the Tauri webview can connect to the signaler
-- [ ] Signaler logs SDP relay events in the Tauri console
+- [ ] `cargo tauri dev` starts the Tauri app with the WT listener up
+- [ ] A browser connects via `new WebTransport(url, { serverCertificateHashes })` with **no CA warning and no interstitial**
+- [ ] Datagram and stream echo round-trips verified in the Tauri console
+- [ ] Cert rotation produces overlapping `current`/`next` hashes without dropping sessions
 
-**Estimated Time:** 4 hours
+**Estimated Time:** 6 hours
 
 ---
 
-#### Task 3.2: WebRTC P2P via `simple-peer` (Client)
+#### Task 3.2: Browser Dial + Movement Sync (`NetworkProvider`)
 
 **Responsibilities:**
-- Connect to the Tauri-node signaler via WebSocket
-- Exchange SDP offer/answer and ICE candidates
-- Open a WebRTC data channel per peer pair
-- Send local player position ticks (unreliable channel)
-- Sync Yjs CRDT state updates (reliable channel)
+- Implement the `NetworkProvider` port from v005 §12.2: `connect()` (certhash dial), `mode(): TransportMode`, `durability(): DurabilityState`, `stats()`
+- Dial with `new WebTransport(url, { serverCertificateHashes })` — Baseline 2026 (Chrome/Edge 100+, Firefox 125+, Safari 26.4+)
+- Send local player position ticks over **datagrams** (unreliable)
+- Open the reliable bidi stream for sync messages
+- Compute RTT/loss from our own `ping`/`pong` datagrams (Chrome does not implement `WebTransport.getStats()` — v005 §3.3)
 
-**Two-channel design:**
-| Channel | Mode | Content |
+**Two-lane design:**
+| Lane | WT mechanism | Content |
 |---------|------|---------|
-| `movement` | unreliable, ordered | 13-byte hand-packed `DataView` position tick |
-| `sync` | reliable, ordered | MessagePack messages (CRDT updates, chat, interactions) |
+| `movement` | datagrams (unreliable) | 13-byte hand-packed `DataView` position tick |
+| `sync` | bidi stream (reliable, ordered) | `SsfEnvelope`-framed messages (y-sync, chat, interactions) |
 
-**Player Synchronization:**
+**Player Synchronization (three-lane rule, v006 §8.1):**
 - Local player: immediate response (client-side prediction)
-- Remote players: position updates from WebRTC unreliable channel at 20 Hz
+- Remote players: positions from the **13-byte datagram ticks** at 20 Hz (50 ms), only-on-change, interpolated — **never through Awareness** (Awareness re-broadcasts the full client state per update; it is for discrete presence, not continuous streams)
+- Awareness carries **discrete presence only**: join/leave, display name, typing/speaking flags, AFK — at human rates
 - Room state (furniture, bulletin boards): Yjs CRDT synced on connect and on change
-- Update frequency: 50 ms (20 updates/second) on movement channel
-- Only send when position changes
+- `TransportMode` reported to gameplay: `direct-unreliable` normally; `direct-reliable` when datagrams are unavailable (movement ticks over the reliable stream at reduced rate)
 
 **Remote Player Management:**
-- Create/destroy remote player entities on `peer:joined` / `peer:left`
-- Update positions from WebRTC data channel
+- Create/destroy remote player entities on awareness join/leave
 - Different visual representation (red vs green)
-- Room-based visibility (only connect to peers in the same room)
+- Room-based scoping (one WT session + one Y.Doc per room)
 
 **Acceptance Criteria:**
-- [ ] Two Tauri windows (or browser tabs served by Tauri) can see each other move
-- [ ] Movement syncs smoothly (< 100 ms latency, LAN)
-- [ ] Player disconnect removes entity correctly
-- [ ] No public internet dependency — works on a LAN with no internet access
+- [ ] Two browser tabs connected to one Tauri node see each other move (< 100 ms latency, LAN)
+- [ ] Player disconnect removes the remote entity (awareness timeout)
+- [ ] No public internet dependency — works on a LAN with no internet access (note the Chrome 142/147 LNA permission prompt on public-origin → LAN dials; make the first dial from page context, not a worker — v005 §3.2)
+- [ ] `stats()` reports live RTT/loss from the ping/pong probe
 
 **Estimated Time:** 5 hours
 
 ---
 
-#### Task 3.3: Yjs CRDT Room State
+#### Task 3.3: Yjs CRDT Room State (`YjsSync`)
 
-**Purpose:** Bulletin boards, furniture placement, and persistent chat history are shared documents — not server-relayed events. Yjs handles merging offline edits and reconnect sync automatically.
+**Purpose:** Bulletin boards, furniture placement, and chat history are shared documents — not server-relayed events. Yjs handles merging offline edits; the node hosts the authoritative doc natively via **yrs** (the Rust y-sync implementation, incl. `Awareness` — verified v005 §3.6).
 
 **Yjs document structure:**
 ```typescript
 const roomDoc = new Y.Doc()
-const chat    = roomDoc.getArray<ChatMessage>('chat')   // append-only log
+// SESSION-CAPPED demo storage behind a ChatProvider seam ('yjs-demo' | 'roomlog');
+// durable chat history is promised only when RoomLog lands (v006 §8.4)
+const chat    = roomDoc.getArray<ChatMessage>('chat')
 const objects = roomDoc.getMap<ObjectState>('objects')  // furniture / interactables
-const players = roomDoc.getMap<PlayerPresence>('players') // online presence
+// Positions ride the DATAGRAM TICKS; Awareness = discrete presence ONLY (v006 §8.1)
+const awareness = new Awareness(roomDoc)
 ```
 
-**Sync provider:** custom `WebrtcProvider`-equivalent that uses the `sync` data channel (reliable) instead of `y-webrtc`'s public signaling server. No third-party signaling.
+**Sync provider:** custom provider over the WT reliable stream using `y-protocols` — **with the state-vector re-handshake**: on every (re)connect both sides exchange `SyncStep1` (state vectors) so a returning peer receives exactly the missing updates, never a blind incremental stream (v005 §12.3). No third-party signaling or sync server.
+
+**Signed-delta seam:** every state-mutating message rides the `SsfEnvelope` with an Ed25519 signature field; the node verifies **before** applying to the doc (v005 §12.4). Phase 1 may stub key management, but the verify-before-apply seam must exist.
 
 **Acceptance Criteria:**
-- [ ] Two peers share the same `chat` array in real time
+- [ ] Two peers share the same `chat` array in real time (session-capped at ~200 messages)
 - [ ] Capsule ownership state is CRDT-synced across peers
-- [ ] Reconnecting peer receives full room state without a server
+- [ ] Reconnecting peer converges via the state-vector handshake without a full replay
+- [ ] Awareness carries presence only; positions arrive via datagrams and are never written to IndexedDB
+- [ ] `y-indexeddb` gives instant local load before the first peer connects
 
-**Estimated Time:** 4 hours
+**Estimated Time:** 5 hours
 
 ---
 
@@ -493,8 +501,8 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 **Optimization Strategies:**
 
 1. **Client-Side Prediction**
-   - Local player responds immediately
-   - No round-trip confirmation needed (P2P, no authoritative server in Phase 1)
+   - Local player responds immediately; movement needs no round-trip confirmation
+   - The node is **soft-authoritative for persistent room state** (signed envelopes verified before apply); awareness is best-effort and non-authoritative — v006 §8.4
    - Reduces perceived input lag
 
 2. **Position Interpolation**
@@ -508,8 +516,11 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
    - Only send position when changed; delta-compress if unchanged
 
 4. **Room-Based Filtering**
-   - WebRTC connections only created between peers in the same room
-   - Yjs doc per room — don't sync unrelated rooms
+   - One WT session + one Yjs doc per room — don't sync unrelated rooms
+   - Awareness scoped per room doc
+
+5. **Comms Weather (seed)**
+   - Surface the ping/pong RTT/loss in a small HUD indicator — the Phase 3 diegetic "comms weather" console starts here (v005 §3.3)
 
 **Acceptance Criteria:**
 - [ ] Network latency < 100 ms (LAN)
@@ -523,16 +534,18 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 #### Sprint 3 Summary
 
 **Deliverables:**
-- ✅ Embedded sovereign WebSocket signaler in Tauri node (Rust)
-- ✅ WebRTC P2P connections brokered without any third-party service
-- ✅ 2-4 player multiplayer with movement and Yjs room-state sync
+- ✅ `wtransport` WebTransport listener in the Tauri node (Rust) with rotating certhash identity
+- ✅ Browser certhash dial — zero third-party services, zero signaling
+- ✅ 2-4 player multiplayer: datagram movement + awareness presence + Yjs room-state sync
+- ✅ `NetworkProvider` / `YjsSync` ports implemented; `RoomLog` port stubbed (the v006 seams)
+- ✅ [BrowserSupportMatrix.md](../BrowserSupportMatrix.md) verified/updated with this sprint's findings
 
 **Demo Milestone:** Demo with 2 physical devices on a LAN — no internet required
 
 **Technical Validation:**
 - Latency: < 100 ms (LAN), < 200 ms (remote)
 - Frame rate: 60 fps maintained
-- Connection stability: No unexpected disconnects
+- Connection stability: No unexpected disconnects; reconnect converges via state-vector handshake
 - Sovereignty check: Disconnect the dev's server — game still connects and plays ✅
 
 ---
@@ -569,10 +582,10 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 - Input field + send button
 - Mode toggle button (Global/Proximity)
 
-**Server-Side:**
-- Chat messages are appended to the Yjs `chat` array in the room document
-- Yjs CRDT sync propagates messages to all peers over the WebRTC reliable channel
-- No Socket.io server, no hosted relay — history persists in the CRDT and is replayed on reconnect
+**Sync path:**
+- Chat messages are appended to the Yjs `chat` array in the room document (session-capped demo storage behind the `ChatProvider` seam — v006 §8.4)
+- Yjs CRDT sync propagates messages to all peers over the WebTransport reliable stream
+- No Socket.io server, no hosted relay — session history replays on reconnect; durable history arrives with RoomLog (Phase 2+)
 
 **Message Format:**
 - Sender name (colored by mode)
@@ -632,9 +645,9 @@ const players = roomDoc.getMap<PlayerPresence>('players') // online presence
 
 **Purpose:** Players can claim one of the capsule rooms off the lobby as their own. Other players see who owns each capsule. This is the foundation for the full ownership and editing system in Phase 2.
 
-**Ownership Model (Phase 1 — local/CRDT only):**
+**Ownership Model (Phase 1 — CRDT state, host-sequenced claims):**
 - Each capsule slot has an `owner` field in the Yjs `objects` map
-- A player can claim an unclaimed capsule by pressing E at its door panel
+- Claims are **host-sequenced** (v006 §8.4): pressing E at the door panel sends a signed claim intent; the node accepts the first intent per slot and writes the authoritative result — two racing claimers resolve deterministically, not by CRDT merge luck
 - Owner's name displayed above the capsule door
 - Owner can enter their capsule; others see a "Private — [Owner]" prompt
 
@@ -729,36 +742,38 @@ capsules: Y.Map<CapsuleState>
 
 ## 🔧 Key Technical Decisions
 
-### Decision 1: Network Architecture — Sovereign WebRTC vs Socket.io
+### Decision 1: Network Architecture — Raw WebTransport (certhash) vs WebRTC + Signaler vs Socket.io
 
 **Problem:** Which networking solution aligns with both Phase 1 speed and the project's sovereignty requirement?
 
-**Decision:** WebRTC P2P brokered by an embedded Tauri signaling server
+**Decision:** Raw WebTransport with `serverCertificateHashes`, dialed directly against a player-run Tauri node
 
-**The Sovereignty Test (from Architecture STUDY v002 §3):**
+> **Supersession trail:** v002 originally selected WebRTC (`simple-peer`) brokered by an embedded WSS signaler. v003 found the certhash mechanism; v004 verified it is **Baseline 2026** (Chrome/Edge 100+, Firefox 125+, **Safari 26.4**); v005 re-verified and locked it (§3.1, §6). WebRTC survives only as the proximity-voice path and a fallback lane — it is no longer the primary transport, and the WSS signaler is deleted from the plan entirely.
+
+**The Sovereignty Test (from Architecture STUDY v002 §3, unchanged):**
 > *"If GitHub, Cloudflare, and the dev team all disappeared tomorrow, could a player's Tauri node bootstrap the game?"*
 
-Socket.io requires a hosted server on Railway/Render — a third party we do not control. It fails the Sovereignty Test immediately. The embedded Tauri signaler passes it: the infrastructure is the player base.
+Socket.io requires a hosted server — fails immediately. The v002 WebRTC+signaler passed the test but carried an SDP/ICE dance, a WSS-to-node certificate wrinkle, and 1-2 s connect times. Raw WebTransport passes the test *and* deletes the signaling layer outright.
 
 **Rationale:**
-| Criteria | Socket.io + Railway/Render | WebRTC + Embedded Tauri Signaler |
-|----------|---------------------------|----------------------------------|
-| **Sovereignty** | ❌ Fails — third-party server | ✅ Passes — player-run infra |
-| **Implementation Speed** | ✅ 1-2 days | ✅ 1-2 days (signaler is ~small Rust file) |
-| **Debugging** | ✅ Simple message inspection | ✅ Tauri console + `simple-peer` event log |
-| **P2P Scale** | ❌ Server bottleneck | ✅ Mesh up to ~12-15 peers; host authority beyond |
-| **Offline / LAN play** | ❌ Requires internet + server | ✅ Works on LAN with zero internet |
-| **Cost** | ⚠️ Requires free/paid hosting | ✅ Zero infra cost |
-| **Alignment with Phase 2+** | ❌ Must be ripped out | ✅ Grows into Chia registry + libp2p DHT |
+| Criteria | Socket.io + hosted | WebRTC + embedded signaler (v002) | **Raw WT + certhash (v005)** |
+|----------|---------------------------|----------------------------------|------------------------------|
+| **Sovereignty** | ❌ third-party server | ✅ player-run infra | ✅ player-run infra |
+| **Signaling required** | hosted server | WSS broker in node + SDP/ICE | ✅ **none** — dial `URL + hash` |
+| **CA / domain needed** | yes | none for DC; wrinkles for WSS | ✅ none — hash-pinned self-signed cert |
+| **Browser reach** | all | all | ✅ Baseline 2026 incl. Safari 26.4 |
+| **Unreliable lane (ticks)** | ❌ TCP only | ✅ unordered DC | ✅ native QUIC datagrams |
+| **Connect time** | fast | ~1-2 s ICE | ✅ 1-RTT QUIC handshake |
+| **Alignment with Phase 2+** | ❌ rip out | ⚠️ partial | ✅ grows into iroh backbone + Chia registry (v005 §6) |
 
 **Trade-offs accepted:**
-- WebRTC NAT traversal adds complexity → mitigated by baked-in seed list and Tauri-embedded STUN reflection
-- `simple-peer` ICE negotiation takes ~1-2 s on first connect → acceptable for Phase 1
+- The node must be UDP-reachable (dorm/corporate UDP blocks → the v006 §11 fallback ladder; UDP 443 masquerade is part of Sprint-3 spike #2). Note the v006 §5.1 ruling: iroh (noq) and wtransport (quinn) are different QUIC stacks — **they never share a socket**; wtransport owns 443
+- ≤ 14-day certificates demand rotation automation → staged `current`/`next` hashes + `reload_config` hot swap (v006 §3.2)
 
 **Future Path:**
-- Phase 2: LAN-local Tauri nodes auto-discover via mDNS (zero config)
+- Phase 2: LAN mDNS auto-discovery (native); **iroh** backbone + iroh-relay fallback lane *(gated on v006 spikes #1 and #6)*
+- Phase 2: RoomLog minimal for boards/contracts *(gated on v006 spike #3 bakeoff + the §7 T&S design note)*
 - Phase 3: Chia on-chain host registry as the production bootstrap (no seed list needed)
-- Phase 4+: `rust-libp2p` QUIC + gossipsub replaces signaler for native swarm
 
 ---
 
@@ -799,7 +814,7 @@ Socket.io requires a hosted server on Railway/Render — a third party we do not
 | **Offline / reconnect** | ❌ State lost on disconnect | ✅ Automatic catchup on reconnect |
 | **Chat history** | ❌ Needs server persistence | ✅ `Y.Array` is the persistent log |
 | **Furniture / objects** | ❌ Needs authoritative server | ✅ `Y.Map` CRDT, any peer can edit |
-| **Sovereignty** | ❌ Implies a sync server | ✅ Syncs over our own WebRTC transport |
+| **Sovereignty** | ❌ Implies a sync server | ✅ Syncs over our own transport (WebTransport) |
 
 Zustand is useful for *purely local* UI state (chat panel open/closed, graphics settings). Yjs owns everything that crosses the network.
 
@@ -875,20 +890,21 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 
 ---
 
-### Risk 2: WebRTC NAT Traversal Failures
+### Risk 2: UDP/QUIC Blocked on Restrictive Networks
 
-**Description:** Some network configurations (symmetric NAT, corporate firewalls) can block WebRTC peer-to-peer connections even with STUN
+**Description:** WebTransport rides QUIC/UDP. Some networks (dorms, corporate firewalls, hotel captive portals) drop non-DNS UDP, which blocks the primary transport outright. Additionally, Chrome 142/147+ gates public-origin → LAN dials behind the **Local Network Access permission prompt** (v005 §3.2).
 
 **Impact:** Medium — affects players on restrictive networks
 
-**Likelihood:** Low-Medium — most home/mobile networks work fine with STUN
+**Likelihood:** Medium on campus/corporate networks; low at home
 
 **Mitigation:**
-1. **Embedded Tauri STUN:** Tauri node reflects ICE candidates itself — no Google STUN dependency
-2. **App-Layer Relay:** Tauri node acts as relay of last resort for peers that can't connect directly
-3. **Baked-in seed list:** Multiple community Tauri nodes in the build reduce single-point failure
+1. **UDP 443 listener:** many "UDP-blocked" networks still allow UDP/443 (QUIC = HTTP/3) — Sprint-3 spike #2 measures this; IPv6 tested as a first-class lane
+2. **`TransportMode` degradation:** report `direct-reliable` / `relayed-*` / `store-forward` so gameplay demotes gracefully instead of failing (v006 §12.6 / v005 §12.2)
+3. **LAN mode:** same-network play needs no upstream at all; handle the LNA prompt diegetically ("Extend station comms onto your local network?") and make the first LAN dial from page context, not a worker
+4. **Phase 2+ fallback lane:** self-hosted **iroh-relay** on TCP/443 — byte-indistinguishable from HTTPS, the realistic hostile-network workhorse (v006 §11) *(spike-gated)*
 
-**Contingency:** Display connection quality indicator; guide players to run a Tauri node for better connectivity
+**Contingency:** Comms-weather indicator shows degraded mode; guide players to run a Tauri node / Station-in-a-Box for better connectivity
 
 ---
 
@@ -922,7 +938,7 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 2. **LAN mDNS:** Tauri nodes on the same LAN discover each other automatically (zero config, Phase 2)
 3. **Chia registry (Phase 3+):** On-chain host list is the censorship-proof bootstrap — no stale seed list
 
-**Contingency:** Allow players to manually enter a known Tauri node address
+**Contingency:** Allow players to manually enter a known Tauri node address + certificate hash (the join-string format from v005 §12.3)
 
 ---
 
@@ -1021,23 +1037,28 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 - [Three.js Documentation](https://threejs.org/docs/)
 - [Tauri Documentation](https://tauri.app/v2/guide/)
 - [Yjs Documentation](https://docs.yjs.dev/)
-- [simple-peer Documentation](https://github.com/feross/simple-peer)
+- [WebTransport API (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport)
+- [wtransport — Rust WebTransport server](https://github.com/BiagioFesta/wtransport)
+- [yrs — Yjs in Rust](https://github.com/y-crdt/y-crdt)
 - [Vite Documentation](https://vitejs.dev/)
-- [rust-libp2p Documentation](https://docs.rs/libp2p/latest/libp2p/)
 - [msgpackr Documentation](https://github.com/kriszyp/msgpackr)
+- [iroh Documentation](https://docs.iroh.computer/) *(Phase 2+ spike)*
+- [p2panda](https://p2panda.org/) *(RoomLog spike)*
+- [chia-wallet-sdk](https://github.com/xch-dev/chia-wallet-sdk) *(Phase 3+)*
 
 ### Tutorials and Examples
 - [Three.js Journey](https://threejs-journey.com/) - Excellent Three.js tutorials
 - [Tauri Getting Started](https://tauri.app/v2/guide/create/) - Tauri project setup
 - [Yjs Shared Editing](https://docs.yjs.dev/getting-started/a-collaborative-editor) - CRDT intro
-- [simple-peer Examples](https://github.com/feross/simple-peer/tree/master/example) - WebRTC data channels
+- [Using WebTransport (Chrome guide)](https://developer.chrome.com/docs/capabilities/web-apis/webtransport) - datagrams + streams walkthrough
 - [Multiplayer Game Architecture](https://www.gabrielgambetta.com/client-server-game-architecture.html)
 
 ### Architecture References
-- [Architecture STUDY v002](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v002.md) — the sovereign tech path this plan implements
-- §5 "Web-First, Tauri-Best" delivery model
-- §6 Sovereign Discovery & Signaling Layer
-- §9.2 The sovereign signaler (embedded Rust WSS broker)
+- [Architecture STUDY v006](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — the verified blueprint this plan implements
+- §5 The four blocker resolutions (port split, Station-in-a-Box trust, markets, RoomLog insurance)
+- §8 Data discipline — the three motion lanes and derive-don't-tick rule this plan follows
+- §12 Deployment playbook — code for the node, handshake, and the `NetworkProvider`/`YjsSync`/`RoomLog` ports
+- Historical: [v005](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v005.md) (the all-Rust node study) · [v002](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v002.md) (original WebRTC+signaler plan) · [v004](../../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v004.md) (platform verification pass)
 
 ### Inspiration References
 - **Habbo Hotel** - Isometric social game
