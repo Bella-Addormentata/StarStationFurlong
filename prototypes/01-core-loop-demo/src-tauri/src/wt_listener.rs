@@ -154,13 +154,14 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
                 let hub_clone = hub.clone();
                 let remote_addr_inner = remote_addr;
                 let mut room_id_inner = chosen_room.clone();
+                let connection_clone = connection.clone();
                 
                 tokio::spawn(async move {
                     let mut length_buf = [0u8; 4];
                     loop {
                         // Read length prefix
                         if let Err(e) = recv.read_exact(&mut length_buf).await {
-                            if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                            if !matches!(e, wtransport::error::StreamReadExactError::FinishedEarly(_)) {
                                 eprintln!("Error reading stream length: {:?}", e);
                             }
                             break;
@@ -193,7 +194,7 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
                                     connections: HashMap::new(),
                                 }
                             });
-                            room.connections.insert(remote_addr_inner, connection.clone());
+                            room.connections.insert(remote_addr_inner, connection_clone.clone());
                         }
 
                         // Route the SsfEnvelope by kind (ysync, chat, etc.)
@@ -205,14 +206,27 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
                         } else if envelope.kind == "awareness" {
                             // Forward awareness presence blocks directly to other room peers
                             if let Some(ref r_id) = room_id_inner {
-                                let rooms = hub_clone.rooms.lock().unwrap();
-                                if let Some(room) = rooms.get(r_id) {
-                                    for (&addr, peer_conn) in &room.connections {
-                                        if addr != remote_addr_inner {
-                                            let mut s = peer_conn.open_bi().await.unwrap().0;
-                                            let _ = s.write_all(&length_buf).await;
-                                            let _ = s.write_all(&payload_buf).await;
-                                        }
+                                // Collect peer connections while holding the lock, then release it before awaiting
+                                let peers: Vec<Connection> = {
+                                    let rooms = hub_clone.rooms.lock().unwrap();
+                                    rooms.get(r_id).map(|room| {
+                                        room.connections
+                                            .iter()
+                                            .filter(|(&addr, _)| addr != remote_addr_inner)
+                                            .map(|(_, conn)| conn.clone())
+                                            .collect()
+                                    }).unwrap_or_default()
+                                };
+                                for peer_conn in peers {
+                                    match peer_conn.open_bi().await {
+                                        Ok(opening) => match opening.await {
+                                            Ok((mut s, _)) => {
+                                                let _ = s.write_all(&length_buf).await;
+                                                let _ = s.write_all(&payload_buf).await;
+                                            }
+                                            Err(e) => eprintln!("Failed opening peer stream: {:?}", e),
+                                        },
+                                        Err(e) => eprintln!("Failed initiating peer stream: {:?}", e),
                                     }
                                 }
                             }
