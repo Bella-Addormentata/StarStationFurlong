@@ -28,11 +28,12 @@ GDD/ (Game Design Documents)
     ├─ Content: Gameplay mechanics, numerical balance, narrative design
     └─ Style: Detailed, visual, experience-focused
 
-TDD/01-Architecture.md (System Architecture)
+TDD architecture of record: STUDY-Architecture v006 (brainstorming/AI BRAINSTORMING/)
     ↓ "Overall technical approach, technology selection rationale"
     ├─ Audience: Tech leads, architects
-    ├─ Content: Tech stack, architecture patterns, major technical decisions
-    └─ Style: High-level, principle-based, decision-oriented
+    ├─ Content: Verified tech stack, trust lanes, storage split, spikes, pitfalls registry
+    ├─ Companion: TDD/BrowserSupportMatrix.md (date-stamped platform facts — re-verify per sprint)
+    └─ Note: TDD/01-Architecture.md is the HISTORICAL v001 study (superseded, banner inside)
 
 TDD/02-Systems/ (Subsystem Design)
     ↓ "Design solutions for each subsystem"
@@ -81,7 +82,7 @@ Each Phase execution plan should include:
    └─ Demo and retrospective at end of each Sprint
 
 4. When encountering problems
-   └─ Consult TDD/01-Architecture.md (architecture level)
+   └─ Consult STUDY-Architecture v006 (architecture level) + TDD/BrowserSupportMatrix.md (platform facts)
    └─ Consult TDD/02-Systems/ (system design level)
    └─ Update Implementation Plan (document solutions)
 

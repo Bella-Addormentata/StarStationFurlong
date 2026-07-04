@@ -15,16 +15,18 @@ Inspired by:
 * Mystical Ninja SNES https://en.wikipedia.org/wiki/The_Legend_of_the_Mystical_Ninja
 
 
-opensource tech:
-* https://github.com/feross/simple-peer
-* https://github.com/webtorrent/webtorrent
-* https://github.com/cabal-club
-* https://retroshare.cc/
-* https://github.com/Chia-Network/chia-gaming
-* https://github.com/mrdoob/three.js/
-* https://github.com/Kaetram
-* https://github.com/Tribler/tribler
-* https://worldofclaudecraft.com/
+opensource tech (current stack — see [STUDY-Architecture v006](brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) and the [Browser Support Matrix](docs/TDD/BrowserSupportMatrix.md)):
+* https://github.com/BiagioFesta/wtransport — WebTransport server (browser↔node pipe, cert-hash pinned)
+* https://github.com/n0-computer/iroh — QUIC hole-punching, relays, blobs (native swarm)
+* https://github.com/p2panda/p2panda — signed append-only logs, groups, encryption (RoomLog)
+* https://github.com/y-crdt/y-crdt + https://github.com/yjs/yjs — CRDT room state (yrs on the node, Yjs in the browser)
+* https://github.com/xch-dev/chia-wallet-sdk + https://github.com/Chia-Network/chia-gaming — deeds, offers, settlement
+* https://github.com/mrdoob/three.js/ — rendering
+* https://github.com/tauri-apps/tauri — desktop + Android shell
+
+earlier explorations (superseded by the studies in [brainstorming/](brainstorming/AI%20BRAINSTORMING/), kept for the ideas they contributed):
+* https://github.com/feross/simple-peer · https://github.com/webtorrent/webtorrent · https://github.com/cabal-club · https://retroshare.cc/ · https://github.com/Tribler/tribler
+* https://github.com/Kaetram · https://worldofclaudecraft.com/
 
 ## Quickstart: Try the Playable Demo
 

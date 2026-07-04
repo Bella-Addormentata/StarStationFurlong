@@ -18,7 +18,6 @@
   },
   "dependencies": {
     "msgpackr": "^1.12.1",
-    "simple-peer": "^9.11.1",
     "three": "^0.167.1",
     "yjs": "^13.6.31"
   }

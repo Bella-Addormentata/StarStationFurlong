@@ -78,7 +78,7 @@ graph LR
 ```
 
 * [ ] **Tech Scaffold:** Initialize the prototype stack in `prototypes/` with a web client, rendering layer, and simple world state.
-* [ ] **Small-Room Multiplayer:** Prototype WebRTC or equivalent P2P connectivity for 2-4 players in a single room.
+* [ ] **Small-Room Multiplayer:** Prototype P2P connectivity (WebTransport cert-hash dial to a player-run node — see the TDD Phase 1 plan) for 2-4 players in a single room.
 * [ ] **Basic Movement and Presence:** Implement avatar rendering, movement, and clear nearby player presence.
 * [ ] **Clone-Born Onboarding:** Start the player in a nursery or starter habitat and establish the clone-citizen fantasy immediately.
 * [ ] **Station Chores Tutorial Slice:** Add one short loop where a new player completes a simple delivery, repair, food-production, or maintenance task.

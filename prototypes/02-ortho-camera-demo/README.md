@@ -85,8 +85,9 @@ This installs the project dependencies defined in `package.json`, including:
 - `vite`
 - `typescript`
 - `yjs`
-- `simple-peer`
 - `msgpackr`
+
+> Historical demo snapshot: networking was never implemented here. The live networking seams (typed ports, protocol contracts) are in [`01-core-loop-demo/src/network/`](../01-core-loop-demo/src/network/) per [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — `simple-peer` was removed with the v005/v006 revisions.
 
 ## 4. Run the Demo in Development Mode
 
