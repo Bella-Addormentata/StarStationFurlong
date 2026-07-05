@@ -11,7 +11,8 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.6.0-core-loop-demo`](0.6.0-core-loop-demo/) | **The game (current release target).** Adds click-to-sit chair navigation, network bootstrapping (Bootstrap Link + Self-Test + seeding status), and Tab-toggled SpacePhone on top of 0.5.0 |
+| [`0.7.0-core-loop-demo`](0.7.0-core-loop-demo/) | **The game (current release target).** Inherits features from 0.6.0 including click-to-sit, bootstrap networking and the Tab phone, ready for Phase 1 Sprint 4 |
+| [`0.6.0-core-loop-demo`](0.6.0-core-loop-demo/) | Frozen v0.6.0 release snapshot: click-to-sit chair navigation, network bootstrapping (Bootstrap Link + Self-Test + seeding status), and Tab-toggled SpacePhone on top of 0.5.0 |
 | [`0.5.0-core-loop-demo`](0.5.0-core-loop-demo/) | Frozen v0.5.0 release snapshot: locked orthographic camera, hybrid WASD + point-and-click A* navigation, WebTransport multiplayer + SpacePhone chat |
 | [`0.0.1-core-loop-demo`](0.0.1-core-loop-demo/) | Original Phase 1 core loop demo (frozen): perspective camera, two-click cinematic entry, NPC with sit/stand behavior, Sprint-3 networking |
 | [`0.0.2-ortho-camera-demo`](0.0.2-ortho-camera-demo/) | Same as the original core loop but with orthographic (parallel) projection and a fully locked camera |
@@ -21,7 +22,7 @@ live game.
 ## Releasing a different demo as the app
 
 The packaged release always uses the Tauri shell from
-[`0.6.0-core-loop-demo/src-tauri`](0.6.0-core-loop-demo/src-tauri/) (window, Rust
+[`0.7.0-core-loop-demo/src-tauri`](0.7.0-core-loop-demo/src-tauri/) (window, Rust
 WebTransport node, icons, app version) — but the **frontend it renders is
 switchable**. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config

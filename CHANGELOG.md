@@ -1,11 +1,15 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.6.0-core-loop-demo](prototypes/0.6.0-core-loop-demo/) and is built by the
+[prototypes/0.7.0-core-loop-demo](prototypes/0.7.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
 [prototypes/0.0.1-core-loop-demo](prototypes/0.0.1-core-loop-demo/)).
+
+## Unreleased
+
+- In progress for Phase 1 Sprint 4.
 
 ## v0.6.0 — 2026-07-05
 

@@ -6,6 +6,8 @@ dist/
 dist-ssr/
 build/
 out/
+gen/
+**/src-tauri/gen/
 
 # Logs
 *.log
