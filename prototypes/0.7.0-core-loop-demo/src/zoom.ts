@@ -285,13 +285,19 @@ export class MultiScaleZoomView {
     const { camera } = window.gameRenderer;
     if (camera) {
       if (this.currentLevel === 1) {
-        // First Person: push orthographic bounds much tighter
-        camera.left = -3.5;
-        camera.right = 3.5;
-        camera.top = 3;
-        camera.bottom = -3;
+        // — FIRST PERSON perspective camera —
+        // We temporarily transition the camera position and orientation to match
+        // the client player's face vector so the user can actually look around!
+        camera.position.set(0, 1.6, 2.5); // align with clone head height (Y=1.6) looking inwards
+        camera.lookAt(0, 1.4, 0); // focus on center lounge
+        camera.left = -1.8;
+        camera.right = 1.8;
+        camera.top = 1.8;
+        camera.bottom = -1.8;
       } else {
-        // Standard room zoom levels
+        // Restore locked cinematic isometric elevated three-quarter view
+        camera.position.set(22, 26, 22);
+        camera.lookAt(0, 0, 0);
         camera.left = -7;
         camera.right = 7;
         camera.top = 7;
