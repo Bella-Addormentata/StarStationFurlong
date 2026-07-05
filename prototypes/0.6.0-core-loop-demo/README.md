@@ -1,22 +1,12 @@
-# StarStation Furlong: Ortho Camera Demo
+# StarStation Furlong: Core Loop Demo
 
-This prototype is a camera-tweaked variant of `0.0.1-core-loop-demo`.
+This prototype is the playable demo for Phase 1, Task 1.1 in the execution plan.
 
 It includes:
 - Vite + TypeScript project setup
-- Three.js rendering
-- **Orthographic (parallel) projection** — no perspective distortion
-- **Locked camera** — fixed isometric position and angle, never moves
-- A Mars-themed station planet and lobby scene
-- WASD-controlled NPC movement with collision and sit/stand behavior
-
-## Camera differences from `0.0.1-core-loop-demo`
-
-| Feature | Core Loop Demo | Ortho Camera Demo |
-|---|---|---|
-| Projection | Perspective | **Orthographic** |
-| Camera animations | Cinematic zoom-in on click | **None — camera locked** |
-| Entry flow | Two-click (approach → lobby) | **One-click (lobby immediately)** |
+- Three.js rendering with a locked orthographic (isometric) camera
+- One-click entry: the station planet morphs into the lobby platform
+- Hybrid navigation: WASD manual movement plus point-and-click A* pathfinding with an animated waypoint reticle
 
 ## 1. Prerequisites
 
@@ -67,7 +57,7 @@ npm --version
 3. Enter the demo folder:
 
 ```bash
-cd /path/to/StarStationFurlong/prototypes/0.0.2-ortho-camera-demo
+cd /path/to/StarStationFurlong/prototypes/0.6.0-core-loop-demo
 ```
 
 Replace `/path/to/StarStationFurlong` with the folder where you cloned or copied the repository.
@@ -84,10 +74,10 @@ This installs the project dependencies defined in `package.json`, including:
 - `three`
 - `vite`
 - `typescript`
-- `yjs`
+- `yjs` (+ `y-protocols`, `y-indexeddb` — Sprint 3 sync/awareness)
 - `msgpackr`
 
-> Historical demo snapshot: networking was never implemented here. The live networking seams (typed ports, protocol contracts) are in [`0.6.0-core-loop-demo/src/network/`](../0.6.0-core-loop-demo/src/network/) per [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — `simple-peer` was removed with the v005/v006 revisions.
+> Networking note: the transport is **raw WebTransport with `serverCertificateHashes`** per [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — `simple-peer` was removed with the v005/v006 revisions. The typed port seams live in `src/network/` (`protocol.ts` defines the contracts; Sprint 3 implements them).
 
 ## 4. Run the Demo in Development Mode
 
@@ -111,11 +101,12 @@ If the browser does not open automatically:
 
 After the page loads:
 
-1. The station appears as a Mars-like planet viewed from a fixed isometric angle.
-2. The debug HUD shows **CAM: ORTHO · LOCKED** confirming the camera mode.
-3. Click `Click to Enter` to expand the platform immediately (no camera animation).
-4. Use `W`, `A`, `S`, `D` to move the NPC around the lounge.
-5. Stop near a sofa or chair for about 1.2 seconds to trigger the sit animation.
+1. The station appears as a Mars-like planet suspended in space.
+2. Click `Click to Enter` — the planet morphs into the lobby platform (the camera stays locked).
+3. Use `W`, `A`, `S`, `D` to move the character around the lounge.
+4. Or click anywhere on the floor to navigate there automatically (A* pathfinding). Any WASD input immediately cancels the waypoint path.
+5. Click a chair or sofa cushion — the avatar walks to its front, turns around, and sits down. Click elsewhere or press WASD to stand back up and continue.
+6. Press `Tab` to open and close the SpacePhone chat overlay.
 
 ## 6. Build the Project
 
@@ -151,16 +142,19 @@ When you are done testing the demo:
 Key files and folders:
 
 ```text
-0.0.2-ortho-camera-demo/
+0.6.0-core-loop-demo/
 ├── public/              # Static assets such as textures
 ├── src/                 # Game source files
-│   ├── main.ts          # Entry point and entry flow (no camera animations)
-│   ├── renderer.ts      # Orthographic camera setup, locked position/angle
-│   ├── world.ts         # Station planet, platform morph, world logic
-│   ├── player.ts        # Mars-like sky planet shown above the lobby
-│   ├── npc.ts           # NPC movement, collision, and sitting behavior
+│   ├── main.ts          # Entry point, one-click entry flow, networking bootstrap
+│   ├── renderer.ts      # Three.js renderer, locked orthographic camera, lighting
+│   ├── world.ts         # Station planet, platform morph, click plane, world logic
+│   ├── player.ts        # Hybrid MANUAL/WAYPOINT player navigation state machine
+│   ├── pathfinding.ts   # A* grid pathfinding (8-directional, octile heuristic)
+│   ├── obstacles.ts     # Shared obstacle AABBs (collision + pathfinding)
+│   ├── waypoint.ts      # Animated destination reticle
+│   ├── hud.ts           # Debug HUD updater (shared, no circular imports)
 │   ├── input.ts         # Keyboard input handling
-│   └── network/         # Placeholder networking files for later phases
+│   └── network/         # WebTransport + Yjs sync networking (Sprint 3)
 ├── index.html           # Main page shell and UI overlay
 ├── package.json         # Scripts and dependencies
 └── vite.config.ts       # Vite configuration
@@ -171,7 +165,7 @@ Key files and folders:
 ### `npm run dev` fails
 
 Check the following:
-1. Make sure you are inside the `0.0.2-ortho-camera-demo` folder.
+1. Make sure you are inside the `0.6.0-core-loop-demo` folder.
 2. Make sure `node --version` shows Node.js 20 or newer.
 3. Run `npm install` again if `node_modules/` is missing.
 4. Make sure you are running the command inside the demo folder, not the repository root.
@@ -191,17 +185,15 @@ public/assets/mars.png
 
 ## 11. Current Scope
 
-This demo covers the same local rendering foundation as `0.0.1-core-loop-demo` with camera tweaks applied.
+This demo currently covers the local rendering foundation for early Phase 1 work.
 
 Included now:
-- Local rendering with orthographic projection
-- Locked isometric camera (position and angle never change)
-- One-click lobby entry (no cinematic zoom)
-- NPC movement, collision, and sit/stand interaction
-- HUD and visual prototype work
+- Local rendering with a locked orthographic camera
+- Planet-to-platform morph entry flow
+- Hybrid WASD + point-and-click A* navigation
+- Real-time multiplayer sync over WebTransport (when a local Rust node is running)
+- SpacePhone chat overlay (Yjs shared array)
+- HUD with live network status and expandable network details panel
 
 Not included yet:
-- Multiplayer sync
-- Chat
 - Multi-room navigation
-- Tauri shell integration

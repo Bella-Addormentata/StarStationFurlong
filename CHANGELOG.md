@@ -1,11 +1,62 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.5.0-core-loop-demo](prototypes/0.5.0-core-loop-demo/) and is built by the
+[prototypes/0.6.0-core-loop-demo](prototypes/0.6.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
 [prototypes/0.0.1-core-loop-demo](prototypes/0.0.1-core-loop-demo/)).
+
+## v0.6.0 — 2026-07-05
+
+### Click-to-sit navigation
+
+Chairs and sofas are now interactive navigation targets:
+
+- **Click a chair** and the avatar A*-walks to the front of that seat, turns so
+  its back faces the chair, and slides down into a seated pose (`SIT_CHAIR` rig
+  state — folded legs, lowered torso).
+- **Click anywhere else or press WASD while seated** and the avatar stands up at
+  the front of the chair first, then continues on the requested route — pending
+  destinations and pending seat-swaps are queued through the stand-up animation.
+- 18 seats defined in a new shared `seats.ts` module (5 armchairs per wall,
+  3 back-sofa cushions, 2 front-sofa cushions approached from the open sides —
+  the middle front cushion is blocked by the coffee table, matching the room's
+  real walkable geometry). Seat fronts sit outside the collision AABBs so
+  pathfinding and the collision resolver never fight; the final slide onto the
+  seat is scripted and bypasses collision.
+- Debug HUD `NAV` row now reports the live sit phase
+  (`APPROACH / FINE / TURN / SIT_DOWN / SEATED / STAND_UP`).
+
+### Sovereign network bootstrapping + connection transparency
+
+Every player's node is part of the hosting fabric by default (the Rust node
+serves on `0.0.0.0` whenever the app runs) — only their connection can block it.
+The network details panel now reflects that model:
+
+- **Bootstrap a network**: enter the address friends can reach you at (LAN IP,
+  public IP/DNS, optional `:port`) and click **Bootstrap Link** — the game builds
+  a `?seed=` URL from *your own node's* certificate fingerprint, with no prior
+  connection required. This is how the first node of a network comes online
+  (interim mechanism until on-chain Chia peer publishing lands).
+- **Self-Test**: dials your own node at the entered address from the browser to
+  verify reachability (LAN results are definitive; public addresses are marked
+  inconclusive when routers refuse hairpin dials).
+- **New status rows**: `Net Type` (wifi/cellular via the Network Information API
+  where available — cellular flags likely CGNAT), `Address Type`
+  (LOOPBACK / LAN / PUBLIC classification), and `Seeding`
+  (`SEEDING · verified` / `SEEDING · untested` / `BASIC · join-only` /
+  `BLOCKED · not reachable` / `RESTRICTED? · UDP/QUIC dial failed`).
+- Locked-down network hint: when a dial to a remote peer fails while the page
+  itself works, the panel calls out that the network (campus/office style) is
+  likely dropping UDP/QUIC.
+- Share links pointing at loopback now substitute the reachable bootstrap
+  address (previously they embedded a useless `127.0.0.1`).
+
+### Controls
+
+- SpacePhone chat overlay now toggles with `Tab` (was `P`); Tab no longer
+  cycles browser focus, and closing the phone releases the chat input focus.
 
 ## v0.5.0 — 2026-07-04
 

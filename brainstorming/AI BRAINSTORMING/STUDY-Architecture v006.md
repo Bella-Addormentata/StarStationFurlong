@@ -44,7 +44,7 @@ Everything else in v005 — the Runtime Gap resolution, the all-Rust node, RoomL
 **Verified first-hand today (2026‑07‑04):**
 - **iroh blog** (iroh.computer/blog): 1.0 "Dial Keys, not IPs" (06‑15), 1.0.1 (06‑29), first-party Swift/Kotlin/Python/JS bindings (06‑18), post-quantum key exchange (05‑19), **noq — n0's own QUIC implementation** (03‑19) with custom transports in 0.97 (03‑16), Tor custom transport (01‑27), ESP32 (03‑24 + the 07‑02 smart-fan follow-up), FROST threshold signatures (2024‑10‑21).
 - **BiagioFesta/wtransport source**: `ServerConfigBuilder::{with_bind_default, with_bind_address, with_bind_socket}` (pre-existing `UdpSocket` accepted; endpoint still owned by wtransport's `quinn::Endpoint::new`), `Endpoint::reload_config(server_config, rebind)` for zero-downtime cert refresh, dual-stack IPv6 config, and the `quinn` feature exposing `EndpointConfig`/`TransportConfig` — but **no API to adopt a foreign QUIC endpoint**.
-- **Repository:** the four v005 reviews; [Phase1-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase1-ExecutionPlan.md) and [Phase2-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase2-ExecutionPlan.md) as updated 2026‑07‑04 (confirming the awareness-positions and ticking-anomaly bugs the reviews flagged); Issues #1/#12; the network seams incl. [RoomLog.ts](../../prototypes/0.5.0-core-loop-demo/src/network/RoomLog.ts).
+- **Repository:** the four v005 reviews; [Phase1-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase1-ExecutionPlan.md) and [Phase2-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase2-ExecutionPlan.md) as updated 2026‑07‑04 (confirming the awareness-positions and ticking-anomaly bugs the reviews flagged); Issues #1/#12; the network seams incl. [RoomLog.ts](../../prototypes/0.6.0-core-loop-demo/src/network/RoomLog.ts).
 
 **Verified in the v005 cycle, carried:** MDN WebTransport table (Baseline 2026, LNA row Chrome 147, no `getStats()` on Chromium); p2panda crate inventory + 🚧 stability banner + MIT/Apache-2.0; `yrs::sync` protocol + Awareness semantics (`set_local_state` replaces the whole state — the §8.1 argument); chia-wallet-sdk WASM bindings existence.
 
@@ -306,7 +306,7 @@ Android may kill the process mid-WAL-commit. Node config on mobile: `PRAGMA sync
 
 ## 12. Deployment Playbook — updated code
 
-> Repository seams: [NetworkProvider.ts](../../prototypes/0.5.0-core-loop-demo/src/network/NetworkProvider.ts) · [YjsSync.ts](../../prototypes/0.5.0-core-loop-demo/src/network/YjsSync.ts) · [RoomLog.ts](../../prototypes/0.5.0-core-loop-demo/src/network/RoomLog.ts) · [Phase1-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase1-ExecutionPlan.md) · [Phase2-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase2-ExecutionPlan.md). Upstream: [n0-computer/iroh](https://github.com/n0-computer/iroh) (1.0) · [p2panda/p2panda](https://github.com/p2panda/p2panda) (0.6) · [y-crdt/y-crdt](https://github.com/y-crdt/y-crdt) (yrs 0.27) · [BiagioFesta/wtransport](https://github.com/BiagioFesta/wtransport) (0.6) · [xch-dev/chia-wallet-sdk](https://github.com/xch-dev/chia-wallet-sdk) (0.33) · semantics reference: [holepunchto/autobase](https://github.com/holepunchto/autobase). Code marked **illustrative** where signatures are simplified; §12.1's rotation call and socket options are the verified APIs from §3.2.
+> Repository seams: [NetworkProvider.ts](../../prototypes/0.6.0-core-loop-demo/src/network/NetworkProvider.ts) · [YjsSync.ts](../../prototypes/0.6.0-core-loop-demo/src/network/YjsSync.ts) · [RoomLog.ts](../../prototypes/0.6.0-core-loop-demo/src/network/RoomLog.ts) · [Phase1-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase1-ExecutionPlan.md) · [Phase2-ExecutionPlan.md](../../docs/TDD/03-Implementation/Phase2-ExecutionPlan.md). Upstream: [n0-computer/iroh](https://github.com/n0-computer/iroh) (1.0) · [p2panda/p2panda](https://github.com/p2panda/p2panda) (0.6) · [y-crdt/y-crdt](https://github.com/y-crdt/y-crdt) (yrs 0.27) · [BiagioFesta/wtransport](https://github.com/BiagioFesta/wtransport) (0.6) · [xch-dev/chia-wallet-sdk](https://github.com/xch-dev/chia-wallet-sdk) (0.33) · semantics reference: [holepunchto/autobase](https://github.com/holepunchto/autobase). Code marked **illustrative** where signatures are simplified; §12.1's rotation call and socket options are the verified APIs from §3.2.
 
 ### 12.1 Node: re-pinned deps, two sockets, hot cert rotation
 
@@ -393,7 +393,7 @@ pub struct SsfOp {
 // a plain iroh bidi stream; store = SQLite (ops table keyed writer+seq).
 ```
 
-The `RoomLog` port ([RoomLog.ts](../../prototypes/0.5.0-core-loop-demo/src/network/RoomLog.ts) browser-side, a Rust trait node-side) is implemented twice in the bakeoff spike — `p2panda` and `SsfLog` — and the winner is a build flag.
+The `RoomLog` port ([RoomLog.ts](../../prototypes/0.6.0-core-loop-demo/src/network/RoomLog.ts) browser-side, a Rust trait node-side) is implemented twice in the bakeoff spike — `p2panda` and `SsfLog` — and the winner is a build flag.
 
 ### 12.4 Market host (the Floor, §5.3) — shape of the engine
 
