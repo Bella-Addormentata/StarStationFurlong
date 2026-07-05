@@ -21,7 +21,71 @@ env:
   RELEASE_FRONTEND: prototypes/0.5.0-core-loop-demo
 
 jobs:
+  # ── Stage 1: create ONE shared draft release ─────────────────────────────
+  # tauri-action cannot reliably find draft releases by tag (drafts are not
+  # addressable via get-release-by-tag), so letting each matrix job create or
+  # find the draft races and scatters the installers across duplicate drafts.
+  # Instead we create the draft exactly once here and hand its id to every
+  # platform job.
+  create-release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.result }}
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # Extract this release's notes (top section of CHANGELOG.md) for the release body
+      - name: 📝 Extract release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          awk '/^## /{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Sovereign P2P Space MMO - Production build stable release ${GITHUB_REF_NAME}. See CHANGELOG.md." > RELEASE_NOTES.md
+          fi
+
+      - name: 🎫 Create shared draft release
+        id: create
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tag = context.ref.replace('refs/tags/', '');
+            const body = fs.readFileSync('RELEASE_NOTES.md', 'utf8');
+
+            // Clean up stale DRAFT releases for this tag left by earlier
+            // partial/failed runs. Published releases are never touched.
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            for (const r of releases.filter((r) => r.draft && r.tag_name === tag)) {
+              core.info(`Deleting stale draft release ${r.id} (${r.name})`);
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: r.id,
+              });
+            }
+
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `StarStation Furlong ${tag}`,
+              body,
+              draft: true, // reviewed & published manually after artifact checks
+              prerelease: false,
+            });
+            core.info(`Created draft release ${data.id}: ${data.html_url}`);
+            return data.id;
+
+  # ── Stage 2: build every platform and upload into the shared draft ───────
   publish-tauri-binaries:
+    needs: create-release
     permissions:
       contents: write
     strategy:
@@ -92,31 +156,12 @@ jobs:
           EOF
           echo "Tauri config overlay:" && cat prototypes/0.5.0-core-loop-demo/release-frontend.json
 
-      # 6. Extract this release's notes (top section of CHANGELOG.md) for the release body
-      - name: 📝 Extract release notes from CHANGELOG.md
-        id: notes
-        shell: bash
-        run: |
-          awk '/^## /{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "Sovereign P2P Space MMO - Production build stable release ${GITHUB_REF_NAME}. See CHANGELOG.md." > RELEASE_NOTES.md
-          fi
-          {
-            echo 'body<<NOTES_EOF'
-            cat RELEASE_NOTES.md
-            echo 'NOTES_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      # 7. Run Rust Cargo builds & bundle installers via Tauri official action
+      # 6. Run Rust Cargo builds & upload installers into the shared draft release
       - name: 🛠️ Build & Package Tauri Application
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "StarStation Furlong ${{ github.ref_name }}"
-          releaseBody: ${{ steps.notes.outputs.body }}
-          releaseDraft: true # Leaves as draft so developers can review release files before publishing!
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           projectPath: "prototypes/0.5.0-core-loop-demo"
           args: --config release-frontend.json ${{ matrix.args }}
