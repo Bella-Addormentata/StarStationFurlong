@@ -1,0 +1,15 @@
+[package]
+name = "ssf-station-seals-v2"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike B-4: Station Seals v2 mini-spec & prototype (FROST t-of-n, pruning property tests)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+ed25519-dalek = "=2.2.0" # dalek-cryptography alignment
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+hex = "0.4"
