@@ -74,6 +74,124 @@
         color: #00d4ff;
         font-weight: 600;
       }
+
+      #network-details-hud {
+        position: absolute;
+        top: 168px;
+        left: 24px;
+        width: 360px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 500;
+        background: rgba(4, 8, 22, 0.80);
+        padding: 10px 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        z-index: 1000;
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+      }
+
+      #network-details-hud.collapsed .network-details-body {
+        display: none;
+      }
+
+      .network-details-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .network-details-title {
+        color: rgba(212, 168, 75, 0.82);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+
+      #network-details-toggle {
+        background: rgba(212, 168, 75, 0.10);
+        color: #d4a84b;
+        border: 1px solid rgba(212, 168, 75, 0.24);
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        line-height: 1;
+        width: 26px;
+        height: 24px;
+      }
+
+      .network-details-body {
+        margin-top: 10px;
+      }
+
+      .network-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin: 4px 0;
+      }
+
+      .network-row .label {
+        color: rgba(212, 168, 75, 0.52);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .network-row .value {
+        color: #00d4ff;
+        font-weight: 600;
+      }
+
+      .network-link-tools {
+        margin-top: 10px;
+        border-top: 1px solid rgba(212, 168, 75, 0.18);
+        padding-top: 10px;
+      }
+
+      .network-link-tools .tool-label {
+        display: block;
+        color: rgba(212, 168, 75, 0.7);
+        font-size: 10px;
+        margin-bottom: 4px;
+      }
+
+      .network-link-tools .tool-row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+
+      .network-link-tools input {
+        flex: 1;
+        border-radius: 6px;
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        background: rgba(0, 0, 0, 0.25);
+        color: #d4a84b;
+        font-size: 11px;
+        padding: 6px 8px;
+      }
+
+      .network-link-tools button {
+        border-radius: 6px;
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        background: rgba(212, 168, 75, 0.12);
+        color: #d4a84b;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 6px 8px;
+        cursor: pointer;
+      }
+
+      #network-link-feedback {
+        color: rgba(212, 168, 75, 0.72);
+        font-size: 10px;
+        min-height: 12px;
+      }
       
       /* Welcome screen with elegant fade */
       #welcome {
@@ -439,6 +557,54 @@
       <div>
         <span class="label">LOSS</span>
         <span class="value" id="loss">-- %</span>
+      </div>
+    </div>
+
+    <div id="network-details-hud" class="collapsed">
+      <div class="network-details-header">
+        <span class="network-details-title">Network Details</span>
+        <button id="network-details-toggle" aria-label="Expand network details">▼</button>
+      </div>
+      <div class="network-details-body">
+        <div class="network-row">
+          <span class="label">Peers Seen</span>
+          <span class="value" id="net-peers-seen">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Ticks Recv</span>
+          <span class="value" id="net-ticks-recv">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Ping/Pong</span>
+          <span class="value" id="net-ping-pong">0/0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Datagrams</span>
+          <span class="value" id="net-datagrams">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Session</span>
+          <span class="value" id="net-uptime">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Endpoint</span>
+          <span class="value" id="net-endpoint">--</span>
+        </div>
+
+        <div class="network-link-tools">
+          <span class="tool-label">Share seed link</span>
+          <div class="tool-row">
+            <input type="text" id="network-share-link" readonly placeholder="Connect first to generate a link">
+            <button id="network-copy-link-btn" type="button">Copy Link</button>
+          </div>
+
+          <span class="tool-label">Paste seed link</span>
+          <div class="tool-row">
+            <input type="text" id="network-import-link" placeholder="Paste link or seed">
+            <button id="network-use-link-btn" type="button">Use Link</button>
+          </div>
+          <div id="network-link-feedback"></div>
+        </div>
       </div>
     </div>
     
