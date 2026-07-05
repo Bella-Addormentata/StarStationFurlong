@@ -61,14 +61,14 @@ export class NetworkProvider implements NetworkProviderPort {
     }
 
     console.log(`🔌 Securing connection link to sovereign node: ${boot.wtUrl}`);
-    
-    // Convert base64 cert hashes to Uint8Array as required by WebTransport API
-    const hashes = boot.certHashesB64.map(b64 => ({
-      algorithm: 'sha-256',
-      value: Uint8Array.from(atob(b64), c => c.charCodeAt(0))
-    }));
 
     try {
+      // Convert base64 cert hashes to Uint8Array as required by WebTransport API
+      const hashes = boot.certHashesB64.map(b64 => ({
+        algorithm: 'sha-256',
+        value: Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+      }));
+
       this.#boot = boot;
       this.#pingSent = 0;
       this.#pongRecv = 0;
@@ -107,6 +107,7 @@ export class NetworkProvider implements NetworkProviderPort {
     this.#isActive = false;
     this.#mode = 'offline';
     this.#connectedAt = 0;
+    this.#boot = null;
     if (this.#wt) {
       try {
         this.#wt.close();
@@ -147,10 +148,9 @@ export class NetworkProvider implements NetworkProviderPort {
     if (!this.#wt) {
       throw new Error('Not connected');
     }
-    this.#openChannels++;
-
     // Open connection bidirectional stream for ysync / awareness / chat
     const stream = await this.#wt.createBidirectionalStream();
+    this.#openChannels++;
     
     const self = this;
     const framedReadable = new ReadableStream<Uint8Array>({

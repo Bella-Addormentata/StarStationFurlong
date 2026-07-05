@@ -52,6 +52,8 @@ async function bootstrapNetworking() {
     }
 
     // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
+    seenPeers.clear();
+    receivedTicks = 0;
     await networkProvider.connect(boot);
     activeBootstrap = boot;
     syncShareLink();
@@ -61,7 +63,7 @@ async function bootstrapNetworking() {
     // 3. Initiate yrs state document handshake over Stream (Task 3.3)
     const channel = await networkProvider.openChannel('ysync');
     yjsSync = new YjsSync({
-      roomId: 'furlong-lobby',
+      roomId: boot.roomId,
       channel,
     });
     await yjsSync.start();
@@ -283,12 +285,25 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
     if (typeof parsed.wtUrl !== 'string' || !Array.isArray(parsed.certHashesB64)) {
       return null;
     }
+    // Validate wtUrl is a well-formed https: URL (WebTransport requirement)
+    let parsedWtUrl: URL;
+    try {
+      parsedWtUrl = new URL(parsed.wtUrl);
+    } catch {
+      return null;
+    }
+    if (parsedWtUrl.protocol !== 'https:') {
+      return null;
+    }
     const certHashesB64 = parsed.certHashesB64.filter((v: unknown): v is string => typeof v === 'string' && v.length > 0);
     if (certHashesB64.length === 0) {
       return null;
     }
+    const roomId = typeof parsed.roomId === 'string' && parsed.roomId.length > 0
+      ? parsed.roomId
+      : 'furlong-lobby';
     return {
-      roomId: typeof parsed.roomId === 'string' ? parsed.roomId : 'furlong-lobby',
+      roomId,
       wtUrl: parsed.wtUrl,
       certHashesB64,
     };
@@ -558,6 +573,12 @@ function animate() {
   } else {
     updateDebugHUD('net-uptime', '--');
     updateDebugHUD('net-endpoint', '--');
+    updateDebugHUD('rtt', '--');
+    updateDebugHUD('loss', '--');
+    updateDebugHUD('net-peers-seen', '--');
+    updateDebugHUD('net-ticks-recv', '--');
+    updateDebugHUD('net-ping-pong', '--');
+    updateDebugHUD('net-datagrams', '--');
   }
   
   // Render
