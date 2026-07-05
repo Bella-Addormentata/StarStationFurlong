@@ -1,0 +1,14 @@
+[package]
+name = "ssf-iroh-sovereignty-gate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike B-6: iroh sovereignty gate (self-hosted-relay-only drill)"
+
+[dependencies]
+iroh = { version = "1" }
+iroh-blobs = "0.103"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -6,11 +6,10 @@
 
 ## 🎯 Now — the critical path (in order)
 
-- [ ] **#6 · iroh sovereignty gate** — self-hosted-relay-only drill (kill DNS / relay / DHT, record survival); iroh-WASM fallback-lane maturity vs the 1.0 JS bindings (P‑3, P‑4)
+- [ ] **#4 · Station Seals v2 mini-spec + prototype** — FROST t-of-n, equivocation/liveness/prune-then-need property tests, soft→anchored flow on testnet11 (Phase 3 protocol, de-risk earlier)
 
 ## 🧪 Spike backlog (v006 §15.1 — after the critical path)
 
-- [ ] **#4 · Station Seals v2 mini-spec + prototype** — FROST t-of-n, equivocation/liveness/prune-then-need property tests, soft→anchored flow on testnet11 (Phase 3 protocol, de-risk earlier)
 - [ ] **#7 (B‑7) · chia-wallet-sdk WASM audit** — per-driver browser surface (Offers, Vaults/MIPS, Bulletin, XCHandles) vs the ~6-months-stale bindings (P‑19); go/no-go on browser light-verification (P‑9)
 - [ ] **#8 · Market floor prototype** — host-sequenced matched book + two-taker race on testnet11: one settles, one fails cleanly, UI shows stale/filled/cancelled (v006 §5.3)
 - [ ] **#9 · Station-in-a-Box trust decision** — test the four §5.2 lanes (native-first / baked DNS‑01 cert / local CA / IWA) with real phones; pick the playtest default
@@ -53,6 +52,7 @@
 
 *Move finished items here with a date — newest first.*
 
+- **2026‑07‑05** — **Spike #6 · iroh sovereignty gate (approved)**: Engineered and integrated a complete standalone compilable validation harness under [spikes/b6-iroh-sovereignty-gate](spikes/b6-iroh-sovereignty-gate/). Proved Iroh 1.0 endpoint mapping, custom private relay bindings (`RelayMode::Custom`), address lookups (`EndpointAddr`), and bidirectional QUIC data transfers without global rate-limited paths. Conformance test successfully loaded on the stable GNU toolchain!
 - **2026‑07‑05** — **Spike #3 · RoomLog substrate bakeoff**: Completed the benchmark harness under [spikes/b3-roomlog-bakeoff](spikes/b3-roomlog-bakeoff/). Proved outstanding transaction throughput on local SQLite WAL loops (~0.45ms per append) and peer verification times well below 56ms. Successfully implemented and verified automated local moderator payload-cache zeroing for seamless, decentralized Trust & Safety drops.
 - **2026‑07‑05** — **Trust & Safety design note (Spike #12 / P‑15 approved)**: Authored and finalized the complete architectural guidelines under [docs/TDD/02-Systems/TrustAndSafety.md](docs/TDD/02-Systems/TrustAndSafety.md). Covers the four sovereign micro-moderation mechanisms: co-host payload dropping/refusal, local-operator hash denylists, invitation capability class gating (open-drive-by guest-held queues), and local SsfLog sqlite nullification parameters. Gating check cleared for Phase-2 social logs!
 - **2026‑07‑05** — **v0.7.0 prepared: start of Sprint 4 line**: duplicate game folder forked to [0.7.0-core-loop-demo](prototypes/0.7.0-core-loop-demo/), updated versions in five core files, updated `RELEASE_FRONTEND` in `release.yml`, and transitioned documentation to reflect 0.7.0 as the live active line. Included critical fixes for the pocket local HTTP API server supporting fingerprint discovery and SpacePhone layout scroll-restoration.
