@@ -34,12 +34,14 @@ async fn rotate_fingerprint(hub: State<'_, SharedHub>) -> Result<Fingerprint, St
 fn main() {
     // Start WebTransport listener in background
     let listen_port = 4443;
-    let (hub, endpoint) = match tokio::runtime::Builder::new_multi_thread()
+    
+    // Create ONE persistent runtime for the lifetime of the application
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap()
-        .block_on(async { start_wt_server(listen_port).await })
-    {
+        .unwrap();
+
+    let (hub, endpoint) = match rt.block_on(async { start_wt_server(listen_port).await }) {
         Ok((h, ep)) => (h, ep),
         Err(e) => {
             eprintln!("⚠️ Failed starting WebTransport server: {:?}", e);
@@ -50,10 +52,6 @@ fn main() {
     let hub_clone = hub.clone();
     let hub_http = hub.clone();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         rt.spawn(async move {
             start_http_api_server(hub_http).await;
         });

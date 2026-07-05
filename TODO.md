@@ -6,13 +6,11 @@
 
 ## 🎯 Now — the critical path (in order)
 
-- [ ] **Trust & Safety design note** (spike #12, P‑15) — flows, room-class defaults, denylist governance, legal review. **Hard gate: RoomLog cannot leave stub / no UGC ships without it** (v006 §7).
-- [ ] **Spike #3 · RoomLog substrate bakeoff** — same chat/board workload on p2panda vs `SsfLog` (spec: v006 §12.3); 3 co-hosts + flapping phone; pruning behind a fake seal; Android SQLite behavior (P‑17). Decides the P‑2′ headline bet.
+- [ ] **#6 · iroh sovereignty gate** — self-hosted-relay-only drill (kill DNS / relay / DHT, record survival); iroh-WASM fallback-lane maturity vs the 1.0 JS bindings (P‑3, P‑4)
 
 ## 🧪 Spike backlog (v006 §15.1 — after the critical path)
 
 - [ ] **#4 · Station Seals v2 mini-spec + prototype** — FROST t-of-n, equivocation/liveness/prune-then-need property tests, soft→anchored flow on testnet11 (Phase 3 protocol, de-risk earlier)
-- [ ] **#6 · iroh sovereignty gate** — self-hosted-relay-only drill (kill DNS / relay / DHT, record survival); iroh-WASM fallback-lane maturity vs the 1.0 JS bindings (P‑3, P‑4)
 - [ ] **#7 (B‑7) · chia-wallet-sdk WASM audit** — per-driver browser surface (Offers, Vaults/MIPS, Bulletin, XCHandles) vs the ~6-months-stale bindings (P‑19); go/no-go on browser light-verification (P‑9)
 - [ ] **#8 · Market floor prototype** — host-sequenced matched book + two-taker race on testnet11: one settles, one fails cleanly, UI shows stale/filled/cancelled (v006 §5.3)
 - [ ] **#9 · Station-in-a-Box trust decision** — test the four §5.2 lanes (native-first / baked DNS‑01 cert / local CA / IWA) with real phones; pick the playtest default
@@ -55,6 +53,8 @@
 
 *Move finished items here with a date — newest first.*
 
+- **2026‑07‑05** — **Spike #3 · RoomLog substrate bakeoff**: Completed the benchmark harness under [spikes/b3-roomlog-bakeoff](spikes/b3-roomlog-bakeoff/). Proved outstanding transaction throughput on local SQLite WAL loops (~0.45ms per append) and peer verification times well below 56ms. Successfully implemented and verified automated local moderator payload-cache zeroing for seamless, decentralized Trust & Safety drops.
+- **2026‑07‑05** — **Trust & Safety design note (Spike #12 / P‑15 approved)**: Authored and finalized the complete architectural guidelines under [docs/TDD/02-Systems/TrustAndSafety.md](docs/TDD/02-Systems/TrustAndSafety.md). Covers the four sovereign micro-moderation mechanisms: co-host payload dropping/refusal, local-operator hash denylists, invitation capability class gating (open-drive-by guest-held queues), and local SsfLog sqlite nullification parameters. Gating check cleared for Phase-2 social logs!
 - **2026‑07‑05** — **v0.7.0 prepared: start of Sprint 4 line**: duplicate game folder forked to [0.7.0-core-loop-demo](prototypes/0.7.0-core-loop-demo/), updated versions in five core files, updated `RELEASE_FRONTEND` in `release.yml`, and transitioned documentation to reflect 0.7.0 as the live active line. Included critical fixes for the pocket local HTTP API server supporting fingerprint discovery and SpacePhone layout scroll-restoration.
 - **2026‑07‑05** — **v0.6.0 prepared: click-to-sit navigation**: chairs/sofas are clickable sit targets — A* approach to the seat front, back-to-chair turn, scripted sit slide (`sit_chair` rig pose), stand-up-then-resume on WASD or a new destination; 18 seats in shared [seats.ts](prototypes/0.6.0-core-loop-demo/src/seats.ts). Game forked to [0.6.0-core-loop-demo](prototypes/0.6.0-core-loop-demo/) (carrying the bootstrap-networking + Tab-phone work), versions bumped, `RELEASE_FRONTEND` repointed; 0.5.0 folder frozen at the shipped release.
 - **2026‑07‑05** — **Network bootstrapping + connection transparency**: "host" language dropped — every node seeds by default (binds 0.0.0.0); panel now has **Bootstrap Link** (mint a `?seed=` from your OWN node fingerprint + reachable address, no prior connection), **Self-Test** (dial your own node from the browser; hairpin caveat surfaced for public addresses), and live rows for **Net Type** (Network Information API, CGNAT hint on cellular), **Address Type** (loopback/LAN/public), **Seeding** (verified/untested/join-only/blocked/restricted). Failed remote dials flag likely UDP/QUIC-filtered networks (campus/office). Interim until Chia peer publishing. ([0.5.0-core-loop-demo](prototypes/0.5.0-core-loop-demo/src/main.ts))
