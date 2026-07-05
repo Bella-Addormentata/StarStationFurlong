@@ -17,6 +17,8 @@
  * Re-uses shared visual coordinate grids and projects 3D-shaded vectors on top.
  */
 
+import * as THREE from 'three';
+
 export interface ZoomScaleDef {
   level: number;
   name: string;
@@ -92,6 +94,13 @@ export const ZOOM_LEVELS: ZoomScaleDef[] = [
     description: 'Infinite serverless seed networks connecting clusters in deep expanding paths.',
   }
 ];
+
+// 🪐 Mouse-Look / Free Look states for First Person Level 1
+let yaw = 0;   // Left-Right rotation (radians)
+let pitch = 0; // Up-Down rotation (radians)
+let initializedMouseLookOffset = false;
+let perspectiveCamera: THREE.PerspectiveCamera | null = null;
+let orthographicCamera: THREE.OrthographicCamera | null = null;
 
 export class MultiScaleZoomView {
   private overlay: HTMLDivElement | null = null;
@@ -213,6 +222,32 @@ export class MultiScaleZoomView {
   }
 
   private setupListeners() {
+    // Free mouse-look handler inside Level 1 (First Person Perspective)
+    window.addEventListener('mousemove', (e) => {
+      if (this.currentLevel !== 1) return;
+      
+      // Accumulate rotation deltas based on mouse movement relative offsets
+      const sensitivity = 0.003;
+      
+      // If pointer is locked use movement values, otherwise use mouse client delta
+      const deltaX = document.pointerLockElement ? e.movementX : (e.clientX - window.innerWidth / 2) * 0.08;
+      const deltaY = document.pointerLockElement ? e.movementY : (e.clientY - window.innerHeight / 2) * 0.08;
+
+      yaw -= deltaX * sensitivity;
+      pitch -= deltaY * sensitivity;
+
+      // Constrain vertical look so the player cannot flip upside down
+      const maxPitch = Math.PI * 0.45;
+      pitch = Math.max(-maxPitch, Math.min(maxPitch, pitch));
+    });
+
+    // Request pointer lock when clicking on canvas in Level 1 first-person view
+    window.addEventListener('mousedown', () => {
+      if (this.currentLevel === 1 && window.gameRenderer?.renderer?.domElement) {
+        window.gameRenderer.renderer.domElement.requestPointerLock?.();
+      }
+    });
+
     window.addEventListener('keydown', (e) => {
       // Ignore toggling when focused in inputs
       const active = document.activeElement;
@@ -282,28 +317,81 @@ export class MultiScaleZoomView {
     }
 
     // Adjust global 3D Three.js camera zooms dynamically
-    const { camera } = window.gameRenderer;
+    const { camera, renderer } = window.gameRenderer;
     if (camera) {
+      if (!orthographicCamera && camera instanceof THREE.OrthographicCamera) {
+        orthographicCamera = camera;
+      }
+
       if (this.currentLevel === 1) {
         // — FIRST PERSON perspective camera —
-        // We temporarily transition the camera position and orientation to match
-        // the client player's face vector so the user can actually look around!
-        camera.position.set(0, 1.6, 2.5); // align with clone head height (Y=1.6) looking inwards
-        camera.lookAt(0, 1.4, 0); // focus on center lounge
-        camera.left = -1.8;
-        camera.right = 1.8;
-        camera.top = 1.8;
-        camera.bottom = -1.8;
+        if (!perspectiveCamera) {
+          const aspect = window.innerWidth / window.innerHeight;
+          perspectiveCamera = new THREE.PerspectiveCamera(65, aspect, 0.1, 1000);
+          
+          window.addEventListener('resize', () => {
+            if (perspectiveCamera) {
+              perspectiveCamera.aspect = window.innerWidth / window.innerHeight;
+              perspectiveCamera.updateProjectionMatrix();
+            }
+          });
+        }
+
+        // Re-assign active camera in global renderer
+        window.gameRenderer.camera = perspectiveCamera as any;
+
+        // Query the player's active position dynamically so we look FROM the player's head instead of at them.
+        const playerPos = (window as any).world?.getPlayer()?.getPosition() || new THREE.Vector3(0, 0, 1.5);
+        
+        // Hide local character mesh so we don't look inside our own head bounds!
+        const playerChar = (window as any).world?.getPlayer();
+        if (playerChar && playerChar.mesh) {
+          playerChar.mesh.visible = false;
+          initializedMouseLookOffset = true;
+        }
+
+        // Camera position is directly on top of the player's eye height (Y=1.25)
+        perspectiveCamera.position.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
+        
+        // Calculate target looking point based on yaw and pitch
+        const targetX = playerPos.x + Math.sin(yaw) * Math.cos(pitch);
+        const targetY = playerPos.y + 1.25 + Math.sin(pitch);
+        const targetZ = playerPos.z + Math.cos(yaw) * Math.cos(pitch);
+
+        perspectiveCamera.lookAt(targetX, targetY, targetZ);
       } else {
+        // Exiting First Person — re-assign OrthographicCamera
+        if (orthographicCamera) {
+          window.gameRenderer.camera = orthographicCamera;
+        }
+
+        // Exit Pointer Lock if active
+        if (document.pointerLockElement === renderer.domElement) {
+          document.exitPointerLock?.();
+        }
+
+        // Restore character mesh visibility when zooming back out
+        if (initializedMouseLookOffset) {
+          const playerChar = (window as any).world?.getPlayer();
+          if (playerChar && playerChar.mesh) {
+            playerChar.mesh.visible = true;
+          }
+          initializedMouseLookOffset = false;
+        }
+
         // Restore locked cinematic isometric elevated three-quarter view
-        camera.position.set(22, 26, 22);
-        camera.lookAt(0, 0, 0);
-        camera.left = -7;
-        camera.right = 7;
-        camera.top = 7;
-        camera.bottom = -7;
+        if (orthographicCamera) {
+          orthographicCamera.position.set(22, 26, 22);
+          orthographicCamera.lookAt(0, 0, 0);
+          orthographicCamera.left = -7;
+          orthographicCamera.right = 7;
+          orthographicCamera.top = 7;
+          orthographicCamera.bottom = -7;
+        }
       }
-      camera.updateProjectionMatrix();
+      if (window.gameRenderer.camera) {
+        window.gameRenderer.camera.updateProjectionMatrix();
+      }
     }
 
     // Toggle pointer events and canvas overlays based on view layers
@@ -381,6 +469,10 @@ export class MultiScaleZoomView {
   }
 
   public tick() {
+    if (this.currentLevel === 1) {
+      // Force continuous rendering updates in first person so mouse look remains fluid
+      this.updateViewContext();
+    }
     if (this.currentLevel <= 2 || !this.canvas || !this.ctx) return;
     this.render();
   }

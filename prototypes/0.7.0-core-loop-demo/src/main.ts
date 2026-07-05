@@ -737,6 +737,7 @@ async function init() {
   
   // Create world
   world = new worldModule.World(scene);
+  (window as any).world = world;
   
   // Initialize input manager
   inputManager = new inputModule.InputManager();
