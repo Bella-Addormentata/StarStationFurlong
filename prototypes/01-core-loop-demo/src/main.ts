@@ -9,7 +9,7 @@ import type { World } from './world';
 import type { InputManager } from './input';
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
-import { packTick, unpackTick } from './network/protocol';
+import { packTick, unpackTick, type RoomBootstrap } from './network/protocol';
 
 type RendererModule = typeof import('./renderer');
 
@@ -34,44 +34,36 @@ const networkProvider = new NetworkProvider();
 let yjsSync: YjsSync | null = null;
 let localSeq = 0;
 let lastTickSent = 0;
+const seenPeers = new Set<string>();
+let receivedTicks = 0;
+let pendingBootstrapOverride: RoomBootstrap | null = null;
+let activeBootstrap: RoomBootstrap | null = null;
+let networkPanelInitialized = false;
 
 async function bootstrapNetworking() {
   try {
     // Setup phone input behaviors, hooks, and date-stamps (Task 4.1)
     setupSpacePhoneOverlay();
-
-    // 1. Fetch active fingerprint from the node REST API (either post 8080 or fallback 8081)
-    let fingerprint = { hex: "", base64: "", port: 4443 };
-    try {
-      const res = await fetch('http://127.0.0.1:8080/api/fingerprint');
-      fingerprint = await res.json();
-    } catch {
-      // default config fallback (Spike B-2/B-5 defaults)
-      const res = await fetch('http://127.0.0.1:8081/api/fingerprint').catch(() => null);
-      if (res) {
-        fingerprint = await res.json();
-      }
-    }
-
-    if (!fingerprint.hex) {
+    const boot = pendingBootstrapOverride ?? await fetchDefaultBootstrap();
+    if (!boot) {
       console.warn('⚠️ No running Rust node found. Seamlessly falling back to offline mode.');
       updateHUDLink('OFFLINE', '#ff1744');
       return;
     }
 
     // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
-    await networkProvider.connect({
-      roomId: 'furlong-lobby',
-      wtUrl: `https://127.0.0.1:${fingerprint.port}`,
-      certHashesB64: [fingerprint.base64],
-    });
+    seenPeers.clear();
+    receivedTicks = 0;
+    await networkProvider.connect(boot);
+    activeBootstrap = boot;
+    syncShareLink();
 
     updateHUDLink('CONNECTED', '#00e676');
 
     // 3. Initiate yrs state document handshake over Stream (Task 3.3)
     const channel = await networkProvider.openChannel('ysync');
     yjsSync = new YjsSync({
-      roomId: 'furlong-lobby',
+      roomId: boot.roomId,
       channel,
     });
     await yjsSync.start();
@@ -110,6 +102,8 @@ async function bootstrapNetworking() {
         const tick = unpackTick(buf);
         // Identify fake/peer client ID from seq mapping
         const peerId = `peer-${tick.seq % 4}`;
+        seenPeers.add(peerId);
+        receivedTicks++;
         world.updateRemotePlayer(peerId, tick.x, tick.z);
       } catch (e) {
         console.warn('Error unpacking incoming remote peer datagram tick:', e);
@@ -181,6 +175,157 @@ function setupSpacePhoneOverlay() {
   }
 }
 
+async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
+  let fingerprint = { hex: "", base64: "", port: 4443 };
+  try {
+    const res = await fetch('http://127.0.0.1:8080/api/fingerprint');
+    fingerprint = await res.json();
+  } catch {
+    const res = await fetch('http://127.0.0.1:8081/api/fingerprint').catch(() => null);
+    if (res) {
+      fingerprint = await res.json();
+    }
+  }
+  if (!fingerprint.hex) {
+    return null;
+  }
+  return {
+    roomId: 'furlong-lobby',
+    wtUrl: `https://127.0.0.1:${fingerprint.port}`,
+    certHashesB64: [fingerprint.base64],
+  };
+}
+
+function setupNetworkDetailsPanel() {
+  if (networkPanelInitialized) return;
+  networkPanelInitialized = true;
+
+  const panel = document.getElementById('network-details-hud');
+  const toggle = document.getElementById('network-details-toggle');
+  const copyBtn = document.getElementById('network-copy-link-btn');
+  const useBtn = document.getElementById('network-use-link-btn');
+  const importInput = document.getElementById('network-import-link') as HTMLInputElement | null;
+  const feedback = document.getElementById('network-link-feedback');
+
+  if (panel && toggle) {
+    toggle.addEventListener('click', () => {
+      panel.classList.toggle('collapsed');
+      toggle.textContent = panel.classList.contains('collapsed') ? '▼' : '▲';
+      toggle.setAttribute('aria-label', panel.classList.contains('collapsed') ? 'Expand network details' : 'Collapse network details');
+    });
+  }
+
+  const urlSeed = new URL(window.location.href).searchParams.get('seed');
+  if (urlSeed) {
+    const imported = decodeBootstrapSeed(urlSeed);
+    if (imported) {
+      pendingBootstrapOverride = imported;
+      if (feedback) {
+        feedback.textContent = 'Seed loaded from URL. Connect to use it.';
+      }
+      if (importInput) {
+        importInput.value = window.location.href;
+      }
+    }
+  }
+
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      const shareLink = buildShareLink();
+      if (!shareLink) {
+        if (feedback) feedback.textContent = 'No active link yet. Connect first.';
+        return;
+      }
+      const shareEl = document.getElementById('network-share-link') as HTMLInputElement | null;
+      if (shareEl) {
+        shareEl.value = shareLink;
+      }
+      try {
+        await navigator.clipboard.writeText(shareLink);
+        if (feedback) feedback.textContent = 'Share link copied.';
+      } catch {
+        if (feedback) feedback.textContent = 'Share link generated in field.';
+      }
+    });
+  }
+
+  if (useBtn && importInput) {
+    useBtn.addEventListener('click', () => {
+      const imported = decodeBootstrapInput(importInput.value.trim());
+      if (!imported) {
+        if (feedback) feedback.textContent = 'Invalid seed link.';
+        return;
+      }
+      pendingBootstrapOverride = imported;
+      if (feedback) feedback.textContent = 'Seed accepted. Connect to use it.';
+    });
+  }
+}
+
+function buildShareLink(): string | null {
+  if (!activeBootstrap) return null;
+  return `${window.location.origin}${window.location.pathname}?seed=${encodeURIComponent(encodeBootstrapSeed(activeBootstrap))}`;
+}
+
+function syncShareLink() {
+  const shareEl = document.getElementById('network-share-link') as HTMLInputElement | null;
+  const link = buildShareLink();
+  if (shareEl && link) {
+    shareEl.value = link;
+  }
+}
+
+function encodeBootstrapSeed(boot: RoomBootstrap): string {
+  return btoa(JSON.stringify(boot));
+}
+
+function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
+  try {
+    const parsed = JSON.parse(atob(seed));
+    if (typeof parsed.wtUrl !== 'string' || !Array.isArray(parsed.certHashesB64)) {
+      return null;
+    }
+    // Validate wtUrl is a well-formed https: URL (WebTransport requirement)
+    let parsedWtUrl: URL;
+    try {
+      parsedWtUrl = new URL(parsed.wtUrl);
+    } catch {
+      return null;
+    }
+    if (parsedWtUrl.protocol !== 'https:') {
+      return null;
+    }
+    const certHashesB64 = parsed.certHashesB64.filter((v: unknown): v is string => typeof v === 'string' && v.length > 0);
+    if (certHashesB64.length === 0) {
+      return null;
+    }
+    const roomId = typeof parsed.roomId === 'string' && parsed.roomId.length > 0
+      ? parsed.roomId
+      : 'furlong-lobby';
+    return {
+      roomId,
+      wtUrl: parsed.wtUrl,
+      certHashesB64,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function decodeBootstrapInput(input: string): RoomBootstrap | null {
+  if (!input) return null;
+  try {
+    const parsedUrl = new URL(input);
+    const seed = parsedUrl.searchParams.get('seed');
+    if (seed) {
+      return decodeBootstrapSeed(seed);
+    }
+  } catch {
+    // Not a URL; try raw base64 seed.
+  }
+  return decodeBootstrapSeed(input);
+}
+
 function logToPhoneSystem(msg: string) {
   const container = document.getElementById('chat-messages-container');
   if (container) {
@@ -250,6 +395,7 @@ async function init() {
   
   // Initialize input manager
   inputManager = new inputModule.InputManager();
+  setupNetworkDetailsPanel();
   
   // Setup click-to-zoom interaction
   setupClickToZoom();
@@ -398,8 +544,15 @@ function animate() {
   // ── Datagram tick sender & stats HUD (Task 3.2 / 3.4)
   if (networkProvider.mode() !== 'offline') {
     const stats = networkProvider.stats();
+    const debug = networkProvider.debugInfo();
     updateDebugHUD('rtt', `${isNaN(stats.rttMs) ? '--' : Math.round(stats.rttMs)} ms`);
     updateDebugHUD('loss', `${isNaN(stats.loss) ? '--' : Math.round(stats.loss * 100)} %`);
+    updateDebugHUD('net-peers-seen', seenPeers.size.toString());
+    updateDebugHUD('net-ticks-recv', receivedTicks.toString());
+    updateDebugHUD('net-ping-pong', `${debug.pingSent}/${debug.pongRecv}`);
+    updateDebugHUD('net-datagrams', debug.datagramsRecv.toString());
+    updateDebugHUD('net-uptime', debug.connectedForMs > 0 ? `${Math.round(debug.connectedForMs / 1000)}s` : '--');
+    updateDebugHUD('net-endpoint', debug.endpointUrl.replace('https://', ''));
     
     // Broadcast movement ticks at 20 Hz (50 ms interval) when moving
     if (world.isPlayerActive() && currentTime - lastTickSent >= 50) {
@@ -417,6 +570,15 @@ function animate() {
       networkProvider.sendTick(packed);
       lastTickSent = currentTime;
     }
+  } else {
+    updateDebugHUD('net-uptime', '--');
+    updateDebugHUD('net-endpoint', '--');
+    updateDebugHUD('rtt', '--');
+    updateDebugHUD('loss', '--');
+    updateDebugHUD('net-peers-seen', '--');
+    updateDebugHUD('net-ticks-recv', '--');
+    updateDebugHUD('net-ping-pong', '--');
+    updateDebugHUD('net-datagrams', '--');
   }
   
   // Render
