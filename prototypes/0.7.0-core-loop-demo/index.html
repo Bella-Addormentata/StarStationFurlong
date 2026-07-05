@@ -204,6 +204,30 @@
         font-size: 10px;
         min-height: 12px;
       }
+
+      #solarmap-toggle-btn {
+        position: absolute;
+        top: 24px;
+        right: 24px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 600;
+        background: rgba(4, 8, 22, 0.80);
+        padding: 12px 18px;
+        border-radius: 12px;
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        cursor: pointer;
+        z-index: 1000;
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        transition: background 0.2s, border-color 0.2s;
+      }
+      #solarmap-toggle-btn:hover {
+        background: rgba(212, 168, 75, 0.15);
+        border-color: rgba(212, 168, 75, 0.44);
+      }
       
       /* Welcome screen with elegant fade */
       #welcome {
@@ -543,6 +567,9 @@
     
     <!-- 3D Canvas -->
     <div id="app"></div>
+
+    <!-- Floating MAP Toggle Trigger -->
+    <button id="solarmap-toggle-btn" type="button" aria-label="Open Solar System Map">🗺️ SOLAR MAP [M]</button>
     
     <!-- Welcome overlay -->
     <div id="welcome">
@@ -669,6 +696,9 @@
       <span class="control-sep">|</span>
       <span class="key">TAB</span>
       <span class="control-text">SpacePhone</span>
+      <span class="control-sep">|</span>
+      <span class="key">M</span>
+      <span class="control-text">Solar Map</span>
     </div>
 
     <!-- 🌌 SpacePhone Chat Overlay Panel (GDD §2 Communication / "SpacePhone Calls") -->

@@ -51,6 +51,7 @@ fn main() {
 
     let hub_clone = hub.clone();
     let hub_http = hub.clone();
+
     std::thread::spawn(move || {
         rt.spawn(async move {
             start_http_api_server(hub_http).await;

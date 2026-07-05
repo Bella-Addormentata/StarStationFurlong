@@ -11,6 +11,7 @@ import type { InputManager } from './input';
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import { packTick, unpackTick, type RoomBootstrap } from './network/protocol';
+import { SolarSystemMap } from './map';
 
 type RendererModule = typeof import('./renderer');
 
@@ -23,6 +24,8 @@ let frameCount = 0;
 let fpsUpdateTime = 0;
 let hasEntered = false;
 let controlsHintShown = false;
+let solarSystemMap: SolarSystemMap;
+let isMapOpen = false;
 
 // ── Raycasting (point-and-click navigation) ───────────────────────────────────
 const raycaster = new THREE.Raycaster();
@@ -667,6 +670,48 @@ function updateHUDLink(status: string, color: string) {
   }
 }
 
+function setupSolarMap() {
+  solarSystemMap = new SolarSystemMap();
+  solarSystemMap.mount(document.body);
+  (window as any).solarSystemMap = solarSystemMap;
+
+  const toggleBtn = document.getElementById('solarmap-toggle-btn');
+
+  const toggleMap = () => {
+    isMapOpen = !isMapOpen;
+    if (isMapOpen) {
+      solarSystemMap.show();
+    } else {
+      solarSystemMap.hide();
+    }
+  };
+
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMap();
+    });
+  }
+
+  window.addEventListener('keydown', (e) => {
+    // Check if player is focused in chat input before toggling map via M/m
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      return;
+    }
+
+    if (e.key === 'm' || e.key === 'M') {
+      toggleMap();
+    }
+  });
+
+  solarSystemMap.onTravelComplete((destinationId) => {
+    console.log(`[Sharding Node] Swapping direct channel to room zone: ${destinationId}`);
+    // Simulated multi-room zone sharding (v006 §8.5/§15.2)
+    logToPhoneSystem(`🛰️ Transit Complete. Connected to Zone: ${destinationId.toUpperCase()}`);
+  });
+}
+
 /**
  * Initialize the game
  */
@@ -689,6 +734,7 @@ async function init() {
   // Initialize input manager
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
+  setupSolarMap();
   
   // Single click: expand the platform and enter the lobby
   setupClickToEnter();
@@ -783,6 +829,10 @@ function animate() {
   // Update game systems
   if (world) {
     world.update(deltaTime, inputManager);
+  }
+
+  if (solarSystemMap) {
+    solarSystemMap.tick();
   }
 
   if (hasEntered && !controlsHintShown && world.isPlayerActive()) {
