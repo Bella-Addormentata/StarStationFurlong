@@ -13,6 +13,8 @@
  * resolution so pathfinding never routes the player through furniture.
  */
 
+import { OBSTACLES } from './obstacles';
+
 // ── Grid constants ────────────────────────────────────────────────────────────
 /** World-space size of each grid cell (metres) */
 export const CELL_SIZE = 0.5;
@@ -21,25 +23,9 @@ export const GRID_SIZE = 22;
 /** Half-extent used to convert between grid and world coordinates */
 export const GRID_HALF = GRID_SIZE / 2;
 
-// ── Obstacle AABBs (world-space, matching player.ts OBSTACLES list) ───────────
-interface Box { x0: number; z0: number; x1: number; z1: number }
-
-// Slightly expanded versions of the player collision boxes to keep the
-// pathfinder from routing through corners that would clip on playback.
-const OBSTACLE_BOXES: Box[] = [
-  { x0: -5.00, z0: -5.95, x1:  5.00, z1: -5.08 },
-  { x0: -1.50, z0: -2.12, x1:  1.50, z1: -0.88 },
-  { x0: -1.50, z0:  2.58, x1:  1.50, z1:  3.82 },
-  { x0: -4.82, z0: -4.32, x1: -3.78, z1:  2.32 },
-  { x0:  3.78, z0: -4.32, x1:  4.82, z1:  2.32 },
-  { x0: -0.94, z0: -3.82, x1:  0.94, z1: -2.78 },
-  { x0: -0.94, z0:  1.02, x1:  0.94, z1:  1.98 },
-  { x0:  4.48, z0:  1.48, x1:  5.92, z1:  4.72 },
-  { x0: -4.62, z0: -5.02, x1: -3.98, z1: -4.38 },
-  { x0:  3.98, z0: -5.02, x1:  4.62, z1: -4.38 },
-  { x0: -4.12, z0:  2.88, x1: -3.48, z1:  3.52 },
-  { x0:  3.48, z0:  2.88, x1:  4.12, z1:  3.52 },
-];
+// ── Obstacle AABBs (world-space, imported from shared obstacles module) ────────
+// Same boxes used by the player collision resolver, so the pathfinder
+// never routes the player through furniture it would collide with.
 
 // ── Pre-baked walkable grid ────────────────────────────────────────────────────
 /**
@@ -54,14 +40,14 @@ export const walkable: boolean[][] = (() => {
       const wx = (col - GRID_HALF + 0.5) * CELL_SIZE;
       const wz = (row - GRID_HALF + 0.5) * CELL_SIZE;
       let blocked = false;
-      for (const b of OBSTACLE_BOXES) {
+      for (const b of OBSTACLES) {
         if (wx > b.x0 && wx < b.x1 && wz > b.z0 && wz < b.z1) {
           blocked = true;
           break;
         }
       }
       // Also mark cells outside the walkable room boundary as blocked
-      if (Math.abs(wx) > 5.0 || Math.abs(wz) > 5.0) blocked = true;
+      if (Math.abs(wx) > 5.2 || Math.abs(wz) > 5.2) blocked = true;
       grid[row][col] = !blocked;
     }
   }

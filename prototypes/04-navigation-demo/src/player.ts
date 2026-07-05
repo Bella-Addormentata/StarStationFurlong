@@ -13,28 +13,14 @@
 
 import * as THREE from 'three';
 import { InputManager } from './input';
-import { updateDebugHUD } from './main';
+import { updateDebugHUD } from './hud';
 import { VoxelCharacter } from './voxelCharacter';
 import { WaypointReticle } from './waypoint';
 import { findPath, worldToCol, worldToRow } from './pathfinding';
+import { OBSTACLES } from './obstacles';
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
 const PLAYER_R = 0.38;
-interface Box { x0: number; z0: number; x1: number; z1: number }
-const OBSTACLES: Box[] = [
-  { x0: -5.00, z0: -5.95, x1:  5.00, z1: -5.08 },
-  { x0: -1.50, z0: -2.12, x1:  1.50, z1: -0.88 },
-  { x0: -1.50, z0:  2.58, x1:  1.50, z1:  3.82 },
-  { x0: -4.82, z0: -4.32, x1: -3.78, z1:  2.32 },
-  { x0:  3.78, z0: -4.32, x1:  4.82, z1:  2.32 },
-  { x0: -0.94, z0: -3.82, x1:  0.94, z1: -2.78 },
-  { x0: -0.94, z0:  1.02, x1:  0.94, z1:  1.98 },
-  { x0:  4.48, z0:  1.48, x1:  5.92, z1:  4.72 },
-  { x0: -4.62, z0: -5.02, x1: -3.98, z1: -4.38 },
-  { x0:  3.98, z0: -5.02, x1:  4.62, z1: -4.38 },
-  { x0: -4.12, z0:  2.88, x1: -3.48, z1:  3.52 },
-  { x0:  3.48, z0:  2.88, x1:  4.12, z1:  3.52 },
-];
 
 const SNAP_INCREMENT = Math.PI / 4;
 
@@ -215,12 +201,16 @@ export class Player {
       const step = Math.min(this.SPEED * deltaTime, dist);
       const candX = pos.x + nx * step;
       const candZ = pos.z + nz * step;
-      const resolved = resolveObstacles(
+      const r1 = resolveObstacles(
         Math.max(-this.BOUND, Math.min(this.BOUND, candX)),
+        pos.z,
+      );
+      const r2 = resolveObstacles(
+        r1.x,
         Math.max(-this.BOUND, Math.min(this.BOUND, candZ)),
       );
-      pos.x = resolved.x;
-      pos.z = resolved.z;
+      pos.x = r2.x;
+      pos.z = r2.z;
 
       this.character.setState('walk', this.logicalAngle);
     }

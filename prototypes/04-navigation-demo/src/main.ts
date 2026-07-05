@@ -5,6 +5,7 @@
 
 import './style.css';
 import * as THREE from 'three';
+import { updateDebugHUD } from './hud';
 import type { World } from './world';
 import type { InputManager } from './input';
 
@@ -145,16 +146,6 @@ function animate() {
 
   // Render — camera position/angle never changes
   renderer.render(scene, camera);
-}
-
-/**
- * Update debug HUD
- */
-function updateDebugHUD(elementId: string, value: string) {
-  const element = document.getElementById(elementId);
-  if (element) {
-    element.textContent = value;
-  }
 }
 
 /**
