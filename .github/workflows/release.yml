@@ -163,5 +163,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          projectPath: "prototypes/0.6.0-core-loop-demo"
+          projectPath: "prototypes/0.7.0-core-loop-demo"
           args: --config release-frontend.json ${{ matrix.args }}
