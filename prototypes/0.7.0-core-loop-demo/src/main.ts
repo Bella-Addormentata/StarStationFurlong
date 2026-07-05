@@ -12,6 +12,7 @@ import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import { packTick, unpackTick, type RoomBootstrap } from './network/protocol';
 import { SolarSystemMap } from './map';
+import { MultiScaleZoomView } from './zoom';
 
 type RendererModule = typeof import('./renderer');
 
@@ -26,6 +27,7 @@ let hasEntered = false;
 let controlsHintShown = false;
 let solarSystemMap: SolarSystemMap;
 let isMapOpen = false;
+let multiScaleZoom: MultiScaleZoomView;
 
 // ── Raycasting (point-and-click navigation) ───────────────────────────────────
 const raycaster = new THREE.Raycaster();
@@ -675,6 +677,11 @@ function setupSolarMap() {
   solarSystemMap.mount(document.body);
   (window as any).solarSystemMap = solarSystemMap;
 
+  // Mount Multiscale Keyboard Zoom manager
+  multiScaleZoom = new MultiScaleZoomView();
+  multiScaleZoom.mount(document.body);
+  (window as any).multiScaleZoom = multiScaleZoom;
+
   const toggleBtn = document.getElementById('solarmap-toggle-btn');
 
   const toggleMap = () => {
@@ -833,6 +840,10 @@ function animate() {
 
   if (solarSystemMap) {
     solarSystemMap.tick();
+  }
+
+  if (multiScaleZoom) {
+    multiScaleZoom.tick();
   }
 
   if (hasEntered && !controlsHintShown && world.isPlayerActive()) {
