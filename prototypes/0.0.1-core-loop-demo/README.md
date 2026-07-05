@@ -1,22 +1,13 @@
-# StarStation Furlong: Ortho Camera Demo
+# StarStation Furlong: Core Loop Demo
 
-This prototype is a camera-tweaked variant of `01-core-loop-demo`.
+This prototype is the playable demo for Phase 1, Task 1.1 in the execution plan.
 
 It includes:
 - Vite + TypeScript project setup
 - Three.js rendering
-- **Orthographic (parallel) projection** — no perspective distortion
-- **Locked camera** — fixed isometric position and angle, never moves
-- A Mars-themed station planet and lobby scene
+- A cinematic intro flow
+- A Mars-themed station planet, sky planet, and lobby scene
 - WASD-controlled NPC movement with collision and sit/stand behavior
-
-## Camera differences from `01-core-loop-demo`
-
-| Feature | Core Loop Demo | Ortho Camera Demo |
-|---|---|---|
-| Projection | Perspective | **Orthographic** |
-| Camera animations | Cinematic zoom-in on click | **None — camera locked** |
-| Entry flow | Two-click (approach → lobby) | **One-click (lobby immediately)** |
 
 ## 1. Prerequisites
 
@@ -67,7 +58,7 @@ npm --version
 3. Enter the demo folder:
 
 ```bash
-cd /path/to/StarStationFurlong/prototypes/02-ortho-camera-demo
+cd /path/to/StarStationFurlong/prototypes/0.0.1-core-loop-demo
 ```
 
 Replace `/path/to/StarStationFurlong` with the folder where you cloned or copied the repository.
@@ -84,10 +75,10 @@ This installs the project dependencies defined in `package.json`, including:
 - `three`
 - `vite`
 - `typescript`
-- `yjs`
+- `yjs` (+ `y-protocols`, `y-indexeddb` — Sprint 3 sync/awareness)
 - `msgpackr`
 
-> Historical demo snapshot: networking was never implemented here. The live networking seams (typed ports, protocol contracts) are in [`01-core-loop-demo/src/network/`](../01-core-loop-demo/src/network/) per [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — `simple-peer` was removed with the v005/v006 revisions.
+> Networking note: the transport is **raw WebTransport with `serverCertificateHashes`** per [STUDY-Architecture v006](../../brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) — `simple-peer` was removed with the v005/v006 revisions. The typed port seams live in `src/network/` (`protocol.ts` defines the contracts; Sprint 3 implements them).
 
 ## 4. Run the Demo in Development Mode
 
@@ -111,9 +102,9 @@ If the browser does not open automatically:
 
 After the page loads:
 
-1. The station appears as a Mars-like planet viewed from a fixed isometric angle.
-2. The debug HUD shows **CAM: ORTHO · LOCKED** confirming the camera mode.
-3. Click `Click to Enter` to expand the platform immediately (no camera animation).
+1. The station appears as a Mars-like planet suspended in space.
+2. Click `Click to Enter` to approach the station.
+3. Click the lobby overlay to open the platform view.
 4. Use `W`, `A`, `S`, `D` to move the NPC around the lounge.
 5. Stop near a sofa or chair for about 1.2 seconds to trigger the sit animation.
 
@@ -151,11 +142,11 @@ When you are done testing the demo:
 Key files and folders:
 
 ```text
-02-ortho-camera-demo/
+0.0.1-core-loop-demo/
 ├── public/              # Static assets such as textures
 ├── src/                 # Game source files
-│   ├── main.ts          # Entry point and entry flow (no camera animations)
-│   ├── renderer.ts      # Orthographic camera setup, locked position/angle
+│   ├── main.ts          # Entry point and intro flow
+│   ├── renderer.ts      # Three.js renderer, camera, lighting
 │   ├── world.ts         # Station planet, platform morph, world logic
 │   ├── player.ts        # Mars-like sky planet shown above the lobby
 │   ├── npc.ts           # NPC movement, collision, and sitting behavior
@@ -171,7 +162,7 @@ Key files and folders:
 ### `npm run dev` fails
 
 Check the following:
-1. Make sure you are inside the `02-ortho-camera-demo` folder.
+1. Make sure you are inside the `0.0.1-core-loop-demo` folder.
 2. Make sure `node --version` shows Node.js 20 or newer.
 3. Run `npm install` again if `node_modules/` is missing.
 4. Make sure you are running the command inside the demo folder, not the repository root.
@@ -191,12 +182,11 @@ public/assets/mars.png
 
 ## 11. Current Scope
 
-This demo covers the same local rendering foundation as `01-core-loop-demo` with camera tweaks applied.
+This demo currently covers the local rendering foundation for early Phase 1 work.
 
 Included now:
-- Local rendering with orthographic projection
-- Locked isometric camera (position and angle never change)
-- One-click lobby entry (no cinematic zoom)
+- Local rendering
+- Intro animation flow
 - NPC movement, collision, and sit/stand interaction
 - HUD and visual prototype work
 

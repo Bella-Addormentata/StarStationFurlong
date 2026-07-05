@@ -9,6 +9,17 @@ on:
     tags:
       - 'v[0-9]*.[0-9]*.0'
 
+env:
+  # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
+  # The Tauri shell (window, Rust node, icons, app version) always comes from
+  # prototypes/0.5.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # To release a different demo:
+  #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
+  #   2. Make sure that folder has a committed package-lock.json and a
+  #      `npm run build` script that outputs to its local dist/.
+  #   3. Commit, then push a vX.Y.0 tag as usual.
+  RELEASE_FRONTEND: prototypes/0.5.0-core-loop-demo
+
 jobs:
   publish-tauri-binaries:
     permissions:
@@ -35,7 +46,7 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
-          cache-dependency-path: 'prototypes/01-core-loop-demo/package-lock.json'
+          cache-dependency-path: '${{ env.RELEASE_FRONTEND }}/package-lock.json'
 
       # 2. Setup stable Rust toolchains for our sovereign backbones
       - name: 🦀 Setup Rust stable
@@ -47,7 +58,7 @@ jobs:
       - name: 💾 Rust Cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'prototypes/01-core-loop-demo/src-tauri -> target'
+          workspaces: 'prototypes/0.5.0-core-loop-demo/src-tauri -> target'
 
       # 3. Install platform-specific compiler dependencies (Webkit/GTK libraries for Linux)
       - name: 🔧 Install System Dependencies (Linux only)
@@ -56,13 +67,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
 
-      # 4. Install npm packages for Vite
-      - name: 📦 Install Frontend Dependencies
+      # 4. Install dependencies and build the SELECTED frontend (env.RELEASE_FRONTEND)
+      - name: 📦 Install & Build Frontend (${{ env.RELEASE_FRONTEND }})
+        shell: bash
         run: |
-          cd prototypes/01-core-loop-demo
+          cd "$RELEASE_FRONTEND"
           npm ci
+          npm run build
 
-      # 5. Compile the frontend & run Rust Cargo builds via Tauri official action
+      # 5. Point the shared Tauri shell at the selected frontend's dist/.
+      #    Written as a JSON overlay merged into tauri.conf.json via `--config`;
+      #    the before-build hook becomes a no-op because step 4 already built it.
+      - name: 🔀 Select release frontend for Tauri shell
+        shell: bash
+        run: |
+          name="${RELEASE_FRONTEND##*/}"
+          cat > prototypes/0.5.0-core-loop-demo/release-frontend.json <<EOF
+          {
+            "build": {
+              "beforeBuildCommand": "echo frontend prebuilt by workflow",
+              "frontendDist": "../../${name}/dist"
+            }
+          }
+          EOF
+          echo "Tauri config overlay:" && cat prototypes/0.5.0-core-loop-demo/release-frontend.json
+
+      # 6. Extract this release's notes (top section of CHANGELOG.md) for the release body
+      - name: 📝 Extract release notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        run: |
+          awk '/^## /{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Sovereign P2P Space MMO - Production build stable release ${GITHUB_REF_NAME}. See CHANGELOG.md." > RELEASE_NOTES.md
+          fi
+          {
+            echo 'body<<NOTES_EOF'
+            cat RELEASE_NOTES.md
+            echo 'NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # 7. Run Rust Cargo builds & bundle installers via Tauri official action
       - name: 🛠️ Build & Package Tauri Application
         uses: tauri-apps/tauri-action@v0
         env:
@@ -70,8 +115,8 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "StarStation Furlong ${{ github.ref_name }}"
-          releaseBody: "Sovereign P2P Space MMO - Production build stable release ${{ github.ref_name }}."
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: true # Leaves as draft so developers can review release files before publishing!
           prerelease: false
-          projectPath: "prototypes/01-core-loop-demo"
-          args: ${{ matrix.args }}
+          projectPath: "prototypes/0.5.0-core-loop-demo"
+          args: --config release-frontend.json ${{ matrix.args }}

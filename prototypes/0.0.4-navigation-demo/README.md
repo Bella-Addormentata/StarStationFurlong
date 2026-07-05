@@ -76,7 +76,7 @@ if (manualInput) {
 ## Running
 
 ```bash
-cd prototypes/04-navigation-demo
+cd prototypes/0.0.4-navigation-demo
 npm install
 npm run dev
 ```

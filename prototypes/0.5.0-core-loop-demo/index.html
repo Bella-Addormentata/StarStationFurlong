@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StarStation Furlong - Core Loop Demo</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        overflow: hidden;
+        background-color: #0a2a5e;
+      }
+      
+      /* Canvas container with vignette overlay */
+      #app {
+        width: 100vw;
+        height: 100vh;
+        position: relative;
+      }
+
+      #app canvas {
+        width: 100vw !important;
+        height: 100vh !important;
+      }
+      
+      /* Subtle vignette to blend edges */
+      #app::after {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: radial-gradient(ellipse at center, transparent 0%, rgba(10, 42, 94, 0.20) 70%, rgba(10, 42, 94, 0.50) 100%);
+        pointer-events: none;
+        z-index: 1;
+      }
+      
+      /* Top status bar - minimalist design */
+      #debug-hud {
+        position: absolute;
+        top: 24px;
+        left: 24px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 500;
+        background: rgba(4, 8, 22, 0.80);
+        padding: 12px 18px;
+        border-radius: 12px;
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        pointer-events: none;
+        z-index: 1000;
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+      }
+      
+      #debug-hud div {
+        margin: 4px 0;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      
+      #debug-hud .label {
+        color: rgba(212, 168, 75, 0.52);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      
+      #debug-hud .value {
+        color: #00d4ff;
+        font-weight: 600;
+      }
+
+      #network-details-hud {
+        position: absolute;
+        top: 210px;
+        left: 24px;
+        width: 360px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 500;
+        background: rgba(4, 8, 22, 0.80);
+        padding: 10px 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        z-index: 1000;
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+      }
+
+      #network-details-hud.collapsed .network-details-body {
+        display: none;
+      }
+
+      .network-details-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .network-details-title {
+        color: rgba(212, 168, 75, 0.82);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+
+      #network-details-toggle {
+        background: rgba(212, 168, 75, 0.10);
+        color: #d4a84b;
+        border: 1px solid rgba(212, 168, 75, 0.24);
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        line-height: 1;
+        width: 26px;
+        height: 24px;
+      }
+
+      .network-details-body {
+        margin-top: 10px;
+      }
+
+      .network-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin: 4px 0;
+      }
+
+      .network-row .label {
+        color: rgba(212, 168, 75, 0.52);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .network-row .value {
+        color: #00d4ff;
+        font-weight: 600;
+      }
+
+      .network-link-tools {
+        margin-top: 10px;
+        border-top: 1px solid rgba(212, 168, 75, 0.18);
+        padding-top: 10px;
+      }
+
+      .network-link-tools .tool-label {
+        display: block;
+        color: rgba(212, 168, 75, 0.7);
+        font-size: 10px;
+        margin-bottom: 4px;
+      }
+
+      .network-link-tools .tool-row {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 6px;
+      }
+
+      .network-link-tools input {
+        flex: 1;
+        border-radius: 6px;
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        background: rgba(0, 0, 0, 0.25);
+        color: #d4a84b;
+        font-size: 11px;
+        padding: 6px 8px;
+      }
+
+      .network-link-tools button {
+        border-radius: 6px;
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        background: rgba(212, 168, 75, 0.12);
+        color: #d4a84b;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 6px 8px;
+        cursor: pointer;
+      }
+
+      #network-link-feedback {
+        color: rgba(212, 168, 75, 0.72);
+        font-size: 10px;
+        min-height: 12px;
+      }
+      
+      /* Welcome screen with elegant fade */
+      #welcome {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: rgba(2, 5, 16, 0.30);
+        backdrop-filter: blur(5px);
+        -webkit-backdrop-filter: blur(5px);
+        z-index: 2000;
+        transition: opacity 0.5s ease;
+        cursor: pointer;
+      }
+      
+      #welcome-content {
+        text-align: center;
+        animation: welcomeSlideUp 1s cubic-bezier(0.4, 0.0, 0.2, 1);
+      }
+      
+      #welcome h1 {
+        font-size: 56px;
+        font-weight: 700;
+        margin: 0 0 16px 0;
+        letter-spacing: 2px;
+        color: #F0C060;
+        text-shadow: 0 0 40px rgba(240, 160, 40, 0.55), 0 4px 16px rgba(0, 0, 0, 0.6);
+      }
+      
+      #welcome .subtitle {
+        font-size: 16px;
+        color: rgba(220, 175, 90, 0.70);
+        margin-bottom: 32px;
+        letter-spacing: 4px;
+        text-transform: uppercase;
+      }
+      
+      #welcome .hint {
+        font-size: 14px;
+        color: rgba(0, 212, 255, 0.9);
+        padding: 8px 20px;
+        border: 1px solid rgba(0, 212, 255, 0.3);
+        border-radius: 20px;
+        display: inline-block;
+        background: rgba(0, 212, 255, 0.05);
+      }
+      
+      @keyframes welcomeFadeOut {
+        0% { opacity: 1; }
+        60% { opacity: 1; }
+        100% { opacity: 0; visibility: hidden; }
+      }
+      
+      @keyframes welcomeSlideUp {
+        from {
+          opacity: 0;
+          transform: translateY(20px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      
+      @keyframes pulse {
+        0%, 100% {
+          transform: translateX(-50%) scale(1);
+          opacity: 1;
+        }
+        50% {
+          transform: translateX(-50%) scale(1.05);
+          opacity: 0.8;
+        }
+      }
+      
+      /* Bottom control hint - floating card style */
+      #controls {
+        position: absolute;
+        bottom: 32px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: #d4a84b;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        font-size: 13px;
+        background: rgba(4, 8, 22, 0.80);
+        padding: 16px 28px;
+        border-radius: 24px;
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      
+      .keys-group {
+        display: flex;
+        gap: 6px;
+      }
+      
+      .key {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 32px;
+        height: 32px;
+        padding: 0 10px;
+        background: rgba(212, 168, 75, 0.10);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 13px;
+        color: #d4a84b;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(212, 168, 75, 0.12);
+        transition: all 0.2s ease;
+      }
+      
+      .control-text {
+        color: rgba(212, 168, 75, 0.65);
+        font-size: 13px;
+      }
+
+      .control-sep {
+        color: rgba(212, 168, 75, 0.30);
+        font-size: 13px;
+      }
+      
+      /* 📱 SpacePhone Simulated Bezel & Screen Styling rules (v006 Retro Theme) */
+      #spacephone-container {
+        position: absolute;
+        bottom: -460px; /* Hidden offscreen by default, slide up transition */
+        right: 40px;
+        width: 320px;
+        height: 500px;
+        background: #040816;
+        border-radius: 40px 40px 10px 10px;
+        border: 4px solid #1a1e2a;
+        box-shadow: 0 20px 80px rgba(0, 0, 0, 0.95);
+        z-index: 5000;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        transition: bottom 0.6s cubic-bezier(0.19, 1, 0.22, 1);
+        backdrop-filter: blur(10px);
+        box-sizing: border-box;
+      }
+
+      #spacephone-container.active {
+        bottom: -15px; /* Slide open and let top bezel notch emerge */
+      }
+
+      /* Phone Bezel Notch */
+      #phone-bezel {
+        height: 38px;
+        background: #111422;
+        width: 100%;
+        position: relative;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        border-bottom: 1px solid rgba(212, 168, 75, 0.08);
+      }
+
+      #notch-speaker {
+        width: 60px;
+        height: 5px;
+        background: #090a12;
+        border-radius: 3px;
+        margin-right: 8px;
+        border: 1px solid rgba(255,255,255,0.06);
+      }
+
+      #notch-camera {
+        width: 8px;
+        height: 8px;
+        background: #000c22;
+        border-radius: 50%;
+        border: 1px solid #1a233a;
+      }
+
+      /* Inside Screen */
+      #phone-screen {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background: rgba(4, 6, 15, 0.96);
+        position: relative;
+      }
+
+      #phone-status-bar {
+        display: flex;
+        justify-content: space-between;
+        padding: 5px 16px;
+        background: rgba(8, 12, 30, 0.6);
+        border-bottom: 1px solid rgba(212, 168, 75, 0.05);
+        color: rgba(224, 226, 238, 0.6);
+        font-family: monospace;
+      }
+
+      #phone-app-header {
+        padding: 10px 16px;
+        background: rgba(10, 14, 34, 0.9);
+        border-bottom: 1px solid rgba(212, 168, 75, 0.12);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      /* Scrollable Message Box */
+      #chat-messages-container {
+        flex: 1;
+        padding: 12px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        scroll-behavior: smooth;
+      }
+
+      .chat-bubble {
+        max-width: 85%;
+        padding: 8px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        line-height: 1.4;
+        word-break: break-word;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .chat-bubble.system {
+        align-self: center;
+        background: rgba(212, 168, 75, 0.07);
+        color: #d4a84b;
+        border: 1px solid rgba(212, 168, 75, 0.12);
+        font-size: 11px;
+        text-align: center;
+        border-radius: 8px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+
+      .chat-bubble.inbound {
+        align-self: flex-start;
+        background: rgba(30, 136, 229, 0.14);
+        color: #90caf9;
+        border-radius: 4px 12px 12px 12px;
+        border: 1px solid rgba(30, 136, 229, 0.2);
+      }
+
+      .chat-bubble.outbound {
+        align-self: flex-end;
+        background: rgba(0, 230, 118, 0.12);
+        color: #a5d6a7;
+        border-radius: 12px 12px 4px 12px;
+        border: 1px solid rgba(0, 230, 118, 0.20);
+      }
+
+      .chat-sender-name {
+        font-size: 9px;
+        font-weight: 700;
+        display: block;
+        margin-bottom: 3px;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+      }
+
+      /* Form Input styling */
+      #chat-input {
+        flex: 1;
+        background: #090a12;
+        color: #e0e2ee;
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        padding: 8px 12px;
+        border-radius: 18px;
+        font-size: 12px;
+        outline: none;
+        transition: border 0.3s;
+      }
+
+      #chat-input:focus {
+        border-color: #1e88e5;
+      }
+
+      #chat-send-btn {
+        background: #1e88e5;
+        color: #fff;
+        border: none;
+        padding: 6px 14px;
+        font-weight: bold;
+        border-radius: 18px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 0.2s;
+      }
+
+      #chat-send-btn:hover {
+        background: #1565c0;
+      }
+
+      /* Ambient corner glow effects */
+      .corner-glow {
+        position: absolute;
+        width: 300px;
+        height: 300px;
+        border-radius: 50%;
+        pointer-events: none;
+        z-index: 0;
+        filter: blur(80px);
+        opacity: 0.15;
+      }
+      
+      .corner-glow.top-left {
+        top: -100px;
+        left: -100px;
+        background: radial-gradient(circle, #00d4ff 0%, transparent 70%);
+      }
+      
+      .corner-glow.bottom-right {
+        bottom: -100px;
+        right: -100px;
+        background: radial-gradient(circle, #e08820 0%, transparent 70%);
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Ambient corner glows -->
+    <div class="corner-glow top-left"></div>
+    <div class="corner-glow bottom-right"></div>
+    
+    <!-- 3D Canvas -->
+    <div id="app"></div>
+    
+    <!-- Welcome overlay -->
+    <div id="welcome">
+      <div id="welcome-content">
+        <h1>STARSTATION FURLONG</h1>
+        <div class="subtitle">Phase 1 Demo</div>
+        <div class="hint" style="animation: pulse 2s ease-in-out infinite;">👆 Click to Enter</div>
+      </div>
+    </div>
+    
+    <!-- Debug HUD -->
+    <div id="debug-hud">
+      <div>
+        <span class="label">FPS</span>
+        <span class="value" id="fps">--</span>
+      </div>
+      <div>
+        <span class="label">CAM</span>
+        <span class="value">ORTHO · LOCKED</span>
+      </div>
+      <div>
+        <span class="label">POS</span>
+        <span class="value" id="position">--</span>
+      </div>
+      <div>
+        <span class="label">NAV</span>
+        <span class="value" id="navmode">MANUAL</span>
+      </div>
+      <div>
+        <span class="label">LINK</span>
+        <span class="value" id="link-status" style="color: #ff1744;">OFFLINE</span>
+      </div>
+      <div>
+        <span class="label">RTT</span>
+        <span class="value" id="rtt">-- ms</span>
+      </div>
+      <div>
+        <span class="label">LOSS</span>
+        <span class="value" id="loss">-- %</span>
+      </div>
+    </div>
+
+    <div id="network-details-hud" class="collapsed">
+      <div class="network-details-header">
+        <span class="network-details-title">Network Details</span>
+        <button id="network-details-toggle" aria-label="Expand network details">▼</button>
+      </div>
+      <div class="network-details-body">
+        <div class="network-row">
+          <span class="label">Peers Seen</span>
+          <span class="value" id="net-peers-seen">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Ticks Recv</span>
+          <span class="value" id="net-ticks-recv">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Ping/Pong</span>
+          <span class="value" id="net-ping-pong">0/0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Datagrams</span>
+          <span class="value" id="net-datagrams">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Session</span>
+          <span class="value" id="net-uptime">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Endpoint</span>
+          <span class="value" id="net-endpoint">--</span>
+        </div>
+
+        <div class="network-link-tools">
+          <label for="network-share-link" class="tool-label">Share seed link</label>
+          <div class="tool-row">
+            <input type="text" id="network-share-link" readonly placeholder="Connect first to generate a link">
+            <button id="network-copy-link-btn" type="button">Copy Link</button>
+          </div>
+
+          <label for="network-import-link" class="tool-label">Paste seed link</label>
+          <div class="tool-row">
+            <input type="text" id="network-import-link" placeholder="Paste link or seed">
+            <button id="network-use-link-btn" type="button">Use Link</button>
+          </div>
+          <div id="network-link-feedback"></div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Control hints -->
+    <div id="controls">
+      <div class="keys-group">
+        <span class="key">W</span>
+        <span class="key">A</span>
+        <span class="key">S</span>
+        <span class="key">D</span>
+      </div>
+      <span class="control-text">Move</span>
+      <span class="control-sep">|</span>
+      <span class="control-text">🖱 Click floor</span>
+      <span class="control-text">Navigate</span>
+      <span class="control-sep">|</span>
+      <span class="key">P</span>
+      <span class="control-text">SpacePhone</span>
+    </div>
+
+    <!-- 🌌 SpacePhone Chat Overlay Panel (GDD §2 Communication / "SpacePhone Calls") -->
+    <div id="spacephone-container">
+      <!-- Simulated Phone Bezel & Top Notch / Ear Piece -->
+      <div id="phone-bezel">
+        <div id="notch-speaker"></div>
+        <div id="notch-camera"></div>
+      </div>
+      
+      <!-- Inside Simulated Mobile Display -->
+      <div id="phone-screen">
+        <div id="phone-status-bar">
+          <span style="font-size: 10px; font-weight: 600; letter-spacing: 0.2px;">FurlongNet LTE</span>
+          <span id="phone-time" style="font-size: 10px; font-weight: 600;">12:00 PM</span>
+          <span style="font-size: 10px; font-weight: 600;">🔋 100%</span>
+        </div>
+
+        <div id="phone-app-header">
+          <div style="font-size: 13px; font-weight: 800; color: #1e88e5; letter-spacing: 0.5px;">👨‍🚀 CLONE CHAT</div>
+          <div style="font-size: 9px; color: rgba(224, 226, 238, 0.4); text-transform: uppercase;">Room: Furlong Lobby</div>
+        </div>
+
+        <!-- Scrollable Messages Container -->
+        <div id="chat-messages-container">
+          <div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>
+        </div>
+
+        <!-- Chat Input Form field -->
+        <form id="chat-form" onsubmit="return false;" style="display: flex; gap: 8px; padding: 10px; border-top: 1px solid rgba(212, 168, 75, 0.12); background: rgba(5, 7, 18, 0.95);">
+          <input type="text" id="chat-input" placeholder="Broadcast to room..." autocomplete="off">
+          <button type="submit" id="chat-send-btn">SEND</button>
+        </form>
+      </div>
+    </div>
+    
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
