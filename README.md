@@ -33,12 +33,12 @@ earlier explorations (superseded by the studies in [brainstorming/](brainstormin
 The current playable prototype is the Phase 1 core loop demo.
 
 ```bash
-cd prototypes/0.7.0-core-loop-demo
+cd prototypes/0.8.0-core-loop-demo
 npm install
 npm run dev
 ```
 
-Full setup instructions: [prototypes/0.7.0-core-loop-demo/README.md](prototypes/0.7.0-core-loop-demo/README.md)
+Full setup instructions: [prototypes/0.8.0-core-loop-demo/README.md](prototypes/0.8.0-core-loop-demo/README.md)
 
 ---
 

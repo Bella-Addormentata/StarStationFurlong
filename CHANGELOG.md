@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.7.0-core-loop-demo](prototypes/0.7.0-core-loop-demo/) and is built by the
+[prototypes/0.8.0-core-loop-demo](prototypes/0.8.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,7 +9,36 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- In progress for Phase 1 Sprint 4.
+- In progress for Phase 2 Star Swarm features.
+
+## v0.7.0 — 2026-07-05
+
+### Standalone P2P Swarm Hub (`ssf-p2p-node`)
+
+Implemented a dedicated console binary facilitating direct, zero-config internet connections:
+- Launches a native Iroh Swarm endpoint alongside WebTransport servers.
+- Automatically routes inbound/outbound streams. Passes chat and datagram movement ticks over direct Iroh hole-punched QUIC streams, bridging them safely into browser contexts.
+- Exposes your unique Iroh Node ID to the browser so "Bootstrap Links" embed your Dial Key. PASTING a seed link triggers a direct P2P dial back to the host, bypassing port-forwarding requirements completely.
+
+### Solar System Map
+
+Designed a lightweight 2.5D top-down system map:
+- Supports central star Sol, circular inner orbits, and highly accurate elliptical orbits (Planet Sovereign with 0.15 eccentricity).
+- Models stable Sovereign L4 and L5 Lagrange points, carrying minable resource nodes of Iron Ore, Silica, and Rare Minerals.
+- Progress travel distances are completely computed deterministically using simulation ticks, respecting 'derive-don't-tick' database pruning rules.
+
+### Keyboard Multi-Scale views
+
+Programmed smooth view transitions using keyboard `+` and `-` inputs:
+- Leverages 8 detailed levels: First Person, Room View, Module structuring, entire H-shaped Space Station outlines, Lagrange systems, Heliocentric Solar rings, Galaxy arms, and universe path seeds.
+- Level 1 First-Person: Swaps active orthographic cameras to a genuine `THREE.PerspectiveCamera` positioned at eye height, and binds pointer-locked free mouse looking (yaw/pitch).
+- Level 1 Transition: Smoothly glides the camera along a trajectory into the player clone's head, gradually fading player opacity.
+- Zoom Out Blink: Closing the perspective camera triggers full-screen organic eyelid blinks to seamlessly re-reveal standard room views.
+
+### SpacePhone battery indicator
+
+- SpacePhone header now parses and shows a retro cellphone signal bar graphic.
+- Displays connection speeds (`LTE` on active ports, `3G` on CGNAT fallbacks, and `NO SIGNAL` on OFFLINE).
 
 ## v0.6.0 — 2026-07-05
 
