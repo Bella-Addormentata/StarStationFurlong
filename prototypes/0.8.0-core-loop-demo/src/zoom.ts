@@ -463,11 +463,22 @@ export class MultiScaleZoomView {
     if (this.overlay) {
       if (this.currentLevel > 2) {
         this.overlay.style.pointerEvents = 'auto'; // intercept clicks
-        if (this.canvas) this.canvas.style.pointerEvents = 'auto';
+        if (this.canvas) {
+          this.canvas.style.pointerEvents = 'auto';
+          this.canvas.style.display = 'block'; // Ensure canvas is visible for levels > 2
+        }
         this.showSidebar(def);
       } else {
         this.overlay.style.pointerEvents = 'none'; // allow clicks to 3D world
-        if (this.canvas) this.canvas.style.pointerEvents = 'none';
+        if (this.canvas) {
+          this.canvas.style.pointerEvents = 'none';
+          // Keep canvas displayed but transparent if blinking, otherwise hide / transparent
+          if (!isBlinking) {
+            this.canvas.style.display = 'none'; // Hide canvas of zoom layers when in room/FP (level <= 2)
+          } else {
+            this.canvas.style.display = 'block';
+          }
+        }
         const side = document.getElementById('zoom-sidebar');
         if (side) side.style.display = 'none';
       }
