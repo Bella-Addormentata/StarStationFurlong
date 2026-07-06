@@ -23,6 +23,7 @@ opensource tech (current stack — see [STUDY-Architecture v006](brainstorming/A
 * https://github.com/xch-dev/chia-wallet-sdk + https://github.com/Chia-Network/chia-gaming — deeds, offers, settlement
 * https://github.com/mrdoob/three.js/ — rendering
 * https://github.com/tauri-apps/tauri — desktop + Android shell
+* https://github.com/yacy
 
 earlier explorations (superseded by the studies in [brainstorming/](brainstorming/AI%20BRAINSTORMING/), kept for the ideas they contributed):
 * https://github.com/feross/simple-peer · https://github.com/webtorrent/webtorrent · https://github.com/cabal-club · https://retroshare.cc/ · https://github.com/Tribler/tribler
