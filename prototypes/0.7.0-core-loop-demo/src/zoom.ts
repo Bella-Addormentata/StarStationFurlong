@@ -102,6 +102,17 @@ let initializedMouseLookOffset = false;
 let perspectiveCamera: THREE.PerspectiveCamera | null = null;
 let orthographicCamera: THREE.OrthographicCamera | null = null;
 
+// 🟢 Transition / Animation states
+let isTransitioningFirstPerson = false;
+let transitionProgress = 0.0; // 0.0 to 1.0
+let transitionStartPos = new THREE.Vector3();
+let transitionTargetPos = new THREE.Vector3();
+
+// Eyelid Blink state (for zooming out)
+let isBlinking = false;
+let blinkProgress = 0.0; // 0.0 to 1.0 (0=open, 0.5=fully closed, 1.0=fully open again)
+let pendingZoomOutAction = false;
+
 export class MultiScaleZoomView {
   private overlay: HTMLDivElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
@@ -292,6 +303,19 @@ export class MultiScaleZoomView {
 
   private zoomIn() {
     if (this.currentLevel > 1) {
+      if (this.currentLevel === 2) {
+        // Trigger smooth trajectory transition to Level 1 (First Person) from current camera position
+        const { camera } = window.gameRenderer;
+        if (camera) {
+          isTransitioningFirstPerson = true;
+          transitionProgress = 0.0;
+          transitionStartPos.copy(camera.position);
+
+          const playerPos = (window as any).world?.getPlayer()?.getPosition() || new THREE.Vector3(0, 0, 1.5);
+          // Target is behind the head looking into the central room (we look toward origin slightly)
+          transitionTargetPos.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
+        }
+      }
       this.currentLevel--;
       this.updateViewContext();
     }
@@ -299,6 +323,13 @@ export class MultiScaleZoomView {
 
   private zoomOut() {
     if (this.currentLevel < 8) {
+      if (this.currentLevel === 1) {
+        // Trigger eyelid blink before returning to standard room view (Level 2)
+        isBlinking = true;
+        blinkProgress = 0.0;
+        pendingZoomOutAction = true;
+        return; // Pause zooming out until eyelids are fully closed at 0.5 progress
+      }
       this.currentLevel++;
       this.updateViewContext();
     }
@@ -351,14 +382,37 @@ export class MultiScaleZoomView {
         }
 
         // Camera position is directly on top of the player's eye height (Y=1.25)
-        perspectiveCamera.position.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
-        
-        // Calculate target looking point based on yaw and pitch
-        const targetX = playerPos.x + Math.sin(yaw) * Math.cos(pitch);
-        const targetY = playerPos.y + 1.25 + Math.sin(pitch);
-        const targetZ = playerPos.z + Math.cos(yaw) * Math.cos(pitch);
+        if (isTransitioningFirstPerson) {
+          // LERP trajectory from start layout up to target back-of-head
+          const ratio = transitionProgress;
+          const currentPos = new THREE.Vector3().lerpVectors(transitionStartPos, transitionTargetPos, ratio);
+          perspectiveCamera.position.copy(currentPos);
 
-        perspectiveCamera.lookAt(targetX, targetY, targetZ);
+          // Render dynamic avatar mesh fading (opacity reduces as we approach)
+          const playerChar = (window as any).world?.getPlayer();
+          if (playerChar && playerChar.mesh) {
+            playerChar.mesh.visible = true; // keep visible during transition
+            const opacity = Math.max(0.0, 1.0 - ratio);
+            playerChar.mesh.traverse((child: any) => {
+              if (child instanceof THREE.Mesh && child.material) {
+                child.material.transparent = true;
+                child.material.opacity = opacity;
+                child.material.needsUpdate = true;
+              }
+            });
+          }
+
+          perspectiveCamera.lookAt(playerPos.x, playerPos.y + 1.25, playerPos.z);
+        } else {
+          perspectiveCamera.position.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
+          
+          // Calculate target looking point based on yaw and pitch
+          const targetX = playerPos.x + Math.sin(yaw) * Math.cos(pitch);
+          const targetY = playerPos.y + 1.25 + Math.sin(pitch);
+          const targetZ = playerPos.z + Math.cos(yaw) * Math.cos(pitch);
+
+          perspectiveCamera.lookAt(targetX, targetY, targetZ);
+        }
       } else {
         // Exiting First Person — re-assign OrthographicCamera
         if (orthographicCamera) {
@@ -375,6 +429,13 @@ export class MultiScaleZoomView {
           const playerChar = (window as any).world?.getPlayer();
           if (playerChar && playerChar.mesh) {
             playerChar.mesh.visible = true;
+            // Fully restore opacity
+            playerChar.mesh.traverse((child: any) => {
+              if (child instanceof THREE.Mesh && child.material) {
+                child.material.opacity = 1.0;
+                child.material.needsUpdate = true;
+              }
+            });
           }
           initializedMouseLookOffset = false;
         }
@@ -469,12 +530,85 @@ export class MultiScaleZoomView {
   }
 
   public tick() {
-    if (this.currentLevel === 1) {
+    // 1. Advance First-Person Camera Trajectory (Y=1.25)
+    if (isTransitioningFirstPerson) {
+      transitionProgress += 0.035; // smooth increment rate
+      if (transitionProgress >= 1.0) {
+        transitionProgress = 1.0;
+        isTransitioningFirstPerson = false;
+        
+        // Final hide of local character mesh upon arrival
+        const playerChar = (window as any).world?.getPlayer();
+        if (playerChar && playerChar.mesh) {
+          playerChar.mesh.visible = false;
+        }
+      }
+      this.updateViewContext();
+    } else if (this.currentLevel === 1) {
       // Force continuous rendering updates in first person so mouse look remains fluid
       this.updateViewContext();
     }
+
+    // 2. Process Eyelid Blink Animation (on Zooming Out)
+    if (isBlinking) {
+      blinkProgress += 0.05; // blink speed
+      if (blinkProgress >= 1.0) {
+        isBlinking = false;
+        blinkProgress = 0.0;
+      } else if (blinkProgress >= 0.5 && pendingZoomOutAction) {
+        // At mid-blink (eyes fully closed), execute the actual camera swap zoom out instantly!
+        pendingZoomOutAction = false;
+        this.currentLevel++;
+        this.updateViewContext();
+      }
+      this.renderBlinkOverlay();
+    }
+
     if (this.currentLevel <= 2 || !this.canvas || !this.ctx) return;
     this.render();
+  }
+
+  private renderBlinkOverlay() {
+    // We render the eyelid blink using a dedicated absolute canvas covering the screen fully
+    if (!this.canvas || !this.ctx) return;
+    const canvas = this.canvas;
+    const ctx = this.ctx;
+
+    // Use a temporary overlay style update if we are on Level 1 or 2 (which normally pass-through pointer-events)
+    if (this.overlay) {
+      this.overlay.style.pointerEvents = 'none';
+      if (this.canvas) this.canvas.style.pointerEvents = 'none';
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Calculate vertical height of top and bottom eyelids based on blink progress
+    // Eyelids fully meet at center (y = height/2) when progress = 0.5
+    const halfH = canvas.height / 2;
+    let multiplier = 0.0;
+
+    if (blinkProgress <= 0.5) {
+      // Closing: 0.0 -> 1.0 multiplier
+      multiplier = blinkProgress / 0.5;
+    } else {
+      // Opening: 1.0 -> 0.0 multiplier
+      multiplier = 1.0 - ((blinkProgress - 0.5) / 0.5);
+    }
+
+    const eyelidHeight = halfH * multiplier;
+
+    ctx.fillStyle = '#01020a'; // warm space void tone black
+    
+    // Top eyelid
+    ctx.fillRect(0, 0, canvas.width, eyelidHeight);
+    
+    // Bottom eyelid
+    ctx.fillRect(0, canvas.height - eyelidHeight, canvas.width, eyelidHeight);
+
+    // Subtle blur border highlight of the eyelids (Organic eye skin warm shadow)
+    ctx.fillStyle = 'rgba(212, 168, 75, 0.05)';
+    ctx.fillRect(0, eyelidHeight, canvas.width, 2);
+    ctx.fillRect(0, canvas.height - eyelidHeight - 2, canvas.width, 2);
   }
 
   private render() {
