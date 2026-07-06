@@ -18,7 +18,7 @@ env:
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
   #   3. Commit, then push a vX.Y.0 tag as usual.
-  RELEASE_FRONTEND: prototypes/0.9.0-core-loop-demo
+  RELEASE_FRONTEND: prototypes/0.10.0-core-loop-demo
 
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────
@@ -122,7 +122,7 @@ jobs:
       - name: 💾 Rust Cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'prototypes/0.9.0-core-loop-demo/src-tauri -> target'
+          workspaces: 'prototypes/0.10.0-core-loop-demo/src-tauri -> target'
 
       # 3. Install platform-specific compiler dependencies (Webkit/GTK libraries for Linux)
       - name: 🔧 Install System Dependencies (Linux only)
@@ -146,7 +146,7 @@ jobs:
         shell: bash
         run: |
           name="${RELEASE_FRONTEND##*/}"
-          cat > prototypes/0.9.0-core-loop-demo/release-frontend.json <<EOF
+          cat > prototypes/0.10.0-core-loop-demo/release-frontend.json <<EOF
           {
             "build": {
               "beforeBuildCommand": "echo frontend prebuilt by workflow",
@@ -154,7 +154,7 @@ jobs:
             }
           }
           EOF
-          echo "Tauri config overlay:" && cat prototypes/0.9.0-core-loop-demo/release-frontend.json
+          echo "Tauri config overlay:" && cat prototypes/0.10.0-core-loop-demo/release-frontend.json
 
       # 6. Run Rust Cargo builds & upload installers into the shared draft release
       - name: 🛠️ Build & Package Tauri Application
@@ -163,5 +163,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          projectPath: "prototypes/0.9.0-core-loop-demo"
+          projectPath: "prototypes/0.10.0-core-loop-demo"
           args: --config release-frontend.json ${{ matrix.args }}

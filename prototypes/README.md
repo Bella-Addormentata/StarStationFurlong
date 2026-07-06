@@ -11,7 +11,8 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.9.0-core-loop-demo`](0.9.0-core-loop-demo/) | **The game (current release target).** Interactive center-wall docking doors, security pin codes, remote handshakes, and adjacent translucent grey-box projections. Inherits standard system maps and keyboard multiscale zoom. |
+| [`0.10.0-core-loop-demo`](0.10.0-core-loop-demo/) | **The game (current release target).** Seamless Quadratic Bezier zoom-in trajectories, interactive Room details maps, flat top-down system transitions, responsive "+/-" map scale bounds, and self-dismissing tooltips. |
+| [`0.9.0-core-loop-demo`](0.9.0-core-loop-demo/) | Frozen v0.9.0 release snapshot: Interactive center-wall docking doors, security pin codes, remote handshakes, and adjacent translucent grey-box projections. Inherits standard system maps and keyboard multiscale zoom. |
 | [`0.8.0-core-loop-demo`](0.8.0-core-loop-demo/) | Frozen v0.8.0 release snapshot: Fully modular H-shaped space stations, 2.5D Keplerian orbit paths, stable L1-L5 Lagrange zones, and multi-scale + / - key zooms. Adds a dedicated iroh P2P standalone node router supporting internet connections. |
 | [`0.7.0-core-loop-demo`](0.7.0-core-loop-demo/) | Frozen v0.7.0 release snapshot: Kepler system map, First-Person switchable camera + pointer locked mouse look, and SpacePhone cellphone weather indicator. |
 | [`0.5.0-core-loop-demo`](0.5.0-core-loop-demo/) | Frozen v0.5.0 release snapshot: locked orthographic camera, hybrid WASD + point-and-click A* navigation, WebTransport multiplayer + SpacePhone chat |
