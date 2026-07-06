@@ -35,6 +35,7 @@ const mouse     = new THREE.Vector2();
 
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
+(window as any).networkProvider = networkProvider;
 let yjsSync: YjsSync | null = null;
 let localSeq = 0;
 let lastTickSent = 0;
@@ -49,7 +50,7 @@ let networkPanelInitialized = false;
 // connection exists — this is how the first node of a sovereign network
 // comes online: there is no server, only peers. Every player's node seeds
 // for the network by default; only their connection can prevent it.
-interface LocalFingerprint { hex: string; base64: string; port: number }
+interface LocalFingerprint { hex: string; base64: string; port: number; iroh_node_id?: string }
 let localFingerprint: LocalFingerprint | null = null;
 const BOOTSTRAP_ADDRESS_STORAGE_KEY = 'ssf-bootstrap-address';
 const LEGACY_BOOTSTRAP_ADDRESS_KEY = 'ssf-host-address';
@@ -363,6 +364,7 @@ async function generateBootstrapLink(): Promise<{ link?: string; error?: string 
     roomId: 'furlong-lobby',
     wtUrl: parsed.wtUrl,
     certHashesB64: [fingerprint.base64],
+    irohNodeId: fingerprint.iroh_node_id, // Embed our Iroh Node ID for automatic hole-punching back-dial!
   };
   return { link: `${window.location.origin}${window.location.pathname}?seed=${encodeURIComponent(encodeBootstrapSeed(boot))}` };
 }
@@ -600,10 +602,14 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
     const roomId = typeof parsed.roomId === 'string' && parsed.roomId.length > 0
       ? parsed.roomId
       : 'furlong-lobby';
+    const irohNodeId = typeof parsed.irohNodeId === 'string' && parsed.irohNodeId.length > 0
+      ? parsed.irohNodeId
+      : undefined;
     return {
       roomId,
       wtUrl: parsed.wtUrl,
       certHashesB64,
+      irohNodeId,
     };
   } catch {
     return null;

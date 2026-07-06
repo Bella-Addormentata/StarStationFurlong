@@ -608,6 +608,16 @@ export class SolarSystemMap {
     console.log(msg);
   }
 
+  public getBootRecord(): any {
+    const net = (window as any).networkProvider;
+    return net ? net.getBootRecord() : null;
+  }
+
+  public getIrohNodeId(): string | undefined {
+    const boot = this.getBootRecord();
+    return boot ? boot.irohNodeId : undefined;
+  }
+
   public show() {
     if (this.container) {
       this.container.style.display = 'flex';

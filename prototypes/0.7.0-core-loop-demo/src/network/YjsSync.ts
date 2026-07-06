@@ -100,6 +100,9 @@ export class YjsSync {
   async #emitEnvelope(_kind: string, payload: Uint8Array) {
     if (!this.#writer) return;
 
+    // Retrieve active bootstrap record to check if we carry an Iroh node ID for direct hole-punching
+    const irohNodeId = (window as any).solarSystemMap?.getIrohNodeId?.() || (window as any).solarSystemMap?.getBootRecord?.()?.irohNodeId;
+
     const envelope: SsfEnvelope = {
       v: 1,
       room: this.opts.roomId,
@@ -107,6 +110,7 @@ export class YjsSync {
       seq: 1,
       author: new Uint8Array(32), // dummy key for Phase 1
       payload,
+      iroh_node_id: irohNodeId, // Inject Iroh node ID so the Rust node can construct direct back-dial connections!
     };
 
     if (this.opts.sign) {

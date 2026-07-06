@@ -116,6 +116,10 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
+  getBootRecord(): RoomBootstrap | null {
+    return this.#boot;
+  }
+
   mode(): TransportMode {
     return this.#mode;
   }

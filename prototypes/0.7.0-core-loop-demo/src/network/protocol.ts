@@ -33,6 +33,7 @@ export interface SsfEnvelope {
   author: Uint8Array;        // Ed25519 public key (32 bytes)
   payload: Uint8Array;       // body (y-sync bytes, CBOR/MessagePack op, …)
   sig?: Uint8Array;          // REQUIRED for state-mutating kinds (v005 §12.4)
+  iroh_node_id?: string;     // Carry sender's Iroh Node ID for automatic hole-punch back-dialing
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ export interface RoomBootstrap {
   certHashesB64: string[];       // staged current/next SHA-256, base64
   challenge?: Uint8Array;        // room-scoped; answered in ClientHello
   relays?: string[];             // iroh-relay hints (fallback lane, spike-gated)
+  irohNodeId?: string;           // Optional Iroh Node ID for automatic hole-punching
 }
 
 export interface ByteDuplex {
