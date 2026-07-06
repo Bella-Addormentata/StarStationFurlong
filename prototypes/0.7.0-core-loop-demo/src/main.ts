@@ -856,6 +856,9 @@ function animate() {
   }
 
   // ── Datagram tick sender & stats HUD (Task 3.2 / 3.4)
+  const elProvider = document.getElementById('phone-provider');
+  const elSignalBars = document.getElementById('phone-signal-bars');
+
   if (networkProvider.mode() !== 'offline') {
     const stats = networkProvider.stats();
     const debug = networkProvider.debugInfo();
@@ -867,6 +870,38 @@ function animate() {
     updateDebugHUD('net-datagrams', debug.datagramsRecv.toString());
     updateDebugHUD('net-uptime', debug.connectedForMs > 0 ? `${Math.round(debug.connectedForMs / 1000)}s` : '--');
     updateDebugHUD('net-endpoint', debug.endpointUrl.replace('https://', ''));
+
+    // Dynamic SpacePhone connection tier + signal bars indicator (LTE vs 3G, No Signal fallback)
+    const seedingSpan = document.getElementById('network-seeding-status');
+    const seedingStatus = seedingSpan?.textContent || '';
+    const hasOpenPorts = seedingStatus.includes('verified') || seedingStatus.includes('PUBLIC');
+
+    if (elProvider) {
+      elProvider.textContent = hasOpenPorts ? 'FurlongNet LTE' : 'FurlongNet 3G';
+    }
+
+    if (elSignalBars) {
+      // Calculate active signal bar colors as a function of peers or latency
+      // RTT < 20ms = 5 bars, RTT < 100ms = 4 bars, RTT < 250ms = 3 bars, etc.
+      let activeBars = 1;
+      const rtt = stats.rttMs;
+      if (!isNaN(rtt)) {
+        if (rtt < 15) activeBars = 5;
+        else if (rtt < 60) activeBars = 4;
+        else if (rtt < 150) activeBars = 3;
+        else if (rtt < 300) activeBars = 2;
+      }
+      
+      const barsDivs = elSignalBars.children;
+      for (let i = 0; i < barsDivs.length; i++) {
+        const bar = barsDivs[i] as HTMLElement;
+        if (i < activeBars) {
+          bar.style.backgroundColor = '#00e676'; // vibrant green active bars
+        } else {
+          bar.style.backgroundColor = 'rgba(255, 255, 255, 0.2)'; // dimmed background bars
+        }
+      }
+    }
     
     // Broadcast movement ticks at 20 Hz (50 ms interval) when moving
     if (world.isPlayerActive() && currentTime - lastTickSent >= 50) {
@@ -893,6 +928,19 @@ function animate() {
     updateDebugHUD('net-ticks-recv', '--');
     updateDebugHUD('net-ping-pong', '--');
     updateDebugHUD('net-datagrams', '--');
+
+    // Offline / No Signal fallback representation
+    if (elProvider) {
+      elProvider.textContent = 'NO SIGNAL';
+    }
+
+    if (elSignalBars) {
+      const barsDivs = elSignalBars.children;
+      for (let i = 0; i < barsDivs.length; i++) {
+        const bar = barsDivs[i] as HTMLElement;
+        bar.style.backgroundColor = 'rgba(255, 255, 255, 0.15)'; // all bars faded on offline
+      }
+    }
   }
   
   // Render — camera position/angle never changes
