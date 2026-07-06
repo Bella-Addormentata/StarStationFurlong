@@ -877,6 +877,14 @@ function animate() {
     updateDebugHUD('net-uptime', debug.connectedForMs > 0 ? `${Math.round(debug.connectedForMs / 1000)}s` : '--');
     updateDebugHUD('net-endpoint', debug.endpointUrl.replace('https://', ''));
 
+    // Expose the active Iroh Dial Key in the informational rows
+    const keyRow = document.getElementById('net-iroh-key');
+    if (keyRow) {
+      const fullId = localFingerprint?.iroh_node_id || '--';
+      keyRow.textContent = fullId.length > 20 ? `${fullId.slice(0, 10)}...${fullId.slice(-10)}` : fullId;
+      keyRow.title = fullId; // hovering shows full robust public key
+    }
+
     // Dynamic SpacePhone connection tier + signal bars indicator (LTE vs 3G, No Signal fallback)
     const seedingSpan = document.getElementById('network-seeding-status');
     const seedingStatus = seedingSpan?.textContent || '';
@@ -934,6 +942,11 @@ function animate() {
     updateDebugHUD('net-ticks-recv', '--');
     updateDebugHUD('net-ping-pong', '--');
     updateDebugHUD('net-datagrams', '--');
+
+    const keyRow = document.getElementById('net-iroh-key');
+    if (keyRow) {
+      keyRow.textContent = '--';
+    }
 
     // Offline / No Signal fallback representation
     if (elProvider) {

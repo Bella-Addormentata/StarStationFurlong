@@ -639,6 +639,10 @@
           <span class="value" id="net-uptime">--</span>
         </div>
         <div class="network-row">
+          <span class="label">Iroh Dial Key</span>
+          <span class="value" id="net-iroh-key" style="font-size: 10px; color: #ffe082;">--</span>
+        </div>
+        <div class="network-row">
           <span class="label">Endpoint</span>
           <span class="value" id="net-endpoint">--</span>
         </div>
@@ -659,19 +663,17 @@
           <label for="network-bootstrap-address" class="tool-label">Bootstrap a network — address friends can reach you at</label>
           <div class="tool-row">
             <input type="text" id="network-bootstrap-address" placeholder="e.g. 192.168.1.20 or my.ddns.net:4443" aria-label="Reachable bootstrap address">
-          </div>
-          <div class="tool-row">
             <button id="network-bootstrap-link-btn" type="button" aria-label="Generate bootstrap link from your own node">Bootstrap Link</button>
             <button id="network-test-reach-btn" type="button" aria-label="Self-test whether your node is reachable at that address">Self-Test</button>
           </div>
 
-          <label for="network-share-link" class="tool-label">Share seed link</label>
+          <label for="network-share-link" class="tool-label">Share link with friends to join room</label>
           <div class="tool-row">
             <input type="text" id="network-share-link" readonly placeholder="Generate a bootstrap link or connect to a peer">
             <button id="network-copy-link-btn" type="button">Copy Link</button>
           </div>
 
-          <label for="network-import-link" class="tool-label">Paste seed link</label>
+          <label for="network-import-link" class="tool-label">Paste reference room link</label>
           <div class="tool-row">
             <input type="text" id="network-import-link" placeholder="Paste link or seed">
             <button id="network-use-link-btn" type="button">Use Link</button>
