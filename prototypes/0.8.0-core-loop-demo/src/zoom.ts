@@ -301,6 +301,10 @@ export class MultiScaleZoomView {
     });
   }
 
+  public getLevel(): number {
+    return this.currentLevel;
+  }
+
   private zoomIn() {
     if (this.currentLevel > 1) {
       if (this.currentLevel === 2) {
