@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.8.0-core-loop-demo](prototypes/0.8.0-core-loop-demo/) and is built by the
+[prototypes/0.9.0-core-loop-demo](prototypes/0.9.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -11,7 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - In progress for Phase 2 Star Swarm features.
 
-## v0.7.0 — 2026-07-05
+## v0.9.0 — 2026-07-05
+
+### Multi-room Docking Port System (`docking.ts`)
+
+- **4-Wall Doors:** Placed moving metal sliding door panels (leaves) and carbon frames at the geometric centers of each lobby limits: North, South, East, and West.
+- **Keypad Control Panel:** Keypad golden terminal is interactive. Click raycasts trigger floating overlay context menus to manage locked states, security pin codes, and remote room seed links.
+- **Blinking LED Warnings:** Remote co-hosts see a flashing yellow indicator LED above the target door keypad upon receiving a pairing request. Owners can accept or reject couplings on the fly.
+- **Adjacent Room Projection:** Paired doors automatically slide open, projecting a translucent "gray-box representation" of the connected, adjacent cockpit outside the doorway walls.
+
+## v0.8.0 — 2026-07-05
 
 ### Standalone P2P Swarm Hub (`ssf-p2p-node`)
 

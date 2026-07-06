@@ -11,9 +11,9 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.8.0-core-loop-demo`](0.8.0-core-loop-demo/) | **The game (current release target).** Fully modular H-shaped space stations, 2.5D Keplerian orbit paths, stable L1-L5 Lagrange zones, and multi-scale + / - key zooms. Adds a dedicated iroh P2P standalone node router supporting internet connections. |
+| [`0.9.0-core-loop-demo`](0.9.0-core-loop-demo/) | **The game (current release target).** Interactive center-wall docking doors, security pin codes, remote handshakes, and adjacent translucent grey-box projections. Inherits standard system maps and keyboard multiscale zoom. |
+| [`0.8.0-core-loop-demo`](0.8.0-core-loop-demo/) | Frozen v0.8.0 release snapshot: Fully modular H-shaped space stations, 2.5D Keplerian orbit paths, stable L1-L5 Lagrange zones, and multi-scale + / - key zooms. Adds a dedicated iroh P2P standalone node router supporting internet connections. |
 | [`0.7.0-core-loop-demo`](0.7.0-core-loop-demo/) | Frozen v0.7.0 release snapshot: Kepler system map, First-Person switchable camera + pointer locked mouse look, and SpacePhone cellphone weather indicator. |
-| [`0.6.0-core-loop-demo`](0.6.0-core-loop-demo/) | Frozen v0.6.0 release snapshot: click-to-sit chair navigation, network bootstrapping (Bootstrap Link + Self-Test + seeding status), and Tab-toggled SpacePhone on top of 0.5.0 |
 | [`0.5.0-core-loop-demo`](0.5.0-core-loop-demo/) | Frozen v0.5.0 release snapshot: locked orthographic camera, hybrid WASD + point-and-click A* navigation, WebTransport multiplayer + SpacePhone chat |
 | [`0.0.1-core-loop-demo`](0.0.1-core-loop-demo/) | Original Phase 1 core loop demo (frozen): perspective camera, two-click cinematic entry, NPC with sit/stand behavior, Sprint-3 networking |
 | [`0.0.2-ortho-camera-demo`](0.0.2-ortho-camera-demo/) | Same as the original core loop but with orthographic (parallel) projection and a fully locked camera |
@@ -23,7 +23,7 @@ live game.
 ## Releasing a different demo as the app
 
 The packaged release always uses the Tauri shell from
-[`0.8.0-core-loop-demo/src-tauri`](0.8.0-core-loop-demo/src-tauri/) (window, Rust
+[`0.9.0-core-loop-demo/src-tauri`](0.9.0-core-loop-demo/src-tauri/) (window, Rust
 WebTransport node, icons, app version) — but the **frontend it renders is
 switchable**. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config

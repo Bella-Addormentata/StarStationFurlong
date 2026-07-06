@@ -83,7 +83,7 @@ By end of Phase 1, we must deliver:
 
 #### Task 1.1: Project Initialization — ✅ COMPLETED (2026-06-15)
 
-> **Completion notes:** Vite + Three.js prototype running at `prototypes/0.0.1-core-loop-demo/` (the frozen original; the live game continued in `prototypes/0.8.0-core-loop-demo/`). Dev server verified, HMR working, production build passing (`npm run build` clean). Visual prototype includes orthographic camera, Mars-textured station planet with cinematic intro flow, WASD player movement, FPS/position debug HUD, and NASA galaxy background. `src-tauri` scaffold deferred to Sprint 2 (browser-only prototype sufficient for Sprint 1 validation).
+> **Completion notes:** Vite + Three.js prototype running at `prototypes/0.0.1-core-loop-demo/` (the frozen original; the live game continued in `prototypes/0.9.0-core-loop-demo/`). Dev server verified, HMR working, production build passing (`npm run build` clean). Visual prototype includes orthographic camera, Mars-textured station planet with cinematic intro flow, WASD player movement, FPS/position debug HUD, and NASA galaxy background. `src-tauri` scaffold deferred to Sprint 2 (browser-only prototype sufficient for Sprint 1 validation).
 
 **Deliverables:**
 - Vite project setup with Three.js
@@ -92,7 +92,7 @@ By end of Phase 1, we must deliver:
 
 **File Structure:**
 ```
-prototypes/0.8.0-core-loop-demo/
+prototypes/0.9.0-core-loop-demo/
 ├── src/                          # Shared TS game core (runs in browser + Tauri webview)
 │   ├── main.ts                   # Entry point
 │   ├── renderer.ts               # Three.js renderer initialization
@@ -1075,7 +1075,7 @@ Zustand is useful for *purely local* UI state (chat panel open/closed, graphics 
 
 ##  Notes
 
-**Implementation Location:** All code implementations will be in `/prototypes/0.8.0-core-loop-demo/` (the highest-versioned core-loop folder is always the live game; superseded versions stay frozen, e.g. `/prototypes/0.7.0-core-loop-demo/`)
+**Implementation Location:** All code implementations will be in `/prototypes/0.9.0-core-loop-demo/` (the highest-versioned core-loop folder is always the live game; superseded versions stay frozen, e.g. `/prototypes/0.8.0-core-loop-demo/`)
 
 **Documentation Philosophy:** This plan focuses on WHAT to build and WHY. The HOW (code) lives in the prototype folder.
 
