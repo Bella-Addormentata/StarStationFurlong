@@ -51,16 +51,18 @@ export class DoorDockingPortSystem {
 
   /**
    * Build 3D geometries and click target boxes for our 4 Doors.
+   * conformed precisely to the grid: small doors take 1 grid cell width (1.0m on wall)
+   * large doors take 2 grid cells width (2.0m on wall)
    */
   public buildPorts() {
     console.log('🚪 Constructing 4-Directional Docking Ports & Control Panels');
     
     // Configurations: [doorId, pos, rot]
-    const doorsConfig: Array<{ id: 'north' | 'south' | 'east' | 'west'; pos: THREE.Vector3; rotY: number }> = [
-      { id: 'north', pos: new THREE.Vector3(0, 2, -6), rotY: 0 },
-      { id: 'south', pos: new THREE.Vector3(0, 2, 6), rotY: Math.PI },
-      { id: 'west', pos: new THREE.Vector3(-6, 2, 0), rotY: Math.PI / 2 },
-      { id: 'east', pos: new THREE.Vector3(6, 2, 0), rotY: -Math.PI / 2 },
+    const doorsConfig: Array<{ id: 'north' | 'south' | 'east' | 'west'; pos: THREE.Vector3; rotY: number; isLarge: boolean }> = [
+      { id: 'north', pos: new THREE.Vector3(0, 2, -6), rotY: 0, isLarge: false }, // Small door (1.0m width)
+      { id: 'south', pos: new THREE.Vector3(0, 2, 6), rotY: Math.PI, isLarge: false }, // Small door (1.0m width)
+      { id: 'west', pos: new THREE.Vector3(-6, 2, 0), rotY: Math.PI / 2, isLarge: true }, // Large door (2.0m width)
+      { id: 'east', pos: new THREE.Vector3(6, 2, 0), rotY: -Math.PI / 2, isLarge: true }, // Large door (2.0m width)
     ];
 
     for (const cfg of doorsConfig) {
@@ -68,32 +70,43 @@ export class DoorDockingPortSystem {
       doorGroup.position.copy(cfg.pos);
       doorGroup.rotation.y = cfg.rotY;
 
+      // Frame width is determined by large vs small door grid specifications
+      const frameWidth = cfg.isLarge ? 3.0 : 2.0;
+
       // 1. Frame Frame Geometries (sleek space-carbon look)
-      const frameGeo = new THREE.BoxGeometry(3.0, 3.5, 0.4);
+      const frameGeo = new THREE.BoxGeometry(frameWidth, 3.5, 0.4);
       const frameMat = new THREE.MeshStandardMaterial({ color: 0x111625, roughness: 0.8 });
       const frame = new THREE.Mesh(frameGeo, frameMat);
       doorGroup.add(frame);
 
-      // 2. Door Panels (moving metal blocks)
-      const leafGeo = new THREE.BoxGeometry(1.2, 3.2, 0.15);
+      // 2. Door Panels (moving metal blocks - matched to 1.0m small or 2.0m large doors)
+      const leafWidth = cfg.isLarge ? 1.2 : 0.7;
+      const leafGeo = new THREE.BoxGeometry(leafWidth, 3.2, 0.15);
       const leafMat = new THREE.MeshStandardMaterial({ color: 0x1E88E5, metalness: 0.1, roughness: 0.5 });
       
+      const leftOffset = cfg.isLarge ? -0.62 : -0.37;
+      const rightOffset = cfg.isLarge ? 0.62 : 0.37;
+
       const leftLeaf = new THREE.Mesh(leafGeo, leafMat);
-      leftLeaf.position.set(-0.62, 0, 0.05);
+      leftLeaf.position.set(leftOffset, 0, 0.05);
       leftLeaf.name = 'leftLeaf';
       
       const rightLeaf = new THREE.Mesh(leafGeo, leafMat);
-      rightLeaf.position.set(0.62, 0, 0.05);
+      rightLeaf.position.set(rightOffset, 0, 0.05);
       rightLeaf.name = 'rightLeaf';
 
       doorGroup.add(leftLeaf);
       doorGroup.add(rightLeaf);
 
+      // We attach the isLarge metadata onto the group so our slider knows the correct target panning offsets
+      doorGroup.userData = { isLarge: cfg.isLarge };
+
       // 3. Interactive Keypad Box (Golden terminal highlight)
       const keypadGeo = new THREE.BoxGeometry(0.3, 0.4, 0.12);
       const keypadMat = new THREE.MeshStandardMaterial({ color: 0xD4A84B, metalness: 0.5 });
       const keypad = new THREE.Mesh(keypadGeo, keypadMat);
-      keypad.position.set(1.6, -0.2, 0.1);
+      const keypadOffsetX = cfg.isLarge ? 1.6 : 1.1;
+      keypad.position.set(keypadOffsetX, -0.2, 0.1);
       keypad.name = `keypad_${cfg.id}`;
       // Store reference inside trigger metadata
       keypad.userData = { isControlPanel: true, doorId: cfg.id };
@@ -103,7 +116,7 @@ export class DoorDockingPortSystem {
       const ledGeo = new THREE.SphereGeometry(0.06, 16, 16);
       const ledMat = new THREE.MeshBasicMaterial({ color: 0xFF1744 }); // Default locked/red indicator
       const led = new THREE.Mesh(ledGeo, ledMat);
-      led.position.set(1.6, 0.1, 0.18);
+      led.position.set(keypadOffsetX, 0.1, 0.18);
       led.name = 'ledStatus';
       doorGroup.add(led);
 
@@ -389,7 +402,8 @@ export class DoorDockingPortSystem {
     const right = group.getObjectByName('rightLeaf') as THREE.Mesh | undefined;
 
     if (left && right) {
-      const targetOffset = open ? 1.45 : 0.62;
+      const isLarge = group.userData?.isLarge === true;
+      const targetOffset = open ? (isLarge ? 1.45 : 0.85) : (isLarge ? 0.62 : 0.37);
       let cur = 0;
       const step = () => {
         cur += 0.05;

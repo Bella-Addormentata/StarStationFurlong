@@ -429,12 +429,12 @@ export class World {
     };
 
     // ── RUGS — back fireplace zone + front entrance lounge ────────────────────
-    place(new THREE.BoxGeometry(8.2, 0.018, 5.4), m(RUG_A,    0.98, 0.0), 0, 0.009, -2.2);
-    place(new THREE.BoxGeometry(7.8, 0.020, 5.0), m(RUG_B,    0.98, 0.0), 0, 0.011, -2.2);
-    place(new THREE.BoxGeometry(7.4, 0.022, 4.6), m(0xE8A878,  0.98, 0.0), 0, 0.013, -2.2);
-    place(new THREE.BoxGeometry(6.4, 0.018, 3.6), m(0xD4B090,  0.98, 0.0), 0, 0.009, +2.8);
-    place(new THREE.BoxGeometry(6.0, 0.020, 3.2), m(0xBC9878,  0.98, 0.0), 0, 0.011, +2.8);
-    place(new THREE.BoxGeometry(5.6, 0.022, 2.8), m(0xE0C8A8,  0.98, 0.0), 0, 0.013, +2.8);
+    place(new THREE.BoxGeometry(8.0, 0.018, 6.0), m(RUG_A,    0.98, 0.0), 0, 0.009, -2.0);
+    place(new THREE.BoxGeometry(7.6, 0.020, 5.6), m(RUG_B,    0.98, 0.0), 0, 0.011, -2.0);
+    place(new THREE.BoxGeometry(7.2, 0.022, 5.2), m(0xE8A878,  0.98, 0.0), 0, 0.013, -2.0);
+    place(new THREE.BoxGeometry(6.0, 0.018, 4.0), m(0xD4B090,  0.98, 0.0), 0, 0.009, +3.0);
+    place(new THREE.BoxGeometry(5.6, 0.020, 3.6), m(0xBC9878,  0.98, 0.0), 0, 0.011, +3.0);
+    place(new THREE.BoxGeometry(5.2, 0.022, 3.2), m(0xE0C8A8,  0.98, 0.0), 0, 0.013, +3.0);
 
     // ── INTEGRATED FIREPLACE + BOOKCASE WALL ──────────────────────────────────
     // Layout: [bookcase SW=2.90] [stone pillar PW=0.52] [opening FW=2.60] [pillar] [bookcase]
@@ -552,45 +552,42 @@ export class World {
         place(new THREE.CylinderGeometry(0.042, 0.042, 0.15, 8), m(WOOD, 0.45, 0.25), sx + dx, 0.075, sz + dz));
     };
 
-    // ── LEFT WALL ARMCHAIRS (x=-4.3, facing +x) — 5 seats ──────────────────────
-    makeArmchair(-4.3, -3.8, -1);
-    makeArmchair(-4.3, -2.4, -1);
-    makeArmchair(-4.3, -1.0, -1);
-    makeArmchair(-4.3,  0.4, -1);  // moved from back conversation group
-    makeArmchair(-4.3,  1.8, -1);  // moved from front conversation group
+    // ── LEFT WALL ARMCHAIRS (x=-4.5, facing +x) ──────────────────────
+    makeArmchair(-4.5, -3.5, -1);
+    makeArmchair(-4.5, -1.5, -1);
+    makeArmchair(-4.5,  0.5, -1);
+    makeArmchair(-4.5,  2.5, -1);
 
-    // ── RIGHT WALL ARMCHAIRS (x=+4.3, facing -x) — 5 seats ─────────────────────
-    makeArmchair( 4.3, -3.8,  1);
-    makeArmchair( 4.3, -2.4,  1);
-    makeArmchair( 4.3, -1.0,  1);
-    makeArmchair( 4.3,  0.4,  1);  // moved from back conversation group
-    makeArmchair( 4.3,  1.8,  1);  // moved from front conversation group
+    // ── RIGHT WALL ARMCHAIRS (x=+4.5, facing -x) ─────────────────────
+    makeArmchair( 4.5, -3.5,  1);
+    makeArmchair( 4.5, -1.5,  1);
+    makeArmchair( 4.5,  0.5,  1);
+    makeArmchair( 4.5,  2.5,  1);
 
     // ── BACK FIREPLACE CONVERSATION GROUP — sofa + coffee table only ────────────
-    // 3-seater sofa, back toward entrance, seat facing fireplace
+    // 3-seater sofa back toward entrance, seat facing fireplace
     makeSofa3(0, -1.5, -1);
     // (flanking armchairs moved to side walls)
-    // Coffee table between sofa and fireplace
-    place(new THREE.BoxGeometry(1.60, 0.06, 0.90), m(WOOD, 0.40, 0.22), 0, 0.37, -3.3);
-    ([[0.70, 0.38], [0.70, -0.38], [-0.70, 0.38], [-0.70, -0.38]] as [number, number][]).forEach(([lx, lz]) =>
-      place(new THREE.BoxGeometry(0.06, 0.32, 0.06), m(WOOD, 0.45, 0.20), lx, 0.16, lz - 3.3));
-    place(new THREE.CylinderGeometry(0.06, 0.048, 0.08, 12), m(TERRA, 0.85, 0.08), -0.40, 0.44, -3.3);
-    place(new THREE.SphereGeometry(0.09, 10, 10), m(PK1, 0.88, 0.02), -0.40, 0.56, -3.3);
-    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0xD09060, 0.8, 0.05),  0.35, 0.41, -3.3);
-    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0x6A9468, 0.8, 0.05),  0.35, 0.443, -3.3);
+    // Coffee table between sofa and fireplace: 2x1 tiles
+    place(new THREE.BoxGeometry(2.0, 0.06, 1.0), m(WOOD, 0.40, 0.22), 0, 0.37, -3.5);
+    ([[0.90, 0.38], [0.90, -0.38], [-0.90, 0.38], [-0.90, -0.38]] as [number, number][]).forEach(([lx, lz]) =>
+      place(new THREE.BoxGeometry(0.06, 0.32, 0.06), m(WOOD, 0.45, 0.20), lx, 0.16, lz - 3.5));
+    place(new THREE.CylinderGeometry(0.06, 0.048, 0.08, 12), m(TERRA, 0.85, 0.08), -0.40, 0.44, -3.5);
+    place(new THREE.SphereGeometry(0.09, 10, 10), m(PK1, 0.88, 0.02), -0.40, 0.56, -3.5);
+    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0xD09060, 0.8, 0.05),  0.35, 0.41, -3.5);
+    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0x6A9468, 0.8, 0.05),  0.35, 0.443, -3.5);
 
     // ── FRONT ENTRANCE LOUNGE — sofa + coffee table only ─────────────────────
-    // 3-seater sofa facing fireplace
-    makeSofa3(0, +3.2, -1);
-    // (flanking armchairs moved to side walls)
-    // Coffee table between front sofa and central zone
-    place(new THREE.BoxGeometry(1.60, 0.06, 0.90), m(WOOD, 0.40, 0.22), 0, 0.37, +1.5);
-    ([[0.70, 0.38], [0.70, -0.38], [-0.70, 0.38], [-0.70, -0.38]] as [number, number][]).forEach(([lx, lz]) =>
+    // 3-seater sofa
+    makeSofa3(0, 3.5, -1);
+    // Coffee table: 2x1 tiles
+    place(new THREE.BoxGeometry(2.0, 0.06, 1.0), m(WOOD, 0.40, 0.22), 0, 0.37, 1.5);
+    ([[0.90, 0.38], [0.90, -0.38], [-0.90, 0.38], [-0.90, -0.38]] as [number, number][]).forEach(([lx, lz]) =>
       place(new THREE.BoxGeometry(0.06, 0.32, 0.06), m(WOOD, 0.45, 0.20), lx, 0.16, lz + 1.5));
-    place(new THREE.CylinderGeometry(0.05, 0.04, 0.07, 12), m(TERRA, 0.85, 0.08), -0.30, 0.44, +1.5);
-    place(new THREE.SphereGeometry(0.08, 10, 10), m(PK2, 0.88, 0.02), -0.30, 0.54, +1.5);
-    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0xA09060, 0.8, 0.05),  0.30, 0.41, +1.5);
-    place(new THREE.BoxGeometry(0.16, 0.032, 0.12), m(0x5A90A8, 0.8, 0.05),  0.30, 0.442, +1.5);
+    place(new THREE.CylinderGeometry(0.05, 0.04, 0.07, 12), m(TERRA, 0.85, 0.08), -0.30, 0.44, 1.5);
+    place(new THREE.SphereGeometry(0.08, 10, 10), m(PK2, 0.88, 0.02), -0.30, 0.54, 1.5);
+    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0xA09060, 0.8, 0.05),  0.30, 0.41, 1.5);
+    place(new THREE.BoxGeometry(0.16, 0.032, 0.12), m(0x5A90A8, 0.8, 0.05),  0.30, 0.442, 1.5);
 
     // ── LAMP TABLES — 4 total (back zone + front zone) ────────────────────────
     const makeSideTable = (tx: number, tz: number) => {
@@ -600,16 +597,16 @@ export class World {
       place(new THREE.CylinderGeometry(0.055, 0.075, 0.20, 10),m(DKWOOD, 0.50, 0.20), tx, 0.72, tz);
       place(new THREE.CylinderGeometry(0.18,  0.12,  0.28, 14),m(0xF8E8C0, 0.88, 0.02, 0xFFD080, 0.55), tx, 0.96, tz);
     };
-    // Back zone: flanking the back wall armchairs
-    makeSideTable(-4.3, -4.7);
-    makeSideTable( 4.3, -4.7);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7), -4.3, 1.1, -4.5, 1.0);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7),  4.3, 1.1, -4.5, 1.0);
-    // Front zone: flanking the front sofa
-    makeSideTable(-3.8, +3.2);
-    makeSideTable( 3.8, +3.2);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7), -3.8, 1.1, +3.2, 1.0);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7),  3.8, 1.1, +3.2, 1.0);
+    // Back zone lamp tables (1x1 corners)
+    makeSideTable(-4.5, -4.5);
+    makeSideTable( 4.5, -4.5);
+    addLight(new THREE.PointLight(0xFFD080, 0, 7), -4.5, 1.1, -4.5, 1.0);
+    addLight(new THREE.PointLight(0xFFD080, 0, 7),  4.5, 1.1, -4.5, 1.0);
+    // Front zone lamp tables (1x1 corners)
+    makeSideTable(-4.5, 3.5);
+    makeSideTable( 4.5, 3.5);
+    addLight(new THREE.PointLight(0xFFD080, 0, 7), -4.5, 1.1, 3.5, 1.0);
+    addLight(new THREE.PointLight(0xFFD080, 0, 7),  4.5, 1.1, 3.5, 1.0);
 
     // (Bookshelves merged into integrated fireplace wall above)
 
