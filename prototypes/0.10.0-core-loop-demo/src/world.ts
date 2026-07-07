@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt } from './seats';
+import { DoorDockingPortSystem } from './docking';
 
 export class World {
   private scene: THREE.Scene;
@@ -28,6 +29,8 @@ export class World {
   // Dynamic outer structural elements (Roof & complete outer hull walls for Level 3 visual context)
   private capsuleRoof: THREE.Mesh | null = null;
   private capsuleOuterWalls: THREE.Mesh[] = [];
+  // Active interactive docking doors subsystem
+  public dockingSystem: DoorDockingPortSystem | null = null;
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
@@ -249,6 +252,9 @@ export class World {
     this.addCapsuleOuterStructure();
     this.addLobbyFurniture();
     this.addAtmosphereEffects();
+    
+    // Construct and build 4-Directional sliding door docking ports natively!
+    this.initializeDockingPorts();
 
     // (orbital rings live on the Mars sphere — created in createStationPlanet)
   }
@@ -1119,5 +1125,15 @@ export class World {
 
   isPlayerActive(): boolean {
     return this.player.mesh.visible && !this.isMorphing;
+  }
+
+  private initializeDockingPorts() {
+    this.dockingSystem = new DoorDockingPortSystem(this.platformGroup);
+    this.dockingSystem.buildPorts();
+
+    // Hook P2P sync routing events (Task: Room pairings over Yjs awareness)
+    this.dockingSystem.onConnectionRequest((doorId, address) => {
+      console.log(`[Docking Pipeline] Dispatching connection handshake: ${doorId} -> ${address}`);
+    });
   }
 }

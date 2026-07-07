@@ -420,7 +420,7 @@ function parseHostAddress(raw: string, defaultPort: number): { wtUrl: string } |
  * directly. (Until on-chain peer publishing lands, this is the origin story
  * of every Furlong network.)
  */
-async function generateBootstrapLink(): Promise<{ link?: string; error?: string }> {
+export async function generateBootstrapLink(): Promise<{ link?: string; error?: string }> {
   const fingerprint = await fetchLocalFingerprint();
   if (!fingerprint) {
     return { error: 'Local node not reachable — launch the app (or Rust node) first.' };
@@ -983,7 +983,7 @@ function setupClickToEnter() {
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
 
-  const { camera } = window.gameRenderer;
+  const { camera, scene } = window.gameRenderer;
   const clickPlane = world.getClickPlane();
   if (!clickPlane) return;
 
@@ -992,6 +992,28 @@ function onCanvasClick(event: MouseEvent): void {
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
   raycaster.setFromCamera(mouse, camera);
+
+  // ── Intercept Golden Keypad Clicks for our Docking System
+  if (world.dockingSystem) {
+    const interactables: THREE.Object3D[] = [];
+    scene.traverse((child) => {
+      if (child.userData && child.userData.isControlPanel) {
+        interactables.push(child);
+      }
+    });
+
+    const keypadHits = raycaster.intersectObjects(interactables, true);
+    if (keypadHits.length > 0) {
+      const hit = keypadHits[0];
+      const doorId = hit.object.userData.doorId as 'north' | 'south' | 'east' | 'west';
+      if (doorId) {
+        console.log(`[Raycast Intercept] Golden Terminal Keypad Click on: ${doorId.toUpperCase()}`);
+        world.dockingSystem.handlePanelRaycast(doorId);
+        return; // Halt navigation routing so player does not walk into the door
+      }
+    }
+  }
+
   const hits = raycaster.intersectObject(clickPlane, false);
 
   for (const hit of hits) {
