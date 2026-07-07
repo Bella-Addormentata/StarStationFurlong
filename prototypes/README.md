@@ -11,7 +11,8 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.11.0-core-loop-demo`](0.11.0-core-loop-demo/) | **The game (current release target).** Complete conformant $1.0\text{m}$ room layout grids. Houses seats, tables, and cabinets on whole integers, and builds wide $2.0\text{m}$ (East/West) and narrow $1.0\text{m}$ (North/South) sliding door units. |
+| [`0.12.0-core-loop-demo`](0.12.0-core-loop-demo/) | **The game (current release target).** Complete dual-lane fully-duplex P2P hole-punching tunnels. Features conformed Base64 envelope framing, persistent identities, secure CORS locks, and grid-aligned modular capsule objects. |
+| [`0.11.0-core-loop-demo`](0.11.0-core-loop-demo/) | Frozen v0.11.0 release snapshot: Complete conformant $1.0\text{m}$ room layout grids. Houses seats, tables, and cabinets on whole integers, and builds wide $2.0\text{m}$ (East/West) and narrow $1.0\text{m}$ (North/South) sliding door units. |
 | [`0.10.0-core-loop-demo`](0.10.0-core-loop-demo/) | Frozen v0.10.0 release snapshot: Seamless Quadratic Bezier zoom-in trajectories, interactive Room details maps, flat top-down system transitions, responsive "+/-" map scale bounds, and self-dismissing tooltips. |
 | [`0.9.0-core-loop-demo`](0.9.0-core-loop-demo/) | Frozen v0.9.0 release snapshot: Interactive center-wall docking doors, security pin codes, remote handshakes, and adjacent translucent grey-box projections. Inherits standard system maps and keyboard multiscale zoom. |
 | [`0.8.0-core-loop-demo`](0.8.0-core-loop-demo/) | Frozen v0.8.0 release snapshot: Fully modular H-shaped space stations, 2.5D Keplerian orbit paths, stable L1-L5 Lagrange zones, and multi-scale + / - key zooms. Adds a dedicated iroh P2P standalone node router supporting internet connections. |
