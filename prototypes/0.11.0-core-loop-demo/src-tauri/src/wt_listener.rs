@@ -12,15 +12,28 @@ use yrs::{
 };
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
+mod b64 {
+    use base64::prelude::*;
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&BASE64_STANDARD.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        BASE64_STANDARD.decode(String::deserialize(d)?).map_err(Error::custom)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SsfEnvelope {
     pub v: u32,
     pub room: String,
     pub kind: String, // tick | awareness | ysync | roomlog | asset | cap | ping | pong
     pub seq: u32,
+    #[serde(with = "b64")]
     pub author: Vec<u8>,
+    #[serde(with = "b64")]
     pub payload: Vec<u8>,
-    pub sig: Option<Vec<u8>>,
+    pub sig: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -388,6 +401,31 @@ pub async fn start_http_api_server(hub: SharedHub) {
                 _ => return,
             };
             let req = String::from_utf8_lossy(&buf[..n]);
+            
+            let req_lines: Vec<&str> = req.lines().collect();
+            let mut origin_header = None;
+            for line in req_lines {
+                if line.to_ascii_lowercase().starts_with("origin:") {
+                    origin_header = Some(line["origin:".len()..].trim().to_string());
+                    break;
+                }
+            }
+
+            let allowed_origins = [
+                "tauri://localhost",
+                "http://localhost:1420",
+                "http://localhost:5173",
+                "http://127.0.0.1:1420",
+                "http://127.0.0.1:5173",
+            ];
+
+            let cors_origin = match origin_header {
+                Some(ref o) if allowed_origins.iter().any(|allowed| o.eq_ignore_ascii_case(allowed)) => {
+                    format!("Access-Control-Allow-Origin: {}\r\n", o)
+                }
+                _ => String::new(),
+            };
+
             if req.starts_with("GET /api/fingerprint") {
                 let fp_json = {
                     let fp = hub_clone.fingerprint.lock().unwrap();
@@ -396,22 +434,24 @@ pub async fn start_http_api_server(hub: SharedHub) {
                 let response = format!(
                     "HTTP/1.1 200 OK\r\n\
                      Content-Type: application/json\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                     {}Access-Control-Allow-Methods: GET, OPTIONS\r\n\
                      Access-Control-Allow-Headers: *\r\n\
                      Content-Length: {}\r\n\
                      Connection: close\r\n\r\n\
                      {}",
+                    cors_origin,
                     fp_json.len(),
                     fp_json
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
             } else if req.starts_with("OPTIONS ") {
-                let response = "HTTP/1.1 204 No Content\r\n\
-                                Access-Control-Allow-Origin: *\r\n\
-                                Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-                                Access-Control-Allow-Headers: *\r\n\
-                                Connection: close\r\n\r\n";
+                let response = format!(
+                    "HTTP/1.1 204 No Content\r\n\
+                     {}Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                     Access-Control-Allow-Headers: *\r\n\
+                     Connection: close\r\n\r\n",
+                     cors_origin
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             } else {
                 let response = "HTTP/1.1 404 No Found\r\n\

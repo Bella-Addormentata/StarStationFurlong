@@ -12,8 +12,19 @@ use yrs::{
     ReadTxn,
 };
 use wtransport::{Connection, Endpoint as WtEndpoint, Identity, ServerConfig};
-use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey};
+use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, SecretKey, RelayMap};
 use iroh::endpoint::presets::Minimal;
+
+mod b64 {
+    use base64::prelude::*;
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&BASE64_STANDARD.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        BASE64_STANDARD.decode(String::deserialize(d)?).map_err(Error::custom)
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SsfEnvelope {
@@ -21,9 +32,11 @@ pub struct SsfEnvelope {
     pub room: String,
     pub kind: String, // tick | awareness | ysync | roomlog | asset | cap | ping | pong
     pub seq: u32,
+    #[serde(with = "b64")]
     pub author: Vec<u8>,
+    #[serde(with = "b64")]
     pub payload: Vec<u8>,
-    pub sig: Option<Vec<u8>>,
+    pub sig: Option<String>,
     /// Carrying the sender's Iroh Node ID so peers know how to back-dial
     pub iroh_node_id: Option<String>,
 }
@@ -69,18 +82,45 @@ pub fn compute_fingerprint(identity: &Identity, port: u16, iroh_node_id: &str) -
     })
 }
 
+fn load_or_create_secret_key() -> Result<SecretKey> {
+    let key_path = std::path::Path::new("iroh_node_id.key");
+    if key_path.exists() {
+        let bytes = std::fs::read(key_path)?;
+        if bytes.len() == 32 {
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("Invalid key format"))?;
+            return Ok(SecretKey::from_bytes(&arr));
+        }
+    }
+    let sk = SecretKey::generate();
+    std::fs::write(key_path, sk.to_bytes())?;
+    Ok(sk)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("🪐 StarStation Furlong — Standalone P2P Swarm Node");
     println!("📡 Initializing real-time networks...");
 
-    // 1. Start Iroh Swarm Node (Zero-Config NAT Traversal & Hole Punching)
-    let iroh_endpoint = IrohEndpoint::builder(Minimal)
-        .bind()
-        .await?;
-    
-    let iroh_id = iroh_endpoint.id();
+    // First load or generate persistent SecretKey (C1 fix)
+    let secret_key = load_or_create_secret_key()?;
+    let iroh_id = secret_key.public();
     println!("🔑 Unified Iroh Swarm ID (YOUR DIAL KEY): {}", iroh_id);
+
+    // Build Endpoint incorporating ALPN "ssf" (B3 fix) and persistent SecretKey (C1 fix)
+    let mut builder = IrohEndpoint::builder(Minimal)
+        .secret_key(secret_key)
+        .alpns(vec![b"ssf".to_vec()]); // Ensure B3 is resolved so we do not reject inbound ALPN
+
+    // Configure custom Community relays (Sovereignty Addendum)
+    let community_relays = vec![
+        "https://relay.stationfurlong.example" // can expand with community/station relay IPs
+    ];
+    if !community_relays.is_empty() {
+         let relay_map = RelayMap::try_from_iter(community_relays.iter().cloned())?;
+         builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map));
+    }
+
+    let iroh_endpoint = builder.bind().await?;
     println!("   Bound Sockets: {:?}", iroh_endpoint.bound_sockets());
 
     // 2. Start WebTransport Server for local browser tab GUI connections
@@ -242,9 +282,20 @@ async fn handle_wt_connection(
                                     match iroh_clone.connect(addr, b"ssf").await {
                                         Ok(iroh_conn) => {
                                             println!("🎯 Iroh connection secured back to peer node!");
-                                            let mut rooms = hub_clone.rooms.lock().unwrap();
-                                            let room = rooms.get_mut(&envelope.room).unwrap();
-                                            room.remote_peers.insert(target_pub_key, iroh_conn);
+                                            {
+                                                let mut rooms = hub_clone.rooms.lock().unwrap();
+                                                let room = rooms.get_mut(&envelope.room).unwrap();
+                                                room.remote_peers.insert(target_pub_key, iroh_conn.clone());
+                                            }
+                                            // Handle bidirectional read/write loop symmetrically for outbound connections (B4 fix):
+                                            let hub_outbound = hub_clone.clone();
+                                            let iroh_outbound = iroh_clone.clone();
+                                            let conn_outbound = iroh_conn.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = handle_iroh_connection(hub_outbound, conn_outbound, iroh_outbound).await {
+                                                    eprintln!("⚠️ Outbound P2P peer loop closed: {:?}", e);
+                                                }
+                                            });
                                         }
                                         Err(e) => eprintln!("⚠️ Failed dialing peer node {}: {:?}", target_node_id_str, e),
                                     }
@@ -555,6 +606,31 @@ async fn start_http_api_server(hub: SharedHub) {
                 _ => return,
             };
             let req = String::from_utf8_lossy(&buf[..n]);
+            
+            let req_lines: Vec<&str> = req.lines().collect();
+            let mut origin_header = None;
+            for line in req_lines {
+                if line.to_ascii_lowercase().starts_with("origin:") {
+                    origin_header = Some(line["origin:".len()..].trim().to_string());
+                    break;
+                }
+            }
+
+            let allowed_origins = [
+                "tauri://localhost",
+                "http://localhost:1420",
+                "http://localhost:5173",
+                "http://127.0.0.1:1420",
+                "http://127.0.0.1:5173",
+            ];
+
+            let cors_origin = match origin_header {
+                Some(ref o) if allowed_origins.iter().any(|allowed| o.eq_ignore_ascii_case(allowed)) => {
+                    format!("Access-Control-Allow-Origin: {}\r\n", o)
+                }
+                _ => String::new(),
+            };
+
             if req.starts_with("GET /api/fingerprint") {
                 let fp_json = {
                     let fp = hub_clone.fingerprint.lock().unwrap();
@@ -563,22 +639,24 @@ async fn start_http_api_server(hub: SharedHub) {
                 let response = format!(
                     "HTTP/1.1 200 OK\r\n\
                      Content-Type: application/json\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                     {}Access-Control-Allow-Methods: GET, OPTIONS\r\n\
                      Access-Control-Allow-Headers: *\r\n\
                      Content-Length: {}\r\n\
                      Connection: close\r\n\r\n\
                      {}",
+                    cors_origin,
                     fp_json.len(),
                     fp_json
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
             } else if req.starts_with("OPTIONS ") {
-                let response = "HTTP/1.1 204 No Content\r\n\
-                                Access-Control-Allow-Origin: *\r\n\
-                                Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-                                Access-Control-Allow-Headers: *\r\n\
-                                Connection: close\r\n\r\n";
+                let response = format!(
+                    "HTTP/1.1 204 No Content\r\n\
+                     {}Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+                     Access-Control-Allow-Headers: *\r\n\
+                     Connection: close\r\n\r\n",
+                    cors_origin
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             } else {
                 let response = "HTTP/1.1 404 No Found\r\n\

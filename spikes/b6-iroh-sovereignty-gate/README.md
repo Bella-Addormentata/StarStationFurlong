@@ -1,8 +1,46 @@
 # 📡 Spike B-6: Iroh Sovereignty Gate
 
 > **Topic:** Iroh 1.0 GA Sovereignty Gate & Self-Hosted Relay Drill  
-> **Status:** ✅ COMPLETED (2026-07-05)  
+> **Status:** ⚠️ **RE-OPENED (2026-07-07)** — prior GO withdrawn; see banner below. *(was: ✅ COMPLETED 2026-07-05)*  
 > **Objective:** Verify compilation, linking, and direct peer-to-peer stream handshakes of `iroh 1.0` under isolated, offline-hardened custom presets. Prove we can completely bypass global `n0` DNS, bootstrap DHTs, and default relay mappings to secure extreme metadata privacy and avoid public server rate limits (P-3 / P-4 constraints).
+
+---
+
+## ⚠️ Re-open notice (2026-07-07)
+
+The GO below is withdrawn after the v0.11.1 hole-punch review
+([REVIEW-20260707-P2P-Hole-Punching-v0.11.1.md §9.3](../../brainstorming/REVIEWS/REVIEW-20260707-P2P-Hole-Punching-v0.11.1.md)).
+Original text is preserved below per repo convention (banners-in-place). Three reasons:
+
+1. **Scope shortfall vs v006 §15.1‑6.** The scoped drill was *self-hosted-relay-only
+   (kill DNS, kill relay, kill DHT — record survivals); iroh-WASM maturity;
+   refuse-publics proven in config.* What ran instead: two `Minimal`-preset endpoints on
+   `127.0.0.1` dialing via explicit `with_ip_addr`. **No relay was ever stood up.** A
+   loopback direct dial exercises none of the sovereignty questions this gate exists for.
+2. **Evidence gap.** The only artifact, [iroh_test.log](iroh_test.log), records a
+   **failed GNU link** (`export ordinal too large: 68463`, compiling `iroh-relay`);
+   `target/debug` contains no built binary. Additionally [src/main.rs](src/main.rs)
+   never calls `.alpns(b"ssf")` on the accepting endpoint — per iroh 1.0 docs
+   (`Endpoint::accept`: "Only connections with the ALPNs configured in `Builder::alpns`
+   will be accepted"), the handshake cannot complete as coded.
+3. **Downstream damage.** The linker failure pushed `ssf-p2p-node` to
+   `default-features = false` + `presets::Minimal`, which stripped the relay lane and
+   produced v0.11.1 blocker B2 (dial-by-key with no relay/lookup = guaranteed
+   `connect()` failure). The Windows-GNU toolchain limit is therefore **on the
+   sovereign critical path**.
+
+### Remaining scope to earn the GO
+
+- [ ] Fix the harness: `.alpns(b"ssf")`, then a **self-hosted `iroh-relay`**
+      (`RelayMode::Custom` / relay map) with the two endpoints on **different networks**
+      (or network-namespaced), no direct-addr hints — prove relay rendezvous + punch upgrade.
+- [ ] Kill-switch survival matrix: kill DNS → kill relay (established connections must
+      survive; new dials fail cleanly) → kill everything (offline behavior recorded).
+- [ ] Refuse-publics proof: config inspection + packet capture showing zero contact with
+      n0 infrastructure.
+- [ ] iroh-WASM maturity check vs the 1.0 JS bindings (browser fallback lane).
+- [ ] **Toolchain resolution:** MSVC build of this spike + `ssf-p2p-node` with full relay
+      features, or a documented minimal feature set that links under GNU.
 
 ---
 

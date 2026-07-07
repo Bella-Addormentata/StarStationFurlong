@@ -34,10 +34,29 @@ export interface YjsSyncOptions {
   sign?: (payload: Uint8Array) => Promise<Uint8Array>;
 }
 
+function u8ToB64(u8: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+function b64ToU8(b64: string): Uint8Array {
+  const binaryString = atob(b64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
 export class YjsSync {
   readonly doc: Y.Doc;
   #active = false;
   #writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
+  #seq = 1;
 
   constructor(private readonly opts: YjsSyncOptions) {
     this.doc = new Y.Doc();
@@ -103,21 +122,24 @@ export class YjsSync {
     // Retrieve active bootstrap record to check if we carry an Iroh node ID for direct hole-punching
     const irohNodeId = (window as any).solarSystemMap?.getIrohNodeId?.() || (window as any).solarSystemMap?.getBootRecord?.()?.irohNodeId;
 
-    const envelope: SsfEnvelope = {
+    let sigStr: string | undefined = undefined;
+    if (this.opts.sign) {
+      const sigData = await this.opts.sign(payload);
+      sigStr = u8ToB64(sigData);
+    }
+
+    const wireEnvelope = {
       v: 1,
       room: this.opts.roomId,
       kind: 'ysync',
-      seq: 1,
-      author: new Uint8Array(32), // dummy key for Phase 1
-      payload,
+      seq: this.#seq++,
+      author: u8ToB64(new Uint8Array(32)), // dummy key for Phase 1
+      payload: u8ToB64(payload),
+      sig: sigStr,
       iroh_node_id: irohNodeId, // Inject Iroh node ID so the Rust node can construct direct back-dial connections!
     };
 
-    if (this.opts.sign) {
-      envelope.sig = await this.opts.sign(payload);
-    }
-
-    const jsonBytes = new TextEncoder().encode(JSON.stringify(envelope));
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(wireEnvelope));
     const lenBytes = new Uint8Array(4);
     const dv = new DataView(lenBytes.buffer);
     dv.setUint32(0, jsonBytes.byteLength, true);
@@ -186,11 +208,11 @@ export class YjsSync {
           const payloadBytes = buffer.subarray(4, 4 + len);
           buffer = buffer.subarray(4 + len);
 
-          // Decode SsfEnvelope
-          const envelope: SsfEnvelope = JSON.parse(new TextDecoder().decode(payloadBytes));
+          // Decode SsfEnvelope from base64 representation on the wire safely
+          const wireEnvelope = JSON.parse(new TextDecoder().decode(payloadBytes));
 
-          if (envelope.kind === 'ysync') {
-            this.#processInboundYsync(envelope.payload);
+          if (wireEnvelope.kind === 'ysync') {
+            this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
           }
         }
       }

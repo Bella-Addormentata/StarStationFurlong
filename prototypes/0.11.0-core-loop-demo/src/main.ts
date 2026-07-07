@@ -388,6 +388,7 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
     roomId: 'furlong-lobby',
     wtUrl: `https://127.0.0.1:${fingerprint.port}`,
     certHashesB64: [fingerprint.base64],
+    irohNodeId: fingerprint.iroh_node_id, // Carry Iroh Dial Key! (C3 fix)
   };
 }
 
@@ -481,6 +482,24 @@ async function testOwnReachability(): Promise<{ ok: boolean; scope: 'loopback' |
   } finally {
     try { wt?.close(); } catch { /* already closed */ }
   }
+}
+
+async function resolveLoopbackSwapIfNeeded(imported: RoomBootstrap): Promise<RoomBootstrap> {
+  try {
+    const isLoopback = classifyAddress(new URL(imported.wtUrl).hostname) === 'loopback';
+    if (isLoopback) {
+      const localBoot = await fetchDefaultBootstrap();
+      if (localBoot) {
+        return {
+          ...localBoot,
+          irohNodeId: imported.irohNodeId, // Propagate friend's DIAL KEY!
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('Failed resolving loopback swap:', err);
+  }
+  return imported;
 }
 
 function setupNetworkDetailsPanel() {
@@ -580,10 +599,12 @@ function setupNetworkDetailsPanel() {
   if (urlSeed) {
     const imported = decodeBootstrapSeed(urlSeed);
     if (imported) {
-      pendingBootstrapOverride = imported;
-      if (feedback) {
-        feedback.textContent = 'Seed loaded from URL. Connect to use it.';
-      }
+      resolveLoopbackSwapIfNeeded(imported).then(resolved => {
+        pendingBootstrapOverride = resolved;
+        if (feedback) {
+          feedback.textContent = 'Zero-config P2P Seed loaded from URL. Entering lobby...';
+        }
+      });
       if (importInput) {
         importInput.value = window.location.href;
       }
@@ -684,25 +705,8 @@ function setupNetworkDetailsPanel() {
         return;
       }
       
-      // Zero-Configuration Iroh Swarm Hole-Punching bridge:
-      // If the incoming seed wtUrl targets a loopback hostname (127.0.0.1 or localhost),
-      // we do not attempt to overwrite our local certificate hashes (which would cause a handshake failure).
-      // Instead, we connect safely to our own local node over WT loopback and inject the target friend's
-      // Iroh Swarm ID into the initial envelopes to let Iroh hole-punch Node-to-Node in the background!
-      const isLoopback = classifyAddress(new URL(imported.wtUrl).hostname) === 'loopback';
-      if (isLoopback) {
-        const localBoot = await fetchDefaultBootstrap();
-        if (localBoot) {
-          pendingBootstrapOverride = {
-            ...localBoot,
-            irohNodeId: imported.irohNodeId, // Propagate friend's Dial Key for automatic P2P NAT hole punching!
-          };
-        } else {
-          pendingBootstrapOverride = imported;
-        }
-      } else {
-        pendingBootstrapOverride = imported;
-      }
+      const resolved = await resolveLoopbackSwapIfNeeded(imported);
+      pendingBootstrapOverride = resolved;
 
       if (feedback) feedback.textContent = 'Zero-config P2P seed accepted. Establishing hole-punched link...';
       try {
@@ -729,9 +733,8 @@ function syncShareLink() {
   const shareElLan = document.getElementById('network-share-link-lan') as HTMLInputElement | null;
   const shareElWan = document.getElementById('network-share-link-wan') as HTMLInputElement | null;
   
-  // Best-effort LAN host extraction (will swap out loopbacks with inputted ones if present)
-  let bestLan = "192.168.1.15"; // standard generic LAN subnet hint
-  let bestWan = "24.254.75.160"; // standard generic internet subnet hint
+  let bestLan = ""; 
+  let bestWan = ""; 
 
   const addressInput = document.getElementById('network-bootstrap-address') as HTMLInputElement | null;
   const rawAddress = addressInput?.value?.trim();
@@ -746,8 +749,22 @@ function syncShareLink() {
     } catch {}
   }
 
-  const lanLink = buildShareLinkForHostname(bestLan);
-  const wanLink = buildShareLinkForHostname(bestWan);
+  // If we have active bootstrap, read defaults
+  if (activeBootstrap) {
+    try {
+       const url = new URL(activeBootstrap.wtUrl);
+       const host = url.hostname;
+       const scope = classifyAddress(host);
+       if (scope === 'private' && !bestLan) {
+         bestLan = host;
+       } else if (scope === 'public' && !bestWan) {
+         bestWan = host;
+       }
+    } catch {}
+  }
+
+  const lanLink = bestLan ? buildShareLinkForHostname(bestLan) : "Enter your LAN address above & click Bootstrap";
+  const wanLink = bestWan ? buildShareLinkForHostname(bestWan) : "Enter your Public WAN/Internet address & click Bootstrap";
 
   if (shareElLan && lanLink) {
     shareElLan.value = lanLink;
