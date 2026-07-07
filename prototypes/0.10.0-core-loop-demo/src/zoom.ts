@@ -467,38 +467,49 @@ export class MultiScaleZoomView {
 
         // Restore locked cinematic isometric elevated three-quarter room view, or handle external capsules view context (Level 3/4)
         if (orthographicCamera) {
+          const aspect = window.innerWidth / window.innerHeight;
+          const halfH_L2 = 14 / 2; // VIEW_SIZE = 14
+          const halfW_L2 = halfH_L2 * aspect;
+
           if (this.currentLevel === 3) {
             // Elevated further back (Level 3 - Outside capsules view)
+            const halfH_L3 = 22 / 2;
+            const halfW_L3 = halfH_L3 * aspect;
             orthographicCamera.position.set(34, 38, 34); 
             orthographicCamera.lookAt(0, 0, 0);
-            orthographicCamera.left = -11;
-            orthographicCamera.right = 11;
-            orthographicCamera.top = 11;
-            orthographicCamera.bottom = -11;
+            orthographicCamera.left = -halfW_L3;
+            orthographicCamera.right = halfW_L3;
+            orthographicCamera.top = halfH_L3;
+            orthographicCamera.bottom = -halfH_L3;
           } else if (this.currentLevel === 4) {
             // Isometric perspective is carried into Level 4, but zoomed further back (Base assembly view)
+            const halfH_L4 = 36 / 2;
+            const halfW_L4 = halfH_L4 * aspect;
             orthographicCamera.position.set(48, 54, 48); 
             orthographicCamera.lookAt(0, 0, 0);
-            orthographicCamera.left = -18;
-            orthographicCamera.right = 18;
-            orthographicCamera.top = 18;
-            orthographicCamera.bottom = -18;
+            orthographicCamera.left = -halfW_L4;
+            orthographicCamera.right = halfW_L4;
+            orthographicCamera.top = halfH_L4;
+            orthographicCamera.bottom = -halfH_L4;
           } else if (this.currentLevel >= 5) {
             // Flat, complete top-down astronomical canvas overlay maps for systems, heliocentric solar zones, galaxies, and seeds (L5+)
+            const halfH_L5 = 52 / 2;
+            const halfW_L5 = halfH_L5 * aspect;
             orthographicCamera.position.set(0, 60, 0); // Flat Top-Down (Straight down looking on Y)
             orthographicCamera.lookAt(0, 0, 0);
-            orthographicCamera.left = -26;
-            orthographicCamera.right = 26;
-            orthographicCamera.top = 26;
-            orthographicCamera.bottom = -26;
+            orthographicCamera.left = -halfW_L5;
+            orthographicCamera.right = halfW_L5;
+            orthographicCamera.top = halfH_L5;
+            orthographicCamera.bottom = -halfH_L5;
           } else {
             // Standard close Room View (Level 2)
+            // Fix squished projection: dynamically calculate left/right/top/bottom respecting the aspect ratio instead of hardcoding static squares!
             orthographicCamera.position.set(22, 26, 22);
             orthographicCamera.lookAt(0, 0, 0);
-            orthographicCamera.left = -7;
-            orthographicCamera.right = 7;
-            orthographicCamera.top = 7;
-            orthographicCamera.bottom = -7;
+            orthographicCamera.left = -halfW_L2;
+            orthographicCamera.right = halfW_L2;
+            orthographicCamera.top = halfH_L2;
+            orthographicCamera.bottom = -halfH_L2;
           }
         }
       }
