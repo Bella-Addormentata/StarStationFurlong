@@ -683,8 +683,28 @@ function setupNetworkDetailsPanel() {
         if (feedback) feedback.textContent = 'Invalid seed link.';
         return;
       }
-      pendingBootstrapOverride = imported;
-      if (feedback) feedback.textContent = 'Seed accepted. Connecting to new peer...';
+      
+      // Zero-Configuration Iroh Swarm Hole-Punching bridge:
+      // If the incoming seed wtUrl targets a loopback hostname (127.0.0.1 or localhost),
+      // we do not attempt to overwrite our local certificate hashes (which would cause a handshake failure).
+      // Instead, we connect safely to our own local node over WT loopback and inject the target friend's
+      // Iroh Swarm ID into the initial envelopes to let Iroh hole-punch Node-to-Node in the background!
+      const isLoopback = classifyAddress(new URL(imported.wtUrl).hostname) === 'loopback';
+      if (isLoopback) {
+        const localBoot = await fetchDefaultBootstrap();
+        if (localBoot) {
+          pendingBootstrapOverride = {
+            ...localBoot,
+            irohNodeId: imported.irohNodeId, // Propagate friend's Dial Key for automatic P2P NAT hole punching!
+          };
+        } else {
+          pendingBootstrapOverride = imported;
+        }
+      } else {
+        pendingBootstrapOverride = imported;
+      }
+
+      if (feedback) feedback.textContent = 'Zero-config P2P seed accepted. Establishing hole-punched link...';
       try {
         await networkProvider.disconnect();
       } catch (err) {
