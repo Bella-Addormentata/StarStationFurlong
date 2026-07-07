@@ -815,10 +815,16 @@
             <button id="network-test-reach-btn" type="button" aria-label="Self-test whether your node is reachable at that address">Self-Test</button>
           </div>
 
-          <label for="network-share-link" class="tool-label">Share link with friends to join room</label>
+          <label for="network-share-link-lan" class="tool-label">Share link with friends to join room (LAN)</label>
           <div class="tool-row">
-            <input type="text" id="network-share-link" readonly placeholder="Generate a bootstrap link or connect to a peer">
-            <button id="network-copy-link-btn" type="button">Copy Link</button>
+            <input type="text" id="network-share-link-lan" readonly placeholder="Enter LAN IP above & click Bootstrap">
+            <button id="network-copy-link-btn-lan" type="button">Copy LAN</button>
+          </div>
+
+          <label for="network-share-link-wan" class="tool-label">Share link with friends to join room (INTERNET)</label>
+          <div class="tool-row">
+            <input type="text" id="network-share-link-wan" readonly placeholder="Enter Public IP above & click Bootstrap">
+            <button id="network-copy-link-btn-wan" type="button">Copy WAN</button>
           </div>
 
           <label for="network-import-link" class="tool-label">Paste reference room link</label>

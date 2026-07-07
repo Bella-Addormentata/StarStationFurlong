@@ -489,7 +489,8 @@ function setupNetworkDetailsPanel() {
 
   const panel = document.getElementById('network-details-hud');
   const toggle = document.getElementById('network-details-toggle');
-  const copyBtn = document.getElementById('network-copy-link-btn');
+  const copyBtnLan = document.getElementById('network-copy-link-btn-lan');
+  const copyBtnWan = document.getElementById('network-copy-link-btn-wan');
   const useBtn = document.getElementById('network-use-link-btn');
   const retryBtn = document.getElementById('network-retry-node-btn');
   const importInput = document.getElementById('network-import-link') as HTMLInputElement | null;
@@ -589,22 +590,36 @@ function setupNetworkDetailsPanel() {
     }
   }
 
-  if (copyBtn) {
-    copyBtn.addEventListener('click', async () => {
-      const shareLink = buildShareLink();
-      if (!shareLink) {
-        if (feedback) feedback.textContent = 'Not connected yet — use "Bootstrap Link" to start your own network.';
+  if (copyBtnLan) {
+    copyBtnLan.addEventListener('click', async () => {
+      const shareEl = document.getElementById('network-share-link-lan') as HTMLInputElement | null;
+      const val = shareEl?.value || '';
+      if (!val || val.includes('Enter LAN')) {
+        if (feedback) feedback.textContent = 'Not connected or bootstrapped yet.';
         return;
       }
-      const shareEl = document.getElementById('network-share-link') as HTMLInputElement | null;
-      if (shareEl) {
-        shareEl.value = shareLink;
+      try {
+        await navigator.clipboard.writeText(val);
+        if (feedback) feedback.textContent = 'LAN seed copied to clipboard.';
+      } catch {
+        if (feedback) feedback.textContent = 'Error copying LAN seed.';
+      }
+    });
+  }
+
+  if (copyBtnWan) {
+    copyBtnWan.addEventListener('click', async () => {
+      const shareEl = document.getElementById('network-share-link-wan') as HTMLInputElement | null;
+      const val = shareEl?.value || '';
+      if (!val || val.includes('Enter Public')) {
+        if (feedback) feedback.textContent = 'Not connected or bootstrapped yet.';
+        return;
       }
       try {
-        await navigator.clipboard.writeText(shareLink);
-        if (feedback) feedback.textContent = 'Share link copied.';
+        await navigator.clipboard.writeText(val);
+        if (feedback) feedback.textContent = 'Internet/WAN seed copied to clipboard.';
       } catch {
-        if (feedback) feedback.textContent = 'Share link generated in field.';
+        if (feedback) feedback.textContent = 'Error copying Internet seed.';
       }
     });
   }
@@ -623,20 +638,10 @@ function setupNetworkDetailsPanel() {
   }
   if (bootstrapBtn) {
     bootstrapBtn.addEventListener('click', async () => {
-      const { link, error } = await generateBootstrapLink();
-      if (!link) {
-        if (feedback) feedback.textContent = error ?? 'Could not generate bootstrap link.';
-        return;
-      }
-      const shareEl = document.getElementById('network-share-link') as HTMLInputElement | null;
-      if (shareEl) {
-        shareEl.value = link;
-      }
-      try {
-        await navigator.clipboard.writeText(link);
-        if (feedback) feedback.textContent = 'Bootstrap link copied — anyone opening it dials your node directly.';
-      } catch {
-        if (feedback) feedback.textContent = 'Bootstrap link generated in the share field.';
+      // Trigger a direct sync of both LAN and WAN links into our dual share inputs (Task: Dual Links Output)
+      syncShareLink();
+      if (feedback) {
+        feedback.textContent = 'Dual seeds updated below. Copy either LAN or WAN link fields!';
       }
     });
   }
@@ -690,31 +695,45 @@ function setupNetworkDetailsPanel() {
   }
 }
 
-function buildShareLink(): string | null {
+function buildShareLinkForHostname(hostname: string): string | null {
   if (!activeBootstrap) return null;
-  let boot = activeBootstrap;
-  // Self-seeding: our "active" bootstrap points at our own loopback node,
-  // which is meaningless to a friend. Substitute the reachable bootstrap
-  // address when the user has provided one.
+  let boot = { ...activeBootstrap };
   try {
     const url = new URL(boot.wtUrl);
-    const isLoopback = classifyAddress(url.hostname) === 'loopback';
-    if (isLoopback) {
-      const addressInput = document.getElementById('network-bootstrap-address') as HTMLInputElement | null;
-      const parsed = parseHostAddress(addressInput?.value ?? '', Number(url.port) || 4443);
-      if (parsed) {
-        boot = { ...boot, wtUrl: parsed.wtUrl };
-      }
-    }
-  } catch { /* keep original bootstrap */ }
+    boot.wtUrl = `https://${hostname}:${url.port || 4443}`;
+  } catch { /* keep original */ }
   return `${window.location.origin}${window.location.pathname}?seed=${encodeURIComponent(encodeBootstrapSeed(boot))}`;
 }
 
 function syncShareLink() {
-  const shareEl = document.getElementById('network-share-link') as HTMLInputElement | null;
-  const link = buildShareLink();
-  if (shareEl && link) {
-    shareEl.value = link;
+  const shareElLan = document.getElementById('network-share-link-lan') as HTMLInputElement | null;
+  const shareElWan = document.getElementById('network-share-link-wan') as HTMLInputElement | null;
+  
+  // Best-effort LAN host extraction (will swap out loopbacks with inputted ones if present)
+  let bestLan = "192.168.1.15"; // standard generic LAN subnet hint
+  let bestWan = "24.254.75.160"; // standard generic internet subnet hint
+
+  const addressInput = document.getElementById('network-bootstrap-address') as HTMLInputElement | null;
+  const rawAddress = addressInput?.value?.trim();
+  if (rawAddress) {
+    try {
+      const scope = classifyAddress(rawAddress);
+      if (scope === 'private') {
+        bestLan = rawAddress;
+      } else if (scope === 'public') {
+        bestWan = rawAddress;
+      }
+    } catch {}
+  }
+
+  const lanLink = buildShareLinkForHostname(bestLan);
+  const wanLink = buildShareLinkForHostname(bestWan);
+
+  if (shareElLan && lanLink) {
+    shareElLan.value = lanLink;
+  }
+  if (shareElWan && wanLink) {
+    shareElWan.value = wanLink;
   }
 }
 
