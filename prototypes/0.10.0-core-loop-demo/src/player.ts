@@ -242,11 +242,19 @@ export class Player {
       this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
 
       const candX = Math.max(-this.BOUND, Math.min(this.BOUND, pos.x + nx * this.SPEED * deltaTime));
-      const r1    = resolveObstacles(candX, pos.z);
       const candZ = Math.max(-this.BOUND, Math.min(this.BOUND, pos.z + nz * this.SPEED * deltaTime));
-      const r2    = resolveObstacles(r1.x, candZ);
-      pos.x = r2.x;
-      pos.z = r2.z;
+      
+      // Separate sliding resolution over Obstacles to prevent sticking on corners during walking (AABB Sliding)
+      const r1 = resolveObstacles(candX, pos.z);
+      const r2 = resolveObstacles(pos.x, candZ);
+      
+      // Apply movement independently if free on that vector
+      if (r1.x === candX) {
+        pos.x = candX;
+      }
+      if (r2.z === candZ) {
+        pos.z = candZ;
+      }
 
       this.character.setState('walk', this.logicalAngle);
     } else {
