@@ -25,6 +25,9 @@ export class World {
   // Spinning orbital rings above the platform
   private orbitRingOuter: THREE.Mesh | null = null;
   private orbitRingInner: THREE.Mesh | null = null;
+  // Dynamic outer structural elements (Roof & complete outer hull walls for Level 3 visual context)
+  private capsuleRoof: THREE.Mesh | null = null;
+  private capsuleOuterWalls: THREE.Mesh[] = [];
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
@@ -243,6 +246,7 @@ export class World {
     this.addCornerMarkers();
     this.addPlatformEdgeLights();
     this.addSideWalls();
+    this.addCapsuleOuterStructure();
     this.addLobbyFurniture();
     this.addAtmosphereEffects();
 
@@ -340,6 +344,48 @@ export class World {
     strip.position.set(-6, wallHeight + 0.05, 0);
     this.platformGroup.add(strip);
     this.platformElements.push(strip);
+  }
+
+  /**
+   * Add complete capsule outer structure (Roof + solid outer walls for Level 3 isometric view)
+   */
+  private addCapsuleOuterStructure() {
+    // 1. Sleek metallic outer roof
+    const roofGeo = new THREE.BoxGeometry(12.35, 0.28, 12.35);
+    const outerMetallicMat = new THREE.MeshStandardMaterial({
+      color: 0x2A3E52, // carbon structural blueprint slate
+      roughness: 0.4,
+      metalness: 0.8,
+      transparent: true,
+      opacity: 0, // starts completely hidden for internal levels <= 2
+    });
+    this.capsuleRoof = new THREE.Mesh(roofGeo, outerMetallicMat);
+    this.capsuleRoof.position.set(0, 4.14, 0);
+    this.platformGroup.add(this.capsuleRoof);
+
+    // 2. Solid metallic outer front/back walls to block inner rendering during external views
+    const wallGeoF = new THREE.BoxGeometry(12.35, 4.0, 0.35);
+    const frontWall = new THREE.Mesh(wallGeoF, outerMetallicMat);
+    frontWall.position.set(0, 2.0, 6.0);
+    this.platformGroup.add(frontWall);
+    this.capsuleOuterWalls.push(frontWall);
+
+    const backWall = new THREE.Mesh(wallGeoF, outerMetallicMat);
+    backWall.position.set(0, 2.0, -6.0);
+    this.platformGroup.add(backWall);
+    this.capsuleOuterWalls.push(backWall);
+    
+    // Also build a full solid left/right wall set with ports slots included
+    const wallGeoLR = new THREE.BoxGeometry(0.35, 4.0, 12.35);
+    const rightWall = new THREE.Mesh(wallGeoLR, outerMetallicMat);
+    rightWall.position.set(6.0, 2.0, 0);
+    this.platformGroup.add(rightWall);
+    this.capsuleOuterWalls.push(rightWall);
+
+    const leftWall = new THREE.Mesh(wallGeoLR, outerMetallicMat);
+    leftWall.position.set(-6.0, 2.0, 0);
+    this.platformGroup.add(leftWall);
+    this.capsuleOuterWalls.push(leftWall);
   }
 
   /**
@@ -929,6 +975,74 @@ export class World {
     this.time += deltaTime;
 
     this.updateMorph(deltaTime);
+
+    // Retrieve active zoom level to adjust interior vs exterior capsule visibility selectively (Level 3 optimization)
+    const zoomView = (window as any).multiScaleZoom;
+    const zoomLevel = zoomView ? (typeof zoomView.getLevel === 'function' ? zoomView.getLevel() : 2) : 2;
+
+    if (zoomLevel >= 3) {
+      // Hide interior furniture so it is not visible through walls or wastes render power
+      this.furnitureMeshes.forEach(mesh => {
+        mesh.visible = false;
+      });
+      // Hide side walls & flooring (which is cut off by the capsule envelope)
+      if (this.platformFloor) this.platformFloor.visible = false;
+      this.sideWalls.forEach(wall => {
+        wall.visible = false;
+      });
+
+      if (zoomLevel === 4) {
+        // Level 4 (Space Station) uses a simpler silhouette/solid representation of the capsules
+        if (this.capsuleRoof) {
+          this.capsuleRoof.visible = true;
+          // Apply a matte structural slate gray style to represent a simplified silhouette unit
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).color.setHex(0x1B2835);
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).roughness = 0.9;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).metalness = 0.1;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).opacity = 1.0;
+        }
+        this.capsuleOuterWalls.forEach(wall => {
+          wall.visible = true;
+          (wall.material as THREE.MeshStandardMaterial).color.setHex(0x1B2835);
+          (wall.material as THREE.MeshStandardMaterial).roughness = 0.9;
+          (wall.material as THREE.MeshStandardMaterial).metalness = 0.1;
+          (wall.material as THREE.MeshStandardMaterial).opacity = 1.0;
+        });
+      } else {
+        // Level 3 (Outside Room) uses the high-fidelity metal capsule texture mapping
+        if (this.capsuleRoof) {
+          this.capsuleRoof.visible = true;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).color.setHex(0x2A3E52);
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).roughness = 0.4;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).metalness = 0.8;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).opacity = 1.0;
+        }
+        this.capsuleOuterWalls.forEach(wall => {
+          wall.visible = true;
+          (wall.material as THREE.MeshStandardMaterial).color.setHex(0x2A3E52);
+          (wall.material as THREE.MeshStandardMaterial).roughness = 0.4;
+          (wall.material as THREE.MeshStandardMaterial).metalness = 0.8;
+          (wall.material as THREE.MeshStandardMaterial).opacity = 1.0;
+        });
+      }
+    } else {
+      // Restore interior rendering when playing inside levels <= 2 (Room / First-Person)
+      this.furnitureMeshes.forEach(mesh => {
+        mesh.visible = true;
+      });
+      if (this.platformFloor) this.platformFloor.visible = true;
+      this.sideWalls.forEach(wall => {
+        wall.visible = true;
+      });
+
+      // Completely clear and hide outer capsule roof and shielding so they don't block the camera!
+      if (this.capsuleRoof) {
+        this.capsuleRoof.visible = false;
+      }
+      this.capsuleOuterWalls.forEach(wall => {
+        wall.visible = false;
+      });
+    }
 
     // Animate station planet (rotation + gentle floating)
     if (this.stationPlanet) {

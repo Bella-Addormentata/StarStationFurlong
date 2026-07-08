@@ -34,6 +34,10 @@ Original text is preserved below per repo convention (banners-in-place). Three r
 - [ ] Fix the harness: `.alpns(b"ssf")`, then a **self-hosted `iroh-relay`**
       (`RelayMode::Custom` / relay map) with the two endpoints on **different networks**
       (or network-namespaced), no direct-addr hints — prove relay rendezvous + punch upgrade.
+- [ ] **Zero-registration relay posture** (Cabal plan §4.1.1): relay on an **IP-literal
+      URL** (no DNS) with a **self-signed cert** trusted via `Builder::ca_tls_config`
+      (API verified in iroh 1.0.2 docs 2026-07-07); also test whether the relay client
+      accepts plain-`http://` relay URLs for the LAN/lab no-TLS mode.
 - [ ] Kill-switch survival matrix: kill DNS → kill relay (established connections must
       survive; new dials fail cleanly) → kill everything (offline behavior recorded).
 - [ ] Refuse-publics proof: config inspection + packet capture showing zero contact with
@@ -41,8 +45,19 @@ Original text is preserved below per repo convention (banners-in-place). Three r
 - [ ] iroh-WASM maturity check vs the 1.0 JS bindings (browser fallback lane).
 - [ ] **Toolchain resolution:** MSVC build of this spike + `ssf-p2p-node` with full relay
       features, or a documented minimal feature set that links under GNU.
+      *Data point 2026‑07‑08:* the **release profile links under GNU**
+      (`cargo build --release` on the 0.12.0 node: finished in 13 m 18 s, binary
+      produced — optimized codegen stays under the 65 536-export limit); dev profile
+      still fails, so MSVC remains the recommended iteration toolchain.
 
 ---
+
+## ⚠️ HISTORICAL — SUPERSEDED TEXT BELOW THIS LINE
+
+> Everything below is the **original 2026-07-05 spike report, preserved verbatim for the
+> citation trail**. Its conclusions — including the "GO" verdict — are **withdrawn**
+> (see the re-open notice at the top of this file). Do not act on the sections below
+> without the re-run above completing.
 
 ## 📊 Summary of Results
 
@@ -74,7 +89,7 @@ cargo run
 
 ---
 
-## ⚖️ Conformance Decision: GO 🟢
+## ⚖️ ~~Conformance Decision: GO 🟢~~ *(withdrawn 2026-07-07 — historical text, see top banner)*
 
 We have successfully proven that **Iroh's 1.0 GA network stack compiles, links, and operates flawlessly on desktop inside private sovereignty bounds**. 
 

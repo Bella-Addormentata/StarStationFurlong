@@ -313,10 +313,15 @@ export class MultiScaleZoomView {
         if (camera) {
           isTransitioningFirstPerson = true;
           transitionProgress = 0.0;
-          transitionStartPos.copy(camera.position);
-
+          
+          // Orthographic cameras don't have standard positions that match perspective coordinates due to parallel lines,
+          // but we can generate an identical apparent starting point of the elevated three-quarter room view: (22, 26, 22).
+          // We start EXACTLY at the isometric offset relative to the player's core center: (playerX + 22, playerY + 26, playerZ + 22)
           const playerPos = (window as any).world?.getPlayer()?.getPosition() || new THREE.Vector3(0, 0, 1.5);
-          // Target is behind the head looking into the central room (we look toward origin slightly)
+          
+          transitionStartPos.set(playerPos.x + 22, playerPos.y + 26, playerPos.z + 22);
+
+          // Target is the eye position of the clone (Y=1.25) looking slightly ahead
           transitionTargetPos.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
         }
       }
@@ -387,10 +392,28 @@ export class MultiScaleZoomView {
 
         // Camera position is directly on top of the player's eye height (Y=1.25)
         if (isTransitioningFirstPerson) {
-          // LERP trajectory from start layout up to target back-of-head
+          // Quadratic Bezier Curve trajectory instead of a straight linear vector!
+          // We construct a curve starting from transitionStartPos, bending via a higher-elevation control point,
+          // and terminating perfectly behind the back of the player's head.
           const ratio = transitionProgress;
-          const currentPos = new THREE.Vector3().lerpVectors(transitionStartPos, transitionTargetPos, ratio);
+          
+          // Generate a smooth quadratic Bezier curve: B(t) = (1-t)^2 * P0 + 2(1-t)*t * P1 + t^2 * P2
+          // Control point (P1) is placed above the midway line to cushion the downward descent
+          const controlPos = new THREE.Vector3().addVectors(transitionStartPos, transitionTargetPos).multiplyScalar(0.5);
+          controlPos.y += 12.0; // Cushion the initial dip from elevated room view
+
+          const term1 = new THREE.Vector3().copy(transitionStartPos).multiplyScalar((1.0 - ratio) * (1.0 - ratio));
+          const term2 = new THREE.Vector3().copy(controlPos).multiplyScalar(2.0 * (1.0 - ratio) * ratio);
+          const term3 = new THREE.Vector3().copy(transitionTargetPos).multiplyScalar(ratio * ratio);
+          
+          const currentPos = new THREE.Vector3().add(term1).add(term2).add(term3);
           perspectiveCamera.position.copy(currentPos);
+
+          // Smoothly look at the back of the head during initial approach, then shift to yaw orientation
+          const lookStart = new THREE.Vector3(playerPos.x, playerPos.y + 0.6, playerPos.z);
+          const lookEnd = new THREE.Vector3(playerPos.x + Math.sin(yaw) * Math.cos(pitch), playerPos.y + 1.25 + Math.sin(pitch), playerPos.z + Math.cos(yaw) * Math.cos(pitch));
+          const currentLookTarget = new THREE.Vector3().lerpVectors(lookStart, lookEnd, ratio);
+          perspectiveCamera.lookAt(currentLookTarget);
 
           // Render dynamic avatar mesh fading (opacity reduces as we approach)
           const playerChar = (window as any).world?.getPlayer();
@@ -405,8 +428,6 @@ export class MultiScaleZoomView {
               }
             });
           }
-
-          perspectiveCamera.lookAt(playerPos.x, playerPos.y + 1.25, playerPos.z);
         } else {
           perspectiveCamera.position.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
           
@@ -444,14 +465,41 @@ export class MultiScaleZoomView {
           initializedMouseLookOffset = false;
         }
 
-        // Restore locked cinematic isometric elevated three-quarter view
+        // Restore locked cinematic isometric elevated three-quarter room view, or handle external capsules view context (Level 3/4)
         if (orthographicCamera) {
-          orthographicCamera.position.set(22, 26, 22);
-          orthographicCamera.lookAt(0, 0, 0);
-          orthographicCamera.left = -7;
-          orthographicCamera.right = 7;
-          orthographicCamera.top = 7;
-          orthographicCamera.bottom = -7;
+          if (this.currentLevel === 3) {
+            // Elevated further back (Level 3 - Outside capsules view)
+            orthographicCamera.position.set(34, 38, 34); 
+            orthographicCamera.lookAt(0, 0, 0);
+            orthographicCamera.left = -11;
+            orthographicCamera.right = 11;
+            orthographicCamera.top = 11;
+            orthographicCamera.bottom = -11;
+          } else if (this.currentLevel === 4) {
+            // Isometric perspective is carried into Level 4, but zoomed further back (Base assembly view)
+            orthographicCamera.position.set(48, 54, 48); 
+            orthographicCamera.lookAt(0, 0, 0);
+            orthographicCamera.left = -18;
+            orthographicCamera.right = 18;
+            orthographicCamera.top = 18;
+            orthographicCamera.bottom = -18;
+          } else if (this.currentLevel >= 5) {
+            // Flat, complete top-down astronomical canvas overlay maps for systems, heliocentric solar zones, galaxies, and seeds (L5+)
+            orthographicCamera.position.set(0, 60, 0); // Flat Top-Down (Straight down looking on Y)
+            orthographicCamera.lookAt(0, 0, 0);
+            orthographicCamera.left = -26;
+            orthographicCamera.right = 26;
+            orthographicCamera.top = 26;
+            orthographicCamera.bottom = -26;
+          } else {
+            // Standard close Room View (Level 2)
+            orthographicCamera.position.set(22, 26, 22);
+            orthographicCamera.lookAt(0, 0, 0);
+            orthographicCamera.left = -7;
+            orthographicCamera.right = 7;
+            orthographicCamera.top = 7;
+            orthographicCamera.bottom = -7;
+          }
         }
       }
       if (window.gameRenderer.camera) {

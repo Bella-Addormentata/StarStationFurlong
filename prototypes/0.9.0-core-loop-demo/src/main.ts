@@ -104,7 +104,8 @@ async function bootstrapNetworking() {
     const boot = pendingBootstrapOverride ?? await fetchDefaultBootstrap();
     if (!boot) {
       console.warn('⚠️ No running Rust node found. Seamlessly falling back to offline mode.');
-      updateHUDLink('OFFLINE', '#ff1744');
+      updateHUDNode('OFFLINE', '#ff1744');
+      updateHUDP2P('OFFLINE', '#ff1744');
       setNetworkRow('network-seeding-status', 'BASIC · join-only (no local node)', '#ffb300');
       return;
     }
@@ -112,11 +113,12 @@ async function bootstrapNetworking() {
     // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
     seenPeers.clear();
     receivedTicks = 0;
+    updateHUDNode('ONLINE', '#00e676');
     await networkProvider.connect(boot);
     activeBootstrap = boot;
     syncShareLink();
 
-    updateHUDLink('CONNECTED', '#00e676');
+    updateHUDP2P('CONNECTED', '#00e676');
 
     // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
     // every player is part of the hosting fabric unless their connection
@@ -134,6 +136,36 @@ async function bootstrapNetworking() {
       channel,
     });
     await yjsSync.start();
+
+    // Bind shared room info map updates (Task: Room Name & Room Owner)
+    const roomMap = yjsSync.doc.getMap('roomInfo');
+    if (!roomMap.has('owner')) {
+      yjsSync.doc.transact(() => {
+        roomMap.set('owner', 'Local-Clone');
+        roomMap.set('name', boot.roomId || 'Lobby');
+      });
+    }
+
+    const updateRoomUI = () => {
+      const nameVal = roomMap.get('name') as string || 'Lobby';
+      const ownerVal = roomMap.get('owner') as string || 'Local-Clone';
+      
+      const nameEl = document.getElementById('room-name-display');
+      const ownerEl = document.getElementById('room-owner-display');
+      
+      if (nameEl && !document.getElementById('room-name-input')) {
+        nameEl.textContent = nameVal;
+      }
+      if (ownerEl) {
+        ownerEl.textContent = ownerVal;
+      }
+    };
+
+    roomMap.observe((_event) => {
+      updateRoomUI();
+    });
+
+    updateRoomUI();
 
     // Bind shared chat array updates to SpacePhone interface (Task Task 3.3/4.1)
     const sharedChat = yjsSync.doc.getArray('chat');
@@ -179,7 +211,13 @@ async function bootstrapNetworking() {
 
   } catch (err) {
     console.warn('Failed to bootstrap connection link:', err);
-    updateHUDLink('OFFLINE', '#ff1744');
+    updateHUDP2P('OFFLINE', '#ff1744');
+    const fp = await fetchLocalFingerprint();
+    if (fp) {
+      updateHUDNode('ONLINE', '#00e676');
+    } else {
+      updateHUDNode('OFFLINE', '#ff1744');
+    }
     // Distinguish "couldn't reach a REMOTE seed" — the classic locked-down
     // network signature (campus/corporate firewalls drop outbound UDP/QUIC
     // while normal web traffic still works).
@@ -198,6 +236,40 @@ function setupSpacePhoneOverlay() {
   const container = document.getElementById('spacephone-container');
   const chatInput = document.getElementById('chat-input') as HTMLInputElement;
   const chatForm = document.getElementById('chat-form');
+  const tipIndicator = document.getElementById('phone-tip-indicator');
+
+  const removeTipIndicator = () => {
+    if (tipIndicator) {
+      tipIndicator.style.opacity = '0';
+      setTimeout(() => {
+        tipIndicator.remove();
+      }, 500);
+      try {
+        localStorage.setItem('ssf-spacephone-tipped', 'true');
+      } catch {}
+    }
+  };
+
+  // Check if tip has been closed globally before
+  try {
+    if (localStorage.getItem('ssf-spacephone-tipped') === 'true' && tipIndicator) {
+      tipIndicator.remove();
+    }
+  } catch {}
+
+  if (tipIndicator) {
+    // Permit clicking on the indicator itself to pop the SpacePhone as a fallback
+    tipIndicator.style.cursor = 'pointer';
+    tipIndicator.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeTipIndicator();
+      if (container) {
+        container.classList.add('active');
+        chatInput?.focus();
+        logToPhoneSystem('Entering SpacePhone net...');
+      }
+    });
+  }
 
   if (container) {
     container.addEventListener('click', (e) => {
@@ -211,6 +283,10 @@ function setupSpacePhoneOverlay() {
       // Suppress the browser's focus-cycling so Tab acts as a pure toggle,
       // and let it close the phone even while the chat input has focus.
       e.preventDefault();
+
+      if (tipIndicator) {
+        removeTipIndicator();
+      }
 
       if (container) {
         container.classList.toggle('active');
@@ -415,8 +491,75 @@ function setupNetworkDetailsPanel() {
   const toggle = document.getElementById('network-details-toggle');
   const copyBtn = document.getElementById('network-copy-link-btn');
   const useBtn = document.getElementById('network-use-link-btn');
+  const retryBtn = document.getElementById('network-retry-node-btn');
   const importInput = document.getElementById('network-import-link') as HTMLInputElement | null;
   const feedback = document.getElementById('network-link-feedback');
+
+  if (retryBtn) {
+    retryBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      localFingerprint = null;
+      if (feedback) feedback.textContent = 'Retrying local node handshake...';
+      try {
+        await networkProvider.disconnect();
+      } catch {}
+      await bootstrapNetworking();
+    });
+  }
+
+  // Room Name editing flow (Task: Edit Room Name)
+  const nameEl = document.getElementById('room-name-display');
+  if (nameEl) {
+    nameEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const inputExists = document.getElementById('room-name-input');
+      if (inputExists) return;
+
+      const currentName = nameEl.textContent || 'Lobby';
+      
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = 'room-name-input';
+      input.value = currentName;
+      input.maxLength = 24;
+
+      nameEl.replaceWith(input);
+      input.focus();
+
+      const saveChanges = () => {
+        const newVal = input.value.trim();
+        if (newVal) {
+          if (yjsSync) {
+            const rMap = yjsSync.doc.getMap('roomInfo');
+            const ownerVal = rMap.get('owner') as string || 'Local-Clone';
+            if (ownerVal === 'Local-Clone') {
+              yjsSync.doc.transact(() => {
+                rMap.set('name', newVal);
+              });
+            } else {
+              if (feedback) feedback.textContent = `Only the owner (${ownerVal}) can edit the room name.`;
+              setTimeout(() => { if (feedback) feedback.textContent = ''; }, 4000);
+            }
+          } else {
+            nameEl.textContent = newVal;
+          }
+        }
+        input.replaceWith(nameEl);
+      };
+
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          saveChanges();
+        } else if (ev.key === 'Escape') {
+          input.replaceWith(nameEl);
+        }
+      });
+
+      input.addEventListener('blur', () => {
+        saveChanges();
+      });
+    });
+  }
 
   if (panel) {
     panel.addEventListener('click', (e) => {
@@ -670,11 +813,19 @@ function simulateLocalMessage(val: string) {
   }
 }
 
-function updateHUDLink(status: string, color: string) {
-  const linkEl = document.getElementById('link-status');
-  if (linkEl) {
-    linkEl.textContent = status;
-    linkEl.style.color = color;
+function updateHUDNode(status: string, color: string) {
+  const nodeEl = document.getElementById('node-status');
+  if (nodeEl) {
+    nodeEl.textContent = status;
+    nodeEl.style.color = color;
+  }
+}
+
+function updateHUDP2P(status: string, color: string) {
+  const p2pEl = document.getElementById('p2p-status');
+  if (p2pEl) {
+    p2pEl.textContent = status;
+    p2pEl.style.color = color;
   }
 }
 
@@ -689,6 +840,8 @@ function setupSolarMap() {
   (window as any).multiScaleZoom = multiScaleZoom;
 
   const toggleBtn = document.getElementById('solarmap-toggle-btn');
+  const zoomInBtn = document.getElementById('map-zoom-in-btn');
+  const zoomOutBtn = document.getElementById('map-zoom-out-btn');
 
   const toggleMap = () => {
     isMapOpen = !isMapOpen;
@@ -703,6 +856,26 @@ function setupSolarMap() {
     toggleBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       toggleMap();
+    });
+  }
+
+  if (zoomInBtn) {
+    zoomInBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (multiScaleZoom) {
+        // Invoke standard zoom-in action via Keyboard Zoom View APIs
+        (multiScaleZoom as any).zoomIn();
+      }
+    });
+  }
+
+  if (zoomOutBtn) {
+    zoomOutBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (multiScaleZoom) {
+        // Invoke standard zoom-out action via Keyboard Zoom View APIs
+        (multiScaleZoom as any).zoomOut();
+      }
     });
   }
 

@@ -1,8 +1,21 @@
 # StarStation Furlong - P2P Hole Punching Implementation Review
 
 Created on: 2026-07-07  
-Status: **APPROVED & VERIFIED Stable (v0.11.1)**  
+Status: ~~APPROVED & VERIFIED Stable (v0.11.1)~~ → **WITHDRAWN 2026-07-07** — the code-verified review in **§6–§10** found four hard blockers and confirmed the §5 outcomes cannot be produced by the shipped code; re-claiming any "verified" status is gated on the §8 falsification checklist  
 Primary Architectural Reference: [STUDY-Architecture v006](brainstorming/AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) (§8.1 Three Motion Lanes, §12.2 Handshake)
+
+---
+
+> ## ⚠️ §§1–5 BELOW ARE HISTORICAL — SUPERSEDED TEXT
+>
+> Sections 1–5 are the **original 2026-07-07 implementation report, preserved verbatim
+> for the citation trail**. Its claims — including §5's "Verified Outcomes" and the
+> STUN/DERP terminology (corrected in §6.8: iroh uses **iroh relays** + QUIC Address
+> Discovery, not STUN/DERP) — were **withdrawn by the §6 code review the same day**.
+> The accurate current state lives in: **§6** (blockers B1–B4, security S1–S3),
+> **§7** (fix plan), **§8** (falsification checklist), **§9** (v006 alignment),
+> **§10** (post-fix re-review + 2026-07-08 postscript). Do not cite §§1–5 as design
+> authority.
 
 ---
 
@@ -739,3 +752,157 @@ spike #6", and spike #6's GO does not hold up:
 *Addendum appended 2026-07-07, same session as §6–§8. Companion edits: re-open banner on
 [spikes/b6-iroh-sovereignty-gate/README.md](spikes/b6-iroh-sovereignty-gate/README.md);
 [TODO.md](TODO.md) critical path re-gated (B‑6 re-run + v0.11.1 fix sprint).*
+
+---
+
+## 10. Re-Review of the Fix Implementation — v0.11.1 → v0.12.0 (2026-07-07, post-pull)
+
+> Reviews commits `80d6dcf` (tag `v0.11.1`, "resolve blockers B1-B4, S1-S3, C1-C2") and
+> `bd571f6` (tag `v0.12.0`, copy-forward to the new live folder
+> [prototypes/0.12.0-core-loop-demo](prototypes/0.12.0-core-loop-demo/README.md)),
+> verified against the code and by compiling the node.
+
+### 10.1 Scorecard — claimed vs verified
+
+| Finding | Claimed | Verified | Notes |
+|---|---|---|---|
+| B1 envelope encoding | ✓ | ✅ **Fixed** | `#[serde(with = "b64")]` on node **and** Tauri sidecar; browser `u8ToB64`/`b64ToU8` both directions; `seq` now increments. The killer bug is dead — the browser↔node lane is alive again |
+| B3 ALPN | ✓ | ✅ **Fixed** | `.alpns(vec![b"ssf"])` on the builder |
+| B4 half-duplex | ✓ | ✅ **Fixed** | outbound dials spawn `handle_iroh_connection` symmetrically |
+| S1 CORS | ✓ | ✅ **Fixed** | origin-echo allowlist (Tauri + dev origins), both node and sidecar. Nits: add `Vary: Origin`; the shipped-web origin will need adding later |
+| S3 fabricated IPs | ✓ | ✅ **Fixed** | placeholders now instruct instead of inventing addresses |
+| C2 `?seed=` bypass | ✓ | ✅ **Fixed** | `resolveLoopbackSwapIfNeeded()` shared by URL path + Use button |
+| C1 persistent identity | ✓ | 🟡 **Half** | iroh secret key persists (`iroh_node_id.key` — but a *relative* path: cwd changes mint new identities; move to the app-data dir). **WT cert is still `Identity::self_signed` per launch** → certhashes in day-old seed links still die on restart; no staged current/next, no `reload_config` rotation (§7.3 unfinished) |
+| B2 relay lane | ✓ | 🔴 **Plumbing only** | `RelayMode::Custom` compiles and binds, but: (a) the relay list is the **fictional placeholder** `relay.stationfurlong.example` — a reserved, non-resolving TLD, so the endpoint never acquires a home relay; (b) the dial is still bare `EndpointAddr::new(key)` — no `with_relay_url`/`with_ip_addr` hints; (c) the list is hardcoded, not player-editable (§9.5 checklist all unchecked). **Cross-NAT dials fail exactly as before** |
+| S2 room challenge | ✓ | 🔴 **Not implemented** | commit message claims S1–S3; no challenge/`cap` handling exists anywhere — only the pre-existing type stubs in protocol.ts. First envelope still joins any room unauthenticated |
+| C3 key-less share links | — | 🔴 **Open** | LAN/WAN links still minted from `activeBootstrap` (no `irohNodeId`); `generateBootstrapLink()` — the only minting path that attaches the Dial Key — remains orphaned (zero call sites) |
+| C4 ghost peers | — | 🔴 **Open** | `peer-${tick.seq % 4}` unchanged (honestly not claimed) |
+
+Compile evidence: `cargo check` passes with 2 trivial warnings (unused `Encode` import,
+needless `mut envelope`) — **but `cargo build` fails at link time** with the exact B‑6
+error (`ld.exe: export ordinal too large: 67762` while linking `iroh-relay` under the
+Windows-GNU toolchain), and no `ssf-p2p-node` binary exists in the 0.11.0 **or** 0.12.0
+target trees. See §10.4 — this means the bridge has never yet run as a program on the
+dev machine; every fix so far has been verified by type-check only.
+
+### 10.2 The end-to-end gap: no UI path can reach the hole-punch lane
+
+The individually-fixed pieces do not yet compose into a remote session. Walk the only
+flow a player has:
+
+1. Host enters their WAN address → `syncShareLink()` mints a seed with
+   `wtUrl = https://<wan>:4443` and **no `irohNodeId`** (C3).
+2. Friend imports it → `resolveLoopbackSwapIfNeeded()` sees a **non-loopback** URL and
+   passes it through untouched → raw WebTransport dial to the WAN address → dropped by
+   NAT → `RESTRICTED?` — the same failure v0.11.0 shipped with.
+3. The loopback-swap lane (the actual bridge trigger) only fires for **loopback seeds —
+   which no UI mints**: `classifyAddress('localhost'/'127.x')` is excluded from both
+   `bestLan` and `bestWan`, and the one function that would emit a loopback+DialKey seed
+   is unreachable.
+4. Even if a loopback seed were hand-crafted, the node's dial is `EndpointAddr::new(key)`
+   against a non-resolving relay domain → per the iroh docs verified in §6.3, `connect()`
+   still fails.
+
+Three small changes close the loop (all already specified in §7):
+
+```ts
+// 1. ONE minting path (retire syncShareLink's activeBootstrap copy):
+//    every seed carries the Dial Key + transport hints from the fingerprint API.
+const boot: RoomBootstrap = {
+  roomId: 'furlong-lobby',
+  wtUrl: parsed.wtUrl,                        // still useful for the LAN direct lane
+  certHashesB64: [fingerprint.base64],
+  irohNodeId: fingerprint.iroh_node_id,
+  irohRelayUrl: fingerprint.iroh_relay_url,   // node fills from endpoint.addr()
+  irohDirectAddrs: fingerprint.iroh_direct_addrs,
+};
+
+// 2. ALWAYS bridge via the local node when one exists (§7.4) — wtUrl scope no longer
+//    decides; it is only the no-node fallback:
+async function resolveImport(imported: RoomBootstrap): Promise<RoomBootstrap> {
+  const localBoot = await fetchDefaultBootstrap();
+  if (!localBoot) return imported;            // last resort: raw direct dial
+  return { ...localBoot, roomId: imported.roomId,
+           irohNodeId: imported.irohNodeId,
+           irohRelayUrl: imported.irohRelayUrl,
+           irohDirectAddrs: imported.irohDirectAddrs };
+}
+```
+
+```rust
+// 3. Dial with every hint the ticket carries (§6.3), against a REAL relay:
+let mut addr = EndpointAddr::new(target_pub_key);
+if let Some(u) = seed_relay_url { addr = addr.with_relay_url(u.parse()?); }
+for s in seed_direct_addrs { if let Ok(sa) = s.parse() { addr = addr.with_ip_addr(sa); } }
+let conn = iroh_clone.connect(addr, b"ssf").await?;
+```
+
+…which requires the prerequisite that cannot be coded around: **stand up one real,
+self-hosted iroh-relay** (a `$4` VPS running the open-source binary behind TLS) and make
+the URL config/env-driven (`SSF_RELAYS`), not a hardcoded `.example` fiction. Until that
+exists, every "hole-punching" claim remains untestable by definition — §8 step 4 and the
+re-opened B‑6 drill both block on it.
+
+### 10.3 Carried nits (§6.7) — still open, one now user-visible
+
+* **No local ysync fan-out**: browser envelopes are forwarded to `remote_peers` only;
+  two tabs on one node still don't see each other's chat until a reconnect
+  (SyncStep2-at-connect now works, thanks to B1). This will fail §8 step 2 — worth
+  fixing alongside, it's a three-line loop over `local_connections`.
+* `rooms.get(&envelope.room).unwrap()` panic paths; stale `local_connections`/
+  `remote_peers` never pruned; `read_length_and_buf(&payload, 2)` hardcoded cursor
+  mis-parse in the iroh handler; `needs_dial` check-then-act race (no `dialing` set,
+  §7.5's smaller-key rule unimplemented).
+* The **Tauri sidecar** ([src-tauri/src/wt_listener.rs](prototypes/0.12.0-core-loop-demo/src-tauri/src/wt_listener.rs))
+  received B1+S1 parity but has **no iroh lane at all** — the packaged desktop app
+  cannot hole-punch; only the standalone `ssf-p2p-node` can. Either embed the bridge in
+  the sidecar or ship/spawn the node with the app, else the flagship feature is
+  dev-only.
+* §8 checklist: step 1's envelope round-trip unit test was not added (no `#[test]`
+  anywhere in the node) — it is the cheapest permanent guard against a B1 regression.
+
+### 10.4 Verdict
+
+**Real, verifiable progress at the source level — but the program has never run.** The
+local-lane fixes are genuinely correct in the code (B1/B3/B4/S1/S3/C2), S2 is
+unimplemented despite being claimed, C1 is half-done (certs still rotate per launch),
+and B2 is plumbing without a reachable relay. And the decisive, newly-verified fact:
+
+* `cargo build` on the v0.12.0 node **fails to link on this machine** —
+  `export ordinal too large: 67762` in `iroh-relay`, the *identical* failure recorded in
+  B‑6's [iroh_test.log](spikes/b6-iroh-sovereignty-gate/iroh_test.log) — and **no
+  prototype line (0.10/0.11/0.12) has ever produced an `ssf-p2p-node` binary** in its
+  target tree. `default-features = false` did *not* dodge the wall once `RelayMode`
+  pulled `iroh-relay` back into the dev-profile link. The node has only ever been
+  `cargo check`ed; even the *fixed* local lane is unexercised.
+* Consequence: the §9.3 **toolchain blocker is now the head of the critical path** —
+  nothing downstream (B‑6 re-run, §8 steps 1–4, any playtest) can execute until the
+  node links. Options, in order of preference: build with the **MSVC toolchain**
+  (`rustup default stable-x86_64-pc-windows-msvc` for this crate; CI's `windows-latest`
+  runners are MSVC already, which is why Tauri releases build), or a `--release`
+  profile / feature-set that keeps the mingw export table under 65 536, documented in
+  the spike.
+
+v0.12.0 is honestly described as *"local + same-LAN multiplayer fixed **in source**,
+pending the first successful build; hole-punch lane structurally present, awaiting a
+real relay + ticket fields + always-bridge import."* Next actions, in order: **link the
+node (MSVC)** → deploy one real relay and make the list configurable → mint full dial
+tickets (§10.2) → re-run B‑6 to its scoped drill → execute §8 steps 1–4.
+
+*Re-review appended 2026-07-07 (same day, post-pull of `80d6dcf`/`bd571f6`). Compile
+verification on the dev machine (Windows GNU toolchain): `cargo check` clean
+(2 warnings); `cargo build` → linker failure `export ordinal too large: 67762`
+(`iroh-relay v1.0.1`), no binary produced; 0.11.0's target tree likewise contains no
+binary — confirming the bridge has never executed locally.*
+
+> **Postscript 2026-07-08 — partial supersession of §10.4's toolchain finding.** The
+> `cargo build --release` attempt kicked off during this review **succeeded** after this
+> section was written: `Finished release profile … in 13m 18s`,
+> `target/release/ssf-p2p-node.exe` produced — **the first node binary in the project's
+> history**. Corrections that follow: (1) "no binary has ever existed" is true only up
+> to 2026-07-07; (2) the blocker downgrades from *cannot build* to *dev-profile GNU
+> cannot build* — optimized codegen stays under the mingw export limit, so release-GNU
+> is a viable ship path while MSVC remains the sane dev-iteration answer; (3) the
+> binary has still **never been run** — every §10.1 "fixed at source" verdict remains
+> execution-unverified, and §8's checklist still starts at step 1. Tracked in
+> [TODO.md](TODO.md) and the [B‑6 checklist](spikes/b6-iroh-sovereignty-gate/README.md).*

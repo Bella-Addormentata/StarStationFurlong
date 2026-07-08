@@ -28,6 +28,10 @@ ssf_log_test.db
 .env.local
 .env.*.local
 
+# Node identity secrets — NEVER commit (written to cwd by ssf-p2p-node; see review §10.4 nit)
+iroh_node_id.key
+**/iroh_node_id.key
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

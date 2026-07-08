@@ -497,3 +497,52 @@ In one line: **v004 proved the browser is ready, v005 proved the node can be bui
 ---
 
 *Companion to [STUDY-Architecture v005](STUDY-Architecture%20v005.md) and the four v005 reviews. Grounded in Issues [#1](https://github.com/Bella-Addormentata/StarStationFurlong/issues/1) and [#12](https://github.com/Bella-Addormentata/StarStationFurlong/issues/12), the Phase [1](../../docs/TDD/03-Implementation/Phase1-ExecutionPlan.md)/[2](../../docs/TDD/03-Implementation/Phase2-ExecutionPlan.md) execution plans, and same-day primary-source checks of the iroh release history (1.0/1.0.1/noq) and the wtransport source (`with_bind_socket`, `reload_config`). Highest-leverage next step: **spike B‑1 (five-crate Android build)** — it gates every other line of this document.*
+
+---
+
+## Errata & Post-v006 Decisions Ledger (appended 2026-07-07 — original text above unchanged)
+
+> v006 remains the current architecture study. This ledger records what changed in the
+> three days since publication, so nobody re-anchors on a superseded line. Each entry
+> cites the artifact that holds the full decision. **v007 is scheduled, gated on three
+> empirics** — see the final entry.
+
+1. **§12.1 pins — p2panda NO-GO (supersedes the primary/insurance framing of §5.4).**
+   Spike B‑1 (2026‑07‑04) found a hard `ed25519-dalek` conflict (p2panda 0.6.1 wants
+   `3.0.0-pre.6`; iroh 1.x wants `3.0.0-rc.0`) — the five crates cannot link in one
+   binary. **`SsfLog` (§12.3) is promoted from insurance to the RoomLog substrate**;
+   the `RoomLog` port is unchanged. Remove `p2panda-*` from any new Cargo.toml.
+2. **§15.1 spike statuses.** #2 WT dial matrix ✅ (incl. live `reload_config` rotation);
+   #3 RoomLog bakeoff ✅ (SsfLog path); #4 Seals v2 mini-spec ✅; #5 yrs⇄Yjs ✅;
+   T&S design note ✅ ([TrustAndSafety.md](../../docs/TDD/02-Systems/TrustAndSafety.md) —
+   the §7 gate). **#6 sovereignty gate: GO WITHDRAWN, RE-OPENED** — the original run
+   was a loopback direct dial with no relay drill and no built binary
+   ([banner](../../spikes/b6-iroh-sovereignty-gate/README.md)).
+3. **NEW platform constraint — Windows-GNU linker wall.** `iroh-relay` (pulled by any
+   relay-enabled iroh build) overflows the mingw 65 536-export table
+   (`export ordinal too large`); `cargo check` passes, `cargo build` fails, and **no
+   node binary had ever been produced** when this was caught. §12.1's build guidance
+   gains a rule: node crates build MSVC on Windows (release CI already does), or a
+   documented feature subset. ([Hole-punch re-review §10.4](../REVIEWS/REVIEW-20260707-P2P-Hole-Punching-v0.11.1.md).)
+   *Update 2026-07-08:* the **release profile links under GNU** (13 m; first binary
+   produced) — dev profile still fails, so the MSVC rule stands for iteration; the
+   binary remains run-unverified.
+4. **§11 doctrine restated after a misreading shipped.** v0.11.x read "sovereign" as
+   "relay-free" (`presets::Minimal`, no rendezvous) and shipped a bridge that could not
+   dial. The standing ruling, now in bold everywhere it matters: **sovereign = own the
+   rendezvous tier; P‑3 bans public *defaults*, never relays** — relay-TCP-443 remains
+   "the reliable one". (Review §§6–9.)
+5. **NEW subsystem since v006 — key-first join & discovery** (extends §12.2, §7.4,
+   §10.1): room-key-first tickets ("the room is the key; addresses are hints"), blinded
+   topic derivations, key-derived `cap` challenge, the reachability ladder, and
+   zero-registration relays (verified: `Builder::ca_tls_config` custom trust anchors,
+   IP-literal `RelayUrl`s, portmapper default-Enabled, `iroh-relay` embeddable server) —
+   full design in the [Cabal DNS-free discovery plan](../REVIEWS/REVIEW-20260707-Cabal-DNS-Free-Discovery-Plan.md),
+   incl. §4.1.3 "every install is a station" (no hardware beyond the player's machine).
+6. **v007 entry criteria** (tracked in [TODO.md](../../TODO.md)): (a) the node **links**
+   and runs on Windows (toolchain verdict recorded), (b) the **B‑6 re-run** delivers a
+   real relay-drill verdict, (c) the **room-key ticket** completes one cross-network
+   join end-to-end. v007 then synthesizes: B‑1 NO-GO/SsfLog, the hole-punch review
+   chain (§§6–10), the Cabal discovery layer, spike results, and the v006 reviewer-panel
+   round — as **facts, not plans**. Writing it earlier would repeat the B‑6 mistake at
+   study scale.
