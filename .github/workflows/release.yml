@@ -2,23 +2,22 @@ name: "🚀 Publish Sovereign Releases"
 
 on:
   push:
-    # Trigger ONLY when tags matching vX.Y.0 are pushed (supporting multi-digit places, e.g. v10.20.0)
-    # (e.g., v0.1.0, v1.12.0, v10.20.0)
-    # This precisely handles minor/major bumps while leaving X.Y.1+ for local/dev use.
+    # Trigger when tags matching vX.Y.Z are pushed (supporting multi-digit places, e.g. v10.20.30)
+    # (e.g., v0.1.0, v1.12.3, v10.20.30)
     # Uses standard GitHub Action glob filter syntax: [0-9]* matches any number of digits starting with a digit.
     tags:
-      - 'v[0-9]*.[0-9]*.0'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
 
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
   # The Tauri shell (window, Rust node, icons, app version) always comes from
-  # prototypes/0.7.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # prototypes/0.13.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
   # To release a different demo:
   #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
-  #   3. Commit, then push a vX.Y.0 tag as usual.
-  RELEASE_FRONTEND: prototypes/0.12.0-core-loop-demo
+  #   3. Commit, then push a vX.Y.Z tag as usual.
+  RELEASE_FRONTEND: prototypes/0.13.0-core-loop-demo
 
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────
@@ -122,7 +121,7 @@ jobs:
       - name: 💾 Rust Cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'prototypes/0.12.0-core-loop-demo/src-tauri -> target'
+          workspaces: 'prototypes/0.13.0-core-loop-demo/src-tauri -> target'
 
       # 3. Install platform-specific compiler dependencies (Webkit/GTK libraries for Linux)
       - name: 🔧 Install System Dependencies (Linux only)
@@ -146,7 +145,7 @@ jobs:
         shell: bash
         run: |
           name="${RELEASE_FRONTEND##*/}"
-          cat > prototypes/0.12.0-core-loop-demo/release-frontend.json <<EOF
+          cat > prototypes/0.13.0-core-loop-demo/release-frontend.json <<EOF
           {
             "build": {
               "beforeBuildCommand": "echo frontend prebuilt by workflow",
@@ -154,7 +153,7 @@ jobs:
             }
           }
           EOF
-          echo "Tauri config overlay:" && cat prototypes/0.12.0-core-loop-demo/release-frontend.json
+          echo "Tauri config overlay:" && cat prototypes/0.13.0-core-loop-demo/release-frontend.json
 
       # 6. Run Rust Cargo builds & upload installers into the shared draft release
       - name: 🛠️ Build & Package Tauri Application
@@ -163,5 +162,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          projectPath: "prototypes/0.12.0-core-loop-demo"
+          projectPath: "prototypes/0.13.0-core-loop-demo"
           args: --config release-frontend.json ${{ matrix.args }}

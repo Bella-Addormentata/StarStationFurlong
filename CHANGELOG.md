@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.12.0-core-loop-demo](prototypes/0.12.0-core-loop-demo/) and is built by the
+[prototypes/0.13.0-core-loop-demo](prototypes/0.13.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -10,6 +10,8 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 ## Unreleased
 
 - In progress for Phase 2 Star Swarm features.
+- v0.13.0 line started from 0.12.0 and wired Phase A discovery updates:
+  room-key-first-compatible seed parsing, always-bridge import semantics, unified share-link ticket minting, and iroh relay/direct hint propagation in `ssf-p2p-node`.
 
 ## v0.12.0 — 2026-07-07
 
