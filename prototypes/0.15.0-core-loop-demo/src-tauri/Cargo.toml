@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "ssf-node"
 version = "0.15.0"
 edition = "2021"

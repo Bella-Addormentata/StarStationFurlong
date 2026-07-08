@@ -121,7 +121,7 @@ jobs:
       - name: 💾 Rust Cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'prototypes/0.14.0-core-loop-demo/src-tauri -> target'
+          workspaces: '${{ env.RELEASE_FRONTEND }}/src-tauri -> target'
 
       # 3. Install platform-specific compiler dependencies (Webkit/GTK libraries for Linux)
       - name: 🔧 Install System Dependencies (Linux only)
@@ -145,7 +145,7 @@ jobs:
         shell: bash
         run: |
           name="${RELEASE_FRONTEND##*/}"
-          cat > prototypes/0.14.0-core-loop-demo/release-frontend.json <<EOF
+          cat > "$RELEASE_FRONTEND/release-frontend.json" <<EOF
           {
             "build": {
               "beforeBuildCommand": "echo frontend prebuilt by workflow",
@@ -153,7 +153,7 @@ jobs:
             }
           }
           EOF
-          echo "Tauri config overlay:" && cat prototypes/0.14.0-core-loop-demo/release-frontend.json
+          echo "Tauri config overlay:" && cat "$RELEASE_FRONTEND/release-frontend.json"
 
       # 6. Run Rust Cargo builds & upload installers into the shared draft release
       - name: 🛠️ Build & Package Tauri Application
@@ -162,5 +162,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          projectPath: "prototypes/0.14.0-core-loop-demo"
+          projectPath: ${{ env.RELEASE_FRONTEND }}
           args: --config release-frontend.json ${{ matrix.args }}

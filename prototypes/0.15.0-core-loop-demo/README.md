@@ -1,4 +1,4 @@
-﻿# StarStation Furlong: Core Loop Demo
+# StarStation Furlong: Core Loop Demo
 
 This prototype is the playable demo for Phase 1, Task 1.1 in the execution plan.
 
