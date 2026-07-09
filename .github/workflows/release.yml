@@ -36,11 +36,13 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
 
-      # Extract this release's notes (top section of CHANGELOG.md) for the release body
+      # Extract this release's notes (top version section of CHANGELOG.md) for the release body.
+      # Matches the first `## v...` heading so the `## Unreleased` stub is skipped
+      # (pre-v0.16.0 releases shipped the Unreleased stub as their body by mistake).
       - name: 📝 Extract release notes from CHANGELOG.md
         shell: bash
         run: |
-          awk '/^## /{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
+          awk '/^## v/{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
           if [ ! -s RELEASE_NOTES.md ]; then
             echo "Sovereign P2P Space MMO - Production build stable release ${GITHUB_REF_NAME}. See CHANGELOG.md." > RELEASE_NOTES.md
           fi
