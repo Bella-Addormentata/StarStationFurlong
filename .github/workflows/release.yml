@@ -11,13 +11,13 @@ on:
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
   # The Tauri shell (window, Rust node, icons, app version) always comes from
-  # prototypes/0.15.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # prototypes/0.16.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
   # To release a different demo:
   #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
   #   3. Commit, then push a vX.Y.Z tag as usual.
-  RELEASE_FRONTEND: prototypes/0.15.0-core-loop-demo
+  RELEASE_FRONTEND: prototypes/0.16.0-core-loop-demo
 
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────
@@ -164,3 +164,51 @@ jobs:
           releaseId: ${{ needs.create-release.outputs.release_id }}
           projectPath: ${{ env.RELEASE_FRONTEND }}
           args: --config release-frontend.json ${{ matrix.args }}
+
+  # ── Stage 2b: build the sovereign P2P node and attach it to the same draft ─
+  # The Tauri app spawns ssf-p2p-node.exe when it finds one (exe-adjacent or
+  # already listening on UDP 4443); without it the app falls back to the
+  # embedded iroh-less listener which cannot bridge cross-machine rooms.
+  # Shipped as a separate release asset until bundle.externalBin lands.
+  # Independent job: if it fails, the installers above are unaffected.
+  publish-p2p-node:
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: windows-latest # MSVC — the GNU dev-profile linker wall does not apply
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+
+      - name: 🛰️ Build sovereign P2P node (release)
+        shell: bash
+        run: cargo build --release --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
+
+      - name: ⬆️ Upload node binary to the shared draft release
+        uses: actions/github-script@v7
+        env:
+          NODE_EXE: ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/target/release/ssf-p2p-node.exe
+        with:
+          script: |
+            const fs = require('fs');
+            const data = fs.readFileSync(process.env.NODE_EXE);
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number('${{ needs.create-release.outputs.release_id }}'),
+              name: 'ssf-p2p-node.exe', // exact name the app's exe-adjacent spawn probe looks for
+              data,
+              headers: {
+                'content-type': 'application/octet-stream',
+                'content-length': data.length,
+              },
+            });
+            core.info(`Uploaded ssf-p2p-node.exe (${data.length} bytes)`);
