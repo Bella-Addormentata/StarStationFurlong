@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.16.0-core-loop-demo](prototypes/0.16.0-core-loop-demo/) and is built by the
+[prototypes/0.17.0-core-loop-demo](prototypes/0.17.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -10,6 +10,20 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 ## Unreleased
 
 - In progress for Phase 2 Star Swarm features.
+
+## v0.17.0 — 2026-07-09
+
+### The Bridge Actually Bridges — Cross-Machine Join Fix Pack (from the first v0.16.0 playtest)
+
+The v0.16.0 two-machine invite test failed silently. Live diagnosis on the joiner found one hard code bug and four reachability gaps — all fixed here:
+
+- **🐛 Browser now reads node-initiated streams (the hard blocker):** the node forwards remote peers' updates by opening new WebTransport streams toward the browser — and no code ever accepted them, so every bridged update died at the local node **even on a perfect network** (LAN included). The browser now drains `incomingBidirectionalStreams` and feeds bridged `ysync` envelopes into the shared room state.
+- **Bridge status is visible:** the node now pushes `bridge` envelopes (`dialing` / `connected` / `failed` + error detail) to the browser; the network panel gained a **Bridge** row and the SpacePhone logs dial outcomes with actionable guidance. No more staring at a quiet room wondering if anything happened.
+- **🐛 Invite hints refresh live:** `/api/fingerprint` now re-reads the iroh endpoint's address view on every request instead of serving a boot-time snapshot — portmapper-mapped and externally-configured public addresses now actually reach invites (in 0.16.0 they never could).
+- **🐛 Shareable link carrier:** invites minted inside the packaged app used the WebView-internal origin `http://tauri.localhost/…`, which resolves nowhere outside the app. Packaged-app invites now mint as `ssf://room?seed=…` (the import box already accepts any URL carrying `?seed=`); dev-server invites stay clickable http links.
+- **Manual reachability rungs wired (§4.1.2 ladder):** `SSF_IROH_PORT` pins the iroh UDP port so a router port-forward is actually possible (default port is random per launch), and `SSF_EXTERNAL_ADDRS` advertises forwarded public addresses to peers, invites, and the DHT.
+- **mDNS same-LAN discovery:** bare room keys + node IDs now resolve on the local network with zero hints and zero internet (`iroh-mdns-address-lookup`; `SSF_NO_MDNS=1` to disable).
+- **Known limits (unchanged physics):** two stations that are BOTH behind unconfigured home routers still cannot punch to each other without one reachable side — use `SSF_IROH_PORT` + a UDP port-forward on one side, or stand up a player-run relay (`SSF_RELAYS`). The relay/beacon lane and the S2 room challenge remain the top backlog items.
 
 ## v0.16.0 — 2026-07-09
 
