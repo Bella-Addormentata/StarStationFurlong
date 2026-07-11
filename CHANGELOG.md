@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.21.0-core-loop-demo](prototypes/0.21.0-core-loop-demo/) and is built by the
+[prototypes/0.22.0-core-loop-demo](prototypes/0.22.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,7 +9,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- **Dynamic-IP self-healing (`SSF_EXTERNAL_ADDRS=auto`):** an `auto` (or `auto:<port>`) entry resolves the machine's current public IPv4 at startup and re-checks every 5 minutes; when the ISP rotates the address, the node hot-swaps the advertised hint live (`Endpoint::add/remove_external_addr`) — the DHT record and newly-minted invites follow automatically, no restart needed. Old invites survive IP changes regardless: they are anchored to room key + node ID, and the DHT re-resolves current addresses. Discovery is **opt-in** (no third-party calls unless `auto` is configured), uses plain-HTTP echo services overridable via `SSF_IP_ECHO`, and refuses to advertise CGNAT/private answers (with an explanation, since a port-forward cannot work behind CGNAT).
+- In progress for Phase 2 Star Swarm features.
+
+## v0.22.0 — 2026-07-10
+
+### The Address That Keeps Itself — Dynamic-IP Self-Healing
+
+- **`SSF_EXTERNAL_ADDRS=auto` (or `auto:<port>`):** the node resolves its current public IPv4 at startup and re-checks every 5 minutes; when the ISP rotates the address, the node hot-swaps the advertised hint live (`Endpoint::add/remove_external_addr`) — the DHT record and newly-minted invites follow automatically, no restart needed. Pairs the discovered IP with the actual bound port (`auto`) or an explicit one (`auto:<port>`).
+- **Invites survive IP changes regardless:** they are anchored to room key + node ID, and remote peers re-resolve current addresses from the Mainline DHT — `auto` closes the last gap (the node's own knowledge of its public address after a manual router forward).
+- **Sovereignty posture kept:** discovery is **opt-in** — the node makes no third-party calls unless `auto` is configured; the plain-HTTP echo services are overridable via `SSF_IP_ECHO=host1,host2` (self-hostable). A poisoned echo can at worst add one dead dial hint: iroh connections are authenticated by node key.
+- **CGNAT detection:** if the echo reports a CGNAT/private WAN address (100.64.0.0/10 etc.), the node refuses to advertise it and explains why a router port-forward cannot work from there — pointing at the relay/beacon lanes instead.
+- Zero-third-party alternative documented: routers with UPnP enabled already self-heal via the built-in portmapper (reachability rung 1) with no echo service involved.
 
 ## v0.21.0 — 2026-07-10
 

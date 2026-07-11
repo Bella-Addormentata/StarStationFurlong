@@ -11,13 +11,13 @@ on:
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
   # The Tauri shell (window, Rust node, icons, app version) always comes from
-  # prototypes/0.21.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # prototypes/0.22.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
   # To release a different demo:
   #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
   #   3. Commit, then push a vX.Y.Z tag as usual.
-  RELEASE_FRONTEND: prototypes/0.21.0-core-loop-demo
+  RELEASE_FRONTEND: prototypes/0.22.0-core-loop-demo
 
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────

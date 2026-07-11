@@ -11,7 +11,8 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.21.0-core-loop-demo`](0.21.0-core-loop-demo/) | **The game (current release target).** Bundled node on Windows/Linux (`bundle.externalBin`, silent sidecar, per-user key dir) + race-proof auto-published releases. macOS sidecar bundling deferred (mac bundler failed on externalBin in the v0.20.0 run). Carries the 0.19.0 default-pinned swarm port (UDP 44442). |
+| [`0.22.0-core-loop-demo`](0.22.0-core-loop-demo/) | **The game (current release target).** Dynamic-IP self-healing: `SSF_EXTERNAL_ADDRS=auto` resolves the public IPv4 (opt-in echo, `SSF_IP_ECHO` overridable), re-checks every 5 min, and hot-swaps the advertised address on ISP rotation — DHT + fresh invites follow live; CGNAT answers refused with an explanation. |
+| [`0.21.0-core-loop-demo`](0.21.0-core-loop-demo/) | Frozen at the v0.21.0 release snapshot: bundled node on Windows/Linux (`bundle.externalBin`, silent sidecar, per-user key dir) + race-proof auto-published releases; macOS sidecar deferred. |
 | [`0.20.0-core-loop-demo`](0.20.0-core-loop-demo/) | Frozen at the v0.20.0 line — **burned release, never shipped artifacts** (draft published mid-run; immutable releases froze it empty). Its changes ship in 0.21.0. |
 | [`0.19.0-core-loop-demo`](0.19.0-core-loop-demo/) | Frozen at the v0.19.0 release snapshot: default-pinned swarm port — the node's iroh UDP socket binds 44442 (IANA-unassigned) instead of a random per-launch port (`SSF_IROH_PORT` overrides, `=0` restores random, graceful fallback when taken). |
 | [`0.18.0-core-loop-demo`](0.18.0-core-loop-demo/) | Frozen at the v0.18.0 release snapshot: hub relay + membership gossip (N-player rooms through one reachable member, loop-safe dedup, automatic mesh-upgrade dials) + ChiaHub C0 scaffold (signed, room-key-sealed presence records with epoch-rotated hints — chain IO lands after spike B-7). |
@@ -35,7 +36,7 @@ live game.
 ## Releasing a different demo as the app
 
 The packaged release always uses the Tauri shell from
-[`0.21.0-core-loop-demo/src-tauri`](0.21.0-core-loop-demo/src-tauri/) (window, Rust
+[`0.22.0-core-loop-demo/src-tauri`](0.22.0-core-loop-demo/src-tauri/) (window, Rust
 WebTransport node, icons, app version) — but the **frontend it renders is
 switchable**. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config
