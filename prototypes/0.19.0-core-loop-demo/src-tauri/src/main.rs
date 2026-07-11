@@ -44,7 +44,7 @@ enum NodeMode {
 }
 
 /// Candidate locations for the standalone node binary, in preference order:
-/// 1. Next to our own executable (future bundled-sidecar layout, §7.5)
+/// 1. Next to our own executable (bundled-sidecar layout, §7.5 — `bundle.externalBin`)
 /// 2. Dev-tree release/debug builds relative to this crate's manifest
 fn node_binary_candidates() -> Vec<std::path::PathBuf> {
     let exe_name = if cfg!(windows) { "ssf-p2p-node.exe" } else { "ssf-p2p-node" };
@@ -58,6 +58,25 @@ fn node_binary_candidates() -> Vec<std::path::PathBuf> {
     candidates.push(manifest_dir.join("../ssf-p2p-node/target/release").join(exe_name));
     candidates.push(manifest_dir.join("../ssf-p2p-node/target/debug").join(exe_name));
     candidates
+}
+
+/// Per-user writable working directory for the spawned node. The node persists
+/// `iroh_node_id.key` into its cwd — which must NOT be the install dir, because
+/// bundled installs can land in read-only locations (Program Files, /usr/bin).
+/// Falls back to the binary's own directory (pre-0.19 behavior) if unavailable.
+fn node_data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Application Support"));
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")));
+    let dir = base?.join("StarStationFurlong");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 /// Prefer the real sovereign node (iroh + DHT + WebTransport) over the embedded
@@ -78,9 +97,24 @@ fn acquire_p2p_node(port: u16) -> NodeMode {
             continue;
         }
         let mut cmd = Command::new(&candidate);
-        // Run the node from its own directory so iroh_node_id.key persists beside the binary.
-        if let Some(dir) = candidate.parent() {
-            cmd.current_dir(dir);
+        // Run the node from a per-user data dir so iroh_node_id.key persists
+        // in a writable location; fall back to the binary's own directory.
+        match node_data_dir() {
+            Some(dir) => {
+                cmd.current_dir(dir);
+            }
+            None => {
+                if let Some(dir) = candidate.parent() {
+                    cmd.current_dir(dir);
+                }
+            }
+        }
+        // Bundled sidecar must not flash a console window on Windows
+        // (CREATE_NO_WINDOW) — its stdout stays on the app's console handle rules.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         match cmd.spawn() {
             Ok(child) => {

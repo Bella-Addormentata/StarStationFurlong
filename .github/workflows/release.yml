@@ -123,7 +123,9 @@ jobs:
       - name: 💾 Rust Cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: '${{ env.RELEASE_FRONTEND }}/src-tauri -> target'
+          workspaces: |
+            ${{ env.RELEASE_FRONTEND }}/src-tauri -> target
+            ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target
 
       # 3. Install platform-specific compiler dependencies (Webkit/GTK libraries for Linux)
       - name: 🔧 Install System Dependencies (Linux only)
@@ -139,6 +141,26 @@ jobs:
           cd "$RELEASE_FRONTEND"
           npm ci
           npm run build
+
+      # 4b. Build the sovereign P2P node for THIS platform and stage it where
+      #     the Tauri bundler expects external binaries (bundle.externalBin):
+      #     src-tauri/binaries/ssf-p2p-node-<host-triple>[.exe]. The installer
+      #     then places it next to the app executable, where the app's spawn
+      #     probe already looks first — no separate download needed.
+      - name: 🛰️ Build & stage bundled P2P node sidecar
+        shell: bash
+        run: |
+          cargo build --release --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          mkdir -p "$RELEASE_FRONTEND/src-tauri/binaries"
+          if [ -f "$RELEASE_FRONTEND/ssf-p2p-node/target/release/ssf-p2p-node.exe" ]; then
+            cp "$RELEASE_FRONTEND/ssf-p2p-node/target/release/ssf-p2p-node.exe" \
+               "$RELEASE_FRONTEND/src-tauri/binaries/ssf-p2p-node-$triple.exe"
+          else
+            cp "$RELEASE_FRONTEND/ssf-p2p-node/target/release/ssf-p2p-node" \
+               "$RELEASE_FRONTEND/src-tauri/binaries/ssf-p2p-node-$triple"
+          fi
+          ls -la "$RELEASE_FRONTEND/src-tauri/binaries"
 
       # 5. Point the shared Tauri shell at the selected frontend's dist/.
       #    Written as a JSON overlay merged into tauri.conf.json via `--config`;
@@ -168,10 +190,10 @@ jobs:
           args: --config release-frontend.json ${{ matrix.args }}
 
   # ── Stage 2b: build the sovereign P2P node and attach it to the same draft ─
-  # The Tauri app spawns ssf-p2p-node.exe when it finds one (exe-adjacent or
-  # already listening on UDP 4443); without it the app falls back to the
-  # embedded iroh-less listener which cannot bridge cross-machine rooms.
-  # Shipped as a separate release asset until bundle.externalBin lands.
+  # The node is ALSO bundled inside every installer via bundle.externalBin
+  # (staged in step 4b above), so fresh installs need no separate download.
+  # This standalone asset remains for headless/always-on node operators
+  # (reachable members, future beacons) and for patching older installs.
   # Independent job: if it fails, the installers above are unaffected.
   publish-p2p-node:
     needs: create-release

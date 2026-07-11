@@ -47,6 +47,8 @@ iroh_node_id.key
 # Tauri
 src-tauri/target/
 src-tauri/WixTools
+# Staged sidecar binaries for bundle.externalBin (built + placed by CI per platform)
+**/src-tauri/binaries/
 
 # Python (just in case)
 __pycache__/
