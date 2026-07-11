@@ -164,6 +164,77 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
     Ok(sk)
 }
 
+/// Default public-IPv4 echo services for `SSF_EXTERNAL_ADDRS=auto` — queried
+/// over plain HTTP/1.0. The response is only our own public IP: nothing secret
+/// leaves the machine, and a poisoned answer can at worst add one dead dial
+/// hint (iroh connections are authenticated by node key regardless).
+/// Operators can substitute their own echo with `SSF_IP_ECHO=host1,host2`.
+/// Never contacted unless an `auto` entry is explicitly configured — the node
+/// makes no third-party calls by default (sovereignty posture, v006 §10.2).
+const DEFAULT_IP_ECHO_HOSTS: &[&str] = &["api.ipify.org", "checkip.amazonaws.com"];
+/// How often `auto` re-checks the public IP (ISP rotations heal within this).
+const AUTO_ADDR_RECHECK_SECS: u64 = 300;
+
+/// True when the address is usable as an internet-facing dial hint — rejects
+/// private/loopback/link-local/documentation ranges and CGNAT (100.64.0.0/10),
+/// where a home-router port-forward cannot produce inbound reachability.
+fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    let cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64; // 100.64.0.0/10
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || cgnat)
+}
+
+/// Resolves the current public IPv4 via the first echo service that answers
+/// with a public address. Tries `SSF_IP_ECHO` hosts (comma-separated) if set,
+/// else the defaults; 10 s timeout per host.
+async fn discover_public_ipv4() -> Result<std::net::Ipv4Addr> {
+    let hosts_env = std::env::var("SSF_IP_ECHO").ok();
+    let hosts: Vec<&str> = match hosts_env.as_deref() {
+        Some(raw) => raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
+        None => DEFAULT_IP_ECHO_HOSTS.to_vec(),
+    };
+    let mut last_err = anyhow!("no IP echo services configured");
+    for host in hosts {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), query_ip_echo(host)).await {
+            Ok(Ok(ip)) if ipv4_is_public(ip) => return Ok(ip),
+            Ok(Ok(ip)) => {
+                last_err = anyhow!("{host} reports non-public address {ip} — this looks like CGNAT/private WAN; a router port-forward cannot make you reachable from there")
+            }
+            Ok(Err(e)) => last_err = e,
+            Err(_) => last_err = anyhow!("{host}: timed out"),
+        }
+    }
+    Err(last_err)
+}
+
+/// Minimal plain-HTTP/1.0 GET returning the echoed IPv4 body (bounded read;
+/// HTTP/1.0 + Connection: close sidesteps chunked encoding entirely).
+async fn query_ip_echo(host: &str) -> Result<std::net::Ipv4Addr> {
+    let mut stream = tokio::net::TcpStream::connect((host, 80)).await?;
+    let req = format!("GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: ssf-p2p-node\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+    let mut resp = Vec::with_capacity(512);
+    let mut limited = stream.take(4096);
+    limited.read_to_end(&mut resp).await?;
+    let text = String::from_utf8_lossy(&resp);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow!("{host}: malformed HTTP response"))?;
+    let status_ok = head.lines().next().map(|l| l.contains(" 200 ")).unwrap_or(false);
+    if !status_ok {
+        return Err(anyhow!("{host}: non-200 echo response"));
+    }
+    body.trim()
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|e| anyhow!("{host}: echo body is not an IPv4 address: {e}"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("🪐 StarStation Furlong — Standalone P2P Swarm Node");
@@ -258,20 +329,73 @@ async fn main() -> Result<()> {
 
     // 📌 Manually-known public addresses (e.g. after a router port-forward):
     // advertised to peers, used in NAT traversal, and flow into invite hints + DHT.
+    // `auto` / `auto:<port>` entries resolve the CURRENT public IPv4 via an HTTP
+    // echo (opt-in; SSF_IP_ECHO overrides the service list) and re-check every
+    // 5 minutes — dynamic-IP rotations heal live, no restart, no stale invites.
+    let mut auto_ports: Vec<Option<u16>> = Vec::new();
     if let Ok(raw) = std::env::var("SSF_EXTERNAL_ADDRS") {
         for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            match entry.parse::<SocketAddr>() {
-                Ok(sock) => {
-                    builder = builder.external_addr(sock);
-                    println!("📌 External address advertised: {sock}");
+            let lower = entry.to_ascii_lowercase();
+            if lower == "auto" {
+                auto_ports.push(None);
+            } else if let Some(port_str) = lower.strip_prefix("auto:") {
+                match port_str.parse::<u16>() {
+                    Ok(p) if p > 0 => auto_ports.push(Some(p)),
+                    _ => eprintln!("⚠️ Ignoring invalid SSF_EXTERNAL_ADDRS entry '{entry}' (want auto:<1-65535>)"),
                 }
-                Err(e) => eprintln!("⚠️ Ignoring invalid SSF_EXTERNAL_ADDRS entry '{entry}': {e:?}"),
+            } else {
+                match entry.parse::<SocketAddr>() {
+                    Ok(sock) => {
+                        builder = builder.external_addr(sock);
+                        println!("📌 External address advertised: {sock}");
+                    }
+                    Err(e) => eprintln!("⚠️ Ignoring invalid SSF_EXTERNAL_ADDRS entry '{entry}': {e:?}"),
+                }
             }
         }
     }
 
     let iroh_endpoint = builder.bind().await?;
     println!("   Bound Sockets: {:?}", iroh_endpoint.bound_sockets());
+
+    // 🔄 Dynamic public-IP advertising (SSF_EXTERNAL_ADDRS=auto[:port]): resolve
+    // now, then re-check every AUTO_ADDR_RECHECK_SECS. On ISP rotation the stale
+    // address is swapped LIVE via Endpoint::{add,remove}_external_addr — the DHT
+    // record and freshly-minted invite hints follow automatically. Invites are
+    // durable across IP changes anyway (room key + node ID; DHT re-resolves).
+    if !auto_ports.is_empty() {
+        let bound_v4_port = iroh_endpoint
+            .bound_sockets()
+            .iter()
+            .find(|s| s.is_ipv4())
+            .map(|s| s.port())
+            .unwrap_or(DEFAULT_IROH_PORT);
+        for port_override in auto_ports {
+            let port = port_override.unwrap_or(bound_v4_port);
+            let ep = iroh_endpoint.clone();
+            tokio::spawn(async move {
+                let mut announced: Option<SocketAddr> = None;
+                loop {
+                    match discover_public_ipv4().await {
+                        Ok(ip) => {
+                            let addr = SocketAddr::from((ip, port));
+                            if announced != Some(addr) {
+                                if let Some(old) = announced.take() {
+                                    let _ = ep.remove_external_addr(&old).await;
+                                    println!("🔄 Public IP changed — un-advertised stale external address {old}");
+                                }
+                                ep.add_external_addr(addr).await;
+                                announced = Some(addr);
+                                println!("📌 External address advertised (auto): {addr} — re-checked every {AUTO_ADDR_RECHECK_SECS}s; router must forward UDP {port} here");
+                            }
+                        }
+                        Err(e) => eprintln!("⚠️ Public-IP auto-discovery failed (will retry in {AUTO_ADDR_RECHECK_SECS}s): {e}"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(AUTO_ADDR_RECHECK_SECS)).await;
+                }
+            });
+        }
+    }
 
     // 📡 mDNS same-LAN lookup: a bare room key + node id resolves on the local
     // network with zero hints, zero internet, zero servers (plan §4.5 lane 3).

@@ -9,7 +9,7 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- In progress for Phase 2 Star Swarm features.
+- **Dynamic-IP self-healing (`SSF_EXTERNAL_ADDRS=auto`):** an `auto` (or `auto:<port>`) entry resolves the machine's current public IPv4 at startup and re-checks every 5 minutes; when the ISP rotates the address, the node hot-swaps the advertised hint live (`Endpoint::add/remove_external_addr`) — the DHT record and newly-minted invites follow automatically, no restart needed. Old invites survive IP changes regardless: they are anchored to room key + node ID, and the DHT re-resolves current addresses. Discovery is **opt-in** (no third-party calls unless `auto` is configured), uses plain-HTTP echo services overridable via `SSF_IP_ECHO`, and refuses to advertise CGNAT/private answers (with an explanation, since a port-forward cannot work behind CGNAT).
 
 ## v0.21.0 — 2026-07-10
 
