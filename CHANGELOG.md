@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.20.0-core-loop-demo](prototypes/0.20.0-core-loop-demo/) and is built by the
+[prototypes/0.21.0-core-loop-demo](prototypes/0.21.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -11,7 +11,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - In progress for Phase 2 Star Swarm features.
 
-## v0.20.0 — 2026-07-10
+## v0.21.0 — 2026-07-10
+
+### Batteries Included, Take Two — Bundled Node (Windows/Linux) + Race-Proof Publishing
+
+- **Re-ships everything from v0.20.0**, which never got artifacts (see its entry below): the sovereign P2P node bundled inside the **Windows and Linux** installers via `bundle.externalBin` — no separate `ssf-p2p-node.exe` download — plus the silent auto-spawn (`CREATE_NO_WINDOW`), the per-user key dir (identity survives read-only install locations), and the v0.19.0 default-pinned swarm port (UDP 44442).
+- **macOS: sidecar bundling temporarily disabled.** The v0.20.0 run showed the mac `tauri build` failing with `externalBin` while Windows and Linux built clean; the release overlay now strips `externalBin` on macOS only, restoring the pre-0.20.0 flow there (standalone node / manual placement) until the mac bundler failure is reproduced with logs. Tracked as a follow-up.
+- **Release publishing is now automated and race-proof.** This repository has **immutable releases**: publishing permanently freezes the asset list. v0.20.0's draft was published while installers were still building, freezing an empty release forever — that is why this version exists. The workflow now holds the draft until a final gate job confirms every installer job and the standalone node asset succeeded (≥ 6 assets attached), then publishes automatically. **Never publish the draft manually.**
+
+## v0.20.0 — 2026-07-10 (burned — no artifacts)
+
+> ⚠️ **This version number is unusable.** The draft release was published while platform builds were still uploading; repository releases are immutable, so the empty v0.20.0 release can neither be deleted nor amended. Windows/Linux builds had succeeded (proving the bundled sidecar) and only failed at upload; macOS had a genuine `tauri build` failure. Everything below ships — with the macOS scope-down — in **v0.21.0**.
 
 ### Batteries Included — The Sovereign Node Ships Inside the Installer
 

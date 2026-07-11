@@ -11,13 +11,13 @@ on:
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
   # The Tauri shell (window, Rust node, icons, app version) always comes from
-  # prototypes/0.20.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # prototypes/0.21.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
   # To release a different demo:
   #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
   #   3. Commit, then push a vX.Y.Z tag as usual.
-  RELEASE_FRONTEND: prototypes/0.20.0-core-loop-demo
+  RELEASE_FRONTEND: prototypes/0.21.0-core-loop-demo
 
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────
@@ -78,7 +78,7 @@ jobs:
               tag_name: tag,
               name: `StarStation Furlong ${tag}`,
               body,
-              draft: true, // reviewed & published manually after artifact checks
+              draft: true, // published by finalize-release ONLY after every artifact is attached
               prerelease: false,
             });
             core.info(`Created draft release ${data.id}: ${data.html_url}`);
@@ -147,7 +147,11 @@ jobs:
       #     src-tauri/binaries/ssf-p2p-node-<host-triple>[.exe]. The installer
       #     then places it next to the app executable, where the app's spawn
       #     probe already looks first — no separate download needed.
+      #     ⛔ macOS: skipped — the v0.20.0 run showed the mac bundler failing
+      #     with externalBin while Windows/Linux built clean; mac keeps the
+      #     standalone-node flow until that failure is reproduced with logs.
       - name: 🛰️ Build & stage bundled P2P node sidecar
+        if: matrix.platform != 'macos-latest'
         shell: bash
         run: |
           cargo build --release --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
@@ -165,16 +169,22 @@ jobs:
       # 5. Point the shared Tauri shell at the selected frontend's dist/.
       #    Written as a JSON overlay merged into tauri.conf.json via `--config`;
       #    the before-build hook becomes a no-op because step 4 already built it.
+      #    On macOS the overlay also strips bundle.externalBin (see step 4b note).
       - name: 🔀 Select release frontend for Tauri shell
         shell: bash
         run: |
           name="${RELEASE_FRONTEND##*/}"
+          if [ "${{ matrix.platform }}" = "macos-latest" ]; then
+            extra=', "bundle": { "externalBin": [] }'
+          else
+            extra=''
+          fi
           cat > "$RELEASE_FRONTEND/release-frontend.json" <<EOF
           {
             "build": {
               "beforeBuildCommand": "echo frontend prebuilt by workflow",
               "frontendDist": "../../${name}/dist"
-            }
+            }${extra}
           }
           EOF
           echo "Tauri config overlay:" && cat "$RELEASE_FRONTEND/release-frontend.json"
@@ -236,3 +246,40 @@ jobs:
               },
             });
             core.info(`Uploaded ssf-p2p-node.exe (${data.length} bytes)`);
+
+  # ── Stage 3: publish the draft ONLY when every artifact is attached ──────
+  # This repository has IMMUTABLE releases: publishing freezes the asset list
+  # permanently, so publishing mid-run bricks the version (v0.20.0 was lost
+  # exactly this way — published while builds were still uploading, leaving an
+  # empty, undeletable release). Never publish the draft manually; this job
+  # flips it once all installer jobs and the node asset are in. If anything
+  # fails upstream, the draft stays a draft and the tag can be re-run safely.
+  finalize-release:
+    needs: [create-release, publish-tauri-binaries, publish-p2p-node]
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 🚀 Publish release (all artifacts green)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const release_id = Number('${{ needs.create-release.outputs.release_id }}');
+            const { data: rel } = await github.rest.repos.getRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id,
+            });
+            // Sanity floor: 3 platform installer sets + standalone node exe.
+            // Guards against publishing (immutably!) a half-populated release.
+            if (rel.assets.length < 6) {
+              core.setFailed(`Refusing to publish: only ${rel.assets.length} assets attached (expected >= 6). Draft left intact.`);
+              return;
+            }
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id,
+              draft: false,
+            });
+            core.info(`Published release ${rel.tag_name} with ${rel.assets.length} assets.`);
