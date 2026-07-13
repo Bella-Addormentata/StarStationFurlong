@@ -1183,7 +1183,25 @@ async function init() {
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
-  
+
+  // ── Dev-only preview flag (PR-A of #30): `?vestibule=<north|south|east|west>`
+  // renders the docking-adapter vestibule outside that door for visual
+  // iteration. No gameplay/network/docking wiring — cosmetic preview only.
+  const vestibuleDoor = new URLSearchParams(location.search).get('vestibule');
+  if (vestibuleDoor === 'north' || vestibuleDoor === 'south' || vestibuleDoor === 'east' || vestibuleDoor === 'west') {
+    const adapter = await import('./adapter');
+    const vestibule = adapter.buildVestibule(vestibuleDoor);
+    scene.add(vestibule);
+    (window as any).__vestibule = vestibule; // console handle for visual iteration
+    (window as any).__setVestibuleLightState = (s: 'idle' | 'cycling' | 'fault') =>
+      adapter.setVestibuleLightState(vestibule, s);
+    // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
+    setInterval(() => {
+      const zv = (window as any).multiScaleZoom;
+      vestibule.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
+    }, 250);
+  }
+
   // Initialize input manager
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
