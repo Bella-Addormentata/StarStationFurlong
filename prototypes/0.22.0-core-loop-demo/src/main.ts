@@ -38,6 +38,22 @@ const mouse     = new THREE.Vector2();
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
 let yjsSync: YjsSync | null = null;
+// Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
+// epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
+// the epoch after EACH await and unwinds if superseded — otherwise a rapid
+// leave→join pair (double-clicked Use-link today, T1 transit tomorrow)
+// interleaves two joins and the older one binds a live YjsSync to the newer
+// session's transport/room.
+let sessionEpoch = 0;
+// Y.Doc lifecycle counter (issue #30 T0 verification aid): joinRoom()
+// increments `created`, teardown increments `destroyed` once YjsSync.stop()
+// has destroyed the doc. Live docs = created - destroyed and must never
+// exceed 1. The counters themselves always run (so code paths don't fork);
+// only the window handle is dev-gated. Nothing in gameplay reads either.
+const ssfDocStats = { created: 0, destroyed: 0 };
+if (import.meta.env.DEV) {
+  (window as any).__ssfDocStats = ssfDocStats;
+}
 let localSeq = 0;
 let lastTickSent = 0;
 const seenPeers = new Set<string>();
@@ -222,7 +238,9 @@ function refreshConnectionTypeRow(): void {
 
 async function bootstrapNetworking() {
   try {
-    // Setup phone input behaviors, hooks, and date-stamps (Task 4.1)
+    // One-time UI init: phone input behaviors, hooks, and date-stamps
+    // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
+    // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
     const boot = pendingBootstrapOverride ?? await fetchDefaultBootstrap();
     if (!boot) {
@@ -233,151 +251,15 @@ async function bootstrapNetworking() {
       return;
     }
 
-    // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
-    seenPeers.clear();
-    receivedTicks = 0;
-    remoteLastSeen.clear();
-    world.clearRemotePlayers();
-    updateHUDNode('ONLINE', '#00e676');
-    await networkProvider.connect(boot);
-    activeBootstrap = boot;
-    await syncShareLink();
-
-    updateHUDP2P('CONNECTED', '#00e676');
-
-    // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
-    // every player is part of the hosting fabric unless their connection
-    // blocks it. "Untested" until the self-test (or a real peer) proves it.
-    if (await fetchLocalFingerprint()) {
-      setNetworkRow('network-seeding-status', 'SEEDING · untested — run Self-Test', '#d4a84b');
-    } else {
-      setNetworkRow('network-seeding-status', 'BASIC · join-only (no local node)', '#ffb300');
-    }
-
-    // 3. Initiate yrs state document handshake over Stream (Task 3.3)
-    const channel = await networkProvider.openChannel('ysync');
-    yjsSync = new YjsSync({
-      roomId: boot.roomId,
-      channel,
-    });
-    await yjsSync.start();
-
-    // 3b. Route NODE-INITIATED envelopes (🐛 0.16.0 blocker fix): remote peers'
-    // updates are bridged to us on node-opened streams — feed ysync frames into
-    // the shared doc and surface bridge dial-status instead of failing silently.
-    networkProvider.onEnvelope((env: { kind?: string; payload?: string; room?: string }) => {
-      if (env.kind === 'ysync') {
-        yjsSync?.ingestEnvelope(env);
-        return;
-      }
-      if (env.kind === 'bridge' && typeof env.payload === 'string') {
-        try {
-          const status = JSON.parse(atob(env.payload)) as { target?: string; status?: string; detail?: string };
-          const shortTarget = (status.target ?? '').slice(0, 8);
-          if (status.status === 'dialing') {
-            setNetworkRow('network-bridge-status', `DIALING → ${shortTarget}…`, '#d4a84b');
-          } else if (status.status === 'connected') {
-            setNetworkRow('network-bridge-status', `LINKED ↔ ${shortTarget}`, '#00e676');
-            logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
-          } else if (status.status === 'failed') {
-            setNetworkRow('network-bridge-status', `FAILED → ${shortTarget} (see node log)`, '#ff1744');
-            logToPhoneSystem(`⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? 'unknown error'}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`);
-          }
-        } catch (e) {
-          console.warn('Unparseable bridge status envelope:', e);
-        }
-      }
-    });
-
-    // Bind shared room info map updates (Task: Room Name & Room Owner)
-    const roomMap = yjsSync.doc.getMap('roomInfo');
-    if (!roomMap.has('owner')) {
-      yjsSync.doc.transact(() => {
-        roomMap.set('owner', 'Local-Clone');
-        roomMap.set('name', boot.roomId || 'Lobby');
-      });
-    }
-
-    const updateRoomUI = () => {
-      const nameVal = roomMap.get('name') as string || 'Lobby';
-      const ownerVal = roomMap.get('owner') as string || 'Local-Clone';
-      
-      const nameEl = document.getElementById('room-name-display');
-      const ownerEl = document.getElementById('room-owner-display');
-      
-      if (nameEl && !document.getElementById('room-name-input')) {
-        nameEl.textContent = nameVal;
-      }
-      if (ownerEl) {
-        ownerEl.textContent = ownerVal;
-      }
-    };
-
-    roomMap.observe((_event) => {
-      updateRoomUI();
-    });
-
-    updateRoomUI();
-
-    // Bind shared chat array updates to SpacePhone interface (Task Task 3.3/4.1)
-    const sharedChat = yjsSync.doc.getArray('chat');
-    sharedChat.observe((_event) => {
-      // Re-populate our scroll container whenever sync modifications occur
-      const container = document.getElementById('chat-messages-container');
-      if (container) {
-        // Safe clear except original system greet is fine
-        container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
-        const items: any[] = sharedChat.toArray();
-        items.forEach(item => {
-          const isMe = item.authorName === 'Local-Clone';
-          const bubble = document.createElement('div');
-          bubble.className = `chat-bubble ${isMe ? 'outbound' : 'inbound'}`;
-          
-          const nameSpan = document.createElement('span');
-          nameSpan.className = 'chat-sender-name';
-          nameSpan.textContent = item.authorName;
-          
-          const textNode = document.createTextNode(item.text);
-          
-          bubble.appendChild(nameSpan);
-          bubble.appendChild(textNode);
-          container.appendChild(bubble);
-        });
-        container.scrollTop = container.scrollHeight;
-      }
-    });
-
-    // 4. Set up incoming real-time client movement tick handler.
-    // 0.23.0 wire (issue #22): the node prefixes every delivered tick with the
-    // sender's 8-byte lane id ([8B sender][13B tick]) so each remote player
-    // keys to a stable identity instead of aliasing into `peer-${seq % 4}`.
-    networkProvider.onTick((buf) => {
-      try {
-        let peerId: string;
-        let tick: MovementTick;
-        if (buf.byteLength === ADDRESSED_TICK_BYTES) {
-          const addressed = unpackAddressedTick(buf);
-          peerId = `peer-${addressed.senderId}`;
-          tick = addressed.tick;
-        } else if (buf.byteLength === TICK_BYTES) {
-          // Legacy un-addressed tick (pre-0.23.0 node or embedded fallback
-          // listener): no sender identity on the wire — collapse into one slot
-          // rather than fabricate ids from the seq counter.
-          peerId = 'peer-legacy';
-          tick = unpackTick(buf);
-        } else {
-          return; // unknown datagram framing — ignore
-        }
-        seenPeers.add(peerId);
-        receivedTicks++;
-        remoteLastSeen.set(peerId, performance.now());
-        world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1);
-      } catch (e) {
-        console.warn('Error unpacking incoming remote peer datagram tick:', e);
-      }
-    });
-
+    await joinRoom(boot);
   } catch (err) {
+    // Review fix (T0 of #30): a join can fail AFTER the transport connected
+    // (openChannel/start) — tear the half-open session down first
+    // (idempotent; no-op when nothing connected) so we never sit
+    // connected-but-labeled-OFFLINE. Only CURRENT-session failures reach
+    // this catch (superseded joins return silently from joinRoom), so the
+    // epoch bump inside leaveRoom cannot cancel a newer in-flight join.
+    await leaveRoom();
     console.warn('Failed to bootstrap connection link:', err);
     updateHUDP2P('OFFLINE', '#ff1744');
     const fp = await fetchLocalFingerprint();
@@ -397,6 +279,253 @@ async function bootstrapNetworking() {
         if (feedback) feedback.textContent = 'Could not dial the peer. Networks like universities/offices often block UDP — web pages load, but QUIC games cannot connect.';
       }
     } catch { /* diagnostic only */ }
+  }
+}
+
+/**
+ * Join a room session (issue #30 T0): connect the transport, run the yrs
+ * document handshake, and bind every per-room observer/handler against the
+ * FRESH Y.Doc. Cleanly re-invokable for a DIFFERENT room after leaveRoom() —
+ * T1 adapter transit is exactly leaveRoom() → joinRoom(target).
+ * NetworkProvider.onEnvelope/onTick hold a single handler slot, so the
+ * re-registration below replaces (never stacks) the previous room's handlers.
+ */
+async function joinRoom(boot: RoomBootstrap): Promise<void> {
+  // Claim a fresh session epoch (see the sessionEpoch declaration): only the
+  // newest join/leave owns the shared provider + module state.
+  const epoch = ++sessionEpoch;
+  try {
+    await joinRoomAtEpoch(boot, epoch);
+  } catch (err) {
+    if (epoch !== sessionEpoch) {
+      // Superseded mid-join: the newer session's leaveRoom yanked our
+      // transport out from under us (expected). Stay silent so the failure
+      // fallout can't clobber the newer session's HUD/state.
+      return;
+    }
+    // Genuine failure of the CURRENT session — bootstrapNetworking's catch
+    // tears down via leaveRoom() and renders the offline fallback.
+    throw err;
+  }
+}
+
+/** Body of joinRoom, bound to the epoch it claimed. After every await it
+ *  re-checks the epoch and unwinds whatever it created if superseded. */
+async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void> {
+  // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
+  seenPeers.clear();
+  receivedTicks = 0;
+  remoteLastSeen.clear();
+  world.clearRemotePlayers();
+  updateHUDNode('ONLINE', '#00e676');
+  await networkProvider.connect(boot);
+  if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
+  activeBootstrap = boot;
+  await syncShareLink();
+  if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
+
+  updateHUDP2P('CONNECTED', '#00e676');
+
+  // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
+  // every player is part of the hosting fabric unless their connection
+  // blocks it. "Untested" until the self-test (or a real peer) proves it.
+  const seedingFingerprint = await fetchLocalFingerprint();
+  if (epoch !== sessionEpoch) return; // superseded — skip UI writes meant for this session
+  if (seedingFingerprint) {
+    setNetworkRow('network-seeding-status', 'SEEDING · untested — run Self-Test', '#d4a84b');
+  } else {
+    setNetworkRow('network-seeding-status', 'BASIC · join-only (no local node)', '#ffb300');
+  }
+
+  // 3. Initiate yrs state document handshake over Stream (Task 3.3)
+  const channel = await networkProvider.openChannel('ysync');
+  if (epoch !== sessionEpoch) {
+    // Superseded mid-handshake — release the channel we just opened
+    // (best-effort; the transport may already be torn down).
+    try { await channel.writable.close(); } catch { /* superseded transport */ }
+    return;
+  }
+  const sync = new YjsSync({
+    roomId: boot.roomId,
+    channel,
+  });
+  ssfDocStats.created++; // doc-lifecycle counter (see declaration)
+  yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
+  await sync.start();
+  if (epoch !== sessionEpoch) {
+    // Superseded while the sync spun up. A concurrent leaveRoom may already
+    // have stopped us (then this is a harmless double-stop); count the doc
+    // as destroyed only if THIS unwind is what actually destroyed it.
+    const docWasDestroyed = (sync.doc as { isDestroyed?: boolean }).isDestroyed === true;
+    try { await sync.stop(); } catch { /* superseded transport */ }
+    if (!docWasDestroyed && (sync.doc as { isDestroyed?: boolean }).isDestroyed) {
+      ssfDocStats.destroyed++; // doc-lifecycle counter (see declaration)
+    }
+    if (yjsSync === sync) yjsSync = null;
+    return;
+  }
+  // No awaits below this line — the epoch can no longer go stale mid-bind,
+  // so every observer/handler below attaches to the CURRENT session's doc.
+
+  // 3b. Route NODE-INITIATED envelopes (🐛 0.16.0 blocker fix): remote peers'
+  // updates are bridged to us on node-opened streams — feed ysync frames into
+  // the shared doc and surface bridge dial-status instead of failing silently.
+  networkProvider.onEnvelope((env: { kind?: string; payload?: string; room?: string }) => {
+    if (env.kind === 'ysync') {
+      yjsSync?.ingestEnvelope(env);
+      return;
+    }
+    if (env.kind === 'bridge' && typeof env.payload === 'string') {
+      try {
+        const status = JSON.parse(atob(env.payload)) as { target?: string; status?: string; detail?: string };
+        const shortTarget = (status.target ?? '').slice(0, 8);
+        if (status.status === 'dialing') {
+          setNetworkRow('network-bridge-status', `DIALING → ${shortTarget}…`, '#d4a84b');
+        } else if (status.status === 'connected') {
+          setNetworkRow('network-bridge-status', `LINKED ↔ ${shortTarget}`, '#00e676');
+          logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
+        } else if (status.status === 'failed') {
+          setNetworkRow('network-bridge-status', `FAILED → ${shortTarget} (see node log)`, '#ff1744');
+          logToPhoneSystem(`⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? 'unknown error'}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`);
+        }
+      } catch (e) {
+        console.warn('Unparseable bridge status envelope:', e);
+      }
+    }
+  });
+
+  // Bind shared room info map updates (Task: Room Name & Room Owner)
+  const roomMap = sync.doc.getMap('roomInfo');
+  if (!roomMap.has('owner')) {
+    sync.doc.transact(() => {
+      roomMap.set('owner', 'Local-Clone');
+      roomMap.set('name', boot.roomId || 'Lobby');
+    });
+  }
+
+  const updateRoomUI = () => {
+    const nameVal = roomMap.get('name') as string || 'Lobby';
+    const ownerVal = roomMap.get('owner') as string || 'Local-Clone';
+
+    const nameEl = document.getElementById('room-name-display');
+    const ownerEl = document.getElementById('room-owner-display');
+
+    if (nameEl && !document.getElementById('room-name-input')) {
+      nameEl.textContent = nameVal;
+    }
+    if (ownerEl) {
+      ownerEl.textContent = ownerVal;
+    }
+  };
+
+  roomMap.observe((_event) => {
+    updateRoomUI();
+  });
+
+  updateRoomUI();
+
+  // Bind shared chat array updates to SpacePhone interface (Task Task 3.3/4.1)
+  const sharedChat = sync.doc.getArray('chat');
+  const rebuildChatLog = () => {
+    // Re-populate our scroll container whenever sync modifications occur
+    const container = document.getElementById('chat-messages-container');
+    if (container) {
+      // Safe clear except original system greet is fine
+      container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
+      const items: any[] = sharedChat.toArray();
+      items.forEach(item => {
+        const isMe = item.authorName === 'Local-Clone';
+        const bubble = document.createElement('div');
+        bubble.className = `chat-bubble ${isMe ? 'outbound' : 'inbound'}`;
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'chat-sender-name';
+        nameSpan.textContent = item.authorName;
+
+        const textNode = document.createTextNode(item.text);
+
+        bubble.appendChild(nameSpan);
+        bubble.appendChild(textNode);
+        container.appendChild(bubble);
+      });
+      container.scrollTop = container.scrollHeight;
+    }
+  };
+  sharedChat.observe((_event) => {
+    rebuildChatLog();
+  });
+  // Rejoin fix (issue #30 T0): after leaveRoom()→joinRoom() the container
+  // still renders the PREVIOUS room's log, and an empty new room never fires
+  // the observer. Rebuild once from the fresh doc now — on a first join this
+  // is a visual no-op (empty array → the same system greeting the container
+  // already holds in index.html). Accepted: this also wipes any PRE-join
+  // logToPhoneSystem() lines — rebind semantics; the log mirrors the doc.
+  rebuildChatLog();
+
+  // 4. Set up incoming real-time client movement tick handler.
+  // 0.23.0 wire (issue #22): the node prefixes every delivered tick with the
+  // sender's 8-byte lane id ([8B sender][13B tick]) so each remote player
+  // keys to a stable identity instead of aliasing into `peer-${seq % 4}`.
+  networkProvider.onTick((buf) => {
+    try {
+      let peerId: string;
+      let tick: MovementTick;
+      if (buf.byteLength === ADDRESSED_TICK_BYTES) {
+        const addressed = unpackAddressedTick(buf);
+        peerId = `peer-${addressed.senderId}`;
+        tick = addressed.tick;
+      } else if (buf.byteLength === TICK_BYTES) {
+        // Legacy un-addressed tick (pre-0.23.0 node or embedded fallback
+        // listener): no sender identity on the wire — collapse into one slot
+        // rather than fabricate ids from the seq counter.
+        peerId = 'peer-legacy';
+        tick = unpackTick(buf);
+      } else {
+        return; // unknown datagram framing — ignore
+      }
+      seenPeers.add(peerId);
+      receivedTicks++;
+      remoteLastSeen.set(peerId, performance.now());
+      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1);
+    } catch (e) {
+      console.warn('Error unpacking incoming remote peer datagram tick:', e);
+    }
+  });
+}
+
+/**
+ * Tear down the active room session (issue #30 T0): stop the yrs sync —
+ * closing its writer and DESTROYING the Y.Doc (the pre-T0 leak: rejoin used
+ * to abandon the old doc with its observers still attached) — then drop the
+ * transport. Safe to call when nothing is connected.
+ * `activeBootstrap` intentionally survives as last-room memory: Retry-node
+ * re-derives the same roomId/roomKey from it via fetchDefaultBootstrap, and
+ * the bootstrap error path reports the last attempted seed.
+ */
+async function leaveRoom(): Promise<void> {
+  // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
+  sessionEpoch++;
+  // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
+  // double-stop (and double-count) the same session.
+  const sync = yjsSync;
+  yjsSync = null;
+  if (sync) {
+    const oldDoc = sync.doc;
+    try {
+      await sync.stop(); // closes the ysync writer + doc.destroy()
+    } catch (err) {
+      console.warn('Error stopping yjs room sync:', err);
+    }
+    if ((oldDoc as { isDestroyed?: boolean }).isDestroyed) {
+      ssfDocStats.destroyed++; // doc-lifecycle counter (see declaration)
+    } else {
+      console.warn('leaveRoom: previous Y.Doc was not destroyed by stop()');
+    }
+  }
+  try {
+    await networkProvider.disconnect();
+  } catch (err) {
+    console.warn('Error disconnecting prior network link:', err);
   }
 }
 
@@ -836,9 +965,9 @@ function setupNetworkDetailsPanel() {
       e.stopPropagation();
       localFingerprint = null;
       if (feedback) feedback.textContent = 'Retrying local node handshake...';
-      try {
-        await networkProvider.disconnect();
-      } catch {}
+      // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
+      // its Y.Doc) before reconnecting, instead of a bare disconnect().
+      await leaveRoom();
       await bootstrapNetworking();
     });
   }
@@ -1020,11 +1149,10 @@ function setupNetworkDetailsPanel() {
       pendingBootstrapOverride = resolved;
 
       if (feedback) feedback.textContent = 'Zero-config P2P seed accepted. Establishing hole-punched link...';
-      try {
-        await networkProvider.disconnect();
-      } catch (err) {
-        console.warn('Error disconnecting prior network link:', err);
-      }
+      // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
+      // its Y.Doc) before joining the imported room, instead of a bare
+      // disconnect() that leaked the previous doc and its observers.
+      await leaveRoom();
       await bootstrapNetworking();
     });
   }
