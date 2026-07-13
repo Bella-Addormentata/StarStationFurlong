@@ -595,7 +595,132 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: 10px;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      /* ‹ Back chevron — only visible inside an app view (router toggles it) */
+      #phone-back-btn {
+        display: none; /* hidden on home; showPhoneView() flips to flex */
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        flex: 0 0 auto;
+        background: rgba(30, 136, 229, 0.12);
+        color: #90caf9;
+        border: 1px solid rgba(30, 136, 229, 0.3);
+        border-radius: 8px;
+        font-size: 18px;
+        line-height: 1;
+        padding: 0 0 2px 0;
+        cursor: pointer;
+        font-family: monospace;
+        transition: background 0.2s, border-color 0.2s;
+      }
+
+      #phone-back-btn:hover {
+        background: rgba(30, 136, 229, 0.25);
+        border-color: rgba(30, 136, 229, 0.6);
+      }
+
+      /* 📱 Phone shell views (issue #20 S1) — one .active view at a time */
+      .phone-app-view {
+        display: none;
+      }
+
+      .phone-app-view.active {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0; /* let inner scroll containers actually scroll */
+      }
+
+      /* Home screen app-launcher grid */
+      #phone-home-screen.active {
+        padding: 18px 14px;
+      }
+
+      #phone-app-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        align-content: start;
+      }
+
+      .phone-app-tile {
+        aspect-ratio: 1 / 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        background: rgba(10, 14, 34, 0.9);
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        border-radius: 14px;
+        cursor: pointer;
+        font-family: monospace;
+        transition: background 0.2s, border-color 0.2s, transform 0.1s;
+      }
+
+      .phone-app-tile:hover {
+        background: rgba(30, 136, 229, 0.14);
+        border-color: rgba(30, 136, 229, 0.45);
+      }
+
+      .phone-app-tile:active {
+        transform: scale(0.94);
+        background: rgba(30, 136, 229, 0.22);
+      }
+
+      .phone-app-tile-icon {
+        font-size: 26px;
+        line-height: 1;
+        filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.6));
+      }
+
+      .phone-app-tile-label {
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        color: rgba(224, 226, 238, 0.75);
+        text-transform: uppercase;
+      }
+
+      /* ▚▚ NO SIGNAL ▚▚ placeholder for unprovisioned apps (Contacts/Bank) */
+      .phone-no-signal {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 20px;
+        text-align: center;
+        font-family: monospace;
+      }
+
+      .phone-no-signal-glyph {
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: 2px;
+        color: #d4a84b;
+        text-shadow: 0 0 12px rgba(212, 168, 75, 0.35);
+        animation: pulse 2s ease-in-out infinite;
+      }
+
+      .phone-no-signal-text {
+        font-size: 11px;
+        color: rgba(224, 226, 238, 0.55);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      .phone-no-signal-sub {
+        font-size: 9px;
+        color: rgba(224, 226, 238, 0.3);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
       }
 
       /* Scrollable Message Box */

@@ -380,6 +380,77 @@ function setupSpacePhoneOverlay() {
   const chatForm = document.getElementById('chat-form');
   const tipIndicator = document.getElementById('phone-tip-indicator');
 
+  // 📱 Phone shell view router (issue #20 S1) — home screen + per-app views.
+  // Policy: Tab always opens the phone to the HOME screen (deterministic,
+  // one tap to any app) rather than restoring the last open view.
+  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank';
+  const phoneViewMeta: Record<PhoneViewId, { elId: string; title: string; subtitle: string }> = {
+    home:     { elId: 'phone-home-screen',   title: '📱 HOME',        subtitle: 'FurlongOS · Select App' },
+    chat:     { elId: 'phone-app-chat',      title: '👨‍🚀 CLONE CHAT', subtitle: 'Room: Furlong Lobby' },
+    contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
+    bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
+  };
+  let currentPhoneView: PhoneViewId = 'home';
+  const backBtn = document.getElementById('phone-back-btn');
+  const appTitle = document.getElementById('phone-app-title');
+  const appSubtitle = document.getElementById('phone-app-subtitle');
+
+  const showPhoneView = (id: PhoneViewId) => {
+    currentPhoneView = id;
+    (Object.keys(phoneViewMeta) as PhoneViewId[]).forEach((viewId) => {
+      const el = document.getElementById(phoneViewMeta[viewId].elId);
+      if (el) el.classList.toggle('active', viewId === id);
+    });
+    if (appTitle) appTitle.textContent = phoneViewMeta[id].title;
+    if (appSubtitle) appSubtitle.textContent = phoneViewMeta[id].subtitle;
+    // Back chevron only makes sense inside an app view
+    if (backBtn) backBtn.style.display = id === 'home' ? 'none' : 'flex';
+    // Chat input focus lives in the chat-view-open path (was: on phone open)
+    if (id === 'chat') {
+      chatInput?.focus();
+      // Hidden views report scrollHeight 0 — restore tail-scroll on re-entry
+      const messages = document.getElementById('chat-messages-container');
+      if (messages) messages.scrollTop = messages.scrollHeight;
+    } else {
+      chatInput?.blur();
+    }
+  };
+
+  // App tiles on the home screen route into their views
+  document.querySelectorAll<HTMLButtonElement>('.phone-app-tile').forEach((tile) => {
+    tile.addEventListener('click', () => {
+      const target = tile.dataset.phoneApp as PhoneViewId | undefined;
+      if (target && target in phoneViewMeta) {
+        showPhoneView(target);
+      }
+    });
+  });
+
+  if (backBtn) {
+    backBtn.addEventListener('click', () => {
+      showPhoneView('home');
+    });
+  }
+
+  // Esc returns to home while the phone is open and inside an app view.
+  // (Esc is otherwise only used by the room-name inline editor input, which
+  // we exclude via the non-chat input guard below.)
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!container || !container.classList.contains('active')) return;
+    const active = document.activeElement;
+    if (
+      active && active !== chatInput &&
+      (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')
+    ) {
+      return; // e.g. room-name editor owns Escape for cancel
+    }
+    if (currentPhoneView !== 'home') {
+      e.preventDefault();
+      showPhoneView('home');
+    }
+  });
+
   const removeTipIndicator = () => {
     if (tipIndicator) {
       tipIndicator.style.opacity = '0';
@@ -407,7 +478,7 @@ function setupSpacePhoneOverlay() {
       removeTipIndicator();
       if (container) {
         container.classList.add('active');
-        chatInput?.focus();
+        showPhoneView('home');
         logToPhoneSystem('Entering SpacePhone net...');
       }
     });
@@ -433,7 +504,8 @@ function setupSpacePhoneOverlay() {
       if (container) {
         container.classList.toggle('active');
         if (container.classList.contains('active')) {
-          chatInput?.focus();
+          // Always land on the home screen (see view-router policy note above)
+          showPhoneView('home');
           logToPhoneSystem('Entering SpacePhone net...');
         } else {
           chatInput?.blur();
