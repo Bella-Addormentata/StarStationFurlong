@@ -13,6 +13,7 @@ import { YjsSync } from './network/YjsSync';
 import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_BYTES, type MovementTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
 import { SolarSystemMap } from './map';
 import { MultiScaleZoomView } from './zoom';
+import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 
 type RendererModule = typeof import('./renderer');
 
@@ -1296,6 +1297,22 @@ async function init() {
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
+
+  // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
+  // expose a debug console handle. LOCAL rig only — remote avatars keep #27's
+  // per-peer hue tint until the phone-plan S2 identity lane carries outfit ids.
+  const applyOutfitById = (id: string): boolean => {
+    const outfit = getOutfitById(id);
+    if (!outfit) { console.warn(`[outfit] unknown outfit id: ${id}`); return false; }
+    // Player keeps its rig private; reach through for this cosmetic path
+    // instead of widening the frozen player/character public API.
+    (world.getPlayer() as any).character.setOutfit(outfit);
+    saveOutfitId(id);
+    return true;
+  };
+  (window as any).__setOutfit = applyOutfitById; // debug handle (permanent)
+  const savedOutfitId = loadSavedOutfitId();
+  if (savedOutfitId && savedOutfitId !== 'default') applyOutfitById(savedOutfitId);
 
   // ── Dev-only preview flag (PR-A of #30): `?vestibule=<north|south|east|west>`
   // renders the docking-adapter vestibule outside that door for visual

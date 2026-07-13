@@ -26,9 +26,22 @@
  *
  * Public API preserved: constructor(scene), masterGroup, setState, update.
  * Only consumer is player.ts; NPCs use their own class.
+ *
+ * Outfit system (TR3, issue #35 — ADDITIVE, frozen API untouched):
+ *  - _build* meshes whose material color comes from a swappable PAL entry are
+ *    tagged with userData.paletteRole ('fur'|'furDeep'|'cream'|'accent').
+ *  - setOutfit(outfit)/clearOutfit() recolor those materials with ABSOLUTE
+ *    setHex (offsetHSL is cumulative — #27's documented trap), dedupe shared
+ *    materials via a Set, skip the shared OUTLINE_MAT, and mirror the recolor
+ *    into emissive where tmat() seeded it from the same hex. Originals are
+ *    captured on first apply so restore/re-apply are exact.
+ *  - attachAccessory/removeAccessory: one procedural head-slot accessory
+ *    (cap/visor/scarf) parented to the head group, so it follows every
+ *    walk/sit/twitch animation for free.
  */
 
 import * as THREE from 'three';
+import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
 
 export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground';
 
@@ -180,6 +193,20 @@ export class VoxelCharacter {
 
   private clock: THREE.Clock;
 
+  // ── Outfit state (TR3, issue #35) ──────────────────────────────────────────
+  /**
+   * Pristine color/emissive per role-tagged material, captured lazily on the
+   * FIRST setOutfit before anything is mutated. clearOutfit restores from
+   * here, and setOutfit reads un-overridden roles from here — so repeated
+   * applies are exact (absolute hexes, zero cumulative drift).
+   */
+  private outfitOriginals = new Map<
+    THREE.MeshToonMaterial,
+    { color: number; emissive: number; emissiveSeeded: boolean }
+  >();
+  /** Currently attached head accessory (one slot), or null. */
+  private accessoryGroup: THREE.Group | null = null;
+
   constructor(scene: THREE.Scene) {
     // ── 1. Master / visual group hierarchy ───────────────────────────────────
     this.masterGroup = new THREE.Group();
@@ -234,6 +261,26 @@ export class VoxelCharacter {
 
     this.clock = new THREE.Clock();
     console.log('✅ VoxelCharacter created (chibi fox)');
+  }
+
+  // ── Palette-role tagging (TR3, issue #35) ─────────────────────────────────
+  //  Called at the end of each _build* with that builder's swappable
+  //  materials. Tags every mesh under `root` whose material is one of them
+  //  with userData.paletteRole so setOutfit can find the recolor targets.
+  //  Everything else is skipped by construction: outline shells carry the
+  //  shared OUTLINE_MAT, the face decal / nose / paw pads / vertex-colored
+  //  ear cones use materials that simply aren't in the map.
+  private _tagPaletteRoles(
+    root: THREE.Object3D,
+    roles: Array<[THREE.Material, PaletteRole]>
+  ): void {
+    const roleByMat = new Map(roles);
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || Array.isArray(mesh.material)) return;
+      const role = roleByMat.get(mesh.material);
+      if (role) mesh.userData.paletteRole = role;
+    });
   }
 
   // ── Head ─────────────────────────────────────────────────────────────────
@@ -412,6 +459,15 @@ export class VoxelCharacter {
     this.leftEar  = buildEar(-1);
     this.rightEar = buildEar( 1);
     this.head.add(this.leftEar, this.rightEar);
+
+    // Outfit roles: skull/muzzle-top/ear tufts = fur; muzzle underside +
+    // inner-ear cones/wisps = cream. Nose, face decal, and the vertex-colored
+    // outer ear cones stay untagged (not meaningfully swappable).
+    this._tagPaletteRoles(this.head, [
+      [furMat, 'fur'],
+      [creamMat, 'cream'],
+      [creamHi, 'cream'],
+    ]);
   }
 
   // ── Face decal ──────────────────────────────────────────────────────────
@@ -569,6 +625,13 @@ export class VoxelCharacter {
     const ruff = new THREE.Mesh(ruffGeo, creamHi);
     ruff.position.set(0, 0.32, 0.15);
     addWithOutline(this.chest, ruff, 0.022);
+
+    // Outfit roles: torso shell = fur; belly patch + chest ruff = cream.
+    this._tagPaletteRoles(this.chest, [
+      [furMat, 'fur'],
+      [creamMat, 'cream'],
+      [creamHi, 'cream'],
+    ]);
   }
 
   // ── Arms ─────────────────────────────────────────────────────────────────
@@ -625,6 +688,16 @@ export class VoxelCharacter {
 
     buildArm(this.leftArm);
     buildArm(this.rightArm);
+
+    // Outfit roles: upper arm = fur; dark glove + paw ball = accent (reads
+    // as "gloves" when recolored). Pink palm pads stay untagged.
+    for (const arm of [this.leftArm, this.rightArm]) {
+      this._tagPaletteRoles(arm, [
+        [furMat, 'fur'],
+        [darkMat, 'accent'],
+        [pawMat, 'accent'],
+      ]);
+    }
   }
 
   // ── Legs ─────────────────────────────────────────────────────────────────
@@ -687,6 +760,16 @@ export class VoxelCharacter {
 
     buildLeg(this.leftLeg);
     buildLeg(this.rightLeg);
+
+    // Outfit roles: thigh = fur; dark sock + foot = accent (reads as
+    // "boots" when recolored). Pink foot pads / toe dots stay untagged.
+    for (const leg of [this.leftLeg, this.rightLeg]) {
+      this._tagPaletteRoles(leg, [
+        [furMat, 'fur'],
+        [darkMat, 'accent'],
+        [pawMat, 'accent'],
+      ]);
+    }
   }
 
   // ── Tail ─────────────────────────────────────────────────────────────────
@@ -751,6 +834,15 @@ export class VoxelCharacter {
     const tipHi = new THREE.Mesh(tipHiGeo, creamHi);
     tipHi.position.set(0, tipY + 0.07, 0.015);
     addWithOutline(this.tail, tipHi, 0.028);
+
+    // Outfit roles: tail spine/fluff = fur, middle segment = furDeep,
+    // white tip = cream.
+    this._tagPaletteRoles(this.tail, [
+      [furMat, 'fur'],
+      [furDeep, 'furDeep'],
+      [creamMat, 'cream'],
+      [creamHi, 'cream'],
+    ]);
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -762,6 +854,107 @@ export class VoxelCharacter {
   setState(newState: CharacterState, networkRotation: number): void {
     this.currentState    = newState;
     this.logicalRotation = networkRotation;
+  }
+
+  /**
+   * Dress the rig in an outfit: absolute palette-role recolor + optional head
+   * accessory. Additive to the frozen API (TR3, issue #35).
+   *
+   * Hazards handled (all learned in #27's applyPeerTint):
+   *  - materials are shared across meshes within the rig → dedupe via a Set;
+   *  - outline shells share the module-wide OUTLINE_MAT → skip it (recoloring
+   *    it would repaint every rig's outlines at once);
+   *  - offsetHSL is cumulative → absolute color.setHex only;
+   *  - tmat() seeds emissive from the same hex as color → mirror the recolor
+   *    into emissive so it holds up in dim light (only when it was seeded).
+   *
+   * Roles absent from paletteOverrides are restored to their pristine PAL
+   * color, so outfit-to-outfit switches never leave stale colors and applying
+   * the same outfit twice is exactly idempotent.
+   */
+  setOutfit(outfit: OutfitDef): void {
+    const seen = new Set<THREE.Material>();
+    this.visualGroup.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const role = mesh.userData.paletteRole as PaletteRole | undefined;
+      if (!role) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        if (!m || m === OUTLINE_MAT || seen.has(m)) continue;
+        seen.add(m);
+        const mat = m as THREE.MeshToonMaterial;
+        if (!mat.color) continue;
+        // Capture pristine values BEFORE the first mutation — the exact
+        // restore source for clearOutfit and un-overridden roles.
+        let orig = this.outfitOriginals.get(mat);
+        if (!orig) {
+          orig = {
+            color: mat.color.getHex(),
+            emissive: mat.emissive ? mat.emissive.getHex() : 0,
+            emissiveSeeded:
+              !!mat.emissive && mat.emissive.getHex() === mat.color.getHex(),
+          };
+          this.outfitOriginals.set(mat, orig);
+        }
+        const target = outfit.paletteOverrides[role] ?? orig.color;
+        mat.color.setHex(target);
+        if (mat.emissive && orig.emissiveSeeded) mat.emissive.setHex(target);
+      }
+    });
+    this.removeAccessory();
+    if (outfit.accessory) this.attachAccessory(outfit.accessory);
+  }
+
+  /** Restore every outfit-touched material to its pristine color/emissive and
+   *  detach any accessory. Exact inverse of setOutfit (no drift). */
+  clearOutfit(): void {
+    for (const [mat, orig] of this.outfitOriginals) {
+      mat.color.setHex(orig.color);
+      if (mat.emissive) mat.emissive.setHex(orig.emissive);
+    }
+    this.removeAccessory();
+  }
+
+  /**
+   * Attach one procedural accessory to the HEAD group (single slot — replaces
+   * any current accessory). Parented under this.head, so it inherits every
+   * walk-bob / sit / facing transform with zero animation wiring.
+   */
+  attachAccessory(kind: AccessoryKind): void {
+    this.removeAccessory();
+    const g =
+      kind === 'cap'   ? this._buildCapAccessory()   :
+      kind === 'visor' ? this._buildVisorAccessory() :
+                         this._buildScarfAccessory();
+    g.name = `accessory:${kind}`;
+    this.head.add(g);
+    this.accessoryGroup = g;
+  }
+
+  /** Detach and dispose the current accessory (if any). Follows the despawn
+   *  discipline from world.ts: dedupe geometries/materials via a Set and
+   *  NEVER dispose the shared OUTLINE_MAT (outline shells reuse host geo). */
+  removeAccessory(): void {
+    const g = this.accessoryGroup;
+    if (!g) return;
+    this.head.remove(g);
+    const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
+    g.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      if (mesh.geometry && !disposed.has(mesh.geometry)) {
+        disposed.add(mesh.geometry);
+        mesh.geometry.dispose();
+      }
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
+        disposed.add(mat);
+        mat.dispose();
+      }
+    });
+    this.accessoryGroup = null;
   }
 
   /**
@@ -852,5 +1045,98 @@ export class VoxelCharacter {
 
     this.mouth.scale.x = 1.0 + smile * 0.7;
     this.mouth.position.y = 0.17 + smile * 0.015;
+  }
+
+  // ── Accessory builders (TR3, issue #35) ────────────────────────────────────
+  //  Small procedural props in the rig's own toon-outline style: same tmat()
+  //  factory + addWithOutline() shells for opaque parts. All coordinates are
+  //  HEAD-LOCAL (head origin = neck point; skull center y≈0.42, r≈0.62;
+  //  ears at x=±0.28, y=0.94; face plane at z=0.61).
+
+  /** Cap: low crown perched between the ears + forward brim + button. */
+  private _buildCapAccessory(): THREE.Group {
+    const g = new THREE.Group();
+    const capMat  = tmat(0x2e6f9e, { emissiveBoost: 0.10 });  // steel blue
+    const trimMat = tmat(0xf2e3c8, { emissiveBoost: 0.11 });  // parchment trim
+
+    // Crown — squashed cylinder sitting on the skull dome, between the ears
+    // (radius 0.30 just clears the ear bases at x=±0.28).
+    const crownGeo = new THREE.CylinderGeometry(0.27, 0.33, 0.17, 20);
+    const crown = new THREE.Mesh(crownGeo, capMat);
+    crown.position.set(0, 1.04, 0.08);
+    addWithOutline(g, crown, 0.03);
+
+    // Dome top — rounds off the crown so the silhouette stays plushie-soft.
+    const domeGeo = new THREE.SphereGeometry(0.27, 20, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+    const dome = new THREE.Mesh(domeGeo, capMat);
+    dome.position.set(0, 1.12, 0.08);
+    g.add(dome);
+
+    // Brim — flat rounded box jutting forward over the face.
+    const brimGeo = new THREE.BoxGeometry(0.44, 0.045, 0.30);
+    const brim = new THREE.Mesh(brimGeo, capMat);
+    brim.position.set(0, 0.99, 0.42);
+    brim.rotation.x = 0.12;   // slight downward tilt
+    addWithOutline(g, brim, 0.025);
+
+    // Button on top.
+    const button = new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 10), trimMat);
+    button.position.set(0, 1.24, 0.08);
+    g.add(button);
+    return g;
+  }
+
+  /** Visor: thin translucent cyan band curved across the face. Translucent →
+   *  no outline shell; renderOrder 6 so it composites over the face decal
+   *  (renderOrder 5, both depthWrite-off). */
+  private _buildVisorAccessory(): THREE.Group {
+    const g = new THREE.Group();
+    const visorMat = new THREE.MeshBasicMaterial({
+      color: 0x63d6e8,
+      transparent: true,
+      opacity: 0.35,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    // Open cylinder segment centered on +Z (thetaStart −0.45π..+0.45π), a
+    // hair wider than the skull so it floats just off the fur.
+    const bandGeo = new THREE.CylinderGeometry(
+      0.66, 0.66, 0.20, 32, 1, true, -Math.PI * 0.45, Math.PI * 0.9
+    );
+    const band = new THREE.Mesh(bandGeo, visorMat);
+    band.position.set(0, 0.47, 0.02);
+    band.renderOrder = 6;
+    g.add(band);
+
+    // Slim dark frame rail along the visor's top edge (opaque anchor).
+    const railGeo = new THREE.CylinderGeometry(
+      0.665, 0.665, 0.04, 32, 1, true, -Math.PI * 0.48, Math.PI * 0.96
+    );
+    const rail = new THREE.Mesh(railGeo, tmat(0x30363f, { emissiveBoost: 0.06 }));
+    rail.position.set(0, 0.585, 0.02);
+    g.add(rail);
+    return g;
+  }
+
+  /** Scarf: chunky torus band hugging the neck seam + a hanging front flap. */
+  private _buildScarfAccessory(): THREE.Group {
+    const g = new THREE.Group();
+    const scarfMat = tmat(0xb8402e, { emissiveBoost: 0.10 });  // warm red
+    // Torus lies in the XZ plane (rotation.x = π/2) right where the skull
+    // meets the torso (head-local y≈−0.06); major radius 0.36 threads the
+    // skull's ~0.42 cross-section radius at that height through the tube.
+    const bandGeo = new THREE.TorusGeometry(0.36, 0.11, 12, 24);
+    const band = new THREE.Mesh(bandGeo, scarfMat);
+    band.rotation.x = Math.PI / 2;
+    band.position.set(0, -0.06, 0.0);
+    addWithOutline(g, band, 0.025);
+
+    // Hanging flap off the front-right of the band, clear of the chest ruff.
+    const flapGeo = new THREE.BoxGeometry(0.15, 0.30, 0.06);
+    const flap = new THREE.Mesh(flapGeo, scarfMat);
+    flap.position.set(0.15, -0.24, 0.40);
+    flap.rotation.z = 0.18;
+    addWithOutline(g, flap, 0.02);
+    return g;
   }
 }
