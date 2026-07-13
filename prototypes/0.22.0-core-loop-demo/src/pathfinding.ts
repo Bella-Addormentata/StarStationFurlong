@@ -30,12 +30,16 @@ export const GRID_HALF = GRID_SIZE / 2;
 // ── Pre-baked walkable grid ────────────────────────────────────────────────────
 /**
  * walkable[row][col] === true  → cell centre is free of obstacles.
- * Built once at module load time.
+ * Baked once at module load; call rebakeWalkableGrid() again whenever
+ * OBSTACLES changes (rows are refilled in place, so existing references to
+ * the array stay valid).
  */
-export const walkable: boolean[][] = (() => {
-  const grid: boolean[][] = [];
+export const walkable: boolean[][] = [];
+
+/** Re-bake the walkable grid from the current OBSTACLES list, in place. */
+export function rebakeWalkableGrid(): void {
   for (let row = 0; row < GRID_SIZE; row++) {
-    grid[row] = [];
+    const cells = walkable[row] ?? (walkable[row] = []);
     for (let col = 0; col < GRID_SIZE; col++) {
       const wx = (col - GRID_HALF + 0.5) * CELL_SIZE;
       const wz = (row - GRID_HALF + 0.5) * CELL_SIZE;
@@ -48,11 +52,12 @@ export const walkable: boolean[][] = (() => {
       }
       // Also mark cells outside the walkable room boundary as blocked
       if (Math.abs(wx) > 5.0 || Math.abs(wz) > 5.0) blocked = true;
-      grid[row][col] = !blocked;
+      cells[col] = !blocked;
     }
   }
-  return grid;
-})();
+}
+
+rebakeWalkableGrid();
 
 // ── Coordinate conversions ────────────────────────────────────────────────────
 /** Convert a world coordinate to the nearest grid column index. */
