@@ -519,8 +519,9 @@ export class DoorDockingPortSystem {
 
   /**
    * Request the door leaves to slide open. onComplete fires exactly once when
-   * both leaves reach the open position. A newer open/close request on the
-   * same door overwrites the in-flight slide (the stale onComplete is dropped).
+   * both leaves reach the open position. A newer opposite-direction request
+   * on the same door overwrites the in-flight slide (its onComplete is
+   * dropped); a same-direction request chains the callbacks instead.
    */
   public openDoor(doorId: DoorId, onComplete?: () => void): void {
     this.startSlide(doorId, true, onComplete);
@@ -536,6 +537,18 @@ export class DoorDockingPortSystem {
     if (!group) return; // no door built — the caller's timeout handles it
     const isLarge = group.userData?.isLarge === true;
     const openTarget = open ? (isLarge ? 1.8 : 1.05) : (isLarge ? 0.62 : 0.37);
+
+    // Same-direction overwrite: chain the in-flight onComplete (old first) so
+    // an external open (keypad unlock, pairing accept) can't drop a waiting
+    // player's door-opened callback. Opposite-direction overwrites still drop
+    // the old callback — that completion will never be reached.
+    const prev = this.slideAnims.get(doorId);
+    if (prev && prev.openTarget === openTarget && prev.onComplete) {
+      const prevCb = prev.onComplete;
+      const nextCb = onComplete;
+      onComplete = nextCb ? () => { prevCb(); nextCb(); } : prevCb;
+    }
+
     this.slideAnims.set(doorId, { openTarget, onComplete });
   }
 

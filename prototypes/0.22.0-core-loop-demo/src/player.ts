@@ -170,7 +170,13 @@ export class Player {
       worldToRow(pos.z), worldToCol(pos.x),
       worldToRow(targetZ), worldToCol(targetX),
     );
-    if (path.length === 0) return;
+    if (path.length === 0) {
+      // Unreachable — but any door/sit approach cancelled above left its
+      // waypoint path behind: stop rather than keep walking a route whose
+      // purpose no longer exists.
+      this._clearPath();
+      return;
+    }
 
     this.waypointPath = path;
     this.navMode      = 'WAYPOINT';
@@ -251,8 +257,15 @@ export class Player {
       this.pendingDest = null;
       return;
     }
-    // Same door already in progress → no-op.
-    if (this.doorPhase !== 'NONE' && this.doorTarget && this.doorTarget.id === door.id) return;
+    // Same door already in progress → no-op. (Except during RETURN: a
+    // re-click on the same door defers below and queues a fresh walk-through
+    // that the RETURN-completion resume path picks up.)
+    if (
+      this.doorPhase !== 'NONE' &&
+      this.doorPhase !== 'RETURN' &&
+      this.doorTarget &&
+      this.doorTarget.id === door.id
+    ) return;
     // Mid walk-through of a different door: return inside first, then go.
     if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
       this.pendingDoor = { door, hooks };
