@@ -10,7 +10,7 @@ import type { World } from './world';
 import type { InputManager } from './input';
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
-import { packTick, unpackTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
+import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_BYTES, type MovementTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
 import { SolarSystemMap } from './map';
 import { MultiScaleZoomView } from './zoom';
 
@@ -41,6 +41,12 @@ let localSeq = 0;
 let lastTickSent = 0;
 const seenPeers = new Set<string>();
 let receivedTicks = 0;
+// Remote-player liveness: last tick arrival per peer, swept in the game loop
+// so ghost avatars despawn after silence (issue #22 follow-through).
+const remoteLastSeen = new Map<string, number>();
+const REMOTE_PEER_TIMEOUT_MS = 10_000;
+const REMOTE_REAPER_SWEEP_MS = 2_000;
+let lastReaperSweep = 0;
 let pendingBootstrapOverride: RoomBootstrap | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
 let networkPanelInitialized = false;
@@ -228,6 +234,8 @@ async function bootstrapNetworking() {
     // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
     seenPeers.clear();
     receivedTicks = 0;
+    remoteLastSeen.clear();
+    world.clearRemotePlayers();
     updateHUDNode('ONLINE', '#00e676');
     await networkProvider.connect(boot);
     activeBootstrap = boot;
@@ -337,14 +345,30 @@ async function bootstrapNetworking() {
       }
     });
 
-    // 4. Set up incoming real-time client movement tick handler
+    // 4. Set up incoming real-time client movement tick handler.
+    // 0.23.0 wire (issue #22): the node prefixes every delivered tick with the
+    // sender's 8-byte lane id ([8B sender][13B tick]) so each remote player
+    // keys to a stable identity instead of aliasing into `peer-${seq % 4}`.
     networkProvider.onTick((buf) => {
       try {
-        const tick = unpackTick(buf);
-        // Identify fake/peer client ID from seq mapping
-        const peerId = `peer-${tick.seq % 4}`;
+        let peerId: string;
+        let tick: MovementTick;
+        if (buf.byteLength === ADDRESSED_TICK_BYTES) {
+          const addressed = unpackAddressedTick(buf);
+          peerId = `peer-${addressed.senderId}`;
+          tick = addressed.tick;
+        } else if (buf.byteLength === TICK_BYTES) {
+          // Legacy un-addressed tick (pre-0.23.0 node or embedded fallback
+          // listener): no sender identity on the wire — collapse into one slot
+          // rather than fabricate ids from the seq counter.
+          peerId = 'peer-legacy';
+          tick = unpackTick(buf);
+        } else {
+          return; // unknown datagram framing — ignore
+        }
         seenPeers.add(peerId);
         receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
         world.updateRemotePlayer(peerId, tick.x, tick.z);
       } catch (e) {
         console.warn('Error unpacking incoming remote peer datagram tick:', e);
@@ -1320,6 +1344,17 @@ function animate() {
       controls.style.animation = 'pulse 1s ease-in-out 3';
     }
     controlsHintShown = true;
+  }
+
+  // ── Remote-player reaper: despawn replicas that stopped ticking (issue #22)
+  if (world && currentTime - lastReaperSweep >= REMOTE_REAPER_SWEEP_MS) {
+    lastReaperSweep = currentTime;
+    for (const [peerId, lastSeen] of remoteLastSeen) {
+      if (currentTime - lastSeen >= REMOTE_PEER_TIMEOUT_MS) {
+        remoteLastSeen.delete(peerId);
+        world.removeRemotePlayer(peerId);
+      }
+    }
   }
 
   // ── Datagram tick sender & stats HUD (Task 3.2 / 3.4)

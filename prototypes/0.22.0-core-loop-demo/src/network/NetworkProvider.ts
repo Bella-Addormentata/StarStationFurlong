@@ -22,6 +22,7 @@ import type {
   RoomBootstrap,
   TransportMode,
 } from './protocol.ts';
+import { TICK_BYTES, ADDRESSED_TICK_BYTES } from './protocol.ts';
 
 export interface NetworkDebugInfo {
   mode: TransportMode;
@@ -267,8 +268,11 @@ export class NetworkProvider implements NetworkProviderPort {
         if (done) break;
         this.#datagramsRecv++;
         
-        // Handle incoming UDP datagrams
-        if (value.length === 13) {
+        // Handle incoming UDP datagrams.
+        // 0.23.0 wire (issue #22): node-delivered ticks are 21 B
+        // ([8B sender lane id][13B tick]); bare 13 B ticks still arrive from
+        // pre-0.23.0 nodes / the embedded fallback listener.
+        if (value.length === ADDRESSED_TICK_BYTES || value.length === TICK_BYTES) {
           this.#tickRecv++;
           // Task 3.2: Forward remote player position ticks
           if (this.#tickHandler) {
