@@ -1215,6 +1215,13 @@ export class World {
       for (const mat of mats) {
         if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
         disposed.add(mat);
+        // Material.dispose() does NOT free textures. The face decal is a
+        // per-instance 512x512 mipmapped CanvasTexture on .map — dispose it
+        // or every despawn strands ~1.3MB of GPU memory. Dispose .map ONLY:
+        // toon materials keep the module-shared GRAD DataTexture in
+        // .gradientMap (a different slot) and their .map is null.
+        const map = (mat as THREE.MeshBasicMaterial).map;
+        if (map) map.dispose();
         mat.dispose();
       }
     });
