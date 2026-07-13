@@ -177,7 +177,14 @@ export function buildStorageTrunk(): StorageTrunkProp {
   let pendingComplete: (() => void) | null = null;
 
   const setLidTarget = (target: number, onComplete?: () => void) => {
-    // A superseding call drops the previous callback (its motion never arrives).
+    if (target === lidTarget && lidAngle !== target) {
+      // Same-target re-request while mid-swing: the earlier motion DOES still
+      // arrive, so chain both callbacks instead of dropping the first.
+      const prev = pendingComplete;
+      pendingComplete = onComplete ? (prev ? () => { prev(); onComplete(); } : onComplete) : prev;
+      return;
+    }
+    // A direction-changing call drops the previous callback (its motion never arrives).
     pendingComplete = null;
     lidTarget = target;
     if (lidAngle === lidTarget) { onComplete?.(); return; } // already there → fire once, now
