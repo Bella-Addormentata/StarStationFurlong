@@ -9,6 +9,8 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
+import { findDoor } from './doors';
+import { showHint } from './hud';
 import { DoorDockingPortSystem } from './docking';
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from './voxelCharacter';
 
@@ -786,6 +788,9 @@ export class World {
     // Animate networked peer replicas (issue #21 — fox avatars, not spheres)
     this.updateRemoteAvatars(deltaTime);
 
+    // Advance door leaf slides (update-loop driven, completion-signalled)
+    if (this.dockingSystem) this.dockingSystem.update(deltaTime);
+
     // Float dust motes upward, reset at ceiling
     if (this.particlePositions && this.particleGeo) {
       const n = this.particlePositions.length / 3;
@@ -960,6 +965,42 @@ export class World {
         this.player.navigateTo(x, z);
       }
     }
+  }
+
+  /**
+   * Route a door-body click into the player's walk-through sequence, wiring
+   * the (docking-system-agnostic) door hooks to this world's docking ports.
+   */
+  public requestDoorWalkthrough(doorId: string): void {
+    const door = findDoor(doorId);
+    if (!door || !this.isPlayerActive() || !this.dockingSystem) return;
+
+    if (!door.enabled) {
+      showHint('This port is blocked by the hearth.');
+      return;
+    }
+
+    const ds = this.dockingSystem;
+    this.player.navigateToDoor(door, {
+      requestOpen: (onOpened) => {
+        const state = ds.getDockingState(door.id);
+        if (state && state.locked) {
+          showHint('Docking port is LOCKED. Use the keypad.');
+          return false;
+        }
+        ds.openDoor(door.id, onOpened);
+        return true;
+      },
+      requestClose: () => ds.closeDoor(door.id),
+      onThrough: () => {
+        const state = ds.getDockingState(door.id);
+        showHint(
+          state && state.pairedSuccessfully
+            ? `Docked room detected at ${door.id.toUpperCase()} — transit coming soon.`
+            : 'No room docked at this port — heading back.',
+        );
+      },
+    });
   }
 
   isPlayerActive(): boolean {

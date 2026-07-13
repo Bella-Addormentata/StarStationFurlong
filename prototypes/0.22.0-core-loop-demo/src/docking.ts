@@ -10,6 +10,15 @@
  */
 
 import * as THREE from 'three';
+import { findDoor } from './doors';
+import type { DoorId } from './doors';
+
+/** Advance a scalar toward a target by at most maxStep, landing exactly. */
+function moveToward(current: number, target: number, maxStep: number): number {
+  const d = target - current;
+  if (Math.abs(d) <= maxStep) return target;
+  return current + Math.sign(d) * maxStep;
+}
 
 export interface DockingState {
   doorId: 'north' | 'south' | 'east' | 'west';
@@ -25,6 +34,12 @@ export class DoorDockingPortSystem {
   private doorState: Map<'north' | 'south' | 'east' | 'west', DockingState> = new Map();
   private doorObjects: Map<string, THREE.Group> = new Map();
   private adjacentRooms: Map<string, THREE.Mesh> = new Map();
+
+  // ── Update-loop-driven leaf slides ─────────────────────────────────────────
+  /** In-flight slide per door; a new open/close overwrites the entry. */
+  private slideAnims = new Map<DoorId, { openTarget: number; onComplete?: () => void }>();
+  /** Leaf slide speed (metres/second). */
+  private readonly SLIDE_SPEED = 2.2;
   
   // Handlers
   private onConnectionRequestCallback: ((doorId: string, address: string) => void) | null = null;
@@ -70,33 +85,128 @@ export class DoorDockingPortSystem {
       doorGroup.position.copy(cfg.pos);
       doorGroup.rotation.y = cfg.rotY;
 
-      // Frame width is determined by large vs small door grid specifications
-      const frameWidth = cfg.isLarge ? 3.0 : 2.0;
+      // Walkability comes from the door registry: the north port hides behind
+      // the fireplace, so it gets NO click box and NO isDoorBody tags —
+      // otherwise fireplace clicks would trigger it.
+      const walkable = findDoor(cfg.id)?.enabled === true;
+      const bodyData = { isDoorBody: true, doorId: cfg.id };
 
-      // 1. Frame Frame Geometries (sleek space-carbon look)
-      const frameGeo = new THREE.BoxGeometry(frameWidth, 3.5, 0.4);
-      const frameMat = new THREE.MeshStandardMaterial({ color: 0x111625, roughness: 0.8 });
-      const frame = new THREE.Mesh(frameGeo, frameMat);
-      doorGroup.add(frame);
+      // Local geometry conventions: group centre sits at world y=2, so the
+      // floor is local y=-2. Opening = 1.4w x 3.0h (small) / 2.4w x 3.0h (large).
+      const openingWidth = cfg.isLarge ? 2.4 : 1.4;
+      const OPEN_H = 3.0;      // opening height (local y -2 .. 1)
+      const POST_W = 0.3;      // side post width
+      const FRAME_D = 0.5;     // frame depth
+      const FLOOR_Y = -2;      // local floor level
 
-      // 2. Door Panels (moving metal blocks - matched to 1.0m small or 2.0m large doors)
-      const leafWidth = cfg.isLarge ? 1.2 : 0.7;
-      const leafGeo = new THREE.BoxGeometry(leafWidth, 3.2, 0.15);
-      const leafMat = new THREE.MeshStandardMaterial({ color: 0x1E88E5, metalness: 0.1, roughness: 0.5 });
-      
+      // ── 1. Frame: two grounded side posts + header (gunmetal) ──────────────
+      const frameMat = new THREE.MeshStandardMaterial({ color: 0x2A3444, roughness: 0.6, metalness: 0.35 });
+      const postGeo = new THREE.BoxGeometry(POST_W, OPEN_H, FRAME_D);
+      for (const side of [-1, 1]) {
+        const post = new THREE.Mesh(postGeo, frameMat);
+        post.position.set(side * (openingWidth / 2 + POST_W / 2), FLOOR_Y + OPEN_H / 2, 0);
+        if (walkable) post.userData = { ...bodyData };
+        doorGroup.add(post);
+      }
+      const header = new THREE.Mesh(
+        new THREE.BoxGeometry(openingWidth + POST_W * 2, 0.5, FRAME_D),
+        frameMat,
+      );
+      header.position.set(0, FLOOR_Y + OPEN_H + 0.25, 0);
+      if (walkable) header.userData = { ...bodyData };
+      doorGroup.add(header);
+
+      // ── 2. Emissive frame strips (status-tinted via syncLEDStatus) ─────────
+      const glowMat = new THREE.MeshBasicMaterial({ color: 0x00E5FF });
+      for (const side of [-1, 1]) {
+        const strip = new THREE.Mesh(new THREE.BoxGeometry(0.06, OPEN_H, 0.06), glowMat);
+        strip.position.set(side * (openingWidth / 2 + 0.03), FLOOR_Y + OPEN_H / 2, FRAME_D / 2);
+        strip.name = 'frameGlow';
+        doorGroup.add(strip);
+      }
+      const headerStrip = new THREE.Mesh(new THREE.BoxGeometry(openingWidth, 0.06, 0.06), glowMat);
+      headerStrip.position.set(0, FLOOR_Y + OPEN_H + 0.03, FRAME_D / 2);
+      headerStrip.name = 'frameGlow';
+      doorGroup.add(headerStrip);
+
+      // ── 3. Leaves as groups (slide code only touches .position.x) ──────────
+      const leafWidth = openingWidth / 2;
+      const steelMat   = new THREE.MeshStandardMaterial({ color: 0x37474F, roughness: 0.5, metalness: 0.55 });
+      const grooveMat  = new THREE.MeshStandardMaterial({ color: 0x1C262E, roughness: 0.85, metalness: 0.2 });
+      const slitMat    = new THREE.MeshBasicMaterial({ color: 0x9BE7FF });
+      const chevronMat = new THREE.MeshStandardMaterial({ color: 0xD4A84B, roughness: 0.4, metalness: 0.5 });
+      const kickMat    = new THREE.MeshStandardMaterial({ color: 0x10161D, roughness: 0.9, metalness: 0.1 });
+
+      const buildLeaf = (name: 'leftLeaf' | 'rightLeaf', closedOffset: number): THREE.Group => {
+        const leaf = new THREE.Group();
+        leaf.name = name;
+        // Grounded: panel spans local y -2 .. 1
+        leaf.position.set(closedOffset, FLOOR_Y + OPEN_H / 2, 0.05);
+        const inner = name === 'leftLeaf' ? 1 : -1; // toward the centre seam
+
+        // Base steel panel
+        const panel = new THREE.Mesh(new THREE.BoxGeometry(leafWidth, OPEN_H, 0.15), steelMat);
+        leaf.add(panel);
+
+        // Recessed groove strips
+        for (const gy of [1.05, 0.55, -0.65]) {
+          const groove = new THREE.Mesh(new THREE.BoxGeometry(leafWidth - 0.12, 0.05, 0.02), grooveMat);
+          groove.position.set(0, gy, 0.075);
+          leaf.add(groove);
+        }
+
+        // Vertical emissive window slit at the INNER edge — the closed door
+        // reads as a lit centre seam.
+        const slit = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.2, 0.03), slitMat);
+        slit.position.set(inner * (leafWidth / 2 - 0.07), 0, 0.08);
+        leaf.add(slit);
+
+        // Amber chevron plate, angled toward the seam
+        const chevron = new THREE.Mesh(new THREE.BoxGeometry(leafWidth * 0.55, 0.16, 0.02), chevronMat);
+        chevron.position.set(0, -1.0, 0.08);
+        chevron.rotation.z = inner * 0.5;
+        leaf.add(chevron);
+
+        // Dark kick plate near the bottom
+        const kick = new THREE.Mesh(new THREE.BoxGeometry(leafWidth, 0.35, 0.03), kickMat);
+        kick.position.set(0, -OPEN_H / 2 + 0.2, 0.08);
+        leaf.add(kick);
+
+        if (walkable) {
+          leaf.children.forEach((child) => { child.userData = { ...bodyData }; });
+        }
+        return leaf;
+      };
+
       const leftOffset = cfg.isLarge ? -0.62 : -0.37;
       const rightOffset = cfg.isLarge ? 0.62 : 0.37;
+      doorGroup.add(buildLeaf('leftLeaf', leftOffset));
+      doorGroup.add(buildLeaf('rightLeaf', rightOffset));
 
-      const leftLeaf = new THREE.Mesh(leafGeo, leafMat);
-      leftLeaf.position.set(leftOffset, 0, 0.05);
-      leftLeaf.name = 'leftLeaf';
-      
-      const rightLeaf = new THREE.Mesh(leafGeo, leafMat);
-      rightLeaf.position.set(rightOffset, 0, 0.05);
-      rightLeaf.name = 'rightLeaf';
+      // ── 4. Floor threshold plate + emissive guide strips ───────────────────
+      const threshold = new THREE.Mesh(
+        new THREE.BoxGeometry(openingWidth + 0.6, 0.04, 0.9),
+        new THREE.MeshStandardMaterial({ color: 0x232E3A, roughness: 0.7, metalness: 0.3 }),
+      );
+      threshold.position.set(0, -1.98, 0);
+      doorGroup.add(threshold);
+      for (const gz of [-0.35, 0.35]) {
+        const guide = new THREE.Mesh(new THREE.BoxGeometry(openingWidth + 0.5, 0.015, 0.05), glowMat);
+        guide.position.set(0, -1.95, gz);
+        guide.name = 'frameGlow';
+        doorGroup.add(guide);
+      }
 
-      doorGroup.add(leftLeaf);
-      doorGroup.add(rightLeaf);
+      // ── 5. Invisible click box covering the doorway (walkable doors only) ──
+      if (walkable) {
+        const clickBox = new THREE.Mesh(
+          new THREE.BoxGeometry(openingWidth + 0.6, 3.4, 0.5),
+          new THREE.MeshBasicMaterial({ visible: false }),
+        );
+        clickBox.position.set(0, -0.3, 0);
+        clickBox.userData = { ...bodyData };
+        doorGroup.add(clickBox);
+      }
 
       // We attach the isLarge metadata onto the group so our slider knows the correct target panning offsets
       doorGroup.userData = { isLarge: cfg.isLarge };
@@ -122,6 +232,10 @@ export class DoorDockingPortSystem {
 
       this.roomsGroup.add(doorGroup);
       this.doorObjects.set(cfg.id, doorGroup);
+
+      // Paint LED + frame glow from the door's initial state
+      const state = this.doorState.get(cfg.id);
+      if (state) this.syncLEDStatus(cfg.id, state);
     }
 
     this.mountInterfaceControlPanel();
@@ -221,7 +335,8 @@ export class DoorDockingPortSystem {
           lockBtn.style.background = state.locked ? '#ff1744' : '#00e676';
           lockBtn.style.color = state.locked ? '#fff' : '#01020a';
           this.syncLEDStatus(activeDoorId, state);
-          this.animateDoorSlides(activeDoorId, !state.locked);
+          if (state.locked) this.closeDoor(activeDoorId);
+          else this.openDoor(activeDoorId);
         }
       });
     }
@@ -316,24 +431,35 @@ export class DoorDockingPortSystem {
   }
 
   /**
-   * Sync Status LED spheres in 3D coordinates based on locks and pairing signals
+   * Sync Status LED spheres in 3D coordinates based on locks and pairing
+   * signals, and tint the emissive 'frameGlow' strips to match:
+   * pending amber, paired green, locked red, otherwise cyan.
    */
   private syncLEDStatus(doorId: 'north' | 'south' | 'east' | 'west', state: DockingState) {
     const group = this.doorObjects.get(doorId);
     if (!group) return;
 
+    let ledColor = 0x1E88E5;  // Blue (idle/unlocked)
+    let glowColor = 0x00E5FF; // Cyan (idle/unlocked)
+    if (state.pairingPending && !state.pairedSuccessfully) {
+      ledColor = 0xFFB300; glowColor = 0xFFB300;  // Yellow/Orange
+    } else if (state.pairedSuccessfully) {
+      ledColor = 0x00E676; glowColor = 0x00E676;  // Green
+    } else if (state.locked) {
+      ledColor = 0xFF1744; glowColor = 0xFF1744;  // Red
+    }
+
     const led = group.getObjectByName('ledStatus') as THREE.Mesh | undefined;
     if (led && led.material instanceof THREE.MeshBasicMaterial) {
-      if (state.pairingPending && !state.pairedSuccessfully) {
-        led.material.color.setHex(0xFFB300); // Yellow/Orange
-      } else if (state.pairedSuccessfully) {
-        led.material.color.setHex(0x00E676); // Green
-      } else if (state.locked) {
-        led.material.color.setHex(0xFF1744); // Red
-      } else {
-        led.material.color.setHex(0x1E88E5); // Blue
-      }
+      led.material.color.setHex(ledColor);
     }
+
+    group.traverse((child) => {
+      if (child.name === 'frameGlow') {
+        const mat = (child as THREE.Mesh).material;
+        if (mat instanceof THREE.MeshBasicMaterial) mat.color.setHex(glowColor);
+      }
+    });
   }
 
   /**
@@ -380,7 +506,7 @@ export class DoorDockingPortSystem {
       state.locked = false; // Open door on success
       this.syncLEDStatus(doorId, state);
       this.drawAdjacentRoomProjection(doorId);
-      this.animateDoorSlides(doorId, true);
+      this.openDoor(doorId);
     } else {
       state.connectedRoomAddress = '';
       this.syncLEDStatus(doorId, state);
@@ -392,27 +518,72 @@ export class DoorDockingPortSystem {
   }
 
   /**
-   * Slide door panels open/closed
+   * Request the door leaves to slide open. onComplete fires exactly once when
+   * both leaves reach the open position. A newer opposite-direction request
+   * on the same door overwrites the in-flight slide (its onComplete is
+   * dropped); a same-direction request chains the callbacks instead.
    */
-  private animateDoorSlides(doorId: 'north' | 'south' | 'east' | 'west', open: boolean) {
+  public openDoor(doorId: DoorId, onComplete?: () => void): void {
+    this.startSlide(doorId, true, onComplete);
+  }
+
+  /** Request the door leaves to slide closed. */
+  public closeDoor(doorId: DoorId, onComplete?: () => void): void {
+    this.startSlide(doorId, false, onComplete);
+  }
+
+  private startSlide(doorId: DoorId, open: boolean, onComplete?: () => void): void {
     const group = this.doorObjects.get(doorId);
-    if (!group) return;
+    if (!group) return; // no door built — the caller's timeout handles it
+    const isLarge = group.userData?.isLarge === true;
+    const openTarget = open ? (isLarge ? 1.8 : 1.05) : (isLarge ? 0.62 : 0.37);
 
-    const left = group.getObjectByName('leftLeaf') as THREE.Mesh | undefined;
-    const right = group.getObjectByName('rightLeaf') as THREE.Mesh | undefined;
-
-    if (left && right) {
-      const isLarge = group.userData?.isLarge === true;
-      const targetOffset = open ? (isLarge ? 1.45 : 0.85) : (isLarge ? 0.62 : 0.37);
-      let cur = 0;
-      const step = () => {
-        cur += 0.05;
-        left.position.x = THREE.MathUtils.lerp(left.position.x, -targetOffset, 0.15);
-        right.position.x = THREE.MathUtils.lerp(right.position.x, targetOffset, 0.15);
-        if (cur < 1.0) requestAnimationFrame(step);
-      };
-      step();
+    // Same-direction overwrite: chain the in-flight onComplete (old first) so
+    // an external open (keypad unlock, pairing accept) can't drop a waiting
+    // player's door-opened callback. Opposite-direction overwrites still drop
+    // the old callback — that completion will never be reached.
+    const prev = this.slideAnims.get(doorId);
+    if (prev && prev.openTarget === openTarget && prev.onComplete) {
+      const prevCb = prev.onComplete;
+      const nextCb = onComplete;
+      onComplete = nextCb ? () => { prevCb(); nextCb(); } : prevCb;
     }
+
+    this.slideAnims.set(doorId, { openTarget, onComplete });
+  }
+
+  /**
+   * Advance in-flight leaf slides. Driven from World.update — no detached
+   * requestAnimationFrame loops, so completion can be signalled reliably.
+   */
+  public update(deltaTime: number): void {
+    if (this.slideAnims.size === 0) return;
+    for (const [doorId, anim] of Array.from(this.slideAnims.entries())) {
+      const group = this.doorObjects.get(doorId);
+      const left = group?.getObjectByName('leftLeaf');
+      const right = group?.getObjectByName('rightLeaf');
+      if (!left || !right) {
+        this.slideAnims.delete(doorId);
+        continue;
+      }
+      const step = this.SLIDE_SPEED * deltaTime;
+      left.position.x  = moveToward(left.position.x,  -anim.openTarget, step);
+      right.position.x = moveToward(right.position.x,  anim.openTarget, step);
+      if (
+        Math.abs(left.position.x + anim.openTarget) < 0.01 &&
+        Math.abs(right.position.x - anim.openTarget) < 0.01
+      ) {
+        left.position.x  = -anim.openTarget;
+        right.position.x =  anim.openTarget;
+        this.slideAnims.delete(doorId);
+        if (anim.onComplete) anim.onComplete();
+      }
+    }
+  }
+
+  /** Read-only access to a door's docking state (doorState map is private). */
+  public getDockingState(doorId: DoorId): DockingState | null {
+    return this.doorState.get(doorId) ?? null;
   }
 
   /**
