@@ -9,6 +9,25 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { DoorDockingPortSystem } from './docking';
+import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from './voxelCharacter';
+
+/**
+ * A networked peer replica: a full fox rig plus interpolation state (issue #21
+ * — remote players render as the avatar character, not a red sphere).
+ */
+interface RemoteAvatar {
+  rig: VoxelCharacter;
+  /** Latest network position (lerp target). */
+  targetX: number;
+  targetZ: number;
+  /** Previous frame's rendered position — used for heading derivation. */
+  lastX: number;
+  lastZ: number;
+  /** Sender-reported moving flag (movement tick flags bit0). */
+  moving: boolean;
+  /** Last known 8-way facing (radians, π/4 steps). */
+  heading: number;
+}
 
 export class World {
   private scene: THREE.Scene;
@@ -1058,6 +1077,9 @@ export class World {
       this.player.update(deltaTime, inputManager);
     }
 
+    // Animate networked peer replicas (issue #21 — fox avatars, not spheres)
+    this.updateRemoteAvatars(deltaTime);
+
     // Float dust motes upward, reset at ceiling
     if (this.particlePositions && this.particleGeo) {
       const n = this.particlePositions.length / 3;
@@ -1077,41 +1099,125 @@ export class World {
     if (this.orbitRingInner) this.orbitRingInner.rotation.y -= 0.006;
   }
 
-  public remotePlayers: Map<string, THREE.Mesh> = new Map();
+  public remotePlayers: Map<string, RemoteAvatar> = new Map();
 
-  public updateRemotePlayer(id: string, x: number, z: number) {
-    let mesh = this.remotePlayers.get(id);
-    if (!mesh) {
-      console.log(`🤖 Spawning remote player node replica: ${id}`);
-      // Create a cute red/amber orbital sphere representing a remote clone peer (Task 3.2 red vs green form)
-      const geo = new THREE.SphereGeometry(0.8, 32, 32);
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0xff4433,
-        roughness: 0.8,
-        metalness: 0.1,
-        emissive: 0x330502,
-        emissiveIntensity: 0.3
+  /** Stable [0,1) hash of a peer id (FNV-1a) — drives the per-peer fur tint. */
+  private static peerHue01(id: string): number {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < id.length; i++) {
+      h ^= id.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0) / 0x100000000;
+  }
+
+  /**
+   * Recolor a freshly-built rig so each peer is visually distinct. Skips the
+   * shared OUTLINE_MAT (one instance serves every rig — recoloring it would
+   * repaint everyone's outlines) and dedupes materials, since one material is
+   * reused by many meshes within a rig and offsetHSL is cumulative.
+   */
+  private applyPeerTint(rig: VoxelCharacter, id: string): void {
+    const hueShift = World.peerHue01(id) * 0.9 - 0.45;
+    const seen = new Set<THREE.Material>();
+    rig.masterGroup.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (!mat || mat === OUTLINE_MAT || seen.has(mat)) continue;
+        seen.add(mat);
+        const colored = mat as THREE.MeshToonMaterial;
+        if (colored.color) colored.color.offsetHSL(hueShift, 0, 0);
+        // Toon materials carry a matching emissive tint — shift it too so the
+        // recolor holds up in dim light.
+        if (colored.emissive) colored.emissive.offsetHSL(hueShift, 0, 0);
+      }
+    });
+  }
+
+  public updateRemotePlayer(id: string, x: number, z: number, moving: boolean = false) {
+    const avatar = this.remotePlayers.get(id);
+    if (!avatar) {
+      console.log(`🤖 Spawning remote player fox avatar: ${id}`);
+      // Parent the rig to the same scene the local player's rig lives in
+      // (player.ts hands the raw scene to VoxelCharacter) so both share
+      // identical transforms. Floor-anchored at y=0, like the local player.
+      const rig = new VoxelCharacter(this.scene);
+      rig.masterGroup.position.set(x, 0, z);
+      this.applyPeerTint(rig, id);
+      this.remotePlayers.set(id, {
+        rig,
+        targetX: x, targetZ: z,
+        lastX: x, lastZ: z,
+        moving,
+        heading: 0,
       });
-      mesh = new THREE.Mesh(geo, mat);
-      mesh.position.set(x, 1.0, z);
-      this.platformGroup.add(mesh);
-      this.remotePlayers.set(id, mesh);
-    } else {
-      // Smoothly lerp towards position (Task 3.4 interpolation)
-      mesh.position.x = THREE.MathUtils.lerp(mesh.position.x, x, 0.28);
-      mesh.position.z = THREE.MathUtils.lerp(mesh.position.z, z, 0.28);
-      mesh.position.y = 1.0 + Math.sin(this.time * 2.2) * 0.015;
+      return;
+    }
+    // Store the network target; per-frame interpolation happens in
+    // updateRemoteAvatars (Task 3.4 interpolation, now frame-rate-safe).
+    avatar.targetX = x;
+    avatar.targetZ = z;
+    avatar.moving = moving;
+  }
+
+  /**
+   * Per-frame remote-avatar animation: lerp toward the network target, derive
+   * an 8-way heading from actual motion, and drive the walk/idle rig states.
+   */
+  private updateRemoteAvatars(deltaTime: number): void {
+    // Frame-rate-safe equivalent of the old fixed 0.28-per-frame lerp at 60fps.
+    const factor = 1 - Math.pow(1 - 0.28, deltaTime * 60);
+    for (const avatar of this.remotePlayers.values()) {
+      const pos = avatar.rig.masterGroup.position;
+      avatar.lastX = pos.x;
+      avatar.lastZ = pos.z;
+      pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
+      pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
+
+      // Robust moving detection: trust the sender's flag OR the fact that we
+      // are still visibly far from the target — animates even when the flag is
+      // unreliable, and settles to idle on arrival.
+      const remaining = Math.hypot(avatar.targetX - pos.x, avatar.targetZ - pos.z);
+      const moving = avatar.moving || remaining > 0.05;
+
+      const dx = pos.x - avatar.lastX;
+      const dz = pos.z - avatar.lastZ;
+      if (moving && Math.hypot(dx, dz) > 1e-4) {
+        avatar.heading = snapTo8Ways(Math.atan2(dx, dz));
+      }
+
+      avatar.rig.setState(moving ? 'walk' : 'idle', avatar.heading);
+      avatar.rig.update(); // exactly once per frame per rig (per-instance clock)
     }
   }
 
   /** Despawn a remote player replica (peer left / stopped ticking — issue #22). */
   public removeRemotePlayer(id: string) {
-    const mesh = this.remotePlayers.get(id);
-    if (!mesh) return;
-    console.log(`👋 Despawning remote player node replica: ${id}`);
-    this.platformGroup.remove(mesh);
-    mesh.geometry.dispose();
-    (mesh.material as THREE.Material).dispose();
+    const avatar = this.remotePlayers.get(id);
+    if (!avatar) return;
+    console.log(`👋 Despawning remote player fox avatar: ${id}`);
+    const root = avatar.rig.masterGroup;
+    root.parent?.remove(root);
+    // VoxelCharacter has no dispose(): free geometries/materials by hand.
+    // Dedupe (outline shells share their host's geometry; one material serves
+    // many meshes) and NEVER dispose the shared OUTLINE_MAT.
+    const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      if (mesh.geometry && !disposed.has(mesh.geometry)) {
+        disposed.add(mesh.geometry);
+        mesh.geometry.dispose();
+      }
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
+        disposed.add(mat);
+        mat.dispose();
+      }
+    });
     this.remotePlayers.delete(id);
   }
 
