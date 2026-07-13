@@ -1189,17 +1189,22 @@ async function init() {
   // iteration. No gameplay/network/docking wiring — cosmetic preview only.
   const vestibuleDoor = new URLSearchParams(location.search).get('vestibule');
   if (vestibuleDoor === 'north' || vestibuleDoor === 'south' || vestibuleDoor === 'east' || vestibuleDoor === 'west') {
-    const adapter = await import('./adapter');
-    const vestibule = adapter.buildVestibule(vestibuleDoor);
-    scene.add(vestibule);
-    (window as any).__vestibule = vestibule; // console handle for visual iteration
-    (window as any).__setVestibuleLightState = (s: 'idle' | 'cycling' | 'fault') =>
-      adapter.setVestibuleLightState(vestibule, s);
-    // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
-    setInterval(() => {
-      const zv = (window as any).multiScaleZoom;
-      vestibule.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
-    }, 250);
+    try {
+      const adapter = await import('./adapter');
+      const vestibule = adapter.buildVestibule(vestibuleDoor);
+      scene.add(vestibule);
+      (window as any).__vestibule = vestibule; // console handle for visual iteration
+      (window as any).__setVestibuleLightState = (s: 'idle' | 'cycling' | 'fault') =>
+        adapter.setVestibuleLightState(vestibule, s);
+      // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
+      setInterval(() => {
+        const zv = (window as any).multiScaleZoom;
+        vestibule.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
+      }, 250);
+    } catch (e) {
+      // A failed preview chunk load must never take the whole app down.
+      console.warn('vestibule preview failed to load:', e);
+    }
   }
 
   // Initialize input manager
