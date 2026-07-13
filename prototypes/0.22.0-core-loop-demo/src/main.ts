@@ -1261,6 +1261,25 @@ function onCanvasClick(event: MouseEvent): void {
     }
   }
 
+  // ── Door-body clicks → walk-through sequence (keypads keep priority) ──────
+  {
+    const doorBodies: THREE.Object3D[] = [];
+    scene.traverse((child) => {
+      if (child.userData && child.userData.isDoorBody) {
+        doorBodies.push(child);
+      }
+    });
+
+    const doorHits = raycaster.intersectObjects(doorBodies, false);
+    if (doorHits.length > 0) {
+      const doorId = doorHits[0].object.userData.doorId as string;
+      if (doorId) {
+        world.requestDoorWalkthrough(doorId);
+        return; // Halt floor-click routing
+      }
+    }
+  }
+
   const hits = raycaster.intersectObject(clickPlane, false);
 
   for (const hit of hits) {
