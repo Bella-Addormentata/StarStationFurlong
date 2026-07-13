@@ -430,7 +430,9 @@ export class MultiScaleZoomView {
             playerChar.mesh.traverse((child: any) => {
               if (child instanceof THREE.Mesh && child.material) {
                 child.material.transparent = true;
-                child.material.opacity = opacity;
+                // Scale by the material's design opacity (userData.baseOpacity,
+                // e.g. the outfit visor ships at 0.35) instead of clobbering it.
+                child.material.opacity = (child.material.userData.baseOpacity ?? 1) * opacity;
                 child.material.needsUpdate = true;
               }
             });
@@ -461,10 +463,11 @@ export class MultiScaleZoomView {
           const playerChar = (window as any).world?.getPlayer();
           if (playerChar && playerChar.mesh) {
             playerChar.mesh.visible = true;
-            // Fully restore opacity
+            // Restore each material's design opacity (1.0 unless it declares
+            // a userData.baseOpacity, like the translucent outfit visor).
             playerChar.mesh.traverse((child: any) => {
               if (child instanceof THREE.Mesh && child.material) {
-                child.material.opacity = 1.0;
+                child.material.opacity = child.material.userData.baseOpacity ?? 1;
                 child.material.needsUpdate = true;
               }
             });
