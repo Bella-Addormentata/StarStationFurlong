@@ -1,10 +1,15 @@
 /**
- * Seats — clickable sit targets derived from the lobby furniture.
+ * Seats — clickable sit targets DERIVED from the furniture registry
+ * (SeatTemplates on each FurnitureDef; see furniture.ts).
  *
  * Every seat defines:
  *  - clickBox   : world-space XZ box; a floor click inside it selects the seat
  *  - front      : the walkable stand-point at the front of the seat (outside
- *                 the inflated collision AABBs, so A* + collision can reach it)
+ *                 the inflated collision AABBs, so A* + collision can reach it).
+ *                 Computed: the template's preferred front offset is used
+ *                 exactly when its grid cell is walkable, otherwise the
+ *                 nearest walkable cell around the footprint is substituted
+ *                 (generalises the hand-tuned front-sofa side approaches).
  *  - sit        : where the avatar's root rests while seated (inside the
  *                 furniture footprint — reached by a scripted slide that
  *                 bypasses collision)
@@ -12,8 +17,13 @@
  *                 the backrest (atan2(nx, nz) convention: +z=0, +x=π/2,
  *                 -z=π, -x=-π/2)
  *
- * Geometry matches the furniture AABBs in obstacles.ts / world.ts.
+ * SEATS keeps its array identity: rebuildSeats() refills it in place, so it
+ * stays in sync after obstacle/grid rebuilds (call order: rebuildObstacles →
+ * rebakeWalkableGrid → rebuildSeats).
  */
+
+import { FURNITURE, buildSeatList } from './furniture';
+import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 
 export interface Seat {
   id: string;
@@ -23,62 +33,19 @@ export interface Seat {
   faceAngle: number;
 }
 
-const SEATS: Seat[] = [];
+export const SEATS: Seat[] = [];
 
-// ── Left-wall armchairs ×4 (backrest at the wall, facing +x) ─────────────────
-[-3.5, -1.5, 0.5, 2.5].forEach((z, i) => {
-  SEATS.push({
-    id: `armchair-left-${i}`,
-    clickBox: { x0: -5.00, z0: z - 0.5, x1: -4.00, z1: z + 0.5 },
-    front: { x: -3.50, z },
-    sit: { x: -4.50, z },
-    faceAngle: Math.PI / 2,
-  });
-});
+/** Re-derive SEATS from the furniture registry + current walkable grid. */
+export function rebuildSeats(): void {
+  SEATS.length = 0;
+  SEATS.push(...buildSeatList(FURNITURE, (x, z) => {
+    const row = worldToRow(z);
+    const col = worldToCol(x);
+    return row >= 0 && row < GRID_SIZE && col >= 0 && col < GRID_SIZE && walkable[row][col];
+  }));
+}
 
-// ── Right-wall armchairs ×4 (facing -x) ──────────────────────────────────────
-[-3.5, -1.5, 0.5, 2.5].forEach((z, i) => {
-  SEATS.push({
-    id: `armchair-right-${i}`,
-    clickBox: { x0: 4.00, z0: z - 0.5, x1: 5.00, z1: z + 0.5 },
-    front: { x: 3.50, z },
-    sit: { x: 4.50, z },
-    faceAngle: -Math.PI / 2,
-  });
-});
-
-// ── Back 3-seater sofa (z=-1.5, facing +z) ───────────────────────────────────
-(
-  [
-    { x: -1.0, x0: -1.50, x1: -0.50 },
-    { x: 0.0, x0: -0.50, x1: 0.50 },
-    { x: 1.0, x0: 0.50, x1: 1.50 },
-  ] as const
-).forEach((c, i) => {
-  SEATS.push({
-    id: `sofa-back-${i}`,
-    clickBox: { x0: c.x0, z0: -2.00, x1: c.x1, z1: -1.00 },
-    front: { x: c.x, z: -0.50 },
-    sit: { x: c.x, z: -1.50 },
-    faceAngle: 0,
-  });
-});
-
-// ── Front 3-seater sofa (z=+3.5, facing -z) ──────────────────────────────────
-SEATS.push({
-  id: 'sofa-front-left',
-  clickBox: { x0: -1.50, z0: 3.00, x1: 0.0, z1: 4.00 },
-  front: { x: -2.00, z: 3.50 },
-  sit: { x: -1.00, z: 3.50 },
-  faceAngle: Math.PI,
-});
-SEATS.push({
-  id: 'sofa-front-right',
-  clickBox: { x0: 0.0, z0: 3.00, x1: 1.50, z1: 4.00 },
-  front: { x: 2.00, z: 3.50 },
-  sit: { x: 1.00, z: 3.50 },
-  faceAngle: Math.PI,
-});
+rebuildSeats();
 
 /** Find the seat whose click box contains the world-space floor point. */
 export function findSeatAt(x: number, z: number): Seat | null {

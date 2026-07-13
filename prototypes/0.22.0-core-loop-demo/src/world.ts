@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt } from './seats';
+import { FURNITURE, buildItemGroup } from './furniture';
 import { DoorDockingPortSystem } from './docking';
 
 export class World {
@@ -34,6 +35,8 @@ export class World {
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
+  /** One group per furniture item, keyed by item id (selection/movement — E2+). */
+  public furnitureGroups: Map<string, THREE.Group> = new Map();
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -399,317 +402,27 @@ export class World {
    * All pieces start at opacity 0 and are stored in furnitureMeshes for morph fade-in.
    */
   private addLobbyFurniture() {
-    // ── Warm frontier colour palette ────────────────────────────────────────
-    const CREAM  = 0xFAF0E0; // warm linen white (sofa)
-    const LINEN  = 0xF5E8D2; // warm ivory (cushions)
-    const BEIGE  = 0xE8D8C4; // warm taupe (armrests)
-    const WOOD   = 0xC8924E; // honey golden wood
-    const DKWOOD = 0xF0F0F0; // white (bookshelves / cabinets)
-    const STONE  = 0xFFFFFF; // pure white (fireplace)
-    const TERRA  = 0xD87A48; // light terracotta (pots)
-    const PK1    = 0xFFB7C5; // cherry blossom light pink
-    const PK2    = 0xFF8FAB; // cherry blossom mid pink
-    const PK3    = 0xFFD6E0; // cherry blossom pale pink
-    const RUG_A  = 0xD4905E; // rug warm rust (lighter)
-    const RUG_B  = 0xBC7848; // rug border
-
-    const m = (color: number, rough = 0.72, metal = 0.06, em = 0x000000, emI = 0) =>
-      new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal, emissive: em, emissiveIntensity: emI, transparent: true, opacity: 0 });
-    const flat = (color: number) =>
-      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0 });
-
-    const place = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number, ry = 0): THREE.Mesh => {
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.set(x, y, z);
-      if (ry) mesh.rotation.y = ry;
-      this.platformGroup.add(mesh);
-      this.furnitureMeshes.push(mesh);
-      return mesh;
-    };
-
-    const addLight = (light: THREE.PointLight, x: number, y: number, z: number, targetIntensity: number) => {
-      light.position.set(x, y, z);
-      this.platformGroup.add(light);
-      this.furnitureLights.push({ light, targetIntensity });
-    };
-
-    // ── RUGS — back fireplace zone + front entrance lounge ────────────────────
-    place(new THREE.BoxGeometry(8.0, 0.018, 6.0), m(RUG_A,    0.98, 0.0), 0, 0.009, -2.0);
-    place(new THREE.BoxGeometry(7.6, 0.020, 5.6), m(RUG_B,    0.98, 0.0), 0, 0.011, -2.0);
-    place(new THREE.BoxGeometry(7.2, 0.022, 5.2), m(0xE8A878,  0.98, 0.0), 0, 0.013, -2.0);
-    place(new THREE.BoxGeometry(6.0, 0.018, 4.0), m(0xD4B090,  0.98, 0.0), 0, 0.009, +3.0);
-    place(new THREE.BoxGeometry(5.6, 0.020, 3.6), m(0xBC9878,  0.98, 0.0), 0, 0.011, +3.0);
-    place(new THREE.BoxGeometry(5.2, 0.022, 3.2), m(0xE0C8A8,  0.98, 0.0), 0, 0.013, +3.0);
-
-    // ── INTEGRATED FIREPLACE + BOOKCASE WALL ──────────────────────────────────
-    // Layout: [bookcase SW=2.90] [stone pillar PW=0.52] [opening FW=2.60] [pillar] [bookcase]
-    // Total unit ≈ 9.62 wide, centered at x=0, front face at z=FZ
-    const FZ   = -5.55;
-    const UH   = 2.65;  // body height
-    const UD   = 0.46;  // depth
-    const FW   = 2.60;  // opening interior width
-    const FH   = 1.82;  // opening interior height
-    const PW   = 0.52;  // stone pillar width
-    const SW   = 2.90;  // bookcase panel width each side
-    const BX   = FW / 2 + PW + SW / 2;        // bookcase centre x ≈ 3.27
-    const CW   = (BX + SW / 2) * 2 + 0.18;   // cornice full width ≈ 9.62
-    const MT   = UH + 0.26;                    // mantle shelf top surface y ≈ 2.91
-    const OMH  = UH - FH - 0.28;              // overmantel height ≈ 0.55
-
-    // Continuous base plinth
-    place(new THREE.BoxGeometry(CW, 0.13, UD + 0.14), m(0xF5F5F5, 0.82, 0.04), 0, 0.065, FZ);
-
-    // Left & right bookcase bodies
-    place(new THREE.BoxGeometry(SW, UH, UD), m(DKWOOD, 0.82, 0.04), -BX, UH / 2, FZ);
-    place(new THREE.BoxGeometry(SW, UH, UD), m(DKWOOD, 0.82, 0.04),  BX, UH / 2, FZ);
-
-    // White stone pillars flanking opening
-    place(new THREE.BoxGeometry(PW, UH, UD), m(STONE, 0.90, 0.04), -(FW / 2 + PW / 2), UH / 2, FZ);
-    place(new THREE.BoxGeometry(PW, UH, UD), m(STONE, 0.90, 0.04),  (FW / 2 + PW / 2), UH / 2, FZ);
-
-    // Hearth floor slab (slight forward projection)
-    place(new THREE.BoxGeometry(FW + 0.22, 0.07, UD + 0.14), m(STONE, 0.85, 0.05), 0, 0.035, FZ);
-
-    // Lintel above opening
-    place(new THREE.BoxGeometry(FW + PW * 2, 0.28, UD), m(STONE, 0.88, 0.05), 0, FH + 0.14, FZ);
-
-    // Overmantel infill (above lintel up to top)
-    place(new THREE.BoxGeometry(FW + PW * 2, OMH, UD), m(STONE, 0.92, 0.03), 0, FH + 0.28 + OMH / 2, FZ);
-
-    // Dark fireback (recessed, fire panels render in front)
-    place(new THREE.BoxGeometry(FW - 0.08, FH - 0.04, 0.06), m(0x190D04, 0.96, 0.04), 0, FH / 2, FZ - UD / 2 + 0.03);
-
-    // Fire layers — self-illuminated
-    place(new THREE.BoxGeometry(2.06, 1.06, 0.04), flat(0xFF3200), 0, 0.62, FZ - 0.02);
-    place(new THREE.BoxGeometry(1.52, 0.90, 0.04), flat(0xFF6600), 0, 0.71, FZ - 0.015);
-    place(new THREE.BoxGeometry(0.98, 0.70, 0.04), flat(0xFFAA00), 0, 0.83, FZ - 0.01);
-    place(new THREE.BoxGeometry(0.52, 0.48, 0.04), flat(0xFFE030), 0, 0.99, FZ - 0.005);
-    place(new THREE.BoxGeometry(0.24, 0.28, 0.04), flat(0xFFFBB0), 0, 1.14, FZ);
-
-    // Logs
-    place(new THREE.CylinderGeometry(0.10, 0.10, 2.1, 8), m(0x5A2812, 0.9, 0.04), 0,   0.14, FZ, Math.PI * 0.5);
-    place(new THREE.CylinderGeometry(0.08, 0.08, 1.8, 8), m(0x5A2812, 0.9, 0.04), 0.2, 0.22, FZ, Math.PI * 0.5 + 0.3);
-
-    // Top cornice (full span + overhang)
-    place(new THREE.BoxGeometry(CW, 0.16, UD + 0.22), m(0xF8F8F8, 0.78, 0.06), 0, UH + 0.08, FZ);
-
-    // Mantle shelf (projects forward slightly)
-    place(new THREE.BoxGeometry(CW, 0.10, UD + 0.28), m(WOOD, 0.50, 0.20), 0, UH + 0.21, FZ + 0.04);
-
-    // Bookcase shelf boards — 3 per side
-    const shelfW = SW - 0.06;
-    ([0.56, 1.20, 1.84] as number[]).forEach(ys => {
-      place(new THREE.BoxGeometry(shelfW, 0.04, UD - 0.06), m(0xE8E8E8, 0.72, 0.04), -BX, ys, FZ);
-      place(new THREE.BoxGeometry(shelfW, 0.04, UD - 0.06), m(0xE8E8E8, 0.72, 0.04),  BX, ys, FZ);
-    });
-
-    // Books on shelves
-    const wallBks1: [number, number][] = [[0xD09070,0.13],[0x6888A8,0.11],[0x78A868,0.12],[0xD0B048,0.11],[0x9068A0,0.10],[0xC05050,0.12],[0x5A90B8,0.11],[0xB07848,0.11]];
-    const wallBks2: [number, number][] = [[0x70A880,0.12],[0xC08048,0.11],[0x5880B0,0.13],[0xA8B068,0.11],[0xD07868,0.13],[0x8070A0,0.11],[0xC09050,0.12],[0x7090A8,0.10]];
-    const wallBks3: [number, number][] = [[0x9870B0,0.11],[0xD08858,0.12],[0x60A890,0.12],[0xB8A048,0.11],[0xA06070,0.13],[0x7888C0,0.12],[0x90B070,0.12]];
-    const placeWallBooks = (cx: number, shelfY: number, books: [number, number][], bookH: number) => {
-      let bo = cx - SW / 2 + 0.05;
-      books.forEach(([c, w]) => {
-        place(new THREE.BoxGeometry(w, bookH, 0.26), m(c, 0.80, 0.04), bo + w / 2, shelfY + bookH / 2 + 0.04, FZ + 0.01);
-        bo += w + 0.01;
+    // Data-driven: each FurnitureItem builds one THREE.Group at its origin
+    // (see furniture.ts). The group is positioned/rotated here, its meshes
+    // feed the existing morph fade-in + zoom-hide machinery unchanged, and
+    // its point lights carry their fade target in userData.targetIntensity.
+    for (const item of FURNITURE) {
+      const group = buildItemGroup(item);
+      this.platformGroup.add(group);
+      this.furnitureGroups.set(item.id, group);
+      group.traverse(obj => {
+        if (obj instanceof THREE.Mesh) {
+          this.furnitureMeshes.push(obj);
+        } else if (obj instanceof THREE.PointLight) {
+          this.furnitureLights.push({ light: obj, targetIntensity: (obj.userData.targetIntensity as number) ?? 0 });
+        }
       });
-    };
-    placeWallBooks(-BX, 0.56, wallBks1, 0.26); placeWallBooks( BX, 0.56, wallBks1, 0.28);
-    placeWallBooks(-BX, 1.20, wallBks2, 0.22); placeWallBooks( BX, 1.20, wallBks2, 0.24);
-    placeWallBooks(-BX, 1.84, wallBks3, 0.20); placeWallBooks( BX, 1.84, wallBks3, 0.22);
-
-    // Candles on mantle
-    place(new THREE.CylinderGeometry(0.050, 0.038, 0.34, 10), m(0xF8E8B0, 0.45, 0.10), -1.35, MT + 0.17, FZ + 0.10);
-    place(new THREE.CylinderGeometry(0.050, 0.038, 0.34, 10), m(0xF8E8B0, 0.45, 0.10),  1.35, MT + 0.17, FZ + 0.10);
-    place(new THREE.SphereGeometry(0.028, 8, 8), flat(0xFFEE88), -1.35, MT + 0.37, FZ + 0.10);
-    place(new THREE.SphereGeometry(0.028, 8, 8), flat(0xFFEE88),  1.35, MT + 0.37, FZ + 0.10);
-    // Mantle vase with cherry blossom
-    place(new THREE.CylinderGeometry(0.13, 0.09, 0.30, 14), m(0x90B8A8, 0.42, 0.38), 0, MT + 0.15, FZ + 0.10);
-    place(new THREE.SphereGeometry(0.09, 10, 10), m(PK1, 0.88, 0.02), 0, MT + 0.39, FZ + 0.08);
-    // Fire and candle lights
-    addLight(new THREE.PointLight(0xFF7A30, 0, 14),  0,    1.2,      FZ + 1.0, 2.8);
-    addLight(new THREE.PointLight(0xFFCC66, 0,  5), -1.35, MT + 0.50, FZ + 0.4, 0.6);
-    addLight(new THREE.PointLight(0xFFCC66, 0,  5),  1.35, MT + 0.50, FZ + 0.4, 0.6);
-
-    // ── SEATING HELPERS ───────────────────────────────────────────────────────
-    // Wall armchair — backDir: -1 backrest toward x=-6, +1 toward x=+6
-    const makeArmchair = (cx: number, cz: number, backDir: number) => {
-      place(new THREE.BoxGeometry(0.92, 0.24, 0.92), m(CREAM, 0.82, 0.05), cx,                  0.22, cz);
-      place(new THREE.BoxGeometry(0.22, 0.66, 0.92), m(CREAM, 0.82, 0.05), cx + backDir * 0.46, 0.71, cz);
-      place(new THREE.BoxGeometry(0.92, 0.46, 0.22), m(BEIGE, 0.78, 0.06), cx, 0.45, cz - 0.46);
-      place(new THREE.BoxGeometry(0.92, 0.46, 0.22), m(BEIGE, 0.78, 0.06), cx, 0.45, cz + 0.46);
-      place(new THREE.BoxGeometry(0.76, 0.13, 0.76), m(LINEN, 0.85, 0.04), cx,                  0.39, cz);
-      place(new THREE.BoxGeometry(0.13, 0.44, 0.76), m(LINEN, 0.85, 0.04), cx + backDir * 0.39, 0.64, cz);
-      ([[0.34, -0.35], [0.34, 0.35], [-0.34, -0.35], [-0.34, 0.35]] as [number, number][]).forEach(([dx, dz]) =>
-        place(new THREE.CylinderGeometry(0.038, 0.038, 0.15, 8), m(WOOD, 0.45, 0.25), cx + dx, 0.075, cz + dz));
-    };
-    // 3-seater sofa facing z — faceZ: -1 faces fireplace, +1 faces entrance
-    const makeSofa3 = (sx: number, sz: number, faceZ: number) => {
-      place(new THREE.BoxGeometry(2.4, 0.24, 0.96),  m(CREAM, 0.82, 0.05), sx, 0.22, sz);
-      place(new THREE.BoxGeometry(2.4, 0.66, 0.22),  m(CREAM, 0.82, 0.05), sx, 0.71, sz + faceZ * 0.46); // backrest
-      place(new THREE.BoxGeometry(0.24, 0.46, 0.96), m(BEIGE, 0.78, 0.06), sx - 1.2, 0.45, sz);
-      place(new THREE.BoxGeometry(0.24, 0.46, 0.96), m(BEIGE, 0.78, 0.06), sx + 1.2, 0.45, sz);
-      ([-0.74, 0, 0.74] as number[]).forEach(dx =>
-        place(new THREE.BoxGeometry(0.72, 0.13, 0.82), m(LINEN, 0.85, 0.04), sx + dx, 0.39, sz));
-      ([-0.74, 0, 0.74] as number[]).forEach(dx =>
-        place(new THREE.BoxGeometry(0.68, 0.44, 0.22), m(LINEN, 0.85, 0.04), sx + dx, 0.64, sz + faceZ * 0.39));
-      ([[1.06, 0.39], [1.06, -0.39], [-1.06, 0.39], [-1.06, -0.39]] as [number, number][]).forEach(([dx, dz]) =>
-        place(new THREE.CylinderGeometry(0.042, 0.042, 0.15, 8), m(WOOD, 0.45, 0.25), sx + dx, 0.075, sz + dz));
-    };
-
-    // ── LEFT WALL ARMCHAIRS (x=-4.5, facing +x) ──────────────────────
-    makeArmchair(-4.5, -3.5, -1);
-    makeArmchair(-4.5, -1.5, -1);
-    makeArmchair(-4.5,  0.5, -1);
-    makeArmchair(-4.5,  2.5, -1);
-
-    // ── RIGHT WALL ARMCHAIRS (x=+4.5, facing -x) ─────────────────────
-    makeArmchair( 4.5, -3.5,  1);
-    makeArmchair( 4.5, -1.5,  1);
-    makeArmchair( 4.5,  0.5,  1);
-    makeArmchair( 4.5,  2.5,  1);
-
-    // ── BACK FIREPLACE CONVERSATION GROUP — sofa + coffee table only ────────────
-    // 3-seater sofa back toward entrance, seat facing fireplace
-    makeSofa3(0, -1.5, -1);
-    // (flanking armchairs moved to side walls)
-    // Coffee table between sofa and fireplace: 2x1 tiles
-    place(new THREE.BoxGeometry(2.0, 0.06, 1.0), m(WOOD, 0.40, 0.22), 0, 0.37, -3.5);
-    ([[0.90, 0.38], [0.90, -0.38], [-0.90, 0.38], [-0.90, -0.38]] as [number, number][]).forEach(([lx, lz]) =>
-      place(new THREE.BoxGeometry(0.06, 0.32, 0.06), m(WOOD, 0.45, 0.20), lx, 0.16, lz - 3.5));
-    place(new THREE.CylinderGeometry(0.06, 0.048, 0.08, 12), m(TERRA, 0.85, 0.08), -0.40, 0.44, -3.5);
-    place(new THREE.SphereGeometry(0.09, 10, 10), m(PK1, 0.88, 0.02), -0.40, 0.56, -3.5);
-    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0xD09060, 0.8, 0.05),  0.35, 0.41, -3.5);
-    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0x6A9468, 0.8, 0.05),  0.35, 0.443, -3.5);
-
-    // ── FRONT ENTRANCE LOUNGE — sofa + coffee table only ─────────────────────
-    // 3-seater sofa
-    makeSofa3(0, 3.5, -1);
-    // Coffee table: 2x1 tiles
-    place(new THREE.BoxGeometry(2.0, 0.06, 1.0), m(WOOD, 0.40, 0.22), 0, 0.37, 1.5);
-    ([[0.90, 0.38], [0.90, -0.38], [-0.90, 0.38], [-0.90, -0.38]] as [number, number][]).forEach(([lx, lz]) =>
-      place(new THREE.BoxGeometry(0.06, 0.32, 0.06), m(WOOD, 0.45, 0.20), lx, 0.16, lz + 1.5));
-    place(new THREE.CylinderGeometry(0.05, 0.04, 0.07, 12), m(TERRA, 0.85, 0.08), -0.30, 0.44, 1.5);
-    place(new THREE.SphereGeometry(0.08, 10, 10), m(PK2, 0.88, 0.02), -0.30, 0.54, 1.5);
-    place(new THREE.BoxGeometry(0.18, 0.032, 0.12), m(0xA09060, 0.8, 0.05),  0.30, 0.41, 1.5);
-    place(new THREE.BoxGeometry(0.16, 0.032, 0.12), m(0x5A90A8, 0.8, 0.05),  0.30, 0.442, 1.5);
-
-    // ── LAMP TABLES — 4 total (back zone + front zone) ────────────────────────
-    const makeSideTable = (tx: number, tz: number) => {
-      place(new THREE.CylinderGeometry(0.28, 0.24, 0.048, 18), m(WOOD,   0.40, 0.22), tx, 0.54, tz);
-      place(new THREE.CylinderGeometry(0.038, 0.038, 0.50, 8), m(DKWOOD, 0.55, 0.18), tx, 0.27, tz);
-      place(new THREE.CylinderGeometry(0.17,  0.17,  0.04, 14),m(DKWOOD, 0.55, 0.18), tx, 0.02, tz);
-      place(new THREE.CylinderGeometry(0.055, 0.075, 0.20, 10),m(DKWOOD, 0.50, 0.20), tx, 0.72, tz);
-      place(new THREE.CylinderGeometry(0.18,  0.12,  0.28, 14),m(0xF8E8C0, 0.88, 0.02, 0xFFD080, 0.55), tx, 0.96, tz);
-    };
-    // Back zone lamp tables (1x1 corners)
-    makeSideTable(-4.5, -4.5);
-    makeSideTable( 4.5, -4.5);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7), -4.5, 1.1, -4.5, 1.0);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7),  4.5, 1.1, -4.5, 1.0);
-    // Front zone lamp tables (1x1 corners)
-    makeSideTable(-4.5, 3.5);
-    makeSideTable( 4.5, 3.5);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7), -4.5, 1.1, 3.5, 1.0);
-    addLight(new THREE.PointLight(0xFFD080, 0, 7),  4.5, 1.1, 3.5, 1.0);
-
-    // (Bookshelves merged into integrated fireplace wall above)
-
-    // ── TALL CHERRY BLOSSOM TREES (four corners) ─────────────────────────────
-    const makeTallPlant = (px: number, pz: number) => {
-      place(new THREE.CylinderGeometry(0.22, 0.17, 0.40, 14),   m(TERRA,    0.85, 0.07), px,        0.20, pz);
-      place(new THREE.CylinderGeometry(0.235, 0.225, 0.048, 14), m(0xC06840, 0.80, 0.05), px,       0.43, pz);
-      place(new THREE.CylinderGeometry(0.058, 0.082, 1.22, 8),   m(0x4A2A18, 0.85, 0.05), px,       1.04, pz);
-      place(new THREE.SphereGeometry(0.44, 12, 12), m(PK1, 0.88, 0.02), px,         1.88, pz);
-      place(new THREE.SphereGeometry(0.36, 12, 12), m(PK2, 0.86, 0.02), px - 0.34,  1.66, pz + 0.18);
-      place(new THREE.SphereGeometry(0.34, 12, 12), m(PK2, 0.86, 0.02), px + 0.34,  1.66, pz - 0.16);
-      place(new THREE.SphereGeometry(0.28, 12, 12), m(PK3, 0.84, 0.02), px - 0.12,  2.20, pz);
-      place(new THREE.SphereGeometry(0.22, 12, 12), m(PK1, 0.88, 0.02), px + 0.28,  2.00, pz + 0.20);
-    };
-    makeTallPlant(-5.0,  4.5);
-    makeTallPlant(-5.0,  3.0); // moved — bar occupies right-front corner
-    makeTallPlant(-4.9, -5.0);
-    makeTallPlant( 4.9, -5.0);
-
-    // ── SMALL CHERRY BLOSSOM ACCENTS on lamp tables ───────────────────────────
-    const makeRoundPlant = (px: number, py: number, pz: number) => {
-      place(new THREE.CylinderGeometry(0.11, 0.08, 0.17, 12), m(TERRA, 0.85, 0.07), px, py + 0.085, pz);
-      place(new THREE.SphereGeometry(0.16, 10, 10), m(PK1, 0.88, 0.02), px,        py + 0.27, pz);
-      place(new THREE.SphereGeometry(0.12, 10, 10), m(PK3, 0.84, 0.02), px + 0.10, py + 0.23, pz + 0.05);
-    };
-    makeRoundPlant(-4.3, 0.56, -4.7);
-    makeRoundPlant( 4.3, 0.56, -4.7);
-    makeRoundPlant(-3.8, 0.56, +3.2);
-    makeRoundPlant( 3.8, 0.56, +3.2);
-
-    // ── BAR CORNER (right-front, hugging x=+6 wall) ───────────────────────────────
-    const BAR_X = 5.24;  // bar body centre x (depth 0.58, back face at +5.53)
-    const BAR_Z = 3.10;  // bar centre z
-    const BAR_L = 2.80;  // bar length (z direction)  z range: 1.70 → 4.50
-    const BAR_H = 1.08;  // counter height
-
-    // Cabinet body
-    place(new THREE.BoxGeometry(0.58, BAR_H, BAR_L), m(DKWOOD, 0.78, 0.06), BAR_X, BAR_H / 2, BAR_Z);
-    // Counter top (white, slight overhang toward room)
-    place(new THREE.BoxGeometry(0.76, 0.072, BAR_L + 0.18), m(0xFAFAFA, 0.45, 0.14), BAR_X - 0.07, BAR_H + 0.036, BAR_Z);
-    // Counter edge trim
-    place(new THREE.BoxGeometry(0.76, 0.036, BAR_L + 0.18), m(WOOD, 0.40, 0.28), BAR_X - 0.07, BAR_H + 0.090, BAR_Z);
-    // Footrest rail (box)
-    place(new THREE.BoxGeometry(0.044, 0.038, BAR_L - 0.24), m(WOOD, 0.40, 0.30), BAR_X - 0.22, 0.25, BAR_Z);
-
-    // Back panel (flat against x=+6 wall)
-    place(new THREE.BoxGeometry(0.055, 1.88, BAR_L + 0.10), m(0xF5F5F5, 0.88, 0.02), 5.97, 0.94, BAR_Z);
-    // Three shelves on back wall
-    ([0.52, 1.00, 1.50] as number[]).forEach(sy =>
-      place(new THREE.BoxGeometry(0.28, 0.036, BAR_L + 0.04), m(0xE8E8E8, 0.72, 0.04), 5.84, sy, BAR_Z));
-
-    // Bottles (cylinder body + neck + cap)
-    const makeBottle = (bz: number, sy: number, col: number) => {
-      place(new THREE.CylinderGeometry(0.040, 0.048, 0.22, 8), m(col, 0.22, 0.58), 5.84, sy + 0.11, bz);
-      place(new THREE.CylinderGeometry(0.017, 0.028, 0.09, 8), m(col, 0.22, 0.58), 5.84, sy + 0.265, bz);
-      place(new THREE.SphereGeometry(0.020, 6, 6),              m(0x888888, 0.40, 0.40), 5.84, sy + 0.315, bz);
-    };
-    const BCOLS = [0x3A7840, 0xA83020, 0xE8C030, 0x284890, 0xD07020, 0x60A050, 0x8848A0];
-    const BOFFS = [-1.1, -0.55, 0, 0.55, 1.1];
-    BOFFS.forEach((dz, i) => makeBottle(BAR_Z + dz, 0.52, BCOLS[i % BCOLS.length]));
-    BOFFS.forEach((dz, i) => makeBottle(BAR_Z + dz, 1.00, BCOLS[(i + 2) % BCOLS.length]));
-    BOFFS.forEach((dz, i) => makeBottle(BAR_Z + dz, 1.50, BCOLS[(i + 4) % BCOLS.length]));
-
-    // Wine glasses on counter (very thin cylinder + stem + base)
-    const makeGlass = (gz: number) => {
-      place(new THREE.CylinderGeometry(0.042, 0.018, 0.15, 10), m(0xDDEEFF, 0.06, 0.12), BAR_X - 0.14, BAR_H + 0.147, gz);
-      place(new THREE.CylinderGeometry(0.006, 0.006, 0.10,  8), m(0xDDEEFF, 0.06, 0.12), BAR_X - 0.14, BAR_H + 0.297, gz);
-      place(new THREE.CylinderGeometry(0.028, 0.028, 0.012,10), m(0xDDEEFF, 0.06, 0.12), BAR_X - 0.14, BAR_H + 0.348, gz);
-    };
-    makeGlass(BAR_Z - 0.80);
-    makeGlass(BAR_Z - 0.10);
-    makeGlass(BAR_Z + 0.60);
-
-    // Bar stools (3, facing bar / +x)
-    const makeBarStool = (sz: number) => {
-      place(new THREE.CylinderGeometry(0.21, 0.21, 0.052, 14), m(CREAM, 0.82, 0.04), BAR_X - 0.64, 0.71,  sz); // seat pad
-      place(new THREE.CylinderGeometry(0.19, 0.19, 0.038, 14), m(LINEN, 0.85, 0.04), BAR_X - 0.64, 0.752, sz); // cushion
-      place(new THREE.CylinderGeometry(0.034, 0.034, 0.65, 8), m(WOOD,  0.45, 0.25), BAR_X - 0.64, 0.37,  sz); // stem
-      place(new THREE.CylinderGeometry(0.21, 0.21, 0.038, 14), m(WOOD,  0.45, 0.25), BAR_X - 0.64, 0.019, sz); // base
-      // footrest cross
-      place(new THREE.BoxGeometry(0.36, 0.028, 0.036), m(WOOD, 0.45, 0.25), BAR_X - 0.64, 0.35, sz);
-      place(new THREE.BoxGeometry(0.036, 0.028, 0.36), m(WOOD, 0.45, 0.25), BAR_X - 0.64, 0.35, sz);
-    };
-    makeBarStool(BAR_Z - 0.95);
-    makeBarStool(BAR_Z);
-    makeBarStool(BAR_Z + 0.95);
-
-    // Pendant light above bar
-    place(new THREE.CylinderGeometry(0.13, 0.09, 0.17, 12), m(0x282828, 0.70, 0.10), BAR_X - 0.45, 2.14, BAR_Z); // shade
-    addLight(new THREE.PointLight(0xFFE8A0, 0, 10), BAR_X - 0.45, 1.9, BAR_Z, 1.6);
-
-    // Small blossom pot at bar end
-    makeRoundPlant(BAR_X - 0.14, BAR_H + 0.072, BAR_Z - BAR_L / 2 + 0.22);
+    }
   }
 
   /**
    * Add atmosphere effects: pendant lights, holographic display,
-   * space-view windows, colored cushions, floating particles.
+   * space-view windows, floating particles.
    */
   private addAtmosphereEffects() {
     const m = (color: number, rough = 0.72, metal = 0.06, em = 0x000000, emI = 0) =>
@@ -776,14 +489,7 @@ export class World {
       // Right wall removed — no paintings or frames on that side
     });
 
-    // ── COLORED THROW CUSHIONS ────────────────────────────────────────────────
-    const cushGeo = new THREE.BoxGeometry(0.60, 0.09, 0.60);
-    // Back sofa (z=-1.5)
-    [ [-0.72, 0xC04060], [0, 0x3870C8], [0.72, 0xD89030] ].forEach(([dx, col]) =>
-      place(cushGeo.clone(), m(col as number, 0.82, 0.02), dx as number, 0.47, -1.5));
-    // Front sofa (z=+3.2)
-    [ [-0.72, 0x50A870], [0, 0xC04060], [0.72, 0x3870C8] ].forEach(([dx, col]) =>
-      place(cushGeo.clone(), m(col as number, 0.82, 0.02), dx as number, 0.47, +3.2));
+    // (Coloured throw cushions moved into the sofa builders — furniture.ts.)
 
     // ── AMBIENT WALL LIGHT STRIPS — glowing accents at ceiling edge ───────────
     // Thin emissive strips along the top of each side wall (z axis, y=3.9)
