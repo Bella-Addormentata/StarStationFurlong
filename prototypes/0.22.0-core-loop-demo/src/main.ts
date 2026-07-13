@@ -1312,7 +1312,9 @@ async function init() {
   };
   (window as any).__setOutfit = applyOutfitById; // debug handle (permanent)
   const savedOutfitId = loadSavedOutfitId();
-  if (savedOutfitId && savedOutfitId !== 'default') applyOutfitById(savedOutfitId);
+  if (savedOutfitId && savedOutfitId !== 'default' && !applyOutfitById(savedOutfitId)) {
+    saveOutfitId('default'); // self-heal a stale/unknown saved id — warn once, not every boot
+  }
 
   // ── Dev-only preview flag (PR-A of #30): `?vestibule=<north|south|east|west>`
   // renders the docking-adapter vestibule outside that door for visual

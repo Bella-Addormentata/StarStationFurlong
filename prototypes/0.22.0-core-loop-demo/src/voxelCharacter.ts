@@ -1098,6 +1098,11 @@ export class VoxelCharacter {
       side: THREE.DoubleSide,
       depthWrite: false,
     });
+    // Design-opacity marker: zoom.ts's first-person avatar fade scales
+    // per-material opacity by (1 − ratio) and restores to this value rather
+    // than a blanket 1.0 — without it, one first-person round trip would
+    // leave the translucent visor a fully opaque cyan slab.
+    visorMat.userData.baseOpacity = 0.35;
     // Open cylinder segment centered on +Z (thetaStart −0.45π..+0.45π), a
     // hair wider than the skull so it floats just off the fur.
     const bandGeo = new THREE.CylinderGeometry(
