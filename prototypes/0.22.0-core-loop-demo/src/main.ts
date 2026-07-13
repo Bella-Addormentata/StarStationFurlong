@@ -1320,6 +1320,44 @@ async function init() {
     }
   }
 
+  // ── Dev-only preview flag (PR-P of #33/#35): `?deviceprops=1` renders the
+  // storage-trunk + wall-computer props for visual iteration. Cosmetic only —
+  // no gameplay/network/focus wiring. try/catch: a failed preview chunk must
+  // never take init() down (same guard as the ?vestibule= hunk, PR #34).
+  if (new URLSearchParams(location.search).get('deviceprops') === '1') {
+    try {
+      const props = await import('./deviceProps');
+      const trunk = props.buildStorageTrunk();
+      trunk.group.position.set(-2.5, 0, -4.6);        // north-wall flank, clear of OBSTACLES
+      scene.add(trunk.group);
+      const wallComputer = props.buildWallComputer();
+      wallComputer.group.position.set(1.8, 1.6, 5.8); // south interior wall, beside the door
+      wallComputer.group.rotation.y = Math.PI;        // screen faces -z (into the room)
+      scene.add(wallComputer.group);
+      (window as any).__trunk = trunk;                // console handles for iteration
+      (window as any).__wallComputer = wallComputer;
+      setInterval(() => trunk.update(0.033), 33);     // drives the lid ease (dev-cheap)
+      const refreshStatus = () => {
+        const roomName = (document.getElementById('room-name') ??
+          document.getElementById('room-name-display'))?.textContent?.trim() || 'FURLONG LOBBY';
+        const peers = parseInt(document.getElementById('net-peers-seen')?.textContent ?? '', 10) || 0;
+        const nodeOnline = (document.getElementById('node-status')?.textContent ?? '').includes('ONLINE');
+        wallComputer.updateStatus({ roomName, peers, nodeOnline });
+        // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
+        const zv = (window as any).multiScaleZoom;
+        const interior = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
+        trunk.group.visible = interior;
+        wallComputer.group.visible = interior;
+      };
+      refreshStatus();
+      setInterval(refreshStatus, 1000);
+    } catch (e) {
+      // A failed preview chunk load must never take the whole app down.
+      console.warn('deviceprops preview failed to load:', e);
+
+    }
+  }
+
   // Initialize input manager
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
