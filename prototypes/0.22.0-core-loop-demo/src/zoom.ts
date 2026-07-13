@@ -266,6 +266,13 @@ export class MultiScaleZoomView {
         return;
       }
 
+      // Suppress zoom hotkeys while the SpacePhone is open (#20 shell views
+      // like home/contacts/bank hold no focused input, so the guard above no
+      // longer covers the phone-open case on its own).
+      if (document.getElementById('spacephone-container')?.classList.contains('active')) {
+        return;
+      }
+
       if (e.key === '-' || e.key === 'Subtract') {
         this.zoomOut();
       } else if (e.key === '+' || e.key === '=' || e.key === 'Add') {

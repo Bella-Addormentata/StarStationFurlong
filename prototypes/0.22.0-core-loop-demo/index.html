@@ -191,20 +191,62 @@
         </div>
 
         <div id="phone-app-header">
-          <div style="font-size: 13px; font-weight: 800; color: #1e88e5; letter-spacing: 0.5px;">👨‍🚀 CLONE CHAT</div>
-          <div style="font-size: 9px; color: rgba(224, 226, 238, 0.4); text-transform: uppercase;">Room: Furlong Lobby</div>
+          <button id="phone-back-btn" type="button" aria-label="Back to home screen" title="Back to home screen">‹</button>
+          <div style="flex: 1; min-width: 0;">
+            <div id="phone-app-title" style="font-size: 13px; font-weight: 800; color: #1e88e5; letter-spacing: 0.5px;">📱 HOME</div>
+            <div id="phone-app-subtitle" style="font-size: 9px; color: rgba(224, 226, 238, 0.4); text-transform: uppercase;">FurlongOS · Select App</div>
+          </div>
         </div>
 
-        <!-- Scrollable Messages Container -->
-        <div id="chat-messages-container">
-          <div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>
+        <!-- 🏠 Home screen: app launcher grid (issue #20 S1 shell) -->
+        <div id="phone-home-screen" class="phone-app-view active">
+          <div id="phone-app-grid">
+            <button type="button" class="phone-app-tile" data-phone-app="chat" aria-label="Open Clone Chat app">
+              <span class="phone-app-tile-icon">💬</span>
+              <span class="phone-app-tile-label">CHAT</span>
+            </button>
+            <button type="button" class="phone-app-tile" data-phone-app="contacts" aria-label="Open Contacts app">
+              <span class="phone-app-tile-icon">👥</span>
+              <span class="phone-app-tile-label">CONTACTS</span>
+            </button>
+            <button type="button" class="phone-app-tile" data-phone-app="bank" aria-label="Open Bank app">
+              <span class="phone-app-tile-icon">🏦</span>
+              <span class="phone-app-tile-label">BANK</span>
+            </button>
+          </div>
         </div>
 
-        <!-- Chat Input Form field -->
-        <form id="chat-form" onsubmit="return false;" style="display: flex; gap: 8px; padding: 10px; border-top: 1px solid rgba(212, 168, 75, 0.12); background: rgba(5, 7, 18, 0.95);">
-          <input type="text" id="chat-input" placeholder="Broadcast to room..." autocomplete="off">
-          <button type="submit" id="chat-send-btn">SEND</button>
-        </form>
+        <!-- 💬 Chat app view (existing chat DOM — ids preserved, do not rename) -->
+        <div id="phone-app-chat" class="phone-app-view">
+          <!-- Scrollable Messages Container -->
+          <div id="chat-messages-container">
+            <div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>
+          </div>
+
+          <!-- Chat Input Form field -->
+          <form id="chat-form" onsubmit="return false;" style="display: flex; gap: 8px; padding: 10px; border-top: 1px solid rgba(212, 168, 75, 0.12); background: rgba(5, 7, 18, 0.95);">
+            <input type="text" id="chat-input" placeholder="Broadcast to room..." autocomplete="off">
+            <button type="submit" id="chat-send-btn">SEND</button>
+          </form>
+        </div>
+
+        <!-- 👥 Contacts app view — placeholder until S4 lands -->
+        <div id="phone-app-contacts" class="phone-app-view">
+          <div class="phone-no-signal">
+            <div class="phone-no-signal-glyph">▚▚ NO SIGNAL ▚▚</div>
+            <div class="phone-no-signal-text">CONTACTS app not yet provisioned</div>
+            <div class="phone-no-signal-sub">FurlongNet OTA update pending…</div>
+          </div>
+        </div>
+
+        <!-- 🏦 Bank app view — placeholder until S6 lands -->
+        <div id="phone-app-bank" class="phone-app-view">
+          <div class="phone-no-signal">
+            <div class="phone-no-signal-glyph">▚▚ NO SIGNAL ▚▚</div>
+            <div class="phone-no-signal-text">BANK app not yet provisioned</div>
+            <div class="phone-no-signal-sub">FurlongNet OTA update pending…</div>
+          </div>
+        </div>
       </div>
     </div>
     
