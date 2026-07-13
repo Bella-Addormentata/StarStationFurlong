@@ -210,3 +210,36 @@ export function unpackTick(buf: Uint8Array): MovementTick {
     seq: dv.getUint16(11, true),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Addressed movement tick — 0.23.0 wire, node→browser leg (issue #22).
+//
+// The browser still SENDS the bare 13-byte tick (it has no global identity);
+// the local node knows who each lane belongs to and prefixes every tick it
+// DELIVERS with an 8-byte sender lane id:
+//   [0..8)   sender lane id — blake3(node id ‖ tab addr) truncated to 8 bytes
+//   [8..21)  the 13-byte movement tick above
+// Before this, receivers fabricated peer identity from the tick's own wrapping
+// seq counter (`peer-${seq % 4}`), so every remote player aliased into the
+// same four render slots and a 3rd joiner "captured" the 2nd player's avatar.
+// ---------------------------------------------------------------------------
+
+export const SENDER_ID_BYTES = 8;
+export const ADDRESSED_TICK_BYTES = SENDER_ID_BYTES + TICK_BYTES; // 21
+
+export interface AddressedTick {
+  /** Lowercase hex of the 8-byte sender lane id — stable per tab session. */
+  senderId: string;
+  tick: MovementTick;
+}
+
+export function unpackAddressedTick(buf: Uint8Array): AddressedTick {
+  if (buf.byteLength < ADDRESSED_TICK_BYTES) {
+    throw new RangeError(`addressed movement tick must be ${ADDRESSED_TICK_BYTES} bytes, got ${buf.byteLength}`);
+  }
+  let senderId = '';
+  for (let i = 0; i < SENDER_ID_BYTES; i++) {
+    senderId += buf[i].toString(16).padStart(2, '0');
+  }
+  return { senderId, tick: unpackTick(buf.subarray(SENDER_ID_BYTES)) };
+}

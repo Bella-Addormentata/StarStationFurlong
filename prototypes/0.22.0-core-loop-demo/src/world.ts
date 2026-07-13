@@ -1104,6 +1104,24 @@ export class World {
     }
   }
 
+  /** Despawn a remote player replica (peer left / stopped ticking — issue #22). */
+  public removeRemotePlayer(id: string) {
+    const mesh = this.remotePlayers.get(id);
+    if (!mesh) return;
+    console.log(`👋 Despawning remote player node replica: ${id}`);
+    this.platformGroup.remove(mesh);
+    mesh.geometry.dispose();
+    (mesh.material as THREE.Material).dispose();
+    this.remotePlayers.delete(id);
+  }
+
+  /** Despawn every remote player replica (room re-bootstrap). */
+  public clearRemotePlayers() {
+    for (const id of [...this.remotePlayers.keys()]) {
+      this.removeRemotePlayer(id);
+    }
+  }
+
   public getPlayer(): Player {
     return this.player;
   }

@@ -134,6 +134,16 @@ pub async fn run_wt_listener(
 async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()> {
     let remote_addr = connection.remote_address();
     let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // 0.23.0 tick identity (issue #22): tag every tick this tab originates with
+    // an 8-byte lane id so sibling tabs key remote players correctly. This
+    // fallback listener is loopback-only, so the tab address alone is unique.
+    let tab_lane_id: [u8; 8] = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(remote_addr.to_string().as_bytes());
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+        id
+    };
 
     loop {
         tokio::select! {
@@ -141,14 +151,18 @@ async fn handle_connection(hub: SharedHub, connection: Connection) -> Result<()>
             dg = connection.receive_datagram() => {
                 let datagram = dg?;
                 if datagram.len() == 13 {
-                    // This is a raw movement tick. Broadcast directly to all other peers in the room.
+                    // This is a raw movement tick. Broadcast [8B sender lane id][13B tick]
+                    // (0.23.0 wire) directly to all other peers in the room.
                     let room_id_snapshot = chosen_room.lock().unwrap().clone();
                     if let Some(ref room_id) = room_id_snapshot {
                         let rooms = hub.rooms.lock().unwrap();
                         if let Some(room) = rooms.get(room_id) {
+                            let mut addressed = Vec::with_capacity(8 + datagram.len());
+                            addressed.extend_from_slice(&tab_lane_id);
+                            addressed.extend_from_slice(&datagram);
                             for (&addr, peer_conn) in &room.connections {
                                 if addr != remote_addr {
-                                    let _ = peer_conn.send_datagram(&*datagram);
+                                    let _ = peer_conn.send_datagram(&addressed[..]);
                                 }
                             }
                         }

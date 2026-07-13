@@ -110,6 +110,19 @@ fn envelope_seen_key(origin_node_id: &str, seq: u32, payload: &[u8]) -> [u8; 16]
     key
 }
 
+/// 8-byte tick-lane sender id (0.23.0 wire, issue #22): blake3 over the given
+/// identity parts, truncated. Tags every movement tick the node delivers so
+/// browsers can key remote players by real sender instead of fabricating ids.
+fn tick_lane_id(parts: &[&[u8]]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    id
+}
+
 pub type SharedHub = Arc<HubState>;
 
 pub fn compute_fingerprint(
@@ -517,6 +530,10 @@ async fn handle_wt_connection(
 ) -> Result<()> {
     let remote_addr = connection.remote_address();
     let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // 0.23.0 tick identity (issue #22): every movement tick this tab originates
+    // is tagged with an 8-byte lane id (node id ‖ tab addr) so receiving
+    // browsers key remote players correctly instead of aliasing them.
+    let tab_lane_id = tick_lane_id(&[iroh_ep.id().as_bytes(), remote_addr.to_string().as_bytes()]);
 
     loop {
         tokio::select! {
@@ -528,18 +545,23 @@ async fn handle_wt_connection(
                     if let Some(ref room_id) = room_id_snapshot {
                         let rooms = hub.rooms.lock().unwrap();
                         if let Some(room) = rooms.get(room_id) {
-                            // Local clients
+                            // Local clients get [8B sender lane id][13B tick] (0.23.0 wire)
+                            let mut addressed = Vec::with_capacity(8 + datagram.len());
+                            addressed.extend_from_slice(&tab_lane_id);
+                            addressed.extend_from_slice(&datagram);
                             for (&addr, peer_conn) in &room.local_connections {
                                 if addr != remote_addr {
-                                    let _ = peer_conn.send_datagram(&*datagram);
+                                    let _ = peer_conn.send_datagram(&addressed[..]);
                                 }
                             }
                             // Forward movement datagram ticks to remote Iroh peers! (v006 §8.1)
-                            // 0.18.0 wire: node→node ticks carry a leading hop byte (0 = origin
-                            // node) so relaying nodes can forward once without echo loops.
+                            // 0.23.0 wire: node→node ticks carry [hop][8B origin lane id][13B tick]
+                            // (hop 0 = origin node) so relaying nodes can forward once without
+                            // echo loops and the real sender identity survives the hop.
                             for (_, iroh_conn) in &room.remote_peers {
-                                let mut relayed = Vec::with_capacity(1 + datagram.len());
+                                let mut relayed = Vec::with_capacity(1 + 8 + datagram.len());
                                 relayed.push(0u8);
+                                relayed.extend_from_slice(&tab_lane_id);
                                 relayed.extend_from_slice(&datagram);
                                 let _ = iroh_conn.send_datagram(relayed.into());
                             }
@@ -786,29 +808,41 @@ fn handle_iroh_connection(
             // Unreliable Datagram lane routing incoming ticks directly to browser WebTransport
             dg = connection.read_datagram() => {
                 let datagram = dg?;
-                // 14B = 0.18.0 hop-flagged node→node tick; 13B = legacy 0.17.0 peer tick.
-                let (tick, hop) = if datagram.len() == 14 {
-                    (&datagram[1..], Some(datagram[0]))
+                // 22B = 0.23.0 node→node tick [hop][8B origin lane id][13B tick];
+                // 14B = 0.18.0–0.22.0 hop-flagged tick (no sender id);
+                // 13B = legacy 0.17.0 peer tick.
+                // Legacy ticks get a lane id synthesized from the sending node's key —
+                // per-node rather than per-tab identity, but never aliased across nodes.
+                let (tick, hop, origin_lane_id): (&[u8], Option<u8>, [u8; 8]) = if datagram.len() == 22 {
+                    (&datagram[9..], Some(datagram[0]), datagram[1..9].try_into().unwrap())
+                } else if datagram.len() == 14 {
+                    (&datagram[1..], Some(datagram[0]), tick_lane_id(&[remote_id.as_bytes()]))
                 } else if datagram.len() == 13 {
-                    (&datagram[..], None)
+                    (&datagram[..], None, tick_lane_id(&[remote_id.as_bytes()]))
                 } else {
-                    (&datagram[..0], None)
+                    (&datagram[..0], None, [0u8; 8])
                 };
                 if tick.len() == 13 {
                     let room_id_snapshot = chosen_room.lock().unwrap().clone();
                     if let Some(ref room_id) = room_id_snapshot {
                         let rooms = hub.rooms.lock().unwrap();
                         if let Some(room) = rooms.get(room_id) {
-                            // Down to local browser tabs (always 13B on that leg)
+                            // Down to local browser tabs as [8B origin lane id][13B tick]
+                            let mut addressed = Vec::with_capacity(8 + tick.len());
+                            addressed.extend_from_slice(&origin_lane_id);
+                            addressed.extend_from_slice(tick);
                             for (_, wt_conn) in &room.local_connections {
-                                let _ = wt_conn.send_datagram(tick);
+                                let _ = wt_conn.send_datagram(&addressed[..]);
                             }
                             // 🌐 Hub relay (0.18.0): first-hop ticks fan out ONCE to the
                             // room's other remote peers so spokes see each other through
                             // a reachable member. hop=1 ticks are never re-relayed.
+                            // 0.23.0: the origin lane id rides along so identity survives
+                            // the hop (legacy hop=0 ticks relay with the synthesized id).
                             if hop == Some(0) {
-                                let mut relayed = Vec::with_capacity(14);
+                                let mut relayed = Vec::with_capacity(1 + 8 + tick.len());
                                 relayed.push(1u8);
+                                relayed.extend_from_slice(&origin_lane_id);
                                 relayed.extend_from_slice(tick);
                                 for (peer_id, iroh_conn) in &room.remote_peers {
                                     if *peer_id != remote_id {
