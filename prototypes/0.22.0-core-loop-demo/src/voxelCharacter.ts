@@ -41,12 +41,23 @@ interface PoseState {
   armRotX: number | null;
 }
 
+// Standing rootY math (issue #21 — feet below floor): torso.y ends up at
+// rootY − 0.15, leg pivots hang at torso − 0.30, and the lowest foot-pad
+// geometry extends −0.7328 below the leg pivot. At rootY 1.0 the pads sank to
+// world y ≈ −0.18; rootY 1.18 puts the pad bottoms at ≈ −0.003 (flush with the
+// y=0 floor). Walk bounce is strictly upward, so no transient dip re-appears.
 const STATES: Record<CharacterState, PoseState> = {
-  idle:       { rootY: 1.0,  legRotX: 0,             armRotX: 0             },
-  walk:       { rootY: 1.0,  legRotX: null,          armRotX: null          },
+  idle:       { rootY: 1.18, legRotX: 0,             armRotX: 0             },
+  walk:       { rootY: 1.18, legRotX: null,          armRotX: null          },
   sit_chair:  { rootY: 0.5,  legRotX: -Math.PI / 2,  armRotX: -Math.PI / 6  },
   sit_ground: { rootY: -0.2, legRotX: -Math.PI / 2,  armRotX: 0             },
 };
+
+/** Snap a continuous angle to the nearest of 8 compass directions (π/4 steps). */
+export function snapTo8Ways(angle: number): number {
+  const PI_4 = Math.PI / 4;
+  return Math.round(angle / PI_4) * PI_4;
+}
 
 // Fox palette — warm rich orange body, bright white underside, dark socks.
 const PAL = {
@@ -101,8 +112,10 @@ function bmat(hex: number): THREE.MeshBasicMaterial {
   return new THREE.MeshBasicMaterial({ color: hex });
 }
 
-// Shared outline material — one instance shared across every outline shell.
-const OUTLINE_MAT = new THREE.MeshBasicMaterial({
+// Shared outline material — ONE instance shared across every outline shell of
+// EVERY VoxelCharacter instance. Exported so despawn/tint code can skip it:
+// disposing or recoloring it would break all rigs at once.
+export const OUTLINE_MAT = new THREE.MeshBasicMaterial({
   color: PAL.outline,
   side: THREE.BackSide,
 });
@@ -197,7 +210,7 @@ export class VoxelCharacter {
     // cycle / seat animations still land right, but the visual meshes attached
     // to each joint are re-sized so the head visually dominates and the limbs
     // read as short stubs.
-    this.torso.position.y = 0.85;             // lower body so head sits at play height
+    this.torso.position.y = 1.03;             // idle rootY (1.18) − 0.15 chibi offset — feet flush at spawn
     this.head.position.y  = 0.55;             // head neck-point above torso — huge head above this
     this.leftArm.position.set(-0.5,  0.32, 0);// shoulders — pulled inward
     this.rightArm.position.set( 0.5,  0.32, 0);
@@ -827,9 +840,7 @@ export class VoxelCharacter {
     // ── 3. 8-way decoupled snapping ───────────────────────────────────────────
     this.masterGroup.rotation.y = this.logicalRotation;
     this.visualGroup.rotation.y = -this.logicalRotation;
-    const PI_4         = Math.PI / 4;
-    const snappedAngle = Math.round(this.logicalRotation / PI_4) * PI_4;
-    this.visualGroup.rotation.y += snappedAngle;
+    this.visualGroup.rotation.y += snapTo8Ways(this.logicalRotation);
   }
 
   private _updateFaceRig(blink: number, smile: number): void {

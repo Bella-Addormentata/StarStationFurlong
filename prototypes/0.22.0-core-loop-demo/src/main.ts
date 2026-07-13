@@ -369,7 +369,7 @@ async function bootstrapNetworking() {
         seenPeers.add(peerId);
         receivedTicks++;
         remoteLastSeen.set(peerId, performance.now());
-        world.updateRemotePlayer(peerId, tick.x, tick.z);
+        world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1);
       } catch (e) {
         console.warn('Error unpacking incoming remote peer datagram tick:', e);
       }
