@@ -1,5 +1,5 @@
 # StarStationFurlong
-Decentalized hangout game.
+Decentralized hangout game.
 
 Inspired by:
 * Habbo Hotel
