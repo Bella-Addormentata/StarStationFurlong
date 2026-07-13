@@ -706,7 +706,21 @@
         letter-spacing: 2px;
         color: #d4a84b;
         text-shadow: 0 0 12px rgba(212, 168, 75, 0.35);
-        animation: pulse 2s ease-in-out infinite;
+        /* Dedicated keyframes — the shared `pulse` bakes translateX(-50%)
+           into every frame (written for an absolutely-positioned element),
+           which would permanently shift this flex child left by half its width. */
+        animation: phoneNoSignalPulse 2s ease-in-out infinite;
+      }
+
+      @keyframes phoneNoSignalPulse {
+        0%, 100% {
+          transform: scale(1);
+          opacity: 1;
+        }
+        50% {
+          transform: scale(1.05);
+          opacity: 0.8;
+        }
       }
 
       .phone-no-signal-text {

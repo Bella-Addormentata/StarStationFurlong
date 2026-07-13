@@ -44,6 +44,7 @@ let receivedTicks = 0;
 let pendingBootstrapOverride: RoomBootstrap | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
 let networkPanelInitialized = false;
+let phoneOverlayInitialized = false;
 
 // Local node identity (fetched from the Rust node's fingerprint endpoint).
 // Kept so the user can mint bootstrap links for friends even before any peer
@@ -375,6 +376,12 @@ async function bootstrapNetworking() {
 }
 
 function setupSpacePhoneOverlay() {
+  // bootstrapNetworking() re-runs via the Retry-node / Use-link buttons;
+  // guard so the Tab toggle and form submit listeners bind exactly once
+  // (same pattern as networkPanelInitialized).
+  if (phoneOverlayInitialized) return;
+  phoneOverlayInitialized = true;
+
   const container = document.getElementById('spacephone-container');
   const chatInput = document.getElementById('chat-input') as HTMLInputElement;
   const chatForm = document.getElementById('chat-form');
@@ -434,14 +441,17 @@ function setupSpacePhoneOverlay() {
 
   // Esc returns to home while the phone is open and inside an app view.
   // (Esc is otherwise only used by the room-name inline editor input, which
-  // we exclude via the non-chat input guard below.)
+  // we exclude via the non-chat input guard below. Guard on e.target — not
+  // document.activeElement — because the editor's Escape branch replaceWith()s
+  // the focused input before the event bubbles here, leaving activeElement
+  // pointing at <body>; e.target stays the original input.)
   window.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!container || !container.classList.contains('active')) return;
-    const active = document.activeElement;
+    const target = e.target as HTMLElement | null;
     if (
-      active && active !== chatInput &&
-      (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')
+      target && target !== chatInput &&
+      (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')
     ) {
       return; // e.g. room-name editor owns Escape for cancel
     }
@@ -1221,6 +1231,13 @@ function setupSolarMap() {
     // Check if player is focused in chat input before toggling map via M/m
     const active = document.activeElement;
     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      return;
+    }
+
+    // Suppress map hotkey while the SpacePhone is open (#20 shell views like
+    // home/contacts/bank hold no focused input, so the guard above no longer
+    // covers the phone-open case on its own).
+    if (document.getElementById('spacephone-container')?.classList.contains('active')) {
       return;
     }
 
