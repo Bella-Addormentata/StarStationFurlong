@@ -25,11 +25,24 @@
  *  SIT_DOWN slide) carries the avatar past the threshold, pauses for a peek,
  *  then walks it back inside and closes the door.
  *
+ * Device focus (click a device — wall computer, trunk, …; #33 D0)
+ * ────────────────────────────────────────────────────────────────
+ *  APPROACH → FINE → TURN → ENGAGED
+ *  The avatar A*-walks to the device's front point, fine-steps onto it, and
+ *  turns to FACE the device (TOWARD it — the opposite of the seats'
+ *  back-to-the-chair convention). ENGAGED fires hooks.onArrived() exactly
+ *  once; the DeviceFocusController (deviceFocus.ts) then owns the camera and
+ *  UI. While ENGAGED all movement is swallowed: WASD or a new click asks the
+ *  controller to let go via hooks.requestRelease(), and the deferred action
+ *  resumes when the controller's release ease completes and calls
+ *  releaseDevice().
+ *
  * WASD always takes priority: pressing any movement key immediately clears
- * the waypoint queue (and any sit/door approach) and reverts to MANUAL mode.
- * The only exception is the scripted THROUGH/PEEK/RETURN stretch outside the
- * room: WASD there triggers (or waits on) the RETURN leg instead of moving,
- * so MANUAL's BOUND clamp can never grab the avatar outside the walls.
+ * the waypoint queue (and any sit/door/device approach) and reverts to MANUAL
+ * mode. Two exceptions: the scripted THROUGH/PEEK/RETURN stretch outside the
+ * room (WASD triggers/awaits the RETURN leg instead of moving, so MANUAL's
+ * BOUND clamp can never grab the avatar outside the walls) and device
+ * ENGAGED (WASD requests a camera release; movement resumes right after).
  */
 
 import * as THREE from 'three';
@@ -41,6 +54,7 @@ import { findPath, worldToCol, worldToRow } from './pathfinding';
 import { OBSTACLES } from './obstacles';
 import type { Seat } from './seats';
 import type { DoorTarget, DoorSequenceHooks } from './doors';
+import type { DeviceTarget, DeviceFocusHooks } from './devices';
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
 const PLAYER_R = 0.38;
@@ -74,6 +88,8 @@ type NavigationMode = 'MANUAL' | 'WAYPOINT';
 type SitPhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'SIT_DOWN' | 'SEATED' | 'STAND_UP';
 /** Door walk-through phases (NONE = regular navigation). */
 type DoorPhase = 'NONE' | 'APPROACH' | 'FINE' | 'WAIT_OPEN' | 'THROUGH' | 'PEEK' | 'RETURN';
+/** Device-focus phases (NONE = regular navigation). Mirrors DoorPhase. */
+type DevicePhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'ENGAGED';
 export class Player {
   /** Root group — consumed by World to toggle visibility and read position. */
   public mesh: THREE.Group;
@@ -103,10 +119,14 @@ export class Player {
   private readonly SIT_ANIM_TIME = 0.35;
   private readonly STAND_ANIM_TIME = 0.28;
   private readonly TURN_TIME = 0.15;
-  /** Deferred actions to resume after STAND_UP / door RETURN completes. */
+  /**
+   * Deferred actions to resume after STAND_UP / door RETURN / device release
+   * completes. At most one is ever non-null (every setter clears the rest).
+   */
   private pendingDest: { x: number; z: number } | null = null;
   private pendingSeat: Seat | null = null;
   private pendingDoor: { door: DoorTarget; hooks: DoorSequenceHooks } | null = null;
+  private pendingDevice: { device: DeviceTarget; hooks: DeviceFocusHooks } | null = null;
 
   // ── Door walk-through state ────────────────────────────────────────────────
   private doorPhase: DoorPhase = 'NONE';
@@ -124,6 +144,16 @@ export class Player {
   private doorSeq = 0;
   private readonly DOOR_WAIT_TIMEOUT = 3.0;
   private readonly DOOR_PEEK_TIME = 0.7;
+
+  // ── Device-focus state (#33 D0) ─────────────────────────────────────────────
+  private devicePhase: DevicePhase = 'NONE';
+  /** Device being approached / engaged. */
+  private deviceTarget: DeviceTarget | null = null;
+  /** Hooks wired by the DeviceFocusController — arrival + release requests. */
+  private deviceHooks: DeviceFocusHooks | null = null;
+  /** Phase timer (TURN dwell — reuses TURN_TIME). */
+  private deviceTimer = 0;
+
   constructor(scene: THREE.Scene) {
     this.scene     = scene;
     this.character = new VoxelCharacter(scene);
@@ -140,20 +170,34 @@ export class Player {
    * No-ops when the destination is unreachable.
    */
   navigateTo(targetX: number, targetZ: number): void {
+    // Engaged on a device: ask the focus controller to let go; the deferred
+    // destination resumes when the release ease completes (releaseDevice).
+    if (this.devicePhase === 'ENGAGED') {
+      this.pendingDest = { x: targetX, z: targetZ };
+      this.pendingSeat = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
+      this.deviceHooks?.requestRelease();
+      return;
+    }
     // Mid door walk-through: defer until the scripted RETURN leg finishes.
     if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
       this.pendingDoor = null;
+      this.pendingDevice = null;
       if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
       return;
     }
-    // Door approach not yet through the threshold: abandon it and re-route.
+    // Door/device approaches not yet committed: abandon them and re-route.
     this._abortDoorApproach();
+    this._cancelDeviceApproach();
 
     if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
       this._beginStandUp();
       return;
     }
@@ -161,6 +205,8 @@ export class Player {
       // Re-target while standing: just swap the deferred destination.
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
       return;
     }
     this._cancelSit();
@@ -196,27 +242,42 @@ export class Player {
    * another seat, stands up first and then walks over.
    */
   navigateToSeat(seat: Seat): void {
+    // Engaged on a device: release the focus first, then walk over and sit.
+    if (this.devicePhase === 'ENGAGED') {
+      this.pendingSeat = seat;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
+      this.deviceHooks?.requestRelease();
+      return;
+    }
     // Mid door walk-through: defer until the scripted RETURN leg finishes.
     if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
       this.pendingSeat = seat;
       this.pendingDest = null;
       this.pendingDoor = null;
+      this.pendingDevice = null;
       if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
       return;
     }
-    // Door approach not yet through the threshold: abandon it and re-route.
+    // Door/device approaches not yet committed: abandon them and re-route.
     this._abortDoorApproach();
+    this._cancelDeviceApproach();
 
     if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
       if (this.sitTarget && this.sitTarget.id === seat.id) return; // already here
       this.pendingSeat = seat;
       this.pendingDest = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
       this._beginStandUp();
       return;
     }
     if (this.sitPhase === 'STAND_UP') {
       this.pendingSeat = seat;
       this.pendingDest = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
       return;
     }
 
@@ -243,10 +304,20 @@ export class Player {
    * request is deferred until the current sequence returns inside.
    */
   navigateToDoor(door: DoorTarget, hooks: DoorSequenceHooks): void {
+    // Engaged on a device: release the focus first, then walk to the door.
+    if (this.devicePhase === 'ENGAGED') {
+      this.pendingDoor = { door, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDevice = null;
+      this.deviceHooks?.requestRelease();
+      return;
+    }
     if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
+      this.pendingDevice = null;
       this._beginStandUp();
       return;
     }
@@ -255,6 +326,7 @@ export class Player {
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
+      this.pendingDevice = null;
       return;
     }
     // Same door already in progress → no-op. (Except during RETURN: a
@@ -271,11 +343,13 @@ export class Player {
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
+      this.pendingDevice = null;
       if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
       return;
     }
 
     this._abortDoorApproach();
+    this._cancelDeviceApproach();
     this._cancelSit();
     this._clearPath();
 
@@ -297,6 +371,124 @@ export class Player {
   }
 
   /**
+   * Request a device focus (#33 D0): A*-walk to the device's front point,
+   * fine-step onto it, turn TOWARD the device, and fire hooks.onArrived()
+   * exactly once (the DeviceFocusController takes the camera from there).
+   * While seated the player stands up first; mid door walk-through the
+   * request defers until the RETURN leg completes; while engaged on another
+   * device the controller is asked to release first.
+   */
+  navigateToDevice(device: DeviceTarget, hooks: DeviceFocusHooks): void {
+    // Already engaged on this exact device → nothing to do.
+    if (this.devicePhase === 'ENGAGED' && this.deviceTarget && this.deviceTarget.id === device.id) return;
+    // Engaged on a different device: release the focus first, then walk over.
+    if (this.devicePhase === 'ENGAGED') {
+      this.pendingDevice = { device, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      this.deviceHooks?.requestRelease();
+      return;
+    }
+    // Mid door walk-through: defer until the scripted RETURN leg finishes.
+    if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
+      this.pendingDevice = { device, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
+      return;
+    }
+    if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
+      this.pendingDevice = { device, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      this._beginStandUp();
+      return;
+    }
+    if (this.sitPhase === 'STAND_UP') {
+      // Re-target while standing: just swap the deferred action.
+      this.pendingDevice = { device, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      return;
+    }
+    // Same device already being approached: adopt the caller's fresh hooks
+    // (a re-click bumps the controller's deviceSeq — keeping the old closure
+    // would make onArrived fire with a stale token and strand the avatar
+    // ENGAGED with no camera) and keep walking.
+    if (this.devicePhase !== 'NONE' && this.deviceTarget && this.deviceTarget.id === device.id) {
+      this.deviceHooks = hooks;
+      return;
+    }
+
+    this._abortDoorApproach();
+    this._cancelDeviceApproach();
+    this._cancelSit();
+    this._clearPath();
+
+    this.deviceTarget = device;
+    this.deviceHooks = hooks;
+    this.devicePhase = 'APPROACH';
+    this.navMode = 'WAYPOINT';
+
+    const pos = this.mesh.position;
+    // May legitimately return an empty path when we're already standing on
+    // the front cell — the APPROACH handler falls straight through to FINE.
+    this.waypointPath = findPath(
+      worldToRow(pos.z), worldToCol(pos.x),
+      worldToRow(device.front.z), worldToCol(device.front.x),
+    );
+
+    this.reticle = new WaypointReticle(this.scene, device.front.x, device.front.z);
+  }
+
+  /**
+   * Called by the DeviceFocusController when its release ease completes (or
+   * on a force-release, or when it must decline an arrival). Clears any
+   * device engagement/approach and resumes whatever interrupted it.
+   */
+  releaseDevice(): void {
+    if (this.devicePhase === 'NONE') return;
+    if (this.devicePhase !== 'ENGAGED') {
+      // Approach never engaged — just abandon it (no pendings to resume:
+      // anything that queued a pending also left APPROACH/FINE/TURN).
+      this._cancelDeviceApproach();
+      return;
+    }
+    this.devicePhase = 'NONE';
+    this.deviceTarget = null;
+    this.deviceHooks = null;
+    this.navMode = 'MANUAL';
+
+    // Resume whatever interrupted the engagement.
+    if (this.pendingDevice) {
+      const next = this.pendingDevice;
+      this.pendingDevice = null;
+      this.navigateToDevice(next.device, next.hooks);
+    } else if (this.pendingDoor) {
+      const next = this.pendingDoor;
+      this.pendingDoor = null;
+      this.navigateToDoor(next.door, next.hooks);
+    } else if (this.pendingSeat) {
+      const next = this.pendingSeat;
+      this.pendingSeat = null;
+      this.navigateToSeat(next);
+    } else if (this.pendingDest) {
+      const dest = this.pendingDest;
+      this.pendingDest = null;
+      this.navigateTo(dest.x, dest.z);
+    }
+  }
+
+  /** Current device-focus phase (debug/verification handle). */
+  getDevicePhase(): DevicePhase {
+    return this.devicePhase;
+  }
+
+  /**
    * Update player movement and character animation for the current frame.
    */
   update(deltaTime: number, inputManager: InputManager): void {
@@ -307,25 +499,40 @@ export class Player {
     // (Outside the room — THROUGH/PEEK/RETURN — it triggers/awaits the
     //  scripted RETURN leg instead, so MANUAL never runs out there.)
     if (manualInput) {
-      if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK') {
+      if (this.devicePhase === 'ENGAGED') {
+        // Swallow movement; ask the focus controller to let go (repeat calls
+        // while the release ease runs are no-ops). Movement resumes as soon
+        // as the controller calls releaseDevice(). Deferred actions drop —
+        // WASD means "give me back control", same as the door RETURN rule.
+        this.pendingDoor = null;
+        this.pendingDest = null;
+        this.pendingSeat = null;
+        this.pendingDevice = null;
+        this.deviceHooks?.requestRelease();
+      } else if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK') {
         // Head back inside; input resumes once RETURN completes.
         this.pendingDoor = null;
         this.pendingDest = null;
         this.pendingSeat = null;
+        this.pendingDevice = null;
         this._beginDoorReturn();
       } else if (this.doorPhase === 'RETURN') {
         // Scripted return in progress — swallow input, drop deferred actions.
         this.pendingDoor = null;
         this.pendingDest = null;
         this.pendingSeat = null;
+        this.pendingDevice = null;
       } else {
-        // APPROACH / FINE / WAIT_OPEN (all safely inside the room) — abort.
+        // Door APPROACH / FINE / WAIT_OPEN and device APPROACH / FINE / TURN
+        // (all safely inside the room, nothing engaged yet) — abort.
         if (this.doorPhase !== 'NONE') this._abortDoorApproach();
+        if (this.devicePhase !== 'NONE') this._cancelDeviceApproach();
         if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
           // Stand up at the chair front first; movement resumes right after.
           this.pendingDest = null;
           this.pendingSeat = null;
           this.pendingDoor = null;
+          this.pendingDevice = null;
           this._beginStandUp();
         } else if (this.sitPhase !== 'STAND_UP') {
           this.navMode = 'MANUAL';
@@ -339,6 +546,10 @@ export class Player {
       // FINE / WAIT_OPEN / THROUGH / PEEK / RETURN are door-driven.
       // (Door APPROACH reuses the regular waypoint follower below.)
       this._updateDoorPhase(deltaTime);
+    } else if (this.devicePhase !== 'NONE' && this.devicePhase !== 'APPROACH') {
+      // FINE / TURN / ENGAGED are device-driven.
+      // (Device APPROACH reuses the regular waypoint follower below.)
+      this._updateDevicePhase(deltaTime);
     } else {
       switch (this.sitPhase) {
         case 'FINE':      this._updateFineApproach(deltaTime); break;
@@ -370,7 +581,9 @@ export class Player {
       'navmode',
       this.doorPhase !== 'NONE'
         ? `DOOR:${this.doorPhase}`
-        : (this.sitPhase !== 'NONE' ? this.sitPhase : this.navMode),
+        : this.devicePhase !== 'NONE'
+          ? `DEVICE:${this.devicePhase}`
+          : (this.sitPhase !== 'NONE' ? this.sitPhase : this.navMode),
     );
   }
 
@@ -427,6 +640,12 @@ export class Player {
         this.doorPhase = 'FINE';
         return;
       }
+      if (this.devicePhase === 'APPROACH') {
+        // Arrived at (or started on) the device's front cell — fine-step next.
+        this._removeReticle();
+        this.devicePhase = 'FINE';
+        return;
+      }
       this.character.setState('idle', this.logicalAngle);
       this._clearPath();
       return;
@@ -454,6 +673,11 @@ export class Player {
         if (this.doorPhase === 'APPROACH') {
           this._removeReticle();
           this.doorPhase = 'FINE';
+          return;
+        }
+        if (this.devicePhase === 'APPROACH') {
+          this._removeReticle();
+          this.devicePhase = 'FINE';
           return;
         }
         this.character.setState('idle', this.logicalAngle);
@@ -601,7 +825,11 @@ export class Player {
       this.navMode = 'MANUAL';
 
       // Resume whatever interrupted the sit.
-      if (this.pendingDoor) {
+      if (this.pendingDevice) {
+        const next = this.pendingDevice;
+        this.pendingDevice = null;
+        this.navigateToDevice(next.device, next.hooks);
+      } else if (this.pendingDoor) {
         const next = this.pendingDoor;
         this.pendingDoor = null;
         this.navigateToDoor(next.door, next.hooks);
@@ -773,7 +1001,11 @@ export class Player {
           hooks.requestClose();
 
           // Resume whatever interrupted the walk-through.
-          if (this.pendingDoor) {
+          if (this.pendingDevice) {
+            const next = this.pendingDevice;
+            this.pendingDevice = null;
+            this.navigateToDevice(next.device, next.hooks);
+          } else if (this.pendingDoor) {
             const next = this.pendingDoor;
             this.pendingDoor = null;
             this.navigateToDoor(next.door, next.hooks);
@@ -796,6 +1028,91 @@ export class Player {
         pos.x += nx * step;
         pos.z += nz * step;
         this.character.setState('walk', this.logicalAngle);
+        return;
+      }
+    }
+  }
+
+  // ── Device-focus sequence (#33 D0) ──────────────────────────────────────────
+
+  /**
+   * Abandon a device approach that hasn't engaged yet (APPROACH/FINE/TURN
+   * only — an ENGAGED device is released through the controller's ease via
+   * releaseDevice()). Clearing the hooks here is what guards against stale
+   * onArrived callbacks: TURN can only fire the hooks it still holds.
+   */
+  private _cancelDeviceApproach(): void {
+    if (
+      this.devicePhase === 'APPROACH' ||
+      this.devicePhase === 'FINE' ||
+      this.devicePhase === 'TURN'
+    ) {
+      this.devicePhase = 'NONE';
+      this.deviceTarget = null;
+      this.deviceHooks = null;
+      this._removeReticle();
+    }
+  }
+
+  /** Drive the FINE / TURN / ENGAGED device phases. */
+  private _updateDevicePhase(deltaTime: number): void {
+    const device = this.deviceTarget;
+    const hooks = this.deviceHooks;
+    if (!device || !hooks) {
+      // Defensive: should be unreachable (state is only cleared with phase).
+      this.devicePhase = 'NONE';
+      this.deviceTarget = null;
+      this.deviceHooks = null;
+      return;
+    }
+
+    const pos = this.mesh.position;
+
+    switch (this.devicePhase) {
+      // ── Straight-step onto the exact front point (collision ON) ───────────
+      case 'FINE': {
+        const dx = device.front.x - pos.x;
+        const dz = device.front.z - pos.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist < 0.06) {
+          pos.x = device.front.x;
+          pos.z = device.front.z;
+          // Turn TOWARD the device (opposite of seats' back-to-chair rule).
+          this.logicalAngle = device.faceAngle;
+          this.character.setState('idle', this.logicalAngle);
+          this.deviceTimer = 0;
+          this.devicePhase = 'TURN';
+          return;
+        }
+
+        const nx = dx / dist;
+        const nz = dz / dist;
+        this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+        const step = Math.min(this.SPEED * deltaTime, dist);
+        const r = resolveObstacles(pos.x + nx * step, pos.z + nz * step);
+        pos.x = r.x;
+        pos.z = r.z;
+        this.character.setState('walk', this.logicalAngle);
+        return;
+      }
+
+      // ── Brief pause while the facing snaps toward the device ──────────────
+      case 'TURN': {
+        this.character.setState('idle', device.faceAngle);
+        this.deviceTimer += deltaTime;
+        if (this.deviceTimer >= this.TURN_TIME) {
+          // ENGAGED before onArrived: the one-way TURN→ENGAGED transition is
+          // what makes the arrival callback fire exactly once.
+          this.devicePhase = 'ENGAGED';
+          hooks.onArrived();
+        }
+        return;
+      }
+
+      // ── Idle at the device until the controller releases us ───────────────
+      case 'ENGAGED': {
+        this.character.setState('idle', device.faceAngle);
         return;
       }
     }

@@ -26,6 +26,7 @@
 
 import * as THREE from 'three';
 import type { Seat } from './seats';
+import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle } from './devices';
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box { x0: number; z0: number; x1: number; z1: number }
@@ -46,7 +47,8 @@ export type FurnitureKind =
   | 'rug-back'
   | 'rug-front'
   | 'cherry-tree'
-  | 'blossom-pot';
+  | 'blossom-pot'
+  | 'wall-computer';
 
 export interface FurnitureItem {
   id: string;
@@ -97,6 +99,13 @@ export interface FurnitureDef {
   /** Tile footprint (metres). null ⇒ decorative: never an obstacle. */
   footprint: { w: number; d: number } | null;
   seats?: SeatTemplate[];
+  /** Capability tags — #30 plan §1.2: capabilities = function-tagged furniture. */
+  functions?: string[];
+  /**
+   * Device-focus template (local frame, rot 0) — items whose def carries one
+   * become clickable focus targets via buildDeviceList() (#33 D0).
+   */
+  device?: DeviceTemplate;
 }
 
 // ── Warm frontier colour palette (moved from world.addLobbyFurniture) ─────────
@@ -373,6 +382,119 @@ const buildBarCorner = (ctx: BuildCtx) => {
   roundPlant(ctx, -0.14, BAR_H + 0.072, -BAR_L / 2 + 0.22);
 };
 
+// ── Wall computer (M1 of #33) — visuals adopted from PR #36's deviceProps.ts ──
+// Wall-mounted room terminal: dark slate housing + bezel + live CanvasTexture
+// screen, amber accent strip (0xD4A84B — adapter/keypad palette). Local frame:
+// screen faces +z, panel centre at mount height WC_Y; the registry item flips
+// it into the room with rot 2 (flush-mount idiom like the bar back-panel).
+const WC_W = 0.9;   // housing width
+const WC_H = 0.7;   // housing height
+const WC_D = 0.12;  // housing depth
+const WC_Y = 1.6;   // mount height (panel centre)
+
+const buildWallComputer = (ctx: BuildCtx) => {
+  const { m, place } = ctx;
+  const HOUSING = 0x2A3444; // gunmetal slate (matches adapter/door frames)
+  const BEZEL = 0x3D4A5E;
+  const ACCENT = 0xD4A84B;  // keypad gold
+
+  place(new THREE.BoxGeometry(WC_W, WC_H, WC_D - 0.04), m(HOUSING, 0.6, 0.5), 0, WC_Y, -0.02);            // housing (back)
+  place(new THREE.BoxGeometry(0.82, 0.60, 0.03), m(BEZEL, 0.55, 0.45), 0, WC_Y + 0.02, WC_D / 2 - 0.015); // bezel
+  place(new THREE.BoxGeometry(WC_W, 0.05, 0.03), m(ACCENT, 0.4, 0.5), 0, WC_Y - WC_H / 2 + 0.025, WC_D / 2 - 0.015); // amber strip
+  place(new THREE.BoxGeometry(0.20, 0.06, 0.02), m(HOUSING, 0.6, 0.5), 0, WC_Y - WC_H / 2 + 0.025, WC_D / 2 + 0.001); // strip badge
+
+  // ── Screen: live CanvasTexture. Redrawn only by the WallScreenHandle the
+  //    World drives at ~1 Hz (permanent home of #36's dev-hook wiring) —
+  //    no internal timer. Starts opacity 0 for the morph fade-in.
+  const cv = document.createElement('canvas');
+  cv.width = 256; cv.height = 192;
+  const c2d = cv.getContext('2d')!;
+  const screenTex = new THREE.CanvasTexture(cv);
+  screenTex.minFilter = THREE.NearestFilter;
+  screenTex.magFilter = THREE.NearestFilter;
+  screenTex.generateMipmaps = false;
+  screenTex.colorSpace = THREE.SRGBColorSpace;
+  const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 }); // unlit = emissive read
+  const screen = place(new THREE.PlaneGeometry(0.72, 0.50), screenMat, 0, WC_Y + 0.02, WC_D / 2 + 0.002);
+
+  const drawStatus = (status: WallComputerStatus) => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = '#0A1018';
+    c2d.fillRect(0, 0, 256, 192);
+    c2d.strokeStyle = '#1E2A38';
+    c2d.strokeRect(3.5, 3.5, 249, 185);
+    // Header: room name (amber)
+    c2d.font = 'bold 16px monospace';
+    c2d.textAlign = 'left';
+    c2d.textBaseline = 'alphabetic';
+    c2d.fillStyle = '#D4A84B';
+    c2d.fillText(status.roomName.toUpperCase().slice(0, 16), 14, 28);
+    c2d.strokeStyle = '#D4A84B';
+    c2d.beginPath(); c2d.moveTo(14, 38); c2d.lineTo(242, 38); c2d.stroke();
+    // Peer count (cyan)
+    c2d.font = '14px monospace';
+    c2d.fillStyle = '#00E5FF';
+    c2d.fillText(`PEERS: ${status.peers}`, 14, 62);
+    // Node status LED + label
+    c2d.beginPath();
+    c2d.arc(21, 82, 5, 0, Math.PI * 2);
+    c2d.fillStyle = status.nodeOnline ? '#00E676' : '#FF1744';
+    c2d.fill();
+    c2d.fillStyle = '#8FA3B8';
+    c2d.fillText(`NODE ${status.nodeOnline ? 'ONLINE' : 'OFFLINE'}`, 34, 87);
+    // Wireframe room-outline motif (the full live view is the FOCUSED DOM UI)
+    c2d.strokeStyle = '#3E92B8';
+    c2d.strokeRect(150.5, 100.5, 92, 68);
+    c2d.fillStyle = '#3E92B8';
+    c2d.fillRect(192, 97, 10, 4);   // north door port
+    c2d.fillRect(192, 167, 10, 4);  // south door port
+    c2d.fillRect(147, 130, 4, 10);  // west door port
+    c2d.fillRect(241, 130, 4, 10);  // east door port
+    c2d.fillStyle = '#25506A';
+    c2d.font = '10px monospace';
+    c2d.fillText('MODULE', 172, 140);
+    // Honesty rule: no fuel system exists — say so, dimly.
+    c2d.fillStyle = '#4A5560';
+    c2d.font = '12px monospace';
+    c2d.fillText('FUEL — NO SENSOR', 14, 120);
+    c2d.fillStyle = '#33404E';
+    c2d.font = '10px monospace';
+    c2d.fillText('SSF ROOM TERMINAL v1', 14, 178);
+    screenTex.needsUpdate = true;
+  };
+
+  // Dimmed frame shown while a player is focused (plan §D0.4 hybrid screens).
+  const drawInUse = () => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = '#060A10';
+    c2d.fillRect(0, 0, 256, 192);
+    c2d.strokeStyle = '#1E2A38';
+    c2d.strokeRect(3.5, 3.5, 249, 185);
+    c2d.font = 'bold 14px monospace';
+    c2d.textAlign = 'center';
+    c2d.textBaseline = 'middle';
+    c2d.fillStyle = 'rgba(212, 168, 75, 0.45)';
+    c2d.fillText('TERMINAL IN USE', 128, 96);
+    screenTex.needsUpdate = true;
+  };
+
+  let engaged = false;
+  let lastStatus: WallComputerStatus = { roomName: 'FURLONG LOBBY', peers: 0, nodeOnline: false };
+  const handle: WallScreenHandle = {
+    updateStatus: (status) => {
+      lastStatus = status;
+      if (engaged) drawInUse(); else drawStatus(status);
+    },
+    setEngaged: (value) => {
+      engaged = value;
+      if (engaged) drawInUse(); else drawStatus(lastStatus);
+    },
+  };
+  // Boot frame so the prop is never a black rectangle before the first tick.
+  drawStatus(lastStatus);
+  screen.userData.wallScreen = handle; // collected by World.addLobbyFurniture
+};
+
 // ── Definitions ───────────────────────────────────────────────────────────────
 const armchairLeftSeats: SeatTemplate[] = [{
   clickBox: { x0: -0.50, z0: -0.50, x1: 0.50, z1: 0.50 },
@@ -415,6 +537,26 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   'rug-front':          { kind: 'rug-front',          build: buildRugFront,          footprint: null },
   'cherry-tree':        { kind: 'cherry-tree',        build: buildCherryTree,        footprint: null },
   'blossom-pot':        { kind: 'blossom-pot',        build: buildBlossomPot,        footprint: null },
+  // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
+  // wall plane and must never become an obstacle. Device template in the
+  // local rot-0 frame (screen faces +z):
+  //  - front 1.0 in front of the screen; faceAngle π = facing TOWARD the
+  //    device (-z locally — opposite of the seats' back-to-chair convention)
+  //  - eye at standing height 0.85 in front; anchor on the screen centre
+  //    (panel centre y = 1.6, screen offset +0.02).
+  'wall-computer': {
+    kind: 'wall-computer',
+    build: buildWallComputer,
+    footprint: null,
+    functions: ['roomTerminal'],
+    device: {
+      kind: 'roomTerminal',
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.45, z: 0.85 },
+      anchor: { x: 0, y: 1.62, z: 0.06 },
+    },
+  },
 };
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
@@ -455,6 +597,12 @@ export const FURNITURE: FurnitureItem[] = [
   { id: 'blossom-pot-back-right', kind: 'blossom-pot',       pos: { x:  4.3,  z: -4.7 }, rot: 0, movable: true },
   { id: 'blossom-pot-front-left', kind: 'blossom-pot',       pos: { x: -3.8,  z:  3.2 }, rot: 0, movable: true },
   { id: 'blossom-pot-front-right', kind: 'blossom-pot',      pos: { x:  3.8,  z:  3.2 }, rot: 0, movable: true },
+  // Wall computer on the south interior wall, east of the south door (#33 M1).
+  // rot 2 flips the +z-facing screen to face -z into the room. x=1.8 clears
+  // the door frame (posts end at |x|=1.0, click box at |x|≤1.0) and the
+  // keypad (at x=-1.1 after the door group's rotY=π flip); z=5.97 is the
+  // bar back-panel flush-mount plane. Footprint null ⇒ never an obstacle.
+  { id: 'wall-computer',         kind: 'wall-computer',      pos: { x:  1.8,  z:  5.97 }, rot: 2, movable: false },
 ];
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
@@ -528,6 +676,43 @@ export function buildSeatList(
   return seats;
 }
 
+/**
+ * Derive the world-space DeviceTarget list (#33 D0 — mirrors buildSeatList:
+ * same rotXZ rotation + computeFront walkable-fallback). faceAngle is TOWARD
+ * the device (opposite of the seats' back-to-chair convention); eye/anchor y
+ * is absolute height, x/z rotate with the item.
+ */
+export function buildDeviceList(
+  items: FurnitureItem[],
+  isWalkable: (x: number, z: number) => boolean,
+): DeviceTarget[] {
+  const devices: DeviceTarget[] = [];
+  for (const item of items) {
+    const t = FURNITURE_DEFS[item.kind].device;
+    if (!t) continue;
+    const fr = rotXZ(t.front.x, t.front.z, item.rot);
+    const eye = rotXZ(t.eye.x, t.eye.z, item.rot);
+    const anchor = rotXZ(t.anchor.x, t.anchor.z, item.rot);
+    const preferred = { x: item.pos.x + fr.x, z: item.pos.z + fr.z };
+    devices.push({
+      id: item.id,
+      kind: t.kind,
+      front: computeFront(preferred, itemAabb(item), isWalkable),
+      faceAngle: normalizeAngle(t.faceAngle + item.rot * (Math.PI / 2)),
+      eye: new THREE.Vector3(item.pos.x + eye.x, t.eye.y, item.pos.z + eye.z),
+      anchor: new THREE.Vector3(item.pos.x + anchor.x, t.anchor.y, item.pos.z + anchor.z),
+    });
+  }
+  return devices;
+}
+
+/** Wrap an angle to (-π, π] so rotated facings stay in canonical range. */
+function normalizeAngle(angle: number): number {
+  while (angle > Math.PI) angle -= Math.PI * 2;
+  while (angle <= -Math.PI) angle += Math.PI * 2;
+  return angle;
+}
+
 /** Pathfinding cell size (kept in sync with pathfinding.ts CELL_SIZE). */
 const CELL = 0.5;
 
@@ -586,7 +771,18 @@ export function buildItemGroup(item: FurnitureItem): THREE.Group {
       group.add(light);
     },
   };
-  FURNITURE_DEFS[item.kind].build(ctx);
+  const def = FURNITURE_DEFS[item.kind];
+  def.build(ctx);
+  // Device items: tag every mesh so the main.ts raycast pass can route a
+  // click anywhere on the prop into world.requestDeviceFocus(item.id).
+  if (def.device) {
+    group.traverse((obj) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        obj.userData.isDevice = true;
+        obj.userData.deviceId = item.id;
+      }
+    });
+  }
   group.name = item.id;
   group.position.set(item.pos.x, 0, item.pos.z);
   group.rotation.y = item.rot * (Math.PI / 2);

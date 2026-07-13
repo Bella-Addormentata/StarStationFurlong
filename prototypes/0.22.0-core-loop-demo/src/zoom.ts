@@ -18,6 +18,7 @@
  */
 
 import * as THREE from 'three';
+import { isDeviceFocusActive } from './deviceFocus';
 
 export interface ZoomScaleDef {
   level: number;
@@ -270,6 +271,13 @@ export class MultiScaleZoomView {
       // like home/contacts/bank hold no focused input, so the guard above no
       // longer covers the phone-open case on its own).
       if (document.getElementById('spacephone-container')?.classList.contains('active')) {
+        return;
+      }
+
+      // Suppress zoom hotkeys while a device focus owns the camera (#33
+      // D0.3 — the focus controller swaps in its own perspective camera;
+      // a zoom level change mid-focus would fight it for the swap).
+      if (isDeviceFocusActive()) {
         return;
       }
 

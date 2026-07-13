@@ -1,18 +1,16 @@
 /**
  * Device props (PR-P of issues #33 + #35)
  *
- * Two purely cosmetic, self-contained prop builders (imports THREE only —
- * same pattern as adapter.ts from PR #34):
+ * Purely cosmetic, self-contained prop builder (imports THREE only — same
+ * pattern as adapter.ts from PR #34):
  *
  *  - buildStorageTrunk()  — TR1 of #35: concept-art-faithful ISS storage
- *    trunk with an update-loop-driven hinged lid animation.
- *  - buildWallComputer()  — the prop half of M1 of #33: wall-mounted room
- *    terminal whose screen is a live CanvasTexture redrawn on demand
- *    (the dev hook calls updateStatus ~1 Hz).
+ *    trunk with an update-loop-driven hinged lid animation. Focus/UI wiring
+ *    arrives with TR2 (see brainstorming/device-focus-and-storage-trunk-plan.md).
  *
- * No gameplay, no network, no focus/interaction wiring in this slice —
- * those arrive with D0 (see brainstorming/device-focus-and-storage-trunk-plan.md).
- * Previewed behind the `?deviceprops=1` dev flag in main.ts init().
+ * The wall computer that previewed here graduated with D0+M1 of #33 into a
+ * real furniture-registry item — see furniture.ts 'wall-computer' — so the
+ * `?deviceprops=1` dev flag in main.ts init() now only spawns the trunk.
  */
 
 import * as THREE from 'three';
@@ -24,9 +22,6 @@ const COL_TRUNK_ORANGE = 0xE8760A; // corner reinforcements, latch plates, lid t
 const COL_TRUNK_LATCH = 0x6E7680;  // gray latch hardware
 const COL_TRUNK_DARK = 0x14181E;   // interior cavity / label plate
 const COL_TRUNK_TRAY = 0x2A3038;   // tool-tray layer
-const COL_HOUSING = 0x2A3444;      // wall-computer dark slate (gunmetal, matches adapter)
-const COL_BEZEL = 0x3D4A5E;        // lighter bezel around the screen
-const COL_ACCENT = 0xD4A84B;       // amber accent strip (keypad-gold, see docking.ts)
 
 const mat = (color: number, roughness = 0.7, metalness = 0.3) =>
   new THREE.MeshStandardMaterial({ color, roughness, metalness });
@@ -213,111 +208,4 @@ export function buildStorageTrunk(): StorageTrunkProp {
       }
     },
   };
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Wall computer (prop half of M1 of #33)
-// ═════════════════════════════════════════════════════════════════════════════
-
-export interface WallComputerStatus {
-  roomName: string;
-  peers: number;
-  nodeOnline: boolean;
-}
-
-export interface WallComputerProp {
-  group: THREE.Group;
-  /** Redraw the screen. Only called ~1 Hz by the host — no internal timer. */
-  updateStatus(status: WallComputerStatus): void;
-}
-
-// Overall ~0.9w × 0.7h × 0.12d, centered on the group origin,
-// screen facing local +z (rotate the group to face the room).
-const WC_W = 0.9;
-const WC_H = 0.7;
-const WC_D = 0.12;
-
-export function buildWallComputer(): WallComputerProp {
-  const group = new THREE.Group();
-  group.name = 'wallComputer';
-  group.userData = { isWallComputer: true };
-
-  const housingMat = mat(COL_HOUSING, 0.6, 0.5);
-  const bezelMat = mat(COL_BEZEL, 0.55, 0.45);
-  const accentMat = mat(COL_ACCENT, 0.4, 0.5);
-
-  addBox(group, housingMat, WC_W, WC_H, WC_D - 0.04, 0, 0, -0.02);              // housing (back)
-  addBox(group, bezelMat, 0.82, 0.60, 0.03, 0, 0.02, WC_D / 2 - 0.015);         // bezel
-  addBox(group, accentMat, WC_W, 0.05, 0.03, 0, -WC_H / 2 + 0.025, WC_D / 2 - 0.015); // amber strip, bottom
-  addBox(group, housingMat, 0.20, 0.06, 0.02, 0, -WC_H / 2 + 0.025, WC_D / 2 + 0.001); // strip badge
-
-  // ── Screen: live CanvasTexture, redrawn only by updateStatus()
-  const cv = document.createElement('canvas');
-  cv.width = 256; cv.height = 192;
-  const ctx = cv.getContext('2d')!;
-  const screenTex = new THREE.CanvasTexture(cv);
-  screenTex.minFilter = THREE.NearestFilter;
-  screenTex.magFilter = THREE.NearestFilter;
-  screenTex.generateMipmaps = false;
-  screenTex.colorSpace = THREE.SRGBColorSpace;
-
-  const screen = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.72, 0.50),
-    new THREE.MeshBasicMaterial({ map: screenTex }), // unlit = emissive screen read
-  );
-  screen.name = 'wallComputerScreen';
-  screen.position.set(0, 0.02, WC_D / 2 + 0.002);
-  group.add(screen);
-
-  const drawStatus = (status: WallComputerStatus) => {
-    ctx.imageSmoothingEnabled = false;
-    // Background + frame
-    ctx.fillStyle = '#0A1018';
-    ctx.fillRect(0, 0, 256, 192);
-    ctx.strokeStyle = '#1E2A38';
-    ctx.strokeRect(3.5, 3.5, 249, 185);
-    // Header: room name (amber)
-    ctx.font = 'bold 16px monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = '#D4A84B';
-    ctx.fillText(status.roomName.toUpperCase().slice(0, 16), 14, 28);
-    ctx.strokeStyle = '#D4A84B';
-    ctx.beginPath(); ctx.moveTo(14, 38); ctx.lineTo(242, 38); ctx.stroke();
-    // Peer count (cyan)
-    ctx.font = '14px monospace';
-    ctx.fillStyle = '#00E5FF';
-    ctx.fillText(`PEERS: ${status.peers}`, 14, 62);
-    // Node status LED + label
-    ctx.beginPath();
-    ctx.arc(21, 82, 5, 0, Math.PI * 2);
-    ctx.fillStyle = status.nodeOnline ? '#00E676' : '#FF1744';
-    ctx.fill();
-    ctx.fillStyle = '#8FA3B8';
-    ctx.fillText(`NODE ${status.nodeOnline ? 'ONLINE' : 'OFFLINE'}`, 34, 87);
-    // Wireframe room-outline motif (full room view arrives with M1's focus UI)
-    ctx.strokeStyle = '#3E92B8';
-    ctx.strokeRect(150.5, 100.5, 92, 68);
-    ctx.fillStyle = '#3E92B8';
-    ctx.fillRect(192, 97, 10, 4);   // north door port
-    ctx.fillRect(192, 167, 10, 4);  // south door port
-    ctx.fillRect(147, 130, 4, 10);  // west door port
-    ctx.fillRect(241, 130, 4, 10);  // east door port
-    ctx.fillStyle = '#25506A';
-    ctx.font = '10px monospace';
-    ctx.fillText('MODULE', 172, 140);
-    // Honesty rule: no fuel system exists — say so, dimly.
-    ctx.fillStyle = '#4A5560';
-    ctx.font = '12px monospace';
-    ctx.fillText('FUEL — NO SENSOR', 14, 120);
-    ctx.fillStyle = '#33404E';
-    ctx.font = '10px monospace';
-    ctx.fillText('SSF ROOM TERMINAL v0', 14, 178);
-    screenTex.needsUpdate = true;
-  };
-
-  // Boot frame so the prop is never a black rectangle before the first update.
-  drawStatus({ roomName: 'FURLONG LOBBY', peers: 0, nodeOnline: false });
-
-  return { group, updateStatus: drawStatus };
 }

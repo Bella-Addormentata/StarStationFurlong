@@ -10,6 +10,9 @@ import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
 import { findDoor } from './doors';
+import { findDevice, createRoomTerminalUI, readLiveRoomStatus } from './devices';
+import type { WallScreenHandle } from './devices';
+import { deviceFocus } from './deviceFocus';
 import { showHint } from './hud';
 import { DoorDockingPortSystem } from './docking';
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from './voxelCharacter';
@@ -58,6 +61,10 @@ export class World {
   private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
   /** One group per furniture item, keyed by item id (selection/movement — E2+). */
   public furnitureGroups: Map<string, THREE.Group> = new Map();
+  /** Live wall-computer screens, keyed by item id (M1 — driven at ~1 Hz). */
+  private wallScreens: Map<string, WallScreenHandle> = new Map();
+  /** Accumulator for the 1 Hz wall-screen status redraw. */
+  private screenStatusTimer = 0;
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -434,6 +441,11 @@ export class World {
       group.traverse(obj => {
         if (obj instanceof THREE.Mesh) {
           this.furnitureMeshes.push(obj);
+          // Wall-computer screens (M1): collect the live-redraw handle the
+          // builder stowed on the screen mesh; update() drives it at ~1 Hz.
+          if (obj.userData.wallScreen) {
+            this.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
+          }
         } else if (obj instanceof THREE.PointLight) {
           this.furnitureLights.push({ light: obj, targetIntensity: (obj.userData.targetIntensity as number) ?? 0 });
         }
@@ -551,6 +563,10 @@ export class World {
    */
   public startMorph() {
     if (this.isMorphing) return;
+    // Morph restart: instantly tear down any live device focus (ortho camera
+    // + avatar restored, player released) before the room rebuilds — plan
+    // §D0.3 force-release rule.
+    deviceFocus.forceRelease();
     this.isMorphing = true;
     this.morphProgress = 0;
     this.createPlatform();
@@ -781,7 +797,9 @@ export class World {
       this.stationPlanet.position.y = Math.sin(this.time * 0.8) * 0.15;
     }
 
-    if (this.player.mesh.visible) {
+    // Keep updating while device-FOCUSED too: the mesh is hidden then, but
+    // player.update() is where WASD-to-release lives (#33 D0.3).
+    if (this.isPlayerActive()) {
       this.player.update(deltaTime, inputManager);
     }
 
@@ -790,6 +808,22 @@ export class World {
 
     // Advance door leaf slides (update-loop driven, completion-signalled)
     if (this.dockingSystem) this.dockingSystem.update(deltaTime);
+
+    // Drive the device-focus camera eases + focused UI (#33 D0)
+    deviceFocus.update(deltaTime);
+
+    // 1 Hz idle status on wall-computer screens (M1 — the permanent home of
+    // PR #36's dev-hook wiring; same live values, same cadence).
+    if (this.wallScreens.size > 0) {
+      this.screenStatusTimer += deltaTime;
+      if (this.screenStatusTimer >= 1.0) {
+        this.screenStatusTimer = 0;
+        const status = readLiveRoomStatus();
+        for (const screen of this.wallScreens.values()) {
+          screen.updateStatus(status);
+        }
+      }
+    }
 
     // Float dust motes upward, reset at ceiling
     if (this.particlePositions && this.particleGeo) {
@@ -1003,8 +1037,35 @@ export class World {
     });
   }
 
+  /**
+   * Route a device click into the walk-to + first-person focus sequence
+   * (#33 D0/M1 — mirrors requestDoorWalkthrough): find the DeviceTarget,
+   * build the kind-appropriate focused UI, and hand both to the
+   * DeviceFocusController, which wires its hooks into navigateToDevice.
+   */
+  public requestDeviceFocus(deviceId: string): void {
+    const device = findDevice(deviceId);
+    if (!device || !this.isPlayerActive()) return;
+    if (device.kind !== 'roomTerminal') {
+      // Desk computer / map table / trunk UIs arrive with M3/M4/TR2.
+      showHint('This device is not operational yet.');
+      return;
+    }
+    const screen = this.wallScreens.get(deviceId) ?? null;
+    const ui = createRoomTerminalUI({
+      dockingSystem: this.dockingSystem,
+      getPlayerPos: () => this.player.getPosition(),
+      // Dim the in-world screen to "TERMINAL IN USE" while focused (D0.4).
+      onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+    });
+    deviceFocus.beginFocus(this.player, device, ui);
+  }
+
   isPlayerActive(): boolean {
-    return this.player.mesh.visible && !this.isMorphing;
+    // Device-FOCUSED counts as active: the avatar mesh is hidden then, but
+    // the player still stands in the room (ticks keep flowing to peers, and
+    // deferred seat/door/dest requests must still be routable).
+    return (this.player.mesh.visible || deviceFocus.isActive()) && !this.isMorphing;
   }
 
   private initializeDockingPorts() {
