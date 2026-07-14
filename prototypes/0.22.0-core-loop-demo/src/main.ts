@@ -744,7 +744,7 @@ function wireAdapterTransit(): void {
   // in-flight swap falls through to the normal peek round-trip instead of
   // spawning a vestibule whose transit would silently early-return.
   world.isTransitBusy = () => transitInProgress;
-  world.dockingSystem?.onProvisionModule(async () => {
+  const provisionModuleSeed = async (): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
     const roomId = `module-${Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`;
@@ -752,7 +752,10 @@ function wireAdapterTransit(): void {
     if (!minted.link) return null;
     mintedRoomIds.add(roomId);
     return minted.link;
-  });
+  };
+  world.dockingSystem?.onProvisionModule(provisionModuleSeed);
+  // DEV1 dev-menu hook: the MODULES row self-enables when this handle exists.
+  (window as any).__ssfProvisionModule = provisionModuleSeed;
 }
 
 // ── Player identity in the room doc (issue #20 S2) ───────────────────────────
@@ -1852,6 +1855,12 @@ async function init() {
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
   setupZoomView();
+
+  // DEV1: temporary Development menu (owner request, demo phase — will be
+  // phased out). Removal = delete src/devMenu.ts, the #dev-menu-btn line in
+  // index.html, and these three lines.
+  const { initDevMenu } = await import('./devMenu');
+  initDevMenu(() => world);
   
   // Single click: expand the platform and enter the lobby
   setupClickToEnter();
