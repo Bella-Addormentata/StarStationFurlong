@@ -738,6 +738,12 @@ export class Player {
    *      observer (evictFromSeat before applying the move, stand-up to the
    *      PRE-move front point) — the local pickup-time eviction in
    *      editMode.beginCarry only covers the editing client.
+   *  (d) stale pendings: onObstaclesChanged never inspects pendingSeat/
+   *      pendingDoor/pendingDevice. Locally unreachable (edit mode excludes
+   *      every phase that queues one), but a REMOTE removal can land while a
+   *      pending is parked across ENGAGED-release/STAND_UP — null any pending
+   *      whose target id matches the removed item, or the player will walk
+   *      over and sit on air where the chair used to be.
    */
 
   /**

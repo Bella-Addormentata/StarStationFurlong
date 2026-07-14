@@ -605,6 +605,10 @@ function buildPanel(): HTMLDivElement {
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
       case 'place-inventory':
+        // Rows re-render synchronously on each place; a double-click's second
+        // click lands on whatever row shifted up into the same spot and would
+        // legitimately place THAT kind too (review F2) — first click only.
+        if ((e as MouseEvent).detail > 1) break;
         placeFromInventory(Number(btn.dataset.index), btn.dataset.kind as FurnitureKind);
         break;
       case 'provision-module': void provisionModule(); break;

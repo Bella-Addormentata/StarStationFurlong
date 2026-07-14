@@ -107,7 +107,8 @@ export function takeFromRoomInventory(
   kind: FurnitureKind,
 ): RoomInventoryEntry | null {
   const entries = loadRoomInventory(roomId);
-  if (index < 0 || index >= entries.length || entries[index].kind !== kind) {
+  // Number.isInteger also rejects NaN, which slips past both < comparisons.
+  if (!Number.isInteger(index) || index < 0 || index >= entries.length || entries[index].kind !== kind) {
     return null;
   }
   const [entry] = entries.splice(index, 1);
