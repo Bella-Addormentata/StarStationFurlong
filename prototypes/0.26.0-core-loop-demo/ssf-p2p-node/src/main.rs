@@ -901,6 +901,47 @@ async fn handle_wt_connection(
                             });
                         }
 
+                        // Fan out to SIBLING local tabs on this node (issue #60):
+                        // the remote path already forwards to local browsers
+                        // (handle_iroh_connection), but a browser-originated ysync
+                        // UPDATE was only relayed to remote peers + merged into the
+                        // node doc — never to other tabs on the SAME node. So two
+                        // tabs / two players on one machine synced movement (the tick
+                        // lane fans out to local_connections) but NOT room state
+                        // (chat, players, games, furniture). Forward the ORIGINAL
+                        // envelope to every local connection except the sender; the
+                        // receiver applies it as a server-origin update and never
+                        // re-emits, so there is no echo. Only UPDATE/SyncStep2 frames
+                        // are forwarded — a SyncStep1 is a per-tab handshake request
+                        // and forwarding it would make siblings answer it spuriously.
+                        if envelope.kind == "ysync" && is_ysync_state_frame(&envelope.payload) {
+                            let siblings: Vec<Connection> = {
+                                let rooms = hub_clone.rooms.lock().unwrap();
+                                rooms
+                                    .get(room_id)
+                                    .map(|r| {
+                                        r.local_connections
+                                            .iter()
+                                            .filter(|(&addr, _)| addr != remote_addr_inner)
+                                            .map(|(_, conn)| conn.clone())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            for wt_conn in siblings {
+                                let payload_bytes = serde_json::to_vec(&envelope).unwrap();
+                                let l_bytes = (payload_bytes.len() as u32).to_le_bytes();
+                                tokio::spawn(async move {
+                                    if let Ok(opening) = wt_conn.open_bi().await {
+                                        if let Ok((mut send_stream, _recv_stream)) = opening.await {
+                                            let _ = send_stream.write_all(&l_bytes).await;
+                                            let _ = send_stream.write_all(&payload_bytes).await;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
                         // Merge locally
                         if envelope.kind == "ysync" {
                             let mut s = send.lock().await;
@@ -1401,6 +1442,20 @@ async fn write_bridge_status<W: AsyncWriteExt + Unpin>(
     writer.write_all(&len_bytes).await?;
     writer.write_all(&bytes).await?;
     Ok(())
+}
+
+/// True when a ysync payload is a STATE-bearing frame (SyncStep2 or Update) —
+/// it carries doc changes to apply — versus a SyncStep1 handshake request.
+/// Used to decide which browser-originated frames to fan out to sibling tabs.
+fn is_ysync_state_frame(payload: &[u8]) -> bool {
+    if let Ok((msg_type, n1)) = read_var_uint(payload, 0) {
+        if msg_type == 0 {
+            if let Ok((sub_type, _)) = read_var_uint(payload, n1) {
+                return sub_type == 1 || sub_type == 2;
+            }
+        }
+    }
+    false
 }
 
 async fn handle_ysync_message<W: AsyncWriteExt + Unpin>(
