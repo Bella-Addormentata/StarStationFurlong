@@ -2,9 +2,10 @@
  * Docking-Adapter Vestibule (PR-A of issue #30)
  *
  * Procedural train-gangway / airlock vestibule that visually bridges the gap
- * between a room wall (at ±6) and the adjacent-room projection (centred 12m
- * out along the door axis). It occupies roughly the 6→9 band outside the
- * given door, centred on the door axis, floor at world y=0.
+ * between a room wall (at ±6) and the adjacent-room projection (centred
+ * 15.2m out along the door axis, near face ≈9.3 — #51). It occupies roughly
+ * the 6→9 band outside the given door, centred on the door axis, floor at
+ * world y=0.
  *
  * Visual language: concertina/accordion ring frames (boxes, matching the
  * pixel-art aesthetic), dark flexible-fabric walls between the rings, a floor
@@ -152,4 +153,32 @@ export function setVestibuleLightState(group: THREE.Group, state: VestibuleLight
     }
   });
   group.userData.lightState = state;
+}
+
+/**
+ * Fade the whole vestibule to the given opacity (#51 — paired doors keep a
+ * persistent vestibule that rests lightly transparent and solidifies as the
+ * player approaches). Materials are deduped (structural materials are shared
+ * by many meshes within one build; glow strips are individual), and the
+ * `transparent` flag is dropped again at full opacity so the solid look
+ * renders in the opaque pass (no blend-sorting artifacts).
+ *
+ * Orthogonal to setVestibuleLightState: this writes only opacity/transparent,
+ * the light state writes only color.
+ */
+export function setVestibuleOpacity(group: THREE.Group, opacity: number): void {
+  const transparent = opacity < 0.999;
+  const seen = new Set<THREE.Material>();
+  group.traverse((child) => {
+    const mesh = child as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const mat of mats) {
+      if (!mat || seen.has(mat)) continue;
+      seen.add(mat);
+      mat.opacity = opacity;
+      mat.transparent = transparent;
+    }
+  });
+  group.userData.opacity = opacity;
 }
