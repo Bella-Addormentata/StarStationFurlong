@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.25.0-core-loop-demo](prototypes/0.25.0-core-loop-demo/) and is built by the
+[prototypes/0.26.0-core-loop-demo](prototypes/0.26.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,7 +9,20 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- In progress for Phase 2 Star Swarm features. Next queued slices (all planned in `brainstorming/`): E4 furniture sync + persistence, T2/T3 cross-node transit + pairing reciprocity (gated on a two-machine playtest), S3 presence (lane-id → player mapping unlocks name tags + remote outfits), TR-sync trunk inventories, M3 desk computer, E5 rugs, and the station-doc slice carrying the flight-control authority tree.
+- In progress for Phase 2 Star Swarm features. Next queued slices (all planned in `brainstorming/`): the staged room-LIST UX (pre-load/connect a pass's room before entering, with a vestibule-style loading indicator — issue #60's larger ask, deferred from this release), E4 furniture PERSISTENCE (survive a node restart), S3 presence (lane-id → player mapping unlocks name tags + remote outfits, and a motionless remote avatar), TR-sync trunk inventories, M3 desk computer, E5 rugs, and the station-doc slice carrying the flight-control authority tree.
+
+## v0.26.0 — 2026-07-14
+
+### The Reachable Room — Cross-Internet Connect/Sync Fixes ([#60](https://github.com/Bella-Addormentata/StarStationFurlong/issues/60))
+
+A diagnosis pass mapped the reported symptoms to one unifying cause — **you entered a room before it was ready** — plus one independent P2P bug and one blocked-on-unbuilt-work item. This line ships the confirmed fixes and builds the furniture-sync slice they needed.
+
+- **The joiner can see the host now (peer tick fan-out symmetry).** Movement ticks flow over the iroh datagram lane and remote avatars spawn from received ticks. A connection the joiner *dialed* never bound its room, so `chosen_room` stayed unset on the dialing side and the node silently dropped every tick the host sent — the joiner saw no host avatar while the host saw the joiner. `handle_iroh_connection` now takes the room on the dial paths; inbound-accepted connections still learn it from the first sync stream. (The same binding was missing on the gossip mesh-upgrade dial and is fixed too.)
+- **Faster first contact (off-loop, retrying dial).** The peer dial ran *inside* the document-sync reader loop, so a multi-minute NAT hole-punch stalled every following sync frame on that stream — the joiner's room state couldn't converge while the dial hung. The dial moved into its own task with bounded backoff (and a single-flight guard so a slow punch can't spawn a storm of duplicate dials), and the stream's writer is shared so it still reports DIALING/LINKED/FAILED.
+- **Enter only when the room is ready (sync-before-enter gate).** Accepting an ACCESS pass used to beam you in the instant the transport connected — before the host's name, owner and layout had synced — so you landed in a room painting default "Lobby / Clone-XXXX" values. The transit now holds the curtain until the room's shared state arrives (bounded, and it enters anyway on timeout, repainting live as state lands).
+- **Furniture layout syncs (E4).** The room's placed furniture now lives in a shared room-doc map: a joiner sees the host's actual arrangement on entry, and the owner's moves / removals / DEV spawns propagate live to everyone (the room owner seeds the default layout on first claim; the seed is deferred past initial sync so an owner reload never reverts a room others have edited). A player standing on — or walking toward — a piece the host moves or removes is stood up / re-routed instead of stranded. The personal removed-item inventory stays local.
+- **Two players on one machine sync room state too.** A browser's document updates were relayed to remote nodes and merged locally but never to *sibling tabs on the same node*, so two tabs on one PC synced movement but not chat / players / games / furniture. The node now fans state-bearing sync frames out to sibling tabs (no echo — applied updates aren't re-emitted).
+- **Release line:** `prototypes/0.26.0-core-loop-demo/` is the shipping copy; `0.25.0-core-loop-demo/` stays frozen at its release snapshot. Deferred by owner decision: the staged room-LIST UX and a default hole-punch relay. Cross-machine tick symmetry is verified by tracing (a single machine can't run two nodes on the fixed ports) and confirmed by the owner's two-machine playtest.
 
 ## v0.25.0 — 2026-07-14
 
