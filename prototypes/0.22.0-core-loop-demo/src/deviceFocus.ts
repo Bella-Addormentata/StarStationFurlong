@@ -134,6 +134,13 @@ class DeviceFocusController {
    * different device the approach is re-routed.
    */
   public beginFocus(player: Player, device: DeviceTarget, ui: DeviceUI): void {
+    // Re-focus of the device that is ALREADY mid-choreography (PREPARING/
+    // FOCUSING/FOCUSED) must not bump deviceSeq — the player-side machine
+    // no-ops for the same device without adopting new hooks, so a bumped seq
+    // would orphan the in-flight onReady/onArrived and wedge the controller.
+    // (Unreachable via canvas clicks today — they release first — but cheap
+    // insurance for console calls and future callers.)
+    if (this.state !== 'IDLE' && this.state !== 'WALKING' && this.active?.device.id === device.id) return;
     this.player = player;
     const seq = ++this.deviceSeq;
     this.nextTarget = { seq, device, ui };

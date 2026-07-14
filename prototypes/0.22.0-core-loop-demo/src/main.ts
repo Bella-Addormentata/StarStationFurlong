@@ -326,15 +326,16 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   receivedTicks = 0;
   remoteLastSeen.clear();
   world.clearRemotePlayers();
+  // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
+  // world.ts activeRoomId). Published BEFORE the connect await (the id is
+  // known synchronously) so a trunk opened during the connect window keys
+  // the right room; sequential re-joins overwrite correctly. The bootstrap
+  // roomId, NOT the editable display name.
+  (window as any).__ssfRoomId = boot.roomId;
   updateHUDNode('ONLINE', '#00e676');
   await networkProvider.connect(boot);
   if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
   activeBootstrap = boot;
-  // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
-  // world.ts activeRoomId). The bootstrap roomId, NOT the editable display
-  // name; before any join, consumers fall back to 'furlong-lobby' like the
-  // rest of this file.
-  (window as any).__ssfRoomId = boot.roomId;
   await syncShareLink();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
