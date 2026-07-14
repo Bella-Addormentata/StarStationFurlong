@@ -70,7 +70,7 @@ import { WaypointReticle } from './waypoint';
 import { findPath, worldToCol, worldToRow } from './pathfinding';
 import { OBSTACLES } from './obstacles';
 import type { Seat } from './seats';
-import type { DoorTarget, DoorSequenceHooks } from './doors';
+import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import type { DeviceTarget, DeviceFocusHooks } from './devices';
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
@@ -1378,6 +1378,15 @@ export class Player {
   /** Current door phase (debug/verification handle — mirrors getDevicePhase). */
   getDoorPhase(): DoorPhase {
     return this.doorPhase;
+  }
+
+  /**
+   * Door involved in the ACTIVE walk-through/transit sequence, or null (#51 —
+   * the camera-facing door fade restores full opacity on a door while the
+   * player approaches / crosses it).
+   */
+  public getActiveDoorId(): DoorId | null {
+    return this.doorPhase !== 'NONE' && this.doorTarget ? this.doorTarget.id : null;
   }
 
   /**

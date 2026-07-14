@@ -12,6 +12,7 @@
 import * as THREE from 'three';
 import { findDoor } from './doors';
 import type { DoorId } from './doors';
+import { getCameraYaw } from './cameraRig';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -40,6 +41,27 @@ export class DoorDockingPortSystem {
   private slideAnims = new Map<DoorId, { openTarget: number; onComplete?: () => void }>();
   /** Leaf slide speed (metres/second). */
   private readonly SLIDE_SPEED = 2.2;
+
+  // ── Camera-facing door fade (#51) ──────────────────────────────────────────
+  /**
+   * Per-door deduped material lists for the screen-lower transparency fade.
+   * Every door material is created inside buildPorts' per-door loop, so no
+   * material is ever shared across doors — a per-door opacity write can't
+   * bleed into a neighbour. The fade only touches `.opacity`/`.transparent`;
+   * syncLEDStatus tints only `.color` — the two never fight.
+   */
+  private doorFadeMats: Map<DoorId, THREE.Material[]> = new Map();
+  /** Current eased fade opacity per door (1 = solid). */
+  private doorFadeOpacity: Map<DoorId, number> = new Map();
+  /** Resting opacity of a camera-facing door in the isometric view. */
+  private static readonly FACING_FADE_OPACITY = 0.35;
+  /** Outward wall normals (XZ) — dot against the camera azimuth direction. */
+  private static readonly DOOR_NORMALS: Record<DoorId, { x: number; z: number }> = {
+    north: { x: 0, z: -1 },
+    south: { x: 0, z: 1 },
+    east:  { x: 1, z: 0 },
+    west:  { x: -1, z: 0 },
+  };
   
   // Handlers
   private onConnectionRequestCallback: ((doorId: string, address: string) => void) | null = null;
@@ -239,6 +261,24 @@ export class DoorDockingPortSystem {
 
       this.roomsGroup.add(doorGroup);
       this.doorObjects.set(cfg.id, doorGroup);
+
+      // #51: collect this door's materials for the camera-facing fade.
+      // Dedupe (one material serves several meshes within the door) and skip
+      // the invisible click box (its material must stay untouched).
+      const fadeMats: THREE.Material[] = [];
+      const seenMats = new Set<THREE.Material>();
+      doorGroup.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const mat of mats) {
+          if (!mat || mat.visible === false || seenMats.has(mat)) continue;
+          seenMats.add(mat);
+          fadeMats.push(mat);
+        }
+      });
+      this.doorFadeMats.set(cfg.id, fadeMats);
+      this.doorFadeOpacity.set(cfg.id, 1);
 
       // Paint LED + frame glow from the door's initial state
       const state = this.doorState.get(cfg.id);
@@ -619,6 +659,49 @@ export class DoorDockingPortSystem {
     }
   }
 
+  /**
+   * #51 — screen-lower door transparency in the isometric view. Doors on the
+   * camera-facing walls occlude the room interior, so their leaves + frames
+   * ease to FACING_FADE_OPACITY while:
+   *   - `enabled` (ortho room view live: zoom 2–4, no morph, no device focus),
+   *   - the wall's outward normal points toward the camera azimuth (the rig's
+   *     current 45° detent — rotation changes WHICH doors are screen-lower),
+   *   - and the door is not `activeDoorId` (a walk-through/transit in
+   *     progress restores full opacity for the crossing).
+   * Called once per frame from World.update, right after update().
+   */
+  public updateFacingFade(deltaTime: number, enabled: boolean, activeDoorId: DoorId | null): void {
+    // Camera XZ direction for the current detent: the base isometric offset
+    // sits on the +X/+Z diagonal (renderer/zoom convention), swung by the
+    // rig's snapped yaw — x' = (cosθ+sinθ)/√2, z' = (cosθ−sinθ)/√2.
+    const yaw = getCameraYaw();
+    const c = Math.cos(yaw);
+    const s = Math.sin(yaw);
+    const camX = (c + s) * Math.SQRT1_2;
+    const camZ = (c - s) * Math.SQRT1_2;
+
+    for (const [doorId, mats] of this.doorFadeMats) {
+      const n = DoorDockingPortSystem.DOOR_NORMALS[doorId];
+      // 45° detents yield dots of 0 / ±0.707 / ±1 — 0.3 splits camera-facing
+      // walls (0.707, 1) from side-on and far walls (0, negatives).
+      const facing = n.x * camX + n.z * camZ > 0.3;
+      const target = enabled && facing && activeDoorId !== doorId
+        ? DoorDockingPortSystem.FACING_FADE_OPACITY
+        : 1.0;
+
+      const current = this.doorFadeOpacity.get(doorId) ?? 1;
+      if (current === target) continue;
+      let next = current + (target - current) * Math.min(1, 8 * deltaTime);
+      if (Math.abs(next - target) < 0.01) next = target;
+      this.doorFadeOpacity.set(doorId, next);
+      const transparent = next < 0.999;
+      for (const mat of mats) {
+        mat.opacity = next;
+        mat.transparent = transparent;
+      }
+    }
+  }
+
   /** Read-only access to a door's docking state (doorState map is private). */
   public getDockingState(doorId: DoorId): DockingState | null {
     return this.doorState.get(doorId) ?? null;
@@ -643,8 +726,11 @@ export class DoorDockingPortSystem {
     
     const adjRoom = new THREE.Mesh(roomGeo, roomMat);
     
-    // Position adjacent room directly outside the corresponding doorway wall
-    const offset = 12.0; // wall to wall center offset
+    // Position the adjoining module on the FAR side of the docking vestibule
+    // (#51): the gangway spans the ~6→9 band outside the wall (outer portal
+    // ≈9.0), so centring the 11.8-wide box 15.2 out puts its near face at
+    // 15.2 − 5.9 = 9.3 — clear of the vestibule instead of touching the wall.
+    const offset = 15.2; // room centre → adjoining module centre
     switch (doorId) {
       case 'north': adjRoom.position.set(0, 2, -offset); break;
       case 'south': adjRoom.position.set(0, 2, offset); break;
