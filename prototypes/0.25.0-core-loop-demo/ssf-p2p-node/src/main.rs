@@ -681,8 +681,25 @@ async fn run_wt_listener(
 ) -> Result<()> {
     loop {
         let incoming = endpoint.accept().await;
-        let request = incoming.await?;
-        let connection = request.accept().await?;
+        // A failed handshake is a per-CLIENT failure — log it and keep
+        // accepting. `?` here killed the whole listener: one bad dial (the
+        // classic case: a browser Retry carrying a pre-restart cert hash in
+        // serverCertificateHashes) permanently deafened the node to every
+        // future tab until the process was restarted.
+        let request = match incoming.await {
+            Ok(req) => req,
+            Err(e) => {
+                eprintln!("⚠️ WT session request failed (client handshake) — still accepting: {:?}", e);
+                continue;
+            }
+        };
+        let connection = match request.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("⚠️ WT accept failed mid-handshake — still accepting: {:?}", e);
+                continue;
+            }
+        };
         let remote_addr = connection.remote_address();
         println!("🤝 Local browser session secured from {}", remote_addr);
 
@@ -948,8 +965,22 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
             None => continue,
         };
 
-        let accepting = incoming_conn.accept()?;
-        let connection = accepting.await?;
+        // Same per-client tolerance as run_wt_listener: a peer failing its
+        // handshake must not tear down the swarm listener for everyone else.
+        let accepting = match incoming_conn.accept() {
+            Ok(acc) => acc,
+            Err(e) => {
+                eprintln!("⚠️ Iroh incoming accept failed — still listening: {:?}", e);
+                continue;
+            }
+        };
+        let connection = match accepting.await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("⚠️ Iroh handshake failed — still listening: {:?}", e);
+                continue;
+            }
+        };
         let remote_id = connection.remote_id();
         println!("🚀 Inbound P2P Swarm handshake from peer: {}", remote_id);
 

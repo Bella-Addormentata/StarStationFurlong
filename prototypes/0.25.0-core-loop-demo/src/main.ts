@@ -332,7 +332,27 @@ async function bootstrapNetworking() {
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
     const override = pendingBootstrapOverride;
-    const boot = override ?? await fetchDefaultBootstrap();
+    let boot = override ?? await fetchDefaultBootstrap();
+    // Stale-cert self-dial guard (node-restart bug): an override captured
+    // before the local node restarted still carries the OLD WT cert hash, so
+    // a loopback dial with it fails the TLS handshake on every Retry. The
+    // live fingerprint is authoritative for LOCAL dials — refresh the hash
+    // (and the WT port, which can drift the same way) before connecting.
+    // Remote wtUrls are left alone: their certs aren't ours to know, and
+    // non-loopback dial failures keep their RESTRICTED? diagnostics below.
+    if (override) {
+      try {
+        if (classifyAddress(new URL(override.wtUrl).hostname) === 'loopback') {
+          const fp = await refreshLocalFingerprint();
+          if (fp && fp.base64) {
+            const wtUrl = new URL(override.wtUrl);
+            wtUrl.port = String(fp.port);
+            boot = { ...override, wtUrl: wtUrl.toString(), certHashesB64: [fp.base64] };
+            pendingBootstrapOverride = boot; // future retries stay coherent
+          }
+        }
+      } catch { /* malformed wtUrl → the normal dial-failure path reports it */ }
+    }
     if (!boot) {
       console.warn('⚠️ No running Rust node found. Seamlessly falling back to offline mode.');
       updateHUDNode('OFFLINE', '#ff1744');
