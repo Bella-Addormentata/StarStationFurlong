@@ -5,8 +5,9 @@
 
 import * as THREE from 'three';
 import './style.css';
-import { updateDebugHUD } from './hud';
+import { updateDebugHUD, showHint } from './hud';
 import type { World } from './world';
+import type { DoorId } from './doors';
 import type { InputManager } from './input';
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
@@ -70,6 +71,17 @@ let pendingBootstrapOverride: RoomBootstrap | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
 let networkPanelInitialized = false;
 let phoneOverlayInitialized = false;
+// ── Adapter transit state (T1 of issue #30) ──────────────────────────────────
+/** Re-entrancy latch: one transit at a time (the player can only stand in
+ *  one vestibule, and the fade/join sequence must never interleave). */
+let transitInProgress = false;
+/**
+ * Room ids minted by THIS client THIS session via PROVISION NEW MODULE.
+ * Transiting into one of them is a first-entry into a fresh room nobody
+ * owns — pass claimRoomDefaults=true so the provisioner becomes the owner.
+ * Every other transit is a JOIN into someone else's room (false).
+ */
+const mintedRoomIds = new Set<string>();
 
 // Local node identity (fetched from the Rust node's fingerprint endpoint).
 // Kept so the user can mint bootstrap links for friends even before any peer
@@ -581,6 +593,120 @@ async function leaveRoom(): Promise<void> {
   }
 }
 
+// ── Adapter transit (T1 of issue #30) ─────────────────────────────────────────
+
+/** Full-screen fade curtain covering the room swap (#welcome overlay
+ *  pattern: opacity transition on a fixed DOM layer). Lazily created. */
+let transitFadeEl: HTMLDivElement | null = null;
+const TRANSIT_FADE_MS = 400;
+
+/** Ease the transit curtain to fully opaque (true) or clear (false).
+ *  Resolves after the transition duration (timer, not transitionend — the
+ *  event is droppable when the tab is backgrounded mid-transit). */
+function transitFadeTo(opaque: boolean): Promise<void> {
+  if (!transitFadeEl) {
+    transitFadeEl = document.createElement('div');
+    transitFadeEl.id = 'transit-fade';
+    transitFadeEl.style.cssText = `
+      position: fixed;
+      inset: 0;
+      background: #01020a;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity ${TRANSIT_FADE_MS}ms ease;
+      z-index: 8500;
+    `;
+    document.body.appendChild(transitFadeEl);
+    // Flush the initial style so the very first opacity write transitions.
+    void transitFadeEl.offsetHeight;
+  }
+  const el = transitFadeEl;
+  // Swallow clicks while covered (nothing behind the curtain is clickable).
+  el.style.pointerEvents = opaque ? 'auto' : 'none';
+  el.style.opacity = opaque ? '1' : '0';
+  return new Promise((resolve) => window.setTimeout(resolve, TRANSIT_FADE_MS + 50));
+}
+
+/**
+ * The room swap at the heart of the adapter transit (T1 of #30), invoked by
+ * the World when the avatar reaches the vestibule hold point (mid
+ * ADAPTER_HOLD). Rides entirely on the T0 seam:
+ *   decode seed → fade in → leaveRoom() → joinRoom(target) → reposition the
+ *   player at the arrival door → fade out → scripted walk-in.
+ * On ANY failure the original room is rejoined (bootstrap snapshot taken
+ * before leaving), the vestibule lights 'fault', and the avatar walks back
+ * in through the departure door — the fade covers both directions.
+ */
+async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
+  if (transitInProgress) return;
+  transitInProgress = true;
+  // Snapshot BEFORE leaving: leaveRoom keeps activeBootstrap as last-room
+  // memory, but joinRoom(target) overwrites it — this is the way back.
+  const originalBoot = activeBootstrap;
+  let leftOriginalRoom = false;
+  try {
+    const imported = decodeBootstrapInput(seedString);
+    if (!imported) {
+      throw new Error('Unreadable docking seed on the paired door');
+    }
+    const target = await resolveBridgeBootstrap(imported);
+    await transitFadeTo(true);
+    await leaveRoom();
+    leftOriginalRoom = true;
+    // Rooms WE minted this session (PROVISION NEW MODULE) are first-entries
+    // into a fresh unowned room — claim the defaults; everything else joins.
+    await joinRoom(target, /* claimRoomDefaults */ mintedRoomIds.has(target.roomId));
+    // Reposition behind the opaque curtain: vestibule down, avatar at the
+    // arrival door's through point, door opening, scripted walk-in.
+    world.completeAdapterArrival(departureDoorId);
+    await transitFadeTo(false);
+  } catch (err) {
+    console.warn('Adapter transit failed — resealing to the departure room:', err);
+    await transitFadeTo(true); // no-op visually if already opaque
+    if (leftOriginalRoom) {
+      // Tear down whatever half-open session the failed join left behind
+      // (idempotent), then re-dock to the original room — local and fast.
+      await leaveRoom();
+      if (originalBoot) {
+        try {
+          await joinRoom(originalBoot, /* claimRoomDefaults */ false);
+        } catch (rejoinErr) {
+          console.warn('Could not rejoin the departure room after a failed transit:', rejoinErr);
+          await leaveRoom();
+          updateHUDNode('OFFLINE', '#ff1744');
+          updateHUDP2P('OFFLINE', '#ff1744');
+        }
+      }
+    }
+    world.failAdapterTransit(departureDoorId);
+    await transitFadeTo(false);
+    showHint('Dock seal failed.');
+  } finally {
+    transitInProgress = false;
+  }
+}
+
+/**
+ * Wire the adapter-transit choreography once the world's docking system
+ * exists (called right after startMorph builds the platform): the swap
+ * driver on the World, and the module-minting callback on the docking pane
+ * (docking.ts never imports main.ts — existing callback-wiring pattern).
+ */
+function wireAdapterTransit(): void {
+  world.onAdapterTransit = (seed, departureDoorId) => {
+    void transitTo(seed, departureDoorId);
+  };
+  world.dockingSystem?.onProvisionModule(async () => {
+    const bytes = new Uint8Array(3);
+    crypto.getRandomValues(bytes);
+    const roomId = `module-${Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`;
+    const minted = await mintBootstrapLink(undefined, roomId);
+    if (!minted.link) return null;
+    mintedRoomIds.add(roomId);
+    return minted.link;
+  });
+}
+
 // ── Player identity in the room doc (issue #20 S2) ───────────────────────────
 
 /** Shape of a `players` map entry. Plain JSON — no Y types nested inside. */
@@ -993,9 +1119,15 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   };
 }
 
-function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerprint): RoomBootstrap {
-  const roomId = activeBootstrap?.roomId ?? 'furlong-lobby';
-  const roomKeyB64 = activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
+function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerprint, roomIdOverride?: string): RoomBootstrap {
+  // roomIdOverride (T1 of #30): mint against a FRESH room on our own node
+  // (PROVISION NEW MODULE) instead of the currently-joined room. The room key
+  // is minted+persisted per roomId, so re-provisioning the same id (never
+  // happens — ids are random) or later rejoining reuses the same key.
+  const roomId = roomIdOverride ?? activeBootstrap?.roomId ?? 'furlong-lobby';
+  const roomKeyB64 = roomIdOverride
+    ? getOrCreateRoomKeyB64(roomId)
+    : activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
 
   const localHint = getLocalNodeHint(fingerprint);
   const mergedHints = mergeMemberHints(
@@ -1018,7 +1150,7 @@ function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerpri
   };
 }
 
-async function mintBootstrapLink(rawAddress?: string): Promise<{ link?: string; error?: string; scope?: ReturnType<typeof classifyAddress> }> {
+async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): Promise<{ link?: string; error?: string; scope?: ReturnType<typeof classifyAddress> }> {
   const fingerprint = await fetchLocalFingerprint();
   if (!fingerprint) {
     return { error: 'Local node not reachable — launch the app (or Rust node) first.' };
@@ -1045,7 +1177,7 @@ async function mintBootstrapLink(rawAddress?: string): Promise<{ link?: string; 
     setNetworkRow('network-address-type', 'AUTO (node hints)');
   }
 
-  const boot = buildOutgoingBootstrap(wtUrl, fingerprint);
+  const boot = buildOutgoingBootstrap(wtUrl, fingerprint, roomIdOverride);
   // 🐛 0.16.0: links minted inside the packaged app carried the origin
   // http://tauri.localhost — a WebView-internal host that resolves NOWHERE
   // outside the app, so shared links silently went nowhere when opened in a
@@ -1760,6 +1892,9 @@ function setupClickToEnter() {
 
     // Expand platform (planet → lobby morph) and bring networking up
     world.startMorph();
+    // startMorph built the docking system synchronously — wire the adapter
+    // transit driver + PROVISION NEW MODULE minting onto it (T1 of #30).
+    wireAdapterTransit();
     bootstrapNetworking();
 
     // Hide welcome overlay
