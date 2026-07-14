@@ -909,6 +909,10 @@ const buildGameTable = (ctx: BuildCtx) => {
 
   // ── Flip tween: constant-duration smoothstep rotation about the long (x)
   //    axis with a sine lift, driven from World.update (trunk-lid idiom).
+  //    The flip is CLIENT-LOCAL in v1 (review F3): cardsUp lives in this
+  //    closure and flip() only fires from the local focused UI, so peers can
+  //    see different faces of the same table while the game state underneath
+  //    stays shared. Doc-sync a per-table cardsUp when the card side is real.
   let flipT = 1;               // 1 = at rest
   let fromAngle = 0;
   let toAngle = 0;

@@ -221,11 +221,17 @@ export function chooseBotMove(state: CheckersState): CheckersMove | null {
 export function isCheckersState(value: unknown): value is CheckersState {
   if (typeof value !== 'object' || value === null) return false;
   const s = value as Partial<CheckersState>;
+  // Strict integer/range/type checks (review F2): a fractional cell is a
+  // phantom jumpable piece, an unbounded chain soft-locks legalMoves, and a
+  // non-string players entry throws in every displayName reader — inside the
+  // Yjs observe callback, taking the whole notify loop down with it.
+  const playerOk = (p: unknown) => p === null || typeof p === 'string';
   return Array.isArray(s.board) && s.board.length === 64
-    && s.board.every((v) => typeof v === 'number' && v >= EMPTY && v <= BLACK_KING)
+    && s.board.every((v) => Number.isInteger(v) && (v as number) >= EMPTY && (v as number) <= BLACK_KING)
     && (s.turn === 'red' || s.turn === 'black')
     && typeof s.players === 'object' && s.players !== null
+    && playerOk(s.players.red) && playerOk(s.players.black)
     && ['waiting', 'playing', 'red-won', 'black-won'].includes(s.status as string)
-    && (s.chain === null || typeof s.chain === 'number')
+    && (s.chain === null || (Number.isInteger(s.chain) && (s.chain as number) >= 0 && (s.chain as number) < 64))
     && typeof s.bot === 'boolean';
 }

@@ -896,10 +896,14 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   };
 
   /** RESET gate: participants or the room owner mid-game; ANYONE once the
-   *  game is finished (otherwise departed winners would pin the seats). */
+   *  game is finished (otherwise departed winners would pin the seats).
+   *  Bot games are always resettable (review F5): the bot holds no real seat,
+   *  so if the red claimant leaves mid-game no seat-holder remains — without
+   *  this an owner-absent room's table is pinned at BLACK (BOT) forever. */
   const canReset = (s: CheckersState | null): boolean => {
     if (!s) return false;
     if (s.status === 'red-won' || s.status === 'black-won') return true;
+    if (s.bot) return true;
     return mySeat(s) !== null || readRoomOwner() === myId;
   };
 
@@ -907,6 +911,10 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     const s = readGame(deps.itemId);
     if (!canReset(s)) return;
     selected = null;
+    // Whole-value LWW (review F4): an in-flight opponent move-write carries a
+    // full old-state snapshot and may win over this reset, silently undoing
+    // it. Converges to a valid state and RESET again recovers; a monotonic
+    // seq field is the robust fix if games outgrow v1.
     writeGame(deps.itemId, initialState());
   };
 
@@ -1083,7 +1091,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           canReset(s) ? 'Clear the board and both seats' : 'Participants or the room owner reset a live game')}
       </div>`}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF GAME TABLE v1 · checkers (American rules, forced captures) · state synced via room doc
+        SSF GAME TABLE v1 · checkers (American rules, forced captures) · state synced via room doc · flip is per-player (only you see the other face)
       </div>
     `;
 

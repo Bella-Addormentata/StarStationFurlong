@@ -31,7 +31,15 @@ const listeners = new Set<() => void>();
 
 function notify(): void {
   // Copy: a listener may unsubscribe (or mount a new UI) mid-notify.
-  for (const listener of [...listeners]) listener();
+  // Isolate: this runs inside Yjs's observe callback — one throwing render
+  // must not kill the remaining listeners or Yjs's transaction cleanup.
+  for (const listener of [...listeners]) {
+    try {
+      listener();
+    } catch (err) {
+      console.error('[games] listener threw during doc notify:', err);
+    }
+  }
 }
 
 /** True while the bound doc is usable (leaveRoom destroys the previous doc). */
