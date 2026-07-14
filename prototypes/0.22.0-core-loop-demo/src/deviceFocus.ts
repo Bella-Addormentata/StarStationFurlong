@@ -44,7 +44,15 @@ import * as THREE from 'three';
 import type { DeviceTarget, DeviceUI } from './devices';
 import type { Player } from './player';
 
-type FocusState = 'IDLE' | 'WALKING' | 'FOCUSING' | 'FOCUSED' | 'RELEASING';
+/**
+ * PREPARING (TR2 of #35) sits between arrival and the camera ease: devices
+ * with a DeviceTarget.prepare hook (the trunk's lid swing) hold there — ortho
+ * camera still live, avatar visible — until prepare's onReady fires, then the
+ * ease begins. Input is treated as focused during PREPARING (isActive() true:
+ * +/-/m suppressed, canvas clicks release) so the camera can't be yanked to
+ * another zoom level mid-choreography.
+ */
+type FocusState = 'IDLE' | 'WALKING' | 'PREPARING' | 'FOCUSING' | 'FOCUSED' | 'RELEASING';
 
 /** Ease duration each way (seconds) — plan §D0.1. */
 const EASE_TIME = 0.45;
@@ -97,16 +105,21 @@ class DeviceFocusController {
       if (document.getElementById('spacephone-container')?.classList.contains('active')) {
         return; // #31 owns Esc while the phone is open
       }
-      if (this.state === 'FOCUSING' || this.state === 'FOCUSED') {
+      if (this.state === 'PREPARING' || this.state === 'FOCUSING' || this.state === 'FOCUSED') {
         e.preventDefault();
         this.release();
       }
     });
   }
 
-  /** True while the focus camera owns the view (FOCUSING/FOCUSED/RELEASING). */
+  /**
+   * True while the focus sequence owns the view/input (PREPARING/FOCUSING/
+   * FOCUSED/RELEASING). During PREPARING the ortho camera is technically
+   * still live, but input must already behave as focused — see FocusState.
+   */
   public isActive(): boolean {
-    return this.state === 'FOCUSING' || this.state === 'FOCUSED' || this.state === 'RELEASING';
+    return this.state === 'PREPARING' || this.state === 'FOCUSING'
+      || this.state === 'FOCUSED' || this.state === 'RELEASING';
   }
 
   /** Current controller state (debug/verification handle). */
@@ -132,10 +145,22 @@ class DeviceFocusController {
   }
 
   /**
-   * Begin the release ease (FOCUSED or mid-FOCUSING). No-op in every other
-   * state, so repeated WASD/click/Esc release requests are harmless.
+   * Begin the release ease (FOCUSED, mid-FOCUSING, or PREPARING). No-op in
+   * every other state, so repeated WASD/click/Esc release requests are
+   * harmless. Release-side device choreography (DeviceTarget.onRelease — the
+   * trunk lid closing) is fired here and runs in PARALLEL with the camera
+   * ease (plan §TR2: unmount → closeLid ∥ ease).
    */
   public release(): void {
+    if (this.state === 'PREPARING') {
+      // The camera was never swapped — just reverse the prepare choreography
+      // and hand control straight back (no ease to run).
+      this.active?.device.onRelease?.();
+      this.state = 'IDLE';
+      this.active = null;
+      this.player?.releaseDevice();
+      return;
+    }
     if (this.state !== 'FOCUSED' && this.state !== 'FOCUSING') return;
     const player = this.player;
     if (!player || !this.focusCam) { this.forceRelease(); return; }
@@ -144,6 +169,7 @@ class DeviceFocusController {
       this.active.ui.unmount();
       this.uiMounted = false;
     }
+    this.active?.device.onRelease?.(); // e.g. trunk lid close, parallel to the ease
 
     // Reverse ease from wherever the camera currently is back to the exact
     // iso offset over the player (who cannot move while ENGAGED).
@@ -167,6 +193,7 @@ class DeviceFocusController {
       this.active.ui.unmount();
       this.uiMounted = false;
     }
+    this.active?.device.onRelease?.(); // reverse any prepare choreography
     if (this.isActive() && this.orthoCam) {
       (window.gameRenderer as { camera: THREE.Camera }).camera = this.orthoCam;
     }
@@ -228,6 +255,35 @@ class DeviceFocusController {
     this.orthoCam = cam;
     this.active = { device: this.nextTarget.device, ui: this.nextTarget.ui };
     this.nextTarget = null;
+
+    // Pre-focus choreography (TR2): devices with a prepare hook (trunk lid)
+    // hold in PREPARING — ortho camera live, avatar standing at the device —
+    // until onReady, then the ease begins. deviceSeq guards a stale onReady
+    // (release/re-route during the choreography bumps the seq).
+    const device = this.active.device;
+    if (device.prepare) {
+      this.state = 'PREPARING';
+      device.prepare(() => {
+        if (seq !== this.deviceSeq || this.state !== 'PREPARING') return;
+        this.startFocusing();
+      });
+      return;
+    }
+    this.startFocusing();
+  }
+
+  /** Swap to the focus camera and start the ease (from onArrived/PREPARING). */
+  private startFocusing(): void {
+    // Re-validate the camera: PREPARING suppresses zoom input (isActive()),
+    // but if anything swapped the camera during the choreography, abort
+    // cleanly instead of corrupting the restore-on-exit chain.
+    if (!this.active || !this.orthoCam || window.gameRenderer?.camera !== this.orthoCam) {
+      this.active?.device.onRelease?.();
+      this.state = 'IDLE';
+      this.active = null;
+      this.player?.releaseDevice();
+      return;
+    }
 
     if (!this.focusCam) {
       this.focusCam = new THREE.PerspectiveCamera(

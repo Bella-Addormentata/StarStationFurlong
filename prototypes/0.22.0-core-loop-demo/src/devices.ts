@@ -28,6 +28,12 @@ import { FURNITURE, buildDeviceList, itemAabb } from './furniture';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import type { DoorDockingPortSystem, DockingState } from './docking';
 import type { DoorId } from './doors';
+import {
+  getItemDef, loadTrunkState,
+  TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
+} from './items';
+import type { ItemDef } from './items';
+import { loadSavedOutfitId } from './outfits';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -59,6 +65,22 @@ export interface DeviceTarget {
   eye: THREE.Vector3;
   /** Focus-camera look target (world space). */
   anchor: THREE.Vector3;
+  /**
+   * Optional pre-focus choreography (TR2 of #35 — e.g. the trunk lid swing).
+   * Called exactly once when the avatar arrives at `front`; the controller
+   * holds in PREPARING (ortho camera still live, room fully visible) and only
+   * starts the camera ease + UI mount after `onReady` fires. Derived
+   * DeviceTargets are plain data — World augments the trunk's target with
+   * this hook at requestDeviceFocus time (the lid handle lives on the built
+   * group, not in the registry).
+   */
+  prepare?(onReady: () => void): void;
+  /**
+   * Optional release-side choreography — fired once on every release path
+   * (ease-back start, PREPARING abort, force-release). Fire-and-forget: the
+   * trunk lid closes in parallel with the camera ease (plan §TR2).
+   */
+  onRelease?(): void;
 }
 
 /**
@@ -103,6 +125,23 @@ export interface WallScreenHandle {
   updateStatus(status: WallComputerStatus): void;
   /** Dim the in-world screen to "TERMINAL IN USE" while a player is focused. */
   setEngaged(engaged: boolean): void;
+}
+
+// ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
+
+/**
+ * Handle onto a storage trunk's animated lid. The builder (furniture.ts)
+ * stows it in the lid slab's userData.trunkLid; World collects it, drives
+ * update(dt) every frame (door-slide idiom), and wires openLid/closeLid into
+ * the focus choreography via DeviceTarget.prepare/onRelease.
+ */
+export interface TrunkLidHandle {
+  /** Swing the lid open (~100° back). onComplete fires exactly once on arrival. */
+  openLid(onComplete?: () => void): void;
+  /** Swing the lid closed. onComplete fires exactly once on arrival. */
+  closeLid(onComplete?: () => void): void;
+  /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
+  update(deltaTime: number): void;
 }
 
 // ── Registry derivation (mirrors seats.ts) ────────────────────────────────────
@@ -364,6 +403,191 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         refreshTimer = 0;
         refresh();
       }
+    },
+  };
+}
+
+// ── TR2 storage-trunk focused UI ──────────────────────────────────────────────
+
+export interface StorageTrunkUIDeps {
+  /** Furniture item id — one localStorage key per (room, trunk). */
+  itemId: string;
+  /** Stable room id (bootstrap roomId, NOT the editable display name). */
+  roomId: string;
+  /**
+   * TR3 equip path: rig setOutfit + 'ssf-outfit' persistence (+ the S2
+   * players-map outfit id once that lane exists). Returns false for unknown
+   * outfit ids.
+   */
+  applyOutfit(outfitId: string): boolean;
+}
+
+const TRUNK_GOLD = '#d4a84b';
+const TRUNK_GOLD_BRIGHT = '#F0C060';
+const TRUNK_DIM = '#4A5560';
+
+/**
+ * The storage trunk's focused DOM UI (plan §3 TR2): two stacked trays over
+ * the opened 3D trunk — TOOLS grid (8 slots) on top, WARDROBE (4 slots)
+ * beneath — rendered from the trunk's local slot state. Clicking a tile opens
+ * an inspect card (name + kind + flavor); outfit items add an EQUIP button
+ * that routes into the TR3 rig path. LOCAL ONLY, and says so on the panel
+ * (`LOCAL STOWAGE — not yet synced`); no cross-trunk transfer, no world drops
+ * (deferred by the plan). Styling matches the wall computer's focused UI
+ * (gold-on-dark monospace, docking-pane palette).
+ */
+export function createStorageTrunkUI(deps: StorageTrunkUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let selectedSlot = -1;
+
+  const state = () => loadTrunkState(deps.roomId, deps.itemId);
+
+  const tileHtml = (def: ItemDef | null, slot: number): string => {
+    const selected = slot === selectedSlot && def;
+    const base = `
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      gap:3px; height:64px; border-radius:6px; box-sizing:border-box; padding:4px;
+      font-size:8px; letter-spacing:0.4px; text-align:center; user-select:none;
+    `;
+    if (!def) {
+      return `<div data-slot="${slot}" style="${base}
+        border:1px dashed rgba(212,168,75,0.16); color:#33404E;">EMPTY</div>`;
+    }
+    return `<div data-slot="${slot}" class="trunk-tile" style="${base}
+      border:1px solid ${selected ? TRUNK_GOLD_BRIGHT : 'rgba(212,168,75,0.35)'};
+      background:${selected ? 'rgba(212,168,75,0.16)' : 'rgba(212,168,75,0.05)'};
+      color:${TRUNK_GOLD}; cursor:pointer;">
+      <span style="font-size:22px; line-height:1;">${def.icon}</span>
+      <span>${def.name.toUpperCase()}</span>
+    </div>`;
+  };
+
+  const inspectHtml = (): string => {
+    const slots = state().slots;
+    const id = selectedSlot >= 0 ? slots[selectedSlot] : null;
+    const def = id ? getItemDef(id) : null;
+    if (!def) {
+      return `<div style="font-size:10px; color:${TRUNK_DIM}; letter-spacing:0.5px;">
+        SELECT AN ITEM TO INSPECT</div>`;
+    }
+    const equippedId = loadSavedOutfitId() ?? 'default';
+    const isEquipped = def.kind === 'outfit' && def.outfit === equippedId;
+    const equipRow = def.kind === 'outfit'
+      ? (isEquipped
+        ? `<span style="font-size:10px; font-weight:800; color:#00E676; letter-spacing:1px;">✓ EQUIPPED</span>`
+        : `<button id="trunk-equip-btn" style="
+            background:rgba(212,168,75,0.12); color:${TRUNK_GOLD_BRIGHT};
+            border:1px solid rgba(212,168,75,0.5); border-radius:4px;
+            font-family:inherit; font-size:10px; font-weight:800; letter-spacing:1.5px;
+            padding:5px 14px; cursor:pointer;">EQUIP</button>`)
+      : '';
+    return `
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span style="font-size:26px;">${def.icon}</span>
+        <div style="flex:1; min-width:0;">
+          <div style="font-size:12px; font-weight:800; color:${TRUNK_GOLD_BRIGHT}; letter-spacing:1px;">${def.name.toUpperCase()}</div>
+          <div style="font-size:9px; color:#8FA3B8; letter-spacing:1px;">${def.kind.toUpperCase()}</div>
+        </div>
+        ${equipRow}
+      </div>
+      <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.5;">${def.flavor}</div>
+    `;
+  };
+
+  const render = () => {
+    if (!panel) return;
+    const slots = state().slots;
+    const toolTiles: string[] = [];
+    for (let i = 0; i < TOOL_SLOT_COUNT; i++) {
+      const id = slots[i];
+      toolTiles.push(tileHtml(id ? getItemDef(id) ?? null : null, i));
+    }
+    const outfitTiles: string[] = [];
+    for (let i = TOOL_SLOT_COUNT; i < TOTAL_SLOT_COUNT; i++) {
+      const id = slots[i];
+      outfitTiles.push(tileHtml(id ? getItemDef(id) ?? null : null, i));
+    }
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${TRUNK_GOLD_BRIGHT}; letter-spacing:1px;">▣ STORAGE TRUNK · ISS-ST04</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:9px; color:${TRUNK_DIM}; letter-spacing:1.5px;">LOCAL STOWAGE — not yet synced</div>
+      <div>
+        <div style="font-size:10px; color:${TRUNK_GOLD}; letter-spacing:2px; margin-bottom:6px;">TOOLS</div>
+        <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:6px;">${toolTiles.join('')}</div>
+      </div>
+      <div>
+        <div style="font-size:10px; color:${TRUNK_GOLD}; letter-spacing:2px; margin-bottom:6px;">WARDROBE</div>
+        <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:6px;">${outfitTiles.join('')}</div>
+      </div>
+      <div id="trunk-inspect" style="min-height:64px; display:flex; flex-direction:column; gap:8px; justify-content:center;
+        border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:10px 12px; background:rgba(10,16,24,0.6);">
+        ${inspectHtml()}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF STOWAGE v1 · 8 tool + 4 wardrobe slots</div>
+    `;
+
+    // Tile selection → inspect card
+    panel.querySelectorAll<HTMLElement>('.trunk-tile').forEach((tile) => {
+      tile.addEventListener('click', () => {
+        selectedSlot = parseInt(tile.dataset.slot ?? '-1', 10);
+        render();
+      });
+    });
+    // EQUIP → TR3 path (rig recolor + accessory + 'ssf-outfit' persistence)
+    panel.querySelector<HTMLButtonElement>('#trunk-equip-btn')?.addEventListener('click', () => {
+      const id = state().slots[selectedSlot];
+      const def = id ? getItemDef(id) : null;
+      if (def?.kind === 'outfit' && def.outfit && deps.applyOutfit(def.outfit)) {
+        render(); // re-render: EQUIP → ✓ EQUIPPED
+      }
+    });
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-trunk-pane';
+      // Same gold-on-dark monospace shell as the room terminal; nudged above
+      // center so the opened 3D trunk stays visible under the downward gaze.
+      panel.style.cssText = `
+        position: absolute;
+        top: 44%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 400px;
+        max-height: 86vh;
+        overflow-y: auto;
+        background: rgba(4, 8, 22, 0.93);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        color: ${TRUNK_GOLD};
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box;
+        pointer-events: auto;
+      `;
+      // Input capture (plan §D0.3): clicks inside the trunk UI never reach
+      // the canvas handler — clicks that DO reach it release the focus.
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      selectedSlot = -1;
+      render();
+    },
+
+    unmount(): void {
+      panel?.remove();
+      panel = null;
+    },
+
+    update(_dt: number): void {
+      // Slot state only changes through this UI in v1 (no sync, no drops) —
+      // nothing to poll. TR-sync will hang its observer re-render here.
     },
   };
 }

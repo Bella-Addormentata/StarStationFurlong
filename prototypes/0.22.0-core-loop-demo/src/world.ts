@@ -10,12 +10,14 @@ import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
 import { findDoor } from './doors';
-import { findDevice, createRoomTerminalUI, readLiveRoomStatus } from './devices';
-import type { WallScreenHandle } from './devices';
+import { findDevice, createRoomTerminalUI, createStorageTrunkUI, readLiveRoomStatus } from './devices';
+import type { WallScreenHandle, TrunkLidHandle, DeviceTarget } from './devices';
 import { deviceFocus } from './deviceFocus';
 import { showHint } from './hud';
 import { DoorDockingPortSystem } from './docking';
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from './voxelCharacter';
+import { getOutfitById, saveOutfitId } from './outfits';
+import type { OutfitDef } from './outfits';
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -65,6 +67,8 @@ export class World {
   private wallScreens: Map<string, WallScreenHandle> = new Map();
   /** Accumulator for the 1 Hz wall-screen status redraw. */
   private screenStatusTimer = 0;
+  /** Animated trunk lids, keyed by item id (TR2 — driven every frame). */
+  private trunkLids: Map<string, TrunkLidHandle> = new Map();
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -446,6 +450,12 @@ export class World {
           if (obj.userData.wallScreen) {
             this.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
           }
+          // Storage-trunk lids (TR2): collect the animation handle the
+          // builder stowed on the lid slab; update() drives it every frame
+          // (door-slide idiom) and requestDeviceFocus wires open/close.
+          if (obj.userData.trunkLid) {
+            this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
+          }
         } else if (obj instanceof THREE.PointLight) {
           this.furnitureLights.push({ light: obj, targetIntensity: (obj.userData.targetIntensity as number) ?? 0 });
         }
@@ -809,6 +819,9 @@ export class World {
     // Advance door leaf slides (update-loop driven, completion-signalled)
     if (this.dockingSystem) this.dockingSystem.update(deltaTime);
 
+    // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
+    for (const lid of this.trunkLids.values()) lid.update(deltaTime);
+
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
 
@@ -1046,19 +1059,74 @@ export class World {
   public requestDeviceFocus(deviceId: string): void {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
-    if (device.kind !== 'roomTerminal') {
-      // Desk computer / map table / trunk UIs arrive with M3/M4/TR2.
-      showHint('This device is not operational yet.');
+
+    if (device.kind === 'roomTerminal') {
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const ui = createRoomTerminalUI({
+        dockingSystem: this.dockingSystem,
+        getPlayerPos: () => this.player.getPosition(),
+        // Dim the in-world screen to "TERMINAL IN USE" while focused (D0.4).
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
-    const screen = this.wallScreens.get(deviceId) ?? null;
-    const ui = createRoomTerminalUI({
-      dockingSystem: this.dockingSystem,
-      getPlayerPos: () => this.player.getPosition(),
-      // Dim the in-world screen to "TERMINAL IN USE" while focused (D0.4).
-      onEngagedChange: (engaged) => screen?.setEngaged(engaged),
-    });
-    deviceFocus.beginFocus(this.player, device, ui);
+
+    if (device.kind === 'storageTrunk') {
+      const ui = createStorageTrunkUI({
+        itemId: deviceId,
+        roomId: World.activeRoomId(),
+        applyOutfit: (outfitId) => this.applyLocalOutfit(outfitId),
+      });
+      // Wire the lid choreography (plan §TR2: onArrived → openLid → ease →
+      // UI; release: unmount → closeLid ∥ ease). Derived DeviceTargets are
+      // plain registry data, so the per-item lid handle is bound here via a
+      // shallow augmented copy — the shared DEVICES entry stays untouched.
+      const lid = this.trunkLids.get(deviceId);
+      const target: DeviceTarget = lid
+        ? {
+          ...device,
+          prepare: (onReady) => lid.openLid(onReady),
+          onRelease: () => lid.closeLid(),
+        }
+        : device;
+      deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    // Desk computer / map table UIs arrive with M3/M4.
+    showHint('This device is not operational yet.');
+  }
+
+  /**
+   * Stable room id for per-room local state (TR2 trunk stowage keys).
+   * main.ts publishes the bootstrap roomId on join; before networking is up
+   * (or when it fails) this matches main.ts's own 'furlong-lobby' fallback.
+   */
+  private static activeRoomId(): string {
+    const id = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+    return typeof id === 'string' && id.length > 0 ? id : 'furlong-lobby';
+  }
+
+  /**
+   * TR3 equip path for the trunk UI (TR2 of #35): recolor the local rig +
+   * attach the outfit's accessory and persist to 'ssf-outfit' — the exact
+   * path main.ts's applyOutfitById/__setOutfit runs at boot. Delegates to
+   * main.ts's window handle when present so future extensions of the boot
+   * path (e.g. S2's players-map outfit id — not merged yet, hence the guard)
+   * apply here for free; falls back to direct rig application otherwise.
+   */
+  private applyLocalOutfit(outfitId: string): boolean {
+    const viaMain = (window as unknown as { __setOutfit?: (id: string) => boolean }).__setOutfit;
+    if (typeof viaMain === 'function') return viaMain(outfitId);
+    const outfit = getOutfitById(outfitId);
+    if (!outfit) return false;
+    // Player keeps its rig private; reach through for this cosmetic path
+    // (same escape hatch main.ts uses — frozen player/character public API).
+    (this.player as unknown as { character: { setOutfit(o: OutfitDef): void } })
+      .character.setOutfit(outfit);
+    saveOutfitId(outfitId);
+    return true;
   }
 
   isPlayerActive(): boolean {

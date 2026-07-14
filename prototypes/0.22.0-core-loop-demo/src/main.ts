@@ -322,6 +322,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
   await networkProvider.connect(boot);
   if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
   activeBootstrap = boot;
+  // Stable room id for per-room LOCAL state (TR2 trunk stowage keys —
+  // world.ts activeRoomId). The bootstrap roomId, NOT the editable display
+  // name; before any join, consumers fall back to 'furlong-lobby' like the
+  // rest of this file.
+  (window as any).__ssfRoomId = boot.roomId;
   await syncShareLink();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
@@ -1477,30 +1482,10 @@ async function init() {
     }
   }
 
-  // ── Dev-only preview flag (PR-P of #33/#35): `?deviceprops=1` renders the
-  // storage-trunk prop for visual iteration. Cosmetic only — no gameplay/
-  // network/focus wiring. The wall computer graduated to a real furniture-
-  // registry item with D0+M1 (furniture.ts 'wall-computer'), so the flag now
-  // only spawns the TRUNK (its focus wiring arrives with TR2). try/catch: a
-  // failed preview chunk must never take init() down (PR #34's guard).
-  if (new URLSearchParams(location.search).get('deviceprops') === '1') {
-    try {
-      const props = await import('./deviceProps');
-      const trunk = props.buildStorageTrunk();
-      trunk.group.position.set(-2.5, 0, -4.6);        // north-wall flank, clear of OBSTACLES
-      scene.add(trunk.group);
-      (window as any).__trunk = trunk;                // console handle for iteration
-      setInterval(() => trunk.update(0.033), 33);     // drives the lid ease (dev-cheap)
-      // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
-      setInterval(() => {
-        const zv = (window as any).multiScaleZoom;
-        trunk.group.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
-      }, 250);
-    } catch (e) {
-      // A failed preview chunk load must never take the whole app down.
-      console.warn('deviceprops preview failed to load:', e);
-    }
-  }
+  // (The PR-P `?deviceprops=1` preview flag is fully retired: the wall
+  // computer graduated with D0+M1 and the storage trunk with TR2 — both are
+  // real furniture-registry items now, so the flag would spawn nothing.
+  // deviceProps.ts was deleted with it.)
 
   // Initialize input manager
   inputManager = new inputModule.InputManager();
