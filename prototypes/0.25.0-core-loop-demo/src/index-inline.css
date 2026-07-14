@@ -192,6 +192,14 @@
         cursor: pointer;
       }
 
+      /* #52: thin pointer left behind after the invite tooling moved to the
+         SpacePhone ACCESS app (mint + accept live there as room passes). */
+      .network-moved-note {
+        color: rgba(212, 168, 75, 0.55);
+        font-size: 10px;
+        margin-bottom: 6px;
+      }
+
       .network-diagnostics-drawer {
         margin-top: 6px;
         border: 1px solid rgba(212, 168, 75, 0.18);
@@ -805,6 +813,111 @@
         color: rgba(224, 226, 238, 0.3);
         text-transform: uppercase;
         letter-spacing: 0.5px;
+      }
+
+      /* 🚪 ACCESS app (#52) — room passes: MY PASS (mint) + ENTER WITH PASS */
+      #phone-app-access.active {
+        padding: 14px;
+        gap: 12px;
+        overflow-y: auto;
+      }
+
+      .phone-access-section {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        background: rgba(10, 14, 34, 0.9);
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        border-radius: 10px;
+        font-family: monospace;
+      }
+
+      .phone-access-header {
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        color: #d4a84b;
+      }
+
+      .phone-access-room-row {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        font-size: 11px;
+        min-width: 0;
+      }
+
+      .phone-access-room-label {
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        color: rgba(224, 226, 238, 0.4);
+        flex: 0 0 auto;
+      }
+
+      #access-room-name {
+        color: #90caf9;
+        font-weight: 700;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      #access-room-id {
+        flex: 0 1 auto;
+        font-size: 9px;
+        color: rgba(224, 226, 238, 0.35);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .phone-access-section input {
+        width: 100%;
+        box-sizing: border-box;
+        border-radius: 6px;
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        background: rgba(0, 0, 0, 0.3);
+        color: #d4a84b;
+        font-size: 10px;
+        font-family: monospace;
+        padding: 6px 8px;
+        outline: none;
+      }
+
+      .phone-access-section button {
+        border-radius: 8px;
+        border: 1px solid rgba(30, 136, 229, 0.3);
+        background: rgba(30, 136, 229, 0.12);
+        color: #90caf9;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        font-family: monospace;
+        padding: 7px 8px;
+        cursor: pointer;
+        transition: background 0.2s, border-color 0.2s;
+      }
+
+      .phone-access-section button:hover {
+        background: rgba(30, 136, 229, 0.25);
+        border-color: rgba(30, 136, 229, 0.6);
+      }
+
+      .phone-access-note {
+        font-size: 8.5px;
+        color: rgba(224, 226, 238, 0.35);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
+      #access-feedback {
+        font-family: monospace;
+        font-size: 9.5px;
+        color: rgba(212, 168, 75, 0.8);
+        min-height: 12px;
+        line-height: 1.4;
       }
 
       /* Scrollable Message Box */

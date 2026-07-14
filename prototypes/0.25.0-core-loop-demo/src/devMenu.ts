@@ -362,14 +362,16 @@ async function provisionModule(): Promise<void> {
       showHint('DEV: module provisioning returned no seed.');
       return;
     }
-    const pairingInput = document.getElementById('network-import-link') as HTMLInputElement | null;
-    if (pairingInput) pairingInput.value = seed;
+    // #52: the accept input moved into the phone — paste the seed into the
+    // ACCESS app's ENTER WITH PASS field (Tab → 🚪 ACCESS → USE PASS).
+    const passInput = document.getElementById('access-pass-input') as HTMLInputElement | null;
+    if (passInput) passInput.value = seed;
     try {
       await navigator.clipboard.writeText(seed);
-      showHint('DEV: module seed minted — copied to clipboard + pairing input.');
+      showHint('DEV: module seed minted — copied to clipboard + the phone ACCESS app.');
     } catch {
-      showHint(pairingInput
-        ? 'DEV: module seed minted — pasted into the pairing input.'
+      showHint(passInput
+        ? 'DEV: module seed minted — pasted into the phone ACCESS app.'
         : 'DEV: module seed minted (clipboard unavailable).');
     }
   } catch (e) {
