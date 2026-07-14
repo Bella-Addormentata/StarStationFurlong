@@ -1,0 +1,29 @@
+[package]
+name = "ssf-p2p-node"
+version = "0.27.0"
+edition = "2021"
+publish = false
+description = "Sovereign P2P Swarm Node & WebTransport Router (Phase 2 P2P Backbone)"
+
+[dependencies]
+# Standard sovereign realtime stack (v006 Â§12.1 pins)
+wtransport = { version = "0.6", features = ["quinn"] }
+# Compile iroh with default-features = false to prevent linking a excessive number of exported DLL symbols on Windows GNU, avoiding E0432 / export ordinal overflows
+# "portmapper" restores UPnP/NAT-PMP/PCP (reachability rung 1) that default-features = false silently dropped.
+iroh = { version = "1", default-features = false, features = ["tls-ring", "portmapper"] }
+# Sovereign zero-server discovery: publish/resolve node addresses via the BitTorrent Mainline DHT.
+iroh-mainline-address-lookup = "0.4"
+# Zero-hint same-LAN discovery (bare room key resolves on the local network, no internet needed).
+iroh-mdns-address-lookup = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+yrs = { version = "0.27", features = ["sync"] }
+blake3 = "1"
+rand = "0.8"
+# ChiaHub lane (REVIEW-20260710-ChiaHub.md): room-key-sealed presence records.
+# Pure-Rust AEAD — no linker-surface risk. Chain IO deps land in C1 after B-7.
+chacha20poly1305 = "0.10"
