@@ -599,6 +599,9 @@ async function leaveRoom(): Promise<void> {
  *  pattern: opacity transition on a fixed DOM layer). Lazily created. */
 let transitFadeEl: HTMLDivElement | null = null;
 const TRANSIT_FADE_MS = 400;
+/** Hard cap on the leave→join swap (review fix F3) — generous against the
+ *  same-node ~100-300 ms swap; T2's cross-node arrival gate supersedes it. */
+const SWAP_WATCHDOG_MS = 15_000;
 
 /** Ease the transit curtain to fully opaque (true) or clear (false).
  *  Resolves after the transition duration (timer, not transitionend — the
@@ -650,12 +653,49 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
       throw new Error('Unreadable docking seed on the paired door');
     }
     const target = await resolveBridgeBootstrap(imported);
-    await transitFadeTo(true);
-    await leaveRoom();
-    leftOriginalRoom = true;
     // Rooms WE minted this session (PROVISION NEW MODULE) are first-entries
     // into a fresh unowned room — claim the defaults; everything else joins.
-    await joinRoom(target, /* claimRoomDefaults */ mintedRoomIds.has(target.roomId));
+    const claiming = mintedRoomIds.has(target.roomId);
+    await transitFadeTo(true);
+    // Swap watchdog (review fix F3): a stalled leave/join would otherwise
+    // hold the opaque curtain forever with all input dead. The timeout
+    // throws into the catch below, whose recovery path already handles a
+    // half-open session (leaveRoom bumps the epoch, so the still-in-flight
+    // join unwinds silently through the T0 epoch guard when it resolves).
+    const swapPromise = (async () => {
+      await leaveRoom();
+      leftOriginalRoom = true;
+      await joinRoom(target, /* claimRoomDefaults */ claiming);
+    })();
+    // Detached-rejection guard: if the watchdog wins the race, the late swap
+    // rejection must not surface as an unhandled-rejection console error.
+    swapPromise.catch(() => { /* reported through the race */ });
+    let watchdogId = 0;
+    try {
+      await Promise.race([
+        swapPromise,
+        new Promise<never>((_, reject) => {
+          watchdogId = window.setTimeout(
+            () => reject(new Error(`Dock swap watchdog: no arrival within ${SWAP_WATCHDOG_MS / 1000} s`)),
+            SWAP_WATCHDOG_MS,
+          );
+        }),
+      ]);
+    } finally {
+      window.clearTimeout(watchdogId);
+    }
+    // Review fix F2: only the FIRST entry into a room we minted claims its
+    // defaults — from now on re-entering it is a plain join, so a rename
+    // made in that room survives later visits (the pre-sync !has('owner')
+    // claim guard always passes on an empty replica and would re-reset it).
+    if (claiming) mintedRoomIds.delete(target.roomId);
+    // Review fix F1: classify every future Retry-node reconnect as a JOIN —
+    // bootstrapNetworking claims defaults only when this override is null,
+    // and after a transit the current room is never a first-entry: foreign
+    // rooms were never ours to claim, and a just-claimed minted room already
+    // has its owner written (a re-claim would race the initial sync and
+    // steal/reset owner+name — the exact S2 bug the claim gate exists for).
+    pendingBootstrapOverride = target;
     // Reposition behind the opaque curtain: vestibule down, avatar at the
     // arrival door's through point, door opening, scripted walk-in.
     world.completeAdapterArrival(departureDoorId);
@@ -696,6 +736,10 @@ function wireAdapterTransit(): void {
   world.onAdapterTransit = (seed, departureDoorId) => {
     void transitTo(seed, departureDoorId);
   };
+  // Review fix F4: expose the transit latch so a door click during an
+  // in-flight swap falls through to the normal peek round-trip instead of
+  // spawning a vestibule whose transit would silently early-return.
+  world.isTransitBusy = () => transitInProgress;
   world.dockingSystem?.onProvisionModule(async () => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
@@ -1308,6 +1352,14 @@ function setupNetworkDetailsPanel() {
   if (retryBtn) {
     retryBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
+      // Review fix F5: the transit curtain blocks pointer events but not
+      // keyboard activation (Enter on a focused button) — a concurrent
+      // leave/join here would leave the transit's arrival choreography
+      // running against the wrong live session.
+      if (transitInProgress) {
+        if (feedback) feedback.textContent = 'Adapter transit in progress — try again in a moment.';
+        return;
+      }
       localFingerprint = null;
       if (feedback) feedback.textContent = 'Retrying local node handshake...';
       // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
@@ -1494,6 +1546,12 @@ function setupNetworkDetailsPanel() {
 
   if (useBtn && importInput) {
     useBtn.addEventListener('click', async () => {
+      // Review fix F5 (see the Retry handler above): keyboard activation
+      // pierces the transit curtain — refuse a concurrent join mid-swap.
+      if (transitInProgress) {
+        if (feedback) feedback.textContent = 'Adapter transit in progress — try again in a moment.';
+        return;
+      }
       const imported = decodeBootstrapInput(importInput.value.trim());
       if (!imported) {
         if (feedback) feedback.textContent = 'Invalid seed link.';

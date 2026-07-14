@@ -66,6 +66,14 @@ export class World {
    * Transit is only offered on paired doors when this is non-null.
    */
   public onAdapterTransit: ((seed: string, departureDoorId: DoorId) => void) | null = null;
+  /**
+   * Transit-latch mirror, wired by main.ts beside onAdapterTransit (review
+   * fix F4): true while a swap is in flight. A paired-door click then falls
+   * through to the normal peek round-trip — beginTransit would spawn a
+   * vestibule whose swap request the busy driver silently drops (never
+   * completed, never failed, never disposed).
+   */
+  public isTransitBusy: (() => boolean) | null = null;
   /** Live vestibule outside the departure door, or null (one at a time). */
   private transitVestibule: THREE.Group | null = null;
   // Lobby furniture (fades in to full opacity)
@@ -1031,9 +1039,12 @@ export class World {
     }
 
     const ds = this.dockingSystem;
-    /** A door offers transit when its pairing completed with a target seed
-     *  AND main.ts wired a swap driver (T1 of #30). */
+    /** A door offers transit when its pairing completed with a target seed,
+     *  main.ts wired a swap driver (T1 of #30), and no swap is already in
+     *  flight (review fix F4 — a busy driver would silently drop the request,
+     *  leaking the vestibule; fall through to the peek round-trip instead). */
     const transitReady = () => {
+      if (this.isTransitBusy && this.isTransitBusy()) return false;
       const state = ds.getDockingState(door.id);
       return !!(state && state.pairedSuccessfully && state.connectedRoomAddress)
         && this.onAdapterTransit !== null;
