@@ -137,6 +137,14 @@ class DeviceFocusController {
       || this.state === 'FOCUSED' || this.state === 'RELEASING';
   }
 
+  /** Id of the device currently focused (or being approached), or null. Its
+   *  value is the furniture item id (buildDeviceList sets device.id = item.id),
+   *  so callers can match it against a furniture item — issue #60 E4 uses this
+   *  to drop a focus whose item a remote edit moved/removed. */
+  public getActiveDeviceId(): string | null {
+    return this.active?.device.id ?? null;
+  }
+
   /** Current controller state (debug/verification handle). */
   public getState(): FocusState {
     return this.state;

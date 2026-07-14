@@ -68,6 +68,7 @@ import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
 import { showHint } from './hud';
 import { isDeviceFocusActive } from './deviceFocus';
+import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
 import type { World } from './world';
 
@@ -656,6 +657,11 @@ class RoomEditController {
     rebuildDevices();
     world.getPlayer().onObstaclesChanged(c.itemId);
 
+    // E4 (issue #60): publish the new placement AFTER the local commit, so the
+    // doc observer's reconcile finds local state already matching (self-echo
+    // no-op) while remote peers apply the move.
+    writeFurnitureItem(c.item);
+
     const itemId = c.itemId;
     this.carrying = null;
     // Back to the plain selected state (the item stays selected).
@@ -776,6 +782,11 @@ class RoomEditController {
     rebuildSeats();
     rebuildDevices();
     player.onObstaclesChanged(itemId);
+
+    // E4 (issue #60): drop it from the shared layout AFTER the local removal,
+    // so the doc observer's reconcile sees local state already matching (a
+    // self-echo no-op) while remote peers apply the removal.
+    deleteFurnitureItem(itemId);
 
     showHint(`Removed ${itemId} → room inventory (DEV menu › INVENTORY re-places it).`, 3200);
   }

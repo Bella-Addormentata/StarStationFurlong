@@ -19,6 +19,7 @@ import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
+import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 
 type RendererModule = typeof import('./renderer');
 
@@ -533,6 +534,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // UIs + the in-world board mirror in world.ts).
   bindGamesDoc(sync.doc);
 
+  // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
+  // item id, drives world.reconcileFurniture on every change (incl. the initial
+  // sync burst that gives a joiner the host's arrangement). Rebinds per join
+  // like players/games/roomInfo (T0 seam).
+  bindFurnitureDoc(sync.doc);
+
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap('roomInfo');
   // Ownership-claim race guard (S2 review fix): `roomMap.has('owner')` runs
@@ -553,6 +560,22 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       // name. Legacy rooms hold 'Local-Clone' here — see isLocalPlayerRoomOwner.
       roomMap.set('owner', getPlayerId());
       roomMap.set('name', boot.roomId || 'Lobby');
+    });
+  }
+  // E4 furniture seed (issue #60): the owner publishes the initial layout so
+  // joiners converge to it — but DEFERRED past the node's initial-state sync.
+  // Seeding from the empty pre-sync replica (the same seam the owner/name claim
+  // above documents) re-published defaults on every owner reload and, worse,
+  // resurrected peer-removed / reverted peer-moved items (review). So wait for
+  // whenServerSynced, then seed ONLY if the room is genuinely empty AND we own
+  // it — an already-edited room comes back non-empty and is left untouched.
+  if (claimRoomDefaults) {
+    const seedEpoch = epoch;
+    void sync.whenServerSynced.then(() => {
+      if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
+      if (roomMap.get('owner') === getPlayerId() && furnitureDocSize() === 0) {
+        seedFurnitureDefaults();
+      }
     });
   }
 
@@ -712,6 +735,44 @@ const TRANSIT_FADE_MS = 400;
 /** Hard cap on the leave→join swap (review fix F3) — generous against the
  *  same-node ~100-300 ms swap; T2's cross-node arrival gate supersedes it. */
 const SWAP_WATCHDOG_MS = 15_000;
+/** Issue #60 (P1.3): how long the transit curtain waits, AFTER the join, for
+ *  the host's room state (roomInfo owner+name) to arrive over the mesh before
+ *  entering anyway. A joiner's local node starts with an empty replica; the
+ *  host's owner/name land as bridged Yjs updates once the peer dial connects,
+ *  so without this the avatar was staged painting default Lobby/Local-Clone
+ *  values. On timeout we enter with defaults, which the roomInfo observer
+ *  (main.ts ~577) repaints live the moment the real state does arrive. */
+const SYNC_GATE_MS = 8_000;
+
+/**
+ * Resolve once the freshly-joined room's shared state has converged — the
+ * host's roomInfo `owner` AND `name` keys are present — or after `timeoutMs`
+ * as a fallback (issue #60 P1.3). Observes the CURRENT session's doc captured
+ * at call time; if a newer session/leave destroys it mid-wait, the timeout
+ * still resolves so the curtain never wedges.
+ */
+function awaitInitialRoomState(timeoutMs: number): Promise<void> {
+  const sync = yjsSync;
+  if (!sync) return Promise.resolve();
+  const roomMap = sync.doc.getMap('roomInfo');
+  const ready = () => roomMap.has('owner') && roomMap.has('name');
+  if (ready()) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const observer = () => { if (ready()) finish(); };
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { roomMap.unobserve(observer); } catch { /* doc may be destroyed */ }
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    roomMap.observe(observer);
+    // Guard the race between the initial ready() check and observe() attaching.
+    if (ready()) finish();
+  });
+}
 
 /** Ease the transit curtain to fully opaque (true) or clear (false).
  *  Resolves after the transition duration (timer, not transitionend — the
@@ -829,6 +890,12 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
     // has its owner written (a re-claim would race the initial sync and
     // steal/reset owner+name — the exact S2 bug the claim gate exists for).
     pendingBootstrapOverride = target;
+    // Issue #60 (P1.3): hold the curtain until the host's room state has synced
+    // (or the bounded fallback) so the avatar isn't staged in a room still
+    // showing the default name/owner (symptoms 1 & 5). Only foreign joins
+    // actually wait — a minted/own room already has owner+name written, and a
+    // same-node transit's replica is already populated, so both resolve at once.
+    await awaitInitialRoomState(SYNC_GATE_MS);
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);
