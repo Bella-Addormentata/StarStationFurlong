@@ -26,7 +26,7 @@
 
 import * as THREE from 'three';
 import type { Seat } from './seats';
-import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle } from './devices';
+import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle, TrunkLidHandle } from './devices';
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box { x0: number; z0: number; x1: number; z1: number }
@@ -49,7 +49,8 @@ export type FurnitureKind =
   | 'cherry-tree'
   | 'blossom-pot'
   | 'wall-computer'
-  | 'map-table';
+  | 'map-table'
+  | 'storage-trunk';
 
 export interface FurnitureItem {
   id: string;
@@ -91,6 +92,13 @@ export interface BuildCtx {
   flat: (color: number) => THREE.MeshBasicMaterial;
   place: (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number, ry?: number) => THREE.Mesh;
   addLight: (light: THREE.PointLight, x: number, y: number, z: number, targetIntensity: number) => void;
+  /**
+   * Add an arbitrary object (e.g. an animated sub-Group like the trunk lid)
+   * to the item group. Meshes inside still ride the morph fade-in / zoom-hide
+   * machinery (World traverses the whole group), so give them transparent
+   * opacity-0 materials via ctx.m — TR2 of #35.
+   */
+  attach: (obj: THREE.Object3D) => void;
 }
 
 export interface FurnitureDef {
@@ -552,6 +560,187 @@ const buildMapTable = (ctx: BuildCtx) => {
   addLight(new THREE.PointLight(HOLO_CYAN, 0, 3.5), 0, MT_HOLO_Y + 0.4, 0, 0.9);
 };
 
+// ── Storage trunk (TR2 of #35) — visuals adopted from PR #36's deviceProps.ts ──
+// Concept-art-faithful ISS crate: light-gray ribbed shell, orange corner
+// reinforcements + latch plates + lid trim, 'ISS-ST04' stencil decal, hinged
+// lid sub-Group. The lid animation is update-loop driven with completion
+// callbacks (PR #29's door-slide idiom, NOT a detached rAF loop): the builder
+// stows a TrunkLidHandle in the lid slab's userData.trunkLid; World collects
+// it, drives update(dt) every frame, and requestDeviceFocus wires openLid/
+// closeLid into the focus choreography (prepare / onRelease).
+const COL_TRUNK_BODY = 0xB8BEC6;   // light-gray ribbed shell
+const COL_TRUNK_RIB = 0xA6ADB6;    // slightly darker ribs / panel lines
+const COL_TRUNK_ORANGE = 0xE8760A; // corner reinforcements, latch plates, lid trim
+const COL_TRUNK_LATCH = 0x6E7680;  // gray latch hardware
+const COL_TRUNK_DARK = 0x14181E;   // interior cavity / label plate
+const COL_TRUNK_TRAY = 0x2A3038;   // tool-tray layer
+
+// Overall footprint ~1.0w × 0.65h × 0.6d, latch face toward local +z.
+const TRUNK_W = 1.0;
+const TRUNK_D = 0.6;
+const TRUNK_BODY_H = 0.5;    // shell height; lid adds 0.15 → 0.65 total
+const TRUNK_LID_H = 0.15;
+const TRUNK_WALL_T = 0.05;
+const LID_OPEN_ANGLE = -Math.PI * (100 / 180); // negative rotation.x = swing up + backward
+const LID_SPEED = 2.4; // rad/s, constant-speed ease
+
+/** One-shot pixel-text decal (star-window CanvasTexture idiom, world.ts). */
+function makeStencilTexture(text: string): THREE.CanvasTexture {
+  const cv = document.createElement('canvas');
+  cv.width = 128; cv.height = 48;
+  const ctx = cv.getContext('2d')!;
+  ctx.fillStyle = '#14181E';
+  ctx.fillRect(0, 0, 128, 48);
+  ctx.strokeStyle = '#3A424C';
+  ctx.strokeRect(2.5, 2.5, 123, 43);
+  ctx.fillStyle = '#E8ECF2';
+  ctx.font = 'bold 18px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 64, 25);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  return tex;
+}
+
+const buildStorageTrunk = (ctx: BuildCtx) => {
+  const { m, place, attach } = ctx;
+  const W = TRUNK_W, D = TRUNK_D, BH = TRUNK_BODY_H, LH = TRUNK_LID_H, T = TRUNK_WALL_T;
+
+  // Shared materials (each mesh sets opacity via the morph fade — sharing is
+  // safe, the fade writes the same value to every user).
+  const bodyMat = m(COL_TRUNK_BODY, 0.65, 0.35);
+  const ribMat = m(COL_TRUNK_RIB, 0.7, 0.3);
+  const orangeMat = m(COL_TRUNK_ORANGE, 0.5, 0.4);
+  const latchMat = m(COL_TRUNK_LATCH, 0.45, 0.6);
+  const darkMat = m(COL_TRUNK_DARK, 0.9, 0.1);
+  const trayMat = m(COL_TRUNK_TRAY, 0.8, 0.2);
+  const box = (w: number, h: number, d: number) => new THREE.BoxGeometry(w, h, d);
+
+  // ── Body shell: floor + four walls, leaving a real cavity for the open lid
+  place(box(W, T, D), bodyMat, 0, T / 2, 0);                                  // floor
+  place(box(W, BH - T, T), bodyMat, 0, (BH + T) / 2, (D - T) / 2);            // front
+  place(box(W, BH - T, T), bodyMat, 0, (BH + T) / 2, -(D - T) / 2);           // back
+  place(box(T, BH - T, D - 2 * T), bodyMat, -(W - T) / 2, (BH + T) / 2, 0);   // left
+  place(box(T, BH - T, D - 2 * T), bodyMat, (W - T) / 2, (BH + T) / 2, 0);    // right
+
+  // ── Interior: dark cavity liner + a hint of a tool-tray layer
+  place(box(W - 2 * T, 0.02, D - 2 * T), darkMat, 0, T + 0.01, 0);            // dark bottom
+  place(box(W - 2 * T - 0.06, 0.03, D - 2 * T - 0.06), trayMat, 0, 0.30, 0);  // tool tray
+  // A few colored blocks suggesting stowed tools on the tray
+  const toolBlocks: Array<[number, number, number, number]> = [
+    [0xE8760A, -0.28, 0.16, 0.05], // orange driver
+    [0x00E5FF, -0.06, 0.10, 0.05], // cyan gauge
+    [0xD4A84B, 0.14, 0.20, 0.05],  // amber wrench case
+    [0x8899AA, 0.32, 0.08, 0.05],  // gray spares tin
+  ];
+  toolBlocks.forEach(([color, x, w, h]) => {
+    place(box(w, h, 0.14), m(color, 0.6, 0.3), x, 0.315 + h / 2, 0.02);
+  });
+
+  // ── Ribs (vertical, front + back faces) and side panel lines
+  for (const rx of [-0.32, -0.11, 0.11, 0.32]) {
+    place(box(0.055, BH - 0.14, 0.015), ribMat, rx, BH / 2, D / 2 + 0.005);   // front ribs
+    place(box(0.055, BH - 0.14, 0.015), ribMat, rx, BH / 2, -D / 2 - 0.005);  // back ribs
+  }
+  for (const sx of [-1, 1]) {
+    place(box(0.015, BH - 0.14, 0.055), ribMat, sx * (W / 2 + 0.005), BH / 2, -0.12); // side rib
+    place(box(0.015, BH - 0.14, 0.055), ribMat, sx * (W / 2 + 0.005), BH / 2, 0.12);  // side rib
+  }
+  // Horizontal panel line across the front, above the label band
+  place(box(W - 0.08, 0.02, 0.012), ribMat, 0, 0.40, D / 2 + 0.004);
+
+  // ── Orange corner reinforcements (all four vertical corners)
+  for (const cx of [-1, 1]) {
+    for (const cz of [-1, 1]) {
+      place(box(0.09, BH, 0.02), orangeMat, cx * (W / 2 - 0.045), BH / 2, cz * (D / 2 + 0.006));
+      place(box(0.02, BH, 0.09), orangeMat, cx * (W / 2 + 0.006), BH / 2, cz * (D / 2 - 0.045));
+    }
+  }
+
+  // ── Front hardware: orange latch plates + gray latches, stencil label
+  for (const lx of [-0.30, 0.30]) {
+    place(box(0.12, 0.16, 0.02), orangeMat, lx, BH - 0.06, D / 2 + 0.008);    // latch plate
+    place(box(0.07, 0.10, 0.03), latchMat, lx, BH - 0.07, D / 2 + 0.022);     // latch body
+  }
+  // Stencil decal: transparent opacity-0 start like every furniture material
+  // so it rides the morph fade-in with the rest of the prop.
+  const labelMat = new THREE.MeshBasicMaterial({
+    map: makeStencilTexture('ISS-ST04'), transparent: true, opacity: 0,
+  });
+  place(new THREE.PlaneGeometry(0.34, 0.13), labelMat, 0, 0.24, D / 2 + 0.012);
+
+  // ── Lid: its own sub-Group hinged at the BACK top edge. Children sit
+  //    forward of the hinge (+z), so negative rotation.x swings the lid
+  //    up and backward over the back wall.
+  const lid = new THREE.Group();
+  lid.name = 'trunkLid';
+  lid.position.set(0, BH, -D / 2);
+  attach(lid);
+
+  const addLid = (geo: THREE.BoxGeometry, mat: THREE.Material, x: number, y: number, z: number): THREE.Mesh => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    lid.add(mesh);
+    return mesh;
+  };
+  const lidSlab = addLid(box(W, LH, D), bodyMat, 0, LH / 2, D / 2);                 // lid slab
+  addLid(box(W - 2 * T, 0.015, D - 2 * T), darkMat, 0, 0.002, D / 2);               // dark underside
+  // Orange lid trim: front edge strip + side edge strips
+  addLid(box(W, 0.04, 0.02), orangeMat, 0, 0.04, D + 0.006);
+  for (const sx of [-1, 1]) {
+    addLid(box(0.02, 0.04, D), orangeMat, sx * (W / 2 + 0.006), 0.04, D / 2);
+  }
+  // Subtle top handle recess: dark inset with a gray grab bar
+  addLid(box(0.30, 0.02, 0.12), darkMat, 0, LH - 0.005, D / 2);
+  addLid(box(0.22, 0.025, 0.03), latchMat, 0, LH + 0.002, D / 2);
+
+  // ── Lid animation: constant-speed ease driven from World.update (like the
+  //    door slides), completion callbacks fired exactly once on arrival.
+  let lidAngle = 0;
+  let lidTarget = 0;
+  let pendingComplete: (() => void) | null = null;
+
+  const setLidTarget = (target: number, onComplete?: () => void) => {
+    if (target === lidTarget && lidAngle !== target) {
+      // Same-target re-request while mid-swing: the earlier motion DOES still
+      // arrive, so chain both callbacks instead of dropping the first.
+      const prev = pendingComplete;
+      pendingComplete = onComplete ? (prev ? () => { prev(); onComplete(); } : onComplete) : prev;
+      return;
+    }
+    // A direction-changing call drops the previous callback (its motion never arrives).
+    pendingComplete = null;
+    lidTarget = target;
+    if (lidAngle === lidTarget) { onComplete?.(); return; } // already there → fire once, now
+    pendingComplete = onComplete ?? null;
+  };
+
+  const handle: TrunkLidHandle = {
+    openLid: (onComplete?: () => void) => setLidTarget(LID_OPEN_ANGLE, onComplete),
+    closeLid: (onComplete?: () => void) => setLidTarget(0, onComplete),
+    update(deltaTime: number): void {
+      if (lidAngle === lidTarget) return;
+      const diff = lidTarget - lidAngle;
+      const step = LID_SPEED * Math.max(0, deltaTime);
+      if (Math.abs(diff) <= step) {
+        lidAngle = lidTarget;
+        lid.rotation.x = lidAngle;
+        if (pendingComplete) {
+          const cb = pendingComplete;
+          pendingComplete = null; // exactly once
+          cb();
+        }
+      } else {
+        lidAngle += Math.sign(diff) * step;
+        lid.rotation.x = lidAngle;
+      }
+    },
+  };
+  lidSlab.userData.trunkLid = handle; // collected by World.addLobbyFurniture
+};
 // ── Definitions ───────────────────────────────────────────────────────────────
 const armchairLeftSeats: SeatTemplate[] = [{
   clickBox: { x0: -0.50, z0: -0.50, x1: 0.50, z1: 0.50 },
@@ -635,6 +824,19 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: MT_HOLO_Y, z: 0 },
     },
   },
+  'storage-trunk': {
+    kind: 'storage-trunk',
+    build: buildStorageTrunk,
+    footprint: { w: 1, d: 1 },
+    functions: ['storageTrunk'],
+    device: {
+      kind: 'storageTrunk',
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.35, z: 1.0 },
+      anchor: { x: 0, y: 0.3, z: 0 },
+    },
+  },
 };
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
@@ -693,27 +895,38 @@ export const FURNITURE: FurnitureItem[] = [
   // keypad (at x=-1.1 after the door group's rotY=π flip); z=5.97 is the
   // bar back-panel flush-mount plane. Footprint null ⇒ never an obstacle.
   { id: 'wall-computer',         kind: 'wall-computer',      pos: { x:  1.8,  z:  5.97 }, rot: 2, movable: false },
+  // Storage trunk on the fireplace wall's west flank (TR2 of #35). The plan's
+  // berth-corner suggestion (-2.5, -5.0) overlaps the fireplace obstacle
+  // (z[-6,-5]) — verified against itemAabb — so the trunk sits one tile south
+  // at (-2.5, -4.5): AABB x[-3,-2] z[-5,-4] touches the hearth at z=-5 without
+  // overlap, clear of the back-left lamp table (x[-5,-4] z[-5,-4]) and the
+  // back coffee table (x[-1,1] z[-4,-3]). rot 0 = latch face toward +z (into
+  // the room); front point (-2.5, -3.5) is a walkable aisle cell.
+  { id: 'storage-trunk',         kind: 'storage-trunk',      pos: { x: -2.5,  z: -4.5 }, rot: 0, movable: true },
 ];
-
-// ── Placement dev-assert (M4): the map table must occupy a genuinely clear
-// 2×2 — its AABB interior may not intersect any other item's obstacle box.
-// Scoped to the map table only: two LEGACY boxes deliberately overlap (bar
-// strip vs front-right lamp override, preserved E1 parity), so an all-pairs
-// assert would fire on hand-authored history rather than new mistakes.
-{
-  const table = FURNITURE.find((i) => i.kind === 'map-table');
-  const a = table ? itemAabb(table) : null;
-  if (table && a) {
-    for (const other of FURNITURE) {
-      if (other === table) continue;
-      const b = itemAabb(other);
-      if (!b) continue;
-      const overlaps = a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
-      console.assert(!overlaps,
-        `[furniture] map-table footprint overlaps '${other.id}' — move one of them`);
+// ── TR2 dev-assert: trunk placement must be clear of every other obstacle ────
+// Dev-only (plan §TR1 "dev-assert against OBSTACLES at build"). Scoped to the
+// trunk rather than a global pairwise check because two PRESERVED legacy boxes
+// (bar-corner and lamp-table-front-right footprintOverrides) already overlap
+// by design — E1 parity, documented at the top of this file.
+function assertPlacementClear(itemId: string): void {
+  const item = FURNITURE.find((i) => i.id === itemId);
+  const box = item ? itemAabb(item) : null;
+  if (!box) return;
+  for (const other of FURNITURE) {
+    if (other.id === itemId) continue;
+    const ob = itemAabb(other);
+    if (!ob) continue;
+    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+      console.error(
+        `[furniture] '${itemId}' footprint ${JSON.stringify(box)} overlaps '${other.id}' ${JSON.stringify(ob)}`,
+      );
     }
   }
 }
+if (import.meta.env.DEV) assertPlacementClear('storage-trunk');
+if (import.meta.env.DEV) assertPlacementClear('map-table');
+
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
 
@@ -880,6 +1093,7 @@ export function buildItemGroup(item: FurnitureItem): THREE.Group {
       light.userData.targetIntensity = targetIntensity;
       group.add(light);
     },
+    attach: (obj) => group.add(obj),
   };
   const def = FURNITURE_DEFS[item.kind];
   def.build(ctx);
