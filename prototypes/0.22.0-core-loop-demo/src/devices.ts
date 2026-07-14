@@ -26,6 +26,7 @@
 import * as THREE from 'three';
 import { FURNITURE, buildDeviceList, itemAabb } from './furniture';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
+import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState } from './docking';
 import type { DoorId } from './doors';
 
@@ -364,6 +365,107 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         refreshTimer = 0;
         refresh();
       }
+    },
+  };
+}
+
+// ── M4 map-table focused UI — the solar map, diegetic ────────────────────────
+
+export interface MapTableDeps {
+  /** Ask the focus controller to step back (wired to the map's CLOSE button). */
+  requestRelease?: () => void;
+}
+
+/**
+ * ONE SolarSystemMap serves every focus session: its mount() re-parents the
+ * existing container on later calls, so canvas, pan/zoom offsets, selection
+ * and in-transit travel state survive stepping away from the table. It also
+ * keeps the window-level listeners (mousemove/mouseup/resize) single-instance
+ * — pre-M4 the standalone overlay held the exact same set for the app's
+ * whole lifetime.
+ */
+let mapTableMap: SolarSystemMap | null = null;
+
+/**
+ * The map table's focused DOM UI (plan §2 M4): a gold-framed panel hosting
+ * the migrated SolarSystemMap. Pan/zoom/select/travel are container-local in
+ * map.ts already; the map's sim tick is driven from update() so it only
+ * advances while the table is actually open (pre-M4 it ticked unconditionally
+ * from main.ts's animate loop).
+ */
+export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-maptable-pane';
+      // Gold-frame device-pane idiom (device-terminal-pane / docking pane),
+      // sized for a map: ~80vw × 78vh. pointer-events re-enabled inside the
+      // inert #device-ui-host.
+      panel.style.cssText = `
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 80vw;
+        height: 78vh;
+        background: rgba(4, 8, 22, 0.95);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box;
+        pointer-events: auto;
+      `;
+      panel.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+          <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">◉ HOLOTABLE — SOL SYSTEM PLOT</span>
+          <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+        </div>
+        <div id="device-maptable-body" style="flex:1; position:relative; overflow:hidden; border-radius:8px;"></div>
+      `;
+      // Input capture (plan §D0.3): clicks inside the device UI never reach
+      // the canvas handler — clicks that DO reach it release the focus.
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+
+      const body = panel.querySelector<HTMLDivElement>('#device-maptable-body')!;
+      if (!mapTableMap) {
+        mapTableMap = new SolarSystemMap();
+        mapTableMap.mount(body); // panel is in the document — listeners bind live
+        mapTableMap.onTravelComplete((destinationId) => {
+          // Zone-shard swap stays a console note (the overlay-era phone-chat
+          // log lived in main.ts and is retired with the overlay wiring).
+          console.log(`[Sharding Node] Swapping direct channel to room zone: ${destinationId}`);
+        });
+        // The map's own CLOSE button now means "step back from the table".
+        document.getElementById('solarmap-close-btn')
+          ?.addEventListener('click', () => deps.requestRelease?.());
+        // Debug handle (kept from the standalone-overlay era — verification
+        // scripts and console poking reach the live instance here).
+        (window as unknown as { solarSystemMap: SolarSystemMap }).solarSystemMap = mapTableMap;
+      } else {
+        mapTableMap.mount(body); // re-parents the existing container
+      }
+      mapTableMap.show();
+    },
+
+    unmount(): void {
+      mapTableMap?.hide();
+      panel?.remove();
+      panel = null;
+    },
+
+    update(_dt: number): void {
+      // Gate the sim tick to the open table (#33 M4) — orbits, transit
+      // progress and the selection pulse only advance while someone watches.
+      if (mapTableMap?.isOpen()) mapTableMap.tick();
     },
   };
 }

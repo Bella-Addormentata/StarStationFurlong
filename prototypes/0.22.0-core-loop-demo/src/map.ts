@@ -24,6 +24,7 @@ export interface MapBody {
 
 export class SolarSystemMap {
   private container: HTMLDivElement | null = null;
+  private mapArea: HTMLDivElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
   private bodies: MapBody[] = [];
@@ -137,17 +138,27 @@ export class SolarSystemMap {
   }
 
   public mount(parentEl: HTMLElement) {
+    // Re-mount into a new parent (M4: the map-table focused UI rebuilds its
+    // panel per focus session but reuses ONE SolarSystemMap — moving the
+    // container keeps canvas, listeners, selection and travel state intact).
+    if (this.container) {
+      parentEl.appendChild(this.container);
+      return;
+    }
+
     // 1. Create HTML Elements
     this.container = document.createElement('div');
     this.container.id = 'solarmap-overlay';
+    // Fills its PARENT (#33 M4 re-parameterization): mounted into the map
+    // table's focus panel it fills the panel body; mounted on document.body
+    // (the pre-M4 standalone overlay path, kept mountable) it fills the view.
     this.container.style.cssText = `
       position: absolute;
       top: 0;
       left: 0;
-      width: 100vw;
-      height: 100vh;
+      width: 100%;
+      height: 100%;
       background: rgba(3, 6, 18, 0.95);
-      z-index: 4000;
       display: none;
       flex-direction: row;
       color: #d4a84b;
@@ -164,10 +175,9 @@ export class SolarSystemMap {
       overflow: hidden;
       cursor: grab;
     `;
+    this.mapArea = mapArea;
 
     this.canvas = document.createElement('canvas');
-    this.canvas.width = window.innerWidth * 0.70;
-    this.canvas.height = window.innerHeight;
     this.canvas.style.display = 'block';
     mapArea.appendChild(this.canvas);
     this.ctx = this.canvas.getContext('2d');
@@ -308,13 +318,25 @@ export class SolarSystemMap {
       travelBtn.addEventListener('click', () => this.initiateLongDistanceTravel());
     }
 
-    // Keyboard support: resize responsive layout
-    window.addEventListener('resize', () => {
-      if (this.canvas) {
-        this.canvas.width = window.innerWidth * 0.70;
-        this.canvas.height = window.innerHeight;
-      }
-    });
+    // Resize responsive layout — re-measure the PARENT, not the window
+    // (#33 M4: the canvas fills whatever host the map is mounted into).
+    window.addEventListener('resize', () => this.resizeCanvas());
+  }
+
+  /**
+   * Size the canvas backing store from its parent map area (#33 M4). Only
+   * meaningful while visible — a display:none container measures 0×0, so the
+   * caller (show / window resize) is responsible for timing; zero dims are
+   * skipped to avoid wiping a valid canvas.
+   */
+  private resizeCanvas() {
+    if (!this.canvas || !this.mapArea) return;
+    const w = this.mapArea.clientWidth;
+    const h = this.mapArea.clientHeight;
+    if (w > 0 && h > 0 && (this.canvas.width !== w || this.canvas.height !== h)) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+    }
   }
 
   private handleCanvasClick(clickX: number, clickY: number) {
@@ -621,8 +643,15 @@ export class SolarSystemMap {
   public show() {
     if (this.container) {
       this.container.style.display = 'flex';
+      // Measure AFTER display:flex — a hidden container has zero layout.
+      this.resizeCanvas();
       this.render();
     }
+  }
+
+  /** True while the map is mounted and visible (gates tick — #33 M4). */
+  public isOpen(): boolean {
+    return !!this.container && this.container.style.display !== 'none';
   }
 
   public hide() {
