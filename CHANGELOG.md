@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.23.0-core-loop-demo](prototypes/0.23.0-core-loop-demo/) and is built by the
+[prototypes/0.25.0-core-loop-demo](prototypes/0.25.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -10,6 +10,13 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 ## Unreleased
 
 - In progress for Phase 2 Star Swarm features. Next queued slices (all planned in `brainstorming/`): E4 furniture sync + persistence, T2/T3 cross-node transit + pairing reciprocity (gated on a two-machine playtest), S3 presence (lane-id → player mapping unlocks name tags + remote outfits), TR-sync trunk inventories, M3 desk computer, E5 rugs, and the station-doc slice carrying the flight-control authority tree.
+
+## v0.25.0 — queued (next tag; 0.24.0 skipped by owner call)
+
+### The Camera Rig — See Every Side of the Room
+
+- **45° view rotation ([PR #48](https://github.com/Bella-Addormentata/StarStationFurlong/pull/48) + Shift-hotkey follow-up):** the room camera keeps its locked isometric elevation and radius but can now swing around the room centre in 45° detents with a ~0.3 s eased tween. Inputs: a bottom-left HUD cluster (`◀ 0° ▶`, azimuth chip between the arrows), `←`/`→`, and `Shift+<` / `Shift+>` (matched via `e.code` so bare `,`/`.` typing keys stay inert). WASD stays screen-relative at every detent ("W = up-screen"); click-to-move, edit-mode picking, seats and doors are rotation-transparent because every raycast already goes through the live camera. Zoom-level snaps (L2/L3/L4), the first-person dive, and device-focus fly-ins/outs all depart from and return to the rotated azimuth. Rotation is guarded out of first person (L1), the flat top-down maps (L5+), and any device-focus substate — the arrows dim and no-op there. New module `src/cameraRig.ts` owns the detent state; guards are dependency-injected from `main.ts` so the module stays import-cycle-free.
+- **Release line cut at 0.25.0:** `prototypes/0.25.0-core-loop-demo/` is a full copy of the 0.23.0 line including the camera rig; `RELEASE_FRONTEND` now points at it, so the next `v0.25.0` tag ships the rotation update.
 
 ## v0.23.0 — 2026-07-13
 
