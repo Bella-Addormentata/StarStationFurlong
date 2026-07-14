@@ -94,6 +94,13 @@ interface LocalFingerprint {
   iroh_node_id?: string;
   iroh_relay_urls?: string[];
   iroh_direct_addrs?: string[];
+  /** R1: live reachability classification from the node —
+   *  'port-mapped' | 'advertised' | 'cgnat' | 'local-only'.
+   *  Optional: the Tauri fallback listener's fingerprint omits it. */
+  reachability?: string;
+  /** R1: the iroh UDP port ACTUALLY bound (post random-port fallback) —
+   *  the port a router forward must target. */
+  iroh_port?: number;
 }
 let localFingerprint: LocalFingerprint | null = null;
 const BOOTSTRAP_ADDRESS_STORAGE_KEY = 'ssf-bootstrap-address';
@@ -232,6 +239,61 @@ const ADDRESS_TYPE_LABEL: Record<ReturnType<typeof classifyAddress>, string> = {
   private: 'LAN (private range)',
   public: 'PUBLIC (internet)',
 };
+
+// ── R1 reachability readout ───────────────────────────────────────────────────
+/** Node-side default iroh UDP pin — display fallback only; the fingerprint's
+ *  `iroh_port` (the ACTUAL bound port, post random-port fallback) wins. */
+const DEFAULT_IROH_UDP_PORT = 44442;
+
+function reachabilityUdpPort(fp: LocalFingerprint | null): number {
+  return fp?.iroh_port && fp.iroh_port > 0 ? fp.iroh_port : DEFAULT_IROH_UDP_PORT;
+}
+
+/** R1: REACHABILITY row — the node's live self-classification. 'advertised'
+ *  is deliberately amber with a caveat: the echo-advertised address is
+ *  UNVERIFIED (no external infra to probe inbound UDP), so it is a hint that
+ *  usually works once the router forward exists, not a guarantee. */
+function renderReachabilityRow(fp: LocalFingerprint | null): void {
+  if (!fp) {
+    setNetworkRow('network-reachability', 'NO NODE', '#ff1744');
+    return;
+  }
+  const port = reachabilityUdpPort(fp);
+  switch (fp.reachability) {
+    case 'port-mapped':
+      // "LIKELY": the public route may be a portmapper mapping (inbound works)
+      // or a peer-observed reflexive address (inbound may still be blocked) —
+      // provenance is inferred, so don't overclaim OPEN (R1 review M1).
+      setNetworkRow('network-reachability', `LIKELY OPEN — public route detected (UDP ${port})`, '#7ddc5a');
+      break;
+    case 'advertised':
+      setNetworkRow('network-reachability', `ADVERTISED — forward UDP ${port} if joins fail`, '#ffb300');
+      break;
+    case 'cgnat':
+      setNetworkRow('network-reachability', 'CGNAT — direct dials impossible, needs relay', '#ff1744');
+      break;
+    case 'local-only':
+      setNetworkRow('network-reachability', `LAN ONLY — set up UDP ${port} forward`, '#ff1744');
+      break;
+    default:
+      // Older node / Tauri fallback listener: no classification available.
+      setNetworkRow('network-reachability', '--');
+      break;
+  }
+}
+
+/** True when any outgoing direct-addr hint is a public IPv4 an internet peer
+ *  could dial. IPv6 hints deliberately don't count — the invite pre-flight
+ *  warns specifically about v4 reachability (the common home-NAT path). */
+function bootstrapHasPublicIPv4(boot: RoomBootstrap): boolean {
+  for (const hint of collectMemberHints(boot)) {
+    for (const addr of hint.irohDirectAddrs ?? []) {
+      const v4 = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(addr);
+      if (v4 && classifyAddress(v4[1]) === 'public') return true;
+    }
+  }
+  return false;
+}
 
 /** Best-effort physical connection type (Network Information API, Chromium). */
 function detectConnectionType(): string {
@@ -1131,6 +1193,15 @@ function setupSpacePhoneOverlay() {
 
 async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
   if (localFingerprint) return localFingerprint;
+  return refreshLocalFingerprint();
+}
+
+/** R1: bypass the cache and re-read the node's fingerprint, updating the
+ *  cached copy and the REACHABILITY row. Reachability and direct-addr hints
+ *  change minutes after node startup (echo loop, portmapper mapping), so the
+ *  panel re-polls this on an interval — a one-shot startup snapshot would
+ *  pin the row (and freshly-minted invite hints) to a stale state. */
+async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   let fingerprint: LocalFingerprint = { hex: '', base64: '', port: 4443 };
   try {
     const res = await fetch('http://127.0.0.1:8080/api/fingerprint');
@@ -1142,11 +1213,16 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
     }
   }
   if (!fingerprint.hex) {
-    return null;
+    // Node unreachable this round: keep the last-known fingerprint (if any)
+    // rather than blanking live sessions; the row shows NO NODE when we have
+    // never seen one.
+    renderReachabilityRow(localFingerprint);
+    return localFingerprint;
   }
   fingerprint.iroh_relay_urls = normalizeStringArray(fingerprint.iroh_relay_urls);
   fingerprint.iroh_direct_addrs = normalizeStringArray(fingerprint.iroh_direct_addrs);
   localFingerprint = fingerprint;
+  renderReachabilityRow(fingerprint);
   return fingerprint;
 }
 
@@ -1202,7 +1278,7 @@ function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerpri
   };
 }
 
-async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): Promise<{ link?: string; error?: string; scope?: ReturnType<typeof classifyAddress> }> {
+async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): Promise<{ link?: string; error?: string; scope?: ReturnType<typeof classifyAddress>; boot?: RoomBootstrap }> {
   const fingerprint = await fetchLocalFingerprint();
   if (!fingerprint) {
     return { error: 'Local node not reachable — launch the app (or Rust node) first.' };
@@ -1245,6 +1321,9 @@ async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): 
       ? `${origin}${window.location.pathname}?${seedParam}`
       : `ssf://room?${seedParam}`,
     scope,
+    // R1: the minted bootstrap rides along so callers (Copy Invite pre-flight)
+    // can inspect the ACTUAL outgoing hints instead of re-deriving them.
+    boot,
   };
 }
 
@@ -1483,11 +1562,30 @@ function setupNetworkDetailsPanel() {
         sharePrimaryInput.value = minted.link;
       }
 
+      // R1 invite pre-flight: warn (but STILL copy) when nothing in this
+      // invite is dialable from the internet — no public IPv4 in the outgoing
+      // hints and no UPnP mapping to catch the dial. The IPv4 hints
+      // deliberately STAY in invite links (owner decision: reliability over
+      // minimalism; DHT re-resolution keeps them refreshable), so a missing
+      // public v4 here is an honest LAN/IPv6-only signal.
+      const inviteWarning =
+        minted.boot && !bootstrapHasPublicIPv4(minted.boot) && localFingerprint?.reachability !== 'port-mapped'
+          ? `⚠ This invite has no internet-reachable IPv4 — LAN/IPv6 only. Forward UDP ${reachabilityUdpPort(localFingerprint)} on the router (auto-advertising is on by default).`
+          : null;
+
       try {
         await navigator.clipboard.writeText(minted.link);
-        if (feedback) feedback.textContent = 'Invite copied. Share this one link with everyone.';
+        if (feedback) {
+          feedback.textContent = inviteWarning
+            ? `Invite copied. ${inviteWarning}`
+            : 'Invite copied. Share this one link with everyone.';
+        }
       } catch {
-        if (feedback) feedback.textContent = 'Invite ready below. Clipboard permission was denied.';
+        if (feedback) {
+          feedback.textContent = inviteWarning
+            ? `Invite ready below (clipboard permission was denied). ${inviteWarning}`
+            : 'Invite ready below. Clipboard permission was denied.';
+        }
       }
     });
   }
@@ -1551,6 +1649,12 @@ function setupNetworkDetailsPanel() {
   refreshConnectionTypeRow();
   const conn = (navigator as { connection?: EventTarget }).connection;
   conn?.addEventListener?.('change', refreshConnectionTypeRow);
+
+  // R1: keep the REACHABILITY row (and the cached fingerprint feeding invite
+  // hints) live. Portmapper mappings and the echo advert appear/heal minutes
+  // after node startup, and the node classifies per request — poll gently.
+  void refreshLocalFingerprint();
+  window.setInterval(() => { void refreshLocalFingerprint(); }, 60_000);
 
   if (useBtn && importInput) {
     useBtn.addEventListener('click', async () => {
