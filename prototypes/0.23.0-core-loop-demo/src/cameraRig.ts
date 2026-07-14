@@ -1,5 +1,6 @@
 /**
- * Camera Rig — 45° isometric view rotation (bottom-left HUD arrows + ←/→ keys).
+ * Camera Rig — 45° isometric view rotation.
+ * Inputs: bottom-left HUD arrows, ←/→, and Shift+< / Shift+> hotkeys.
  *
  * The room camera has always been LOCKED to a single three-quarter angle
  * (renderer.ts parks it on the +X/+Z diagonal looking at the origin). That
@@ -241,8 +242,8 @@ export function initCameraRig(rigGuards: RigGuards): void {
     return btn;
   };
 
-  leftBtn = makeButton('◀', 'Rotate view 45° left (Left Arrow)', -1);
-  rightBtn = makeButton('▶', 'Rotate view 45° right (Right Arrow)', 1);
+  leftBtn = makeButton('◀', 'Rotate view 45° left (← or <)', -1);
+  rightBtn = makeButton('▶', 'Rotate view 45° right (→ or >)', 1);
 
   angleChip = document.createElement('div');
   angleChip.title = 'View rotation';
@@ -265,18 +266,25 @@ export function initCameraRig(rigGuards: RigGuards): void {
   document.body.appendChild(wrap);
   refreshAngleChip();
 
-  // ←/→ keyboard complement. One detent per press (ignore auto-repeat), and
-  // stay out of the way of typing and of the SpacePhone (same guard pattern
-  // as the zoom hotkeys in zoom.ts).
+  // Keyboard complement: ←/→, plus Shift+< / Shift+> (owner request — the
+  // SHIFT gate keeps the bare ,/. typing keys inert; matched via e.code so
+  // the chord is layout-independent). One detent per press (ignore
+  // auto-repeat), and stay out of the way of typing and of the SpacePhone
+  // (same guard pattern as the zoom hotkeys in zoom.ts).
   window.addEventListener('keydown', (e) => {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    let dir: 1 | -1 | 0 = 0;
+    if (e.key === 'ArrowLeft') dir = -1;
+    else if (e.key === 'ArrowRight') dir = 1;
+    else if (e.shiftKey && e.code === 'Comma') dir = -1;  // Shift+, → '<'
+    else if (e.shiftKey && e.code === 'Period') dir = 1;  // Shift+. → '>'
+    if (dir === 0) return;
     if (e.repeat) return;
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
     if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
     if (!canRotate()) return; // silent — keys shouldn't toast like misclicks
     e.preventDefault();
-    rotateStep(e.key === 'ArrowRight' ? 1 : -1);
+    rotateStep(dir);
   });
 
   console.log('✅ Camera rig initialized (45° view rotation, bottom-left HUD)');
