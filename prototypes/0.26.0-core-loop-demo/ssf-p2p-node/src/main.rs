@@ -726,6 +726,27 @@ async fn handle_wt_connection(
     connection: Connection,
     iroh_ep: IrohEndpoint,
 ) -> Result<()> {
+    // Reclaim the connection on exit (issue #60 review): drop it from every
+    // room's local_connections so the node doesn't accumulate dead browser
+    // connections. Each staged-room-list prefetch is its own WT connection;
+    // without this, room changes / reloads leak them for the node's lifetime
+    // and dead entries draw doomed tick/ysync fan-out sends.
+    let remote_addr = connection.remote_address();
+    let result = handle_wt_connection_inner(hub.clone(), connection, iroh_ep).await;
+    {
+        let mut rooms = hub.rooms.lock().unwrap();
+        for room in rooms.values_mut() {
+            room.local_connections.remove(&remote_addr);
+        }
+    }
+    result
+}
+
+async fn handle_wt_connection_inner(
+    hub: SharedHub,
+    connection: Connection,
+    iroh_ep: IrohEndpoint,
+) -> Result<()> {
     let remote_addr = connection.remote_address();
     let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // 0.23.0 tick identity (issue #22): every movement tick this tab originates

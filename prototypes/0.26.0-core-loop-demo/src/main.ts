@@ -719,6 +719,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
 async function leaveRoom(): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   sessionEpoch++;
+  // We are now roomless (issue #60 review): clear the active-pass room so a
+  // swap that leaves but never re-joins (stranded) can't wedge a pass showing
+  // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
+  // room we left re-warms so it stays enterable from the list.
+  setActivePassRoom(null);
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;

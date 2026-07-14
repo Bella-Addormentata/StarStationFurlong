@@ -32,6 +32,15 @@ export interface YjsSyncOptions {
   /** Signs outgoing state-mutating envelopes (stubbed key mgmt is OK in Phase 1;
    *  the verify-before-apply seam must exist — Phase 1 Task 3.3). */
   sign?: (payload: Uint8Array) => Promise<Uint8Array>;
+  /**
+   * Source of the iroh dial hints stamped on outgoing envelopes so the node
+   * dials THIS room's host. Defaults to the global active provider's boot —
+   * correct for the main session. A BACKGROUND prefetch (issue #60 staged
+   * room-list) MUST pass its own provider's boot here, or its envelopes carry
+   * the active room's hints and the node dials the wrong peer (the prefetch
+   * room then never syncs).
+   */
+  bootRecord?: () => { memberHints?: unknown; irohNodeId?: unknown; irohRelayUrls?: unknown; irohDirectAddrs?: unknown } | null | undefined;
 }
 
 function u8ToB64(u8: Uint8Array): string {
@@ -149,10 +158,15 @@ export class YjsSync {
   async #emitEnvelope(_kind: string, payload: Uint8Array) {
     if (!this.#writer) return;
 
-    // Carry iroh dial hints from the active bootstrap ticket so the local node
-    // can construct EndpointAddr with relay/direct hints for outbound dialing.
-    const provider = (window as any).networkProvider as { getBootRecord?: () => any } | undefined;
-    const boot = provider?.getBootRecord?.();
+    // Carry iroh dial hints from THIS sync's bootstrap so the local node can
+    // construct EndpointAddr with relay/direct hints for outbound dialing.
+    // A background prefetch supplies its own room's boot via opts.bootRecord;
+    // the main session omits it and falls back to the global active provider.
+    let boot = this.opts.bootRecord?.();
+    if (!boot) {
+      const provider = (window as any).networkProvider as { getBootRecord?: () => any } | undefined;
+      boot = provider?.getBootRecord?.();
+    }
 
     const memberHints = Array.isArray(boot?.memberHints)
       ? boot.memberHints.filter((hint: any) => typeof hint?.irohNodeId === 'string' && hint.irohNodeId.length > 0)

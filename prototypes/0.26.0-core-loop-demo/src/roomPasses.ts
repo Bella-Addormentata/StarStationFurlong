@@ -61,6 +61,7 @@ export interface RoomPassDeps {
 
 const STORAGE_KEY = 'ssf-room-passes';
 const READY_TICK_MS = 250; // roomInfo poll cadence while a prefetch loads
+const LOAD_TIMEOUT_MS = 25_000; // loading → offline if the host never delivers state
 
 let deps: RoomPassDeps | null = null;
 let passes: RoomPass[] = [];
@@ -138,9 +139,17 @@ export function setActivePassRoom(roomId: string | null): void {
   // Stop warming the room we just entered — the active session owns it now.
   if (roomId) stopPrefetch(roomId);
   // Re-warm the room we just left, if it's a saved pass.
-  if (previous && passes.some((p) => p.roomId === previous)) {
+  if (previous) {
     const p = passes.find((x) => x.roomId === previous);
     if (p) startPrefetch(p);
+  }
+  // Retry any pass that went OFFLINE (node/host was down when it last tried) —
+  // a room change is a cheap, natural moment to self-heal (review LOW), and
+  // the node now reclaims the stale connection so re-warming doesn't leak.
+  for (const p of passes) {
+    if (p.roomId !== activeRoomId && prefetches.get(p.roomId)?.state === 'offline') {
+      startPrefetch(p);
+    }
   }
   notify();
 }
@@ -239,7 +248,14 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
   const channel = await pf.provider.openChannel('ysync');
   if (!alive()) { try { await channel.writable.close(); } catch {} return; }
 
-  const sync = new YjsSync({ roomId: boot.roomId, channel });
+  const sync = new YjsSync({
+    roomId: boot.roomId,
+    channel,
+    // Stamp THIS room's dial hints on outgoing envelopes (review HIGH): without
+    // this the prefetch inherits the ACTIVE room's hints from the global
+    // provider and the node dials the wrong peer — the prefetch never syncs.
+    bootRecord: () => pf.provider.getBootRecord(),
+  });
   pf.sync = sync;
   // The node forwards this room's updates to THIS connection; feed them in.
   pf.provider.onEnvelope((env: { kind?: string; room?: string; payload?: string }) => {
@@ -248,10 +264,6 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
   await sync.start();
   if (!alive()) return;
   setState(pass.roomId, 'loading');
-
-  // "Downloaded" = the node answered AND the host's roomInfo has arrived.
-  await sync.whenServerSynced;
-  if (!alive()) return;
 
   const roomMap = sync.doc.getMap('roomInfo');
   const ready = () => typeof roomMap.get('name') === 'string' && roomMap.has('owner');
@@ -264,12 +276,20 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
     }
     setState(pass.roomId, 'ready');
   };
+  // "Downloaded" = the host's roomInfo (name+owner) has arrived via the mesh —
+  // poll for it directly (roomInfo fills as updates apply, independent of the
+  // whenServerSynced signal, so we never block on a node that never answers).
+  // After LOAD_TIMEOUT_MS still-not-ready surfaces OFFLINE so a dead room is
+  // distinguishable from a slow one (review LOW); the poll keeps running, so a
+  // late-arriving host still flips the row to READY.
   if (ready()) { finishReady(); return; }
-  // Poll roomInfo (observing across a bridged doc is fine, but a poll keeps the
-  // liveness check trivial and self-cleaning against teardown).
+  const deadline = performance.now() + LOAD_TIMEOUT_MS;
   const tick = () => {
     if (!alive()) return;
     if (ready()) { finishReady(); return; }
+    if (performance.now() >= deadline && prefetches.get(pass.roomId)?.state === 'loading') {
+      setState(pass.roomId, 'offline');
+    }
     window.setTimeout(tick, READY_TICK_MS);
   };
   window.setTimeout(tick, READY_TICK_MS);
