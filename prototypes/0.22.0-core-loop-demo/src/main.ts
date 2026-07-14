@@ -14,6 +14,7 @@ import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_B
 import { SolarSystemMap } from './map';
 import { MultiScaleZoomView } from './zoom';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
+import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 
 type RendererModule = typeof import('./renderer');
 
@@ -1394,6 +1395,12 @@ function setupSolarMap() {
       return;
     }
 
+    // Suppress the map hotkey while a device focus owns the camera (#33
+    // D0.3 — stacked under the phone guard, mirroring zoom.ts).
+    if (isDeviceFocusActive()) {
+      return;
+    }
+
     if (e.key === 'm' || e.key === 'M') {
       toggleMap();
     }
@@ -1468,40 +1475,27 @@ async function init() {
   }
 
   // ── Dev-only preview flag (PR-P of #33/#35): `?deviceprops=1` renders the
-  // storage-trunk + wall-computer props for visual iteration. Cosmetic only —
-  // no gameplay/network/focus wiring. try/catch: a failed preview chunk must
-  // never take init() down (same guard as the ?vestibule= hunk, PR #34).
+  // storage-trunk prop for visual iteration. Cosmetic only — no gameplay/
+  // network/focus wiring. The wall computer graduated to a real furniture-
+  // registry item with D0+M1 (furniture.ts 'wall-computer'), so the flag now
+  // only spawns the TRUNK (its focus wiring arrives with TR2). try/catch: a
+  // failed preview chunk must never take init() down (PR #34's guard).
   if (new URLSearchParams(location.search).get('deviceprops') === '1') {
     try {
       const props = await import('./deviceProps');
       const trunk = props.buildStorageTrunk();
       trunk.group.position.set(-2.5, 0, -4.6);        // north-wall flank, clear of OBSTACLES
       scene.add(trunk.group);
-      const wallComputer = props.buildWallComputer();
-      wallComputer.group.position.set(1.8, 1.6, 5.8); // south interior wall, beside the door
-      wallComputer.group.rotation.y = Math.PI;        // screen faces -z (into the room)
-      scene.add(wallComputer.group);
-      (window as any).__trunk = trunk;                // console handles for iteration
-      (window as any).__wallComputer = wallComputer;
+      (window as any).__trunk = trunk;                // console handle for iteration
       setInterval(() => trunk.update(0.033), 33);     // drives the lid ease (dev-cheap)
-      const refreshStatus = () => {
-        const roomName = (document.getElementById('room-name') ??
-          document.getElementById('room-name-display'))?.textContent?.trim() || 'FURLONG LOBBY';
-        const peers = parseInt(document.getElementById('net-peers-seen')?.textContent ?? '', 10) || 0;
-        const nodeOnline = (document.getElementById('node-status')?.textContent ?? '').includes('ONLINE');
-        wallComputer.updateStatus({ roomName, peers, nodeOnline });
-        // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
+      // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
+      setInterval(() => {
         const zv = (window as any).multiScaleZoom;
-        const interior = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
-        trunk.group.visible = interior;
-        wallComputer.group.visible = interior;
-      };
-      refreshStatus();
-      setInterval(refreshStatus, 1000);
+        trunk.group.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
+      }, 250);
     } catch (e) {
       // A failed preview chunk load must never take the whole app down.
       console.warn('deviceprops preview failed to load:', e);
-
     }
   }
 
@@ -1551,6 +1545,15 @@ function setupClickToEnter() {
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
 
+  // ── While the device-focus camera is live, any click reaching the canvas
+  //    releases the focus (#33 D0.3 — device-UI panels stop propagation, so
+  //    UI clicks never land here). Raycasting is skipped entirely: the view
+  //    is the focus perspective camera, not the isometric one.
+  if (isDeviceFocusActive()) {
+    deviceFocus.release();
+    return;
+  }
+
   const { camera, scene } = window.gameRenderer;
   const clickPlane = world.getClickPlane();
   if (!clickPlane) return;
@@ -1596,6 +1599,27 @@ function onCanvasClick(event: MouseEvent): void {
       const doorId = doorHits[0].object.userData.doorId as string;
       if (doorId) {
         world.requestDoorWalkthrough(doorId);
+        return; // Halt floor-click routing
+      }
+    }
+  }
+
+  // ── Device clicks → walk-to + first-person focus (#33 D0; keypads and door
+  //    bodies keep priority). v1: routed at zoom level 2 only (plan §D0.2 —
+  //    the level-1 perspective raycast is deferred).
+  if (!multiScaleZoom || multiScaleZoom.getLevel() === 2) {
+    const deviceMeshes: THREE.Object3D[] = [];
+    scene.traverse((child) => {
+      if (child.userData && child.userData.isDevice) {
+        deviceMeshes.push(child);
+      }
+    });
+
+    const deviceHits = raycaster.intersectObjects(deviceMeshes, false);
+    if (deviceHits.length > 0) {
+      const deviceId = deviceHits[0].object.userData.deviceId as string;
+      if (deviceId) {
+        world.requestDeviceFocus(deviceId);
         return; // Halt floor-click routing
       }
     }
