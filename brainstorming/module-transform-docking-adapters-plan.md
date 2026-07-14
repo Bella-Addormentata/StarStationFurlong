@@ -63,6 +63,15 @@ Acceptance: join a seed twice — Tab still single-fires; no orphaned Y.Doc; rem
 - **Module transformation / equipment**: `FurnitureDef.functions` tags need E2/E3 (place equipment) + E4 (sync). Flight controller comes after the station doc defines the pose frame.
 - **Station-shared systems doc**: after T3 migrates doorPairings into it.
 
+### Station flight-control authority (owner ruling, 2026-07-13 — design for the station-doc slice)
+When multiple connected modules are flight-capable, **exactly one holds station flight control** at a time:
+
+- **Default: the oldest module connected to the station.** The station doc's member map records `connectedAt` per module; the controller field defaults to the member with the smallest `connectedAt` (deterministic across replicas; ties broken by module id).
+- **Handover is explicit and tree-shaped.** The controlling module can hand flight control to any *connected* module (adjacent in the docking graph or reachable through it). Handovers form a delegation tree rooted at the current controller: `station.controlTree = { controllerId, delegations: parentId → childId[] }`. Only the current controller (or a delegator above the target in the tree) can re-assign control below itself.
+- **Break-off.** Any module (with its subtree of docked modules) can *break off*: it undocks as an independent flight group, becoming a new station doc whose controller defaults to the oldest module **within the departing subtree**. The remaining station keeps its controller; if the controller itself departs, control reverts to the oldest remaining member (the default rule re-applies — no orphaned control).
+- **Enforcement posture:** same as room ownership (S2 precedent) — v1 is honest-client UI gating on the station doc's controller field; signed-op enforcement arrives with RoomLog (Phase 2). Pilot-seat input is simply ignored unless your module holds control.
+- **Where it lives:** the station doc (§1.3). Not implementable before the station-doc slice — recorded here so the T4 design starts from these rules.
+
 ## 3. Risks and unknowns — honest answers
 1. **Tick identity across switch**: new connection ⇒ new lane id; in room A your ghost lingers ≤10 s (reaper). **A→B→A round trips under 10 s produce a brief self-doppelganger.** Accepted for v1; real fix = node-side leave signal on disconnect (pairs with the local_connections cleanup).
 2. **Doc/chat lifecycle**: client Y.Doc replaced wholesale per join; T0 adds the missing stop(). Node docs are memory-only — room state survives transits but not node restarts. E4's per-room IndexeddbPersistence composes cleanly.
