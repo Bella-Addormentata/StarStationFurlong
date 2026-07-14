@@ -1352,7 +1352,19 @@ export class World {
     // Device-FOCUSED counts as active: the avatar mesh is hidden then, but
     // the player still stands in the room (ticks keep flowing to peers, and
     // deferred seat/door/dest requests must still be routable).
-    return (this.player.mesh.visible || deviceFocus.isActive()) && !this.isMorphing;
+    // FIRST PERSON (#49) counts as active for the same reason: zoom level 1
+    // hides the local mesh (so we don't render inside our own head), but the
+    // player still stands in the room — WASD must keep walking (the
+    // camera-relative branch in input.ts), collision/BOUND still apply in
+    // player.update, and movement ticks must keep flowing to peers. Without
+    // this the mesh-visibility gate silently disabled all first-person WASD.
+    const zoomView = (window as any).multiScaleZoom;
+    const firstPerson =
+      !!zoomView && typeof zoomView.getLevel === 'function' && zoomView.getLevel() === 1;
+    return (
+      (this.player.mesh.visible || deviceFocus.isActive() || firstPerson) &&
+      !this.isMorphing
+    );
   }
 
   private initializeDockingPorts() {

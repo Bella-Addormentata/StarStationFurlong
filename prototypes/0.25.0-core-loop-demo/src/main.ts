@@ -2019,6 +2019,15 @@ function setupClickToEnter() {
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
 
+  // ── First-person pointer-lock click model (#49): the click paired with the
+  //    mousedown that freed the cursor from pointer lock is swallowed — its
+  //    coordinates are frozen at the lock point and must not raycast.
+  //    Subsequent unlocked clicks fall through and interact normally.
+  if (multiScaleZoom && multiScaleZoom.getLevel() === 1
+      && multiScaleZoom.consumeFirstPersonUnlockClick()) {
+    return;
+  }
+
   // ── While the device-focus camera is live, any click reaching the canvas
   //    releases the focus (#33 D0.3 — device-UI panels stop propagation, so
   //    UI clicks never land here). Raycasting is skipped entirely: the view
@@ -2089,7 +2098,12 @@ function onCanvasClick(event: MouseEvent): void {
 
   // ── Device clicks → walk-to + first-person focus (#33 D0; keypads and door
   //    bodies keep priority). v1: routed at zoom level 2 only (plan §D0.2 —
-  //    the level-1 perspective raycast is deferred).
+  //    the level-1 perspective raycast is deferred). #49 keeps this gate:
+  //    from first person, seats/floor-walk (via the click plane below) and
+  //    keypad/door clicks work, but a device click would swap in the
+  //    device-focus camera mid-first-person — that hand-off is deferred with
+  //    the rest of D0.2. A first-person device click falls through to the
+  //    floor plane and walks the player next to the device instead.
   if (!multiScaleZoom || multiScaleZoom.getLevel() === 2) {
     const deviceMeshes: THREE.Object3D[] = [];
     scene.traverse((child) => {
@@ -2113,8 +2127,20 @@ function onCanvasClick(event: MouseEvent): void {
   for (const hit of hits) {
     if (hit.object.userData.isTile) {
       world.navigateTo(hit.point.x, hit.point.z);
-      break;
+      return;
     }
+  }
+
+  // ── #49: a first-person click on INACTIVE space (no keypad / door / device
+  //    / floor hit) re-engages pointer lock and resumes look-around. Guarded
+  //    to clicks on the 3D canvas itself so DOM/HUD clicks (dev menu, rotate
+  //    arrows, panels — which also stopPropagation) can never steal the
+  //    cursor. This click is also the user activation the lock request needs.
+  if (
+    multiScaleZoom && multiScaleZoom.getLevel() === 1 &&
+    event.target === window.gameRenderer?.renderer?.domElement
+  ) {
+    multiScaleZoom.requestFirstPersonPointerLock();
   }
 }
 
