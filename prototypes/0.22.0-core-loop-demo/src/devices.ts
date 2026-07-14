@@ -35,6 +35,7 @@ import {
 } from './items';
 import type { ItemDef } from './items';
 import { loadSavedOutfitId } from './outfits';
+import type { RoomEditPermission } from './editMode';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -206,6 +207,17 @@ export interface RoomTerminalDeps {
   getPlayerPos: () => THREE.Vector3;
   /** Lets World dim the in-world screen to "TERMINAL IN USE" while focused. */
   onEngagedChange?: (engaged: boolean) => void;
+  /**
+   * EDIT ROOM entry point (#33 M2 amendment of #25 E2 — the HUD pencil never
+   * ships; THIS button is the only way into edit mode). `permission` gates
+   * the button (disabled + reason when not the owner); `request` must release
+   * the device focus first and enter edit mode once the release completes
+   * (World wires it to deviceFocus.releaseThen → roomEdit.enter).
+   */
+  editRoom?: {
+    permission: () => RoomEditPermission;
+    request: () => void;
+  };
 }
 
 /** Door port geometry for the wireframe view (docking.ts buildPorts widths). */
@@ -262,6 +274,21 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       adjEl.textContent = paired.length
         ? `PORT ${paired.join(', ')} PAIRED — NO ADJACENT MODULE DATA`
         : 'NO ADJACENT MODULE DATA';
+    }
+
+    // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
+    // change (e.g. set via console for the non-owner test path) shows up live.
+    const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
+    const editNote = panel.querySelector<HTMLElement>('#device-terminal-edit-room-note');
+    if (editBtn && deps.editRoom) {
+      const perm = deps.editRoom.permission();
+      editBtn.disabled = !perm.ok;
+      editBtn.style.opacity = perm.ok ? '1' : '0.35';
+      editBtn.style.cursor = perm.ok ? 'pointer' : 'not-allowed';
+      editBtn.title = perm.ok
+        ? 'Rearrange this room’s furniture'
+        : perm.reason;
+      if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
     }
 
     drawWireframe();
@@ -375,6 +402,22 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         </div>
         <canvas id="device-terminal-map" width="${CANVAS_RES}" height="${CANVAS_RES}"
           style="width:${CANVAS_CSS}px; height:${CANVAS_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+        ${deps.editRoom ? `
+        <div style="display:flex; flex-direction:column; gap:3px;">
+          <button id="device-terminal-edit-room" style="
+            padding: 8px 12px;
+            background: rgba(212, 168, 75, 0.10);
+            border: 1px solid rgba(212, 168, 75, 0.45);
+            border-radius: 6px;
+            color: #F0C060;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 1.5px;
+            cursor: pointer;
+          ">EDIT ROOM ✎</button>
+          <div id="device-terminal-edit-room-note" style="font-size:9px; color:#4A5560; letter-spacing:0.5px;"></div>
+        </div>` : ''}
         <div>
           <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:4px;">FUEL — NO SENSOR FITTED</div>
           <div style="height:12px; border:1px solid rgba(212,168,75,0.22); border-radius:3px; background:repeating-linear-gradient(45deg, rgba(74,85,96,0.25) 0 6px, transparent 6px 12px);"></div>
@@ -387,6 +430,16 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
       canvas = panel.querySelector<HTMLCanvasElement>('#device-terminal-map');
+      // EDIT ROOM (#33 M2): release the focus first, THEN enter edit mode —
+      // the wired request() is deviceFocus.releaseThen(→ roomEdit.enter).
+      const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
+      if (editBtn && deps.editRoom) {
+        const editRoom = deps.editRoom;
+        editBtn.addEventListener('click', () => {
+          if (!editRoom.permission().ok) return; // gate re-checked at press time
+          editRoom.request();
+        });
+      }
       deps.onEngagedChange?.(true);
       refresh();
     },

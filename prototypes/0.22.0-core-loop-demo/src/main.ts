@@ -15,6 +15,7 @@ import { MultiScaleZoomView } from './zoom';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
+import { roomEdit, setRoomEditPermission } from './editMode';
 
 type RendererModule = typeof import('./renderer');
 
@@ -1595,6 +1596,18 @@ async function init() {
   world = new worldModule.World(scene);
   (window as any).world = world;
 
+  // ── Room-edit owner gate (E2 of #25, plan §1), on S2's identity:
+  // isLocalPlayerRoomOwner accepts the local playerId AND the legacy
+  // 'Local-Clone' owner (pre-S2 rooms stay editable). The reason string
+  // resolves the owner's display name through the players map.
+  setRoomEditPermission(() => {
+    if (!yjsSync) return { ok: true }; // offline: your room
+    const owner = (yjsSync.doc.getMap('roomInfo').get('owner') as string | undefined) ?? 'Local-Clone';
+    return isLocalPlayerRoomOwner(owner)
+      ? { ok: true }
+      : { ok: false, reason: `Only the owner (${resolveOwnerLabel(owner)}) can edit this room.` };
+  });
+
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
   // expose a debug console handle. LOCAL rig only — S2 now carries outfitId in
   // the room doc's players map (data foundation), but remote avatars keep
@@ -1697,6 +1710,15 @@ function onCanvasClick(event: MouseEvent): void {
   //    is the focus perspective camera, not the isometric one.
   if (isDeviceFocusActive()) {
     deviceFocus.release();
+    return;
+  }
+
+  // ── Edit mode owns clicks (E2 of #25, routed BEFORE the keypad → door →
+  //    device passes per the #33 M2 amendment): a click on a movable item
+  //    selects it, a click anywhere else deselects — and navigation is
+  //    suppressed entirely (WASD stays live for walking while editing).
+  if (roomEdit.isEditModeActive()) {
+    roomEdit.handleClick(event);
     return;
   }
 
