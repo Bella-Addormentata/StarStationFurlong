@@ -247,13 +247,43 @@
           </form>
         </div>
 
-        <!-- 👥 Contacts app view — placeholder until S4 lands -->
+        <!-- 👥 Contacts app view — keyed identity: your card, friends + contacts.
+             Contacts are VERIFIED public keys (self-signed cards). Friends are
+             the curated subset (DM boundary + mesh trust anchors). -->
         <div id="phone-app-contacts" class="phone-app-view">
-          <div class="phone-no-signal">
-            <div class="phone-no-signal-glyph">▚▚ NO SIGNAL ▚▚</div>
-            <div class="phone-no-signal-text">CONTACTS app not yet provisioned</div>
-            <div class="phone-no-signal-sub">FurlongNet OTA update pending…</div>
+          <div class="phone-access-section">
+            <div class="phone-access-header">YOU</div>
+            <div class="phone-access-room-row">
+              <span class="phone-access-room-label">NAME:</span>
+              <span id="contacts-my-name" title="Your display name">Clone</span>
+              <span id="contacts-my-fp" title="Your identity fingerprint (first 8 hex of your public key)">🔑 --------</span>
+            </div>
+            <button type="button" id="contacts-share-btn" aria-label="Copy your contact card to share">🪪 SHARE MY CARD</button>
+            <input type="text" id="contacts-my-card" readonly placeholder="Your card appears here" aria-label="Your contact card">
+            <details id="contacts-recovery">
+              <summary>🔐 Backup / restore identity</summary>
+              <div class="phone-access-note">Your recovery key IS your identity — anyone who has it becomes you. There is no reset. Store it somewhere only you control.</div>
+              <button type="button" id="contacts-export-btn" aria-label="Reveal recovery key">Reveal recovery key</button>
+              <input type="text" id="contacts-recovery-out" readonly placeholder="Recovery key (hidden)" aria-label="Recovery key">
+              <input type="text" id="contacts-recovery-in" placeholder="Paste a recovery key to restore" autocomplete="off" aria-label="Recovery key to restore">
+              <button type="button" id="contacts-import-key-btn" aria-label="Restore identity from recovery key">Restore identity</button>
+            </details>
           </div>
+          <div class="phone-access-section">
+            <div class="phone-access-header">ADD A CONTACT</div>
+            <input type="text" id="contacts-add-input" placeholder="Paste someone's contact card" autocomplete="off" aria-label="Contact card to add">
+            <button type="button" id="contacts-add-btn" aria-label="Verify and add the pasted contact card">➕ ADD CONTACT</button>
+            <div class="phone-access-note">Cards are cryptographically verified on import. Always check the fingerprint out-of-band.</div>
+          </div>
+          <div class="phone-access-section">
+            <div class="phone-access-header">FRIENDS</div>
+            <div id="contacts-friends-list" role="list" aria-label="Your friends"></div>
+          </div>
+          <div class="phone-access-section">
+            <div class="phone-access-header">CONTACTS</div>
+            <div id="contacts-all-list" role="list" aria-label="All contacts"></div>
+          </div>
+          <div id="contacts-feedback"></div>
         </div>
 
         <!-- 🏦 Bank app view — placeholder until S6 lands -->

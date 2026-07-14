@@ -28,6 +28,10 @@ import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
   setActivePassRoom, removePass, type PassState,
 } from './roomPasses';
+import {
+  initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
+  encodeMyCard, addContactFromCard, setFriend, removeContact,
+} from './contacts';
 
 type RendererModule = typeof import('./renderer');
 
@@ -568,6 +572,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   if (!roomPassesInited) {
     roomPassesInited = true;
     initRoomPasses({ decode: decodeBootstrapInput, resolve: resolveBridgeBootstrap });
+    // Contacts (keyed identity §8): our card embeds our node reachability (the
+    // same local hint passes carry) so a friend can dial us for a DM / mesh link.
+    initContacts({
+      myName: () => getPlayerName(),
+      myHints: () => (localFingerprint ? getLocalNodeHint(localFingerprint) : null),
+    });
   }
   setActivePassRoom(boot.roomId);
 
@@ -1220,6 +1230,7 @@ function setupSpacePhoneOverlay() {
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
     if (id === 'access') refreshAccessRoomRow();
+    if (id === 'contacts') refreshContactsApp();
   };
 
   // App tiles on the home screen route into their views
@@ -1454,6 +1465,9 @@ function setupSpacePhoneOverlay() {
       applyAccessModeUI(getRoomAccessMode());
     });
   }
+
+  // 👥 Contacts app wiring (keyed identity §8) — share/import cards, friends.
+  setupContactsApp();
 
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
@@ -2028,6 +2042,151 @@ function refreshAccessRoomRow(): void {
   }
   nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Lobby';
   idEl.textContent = activeBootstrap?.roomId ?? 'furlong-lobby';
+}
+
+// ── 👥 Contacts app (keyed identity §8) ──────────────────────────────────────
+
+/** Repaint the phone identity row (name + key fingerprint). Module-level so
+ *  actions outside setupSpacePhoneOverlay (identity restore) can refresh it. */
+function refreshIdentityKeyRow(): void {
+  const nameEl = document.getElementById('phone-player-name');
+  if (nameEl) nameEl.textContent = getPlayerName();
+  const keyEl = document.getElementById('phone-identity-key');
+  if (keyEl) {
+    keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
+    keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
+  }
+}
+
+let contactsAppInited = false;
+
+function setContactsFeedback(msg: string): void {
+  const el = document.getElementById('contacts-feedback');
+  if (el) el.textContent = msg;
+}
+
+/** Bind the Contacts app once: share/import cards, recovery, friend/contact
+ *  list actions (delegated). Re-render on any contacts change. */
+function setupContactsApp(): void {
+  if (contactsAppInited) return;
+  contactsAppInited = true;
+
+  document.getElementById('contacts-share-btn')?.addEventListener('click', () => {
+    const card = encodeMyCard();
+    const out = document.getElementById('contacts-my-card') as HTMLInputElement | null;
+    if (out) { out.value = card; out.select(); }
+    navigator.clipboard?.writeText(card).then(
+      () => setContactsFeedback('Your card is copied — share it however you like.'),
+      () => setContactsFeedback('Your card is shown above — copy it manually.'),
+    );
+  });
+
+  const addBtn = document.getElementById('contacts-add-btn');
+  const addInput = document.getElementById('contacts-add-input') as HTMLInputElement | null;
+  addBtn?.addEventListener('click', () => {
+    const raw = addInput?.value.trim();
+    if (!raw) { setContactsFeedback('Paste a contact card first.'); return; }
+    const result = addContactFromCard(raw);
+    if (!result.ok) { setContactsFeedback(result.error); return; }
+    if (addInput) addInput.value = '';
+    setContactsFeedback(result.isSelf
+      ? "That's your own card."
+      : `Added ${result.name} · 🔑 ${contactFingerprint(result.pub)}. Verify the fingerprint out-of-band.`);
+  });
+
+  // Recovery: reveal export / restore (destructive — swaps your identity).
+  document.getElementById('contacts-export-btn')?.addEventListener('click', () => {
+    const out = document.getElementById('contacts-recovery-out') as HTMLInputElement | null;
+    if (out) { out.value = (window as any).__ssfIdentity.exportRecoveryKey(); out.select(); }
+    setContactsFeedback('Recovery key revealed — store it somewhere only you control.');
+  });
+  document.getElementById('contacts-import-key-btn')?.addEventListener('click', () => {
+    const inp = document.getElementById('contacts-recovery-in') as HTMLInputElement | null;
+    const raw = inp?.value.trim();
+    if (!raw) { setContactsFeedback('Paste a recovery key to restore.'); return; }
+    const newPub = (window as any).__ssfIdentity.importRecoveryKey(raw);
+    if (!newPub) { setContactsFeedback('That is not a valid recovery key.'); return; }
+    if (inp) inp.value = '';
+    // Re-assert the restored identity into the current room's player entry.
+    updateLocalPlayerEntry();
+    refreshIdentityKeyRow();
+    refreshContactsApp();
+    setContactsFeedback('Identity restored. Your key fingerprint updated.');
+  });
+
+  // Delegated list actions (friend toggle, DM, remove) for both lists.
+  const onListClick = (e: Event) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-contact-act]');
+    if (!btn) return;
+    const pub = btn.dataset.contactPub;
+    if (!pub) return;
+    switch (btn.dataset.contactAct) {
+      case 'friend': setFriend(pub, true); setContactsFeedback('Added to friends.'); break;
+      case 'unfriend': setFriend(pub, false); setContactsFeedback('Removed from friends.'); break;
+      case 'remove': removeContact(pub); setContactsFeedback('Contact removed.'); break;
+      case 'dm': openDirectMessage(pub); break;
+    }
+  };
+  document.getElementById('contacts-friends-list')?.addEventListener('click', onListClick);
+  document.getElementById('contacts-all-list')?.addEventListener('click', onListClick);
+
+  // Keep the app live while it (or anything) mutates the contacts store.
+  subscribeContacts(() => { if (isContactsAppOpen()) refreshContactsApp(); });
+}
+
+function isContactsAppOpen(): boolean {
+  const el = document.getElementById('phone-app-contacts');
+  return !!el && el.classList.contains('active');
+}
+
+function contactRowHtml(name: string, pub: string, opts: { friend: boolean }): string {
+  const fp = contactFingerprint(pub);
+  const safeName = escapeHtml(name);
+  const friendBtn = opts.friend
+    ? `<button type="button" data-contact-act="unfriend" data-contact-pub="${pub}" title="Remove from friends">★</button>`
+    : `<button type="button" data-contact-act="friend" data-contact-pub="${pub}" title="Add to friends">☆</button>`;
+  const dmBtn = opts.friend
+    ? `<button type="button" data-contact-act="dm" data-contact-pub="${pub}" title="Direct message">💬</button>`
+    : '';
+  return `<div class="contact-row" role="listitem">
+    <span class="contact-name" title="${pub}">${safeName}</span>
+    <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
+    <span class="contact-actions">${dmBtn}${friendBtn}<button type="button" data-contact-act="remove" data-contact-pub="${pub}" title="Remove contact">✕</button></span>
+  </div>`;
+}
+
+function refreshContactsApp(): void {
+  const nameEl = document.getElementById('contacts-my-name');
+  const fpEl = document.getElementById('contacts-my-fp');
+  if (nameEl) nameEl.textContent = getPlayerName();
+  if (fpEl) fpEl.textContent = `🔑 ${getIdentityFingerprint()}`;
+
+  const friends = listFriends();
+  const all = listContacts();
+  const friendsList = document.getElementById('contacts-friends-list');
+  const allList = document.getElementById('contacts-all-list');
+  if (friendsList) {
+    friendsList.innerHTML = friends.length
+      ? friends.map((c) => contactRowHtml(c.name, c.pub, { friend: true })).join('')
+      : '<div class="phone-access-note">No friends yet — add a contact, then tap ☆ to make them a friend.</div>';
+  }
+  if (allList) {
+    allList.innerHTML = all.length
+      ? all.map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend })).join('')
+      : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => (
+    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;'
+  ));
+}
+
+// DM entry point — the real pairwise signed-conversation transport lands in the
+// next slice (directMessages.ts). Wired here so the 💬 button is already live.
+function openDirectMessage(pub: string): void {
+  setContactsFeedback(`DM with 🔑 ${contactFingerprint(pub)} — messaging transport comes online next.`);
 }
 
 // ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────

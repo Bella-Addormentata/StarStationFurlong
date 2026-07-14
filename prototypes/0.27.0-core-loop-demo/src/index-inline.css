@@ -921,13 +921,66 @@
         letter-spacing: 0.5px;
       }
 
-      #access-feedback {
+      #access-feedback,
+      #contacts-feedback {
         font-family: monospace;
         font-size: 9.5px;
         color: rgba(212, 168, 75, 0.8);
         min-height: 12px;
         line-height: 1.4;
       }
+
+      /* 👥 Contacts app rows */
+      .contact-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 4px;
+        border-bottom: 1px solid rgba(224, 226, 238, 0.08);
+      }
+      .contact-name {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+        color: #e0e2ee;
+      }
+      .contact-fp {
+        flex: 0 0 auto;
+        font-family: monospace;
+        font-size: 9px;
+        color: rgba(0, 224, 224, 0.75);
+      }
+      .contact-actions {
+        flex: 0 0 auto;
+        display: flex;
+        gap: 3px;
+      }
+      .contact-actions button {
+        background: rgba(224, 226, 238, 0.06);
+        border: 1px solid rgba(224, 226, 238, 0.15);
+        color: #e0e2ee;
+        border-radius: 4px;
+        font-size: 11px;
+        line-height: 1;
+        padding: 3px 5px;
+        cursor: pointer;
+      }
+      .contact-actions button:hover { background: rgba(212, 168, 75, 0.2); }
+      #contacts-recovery {
+        margin-top: 8px;
+        font-size: 9px;
+      }
+      #contacts-recovery summary {
+        cursor: pointer;
+        color: rgba(224, 226, 238, 0.6);
+        letter-spacing: 0.5px;
+      }
+      #contacts-my-card,
+      #contacts-recovery-out,
+      #contacts-recovery-in { font-family: monospace; font-size: 9px; }
 
       /* Room access mode selector (public-doors) */
       #access-mode-row {
