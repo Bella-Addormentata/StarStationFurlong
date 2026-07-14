@@ -168,9 +168,13 @@ export function subscribePeers(listener: () => void): () => void {
 
 /**
  * Best-known reachability for a pubkey, for dialing. Returns the peer's own
- * hints if we have them; null if we know the identity but no route (a later
- * introduction / DHT re-resolution by pubkey can fill it). M3/M4 extend this to
- * return a trust-ranked list of *introducer* paths when there's no direct route.
+ * hints if we have them; null if we know the identity but no route. M3/M4 extend
+ * this to return a trust-ranked list of *introducer* paths when there's no direct
+ * route. A null here is the designed FALL-THROUGH point to the always-on floor:
+ * an identity-keyed ChiaHub presence lookup (rung 6) re-resolves a friend's
+ * CURRENT address off-chain-of-the-mesh when identity is known but the route is
+ * dead — see brainstorming/keyed-identity-contacts-plan.md §7.7 +
+ * REVIEWS/REVIEW-20260710-ChiaHub.md (gated on spike B-7; not wired yet).
  */
 export function hintsFor(pub: string): RoomMemberHint | null {
   return peers.get(pub)?.hints ?? null;
