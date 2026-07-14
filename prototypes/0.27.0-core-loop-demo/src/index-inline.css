@@ -661,6 +661,15 @@
         color: rgba(224, 226, 238, 0.4);
         flex: 0 0 auto;
       }
+      #phone-identity-key {
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 8.5px;
+        letter-spacing: 0.5px;
+        color: rgba(0, 212, 255, 0.6);
+        margin-left: auto;
+        flex: 0 0 auto;
+        cursor: default;
+      }
 
       #phone-player-name {
         flex: 1;

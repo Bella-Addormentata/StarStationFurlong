@@ -17,6 +17,10 @@ import { initCameraRig, updateCameraRig } from './cameraRig';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
+import {
+  getIdentityPub, getIdentityFingerprint, signNameCert, verifyNameCert,
+  exportRecoveryKey, importRecoveryKey,
+} from './keypair';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
@@ -45,6 +49,16 @@ const mouse     = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+
+// Keyed-identity Slice 1: expose the identity for verification + the recovery
+// backup/restore flow (the polished UI lands with the Contacts app, Slice 3).
+(window as any).__ssfIdentity = {
+  getPub: () => getIdentityPub(),
+  getFingerprint: () => getIdentityFingerprint(),
+  exportRecoveryKey: () => exportRecoveryKey(),
+  importRecoveryKey: (r: string) => importRecoveryKey(r),
+  verifyNameCert,
+};
 let yjsSync: YjsSync | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
@@ -596,6 +610,15 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     });
   }
 
+  // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
+  // so our KEYED entry (keyB64 + self-cert) wins over any stale pre-Slice-1
+  // entry for the same id that the node holds — the join-time upsert above runs
+  // pre-sync, and Yjs LWW would otherwise keep the older keyless version.
+  const entryEpoch = epoch;
+  void sync.whenServerSynced.then(() => {
+    if (entryEpoch === sessionEpoch) updateLocalPlayerEntry();
+  });
+
   const updateRoomUI = () => {
     const nameVal = roomMap.get('name') as string || 'Lobby';
     const ownerVal = roomMap.get('owner') as string || 'Local-Clone';
@@ -1028,6 +1051,14 @@ interface PlayerEntry {
   name: string;
   joinedAt: number;
   outfitId: string;
+  /** Keyed-identity Slice 1 (additive): the player's Ed25519 public key
+   *  (base64url) and a self-signature over the name↔key binding. Lets a peer
+   *  verify a display name is backed by a real key (verifyNameCert). The map
+   *  is still KEYED by the legacy UUID (getPlayerId) — the pubkey-as-id
+   *  migration is a later, dual-read slice. Optional so legacy entries stay
+   *  valid. */
+  keyB64?: string;
+  keySig?: string;
 }
 
 /**
@@ -1043,10 +1074,15 @@ function updateLocalPlayerEntry(): void {
   const players = sync.doc.getMap('players');
   const id = getPlayerId();
   const prev = players.get(id) as Partial<PlayerEntry> | undefined;
+  const name = getPlayerName();
   const entry: PlayerEntry = {
-    name: getPlayerName(),
+    name,
     joinedAt: typeof prev?.joinedAt === 'number' ? prev.joinedAt : Date.now(),
     outfitId: loadSavedOutfitId() ?? 'default',
+    // Self-signed name↔key cert (Slice 1): proves the identity key holder
+    // claims this name. Re-signed on every upsert so a name edit re-certs.
+    keyB64: getIdentityPub(),
+    keySig: signNameCert(name),
   };
   sync.doc.transact(() => {
     players.set(id, entry);
@@ -1306,6 +1342,11 @@ function setupSpacePhoneOverlay() {
   const playerNameEditBtn = document.getElementById('phone-player-name-edit');
   const refreshIdentityRow = () => {
     if (playerNameEl) playerNameEl.textContent = getPlayerName();
+    const keyEl = document.getElementById('phone-identity-key');
+    if (keyEl) {
+      keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
+      keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
+    }
   };
   refreshIdentityRow();
   const beginPlayerNameEdit = () => {
