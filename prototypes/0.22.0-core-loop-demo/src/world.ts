@@ -13,6 +13,7 @@ import { findDoor } from './doors';
 import { findDevice, createRoomTerminalUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle } from './devices';
 import { deviceFocus } from './deviceFocus';
+import { roomEdit, canEditRoom } from './editMode';
 import { showHint } from './hud';
 import { DoorDockingPortSystem } from './docking';
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from './voxelCharacter';
@@ -565,8 +566,10 @@ export class World {
     if (this.isMorphing) return;
     // Morph restart: instantly tear down any live device focus (ortho camera
     // + avatar restored, player released) before the room rebuilds — plan
-    // §D0.3 force-release rule.
+    // §D0.3 force-release rule. Edit mode force-exits for the same reason
+    // (#25 plan §4.5 — highlights restored, grid hidden).
     deviceFocus.forceRelease();
+    roomEdit.forceExit();
     this.isMorphing = true;
     this.morphProgress = 0;
     this.createPlatform();
@@ -677,10 +680,9 @@ export class World {
       (this.platformFloor.material as THREE.MeshStandardMaterial).opacity = eased * 0.9;
     }
 
-    // Show grid
-    if (this.platformGrid && eased > 0.5) {
-      this.platformGrid.visible = true;
-    }
+    // The platform grid is an EDIT-MODE affordance (E2 of #25) — it no
+    // longer auto-shows during the morph; setEditMode() owns its visibility.
+    // (It sat under the near-opaque wooden floor anyway.)
 
     // Fade in all platform elements
     this.platformElements.forEach(element => {
@@ -811,6 +813,10 @@ export class World {
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
+
+    // Drive room-edit mode (E2 of #25): force-exit when the view leaves the
+    // plain isometric room (zoom ≠ 2 / solar map) + selection-label tracking.
+    roomEdit.update();
 
     // 1 Hz idle status on wall-computer screens (M1 — the permanent home of
     // PR #36's dev-hook wiring; same live values, same cadence).
@@ -1057,8 +1063,23 @@ export class World {
       getPlayerPos: () => this.player.getPosition(),
       // Dim the in-world screen to "TERMINAL IN USE" while focused (D0.4).
       onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+      // EDIT ROOM entry (#33 M2 amendment of #25 E2): the button releases the
+      // device focus FIRST, then enters edit mode once the release completes
+      // (release-with-continuation, not nesting — edit is an iso activity).
+      editRoom: {
+        permission: () => canEditRoom(),
+        request: () => deviceFocus.releaseThen(() => roomEdit.enter(this)),
+      },
     });
     deviceFocus.beginFocus(this.player, device, ui);
+  }
+
+  /**
+   * Room-edit mode visual switch (E2 of #25): shows/hides the 1 m platform
+   * grid while the RoomEditController is active.
+   */
+  public setEditMode(on: boolean): void {
+    if (this.platformGrid) this.platformGrid.visible = on;
   }
 
   isPlayerActive(): boolean {

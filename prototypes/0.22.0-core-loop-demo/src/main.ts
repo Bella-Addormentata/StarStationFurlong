@@ -15,6 +15,7 @@ import { SolarSystemMap } from './map';
 import { MultiScaleZoomView } from './zoom';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
+import { roomEdit, setRoomEditPermission } from './editMode';
 
 type RendererModule = typeof import('./renderer');
 
@@ -1436,6 +1437,22 @@ async function init() {
   world = new worldModule.World(scene);
   (window as any).world = world;
 
+  // ── Room-edit owner gate (E2 of #25, plan §1) — the permissive v1 check,
+  // registered as editMode.ts's isolated predicate so swapping to the S2
+  // identity gate at integration is a one-line change of THIS registration.
+  // Precedent: the room-NAME edit gate uses the same literal (saveChanges in
+  // setupNetworkDetailsPanel above).
+  // TODO(#20-S2): replace with the playersMap identity check
+  // (isLocalPlayerRoomOwner) once stable playerIds land — the node's stable
+  // 8-byte lane id is a candidate owner value after #26/#27.
+  setRoomEditPermission(() => {
+    if (!yjsSync) return { ok: true }; // offline: your room
+    const owner = (yjsSync.doc.getMap('roomInfo').get('owner') as string | undefined) ?? 'Local-Clone';
+    return owner === 'Local-Clone'
+      ? { ok: true }
+      : { ok: false, reason: `Only the owner (${owner}) can edit this room.` };
+  });
+
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
   // expose a debug console handle. LOCAL rig only — remote avatars keep #27's
   // per-peer hue tint until the phone-plan S2 identity lane carries outfit ids.
@@ -1554,6 +1571,15 @@ function onCanvasClick(event: MouseEvent): void {
   //    is the focus perspective camera, not the isometric one.
   if (isDeviceFocusActive()) {
     deviceFocus.release();
+    return;
+  }
+
+  // ── Edit mode owns clicks (E2 of #25, routed BEFORE the keypad → door →
+  //    device passes per the #33 M2 amendment): a click on a movable item
+  //    selects it, a click anywhere else deselects — and navigation is
+  //    suppressed entirely (WASD stays live for walking while editing).
+  if (roomEdit.isEditModeActive()) {
+    roomEdit.handleClick(event);
     return;
   }
 

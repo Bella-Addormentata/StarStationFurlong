@@ -66,6 +66,14 @@ class DeviceFocusController {
   /** The device/UI currently owning the camera (FOCUSING/FOCUSED/RELEASING). */
   private active: { device: DeviceTarget; ui: DeviceUI } | null = null;
   private uiMounted = false;
+  /**
+   * Release-then-continue hook (#33 M2): runs exactly once after a release
+   * completes (ortho camera + avatar restored, player released) — the wall
+   * computer's EDIT ROOM button uses it to enter edit mode from the plain
+   * isometric view. Cleared without running on forceRelease (morph restart /
+   * room swap must not resurrect a deferred continuation).
+   */
+  private pendingReleaseContinuation: (() => void) | null = null;
 
   private focusCam: THREE.PerspectiveCamera | null = null;
   private orthoCam: THREE.OrthographicCamera | null = null;
@@ -158,10 +166,27 @@ class DeviceFocusController {
   }
 
   /**
+   * Release the focus, then run `continuation` once the release has fully
+   * completed (ortho camera restored, player released) — additive #33 M2
+   * hook for the EDIT ROOM entry, which must begin from the plain isometric
+   * view, not nested inside a live focus. When no focus is active the
+   * continuation runs immediately.
+   */
+  public releaseThen(continuation: () => void): void {
+    if (this.state !== 'FOCUSED' && this.state !== 'FOCUSING') {
+      continuation();
+      return;
+    }
+    this.pendingReleaseContinuation = continuation;
+    this.release();
+  }
+
+  /**
    * Instant, no-ease teardown (morph restart / room swap — plan §D0.3).
    * Restores the ortho camera + avatar and releases the player immediately.
    */
   public forceRelease(): void {
+    this.pendingReleaseContinuation = null; // never resurrect across a force-release
     if (this.state === 'IDLE') return;
     if (this.uiMounted && this.active) {
       this.active.ui.unmount();
@@ -286,6 +311,11 @@ class DeviceFocusController {
     this.active = null;
     // releaseDevice resumes any deferred seat/door/dest/device request.
     this.player?.releaseDevice();
+    // Release-then-continue (#33 M2): run AFTER the camera/player restore so
+    // the continuation (e.g. roomEdit.enter) starts from the plain iso view.
+    const continuation = this.pendingReleaseContinuation;
+    this.pendingReleaseContinuation = null;
+    continuation?.();
   }
 
   /** Avatar fade during the eases (zoom.ts:418–430 / 452–466 pattern). */
