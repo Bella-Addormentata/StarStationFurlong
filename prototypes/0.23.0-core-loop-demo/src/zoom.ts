@@ -19,6 +19,14 @@
 
 import * as THREE from 'three';
 import { isDeviceFocusActive } from './deviceFocus';
+import { rotateIsoOffset } from './cameraRig';
+
+// Base (yaw-0) isometric offsets for the ortho levels — the camera rig
+// (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
+// so every level snap below lands on whatever angle the player rotated to.
+const ISO_BASE_L2 = new THREE.Vector3(22, 26, 22);
+const ISO_BASE_L3 = new THREE.Vector3(34, 38, 34);
+const ISO_BASE_L4 = new THREE.Vector3(48, 54, 48);
 
 export interface ZoomScaleDef {
   level: number;
@@ -356,11 +364,12 @@ export class MultiScaleZoomView {
           transitionProgress = 0.0;
           
           // Orthographic cameras don't have standard positions that match perspective coordinates due to parallel lines,
-          // but we can generate an identical apparent starting point of the elevated three-quarter room view: (22, 26, 22).
-          // We start EXACTLY at the isometric offset relative to the player's core center: (playerX + 22, playerY + 26, playerZ + 22)
+          // but we can generate an identical apparent starting point of the elevated three-quarter room view: (22, 26, 22)
+          // swung to the camera rig's current 45°-detent azimuth (cameraRig.ts).
+          // We start EXACTLY at the isometric offset relative to the player's core center.
           const playerPos = (window as any).world?.getPlayer()?.getPosition() || new THREE.Vector3(0, 0, 1.5);
-          
-          transitionStartPos.set(playerPos.x + 22, playerPos.y + 26, playerPos.z + 22);
+
+          rotateIsoOffset(ISO_BASE_L2, transitionStartPos).add(playerPos);
 
           // Target is the eye position of the clone (Y=1.25) looking slightly ahead
           transitionTargetPos.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
@@ -525,7 +534,7 @@ export class MultiScaleZoomView {
             // Elevated further back (Level 3 - Outside capsules view)
             const halfH_L3 = 22 / 2;
             const halfW_L3 = halfH_L3 * aspect;
-            orthographicCamera.position.set(34, 38, 34); 
+            rotateIsoOffset(ISO_BASE_L3, orthographicCamera.position);
             orthographicCamera.lookAt(0, 0, 0);
             orthographicCamera.left = -halfW_L3;
             orthographicCamera.right = halfW_L3;
@@ -535,7 +544,7 @@ export class MultiScaleZoomView {
             // Isometric perspective is carried into Level 4, but zoomed further back (Base assembly view)
             const halfH_L4 = 36 / 2;
             const halfW_L4 = halfH_L4 * aspect;
-            orthographicCamera.position.set(48, 54, 48); 
+            rotateIsoOffset(ISO_BASE_L4, orthographicCamera.position);
             orthographicCamera.lookAt(0, 0, 0);
             orthographicCamera.left = -halfW_L4;
             orthographicCamera.right = halfW_L4;
@@ -554,7 +563,7 @@ export class MultiScaleZoomView {
           } else {
             // Standard close Room View (Level 2)
             // Fix squished projection: dynamically calculate left/right/top/bottom respecting the aspect ratio instead of hardcoding static squares!
-            orthographicCamera.position.set(22, 26, 22);
+            rotateIsoOffset(ISO_BASE_L2, orthographicCamera.position);
             orthographicCamera.lookAt(0, 0, 0);
             orthographicCamera.left = -halfW_L2;
             orthographicCamera.right = halfW_L2;

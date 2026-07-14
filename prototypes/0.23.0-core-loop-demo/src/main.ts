@@ -13,6 +13,7 @@ import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_BYTES, type MovementTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
 import { MultiScaleZoomView } from './zoom';
+import { initCameraRig, updateCameraRig } from './cameraRig';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
@@ -1856,6 +1857,14 @@ async function init() {
   setupNetworkDetailsPanel();
   setupZoomView();
 
+  // Camera rig: 45° view-rotation arrows (bottom-left HUD, next to DEV).
+  // Injected probes keep cameraRig.ts import-cycle-free: it must not import
+  // zoom.ts (which imports it for rotated level snaps) nor deviceFocus.ts.
+  initCameraRig({
+    getZoomLevel: () => (multiScaleZoom ? multiScaleZoom.getLevel() : 2),
+    isCameraBusy: () => isDeviceFocusActive(),
+  });
+
   // DEV1: temporary Development menu (owner request, demo phase — will be
   // phased out). Removal = delete src/devMenu.ts, the #dev-menu-btn line in
   // index.html, and these three lines.
@@ -2051,6 +2060,11 @@ function animate() {
     multiScaleZoom.tick();
   }
 
+  // Camera rig: ease the 45°-detent view rotation and steer the ortho room
+  // camera while it owns the view (levels 2–4, no device focus). Runs after
+  // the zoom tick so a level snap and the rig agree within the same frame.
+  updateCameraRig(deltaTime);
+
   if (hasEntered && !controlsHintShown && world.isPlayerActive()) {
     const controls = document.getElementById('controls');
     if (controls) {
@@ -2171,7 +2185,7 @@ function animate() {
     }
   }
   
-  // Render — camera position/angle never changes
+  // Render — camera stays locked except for the rig's 45° view detents
   renderer.render(scene, camera);
 }
 
