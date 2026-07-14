@@ -1247,7 +1247,11 @@ export class World {
       let vestibule = this.pairedVestibules.get(door.id);
 
       if (!paired) {
-        if (vestibule && this.transitVestibuleDoorId !== door.id) {
+        // Defer disposal while EITHER a transit or a plain walk-through is on
+        // this door — mid-PEEK the avatar physically stands in the gangway,
+        // and an unpair must not pop the tube out around them (review L1;
+        // mirrors the activeDoorId exemption in the opacity branch below).
+        if (vestibule && this.transitVestibuleDoorId !== door.id && activeDoorId !== door.id) {
           this.disposeVestibule(door.id);
         }
         continue;
