@@ -14,6 +14,7 @@
  */
 
 import { OBSTACLES } from './obstacles';
+import type { Box } from './obstacles';
 
 // ── Grid constants ────────────────────────────────────────────────────────────
 /** World-space size of each grid cell (metres) */
@@ -197,4 +198,76 @@ export function findPath(
   }
 
   return []; // no path found
+}
+
+// ── Scratch-grid reachability (E3 of #25 — move-furniture connectivity gate) ──
+
+/**
+ * Flood-fill reachability over a SCRATCH grid baked from the given obstacle
+ * list — the helper the edit-room plan promised for E3 validity (§2.4).
+ * Entirely side-effect free: the real `walkable` grid is untouched, so a
+ * candidate furniture layout can be probed without committing it.
+ *
+ * The scratch bake uses the exact rebakeWalkableGrid() rules (cell-centre
+ * containment + the ±5.0 room boundary) and the flood fill expands with the
+ * same 8-directional + corner-cut rule as findPath (a diagonal step requires
+ * both flanking cardinal cells to be walkable), so "reachable" here means
+ * precisely "A* could route there".
+ *
+ * Returns reachable[row][col], flooded from the cell containing
+ * (startX, startZ). When the start cell itself is blocked in the scratch
+ * grid, every cell reads unreachable.
+ */
+export function computeReachable(
+  obstacles: readonly Box[],
+  startX: number,
+  startZ: number,
+): boolean[][] {
+  // Bake the scratch walkable grid (same rules as rebakeWalkableGrid).
+  const scratch: boolean[][] = [];
+  for (let row = 0; row < GRID_SIZE; row++) {
+    const cells: boolean[] = [];
+    for (let col = 0; col < GRID_SIZE; col++) {
+      const wx = (col - GRID_HALF + 0.5) * CELL_SIZE;
+      const wz = (row - GRID_HALF + 0.5) * CELL_SIZE;
+      let blocked = false;
+      for (const b of obstacles) {
+        if (wx > b.x0 && wx < b.x1 && wz > b.z0 && wz < b.z1) {
+          blocked = true;
+          break;
+        }
+      }
+      if (Math.abs(wx) > 5.0 || Math.abs(wz) > 5.0) blocked = true;
+      cells.push(!blocked);
+    }
+    scratch.push(cells);
+  }
+
+  const reachable: boolean[][] = scratch.map((row) => row.map(() => false));
+  const startRow = Math.max(0, Math.min(GRID_SIZE - 1, worldToRow(startZ)));
+  const startCol = Math.max(0, Math.min(GRID_SIZE - 1, worldToCol(startX)));
+  if (!scratch[startRow][startCol]) return reachable;
+
+  const dirs = [
+    [-1, 0], [1, 0], [0, -1], [0, 1],
+    [-1, -1], [-1, 1], [1, -1], [1, 1],
+  ] as const;
+
+  reachable[startRow][startCol] = true;
+  const stack: Array<[number, number]> = [[startRow, startCol]];
+  while (stack.length > 0) {
+    const [r, c] = stack.pop()!;
+    for (const [dr, dc] of dirs) {
+      const nr = r + dr;
+      const nc = c + dc;
+      if (nr < 0 || nr >= GRID_SIZE || nc < 0 || nc >= GRID_SIZE) continue;
+      if (!scratch[nr][nc] || reachable[nr][nc]) continue;
+      // Corner-cut rule (mirrors findPath): a diagonal expansion needs both
+      // flanking cardinal cells walkable.
+      if (dr !== 0 && dc !== 0 && (!scratch[r + dr][c] || !scratch[r][c + dc])) continue;
+      reachable[nr][nc] = true;
+      stack.push([nr, nc]);
+    }
+  }
+  return reachable;
 }
