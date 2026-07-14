@@ -25,6 +25,27 @@ export const PLAYER_NAME_MAX_LENGTH = 24;
 let cachedPlayerId: string | null = null;
 let cachedPlayerName: string | null = null;
 
+/**
+ * Mint a UUID for the player id. crypto.randomUUID is unavailable outside
+ * secure contexts (and on older engines) — identity here is UNIQUENESS, not
+ * security (see the header note), so a Math.random/Date-seeded v4 shape is an
+ * acceptable fallback; the whole phone UI must not die on a missing API.
+ */
+function mintPlayerUuid(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch { /* fall through to the non-crypto shape */ }
+  let seed = Date.now();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (seed + Math.random() * 16) % 16 | 0;
+    seed = Math.floor(seed / 16);
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 /** Per-install player id (UUID). Minted + persisted on first call. */
 export function getPlayerId(): string {
   if (cachedPlayerId) return cachedPlayerId;
@@ -35,7 +56,7 @@ export function getPlayerId(): string {
       return existing;
     }
   } catch { /* privacy mode — mint a session-scoped id below */ }
-  const minted = crypto.randomUUID();
+  const minted = mintPlayerUuid();
   cachedPlayerId = minted;
   try {
     localStorage.setItem(ID_STORAGE_KEY, minted);

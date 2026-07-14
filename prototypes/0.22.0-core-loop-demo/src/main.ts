@@ -243,7 +243,8 @@ async function bootstrapNetworking() {
     // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
-    const boot = pendingBootstrapOverride ?? await fetchDefaultBootstrap();
+    const override = pendingBootstrapOverride;
+    const boot = override ?? await fetchDefaultBootstrap();
     if (!boot) {
       console.warn('⚠️ No running Rust node found. Seamlessly falling back to offline mode.');
       updateHUDNode('OFFLINE', '#ff1744');
@@ -252,7 +253,14 @@ async function bootstrapNetworking() {
       return;
     }
 
-    await joinRoom(boot);
+    // Room-defaults claim gate (S2 review fix): only the DEFAULT-bootstrap
+    // path — our own node's own room — may claim roomInfo owner/name
+    // defaults. Imported seeds (?seed= URL, Use-link) are JOINS into someone
+    // else's room and must never write defaults; see the claimRoomDefaults
+    // comment in joinRoomAtEpoch for the initial-sync race this prevents.
+    // pendingBootstrapOverride intentionally persists after use, so a
+    // Retry-node following a seed import stays classified as a join.
+    await joinRoom(boot, /* claimRoomDefaults */ !override);
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -291,12 +299,12 @@ async function bootstrapNetworking() {
  * NetworkProvider.onEnvelope/onTick hold a single handler slot, so the
  * re-registration below replaces (never stacks) the previous room's handlers.
  */
-async function joinRoom(boot: RoomBootstrap): Promise<void> {
+async function joinRoom(boot: RoomBootstrap, claimRoomDefaults: boolean): Promise<void> {
   // Claim a fresh session epoch (see the sessionEpoch declaration): only the
   // newest join/leave owns the shared provider + module state.
   const epoch = ++sessionEpoch;
   try {
-    await joinRoomAtEpoch(boot, epoch);
+    await joinRoomAtEpoch(boot, epoch, claimRoomDefaults);
   } catch (err) {
     if (epoch !== sessionEpoch) {
       // Superseded mid-join: the newer session's leaveRoom yanked our
@@ -311,8 +319,10 @@ async function joinRoom(boot: RoomBootstrap): Promise<void> {
 }
 
 /** Body of joinRoom, bound to the epoch it claimed. After every await it
- *  re-checks the epoch and unwinds whatever it created if superseded. */
-async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void> {
+ *  re-checks the epoch and unwinds whatever it created if superseded.
+ *  `claimRoomDefaults`: true only on the own-room default-bootstrap path —
+ *  gates the roomInfo owner/name default writes (see below). */
+async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefaults: boolean): Promise<void> {
   // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
   seenPeers.clear();
   receivedTicks = 0;
@@ -404,7 +414,19 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap('roomInfo');
-  if (!roomMap.has('owner')) {
+  // Ownership-claim race guard (S2 review fix): `roomMap.has('owner')` runs
+  // SYNCHRONOUSLY after sync.start(), but start() only SENDS SyncStep1 — the
+  // SyncStep2 carrying the room's established state arrives async in the
+  // reader loop, so the local replica is always EMPTY here. Without the
+  // claimRoomDefaults gate every seed-link joiner saw "no owner", claimed
+  // ownership, and reset the room name concurrently with the real values —
+  // and Yjs LWW let the joiner's write win on all replicas roughly half the
+  // time. Only the own-room default-bootstrap path claims now; a reload of
+  // your own room re-claims the same player id (idempotent). Residual known
+  // gap (pre-existing, unchanged): the OWN-room claim itself still races the
+  // initial sync, so an owner who renamed their room can see the name revert
+  // on reload — fixing that needs a sync-complete signal from YjsSync.
+  if (claimRoomDefaults && !roomMap.has('owner')) {
     sync.doc.transact(() => {
       // S2: the owner is a player ID (stable across reloads), not a display
       // name. Legacy rooms hold 'Local-Clone' here — see isLocalPlayerRoomOwner.
@@ -456,9 +478,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
       container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
       const items: any[] = sharedChat.toArray();
       items.forEach(item => {
-        // S2: classify by stable authorId. Messages from pre-S2 docs carry no
-        // authorId — fall back to the old hardcoded-name compare so legacy
-        // logs still split into me/them instead of all flipping to 'them'.
+        // S2: classify by stable authorId. Pre-S2 messages carry no authorId
+        // and EVERY pre-S2 sender wrote the literal authorName 'Local-Clone',
+        // so the fallback renders all legacy messages as 'me' — exactly the
+        // pre-S2 behavior (no regression, no improvement). The 2+ player
+        // me/them fix only applies to messages written with an authorId.
         const isMe = typeof item.authorId === 'string'
           ? item.authorId === getPlayerId()
           : item.authorName === 'Local-Clone';
@@ -609,10 +633,14 @@ function isLocalPlayerRoomOwner(owner: string): boolean {
 }
 
 /**
- * Render the 'CLONES IN ROOM' roster on the phone home screen from the
- * current doc's `players` map. Called from the per-join players observer and
- * on phone setup (offline placeholder). DOM built via textContent — names are
+ * Render the 'CLONES SEEN' roster on the phone home screen from the current
+ * doc's `players` map. Called from the per-join players observer and on
+ * phone setup (offline placeholder). DOM built via textContent — names are
  * remote-controlled strings and must never hit innerHTML.
+ *
+ * 'SEEN', not 'IN ROOM': nothing ever REMOVES a players entry in S2 (no
+ * leave hook, no liveness), so departed players stay listed until S3
+ * presence lands heartbeat/lastSeen semantics.
  *
  * v1 scope note (S2): this list IS the visual surface for the players map.
  * Name tags over remote rigs and outfit application on remote rigs are
