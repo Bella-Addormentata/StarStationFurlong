@@ -34,6 +34,10 @@ export class DoorDockingPortSystem {
   private roomsGroup: THREE.Group;
   private doorState: Map<'north' | 'south' | 'east' | 'west', DockingState> = new Map();
   private doorObjects: Map<string, THREE.Group> = new Map();
+  /** Room ENTRY policy (public doors) — distinct from the per-door pairing
+   *  lock the terminal manages. Tints every door's status LED so the room's
+   *  openness is legible at each threshold. Re-asserted on door (re)build. */
+  private accessMode: 'public' | 'pass' | 'keyed' = 'pass';
   private adjacentRooms: Map<string, THREE.Mesh> = new Map();
 
   // ── Update-loop-driven leaf slides ─────────────────────────────────────────
@@ -608,6 +612,29 @@ export class DoorDockingPortSystem {
   /** Request the door leaves to slide closed. */
   public closeDoor(doorId: DoorId, onComplete?: () => void): void {
     this.startSlide(doorId, false, onComplete);
+  }
+
+  /**
+   * Set the room's ENTRY access mode (public-doors feature) and tint every
+   * door's status LED so a visitor reads the room's openness at any threshold:
+   * green = PUBLIC (anyone enters), amber = PASS (anyone with the link —
+   * today's default), red = KEYED (granted keys only; enforced once keyed
+   * identity ships). Driven from the roomInfo observer; distinct from the
+   * per-door pairing/lock the docking terminal manages. Idempotent.
+   */
+  public setAccessMode(mode: 'public' | 'pass' | 'keyed'): void {
+    this.accessMode = mode;
+    const color = mode === 'public' ? 0x00e676 : mode === 'keyed' ? 0xff1744 : 0xd4a84b;
+    for (const group of this.doorObjects.values()) {
+      const led = group.getObjectByName('ledStatus') as THREE.Mesh | null;
+      const mat = led?.material as THREE.MeshBasicMaterial | undefined;
+      if (mat?.color) mat.color.setHex(color);
+    }
+  }
+
+  /** The current room entry access mode (public-doors feature). */
+  public getAccessMode(): 'public' | 'pass' | 'keyed' {
+    return this.accessMode;
   }
 
   private startSlide(doorId: DoorId, open: boolean, onComplete?: () => void): void {

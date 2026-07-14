@@ -920,6 +920,29 @@
         line-height: 1.4;
       }
 
+      /* Room access mode selector (public-doors) */
+      #access-mode-row {
+        display: flex;
+        gap: 5px;
+      }
+      .access-mode-btn {
+        flex: 1;
+        font-family: inherit;
+        font-size: 9.5px;
+        font-weight: 700;
+        letter-spacing: 0.4px;
+        padding: 6px 4px;
+        border-radius: 6px;
+        border: 1px solid rgba(212, 168, 75, 0.24);
+        background: rgba(0, 0, 0, 0.25);
+        color: rgba(224, 226, 238, 0.55);
+        cursor: pointer;
+      }
+      .access-mode-btn[aria-checked="true"][data-access-mode="public"] { border-color: rgba(0,230,118,0.6);  background: rgba(0,230,118,0.16);  color: #e0e2ee; }
+      .access-mode-btn[aria-checked="true"][data-access-mode="pass"]   { border-color: rgba(212,168,75,0.7); background: rgba(212,168,75,0.16); color: #e0e2ee; }
+      .access-mode-btn[aria-checked="true"][data-access-mode="keyed"]  { border-color: rgba(255,23,68,0.6);  background: rgba(255,23,68,0.14);  color: #e0e2ee; }
+      .access-mode-btn.is-disabled { opacity: 0.4; cursor: default; }
+
       /* MY ROOMS list (issue #60 staged room-list) */
       #access-rooms-list {
         display: flex;

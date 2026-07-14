@@ -281,6 +281,13 @@
             </div>
             <button type="button" id="access-generate-btn" aria-label="Generate and copy a pass for this room">🎫 GENERATE PASS</button>
             <input type="text" id="access-pass-output" readonly placeholder="Pass appears when your node is reachable" aria-label="Generated room pass">
+            <div class="phone-access-header" style="margin-top:10px;">ROOM ACCESS</div>
+            <div id="access-mode-row" role="radiogroup" aria-label="Room access mode">
+              <button type="button" class="access-mode-btn" data-access-mode="public" role="radio" aria-checked="false">🌐 PUBLIC</button>
+              <button type="button" class="access-mode-btn" data-access-mode="pass" role="radio" aria-checked="true">🔗 PASS</button>
+              <button type="button" class="access-mode-btn" data-access-mode="keyed" role="radio" aria-checked="false">🔑 KEYED</button>
+            </div>
+            <div id="access-mode-note" class="phone-access-note">PASS · anyone with the link can enter (default).</div>
           </div>
           <div class="phone-access-section">
             <div class="phone-access-header">ADD A PASS</div>

@@ -1401,6 +1401,19 @@ function setupSpacePhoneOverlay() {
   renderPassesList();
   subscribePasses(renderPassesList);
 
+  // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
+  // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
+  // owner-gated, so a non-owner click is inert).
+  const accessModeRow = document.getElementById('access-mode-row');
+  if (accessModeRow) {
+    accessModeRow.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.access-mode-btn');
+      if (!btn || btn.disabled) return;
+      setRoomAccessMode(btn.dataset.accessMode as AccessMode);
+      applyAccessModeUI(getRoomAccessMode());
+    });
+  }
+
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
     // Standardize behavior and prevent focused inputs from scrolling/shifting window viewports
@@ -1914,7 +1927,56 @@ async function syncAccessPass(): Promise<void> {
  *  session (#52). Called when the ACCESS view opens (covers offline/pre-join
  *  states), after a successful beam-in, and from the per-join roomInfo /
  *  players observers so a rename or ownership resolve repaints it live. */
+// ── Room access mode (public-doors) ──────────────────────────────────────────
+// The room's ENTRY policy, synced in roomInfo and surfaced at every door LED
+// + the ACCESS app. PUBLIC = anyone enters; PASS = anyone with the link
+// (today's default); KEYED = granted keys only (enforced once keyed identity
+// ships — see brainstorming/keyed-identity-contacts-plan.md §9). Owner-set.
+type AccessMode = 'public' | 'pass' | 'keyed';
+
+const ACCESS_MODE_COPY: Record<AccessMode, string> = {
+  public: 'PUBLIC · anyone can enter this room.',
+  pass: 'PASS · anyone with the link can enter (default).',
+  keyed: 'KEYED · granted keys only (enforced once keyed identity ships).',
+};
+
+function getRoomAccessMode(): AccessMode {
+  const m = yjsSync?.doc.getMap('roomInfo').get('accessMode');
+  return m === 'public' || m === 'keyed' ? m : 'pass';
+}
+
+function isLocalOwnerOfCurrentRoom(): boolean {
+  const owner = yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined;
+  return !!owner && isLocalPlayerRoomOwner(owner);
+}
+
+function setRoomAccessMode(mode: AccessMode): void {
+  if (!yjsSync || !isLocalOwnerOfCurrentRoom()) return; // owner-gated
+  const rm = yjsSync.doc.getMap('roomInfo');
+  yjsSync.doc.transact(() => rm.set('accessMode', mode));
+}
+
+/** Reflect the current access mode: tint the door LEDs + paint the ACCESS
+ *  app's selector (owner-editable, everyone else read-only). */
+function applyAccessModeUI(mode: AccessMode): void {
+  world.dockingSystem?.setAccessMode(mode);
+  const isOwner = isLocalOwnerOfCurrentRoom();
+  const row = document.getElementById('access-mode-row');
+  if (row) {
+    for (const btn of row.querySelectorAll<HTMLButtonElement>('.access-mode-btn')) {
+      const btnMode = btn.dataset.accessMode as AccessMode;
+      btn.setAttribute('aria-checked', String(btnMode === mode));
+      btn.disabled = !isOwner;
+      btn.classList.toggle('is-disabled', !isOwner);
+      btn.title = isOwner ? `Set room access to ${btnMode}` : 'Only the room owner can change access mode';
+    }
+  }
+  const note = document.getElementById('access-mode-note');
+  if (note) note.textContent = isOwner ? ACCESS_MODE_COPY[mode] : `${ACCESS_MODE_COPY[mode]} (owner-set)`;
+}
+
 function refreshAccessRoomRow(): void {
+  applyAccessModeUI(getRoomAccessMode());
   const nameEl = document.getElementById('access-room-name');
   const idEl = document.getElementById('access-room-id');
   if (!nameEl || !idEl) return;
