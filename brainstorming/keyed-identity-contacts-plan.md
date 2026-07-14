@@ -136,3 +136,30 @@ So a person is discoverable only via a self-signed **`discoverable`** flag in th
 
 ### Key decisions (Phase 4)
 Discoverability default (recommend **opt-in** for a sovereignty-minded audience); peer-store cap size + eviction policy; automatic vs user-curated introductions (recommend automatic for reachability among mutuals, curated for anything wider); and whether relaying for others is on-by-default or opt-in (bandwidth + exposure).
+
+---
+
+## 8. Social structure: Friends, Contacts (mesh), and Companies *(owner refinement)*
+
+Two tiers over the keyed identity, plus a future shared-ownership entity. This splits the double duty "Contacts" carried above (verified people *and* mesh substrate) into a cleaner layering.
+
+**Contacts = the mesh (wide, low-intent).** Every verified identity your node has encountered or been introduced to — the §7 peer/identity graph, auto-populated from rooms + gossip + introductions. Purpose: reachability, discovery, "people you've met." A contact is just a verified key you've seen; trust is low by default.
+
+**Friends = curated (narrow, high-intent).** A subset you explicitly add, via a **mutual signed handshake** (you sign a friend-request to their key; they accept by counter-signing — mutual friendship = both signatures, a verifiable two-party cert). Purpose:
+- **Trust anchors for the mesh.** "Friend-of-trusted-friend" (§7 M3) becomes literally friend-of-friend — sybil-resistant peer prioritization radiates from your **friends**, not from anonymous mesh contacts. Friends are the web-of-trust roots.
+- **The DM boundary.** DMs go to friends; non-friends can't DM you (or land in a "requests" bucket). Natural spam control a keyless system can't do cleanly.
+- **Presence you care about** (their online/offline status — the S3 presence work).
+
+### Friends + Direct Messages *(maps to phone-apps S5)*
+- **Friend request / accept** = signed ops `{from, to, issuedAt, sig}` + the counter-signed accept, carried over the existing `ssf://` credential + the Slice-2 sign seam. Pending requests surface in a Friends "requests" bucket.
+- **DM** = a conversation between two mutual-friend keys. Substrate: a Yjs conversation doc keyed by the *sorted pair of pubkeys* (mirrors the room/games docs, syncs via the node) — authenticated by the sign seam. For confidentiality even against a curious node, seal payloads to the recipient's key (`chia_lane::seal/open`, Phase 3). Recommend authenticated DMs first, sealed later.
+- **Depends on:** Slice 1 (keys) + Slice 2 (sign seam) + Slice 3 (contacts). Sits alongside Slice 4. This is the S5 "DMs" slice, now cleanly gated: friends only, verified keys, no server, no directory.
+
+### Future: Companies (shared ownership + income)
+A **company** is a *keyed entity* — its own identity (keypair) plus a set of member keys and ownership shares — that collectively owns items and receives income. Sovereign, no registrar. It fits the keyed model directly:
+- **Identity:** a company is a pubkey like any other; its authority is a *shared control policy*, not a single private key.
+- **Control:** **M-of-N threshold** — transferring an item or paying out requires signatures from a threshold of member keys (multisig), recorded on a company ledger (the RoomLog machinery generalizes: an append-only signed op-log, for an entity instead of a room).
+- **Ownership:** items become *signed ledger claims* for the company rather than mere possession — which requires **moving asset-ownership from today's possession model** (furniture/modules you happen to hold) to a signed ownership ledger. That is the load-bearing prerequisite.
+- **Income:** the Bank ledger (phone-apps S6) credits the company account; distribution splits by share to member keys. Income sources tie into games/wagering (the chia-gaming rail in `games-plan.md`).
+
+**Honest placement:** economy-phase, several steps out — it depends on (a) keyed identity (this design), (b) the Bank/ledger (S6), and (c) asset-ownership-as-ledger (new). Record it as the north-star for a "shared entities" phase; don't build it before the economy exists. But nothing in the keyed-identity foundation blocks it: a company is just a keyed entity with a threshold control policy and a share ledger — all expressible with the same Ed25519 + signed-op-log primitives this plan already builds.
