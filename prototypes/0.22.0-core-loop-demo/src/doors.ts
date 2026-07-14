@@ -58,4 +58,18 @@ export interface DoorSequenceHooks {
   requestClose(): void;
   /** Fired when the avatar reaches the `through` point past the threshold. */
   onThrough(): void;
+  /**
+   * Adapter transit branch point (T1 of issue #30), consulted right after
+   * onThrough() at the THROUGH completion. Return true to walk on into the
+   * docking vestibule (ADAPTER_OUT → ADAPTER_HOLD) instead of the PEEK
+   * look-around; absent or false keeps the pre-T1 peek-and-return behavior
+   * exactly. The hook is where the World spawns the vestibule visuals.
+   */
+  beginTransit?: () => boolean;
+  /**
+   * Fired exactly once when the avatar reaches the vestibule hold point and
+   * enters ADAPTER_HOLD (T1). The room swap (leaveRoom→joinRoom) kicks off
+   * here — mid-hold, behind the full-screen fade.
+   */
+  onAdapterHold?: () => void;
 }

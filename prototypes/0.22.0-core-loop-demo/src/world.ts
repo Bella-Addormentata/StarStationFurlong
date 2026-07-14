@@ -10,6 +10,8 @@ import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
 import { findDoor } from './doors';
+import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
+import { buildVestibule, setVestibuleLightState } from './adapter';
 import { findDevice, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, DeviceTarget } from './devices';
 import { deviceFocus } from './deviceFocus';
@@ -59,6 +61,24 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // Active interactive docking doors subsystem
   public dockingSystem: DoorDockingPortSystem | null = null;
+  // ── Adapter transit (T1 of issue #30) ───────────────────────────────────────
+  /**
+   * Room-swap driver, wired by main.ts (callback pattern — world must not
+   * import main). Receives the paired door's seed string and the departure
+   * door id when the avatar reaches the vestibule hold point (mid-HOLD).
+   * Transit is only offered on paired doors when this is non-null.
+   */
+  public onAdapterTransit: ((seed: string, departureDoorId: DoorId) => void) | null = null;
+  /**
+   * Transit-latch mirror, wired by main.ts beside onAdapterTransit (review
+   * fix F4): true while a swap is in flight. A paired-door click then falls
+   * through to the normal peek round-trip — beginTransit would spawn a
+   * vestibule whose swap request the busy driver silently drops (never
+   * completed, never failed, never disposed).
+   */
+  public isTransitBusy: (() => boolean) | null = null;
+  /** Live vestibule outside the departure door, or null (one at a time). */
+  private transitVestibule: THREE.Group | null = null;
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
@@ -833,6 +853,10 @@ export class World {
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
     for (const lid of this.trunkLids.values()) lid.update(deltaTime);
 
+    // Transit vestibule honors the interior zoom-hide convention (≥3 hides
+    // interior detail) — it only lives for the few seconds of a transit.
+    if (this.transitVestibule) this.transitVestibule.visible = zoomLevel < 3;
+
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
 
@@ -1050,6 +1074,16 @@ export class World {
     }
 
     const ds = this.dockingSystem;
+    /** A door offers transit when its pairing completed with a target seed,
+     *  main.ts wired a swap driver (T1 of #30), and no swap is already in
+     *  flight (review fix F4 — a busy driver would silently drop the request,
+     *  leaking the vestibule; fall through to the peek round-trip instead). */
+    const transitReady = () => {
+      if (this.isTransitBusy && this.isTransitBusy()) return false;
+      const state = ds.getDockingState(door.id);
+      return !!(state && state.pairedSuccessfully && state.connectedRoomAddress)
+        && this.onAdapterTransit !== null;
+    };
     this.player.navigateToDoor(door, {
       requestOpen: (onOpened) => {
         const state = ds.getDockingState(door.id);
@@ -1064,12 +1098,139 @@ export class World {
       onThrough: () => {
         const state = ds.getDockingState(door.id);
         showHint(
-          state && state.pairedSuccessfully
-            ? `Docked room detected at ${door.id.toUpperCase()} — transit coming soon.`
-            : 'No room docked at this port — heading back.',
+          transitReady()
+            ? `Dock seal engaged at ${door.id.toUpperCase()} — cycling airlock…`
+            : state && state.pairedSuccessfully
+              ? `Docked room detected at ${door.id.toUpperCase()} — transit coming soon.`
+              : 'No room docked at this port — heading back.',
         );
       },
+      // ── T1 adapter transit branch (consulted at the THROUGH completion) ──
+      beginTransit: () => {
+        if (!transitReady()) return false;
+        // A live device focus/edit surface must never survive a room swap.
+        // (It cannot actually be active here — the door machine and the
+        //  device machine are mutually exclusive — but the transit is a hard
+        //  scene change, so force-release defensively.)
+        deviceFocus.forceRelease();
+        roomEdit.forceExit();
+        this.spawnTransitVestibule(door.id);
+        return true;
+      },
+      // Avatar reached the vestibule hold point — run the swap (main.ts).
+      onAdapterHold: () => {
+        const state = ds.getDockingState(door.id);
+        const seed = state?.connectedRoomAddress ?? '';
+        this.onAdapterTransit?.(seed, door.id);
+      },
     });
+  }
+
+  // ── Adapter transit choreography (T1 of issue #30) ──────────────────────────
+
+  /**
+   * Build the gangway vestibule outside the departure door and light it
+   * 'cycling'. Departure side only — the arrival room could briefly show one
+   * outside the arrival door too, but it would exist for well under a second
+   * behind the full-screen fade, so that polish is deliberately skipped.
+   */
+  private spawnTransitVestibule(doorId: DoorId): void {
+    this.disposeTransitVestibule();
+    const vestibule = buildVestibule(doorId);
+    setVestibuleLightState(vestibule, 'cycling');
+    this.platformGroup.add(vestibule);
+    this.transitVestibule = vestibule;
+  }
+
+  /** Remove and dispose the transit vestibule (geometries + materials). */
+  private disposeTransitVestibule(): void {
+    const vestibule = this.transitVestibule;
+    if (!vestibule) return;
+    this.transitVestibule = null;
+    vestibule.parent?.remove(vestibule);
+    const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
+    vestibule.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      if (mesh.geometry && !disposed.has(mesh.geometry)) {
+        disposed.add(mesh.geometry);
+        mesh.geometry.dispose();
+      }
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (!mat || disposed.has(mat)) continue;
+        disposed.add(mat);
+        mat.dispose();
+      }
+    });
+  }
+
+  /**
+   * Arrival-door convention (T1): default is the OPPOSITE cardinal of the
+   * departure door (east↔west, north↔south) — walk out one side, walk in the
+   * other. The opposite must be `enabled`; the only disabled door is north
+   * (fireplace), i.e. a SOUTH departure, and for that case the convention
+   * falls back to EAST (the canonical large door). East/west departures can
+   * never hit the fallback.
+   */
+  public resolveArrivalDoor(departureDoorId: DoorId): DoorTarget {
+    const opposite: Record<DoorId, DoorId> = {
+      north: 'south', south: 'north', east: 'west', west: 'east',
+    };
+    const candidate = findDoor(opposite[departureDoorId]);
+    if (candidate && candidate.enabled) return candidate;
+    return findDoor('east')!; // north is the only disabled door; east always exists
+  }
+
+  /**
+   * Success half of the swap, called by main.ts while the transit fade is
+   * fully opaque and the target room's session is live: tear the vestibule
+   * down and script the walk-in through the arrival door.
+   */
+  public completeAdapterArrival(departureDoorId: DoorId): void {
+    this.disposeTransitVestibule();
+    const arrival = this.resolveArrivalDoor(departureDoorId);
+    this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
+  }
+
+  /**
+   * Failure half of the swap: the avatar still stands at the vestibule hold
+   * point outside the departure door (the world is never rebuilt on transit).
+   * Light the vestibule 'fault', walk back in through the departure door, and
+   * tear the vestibule down once the door closes behind the player.
+   */
+  public failAdapterTransit(departureDoorId: DoorId): void {
+    if (this.transitVestibule) {
+      setVestibuleLightState(this.transitVestibule, 'fault');
+    }
+    const door = findDoor(departureDoorId);
+    if (!door) { this.disposeTransitVestibule(); return; }
+    this.player.enterFromDoor(
+      door,
+      this._makeArrivalHooks(door, /* disposeVestibuleOnClose */ true),
+      /* spawnAtThrough */ false, // walk back from where the hold left us
+    );
+  }
+
+  /**
+   * Door hooks for the scripted arrival/return walk-in. Locks are ignored on
+   * purpose: the walk-in is the only way back INTO a room — denying it would
+   * strand the avatar outside the walls.
+   */
+  private _makeArrivalHooks(door: DoorTarget, disposeVestibuleOnClose = false): DoorSequenceHooks {
+    const ds = this.dockingSystem;
+    return {
+      requestOpen: (onOpened) => {
+        if (!ds) { onOpened(); return true; }
+        ds.openDoor(door.id, onOpened);
+        return true;
+      },
+      requestClose: () => {
+        ds?.closeDoor(door.id);
+        if (disposeVestibuleOnClose) this.disposeTransitVestibule();
+      },
+      onThrough: () => { /* arrival leg never re-crosses outward */ },
+    };
   }
 
   /**

@@ -25,6 +25,23 @@
  *  SIT_DOWN slide) carries the avatar past the threshold, pauses for a peek,
  *  then walks it back inside and closes the door.
  *
+ * Adapter transit (T1 of issue #30 — paired docking door)
+ * ───────────────────────────────────────────────────────
+ *  … THROUGH → ADAPTER_OUT → ADAPTER_HOLD  ⇢ (room swap) ⇢  ARRIVE_OPEN → ARRIVE
+ *  At the THROUGH completion the optional hooks.beginTransit() is consulted:
+ *  true branches into ADAPTER_OUT — a scripted walk onward from `through`
+ *  into the docking vestibule — then ADAPTER_HOLD (idle at the hold point;
+ *  hooks.onAdapterHold() fires once and the world runs the leaveRoom→joinRoom
+ *  swap behind a full-screen fade). The arrival leg is started explicitly by
+ *  the world via enterFromDoor(): spawn at the arrival door's `through`
+ *  point, wait for the door to open (ARRIVE_OPEN), walk in to `front`
+ *  (ARRIVE), close the door, navMode MANUAL. All WASD input and click
+ *  navigation during ADAPTER_* and ARRIVE_* is swallowed — the stretch is
+ *  fully scripted and (mid-swap) the room under the avatar is being replaced.
+ *  ADAPTER_HOLD is timer-capped (8 s): if the swap never resolves, the
+ *  avatar walks itself back inside (defensive — the transit driver has its
+ *  own failure path that calls enterFromDoor on the departure door).
+ *
  * Device focus (click a device — wall computer, trunk, …; #33 D0)
  * ────────────────────────────────────────────────────────────────
  *  APPROACH → FINE → TURN → ENGAGED
@@ -86,8 +103,12 @@ function resolveObstacles(x: number, z: number): { x: number; z: number } {
 type NavigationMode = 'MANUAL' | 'WAYPOINT';
 /** Sitting sequence phases (NONE = regular navigation). */
 type SitPhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'SIT_DOWN' | 'SEATED' | 'STAND_UP';
-/** Door walk-through phases (NONE = regular navigation). */
-type DoorPhase = 'NONE' | 'APPROACH' | 'FINE' | 'WAIT_OPEN' | 'THROUGH' | 'PEEK' | 'RETURN';
+/** Door walk-through phases (NONE = regular navigation). ADAPTER_OUT /
+ *  ADAPTER_HOLD are the departure half of an adapter transit; ARRIVE_OPEN /
+ *  ARRIVE are the arrival half in the destination room (T1 of issue #30). */
+type DoorPhase =
+  | 'NONE' | 'APPROACH' | 'FINE' | 'WAIT_OPEN' | 'THROUGH' | 'PEEK' | 'RETURN'
+  | 'ADAPTER_OUT' | 'ADAPTER_HOLD' | 'ARRIVE_OPEN' | 'ARRIVE';
 /** Device-focus phases (NONE = regular navigation). Mirrors DoorPhase. */
 type DevicePhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'ENGAGED';
 export class Player {
@@ -145,6 +166,21 @@ export class Player {
   private readonly DOOR_WAIT_TIMEOUT = 3.0;
   private readonly DOOR_PEEK_TIME = 0.7;
 
+  // ── Adapter transit state (T1 of issue #30) ────────────────────────────────
+  /**
+   * Vestibule hold point for the current ADAPTER_OUT leg: `through` plus
+   * ADAPTER_OUT_DIST further out along the door axis. The plan sketched
+   * "~2.5 m further out", but that lands PAST the vestibule's outer portal
+   * (the gangway spans the 6→9 band and `through` already sits at ±7.0), so
+   * 1.2 m is used — the hold point centres in the outermost concertina bay,
+   * visibly inside the tube.
+   */
+  private adapterOutTarget: { x: number; z: number } | null = null;
+  private readonly ADAPTER_OUT_DIST = 1.2;
+  /** Defensive cap on ADAPTER_HOLD — the swap driver should always resolve
+   *  (success or failure) via enterFromDoor long before this fires. */
+  private readonly ADAPTER_HOLD_TIMEOUT = 8.0;
+
   // ── Device-focus state (#33 D0) ─────────────────────────────────────────────
   private devicePhase: DevicePhase = 'NONE';
   /** Device being approached / engaged. */
@@ -170,6 +206,8 @@ export class Player {
    * No-ops when the destination is unreachable.
    */
   navigateTo(targetX: number, targetZ: number): void {
+    // Mid adapter transit: fully scripted, room being swapped — swallow.
+    if (this._inAdapterTransit()) return;
     // Engaged on a device: ask the focus controller to let go; the deferred
     // destination resumes when the release ease completes (releaseDevice).
     if (this.devicePhase === 'ENGAGED') {
@@ -242,6 +280,8 @@ export class Player {
    * another seat, stands up first and then walks over.
    */
   navigateToSeat(seat: Seat): void {
+    // Mid adapter transit: fully scripted, room being swapped — swallow.
+    if (this._inAdapterTransit()) return;
     // Engaged on a device: release the focus first, then walk over and sit.
     if (this.devicePhase === 'ENGAGED') {
       this.pendingSeat = seat;
@@ -304,6 +344,8 @@ export class Player {
    * request is deferred until the current sequence returns inside.
    */
   navigateToDoor(door: DoorTarget, hooks: DoorSequenceHooks): void {
+    // Mid adapter transit: fully scripted, room being swapped — swallow.
+    if (this._inAdapterTransit()) return;
     // Engaged on a device: release the focus first, then walk to the door.
     if (this.devicePhase === 'ENGAGED') {
       this.pendingDoor = { door, hooks };
@@ -379,6 +421,8 @@ export class Player {
    * device the controller is asked to release first.
    */
   navigateToDevice(device: DeviceTarget, hooks: DeviceFocusHooks): void {
+    // Mid adapter transit: fully scripted, room being swapped — swallow.
+    if (this._inAdapterTransit()) return;
     // Already engaged on this exact device → nothing to do.
     if (this.devicePhase === 'ENGAGED' && this.deviceTarget && this.deviceTarget.id === device.id) return;
     // Engaged on a different device: release the focus first, then walk over.
@@ -516,8 +560,10 @@ export class Player {
         this.pendingSeat = null;
         this.pendingDevice = null;
         this._beginDoorReturn();
-      } else if (this.doorPhase === 'RETURN') {
-        // Scripted return in progress — swallow input, drop deferred actions.
+      } else if (this.doorPhase === 'RETURN' || this._inAdapterTransit()) {
+        // Scripted return / adapter transit in progress — swallow input,
+        // drop deferred actions. (During ADAPTER_*/ARRIVE_* the room under
+        // the avatar may be mid-swap; MANUAL must never run out there.)
         this.pendingDoor = null;
         this.pendingDest = null;
         this.pendingSeat = null;
@@ -957,10 +1003,22 @@ export class Player {
         if (dist < 0.06) {
           pos.x = door.through.x;
           pos.z = door.through.z;
-          this.doorPhase = 'PEEK';
           this.doorTimer = 0;
           this.character.setState('idle', door.faceAngle);
           hooks.onThrough();
+          // T1 branch point: a paired door begins the adapter transit —
+          // walk onward into the vestibule instead of the peek look-around.
+          if (hooks.beginTransit && hooks.beginTransit()) {
+            const ox = Math.sin(door.faceAngle);
+            const oz = Math.cos(door.faceAngle);
+            this.adapterOutTarget = {
+              x: door.through.x + ox * this.ADAPTER_OUT_DIST,
+              z: door.through.z + oz * this.ADAPTER_OUT_DIST,
+            };
+            this.doorPhase = 'ADAPTER_OUT';
+          } else {
+            this.doorPhase = 'PEEK';
+          }
           return;
         }
 
@@ -1030,7 +1088,160 @@ export class Player {
         this.character.setState('walk', this.logicalAngle);
         return;
       }
+
+      // ── T1: scripted walk onward into the vestibule (no collision) ─────────
+      case 'ADAPTER_OUT': {
+        const target = this.adapterOutTarget;
+        if (!target) {
+          // Defensive: target is always set with the phase.
+          this.doorPhase = 'ADAPTER_HOLD';
+          this.doorTimer = 0;
+          hooks.onAdapterHold?.();
+          return;
+        }
+        const dx = target.x - pos.x;
+        const dz = target.z - pos.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist < 0.06) {
+          pos.x = target.x;
+          pos.z = target.z;
+          this.adapterOutTarget = null;
+          this.doorPhase = 'ADAPTER_HOLD';
+          this.doorTimer = 0;
+          this.character.setState('idle', door.faceAngle);
+          // Seal the departure door behind us; the swap runs during HOLD.
+          hooks.requestClose();
+          hooks.onAdapterHold?.();
+          return;
+        }
+
+        const nx = dx / dist;
+        const nz = dz / dist;
+        this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+        const step = Math.min(this.SPEED * deltaTime, dist);
+        pos.x += nx * step;
+        pos.z += nz * step;
+        this.character.setState('walk', this.logicalAngle);
+        return;
+      }
+
+      // ── T1: idle at the hold point while the room swap runs ────────────────
+      case 'ADAPTER_HOLD': {
+        this.character.setState('idle', door.faceAngle);
+        this.doorTimer += deltaTime;
+        if (this.doorTimer > this.ADAPTER_HOLD_TIMEOUT) {
+          // Defensive cap — the swap never resolved. Re-open the door and
+          // walk back inside (RETURN's completion closes it and restores
+          // MANUAL). enterFromDoor still takes over cleanly if the transit
+          // driver eventually resolves (it bumps doorSeq and re-targets).
+          hooks.requestOpen(() => { /* fire-and-forget re-open */ });
+          this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI);
+          this.doorPhase = 'RETURN';
+        }
+        return;
+      }
+
+      // ── T1 arrival: idle at `through` (outside) while the door opens ───────
+      case 'ARRIVE_OPEN': {
+        this.character.setState('idle', this.logicalAngle);
+        this.doorTimer += deltaTime;
+        if (this.doorTimer > this.DOOR_WAIT_TIMEOUT) {
+          // Door never signalled open — walk in anyway (scripted stretch;
+          // being stuck outside the room would be strictly worse).
+          this.doorPhase = 'ARRIVE';
+        }
+        return;
+      }
+
+      // ── T1 arrival: scripted walk in from `through` to `front` ─────────────
+      case 'ARRIVE': {
+        const dx = door.front.x - pos.x;
+        const dz = door.front.z - pos.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+
+        if (dist < 0.06) {
+          pos.x = door.front.x;
+          pos.z = door.front.z;
+          this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI); // face into the room
+          this.doorPhase = 'NONE';
+          this.doorTarget = null;
+          this.doorHooks = null;
+          this.navMode = 'MANUAL';
+          this.character.setState('idle', this.logicalAngle);
+          hooks.requestClose();
+          // No pending resumes: everything queued before/during a transit is
+          // deliberately dropped (enterFromDoor clears the pending slots).
+          return;
+        }
+
+        const nx = dx / dist;
+        const nz = dz / dist;
+        this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+        const step = Math.min(this.SPEED * deltaTime, dist);
+        pos.x += nx * step;
+        pos.z += nz * step;
+        this.character.setState('walk', this.logicalAngle);
+        return;
+      }
     }
+  }
+
+  // ── Adapter transit (T1 of issue #30) ───────────────────────────────────────
+
+  /** True while any adapter-transit door phase is active (departure hold or
+   *  arrival walk-in) — all input and click navigation is swallowed then. */
+  private _inAdapterTransit(): boolean {
+    return (
+      this.doorPhase === 'ADAPTER_OUT' ||
+      this.doorPhase === 'ADAPTER_HOLD' ||
+      this.doorPhase === 'ARRIVE_OPEN' ||
+      this.doorPhase === 'ARRIVE'
+    );
+  }
+
+  /** Current door phase (debug/verification handle — mirrors getDevicePhase). */
+  getDoorPhase(): DoorPhase {
+    return this.doorPhase;
+  }
+
+  /**
+   * Arrival leg of an adapter transit (T1): take over whatever sequence is
+   * active (normally ADAPTER_HOLD mid-swap), place the avatar at the door's
+   * `through` point just outside the room (skipped when `spawnAtThrough` is
+   * false — the failure path walks back in from the vestibule hold point it
+   * already stands on), ask the door to open, walk in to `front`, close the
+   * door, and hand back MANUAL control. Deferred actions are dropped: a
+   * transit is a hard scene change, nothing queued before it survives.
+   */
+  enterFromDoor(door: DoorTarget, hooks: DoorSequenceHooks, spawnAtThrough = true): void {
+    this.doorSeq++; // invalidate any in-flight requestOpen completion
+    this._cancelSit();
+    this._cancelDeviceApproach();
+    this.pendingDest = null;
+    this.pendingSeat = null;
+    this.pendingDoor = null;
+    this.pendingDevice = null;
+    this._clearPath();
+
+    this.doorTarget = door;
+    this.doorHooks = hooks;
+    this.adapterOutTarget = null;
+    if (spawnAtThrough) {
+      this.mesh.position.x = door.through.x;
+      this.mesh.position.z = door.through.z;
+    }
+    this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI); // face inward
+    this.character.setState('idle', this.logicalAngle);
+    this.doorTimer = 0;
+    this.doorPhase = 'ARRIVE_OPEN';
+
+    const seq = this.doorSeq;
+    hooks.requestOpen(() => {
+      // Ignore stale completions from a cancelled/replaced sequence.
+      if (seq !== this.doorSeq || this.doorPhase !== 'ARRIVE_OPEN') return;
+      this.doorPhase = 'ARRIVE';
+    });
   }
 
   // ── Device-focus sequence (#33 D0) ──────────────────────────────────────────
