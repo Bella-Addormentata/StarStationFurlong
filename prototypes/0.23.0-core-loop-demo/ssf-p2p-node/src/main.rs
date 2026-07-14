@@ -53,6 +53,18 @@ pub struct Fingerprint {
     pub iroh_node_id: String, // expose our Iroh Node ID to the browser client!
     pub iroh_relay_urls: Vec<String>,
     pub iroh_direct_addrs: Vec<String>,
+    /// R1 live reachability classification (recomputed per API request):
+    /// "port-mapped" | "advertised" | "cgnat" | "local-only" — see
+    /// [`classify_reachability`] for exact semantics and the provenance
+    /// inference. "advertised" is honest about being UNVERIFIED: we cannot
+    /// probe inbound UDP without external infra, so the browser copy carries
+    /// the caveat.
+    pub reachability: String,
+    /// R1: the iroh IPv4 UDP port ACTUALLY bound — after the random-port
+    /// fallback when the default pin (44442) was taken. This is the port a
+    /// router forward must target, so the UI must show this one, never a
+    /// hardcoded default.
+    pub iroh_port: u16,
 }
 
 // Global server state
@@ -70,6 +82,71 @@ pub struct HubState {
     /// Relay dedup (0.18.0 hub-relay): envelopes seen/forwarded recently, keyed by
     /// blake3(origin_node_id ‖ seq ‖ payload). Prevents echo storms once meshes form.
     pub seen_envelopes: Mutex<SeenCache>,
+    /// R1: live reachability posture — written by the auto echo loop (and the
+    /// explicit SSF_EXTERNAL_ADDRS parser), read by the fingerprint API.
+    pub reach: Arc<ReachState>,
+}
+
+/// R1 live reachability posture. The auto public-IP echo loop writes here as
+/// it advertises/withdraws addresses and detects CGNAT; the fingerprint API
+/// reads it per request so the browser HUD always shows the CURRENT state.
+pub struct ReachState {
+    /// Public v4 sockets WE advertised ourselves — via the echo auto loop or
+    /// explicit `SSF_EXTERNAL_ADDRS` entries. Needed to tell "iroh discovered
+    /// a public v4 on its own" (portmapper/QAD) apart from "we merely claimed
+    /// one" in [`classify_reachability`].
+    pub self_advertised: Mutex<std::collections::HashSet<SocketAddr>>,
+    /// The last echo answer was a CGNAT/private WAN address (100.64.0.0/10
+    /// etc.) — a router port-forward cannot produce inbound reachability
+    /// there, so the node refuses to advertise (unchanged since 0.22.0) and
+    /// now also SURFACES the condition instead of logging console-only.
+    pub cgnat_detected: std::sync::atomic::AtomicBool,
+}
+
+impl ReachState {
+    pub fn new() -> Self {
+        Self {
+            self_advertised: Mutex::new(std::collections::HashSet::new()),
+            cgnat_detected: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+/// Classifies current reachability for the fingerprint API (R1).
+///
+/// Priority: cgnat > port-mapped > advertised > local-only.
+///
+/// PROVENANCE INFERENCE (documented per R1): iroh 1.0.1 tags every direct
+/// address internally with its origin (`DirectAddrType::{Local, Qad,
+/// Portmapped, Qad4LocalPort, Config}`) but the typed set never crosses the
+/// public API — `Endpoint::watch_addr()` maps `DirectAddr` down to bare
+/// `SocketAddr`s and the typed `Socket::ip_addrs()` watcher is pub(crate).
+/// So we infer: a PUBLIC IPv4 in the live direct-addr set that we did NOT
+/// advertise ourselves must have been produced by iroh — the portmapper
+/// (UPnP/NAT-PMP/PCP) or a QAD-observed reflexive address. Both mean iroh
+/// derived/verified a public v4 route, so the inference ranks them above our
+/// own unverified echo advert and reports "port-mapped". Known limit: if the
+/// portmapper maps the exact ip:port we also echo-advertised, it is
+/// indistinguishable from our own advert and reports "advertised"
+/// (understated, never overstated).
+pub fn classify_reachability(reach: &ReachState, live_direct_addrs: &[String]) -> String {
+    if reach.cgnat_detected.load(std::sync::atomic::Ordering::Relaxed) {
+        return "cgnat".to_string();
+    }
+    let advertised = reach.self_advertised.lock().unwrap().clone();
+    for addr_str in live_direct_addrs {
+        if let Ok(sock) = addr_str.parse::<SocketAddr>() {
+            if let std::net::IpAddr::V4(v4) = sock.ip() {
+                if ipv4_is_public(v4) && !advertised.contains(&sock) {
+                    return "port-mapped".to_string();
+                }
+            }
+        }
+    }
+    if !advertised.is_empty() {
+        return "advertised".to_string();
+    }
+    "local-only".to_string()
 }
 
 /// Bounded recently-seen set for relay loop protection.
@@ -131,6 +208,8 @@ pub fn compute_fingerprint(
     iroh_node_id: &str,
     iroh_relay_urls: Vec<String>,
     iroh_direct_addrs: Vec<String>,
+    reachability: String,
+    iroh_port: u16,
 ) -> Result<Fingerprint> {
     let chain = identity.certificate_chain();
     let certs = chain.as_slice();
@@ -148,6 +227,8 @@ pub fn compute_fingerprint(
         iroh_node_id: iroh_node_id.to_string(),
         iroh_relay_urls,
         iroh_direct_addrs,
+        reachability,
+        iroh_port,
     })
 }
 
@@ -182,8 +263,16 @@ fn load_or_create_secret_key() -> Result<SecretKey> {
 /// leaves the machine, and a poisoned answer can at worst add one dead dial
 /// hint (iroh connections are authenticated by node key regardless).
 /// Operators can substitute their own echo with `SSF_IP_ECHO=host1,host2`.
-/// Never contacted unless an `auto` entry is explicitly configured — the node
-/// makes no third-party calls by default (sovereignty posture, v006 §10.2).
+///
+/// IMPORTANT — R1 POSTURE FLIP (deliberate owner decision, demo phase):
+/// 0.22.0 shipped `auto` as OPT-IN — "no third-party calls unless an `auto`
+/// entry is explicitly configured" (sovereignty posture, v006 §10.2). R1
+/// flips this to OPT-OUT so internet connectivity works with ZERO terminal
+/// setup: an UNSET `SSF_EXTERNAL_ADDRS` now behaves exactly like `auto`, and
+/// these hosts ARE contacted by default. Full opt-out (today's old silence,
+/// no echo calls at all): `SSF_EXTERNAL_ADDRS=off` (or `none` / `0`,
+/// case-insensitive). `SSF_IP_ECHO` still overrides the echo hosts; CGNAT
+/// detection/refusal is unchanged.
 const DEFAULT_IP_ECHO_HOSTS: &[&str] = &["api.ipify.org", "checkip.amazonaws.com"];
 /// How often `auto` re-checks the public IP (ISP rotations heal within this).
 const AUTO_ADDR_RECHECK_SECS: u64 = 300;
@@ -203,27 +292,47 @@ fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
         || cgnat)
 }
 
+/// Outcome of one public-IPv4 echo round. CGNAT is split out from plain
+/// failure (R1) so the fingerprint can classify reachability honestly —
+/// "the echo answered but the WAN is CGNAT" is actionable ("needs relay"),
+/// "the echo never answered" is not.
+enum PublicIpv4Outcome {
+    /// A public IPv4 usable as an internet-facing dial hint.
+    Public(std::net::Ipv4Addr),
+    /// The echo answered with a CGNAT/private WAN address — advertising is
+    /// refused (unchanged since 0.22.0): no router port-forward can produce
+    /// inbound reachability from there.
+    Cgnat(std::net::Ipv4Addr),
+    /// No echo service produced a usable answer (offline, blocked, timeout).
+    Failed(anyhow::Error),
+}
+
 /// Resolves the current public IPv4 via the first echo service that answers
 /// with a public address. Tries `SSF_IP_ECHO` hosts (comma-separated) if set,
 /// else the defaults; 10 s timeout per host.
-async fn discover_public_ipv4() -> Result<std::net::Ipv4Addr> {
+async fn discover_public_ipv4() -> PublicIpv4Outcome {
     let hosts_env = std::env::var("SSF_IP_ECHO").ok();
     let hosts: Vec<&str> = match hosts_env.as_deref() {
         Some(raw) => raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
         None => DEFAULT_IP_ECHO_HOSTS.to_vec(),
     };
+    let mut cgnat_ip: Option<std::net::Ipv4Addr> = None;
     let mut last_err = anyhow!("no IP echo services configured");
     for host in hosts {
         match tokio::time::timeout(std::time::Duration::from_secs(10), query_ip_echo(host)).await {
-            Ok(Ok(ip)) if ipv4_is_public(ip) => return Ok(ip),
+            Ok(Ok(ip)) if ipv4_is_public(ip) => return PublicIpv4Outcome::Public(ip),
             Ok(Ok(ip)) => {
+                cgnat_ip = Some(ip);
                 last_err = anyhow!("{host} reports non-public address {ip} — this looks like CGNAT/private WAN; a router port-forward cannot make you reachable from there")
             }
             Ok(Err(e)) => last_err = e,
             Err(_) => last_err = anyhow!("{host}: timed out"),
         }
     }
-    Err(last_err)
+    match cgnat_ip {
+        Some(ip) => PublicIpv4Outcome::Cgnat(ip),
+        None => PublicIpv4Outcome::Failed(last_err),
+    }
 }
 
 /// Minimal plain-HTTP/1.0 GET returning the echoed IPv4 body (bounded read;
@@ -340,13 +449,33 @@ async fn main() -> Result<()> {
         None => println!("📌 SSF_IROH_PORT=0 — iroh IPv4 socket uses a random per-launch port (not manually forwardable)"),
     }
 
-    // 📌 Manually-known public addresses (e.g. after a router port-forward):
-    // advertised to peers, used in NAT traversal, and flow into invite hints + DHT.
-    // `auto` / `auto:<port>` entries resolve the CURRENT public IPv4 via an HTTP
-    // echo (opt-in; SSF_IP_ECHO overrides the service list) and re-check every
-    // 5 minutes — dynamic-IP rotations heal live, no restart, no stale invites.
+    // 📌 External-address advertising: manually-known public addresses (e.g.
+    // after a router port-forward) and `auto` / `auto:<port>` entries that
+    // resolve the CURRENT public IPv4 via an HTTP echo (SSF_IP_ECHO overrides
+    // the service list) and re-check every 5 minutes — dynamic-IP rotations
+    // heal live, no restart, no stale invites.
+    //
+    // IMPORTANT — R1 POSTURE FLIP (deliberate owner decision, demo phase —
+    // "as easy as possible"): the 0.22.0 opt-in echo posture is now OPT-OUT.
+    // UNSET SSF_EXTERNAL_ADDRS behaves exactly like `auto`; the full opt-out
+    // (no echo calls — the pre-R1 unset behavior) is SSF_EXTERNAL_ADDRS=off
+    // (or `none` / `0`, case-insensitive). Explicit values keep their exact
+    // 0.22.0 semantics. SSF_IP_ECHO still overrides the echo hosts; CGNAT
+    // detection/refusal is unchanged.
+    let reach = Arc::new(ReachState::new());
+    let external_addrs_cfg: Option<String> = match std::env::var("SSF_EXTERNAL_ADDRS") {
+        Err(_) => {
+            println!("📌 SSF_EXTERNAL_ADDRS not set — public-IP auto-advertising is ON by default (R1); set SSF_EXTERNAL_ADDRS=off to opt out");
+            Some("auto".to_string())
+        }
+        Ok(raw) if matches!(raw.trim().to_ascii_lowercase().as_str(), "off" | "none" | "0") => {
+            println!("📌 External-address advertising OFF (SSF_EXTERNAL_ADDRS={}) — no public-IP echo calls will be made", raw.trim());
+            None
+        }
+        Ok(raw) => Some(raw),
+    };
     let mut auto_ports: Vec<Option<u16>> = Vec::new();
-    if let Ok(raw) = std::env::var("SSF_EXTERNAL_ADDRS") {
+    if let Some(raw) = external_addrs_cfg {
         for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let lower = entry.to_ascii_lowercase();
             if lower == "auto" {
@@ -360,6 +489,14 @@ async fn main() -> Result<()> {
                 match entry.parse::<SocketAddr>() {
                     Ok(sock) => {
                         builder = builder.external_addr(sock);
+                        // R1: record explicit PUBLIC v4 entries as self-advertised so
+                        // classify_reachability reports them "advertised" (unverified
+                        // claim) instead of misinferring "port-mapped".
+                        if let std::net::IpAddr::V4(v4) = sock.ip() {
+                            if ipv4_is_public(v4) {
+                                reach.self_advertised.lock().unwrap().insert(sock);
+                            }
+                        }
                         println!("📌 External address advertised: {sock}");
                     }
                     Err(e) => eprintln!("⚠️ Ignoring invalid SSF_EXTERNAL_ADDRS entry '{entry}': {e:?}"),
@@ -371,38 +508,61 @@ async fn main() -> Result<()> {
     let iroh_endpoint = builder.bind().await?;
     println!("   Bound Sockets: {:?}", iroh_endpoint.bound_sockets());
 
-    // 🔄 Dynamic public-IP advertising (SSF_EXTERNAL_ADDRS=auto[:port]): resolve
-    // now, then re-check every AUTO_ADDR_RECHECK_SECS. On ISP rotation the stale
-    // address is swapped LIVE via Endpoint::{add,remove}_external_addr — the DHT
-    // record and freshly-minted invite hints follow automatically. Invites are
-    // durable across IP changes anyway (room key + node ID; DHT re-resolves).
+    // R1: the iroh IPv4 UDP port ACTUALLY bound — after any random-port
+    // fallback above — is what a router forward must target. It feeds the
+    // fingerprint (`iroh_port`, so the UI shows WHICH port to forward) and
+    // the auto-advertise loop below.
+    let bound_v4_port = iroh_endpoint
+        .bound_sockets()
+        .iter()
+        .find(|s| s.is_ipv4())
+        .map(|s| s.port())
+        .unwrap_or(DEFAULT_IROH_PORT);
+
+    // 🔄 Dynamic public-IP advertising (default `auto` since R1; also
+    // auto:<port>): resolve now, then re-check every AUTO_ADDR_RECHECK_SECS.
+    // On ISP rotation the stale address is swapped LIVE via
+    // Endpoint::{add,remove}_external_addr — the DHT record and freshly-minted
+    // invite hints follow automatically. Invites are durable across IP changes
+    // anyway (room key + node ID; DHT re-resolves).
     if !auto_ports.is_empty() {
-        let bound_v4_port = iroh_endpoint
-            .bound_sockets()
-            .iter()
-            .find(|s| s.is_ipv4())
-            .map(|s| s.port())
-            .unwrap_or(DEFAULT_IROH_PORT);
         for port_override in auto_ports {
             let port = port_override.unwrap_or(bound_v4_port);
             let ep = iroh_endpoint.clone();
+            let reach_auto = reach.clone();
             tokio::spawn(async move {
                 let mut announced: Option<SocketAddr> = None;
                 loop {
                     match discover_public_ipv4().await {
-                        Ok(ip) => {
+                        PublicIpv4Outcome::Public(ip) => {
+                            reach_auto.cgnat_detected.store(false, std::sync::atomic::Ordering::Relaxed);
                             let addr = SocketAddr::from((ip, port));
                             if announced != Some(addr) {
                                 if let Some(old) = announced.take() {
                                     let _ = ep.remove_external_addr(&old).await;
+                                    reach_auto.self_advertised.lock().unwrap().remove(&old);
                                     println!("🔄 Public IP changed — un-advertised stale external address {old}");
                                 }
                                 ep.add_external_addr(addr).await;
+                                reach_auto.self_advertised.lock().unwrap().insert(addr);
                                 announced = Some(addr);
                                 println!("📌 External address advertised (auto): {addr} — re-checked every {AUTO_ADDR_RECHECK_SECS}s; router must forward UDP {port} here");
                             }
                         }
-                        Err(e) => eprintln!("⚠️ Public-IP auto-discovery failed (will retry in {AUTO_ADDR_RECHECK_SECS}s): {e}"),
+                        PublicIpv4Outcome::Cgnat(ip) => {
+                            // CGNAT refusal unchanged since 0.22.0 — never advertise a
+                            // CGNAT/private WAN address. R1 additionally SURFACES the
+                            // condition (fingerprint reachability: "cgnat") instead of
+                            // leaving it console-only.
+                            reach_auto.cgnat_detected.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(old) = announced.take() {
+                                let _ = ep.remove_external_addr(&old).await;
+                                reach_auto.self_advertised.lock().unwrap().remove(&old);
+                                println!("🔄 WAN fell behind CGNAT — un-advertised stale external address {old}");
+                            }
+                            eprintln!("⚠️ Public-IP echo reports CGNAT/private WAN address {ip} — refusing to advertise it (a router port-forward cannot make you reachable from there; direct inbound dials need a relay); re-checking in {AUTO_ADDR_RECHECK_SECS}s");
+                        }
+                        PublicIpv4Outcome::Failed(e) => eprintln!("⚠️ Public-IP auto-discovery failed (will retry in {AUTO_ADDR_RECHECK_SECS}s): {e}"),
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(AUTO_ADDR_RECHECK_SECS)).await;
                 }
@@ -447,12 +607,18 @@ async fn main() -> Result<()> {
     let identity = Identity::self_signed(["localhost", "127.0.0.1"])
         .map_err(|e| anyhow!("Failed to generate self-signed identity: {:?}", e))?;
     
+    // R1: seed the fingerprint with the reachability known NOW (usually
+    // "local-only" — the first echo round is still in flight); the HTTP API
+    // re-classifies per request, exactly like the direct-addr hint refresh.
+    let initial_reachability = classify_reachability(&reach, &iroh_direct_addrs);
     let fingerprint = compute_fingerprint(
         &identity,
         listen_port,
         &iroh_id.to_string(),
         configured_relays.clone(),
         iroh_direct_addrs,
+        initial_reachability,
+        bound_v4_port,
     )?;
     
     let addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
@@ -470,6 +636,7 @@ async fn main() -> Result<()> {
         port: listen_port,
         configured_relays,
         seen_envelopes: Mutex::new(SeenCache::new()),
+        reach: reach.clone(),
     });
 
     // Start background HTTP API for local certificate fingerprint requests.
@@ -1332,6 +1499,10 @@ async fn start_http_api_server(hub: SharedHub, iroh_endpoint: IrohEndpoint) {
                     if !live_direct_addrs.is_empty() {
                         fp.iroh_direct_addrs = live_direct_addrs;
                     }
+                    // R1: reachability is classified LIVE per request too —
+                    // the echo loop and the portmapper both change state
+                    // minutes after startup.
+                    fp.reachability = classify_reachability(&hub_clone.reach, &fp.iroh_direct_addrs);
                     serde_json::to_string(&*fp).unwrap()
                 };
                 let response = format!(
