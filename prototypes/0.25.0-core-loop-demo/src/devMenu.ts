@@ -53,7 +53,7 @@ import {
 } from './pathfinding';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
-import type { WallScreenHandle, TrunkLidHandle } from './devices';
+import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle } from './devices';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -91,6 +91,7 @@ interface WorldInternals {
   wallScreens: Map<string, WallScreenHandle>;
   holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }>;
   trunkLids: Map<string, TrunkLidHandle>;
+  gameTableTops: Map<string, GameTableTopHandle>;
 }
 
 let getWorld: GetWorld = () => null;
@@ -293,6 +294,9 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       }
       if (obj.userData.trunkLid) {
         w.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
+      }
+      if (obj.userData.gameTableTop) {
+        w.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
       }
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
