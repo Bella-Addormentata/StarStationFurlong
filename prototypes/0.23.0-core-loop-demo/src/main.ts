@@ -260,7 +260,10 @@ function renderReachabilityRow(fp: LocalFingerprint | null): void {
   const port = reachabilityUdpPort(fp);
   switch (fp.reachability) {
     case 'port-mapped':
-      setNetworkRow('network-reachability', `OPEN (UPnP UDP ${port})`, '#00e676');
+      // "LIKELY": the public route may be a portmapper mapping (inbound works)
+      // or a peer-observed reflexive address (inbound may still be blocked) —
+      // provenance is inferred, so don't overclaim OPEN (R1 review M1).
+      setNetworkRow('network-reachability', `LIKELY OPEN — public route detected (UDP ${port})`, '#7ddc5a');
       break;
     case 'advertised':
       setNetworkRow('network-reachability', `ADVERTISED — forward UDP ${port} if joins fail`, '#ffb300');

@@ -468,7 +468,7 @@ async fn main() -> Result<()> {
             println!("📌 SSF_EXTERNAL_ADDRS not set — public-IP auto-advertising is ON by default (R1); set SSF_EXTERNAL_ADDRS=off to opt out");
             Some("auto".to_string())
         }
-        Ok(raw) if matches!(raw.trim().to_ascii_lowercase().as_str(), "off" | "none" | "0") => {
+        Ok(raw) if matches!(raw.trim().to_ascii_lowercase().as_str(), "off" | "none" | "0" | "") => {
             println!("📌 External-address advertising OFF (SSF_EXTERNAL_ADDRS={}) — no public-IP echo calls will be made", raw.trim());
             None
         }
@@ -540,7 +540,11 @@ async fn main() -> Result<()> {
                             if announced != Some(addr) {
                                 if let Some(old) = announced.take() {
                                     let _ = ep.remove_external_addr(&old).await;
-                                    reach_auto.self_advertised.lock().unwrap().remove(&old);
+                                    // Deliberately NOT removed from self_advertised: iroh's
+                                    // live snapshot can report the old addr for a beat after
+                                    // remove_external_addr, and a fingerprint request in that
+                                    // window would misclassify it as "port-mapped" (green).
+                                    // Stale set entries can only ever UNDERSTATE (R1 review L1).
                                     println!("🔄 Public IP changed — un-advertised stale external address {old}");
                                 }
                                 ep.add_external_addr(addr).await;
@@ -557,7 +561,9 @@ async fn main() -> Result<()> {
                             reach_auto.cgnat_detected.store(true, std::sync::atomic::Ordering::Relaxed);
                             if let Some(old) = announced.take() {
                                 let _ = ep.remove_external_addr(&old).await;
-                                reach_auto.self_advertised.lock().unwrap().remove(&old);
+                                // Kept in self_advertised — same transient-window rationale
+                                // as the rotation branch (R1 review L1); cgnat_detected
+                                // dominates classification anyway.
                                 println!("🔄 WAN fell behind CGNAT — un-advertised stale external address {old}");
                             }
                             eprintln!("⚠️ Public-IP echo reports CGNAT/private WAN address {ip} — refusing to advertise it (a router port-forward cannot make you reachable from there; direct inbound dials need a relay); re-checking in {AUTO_ADDR_RECHECK_SECS}s");
