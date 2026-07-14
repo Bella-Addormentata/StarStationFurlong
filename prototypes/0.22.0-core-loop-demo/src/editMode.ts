@@ -88,9 +88,9 @@ export interface PlacementContext {
   floodFrom: { x: number; z: number };
   /**
    * Front points that are CURRENTLY reachable and must stay so (seat fronts,
-   * enabled door fronts, device fronts — pre-filtered by the caller against
-   * the pre-move grid, excluding the moved item's own fronts, which are
-   * rebaked after commit anyway).
+   * ALL door fronts, device fronts — pre-filtered by the caller against the
+   * pre-move grid, excluding the moved item's own fronts, which are rebaked
+   * after commit anyway).
    */
   requiredReachable: ReadonlyArray<{ x: number; z: number }>;
 }
@@ -103,7 +103,13 @@ export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
  *  2. no AABB overlap with any OTHER item's current footprint (touching
  *     edges are fine — the trunk sits flush against the hearth by design)
  *  3. no player inside the footprint inflated by PLAYER_R (0.38)
- *  4. connectivity: flood-fill a scratch grid with the moved footprint
+ *  4. stand-point clearance (review F1): no requiredReachable point inside
+ *     the footprint inflated by PLAYER_R + the FINE arrival tolerance —
+ *     grid reachability alone is NOT standability (the FINE phases drive to
+ *     the EXACT point with collision on, so a box edge within PLAYER_R of a
+ *     front point wedges every approach even though the point's grid cell
+ *     stays clear)
+ *  5. connectivity: flood-fill a scratch grid with the moved footprint
  *     applied — every requiredReachable point must stay reachable from the
  *     local player's cell
  *
@@ -156,7 +162,25 @@ export function validatePlacement(
     }
   }
 
-  // 4. Connectivity on a scratch grid: candidate box + every OTHER item's
+  // 4. Stand-point clearance (review F1): the FINE approach phases need to
+  //    land within 0.06 of the EXACT front point while resolveObstacles
+  //    keeps the player PLAYER_R away from every box — a candidate whose
+  //    inflated extent swallows a protected front point is physically
+  //    un-standable even when the point's grid cell stays walkable
+  //    (concrete pre-fix wedge: armchair at (2.5,4.5) put its edge 0.03 m
+  //    from the wall computer's front (1.8,4.97) — edit mode itself became
+  //    unreachable, with no way to undo).
+  const STAND_R = PLAYER_R + 0.06;
+  for (const pt of ctx.requiredReachable) {
+    if (
+      pt.x > box.x0 - STAND_R && pt.x < box.x1 + STAND_R &&
+      pt.z > box.z0 - STAND_R && pt.z < box.z1 + STAND_R
+    ) {
+      return { ok: false, reason: 'would block a stand-point' };
+    }
+  }
+
+  // 5. Connectivity on a scratch grid: candidate box + every OTHER item's
   //    current box (the original spot is vacated, the candidate is applied).
   const scratch: Box[] = [box];
   for (const other of FURNITURE) {
@@ -694,9 +718,12 @@ class RoomEditController {
   /**
    * Snapshot the front points that are currently reachable from the flood
    * origin — the set a valid drop must preserve (plan §E3): every seat
-   * front, every ENABLED door front, and every device front (a deliberate
-   * small extension over the plan's seats+doors list: sealing the wall
-   * computer would lock the owner out of edit mode itself). The MOVED item's
+   * front, every door front (ALL four — review F3: pairing is dynamic, so a
+   * mid-carry pairing can enable a door whose front was just sealed; door
+   * hardware is fixed, protecting the lot costs nothing), and every device
+   * front (a deliberate small extension over the plan's seats+doors list:
+   * sealing the wall computer would lock the owner out of edit mode
+   * itself). The MOVED item's
    * own fronts are excluded — they are rebaked at its new position after
    * commit. Fixed for the whole carry: the pre-move grid cannot change while
    * the item is held (its original obstacle never leaves OBSTACLES).
@@ -717,7 +744,7 @@ class RoomEditController {
       if (isReachable(seat.front)) pts.push({ x: seat.front.x, z: seat.front.z });
     }
     for (const door of DOORS) {
-      if (door.enabled && isReachable(door.front)) pts.push({ x: door.front.x, z: door.front.z });
+      if (isReachable(door.front)) pts.push({ x: door.front.x, z: door.front.z });
     }
     for (const device of DEVICES) {
       if (device.id === itemId) continue;
