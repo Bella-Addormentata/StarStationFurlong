@@ -1814,7 +1814,11 @@ function animate() {
   }
   
   const currentTime = performance.now();
-  const deltaTime = (currentTime - lastTime) / 1000; // Convert to seconds
+  // Clamped: a backgrounded tab pauses rAF, so the first resumed frame sees
+  // SECONDS of elapsed time — unclamped, that teleports the player a full
+  // bound-width, snaps interpolations, and (before the voxelCharacter clamp)
+  // exploded the rig's lerp extrapolation. 100 ms ≈ a 10 fps floor.
+  const deltaTime = Math.min((currentTime - lastTime) / 1000, 0.1);
   lastTime = currentTime;
   
   // Update FPS counter

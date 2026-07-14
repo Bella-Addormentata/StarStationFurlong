@@ -962,11 +962,17 @@ export class VoxelCharacter {
    * Call this inside your requestAnimationFrame / game-loop update.
    */
   update(): void {
-    const delta = this.clock.getDelta();
+    // Clamp the frame delta: a backgrounded tab pauses rAF, so on resume
+    // getDelta() returns SECONDS. lerp(a, b, t) with t > 1 EXTRAPOLATES past
+    // the target and amplifies each frame — the torso (carrying legs/feet)
+    // exploded to ±1e17 world units after one alt-tab cycle ("legs and feet
+    // shifted below ground"). Clamping both the delta and the lerp factor
+    // makes every rig interpolation unconditionally stable.
+    const delta = Math.min(this.clock.getDelta(), 0.1);
     const time  = this.clock.getElapsedTime();
     const state = STATES[this.currentState];
 
-    const lerpSpeed = 10 * delta;
+    const lerpSpeed = Math.min(10 * delta, 1);
 
     // ── 1. Root height interpolation (for sitting states) ────────────────────
     this.torso.position.y = THREE.MathUtils.lerp(
