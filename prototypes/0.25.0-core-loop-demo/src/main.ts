@@ -296,6 +296,19 @@ function bootstrapHasPublicIPv4(boot: RoomBootstrap): boolean {
   return false;
 }
 
+/** R1 invite pre-flight (lives in the ACCESS app since #52): warn — but the
+ *  pass is STILL handed over — when nothing in it is dialable from the
+ *  internet: no public IPv4 in the outgoing hints and no UPnP mapping to
+ *  catch the dial. The IPv4 hints deliberately STAY in passes (owner
+ *  decision: reliability over minimalism; DHT re-resolution keeps them
+ *  refreshable), so a missing public v4 here is an honest LAN/IPv6-only
+ *  signal. Returns null when the pass looks internet-dialable. */
+function inviteReachabilityWarning(boot: RoomBootstrap | undefined): string | null {
+  return boot && !bootstrapHasPublicIPv4(boot) && localFingerprint?.reachability !== 'port-mapped'
+    ? `⚠ This pass has no internet-reachable IPv4 — LAN/IPv6 only. Forward UDP ${reachabilityUdpPort(localFingerprint)} on the router (auto-advertising is on by default).`
+    : null;
+}
+
 /** Best-effort physical connection type (Network Information API, Chromium). */
 function detectConnectionType(): string {
   const conn = (navigator as { connection?: { type?: string; effectiveType?: string } }).connection;
@@ -413,7 +426,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   await networkProvider.connect(boot);
   if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
   activeBootstrap = boot;
-  await syncShareLink();
+  await syncAccessPass();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
   updateHUDP2P('CONNECTED', '#00e676');
@@ -537,6 +550,8 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       // Owner is an id since S2 — show the display NAME via the players map.
       ownerEl.textContent = resolveOwnerLabel(ownerVal);
     }
+    // #52: the ACCESS app's MY PASS room row mirrors the same doc state.
+    refreshAccessRoomRow();
   };
 
   roomMap.observe((_event) => {
@@ -705,18 +720,41 @@ function transitFadeTo(opaque: boolean): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, TRANSIT_FADE_MS + 50));
 }
 
+/** Outcome of a curtain-covered room swap: 'ok', 'busy' (another swap holds
+ *  the transit latch — nothing happened), or the failure that was recovered
+ *  from (the original room was restored, or torn down to offline when even
+ *  the restore failed). */
+type RoomSwapResult = 'ok' | 'busy' | Error;
+
+/** A swap failure that ALSO left us with no room at all (the pass was used
+ *  before the first join completed, or the departure-room rejoin failed):
+ *  the HUD shows OFFLINE and callers must not claim "returned to your room". */
+class StrandedOfflineError extends Error {}
+
+/** Per-caller choreography hooks for performRoomSwap. Both run while the
+ *  transit curtain is fully opaque. */
+interface RoomSwapChoreography {
+  /** Arrival — the target room's session is live; stage the avatar (the T1
+   *  transit walks in through the arrival door, the #52 ACCESS beam-in
+   *  simply places the avatar at the default spawn). */
+  arrive: () => void;
+  /** Failure — the original room has been restored (or torn down). The T1
+   *  transit lights the vestibule 'fault' and walks back in; the beam-in has
+   *  nothing to restage (the avatar never moved). */
+  fail: () => void;
+}
+
 /**
- * The room swap at the heart of the adapter transit (T1 of #30), invoked by
- * the World when the avatar reaches the vestibule hold point (mid
- * ADAPTER_HOLD). Rides entirely on the T0 seam:
- *   decode seed → fade in → leaveRoom() → joinRoom(target) → reposition the
- *   player at the arrival door → fade out → scripted walk-in.
+ * The curtain-covered room swap shared by the T1 adapter transit (#30) and
+ * the #52 ACCESS-app pass transport. Rides entirely on the T0 seam:
+ *   decode seed → fade in → leaveRoom() → joinRoom(target) → arrival
+ *   choreography → fade out.
  * On ANY failure the original room is rejoined (bootstrap snapshot taken
- * before leaving), the vestibule lights 'fault', and the avatar walks back
- * in through the departure door — the fade covers both directions.
+ * before leaving) and the failure choreography runs — the fade covers both
+ * directions. One swap at a time (transitInProgress latch).
  */
-async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
-  if (transitInProgress) return;
+async function performRoomSwap(seedString: string, choreography: RoomSwapChoreography): Promise<RoomSwapResult> {
+  if (transitInProgress) return 'busy';
   transitInProgress = true;
   // Snapshot BEFORE leaving: leaveRoom keeps activeBootstrap as last-room
   // memory, but joinRoom(target) overwrites it — this is the way back.
@@ -725,7 +763,7 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
   try {
     const imported = decodeBootstrapInput(seedString);
     if (!imported) {
-      throw new Error('Unreadable docking seed on the paired door');
+      throw new Error('Unreadable room seed');
     }
     const target = await resolveBridgeBootstrap(imported);
     // Rooms WE minted this session (PROVISION NEW MODULE) are first-entries
@@ -771,13 +809,14 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
     // has its owner written (a re-claim would race the initial sync and
     // steal/reset owner+name — the exact S2 bug the claim gate exists for).
     pendingBootstrapOverride = target;
-    // Reposition behind the opaque curtain: vestibule down, avatar at the
-    // arrival door's through point, door opening, scripted walk-in.
-    world.completeAdapterArrival(departureDoorId);
+    // Stage the avatar behind the opaque curtain.
+    choreography.arrive();
     await transitFadeTo(false);
+    return 'ok';
   } catch (err) {
-    console.warn('Adapter transit failed — resealing to the departure room:', err);
+    console.warn('Room swap failed — restoring the departure room:', err);
     await transitFadeTo(true); // no-op visually if already opaque
+    let stranded = false;
     if (leftOriginalRoom) {
       // Tear down whatever half-open session the failed join left behind
       // (idempotent), then re-dock to the original room — local and fast.
@@ -790,15 +829,59 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
           await leaveRoom();
           updateHUDNode('OFFLINE', '#ff1744');
           updateHUDP2P('OFFLINE', '#ff1744');
+          stranded = true;
         }
+      } else {
+        // No departure room existed (pass used before the first join
+        // completed / bootstrap never succeeded) — we are genuinely roomless
+        // now; say so on the HUD instead of pretending a restore happened.
+        updateHUDNode('OFFLINE', '#ff1744');
+        updateHUDP2P('OFFLINE', '#ff1744');
+        stranded = true;
       }
     }
-    world.failAdapterTransit(departureDoorId);
+    choreography.fail();
     await transitFadeTo(false);
-    showHint('Dock seal failed.');
+    const failure = err instanceof Error ? err : new Error(String(err));
+    return stranded ? new StrandedOfflineError(failure.message) : failure;
   } finally {
     transitInProgress = false;
   }
+}
+
+/**
+ * The adapter transit (T1 of #30), invoked by the World when the avatar
+ * reaches the vestibule hold point (mid ADAPTER_HOLD): the shared room swap
+ * with door choreography on both ends — reposition at the arrival door and
+ * scripted walk-in on success; vestibule 'fault' lights and a walk back in
+ * through the departure door on failure. A busy latch stays silent (the
+ * door machine falls through to the peek round-trip — review fix F4).
+ */
+async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
+  const result = await performRoomSwap(seedString, {
+    arrive: () => world.completeAdapterArrival(departureDoorId),
+    fail: () => world.failAdapterTransit(departureDoorId),
+  });
+  if (result instanceof Error) showHint('Dock seal failed.');
+}
+
+/**
+ * ACCESS-app pass acceptance (#52). Dev-phase ruling: using a pass
+ * IMMEDIATELY TRANSPORTS the player — the same curtain-covered swap as the
+ * adapter transit but with no door walk on either side: on arrival the
+ * avatar is simply placed at the room's default spawn in MANUAL control (a
+ * "beam-in"). On failure the original room is restored and the avatar stays
+ * exactly where it was.
+ * FUTURE (map slice): once the map table carries room pins, a used pass will
+ * instead drop a pin at the room's location on the map with the access
+ * permission attached — travel then goes through the map/doors, and this
+ * instant beam retires with the dev phase.
+ */
+async function accessBeamTransport(seedString: string): Promise<RoomSwapResult> {
+  return performRoomSwap(seedString, {
+    arrive: () => world.completeAccessBeamIn(),
+    fail: () => { /* the avatar never left the origin room — nothing to restage */ },
+  });
 }
 
 /**
@@ -956,12 +1039,13 @@ function setupSpacePhoneOverlay() {
   // 📱 Phone shell view router (issue #20 S1) — home screen + per-app views.
   // Policy: Tab always opens the phone to the HOME screen (deterministic,
   // one tap to any app) rather than restoring the last open view.
-  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank';
+  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access';
   const phoneViewMeta: Record<PhoneViewId, { elId: string; title: string; subtitle: string }> = {
     home:     { elId: 'phone-home-screen',   title: '📱 HOME',        subtitle: 'FurlongOS · Select App' },
     chat:     { elId: 'phone-app-chat',      title: '👨‍🚀 CLONE CHAT', subtitle: 'Room: Furlong Lobby' },
     contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
     bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
+    access:   { elId: 'phone-app-access',    title: '🚪 ACCESS',      subtitle: 'Room Passes · FurlongNet' },
   };
   let currentPhoneView: PhoneViewId = 'home';
   const backBtn = document.getElementById('phone-back-btn');
@@ -987,6 +1071,10 @@ function setupSpacePhoneOverlay() {
     } else {
       chatInput?.blur();
     }
+    // ACCESS (#52): MY PASS shows the CURRENT room — repaint on every open
+    // (the per-join observers keep it live afterwards; this covers the
+    // offline/pre-join state and the first open).
+    if (id === 'access') refreshAccessRoomRow();
   };
 
   // App tiles on the home screen route into their views
@@ -1145,6 +1233,81 @@ function setupSpacePhoneOverlay() {
   // Roster section starts in the offline placeholder state; the per-join
   // players-map observer repaints it once a doc is bound.
   renderPhonePlayersList();
+
+  // ── 🚪 ACCESS app (#52) — room passes ───────────────────────────────────────
+  // MY PASS: mint an invite for the current room (the network panel's old
+  // Copy Invite pipeline, R1 pre-flight warning included) and copy it.
+  // ENTER WITH PASS: accept a pass — dev-phase ruling: instant transport.
+  const accessGenerateBtn = document.getElementById('access-generate-btn');
+  const accessOutput = document.getElementById('access-pass-output') as HTMLInputElement | null;
+  const accessInput = document.getElementById('access-pass-input') as HTMLInputElement | null;
+  const accessUseBtn = document.getElementById('access-use-btn');
+  const setAccessFeedback = (msg: string) => {
+    const el = document.getElementById('access-feedback');
+    if (el) el.textContent = msg;
+  };
+
+  if (accessGenerateBtn) {
+    accessGenerateBtn.addEventListener('click', async () => {
+      const minted = await mintBootstrapLink();
+      if (!minted.link) {
+        setAccessFeedback(minted.error ?? 'Pass is not available yet.');
+        return;
+      }
+      if (accessOutput) accessOutput.value = minted.link;
+      const warning = inviteReachabilityWarning(minted.boot);
+      try {
+        await navigator.clipboard.writeText(minted.link);
+        setAccessFeedback(warning
+          ? `Pass copied. ${warning}`
+          : 'Pass copied. Share this one pass with everyone.');
+      } catch {
+        setAccessFeedback(warning
+          ? `Pass ready above (clipboard permission was denied). ${warning}`
+          : 'Pass ready above. Clipboard permission was denied.');
+      }
+    });
+  }
+
+  if (accessUseBtn && accessInput) {
+    accessUseBtn.addEventListener('click', async () => {
+      const raw = accessInput.value.trim();
+      if (!raw) {
+        setAccessFeedback('Paste a pass first.');
+        return;
+      }
+      // Pre-flight decode so a bad paste fails fast, without a fade cycle
+      // (performRoomSwap re-decodes — cheap, and it keeps the swap core
+      // self-contained against other callers).
+      if (!decodeBootstrapInput(raw)) {
+        setAccessFeedback('Invalid pass — paste a room link or seed.');
+        return;
+      }
+      // Review fix (#52): a beam FAILURE while the adapter choreography owns
+      // the avatar leaves the door machine holding with nobody to resolve it
+      // (the hold's transitTo hits the beam's busy latch and returns
+      // silently) — an 8 s wedge with the vestibule's transit lights latched.
+      // Refuse the pass for the few scripted seconds instead.
+      if (world.getPlayer().isInAdapterTransit()) {
+        setAccessFeedback('Docking transit in progress — use the pass once you are through.');
+        return;
+      }
+      setAccessFeedback('Pass accepted — transporting…');
+      const result = await accessBeamTransport(raw);
+      if (result === 'busy') {
+        setAccessFeedback('A transit is already in progress — try again in a moment.');
+        return;
+      }
+      if (result instanceof Error) {
+        setAccessFeedback(result instanceof StrandedOfflineError
+          ? `Transport failed — ${result.message}. No room to return to — node OFFLINE; use another pass or retry the node.`
+          : `Transport failed — ${result.message}. Returned to your room.`);
+        return;
+      }
+      setAccessFeedback('Transport complete. Welcome aboard.');
+      refreshAccessRoomRow();
+    });
+  }
 
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
@@ -1435,13 +1598,12 @@ function setupNetworkDetailsPanel() {
   if (networkPanelInitialized) return;
   networkPanelInitialized = true;
 
+  // #52: the invite mint (Copy Invite) and accept (Use Link) widgets MOVED
+  // to the SpacePhone ACCESS app — this panel keeps diagnostics, node status
+  // and the reachability rows only (plus a thin moved-note pointer).
   const panel = document.getElementById('network-details-hud');
   const toggle = document.getElementById('network-details-toggle');
-  const copyInviteBtn = document.getElementById('network-copy-invite-btn');
-  const sharePrimaryInput = document.getElementById('network-share-link-primary') as HTMLInputElement | null;
-  const useBtn = document.getElementById('network-use-link-btn');
   const retryBtn = document.getElementById('network-retry-node-btn');
-  const importInput = document.getElementById('network-import-link') as HTMLInputElement | null;
   const feedback = document.getElementById('network-link-feedback');
 
   if (retryBtn) {
@@ -1542,6 +1704,8 @@ function setupNetworkDetailsPanel() {
     });
   }
 
+  // ?seed= deep-link import (unchanged bootstrap path — only the input it
+  // echoes into moved to the phone with #52).
   const urlSeed = new URL(window.location.href).searchParams.get('seed');
   if (urlSeed) {
     const imported = decodeBootstrapSeed(urlSeed);
@@ -1552,51 +1716,15 @@ function setupNetworkDetailsPanel() {
           feedback.textContent = 'Zero-config P2P Seed loaded from URL. Entering lobby...';
         }
       });
-      if (importInput) {
-        importInput.value = window.location.href;
+      const accessPassInput = document.getElementById('access-pass-input') as HTMLInputElement | null;
+      if (accessPassInput) {
+        accessPassInput.value = window.location.href;
       }
     }
   }
 
-  if (copyInviteBtn) {
-    copyInviteBtn.addEventListener('click', async () => {
-      const minted = await mintBootstrapLink();
-      if (!minted.link) {
-        if (feedback) feedback.textContent = minted.error ?? 'Invite link is not available yet.';
-        return;
-      }
-
-      if (sharePrimaryInput) {
-        sharePrimaryInput.value = minted.link;
-      }
-
-      // R1 invite pre-flight: warn (but STILL copy) when nothing in this
-      // invite is dialable from the internet — no public IPv4 in the outgoing
-      // hints and no UPnP mapping to catch the dial. The IPv4 hints
-      // deliberately STAY in invite links (owner decision: reliability over
-      // minimalism; DHT re-resolution keeps them refreshable), so a missing
-      // public v4 here is an honest LAN/IPv6-only signal.
-      const inviteWarning =
-        minted.boot && !bootstrapHasPublicIPv4(minted.boot) && localFingerprint?.reachability !== 'port-mapped'
-          ? `⚠ This invite has no internet-reachable IPv4 — LAN/IPv6 only. Forward UDP ${reachabilityUdpPort(localFingerprint)} on the router (auto-advertising is on by default).`
-          : null;
-
-      try {
-        await navigator.clipboard.writeText(minted.link);
-        if (feedback) {
-          feedback.textContent = inviteWarning
-            ? `Invite copied. ${inviteWarning}`
-            : 'Invite copied. Share this one link with everyone.';
-        }
-      } catch {
-        if (feedback) {
-          feedback.textContent = inviteWarning
-            ? `Invite ready below (clipboard permission was denied). ${inviteWarning}`
-            : 'Invite ready below. Clipboard permission was denied.';
-        }
-      }
-    });
-  }
+  // (The Copy Invite handler and its R1 pre-flight warning live in the
+  //  ACCESS app now — setupSpacePhoneOverlay + inviteReachabilityWarning.)
 
   // — Bootstrap-a-network controls (sovereign origin; every node seeds) —
   const bootstrapBtn = document.getElementById('network-bootstrap-link-btn');
@@ -1618,12 +1746,15 @@ function setupNetworkDetailsPanel() {
         return;
       }
 
-      if (sharePrimaryInput) {
-        sharePrimaryInput.value = minted.link;
+      // #52: the shareable field lives in the ACCESS app now — write the
+      // override-minted pass there so diagnostics keep a copyable artifact.
+      const passOutput = document.getElementById('access-pass-output') as HTMLInputElement | null;
+      if (passOutput) {
+        passOutput.value = minted.link;
       }
 
       if (feedback) {
-        feedback.textContent = 'Override invite generated below (diagnostics mode).';
+        feedback.textContent = 'Override invite written to the phone ACCESS app (diagnostics mode).';
       }
     });
   }
@@ -1664,45 +1795,44 @@ function setupNetworkDetailsPanel() {
   void refreshLocalFingerprint();
   window.setInterval(() => { void refreshLocalFingerprint(); }, 60_000);
 
-  if (useBtn && importInput) {
-    useBtn.addEventListener('click', async () => {
-      // Review fix F5 (see the Retry handler above): keyboard activation
-      // pierces the transit curtain — refuse a concurrent join mid-swap.
-      if (transitInProgress) {
-        if (feedback) feedback.textContent = 'Adapter transit in progress — try again in a moment.';
-        return;
-      }
-      const imported = decodeBootstrapInput(importInput.value.trim());
-      if (!imported) {
-        if (feedback) feedback.textContent = 'Invalid seed link.';
-        return;
-      }
-      
-      const resolved = await resolveBridgeBootstrap(imported);
-      pendingBootstrapOverride = resolved;
-
-      if (feedback) feedback.textContent = 'Zero-config P2P seed accepted. Establishing hole-punched link...';
-      // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
-      // its Y.Doc) before joining the imported room, instead of a bare
-      // disconnect() that leaked the previous doc and its observers.
-      await leaveRoom();
-      await bootstrapNetworking();
-    });
-  }
+  // (The Use Link accept path moved to the ACCESS app with #52 — USE PASS
+  //  runs the curtain-covered swap via accessBeamTransport, which already
+  //  honors the transit latch the old handler guarded with review fix F5.)
 }
 
-async function syncShareLink(): Promise<void> {
-  const sharePrimaryInput = document.getElementById('network-share-link-primary') as HTMLInputElement | null;
-  if (!sharePrimaryInput) {
+/** Keep the ACCESS app's MY PASS field current for the room we just joined
+ *  (pre-#52 this fed the network panel's share-link input). Runs per join,
+ *  so after a transit/beam the visible pass always belongs to the CURRENT
+ *  room without pressing GENERATE. */
+async function syncAccessPass(): Promise<void> {
+  const passOutput = document.getElementById('access-pass-output') as HTMLInputElement | null;
+  if (!passOutput) {
     return;
   }
 
   const minted = await mintBootstrapLink();
   if (minted.link) {
-    sharePrimaryInput.value = minted.link;
+    passOutput.value = minted.link;
   } else {
-    sharePrimaryInput.value = minted.error ?? 'Local node not reachable — launch the app (or Rust node) first.';
+    passOutput.value = minted.error ?? 'Local node not reachable — launch the app (or Rust node) first.';
   }
+}
+
+/** Paint the ACCESS app's MY PASS room row (name + roomId) from the live
+ *  session (#52). Called when the ACCESS view opens (covers offline/pre-join
+ *  states), after a successful beam-in, and from the per-join roomInfo /
+ *  players observers so a rename or ownership resolve repaints it live. */
+function refreshAccessRoomRow(): void {
+  const nameEl = document.getElementById('access-room-name');
+  const idEl = document.getElementById('access-room-id');
+  if (!nameEl || !idEl) return;
+  if (!yjsSync) {
+    nameEl.textContent = 'OFFLINE';
+    idEl.textContent = 'no room joined';
+    return;
+  }
+  nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Lobby';
+  idEl.textContent = activeBootstrap?.roomId ?? 'furlong-lobby';
 }
 
 function encodeBootstrapSeed(boot: RoomBootstrap): string {

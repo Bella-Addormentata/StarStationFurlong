@@ -1386,6 +1386,12 @@ export class Player {
     return this.doorPhase;
   }
 
+  /** Public mirror of _inAdapterTransit for UI gates (#52 review): true while
+   *  the adapter-transit choreography owns the avatar. */
+  isInAdapterTransit(): boolean {
+    return this._inAdapterTransit();
+  }
+
   /**
    * Door involved in the ACTIVE walk-through/transit sequence, or null (#51 —
    * the camera-facing door fade restores full opacity on a door while the
@@ -1432,6 +1438,50 @@ export class Player {
       if (seq !== this.doorSeq || this.doorPhase !== 'ARRIVE_OPEN') return;
       this.doorPhase = 'ARRIVE';
     });
+  }
+
+  /**
+   * ACCESS-pass beam-in (#52, dev phase): hard takeover that materializes
+   * the avatar at (x, z), standing, in MANUAL control — no door walk, no
+   * vestibule, no scripted leg; the transit curtain covers the jump. Mirrors
+   * enterFromDoor's takeover discipline (invalidate in-flight door
+   * callbacks, drop every pending/scripted sequence) plus two extras the
+   * door path never needs: an ACTIVE sit is dropped outright (the phone
+   * works while seated and a beamed clone must arrive standing — no
+   * stand-up slide, the curtain hides the pose swap), and a mid-walk door
+   * leg is closed behind us (the room geometry survives the swap, so an
+   * abandoned open leaf would stay visibly open in the destination room).
+   * A device ENGAGED state is NOT unwound here — the caller force-releases
+   * the focus controller first (World.completeAccessBeamIn); the controller
+   * owns the swapped camera and must restore it itself.
+   */
+  beamTo(x: number, z: number): void {
+    this.doorSeq++; // invalidate any in-flight requestOpen completion
+    this._cancelDeviceApproach();
+    this.pendingDest = null;
+    this.pendingSeat = null;
+    this.pendingDoor = null;
+    this.pendingDevice = null;
+    this._clearPath();
+    // Sit teardown: _cancelSit only covers the approach phases — drop
+    // SIT_DOWN / SEATED / STAND_UP too (idle pose restored below).
+    this.sitPhase = 'NONE';
+    this.sitTarget = null;
+    this.sitAnim = 0;
+    // Door/adapter teardown: close whatever leaf a mid-walk leg left open
+    // (closeDoor is idempotent), then drop the leg entirely.
+    if (this.doorPhase !== 'NONE') this.doorHooks?.requestClose();
+    this.doorPhase = 'NONE';
+    this.doorTarget = null;
+    this.doorHooks = null;
+    this.adapterOutTarget = null;
+    this.doorTimer = 0;
+
+    this.mesh.position.x = x;
+    this.mesh.position.z = z;
+    this.logicalAngle = 0; // default spawn facing (constructor pose)
+    this.character.setState('idle', this.logicalAngle);
+    this.navMode = 'MANUAL';
   }
 
   // ── Device-focus sequence (#33 D0) ──────────────────────────────────────────
