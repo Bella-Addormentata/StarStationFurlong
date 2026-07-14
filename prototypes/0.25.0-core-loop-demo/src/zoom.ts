@@ -122,6 +122,20 @@ let isBlinking = false;
 let blinkProgress = 0.0; // 0.0 to 1.0 (0=open, 0.5=fully closed, 1.0=fully open again)
 let pendingZoomOutAction = false;
 
+// ── First-person pointer-lock click model (#49) ──────────────────────────────
+// While LOCKED the mouse is hidden and drives look-around; a click frees the
+// cursor for interaction (seats / doors / floor-walk raycasts in main.ts's
+// onCanvasClick). A subsequent click on INACTIVE space (no interactive hit)
+// re-engages the lock. Esc (browser-native unlock) degrades to the same
+// unlocked-interaction state. This flag swallows the click event paired with
+// the unlocking mousedown — its coordinates are frozen at the lock point and
+// must never reach the raycaster.
+// Timestamped (review F2): if the paired click never reaches onCanvasClick
+// (stopPropagation surfaces, non-primary buttons), a stale flag must not eat
+// the NEXT legitimate click — consumption honors it only within this window.
+let fpUnlockClickPendingAt = 0;
+const FP_UNLOCK_CLICK_TTL_MS = 300;
+
 /**
  * M-dep of #33 (diegetic-maps ruling): levels 3–8 are non-diegetic canvas
  * fiction, deprecated in favour of in-world devices (M4 map table). zoomOut()
@@ -254,29 +268,41 @@ export class MultiScaleZoomView {
   }
 
   private setupListeners() {
-    // Free mouse-look handler inside Level 1 (First Person Perspective)
+    // Free mouse-look handler inside Level 1 (First Person Perspective).
+    // #49 click model: look-around runs ONLY while the pointer is locked.
+    // Unlocked = interaction mode — the visible cursor must be able to travel
+    // to seats/doors/floor without spinning the view. (The old unlocked
+    // fallback steered the camera by absolute cursor offset, which made
+    // clicking anything in first person impossible.)
     window.addEventListener('mousemove', (e) => {
       if (this.currentLevel !== 1) return;
-      
+      if (!document.pointerLockElement) return;
+
       // Accumulate rotation deltas based on mouse movement relative offsets
       const sensitivity = 0.003;
-      
-      // If pointer is locked use movement values, otherwise use mouse client delta
-      const deltaX = document.pointerLockElement ? e.movementX : (e.clientX - window.innerWidth / 2) * 0.08;
-      const deltaY = document.pointerLockElement ? e.movementY : (e.clientY - window.innerHeight / 2) * 0.08;
 
-      yaw -= deltaX * sensitivity;
-      pitch -= deltaY * sensitivity;
+      yaw -= e.movementX * sensitivity;
+      pitch -= e.movementY * sensitivity;
 
       // Constrain vertical look so the player cannot flip upside down
       const maxPitch = Math.PI * 0.45;
       pitch = Math.max(-maxPitch, Math.min(maxPitch, pitch));
     });
 
-    // Request pointer lock when clicking on canvas in Level 1 first-person view
-    window.addEventListener('mousedown', () => {
-      if (this.currentLevel === 1 && window.gameRenderer?.renderer?.domElement) {
-        window.gameRenderer.renderer.domElement.requestPointerLock?.();
+    // #49 click model, unlock half: a click WHILE LOCKED frees the cursor for
+    // interaction. The paired click event is swallowed via
+    // fpUnlockClickPending (consumed by main.ts's onCanvasClick). Re-locking
+    // on inactive-space clicks also lives in onCanvasClick — only it knows
+    // whether the click hit anything interactive.
+    window.addEventListener('mousedown', (e) => {
+      if (this.currentLevel !== 1) return;
+      // Primary button only (review F1): right/middle mousedown never fires a
+      // paired click, so arming the swallow flag for them would eat the next
+      // legitimate left click.
+      if (e.button !== 0) return;
+      if (document.pointerLockElement) {
+        fpUnlockClickPendingAt = performance.now();
+        document.exitPointerLock?.();
       }
     });
 
@@ -341,6 +367,46 @@ export class MultiScaleZoomView {
   }
 
   /**
+   * #49 pointer-lock click model: swallow the click event paired with the
+   * mousedown that freed the cursor (its coordinates are frozen at the lock
+   * point and must not raycast). main.ts's onCanvasClick calls this first
+   * whenever a click lands at level 1; true = eat the click.
+   */
+  public consumeFirstPersonUnlockClick(): boolean {
+    if (fpUnlockClickPendingAt === 0) return false;
+    const fresh = performance.now() - fpUnlockClickPendingAt <= FP_UNLOCK_CLICK_TTL_MS;
+    fpUnlockClickPendingAt = 0;
+    return fresh; // stale flag (paired click never arrived) → don't eat this one
+  }
+
+  /**
+   * Engage first-person pointer lock (mouse hidden, look-around live).
+   * Called on entering level 1 (the zoom keydown is a user activation) and
+   * by main.ts when an unlocked first-person click lands on inactive space.
+   * Failures are non-fatal by design: Chrome refuses re-locks for ~1.25 s
+   * after an Esc exit — the cursor simply stays free and the next
+   * inactive-space click retries.
+   */
+  public requestFirstPersonPointerLock(): void {
+    if (this.currentLevel !== 1) return;
+    // Review F3: never grab the cursor while the welcome overlay is still up
+    // (a '+' on the entry screen reaches level 1 pre-entry; locking there
+    // vanishes the cursor over the overlay and arms a stale swallow flag).
+    const welcome = document.getElementById('welcome');
+    if (welcome && welcome.style.display !== 'none') return;
+    fpUnlockClickPendingAt = 0;
+    const el = window.gameRenderer?.renderer?.domElement;
+    if (!el || document.pointerLockElement === el) return;
+    try {
+      // Modern browsers return a Promise; older ones return undefined.
+      const req = el.requestPointerLock?.() as unknown as Promise<void> | undefined;
+      if (req && typeof req.catch === 'function') {
+        req.catch(() => { /* cooldown / permission — stay unlocked */ });
+      }
+    } catch { /* legacy sync API rejection — stay unlocked */ }
+  }
+
+  /**
    * Hotkey hint honouring the M-dep clamp — never advertise a dead key:
    * without ?devzoom=1, [-] only does anything at level 1 (back to the room).
    */
@@ -348,7 +414,13 @@ export class MultiScaleZoomView {
     const parts: string[] = [];
     if (DEVZOOM || this.currentLevel === 1) parts.push('[-] TO OUT');
     if (this.currentLevel > 1) parts.push('[+] TO IN');
-    return `PRESS ${parts.join(' / ')}`;
+    let hint = `PRESS ${parts.join(' / ')}`;
+    if (this.currentLevel === 1) {
+      // #49 cursor model: click frees the cursor to interact; a click on
+      // empty space re-locks it for look-around. WASD walks either way.
+      hint += ' · WASD WALK · CLICK TOGGLES CURSOR/LOOK';
+    }
+    return hint;
   }
 
   private zoomIn() {
@@ -377,6 +449,11 @@ export class MultiScaleZoomView {
       }
       this.currentLevel--;
       this.updateViewContext();
+      if (this.currentLevel === 1) {
+        // #49: entering first person engages pointer lock right away — mouse
+        // hidden, look-around live (the zoom keydown is a user activation).
+        this.requestFirstPersonPointerLock();
+      }
     }
   }
 
@@ -506,6 +583,9 @@ export class MultiScaleZoomView {
         if (document.pointerLockElement === renderer.domElement) {
           document.exitPointerLock?.();
         }
+        // #49: never carry a pending unlock-click swallow out of level 1 —
+        // it would silently eat the next room-view click.
+        fpUnlockClickPendingAt = 0;
 
         // Restore character mesh visibility when zooming back out
         if (initializedMouseLookOffset) {

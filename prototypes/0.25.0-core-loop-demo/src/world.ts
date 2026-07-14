@@ -9,9 +9,9 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
-import { findDoor } from './doors';
+import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
-import { buildVestibule, setVestibuleLightState } from './adapter';
+import { buildVestibule, setVestibuleLightState, setVestibuleOpacity } from './adapter';
 import { findDevice, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, DeviceTarget } from './devices';
 import { deviceFocus } from './deviceFocus';
@@ -77,8 +77,20 @@ export class World {
    * completed, never failed, never disposed).
    */
   public isTransitBusy: (() => boolean) | null = null;
-  /** Live vestibule outside the departure door, or null (one at a time). */
-  private transitVestibule: THREE.Group | null = null;
+  /**
+   * Persistent gangway vestibules, one per PAIRED door (#51). Spawned the
+   * frame a door's pairing completes, resting lightly translucent and
+   * solidifying as the player approaches; disposed on unpair / morph restart.
+   * A transit rides the SAME instance (no separate transit vestibule) — the
+   * 'cycling'/'fault' lights only run while the transit is in flight.
+   */
+  private pairedVestibules: Map<DoorId, THREE.Group> = new Map();
+  /** Door whose vestibule is lit for an in-flight transit, or null. */
+  private transitVestibuleDoorId: DoorId | null = null;
+  /** Resting opacity of a paired-door vestibule when the player is far. */
+  private static readonly VESTIBULE_BASE_OPACITY = 0.25;
+  /** Proximity fade range (m from the door's front stand-point). */
+  private static readonly VESTIBULE_FADE_RANGE = 4.0;
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
@@ -607,6 +619,9 @@ export class World {
     // (#25 plan §4.5 — highlights restored, grid hidden).
     deviceFocus.forceRelease();
     roomEdit.forceExit();
+    // #51: paired-door vestibules belong to the docking system being rebuilt
+    // by createPlatform — dispose them all (clears the transit latch too).
+    for (const doorId of [...this.pairedVestibules.keys()]) this.disposeVestibule(doorId);
     this.isMorphing = true;
     this.morphProgress = 0;
     this.createPlatform();
@@ -848,14 +863,22 @@ export class World {
     this.updateRemoteAvatars(deltaTime);
 
     // Advance door leaf slides (update-loop driven, completion-signalled)
-    if (this.dockingSystem) this.dockingSystem.update(deltaTime);
+    if (this.dockingSystem) {
+      this.dockingSystem.update(deltaTime);
+      // #51 camera-facing door fade: only while the ortho room camera is
+      // live (zoom 2–4 — visually it only matters at 2), never during the
+      // morph, first person (level 1) or a device-focus camera.
+      const fadeEnabled =
+        !this.isMorphing && zoomLevel >= 2 && zoomLevel <= 4 && !deviceFocus.isActive();
+      this.dockingSystem.updateFacingFade(deltaTime, fadeEnabled, this.player.getActiveDoorId());
+    }
 
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
     for (const lid of this.trunkLids.values()) lid.update(deltaTime);
 
-    // Transit vestibule honors the interior zoom-hide convention (≥3 hides
-    // interior detail) — it only lives for the few seconds of a transit.
-    if (this.transitVestibule) this.transitVestibule.visible = zoomLevel < 3;
+    // #51 — paired-door vestibules: spawn/dispose from pairing state, drive
+    // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.
+    this.updatePairedVestibules(deltaTime, zoomLevel);
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
@@ -1143,24 +1166,45 @@ export class World {
   // ── Adapter transit choreography (T1 of issue #30) ──────────────────────────
 
   /**
-   * Build the gangway vestibule outside the departure door and light it
-   * 'cycling'. Departure side only — the arrival room could briefly show one
-   * outside the arrival door too, but it would exist for well under a second
-   * behind the full-screen fade, so that polish is deliberately skipped.
+   * Light the departure door's gangway vestibule 'cycling' for the transit
+   * (#51 unification: transit rides the persistent paired-door vestibule —
+   * transit is only offered on paired doors, so it already exists; built
+   * defensively if it somehow doesn't). Departure side only — the arrival
+   * room could briefly show one outside the arrival door too, but it would
+   * exist for well under a second behind the full-screen fade, so that
+   * polish is deliberately skipped.
    */
   private spawnTransitVestibule(doorId: DoorId): void {
-    this.disposeTransitVestibule();
-    const vestibule = buildVestibule(doorId);
+    this.endTransitVestibule();
+    let vestibule = this.pairedVestibules.get(doorId);
+    if (!vestibule) {
+      vestibule = buildVestibule(doorId);
+      this.platformGroup.add(vestibule);
+      this.pairedVestibules.set(doorId, vestibule);
+    }
     setVestibuleLightState(vestibule, 'cycling');
-    this.platformGroup.add(vestibule);
-    this.transitVestibule = vestibule;
+    this.transitVestibuleDoorId = doorId;
   }
 
-  /** Remove and dispose the transit vestibule (geometries + materials). */
-  private disposeTransitVestibule(): void {
-    const vestibule = this.transitVestibule;
+  /**
+   * Transit over: revert the vestibule lights to 'idle' and release the
+   * transit latch. The vestibule itself persists while its door stays paired
+   * (#51); updatePairedVestibules disposes it on unpair.
+   */
+  private endTransitVestibule(): void {
+    const doorId = this.transitVestibuleDoorId;
+    this.transitVestibuleDoorId = null;
+    if (!doorId) return;
+    const vestibule = this.pairedVestibules.get(doorId);
+    if (vestibule) setVestibuleLightState(vestibule, 'idle');
+  }
+
+  /** Remove and dispose one paired-door vestibule (geometries + materials). */
+  private disposeVestibule(doorId: DoorId): void {
+    const vestibule = this.pairedVestibules.get(doorId);
     if (!vestibule) return;
-    this.transitVestibule = null;
+    this.pairedVestibules.delete(doorId);
+    if (this.transitVestibuleDoorId === doorId) this.transitVestibuleDoorId = null;
     vestibule.parent?.remove(vestibule);
     const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
     vestibule.traverse((obj) => {
@@ -1177,6 +1221,67 @@ export class World {
         mat.dispose();
       }
     });
+  }
+
+  /**
+   * #51 — persistent translucent vestibules on paired doors, driven per
+   * frame from update():
+   *  - a door whose pairing just completed grows a vestibule (fading up from
+   *    0 to the resting translucency); an unpaired door's vestibule is
+   *    disposed (a mid-transit unpair defers to the transit's end),
+   *  - opacity rests at VESTIBULE_BASE_OPACITY and lerps to solid as the
+   *    player nears the door's front stand-point (within FADE_RANGE), forced
+   *    solid during this door's transit AND during any door sequence on it
+   *    (mid-PEEK the avatar STANDS inside the gangway, past the front point —
+   *    distance alone would leave the tube half-ghosted around them),
+   *  - honors the interior zoom-hide convention (≥3 hides) and the morph.
+   */
+  private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
+    const ds = this.dockingSystem;
+    if (!ds) return;
+    const playerPos = this.player.getPosition();
+    const activeDoorId = this.player.getActiveDoorId();
+
+    for (const door of DOORS) {
+      const paired = ds.getDockingState(door.id)?.pairedSuccessfully === true;
+      let vestibule = this.pairedVestibules.get(door.id);
+
+      if (!paired) {
+        // Defer disposal while EITHER a transit or a plain walk-through is on
+        // this door — mid-PEEK the avatar physically stands in the gangway,
+        // and an unpair must not pop the tube out around them (review L1;
+        // mirrors the activeDoorId exemption in the opacity branch below).
+        if (vestibule && this.transitVestibuleDoorId !== door.id && activeDoorId !== door.id) {
+          this.disposeVestibule(door.id);
+        }
+        continue;
+      }
+
+      if (!vestibule) {
+        vestibule = buildVestibule(door.id);
+        setVestibuleOpacity(vestibule, 0); // fades up to the resting level
+        this.platformGroup.add(vestibule);
+        this.pairedVestibules.set(door.id, vestibule);
+      }
+
+      vestibule.visible = zoomLevel < 3 && !this.isMorphing;
+      if (!vestibule.visible) continue;
+
+      let target: number;
+      if (this.transitVestibuleDoorId === door.id || activeDoorId === door.id) {
+        target = 1.0; // transit / walk-through in progress — fully material
+      } else {
+        const dist = Math.hypot(playerPos.x - door.front.x, playerPos.z - door.front.z);
+        const t = THREE.MathUtils.clamp(1 - dist / World.VESTIBULE_FADE_RANGE, 0, 1);
+        target = World.VESTIBULE_BASE_OPACITY + t * (1 - World.VESTIBULE_BASE_OPACITY);
+      }
+
+      const current = (vestibule.userData.opacity as number) ?? 0;
+      if (current === target) continue;
+      let next = current + (target - current) * Math.min(1, 6 * deltaTime);
+      if (Math.abs(next - target) < 0.005) next = target;
+      setVestibuleOpacity(vestibule, next);
+    }
   }
 
   /**
@@ -1198,11 +1303,12 @@ export class World {
 
   /**
    * Success half of the swap, called by main.ts while the transit fade is
-   * fully opaque and the target room's session is live: tear the vestibule
-   * down and script the walk-in through the arrival door.
+   * fully opaque and the target room's session is live: end the transit
+   * (vestibule back to 'idle' — it persists while its door stays paired,
+   * #51) and script the walk-in through the arrival door.
    */
   public completeAdapterArrival(departureDoorId: DoorId): void {
-    this.disposeTransitVestibule();
+    this.endTransitVestibule();
     const arrival = this.resolveArrivalDoor(departureDoorId);
     this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
   }
@@ -1228,17 +1334,17 @@ export class World {
    * Failure half of the swap: the avatar still stands at the vestibule hold
    * point outside the departure door (the world is never rebuilt on transit).
    * Light the vestibule 'fault', walk back in through the departure door, and
-   * tear the vestibule down once the door closes behind the player.
+   * end the transit (lights back to 'idle') once the door closes behind the
+   * player — the vestibule persists, the door is still paired (#51).
    */
   public failAdapterTransit(departureDoorId: DoorId): void {
-    if (this.transitVestibule) {
-      setVestibuleLightState(this.transitVestibule, 'fault');
-    }
+    const vestibule = this.pairedVestibules.get(departureDoorId);
+    if (vestibule) setVestibuleLightState(vestibule, 'fault');
     const door = findDoor(departureDoorId);
-    if (!door) { this.disposeTransitVestibule(); return; }
+    if (!door) { this.endTransitVestibule(); return; }
     this.player.enterFromDoor(
       door,
-      this._makeArrivalHooks(door, /* disposeVestibuleOnClose */ true),
+      this._makeArrivalHooks(door, /* endTransitOnClose */ true),
       /* spawnAtThrough */ false, // walk back from where the hold left us
     );
   }
@@ -1248,7 +1354,7 @@ export class World {
    * purpose: the walk-in is the only way back INTO a room — denying it would
    * strand the avatar outside the walls.
    */
-  private _makeArrivalHooks(door: DoorTarget, disposeVestibuleOnClose = false): DoorSequenceHooks {
+  private _makeArrivalHooks(door: DoorTarget, endTransitOnClose = false): DoorSequenceHooks {
     const ds = this.dockingSystem;
     return {
       requestOpen: (onOpened) => {
@@ -1258,7 +1364,7 @@ export class World {
       },
       requestClose: () => {
         ds?.closeDoor(door.id);
-        if (disposeVestibuleOnClose) this.disposeTransitVestibule();
+        if (endTransitOnClose) this.endTransitVestibule();
       },
       onThrough: () => { /* arrival leg never re-crosses outward */ },
     };
@@ -1369,7 +1475,19 @@ export class World {
     // Device-FOCUSED counts as active: the avatar mesh is hidden then, but
     // the player still stands in the room (ticks keep flowing to peers, and
     // deferred seat/door/dest requests must still be routable).
-    return (this.player.mesh.visible || deviceFocus.isActive()) && !this.isMorphing;
+    // FIRST PERSON (#49) counts as active for the same reason: zoom level 1
+    // hides the local mesh (so we don't render inside our own head), but the
+    // player still stands in the room — WASD must keep walking (the
+    // camera-relative branch in input.ts), collision/BOUND still apply in
+    // player.update, and movement ticks must keep flowing to peers. Without
+    // this the mesh-visibility gate silently disabled all first-person WASD.
+    const zoomView = (window as any).multiScaleZoom;
+    const firstPerson =
+      !!zoomView && typeof zoomView.getLevel === 'function' && zoomView.getLevel() === 1;
+    return (
+      (this.player.mesh.visible || deviceFocus.isActive() || firstPerson) &&
+      !this.isMorphing
+    );
   }
 
   private initializeDockingPorts() {
