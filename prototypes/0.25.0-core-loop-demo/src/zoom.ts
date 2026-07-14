@@ -130,7 +130,11 @@ let pendingZoomOutAction = false;
 // unlocked-interaction state. This flag swallows the click event paired with
 // the unlocking mousedown — its coordinates are frozen at the lock point and
 // must never reach the raycaster.
-let fpUnlockClickPending = false;
+// Timestamped (review F2): if the paired click never reaches onCanvasClick
+// (stopPropagation surfaces, non-primary buttons), a stale flag must not eat
+// the NEXT legitimate click — consumption honors it only within this window.
+let fpUnlockClickPendingAt = 0;
+const FP_UNLOCK_CLICK_TTL_MS = 300;
 
 /**
  * M-dep of #33 (diegetic-maps ruling): levels 3–8 are non-diegetic canvas
@@ -290,10 +294,14 @@ export class MultiScaleZoomView {
     // fpUnlockClickPending (consumed by main.ts's onCanvasClick). Re-locking
     // on inactive-space clicks also lives in onCanvasClick — only it knows
     // whether the click hit anything interactive.
-    window.addEventListener('mousedown', () => {
+    window.addEventListener('mousedown', (e) => {
       if (this.currentLevel !== 1) return;
+      // Primary button only (review F1): right/middle mousedown never fires a
+      // paired click, so arming the swallow flag for them would eat the next
+      // legitimate left click.
+      if (e.button !== 0) return;
       if (document.pointerLockElement) {
-        fpUnlockClickPending = true;
+        fpUnlockClickPendingAt = performance.now();
         document.exitPointerLock?.();
       }
     });
@@ -365,9 +373,10 @@ export class MultiScaleZoomView {
    * whenever a click lands at level 1; true = eat the click.
    */
   public consumeFirstPersonUnlockClick(): boolean {
-    if (!fpUnlockClickPending) return false;
-    fpUnlockClickPending = false;
-    return true;
+    if (fpUnlockClickPendingAt === 0) return false;
+    const fresh = performance.now() - fpUnlockClickPendingAt <= FP_UNLOCK_CLICK_TTL_MS;
+    fpUnlockClickPendingAt = 0;
+    return fresh; // stale flag (paired click never arrived) → don't eat this one
   }
 
   /**
@@ -380,7 +389,12 @@ export class MultiScaleZoomView {
    */
   public requestFirstPersonPointerLock(): void {
     if (this.currentLevel !== 1) return;
-    fpUnlockClickPending = false;
+    // Review F3: never grab the cursor while the welcome overlay is still up
+    // (a '+' on the entry screen reaches level 1 pre-entry; locking there
+    // vanishes the cursor over the overlay and arms a stale swallow flag).
+    const welcome = document.getElementById('welcome');
+    if (welcome && welcome.style.display !== 'none') return;
+    fpUnlockClickPendingAt = 0;
     const el = window.gameRenderer?.renderer?.domElement;
     if (!el || document.pointerLockElement === el) return;
     try {
@@ -571,7 +585,7 @@ export class MultiScaleZoomView {
         }
         // #49: never carry a pending unlock-click swallow out of level 1 —
         // it would silently eat the next room-view click.
-        fpUnlockClickPending = false;
+        fpUnlockClickPendingAt = 0;
 
         // Restore character mesh visibility when zooming back out
         if (initializedMouseLookOffset) {
