@@ -39,6 +39,18 @@
  *    player.evictFromSeat() (plan §4.2)
  *  - forceExit() cancels a live carry before tearing down (plan §4.5)
  *
+ * #53 scope — remove to room inventory:
+ *  - with an item SELECTED (and no carry live), a floating ✕ REMOVE button
+ *    under the selection label — or the X / Delete key — removes the item:
+ *    despawn + deregister (world.removeFurnitureVisuals + FURNITURE splice),
+ *    stow its kind in the per-room furniture inventory (roomInventory.ts),
+ *    then the exact commit rebake pipeline. The DEV menu's INVENTORY section
+ *    re-places stored pieces.
+ *  - removal needs NO validity gate: deleting an obstacle only OPENS space —
+ *    the walkable set strictly grows, so nothing reachable can become
+ *    unreachable (the whole reason commitCarry needs validatePlacement is
+ *    that a move also ADDS a box; removal never does).
+ *
  * Module singleton — exported as `roomEdit`, with `isEditModeActive()` for
  * the click-routing guard in main.ts (mirrors deviceFocus.ts).
  */
@@ -55,6 +67,8 @@ import { PLAYER_R } from './player';
 import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
 import { showHint } from './hud';
+import { isDeviceFocusActive } from './deviceFocus';
+import { addToRoomInventory, activeRoomId } from './roomInventory';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -268,6 +282,8 @@ class RoomEditController {
 
   /** Floating label showing the selected item's id. */
   private labelEl: HTMLDivElement | null = null;
+  /** Floating ✕ REMOVE button under the label (#53) — shown while selected. */
+  private removeBtnEl: HTMLButtonElement | null = null;
   private labelAnchor = new THREE.Vector3();
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
@@ -319,6 +335,19 @@ class RoomEditController {
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
       this.rotateCarry();
+    });
+
+    // #53: X / Delete removes the SELECTED item to the room inventory.
+    // Not while carrying — a held item must be placed or cancelled first
+    // (Esc / right-click own that path), so the origin restore stays a pure
+    // visual concern and removal always acts on a committed registry pose.
+    window.addEventListener('keydown', (e) => {
+      if (!this.active || this.carrying || !this.selectedId) return;
+      if (e.key !== 'x' && e.key !== 'X' && e.key !== 'Delete') return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      e.preventDefault();
+      this.removeSelected();
     });
   }
 
@@ -376,7 +405,7 @@ class RoomEditController {
     this.buildRaycastIndex(world);
     window.addEventListener('mousemove', this.onMouseMove);
     world.setEditMode(true);
-    showHint('EDIT MODE — click furniture to select · ESC to exit', 4000);
+    showHint('EDIT MODE — click furniture to select · X removes · ESC exits', 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
@@ -552,6 +581,7 @@ class RoomEditController {
       floodOrigin,
     };
     this.setHovered(null);
+    this.syncRemoveButton(); // #53: no removal mid-carry — hide the button
     this.revalidateCarry(true);
     this.setCanvasCursor('grabbing');
     showHint('CARRYING — click to place · R rotate · ESC cancel', 5000);
@@ -634,6 +664,7 @@ class RoomEditController {
     } else {
       this.clearTint(itemId);
     }
+    this.syncRemoveButton(); // #53: selection persists → button returns
     this.setCanvasCursor('');
     showHint('Placed.', 1400);
   }
@@ -653,8 +684,100 @@ class RoomEditController {
     } else {
       this.clearTint(c.itemId);
     }
+    this.syncRemoveButton(); // #53: selection persists → button returns
     this.setCanvasCursor('');
     if (announce) showHint('Move cancelled.', 1400);
+  }
+
+  // ── Remove to room inventory (#53) ──────────────────────────────────────────
+
+  /**
+   * Remove the SELECTED item from the room and stow its kind in the per-room
+   * furniture inventory (roomInventory.ts — the DEV menu's INVENTORY section
+   * re-places it via the spawn machinery). Steps, in dependency order:
+   *
+   *  1. guards — movable only (structurally guaranteed: buildRaycastIndex
+   *     only indexes movable items, so fireplace/bar/wall-computer can never
+   *     be SELECTED — but fail closed anyway), no live carry (the X handler
+   *     and button visibility already exclude it; re-checked here);
+   *  2. a local player seated ON the item stands up first (the same
+   *     evictFromSeat idiom as beginCarry, plan §4.2) — the stand-up slide
+   *     targets the seat's front point, which stays valid: removal only
+   *     OPENS space. (Remote seated players are the E4 observer's problem —
+   *     see player.ts's E4 remote-apply hazards note.)
+   *  3. selection/hover teardown BEFORE disposal — clearTint (via
+   *     setSelected(null)) must restore saved emissive state while the
+   *     materials still exist, and the raycast index must drop the meshes so
+   *     no hover can touch freed handles;
+   *  4. despawn + deregister — world.removeFurnitureVisuals (scene graph,
+   *     geometry/material/texture disposal, furnitureMeshes/Lights,
+   *     wallScreens/trunkLids/holoSpinners), then the FURNITURE splice;
+   *  5. stow the KIND in the room inventory (pos/rot/id are not kept —
+   *     re-placing searches for a fresh valid spot and mints a fresh id;
+   *     local-only until E4, see roomInventory.ts's honesty note);
+   *  6. the exact commit rebake pipeline + onObstaclesChanged(itemId) — the
+   *     id argument cancels in-flight approaches to the removed item's seats
+   *     and device front (their derived entries just vanished).
+   *
+   * NO validity check, deliberately: validatePlacement gates moves because a
+   * move ADDS a footprint somewhere new; removal only deletes one, the
+   * walkable set strictly grows, so every currently-reachable front stays
+   * reachable and no player can end up inside an obstacle. A player standing
+   * NEXT to the item just gains floor.
+   *
+   * Removing a device mid-focus is impossible locally: edit mode and device
+   * focus are mutually exclusive by construction (EDIT ROOM releases the
+   * focus before entering — deviceFocus.releaseThen — and canvas clicks
+   * route here before the device pass while active). Dev-asserted below.
+   */
+  private removeSelected(): void {
+    const world = this.world;
+    const itemId = this.selectedId;
+    if (!world || !itemId || this.carrying) return;
+    const item = FURNITURE.find((i) => i.id === itemId);
+    if (!item) return;
+    if (!item.movable) {
+      showHint("CAN'T REMOVE — fixed room structure.", 2200);
+      return;
+    }
+    if (import.meta.env.DEV && isDeviceFocusActive()) {
+      console.error('[editMode] removeSelected during device focus — the edit-mode/device-focus mutual exclusion is broken');
+    }
+
+    // 2. Stand up a player sitting on the removed item (seat ids are
+    //    `${itemId}:${templateIndex}` — same match as beginCarry).
+    const player = world.getPlayer();
+    const seatedId = player.getSeatedSeatId();
+    if (seatedId && seatedId.startsWith(`${itemId}:`)) {
+      player.evictFromSeat();
+    }
+
+    // 3. Selection/hover teardown while the materials still exist.
+    this.setSelected(null); // restores tint, hides label + button
+    if (this.hoveredId === itemId) this.setHovered(null);
+    const meshes = this.itemMeshes.get(itemId) ?? [];
+    for (const mesh of meshes) this.meshToItem.delete(mesh);
+    this.itemMeshes.delete(itemId);
+    const meshSet = new Set<THREE.Object3D>(meshes);
+    this.raycastTargets = this.raycastTargets.filter((m) => !meshSet.has(m));
+
+    // 4. Despawn visuals + deregister world handles, then the registry.
+    world.removeFurnitureVisuals(itemId);
+    const idx = FURNITURE.findIndex((i) => i.id === itemId);
+    if (idx !== -1) FURNITURE.splice(idx, 1);
+
+    // 5. Stow in the per-room furniture inventory.
+    addToRoomInventory(activeRoomId(), item.kind);
+
+    // 6. The exact commit rebake pipeline (commitCarry's order — seats AND
+    //    devices bake world-space fronts/poses off the fresh grid).
+    rebuildObstacles();
+    rebakeWalkableGrid();
+    rebuildSeats();
+    rebuildDevices();
+    player.onObstaclesChanged(itemId);
+
+    showHint(`Removed ${itemId} → room inventory (DEV menu › INVENTORY re-places it).`, 3200);
   }
 
   /** Validate the current candidate against live player positions. */
@@ -785,6 +908,7 @@ class RoomEditController {
     } else {
       this.hideLabel();
     }
+    this.syncRemoveButton();
   }
 
   /**
@@ -865,7 +989,57 @@ class RoomEditController {
     if (this.labelEl) this.labelEl.style.display = 'none';
   }
 
-  /** Reproject the label to float above the selected item's bounding box. */
+  /**
+   * Show the floating ✕ REMOVE button iff an item is SELECTED and no carry
+   * is live (#53). The movable guard is structural — buildRaycastIndex only
+   * indexes movable items, so a selected item is movable by construction
+   * (fireplace / bar / wall computer can never be selected, hence never show
+   * the button) — but re-checked so a future selectable-but-fixed item fails
+   * closed (hidden), matching the "button hidden, not disabled" rule.
+   */
+  private syncRemoveButton(): void {
+    const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;
+    const show = this.active && !this.carrying && !!item && item.movable;
+    if (!this.removeBtnEl) {
+      if (!show) return;
+      this.removeBtnEl = document.createElement('button');
+      this.removeBtnEl.id = 'room-edit-remove-btn';
+      this.removeBtnEl.type = 'button';
+      this.removeBtnEl.textContent = '✕ REMOVE';
+      this.removeBtnEl.title = 'Remove to room inventory (X / Delete)';
+      // Label palette shifted to the carry-invalid red; sits UNDER the label
+      // (label transform is -130%, this one +35% off the same anchor).
+      this.removeBtnEl.style.cssText = `
+        position: fixed;
+        transform: translate(-50%, 35%);
+        padding: 3px 10px;
+        background: rgba(22, 4, 8, 0.92);
+        border: 1px solid rgba(224, 84, 84, 0.65);
+        border-radius: 6px;
+        color: #e05454;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4600;
+        cursor: pointer;
+      `;
+      // stopPropagation: a button click must never bubble to the window
+      // click routing and double as a canvas click (same input-capture rule
+      // as the device UIs and the DEV panel).
+      this.removeBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.removeSelected();
+      });
+      document.body.appendChild(this.removeBtnEl);
+    }
+    this.removeBtnEl.style.display = show ? 'block' : 'none';
+    if (show) this.updateLabelPosition();
+  }
+
+  /** Reproject the label (above) + REMOVE button (below) every frame. */
   private updateLabelPosition(): void {
     if (!this.labelEl || !this.selectedId || this.labelEl.style.display === 'none') return;
     const group = this.world?.furnitureGroups.get(this.selectedId);
@@ -873,8 +1047,14 @@ class RoomEditController {
     if (!group || !camera) return;
     this.labelAnchor.set(group.position.x, this.selectedTopY + 0.12, group.position.z);
     this.labelAnchor.project(camera);
-    this.labelEl.style.left = `${((this.labelAnchor.x + 1) / 2) * window.innerWidth}px`;
-    this.labelEl.style.top = `${((1 - this.labelAnchor.y) / 2) * window.innerHeight}px`;
+    const left = `${((this.labelAnchor.x + 1) / 2) * window.innerWidth}px`;
+    const top = `${((1 - this.labelAnchor.y) / 2) * window.innerHeight}px`;
+    this.labelEl.style.left = left;
+    this.labelEl.style.top = top;
+    if (this.removeBtnEl && this.removeBtnEl.style.display !== 'none') {
+      this.removeBtnEl.style.left = left;
+      this.removeBtnEl.style.top = top;
+    }
   }
 
   private setCanvasCursor(cursor: string): void {

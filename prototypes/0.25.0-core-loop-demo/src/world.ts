@@ -492,6 +492,64 @@ export class World {
   }
 
   /**
+   * Despawn ONE furniture item's visuals and deregister every per-item
+   * handle — the exact inverse of addLobbyFurniture's per-item registration
+   * (#53 remove-to-inventory). Scene-graph and World-collection side only:
+   * the FURNITURE registry splice and the rebake pipeline (obstacles → grid
+   * → seats → devices → replan) are the CALLER's responsibility, mirroring
+   * how commitCarry/spawnFurniture own that pipeline around their mutation.
+   *
+   * Disposal follows the removeRemotePlayer discipline: dedupe geometries
+   * and materials (one material serves many meshes), never dispose the
+   * shared OUTLINE_MAT (furniture groups don't contain it, but guard anyway
+   * — #27's lesson), and dispose .map textures explicitly (the wall
+   * computer's live screen CanvasTexture, the trunk's stencil decal) —
+   * Material.dispose() does NOT free them.
+   *
+   * Deleting from wallScreens/trunkLids/holoSpinners is what stops update()
+   * driving freed handles: the 1 Hz screen redraw, the per-frame lid ease
+   * and the holo-ring spin all iterate those collections.
+   */
+  public removeFurnitureVisuals(itemId: string): boolean {
+    const group = this.furnitureGroups.get(itemId);
+    if (!group) return false;
+    this.platformGroup.remove(group);
+    this.furnitureGroups.delete(itemId);
+    this.wallScreens.delete(itemId);
+    this.trunkLids.delete(itemId);
+
+    const groupMeshes = new Set<THREE.Object3D>();
+    const groupLights = new Set<THREE.PointLight>();
+    const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
+    group.traverse((obj) => {
+      if (obj instanceof THREE.PointLight) {
+        groupLights.add(obj);
+        obj.dispose();
+        return;
+      }
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      groupMeshes.add(mesh);
+      if (mesh.geometry && !disposed.has(mesh.geometry)) {
+        disposed.add(mesh.geometry);
+        mesh.geometry.dispose();
+      }
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
+        disposed.add(mat);
+        const map = (mat as THREE.MeshBasicMaterial).map;
+        if (map) map.dispose();
+        mat.dispose();
+      }
+    });
+    this.furnitureMeshes = this.furnitureMeshes.filter((m) => !groupMeshes.has(m));
+    this.furnitureLights = this.furnitureLights.filter(({ light }) => !groupLights.has(light));
+    this.holoSpinners = this.holoSpinners.filter(({ mesh }) => !groupMeshes.has(mesh));
+    return true;
+  }
+
+  /**
    * Add atmosphere effects: pendant lights, holographic display,
    * space-view windows, floating particles.
    */

@@ -25,6 +25,9 @@
  *                pipeline (obstacles → grid → seats → devices → replan), so
  *                the piece collides, paths, sits, focuses and edit-moves
  *                like built-in furniture. LOCAL ONLY until E4 sync.
+ *  - INVENTORY : pieces removed in edit mode (#53 — roomInventory.ts store),
+ *                each with a PLACE button that re-spawns through the same
+ *                machinery as FURNITURE and pops the inventory entry.
  *  - MODULES   : provision a module seed IF a transit build exposes
  *                window.__ssfProvisionModule (T1 of #30 — not on every
  *                branch); resilient either way.
@@ -59,6 +62,9 @@ import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
 } from './items';
+import {
+  loadRoomInventory, takeFromRoomInventory, ROOM_INVENTORY_EVENT,
+} from './roomInventory';
 import { OUTFITS } from './outfits';
 import { showHint } from './hud';
 import type { World } from './world';
@@ -190,11 +196,11 @@ function equipOutfit(outfitId: string): void {
 
 // ── FURNITURE: spawn a new registry item at the nearest valid snapped spot ───
 
-function uniqueSpawnId(kind: FurnitureKind): string {
+function uniqueSpawnId(kind: FurnitureKind, prefix = 'dev'): string {
   let id: string;
   do {
     spawnCounter += 1;
-    id = `dev-${kind}-${spawnCounter}`;
+    id = `${prefix}-${kind}-${spawnCounter}`;
   } while (FURNITURE.some((i) => i.id === id));
   return id;
 }
@@ -306,6 +312,28 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
   });
 }
 
+/**
+ * Registry push + world registration + the exact E3 commit pipeline (order
+ * matters: seats AND devices bake world-space fronts/poses off the fresh
+ * walkable grid), then replan — shared by the free-spawn (FURNITURE section)
+ * and inventory re-place (#53 INVENTORY section) paths.
+ */
+function commitSpawn(world: World, item: FurnitureItem): void {
+  FURNITURE.push(item);
+  registerSpawnedGroup(world, item);
+  rebuildObstacles();
+  rebakeWalkableGrid();
+  rebuildSeats();
+  rebuildDevices();
+  world.getPlayer().onObstaclesChanged();
+  // A live edit session indexed the raycast targets on enter — refresh it so
+  // the new piece is immediately selectable/movable.
+  if (roomEdit.isEditModeActive()) {
+    roomEdit.forceExit();
+    roomEdit.enter(world);
+  }
+}
+
 function spawnFurniture(kind: FurnitureKind): void {
   const world = getWorld();
   if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
@@ -325,22 +353,50 @@ function spawnFurniture(kind: FurnitureKind): void {
     return;
   }
   item.pos = spot;
-  FURNITURE.push(item);
-  registerSpawnedGroup(world, item);
-  // The exact E3 commit pipeline (order matters: seats AND devices bake
-  // world-space fronts/poses off the fresh walkable grid), then replan.
-  rebuildObstacles();
-  rebakeWalkableGrid();
-  rebuildSeats();
-  rebuildDevices();
-  world.getPlayer().onObstaclesChanged();
-  // A live edit session indexed the raycast targets on enter — refresh it so
-  // the new piece is immediately selectable/movable.
-  if (roomEdit.isEditModeActive()) {
-    roomEdit.forceExit();
-    roomEdit.enter(world);
-  }
+  commitSpawn(world, item);
   showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — local only until E4 sync.`);
+}
+
+// ── INVENTORY: re-place furniture removed to the room inventory (#53) ────────
+
+/**
+ * PLACE button on a room-inventory row: re-spawn the stored KIND through the
+ * exact spawn machinery above (nearest-valid-spot search, full placement
+ * gate) and pop the entry. Ordering is deliberate: the entry is only taken
+ * AFTER a spot is secured (a full room keeps the piece safely in inventory),
+ * and the take re-checks the row's kind so a stale panel (list changed in
+ * another tab / a remove landed while open) refuses rather than popping the
+ * wrong entry. A re-placed piece gets a fresh `inv-` id — ids are not stable
+ * across remove/re-place until E4 persistence (a removed trunk's stowage key
+ * `ssf-trunk:<roomId>:<oldId>` is therefore orphaned; a re-placed trunk
+ * seeds fresh contents — the TR-sync slice owns migrating that).
+ */
+function placeFromInventory(index: number, kind: FurnitureKind): void {
+  const world = getWorld();
+  if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
+    showHint('DEV: enter the room first.');
+    return;
+  }
+  const item: FurnitureItem = {
+    id: uniqueSpawnId(kind, 'inv'),
+    kind,
+    pos: { x: 0, z: 0 },
+    rot: 0,
+    movable: true,
+  };
+  const spot = findSpawnSpot(world, item);
+  if (!spot) {
+    showHint(`DEV: CAN'T PLACE ${kind} — no valid spot (room is full). Kept in inventory.`);
+    return;
+  }
+  if (!takeFromRoomInventory(activeRoomId(), index, kind)) {
+    refreshInventoryRows(); // stale row — resync the panel with the store
+    showHint('DEV: inventory changed underneath the panel — try again.');
+    return;
+  }
+  item.pos = spot;
+  commitSpawn(world, item);
+  showHint(`DEV: placed ${item.id} from room inventory at (${item.pos.x}, ${item.pos.z}).`);
 }
 
 // ── MODULES: provision a module seed IF a transit build exposes the handle ───
@@ -529,6 +585,7 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('ITEMS', 'into the room trunk', itemRows)}
       ${sectionHtml('OUTFITS', null, outfitRows)}
       ${sectionHtml('FURNITURE', 'local only until E4 sync', furnitureRows)}
+      ${sectionHtml('INVENTORY', 'removed furniture · local only', ['<div id="dev-inventory-rows"></div>'])}
       ${sectionHtml('MODULES', null, [moduleRow])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
     </div>
@@ -547,6 +604,9 @@ function buildPanel(): HTMLDivElement {
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
+      case 'place-inventory':
+        placeFromInventory(Number(btn.dataset.index), btn.dataset.kind as FurnitureKind);
+        break;
       case 'provision-module': void provisionModule(); break;
       case 'toggle-vestibule': void toggleVestibule(); break;
     }
@@ -556,9 +616,40 @@ function buildPanel(): HTMLDivElement {
   return el;
 }
 
+/**
+ * Rebuild the INVENTORY section's rows from the live room-inventory store
+ * (#53). Called on open, and by the ROOM_INVENTORY_EVENT listener whenever
+ * the store mutates (edit-mode remove / PLACE pop) while the panel is open.
+ */
+function refreshInventoryRows(): void {
+  if (!panel) return;
+  const holder = panel.querySelector<HTMLElement>('#dev-inventory-rows');
+  if (!holder) return;
+  const entries = loadRoomInventory(activeRoomId());
+  if (entries.length === 0) {
+    holder.innerHTML = `
+      <div style="${ROW_STYLE}">
+        <span style="color:rgba(255,179,0,0.4);">empty — edit mode's ✕ REMOVE (X key) stows furniture here</span>
+      </div>
+    `;
+    return;
+  }
+  holder.innerHTML = entries.map((entry, i) => `
+    <div style="${ROW_STYLE}">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${entry.kind.toUpperCase()}${
+        entry.storedAt > 0
+          ? ` <span style="color:rgba(255,179,0,0.4);">· ${new Date(entry.storedAt).toLocaleTimeString()}</span>`
+          : ''
+      }</span>
+      <button type="button" data-dev-action="place-inventory" data-index="${i}" data-kind="${entry.kind}" style="${BTN_STYLE}">PLACE</button>
+    </div>
+  `).join('');
+}
+
 /** Rows whose state depends on the live environment (module handle, preview). */
 function refreshDynamicRows(): void {
   if (!panel) return;
+  refreshInventoryRows();
   const moduleBtn = panel.querySelector<HTMLButtonElement>('#dev-module-btn');
   const moduleNote = panel.querySelector<HTMLElement>('#dev-module-note');
   if (moduleBtn && moduleNote) {
@@ -618,6 +709,12 @@ export function initDevMenu(getWorldRef: GetWorld): void {
       setOpen(!isOpen());
     });
   }
+
+  // #53: keep the INVENTORY rows honest while the panel is open — the store
+  // mutates from OUTSIDE the panel too (edit mode's ✕ REMOVE / X key).
+  window.addEventListener(ROOM_INVENTORY_EVENT, () => {
+    if (isOpen()) refreshInventoryRows();
+  });
 
   window.addEventListener('keydown', (e) => {
     const target = e.target as HTMLElement | null;
