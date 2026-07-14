@@ -20,6 +20,10 @@ import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } fro
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
+import {
+  initRoomPasses, addPass, listPasses, passState, subscribePasses,
+  setActivePassRoom, removePass, type PassState,
+} from './roomPasses';
 
 type RendererModule = typeof import('./renderer');
 
@@ -83,6 +87,10 @@ let transitInProgress = false;
  * Every other transit is a JOIN into someone else's room (false).
  */
 const mintedRoomIds = new Set<string>();
+
+/** Staged room-list (issue #60): the passes manager is restored+warmed once,
+ *  after the first join confirms the node is up. */
+let roomPassesInited = false;
 
 // Local node identity (fetched from the Rust node's fingerprint endpoint).
 // Kept so the user can mint bootstrap links for friends even before any peer
@@ -539,6 +547,15 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // sync burst that gives a joiner the host's arrangement). Rebinds per join
   // like players/games/roomInfo (T0 seam).
   bindFurnitureDoc(sync.doc);
+
+  // Staged room-list (issue #60): restore + background-warm the saved passes
+  // once (the node is up here), and tell the manager which room is active so
+  // its pass reads CURRENT and the room we LEFT re-warms in the list.
+  if (!roomPassesInited) {
+    roomPassesInited = true;
+    initRoomPasses({ decode: decodeBootstrapInput, resolve: resolveBridgeBootstrap });
+  }
+  setActivePassRoom(boot.roomId);
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap('roomInfo');
@@ -1356,45 +1373,28 @@ function setupSpacePhoneOverlay() {
     });
   }
 
+  // ADD PASS (issue #60 staged room-list): a pasted pass is ADDED to MY ROOMS
+  // and warmed in the background — it no longer beams you mid-connect. You
+  // enter from the list once the room reads READY.
   if (accessUseBtn && accessInput) {
-    accessUseBtn.addEventListener('click', async () => {
+    accessUseBtn.addEventListener('click', () => {
       const raw = accessInput.value.trim();
       if (!raw) {
         setAccessFeedback('Paste a pass first.');
         return;
       }
-      // Pre-flight decode so a bad paste fails fast, without a fade cycle
-      // (performRoomSwap re-decodes — cheap, and it keeps the swap core
-      // self-contained against other callers).
-      if (!decodeBootstrapInput(raw)) {
-        setAccessFeedback('Invalid pass — paste a room link or seed.');
+      const result = addPass(raw);
+      if (!result.ok) {
+        setAccessFeedback(result.error);
         return;
       }
-      // Review fix (#52): a beam FAILURE while the adapter choreography owns
-      // the avatar leaves the door machine holding with nobody to resolve it
-      // (the hold's transitTo hits the beam's busy latch and returns
-      // silently) — an 8 s wedge with the vestibule's transit lights latched.
-      // Refuse the pass for the few scripted seconds instead.
-      if (world.getPlayer().isInAdapterTransit()) {
-        setAccessFeedback('Docking transit in progress — use the pass once you are through.');
-        return;
-      }
-      setAccessFeedback('Pass accepted — transporting…');
-      const result = await accessBeamTransport(raw);
-      if (result === 'busy') {
-        setAccessFeedback('A transit is already in progress — try again in a moment.');
-        return;
-      }
-      if (result instanceof Error) {
-        setAccessFeedback(result instanceof StrandedOfflineError
-          ? `Transport failed — ${result.message}. No room to return to — node OFFLINE; use another pass or retry the node.`
-          : `Transport failed — ${result.message}. Returned to your room.`);
-        return;
-      }
-      setAccessFeedback('Transport complete. Welcome aboard.');
-      refreshAccessRoomRow();
+      accessInput.value = '';
+      setAccessFeedback(`Added ${result.roomId} — loading in the background…`);
     });
   }
+
+  renderPassesList();
+  subscribePasses(renderPassesList);
 
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
@@ -1920,6 +1920,105 @@ function refreshAccessRoomRow(): void {
   }
   nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Lobby';
   idEl.textContent = activeBootstrap?.roomId ?? 'furlong-lobby';
+}
+
+// ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────
+
+/** Enter a room from its pass — the ACCESS beam, now fast because a READY
+ *  room is already warm on the node (no minutes-long re-dial). Also the DEV
+ *  "jump now" path (immediate, before READY). */
+async function enterRoomFromPass(seed: string): Promise<void> {
+  const setAccessFeedback = (msg: string) => {
+    const el = document.getElementById('access-feedback');
+    if (el) el.textContent = msg;
+  };
+  if (world.getPlayer().isInAdapterTransit()) {
+    setAccessFeedback('Docking transit in progress — enter once you are through.');
+    return;
+  }
+  setAccessFeedback('Entering room…');
+  const result = await accessBeamTransport(seed);
+  if (result === 'busy') {
+    setAccessFeedback('A transit is already in progress — try again in a moment.');
+    return;
+  }
+  if (result instanceof Error) {
+    setAccessFeedback(result instanceof StrandedOfflineError
+      ? `Entry failed — ${result.message}. No room to return to — node OFFLINE.`
+      : `Entry failed — ${result.message}. Returned to your room.`);
+    return;
+  }
+  setAccessFeedback('Welcome aboard.');
+  refreshAccessRoomRow();
+}
+
+function passStatusLabel(state: PassState): string {
+  switch (state) {
+    case 'connecting': return '<span class="access-room-spinner"></span>CONNECTING…';
+    case 'loading': return '<span class="access-room-spinner"></span>LOADING…';
+    case 'ready': return 'READY';
+    case 'current': return 'YOU ARE HERE';
+    case 'offline': return 'NODE OFFLINE';
+  }
+}
+
+function renderPassesList(): void {
+  const container = document.getElementById('access-rooms-list');
+  if (!container) return;
+  const items = listPasses();
+  if (items.length === 0) {
+    container.innerHTML = '<div id="access-rooms-empty">No rooms yet — add a pass above.</div>';
+    return;
+  }
+  container.textContent = '';
+  for (const pass of items) {
+    const state = passState(pass.roomId);
+    const row = document.createElement('div');
+    row.className = `access-room-item is-${state}`;
+    row.setAttribute('role', 'listitem');
+
+    const info = document.createElement('div');
+    info.className = 'access-room-info';
+    const title = document.createElement('div');
+    title.className = 'access-room-title';
+    title.textContent = pass.name || pass.roomId;
+    title.title = pass.roomId;
+    const status = document.createElement('div');
+    status.className = 'access-room-status';
+    status.innerHTML = passStatusLabel(state);
+    info.append(title, status);
+
+    const actions = document.createElement('div');
+    actions.className = 'access-room-actions';
+    if (state !== 'current') {
+      const enter = document.createElement('button');
+      enter.className = 'access-room-btn' + (state === 'ready' ? '' : ' is-disabled');
+      enter.textContent = 'ENTER';
+      enter.setAttribute('aria-label', `Enter ${pass.name}`);
+      if (state === 'ready') {
+        enter.addEventListener('click', () => void enterRoomFromPass(pass.seed));
+      }
+      actions.append(enter);
+      // DEV escape hatch: jump immediately, before the room finishes loading.
+      const jump = document.createElement('button');
+      jump.className = 'access-room-btn access-room-dev';
+      jump.textContent = 'JUMP';
+      jump.title = 'DEV: jump immediately (before READY)';
+      jump.setAttribute('aria-label', `DEV jump to ${pass.name} now`);
+      jump.addEventListener('click', () => void enterRoomFromPass(pass.seed));
+      actions.append(jump);
+    }
+
+    const remove = document.createElement('button');
+    remove.className = 'access-room-remove';
+    remove.textContent = '✕';
+    remove.title = 'Remove this pass';
+    remove.setAttribute('aria-label', `Remove pass for ${pass.name}`);
+    remove.addEventListener('click', () => removePass(pass.roomId));
+
+    row.append(info, actions, remove);
+    container.append(row);
+  }
 }
 
 function encodeBootstrapSeed(boot: RoomBootstrap): string {

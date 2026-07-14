@@ -920,6 +920,99 @@
         line-height: 1.4;
       }
 
+      /* MY ROOMS list (issue #60 staged room-list) */
+      #access-rooms-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      #access-rooms-empty {
+        font-size: 9px;
+        color: rgba(224, 226, 238, 0.35);
+        letter-spacing: 0.5px;
+        padding: 2px 0;
+      }
+      .access-room-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 9px;
+        border: 1px solid rgba(0, 212, 255, 0.18);
+        border-radius: 7px;
+        background: rgba(0, 212, 255, 0.05);
+      }
+      .access-room-item.is-ready { border-color: rgba(0, 230, 118, 0.4); background: rgba(0, 230, 118, 0.07); }
+      .access-room-item.is-current { border-color: rgba(212, 168, 75, 0.5); background: rgba(212, 168, 75, 0.08); }
+      .access-room-item.is-offline { border-color: rgba(255, 23, 68, 0.35); }
+      .access-room-info { flex: 1; min-width: 0; }
+      .access-room-title {
+        font-size: 11px;
+        font-weight: 700;
+        color: #e0e2ee;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .access-room-status {
+        font-size: 8.5px;
+        letter-spacing: 0.6px;
+        text-transform: uppercase;
+        color: rgba(224, 226, 238, 0.5);
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .access-room-item.is-ready .access-room-status { color: rgba(0, 230, 118, 0.85); }
+      .access-room-item.is-current .access-room-status { color: rgba(212, 168, 75, 0.9); }
+      .access-room-item.is-offline .access-room-status { color: rgba(255, 23, 68, 0.8); }
+      /* Vestibule-style loading spinner (cyan cycling ring) */
+      .access-room-spinner {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        border: 2px solid rgba(0, 212, 255, 0.25);
+        border-top-color: rgba(0, 212, 255, 0.9);
+        animation: access-spin 0.7s linear infinite;
+        flex: 0 0 auto;
+      }
+      @keyframes access-spin { to { transform: rotate(360deg); } }
+      .access-room-actions { display: flex; gap: 5px; flex: 0 0 auto; }
+      .access-room-btn {
+        font-family: inherit;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        padding: 5px 9px;
+        border-radius: 6px;
+        border: 1px solid rgba(0, 230, 118, 0.5);
+        background: rgba(0, 230, 118, 0.14);
+        color: #e0e2ee;
+        cursor: pointer;
+      }
+      .access-room-btn:hover { background: rgba(0, 230, 118, 0.24); }
+      .access-room-btn.is-disabled {
+        opacity: 0.4;
+        cursor: default;
+        border-color: rgba(224, 226, 238, 0.2);
+        background: rgba(224, 226, 238, 0.05);
+      }
+      .access-room-btn.access-room-dev {
+        border-color: rgba(212, 168, 75, 0.45);
+        background: rgba(212, 168, 75, 0.12);
+      }
+      .access-room-btn.access-room-dev:hover { background: rgba(212, 168, 75, 0.22); }
+      .access-room-remove {
+        border: none;
+        background: none;
+        color: rgba(224, 226, 238, 0.35);
+        font-size: 13px;
+        line-height: 1;
+        cursor: pointer;
+        padding: 2px 4px;
+        flex: 0 0 auto;
+      }
+      .access-room-remove:hover { color: rgba(255, 23, 68, 0.85); }
+
       /* Scrollable Message Box */
       #chat-messages-container {
         flex: 1;
