@@ -1380,6 +1380,12 @@ export class Player {
     return this.doorPhase;
   }
 
+  /** Public mirror of _inAdapterTransit for UI gates (#52 review): true while
+   *  the adapter-transit choreography owns the avatar. */
+  isInAdapterTransit(): boolean {
+    return this._inAdapterTransit();
+  }
+
   /**
    * Door involved in the ACTIVE walk-through/transit sequence, or null (#51 —
    * the camera-facing door fade restores full opacity on a door while the

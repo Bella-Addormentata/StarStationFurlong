@@ -1316,17 +1316,22 @@ export class World {
   /**
    * Arrival half of the ACCESS-app pass transport (#52, dev phase): no door
    * choreography at all — force-release any live device focus / edit session
-   * (a hard scene change, same rule as startMorph and beginTransit), tear
-   * down a stray transit vestibule (a pass can be used mid door-walk; the
-   * interrupted leg must not leak its tube), and materialize the avatar at
-   * the room's default spawn in MANUAL control. The transit curtain covers
-   * all of it. FUTURE: retires with the dev phase once passes become map
-   * pins + access permissions (see accessBeamTransport in main.ts).
+   * (a hard scene change, same rule as startMorph and beginTransit), end any
+   * in-flight transit on the vestibule (a pass can be used mid door-walk; the
+   * interrupted leg must not leave 'cycling' lights or the forced-solid latch
+   * behind — post-#51 the vestibule itself belongs to the door PAIRING and
+   * survives the beam), and materialize the avatar at the room's default
+   * spawn in MANUAL control. The transit curtain covers all of it.
+   * FUTURE: retires with the dev phase once passes become map pins + access
+   * permissions (see accessBeamTransport in main.ts).
+   * NOTE: anything focused here that binds the room doc directly must follow
+   * the per-join rebind seam (players/chat/games do) — focus survives to
+   * arrival, and on a FAILED beam it survives a full leave+rejoin.
    */
   public completeAccessBeamIn(): void {
     deviceFocus.forceRelease();
     roomEdit.forceExit();
-    this.disposeTransitVestibule();
+    this.endTransitVestibule();
     this.player.beamTo(0, 1.5); // the Player constructor's spawn point
   }
 

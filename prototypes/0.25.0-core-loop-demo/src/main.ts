@@ -718,6 +718,11 @@ function transitFadeTo(opaque: boolean): Promise<void> {
  *  the restore failed). */
 type RoomSwapResult = 'ok' | 'busy' | Error;
 
+/** A swap failure that ALSO left us with no room at all (the pass was used
+ *  before the first join completed, or the departure-room rejoin failed):
+ *  the HUD shows OFFLINE and callers must not claim "returned to your room". */
+class StrandedOfflineError extends Error {}
+
 /** Per-caller choreography hooks for performRoomSwap. Both run while the
  *  transit curtain is fully opaque. */
 interface RoomSwapChoreography {
@@ -803,6 +808,7 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
   } catch (err) {
     console.warn('Room swap failed — restoring the departure room:', err);
     await transitFadeTo(true); // no-op visually if already opaque
+    let stranded = false;
     if (leftOriginalRoom) {
       // Tear down whatever half-open session the failed join left behind
       // (idempotent), then re-dock to the original room — local and fast.
@@ -815,12 +821,21 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
           await leaveRoom();
           updateHUDNode('OFFLINE', '#ff1744');
           updateHUDP2P('OFFLINE', '#ff1744');
+          stranded = true;
         }
+      } else {
+        // No departure room existed (pass used before the first join
+        // completed / bootstrap never succeeded) — we are genuinely roomless
+        // now; say so on the HUD instead of pretending a restore happened.
+        updateHUDNode('OFFLINE', '#ff1744');
+        updateHUDP2P('OFFLINE', '#ff1744');
+        stranded = true;
       }
     }
     choreography.fail();
     await transitFadeTo(false);
-    return err instanceof Error ? err : new Error(String(err));
+    const failure = err instanceof Error ? err : new Error(String(err));
+    return stranded ? new StrandedOfflineError(failure.message) : failure;
   } finally {
     transitInProgress = false;
   }
@@ -1260,6 +1275,15 @@ function setupSpacePhoneOverlay() {
         setAccessFeedback('Invalid pass — paste a room link or seed.');
         return;
       }
+      // Review fix (#52): a beam FAILURE while the adapter choreography owns
+      // the avatar leaves the door machine holding with nobody to resolve it
+      // (the hold's transitTo hits the beam's busy latch and returns
+      // silently) — an 8 s wedge with the vestibule's transit lights latched.
+      // Refuse the pass for the few scripted seconds instead.
+      if (world.getPlayer().isInAdapterTransit()) {
+        setAccessFeedback('Docking transit in progress — use the pass once you are through.');
+        return;
+      }
       setAccessFeedback('Pass accepted — transporting…');
       const result = await accessBeamTransport(raw);
       if (result === 'busy') {
@@ -1267,7 +1291,9 @@ function setupSpacePhoneOverlay() {
         return;
       }
       if (result instanceof Error) {
-        setAccessFeedback(`Transport failed — ${result.message}. Returned to your room.`);
+        setAccessFeedback(result instanceof StrandedOfflineError
+          ? `Transport failed — ${result.message}. No room to return to — node OFFLINE; use another pass or retry the node.`
+          : `Transport failed — ${result.message}. Returned to your room.`);
         return;
       }
       setAccessFeedback('Transport complete. Welcome aboard.');
