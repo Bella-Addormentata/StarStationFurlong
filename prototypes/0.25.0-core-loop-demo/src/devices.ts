@@ -36,10 +36,17 @@ import {
 import type { ItemDef } from './items';
 import { loadSavedOutfitId } from './outfits';
 import type { RoomEditPermission } from './editMode';
+import {
+  initialState, legalMoves, applyMove, chooseBotMove, pieceColor, otherColor,
+  RED_KING, BLACK_KING,
+} from './games/checkers';
+import type { CheckersState, CheckersColor } from './games/checkers';
+import { readGame, writeGame, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+import { getPlayerId } from './identity';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -142,6 +149,35 @@ export interface TrunkLidHandle {
   openLid(onComplete?: () => void): void;
   /** Swing the lid closed. onComplete fires exactly once on arrival. */
   closeLid(onComplete?: () => void): void;
+  /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
+  update(deltaTime: number): void;
+}
+
+// ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
+
+/**
+ * Handle onto a game table's flippable two-face top (checkerboard / card
+ * felt). The builder (furniture.ts) stows it in the top slab's
+ * userData.gameTableTop; World collects it, drives update(dt) every frame
+ * (the trunk-lid idiom — update-loop tween, completion-signalled, never a
+ * detached rAF), and the focused UI's FLIP affordance calls flip().
+ */
+export interface GameTableTopHandle {
+  /**
+   * Start a 180° flip (lift, rotate about the long axis, settle). onComplete
+   * fires exactly once on arrival. Returns false (no-op) mid-flip.
+   */
+  flip(onComplete?: () => void): boolean;
+  /** True while the flip tween runs. */
+  isFlipping(): boolean;
+  /** True when the card-felt face is up (checkerboard face down). */
+  isCardsUp(): boolean;
+  /**
+   * Repaint the in-world checkerboard texture from a 64-cell board array
+   * (games/checkers.ts codes), or null for the bare board. Lets spectators
+   * see the live game without focusing (wall-screen hybrid idiom, §D0.4).
+   */
+  setBoard(board: number[] | null): void;
   /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
   update(deltaTime: number): void;
 }
@@ -743,6 +779,393 @@ export function createStorageTrunkUI(deps: StorageTrunkUIDeps): DeviceUI {
     update(_dt: number): void {
       // Slot state only changes through this UI in v1 (no sync, no drops) —
       // nothing to poll. TR-sync will hang its observer re-render here.
+    },
+  };
+}
+
+// ── #45 v1 game-table focused UI — flippable surface + doc-synced checkers ───
+
+export interface GameTableUIDeps {
+  /** Furniture item id — the key into the room doc's `games` map. */
+  itemId: string;
+  /**
+   * Flip/board handle of THIS table's built top (null for tables whose
+   * handle was never collected — the FLIP affordance disables itself).
+   */
+  top: GameTableTopHandle | null;
+}
+
+const GT_GOLD = '#d4a84b';
+const GT_GOLD_BRIGHT = '#F0C060';
+const GT_DIM = '#4A5560';
+
+/** DOM-board palette (mirrors the in-world texture painter in furniture.ts). */
+const DOM_SQ_LIGHT = '#EAD9B0';
+const DOM_SQ_DARK = '#7A4A28';
+const DOM_RED = '#C43C3C';
+const DOM_BLACK = '#23252E';
+
+/**
+ * The game table's focused DOM UI (#45 v1): FLIP affordance for the two-face
+ * top, and the checkers game on face A — seat claiming (first two claimants,
+ * keyed by S2 player id), click-to-move with mandatory-capture highlighting,
+ * VS BOT single-player, forfeit/reset, live spectator view. ALL game state
+ * lives in the room doc's `games` map (games/gamesDoc.ts): every transition
+ * is read → pure-engine compute → transacted write, and every repaint is
+ * observer-driven — a second tab (or a rejoin) converges from the doc alone.
+ *
+ * Honest-scope notes baked into the panel: the card face has no games yet
+ * (war/poker/solitaire arrive per brainstorming/games-plan.md), and the
+ * trivial bot only "thinks" while the RED claimant has the table focused.
+ */
+export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let boardCanvas: HTMLCanvasElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  /** Selected own-piece cell, or null. Local-only — never written to the doc. */
+  let selected: number | null = null;
+  let botTimer = 0;
+  const myId = getPlayerId();
+
+  const BOARD_CSS = 320;  // CSS px (square)
+  const BOARD_RES = 640;  // backing-store px (2x for crisp squares)
+
+  const mySeat = (s: CheckersState): CheckersColor | null =>
+    s.players.red === myId ? 'red' : s.players.black === myId ? 'black' : null;
+
+  /** May I interact with the board right now (seat + turn + not the bot's)? */
+  const myTurn = (s: CheckersState): boolean => {
+    const seat = mySeat(s);
+    return s.status === 'playing' && seat !== null && s.turn === seat
+      && !(s.bot && s.turn === 'black');
+  };
+
+  const seatLabel = (s: CheckersState, color: CheckersColor): string => {
+    if (color === 'black' && s.bot) return 'BOT';
+    const id = s.players[color];
+    if (!id) return 'OPEN';
+    const name = readPlayerDisplayName(id).toUpperCase();
+    return id === myId ? `${name} (YOU)` : name;
+  };
+
+  const statusText = (s: CheckersState): string => {
+    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT DOWN TO CLAIM A COLOR';
+    if (s.status === 'red-won') return '● RED WINS';
+    if (s.status === 'black-won') return '● BLACK WINS';
+    const who = s.turn.toUpperCase();
+    const yours = myTurn(s) ? ' — YOUR MOVE' : '';
+    const chain = s.chain !== null ? ' · MULTI-JUMP: SAME PIECE CONTINUES' : '';
+    return `${who} TO MOVE${yours}${chain}`;
+  };
+
+  // ── Doc transitions (read → pure engine → transacted write) ────────────────
+
+  const claimSeat = (color: CheckersColor): void => {
+    const s = readGame(deps.itemId) ?? initialState();
+    if (s.status !== 'waiting') return;            // claims only pre-game (v1)
+    if (s.players[color] !== null) return;         // taken (doc LWW settles races)
+    if (s.players[otherColor(color)] === myId) return; // one seat per player (v1)
+    if (s.bot && color === 'black') return;        // bot holds black
+    const players = { ...s.players, [color]: myId };
+    const status = players.red && players.black ? 'playing' as const : s.status;
+    writeGame(deps.itemId, { ...s, players, status });
+  };
+
+  const startBotGame = (): void => {
+    const s = readGame(deps.itemId) ?? initialState();
+    if (s.status !== 'waiting' || s.players.black !== null) return;
+    if (s.players.red !== null && s.players.red !== myId) return; // not alone
+    writeGame(deps.itemId, {
+      ...s,
+      players: { ...s.players, red: myId },
+      bot: true,
+      status: 'playing',
+    });
+  };
+
+  const forfeit = (): void => {
+    const s = readGame(deps.itemId);
+    if (!s || s.status !== 'playing') return;
+    const seat = mySeat(s);
+    if (!seat) return;
+    writeGame(deps.itemId, {
+      ...s,
+      status: seat === 'red' ? 'black-won' : 'red-won',
+      chain: null,
+    });
+  };
+
+  /** RESET gate: participants or the room owner mid-game; ANYONE once the
+   *  game is finished (otherwise departed winners would pin the seats). */
+  const canReset = (s: CheckersState | null): boolean => {
+    if (!s) return false;
+    if (s.status === 'red-won' || s.status === 'black-won') return true;
+    return mySeat(s) !== null || readRoomOwner() === myId;
+  };
+
+  const reset = (): void => {
+    const s = readGame(deps.itemId);
+    if (!canReset(s)) return;
+    selected = null;
+    writeGame(deps.itemId, initialState());
+  };
+
+  // ── Board rendering + click-to-move ────────────────────────────────────────
+
+  const drawBoard = (s: CheckersState | null): void => {
+    if (!boardCanvas) return;
+    const ctx = boardCanvas.getContext('2d');
+    if (!ctx) return;
+    const state = s ?? initialState();
+    const SQ = BOARD_RES / 8;
+    ctx.imageSmoothingEnabled = false;
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        ctx.fillStyle = (r + c) % 2 === 1 ? DOM_SQ_DARK : DOM_SQ_LIGHT;
+        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
+      }
+    }
+    const moves = s && myTurn(s) ? legalMoves(s) : [];
+    // Selected piece: gold frame; its legal destinations: gold dots.
+    if (selected !== null) {
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = GT_GOLD_BRIGHT;
+      ctx.strokeRect((selected % 8) * SQ + 3, Math.floor(selected / 8) * SQ + 3, SQ - 6, SQ - 6);
+      for (const m of moves) {
+        if (m.from !== selected) continue;
+        ctx.beginPath();
+        ctx.arc((m.to % 8) * SQ + SQ / 2, Math.floor(m.to / 8) * SQ + SQ / 2, SQ * 0.14, 0, Math.PI * 2);
+        ctx.fillStyle = GT_GOLD_BRIGHT;
+        ctx.fill();
+      }
+    }
+    for (let idx = 0; idx < 64; idx++) {
+      const v = state.board[idx];
+      if (v === 0) continue;
+      const red = pieceColor(v) === 'red';
+      const cx = (idx % 8) * SQ + SQ / 2;
+      const cy = Math.floor(idx / 8) * SQ + SQ / 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, SQ * 0.36, 0, Math.PI * 2);
+      ctx.fillStyle = red ? DOM_RED : DOM_BLACK;
+      ctx.fill();
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = red ? '#8E2626' : '#0E0F14';
+      ctx.stroke();
+      // Movable pieces get a soft halo on your turn (mandatory captures make
+      // "why can't I move THIS piece?" a real question — show the answer).
+      if (moves.some((m) => m.from === idx)) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, SQ * 0.44, 0, Math.PI * 2);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(240, 192, 96, 0.65)';
+        ctx.stroke();
+      }
+      if (v === RED_KING || v === BLACK_KING) {
+        ctx.fillStyle = GT_GOLD_BRIGHT;
+        ctx.font = 'bold 30px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('K', cx, cy + 2);
+      }
+    }
+  };
+
+  const onBoardClick = (e: MouseEvent): void => {
+    if (!boardCanvas) return;
+    const s = readGame(deps.itemId);
+    if (!s || !myTurn(s)) return; // spectators/off-turn: view only
+    const rect = boardCanvas.getBoundingClientRect();
+    const c = Math.floor(((e.clientX - rect.left) / rect.width) * 8);
+    const r = Math.floor(((e.clientY - rect.top) / rect.height) * 8);
+    if (r < 0 || r > 7 || c < 0 || c > 7) return;
+    const idx = r * 8 + c;
+    const moves = legalMoves(s);
+    if (selected !== null) {
+      const move = moves.find((m) => m.from === selected && m.to === idx);
+      if (move) {
+        const next = applyMove(s, move);
+        // Multi-jump: keep the chained piece selected so the continuation
+        // reads as one gesture; otherwise clear.
+        selected = next.chain;
+        writeGame(deps.itemId, next); // observer repaints
+        return;
+      }
+    }
+    // (Re)select one of my movable pieces; anything else clears.
+    selected = pieceColor(s.board[idx]) === s.turn && moves.some((m) => m.from === idx)
+      ? idx : null;
+    drawBoard(s); // selection is local — no doc write, repaint directly
+  };
+
+  // ── Panel rendering (trunk-UI idiom: re-render + re-attach on change) ──────
+
+  const render = (): void => {
+    if (!panel) return;
+    const s = readGame(deps.itemId);
+    // Prune a stale selection (an opponent/bot move landed, or a reset).
+    if (selected !== null
+      && (!s || !myTurn(s) || !legalMoves(s).some((m) => m.from === selected))) {
+      selected = s?.chain ?? null;
+    }
+    const cardsUp = deps.top?.isCardsUp() ?? false;
+    const flipping = deps.top?.isFlipping() ?? false;
+    const surface = flipping ? 'FLIPPING…' : cardsUp ? 'CARD FELT' : 'CHECKERBOARD';
+
+    const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
+      <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
+        padding: 6px 10px;
+        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
+        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
+        border-radius: 6px;
+        color: ${disabled ? GT_DIM : GT_GOLD_BRIGHT};
+        font-family: inherit;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 1.5px;
+        cursor: ${disabled ? 'not-allowed' : 'pointer'};
+        opacity: ${disabled ? '0.5' : '1'};
+      ">${label}</button>`;
+
+    const seatCell = (color: CheckersColor): string => {
+      const state = s ?? initialState();
+      const label = seatLabel(state, color);
+      const claimable = state.status === 'waiting'
+        && state.players[color] === null
+        && !(state.bot && color === 'black')
+        && state.players[otherColor(color)] !== myId;
+      const dot = color === 'red' ? DOM_RED : '#9AA3B2';
+      return `
+        <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:7px 10px;">
+          <span style="width:10px; height:10px; border-radius:50%; background:${dot}; flex:none;"></span>
+          <span style="flex:1; font-size:10px; letter-spacing:1px; color:${GT_GOLD};">${color.toUpperCase()} — ${label}</span>
+          ${claimable ? btn(`gt-sit-${color}`, 'SIT', false, `Claim ${color}`) : ''}
+        </div>`;
+    };
+
+    const state = s ?? initialState();
+    const showBot = state.status === 'waiting' && state.players.black === null
+      && (state.players.red === null || state.players.red === myId);
+    const showForfeit = state.status === 'playing' && mySeat(state) !== null;
+
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1px;">▦ GAME TABLE</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">SURFACE:</span>
+        <span style="flex:1; font-size:11px; font-weight:800; color:${GT_GOLD}; letter-spacing:1.5px;">${surface}</span>
+        ${btn('gt-flip', '⟲ FLIP TABLE', !deps.top || flipping,
+          deps.top ? 'Flip to the other playing surface' : 'This table top is not animatable')}
+      </div>
+      ${cardsUp ? `
+      <div style="display:flex; flex-direction:column; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:14px 12px; background:rgba(10,24,14,0.5);">
+        <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">♠ CARD FELT</div>
+        <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
+          NO DECK DEALT — war, two-player poker and solitaire arrive with the
+          games roadmap (brainstorming/games-plan.md). Flip back for checkers.
+        </div>
+      </div>` : `
+      <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
+        state.status === 'playing' ? GT_GOLD_BRIGHT : state.status === 'waiting' ? GT_DIM : '#00E676'
+      };">${statusText(state)}</div>
+      <div style="display:flex; gap:8px;">
+        ${seatCell('red')}
+        ${seatCell('black')}
+      </div>
+      ${showBot ? `<div>${btn('gt-bot', '⚙ VS BOT — PLAY ALONE', false, 'Start a single-player game against a trivial AI')}</div>` : ''}
+      <canvas id="gt-board" width="${BOARD_RES}" height="${BOARD_RES}"
+        style="width:${BOARD_CSS}px; height:${BOARD_CSS}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${s && myTurn(s) ? 'pointer' : 'default'};"></canvas>
+      <div style="display:flex; gap:8px; justify-content:flex-end;">
+        ${showForfeit ? btn('gt-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
+        ${btn('gt-reset', 'RESET', !canReset(s),
+          canReset(s) ? 'Clear the board and both seats' : 'Participants or the room owner reset a live game')}
+      </div>`}
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF GAME TABLE v1 · checkers (American rules, forced captures) · state synced via room doc
+      </div>
+    `;
+
+    panel.querySelector<HTMLButtonElement>('#gt-flip')?.addEventListener('click', () => {
+      if (!deps.top || deps.top.isFlipping()) return;
+      selected = null;
+      deps.top.flip(() => render()); // completion swaps the panel face
+      render();                      // immediate: show FLIPPING…
+    });
+    panel.querySelector<HTMLButtonElement>('#gt-sit-red')?.addEventListener('click', () => claimSeat('red'));
+    panel.querySelector<HTMLButtonElement>('#gt-sit-black')?.addEventListener('click', () => claimSeat('black'));
+    panel.querySelector<HTMLButtonElement>('#gt-bot')?.addEventListener('click', () => startBotGame());
+    panel.querySelector<HTMLButtonElement>('#gt-forfeit')?.addEventListener('click', () => forfeit());
+    panel.querySelector<HTMLButtonElement>('#gt-reset')?.addEventListener('click', () => reset());
+    boardCanvas = panel.querySelector<HTMLCanvasElement>('#gt-board');
+    boardCanvas?.addEventListener('click', onBoardClick);
+    drawBoard(s);
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-gametable-pane';
+      // Gold-on-dark monospace shell (room-terminal idiom), nudged above
+      // centre so the 3D tabletop stays visible under the downward gaze.
+      panel.style.cssText = `
+        position: absolute;
+        top: 46%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 420px;
+        max-height: 92vh;
+        overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        color: ${GT_GOLD};
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box;
+        pointer-events: auto;
+      `;
+      // Input capture (plan §D0.3): clicks inside the device UI never reach
+      // the canvas handler — clicks that DO reach it release the focus.
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      selected = null;
+      botTimer = 0;
+      // Observer-driven repaint: doc changes (peer moves, claims, resets,
+      // rebinds after a rejoin) re-render the whole panel from the doc.
+      unsubscribe = subscribeGames(() => render());
+      render();
+    },
+
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+      boardCanvas = null;
+    },
+
+    update(dt: number): void {
+      // Single-player bot pump: the RED claimant's client plays BLACK with a
+      // small think-delay. Runs only while this UI is mounted — the trivial
+      // bot sleeps when the table is not focused (documented v1 scope).
+      const s = readGame(deps.itemId);
+      if (s && s.bot && s.status === 'playing' && s.turn === 'black'
+        && s.players.red === myId) {
+        botTimer += dt;
+        if (botTimer >= 0.7) {
+          botTimer = 0;
+          const move = chooseBotMove(s);
+          if (move) writeGame(deps.itemId, applyMove(s, move));
+        }
+      } else {
+        botTimer = 0;
+      }
     },
   };
 }

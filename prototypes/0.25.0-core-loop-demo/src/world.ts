@@ -12,8 +12,9 @@ import { FURNITURE, buildItemGroup } from './furniture';
 import { findDoor } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import { buildVestibule, setVestibuleLightState } from './adapter';
-import { findDevice, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, readLiveRoomStatus } from './devices';
-import type { WallScreenHandle, TrunkLidHandle, DeviceTarget } from './devices';
+import { findDevice, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, readLiveRoomStatus } from './devices';
+import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
+import { subscribeGames, readGame } from './games/gamesDoc';
 import { deviceFocus } from './deviceFocus';
 import { roomEdit, canEditRoom } from './editMode';
 import { showHint } from './hud';
@@ -92,6 +93,8 @@ export class World {
   private holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }> = [];
   /** Animated trunk lids, keyed by item id (TR2 — driven every frame). */
   private trunkLids: Map<string, TrunkLidHandle> = new Map();
+  /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
+  private gameTableTops: Map<string, GameTableTopHandle> = new Map();
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -484,10 +487,30 @@ export class World {
           if (obj.userData.trunkLid) {
             this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
           }
+          // Game-table tops (#45): collect the flip/board handle from the top
+          // slab; update() drives the flip tween and the games-map mirror
+          // below repaints the in-world board face.
+          if (obj.userData.gameTableTop) {
+            this.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
+          }
         } else if (obj instanceof THREE.PointLight) {
           this.furnitureLights.push({ light: obj, targetIntensity: (obj.userData.targetIntensity as number) ?? 0 });
         }
       });
+    }
+
+    // In-world checkers mirror (#45): repaint every game table's board face
+    // from the doc-synced `games` map, so spectators see the live game
+    // without focusing (the wall-screen hybrid idiom, §D0.4). The
+    // subscription survives room rebinds — gamesDoc re-notifies on bind.
+    if (this.gameTableTops.size > 0) {
+      const repaintBoards = () => {
+        for (const [id, top] of this.gameTableTops) {
+          top.setBoard(readGame(id)?.board ?? null);
+        }
+      };
+      subscribeGames(repaintBoards);
+      repaintBoards();
     }
   }
 
@@ -852,6 +875,9 @@ export class World {
 
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
     for (const lid of this.trunkLids.values()) lid.update(deltaTime);
+
+    // Advance game-table top flips (#45 — same update-loop-driven idiom)
+    for (const top of this.gameTableTops.values()) top.update(deltaTime);
 
     // Transit vestibule honors the interior zoom-hide convention (≥3 hides
     // interior detail) — it only lives for the few seconds of a transit.
@@ -1302,6 +1328,18 @@ export class World {
         }
         : device;
       deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    if (device.kind === 'gameTable') {
+      // #45 v1: flippable surface + doc-synced checkers. The flip is a UI
+      // affordance (button), not focus choreography — no prepare hook; the
+      // top handle simply rides along so FLIP can drive the tween.
+      const ui = createGameTableUI({
+        itemId: deviceId,
+        top: this.gameTableTops.get(deviceId) ?? null,
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

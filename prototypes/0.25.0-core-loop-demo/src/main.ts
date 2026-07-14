@@ -18,6 +18,7 @@ import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
 import { roomEdit, setRoomEditPermission } from './editMode';
+import { bindGamesDoc } from './games/gamesDoc';
 
 type RendererModule = typeof import('./renderer');
 
@@ -491,6 +492,13 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // player id so a Use-link rejoin overwrites instead of duplicating.
   const playersMap = sync.doc.getMap('players');
   (window as any).__players = playersMap; // debug handle (permanent, like __setOutfit)
+
+  // Bind the shared games map (issue #45): per-table game state (checkers
+  // v1) in the room doc, keyed by game-table furniture item id. Rebinds per
+  // join like players/roomInfo/chat (T0 seam) — gamesDoc attaches its
+  // observer to the FRESH doc and re-notifies every subscriber (mounted game
+  // UIs + the in-world board mirror in world.ts).
+  bindGamesDoc(sync.doc);
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap('roomInfo');

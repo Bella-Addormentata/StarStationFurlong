@@ -26,7 +26,7 @@
 
 import * as THREE from 'three';
 import type { Seat } from './seats';
-import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle, TrunkLidHandle } from './devices';
+import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle, TrunkLidHandle, GameTableTopHandle } from './devices';
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box { x0: number; z0: number; x1: number; z1: number }
@@ -50,7 +50,8 @@ export type FurnitureKind =
   | 'blossom-pot'
   | 'wall-computer'
   | 'map-table'
-  | 'storage-trunk';
+  | 'storage-trunk'
+  | 'game-table';
 
 export interface FurnitureItem {
   id: string;
@@ -741,6 +742,221 @@ const buildStorageTrunk = (ctx: BuildCtx) => {
   };
   lidSlab.userData.trunkLid = handle; // collected by World.addLobbyFurniture
 };
+
+// ── Game table (#45 v1) — sturdy lounge table with a flippable two-face top ──
+// FACE A: 8×8 checkerboard (live CanvasTexture, NearestFilter — the wall-
+// computer screen idiom); FACE B: green card felt with a card-outline motif.
+// The top is its own sub-Group pivoted at slab centre: FLIP lifts it, rotates
+// 180° about the long (x) axis and settles — update-loop tween with a
+// completion callback, exactly the trunk-lid idiom (never a detached rAF).
+// The builder stows a GameTableTopHandle in the slab's userData.gameTableTop;
+// World collects it, drives update(dt), and repaints the board face from the
+// doc-synced game state so spectators see the live game in-world.
+const GT_TOP_Y = 0.78;     // top pivot height (slab centre)
+const GT_FLIP_TIME = 0.9;  // seconds for the 180° flip
+const GT_FLIP_LIFT = 0.5;  // peak lift — the swinging slab clears the apron
+
+// Checkerboard palette (warm frontier family)
+const GT_SQ_LIGHT = '#EAD9B0';
+const GT_SQ_DARK = '#7A4A28';
+const GT_FRAME = '#4A2F1B';
+const GT_RED = '#C43C3C';
+const GT_RED_RIM = '#8E2626';
+const GT_BLACK = '#23252E';
+const GT_BLACK_RIM = '#0E0F14';
+const GT_CROWN = '#F0C060';
+
+/** Board-face painter shared by the builder (in-world texture). Kept board-
+ *  code-compatible with games/checkers.ts (1/2 red man/king, 3/4 black). */
+function drawCheckerboard(c2d: CanvasRenderingContext2D, board: number[] | null): void {
+  const S = 512, PAD = 32, SQ = (S - PAD * 2) / 8; // 56 px squares
+  c2d.imageSmoothingEnabled = false;
+  c2d.fillStyle = GT_FRAME;
+  c2d.fillRect(0, 0, S, S);
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      c2d.fillStyle = (r + c) % 2 === 1 ? GT_SQ_DARK : GT_SQ_LIGHT;
+      c2d.fillRect(PAD + c * SQ, PAD + r * SQ, SQ, SQ);
+    }
+  }
+  if (!board) return;
+  for (let idx = 0; idx < 64; idx++) {
+    const v = board[idx];
+    if (v === 0) continue;
+    const red = v === 1 || v === 2;
+    const king = v === 2 || v === 4;
+    const cx = PAD + (idx % 8) * SQ + SQ / 2;
+    const cy = PAD + Math.floor(idx / 8) * SQ + SQ / 2;
+    c2d.beginPath();
+    c2d.arc(cx, cy, SQ * 0.36, 0, Math.PI * 2);
+    c2d.fillStyle = red ? GT_RED : GT_BLACK;
+    c2d.fill();
+    c2d.lineWidth = 4;
+    c2d.strokeStyle = red ? GT_RED_RIM : GT_BLACK_RIM;
+    c2d.stroke();
+    if (king) {
+      c2d.fillStyle = GT_CROWN;
+      c2d.font = 'bold 26px monospace';
+      c2d.textAlign = 'center';
+      c2d.textBaseline = 'middle';
+      c2d.fillText('K', cx, cy + 1);
+    }
+  }
+}
+
+/** One-shot card-felt face: green baize, darker border, two card outlines +
+ *  centre pips. Motif is 180°-rotation-symmetric on purpose — the face is
+ *  only ever seen after a flip, so no text that could read upside down. */
+function drawCardFelt(c2d: CanvasRenderingContext2D): void {
+  const W = 512, H = 256;
+  c2d.imageSmoothingEnabled = false;
+  c2d.fillStyle = '#14532D';
+  c2d.fillRect(0, 0, W, H);
+  c2d.fillStyle = '#1B6B3A';
+  c2d.fillRect(10, 10, W - 20, H - 20);
+  c2d.strokeStyle = '#0E3B20';
+  c2d.lineWidth = 4;
+  c2d.strokeRect(20, 20, W - 40, H - 40);
+  // Two card outlines, mirrored about the centre (rotation-symmetric)
+  const card = (x: number, y: number) => {
+    c2d.strokeStyle = 'rgba(240, 240, 230, 0.75)';
+    c2d.lineWidth = 3;
+    const w = 64, h = 92, rr = 8;
+    c2d.beginPath();
+    c2d.moveTo(x + rr, y);
+    c2d.arcTo(x + w, y, x + w, y + h, rr);
+    c2d.arcTo(x + w, y + h, x, y + h, rr);
+    c2d.arcTo(x, y + h, x, y, rr);
+    c2d.arcTo(x, y, x + w, y, rr);
+    c2d.closePath();
+    c2d.stroke();
+  };
+  card(W / 2 - 64 - 22, H / 2 - 46);
+  card(W / 2 + 22, H / 2 - 46);
+  // Centre diamond pip pair
+  c2d.fillStyle = 'rgba(240, 240, 230, 0.55)';
+  for (const dy of [-6, 6]) {
+    c2d.beginPath();
+    c2d.moveTo(W / 2, H / 2 + dy - 10);
+    c2d.lineTo(W / 2 + 8, H / 2 + dy);
+    c2d.lineTo(W / 2, H / 2 + dy + 10);
+    c2d.lineTo(W / 2 - 8, H / 2 + dy);
+    c2d.closePath();
+    c2d.fill();
+  }
+}
+
+const buildGameTable = (ctx: BuildCtx) => {
+  const { m, place, attach } = ctx;
+
+  // ── Fixed base: apron + four sturdy legs + low stretcher shelf (WOOD family)
+  place(new THREE.BoxGeometry(1.50, 0.14, 0.62), m(WOOD, 0.55, 0.15), 0, 0.62, 0);       // apron
+  place(new THREE.BoxGeometry(1.40, 0.04, 0.50), m(WOOD, 0.60, 0.12), 0, 0.16, 0);       // stretcher
+  ([[-0.72, -0.30], [-0.72, 0.30], [0.72, -0.30], [0.72, 0.30]] as [number, number][]).forEach(([lx, lz]) => {
+    place(new THREE.BoxGeometry(0.12, 0.62, 0.12), m(DKWOOD, 0.55, 0.18), lx, 0.31, lz); // leg
+    place(new THREE.BoxGeometry(0.15, 0.04, 0.15), m(WOOD, 0.50, 0.20), lx, 0.02, lz);   // foot
+  });
+
+  // ── Flippable top: sub-Group pivoted at the slab centre
+  const top = new THREE.Group();
+  top.name = 'gameTableTop';
+  top.position.set(0, GT_TOP_Y, 0);
+  attach(top);
+
+  const addTop = (geo: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number): THREE.Mesh => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    top.add(mesh);
+    return mesh;
+  };
+  const slab = addTop(new THREE.BoxGeometry(1.76, 0.07, 0.86), m(WOOD, 0.45, 0.20), 0, 0, 0);
+  // Thin darker edge band so the flip reads even from far away
+  addTop(new THREE.BoxGeometry(1.80, 0.024, 0.90), m(0xA06A32, 0.50, 0.18), 0, 0, 0);
+
+  // FACE A — checkerboard CanvasTexture (NearestFilter, wall-screen idiom).
+  const boardCv = document.createElement('canvas');
+  boardCv.width = 512; boardCv.height = 512;
+  const boardC2d = boardCv.getContext('2d')!;
+  const boardTex = new THREE.CanvasTexture(boardCv);
+  boardTex.minFilter = THREE.NearestFilter;
+  boardTex.magFilter = THREE.NearestFilter;
+  boardTex.generateMipmaps = false;
+  boardTex.colorSpace = THREE.SRGBColorSpace;
+  drawCheckerboard(boardC2d, null); // bare board until a game exists
+  const boardMat = new THREE.MeshBasicMaterial({ map: boardTex, transparent: true, opacity: 0 });
+  // rotateX(-π/2) faces +y; the extra rotateY(π) points texture-up AWAY from
+  // the device front (-z), so board row 0 (black home) reads at the far side
+  // for the focused viewer — matching the DOM board's fixed orientation.
+  const boardGeo = new THREE.PlaneGeometry(0.74, 0.74);
+  boardGeo.rotateX(-Math.PI / 2);
+  boardGeo.rotateY(Math.PI);
+  addTop(boardGeo, boardMat, 0, 0.037, 0);
+
+  // FACE B — card felt, facing -y until a flip brings it up.
+  const feltCv = document.createElement('canvas');
+  feltCv.width = 512; feltCv.height = 256;
+  drawCardFelt(feltCv.getContext('2d')!);
+  const feltTex = new THREE.CanvasTexture(feltCv);
+  feltTex.minFilter = THREE.NearestFilter;
+  feltTex.magFilter = THREE.NearestFilter;
+  feltTex.generateMipmaps = false;
+  feltTex.colorSpace = THREE.SRGBColorSpace;
+  const feltMat = new THREE.MeshBasicMaterial({ map: feltTex, transparent: true, opacity: 0 });
+  const feltGeo = new THREE.PlaneGeometry(1.55, 0.72);
+  feltGeo.rotateX(Math.PI / 2);  // face -y
+  feltGeo.rotateY(Math.PI);      // texture-up lands away from the viewer post-flip
+  addTop(feltGeo, feltMat, 0, -0.037, 0);
+
+  // ── Flip tween: constant-duration smoothstep rotation about the long (x)
+  //    axis with a sine lift, driven from World.update (trunk-lid idiom).
+  let flipT = 1;               // 1 = at rest
+  let fromAngle = 0;
+  let toAngle = 0;
+  let cardsUp = false;
+  let pendingComplete: (() => void) | null = null;
+
+  const handle: GameTableTopHandle = {
+    flip(onComplete?: () => void): boolean {
+      if (flipT < 1) return false; // one flip at a time
+      fromAngle = toAngle;
+      toAngle = fromAngle + Math.PI;
+      flipT = 0;
+      pendingComplete = onComplete ?? null;
+      return true;
+    },
+    isFlipping(): boolean {
+      return flipT < 1;
+    },
+    isCardsUp(): boolean {
+      return cardsUp;
+    },
+    setBoard(board: number[] | null): void {
+      drawCheckerboard(boardC2d, board);
+      boardTex.needsUpdate = true;
+    },
+    update(deltaTime: number): void {
+      if (flipT >= 1) return;
+      flipT = Math.min(1, flipT + Math.max(0, deltaTime) / GT_FLIP_TIME);
+      const s = flipT * flipT * (3 - 2 * flipT); // smoothstep
+      top.rotation.x = fromAngle + (toAngle - fromAngle) * s;
+      top.position.y = GT_TOP_Y + Math.sin(Math.PI * flipT) * GT_FLIP_LIFT;
+      if (flipT >= 1) {
+        toAngle = toAngle % (Math.PI * 2); // keep the accumulator bounded
+        fromAngle = toAngle;
+        top.rotation.x = toAngle;
+        top.position.y = GT_TOP_Y;
+        cardsUp = !cardsUp;
+        if (pendingComplete) {
+          const cb = pendingComplete;
+          pendingComplete = null; // exactly once
+          cb();
+        }
+      }
+    },
+  };
+  slab.userData.gameTableTop = handle; // collected by World.addLobbyFurniture
+};
+
 // ── Definitions ───────────────────────────────────────────────────────────────
 const armchairLeftSeats: SeatTemplate[] = [{
   clickBox: { x0: -0.50, z0: -0.50, x1: 0.50, z1: 0.50 },
@@ -837,6 +1053,25 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.3, z: 0 },
     },
   },
+  // Flippable game table (#45 v1): footprint 2×1 — a real obstacle. Device
+  // template in the local rot-0 frame; the top's open side is -z:
+  //  - front 0.5 m beyond the -z footprint edge; faceAngle 0 = facing TOWARD
+  //    the table (+z locally — toward-the-device convention, like the others)
+  //  - eye above the front edge (y 1.55), anchor at the board centre on the
+  //    top surface (y ≈ 0.82) — a downward gaze onto the playing face.
+  'game-table': {
+    kind: 'game-table',
+    build: buildGameTable,
+    footprint: { w: 2, d: 1 },
+    functions: ['gameTable'],
+    device: {
+      kind: 'gameTable',
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.55, z: -0.95 },
+      anchor: { x: 0, y: 0.82, z: 0 },
+    },
+  },
 };
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
@@ -903,6 +1138,18 @@ export const FURNITURE: FurnitureItem[] = [
   // back coffee table (x[-1,1] z[-4,-3]). rot 0 = latch face toward +z (into
   // the room); front point (-2.5, -3.5) is a walkable aisle cell.
   { id: 'storage-trunk',         kind: 'storage-trunk',      pos: { x: -2.5,  z: -4.5 }, rot: 0, movable: true },
+  // Flippable game table (#45 v1) on the south wall, west of the south door:
+  // AABB x[-5,-3] z[5,6], EDGE-FLUSH with the south wall (z=6) so no wall-side
+  // sliver exists. Spot chosen against the wedge-trap rule documented on the
+  // map-table above (grid bakes RAW boxes, player collides with PLAYER_R-
+  // inflated ones): the nearest obstacle, lamp-table-front-left (x[-5,-4]
+  // z[3,4]), is a full 1 m away in z — the z[4,5] band between them stays
+  // physically passable everywhere (no sub-0.76 m residual), and the corner
+  // pocket x[-6,-5] z[4,6] keeps its wide-open east mouth. Clear of the south
+  // door (posts/click box |x|≤1.0 — our x1=-3) and of the sofa-front AABB
+  // (x[-1.5,1.5] z[3,4]). Front point (-4, 4.5) is open aisle floor; parity:
+  // w=2 even → x integer, d=1 odd → z at n+0.5. Overlaps dev-asserted below.
+  { id: 'game-table',            kind: 'game-table',         pos: { x: -4.0,  z:  5.5 }, rot: 0, movable: true },
 ];
 // ── TR2 dev-assert: trunk placement must be clear of every other obstacle ────
 // Dev-only (plan §TR1 "dev-assert against OBSTACLES at build"). Scoped to the
@@ -926,6 +1173,7 @@ function assertPlacementClear(itemId: string): void {
 }
 if (import.meta.env.DEV) assertPlacementClear('storage-trunk');
 if (import.meta.env.DEV) assertPlacementClear('map-table');
+if (import.meta.env.DEV) assertPlacementClear('game-table');
 
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
