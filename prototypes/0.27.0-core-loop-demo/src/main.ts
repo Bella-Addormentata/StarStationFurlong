@@ -36,6 +36,9 @@ import {
   initDirectMessages, openDm, sendMessage, readMessages, closeDm,
   dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
 } from './directMessages';
+import {
+  initPeerStore, recordPeer, hintsFor, peerCount, listPeers, subscribePeers,
+} from './peerStore';
 
 type RendererModule = typeof import('./renderer');
 
@@ -69,6 +72,8 @@ const networkProvider = new NetworkProvider();
 };
 // DM pair-derivation debug hook (deterministic room/key from a peer pubkey).
 (window as any).__ssfDM = { roomIdFor: dmRoomIdFor, roomKeyFor: dmRoomKeyFor };
+// 🕸️ Mesh peer-store debug hook (§7 M1).
+(window as any).__ssfMesh = { count: () => peerCount(), list: () => listPeers(), hintsFor };
 let yjsSync: YjsSync | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
@@ -585,6 +590,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       myHints: () => (localFingerprint ? getLocalNodeHint(localFingerprint) : null),
     });
     initDirectMessages({ resolve: resolveBridgeBootstrap, myName: () => getPlayerName() });
+    // 🕸️ Mesh peer store (§7 M1): harvest every contact/friend into the durable
+    // trust-weighted pool, and re-harvest whenever contacts change.
+    initPeerStore({ selfPub: () => getIdentityPub() });
+    harvestContactsIntoMesh();
+    subscribeContacts(harvestContactsIntoMesh);
   }
   setActivePassRoom(boot.roomId);
 
@@ -664,6 +674,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   playersMap.observe((_event) => {
     renderPhonePlayersList();
     updateRoomUI();
+    harvestRoomPlayersIntoMesh(playersMap);
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -2137,8 +2148,10 @@ function setupContactsApp(): void {
   document.getElementById('contacts-friends-list')?.addEventListener('click', onListClick);
   document.getElementById('contacts-all-list')?.addEventListener('click', onListClick);
 
-  // Keep the app live while it (or anything) mutates the contacts store.
+  // Keep the app live while it (or anything) mutates the contacts store or the
+  // mesh peer store (room harvest densifies the mesh while you're in a room).
   subscribeContacts(() => { if (isContactsAppOpen()) refreshContactsApp(); });
+  subscribePeers(() => { if (isContactsAppOpen()) refreshContactsApp(); });
 }
 
 function isContactsAppOpen(): boolean {
@@ -2182,12 +2195,47 @@ function refreshContactsApp(): void {
       ? all.map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend })).join('')
       : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
   }
+  const meshNote = document.getElementById('contacts-mesh-note');
+  if (meshNote) {
+    const n = peerCount();
+    const routable = listPeers().filter((p) => p.hints != null).length;
+    meshNote.textContent = n
+      ? `${n} peer${n === 1 ? '' : 's'} known · ${routable} with a live route. Every verified identity you meet strengthens the network.`
+      : 'Every verified identity you meet strengthens the peer network.';
+  }
 }
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (ch) => (
     ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;'
   ));
+}
+
+/** 🕸️ Mesh harvest (§7 M1): fold every contact/friend into the peer store.
+ *  Friends outrank plain contacts; hints (reachability) carry through. */
+function harvestContactsIntoMesh(): void {
+  for (const c of listContacts()) {
+    recordPeer({
+      pub: c.pub,
+      name: c.name,
+      hints: (c.hints as RoomMemberHint | undefined) ?? null,
+      trust: c.friend ? 'friend' : 'contact',
+    });
+  }
+}
+
+/** 🕸️ Mesh harvest (§7 M1): fold room co-members into the peer store — but
+ *  ONLY those whose name↔key self-cert verifies (an unverified keyB64 is an
+ *  untrusted claim anyone could write into the map). A room encounter carries
+ *  identity, not a route, so it seeds the graph at 'room' trust until a card or
+ *  introduction supplies reachability. */
+function harvestRoomPlayersIntoMesh(players: { forEach: (cb: (v: unknown) => void) => void }): void {
+  players.forEach((value) => {
+    const e = value as Partial<PlayerEntry>;
+    if (e.keyB64 && e.keySig && e.name && verifyNameCert(e.name, e.keyB64, e.keySig)) {
+      recordPeer({ pub: e.keyB64, name: e.name, hints: null, trust: 'room' });
+    }
+  });
 }
 
 // ── 💬 Direct-message overlay (keyed identity §8) ────────────────────────────
@@ -2258,7 +2306,9 @@ function openDirectMessage(pub: string): void {
   setDmStatus('connecting');
   (document.getElementById('dm-input') as HTMLInputElement | null)?.focus();
 
-  const hints = (contact?.hints as RoomMemberHint | undefined) ?? null;
+  // Prefer the contact card's own route; fall back to the mesh peer store
+  // (§7 M1 consume) — a route another encounter/introduction supplied.
+  const hints = (contact?.hints as RoomMemberHint | undefined) ?? hintsFor(pub) ?? null;
   openDm(pub, hints).then(
     (session) => {
       if (dmActivePeer !== pub) return; // user already navigated away
