@@ -19,6 +19,7 @@ import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
+import { bindFurnitureDoc, seedFurnitureDefaults } from './furnitureDoc';
 
 type RendererModule = typeof import('./renderer');
 
@@ -533,6 +534,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // UIs + the in-world board mirror in world.ts).
   bindGamesDoc(sync.doc);
 
+  // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
+  // item id, drives world.reconcileFurniture on every change (incl. the initial
+  // sync burst that gives a joiner the host's arrangement). Rebinds per join
+  // like players/games/roomInfo (T0 seam).
+  bindFurnitureDoc(sync.doc);
+
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap('roomInfo');
   // Ownership-claim race guard (S2 review fix): `roomMap.has('owner')` runs
@@ -554,6 +561,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       roomMap.set('owner', getPlayerId());
       roomMap.set('name', boot.roomId || 'Lobby');
     });
+    // E4 (issue #60): the owner publishes the initial furniture layout so
+    // joiners converge to it. Idempotent — a no-op once the map is seeded.
+    seedFurnitureDefaults();
   }
 
   const updateRoomUI = () => {

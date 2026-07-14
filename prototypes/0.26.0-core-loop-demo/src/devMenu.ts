@@ -24,7 +24,7 @@
  *                search, outward), runs the full registration + rebake
  *                pipeline (obstacles → grid → seats → devices → replan), so
  *                the piece collides, paths, sits, focuses and edit-moves
- *                like built-in furniture. LOCAL ONLY until E4 sync.
+ *                like built-in furniture — and syncs to the room (E4).
  *  - INVENTORY : pieces removed in edit mode (#53 — roomInventory.ts store),
  *                each with a PLACE button that re-spawns through the same
  *                machinery as FURNITURE and pops the inventory entry.
@@ -49,6 +49,7 @@ import {
 import type { FurnitureItem, FurnitureKind } from './furniture';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
+import { writeFurnitureItem } from './furnitureDoc';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import {
@@ -330,6 +331,9 @@ function commitSpawn(world: World, item: FurnitureItem): void {
   rebuildSeats();
   rebuildDevices();
   world.getPlayer().onObstaclesChanged();
+  // E4 (issue #60): publish the spawned piece so it syncs to everyone. AFTER
+  // the local commit — the doc observer's reconcile then no-ops on the echo.
+  writeFurnitureItem(item);
   // A live edit session indexed the raycast targets on enter — refresh it so
   // the new piece is immediately selectable/movable.
   if (roomEdit.isEditModeActive()) {
@@ -358,7 +362,7 @@ function spawnFurniture(kind: FurnitureKind): void {
   }
   item.pos = spot;
   commitSpawn(world, item);
-  showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — local only until E4 sync.`);
+  showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — synced to the room (E4).`);
 }
 
 // ── INVENTORY: re-place furniture removed to the room inventory (#53) ────────
@@ -590,7 +594,7 @@ function buildPanel(): HTMLDivElement {
       </div>
       ${sectionHtml('ITEMS', 'into the room trunk', itemRows)}
       ${sectionHtml('OUTFITS', null, outfitRows)}
-      ${sectionHtml('FURNITURE', 'local only until E4 sync', furnitureRows)}
+      ${sectionHtml('FURNITURE', 'synced to the room (E4)', furnitureRows)}
       ${sectionHtml('INVENTORY', 'removed furniture · local only', ['<div id="dev-inventory-rows"></div>'])}
       ${sectionHtml('MODULES', null, [moduleRow])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}

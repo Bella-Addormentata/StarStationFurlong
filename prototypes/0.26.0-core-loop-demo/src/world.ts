@@ -7,12 +7,17 @@
 import * as THREE from 'three';
 import { Player } from './player';
 import { InputManager } from './input';
-import { findSeatAt } from './seats';
+import { findSeatAt, rebuildSeats } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
+import type { FurnitureItem } from './furniture';
+import { rebuildObstacles } from './obstacles';
+import { rebakeWalkableGrid } from './pathfinding';
+import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
+import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import { buildVestibule, setVestibuleLightState, setVestibuleOpacity } from './adapter';
-import { findDevice, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, readLiveRoomStatus } from './devices';
+import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
 import { deviceFocus } from './deviceFocus';
@@ -126,7 +131,13 @@ export class World {
     // Create player (will be shown after morph)
     this.player = new Player(this.scene);
     this.player.mesh.visible = false;
-    
+
+    // Furniture layout sync (issue #60 E4): reconcile the local room to the
+    // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
+    // morph) — furnitureDoc re-notifies on every room (re)bind, and reconcile
+    // is a no-op until the platform exists (empty map / no groups yet).
+    subscribeFurniture(() => this.reconcileFurniture(readAllFurniture()));
+
     console.log('✅ World initialized - Station planet ready');
   }
   
@@ -476,41 +487,9 @@ export class World {
     // (see furniture.ts). The group is positioned/rotated here, its meshes
     // feed the existing morph fade-in + zoom-hide machinery unchanged, and
     // its point lights carry their fade target in userData.targetIntensity.
+    // reveal=false: built-in items ride the morph fade-in (opacity starts 0).
     for (const item of FURNITURE) {
-      const group = buildItemGroup(item);
-      this.platformGroup.add(group);
-      this.furnitureGroups.set(item.id, group);
-      group.traverse(obj => {
-        if (obj instanceof THREE.Mesh) {
-          this.furnitureMeshes.push(obj);
-          // Wall-computer screens (M1): collect the live-redraw handle the
-          // builder stowed on the screen mesh; update() drives it at ~1 Hz.
-          if (obj.userData.wallScreen) {
-            this.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
-          }
-          // Map-table holo rings (M4): collect spin-tagged meshes; update()
-          // rotates them every frame (same collect-and-drive seam).
-          if (typeof obj.userData.holoSpin === 'number') {
-            this.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin });
-          }
-          // Storage-trunk lids (TR2): collect the animation handle the
-          // builder stowed on the lid slab; update() drives it every frame
-          // (door-slide idiom) and requestDeviceFocus wires open/close.
-          if (obj.userData.trunkLid) {
-            this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
-          }
-          // Game-table tops (#45): collect the flip/board handle from the top
-          // slab; update() drives the flip tween and the games-map mirror
-          // below repaints the in-world board face.
-          // ⚠ New per-item collection here ⇒ add the inverse delete in
-          // removeFurnitureVisuals, or removal leaves a live driven handle.
-          if (obj.userData.gameTableTop) {
-            this.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
-          }
-        } else if (obj instanceof THREE.PointLight) {
-          this.furnitureLights.push({ light: obj, targetIntensity: (obj.userData.targetIntensity as number) ?? 0 });
-        }
-      });
+      this.registerFurnitureGroup(item, false);
     }
 
     // In-world checkers mirror (#45): repaint every game table's board face
@@ -525,6 +504,145 @@ export class World {
       };
       subscribeGames(repaintBoards);
       repaintBoards();
+    }
+  }
+
+  /**
+   * Build ONE furniture item's group, add it to the platform, and collect its
+   * per-item drive handles — the shared registration used by both the initial
+   * lobby build and the E4 reconcile (issue #60). `reveal` decides opacity:
+   *  - false: the item rides the morph fade-in (materials start at opacity 0);
+   *    used for the initial build, where the morph reveals everything.
+   *  - true: reveal immediately (materials → baseOpacity, lights → target
+   *    intensity); used for a runtime add (DEV spawn, or a synced item landing
+   *    on a client already past the morph) which no fade-in will ever touch.
+   * ⚠ Every per-item collection here MUST have its inverse delete in
+   * removeFurnitureVisuals, or removal leaves a live driven handle (#45 F1).
+   */
+  private registerFurnitureGroup(item: FurnitureItem, reveal: boolean): void {
+    const group = buildItemGroup(item);
+    this.platformGroup.add(group);
+    this.furnitureGroups.set(item.id, group);
+    group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        this.furnitureMeshes.push(obj);
+        if (obj.userData.wallScreen) {
+          this.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
+        }
+        if (typeof obj.userData.holoSpin === 'number') {
+          this.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin });
+        }
+        if (obj.userData.trunkLid) {
+          this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
+        }
+        if (obj.userData.gameTableTop) {
+          this.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
+        }
+        if (reveal) {
+          const mat = obj.material as THREE.Material & { opacity: number; userData: { baseOpacity?: number } };
+          if ('opacity' in mat) mat.opacity = mat.userData.baseOpacity ?? 1;
+        }
+      } else if (obj instanceof THREE.PointLight) {
+        const targetIntensity = (obj.userData.targetIntensity as number) ?? 0;
+        this.furnitureLights.push({ light: obj, targetIntensity });
+        if (reveal) obj.intensity = targetIntensity;
+      }
+    });
+  }
+
+  /**
+   * Reconcile the local room to the shared `furniture` layout map (issue #60
+   * E4). Called from the furnitureDoc subscription on every change — including
+   * the initial sync burst that brings a joiner the host's arrangement. Diffs
+   * the desired records against the local FURNITURE registry and applies
+   * removals, adds and moves, then rebakes the pipeline ONCE.
+   *
+   * Empty map ⇒ no-op: an unseeded room (nobody has claimed/edited) keeps the
+   * identical code-default layout every client already built, so we never
+   * wipe the room to nothing while waiting for a seed that isn't coming.
+   *
+   * Self-echo safe: the owner's own edit already mutated FURNITURE + visuals
+   * before writing the doc, so its record matches local state and the diff
+   * finds nothing to do. Only genuinely-remote changes apply here.
+   */
+  public reconcileFurniture(records: Map<string, FurnitureRecord>): void {
+    if (records.size === 0) return; // unseeded — keep local defaults
+    if (this.furnitureGroups.size === 0) return; // platform not built yet
+
+    let changed = false;
+
+    // 1. Removals — local items no longer in the shared layout.
+    for (const item of [...FURNITURE]) {
+      if (records.has(item.id)) continue;
+      this.evictAndDefocusForItem(item.id);
+      this.removeFurnitureVisuals(item.id);
+      const idx = FURNITURE.findIndex((i) => i.id === item.id);
+      if (idx !== -1) FURNITURE.splice(idx, 1);
+      changed = true;
+    }
+
+    // 2. Adds + moves.
+    for (const [id, rec] of records) {
+      const existing = FURNITURE.find((i) => i.id === id);
+      if (!existing) {
+        const item: FurnitureItem = {
+          id,
+          kind: rec.kind,
+          pos: { x: rec.x, z: rec.z },
+          rot: rec.rot,
+          movable: rec.movable,
+        };
+        FURNITURE.push(item);
+        this.registerFurnitureGroup(item, /* reveal */ true);
+        changed = true;
+      } else if (existing.pos.x !== rec.x || existing.pos.z !== rec.z || existing.rot !== rec.rot) {
+        this.evictAndDefocusForItem(id);
+        existing.pos = { x: rec.x, z: rec.z };
+        existing.rot = rec.rot;
+        // A moved item sheds its hand-authored obstacle override (matches
+        // commitCarry) — the derived footprint is now the honest obstacle.
+        if (existing.footprintOverride !== undefined) delete existing.footprintOverride;
+        const group = this.furnitureGroups.get(id);
+        if (group) {
+          group.position.set(rec.x, 0, rec.z);
+          group.rotation.y = rec.rot * (Math.PI / 2);
+        }
+        changed = true;
+      }
+    }
+
+    if (!changed) return;
+
+    // Same order commitCarry/commitSpawn use: seats AND devices bake world-space
+    // fronts/poses off the fresh walkable grid, then replan in-flight nav.
+    rebuildObstacles();
+    rebakeWalkableGrid();
+    rebuildSeats();
+    rebuildDevices();
+    this.player.onObstaclesChanged();
+
+    // A live edit session indexed its raycast targets on enter; refresh it so
+    // a remotely-added piece is selectable and a removed one drops out.
+    if (roomEdit.isEditModeActive()) {
+      roomEdit.forceExit();
+      roomEdit.enter(this);
+    }
+  }
+
+  /**
+   * A remote layout change is about to move or remove item `id`. Protect the
+   * LOCAL player from being stranded on it (issue #60 E4 hazards): stand them
+   * up if seated on it, and drop a device focus anchored to it (the eye/anchor
+   * baked in world space go stale the moment it moves). Seat ids are
+   * `${itemId}:${idx}`; a device's id IS the item id (buildDeviceList).
+   */
+  private evictAndDefocusForItem(id: string): void {
+    const seatedId = this.player.getSeatedSeatId();
+    if (seatedId && seatedId.startsWith(`${id}:`)) {
+      this.player.evictFromSeat();
+    }
+    if (deviceFocus.isActive() && deviceFocus.getActiveDeviceId() === id) {
+      deviceFocus.forceRelease();
     }
   }
 
