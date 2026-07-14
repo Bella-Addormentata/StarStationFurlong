@@ -48,7 +48,8 @@ export type FurnitureKind =
   | 'rug-front'
   | 'cherry-tree'
   | 'blossom-pot'
-  | 'wall-computer';
+  | 'wall-computer'
+  | 'map-table';
 
 export interface FurnitureItem {
   id: string;
@@ -495,6 +496,62 @@ const buildWallComputer = (ctx: BuildCtx) => {
   screen.userData.wallScreen = handle; // collected by World.addLobbyFurniture
 };
 
+// ── Map table / holograph table (M4 of #33) ──────────────────────────────────
+// Sturdy dark 2×2 table (4 chunky legs + top) with a holographic disc floating
+// above it: emissive cyan plane + a slow-spinning broken emissive ring (the
+// gap is what makes the spin readable). flat() = MeshBasicMaterial, the same
+// unlit-reads-as-emissive idiom as the fireplace fire layers and wall strips.
+// The ring mesh carries userData.holoSpin (rad/s); World.addLobbyFurniture
+// collects it and World.update() drives the rotation — same collect-and-drive
+// seam as the wall computer's userData.wallScreen handle.
+const MT_TOP_Y = 0.84;   // table-top surface height
+const MT_HOLO_Y = 1.18;  // holo disc plane height
+const HOLO_CYAN = 0x00E5FF;
+
+const buildMapTable = (ctx: BuildCtx) => {
+  const { m, flat, place, addLight } = ctx;
+  const BODY = 0x232B36;   // dark gunmetal (wall-computer housing family)
+  const TRIM = 0x3D4A5E;   // bezel slate
+  const ACCENT = 0xD4A84B; // keypad gold
+
+  // Top slab + slate trim lip (footprint is 2×2; visuals inset for clearance)
+  place(new THREE.BoxGeometry(1.80, 0.10, 1.80), m(BODY, 0.55, 0.45), 0, MT_TOP_Y - 0.05, 0);
+  place(new THREE.BoxGeometry(1.86, 0.04, 1.86), m(TRIM, 0.50, 0.50), 0, MT_TOP_Y - 0.11, 0);
+  // Apron under the slab
+  place(new THREE.BoxGeometry(1.55, 0.16, 1.55), m(BODY, 0.60, 0.40), 0, MT_TOP_Y - 0.20, 0);
+  // Amber accent strip ringing the apron (gold band on the -z/player face)
+  place(new THREE.BoxGeometry(1.57, 0.035, 1.57), m(ACCENT, 0.40, 0.50), 0, MT_TOP_Y - 0.145, 0);
+  // Four chunky legs
+  ([[-0.76, -0.76], [-0.76, 0.76], [0.76, -0.76], [0.76, 0.76]] as [number, number][]).forEach(([lx, lz]) => {
+    place(new THREE.BoxGeometry(0.16, MT_TOP_Y - 0.10, 0.16), m(BODY, 0.60, 0.40), lx, (MT_TOP_Y - 0.10) / 2, lz);
+    place(new THREE.BoxGeometry(0.20, 0.05, 0.20), m(TRIM, 0.55, 0.45), lx, 0.025, lz); // foot
+  });
+
+  // Holo emitter puck at the table centre
+  place(new THREE.CylinderGeometry(0.16, 0.20, 0.06, 16), m(TRIM, 0.45, 0.55), 0, MT_TOP_Y + 0.03, 0);
+  place(new THREE.CylinderGeometry(0.10, 0.10, 0.015, 16), flat(HOLO_CYAN), 0, MT_TOP_Y + 0.065, 0);
+
+  // Holographic disc — emissive cyan plane floating above the table. The
+  // geometry is rotated flat (rotateX) so the MESH keeps identity rotation
+  // and the ring below can spin with a plain rotation.y increment.
+  const discMat = flat(HOLO_CYAN);
+  discMat.userData.baseOpacity = 0.28; // translucent hologram (morph respects it)
+  const discGeo = new THREE.CircleGeometry(0.62, 40);
+  discGeo.rotateX(-Math.PI / 2); // face +y
+  place(discGeo, discMat, 0, MT_HOLO_Y, 0);
+
+  // Slow-spinning broken emissive ring above the disc rim
+  const ringMat = flat(0x7FF3FF);
+  ringMat.userData.baseOpacity = 0.85;
+  const ringGeo = new THREE.TorusGeometry(0.55, 0.018, 8, 48, Math.PI * 1.55);
+  ringGeo.rotateX(Math.PI / 2); // lie flat in the XZ plane
+  const ring = place(ringGeo, ringMat, 0, MT_HOLO_Y + 0.05, 0);
+  ring.userData.holoSpin = 0.6; // rad/s — collected by World.addLobbyFurniture
+
+  // Faint cyan wash over the table surface
+  addLight(new THREE.PointLight(HOLO_CYAN, 0, 3.5), 0, MT_HOLO_Y + 0.4, 0, 0.9);
+};
+
 // ── Definitions ───────────────────────────────────────────────────────────────
 const armchairLeftSeats: SeatTemplate[] = [{
   clickBox: { x0: -0.50, z0: -0.50, x1: 0.50, z1: 0.50 },
@@ -557,6 +614,27 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 1.62, z: 0.06 },
     },
   },
+  // Holographic map table (M4 of #33): footprint 2×2 — a REAL obstacle (both
+  // collision and pathfinding derive from it). Device template in the local
+  // rot-0 frame:
+  //  - front 0.5 m beyond the +z footprint edge; faceAngle π = facing TOWARD
+  //    the table (-z locally — same toward-the-device convention as the
+  //    wall computer, opposite of seats)
+  //  - eye above the table edge (y 1.6, just inside the +z rim), anchor at
+  //    the holo disc centre (y ≈ 1.2) — a gentle downward gaze onto the map.
+  'map-table': {
+    kind: 'map-table',
+    build: buildMapTable,
+    footprint: { w: 2, d: 2 },
+    functions: ['mapTable'],
+    device: {
+      kind: 'mapTable',
+      front: { x: 0, z: 1.5 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.6, z: 1.15 },
+      anchor: { x: 0, y: MT_HOLO_Y, z: 0 },
+    },
+  },
 };
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
@@ -586,6 +664,18 @@ export const FURNITURE: FurnitureItem[] = [
   // Original obstacle sits one tile south of the visual (documented mismatch).
   { id: 'lamp-table-front-right', kind: 'lamp-table',        pos: { x:  4.5,  z:  3.5 }, rot: 0, movable: true,
     footprintOverride: { x0: 4.00, z0: 4.00, x1: 5.00, z1: 5.00 } },
+  // Holographic map table (#33 M4) in the fireplace-wall map nook: 2×2 box
+  // x[1,3] z[-5,-3], EDGE-FLUSH with the fireplace wall (z=-5) and the back
+  // coffee table (x=1). Flush edges matter: the A* grid bakes RAW obstacle
+  // boxes while the player collides against boxes inflated by PLAYER_R
+  // (0.38), so any sub-1.5 m gap between boxes on a through-route is
+  // grid-walkable but physically impassable — a permanent wedge trap (the
+  // first candidate spot (3,-3) trapped door/seat paths on exactly such a
+  // seam against sofa-back). Here every residual gap (east corridor x[3,4]
+  // z[-5,-3], west sliver z[-5,-4]) is a DEAD-END nook off the north wall,
+  // never a route, and the derived front (2, -2.5) sits in the open
+  // z∈(-3,-2) artery. Interior overlaps are dev-asserted below.
+  { id: 'map-table',             kind: 'map-table',          pos: { x:  2.0,  z: -4.0 }, rot: 0, movable: true },
   // Decorative items — footprint null, never obstacles.
   { id: 'rug-back',              kind: 'rug-back',           pos: { x:  0.0,  z: -2.0 }, rot: 0, movable: true },
   { id: 'rug-front',             kind: 'rug-front',          pos: { x:  0.0,  z:  3.0 }, rot: 0, movable: true },
@@ -604,6 +694,26 @@ export const FURNITURE: FurnitureItem[] = [
   // bar back-panel flush-mount plane. Footprint null ⇒ never an obstacle.
   { id: 'wall-computer',         kind: 'wall-computer',      pos: { x:  1.8,  z:  5.97 }, rot: 2, movable: false },
 ];
+
+// ── Placement dev-assert (M4): the map table must occupy a genuinely clear
+// 2×2 — its AABB interior may not intersect any other item's obstacle box.
+// Scoped to the map table only: two LEGACY boxes deliberately overlap (bar
+// strip vs front-right lamp override, preserved E1 parity), so an all-pairs
+// assert would fire on hand-authored history rather than new mistakes.
+{
+  const table = FURNITURE.find((i) => i.kind === 'map-table');
+  const a = table ? itemAabb(table) : null;
+  if (table && a) {
+    for (const other of FURNITURE) {
+      if (other === table) continue;
+      const b = itemAabb(other);
+      if (!b) continue;
+      const overlaps = a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
+      console.assert(!overlaps,
+        `[furniture] map-table footprint overlaps '${other.id}' — move one of them`);
+    }
+  }
+}
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
 

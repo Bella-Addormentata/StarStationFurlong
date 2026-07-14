@@ -114,6 +114,18 @@ let isBlinking = false;
 let blinkProgress = 0.0; // 0.0 to 1.0 (0=open, 0.5=fully closed, 1.0=fully open again)
 let pendingZoomOutAction = false;
 
+/**
+ * M-dep of #33 (diegetic-maps ruling): levels 3–8 are non-diegetic canvas
+ * fiction, deprecated in favour of in-world devices (M4 map table). zoomOut()
+ * clamps at level 2 unless `?devzoom=1` (same URL-flag pattern as ?vestibule=
+ * / ?deviceprops=). Levels 1↔2 — both ruling-compliant — keep working either
+ * way, including the first-person transition and the eyelid blink. The
+ * level 3–8 renderer below is deliberately KEPT: it stays demoable behind the
+ * flag during the transition, and world.ts's capsule show-hide at level ≥ 3
+ * remains the seed of the future exterior renderer.
+ */
+const DEVZOOM = new URLSearchParams(window.location.search).get('devzoom') === '1';
+
 export class MultiScaleZoomView {
   private overlay: HTMLDivElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
@@ -203,7 +215,7 @@ export class MultiScaleZoomView {
       text-align: center;
       transition: all 0.3s;
     `;
-    indicator.innerHTML = `LEVEL 2: ROOM VIEW (DEFAULT) <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">PRESS [-] TO OUT / [+] TO IN</span>`;
+    indicator.innerHTML = `LEVEL 2: ROOM VIEW (DEFAULT) <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>`;
     this.overlay.appendChild(indicator);
 
     // Context Sidebar details for upper views (levels >= 3)
@@ -320,6 +332,17 @@ export class MultiScaleZoomView {
     return this.currentLevel;
   }
 
+  /**
+   * Hotkey hint honouring the M-dep clamp — never advertise a dead key:
+   * without ?devzoom=1, [-] only does anything at level 1 (back to the room).
+   */
+  private zoomHintText(): string {
+    const parts: string[] = [];
+    if (DEVZOOM || this.currentLevel === 1) parts.push('[-] TO OUT');
+    if (this.currentLevel > 1) parts.push('[+] TO IN');
+    return `PRESS ${parts.join(' / ')}`;
+  }
+
   private zoomIn() {
     // Device focus owns the camera — HUD zoom buttons must not steal it
     // (the keydown path is guarded upstream; this covers the buttons).
@@ -359,6 +382,10 @@ export class MultiScaleZoomView {
         pendingZoomOutAction = true;
         return; // Pause zooming out until eyelids are fully closed at 0.5 progress
       }
+      // M-dep clamp: past level 2 lies the deprecated non-diegetic overlay —
+      // dev-flag only. The level-1 branch above never reaches this (its blink
+      // callback in tick() advances 1→2 directly), so first person is intact.
+      if (this.currentLevel >= 2 && !DEVZOOM) return;
       this.currentLevel++;
       this.updateViewContext();
     }
@@ -372,7 +399,7 @@ export class MultiScaleZoomView {
     if (ind) {
       ind.innerHTML = `
         <span style="color:#00d4ff;">LEVEL ${def.level}: ${def.name}</span>
-        <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">PRESS [-] TO OUT / [+] TO IN</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>
       `;
     }
 

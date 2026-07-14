@@ -10,7 +10,7 @@ import { InputManager } from './input';
 import { findSeatAt } from './seats';
 import { FURNITURE, buildItemGroup } from './furniture';
 import { findDoor } from './doors';
-import { findDevice, createRoomTerminalUI, readLiveRoomStatus } from './devices';
+import { findDevice, createRoomTerminalUI, createMapTableUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle } from './devices';
 import { deviceFocus } from './deviceFocus';
 import { showHint } from './hud';
@@ -65,6 +65,8 @@ export class World {
   private wallScreens: Map<string, WallScreenHandle> = new Map();
   /** Accumulator for the 1 Hz wall-screen status redraw. */
   private screenStatusTimer = 0;
+  /** Holo-ring spinners (M4 map table) — meshes tagged userData.holoSpin. */
+  private holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }> = [];
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -446,6 +448,11 @@ export class World {
           if (obj.userData.wallScreen) {
             this.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
           }
+          // Map-table holo rings (M4): collect spin-tagged meshes; update()
+          // rotates them every frame (same collect-and-drive seam).
+          if (typeof obj.userData.holoSpin === 'number') {
+            this.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin });
+          }
         } else if (obj instanceof THREE.PointLight) {
           this.furnitureLights.push({ light: obj, targetIntensity: (obj.userData.targetIntensity as number) ?? 0 });
         }
@@ -699,10 +706,12 @@ export class World {
       (wall.material as THREE.MeshStandardMaterial).opacity = eased * 0.35;
     });
 
-    // Fade in furniture to full opacity
+    // Fade in furniture to its design opacity — materials declaring a
+    // userData.baseOpacity (the map table's translucent holo disc/ring, M4)
+    // fade toward that instead of 1.0 (same contract as zoom.ts's avatar fade).
     this.furnitureMeshes.forEach(mesh => {
       const mat = mesh.material as THREE.MeshStandardMaterial | THREE.MeshBasicMaterial;
-      if ('opacity' in mat) mat.opacity = eased;
+      if ('opacity' in mat) mat.opacity = eased * ((mat.userData.baseOpacity as number) ?? 1);
     });
 
     // Fade in lobby point lights
@@ -842,6 +851,13 @@ export class World {
     // Spin the orbital rings above the platform
     if (this.orbitRingOuter) this.orbitRingOuter.rotation.y += 0.004;
     if (this.orbitRingInner) this.orbitRingInner.rotation.y -= 0.006;
+
+    // Spin the map table's holographic ring (M4) — the ring geometry is baked
+    // flat (geometry rotateX), so a plain rotation.y increment spins it about
+    // the world-up axis.
+    for (const { mesh, speed } of this.holoSpinners) {
+      mesh.rotation.y += speed * deltaTime;
+    }
   }
 
   public remotePlayers: Map<string, RemoteAvatar> = new Map();
@@ -1046,19 +1062,23 @@ export class World {
   public requestDeviceFocus(deviceId: string): void {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
-    if (device.kind !== 'roomTerminal') {
-      // Desk computer / map table / trunk UIs arrive with M3/M4/TR2.
+    if (device.kind === 'roomTerminal') {
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const ui = createRoomTerminalUI({
+        dockingSystem: this.dockingSystem,
+        getPlayerPos: () => this.player.getPosition(),
+        // Dim the in-world screen to "TERMINAL IN USE" while focused (D0.4).
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+    } else if (device.kind === 'mapTable') {
+      // M4: the solar map, diegetic — mounted inside the focus overlay.
+      const ui = createMapTableUI({ requestRelease: () => deviceFocus.release() });
+      deviceFocus.beginFocus(this.player, device, ui);
+    } else {
+      // Desk computer / trunk UIs arrive with M3/TR2.
       showHint('This device is not operational yet.');
-      return;
     }
-    const screen = this.wallScreens.get(deviceId) ?? null;
-    const ui = createRoomTerminalUI({
-      dockingSystem: this.dockingSystem,
-      getPlayerPos: () => this.player.getPosition(),
-      // Dim the in-world screen to "TERMINAL IN USE" while focused (D0.4).
-      onEngagedChange: (engaged) => screen?.setEngaged(engaged),
-    });
-    deviceFocus.beginFocus(this.player, device, ui);
   }
 
   isPlayerActive(): boolean {

@@ -11,7 +11,6 @@ import type { InputManager } from './input';
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_BYTES, type MovementTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
-import { SolarSystemMap } from './map';
 import { MultiScaleZoomView } from './zoom';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
@@ -28,8 +27,6 @@ let frameCount = 0;
 let fpsUpdateTime = 0;
 let hasEntered = false;
 let controlsHintShown = false;
-let solarSystemMap: SolarSystemMap;
-let isMapOpen = false;
 let multiScaleZoom: MultiScaleZoomView;
 
 // ── Raycasting (point-and-click navigation) ───────────────────────────────────
@@ -1559,89 +1556,17 @@ function updateHUDP2P(status: string, color: string) {
   }
 }
 
-function setupSolarMap() {
-  solarSystemMap = new SolarSystemMap();
-  solarSystemMap.mount(document.body);
-  (window as any).solarSystemMap = solarSystemMap;
-
+// M-dep of #33: the fullscreen solar-map overlay is retired — the 'm' hotkey,
+// the #solarmap-toggle-btn and the +/- HUD zoom buttons are gone. The solar
+// map now lives INSIDE the world: click the holographic map table (M4) and
+// the same SolarSystemMap mounts into the device-focus panel (devices.ts
+// createMapTableUI). Keyboard +/- zoom survives in zoom.ts, clamped at
+// level 2 unless ?devzoom=1.
+function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
   multiScaleZoom.mount(document.body);
   (window as any).multiScaleZoom = multiScaleZoom;
-
-  const toggleBtn = document.getElementById('solarmap-toggle-btn');
-  const zoomInBtn = document.getElementById('map-zoom-in-btn');
-  const zoomOutBtn = document.getElementById('map-zoom-out-btn');
-
-  const toggleMap = () => {
-    // Don't open the fullscreen map overlay while device focus owns the view
-    // (the 'm' hotkey is guarded upstream; this covers the HUD toggle button).
-    if (isDeviceFocusActive() && !isMapOpen) return;
-    isMapOpen = !isMapOpen;
-    if (isMapOpen) {
-      solarSystemMap.show();
-    } else {
-      solarSystemMap.hide();
-    }
-  };
-
-  if (toggleBtn) {
-    toggleBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleMap();
-    });
-  }
-
-  if (zoomInBtn) {
-    zoomInBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (multiScaleZoom) {
-        // Invoke standard zoom-in action via Keyboard Zoom View APIs
-        (multiScaleZoom as any).zoomIn();
-      }
-    });
-  }
-
-  if (zoomOutBtn) {
-    zoomOutBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (multiScaleZoom) {
-        // Invoke standard zoom-out action via Keyboard Zoom View APIs
-        (multiScaleZoom as any).zoomOut();
-      }
-    });
-  }
-
-  window.addEventListener('keydown', (e) => {
-    // Check if player is focused in chat input before toggling map via M/m
-    const active = document.activeElement;
-    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-      return;
-    }
-
-    // Suppress map hotkey while the SpacePhone is open (#20 shell views like
-    // home/contacts/bank hold no focused input, so the guard above no longer
-    // covers the phone-open case on its own).
-    if (document.getElementById('spacephone-container')?.classList.contains('active')) {
-      return;
-    }
-
-    // Suppress the map hotkey while a device focus owns the camera (#33
-    // D0.3 — stacked under the phone guard, mirroring zoom.ts).
-    if (isDeviceFocusActive()) {
-      return;
-    }
-
-    if (e.key === 'm' || e.key === 'M') {
-      toggleMap();
-    }
-  });
-
-  solarSystemMap.onTravelComplete((destinationId) => {
-    console.log(`[Sharding Node] Swapping direct channel to room zone: ${destinationId}`);
-    // Simulated multi-room zone sharding (v006 §8.5/§15.2)
-    logToPhoneSystem(`🛰️ Transit Complete. Connected to Zone: ${destinationId.toUpperCase()}`);
-  });
 }
 
 /**
@@ -1737,7 +1662,7 @@ async function init() {
   // Initialize input manager
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
-  setupSolarMap();
+  setupZoomView();
   
   // Single click: expand the platform and enter the lobby
   setupClickToEnter();
@@ -1905,9 +1830,8 @@ function animate() {
     world.update(deltaTime, inputManager);
   }
 
-  if (solarSystemMap) {
-    solarSystemMap.tick();
-  }
+  // (M4/M-dep: the solar map's tick moved into the map-table DeviceUI —
+  // devices.ts createMapTableUI drives it only while the table is open.)
 
   if (multiScaleZoom) {
     multiScaleZoom.tick();
