@@ -17,7 +17,7 @@ env:
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
   #   3. Commit, then push a vX.Y.Z tag as usual.
-  RELEASE_FRONTEND: prototypes/0.25.0-core-loop-demo
+  RELEASE_FRONTEND: prototypes/0.24.0-core-loop-demo
 
 jobs:
   # ── Stage 1: create ONE shared draft release ─────────────────────────────

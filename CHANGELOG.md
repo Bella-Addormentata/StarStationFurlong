@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.25.0-core-loop-demo](prototypes/0.25.0-core-loop-demo/) and is built by the
+[prototypes/0.24.0-core-loop-demo](prototypes/0.24.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,17 +9,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- In progress for Phase 2 Star Swarm features. Next queued slices (all planned in `brainstorming/`): E4 furniture sync + persistence, T2/T3 cross-node transit + pairing reciprocity (gated on a two-machine playtest), S3 presence (lane-id → player mapping unlocks name tags + remote outfits), TR-sync trunk inventories, M3 desk computer, E5 rugs, and the station-doc slice carrying the flight-control authority tree.
+
+## v0.24.0 — 2026-07-14
+
+### The Open Door — Reachability by Default + The Camera Rig
+
+_(0.24.0 was briefly marked "skipped" when the 0.25.0 line was pre-cut; the owner un-skipped it — this release pairs the camera rig with the zero-setup reachability work, and 0.25.0 follows with the next issue batch.)_
+
 - **Internet reachability by default (R1):** the node now auto-advertises its public IPv4 with **zero terminal setup** — an unset `SSF_EXTERNAL_ADDRS` behaves exactly like `auto` (resolve via HTTP echo, re-check every 5 minutes, hot-swap on ISP rotation). **This deliberately flips the v0.22.0 opt-in posture to opt-out for the demo phase** (owner decision: joining a friend's station must "just work"); the full opt-out — no third-party echo calls at all, the old default — is `SSF_EXTERNAL_ADDRS=off` (also `none`/`0`, case-insensitive). Explicit address lists keep their exact semantics, `SSF_IP_ECHO` still overrides the echo hosts, and CGNAT detection/refusal is unchanged.
 - **Live reachability status in the network panel:** the fingerprint API now carries a per-request reachability classification plus the *actually bound* iroh UDP port (so the random-port fallback shows the real port to forward). A new REACHABILITY row renders it: light-green `LIKELY OPEN — public route detected (UDP <port>)` when iroh discovered a public v4 on its own (a portmapper mapping or a peer-observed address — provenance is inferred since iroh 1.0.1 doesn't expose it publicly, so the row deliberately doesn't overclaim OPEN), amber `ADVERTISED — forward UDP <port> if joins fail` for the echo-advertised address (honest: unverified — inbound UDP can't be probed without external infra), red `CGNAT — direct dials impossible, needs relay`, red `LAN ONLY — set up UDP <port> forward`. The browser re-polls the fingerprint every 60 s, which also keeps freshly-minted invite hints current.
 - **Copy Invite pre-flight warning:** if the outgoing invite carries no internet-reachable IPv4 (and no UPnP mapping is active), the invite still copies but the panel warns inline: "⚠ This invite has no internet-reachable IPv4 — LAN/IPv6 only. Forward UDP <port> on the router (auto-advertising is on by default)." IPv4 hints deliberately stay in invite links (reliability over minimalism — DHT re-resolution keeps them refreshable).
-- In progress for Phase 2 Star Swarm features. Next queued slices (all planned in `brainstorming/`): E4 furniture sync + persistence, T2/T3 cross-node transit + pairing reciprocity (gated on a two-machine playtest), S3 presence (lane-id → player mapping unlocks name tags + remote outfits), TR-sync trunk inventories, M3 desk computer, E5 rugs, and the station-doc slice carrying the flight-control authority tree.
-
-## v0.25.0 — queued (next tag; 0.24.0 skipped by owner call)
-
-### The Camera Rig — See Every Side of the Room
-
 - **45° view rotation ([PR #48](https://github.com/Bella-Addormentata/StarStationFurlong/pull/48) + Shift-hotkey follow-up):** the room camera keeps its locked isometric elevation and radius but can now swing around the room centre in 45° detents with a ~0.3 s eased tween. Inputs: a bottom-left HUD cluster (`◀ 0° ▶`, azimuth chip between the arrows), `←`/`→`, and `Shift+<` / `Shift+>` (matched via `e.code` so bare `,`/`.` typing keys stay inert). WASD stays screen-relative at every detent ("W = up-screen"); click-to-move, edit-mode picking, seats and doors are rotation-transparent because every raycast already goes through the live camera. Zoom-level snaps (L2/L3/L4), the first-person dive, and device-focus fly-ins/outs all depart from and return to the rotated azimuth. Rotation is guarded out of first person (L1), the flat top-down maps (L5+), and any device-focus substate — the arrows dim and no-op there. New module `src/cameraRig.ts` owns the detent state; guards are dependency-injected from `main.ts` so the module stays import-cycle-free.
-- **Release line cut at 0.25.0:** `prototypes/0.25.0-core-loop-demo/` is a full copy of the 0.23.0 line including the camera rig; `RELEASE_FRONTEND` now points at it, so the next `v0.25.0` tag ships the rotation update.
+- **Release line:** `prototypes/0.24.0-core-loop-demo/` is the shipping copy (camera rig + reachability); the pre-cut `0.25.0-core-loop-demo/` folder is re-cut from it after this release and carries the next issue batch (`v0.25.0`).
 
 ## v0.23.0 — 2026-07-13
 

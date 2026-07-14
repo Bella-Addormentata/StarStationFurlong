@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StarStation Furlong - Core Loop Demo</title>
+    <link rel=stylesheet href=/src/index-inline.css />
+  </head>
+  <body>
+    <!-- Ambient corner glows -->
+    <div class="corner-glow top-left"></div>
+    <div class="corner-glow bottom-right"></div>
+    
+    <!-- 3D Canvas -->
+    <div id="app"></div>
+
+    <!-- (M4/M-dep of #33: the SOLAR MAP [M] toggle is gone — the solar map is
+         diegetic now: click the holographic map table in the lobby.) -->
+
+    <!-- Welcome overlay -->
+    <div id="welcome">
+      <div id="welcome-content">
+        <h1>STARSTATION FURLONG</h1>
+        <div class="subtitle">Phase 1 Demo</div>
+        <div class="hint" style="animation: pulse 2s ease-in-out infinite;">👆 Click to Enter</div>
+      </div>
+    </div>
+    
+    <!-- Debug HUD -->
+    <div id="debug-hud">
+      <div>
+        <span class="label">FPS</span>
+        <span class="value" id="fps">--</span>
+      </div>
+      <div>
+        <span class="label">CAM</span>
+        <span class="value">ORTHO · LOCKED</span>
+      </div>
+      <div>
+        <span class="label">POS</span>
+        <span class="value" id="position">--</span>
+      </div>
+      <div>
+        <span class="label">NAV</span>
+        <span class="value" id="navmode">MANUAL</span>
+      </div>
+      <div>
+        <span class="label">NODE</span>
+        <span class="value" id="node-status" style="color: #ff1744;">OFFLINE</span>
+      </div>
+      <div>
+        <span class="label">P2P</span>
+        <span class="value" id="p2p-status" style="color: #ff1744;">OFFLINE</span>
+      </div>
+      <div>
+        <span class="label">RTT</span>
+        <span class="value" id="rtt">-- ms</span>
+      </div>
+      <div>
+        <span class="label">LOSS</span>
+        <span class="value" id="loss">-- %</span>
+      </div>
+    </div>
+
+    <!-- Room Info HUD -->
+    <div id="room-info-hud">
+      <div class="room-info-row">
+        <span class="label">Room Name</span>
+        <span class="value" id="room-name-display" style="cursor: pointer;" title="Click to edit room name">Lobby</span>
+      </div>
+      <div class="room-info-row">
+        <span class="label">Room Owner</span>
+        <span class="value" id="room-owner-display">Local-Clone</span>
+      </div>
+    </div>
+
+    <div id="network-details-hud" class="collapsed">
+      <div class="network-details-header">
+        <span class="network-details-title">Network Details</span>
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <button id="network-retry-node-btn" style="background: rgba(0, 232, 120, 0.12); color: #00e676; border: 1px solid rgba(0, 232, 120, 0.3); border-radius: 6px; font-size: 10px; padding: 4px 8px; cursor: pointer; font-family: monospace; font-weight: 600;" title="Retry connection to local node">🔄 RETRY</button>
+          <button id="network-details-toggle" aria-label="Expand network details">▼</button>
+        </div>
+      </div>
+      <div class="network-details-body">
+        <div class="network-row">
+          <span class="label">Peers Seen</span>
+          <span class="value" id="net-peers-seen">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Ticks Recv</span>
+          <span class="value" id="net-ticks-recv">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Ping/Pong</span>
+          <span class="value" id="net-ping-pong">0/0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Datagrams</span>
+          <span class="value" id="net-datagrams">0</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Session</span>
+          <span class="value" id="net-uptime">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Iroh Dial Key</span>
+          <span class="value" id="net-iroh-key" style="font-size: 10px; color: #ffe082;">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Endpoint</span>
+          <span class="value" id="net-endpoint">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Net Type</span>
+          <span class="value" id="network-connection-type">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Address Type</span>
+          <span class="value" id="network-address-type">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Seeding</span>
+          <span class="value" id="network-seeding-status">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Reachability</span>
+          <span class="value" id="network-reachability">--</span>
+        </div>
+        <div class="network-row">
+          <span class="label">Bridge</span>
+          <span class="value" id="network-bridge-status">--</span>
+        </div>
+
+        <div class="network-link-tools">
+          <label for="network-share-link-primary" class="tool-label">Copy invite link (autogenerated by your node, no typing)</label>
+          <div class="tool-row">
+            <input type="text" id="network-share-link-primary" readonly placeholder="Invite link appears when your local node is reachable">
+            <button id="network-copy-invite-btn" type="button" aria-label="Copy room invite">Copy Invite</button>
+          </div>
+
+          <label for="network-import-link" class="tool-label">Paste reference room link</label>
+          <div class="tool-row">
+            <input type="text" id="network-import-link" placeholder="Paste link or seed">
+            <button id="network-use-link-btn" type="button">Use Link</button>
+          </div>
+
+          <details id="network-diagnostics-drawer" class="network-diagnostics-drawer">
+            <summary>Diagnostics + manual address override</summary>
+            <label for="network-bootstrap-address" class="tool-label">Optional override — reachable address friends can dial directly</label>
+            <div class="tool-row">
+              <input type="text" id="network-bootstrap-address" placeholder="e.g. 192.168.1.20 or my.ddns.net:4443" aria-label="Reachable bootstrap address override">
+              <button id="network-bootstrap-link-btn" type="button" aria-label="Generate invite using override address">Override Invite</button>
+              <button id="network-test-reach-btn" type="button" aria-label="Self-test whether your node is reachable at that address">Self-Test</button>
+            </div>
+          </details>
+
+          <div id="network-link-feedback"></div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- (M4/M-dep of #33: the HUD +/- zoom buttons are gone — keyboard +/-
+         survives in zoom.ts, clamped at level 2 unless ?devzoom=1.) -->
+
+    <!-- Phone Tip indicator box -->
+    <div id="phone-tip-indicator">📲 Press TAB or Click here to activate SpacePhone!</div>
+
+    <!-- 🌌 SpacePhone Chat Overlay Panel (GDD §2 Communication / "SpacePhone Calls") -->
+    <div id="spacephone-container">
+      <!-- Simulated Phone Bezel & Top Notch / Ear Piece -->
+      <div id="phone-bezel">
+        <div id="notch-speaker"></div>
+        <div id="notch-camera"></div>
+      </div>
+      
+      <!-- Inside Simulated Mobile Display -->
+      <div id="phone-screen">
+        <div id="phone-status-bar">
+          <span id="phone-provider" style="font-size: 10px; font-weight: 600; letter-spacing: 0.2px;">FurlongNet LTE</span>
+          <span id="phone-time" style="font-size: 10px; font-weight: 600;">12:00 PM</span>
+          <div style="display: flex; align-items: center; gap: 4px;">
+            <div id="phone-signal-bars" style="display: flex; align-items: flex-end; gap: 1px; height: 10px; width: 14px;">
+              <div style="width: 2px; height: 2px; background: rgba(255,255,255,0.2);"></div>
+              <div style="width: 2px; height: 4px; background: rgba(255,255,255,0.2);"></div>
+              <div style="width: 2px; height: 6px; background: rgba(255,255,255,0.2);"></div>
+              <div style="width: 2px; height: 8px; background: rgba(255,255,255,0.2);"></div>
+              <div style="width: 2px; height: 10px; background: rgba(255,255,255,0.2);"></div>
+            </div>
+            <span style="font-size: 10px; font-weight: 600;">🔋 100%</span>
+          </div>
+        </div>
+
+        <div id="phone-app-header">
+          <button id="phone-back-btn" type="button" aria-label="Back to home screen" title="Back to home screen">‹</button>
+          <div style="flex: 1; min-width: 0;">
+            <div id="phone-app-title" style="font-size: 13px; font-weight: 800; color: #1e88e5; letter-spacing: 0.5px;">📱 HOME</div>
+            <div id="phone-app-subtitle" style="font-size: 9px; color: rgba(224, 226, 238, 0.4); text-transform: uppercase;">FurlongOS · Select App</div>
+          </div>
+        </div>
+
+        <!-- 🏠 Home screen: app launcher grid (issue #20 S1 shell) -->
+        <div id="phone-home-screen" class="phone-app-view active">
+          <!-- 🧑‍🚀 Identity row (issue #20 S2) — inline-editable display name -->
+          <div id="phone-identity-row">
+            <span class="phone-identity-label">YOU:</span>
+            <span id="phone-player-name" title="Click to edit your clone name">Clone-????</span>
+            <button type="button" id="phone-player-name-edit" aria-label="Edit your clone name" title="Edit your clone name">✎ EDIT</button>
+          </div>
+          <div id="phone-app-grid">
+            <button type="button" class="phone-app-tile" data-phone-app="chat" aria-label="Open Clone Chat app">
+              <span class="phone-app-tile-icon">💬</span>
+              <span class="phone-app-tile-label">CHAT</span>
+            </button>
+            <button type="button" class="phone-app-tile" data-phone-app="contacts" aria-label="Open Contacts app">
+              <span class="phone-app-tile-icon">👥</span>
+              <span class="phone-app-tile-label">CONTACTS</span>
+            </button>
+            <button type="button" class="phone-app-tile" data-phone-app="bank" aria-label="Open Bank app">
+              <span class="phone-app-tile-icon">🏦</span>
+              <span class="phone-app-tile-label">BANK</span>
+            </button>
+          </div>
+
+          <!-- 🛰️ Room roster (issue #20 S2) — rendered from the Yjs players map.
+               'SEEN' not 'IN ROOM': entries are never removed, so departed
+               players stay listed until S3 presence adds liveness. -->
+          <div id="phone-players-section">
+            <div id="phone-players-header">CLONES SEEN: <span id="phone-players-count">--</span></div>
+            <ul id="phone-players-list">
+              <li class="phone-players-empty">OFFLINE · no room link</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- 💬 Chat app view (existing chat DOM — ids preserved, do not rename) -->
+        <div id="phone-app-chat" class="phone-app-view">
+          <!-- Scrollable Messages Container -->
+          <div id="chat-messages-container">
+            <div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>
+          </div>
+
+          <!-- Chat Input Form field -->
+          <form id="chat-form" onsubmit="return false;" style="display: flex; gap: 8px; padding: 10px; border-top: 1px solid rgba(212, 168, 75, 0.12); background: rgba(5, 7, 18, 0.95);">
+            <input type="text" id="chat-input" placeholder="Broadcast to room..." autocomplete="off">
+            <button type="submit" id="chat-send-btn">SEND</button>
+          </form>
+        </div>
+
+        <!-- 👥 Contacts app view — placeholder until S4 lands -->
+        <div id="phone-app-contacts" class="phone-app-view">
+          <div class="phone-no-signal">
+            <div class="phone-no-signal-glyph">▚▚ NO SIGNAL ▚▚</div>
+            <div class="phone-no-signal-text">CONTACTS app not yet provisioned</div>
+            <div class="phone-no-signal-sub">FurlongNet OTA update pending…</div>
+          </div>
+        </div>
+
+        <!-- 🏦 Bank app view — placeholder until S6 lands -->
+        <div id="phone-app-bank" class="phone-app-view">
+          <div class="phone-no-signal">
+            <div class="phone-no-signal-glyph">▚▚ NO SIGNAL ▚▚</div>
+            <div class="phone-no-signal-text">BANK app not yet provisioned</div>
+            <div class="phone-no-signal-sub">FurlongNet OTA update pending…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- DEV1: temporary Development menu toggle (src/devMenu.ts owns styling + behavior) — remove with it -->
+    <button id="dev-menu-btn" type="button" title="Development menu — temporary (` toggles)">DEV</button>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

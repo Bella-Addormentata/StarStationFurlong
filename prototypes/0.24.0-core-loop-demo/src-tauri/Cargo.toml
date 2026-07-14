@@ -1,0 +1,26 @@
+[package]
+name = "ssf-node"
+version = "0.24.0"
+edition = "2021"
+publish = false
+description = "StarStation Furlong - Tauri Client & Node Host"
+
+[dependencies]
+# Tauri v2 shell (sovereign backbone)
+tauri = { version = "2.0.0-rc", features = [] }
+tauri-build = { version = "2.0.0-rc", optional = true }
+
+# Sovereign real-time stack (v006 Â§12.1 pins)
+wtransport = { version = "0.6", features = ["quinn"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+yrs = { version = "0.27", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+blake3 = "1"
+ed25519-dalek = "=2.2.0" # exact match to yrs dependencies
+
+[build-dependencies]
+tauri-build = { version = "2.0.0-rc" }
