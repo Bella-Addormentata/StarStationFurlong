@@ -11,7 +11,8 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.22.0-core-loop-demo`](0.22.0-core-loop-demo/) | **The game (current release target).** Dynamic-IP self-healing: `SSF_EXTERNAL_ADDRS=auto` resolves the public IPv4 (opt-in echo, `SSF_IP_ECHO` overridable), re-checks every 5 min, and hot-swaps the advertised address on ISP rotation — DHT + fresh invites follow live; CGNAT answers refused with an explanation. |
+| [`0.23.0-core-loop-demo`](0.23.0-core-loop-demo/) | **The game (current release target).** The hangout update: N-player rooms with real peer identity (fox avatars, names, outfits), sci-fi doors you walk through — including same-node room transit via the gangway vestibule — diegetic devices (wall computer, holo map table, storage trunk), room editing (move furniture with pathfinding-aware validity), and a temporary DEV spawn menu for the demo phase. |
+| [`0.22.0-core-loop-demo`](0.22.0-core-loop-demo/) | Frozen at the v0.22.0 release snapshot. Dynamic-IP self-healing: `SSF_EXTERNAL_ADDRS=auto` resolves the public IPv4 (opt-in echo, `SSF_IP_ECHO` overridable), re-checks every 5 min, and hot-swaps the advertised address on ISP rotation — DHT + fresh invites follow live; CGNAT answers refused with an explanation. |
 | [`0.21.0-core-loop-demo`](0.21.0-core-loop-demo/) | Frozen at the v0.21.0 release snapshot: bundled node on Windows/Linux (`bundle.externalBin`, silent sidecar, per-user key dir) + race-proof auto-published releases; macOS sidecar deferred. |
 | [`0.20.0-core-loop-demo`](0.20.0-core-loop-demo/) | Frozen at the v0.20.0 line — **burned release, never shipped artifacts** (draft published mid-run; immutable releases froze it empty). Its changes ship in 0.21.0. |
 | [`0.19.0-core-loop-demo`](0.19.0-core-loop-demo/) | Frozen at the v0.19.0 release snapshot: default-pinned swarm port — the node's iroh UDP socket binds 44442 (IANA-unassigned) instead of a random per-launch port (`SSF_IROH_PORT` overrides, `=0` restores random, graceful fallback when taken). |
@@ -36,7 +37,7 @@ live game.
 ## Releasing a different demo as the app
 
 The packaged release always uses the Tauri shell from
-[`0.22.0-core-loop-demo/src-tauri`](0.22.0-core-loop-demo/src-tauri/) (window, Rust
+[`0.23.0-core-loop-demo/src-tauri`](0.23.0-core-loop-demo/src-tauri/) (window, Rust
 WebTransport node, icons, app version) — but the **frontend it renders is
 switchable**. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config
