@@ -1662,6 +1662,12 @@ async function init() {
   inputManager = new inputModule.InputManager();
   setupNetworkDetailsPanel();
   setupZoomView();
+
+  // DEV1: temporary Development menu (owner request, demo phase — will be
+  // phased out). Removal = delete src/devMenu.ts, the #dev-menu-btn line in
+  // index.html, and these three lines.
+  const { initDevMenu } = await import('./devMenu');
+  initDevMenu(() => world);
   
   // Single click: expand the platform and enter the lobby
   setupClickToEnter();
