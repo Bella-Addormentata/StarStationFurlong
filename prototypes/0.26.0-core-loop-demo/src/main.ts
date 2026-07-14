@@ -712,6 +712,44 @@ const TRANSIT_FADE_MS = 400;
 /** Hard cap on the leave→join swap (review fix F3) — generous against the
  *  same-node ~100-300 ms swap; T2's cross-node arrival gate supersedes it. */
 const SWAP_WATCHDOG_MS = 15_000;
+/** Issue #60 (P1.3): how long the transit curtain waits, AFTER the join, for
+ *  the host's room state (roomInfo owner+name) to arrive over the mesh before
+ *  entering anyway. A joiner's local node starts with an empty replica; the
+ *  host's owner/name land as bridged Yjs updates once the peer dial connects,
+ *  so without this the avatar was staged painting default Lobby/Local-Clone
+ *  values. On timeout we enter with defaults, which the roomInfo observer
+ *  (main.ts ~577) repaints live the moment the real state does arrive. */
+const SYNC_GATE_MS = 8_000;
+
+/**
+ * Resolve once the freshly-joined room's shared state has converged — the
+ * host's roomInfo `owner` AND `name` keys are present — or after `timeoutMs`
+ * as a fallback (issue #60 P1.3). Observes the CURRENT session's doc captured
+ * at call time; if a newer session/leave destroys it mid-wait, the timeout
+ * still resolves so the curtain never wedges.
+ */
+function awaitInitialRoomState(timeoutMs: number): Promise<void> {
+  const sync = yjsSync;
+  if (!sync) return Promise.resolve();
+  const roomMap = sync.doc.getMap('roomInfo');
+  const ready = () => roomMap.has('owner') && roomMap.has('name');
+  if (ready()) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const observer = () => { if (ready()) finish(); };
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { roomMap.unobserve(observer); } catch { /* doc may be destroyed */ }
+      window.clearTimeout(timer);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, timeoutMs);
+    roomMap.observe(observer);
+    // Guard the race between the initial ready() check and observe() attaching.
+    if (ready()) finish();
+  });
+}
 
 /** Ease the transit curtain to fully opaque (true) or clear (false).
  *  Resolves after the transition duration (timer, not transitionend — the
@@ -829,6 +867,12 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
     // has its owner written (a re-claim would race the initial sync and
     // steal/reset owner+name — the exact S2 bug the claim gate exists for).
     pendingBootstrapOverride = target;
+    // Issue #60 (P1.3): hold the curtain until the host's room state has synced
+    // (or the bounded fallback) so the avatar isn't staged in a room still
+    // showing the default name/owner (symptoms 1 & 5). Only foreign joins
+    // actually wait — a minted/own room already has owner+name written, and a
+    // same-node transit's replica is already populated, so both resolve at once.
+    await awaitInitialRoomState(SYNC_GATE_MS);
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);

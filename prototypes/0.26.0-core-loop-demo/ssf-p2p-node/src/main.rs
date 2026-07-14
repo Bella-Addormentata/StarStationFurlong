@@ -763,15 +763,22 @@ async fn handle_wt_connection(
             }
             // Bidirectional synchronisation streams
             stream = connection.accept_bi() => {
-                let (mut send, mut recv) = stream?;
+                let (send, mut recv) = stream?;
                 let hub_clone = hub.clone();
                 let remote_addr_inner = remote_addr;
                 let mut room_id_inner = chosen_room.lock().unwrap().clone();
                 let connection_clone = connection.clone();
                 let chosen_room_inner = chosen_room.clone();
                 let iroh_clone = iroh_ep.clone();
-                
+
                 tokio::spawn(async move {
+                    // P1.2 (issue #60): the peer dial runs in its own retrying task
+                    // (dial_peer_with_retry) so a slow hole-punch never blocks this
+                    // ysync reader. That task and this loop BOTH write to the stream's
+                    // `send` half (bridge status vs. SyncStep2 responses), so share it
+                    // behind an async Mutex — each writer holds the lock across a whole
+                    // framed message, so frames never interleave.
+                    let send = std::sync::Arc::new(tokio::sync::Mutex::new(send));
                     let mut length_buf = [0u8; 4];
                     loop {
                         if let Err(_) = recv.read_exact(&mut length_buf).await {
@@ -803,7 +810,12 @@ async fn handle_wt_connection(
                             room.local_connections.insert(remote_addr_inner, connection_clone.clone());
                         }
 
-                        // Check if the envelope carries a new peer's Iroh ID to dial back
+                        // Dial a newly-advertised peer OFF this reader loop (issue #60
+                        // symptoms 2 + 4): a hole-punch can take minutes, and dialing
+                        // inline stalled every following ysync frame on this stream —
+                        // the joiner's document (owner/name/players) never converged
+                        // while the dial hung. dial_peer_with_retry backs off, binds
+                        // the room, and reports status through the channel above.
                         if let Some(ref target_node_id_str) = envelope.iroh_node_id {
                             if let Ok(target_pub_key) = target_node_id_str.parse::<PublicKey>() {
                                 let needs_dial = {
@@ -816,86 +828,30 @@ async fn handle_wt_connection(
 
                                 if needs_dial {
                                     println!("📡 Dispatching Iroh Dial to remote peer key: {}", target_node_id_str);
-                                    let _ = write_bridge_status(
-                                        &mut send,
-                                        &envelope.room,
-                                        target_node_id_str,
-                                        "dialing",
-                                        None,
-                                    )
-                                    .await;
-                                    let fallback_relays = hub_clone.configured_relays.clone();
                                     let relay_hints = envelope
                                         .iroh_relay_urls
                                         .clone()
                                         .filter(|hints| !hints.is_empty())
-                                        .unwrap_or(fallback_relays);
-                                    let direct_hints = envelope
-                                        .iroh_direct_addrs
-                                        .clone()
-                                        .unwrap_or_default();
-
-                                    let mut addr = EndpointAddr::new(target_pub_key);
-                                    for relay_url_str in relay_hints {
-                                        match relay_url_str.parse::<RelayUrl>() {
-                                            Ok(relay_url) => {
-                                                addr = addr.with_relay_url(relay_url);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("⚠️ Ignoring invalid relay hint '{}': {:?}", relay_url_str, e);
-                                            }
-                                        }
-                                    }
-                                    for direct_addr_str in direct_hints {
-                                        match direct_addr_str.parse::<SocketAddr>() {
-                                            Ok(socket_addr) => {
-                                                addr = addr.with_ip_addr(socket_addr);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("⚠️ Ignoring invalid direct hint '{}': {:?}", direct_addr_str, e);
-                                            }
-                                        }
-                                    }
-
-                                    match iroh_clone.connect(addr, b"ssf").await {
-                                        Ok(iroh_conn) => {
-                                            println!("🎯 Iroh connection secured back to peer node!");
-                                            let _ = write_bridge_status(
-                                                &mut send,
-                                                &envelope.room,
-                                                target_node_id_str,
-                                                "connected",
-                                                None,
-                                            )
-                                            .await;
-                                            {
-                                                let mut rooms = hub_clone.rooms.lock().unwrap();
-                                                if let Some(room) = rooms.get_mut(&envelope.room) {
-                                                    room.remote_peers.insert(target_pub_key, iroh_conn.clone());
-                                                }
-                                            }
-                                            // Handle bidirectional read/write loop symmetrically for outbound connections (B4 fix):
-                                            let hub_outbound = hub_clone.clone();
-                                            let iroh_outbound = iroh_clone.clone();
-                                            let conn_outbound = iroh_conn.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(e) = handle_iroh_connection(hub_outbound, conn_outbound, iroh_outbound).await {
-                                                    eprintln!("⚠️ Outbound P2P peer loop closed: {:?}", e);
-                                                }
-                                            });
-                                        }
-                                        Err(e) => {
-                                            eprintln!("⚠️ Failed dialing peer node {}: {:?}", target_node_id_str, e);
-                                            let _ = write_bridge_status(
-                                                &mut send,
-                                                &envelope.room,
-                                                target_node_id_str,
-                                                "failed",
-                                                Some(&format!("{e:?}")),
-                                            )
-                                            .await;
-                                        }
-                                    }
+                                        .unwrap_or_else(|| hub_clone.configured_relays.clone());
+                                    let direct_hints = envelope.iroh_direct_addrs.clone().unwrap_or_default();
+                                    let hub_dial = hub_clone.clone();
+                                    let iroh_dial = iroh_clone.clone();
+                                    let room_dial = envelope.room.clone();
+                                    let target_dial = target_node_id_str.clone();
+                                    let send_dial = send.clone();
+                                    tokio::spawn(async move {
+                                        dial_peer_with_retry(
+                                            hub_dial,
+                                            iroh_dial,
+                                            room_dial,
+                                            target_pub_key,
+                                            target_dial,
+                                            relay_hints,
+                                            direct_hints,
+                                            send_dial,
+                                        )
+                                        .await;
+                                    });
                                 }
                             }
                         }
@@ -947,7 +903,8 @@ async fn handle_wt_connection(
 
                         // Merge locally
                         if envelope.kind == "ysync" {
-                            let _ = handle_ysync_message(&hub_clone, room_id, &envelope, &mut send).await;
+                            let mut s = send.lock().await;
+                            let _ = handle_ysync_message(&hub_clone, room_id, &envelope, &mut *s).await;
                         }
                     }
                 });
@@ -987,10 +944,121 @@ async fn run_iroh_listener(hub: SharedHub, endpoint: IrohEndpoint) -> Result<()>
         let hub_clone = hub.clone();
         let iroh_clone = endpoint.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_iroh_connection(hub_clone, connection, iroh_clone).await {
+            // Inbound-accepted: learn the room from the peer's first ysync stream.
+            if let Err(e) = handle_iroh_connection(hub_clone, connection, iroh_clone, None).await {
                 eprintln!("⚠️ Swarm connection error with peer ({}): {:?}", remote_id, e);
             }
         });
+    }
+}
+
+// Issue #60 symptom 2: bounded, backing-off dial that runs OFF the browser's
+// ysync reader loop so a multi-minute hole-punch never stalls document sync.
+const MAX_DIAL_ATTEMPTS: u32 = 8;
+const DIAL_BACKOFF_START_MS: u64 = 500;
+const DIAL_BACKOFF_CAP_MS: u64 = 8000;
+
+/// Dial a remote peer node with bounded retry/backoff, bind the connection to
+/// `room_id` (so its inbound ticks fan out — issue #60 symptom 4), and report
+/// dialing/connected/failed to the browser through `status_tx`. Rebuilds the
+/// EndpointAddr from the relay/direct hints each attempt, and re-checks the
+/// room's remote_peers before every attempt so a peer that another path (a
+/// second envelope, or the inbound accept) already linked is left alone — no
+/// dial storm, no duplicate connection.
+async fn dial_peer_with_retry(
+    hub: SharedHub,
+    iroh_ep: IrohEndpoint,
+    room_id: String,
+    target_pub_key: PublicKey,
+    target_str: String,
+    relay_hints: Vec<String>,
+    direct_hints: Vec<String>,
+    send: std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>,
+) {
+    {
+        let mut s = send.lock().await;
+        let _ = write_bridge_status(&mut *s, &room_id, &target_str, "dialing", None).await;
+    }
+    let mut delay = std::time::Duration::from_millis(DIAL_BACKOFF_START_MS);
+    for attempt in 1..=MAX_DIAL_ATTEMPTS {
+        let still_needs = {
+            let rooms = hub.rooms.lock().unwrap();
+            rooms
+                .get(&room_id)
+                .map(|room| !room.remote_peers.contains_key(&target_pub_key))
+                .unwrap_or(false)
+        };
+        if !still_needs {
+            return; // already linked by another path — nothing to do
+        }
+
+        let mut addr = EndpointAddr::new(target_pub_key);
+        for relay_url_str in &relay_hints {
+            match relay_url_str.parse::<RelayUrl>() {
+                Ok(relay_url) => addr = addr.with_relay_url(relay_url),
+                Err(e) => eprintln!("⚠️ Ignoring invalid relay hint '{}': {:?}", relay_url_str, e),
+            }
+        }
+        for direct_addr_str in &direct_hints {
+            match direct_addr_str.parse::<SocketAddr>() {
+                Ok(socket_addr) => addr = addr.with_ip_addr(socket_addr),
+                Err(e) => eprintln!("⚠️ Ignoring invalid direct hint '{}': {:?}", direct_addr_str, e),
+            }
+        }
+
+        match iroh_ep.connect(addr, b"ssf").await {
+            Ok(iroh_conn) => {
+                println!(
+                    "🎯 Iroh connection secured to peer node (attempt {}/{}).",
+                    attempt, MAX_DIAL_ATTEMPTS
+                );
+                {
+                    let mut rooms = hub.rooms.lock().unwrap();
+                    if let Some(room) = rooms.get_mut(&room_id) {
+                        room.remote_peers.insert(target_pub_key, iroh_conn.clone());
+                    }
+                }
+                {
+                    let mut s = send.lock().await;
+                    let _ = write_bridge_status(&mut *s, &room_id, &target_str, "connected", None).await;
+                }
+                let hub_out = hub.clone();
+                let iroh_out = iroh_ep.clone();
+                let room_out = room_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_iroh_connection(hub_out, iroh_conn, iroh_out, Some(room_out)).await
+                    {
+                        eprintln!("⚠️ Outbound P2P peer loop closed: {:?}", e);
+                    }
+                });
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️ Dial attempt {}/{} to {} failed: {:?}",
+                    attempt, MAX_DIAL_ATTEMPTS, target_str, e
+                );
+                if attempt < MAX_DIAL_ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(
+                        delay * 2,
+                        std::time::Duration::from_millis(DIAL_BACKOFF_CAP_MS),
+                    );
+                }
+            }
+        }
+    }
+    {
+        let mut s = send.lock().await;
+        let _ = write_bridge_status(
+            &mut *s,
+            &room_id,
+            &target_str,
+            "failed",
+            Some(&format!("no route after {} attempts", MAX_DIAL_ATTEMPTS)),
+        )
+        .await;
     }
 }
 
@@ -1001,11 +1069,19 @@ fn handle_iroh_connection(
     hub: SharedHub,
     connection: iroh::endpoint::Connection,
     iroh_ep: IrohEndpoint,
+    preset_room: Option<String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
     Box::pin(async move {
     let remote_id = connection.remote_id();
     let self_id = iroh_ep.id();
-    let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Room binding (issue #60 symptom 4): a connection we DIALED already knows
+    // its room, so pre-seed it. Without this, chosen_room stayed None on the
+    // dialing side and its inbound-datagram gate (below) silently dropped every
+    // tick the remote peer sent — the joiner saw the host's ticks vanish while
+    // the accepting side (whose chosen_room gets set by the peer's first bi
+    // stream) still saw the joiner. Inbound-accepted conns still pass None and
+    // learn their room from the first ysync stream, exactly as before.
+    let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(preset_room));
 
     loop {
         tokio::select! {
@@ -1156,8 +1232,11 @@ fn handle_iroh_connection(
                                             let hub_outbound = hub_clone.clone();
                                             let iroh_outbound = iroh_clone.clone();
                                             let conn_outbound = iroh_conn.clone();
+                                            // We dialed this gossip-learned peer, so bind its room
+                                            // (issue #60 symptom 4) — else its inbound ticks drop.
+                                            let room_outbound = room_id.clone();
                                             tokio::spawn(async move {
-                                                if let Err(e) = handle_iroh_connection(hub_outbound, conn_outbound, iroh_outbound).await {
+                                                if let Err(e) = handle_iroh_connection(hub_outbound, conn_outbound, iroh_outbound, Some(room_outbound)).await {
                                                     eprintln!("⚠️ Mesh peer loop closed: {:?}", e);
                                                 }
                                             });
