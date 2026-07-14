@@ -15,6 +15,7 @@ import { SolarSystemMap } from './map';
 import { MultiScaleZoomView } from './zoom';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
+import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
 
 type RendererModule = typeof import('./renderer');
 
@@ -243,7 +244,8 @@ async function bootstrapNetworking() {
     // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
-    const boot = pendingBootstrapOverride ?? await fetchDefaultBootstrap();
+    const override = pendingBootstrapOverride;
+    const boot = override ?? await fetchDefaultBootstrap();
     if (!boot) {
       console.warn('⚠️ No running Rust node found. Seamlessly falling back to offline mode.');
       updateHUDNode('OFFLINE', '#ff1744');
@@ -252,7 +254,14 @@ async function bootstrapNetworking() {
       return;
     }
 
-    await joinRoom(boot);
+    // Room-defaults claim gate (S2 review fix): only the DEFAULT-bootstrap
+    // path — our own node's own room — may claim roomInfo owner/name
+    // defaults. Imported seeds (?seed= URL, Use-link) are JOINS into someone
+    // else's room and must never write defaults; see the claimRoomDefaults
+    // comment in joinRoomAtEpoch for the initial-sync race this prevents.
+    // pendingBootstrapOverride intentionally persists after use, so a
+    // Retry-node following a seed import stays classified as a join.
+    await joinRoom(boot, /* claimRoomDefaults */ !override);
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -291,12 +300,12 @@ async function bootstrapNetworking() {
  * NetworkProvider.onEnvelope/onTick hold a single handler slot, so the
  * re-registration below replaces (never stacks) the previous room's handlers.
  */
-async function joinRoom(boot: RoomBootstrap): Promise<void> {
+async function joinRoom(boot: RoomBootstrap, claimRoomDefaults: boolean): Promise<void> {
   // Claim a fresh session epoch (see the sessionEpoch declaration): only the
   // newest join/leave owns the shared provider + module state.
   const epoch = ++sessionEpoch;
   try {
-    await joinRoomAtEpoch(boot, epoch);
+    await joinRoomAtEpoch(boot, epoch, claimRoomDefaults);
   } catch (err) {
     if (epoch !== sessionEpoch) {
       // Superseded mid-join: the newer session's leaveRoom yanked our
@@ -311,8 +320,10 @@ async function joinRoom(boot: RoomBootstrap): Promise<void> {
 }
 
 /** Body of joinRoom, bound to the epoch it claimed. After every await it
- *  re-checks the epoch and unwinds whatever it created if superseded. */
-async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void> {
+ *  re-checks the epoch and unwinds whatever it created if superseded.
+ *  `claimRoomDefaults`: true only on the own-room default-bootstrap path —
+ *  gates the roomInfo owner/name default writes (see below). */
+async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefaults: boolean): Promise<void> {
   // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
   seenPeers.clear();
   receivedTicks = 0;
@@ -395,11 +406,32 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
     }
   });
 
+  // Bind shared players map (issue #20 S2): stable per-install identity in
+  // the room doc. Rebinds per join like roomInfo/chat below (T0 seam) — the
+  // observer attaches to the FRESH doc and our entry is re-upserted, keyed by
+  // player id so a Use-link rejoin overwrites instead of duplicating.
+  const playersMap = sync.doc.getMap('players');
+  (window as any).__players = playersMap; // debug handle (permanent, like __setOutfit)
+
   // Bind shared room info map updates (Task: Room Name & Room Owner)
   const roomMap = sync.doc.getMap('roomInfo');
-  if (!roomMap.has('owner')) {
+  // Ownership-claim race guard (S2 review fix): `roomMap.has('owner')` runs
+  // SYNCHRONOUSLY after sync.start(), but start() only SENDS SyncStep1 — the
+  // SyncStep2 carrying the room's established state arrives async in the
+  // reader loop, so the local replica is always EMPTY here. Without the
+  // claimRoomDefaults gate every seed-link joiner saw "no owner", claimed
+  // ownership, and reset the room name concurrently with the real values —
+  // and Yjs LWW let the joiner's write win on all replicas roughly half the
+  // time. Only the own-room default-bootstrap path claims now; a reload of
+  // your own room re-claims the same player id (idempotent). Residual known
+  // gap (pre-existing, unchanged): the OWN-room claim itself still races the
+  // initial sync, so an owner who renamed their room can see the name revert
+  // on reload — fixing that needs a sync-complete signal from YjsSync.
+  if (claimRoomDefaults && !roomMap.has('owner')) {
     sync.doc.transact(() => {
-      roomMap.set('owner', 'Local-Clone');
+      // S2: the owner is a player ID (stable across reloads), not a display
+      // name. Legacy rooms hold 'Local-Clone' here — see isLocalPlayerRoomOwner.
+      roomMap.set('owner', getPlayerId());
       roomMap.set('name', boot.roomId || 'Lobby');
     });
   }
@@ -415,7 +447,8 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
       nameEl.textContent = nameVal;
     }
     if (ownerEl) {
-      ownerEl.textContent = ownerVal;
+      // Owner is an id since S2 — show the display NAME via the players map.
+      ownerEl.textContent = resolveOwnerLabel(ownerVal);
     }
   };
 
@@ -423,6 +456,17 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
     updateRoomUI();
   });
 
+  // Players-map changes re-render the phone roster AND the room HUD — the
+  // owner's players entry can sync in after roomInfo, and name edits must
+  // retitle the owner row live.
+  playersMap.observe((_event) => {
+    renderPhonePlayersList();
+    updateRoomUI();
+  });
+
+  // Register/refresh our own entry now that the doc is bound (fires the
+  // observer above, which paints the roster + HUD).
+  updateLocalPlayerEntry();
   updateRoomUI();
 
   // Bind shared chat array updates to SpacePhone interface (Task Task 3.3/4.1)
@@ -435,7 +479,14 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number): Promise<void
       container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
       const items: any[] = sharedChat.toArray();
       items.forEach(item => {
-        const isMe = item.authorName === 'Local-Clone';
+        // S2: classify by stable authorId. Pre-S2 messages carry no authorId
+        // and EVERY pre-S2 sender wrote the literal authorName 'Local-Clone',
+        // so the fallback renders all legacy messages as 'me' — exactly the
+        // pre-S2 behavior (no regression, no improvement). The 2+ player
+        // me/them fix only applies to messages written with an authorId.
+        const isMe = typeof item.authorId === 'string'
+          ? item.authorId === getPlayerId()
+          : item.authorName === 'Local-Clone';
         const bubble = document.createElement('div');
         bubble.className = `chat-bubble ${isMe ? 'outbound' : 'inbound'}`;
 
@@ -527,6 +578,118 @@ async function leaveRoom(): Promise<void> {
     await networkProvider.disconnect();
   } catch (err) {
     console.warn('Error disconnecting prior network link:', err);
+  }
+}
+
+// ── Player identity in the room doc (issue #20 S2) ───────────────────────────
+
+/** Shape of a `players` map entry. Plain JSON — no Y types nested inside. */
+interface PlayerEntry {
+  name: string;
+  joinedAt: number;
+  outfitId: string;
+}
+
+/**
+ * Upsert OUR entry in the current room doc's `players` map. Keyed by the
+ * per-install player id, so a leave→rejoin overwrites in place (no duplicate
+ * entries) and `joinedAt` is preserved from the existing entry when present.
+ * Safe to call any time (no-op offline); the name editor and the outfit
+ * switcher both funnel through here so the doc always mirrors local state.
+ */
+function updateLocalPlayerEntry(): void {
+  const sync = yjsSync;
+  if (!sync) return;
+  const players = sync.doc.getMap('players');
+  const id = getPlayerId();
+  const prev = players.get(id) as Partial<PlayerEntry> | undefined;
+  const entry: PlayerEntry = {
+    name: getPlayerName(),
+    joinedAt: typeof prev?.joinedAt === 'number' ? prev.joinedAt : Date.now(),
+    outfitId: loadSavedOutfitId() ?? 'default',
+  };
+  sync.doc.transact(() => {
+    players.set(id, entry);
+  });
+}
+
+/**
+ * Resolve a `roomInfo.owner` value to a display label. Owners are player ids
+ * as of S2 — resolve the NAME through the players map when the entry exists.
+ * Legacy docs store the literal 'Local-Clone' (shown as-is); an id with no
+ * players entry yet renders shortened rather than as a full UUID.
+ */
+function resolveOwnerLabel(owner: string): string {
+  const entry = yjsSync?.doc.getMap('players').get(owner) as Partial<PlayerEntry> | undefined;
+  if (entry && typeof entry.name === 'string' && entry.name) {
+    return entry.name;
+  }
+  return owner.length > 16 ? `${owner.slice(0, 8)}…` : owner;
+}
+
+/** True when WE may edit the room name: owner is our player id, or the room
+ *  predates S2 (legacy 'Local-Clone' owner — those rooms stay editable). */
+function isLocalPlayerRoomOwner(owner: string): boolean {
+  return owner === getPlayerId() || owner === 'Local-Clone';
+}
+
+/**
+ * Render the 'CLONES SEEN' roster on the phone home screen from the current
+ * doc's `players` map. Called from the per-join players observer and on
+ * phone setup (offline placeholder). DOM built via textContent — names are
+ * remote-controlled strings and must never hit innerHTML.
+ *
+ * 'SEEN', not 'IN ROOM': nothing ever REMOVES a players entry in S2 (no
+ * leave hook, no liveness), so departed players stay listed until S3
+ * presence lands heartbeat/lastSeen semantics.
+ *
+ * v1 scope note (S2): this list IS the visual surface for the players map.
+ * Name tags over remote rigs and outfit application on remote rigs are
+ * deferred to S3 — the tick lane keys peers by per-connection lane id and
+ * there is no lane-id → player-id mapping yet, so any rig↔entry pairing here
+ * would be a guess for 2+ remote players.
+ */
+function renderPhonePlayersList(): void {
+  const countEl = document.getElementById('phone-players-count');
+  const listEl = document.getElementById('phone-players-list');
+  if (!countEl || !listEl) return;
+  listEl.textContent = '';
+
+  const sync = yjsSync;
+  if (!sync) {
+    countEl.textContent = '--';
+    const offline = document.createElement('li');
+    offline.className = 'phone-players-empty';
+    offline.textContent = 'OFFLINE · no room link';
+    listEl.appendChild(offline);
+    return;
+  }
+
+  const players = sync.doc.getMap('players');
+  const rows: Array<{ id: string; entry: Partial<PlayerEntry> }> = [];
+  players.forEach((value, key) => {
+    if (value && typeof value === 'object') {
+      rows.push({ id: key, entry: value as Partial<PlayerEntry> });
+    }
+  });
+  rows.sort((a, b) => (a.entry.joinedAt ?? 0) - (b.entry.joinedAt ?? 0));
+
+  countEl.textContent = String(rows.length);
+  const myId = getPlayerId();
+  for (const { id, entry } of rows) {
+    const li = document.createElement('li');
+    li.className = 'phone-players-row';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'phone-players-name';
+    nameSpan.textContent = (entry.name || 'Unknown-Clone') + (id === myId ? ' (you)' : '');
+    const sinceSpan = document.createElement('span');
+    sinceSpan.className = 'phone-players-since';
+    sinceSpan.textContent = typeof entry.joinedAt === 'number'
+      ? new Date(entry.joinedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '--:--';
+    li.appendChild(nameSpan);
+    li.appendChild(sinceSpan);
+    listEl.appendChild(li);
   }
 }
 
@@ -689,6 +852,52 @@ function setupSpacePhoneOverlay() {
   setInterval(updatePhoneTime, 10000);
   updatePhoneTime();
 
+  // 🧑‍🚀 Identity row (issue #20 S2): 'YOU: <name> [edit]' on the home screen.
+  // Clicking the name (or ✎) swaps it for an inline input — Enter/blur saves
+  // via setPlayerName and pushes the change into the room doc's players map;
+  // Escape cancels (the phone's own Escape-to-home handler above already
+  // ignores keydowns targeted at non-chat inputs, same as the room-name editor).
+  const playerNameEl = document.getElementById('phone-player-name');
+  const playerNameEditBtn = document.getElementById('phone-player-name-edit');
+  const refreshIdentityRow = () => {
+    if (playerNameEl) playerNameEl.textContent = getPlayerName();
+  };
+  refreshIdentityRow();
+  const beginPlayerNameEdit = () => {
+    if (!playerNameEl || document.getElementById('phone-player-name-input')) return;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'phone-player-name-input';
+    input.value = getPlayerName();
+    input.maxLength = PLAYER_NAME_MAX_LENGTH;
+    playerNameEl.replaceWith(input);
+    input.focus();
+    input.select();
+    let finished = false; // guards the Enter→blur double-fire
+    const closeEditor = (save: boolean) => {
+      if (finished) return;
+      finished = true;
+      if (save) setPlayerName(input.value); // blank input → name unchanged
+      input.replaceWith(playerNameEl);
+      refreshIdentityRow();
+      if (save) updateLocalPlayerEntry(); // mirror into the room doc (no-op offline)
+    };
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        closeEditor(true);
+      } else if (ev.key === 'Escape') {
+        closeEditor(false);
+      }
+    });
+    input.addEventListener('blur', () => closeEditor(true));
+  };
+  playerNameEl?.addEventListener('click', beginPlayerNameEdit);
+  playerNameEditBtn?.addEventListener('click', beginPlayerNameEdit);
+
+  // Roster section starts in the offline placeholder state; the per-join
+  // players-map observer repaints it once a doc is bound.
+  renderPhonePlayersList();
+
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
     // Standardize behavior and prevent focused inputs from scrolling/shifting window viewports
@@ -725,7 +934,10 @@ function setupSpacePhoneOverlay() {
         // Transact safe transactional delta block append (Task 3.3 / 4.1)
         yjsSync.doc.transact(() => {
           sharedChat.push([{
-            authorName: 'Local-Clone',
+            // S2: authorId is the stable identity (isMe check); authorName is
+            // denormalized for display + legacy readers.
+            authorId: getPlayerId(),
+            authorName: getPlayerName(),
             text: val,
             atTick: localSeq,
             scope: 'global'
@@ -998,12 +1210,14 @@ function setupNetworkDetailsPanel() {
           if (yjsSync) {
             const rMap = yjsSync.doc.getMap('roomInfo');
             const ownerVal = rMap.get('owner') as string || 'Local-Clone';
-            if (ownerVal === 'Local-Clone') {
+            // S2 gate: owner is our player id, or a legacy pre-S2 room
+            // ('Local-Clone' owner) — those stay editable by everyone.
+            if (isLocalPlayerRoomOwner(ownerVal)) {
               yjsSync.doc.transact(() => {
                 rMap.set('name', newVal);
               });
             } else {
-              if (feedback) feedback.textContent = `Only the owner (${ownerVal}) can edit the room name.`;
+              if (feedback) feedback.textContent = `Only the owner (${resolveOwnerLabel(ownerVal)}) can edit the room name.`;
               setTimeout(() => { if (feedback) feedback.textContent = ''; }, 4000);
             }
           } else {
@@ -1011,6 +1225,14 @@ function setupNetworkDetailsPanel() {
           }
         }
         input.replaceWith(nameEl);
+        // Repaint from the doc: the roomInfo observer fired INSIDE the
+        // transact above, while the editor input was still mounted — and
+        // updateRoomUI skips #room-name-display whenever #room-name-input
+        // exists — so without this the display kept the pre-edit name until
+        // the next unrelated doc change.
+        if (yjsSync) {
+          nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string) || 'Lobby';
+        }
       };
 
       input.addEventListener('keydown', (ev) => {
@@ -1291,7 +1513,13 @@ function simulateLocalMessage(val: string) {
   if (container) {
     const ourBubble = document.createElement('div');
     ourBubble.className = 'chat-bubble outbound';
-    ourBubble.innerHTML = `<span class="chat-sender-name">Local-Clone</span>${val}`;
+    // S2: label offline-sim bubbles with the real display name. Built via
+    // textContent — both the name and the message are user-typed strings.
+    const senderSpan = document.createElement('span');
+    senderSpan.className = 'chat-sender-name';
+    senderSpan.textContent = getPlayerName();
+    ourBubble.appendChild(senderSpan);
+    ourBubble.appendChild(document.createTextNode(val));
     container.appendChild(ourBubble);
 
     // Cute simulated server response after 1.5 seconds
@@ -1437,8 +1665,11 @@ async function init() {
   (window as any).world = world;
 
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
-  // expose a debug console handle. LOCAL rig only — remote avatars keep #27's
-  // per-peer hue tint until the phone-plan S2 identity lane carries outfit ids.
+  // expose a debug console handle. LOCAL rig only — S2 now carries outfitId in
+  // the room doc's players map (data foundation), but remote avatars keep
+  // #27's per-peer hue tint until S3 lands the lane-id → player-id mapping
+  // (tick-lane peers key by per-connection lane id; pairing rigs to players
+  // map entries without that mapping would be a guess for 2+ remotes).
   const applyOutfitById = (id: string): boolean => {
     const outfit = getOutfitById(id);
     if (!outfit) { console.warn(`[outfit] unknown outfit id: ${id}`); return false; }
@@ -1446,6 +1677,7 @@ async function init() {
     // instead of widening the frozen player/character public API.
     (world.getPlayer() as any).character.setOutfit(outfit);
     saveOutfitId(id);
+    updateLocalPlayerEntry(); // S2: mirror outfitId into the room doc's players map
     return true;
   };
   (window as any).__setOutfit = applyOutfitById; // debug handle (permanent)

@@ -687,6 +687,130 @@
         text-transform: uppercase;
       }
 
+      /* 🧑‍🚀 Identity row — 'YOU: <name> [✎ EDIT]' (issue #20 S2) */
+      #phone-identity-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 14px;
+        padding: 8px 10px;
+        background: rgba(10, 14, 34, 0.9);
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        border-radius: 10px;
+        font-family: monospace;
+      }
+
+      .phone-identity-label {
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        color: rgba(224, 226, 238, 0.4);
+        flex: 0 0 auto;
+      }
+
+      #phone-player-name {
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        font-weight: 700;
+        color: #90caf9;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+      }
+
+      #phone-player-name-input {
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
+        font-weight: 700;
+        font-family: monospace;
+        color: #90caf9;
+        background: rgba(30, 136, 229, 0.12);
+        border: 1px solid rgba(30, 136, 229, 0.45);
+        border-radius: 6px;
+        padding: 2px 6px;
+        outline: none;
+      }
+
+      #phone-player-name-edit {
+        flex: 0 0 auto;
+        background: rgba(30, 136, 229, 0.12);
+        color: #90caf9;
+        border: 1px solid rgba(30, 136, 229, 0.3);
+        border-radius: 6px;
+        font-size: 8px;
+        font-weight: 700;
+        letter-spacing: 0.8px;
+        padding: 3px 7px;
+        cursor: pointer;
+        font-family: monospace;
+        transition: background 0.2s, border-color 0.2s;
+      }
+
+      #phone-player-name-edit:hover {
+        background: rgba(30, 136, 229, 0.25);
+        border-color: rgba(30, 136, 229, 0.6);
+      }
+
+      /* 🛰️ Room roster — 'CLONES IN ROOM: n' (issue #20 S2, players map) */
+      #phone-players-section {
+        margin-top: 16px;
+        padding: 10px;
+        background: rgba(10, 14, 34, 0.9);
+        border: 1px solid rgba(212, 168, 75, 0.18);
+        border-radius: 10px;
+        font-family: monospace;
+      }
+
+      #phone-players-header {
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        color: #d4a84b;
+        margin-bottom: 6px;
+      }
+
+      #phone-players-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        max-height: 110px;
+        overflow-y: auto;
+      }
+
+      .phone-players-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 11px;
+      }
+
+      .phone-players-name {
+        color: rgba(224, 226, 238, 0.85);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .phone-players-since {
+        flex: 0 0 auto;
+        font-size: 9px;
+        color: rgba(224, 226, 238, 0.35);
+      }
+
+      .phone-players-empty {
+        font-size: 10px;
+        color: rgba(224, 226, 238, 0.35);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+
       /* ▚▚ NO SIGNAL ▚▚ placeholder for unprovisioned apps (Contacts/Bank) */
       .phone-no-signal {
         flex: 1;
