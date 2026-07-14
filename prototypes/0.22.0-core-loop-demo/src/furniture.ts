@@ -940,18 +940,65 @@ function rotXZ(x: number, z: number, rot: Rot): { x: number; z: number } {
   }
 }
 
-/** World-space obstacle AABB for one item, or null for decorative items. */
-export function itemAabb(item: FurnitureItem): Box | null {
-  if (item.footprintOverride !== undefined) return item.footprintOverride;
-  const fp = FURNITURE_DEFS[item.kind].footprint;
+/**
+ * Footprint-derived world AABB for a kind as if placed at (pos, rot) —
+ * IGNORING any per-item footprintOverride. This is the candidate box the
+ * move-furniture validity check (E3) probes with: a MOVED item sheds its
+ * hand-authored world-space override (the override encoded the ORIGINAL
+ * legacy obstacle; after a move the derived footprint, which matches the
+ * visual, is the honest obstacle).
+ */
+export function footprintAabb(
+  kind: FurnitureKind,
+  pos: { x: number; z: number },
+  rot: Rot,
+): Box | null {
+  const fp = FURNITURE_DEFS[kind].footprint;
   if (!fp) return null;
-  const rotated = item.rot % 2 === 1;
+  const rotated = rot % 2 === 1;
   const hw = (rotated ? fp.d : fp.w) / 2;
   const hd = (rotated ? fp.w : fp.d) / 2;
   return {
-    x0: item.pos.x - hw, z0: item.pos.z - hd,
-    x1: item.pos.x + hw, z1: item.pos.z + hd,
+    x0: pos.x - hw, z0: pos.z - hd,
+    x1: pos.x + hw, z1: pos.z + hd,
   };
+}
+
+/** World-space obstacle AABB for one item, or null for decorative items. */
+export function itemAabb(item: FurnitureItem): Box | null {
+  if (item.footprintOverride !== undefined) return item.footprintOverride;
+  return footprintAabb(item.kind, item.pos, item.rot);
+}
+
+/**
+ * Snap a candidate centre to the placement lattice (plan §2.6 parity rule):
+ * footprint tile-extents are integers, so per axis an ODD tile-extent puts
+ * the centre at n+0.5 and an EVEN extent at integer n (rot swaps which
+ * extent rules which axis). Items without a footprint (rugs, cherry trees,
+ * blossom pots — never obstacles) snap to the plain 0.5 m half-grid.
+ *
+ * Known parity wart (documented, not fixed): the two sofas' DEFAULT x=0.0
+ * sits on the even lattice while their w=3 parity prefers n+0.5 — a moved
+ * sofa therefore lands tile-aligned (x at n+0.5) rather than back on the
+ * legacy half-tile-offset column. Esc-cancel always restores the exact
+ * original position regardless.
+ */
+export function snapItemPos(
+  kind: FurnitureKind,
+  rot: Rot,
+  x: number,
+  z: number,
+): { x: number; z: number } {
+  const fp = FURNITURE_DEFS[kind].footprint;
+  if (!fp) {
+    return { x: Math.round(x * 2) / 2, z: Math.round(z * 2) / 2 };
+  }
+  const rotated = rot % 2 === 1;
+  const extentX = rotated ? fp.d : fp.w;
+  const extentZ = rotated ? fp.w : fp.d;
+  const snapAxis = (v: number, extent: number) =>
+    Math.round(extent) % 2 === 1 ? Math.floor(v) + 0.5 : Math.round(v);
+  return { x: snapAxis(x, extentX), z: snapAxis(z, extentZ) };
 }
 
 /** Derive the collision obstacle list (order = FURNITURE order). */

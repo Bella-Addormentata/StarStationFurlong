@@ -7,7 +7,7 @@
  * (deviceFocus.releaseThen), then enters edit mode; exiting edit mode returns
  * to the plain isometric room view.
  *
- * E2 scope — selection/highlight SHELL only (movement is E3):
+ * E2 scope — selection/highlight SHELL (E3 adds movement):
  *  - world.setEditMode(true) shows the 1 m platform grid
  *  - raycast hover over MOVABLE furniture groups applies an emissive
  *    highlight tint (originals stored per-material and restored exactly)
@@ -21,12 +21,38 @@
  *    morph restart (world.startMorph calls forceExit, mirroring
  *    deviceFocus.forceRelease)
  *
+ * E3 scope — click-carry-place (plan §E3 + §4 edge cases):
+ *  - clicking the SELECTED movable item picks it up: the group follows the
+ *    click-plane raycast point, snapped per the §2.6 parity rule
+ *    (snapItemPos); the original obstacle STAYS in OBSTACLES until commit —
+ *    no transient walk-through hole
+ *  - green/red emissive tint reflects validatePlacement() (bounds → overlap
+ *    → player clearance → scratch-grid connectivity), re-checked every frame
+ *    (players keep moving under a held item)
+ *  - click commits: item.pos/rot update → rebuildObstacles →
+ *    rebakeWalkableGrid → rebuildSeats → rebuildDevices (THAT order —
+ *    devices bake world-space eye/anchor poses off the walkable grid), then
+ *    player.onObstaclesChanged(itemId) replans/cancels in-flight navigation
+ *  - Esc / right-click cancels back to the exact origin (position, rotation
+ *    and OBSTACLES untouched); R rotates a quarter-turn while carrying
+ *  - picking up the item the local player sits on evicts them first via
+ *    player.evictFromSeat() (plan §4.2)
+ *  - forceExit() cancels a live carry before tearing down (plan §4.5)
+ *
  * Module singleton — exported as `roomEdit`, with `isEditModeActive()` for
  * the click-routing guard in main.ts (mirrors deviceFocus.ts).
  */
 
 import * as THREE from 'three';
-import { FURNITURE } from './furniture';
+import { FURNITURE, footprintAabb, itemAabb, snapItemPos } from './furniture';
+import type { FurnitureItem, Rot, Box } from './furniture';
+import { OBSTACLES, rebuildObstacles } from './obstacles';
+import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
+import { SEATS, rebuildSeats } from './seats';
+import { DEVICES, rebuildDevices } from './devices';
+import { DOORS } from './doors';
+import { PLAYER_R } from './player';
+import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
 import { showHint } from './hud';
 import type { World } from './world';
@@ -53,6 +79,127 @@ export function canEditRoom(): RoomEditPermission {
   return ownerPredicate();
 }
 
+// ── Placement validity (E3 of #25 — pure, reused by E4 remote-apply) ──────────
+
+export interface PlacementContext {
+  /** Every player position that must not be squashed (local + remotes). */
+  playerPositions: ReadonlyArray<{ x: number; z: number }>;
+  /** Connectivity flood-fill origin — the local player's position. */
+  floodFrom: { x: number; z: number };
+  /**
+   * Front points that are CURRENTLY reachable and must stay so (seat fronts,
+   * ALL door fronts, device fronts — pre-filtered by the caller against the
+   * pre-move grid, excluding the moved item's own fronts, which are rebaked
+   * after commit anyway).
+   */
+  requiredReachable: ReadonlyArray<{ x: number; z: number }>;
+}
+
+export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * May `item` be placed at (pos, rot)? Checks, in order (plan §E3):
+ *  1. footprint within the [−5,5]² walkable bounds
+ *  2. no AABB overlap with any OTHER item's current footprint (touching
+ *     edges are fine — the trunk sits flush against the hearth by design)
+ *  3. no player inside the footprint inflated by PLAYER_R (0.38)
+ *  4. stand-point clearance (review F1): no requiredReachable point inside
+ *     the footprint inflated by PLAYER_R + the FINE arrival tolerance —
+ *     grid reachability alone is NOT standability (the FINE phases drive to
+ *     the EXACT point with collision on, so a box edge within PLAYER_R of a
+ *     front point wedges every approach even though the point's grid cell
+ *     stays clear)
+ *  5. connectivity: flood-fill a scratch grid with the moved footprint
+ *     applied — every requiredReachable point must stay reachable from the
+ *     local player's cell
+ *
+ * The candidate box derives from the def footprint (footprintAabb), NOT a
+ * per-item footprintOverride — a moved item sheds its legacy world-space
+ * override on commit. Decorative items (footprint null — rugs, trees, pots)
+ * only get the bounds check: they never obstruct, so overlap/connectivity
+ * are moot (E5 refines their layering/raycast niceties).
+ *
+ * Pure: reads FURNITURE for the other items' current boxes, mutates nothing.
+ */
+export function validatePlacement(
+  item: FurnitureItem,
+  pos: { x: number; z: number },
+  rot: Rot,
+  ctx: PlacementContext,
+): PlacementVerdict {
+  const box = footprintAabb(item.kind, pos, rot);
+
+  // Decorative: bounds-only (position point inside the walkable square).
+  if (!box) {
+    if (pos.x < -5 || pos.x > 5 || pos.z < -5 || pos.z > 5) {
+      return { ok: false, reason: 'out of bounds' };
+    }
+    return { ok: true };
+  }
+
+  // 1. Bounds.
+  if (box.x0 < -5 || box.x1 > 5 || box.z0 < -5 || box.z1 > 5) {
+    return { ok: false, reason: 'out of bounds' };
+  }
+
+  // 2. Overlap with every other item's CURRENT footprint.
+  for (const other of FURNITURE) {
+    if (other.id === item.id) continue;
+    const ob = itemAabb(other);
+    if (!ob) continue;
+    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+      return { ok: false, reason: `overlaps ${other.id}` };
+    }
+  }
+
+  // 3. Player clearance (footprint inflated by the collision radius).
+  for (const p of ctx.playerPositions) {
+    if (
+      p.x > box.x0 - PLAYER_R && p.x < box.x1 + PLAYER_R &&
+      p.z > box.z0 - PLAYER_R && p.z < box.z1 + PLAYER_R
+    ) {
+      return { ok: false, reason: 'a player is in the way' };
+    }
+  }
+
+  // 4. Stand-point clearance (review F1): the FINE approach phases need to
+  //    land within 0.06 of the EXACT front point while resolveObstacles
+  //    keeps the player PLAYER_R away from every box — a candidate whose
+  //    inflated extent swallows a protected front point is physically
+  //    un-standable even when the point's grid cell stays walkable
+  //    (concrete pre-fix wedge: armchair at (2.5,4.5) put its edge 0.03 m
+  //    from the wall computer's front (1.8,4.97) — edit mode itself became
+  //    unreachable, with no way to undo).
+  const STAND_R = PLAYER_R + 0.06;
+  for (const pt of ctx.requiredReachable) {
+    if (
+      pt.x > box.x0 - STAND_R && pt.x < box.x1 + STAND_R &&
+      pt.z > box.z0 - STAND_R && pt.z < box.z1 + STAND_R
+    ) {
+      return { ok: false, reason: 'would block a stand-point' };
+    }
+  }
+
+  // 5. Connectivity on a scratch grid: candidate box + every OTHER item's
+  //    current box (the original spot is vacated, the candidate is applied).
+  const scratch: Box[] = [box];
+  for (const other of FURNITURE) {
+    if (other.id === item.id) continue;
+    const ob = itemAabb(other);
+    if (ob) scratch.push(ob);
+  }
+  const reachable = computeReachable(scratch, ctx.floodFrom.x, ctx.floodFrom.z);
+  for (const pt of ctx.requiredReachable) {
+    const row = worldToRow(pt.z);
+    const col = worldToCol(pt.x);
+    if (row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE || !reachable[row][col]) {
+      return { ok: false, reason: 'would seal off part of the room' };
+    }
+  }
+
+  return { ok: true };
+}
+
 // ── Highlight tints ───────────────────────────────────────────────────────────
 
 /** Hover: soft gold emissive wash (docking-terminal palette). */
@@ -61,6 +208,12 @@ const HOVER_INTENSITY = 0.28;
 /** Selected: stronger, brighter gold. */
 const SELECT_EMISSIVE = 0xf0c060;
 const SELECT_INTENSITY = 0.65;
+/** Carrying, current spot valid: green wash. */
+const CARRY_VALID_EMISSIVE = 0x35d06a;
+const CARRY_VALID_INTENSITY = 0.55;
+/** Carrying, current spot invalid: red wash. */
+const CARRY_INVALID_EMISSIVE = 0xe03636;
+const CARRY_INVALID_INTENSITY = 0.6;
 
 /** A material we can emissive-tint (MeshStandardMaterial and friends). */
 type EmissiveMaterial = THREE.Material & { emissive: THREE.Color; emissiveIntensity: number };
@@ -82,6 +235,28 @@ class RoomEditController {
 
   private hoveredId: string | null = null;
   private selectedId: string | null = null;
+
+  /**
+   * Live carry (E3), or null. While non-null the group at `group` follows
+   * the pointer (snapped); the registry item and OBSTACLES stay untouched
+   * until commit, so cancel is a pure visual restore.
+   */
+  private carrying: {
+    itemId: string;
+    item: FurnitureItem;
+    group: THREE.Group;
+    originPos: { x: number; z: number };
+    originRot: Rot;
+    candidatePos: { x: number; z: number };
+    candidateRot: Rot;
+    valid: boolean;
+    /** Currently-reachable fronts that must survive the move (fixed for the
+     *  whole carry — the pre-move grid can't change while we hold the item). */
+    requiredReachable: Array<{ x: number; z: number }>;
+    /** Flood origin captured at pickup — the per-frame fallback when the
+     *  player's live cell is transiently blocked (mid stand-up slide). */
+    floodOrigin: { x: number; z: number };
+  } | null = null;
 
   /**
    * Original emissive state, saved ONCE per material on first tint and
@@ -119,7 +294,31 @@ class RoomEditController {
         return; // #31 owns Esc while the phone is open
       }
       e.preventDefault();
+      // E3: a live carry consumes the first Esc (cancel back to origin);
+      // a second Esc then exits edit mode as before.
+      if (this.carrying) {
+        this.cancelCarry(true);
+        return;
+      }
       this.exit();
+    });
+
+    // E3: right-click cancels a live carry (same restore path as Esc).
+    window.addEventListener('contextmenu', (e) => {
+      if (!this.active || !this.carrying) return;
+      e.preventDefault();
+      this.cancelCarry(true);
+    });
+
+    // E3: R rotates the carried item a quarter-turn CCW (cheap on the
+    // existing rotXZ machinery — itemAabb/snapItemPos/buildSeatList already
+    // understand rot, so this is candidateRot + group.rotation.y + re-snap).
+    window.addEventListener('keydown', (e) => {
+      if (!this.active || !this.carrying) return;
+      if (e.key !== 'r' && e.key !== 'R') return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      this.rotateCarry();
     });
   }
 
@@ -131,6 +330,23 @@ class RoomEditController {
   /** Currently selected item id, or null (debug/verification handle). */
   public getSelectedId(): string | null {
     return this.selectedId;
+  }
+
+  /** Id of the item being carried, or null (debug/verification handle). */
+  public getCarriedId(): string | null {
+    return this.carrying?.itemId ?? null;
+  }
+
+  /** Whether the current carry position is a valid drop (debug/verification). */
+  public isCarryValid(): boolean {
+    return this.carrying?.valid ?? false;
+  }
+
+  /** Current snapped carry candidate pose, or null (debug/verification). */
+  public getCarryCandidate(): { x: number; z: number; rot: Rot } | null {
+    return this.carrying
+      ? { ...this.carrying.candidatePos, rot: this.carrying.candidateRot }
+      : null;
   }
 
   /**
@@ -166,6 +382,7 @@ class RoomEditController {
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
   public exit(): void {
     if (!this.active) return;
+    this.cancelCarry(false); // E3: never exit with an item in hand
     this.setHovered(null);
     this.setSelected(null);
     window.removeEventListener('mousemove', this.onMouseMove);
@@ -181,21 +398,44 @@ class RoomEditController {
 
   /**
    * Instant teardown for external interruptions — morph restart
-   * (world.startMorph), zoom leaving level 2, solar map opening. E2 has no
-   * carry state, so this is exit(); E3 will additionally cancel a carry here.
+   * (world.startMorph), zoom leaving level 2, solar map opening. A live
+   * carry cancels back to its origin first (plan §4.5 — the original
+   * obstacle never left OBSTACLES, so this is a pure visual restore).
    */
   public forceExit(): void {
+    this.cancelCarry(false);
     this.exit();
   }
 
   /**
    * Edit-mode click routing (from main.ts onCanvasClick, BEFORE the keypad →
-   * door → device passes): click a movable item → select it; click anywhere
-   * else → deselect. Navigation is suppressed by the caller returning early.
+   * door → device passes). Navigation is suppressed by the caller returning
+   * early. Three-way:
+   *  - carrying → the click is a COMMIT attempt at the (snapped) click point
+   *  - clicking the already-SELECTED movable item → pick it up (E3)
+   *  - otherwise → select / deselect (E2 behaviour)
    */
   public handleClick(event: MouseEvent): void {
     if (!this.active) return;
-    this.setSelected(this.pickItemAt(event.clientX, event.clientY));
+
+    if (this.carrying) {
+      // Ignore clicks landing on HUD/overlay elements — only canvas clicks
+      // count as a place attempt (mirrors the hover e.target guard).
+      const canvas = window.gameRenderer?.renderer?.domElement;
+      if (canvas && event.target !== canvas) return;
+      // Track the click point first (a commit without a preceding mousemove —
+      // e.g. synthetic clicks — must still place AT the click).
+      this.updateCarryFromPointer(event.clientX, event.clientY);
+      this.commitCarry();
+      return;
+    }
+
+    const hit = this.pickItemAt(event.clientX, event.clientY);
+    if (hit && hit === this.selectedId) {
+      this.beginCarry(hit);
+      return;
+    }
+    this.setSelected(hit);
   }
 
   /**
@@ -216,6 +456,11 @@ class RoomEditController {
       this.forceExit();
       return;
     }
+
+    // E3: re-validate the carry every frame — the candidate spot is fixed
+    // between mousemoves but PLAYERS keep walking (WASD stays live in edit
+    // mode, and remotes move on their own), so validity can flip in place.
+    if (this.carrying) this.revalidateCarry();
 
     this.updateLabelPosition();
   }
@@ -265,8 +510,248 @@ class RoomEditController {
       this.setHovered(null);
       return;
     }
+    // E3: while carrying, the pointer drives the held item, not hover.
+    if (this.carrying) {
+      this.updateCarryFromPointer(e.clientX, e.clientY);
+      return;
+    }
     this.setHovered(this.pickItemAt(e.clientX, e.clientY));
   };
+
+  // ── Carry machinery (E3 of #25) ─────────────────────────────────────────────
+
+  /** Pick up the (already selected) movable item — enter carry mode. */
+  private beginCarry(itemId: string): void {
+    const world = this.world;
+    if (!world || this.carrying) return;
+    const item = FURNITURE.find((i) => i.id === itemId);
+    const group = world.furnitureGroups.get(itemId);
+    if (!item || !group || !item.movable) return;
+
+    const player = world.getPlayer();
+    // Flood origin BEFORE any eviction: a player seated on the carried item
+    // resolves to that seat's front point (where the stand-up slide lands).
+    const floodOrigin = this.localFloodOrigin(player);
+    // Plan §4.2: picking up the item the local player sits on evicts them
+    // first (public stand-up path).
+    const seatedId = player.getSeatedSeatId();
+    if (seatedId && seatedId.startsWith(`${itemId}:`)) {
+      player.evictFromSeat();
+    }
+
+    this.carrying = {
+      itemId,
+      item,
+      group,
+      originPos: { ...item.pos },
+      originRot: item.rot,
+      candidatePos: { ...item.pos },
+      candidateRot: item.rot,
+      valid: true,
+      requiredReachable: this.collectRequiredReachable(itemId, floodOrigin),
+      floodOrigin,
+    };
+    this.setHovered(null);
+    this.revalidateCarry(true);
+    this.setCanvasCursor('grabbing');
+    showHint('CARRYING — click to place · R rotate · ESC cancel', 5000);
+  }
+
+  /** Track the click-plane raycast point, snapped to the placement lattice. */
+  private updateCarryFromPointer(clientX: number, clientY: number): void {
+    const c = this.carrying;
+    const camera = window.gameRenderer?.camera;
+    const plane = this.world?.getClickPlane();
+    if (!c || !camera || !plane) return;
+    this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
+    this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointerNdc, camera);
+    const hits = this.raycaster.intersectObject(plane, false);
+    if (hits.length === 0) return;
+    const snapped = snapItemPos(c.item.kind, c.candidateRot, hits[0].point.x, hits[0].point.z);
+    if (snapped.x === c.candidatePos.x && snapped.z === c.candidatePos.z) return;
+    c.candidatePos = snapped;
+    c.group.position.set(snapped.x, 0, snapped.z);
+    this.revalidateCarry(); // immediate tint (update() re-checks per frame too)
+  }
+
+  /** R: quarter-turn CCW; parity can swap for non-square footprints → re-snap. */
+  private rotateCarry(): void {
+    const c = this.carrying;
+    if (!c) return;
+    c.candidateRot = ((c.candidateRot + 1) % 4) as Rot;
+    c.candidatePos = snapItemPos(c.item.kind, c.candidateRot, c.candidatePos.x, c.candidatePos.z);
+    c.group.position.set(c.candidatePos.x, 0, c.candidatePos.z);
+    c.group.rotation.y = c.candidateRot * (Math.PI / 2);
+    this.revalidateCarry(true);
+  }
+
+  /**
+   * Commit the carry at the current candidate: registry write-through, then
+   * the full rebake pipeline in the order the derivations depend on each
+   * other — rebuildObstacles → rebakeWalkableGrid → rebuildSeats →
+   * rebuildDevices (seats AND devices bake world-space fronts/poses off the
+   * fresh grid — the #33 review's coordination point) — then
+   * player.onObstaclesChanged(). Invalid spots reject with a hint and stay
+   * in carry mode.
+   */
+  private commitCarry(): void {
+    const c = this.carrying;
+    const world = this.world;
+    if (!c || !world) return;
+
+    const verdict = this.currentCarryVerdict();
+    if (!verdict.ok) {
+      c.valid = false;
+      this.applyTint(c.itemId, CARRY_INVALID_EMISSIVE, CARRY_INVALID_INTENSITY);
+      showHint(`CAN'T PLACE — ${verdict.reason}`, 2200);
+      return;
+    }
+
+    c.item.pos = { ...c.candidatePos };
+    c.item.rot = c.candidateRot;
+    // A committed item sheds its E1 world-space footprintOverride: the
+    // override encoded the ORIGINAL hand-authored obstacle (e.g. the
+    // front-right lamp table's one-tile drift); from here on the derived
+    // footprint — which matches the visual, and is what validatePlacement
+    // just approved — is the honest obstacle.
+    if (c.item.footprintOverride !== undefined) delete c.item.footprintOverride;
+
+    c.group.position.set(c.item.pos.x, 0, c.item.pos.z);
+    c.group.rotation.y = c.item.rot * (Math.PI / 2);
+
+    rebuildObstacles();
+    rebakeWalkableGrid();
+    rebuildSeats();
+    rebuildDevices();
+    world.getPlayer().onObstaclesChanged(c.itemId);
+
+    const itemId = c.itemId;
+    this.carrying = null;
+    // Back to the plain selected state (the item stays selected).
+    if (this.selectedId === itemId) {
+      this.applyTint(itemId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else {
+      this.clearTint(itemId);
+    }
+    this.setCanvasCursor('');
+    showHint('Placed.', 1400);
+  }
+
+  /**
+   * Cancel back to the exact origin. The registry item and OBSTACLES were
+   * never touched during the carry, so this is a pure visual restore.
+   */
+  private cancelCarry(announce: boolean): void {
+    const c = this.carrying;
+    if (!c) return;
+    c.group.position.set(c.originPos.x, 0, c.originPos.z);
+    c.group.rotation.y = c.originRot * (Math.PI / 2);
+    this.carrying = null;
+    if (this.selectedId === c.itemId) {
+      this.applyTint(c.itemId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else {
+      this.clearTint(c.itemId);
+    }
+    this.setCanvasCursor('');
+    if (announce) showHint('Move cancelled.', 1400);
+  }
+
+  /** Validate the current candidate against live player positions. */
+  private currentCarryVerdict(): PlacementVerdict {
+    const c = this.carrying;
+    const world = this.world;
+    if (!c || !world) return { ok: false, reason: 'no carry in progress' };
+    const player = world.getPlayer();
+    const local = player.getPosition();
+
+    // Per-frame flood origin: the player's live cell, unless it is blocked
+    // in the CURRENT grid (transient — mid stand-up slide), then the origin
+    // captured at pickup.
+    let floodFrom = this.localFloodOrigin(player);
+    const row = worldToRow(floodFrom.z);
+    const col = worldToCol(floodFrom.x);
+    if (row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE || !walkable[row][col]) {
+      floodFrom = c.floodOrigin;
+    }
+
+    return validatePlacement(c.item, c.candidatePos, c.candidateRot, {
+      playerPositions: [
+        { x: local.x, z: local.z },
+        ...world.getRemotePlayerPositions(),
+      ],
+      floodFrom,
+      requiredReachable: c.requiredReachable,
+    });
+  }
+
+  /** Re-check validity; retint green/red only when the verdict flips. */
+  private revalidateCarry(forceTint = false): void {
+    const c = this.carrying;
+    if (!c) return;
+    const ok = this.currentCarryVerdict().ok;
+    if (ok !== c.valid || forceTint) {
+      c.valid = ok;
+      this.applyTint(
+        c.itemId,
+        ok ? CARRY_VALID_EMISSIVE : CARRY_INVALID_EMISSIVE,
+        ok ? CARRY_VALID_INTENSITY : CARRY_INVALID_INTENSITY,
+      );
+    }
+  }
+
+  /**
+   * The local player's connectivity origin: their position — or, while
+   * seated (the sit point is INSIDE a footprint, so its cell is blocked),
+   * the occupied seat's front point.
+   */
+  private localFloodOrigin(player: Player): { x: number; z: number } {
+    const seatedId = player.getSeatedSeatId();
+    if (seatedId) {
+      const seat = SEATS.find((s) => s.id === seatedId);
+      if (seat) return { x: seat.front.x, z: seat.front.z };
+    }
+    const pos = player.getPosition();
+    return { x: pos.x, z: pos.z };
+  }
+
+  /**
+   * Snapshot the front points that are currently reachable from the flood
+   * origin — the set a valid drop must preserve (plan §E3): every seat
+   * front, every door front (ALL four — review F3: pairing is dynamic, so a
+   * mid-carry pairing can enable a door whose front was just sealed; door
+   * hardware is fixed, protecting the lot costs nothing), and every device
+   * front (a deliberate small extension over the plan's seats+doors list:
+   * sealing the wall computer would lock the owner out of edit mode
+   * itself). The MOVED item's
+   * own fronts are excluded — they are rebaked at its new position after
+   * commit. Fixed for the whole carry: the pre-move grid cannot change while
+   * the item is held (its original obstacle never leaves OBSTACLES).
+   */
+  private collectRequiredReachable(
+    itemId: string,
+    origin: { x: number; z: number },
+  ): Array<{ x: number; z: number }> {
+    const reachable = computeReachable(OBSTACLES, origin.x, origin.z);
+    const isReachable = (p: { x: number; z: number }): boolean => {
+      const row = worldToRow(p.z);
+      const col = worldToCol(p.x);
+      return row >= 0 && row < GRID_SIZE && col >= 0 && col < GRID_SIZE && reachable[row][col];
+    };
+    const pts: Array<{ x: number; z: number }> = [];
+    for (const seat of SEATS) {
+      if (seat.id.startsWith(`${itemId}:`)) continue;
+      if (isReachable(seat.front)) pts.push({ x: seat.front.x, z: seat.front.z });
+    }
+    for (const door of DOORS) {
+      if (isReachable(door.front)) pts.push({ x: door.front.x, z: door.front.z });
+    }
+    for (const device of DEVICES) {
+      if (device.id === itemId) continue;
+      if (isReachable(device.front)) pts.push({ x: device.front.x, z: device.front.z });
+    }
+    return pts;
+  }
 
   private setHovered(itemId: string | null): void {
     if (itemId === this.hoveredId) return;

@@ -1032,6 +1032,20 @@ export class World {
     this.remotePlayers.delete(id);
   }
 
+  /**
+   * World positions of every remote player replica (E3 of #25 — the plan's
+   * "read remote positions through a World accessor" rule: #27 owns the
+   * replica representation, so validity checks must not reach into it).
+   */
+  public getRemotePlayerPositions(): Array<{ x: number; z: number }> {
+    const positions: Array<{ x: number; z: number }> = [];
+    for (const avatar of this.remotePlayers.values()) {
+      const pos = avatar.rig.masterGroup.position;
+      positions.push({ x: pos.x, z: pos.z });
+    }
+    return positions;
+  }
+
   /** Despawn every remote player replica (room re-bootstrap). */
   public clearRemotePlayers() {
     for (const id of [...this.remotePlayers.keys()]) {

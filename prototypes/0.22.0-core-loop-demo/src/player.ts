@@ -64,7 +64,7 @@
 
 import * as THREE from 'three';
 import { InputManager } from './input';
-import { updateDebugHUD } from './hud';
+import { updateDebugHUD, showHint } from './hud';
 import { VoxelCharacter } from './voxelCharacter';
 import { WaypointReticle } from './waypoint';
 import { findPath, worldToCol, worldToRow } from './pathfinding';
@@ -74,7 +74,8 @@ import type { DoorTarget, DoorSequenceHooks } from './doors';
 import type { DeviceTarget, DeviceFocusHooks } from './devices';
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
-const PLAYER_R = 0.38;
+/** Collision radius — exported for the E3 move-furniture player-overlap check. */
+export const PLAYER_R = 0.38;
 
 const SNAP_INCREMENT = Math.PI / 4;
 
@@ -189,6 +190,16 @@ export class Player {
   private deviceHooks: DeviceFocusHooks | null = null;
   /** Phase timer (TURN dwell — reuses TURN_TIME). */
   private deviceTimer = 0;
+
+  // ── FINE stuck watchdog (E3 review F2) ─────────────────────────────────────
+  /** Seconds without positional progress while in a FINE phase. */
+  private fineStuckTimer = 0;
+  /** Last frame's position — progress baseline for the watchdog. */
+  private fineLastPos = { x: 0, z: 0 };
+  /** No progress for this long in any FINE phase → give up (belt-and-braces). */
+  private readonly FINE_STUCK_TIME = 1.5;
+  /** Per-frame movement below this counts as "no progress". */
+  private readonly FINE_STUCK_EPS = 0.005;
 
   constructor(scene: THREE.Scene) {
     this.scene     = scene;
@@ -612,6 +623,10 @@ export class Player {
       }
     }
 
+    // FINE stuck watchdog (E3 review F2): runs AFTER the phase updates so it
+    // compares post-move positions.
+    this._updateFineWatchdog(deltaTime);
+
     // Animate the reticle if active
     if (this.reticle) {
       this.reticle.update(deltaTime);
@@ -636,6 +651,166 @@ export class Player {
   /** Returns the player's current world-space position. */
   getPosition(): THREE.Vector3 {
     return this.mesh.position.clone();
+  }
+
+  /**
+   * Seat id currently occupied (SEATED, or mid SIT_DOWN slide), or null.
+   * E3 of #25: the room editor uses it to detect "picking up the item I'm
+   * sitting on" (seat ids are `${itemId}:${templateIndex}`).
+   */
+  public getSeatedSeatId(): string | null {
+    return (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') && this.sitTarget
+      ? this.sitTarget.id
+      : null;
+  }
+
+  /**
+   * Public eviction wrapping the stand-up path (E3 of #25): the room editor
+   * calls it before carrying the item the local player is sitting on. Any
+   * deferred action is dropped — the sit is over, nothing should resume —
+   * and control returns to MANUAL once the stand-up slide completes.
+   */
+  public evictFromSeat(): void {
+    if (this.sitPhase !== 'SEATED' && this.sitPhase !== 'SIT_DOWN') return;
+    this.pendingDest = null;
+    this.pendingSeat = null;
+    this.pendingDoor = null;
+    this.pendingDevice = null;
+    this._beginStandUp();
+  }
+
+  /**
+   * FINE stuck watchdog (E3 review F2, belt-and-braces): every FINE phase
+   * (seat / door / device) drives toward an EXACT front point with collision
+   * ON and a 0.06 arrival tolerance. The placement gate's stand-point check
+   * keeps PROTECTED fronts clear, but the moved item's OWN rebaked fronts
+   * are never validated and computeFront's nearest-walkable fallback can
+   * pick a cell that is grid-walkable yet physically pinched by inflated
+   * AABBs — a wedge that would otherwise idle-walk forever. No positional
+   * progress for FINE_STUCK_TIME while in any FINE phase → abandon the
+   * approach, back to MANUAL, with a hint.
+   */
+  private _updateFineWatchdog(deltaTime: number): void {
+    const inFine =
+      this.sitPhase === 'FINE' || this.doorPhase === 'FINE' || this.devicePhase === 'FINE';
+    const pos = this.mesh.position;
+    if (!inFine) {
+      this.fineStuckTimer = 0;
+      this.fineLastPos.x = pos.x;
+      this.fineLastPos.z = pos.z;
+      return;
+    }
+    const moved = Math.hypot(pos.x - this.fineLastPos.x, pos.z - this.fineLastPos.z);
+    this.fineLastPos.x = pos.x;
+    this.fineLastPos.z = pos.z;
+    if (moved > this.FINE_STUCK_EPS) {
+      this.fineStuckTimer = 0;
+      return;
+    }
+    this.fineStuckTimer += deltaTime;
+    if (this.fineStuckTimer < this.FINE_STUCK_TIME) return;
+    this.fineStuckTimer = 0;
+    // Wedged — abandon whichever approach owns the fine step (exactly one
+    // of these is non-NONE; the cancel helpers no-op for the others).
+    this._abortDoorApproach();
+    this._cancelDeviceApproach();
+    this._cancelSit();
+    this._clearPath();
+    this.navMode = 'MANUAL';
+    showHint("Can't reach that spot.");
+  }
+
+  /*
+   * E4 remote-apply hazards (recorded for the sync slice — review F4).
+   * When a REMOTE furniture move arrives via the Yjs observer and is applied
+   * through this same rebuild pipeline, onObstaclesChanged as written is NOT
+   * sufficient:
+   *  (a) it must no-op/defer while the local player is on a scripted
+   *      outside-the-room leg (door THROUGH/PEEK/RETURN, and any future
+   *      ADAPTER_* vestibule phases) — those legs ignore the grid by design,
+   *      and replanning mid-leg would yank the avatar through geometry;
+   *      defer the reconcile until the RETURN leg completes.
+   *  (b) a remote move of a device the local player is FOCUSED on (or
+   *      PREPARING toward) needs a deviceFocus force-release or camera
+   *      re-anchor — the eye/anchor this session's controller holds were
+   *      baked in world space and went stale the moment the item moved.
+   *  (c) a remote-seated player must be evicted at COMMIT time by the
+   *      observer (evictFromSeat before applying the move, stand-up to the
+   *      PRE-move front point) — the local pickup-time eviction in
+   *      editMode.beginCarry only covers the editing client.
+   */
+
+  /**
+   * The furniture layout just changed under our feet (E3 of #25 — a move was
+   * committed: OBSTACLES rebuilt, walkable grid rebaked, SEATS/DEVICES
+   * rederived). Reconcile navigation state with the new layout:
+   *
+   *  - a seat approach (APPROACH/FINE/TURN) whose seat belongs to the moved
+   *    item is cancelled — its derived Seat entry was rebaked, the held
+   *    reference points at the OLD world pose;
+   *  - a device approach (APPROACH/FINE/TURN) to the moved item is cancelled
+   *    for the same reason (the DeviceTarget's front/eye/anchor were rebaked
+   *    in world space — the #33 review's exact coordination point);
+   *  - a door approach is never target-cancelled here — doors cannot move in
+   *    E3 and the connectivity gate guarantees enabled door fronts stay
+   *    reachable — but its APPROACH leg is replanned like any other path;
+   *  - a surviving WAYPOINT path is replanned from the current position to
+   *    its destination (the reticle point, or the approach target's front),
+   *    since the old node list may now thread through the moved footprint.
+   *    If the destination became unreachable the whole route is cancelled.
+   *
+   * SEATED and ENGAGED poses are left alone (the editor evicts a player
+   * seated ON the moved item explicitly via evictFromSeat() at pickup), as
+   * is the scripted door THROUGH/PEEK/RETURN stretch outside the room.
+   */
+  public onObstaclesChanged(movedItemId?: string): void {
+    // 1. Cancel in-flight approaches whose target item moved.
+    if (
+      movedItemId !== undefined &&
+      (this.devicePhase === 'APPROACH' || this.devicePhase === 'FINE' || this.devicePhase === 'TURN') &&
+      this.deviceTarget && this.deviceTarget.id === movedItemId
+    ) {
+      this._cancelDeviceApproach();
+      this.navMode = 'MANUAL';
+    }
+    if (
+      movedItemId !== undefined &&
+      (this.sitPhase === 'APPROACH' || this.sitPhase === 'FINE' || this.sitPhase === 'TURN') &&
+      this.sitTarget && this.sitTarget.id.startsWith(`${movedItemId}:`)
+    ) {
+      this._cancelSit();
+      this._clearPath();
+      this.navMode = 'MANUAL';
+    }
+    // (Door approaches: nothing to cancel — see doc comment — fall through
+    //  to the replan below.)
+
+    // 2. Replan a surviving WAYPOINT leg across the new grid.
+    if (this.navMode !== 'WAYPOINT' || this.waypointPath.length === 0) return;
+
+    const goal =
+      this.sitPhase === 'APPROACH' && this.sitTarget ? this.sitTarget.front
+      : this.doorPhase === 'APPROACH' && this.doorTarget ? this.doorTarget.front
+      : this.devicePhase === 'APPROACH' && this.deviceTarget ? this.deviceTarget.front
+      : this.waypointPath[this.waypointPath.length - 1];
+
+    const pos = this.mesh.position;
+    const path = findPath(
+      worldToRow(pos.z), worldToCol(pos.x),
+      worldToRow(goal.z), worldToCol(goal.x),
+    );
+    if (path.length === 0) {
+      // Destination unreachable in the new layout (or we already stand on
+      // its cell — cancelling then is harmless): stop rather than walk a
+      // stale node list through the moved footprint.
+      this._abortDoorApproach();
+      this._cancelDeviceApproach();
+      this._cancelSit();
+      this._clearPath();
+      this.navMode = 'MANUAL';
+      return;
+    }
+    this.waypointPath = path;
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
