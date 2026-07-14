@@ -153,6 +153,10 @@ They compose at three concrete seams — this is where the Phase-4 code hands of
 
 **Build order:** ChiaHub chain IO (C1) is gated on spike **B-7** (chia-wallet-sdk audit) and is independent of Slices 1–6 — but Slice 1's identity keys are a *prerequisite* for seam 3 (identity-keyed presence). Recommend: land Slices 1–4 + M1–M2 first (done/in-progress), then B-7 → C1 presence-as-a-hint-source, wiring it behind `hintsFor → null` as seam 1. Do **not** let ChiaHub block the live mesh; it is the floor, added under a working ladder.
 
+### 7.8 — M5: the *traffic* mesh (distinct from this *reachability* mesh) *(cross-link)*
+
+M1–M4 above are a **reachability** mesh (find + reach a peer); they do not change how game **traffic** is distributed — that stays a hub-centric star (real-time ticks are hop-1-capped, single-hub-critical). The **traffic-topology** layer is its own plan: **[m5-traffic-mesh-plan.md](m5-traffic-mesh-plan.md)** — "flood over a bounded, trust-ordered neighbor set," synthesized from a design panel. It **depends on** M4 (M4 makes neighbors connectable; M5 decides the overlay + floods over it) and reuses M1's `peerStore` (neighbor selection) + M2's introductions (roster-admission sybil gate). Its first slice (M5.0, the signed roster/admission gate) **overlaps Slice 2** (the node verify-before-apply seam) — sequence them together. Keep the two meshes conceptually separate: M4 = *who can I reach*, M5 = *how does traffic flow across the reachable set*.
+
 ---
 
 ## 8. Social structure: Friends, Contacts (mesh), and Companies *(owner refinement)*
