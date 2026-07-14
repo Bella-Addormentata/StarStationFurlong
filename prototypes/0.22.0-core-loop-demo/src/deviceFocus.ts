@@ -296,7 +296,10 @@ class DeviceFocusController {
       if (child instanceof THREE.Mesh && child.material) {
         const mat = child.material as THREE.Material & { opacity: number };
         mat.transparent = true;
-        mat.opacity = opacity;
+        // Respect design opacity (e.g. the outfit visor's 0.35) — same contract
+        // as zoom.ts's avatar fade. A blanket 1.0 restore would leave
+        // translucent accessories permanently opaque after one focus cycle.
+        mat.opacity = ((mat.userData?.baseOpacity as number) ?? 1) * opacity;
         mat.needsUpdate = true;
       }
     });

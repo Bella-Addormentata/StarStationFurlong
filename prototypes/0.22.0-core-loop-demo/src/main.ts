@@ -1346,6 +1346,9 @@ function setupSolarMap() {
   const zoomOutBtn = document.getElementById('map-zoom-out-btn');
 
   const toggleMap = () => {
+    // Don't open the fullscreen map overlay while device focus owns the view
+    // (the 'm' hotkey is guarded upstream; this covers the HUD toggle button).
+    if (isDeviceFocusActive() && !isMapOpen) return;
     isMapOpen = !isMapOpen;
     if (isMapOpen) {
       solarSystemMap.show();

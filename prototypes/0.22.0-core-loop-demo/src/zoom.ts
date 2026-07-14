@@ -321,6 +321,9 @@ export class MultiScaleZoomView {
   }
 
   private zoomIn() {
+    // Device focus owns the camera — HUD zoom buttons must not steal it
+    // (the keydown path is guarded upstream; this covers the buttons).
+    if (isDeviceFocusActive()) return;
     if (this.currentLevel > 1) {
       if (this.currentLevel === 2) {
         // Trigger smooth trajectory transition to Level 1 (First Person) from current camera position
@@ -346,6 +349,8 @@ export class MultiScaleZoomView {
   }
 
   private zoomOut() {
+    // Device focus owns the camera — see zoomIn() guard.
+    if (isDeviceFocusActive()) return;
     if (this.currentLevel < 8) {
       if (this.currentLevel === 1) {
         // Trigger eyelid blink before returning to standard room view (Level 2)
