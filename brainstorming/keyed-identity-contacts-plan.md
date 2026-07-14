@@ -163,3 +163,17 @@ A **company** is a *keyed entity* — its own identity (keypair) plus a set of m
 - **Income:** the Bank ledger (phone-apps S6) credits the company account; distribution splits by share to member keys. Income sources tie into games/wagering (the chia-gaming rail in `games-plan.md`).
 
 **Honest placement:** economy-phase, several steps out — it depends on (a) keyed identity (this design), (b) the Bank/ledger (S6), and (c) asset-ownership-as-ledger (new). Record it as the north-star for a "shared entities" phase; don't build it before the economy exists. But nothing in the keyed-identity foundation blocks it: a company is just a keyed entity with a threshold control policy and a share ledger — all expressible with the same Ed25519 + signed-op-log primitives this plan already builds.
+
+---
+
+## 9. Room access modes: Public / Pass / Keyed — doors as the surface *(owner refinement)*
+
+Access is a spectrum, not a lock. A room carries an explicit owner-set **access mode**, stored in `roomInfo` and surfaced at the door:
+
+- **Public / Unlocked** — anyone can enter; freely discoverable; the door is open (green), no pin, no grant. Town squares, shops, open events. The deliberate *open* end — the counterpart that keeps the mesh welcoming rather than walled.
+- **Pass / Possession** (today's default) — anyone holding the room pass enters (shareable link; unlisted-but-open).
+- **Keyed / Granted** — only granted contact keys (Slices 5–6). Homes, private hangouts.
+
+**Doors are the surface.** `DoorTarget` (`src/doors.ts:22`) already has an `enabled` flag and a `requestOpen` that can be **denied** — *"Returns false immediately when the request is denied (locked port)"* (`src/doors.ts:53–56`). That denial hook is exactly the seam: an **unlocked/public door** always opens and admits anyone who walks through; a **locked door** consults the target room's mode (the existing pin/keypad today; the grant check after Slice 6). The north door's keypad is the "locked" visual — "public" is its open twin (green, always-opens).
+
+**This ships mostly independent of the crypto — and can come FIRST.** "Public" is the *permissive* direction: no new enforcement, just (a) an explicit `accessMode: 'public'` on the room (`roomInfo`), owner-set in edit mode, (b) a door unlocked-state (open/green, no pin, always-opens), and (c) optionally listing the room as discoverable (a simple shareable "public rooms" set, later advertised over the §7 mesh). The *restrictive* direction (keyed grants) is the part that needs Slices 1–6. So a **public-doors slice is a candidate to land before the keyed identity** — it makes the open mode intentional and legible today, and it composes cleanly with the crypto because the node's Slice-6 rule is already "keyed iff a valid `create` op exists, else open." Public/pass rooms simply never carry a `create` op, so they need no gate by construction; `accessMode` is the owner's stated *intent*, and the node enforces only the keyed case.
