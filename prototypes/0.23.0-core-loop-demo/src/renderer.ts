@@ -1,7 +1,8 @@
 /**
  * Three.js Renderer Setup
- * Orthographic (parallel-projection) camera locked to a fixed isometric angle.
- * Camera position and orientation never change after initialization.
+ * Orthographic (parallel-projection) camera locked to a fixed isometric
+ * elevation and radius. After initialization only two systems may move it:
+ * zoom.ts (level snaps) and cameraRig.ts (45°-detent view rotation).
  */
 
 import * as THREE from 'three';
@@ -62,8 +63,9 @@ export function initRenderer() {
 
   // ── Fixed isometric angle ──────────────────────────────────────────────────
   // Position the camera along the (1, 1.2, 1) diagonal so we get a slightly
-  // elevated three-quarter view of the lobby platform.  This position is
-  // intentionally never modified after this point.
+  // elevated three-quarter view of the lobby platform. This is the yaw-0
+  // detent of the camera rig — cameraRig.ts swings the same offset around
+  // the Y axis in 45° steps (elevation and radius stay locked).
   camera.position.set(22, 26, 22);
   camera.lookAt(0, 0, 0);
   camera.updateProjectionMatrix();

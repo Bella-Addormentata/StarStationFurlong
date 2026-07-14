@@ -41,6 +41,7 @@
  */
 
 import * as THREE from 'three';
+import { rotateIsoOffset } from './cameraRig';
 import type { DeviceTarget, DeviceUI } from './devices';
 import type { Player } from './player';
 
@@ -56,8 +57,14 @@ type FocusState = 'IDLE' | 'WALKING' | 'PREPARING' | 'FOCUSING' | 'FOCUSED' | 'R
 
 /** Ease duration each way (seconds) — plan §D0.1. */
 const EASE_TIME = 0.45;
-/** The isometric camera offset from the look target (renderer.ts:67). */
+/**
+ * The yaw-0 isometric camera offset from the look target (renderer.ts:67).
+ * Ease endpoints swing it through rotateIsoOffset() so the flight departs
+ * from / returns to whatever 45° detent the camera rig is parked on.
+ */
 const ISO_OFFSET = new THREE.Vector3(22, 26, 22);
+/** Scratch vector for the rotated offset (avoids per-ease allocation). */
+const ROTATED_ISO = new THREE.Vector3();
 
 class DeviceFocusController {
   private state: FocusState = 'IDLE';
@@ -187,11 +194,12 @@ class DeviceFocusController {
     this.active?.device.onRelease?.(); // e.g. trunk lid close, parallel to the ease
 
     // Reverse ease from wherever the camera currently is back to the exact
-    // iso offset over the player (who cannot move while ENGAGED).
+    // iso offset over the player (who cannot move while ENGAGED), on the
+    // camera rig's current rotation detent.
     const playerPos = player.getPosition();
     this.easeFromPos.copy(this.focusCam.position);
     this.easeFromLook.copy(this.currentLook);
-    this.easeToPos.copy(playerPos).add(ISO_OFFSET);
+    this.easeToPos.copy(playerPos).add(rotateIsoOffset(ISO_OFFSET, ROTATED_ISO));
     this.easeToLook.set(playerPos.x, playerPos.y + 0.6, playerPos.z);
     this.easeT = 0;
     player.mesh.visible = true; // fades back in during the ease
@@ -334,8 +342,9 @@ class DeviceFocusController {
     const playerPos = player.getPosition();
 
     // Iso-offset continuity: the perspective flight starts at the exact
-    // apparent isometric viewpoint, then eases down to the device eye.
-    this.easeFromPos.copy(playerPos).add(ISO_OFFSET);
+    // apparent isometric viewpoint (at the rig's current rotation detent),
+    // then eases down to the device eye.
+    this.easeFromPos.copy(playerPos).add(rotateIsoOffset(ISO_OFFSET, ROTATED_ISO));
     this.easeToPos.copy(this.active.device.eye);
     this.easeFromLook.set(playerPos.x, playerPos.y + 0.6, playerPos.z);
     this.easeToLook.copy(this.active.device.anchor);

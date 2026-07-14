@@ -4,6 +4,10 @@
  */
 
 import * as THREE from 'three';
+import { getCameraYaw } from './cameraRig';
+
+// World up axis — WASD vectors rotate around this by the camera-rig yaw.
+const UP = new THREE.Vector3(0, 1, 0);
 
 export class InputManager {
   private keys: Set<string> = new Set();
@@ -67,8 +71,17 @@ export class InputManager {
       if (this.keys.has('s')) direction.z += 1;
       if (this.keys.has('a')) direction.x -= 1;
       if (this.keys.has('d')) direction.x += 1;
+
+      // Keep WASD screen-relative when the camera rig is rotated: swing the
+      // world-space vector by the same 45° detent the camera sits on, so
+      // "W = up-screen" holds at every view angle. Yaw 0 preserves the
+      // original mapping bit-for-bit.
+      const camYaw = getCameraYaw();
+      if (camYaw !== 0 && direction.lengthSq() > 0) {
+        direction.applyAxisAngle(UP, camYaw);
+      }
     }
-    
+
     return direction;
   }
   
