@@ -200,6 +200,12 @@
 
         <!-- 🏠 Home screen: app launcher grid (issue #20 S1 shell) -->
         <div id="phone-home-screen" class="phone-app-view active">
+          <!-- 🧑‍🚀 Identity row (issue #20 S2) — inline-editable display name -->
+          <div id="phone-identity-row">
+            <span class="phone-identity-label">YOU:</span>
+            <span id="phone-player-name" title="Click to edit your clone name">Clone-????</span>
+            <button type="button" id="phone-player-name-edit" aria-label="Edit your clone name" title="Edit your clone name">✎ EDIT</button>
+          </div>
           <div id="phone-app-grid">
             <button type="button" class="phone-app-tile" data-phone-app="chat" aria-label="Open Clone Chat app">
               <span class="phone-app-tile-icon">💬</span>
@@ -213,6 +219,14 @@
               <span class="phone-app-tile-icon">🏦</span>
               <span class="phone-app-tile-label">BANK</span>
             </button>
+          </div>
+
+          <!-- 🛰️ Room roster (issue #20 S2) — rendered from the Yjs players map -->
+          <div id="phone-players-section">
+            <div id="phone-players-header">CLONES IN ROOM: <span id="phone-players-count">--</span></div>
+            <ul id="phone-players-list">
+              <li class="phone-players-empty">OFFLINE · no room link</li>
+            </ul>
           </div>
         </div>
 
