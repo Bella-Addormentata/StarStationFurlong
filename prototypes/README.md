@@ -11,8 +11,8 @@ live game.
 
 | Demo | Description |
 |---|---|
-| [`0.25.0-core-loop-demo`](0.25.0-core-loop-demo/) | **Queued next line** (re-cut from 0.24.0 after its release; carries the next issue batch for the `v0.25.0` tag). |
-| [`0.24.0-core-loop-demo`](0.24.0-core-loop-demo/) | **The game (current release target).** The 0.23.0 hangout update plus the camera rig — rotate the room view in 45° detents (bottom-left HUD arrows, `←`/`→`, `Shift+<`/`Shift+>`) with screen-relative WASD — and internet reachability by default: the node auto-advertises its public IPv4 (opt out with `SSF_EXTERNAL_ADDRS=off`), a live REACHABILITY row shows whether UDP 44442 needs a router forward, and Copy Invite warns before you share a link that can't be reached. |
+| [`0.25.0-core-loop-demo`](0.25.0-core-loop-demo/) | **The game (current release target).** Game night on the station: first-person WASD with pointer-lock mouse look (zoom level 1 is a real camera now), modules spaced apart with continuous gangway vestibules that fade with camera facing, the ACCESS phone app (generate/use room passes — using one beams you straight to the room), edit-mode furniture removal into a per-room inventory with dev-menu re-placement, and a flippable game table with fully playable doc-synced checkers (VS BOT included). |
+| [`0.24.0-core-loop-demo`](0.24.0-core-loop-demo/) | Frozen at the v0.24.0 release snapshot. The 0.23.0 hangout update plus the camera rig — rotate the room view in 45° detents (bottom-left HUD arrows, `←`/`→`, `Shift+<`/`Shift+>`) with screen-relative WASD — and internet reachability by default: the node auto-advertises its public IPv4 (opt out with `SSF_EXTERNAL_ADDRS=off`), a live REACHABILITY row shows whether UDP 44442 needs a router forward, and Copy Invite warns before you share a link that can't be reached. |
 | [`0.23.0-core-loop-demo`](0.23.0-core-loop-demo/) | Frozen at the v0.23.0 line (plus the post-release camera-rig work that ships in 0.24.0). The hangout update: N-player rooms with real peer identity (fox avatars, names, outfits), sci-fi doors you walk through — including same-node room transit via the gangway vestibule — diegetic devices (wall computer, holo map table, storage trunk), room editing (move furniture with pathfinding-aware validity), and a temporary DEV spawn menu for the demo phase. |
 | [`0.22.0-core-loop-demo`](0.22.0-core-loop-demo/) | Frozen at the v0.22.0 release snapshot. Dynamic-IP self-healing: `SSF_EXTERNAL_ADDRS=auto` resolves the public IPv4 (opt-in echo, `SSF_IP_ECHO` overridable), re-checks every 5 min, and hot-swaps the advertised address on ISP rotation — DHT + fresh invites follow live; CGNAT answers refused with an explanation. |
 | [`0.21.0-core-loop-demo`](0.21.0-core-loop-demo/) | Frozen at the v0.21.0 release snapshot: bundled node on Windows/Linux (`bundle.externalBin`, silent sidecar, per-user key dir) + race-proof auto-published releases; macOS sidecar deferred. |
@@ -39,7 +39,7 @@ live game.
 ## Releasing a different demo as the app
 
 The packaged release always uses the Tauri shell from
-[`0.24.0-core-loop-demo/src-tauri`](0.24.0-core-loop-demo/src-tauri/) (window, Rust
+[`0.25.0-core-loop-demo/src-tauri`](0.25.0-core-loop-demo/src-tauri/) (window, Rust
 WebTransport node, icons, app version) — but the **frontend it renders is
 switchable**. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config
