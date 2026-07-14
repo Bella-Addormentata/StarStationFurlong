@@ -335,6 +335,26 @@
       </div>
     </div>
     
+    <!-- 💬 Direct-message overlay (keyed identity §8) — a friend's private,
+         signed conversation. Hidden until openDirectMessage() opens it. -->
+    <div id="dm-overlay" role="dialog" aria-modal="true" aria-label="Direct message" hidden>
+      <div id="dm-panel">
+        <div id="dm-header">
+          <button type="button" id="dm-close" aria-label="Close conversation">‹</button>
+          <div id="dm-peer">
+            <span id="dm-peer-name">Contact</span>
+            <span id="dm-peer-fp" title="Verified identity fingerprint">🔑 --------</span>
+          </div>
+          <span id="dm-status" title="Connection status">…</span>
+        </div>
+        <div id="dm-messages" aria-live="polite"></div>
+        <form id="dm-form" autocomplete="off">
+          <input type="text" id="dm-input" placeholder="Message…" maxlength="500" aria-label="Message text">
+          <button type="submit" id="dm-send" aria-label="Send message">Send</button>
+        </form>
+      </div>
+    </div>
+
     <!-- DEV1: temporary Development menu toggle (src/devMenu.ts owns styling + behavior) — remove with it -->
     <button id="dev-menu-btn" type="button" title="Development menu — temporary (` toggles)">DEV</button>
 

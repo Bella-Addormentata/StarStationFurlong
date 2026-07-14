@@ -30,8 +30,12 @@ import {
 } from './roomPasses';
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
-  encodeMyCard, addContactFromCard, setFriend, removeContact,
+  encodeMyCard, addContactFromCard, setFriend, removeContact, getContact,
 } from './contacts';
+import {
+  initDirectMessages, openDm, sendMessage, readMessages, closeDm,
+  dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
+} from './directMessages';
 
 type RendererModule = typeof import('./renderer');
 
@@ -63,6 +67,8 @@ const networkProvider = new NetworkProvider();
   importRecoveryKey: (r: string) => importRecoveryKey(r),
   verifyNameCert,
 };
+// DM pair-derivation debug hook (deterministic room/key from a peer pubkey).
+(window as any).__ssfDM = { roomIdFor: dmRoomIdFor, roomKeyFor: dmRoomKeyFor };
 let yjsSync: YjsSync | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
@@ -578,6 +584,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       myName: () => getPlayerName(),
       myHints: () => (localFingerprint ? getLocalNodeHint(localFingerprint) : null),
     });
+    initDirectMessages({ resolve: resolveBridgeBootstrap, myName: () => getPlayerName() });
   }
   setActivePassRoom(boot.roomId);
 
@@ -2183,10 +2190,105 @@ function escapeHtml(s: string): string {
   ));
 }
 
-// DM entry point — the real pairwise signed-conversation transport lands in the
-// next slice (directMessages.ts). Wired here so the 💬 button is already live.
+// ── 💬 Direct-message overlay (keyed identity §8) ────────────────────────────
+
+let dmOverlayInited = false;
+let dmActivePeer: string | null = null;
+let dmActiveSession: DmSession | null = null;
+let dmObserver: (() => void) | null = null;
+
+function setupDmOverlay(): void {
+  if (dmOverlayInited) return;
+  dmOverlayInited = true;
+  document.getElementById('dm-close')?.addEventListener('click', closeDmOverlay);
+  const form = document.getElementById('dm-form') as HTMLFormElement | null;
+  const input = document.getElementById('dm-input') as HTMLInputElement | null;
+  form?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input?.value ?? '';
+    if (!text.trim() || !dmActiveSession) return;
+    sendMessage(dmActiveSession, text);
+    if (input) input.value = '';
+    renderDmMessages(); // local echo is immediate; the observer covers remote
+  });
+  // Esc closes the DM (capture so it beats the phone's Esc-to-home handler).
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !document.getElementById('dm-overlay')?.hasAttribute('hidden')) {
+      e.stopPropagation();
+      closeDmOverlay();
+    }
+  }, true);
+}
+
+function setDmStatus(text: string): void {
+  const el = document.getElementById('dm-status');
+  if (el) el.textContent = text;
+}
+
+function renderDmMessages(): void {
+  const list = document.getElementById('dm-messages');
+  if (!list || !dmActiveSession) return;
+  const me = getIdentityPub();
+  const msgs: DirectMessage[] = readMessages(dmActiveSession);
+  if (!msgs.length) {
+    list.innerHTML = '<div id="dm-empty">No messages yet — say hello. Messages are signed end-to-end.</div>';
+    return;
+  }
+  list.innerHTML = msgs.map((m) => {
+    const mine = m.author === me;
+    const time = new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `<div class="dm-msg ${mine ? 'dm-mine' : 'dm-theirs'}">${escapeHtml(m.text)}<span class="dm-msg-meta">${escapeHtml(mine ? 'you' : m.authorName)} · ${time}</span></div>`;
+  }).join('');
+  list.scrollTop = list.scrollHeight;
+}
+
+/** Open a friend's private conversation — connects the DM transport (dialing
+ *  them via their card hints) and streams the signed history. */
 function openDirectMessage(pub: string): void {
-  setContactsFeedback(`DM with 🔑 ${contactFingerprint(pub)} — messaging transport comes online next.`);
+  setupDmOverlay();
+  const contact = getContact(pub);
+  const overlay = document.getElementById('dm-overlay');
+  const nameEl = document.getElementById('dm-peer-name');
+  const fpEl = document.getElementById('dm-peer-fp');
+  if (nameEl) nameEl.textContent = contact?.name ?? 'Contact';
+  if (fpEl) fpEl.textContent = `🔑 ${contactFingerprint(pub)}`;
+  dmActivePeer = pub;
+  overlay?.removeAttribute('hidden');
+  document.getElementById('dm-messages')!.innerHTML = '<div id="dm-empty">Connecting…</div>';
+  setDmStatus('connecting');
+  (document.getElementById('dm-input') as HTMLInputElement | null)?.focus();
+
+  const hints = (contact?.hints as RoomMemberHint | undefined) ?? null;
+  openDm(pub, hints).then(
+    (session) => {
+      if (dmActivePeer !== pub) return; // user already navigated away
+      dmActiveSession = session;
+      (window as any).__ssfDM.active = session; // debug hook (matches __players etc.)
+      setDmStatus('connected');
+      renderDmMessages();
+      // Live updates: re-render on any change to the conversation array.
+      const obs = () => { if (dmActivePeer === pub) renderDmMessages(); };
+      session.messages.observe(obs);
+      dmObserver = () => session.messages.unobserve(obs);
+    },
+    (err) => {
+      if (dmActivePeer !== pub) return;
+      setDmStatus('offline');
+      const list = document.getElementById('dm-messages');
+      if (list) list.innerHTML = `<div id="dm-empty">Could not reach ${escapeHtml(contact?.name ?? 'contact')} — they may be offline. ${escapeHtml(String(err?.message ?? ''))}</div>`;
+    },
+  );
+}
+
+function closeDmOverlay(): void {
+  document.getElementById('dm-overlay')?.setAttribute('hidden', '');
+  if (dmObserver) { dmObserver(); dmObserver = null; }
+  const peer = dmActivePeer;
+  dmActivePeer = null;
+  dmActiveSession = null;
+  // Keep the transport warm briefly? No — tear it down so we don't hold a
+  // connection per contact. A re-open reconnects (fast; node stays warm).
+  if (peer) void closeDm(peer);
 }
 
 // ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────
