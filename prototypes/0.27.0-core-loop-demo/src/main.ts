@@ -31,13 +31,17 @@ import {
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
   encodeMyCard, addContactFromCard, setFriend, removeContact, getContact,
+  isDiscoverable, setDiscoverable,
 } from './contacts';
+import {
+  makeIntroductions, ingestIntroduction, type Introduction,
+} from './introductions';
 import {
   initDirectMessages, openDm, sendMessage, readMessages, closeDm,
   dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
 } from './directMessages';
 import {
-  initPeerStore, recordPeer, hintsFor, peerCount, listPeers, subscribePeers,
+  initPeerStore, recordPeer, hintsFor, peerCount, listPeers, subscribePeers, getPeer,
 } from './peerStore';
 
 type RendererModule = typeof import('./renderer');
@@ -2089,6 +2093,17 @@ function setupContactsApp(): void {
   if (contactsAppInited) return;
   contactsAppInited = true;
 
+  const discoverableBox = document.getElementById('contacts-discoverable') as HTMLInputElement | null;
+  if (discoverableBox) {
+    discoverableBox.checked = isDiscoverable();
+    discoverableBox.addEventListener('change', () => {
+      setDiscoverable(discoverableBox.checked);
+      setContactsFeedback(discoverableBox.checked
+        ? 'Discoverable — re-share your card so friends can introduce you.'
+        : 'No longer discoverable. New cards you share opt out.');
+    });
+  }
+
   document.getElementById('contacts-share-btn')?.addEventListener('click', () => {
     const card = encodeMyCard();
     const out = document.getElementById('contacts-my-card') as HTMLInputElement | null;
@@ -2315,6 +2330,7 @@ function openDirectMessage(pub: string): void {
       dmActiveSession = session;
       (window as any).__ssfDM.active = session; // debug hook (matches __players etc.)
       setDmStatus('connected');
+      gossipIntroductions(session); // §7 M2: densify the mesh over this friend link
       renderDmMessages();
       // Live updates: re-render on any change to the conversation array.
       const obs = () => { if (dmActivePeer === pub) renderDmMessages(); };
@@ -2339,6 +2355,35 @@ function closeDmOverlay(): void {
   // Keep the transport warm briefly? No — tear it down so we don't hold a
   // connection per contact. A re-open reconnects (fast; node stays warm).
   if (peer) void closeDm(peer);
+}
+
+/**
+ * 🤝 §7 M2: gossip signed friend-of-friend introductions over an open DM. We
+ * publish introductions for OUR discoverable contacts (the friend learns routes
+ * to them), and ingest the ones they publish (trust + consent gated) into the
+ * mesh peer store — so the network densifies from every friend connection.
+ */
+function gossipIntroductions(session: DmSession): void {
+  const introsArr = session.sync.doc.getArray<Introduction>('intros');
+  const mine = makeIntroductions(listContacts());
+  if (mine.length) session.sync.doc.transact(() => { introsArr.push(mine); });
+  const ingestAll = () => {
+    for (const intro of introsArr.toArray()) {
+      ingestIntroduction(intro, {
+        // Trust the introducer iff it's the friend we're DMing, or already a
+        // vetted (friend/contact) peer in our store — never an unvetted key.
+        isTrustedIntroducer: (introPub) => {
+          if (introPub === session.peerPub) return true;
+          const p = getPeer(introPub);
+          return !!p && (p.trust === 'friend' || p.trust === 'contact');
+        },
+        record: ({ pub, name, hints, introducer }) =>
+          recordPeer({ pub, name, hints, trust: 'introduced', introducer }),
+      });
+    }
+  };
+  ingestAll();
+  introsArr.observe(ingestAll);
 }
 
 // ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────

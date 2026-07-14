@@ -981,6 +981,16 @@
       #contacts-my-card,
       #contacts-recovery-out,
       #contacts-recovery-in { font-family: monospace; font-size: 9px; }
+      #contacts-discoverable-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 7px;
+        font-size: 9px;
+        color: rgba(224, 226, 238, 0.6);
+        cursor: pointer;
+      }
+      #contacts-discoverable-row input { flex: 0 0 auto; }
 
       /* 💬 Direct-message overlay */
       #dm-overlay {

@@ -27,6 +27,10 @@ export interface ContactCard {
   pub: string;                 // base64url Ed25519 public key
   name: string;
   hints?: unknown;             // reachability (memberHints) for DM / mesh dialing
+  /** Self-signed CONSENT to be introduced friend-of-friend in the mesh (§7 M2).
+   *  Only a discoverable subject is ever gossiped; the flag travels IN the
+   *  signed card so an introducer can prove the subject opted in. */
+  discoverable?: boolean;
   issuedAt: number;
   sig: string;                 // base64url self-signature over the canonical bytes
 }
@@ -35,6 +39,7 @@ export interface Contact {
   pub: string;
   name: string;
   hints?: unknown;
+  discoverable?: boolean;
   friend: boolean;
   addedAt: number;
 }
@@ -54,11 +59,24 @@ const listeners = new Set<() => void>();
 
 // ── Canonical sign-bytes (domain-tagged + versioned, replay-proof) ───────────
 
-function cardSignBytes(pub: string, name: string, issuedAt: number, hints: unknown): Uint8Array {
-  // Stable JSON of the signed fields (hints included so a swapped address is
-  // detected). Sorted keys via explicit ordering — no Object.keys ambiguity.
-  const canonical = JSON.stringify({ k: 'ssf-contact-card:v1', pub, name, issuedAt, hints: hints ?? null });
+function cardSignBytes(pub: string, name: string, issuedAt: number, hints: unknown, discoverable: boolean): Uint8Array {
+  // Stable JSON of the signed fields (hints + discoverable included so a swapped
+  // address or forged consent is detected). Explicit key order — no ambiguity.
+  const canonical = JSON.stringify({ k: 'ssf-contact-card:v1', pub, name, issuedAt, hints: hints ?? null, discoverable: !!discoverable });
   return new TextEncoder().encode(canonical);
+}
+
+const DISCOVERABLE_KEY = 'ssf-discoverable';
+
+/** Whether WE consent to friend-of-friend introduction (default off — opt-in,
+ *  the sovereignty-minded default). */
+export function isDiscoverable(): boolean {
+  try { return localStorage.getItem(DISCOVERABLE_KEY) === '1'; } catch { return false; }
+}
+
+export function setDiscoverable(on: boolean): void {
+  try { localStorage.setItem(DISCOVERABLE_KEY, on ? '1' : '0'); } catch { /* session-only */ }
+  notify();
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────────
@@ -122,9 +140,10 @@ export function myContactCard(): ContactCard {
   const pub = getIdentityPub();
   const name = deps?.myName() ?? 'Clone';
   const hints = deps?.myHints() ?? null;
+  const discoverable = isDiscoverable();
   const issuedAt = Date.now();
-  const sig = signIdentity(cardSignBytes(pub, name, issuedAt, hints));
-  return { v: 1, kind: 'contact', pub, name, hints: hints ?? undefined, issuedAt, sig };
+  const sig = signIdentity(cardSignBytes(pub, name, issuedAt, hints, discoverable));
+  return { v: 1, kind: 'contact', pub, name, hints: hints ?? undefined, discoverable, issuedAt, sig };
 }
 
 /** Encode our card as an `ssf://contact?card=...` string for sharing. */
@@ -155,7 +174,7 @@ export function decodeContactCard(input: string): ContactCard | null {
     typeof card.issuedAt !== 'number' || typeof card.sig !== 'string'
   ) return null;
   // The card MUST be self-signed by the key it claims — this is the whole point.
-  const ok = verifyIdentity(card.pub, cardSignBytes(card.pub, card.name, card.issuedAt, card.hints ?? null), card.sig);
+  const ok = verifyIdentity(card.pub, cardSignBytes(card.pub, card.name, card.issuedAt, card.hints ?? null, !!card.discoverable), card.sig);
   return ok ? card : null;
 }
 
@@ -168,10 +187,11 @@ export function addContactFromCard(input: string): { ok: true; pub: string; name
   if (card.pub === getIdentityPub()) return { ok: true, pub: card.pub, name: card.name, isSelf: true };
   const existing = contacts.find((c) => c.pub === card.pub);
   if (existing) {
-    existing.name = card.name;         // refresh name
-    existing.hints = card.hints;       // refresh reachability
+    existing.name = card.name;               // refresh name
+    existing.hints = card.hints;             // refresh reachability
+    existing.discoverable = !!card.discoverable; // refresh consent flag
   } else {
-    contacts.push({ pub: card.pub, name: card.name, hints: card.hints, friend: false, addedAt: Date.now() });
+    contacts.push({ pub: card.pub, name: card.name, hints: card.hints, discoverable: !!card.discoverable, friend: false, addedAt: Date.now() });
   }
   persist();
   notify();
