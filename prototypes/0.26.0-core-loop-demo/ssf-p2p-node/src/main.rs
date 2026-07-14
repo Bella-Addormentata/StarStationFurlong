@@ -82,6 +82,13 @@ pub struct HubState {
     /// Relay dedup (0.18.0 hub-relay): envelopes seen/forwarded recently, keyed by
     /// blake3(origin_node_id ‖ seq ‖ payload). Prevents echo storms once meshes form.
     pub seen_envelopes: Mutex<SeenCache>,
+    /// In-flight dial single-flight (issue #60): peer keys we are CURRENTLY
+    /// dialing. `remote_peers` only records a peer AFTER a dial succeeds, so
+    /// during a slow hole-punch every browser envelope carrying the target's
+    /// node id would otherwise spawn a fresh dial task — a connection storm.
+    /// A key is claimed here before spawning the dial and released when it
+    /// resolves (success, exhaustion, or already-linked).
+    pub dialing: Mutex<std::collections::HashSet<PublicKey>>,
     /// R1: live reachability posture — written by the auto echo loop (and the
     /// explicit SSF_EXTERNAL_ADDRS parser), read by the fingerprint API.
     pub reach: Arc<ReachState>,
@@ -642,6 +649,7 @@ async fn main() -> Result<()> {
         port: listen_port,
         configured_relays,
         seen_envelopes: Mutex::new(SeenCache::new()),
+        dialing: Mutex::new(std::collections::HashSet::new()),
         reach: reach.clone(),
     });
 
@@ -826,7 +834,15 @@ async fn handle_wt_connection(
                                         .unwrap_or(false)
                                 };
 
-                                if needs_dial {
+                                // Single-flight (issue #60): claim the dial before
+                                // spawning. Without this, a slow hole-punch keeps
+                                // needs_dial=true and every subsequent browser
+                                // envelope carrying this target spawns another dial
+                                // ladder — a connection storm + leaked peer loops.
+                                let claimed_dial = needs_dial && {
+                                    hub_clone.dialing.lock().unwrap().insert(target_pub_key)
+                                };
+                                if claimed_dial {
                                     println!("📡 Dispatching Iroh Dial to remote peer key: {}", target_node_id_str);
                                     let relay_hints = envelope
                                         .iroh_relay_urls
@@ -999,14 +1015,39 @@ const MAX_DIAL_ATTEMPTS: u32 = 8;
 const DIAL_BACKOFF_START_MS: u64 = 500;
 const DIAL_BACKOFF_CAP_MS: u64 = 8000;
 
-/// Dial a remote peer node with bounded retry/backoff, bind the connection to
-/// `room_id` (so its inbound ticks fan out — issue #60 symptom 4), and report
-/// dialing/connected/failed to the browser through `status_tx`. Rebuilds the
-/// EndpointAddr from the relay/direct hints each attempt, and re-checks the
-/// room's remote_peers before every attempt so a peer that another path (a
-/// second envelope, or the inbound accept) already linked is left alone — no
-/// dial storm, no duplicate connection.
+/// Dial a remote peer with bounded retry/backoff and ALWAYS release the
+/// single-flight claim (`hub.dialing`) when done, however the dial ended —
+/// success, exhaustion, or already-linked. The retry body has several early
+/// returns, so the release lives here in the wrapper rather than at each exit.
 async fn dial_peer_with_retry(
+    hub: SharedHub,
+    iroh_ep: IrohEndpoint,
+    room_id: String,
+    target_pub_key: PublicKey,
+    target_str: String,
+    relay_hints: Vec<String>,
+    direct_hints: Vec<String>,
+    send: std::sync::Arc<tokio::sync::Mutex<wtransport::SendStream>>,
+) {
+    dial_peer_inner(
+        hub.clone(),
+        iroh_ep,
+        room_id,
+        target_pub_key,
+        target_str,
+        relay_hints,
+        direct_hints,
+        send,
+    )
+    .await;
+    hub.dialing.lock().unwrap().remove(&target_pub_key);
+}
+
+/// Bind the connection to `room_id` (so its inbound ticks fan out — issue #60
+/// symptom 4), report dialing/connected/failed to the browser, rebuild the
+/// EndpointAddr from the hints each attempt, and re-check remote_peers before
+/// every attempt so a peer another path already linked is left alone.
+async fn dial_peer_inner(
     hub: SharedHub,
     iroh_ep: IrohEndpoint,
     room_id: String,

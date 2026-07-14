@@ -54,12 +54,28 @@ function b64ToU8(b64: string): Uint8Array {
 
 export class YjsSync {
   readonly doc: Y.Doc;
+  /**
+   * Resolves once the node's INITIAL state response (the first SyncStep2) has
+   * been applied — i.e. this replica has converged with whatever the node
+   * holds for the room. Distinct from start() (which only SENDS SyncStep1):
+   * callers that must not act on the empty pre-sync replica await this. Used
+   * by the E4 furniture seed so it never re-publishes defaults over a room
+   * that already has a synced layout (issue #60 review). Never rejects; if the
+   * node never answers it simply never resolves (callers gate side effects on
+   * it, so "no sync" degrades to "no action", which is safe).
+   */
+  readonly whenServerSynced: Promise<void>;
+  #resolveServerSynced!: () => void;
+  #serverSynced = false;
   #active = false;
   #writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #seq = 1;
 
   constructor(private readonly opts: YjsSyncOptions) {
     this.doc = new Y.Doc();
+    this.whenServerSynced = new Promise<void>((resolve) => {
+      this.#resolveServerSynced = resolve;
+    });
   }
 
   /** Kick off the y-sync state machine over the reliable channel:
@@ -287,6 +303,11 @@ export class YjsSync {
     } else if (subtype === 1 || subtype === 2) {
       // Received SyncStep2 or Update
       Y.applyUpdate(this.doc, data, 'server-origin');
+      // The first SyncStep2 (initial state) marks convergence with the node.
+      if (subtype === 1 && !this.#serverSynced) {
+        this.#serverSynced = true;
+        this.#resolveServerSynced();
+      }
       console.log(`✅ YjsSync Handshake Complete for Y.Doc room replica!`);
     }
   }

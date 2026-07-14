@@ -19,7 +19,7 @@ import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
-import { bindFurnitureDoc, seedFurnitureDefaults } from './furnitureDoc';
+import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 
 type RendererModule = typeof import('./renderer');
 
@@ -561,9 +561,22 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       roomMap.set('owner', getPlayerId());
       roomMap.set('name', boot.roomId || 'Lobby');
     });
-    // E4 (issue #60): the owner publishes the initial furniture layout so
-    // joiners converge to it. Idempotent — a no-op once the map is seeded.
-    seedFurnitureDefaults();
+  }
+  // E4 furniture seed (issue #60): the owner publishes the initial layout so
+  // joiners converge to it — but DEFERRED past the node's initial-state sync.
+  // Seeding from the empty pre-sync replica (the same seam the owner/name claim
+  // above documents) re-published defaults on every owner reload and, worse,
+  // resurrected peer-removed / reverted peer-moved items (review). So wait for
+  // whenServerSynced, then seed ONLY if the room is genuinely empty AND we own
+  // it — an already-edited room comes back non-empty and is left untouched.
+  if (claimRoomDefaults) {
+    const seedEpoch = epoch;
+    void sync.whenServerSynced.then(() => {
+      if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
+      if (roomMap.get('owner') === getPlayerId() && furnitureDocSize() === 0) {
+        seedFurnitureDefaults();
+      }
+    });
   }
 
   const updateRoomUI = () => {

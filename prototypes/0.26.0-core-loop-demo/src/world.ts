@@ -569,7 +569,7 @@ export class World {
     if (records.size === 0) return; // unseeded — keep local defaults
     if (this.furnitureGroups.size === 0) return; // platform not built yet
 
-    let changed = false;
+    const changedIds = new Set<string>();
 
     // 1. Removals — local items no longer in the shared layout.
     for (const item of [...FURNITURE]) {
@@ -578,7 +578,7 @@ export class World {
       this.removeFurnitureVisuals(item.id);
       const idx = FURNITURE.findIndex((i) => i.id === item.id);
       if (idx !== -1) FURNITURE.splice(idx, 1);
-      changed = true;
+      changedIds.add(item.id);
     }
 
     // 2. Adds + moves.
@@ -594,7 +594,7 @@ export class World {
         };
         FURNITURE.push(item);
         this.registerFurnitureGroup(item, /* reveal */ true);
-        changed = true;
+        changedIds.add(id);
       } else if (existing.pos.x !== rec.x || existing.pos.z !== rec.z || existing.rot !== rec.rot) {
         this.evictAndDefocusForItem(id);
         existing.pos = { x: rec.x, z: rec.z };
@@ -607,11 +607,11 @@ export class World {
           group.position.set(rec.x, 0, rec.z);
           group.rotation.y = rec.rot * (Math.PI / 2);
         }
-        changed = true;
+        changedIds.add(id);
       }
     }
 
-    if (!changed) return;
+    if (changedIds.size === 0) return;
 
     // Same order commitCarry/commitSpawn use: seats AND devices bake world-space
     // fronts/poses off the fresh walkable grid, then replan in-flight nav.
@@ -619,7 +619,14 @@ export class World {
     rebakeWalkableGrid();
     rebuildSeats();
     rebuildDevices();
-    this.player.onObstaclesChanged();
+    // Replan per changed item (review fix): onObstaclesChanged only cancels an
+    // in-flight APPROACH/FINE/TURN toward the item when given that item's id —
+    // a no-arg call left a joiner walking to (and sitting/focusing onto) where
+    // a remotely moved/removed item USED to be. evictAndDefocusForItem above
+    // handles the already-SEATED/FOCUSED case; this handles the approach case.
+    for (const id of changedIds) {
+      this.player.onObstaclesChanged(id);
+    }
 
     // A live edit session indexed its raycast targets on enter; refresh it so
     // a remotely-added piece is selectable and a removed one drops out.
