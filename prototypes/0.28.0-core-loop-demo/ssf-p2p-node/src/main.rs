@@ -1402,14 +1402,6 @@ fn handle_iroh_connection(
                             _ => break,
                         };
 
-                        // [DIAG host->joiner] does the dialed connection RECEIVE the host's ysync stream?
-                        eprintln!(
-                            "📥 iroh-recv kind={} env.room={} origin={:?} chosen={:?}",
-                            envelope.kind, envelope.room,
-                            envelope.iroh_node_id.as_deref().map(|s| &s[..s.len().min(8)]),
-                            room_id_inner.as_deref(),
-                        );
-
                         if room_id_inner.is_none() {
                             room_id_inner = Some(envelope.room.clone());
                             *chosen_room_inner.lock().unwrap() = room_id_inner.clone();
@@ -1512,10 +1504,6 @@ fn handle_iroh_connection(
                             let rooms = hub_clone.rooms.lock().unwrap();
                             rooms.get(room_id).map(|r| r.local_connections.values().cloned().collect()).unwrap_or_default()
                         };
-                        // [DIAG host->joiner] how many local browser tabs does the ysync forward target?
-                        if envelope.kind == "ysync" {
-                            eprintln!("📤 iroh->local room={} local_tabs={}", room_id, clients.len());
-                        }
 
                         for wt_conn in clients {
                             let payload_bytes = serde_json::to_vec(&envelope).unwrap();
