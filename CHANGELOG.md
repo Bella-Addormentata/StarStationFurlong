@@ -2,7 +2,7 @@
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
 [prototypes/0.28.0-core-loop-demo](prototypes/0.28.0-core-loop-demo/) and is built by the
-[release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
+[release workflow](.github/workflows/release.yml) when a `vX.Y.Z` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
 [prototypes/0.0.1-core-loop-demo](prototypes/0.0.1-core-loop-demo/)).
@@ -21,6 +21,15 @@ The node-side half of the keyed-identity work: the sovereign node now verifies t
 - **Per-install random default room id (dev-stage collision fix).** Every install used to boot into the literal room id `furlong-lobby`, so a pass for one install's lobby collided with the other's — the joiner saw "YOU ARE HERE" and its node short-circuited the dial to itself. The default room is now a random, persisted `home-<hex>` per install (display name still "Lobby"), so a home-room pass bridges two installs directly. Confirmed cross-internet: the joiner's node now dials the *host's* node and the QUIC link secures on the first attempt.
 - **Node datagram/ysync lane split (long-standing cross-internet sync fix).** `handle_iroh_connection` raced the unreliable tick lane (`read_datagram`, 20 Hz movement) and the reliable ysync lane (`accept_bi`) in a single `tokio::select!`. A peer streaming ticks kept the datagram branch perpetually ready, so `accept_bi` was cancelled every iteration before it could accept a single stream — a joiner received the host's **ticks** (avatar) but never its **state** (players map, chat, room name). Instrumented proof across two machines: zero stream receives despite a secured link and flowing ticks. The two lanes now run as independent tasks so neither starves the other (the ysync sibling of the tick fix in #60). **Note:** both peers must run this node build — a peer on the old node can still starve its own `accept_bi`; final bidirectional confirmation is pending both machines on 0.28.0.
 - **Release line:** `prototypes/0.28.0-core-loop-demo/` is the shipping copy; `0.27.0-core-loop-demo/` stays frozen at its release snapshot.
+
+## v0.28.1 — 2026-07-15
+
+### Two-Way Cross-Internet Sync, Confirmed
+
+The fix that finished v0.28.0's story — with two internet-separated machines both on this build, a joiner now sees the host's **player *and* full furniture layout** (verified: 29 pieces), both directions.
+
+- **Node relay streams now `finish()` gracefully (the fix that closed the host→joiner state gap).** Every node-to-node relay opened a QUIC bi-stream, wrote the framed envelope, and **dropped the send stream — which in iroh/quinn sends `RESET_STREAM`**, so the peer's read could get the reset before the frame and silently discard the ysync update. Racy and timing-asymmetric: one direction won the race, the other lost it, so state stalled while ticks (datagrams) flowed — the joiner saw the host's avatar but not its room. The relays now call `send_stream.finish()` (graceful FIN; quinn retains and delivers the finished stream's data). Together with v0.28.0's lane split, this closes a bug visible as far back as the 0.22.0 "red ball" placeholder. **Confirmed on two internet-separated machines.**
+- **Release line:** `prototypes/0.28.0-core-loop-demo/` is the shipping copy (version bumped to 0.28.1 in place — a patch on the same line); `0.27.0-core-loop-demo/` stays frozen.
 
 ## v0.27.0 — 2026-07-14
 
