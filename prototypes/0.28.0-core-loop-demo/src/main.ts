@@ -16,7 +16,7 @@ import { MultiScaleZoomView } from './zoom';
 import { initCameraRig, updateCameraRig } from './cameraRig';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
-import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
+import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH, getDefaultRoomId } from './identity';
 import {
   getIdentityPub, getIdentityFingerprint, signNameCert, verifyNameCert,
   exportRecoveryKey, importRecoveryKey, ysyncSigner,
@@ -64,6 +64,11 @@ const mouse     = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+// Publish the per-install default room id early so pre-join readers of
+// __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
+// home id rather than a shared literal (dev-stage collision fix). Overwritten
+// with the actual room on join.
+(window as any).__ssfRoomId = getDefaultRoomId();
 
 // Keyed-identity Slice 1: expose the identity for verification + the recovery
 // backup/restore flow (the polished UI lands with the Contacts app, Slice 3).
@@ -1585,7 +1590,7 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   if (!fingerprint) {
     return null;
   }
-  const roomId = activeBootstrap?.roomId ?? 'furlong-lobby';
+  const roomId = activeBootstrap?.roomId ?? getDefaultRoomId();
   const roomKeyB64 = activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
   const localHint = getLocalNodeHint(fingerprint);
   return {
@@ -1606,7 +1611,7 @@ function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerpri
   // (PROVISION NEW MODULE) instead of the currently-joined room. The room key
   // is minted+persisted per roomId, so re-provisioning the same id (never
   // happens — ids are random) or later rejoining reuses the same key.
-  const roomId = roomIdOverride ?? activeBootstrap?.roomId ?? 'furlong-lobby';
+  const roomId = roomIdOverride ?? activeBootstrap?.roomId ?? getDefaultRoomId();
   const roomKeyB64 = roomIdOverride
     ? getOrCreateRoomKeyB64(roomId)
     : activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
@@ -1756,7 +1761,7 @@ async function resolveBridgeBootstrap(imported: RoomBootstrap): Promise<RoomBoot
     return imported;
   }
 
-  const roomId = imported.roomId || localBoot.roomId || 'furlong-lobby';
+  const roomId = imported.roomId || localBoot.roomId || getDefaultRoomId();
   const importedHints = collectMemberHints(imported);
   const mergedHints = mergeMemberHints(importedHints, collectMemberHints(localBoot));
   const remoteHint = importedHints[0];
@@ -2064,7 +2069,7 @@ function refreshAccessRoomRow(): void {
     return;
   }
   nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Lobby';
-  idEl.textContent = activeBootstrap?.roomId ?? 'furlong-lobby';
+  idEl.textContent = activeBootstrap?.roomId ?? getDefaultRoomId();
 }
 
 // ── 👥 Contacts app (keyed identity §8) ──────────────────────────────────────
@@ -2526,7 +2531,7 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
 
     const roomId = typeof parsed.roomId === 'string' && parsed.roomId.length > 0
       ? parsed.roomId
-      : 'furlong-lobby';
+      : getDefaultRoomId();
 
     const rawWtUrl = typeof parsed.wtUrl === 'string' ? parsed.wtUrl : '';
     const certHashesB64 = normalizeStringArray(parsed.certHashesB64);

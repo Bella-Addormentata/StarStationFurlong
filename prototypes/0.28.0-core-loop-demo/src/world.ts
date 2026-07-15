@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt, rebuildSeats } from './seats';
+import { getDefaultRoomId } from './identity';
 import { FURNITURE, buildItemGroup } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { rebuildObstacles } from './obstacles';
@@ -1668,11 +1669,11 @@ export class World {
   /**
    * Stable room id for per-room local state (TR2 trunk stowage keys).
    * main.ts publishes the bootstrap roomId on join; before networking is up
-   * (or when it fails) this matches main.ts's own 'furlong-lobby' fallback.
+   * (or when it fails) this falls back to the per-install default (getDefaultRoomId).
    */
   private static activeRoomId(): string {
     const id = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-    return typeof id === 'string' && id.length > 0 ? id : 'furlong-lobby';
+    return typeof id === 'string' && id.length > 0 ? id : getDefaultRoomId();
   }
 
   /**

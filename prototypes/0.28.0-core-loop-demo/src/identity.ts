@@ -15,6 +15,7 @@
 
 const ID_STORAGE_KEY = 'ssf-player-id';
 const NAME_STORAGE_KEY = 'ssf-player-name';
+const DEFAULT_ROOM_STORAGE_KEY = 'ssf-default-room-id';
 
 /** Same cap as the room-name editor — keeps phone rows from overflowing. */
 export const PLAYER_NAME_MAX_LENGTH = 24;
@@ -24,6 +25,7 @@ export const PLAYER_NAME_MAX_LENGTH = 24;
 // even when persistence is unavailable.
 let cachedPlayerId: string | null = null;
 let cachedPlayerName: string | null = null;
+let cachedDefaultRoomId: string | null = null;
 
 /**
  * Mint a UUID for the player id. crypto.randomUUID is unavailable outside
@@ -62,6 +64,37 @@ export function getPlayerId(): string {
     localStorage.setItem(ID_STORAGE_KEY, minted);
   } catch { /* session-scoped id is the best we can do */ }
   return minted;
+}
+
+/**
+ * Per-install DEFAULT room id — the "home" room you boot into. Random +
+ * persisted so two fresh installs NEVER collide on a shared id.
+ *
+ * Dev-stage fix: everyone used to default to the literal `furlong-lobby`, so a
+ * pass for one install's lobby matched the other's own lobby — the joiner saw
+ * "YOU ARE HERE" and its node short-circuited the dial to itself. A random id
+ * makes every install's home room unique, so a home-room pass bridges two
+ * installs directly. Only the ID is unique; the DISPLAY name is still "Lobby"
+ * (roomInfo.name). Minted once + cached, mirroring getPlayerId. (The id system
+ * is expected to change again later — see brainstorming/.)
+ */
+export function getDefaultRoomId(): string {
+  if (cachedDefaultRoomId) return cachedDefaultRoomId;
+  try {
+    const existing = localStorage.getItem(DEFAULT_ROOM_STORAGE_KEY);
+    if (existing) { cachedDefaultRoomId = existing; return existing; }
+  } catch { /* privacy mode — mint a session-scoped id below */ }
+  const minted = mintDefaultRoomId();
+  cachedDefaultRoomId = minted;
+  try { localStorage.setItem(DEFAULT_ROOM_STORAGE_KEY, minted); } catch { /* session-scoped */ }
+  return minted;
+}
+
+function mintDefaultRoomId(): string {
+  const bytes = new Uint8Array(6);
+  try { crypto.getRandomValues(bytes); }
+  catch { for (let i = 0; i < 6; i++) bytes[i] = Math.floor(Math.random() * 256); }
+  return 'home-' + Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /** Default display name: Clone-XXXX from the last 4 hex chars of the id. */

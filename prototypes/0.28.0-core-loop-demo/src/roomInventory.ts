@@ -26,6 +26,7 @@
 
 import { FURNITURE_DEFS } from './furniture';
 import type { FurnitureKind } from './furniture';
+import { getDefaultRoomId } from './identity';
 
 export interface RoomInventoryEntry {
   kind: FurnitureKind;
@@ -44,11 +45,11 @@ export function roomInventoryKey(roomId: string): string {
 /**
  * Stable room id for per-room local state — the same window-global reader as
  * World.activeRoomId / devMenu.activeRoomId (main.ts publishes the bootstrap
- * roomId on join; 'furlong-lobby' is main.ts's own offline fallback).
+ * roomId on join; getDefaultRoomId() is the per-install default fallback).
  */
 export function activeRoomId(): string {
   const id = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-  return typeof id === 'string' && id.length > 0 ? id : 'furlong-lobby';
+  return typeof id === 'string' && id.length > 0 ? id : getDefaultRoomId();
 }
 
 /**

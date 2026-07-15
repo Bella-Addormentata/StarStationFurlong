@@ -50,6 +50,7 @@ import type { FurnitureItem, FurnitureKind } from './furniture';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
+import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import {
@@ -113,7 +114,7 @@ let vestibuleZoomTimer: number | null = null;
 
 function activeRoomId(): string {
   const id = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-  return typeof id === 'string' && id.length > 0 ? id : 'furlong-lobby';
+  return typeof id === 'string' && id.length > 0 ? id : getDefaultRoomId();
 }
 
 /** Same seated-player fallback as editMode.localFloodOrigin. */
