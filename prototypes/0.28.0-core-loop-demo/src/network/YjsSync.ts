@@ -24,14 +24,24 @@
  */
 import * as Y from 'yjs';
 import type { ByteDuplex } from './protocol.ts';
+import { canonicalSignBytes } from './signBytes';
 
 export interface YjsSyncOptions {
   roomId: string;
   /** Reliable 'ysync' channel from NetworkProvider.openChannel(). */
   channel: ByteDuplex;
-  /** Signs outgoing state-mutating envelopes (stubbed key mgmt is OK in Phase 1;
-   *  the verify-before-apply seam must exist — Phase 1 Task 3.3). */
-  sign?: (payload: Uint8Array) => Promise<Uint8Array>;
+  /** Signs the CANONICAL envelope bytes (v‖roomId‖kind‖seq‖payload, see
+   *  signBytes.ts) for an outgoing state-mutating envelope — Slice 2. Returns
+   *  the raw Ed25519 signature; YjsSync base64s it onto the wire. */
+  sign?: (canonicalBytes: Uint8Array) => Promise<Uint8Array>;
+  /** Our raw 32-byte identity pubkey, stamped as the envelope author (Slice 2 —
+   *  replaces the Phase-1 dummy zero key). Omit to keep the legacy dummy. */
+  authorPub?: () => Uint8Array;
+  /** Verify-before-apply (Slice 2): checks a raw signature over the canonical
+   *  bytes against the author. When present, an inbound envelope that IS signed
+   *  but fails verification is DROPPED before it touches the Y.Doc; an UNSIGNED
+   *  envelope (legacy client / the local node's own SyncStep2) is still applied. */
+  verify?: (authorBytes: Uint8Array, canonicalBytes: Uint8Array, sigBytes: Uint8Array) => boolean;
   /**
    * Source of the iroh dial hints stamped on outgoing envelopes so the node
    * dials THIS room's host. Defaults to the global active provider's boot —
@@ -121,14 +131,39 @@ export class YjsSync {
   /** Feed an envelope that arrived on a NODE-INITIATED stream (remote peers'
    *  updates bridged through the local node) into the y-sync state machine.
    *  0.16.0 dead-ended these — see NetworkProvider.#listenIncomingStreams. */
-  ingestEnvelope(wireEnvelope: { kind?: string; room?: string; payload?: string }): void {
+  ingestEnvelope(wireEnvelope: { v?: number; kind?: string; room?: string; seq?: number; author?: string; payload?: string; sig?: string }): void {
     if (!this.#active) return;
     if (wireEnvelope.kind !== 'ysync' || typeof wireEnvelope.payload !== 'string') return;
     if (wireEnvelope.room && wireEnvelope.room !== this.opts.roomId) return;
+    if (!this.#verifyEnvelope(wireEnvelope)) return; // Slice 2: drop signed-but-invalid
     try {
       this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
     } catch (e) {
       console.warn('YjsSync failed ingesting bridged envelope:', e);
+    }
+  }
+
+  /** Slice 2 verify-before-apply: true if the envelope may be applied. An
+   *  envelope with no author/sig — a legacy client, or the local node's own
+   *  SyncStep2 (the node holds no identity key) — is allowed; a SIGNED envelope
+   *  must verify against its author over the canonical bytes or it's dropped. No
+   *  verify hook wired (prefetch/legacy construction) = allow everything. */
+  #verifyEnvelope(env: { v?: number; kind?: string; seq?: number; author?: string; payload?: string; sig?: string }): boolean {
+    if (!this.opts.verify) return true;
+    if (typeof env.sig !== 'string' || typeof env.author !== 'string' || typeof env.payload !== 'string') return true;
+    let authorBytes: Uint8Array;
+    try { authorBytes = b64ToU8(env.author); } catch { return true; }
+    // A 32-byte all-zero author is the Phase-1 dummy → treat as unsigned/legacy.
+    if (authorBytes.length !== 32 || authorBytes.every((b) => b === 0)) return true;
+    try {
+      const payload = b64ToU8(env.payload);
+      const canonical = canonicalSignBytes(env.v ?? 1, this.opts.roomId, env.kind ?? 'ysync', env.seq ?? 0, payload);
+      const ok = this.opts.verify(authorBytes, canonical, b64ToU8(env.sig));
+      if (!ok) console.warn(`[YjsSync] dropped envelope with INVALID signature (room ${this.opts.roomId}, seq ${env.seq})`);
+      return ok;
+    } catch (e) {
+      console.warn('[YjsSync] verify error, dropping envelope:', e);
+      return false;
     }
   }
 
@@ -179,18 +214,25 @@ export class YjsSync {
         }
       : undefined);
 
+    // Slice 2: capture seq BEFORE signing so the canonical bytes and the wire
+    // envelope agree; sign the canonical v‖room‖kind‖seq‖payload (not payload
+    // alone) and stamp our REAL pubkey author.
+    const v = 1;
+    const seq = this.#seq++;
     let sigStr: string | undefined = undefined;
     if (this.opts.sign) {
-      const sigData = await this.opts.sign(payload);
+      const canonical = canonicalSignBytes(v, this.opts.roomId, 'ysync', seq, payload);
+      const sigData = await this.opts.sign(canonical);
       sigStr = u8ToB64(sigData);
     }
+    const authorBytes = this.opts.authorPub?.() ?? new Uint8Array(32); // dummy if unwired
 
     const wireEnvelope = {
-      v: 1,
+      v,
       room: this.opts.roomId,
       kind: 'ysync',
-      seq: this.#seq++,
-      author: u8ToB64(new Uint8Array(32)), // dummy key for Phase 1
+      seq,
+      author: u8ToB64(authorBytes),
       payload: u8ToB64(payload),
       sig: sigStr,
       iroh_node_id: primaryHint?.irohNodeId,
@@ -270,7 +312,7 @@ export class YjsSync {
           // Decode SsfEnvelope from base64 representation on the wire safely
           const wireEnvelope = JSON.parse(new TextDecoder().decode(payloadBytes));
 
-          if (wireEnvelope.kind === 'ysync') {
+          if (wireEnvelope.kind === 'ysync' && this.#verifyEnvelope(wireEnvelope)) {
             this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
           }
         }

@@ -30,6 +30,7 @@
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
+import { ysyncSigner } from './keypair';
 
 export type PassState = 'connecting' | 'loading' | 'ready' | 'offline' | 'current';
 
@@ -251,6 +252,7 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
   const sync = new YjsSync({
     roomId: boot.roomId,
     channel,
+    ...ysyncSigner(), // Slice 2: sign + verify-before-apply on the prefetch too
     // Stamp THIS room's dial hints on outgoing envelopes (review HIGH): without
     // this the prefetch inherits the ACTIVE room's hints from the global
     // provider and the node dials the wrong peer — the prefetch never syncs.

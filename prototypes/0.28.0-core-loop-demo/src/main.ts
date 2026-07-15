@@ -19,7 +19,7 @@ import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
 import {
   getIdentityPub, getIdentityFingerprint, signNameCert, verifyNameCert,
-  exportRecoveryKey, importRecoveryKey,
+  exportRecoveryKey, importRecoveryKey, ysyncSigner,
 } from './keypair';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
@@ -515,6 +515,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   const sync = new YjsSync({
     roomId: boot.roomId,
     channel,
+    ...ysyncSigner(), // Slice 2: sign outgoing + verify-before-apply on inbound
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us

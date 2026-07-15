@@ -132,3 +132,24 @@ export function importRecoveryKey(recovery: string): string | null {
   try { localStorage.setItem(SEED_STORAGE_KEY, b64urlEncode(seed)); } catch { /* session-only */ }
   return getIdentityPub();
 }
+
+/**
+ * The identity signer YjsSync wires in for the Slice-2 sign/verify-before-apply
+ * seam. Operates on RAW bytes (YjsSync owns the base64 on the wire): authorPub
+ * is our 32-byte pubkey, sign signs the canonical envelope bytes, verify checks
+ * a peer's signature. Live-reads the seed each call so an identity restore is
+ * reflected without re-wiring.
+ */
+export function ysyncSigner(): {
+  authorPub: () => Uint8Array;
+  sign: (bytes: Uint8Array) => Promise<Uint8Array>;
+  verify: (authorBytes: Uint8Array, bytes: Uint8Array, sigBytes: Uint8Array) => boolean;
+} {
+  return {
+    authorPub: () => getPubBytes(),
+    sign: (bytes: Uint8Array) => Promise.resolve(ed.sign(bytes, getSeed())),
+    verify: (authorBytes: Uint8Array, bytes: Uint8Array, sigBytes: Uint8Array): boolean => {
+      try { return ed.verify(sigBytes, bytes, authorBytes); } catch { return false; }
+    },
+  };
+}

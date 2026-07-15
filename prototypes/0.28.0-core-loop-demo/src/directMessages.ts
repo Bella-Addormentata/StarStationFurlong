@@ -25,7 +25,7 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap, RoomMemberHint } from './network/protocol';
 import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex } from '@noble/hashes/utils';
-import { getIdentityPub, signIdentity, verifyIdentity } from './keypair';
+import { getIdentityPub, signIdentity, verifyIdentity, ysyncSigner } from './keypair';
 
 export interface DirectMessage {
   author: string;      // base64url Ed25519 pubkey of the sender
@@ -136,7 +136,7 @@ async function openDmInner(peerPub: string, peerHints: RoomMemberHint | null): P
   const provider = new NetworkProvider();
   await provider.connect(boot);
   const channel = await provider.openChannel('ysync');
-  const sync = new YjsSync({ roomId, channel, bootRecord: () => provider.getBootRecord() });
+  const sync = new YjsSync({ roomId, channel, ...ysyncSigner(), bootRecord: () => provider.getBootRecord() });
   provider.onEnvelope((env: { kind?: string; room?: string; payload?: string }) => {
     if (env.kind === 'ysync') sync.ingestEnvelope(env);
   });
