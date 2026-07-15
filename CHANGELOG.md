@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.28.0-core-loop-demo](prototypes/0.28.0-core-loop-demo/) and is built by the
+[prototypes/0.29.0-core-loop-demo](prototypes/0.29.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.Z` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,7 +9,22 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- Next on the node-side mesh chain (designed in `brainstorming/keyed-identity-contacts-plan.md` + `m5-traffic-mesh-plan.md`): M3 trust-weighted dial policy, M4 reachability introduction/relay, and M5 the hole-punched P2P traffic gossip mesh — plus the final two-machine confirmation of the host→joiner ysync fix (both peers on the 0.28.0 node), a self-dial guard (the browser stamps its own node id as a peer hint, so the node briefly dials itself), E4 furniture PERSISTENCE, S3 presence (name tags + remote outfits), and the station-doc flight-control authority tree.
+- The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
+
+## v0.29.0 — 2026-07-15
+
+### The Traffic Mesh — Multi-Hop Movement, Live Membership, and a Bounded, Trust-Ordered Overlay
+
+M1–M4 made the network *reachable*; this line changes how game **traffic flows across it**. The hub-centric star — where real-time movement was hop-1-capped, single-hub-critical, and `remote_peers` was insert-only with no liveness — becomes a resilient, hub-independent, multi-hop gossip overlay, admission-gated so free-minted keys can't buy relay leverage. Built from the design panel's synthesis: *flood over a bounded, trust-ordered neighbor set.* (Node-side; the browser stays a thin WebTransport client.)
+
+- **Multi-hop movement (M5.2) — the core win.** The 20 Hz movement-tick lane was hop-1-capped (`main.rs`), so a spoke two relay-nodes out never saw you. The datagram hop byte is repurposed from a 0/1 flag to a **decrementing TTL** (init 4), and a **second, tick-scoped dedup cache** (keyed on the full 13-byte tick, so a wrapping `u16` seq can never alias a fresh tick) makes the multi-hop flood loop-safe. Dedup gates *before* both local delivery and relay; a node seeds its own outgoing ticks so a mesh cycle can't echo them back. Result: in an A–B–C line where A and C aren't directly linked, A's movement reaches C through B — with no echo storm.
+- **The node's first-ever liveness (M5.1).** `remote_peers` was insert-only and never pruned, so every relay fanned out to dead connections forever. A per-room **heartbeat** (5 s) now stamps `last_seen` on every tick/frame/heartbeat and **prunes** a peer silent past ~15 s — and a pruned-but-live peer is **re-admitted** the instant it sends again, so a transient gap can't harden into a permanent one-way partition.
+- **Signed control plane + closed the unsigned dial (M5.0).** The old gossip mesh-upgrade dialed off **any** relayed bytes with no signature check, inline (stalling the ysync reader) and bypassing the dial single-flight — an open amplifier. It now requires a **sig-Valid** envelope, claims the single-flight, and routes through the bounded-backoff dialer. New control kinds (`roster`/`graft`/`prune`/`px`/`ihave`/`iwant`) ride the reliable lane behind **strict admission** (signature must be *Valid*, not merely present — independent of `SSF_REQUIRE_SIG`), and are never blind-flooded.
+- **Bounded, trust-ordered neighbor set (M5.3) + trust-tiered dialing (M3).** Each node holds mesh links to a bounded degree (`D≈6`, hysteresis 4/8); every relay is narrowed to that `in_mesh` neighbor set (at ≤ 8 nodes it *is* the complete graph, so small rooms are unchanged). Dial candidates are trust-ordered (direct > room > introduced > unvetted; the browser stamps the tier, the node's hard gate stays sig-Valid), and the bounded candidate pool is capped (256/room) so a key-spraying peer can't exhaust memory.
+- **Reachability bootstrap-dial (M4).** The node bootstrap-dials **every** member hint from the room roster, not just the first — so if the primary host is unreachable, another reachable member still bootstraps you, and the node learns the whole roster (transitive gossip meshes the rest). A **ChiaHub rung-6 fall-through hook** is left at dial-exhaustion (`resolve_presence`, an inert `None` stub until chain IO lands) — "identity known, route unknown" made recoverable later with zero live infrastructure.
+- **Security hardening from an adversarial review** (10 findings, all actionable ones fixed before ship): gossip-learned peers dial by **node id only** (DHT-resolved) so a relay can't aim our QUIC handshake at an arbitrary IP (reflection); the pruned-but-live re-admission above; the bounded candidate pool; and the IWANT responder gated off with the rest of lazy-pull.
+- **Honest scope — the link-trust boundary.** This ships M5.0–M5.4 on the *link-trust* boundary. **M5.5** (per-tick authorship) is designed and stubbed but deferred — the 13-byte/20 Hz tick stays unsigned, so tick-spoof resistance rests on neighbor-trust + TTL + dedup, which is sound for the small trusted rooms this targets. **M5.4** lazy-pull (IHAVE/IWANT) is wired but **opt-in** (`SSF_MESH_LAZYPULL=1`); the deduped flood is the correct default. The large-room symmetric-membership work (emit `graft`/`prune`/`px`) is dormant at ≤ 8 nodes and deferred. **Verification:** the multi-hop flood + prune + convergence need a **three-machine** test (A–B–C) to confirm — this line is cut for that test; publish follows a green run.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy; `0.28.0-core-loop-demo/` stays frozen at its 0.28.1 release snapshot.
 
 ## v0.28.0 — 2026-07-15
 
