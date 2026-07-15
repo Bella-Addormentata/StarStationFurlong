@@ -11,6 +11,13 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.3 — 2026-07-15
+
+### Paste a Pass → You're In — Auto-Enter on Ready
+
+- **ADD PASS now takes you into the room automatically.** The staged room-list (#60) warms a pasted pass in the *background* and left you standing in your *own* room until you noticed the row turn READY and clicked ENTER — so a working cross-internet connection *looked* like a failure ("peers seen" stayed 0 because you were alone in your own room). Pasting a pass is a request to *join*, so it now arms an **auto-enter**: the room warms, and the instant it's READY the app swaps you in and closes the phone — "🛰️ Connecting to that room — you'll be taken in automatically once it's ready." The sync-before-enter gate is preserved (it waits for the room's state, never drops you into a half-loaded room), a first cross-internet connect is called out as taking up to ~30s, and a timeout surfaces a clear, non-destructive "couldn't reach it — it's saved, tap ENTER to retry." A manual ENTER/JUMP on any room cancels the pending auto-enter. Verified end-to-end against a live port-forwarded host: paste → connecting → auto-entered the host's room → host avatar + live movement ticks visible.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.3 in place). Frontend-only — the v0.29.0 node binary is unchanged.
+
 ## v0.29.2 — 2026-07-15
 
 ### Room List, by Owner — My Rooms / Friends' Rooms / Visited, + an ADD-PASS Fix
