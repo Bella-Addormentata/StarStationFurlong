@@ -390,7 +390,7 @@ async function bootstrapNetworking() {
     if (override) {
       try {
         if (classifyAddress(new URL(override.wtUrl).hostname) === 'loopback') {
-          const fp = await refreshLocalFingerprint();
+          const fp = await awaitLocalNodeFingerprint();
           if (fp && fp.base64) {
             const wtUrl = new URL(override.wtUrl);
             wtUrl.port = String(fp.port);
@@ -490,9 +490,32 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // roomId, NOT the editable display name.
   (window as any).__ssfRoomId = boot.roomId;
   updateHUDNode('ONLINE', '#00e676');
-  await networkProvider.connect(boot);
+  // Connect with a cert-refresh retry on the LOCAL loopback dial: the node's WT
+  // cert regenerates every launch, so a stale hash fails the handshake — on
+  // failure we re-read the CURRENT cert and retry before surfacing OFFLINE.
+  // Remote dials aren't retried here (their cert isn't ours to refresh — the
+  // RESTRICTED? diagnostics in bootstrapNetworking own that path).
+  let connectBoot = boot;
+  const isLoopback = (() => {
+    try { return classifyAddress(new URL(boot.wtUrl).hostname) === 'loopback'; } catch { return false; }
+  })();
+  let connected = false;
+  for (let attempt = 0; attempt < 3 && !connected; attempt++) {
+    try {
+      await networkProvider.connect(connectBoot);
+      connected = true;
+    } catch (e) {
+      if (epoch !== sessionEpoch) return; // superseded mid-connect
+      if (!isLoopback || attempt === 2) throw e;
+      const fp = await refreshLocalFingerprint();
+      if (fp && fp.base64) {
+        connectBoot = { ...connectBoot, wtUrl: `https://127.0.0.1:${fp.port}`, certHashesB64: [fp.base64] };
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
   if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
-  activeBootstrap = boot;
+  activeBootstrap = connectBoot;
   await syncAccessPass();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
@@ -1625,8 +1648,23 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   return fingerprint;
 }
 
+/** Wait for the local node to be reachable, RE-READING a fresh fingerprint each
+ *  attempt. The node sidecar can take a second or two to bind after the app
+ *  launches, and its WebTransport cert is regenerated on every node launch — so
+ *  a cached/stale hash would fail the loopback handshake. Without this retry a
+ *  startup race between the WebView and the node dropped us straight to NODE
+ *  OFFLINE with no recovery (the recurring "node offline" on launch). */
+async function awaitLocalNodeFingerprint(attempts = 12, delayMs = 600): Promise<LocalFingerprint | null> {
+  for (let i = 0; i < attempts; i++) {
+    const fp = await refreshLocalFingerprint();
+    if (fp && fp.base64) return fp;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return null;
+}
+
 async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
-  const fingerprint = await fetchLocalFingerprint();
+  const fingerprint = await awaitLocalNodeFingerprint();
   if (!fingerprint) {
     return null;
   }
