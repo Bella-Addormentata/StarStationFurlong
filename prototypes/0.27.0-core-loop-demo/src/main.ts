@@ -31,13 +31,13 @@ import {
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
   encodeMyCard, addContactFromCard, setFriend, removeContact, getContact,
-  isDiscoverable, setDiscoverable,
+  isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
 } from './contacts';
 import {
   makeIntroductions, ingestIntroduction, type Introduction,
 } from './introductions';
 import {
-  initDirectMessages, openDm, sendMessage, readMessages, closeDm,
+  initDirectMessages, openDm, sendMessage, readMessages, closeDm, closeAllDms,
   dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
 } from './directMessages';
 import {
@@ -2140,6 +2140,10 @@ function setupContactsApp(): void {
     const newPub = (window as any).__ssfIdentity.importRecoveryKey(raw);
     if (!newPub) { setContactsFeedback('That is not a valid recovery key.'); return; }
     if (inp) inp.value = '';
+    // The old identity's DM rooms are derived from the OLD pubkey pair and would
+    // sign/verify-mismatch under the new key — tear them down (review LOW).
+    closeDmOverlay();
+    void closeAllDms();
     // Re-assert the restored identity into the current room's player entry.
     updateLocalPlayerEntry();
     refreshIdentityKeyRow();
@@ -2177,16 +2181,17 @@ function isContactsAppOpen(): boolean {
 function contactRowHtml(name: string, pub: string, opts: { friend: boolean }): string {
   const fp = contactFingerprint(pub);
   const safeName = escapeHtml(name);
+  const safePub = escapeHtml(pub); // defense-in-depth: pub is canonical b64url today, but never trust it into HTML
   const friendBtn = opts.friend
-    ? `<button type="button" data-contact-act="unfriend" data-contact-pub="${pub}" title="Remove from friends">★</button>`
-    : `<button type="button" data-contact-act="friend" data-contact-pub="${pub}" title="Add to friends">☆</button>`;
+    ? `<button type="button" data-contact-act="unfriend" data-contact-pub="${safePub}" title="Remove from friends">★</button>`
+    : `<button type="button" data-contact-act="friend" data-contact-pub="${safePub}" title="Add to friends">☆</button>`;
   const dmBtn = opts.friend
-    ? `<button type="button" data-contact-act="dm" data-contact-pub="${pub}" title="Direct message">💬</button>`
+    ? `<button type="button" data-contact-act="dm" data-contact-pub="${safePub}" title="Direct message">💬</button>`
     : '';
   return `<div class="contact-row" role="listitem">
-    <span class="contact-name" title="${pub}">${safeName}</span>
+    <span class="contact-name" title="${safePub}">${safeName}</span>
     <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
-    <span class="contact-actions">${dmBtn}${friendBtn}<button type="button" data-contact-act="remove" data-contact-pub="${pub}" title="Remove contact">✕</button></span>
+    <span class="contact-actions">${dmBtn}${friendBtn}<button type="button" data-contact-act="remove" data-contact-pub="${safePub}" title="Remove contact">✕</button></span>
   </div>`;
 }
 
@@ -2244,12 +2249,18 @@ function harvestContactsIntoMesh(): void {
  *  untrusted claim anyone could write into the map). A room encounter carries
  *  identity, not a route, so it seeds the graph at 'room' trust until a card or
  *  introduction supplies reachability. */
+const verifiedCertCache = new Set<string>(); // memo of (keyB64|name|keySig) already verified
 function harvestRoomPlayersIntoMesh(players: { forEach: (cb: (v: unknown) => void) => void }): void {
   players.forEach((value) => {
     const e = value as Partial<PlayerEntry>;
-    if (e.keyB64 && e.keySig && e.name && verifyNameCert(e.name, e.keyB64, e.keySig)) {
-      recordPeer({ pub: e.keyB64, name: e.name, hints: null, trust: 'room' });
-    }
+    if (!e.keyB64 || !e.keySig || !e.name) return;
+    // Memoize the Ed25519 verify so a busy players map (a name/outfit edit fires
+    // the observer) doesn't re-verify every entry each change (review perf).
+    const cacheKey = `${e.keyB64}|${e.name}|${e.keySig}`;
+    if (verifiedCertCache.has(cacheKey)) return; // verified + recorded already
+    if (!verifyNameCert(e.name, e.keyB64, e.keySig)) return;
+    verifiedCertCache.add(cacheKey);
+    recordPeer({ pub: e.keyB64, name: e.name, hints: null, trust: 'room' });
   });
 }
 
@@ -2294,7 +2305,7 @@ function renderDmMessages(): void {
   const me = getIdentityPub();
   const msgs: DirectMessage[] = readMessages(dmActiveSession);
   if (!msgs.length) {
-    list.innerHTML = '<div id="dm-empty">No messages yet — say hello. Messages are signed end-to-end.</div>';
+    list.innerHTML = '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
     return;
   }
   list.innerHTML = msgs.map((m) => {
@@ -2363,12 +2374,31 @@ function closeDmOverlay(): void {
  * to them), and ingest the ones they publish (trust + consent gated) into the
  * mesh peer store — so the network densifies from every friend connection.
  */
+const gossipedSessions = new WeakSet<DmSession>();
+
 function gossipIntroductions(session: DmSession): void {
+  if (gossipedSessions.has(session)) return; // once per session (re-open/double-tap guard)
+  gossipedSessions.add(session);
   const introsArr = session.sync.doc.getArray<Introduction>('intros');
-  const mine = makeIntroductions(listContacts());
+
+  // Publish OUR discoverable contacts' introductions once — each carries the
+  // subject's OWN signed card (reconstructCard), so consent is subject-proven.
+  const mine = makeIntroductions(
+    listContacts().map(reconstructCard).filter((c): c is ContactCard => !!c),
+  );
   if (mine.length) session.sync.doc.transact(() => { introsArr.push(mine); });
-  const ingestAll = () => {
-    for (const intro of introsArr.toArray()) {
+
+  // Delta-ingest: process only entries past the cursor on each fire (no O(n^2)
+  // full re-verify), deduped by (subjectPub, introducerPub).
+  const seen = new Set<string>();
+  let cursor = 0;
+  const ingestNew = () => {
+    const all = introsArr.toArray();
+    for (; cursor < all.length; cursor++) {
+      const intro = all[cursor];
+      const key = intro && intro.card ? `${intro.card.pub}|${intro.introducerPub}` : '';
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
       ingestIntroduction(intro, {
         // Trust the introducer iff it's the friend we're DMing, or already a
         // vetted (friend/contact) peer in our store — never an unvetted key.
@@ -2382,8 +2412,8 @@ function gossipIntroductions(session: DmSession): void {
       });
     }
   };
-  ingestAll();
-  introsArr.observe(ingestAll);
+  ingestNew();
+  introsArr.observe(ingestNew);
 }
 
 // ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────

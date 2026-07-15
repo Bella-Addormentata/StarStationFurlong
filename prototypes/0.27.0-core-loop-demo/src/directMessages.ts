@@ -74,8 +74,11 @@ export function dmRoomIdFor(peerPub: string): string {
   return `dm-${bytesToHex(h).slice(0, 32)}`;
 }
 
-/** The DM room key (possession-based access) — identical on both sides. Base64
- *  to match the room-key carrier; not a confidentiality key (see file header). */
+/** The DM room key — identical on both sides. NB: derived purely from the two
+ *  PUBLIC keys, so it grants NO read confidentiality (anyone who has seen both
+ *  pubkeys can recompute it and read the relayed plaintext). It is an addressing
+ *  tag, not a secret. Messages are AUTHENTICATED (signed), not encrypted;
+ *  confidentiality needs an X25519-ECDH shared secret (a later phase). */
 export function dmRoomKeyFor(peerPub: string): string {
   const [a, b] = sortedPair(peerPub);
   const h = sha512(new TextEncoder().encode(`ssf-dm-key:v1:${a}|${b}`));
@@ -86,16 +89,17 @@ export function dmRoomKeyFor(peerPub: string): string {
 
 // ── Message signing / verification ───────────────────────────────────────────
 
-function msgSignBytes(roomId: string, author: string, ts: number, text: string): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify({ k: 'ssf-dm-msg:v1', roomId, author, ts, text }));
+function msgSignBytes(roomId: string, author: string, authorName: string, ts: number, text: string): Uint8Array {
+  // authorName is bound so a validly-signed message can't carry a spoofed name.
+  return new TextEncoder().encode(JSON.stringify({ k: 'ssf-dm-msg:v1', roomId, author, authorName, ts, text }));
 }
 
 /** True iff the message is signed by an author who is one of THIS DM's two
  *  members and the signature is valid — the anti-forgery check. */
 export function verifyMessage(session: DmSession, m: DirectMessage): boolean {
   if (m.author !== getIdentityPub() && m.author !== session.peerPub) return false;
-  if (typeof m.text !== 'string' || typeof m.ts !== 'number' || typeof m.sig !== 'string') return false;
-  return verifyIdentity(m.author, msgSignBytes(session.roomId, m.author, m.ts, m.text), m.sig);
+  if (typeof m.text !== 'string' || typeof m.ts !== 'number' || typeof m.sig !== 'string' || typeof m.authorName !== 'string') return false;
+  return verifyIdentity(m.author, msgSignBytes(session.roomId, m.author, m.authorName, m.ts, m.text), m.sig);
 }
 
 // ── Session lifecycle ────────────────────────────────────────────────────────
@@ -149,20 +153,28 @@ async function openDmInner(peerPub: string, peerHints: RoomMemberHint | null): P
   return session;
 }
 
+/** Max messages re-verified + rendered per read — bounds the O(n) verify cost
+ *  if a relay (or anyone who guessed the room) floods the shared 'dm' array. */
+const DM_RENDER_CAP = 300;
+
 /** Append a signed message to the conversation. */
 export function sendMessage(session: DmSession, text: string): void {
   const trimmed = text.trim();
   if (!trimmed) return;
   const author = getIdentityPub();
+  const authorName = deps?.myName() ?? 'Clone';
   const ts = Date.now();
-  const sig = signIdentity(msgSignBytes(session.roomId, author, ts, trimmed));
-  session.messages.push([{ author, authorName: deps?.myName() ?? 'Clone', text: trimmed, ts, sig }]);
+  const sig = signIdentity(msgSignBytes(session.roomId, author, authorName, ts, trimmed));
+  session.messages.push([{ author, authorName, text: trimmed, ts, sig }]);
 }
 
 /** Verified, time-ordered snapshot of the conversation (unverifiable messages
- *  dropped — never rendered). */
+ *  dropped — never rendered). Only the most recent DM_RENDER_CAP entries are
+ *  verified so a flooded array can't turn each render into unbounded work. */
 export function readMessages(session: DmSession): DirectMessage[] {
-  return session.messages.toArray()
+  const all = session.messages.toArray();
+  const tail = all.length > DM_RENDER_CAP ? all.slice(all.length - DM_RENDER_CAP) : all;
+  return tail
     .filter((m) => verifyMessage(session, m))
     .map((m) => ({ ...m, verified: true }))
     .sort((a, b) => a.ts - b.ts);
@@ -179,4 +191,10 @@ export async function closeDm(peerPub: string): Promise<void> {
   sessions.delete(peerPub);
   try { await s.sync.stop(); } catch { /* doc may be gone */ }
   try { await s.provider.disconnect(); } catch { /* transport may be gone */ }
+}
+
+/** Tear down ALL live DM sessions — e.g. on an identity switch, whose rooms are
+ *  derived from the OLD pubkey pair and would otherwise sign/verify-mismatch. */
+export async function closeAllDms(): Promise<void> {
+  await Promise.all([...sessions.keys()].map((p) => closeDm(p)));
 }

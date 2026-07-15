@@ -42,6 +42,11 @@ export interface Contact {
   discoverable?: boolean;
   friend: boolean;
   addedAt: number;
+  /** The subject's OWN signature + issuance from their card, retained so we can
+   *  reconstruct their verifiable signed card (reconstructCard) — e.g. to prove
+   *  their consent when introducing them (§7 M2 receiver-side consent proof). */
+  cardIssuedAt?: number;
+  cardSig?: string;
 }
 
 export interface ContactsDeps {
@@ -168,14 +173,31 @@ export function decodeContactCard(input: string): ContactCard | null {
   } catch {
     return null;
   }
+  return verifyContactCard(card) ? card : null;
+}
+
+/** Object-level card verification: shape + the self-signature by the key it
+ *  claims. Shared by decodeContactCard and by introduction ingest (so a
+ *  vouched subject's card proves identity + consent + route by the subject's
+ *  OWN key, not the introducer's word). */
+export function verifyContactCard(card: ContactCard | null | undefined): boolean {
   if (
     !card || card.kind !== 'contact' ||
     typeof card.pub !== 'string' || typeof card.name !== 'string' ||
     typeof card.issuedAt !== 'number' || typeof card.sig !== 'string'
-  ) return null;
-  // The card MUST be self-signed by the key it claims — this is the whole point.
-  const ok = verifyIdentity(card.pub, cardSignBytes(card.pub, card.name, card.issuedAt, card.hints ?? null, !!card.discoverable), card.sig);
-  return ok ? card : null;
+  ) return false;
+  return verifyIdentity(card.pub, cardSignBytes(card.pub, card.name, card.issuedAt, card.hints ?? null, !!card.discoverable), card.sig);
+}
+
+/** Rebuild a contact's verifiable signed card from the retained fields, or null
+ *  if we never stored the subject's signature (legacy/self-added contact). */
+export function reconstructCard(c: Contact): ContactCard | null {
+  if (typeof c.cardSig !== 'string' || typeof c.cardIssuedAt !== 'number') return null;
+  const card: ContactCard = {
+    v: 1, kind: 'contact', pub: c.pub, name: c.name,
+    hints: c.hints, discoverable: !!c.discoverable, issuedAt: c.cardIssuedAt, sig: c.cardSig,
+  };
+  return verifyContactCard(card) ? card : null;
 }
 
 /** Import a verified card → add/refresh the contact. Returns the pub, or an
@@ -190,8 +212,13 @@ export function addContactFromCard(input: string): { ok: true; pub: string; name
     existing.name = card.name;               // refresh name
     existing.hints = card.hints;             // refresh reachability
     existing.discoverable = !!card.discoverable; // refresh consent flag
+    existing.cardIssuedAt = card.issuedAt;   // retain the subject's own signature
+    existing.cardSig = card.sig;             // so we can prove their consent later
   } else {
-    contacts.push({ pub: card.pub, name: card.name, hints: card.hints, discoverable: !!card.discoverable, friend: false, addedAt: Date.now() });
+    contacts.push({
+      pub: card.pub, name: card.name, hints: card.hints, discoverable: !!card.discoverable,
+      friend: false, addedAt: Date.now(), cardIssuedAt: card.issuedAt, cardSig: card.sig,
+    });
   }
   persist();
   notify();
