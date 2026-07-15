@@ -45,6 +45,117 @@ pub struct SsfEnvelope {
     pub iroh_direct_addrs: Option<Vec<String>>,
 }
 
+// ── Slice 2: verify-before-apply seam (keyed identity) ───────────────────────
+
+/// SSF_REQUIRE_SIG mode. Default `warn`: verify signed envelopes and LOG
+/// mismatches but drop nothing (observe-then-enforce; the owner flips to
+/// `reject` once the warn metric shows zero false drops). `off` skips checking.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SigMode {
+    Off,
+    Warn,
+    Reject,
+}
+
+static SIG_MODE: std::sync::OnceLock<SigMode> = std::sync::OnceLock::new();
+
+fn sig_mode() -> SigMode {
+    *SIG_MODE.get_or_init(|| {
+        let m = match std::env::var("SSF_REQUIRE_SIG")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" => SigMode::Off,
+            "reject" => SigMode::Reject,
+            _ => SigMode::Warn,
+        };
+        println!("🔒 SSF_REQUIRE_SIG mode: {:?} (Slice 2 verify-before-apply)", m);
+        m
+    })
+}
+
+/// Canonical envelope sign-bytes — MUST byte-match the browser (signBytes.ts):
+/// blake3("ssf-env:v1\n{v}\n{room}\n{kind}\n{seq}\n" ‖ payload).
+fn canonical_sign_bytes(v: u32, room: &str, kind: &str, seq: u32, payload: &[u8]) -> [u8; 32] {
+    let header = format!("ssf-env:v1\n{}\n{}\n{}\n{}\n", v, room, kind, seq);
+    let mut buf = Vec::with_capacity(header.len() + payload.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(payload);
+    *blake3::hash(&buf).as_bytes()
+}
+
+#[derive(PartialEq, Eq)]
+enum SigVerdict {
+    Valid,
+    Invalid,
+    Unsigned,
+}
+
+/// Verify an envelope's Ed25519 signature over the canonical bytes. Missing sig,
+/// or a non-32-byte / all-zero author (the Phase-1 dummy), is `Unsigned` (legacy,
+/// always allowed); a present sig that fails to verify is `Invalid`.
+fn verify_envelope_sig(env: &SsfEnvelope) -> SigVerdict {
+    let sig_b64 = match &env.sig {
+        Some(s) if !s.is_empty() => s,
+        _ => return SigVerdict::Unsigned,
+    };
+    if env.author.len() != 32 || env.author.iter().all(|&b| b == 0) {
+        return SigVerdict::Unsigned;
+    }
+    let pub_arr: [u8; 32] = match env.author.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return SigVerdict::Invalid,
+    };
+    let public = match PublicKey::from_bytes(&pub_arr) {
+        Ok(p) => p,
+        Err(_) => return SigVerdict::Invalid,
+    };
+    let sig_bytes = match base64::Engine::decode(&base64::prelude::BASE64_STANDARD, sig_b64) {
+        Ok(b) => b,
+        Err(_) => return SigVerdict::Invalid,
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return SigVerdict::Invalid,
+    };
+    let sig = iroh::Signature::from_bytes(&sig_arr);
+    let canonical = canonical_sign_bytes(env.v, &env.room, &env.kind, env.seq, &env.payload);
+    match public.verify(&canonical, &sig) {
+        Ok(()) => SigVerdict::Valid,
+        Err(_) => SigVerdict::Invalid,
+    }
+}
+
+/// Slice 2 gate: true = DROP this envelope (skip relay + merge). Only reject-mode
+/// + a present-but-INVALID signature drops; unsigned (legacy) and valid proceed.
+/// Logs invalids under warn/reject so the false-drop metric is observable.
+fn sig_should_drop(env: &SsfEnvelope, path: &str) -> bool {
+    let mode = sig_mode();
+    if mode == SigMode::Off {
+        return false;
+    }
+    match verify_envelope_sig(env) {
+        SigVerdict::Valid | SigVerdict::Unsigned => false,
+        SigVerdict::Invalid => match mode {
+            SigMode::Reject => {
+                eprintln!(
+                    "🔒 reject: DROPPED invalid-sig {} (room {}, seq {}, path {})",
+                    env.kind, env.room, env.seq, path
+                );
+                true
+            }
+            _ => {
+                eprintln!(
+                    "🔎 warn: invalid-sig {} would drop (room {}, seq {}, path {})",
+                    env.kind, env.room, env.seq, path
+                );
+                false
+            }
+        },
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Fingerprint {
     pub hex: String,
@@ -893,6 +1004,14 @@ async fn handle_wt_connection_inner(
                             }
                         }
 
+                        // Slice 2 verify-before-apply: under SSF_REQUIRE_SIG=reject a forged
+                        // (signed-but-invalid) ysync is dropped BEFORE relay + merge; warn
+                        // only logs it. The dial above is reachability (gated by M5.0), not
+                        // state, so it's left to run.
+                        if envelope.kind == "ysync" && sig_should_drop(&envelope, "wt-in") {
+                            continue;
+                        }
+
                         // Relayer/Bridge Pipeline: Forward stream updates over Iroh P2P to remote peers
                         let room_id = room_id_inner.as_ref().unwrap();
                         let peers: Vec<iroh::endpoint::Connection> = {
@@ -1290,6 +1409,13 @@ fn handle_iroh_connection(
                             if !hub_clone.seen_envelopes.lock().unwrap().check_and_insert(key) {
                                 continue;
                             }
+                        }
+
+                        // Slice 2 verify-before-apply (iroh path): under SSF_REQUIRE_SIG=reject
+                        // a forged (signed-but-invalid) ysync is dropped BEFORE the gossip-dial,
+                        // relay and merge — we act on nothing a bad signature carries; warn logs.
+                        if envelope.kind == "ysync" && sig_should_drop(&envelope, "iroh-in") {
+                            continue;
                         }
 
                         let room_id = room_id_inner.as_ref().unwrap();
