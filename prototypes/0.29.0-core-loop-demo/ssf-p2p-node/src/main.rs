@@ -424,10 +424,31 @@ impl SeenCache {
     }
 }
 
-/// Relay-dedup key: origin identity + sequence + payload bytes.
-fn envelope_seen_key(origin_node_id: &str, seq: u32, payload: &[u8]) -> [u8; 16] {
+/// Relay-dedup key: origin identity + ROOM + sequence + payload bytes.
+///
+/// The `room` component is load-bearing (v0.29.6 fix): `hub.seen_envelopes` is
+/// ONE cache shared across every room, so a room-blind key let two DIFFERENT
+/// rooms' byte-identical frames alias. That is not hypothetical — every YjsSync
+/// opens with `SyncStep1 = encodeStateVector(emptyDoc)`, and an empty Y.Doc's
+/// state vector is a CONSTANT. A browser running a DM provider (opened at app
+/// load) and a room provider (opened on JUMP) emits both openers from the SAME
+/// iroh node id at the same starting seq with the same empty-doc payload → an
+/// identical `(node,seq,payload)` key. The DM's opener won the slot first, so
+/// the room's SyncStep1 hit `check_and_insert()==false` and was dropped BEFORE
+/// delivery — the host never answered with the room's SyncStep2 (players /
+/// roomInfo / furniture), while the separately-keyed tick lane kept flowing.
+/// (A wiped localStorage after a reinstall makes both docs empty → the openers
+/// become byte-identical → deterministic collision; persisted non-empty docs
+/// had distinct state vectors, which is why the same path synced before.)
+///
+/// A 0x1f unit separator keeps the two variable-length string fields
+/// (origin_node_id, room) from concat-aliasing across the boundary.
+fn envelope_seen_key(origin_node_id: &str, room: &str, seq: u32, payload: &[u8]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(origin_node_id.as_bytes());
+    hasher.update(&[0x1f]);
+    hasher.update(room.as_bytes());
+    hasher.update(&[0x1f]);
     hasher.update(&seq.to_le_bytes());
     hasher.update(payload);
     let hash = hasher.finalize();
@@ -1302,7 +1323,7 @@ async fn handle_wt_connection_inner(
                         // mesh echo can never re-enter this node as "new" (0.18.0 hub relay).
                         let self_id_str = iroh_clone.id().to_string();
                         {
-                            let key = envelope_seen_key(&self_id_str, envelope.seq, &envelope.payload);
+                            let key = envelope_seen_key(&self_id_str, room_id, envelope.seq, &envelope.payload);
                             hub_clone.seen_envelopes.lock().unwrap().check_and_insert(key);
                         }
 
@@ -1857,7 +1878,7 @@ fn handle_iroh_connection(
                             .clone()
                             .unwrap_or_else(|| remote_id.to_string());
                         {
-                            let key = envelope_seen_key(&origin_id_str, envelope.seq, &envelope.payload);
+                            let key = envelope_seen_key(&origin_id_str, room_id, envelope.seq, &envelope.payload);
                             if !hub_clone.seen_envelopes.lock().unwrap().check_and_insert(key) {
                                 continue;
                             }

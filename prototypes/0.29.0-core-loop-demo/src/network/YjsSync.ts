@@ -118,6 +118,21 @@ export class YjsSync {
     this.#readIncoming();
   }
 
+  /** Re-issue the opening SyncStep1 handshake AFTER start(). The initial
+   *  SyncStep1 (start(), step 1) is a one-shot: it fires the instant the local
+   *  WebTransport is up, which is BEFORE the node's P2P dial to the room host
+   *  finishes. At that moment the node's neighbor set is empty, so the frame is
+   *  relayed to nobody and the host never answers with SyncStep2. The host's
+   *  room state (roster, roomInfo.name, furniture) is STATIC — it only ships in
+   *  reply to a SyncStep1 — so it never transfers, while the continuous tick
+   *  lane (movement) still flows. Re-issuing SyncStep1 once the node reports a
+   *  peer LINKED (bridge `connected`) reaches the now-present host and pulls its
+   *  full state. Safe to call repeatedly: a SyncStep1 is idempotent. */
+  resync(): void {
+    if (!this.#active || !this.#writer) return;
+    void this.#sendSyncStep1();
+  }
+
   async stop(): Promise<void> {
     this.#active = false;
     if (this.#writer) {
