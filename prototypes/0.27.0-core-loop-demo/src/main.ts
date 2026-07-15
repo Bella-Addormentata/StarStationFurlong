@@ -17,6 +17,10 @@ import { initCameraRig, updateCameraRig } from './cameraRig';
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
 import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
 import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH } from './identity';
+import {
+  getIdentityPub, getIdentityFingerprint, signNameCert, verifyNameCert,
+  exportRecoveryKey, importRecoveryKey,
+} from './keypair';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
@@ -24,6 +28,21 @@ import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
   setActivePassRoom, removePass, type PassState,
 } from './roomPasses';
+import {
+  initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
+  encodeMyCard, addContactFromCard, setFriend, removeContact, getContact,
+  isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
+} from './contacts';
+import {
+  makeIntroductions, ingestIntroduction, type Introduction,
+} from './introductions';
+import {
+  initDirectMessages, openDm, sendMessage, readMessages, closeDm, closeAllDms,
+  dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
+} from './directMessages';
+import {
+  initPeerStore, recordPeer, hintsFor, peerCount, listPeers, subscribePeers, getPeer,
+} from './peerStore';
 
 type RendererModule = typeof import('./renderer');
 
@@ -45,6 +64,20 @@ const mouse     = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+
+// Keyed-identity Slice 1: expose the identity for verification + the recovery
+// backup/restore flow (the polished UI lands with the Contacts app, Slice 3).
+(window as any).__ssfIdentity = {
+  getPub: () => getIdentityPub(),
+  getFingerprint: () => getIdentityFingerprint(),
+  exportRecoveryKey: () => exportRecoveryKey(),
+  importRecoveryKey: (r: string) => importRecoveryKey(r),
+  verifyNameCert,
+};
+// DM pair-derivation debug hook (deterministic room/key from a peer pubkey).
+(window as any).__ssfDM = { roomIdFor: dmRoomIdFor, roomKeyFor: dmRoomKeyFor };
+// 🕸️ Mesh peer-store debug hook (§7 M1).
+(window as any).__ssfMesh = { count: () => peerCount(), list: () => listPeers(), hintsFor };
 let yjsSync: YjsSync | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
@@ -554,6 +587,18 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   if (!roomPassesInited) {
     roomPassesInited = true;
     initRoomPasses({ decode: decodeBootstrapInput, resolve: resolveBridgeBootstrap });
+    // Contacts (keyed identity §8): our card embeds our node reachability (the
+    // same local hint passes carry) so a friend can dial us for a DM / mesh link.
+    initContacts({
+      myName: () => getPlayerName(),
+      myHints: () => (localFingerprint ? getLocalNodeHint(localFingerprint) : null),
+    });
+    initDirectMessages({ resolve: resolveBridgeBootstrap, myName: () => getPlayerName() });
+    // 🕸️ Mesh peer store (§7 M1): harvest every contact/friend into the durable
+    // trust-weighted pool, and re-harvest whenever contacts change.
+    initPeerStore({ selfPub: () => getIdentityPub() });
+    harvestContactsIntoMesh();
+    subscribeContacts(harvestContactsIntoMesh);
   }
   setActivePassRoom(boot.roomId);
 
@@ -596,6 +641,15 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     });
   }
 
+  // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
+  // so our KEYED entry (keyB64 + self-cert) wins over any stale pre-Slice-1
+  // entry for the same id that the node holds — the join-time upsert above runs
+  // pre-sync, and Yjs LWW would otherwise keep the older keyless version.
+  const entryEpoch = epoch;
+  void sync.whenServerSynced.then(() => {
+    if (entryEpoch === sessionEpoch) updateLocalPlayerEntry();
+  });
+
   const updateRoomUI = () => {
     const nameVal = roomMap.get('name') as string || 'Lobby';
     const ownerVal = roomMap.get('owner') as string || 'Local-Clone';
@@ -624,6 +678,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   playersMap.observe((_event) => {
     renderPhonePlayersList();
     updateRoomUI();
+    harvestRoomPlayersIntoMesh(playersMap);
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -1028,6 +1083,14 @@ interface PlayerEntry {
   name: string;
   joinedAt: number;
   outfitId: string;
+  /** Keyed-identity Slice 1 (additive): the player's Ed25519 public key
+   *  (base64url) and a self-signature over the name↔key binding. Lets a peer
+   *  verify a display name is backed by a real key (verifyNameCert). The map
+   *  is still KEYED by the legacy UUID (getPlayerId) — the pubkey-as-id
+   *  migration is a later, dual-read slice. Optional so legacy entries stay
+   *  valid. */
+  keyB64?: string;
+  keySig?: string;
 }
 
 /**
@@ -1043,10 +1106,15 @@ function updateLocalPlayerEntry(): void {
   const players = sync.doc.getMap('players');
   const id = getPlayerId();
   const prev = players.get(id) as Partial<PlayerEntry> | undefined;
+  const name = getPlayerName();
   const entry: PlayerEntry = {
-    name: getPlayerName(),
+    name,
     joinedAt: typeof prev?.joinedAt === 'number' ? prev.joinedAt : Date.now(),
     outfitId: loadSavedOutfitId() ?? 'default',
+    // Self-signed name↔key cert (Slice 1): proves the identity key holder
+    // claims this name. Re-signed on every upsert so a name edit re-certs.
+    keyB64: getIdentityPub(),
+    keySig: signNameCert(name),
   };
   sync.doc.transact(() => {
     players.set(id, entry);
@@ -1184,6 +1252,7 @@ function setupSpacePhoneOverlay() {
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
     if (id === 'access') refreshAccessRoomRow();
+    if (id === 'contacts') refreshContactsApp();
   };
 
   // App tiles on the home screen route into their views
@@ -1306,6 +1375,11 @@ function setupSpacePhoneOverlay() {
   const playerNameEditBtn = document.getElementById('phone-player-name-edit');
   const refreshIdentityRow = () => {
     if (playerNameEl) playerNameEl.textContent = getPlayerName();
+    const keyEl = document.getElementById('phone-identity-key');
+    if (keyEl) {
+      keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
+      keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
+    }
   };
   refreshIdentityRow();
   const beginPlayerNameEdit = () => {
@@ -1400,6 +1474,22 @@ function setupSpacePhoneOverlay() {
 
   renderPassesList();
   subscribePasses(renderPassesList);
+
+  // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
+  // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
+  // owner-gated, so a non-owner click is inert).
+  const accessModeRow = document.getElementById('access-mode-row');
+  if (accessModeRow) {
+    accessModeRow.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.access-mode-btn');
+      if (!btn || btn.disabled) return;
+      setRoomAccessMode(btn.dataset.accessMode as AccessMode);
+      applyAccessModeUI(getRoomAccessMode());
+    });
+  }
+
+  // 👥 Contacts app wiring (keyed identity §8) — share/import cards, friends.
+  setupContactsApp();
 
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
@@ -1914,7 +2004,56 @@ async function syncAccessPass(): Promise<void> {
  *  session (#52). Called when the ACCESS view opens (covers offline/pre-join
  *  states), after a successful beam-in, and from the per-join roomInfo /
  *  players observers so a rename or ownership resolve repaints it live. */
+// ── Room access mode (public-doors) ──────────────────────────────────────────
+// The room's ENTRY policy, synced in roomInfo and surfaced at every door LED
+// + the ACCESS app. PUBLIC = anyone enters; PASS = anyone with the link
+// (today's default); KEYED = granted keys only (enforced once keyed identity
+// ships — see brainstorming/keyed-identity-contacts-plan.md §9). Owner-set.
+type AccessMode = 'public' | 'pass' | 'keyed';
+
+const ACCESS_MODE_COPY: Record<AccessMode, string> = {
+  public: 'PUBLIC · anyone can enter this room.',
+  pass: 'PASS · anyone with the link can enter (default).',
+  keyed: 'KEYED · granted keys only (enforced once keyed identity ships).',
+};
+
+function getRoomAccessMode(): AccessMode {
+  const m = yjsSync?.doc.getMap('roomInfo').get('accessMode');
+  return m === 'public' || m === 'keyed' ? m : 'pass';
+}
+
+function isLocalOwnerOfCurrentRoom(): boolean {
+  const owner = yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined;
+  return !!owner && isLocalPlayerRoomOwner(owner);
+}
+
+function setRoomAccessMode(mode: AccessMode): void {
+  if (!yjsSync || !isLocalOwnerOfCurrentRoom()) return; // owner-gated
+  const rm = yjsSync.doc.getMap('roomInfo');
+  yjsSync.doc.transact(() => rm.set('accessMode', mode));
+}
+
+/** Reflect the current access mode: tint the door LEDs + paint the ACCESS
+ *  app's selector (owner-editable, everyone else read-only). */
+function applyAccessModeUI(mode: AccessMode): void {
+  world.dockingSystem?.setAccessMode(mode);
+  const isOwner = isLocalOwnerOfCurrentRoom();
+  const row = document.getElementById('access-mode-row');
+  if (row) {
+    for (const btn of row.querySelectorAll<HTMLButtonElement>('.access-mode-btn')) {
+      const btnMode = btn.dataset.accessMode as AccessMode;
+      btn.setAttribute('aria-checked', String(btnMode === mode));
+      btn.disabled = !isOwner;
+      btn.classList.toggle('is-disabled', !isOwner);
+      btn.title = isOwner ? `Set room access to ${btnMode}` : 'Only the room owner can change access mode';
+    }
+  }
+  const note = document.getElementById('access-mode-note');
+  if (note) note.textContent = isOwner ? ACCESS_MODE_COPY[mode] : `${ACCESS_MODE_COPY[mode]} (owner-set)`;
+}
+
 function refreshAccessRoomRow(): void {
+  applyAccessModeUI(getRoomAccessMode());
   const nameEl = document.getElementById('access-room-name');
   const idEl = document.getElementById('access-room-id');
   if (!nameEl || !idEl) return;
@@ -1925,6 +2064,356 @@ function refreshAccessRoomRow(): void {
   }
   nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Lobby';
   idEl.textContent = activeBootstrap?.roomId ?? 'furlong-lobby';
+}
+
+// ── 👥 Contacts app (keyed identity §8) ──────────────────────────────────────
+
+/** Repaint the phone identity row (name + key fingerprint). Module-level so
+ *  actions outside setupSpacePhoneOverlay (identity restore) can refresh it. */
+function refreshIdentityKeyRow(): void {
+  const nameEl = document.getElementById('phone-player-name');
+  if (nameEl) nameEl.textContent = getPlayerName();
+  const keyEl = document.getElementById('phone-identity-key');
+  if (keyEl) {
+    keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
+    keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
+  }
+}
+
+let contactsAppInited = false;
+
+function setContactsFeedback(msg: string): void {
+  const el = document.getElementById('contacts-feedback');
+  if (el) el.textContent = msg;
+}
+
+/** Bind the Contacts app once: share/import cards, recovery, friend/contact
+ *  list actions (delegated). Re-render on any contacts change. */
+function setupContactsApp(): void {
+  if (contactsAppInited) return;
+  contactsAppInited = true;
+
+  const discoverableBox = document.getElementById('contacts-discoverable') as HTMLInputElement | null;
+  if (discoverableBox) {
+    discoverableBox.checked = isDiscoverable();
+    discoverableBox.addEventListener('change', () => {
+      setDiscoverable(discoverableBox.checked);
+      setContactsFeedback(discoverableBox.checked
+        ? 'Discoverable — re-share your card so friends can introduce you.'
+        : 'No longer discoverable. New cards you share opt out.');
+    });
+  }
+
+  document.getElementById('contacts-share-btn')?.addEventListener('click', () => {
+    const card = encodeMyCard();
+    const out = document.getElementById('contacts-my-card') as HTMLInputElement | null;
+    if (out) { out.value = card; out.select(); }
+    navigator.clipboard?.writeText(card).then(
+      () => setContactsFeedback('Your card is copied — share it however you like.'),
+      () => setContactsFeedback('Your card is shown above — copy it manually.'),
+    );
+  });
+
+  const addBtn = document.getElementById('contacts-add-btn');
+  const addInput = document.getElementById('contacts-add-input') as HTMLInputElement | null;
+  addBtn?.addEventListener('click', () => {
+    const raw = addInput?.value.trim();
+    if (!raw) { setContactsFeedback('Paste a contact card first.'); return; }
+    const result = addContactFromCard(raw);
+    if (!result.ok) { setContactsFeedback(result.error); return; }
+    if (addInput) addInput.value = '';
+    setContactsFeedback(result.isSelf
+      ? "That's your own card."
+      : `Added ${result.name} · 🔑 ${contactFingerprint(result.pub)}. Verify the fingerprint out-of-band.`);
+  });
+
+  // Recovery: reveal export / restore (destructive — swaps your identity).
+  document.getElementById('contacts-export-btn')?.addEventListener('click', () => {
+    const out = document.getElementById('contacts-recovery-out') as HTMLInputElement | null;
+    if (out) { out.value = (window as any).__ssfIdentity.exportRecoveryKey(); out.select(); }
+    setContactsFeedback('Recovery key revealed — store it somewhere only you control.');
+  });
+  document.getElementById('contacts-import-key-btn')?.addEventListener('click', () => {
+    const inp = document.getElementById('contacts-recovery-in') as HTMLInputElement | null;
+    const raw = inp?.value.trim();
+    if (!raw) { setContactsFeedback('Paste a recovery key to restore.'); return; }
+    const newPub = (window as any).__ssfIdentity.importRecoveryKey(raw);
+    if (!newPub) { setContactsFeedback('That is not a valid recovery key.'); return; }
+    if (inp) inp.value = '';
+    // The old identity's DM rooms are derived from the OLD pubkey pair and would
+    // sign/verify-mismatch under the new key — tear them down (review LOW).
+    closeDmOverlay();
+    void closeAllDms();
+    // Re-assert the restored identity into the current room's player entry.
+    updateLocalPlayerEntry();
+    refreshIdentityKeyRow();
+    refreshContactsApp();
+    setContactsFeedback('Identity restored. Your key fingerprint updated.');
+  });
+
+  // Delegated list actions (friend toggle, DM, remove) for both lists.
+  const onListClick = (e: Event) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-contact-act]');
+    if (!btn) return;
+    const pub = btn.dataset.contactPub;
+    if (!pub) return;
+    switch (btn.dataset.contactAct) {
+      case 'friend': setFriend(pub, true); setContactsFeedback('Added to friends.'); break;
+      case 'unfriend': setFriend(pub, false); setContactsFeedback('Removed from friends.'); break;
+      case 'remove': removeContact(pub); setContactsFeedback('Contact removed.'); break;
+      case 'dm': openDirectMessage(pub); break;
+    }
+  };
+  document.getElementById('contacts-friends-list')?.addEventListener('click', onListClick);
+  document.getElementById('contacts-all-list')?.addEventListener('click', onListClick);
+
+  // Keep the app live while it (or anything) mutates the contacts store or the
+  // mesh peer store (room harvest densifies the mesh while you're in a room).
+  subscribeContacts(() => { if (isContactsAppOpen()) refreshContactsApp(); });
+  subscribePeers(() => { if (isContactsAppOpen()) refreshContactsApp(); });
+}
+
+function isContactsAppOpen(): boolean {
+  const el = document.getElementById('phone-app-contacts');
+  return !!el && el.classList.contains('active');
+}
+
+function contactRowHtml(name: string, pub: string, opts: { friend: boolean }): string {
+  const fp = contactFingerprint(pub);
+  const safeName = escapeHtml(name);
+  const safePub = escapeHtml(pub); // defense-in-depth: pub is canonical b64url today, but never trust it into HTML
+  const friendBtn = opts.friend
+    ? `<button type="button" data-contact-act="unfriend" data-contact-pub="${safePub}" title="Remove from friends">★</button>`
+    : `<button type="button" data-contact-act="friend" data-contact-pub="${safePub}" title="Add to friends">☆</button>`;
+  const dmBtn = opts.friend
+    ? `<button type="button" data-contact-act="dm" data-contact-pub="${safePub}" title="Direct message">💬</button>`
+    : '';
+  return `<div class="contact-row" role="listitem">
+    <span class="contact-name" title="${safePub}">${safeName}</span>
+    <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
+    <span class="contact-actions">${dmBtn}${friendBtn}<button type="button" data-contact-act="remove" data-contact-pub="${safePub}" title="Remove contact">✕</button></span>
+  </div>`;
+}
+
+function refreshContactsApp(): void {
+  const nameEl = document.getElementById('contacts-my-name');
+  const fpEl = document.getElementById('contacts-my-fp');
+  if (nameEl) nameEl.textContent = getPlayerName();
+  if (fpEl) fpEl.textContent = `🔑 ${getIdentityFingerprint()}`;
+
+  const friends = listFriends();
+  const all = listContacts();
+  const friendsList = document.getElementById('contacts-friends-list');
+  const allList = document.getElementById('contacts-all-list');
+  if (friendsList) {
+    friendsList.innerHTML = friends.length
+      ? friends.map((c) => contactRowHtml(c.name, c.pub, { friend: true })).join('')
+      : '<div class="phone-access-note">No friends yet — add a contact, then tap ☆ to make them a friend.</div>';
+  }
+  if (allList) {
+    allList.innerHTML = all.length
+      ? all.map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend })).join('')
+      : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
+  }
+  const meshNote = document.getElementById('contacts-mesh-note');
+  if (meshNote) {
+    const n = peerCount();
+    const routable = listPeers().filter((p) => p.hints != null).length;
+    meshNote.textContent = n
+      ? `${n} peer${n === 1 ? '' : 's'} known · ${routable} with a live route. Every verified identity you meet strengthens the network.`
+      : 'Every verified identity you meet strengthens the peer network.';
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => (
+    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;'
+  ));
+}
+
+/** 🕸️ Mesh harvest (§7 M1): fold every contact/friend into the peer store.
+ *  Friends outrank plain contacts; hints (reachability) carry through. */
+function harvestContactsIntoMesh(): void {
+  for (const c of listContacts()) {
+    recordPeer({
+      pub: c.pub,
+      name: c.name,
+      hints: (c.hints as RoomMemberHint | undefined) ?? null,
+      trust: c.friend ? 'friend' : 'contact',
+    });
+  }
+}
+
+/** 🕸️ Mesh harvest (§7 M1): fold room co-members into the peer store — but
+ *  ONLY those whose name↔key self-cert verifies (an unverified keyB64 is an
+ *  untrusted claim anyone could write into the map). A room encounter carries
+ *  identity, not a route, so it seeds the graph at 'room' trust until a card or
+ *  introduction supplies reachability. */
+const verifiedCertCache = new Set<string>(); // memo of (keyB64|name|keySig) already verified
+function harvestRoomPlayersIntoMesh(players: { forEach: (cb: (v: unknown) => void) => void }): void {
+  players.forEach((value) => {
+    const e = value as Partial<PlayerEntry>;
+    if (!e.keyB64 || !e.keySig || !e.name) return;
+    // Memoize the Ed25519 verify so a busy players map (a name/outfit edit fires
+    // the observer) doesn't re-verify every entry each change (review perf).
+    const cacheKey = `${e.keyB64}|${e.name}|${e.keySig}`;
+    if (verifiedCertCache.has(cacheKey)) return; // verified + recorded already
+    if (!verifyNameCert(e.name, e.keyB64, e.keySig)) return;
+    verifiedCertCache.add(cacheKey);
+    recordPeer({ pub: e.keyB64, name: e.name, hints: null, trust: 'room' });
+  });
+}
+
+// ── 💬 Direct-message overlay (keyed identity §8) ────────────────────────────
+
+let dmOverlayInited = false;
+let dmActivePeer: string | null = null;
+let dmActiveSession: DmSession | null = null;
+let dmObserver: (() => void) | null = null;
+
+function setupDmOverlay(): void {
+  if (dmOverlayInited) return;
+  dmOverlayInited = true;
+  document.getElementById('dm-close')?.addEventListener('click', closeDmOverlay);
+  const form = document.getElementById('dm-form') as HTMLFormElement | null;
+  const input = document.getElementById('dm-input') as HTMLInputElement | null;
+  form?.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input?.value ?? '';
+    if (!text.trim() || !dmActiveSession) return;
+    sendMessage(dmActiveSession, text);
+    if (input) input.value = '';
+    renderDmMessages(); // local echo is immediate; the observer covers remote
+  });
+  // Esc closes the DM (capture so it beats the phone's Esc-to-home handler).
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !document.getElementById('dm-overlay')?.hasAttribute('hidden')) {
+      e.stopPropagation();
+      closeDmOverlay();
+    }
+  }, true);
+}
+
+function setDmStatus(text: string): void {
+  const el = document.getElementById('dm-status');
+  if (el) el.textContent = text;
+}
+
+function renderDmMessages(): void {
+  const list = document.getElementById('dm-messages');
+  if (!list || !dmActiveSession) return;
+  const me = getIdentityPub();
+  const msgs: DirectMessage[] = readMessages(dmActiveSession);
+  if (!msgs.length) {
+    list.innerHTML = '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
+    return;
+  }
+  list.innerHTML = msgs.map((m) => {
+    const mine = m.author === me;
+    const time = new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `<div class="dm-msg ${mine ? 'dm-mine' : 'dm-theirs'}">${escapeHtml(m.text)}<span class="dm-msg-meta">${escapeHtml(mine ? 'you' : m.authorName)} · ${time}</span></div>`;
+  }).join('');
+  list.scrollTop = list.scrollHeight;
+}
+
+/** Open a friend's private conversation — connects the DM transport (dialing
+ *  them via their card hints) and streams the signed history. */
+function openDirectMessage(pub: string): void {
+  setupDmOverlay();
+  const contact = getContact(pub);
+  const overlay = document.getElementById('dm-overlay');
+  const nameEl = document.getElementById('dm-peer-name');
+  const fpEl = document.getElementById('dm-peer-fp');
+  if (nameEl) nameEl.textContent = contact?.name ?? 'Contact';
+  if (fpEl) fpEl.textContent = `🔑 ${contactFingerprint(pub)}`;
+  dmActivePeer = pub;
+  overlay?.removeAttribute('hidden');
+  document.getElementById('dm-messages')!.innerHTML = '<div id="dm-empty">Connecting…</div>';
+  setDmStatus('connecting');
+  (document.getElementById('dm-input') as HTMLInputElement | null)?.focus();
+
+  // Prefer the contact card's own route; fall back to the mesh peer store
+  // (§7 M1 consume) — a route another encounter/introduction supplied.
+  const hints = (contact?.hints as RoomMemberHint | undefined) ?? hintsFor(pub) ?? null;
+  openDm(pub, hints).then(
+    (session) => {
+      if (dmActivePeer !== pub) return; // user already navigated away
+      dmActiveSession = session;
+      (window as any).__ssfDM.active = session; // debug hook (matches __players etc.)
+      setDmStatus('connected');
+      gossipIntroductions(session); // §7 M2: densify the mesh over this friend link
+      renderDmMessages();
+      // Live updates: re-render on any change to the conversation array.
+      const obs = () => { if (dmActivePeer === pub) renderDmMessages(); };
+      session.messages.observe(obs);
+      dmObserver = () => session.messages.unobserve(obs);
+    },
+    (err) => {
+      if (dmActivePeer !== pub) return;
+      setDmStatus('offline');
+      const list = document.getElementById('dm-messages');
+      if (list) list.innerHTML = `<div id="dm-empty">Could not reach ${escapeHtml(contact?.name ?? 'contact')} — they may be offline. ${escapeHtml(String(err?.message ?? ''))}</div>`;
+    },
+  );
+}
+
+function closeDmOverlay(): void {
+  document.getElementById('dm-overlay')?.setAttribute('hidden', '');
+  if (dmObserver) { dmObserver(); dmObserver = null; }
+  const peer = dmActivePeer;
+  dmActivePeer = null;
+  dmActiveSession = null;
+  // Keep the transport warm briefly? No — tear it down so we don't hold a
+  // connection per contact. A re-open reconnects (fast; node stays warm).
+  if (peer) void closeDm(peer);
+}
+
+/**
+ * 🤝 §7 M2: gossip signed friend-of-friend introductions over an open DM. We
+ * publish introductions for OUR discoverable contacts (the friend learns routes
+ * to them), and ingest the ones they publish (trust + consent gated) into the
+ * mesh peer store — so the network densifies from every friend connection.
+ */
+const gossipedSessions = new WeakSet<DmSession>();
+
+function gossipIntroductions(session: DmSession): void {
+  if (gossipedSessions.has(session)) return; // once per session (re-open/double-tap guard)
+  gossipedSessions.add(session);
+  const introsArr = session.sync.doc.getArray<Introduction>('intros');
+
+  // Publish OUR discoverable contacts' introductions once — each carries the
+  // subject's OWN signed card (reconstructCard), so consent is subject-proven.
+  const mine = makeIntroductions(
+    listContacts().map(reconstructCard).filter((c): c is ContactCard => !!c),
+  );
+  if (mine.length) session.sync.doc.transact(() => { introsArr.push(mine); });
+
+  // Delta-ingest: process only entries past the cursor on each fire (no O(n^2)
+  // full re-verify), deduped by (subjectPub, introducerPub).
+  const seen = new Set<string>();
+  let cursor = 0;
+  const ingestNew = () => {
+    const all = introsArr.toArray();
+    for (; cursor < all.length; cursor++) {
+      const intro = all[cursor];
+      const key = intro && intro.card ? `${intro.card.pub}|${intro.introducerPub}` : '';
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      ingestIntroduction(intro, {
+        // Trust the introducer iff it's the friend we're DMing, or already a
+        // vetted (friend/contact) peer in our store — never an unvetted key.
+        isTrustedIntroducer: (introPub) => {
+          if (introPub === session.peerPub) return true;
+          const p = getPeer(introPub);
+          return !!p && (p.trust === 'friend' || p.trust === 'contact');
+        },
+        record: ({ pub, name, hints, introducer }) =>
+          recordPeer({ pub, name, hints, trust: 'introduced', introducer }),
+      });
+    }
+  };
+  ingestNew();
+  introsArr.observe(ingestNew);
 }
 
 // ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────
