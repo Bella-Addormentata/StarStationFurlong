@@ -1048,11 +1048,17 @@ async fn handle_wt_connection_inner(
                             };
                             let payload_bytes = serde_json::to_vec(&env_copy).unwrap();
                             let l_bytes = (payload_bytes.len() as u32).to_le_bytes();
+                            let kind_dbg = env_copy.kind.clone();
 
                             tokio::spawn(async move {
-                                if let Ok((mut send_stream, _recv_stream)) = peer_conn.open_bi().await {
-                                    let _ = send_stream.write_all(&l_bytes).await;
-                                    let _ = send_stream.write_all(&payload_bytes).await;
+                                // [DIAG send] does this node's relay open_bi to a remote peer succeed?
+                                match peer_conn.open_bi().await {
+                                    Ok((mut send_stream, _recv_stream)) => {
+                                        let _ = send_stream.write_all(&l_bytes).await;
+                                        let _ = send_stream.write_all(&payload_bytes).await;
+                                        if kind_dbg == "ysync" { eprintln!("📤 SEND relay ok: ysync -> remote peer"); }
+                                    }
+                                    Err(e) => eprintln!("📤 SEND relay FAIL open_bi -> remote peer (kind={}): {:?}", kind_dbg, e),
                                 }
                             });
                         }
@@ -1401,6 +1407,13 @@ fn handle_iroh_connection(
                             Ok(env) => env,
                             _ => break,
                         };
+
+                        // [DIAG recv] the accept_bi lane received a node-to-node stream frame.
+                        eprintln!(
+                            "📥 RECV accept_bi kind={} room={} origin={:?}",
+                            envelope.kind, envelope.room,
+                            envelope.iroh_node_id.as_deref().map(|s| &s[..s.len().min(8)]),
+                        );
 
                         if room_id_inner.is_none() {
                             room_id_inner = Some(envelope.room.clone());
