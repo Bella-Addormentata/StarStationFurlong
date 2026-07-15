@@ -1305,11 +1305,23 @@ fn handle_iroh_connection(
     // learn their room from the first ysync stream, exactly as before.
     let chosen_room: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(preset_room));
 
-    loop {
-        tokio::select! {
+    // Split the two lanes into INDEPENDENT tasks. Racing them in one
+    // tokio::select! starved the reliable ysync lane: a peer streaming 20Hz
+    // movement ticks kept read_datagram() perpetually ready, so accept_bi() was
+    // cancelled every loop iteration before it could accept a single stream — the
+    // joiner received the host's TICKS (avatar spawned) but never its ysync STATE
+    // (players map, chat, roomInfo). Separate loops let both lanes make progress.
+    {
+        let connection = connection.clone();
+        let hub = hub.clone();
+        let chosen_room = chosen_room.clone();
+        tokio::spawn(async move {
             // Unreliable Datagram lane routing incoming ticks directly to browser WebTransport
-            dg = connection.read_datagram() => {
-                let datagram = dg?;
+            loop {
+                let datagram = match connection.read_datagram().await {
+                    Ok(d) => d,
+                    Err(_) => break,
+                };
                 // 22B = 0.23.0 node→node tick [hop][8B origin lane id][13B tick];
                 // 14B = 0.18.0–0.22.0 hop-flagged tick (no sender id);
                 // 13B = legacy 0.17.0 peer tick.
@@ -1356,9 +1368,16 @@ fn handle_iroh_connection(
                     }
                 }
             }
-            // Multi-channel streams incoming from remote Iroh peers
-            stream = connection.accept_bi() => {
-                let (mut _send, mut recv) = stream?;
+        });
+    }
+
+    // ── ysync (reliable bi-stream) lane — its OWN loop so ticks can't starve it ──
+    // Multi-channel streams incoming from remote Iroh peers
+    loop {
+                let (mut _send, mut recv) = match connection.accept_bi().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
                 let hub_clone = hub.clone();
                 let mut room_id_inner = chosen_room.lock().unwrap().clone();
                 let connection_clone = connection.clone();
@@ -1382,6 +1401,14 @@ fn handle_iroh_connection(
                             Ok(env) => env,
                             _ => break,
                         };
+
+                        // [DIAG host->joiner] does the dialed connection RECEIVE the host's ysync stream?
+                        eprintln!(
+                            "📥 iroh-recv kind={} env.room={} origin={:?} chosen={:?}",
+                            envelope.kind, envelope.room,
+                            envelope.iroh_node_id.as_deref().map(|s| &s[..s.len().min(8)]),
+                            room_id_inner.as_deref(),
+                        );
 
                         if room_id_inner.is_none() {
                             room_id_inner = Some(envelope.room.clone());
@@ -1485,6 +1512,10 @@ fn handle_iroh_connection(
                             let rooms = hub_clone.rooms.lock().unwrap();
                             rooms.get(room_id).map(|r| r.local_connections.values().cloned().collect()).unwrap_or_default()
                         };
+                        // [DIAG host->joiner] how many local browser tabs does the ysync forward target?
+                        if envelope.kind == "ysync" {
+                            eprintln!("📤 iroh->local room={} local_tabs={}", room_id, clients.len());
+                        }
 
                         for wt_conn in clients {
                             let payload_bytes = serde_json::to_vec(&envelope).unwrap();
@@ -1544,9 +1575,8 @@ fn handle_iroh_connection(
                         }
                     }
                 });
-            }
-        }
     }
+    Ok(())
     })
 }
 
