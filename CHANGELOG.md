@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.26.0-core-loop-demo](prototypes/0.26.0-core-loop-demo/) and is built by the
+[prototypes/0.27.0-core-loop-demo](prototypes/0.27.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,7 +9,23 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- In progress for Phase 2 Star Swarm features. Next queued slices (all planned in `brainstorming/`): the staged room-LIST UX (pre-load/connect a pass's room before entering, with a vestibule-style loading indicator — issue #60's larger ask, deferred from this release), E4 furniture PERSISTENCE (survive a node restart), S3 presence (lane-id → player mapping unlocks name tags + remote outfits, and a motionless remote avatar), TR-sync trunk inventories, M3 desk computer, E5 rugs, and the station-doc slice carrying the flight-control authority tree.
+- In progress for Phase 2 Star Swarm features. The node-side mesh chain is next (designed in `brainstorming/keyed-identity-contacts-plan.md` + `m5-traffic-mesh-plan.md`): the node verify-before-apply seam (Slice 2), M3 trust-weighted dial policy, M4 reachability introduction/relay (the two-machine NAT-traversal payoff that reduces per-peer port-forwarding reliance), and M5 the hole-punched P2P traffic gossip mesh. Also queued: E4 furniture PERSISTENCE (survive a node restart), S3 presence (name tags + remote outfits), TR-sync trunk inventories, and the station-doc flight-control authority tree.
+
+## v0.27.0 — 2026-07-14
+
+### Keyed Identity & the Social Mesh — Contacts, DMs, and a Trust-Weighted Peer Substrate
+
+This line makes identity real and builds the sovereign social layer on top of it: every install now holds a cryptographic keypair, and Contacts, friends, direct messages, and the contacts-as-mesh substrate are all built on it — authenticated by client-side signatures, with no servers, directory, or third-party infrastructure.
+
+- **Real cryptographic identity (keyed-identity Slice 1).** Every install mints a 32-byte Ed25519 seed (`@noble`, fully in-browser, zero network) persisted beside the legacy UUID — the public key is your durable identity. The seed is exportable as a recovery credential (sovereign: no reset service), the phone shows your key fingerprint, and the room `players` map carries a self-signed name↔key cert so a display name is cryptographically tied to a key. Fully additive — no wire change, legacy entries coexist, and the keyed entry is re-asserted after sync so it wins over a stale pre-keyed entry.
+- **The Contacts app is real** (was a NO SIGNAL placeholder). Self-signed **contact cards** carry identity + reachability + a self-signed `discoverable` consent flag, cryptographically verified on import (a tampered card is rejected). Two tiers: CONTACTS (everyone you've verified) and FRIENDS (the curated subset, the DM boundary + mesh trust anchors). Share your card, import one back, toggle friends, and back up / restore your identity from the recovery key.
+- **Direct messages between friends.** A DM is a private two-person room derived deterministically from the pair of keys — both sides compute the same room from the sorted pubkeys, nothing exchanged — dialed via the friend's card reachability over the proven room/prefetch transport. Every message is signed (author + name bound) and verified by the recipient: a relay can inject bytes into the shared doc but cannot forge into the conversation (verified — injected wrong-author and bad-signature messages are dropped before rendering). Honest scope: **authenticated, not encrypted** (the node relays plaintext, same as every room today; the room key is an addressing tag derived from public keys, not a secret).
+- **Contacts as a self-strengthening mesh (§7 M1 + M2).** Every verified identity you meet — friends, contacts, and room co-members with a valid self-cert — folds into a durable, bounded, trust-weighted peer store: the sovereign alternative to relay servers, so the network densifies from who you know with no central index. Trust tiers (friend > contact > introduced > room > unvetted) rank dialing and decide cap survival, so a flood of free-minted keys can't crowd real contacts out (verified — 700 sybils cap to 500 without evicting the vetted friend). Signed, consent-gated friend-of-friend **introductions** gossip reachable peers over a friend's DM: consent is proven by the subject's *own* signature (a trusted-but-malicious introducer can't introduce a non-consenting subject), and an untrusted introducer's vouch is dropped.
+- **Staged room-list UX (issue #60 P2, ported).** The ACCESS app keeps a persisted list of rooms you hold a pass to; adding a pass background-loads the room and you enter once it reads READY, instead of being dropped in mid-connect.
+- **Public / unlocked doors.** A room owner can set the room access mode to 🌐 PUBLIC (anyone enters), 🔗 PASS (link-gated, the default), or 🔑 KEYED; the door status LEDs retint to the mode and it syncs live to everyone in the room.
+- **Security hardening** across the keyed-identity + mesh layer, from an adversarial review before the node-side work: subject-proven introduction consent, signed DM author names, bounded + deduped introduction gossip, memoized cert verification, and honest DM confidentiality copy.
+- **Scope honesty:** this is the browser-side social layer, authenticated by client-side signatures. The node-enforced verify-before-apply seam and the node-side reachability + traffic mesh (M4/M5, designed in `brainstorming/`) are future work — cross-internet DM/mesh reach depends on the same reachability as rooms today.
+- **Release line:** `prototypes/0.27.0-core-loop-demo/` is the shipping copy; `0.26.0-core-loop-demo/` stays frozen at its release snapshot.
 
 ## v0.26.0 — 2026-07-14
 
