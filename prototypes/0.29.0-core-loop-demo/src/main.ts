@@ -580,6 +580,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
         } else if (status.status === 'connected') {
           setNetworkRow('network-bridge-status', `LINKED ↔ ${shortTarget}`, '#00e676');
           logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
+          // The peer JUST linked — but our opening SyncStep1 fired before the
+          // dial finished and was relayed to an empty neighbor set, so the host
+          // never sent its (static) room state. Re-issue SyncStep1 now that the
+          // host is a live neighbor to pull the roster / room name / furniture.
+          yjsSync?.resync();
         } else if (status.status === 'failed') {
           setNetworkRow('network-bridge-status', `FAILED → ${shortTarget} (see node log)`, '#ff1744');
           logToPhoneSystem(`⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? 'unknown error'}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`);
@@ -2541,7 +2546,10 @@ function passStatusLabel(state: PassState): string {
     case 'loading': return '<span class="access-room-spinner"></span>LOADING…';
     case 'ready': return 'READY';
     case 'current': return 'YOU ARE HERE';
-    case 'offline': return 'NODE OFFLINE';
+    // "UNREACHABLE", not "NODE OFFLINE": when a warm times out it's almost always
+    // the HOST that couldn't be reached (offline / behind NAT), NOT the local
+    // node — the old label made people think their own node was broken.
+    case 'offline': return 'UNREACHABLE';
   }
 }
 
