@@ -1089,12 +1089,27 @@
       .access-mode-btn[aria-checked="true"][data-access-mode="keyed"]  { border-color: rgba(255,23,68,0.6);  background: rgba(255,23,68,0.14);  color: #e0e2ee; }
       .access-mode-btn.is-disabled { opacity: 0.4; cursor: default; }
 
-      /* MY ROOMS list (issue #60 staged room-list) */
+      /* ROOMS list (issue #60 staged room-list) — grouped by owner into
+         My Rooms / Friends' Rooms / Visited / Unreached sub-sections. */
       #access-rooms-list {
         display: flex;
         flex-direction: column;
         gap: 6px;
       }
+      .access-rooms-subhead {
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: rgba(224, 226, 238, 0.5);
+        padding: 6px 2px 1px;
+        border-bottom: 1px solid rgba(212, 168, 75, 0.1);
+      }
+      .access-rooms-subhead:first-child { padding-top: 0; }
+      .access-rooms-subhead.is-mine { color: #d4a84b; }
+      .access-rooms-subhead.is-friend { color: #90caf9; }
+      .access-rooms-subhead.is-visited { color: rgba(224, 226, 238, 0.5); }
+      .access-rooms-subhead.is-unreached { color: rgba(224, 226, 238, 0.32); }
       #access-rooms-empty {
         font-size: 9px;
         color: rgba(224, 226, 238, 0.35);

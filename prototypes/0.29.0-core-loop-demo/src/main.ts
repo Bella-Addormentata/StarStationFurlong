@@ -26,7 +26,7 @@ import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
-  setActivePassRoom, removePass, type PassState,
+  setActivePassRoom, removePass, passRoomInfo, type PassState,
 } from './roomPasses';
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
@@ -672,6 +672,10 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     }
     // #52: the ACCESS app's MY PASS room row mirrors the same doc state.
     refreshAccessRoomRow();
+    // Recategorise the room list: owner (roomInfo) and the owner's pubkey (its
+    // players entry) can sync in after entry, moving the current room into its
+    // correct section (My Rooms / Friends' / Visited) instead of Unreached.
+    renderPassesList();
   };
 
   roomMap.observe((_event) => {
@@ -1480,6 +1484,9 @@ function setupSpacePhoneOverlay() {
 
   renderPassesList();
   subscribePasses(renderPassesList);
+  // Re-categorise rooms when the friends list changes (a room's owner moving
+  // in/out of Friends flips it between the FRIENDS' ROOMS and VISITED sections).
+  subscribeContacts(renderPassesList);
 
   // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
   // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
@@ -2462,62 +2469,153 @@ function passStatusLabel(state: PassState): string {
   }
 }
 
-function renderPassesList(): void {
-  const container = document.getElementById('access-rooms-list');
-  if (!container) return;
-  const items = listPasses();
-  if (items.length === 0) {
-    container.innerHTML = '<div id="access-rooms-empty">No rooms yet — add a pass above.</div>';
-    return;
+// ── Room categorisation: My Rooms / Friends' Rooms / Visited / Unreached ──────
+type RoomCategory = 'mine' | 'friend' | 'visited' | 'unreached';
+
+/** Owner of a room by roomId. The room you're CURRENTLY in reads from the live
+ *  session doc; any other (saved-pass) room reads from its background prefetch
+ *  doc (empty until it has synced). */
+function roomOwnerInfo(roomId: string): { ownerId?: string; ownerPub?: string } {
+  const currentRoomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+  if (roomId === currentRoomId && yjsSync) {
+    const doc = yjsSync.doc;
+    const ownerId = doc.getMap('roomInfo').get('owner');
+    if (typeof ownerId !== 'string' || !ownerId) return {};
+    const entry = doc.getMap('players').get(ownerId) as { keyB64?: string } | undefined;
+    return { ownerId, ownerPub: typeof entry?.keyB64 === 'string' ? entry.keyB64 : undefined };
   }
-  container.textContent = '';
-  for (const pass of items) {
-    const state = passState(pass.roomId);
-    const row = document.createElement('div');
-    row.className = `access-room-item is-${state}`;
-    row.setAttribute('role', 'listitem');
+  return passRoomInfo(roomId);
+}
 
-    const info = document.createElement('div');
-    info.className = 'access-room-info';
-    const title = document.createElement('div');
-    title.className = 'access-room-title';
-    title.textContent = pass.name || pass.roomId;
-    title.title = pass.roomId;
-    const status = document.createElement('div');
-    status.className = 'access-room-status';
-    status.innerHTML = passStatusLabel(state);
-    info.append(title, status);
+/** Which list a room belongs in. Owner unknown (not synced) ⇒ 'unreached' so we
+ *  never mis-file a room we haven't actually reached. `friendPubs` is passed in
+ *  (computed once per render) rather than re-derived per room. */
+function categorizeRoom(roomId: string, friendPubs: Set<string>): RoomCategory {
+  const { ownerId, ownerPub } = roomOwnerInfo(roomId);
+  if (!ownerId) return 'unreached';
+  // 'Local-Clone' is the legacy self-owned marker (pre-keyed-identity rooms).
+  if (ownerId === getPlayerId() || ownerId === 'Local-Clone' || (ownerPub && ownerPub === getIdentityPub())) {
+    return 'mine';
+  }
+  if (ownerPub && friendPubs.has(ownerPub)) return 'friend';
+  return 'visited';
+}
 
-    const actions = document.createElement('div');
-    actions.className = 'access-room-actions';
-    if (state !== 'current') {
-      const enter = document.createElement('button');
-      enter.className = 'access-room-btn' + (state === 'ready' ? '' : ' is-disabled');
-      enter.textContent = 'ENTER';
-      enter.setAttribute('aria-label', `Enter ${pass.name}`);
-      if (state === 'ready') {
-        enter.addEventListener('click', () => void enterRoomFromPass(pass.seed));
-      }
-      actions.append(enter);
-      // DEV escape hatch: jump immediately, before the room finishes loading.
-      const jump = document.createElement('button');
-      jump.className = 'access-room-btn access-room-dev';
-      jump.textContent = 'JUMP';
-      jump.title = 'DEV: jump immediately (before READY)';
-      jump.setAttribute('aria-label', `DEV jump to ${pass.name} now`);
-      jump.addEventListener('click', () => void enterRoomFromPass(pass.seed));
-      actions.append(jump);
+interface RoomEntry {
+  roomId: string;
+  name: string;
+  seed: string;
+  state: PassState;
+  /** Saved passes can be removed; the synthesised current-room row cannot. */
+  removable: boolean;
+}
+
+function currentRoomDisplayName(): string {
+  const name = yjsSync?.doc.getMap('roomInfo').get('name');
+  return (typeof name === 'string' && name) ? name : 'Your room';
+}
+
+function buildRoomRow(e: RoomEntry): HTMLElement {
+  const row = document.createElement('div');
+  row.className = `access-room-item is-${e.state}`;
+  row.setAttribute('role', 'listitem');
+
+  const info = document.createElement('div');
+  info.className = 'access-room-info';
+  const title = document.createElement('div');
+  title.className = 'access-room-title';
+  title.textContent = e.name || e.roomId;
+  title.title = e.roomId;
+  const status = document.createElement('div');
+  status.className = 'access-room-status';
+  status.innerHTML = passStatusLabel(e.state);
+  info.append(title, status);
+
+  const actions = document.createElement('div');
+  actions.className = 'access-room-actions';
+  if (e.state !== 'current') {
+    const enter = document.createElement('button');
+    enter.className = 'access-room-btn' + (e.state === 'ready' ? '' : ' is-disabled');
+    enter.textContent = 'ENTER';
+    enter.setAttribute('aria-label', `Enter ${e.name}`);
+    if (e.state === 'ready') {
+      enter.addEventListener('click', () => void enterRoomFromPass(e.seed));
     }
+    actions.append(enter);
+    // DEV escape hatch: jump immediately, before the room finishes loading.
+    const jump = document.createElement('button');
+    jump.className = 'access-room-btn access-room-dev';
+    jump.textContent = 'JUMP';
+    jump.title = 'DEV: jump immediately (before READY)';
+    jump.setAttribute('aria-label', `DEV jump to ${e.name} now`);
+    jump.addEventListener('click', () => void enterRoomFromPass(e.seed));
+    actions.append(jump);
+  }
 
+  row.append(info, actions);
+  if (e.removable) {
     const remove = document.createElement('button');
     remove.className = 'access-room-remove';
     remove.textContent = '✕';
     remove.title = 'Remove this pass';
-    remove.setAttribute('aria-label', `Remove pass for ${pass.name}`);
-    remove.addEventListener('click', () => removePass(pass.roomId));
+    remove.setAttribute('aria-label', `Remove pass for ${e.name}`);
+    remove.addEventListener('click', () => removePass(e.roomId));
+    row.append(remove);
+  }
+  return row;
+}
 
-    row.append(info, actions, remove);
-    container.append(row);
+function renderPassesList(): void {
+  const container = document.getElementById('access-rooms-list');
+  if (!container) return;
+
+  const passes = listPasses();
+  const entries: RoomEntry[] = passes.map((p) => ({
+    roomId: p.roomId,
+    name: p.name || p.roomId,
+    seed: p.seed,
+    state: passState(p.roomId),
+    removable: true,
+  }));
+  // Always surface the room you're currently in, in its owner's section (your
+  // home room → My Rooms; a friend's room you're visiting → Friends'), unless
+  // it's already a saved pass (passState marks that one 'current' already).
+  const currentRoomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+  if (currentRoomId && !passes.some((p) => p.roomId === currentRoomId)) {
+    entries.push({
+      roomId: currentRoomId,
+      name: currentRoomDisplayName(),
+      seed: '',
+      state: 'current',
+      removable: false,
+    });
+  }
+
+  if (entries.length === 0) {
+    container.innerHTML = '<div id="access-rooms-empty">No rooms yet — add a pass above.</div>';
+    return;
+  }
+
+  const friendPubs = new Set(listFriends().map((f) => f.pub));
+  const buckets: Record<RoomCategory, RoomEntry[]> = { mine: [], friend: [], visited: [], unreached: [] };
+  for (const e of entries) buckets[categorizeRoom(e.roomId, friendPubs)].push(e);
+
+  const sections: Array<[RoomCategory, string]> = [
+    ['mine', 'MY ROOMS'],
+    ['friend', "FRIENDS' ROOMS"],
+    ['visited', 'VISITED'],
+    ['unreached', 'UNREACHED'],
+  ];
+
+  container.textContent = '';
+  for (const [cat, label] of sections) {
+    const list = buckets[cat];
+    if (list.length === 0) continue;
+    const head = document.createElement('div');
+    head.className = `access-rooms-subhead is-${cat}`;
+    head.textContent = `${label} · ${list.length}`;
+    container.append(head);
+    for (const e of list) container.append(buildRoomRow(e));
   }
 }
 
@@ -2529,9 +2627,15 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
   try {
     const parsed = JSON.parse(atob(seed));
 
+    // A pass MUST name its own room. The old fallback to getDefaultRoomId() —
+    // OUR OWN room — meant a pass that lost its roomId was silently "added" as
+    // our current room (ADD PASS appeared to refresh your own room instead of
+    // adding the pasted one, and startPrefetch no-oped because it was active).
+    // Reject instead, so a malformed pass surfaces as "Invalid pass".
     const roomId = typeof parsed.roomId === 'string' && parsed.roomId.length > 0
       ? parsed.roomId
-      : getDefaultRoomId();
+      : null;
+    if (!roomId) return null;
 
     const rawWtUrl = typeof parsed.wtUrl === 'string' ? parsed.wtUrl : '';
     const certHashesB64 = normalizeStringArray(parsed.certHashesB64);

@@ -194,6 +194,23 @@ export function passSeed(roomId: string): string | null {
   return passes.find((p) => p.roomId === roomId)?.seed ?? null;
 }
 
+/**
+ * The owner of a warmed pass's room, read from its background prefetch doc —
+ * returns `{}` until the room's `roomInfo` has actually synced (owner unknown =
+ * not-yet-reached). `ownerPub` is resolved from the players-map name↔key cert
+ * (PlayerEntry.keyB64) so the caller can match it against the friends list,
+ * which is keyed by pubkey. Owner categorisation for the room you're CURRENTLY
+ * in is the caller's job (its doc is the active session, not a prefetch here).
+ */
+export function passRoomInfo(roomId: string): { ownerId?: string; ownerPub?: string } {
+  const doc = prefetches.get(roomId)?.sync?.doc;
+  if (!doc) return {};
+  const ownerId = doc.getMap('roomInfo').get('owner');
+  if (typeof ownerId !== 'string' || !ownerId) return {};
+  const entry = doc.getMap('players').get(ownerId) as { keyB64?: string } | undefined;
+  return { ownerId, ownerPub: typeof entry?.keyB64 === 'string' ? entry.keyB64 : undefined };
+}
+
 // ── Prefetch lifecycle ───────────────────────────────────────────────────────
 
 function setState(roomId: string, state: PassState): void {

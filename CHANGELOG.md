@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.2 — 2026-07-15
+
+### Room List, by Owner — My Rooms / Friends' Rooms / Visited, + an ADD-PASS Fix
+
+- **The ACCESS room list is now grouped by owner.** The single flat list becomes four sub-sections: **MY ROOMS** (rooms you own — `roomInfo.owner` is you), **FRIENDS' ROOMS** (owner is on your Friends list — resolved owner-id→pubkey via the players-map name↔key cert, then matched against friends, which are keyed by pubkey), **VISITED** (a pass to someone else's room), and **UNREACHED** (a room whose owner hasn't synced yet — so we never mis-file a room we haven't actually reached). The room you're currently in always appears in its owner's section ("YOU ARE HERE"), and a newly-added pass shows up immediately under UNREACHED (loading) and moves to its real section as it warms. Re-categorises live as rooms sync and as you add/remove friends.
+- **ADD PASS no longer "refreshes your own room".** A pass that lost its room id used to fall back to `getDefaultRoomId()` — *your own room* — so ADD PASS silently added your current room (which then no-oped its prefetch) instead of the pasted one. Decode now rejects a room-id-less pass as invalid rather than substituting yours, and the grouped list makes a real add visibly land under UNREACHED so it can never look like "nothing happened."
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.2 in place). Frontend-only — the v0.29.0 node binary is unchanged.
+
 ## v0.29.1 — 2026-07-15
 
 ### SpacePhone Scroll Fix
