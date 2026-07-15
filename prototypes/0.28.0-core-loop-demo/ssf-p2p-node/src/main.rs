@@ -1048,21 +1048,17 @@ async fn handle_wt_connection_inner(
                             };
                             let payload_bytes = serde_json::to_vec(&env_copy).unwrap();
                             let l_bytes = (payload_bytes.len() as u32).to_le_bytes();
-                            let kind_dbg = env_copy.kind.clone();
 
                             tokio::spawn(async move {
-                                match peer_conn.open_bi().await {
-                                    Ok((mut send_stream, _recv_stream)) => {
-                                        let _ = send_stream.write_all(&l_bytes).await;
-                                        let _ = send_stream.write_all(&payload_bytes).await;
-                                        // finish() = graceful FIN. Without it, dropping the send
-                                        // stream RESETs it and the peer's read can get the reset
-                                        // before the frame — silently dropping ysync state (the
-                                        // host->joiner furniture/state-sync bug). quinn retains the
-                                        // finished stream's data and delivers it after the drop.
-                                        let _ = send_stream.finish();
-                                    }
-                                    Err(e) => eprintln!("📤 SEND relay FAIL open_bi -> remote peer (kind={}): {:?}", kind_dbg, e),
+                                if let Ok((mut send_stream, _recv_stream)) = peer_conn.open_bi().await {
+                                    let _ = send_stream.write_all(&l_bytes).await;
+                                    let _ = send_stream.write_all(&payload_bytes).await;
+                                    // finish() = graceful FIN. Without it, dropping the send stream
+                                    // RESETs it and the peer's read can get the reset before the
+                                    // frame — silently dropping relayed ysync state (the cross-
+                                    // internet host->joiner furniture/roster sync bug). quinn
+                                    // retains + delivers the finished stream's data after the drop.
+                                    let _ = send_stream.finish();
                                 }
                             });
                         }
@@ -1411,13 +1407,6 @@ fn handle_iroh_connection(
                             Ok(env) => env,
                             _ => break,
                         };
-
-                        // [DIAG recv] the accept_bi lane received a node-to-node stream frame.
-                        eprintln!(
-                            "📥 RECV accept_bi kind={} room={} origin={:?}",
-                            envelope.kind, envelope.room,
-                            envelope.iroh_node_id.as_deref().map(|s| &s[..s.len().min(8)]),
-                        );
 
                         if room_id_inner.is_none() {
                             room_id_inner = Some(envelope.room.clone());
