@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to StarStation Furlong releases. The packaged application lives in
-[prototypes/0.27.0-core-loop-demo](prototypes/0.27.0-core-loop-demo/) and is built by the
+[prototypes/0.28.0-core-loop-demo](prototypes/0.28.0-core-loop-demo/) and is built by the
 [release workflow](.github/workflows/release.yml) when a `vX.Y.0` tag is pushed.
 Prototype folders are named `<release-version>-<demo-name>`; superseded demos stay
 frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved at
@@ -9,7 +9,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
-- In progress for Phase 2 Star Swarm features. The node-side mesh chain is next (designed in `brainstorming/keyed-identity-contacts-plan.md` + `m5-traffic-mesh-plan.md`): the node verify-before-apply seam (Slice 2), M3 trust-weighted dial policy, M4 reachability introduction/relay (the two-machine NAT-traversal payoff that reduces per-peer port-forwarding reliance), and M5 the hole-punched P2P traffic gossip mesh. Also queued: E4 furniture PERSISTENCE (survive a node restart), S3 presence (name tags + remote outfits), TR-sync trunk inventories, and the station-doc flight-control authority tree.
+- Next on the node-side mesh chain (designed in `brainstorming/keyed-identity-contacts-plan.md` + `m5-traffic-mesh-plan.md`): M3 trust-weighted dial policy, M4 reachability introduction/relay, and M5 the hole-punched P2P traffic gossip mesh — plus the final two-machine confirmation of the host→joiner ysync fix (both peers on the 0.28.0 node), a self-dial guard (the browser stamps its own node id as a peer hint, so the node briefly dials itself), E4 furniture PERSISTENCE, S3 presence (name tags + remote outfits), and the station-doc flight-control authority tree.
+
+## v0.28.0 — 2026-07-15
+
+### The Signed Wire — Verify-Before-Apply, Sovereign Room IDs, and a Cross-Internet Sync Fix
+
+The node-side half of the keyed-identity work: the sovereign node now verifies the signatures it relays, plus two connectivity fixes surfaced by a real two-machine (cross-internet) test.
+
+- **Keyed-identity Slice 2 — the real sign/verify-before-apply seam (browser + node).** Outgoing ysync envelopes are signed over canonical bytes that bind `v‖roomId‖kind‖seq‖payload` (`blake3`, domain-tagged) — closing the old payload-only gap so a signature can't be replayed into a different room or as a different message kind. The browser verifies before `Y.applyUpdate` (a signed-but-tampered envelope is dropped; unsigned legacy still applies), and the node verifies in **both** reader loops, gated by **`SSF_REQUIRE_SIG = off | warn | reject`** shipping at **`warn`** (observe-then-enforce — logs mismatches, drops nothing; the owner flips to `reject` once the metric is clean). Verified on real cross-machine traffic: signed state synced between two internet-separated nodes with **zero invalid-sig on both** — and cross-room replay resistance, tamper rejection, and wrong-author rejection all hold.
+- **Per-install random default room id (dev-stage collision fix).** Every install used to boot into the literal room id `furlong-lobby`, so a pass for one install's lobby collided with the other's — the joiner saw "YOU ARE HERE" and its node short-circuited the dial to itself. The default room is now a random, persisted `home-<hex>` per install (display name still "Lobby"), so a home-room pass bridges two installs directly. Confirmed cross-internet: the joiner's node now dials the *host's* node and the QUIC link secures on the first attempt.
+- **Node datagram/ysync lane split (long-standing cross-internet sync fix).** `handle_iroh_connection` raced the unreliable tick lane (`read_datagram`, 20 Hz movement) and the reliable ysync lane (`accept_bi`) in a single `tokio::select!`. A peer streaming ticks kept the datagram branch perpetually ready, so `accept_bi` was cancelled every iteration before it could accept a single stream — a joiner received the host's **ticks** (avatar) but never its **state** (players map, chat, room name). Instrumented proof across two machines: zero stream receives despite a secured link and flowing ticks. The two lanes now run as independent tasks so neither starves the other (the ysync sibling of the tick fix in #60). **Note:** both peers must run this node build — a peer on the old node can still starve its own `accept_bi`; final bidirectional confirmation is pending both machines on 0.28.0.
+- **Release line:** `prototypes/0.28.0-core-loop-demo/` is the shipping copy; `0.27.0-core-loop-demo/` stays frozen at its release snapshot.
 
 ## v0.27.0 — 2026-07-14
 
