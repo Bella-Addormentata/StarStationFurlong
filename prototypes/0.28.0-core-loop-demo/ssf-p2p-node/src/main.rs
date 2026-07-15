@@ -1051,12 +1051,16 @@ async fn handle_wt_connection_inner(
                             let kind_dbg = env_copy.kind.clone();
 
                             tokio::spawn(async move {
-                                // [DIAG send] does this node's relay open_bi to a remote peer succeed?
                                 match peer_conn.open_bi().await {
                                     Ok((mut send_stream, _recv_stream)) => {
                                         let _ = send_stream.write_all(&l_bytes).await;
                                         let _ = send_stream.write_all(&payload_bytes).await;
-                                        if kind_dbg == "ysync" { eprintln!("📤 SEND relay ok: ysync -> remote peer"); }
+                                        // finish() = graceful FIN. Without it, dropping the send
+                                        // stream RESETs it and the peer's read can get the reset
+                                        // before the frame — silently dropping ysync state (the
+                                        // host->joiner furniture/state-sync bug). quinn retains the
+                                        // finished stream's data and delivers it after the drop.
+                                        let _ = send_stream.finish();
                                     }
                                     Err(e) => eprintln!("📤 SEND relay FAIL open_bi -> remote peer (kind={}): {:?}", kind_dbg, e),
                                 }
@@ -1559,6 +1563,7 @@ fn handle_iroh_connection(
                                 if let Ok((mut send_stream, _recv_stream)) = peer_conn.open_bi().await {
                                     let _ = send_stream.write_all(&l_bytes).await;
                                     let _ = send_stream.write_all(&payload_bytes).await;
+                                    let _ = send_stream.finish();       // graceful FIN, not RESET (host->joiner fix)
                                 }
                             });
                         }
