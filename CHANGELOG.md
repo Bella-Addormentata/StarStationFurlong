@@ -11,6 +11,13 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.1 — 2026-07-15
+
+### SpacePhone Scroll Fix
+
+- **The SpacePhone's tall apps scroll now.** `#phone-screen` (the `flex: 1` child of the fixed-height phone frame) was missing `min-height: 0`, so a tall app view — **ACCESS with its MY ROOMS list**, or CONTACTS with its many sections — grew *past* the 500px frame instead of letting its inner `overflow-y: auto` engage; the container's `overflow: hidden` then clipped everything below the fold, leaving **MY ROOMS unreachable**. Adding `min-height: 0` (+ `overflow: hidden`) to `#phone-screen` completes the flex-shrink chain so the active app view becomes the scroll region, and CONTACTS gets the same `overflow-y: auto` + padding as ACCESS. Verified in-browser: the ACCESS view now bounds to the frame and scrolls (was clipped, no scroll). Frontend-only — the v0.29.0 node binary is unchanged.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.1 in place — a patch on the same line).
+
 ## v0.29.0 — 2026-07-15
 
 ### The Traffic Mesh — Multi-Hop Movement, Live Membership, and a Bounded, Trust-Ordered Overlay
