@@ -285,14 +285,25 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
   setState(pass.roomId, 'loading');
 
   const roomMap = sync.doc.getMap('roomInfo');
-  const ready = () => typeof roomMap.get('name') === 'string' && roomMap.has('owner');
-  const finishReady = () => {
+  // Keep the pass's display NAME in sync with the room's LIVE roomInfo.name. A
+  // host RENAME must propagate to the joiner's list — the old code captured the
+  // name ONCE at READY and froze it, so a rename left every joiner showing the
+  // stale name forever. The observer fires on the initial sync AND every later
+  // rename, persists, and re-renders via notify(); it's torn down with the doc
+  // when the prefetch stops (sync.stop()), so it can't leak.
+  const syncPassName = () => {
     if (!alive()) return;
     const name = roomMap.get('name');
     if (typeof name === 'string' && name) {
       const p = passes.find((x) => x.roomId === pass.roomId);
-      if (p && p.name !== name) { p.name = name; persist(); }
+      if (p && p.name !== name) { p.name = name; persist(); notify(); }
     }
+  };
+  roomMap.observe(syncPassName);
+  const ready = () => typeof roomMap.get('name') === 'string' && roomMap.has('owner');
+  const finishReady = () => {
+    if (!alive()) return;
+    syncPassName();
     setState(pass.roomId, 'ready');
   };
   // "Downloaded" = the host's roomInfo (name+owner) has arrived via the mesh —

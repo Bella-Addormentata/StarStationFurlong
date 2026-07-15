@@ -11,6 +11,13 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.5 — 2026-07-15
+
+### Room Renames Now Propagate to the Pass List
+
+- **A renamed room no longer shows its old name on a joiner's list.** The pass list captured `roomInfo.name` exactly **once**, when a pass first warmed to READY, and then froze it — so if the host renamed the room afterward, every joiner kept showing the stale name forever (and a pass added before the sync completed could keep the raw roomId). The room-warm now **observes** `roomInfo` and keeps the pass's display name synced to the room's live name on the initial sync *and* every later rename (persisting + re-rendering the list), and the row for the room you're currently in reads the name straight from the live session doc so a local rename shows instantly. Verified: renaming the current room updates the list immediately; the cross-machine propagation rides the same `roomInfo` observer.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.5 in place). Frontend-only — the v0.29.0 node binary is unchanged.
+
 ## v0.29.4 — 2026-07-15
 
 ### NODE OFFLINE on Launch — Wait for the Node, Retry with a Fresh Cert

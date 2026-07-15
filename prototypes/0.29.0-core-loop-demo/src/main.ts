@@ -2591,6 +2591,18 @@ function currentRoomDisplayName(): string {
   return (typeof name === 'string' && name) ? name : 'Your room';
 }
 
+/** A room's LIVE display name: for the room you're currently IN, read the active
+ *  session doc so a local rename shows instantly; otherwise use the pass's stored
+ *  name (kept current by roomPasses' roomInfo observer) or the roomId. */
+function liveRoomName(roomId: string, fallback: string): string {
+  const currentRoomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+  if (roomId === currentRoomId && yjsSync) {
+    const n = yjsSync.doc.getMap('roomInfo').get('name');
+    if (typeof n === 'string' && n) return n;
+  }
+  return fallback;
+}
+
 function buildRoomRow(e: RoomEntry): HTMLElement {
   const row = document.createElement('div');
   row.className = `access-room-item is-${e.state}`;
@@ -2648,7 +2660,7 @@ function renderPassesList(): void {
   const passes = listPasses();
   const entries: RoomEntry[] = passes.map((p) => ({
     roomId: p.roomId,
-    name: p.name || p.roomId,
+    name: liveRoomName(p.roomId, p.name || p.roomId),
     seed: p.seed,
     state: passState(p.roomId),
     removable: true,
