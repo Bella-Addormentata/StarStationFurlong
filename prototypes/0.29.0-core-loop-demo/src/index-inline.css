@@ -530,6 +530,15 @@
         flex-direction: column;
         background: rgba(4, 6, 15, 0.96);
         position: relative;
+        /* min-height:0 is the missing link in the flex-shrink chain: without it
+           this flex:1 child keeps its default min-height:auto (= content size),
+           so a tall app view (ACCESS / CONTACTS with many sections) grows past
+           the fixed 500px phone frame and gets clipped by the container's
+           overflow:hidden — the inner overflow-y:auto never engages, so MY ROOMS
+           below the fold was unreachable. With min-height:0 the screen stays
+           bounded and the active app view scrolls. */
+        min-height: 0;
+        overflow: hidden;
       }
 
       #phone-status-bar {
@@ -824,8 +833,11 @@
         letter-spacing: 0.5px;
       }
 
-      /* 🚪 ACCESS app (#52) — room passes: MY PASS (mint) + ENTER WITH PASS */
-      #phone-app-access.active {
+      /* 🚪 ACCESS app (#52) — room passes: MY PASS (mint) + ENTER WITH PASS.
+         CONTACTS shares the layout — both are tall, multi-section scrolling apps
+         (overflow-y:auto engages now that #phone-screen is bounded above). */
+      #phone-app-access.active,
+      #phone-app-contacts.active {
         padding: 14px;
         gap: 12px;
         overflow-y: auto;
