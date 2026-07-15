@@ -26,7 +26,7 @@ import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
-  setActivePassRoom, removePass, passRoomInfo, type PassState,
+  setActivePassRoom, removePass, passRoomInfo, passSeed, type PassState,
 } from './roomPasses';
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
@@ -1478,7 +1478,15 @@ function setupSpacePhoneOverlay() {
         return;
       }
       accessInput.value = '';
-      setAccessFeedback(`Added ${result.roomId} — loading in the background…`);
+      // Streamlined "join now": pasting a pass IS a request to enter that room,
+      // so arm an auto-enter — we still wait for it to warm to READY (the
+      // sync-before-enter gate, #60) before swapping, so you never land in a
+      // half-loaded room, but you no longer have to notice + click ENTER.
+      autoEnterRoomId = result.roomId;
+      setAccessFeedback(
+        `🛰️ Connecting to that room — you'll be taken in automatically once it's ready. ` +
+        `A first cross-internet connect can take up to ~30s.`,
+      );
     });
   }
 
@@ -1487,6 +1495,31 @@ function setupSpacePhoneOverlay() {
   // Re-categorise rooms when the friends list changes (a room's owner moving
   // in/out of Friends flips it between the FRIENDS' ROOMS and VISITED sections).
   subscribeContacts(renderPassesList);
+
+  // Auto-enter driver: when the just-added pass finishes warming, take the user
+  // in (and close the phone so the room is right there). OFFLINE surfaces a
+  // clear, non-destructive message — the pass stays saved for a manual retry.
+  subscribePasses(() => {
+    if (!autoEnterRoomId) return;
+    const rid = autoEnterRoomId;
+    const state = passState(rid);
+    if (state === 'ready') {
+      autoEnterRoomId = null;
+      const seed = passSeed(rid);
+      if (seed) {
+        container?.classList.remove('active');
+        void enterRoomFromPass(seed);
+      }
+    } else if (state === 'offline') {
+      autoEnterRoomId = null;
+      setAccessFeedback(
+        `Couldn't reach that room yet — it may be offline or still hole-punching. ` +
+        `It's saved in your list; tap ENTER to retry.`,
+      );
+    } else if (state === 'current') {
+      autoEnterRoomId = null; // already there
+    }
+  });
 
   // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
   // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
@@ -2431,6 +2464,11 @@ function gossipIntroductions(session: DmSession): void {
 
 // ── MY ROOMS list (issue #60 staged room-list) ───────────────────────────────
 
+/** The room a just-added pass should auto-enter once it warms to READY (the
+ *  streamlined "join now" flow). Cleared on enter, on OFFLINE timeout, or when
+ *  the user makes a manual choice (ENTER/JUMP another room). */
+let autoEnterRoomId: string | null = null;
+
 /** Enter a room from its pass — the ACCESS beam, now fast because a READY
  *  room is already warm on the node (no minutes-long re-dial). Also the DEV
  *  "jump now" path (immediate, before READY). */
@@ -2539,7 +2577,7 @@ function buildRoomRow(e: RoomEntry): HTMLElement {
     enter.textContent = 'ENTER';
     enter.setAttribute('aria-label', `Enter ${e.name}`);
     if (e.state === 'ready') {
-      enter.addEventListener('click', () => void enterRoomFromPass(e.seed));
+      enter.addEventListener('click', () => { autoEnterRoomId = null; void enterRoomFromPass(e.seed); });
     }
     actions.append(enter);
     // DEV escape hatch: jump immediately, before the room finishes loading.
@@ -2548,7 +2586,7 @@ function buildRoomRow(e: RoomEntry): HTMLElement {
     jump.textContent = 'JUMP';
     jump.title = 'DEV: jump immediately (before READY)';
     jump.setAttribute('aria-label', `DEV jump to ${e.name} now`);
-    jump.addEventListener('click', () => void enterRoomFromPass(e.seed));
+    jump.addEventListener('click', () => { autoEnterRoomId = null; void enterRoomFromPass(e.seed); });
     actions.append(jump);
   }
 
