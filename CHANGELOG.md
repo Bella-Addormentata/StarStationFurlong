@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.8 — 2026-07-15
+
+### Furniture Editor — a Visible EXIT, and Tab No Longer Traps You
+
+- **You could get stuck in the furniture editor with no way out.** Edit mode advertised only a transient "ESC exits" hint — no visible button — and the edit-mode ESC handler (like the `+`/`-` first-person keys) early-returns whenever the SpacePhone is open. The Tab key toggles the phone, and its handler was **completely unguarded**, so pressing Tab *while editing* opened the phone on top of edit mode — and from then on ESC no longer exited the editor **and** `+`/`-` no longer entered first-person, because both defer to the open phone. With no exit button, it was a dead end. (Neither key was "disabled" — verified live that `+` still enters first-person from the room; an open phone was silently swallowing them.)
+- **Two fixes.** (1) A persistent **✓ DONE EDITING** button, top-center, visible the whole time you edit — it calls exit **directly**, bypassing the keyboard-guard chain, and blurs focus on the way out, so it works even if the phone is open; a click mid-move cancels that move first (mirrors ESC). (2) The Tab handler now **refuses to open the phone while you're editing** (it can still close an already-open one), so the guard that swallows ESC and `+`/`-` can never latch during an edit session. Together: ESC exits, `+`/`-` reach first-person, and there's always an obvious way out.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.8 in place). **Frontend-only — the v0.29.6 node binary is unchanged.**
+
 ## v0.29.7 — 2026-07-15
 
 ### The Room Name and Furniture Finally Land — Backfill the Quiescent SyncStep2

@@ -1407,6 +1407,12 @@ function setupSpacePhoneOverlay() {
       }
 
       if (container) {
+        // Don't let Tab OPEN the SpacePhone while editing the room: an open
+        // phone latches the #spacephone-container.active guard that swallows the
+        // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
+        // (zoom.ts), stranding the player in edit mode with no working exit.
+        // Tab may still CLOSE an already-open phone.
+        if (roomEdit.isEditModeActive() && !container.classList.contains('active')) return;
         container.classList.toggle('active');
         if (container.classList.contains('active')) {
           // Always land on the home screen (see view-router policy note above)

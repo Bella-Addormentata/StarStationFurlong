@@ -285,6 +285,10 @@ class RoomEditController {
   private labelEl: HTMLDivElement | null = null;
   /** Floating ✕ REMOVE button under the label (#53) — shown while selected. */
   private removeBtnEl: HTMLButtonElement | null = null;
+  /** Persistent DONE EDITING button — the always-visible exit affordance
+   *  (edit mode previously advertised only a transient "ESC exits" hint, so a
+   *  swallowed Esc left the player with no obvious way out). */
+  private exitBtnEl: HTMLButtonElement | null = null;
   private labelAnchor = new THREE.Vector3();
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
@@ -406,7 +410,8 @@ class RoomEditController {
     this.buildRaycastIndex(world);
     window.addEventListener('mousemove', this.onMouseMove);
     world.setEditMode(true);
-    showHint('EDIT MODE — click furniture to select · X removes · ESC exits', 4000);
+    this.showExitButton();
+    showHint('EDIT MODE — click furniture to select · X removes · DONE EDITING (or ESC) exits', 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
@@ -415,6 +420,7 @@ class RoomEditController {
     this.cancelCarry(false); // E3: never exit with an item in hand
     this.setHovered(null);
     this.setSelected(null);
+    this.hideExitButton();
     window.removeEventListener('mousemove', this.onMouseMove);
     this.setCanvasCursor('');
     this.world?.setEditMode(false);
@@ -1048,6 +1054,56 @@ class RoomEditController {
     }
     this.removeBtnEl.style.display = show ? 'block' : 'none';
     if (show) this.updateLabelPosition();
+  }
+
+  /**
+   * The persistent, always-visible EXIT affordance (top-centre) for the whole
+   * edit session. Clicking it calls exit() DIRECTLY — bypassing the keydown
+   * Esc handler and its guards — and blurs itself first so any input that had
+   * stolen focus (which would also have been swallowing the Esc key and the
+   * +/- zoom keys) is released as we leave. stopPropagation keeps the click
+   * off the window canvas-click routing (same rule as the REMOVE button).
+   */
+  private showExitButton(): void {
+    if (!this.exitBtnEl) {
+      this.exitBtnEl = document.createElement('button');
+      this.exitBtnEl.id = 'room-edit-exit-btn';
+      this.exitBtnEl.type = 'button';
+      this.exitBtnEl.textContent = '✓ DONE EDITING';
+      this.exitBtnEl.title = 'Leave edit mode (or press Esc)';
+      this.exitBtnEl.style.cssText = `
+        position: fixed;
+        top: 16px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 8px 20px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(240, 192, 96, 0.75);
+        border-radius: 8px;
+        color: #f0c060;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      this.exitBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        // Mirror the Esc two-stage semantics: a click WHILE carrying cancels the
+        // move back to origin first; the next click then leaves edit mode.
+        if (this.carrying) { this.cancelCarry(true); return; }
+        this.exit();
+      });
+      document.body.appendChild(this.exitBtnEl);
+    }
+    this.exitBtnEl.style.display = 'block';
+  }
+
+  private hideExitButton(): void {
+    if (this.exitBtnEl) this.exitBtnEl.style.display = 'none';
   }
 
   /** Reproject the label (above) + REMOVE button (below) every frame. */
