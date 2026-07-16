@@ -21,10 +21,26 @@ use clvmr::{Allocator, NodePtr};
 
 use crate::chia_lane::{self, ChiaPresenceRecord};
 
-/// Resolve the freshest presence record published under `room_key`. Scans the
-/// current epoch and the previous one (records straddling midnight stay found),
-/// verifies the signature + freshness, and returns the first valid record.
+/// Resolve the freshest presence record published under `room_key` (any member).
 pub async fn resolve_by_room_key(room_key: &[u8; 32]) -> Result<Option<ChiaPresenceRecord>> {
+    resolve_inner(room_key, None).await
+}
+
+/// Resolve the freshest record for a SPECIFIC peer (`target_node_id`, the iroh
+/// node-id hex) under `room_key` — the introduction lookup at dial-exhaustion.
+pub async fn resolve_target(
+    room_key: &[u8; 32],
+    target_node_id: &str,
+) -> Result<Option<ChiaPresenceRecord>> {
+    resolve_inner(room_key, Some(target_node_id)).await
+}
+
+/// Scans the current epoch and the previous one (records straddling midnight stay
+/// found), verifies signature + freshness, and returns the first matching record.
+async fn resolve_inner(
+    room_key: &[u8; 32],
+    target: Option<&str>,
+) -> Result<Option<ChiaPresenceRecord>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -33,7 +49,7 @@ pub async fn resolve_by_room_key(room_key: &[u8; 32]) -> Result<Option<ChiaPrese
     let epoch = chia_lane::epoch_now(now);
     for e in [epoch, epoch.saturating_sub(1)] {
         let hint = Bytes32::new(chia_lane::derive_hint(room_key, e));
-        if let Some(rec) = resolve_one_hint(&client, hint, room_key, now).await? {
+        if let Some(rec) = resolve_one_hint(&client, hint, room_key, now, target).await? {
             return Ok(Some(rec));
         }
     }
@@ -45,6 +61,7 @@ async fn resolve_one_hint(
     hint: Bytes32,
     room_key: &[u8; 32],
     now: u64,
+    target: Option<&str>,
 ) -> Result<Option<ChiaPresenceRecord>> {
     let resp = client
         .get_coin_records_by_hint(hint, None, None, Some(true), None)
@@ -77,6 +94,12 @@ async fn resolve_one_hint(
             Ok(r) => r,
             Err(_) => continue, // tampered / bad signature
         };
+        // Introduction wants a SPECIFIC peer — skip other members' records.
+        if let Some(want) = target {
+            if record.node_id != want {
+                continue;
+            }
+        }
         if record.expires_at != 0 && record.expires_at < now {
             continue; // stale — a newer heartbeat should exist
         }

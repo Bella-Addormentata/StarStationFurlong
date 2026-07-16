@@ -169,20 +169,11 @@ pub fn startup_status(secret: &iroh::SecretKey, live_addrs: &[String]) {
         hex::encode(&hint[..8]),
     );
 }
-
-/// [C1-HOOK: M4 seam 1] Resolve a peer's CURRENT presence record from the chain,
-/// keyed by IDENTITY, when the live dial ladder is exhausted ("identity known,
-/// route unknown"). Returns `None` today — no chain IO ships (gated on spike
-/// B-7); this is the seam boundary `dial_peer_inner`'s fall-through calls before
-/// giving up. A future impl does an IDENTITY-keyed lookup (NOT the room-key-sealed
-/// `derive_hint`/`seal` above — at dial-exhaustion the node holds the target
-/// pubkey but no room key, chia_lane's open [C1-DESIGN] question), verifies the
-/// self-signed record via `decode_signed`, honours `expires_at` freshness, and
-/// hands its addrs back into exactly ONE more dial attempt. The chain is the
-/// swarm's address book + metronome, never its pipe (~19 s blocks vs 20 Hz).
-pub async fn resolve_presence(_target: &iroh::PublicKey) -> Option<ChiaPresenceRecord> {
-    None
-}
+// [C1-HOOK realized in Slice 5b] The dial-exhaustion resolve now lives in
+// `chia_resolve` (room-key-keyed, per the [C1-DESIGN] resolution: the node holds
+// the room key via Slice 3's `cap` lane, and filters resolved records by the
+// target node-id). `dial_peer_inner` calls `chia_resolve::resolve_target` and
+// feeds the public addrs into one more node-id-authenticated dial.
 
 #[cfg(test)]
 mod tests {

@@ -641,6 +641,68 @@ fn ipv4_is_public(ip: std::net::Ipv4Addr) -> bool {
         || cgnat)
 }
 
+/// v6 companion to [`ipv4_is_public`] (Slice 5b): rejects loopback/unspecified/
+/// multicast, link-local (fe80::/10) and ULA (fc00::/7); keeps global unicast.
+#[cfg(feature = "chia-lane")]
+fn ipv6_is_public(ip: std::net::Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xffc0) == 0xfe80   // fe80::/10 link-local
+        || (first & 0xfe00) == 0xfc00)  // fc00::/7 unique-local
+}
+
+/// Slice 5b addr-trust filter: a chia-resolved record's addrs are SELF-declared,
+/// so feed only PUBLIC, internet-routable ones into a dial and cap the count —
+/// never probe our own LAN/loopback off a record (same-LAN peers are found by
+/// mDNS at rung 2 anyway). The dial is node-id-authenticated, so even a spoofed
+/// public addr yields only a failed handshake, never a completed link.
+#[cfg(feature = "chia-lane")]
+fn chia_public_dial_addrs(addrs: &[String]) -> Vec<SocketAddr> {
+    const CAP: usize = 4;
+    addrs
+        .iter()
+        .filter_map(|s| s.parse::<SocketAddr>().ok())
+        .filter(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => ipv4_is_public(v4),
+            std::net::IpAddr::V6(v6) => ipv6_is_public(v6),
+        })
+        .take(CAP)
+        .collect()
+}
+
+#[cfg(all(test, feature = "chia-lane"))]
+mod chia_addr_filter_tests {
+    use super::*;
+
+    #[test]
+    fn public_filter_keeps_public_drops_nonroutable() {
+        let addrs: Vec<String> = [
+            "192.168.1.79:58827",                    // private v4 -> drop
+            "127.0.0.1:1234",                        // loopback -> drop
+            "100.64.1.1:1",                          // CGNAT 100.64/10 -> drop
+            "169.254.5.5:1",                         // link-local v4 -> drop
+            "[fe80::1]:1",                           // link-local v6 -> drop
+            "[fc00::1]:1",                           // ULA v6 -> drop
+            "203.0.113.9:44442",                     // TEST-NET-3 documentation -> drop
+            "8.8.8.8:44442",                         // public v4 -> KEEP
+            "[2600:1700:68a0:8ca0::29]:58828",       // public v6 -> KEEP
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let kept: Vec<String> = chia_public_dial_addrs(&addrs).iter().map(|s| s.to_string()).collect();
+        assert_eq!(kept.len(), 2, "only the two public addrs survive, got {kept:?}");
+        assert!(kept.contains(&"8.8.8.8:44442".to_string()));
+        assert!(kept.iter().any(|s| s.contains("2600:1700")));
+        for bad in ["192.168", "127.0.0.1", "100.64", "169.254", "fe80", "fc00", "203.0.113"] {
+            assert!(!kept.iter().any(|s| s.contains(bad)), "{bad} should be filtered out");
+        }
+    }
+}
+
 /// Outcome of one public-IPv4 echo round. CGNAT is split out from plain
 /// failure (R1) so the fingerprint can classify reachability honestly —
 /// "the echo answered but the WAN is CGNAT" is actionable ("needs relay"),
@@ -1716,18 +1778,74 @@ async fn dial_peer_inner(
         }
     }
 
-    // [C1-HOOK: ChiaHub rung-6 fall-through] (M4 seam 1). The direct dial ladder
-    // is exhausted: rung 4 (hub/gossip/punch) found no route. Before giving up,
-    // this is where a future ChiaHub lookup resolves the target's CURRENT presence
-    // record from the chain — "identity known, route unknown" is exactly the state
-    // the chain makes recoverable with zero live infrastructure — and feeds those
-    // fresh addrs back into ONE more dial attempt. resolve_presence returns None
-    // today (no chain IO ships; gated on spike B-7), so this is an inert no-op that
-    // falls straight through to "failed", identical to prior behaviour. The resolve
-    // MUST stay off this loop's critical path and never hold `rooms` (a ~19s block
-    // query): the chain is an address book, never a pipe.
-    if let Some(rec) = chia_lane::resolve_presence(&target_pub_key).await {
-        let _ = rec; // future: rebuild EndpointAddr from rec.addrs, one more attempt
+    // [C1-HOOK: ChiaHub rung-6 fall-through] (Slice 5b). The direct dial ladder is
+    // exhausted: rungs 1–4 (mDNS/DHT/hub/gossip/punch) found no route. "Identity
+    // known, route unknown" is exactly the state the chain makes recoverable with
+    // zero live infrastructure. If this room opted into chia mode and the browser
+    // delivered its room key (Slice 3), resolve the target's CURRENT presence from
+    // testnet11 and feed its PUBLIC addrs into ONE more node-id-authenticated dial.
+    // The resolve is a ~19s block query, so it runs OFF the `rooms` lock and only
+    // after the fast ladder gave up — the chain is an address book, never a pipe.
+    #[cfg(feature = "chia-lane")]
+    {
+        let chia_cap = hub.chia_rooms.lock().unwrap().get(&room_id).cloned();
+        if let Some(cap) = chia_cap {
+            if cap.chia_mode {
+                match chia_resolve::resolve_target(&cap.room_key, &target_str).await {
+                    Ok(Some(rec)) => {
+                        let addrs = chia_public_dial_addrs(&rec.addrs);
+                        if addrs.is_empty() {
+                            println!("⛓️ ChiaHub rung-6: resolved {target_str} but no public addr survived the trust filter");
+                        } else {
+                            println!(
+                                "⛓️ ChiaHub rung-6: resolved {target_str} on-chain — {} public addr(s), one authenticated dial",
+                                addrs.len()
+                            );
+                            let mut addr = EndpointAddr::new(target_pub_key);
+                            for sa in &addrs {
+                                addr = addr.with_ip_addr(*sa);
+                            }
+                            if let Ok(iroh_conn) = iroh_ep.connect(addr, b"ssf").await {
+                                println!("🎯 ChiaHub-introduced connection secured to {target_str}");
+                                {
+                                    let mut rooms = hub.rooms.lock().unwrap();
+                                    if let Some(room) = rooms.get_mut(&room_id) {
+                                        let in_mesh = mesh_has_room_for(room, dial_tier);
+                                        room.remote_peers.insert(
+                                            target_pub_key,
+                                            MemberEntry::new(
+                                                iroh_conn.clone(),
+                                                dial_tier,
+                                                in_mesh,
+                                                PeerHints {
+                                                    relay_urls: relay_hints.clone(),
+                                                    direct_addrs: addrs.iter().map(|s| s.to_string()).collect(),
+                                                },
+                                            ),
+                                        );
+                                        room.candidates.remove(&target_pub_key);
+                                    }
+                                }
+                                report_dial_status(&hub, &send, &room_id, &target_str, "connected", None).await;
+                                let hub_out = hub.clone();
+                                let iroh_out = iroh_ep.clone();
+                                let room_out = room_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        handle_iroh_connection(hub_out, iroh_conn, iroh_out, Some(room_out)).await
+                                    {
+                                        eprintln!("⚠️ ChiaHub-introduced peer loop closed: {:?}", e);
+                                    }
+                                });
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("⛓️ ChiaHub rung-6 resolve error: {e:#}"),
+                }
+            }
+        }
     }
 
     report_dial_status(
