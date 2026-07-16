@@ -63,6 +63,7 @@ export interface RoomPassDeps {
 const STORAGE_KEY = 'ssf-room-passes';
 const READY_TICK_MS = 250; // roomInfo poll cadence while a prefetch loads
 const LOAD_TIMEOUT_MS = 25_000; // loading → offline if the host never delivers state
+const BACKFILL_RESYNC_MS = 2_000; // re-issue SyncStep1 at most this often while loading (v0.29.7)
 
 let deps: RoomPassDeps | null = null;
 let passes: RoomPass[] = [];
@@ -278,7 +279,17 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
   pf.sync = sync;
   // The node forwards this room's updates to THIS connection; feed them in.
   pf.provider.onEnvelope((env: { kind?: string; room?: string; payload?: string }) => {
-    if (env.kind === 'ysync') sync.ingestEnvelope(env);
+    if (env.kind === 'ysync') { sync.ingestEnvelope(env); return; }
+    // Fast path (v0.29.7): the instant the node reports the host LINKED, re-ask
+    // for state. The prefetch's opening SyncStep1 (start()) fires before the
+    // host dial completes and is relayed to an empty neighbor set, so a static
+    // room's roomInfo never arrives and the row is stuck LOADING → UNREACHABLE.
+    // The main session already resyncs on 'connected' (main.ts); the prefetch
+    // used to drop this status entirely. The poll below also re-asks as a
+    // fallback in case this status is missed.
+    if (env.kind === 'bridge' && typeof env.payload === 'string') {
+      try { if (JSON.parse(atob(env.payload))?.status === 'connected') sync.resync(); } catch { /* non-JSON bridge payload */ }
+    }
   });
   await sync.start();
   if (!alive()) return;
@@ -314,11 +325,20 @@ async function warm(pass: RoomPass, pf: Prefetch): Promise<void> {
   // late-arriving host still flips the row to READY.
   if (ready()) { finishReady(); return; }
   const deadline = performance.now() + LOAD_TIMEOUT_MS;
+  let lastResync = 0;
   const tick = () => {
     if (!alive()) return;
     if (ready()) { finishReady(); return; }
-    if (performance.now() >= deadline && prefetches.get(pass.roomId)?.state === 'loading') {
-      setState(pass.roomId, 'offline');
+    const now = performance.now();
+    if (now >= deadline) {
+      if (prefetches.get(pass.roomId)?.state === 'loading') setState(pass.roomId, 'offline');
+    } else if (now - lastResync >= BACKFILL_RESYNC_MS) {
+      // Fallback re-ask (v0.29.7): re-issue SyncStep1 on a slow cadence until the
+      // host's quiescent roomInfo backfills, in case the 'connected' fast path
+      // was missed (e.g. the host dial was single-flight-claimed by another
+      // connection so this one never saw a 'connected' status).
+      lastResync = now;
+      sync.resync();
     }
     window.setTimeout(tick, READY_TICK_MS);
   };
