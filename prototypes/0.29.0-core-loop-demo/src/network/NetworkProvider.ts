@@ -103,6 +103,18 @@ export class NetworkProvider implements NetworkProviderPort {
       // 3. Start RTT Ping/Pong probe loop (Task 3.4 / v006 §3.8 Chrome fallback)
       this.#startPingProbe();
 
+      // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + per-room
+      // chia-mode flag over a one-shot `cap` stream, so it can derive the room's
+      // chia lookup hint and (later) publish/resolve presence. Loopback only; the
+      // node drops it entirely unless it was built with the chia-lane feature AND
+      // SSF_CHIA_LANE=1. The chia-mode flag is the "advanced chia mesh mode"
+      // toggle — sourced from localStorage until the management-computer UI sets it.
+      if (boot.roomKeyB64) {
+        let chiaMode = false;
+        try { chiaMode = localStorage.getItem('ssf-chia-mode') === '1'; } catch { /* privacy mode */ }
+        void this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
+      }
+
     } catch (err: any) {
       console.error(`⚠️ WebTransport handshaking failed:`, err);
       this.#mode = 'offline';
@@ -154,6 +166,34 @@ export class NetworkProvider implements NetworkProviderPort {
 
   onTick(handler: (buf: Uint8Array) => void): void {
     this.#tickHandler = handler;
+  }
+
+  /** ChiaHub Slice 3: deliver this room's key (+ per-room chia-mode flag) to the
+   *  LOCAL node over a one-shot `cap` stream. The node needs the room key to
+   *  derive the room's chia lookup hint and seal presence records; it holds the
+   *  room's plaintext doc already, so this is loopback-only and exposes nothing
+   *  new. Fire-and-forget: the node silently drops it unless it was built with
+   *  the chia-lane feature and SSF_CHIA_LANE=1. Same `[u32-LE len][JSON]` framing
+   *  the node reads on every browser->node stream. */
+  async sendRoomCap(roomId: string, roomKeyB64: string, chiaMode: boolean): Promise<void> {
+    if (!this.#wt || this.#mode === 'offline') return;
+    try {
+      const payloadBytes = new TextEncoder().encode(JSON.stringify({ roomKeyB64, chiaMode }));
+      // Small payload (<128 B) — a single btoa is safe. Node decodes with
+      // BASE64_STANDARD, which btoa produces.
+      const payloadB64 = btoa(String.fromCharCode(...payloadBytes));
+      const wire = { v: 1, room: roomId, kind: 'cap', seq: 0, author: '', payload: payloadB64 };
+      const jsonBytes = new TextEncoder().encode(JSON.stringify(wire));
+      const packet = new Uint8Array(4 + jsonBytes.length);
+      new DataView(packet.buffer).setUint32(0, jsonBytes.length, true);
+      packet.set(jsonBytes, 4);
+      const stream = await this.#wt.createBidirectionalStream();
+      const writer = stream.writable.getWriter();
+      await writer.write(packet);
+      writer.releaseLock();
+    } catch (e) {
+      console.warn('Failed to send room cap to node:', e);
+    }
   }
 
   /** Register a handler for envelopes arriving on node-initiated streams

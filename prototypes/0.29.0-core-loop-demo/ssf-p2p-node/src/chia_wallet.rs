@@ -15,9 +15,12 @@
 //! chia-puzzle-types 0.36.1, chia-protocol 0.36.1, chia-sdk-utils 0.34.
 #![cfg(feature = "chia-lane")]
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 
 // --- Verified chia 0.34/0.36 surface (audit "Surface A"), imported from the
 // SUB-CRATES directly (see Cargo.toml note — the umbrella crate overflows the
@@ -132,6 +135,99 @@ pub fn log_receive_address(sk: &SecretKey) {
     );
 }
 
+// ── Slice 3: room-key plumbing (browser -> local node over the `cap` lane) ──
+
+/// Per-room chia capability the LOCAL browser hands the node: the room key (so
+/// the node can derive the room's lookup hint and seal presence records) and the
+/// per-room chia-mode toggle (whether this room actually uses the introduction
+/// lane — the "advanced chia mesh mode" switch). Trust-safe: loopback delivery,
+/// and the node already holds the room's plaintext Yjs doc, so the key exposes
+/// nothing new.
+#[derive(Clone)]
+pub struct ChiaRoomCap {
+    pub room_key: [u8; 32],
+    pub chia_mode: bool,
+}
+
+/// Wire shape of a `cap` envelope's JSON payload (browser camelCase).
+#[derive(Deserialize)]
+struct RoomCapPayload {
+    #[serde(rename = "roomKeyB64")]
+    room_key_b64: String,
+    #[serde(rename = "chiaMode", default)]
+    chia_mode: bool,
+}
+
+/// Decode a 32-byte room key from whatever base64 flavor the browser emits
+/// (`getOrCreateRoomKeyB64` uses base64url-no-pad; be tolerant of all four).
+fn decode_room_key(s: &str) -> Option<[u8; 32]> {
+    use base64::Engine;
+    let trimmed = s.trim();
+    for eng in [
+        base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        base64::engine::general_purpose::URL_SAFE,
+        base64::engine::general_purpose::STANDARD,
+        base64::engine::general_purpose::STANDARD_NO_PAD,
+    ] {
+        if let Ok(bytes) = eng.decode(trimmed) {
+            if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                return Some(arr);
+            }
+        }
+    }
+    None
+}
+
+/// Pure parse of a `cap` payload into a [`ChiaRoomCap`] — the testable core of
+/// [`ingest_room_cap`], with no env gate, storage, or logging. `None` on bad JSON
+/// or a key that isn't 32 bytes of (any-flavor) base64.
+fn parse_room_cap(payload: &[u8]) -> Option<ChiaRoomCap> {
+    let parsed: RoomCapPayload = serde_json::from_slice(payload).ok()?;
+    let room_key = decode_room_key(&parsed.room_key_b64)?;
+    Some(ChiaRoomCap { room_key, chia_mode: parsed.chia_mode })
+}
+
+/// Ingest a `cap` payload the local browser sent for `room`: store the room key
+/// + chia-mode flag, and log the REAL per-room lookup hint (proof the plumbing
+/// works — this is the actual room key, not the C0 `[7u8;32]` self-test key).
+/// No-op unless `SSF_CHIA_LANE=1` — so a chia-lane build that hasn't opted in
+/// holds no room-key material.
+pub fn ingest_room_cap(rooms: &Mutex<HashMap<String, ChiaRoomCap>>, room: &str, payload: &[u8]) {
+    if std::env::var("SSF_CHIA_LANE").ok().as_deref() != Some("1") {
+        return;
+    }
+    let cap = match parse_room_cap(payload) {
+        Some(c) => c,
+        None => {
+            eprintln!("⛓️ ChiaHub lane: ignoring malformed room cap for {room}");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hint = crate::chia_lane::derive_hint(&cap.room_key, crate::chia_lane::epoch_now(now));
+    let chia_mode = cap.chia_mode;
+    // Log only when something changed, so a re-sent cap on reconnect is quiet.
+    let changed = {
+        let mut map = rooms.lock().unwrap();
+        match map.get(room) {
+            Some(prev) if prev.room_key == cap.room_key && prev.chia_mode == cap.chia_mode => false,
+            _ => {
+                map.insert(room.to_string(), cap);
+                true
+            }
+        }
+    };
+    if changed {
+        println!(
+            "⛓️ ChiaHub lane: room {room} key received (chia_mode={chia_mode}) · real epoch hint {}",
+            hex::encode(&hint[..8]),
+        );
+    }
+}
+
 /// Tighten the seed file to owner-only on Unix; a no-op elsewhere (Windows ACLs
 /// are inherited from the node-data dir). Best-effort — a failure here never
 /// stops the node.
@@ -171,5 +267,30 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn room_cap_parses_browser_base64url_and_mode() {
+        use base64::Engine;
+        // Exactly how the browser's toBase64Url emits the key: base64url, no pad.
+        let key = [9u8; 32];
+        let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let payload = format!("{{\"roomKeyB64\":\"{b64url}\",\"chiaMode\":true}}");
+        let cap = parse_room_cap(payload.as_bytes()).expect("valid cap parses");
+        assert_eq!(cap.room_key, key);
+        assert!(cap.chia_mode);
+    }
+
+    #[test]
+    fn room_cap_defaults_mode_false_and_rejects_junk() {
+        use base64::Engine;
+        let key = [3u8; 32];
+        let b64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        // chiaMode omitted -> defaults false.
+        let payload = format!("{{\"roomKeyB64\":\"{b64url}\"}}");
+        assert!(!parse_room_cap(payload.as_bytes()).expect("parses").chia_mode);
+        // Junk / wrong-length key -> None (no panic, no store).
+        assert!(parse_room_cap(b"not json at all").is_none());
+        assert!(parse_room_cap(b"{\"roomKeyB64\":\"c2hvcnQ\"}").is_none());
     }
 }

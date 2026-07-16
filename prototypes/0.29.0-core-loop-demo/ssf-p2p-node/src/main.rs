@@ -336,6 +336,12 @@ pub struct HubState {
     /// R1: live reachability posture — written by the auto echo loop (and the
     /// explicit SSF_EXTERNAL_ADDRS parser), read by the fingerprint API.
     pub reach: Arc<ReachState>,
+    /// ChiaHub C1 Slice 3: per-room key + chia-mode flag the LOCAL browser hands
+    /// us over the `cap` lane, so the node can derive the room's chia lookup hint
+    /// and seal presence records. Loopback + trust-safe (we already hold the
+    /// plaintext room doc). Present only when the `chia-lane` feature is built.
+    #[cfg(feature = "chia-lane")]
+    pub chia_rooms: Mutex<HashMap<String, chia_wallet::ChiaRoomCap>>,
 }
 
 /// R1 live reachability posture. The auto public-IP echo loop writes here as
@@ -1018,6 +1024,8 @@ async fn main() -> Result<()> {
         secret_key: secret_key.clone(),
         dialing: Mutex::new(std::collections::HashSet::new()),
         reach: reach.clone(),
+        #[cfg(feature = "chia-lane")]
+        chia_rooms: Mutex::new(HashMap::new()),
     });
 
     // M5.1: the node's first-ever liveness — a heartbeat loop that pings mesh
@@ -1225,6 +1233,23 @@ async fn handle_wt_connection_inner(
                                 }
                             });
                             room.local_connections.insert(remote_addr_inner, connection_clone.clone());
+                        }
+
+                        // ChiaHub C1 Slice 3: a `cap` envelope from the LOCAL browser
+                        // carries this room's key (+ chia-mode flag) so the node can
+                        // derive the room's chia lookup hint and seal presence records.
+                        // Consumed locally and NEVER relayed to remote peers (the room
+                        // key must not leave this machine) — hence the early `continue`.
+                        // Ingest is a no-op unless the chia-lane feature is built AND
+                        // SSF_CHIA_LANE=1; the default release binary just drops it.
+                        if envelope.kind == "cap" {
+                            #[cfg(feature = "chia-lane")]
+                            chia_wallet::ingest_room_cap(
+                                &hub_clone.chia_rooms,
+                                &envelope.room,
+                                &envelope.payload,
+                            );
+                            continue;
                         }
 
                         // Dial a newly-advertised peer OFF this reader loop (issue #60
