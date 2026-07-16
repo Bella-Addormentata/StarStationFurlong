@@ -48,12 +48,25 @@ chacha20poly1305 = "0.10"
 # The node is a bin (exports nothing) and nothing links iroh-relay's cdylib, so
 # the flag is safe. The DEFAULT (no-chia) release build does NOT need it and is
 # left untouched.
-chia-bls = { version = "0.36", optional = true }
-chia-protocol = { version = "0.36", optional = true }
+chia-bls = { version = "0.36", optional = true, features = ["serde"] }
+chia-protocol = { version = "0.36", optional = true, features = ["serde"] }
 chia-puzzle-types = { version = "0.36", optional = true }
 chia-sdk-utils = { version = "0.34", optional = true }
+# Slice 4 (publish) + Slice 5 (resolve): spend construction, signing, coinset RPC.
+# chia-sdk-coinset needs a TLS backend for testnet11 HTTPS (off by default) — enable rustls.
+chia-sdk-driver = { version = "0.34", optional = true }
+chia-sdk-types = { version = "0.34", optional = true }
+chia-sdk-signer = { version = "0.34", optional = true }
+chia-sdk-coinset = { version = "0.34", optional = true, features = ["rustls"] }
+# Allocator for the signer's RequiredSignature::from_coin_spends (already in the
+# graph transitively; direct dep just makes clvmr::Allocator nameable).
+clvmr = { version = "0.16", optional = true }
 
 [features]
 # Off by default. Turns on the Chia introduction-lane chain IO (wallet address,
 # spend-to-self publish, lookup-by-hint resolve). Runtime still gated by SSF_CHIA_LANE=1.
-chia-lane = ["dep:chia-bls", "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-utils"]
+chia-lane = [
+    "dep:chia-bls", "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-utils",
+    "dep:chia-sdk-driver", "dep:chia-sdk-types", "dep:chia-sdk-signer", "dep:chia-sdk-coinset",
+    "dep:clvmr",
+]

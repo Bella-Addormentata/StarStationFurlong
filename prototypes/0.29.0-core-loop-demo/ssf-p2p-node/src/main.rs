@@ -18,6 +18,8 @@ use iroh::endpoint::presets::Minimal;
 mod chia_lane;
 #[cfg(feature = "chia-lane")]
 mod chia_wallet;
+#[cfg(feature = "chia-lane")]
+mod chia_publish;
 
 mod b64 {
     use base64::prelude::*;
@@ -981,7 +983,28 @@ async fn main() -> Result<()> {
     {
         let seed_path = std::path::Path::new("chia_identity.seed");
         match chia_wallet::load_or_mint_bls_key(seed_path) {
-            Ok(chia_sk) => chia_wallet::log_receive_address(&chia_sk),
+            Ok(chia_sk) => {
+                chia_wallet::log_receive_address(&chia_sk);
+                // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend
+                // a coin to publish a presence record under a FIXED test room key, so
+                // the publish->resolve loop can be validated without a browser having
+                // delivered a real room key. Spawned so it never blocks node startup;
+                // logs the hint on success or the reason on failure (e.g. unfunded).
+                if std::env::var("SSF_CHIA_PUBLISH_TEST").ok().as_deref() == Some("1") {
+                    let iroh_sk = secret_key.clone();
+                    let addrs = iroh_direct_addrs.clone();
+                    let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
+                    tokio::spawn(async move {
+                        match chia_publish::publish_presence(&iroh_sk, &chia_sk, &test_room_key, &addrs).await {
+                            Ok(hint) => println!(
+                                "⛓️ ChiaHub PUBLISH ok — testnet11 presence record written at hint {}",
+                                hex::encode(&hint.to_bytes()[..8])
+                            ),
+                            Err(e) => eprintln!("⛓️ ChiaHub PUBLISH failed: {e:#}"),
+                        }
+                    });
+                }
+            }
             Err(e) => eprintln!("⛓️ ChiaHub lane: could not load chia identity: {e:#}"),
         }
     }
