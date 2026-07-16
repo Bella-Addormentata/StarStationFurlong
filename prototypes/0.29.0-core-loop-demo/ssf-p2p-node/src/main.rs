@@ -782,6 +782,26 @@ async fn main() -> Result<()> {
                     return Err(anyhow!("SSF_IROH_PORT={port} requested but UDP {port} is unavailable: {e}"));
                 }
             }
+            // IPv6 pin: the v6 socket previously kept its DEFAULT bind = a RANDOM
+            // ephemeral port every launch (the comment above used to admit "IPv6
+            // keeps its default bind"), so an [v6]:44442 firewall allow-rule or
+            // invite hint never matched v6 traffic. Pin it to the SAME port so a
+            // member is STABLY dialable on IPv6 — the self-healing mesh's sovereign
+            // path (no NAT, so a fixed [v6]:port is directly reachable). Probe first
+            // and degrade to random on conflict, exactly like the IPv4 pin; a v6
+            // failure is never fatal (IPv4 + relays/DHT still carry us).
+            match std::net::UdpSocket::bind(("::", port)) {
+                Ok(probe) => {
+                    drop(probe);
+                    builder = builder
+                        .bind_addr(format!("[::]:{port}"))
+                        .map_err(|e| anyhow!("Invalid iroh bind address [::]:{port}: {e:?}"))?;
+                    println!("📌 iroh IPv6 socket pinned to UDP {port} — allow inbound UDP {port} on your IPv6 firewall for direct reachability");
+                }
+                Err(e) => {
+                    eprintln!("⚠️ iroh IPv6 port UDP {port} unavailable ({e}); IPv6 falls back to a random per-launch port — direct v6 dials then need the other reachability rungs");
+                }
+            }
         }
         None => println!("📌 SSF_IROH_PORT=0 — iroh IPv4 socket uses a random per-launch port (not manually forwardable)"),
     }
@@ -1931,9 +1951,21 @@ fn handle_iroh_connection(
                         // The gossip-learned peer is also recorded as an INTRODUCED-tier graft
                         // candidate (M5.3) whether or not we dial right now.
                         if let Ok(origin_key) = origin_id_str.parse::<PublicKey>() {
+                            // IPv6 self-healing mesh: BOTH sides dial (the old
+                            // `self_id < origin_key` smaller-id rule elected only ONE
+                            // dialer to avoid glare). But a stateful IPv6 firewall only
+                            // opens for a flow the device itself started — so a one-
+                            // sided dial is dropped as unsolicited inbound and never
+                            // connects two firewalled spokes. Both peers dialing (each
+                            // sends an outbound probe to the DHT-resolved node route)
+                            // opens BOTH pinholes; iroh dedups the resulting connection
+                            // by node id, and hub.dialing single-flights each side, so
+                            // the double-dial is bounded, not a storm. Still node-id
+                            // ONLY with EMPTY hints (below) — the DHT resolves the
+                            // route, no relay can aim the handshake (reflection stays
+                            // closed).
                             if origin_key != self_id_inner
                                 && origin_key != remote_id
-                                && self_id_inner.as_bytes() < origin_key.as_bytes()
                                 && verify_envelope_sig(&envelope) == SigVerdict::Valid
                             {
                                 // SECURITY (review HIGH): the signature covers the payload +
