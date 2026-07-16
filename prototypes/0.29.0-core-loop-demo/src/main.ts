@@ -724,6 +724,31 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   updateLocalPlayerEntry();
   updateRoomUI();
 
+  // Backfill retry (v0.29.7): the host's QUIESCENT room state — name, owner,
+  // furniture — all ride ONE signed SyncStep2 that transfers only when the host
+  // browser answers a SyncStep1 reaching it AFTER the P2P link is up. But the
+  // opening SyncStep1 (start()) races the node's dial and is relayed to an empty
+  // neighbor set, and the resync-on-'connected' above can be swallowed when a
+  // background prefetch already claimed the node's shared dial single-flight (so
+  // this session never receives a 'connected' status). Result: movement ticks
+  // flow (separate unsigned lane) but the room shows "Lobby" with no furniture
+  // forever. Re-issue SyncStep1 on a bounded cadence until the host's roomInfo
+  // lands (owner present), then stop. A room we OWN already set its own owner
+  // via claimRoomDefaults, so this no-ops there. Verified: a single post-link
+  // resync pulls the full roomInfo/players/furniture SyncStep2.
+  if (!claimRoomDefaults) {
+    const backfillEpoch = epoch;
+    const backfillDeadline = performance.now() + 30_000;
+    const backfillTick = () => {
+      if (backfillEpoch !== sessionEpoch) return; // superseded by a newer join
+      if (roomMap.has('owner')) return;           // host state arrived — done
+      if (performance.now() >= backfillDeadline) return;
+      yjsSync?.resync();
+      window.setTimeout(backfillTick, 2_000);
+    };
+    window.setTimeout(backfillTick, 1_500);
+  }
+
   // Bind shared chat array updates to SpacePhone interface (Task Task 3.3/4.1)
   const sharedChat = sync.doc.getArray('chat');
   const rebuildChatLog = () => {
