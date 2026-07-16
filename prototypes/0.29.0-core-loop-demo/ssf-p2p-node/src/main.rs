@@ -16,6 +16,8 @@ use iroh::{Endpoint as IrohEndpoint, EndpointAddr, PublicKey, RelayMap, RelayUrl
 use iroh::endpoint::presets::Minimal;
 
 mod chia_lane;
+#[cfg(feature = "chia-lane")]
+mod chia_wallet;
 
 mod b64 {
     use base64::prelude::*;
@@ -964,6 +966,19 @@ async fn main() -> Result<()> {
 
     // ⛓️ ChiaHub lane scaffold (C0): crypto self-test + status when SSF_CHIA_LANE=1.
     chia_lane::startup_status(&secret_key, &iroh_direct_addrs);
+
+    // ⛓️ ChiaHub lane C1 SLICE 2 (chia-lane feature): load/mint the node's Chia
+    // BLS identity and print its testnet11 receive address to fund. Gated at
+    // runtime by SSF_CHIA_LANE=1 inside log_receive_address. The seed persists
+    // beside the iroh key (bare CWD-relative path, same convention).
+    #[cfg(feature = "chia-lane")]
+    {
+        let seed_path = std::path::Path::new("chia_identity.seed");
+        match chia_wallet::load_or_mint_bls_key(seed_path) {
+            Ok(chia_sk) => chia_wallet::log_receive_address(&chia_sk),
+            Err(e) => eprintln!("⛓️ ChiaHub lane: could not load chia identity: {e:#}"),
+        }
+    }
 
     // 2. Start WebTransport Server for local browser tab GUI connections
     let listen_port = 4443;
