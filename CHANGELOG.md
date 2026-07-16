@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.9 — 2026-07-15
+
+### Joiners See Each Other Move — the Tick-Relay Version-Skew Fix
+
+- **In a room with a host and multiple joiners, the joiners could see each other in chat and the roster, but not each other's avatars moving.** The host relays traffic between spokes (joiners don't connect directly — see below), and it relayed *ysync* (chat, roster) fine but silently dropped *movement ticks*. Root cause: the multi-hop tick relay is gated on `if ttl > 1`, and a movement packet arriving in the **legacy (pre-M5.2) wire format** — a bare 13- or 14-byte tick with no TTL byte — parsed as `ttl = 0`. So the host delivered it to *its own* screen (that path is ungated → the host saw every joiner) but refused to *relay* it to the other joiners. Chat survived because ysync has no TTL and also self-heals through the durable room doc. Net effect: **a joiner running a version-mismatched node was invisible to other joiners' movement while everything else worked.**
+- **Fix (node): normalize legacy frames + relay the last hop.** Legacy 13/14-byte ticks now get a full flood budget instead of `ttl 0`, and the relay gate is `ttl >= 1` (the dedup cache — not the TTL — is what kills loops, so the final hop is safe). A version-skewed joiner is now forwarded to the whole room. **The most reliable fix is still to run the same build everywhere** — installing this release on every machine both eliminates the skew and hardens the relay against a future straggler.
+- **Note on topology (by design):** joiners are spokes — they route to each other *through the host*, not via direct links. Two peers behind home NATs generally can't hole-punch each other without a relay/coordinator (iroh relays are disabled in the sovereign preset), so "1 peer seen" on a joiner is the intended steady state, and the host relay is the movement path. A true joiner-to-joiner mesh is a separate, larger design item.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.9 in place). **Node binary changed — every machine must install this build** (and, for the fix to take effect, at minimum the *host* must run it, since it's the host's relay that was dropping the frames).
+
 ## v0.29.8 — 2026-07-15
 
 ### Furniture Editor — a Visible EXIT, and Tab No Longer Traps You
