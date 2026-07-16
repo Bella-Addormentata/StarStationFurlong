@@ -20,6 +20,8 @@ mod chia_lane;
 mod chia_wallet;
 #[cfg(feature = "chia-lane")]
 mod chia_publish;
+#[cfg(feature = "chia-lane")]
+mod chia_resolve;
 
 mod b64 {
     use base64::prelude::*;
@@ -1007,6 +1009,25 @@ async fn main() -> Result<()> {
             }
             Err(e) => eprintln!("⛓️ ChiaHub lane: could not load chia identity: {e:#}"),
         }
+    }
+
+    // SLICE 5 test hook (SSF_CHIA_RESOLVE_TEST=1): resolve a presence record from
+    // testnet11 under the same fixed test room key the publish hook uses, and log
+    // the recovered node_id + addrs — the READ side of mesh introduction. Read-only
+    // (no wallet needed); spawned so it never blocks startup.
+    #[cfg(feature = "chia-lane")]
+    if std::env::var("SSF_CHIA_RESOLVE_TEST").ok().as_deref() == Some("1") {
+        let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
+        tokio::spawn(async move {
+            match chia_resolve::resolve_by_room_key(&test_room_key).await {
+                Ok(Some(rec)) => println!(
+                    "⛓️ ChiaHub RESOLVE ok — recovered node_id {} · addrs {:?} · expires_at {}",
+                    rec.node_id, rec.addrs, rec.expires_at
+                ),
+                Ok(None) => println!("⛓️ ChiaHub RESOLVE — no fresh record found for the test room key yet"),
+                Err(e) => eprintln!("⛓️ ChiaHub RESOLVE failed: {e:#}"),
+            }
+        });
     }
 
     // 2. Start WebTransport Server for local browser tab GUI connections

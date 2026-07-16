@@ -61,6 +61,9 @@ chia-sdk-coinset = { version = "0.34", optional = true, features = ["rustls"] }
 # Allocator for the signer's RequiredSignature::from_coin_spends (already in the
 # graph transitively; direct dep just makes clvmr::Allocator nameable).
 clvmr = { version = "0.16", optional = true }
+# Slice 5 (resolve): ToClvm/FromClvm traits to run the parent spend and decode the
+# create_coin memos back out (already transitive; direct dep makes them nameable).
+clvm-traits = { version = "0.36", optional = true }
 
 [features]
 # Off by default. Turns on the Chia introduction-lane chain IO (wallet address,
@@ -68,5 +71,5 @@ clvmr = { version = "0.16", optional = true }
 chia-lane = [
     "dep:chia-bls", "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-utils",
     "dep:chia-sdk-driver", "dep:chia-sdk-types", "dep:chia-sdk-signer", "dep:chia-sdk-coinset",
-    "dep:clvmr",
+    "dep:clvmr", "dep:clvm-traits",
 ]

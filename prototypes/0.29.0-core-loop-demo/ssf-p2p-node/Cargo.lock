@@ -4749,6 +4749,7 @@ dependencies = [
  "chia-sdk-signer",
  "chia-sdk-types",
  "chia-sdk-utils",
+ "clvm-traits 0.36.1",
  "clvmr",
  "hex",
  "iroh",
