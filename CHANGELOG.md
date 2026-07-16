@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.29.10 — 2026-07-16
+
+### IPv6 Self-Healing Mesh — Core (Direct Spoke-to-Spoke Groundwork)
+
+- **Groundwork so firewalled peers can link *directly* over IPv6, not only through the host relay.** v0.29.9 established that joiners are spokes that route through the host; this release lays the two pieces a true joiner-to-joiner IPv6 mesh needs. It is **node-behavior groundwork that wants the 3-machine test to validate** — the relay path from v0.29.9 is unchanged and still carries the room, so nothing regresses if the direct link doesn't form.
+- **(1) IPv6 port pin.** The iroh endpoint pinned only its IPv4 socket to the stable port; the IPv6 socket kept its default = a *random ephemeral port every launch*, so a `[v6]:44442` firewall allow-rule or an invite hint could never match v6 traffic. It now probes and pins `[::]:44442` too (degrading to a random port on conflict, exactly like the v4 pin; a v6 failure is never fatal — v4 + DHT still carry us). A member is now **stably dialable on IPv6**, which matters because IPv6 has no NAT — a fixed `[v6]:port` is directly reachable once the firewall is open.
+- **(2) Both-side mesh-upgrade dial.** The signed gossip mesh-upgrade previously elected a *single* dialer via a `smaller-node-id` rule (to avoid glare). But a stateful IPv6 firewall only opens for a flow the device itself starts, so a one-sided dial is dropped as unsolicited inbound and two firewalled spokes never connect. **Both** peers now dial: each sends an outbound probe to the DHT-resolved route, opening **both** pinholes; iroh dedups the resulting connection by node id and `hub.dialing` single-flights each side, so the double-dial is bounded, not a storm.
+- **Security unchanged (the reflection invariant holds).** The mesh-upgrade dial is still **node-id-only with empty address hints** — the sovereign Mainline DHT resolves the real route, so no relaying node can aim our QUIC handshake at a victim IP. Removing the smaller-id guard does not touch that: a peer's self-declared address is still never dialed.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` is the shipping copy (version bumped to 0.29.10 in place). **Node binary changed — every machine must install this build**, and for a direct IPv6 link both peers must allow inbound UDP 44442 on their IPv6 firewall (the node prints a reminder at startup). Without that, the v0.29.9 host relay remains the movement path.
+
 ## v0.29.9 — 2026-07-15
 
 ### Joiners See Each Other Move — the Tick-Relay Version-Skew Fix
