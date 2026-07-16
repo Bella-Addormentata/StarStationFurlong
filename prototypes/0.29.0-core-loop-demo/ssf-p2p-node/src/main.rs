@@ -1709,9 +1709,17 @@ fn handle_iroh_connection(
                 let (tick, ttl, origin_lane_id): (&[u8], u8, [u8; 8]) = if datagram.len() == 22 {
                     (&datagram[9..], datagram[0], datagram[1..9].try_into().unwrap())
                 } else if datagram.len() == 14 {
-                    (&datagram[1..], datagram[0], tick_lane_id(&[remote_id.as_bytes()]))
+                    // Legacy pre-M5.2 frame: byte[0] is an OLD 0/1 hop flag, NOT a
+                    // TTL. Reading it AS a ttl made a version-mismatched peer's ticks
+                    // parse as ttl 0/1 and get gated out of the relay below — so a
+                    // joiner on an older node was invisible to sibling joiners' MOVEMENT
+                    // (its chat still relayed, since ysync has no TTL). Grant a full
+                    // flood budget instead; the dedup cache still kills loops.
+                    (&datagram[1..], TICK_TTL_INIT, tick_lane_id(&[remote_id.as_bytes()]))
                 } else if datagram.len() == 13 {
-                    (&datagram[..], 0u8, tick_lane_id(&[remote_id.as_bytes()]))
+                    // Bare legacy tick, no TTL byte at all — same fix: full budget so a
+                    // version-skewed joiner still reaches the rest of the room.
+                    (&datagram[..], TICK_TTL_INIT, tick_lane_id(&[remote_id.as_bytes()]))
                 } else {
                     (&datagram[..0], 0u8, [0u8; 8])
                 };
@@ -1759,9 +1767,14 @@ fn handle_iroh_connection(
                         // decremented TTL to the bounded NEIGHBOR set (M5.3 in_mesh),
                         // except the peer we received it from. The dedup above (not the
                         // back-edge filter alone) is what kills 3rd-node return loops.
-                        if ttl > 1 {
+                        // Relay while any budget remains (was `ttl > 1`): the DEDUP
+                        // cache above — not the TTL — is what kills return loops (M5.2
+                        // note), so a ttl==1 frame should still get its single hop out
+                        // to the neighbor set instead of dying one node short. A
+                        // genuinely exhausted frame (ttl 0) still stops here.
+                        if ttl >= 1 {
                             let mut relayed = Vec::with_capacity(1 + 8 + tick.len());
-                            relayed.push(ttl - 1);
+                            relayed.push(ttl.saturating_sub(1));
                             relayed.extend_from_slice(&origin_lane_id);
                             relayed.extend_from_slice(tick);
                             for (peer_id, member) in room.remote_peers.iter().filter(|(_, m)| m.in_mesh) {
