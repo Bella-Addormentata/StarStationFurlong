@@ -704,6 +704,8 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // players entry) can sync in after entry, moving the current room into its
     // correct section (My Rooms / Friends' / Visited) instead of Unreached.
     renderPassesList();
+    // Slice 3b: sync the advanced-chia-mesh toggle to this room's flag.
+    refreshChiaModeToggle();
   };
 
   roomMap.observe((_event) => {
@@ -1896,6 +1898,24 @@ async function resolveBridgeBootstrap(imported: RoomBootstrap): Promise<RoomBoot
   };
 }
 
+// ChiaHub Slice 3b: reflect the CURRENT room's advanced-chia-mesh flag on the
+// management-computer toggle (network-details panel). Called on room changes and
+// panel setup. The flag is per-room in localStorage (`ssf-chia-mode-<roomId>`),
+// matching how NetworkProvider reads it at connect and the node stores it per-room.
+function refreshChiaModeToggle() {
+  const toggle = document.getElementById('chia-mode-toggle') as HTMLInputElement | null;
+  const state = document.getElementById('chia-mode-state');
+  if (!toggle) return;
+  const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+  let on = false;
+  if (roomId) {
+    try { on = localStorage.getItem(`ssf-chia-mode-${roomId}`) === '1'; } catch { /* privacy mode */ }
+  }
+  toggle.checked = on;
+  toggle.disabled = !roomId; // no room context yet -> nothing to toggle
+  if (state) state.textContent = on ? 'ON' : 'OFF';
+}
+
 function setupNetworkDetailsPanel() {
   if (networkPanelInitialized) return;
   networkPanelInitialized = true;
@@ -2004,6 +2024,30 @@ function setupNetworkDetailsPanel() {
       toggle.textContent = panel.classList.contains('collapsed') ? '▼' : '▲';
       toggle.setAttribute('aria-label', panel.classList.contains('collapsed') ? 'Expand network details' : 'Collapse network details');
     });
+  }
+
+  // ChiaHub Slice 3b: the "advanced Chia mesh mode" switch. Writes the per-room
+  // flag and re-sends the room cap so the node picks it up live (no reconnect).
+  const chiaToggle = document.getElementById('chia-mode-toggle') as HTMLInputElement | null;
+  if (chiaToggle) {
+    chiaToggle.addEventListener('change', () => {
+      const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+      const on = chiaToggle.checked;
+      const state = document.getElementById('chia-mode-state');
+      if (state) state.textContent = on ? 'ON' : 'OFF';
+      if (roomId) {
+        try { localStorage.setItem(`ssf-chia-mode-${roomId}`, on ? '1' : '0'); } catch { /* privacy mode */ }
+      }
+      // Apply live — re-send this room's cap to the local node with the new flag.
+      void networkProvider.resendRoomCap(on);
+      if (feedback) {
+        feedback.textContent = on
+          ? 'Advanced Chia mesh mode ON for this room (experimental — needs a chia-lane node + funded testnet wallet; otherwise a harmless no-op).'
+          : 'Advanced Chia mesh mode OFF for this room.';
+        setTimeout(() => { if (feedback) feedback.textContent = ''; }, 5000);
+      }
+    });
+    refreshChiaModeToggle();
   }
 
   // ?seed= deep-link import (unchanged bootstrap path — only the input it

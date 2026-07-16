@@ -111,7 +111,7 @@ export class NetworkProvider implements NetworkProviderPort {
       // toggle — sourced from localStorage until the management-computer UI sets it.
       if (boot.roomKeyB64) {
         let chiaMode = false;
-        try { chiaMode = localStorage.getItem('ssf-chia-mode') === '1'; } catch { /* privacy mode */ }
+        try { chiaMode = localStorage.getItem(`ssf-chia-mode-${boot.roomId}`) === '1'; } catch { /* privacy mode */ }
         void this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
       }
 
@@ -193,6 +193,16 @@ export class NetworkProvider implements NetworkProviderPort {
       writer.releaseLock();
     } catch (e) {
       console.warn('Failed to send room cap to node:', e);
+    }
+  }
+
+  /** Re-send the current room's cap with a new chia-mode flag, reusing the boot
+   *  this session connected with (so the room key matches exactly). Called by the
+   *  management-computer toggle so the change takes effect without a reconnect. */
+  async resendRoomCap(chiaMode: boolean): Promise<void> {
+    const boot = this.#boot;
+    if (boot?.roomKeyB64) {
+      await this.sendRoomCap(boot.roomId, boot.roomKeyB64, chiaMode);
     }
   }
 
