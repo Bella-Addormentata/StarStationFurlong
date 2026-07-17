@@ -14,6 +14,7 @@ import type { FurnitureItem } from './furniture';
 import { rebuildObstacles } from './obstacles';
 import { rebakeWalkableGrid } from './pathfinding';
 import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
+import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type DoorRecord } from './doorsDoc';
 import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
@@ -142,6 +143,12 @@ export class World {
     // morph) — furnitureDoc re-notifies on every room (re)bind, and reconcile
     // is a no-op until the platform exists (empty map / no groups yet).
     subscribeFurniture(() => this.reconcileFurniture(readAllFurniture()));
+
+    // Door-pairing sync (issue #64): reconcile docked-module pairings from the
+    // shared `doors` map whenever it changes. Subscribed ONCE here — doorsDoc
+    // re-notifies on every room (re)bind, and reconcile is a no-op until the
+    // docking system exists.
+    subscribeDoors(() => this.reconcileDoors(readAllDoors()));
 
     console.log('✅ World initialized - Station planet ready');
   }
@@ -570,6 +577,27 @@ export class World {
    * before writing the doc, so its record matches local state and the diff
    * finds nothing to do. Only genuinely-remote changes apply here.
    */
+  /**
+   * #64: reconcile docked-module door pairings from the shared `doors` map — a
+   * module someone docked to a door now shows (adjacent-room projection) and is
+   * enterable (transitReady) for everyone. A door present + paired in the doc is
+   * applied; a door absent (unpaired/removed) is torn down. Both apply-paths are
+   * idempotent + self-echo safe (the local docker already drew via completePairing,
+   * so applyRemotePairing early-returns), and never re-publish.
+   */
+  public reconcileDoors(records: Map<string, DoorRecord>): void {
+    if (!this.dockingSystem) return; // docking ports not built yet
+    const doors: Array<'north' | 'south' | 'east' | 'west'> = ['north', 'south', 'east', 'west'];
+    for (const doorId of doors) {
+      const rec = records.get(doorId);
+      if (rec && rec.paired && rec.connectedRoomAddress) {
+        this.dockingSystem.applyRemotePairing(doorId, rec.connectedRoomAddress);
+      } else {
+        this.dockingSystem.clearRemotePairing(doorId);
+      }
+    }
+  }
+
   public reconcileFurniture(records: Map<string, FurnitureRecord>): void {
     if (records.size === 0) return; // unseeded — keep local defaults
     if (this.furnitureGroups.size === 0) return; // platform not built yet
@@ -1754,6 +1782,20 @@ export class World {
     // Hook P2P sync routing events (Task: Room pairings over Yjs awareness)
     this.dockingSystem.onConnectionRequest((doorId, address) => {
       console.log(`[Docking Pipeline] Dispatching connection handshake: ${doorId} -> ${address}`);
+    });
+
+    // #64: publish a completed local pairing to the shared `doors` doc so every
+    // other user in the room reconciles it (sees the docked module + can enter).
+    // completePairing is the sole setter of pairedSuccessfully, so this is the
+    // single publish point; the reconcile path (applyRemotePairing) deliberately
+    // does NOT fire this callback, so applying a remote pairing never re-publishes.
+    this.dockingSystem.onPairingStatusChanged((doorId, status) => {
+      if (status === 'ACCEPTED') {
+        const addr = this.dockingSystem?.getDockingState(doorId as 'north' | 'south' | 'east' | 'west')?.connectedRoomAddress;
+        if (addr) writeDoorPairing(doorId, addr);
+      } else if (status === 'REJECTED') {
+        deleteDoorPairing(doorId);
+      }
     });
   }
 }
