@@ -68,6 +68,11 @@ import {
   loadRoomInventory, takeFromRoomInventory, ROOM_INVENTORY_EVENT,
 } from './roomInventory';
 import { OUTFITS } from './outfits';
+import {
+  partsCount, addParts, armedPreset, setArmedPreset, moduleLedger,
+  autoAcceptEnabled, setAutoAccept, northDoorUnlocked, setNorthDoorUnlocked,
+  subscribeStationParts, type PresetId,
+} from './stationParts';
 import { showHint } from './hud';
 import type { World } from './world';
 import type { Player } from './player';
@@ -598,6 +603,7 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('FURNITURE', 'synced to the room (E4)', furnitureRows)}
       ${sectionHtml('INVENTORY', 'removed furniture · local only', ['<div id="dev-inventory-rows"></div>'])}
       ${sectionHtml('MODULES', null, [moduleRow])}
+      ${sectionHtml('PARTS', 'station construction (#62)', ['<div id="dev-parts-rows"></div>'])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
     </div>
   `;
@@ -624,6 +630,38 @@ function buildPanel(): HTMLDivElement {
         break;
       case 'provision-module': void provisionModule(); break;
       case 'toggle-vestibule': void toggleVestibule(); break;
+      // ── #62 P4 PARTS actions ──
+      case 'add-flex': addParts('flex', 4); refreshPartsRows(); break;
+      case 'add-ext': addParts('ext', 2); refreshPartsRows(); break;
+      case 'arm-preset': {
+        const p = btn.dataset.preset as PresetId;
+        setArmedPreset(armedPreset() === p ? null : p); // toggle
+        refreshPartsRows();
+        showHint(armedPreset()
+          ? `DEV: ${armedPreset() === 'ring' ? 'RING LINK' : 'HUB SPOKE'} preset armed — opens prefilled in the door keypad.`
+          : 'DEV: preset disarmed.');
+        break;
+      }
+      case 'toggle-auto-accept': setAutoAccept(!autoAcceptEnabled()); refreshPartsRows(); break;
+      case 'toggle-north-door': {
+        setNorthDoorUnlocked(!northDoorUnlocked());
+        // Flip the live door flag too (doors.ts reads the store at build; a
+        // running session updates in place — fireplace overlap is cosmetic).
+        const north = DOORS.find((d) => d.id === 'north');
+        if (north) north.enabled = northDoorUnlocked();
+        refreshPartsRows();
+        showHint(northDoorUnlocked() ? 'DEV: NORTH door enabled (fireplace overlap is cosmetic).' : 'DEV: NORTH door disabled.');
+        break;
+      }
+      case 'copy-seed': {
+        const seed = btn.dataset.seed ?? '';
+        if (seed) {
+          void navigator.clipboard.writeText(seed)
+            .then(() => showHint('DEV: module seed copied.'))
+            .catch(() => showHint('DEV: clipboard unavailable — seed is in the ledger row title.'));
+        }
+        break;
+      }
     }
   });
 
@@ -661,10 +699,56 @@ function refreshInventoryRows(): void {
   `).join('');
 }
 
+/** #62 P4: rebuild the PARTS section rows (counts, presets, toggles, ledger). */
+function refreshPartsRows(): void {
+  const host = panel?.querySelector<HTMLElement>('#dev-parts-rows');
+  if (!host) return;
+  const preset = armedPreset();
+  const onOff = (on: boolean) => on ? 'ON' : 'OFF';
+  const ledger = moduleLedger();
+  const ledgerRows = ledger.length === 0
+    ? `<div style="font-size:9px; color:rgba(255,179,0,0.4); padding:2px 2px 0;">no minted modules yet — PROVISION adds them here</div>`
+    : ledger.map((e) => `
+        <div style="${ROW_STYLE}">
+          <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${e.seed.replace(/"/g, '&quot;')}">📦 ${e.roomId.toUpperCase()}</span>
+          <button type="button" data-dev-action="copy-seed" data-seed="${e.seed.replace(/"/g, '&quot;')}" style="${BTN_STYLE}">COPY</button>
+        </div>
+      `).join('');
+  host.innerHTML = `
+    <div style="${ROW_STYLE}">
+      <span>🪗 FLEX JOINT <span style="color:rgba(255,179,0,0.5);">× ${partsCount('flex')}</span></span>
+      <button type="button" data-dev-action="add-flex" style="${BTN_STYLE}">+4</button>
+    </div>
+    <div style="${ROW_STYLE}">
+      <span>🧵 EXTENSION <span style="color:rgba(255,179,0,0.5);">× ${partsCount('ext')}</span></span>
+      <button type="button" data-dev-action="add-ext" style="${BTN_STYLE}">+2</button>
+    </div>
+    <div style="${ROW_STYLE}">
+      <span>⭕ RING LINK <span style="color:rgba(255,179,0,0.4);">· flex+22.5 / ext×4 / flex+22.5</span></span>
+      <button type="button" data-dev-action="arm-preset" data-preset="ring" style="${BTN_STYLE}${preset === 'ring' ? 'background:rgba(0,230,118,0.18); color:#00e676; border-color:rgba(0,230,118,0.5);' : ''}">${preset === 'ring' ? 'ARMED' : 'ARM'}</button>
+    </div>
+    <div style="${ROW_STYLE}">
+      <span>➰ HUB SPOKE <span style="color:rgba(255,179,0,0.4);">· flex 0 / ext×11 / flex 0</span></span>
+      <button type="button" data-dev-action="arm-preset" data-preset="spoke" style="${BTN_STYLE}${preset === 'spoke' ? 'background:rgba(0,230,118,0.18); color:#00e676; border-color:rgba(0,230,118,0.5);' : ''}">${preset === 'spoke' ? 'ARMED' : 'ARM'}</button>
+    </div>
+    <div style="${ROW_STYLE}">
+      <span>🤝 AUTO-ACCEPT MY MODULES</span>
+      <button type="button" data-dev-action="toggle-auto-accept" style="${BTN_STYLE}">${onOff(autoAcceptEnabled())}</button>
+    </div>
+    <div style="${ROW_STYLE}">
+      <span>🚪 NORTH DOOR (FIREPLACE)</span>
+      <button type="button" data-dev-action="toggle-north-door" style="${BTN_STYLE}">${onOff(northDoorUnlocked())}</button>
+    </div>
+    <div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.55); letter-spacing:1px; margin-top:6px;">MODULE LEDGER</div>
+    ${ledgerRows}
+  `;
+}
+
 /** Rows whose state depends on the live environment (module handle, preview). */
 function refreshDynamicRows(): void {
   if (!panel) return;
   refreshInventoryRows();
+  refreshPartsRows();
   const moduleBtn = panel.querySelector<HTMLButtonElement>('#dev-module-btn');
   const moduleNote = panel.querySelector<HTMLElement>('#dev-module-note');
   if (moduleBtn && moduleNote) {
@@ -698,6 +782,16 @@ function setOpen(open: boolean): void {
  */
 export function initDevMenu(getWorldRef: GetWorld): void {
   getWorld = getWorldRef;
+
+  // #62 P4: keep the PARTS rows live while the panel is open (the ledger grows
+  // when provisioning from the docking pane; counts change as chips consume).
+  subscribeStationParts(() => { if (isOpen()) refreshPartsRows(); });
+
+  // North-door unlock survives reloads — re-assert the live flag at init.
+  if (northDoorUnlocked()) {
+    const north = DOORS.find((d) => d.id === 'north');
+    if (north) north.enabled = true;
+  }
 
   const btn = document.getElementById('dev-menu-btn');
   if (btn) {

@@ -14,6 +14,10 @@ import { findDoor } from './doors';
 import type { DoorId } from './doors';
 import { getCameraYaw } from './cameraRig';
 import { projectionPoseForDoor, type ConnectorSegment } from './adapter';
+import {
+  armedPreset, presetSegments, partsCount, consumePart, refundPart,
+  consumeForSegments, refundForSegments,
+} from './stationParts';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -77,6 +81,10 @@ export class DoorDockingPortSystem {
   // Handlers
   private onConnectionRequestCallback: ((doorId: string, address: string) => void) | null = null;
   private onPairingStatusChangedCallback: ((doorId: string, status: string) => void) | null = null;
+  /** #62 P4: main.ts answers "may this address pair without a far-side human?"
+   *  — true for modules THIS client minted (the ledger) when AUTO-ACCEPT MY
+   *  MODULES is on. Removes 12 hop-accept-hop round trips from the octagon. */
+  private autoAcceptCheckCallback: ((address: string) => boolean) | null = null;
   /**
    * "Buy a module" v0 (T1 of issue #30): mints a fresh room seed against the
    * LOCAL node. Wired by main.ts (callback pattern — docking.ts must not
@@ -343,6 +351,30 @@ export class DoorDockingPortSystem {
           <input type="text" id="docking-pin-input" placeholder="e.g. 1106" style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace;">
         </div>
 
+        <!-- #62 P4: CONNECTION ASSEMBLY — chain chips + far-side controls.
+             Parts come from the DEV PARTS inventory; the armed preset prefills
+             on pane open. The chain renders in-world as a ghost while unpaired
+             and publishes with the pairing record (P2/P3 machinery). -->
+        <div id="docking-assembly" style="border-top:1px solid rgba(212,168,75,0.14); padding-top:10px;">
+          <label style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">CONNECTION ASSEMBLY <span id="docking-parts-note" style="color:rgba(212,168,75,0.38); font-size:9px;"></span></label>
+          <div id="docking-chips" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px; min-height:20px;"></div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+            <button id="docking-add-flex" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">+FLEX</button>
+            <button id="docking-add-ext" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">+EXT</button>
+            <button id="docking-clear-chain" style="background:rgba(255,23,68,0.08); border:1px solid rgba(255,23,68,0.3); border-radius:5px; color:#ff8a80; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">CLEAR</button>
+            <span style="flex:1;"></span>
+            <span style="font-size:9px; color:rgba(212,168,75,0.55);">FAR:</span>
+            <select id="docking-far-door" style="background:rgba(0,0,0,0.3); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#d4a84b; font-size:9px; padding:2px 4px;">
+              <option value="">auto</option>
+              <option value="north">north</option>
+              <option value="south">south</option>
+              <option value="east">east</option>
+              <option value="west">west</option>
+            </select>
+            <button id="docking-far-yaw" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">YAW —</button>
+          </div>
+        </div>
+
         <!-- Connection address -->
         <div>
           <label style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">TARGET CONNECTED ROOM ADDRESS:</label>
@@ -455,6 +487,12 @@ export class DoorDockingPortSystem {
           if (this.onConnectionRequestCallback) {
             this.onConnectionRequestCallback(activeDoorId, state.connectedRoomAddress);
           }
+          // #62 P4: modules this client minted pair instantly when auto-accept
+          // is on — no far-side human exists for a freshly provisioned room.
+          if (this.autoAcceptCheckCallback?.(state.connectedRoomAddress)) {
+            this.completePairing(activeDoorId, true);
+            console.log(`🤝 Auto-accepted pairing on ${activeDoorId} (own minted module).`);
+          }
           if (box) box.style.display = 'none';
         }
       });
@@ -479,6 +517,136 @@ export class DoorDockingPortSystem {
         this.completePairing(activeDoorId, false);
         if (box) box.style.display = 'none';
       });
+    }
+
+    // ── #62 P4: CONNECTION ASSEMBLY wiring ──────────────────────────────────
+    const activeDoor = (): ('north' | 'south' | 'east' | 'west') | null => {
+      const pane = document.getElementById('docking-control-pane');
+      return pane ? ((pane as any).activeDoorId ?? null) : null;
+    };
+
+    document.getElementById('docking-add-flex')?.addEventListener('click', () => {
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      if (!doorId || !state) return;
+      if (!consumePart('flex')) { this.renderAssemblyStrip(doorId, 'no FLEX parts — DEV menu › PARTS'); return; }
+      state.segments = [...(state.segments ?? []), { kind: 'flex', bendDeg: 0, stretch: 0 }];
+      this.renderAssemblyStrip(doorId);
+      this.publishIfPaired(doorId);
+    });
+
+    document.getElementById('docking-add-ext')?.addEventListener('click', () => {
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      if (!doorId || !state) return;
+      if (!consumePart('ext')) { this.renderAssemblyStrip(doorId, 'no EXTENSION parts — DEV menu › PARTS'); return; }
+      state.segments = [...(state.segments ?? []), { kind: 'ext', bays: 4, skin: 'solid' }];
+      this.renderAssemblyStrip(doorId);
+      this.publishIfPaired(doorId);
+    });
+
+    document.getElementById('docking-clear-chain')?.addEventListener('click', () => {
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      if (!doorId || !state) return;
+      if (state.segments?.length) refundForSegments(state.segments);
+      state.segments = undefined;
+      this.renderAssemblyStrip(doorId);
+      this.publishIfPaired(doorId);
+    });
+
+    // Chip interactions (delegated): cycle the main parameter, toggle skin,
+    // or remove (with refund).
+    document.getElementById('docking-chips')?.addEventListener('click', (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-chip-action]');
+      if (!el) return;
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      const i = Number(el.dataset.i);
+      if (!doorId || !state || !state.segments || !Number.isInteger(i) || !state.segments[i]) return;
+      const seg = { ...state.segments[i] };
+      const action = el.dataset.chipAction;
+      if (action === 'remove') {
+        refundPart(seg.kind === 'flex' ? 'flex' : 'ext');
+        state.segments = state.segments.filter((_, k) => k !== i);
+        if (state.segments.length === 0) state.segments = undefined;
+      } else if (action === 'cycle') {
+        if (seg.kind === 'flex') {
+          const bends = [-45, -22.5, 0, 22.5, 45];
+          const at = bends.indexOf(seg.bendDeg ?? 0);
+          seg.bendDeg = bends[(at + 1 + bends.length) % bends.length];
+        } else {
+          const bays = [2, 4, 6, 8, 11];
+          const at = bays.indexOf(seg.bays ?? 4);
+          seg.bays = bays[(at + 1 + bays.length) % bays.length];
+        }
+        state.segments = state.segments.map((s, k) => (k === i ? seg : s));
+      } else if (action === 'skin' && seg.kind === 'ext') {
+        seg.skin = seg.skin === 'solid' ? 'ribbed' : 'solid';
+        state.segments = state.segments.map((s, k) => (k === i ? seg : s));
+      }
+      this.renderAssemblyStrip(doorId);
+      this.publishIfPaired(doorId);
+    });
+
+    (document.getElementById('docking-far-door') as HTMLSelectElement | null)?.addEventListener('change', (e) => {
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      if (!doorId || !state) return;
+      const v = (e.target as HTMLSelectElement).value;
+      state.farDoor = v === 'north' || v === 'south' || v === 'east' || v === 'west' ? v : undefined;
+      this.publishIfPaired(doorId);
+    });
+
+    document.getElementById('docking-far-yaw')?.addEventListener('click', () => {
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      if (!doorId || !state) return;
+      // Cycle — → 0 → 45 → —
+      state.farYawDeg = state.farYawDeg === undefined ? 0 : state.farYawDeg === 0 ? 45 : undefined;
+      this.renderAssemblyStrip(doorId);
+      this.publishIfPaired(doorId);
+    });
+  }
+
+  /** #62 P4: paint the assembly strip from the door's working chain. */
+  private renderAssemblyStrip(doorId: 'north' | 'south' | 'east' | 'west', note?: string): void {
+    const state = this.doorState.get(doorId);
+    const chips = document.getElementById('docking-chips');
+    const partsNote = document.getElementById('docking-parts-note');
+    const farSel = document.getElementById('docking-far-door') as HTMLSelectElement | null;
+    const yawBtn = document.getElementById('docking-far-yaw');
+    if (!state || !chips) return;
+    const segs = state.segments ?? [];
+    chips.innerHTML = segs.length === 0
+      ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway</span>`
+      : segs.map((s, i) => {
+          const label = s.kind === 'flex'
+            ? `FLEX ${(s.bendDeg ?? 0) > 0 ? '+' : ''}${s.bendDeg ?? 0}°`
+            : `EXT ×${s.bays ?? 4}`;
+          const skinBtn = s.kind === 'ext'
+            ? `<button type="button" data-chip-action="skin" data-i="${i}" title="Toggle skin" style="background:none; border:none; color:rgba(212,168,75,0.7); font-size:8px; cursor:pointer; padding:0 2px;">${s.skin === 'solid' ? 'SOLID' : 'RIBBED'}</button>`
+            : '';
+          return `
+            <span style="display:inline-flex; align-items:center; gap:4px; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:10px; padding:2px 8px; font-size:9px; font-weight:700;">
+              <button type="button" data-chip-action="cycle" data-i="${i}" title="Click to cycle ${s.kind === 'flex' ? 'bend' : 'length'}" style="background:none; border:none; color:#f0c060; font-size:9px; font-weight:700; cursor:pointer; padding:0;">${label}</button>
+              ${skinBtn}
+              <button type="button" data-chip-action="remove" data-i="${i}" title="Remove (refunds the part)" style="background:none; border:none; color:#ff8a80; font-size:9px; cursor:pointer; padding:0 1px;">✕</button>
+            </span>`;
+        }).join('');
+    if (partsNote) {
+      partsNote.textContent = note ?? `· stock F×${partsCount('flex')} E×${partsCount('ext')}`;
+    }
+    if (farSel) farSel.value = state.farDoor ?? '';
+    if (yawBtn) yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? '—' : state.farYawDeg}`;
+  }
+
+  /** #62 P4: a post-pairing chain edit re-fires the ACCEPTED publish so the
+   *  record rewrites and every client's geometry diff picks it up. */
+  private publishIfPaired(doorId: 'north' | 'south' | 'east' | 'west'): void {
+    const state = this.doorState.get(doorId);
+    if (state?.pairedSuccessfully && this.onPairingStatusChangedCallback) {
+      this.onPairingStatusChangedCallback(doorId, 'ACCEPTED');
     }
   }
 
@@ -517,6 +685,22 @@ export class DoorDockingPortSystem {
     } else {
       noticeBox.style.display = 'none';
     }
+
+    // #62 P4: armed-preset prefill — an unpaired door with no working chain
+    // opens with the DEV-armed preset's chips already placed (parts consumed
+    // atomically; silently skipped when stock is short). RING targets a
+    // diamond ring room, so it defaults FAR yaw to 45.
+    if (!state.pairedSuccessfully && (!state.segments || state.segments.length === 0)) {
+      const preset = armedPreset();
+      if (preset) {
+        const segs = presetSegments(preset);
+        if (consumeForSegments(segs)) {
+          state.segments = segs;
+          if (preset === 'ring' && state.farYawDeg === undefined) state.farYawDeg = 45;
+        }
+      }
+    }
+    this.renderAssemblyStrip(doorId);
   }
 
   /**
@@ -855,6 +1039,11 @@ export class DoorDockingPortSystem {
 
   public onPairingStatusChanged(cb: (doorId: string, status: string) => void) {
     this.onPairingStatusChangedCallback = cb;
+  }
+
+  /** #62 P4: wire the auto-accept decider (see field docs). */
+  public onAutoAcceptCheck(cb: (address: string) => boolean) {
+    this.autoAcceptCheckCallback = cb;
   }
 
   /** Wire the PROVISION NEW MODULE minting callback (see field docs). */

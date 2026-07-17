@@ -1531,9 +1531,13 @@ export class World {
     for (const door of DOORS) {
       const state = ds.getDockingState(door.id);
       const paired = state?.pairedSuccessfully === true;
+      // #62 P4: an UNPAIRED door with an assembled chain renders it as a GHOST
+      // (fixed light translucency) so the builder sees the connection curve
+      // before pairing — the plan's live-preview affordance.
+      const ghost = !paired && (state?.segments?.length ?? 0) > 0;
       let vestibule = this.pairedVestibules.get(door.id);
 
-      if (!paired) {
+      if (!paired && !ghost) {
         // Defer disposal while EITHER a transit or a plain walk-through is on
         // this door — mid-PEEK the avatar physically stands in the gangway,
         // and an unpair must not pop the tube out around them (review L1;
@@ -1568,7 +1572,9 @@ export class World {
       if (!vestibule.visible) continue;
 
       let target: number;
-      if (this.transitVestibuleDoorId === door.id || activeDoorId === door.id) {
+      if (ghost) {
+        target = 0.35; // #62 P4: armed-but-unpaired chain — fixed ghost preview
+      } else if (this.transitVestibuleDoorId === door.id || activeDoorId === door.id) {
         target = 1.0; // transit / walk-through in progress — fully material
       } else {
         const dist = Math.hypot(playerPos.x - door.front.x, playerPos.z - door.front.z);
@@ -1614,9 +1620,10 @@ export class World {
    * (vestibule back to 'idle' — it persists while its door stays paired,
    * #51) and script the walk-in through the arrival door.
    */
-  public completeAdapterArrival(departureDoorId: DoorId): void {
+  public completeAdapterArrival(departureDoorId: DoorId, farDoor?: DoorId): void {
     this.endTransitVestibule();
-    const arrival = this.resolveArrivalDoor(departureDoorId);
+    // #62 P4: an assembled connection's record names the exact arrival door.
+    const arrival = this.resolveArrivalDoor(departureDoorId, farDoor);
     this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
   }
 

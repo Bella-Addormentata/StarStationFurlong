@@ -24,7 +24,8 @@ import {
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
-import { bindDoorsDoc } from './doorsDoc';
+import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
+import { addToLedger, ledgerHasRoom, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
@@ -1139,11 +1140,43 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
  * door machine falls through to the peek round-trip — review fix F4).
  */
 async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
+  // #62 P4: capture the departure connection BEFORE the swap tears the room
+  // down — the arrival choreography wants the record's farDoor, and the lazy
+  // mirror write needs the chain + the departure room's own address.
+  const depState = world.dockingSystem?.getDockingState(departureDoorId);
+  const depGeometry = depState?.segments?.length
+    ? { segments: depState.segments, farDoor: depState.farDoor, farYawDeg: depState.farYawDeg }
+    : null;
+  const depRoomId = activeBootstrap?.roomId ?? null;
+  const depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+
   const result = await performRoomSwap(seedString, {
-    arrive: () => world.completeAdapterArrival(departureDoorId),
+    arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
-  if (result instanceof Error) showHint('Dock seal failed.');
+  if (result instanceof Error) {
+    showHint('Dock seal failed.');
+    return;
+  }
+
+  // #62 P4: LAZY MIRROR — the first entry through an assembled connection
+  // writes the ARRIVAL room's half of the record into its (now-bound) doors
+  // doc: reversed segments (flex bends negated — an arc traversed backwards
+  // reverses its heading change), farDoor pointing back at the departure
+  // door. The link then renders + transits from BOTH sides for everyone.
+  // Never clobbers an existing pairing on the arrival door.
+  if (depGeometry && depAddress) {
+    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry.farDoor).id;
+    const existing = readAllDoors().get(arrivalDoorId);
+    if (!existing?.paired) {
+      writeDoorPairing(arrivalDoorId, depAddress, {
+        segments: mirrorSegments(depGeometry.segments),
+        farDoor: departureDoorId,
+        farYawDeg: depGeometry.farYawDeg,
+      });
+      console.log(`🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`);
+    }
+  }
 }
 
 /**
@@ -1186,9 +1219,26 @@ function wireAdapterTransit(): void {
     const minted = await mintBootstrapLink(undefined, roomId);
     if (!minted.link) return null;
     mintedRoomIds.add(roomId);
+    // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
+    // than a clipboard that holds one) and powers auto-accept.
+    addToLedger(roomId, minted.link);
     return minted.link;
   };
   world.dockingSystem?.onProvisionModule(provisionModuleSeed);
+  // #62 P4: auto-accept decider — a pairing may complete without a far-side
+  // human only for rooms THIS client minted (the ledger / this session's
+  // mints) or its own current room, and only while the DEV toggle is on.
+  world.dockingSystem?.onAutoAcceptCheck((address) => {
+    if (!autoAcceptEnabled()) return false;
+    try {
+      const boot = decodeBootstrapInput(address);
+      const rid = boot?.roomId;
+      if (!rid) return false;
+      return ledgerHasRoom(rid) || mintedRoomIds.has(rid) || rid === activeBootstrap?.roomId;
+    } catch {
+      return false;
+    }
+  });
   // DEV1 dev-menu hook: the MODULES row self-enables when this handle exists.
   (window as any).__ssfProvisionModule = provisionModuleSeed;
 }
