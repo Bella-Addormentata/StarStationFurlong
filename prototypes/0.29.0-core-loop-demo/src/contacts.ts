@@ -19,7 +19,7 @@
  * shared truth. No server, no directory, no third-party infra.
  */
 
-import { getIdentityPub, signIdentity, verifyIdentity, fingerprintOf } from './keypair';
+import { getIdentityPub, signIdentity, verifyIdentity, verifyNameCert, fingerprintOf } from './keypair';
 
 export interface ContactCard {
   v: 1;
@@ -223,6 +223,42 @@ export function addContactFromCard(input: string): { ok: true; pub: string; name
   persist();
   notify();
   return { ok: true, pub: card.pub, name: card.name, isSelf: false };
+}
+
+/**
+ * Add (or refresh) a contact from a ROOM ROSTER entry — a players-map row that
+ * carries the subject's identity key + name↔key self-cert (keyed-identity
+ * Slice 1, the CLONES SEEN list). The name↔key binding is verified here to the
+ * SAME standard as a card import (verifyNameCert). What a roster entry
+ * legitimately lacks is reachability hints and the card-consent signature —
+ * both arrive if they later share a real card or the mesh introduces them.
+ * Never DOWNGRADES a card-imported contact: hints/cardSig/discoverable are
+ * left untouched on refresh; only the (re-verified) name and the friend flag
+ * can change.
+ */
+export function addContactFromRoomEntry(
+  pub: string,
+  name: string,
+  keySig: string,
+  opts?: { friend?: boolean },
+): { ok: true; pub: string } | { ok: false; error: string } {
+  if (typeof pub !== 'string' || !pub || typeof name !== 'string' || !name || typeof keySig !== 'string' || !keySig) {
+    return { ok: false, error: 'Roster entry is missing identity fields.' };
+  }
+  if (pub === getIdentityPub()) return { ok: false, error: 'That is you.' };
+  if (!verifyNameCert(name, pub, keySig)) {
+    return { ok: false, error: 'Name↔key certificate failed verification.' };
+  }
+  const existing = contacts.find((c) => c.pub === pub);
+  if (existing) {
+    existing.name = name; // verified refresh
+    if (opts?.friend) existing.friend = true;
+  } else {
+    contacts.push({ pub, name, friend: !!opts?.friend, addedAt: Date.now() });
+  }
+  persist();
+  notify();
+  return { ok: true, pub };
 }
 
 /** Add/remove a contact from the FRIENDS tier (curated). v1 is one-sided (a

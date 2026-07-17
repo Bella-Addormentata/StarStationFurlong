@@ -32,8 +32,8 @@ import {
 } from './roomPasses';
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
-  encodeMyCard, addContactFromCard, setFriend, removeContact, getContact,
-  isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
+  encodeMyCard, addContactFromCard, addContactFromRoomEntry, setFriend, removeContact,
+  getContact, isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
 } from './contacts';
 import {
   makeIntroductions, ingestIntroduction, type Introduction,
@@ -672,6 +672,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     initPeerStore({ selfPub: () => getIdentityPub() });
     harvestContactsIntoMesh();
     subscribeContacts(harvestContactsIntoMesh);
+    // Friend-from-roster: contact changes swap the CLONES SEEN row button for
+    // the ★ FRIEND badge (and vice versa on removal) without a doc change.
+    subscribeContacts(() => renderPhonePlayersList());
   }
   setActivePassRoom(boot.roomId);
 
@@ -1311,6 +1314,46 @@ function renderPhonePlayersList(): void {
       : '--:--';
     li.appendChild(nameSpan);
     li.appendChild(sinceSpan);
+
+    // 👥 Friend-from-roster: a keyed entry (identity pub + name↔key self-cert)
+    // unlocks one-tap friending straight from CLONES SEEN — verified on click by
+    // addContactFromRoomEntry to the same standard as a card import. Legacy
+    // keyless entries get no button (nothing verifiable to add). The contacts
+    // subscriber re-renders this list, so a successful add swaps the button for
+    // the ★ FRIEND badge (and the room list recategorizes into Friends' Rooms).
+    if (id !== myId && typeof entry.keyB64 === 'string' && entry.keyB64 && typeof entry.keySig === 'string' && entry.keySig) {
+      const pub = entry.keyB64;
+      const keySig = entry.keySig;
+      const entryName = entry.name || 'Unknown-Clone';
+      const existing = getContact(pub);
+      if (existing?.friend) {
+        const badge = document.createElement('span');
+        badge.className = 'phone-players-friend-badge';
+        badge.textContent = '★ FRIEND';
+        badge.title = `Friend · key ${contactFingerprint(pub)}`;
+        li.appendChild(badge);
+      } else {
+        const btn = document.createElement('button');
+        btn.className = 'phone-players-friend-btn';
+        btn.textContent = existing ? '★ BEFRIEND' : '+ FRIEND';
+        btn.title = existing
+          ? `Promote this contact to a friend · key ${contactFingerprint(pub)}`
+          : `Add to Contacts as a friend · key ${contactFingerprint(pub)}`;
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const res = addContactFromRoomEntry(pub, entryName, keySig, { friend: true });
+          if (res.ok) {
+            logToPhoneSystem(`⭐ ${entryName} added to your friends (key ${contactFingerprint(pub)}).`);
+            // contacts notify() re-renders this list → badge replaces button.
+          } else {
+            btn.textContent = '✗ UNVERIFIED';
+            btn.disabled = true;
+            btn.title = res.error;
+          }
+        });
+        li.appendChild(btn);
+      }
+    }
     listEl.appendChild(li);
   }
 }
