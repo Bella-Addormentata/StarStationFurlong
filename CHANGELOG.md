@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.4 — 2026-07-17
+
+### Rooms Survive Closed Browsers + Instant Rejoins (durability Tiers A & C2)
+
+- **A room no longer dies the moment its browsers close.** Root cause found and fixed: the node held every room's doc but **never answered a relayed sync request** — only browser-local requests got answers; relayed ones were silently dropped in a blind decode (which could also panic on malformed frames — also fixed). Now any room a local browser participated in is *served*: after the browser closes, the still-running node answers visitors' sync requests from its own copy, point-to-point. **"Owner left the game open-but-minimized, or closed the window but not the machine" rooms now load for visitors.** Rooms a node only relayed for are unchanged.
+- **Rejoins paint instantly from a local snapshot cache.** The browser now caches each room's doc in IndexedDB (full CRDT snapshots): rejoining a room restores the cached state *before* the network sync, so the room appears immediately and the host ships only the missing delta. Your own room's cached owner also closes the long-documented rename-revert-on-reload race. Stale-cache freshness is guarded: after a cache restore the bounded resync window always runs. Chat is now capped at 200 messages in the shared doc (bounds doc, cache, and sync at the source). The cache never evicts rooms you own; corrupt entries self-discard; private-mode browsers degrade to exactly the old behavior.
+- **Also from v0.30.3 (installing this skips it):** the ChiaHub heartbeat — armed rooms (chia-lane node + `SSF_CHIA_LANE=1` + Chia Mesh toggle ON + funded wallet) publish presence under their real room key every ~30 min. **Use THIS release's `ssf-p2p-node-chia.exe` for the chia test.**
+- **New multi-machine test this enables:** enter a room from machine A, close the game *window* on A (leave the machine on — note the installed app kills its node on exit only if the whole app closes; minimizing keeps it alive), then cold-join from machine B: the room should load with full state instead of an empty Lobby. Verified in dev: cache write→restore round-trip live in-browser; the two-node serve path is the runtime test.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.4 in place). Frontend + node both changed — install on every machine.
+
 ## v0.30.3 — 2026-07-17
 
 ### ChiaHub Heartbeat — Armed Rooms Now Actually Publish (node-only)
