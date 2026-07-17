@@ -1,6 +1,6 @@
 [package]
 name = "ssf-p2p-node"
-version = "0.29.10"
+version = "0.30.0"
 edition = "2021"
 publish = false
 description = "Sovereign P2P Swarm Node & WebTransport Router (Phase 2 P2P Backbone)"
@@ -27,3 +27,49 @@ rand = "0.8"
 # ChiaHub lane (REVIEW-20260710-ChiaHub.md): room-key-sealed presence records.
 # Pure-Rust AEAD — no linker-surface risk. Chain IO deps land in C1 after B-7.
 chacha20poly1305 = "0.10"
+
+# Chia chain IO (C1) — OPTIONAL, behind the `chia-lane` feature so the default
+# release binary never pulls the heavy BLS12-381 + clvm stack. Build/develop the
+# lane with `cargo build --features chia-lane`; ship without it until it's ready.
+#
+# We depend on the specific chia-sdk SUB-CRATES, NOT the umbrella `chia-wallet-sdk`.
+# The umbrella pulls chia-sdk-test (peer simulator), chia-sdk-daemon, chia-sdk-client,
+# and the `rue` CLVM compiler as NON-optional deps; that extra symbol mass overflows
+# the Windows-GNU DLL export-ordinal limit at link time (the same iroh-relay cdylib
+# limit the iroh dep comment above already fights). Sub-crates only = far fewer
+# exported symbols. Slice 2 (wallet key + address) needs just these four; the
+# driver/types/signer/coinset crates get added as the publish/resolve slices land.
+#
+# WINDOWS-GNU LINK NOTE: even the slim set tips the node's total DLL-export count
+# over the 16-bit ordinal ceiling, because `iroh-relay` is force-built as an
+# (unused) cdylib and MinGW ld auto-exports every symbol. Build the chia-lane
+# feature with the flag that suppresses those unused cdylib exports:
+#   RUSTFLAGS="-C link-arg=-Wl,--exclude-all-symbols" cargo build --features chia-lane
+# The node is a bin (exports nothing) and nothing links iroh-relay's cdylib, so
+# the flag is safe. The DEFAULT (no-chia) release build does NOT need it and is
+# left untouched.
+chia-bls = { version = "0.36", optional = true, features = ["serde"] }
+chia-protocol = { version = "0.36", optional = true, features = ["serde"] }
+chia-puzzle-types = { version = "0.36", optional = true }
+chia-sdk-utils = { version = "0.34", optional = true }
+# Slice 4 (publish) + Slice 5 (resolve): spend construction, signing, coinset RPC.
+# chia-sdk-coinset needs a TLS backend for testnet11 HTTPS (off by default) — enable rustls.
+chia-sdk-driver = { version = "0.34", optional = true }
+chia-sdk-types = { version = "0.34", optional = true }
+chia-sdk-signer = { version = "0.34", optional = true }
+chia-sdk-coinset = { version = "0.34", optional = true, features = ["rustls"] }
+# Allocator for the signer's RequiredSignature::from_coin_spends (already in the
+# graph transitively; direct dep just makes clvmr::Allocator nameable).
+clvmr = { version = "0.16", optional = true }
+# Slice 5 (resolve): ToClvm/FromClvm traits to run the parent spend and decode the
+# create_coin memos back out (already transitive; direct dep makes them nameable).
+clvm-traits = { version = "0.36", optional = true }
+
+[features]
+# Off by default. Turns on the Chia introduction-lane chain IO (wallet address,
+# spend-to-self publish, lookup-by-hint resolve). Runtime still gated by SSF_CHIA_LANE=1.
+chia-lane = [
+    "dep:chia-bls", "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-utils",
+    "dep:chia-sdk-driver", "dep:chia-sdk-types", "dep:chia-sdk-signer", "dep:chia-sdk-coinset",
+    "dep:clvmr", "dep:clvm-traits",
+]

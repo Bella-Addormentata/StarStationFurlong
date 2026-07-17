@@ -131,6 +131,13 @@
           <span class="label">Bridge</span>
           <span class="value" id="network-bridge-status">--</span>
         </div>
+        <div class="network-row" id="chia-mode-row" title="Advanced Chia mesh mode (experimental). When ON, this room can find a lost peer through the sovereign Chia chain after every live route fails. Needs a chia-lane node build + a funded testnet wallet; otherwise it is a harmless no-op.">
+          <span class="label">Chia Mesh <span style="opacity:0.5; font-size:9px; letter-spacing:0.5px;">ADV</span></span>
+          <label style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; margin:0;">
+            <input type="checkbox" id="chia-mode-toggle" style="cursor:pointer; accent-color:#00e676; margin:0;">
+            <span class="value" id="chia-mode-state" style="min-width:26px;">OFF</span>
+          </label>
+        </div>
 
         <div class="network-link-tools">
           <!-- #52: the invite mint (Copy Invite) and accept (Use Link) rows

@@ -222,30 +222,49 @@ jobs:
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
 
-      - name: 🛰️ Build sovereign P2P node (release)
+      - name: 🛰️ Build sovereign P2P node (release — default + chia-lane)
         shell: bash
-        run: cargo build --release --manifest-path "$RELEASE_FRONTEND/ssf-p2p-node/Cargo.toml"
+        run: |
+          NODE="$RELEASE_FRONTEND/ssf-p2p-node"
+          # Default node — the one bundled in installers and the standalone asset.
+          cargo build --release --manifest-path "$NODE/Cargo.toml"
+          cp "$NODE/target/release/ssf-p2p-node.exe" ssf-p2p-node.exe
+          # Experimental ChiaHub introduction lane (opt-in test build). CI is MSVC,
+          # so the Windows-GNU iroh-relay cdylib export-ordinal wall does NOT apply
+          # here and no special linker flag is needed (that flag is a local-GNU-only
+          # workaround). Overwrites target/release/ssf-p2p-node.exe, so the default
+          # copy above must already be staged.
+          cargo build --release --features chia-lane --manifest-path "$NODE/Cargo.toml"
+          cp "$NODE/target/release/ssf-p2p-node.exe" ssf-p2p-node-chia.exe
+          ls -la ssf-p2p-node*.exe
 
-      - name: ⬆️ Upload node binary to the shared draft release
+      - name: ⬆️ Upload node binaries to the shared draft release
         uses: actions/github-script@v7
-        env:
-          NODE_EXE: ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/target/release/ssf-p2p-node.exe
         with:
           script: |
             const fs = require('fs');
-            const data = fs.readFileSync(process.env.NODE_EXE);
-            await github.rest.repos.uploadReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: Number('${{ needs.create-release.outputs.release_id }}'),
-              name: 'ssf-p2p-node.exe', // exact name the app's exe-adjacent spawn probe looks for
-              data,
-              headers: {
-                'content-type': 'application/octet-stream',
-                'content-length': data.length,
-              },
-            });
-            core.info(`Uploaded ssf-p2p-node.exe (${data.length} bytes)`);
+            const release_id = Number('${{ needs.create-release.outputs.release_id }}');
+            // Default keeps the exact name the app's exe-adjacent spawn probe looks
+            // for; the chia-lane build ships as a SEPARATE opt-in asset testers swap in.
+            const assets = [
+              { file: 'ssf-p2p-node.exe', name: 'ssf-p2p-node.exe' },
+              { file: 'ssf-p2p-node-chia.exe', name: 'ssf-p2p-node-chia.exe' },
+            ];
+            for (const a of assets) {
+              const data = fs.readFileSync(a.file);
+              await github.rest.repos.uploadReleaseAsset({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id,
+                name: a.name,
+                data,
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': data.length,
+                },
+              });
+              core.info(`Uploaded ${a.name} (${data.length} bytes)`);
+            }
 
   # ── Stage 3: publish the draft ONLY when every artifact is attached ──────
   # This repository has IMMUTABLE releases: publishing freezes the asset list
