@@ -18,7 +18,7 @@ import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type
 import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
-import { buildVestibule, setVestibuleLightState, setVestibuleOpacity } from './adapter';
+import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
 import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
@@ -591,7 +591,13 @@ export class World {
     for (const doorId of doors) {
       const rec = records.get(doorId);
       if (rec && rec.paired && rec.connectedRoomAddress) {
-        this.dockingSystem.applyRemotePairing(doorId, rec.connectedRoomAddress);
+        // #62 P2: geometry (sanitized by readAllDoors) rides along; the diff
+        // inside applyRemotePairing catches chain edits on a same-address record.
+        this.dockingSystem.applyRemotePairing(doorId, rec.connectedRoomAddress, {
+          segments: rec.segments,
+          farDoor: rec.farDoor,
+          farYawDeg: rec.farYawDeg,
+        });
       } else {
         this.dockingSystem.clearRemotePairing(doorId);
       }
@@ -1442,11 +1448,23 @@ export class World {
    * exist for well under a second behind the full-screen fade, so that
    * polish is deliberately skipped.
    */
+  /** #62 P3: build the door's connector from its pairing RECORD — an
+   *  assembled chain when segments exist, the legacy straight gangway
+   *  otherwise. The geometry key on userData drives rebuild-on-diff. */
+  private buildDoorConnector(doorId: DoorId): THREE.Group {
+    const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
+    const group = segments && segments.length > 0
+      ? buildConnectorChain(doorId, segments)
+      : buildVestibule(doorId);
+    group.userData.segmentsKey = JSON.stringify(segments ?? null);
+    return group;
+  }
+
   private spawnTransitVestibule(doorId: DoorId): void {
     this.endTransitVestibule();
     let vestibule = this.pairedVestibules.get(doorId);
     if (!vestibule) {
-      vestibule = buildVestibule(doorId);
+      vestibule = this.buildDoorConnector(doorId);
       this.platformGroup.add(vestibule);
       this.pairedVestibules.set(doorId, vestibule);
     }
@@ -1511,10 +1529,15 @@ export class World {
     const activeDoorId = this.player.getActiveDoorId();
 
     for (const door of DOORS) {
-      const paired = ds.getDockingState(door.id)?.pairedSuccessfully === true;
+      const state = ds.getDockingState(door.id);
+      const paired = state?.pairedSuccessfully === true;
+      // #62 P4: an UNPAIRED door with an assembled chain renders it as a GHOST
+      // (fixed light translucency) so the builder sees the connection curve
+      // before pairing — the plan's live-preview affordance.
+      const ghost = !paired && (state?.segments?.length ?? 0) > 0;
       let vestibule = this.pairedVestibules.get(door.id);
 
-      if (!paired) {
+      if (!paired && !ghost) {
         // Defer disposal while EITHER a transit or a plain walk-through is on
         // this door — mid-PEEK the avatar physically stands in the gangway,
         // and an unpair must not pop the tube out around them (review L1;
@@ -1525,8 +1548,21 @@ export class World {
         continue;
       }
 
+      // #62 P3 rebuild-on-diff: a chain edit changes the record's segments;
+      // rebuild this door's connector to match — but never mid-transit or
+      // mid-walk-through (same deferral rule as unpair; the next frame after
+      // the door sequence ends picks the rebuild up).
+      const wantKey = JSON.stringify(state?.segments ?? null);
+      if (
+        vestibule && vestibule.userData.segmentsKey !== wantKey &&
+        this.transitVestibuleDoorId !== door.id && activeDoorId !== door.id
+      ) {
+        this.disposeVestibule(door.id);
+        vestibule = undefined;
+      }
+
       if (!vestibule) {
-        vestibule = buildVestibule(door.id);
+        vestibule = this.buildDoorConnector(door.id);
         setVestibuleOpacity(vestibule, 0); // fades up to the resting level
         this.platformGroup.add(vestibule);
         this.pairedVestibules.set(door.id, vestibule);
@@ -1536,7 +1572,9 @@ export class World {
       if (!vestibule.visible) continue;
 
       let target: number;
-      if (this.transitVestibuleDoorId === door.id || activeDoorId === door.id) {
+      if (ghost) {
+        target = 0.35; // #62 P4: armed-but-unpaired chain — fixed ghost preview
+      } else if (this.transitVestibuleDoorId === door.id || activeDoorId === door.id) {
         target = 1.0; // transit / walk-through in progress — fully material
       } else {
         const dist = Math.hypot(playerPos.x - door.front.x, playerPos.z - door.front.z);
@@ -1560,7 +1598,14 @@ export class World {
    * falls back to EAST (the canonical large door). East/west departures can
    * never hit the fallback.
    */
-  public resolveArrivalDoor(departureDoorId: DoorId): DoorTarget {
+  public resolveArrivalDoor(departureDoorId: DoorId, farDoor?: DoorId): DoorTarget {
+    // #62 P2: an assembled connection knows exactly which far door it lands on
+    // (the record's farDoor) — prefer it when enabled. The angled octagon links
+    // routinely land on NON-opposite doors (e.g. depart east, arrive north).
+    if (farDoor) {
+      const preferred = findDoor(farDoor);
+      if (preferred && preferred.enabled) return preferred;
+    }
     const opposite: Record<DoorId, DoorId> = {
       north: 'south', south: 'north', east: 'west', west: 'east',
     };
@@ -1575,9 +1620,10 @@ export class World {
    * (vestibule back to 'idle' — it persists while its door stays paired,
    * #51) and script the walk-in through the arrival door.
    */
-  public completeAdapterArrival(departureDoorId: DoorId): void {
+  public completeAdapterArrival(departureDoorId: DoorId, farDoor?: DoorId): void {
     this.endTransitVestibule();
-    const arrival = this.resolveArrivalDoor(departureDoorId);
+    // #62 P4: an assembled connection's record names the exact arrival door.
+    const arrival = this.resolveArrivalDoor(departureDoorId, farDoor);
     this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
   }
 
@@ -1791,8 +1837,16 @@ export class World {
     // does NOT fire this callback, so applying a remote pairing never re-publishes.
     this.dockingSystem.onPairingStatusChanged((doorId, status) => {
       if (status === 'ACCEPTED') {
-        const addr = this.dockingSystem?.getDockingState(doorId as 'north' | 'south' | 'east' | 'west')?.connectedRoomAddress;
-        if (addr) writeDoorPairing(doorId, addr);
+        const st = this.dockingSystem?.getDockingState(doorId as 'north' | 'south' | 'east' | 'west');
+        if (st?.connectedRoomAddress) {
+          // #62 P2: an assembled chain publishes its geometry with the pairing
+          // (absent on plain pairings — the legacy record shape, v0.30.x-safe).
+          writeDoorPairing(doorId, st.connectedRoomAddress, {
+            segments: st.segments,
+            farDoor: st.farDoor,
+            farYawDeg: st.farYawDeg,
+          });
+        }
       } else if (status === 'REJECTED') {
         deleteDoorPairing(doorId);
       }

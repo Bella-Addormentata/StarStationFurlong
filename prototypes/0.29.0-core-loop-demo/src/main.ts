@@ -24,7 +24,8 @@ import {
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
-import { bindDoorsDoc } from './doorsDoc';
+import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
+import { addToLedger, ledgerHasRoom, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
@@ -32,8 +33,8 @@ import {
 } from './roomPasses';
 import {
   initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
-  encodeMyCard, addContactFromCard, setFriend, removeContact, getContact,
-  isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
+  encodeMyCard, addContactFromCard, addContactFromRoomEntry, setFriend, removeContact,
+  getContact, isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
 } from './contacts';
 import {
   makeIntroductions, ingestIntroduction, type Introduction,
@@ -672,6 +673,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     initPeerStore({ selfPub: () => getIdentityPub() });
     harvestContactsIntoMesh();
     subscribeContacts(harvestContactsIntoMesh);
+    // Friend-from-roster: contact changes swap the CLONES SEEN row button for
+    // the ★ FRIEND badge (and vice versa on removal) without a doc change.
+    subscribeContacts(() => renderPhonePlayersList());
   }
   setActivePassRoom(boot.roomId);
 
@@ -1136,11 +1140,43 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
  * door machine falls through to the peek round-trip — review fix F4).
  */
 async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
+  // #62 P4: capture the departure connection BEFORE the swap tears the room
+  // down — the arrival choreography wants the record's farDoor, and the lazy
+  // mirror write needs the chain + the departure room's own address.
+  const depState = world.dockingSystem?.getDockingState(departureDoorId);
+  const depGeometry = depState?.segments?.length
+    ? { segments: depState.segments, farDoor: depState.farDoor, farYawDeg: depState.farYawDeg }
+    : null;
+  const depRoomId = activeBootstrap?.roomId ?? null;
+  const depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+
   const result = await performRoomSwap(seedString, {
-    arrive: () => world.completeAdapterArrival(departureDoorId),
+    arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
-  if (result instanceof Error) showHint('Dock seal failed.');
+  if (result instanceof Error) {
+    showHint('Dock seal failed.');
+    return;
+  }
+
+  // #62 P4: LAZY MIRROR — the first entry through an assembled connection
+  // writes the ARRIVAL room's half of the record into its (now-bound) doors
+  // doc: reversed segments (flex bends negated — an arc traversed backwards
+  // reverses its heading change), farDoor pointing back at the departure
+  // door. The link then renders + transits from BOTH sides for everyone.
+  // Never clobbers an existing pairing on the arrival door.
+  if (depGeometry && depAddress) {
+    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry.farDoor).id;
+    const existing = readAllDoors().get(arrivalDoorId);
+    if (!existing?.paired) {
+      writeDoorPairing(arrivalDoorId, depAddress, {
+        segments: mirrorSegments(depGeometry.segments),
+        farDoor: departureDoorId,
+        farYawDeg: depGeometry.farYawDeg,
+      });
+      console.log(`🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`);
+    }
+  }
 }
 
 /**
@@ -1183,9 +1219,26 @@ function wireAdapterTransit(): void {
     const minted = await mintBootstrapLink(undefined, roomId);
     if (!minted.link) return null;
     mintedRoomIds.add(roomId);
+    // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
+    // than a clipboard that holds one) and powers auto-accept.
+    addToLedger(roomId, minted.link);
     return minted.link;
   };
   world.dockingSystem?.onProvisionModule(provisionModuleSeed);
+  // #62 P4: auto-accept decider — a pairing may complete without a far-side
+  // human only for rooms THIS client minted (the ledger / this session's
+  // mints) or its own current room, and only while the DEV toggle is on.
+  world.dockingSystem?.onAutoAcceptCheck((address) => {
+    if (!autoAcceptEnabled()) return false;
+    try {
+      const boot = decodeBootstrapInput(address);
+      const rid = boot?.roomId;
+      if (!rid) return false;
+      return ledgerHasRoom(rid) || mintedRoomIds.has(rid) || rid === activeBootstrap?.roomId;
+    } catch {
+      return false;
+    }
+  });
   // DEV1 dev-menu hook: the MODULES row self-enables when this handle exists.
   (window as any).__ssfProvisionModule = provisionModuleSeed;
 }
@@ -1311,6 +1364,46 @@ function renderPhonePlayersList(): void {
       : '--:--';
     li.appendChild(nameSpan);
     li.appendChild(sinceSpan);
+
+    // 👥 Friend-from-roster: a keyed entry (identity pub + name↔key self-cert)
+    // unlocks one-tap friending straight from CLONES SEEN — verified on click by
+    // addContactFromRoomEntry to the same standard as a card import. Legacy
+    // keyless entries get no button (nothing verifiable to add). The contacts
+    // subscriber re-renders this list, so a successful add swaps the button for
+    // the ★ FRIEND badge (and the room list recategorizes into Friends' Rooms).
+    if (id !== myId && typeof entry.keyB64 === 'string' && entry.keyB64 && typeof entry.keySig === 'string' && entry.keySig) {
+      const pub = entry.keyB64;
+      const keySig = entry.keySig;
+      const entryName = entry.name || 'Unknown-Clone';
+      const existing = getContact(pub);
+      if (existing?.friend) {
+        const badge = document.createElement('span');
+        badge.className = 'phone-players-friend-badge';
+        badge.textContent = '★ FRIEND';
+        badge.title = `Friend · key ${contactFingerprint(pub)}`;
+        li.appendChild(badge);
+      } else {
+        const btn = document.createElement('button');
+        btn.className = 'phone-players-friend-btn';
+        btn.textContent = existing ? '★ BEFRIEND' : '+ FRIEND';
+        btn.title = existing
+          ? `Promote this contact to a friend · key ${contactFingerprint(pub)}`
+          : `Add to Contacts as a friend · key ${contactFingerprint(pub)}`;
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const res = addContactFromRoomEntry(pub, entryName, keySig, { friend: true });
+          if (res.ok) {
+            logToPhoneSystem(`⭐ ${entryName} added to your friends (key ${contactFingerprint(pub)}).`);
+            // contacts notify() re-renders this list → badge replaces button.
+          } else {
+            btn.textContent = '✗ UNVERIFIED';
+            btn.disabled = true;
+            btn.title = res.error;
+          }
+        });
+        li.appendChild(btn);
+      }
+    }
     listEl.appendChild(li);
   }
 }
@@ -1330,14 +1423,45 @@ function setupSpacePhoneOverlay() {
   // 📱 Phone shell view router (issue #20 S1) — home screen + per-app views.
   // Policy: Tab always opens the phone to the HOME screen (deterministic,
   // one tap to any app) rather than restoring the last open view.
-  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access';
+  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access' | 'settings' | 'setnet' | 'setstats';
   const phoneViewMeta: Record<PhoneViewId, { elId: string; title: string; subtitle: string }> = {
     home:     { elId: 'phone-home-screen',   title: '📱 HOME',        subtitle: 'FurlongOS · Select App' },
     chat:     { elId: 'phone-app-chat',      title: '👨‍🚀 CLONE CHAT', subtitle: 'Room: Furlong Lobby' },
     contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
     bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
     access:   { elId: 'phone-app-access',    title: '🚪 ACCESS',      subtitle: 'Room Passes · FurlongNet' },
+    settings: { elId: 'phone-app-settings',          title: '⚙️ SETTINGS', subtitle: 'FurlongOS · System' },
+    setnet:   { elId: 'phone-app-settings-network',  title: '🌐 NETWORK',  subtitle: 'Settings · Node & Mesh' },
+    setstats: { elId: 'phone-app-settings-stats',    title: '📊 STATS',    subtitle: 'Settings · Live Readout' },
   };
+  /** Sub-views return to their parent on BACK instead of jumping home. */
+  const phoneViewParent: Partial<Record<PhoneViewId, PhoneViewId>> = {
+    setnet: 'settings',
+    setstats: 'settings',
+  };
+
+  // 📦 De-overlay (owner request): the Network Details, stats and room-info
+  // boxes move OFF the screen overlay and INTO phone views — reparented at
+  // runtime with their ids intact, so every live-updater (updateDebugHUD,
+  // setNetworkRow, the room-name editor, chia toggle, RETRY) works unchanged.
+  {
+    const netHud = document.getElementById('network-details-hud');
+    const netView = document.getElementById('phone-app-settings-network');
+    if (netHud && netView) {
+      netView.appendChild(netHud);
+      // Inside the phone the panel is always expanded — the collapse chevron
+      // was an overlay-space concern. (Its listener no-ops on a hidden button.)
+      netHud.classList.remove('collapsed');
+      const chevron = document.getElementById('network-details-toggle');
+      if (chevron) chevron.style.display = 'none';
+    }
+    const statsHud = document.getElementById('debug-hud');
+    const statsView = document.getElementById('phone-app-settings-stats');
+    if (statsHud && statsView) statsView.appendChild(statsHud);
+    const roomHud = document.getElementById('room-info-hud');
+    const accessView = document.getElementById('phone-app-access');
+    if (roomHud && accessView) accessView.insertBefore(roomHud, accessView.firstChild);
+  }
   let currentPhoneView: PhoneViewId = 'home';
   const backBtn = document.getElementById('phone-back-btn');
   const appTitle = document.getElementById('phone-app-title');
@@ -1381,7 +1505,7 @@ function setupSpacePhoneOverlay() {
 
   if (backBtn) {
     backBtn.addEventListener('click', () => {
-      showPhoneView('home');
+      showPhoneView(phoneViewParent[currentPhoneView] ?? 'home');
     });
   }
 

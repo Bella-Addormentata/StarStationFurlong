@@ -235,9 +235,14 @@ export class MultiScaleZoomView {
       box-shadow: 0 4px 18px rgba(0,0,0,0.8);
       z-index: 100;
       text-align: center;
-      transition: all 0.3s;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.4s, visibility 0.4s;
     `;
-    indicator.innerHTML = `LEVEL 2: ROOM VIEW (DEFAULT) <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>`;
+    // No permanent info box (owner request): the pill starts hidden and only
+    // TOASTS for a moment on an actual level change (updateViewContext) — so
+    // the first-person controls hint still appears when you enter level 1,
+    // then the screen goes clean again.
     this.overlay.appendChild(indicator);
 
     // Context Sidebar details for upper views (levels >= 3)
@@ -477,16 +482,34 @@ export class MultiScaleZoomView {
     }
   }
 
+  /** Last level the indicator toasted for — updateViewContext runs EVERY FRAME
+   *  in first person, so the toast must fire on actual level CHANGES only. */
+  private lastIndicatorLevel = 2; // matches the boot default → no toast at boot
+  private indicatorHideTimer: number | null = null;
+
   private updateViewContext() {
     const def = ZOOM_LEVELS[this.currentLevel - 1];
-    
-    // Update indicator HUD
-    const ind = document.getElementById('zoom-hud-indicator');
-    if (ind) {
-      ind.innerHTML = `
-        <span style="color:#00d4ff;">LEVEL ${def.level}: ${def.name}</span>
-        <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>
-      `;
+
+    // Indicator TOAST (owner request: no permanent info box) — on a level
+    // change, show the pill for a moment (it carries the controls hint, which
+    // matters most entering first person), then fade back to a clean screen.
+    if (def.level !== this.lastIndicatorLevel) {
+      this.lastIndicatorLevel = def.level;
+      const ind = document.getElementById('zoom-hud-indicator');
+      if (ind) {
+        ind.innerHTML = `
+          <span style="color:#00d4ff;">LEVEL ${def.level}: ${def.name}</span>
+          <span style="font-size:9px; color:rgba(212,168,75,0.5); display:block; margin-top:2px;">${this.zoomHintText()}</span>
+        `;
+        ind.style.opacity = '1';
+        ind.style.visibility = 'visible';
+        if (this.indicatorHideTimer !== null) window.clearTimeout(this.indicatorHideTimer);
+        this.indicatorHideTimer = window.setTimeout(() => {
+          this.indicatorHideTimer = null;
+          ind.style.opacity = '0';
+          ind.style.visibility = 'hidden'; // transitions out with the opacity
+        }, 2_500);
+      }
     }
 
     // Adjust global 3D Three.js camera zooms dynamically

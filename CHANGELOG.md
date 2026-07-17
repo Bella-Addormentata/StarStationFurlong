@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.5 — 2026-07-17
+
+### The Station Builder (#62 P1–P4) + the Settings Phone App + Roster Friending
+
+- **Build angled stations — the octagon toolkit is in.** New buildable connector parts: **FLEX JOINT** (corrugated bellows, bend ±60° in 7.5° steps, slight stretch) and **EXTENSION** (straight tube, 1.2–7.2 m, ribbed or solid skin per the concept art). Assemble them per-door in the docking keypad's new **CONNECTION ASSEMBLY** strip (chips: click to cycle bend/length, toggle skin, ✕ to remove), and the chain renders live in-world as a translucent ghost while unpaired. Pairing publishes the geometry with the connection: **everyone in the room sees the bent link, and the far room's projection sits at the chain's true angled position** (v0.30.x clients see the straight gangway — fully compatible). Arrival doors follow the connection (angled links land on non-opposite doors), and the first walk through an assembled link auto-writes the far side's mirror record so the connection works from both ends.
+- **DEV menu → PARTS**: part counts (+4 flex / +2 ext per click), the two build presets (**RING LINK** = the octagon's 45° turn, **HUB SPOKE** = straight hub run — armed presets prefill the keypad), a **module seeds ledger** with COPY buttons (building 9 rooms needs more than one clipboard), **AUTO-ACCEPT MY MODULES** (your own minted modules pair instantly), and the **NORTH DOOR** unlock. The full in-game octagon walkthrough is §6.4 of `brainstorming/angled-vestibules-octagon-plan.md` — this release is the build to attempt it on.
+- **⚙️ SETTINGS phone app**: Network Details (incl. the Chia Mesh toggle + RETRY) and the FPS/POS/NODE stats moved off the screen overlay into the phone (Settings → NETWORK / STATS); Room Name + Owner moved into the ACCESS app. The zoom-level pill is now a 2.5 s toast on level change instead of a permanent box. The screen is clean.
+- **Friend from the roster**: CLONES SEEN rows with a verified identity get a one-tap **+ FRIEND** button (cert-verified to the same standard as a card import; ★ FRIEND badge once added; room list recategorizes into Friends' Rooms).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.5 in place). **Frontend-only — node binaries unchanged from v0.30.0**, so the `ssf-p2p-node-chia.exe` chia asset (heartbeat version: v0.30.3+) still applies.
+
 ## v0.30.4 — 2026-07-17
 
 ### Rooms Survive Closed Browsers + Instant Rejoins (durability Tiers A & C2)
