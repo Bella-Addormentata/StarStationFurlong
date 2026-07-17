@@ -227,6 +227,10 @@
               <span class="phone-app-tile-icon">🚪</span>
               <span class="phone-app-tile-label">ACCESS</span>
             </button>
+            <button type="button" class="phone-app-tile" data-phone-app="settings" aria-label="Open Settings app">
+              <span class="phone-app-tile-icon">⚙️</span>
+              <span class="phone-app-tile-label">SETTINGS</span>
+            </button>
           </div>
 
           <!-- 🛰️ Room roster (issue #20 S2) — rendered from the Yjs players map.
@@ -346,6 +350,29 @@
           </div>
           <div id="access-feedback"></div>
         </div>
+
+        <!-- ⚙️ Settings app view — sub-menu into NETWORK / STATS. The actual
+             panels (#network-details-hud, #debug-hud, #room-info-hud) are
+             REPARENTED into these views at phone setup (main.ts) so every
+             live-updater keeps its ids; they are no longer screen overlays. -->
+        <div id="phone-app-settings" class="phone-app-view">
+          <div id="phone-settings-grid">
+            <button type="button" class="phone-app-tile" data-phone-app="setnet" aria-label="Open network settings">
+              <span class="phone-app-tile-icon">🌐</span>
+              <span class="phone-app-tile-label">NETWORK</span>
+            </button>
+            <button type="button" class="phone-app-tile" data-phone-app="setstats" aria-label="Open stats readout">
+              <span class="phone-app-tile-icon">📊</span>
+              <span class="phone-app-tile-label">STATS</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- ⚙️→🌐 Network settings view (receives #network-details-hud) -->
+        <div id="phone-app-settings-network" class="phone-app-view"></div>
+
+        <!-- ⚙️→📊 Stats view (receives #debug-hud) -->
+        <div id="phone-app-settings-stats" class="phone-app-view"></div>
       </div>
     </div>
     

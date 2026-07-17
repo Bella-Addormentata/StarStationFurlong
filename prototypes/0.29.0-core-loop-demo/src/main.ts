@@ -1373,14 +1373,45 @@ function setupSpacePhoneOverlay() {
   // 📱 Phone shell view router (issue #20 S1) — home screen + per-app views.
   // Policy: Tab always opens the phone to the HOME screen (deterministic,
   // one tap to any app) rather than restoring the last open view.
-  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access';
+  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access' | 'settings' | 'setnet' | 'setstats';
   const phoneViewMeta: Record<PhoneViewId, { elId: string; title: string; subtitle: string }> = {
     home:     { elId: 'phone-home-screen',   title: '📱 HOME',        subtitle: 'FurlongOS · Select App' },
     chat:     { elId: 'phone-app-chat',      title: '👨‍🚀 CLONE CHAT', subtitle: 'Room: Furlong Lobby' },
     contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
     bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
     access:   { elId: 'phone-app-access',    title: '🚪 ACCESS',      subtitle: 'Room Passes · FurlongNet' },
+    settings: { elId: 'phone-app-settings',          title: '⚙️ SETTINGS', subtitle: 'FurlongOS · System' },
+    setnet:   { elId: 'phone-app-settings-network',  title: '🌐 NETWORK',  subtitle: 'Settings · Node & Mesh' },
+    setstats: { elId: 'phone-app-settings-stats',    title: '📊 STATS',    subtitle: 'Settings · Live Readout' },
   };
+  /** Sub-views return to their parent on BACK instead of jumping home. */
+  const phoneViewParent: Partial<Record<PhoneViewId, PhoneViewId>> = {
+    setnet: 'settings',
+    setstats: 'settings',
+  };
+
+  // 📦 De-overlay (owner request): the Network Details, stats and room-info
+  // boxes move OFF the screen overlay and INTO phone views — reparented at
+  // runtime with their ids intact, so every live-updater (updateDebugHUD,
+  // setNetworkRow, the room-name editor, chia toggle, RETRY) works unchanged.
+  {
+    const netHud = document.getElementById('network-details-hud');
+    const netView = document.getElementById('phone-app-settings-network');
+    if (netHud && netView) {
+      netView.appendChild(netHud);
+      // Inside the phone the panel is always expanded — the collapse chevron
+      // was an overlay-space concern. (Its listener no-ops on a hidden button.)
+      netHud.classList.remove('collapsed');
+      const chevron = document.getElementById('network-details-toggle');
+      if (chevron) chevron.style.display = 'none';
+    }
+    const statsHud = document.getElementById('debug-hud');
+    const statsView = document.getElementById('phone-app-settings-stats');
+    if (statsHud && statsView) statsView.appendChild(statsHud);
+    const roomHud = document.getElementById('room-info-hud');
+    const accessView = document.getElementById('phone-app-access');
+    if (roomHud && accessView) accessView.insertBefore(roomHud, accessView.firstChild);
+  }
   let currentPhoneView: PhoneViewId = 'home';
   const backBtn = document.getElementById('phone-back-btn');
   const appTitle = document.getElementById('phone-app-title');
@@ -1424,7 +1455,7 @@ function setupSpacePhoneOverlay() {
 
   if (backBtn) {
     backBtn.addEventListener('click', () => {
-      showPhoneView('home');
+      showPhoneView(phoneViewParent[currentPhoneView] ?? 'home');
     });
   }
 

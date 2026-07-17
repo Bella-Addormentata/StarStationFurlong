@@ -42,10 +42,9 @@
       }
       
       /* Top status bar - minimalist design */
+      /* Lives INSIDE the phone (⚙️ SETTINGS → 📊 STATS) since the de-overlay
+         pass — reparented at phone setup; no longer a screen overlay. */
       #debug-hud {
-        position: absolute;
-        top: 24px;
-        left: 24px;
         color: #d4a84b;
         font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         font-size: 12px;
@@ -54,11 +53,7 @@
         padding: 12px 18px;
         border-radius: 12px;
         border: 1px solid rgba(212, 168, 75, 0.18);
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-        pointer-events: none;
-        z-index: 1000;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        margin: 10px;
       }
       
       #debug-hud div {
@@ -80,11 +75,9 @@
         font-weight: 600;
       }
 
+      /* Lives INSIDE the phone (⚙️ SETTINGS → 🌐 NETWORK) since the de-overlay
+         pass — reparented at phone setup; always expanded there. */
       #network-details-hud {
-        position: absolute;
-        top: 210px;
-        left: 24px;
-        width: 360px;
         color: #d4a84b;
         font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         font-size: 12px;
@@ -93,10 +86,7 @@
         padding: 10px 14px;
         border-radius: 12px;
         border: 1px solid rgba(212, 168, 75, 0.18);
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-        z-index: 1000;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
+        margin: 10px;
       }
 
       #network-details-hud.collapsed .network-details-body {
@@ -282,11 +272,9 @@
         }
       }
 
-      /* Room Info HUD Styles */
+      /* Room Info — lives INSIDE the phone (🚪 ACCESS, top) since the
+         de-overlay pass; the click-to-edit room name works there unchanged. */
       #room-info-hud {
-        position: absolute;
-        top: 24px;
-        left: 220px;
         color: #d4a84b;
         font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         font-size: 11px;
@@ -295,14 +283,18 @@
         padding: 10px 14px;
         border-radius: 12px;
         border: 1px solid rgba(212, 168, 75, 0.18);
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-        z-index: 1000;
-        backdrop-filter: blur(20px) saturate(180%);
-        -webkit-backdrop-filter: blur(20px) saturate(180%);
         display: flex;
         flex-direction: column;
         gap: 6px;
-        width: 190px;
+        margin: 10px 10px 0 10px;
+      }
+
+      /* ⚙️ Settings sub-menu grid (NETWORK / STATS tiles) */
+      #phone-settings-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        padding: 12px;
       }
 
       .room-info-row {
