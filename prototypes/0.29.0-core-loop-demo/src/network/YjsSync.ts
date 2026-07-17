@@ -87,6 +87,12 @@ export class YjsSync {
   #resolveServerSynced!: () => void;
   #serverSynced = false;
   #active = false;
+
+  /** True once the node's initial SyncStep2 has applied (the promise above,
+   *  as a synchronous probe — Tier A's backfill logic reads it). */
+  get serverSynced(): boolean {
+    return this.#serverSynced;
+  }
   #writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #seq = 1;
 

@@ -313,6 +313,11 @@ pub struct Room {
     pub candidates: HashMap<PublicKey, Candidate>,
     /// M5.4: recently-relayed reliable envelopes, retained to answer IWANT pulls.
     pub retained: RetainStore,
+    /// C2 (room durability): a LOCAL browser participated in this room, so this
+    /// node's doc is an authoritative-enough replica to ANSWER relayed SyncStep1s
+    /// from remote peers — the room stays alive after the browser closes. A room
+    /// this node only ever relayed for (visitor pass-through) stays un-served.
+    pub served: bool,
 }
 
 pub struct HubState {
@@ -1359,9 +1364,15 @@ async fn handle_wt_connection_inner(
                                     remote_peers: HashMap::new(),
                                     candidates: HashMap::new(),
                                     retained: RetainStore::new(),
+                                    served: false,
                                 }
                             });
                             room.local_connections.insert(remote_addr_inner, connection_clone.clone());
+                            // C2 (room durability): a LOCAL browser bound this room, so this
+                            // node's replica may ANSWER relayed SyncStep1s — and keeps doing
+                            // so after the browser closes (the "owner left the browser but
+                            // not the machine" fix). Sticky by design.
+                            room.served = true;
                         }
 
                         // ChiaHub C1 Slice 3: a `cap` envelope from the LOCAL browser
@@ -2076,6 +2087,8 @@ fn handle_iroh_connection(
                                     remote_peers: HashMap::new(),
                                     candidates: HashMap::new(),
                                     retained: RetainStore::new(),
+                                    // iroh-created room: relay-only until a local browser binds it.
+                                    served: false,
                                 }
                             });
                             let in_mesh = mesh_has_room_for(room, TIER_UNVETTED);
@@ -2300,15 +2313,79 @@ fn handle_iroh_connection(
                             });
                         }
 
-                        // Sync natively (importing ReadTxn / WriteTxn as needed)
+                        // Sync natively — C2 (room durability): parse the y-sync SUB-TYPE
+                        // instead of blind-decoding everything as an Update. A relayed
+                        // SyncStep1 (subtype 0) used to fail Update::decode and be SILENTLY
+                        // DROPPED — the single asymmetry that made a room die once its
+                        // browsers closed even though this node still held the doc. A room a
+                        // local browser participated in (`served`) now ANSWERS it with
+                        // SyncStep2 built from the node's own doc (mirror of
+                        // handle_ysync_message), sent point-to-point back down the RECEIVING
+                        // connection — never the relay fan-out (echo risk). Un-served rooms
+                        // and state frames behave exactly as before (also fixes the old
+                        // `.unwrap()` panic on malformed ysync payloads).
                         if envelope.kind == "ysync" {
-                            let (update_bytes, _) = read_length_and_buf(&envelope.payload, 2).unwrap();
-                            if let Ok(update) = Update::decode_v1(&update_bytes) {
-                                let rooms = hub_clone.rooms.lock().unwrap();
-                                if let Some(room) = rooms.get(room_id) {
-                                    let mut txn = room.doc.transact_mut();
-                                    let _ = txn.apply_update(update);
+                            let sub = read_var_uint(&envelope.payload, 0).ok().and_then(|(mt, n1)| {
+                                read_var_uint(&envelope.payload, n1)
+                                    .ok()
+                                    .map(|(st, n2)| (mt, st, n1 + n2))
+                            });
+                            match sub {
+                                Some((0, 0, cursor)) => {
+                                    // Relayed SyncStep1: answer from our doc when served.
+                                    // Diff built under the lock, sent after dropping it.
+                                    let diff = {
+                                        let rooms = hub_clone.rooms.lock().unwrap();
+                                        match rooms.get(room_id) {
+                                            Some(room) if room.served => {
+                                                read_length_and_buf(&envelope.payload, cursor)
+                                                    .ok()
+                                                    .and_then(|(sv_bytes, _)| StateVector::decode_v1(&sv_bytes).ok())
+                                                    .map(|client_sv| room.doc.transact().encode_diff_v1(&client_sv))
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                    if let Some(diff) = diff {
+                                        let mut encoder = EncoderV1::new();
+                                        encoder.write_var(0u32); // messageType = Sync
+                                        encoder.write_var(1u32); // syncSubType = SyncStep2
+                                        encoder.write_buf(&diff);
+                                        let reply_env = SsfEnvelope {
+                                            v: 1,
+                                            room: room_id.clone(),
+                                            kind: "ysync".to_string(),
+                                            seq: envelope.seq + 1,
+                                            author: vec![],
+                                            payload: encoder.to_vec(),
+                                            sig: None,
+                                            iroh_node_id: Some(self_id_inner.to_string()),
+                                            iroh_relay_urls: None,
+                                            iroh_direct_addrs: None,
+                                            trust_tier: None,
+                                            iroh_member_hints: None,
+                                        };
+                                        if let Ok(bytes) = serde_json::to_vec(&reply_env) {
+                                            let reply_conn = connection_clone.clone();
+                                            tokio::spawn(async move {
+                                                send_framed(&reply_conn, &bytes).await;
+                                            });
+                                        }
+                                    }
                                 }
+                                Some((0, 1, cursor)) | Some((0, 2, cursor)) => {
+                                    // SyncStep2 / Update: merge into our replica (as before).
+                                    if let Ok((update_bytes, _)) = read_length_and_buf(&envelope.payload, cursor) {
+                                        if let Ok(update) = Update::decode_v1(&update_bytes) {
+                                            let rooms = hub_clone.rooms.lock().unwrap();
+                                            if let Some(room) = rooms.get(room_id) {
+                                                let mut txn = room.doc.transact_mut();
+                                                let _ = txn.apply_update(update);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {} // unknown framing — ignore, never panic
                             }
                         }
                     }

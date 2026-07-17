@@ -25,6 +25,7 @@ import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import { bindDoorsDoc } from './doorsDoc';
+import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
   setActivePassRoom, removePass, passRoomInfo, passSeed, type PassState,
@@ -85,6 +86,8 @@ const networkProvider = new NetworkProvider();
 // 🕸️ Mesh peer-store debug hook (§7 M1).
 (window as any).__ssfMesh = { count: () => peerCount(), list: () => listPeers(), hintsFor };
 let yjsSync: YjsSync | null = null;
+/** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
+let roomCacheHandle: RoomCacheHandle | null = null;
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
 // the epoch after EACH await and unwinds if superseded — otherwise a rapid
@@ -548,6 +551,23 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   });
   ssfDocStats.created++; // doc-lifecycle counter (see declaration)
   yjsSync = sync; // publish BEFORE start() so a concurrent leaveRoom can stop us
+  // 💾 Tier A restore (room-durability-plan §3.2): apply the cached snapshot
+  // BEFORE start(), so the opening SyncStep1 carries a real state vector (the
+  // host ships only the missing delta), the restore is silent (no update-echo),
+  // and an owned room's cached `owner` suppresses the claimRoomDefaults
+  // rename-revert race. CRDT idempotence makes any interleaving safe; a corrupt
+  // blob is discarded inside restoreRoomSnapshot (degrades to today's no-cache).
+  const restoredFromCache = await restoreRoomSnapshot(sync.doc, boot.roomId);
+  if (epoch !== sessionEpoch) {
+    // Superseded during the cache read — same unwind as the post-start guard.
+    const docWasDestroyed = (sync.doc as { isDestroyed?: boolean }).isDestroyed === true;
+    try { await sync.stop(); } catch { /* superseded transport */ }
+    if (!docWasDestroyed && (sync.doc as { isDestroyed?: boolean }).isDestroyed) {
+      ssfDocStats.destroyed++; // doc-lifecycle counter (see declaration)
+    }
+    if (yjsSync === sync) yjsSync = null;
+    return;
+  }
   await sync.start();
   if (epoch !== sessionEpoch) {
     // Superseded while the sync spun up. A concurrent leaveRoom may already
@@ -563,6 +583,19 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   }
   // No awaits below this line — the epoch can no longer go stale mid-bind,
   // so every observer/handler below attaches to the CURRENT session's doc.
+
+  // 💾 Tier A persist: debounced snapshot writer (flushed again on server-sync
+  // and finally in leaveRoom, synchronously before the doc is destroyed).
+  // `owned` is sampled at write time — ownership can resolve after join.
+  roomCacheHandle?.detach(); // stale handle from a superseded session, if any
+  roomCacheHandle = attachRoomCache(sync.doc, boot.roomId, () =>
+    isLocalPlayerRoomOwner((sync.doc.getMap('roomInfo').get('owner') as string) || ''));
+  {
+    const cacheEpoch = epoch;
+    void sync.whenServerSynced.then(() => {
+      if (cacheEpoch === sessionEpoch) roomCacheHandle?.flushNow();
+    });
+  }
 
   // 3b. Route NODE-INITIATED envelopes (🐛 0.16.0 blocker fix): remote peers'
   // updates are bridged to us on node-opened streams — feed ysync frames into
@@ -749,7 +782,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     const backfillDeadline = performance.now() + 30_000;
     const backfillTick = () => {
       if (backfillEpoch !== sessionEpoch) return; // superseded by a newer join
-      if (roomMap.has('owner')) return;           // host state arrived — done
+      // 💾 Tier A counter-fix (plan §3.2): a restored cache satisfies
+      // `roomMap.has('owner')` at t=0 with STALE state — so when we restored
+      // from cache, keep the bounded resync cadence running for the full window
+      // (idempotent SyncStep1s, ~15 tiny frames worst case) instead of stopping
+      // on the cache's own echo. Freshness still lands via the normal SyncStep2.
+      if (!restoredFromCache && roomMap.has('owner')) return; // host state arrived — done
       if (performance.now() >= backfillDeadline) return;
       yjsSync?.resync();
       window.setTimeout(backfillTick, 2_000);
@@ -855,6 +893,11 @@ async function leaveRoom(): Promise<void> {
   const sync = yjsSync;
   yjsSync = null;
   if (sync) {
+    // 💾 Tier A: final snapshot BEFORE stop() destroys the doc (encode is
+    // synchronous; the IndexedDB put is fire-and-forget and survives us).
+    try { roomCacheHandle?.flushNow(); } catch { /* cache is never fatal */ }
+    roomCacheHandle?.detach();
+    roomCacheHandle = null;
     const oldDoc = sync.doc;
     try {
       await sync.stop(); // closes the ysync writer + doc.destroy()
@@ -1648,6 +1691,11 @@ function setupSpacePhoneOverlay() {
             atTick: localSeq,
             scope: 'global'
           }]);
+          // 💾 Tier A (plan §3.3): cap chat IN THE DOC so the room doc — and its
+          // cached snapshot, and every sync — stays bounded. Concurrent trims
+          // delete overlapping ranges idempotently (CRDT-safe).
+          const excess = sharedChat.length - 200;
+          if (excess > 0) sharedChat.delete(0, excess);
         });
       } else {
         // Fallback offline simulator if no node serves connection
