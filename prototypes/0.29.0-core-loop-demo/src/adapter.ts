@@ -140,6 +140,317 @@ export function buildVestibule(doorId: VestibuleDoorId): THREE.Group {
   return group;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// #62 P1 — PARAMETERIZED CONNECTOR PARTS (angled-vestibules-octagon-plan.md §5)
+//
+// Two buildable parts plus a chain builder:
+//  - FLEX JOINT: corrugated bellows on a constant-curvature arc — 7 rings
+//    (denser than the vestibule's 5 → reads as bellows), per-gap fabric so the
+//    tube can bend (a single long fabric box cannot), bend ±60° snap 7.5°,
+//    stretch −0.30..+0.45 on a 2.4 m rest length.
+//  - EXTENSION: straight tube, `bays × 0.6 m` (2..12), ribbed skin (vestibule
+//    look) or solid skin (the concept art's rigid mid-tube: hull walls, groove
+//    seams, collar rings with amber bands).
+//  - buildConnectorChain: folds a 2D transform cursor (XZ plane, yaw about +Y)
+//    from the door face through the ordered segments, placing each part at the
+//    cursor pose; heavy portal frames cap the chain's two DOOR terminations.
+//    The same fold is exported as pure math (foldChainEnd) so P3 can pose the
+//    far room's projection at the chain's exit without building meshes.
+//
+// Everything is named/nested so setVestibuleLightState / setVestibuleOpacity
+// traverse chains unchanged ('vestibuleGlow' strips throughout), and the
+// legacy buildVestibule above stays byte-identical for v0.30.x pairings.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** One ordered piece of a door connection (the P2 wire mirrors this shape). */
+export interface ConnectorSegment {
+  kind: 'flex' | 'ext';
+  /** flex only: bend in degrees, clamped ±FLEX_BEND_MAX_DEG, snapped. */
+  bendDeg?: number;
+  /** flex only: length delta on FLEX_REST_LEN, clamped to the stretch range. */
+  stretch?: number;
+  /** ext only: length in bays of EXT_BAY_LEN, clamped 2..12. */
+  bays?: number;
+  /** ext only: skin style (default 'ribbed'). */
+  skin?: 'ribbed' | 'solid';
+}
+
+// ── Parts catalog (plan §5.1/§5.2 — the clamp source of truth for P2's guards)
+export const FLEX_REST_LEN = 2.4;
+export const FLEX_STRETCH_MIN = -0.3;
+export const FLEX_STRETCH_MAX = 0.45;
+export const FLEX_BEND_MAX_DEG = 60;
+export const FLEX_BEND_SNAP_DEG = 7.5;
+export const EXT_BAY_LEN = 0.6;
+export const EXT_BAYS_MIN = 2;
+export const EXT_BAYS_MAX = 12;
+
+export function clampFlexBend(deg: number): number {
+  const snapped = Math.round(deg / FLEX_BEND_SNAP_DEG) * FLEX_BEND_SNAP_DEG;
+  return Math.max(-FLEX_BEND_MAX_DEG, Math.min(FLEX_BEND_MAX_DEG, snapped));
+}
+export function clampFlexStretch(s: number): number {
+  return Math.max(FLEX_STRETCH_MIN, Math.min(FLEX_STRETCH_MAX, s));
+}
+export function clampExtBays(b: number): number {
+  return Math.max(EXT_BAYS_MIN, Math.min(EXT_BAYS_MAX, Math.round(b)));
+}
+
+/** Groove seam color for the solid extension skin (door-leaf groove trick). */
+const COL_GROOVE = 0x1C262E;
+
+/** Shared material set for one part build (mirrors buildVestibule's). */
+function partMats() {
+  return {
+    frame: new THREE.MeshStandardMaterial({ color: COL_FRAME, roughness: 0.6, metalness: 0.5 }),
+    fabric: new THREE.MeshStandardMaterial({ color: COL_FABRIC, roughness: 0.95, metalness: 0.05 }),
+    floor: new THREE.MeshStandardMaterial({ color: COL_FLOOR, roughness: 0.8, metalness: 0.35 }),
+    accent: new THREE.MeshStandardMaterial({ color: COL_ACCENT, roughness: 0.4, metalness: 0.5 }),
+    groove: new THREE.MeshStandardMaterial({ color: COL_GROOVE, roughness: 0.9, metalness: 0.1 }),
+  };
+}
+type PartMats = ReturnType<typeof partMats>;
+
+function boxInto(
+  parent: THREE.Object3D, w: number, h: number, d: number, mat: THREE.Material,
+  x: number, y: number, z: number, name?: string,
+): THREE.Mesh {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  mesh.position.set(x, y, z);
+  if (name) mesh.name = name;
+  parent.add(mesh);
+  return mesh;
+}
+
+/** Rectangular ring frame as its own posable sub-group (entry-plane centred). */
+function ringGroup(mats: PartMats, outerW: number, outerH: number, bar: number, ringDepth: number): THREE.Group {
+  const g = new THREE.Group();
+  const postX = (outerW - bar) / 2;
+  boxInto(g, bar, outerH, ringDepth, mats.frame, -postX, outerH / 2, 0);
+  boxInto(g, bar, outerH, ringDepth, mats.frame, postX, outerH / 2, 0);
+  boxInto(g, outerW, bar, ringDepth, mats.frame, 0, outerH - bar / 2, 0);
+  boxInto(g, outerW, 0.12, ringDepth, mats.frame, 0, 0.06, 0);
+  return g;
+}
+
+/** Heavy door-termination portal (the buildVestibule end-frame recipe) as a
+ *  posable sub-group, status strip included. */
+function portalGroup(mats: PartMats): THREE.Group {
+  const g = new THREE.Group();
+  const pw = 3.6, ph = 3.8, bar = 0.28;
+  const postX = (pw - bar) / 2;
+  boxInto(g, bar, ph, 0.24, mats.frame, -postX, ph / 2, 0);
+  boxInto(g, bar, ph, 0.24, mats.frame, postX, ph / 2, 0);
+  boxInto(g, pw, bar, 0.24, mats.frame, 0, ph - bar / 2, 0);
+  boxInto(g, pw, 0.14, 0.24, mats.frame, 0, 0.07, 0);
+  boxInto(g, 0.2, 0.2, 0.26, mats.accent, -postX, ph - 0.32, 0);
+  boxInto(g, 0.2, 0.2, 0.26, mats.accent, postX, ph - 0.32, 0);
+  const statusMat = new THREE.MeshBasicMaterial({ color: LIGHT_STATE_COLORS.idle });
+  boxInto(g, 1.2, 0.08, 0.28, statusMat, 0, INNER_H + 0.22, 0, 'vestibuleGlow');
+  return g;
+}
+
+/** Pose on the flex joint's constant-curvature arc at parameter t ∈ [0,1]
+ *  (local frame: entry at origin facing +Z; +bend curves toward +X). */
+function flexArcFrame(bendRad: number, length: number, t: number): { x: number; z: number; yaw: number } {
+  if (Math.abs(bendRad) < 1e-4) return { x: 0, z: length * t, yaw: 0 };
+  const r = length / bendRad;
+  return { x: (1 - Math.cos(bendRad * t)) * r, z: Math.sin(bendRad * t) * r, yaw: bendRad * t };
+}
+
+/**
+ * FLEX JOINT — corrugated bellows with a parameterized bend (plan §5.1).
+ * Local frame: entry portal plane at z=0 facing +Z, floor at y=0. No handrails
+ * (pure corrugation, per the art); terminating portals are the CHAIN's job.
+ */
+export function buildFlexJoint(bendDeg: number, stretch = 0): THREE.Group {
+  const group = new THREE.Group();
+  const bend = clampFlexBend(bendDeg);
+  const len = FLEX_REST_LEN + clampFlexStretch(stretch);
+  group.name = 'connectorFlex';
+  group.userData = { isConnectorPart: true, kind: 'flex', bendDeg: bend, stretch: clampFlexStretch(stretch) };
+  const mats = partMats();
+  const th = THREE.MathUtils.degToRad(bend);
+
+  const N = 7; // rings (6 gaps → ≤10°/gap at full bend; 0.08 overlap covers the pleat shear)
+  const frames = Array.from({ length: N }, (_, k) => flexArcFrame(th, len, k / (N - 1)));
+
+  // Rings, alternating heavy/light for the accordion-pleat read.
+  frames.forEach((f, i) => {
+    const big = i % 2 === 0;
+    const ring = ringGroup(mats, big ? 3.45 : 3.25, big ? 3.65 : 3.45, 0.18, 0.22);
+    ring.position.set(f.x, 0, f.z);
+    ring.rotation.y = f.yaw;
+    group.add(ring);
+  });
+
+  // Per-gap skin: fabric walls + ceiling + floor plate + glow strips, each gap
+  // posed at its midpoint with the mean yaw; depth spans the ring distance
+  // plus 0.16 overlap so the pleats never show daylight at full bend.
+  for (let i = 0; i < N - 1; i++) {
+    const a = frames[i], b = frames[i + 1];
+    const gap = new THREE.Group();
+    gap.position.set((a.x + b.x) / 2, 0, (a.z + b.z) / 2);
+    gap.rotation.y = (a.yaw + b.yaw) / 2;
+    const d = Math.hypot(b.x - a.x, b.z - a.z) + 0.16;
+    boxInto(gap, 0.06, INNER_H, d, mats.fabric, -(INNER_W / 2 + 0.03), INNER_H / 2, 0);
+    boxInto(gap, 0.06, INNER_H, d, mats.fabric, INNER_W / 2 + 0.03, INNER_H / 2, 0);
+    boxInto(gap, INNER_W + 0.12, 0.06, d, mats.fabric, 0, INNER_H + 0.03, 0);
+    boxInto(gap, INNER_W, 0.08, d, mats.floor, 0, 0.04, 0);
+    for (const side of [-1, 1]) {
+      const glowMat = new THREE.MeshBasicMaterial({ color: LIGHT_STATE_COLORS.idle });
+      boxInto(gap, 0.12, 0.025, d - 0.06, glowMat, side * 0.55, 0.095, 0, 'vestibuleGlow');
+    }
+    group.add(gap);
+  }
+
+  // Exit pose for the chain cursor (P3 reads the same numbers via foldChainEnd).
+  const end = frames[N - 1];
+  group.userData.exit = { x: end.x, z: end.z, yawRad: end.yaw };
+  return group;
+}
+
+/**
+ * EXTENSION — straight tube of `bays × 0.6 m` (plan §5.2). Local frame: entry
+ * at z=0 facing +Z. 'ribbed' = ring-per-bay + fabric (the vestibule look,
+ * elongated); 'solid' = the art's rigid mid-tube (hull walls, groove seams
+ * every 1.2 m, collar ring + amber band every 2.4 m).
+ */
+export function buildExtension(bays: number, skin: 'ribbed' | 'solid' = 'ribbed'): THREE.Group {
+  const group = new THREE.Group();
+  const nBays = clampExtBays(bays);
+  const len = nBays * EXT_BAY_LEN;
+  group.name = 'connectorExtension';
+  group.userData = { isConnectorPart: true, kind: 'ext', bays: nBays, skin };
+  const mats = partMats();
+
+  if (skin === 'ribbed') {
+    // Ring frame at every bay boundary, continuous inner fabric tube between.
+    for (let k = 0; k <= nBays; k++) {
+      const big = k % 2 === 0;
+      const ring = ringGroup(mats, big ? 3.45 : 3.25, big ? 3.65 : 3.45, 0.18, 0.22);
+      ring.position.set(0, 0, k * EXT_BAY_LEN);
+      group.add(ring);
+    }
+    const fabricD = len - 0.2;
+    boxInto(group, 0.06, INNER_H, fabricD, mats.fabric, -(INNER_W / 2 + 0.03), INNER_H / 2, len / 2);
+    boxInto(group, 0.06, INNER_H, fabricD, mats.fabric, INNER_W / 2 + 0.03, INNER_H / 2, len / 2);
+    boxInto(group, INNER_W + 0.12, 0.06, fabricD, mats.fabric, 0, INNER_H + 0.03, len / 2);
+  } else {
+    // Solid hull: full-length walls + ceiling in frame gunmetal.
+    boxInto(group, 0.14, INNER_H, len, mats.frame, -(INNER_W / 2 + 0.07), INNER_H / 2, len / 2);
+    boxInto(group, 0.14, INNER_H, len, mats.frame, INNER_W / 2 + 0.07, INNER_H / 2, len / 2);
+    boxInto(group, INNER_W + 0.28, 0.12, len, mats.frame, 0, INNER_H + 0.06, len / 2);
+    // Recessed groove seams every 1.2 m (panel-line read).
+    for (let z = 1.2; z < len - 0.05; z += 1.2) {
+      for (const side of [-1, 1]) {
+        boxInto(group, 0.02, INNER_H - 0.3, 0.1, mats.groove, side * (INNER_W / 2 + 0.15), INNER_H / 2, z);
+      }
+    }
+    // Heavier collar ring + amber accent band every 2.4 m.
+    for (let z = 0; z <= len + 0.01; z += 2.4) {
+      const collar = ringGroup(mats, 3.55, 3.75, 0.22, 0.26);
+      collar.position.set(0, 0, Math.min(z, len));
+      group.add(collar);
+      boxInto(group, 3.56, 0.1, 0.1, mats.accent, 0, INNER_H + 0.34, Math.min(z, len));
+    }
+  }
+
+  // Full-length floor plate + guide glow strips (both skins).
+  boxInto(group, INNER_W, 0.08, len, mats.floor, 0, 0.04, len / 2);
+  for (const side of [-1, 1]) {
+    const glowMat = new THREE.MeshBasicMaterial({ color: LIGHT_STATE_COLORS.idle });
+    boxInto(group, 0.12, 0.025, len - 0.2, glowMat, side * 0.55, 0.095, len / 2, 'vestibuleGlow');
+  }
+
+  group.userData.exit = { x: 0, z: len, yawRad: 0 };
+  return group;
+}
+
+/** Exit pose of one segment in ITS OWN local frame (pure math — no meshes). */
+function segmentExit(seg: ConnectorSegment): { x: number; z: number; yawRad: number } {
+  if (seg.kind === 'flex') {
+    const th = THREE.MathUtils.degToRad(clampFlexBend(seg.bendDeg ?? 0));
+    const len = FLEX_REST_LEN + clampFlexStretch(seg.stretch ?? 0);
+    const f = flexArcFrame(th, len, 1);
+    return { x: f.x, z: f.z, yawRad: f.yaw };
+  }
+  return { x: 0, z: clampExtBays(seg.bays ?? EXT_BAYS_MIN) * EXT_BAY_LEN, yawRad: 0 };
+}
+
+/**
+ * Fold the transform cursor through a segment chain (pure math): returns the
+ * chain's EXIT pose in the chain-local frame (entry at origin facing +Z).
+ * P3 poses the far room's projection with exactly this. Includes the two
+ * portal margins so meshes and math agree.
+ */
+export function foldChainEnd(segments: ConnectorSegment[]): { x: number; z: number; yawRad: number } {
+  let x = 0, z = CHAIN_PORTAL_MARGIN, yaw = 0;
+  for (const seg of segments) {
+    const e = segmentExit(seg);
+    // Rotate the segment's local exit offset by the accumulated yaw.
+    x += e.x * Math.cos(yaw) + e.z * Math.sin(yaw);
+    z += -e.x * Math.sin(yaw) + e.z * Math.cos(yaw);
+    yaw += e.yawRad;
+  }
+  // Exit portal margin along the final heading.
+  x += CHAIN_PORTAL_MARGIN * Math.sin(yaw);
+  z += CHAIN_PORTAL_MARGIN * Math.cos(yaw);
+  return { x, z, yawRad: yaw };
+}
+
+/** Gap between the door face / chain end and the heavy portal planes. */
+export const CHAIN_PORTAL_MARGIN = 0.3;
+
+/**
+ * Build a full connector chain outward from `doorId` (plan §5/P1): heavy
+ * portal at the door face, each segment posed at the folded cursor, heavy
+ * portal at the exit. Same outer positioning contract as buildVestibule
+ * (group at the ±6 wall, local +Z = outward door axis), and the group answers
+ * to setVestibuleLightState / setVestibuleOpacity unchanged.
+ */
+export function buildConnectorChain(doorId: VestibuleDoorId, segments: ConnectorSegment[]): THREE.Group {
+  const group = new THREE.Group();
+  group.name = 'dockingVestibule'; // world.ts treats chains exactly like vestibules
+  group.userData = { doorId, isVestibule: true, isConnectorChain: true, lightState: 'idle', segments };
+  const mats = partMats();
+
+  // Door-face portal.
+  const entry = portalGroup(mats);
+  entry.position.set(0, 0, 0.12);
+  group.add(entry);
+
+  // Fold the cursor through the segments, adding each part's meshes.
+  let x = 0, z = CHAIN_PORTAL_MARGIN, yaw = 0;
+  for (const seg of segments) {
+    const part = seg.kind === 'flex'
+      ? buildFlexJoint(seg.bendDeg ?? 0, seg.stretch ?? 0)
+      : buildExtension(seg.bays ?? EXT_BAYS_MIN, seg.skin ?? 'ribbed');
+    part.position.set(x, 0, z);
+    part.rotation.y = yaw;
+    group.add(part);
+    const e = part.userData.exit as { x: number; z: number; yawRad: number };
+    x += e.x * Math.cos(yaw) + e.z * Math.sin(yaw);
+    z += -e.x * Math.sin(yaw) + e.z * Math.cos(yaw);
+    yaw += e.yawRad;
+  }
+
+  // Exit portal at the folded end, facing the final heading.
+  const exit = portalGroup(mats);
+  exit.position.set(x + 0.18 * Math.sin(yaw), 0, z + 0.18 * Math.cos(yaw));
+  exit.rotation.y = yaw;
+  group.add(exit);
+
+  // Same wall-face placement as buildVestibule.
+  switch (doorId) {
+    case 'north': group.position.set(0, 0, -6); group.rotation.y = Math.PI; break;
+    case 'south': group.position.set(0, 0, 6); group.rotation.y = 0; break;
+    case 'east': group.position.set(6, 0, 0); group.rotation.y = Math.PI / 2; break;
+    case 'west': group.position.set(-6, 0, 0); group.rotation.y = -Math.PI / 2; break;
+  }
+  return group;
+}
+
 /**
  * Tint every mesh named 'vestibuleGlow' (guide strips + portal status strips)
  * to reflect the airlock state: idle cyan, cycling amber, fault red.
