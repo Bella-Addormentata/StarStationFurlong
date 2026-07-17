@@ -665,6 +665,23 @@ export class Player {
   }
 
   /**
+   * #63: true once the avatar is on (or sliding onto) a seat, so the movement
+   * tick can broadcast a seated flag and peers render the seated pose instead of
+   * an idle stand at the chair.
+   */
+  public isSeated(): boolean {
+    return this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN';
+  }
+
+  /**
+   * #63: the seated world facing (seat.faceAngle — avatar's BACK to the backrest)
+   * to broadcast so peers orient the sit pose correctly. 0 when not seated.
+   */
+  public getSeatedFacing(): number {
+    return this.isSeated() && this.sitTarget ? this.sitTarget.faceAngle : 0;
+  }
+
+  /**
    * Public eviction wrapping the stand-up path (E3 of #25): the room editor
    * calls it before carrying the item the local player is sitting on. Any
    * deferred action is dropped — the sit is over, nothing should resume —

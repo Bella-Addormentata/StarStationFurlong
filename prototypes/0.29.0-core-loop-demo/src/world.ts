@@ -43,6 +43,10 @@ interface RemoteAvatar {
   lastZ: number;
   /** Sender-reported moving flag (movement tick flags bit0). */
   moving: boolean;
+  /** #63: sender-reported seated flag (movement tick flags bit1). */
+  seated: boolean;
+  /** #63: seated world facing (tick yaw when seated) — orients the sit pose. */
+  facing: number;
   /** Last known 8-way facing (radians, π/4 steps). */
   heading: number;
 }
@@ -1180,7 +1184,14 @@ export class World {
     });
   }
 
-  public updateRemotePlayer(id: string, x: number, z: number, moving: boolean = false) {
+  public updateRemotePlayer(
+    id: string,
+    x: number,
+    z: number,
+    moving: boolean = false,
+    seated: boolean = false,
+    facing: number = 0,
+  ) {
     const avatar = this.remotePlayers.get(id);
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
@@ -1195,6 +1206,8 @@ export class World {
         targetX: x, targetZ: z,
         lastX: x, lastZ: z,
         moving,
+        seated,
+        facing,
         heading: 0,
       });
       return;
@@ -1204,6 +1217,8 @@ export class World {
     avatar.targetX = x;
     avatar.targetZ = z;
     avatar.moving = moving;
+    avatar.seated = seated;
+    avatar.facing = facing;
   }
 
   /**
@@ -1223,6 +1238,14 @@ export class World {
       // Robust moving detection: trust the sender's flag OR the fact that we
       // are still visibly far from the target — animates even when the flag is
       // unreliable, and settles to idle on arrival.
+      // #63: a seated peer renders the sit pose at the seat facing and skips the
+      // motion-derived walk/idle path entirely (still lerps to the seat point).
+      if (avatar.seated) {
+        avatar.rig.setState('sit_chair', avatar.facing);
+        avatar.rig.update();
+        continue;
+      }
+
       const remaining = Math.hypot(avatar.targetX - pos.x, avatar.targetZ - pos.z);
       const moving = avatar.moving || remaining > 0.05;
 
