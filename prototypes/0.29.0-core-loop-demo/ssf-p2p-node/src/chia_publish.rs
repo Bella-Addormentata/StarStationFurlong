@@ -12,6 +12,9 @@
 //! Behind the `chia-lane` feature; runtime-gated by SSF_CHIA_LANE=1 at the caller.
 #![cfg(feature = "chia-lane")]
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Result};
 use chia_bls::{aggregate, sign, PublicKey, SecretKey, Signature};
 use chia_protocol::{Bytes, Bytes32, Coin, CoinSpend, SpendBundle};
@@ -120,6 +123,112 @@ pub fn build_publish_bundle(
     }
     let aggregated: Signature = aggregate(&sigs);
     Ok(SpendBundle::new(coin_spends, aggregated))
+}
+
+// ── Slice 6: heartbeat publisher for ARMED rooms ─────────────────────────────
+
+/// Publish cadence once a room's last publish SUCCEEDED (the ~30–60 min
+/// heartbeat from the ChiaHub plan §3.1; 30 min keeps records fresh well inside
+/// resolvers' freshness window).
+const HEARTBEAT_OK_SECS: u64 = 30 * 60;
+/// Retry cadence after a FAILED publish (e.g. wallet unfunded) — frequent enough
+/// to pick up a faucet funding within minutes, sparse enough not to spam logs.
+const HEARTBEAT_RETRY_SECS: u64 = 5 * 60;
+/// Loop tick — how often armed rooms are checked for due publishes.
+const HEARTBEAT_TICK_SECS: u64 = 60;
+
+/// Last publish attempt per room (loop-local; rebuilt on node restart, which just
+/// causes one early republish — harmless, spend-to-self is idempotent in effect).
+struct PublishMark {
+    room_key: [u8; 32],
+    addrs_sig: String,
+    at: Instant,
+    ok: bool,
+}
+
+/// Slice 6: the REAL-room publisher — what makes the lane operate beyond the
+/// fixed-test-key SLICE 4 hook. Every armed room (its browser delivered the room
+/// key with chia_mode=true — the "advanced Chia mesh mode" toggle) gets a
+/// presence record sealed under its REAL room key published: within one tick of
+/// arming, every ~30 min thereafter, immediately on address change, and on a
+/// 5-min retry after failures (e.g. unfunded wallet — the log tells the operator
+/// to fund).
+///
+/// At most ONE room publishes per tick: sequential spends inside one ~19 s block
+/// window would double-spend the same wallet coin (the recreated coin only
+/// becomes findable once its block confirms), so due rooms drain one per minute —
+/// far faster than the 30-min cadence needs. Every failure is log-and-continue;
+/// the lane never affects the mesh.
+pub async fn heartbeat_loop(
+    hub: crate::SharedHub,
+    iroh_ep: iroh::Endpoint,
+    iroh_sk: iroh::SecretKey,
+    chia_sk: SecretKey,
+) {
+    let mut marks: HashMap<String, PublishMark> = HashMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(HEARTBEAT_TICK_SECS)).await;
+        // Live addresses (F3 rule: hints are live data, not a boot-time snapshot).
+        let addrs: Vec<String> = iroh_ep
+            .addr()
+            .ip_addrs()
+            .filter(|sock| !sock.ip().is_unspecified())
+            .map(|sock| sock.to_string())
+            .collect();
+        if addrs.is_empty() {
+            continue; // nothing routable to advertise yet
+        }
+        let addrs_sig = addrs.join(",");
+        let armed: Vec<(String, [u8; 32])> = hub
+            .chia_rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, cap)| cap.chia_mode)
+            .map(|(room, cap)| (room.clone(), cap.room_key))
+            .collect();
+        // Forget rooms no longer armed (toggle flipped off / cap replaced).
+        marks.retain(|room, _| armed.iter().any(|(r, _)| r == room));
+        for (room, room_key) in armed {
+            let due = match marks.get(&room) {
+                None => true,
+                Some(m) => {
+                    m.room_key != room_key
+                        || m.addrs_sig != addrs_sig
+                        || m.at.elapsed()
+                            >= Duration::from_secs(if m.ok {
+                                HEARTBEAT_OK_SECS
+                            } else {
+                                HEARTBEAT_RETRY_SECS
+                            })
+                }
+            };
+            if !due {
+                continue;
+            }
+            let ok = match publish_presence(&iroh_sk, &chia_sk, &room_key, &addrs).await {
+                Ok(hint) => {
+                    println!(
+                        "⛓️ ChiaHub heartbeat: presence published for room {room} · hint {}",
+                        hex::encode(&hint.to_bytes()[..8])
+                    );
+                    true
+                }
+                Err(e) => {
+                    eprintln!(
+                        "⛓️ ChiaHub heartbeat: publish for room {room} failed: {e:#} (retry in {} min)",
+                        HEARTBEAT_RETRY_SECS / 60
+                    );
+                    false
+                }
+            };
+            marks.insert(
+                room,
+                PublishMark { room_key, addrs_sig: addrs_sig.clone(), at: Instant::now(), ok },
+            );
+            break; // one publish per tick — see doc comment (mempool double-spend)
+        }
+    }
 }
 
 /// Full publish: seal the presence record, find our coin, spend-to-self with the

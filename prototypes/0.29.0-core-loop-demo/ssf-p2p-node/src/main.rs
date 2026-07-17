@@ -1043,12 +1043,18 @@ async fn main() -> Result<()> {
     // BLS identity and print its testnet11 receive address to fund. Gated at
     // runtime by SSF_CHIA_LANE=1 inside log_receive_address. The seed persists
     // beside the iroh key (bare CWD-relative path, same convention).
+    // Slice 6 stash: the wallet key outlives this block so the heartbeat
+    // publisher (spawned after HubState exists — it reads hub.chia_rooms)
+    // can sign spends for ARMED rooms.
+    #[cfg(feature = "chia-lane")]
+    let mut chia_heartbeat_sk: Option<chia_bls::SecretKey> = None;
     #[cfg(feature = "chia-lane")]
     {
         let seed_path = std::path::Path::new("chia_identity.seed");
         match chia_wallet::load_or_mint_bls_key(seed_path) {
             Ok(chia_sk) => {
                 chia_wallet::log_receive_address(&chia_sk);
+                chia_heartbeat_sk = Some(chia_sk.clone());
                 // SLICE 4 test hook (SSF_CHIA_PUBLISH_TEST=1): once at startup, spend
                 // a coin to publish a presence record under a FIXED test room key, so
                 // the publish->resolve loop can be validated without a browser having
@@ -1133,6 +1139,23 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-lane")]
         chia_rooms: Mutex::new(HashMap::new()),
     });
+
+    // ⛓️ ChiaHub C1 SLICE 6 (chia-lane): the REAL-room heartbeat publisher.
+    // Every armed room (browser delivered its room key with chia_mode=true via
+    // the Slice 3/3b toggle) gets presence published under its REAL room key —
+    // within a minute of arming, every ~30 min after, and on address change.
+    // The SLICE 4 test hook publishes only a fixed test key; this is the live lane.
+    #[cfg(feature = "chia-lane")]
+    if std::env::var("SSF_CHIA_LANE").ok().as_deref() == Some("1") {
+        if let Some(chia_sk) = chia_heartbeat_sk.clone() {
+            let hub_hb = hub.clone();
+            let iroh_hb = iroh_endpoint.clone();
+            let iroh_sk_hb = secret_key.clone();
+            tokio::spawn(async move {
+                chia_publish::heartbeat_loop(hub_hb, iroh_hb, iroh_sk_hb, chia_sk).await;
+            });
+        }
+    }
 
     // M5.1: the node's first-ever liveness — a heartbeat loop that pings mesh
     // neighbors, prunes silent ones, and (M5.3) rebalances the bounded neighbor
