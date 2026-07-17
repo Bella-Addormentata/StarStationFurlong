@@ -24,6 +24,7 @@ import {
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
+import { bindDoorsDoc } from './doorsDoc';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
   setActivePassRoom, removePass, passRoomInfo, passSeed, type PassState,
@@ -614,6 +615,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // sync burst that gives a joiner the host's arrangement). Rebinds per join
   // like players/games/roomInfo (T0 seam).
   bindFurnitureDoc(sync.doc);
+
+  // Bind the shared door-pairing map (issue #64): keyed by door id, drives
+  // world.reconcileDoors so a module another user docks to a door becomes visible
+  // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
+  bindDoorsDoc(sync.doc);
 
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so

@@ -600,6 +600,55 @@ export class DoorDockingPortSystem {
   }
 
   /**
+   * #64: apply a pairing ANOTHER user in the room made, delivered via the shared
+   * `doors` doc. Mirrors completePairing's accept branch (open door, draw the
+   * adjacent-module projection, mark paired so transitReady passes) but does NOT
+   * fire onPairingStatusChanged — that callback publishes to the doc, and a remote
+   * apply must never re-publish (it would loop). Idempotent: re-applying the same
+   * pairing is a no-op (drawAdjacentRoomProjection guards on adjacentRooms.has).
+   */
+  public applyRemotePairing(doorId: DoorId, address: string): void {
+    const state = this.doorState.get(doorId);
+    if (!state) return;
+    if (state.pairedSuccessfully && state.connectedRoomAddress === address) return;
+    state.connectedRoomAddress = address;
+    state.pairingPending = false;
+    state.pairedSuccessfully = true;
+    state.locked = false;
+    this.syncLEDStatus(doorId, state);
+    this.drawAdjacentRoomProjection(doorId);
+    this.openDoor(doorId);
+  }
+
+  /**
+   * #64: reverse a pairing removed from the shared `doors` doc (unpair) — tear the
+   * projection down, close + re-lock the door. No-op on an already-unpaired door,
+   * and (like applyRemotePairing) never fires the publish callback.
+   */
+  public clearRemotePairing(doorId: DoorId): void {
+    const state = this.doorState.get(doorId);
+    if (!state || !state.pairedSuccessfully) return;
+    state.pairedSuccessfully = false;
+    state.pairingPending = false;
+    state.connectedRoomAddress = '';
+    state.locked = true;
+    this.removeAdjacentRoomProjection(doorId);
+    this.closeDoor(doorId);
+    this.syncLEDStatus(doorId, state);
+  }
+
+  /** Remove + dispose the adjacent-module gray-box projection (inverse of
+   *  drawAdjacentRoomProjection). */
+  private removeAdjacentRoomProjection(doorId: DoorId): void {
+    const adj = this.adjacentRooms.get(doorId);
+    if (!adj) return;
+    this.roomsGroup.remove(adj);
+    adj.geometry.dispose();
+    if (adj.material instanceof THREE.Material) adj.material.dispose();
+    this.adjacentRooms.delete(doorId);
+  }
+
+  /**
    * Request the door leaves to slide open. onComplete fires exactly once when
    * both leaves reach the open position. A newer opposite-direction request
    * on the same door overwrites the in-flight slide (its onComplete is
