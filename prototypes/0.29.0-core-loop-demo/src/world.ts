@@ -591,7 +591,13 @@ export class World {
     for (const doorId of doors) {
       const rec = records.get(doorId);
       if (rec && rec.paired && rec.connectedRoomAddress) {
-        this.dockingSystem.applyRemotePairing(doorId, rec.connectedRoomAddress);
+        // #62 P2: geometry (sanitized by readAllDoors) rides along; the diff
+        // inside applyRemotePairing catches chain edits on a same-address record.
+        this.dockingSystem.applyRemotePairing(doorId, rec.connectedRoomAddress, {
+          segments: rec.segments,
+          farDoor: rec.farDoor,
+          farYawDeg: rec.farYawDeg,
+        });
       } else {
         this.dockingSystem.clearRemotePairing(doorId);
       }
@@ -1560,7 +1566,14 @@ export class World {
    * falls back to EAST (the canonical large door). East/west departures can
    * never hit the fallback.
    */
-  public resolveArrivalDoor(departureDoorId: DoorId): DoorTarget {
+  public resolveArrivalDoor(departureDoorId: DoorId, farDoor?: DoorId): DoorTarget {
+    // #62 P2: an assembled connection knows exactly which far door it lands on
+    // (the record's farDoor) — prefer it when enabled. The angled octagon links
+    // routinely land on NON-opposite doors (e.g. depart east, arrive north).
+    if (farDoor) {
+      const preferred = findDoor(farDoor);
+      if (preferred && preferred.enabled) return preferred;
+    }
     const opposite: Record<DoorId, DoorId> = {
       north: 'south', south: 'north', east: 'west', west: 'east',
     };
@@ -1791,8 +1804,16 @@ export class World {
     // does NOT fire this callback, so applying a remote pairing never re-publishes.
     this.dockingSystem.onPairingStatusChanged((doorId, status) => {
       if (status === 'ACCEPTED') {
-        const addr = this.dockingSystem?.getDockingState(doorId as 'north' | 'south' | 'east' | 'west')?.connectedRoomAddress;
-        if (addr) writeDoorPairing(doorId, addr);
+        const st = this.dockingSystem?.getDockingState(doorId as 'north' | 'south' | 'east' | 'west');
+        if (st?.connectedRoomAddress) {
+          // #62 P2: an assembled chain publishes its geometry with the pairing
+          // (absent on plain pairings — the legacy record shape, v0.30.x-safe).
+          writeDoorPairing(doorId, st.connectedRoomAddress, {
+            segments: st.segments,
+            farDoor: st.farDoor,
+            farYawDeg: st.farYawDeg,
+          });
+        }
       } else if (status === 'REJECTED') {
         deleteDoorPairing(doorId);
       }

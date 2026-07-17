@@ -13,6 +13,7 @@ import * as THREE from 'three';
 import { findDoor } from './doors';
 import type { DoorId } from './doors';
 import { getCameraYaw } from './cameraRig';
+import type { ConnectorSegment } from './adapter';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -28,6 +29,12 @@ export interface DockingState {
   connectedRoomAddress: string; // Target room URL seed
   pairingPending: boolean;
   pairedSuccessfully: boolean;
+  /** #62 P2 (optional — absent on legacy pairings): the connection's assembled
+   *  connector chain + far-side geometry, mirrored from the doors doc. P3
+   *  renders the chain + poses the projection from these; P2 only stores/diffs. */
+  segments?: ConnectorSegment[];
+  farDoor?: 'north' | 'south' | 'east' | 'west';
+  farYawDeg?: 0 | 45;
 }
 
 export class DoorDockingPortSystem {
@@ -607,11 +614,25 @@ export class DoorDockingPortSystem {
    * apply must never re-publish (it would loop). Idempotent: re-applying the same
    * pairing is a no-op (drawAdjacentRoomProjection guards on adjacentRooms.has).
    */
-  public applyRemotePairing(doorId: DoorId, address: string): void {
+  public applyRemotePairing(
+    doorId: DoorId,
+    address: string,
+    geometry?: { segments?: ConnectorSegment[]; farDoor?: DoorId; farYawDeg?: 0 | 45 },
+  ): void {
     const state = this.doorState.get(doorId);
     if (!state) return;
-    if (state.pairedSuccessfully && state.connectedRoomAddress === address) return;
+    // #62 P2: idempotency must diff the GEOMETRY too — a post-pairing chain
+    // edit rewrites the record with the same address, and every client must
+    // pick it up (P3 rebuilds the chain + reposes the projection on change).
+    const sameGeometry =
+      JSON.stringify(state.segments ?? null) === JSON.stringify(geometry?.segments ?? null) &&
+      state.farDoor === geometry?.farDoor &&
+      state.farYawDeg === geometry?.farYawDeg;
+    if (state.pairedSuccessfully && state.connectedRoomAddress === address && sameGeometry) return;
     state.connectedRoomAddress = address;
+    state.segments = geometry?.segments;
+    state.farDoor = geometry?.farDoor;
+    state.farYawDeg = geometry?.farYawDeg;
     state.pairingPending = false;
     state.pairedSuccessfully = true;
     state.locked = false;
@@ -631,6 +652,9 @@ export class DoorDockingPortSystem {
     state.pairedSuccessfully = false;
     state.pairingPending = false;
     state.connectedRoomAddress = '';
+    state.segments = undefined;
+    state.farDoor = undefined;
+    state.farYawDeg = undefined;
     state.locked = true;
     this.removeAdjacentRoomProjection(doorId);
     this.closeDoor(doorId);
