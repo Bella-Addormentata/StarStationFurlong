@@ -168,7 +168,7 @@ export interface ChatMessage {
 // Movement tick codec — the 13-byte hand-packed DataView from the Phase 1 plan
 // (Task 3.2 / 3.4: no JSON, no MessagePack on the hot path).
 // Layout (little-endian) — adjustable in Sprint 3, budget is fixed at 13 bytes:
-//   [0]      u8   flags (bit0: moving, bit1: interact-anim, rest reserved)
+//   [0]      u8   flags (bit0: moving, bit1: seated [#63], rest reserved)
 //   [1..5)   f32  x
 //   [5..9)   f32  z
 //   [9..11)  u16  yaw    (radians × 10430.378 → 0..65535 wraps 2π)

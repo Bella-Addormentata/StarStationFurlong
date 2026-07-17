@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.1 — 2026-07-17
+
+### Seated Players Now Look Seated to Everyone (issue #63)
+
+- **When a player sat in a chair, everyone else saw them standing upright at the chair.** Sitting was fully implemented locally (the avatar walks over, turns, and slides into a seated pose), but the seated state was never replicated — the 13-byte movement tick only carried a "moving" bit, so remote clients rendered every seated peer as an idle stand at the seat's position.
+- **Fix (frontend, no wire-size change):** the movement tick now carries the seated state in a spare flag bit (bit1) and the seat's facing in the otherwise-unused yaw field. A seated peer is rendered in the `sit_chair` pose at the correct orientation and skips the walk/idle motion path; standing up reverts to idle/walk. No codec change — `packTick`/`unpackTick` already round-trip flags + yaw.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.1 in place). **Frontend-only — the v0.30.0 node binaries are unchanged**, so the experimental `ssf-p2p-node-chia.exe` from v0.30.0 still applies for Chia-lane testing.
+- **Known-diagnosed, not in this release:** issue #64 (a provisioned + docked module does not show up for other users) is fully diagnosed — door pairings are local-only and never enter the shared room doc. The fix (a synced door-pairing doc mirroring the furniture-layout sync) touches the docking/vestibule subsystem and wants a two-user runtime test, so it is landing as a focused follow-up rather than being rushed here.
+
 ## v0.30.0 — 2026-07-16
 
 ### ChiaHub Introduction Lane — Sovereign Chain Discovery (EXPERIMENTAL test build)

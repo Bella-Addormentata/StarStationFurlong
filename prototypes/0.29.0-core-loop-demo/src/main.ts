@@ -820,7 +820,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       seenPeers.add(peerId);
       receivedTicks++;
       remoteLastSeen.set(peerId, performance.now());
-      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1);
+      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1, (tick.flags & 2) === 2, tick.yaw);
     } catch (e) {
       console.warn('Error unpacking incoming remote peer datagram tick:', e);
     }
@@ -3373,11 +3373,15 @@ function animate() {
     if (world.isPlayerActive() && currentTime - lastTickSent >= 50) {
       const localPos = world.getPlayer().getPosition();
       const dir = inputManager.getMoveDirection();
+      // #63: broadcast the seated pose over the existing tick lane — bit1 = seated,
+      // and the otherwise-unused yaw field carries the seat facing so peers render
+      // 'sit_chair' at the right orientation instead of an idle stand at the chair.
+      const seated = world.getPlayer().isSeated();
       const tickData = {
-        flags: (dir.x !== 0 || dir.z !== 0) ? 1 : 0,
+        flags: ((dir.x !== 0 || dir.z !== 0) ? 1 : 0) | (seated ? 2 : 0),
         x: localPos.x,
         z: localPos.z,
-        yaw: 0, // fixed direction for isometric rotation
+        yaw: seated ? world.getPlayer().getSeatedFacing() : 0,
         seq: localSeq++,
       };
       
