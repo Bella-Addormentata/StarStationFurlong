@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.2 — 2026-07-17
+
+### Docked Modules Now Appear for Everyone in the Room (issue #64)
+
+- **A module you provisioned and docked to a door was invisible to the other players in the room** — they couldn't see the adjacent-module projection and got "No room docked at this port" when they tried to walk through. Door pairings lived only in the local docking system's private state and never entered the shared room doc, so everyone else's door read unpaired.
+- **Fix (frontend):** door pairings are now part of the shared room doc — a new `doors` map keyed by door id, mirroring the furniture-layout sync that already keeps every client's arrangement in step. When one user docks a module, the pairing publishes to the doc; every other client reconciles it, drawing the module projection, opening the door, and enabling transit. Applying a remote pairing is idempotent and self-echo-safe (it never re-publishes), and unpairing tears the projection back down. A player who never docks a module sees no change.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.2 in place). **Frontend-only — the v0.30.0 node binaries are unchanged**, so the experimental `ssf-p2p-node-chia.exe` from v0.30.0 still applies for Chia-lane testing. This can be exercised in the same multi-machine session as the Chia test: dock a module on one machine and confirm the others see + enter it.
+
 ## v0.30.1 — 2026-07-17
 
 ### Seated Players Now Look Seated to Everyone (issue #63)
