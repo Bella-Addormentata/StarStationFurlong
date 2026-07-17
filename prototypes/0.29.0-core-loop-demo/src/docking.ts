@@ -13,7 +13,7 @@ import * as THREE from 'three';
 import { findDoor } from './doors';
 import type { DoorId } from './doors';
 import { getCameraYaw } from './cameraRig';
-import type { ConnectorSegment } from './adapter';
+import { projectionPoseForDoor, type ConnectorSegment } from './adapter';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -811,7 +811,19 @@ export class DoorDockingPortSystem {
    * Render "Gray Box" Projection of the connected room outside the doorway
    */
   private drawAdjacentRoomProjection(doorId: 'north' | 'south' | 'east' | 'west') {
-    if (this.adjacentRooms.has(doorId)) return;
+    // #62 P3: the projection is POSED FROM THE CONNECTION RECORD — the far
+    // room's box sits at the folded chain's exit (at its angle) instead of the
+    // old hardcoded cardinal 15.2. Legacy pairings (no segments) get the exact
+    // pre-#62 pose from the same pure function. Rebuild-on-diff: a chain edit
+    // re-runs this via applyRemotePairing's geometry diff, so an existing box
+    // drawn with the SAME geometry stays; a different one is disposed+redrawn.
+    const state = this.doorState.get(doorId);
+    const poseKey = JSON.stringify({ s: state?.segments ?? null, f: state?.farDoor ?? null });
+    const existing = this.adjacentRooms.get(doorId);
+    if (existing) {
+      if (existing.userData.poseKey === poseKey) return; // unchanged — keep it
+      this.removeAdjacentRoomProjection(doorId);
+    }
 
     // Establish scale boundaries equal to active lounge (12x12 plane)
     const roomGeo = new THREE.BoxGeometry(11.8, 4.0, 11.8);
@@ -823,24 +835,16 @@ export class DoorDockingPortSystem {
       opacity: 0.45,
       wireframe: false,
     });
-    
+
     const adjRoom = new THREE.Mesh(roomGeo, roomMat);
-    
-    // Position the adjoining module on the FAR side of the docking vestibule
-    // (#51): the gangway spans the ~6→9 band outside the wall (outer portal
-    // ≈9.0), so centring the 11.8-wide box 15.2 out puts its near face at
-    // 15.2 − 5.9 = 9.3 — clear of the vestibule instead of touching the wall.
-    const offset = 15.2; // room centre → adjoining module centre
-    switch (doorId) {
-      case 'north': adjRoom.position.set(0, 2, -offset); break;
-      case 'south': adjRoom.position.set(0, 2, offset); break;
-      case 'west': adjRoom.position.set(-offset, 2, 0); break;
-      case 'east': adjRoom.position.set(offset, 2, 0); break;
-    }
+    const pose = projectionPoseForDoor(doorId, state?.segments, state?.farDoor);
+    adjRoom.position.set(pose.x, 2, pose.z);
+    adjRoom.rotation.y = pose.rotY;
+    adjRoom.userData.poseKey = poseKey;
 
     this.roomsGroup.add(adjRoom);
     this.adjacentRooms.set(doorId, adjRoom);
-    
+
     console.log(`📡 Rendered "Gray Box" projection of external capsule outside ${doorId.toUpperCase()} portal`);
   }
 

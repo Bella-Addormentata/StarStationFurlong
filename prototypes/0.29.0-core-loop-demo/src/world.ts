@@ -18,7 +18,7 @@ import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type
 import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
-import { buildVestibule, setVestibuleLightState, setVestibuleOpacity } from './adapter';
+import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
 import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
@@ -1448,11 +1448,23 @@ export class World {
    * exist for well under a second behind the full-screen fade, so that
    * polish is deliberately skipped.
    */
+  /** #62 P3: build the door's connector from its pairing RECORD — an
+   *  assembled chain when segments exist, the legacy straight gangway
+   *  otherwise. The geometry key on userData drives rebuild-on-diff. */
+  private buildDoorConnector(doorId: DoorId): THREE.Group {
+    const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
+    const group = segments && segments.length > 0
+      ? buildConnectorChain(doorId, segments)
+      : buildVestibule(doorId);
+    group.userData.segmentsKey = JSON.stringify(segments ?? null);
+    return group;
+  }
+
   private spawnTransitVestibule(doorId: DoorId): void {
     this.endTransitVestibule();
     let vestibule = this.pairedVestibules.get(doorId);
     if (!vestibule) {
-      vestibule = buildVestibule(doorId);
+      vestibule = this.buildDoorConnector(doorId);
       this.platformGroup.add(vestibule);
       this.pairedVestibules.set(doorId, vestibule);
     }
@@ -1517,7 +1529,8 @@ export class World {
     const activeDoorId = this.player.getActiveDoorId();
 
     for (const door of DOORS) {
-      const paired = ds.getDockingState(door.id)?.pairedSuccessfully === true;
+      const state = ds.getDockingState(door.id);
+      const paired = state?.pairedSuccessfully === true;
       let vestibule = this.pairedVestibules.get(door.id);
 
       if (!paired) {
@@ -1531,8 +1544,21 @@ export class World {
         continue;
       }
 
+      // #62 P3 rebuild-on-diff: a chain edit changes the record's segments;
+      // rebuild this door's connector to match — but never mid-transit or
+      // mid-walk-through (same deferral rule as unpair; the next frame after
+      // the door sequence ends picks the rebuild up).
+      const wantKey = JSON.stringify(state?.segments ?? null);
+      if (
+        vestibule && vestibule.userData.segmentsKey !== wantKey &&
+        this.transitVestibuleDoorId !== door.id && activeDoorId !== door.id
+      ) {
+        this.disposeVestibule(door.id);
+        vestibule = undefined;
+      }
+
       if (!vestibule) {
-        vestibule = buildVestibule(door.id);
+        vestibule = this.buildDoorConnector(door.id);
         setVestibuleOpacity(vestibule, 0); // fades up to the resting level
         this.platformGroup.add(vestibule);
         this.pairedVestibules.set(door.id, vestibule);

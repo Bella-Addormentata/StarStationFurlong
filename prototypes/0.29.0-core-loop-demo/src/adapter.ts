@@ -402,6 +402,63 @@ export function foldChainEnd(segments: ConnectorSegment[]): { x: number; z: numb
 /** Gap between the door face / chain end and the heavy portal planes. */
 export const CHAIN_PORTAL_MARGIN = 0.3;
 
+// ── #62 P3: far-room projection pose ─────────────────────────────────────────
+
+/** Room half-width (11.8 / 2) — the projection box's centre sits this far past
+ *  the chain exit along the arrival heading (+ the exit-portal margin). */
+const ROOM_HALF = 5.9;
+/** Legacy fixed projection offset (room centre → adjoining module centre). */
+const LEGACY_PROJECTION_OFFSET = 15.2;
+
+/** Outward-normal yaw of each door in ROOM-LOCAL frame (matches the
+ *  buildVestibule placement switch: south faces +Z = yaw 0). */
+const DOOR_YAW: Record<VestibuleDoorId, number> = {
+  south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2,
+};
+const DOOR_POS: Record<VestibuleDoorId, { x: number; z: number }> = {
+  south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, north: { x: 0, z: -6 }, west: { x: -6, z: 0 },
+};
+
+/**
+ * Where (and at what rotation) the FAR room's gray-box projection sits for a
+ * door connection — pure math, room-local coordinates (P3 replaces the
+ * hardcoded cardinal 15.2 offset with this; S-slices reuse it for map views).
+ *
+ * With `segments`: fold the chain from the door face, place the box centre
+ * ROOM_HALF past the exit along the final heading; the box's rotation comes
+ * from `farDoor` (the far room is oriented so that door faces BACK along the
+ * arrival heading) or defaults to the heading itself. Without segments: the
+ * legacy fixed cardinal pose, bit-identical to the pre-#62 behavior.
+ */
+export function projectionPoseForDoor(
+  doorId: VestibuleDoorId,
+  segments?: ConnectorSegment[],
+  farDoor?: VestibuleDoorId,
+): { x: number; z: number; rotY: number } {
+  const dYaw = DOOR_YAW[doorId];
+  const dPos = DOOR_POS[doorId];
+  if (!segments || segments.length === 0) {
+    // Legacy: centre 15.2 out along the cardinal axis, unrotated.
+    return {
+      x: dPos.x === 0 ? 0 : Math.sign(dPos.x) * LEGACY_PROJECTION_OFFSET,
+      z: dPos.z === 0 ? 0 : Math.sign(dPos.z) * LEGACY_PROJECTION_OFFSET,
+      rotY: 0,
+    };
+  }
+  const exit = foldChainEnd(segments);
+  // Chain-local exit → room frame (rotate by the door's outward yaw).
+  const xr = dPos.x + exit.x * Math.cos(dYaw) + exit.z * Math.sin(dYaw);
+  const zr = dPos.z - exit.x * Math.sin(dYaw) + exit.z * Math.cos(dYaw);
+  const heading = dYaw + exit.yawRad; // world heading at the chain exit
+  const x = xr + Math.sin(heading) * ROOM_HALF;
+  const z = zr + Math.cos(heading) * ROOM_HALF;
+  // Far room rotation: its `farDoor` faces BACK along the arrival heading.
+  const rotY = farDoor !== undefined
+    ? heading + Math.PI - DOOR_YAW[farDoor]
+    : heading;
+  return { x, z, rotY };
+}
+
 /**
  * Build a full connector chain outward from `doorId` (plan §5/P1): heavy
  * portal at the door face, each segment posed at the folded cursor, heavy
