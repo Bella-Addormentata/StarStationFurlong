@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.3 — 2026-07-17
+
+### ChiaHub Heartbeat — Armed Rooms Now Actually Publish (node-only)
+
+- **Slice 6, the last gap in the introduction lane.** The resolve side (dial-exhaustion → find a lost peer via the chain) already used real room keys, but publishing only fired via a fixed-test-key dev hook — an *armed* room (chia-lane node + `SSF_CHIA_LANE=1` + Chia Mesh toggle ON) would never write its presence. Now a heartbeat publisher covers every armed room: it publishes within a minute of arming, every ~30 min thereafter, immediately on address change, and retries every 5 min after failures (an unfunded wallet logs exactly that, so the operator knows to fund). One room publishes per minute at most — sequential spends inside one ~19 s block window would double-spend the wallet coin.
+- **For the 3-machine chia test, use THIS release's `ssf-p2p-node-chia.exe`** — the v0.30.0–v0.30.2 chia assets predate the heartbeat and will not publish for armed rooms. The default node and the app itself are unchanged in behavior; if you already installed v0.30.2 you only need the new chia exe (no reinstall).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.3 in place). Node-only (feature-gated chia code + a design doc); frontend identical to v0.30.2.
+
 ## v0.30.2 — 2026-07-17
 
 ### Docked Modules Now Appear for Everyone in the Room (issue #64)
