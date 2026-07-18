@@ -130,11 +130,16 @@ export function buildVestibule(doorId: VestibuleDoorId): THREE.Group {
 
   // ── Orient + position per door. Door walls sit at ±6; local +Z maps to the
   //    outward door axis, so the vestibule spans the ~6→9 band. Floor at y=0.
-  switch (doorId) {
-    case 'north': group.position.set(0, 0, -6); group.rotation.y = Math.PI; break;
-    case 'south': group.position.set(0, 0, 6); group.rotation.y = 0; break;
-    case 'east': group.position.set(6, 0, 0); group.rotation.y = Math.PI / 2; break;
-    case 'west': group.position.set(-6, 0, 0); group.rotation.y = -Math.PI / 2; break;
+  //    #66 S1: a slid door carries its vestibule anchor along the wall.
+  {
+    const p = slidDoorPos(doorId);
+    group.position.set(p.x, 0, p.z);
+    switch (doorId) {
+      case 'north': group.rotation.y = Math.PI; break;
+      case 'south': group.rotation.y = 0; break;
+      case 'east': group.rotation.y = Math.PI / 2; break;
+      case 'west': group.rotation.y = -Math.PI / 2; break;
+    }
   }
 
   return group;
@@ -419,6 +424,27 @@ const DOOR_POS: Record<VestibuleDoorId, { x: number; z: number }> = {
   south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, north: { x: 0, z: -6 }, west: { x: -6, z: 0 },
 };
 
+// ── 🧱 #66 S1: door-slide deltas (lateral along each door's wall) ────────────
+// world.reconcileDoorPlacements pushes these; every anchor in this module
+// (vestibule placement, projection poses) adds its door's delta on the wall's
+// lateral axis. 0 everywhere ⇒ bit-identical legacy math. Paired doors can't
+// slide (plan §6.2), so live chains never re-solve — the deltas matter for
+// FUTURE pairings and the unpaired-door peek.
+let slideDeltas: Record<VestibuleDoorId, number> = { north: 0, south: 0, east: 0, west: 0 };
+
+export function setDoorSlideDeltas(d: Record<VestibuleDoorId, number>): void {
+  slideDeltas = { ...d };
+}
+
+/** A door's anchor point WITH its slide applied (n/s slide in x, e/w in z). */
+function slidDoorPos(doorId: VestibuleDoorId): { x: number; z: number } {
+  const base = DOOR_POS[doorId];
+  const d = slideDeltas[doorId] ?? 0;
+  return doorId === 'north' || doorId === 'south'
+    ? { x: base.x + d, z: base.z }
+    : { x: base.x, z: base.z + d };
+}
+
 /**
  * Where (and at what rotation) the FAR room's gray-box projection sits for a
  * door connection — pure math, room-local coordinates (P3 replaces the
@@ -436,12 +462,15 @@ export function projectionPoseForDoor(
   farDoor?: VestibuleDoorId,
 ): { x: number; z: number; rotY: number } {
   const dYaw = DOOR_YAW[doorId];
-  const dPos = DOOR_POS[doorId];
+  const dPos = slidDoorPos(doorId);
+  const base = DOOR_POS[doorId];
   if (!segments || segments.length === 0) {
-    // Legacy: centre 15.2 out along the cardinal axis, unrotated.
+    // Legacy: centre 15.2 out along the cardinal axis; a slid door carries
+    // its projection sideways with it (lateral = the door's slide delta).
+    const northSouth = doorId === 'north' || doorId === 'south';
     return {
-      x: dPos.x === 0 ? 0 : Math.sign(dPos.x) * LEGACY_PROJECTION_OFFSET,
-      z: dPos.z === 0 ? 0 : Math.sign(dPos.z) * LEGACY_PROJECTION_OFFSET,
+      x: northSouth ? dPos.x : Math.sign(base.x) * LEGACY_PROJECTION_OFFSET,
+      z: northSouth ? Math.sign(base.z) * LEGACY_PROJECTION_OFFSET : dPos.z,
       rotY: 0,
     };
   }

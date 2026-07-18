@@ -16,6 +16,9 @@ import { rebuildObstacles } from './obstacles';
 import { rebakeWalkableGrid } from './pathfinding';
 import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
 import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type DoorRecord } from './doorsDoc';
+import { readDoorDeltas } from './floorPlanDoc';
+import { applyDoorSlideDeltas } from './doors';
+import { setDoorSlideDeltas } from './adapter';
 import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
@@ -611,6 +614,22 @@ export class World {
   }
 
   /**
+   * 🧱 #66 S1: re-derive every door anchor from the shared floor plan's
+   * slide deltas — walk targets (doors.ts), the 3D door groups (frame +
+   * leaves + keypad ride together), adapter anchors for FUTURE pairings
+   * (paired doors cannot slide, so live chains never re-solve), and the
+   * north blocking zone (it reads the slid front). Delta 0 everywhere ⇒
+   * bit-identical legacy behavior.
+   */
+  public reconcileDoorPlacements(): void {
+    const deltas = readDoorDeltas();
+    applyDoorSlideDeltas(deltas);
+    setDoorSlideDeltas(deltas);
+    this.dockingSystem?.repositionDoorGroups(deltas);
+    this.updateNorthDoorForFireplace();
+  }
+
+  /**
    * Floor-plan work (owner request): the NORTH door unblocks DYNAMICALLY once
    * the fireplace no longer covers its approach — move the hearth aside and
    * the fourth door opens; move it back and the door disables again. The DEV
@@ -622,7 +641,10 @@ export class World {
     if (!north) return;
     // Approach zone in front of the north wall opening (opening ~1.4 wide at
     // z=-6; the zone reaches to the door's `front` stand-point at z=-4.5).
-    const zone = { x0: -1.4, x1: 1.4, z0: -6.2, z1: -4.4 };
+    // 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid position
+    // (front.x carries the slide delta), the plan §6.2 generalization seed.
+    const cx = north.front.x;
+    const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
     const blocked = FURNITURE.some((item) => {
       if (item.kind !== 'fireplace-wall') return false;
       const fp = FURNITURE_DEFS[item.kind].footprint;

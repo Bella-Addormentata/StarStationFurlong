@@ -22,6 +22,7 @@
 import * as THREE from 'three';
 import { readExterior, nextFreeExteriorSlot, writeExteriorSlot } from './exteriorDoc';
 import { readDoorPolicy } from './doorPolicy';
+import { readDoorDeltas } from './floorPlanDoc';
 
 const HULL = 0x39445A;
 const HULL_DARK = 0x2A3444;
@@ -136,9 +137,15 @@ function buildGroup(): THREE.Group {
     east:  { x: 5.9, z: 0, ry: Math.PI / 2 },
     west:  { x: -5.9, z: 0, ry: -Math.PI / 2 },
   };
-  for (const doorId of ['north', 'south', 'east', 'west']) {
+  const slideDeltas = readDoorDeltas();
+  for (const doorId of ['north', 'south', 'east', 'west'] as const) {
     if (!readDoorPolicy(doorId).adapter) continue;
-    const pose = doorPose[doorId];
+    const base = doorPose[doorId];
+    // 🧱 #66 S1: the collar follows a slid door along its wall.
+    const d = slideDeltas[doorId] ?? 0;
+    const pose = doorId === 'north' || doorId === 'south'
+      ? { ...base, x: base.x + d }
+      : { ...base, z: base.z + d };
     const collar = new THREE.Group();
     collar.name = `dockAdapter-${doorId}`;
     const softGoods = new THREE.MeshStandardMaterial({ color: 0xF2EFE6, roughness: 0.85, metalness: 0.08 });

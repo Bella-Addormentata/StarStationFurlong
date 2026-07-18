@@ -26,6 +26,10 @@ import {
 import { getIdentityPub } from './keypair';
 import { getPlayerName } from './identity';
 import { deleteDoorPairing } from './doorsDoc';
+import {
+  seedFloorPlan, writeDoorPlacement, readDoorDeltas, lateralOf,
+  LEGACY_PLACEMENTS, DOOR_LATTICE,
+} from './floorPlanDoc';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -725,6 +729,16 @@ export class DoorDockingPortSystem {
         const p = readDoorPolicy(doorId);
         const next: Record<ConstructionMode, ConstructionMode> = { owner: 'request', request: 'public', public: 'owner' };
         writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
+      } else if (action === 'slide-neg' || action === 'slide-pos') {
+        // 🧱 #66 S1: slide the door 0.5 m along its wall. Owner-only (this
+        // branch), UNPAIRED-only (plan §6.2 — live chains never re-solve),
+        // snapped + clamped in floorPlanDoc on both write and read.
+        const st2 = this.doorState.get(doorId);
+        if (st2?.pairedSuccessfully) return;
+        seedFloorPlan(); // lazy first-structure-commit seed (idempotent)
+        const legacy = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
+        const current = legacy + (readDoorDeltas()[doorId] ?? 0);
+        writeDoorPlacement(doorId, current + (action === 'slide-pos' ? DOOR_LATTICE : -DOOR_LATTICE));
       } else if (action === 'install-adapter') {
         // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
         if (consumePart('adapter')) {
@@ -786,6 +800,12 @@ export class DoorDockingPortSystem {
           <button type="button" data-policy-action="cycle-passage" style="${pill}">${policy.passage.toUpperCase()}</button></div>
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
+        <div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? ' — unpair first' : ''}</span></span>
+          <span style="flex-shrink:0; display:flex; gap:4px; align-items:center;">
+            <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? 'disabled' : ''} style="${pill}">◀</button>
+            <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => { const d = readDoorDeltas()[doorId] ?? 0; return d === 0 ? 'CENTER' : `${d > 0 ? '+' : ''}${d.toFixed(1)}m`; })()}</span>
+            <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? 'disabled' : ''} style="${pill}">▶</button>
+          </span></div>
         <div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
           ${policy.adapter
             ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
@@ -1288,6 +1308,17 @@ export class DoorDockingPortSystem {
    *  before offering the door sequence). */
   public canPass(doorId: string): boolean {
     return this.canOperateDoor(doorId);
+  }
+
+  /** 🧱 #66 S1: slide each door's 3D group (frame + leaves + keypad ride the
+   *  same group) along its wall by the placement delta. Legacy group lateral
+   *  is 0 for every door, so position = delta directly. */
+  public repositionDoorGroups(deltas: Record<'north' | 'south' | 'east' | 'west', number>): void {
+    for (const [id, group] of this.doorObjects) {
+      const d = deltas[id as 'north' | 'south' | 'east' | 'west'] ?? 0;
+      if (id === 'north' || id === 'south') group.position.x = d;
+      else group.position.z = d;
+    }
   }
 
   /** 🛰️ Exterior view: edit one chain segment in place (the click-a-joint
