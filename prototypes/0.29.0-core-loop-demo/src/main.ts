@@ -25,7 +25,7 @@ import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
-import { addToLedger, ledgerHasRoom, autoAcceptEnabled, mirrorSegments } from './stationParts';
+import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -1163,13 +1163,30 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
 async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
   // #62 P4: capture the departure connection BEFORE the swap tears the room
   // down — the arrival choreography wants the record's farDoor, and the lazy
-  // mirror write needs the chain + the departure room's own address.
+  // mirror write needs the departure room's own address.
   const depState = world.dockingSystem?.getDockingState(departureDoorId);
+  const depPaired = depState?.pairedSuccessfully === true;
   const depGeometry = depState?.segments?.length
     ? { segments: depState.segments, farDoor: depState.farDoor, farYawDeg: depState.farYawDeg }
     : null;
   const depRoomId = activeBootstrap?.roomId ?? null;
-  const depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+
+  // Vestibule-findings fix (root cause 2): the walker's own rooms are exactly
+  // the rooms NEVER in their own pass list, so passSeed alone silently killed
+  // most mirrors. Resolution ladder: pass list → minted-module ledger → mint a
+  // fresh link (local node op; done PRE-swap while the departure room's state
+  // is definitely alive).
+  let depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+  if (depPaired && depRoomId && !depAddress) {
+    depAddress = moduleLedger().find((e) => e.roomId === depRoomId)?.seed ?? null;
+  }
+  if (depPaired && depRoomId && !depAddress) {
+    try {
+      depAddress = (await mintBootstrapLink(undefined, depRoomId)).link ?? null;
+    } catch (e) {
+      console.warn('🪞 Mirror: could not mint a departure-room link:', e);
+    }
+  }
 
   const result = await performRoomSwap(seedString, {
     arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor),
@@ -1180,23 +1197,28 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
     return;
   }
 
-  // #62 P4: LAZY MIRROR — the first entry through an assembled connection
-  // writes the ARRIVAL room's half of the record into its (now-bound) doors
-  // doc: reversed segments (flex bends negated — an arc traversed backwards
-  // reverses its heading change), farDoor pointing back at the departure
-  // door. The link then renders + transits from BOTH sides for everyone.
+  // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY
+  // pairing, plain or assembled — before this, a plain pairing NEVER wrote the
+  // far room's record (pre-#62 nothing did), so the return direction
+  // structurally did not exist: the far room's doors doc stayed empty and the
+  // return gate said "No room docked". Now the first walk-through writes the
+  // arrival room's half: address back to the departure room, farDoor pointing
+  // at the departure door, and (chains only) reversed segments with negated
+  // flex bends (an arc traversed backwards reverses its heading change).
   // Never clobbers an existing pairing on the arrival door.
-  if (depGeometry && depAddress) {
-    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry.farDoor).id;
+  if (depPaired && depAddress) {
+    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry?.farDoor).id;
     const existing = readAllDoors().get(arrivalDoorId);
     if (!existing?.paired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
-        segments: mirrorSegments(depGeometry.segments),
+        segments: depGeometry ? mirrorSegments(depGeometry.segments) : undefined,
         farDoor: departureDoorId,
-        farYawDeg: depGeometry.farYawDeg,
+        farYawDeg: depGeometry?.farYawDeg,
       });
       console.log(`🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`);
     }
+  } else if (depPaired) {
+    console.warn(`🪞 Mirror SKIPPED: no resolvable address for departure room ${depRoomId} — the return direction will refuse until one side pairs manually.`);
   }
 }
 

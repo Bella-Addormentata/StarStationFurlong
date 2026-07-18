@@ -95,6 +95,13 @@ export class DoorDockingPortSystem {
   private isRoomOwner(): boolean {
     return this.ownerCheckCallback ? this.ownerCheckCallback() : true;
   }
+
+  /** Vestibule-findings fix (ghost residue): doors whose chain came from the
+   *  armed-preset PREFILL and was never touched by the user. Closing the pane
+   *  with the prefill untouched refunds it — merely INSPECTING a keypad must
+   *  not leave a ghost tube (or consume parts) as a side effect. Any deliberate
+   *  edit or INITIATE clears the flag and the chain becomes intentional. */
+  private untouchedPrefills = new Set<string>();
   /**
    * "Buy a module" v0 (T1 of issue #30): mints a fresh room seed against the
    * LOCAL node. Wired by main.ts (callback pattern — docking.ts must not
@@ -421,7 +428,13 @@ export class DoorDockingPortSystem {
     const rejectBtn = document.getElementById('docking-reject-btn');
     const box = document.getElementById('docking-control-pane');
     
-    if (closeBtn) closeBtn.addEventListener('click', () => { if (box) box.style.display = 'none'; });
+    if (closeBtn) closeBtn.addEventListener('click', () => {
+      // Ghost-residue fix: closing without using the prefilled chain refunds it.
+      const pane = document.getElementById('docking-control-pane');
+      const activeDoorId = pane ? (pane as any).activeDoorId : null;
+      if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
+      if (box) box.style.display = 'none';
+    });
 
     // Handle clicks inside the modal to prevent passing them to 3D world floor clicks
     box?.addEventListener('click', (e) => e.stopPropagation());
@@ -487,6 +500,7 @@ export class DoorDockingPortSystem {
           alert('Only this room\'s owner can dock modules to its ports.');
           return;
         }
+        if (activeDoorId) this.untouchedPrefills.delete(activeDoorId); // INITIATE = intentional
         if (state && addrInput && pinInput) {
           state.connectedRoomAddress = addrInput.value.trim();
           state.pinCode = pinInput.value.trim();
@@ -549,6 +563,7 @@ export class DoorDockingPortSystem {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.isRoomOwner()) return;
+      this.untouchedPrefills.delete(doorId); // deliberate edit — chain is intentional now
       if (!consumePart('flex')) { this.renderAssemblyStrip(doorId, 'no FLEX parts — DEV menu › PARTS'); return; }
       state.segments = [...(state.segments ?? []), { kind: 'flex', bendDeg: 0, stretch: 0 }];
       this.renderAssemblyStrip(doorId);
@@ -559,6 +574,7 @@ export class DoorDockingPortSystem {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.isRoomOwner()) return;
+      this.untouchedPrefills.delete(doorId);
       if (!consumePart('ext')) { this.renderAssemblyStrip(doorId, 'no EXTENSION parts — DEV menu › PARTS'); return; }
       state.segments = [...(state.segments ?? []), { kind: 'ext', bays: 4, skin: 'solid' }];
       this.renderAssemblyStrip(doorId);
@@ -569,6 +585,7 @@ export class DoorDockingPortSystem {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.isRoomOwner()) return;
+      this.untouchedPrefills.delete(doorId);
       if (state.segments?.length) refundForSegments(state.segments);
       state.segments = undefined;
       this.renderAssemblyStrip(doorId);
@@ -585,6 +602,7 @@ export class DoorDockingPortSystem {
       const i = Number(el.dataset.i);
       if (!doorId || !state || !state.segments || !Number.isInteger(i) || !state.segments[i]) return;
       if (!this.isRoomOwner()) return;
+      this.untouchedPrefills.delete(doorId);
       const seg = { ...state.segments[i] };
       const action = el.dataset.chipAction;
       if (action === 'remove') {
@@ -723,10 +741,20 @@ export class DoorDockingPortSystem {
         if (consumeForSegments(segs)) {
           state.segments = segs;
           if (preset === 'ring' && state.farYawDeg === undefined) state.farYawDeg = 45;
+          this.untouchedPrefills.add(doorId); // refunded on close unless used
         }
       }
     }
     this.renderAssemblyStrip(doorId);
+  }
+
+  /** Refund + drop an untouched prefill chain (see untouchedPrefills docs). */
+  private discardUntouchedPrefill(doorId: 'north' | 'south' | 'east' | 'west'): void {
+    if (!this.untouchedPrefills.delete(doorId)) return;
+    const state = this.doorState.get(doorId);
+    if (!state || state.pairedSuccessfully || !state.segments?.length) return;
+    refundForSegments(state.segments);
+    state.segments = undefined;
   }
 
   /**
@@ -808,6 +836,11 @@ export class DoorDockingPortSystem {
       this.openDoor(doorId);
     } else {
       state.connectedRoomAddress = '';
+      // Vestibule-findings fix (ghost residue): a REJECTED connection's working
+      // chain must not linger as a ghost tube on an unpaired door — refund the
+      // parts and drop it.
+      if (state.segments?.length) refundForSegments(state.segments);
+      state.segments = undefined;
       this.syncLEDStatus(doorId, state);
     }
 
