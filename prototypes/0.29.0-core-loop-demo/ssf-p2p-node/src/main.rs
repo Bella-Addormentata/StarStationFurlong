@@ -598,6 +598,60 @@ fn load_configured_relays_from_env() -> Vec<String> {
         .collect()
 }
 
+// ── Room-doc disk persistence (durability plan §4.2 C4/B) ────────────────────
+// SERVED rooms (a local browser participated — the C2 flag) persist their Yjs
+// doc to `rooms/<hex-room-id>.bin` beside `iroh_node_id.key`, and load back at
+// startup re-marked `served`. Combined with C2 this closes the next durability
+// rung: a room now survives not just a closed browser but a NODE RESTART —
+// the owner's machine reboots and visitors still get the room. Corrupt or
+// unreadable files fail OPEN (fresh doc, logged), never fatal.
+
+const ROOMS_DIR: &str = "rooms";
+
+/// Room ids are user-influenced strings — hex-encode for a filesystem-safe,
+/// reversible filename.
+fn room_doc_path(room_id: &str) -> std::path::PathBuf {
+    std::path::Path::new(ROOMS_DIR).join(format!("{}.bin", hex::encode(room_id.as_bytes())))
+}
+
+/// Write one room's full-state snapshot. Best-effort: failures log and drop.
+fn persist_room_doc(room_id: &str, snapshot: &[u8]) {
+    if let Err(e) = std::fs::create_dir_all(ROOMS_DIR) {
+        eprintln!("💾 room persist: cannot create {ROOMS_DIR}/: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(room_doc_path(room_id), snapshot) {
+        eprintln!("💾 room persist: write failed for {room_id}: {e}");
+    }
+}
+
+/// Load every persisted room doc at startup → (room_id, snapshot) pairs.
+/// Malformed filenames / unreadable files are skipped with a log line.
+fn load_persisted_rooms() -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(ROOMS_DIR) {
+        Ok(e) => e,
+        Err(_) => return out, // no dir yet — first run
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(hex_id) = name.strip_suffix(".bin") else { continue };
+        let room_id = match hex::decode(hex_id).ok().and_then(|b| String::from_utf8(b).ok()) {
+            Some(id) if !id.is_empty() => id,
+            _ => {
+                eprintln!("💾 room persist: skipping malformed filename {name}");
+                continue;
+            }
+        };
+        match std::fs::read(entry.path()) {
+            Ok(bytes) if !bytes.is_empty() => out.push((room_id, bytes)),
+            Ok(_) => {}
+            Err(e) => eprintln!("💾 room persist: unreadable {name}: {e}"),
+        }
+    }
+    out
+}
+
 fn load_or_create_secret_key() -> Result<SecretKey> {
     let key_path = std::path::Path::new("iroh_node_id.key");
     if key_path.exists() {
@@ -1144,6 +1198,76 @@ async fn main() -> Result<()> {
         #[cfg(feature = "chia-lane")]
         chia_rooms: Mutex::new(HashMap::new()),
     });
+
+    // 💾 C4/B restore: load persisted room docs and serve them from boot.
+    // A visitor can cold-join a room whose owner's machine rebooted, as long
+    // as this node is running — no browser required (C2 answers SyncStep1).
+    {
+        let restored = load_persisted_rooms();
+        if !restored.is_empty() {
+            let mut rooms = hub.rooms.lock().unwrap();
+            let mut ok = 0usize;
+            for (room_id, bytes) in restored {
+                let doc = Doc::new();
+                let applied = Update::decode_v1(&bytes)
+                    .ok()
+                    .and_then(|u| doc.transact_mut().apply_update(u).ok())
+                    .is_some();
+                if !applied {
+                    eprintln!("💾 room persist: corrupt snapshot for {room_id} — starting fresh (file kept for inspection)");
+                    continue;
+                }
+                rooms.entry(room_id.clone()).or_insert_with(|| Room {
+                    doc,
+                    local_connections: HashMap::new(),
+                    remote_peers: HashMap::new(),
+                    candidates: HashMap::new(),
+                    retained: RetainStore::new(),
+                    served: true, // a persisted room was served when saved — keep serving
+                });
+                ok += 1;
+            }
+            if ok > 0 {
+                println!("💾 Restored {ok} persisted room doc(s) — serving from boot (rooms survive node restarts)");
+            }
+        }
+    }
+
+    // 💾 C4/B saver: every 15 s, snapshot each SERVED room's doc and write it
+    // when its content actually changed (blake3 dedup — idle rooms cost one
+    // encode, no IO). Encode happens under the rooms lock (cheap: docs are
+    // small, chat is capped in-doc), file IO after dropping it.
+    {
+        let hub_persist = hub.clone();
+        tokio::spawn(async move {
+            let mut last_hash: HashMap<String, [u8; 32]> = HashMap::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let snapshots: Vec<(String, Vec<u8>)> = {
+                    let rooms = hub_persist.rooms.lock().unwrap();
+                    rooms
+                        .iter()
+                        .filter(|(_, room)| room.served)
+                        .map(|(id, room)| {
+                            let txn = room.doc.transact();
+                            (id.clone(), txn.encode_diff_v1(&StateVector::default()))
+                        })
+                        .collect()
+                };
+                for (room_id, snapshot) in snapshots {
+                    if snapshot.is_empty() {
+                        continue; // never persist an empty doc over a good file
+                    }
+                    let hash = *blake3::hash(&snapshot).as_bytes();
+                    if last_hash.get(&room_id) == Some(&hash) {
+                        continue;
+                    }
+                    persist_room_doc(&room_id, &snapshot);
+                    last_hash.insert(room_id, hash);
+                }
+            }
+        });
+    }
 
     // ⛓️ ChiaHub C1 SLICE 6 (chia-lane): the REAL-room heartbeat publisher.
     // Every armed room (browser delivered its room key with chia_mode=true via
