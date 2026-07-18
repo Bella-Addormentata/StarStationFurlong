@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.31.3 — 2026-07-18
+
+### 🤝 Co-Hosts (durability C1)
+
+- **Rooms can have co-hosts now.** In the phone's ACCESS app, members tap **🤝 VOLUNTEER AS CO-HOST** (withdrawable); the owner sees pending volunteers there and ACCEPTs into a **standing, revocable designation** tied to the member's cryptographic identity (it survives leaving and rejoining).
+- v1 is designation only — the shared record that upcoming slices build on: co-host **nodes keeping your room alive while you're away** (the next node update), co-host addresses riding room passes, and signed authority chains. Co-hosts don't gain owner powers.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.31.3 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.31.2 — 2026-07-18
 
 ### 🔌 The Docking Adapter (#67 D2)
