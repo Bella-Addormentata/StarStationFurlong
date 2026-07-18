@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.0 — 2026-07-18
+
+### ♟ Chess + 🏦 A Real Bank
+
+- **Chess is on the game table** — full rules: castling, en passant, promotion (auto-queen), check warnings, checkmate and stalemate. The board face now opens with a **game menu** (♟ CHESS / ⛀ CHECKERS — anyone picks, first two SIT), pieces show where they can move on your turn, the last move glows, a threatened king flares red, and VS BOT works for solo play. RESET clears the table back to the menu so you can switch games. Everything syncs through the room — spectators see the game live.
+- **BANK is a real app now**: your ACCOUNT card (name + account key for receiving shares), your PORTFOLIO (venture stakes, live), and an honest Registry section — no fake balances; Chia numbers appear when the node's account service lands.
+- Issues housekeeping: [#25](https://github.com/Bella-Addormentata/StarStationFurlong/issues/25) closed into [#66](https://github.com/Bella-Addormentata/StarStationFurlong/issues/66)/[#30](https://github.com/Bella-Addormentata/StarStationFurlong/issues/30). Still to come on [#45](https://github.com/Bella-Addormentata/StarStationFurlong/issues/45): war, two-player poker, and solitaire on the card felt, then chia-gaming wagers.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.0 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.31.5 — 2026-07-18
 
 ### 🚶 Automatic Doors in First Person

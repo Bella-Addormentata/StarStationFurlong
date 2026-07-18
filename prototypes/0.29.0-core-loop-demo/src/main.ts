@@ -720,6 +720,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     subscribeVentures(() => {
       syncVentureLedgerFromCurrentRoom();
       renderVenturesApp();
+      renderBankApp(); // the portfolio mirrors the same records
     });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
@@ -1517,6 +1518,57 @@ function renderPhonePlayersList(): void {
   }
 }
 
+// ── 🏦 BANK app (#20, de-stubbed with #68) ───────────────────────────────────
+// Your ACCOUNT (identity card), your PORTFOLIO (venture stakes), and the
+// Registry status. Balances in Chia arrive when the node serves a wallet
+// endpoint (the chia-lane build keeps its account node-side today) — the
+// panel says so honestly instead of faking a number.
+
+function renderBankApp(): void {
+  const view = document.getElementById('phone-app-bank');
+  if (!view) return;
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  const myPub = getIdentityPub();
+  const header = (t: string) => `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+
+  const current = ventureRecord();
+  const ledger = ventureLedger();
+  const seen = new Set<string>();
+  const rows: string[] = [];
+  const stakeRow = (name: string, mine: number, total: number, here: boolean) => {
+    const pct = total > 0 ? Math.round((mine / total) * 100) : 0;
+    return `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span>' : ''}</span>
+      <span style="flex-shrink:0; color:#f0c060;">${mine} shares <span style="color:rgba(212,168,75,0.5);">(${pct}%)</span></span>
+    </div>`;
+  };
+  if (current && (current.shares[myPub] ?? 0) > 0) {
+    seen.add(current.id);
+    rows.push(stakeRow(current.name, current.shares[myPub], current.totalShares, true));
+  }
+  for (const e of ledger) {
+    if (seen.has(e.id) || e.myShares <= 0) continue;
+    rows.push(stakeRow(e.name, e.myShares, e.totalShares, false));
+  }
+
+  view.innerHTML = `
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">ACCOUNT</div>
+    <div style="border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:10px 12px; margin-top:5px;">
+      <div style="font-size:12px; font-weight:800; color:#f0c060;">${esc(getPlayerName())}</div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:3px;" title="Your account key — share it to receive shares">KEY ${esc(contactFingerprint(myPub))}</div>
+      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px; word-break:break-all;">${esc(myPub)}</div>
+    </div>
+    ${header('PORTFOLIO')}
+    ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
+    ${header('THE REGISTRY')}
+    <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
+      Chia account: kept by your station node (test network). Balances and
+      on-Registry share trading appear here when the node's account service
+      lands. Shares today are room records — same rules, no coins at risk.
+    </div>
+  `;
+}
+
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
 // Screen 1: every entity you hold a stake in (name · SOLE/JOINT · your stake).
 // Screen 2: entity detail — Charter block, OWNERS cap table, PROPERTY, actions
@@ -1910,6 +1962,7 @@ function setupSpacePhoneOverlay() {
     // offline/pre-join state and the first open).
     if (id === 'access') { refreshAccessRoomRow(); renderCoHostsSection(); }
     if (id === 'ventures') { ventureDetailId = ''; renderVenturesApp(); }
+    if (id === 'bank') renderBankApp();
     if (id === 'contacts') refreshContactsApp();
   };
 
