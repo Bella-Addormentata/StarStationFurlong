@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.1 — 2026-07-18
+
+### 🧱 Doors Slide Now (#66 S1)
+
+- **Move your doors.** Every door keypad has a 🧱 POSITION row (owner-only): ◀ ▶ slide the door along its wall in 0.5 m steps. Everything follows — the frame and keypad, where you walk to enter, the first-person auto-open doorway, future vestibule connections, even the adapter collar in the exterior view. Everyone in the room sees the door move live.
+- A **paired** door won't slide ("unpair first") — connections never warp. Positions are shared room truth on the new floor-plan record, which also quietly lays the foundation for #66's next act: **growing your room one hull tile at a time**.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.1 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.0 — 2026-07-18
 
 ### ♟ Chess + 🏦 A Real Bank
