@@ -11,6 +11,13 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.5 — 2026-07-18
+
+### 🔧 The Vestibule Pills Are Back On Top
+
+- Fixed the keypad regression from the permissions work: the **CONNECTION ASSEMBLY chips** (the FLEX/EXT pills where you cycle bend angles) had been pushed below the fold by the DOOR POLICY block — they looked gone, but were just buried. Assembly is back at the top of the keypad where it belongs, and the policy controls now live in a **collapsed ⚙ DOOR POLICY · RIGHTS · POSITION section** at the bottom — one click to open, never in the way.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.5 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.4 — 2026-07-18
 
 ### 🗺️ See the Whole Station + Click-to-Connect (octagon findings)
