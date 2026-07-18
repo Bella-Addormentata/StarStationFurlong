@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.6 — 2026-07-17
+
+### Rooms Survive Node Restarts (durability C4/B)
+
+- **The next durability rung.** v0.30.4 made a room survive its closed *browser* (the still-running node answers visitors from RAM); this release makes it survive a **node restart**: every room your browser participated in persists its doc to disk (`rooms/` beside the node's key — 15-second snapshots, written only when content changed) and loads back at boot still serving. Reboot the owner's machine, relaunch the game, and visitors get the full room with no browser open. Corrupt or unreadable files never block startup (the node logs and boots fresh).
+- **Node binaries changed** — install on every machine. The `ssf-p2p-node-chia.exe` asset from this release carries the same persistence plus the chia heartbeat (v0.30.3+) and remains the one to use for chia testing.
+- Known-open: the owner is documenting vestibule-transit issues found in the v0.30.5 two-machine session — fixes land in the next release once studied.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.6 in place).
+
 ## v0.30.5 — 2026-07-17
 
 ### The Station Builder (#62 P1–P4) + the Settings Phone App + Roster Friending
