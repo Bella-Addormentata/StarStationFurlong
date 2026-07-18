@@ -400,15 +400,6 @@ export class DoorDockingPortSystem {
           <input type="text" id="docking-pin-input" placeholder="e.g. 1106" style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace;">
         </div>
 
-        <!-- #67 D1/D1b: per-door policy + rights requests. Owner sees the two
-             policy cycles + pending requests (ACCEPT/DENY) + standing grants
-             (REVOKE); guests see the policy summary and, in 'request' mode,
-             the REQUEST BUILD RIGHTS button. Rendered by renderPolicySection. -->
-        <div id="docking-policy" style="border-top:1px solid rgba(212,168,75,0.14); padding-top:10px;">
-          <label style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">DOOR POLICY</label>
-          <div id="docking-policy-body" style="display:flex; flex-direction:column; gap:6px; font-size:10px;"></div>
-        </div>
-
         <!-- #62 P4: CONNECTION ASSEMBLY — chain chips + far-side controls.
              Parts come from the DEV PARTS inventory; the armed preset prefills
              on pane open. The chain renders in-world as a ghost while unpaired
@@ -444,6 +435,15 @@ export class DoorDockingPortSystem {
         <button id="docking-provision-btn" style="width:100%; border-radius:6px; border:1px solid #d4a84b; background:rgba(212,168,75,0.12); color:#f0c060; padding:8px; font-weight:bold; cursor:pointer; text-transform:uppercase;">➕ PROVISION NEW MODULE</button>
 
         <button id="docking-request-btn" style="width:100%; border-radius:6px; border:1px solid #1e88e5; background:rgba(30,136,229,0.15); color:#90caf9; padding:8px; font-weight:bold; cursor:pointer; text-transform:uppercase;">INITIATE PORT PLUG PAIRING</button>
+
+        <!-- #67 D1/D1b: per-door policy + rights requests — COLLAPSED by
+             default (regression fix: this block above the assembly pushed the
+             chain pills below the fold; assembly is the primary action, this
+             is configuration). Rendered by renderPolicySection. -->
+        <details id="docking-policy" style="border-top:1px solid rgba(212,168,75,0.14); padding-top:8px;">
+          <summary style="cursor:pointer; color:rgba(212,168,75,0.6); font-size:10px; letter-spacing:1px; user-select:none;">⚙ DOOR POLICY · RIGHTS · POSITION</summary>
+          <div id="docking-policy-body" style="display:flex; flex-direction:column; gap:6px; font-size:10px; margin-top:8px;"></div>
+        </details>
       </div>
 
       <!-- Pairing notifications -->
