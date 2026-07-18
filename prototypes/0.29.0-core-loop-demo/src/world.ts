@@ -23,7 +23,7 @@ import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
-import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, readLiveRoomStatus } from './devices';
+import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
 import { deviceFocus } from './deviceFocus';
@@ -1927,6 +1927,13 @@ export class World {
         top: this.gameTableTops.get(deviceId) ?? null,
       });
       deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === 'helm') {
+      // 🚀 #30 SH1: ship-status readout (flight controls come with the
+      // flight slices — the panel says so).
+      deviceFocus.beginFocus(this.player, device, createHelmUI());
       return;
     }
 
