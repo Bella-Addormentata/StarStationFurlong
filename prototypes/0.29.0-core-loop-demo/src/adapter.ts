@@ -172,7 +172,11 @@ export interface ConnectorSegment {
   kind: 'flex' | 'ext';
   /** flex only: bend in degrees, clamped ±FLEX_BEND_MAX_DEG, snapped. */
   bendDeg?: number;
-  /** flex only: length delta on FLEX_REST_LEN, clamped to the stretch range. */
+  /** flex: length delta on FLEX_REST_LEN (clamped to the flex range).
+   *  🛬 ext: continuous telescoping delta on the bays×EXT_BAY_LEN length
+   *  (clamped ±EXT_STRETCH_MAX) — the jetbridge give that lets a chain fit
+   *  a module sitting slightly nearer/farther than the rigid length.
+   *  ADDITIVE on the wire; legacy readers ignore it (rigid render). */
   stretch?: number;
   /** ext only: length in bays of EXT_BAY_LEN, clamped 2..12. */
   bays?: number;
@@ -194,11 +198,23 @@ export function clampFlexBend(deg: number): number {
   const snapped = Math.round(deg / FLEX_BEND_SNAP_DEG) * FLEX_BEND_SNAP_DEG;
   return Math.max(-FLEX_BEND_MAX_DEG, Math.min(FLEX_BEND_MAX_DEG, snapped));
 }
+/** 🛬 Jetbridge fit (owner's ruling): SOLVED chains carry CONTINUOUS bends —
+ *  the 7.5° detents are a hand-editing convenience, not a physical limit.
+ *  Range-clamped only; used by the doc sanitizer + fold/render paths so a
+ *  solved 40.1° survives the wire and renders as built. */
+export function clampFlexBendFine(deg: number): number {
+  return Math.max(-FLEX_BEND_MAX_DEG, Math.min(FLEX_BEND_MAX_DEG, deg));
+}
 export function clampFlexStretch(s: number): number {
   return Math.max(FLEX_STRETCH_MIN, Math.min(FLEX_STRETCH_MAX, s));
 }
 export function clampExtBays(b: number): number {
   return Math.max(EXT_BAYS_MIN, Math.min(EXT_BAYS_MAX, Math.round(b)));
+}
+/** 🛬 Extensions get ±one bay of continuous give (the telescoping section). */
+export const EXT_STRETCH_MAX = EXT_BAY_LEN;
+export function clampExtStretch(s: number): number {
+  return Math.max(-EXT_STRETCH_MAX, Math.min(EXT_STRETCH_MAX, s));
 }
 
 /** Groove seam color for the solid extension skin (door-leaf groove trick). */
@@ -270,7 +286,7 @@ function flexArcFrame(bendRad: number, length: number, t: number): { x: number; 
  */
 export function buildFlexJoint(bendDeg: number, stretch = 0): THREE.Group {
   const group = new THREE.Group();
-  const bend = clampFlexBend(bendDeg);
+  const bend = clampFlexBendFine(bendDeg); // 🛬 solved chains render as solved
   const len = FLEX_REST_LEN + clampFlexStretch(stretch);
   group.name = 'connectorFlex';
   group.userData = { isConnectorPart: true, kind: 'flex', bendDeg: bend, stretch: clampFlexStretch(stretch) };
@@ -321,12 +337,18 @@ export function buildFlexJoint(bendDeg: number, stretch = 0): THREE.Group {
  * elongated); 'solid' = the art's rigid mid-tube (hull walls, groove seams
  * every 1.2 m, collar ring + amber band every 2.4 m).
  */
-export function buildExtension(bays: number, skin: 'ribbed' | 'solid' = 'ribbed'): THREE.Group {
+export function buildExtension(bays: number, skin: 'ribbed' | 'solid' = 'ribbed', stretch = 0): THREE.Group {
   const group = new THREE.Group();
   const nBays = clampExtBays(bays);
   const len = nBays * EXT_BAY_LEN;
   group.name = 'connectorExtension';
-  group.userData = { isConnectorPart: true, kind: 'ext', bays: nBays, skin };
+  group.userData = { isConnectorPart: true, kind: 'ext', bays: nBays, skin, stretch: clampExtStretch(stretch) };
+  // 🛬 Telescoping give: the whole tube scales along its axis to the solved
+  // length — the fold math (segmentExit) uses the same delta, so meshes and
+  // math agree. A ±0.6 m scale on a ≥1.2 m tube reads as the jetbridge
+  // sliding section, exactly the fiction.
+  const s = clampExtStretch(stretch);
+  if (s !== 0) group.scale.z = (len + s) / len;
   const mats = partMats();
 
   if (skin === 'ribbed') {
@@ -372,15 +394,103 @@ export function buildExtension(bays: number, skin: 'ribbed' | 'solid' = 'ribbed'
   return group;
 }
 
-/** Exit pose of one segment in ITS OWN local frame (pure math — no meshes). */
+/** Exit pose of one segment in ITS OWN local frame (pure math — no meshes).
+ *  🛬 Fine (unsnapped) bends + ext telescoping stretch — solved chains fold
+ *  exactly as solved. */
 function segmentExit(seg: ConnectorSegment): { x: number; z: number; yawRad: number } {
   if (seg.kind === 'flex') {
-    const th = THREE.MathUtils.degToRad(clampFlexBend(seg.bendDeg ?? 0));
+    const th = THREE.MathUtils.degToRad(clampFlexBendFine(seg.bendDeg ?? 0));
     const len = FLEX_REST_LEN + clampFlexStretch(seg.stretch ?? 0);
     const f = flexArcFrame(th, len, 1);
     return { x: f.x, z: f.z, yawRad: f.yaw };
   }
-  return { x: 0, z: clampExtBays(seg.bays ?? EXT_BAYS_MIN) * EXT_BAY_LEN, yawRad: 0 };
+  return {
+    x: 0,
+    z: clampExtBays(seg.bays ?? EXT_BAYS_MIN) * EXT_BAY_LEN + clampExtStretch(seg.stretch ?? 0),
+    yawRad: 0,
+  };
+}
+
+/**
+ * 🛬 THE JETBRIDGE SOLVER (owner's ruling): adjust a chain's FREE parameters
+ * — every flex bend (continuous, ±60°), every flex stretch, every ext
+ * telescope — so the folded chain lands EXACTLY on a target pose (a real
+ * module's door face, from the station atlas). Bends EQUALIZE by
+ * construction: the required heading change is distributed evenly across
+ * the flex joints as the starting point (the domino effect the owner
+ * described), and a light regularizer keeps them together while the
+ * position residual is absorbed. Bays stay integral (structure); the
+ * continuous give lives in bends + stretches. Returns the solved chain +
+ * the remaining residual — callers decide if the fit is good enough.
+ */
+export function solveChain(
+  segments: ConnectorSegment[],
+  target: { x: number; z: number; yawRad: number },
+): { segments: ConnectorSegment[]; residualDist: number; residualYawDeg: number } {
+  const segs = segments.map((s) => ({ ...s }));
+  const flexIdx = segs.map((s, i) => (s.kind === 'flex' ? i : -1)).filter((i) => i >= 0);
+  const extIdx = segs.map((s, i) => (s.kind === 'ext' ? i : -1)).filter((i) => i >= 0);
+
+  // Equalized initialization: split the needed heading change across flexes.
+  if (flexIdx.length > 0) {
+    const per = THREE.MathUtils.radToDeg(target.yawRad) / flexIdx.length;
+    for (const i of flexIdx) segs[i].bendDeg = clampFlexBendFine(per);
+  }
+
+  // Free parameter vector: [flex bends (deg), flex stretches, ext stretches].
+  const read = (): number[] => [
+    ...flexIdx.map((i) => segs[i].bendDeg ?? 0),
+    ...flexIdx.map((i) => segs[i].stretch ?? 0),
+    ...extIdx.map((i) => segs[i].stretch ?? 0),
+  ];
+  const write = (p: number[]): void => {
+    let k = 0;
+    for (const i of flexIdx) segs[i].bendDeg = clampFlexBendFine(p[k++]);
+    for (const i of flexIdx) segs[i].stretch = clampFlexStretch(p[k++]);
+    for (const i of extIdx) segs[i].stretch = clampExtStretch(p[k++]);
+  };
+  const errOf = (): [number, number, number] => {
+    const e = foldChainEnd(segs);
+    return [e.x - target.x, e.z - target.z, e.yawRad - target.yawRad];
+  };
+
+  // Damped numeric Gauss–Newton, 60 iterations — tiny problem, instant.
+  const YAW_W = 3.0; // a degree of heading error matters more than a cm
+  for (let iter = 0; iter < 60; iter++) {
+    const p = read();
+    const e0 = errOf();
+    const cost = Math.hypot(e0[0], e0[1]) + YAW_W * Math.abs(e0[2]);
+    if (cost < 0.005) break;
+    // Numeric jacobian columns.
+    const grad: number[] = new Array(p.length).fill(0);
+    for (let j = 0; j < p.length; j++) {
+      const h = j < flexIdx.length ? 0.5 : 0.01; // deg vs metres
+      const pj = p.slice();
+      pj[j] += h;
+      write(pj);
+      const e1 = errOf();
+      grad[j] = ((Math.hypot(e1[0], e1[1]) + YAW_W * Math.abs(e1[2])) - cost) / h;
+      write(p);
+    }
+    // Equalization pull: bends drift toward their mean (owner's domino).
+    if (flexIdx.length > 1) {
+      const mean = flexIdx.reduce((s, i) => s + (segs[i].bendDeg ?? 0), 0) / flexIdx.length;
+      for (let j = 0; j < flexIdx.length; j++) {
+        grad[j] += 0.02 * ((p[j] - mean));
+      }
+    }
+    const norm = Math.hypot(...grad);
+    if (norm < 1e-6) break;
+    const step = Math.min(1, cost / norm) * 0.6;
+    write(p.map((v, j) => v - step * grad[j] / norm * (j < flexIdx.length ? 8 : 0.4)));
+  }
+
+  const e = errOf();
+  return {
+    segments: segs,
+    residualDist: Math.hypot(e[0], e[1]),
+    residualYawDeg: Math.abs(THREE.MathUtils.radToDeg(e[2])),
+  };
 }
 
 /**
@@ -511,7 +621,7 @@ export function buildConnectorChain(doorId: VestibuleDoorId, segments: Connector
   for (const seg of segments) {
     const part = seg.kind === 'flex'
       ? buildFlexJoint(seg.bendDeg ?? 0, seg.stretch ?? 0)
-      : buildExtension(seg.bays ?? EXT_BAYS_MIN, seg.skin ?? 'ribbed');
+      : buildExtension(seg.bays ?? EXT_BAYS_MIN, seg.skin ?? 'ribbed', seg.stretch ?? 0);
     part.position.set(x, 0, z);
     part.rotation.y = yaw;
     group.add(part);

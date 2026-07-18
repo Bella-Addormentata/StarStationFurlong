@@ -19,7 +19,7 @@
 
 import * as Y from 'yjs';
 import {
-  clampExtBays, clampFlexBend, clampFlexStretch, type ConnectorSegment,
+  clampExtBays, clampFlexBendFine, clampFlexStretch, clampExtStretch, type ConnectorSegment,
 } from './adapter';
 
 /**
@@ -107,7 +107,9 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
       if (s.kind === 'flex') {
         clean.push({
           kind: 'flex',
-          bendDeg: clampFlexBend(typeof s.bendDeg === 'number' && Number.isFinite(s.bendDeg) ? s.bendDeg : 0),
+          // 🛬 FINE clamp (range only, no detent snap): solved jetbridge
+          // bends (e.g. 40.1°) survive the wire and render as solved.
+          bendDeg: clampFlexBendFine(typeof s.bendDeg === 'number' && Number.isFinite(s.bendDeg) ? s.bendDeg : 0),
           stretch: clampFlexStretch(typeof s.stretch === 'number' && Number.isFinite(s.stretch) ? s.stretch : 0),
         });
       } else if (s.kind === 'ext') {
@@ -115,6 +117,8 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
           kind: 'ext',
           bays: clampExtBays(typeof s.bays === 'number' && Number.isFinite(s.bays) ? s.bays : 2),
           skin: s.skin === 'solid' ? 'solid' : 'ribbed',
+          // 🛬 Telescoping delta (additive; legacy readers ignore → rigid).
+          stretch: clampExtStretch(typeof s.stretch === 'number' && Number.isFinite(s.stretch) ? s.stretch : 0),
         });
       } else {
         ok = false; // unknown kind (newer client) — fall back to legacy render
