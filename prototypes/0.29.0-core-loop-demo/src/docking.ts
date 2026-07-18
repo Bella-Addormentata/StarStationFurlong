@@ -30,6 +30,7 @@ import {
   seedFloorPlan, writeDoorPlacement, readDoorDeltas, lateralOf,
   LEGACY_PLACEMENTS, DOOR_LATTICE,
 } from './floorPlanDoc';
+import { readAtlas } from './stationAtlas';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -428,6 +429,12 @@ export class DoorDockingPortSystem {
         <div>
           <label style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">TARGET CONNECTED ROOM ADDRESS:</label>
           <input type="text" id="docking-addr-input" placeholder="Paste target seed link..." style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace;">
+          <!-- 🗺️ Known-modules picker (owner's 8th→1st finding): every module
+               the station atlas has an address for, one tap to target — the
+               close-the-ring flow without the zoom-out dance. -->
+          <select id="docking-known-modules" style="width:100%; margin-top:5px; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:5px 8px; font-size:10px; outline:none;">
+            <option value="">🗺️ … or pick a KNOWN MODULE</option>
+          </select>
         </div>
 
         <!-- "Buy a module" v0 (T1 of #30): mint a fresh room on the local node
@@ -703,6 +710,19 @@ export class DoorDockingPortSystem {
       this.publishIfPaired(doorId);
     });
 
+    // 🗺️ Known-modules picker → fills the address input (repopulated on
+    // every pane open by renderKnownModules).
+    document.getElementById('docking-known-modules')?.addEventListener('change', (e) => {
+      const sel = e.target as HTMLSelectElement;
+      const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
+      if (sel.value && addrInput) {
+        addrInput.value = sel.value;
+        addrInput.style.borderColor = 'rgba(0,230,118,0.7)';
+        setTimeout(() => { addrInput.style.borderColor = ''; }, 1600);
+      }
+      sel.selectedIndex = 0; // reads as a menu, not a state
+    });
+
     // ── #67 D1/D1b: DOOR POLICY actions (delegated) ─────────────────────────
     document.getElementById('docking-policy-body')?.addEventListener('click', (e) => {
       const el = (e.target as HTMLElement).closest<HTMLElement>('[data-policy-action]');
@@ -948,6 +968,25 @@ export class DoorDockingPortSystem {
     }
     this.renderAssemblyStrip(doorId);
     this.renderPolicySection(doorId); // #67 D1
+    this.renderKnownModules();        // 🗺️ atlas picker
+  }
+
+  /** 🗺️ Repopulate the known-modules picker from the station atlas (every
+   *  entry holding an address, current room excluded, most recent first). */
+  private renderKnownModules(): void {
+    const sel = document.getElementById('docking-known-modules') as HTMLSelectElement | null;
+    if (!sel) return;
+    const currentId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+    const entries = Object.values(readAtlas())
+      .filter((e) => e.seed && e.roomId !== currentId)
+      .sort((a, b) => b.lastSeen - a.lastSeen)
+      .slice(0, 24);
+    sel.innerHTML = '<option value="">🗺️ … or pick a KNOWN MODULE</option>'
+      + entries.map((e) => {
+        const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+        return `<option value="${esc(e.seed!)}">${esc(e.name)} · ${esc(e.roomId.slice(0, 10))}</option>`;
+      }).join('');
+    sel.style.display = entries.length > 0 ? 'block' : 'none';
   }
 
   /** Refund + drop an untouched prefill chain (see untouchedPrefills docs). */

@@ -19,6 +19,7 @@ import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type
 import { readDoorDeltas } from './floorPlanDoc';
 import { applyDoorSlideDeltas } from './doors';
 import { setDoorSlideDeltas } from './adapter';
+import { roomIdFromSeed } from './stationAtlas';
 import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
@@ -1763,7 +1764,28 @@ export class World {
    * falls back to EAST (the canonical large door). East/west departures can
    * never hit the fallback.
    */
-  public resolveArrivalDoor(departureDoorId: DoorId, farDoor?: DoorId): DoorTarget {
+  public resolveArrivalDoor(departureDoorId: DoorId, farDoor?: DoorId, fromRoomId?: string): DoorTarget {
+    // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
+    // records — the door whose pairing points BACK at the room we came from.
+    // This survives every other keypad/vestibule change on either side: a
+    // center hub with four spokes routes each arrival to ITS door, no matter
+    // which cardinal you departed from or what farDoor a stale record names.
+    // (Callable only after the arrival doc is bound — both call sites are.)
+    if (fromRoomId) {
+      const backs: DoorTarget[] = [];
+      for (const [doorId, rec] of readAllDoors()) {
+        if (!rec.paired || !rec.connectedRoomAddress) continue;
+        if (roomIdFromSeed(rec.connectedRoomAddress) !== fromRoomId) continue;
+        const d = findDoor(doorId);
+        if (d && d.enabled) backs.push(d);
+      }
+      if (backs.length === 1) return backs[0];
+      if (backs.length > 1) {
+        // Same room docked twice — let the record's farDoor break the tie.
+        const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
+        return named ?? backs[0];
+      }
+    }
     // #62 P2: an assembled connection knows exactly which far door it lands on
     // (the record's farDoor) — prefer it when enabled. The angled octagon links
     // routinely land on NON-opposite doors (e.g. depart east, arrive north).
@@ -1785,7 +1807,7 @@ export class World {
    * (vestibule back to 'idle' — it persists while its door stays paired,
    * #51) and script the walk-in through the arrival door.
    */
-  public completeAdapterArrival(departureDoorId: DoorId, farDoor?: DoorId): void {
+  public completeAdapterArrival(departureDoorId: DoorId, farDoor?: DoorId, fromRoomId?: string): void {
     this.endTransitVestibule();
     // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
     // its aperture — grace period + disarm so the return leg needs a real,
@@ -1793,8 +1815,10 @@ export class World {
     this.fpArrivalCooldownUntil = performance.now() + 1500;
     this.fpTransitArmed = false;
     this.fpAutoOpened.clear(); // departure-room door refs died with the swap
-    // #62 P4: an assembled connection's record names the exact arrival door.
-    const arrival = this.resolveArrivalDoor(departureDoorId, farDoor);
+    // 🔗 The arrival room's own back-pointing record picks the door (see
+    // resolveArrivalDoor); the record's farDoor and the opposite-cardinal
+    // guess are fallbacks only.
+    const arrival = this.resolveArrivalDoor(departureDoorId, farDoor, fromRoomId);
     this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
   }
 
