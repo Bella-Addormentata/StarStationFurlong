@@ -28,6 +28,11 @@ import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
 import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
+import {
+  bindRoomRoles, subscribeRoomRoles, readCoHostRequests, readCoHosts,
+  writeCoHostRequest, removeCoHostRequest, writeCoHost, removeCoHost,
+  isCoHost, hasCoHostRequest,
+} from './roomRoles';
 import { refreshExteriorView, setExteriorOwnerCheck, showEnterRoomBubble } from './exteriorView';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
@@ -665,6 +670,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
   bindExteriorDoc(sync.doc);
 
+  // 🤝 Durability C1: co-host designations ride the room doc (T0 seam).
+  bindRoomRoles(sync.doc);
+
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
@@ -693,6 +701,10 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
     });
+    // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
+    // appearing while the owner has the app open, an accept while the
+    // volunteer watches).
+    subscribeRoomRoles(() => renderCoHostsSection());
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1485,6 +1497,89 @@ function renderPhonePlayersList(): void {
   }
 }
 
+// ── 🤝 CO-HOSTS section (durability C1) — lives in the ACCESS app ────────────
+// Members volunteer; the owner accepts into a standing, revocable designation
+// keyed to identity pubkeys. v1 is DESIGNATION ONLY (the doc record later
+// slices consume: node retention/serving C4, pass hints C3, roomProof C6) —
+// co-hosts do NOT pass owner gates.
+
+function renderCoHostsSection(): void {
+  const accessView = document.getElementById('phone-app-access');
+  if (!accessView) return;
+  let section = document.getElementById('access-cohosts-section');
+  if (!section) {
+    section = document.createElement('div');
+    section.id = 'access-cohosts-section';
+    section.style.cssText = 'margin-top:14px; padding-top:10px; border-top:1px solid rgba(212,168,75,0.14); font-size:10px;';
+    accessView.appendChild(section);
+    // Delegated actions (bound once; survives re-renders).
+    section.addEventListener('click', (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-cohost-action]');
+      if (!el) return;
+      const pub = el.dataset.pub ?? '';
+      const action = el.dataset.cohostAction;
+      const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+      const amOwner = isLocalPlayerRoomOwner(ownerVal);
+      if (action === 'volunteer') {
+        writeCoHostRequest(getIdentityPub(), getPlayerName());
+      } else if (action === 'withdraw') {
+        removeCoHostRequest(getIdentityPub());
+      } else if (!amOwner) {
+        return; // accept/deny/revoke are owner-only (UI gate, dev-phase posture)
+      } else if (action === 'accept' && pub) {
+        writeCoHost(pub, el.dataset.name ?? 'Unknown-Clone');
+      } else if (action === 'deny' && pub) {
+        removeCoHostRequest(pub);
+      } else if (action === 'revoke' && pub) {
+        removeCoHost(pub);
+      }
+      renderCoHostsSection();
+    });
+  }
+
+  const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+  const amOwner = isLocalPlayerRoomOwner(ownerVal);
+  const myPub = getIdentityPub();
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  const pill = 'display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;';
+  const rowStyle = 'display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:5px;';
+  const coHosts = readCoHosts();
+  const requests = readCoHostRequests();
+
+  const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 CO-HOSTS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· room keepers</span></div>
+    <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Designation now — node-side serving lands in the next node update.</div>`;
+
+  const coHostRows = coHosts.map((c) => `
+    <div style="${rowStyle}">
+      <span style="color:#00e676; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(c.pub)}">✔ ${esc(c.name)} <span style="color:rgba(212,168,75,0.4);">${esc(c.pub.slice(0, 8))}</span>${c.pub === myPub ? ' <span style="color:rgba(0,230,118,0.6);">(you)</span>' : ''}</span>
+      ${amOwner ? `<button type="button" data-cohost-action="revoke" data-pub="${esc(c.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>` : ''}
+    </div>`).join('');
+
+  const requestRows = amOwner ? requests.map((r) => `
+    <div style="${rowStyle}">
+      <span style="color:#ffb300; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(r.pub)}">⚠ ${esc(r.name)} <span style="color:rgba(212,168,75,0.4);">${esc(r.pub.slice(0, 8))}</span></span>
+      <span style="flex-shrink:0; display:flex; gap:4px;">
+        <button type="button" data-cohost-action="accept" data-pub="${esc(r.pub)}" data-name="${esc(r.name)}" style="${pill} background:rgba(0,230,118,0.15); border-color:rgba(0,230,118,0.4); color:#00e676;">ACCEPT</button>
+        <button type="button" data-cohost-action="deny" data-pub="${esc(r.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DENY</button>
+      </span>
+    </div>`).join('') : '';
+
+  let memberLine = '';
+  if (!amOwner) {
+    memberLine = isCoHost(myPub)
+      ? '<div style="margin-top:6px; color:#00e676;">✔ You are a co-host of this room.</div>'
+      : hasCoHostRequest(myPub)
+        ? `<div style="${rowStyle}"><span style="color:#ffb300;">⏳ Volunteer request pending…</span><button type="button" data-cohost-action="withdraw" style="${pill}">WITHDRAW</button></div>`
+        : `<div style="margin-top:6px;"><button type="button" data-cohost-action="volunteer" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#00e676;">🤝 VOLUNTEER AS CO-HOST</button></div>`;
+  }
+
+  const emptyState = amOwner && coHosts.length === 0 && requests.length === 0
+    ? '<div style="margin-top:6px; color:rgba(212,168,75,0.4);">No co-hosts yet — members can volunteer from this app.</div>'
+    : '';
+
+  section.innerHTML = header + coHostRows + requestRows + memberLine + emptyState;
+}
+
 // ── 💬 QUICK CHAT (owner request) ────────────────────────────────────────────
 // Enter (game focus) pops a mini bar holding JUST the chat field — the top of
 // the phone peeking up. Enter sends (the overhead bubble shows); Enter on a
@@ -1628,7 +1723,7 @@ function setupSpacePhoneOverlay() {
     // ACCESS (#52): MY PASS shows the CURRENT room — repaint on every open
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
-    if (id === 'access') refreshAccessRoomRow();
+    if (id === 'access') { refreshAccessRoomRow(); renderCoHostsSection(); }
     if (id === 'contacts') refreshContactsApp();
   };
 
