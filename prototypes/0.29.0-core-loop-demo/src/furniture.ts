@@ -51,7 +51,10 @@ export type FurnitureKind =
   | 'wall-computer'
   | 'map-table'
   | 'storage-trunk'
-  | 'game-table';
+  | 'game-table'
+  | 'fuel-tank'
+  | 'engine-block'
+  | 'helm-console';
 
 export interface FurnitureItem {
   id: string;
@@ -1076,7 +1079,82 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.82, z: 0 },
     },
   },
+  // ── 🚀 Ship fittings (#30 SH1) — capability = the `functions` TAG, not the
+  // kind (spaceship-conversion-plan.md invariant: future part variants tag
+  // the same capability; the helm/exterior count by tag). ──
+  'fuel-tank': { kind: 'fuel-tank', build: buildFuelTank, footprint: { w: 2, d: 1 }, functions: ['fuelTank'] },
+  'engine-block': { kind: 'engine-block', build: buildEngineBlock, footprint: { w: 1, d: 1 }, functions: ['engine'] },
+  'helm-console': {
+    kind: 'helm-console',
+    build: buildHelmConsole,
+    footprint: { w: 2, d: 1 },
+    functions: ['helm'],
+    device: {
+      kind: 'helm',
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.5, z: -0.9 },
+      anchor: { x: 0, y: 1.05, z: 0.2 },
+    },
+  },
 };
+
+// ── 🚀 Ship fittings (#30 SH1) — the parts that turn a module into a ship ────
+// Interior halves only; the EXTERIOR dress (engine bells on the hull, saddle
+// tanks on the roof) renders in exteriorView.ts from the same furniture
+// records. Function declarations (hoisted — FURNITURE_DEFS above references
+// them; the other builders predate the table, these follow the game-table).
+
+function buildFuelTank({ m, place }: BuildCtx) {
+  // Skid + cradles + horizontal tank + hazard band + valve wheel.
+  place(new THREE.BoxGeometry(1.7, 0.14, 0.8), m(0x2A3444, 0.7, 0.35), 0, 0.07, 0);
+  for (const sx of [-0.55, 0.55]) {
+    place(new THREE.BoxGeometry(0.14, 0.36, 0.78), m(0x2A3444, 0.7, 0.35), sx, 0.30, 0);
+  }
+  const tank = place(new THREE.CylinderGeometry(0.36, 0.36, 1.55, 18), m(0xC8CDD8, 0.35, 0.75), 0, 0.72, 0);
+  tank.rotation.z = Math.PI / 2;
+  const band = place(new THREE.CylinderGeometry(0.37, 0.37, 0.18, 18), m(0xFFB300, 0.5, 0.4), 0, 0.72, 0);
+  band.rotation.z = Math.PI / 2;
+  for (const sx of [-0.775, 0.775]) {
+    const cap = place(new THREE.SphereGeometry(0.36, 14, 10), m(0xB8BFCC, 0.4, 0.7), sx, 0.72, 0);
+    cap.scale.x = 0.45;
+  }
+  const wheel = place(new THREE.TorusGeometry(0.11, 0.025, 8, 16), m(0xD4A84B, 0.45, 0.5), 0, 1.14, 0);
+  wheel.rotation.x = Math.PI / 2;
+  place(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 8), m(0x8A93A0, 0.5, 0.6), 0, 1.08, 0);
+}
+
+function buildEngineBlock({ m, place }: BuildCtx) {
+  // Reactor pillar + cooling fins + glowing core ring + feed pipes.
+  place(new THREE.BoxGeometry(0.78, 0.2, 0.78), m(0x2A3444, 0.7, 0.35), 0, 0.10, 0);
+  place(new THREE.CylinderGeometry(0.3, 0.34, 1.1, 12), m(0x37474F, 0.5, 0.6), 0, 0.75, 0);
+  for (let i = 0; i < 4; i++) {
+    const fin = place(new THREE.BoxGeometry(0.06, 0.9, 0.5), m(0x2A3444, 0.6, 0.5), 0, 0.75, 0);
+    fin.rotation.y = (i / 4) * Math.PI;
+  }
+  const core = place(new THREE.TorusGeometry(0.24, 0.05, 10, 20), m(0x00E5FF, 0.3, 0.2, 0x00E5FF, 0.9), 0, 0.75, 0);
+  core.rotation.x = Math.PI / 2;
+  place(new THREE.CylinderGeometry(0.16, 0.2, 0.22, 12), m(0xD4A84B, 0.45, 0.5), 0, 1.4, 0);
+  const pipe = place(new THREE.CylinderGeometry(0.045, 0.045, 0.7, 8), m(0x8A93A0, 0.5, 0.6), 0.3, 1.2, 0);
+  pipe.rotation.z = Math.PI / 4;
+}
+
+function buildHelmConsole({ m, flat, place }: BuildCtx) {
+  // Flight desk + angled dash + main screen + throttle + stick.
+  place(new THREE.BoxGeometry(1.7, 0.1, 0.7), m(0x2A3444, 0.6, 0.4), 0, 0.72, 0);
+  for (const sx of [-0.72, 0.72]) {
+    place(new THREE.BoxGeometry(0.14, 0.7, 0.6), m(0x37474F, 0.6, 0.4), sx, 0.36, 0);
+  }
+  const dash = place(new THREE.BoxGeometry(1.6, 0.5, 0.08), m(0x1C262E, 0.6, 0.4), 0, 1.05, 0.26);
+  dash.rotation.x = -0.5;
+  const screen = place(new THREE.PlaneGeometry(1.3, 0.34), flat(0x0A2A3A), 0, 1.07, 0.215);
+  screen.rotation.x = -0.5;
+  const glowLine = place(new THREE.PlaneGeometry(1.1, 0.05), flat(0x00E5FF), 0, 1.12, 0.20);
+  glowLine.rotation.x = -0.5;
+  place(new THREE.CylinderGeometry(0.025, 0.025, 0.2, 8), m(0xD4A84B, 0.45, 0.5), -0.45, 0.86, -0.05);
+  place(new THREE.SphereGeometry(0.045, 10, 8), m(0xFF1744, 0.5, 0.3), -0.45, 0.97, -0.05);
+  place(new THREE.BoxGeometry(0.16, 0.05, 0.22), m(0x37474F, 0.5, 0.5), 0.42, 0.78, -0.05);
+}
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
 // Obstacle-bearing items appear first, in the same order as the original

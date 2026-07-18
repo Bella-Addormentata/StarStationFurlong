@@ -23,7 +23,7 @@ import {
 } from './keypair';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
-import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
+import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
@@ -737,6 +737,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
     });
+    // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
+    // tanks appear in the exterior as fittings land inside).
+    subscribeFurniture(() => refreshExteriorView());
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());

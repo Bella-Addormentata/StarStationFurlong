@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.3 — 2026-07-18
+
+### 🚀 Ship Fittings (#30 SH1) — your module starts becoming a ship
+
+- **Three new fittings** (DEV menu stocks them; place in edit mode): the 🛢 **FUEL TANK**, the ⚙ **ENGINE BLOCK** (glowing reactor core), and the 🎛 **HELM CONSOLE**. Walk up to the helm and it opens a **pre-flight checklist**: engines, fuel, helm, hull — and a verdict: *ALL SYSTEMS FITTED — this module is spaceworthy* (or what's missing). Flight controls arrive with the flight update; the helm says so honestly.
+- **The hull shows it**: fit engines and tanks inside, then zoom out — **engine bells appear on the aft face and saddle tanks on the roof**. Your module visibly transforms as you outfit it, exactly the #30 fantasy.
+- Also landed: the full **module→spaceship sliced plan** ([`brainstorming/spaceship-conversion-plan.md`](brainstorming/spaceship-conversion-plan.md)) — flight will be *a record, not a simulation* (everyone aboard travels together because the ship IS the room), chained modules can't fly by construction, and undock/redock rides the #67 berthing already shipped. Next: SH2 fuel truth, SH3 first flight.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.3 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.2 — 2026-07-18
 
 ### 🏘 Ventures Own Multiple Modules (#68 V2)

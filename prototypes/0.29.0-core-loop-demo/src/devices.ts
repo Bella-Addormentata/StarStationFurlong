@@ -24,7 +24,10 @@
  */
 
 import * as THREE from 'three';
-import { FURNITURE, buildDeviceList, itemAabb } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, buildDeviceList, itemAabb } from './furniture';
+// 🚀 #30 SH1: the helm re-renders its checklist when the furniture doc moves
+// (an engine landing while someone reads the status flips the row live).
+import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState } from './docking';
@@ -53,7 +56,7 @@ import { getPlayerId } from './identity';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -1450,5 +1453,80 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         chessBotTimer = 0;
       }
     },
+  };
+}
+
+// ── 🚀 #30 SH1: the HELM console — ship status, no flight yet ────────────────
+
+/**
+ * The helm's focused UI: a SHIP STATUS checklist derived LIVE from the room's
+ * furniture (the fittings ARE the requirements — #62's physical-item ruling
+ * applied to ships). No doc state of its own in SH1: presence of fittings is
+ * already shared truth via the furniture map. Flight controls arrive with the
+ * flight slices (spaceship-conversion-plan.md); the panel says so honestly.
+ */
+export function createHelmUI(): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+
+  const render = (): void => {
+    if (!panel) return;
+    const engines = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('engine')).length;
+    const tanks = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank')).length;
+    const check = (ok: boolean) => ok
+      ? '<span style="color:#00E676;">✔</span>'
+      : '<span style="color:#FF8A80;">✗</span>';
+    const row = (label: string, value: string) => `
+      <div style="display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid rgba(212,168,75,0.10); font-size:11px;">
+        <span style="color:rgba(212,168,75,0.75);">${label}</span><span>${value}</span>
+      </div>`;
+    const ready = engines >= 1 && tanks >= 1;
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — SHIP STATUS</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      ${row('ENGINES', `${check(engines >= 1)} ${engines} mounted`)}
+      ${row('FUEL', `${check(tanks >= 1)} ${tanks} tank${tanks === 1 ? '' : 's'}${tanks > 0 ? ' · FULL' : ' — install a fuel tank'}`)}
+      ${row('HELM', `${check(true)} online`)}
+      ${row('PROVISIONS', '— <span style="color:rgba(212,168,75,0.45);">galley update coming</span>')}
+      ${row('HULL', `${check(true)} sealed`)}
+      <div style="margin-top:10px; padding:10px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.6; color:${ready ? '#00E676' : 'rgba(212,168,75,0.7)'};">
+        ${ready
+          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. Undocking and flight arrive with the flight update; the station keeps you safely berthed until then.'
+          : 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
+        SSF FLIGHT SYSTEMS v0 · status only — controls arrive with the flight update
+      </div>
+    `;
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-helm-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 380px; max-height: 88vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column;
+        color: #d4a84b; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeFurnitureForHelm(() => render());
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+    },
+
+    update(): void { /* status is observer-driven; nothing per-frame */ },
   };
 }

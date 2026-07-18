@@ -23,6 +23,7 @@ import * as THREE from 'three';
 import { readExterior, nextFreeExteriorSlot, writeExteriorSlot } from './exteriorDoc';
 import { readDoorPolicy } from './doorPolicy';
 import { readDoorDeltas } from './floorPlanDoc';
+import { FURNITURE, FURNITURE_DEFS } from './furniture';
 
 const HULL = 0x39445A;
 const HULL_DARK = 0x2A3444;
@@ -198,6 +199,60 @@ function buildGroup(): THREE.Group {
     // Push the collar outward along the wall normal so it hangs OFF the hull.
     collar.translateZ(0.85);
     g.add(collar);
+  }
+
+  // 🚀 Ship fittings dress (#30 SH1): interior fittings show OUTSIDE — engine
+  // bells low on the aft (south) face, saddle tanks on the roof. The module
+  // visibly becomes a ship as you fit it out.
+  const engineCount = Math.min(3, FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('engine')).length);
+  const tankCount = Math.min(2, FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank')).length);
+  const bellXs = [-3.4, 3.4, 0].slice(0, engineCount);
+  for (const bx of bellXs) {
+    const bell = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.55, 0.3, 0.95, 14, 1, true),
+      new THREE.MeshStandardMaterial({ color: 0x37474F, roughness: 0.45, metalness: 0.7, side: THREE.DoubleSide }),
+    );
+    bell.rotation.x = -Math.PI / 2;
+    bell.position.set(bx, 1.0, 6.45);
+    g.add(bell);
+    const glow = new THREE.Mesh(
+      new THREE.CircleGeometry(0.26, 12),
+      new THREE.MeshBasicMaterial({ color: 0x7FD4FF, transparent: true, opacity: 0.85 }),
+    );
+    glow.position.set(bx, 1.0, 6.55);
+    g.add(glow);
+    const collar9 = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.32, 0.36, 0.3, 12),
+      new THREE.MeshStandardMaterial({ color: 0x2A3444, roughness: 0.6, metalness: 0.5 }),
+    );
+    collar9.rotation.x = -Math.PI / 2;
+    collar9.position.set(bx, 1.0, 5.95);
+    g.add(collar9);
+  }
+  const tankXs = [-2.6, 2.6].slice(0, tankCount);
+  for (const tx of tankXs) {
+    const saddle = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.5, 0.5, 2.6, 16),
+      new THREE.MeshStandardMaterial({ color: 0xC8CDD8, roughness: 0.35, metalness: 0.75 }),
+    );
+    saddle.rotation.z = Math.PI / 2;
+    saddle.position.set(tx, 4.75, -3.4);
+    g.add(saddle);
+    const band9 = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.52, 0.52, 0.25, 16),
+      new THREE.MeshStandardMaterial({ color: 0xFFB300, roughness: 0.5, metalness: 0.4 }),
+    );
+    band9.rotation.z = Math.PI / 2;
+    band9.position.set(tx, 4.75, -3.4);
+    g.add(band9);
+    for (const cx of [-0.9, 0.9]) {
+      const cradle = new THREE.Mesh(
+        new THREE.BoxGeometry(0.16, 0.5, 0.7),
+        new THREE.MeshStandardMaterial({ color: 0x2A3444, roughness: 0.6, metalness: 0.5 }),
+      );
+      cradle.position.set(tx + cx, 4.4, -3.4);
+      g.add(cradle);
+    }
   }
 
   // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.
