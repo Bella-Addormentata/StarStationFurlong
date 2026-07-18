@@ -1431,6 +1431,13 @@ export class World {
       return;
     }
 
+    // #67 D1: passage policy — an owner-restricted door refuses non-owners
+    // before any walk choreography starts.
+    if (!this.dockingSystem.canPass(door.id)) {
+      showHint('This door\'s passage is restricted by the room owner.');
+      return;
+    }
+
     const ds = this.dockingSystem;
     /** A door offers transit when its pairing completed with a target seed,
      *  main.ts wired a swap driver (T1 of #30), and no swap is already in

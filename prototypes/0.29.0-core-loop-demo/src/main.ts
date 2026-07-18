@@ -26,6 +26,7 @@ import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
+import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -656,6 +657,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
   bindDoorsDoc(sync.doc);
 
+  // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
+  bindDoorPolicy(sync.doc);
+
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
@@ -677,6 +681,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // Friend-from-roster: contact changes swap the CLONES SEEN row button for
     // the ★ FRIEND badge (and vice versa on removal) without a doc change.
     subscribeContacts(() => renderPhonePlayersList());
+    // #67 D1b: policy/request/grant changes repaint an OPEN keypad live — a
+    // grant landing while the guest stares at the pane unlocks it in place.
+    subscribeDoorPolicy(() => world?.dockingSystem?.refreshPolicyUI());
   }
   setActivePassRoom(boot.roomId);
 
