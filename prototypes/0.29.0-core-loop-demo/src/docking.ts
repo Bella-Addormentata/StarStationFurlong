@@ -30,7 +30,7 @@ import {
   seedFloorPlan, writeDoorPlacement, readDoorDeltas, lateralOf,
   LEGACY_PLACEMENTS, DOOR_LATTICE,
 } from './floorPlanDoc';
-import { readAtlas } from './stationAtlas';
+import { readAtlas, atlasLayout } from './stationAtlas';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -423,6 +423,10 @@ export class DoorDockingPortSystem {
             </select>
             <button id="docking-far-yaw" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">YAW —</button>
           </div>
+          <!-- 🧲 Chain-contact detection (owner's ask): when the working chain's
+               far end lands on a KNOWN module (station atlas), offer the
+               connection right here. Rendered by detectChainContact. -->
+          <div id="docking-dock-detect" style="display:none; margin-top:6px;"></div>
         </div>
 
         <!-- Connection address -->
@@ -902,6 +906,9 @@ export class DoorDockingPortSystem {
     }
     if (farSel) farSel.value = state.farDoor ?? '';
     if (yawBtn) yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? '—' : state.farYawDeg}`;
+    // 🧲 Every chain edit re-tests whether the far end now reaches a known
+    // module — the connect prompt appears/disappears as you build.
+    this.detectChainContact(doorId);
   }
 
   /** #62 P4: a post-pairing chain edit re-fires the ACCEPTED publish so the
@@ -969,6 +976,74 @@ export class DoorDockingPortSystem {
     this.renderAssemblyStrip(doorId);
     this.renderPolicySection(doorId); // #67 D1
     this.renderKnownModules();        // 🗺️ atlas picker
+  }
+
+  /**
+   * 🧲 Chain-contact detection (owner's ask): fold the WORKING chain from
+   * this door and test whether the module that would sit at its far end
+   * coincides with a KNOWN module (the station atlas, laid out through the
+   * connection graph — so closing the octagon matches room 1 via the path
+   * around the ring). On contact: prompt right in the pane — CONNECT fills
+   * the address + FAR door and fires the normal INITIATE path.
+   * Works for modules the atlas can PLACE (reachable through known links);
+   * an island module it has never seen connected can't be matched.
+   */
+  private detectChainContact(doorId: 'north' | 'south' | 'east' | 'west'): void {
+    const slot = document.getElementById('docking-dock-detect');
+    if (!slot) return;
+    slot.style.display = 'none';
+    const state = this.doorState.get(doorId);
+    if (!state || state.pairedSuccessfully || !state.segments || state.segments.length === 0) return;
+    const currentId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+    if (!currentId) return;
+
+    // Where would a module sit at this chain's far end? (Room-local = world
+    // for the current room — the same frame atlasLayout emits.)
+    const wouldBe = projectionPoseForDoor(doorId, state.segments, undefined);
+    const layout = atlasLayout(currentId, (d, s, f) => projectionPoseForDoor(d, s, f), 8);
+    let best: { roomId: string; name: string; seed?: string; dist: number; door: string } | null = null;
+    const DOOR_YAW: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
+    const angDiff = (a: number, b: number) => {
+      let d = (a - b) % (Math.PI * 2);
+      if (d > Math.PI) d -= Math.PI * 2;
+      if (d < -Math.PI) d += Math.PI * 2;
+      return Math.abs(d);
+    };
+    for (const mod of layout) {
+      const dist = Math.hypot(mod.x - wouldBe.x, mod.z - wouldBe.z);
+      if (dist > 4.5 || (best && dist >= best.dist)) continue;
+      // The chain arrives heading wouldBe.rotY (no farDoor ⇒ rotY = heading);
+      // the matching door of the module faces BACK along it.
+      const arrivalFacing = wouldBe.rotY + Math.PI;
+      let doorPick: string | null = null;
+      let doorErr = Math.PI;
+      for (const d of ['north', 'south', 'east', 'west']) {
+        const err = angDiff(mod.rotY + DOOR_YAW[d], arrivalFacing);
+        if (err < doorErr) { doorErr = err; doorPick = d; }
+      }
+      if (doorPick && doorErr < Math.PI / 3) {
+        best = { roomId: mod.roomId, name: mod.name, seed: mod.seed, dist, door: doorPick };
+      }
+    }
+    if (!best || !best.seed) return;
+
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    slot.innerHTML = `
+      <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
+        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its ${best.door.toUpperCase()} door?</span>
+        <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
+      </div>`;
+    slot.style.display = 'block';
+    document.getElementById('docking-dock-connect')?.addEventListener('click', () => {
+      const addr = document.getElementById('docking-addr-input') as HTMLInputElement | null;
+      const far = document.getElementById('docking-far-door') as HTMLSelectElement | null;
+      if (addr) addr.value = best!.seed!;
+      if (far) far.value = best!.door;
+      const st = this.doorState.get(doorId);
+      if (st) st.farDoor = best!.door as 'north' | 'south' | 'east' | 'west';
+      // Fire the normal INITIATE path (all its gates apply).
+      document.getElementById('docking-request-btn')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
   }
 
   /** 🗺️ Repopulate the known-modules picker from the station atlas (every
