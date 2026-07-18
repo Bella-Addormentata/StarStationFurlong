@@ -1083,7 +1083,10 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
 // therefore sliding behaviour in multi-box corners) is unchanged.
 export const FURNITURE: FurnitureItem[] = [
-  { id: 'fireplace-wall',        kind: 'fireplace-wall',     pos: { x:  0.0,  z: -5.5 }, rot: 0, movable: false },
+  // Movable since the floor-plan work (owner request): the hearth can slide
+  // aside to free the NORTH door — the door unblocks dynamically when the
+  // fireplace footprint clears its approach zone (world.updateNorthDoorForFireplace).
+  { id: 'fireplace-wall',        kind: 'fireplace-wall',     pos: { x:  0.0,  z: -5.5 }, rot: 0, movable: true },
   { id: 'sofa-back',             kind: 'sofa-back',          pos: { x:  0.0,  z: -1.5 }, rot: 0, movable: true },
   { id: 'sofa-front',            kind: 'sofa-front',         pos: { x:  0.0,  z:  3.5 }, rot: 0, movable: true },
   { id: 'armchair-left-0',       kind: 'armchair-left',      pos: { x: -4.5,  z: -3.5 }, rot: 0, movable: true },

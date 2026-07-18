@@ -88,13 +88,24 @@ export function isFurnitureRecord(value: unknown): value is FurnitureRecord {
   );
 }
 
+/** Kinds whose movability is KIND-DERIVED, overriding the stored record flag.
+ *  Migration seam (owner request, floor-plan work): rooms seeded before the
+ *  fireplace became movable carry `movable: false` in their doc forever —
+ *  the override frees them without touching stored data. */
+const MOVABLE_KIND_OVERRIDE: Partial<Record<FurnitureKind, boolean>> = {
+  'fireplace-wall': true,
+};
+
 /** Snapshot the whole layout as id → validated record (malformed entries are
  *  skipped, not fatal — a bad peer write degrades to "that item is absent"). */
 export function readAllFurniture(): Map<string, FurnitureRecord> {
   const out = new Map<string, FurnitureRecord>();
   if (!docAlive()) return out;
   for (const [id, value] of furnitureMap!.entries()) {
-    if (isFurnitureRecord(value)) out.set(id, value);
+    if (isFurnitureRecord(value)) {
+      const override = MOVABLE_KIND_OVERRIDE[value.kind];
+      out.set(id, override === undefined ? value : { ...value, movable: override });
+    }
   }
   return out;
 }

@@ -25,7 +25,8 @@ import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
-import { addToLedger, ledgerHasRoom, autoAcceptEnabled, mirrorSegments } from './stationParts';
+import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
+import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
@@ -833,7 +834,25 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       container.scrollTop = container.scrollHeight;
     }
   };
-  sharedChat.observe((_event) => {
+  sharedChat.observe((event) => {
+    // 💬 Overhead bubbles from the event's INSERT delta only — robust against
+    // the in-transact 200-cap trim (length deltas lie there) and precise about
+    // what is genuinely NEW. Gated on serverSynced so the join-time history
+    // burst (one big insert delta) never floods bubbles for old messages.
+    if (sync.serverSynced) {
+      try {
+        for (const op of event.changes.delta) {
+          const inserted = (op as { insert?: unknown[] }).insert;
+          if (!Array.isArray(inserted)) continue;
+          for (const item of inserted) {
+            const msg = item as { authorId?: string; text?: string; atX?: number; atZ?: number };
+            if (typeof msg?.text !== 'string') continue;
+            const isSelf = typeof msg.authorId === 'string' && msg.authorId === getPlayerId();
+            spawnChatBubble(msg.text, isSelf, msg.atX, msg.atZ);
+          }
+        }
+      } catch { /* bubbles are cosmetic — never break the chat log */ }
+    }
     rebuildChatLog();
   });
   // Rejoin fix (issue #30 T0): after leaveRoom()→joinRoom() the container
@@ -892,6 +911,8 @@ async function leaveRoom(): Promise<void> {
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
   // room we left re-warms so it stays enterable from the list.
   setActivePassRoom(null);
+  // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
+  clearChatBubbles();
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -1142,13 +1163,30 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
 async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
   // #62 P4: capture the departure connection BEFORE the swap tears the room
   // down — the arrival choreography wants the record's farDoor, and the lazy
-  // mirror write needs the chain + the departure room's own address.
+  // mirror write needs the departure room's own address.
   const depState = world.dockingSystem?.getDockingState(departureDoorId);
+  const depPaired = depState?.pairedSuccessfully === true;
   const depGeometry = depState?.segments?.length
     ? { segments: depState.segments, farDoor: depState.farDoor, farYawDeg: depState.farYawDeg }
     : null;
   const depRoomId = activeBootstrap?.roomId ?? null;
-  const depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+
+  // Vestibule-findings fix (root cause 2): the walker's own rooms are exactly
+  // the rooms NEVER in their own pass list, so passSeed alone silently killed
+  // most mirrors. Resolution ladder: pass list → minted-module ledger → mint a
+  // fresh link (local node op; done PRE-swap while the departure room's state
+  // is definitely alive).
+  let depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+  if (depPaired && depRoomId && !depAddress) {
+    depAddress = moduleLedger().find((e) => e.roomId === depRoomId)?.seed ?? null;
+  }
+  if (depPaired && depRoomId && !depAddress) {
+    try {
+      depAddress = (await mintBootstrapLink(undefined, depRoomId)).link ?? null;
+    } catch (e) {
+      console.warn('🪞 Mirror: could not mint a departure-room link:', e);
+    }
+  }
 
   const result = await performRoomSwap(seedString, {
     arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor),
@@ -1159,23 +1197,28 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
     return;
   }
 
-  // #62 P4: LAZY MIRROR — the first entry through an assembled connection
-  // writes the ARRIVAL room's half of the record into its (now-bound) doors
-  // doc: reversed segments (flex bends negated — an arc traversed backwards
-  // reverses its heading change), farDoor pointing back at the departure
-  // door. The link then renders + transits from BOTH sides for everyone.
+  // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY
+  // pairing, plain or assembled — before this, a plain pairing NEVER wrote the
+  // far room's record (pre-#62 nothing did), so the return direction
+  // structurally did not exist: the far room's doors doc stayed empty and the
+  // return gate said "No room docked". Now the first walk-through writes the
+  // arrival room's half: address back to the departure room, farDoor pointing
+  // at the departure door, and (chains only) reversed segments with negated
+  // flex bends (an arc traversed backwards reverses its heading change).
   // Never clobbers an existing pairing on the arrival door.
-  if (depGeometry && depAddress) {
-    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry.farDoor).id;
+  if (depPaired && depAddress) {
+    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry?.farDoor).id;
     const existing = readAllDoors().get(arrivalDoorId);
     if (!existing?.paired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
-        segments: mirrorSegments(depGeometry.segments),
+        segments: depGeometry ? mirrorSegments(depGeometry.segments) : undefined,
         farDoor: departureDoorId,
-        farYawDeg: depGeometry.farYawDeg,
+        farYawDeg: depGeometry?.farYawDeg,
       });
       console.log(`🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`);
     }
+  } else if (depPaired) {
+    console.warn(`🪞 Mirror SKIPPED: no resolvable address for departure room ${depRoomId} — the return direction will refuse until one side pairs manually.`);
   }
 }
 
@@ -1228,6 +1271,14 @@ function wireAdapterTransit(): void {
   // #62 P4: auto-accept decider — a pairing may complete without a far-side
   // human only for rooms THIS client minted (the ledger / this session's
   // mints) or its own current room, and only while the DEV toggle is on.
+  // Vestibule-findings fix: connection changes (request / approve / assembly)
+  // are limited to the room's OWNER — the same gate the room-name editor and
+  // edit mode use. Legacy 'Local-Clone' rooms stay editable by everyone, per
+  // the S2 convention inside isLocalPlayerRoomOwner.
+  world.dockingSystem?.onOwnerCheck(() => {
+    const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+    return isLocalPlayerRoomOwner(ownerVal);
+  });
   world.dockingSystem?.onAutoAcceptCheck((address) => {
     if (!autoAcceptEnabled()) return false;
     try {
@@ -1414,6 +1465,22 @@ function setupSpacePhoneOverlay() {
   // (same pattern as networkPanelInitialized).
   if (phoneOverlayInitialized) return;
   phoneOverlayInitialized = true;
+
+  // 💬 Overhead chat bubbles — live-closure deps (world/camera resolve lazily,
+  // so init order doesn't matter; every getter null-guards).
+  initChatBubbles({
+    camera: () => (window as any).gameRenderer?.camera,
+    localPos: () => {
+      try { return world?.getPlayer()?.getPosition() ?? null; } catch { return null; }
+    },
+    remotes: () => {
+      try { return world?.getRemoteAvatarSnapshots() ?? []; } catch { return []; }
+    },
+    zoomLevel: () => {
+      const zv = (window as any).multiScaleZoom;
+      return zv && typeof zv.getLevel === 'function' ? zv.getLevel() : 2;
+    },
+  });
 
   const container = document.getElementById('spacephone-container');
   const chatInput = document.getElementById('chat-input') as HTMLInputElement;
@@ -1813,7 +1880,16 @@ function setupSpacePhoneOverlay() {
             authorName: getPlayerName(),
             text: val,
             atTick: localSeq,
-            scope: 'global'
+            scope: 'global',
+            // 💬 Bubble anchor (additive; legacy readers ignore): the sender's
+            // position at send time — remote clients pop the bubble over the
+            // avatar nearest this spot (no lane↔player mapping exists yet).
+            ...((): { atX?: number; atZ?: number } => {
+              try {
+                const p = world?.getPlayer()?.getPosition();
+                return p ? { atX: p.x, atZ: p.z } : {};
+              } catch { return {}; }
+            })(),
           }]);
           // 💾 Tier A (plan §3.3): cap chat IN THE DOC so the room doc — and its
           // cached snapshot, and every sync — stays bounded. Concurrent trims
@@ -3088,6 +3164,8 @@ function logToPhoneSystem(msg: string) {
 }
 
 function simulateLocalMessage(val: string) {
+  // 💬 Offline path never touches the doc, so pop the overhead bubble directly.
+  spawnChatBubble(val, /* isSelf */ true);
   const container = document.getElementById('chat-messages-container');
   if (container) {
     const ourBubble = document.createElement('div');
@@ -3426,6 +3504,8 @@ function onCanvasClick(event: MouseEvent): void {
  */
 function animate() {
   requestAnimationFrame(animate);
+  // 💬 Reproject overhead chat bubbles onto their avatars every frame.
+  updateChatBubbles();
 
   if (!rendererApi) {
     return;
