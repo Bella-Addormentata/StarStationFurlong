@@ -13,7 +13,7 @@ import * as THREE from 'three';
 import { findDoor } from './doors';
 import type { DoorId } from './doors';
 import { getCameraYaw } from './cameraRig';
-import { projectionPoseForDoor, type ConnectorSegment } from './adapter';
+import { projectionPoseForDoor, solveChain, type ConnectorSegment } from './adapter';
 import {
   armedPreset, presetSegments, partsCount, consumePart, refundPart,
   consumeForSegments, refundForSegments,
@@ -1027,19 +1027,61 @@ export class DoorDockingPortSystem {
     }
     if (!best || !best.seed) return;
 
+    // 🛬 JETBRIDGE FIT: solve the chain's free parameters (continuous bends,
+    // flex + telescoping ext stretch) so the fold lands EXACTLY on the
+    // matched module's door face — the owner's ruling: the chain adjusts to
+    // reality (a 45° preset relaxes to 40°, bends equalize, the extension
+    // slides). Target = the matched door's face, in this door's chain frame.
+    const mod = layout.find((m) => m.roomId === best!.roomId)!;
+    const dyaw: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
+    const doorFaceLocal = { north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 } }[best.door]!;
+    const mc = Math.cos(mod.rotY), ms = Math.sin(mod.rotY);
+    const faceWorld = {
+      x: mod.x + doorFaceLocal.x * mc + doorFaceLocal.z * ms,
+      z: mod.z - doorFaceLocal.x * ms + doorFaceLocal.z * mc,
+    };
+    // Chain frame: origin at OUR door face, +z outward, rotated by our door's yaw.
+    const ourYaw = dyaw[doorId];
+    const ourFace = { north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 } }[doorId]!;
+    const dx = faceWorld.x - ourFace.x, dz = faceWorld.z - ourFace.z;
+    const oc = Math.cos(-ourYaw), os = Math.sin(-ourYaw);
+    const targetLocal = {
+      x: dx * oc + dz * os,
+      z: -dx * os + dz * oc,
+      // Chain exit heading must point INTO the matched door.
+      yawRad: (mod.rotY + dyaw[best.door] + Math.PI) - ourYaw,
+    };
+    // Normalize the yaw into (-π, π].
+    while (targetLocal.yawRad > Math.PI) targetLocal.yawRad -= Math.PI * 2;
+    while (targetLocal.yawRad <= -Math.PI) targetLocal.yawRad += Math.PI * 2;
+    const solved = solveChain(state.segments, targetLocal);
+    const fits = solved.residualDist < 0.35 && solved.residualYawDeg < 4;
+
     const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    const fitNote = fits
+      ? (() => {
+        const bends = solved.segments.filter((s) => s.kind === 'flex').map((s) => `${(s.bendDeg ?? 0).toFixed(1)}°`).join('/');
+        return ` · auto-fit ${bends}`;
+      })()
+      : ' · rigid (fit out of range)';
     slot.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
-        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its ${best.door.toUpperCase()} door?</span>
+        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its ${best.door.toUpperCase()} door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
         <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
       </div>`;
     slot.style.display = 'block';
     document.getElementById('docking-dock-connect')?.addEventListener('click', () => {
+      const st = this.doorState.get(doorId);
+      // 🛬 Apply the SOLVED chain (exact fit) before pairing — the record
+      // then carries the fitted geometry to every client.
+      if (st && fits) {
+        st.segments = solved.segments;
+        this.renderAssemblyStrip(doorId);
+      }
       const addr = document.getElementById('docking-addr-input') as HTMLInputElement | null;
       const far = document.getElementById('docking-far-door') as HTMLSelectElement | null;
       if (addr) addr.value = best!.seed!;
       if (far) far.value = best!.door;
-      const st = this.doorState.get(doorId);
       if (st) st.farDoor = best!.door as 'north' | 'south' | 'east' | 'west';
       // Fire the normal INITIATE path (all its gates apply).
       document.getElementById('docking-request-btn')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
