@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.31.4 — 2026-07-18
+
+### 🚀 VENTURES — Joint Ownership (#68 V1)
+
+- **Found a space company.** New 🚀 VENTURES phone app: in a module you own, **sign a Charter** — the module becomes the venture's registered office, and 100 shares are issued to you. **Transfer shares** to other players from the app (paste their key from CONTACTS), and the cap table updates for everyone.
+- **Any share = full co-ownership**: every shareholder gets owner-equivalent access to venture property — docking, edit mode, door policies, co-hosts, all of it. A shared clubhouse actually shared.
+- The app: list screen (your stakes — name, SOLE/JOINT, %) → detail screen (the Charter, OWNERS with percentages, PROPERTY, transfers). Everything in plain language — deeds, charters, shares; no crypto jargon anywhere.
+- v1 scope: a venture owns its founding module; multi-module property and the on-Registry Charter (real tradeable shares + the trading floor) are the next slices on [#68](https://github.com/Bella-Addormentata/StarStationFurlong/issues/68).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.31.4 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.31.3 — 2026-07-18
 
 ### 🤝 Co-Hosts (durability C1)
