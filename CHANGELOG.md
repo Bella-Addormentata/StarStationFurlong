@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.8 — 2026-07-18
+
+### 💬 QUICK CHAT
+
+- **Press ENTER to chat** — no phone dance needed: a mini bar slides up from the bottom edge (the top of your phone peeking) holding just the chat field. Type + ENTER to send — your message pops as a bubble over your avatar and the field stays ready for the next line. ENTER on a **blank** field (or ESC) slides it away. **TAB from the mini bar expands to the full phone on the CHAT app** so you can scroll history; TAB again puts the phone away.
+- Installing this skips v0.30.7 — everything from it is included (one-way vestibule fixes, owner-only docking, chat bubbles, movable fireplace + auto north door).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.8 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.30.7 — 2026-07-18
 
 ### Vestibule Fixes (owner's findings) + 💬 Chat Bubbles + Movable Fireplace
