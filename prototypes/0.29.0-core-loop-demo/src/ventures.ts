@@ -27,7 +27,17 @@ import * as Y from 'yjs';
 
 export const CHARTER_TOTAL_SHARES = 100;
 
-/** The room-doc record — one venture per room in V1 (`venture` map, key 'v'). */
+/** The room-doc record (`venture` map, key 'v').
+ *
+ *  V2 — two flavors, same shape:
+ *  - OFFICE record (the founding room): THE authoritative cap table. No
+ *    `snapshotAt`. Transfers happen only here.
+ *  - PROPERTY LINK (any other module assigned to the venture): a SNAPSHOT of
+ *    the office cap table, stamped `snapshotAt`, refreshed by VISITATION
+ *    GOSSIP — any shareholder whose personal ledger carries a NEWER cap
+ *    table (they visited the office since) rewrites the link on entry. No
+ *    cross-doc sync exists (one doc at a time), so freshness spreads the way
+ *    people do; the V3 Registry anchor replaces this wholesale. */
 export interface VentureRecord {
   id: string;            // stable venture id (random, minted at founding)
   name: string;
@@ -39,9 +49,15 @@ export interface VentureRecord {
   shares: Record<string, number>;
   /** pub → display name (denormalized for the cap table). */
   holderNames: Record<string, string>;
+  /** The venture's registered-office room id (absent on pre-V2 records). */
+  officeRoomId?: string;
+  /** PROPERTY LINK marker: when this record was snapshotted from the ledger.
+   *  Absent ⇒ this room IS the office (authoritative). */
+  snapshotAt?: number;
 }
 
-/** Personal ledger entry (localStorage) — powers the app's list screen. */
+/** Personal ledger entry (localStorage) — powers the app's list screen AND
+ *  carries the freshest cap table this player has SEEN (visitation gossip). */
 export interface VentureLedgerEntry {
   id: string;
   name: string;
@@ -49,6 +65,12 @@ export interface VentureLedgerEntry {
   myShares: number;
   totalShares: number;
   lastSeenAt: number;
+  /** Freshest cap table seen + when (source: office visits or newer links). */
+  shares?: Record<string, number>;
+  holderNames?: Record<string, string>;
+  capSeenAt?: number;
+  /** Property modules seen for this venture (room ids, capped). */
+  properties?: string[];
 }
 
 const LEDGER_KEY = 'ssf-venture-ledger';
@@ -86,8 +108,10 @@ function docAlive(): boolean {
 export function ventureRecord(): VentureRecord | null {
   if (!docAlive()) return null;
   const raw = ventureMap!.get('v') as Partial<VentureRecord> | undefined;
+  // founderPub may be EMPTY on V2 property links (display metadata only —
+  // authority lives in the shares map); it must still be a string.
   if (!raw || typeof raw.id !== 'string' || !raw.id || typeof raw.name !== 'string'
-    || typeof raw.founderPub !== 'string' || !raw.founderPub
+    || typeof raw.founderPub !== 'string'
     || typeof raw.totalShares !== 'number' || !Number.isFinite(raw.totalShares)
     || typeof raw.shares !== 'object' || raw.shares === null) return null;
   const shares: Record<string, number> = {};
@@ -112,7 +136,16 @@ export function ventureRecord(): VentureRecord | null {
     totalShares: Math.floor(raw.totalShares),
     shares,
     holderNames,
+    officeRoomId: typeof raw.officeRoomId === 'string' ? raw.officeRoomId : undefined,
+    snapshotAt: typeof raw.snapshotAt === 'number' && Number.isFinite(raw.snapshotAt) ? raw.snapshotAt : undefined,
   };
+}
+
+/** Is the CURRENT room this venture's registered office (authoritative cap
+ *  table — transfers allowed)? Property links carry `snapshotAt`. */
+export function isOfficeHere(): boolean {
+  const v = ventureRecord();
+  return !!v && v.snapshotAt === undefined;
 }
 
 /** ANY share ⇒ owner-equivalent access (v1 owner rule). */
@@ -127,7 +160,7 @@ export function myVentureShares(pub: string): number {
 
 /** Sign the Charter: found a venture in the CURRENT room (caller enforces
  *  "you own this room" + "no venture here yet"). All 100 shares → founder. */
-export function foundVenture(name: string, founderPub: string, founderName: string): boolean {
+export function foundVenture(name: string, founderPub: string, founderName: string, officeRoomId?: string): boolean {
   if (!docAlive() || !founderPub || ventureRecord() !== null) return false;
   const clean = name.trim().slice(0, 48);
   if (!clean) return false;
@@ -142,8 +175,64 @@ export function foundVenture(name: string, founderPub: string, founderName: stri
       totalShares: CHARTER_TOTAL_SHARES,
       shares: { [founderPub]: CHARTER_TOTAL_SHARES },
       holderNames: { [founderPub]: founderName || 'Unknown-Clone' },
+      officeRoomId,
     } satisfies VentureRecord);
   });
+  return true;
+}
+
+/** 🏠 V2: assign the CURRENT room to a venture as PROPERTY — writes a link
+ *  record snapshotted from the caller's ledger knowledge (the freshest cap
+ *  table they've seen). Caller enforces: room is personally owned by them,
+ *  unchartered, and they hold shares. Refused when a venture already sits
+ *  here (office or link). */
+export function writeVentureLink(entry: VentureLedgerEntry): boolean {
+  if (!docAlive() || ventureRecord() !== null) return false;
+  if (!entry.shares || !entry.capSeenAt) return false; // no cap table seen yet
+  boundDoc!.transact(() => {
+    ventureMap!.set('v', {
+      id: entry.id,
+      name: entry.name,
+      foundedAt: 0,
+      founderPub: '',
+      founderName: '',
+      totalShares: entry.totalShares,
+      shares: { ...entry.shares },
+      holderNames: { ...(entry.holderNames ?? {}) },
+      officeRoomId: entry.officeRoomId,
+      snapshotAt: entry.capSeenAt,
+    });
+  });
+  return true;
+}
+
+/** V2: refresh a STALE property link in place from newer ledger knowledge.
+ *  No-op unless this room holds a link for the same venture with an older
+ *  snapshot. Returns true when a refresh was written. */
+export function refreshVentureLink(entry: VentureLedgerEntry): boolean {
+  if (!docAlive() || !entry.shares || !entry.capSeenAt) return false;
+  const v = ventureRecord();
+  if (!v || v.snapshotAt === undefined || v.id !== entry.id) return false;
+  if (v.snapshotAt >= entry.capSeenAt) return false;
+  boundDoc!.transact(() => {
+    ventureMap!.set('v', {
+      ...v,
+      totalShares: entry.totalShares,
+      shares: { ...entry.shares },
+      holderNames: { ...(entry.holderNames ?? {}) },
+      snapshotAt: entry.capSeenAt,
+    });
+  });
+  return true;
+}
+
+/** V2: detach the CURRENT room from its venture (property links only — the
+ *  office cannot detach; caller gates to the room's PERSONAL owner). */
+export function removeVentureLink(): boolean {
+  if (!docAlive()) return false;
+  const v = ventureRecord();
+  if (!v || v.snapshotAt === undefined) return false;
+  boundDoc!.transact(() => { ventureMap!.delete('v'); });
   return true;
 }
 
@@ -157,6 +246,9 @@ export function transferShares(fromPub: string, toPub: string, toName: string, c
   if (!docAlive() || !fromPub || !toPub || fromPub === toPub) return false;
   const v = ventureRecord();
   if (!v) return false;
+  // V2: transfers happen at the OFFICE only — a property link's cap table is
+  // a snapshot; writing trades into it would fork the truth.
+  if (v.snapshotAt !== undefined) return false;
   const n = Math.floor(count);
   const held = v.shares[fromPub] ?? 0;
   if (n <= 0 || n > held) return false;
