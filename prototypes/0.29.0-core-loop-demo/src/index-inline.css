@@ -768,6 +768,36 @@
         color: rgba(224, 226, 238, 0.35);
       }
 
+      /* 💬 Overhead chat bubbles (anchored above avatar heads per frame) */
+      .overhead-chat-bubble {
+        position: absolute;
+        left: 0;
+        top: 0;
+        max-width: 220px;
+        padding: 5px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(212, 168, 75, 0.45);
+        background: rgba(4, 8, 22, 0.92);
+        color: #e0e2ee;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        white-space: pre-wrap;
+        word-break: break-word;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+        will-change: transform, opacity;
+      }
+      .overhead-chat-bubble::after {
+        content: '';
+        position: absolute;
+        left: 50%;
+        bottom: -5px;
+        transform: translateX(-50%);
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-top: 5px solid rgba(212, 168, 75, 0.45);
+      }
+
       /* 👥 Friend-from-roster (CLONES SEEN one-tap friending) */
       .phone-players-friend-btn {
         flex: 0 0 auto;

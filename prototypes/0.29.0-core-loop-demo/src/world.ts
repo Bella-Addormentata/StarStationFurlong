@@ -1330,6 +1330,17 @@ export class World {
     }
   }
 
+  /** 💬 Chat bubbles: live snapshot of every remote avatar's rendered position
+   *  (keyed by lane-derived peer id — the bubble anchor). */
+  public getRemoteAvatarSnapshots(): Array<{ id: string; x: number; z: number }> {
+    const out: Array<{ id: string; x: number; z: number }> = [];
+    for (const [id, avatar] of this.remotePlayers) {
+      const pos = avatar.rig.masterGroup.position;
+      out.push({ id, x: pos.x, z: pos.z });
+    }
+    return out;
+  }
+
   /** Despawn a remote player replica (peer left / stopped ticking — issue #22). */
   public removeRemotePlayer(id: string) {
     const avatar = this.remotePlayers.get(id);

@@ -26,6 +26,7 @@ import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, autoAcceptEnabled, mirrorSegments } from './stationParts';
+import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
   initRoomPasses, addPass, listPasses, passState, subscribePasses,
@@ -833,7 +834,25 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       container.scrollTop = container.scrollHeight;
     }
   };
-  sharedChat.observe((_event) => {
+  sharedChat.observe((event) => {
+    // 💬 Overhead bubbles from the event's INSERT delta only — robust against
+    // the in-transact 200-cap trim (length deltas lie there) and precise about
+    // what is genuinely NEW. Gated on serverSynced so the join-time history
+    // burst (one big insert delta) never floods bubbles for old messages.
+    if (sync.serverSynced) {
+      try {
+        for (const op of event.changes.delta) {
+          const inserted = (op as { insert?: unknown[] }).insert;
+          if (!Array.isArray(inserted)) continue;
+          for (const item of inserted) {
+            const msg = item as { authorId?: string; text?: string; atX?: number; atZ?: number };
+            if (typeof msg?.text !== 'string') continue;
+            const isSelf = typeof msg.authorId === 'string' && msg.authorId === getPlayerId();
+            spawnChatBubble(msg.text, isSelf, msg.atX, msg.atZ);
+          }
+        }
+      } catch { /* bubbles are cosmetic — never break the chat log */ }
+    }
     rebuildChatLog();
   });
   // Rejoin fix (issue #30 T0): after leaveRoom()→joinRoom() the container
@@ -892,6 +911,8 @@ async function leaveRoom(): Promise<void> {
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
   // room we left re-warms so it stays enterable from the list.
   setActivePassRoom(null);
+  // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
+  clearChatBubbles();
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -1423,6 +1444,22 @@ function setupSpacePhoneOverlay() {
   if (phoneOverlayInitialized) return;
   phoneOverlayInitialized = true;
 
+  // 💬 Overhead chat bubbles — live-closure deps (world/camera resolve lazily,
+  // so init order doesn't matter; every getter null-guards).
+  initChatBubbles({
+    camera: () => (window as any).gameRenderer?.camera,
+    localPos: () => {
+      try { return world?.getPlayer()?.getPosition() ?? null; } catch { return null; }
+    },
+    remotes: () => {
+      try { return world?.getRemoteAvatarSnapshots() ?? []; } catch { return []; }
+    },
+    zoomLevel: () => {
+      const zv = (window as any).multiScaleZoom;
+      return zv && typeof zv.getLevel === 'function' ? zv.getLevel() : 2;
+    },
+  });
+
   const container = document.getElementById('spacephone-container');
   const chatInput = document.getElementById('chat-input') as HTMLInputElement;
   const chatForm = document.getElementById('chat-form');
@@ -1821,7 +1858,16 @@ function setupSpacePhoneOverlay() {
             authorName: getPlayerName(),
             text: val,
             atTick: localSeq,
-            scope: 'global'
+            scope: 'global',
+            // 💬 Bubble anchor (additive; legacy readers ignore): the sender's
+            // position at send time — remote clients pop the bubble over the
+            // avatar nearest this spot (no lane↔player mapping exists yet).
+            ...((): { atX?: number; atZ?: number } => {
+              try {
+                const p = world?.getPlayer()?.getPosition();
+                return p ? { atX: p.x, atZ: p.z } : {};
+              } catch { return {}; }
+            })(),
           }]);
           // 💾 Tier A (plan §3.3): cap chat IN THE DOC so the room doc — and its
           // cached snapshot, and every sync — stays bounded. Concurrent trims
@@ -3096,6 +3142,8 @@ function logToPhoneSystem(msg: string) {
 }
 
 function simulateLocalMessage(val: string) {
+  // 💬 Offline path never touches the doc, so pop the overhead bubble directly.
+  spawnChatBubble(val, /* isSelf */ true);
   const container = document.getElementById('chat-messages-container');
   if (container) {
     const ourBubble = document.createElement('div');
@@ -3434,6 +3482,8 @@ function onCanvasClick(event: MouseEvent): void {
  */
 function animate() {
   requestAnimationFrame(animate);
+  // 💬 Reproject overhead chat bubbles onto their avatars every frame.
+  updateChatBubbles();
 
   if (!rendererApi) {
     return;
