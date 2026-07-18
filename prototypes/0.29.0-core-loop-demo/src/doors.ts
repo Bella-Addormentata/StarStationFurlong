@@ -42,6 +42,38 @@ export function findDoor(id: string): DoorTarget | null {
   return null;
 }
 
+// ── 🧱 #66 S1: door-slide — walk targets follow the placement ────────────────
+// The DOORS values above are the LEGACY BASE (captured below before any
+// mutation); a slide applies a lateral delta along the door's wall to
+// front/through. Delta 0 ⇒ bit-identical legacy targets. `enabled` is
+// deliberately untouched — the fireplace blocking rule owns it at runtime.
+
+const BASE_POINTS: Record<DoorId, { front: { x: number; z: number }; through: { x: number; z: number } }> = {
+  north: { front: { x: 0, z: -4.5 }, through: { x: 0, z: -7.0 } },
+  south: { front: { x: 0, z: 4.5 }, through: { x: 0, z: 7.0 } },
+  west: { front: { x: -4.5, z: -0.5 }, through: { x: -7.0, z: -0.5 } },
+  east: { front: { x: 4.5, z: -0.5 }, through: { x: 7.0, z: -0.5 } },
+};
+
+/** Re-derive every door's walk points from its slide delta (0 = legacy). */
+export function applyDoorSlideDeltas(deltas: Record<DoorId, number>): void {
+  for (const door of DOORS) {
+    const base = BASE_POINTS[door.id];
+    const d = deltas[door.id] ?? 0;
+    if (door.id === 'north' || door.id === 'south') {
+      door.front.x = base.front.x + d;
+      door.front.z = base.front.z;
+      door.through.x = base.through.x + d;
+      door.through.z = base.through.z;
+    } else {
+      door.front.x = base.front.x;
+      door.front.z = base.front.z + d;
+      door.through.x = base.through.x;
+      door.through.z = base.through.z + d;
+    }
+  }
+}
+
 /**
  * Hooks the player's door-walk sequence uses to drive the door hardware.
  * Keeps the Player decoupled from the docking system — World wires the two

@@ -28,6 +28,7 @@ import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
 import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
+import { bindFloorPlan, subscribeFloorPlan } from './floorPlanDoc';
 import {
   bindRoomRoles, subscribeRoomRoles, readCoHostRequests, readCoHosts,
   writeCoHostRequest, removeCoHostRequest, writeCoHost, removeCoHost,
@@ -677,6 +678,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // 🤝 Durability C1: co-host designations ride the room doc (T0 seam).
   bindRoomRoles(sync.doc);
 
+  // 🧱 #66 S1: the floor plan (door placements) rides the doc; re-derive the
+  // door anchors from the fresh doc immediately (joiners see slid doors).
+  bindFloorPlan(sync.doc);
+  world?.reconcileDoorPlacements();
+
   // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
   // whenever it shows us as a shareholder, refresh the personal ledger that
   // powers the VENTURES app's list screen.
@@ -721,6 +727,14 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       syncVentureLedgerFromCurrentRoom();
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
+    });
+    // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
+    // the door slide), refresh an open keypad's POSITION row, and re-dress
+    // the exterior (a slid door carries its adapter collar).
+    subscribeFloorPlan(() => {
+      world?.reconcileDoorPlacements();
+      world?.dockingSystem?.refreshPolicyUI();
+      refreshExteriorView();
     });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
