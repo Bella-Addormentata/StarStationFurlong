@@ -21,6 +21,7 @@
 
 import * as THREE from 'three';
 import { readExterior, nextFreeExteriorSlot, writeExteriorSlot } from './exteriorDoc';
+import { readDoorPolicy } from './doorPolicy';
 
 const HULL = 0x39445A;
 const HULL_DARK = 0x2A3444;
@@ -123,6 +124,73 @@ function buildGroup(): THREE.Group {
     }
     panel.position.set(p.x, 4.28, p.z);
     g.add(panel);
+  }
+
+  // 🔌 IDA-style docking collars at adapter doors (#67 D2 — built to the
+  // owner's pixel-art reference): white soft-goods torus, black capture
+  // latches around the rim, concentric silver guide rings with an X brace,
+  // a flank equipment box, and BLUE truss struts back to the hull.
+  const doorPose: Record<string, { x: number; z: number; ry: number }> = {
+    north: { x: 0, z: -5.9, ry: Math.PI },       // collar faces -z
+    south: { x: 0, z: 5.9, ry: 0 },
+    east:  { x: 5.9, z: 0, ry: Math.PI / 2 },
+    west:  { x: -5.9, z: 0, ry: -Math.PI / 2 },
+  };
+  for (const doorId of ['north', 'south', 'east', 'west']) {
+    if (!readDoorPolicy(doorId).adapter) continue;
+    const pose = doorPose[doorId];
+    const collar = new THREE.Group();
+    collar.name = `dockAdapter-${doorId}`;
+    const softGoods = new THREE.MeshStandardMaterial({ color: 0xF2EFE6, roughness: 0.85, metalness: 0.08 });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(1.35, 0.42, 12, 28), softGoods);
+    collar.add(ring);
+    // Capture latches: 6 black blocks around the rim face.
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 + Math.PI / 6;
+      const latch = new THREE.Mesh(
+        new THREE.BoxGeometry(0.34, 0.34, 0.22),
+        new THREE.MeshStandardMaterial({ color: 0x14161C, roughness: 0.6, metalness: 0.4 }),
+      );
+      latch.position.set(Math.cos(a) * 1.35, Math.sin(a) * 1.35, 0.42);
+      collar.add(latch);
+    }
+    // Concentric guide rings + X cross-brace (silver).
+    const silver = new THREE.MeshStandardMaterial({ color: 0xB8BFCC, roughness: 0.4, metalness: 0.7 });
+    for (const r of [0.85, 0.6]) {
+      const guide = new THREE.Mesh(new THREE.TorusGeometry(r, 0.05, 8, 24), silver);
+      guide.position.z = 0.18;
+      collar.add(guide);
+    }
+    for (const rz of [Math.PI / 4, -Math.PI / 4]) {
+      const brace = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.06, 0.06), silver);
+      brace.position.z = 0.14;
+      brace.rotation.z = rz;
+      collar.add(brace);
+    }
+    // Flank equipment box with a dark label plate (the IDA2 crate).
+    const crate = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.62, 0.62), softGoods);
+    crate.position.set(1.55, -0.55, 0.1);
+    collar.add(crate);
+    const plate = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.34, 0.02),
+      new THREE.MeshStandardMaterial({ color: 0x1C2230, roughness: 0.5 }),
+    );
+    plate.position.set(1.55, -0.5, 0.42);
+    collar.add(plate);
+    // Blue truss struts bracing back to the hull (keep the art's blue).
+    const trussBlue = new THREE.MeshStandardMaterial({ color: 0x2A6BD4, roughness: 0.55, metalness: 0.5 });
+    for (const [sx, sy] of [[-1, 1], [1, 1], [0, -1]] as const) {
+      const strut = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.09, 0.9), trussBlue);
+      strut.position.set(sx * 0.95, sy * 0.95, -0.55);
+      strut.rotation.y = sx * 0.35;
+      strut.rotation.x = -sy * 0.3;
+      collar.add(strut);
+    }
+    collar.position.set(pose.x, 2.0, pose.z);
+    collar.rotation.y = pose.ry;
+    // Push the collar outward along the wall normal so it hangs OFF the hull.
+    collar.translateZ(0.85);
+    g.add(collar);
   }
 
   // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.

@@ -13,13 +13,13 @@
 
 import type { ConnectorSegment } from './adapter';
 
-const PARTS_KEY = 'ssf-station-parts';       // { flex: n, ext: n }
+const PARTS_KEY = 'ssf-station-parts';       // { flex: n, ext: n, adapter: n }
 const LEDGER_KEY = 'ssf-module-ledger';      // [{ roomId, seed, mintedAt }]
 const PRESET_KEY = 'ssf-armed-preset';       // 'ring' | 'spoke' | ''
 const AUTO_ACCEPT_KEY = 'ssf-auto-accept';   // '1' when on
 const NORTH_DOOR_KEY = 'ssf-north-door';     // '1' when unlocked
 
-export type PartKind = 'flex' | 'ext';
+export type PartKind = 'flex' | 'ext' | 'adapter';
 export type PresetId = 'ring' | 'spoke';
 
 export interface LedgerEntry {
@@ -41,7 +41,7 @@ export function subscribeStationParts(listener: () => void): () => void {
 
 // ── Parts counts ─────────────────────────────────────────────────────────────
 
-function loadParts(): { flex: number; ext: number } {
+function loadParts(): { flex: number; ext: number; adapter: number } {
   try {
     const raw = localStorage.getItem(PARTS_KEY);
     if (raw) {
@@ -49,13 +49,14 @@ function loadParts(): { flex: number; ext: number } {
       return {
         flex: Number.isFinite(p?.flex) ? Math.max(0, Math.floor(p.flex)) : 0,
         ext: Number.isFinite(p?.ext) ? Math.max(0, Math.floor(p.ext)) : 0,
+        adapter: Number.isFinite(p?.adapter) ? Math.max(0, Math.floor(p.adapter)) : 0,
       };
     }
   } catch { /* privacy mode / corrupt — start empty */ }
-  return { flex: 0, ext: 0 };
+  return { flex: 0, ext: 0, adapter: 0 };
 }
 
-function saveParts(p: { flex: number; ext: number }): void {
+function saveParts(p: { flex: number; ext: number; adapter: number }): void {
   try { localStorage.setItem(PARTS_KEY, JSON.stringify(p)); } catch { /* session-only */ }
   notify();
 }

@@ -40,6 +40,10 @@ export interface DoorRecord {
   farDoor?: 'north' | 'south' | 'east' | 'west';
   /** Far room ring-orientation: 0 = square, 45 = diamond (octagon ring). */
   farYawDeg?: 0 | 45;
+  /** #67 D2: TRANSIENT guest berth (docking-adapter pairing) — no chains, no
+   *  station-graph permanence, either side may detach. Additive; legacy
+   *  readers ignore it. */
+  transient?: boolean;
 }
 
 const DOOR_IDS = ['north', 'south', 'east', 'west'] as const;
@@ -123,6 +127,7 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
     out.farDoor = r.farDoor;
   }
   if (r.farYawDeg === 0 || r.farYawDeg === 45) out.farYawDeg = r.farYawDeg;
+  if (r.transient === true) out.transient = true;
   return out;
 }
 
@@ -143,6 +148,7 @@ export interface DoorGeometry {
   segments?: ConnectorSegment[];
   farDoor?: DoorRecord['farDoor'];
   farYawDeg?: DoorRecord['farYawDeg'];
+  transient?: boolean;
 }
 
 /** Publish one door's pairing (whoever docked a module). The two legacy
@@ -154,6 +160,7 @@ export function writeDoorPairing(doorId: string, address: string, geometry?: Doo
   if (geometry?.segments && geometry.segments.length > 0) record.segments = geometry.segments;
   if (geometry?.farDoor) record.farDoor = geometry.farDoor;
   if (geometry?.farYawDeg !== undefined) record.farYawDeg = geometry.farYawDeg;
+  if (geometry?.transient === true) record.transient = true;
   boundDoc!.transact(() => {
     doorsMap!.set(doorId, record);
   });

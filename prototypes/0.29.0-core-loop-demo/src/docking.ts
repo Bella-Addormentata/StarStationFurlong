@@ -25,6 +25,7 @@ import {
 } from './doorPolicy';
 import { getIdentityPub } from './keypair';
 import { getPlayerName } from './identity';
+import { deleteDoorPairing } from './doorsDoc';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -46,6 +47,8 @@ export interface DockingState {
   segments?: ConnectorSegment[];
   farDoor?: 'north' | 'south' | 'east' | 'west';
   farYawDeg?: 0 | 45;
+  /** #67 D2: this pairing is a TRANSIENT guest berth (docking adapter). */
+  transient?: boolean;
 }
 
 export class DoorDockingPortSystem {
@@ -535,10 +538,19 @@ export class DoorDockingPortSystem {
         const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
         const pinInput = document.getElementById('docking-pin-input') as HTMLInputElement | null;
         
-        // #67 D1: construction rights per the door's policy (owner / grant / public).
+        // #67 D1/D2: construction rights per the door's policy — EXCEPT at an
+        // adapter door, where anyone may TRANSIENTLY berth a ship (no chains).
         if (activeDoorId && !this.canConstruct(activeDoorId)) {
-          alert('No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).');
-          return;
+          const berthState = this.doorState.get(activeDoorId);
+          if (readDoorPolicy(activeDoorId).adapter && !(berthState?.segments?.length)) {
+            if (berthState) berthState.transient = true; // guest berth, not construction
+          } else {
+            alert('No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).');
+            return;
+          }
+        } else if (activeDoorId) {
+          const st = this.doorState.get(activeDoorId);
+          if (st) st.transient = false; // rights-holder pairing = permanent structure
         }
         if (activeDoorId) this.untouchedPrefills.delete(activeDoorId); // INITIATE = intentional
         if (state && addrInput && pinInput) {
@@ -698,6 +710,11 @@ export class DoorDockingPortSystem {
       if (action === 'req-build') {
         // Any player may ASK (that is the point) — their own client writes it.
         writeDoorRequest(doorId, getIdentityPub(), getPlayerName());
+      } else if (action === 'detach-berth') {
+        // #67 D2: EITHER side casts off a transient berth — no owner ceremony.
+        // The doc delete reconciles to every client (projection torn down,
+        // door re-locked) through the normal doors-doc path.
+        deleteDoorPairing(doorId);
       } else if (!this.isRoomOwner()) {
         return; // every action below is owner-only (UI gate, dev-phase posture)
       } else if (action === 'cycle-passage') {
@@ -708,6 +725,14 @@ export class DoorDockingPortSystem {
         const p = readDoorPolicy(doorId);
         const next: Record<ConstructionMode, ConstructionMode> = { owner: 'request', request: 'public', public: 'owner' };
         writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
+      } else if (action === 'install-adapter') {
+        // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
+        if (consumePart('adapter')) {
+          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: true });
+        }
+      } else if (action === 'remove-adapter') {
+        refundPart('adapter');
+        writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
       } else if (action === 'accept-req' && pub) {
         writeDoorGrant(doorId, pub, el.dataset.name ?? 'Unknown-Clone');
       } else if (action === 'deny-req' && pub) {
@@ -732,6 +757,14 @@ export class DoorDockingPortSystem {
     const row = `display:flex; align-items:center; justify-content:space-between; gap:8px;`;
     const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
+    // #67 D2: a live transient berth shows a DETACH row to EVERYONE — either
+    // side may cast off a guest ship without owner ceremony.
+    const st = this.doorState.get(doorId);
+    const detachRow = st?.pairedSuccessfully && st.transient
+      ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
+           <button type="button" data-policy-action="detach-berth" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>`
+      : '';
+
     if (owner) {
       const requests = readDoorRequests(doorId);
       const grants = readDoorGrants(doorId);
@@ -753,6 +786,11 @@ export class DoorDockingPortSystem {
           <button type="button" data-policy-action="cycle-passage" style="${pill}">${policy.passage.toUpperCase()}</button></div>
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
+        <div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
+          ${policy.adapter
+            ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
+            : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount('adapter') === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ''}>INSTALL (×${partsCount('adapter')})</button>`}</div>
+        ${detachRow}
         ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ''}
         ${grants.length ? `<div style="font-size:9px; font-weight:800; color:rgba(0,230,118,0.6); letter-spacing:1px; margin-top:2px;">STANDING GRANTS</div>${grantRows}` : ''}
       `;
@@ -770,6 +808,10 @@ export class DoorDockingPortSystem {
           : '<span style="color:rgba(212,168,75,0.55);">BUILD: OWNER ONLY</span>';
       body.innerHTML = `
         <div style="${row}"><span>PASSAGE: ${policy.passage.toUpperCase()}</span>${buildLine}</div>
+        ${policy.adapter && !this.canConstruct(doorId)
+          ? `<div style="color:#80d8ff;">🔌 BERTHING OPEN — enter your ship's address above and INITIATE to dock transiently</div>`
+          : ''}
+        ${detachRow}
       `;
     }
   }
@@ -1000,7 +1042,7 @@ export class DoorDockingPortSystem {
   public applyRemotePairing(
     doorId: DoorId,
     address: string,
-    geometry?: { segments?: ConnectorSegment[]; farDoor?: DoorId; farYawDeg?: 0 | 45 },
+    geometry?: { segments?: ConnectorSegment[]; farDoor?: DoorId; farYawDeg?: 0 | 45; transient?: boolean },
   ): void {
     const state = this.doorState.get(doorId);
     if (!state) return;
@@ -1016,6 +1058,7 @@ export class DoorDockingPortSystem {
     state.segments = geometry?.segments;
     state.farDoor = geometry?.farDoor;
     state.farYawDeg = geometry?.farYawDeg;
+    state.transient = geometry?.transient === true; // #67 D2
     state.pairingPending = false;
     state.pairedSuccessfully = true;
     state.locked = false;
@@ -1038,6 +1081,7 @@ export class DoorDockingPortSystem {
     state.segments = undefined;
     state.farDoor = undefined;
     state.farYawDeg = undefined;
+    state.transient = false;
     state.locked = true;
     this.removeAdjacentRoomProjection(doorId);
     this.closeDoor(doorId);
