@@ -24,6 +24,9 @@ import { readExterior, nextFreeExteriorSlot, writeExteriorSlot } from './exterio
 import { readDoorPolicy } from './doorPolicy';
 import { readDoorDeltas } from './floorPlanDoc';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
+import { atlasLayout } from './stationAtlas';
+import { projectionPoseForDoor } from './adapter';
+import type { DoorId } from './doors';
 
 const HULL = 0x39445A;
 const HULL_DARK = 0x2A3444;
@@ -46,7 +49,30 @@ let group: THREE.Group | null = null;
 let toolbar: HTMLDivElement | null = null;
 let editor: HTMLDivElement | null = null;
 let ownerCheck: () => boolean = () => false;
+let roomIdGetter: () => string = () => '';
 let savedZoom: number | null = null;
+/** Farthest known-station module (world units) — drives camera framing. */
+let lastStationExtent = 0;
+
+/** Frame the WHOLE known station: the base pull-back covers the home module;
+ *  a big atlas (the octagon!) pulls back further so edge modules stay well
+ *  inside the frustum (clickable, not clipped). */
+function exteriorZoomFactor(): number {
+  const needed = lastStationExtent + 14; // farthest module + its own half + margin
+  return Math.min(0.42, 0.42 * (16 / Math.max(16, needed)));
+}
+
+function applyExteriorZoom(): void {
+  const camera = gr().camera as (THREE.OrthographicCamera & { zoom: number }) | undefined;
+  if (camera && typeof camera.zoom === 'number' && savedZoom !== null) {
+    camera.zoom = savedZoom * exteriorZoomFactor();
+    camera.updateProjectionMatrix?.();
+  }
+}
+
+export function setExteriorRoomId(cb: () => string): void {
+  roomIdGetter = cb;
+}
 const raycaster = new THREE.Raycaster();
 
 export function setExteriorOwnerCheck(cb: () => boolean): void {
@@ -255,6 +281,50 @@ function buildGroup(): THREE.Group {
     }
   }
 
+  // 🗺️ The KNOWN STATION (#62 P5 findings): every module the atlas has seen,
+  // posed by walking the connection graph with the same geometry the
+  // projections use — walk the octagon once and all eight render from space.
+  // Clicking one fills an open keypad's address box (close-the-ring flow).
+  const currentRoomId = roomIdGetter();
+  lastStationExtent = 0;
+  if (currentRoomId) {
+    const poses = atlasLayout(
+      currentRoomId,
+      (doorId, segments, farDoor) => projectionPoseForDoor(doorId as DoorId, segments, farDoor),
+      8,
+    );
+    for (const pose of poses) {
+      lastStationExtent = Math.max(lastStationExtent, Math.hypot(pose.x, pose.z));
+      const mod = new THREE.Group();
+      mod.name = `atlasModule-${pose.roomId}`;
+      mod.userData = { isAtlasModule: true, roomId: pose.roomId, seed: pose.seed ?? '', label: pose.name };
+      const hullMat = new THREE.MeshStandardMaterial({
+        color: 0x3A4556, roughness: 0.7, metalness: 0.4, transparent: true, opacity: 0.82,
+      });
+      const body = new THREE.Mesh(new THREE.BoxGeometry(11.8, 4.0, 11.8), hullMat);
+      body.position.y = 2.0;
+      mod.add(body);
+      const roof = new THREE.Mesh(
+        new THREE.BoxGeometry(11.8, 0.24, 11.8),
+        new THREE.MeshStandardMaterial({ color: 0x2F3A4C, roughness: 0.6, metalness: 0.5, transparent: true, opacity: 0.85 }),
+      );
+      roof.position.y = 4.12;
+      mod.add(roof);
+      // Amber corner clamps echo the live hull's look at a glance.
+      for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
+        const clamp = new THREE.Mesh(
+          new THREE.BoxGeometry(0.45, 0.18, 0.45),
+          new THREE.MeshStandardMaterial({ color: ACCENT, roughness: 0.6, metalness: 0.4, transparent: true, opacity: 0.9 }),
+        );
+        clamp.position.set(sx * 5.4, 4.3, sz * 5.4);
+        mod.add(clamp);
+      }
+      mod.position.set(pose.x, 0, pose.z);
+      mod.rotation.y = pose.rotY;
+      g.add(mod);
+    }
+  }
+
   // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.
   const planet = new THREE.Mesh(
     new THREE.SphereGeometry(42, 48, 32),
@@ -371,11 +441,33 @@ function onClickCapture(e: MouseEvent): void {
   const hits = raycaster.intersectObjects(targets, true);
   if (hits.length === 0) { closeEditor(); return; }
 
-  // Walk up from the hit mesh looking for a solar panel or a flex part.
+  // Walk up from the hit mesh looking for a solar panel, an atlas module,
+  // or a flex part.
   let node: THREE.Object3D | null = hits[0].object;
   let flexPart: THREE.Object3D | null = null;
   let chainRoot: THREE.Object3D | null = null;
   while (node) {
+    if (node.userData?.isAtlasModule) {
+      // 🗺️ Click-to-connect (#62 P5, the owner's flow): with a door keypad
+      // open, clicking a known module from space fills its address box —
+      // zoom back in and INITIATE closes the ring.
+      const seed = node.userData.seed as string;
+      const label = node.userData.label as string;
+      const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
+      const paneOpen = (document.getElementById('docking-control-pane')?.style.display ?? 'none') !== 'none';
+      const hint = document.getElementById('exterior-toolbar-hint');
+      if (paneOpen && addrInput && seed) {
+        addrInput.value = seed;
+        addrInput.style.borderColor = 'rgba(0,230,118,0.7)';
+        setTimeout(() => { addrInput.style.borderColor = ''; }, 1600);
+        if (hint) hint.textContent = `${label} → address filled — zoom in and INITIATE`;
+      } else if (hint) {
+        hint.textContent = seed
+          ? `${label}: open a door keypad first, then click me to fill its address`
+          : `${label}: no address known yet — visit it once`;
+      }
+      return;
+    }
     if (node.userData?.isSolarPanel) {
       if (ownerCheck()) {
         writeExteriorSlot(node.userData.slot as string, null);
@@ -453,6 +545,7 @@ export function refreshExteriorView(): void {
   group = buildGroup();
   scene?.add(group);
   renderToolbar();
+  applyExteriorZoom(); // the known station may have grown — reframe
 }
 
 /** zoom.ts calls this on level transitions (true entering 3, false leaving). */
@@ -462,16 +555,19 @@ export function setExteriorActive(on: boolean): void {
   const scene = gr().scene;
   const camera = gr().camera as (THREE.OrthographicCamera & { zoom: number }) | undefined;
   if (on) {
+    // Keypad panes dock LEFT while in space (CSS rule keyed on this class) —
+    // the station stays visible + clickable beside them (click-to-connect).
+    document.body.classList.add('exterior-active');
     group = buildGroup();
     scene?.add(group);
     renderToolbar();
     if (camera && typeof camera.zoom === 'number') {
       savedZoom = camera.zoom;
-      camera.zoom = savedZoom * 0.42; // pull back — whole station in frame
-      camera.updateProjectionMatrix?.();
+      applyExteriorZoom(); // frames the whole KNOWN station (atlas extent)
     }
     window.addEventListener('click', onClickCapture, true);
   } else {
+    document.body.classList.remove('exterior-active');
     window.removeEventListener('click', onClickCapture, true);
     closeEditor();
     closeEnterBubble();
