@@ -798,6 +798,13 @@
         border-top: 5px solid rgba(212, 168, 75, 0.45);
       }
 
+      /* 🛰️ Exterior view: with a keypad open IN SPACE, dock it left so the
+         station stays visible + clickable (click-to-connect, #62 P5). */
+      body.exterior-active #docking-control-pane {
+        left: 8px !important;
+        transform: translate(0, -50%) !important;
+      }
+
       /* 🛰️ Exterior view (zoom level 3): toolbar + the click-a-joint editor */
       #exterior-toolbar {
         position: fixed;

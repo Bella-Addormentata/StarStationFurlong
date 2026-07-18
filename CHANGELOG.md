@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.4 — 2026-07-18
+
+### 🗺️ See the Whole Station + Click-to-Connect (octagon findings)
+
+- **The exterior view now shows every module you've visited** — not just the neighbors of the room you're in. Your client keeps a personal station atlas (each room you enter contributes its name, address, and connections), and the space view walks the whole graph with true chain geometry — **the octagon renders as a complete closed ring**. The camera automatically pulls back to frame however big your station has grown.
+- **Closing the ring is now a click**: open the door keypad in room 8, zoom out to space, **click room 1** — its address drops straight into the keypad ("address filled — zoom in and INITIATE"). Keypads dock to the left edge while you're in space so the station stays visible. Modules you haven't visited yet say so ("visit it once").
+- Also answered ([#62](https://github.com/Bella-Addormentata/StarStationFurlong/issues/62)): module *ownership* belongs on the Chia Registry (the deed architecture); connection *topology* stays in room records — the atlas is your local view of it.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.4 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.3 — 2026-07-18
 
 ### 🚀 Ship Fittings (#30 SH1) — your module starts becoming a ship

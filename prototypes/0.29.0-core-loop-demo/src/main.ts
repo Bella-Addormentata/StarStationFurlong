@@ -24,7 +24,7 @@ import {
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
-import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
+import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
 import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
@@ -39,7 +39,8 @@ import {
   isVentureShareholder, ventureLedger, upsertVentureLedger,
   writeVentureLink, refreshVentureLink, removeVentureLink,
 } from './ventures';
-import { refreshExteriorView, setExteriorOwnerCheck, showEnterRoomBubble } from './exteriorView';
+import { refreshExteriorView, setExteriorOwnerCheck, setExteriorRoomId, showEnterRoomBubble } from './exteriorView';
+import { harvestIntoAtlas } from './stationAtlas';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -684,6 +685,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   bindFloorPlan(sync.doc);
   world?.reconcileDoorPlacements();
 
+  // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
+  harvestStationAtlas();
+
   // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
   // whenever it shows us as a shareholder, refresh the personal ledger that
   // powers the VENTURES app's list screen.
@@ -740,6 +744,13 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
     // tanks appear in the exterior as fittings land inside).
     subscribeFurniture(() => refreshExteriorView());
+    // 🗺️ #62 P5: door changes update the atlas + the whole-station render.
+    subscribeDoors(() => {
+      harvestStationAtlas();
+      refreshExteriorView();
+    });
+    // The exterior's atlas walk starts from the CURRENT room.
+    setExteriorRoomId(() => activeBootstrap?.roomId ?? '');
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1534,6 +1545,28 @@ function renderPhonePlayersList(): void {
     }
     listEl.appendChild(li);
   }
+}
+
+// ── 🗺️ Station atlas harvest (#62 P5 findings) ───────────────────────────────
+// Every joined room contributes its identity + door records to the local
+// atlas — the exterior view's whole-station render and click-to-connect feed
+// from it. Called at the T0 seam and on every doors-doc change.
+
+function harvestStationAtlas(): void {
+  const roomId = activeBootstrap?.roomId;
+  if (!roomId) return;
+  const name = (yjsSync?.doc.getMap('roomInfo').get('name') as string | undefined) || 'Module';
+  const seed = passSeed(roomId) ?? moduleLedger().find((e) => e.roomId === roomId)?.seed;
+  const doors = [...readAllDoors().entries()]
+    .filter(([, r]) => r.paired && r.connectedRoomAddress)
+    .map(([doorId, r]) => ({
+      doorId: doorId as DoorId,
+      targetSeed: r.connectedRoomAddress,
+      segments: r.segments,
+      farDoor: r.farDoor,
+      farYawDeg: r.farYawDeg,
+    }));
+  harvestIntoAtlas({ roomId, name, seed, doors });
 }
 
 // ── 🏦 BANK app (#20, de-stubbed with #68) ───────────────────────────────────
