@@ -11,6 +11,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.7 — 2026-07-18
+
+### Vestibule Fixes (owner's findings) + 💬 Chat Bubbles + Movable Fireplace
+
+- **One-way vestibules FIXED** (root-caused, three compounding bugs): (1) a plain pairing never wrote the far room's half of the connection — the return direction *structurally didn't exist* ("No room docked at this port"); the first walk-through now writes the mirror record for **every** pairing, plain or assembled. (2) The mirror's departure-address lookup failed for exactly the rooms you walk out of most — your own (never in your own pass list); it now falls back to the module ledger and then mints a link, and skips log loudly instead of silently. (3) The misleading "it shows a vestibule though" ghost: merely *opening* a keypad with a preset armed consumed parts and armed a ghost tube on an unpaired door — untouched prefills are now refunded on pane close, and a rejected pairing refunds + drops its chain.
+- **Docking is now OWNER-only**: initiating, approving, and editing connections on a room's ports requires being that room's owner (guests see "owner only"; legacy unowned rooms stay open to all). Dev-phase UI gating — cryptographic record signing is a planned later slice.
+- **💬 Chat bubbles**: messages sent via the phone's CHAT app pop up above the sender's avatar for ~6 s, tracking the head in both the room view and first person. Works across machines (the message carries the sender's position; the bubble finds their avatar), and offline.
+- **🔥 The fireplace is furniture now** — pick it up in edit mode and slide it aside; the **north door unblocks automatically** when its approach is clear (re-blocks if you put it back). Works in existing rooms too.
+- Also: the movable-doors + unit-grid floor-plan design landed (`brainstorming/floorplan-grid-plan.md`, issue #66) — 6×6 m tiles, today's room is exactly 2×2, door-slide ships first. The opening station-exterior view is tracked as #65 (not yet built; the zoomed dev views are unrelated 2D schematics).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.7 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.30.6 — 2026-07-17
 
 ### Rooms Survive Node Restarts (durability C4/B)
