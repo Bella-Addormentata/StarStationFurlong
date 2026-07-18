@@ -227,6 +227,10 @@
               <span class="phone-app-tile-icon">🚪</span>
               <span class="phone-app-tile-label">ACCESS</span>
             </button>
+            <button type="button" class="phone-app-tile" data-phone-app="ventures" aria-label="Open Ventures app">
+              <span class="phone-app-tile-icon">🚀</span>
+              <span class="phone-app-tile-label">VENTURES</span>
+            </button>
             <button type="button" class="phone-app-tile" data-phone-app="settings" aria-label="Open Settings app">
               <span class="phone-app-tile-icon">⚙️</span>
               <span class="phone-app-tile-label">SETTINGS</span>
@@ -320,6 +324,12 @@
              FUTURE: once the map table carries room pins, a used pass will
              drop a pin + access permission on the map instead (see
              accessBeamTransport in main.ts). -->
+        <!-- 🚀 VENTURES (issue #68 V1): joint ownership. List screen (entity
+             name · SOLE/JOINT · your stake) → detail screen (Charter block,
+             OWNERS cap table, PROPERTY, actions). Rendered by main.ts
+             renderVenturesApp; plain-language rule — no chain jargon. -->
+        <div id="phone-app-ventures" class="phone-app-view"></div>
+
         <div id="phone-app-access" class="phone-app-view">
           <div class="phone-access-section">
             <div class="phone-access-header">MY PASS</div>
