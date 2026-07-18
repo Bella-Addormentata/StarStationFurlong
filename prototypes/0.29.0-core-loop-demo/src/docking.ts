@@ -1246,6 +1246,26 @@ export class DoorDockingPortSystem {
     return this.canOperateDoor(doorId);
   }
 
+  /** 🛰️ Exterior view: edit one chain segment in place (the click-a-joint
+   *  BEND editor). Same rights gate + publish path as the keypad chips — the
+   *  record rewrites and every client's geometry diff rebuilds the chain.
+   *  Returns false when refused (no rights / no such segment). */
+  public editChainSegment(
+    doorId: 'north' | 'south' | 'east' | 'west',
+    index: number,
+    patch: { bendDeg?: number; stretch?: number; bays?: number; skin?: 'ribbed' | 'solid' },
+  ): boolean {
+    const state = this.doorState.get(doorId);
+    if (!state || !state.segments || !state.segments[index]) return false;
+    if (!this.canConstruct(doorId)) return false;
+    const seg = { ...state.segments[index], ...patch };
+    state.segments = state.segments.map((s, i) => (i === index ? seg : s));
+    this.untouchedPrefills.delete(doorId);
+    this.renderAssemblyStrip(doorId); // keep an open keypad in sync
+    this.publishIfPaired(doorId);
+    return true;
+  }
+
   /** #62 P4: wire the auto-accept decider (see field docs). */
   public onAutoAcceptCheck(cb: (address: string) => boolean) {
     this.autoAcceptCheckCallback = cb;

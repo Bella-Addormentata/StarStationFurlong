@@ -798,6 +798,57 @@
         border-top: 5px solid rgba(212, 168, 75, 0.45);
       }
 
+      /* 🛰️ Exterior view (zoom level 3): toolbar + the click-a-joint editor */
+      #exterior-toolbar {
+        position: fixed;
+        top: 18px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: none;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 16px;
+        border-radius: 12px;
+        background: rgba(4, 8, 22, 0.90);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        z-index: 1200;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.7);
+      }
+      #exterior-toolbar-title { font-size: 12px; font-weight: 800; letter-spacing: 1px; color: #f0c060; }
+      #exterior-toolbar-hint { font-size: 9px; color: rgba(212, 168, 75, 0.55); }
+      #exterior-add-solar {
+        font-family: inherit; font-size: 10px; font-weight: 700;
+        padding: 4px 10px; border-radius: 6px; cursor: pointer;
+        color: #ffd54f; background: rgba(255, 213, 79, 0.10);
+        border: 1px solid rgba(255, 213, 79, 0.35);
+      }
+      #exterior-add-solar:disabled { opacity: 0.4; cursor: default; }
+
+      #exterior-bend-editor {
+        position: fixed;
+        width: 230px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: rgba(4, 8, 22, 0.95);
+        border: 1px solid rgba(212, 168, 75, 0.35);
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        color: #d4a84b;
+        z-index: 1300;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+      }
+      #exterior-bend-title { font-size: 10px; font-weight: 800; letter-spacing: 0.5px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+      #exterior-bend-close { background: none; border: none; color: #ff8a80; cursor: pointer; font-size: 11px; }
+      #exterior-bend-row { display: flex; gap: 4px; }
+      .exterior-bend-btn {
+        flex: 1; font-family: inherit; font-size: 9px; font-weight: 700;
+        padding: 4px 0; border-radius: 5px; cursor: pointer;
+        color: #d4a84b; background: rgba(212, 168, 75, 0.08);
+        border: 1px solid rgba(212, 168, 75, 0.3);
+      }
+      .exterior-bend-btn.current { color: #00e5ff; border-color: rgba(0, 229, 255, 0.5); background: rgba(0, 229, 255, 0.10); }
+      #exterior-bend-note { font-size: 8.5px; color: rgba(212, 168, 75, 0.5); margin-top: 6px; min-height: 10px; }
+
       /* 💬 QUICK CHAT mini bar — the top of the phone peeking up from the
          bottom edge, holding the (reparented) chat form. */
       #phone-mini-chat {
