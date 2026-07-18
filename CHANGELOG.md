@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.31.1 — 2026-07-18
+
+### 🚪 Boot Into Space (#65 complete)
+
+- **The game now opens in the exterior view**: after the welcome click, you arrive in space — your module's hull with the planet below — and a bobbing **🚪 ENTER ROOM** bubble over the dome drops you inside. `-` from the room takes you back out any time.
+- Fixed in passing: the exterior view's click capture was swallowing every UI click at level 3 (phone, dev menu, its own toolbar) — it now claims only clicks on the game canvas.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.31.1 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.31.0 — 2026-07-18
 
 ### 🛰️ The Outside-the-Station View
