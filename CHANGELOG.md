@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.31.0 — 2026-07-18
+
+### 🛰️ The Outside-the-Station View
+
+- **Zoom out once from the room view and you're in space.** Level 3 is now a real 3D exterior: your module wears a hull shell (roof plating, observation dome, antennas, comms dish), the **planet hangs below**, and every paired connector chain + neighboring module stays visible at its true angle — your station, seen from outside, exactly like the concept art. (Reaching level 3 currently uses the `-` key with `?devzoom=1`; the default-on zoom path and the boot-into-exterior "enter room" bubble are #65's next step.)
+- **Click a bellows joint to bend it**: a floating BEND editor (−45°…+45°) rewrites that segment live — same construction-rights gate and sync path as the keypad, so everyone in the room sees the chain re-curve.
+- **☀️ Solar panels**: owners add panels to four roof slots from the exterior toolbar and click a panel to dismount it. Synced — joiners see your array.
+- **Issues housekeeping**: closed #12 (phone chat), #21 (player appearance), #63 (sitting), #64 (module sync) with evidence; status updates on #20/#62/#65.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.31.0 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.30.9 — 2026-07-18
 
 ### 🚦 Door Permissions + Build-Rights Requests (#67 D1/D1b)
