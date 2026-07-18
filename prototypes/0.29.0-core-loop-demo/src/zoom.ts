@@ -484,6 +484,14 @@ export class MultiScaleZoomView {
     }
   }
 
+  /** 🛰️ #65 boot flow: open the session IN the exterior view (level 3) — the
+   *  station from space is the opening shot; the ENTER ROOM bubble walks the
+   *  player down to level 2 through the normal zoom-in path. */
+  public bootIntoExterior(): void {
+    this.currentLevel = 3;
+    this.updateViewContext();
+  }
+
   /** Last level the indicator toasted for — updateViewContext runs EVERY FRAME
    *  in first person, so the toast must fire on actual level CHANGES only. */
   private lastIndicatorLevel = 2; // matches the boot default → no toast at boot

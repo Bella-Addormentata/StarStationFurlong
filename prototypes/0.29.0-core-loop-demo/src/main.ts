@@ -28,7 +28,7 @@ import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
 import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
-import { refreshExteriorView, setExteriorOwnerCheck } from './exteriorView';
+import { refreshExteriorView, setExteriorOwnerCheck, showEnterRoomBubble } from './exteriorView';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -3458,6 +3458,19 @@ function setupClickToEnter() {
     // transit driver + PROVISION NEW MODULE minting onto it (T1 of #30).
     wireAdapterTransit();
     bootstrapNetworking();
+
+    // 🛰️ #65 boot flow: once the intro morph settles, open IN the exterior —
+    // the station from space with the planet below — and hang the ENTER ROOM
+    // bubble over the dome. Clicking it rides the normal zoom-in path (level
+    // 3 → 2), the same as pressing [+].
+    const bootExterior = () => {
+      if (world.isMorphActive()) { setTimeout(bootExterior, 200); return; }
+      multiScaleZoom?.bootIntoExterior();
+      showEnterRoomBubble(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: '+' }));
+      });
+    };
+    setTimeout(bootExterior, 400); // let startMorph flip isMorphing first
 
     // Hide welcome overlay
     const welcome = document.getElementById('welcome');

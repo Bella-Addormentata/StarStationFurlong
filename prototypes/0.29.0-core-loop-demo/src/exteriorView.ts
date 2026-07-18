@@ -219,7 +219,12 @@ function openBendEditor(doorId: string, index: number, currentBend: number, atX:
 
 function onClickCapture(e: MouseEvent): void {
   if (!active) return;
-  // The exterior view owns clicks — never walk-to-point from space.
+  // DOM UI (toolbar, editor, phone, dev menu, the ENTER ROOM bubble…) owns its
+  // own clicks — we only claim clicks that reach the GAME CANVAS. Without this
+  // guard the capture listener would strangle every button at level 3.
+  const t = e.target as HTMLElement | null;
+  if (t && t.tagName !== 'CANVAS') return;
+  // The exterior view owns canvas clicks — never walk-to-point from space.
   e.stopPropagation();
   const camera = gr().camera;
   if (!camera) return;
@@ -266,6 +271,44 @@ function onClickCapture(e: MouseEvent): void {
   closeEditor();
 }
 
+// ── ENTER ROOM bubble (#65 boot flow) ────────────────────────────────────────
+
+let enterBubble: HTMLDivElement | null = null;
+let bubbleReposition: (() => void) | null = null;
+
+function closeEnterBubble(): void {
+  if (bubbleReposition) window.removeEventListener('resize', bubbleReposition);
+  bubbleReposition = null;
+  enterBubble?.remove();
+  enterBubble = null;
+}
+
+/** Anchor the boot bubble over the module's dome; clicking it hands off to
+ *  onEnter (main.ts drops the player into the room). The camera is static in
+ *  the exterior view, so we project once (+ on resize). */
+export function showEnterRoomBubble(onEnter: () => void): void {
+  closeEnterBubble();
+  if (!active) { onEnter(); return; } // exterior unavailable → straight inside
+  enterBubble = document.createElement('div');
+  enterBubble.id = 'exterior-enter-bubble';
+  enterBubble.innerHTML = `<span>🚪 ENTER ROOM</span><div id="exterior-enter-tail"></div>`;
+  enterBubble.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeEnterBubble();
+    onEnter();
+  });
+  document.body.appendChild(enterBubble);
+  bubbleReposition = () => {
+    const camera = gr().camera;
+    if (!camera || !enterBubble) return;
+    const v = new THREE.Vector3(0, 4.6, 0).project(camera);
+    enterBubble.style.left = `${((v.x * 0.5 + 0.5) * window.innerWidth).toFixed(0)}px`;
+    enterBubble.style.top = `${((-v.y * 0.5 + 0.5) * window.innerHeight - 18).toFixed(0)}px`;
+  };
+  bubbleReposition();
+  window.addEventListener('resize', bubbleReposition);
+}
+
 // ── Activation ───────────────────────────────────────────────────────────────
 
 /** Rebuild the exterior dress (solar slots changed / room swapped). */
@@ -301,6 +344,7 @@ export function setExteriorActive(on: boolean): void {
   } else {
     window.removeEventListener('click', onClickCapture, true);
     closeEditor();
+    closeEnterBubble();
     if (toolbar) toolbar.style.display = 'none';
     if (group) {
       scene?.remove(group);
