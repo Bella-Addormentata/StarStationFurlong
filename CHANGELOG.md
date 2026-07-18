@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.6 — 2026-07-18
+
+### 🔧 The Station Atlas Actually Learns Now
+
+- Fixed the follow-up from the octagon report: the atlas was parsing **the wrong pass format** (a test-fixture format instead of the real base64 passes), so it could never link modules together — the exterior stayed stuck at direct neighbors. It now decodes real passes (raw or URL-wrapped), verified against a full synthetic octagon rendering as a closed ring.
+- **After updating: walk your octagon once** (each room you enter re-records its connections correctly) and the whole ring appears from space, ready for click-to-connect.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.6 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.5 — 2026-07-18
 
 ### 🔧 The Vestibule Pills Are Back On Top
