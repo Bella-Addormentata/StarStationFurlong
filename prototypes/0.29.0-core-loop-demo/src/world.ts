@@ -1171,6 +1171,7 @@ export class World {
     // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.
     // (Supersedes the old transitVestibule visibility line #45 sat next to.)
     this.updatePairedVestibules(deltaTime, zoomLevel);
+    this.updateFirstPersonAutoDoors(zoomLevel);
 
     // Drive the device-focus camera eases + focused UI (#33 D0)
     deviceFocus.update(deltaTime);
@@ -1589,6 +1590,79 @@ export class World {
    *    distance alone would leave the tube half-ghosted around them),
    *  - honors the interior zoom-hide convention (≥3 hides) and the morph.
    */
+  // ── 🚶 First-person automatic doors (owner request) ────────────────────────
+  /** Doors this system slid open on approach (closed again on retreat). */
+  private fpAutoOpened = new Set<DoorId>();
+  /** One transit per aperture entry — re-armed only after stepping clear. */
+  private fpTransitArmed = true;
+  /** Post-arrival grace: the player SPAWNS at the arrival door, inside its
+   *  aperture — without this the return transit would fire instantly. */
+  private fpArrivalCooldownUntil = 0;
+
+  /**
+   * In FIRST PERSON (zoom 1), walking up to a passable PAIRED door slides it
+   * open automatically (station doors, as is right and proper), and pressing
+   * into the open doorway carries you through — the same transit the click
+   * path runs, minus the scripted avatar walk (you ARE the walk). Doors we
+   * opened close behind us on retreat/exit. Unpaired doors stay shut (there
+   * is nothing on the other side to open onto), and every gate the click
+   * path enforces applies: enabled (hearth), passage policy (#67), lock,
+   * transit-driver readiness, swap-in-flight.
+   */
+  private updateFirstPersonAutoDoors(zoomLevel: number): void {
+    const ds = this.dockingSystem;
+    if (zoomLevel !== 1 || !ds || this.isMorphing || !this.isPlayerActive()) {
+      if (this.fpAutoOpened.size && ds) {
+        for (const id of this.fpAutoOpened) ds.closeDoor(id);
+      }
+      this.fpAutoOpened.clear();
+      this.fpTransitArmed = true;
+      return;
+    }
+    const p = this.player.getPosition();
+    const now = performance.now();
+    let inAnyAperture = false;
+    for (const door of DOORS) {
+      // Aperture frame: lateral offset along the wall vs distance INTO it.
+      const northSouth = door.id === 'north' || door.id === 'south';
+      const lateral = Math.abs(northSouth ? p.x - door.front.x : p.z - door.front.z);
+      const wallCoord = Math.abs(northSouth ? p.z : p.x);
+      const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
+
+      const state = ds.getDockingState(door.id);
+      const paired = !!(state && state.pairedSuccessfully && state.connectedRoomAddress);
+      const passable = door.enabled && !state?.locked && ds.canPass(door.id);
+
+      // Slide open on approach; slide shut once the player retreats.
+      if (paired && passable && approachDist < 2.2 && !this.fpAutoOpened.has(door.id)) {
+        ds.openDoor(door.id);
+        this.fpAutoOpened.add(door.id);
+      } else if (this.fpAutoOpened.has(door.id) && approachDist > 3.0) {
+        ds.closeDoor(door.id);
+        this.fpAutoOpened.delete(door.id);
+      }
+
+      // Threshold: pressed into the open doorway (the manual-movement clamp
+      // stops the body at the wall, so "as far in as possible" IS the cross).
+      const inAperture = lateral < 0.95 && wallCoord > 5.15;
+      if (inAperture) inAnyAperture = true;
+      if (
+        inAperture && paired && passable
+        && this.fpTransitArmed
+        && now > this.fpArrivalCooldownUntil
+        && !(this.isTransitBusy && this.isTransitBusy())
+        && this.onAdapterTransit !== null
+      ) {
+        this.fpTransitArmed = false; // step clear to re-arm
+        deviceFocus.forceRelease();
+        roomEdit.forceExit();
+        this.spawnTransitVestibule(door.id);
+        this.onAdapterTransit?.(state!.connectedRoomAddress, door.id);
+      }
+    }
+    if (!inAnyAperture) this.fpTransitArmed = true;
+  }
+
   private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
     const ds = this.dockingSystem;
     if (!ds) return;
@@ -1691,6 +1765,12 @@ export class World {
    */
   public completeAdapterArrival(departureDoorId: DoorId, farDoor?: DoorId): void {
     this.endTransitVestibule();
+    // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
+    // its aperture — grace period + disarm so the return leg needs a real,
+    // deliberate re-entry (step clear, then walk back in).
+    this.fpArrivalCooldownUntil = performance.now() + 1500;
+    this.fpTransitArmed = false;
+    this.fpAutoOpened.clear(); // departure-room door refs died with the swap
     // #62 P4: an assembled connection's record names the exact arrival door.
     const arrival = this.resolveArrivalDoor(departureDoorId, farDoor);
     this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
