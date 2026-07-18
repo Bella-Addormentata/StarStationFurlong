@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.9 — 2026-07-18
+
+### 🛬 Jetbridge Vestibules — Chains Fit Reality
+
+- **Vestibule chains now solve themselves to fit** — like an airport jetbridge. When the 🧲 contact prompt matches a real module, the chain's bends relax to the *actual* angle needed (a 45° preset becomes 40° if that's the truth), **bends equalize across the chain** (your domino effect), and **extensions telescope** (±0.6 m of slide) when the module sits a little nearer or farther. The prompt shows the fit — *"auto-fit 20.1°/24.2°"* — and CONNECT builds exactly that.
+- Bend detents (7.5° steps) remain for hand-editing; solved chains carry precise angles and sync to everyone as built. If a fit is genuinely out of range, the prompt says so and connects rigid as before.
+- Ready for the custom-sized modules ahead: whatever shape the station takes, the tubes reach.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.9 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.8 — 2026-07-18
 
 ### 🧲 The Chain Finds the Door
