@@ -42,6 +42,27 @@ const KEY = 'ssf-station-atlas';
 const MAX_ENTRIES = 64;
 
 export function roomIdFromSeed(seed: string): string {
+  // REAL pass format (decodeBootstrapSeed): base64(JSON{ roomId, wtUrl, … }),
+  // either raw or wrapped in a URL's ?seed= param. The #room= form is kept
+  // last for the synthetic fixtures. (v0.32.4 shipped with ONLY the #room=
+  // parse — every real edge decoded empty and the atlas graph never grew
+  // past the current room; the owner's octagon caught it.)
+  const tryB64 = (s: string): string => {
+    try {
+      const parsed = JSON.parse(atob(s));
+      return typeof parsed?.roomId === 'string' ? parsed.roomId : '';
+    } catch { return ''; }
+  };
+  try {
+    const url = new URL(seed);
+    const q = url.searchParams.get('seed');
+    if (q) {
+      const id = tryB64(q);
+      if (id) return id;
+    }
+  } catch { /* not a URL — fall through */ }
+  const direct = tryB64(seed);
+  if (direct) return direct;
   const m = /[#&]room=([^&]+)/.exec(seed);
   return m ? decodeURIComponent(m[1]) : '';
 }
