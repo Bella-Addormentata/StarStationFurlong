@@ -1330,6 +1330,12 @@ export class World {
     }
   }
 
+  /** 🛰️ #65 boot flow: main.ts waits for the intro morph before presenting
+   *  the exterior (the hull shell over a half-morphed platform looks wrong). */
+  public isMorphActive(): boolean {
+    return this.isMorphing;
+  }
+
   /** 🛰️ Exterior view: the live paired-connector groups (raycast targets for
    *  the click-a-joint bend editor). */
   public getPairedVestibuleGroups(): Map<string, THREE.Group> {
