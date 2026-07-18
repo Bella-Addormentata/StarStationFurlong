@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.31.5 — 2026-07-18
+
+### 🚶 Automatic Doors in First Person
+
+- **Walk through doors like it's a space station.** In first person, approaching a passable docked door slides it open automatically; keep walking into the doorway and you're carried through into the next room. Doors close behind you when you step away. All the rules still apply — hearth-blocked, owner-restricted (passage policy), and locked doors don't open, and there's a grace period on arrival so you don't bounce straight back.
+- Also landed: the **shared-ownership architecture doc** ([`brainstorming/chia-ventures-shared-ownership.md`](brainstorming/chia-ventures-shared-ownership.md)) — how VENTURES anchor to the Registry later (vault-custodied deeds, provably fixed share supplies, holder proofs, offers as the market). The v0.31.4 in-game ventures are the exact off-chain first phase it prescribes.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.31.5 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.31.4 — 2026-07-18
 
 ### 🚀 VENTURES — Joint Ownership (#68 V1)
