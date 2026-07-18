@@ -1270,7 +1270,9 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
   }
 
   const result = await performRoomSwap(seedString, {
-    arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor),
+    // 🔗 depRoomId lets the ARRIVAL room's own back-pointing record pick the
+    // door (owner's octagon fix) — farDoor/opposite are fallbacks only.
+    arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor, depRoomId ?? undefined),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
   if (result instanceof Error) {
@@ -1288,7 +1290,8 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
   // flex bends (an arc traversed backwards reverses its heading change).
   // Never clobbers an existing pairing on the arrival door.
   if (depPaired && depAddress) {
-    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry?.farDoor).id;
+    // 🔗 Mirror onto the SAME door the player actually arrived through.
+    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry?.farDoor, depRoomId ?? undefined).id;
     const existing = readAllDoors().get(arrivalDoorId);
     if (!existing?.paired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
