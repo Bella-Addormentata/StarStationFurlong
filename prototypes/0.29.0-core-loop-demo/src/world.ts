@@ -9,8 +9,9 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt, rebuildSeats } from './seats';
 import { getDefaultRoomId } from './identity';
-import { FURNITURE, buildItemGroup } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, buildItemGroup } from './furniture';
 import type { FurnitureItem } from './furniture';
+import { northDoorUnlocked } from './stationParts';
 import { rebuildObstacles } from './obstacles';
 import { rebakeWalkableGrid } from './pathfinding';
 import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
@@ -352,6 +353,10 @@ export class World {
     // Construct and build 4-Directional sliding door docking ports natively!
     this.initializeDockingPorts();
 
+    // Floor-plan work: initial north-door state honors the (default) fireplace
+    // position — and the local owner's move path re-runs this via reconcile.
+    this.updateNorthDoorForFireplace();
+
     // (orbital rings live on the Mars sphere — created in createStationPlanet)
   }
 
@@ -604,6 +609,32 @@ export class World {
     }
   }
 
+  /**
+   * Floor-plan work (owner request): the NORTH door unblocks DYNAMICALLY once
+   * the fireplace no longer covers its approach — move the hearth aside and
+   * the fourth door opens; move it back and the door disables again. The DEV
+   * NORTH DOOR toggle still force-enables regardless (walkthrough tool).
+   * Called after every furniture reconcile and at platform build.
+   */
+  public updateNorthDoorForFireplace(): void {
+    const north = findDoor('north');
+    if (!north) return;
+    // Approach zone in front of the north wall opening (opening ~1.4 wide at
+    // z=-6; the zone reaches to the door's `front` stand-point at z=-4.5).
+    const zone = { x0: -1.4, x1: 1.4, z0: -6.2, z1: -4.4 };
+    const blocked = FURNITURE.some((item) => {
+      if (item.kind !== 'fireplace-wall') return false;
+      const fp = FURNITURE_DEFS[item.kind].footprint;
+      if (!fp) return false; // footprint-less def — nothing to block with
+      const w = item.rot % 2 === 0 ? fp.w : fp.d;
+      const d = item.rot % 2 === 0 ? fp.d : fp.w;
+      const x0 = item.pos.x - w / 2, x1 = item.pos.x + w / 2;
+      const z0 = item.pos.z - d / 2, z1 = item.pos.z + d / 2;
+      return x0 < zone.x1 && x1 > zone.x0 && z0 < zone.z1 && z1 > zone.z0;
+    });
+    north.enabled = northDoorUnlocked() || !blocked;
+  }
+
   public reconcileFurniture(records: Map<string, FurnitureRecord>): void {
     if (records.size === 0) return; // unseeded — keep local defaults
     if (this.furnitureGroups.size === 0) return; // platform not built yet
@@ -649,6 +680,11 @@ export class World {
         changedIds.add(id);
       }
     }
+
+    // Floor-plan work: run BEFORE the no-change early-return — the LOCAL
+    // owner's own move self-echoes with an empty diff (see module header), and
+    // their north door must still unblock. Cheap (one AABB test).
+    this.updateNorthDoorForFireplace();
 
     if (changedIds.size === 0) return;
 
