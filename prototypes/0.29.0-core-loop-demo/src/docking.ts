@@ -18,6 +18,13 @@ import {
   armedPreset, presetSegments, partsCount, consumePart, refundPart,
   consumeForSegments, refundForSegments,
 } from './stationParts';
+import {
+  readDoorPolicy, writeDoorPolicy, readDoorRequests, readDoorGrants,
+  writeDoorRequest, removeDoorRequest, writeDoorGrant, removeDoorGrant,
+  hasDoorGrant, hasDoorRequest, type ConstructionMode, type PassageMode,
+} from './doorPolicy';
+import { getIdentityPub } from './keypair';
+import { getPlayerName } from './identity';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -94,6 +101,24 @@ export class DoorDockingPortSystem {
 
   private isRoomOwner(): boolean {
     return this.ownerCheckCallback ? this.ownerCheckCallback() : true;
+  }
+
+  /** #67 D1: may the LOCAL player build (dock/assemble) at this door? Owner
+   *  always; otherwise per the door's construction policy — 'public' opens it
+   *  to everyone, 'request' honors a standing grant keyed to the player's
+   *  identity pub, 'owner' refuses. */
+  private canConstruct(doorId: string): boolean {
+    if (this.isRoomOwner()) return true;
+    const mode = readDoorPolicy(doorId).construction;
+    if (mode === 'public') return true;
+    if (mode === 'request') return hasDoorGrant(doorId, getIdentityPub());
+    return false;
+  }
+
+  /** #67 D1: may the LOCAL player operate (lock/unlock) this door? Follows the
+   *  PASSAGE policy — 'public' (default) keeps today's anyone-can behavior. */
+  private canOperateDoor(doorId: string): boolean {
+    return this.isRoomOwner() || readDoorPolicy(doorId).passage === 'public';
   }
 
   /** Vestibule-findings fix (ghost residue): doors whose chain came from the
@@ -368,6 +393,15 @@ export class DoorDockingPortSystem {
           <input type="text" id="docking-pin-input" placeholder="e.g. 1106" style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace;">
         </div>
 
+        <!-- #67 D1/D1b: per-door policy + rights requests. Owner sees the two
+             policy cycles + pending requests (ACCEPT/DENY) + standing grants
+             (REVOKE); guests see the policy summary and, in 'request' mode,
+             the REQUEST BUILD RIGHTS button. Rendered by renderPolicySection. -->
+        <div id="docking-policy" style="border-top:1px solid rgba(212,168,75,0.14); padding-top:10px;">
+          <label style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">DOOR POLICY</label>
+          <div id="docking-policy-body" style="display:flex; flex-direction:column; gap:6px; font-size:10px;"></div>
+        </div>
+
         <!-- #62 P4: CONNECTION ASSEMBLY — chain chips + far-side controls.
              Parts come from the DEV PARTS inventory; the armed preset prefills
              on pane open. The chain renders in-world as a ghost while unpaired
@@ -445,6 +479,12 @@ export class DoorDockingPortSystem {
         const pane = document.getElementById('docking-control-pane');
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
+        // #67 D1: lock/unlock follows the PASSAGE policy (this control was
+        // accidentally ungated before the policy work surfaced it).
+        if (!this.canOperateDoor(activeDoorId)) {
+          alert('This door\'s passage is owner-restricted.');
+          return;
+        }
         const state = this.doorState.get(activeDoorId);
         if (state) {
           state.locked = !state.locked;
@@ -495,9 +535,9 @@ export class DoorDockingPortSystem {
         const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
         const pinInput = document.getElementById('docking-pin-input') as HTMLInputElement | null;
         
-        // Vestibule-findings fix: connection changes are OWNER-only.
-        if (!this.isRoomOwner()) {
-          alert('Only this room\'s owner can dock modules to its ports.');
+        // #67 D1: construction rights per the door's policy (owner / grant / public).
+        if (activeDoorId && !this.canConstruct(activeDoorId)) {
+          alert('No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).');
           return;
         }
         if (activeDoorId) this.untouchedPrefills.delete(activeDoorId); // INITIATE = intentional
@@ -533,9 +573,9 @@ export class DoorDockingPortSystem {
         const pane = document.getElementById('docking-control-pane');
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
-        // Vestibule-findings fix: only the room's owner may APPROVE a docking.
-        if (!this.isRoomOwner()) {
-          alert('Only this room\'s owner can approve a docking request.');
+        // #67 D1: approving a docking follows construction rights.
+        if (!this.canConstruct(activeDoorId)) {
+          alert('No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).');
           return;
         }
         this.completePairing(activeDoorId, true);
@@ -562,7 +602,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-add-flex')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.isRoomOwner()) return;
+      if (!doorId || !state || !this.canConstruct(doorId)) return;
       this.untouchedPrefills.delete(doorId); // deliberate edit — chain is intentional now
       if (!consumePart('flex')) { this.renderAssemblyStrip(doorId, 'no FLEX parts — DEV menu › PARTS'); return; }
       state.segments = [...(state.segments ?? []), { kind: 'flex', bendDeg: 0, stretch: 0 }];
@@ -573,7 +613,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-add-ext')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.isRoomOwner()) return;
+      if (!doorId || !state || !this.canConstruct(doorId)) return;
       this.untouchedPrefills.delete(doorId);
       if (!consumePart('ext')) { this.renderAssemblyStrip(doorId, 'no EXTENSION parts — DEV menu › PARTS'); return; }
       state.segments = [...(state.segments ?? []), { kind: 'ext', bays: 4, skin: 'solid' }];
@@ -584,7 +624,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-clear-chain')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.isRoomOwner()) return;
+      if (!doorId || !state || !this.canConstruct(doorId)) return;
       this.untouchedPrefills.delete(doorId);
       if (state.segments?.length) refundForSegments(state.segments);
       state.segments = undefined;
@@ -601,7 +641,7 @@ export class DoorDockingPortSystem {
       const state = doorId ? this.doorState.get(doorId) : null;
       const i = Number(el.dataset.i);
       if (!doorId || !state || !state.segments || !Number.isInteger(i) || !state.segments[i]) return;
-      if (!this.isRoomOwner()) return;
+      if (!this.canConstruct(doorId)) return;
       this.untouchedPrefills.delete(doorId);
       const seg = { ...state.segments[i] };
       const action = el.dataset.chipAction;
@@ -631,7 +671,7 @@ export class DoorDockingPortSystem {
     (document.getElementById('docking-far-door') as HTMLSelectElement | null)?.addEventListener('change', (e) => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.isRoomOwner()) return;
+      if (!doorId || !state || !this.canConstruct(doorId)) return;
       const v = (e.target as HTMLSelectElement).value;
       state.farDoor = v === 'north' || v === 'south' || v === 'east' || v === 'west' ? v : undefined;
       this.publishIfPaired(doorId);
@@ -640,12 +680,109 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-far-yaw')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.isRoomOwner()) return;
+      if (!doorId || !state || !this.canConstruct(doorId)) return;
       // Cycle — → 0 → 45 → —
       state.farYawDeg = state.farYawDeg === undefined ? 0 : state.farYawDeg === 0 ? 45 : undefined;
       this.renderAssemblyStrip(doorId);
       this.publishIfPaired(doorId);
     });
+
+    // ── #67 D1/D1b: DOOR POLICY actions (delegated) ─────────────────────────
+    document.getElementById('docking-policy-body')?.addEventListener('click', (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-policy-action]');
+      if (!el) return;
+      const doorId = activeDoor();
+      if (!doorId) return;
+      const action = el.dataset.policyAction;
+      const pub = el.dataset.pub ?? '';
+      if (action === 'req-build') {
+        // Any player may ASK (that is the point) — their own client writes it.
+        writeDoorRequest(doorId, getIdentityPub(), getPlayerName());
+      } else if (!this.isRoomOwner()) {
+        return; // every action below is owner-only (UI gate, dev-phase posture)
+      } else if (action === 'cycle-passage') {
+        const p = readDoorPolicy(doorId);
+        const passage: PassageMode = p.passage === 'public' ? 'owner' : 'public';
+        writeDoorPolicy(doorId, { ...p, passage });
+      } else if (action === 'cycle-construction') {
+        const p = readDoorPolicy(doorId);
+        const next: Record<ConstructionMode, ConstructionMode> = { owner: 'request', request: 'public', public: 'owner' };
+        writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
+      } else if (action === 'accept-req' && pub) {
+        writeDoorGrant(doorId, pub, el.dataset.name ?? 'Unknown-Clone');
+      } else if (action === 'deny-req' && pub) {
+        removeDoorRequest(doorId, pub);
+      } else if (action === 'revoke-grant' && pub) {
+        removeDoorGrant(doorId, pub);
+      }
+      this.renderPolicySection(doorId);
+      this.renderAssemblyStrip(doorId); // a grant/mode change may unlock the strip
+    });
+  }
+
+  /** #67 D1/D1b: paint the DOOR POLICY section (policy cycles for the owner;
+   *  summary + request flow for guests; live request/grant lists). */
+  private renderPolicySection(doorId: 'north' | 'south' | 'east' | 'west'): void {
+    const body = document.getElementById('docking-policy-body');
+    if (!body) return;
+    const policy = readDoorPolicy(doorId);
+    const owner = this.isRoomOwner();
+    const myPub = getIdentityPub();
+    const pill = `display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;`;
+    const row = `display:flex; align-items:center; justify-content:space-between; gap:8px;`;
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+
+    if (owner) {
+      const requests = readDoorRequests(doorId);
+      const grants = readDoorGrants(doorId);
+      const reqRows = requests.map((r) => `
+        <div style="${row}">
+          <span style="color:#ffb300; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(r.requesterPub)}">⚠ ${esc(r.requesterName)} <span style="color:rgba(212,168,75,0.4);">${esc(r.requesterPub.slice(0, 8))}</span></span>
+          <span style="flex-shrink:0; display:flex; gap:4px;">
+            <button type="button" data-policy-action="accept-req" data-pub="${esc(r.requesterPub)}" data-name="${esc(r.requesterName)}" style="${pill} background:rgba(0,230,118,0.15); border-color:rgba(0,230,118,0.4); color:#00e676;">ACCEPT</button>
+            <button type="button" data-policy-action="deny-req" data-pub="${esc(r.requesterPub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DENY</button>
+          </span>
+        </div>`).join('');
+      const grantRows = grants.map((g) => `
+        <div style="${row}">
+          <span style="color:#00e676; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(g.pub)}">✔ ${esc(g.name)} <span style="color:rgba(212,168,75,0.4);">${esc(g.pub.slice(0, 8))}</span></span>
+          <button type="button" data-policy-action="revoke-grant" data-pub="${esc(g.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>
+        </div>`).join('');
+      body.innerHTML = `
+        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk</span></span>
+          <button type="button" data-policy-action="cycle-passage" style="${pill}">${policy.passage.toUpperCase()}</button></div>
+        <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
+          <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
+        ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ''}
+        ${grants.length ? `<div style="font-size:9px; font-weight:800; color:rgba(0,230,118,0.6); letter-spacing:1px; margin-top:2px;">STANDING GRANTS</div>${grantRows}` : ''}
+      `;
+    } else {
+      const granted = hasDoorGrant(doorId, myPub);
+      const requested = hasDoorRequest(doorId, myPub);
+      const buildLine = policy.construction === 'public'
+        ? '<span style="color:#00e676;">BUILD: PUBLIC</span>'
+        : policy.construction === 'request'
+          ? (granted
+            ? '<span style="color:#00e676;">✔ BUILD RIGHTS GRANTED</span>'
+            : requested
+              ? '<span style="color:#ffb300;">⏳ RIGHTS REQUESTED — awaiting the owner</span>'
+              : `<button type="button" data-policy-action="req-build" style="${pill} background:rgba(255,179,0,0.12); border-color:rgba(255,179,0,0.4); color:#ffb300;">🙋 REQUEST BUILD RIGHTS</button>`)
+          : '<span style="color:rgba(212,168,75,0.55);">BUILD: OWNER ONLY</span>';
+      body.innerHTML = `
+        <div style="${row}"><span>PASSAGE: ${policy.passage.toUpperCase()}</span>${buildLine}</div>
+      `;
+    }
+  }
+
+  /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
+   *  a grant landing while a guest stares at the keypad unlocks it live). */
+  public refreshPolicyUI(): void {
+    const pane = document.getElementById('docking-control-pane');
+    if (!pane || pane.style.display === 'none') return;
+    const doorId = (pane as any).activeDoorId as ('north' | 'south' | 'east' | 'west') | null;
+    if (!doorId) return;
+    this.renderPolicySection(doorId);
+    this.renderAssemblyStrip(doorId);
   }
 
   /** #62 P4: paint the assembly strip from the door's working chain. */
@@ -675,9 +812,11 @@ export class DoorDockingPortSystem {
         }).join('');
     if (partsNote) {
       partsNote.textContent = note
-        ?? (this.isRoomOwner()
+        ?? (this.canConstruct(doorId)
           ? `· stock F×${partsCount('flex')} E×${partsCount('ext')}`
-          : '· owner only — ask the room owner to dock modules');
+          : readDoorPolicy(doorId).construction === 'request'
+            ? '· no build rights — REQUEST below'
+            : '· owner only on this port');
     }
     if (farSel) farSel.value = state.farDoor ?? '';
     if (yawBtn) yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? '—' : state.farYawDeg}`;
@@ -734,7 +873,7 @@ export class DoorDockingPortSystem {
     // diamond ring room, so it defaults FAR yaw to 45. OWNER-only (vestibule
     // findings): a guest merely inspecting a keypad must not consume parts or
     // arm a ghost on someone else's room.
-    if (this.isRoomOwner() && !state.pairedSuccessfully && (!state.segments || state.segments.length === 0)) {
+    if (this.canConstruct(doorId) && !state.pairedSuccessfully && (!state.segments || state.segments.length === 0)) {
       const preset = armedPreset();
       if (preset) {
         const segs = presetSegments(preset);
@@ -746,6 +885,7 @@ export class DoorDockingPortSystem {
       }
     }
     this.renderAssemblyStrip(doorId);
+    this.renderPolicySection(doorId); // #67 D1
   }
 
   /** Refund + drop an untouched prefill chain (see untouchedPrefills docs). */
@@ -1098,6 +1238,12 @@ export class DoorDockingPortSystem {
 
   public onPairingStatusChanged(cb: (doorId: string, status: string) => void) {
     this.onPairingStatusChangedCallback = cb;
+  }
+
+  /** #67 D1: passage check for walk-through/transit (world.ts consults this
+   *  before offering the door sequence). */
+  public canPass(doorId: string): boolean {
+    return this.canOperateDoor(doorId);
   }
 
   /** #62 P4: wire the auto-accept decider (see field docs). */
