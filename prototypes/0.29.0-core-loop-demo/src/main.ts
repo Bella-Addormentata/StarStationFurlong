@@ -33,6 +33,10 @@ import {
   writeCoHostRequest, removeCoHostRequest, writeCoHost, removeCoHost,
   isCoHost, hasCoHostRequest,
 } from './roomRoles';
+import {
+  bindVentures, subscribeVentures, ventureRecord, foundVenture, transferShares,
+  isVentureShareholder, ventureLedger, upsertVentureLedger,
+} from './ventures';
 import { refreshExteriorView, setExteriorOwnerCheck, showEnterRoomBubble } from './exteriorView';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
@@ -673,6 +677,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // 🤝 Durability C1: co-host designations ride the room doc (T0 seam).
   bindRoomRoles(sync.doc);
 
+  // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
+  // whenever it shows us as a shareholder, refresh the personal ledger that
+  // powers the VENTURES app's list screen.
+  bindVentures(sync.doc);
+  syncVentureLedgerFromCurrentRoom();
+
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
@@ -705,6 +715,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // appearing while the owner has the app open, an accept while the
     // volunteer watches).
     subscribeRoomRoles(() => renderCoHostsSection());
+    // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
+    // open VENTURES app (a share transfer landing while both look at it).
+    subscribeVentures(() => {
+      syncVentureLedgerFromCurrentRoom();
+      renderVenturesApp();
+    });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1391,10 +1407,14 @@ function resolveOwnerLabel(owner: string): string {
   return owner.length > 16 ? `${owner.slice(0, 8)}…` : owner;
 }
 
-/** True when WE may edit the room name: owner is our player id, or the room
- *  predates S2 (legacy 'Local-Clone' owner — those rooms stay editable). */
+/** True when WE hold owner authority here: owner is our player id, the room
+ *  predates S2 (legacy 'Local-Clone' owner — those rooms stay editable), or —
+ *  🚀 #68 V1 owner rule — the room belongs to a VENTURE and we hold ANY of
+ *  its shares (joint owners are owner-equivalent everywhere: docking, edit
+ *  mode, policies, co-hosts — every gate funnels through this check). */
 function isLocalPlayerRoomOwner(owner: string): boolean {
-  return owner === getPlayerId() || owner === 'Local-Clone';
+  return owner === getPlayerId() || owner === 'Local-Clone'
+    || isVentureShareholder(getIdentityPub());
 }
 
 /**
@@ -1496,6 +1516,170 @@ function renderPhonePlayersList(): void {
     listEl.appendChild(li);
   }
 }
+
+// ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
+// Screen 1: every entity you hold a stake in (name · SOLE/JOINT · your stake).
+// Screen 2: entity detail — Charter block, OWNERS cap table, PROPERTY, actions
+// (sign a Charter here; transfer shares to a contact). Plain-language rule:
+// deeds/charters/shares/ventures only — no chain jargon, ever.
+
+/** Which detail screen is open ('' = the list). */
+let ventureDetailId = '';
+
+function syncVentureLedgerFromCurrentRoom(): void {
+  const v = ventureRecord();
+  const mine = v?.shares[getIdentityPub()] ?? 0;
+  if (v && mine > 0 && activeBootstrap?.roomId) {
+    upsertVentureLedger({
+      id: v.id, name: v.name, officeRoomId: activeBootstrap.roomId,
+      myShares: mine, totalShares: v.totalShares, lastSeenAt: Date.now(),
+    });
+  }
+}
+
+function renderVenturesApp(): void {
+  const view = document.getElementById('phone-app-ventures');
+  if (!view) return;
+  if (!view.dataset.wired) {
+    view.dataset.wired = '1';
+    view.addEventListener('click', (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-venture-action]');
+      if (!el) return;
+      const action = el.dataset.ventureAction;
+      const myPub = getIdentityPub();
+      if (action === 'open') {
+        ventureDetailId = el.dataset.id ?? '';
+      } else if (action === 'back') {
+        ventureDetailId = '';
+      } else if (action === 'found') {
+        const nameInput = document.getElementById('venture-found-name') as HTMLInputElement | null;
+        const name = nameInput?.value.trim() ?? '';
+        if (!name) return;
+        if (foundVenture(name, myPub, getPlayerName())) {
+          syncVentureLedgerFromCurrentRoom();
+          const v = ventureRecord();
+          if (v) ventureDetailId = v.id;
+        }
+      } else if (action === 'transfer') {
+        const pubInput = document.getElementById('venture-transfer-pub') as HTMLInputElement | null;
+        const countInput = document.getElementById('venture-transfer-count') as HTMLInputElement | null;
+        const toPub = pubInput?.value.trim() ?? '';
+        const count = Math.floor(Number(countInput?.value ?? 0));
+        if (!toPub || !(count > 0)) return;
+        // Recipient display name from contacts when we know them (pub-keyed).
+        const known = listContacts().find((c) => c.pub === toPub);
+        if (transferShares(getIdentityPub(), toPub, known?.name ?? 'Unknown-Clone', count)) {
+          syncVentureLedgerFromCurrentRoom();
+          if (pubInput) pubInput.value = '';
+          if (countInput) countInput.value = '';
+        } else {
+          const note = document.getElementById('venture-transfer-note');
+          if (note) note.textContent = 'transfer refused — check the key and your share count';
+          return; // keep inputs for correction
+        }
+      }
+      renderVenturesApp();
+    });
+  }
+
+  const myPub = getIdentityPub();
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  const pill = 'display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;';
+  const current = ventureRecord();
+  const currentRoomId = activeBootstrap?.roomId ?? null;
+
+  // ── Detail screen ──
+  const detail = ventureDetailId
+    ? (current && current.id === ventureDetailId
+      ? current
+      : null)
+    : null;
+  if (ventureDetailId && detail) {
+    const holders = Object.entries(detail.shares).sort((a, b) => b[1] - a[1]);
+    const mine = detail.shares[myPub] ?? 0;
+    const capTable = holders.map(([pub, n]) => {
+      const pct = Math.round((n / detail.totalShares) * 100);
+      const name = detail.holderNames[pub] ?? 'Unknown-Clone';
+      return `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px;">
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(pub)}">${pub === myPub ? '⭐' : '👤'} ${esc(name)} <span style="color:rgba(212,168,75,0.4);">${esc(pub.slice(0, 8))}</span></span>
+        <span style="flex-shrink:0; color:#f0c060;">${n} <span style="color:rgba(212,168,75,0.5);">(${pct}%)</span></span>
+      </div>`;
+    }).join('');
+    view.innerHTML = `
+      <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← ALL VENTURES</button>
+      <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(detail.name)}</div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">CHARTER · signed ${new Date(detail.foundedAt).toLocaleDateString()} by ${esc(detail.founderName)} · ${detail.totalShares} shares issued</div>
+      <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">OWNERS</div>
+      ${capTable}
+      <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">PROPERTY</div>
+      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.4);">· registered office</span></div>
+      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Every shareholder has full access to venture property.</div>
+      ${mine > 0 ? `
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">TRANSFER SHARES</div>
+        <div style="display:flex; gap:4px; margin-top:4px;">
+          <input type="text" id="venture-transfer-pub" placeholder="recipient's key (from CONTACTS)" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
+          <input type="number" id="venture-transfer-count" min="1" max="${mine}" placeholder="#" style="width:44px; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
+          <button type="button" data-venture-action="transfer" style="${pill}">SEND</button>
+        </div>
+        <div id="venture-transfer-note" style="font-size:8.5px; color:#ffb300; margin-top:3px; min-height:10px;"></div>
+        <div style="font-size:8.5px; color:rgba(212,168,75,0.35);">You hold ${mine} of ${detail.totalShares} shares. Transfers are recorded for everyone in the room.</div>` : ''}
+    `;
+    return;
+  }
+  if (ventureDetailId && !detail) {
+    // Detail requested for a venture whose office is another room.
+    const entry = ventureLedger().find((e) => e.id === ventureDetailId);
+    view.innerHTML = `
+      <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← ALL VENTURES</button>
+      <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(entry?.name ?? 'Venture')}</div>
+      <div style="font-size:10px; color:rgba(212,168,75,0.5); margin-top:8px;">The Charter is kept at the registered office. Visit the venture's module to view the cap table or transfer shares.</div>
+    `;
+    return;
+  }
+
+  // ── List screen ──
+  const ledger = ventureLedger();
+  const rows: string[] = [];
+  const seen = new Set<string>();
+  // The current room's venture first (freshest data), then the ledger.
+  if (current) {
+    seen.add(current.id);
+    const mine = current.shares[myPub] ?? 0;
+    const type = Object.keys(current.shares).length > 1 ? 'JOINT' : 'SOLE';
+    rows.push(`<button type="button" data-venture-action="open" data-id="${esc(current.id)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,0.06); border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(current.name)} <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span></span>
+      <span style="flex-shrink:0; font-size:9px;">${type}${mine > 0 ? ` · ${Math.round((mine / current.totalShares) * 100)}%` : ''}</span>
+    </button>`);
+  }
+  for (const e of ledger) {
+    if (seen.has(e.id)) continue;
+    const pct = e.totalShares > 0 ? Math.round((e.myShares / e.totalShares) * 100) : 0;
+    const type = e.myShares >= e.totalShares ? 'SOLE' : 'JOINT';
+    rows.push(`<button type="button" data-venture-action="open" data-id="${esc(e.id)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,0.04); border:1px solid rgba(212,168,75,0.14); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(e.name)}</span>
+      <span style="flex-shrink:0; font-size:9px;">${type} · ${pct}%</span>
+    </button>`);
+  }
+
+  // Founding is offered when this room is OURS outright and unchartered.
+  const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+  const ownThisRoom = ownerVal === getPlayerId();
+  const foundBlock = !current && ownThisRoom && currentRoomId
+    ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:14px;">SIGN A CHARTER</div>
+       <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Found a venture here — this module becomes its registered office and first property. ${CHARTER_TOTAL_SHARES_LABEL} shares are issued to you; transfer them to bring in co-owners.</div>
+       <div style="display:flex; gap:4px; margin-top:6px;">
+         <input type="text" id="venture-found-name" maxlength="48" placeholder="venture name" style="flex:1; min-width:0; font-size:10px; padding:5px 8px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
+         <button type="button" data-venture-action="found" style="${pill}">🖋 SIGN</button>
+       </div>`
+    : '';
+
+  view.innerHTML = `
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">YOUR STAKES</div>
+    ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
+    ${foundBlock}
+  `;
+}
+const CHARTER_TOTAL_SHARES_LABEL = 100;
 
 // ── 🤝 CO-HOSTS section (durability C1) — lives in the ACCESS app ────────────
 // Members volunteer; the owner accepts into a standing, revocable designation
@@ -1657,13 +1841,14 @@ function setupSpacePhoneOverlay() {
   // 📱 Phone shell view router (issue #20 S1) — home screen + per-app views.
   // Policy: Tab always opens the phone to the HOME screen (deterministic,
   // one tap to any app) rather than restoring the last open view.
-  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access' | 'settings' | 'setnet' | 'setstats';
+  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access' | 'ventures' | 'settings' | 'setnet' | 'setstats';
   const phoneViewMeta: Record<PhoneViewId, { elId: string; title: string; subtitle: string }> = {
     home:     { elId: 'phone-home-screen',   title: '📱 HOME',        subtitle: 'FurlongOS · Select App' },
     chat:     { elId: 'phone-app-chat',      title: '👨‍🚀 CLONE CHAT', subtitle: 'Room: Furlong Lobby' },
     contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
     bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
     access:   { elId: 'phone-app-access',    title: '🚪 ACCESS',      subtitle: 'Room Passes · FurlongNet' },
+    ventures: { elId: 'phone-app-ventures',  title: '🚀 VENTURES',    subtitle: 'Charters & Shares · Furlong Registry' },
     settings: { elId: 'phone-app-settings',          title: '⚙️ SETTINGS', subtitle: 'FurlongOS · System' },
     setnet:   { elId: 'phone-app-settings-network',  title: '🌐 NETWORK',  subtitle: 'Settings · Node & Mesh' },
     setstats: { elId: 'phone-app-settings-stats',    title: '📊 STATS',    subtitle: 'Settings · Live Readout' },
@@ -1724,6 +1909,7 @@ function setupSpacePhoneOverlay() {
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
     if (id === 'access') { refreshAccessRoomRow(); renderCoHostsSection(); }
+    if (id === 'ventures') { ventureDetailId = ''; renderVenturesApp(); }
     if (id === 'contacts') refreshContactsApp();
   };
 
