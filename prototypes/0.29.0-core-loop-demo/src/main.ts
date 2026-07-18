@@ -37,6 +37,7 @@ import {
 import {
   bindVentures, subscribeVentures, ventureRecord, foundVenture, transferShares,
   isVentureShareholder, ventureLedger, upsertVentureLedger,
+  writeVentureLink, refreshVentureLink, removeVentureLink,
 } from './ventures';
 import { refreshExteriorView, setExteriorOwnerCheck, showEnterRoomBubble } from './exteriorView';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
@@ -1594,13 +1595,34 @@ let ventureDetailId = '';
 
 function syncVentureLedgerFromCurrentRoom(): void {
   const v = ventureRecord();
-  const mine = v?.shares[getIdentityPub()] ?? 0;
-  if (v && mine > 0 && activeBootstrap?.roomId) {
-    upsertVentureLedger({
-      id: v.id, name: v.name, officeRoomId: activeBootstrap.roomId,
-      myShares: mine, totalShares: v.totalShares, lastSeenAt: Date.now(),
-    });
-  }
+  if (!v || !activeBootstrap?.roomId) return;
+  const myPub = getIdentityPub();
+  const mine = v.shares[myPub] ?? 0;
+  if (mine <= 0) return;
+  const roomId = activeBootstrap.roomId;
+  const isOffice = v.snapshotAt === undefined;
+  const prior = ventureLedger().find((e) => e.id === v.id);
+  // V2 visitation gossip, both directions:
+  //  - the OFFICE (or a NEWER link) refreshes the ledger's cap-table snapshot;
+  //  - a STALE link gets rewritten from the ledger (freshness travels with us).
+  const seenAt = isOffice ? Date.now() : (v.snapshotAt ?? 0);
+  const ledgerFresher = (prior?.capSeenAt ?? 0) > seenAt;
+  const properties = new Set(prior?.properties ?? []);
+  if (!isOffice) properties.add(roomId);
+  const entry = {
+    id: v.id,
+    name: v.name,
+    officeRoomId: v.officeRoomId ?? (isOffice ? roomId : prior?.officeRoomId ?? ''),
+    myShares: ledgerFresher ? (prior!.shares?.[myPub] ?? mine) : mine,
+    totalShares: v.totalShares,
+    lastSeenAt: Date.now(),
+    shares: ledgerFresher ? prior!.shares : { ...v.shares },
+    holderNames: ledgerFresher ? prior!.holderNames : { ...v.holderNames },
+    capSeenAt: Math.max(prior?.capSeenAt ?? 0, seenAt),
+    properties: [...properties].slice(0, 20),
+  };
+  upsertVentureLedger(entry);
+  if (!isOffice && ledgerFresher) refreshVentureLink(entry);
 }
 
 function renderVenturesApp(): void {
@@ -1621,11 +1643,19 @@ function renderVenturesApp(): void {
         const nameInput = document.getElementById('venture-found-name') as HTMLInputElement | null;
         const name = nameInput?.value.trim() ?? '';
         if (!name) return;
-        if (foundVenture(name, myPub, getPlayerName())) {
+        if (foundVenture(name, myPub, getPlayerName(), activeBootstrap?.roomId)) {
           syncVentureLedgerFromCurrentRoom();
           const v = ventureRecord();
           if (v) ventureDetailId = v.id;
         }
+      } else if (action === 'add-property') {
+        // 🏠 V2: assign MY unchartered room to a venture I hold shares in —
+        // the link snapshots the freshest cap table my ledger has seen.
+        const entry = ventureLedger().find((e) => e.id === el.dataset.id);
+        if (entry && writeVentureLink(entry)) syncVentureLedgerFromCurrentRoom();
+      } else if (action === 'detach-property') {
+        // Personal owner of a property room casts it out of the venture.
+        removeVentureLink();
       } else if (action === 'transfer') {
         const pubInput = document.getElementById('venture-transfer-pub') as HTMLInputElement | null;
         const countInput = document.getElementById('venture-transfer-count') as HTMLInputElement | null;
@@ -1653,6 +1683,10 @@ function renderVenturesApp(): void {
   const pill = 'display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;';
   const current = ventureRecord();
   const currentRoomId = activeBootstrap?.roomId ?? null;
+  /** PERSONAL room ownership (raw — deliberately NOT the shareholder-extended
+   *  gate: assigning/detaching property is the personal owner's call). */
+  const ownerValIsMe = () =>
+    (((yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '') === getPlayerId());
 
   // ── Detail screen ──
   const detail = ventureDetailId
@@ -1678,9 +1712,13 @@ function renderVenturesApp(): void {
       <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">OWNERS</div>
       ${capTable}
       <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">PROPERTY</div>
-      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.4);">· registered office</span></div>
-      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Every shareholder has full access to venture property.</div>
-      ${mine > 0 ? `
+      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.4);">· ${detail.snapshotAt === undefined ? 'registered office' : 'venture property'}</span></div>
+      ${(ventureLedger().find((e) => e.id === detail.id)?.properties ?? [])
+        .filter((rid) => rid !== (activeBootstrap?.roomId ?? ''))
+        .map((rid) => `<div style="margin-top:3px; font-size:10px;">🏘 Module <span style="color:rgba(212,168,75,0.4);">${esc(rid.slice(0, 10))}…</span></div>`).join('')}
+      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? ' Cap table is a snapshot — trades happen at the office.' : ''}</div>
+      ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ''}
+      ${mine > 0 && detail.snapshotAt === undefined ? `
         <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">TRANSFER SHARES</div>
         <div style="display:flex; gap:4px; margin-top:4px;">
           <input type="text" id="venture-transfer-pub" placeholder="recipient's key (from CONTACTS)" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
@@ -1739,10 +1777,17 @@ function renderVenturesApp(): void {
        </div>`
     : '';
 
+  // 🏠 V2: my unchartered room can JOIN a venture I hold shares in.
+  const addBlock = !current && ownerValIsMe() && currentRoomId
+    ? ventureLedger().filter((e) => e.myShares > 0 && e.capSeenAt).map((e) => `
+      <div style="margin-top:6px;"><button type="button" data-venture-action="add-property" data-id="${esc(e.id)}" style="${pill}">🏘 ADD THIS MODULE TO ${esc(e.name.toUpperCase())}</button></div>`).join('')
+    : '';
+
   view.innerHTML = `
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">YOUR STAKES</div>
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
     ${foundBlock}
+    ${addBlock}
   `;
 }
 const CHARTER_TOTAL_SHARES_LABEL = 100;
