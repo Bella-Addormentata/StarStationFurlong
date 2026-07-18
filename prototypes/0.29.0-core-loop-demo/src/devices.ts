@@ -41,7 +41,14 @@ import {
   RED_KING, BLACK_KING,
 } from './games/checkers';
 import type { CheckersState, CheckersColor } from './games/checkers';
-import { readGame, writeGame, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+import {
+  initialChessState, legalChessMoves, applyChessMove, chooseChessBotMove,
+  chessPieceColor, otherChessColor, inCheck,
+  W_PAWN, W_KNIGHT, W_BISHOP, W_ROOK, W_QUEEN, W_KING,
+  B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
+} from './games/chess';
+import type { ChessState, ChessColor } from './games/chess';
+import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
@@ -907,16 +914,10 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     return mySeat(s) !== null || readRoomOwner() === myId;
   };
 
-  const reset = (): void => {
-    const s = readGame(deps.itemId);
-    if (!canReset(s)) return;
-    selected = null;
-    // Whole-value LWW (review F4): an in-flight opponent move-write carries a
-    // full old-state snapshot and may win over this reset, silently undoing
-    // it. Converges to a valid state and RESET again recovers; a monotonic
-    // seq field is the robust fix if games outgrow v1.
-    writeGame(deps.itemId, initialState());
-  };
+  // (The old per-game reset became clearToPicker — RESET now clears the whole
+  // table back to the game menu for BOTH kinds. The LWW caveat still applies:
+  // an in-flight opponent move-write may win over the clear; RESET again
+  // recovers. canReset above remains the checkers half of canClearTable.)
 
   // ── Board rendering + click-to-move ────────────────────────────────────────
 
@@ -1006,6 +1007,184 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     drawBoard(s); // selection is local — no doc write, repaint directly
   };
 
+  // ── ♟ Chess (#45 — the board face's second game; checkers' sibling) ────────
+
+  let chessSelected: number | null = null;
+  let chessBotTimer = 0;
+
+  const myChessSeat = (s: ChessState): ChessColor | null =>
+    s.players.white === myId ? 'white' : s.players.black === myId ? 'black' : null;
+
+  const myChessTurn = (s: ChessState): boolean => {
+    const seat = myChessSeat(s);
+    return s.status === 'playing' && seat !== null && s.turn === seat
+      && !(s.bot && s.turn === 'black');
+  };
+
+  const chessSeatLabel = (s: ChessState, color: ChessColor): string => {
+    if (color === 'black' && s.bot) return 'BOT';
+    const id = s.players[color];
+    if (!id) return 'OPEN';
+    const name = readPlayerDisplayName(id).toUpperCase();
+    return id === myId ? `${name} (YOU)` : name;
+  };
+
+  const chessStatusText = (s: ChessState): string => {
+    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT DOWN TO CLAIM A COLOR';
+    if (s.status === 'white-won') return '♔ WHITE WINS — CHECKMATE';
+    if (s.status === 'black-won') return '♚ BLACK WINS — CHECKMATE';
+    if (s.status === 'draw') return '½–½ DRAW — STALEMATE';
+    const who = s.turn.toUpperCase();
+    const yours = myChessTurn(s) ? ' — YOUR MOVE' : '';
+    const check = inCheck(s.board, s.turn) ? ' · CHECK!' : '';
+    return `${who} TO MOVE${yours}${check}`;
+  };
+
+  const claimChessSeat = (color: ChessColor): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'chess') return;
+    const s = t.state;
+    if (s.status !== 'waiting') return;
+    if (s.players[color] !== null) return;
+    if (s.players[otherChessColor(color)] === myId) return;
+    if (s.bot && color === 'black') return;
+    const players = { ...s.players, [color]: myId };
+    const status = players.white && players.black ? 'playing' as const : s.status;
+    writeGame(deps.itemId, { ...s, players, status });
+  };
+
+  const startChessBotGame = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'chess') return;
+    const s = t.state;
+    if (s.status !== 'waiting' || s.players.black !== null) return;
+    if (s.players.white !== null && s.players.white !== myId) return;
+    writeGame(deps.itemId, { ...s, players: { ...s.players, white: myId }, bot: true, status: 'playing' });
+  };
+
+  const chessForfeit = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'chess' || t.state.status !== 'playing') return;
+    const seat = myChessSeat(t.state);
+    if (!seat) return;
+    writeGame(deps.itemId, { ...t.state, status: seat === 'white' ? 'black-won' : 'white-won' });
+  };
+
+  /** RESET gate for EITHER game kind (mirror of canReset's reasoning). */
+  const canClearTable = (): boolean => {
+    const t = readTable(deps.itemId);
+    if (!t) return false;
+    if (t.kind === 'checkers') return canReset(t.state);
+    const s = t.state;
+    if (s.status !== 'waiting' && s.status !== 'playing') return true;
+    if (s.bot) return true;
+    if (s.status === 'waiting') return true; // nobody committed yet
+    return myChessSeat(s) !== null || readRoomOwner() === myId;
+  };
+
+  /** Clear the table back to the GAME PICKER (both kinds — lets players
+   *  switch games; the whole-value LWW caveat from reset() applies). */
+  const clearToPicker = (): void => {
+    if (!canClearTable()) return;
+    selected = null;
+    chessSelected = null;
+    clearTable(deps.itemId);
+  };
+
+  const CHESS_GLYPHS: Record<number, string> = {
+    [W_KING]: '♔', [W_QUEEN]: '♕', [W_ROOK]: '♖', [W_BISHOP]: '♗', [W_KNIGHT]: '♘', [W_PAWN]: '♙',
+    [B_KING]: '♚', [B_QUEEN]: '♛', [B_ROOK]: '♜', [B_BISHOP]: '♝', [B_KNIGHT]: '♞', [B_PAWN]: '♟',
+  };
+
+  const drawChessBoard = (s: ChessState): void => {
+    if (!boardCanvas) return;
+    const ctx = boardCanvas.getContext('2d');
+    if (!ctx) return;
+    const SQ = BOARD_RES / 8;
+    ctx.imageSmoothingEnabled = true;
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        ctx.fillStyle = (r + c) % 2 === 1 ? '#8A6A48' : '#EAD9B0';
+        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
+      }
+    }
+    // Last-move echo (both squares) — reads the opponent's reply at a glance.
+    if (s.last) {
+      ctx.fillStyle = 'rgba(240, 192, 96, 0.28)';
+      for (const sq of [s.last.from, s.last.to]) {
+        ctx.fillRect((sq % 8) * SQ, Math.floor(sq / 8) * SQ, SQ, SQ);
+      }
+    }
+    const moves = myChessTurn(s) ? legalChessMoves(s) : [];
+    if (chessSelected !== null) {
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = GT_GOLD_BRIGHT;
+      ctx.strokeRect((chessSelected % 8) * SQ + 3, Math.floor(chessSelected / 8) * SQ + 3, SQ - 6, SQ - 6);
+      for (const m of moves) {
+        if (m.from !== chessSelected) continue;
+        ctx.beginPath();
+        ctx.arc((m.to % 8) * SQ + SQ / 2, Math.floor(m.to / 8) * SQ + SQ / 2, SQ * 0.13, 0, Math.PI * 2);
+        ctx.fillStyle = GT_GOLD_BRIGHT;
+        ctx.fill();
+      }
+    }
+    // Check flare under the threatened king.
+    if (s.status === 'playing' && inCheck(s.board, s.turn)) {
+      const k = s.board.indexOf(s.turn === 'white' ? W_KING : B_KING);
+      if (k >= 0) {
+        ctx.fillStyle = 'rgba(255, 23, 68, 0.35)';
+        ctx.fillRect((k % 8) * SQ, Math.floor(k / 8) * SQ, SQ, SQ);
+      }
+    }
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `${Math.floor(SQ * 0.78)}px serif`;
+    for (let idx = 0; idx < 64; idx++) {
+      const v = s.board[idx];
+      if (v === 0) continue;
+      const cx = (idx % 8) * SQ + SQ / 2;
+      const cy = Math.floor(idx / 8) * SQ + SQ / 2 + 4;
+      // Halo for movable pieces on your turn (mirrors checkers affordance).
+      if (moves.some((m) => m.from === idx)) {
+        ctx.beginPath();
+        ctx.arc(cx, cy - 4, SQ * 0.42, 0, Math.PI * 2);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = 'rgba(240, 192, 96, 0.6)';
+        ctx.stroke();
+      }
+      // Outline both colors for contrast on both square shades.
+      ctx.fillStyle = v > 0 ? '#FFFFFF' : '#16181F';
+      ctx.strokeStyle = v > 0 ? '#3A3A3A' : '#C9CDD6';
+      ctx.lineWidth = 2;
+      ctx.strokeText(CHESS_GLYPHS[v], cx, cy);
+      ctx.fillText(CHESS_GLYPHS[v], cx, cy);
+    }
+  };
+
+  const onChessBoardClick = (e: MouseEvent): void => {
+    if (!boardCanvas) return;
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'chess' || !myChessTurn(t.state)) return;
+    const s = t.state;
+    const rect = boardCanvas.getBoundingClientRect();
+    const c = Math.floor(((e.clientX - rect.left) / rect.width) * 8);
+    const r = Math.floor(((e.clientY - rect.top) / rect.height) * 8);
+    if (r < 0 || r > 7 || c < 0 || c > 7) return;
+    const idx = r * 8 + c;
+    const moves = legalChessMoves(s);
+    if (chessSelected !== null) {
+      const move = moves.find((m) => m.from === chessSelected && m.to === idx);
+      if (move) {
+        chessSelected = null;
+        writeGame(deps.itemId, applyChessMove(s, move)); // observer repaints
+        return;
+      }
+    }
+    chessSelected = chessPieceColor(s.board[idx]) === s.turn && moves.some((m) => m.from === idx)
+      ? idx : null;
+    drawChessBoard(s);
+  };
+
   // ── Panel rendering (trunk-UI idiom: re-render + re-attach on change) ──────
 
   const render = (): void => {
@@ -1051,10 +1230,88 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         </div>`;
     };
 
-    const state = s ?? initialState();
-    const showBot = state.status === 'waiting' && state.players.black === null
-      && (state.players.red === null || state.players.red === myId);
-    const showForfeit = state.status === 'playing' && mySeat(state) !== null;
+    const table = readTable(deps.itemId);
+
+    // Chess: prune a stale selection (opponent/bot moved, or the table reset).
+    if (chessSelected !== null
+      && (table?.kind !== 'chess' || !myChessTurn(table.state)
+        || !legalChessMoves(table.state).some((m) => m.from === chessSelected))) {
+      chessSelected = null;
+    }
+
+    const boardCursor = (interactive: boolean): string => interactive ? 'pointer' : 'default';
+    const canvasHtml = (interactive: boolean): string => `
+      <canvas id="gt-board" width="${BOARD_RES}" height="${BOARD_RES}"
+        style="width:${BOARD_CSS}px; height:${BOARD_CSS}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${boardCursor(interactive)};"></canvas>`;
+
+    const chessSeatCell = (state: ChessState, color: ChessColor): string => {
+      const label = chessSeatLabel(state, color);
+      const claimable = state.status === 'waiting'
+        && state.players[color] === null
+        && !(state.bot && color === 'black')
+        && state.players[otherChessColor(color)] !== myId;
+      const dot = color === 'white' ? '#EAEAEA' : '#23252E';
+      return `
+        <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:7px 10px;">
+          <span style="width:10px; height:10px; border-radius:50%; background:${dot}; border:1px solid #666; flex:none;"></span>
+          <span style="flex:1; font-size:10px; letter-spacing:1px; color:${GT_GOLD};">${color.toUpperCase()} — ${label}</span>
+          ${claimable ? btn(`gt-chess-sit-${color}`, 'SIT', false, `Claim ${color}`) : ''}
+        </div>`;
+    };
+
+    // ── The board face: game picker / checkers / chess ──
+    let boardFace: string;
+    if (table === null) {
+      boardFace = `
+        <div style="display:flex; flex-direction:column; gap:10px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:16px 12px;">
+          <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">CHOOSE A GAME</div>
+          <div style="display:flex; gap:10px;">
+            ${btn('gt-pick-chess', '♟ CHESS', false, 'Full rules — castling, en passant, checkmate')}
+            ${btn('gt-pick-checkers', '⛀ CHECKERS', false, 'American rules, forced captures')}
+          </div>
+          <div style="font-size:9px; color:rgba(212,168,75,0.5);">Anyone at the table picks; the first two to SIT play. RESET brings this menu back.</div>
+        </div>`;
+    } else if (table.kind === 'chess') {
+      const cs = table.state;
+      const showChessBot = cs.status === 'waiting' && cs.players.black === null
+        && (cs.players.white === null || cs.players.white === myId);
+      const showChessForfeit = cs.status === 'playing' && myChessSeat(cs) !== null;
+      boardFace = `
+        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
+          cs.status === 'playing' ? GT_GOLD_BRIGHT : cs.status === 'waiting' ? GT_DIM : '#00E676'
+        };">${chessStatusText(cs)}</div>
+        <div style="display:flex; gap:8px;">
+          ${chessSeatCell(cs, 'white')}
+          ${chessSeatCell(cs, 'black')}
+        </div>
+        ${showChessBot ? `<div>${btn('gt-chess-bot', '⚙ VS BOT — PLAY ALONE', false, 'Single-player against a trivial AI')}</div>` : ''}
+        ${canvasHtml(myChessTurn(cs))}
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          ${showChessForfeit ? btn('gt-chess-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
+          ${btn('gt-reset', 'RESET', !canClearTable(),
+            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
+        </div>`;
+    } else {
+      const state = table.state;
+      const showBot = state.status === 'waiting' && state.players.black === null
+        && (state.players.red === null || state.players.red === myId);
+      const showForfeit = state.status === 'playing' && mySeat(state) !== null;
+      boardFace = `
+        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
+          state.status === 'playing' ? GT_GOLD_BRIGHT : state.status === 'waiting' ? GT_DIM : '#00E676'
+        };">${statusText(state)}</div>
+        <div style="display:flex; gap:8px;">
+          ${seatCell('red')}
+          ${seatCell('black')}
+        </div>
+        ${showBot ? `<div>${btn('gt-bot', '⚙ VS BOT — PLAY ALONE', false, 'Start a single-player game against a trivial AI')}</div>` : ''}
+        ${canvasHtml(myTurn(state))}
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          ${showForfeit ? btn('gt-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
+          ${btn('gt-reset', 'RESET', !canClearTable(),
+            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
+        </div>`;
+    }
 
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
@@ -1072,43 +1329,48 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">♠ CARD FELT</div>
         <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
           NO DECK DEALT — war, two-player poker and solitaire arrive with the
-          games roadmap (brainstorming/games-plan.md). Flip back for checkers.
+          games roadmap (brainstorming/games-plan.md). Flip back for the board games.
         </div>
-      </div>` : `
-      <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
-        state.status === 'playing' ? GT_GOLD_BRIGHT : state.status === 'waiting' ? GT_DIM : '#00E676'
-      };">${statusText(state)}</div>
-      <div style="display:flex; gap:8px;">
-        ${seatCell('red')}
-        ${seatCell('black')}
-      </div>
-      ${showBot ? `<div>${btn('gt-bot', '⚙ VS BOT — PLAY ALONE', false, 'Start a single-player game against a trivial AI')}</div>` : ''}
-      <canvas id="gt-board" width="${BOARD_RES}" height="${BOARD_RES}"
-        style="width:${BOARD_CSS}px; height:${BOARD_CSS}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${s && myTurn(s) ? 'pointer' : 'default'};"></canvas>
-      <div style="display:flex; gap:8px; justify-content:flex-end;">
-        ${showForfeit ? btn('gt-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
-        ${btn('gt-reset', 'RESET', !canReset(s),
-          canReset(s) ? 'Clear the board and both seats' : 'Participants or the room owner reset a live game')}
-      </div>`}
+      </div>` : boardFace}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF GAME TABLE v1 · checkers (American rules, forced captures) · state synced via room doc · flip is per-player (only you see the other face)
+        SSF GAME TABLE · chess (full rules, auto-queen) + checkers (American rules) · state synced via room doc · flip is per-player (only you see the other face)
       </div>
     `;
 
     panel.querySelector<HTMLButtonElement>('#gt-flip')?.addEventListener('click', () => {
       if (!deps.top || deps.top.isFlipping()) return;
       selected = null;
+      chessSelected = null;
       deps.top.flip(() => render()); // completion swaps the panel face
       render();                      // immediate: show FLIPPING…
     });
+    // Picker.
+    panel.querySelector<HTMLButtonElement>('#gt-pick-chess')?.addEventListener('click', () => {
+      if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialChessState());
+    });
+    panel.querySelector<HTMLButtonElement>('#gt-pick-checkers')?.addEventListener('click', () => {
+      if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialState());
+    });
+    // Checkers controls.
     panel.querySelector<HTMLButtonElement>('#gt-sit-red')?.addEventListener('click', () => claimSeat('red'));
     panel.querySelector<HTMLButtonElement>('#gt-sit-black')?.addEventListener('click', () => claimSeat('black'));
     panel.querySelector<HTMLButtonElement>('#gt-bot')?.addEventListener('click', () => startBotGame());
     panel.querySelector<HTMLButtonElement>('#gt-forfeit')?.addEventListener('click', () => forfeit());
-    panel.querySelector<HTMLButtonElement>('#gt-reset')?.addEventListener('click', () => reset());
+    // Chess controls.
+    panel.querySelector<HTMLButtonElement>('#gt-chess-sit-white')?.addEventListener('click', () => claimChessSeat('white'));
+    panel.querySelector<HTMLButtonElement>('#gt-chess-sit-black')?.addEventListener('click', () => claimChessSeat('black'));
+    panel.querySelector<HTMLButtonElement>('#gt-chess-bot')?.addEventListener('click', () => startChessBotGame());
+    panel.querySelector<HTMLButtonElement>('#gt-chess-forfeit')?.addEventListener('click', () => chessForfeit());
+    // Shared RESET → back to the picker (both kinds).
+    panel.querySelector<HTMLButtonElement>('#gt-reset')?.addEventListener('click', () => clearToPicker());
     boardCanvas = panel.querySelector<HTMLCanvasElement>('#gt-board');
-    boardCanvas?.addEventListener('click', onBoardClick);
-    drawBoard(s);
+    if (table?.kind === 'chess') {
+      boardCanvas?.addEventListener('click', onChessBoardClick);
+      drawChessBoard(table.state);
+    } else {
+      boardCanvas?.addEventListener('click', onBoardClick);
+      drawBoard(table?.state ?? null);
+    }
   };
 
   return {
@@ -1159,20 +1421,33 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     },
 
     update(dt: number): void {
-      // Single-player bot pump: the RED claimant's client plays BLACK with a
-      // small think-delay. Runs only while this UI is mounted — the trivial
-      // bot sleeps when the table is not focused (documented v1 scope).
-      const s = readGame(deps.itemId);
-      if (s && s.bot && s.status === 'playing' && s.turn === 'black'
-        && s.players.red === myId) {
-        botTimer += dt;
-        if (botTimer >= 0.7) {
-          botTimer = 0;
-          const move = chooseBotMove(s);
-          if (move) writeGame(deps.itemId, applyMove(s, move));
-        }
+      // Single-player bot pumps: the human claimant's client plays the bot
+      // side with a small think-delay. Runs only while this UI is mounted —
+      // the trivial bots sleep when the table is not focused (documented v1).
+      const t = readTable(deps.itemId);
+      if (t?.kind === 'checkers') {
+        const s = t.state;
+        if (s.bot && s.status === 'playing' && s.turn === 'black' && s.players.red === myId) {
+          botTimer += dt;
+          if (botTimer >= 0.7) {
+            botTimer = 0;
+            const move = chooseBotMove(s);
+            if (move) writeGame(deps.itemId, applyMove(s, move));
+          }
+        } else botTimer = 0;
+      } else if (t?.kind === 'chess') {
+        const s = t.state;
+        if (s.bot && s.status === 'playing' && s.turn === 'black' && s.players.white === myId) {
+          chessBotTimer += dt;
+          if (chessBotTimer >= 0.8) {
+            chessBotTimer = 0;
+            const move = chooseChessBotMove(s);
+            if (move) writeGame(deps.itemId, applyChessMove(s, move));
+          }
+        } else chessBotTimer = 0;
       } else {
         botTimer = 0;
+        chessBotTimer = 0;
       }
     },
   };

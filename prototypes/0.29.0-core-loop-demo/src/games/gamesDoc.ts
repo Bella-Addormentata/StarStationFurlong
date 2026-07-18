@@ -24,6 +24,15 @@
 import * as Y from 'yjs';
 import { initialState, legalMoves, applyMove, chooseBotMove, isCheckersState } from './checkers';
 import type { CheckersState } from './checkers';
+import { isChessState } from './chess';
+import type { ChessState } from './chess';
+
+/** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`;
+ *  legacy checkers states are kind-less (isCheckersState identifies them) —
+ *  the additive discriminator keeps every pre-chess doc entry working. */
+export type TableGame =
+  | { kind: 'checkers'; state: CheckersState }
+  | { kind: 'chess'; state: ChessState };
 
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
@@ -83,11 +92,28 @@ export function readGame(tableId: string): CheckersState | null {
   return isCheckersState(value) ? value : null;
 }
 
+/** Kind-discriminated read: whichever game currently lives on the table.
+ *  Chess carries `kind: 'chess'`; kind-less entries are legacy checkers. */
+export function readTable(tableId: string): TableGame | null {
+  const value = ensureMap().get(tableId);
+  if (isChessState(value)) return { kind: 'chess', state: value };
+  if (isCheckersState(value)) return { kind: 'checkers', state: value };
+  return null;
+}
+
 /** Transacted whole-value write of one table's state (LWW per table key). */
-export function writeGame(tableId: string, state: CheckersState): void {
+export function writeGame(tableId: string, state: CheckersState | ChessState): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(tableId, state);
+  });
+}
+
+/** Clear the table entirely — back to the game PICKER on every client. */
+export function clearTable(tableId: string): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.delete(tableId);
   });
 }
 
