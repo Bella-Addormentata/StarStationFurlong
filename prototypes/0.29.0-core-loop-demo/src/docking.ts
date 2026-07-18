@@ -85,6 +85,16 @@ export class DoorDockingPortSystem {
    *  — true for modules THIS client minted (the ledger) when AUTO-ACCEPT MY
    *  MODULES is on. Removes 12 hop-accept-hop round trips from the octagon. */
   private autoAcceptCheckCallback: ((address: string) => boolean) | null = null;
+  /** Owner gate (vestibule-findings fix): main.ts answers "is the LOCAL player
+   *  this room's owner?" — connection changes (request/accept/assembly) are
+   *  owner-only, same posture as edit mode. UI-level gating for the dev phase;
+   *  read-side enforcement needs signed door records (a later slice). Default
+   *  true when unwired so standalone/dev use keeps working. */
+  private ownerCheckCallback: (() => boolean) | null = null;
+
+  private isRoomOwner(): boolean {
+    return this.ownerCheckCallback ? this.ownerCheckCallback() : true;
+  }
   /**
    * "Buy a module" v0 (T1 of issue #30): mints a fresh room seed against the
    * LOCAL node. Wired by main.ts (callback pattern — docking.ts must not
@@ -472,10 +482,15 @@ export class DoorDockingPortSystem {
         const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
         const pinInput = document.getElementById('docking-pin-input') as HTMLInputElement | null;
         
+        // Vestibule-findings fix: connection changes are OWNER-only.
+        if (!this.isRoomOwner()) {
+          alert('Only this room\'s owner can dock modules to its ports.');
+          return;
+        }
         if (state && addrInput && pinInput) {
           state.connectedRoomAddress = addrInput.value.trim();
           state.pinCode = pinInput.value.trim();
-          
+
           if (!state.connectedRoomAddress) {
             alert('Please paste a target room seed link first!');
             return;
@@ -504,6 +519,11 @@ export class DoorDockingPortSystem {
         const pane = document.getElementById('docking-control-pane');
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
+        // Vestibule-findings fix: only the room's owner may APPROVE a docking.
+        if (!this.isRoomOwner()) {
+          alert('Only this room\'s owner can approve a docking request.');
+          return;
+        }
         this.completePairing(activeDoorId, true);
         if (box) box.style.display = 'none';
       });
@@ -528,7 +548,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-add-flex')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state) return;
+      if (!doorId || !state || !this.isRoomOwner()) return;
       if (!consumePart('flex')) { this.renderAssemblyStrip(doorId, 'no FLEX parts — DEV menu › PARTS'); return; }
       state.segments = [...(state.segments ?? []), { kind: 'flex', bendDeg: 0, stretch: 0 }];
       this.renderAssemblyStrip(doorId);
@@ -538,7 +558,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-add-ext')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state) return;
+      if (!doorId || !state || !this.isRoomOwner()) return;
       if (!consumePart('ext')) { this.renderAssemblyStrip(doorId, 'no EXTENSION parts — DEV menu › PARTS'); return; }
       state.segments = [...(state.segments ?? []), { kind: 'ext', bays: 4, skin: 'solid' }];
       this.renderAssemblyStrip(doorId);
@@ -548,7 +568,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-clear-chain')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state) return;
+      if (!doorId || !state || !this.isRoomOwner()) return;
       if (state.segments?.length) refundForSegments(state.segments);
       state.segments = undefined;
       this.renderAssemblyStrip(doorId);
@@ -564,6 +584,7 @@ export class DoorDockingPortSystem {
       const state = doorId ? this.doorState.get(doorId) : null;
       const i = Number(el.dataset.i);
       if (!doorId || !state || !state.segments || !Number.isInteger(i) || !state.segments[i]) return;
+      if (!this.isRoomOwner()) return;
       const seg = { ...state.segments[i] };
       const action = el.dataset.chipAction;
       if (action === 'remove') {
@@ -592,7 +613,7 @@ export class DoorDockingPortSystem {
     (document.getElementById('docking-far-door') as HTMLSelectElement | null)?.addEventListener('change', (e) => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state) return;
+      if (!doorId || !state || !this.isRoomOwner()) return;
       const v = (e.target as HTMLSelectElement).value;
       state.farDoor = v === 'north' || v === 'south' || v === 'east' || v === 'west' ? v : undefined;
       this.publishIfPaired(doorId);
@@ -601,7 +622,7 @@ export class DoorDockingPortSystem {
     document.getElementById('docking-far-yaw')?.addEventListener('click', () => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state) return;
+      if (!doorId || !state || !this.isRoomOwner()) return;
       // Cycle — → 0 → 45 → —
       state.farYawDeg = state.farYawDeg === undefined ? 0 : state.farYawDeg === 0 ? 45 : undefined;
       this.renderAssemblyStrip(doorId);
@@ -635,7 +656,10 @@ export class DoorDockingPortSystem {
             </span>`;
         }).join('');
     if (partsNote) {
-      partsNote.textContent = note ?? `· stock F×${partsCount('flex')} E×${partsCount('ext')}`;
+      partsNote.textContent = note
+        ?? (this.isRoomOwner()
+          ? `· stock F×${partsCount('flex')} E×${partsCount('ext')}`
+          : '· owner only — ask the room owner to dock modules');
     }
     if (farSel) farSel.value = state.farDoor ?? '';
     if (yawBtn) yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? '—' : state.farYawDeg}`;
@@ -689,8 +713,10 @@ export class DoorDockingPortSystem {
     // #62 P4: armed-preset prefill — an unpaired door with no working chain
     // opens with the DEV-armed preset's chips already placed (parts consumed
     // atomically; silently skipped when stock is short). RING targets a
-    // diamond ring room, so it defaults FAR yaw to 45.
-    if (!state.pairedSuccessfully && (!state.segments || state.segments.length === 0)) {
+    // diamond ring room, so it defaults FAR yaw to 45. OWNER-only (vestibule
+    // findings): a guest merely inspecting a keypad must not consume parts or
+    // arm a ghost on someone else's room.
+    if (this.isRoomOwner() && !state.pairedSuccessfully && (!state.segments || state.segments.length === 0)) {
       const preset = armedPreset();
       if (preset) {
         const segs = presetSegments(preset);
@@ -1044,6 +1070,11 @@ export class DoorDockingPortSystem {
   /** #62 P4: wire the auto-accept decider (see field docs). */
   public onAutoAcceptCheck(cb: (address: string) => boolean) {
     this.autoAcceptCheckCallback = cb;
+  }
+
+  /** Owner gate: wire the "is the local player this room's owner?" decider. */
+  public onOwnerCheck(cb: () => boolean) {
+    this.ownerCheckCallback = cb;
   }
 
   /** Wire the PROVISION NEW MODULE minting callback (see field docs). */

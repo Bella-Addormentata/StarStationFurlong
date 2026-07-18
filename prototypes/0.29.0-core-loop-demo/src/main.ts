@@ -1228,6 +1228,14 @@ function wireAdapterTransit(): void {
   // #62 P4: auto-accept decider — a pairing may complete without a far-side
   // human only for rooms THIS client minted (the ledger / this session's
   // mints) or its own current room, and only while the DEV toggle is on.
+  // Vestibule-findings fix: connection changes (request / approve / assembly)
+  // are limited to the room's OWNER — the same gate the room-name editor and
+  // edit mode use. Legacy 'Local-Clone' rooms stay editable by everyone, per
+  // the S2 convention inside isLocalPlayerRoomOwner.
+  world.dockingSystem?.onOwnerCheck(() => {
+    const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+    return isLocalPlayerRoomOwner(ownerVal);
+  });
   world.dockingSystem?.onAutoAcceptCheck((address) => {
     if (!autoAcceptEnabled()) return false;
     try {
