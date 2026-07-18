@@ -1459,6 +1459,52 @@ function renderPhonePlayersList(): void {
   }
 }
 
+// ── 💬 QUICK CHAT (owner request) ────────────────────────────────────────────
+// Enter (game focus) pops a mini bar holding JUST the chat field — the top of
+// the phone peeking up. Enter sends (the overhead bubble shows); Enter on a
+// BLANK field slides it away; Tab from the mini bar expands to the full phone
+// on the CHAT app for history. The REAL #chat-form is REPARENTED into the bar
+// (its submit listener travels with it — the settings de-overlay pattern), so
+// send behavior is identical in both homes.
+
+let miniChatOpen = false;
+
+function miniChatBar(): HTMLDivElement {
+  let bar = document.getElementById('phone-mini-chat') as HTMLDivElement | null;
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'phone-mini-chat';
+    bar.innerHTML = `<div id="phone-mini-chat-hint">💬 QUICK CHAT · ENTER sends · blank ENTER closes · TAB full history</div>`;
+    // Panel clicks stay off the canvas click handler (same rule as the phone).
+    bar.addEventListener('click', (e) => e.stopPropagation());
+    document.body.appendChild(bar);
+  }
+  return bar;
+}
+
+function openMiniChat(): void {
+  if (miniChatOpen) return;
+  const form = document.getElementById('chat-form');
+  if (!form) return;
+  miniChatOpen = true;
+  const bar = miniChatBar();
+  bar.appendChild(form);
+  bar.classList.add('active');
+  (document.getElementById('chat-input') as HTMLInputElement | null)?.focus();
+}
+
+function closeMiniChat(): void {
+  if (!miniChatOpen) return;
+  miniChatOpen = false;
+  const bar = document.getElementById('phone-mini-chat');
+  bar?.classList.remove('active');
+  // The form goes home under the messages list (its listeners travel with it).
+  const form = document.getElementById('chat-form');
+  const chatView = document.getElementById('phone-app-chat');
+  if (form && chatView) chatView.appendChild(form);
+  (document.getElementById('chat-input') as HTMLInputElement | null)?.blur();
+}
+
 function setupSpacePhoneOverlay() {
   // bootstrapNetworking() re-runs via the Retry-node / Use-link buttons;
   // guard so the Tab toggle and form submit listeners bind exactly once
@@ -1584,6 +1630,12 @@ function setupSpacePhoneOverlay() {
   // pointing at <body>; e.target stays the original input.)
   window.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
+    // 💬 QUICK CHAT: Esc dismisses the mini bar (even while typing in it).
+    if (miniChatOpen) {
+      e.preventDefault();
+      closeMiniChat();
+      return;
+    }
     if (!container || !container.classList.contains('active')) return;
     const target = e.target as HTMLElement | null;
     if (
@@ -1637,6 +1689,21 @@ function setupSpacePhoneOverlay() {
     });
   }
 
+  // 💬 QUICK CHAT opener: Enter (with game focus) pops the mini chat bar.
+  // Guards: never while typing in any field, never with the phone or welcome
+  // screen open, never during edit mode / device focus (they own the keys).
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || miniChatOpen) return;
+    if (container?.classList.contains('active')) return;
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+    const welcome = document.getElementById('welcome');
+    if (welcome && getComputedStyle(welcome).display !== 'none') return;
+    if (roomEdit.isEditModeActive() || isDeviceFocusActive()) return;
+    e.preventDefault();
+    openMiniChat();
+  });
+
   // Open/Close phone toggle binding Tab key
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Tab') {
@@ -1646,6 +1713,18 @@ function setupSpacePhoneOverlay() {
 
       if (tipIndicator) {
         removeTipIndicator();
+      }
+
+      // 💬 QUICK CHAT: Tab from the mini bar EXPANDS to the full phone on the
+      // CHAT app (scrollable history) instead of the home-screen toggle.
+      if (miniChatOpen) {
+        closeMiniChat();
+        if (container && !container.classList.contains('active')) {
+          container.classList.add('active');
+          showPhoneView('chat');
+          logToPhoneSystem('Entering SpacePhone net...');
+        }
+        return;
       }
 
       if (container) {
@@ -1865,7 +1944,12 @@ function setupSpacePhoneOverlay() {
     chatForm.addEventListener('submit', (e) => {
       e.preventDefault();
       const val = chatInput.value.trim();
-      if (!val) return;
+      if (!val) {
+        // 💬 QUICK CHAT: Enter on a BLANK field slides the mini bar away
+        // ("done chatting"). In the full phone a blank Enter stays a no-op.
+        if (miniChatOpen) closeMiniChat();
+        return;
+      }
 
       chatInput.value = '';
 
