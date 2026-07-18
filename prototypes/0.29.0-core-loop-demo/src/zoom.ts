@@ -18,6 +18,7 @@
  */
 
 import * as THREE from 'three';
+import { setExteriorActive } from './exteriorView';
 import { isDeviceFocusActive } from './deviceFocus';
 import { rotateIsoOffset } from './cameraRig';
 
@@ -346,9 +347,10 @@ export class MultiScaleZoomView {
       }
     });
 
-    // Custom Canvas Click routing for upper views
+    // Custom Canvas Click routing for upper views (level 3 is the 3D exterior
+    // view — exteriorView.ts owns its clicks; the schematic starts at 4)
     window.addEventListener('click', (e) => {
-      if (this.currentLevel <= 2 || !this.canvas) return;
+      if (this.currentLevel <= 3 || !this.canvas) return;
       
       const rect = this.canvas.getBoundingClientRect();
       const clickX = e.clientX - rect.left;
@@ -680,13 +682,18 @@ export class MultiScaleZoomView {
       }
     }
 
+    // 🛰️ Level 3 is the 3D EXTERIOR VIEW (exteriorView.ts): hull + planet +
+    // chains in the real scene, its own click routing. The 2D schematic
+    // overlay + sidebar now start at level 4. Idempotent per-frame safe.
+    setExteriorActive(def.level === 3);
+
     // Toggle pointer events and canvas overlays based on view layers
     if (this.overlay) {
-      if (this.currentLevel > 2) {
+      if (this.currentLevel > 3) {
         this.overlay.style.pointerEvents = 'auto'; // intercept clicks
         if (this.canvas) {
           this.canvas.style.pointerEvents = 'auto';
-          this.canvas.style.display = 'block'; // Ensure canvas is visible for levels > 2
+          this.canvas.style.display = 'block'; // Ensure canvas is visible for levels > 3
         }
         this.showSidebar(def);
       } else {
@@ -800,7 +807,7 @@ export class MultiScaleZoomView {
       this.renderBlinkOverlay();
     }
 
-    if (this.currentLevel <= 2 || !this.canvas || !this.ctx) return;
+    if (this.currentLevel <= 3 || !this.canvas || !this.ctx) return; // 3 = 3D exterior, no schematic
     this.render();
   }
 

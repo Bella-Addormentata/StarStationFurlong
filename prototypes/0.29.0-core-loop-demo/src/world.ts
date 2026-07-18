@@ -1330,6 +1330,12 @@ export class World {
     }
   }
 
+  /** 🛰️ Exterior view: the live paired-connector groups (raycast targets for
+   *  the click-a-joint bend editor). */
+  public getPairedVestibuleGroups(): Map<string, THREE.Group> {
+    return new Map(this.pairedVestibules);
+  }
+
   /** 💬 Chat bubbles: live snapshot of every remote avatar's rendered position
    *  (keyed by lane-derived peer id — the bubble anchor). */
   public getRemoteAvatarSnapshots(): Array<{ id: string; x: number; z: number }> {
@@ -1622,7 +1628,9 @@ export class World {
         this.pairedVestibules.set(door.id, vestibule);
       }
 
-      vestibule.visible = zoomLevel < 3 && !this.isMorphing;
+      // 🛰️ Exterior view: chains STAY visible at level 3 (they are the station's
+      // connective tissue from outside); levels 4+ (schematics) still hide them.
+      vestibule.visible = zoomLevel < 4 && !this.isMorphing;
       if (!vestibule.visible) continue;
 
       let target: number;

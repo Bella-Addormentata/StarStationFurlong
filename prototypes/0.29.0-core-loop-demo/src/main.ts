@@ -27,6 +27,8 @@ import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize } from './fur
 import { bindDoorsDoc, writeDoorPairing, readAllDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
+import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
+import { refreshExteriorView, setExteriorOwnerCheck } from './exteriorView';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -660,6 +662,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
   bindDoorPolicy(sync.doc);
 
+  // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
+  bindExteriorDoc(sync.doc);
+
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
@@ -684,6 +689,13 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // #67 D1b: policy/request/grant changes repaint an OPEN keypad live — a
     // grant landing while the guest stares at the pane unlocks it in place.
     subscribeDoorPolicy(() => world?.dockingSystem?.refreshPolicyUI());
+    // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
+    // and the toolbar's ADD button follows ownership of the current room.
+    subscribeExterior(() => refreshExteriorView());
+    setExteriorOwnerCheck(() => {
+      const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+      return isLocalPlayerRoomOwner(ownerVal);
+    });
   }
   setActivePassRoom(boot.roomId);
 
