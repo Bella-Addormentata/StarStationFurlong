@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.2 — 2026-07-18
+
+### 🏘 Ventures Own Multiple Modules (#68 V2)
+
+- **A venture can own the whole neighborhood now.** In any module you personally own, the VENTURES app offers **🏘 ADD THIS MODULE TO \<venture\>** — it becomes venture property, and **every shareholder gets full co-owner access there** (docking, editing, policies — same as the office). The property room's personal owner can ⏏ DETACH it any time.
+- The **registered office stays the source of truth**: share transfers happen only there; property rooms carry a snapshot that **refreshes as shareholders come and go** (whoever saw the office most recently brings the news — very frontier-town, and exactly how a P2P station should work).
+- Perfect for the weekend test: found a venture, hand your friends shares at the office, add your other modules, and everyone co-owns the lot.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.2 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.1 — 2026-07-18
 
 ### 🧱 Doors Slide Now (#66 S1)
