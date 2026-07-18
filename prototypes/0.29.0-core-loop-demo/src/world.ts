@@ -602,6 +602,7 @@ export class World {
           segments: rec.segments,
           farDoor: rec.farDoor,
           farYawDeg: rec.farYawDeg,
+          transient: rec.transient, // #67 D2
         });
       } else {
         this.dockingSystem.clearRemotePairing(doorId);
@@ -1913,6 +1914,7 @@ export class World {
             segments: st.segments,
             farDoor: st.farDoor,
             farYawDeg: st.farYawDeg,
+            transient: st.transient, // #67 D2: guest berths carry the flag
           });
         }
       } else if (status === 'REJECTED') {

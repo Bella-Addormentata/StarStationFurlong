@@ -32,6 +32,11 @@ export type ConstructionMode = 'owner' | 'request' | 'public';
 export interface DoorPolicyRecord {
   passage: PassageMode;
   construction: ConstructionMode;
+  /** #67 D2: a 🔌 Docking Adapter is INSTALLED at this door — anyone may
+   *  TRANSIENTLY berth a ship module here (no chains, no station-graph
+   *  permanence, either side detaches). Owner installs/removes (consumes/
+   *  refunds an ADAPTER part). */
+  adapter?: boolean;
 }
 
 export interface DoorRightsRequest {
@@ -93,6 +98,7 @@ export function readDoorPolicy(doorId: string): DoorPolicyRecord {
   return {
     passage: raw?.passage === 'owner' ? 'owner' : 'public',
     construction: raw?.construction === 'request' || raw?.construction === 'public' ? raw.construction : 'owner',
+    adapter: raw?.adapter === true,
   };
 }
 
@@ -100,7 +106,11 @@ export function readDoorPolicy(doorId: string): DoorPolicyRecord {
 export function writeDoorPolicy(doorId: string, policy: DoorPolicyRecord): void {
   if (!docAlive() || !(DOOR_IDS as readonly string[]).includes(doorId)) return;
   boundDoc!.transact(() => {
-    policyMap!.set(doorId, { passage: policy.passage, construction: policy.construction });
+    policyMap!.set(doorId, {
+      passage: policy.passage,
+      construction: policy.construction,
+      adapter: policy.adapter === true,
+    });
   });
 }
 

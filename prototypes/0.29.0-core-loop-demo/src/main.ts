@@ -688,7 +688,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     subscribeContacts(() => renderPhonePlayersList());
     // #67 D1b: policy/request/grant changes repaint an OPEN keypad live — a
     // grant landing while the guest stares at the pane unlocks it in place.
-    subscribeDoorPolicy(() => world?.dockingSystem?.refreshPolicyUI());
+    // D2: adapter installs also re-dress the hull (the IDA collar in space).
+    subscribeDoorPolicy(() => {
+      world?.dockingSystem?.refreshPolicyUI();
+      refreshExteriorView();
+    });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1233,6 +1237,9 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
         segments: depGeometry ? mirrorSegments(depGeometry.segments) : undefined,
         farDoor: departureDoorId,
         farYawDeg: depGeometry?.farYawDeg,
+        // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
+        // detaching either side casts the whole connection off.
+        transient: depState?.transient,
       });
       console.log(`🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`);
     }
