@@ -419,7 +419,7 @@ export class MultiScaleZoomView {
    */
   private zoomHintText(): string {
     const parts: string[] = [];
-    if (DEVZOOM || this.currentLevel === 1) parts.push('[-] TO OUT');
+    if (DEVZOOM || this.currentLevel <= 2) parts.push('[-] TO OUT'); // room→exterior is normal play now
     if (this.currentLevel > 1) parts.push('[+] TO IN');
     let hint = `PRESS ${parts.join(' / ')}`;
     if (this.currentLevel === 1) {
@@ -475,10 +475,10 @@ export class MultiScaleZoomView {
         pendingZoomOutAction = true;
         return; // Pause zooming out until eyelids are fully closed at 0.5 progress
       }
-      // M-dep clamp: past level 2 lies the deprecated non-diegetic overlay —
-      // dev-flag only. The level-1 branch above never reaches this (its blink
-      // callback in tick() advances 1→2 directly), so first person is intact.
-      if (this.currentLevel >= 2 && !DEVZOOM) return;
+      // 🛰️ Level 3 is now the REAL 3D exterior view (#65) — reachable in
+      // normal play: [-] from the room view goes outside. The M-dep clamp
+      // still guards the DEPRECATED 2D schematics (levels 4+, dev-flag only).
+      if (this.currentLevel >= 3 && !DEVZOOM) return;
       this.currentLevel++;
       this.updateViewContext();
     }
