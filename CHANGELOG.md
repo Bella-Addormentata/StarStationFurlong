@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.30.9 — 2026-07-18
+
+### 🚦 Door Permissions + Build-Rights Requests (#67 D1/D1b)
+
+- **Every door now has two owner-set policies** in the keypad's new DOOR POLICY section: **PASSAGE** (open/close/walk-through: `PUBLIC` default / `OWNER`) and **CONSTRUCTION** (dock/build: `OWNER` default / `REQUEST` / `PUBLIC`). A door can be freely walkable but build-locked, wide open to community construction, or owner-restricted entirely. Defaults preserve today's behavior exactly.
+- **REQUEST mode makes rights a social flow**: a guest at the keypad taps **🙋 REQUEST BUILD RIGHTS** → the owner sees the pending request in the same keypad (ACCEPT/DENY) → ACCEPT creates a **standing, revocable grant** keyed to the guest's cryptographic identity (it survives leave/rejoin), and the guest's assembly controls unlock live, on the spot.
+- The LOCK button now follows the passage policy (it had escaped the v0.30.7 owner gate), and an owner-restricted door refuses walk-through before any choreography starts.
+- Enforcement is UI-level for the dev phase (like edit mode); cryptographically signed records are the planned D3 slice. Next up on #67: **D2 — the 🔌 Docking Adapter** item for transient guest ship berthing.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.30.9 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.30.8 — 2026-07-18
 
 ### 💬 QUICK CHAT
