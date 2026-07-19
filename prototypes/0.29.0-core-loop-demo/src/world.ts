@@ -360,6 +360,26 @@ export class World {
     // Floor-plan work: initial north-door state honors the (default) fireplace
     // position — and the local owner's move path re-runs this via reconcile.
     this.updateNorthDoorForFireplace();
+    this.updateSideWallCoverage();
+
+    // 🪟 The view outside (owner request): a distant planet + its glow hang
+    // off the room's open/left side — what you see through a window-wall's
+    // glass (or an opened wall) at ROOM level, without waiting for zoom 3.
+    {
+      const ambient = new THREE.Mesh(
+        new THREE.SphereGeometry(16, 32, 24),
+        new THREE.MeshStandardMaterial({ color: 0x2a5a8f, roughness: 0.9, metalness: 0.05, emissive: 0x0c2038, emissiveIntensity: 0.55 }),
+      );
+      ambient.name = 'ambientPlanet';
+      ambient.position.set(-70, -10, -28);
+      this.platformGroup.add(ambient);
+      const glow = new THREE.Mesh(
+        new THREE.SphereGeometry(16.8, 32, 24),
+        new THREE.MeshBasicMaterial({ color: 0x7fb8ff, transparent: true, opacity: 0.08, side: THREE.BackSide }),
+      );
+      glow.position.copy(ambient.position);
+      this.platformGroup.add(glow);
+    }
 
     // (orbital rings live on the Mars sphere — created in createStationPlanet)
   }
@@ -637,6 +657,31 @@ export class World {
    * NORTH DOOR toggle still force-enables regardless (walkthrough tool).
    * Called after every furniture reconcile and at platform build.
    */
+  /**
+   * 🧱🪟 Modular walls (owner request): when a brick-wall / window-wall
+   * furniture item sits ON a structural side wall's line (|x| > 5 — the
+   * built-in bricks live at ±6), that side's built-in wall HIDES — the
+   * placed sections become the wall, and a window section becomes a real
+   * view out (stars, the planet, docked-module projections through the
+   * glass). Remove the sections and the built-in wall returns. Same
+   * furniture-drives-structure pattern as the fireplace/north door.
+   */
+  public updateSideWallCoverage(): void {
+    this.sideWallCovered[0] = false;
+    this.sideWallCovered[1] = false;
+    for (const item of FURNITURE) {
+      if (item.kind !== 'brick-wall' && item.kind !== 'window-wall') continue;
+      if (item.pos.x < -5) this.sideWallCovered[0] = true;
+      if (item.pos.x > 5) this.sideWallCovered[1] = true;
+    }
+    // addSideWalls order: [0] = left (x=-6). The zoom machinery consults the
+    // flags too (it force-restores walls at interior levels otherwise).
+    this.sideWalls.forEach((wall, i) => { wall.visible = !this.sideWallCovered[i]; });
+  }
+
+  /** Which built-in side walls are REPLACED by placed wall sections. */
+  private sideWallCovered: boolean[] = [false, false];
+
   public updateNorthDoorForFireplace(): void {
     const north = findDoor('north');
     if (!north) return;
@@ -709,6 +754,7 @@ export class World {
     // owner's own move self-echoes with an empty diff (see module header), and
     // their north door must still unblock. Cheap (one AABB test).
     this.updateNorthDoorForFireplace();
+    this.updateSideWallCoverage(); // 🧱🪟 wall sections replace the built-in wall
 
     if (changedIds.size === 0) return;
 
@@ -1144,8 +1190,10 @@ export class World {
         mesh.visible = true;
       });
       if (this.platformFloor) this.platformFloor.visible = true;
-      this.sideWalls.forEach(wall => {
-        wall.visible = true;
+      // 🧱🪟 Placed wall sections REPLACE a built-in side wall — the interior
+      // restore must not resurrect a covered one.
+      this.sideWalls.forEach((wall, i) => {
+        wall.visible = !this.sideWallCovered[i];
       });
 
       // Completely clear and hide outer capsule roof and shielding so they don't block the camera!

@@ -54,7 +54,9 @@ export type FurnitureKind =
   | 'game-table'
   | 'fuel-tank'
   | 'engine-block'
-  | 'helm-console';
+  | 'helm-console'
+  | 'brick-wall'
+  | 'window-wall';
 
 export interface FurnitureItem {
   id: string;
@@ -1084,6 +1086,10 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   // the same capability; the helm/exterior count by tag). ──
   'fuel-tank': { kind: 'fuel-tank', build: buildFuelTank, footprint: { w: 2, d: 1 }, functions: ['fuelTank'] },
   'engine-block': { kind: 'engine-block', build: buildEngineBlock, footprint: { w: 1, d: 1 }, functions: ['engine'] },
+  // 🧱🪟 Modular wall sections (movable; placed on a side wall's line they
+  // replace the built-in brick — see world.updateSideWallCoverage).
+  'brick-wall': { kind: 'brick-wall', build: buildBrickWall, footprint: { w: 4, d: 1 } },
+  'window-wall': { kind: 'window-wall', build: buildWindowWall, footprint: { w: 4, d: 1 } },
   'helm-console': {
     kind: 'helm-console',
     build: buildHelmConsole,
@@ -1154,6 +1160,43 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
   place(new THREE.CylinderGeometry(0.025, 0.025, 0.2, 8), m(0xD4A84B, 0.45, 0.5), -0.45, 0.86, -0.05);
   place(new THREE.SphereGeometry(0.045, 10, 8), m(0xFF1744, 0.5, 0.3), -0.45, 0.97, -0.05);
   place(new THREE.BoxGeometry(0.16, 0.05, 0.22), m(0x37474F, 0.5, 0.5), 0.42, 0.78, -0.05);
+}
+
+// ── 🧱🪟 Modular wall sections (owner request) ────────────────────────────────
+// Placeable wall pieces: a solid brick section and a WINDOW section with real
+// glass. Placed along a structural side wall's line, they REPLACE it (world
+// hides the built-in brick wall for that side — see updateSideWallCoverage),
+// so a window section becomes a genuine view out: stars, the planet, and
+// the docked-module projections beyond the glass.
+
+function buildBrickWall({ m, place }: BuildCtx) {
+  // Brick slab + mortar grooves + coping cap (matches the built-in wall look).
+  place(new THREE.BoxGeometry(4, 3.4, 0.3), m(0x8A4A3A, 0.85, 0.05), 0, 1.7, 0);
+  for (const gy of [0.6, 1.25, 1.9, 2.55]) {
+    place(new THREE.BoxGeometry(3.96, 0.05, 0.32), m(0x1A2835, 0.9, 0.02), 0, gy, 0);
+  }
+  place(new THREE.BoxGeometry(4.06, 0.12, 0.36), m(0xB8C8D8, 0.75, 0.05), 0, 3.46, 0);
+}
+
+function buildWindowWall({ m, place }: BuildCtx) {
+  // Brick frame around a big glazed opening (1.0..2.6 high, 3.0 wide).
+  place(new THREE.BoxGeometry(4, 1.0, 0.3), m(0x8A4A3A, 0.85, 0.05), 0, 0.5, 0);      // sill course
+  place(new THREE.BoxGeometry(4, 0.8, 0.3), m(0x8A4A3A, 0.85, 0.05), 0, 3.0, 0);      // header course
+  for (const sx of [-1.75, 1.75]) {
+    place(new THREE.BoxGeometry(0.5, 1.6, 0.3), m(0x8A4A3A, 0.85, 0.05), sx, 1.8, 0); // jamb piers
+  }
+  place(new THREE.BoxGeometry(3.1, 0.1, 0.34), m(0x2A3444, 0.6, 0.4), 0, 1.02, 0);    // frame sill
+  place(new THREE.BoxGeometry(3.1, 0.1, 0.34), m(0x2A3444, 0.6, 0.4), 0, 2.58, 0);    // frame head
+  for (const sx of [-1.5, 0, 1.5]) {
+    place(new THREE.BoxGeometry(0.08, 1.56, 0.34), m(0x2A3444, 0.6, 0.4), sx, 1.8, 0); // mullions
+  }
+  // The glass: barely-there blue, transparent both sides — the view is the point.
+  const glass = place(new THREE.PlaneGeometry(3.0, 1.5), m(0x9BD4E8, 0.05, 0.1), 0, 1.8, 0);
+  const gm = glass.material as THREE.MeshStandardMaterial;
+  gm.transparent = true;
+  gm.opacity = 0.16;
+  gm.side = THREE.DoubleSide;
+  place(new THREE.BoxGeometry(4.06, 0.12, 0.36), m(0xB8C8D8, 0.75, 0.05), 0, 3.46, 0); // coping
 }
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────

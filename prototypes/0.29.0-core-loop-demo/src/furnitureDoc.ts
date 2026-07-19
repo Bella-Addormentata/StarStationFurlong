@@ -94,6 +94,9 @@ export function isFurnitureRecord(value: unknown): value is FurnitureRecord {
  *  the override frees them without touching stored data. */
 const MOVABLE_KIND_OVERRIDE: Partial<Record<FurnitureKind, boolean>> = {
   'fireplace-wall': true,
+  // Owner request (2026-07-18): the bar (stools ride along — they are part
+  // of the build) moves and stows like everything else now.
+  'bar-corner': true,
 };
 
 /** Snapshot the whole layout as id → validated record (malformed entries are
