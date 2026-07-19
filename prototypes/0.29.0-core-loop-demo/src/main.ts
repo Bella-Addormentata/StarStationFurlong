@@ -4354,6 +4354,42 @@ function onCanvasClick(event: MouseEvent): void {
     }
   }
 
+  // ── Vestibule clicks → the SAME door walk-through (owner request: small
+  //    doors are fiddly click targets; the tube outside them is huge). Both
+  //    the plain paired vestibule and assembled connector chains carry
+  //    isVestibule + doorId on their group (adapter.ts), so one pass covers
+  //    every connection style. Walk up from the hit mesh to the marked group.
+  //    Level 2 only: in first person the ray would pass through the wall and
+  //    hit the tube outside, turning wall clicks into surprise walkthroughs.
+  //    In-room clicks stay floor clicks: the tubes are translucent and a
+  //    near-side tube visually overlaps interior floor, so the pass only
+  //    claims clicks whose ground point lands OUTSIDE the wall footprint —
+  //    out where the tube actually lives (hull.WALL_LINE = 6).
+  if (multiScaleZoom && multiScaleZoom.getLevel() === 2) {
+    const groundT = -raycaster.ray.origin.y / raycaster.ray.direction.y;
+    const gx = raycaster.ray.origin.x + raycaster.ray.direction.x * groundT;
+    const gz = raycaster.ray.origin.z + raycaster.ray.direction.z * groundT;
+    const insideRoom = groundT > 0 && Math.abs(gx) <= 6 && Math.abs(gz) <= 6;
+    if (!insideRoom) {
+      const vestibuleGroups: THREE.Object3D[] = [];
+      scene.traverse((child) => {
+        if (child.userData && child.userData.isVestibule && child.userData.doorId) {
+          vestibuleGroups.push(child);
+        }
+      });
+      const vestibuleHits = raycaster.intersectObjects(vestibuleGroups, true);
+      if (vestibuleHits.length > 0) {
+        let node: THREE.Object3D | null = vestibuleHits[0].object;
+        while (node && !(node.userData && node.userData.isVestibule)) node = node.parent;
+        const doorId = node?.userData?.doorId as string | undefined;
+        if (doorId) {
+          world.requestDoorWalkthrough(doorId);
+          return; // Halt floor-click routing
+        }
+      }
+    }
+  }
+
   // ── Device clicks → walk-to + first-person focus (#33 D0; keypads and door
   //    bodies keep priority). v1: routed at zoom level 2 only (plan §D0.2 —
   //    the level-1 perspective raycast is deferred). #49 keeps this gate:

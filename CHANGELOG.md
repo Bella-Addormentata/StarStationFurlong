@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.29 — 2026-07-19
+
+### 🖱️🚪 Click the Tube, Take the Door
+
+- **Clicking a vestibule now walks you through its door** (owner report: the small doors are fiddly click targets when clicking the floor to traverse them). The bellows tube attached to a door — and a full assembled connector chain alike — is one big click target: click anywhere on it from the room view and the player runs the *same* door walk-through the door itself triggers, one-way rules and all.
+- **Floor clicks stay floor clicks.** The tubes are translucent and a near-side tube can visually overlap the room floor, so the new pass only claims clicks that land *outside* the walls — out where the tube actually lives. Verified live on the owner's real station: a tube click starts the walk-through, a mid-room floor click still walks to that exact spot, and in first person a click at a wall can't ray through it and door you by surprise (the pass is room-view only; first person keeps its free-look/point-and-click model untouched).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.29 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.28 — 2026-07-19
 
 ### 🔗 The Octagon Closes — Atlas Ring Fix (Field-Diagnosed by Visit)
