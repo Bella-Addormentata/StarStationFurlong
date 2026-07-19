@@ -192,8 +192,18 @@ export function atlasLayout(
     if (!entry) continue;
     for (const [doorId, door] of Object.entries(entry.doors) as Array<[DoorId, AtlasDoor]>) {
       if (!door || !door.targetRoomId || placed.has(door.targetRoomId)) continue;
+      // 🔗 farDoor inference (owner's octagon-render fix, 2026-07-19): a
+      // record written by a manual INITIATE (far-door dropdown left empty)
+      // carries NO farDoor — the pose then falls back to rotY = heading,
+      // which inverts that arm's curvature in a ring walk (observed live:
+      // seven 18.6 m hops and one 78 m chasm, the scattered-boxes render).
+      // But the FAR room's own record pointing back at us NAMES the door —
+      // infer it from the graph before composing the hop.
+      const farDoor = door.farDoor
+        ?? (Object.entries(atlas[door.targetRoomId]?.doors ?? {})
+          .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === fromId)?.[0] as DoorId | undefined);
       // The hop's pose in the FROM room's local frame → compose into world.
-      const local = poseForDoor(doorId, door.segments, door.farDoor);
+      const local = poseForDoor(doorId, door.segments, farDoor);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
