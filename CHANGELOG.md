@@ -11,6 +11,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.17 — 2026-07-19
+
+### 🚀 Exterior Wall Mounts — Engines on the Hull
+
+- **🚀 Exterior wall mounts** — furniture can hang on the OUTSIDE of the hull now (new mount placement mode: wall snapping, door-band guard, edit-mode carry); the engine module became a proper **5-bell main thrust array** out there — mount plate flat against the hull, flared nozzles pointing away from the room, orange feed lines and a warm idle glow in every throat.
+- Placement stays honest: exterior items snap to the outer wall lattice with a wall-derived orientation (no free rotation — a hint explains why), keep clear of every door's docking envelope, and never obstruct the interior. Edit-mode carry slides them along the walls; DEV spawn finds the nearest free hull spot.
+- This is the shared mechanism for what's ahead — solar panels and the manipulator arm just tag the same mount mode. Legacy engine records at interior positions self-heal when picked up in edit mode (the carry snaps them to a wall).
+- The helm's spaceworthiness checklist still counts these engines (capability tags unchanged).
+- Built and browser-verified by its session (hull mount + snap + door-band clearance + doc reconcile, test records cleaned up).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.17 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.16 — 2026-07-19
 
 ### 🧬 Clone Vat — Spawning Is Diegetic

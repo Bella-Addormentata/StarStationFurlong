@@ -44,9 +44,9 @@
 import * as THREE from 'three';
 import {
   FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos,
-  footprintAabb, itemAabb,
+  footprintAabb, itemAabb, snapExteriorPos, validateExteriorPlacement,
 } from './furniture';
-import type { FurnitureItem, FurnitureKind } from './furniture';
+import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
@@ -365,14 +365,52 @@ function spawnFurniture(kind: FurnitureKind): void {
     rot: 0,
     movable: true,
   };
-  const spot = findSpawnSpot(world, item);
+  // 🚀 Exterior-wall fittings mount on the hull, not the floor: search the
+  // four walls' outer lattices instead of the interior spot search.
+  const spot: { x: number; z: number; rot?: Rot } | null =
+    FURNITURE_DEFS[kind].mount === 'exterior-wall'
+      ? findExteriorSpot(world, item)
+      : findSpawnSpot(world, item);
   if (!spot) {
     showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (room is full).`);
     return;
   }
-  item.pos = spot;
+  item.pos = { x: spot.x, z: spot.z };
+  if (spot.rot !== undefined) item.rot = spot.rot;
   commitSpawn(world, item);
   showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — synced to the room (E4).`);
+}
+
+/**
+ * 🚀 Nearest free exterior mount pose: probe points just outside the four
+ * walls, snap each through snapExteriorPos, dedupe, sort by distance to the
+ * player, and return the first pose validateExteriorPlacement approves.
+ */
+function findExteriorSpot(
+  world: World,
+  item: FurnitureItem,
+): { x: number; z: number; rot?: Rot } | null {
+  const p = world.getPlayer().getPosition();
+  const seen = new Set<string>();
+  const candidates: Array<{ x: number; z: number; rot: Rot; d: number }> = [];
+  for (let t = -5.5; t <= 5.5; t += 0.5) {
+    for (const probe of [
+      { x: t, z: -7 }, { x: t, z: 7 }, { x: -7, z: t }, { x: 7, z: t },
+    ]) {
+      const s = snapExteriorPos(item.kind, probe.x, probe.z);
+      const key = `${s.x},${s.z},${s.rot}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ ...s, d: (s.x - p.x) ** 2 + (s.z - p.z) ** 2 });
+    }
+  }
+  candidates.sort((a, b) => a.d - b.d);
+  for (const c of candidates) {
+    if (validateExteriorPlacement(item, { x: c.x, z: c.z }, c.rot).ok) {
+      return c;
+    }
+  }
+  return null;
 }
 
 // ── INVENTORY: re-place furniture removed to the room inventory (#53) ────────
@@ -402,7 +440,11 @@ function placeFromInventory(index: number, kind: FurnitureKind): void {
     rot: 0,
     movable: true,
   };
-  const spot = findSpawnSpot(world, item);
+  // 🚀 Exterior-wall fittings re-mount on the hull (same routing as spawn).
+  const spot: { x: number; z: number; rot?: Rot } | null =
+    FURNITURE_DEFS[kind].mount === 'exterior-wall'
+      ? findExteriorSpot(world, item)
+      : findSpawnSpot(world, item);
   if (!spot) {
     showHint(`DEV: CAN'T PLACE ${kind} — no valid spot (room is full). Kept in inventory.`);
     return;
@@ -412,7 +454,8 @@ function placeFromInventory(index: number, kind: FurnitureKind): void {
     showHint('DEV: inventory changed underneath the panel — try again.');
     return;
   }
-  item.pos = spot;
+  item.pos = { x: spot.x, z: spot.z };
+  if (spot.rot !== undefined) item.rot = spot.rot;
   commitSpawn(world, item);
   showHint(`DEV: placed ${item.id} from room inventory at (${item.pos.x}, ${item.pos.z}).`);
 }

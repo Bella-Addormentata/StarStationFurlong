@@ -56,7 +56,7 @@
  */
 
 import * as THREE from 'three';
-import { FURNITURE, footprintAabb, itemAabb, snapItemPos } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos, snapExteriorPos, validateExteriorPlacement } from './furniture';
 import type { FurnitureItem, Rot, Box } from './furniture';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
@@ -142,6 +142,13 @@ export function validatePlacement(
   rot: Rot,
   ctx: PlacementContext,
 ): PlacementVerdict {
+  // 🚀 Exterior-wall fittings route to the hull rules: they live OUTSIDE the
+  // walkable square, so interior bounds / obstacle overlap / player clearance
+  // / connectivity are all moot — nothing walks on the hull.
+  if (FURNITURE_DEFS[item.kind].mount === 'exterior-wall') {
+    return validateExteriorPlacement(item, pos, rot);
+  }
+
   const box = footprintAabb(item.kind, pos, rot);
 
   // Decorative: bounds-only (position point inside the walkable square).
@@ -605,6 +612,19 @@ class RoomEditController {
     this.raycaster.setFromCamera(this.pointerNdc, camera);
     const hits = this.raycaster.intersectObject(plane, false);
     if (hits.length === 0) return;
+    // 🚀 Exterior-wall fittings snap to the nearest wall's OUTER mount line
+    // (drag near a wall inside the room; the piece rides the outside of that
+    // wall). The rot comes with the wall — bells always face away.
+    if (FURNITURE_DEFS[c.item.kind].mount === 'exterior-wall') {
+      const s = snapExteriorPos(c.item.kind, hits[0].point.x, hits[0].point.z);
+      if (s.x === c.candidatePos.x && s.z === c.candidatePos.z && s.rot === c.candidateRot) return;
+      c.candidatePos = { x: s.x, z: s.z };
+      c.candidateRot = s.rot;
+      c.group.position.set(s.x, 0, s.z);
+      c.group.rotation.y = s.rot * (Math.PI / 2);
+      this.revalidateCarry();
+      return;
+    }
     const snapped = snapItemPos(c.item.kind, c.candidateRot, hits[0].point.x, hits[0].point.z);
     if (snapped.x === c.candidatePos.x && snapped.z === c.candidatePos.z) return;
     c.candidatePos = snapped;
@@ -616,6 +636,11 @@ class RoomEditController {
   private rotateCarry(): void {
     const c = this.carrying;
     if (!c) return;
+    // 🚀 Exterior fittings can't rotate freely — the facing IS the wall's.
+    if (FURNITURE_DEFS[c.item.kind].mount === 'exterior-wall') {
+      showHint('EXTERIOR MOUNT — faces away from its wall automatically; drag to another wall instead.', 2600);
+      return;
+    }
     c.candidateRot = ((c.candidateRot + 1) % 4) as Rot;
     c.candidatePos = snapItemPos(c.item.kind, c.candidateRot, c.candidatePos.x, c.candidatePos.z);
     c.group.position.set(c.candidatePos.x, 0, c.candidatePos.z);
