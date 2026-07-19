@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.28 — 2026-07-19
+
+### 🔗 The Octagon Closes — Atlas Ring Fix (Field-Diagnosed by Visit)
+
+- **Fixed the scattered-boxes station render** (owner report, with screenshot): the atlas walk inverted one arm of the ring — seven perfect 18.6 m hops and one **78 m chasm**, measured live. Root cause: door records written by a **manual INITIATE with the far-door dropdown left empty carry no `farDoor`**, and the pose math then falls back to "rotation = heading", flipping that arm's curvature. (Records from the 🧲 CONNECT flow always name the far door — which is why half the ring composed fine.)
+- **The fix is reader-side and heals every existing station instantly**: when a record lacks `farDoor`, the atlas walk now **infers it from the far room's own record pointing back** — the graph already knows the answer. No stored data changes, no migration; every viewer of every station gets the closed ring on update.
+- **Diagnosed by actually visiting**: this session joined the owner's live station **across the internet** with their pass (local node → iroh dial, connected on the first attempt), received the whole station through the v0.32.20 shared atlas as a first-time visitor, measured the broken ring on the real records, applied the fix, and re-measured: hops 18.6×7 + 19.1, orientations stepping a clean 45° — the octagon renders closed from space.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.28 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.27 — 2026-07-19
 
 ### 🚪↦ One-Way Doors — Turnstiles for the Station
