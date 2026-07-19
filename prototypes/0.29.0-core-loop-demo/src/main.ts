@@ -4135,6 +4135,10 @@ function setupClickToEnter() {
   const maybeFade = () => {
     if (faded || !dwellDone || !exteriorReady) return;
     faded = true;
+    // 🎬 Pre-entry ends with the curtain: HUD elements gated on it (the
+    // SpacePhone tip) become eligible again — the exterior-active gate keeps
+    // them hidden until the player actually enters the room.
+    document.body.classList.remove('pre-entry');
     const welcome = document.getElementById('welcome');
     if (welcome) {
       welcome.style.transition = 'opacity 0.9s ease';
@@ -4156,7 +4160,10 @@ function setupClickToEnter() {
   // 🎬 Solid curtain (owner request): the title screen's frosted glass let
   // the room module show through while it assembled. Solidify the backdrop
   // (same hue, full opacity) the moment the auto-boot starts — NOTHING is
-  // visible until the fade reveals the station from space.
+  // visible until the fade reveals the station from space. body.pre-entry
+  // gates HUD elements (the SpacePhone tip) that must not float over the
+  // title; maybeFade removes it.
+  document.body.classList.add('pre-entry');
   const curtain = document.getElementById('welcome');
   if (curtain) curtain.style.background = 'rgb(2, 5, 16)';
 

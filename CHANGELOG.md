@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.23 — 2026-07-19
+
+### 🧹 HUD Declutter — Space View Breathes, the Tip Knows Its Place
+
+- **The "🛰️ EXTERIOR VIEW · click a bellows joint to bend it" bubble is gone** (owner request). The bar now appears only when it has something real to say: the owner's ☀️ ADD SOLAR PANEL button, or a transient click-to-connect message when you click a module from space (auto-clears after a few seconds).
+- **The "Press TAB to activate SpacePhone" tip waits for the room**: hidden through the title screen and the whole station space view, it appears only once you ENTER ROOM — and it now sits where it belongs, **perched just above the stowed phone at the bottom of the screen** instead of floating mid-air. (It remains a one-time hint: once you've opened the phone it never returns.)
+- Verified through all three boot phases live: hidden at title, hidden in the space view, visible in-room at the stowed-phone anchor (bottom 52px · right 40px); the exterior bar shows no bubble text and stays empty for non-owners.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.23 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.22 — 2026-07-19
 
 ### 🎬 Boot Polish — a Truly Solid Curtain
