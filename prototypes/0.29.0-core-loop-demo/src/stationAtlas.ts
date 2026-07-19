@@ -10,11 +10,25 @@
  * exterior then renders the WHOLE known station, and clicking a module from
  * space fills an open keypad's address box (the owner's close-the-ring flow).
  *
- * LOCAL, per-install (localStorage) — deliberately not shared truth: it is a
- * personal map of where you've been, not an authority record. The station
- * doc (durability plan) eventually replaces walk-to-learn with shared truth.
+ * LOCAL, per-install (localStorage) — a personal map of where you've been.
+ *
+ * 🛰️ SHARED station atlas (owner request 2026-07-19): the room doc ALSO
+ * carries an `atlas` map, two-way merged with the local store — every client
+ * writes what it knows UP and merges what the doc knows DOWN, so each room's
+ * doc converges toward the whole station's layout (the ventures-gossip
+ * pattern applied to topology). A visiting ship that joins ANY room of the
+ * station downloads the full map with the doc sync and renders the entire
+ * station from space BEFORE docking anywhere.
+ *
+ * CREDENTIAL RULE — layout is public, admission is not: gossip carries
+ * GEOMETRY AND NAMES ONLY. Seeds (passes) never travel between docs, with
+ * one exception: a doc's OWN-ROOM entry may carry its seed and door seeds —
+ * the same doc already exposes them via doorsDoc, so nothing new leaks —
+ * and the top-level seed rides only while the room's passage policy is
+ * public. Locally-earned seeds are never erased by seedless shared entries.
  */
 
+import * as Y from 'yjs';
 import type { DoorId } from './doors';
 import type { ConnectorSegment } from './adapter';
 
@@ -198,4 +212,157 @@ export function atlasLayout(
   }
   placed.delete(currentRoomId);
   return [...placed.values()];
+}
+
+// ── 🛰️ Shared station atlas — the `atlas` room-doc map (see module header) ───
+
+/** Doc-side entry (plain JSON, keyed by roomId, whole-value LWW). */
+interface SharedAtlasEntry {
+  roomId: string;
+  name: string;
+  doors: Partial<Record<DoorId, {
+    targetRoomId: string;
+    /** Present ONLY on a doc's own-room entry (doorsDoc exposes it anyway). */
+    targetSeed?: string;
+    segments?: ConnectorSegment[];
+    farDoor?: DoorId;
+    farYawDeg?: 0 | 45;
+  }>>;
+  /** Present ONLY on a doc's own-room entry while passage policy is public. */
+  seed?: string;
+  updatedAt: number;
+}
+
+let sharedDoc: Y.Doc | null = null;
+let sharedMap: Y.Map<unknown> | null = null;
+let sharedCtx: { roomId: string; isPassagePublic: () => boolean } | null = null;
+const sharedListeners = new Set<() => void>();
+
+function sharedAlive(): boolean {
+  return sharedDoc !== null
+    && (sharedDoc as { isDestroyed?: boolean }).isDestroyed !== true
+    && sharedMap !== null;
+}
+
+/** Shape guard — doc reads cross the peer trust boundary. */
+function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
+  if (typeof value !== 'object' || value === null) return false;
+  const e = value as Partial<SharedAtlasEntry>;
+  return typeof e.roomId === 'string' && e.roomId.length > 0
+    && typeof e.name === 'string'
+    && typeof e.doors === 'object' && e.doors !== null
+    && typeof e.updatedAt === 'number'
+    && (e.seed === undefined || typeof e.seed === 'string');
+}
+
+/**
+ * Bind (or re-bind) the shared atlas to a room doc — main.ts T0 seam, beside
+ * the games/furniture/casino bindings. Pulls immediately, pushes what this
+ * client already knows, and re-pulls on every doc change.
+ */
+export function bindStationAtlasDoc(
+  doc: Y.Doc,
+  ctx: { roomId: string; isPassagePublic: () => boolean },
+): void {
+  sharedDoc = doc;
+  sharedCtx = ctx;
+  sharedMap = doc.getMap('atlas');
+  sharedMap.observe(() => {
+    pullSharedAtlas();
+    // Copy + isolate (the furnitureDoc guard): renders must not kill the rest.
+    for (const listener of [...sharedListeners]) {
+      try {
+        listener();
+      } catch (err) {
+        console.error('[atlas] shared listener threw during doc notify:', err);
+      }
+    }
+  });
+  pullSharedAtlas();
+  pushAtlasToDoc();
+}
+
+/** Fires after every shared-atlas pull (main rebuilds an active exterior). */
+export function subscribeSharedAtlas(listener: () => void): () => void {
+  sharedListeners.add(listener);
+  return () => sharedListeners.delete(listener);
+}
+
+/** Doc → localStorage. Never erases a locally-earned seed. */
+function pullSharedAtlas(): void {
+  if (!sharedAlive()) return;
+  const atlas = readAtlas();
+  let changed = false;
+  for (const [rid, value] of sharedMap!.entries()) {
+    if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
+    const prior = atlas[rid];
+    if (prior
+      && prior.lastSeen >= value.updatedAt
+      && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
+    const doors: Partial<Record<DoorId, AtlasDoor>> = {};
+    for (const [d, door] of Object.entries(value.doors) as Array<[DoorId, NonNullable<SharedAtlasEntry['doors'][DoorId]>]>) {
+      if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
+      doors[d] = {
+        targetSeed: door.targetSeed ?? prior?.doors[d]?.targetSeed ?? '',
+        targetRoomId: door.targetRoomId,
+        segments: door.segments,
+        farDoor: door.farDoor,
+        farYawDeg: door.farYawDeg,
+      };
+    }
+    atlas[rid] = {
+      roomId: rid,
+      name: value.name || prior?.name || 'Module',
+      seed: value.seed ?? prior?.seed,
+      doors,
+      lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
+    };
+    changed = true;
+  }
+  if (changed) writeAtlas(atlas);
+}
+
+/**
+ * localStorage → doc (called after every harvest). Gossip carries geometry +
+ * names; SEEDS DO NOT TRAVEL — except the doc's own-room entry (see header).
+ * Content-compared (stamp excluded) so re-joins don't churn the doc.
+ */
+export function pushAtlasToDoc(): void {
+  if (!sharedAlive() || !sharedCtx) return;
+  const ctx = sharedCtx;
+  const atlas = readAtlas();
+  sharedDoc!.transact(() => {
+    for (const entry of Object.values(atlas)) {
+      const isOwn = entry.roomId === ctx.roomId;
+      const doorIds = Object.keys(entry.doors) as DoorId[];
+      if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
+      const existing = sharedMap!.get(entry.roomId);
+      const known = isSharedAtlasEntry(existing) ? existing : null;
+      if (known && !isOwn
+        && known.updatedAt >= entry.lastSeen
+        && Object.keys(known.doors).length >= doorIds.length) continue;
+      const doors: SharedAtlasEntry['doors'] = {};
+      for (const d of doorIds) {
+        const door = entry.doors[d];
+        if (!door || !door.targetRoomId) continue;
+        doors[d] = {
+          targetRoomId: door.targetRoomId,
+          segments: door.segments,
+          farDoor: door.farDoor,
+          farYawDeg: door.farYawDeg,
+          ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
+        };
+      }
+      const rec: SharedAtlasEntry = {
+        roomId: entry.roomId,
+        name: entry.name,
+        doors,
+        updatedAt: entry.lastSeen,
+      };
+      if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = entry.seed;
+      if (known
+        && JSON.stringify({ ...known, updatedAt: 0 }) === JSON.stringify({ ...rec, updatedAt: 0 })) continue;
+      sharedMap!.set(entry.roomId, rec);
+    }
+  });
 }
