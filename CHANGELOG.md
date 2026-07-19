@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.20 — 2026-07-19
+
+### 🗺️ The Station Shares Its Own Map + 🎬 A Real Opening Shot
+
+- **🗺️ Shared station atlas** (owner request): each room's doc now carries the station's layout, two-way merged with every visitor's personal atlas — so the map every regular has walked flows into the doc, and **a first-time visitor renders the ENTIRE station from space the moment their first join syncs**, before docking anywhere. One visit to any room shows the whole octagon.
+- **Layout is public, admission is not**: gossip carries geometry and names only — **passes never travel between rooms**. A room's own entry shares its pass only while a door's passage policy is public (its own doc exposes those doors anyway), and locally-earned passes are never erased by the shared map.
+- **🎬 The opening is cinematic now**: no Start press. The title holds while — underneath — the station assembles and the mesh sync begins; then it fades **straight into the station seen from space**, slowly rotating (one revolution ≈ 5 minutes, driven through the camera rig so the 45° view arrows still work and re-snap on entry), with ENTER ROOM as the first click. The old flash of the interior before the space view is gone. A click during the title skips the wait — but never outruns the space view.
+- Verified: full boot timeline captured (overlay holds until the exterior is live; interior never visible), drift exact through the rig (12.03°/10s, radius stable), and the atlas doc round-trip — own-room seed rides when public, other rooms' seeds stripped at both levels, graph intact, no-churn re-push, fresh visitor renders the whole station from the doc alone.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.20 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.19 — 2026-07-19
 
 ### 🛰️ EDIT HULL — the Outside Is a Click Away

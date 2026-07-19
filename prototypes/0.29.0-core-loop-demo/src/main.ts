@@ -28,7 +28,7 @@ import { chipDotsHtml } from './chipDisplay';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
-import { bindDoorPolicy, subscribeDoorPolicy } from './doorPolicy';
+import { bindDoorPolicy, subscribeDoorPolicy, readDoorPolicy } from './doorPolicy';
 import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
 import { bindFloorPlan, subscribeFloorPlan } from './floorPlanDoc';
 import {
@@ -42,8 +42,8 @@ import {
   writeVentureLink, refreshVentureLink, removeVentureLink, isOfficeHere,
 } from './ventures';
 import { deedsLedger, upsertDeed, removeDeed } from './deeds';
-import { refreshExteriorView, setExteriorOwnerCheck, setExteriorRoomId, showEnterRoomBubble } from './exteriorView';
-import { harvestIntoAtlas, readAtlas } from './stationAtlas';
+import { refreshExteriorView, setExteriorOwnerCheck, setExteriorRoomId, showEnterRoomBubble, isExteriorActive, tickExterior } from './exteriorView';
+import { harvestIntoAtlas, readAtlas, bindStationAtlasDoc, pushAtlasToDoc, subscribeSharedAtlas } from './stationAtlas';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -667,6 +667,17 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // table state. Rebinds per join like games/furniture (T0 seam).
   bindCasinoDoc(sync.doc);
 
+  // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
+  // with the local visitation atlas, so a first-time visitor renders the
+  // whole station from space immediately. Seeds don't travel (credential
+  // rule in stationAtlas.ts) — the own-room seed rides only while a door's
+  // passage policy is public.
+  bindStationAtlasDoc(sync.doc, {
+    roomId: boot.roomId,
+    isPassagePublic: () => (['north', 'south', 'east', 'west'] as const)
+      .some((d) => readDoorPolicy(d).passage === 'public'),
+  });
+
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
   // item id, drives world.reconcileFurniture on every change (incl. the initial
   // sync burst that gives a joiner the host's arrangement). Rebinds per join
@@ -767,6 +778,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
+    // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
+    // in live as the doc syncs (usually within the first second of joining).
+    subscribeSharedAtlas(() => refreshExteriorView());
     setExteriorOwnerCheck(() => {
       const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
       return isLocalPlayerRoomOwner(ownerVal);
@@ -1588,6 +1602,9 @@ function harvestStationAtlas(): void {
       farYawDeg: r.farYawDeg,
     }));
   harvestIntoAtlas({ roomId, name, seed, doors });
+  // 🛰️ Every harvest also publishes what we now know into the room doc's
+  // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
+  pushAtlasToDoc();
 }
 
 // ── 🏦 BANK app (#20, de-stubbed with #68) ───────────────────────────────────
@@ -4076,6 +4093,8 @@ async function init() {
   initCameraRig({
     getZoomLevel: () => (multiScaleZoom ? multiScaleZoom.getLevel() : 2),
     isCameraBusy: () => isDeviceFocusActive(),
+    // 🎬 The rig adds the slow station drift while the space view is up.
+    isExteriorDrifting: () => isExteriorActive(),
   });
 
   // DEV1: temporary Development menu (owner request, demo phase — will be
@@ -4095,47 +4114,64 @@ async function init() {
 }
 
 /**
- * One-click entry: expand the platform immediately (no camera zoom).
- * Subsequent clicks are routed to the navigation handler.
+ * 🎬 Auto-entry (owner request): no button press. The intro title holds the
+ * screen while — underneath it — the planet→lobby morph runs, networking
+ * comes up and the room doc (furniture, shared atlas, …) starts syncing from
+ * the mesh. The overlay fades ONLY once the EXTERIOR view is live, so the
+ * first thing ever seen is the station from space (never the old brief
+ * third-person interior flash), with the ENTER ROOM bubble as the first
+ * interaction. A click during the title skips the minimum dwell — but never
+ * outruns the exterior.
  */
 function setupClickToEnter() {
-  const handleEnterClick = () => {
-    if (hasEntered) return;
-    hasEntered = true;
+  const MIN_DWELL_MS = 2800; // long enough to read the title + let sync start
+  let dwellDone = false;
+  let exteriorReady = false;
+  let faded = false;
 
-    // Expand platform (planet → lobby morph) and bring networking up
-    world.startMorph();
-    // startMorph built the docking system synchronously — wire the adapter
-    // transit driver + PROVISION NEW MODULE minting onto it (T1 of #30).
-    wireAdapterTransit();
-    bootstrapNetworking();
-
-    // 🛰️ #65 boot flow: once the intro morph settles, open IN the exterior —
-    // the station from space with the planet below — and hang the ENTER ROOM
-    // bubble over the dome. Clicking it rides the normal zoom-in path (level
-    // 3 → 2), the same as pressing [+].
-    const bootExterior = () => {
-      if (world.isMorphActive()) { setTimeout(bootExterior, 200); return; }
-      multiScaleZoom?.bootIntoExterior();
-      showEnterRoomBubble(() => {
-        window.dispatchEvent(new KeyboardEvent('keydown', { key: '+' }));
-      });
-    };
-    setTimeout(bootExterior, 400); // let startMorph flip isMorphing first
-
-    // Hide welcome overlay
+  const maybeFade = () => {
+    if (faded || !dwellDone || !exteriorReady) return;
+    faded = true;
     const welcome = document.getElementById('welcome');
     if (welcome) {
+      welcome.style.transition = 'opacity 0.9s ease';
       welcome.style.opacity = '0';
-      setTimeout(() => { welcome.style.display = 'none'; }, 500);
+      setTimeout(() => { welcome.style.display = 'none'; }, 950);
     }
-
-    window.removeEventListener('click', handleEnterClick);
-    // Now register the point-and-click navigation handler
+    // Point-and-click navigation arms only once the world is actually
+    // visible — intro clicks can never raycast through the curtain.
     window.addEventListener('click', onCanvasClick);
   };
 
-  window.addEventListener('click', handleEnterClick);
+  setTimeout(() => { dwellDone = true; maybeFade(); }, MIN_DWELL_MS);
+  const skipDwell = () => { dwellDone = true; maybeFade(); };
+  window.addEventListener('click', skipDwell, { once: true });
+
+  if (hasEntered) return;
+  hasEntered = true;
+
+  // Expand platform (planet → lobby morph) and bring networking up — all
+  // behind the title curtain.
+  world.startMorph();
+  // startMorph built the docking system synchronously — wire the adapter
+  // transit driver + PROVISION NEW MODULE minting onto it (T1 of #30).
+  wireAdapterTransit();
+  bootstrapNetworking();
+
+  // 🛰️ #65 boot flow: once the intro morph settles, open IN the exterior —
+  // the station from space with the planet below — and hang the ENTER ROOM
+  // bubble over the dome. Clicking it rides the normal zoom-in path (level
+  // 3 → 2), the same as pressing [+].
+  const bootExterior = () => {
+    if (world.isMorphActive()) { setTimeout(bootExterior, 200); return; }
+    multiScaleZoom?.bootIntoExterior();
+    showEnterRoomBubble(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '+' }));
+    });
+    exteriorReady = true;
+    maybeFade();
+  };
+  setTimeout(bootExterior, 400); // let startMorph flip isMorphing first
 }
 
 function onCanvasClick(event: MouseEvent): void {
@@ -4284,6 +4320,10 @@ function animate() {
   // bound-width, snaps interpolations, and (before the voxelCharacter clamp)
   // exploded the rig's lerp extrapolation. 100 ms ≈ a 10 fps floor.
   const deltaTime = Math.min((currentTime - lastTime) / 1000, 0.1);
+
+  // 🛰️ Slow station rotation while the space view is up (owner request —
+  // a lively drift; the camera orbits, the ENTER bubble tracks).
+  if (isExteriorActive()) tickExterior(deltaTime);
   lastTime = currentTime;
   
   // Update FPS counter

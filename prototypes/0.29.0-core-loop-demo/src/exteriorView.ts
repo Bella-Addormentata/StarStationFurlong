@@ -528,6 +528,18 @@ export function refreshExteriorView(): void {
 }
 
 /** zoom.ts calls this on level transitions (true entering 3, false leaving). */
+// ── 🎬 Slow station drift (owner request): the CAMERA RIG owns the actual
+// yaw (cameraRig.ts EXT_DRIFT_RATE, fed by main's isExteriorDrifting probe —
+// the rig re-poses the ortho camera every frame, so it must be the single
+// author). This tick only keeps the projected ENTER ROOM bubble tracking
+// the drifting view.
+
+/** Driven from main.ts's animate loop while the exterior is active. */
+export function tickExterior(_dt: number): void {
+  if (!active) return;
+  bubbleReposition?.();
+}
+
 export function setExteriorActive(on: boolean): void {
   if (on === active) return;
   active = on;

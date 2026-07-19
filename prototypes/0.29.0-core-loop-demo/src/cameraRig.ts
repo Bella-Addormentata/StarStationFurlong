@@ -71,7 +71,17 @@ interface RigGuards {
   getZoomLevel: () => number;
   /** True while another controller owns the camera (device focus, #33). */
   isCameraBusy: () => boolean;
+  /** 🎬 True while the space view drifts (exteriorView active) — the rig adds
+   *  a stately continuous yaw so the station slowly rotates on screen.
+   *  Injected like the other probes to stay import-cycle-free. */
+  isExteriorDrifting?: () => boolean;
 }
+
+/** 🎬 Exterior drift rate (rad/s) — one revolution ≈ 5 minutes. */
+const EXT_DRIFT_RATE = 0.021;
+
+/** Falling-edge tracker for the drift → detent re-snap. */
+let wasDrifting = false;
 
 let guards: RigGuards | null = null;
 
@@ -133,7 +143,13 @@ function rotateStep(dir: 1 | -1): void {
     return;
   }
   stepIndex += dir;
-  targetYaw = stepIndex * STEP_RAD;
+  // 🎬 While the space view drifts, targetYaw has left the detent grid —
+  // step RELATIVE to the drifting frame (never snap back to the grid).
+  if (guards?.isExteriorDrifting?.()) {
+    targetYaw += dir * STEP_RAD;
+  } else {
+    targetYaw = stepIndex * STEP_RAD;
+  }
   refreshAngleChip();
 }
 
@@ -152,6 +168,21 @@ function refreshAngleChip(): void {
  * arrows' enabled/disabled styling in sync with availability.
  */
 export function updateCameraRig(deltaTime: number): void {
+  // 🎬 Space-view drift: a slow continuous yaw UNDER the detent machinery —
+  // both yaws advance together so the user's 45° arrow steps still tween
+  // relative to the drifting frame. Leaving the space view re-snaps the rig
+  // to the nearest detent (the tween carries it there smoothly).
+  const drifting = guards?.isExteriorDrifting?.() ?? false;
+  if (drifting) {
+    const drift = EXT_DRIFT_RATE * Math.max(0, deltaTime);
+    currentYaw += drift;
+    targetYaw += drift;
+  } else if (wasDrifting) {
+    stepIndex = Math.round(targetYaw / STEP_RAD);
+    targetYaw = stepIndex * STEP_RAD;
+  }
+  wasDrifting = drifting;
+
   // Tween — exponential approach with a hard snap at the end.
   const remaining = targetYaw - currentYaw;
   if (Math.abs(remaining) > SNAP_EPS) {
