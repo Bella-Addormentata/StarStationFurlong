@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.24 — 2026-07-19
+
+### 🎬 First-Paint Polish — No Flash, No False Prompt
+
+- **"👆 Click to Enter" is gone from the title screen** (owner request) — it stopped being true when the boot became automatic; a click merely skips the title dwell, and the screen no longer claims otherwise.
+- **The title curtain is opaque from the very first paint.** The v0.32.22 solidifier ran from JS a few seconds after load, leaving a window where the frosted default leaked the assembling room — and the phone tip (which sits above the curtain) flashed briefly. Both gates moved into the stylesheet: the curtain ships opaque (blur removed), and **the SpacePhone tip is hidden by default**, revealed only by the first descent into the room and re-hidden whenever you return to space.
+- Verified at first paint (hint hidden, curtain `rgb(2,5,16)` no-blur, tip hidden before any script ran) and through the full loop: space → hidden, first ENTER ROOM → visible on the stowed phone, zoom back to space → hidden again.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.24 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.23 — 2026-07-19
 
 ### 🧹 HUD Declutter — Space View Breathes, the Tip Knows Its Place
