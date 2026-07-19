@@ -24,6 +24,7 @@ import {
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindCasinoDoc, readChips } from './casinoDoc';
+import { chipDotsHtml } from './chipDisplay';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
@@ -1634,15 +1635,14 @@ function renderBankApp(): void {
     ${header('PORTFOLIO')}
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
     ${(() => {
-      // 🎰 #69: chips are PER-CASINO records — the BANK shows the chips you
-      // hold in the room you are standing in (the cashier is the full ledger).
+      // 🎰 #69: chips are PER-CASINO records — and PHYSICAL (owner rule):
+      // the BANK shows the chips themselves, never a total. Count them, or
+      // walk to the room's CASHIER for the number.
       const chips = readChips(getPlayerId());
       return chips > 0 ? `${header('CHIPS')}
-        <div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
-          <span>🎰 This room's casino</span>
-          <span style="color:#f0c060;">🪙 ${chips} chips</span>
-        </div>
-        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Chips stay with their casino — cash out at its CASHIER.</div>` : '';
+        <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
+        <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
+        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>` : '';
     })()}
     ${header('PROPERTY')}
     ${deedsLedger().length
