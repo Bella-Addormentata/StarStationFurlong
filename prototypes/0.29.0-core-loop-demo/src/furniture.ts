@@ -70,7 +70,7 @@ export interface FurnitureItem {
   kind: FurnitureKind;
   pos: { x: number; z: number };
   rot: Rot;
-  /** false: fixed room structure (fireplace wall, bar corner) — v1 */
+  /** false: fixed room structure (wall computer — the edit-mode entry point). */
   movable: boolean;
   /**
    * E1 parity escape hatch: when present, this exact box is used as the
@@ -377,7 +377,7 @@ const buildCherryTree = ({ m, place }: BuildCtx) => {
 // Small cherry blossom accent (sits at lamp-table top height).
 const buildBlossomPot = (ctx: BuildCtx) => roundPlant(ctx, 0, 0.56, 0);
 
-// Bar corner (right-front, hugging x=+6 wall) — composite, movable: false.
+// Bar corner (right-front, hugging x=+6 wall) — composite, moves as ONE unit.
 const buildBarCorner = (ctx: BuildCtx) => {
   const { m, place, addLight } = ctx;
   // Item origin = original bar body centre (BAR_X=5.24, BAR_Z=3.10).
@@ -1064,9 +1064,12 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   'armchair-right':     { kind: 'armchair-right',     build: buildArmchair(1),       footprint: { w: 1, d: 1 }, seats: armchairRightSeats },
   'coffee-table-back':  { kind: 'coffee-table-back',  build: buildCoffeeTableBack,   footprint: { w: 2, d: 1 } },
   'coffee-table-front': { kind: 'coffee-table-front', build: buildCoffeeTableFront,  footprint: { w: 2, d: 1 } },
-  // Bar footprint is expressed per-item (footprintOverride) — the original
-  // obstacle box covers the stool strip, not the cabinet body.
-  'bar-corner':         { kind: 'bar-corner',         build: buildBarCorner,         footprint: null },
+  // The DEFAULT bar keeps its hand-authored footprintOverride (the stool
+  // strip); once MOVED the override sheds and this real footprint takes over
+  // (2×3 covers counter + stools) so the bar still blocks walking. Wall-flush
+  // re-placement is out of interior bounds — like the fireplace, sliding it
+  // off the wall is one-way toward the room.
+  'bar-corner':         { kind: 'bar-corner',         build: buildBarCorner,         footprint: { w: 2, d: 3 } },
   'lamp-table':         { kind: 'lamp-table',         build: buildLampTable,         footprint: { w: 1, d: 1 } },
   'rug-back':           { kind: 'rug-back',           build: buildRugBack,           footprint: null },
   'rug-front':          { kind: 'rug-front',          build: buildRugFront,          footprint: null },
@@ -1196,13 +1199,21 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     },
   },
   // 🧬 Clone vat — the diegetic spawn point (owner request). 1×1 obstacle,
-  // no seats, no device: the tank is walked OUT of, never into — the spawn
-  // choreography (World.respawnAtVat) owns all interaction.
+  // no seats. The DEVICE panel is the spawn-point picker ("wake up here");
+  // the decant choreography itself stays with World.respawnAtVat. Front is
+  // the door face (+z at rot 0 — the walk-out side).
   'clone-vat': {
     kind: 'clone-vat',
     build: buildCloneVat,
     footprint: { w: 1, d: 1 },
     functions: ['cloneVat'],
+    device: {
+      kind: 'cloneVat',
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.6, z: 0.95 },
+      anchor: { x: 0, y: 1.2, z: 0 },
+    },
   },
   // 🛏️ Bunk bed — two lie-down berths (SeatTemplates with sitY + lie), no
   // device. Footprint 2×1 = a real obstacle; builder + templates live below
@@ -1833,7 +1844,11 @@ export const FURNITURE: FurnitureItem[] = [
   { id: 'coffee-table-back',     kind: 'coffee-table-back',  pos: { x:  0.0,  z: -3.5 }, rot: 0, movable: true },
   { id: 'coffee-table-front',    kind: 'coffee-table-front', pos: { x:  0.0,  z:  1.5 }, rot: 0, movable: true },
   // Bar obstacle covers the 1x2-tile stool strip (parity with original list).
-  { id: 'bar-corner',            kind: 'bar-corner',         pos: { x:  5.24, z:  3.10 }, rot: 0, movable: false,
+  // movable:true completes the v0.32.11 "movable bar" migration — the
+  // MOVABLE_KIND_OVERRIDE (furnitureDoc.ts) only reaches doc READS; edit
+  // mode's raycast index consults THIS registry default (stools/bottles/
+  // shelves ride along — they are sub-meshes of the one composite build).
+  { id: 'bar-corner',            kind: 'bar-corner',         pos: { x:  5.24, z:  3.10 }, rot: 0, movable: true,
     footprintOverride: { x0: 4.00, z0: 3.00, x1: 5.00, z1: 5.00 } },
   { id: 'lamp-table-back-left',  kind: 'lamp-table',         pos: { x: -4.5,  z: -4.5 }, rot: 0, movable: true },
   { id: 'lamp-table-back-right', kind: 'lamp-table',         pos: { x:  4.5,  z: -4.5 }, rot: 0, movable: true },
@@ -1911,6 +1926,25 @@ export const FURNITURE: FurnitureItem[] = [
   // Parity: w=1/d=1 both odd → centre at n+0.5 on both axes ✓.
   { id: 'clone-vat',             kind: 'clone-vat',          pos: { x: -3.5,  z: -4.5 }, rot: 0, movable: true },
 ];
+
+/**
+ * Module-load snapshot of the hand-authored footprintOverrides above, keyed
+ * by item id with the default pose they belong to. FurnitureRecords cannot
+ * carry overrides, so a doc round-trip (cross-room travel: reconcile removes
+ * then re-adds default items) would silently swap an authored obstacle for
+ * the kind's derived footprint — clients' walkable grids would then differ
+ * by visit history. reconcileFurniture consults this table to restore the
+ * authored box whenever an item sits at its exact default pose. Captured
+ * here, before anything mutates FURNITURE.
+ */
+export const DEFAULT_FOOTPRINT_OVERRIDES: Record<string, { box: Box; x: number; z: number; rot: Rot }> = {};
+for (const item of FURNITURE) {
+  if (item.footprintOverride) {
+    DEFAULT_FOOTPRINT_OVERRIDES[item.id] = {
+      box: { ...item.footprintOverride }, x: item.pos.x, z: item.pos.z, rot: item.rot,
+    };
+  }
+}
 // ── TR2 dev-assert: trunk placement must be clear of every other obstacle ────
 // Dev-only (plan §TR1 "dev-assert against OBSTACLES at build"). Scoped to the
 // trunk rather than a global pairwise check because two PRESERVED legacy boxes

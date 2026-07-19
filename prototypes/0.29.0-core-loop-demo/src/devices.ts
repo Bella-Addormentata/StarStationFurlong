@@ -69,7 +69,7 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'cloneVat';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -1596,6 +1596,83 @@ export function createHelmUI(): DeviceUI {
     },
 
     update(): void { /* status is observer-driven; nothing per-frame */ },
+  };
+}
+
+// ── 🧬 Clone-vat panel — pick where your clone decants (owner request) ───────
+
+export interface CloneVatUIDeps {
+  /** Is THIS vat my saved spawn point in this room? */
+  isMySpawn: () => boolean;
+  /** Would this vat decant me anyway (it's the room's effective spawn vat)? */
+  isEffectiveSpawn: () => boolean;
+  /** Save / clear this vat as my spawn point. */
+  setMySpawn: (on: boolean) => void;
+}
+
+/**
+ * The clone vat's focused panel: one clear choice — make this tank the place
+ * YOUR clone wakes up in this module. Local preference (each visitor picks
+ * their own tank); arrivals with no pick decant from the room's first vat.
+ */
+export function createCloneVatUI(deps: CloneVatUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+
+  const render = (): void => {
+    if (!panel) return;
+    const mine = deps.isMySpawn();
+    const effective = deps.isEffectiveSpawn();
+    const status = mine
+      ? '⭐ This is <b>your tank</b> — your clone wakes up here.'
+      : effective
+        ? 'This is the module\'s <b>first tank</b> — clones with no saved pick (you included) wake up here.'
+        : 'Your clone currently wakes up elsewhere in this module.';
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🧬 CLONE VAT</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:11px; line-height:1.6; margin-top:10px;">${status}</div>
+      <div style="margin-top:12px;">
+        <button type="button" id="vat-spawn-toggle" style="display:inline-block; padding:6px 12px; border-radius:8px; font-size:11px; font-weight:700; cursor:pointer; ${mine
+          ? 'background:rgba(255,23,68,0.10); border:1px solid rgba(255,23,68,0.35); color:#ff8a80;'
+          : 'background:rgba(0,230,118,0.10); border:1px solid rgba(0,230,118,0.35); color:#69f0ae;'}">
+          ${mine ? '✗ FORGET THIS TANK' : '⭐ WAKE UP HERE'}
+        </button>
+      </div>
+      <div style="font-size:10px; color:rgba(212,168,75,0.65); line-height:1.6; margin-top:10px;">
+        Your pick is saved on this device, per module.${mine || effective
+          ? ' Visitors arriving with a room pass decant from a tank too — this is where new clones step out.'
+          : ''}
+      </div>`;
+    panel.querySelector('#vat-spawn-toggle')?.addEventListener('click', () => {
+      deps.setMySpawn(!deps.isMySpawn());
+      render();
+    });
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-clone-vat-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 320px; max-height: 88vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column;
+        color: #d4a84b; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      render();
+    },
+    unmount(): void {
+      panel?.remove();
+      panel = null;
+    },
+    update(): void { /* nothing per-frame */ },
   };
 }
 
