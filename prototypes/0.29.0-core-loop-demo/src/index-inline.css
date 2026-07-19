@@ -235,7 +235,10 @@
       /* Phone Tip Indicator bubble styling */
       #phone-tip-indicator {
         position: absolute;
-        bottom: 505px;
+        /* Owner request: sit just above the STOWED phone's visible sliver
+           (container bottom -460px of a 500px body ⇒ ~40px peeks) instead of
+           floating mid-screen. */
+        bottom: 52px;
         right: 40px;
         background: #1e88e5;
         color: #fff;
@@ -249,6 +252,13 @@
         pointer-events: auto;
         animation: tipPulse 2s infinite ease-in-out;
         border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+      /* Owner request: the SpacePhone tip only exists INSIDE the room —
+         hidden through the title curtain (body.pre-entry, set by the boot)
+         and the station space view (body.exterior-active). */
+      body.pre-entry #phone-tip-indicator,
+      body.exterior-active #phone-tip-indicator {
+        display: none;
       }
       #phone-tip-indicator::after {
         content: '';

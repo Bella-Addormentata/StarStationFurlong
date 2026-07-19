@@ -343,16 +343,35 @@ function renderToolbar(): void {
   const t = ensureToolbar();
   const owner = ownerCheck();
   const free = nextFreeExteriorSlot();
+  // Owner request: the "🛰️ EXTERIOR VIEW · click a bellows joint…" bubble is
+  // GONE. The bar only appears when it holds something real — the owner's
+  // solar button, or a transient click-to-connect message (showToolbarHint).
   t.innerHTML = `
-    <span id="exterior-toolbar-title">🛰️ EXTERIOR VIEW</span>
-    <span id="exterior-toolbar-hint">click a bellows joint to bend it${owner ? ' · click a panel to dismount' : ''}</span>
+    <span id="exterior-toolbar-hint"></span>
     ${owner ? `<button type="button" id="exterior-add-solar" ${free === null ? 'disabled' : ''}>☀️ ADD SOLAR PANEL${free === null ? ' (FULL)' : ''}</button>` : ''}
   `;
   t.querySelector('#exterior-add-solar')?.addEventListener('click', () => {
     const slot = nextFreeExteriorSlot();
     if (slot !== null) writeExteriorSlot(slot, { kind: 'solar' });
   });
+  t.style.display = owner ? 'flex' : 'none';
+}
+
+/** Transient toolbar message (click-to-connect feedback) — shows the bar for
+ *  a few seconds even for non-owners, then clears back to hidden/quiet. */
+let toolbarHintTimer: number | null = null;
+function showToolbarHint(msg: string): void {
+  const t = ensureToolbar();
+  const hint = document.getElementById('exterior-toolbar-hint');
+  if (!hint) return;
+  hint.textContent = msg;
   t.style.display = 'flex';
+  if (toolbarHintTimer !== null) window.clearTimeout(toolbarHintTimer);
+  toolbarHintTimer = window.setTimeout(() => {
+    toolbarHintTimer = null;
+    hint.textContent = '';
+    if (!ownerCheck()) t.style.display = 'none';
+  }, 5000);
 }
 
 function closeEditor(): void {
@@ -434,16 +453,15 @@ function onClickCapture(e: MouseEvent): void {
       const label = node.userData.label as string;
       const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
       const paneOpen = (document.getElementById('docking-control-pane')?.style.display ?? 'none') !== 'none';
-      const hint = document.getElementById('exterior-toolbar-hint');
       if (paneOpen && addrInput && seed) {
         addrInput.value = seed;
         addrInput.style.borderColor = 'rgba(0,230,118,0.7)';
         setTimeout(() => { addrInput.style.borderColor = ''; }, 1600);
-        if (hint) hint.textContent = `${label} → address filled — zoom in and INITIATE`;
-      } else if (hint) {
-        hint.textContent = seed
+        showToolbarHint(`${label} → address filled — zoom in and INITIATE`);
+      } else {
+        showToolbarHint(seed
           ? `${label}: open a door keypad first, then click me to fill its address`
-          : `${label}: no address known yet — visit it once`;
+          : `${label}: no address known yet — visit it once`);
       }
       return;
     }
