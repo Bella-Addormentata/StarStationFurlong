@@ -495,6 +495,9 @@ export class MultiScaleZoomView {
   /** Last level the indicator toasted for — updateViewContext runs EVERY FRAME
    *  in first person, so the toast must fire on actual level CHANGES only. */
   private lastIndicatorLevel = 2; // matches the boot default → no toast at boot
+  /** 🧹 Toast mute until the first MANUAL zoom away from the room (owner
+   *  request: no text boxes during the boot sequence). */
+  private indicatorUnlocked = false;
   private indicatorHideTimer: number | null = null;
 
   private updateViewContext() {
@@ -504,8 +507,18 @@ export class MultiScaleZoomView {
     // change, show the pill for a moment (it carries the controls hint, which
     // matters most entering first person), then fade back to a clean screen.
     if (def.level !== this.lastIndicatorLevel) {
+      // 🧹 Boot silence (owner request): the toast stays MUTED until the
+      // player, already in the room, manually zooms away from it (2→1 first
+      // person or 2→3 space). The boot's automatic 2→3 flip and the first
+      // ENTER ROOM descent (3→2) show nothing — the level tracker still
+      // updates silently so the eventual unlock toasts the right change.
+      if (!this.indicatorUnlocked
+        && this.lastIndicatorLevel === 2
+        && document.body.classList.contains('in-room')) {
+        this.indicatorUnlocked = true;
+      }
       this.lastIndicatorLevel = def.level;
-      const ind = document.getElementById('zoom-hud-indicator');
+      const ind = this.indicatorUnlocked ? document.getElementById('zoom-hud-indicator') : null;
       if (ind) {
         ind.innerHTML = `
           <span style="color:#00d4ff;">LEVEL ${def.level}: ${def.name}</span>

@@ -256,6 +256,13 @@
         animation: tipPulse 2s infinite ease-in-out;
         border: 1px solid rgba(255, 255, 255, 0.2);
       }
+      /* 🧹 Owner request: the view-rotation arrows + degree chip stay hidden
+         until the player has entered the room once (same body.in-room marker
+         as the phone tip) — the boot's space view shows only ENTER ROOM.
+         !important: the rig sets an inline display:flex on the wrapper. */
+      body:not(.in-room) #camera-rotate-hud {
+        display: none !important;
+      }
       /* Owner request: the SpacePhone tip only exists INSIDE the room.
          Shown by body.in-room (first descent from the space view); the
          pre-entry / exterior-active hides below OUTRANK it by order, so

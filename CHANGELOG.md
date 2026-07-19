@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.25 — 2026-07-19
+
+### 🤫 Silent Boot — No Toasts, No Buttons Until You're Home
+
+- **The "LEVEL 3" toast no longer pops after the title fades** (owner request). The zoom indicator stays muted through the entire boot — the automatic flip to space AND the first ENTER ROOM descent — and unlocks only when you, already in the room, **manually zoom away** (out to space or into first person, where its controls hint matters). From then on it behaves as before.
+- **The view-rotation arrows and degree chip wait for the room too**: hidden until your first ENTER ROOM (the same in-room marker as the phone tip), so the boot's space view shows exactly one thing — the ENTER ROOM bubble.
+- Verified live: zero toast sightings sampled across the whole boot and descent; the toast fires (with the right text) only after a manual zoom-out from the room; the rotation HUD hides/shows strictly by the in-room marker.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.25 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.24 — 2026-07-19
 
 ### 🎬 First-Paint Polish — No Flash, No False Prompt
