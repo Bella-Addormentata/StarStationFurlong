@@ -194,6 +194,19 @@ export class Player {
   /** Phase timer (TURN dwell — reuses TURN_TIME). */
   private deviceTimer = 0;
 
+  // ── 🧬 Clone-vat spawn state (owner request — diegetic spawn point) ────────
+  /** HOLD = frozen inside the tube; WALK_OUT = scripted straight exit walk. */
+  private vatPhase: 'NONE' | 'HOLD' | 'WALK_OUT' = 'NONE';
+  private vatExit: { x: number; z: number } | null = null;
+  private vatFacing = 0;
+  private vatDone: (() => void) | null = null;
+  /** Seconds spent in HOLD — watchdog releases a stranded clone (a vat
+   *  animation that never calls walkOutOfVat must not soft-lock input). */
+  private vatHoldTimer = 0;
+  private readonly VAT_HOLD_TIMEOUT = 15;
+  /** Deliberate first steps — slower than SPEED so the reveal reads. */
+  private readonly VAT_WALK_SPEED = 1.6;
+
   // ── FINE stuck watchdog (E3 review F2) ─────────────────────────────────────
   /** Seconds without positional progress while in a FINE phase. */
   private fineStuckTimer = 0;
@@ -552,6 +565,19 @@ export class Player {
   update(deltaTime: number, inputManager: InputManager): void {
     const dir = inputManager.getMoveDirection();
     const manualInput = dir.x !== 0 || dir.z !== 0;
+
+    // ── 🧬 Clone-vat spawn choreography: fully scripted (HOLD inside the
+    //    tube while it drains/opens, then the straight walk-out). Input is
+    //    swallowed like the adapter transit; control returns to MANUAL when
+    //    the walk-out completes (or the HOLD watchdog releases it).
+    if (this.vatPhase !== 'NONE') {
+      this._updateVatPhase(deltaTime);
+      this.character.update();
+      const vpos = this.mesh.position;
+      updateDebugHUD('position', `${vpos.x.toFixed(1)}, ${vpos.z.toFixed(1)}`);
+      updateDebugHUD('navmode', `VAT:${this.vatPhase}`);
+      return;
+    }
 
     // ── WASD always overrides navigation & sitting ──────────────────────────
     // (Outside the room — THROUGH/PEEK/RETURN — it triggers/awaits the
@@ -1528,6 +1554,90 @@ export class Player {
     this.logicalAngle = 0; // default spawn facing (constructor pose)
     this.character.setState('idle', this.logicalAngle);
     this.navMode = 'MANUAL';
+  }
+
+  // ── 🧬 Clone-vat spawn choreography ─────────────────────────────────────────
+
+  /**
+   * Place the avatar inside the vat tube, frozen and facing the door.
+   * Reuses beamTo's full teardown (any sit/door/device/path state dies), then
+   * enters the scripted HOLD — update() swallows all input until the walk-out
+   * completes. World sequences the vat animation and calls walkOutOfVat when
+   * the doorway is clear.
+   */
+  public beginVatSpawn(inside: { x: number; z: number }, faceAngle: number): void {
+    this.beamTo(inside.x, inside.z);
+    this.vatPhase = 'HOLD';
+    this.vatExit = null;
+    this.vatDone = null;
+    this.vatHoldTimer = 0;
+    this.vatFacing = faceAngle;
+    this.logicalAngle = faceAngle;
+    this.character.setState('idle', faceAngle);
+  }
+
+  /**
+   * Release the HOLD and walk straight out to the exit point (collision OFF —
+   * the vat's own footprint is an obstacle, exactly like the seat slides).
+   * onDone fires once on arrival; control returns to MANUAL.
+   */
+  public walkOutOfVat(exit: { x: number; z: number }, onDone?: () => void): void {
+    if (this.vatPhase === 'NONE') return; // aborted meanwhile — stay released
+    this.vatPhase = 'WALK_OUT';
+    this.vatExit = exit;
+    this.vatDone = onDone ?? null;
+  }
+
+  /** True while the spawn choreography owns the avatar (HOLD or WALK_OUT). */
+  public isVatSpawning(): boolean {
+    return this.vatPhase !== 'NONE';
+  }
+
+  /**
+   * Instantly release the choreography at the current position (vat removed
+   * mid-cycle, room teardown). The pending onDone is dropped — the cycle is
+   * over, nothing should resume.
+   */
+  public abortVatSpawn(): void {
+    this.vatPhase = 'NONE';
+    this.vatExit = null;
+    this.vatDone = null;
+    this.navMode = 'MANUAL';
+  }
+
+  private _updateVatPhase(deltaTime: number): void {
+    const pos = this.mesh.position;
+    if (this.vatPhase === 'HOLD') {
+      this.character.setState('idle', this.vatFacing);
+      this.vatHoldTimer += deltaTime;
+      if (this.vatHoldTimer >= this.VAT_HOLD_TIMEOUT) {
+        // Watchdog: the vat never opened (handle lost mid-cycle?) — release
+        // where we stand rather than soft-locking the session.
+        this.abortVatSpawn();
+      }
+      return;
+    }
+    // WALK_OUT — straight constant-speed exit, no collision, no pathfinding.
+    const exit = this.vatExit;
+    if (!exit) { this.abortVatSpawn(); return; }
+    const dx = exit.x - pos.x;
+    const dz = exit.z - pos.z;
+    const dist = Math.hypot(dx, dz);
+    const step = this.VAT_WALK_SPEED * deltaTime;
+    if (dist <= Math.max(step, 0.02)) {
+      pos.x = exit.x;
+      pos.z = exit.z;
+      this.logicalAngle = this.vatFacing;
+      this.character.setState('idle', this.logicalAngle);
+      const done = this.vatDone;
+      this.abortVatSpawn(); // clears state, MANUAL
+      done?.();
+      return;
+    }
+    this.logicalAngle = snapTo8Ways(Math.atan2(dx / dist, dz / dist));
+    pos.x += (dx / dist) * step;
+    pos.z += (dz / dist) * step;
+    this.character.setState('walk', this.logicalAngle);
   }
 
   // ── Device-focus sequence (#33 D0) ──────────────────────────────────────────

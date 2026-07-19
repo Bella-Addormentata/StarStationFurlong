@@ -58,7 +58,7 @@ import {
 } from './pathfinding';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
-import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle } from './devices';
+import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -105,6 +105,7 @@ interface WorldInternals {
   holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }>;
   trunkLids: Map<string, TrunkLidHandle>;
   gameTableTops: Map<string, GameTableTopHandle>;
+  cloneVats: Map<string, CloneVatHandle>;
 }
 
 let getWorld: GetWorld = () => null;
@@ -310,6 +311,9 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       }
       if (obj.userData.gameTableTop) {
         w.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
+      }
+      if (obj.userData.cloneVat) {
+        w.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
       }
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
@@ -588,6 +592,14 @@ function buildPanel(): HTMLDivElement {
     </div>
   `;
 
+  // 🧬 Re-run the clone-vat spawn ceremony (future death flow's entry point).
+  const cloneRow = `
+    <div style="${ROW_STYLE}">
+      <span>CLONE-VAT SPAWN CEREMONY</span>
+      <button type="button" data-dev-action="respawn-vat" style="${BTN_STYLE}">RESPAWN</button>
+    </div>
+  `;
+
   el.innerHTML = `
     <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;
       padding:10px 12px 8px; border-bottom:2px dashed ${DEV_AMBER_DIM};">
@@ -602,6 +614,7 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('OUTFITS', null, outfitRows)}
       ${sectionHtml('FURNITURE', 'synced to the room (E4)', furnitureRows)}
       ${sectionHtml('INVENTORY', 'removed furniture · local only', ['<div id="dev-inventory-rows"></div>'])}
+      ${sectionHtml('CLONE', 'respawn at the vat (🧬)', [cloneRow])}
       ${sectionHtml('MODULES', null, [moduleRow])}
       ${sectionHtml('PARTS', 'station construction (#62)', ['<div id="dev-parts-rows"></div>'])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
@@ -628,6 +641,14 @@ function buildPanel(): HTMLDivElement {
         if ((e as MouseEvent).detail > 1) break;
         placeFromInventory(Number(btn.dataset.index), btn.dataset.kind as FurnitureKind);
         break;
+      case 'respawn-vat': {
+        const w = getWorld();
+        if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        showHint(w.respawnAtVat()
+          ? 'DEV: 🧬 clone deployed — vat cycle running.'
+          : 'DEV: no clone vat in this room — spawn one from FURNITURE first.');
+        break;
+      }
       case 'provision-module': void provisionModule(); break;
       case 'toggle-vestibule': void toggleVestibule(); break;
       // ── #62 P4 PARTS actions ──
