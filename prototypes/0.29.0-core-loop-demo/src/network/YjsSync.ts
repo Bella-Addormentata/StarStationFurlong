@@ -194,12 +194,27 @@ export class YjsSync {
     // Build standard Yjs SyncStep1 binary message
     // messageType (0 = Sync), syncSubtype (0 = SyncStep1), then state vector bytes
     const sv = Y.encodeStateVector(this.doc);
-    
+
     // Simple y-sync format payload
     const payload = this.#packYSyncPayload(0, 0, sv);
 
     await this.#emitEnvelope('ysync', payload);
     console.log(`📤 YjsSync -> SyncStep1 state vector handshake dispatched over WebTransport`);
+
+    // Half-handshake fix (two local tabs never synced): the node answers our
+    // SyncStep1 from ITS replica but never sends its own SyncStep1 back, so
+    // nothing ever asked US for our state — after a node restart its replica
+    // stayed empty and every sibling tab's handshake got an empty diff
+    // forever. Push our full state as a standard Update alongside the
+    // handshake: the node merges it (idempotent CRDT), sibling tabs get it
+    // via the node's local fan-out, and the mesh relay carries it outward —
+    // which also re-arms the node's served replica (C2 durability) after a
+    // restart. Skipped for an empty doc (a fresh guest has nothing to offer).
+    const baseline = Y.encodeStateAsUpdate(this.doc);
+    if (baseline.length > 2) {
+      await this.#sendUpdateMessage(baseline);
+      console.log(`📤 YjsSync -> baseline state pushed to the node replica (${baseline.length}B)`);
+    }
   }
 
   async #sendUpdateMessage(update: Uint8Array) {
