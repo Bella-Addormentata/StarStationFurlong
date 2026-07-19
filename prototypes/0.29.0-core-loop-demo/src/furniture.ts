@@ -26,7 +26,7 @@
 
 import * as THREE from 'three';
 import type { Seat } from './seats';
-import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle, TrunkLidHandle, GameTableTopHandle } from './devices';
+import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from './games/roulette';
@@ -62,7 +62,8 @@ export type FurnitureKind =
   | 'window-wall'
   | 'cashier-atm'
   | 'roulette-table'
-  | 'bunk-bed';
+  | 'bunk-bed'
+  | 'clone-vat';
 
 export interface FurnitureItem {
   id: string;
@@ -1152,6 +1153,15 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.85, z: 0 },
     },
   },
+  // 🧬 Clone vat — the diegetic spawn point (owner request). 1×1 obstacle,
+  // no seats, no device: the tank is walked OUT of, never into — the spawn
+  // choreography (World.respawnAtVat) owns all interaction.
+  'clone-vat': {
+    kind: 'clone-vat',
+    build: buildCloneVat,
+    footprint: { w: 1, d: 1 },
+    functions: ['cloneVat'],
+  },
   // 🛏️ Bunk bed — two lie-down berths (SeatTemplates with sitY + lie), no
   // device. Footprint 2×1 = a real obstacle; builder + templates live below
   // (function declarations hoist, matching the ship-fittings precedent).
@@ -1513,6 +1523,205 @@ function buildBunkBed({ m, place }: BuildCtx) {
   place(box(0.015, 0.16, 0.30), m(0x2A3444, 0.6, 0.4), 0.965, 1.0, 0);
 }
 
+// ── 🧬 Clone vat (owner request) — the diegetic spawn point ──────────────────
+// Concept-art-faithful cloning tank: gunmetal plinth + cap, a glass cylinder
+// full of glowing green nutrient bath, orange feed pipes and a status plate.
+// Local frame (rot 0): the DOOR faces +z. The spawn choreography (drain the
+// liquid, then SPIN the front glass segment around the cylinder axis until it
+// tucks behind the fixed back shell) is driven by a CloneVatHandle stowed in
+// a base mesh's userData.cloneVat — World collects it and drives update(dt)
+// every frame (trunk-lid idiom, never a detached rAF).
+const VAT_GLASS_R = 0.40;   // glass tube radius
+const VAT_GLASS_H = 1.80;   // glass tube height (y 0.30 → 2.10)
+const VAT_DOOR_ARC = (Math.PI * 2) / 3;        // 120° front door segment
+const VAT_DOOR_OPEN = Math.PI * 0.72;          // spun back behind the shell
+const VAT_BEAT_TIME = 0.5;   // full-tank hold before the drain starts
+const VAT_DRAIN_TIME = 1.4;
+const VAT_DOOR_TIME = 0.9;
+const VAT_REFILL_TIME = 2.6;
+const VAT_GREEN = 0x39FF6A;
+
+/** One-shot status-plate decal (trunk stencil idiom, two-line variant). */
+function makeVatPlateTexture(): THREE.CanvasTexture {
+  const cv = document.createElement('canvas');
+  cv.width = 128; cv.height = 64;
+  const c2d = cv.getContext('2d')!;
+  c2d.fillStyle = '#14181E';
+  c2d.fillRect(0, 0, 128, 64);
+  c2d.strokeStyle = '#3A424C';
+  c2d.strokeRect(2.5, 2.5, 123, 59);
+  c2d.fillStyle = '#E8ECF2';
+  c2d.font = 'bold 16px monospace';
+  c2d.textAlign = 'center';
+  c2d.fillText('CLONE VAT', 64, 24);
+  c2d.fillStyle = '#39FF6A';
+  c2d.font = 'bold 14px monospace';
+  c2d.fillText('C-01', 64, 46);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  return tex;
+}
+
+function buildCloneVat(ctx: BuildCtx) {
+  const { m, flat, place, attach, addLight } = ctx;
+  const BODY = 0x2A3444;   // gunmetal (wall-computer housing family)
+  const TRIM = 0x3D4A5E;   // bezel slate
+  const PIPE_O = 0xE8760A; // trunk orange conduits
+  const STEEL = 0x8A93A0;
+
+  // ── Plinth + interior floor pad
+  place(new THREE.CylinderGeometry(0.50, 0.52, 0.08, 20), m(TRIM, 0.6, 0.4), 0, 0.04, 0);
+  place(new THREE.CylinderGeometry(0.46, 0.48, 0.24, 20), m(BODY, 0.55, 0.45), 0, 0.20, 0);
+  place(new THREE.CylinderGeometry(0.38, 0.38, 0.03, 20), m(0x14181E, 0.9, 0.1), 0, 0.315, 0);
+  // Drain grate + green-lit outflow at the door side (concept art's spout)
+  place(new THREE.BoxGeometry(0.22, 0.07, 0.10), m(0x14181E, 0.8, 0.2), 0, 0.10, 0.48);
+  place(new THREE.BoxGeometry(0.14, 0.02, 0.03), flat(VAT_GREEN), 0, 0.10, 0.53);
+
+  // ── Cap + head-end greebles
+  place(new THREE.CylinderGeometry(0.48, 0.46, 0.22, 20), m(BODY, 0.55, 0.45), 0, 2.21, 0);
+  place(new THREE.CylinderGeometry(0.14, 0.14, 0.34, 12), m(TRIM, 0.5, 0.5), 0, 2.49, 0);
+  place(new THREE.CylinderGeometry(0.05, 0.05, 0.20, 8), m(STEEL, 0.45, 0.6), 0, 2.72, 0);
+  // Orange feed conduits arcing down the back
+  for (const sx of [-1, 1]) {
+    const pipe = place(new THREE.CylinderGeometry(0.035, 0.035, 1.9, 8), m(PIPE_O, 0.5, 0.4), sx * 0.30, 1.2, -0.40);
+    pipe.rotation.x = 0.08;
+    place(new THREE.CylinderGeometry(0.045, 0.045, 0.10, 8), m(STEEL, 0.45, 0.6), sx * 0.30, 2.18, -0.42);
+  }
+  // Status plate on the cap front (faces the door side)
+  const plateMat = new THREE.MeshBasicMaterial({
+    map: makeVatPlateTexture(), transparent: true, opacity: 0,
+  });
+  place(new THREE.PlaneGeometry(0.34, 0.17), plateMat, 0, 2.21, 0.475);
+  // Green status pip strip on the plinth front
+  place(new THREE.BoxGeometry(0.20, 0.035, 0.02), flat(VAT_GREEN), 0, 0.24, 0.475);
+
+  // ── Glass: fixed back shell (240°) + spinning front door segment (120°).
+  //    CylinderGeometry θ=0 sits on +z (vertex = (sinθ, y, cosθ)), so a door
+  //    centred on the +z axis is thetaStart −60° for 120°.
+  const glassMat = () => {
+    const gm = m(0x9BD4E8, 0.05, 0.1);
+    gm.side = THREE.DoubleSide;
+    gm.userData.baseOpacity = 0.22; // translucent tube (morph fade contract)
+    return gm;
+  };
+  place(
+    new THREE.CylinderGeometry(VAT_GLASS_R, VAT_GLASS_R, VAT_GLASS_H, 28, 1, true, Math.PI / 3, Math.PI * 4 / 3),
+    glassMat(), 0, 0.30 + VAT_GLASS_H / 2, 0,
+  );
+  const doorGroup = new THREE.Group();
+  doorGroup.name = 'cloneVatDoor';
+  doorGroup.position.set(0, 0.30 + VAT_GLASS_H / 2, 0); // on the tube axis
+  attach(doorGroup);
+  const doorMesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(VAT_GLASS_R + 0.012, VAT_GLASS_R + 0.012, VAT_GLASS_H, 12, 1, true, -VAT_DOOR_ARC / 2, VAT_DOOR_ARC),
+    glassMat(),
+  );
+  doorGroup.add(doorMesh);
+  // Thin steel edge rails on the door segment so the spin reads from afar
+  for (const edge of [-VAT_DOOR_ARC / 2, VAT_DOOR_ARC / 2]) {
+    const rail = new THREE.Mesh(
+      new THREE.BoxGeometry(0.03, VAT_GLASS_H, 0.03),
+      m(STEEL, 0.5, 0.5),
+    );
+    rail.position.set(Math.sin(edge) * (VAT_GLASS_R + 0.02), 0, Math.cos(edge) * (VAT_GLASS_R + 0.02));
+    doorGroup.add(rail);
+  }
+
+  // ── Nutrient bath: emissive green column, origin at its BOTTOM so scale.y
+  //    is the fill level (drains downward like the art's outflow panels).
+  const liquidGeo = new THREE.CylinderGeometry(0.355, 0.355, VAT_GLASS_H - 0.10, 24);
+  liquidGeo.translate(0, (VAT_GLASS_H - 0.10) / 2, 0);
+  const liquidMat = flat(VAT_GREEN);
+  liquidMat.userData.baseOpacity = 0.5;
+  const liquid = place(liquidGeo, liquidMat, 0, 0.33, 0);
+  // Inner glow core (brighter, thinner — reads as depth in the bath)
+  const coreGeo = new THREE.CylinderGeometry(0.16, 0.16, VAT_GLASS_H - 0.30, 12);
+  coreGeo.translate(0, (VAT_GLASS_H - 0.30) / 2, 0);
+  const coreMat = flat(0x9FFFB8);
+  coreMat.userData.baseOpacity = 0.35;
+  const core = place(coreGeo, coreMat, 0, 0.36, 0);
+  // Bath glow light (dims as the tank drains — handle-owned post-morph)
+  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 4.5);
+  addLight(bathLight, 0, 1.3, 0, 1.4);
+
+  // ── Handle: BEAT → DRAIN → OPEN (onOpen) / CLOSE → REFILL state machine.
+  type VatPhase = 'IDLE_FULL' | 'BEAT' | 'DRAIN' | 'OPEN' | 'IDLE_OPEN' | 'CLOSE' | 'REFILL';
+  let phase: VatPhase = 'IDLE_FULL';
+  let t = 0;
+  let level = 1;      // liquid fill 0..1
+  let doorAngle = 0;  // 0 closed → VAT_DOOR_OPEN tucked behind
+  let onOpenCb: (() => void) | null = null;
+  const smooth = (v: number) => v * v * (3 - 2 * v);
+
+  const applyPose = () => {
+    const l = Math.max(0.0001, level); // scale 0 breaks matrix inversion
+    liquid.scale.y = l;
+    core.scale.y = l;
+    liquid.visible = level > 0.005;
+    core.visible = level > 0.005;
+    doorGroup.rotation.y = doorAngle;
+  };
+
+  const handle: CloneVatHandle = {
+    beginSpawnCycle(onOpen: () => void): void {
+      phase = 'BEAT';
+      t = 0;
+      level = 1;
+      doorAngle = 0;
+      onOpenCb = onOpen;
+      applyPose();
+    },
+    closeAndRefill(): void {
+      phase = 'CLOSE';
+      t = 0;
+      onOpenCb = null; // a pending open is superseded — never fire it late
+    },
+    update(deltaTime: number): void {
+      if (phase === 'IDLE_FULL' || phase === 'IDLE_OPEN') return;
+      t += Math.max(0, deltaTime);
+      switch (phase) {
+        case 'BEAT':
+          if (t >= VAT_BEAT_TIME) { phase = 'DRAIN'; t = 0; }
+          break;
+        case 'DRAIN':
+          level = 1 - smooth(Math.min(1, t / VAT_DRAIN_TIME));
+          if (t >= VAT_DRAIN_TIME) { level = 0; phase = 'OPEN'; t = 0; }
+          break;
+        case 'OPEN':
+          doorAngle = VAT_DOOR_OPEN * smooth(Math.min(1, t / VAT_DOOR_TIME));
+          if (t >= VAT_DOOR_TIME) {
+            doorAngle = VAT_DOOR_OPEN;
+            phase = 'IDLE_OPEN';
+            if (onOpenCb) {
+              const cb = onOpenCb;
+              onOpenCb = null; // exactly once
+              cb();
+            }
+          }
+          break;
+        case 'CLOSE':
+          doorAngle = VAT_DOOR_OPEN * (1 - smooth(Math.min(1, t / VAT_DOOR_TIME)));
+          if (t >= VAT_DOOR_TIME) { doorAngle = 0; phase = 'REFILL'; t = 0; }
+          break;
+        case 'REFILL':
+          level = smooth(Math.min(1, t / VAT_REFILL_TIME));
+          if (t >= VAT_REFILL_TIME) { level = 1; phase = 'IDLE_FULL'; }
+          break;
+      }
+      // Bath glow follows the liquid (idle phases return early above, so the
+      // morph fade-in owns the light until a spawn cycle actually runs).
+      bathLight.intensity = ((bathLight.userData.targetIntensity as number) ?? 1.4) * (0.2 + 0.8 * level);
+      applyPose();
+    },
+  };
+  // Stow on a tiny carrier mesh inside the plinth — collected by World and
+  // devMenu's registerSpawnedGroup exactly like userData.trunkLid.
+  const carrier = place(new THREE.BoxGeometry(0.01, 0.01, 0.01), m(BODY, 0.5, 0.5), 0, 0.05, 0);
+  carrier.userData.cloneVat = handle;
+}
+
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
 // Obstacle-bearing items appear first, in the same order as the original
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
@@ -1604,6 +1813,14 @@ export const FURNITURE: FurnitureItem[] = [
   // n+0.5 (3.5 ✓), extentZ=w=2 even → z integer (-4 ✓). Head against the
   // fireplace wall, exactly like the concept art's wall-tucked crew berth.
   { id: 'bunk-bed',              kind: 'bunk-bed',           pos: { x:  3.5,  z: -4.0 }, rot: 1, movable: true },
+  // 🧬 Clone vat in the NW pocket: AABB x[-4,-3] z[-5,-4] fills the 1×1
+  // dead-end between the back-left lamp table (x[-5,-4] z[-5,-4]) and the
+  // storage trunk (x[-3,-2] z[-5,-4]), flush against the fireplace line
+  // (z=-5) — zero residual gaps, same wedge-trap-safe-by-construction
+  // reasoning as the bunk bed's nook. rot 0 ⇒ the glass door faces +z into
+  // the open x[-4,-3] z[-4,-3] cell; the spawn walk-out exits to (-3.5,-3.5).
+  // Parity: w=1/d=1 both odd → centre at n+0.5 on both axes ✓.
+  { id: 'clone-vat',             kind: 'clone-vat',          pos: { x: -3.5,  z: -4.5 }, rot: 0, movable: true },
 ];
 // ── TR2 dev-assert: trunk placement must be clear of every other obstacle ────
 // Dev-only (plan §TR1 "dev-assert against OBSTACLES at build"). Scoped to the
@@ -1629,12 +1846,15 @@ if (import.meta.env.DEV) assertPlacementClear('storage-trunk');
 if (import.meta.env.DEV) assertPlacementClear('map-table');
 if (import.meta.env.DEV) assertPlacementClear('game-table');
 if (import.meta.env.DEV) assertPlacementClear('bunk-bed');
+if (import.meta.env.DEV) assertPlacementClear('clone-vat');
 
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
 
-/** Rotate a local XZ offset by quarter-turns CCW about +y (exact — no FP drift). */
-function rotXZ(x: number, z: number, rot: Rot): { x: number; z: number } {
+/** Rotate a local XZ offset by quarter-turns CCW about +y (exact — no FP
+ *  drift). Exported for the clone-vat spawn choreography (world.ts derives
+ *  the walk-out exit point from the vat item's rot). */
+export function rotXZ(x: number, z: number, rot: Rot): { x: number; z: number } {
   switch (rot) {
     case 0: return { x, z };
     case 1: return { x: z, z: -x };

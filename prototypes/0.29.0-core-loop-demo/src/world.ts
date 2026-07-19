@@ -9,7 +9,7 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt, rebuildSeats } from './seats';
 import { getDefaultRoomId } from './identity';
-import { FURNITURE, FURNITURE_DEFS, buildItemGroup, BUNK_TOP_Y } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, buildItemGroup, BUNK_TOP_Y, rotXZ } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { northDoorUnlocked } from './stationParts';
 import { rebuildObstacles } from './obstacles';
@@ -25,7 +25,7 @@ import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
 import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, createCashierUI, createRouletteUI, readLiveRoomStatus } from './devices';
-import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
+import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
 import { deviceFocus } from './deviceFocus';
 import { roomEdit, canEditRoom } from './editMode';
@@ -125,6 +125,14 @@ export class World {
   private holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }> = [];
   /** Animated trunk lids, keyed by item id (TR2 — driven every frame). */
   private trunkLids: Map<string, TrunkLidHandle> = new Map();
+  /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
+  private cloneVats: Map<string, CloneVatHandle> = new Map();
+  /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
+  private pendingVatSpawn = false;
+  /** 🧬 Grace before the queued spawn may fire: the #65 exterior boot flips
+   *  the zoom to level 3 a beat AFTER morph-complete, and the ceremony must
+   *  not race it and play unseen (zoom reads 2 for the first few frames). */
+  private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
   // Atmosphere effects (animated each frame)
@@ -583,6 +591,9 @@ export class World {
         if (obj.userData.gameTableTop) {
           this.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
         }
+        if (obj.userData.cloneVat) {
+          this.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
+        }
         if (reveal) {
           const mat = obj.material as THREE.Material & { opacity: number; userData: { baseOpacity?: number } };
           if ('opacity' in mat) mat.opacity = mat.userData.baseOpacity ?? 1;
@@ -832,6 +843,11 @@ export class World {
     // handle — update() tweens against disposed meshes and the games-map
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
+    // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
+    // its onOpen would otherwise never fire (only the HOLD watchdog would).
+    if (this.cloneVats.delete(itemId) && this.player.isVatSpawning()) {
+      this.player.abortVatSpawn();
+    }
 
     const groupMeshes = new Set<THREE.Object3D>();
     const groupLights = new Set<THREE.PointLight>();
@@ -1067,6 +1083,21 @@ export class World {
       this.player.mesh.visible = true;
       this.platformGroup.position.set(0, 0, 0);
       console.log('✅ Morph complete - Platform active');
+      // 🧬 Diegetic boot spawn: if this room has a clone vat, the fresh
+      // avatar materialises INSIDE it (held, tank full) and the reveal cycle
+      // is deferred until the player actually looks at the room (update()'s
+      // zoom ≤ 2 gate) — it would otherwise play unseen behind the exterior
+      // boot view (#65). Vat-less rooms (docs seeded before this feature)
+      // keep the legacy mid-room spawn.
+      const vat = this.findSpawnVat();
+      if (vat) {
+        this.player.beginVatSpawn(
+          { x: vat.item.pos.x, z: vat.item.pos.z },
+          vat.item.rot * (Math.PI / 2),
+        );
+        this.pendingVatSpawn = true;
+        this.pendingVatSpawnGrace = 0.8; // outlast the exterior-boot flip (#65)
+      }
     }
 
     const t = this.morphProgress;
@@ -1142,6 +1173,19 @@ export class World {
     // Retrieve active zoom level to adjust interior vs exterior capsule visibility selectively (Level 3 optimization)
     const zoomView = (window as any).multiScaleZoom;
     const zoomLevel = zoomView ? (typeof zoomView.getLevel === 'function' ? zoomView.getLevel() : 2) : 2;
+
+    // 🧬 Deferred boot spawn: run the vat reveal the first frame the player
+    // actually sees the room interior (zoom ≤ 2) — queued at morph-complete.
+    // The grace lets the #65 exterior boot flip the zoom to 3 first; without
+    // it the ceremony fires on the same-frame default level 2 and plays
+    // unseen behind the station-from-space view.
+    if (this.pendingVatSpawn && !this.isMorphing) {
+      this.pendingVatSpawnGrace -= deltaTime;
+      if (this.pendingVatSpawnGrace <= 0 && zoomLevel <= 2) {
+        this.pendingVatSpawn = false;
+        this.respawnAtVat();
+      }
+    }
 
     if (zoomLevel >= 3) {
       // Hide interior furniture so it is not visible through walls or wastes render power
@@ -1241,6 +1285,9 @@ export class World {
 
     // Advance game-table top flips (#45 — same update-loop-driven idiom)
     for (const top of this.gameTableTops.values()) top.update(deltaTime);
+
+    // 🧬 Advance clone-vat drain / door-spin cycles (same idiom)
+    for (const vat of this.cloneVats.values()) vat.update(deltaTime);
 
     // #51 — paired-door vestibules: spawn/dispose from pairing state, drive
     // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.
@@ -2108,6 +2155,44 @@ export class World {
    */
   public setEditMode(on: boolean): void {
     if (this.platformGrid) this.platformGrid.visible = on;
+  }
+
+  // ── 🧬 Clone-vat spawn choreography (owner request) ─────────────────────────
+
+  /** First clone-vat item with a live handle, or null (vat-less room). */
+  private findSpawnVat(): { item: FurnitureItem; handle: CloneVatHandle } | null {
+    for (const item of FURNITURE) {
+      if (item.kind !== 'clone-vat') continue;
+      const handle = this.cloneVats.get(item.id);
+      if (handle) return { item, handle };
+    }
+    return null;
+  }
+
+  /**
+   * Run the full spawn ceremony at the room's clone vat: the avatar is held
+   * inside the tube, the nutrient bath drains, the glass door spins open,
+   * and the clone walks out to the cell in front of the door — then the vat
+   * seals and slowly refills behind them. Used at boot (deferred via
+   * pendingVatSpawn), by the DEV RESPAWN button, and by any future death
+   * flow. Returns false when the room has no vat (legacy spawn applies).
+   */
+  public respawnAtVat(): boolean {
+    const found = this.findSpawnVat();
+    if (!found || this.isMorphing) return false;
+    const { item, handle } = found;
+    // Exit = one tile out through the door face (local +z, rotated with the
+    // item) — for the default NW-pocket vat that is the open (-3.5, -3.5).
+    const exitOff = rotXZ(0, 1.0, item.rot);
+    const exit = { x: item.pos.x + exitOff.x, z: item.pos.z + exitOff.z };
+    this.player.beginVatSpawn(
+      { x: item.pos.x, z: item.pos.z },
+      item.rot * (Math.PI / 2),
+    );
+    handle.beginSpawnCycle(() => {
+      this.player.walkOutOfVat(exit, () => handle.closeAndRefill());
+    });
+    return true;
   }
 
   isPlayerActive(): boolean {

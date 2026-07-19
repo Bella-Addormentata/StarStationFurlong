@@ -176,6 +176,30 @@ export interface TrunkLidHandle {
   update(deltaTime: number): void;
 }
 
+// ── 🧬 Clone-vat handle (owner request — diegetic spawn point) ───────────────
+
+/**
+ * Handle onto a clone vat's animated tank: green nutrient liquid that drains
+ * and a glass door shell that spins open around the cylinder axis. The
+ * builder (furniture.ts) stows it in the tank base's userData.cloneVat;
+ * World collects it, drives update(dt) every frame (trunk-lid idiom), and
+ * the spawn choreography (World.respawnAtVat) sequences it against the
+ * player's scripted walk-out.
+ */
+export interface CloneVatHandle {
+  /**
+   * Snap to the full+closed attract state, hold a short beat, then drain the
+   * liquid and spin the glass door open. onOpen fires exactly once when the
+   * doorway is clear (the avatar may walk out). Restarts cleanly if called
+   * mid-cycle.
+   */
+  beginSpawnCycle(onOpen: () => void): void;
+  /** Spin the door shut, then slowly refill the tank (idle attract state). */
+  closeAndRefill(): void;
+  /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
+  update(deltaTime: number): void;
+}
+
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
 
 /**
