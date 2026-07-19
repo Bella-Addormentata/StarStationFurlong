@@ -486,6 +486,13 @@
         bottom: -15px; /* Slide open and let top bezel notch emerge */
       }
 
+      /* 💬 QUICK CHAT peek (owner request): the phone ITSELF rises a sliver —
+         top bezel + a hint line + the chat field — instead of the old separate
+         mini bar. Rides the container's existing bottom transition. */
+      #spacephone-container.peek {
+        bottom: -386px; /* 500px shell − 386 = ~114px sliver: bezel+hint+field */
+      }
+
       /* Phone Bezel Notch */
       #phone-bezel {
         height: 38px;
@@ -922,33 +929,23 @@
 
       /* 💬 QUICK CHAT mini bar — the top of the phone peeking up from the
          bottom edge, holding the (reparented) chat form. */
-      #phone-mini-chat {
-        position: fixed;
-        left: 50%;
-        bottom: 0;
-        width: 344px;
-        max-width: calc(100vw - 24px);
-        transform: translate(-50%, 105%);
-        background: rgba(8, 11, 26, 0.97);
-        border: 2px solid rgba(212, 168, 75, 0.35);
-        border-bottom: none;
-        border-radius: 16px 16px 0 0;
-        padding: 8px 10px 10px;
-        z-index: 5500;
-        box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.75);
-        transition: transform 0.22s ease;
-        box-sizing: border-box;
+      /* 💬 QUICK CHAT peek slot — lives INSIDE the phone, directly under the
+         top bezel, so the `.peek` sliver shows exactly bezel + hint + field.
+         Hidden in every other phone state (the form lives in the CHAT app). */
+      #phone-peek-chat {
+        display: none;
       }
-      #phone-mini-chat.active {
-        transform: translate(-50%, 0);
+      #spacephone-container.peek #phone-peek-chat {
+        display: block;
+        padding: 2px 8px 0;
       }
-      #phone-mini-chat-hint {
+      #phone-peek-chat-hint {
         font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         font-size: 9px;
         letter-spacing: 0.5px;
-        color: rgba(212, 168, 75, 0.5);
+        color: rgba(212, 168, 75, 0.7);
         text-align: center;
-        margin-bottom: 6px;
+        margin: 4px 0 2px;
         user-select: none;
       }
 
