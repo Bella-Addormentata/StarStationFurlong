@@ -61,7 +61,8 @@ export type FurnitureKind =
   | 'brick-wall'
   | 'window-wall'
   | 'cashier-atm'
-  | 'roulette-table';
+  | 'roulette-table'
+  | 'bunk-bed';
 
 export interface FurnitureItem {
   id: string;
@@ -95,6 +96,17 @@ export interface SeatTemplate {
   sit: { x: number; z: number };
   /** World facing while seated when rot = 0 (atan2(nx, nz) convention). */
   faceAngle: number;
+  /**
+   * 🛏️ Avatar-root HEIGHT while on the seat (metres above the floor) — bunk
+   * mattress tops. Default 0 (every ground-level chair/sofa seat).
+   */
+  sitY?: number;
+  /**
+   * 🛏️ true ⇒ the occupant LIES DOWN (rig 'sleep' pose) instead of sitting.
+   * Head points OPPOSITE the faceAngle direction (the recline tips backward),
+   * so faceAngle = the feet-ward axis of the berth.
+   */
+  lie?: boolean;
 }
 
 /** Build-time helpers bound to the item's group (all coordinates local). */
@@ -997,6 +1009,24 @@ const sofaFrontSeats: SeatTemplate[] = [
   { clickBox: { x0:  0.00, z0: -0.50, x1: 1.50, z1: 0.50 }, front: { x:  2.0, z: 0 }, sit: { x:  1.0, z: 0 }, faceAngle: Math.PI },
 ];
 
+// 🛏️ Bunk-bed berth heights + templates — order matters: findSeatAt returns
+// the FIRST clickBox containing the floor click, so the TOP bunk's narrow
+// ladder-end strip is listed first and the bottom bunk sweeps up the rest of
+// the bed. Both lie head toward +x (local): faceAngle -π/2 points the FEET at
+// the ladder end (the sleep recline tips the head opposite the facing). The
+// shared front point sits off the ladder end — the only guaranteed-open face
+// when the bed is tucked flush into a wall nook.
+export const BUNK_BOTTOM_Y = 0.32; // bottom mattress top surface (avatar root)
+export const BUNK_TOP_Y = 1.32;    // top mattress top surface (avatar root)
+const bunkBedSeats: SeatTemplate[] = [
+  { clickBox: { x0: -1.00, z0: -0.50, x1: -0.62, z1: 0.50 },
+    front: { x: -1.5, z: 0 }, sit: { x: 0.05, z: 0 },
+    faceAngle: -Math.PI / 2, sitY: BUNK_TOP_Y, lie: true },
+  { clickBox: { x0: -0.62, z0: -0.50, x1:  1.00, z1: 0.50 },
+    front: { x: -1.5, z: 0 }, sit: { x: 0.05, z: 0 },
+    faceAngle: -Math.PI / 2, sitY: BUNK_BOTTOM_Y, lie: true },
+];
+
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   'fireplace-wall':     { kind: 'fireplace-wall',     build: buildFireplaceWall,     footprint: { w: 10, d: 1 } },
   'sofa-back':          { kind: 'sofa-back',          build: buildSofa3([[-0.72, 0, 0xC04060], [0, 0, 0x3870C8], [0.72, 0, 0xD89030]]), footprint: { w: 3, d: 1 }, seats: sofaBackSeats },
@@ -1121,6 +1151,16 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       eye: { x: 0, y: 1.7, z: -0.95 },
       anchor: { x: 0, y: 0.85, z: 0 },
     },
+  },
+  // 🛏️ Bunk bed — two lie-down berths (SeatTemplates with sitY + lie), no
+  // device. Footprint 2×1 = a real obstacle; builder + templates live below
+  // (function declarations hoist, matching the ship-fittings precedent).
+  'bunk-bed': {
+    kind: 'bunk-bed',
+    build: buildBunkBed,
+    footprint: { w: 2, d: 1 },
+    functions: ['sleepBerth'],
+    seats: bunkBedSeats,
   },
   'helm-console': {
     kind: 'helm-console',
@@ -1415,6 +1455,63 @@ function buildRouletteTable(ctx: BuildCtx) {
   });
 }
 
+// ── 🛏️ Bunk bed (owner request) — two stacked sleep berths ───────────────────
+// Concept-art-faithful crew berth: light station-gray frame, gray-green
+// mattress pads with orange + blue sleep-restraint straps (micro-gravity
+// habit — pure décor down here), white pillows, a foot-end ladder up to the
+// top bunk and safety rails along its open sides. Local frame (rot 0): the
+// bed runs along X, HEAD end at +x, ladder/foot end at -x. Palette reuses the
+// storage-trunk shell grays + the trunk-orange / sofa-blue accent pair.
+// (BUNK_*_Y + the berth SeatTemplates live up with the other seat templates —
+// FURNITURE_DEFS evaluates them at module load, so unlike this hoisted
+// function declaration they must precede it.)
+function buildBunkBed({ m, place }: BuildCtx) {
+  const FRAME = 0xB8BEC6;    // light-gray shell (storage-trunk family)
+  const FRAME_DK = 0x8A93A0; // darker gray hardware
+  const PAD = 0x9AA48E;      // gray-green mattress
+  const PILLOW = 0xF5F2E8;   // warm white
+  const STRAP_O = 0xE8760A;  // trunk orange
+  const STRAP_B = 0x3870C8;  // sofa-cushion blue
+  const box = (w: number, h: number, d: number) => new THREE.BoxGeometry(w, h, d);
+
+  // Four corner posts + head-end panels
+  for (const px of [-0.93, 0.93]) {
+    for (const pz of [-0.42, 0.42]) {
+      place(box(0.10, 2.05, 0.10), m(FRAME, 0.6, 0.35), px, 1.025, pz);
+    }
+  }
+  for (const py of [0.42, 1.42]) {
+    place(box(0.06, 0.42, 0.86), m(FRAME, 0.65, 0.3), 0.93, py, 0); // headboards
+  }
+
+  // Platforms + mattresses (tops at BUNK_BOTTOM_Y / BUNK_TOP_Y)
+  for (const [slabY, padY] of [[0.14, 0.25], [1.14, 1.25]] as [number, number][]) {
+    place(box(1.94, 0.08, 0.92), m(FRAME_DK, 0.6, 0.35), 0, slabY, 0);   // frame slab
+    place(box(1.82, 0.14, 0.84), m(PAD, 0.85, 0.04), 0, padY, 0);        // mattress
+    place(box(0.36, 0.11, 0.58), m(PILLOW, 0.88, 0.02), 0.62, padY + 0.10, 0); // pillow
+    // Blanket over the foot half with two restraint straps (reference art)
+    place(box(1.10, 0.05, 0.86), m(0xB8BEA8, 0.9, 0.02), -0.30, padY + 0.085, 0);
+    place(box(0.09, 0.025, 0.87), m(STRAP_O, 0.7, 0.1), -0.62, padY + 0.115, 0);
+    place(box(0.09, 0.025, 0.87), m(STRAP_B, 0.7, 0.1), -0.10, padY + 0.115, 0);
+  }
+
+  // Top-bunk safety rails along both long sides (head half stays open for entry)
+  for (const rz of [-0.44, 0.44]) {
+    place(box(1.00, 0.05, 0.05), m(FRAME_DK, 0.55, 0.4), 0.25, 1.58, rz);
+    place(box(0.05, 0.22, 0.05), m(FRAME_DK, 0.55, 0.4), -0.20, 1.47, rz);
+  }
+
+  // Foot-end ladder: two stiles + rungs (clicking this end claims the TOP bunk)
+  for (const lz of [-0.20, 0.20]) {
+    place(box(0.05, 1.90, 0.05), m(FRAME, 0.6, 0.35), -0.97, 0.95, lz);
+  }
+  for (let ry = 0.30; ry <= 1.70; ry += 0.35) {
+    place(box(0.04, 0.04, 0.44), m(FRAME_DK, 0.55, 0.4), -0.97, ry, 0);
+  }
+
+  // Berth number decal-plate on the head-end post face (art: 'CREW BERTH 04')
+  place(box(0.015, 0.16, 0.30), m(0x2A3444, 0.6, 0.4), 0.965, 1.0, 0);
+}
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
 // Obstacle-bearing items appear first, in the same order as the original
@@ -1495,6 +1592,18 @@ export const FURNITURE: FurnitureItem[] = [
   // (x[-1.5,1.5] z[3,4]). Front point (-4, 4.5) is open aisle floor; parity:
   // w=2 even → x integer, d=1 odd → z at n+0.5. Overlaps dev-asserted below.
   { id: 'game-table',            kind: 'game-table',         pos: { x: -4.0,  z:  5.5 }, rot: 0, movable: true },
+  // 🛏️ Bunk bed in the NE nook: rot 1 AABB x[3,4] z[-5,-3] fills the
+  // DEAD-END pocket documented on the map-table entry above (east corridor
+  // x[3,4] z[-5,-3] — never a route) FLUSH on three sides: map-table x[1,3]
+  // z[-5,-3] to the west, fireplace z[-6,-5] to the north, lamp-table-back-
+  // right x[4,5] z[-5,-4] + armchair-right-0 x[4,5] z[-4,-3] to the east —
+  // zero residual gaps, so the wedge-trap rule is satisfied by construction.
+  // The only open face (south, z=-3) is the ladder/foot end after rot 1
+  // (local -x → world +z), fronting the open z∈(-3,-2) artery: the derived
+  // berth front lands at (3.5, -2.5). Parity: rot 1 ⇒ extentX=d=1 odd → x at
+  // n+0.5 (3.5 ✓), extentZ=w=2 even → z integer (-4 ✓). Head against the
+  // fireplace wall, exactly like the concept art's wall-tucked crew berth.
+  { id: 'bunk-bed',              kind: 'bunk-bed',           pos: { x:  3.5,  z: -4.0 }, rot: 1, movable: true },
 ];
 // ── TR2 dev-assert: trunk placement must be clear of every other obstacle ────
 // Dev-only (plan §TR1 "dev-assert against OBSTACLES at build"). Scoped to the
@@ -1519,6 +1628,7 @@ function assertPlacementClear(itemId: string): void {
 if (import.meta.env.DEV) assertPlacementClear('storage-trunk');
 if (import.meta.env.DEV) assertPlacementClear('map-table');
 if (import.meta.env.DEV) assertPlacementClear('game-table');
+if (import.meta.env.DEV) assertPlacementClear('bunk-bed');
 
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
@@ -1633,6 +1743,8 @@ export function buildSeatList(
         front: computeFront(preferred, itemAabb(item), isWalkable),
         sit: { x: item.pos.x + sit.x, z: item.pos.z + sit.z },
         faceAngle: t.faceAngle + item.rot * (Math.PI / 2),
+        sitY: t.sitY ?? 0,
+        lie: t.lie ?? false,
       });
     });
   }

@@ -31,6 +31,10 @@ export interface Seat {
   front: { x: number; z: number };
   sit: { x: number; z: number };
   faceAngle: number;
+  /** 🛏️ Avatar-root height while on the seat (bunk mattress tops); 0 = floor. */
+  sitY: number;
+  /** 🛏️ true ⇒ occupant lies down (rig 'sleep' pose) instead of sitting. */
+  lie: boolean;
 }
 
 export const SEATS: Seat[] = [];

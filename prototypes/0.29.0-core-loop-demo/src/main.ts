@@ -985,7 +985,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       seenPeers.add(peerId);
       receivedTicks++;
       remoteLastSeen.set(peerId, performance.now());
-      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1, (tick.flags & 2) === 2, tick.yaw);
+      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1, (tick.flags & 2) === 2, tick.yaw, (tick.flags & 4) === 4, (tick.flags & 8) === 8);
     } catch (e) {
       console.warn('Error unpacking incoming remote peer datagram tick:', e);
     }
@@ -4392,9 +4392,14 @@ function animate() {
       // #63: broadcast the seated pose over the existing tick lane — bit1 = seated,
       // and the otherwise-unused yaw field carries the seat facing so peers render
       // 'sit_chair' at the right orientation instead of an idle stand at the chair.
+      // 🛏️ bunk berths ride two more reserved flag bits (byte layout unchanged —
+      // old clients ignore them and degrade to a floor-level sit): bit2 = lying
+      // ('sleep' pose), bit3 = elevated (top bunk ⇒ BUNK_TOP_Y on the far side).
       const seated = world.getPlayer().isSeated();
+      const lying = world.getPlayer().isLying();
+      const elevated = world.getPlayer().getSeatedY() > 0.8;
       const tickData = {
-        flags: ((dir.x !== 0 || dir.z !== 0) ? 1 : 0) | (seated ? 2 : 0),
+        flags: ((dir.x !== 0 || dir.z !== 0) ? 1 : 0) | (seated ? 2 : 0) | (lying ? 4 : 0) | (elevated ? 8 : 0),
         x: localPos.x,
         z: localPos.z,
         yaw: seated ? world.getPlayer().getSeatedFacing() : 0,
