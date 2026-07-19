@@ -13,7 +13,7 @@ import { FURNITURE, FURNITURE_DEFS, buildItemGroup } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { northDoorUnlocked } from './stationParts';
 import { rebuildObstacles } from './obstacles';
-import { rebakeWalkableGrid } from './pathfinding';
+import { rebakeWalkableGrid, walkable, worldToRow, worldToCol, colToWorld, rowToWorld } from './pathfinding';
 import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
 import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type DoorRecord } from './doorsDoc';
 import { readDoorDeltas } from './floorPlanDoc';
@@ -1475,6 +1475,32 @@ export class World {
       return;
     }
 
+    // 🚪 Blocked-front fix (owner's report: SMALL doors 'sometimes' ignore
+    // clicks): the small doors' stand-points (0, ±4.5) sit in the
+    // furniture-heavy centre column — when furniture covers the front cell,
+    // findPath fails and the walk silently dies. Retarget to the nearest
+    // WALKABLE cell within 1.5 m of the front (biased to stay on the door's
+    // approach axis) instead of giving up. Large doors' wall-hugging fronts
+    // rarely need this; now neither kind ever no-ops.
+    const walkableDoor = ((): DoorTarget => {
+      const r = worldToRow(door.front.z), c = worldToCol(door.front.x);
+      if (walkable[r]?.[c]) return door;
+      let best: { x: number; z: number; d: number } | null = null;
+      for (let dr = -3; dr <= 3; dr++) {
+        for (let dc = -3; dc <= 3; dc++) {
+          if (!walkable[r + dr]?.[c + dc]) continue;
+          const wx = colToWorld(c + dc), wz = rowToWorld(r + dr);
+          const d = Math.hypot(wx - door.front.x, wz - door.front.z);
+          if (d <= 1.6 && (!best || d < best.d)) best = { x: wx, z: wz, d };
+        }
+      }
+      if (!best) {
+        showHint('The doorway is blocked by furniture.');
+        return door; // let the old behavior stand as the final fallback
+      }
+      return { ...door, front: { x: best.x, z: best.z } };
+    })();
+
     const ds = this.dockingSystem;
     /** A door offers transit when its pairing completed with a target seed,
      *  main.ts wired a swap driver (T1 of #30), and no swap is already in
@@ -1486,7 +1512,7 @@ export class World {
       return !!(state && state.pairedSuccessfully && state.connectedRoomAddress)
         && this.onAdapterTransit !== null;
     };
-    this.player.navigateToDoor(door, {
+    this.player.navigateToDoor(walkableDoor, {
       requestOpen: (onOpened) => {
         const state = ds.getDockingState(door.id);
         if (state && state.locked) {
