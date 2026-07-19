@@ -237,7 +237,10 @@
         position: absolute;
         /* Owner request: sit just above the STOWED phone's visible sliver
            (container bottom -460px of a 500px body ⇒ ~40px peeks) instead of
-           floating mid-screen. */
+           floating mid-screen. HIDDEN FROM FIRST PAINT (it out-z-indexes the
+           title curtain): body.in-room — added the first time the player
+           descends from the space view — is what reveals it. */
+        display: none;
         bottom: 52px;
         right: 40px;
         background: #1e88e5;
@@ -253,9 +256,13 @@
         animation: tipPulse 2s infinite ease-in-out;
         border: 1px solid rgba(255, 255, 255, 0.2);
       }
-      /* Owner request: the SpacePhone tip only exists INSIDE the room —
-         hidden through the title curtain (body.pre-entry, set by the boot)
-         and the station space view (body.exterior-active). */
+      /* Owner request: the SpacePhone tip only exists INSIDE the room.
+         Shown by body.in-room (first descent from the space view); the
+         pre-entry / exterior-active hides below OUTRANK it by order, so
+         zooming back out to space re-hides it. */
+      body.in-room #phone-tip-indicator {
+        display: block;
+      }
       body.pre-entry #phone-tip-indicator,
       body.exterior-active #phone-tip-indicator {
         display: none;
@@ -350,9 +357,10 @@
         flex-direction: column;
         align-items: center;
         justify-content: center;
-        background: rgba(2, 5, 16, 0.30);
-        backdrop-filter: blur(5px);
-        -webkit-backdrop-filter: blur(5px);
+        /* 🎬 FULLY OPAQUE from the very first paint (owner request): the JS
+           solidifier ran seconds after load, and the frosted default leaked
+           the assembling room (and the phone tip) in that window. */
+        background: rgb(2, 5, 16);
         z-index: 2000;
         transition: opacity 0.5s ease;
         cursor: pointer;
@@ -381,13 +389,10 @@
       }
       
       #welcome .hint {
-        font-size: 14px;
-        color: rgba(0, 212, 255, 0.9);
-        padding: 8px 20px;
-        border: 1px solid rgba(0, 212, 255, 0.3);
-        border-radius: 20px;
-        display: inline-block;
-        background: rgba(0, 212, 255, 0.05);
+        /* 🎬 Retired with the auto-boot (owner request): "👆 Click to Enter"
+           is no longer true — the game enters itself; a click merely skips
+           the title dwell. Rule kept (hidden) so the markup needn't change. */
+        display: none;
       }
       
       @keyframes welcomeFadeOut {

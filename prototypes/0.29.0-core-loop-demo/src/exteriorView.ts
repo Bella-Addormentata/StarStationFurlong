@@ -561,6 +561,10 @@ export function tickExterior(_dt: number): void {
 export function setExteriorActive(on: boolean): void {
   if (on === active) return;
   active = on;
+  // 🧹 First descent from space ⇒ the player is IN the room: reveals the
+  // room-only HUD (the SpacePhone tip's body.in-room gate). Sticky by
+  // design — later trips to space re-hide via body.exterior-active.
+  if (!on) document.body.classList.add('in-room');
   const scene = gr().scene;
   const camera = gr().camera as (THREE.OrthographicCamera & { zoom: number }) | undefined;
   if (on) {
