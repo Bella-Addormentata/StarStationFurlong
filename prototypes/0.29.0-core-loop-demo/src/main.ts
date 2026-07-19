@@ -44,6 +44,9 @@ import {
 import { deedsLedger, upsertDeed, removeDeed } from './deeds';
 import { refreshExteriorView, setExteriorOwnerCheck, setExteriorRoomId, showEnterRoomBubble, isExteriorActive, tickExterior } from './exteriorView';
 import { harvestIntoAtlas, readAtlas, bindStationAtlasDoc, pushAtlasToDoc, subscribeSharedAtlas } from './stationAtlas';
+// 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
+// clickable — the floor branch needs the seat hit test.
+import { findSeatAt } from './seats';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -4262,7 +4265,12 @@ function onCanvasClick(event: MouseEvent): void {
   //    device-focus camera mid-first-person — that hand-off is deferred with
   //    the rest of D0.2. A first-person device click falls through to the
   //    floor plane and walks the player next to the device instead.
-  if (!multiScaleZoom || multiScaleZoom.getLevel() === 2) {
+  // 🚶 First-person click model (owner request): bare floor is NOT a walk
+  // target in first person — WASD moves you. This flag lets a level-1 DEVICE
+  // click keep its old behavior (fall through to the floor and walk the
+  // player next to the device) while a plain floor click toggles free look.
+  let fpDeviceClicked = false;
+  if (!multiScaleZoom || multiScaleZoom.getLevel() <= 2) {
     const deviceMeshes: THREE.Object3D[] = [];
     scene.traverse((child) => {
       if (child.userData && child.userData.isDevice) {
@@ -4274,8 +4282,13 @@ function onCanvasClick(event: MouseEvent): void {
     if (deviceHits.length > 0) {
       const deviceId = deviceHits[0].object.userData.deviceId as string;
       if (deviceId) {
-        world.requestDeviceFocus(deviceId);
-        return; // Halt floor-click routing
+        if (!multiScaleZoom || multiScaleZoom.getLevel() === 2) {
+          world.requestDeviceFocus(deviceId);
+          return; // Halt floor-click routing
+        }
+        // Level 1: the focus-camera hand-off stays deferred (#33 D0.2) —
+        // walk beside the device via the floor fall-through instead.
+        fpDeviceClicked = true;
       }
     }
   }
@@ -4284,6 +4297,19 @@ function onCanvasClick(event: MouseEvent): void {
 
   for (const hit of hits) {
     if (hit.object.userData.isTile) {
+      // 🚶 First person: a click on BARE floor (no seat, no device) is the
+      // MODE TOGGLE back to free look — never a walk command. Seats (chairs,
+      // bunks) remain clickable items, and device clicks walk you over.
+      if (
+        multiScaleZoom && multiScaleZoom.getLevel() === 1
+        && !fpDeviceClicked
+        && !findSeatAt(hit.point.x, hit.point.z)
+      ) {
+        if (event.target === window.gameRenderer?.renderer?.domElement) {
+          multiScaleZoom.requestFirstPersonPointerLock();
+        }
+        return;
+      }
       world.navigateTo(hit.point.x, hit.point.z);
       return;
     }
