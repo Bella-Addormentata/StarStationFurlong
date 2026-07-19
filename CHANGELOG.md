@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.15 — 2026-07-19
+
+### 🪙 Chips Go Physical — Count Them
+
+- **Casino chips are physical now (owner rule)**: outside the cashier, no screen ever shows a chip TOTAL. Your rack at the roulette table is a tray of actual chip stacks — standard casino colors (1 white · 5 red · 25 green · 100 black · 500 purple · 1000 orange), stacks of ten, edge stripes, the face value printed under each denomination — you **count them** to know what you hold. Buy-in and the wheel don't change; only the accounting moved from a number to your eyes.
+- **The felt shows the real chips as placed**: every bet is one physical chip of its denomination, stacked in placement order — yours bright, other players' dimmed beside them. The old numbered marker is gone. Wins arrive as a **YOUR WIN tray of chips**, not a figure.
+- **The BANK app** shows your chips as countable discs (no total). **The CASHIER is the one place the number exists** — balance, the cage ledger, and cash-out, plus the same physical tray beside the figure so the counting stays honest.
+- Accuracy is guaranteed by one renderer (`chipDisplay.ts`): the drawn chips always sum EXACTLY to the balance (decomposition verified across 519 balances), and felt stacks are the literal bet records.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.15 in place). **Frontend-only — node binaries unchanged from v0.30.6.** (Also rides along: the 💬 quick-chat peek rework committed on the branch — the Enter-key chat bar now peeks the REAL phone.)
+
 ## v0.32.14 — 2026-07-19
 
 ### 🛏️ Bunk Beds — Sleep Berths

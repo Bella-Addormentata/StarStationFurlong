@@ -60,9 +60,12 @@ import {
   readMyBets, writeMyBets, readAllBets, subscribeCasino,
 } from './casinoDoc';
 import {
-  WHEEL_ORDER, resolveRound, betLabel, pocketColor,
+  WHEEL_ORDER, resolveRound, pocketColor,
 } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
+// 🪙 Physical chips (owner request): outside the cashier, balances render as
+// countable chip stacks — never as a number. One renderer enforces the rule.
+import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -1596,6 +1599,8 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
         <span style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">YOUR CHIPS</span>
         <span style="font-size:26px; font-weight:800; color:${CH_GOLD_BRIGHT};">🪙 ${chips}</span>
       </div>
+      <canvas id="cashier-rack" width="680" height="150"
+        style="width:340px; height:75px; align-self:flex-start;"></canvas>
       <div>
         <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">BUY-IN</div>
         <div style="display:flex; gap:8px;">
@@ -1641,6 +1646,15 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#cashier-buy-100')?.addEventListener('click', () => buyInChips(myId, 100));
     panel.querySelector<HTMLButtonElement>('#cashier-buy-500')?.addEventListener('click', () => buyInChips(myId, 500));
     panel.querySelector<HTMLButtonElement>('#cashier-cashout')?.addEventListener('click', () => cashOutChips(myId, readChips(myId)));
+    // 🪙 The cashier ALSO shows the physical tray (the one place number and
+    // chips appear together — it teaches the counting).
+    const rack = panel.querySelector<HTMLCanvasElement>('#cashier-rack');
+    const rctx = rack?.getContext('2d');
+    if (rack && rctx) {
+      rctx.setTransform(2, 0, 0, 2, 0, 0);
+      rctx.clearRect(0, 0, 340, 75);
+      drawChips(rctx, chipsFor(chips), 0, 0, 340, 75, { emptyText: 'THE TRAY IS EMPTY' });
+    }
   };
 
   return {
@@ -1906,9 +1920,23 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
     ctx.clearRect(0, 0, RL_BOARD_W, RL_BOARD_H);
     ctx.fillStyle = '#14532D';
     ctx.fillRect(0, 0, RL_BOARD_W, RL_BOARD_H);
+    // 🪙 Physical chips as placed: every bet record is ONE chip of its
+    // denomination — the felt shows the actual chips (mine bright, other
+    // players' dimmed), never a numeric total. Count them.
     const keyOf = (b: { type: string; pick?: number }) => `${b.type}:${b.pick ?? ''}`;
-    const mine = new Map<string, number>();
-    for (const b of myBets()) mine.set(keyOf(b), (mine.get(keyOf(b)) ?? 0) + b.amount);
+    const mineChips = new Map<string, number[]>();
+    for (const b of myBets()) {
+      const k = keyOf(b);
+      mineChips.set(k, [...(mineChips.get(k) ?? []), b.amount]);
+    }
+    const otherChips = new Map<string, number[]>();
+    for (const [pid, list] of Object.entries(readAllBets(deps.itemId, round()))) {
+      if (pid === myId) continue;
+      for (const b of list) {
+        const k = keyOf(b);
+        otherChips.set(k, [...(otherChips.get(k) ?? []), b.amount]);
+      }
+    }
     const winning = state()?.phase === 'settled' && animT === null ? state()!.result : null;
     for (const rg of regions) {
       ctx.fillStyle = rg.fill ?? '#1B6B3A';
@@ -1928,16 +1956,13 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(rg.label, rg.x + rg.w / 2, rg.y + rg.h / 2);
-      // My chips on this region.
-      const staked = mine.get(keyOf(rg.bet));
-      if (staked) {
-        const cx = rg.x + rg.w - 14, cy = rg.y + rg.h - 12;
-        ctx.beginPath(); ctx.arc(cx, cy, 10, 0, Math.PI * 2);
-        ctx.fillStyle = '#F0C060'; ctx.fill();
-        ctx.lineWidth = 2; ctx.strokeStyle = '#8E6A1E'; ctx.stroke();
-        ctx.fillStyle = '#1A1408';
-        ctx.font = 'bold 9px monospace';
-        ctx.fillText(String(staked), cx, cy + 0.5);
+      // The region's physical chips: others left (dim), mine right (bright).
+      const theirs = otherChips.get(keyOf(rg.bet));
+      if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
+      const placed = mineChips.get(keyOf(rg.bet));
+      if (placed) {
+        const cols = Math.ceil(placed.length / 8);
+        drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
       }
     }
   };
@@ -1963,22 +1988,18 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
     const house = deps.isHouse();
     const spinning = animT !== null;
 
-    // Other players' chips on the felt (spectator/croupier context).
-    const all = readAllBets(deps.itemId, round());
-    const others = Object.entries(all)
-      .filter(([pid]) => pid !== myId)
-      .map(([pid, list]) => `${readPlayerDisplayName(pid).toUpperCase()} 🪙 ${list.reduce((t, b) => t + b.amount, 0)}`);
-
     let statusLine: string;
     let statusColor = GT_GOLD_BRIGHT;
     if (spinning) {
       statusLine = 'NO MORE BETS — THE WHEEL SPINS…';
       statusColor = CH_PINK;
     } else if (p === 'settled' && s?.result !== null && s) {
+      // 🪙 Physical-chips rule: the win shows as CHIPS (the YOUR WIN tray),
+      // never as a number — the pocket label is the wheel's, not money.
       const won = s.payouts?.[myId] ?? 0;
       const col = pocketColor(s.result!).toUpperCase();
       statusLine = `● ${s.result} ${col}` + (staked > 0 || won > 0
-        ? (won > 0 ? ` — YOU WON 🪙 ${won}` : ' — NO WIN THIS TIME')
+        ? (won > 0 ? ' — YOU WIN' : ' — NO WIN THIS TIME')
         : '');
       statusColor = won > 0 ? '#00E676' : GT_GOLD_BRIGHT;
     } else {
@@ -2005,7 +2026,6 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
         font-family: inherit; font-size: 10px; font-weight: 800; cursor: pointer;
       ">${n}</button>`;
 
-    const betRows = bets.map((b) => `${betLabel(b)} 🪙 ${b.amount}`).join(' · ');
 
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
@@ -2017,12 +2037,14 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
       <div style="display:flex; gap:14px; align-items:center;">
         <canvas id="rl-wheel" width="${WHEEL_RES}" height="${WHEEL_RES}"
           style="width:${WHEEL_CSS}px; height:${WHEEL_CSS}px; flex:none;"></canvas>
-        <div style="display:flex; flex-direction:column; gap:8px; min-width:0;">
-          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">YOUR CHIPS</div>
-          <div style="font-size:22px; font-weight:800; color:${GT_GOLD_BRIGHT};">🪙 ${chips}</div>
+        <div style="display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;">
+          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">YOUR CHIPS — COUNT THEM</div>
+          <canvas id="rl-rack" width="380" height="132" style="width:190px; height:66px;"></canvas>
           <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">ON THE FELT</div>
-          <div style="font-size:14px; font-weight:800; color:${CH_PINK};">🪙 ${staked}</div>
-          ${others.length ? `<div style="font-size:9px; color:${GT_DIM}; line-height:1.6;">${others.join('<br>')}</div>` : ''}
+          <canvas id="rl-felt-rack" width="380" height="88" style="width:190px; height:44px;"></canvas>
+          ${p === 'settled' && !spinning && (s?.payouts?.[myId] ?? 0) > 0 ? `
+          <div style="font-size:10px; color:#00E676; letter-spacing:1.5px;">YOUR WIN</div>
+          <canvas id="rl-won" width="380" height="88" style="width:190px; height:44px;"></canvas>` : ''}
         </div>
       </div>
       <div style="display:flex; align-items:center; gap:8px;">
@@ -2034,7 +2056,6 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
       </div>
       <canvas id="rl-board" width="${RL_BOARD_W * 2}" height="${RL_BOARD_H * 2}"
         style="width:${RL_BOARD_W}px; height:${RL_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${p === 'betting' && !spinning ? 'pointer' : 'default'};"></canvas>
-      ${betRows ? `<div style="font-size:9.5px; color:${CH_GOLD}; line-height:1.6;">MY BETS: ${betRows}</div>` : ''}
       <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
         ${house
           ? (p === 'betting'
@@ -2045,6 +2066,7 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
         SINGLE-ZERO WHEEL · straight pays 35:1 · dozens &amp; columns 2:1 · red/black odd/even 1–18/19–36 1:1
         · house-banked, the croupier's spin settles the round · fair-spin upgrade coming
+        · chips are physical at the table — count them; the CASHIER's screen shows the number
       </div>
     `;
     panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
@@ -2060,6 +2082,21 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
     flash = '';
     drawWheelForNow();
     drawBoard();
+    // 🪙 The physical trays (2x backing): rack = full balance decomposed;
+    // felt tray = the exact chips placed this round; win tray = the payout.
+    const paintTray = (id: string, tray: number[], cssW: number, cssH: number, emptyText?: string) => {
+      const cv = panel!.querySelector<HTMLCanvasElement>(`#${id}`);
+      const c2 = cv?.getContext('2d');
+      if (!cv || !c2) return;
+      c2.setTransform(2, 0, 0, 2, 0, 0);
+      c2.clearRect(0, 0, cssW, cssH);
+      drawChips(c2, tray, 0, 0, cssW, cssH, { emptyText });
+    };
+    paintTray('rl-rack', chipsFor(chips), 190, 66, 'NO CHIPS — VISIT THE CASHIER');
+    paintTray('rl-felt-rack', bets.map((b) => b.amount), 190, 44, 'NOTHING STAKED');
+    if (p === 'settled' && !spinning) {
+      paintTray('rl-won', chipsFor(s?.payouts?.[myId] ?? 0), 190, 44);
+    }
   };
 
   return {

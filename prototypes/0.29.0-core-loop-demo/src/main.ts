@@ -24,6 +24,7 @@ import {
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindCasinoDoc, readChips } from './casinoDoc';
+import { chipDotsHtml } from './chipDisplay';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
@@ -1634,15 +1635,14 @@ function renderBankApp(): void {
     ${header('PORTFOLIO')}
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
     ${(() => {
-      // 🎰 #69: chips are PER-CASINO records — the BANK shows the chips you
-      // hold in the room you are standing in (the cashier is the full ledger).
+      // 🎰 #69: chips are PER-CASINO records — and PHYSICAL (owner rule):
+      // the BANK shows the chips themselves, never a total. Count them, or
+      // walk to the room's CASHIER for the number.
       const chips = readChips(getPlayerId());
       return chips > 0 ? `${header('CHIPS')}
-        <div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
-          <span>🎰 This room's casino</span>
-          <span style="color:#f0c060;">🪙 ${chips} chips</span>
-        </div>
-        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Chips stay with their casino — cash out at its CASHIER.</div>` : '';
+        <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
+        <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
+        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>` : '';
     })()}
     ${header('PROPERTY')}
     ${deedsLedger().length
@@ -2117,45 +2117,54 @@ function renderCoHostsSection(): void {
   section.innerHTML = header + coHostRows + requestRows + memberLine + emptyState;
 }
 
-// ── 💬 QUICK CHAT (owner request) ────────────────────────────────────────────
-// Enter (game focus) pops a mini bar holding JUST the chat field — the top of
-// the phone peeking up. Enter sends (the overhead bubble shows); Enter on a
-// BLANK field slides it away; Tab from the mini bar expands to the full phone
-// on the CHAT app for history. The REAL #chat-form is REPARENTED into the bar
-// (its submit listener travels with it — the settings de-overlay pattern), so
-// send behavior is identical in both homes.
+// ── 💬 QUICK CHAT (owner request, v2: ON the phone) ──────────────────────────
+// Enter (game focus) raises the SPACE PHONE ITSELF a sliver (`.peek` on the
+// container — same slide transition as a full open): top bezel + a hint line
+// + the chat field emerge at the bottom-right. Enter sends (the overhead
+// bubble shows); Enter on a BLANK field slides the phone back down; Tab
+// expands to the full phone on the CHAT app for history. The REAL #chat-form
+// is REPARENTED into a peek slot under the bezel (its submit listener travels
+// with it — the settings de-overlay pattern), so send behavior is identical
+// in both homes. v1 was a separate lookalike mini bar; the owner wanted the
+// phone itself to do the peeking.
 
 let miniChatOpen = false;
 
-function miniChatBar(): HTMLDivElement {
-  let bar = document.getElementById('phone-mini-chat') as HTMLDivElement | null;
-  if (!bar) {
-    bar = document.createElement('div');
-    bar.id = 'phone-mini-chat';
-    bar.innerHTML = `<div id="phone-mini-chat-hint">💬 QUICK CHAT · ENTER sends · blank ENTER closes · TAB full history</div>`;
-    // Panel clicks stay off the canvas click handler (same rule as the phone).
-    bar.addEventListener('click', (e) => e.stopPropagation());
-    document.body.appendChild(bar);
+/** The peek slot sits INSIDE the phone, directly under the top bezel, so the
+ *  `.peek` sliver shows exactly bezel + hint + field. Created once; clicks
+ *  already stay off the canvas via the container's own click guard. */
+function phonePeekSlot(): HTMLDivElement | null {
+  let slot = document.getElementById('phone-peek-chat') as HTMLDivElement | null;
+  if (!slot) {
+    const bezel = document.getElementById('phone-bezel');
+    if (!bezel) return null;
+    slot = document.createElement('div');
+    slot.id = 'phone-peek-chat';
+    slot.innerHTML = `<div id="phone-peek-chat-hint">💬 QUICK CHAT · ENTER sends · blank ENTER closes · TAB full history</div>`;
+    bezel.insertAdjacentElement('afterend', slot);
   }
-  return bar;
+  return slot;
 }
 
 function openMiniChat(): void {
   if (miniChatOpen) return;
   const form = document.getElementById('chat-form');
-  if (!form) return;
+  const phone = document.getElementById('spacephone-container');
+  const slot = phonePeekSlot();
+  if (!form || !phone || !slot) return;
   miniChatOpen = true;
-  const bar = miniChatBar();
-  bar.appendChild(form);
-  bar.classList.add('active');
-  (document.getElementById('chat-input') as HTMLInputElement | null)?.focus();
+  slot.appendChild(form);
+  phone.classList.add('peek');
+  // preventScroll: focusing the input while the phone is still mid-slide
+  // (offscreen) otherwise scrolls the WHOLE page up to reveal it — shifting
+  // the game canvas 400+px and leaving the layout broken.
+  (document.getElementById('chat-input') as HTMLInputElement | null)?.focus({ preventScroll: true });
 }
 
 function closeMiniChat(): void {
   if (!miniChatOpen) return;
   miniChatOpen = false;
-  const bar = document.getElementById('phone-mini-chat');
-  bar?.classList.remove('active');
+  document.getElementById('spacephone-container')?.classList.remove('peek');
   // The form goes home under the messages list (its listeners travel with it).
   const form = document.getElementById('chat-form');
   const chatView = document.getElementById('phone-app-chat');
