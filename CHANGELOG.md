@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.31 — 2026-07-19
+
+### 🔁 Two Tabs, One Truth — the Local Sync Gap Closes (+ dependency patch-up)
+
+- **Fixed: a second browser tab on the same machine never received the room** (found while verifying v0.32.30's offers). The room-record exchange with the local node implemented only *half* the handshake — a tab asked the node what it was missing, but nothing ever asked the **tab** for *its* records, so after a node restart the node's copy stayed empty and every later tab's request was answered with nothing, forever. Each tab now pushes its full room records alongside the handshake (a standard, safely-mergeable update): the node's copy converges instantly, sibling tabs receive it through the existing fan-out, and the node's stay-behind serving copy (room durability) re-arms after every restart instead of only after live edits. Remote visitors were never affected — their requests are answered by the far side directly.
+- **Proven with the real thing:** two tabs, two identities, one node — a transfer offer cut in one tab was pasted, verified, and redeemed in the other (deed changed hands live), then offered *back* and redeemed by the original owner. Both redemption records landed in the shared room records on both sides.
+- **Dependency patch-up (Dependabot close-out):** the live line's dev tooling moved to **vite 6.4.3 / esbuild 0.25.12**, clearing a high-severity Windows dev-server path-check bypass and three medium advisories (build + dev server verified). The remaining 133 alerts were triaged and dismissed with reasons: 107 sit in frozen archived prototype folders whose dev servers are never run, and 26 are a Linux-only soundness note in the desktop shell's UI toolkit, pinned upstream until its next major migration.
+- Also rides along: the transfer-offers design note joins `brainstorming/` (authored by a parallel design session).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.31 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.30 — 2026-07-19
 
 ### 📤 Transfer Offers, a Bar That Finally Moves, and Wake-Up Tanks
