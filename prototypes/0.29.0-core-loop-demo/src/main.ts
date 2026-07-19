@@ -23,6 +23,7 @@ import {
 } from './keypair';
 import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
+import { bindCasinoDoc, readChips } from './casinoDoc';
 import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
@@ -660,6 +661,10 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // observer to the FRESH doc and re-notifies every subscriber (mounted game
   // UIs + the in-world board mirror in world.ts).
   bindGamesDoc(sync.doc);
+
+  // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
+  // table state. Rebinds per join like games/furniture (T0 seam).
+  bindCasinoDoc(sync.doc);
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
   // item id, drives world.reconcileFurniture on every change (incl. the initial
@@ -1628,6 +1633,17 @@ function renderBankApp(): void {
     </div>
     ${header('PORTFOLIO')}
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
+    ${(() => {
+      // 🎰 #69: chips are PER-CASINO records — the BANK shows the chips you
+      // hold in the room you are standing in (the cashier is the full ledger).
+      const chips = readChips(getPlayerId());
+      return chips > 0 ? `${header('CHIPS')}
+        <div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+          <span>🎰 This room's casino</span>
+          <span style="color:#f0c060;">🪙 ${chips} chips</span>
+        </div>
+        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Chips stay with their casino — cash out at its CASHIER.</div>` : '';
+    })()}
     ${header('PROPERTY')}
     ${deedsLedger().length
       ? deedsLedger().map((d) => `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">

@@ -27,6 +27,9 @@
 import * as THREE from 'three';
 import type { Seat } from './seats';
 import type { DeviceTarget, DeviceTemplate, WallComputerStatus, WallScreenHandle, TrunkLidHandle, GameTableTopHandle } from './devices';
+// 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
+// order/colors from the pure engine — one source of truth with the focused UI.
+import { WHEEL_ORDER, pocketColor } from './games/roulette';
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box { x0: number; z0: number; x1: number; z1: number }
@@ -56,7 +59,9 @@ export type FurnitureKind =
   | 'engine-block'
   | 'helm-console'
   | 'brick-wall'
-  | 'window-wall';
+  | 'window-wall'
+  | 'cashier-atm'
+  | 'roulette-table';
 
 export interface FurnitureItem {
   id: string;
@@ -1090,6 +1095,33 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   // replace the built-in brick — see world.updateSideWallCoverage).
   'brick-wall': { kind: 'brick-wall', build: buildBrickWall, footprint: { w: 4, d: 1 } },
   'window-wall': { kind: 'window-wall', build: buildWindowWall, footprint: { w: 4, d: 1 } },
+  // ── 🎰 Casino fixtures (#69 G1/G2) — device fronts face -z (helm idiom). ──
+  'cashier-atm': {
+    kind: 'cashier-atm',
+    build: buildCashierAtm,
+    footprint: { w: 1, d: 1 },
+    functions: ['casinoCashier'],
+    device: {
+      kind: 'cashier',
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.5, z: -0.9 },
+      anchor: { x: 0, y: 1.3, z: 0 },
+    },
+  },
+  'roulette-table': {
+    kind: 'roulette-table',
+    build: buildRouletteTable,
+    footprint: { w: 2, d: 1 },
+    functions: ['rouletteTable'],
+    device: {
+      kind: 'roulette',
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.7, z: -0.95 },
+      anchor: { x: 0, y: 0.85, z: 0 },
+    },
+  },
   'helm-console': {
     kind: 'helm-console',
     build: buildHelmConsole,
@@ -1198,6 +1230,191 @@ function buildWindowWall({ m, place }: BuildCtx) {
   gm.side = THREE.DoubleSide;
   place(new THREE.BoxGeometry(4.06, 0.12, 0.36), m(0xB8C8D8, 0.75, 0.05), 0, 3.46, 0); // coping
 }
+
+// ── 🎰 Casino fixtures (#69 G1/G2) — cashier ATM + roulette table ────────────
+// Canvas-textured faces follow the game-table idiom: MeshBasicMaterial with
+// transparent + opacity 0 so the morph fade-in machinery raises them with
+// everything else. Focused UIs live in devices.ts (createCashierUI /
+// createRouletteUI); these builders are the in-world halves.
+
+/** Cashier sign face: 'CASHIER · CHIPS' gold on dark with a chip pip. */
+function drawCashierSign(c2d: CanvasRenderingContext2D): void {
+  const W = 256, H = 128;
+  c2d.fillStyle = '#0A0E1A';
+  c2d.fillRect(0, 0, W, H);
+  c2d.strokeStyle = '#D4A84B';
+  c2d.lineWidth = 4;
+  c2d.strokeRect(6, 6, W - 12, H - 12);
+  c2d.fillStyle = '#F0C060';
+  c2d.font = 'bold 34px monospace';
+  c2d.textAlign = 'center';
+  c2d.textBaseline = 'middle';
+  c2d.fillText('CASHIER', W / 2, 42);
+  c2d.font = 'bold 22px monospace';
+  c2d.fillStyle = '#FF2D95';
+  c2d.fillText('· CHIPS ·', W / 2, 88);
+}
+
+/** Cashier screen face: idle attract loop, drawn once (static in-world). */
+function drawCashierScreen(c2d: CanvasRenderingContext2D): void {
+  const W = 256, H = 192;
+  c2d.fillStyle = '#06121C';
+  c2d.fillRect(0, 0, W, H);
+  c2d.fillStyle = '#0E2A38';
+  c2d.fillRect(8, 8, W - 16, H - 16);
+  c2d.fillStyle = '#00E5FF';
+  c2d.font = 'bold 24px monospace';
+  c2d.textAlign = 'center';
+  c2d.fillText('BUY-IN', W / 2, 56);
+  c2d.fillText('CASH OUT', W / 2, 92);
+  c2d.fillStyle = '#F0C060';
+  c2d.font = '16px monospace';
+  c2d.fillText('WALK UP TO BEGIN', W / 2, 146);
+}
+
+/** Roulette felt: green baize, gold trim, betting-grid motif on the +x half
+ *  (the wheel occupies -x). Painted once — the LIVE board is the focused UI. */
+function drawRouletteFelt(c2d: CanvasRenderingContext2D): void {
+  const W = 512, H = 256;
+  c2d.fillStyle = '#14532D';
+  c2d.fillRect(0, 0, W, H);
+  c2d.fillStyle = '#1B6B3A';
+  c2d.fillRect(8, 8, W - 16, H - 16);
+  c2d.strokeStyle = 'rgba(240, 224, 180, 0.8)';
+  c2d.lineWidth = 3;
+  // Grid motif: 12×3 cells on the right half + a zero wedge.
+  const gx = 280, gy = 40, cw = 16, ch = 56;
+  for (let col = 0; col <= 12; col++) {
+    c2d.beginPath(); c2d.moveTo(gx + col * cw, gy); c2d.lineTo(gx + col * cw, gy + 3 * ch); c2d.stroke();
+  }
+  for (let row = 0; row <= 3; row++) {
+    c2d.beginPath(); c2d.moveTo(gx, gy + row * ch); c2d.lineTo(gx + 12 * cw, gy + row * ch); c2d.stroke();
+  }
+  c2d.beginPath(); // zero wedge left of the grid
+  c2d.moveTo(gx, gy); c2d.lineTo(gx - 28, gy + 1.5 * ch); c2d.lineTo(gx, gy + 3 * ch);
+  c2d.closePath(); c2d.stroke();
+  // Outside-bet boxes under the grid.
+  for (let b = 0; b < 6; b++) {
+    c2d.strokeRect(gx + b * 32, gy + 3 * ch + 10, 32, 24);
+  }
+}
+
+function buildCashierAtm({ m, flat, place }: BuildCtx) {
+  // Plinth + kiosk body (station-steel family).
+  place(new THREE.BoxGeometry(0.9, 0.12, 0.6), m(0x2A3444, 0.7, 0.35), 0, 0.06, 0);
+  place(new THREE.BoxGeometry(0.8, 1.6, 0.5), m(0x1C262E, 0.6, 0.4), 0, 0.92, 0);
+  // Screen (faces -z into the room at rot 0 — the device-front convention).
+  const bezel = place(new THREE.BoxGeometry(0.66, 0.5, 0.07), m(0x0A0E1A, 0.5, 0.5), 0, 1.32, -0.24);
+  bezel.rotation.x = 0.24;
+  const screenCv = document.createElement('canvas');
+  screenCv.width = 256; screenCv.height = 192;
+  drawCashierScreen(screenCv.getContext('2d')!);
+  const screenTex = new THREE.CanvasTexture(screenCv);
+  screenTex.minFilter = THREE.NearestFilter;
+  screenTex.magFilter = THREE.NearestFilter;
+  screenTex.generateMipmaps = false;
+  screenTex.colorSpace = THREE.SRGBColorSpace;
+  const screen = place(new THREE.PlaneGeometry(0.58, 0.42),
+    new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 }), 0, 1.325, -0.285);
+  screen.rotation.x = 0.24;
+  screen.rotation.y = Math.PI; // face -z
+  // Keypad shelf + chip tray.
+  const pad = place(new THREE.BoxGeometry(0.5, 0.26, 0.09), m(0x37474F, 0.55, 0.45), 0, 0.98, -0.27);
+  pad.rotation.x = -0.5;
+  place(new THREE.BoxGeometry(0.5, 0.06, 0.18), m(0xD4A84B, 0.45, 0.5), 0, 0.7, -0.3);
+  // Side neon strips (casino magenta) + gold accent line.
+  for (const sx of [-0.42, 0.42]) {
+    place(new THREE.BoxGeometry(0.05, 1.5, 0.05), m(0xFF2D95, 0.4, 0.2, 0xFF2D95, 0.8), sx, 0.95, -0.18);
+  }
+  // Roof sign, double-faced.
+  place(new THREE.BoxGeometry(0.92, 0.5, 0.12), m(0x0A0E1A, 0.55, 0.4), 0, 1.98, 0);
+  const signCv = document.createElement('canvas');
+  signCv.width = 256; signCv.height = 128;
+  drawCashierSign(signCv.getContext('2d')!);
+  const signTex = new THREE.CanvasTexture(signCv);
+  signTex.minFilter = THREE.NearestFilter;
+  signTex.magFilter = THREE.NearestFilter;
+  signTex.generateMipmaps = false;
+  signTex.colorSpace = THREE.SRGBColorSpace;
+  const sign = place(new THREE.PlaneGeometry(0.86, 0.44),
+    new THREE.MeshBasicMaterial({ map: signTex, transparent: true, opacity: 0 }), 0, 1.98, -0.07);
+  sign.rotation.y = Math.PI; // face -z
+  // Status pip.
+  place(new THREE.SphereGeometry(0.03, 8, 6), flat(0x00E676), 0.3, 0.72, -0.28);
+}
+
+function buildRouletteTable(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  // Base: apron + legs (game-table family, darker casino wood).
+  place(new THREE.BoxGeometry(1.86, 0.14, 0.86), m(0x4A2F1B, 0.55, 0.15), 0, 0.62, 0);
+  ([[-0.85, -0.35], [-0.85, 0.35], [0.85, -0.35], [0.85, 0.35]] as [number, number][]).forEach(([lx, lz]) => {
+    place(new THREE.BoxGeometry(0.12, 0.62, 0.12), m(0x3A2417, 0.55, 0.18), lx, 0.31, lz);
+    place(new THREE.BoxGeometry(0.15, 0.04, 0.15), m(0x4A2F1B, 0.50, 0.20), lx, 0.02, lz);
+  });
+  // Top slab + padded rim.
+  place(new THREE.BoxGeometry(1.96, 0.07, 0.96), m(0x4A2F1B, 0.5, 0.2), 0, 0.775, 0);
+  for (const [w, d, lx, lz] of [[1.96, 0.08, 0, -0.44], [1.96, 0.08, 0, 0.44], [0.08, 0.96, -0.94, 0], [0.08, 0.96, 0.94, 0]] as [number, number, number, number][]) {
+    place(new THREE.BoxGeometry(w, 0.09, d), m(0x3A2417, 0.6, 0.1), lx, 0.845, lz);
+  }
+  // Felt (canvas) across the top.
+  const feltCv = document.createElement('canvas');
+  feltCv.width = 512; feltCv.height = 256;
+  drawRouletteFelt(feltCv.getContext('2d')!);
+  const feltTex = new THREE.CanvasTexture(feltCv);
+  feltTex.minFilter = THREE.NearestFilter;
+  feltTex.magFilter = THREE.NearestFilter;
+  feltTex.generateMipmaps = false;
+  feltTex.colorSpace = THREE.SRGBColorSpace;
+  const feltGeo = new THREE.PlaneGeometry(1.84, 0.84);
+  feltGeo.rotateX(-Math.PI / 2);
+  place(feltGeo, new THREE.MeshBasicMaterial({ map: feltTex, transparent: true, opacity: 0 }), 0, 0.812, 0);
+  // Wheel at the -x end: bowl + pocket disc (canvas) + gold hub and rim.
+  place(new THREE.CylinderGeometry(0.34, 0.36, 0.06, 28), m(0x2A1A10, 0.5, 0.3), -0.58, 0.845, 0);
+  const wheelCv = document.createElement('canvas');
+  wheelCv.width = 256; wheelCv.height = 256;
+  const wc = wheelCv.getContext('2d')!;
+  const CX = 128, CY = 128;
+  wc.fillStyle = '#2A1A10';
+  wc.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < WHEEL_ORDER.length; i++) {
+    const a0 = (i / WHEEL_ORDER.length) * Math.PI * 2;
+    const a1 = ((i + 1) / WHEEL_ORDER.length) * Math.PI * 2;
+    const col = pocketColor(WHEEL_ORDER[i]);
+    wc.beginPath();
+    wc.moveTo(CX, CY);
+    wc.arc(CX, CY, 120, a0, a1);
+    wc.closePath();
+    wc.fillStyle = col === 'green' ? '#1B6B3A' : col === 'red' ? '#C43C3C' : '#23252E';
+    wc.fill();
+  }
+  wc.beginPath();
+  wc.arc(CX, CY, 52, 0, Math.PI * 2);
+  wc.fillStyle = '#4A2F1B';
+  wc.fill();
+  wc.beginPath();
+  wc.arc(CX, CY, 120, 0, Math.PI * 2);
+  wc.lineWidth = 5;
+  wc.strokeStyle = '#D4A84B';
+  wc.stroke();
+  const wheelTex = new THREE.CanvasTexture(wheelCv);
+  wheelTex.minFilter = THREE.NearestFilter;
+  wheelTex.magFilter = THREE.NearestFilter;
+  wheelTex.generateMipmaps = false;
+  wheelTex.colorSpace = THREE.SRGBColorSpace;
+  const wheelGeo = new THREE.CircleGeometry(0.31, 48);
+  wheelGeo.rotateX(-Math.PI / 2);
+  place(wheelGeo, new THREE.MeshBasicMaterial({ map: wheelTex, transparent: true, opacity: 0 }), -0.58, 0.877, 0);
+  const hub = place(new THREE.ConeGeometry(0.06, 0.09, 12), m(0xD4A84B, 0.4, 0.6), -0.58, 0.92, 0);
+  hub.rotation.y = 0.3;
+  const rim = place(new THREE.TorusGeometry(0.335, 0.018, 8, 32), m(0xD4A84B, 0.45, 0.5), -0.58, 0.877, 0);
+  rim.rotation.x = Math.PI / 2;
+  // Chip stacks near the +x end (deco).
+  const chipColors = [0xC43C3C, 0x3E92B8, 0xF0C060];
+  chipColors.forEach((col, i) => {
+    place(new THREE.CylinderGeometry(0.045, 0.045, 0.06, 12), m(col, 0.5, 0.25), 0.52 + (i % 2) * 0.12, 0.845, -0.18 + i * 0.14);
+  });
+}
+
 
 // ── Item list — today's EXACT lobby layout ────────────────────────────────────
 // Obstacle-bearing items appear first, in the same order as the original

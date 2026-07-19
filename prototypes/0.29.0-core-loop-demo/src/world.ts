@@ -24,7 +24,7 @@ import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
-import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, readLiveRoomStatus } from './devices';
+import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, createCashierUI, createRouletteUI, readLiveRoomStatus } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
 import { deviceFocus } from './deviceFocus';
@@ -2032,6 +2032,19 @@ export class World {
       // 🚀 #30 SH1: ship-status readout (flight controls come with the
       // flight slices — the panel says so).
       deviceFocus.beginFocus(this.player, device, createHelmUI());
+      return;
+    }
+
+    if (device.kind === 'cashier' || device.kind === 'roulette') {
+      // 🎰 #69 G1/G2: the HOUSE side (cashier book, croupier spin) rides the
+      // same owner-equivalent seam as room editing — canEditRoom funnels
+      // main.ts's isLocalPlayerRoomOwner, so a venture-owned room makes every
+      // shareholder the house (the #68 V1 rule, applied to the casino).
+      const isHouse = () => canEditRoom().ok;
+      const ui = device.kind === 'cashier'
+        ? createCashierUI({ isHouse })
+        : createRouletteUI({ itemId: deviceId, isHouse });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

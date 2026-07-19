@@ -421,9 +421,13 @@ function onClickCapture(e: MouseEvent): void {
   if (!active) return;
   // DOM UI (toolbar, editor, phone, dev menu, the ENTER ROOM bubble…) owns its
   // own clicks — we only claim clicks that reach the GAME CANVAS. Without this
-  // guard the capture listener would strangle every button at level 3.
+  // guard the capture listener would strangle every button at level 3. The
+  // check is against THE renderer's element, not tagName: UI panes carry
+  // canvases of their own (game boards, the 🎡 roulette felt) and a tagName
+  // guard would strangle those instead.
   const t = e.target as HTMLElement | null;
-  if (t && t.tagName !== 'CANVAS') return;
+  const gameCanvas = gr().renderer?.domElement ?? null;
+  if (t && (gameCanvas ? t !== gameCanvas : t.tagName !== 'CANVAS')) return;
   // The exterior view owns canvas clicks — never walk-to-point from space.
   e.stopPropagation();
   const camera = gr().camera;
