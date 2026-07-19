@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.26 — 2026-07-19
+
+### 📟 Stats Grow Up — Version, Disk Budget, and a Friendlier Default
+
+- **The rotate-view arrows now truly wait for the room** (owner report: still visible pre-entry): the camera rig itself enforces the in-room gate every frame on top of the stylesheet rule, so no build or style-ordering quirk can leak them again. Verified riding a real boot end to end — never visible until ENTER ROOM.
+- **Settings › Stats shows the installed version** (from a new in-app version constant that release bumps keep in step).
+- **Settings › Stats shows this device's mesh storage**: live browser-store usage with a usage bar, plus a selectable **disk budget** (250 MB / 1 GB / 5 GB / Unlimited, default 1 GB). Honest scope: the number is what the browser reports for this device's room-record store, and the budget is advisory until a clean-up slice enforces it — the panel says so.
+- **"Discoverable — friends may introduce me" now defaults to ON** (owner request): friend-of-friend introductions are the point of the mesh. An explicit opt-out is respected forever; only fresh installs (or never-touched toggles) change behavior.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.26 in place — including the new 9th version location, `src/version.ts`). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.25 — 2026-07-19
 
 ### 🤫 Silent Boot — No Toasts, No Buttons Until You're Home

@@ -73,10 +73,11 @@ function cardSignBytes(pub: string, name: string, issuedAt: number, hints: unkno
 
 const DISCOVERABLE_KEY = 'ssf-discoverable';
 
-/** Whether WE consent to friend-of-friend introduction (default off — opt-in,
- *  the sovereignty-minded default). */
+/** Whether WE consent to friend-of-friend introduction. Default ON (owner
+ *  request 2026-07-19 — friends introducing friends is the point of the
+ *  mesh); an explicit opt-out ('0') is always respected. */
 export function isDiscoverable(): boolean {
-  try { return localStorage.getItem(DISCOVERABLE_KEY) === '1'; } catch { return false; }
+  try { return localStorage.getItem(DISCOVERABLE_KEY) !== '0'; } catch { return true; }
 }
 
 export function setDiscoverable(on: boolean): void {
