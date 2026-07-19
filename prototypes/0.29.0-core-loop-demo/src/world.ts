@@ -691,11 +691,21 @@ export class World {
     }
     // addSideWalls order: [0] = left (x=-6). The zoom machinery consults the
     // flags too (it force-restores walls at interior levels otherwise).
-    this.sideWalls.forEach((wall, i) => { wall.visible = !this.sideWallCovered[i]; });
+    this.sideWalls.forEach((wall, i) => { wall.visible = !this.hullEditView && !this.sideWallCovered[i]; });
   }
 
   /** Which built-in side walls are REPLACED by placed wall sections. */
   private sideWallCovered: boolean[] = [false, false];
+
+  /** 🛰️ HULL EDIT presentation (editMode hull scope): walls drop so the
+   *  outside is visible/clickable; the per-frame interior restore respects
+   *  the flag, and clearing it re-runs the coverage rules. */
+  private hullEditView = false;
+
+  public setHullEditView(on: boolean): void {
+    this.hullEditView = on;
+    this.sideWalls.forEach((wall, i) => { wall.visible = !on && !this.sideWallCovered[i]; });
+  }
 
   public updateNorthDoorForFireplace(): void {
     const north = findDoor('north');
@@ -1241,9 +1251,10 @@ export class World {
       });
       if (this.platformFloor) this.platformFloor.visible = true;
       // 🧱🪟 Placed wall sections REPLACE a built-in side wall — the interior
-      // restore must not resurrect a covered one.
+      // restore must not resurrect a covered one (nor one dropped for 🛰️
+      // HULL EDIT).
       this.sideWalls.forEach((wall, i) => {
-        wall.visible = !this.sideWallCovered[i];
+        wall.visible = !this.hullEditView && !this.sideWallCovered[i];
       });
 
       // Completely clear and hide outer capsule roof and shielding so they don't block the camera!
@@ -2049,6 +2060,9 @@ export class World {
         editRoom: {
           permission: () => canEditRoom(),
           request: () => deviceFocus.releaseThen(() => roomEdit.enter(this)),
+          // 🛰️ Same machinery, hull presentation — camera pulls back and the
+          // walls drop so the OUTSIDE is visible and clickable.
+          requestHull: () => deviceFocus.releaseThen(() => roomEdit.enter(this, 'hull')),
         },
       });
       deviceFocus.beginFocus(this.player, device, ui);

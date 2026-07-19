@@ -300,6 +300,9 @@ export interface RoomTerminalDeps {
   editRoom?: {
     permission: () => RoomEditPermission;
     request: () => void;
+    /** 🛰️ EDIT HULL — same edit mode, camera pulled back + walls dropped so
+     *  the OUTSIDE of the module (tanks, engines, stacks) is editable. */
+    requestHull: () => void;
   };
 }
 
@@ -362,15 +365,22 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
     // change (e.g. set via console for the non-owner test path) shows up live.
     const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
+    const hullBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-hull');
     const editNote = panel.querySelector<HTMLElement>('#device-terminal-edit-room-note');
     if (editBtn && deps.editRoom) {
       const perm = deps.editRoom.permission();
-      editBtn.disabled = !perm.ok;
-      editBtn.style.opacity = perm.ok ? '1' : '0.35';
-      editBtn.style.cursor = perm.ok ? 'pointer' : 'not-allowed';
-      editBtn.title = perm.ok
-        ? 'Rearrange this room’s furniture'
-        : perm.reason;
+      for (const btn of [editBtn, hullBtn]) {
+        if (!btn) continue;
+        btn.disabled = !perm.ok;
+        btn.style.opacity = perm.ok ? '1' : '0.35';
+        btn.style.cursor = perm.ok ? 'pointer' : 'not-allowed';
+      }
+      editBtn.title = perm.ok ? 'Rearrange this room’s furniture' : perm.reason;
+      if (hullBtn) {
+        hullBtn.title = perm.ok
+          ? 'Mount tanks and engines on the OUTSIDE of the module (stacks too)'
+          : perm.reason;
+      }
       if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
     }
 
@@ -487,18 +497,34 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           style="width:${CANVAS_CSS}px; height:${CANVAS_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
         ${deps.editRoom ? `
         <div style="display:flex; flex-direction:column; gap:3px;">
-          <button id="device-terminal-edit-room" style="
-            padding: 8px 12px;
-            background: rgba(212, 168, 75, 0.10);
-            border: 1px solid rgba(212, 168, 75, 0.45);
-            border-radius: 6px;
-            color: #F0C060;
-            font-family: inherit;
-            font-size: 12px;
-            font-weight: 800;
-            letter-spacing: 1.5px;
-            cursor: pointer;
-          ">EDIT ROOM ✎</button>
+          <div style="display:flex; gap:8px;">
+            <button id="device-terminal-edit-room" style="
+              flex: 1;
+              padding: 8px 12px;
+              background: rgba(212, 168, 75, 0.10);
+              border: 1px solid rgba(212, 168, 75, 0.45);
+              border-radius: 6px;
+              color: #F0C060;
+              font-family: inherit;
+              font-size: 12px;
+              font-weight: 800;
+              letter-spacing: 1.5px;
+              cursor: pointer;
+            ">EDIT ROOM ✎</button>
+            <button id="device-terminal-edit-hull" style="
+              flex: 1;
+              padding: 8px 12px;
+              background: rgba(62, 146, 184, 0.10);
+              border: 1px solid rgba(62, 146, 184, 0.45);
+              border-radius: 6px;
+              color: #7FD4FF;
+              font-family: inherit;
+              font-size: 12px;
+              font-weight: 800;
+              letter-spacing: 1.5px;
+              cursor: pointer;
+            ">EDIT HULL 🛰️</button>
+          </div>
           <div id="device-terminal-edit-room-note" style="font-size:9px; color:#4A5560; letter-spacing:0.5px;"></div>
         </div>` : ''}
         <div>
@@ -516,11 +542,16 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       // EDIT ROOM (#33 M2): release the focus first, THEN enter edit mode —
       // the wired request() is deviceFocus.releaseThen(→ roomEdit.enter).
       const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
+      const hullBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-hull');
       if (editBtn && deps.editRoom) {
         const editRoom = deps.editRoom;
         editBtn.addEventListener('click', () => {
           if (!editRoom.permission().ok) return; // gate re-checked at press time
           editRoom.request();
+        });
+        hullBtn?.addEventListener('click', () => {
+          if (!editRoom.permission().ok) return;
+          editRoom.requestHull();
         });
       }
       deps.onEngagedChange?.(true);
