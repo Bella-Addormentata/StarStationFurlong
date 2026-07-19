@@ -1593,6 +1593,8 @@ function harvestStationAtlas(): void {
 function renderBankApp(): void {
   const view = document.getElementById('phone-app-bank');
   if (!view) return;
+  // Same black-inheritance fix as the VENTURES app (portfolio/property rows).
+  view.style.color = '#e8d5a3';
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
   const myPub = getIdentityPub();
   const header = (t: string) => `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
@@ -1750,6 +1752,9 @@ function executeDeedHandover(toPlayerId: string): boolean {
 function renderVenturesApp(): void {
   const view = document.getElementById('phone-app-ventures');
   if (!view) return;
+  // Readable default: template lines without an explicit color used to
+  // inherit BLACK on the near-black screen (cap-table names, property rows).
+  view.style.color = '#e8d5a3';
   if (!view.dataset.wired) {
     view.dataset.wired = '1';
     view.addEventListener('click', (e) => {
@@ -1851,7 +1856,7 @@ function renderVenturesApp(): void {
     let transferBlock = '';
     if (here && currentRoomDeedIsMine()) {
       if (office) {
-        transferBlock = `<div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:10px;">This module is ${ventureName ? `the registered office of 🚀 ${esc(ventureName)}` : 'a registered office'} — the Charter holds its deed. Bring in co-owners by transferring shares instead.</div>`;
+        transferBlock = `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">This module is ${ventureName ? `the registered office of 🚀 ${esc(ventureName)}` : 'a registered office'} — the Charter holds its deed. Bring in co-owners by transferring shares instead.</div>`;
       } else {
         // Recipients: every KEYED players entry in this doc except me — they
         // have been here, so their pub resolves on every owner surface.
@@ -1866,24 +1871,24 @@ function renderVenturesApp(): void {
         });
         const armed = !!deedHandoverArmed && !!armedName;
         transferBlock = options.length
-          ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">HAND OVER THE DEED</div>
+          ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">HAND OVER THE DEED</div>
              <div style="display:flex; gap:4px; margin-top:4px;">
                <select id="deed-transfer-to" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">${options.join('')}</select>
                <button type="button" data-venture-action="deed-transfer" style="${pill}${armed ? ' background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;' : ''}">${armed ? '⚠ CONFIRM' : '🖋 HAND OVER'}</button>
              </div>
-             <div id="deed-transfer-note" style="font-size:8.5px; color:#ffb300; margin-top:3px; min-height:10px;">${armed ? `Hand this module to ${esc(armedName)}? Tap CONFIRM to sign the deed over.` : ''}</div>
-             <div style="font-size:8.5px; color:rgba(212,168,75,0.35);">The new owner takes the module as it stands — passes, door policies, co-hosts${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ''} ride along. You cannot take a deed back.</div>`
-          : '<div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:10px;">No one to hand the deed to yet — the recipient must visit this module once (their key signs into the room record).</div>';
+             <div id="deed-transfer-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${armed ? `Hand this module to ${esc(armedName)}? Tap CONFIRM to sign the deed over.` : ''}</div>
+             <div style="font-size:9px; color:rgba(212,168,75,0.65);">The new owner takes the module as it stands — passes, door policies, co-hosts${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ''} ride along. You cannot take a deed back.</div>`
+          : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">No one to hand the deed to yet — the recipient must visit this module once (their key signs into the room record).</div>';
       }
     } else if (!here) {
-      transferBlock = `<div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:10px;">The deed is kept at the module — travel there to hand it over. Recorded ${new Date(deedDetail.lastSeen).toLocaleDateString()}.</div>`;
+      transferBlock = `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">The deed is kept at the module — travel there to hand it over. Recorded ${new Date(deedDetail.lastSeen).toLocaleDateString()}.</div>`;
     }
 
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← REAL ESTATE</button>
       <div style="font-size:14px; font-weight:800; color:#f0c060;">🏠 ${esc(name)}</div>
-      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">DEED · module ${esc(deedDetail.roomId.slice(0, 10))}… · ${here ? 'you are here' : 'held from afar'}</div>
-      <div style="font-size:10px; margin-top:10px;">${ventureName ? `🚀 Assigned to <b>${esc(ventureName)}</b>${office ? ' <span style="color:rgba(212,168,75,0.4);">· registered office</span>' : ' <span style="color:rgba(212,168,75,0.4);">· venture property</span>'}` : 'Held outright — sole personal owner.'}</div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.8); margin-top:2px;">DEED · module ${esc(deedDetail.roomId.slice(0, 10))}… · ${here ? 'you are here' : 'held from afar'}</div>
+      <div style="font-size:10px; margin-top:10px;">${ventureName ? `🚀 Assigned to <b>${esc(ventureName)}</b>${office ? ' <span style="color:rgba(212,168,75,0.7);">· registered office</span>' : ' <span style="color:rgba(212,168,75,0.7);">· venture property</span>'}` : 'Held outright — sole personal owner.'}</div>
       ${dockedLinks > 0 ? `<div style="font-size:10px; margin-top:4px;">🚪 ${dockedLinks} docked link${dockedLinks === 1 ? '' : 's'}</div>` : ''}
       ${transferBlock}
     `;
@@ -1903,32 +1908,32 @@ function renderVenturesApp(): void {
       const pct = Math.round((n / detail.totalShares) * 100);
       const name = detail.holderNames[pub] ?? 'Unknown-Clone';
       return `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px;">
-        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(pub)}">${pub === myPub ? '⭐' : '👤'} ${esc(name)} <span style="color:rgba(212,168,75,0.4);">${esc(pub.slice(0, 8))}</span></span>
-        <span style="flex-shrink:0; color:#f0c060;">${n} <span style="color:rgba(212,168,75,0.5);">(${pct}%)</span></span>
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(pub)}">${pub === myPub ? '⭐' : '👤'} ${esc(name)} <span style="color:rgba(212,168,75,0.7);">${esc(pub.slice(0, 8))}</span></span>
+        <span style="flex-shrink:0; color:#f0c060;">${n} <span style="color:rgba(212,168,75,0.8);">(${pct}%)</span></span>
       </div>`;
     }).join('');
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← ALL VENTURES</button>
       <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(detail.name)}</div>
-      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">CHARTER · signed ${new Date(detail.foundedAt).toLocaleDateString()} by ${esc(detail.founderName)} · ${detail.totalShares} shares issued</div>
-      <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">OWNERS</div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.8); margin-top:2px;">CHARTER · signed ${new Date(detail.foundedAt).toLocaleDateString()} by ${esc(detail.founderName)} · ${detail.totalShares} shares issued</div>
+      <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">OWNERS</div>
       ${capTable}
-      <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">PROPERTY</div>
-      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.4);">· ${detail.snapshotAt === undefined ? 'registered office' : 'venture property'}</span></div>
+      <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">PROPERTY</div>
+      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.7);">· ${detail.snapshotAt === undefined ? 'registered office' : 'venture property'}</span></div>
       ${(ventureLedger().find((e) => e.id === detail.id)?.properties ?? [])
         .filter((rid) => rid !== (activeBootstrap?.roomId ?? ''))
-        .map((rid) => `<div style="margin-top:3px; font-size:10px;">🏘 ${esc(readAtlas()[rid]?.name || 'Module')} <span style="color:rgba(212,168,75,0.4);">${esc(rid.slice(0, 10))}…</span></div>`).join('')}
-      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? ' Cap table is a snapshot — trades happen at the office.' : ''}</div>
+        .map((rid) => `<div style="margin-top:3px; font-size:10px;">🏘 ${esc(readAtlas()[rid]?.name || 'Module')} <span style="color:rgba(212,168,75,0.7);">${esc(rid.slice(0, 10))}…</span></div>`).join('')}
+      <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? ' Cap table is a snapshot — trades happen at the office.' : ''}</div>
       ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ''}
       ${mine > 0 && detail.snapshotAt === undefined ? `
-        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">TRANSFER SHARES</div>
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">TRANSFER SHARES</div>
         <div style="display:flex; gap:4px; margin-top:4px;">
           <input type="text" id="venture-transfer-pub" placeholder="recipient's key (from CONTACTS)" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
           <input type="number" id="venture-transfer-count" min="1" max="${mine}" placeholder="#" style="width:44px; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
           <button type="button" data-venture-action="transfer" style="${pill}">SEND</button>
         </div>
-        <div id="venture-transfer-note" style="font-size:8.5px; color:#ffb300; margin-top:3px; min-height:10px;"></div>
-        <div style="font-size:8.5px; color:rgba(212,168,75,0.35);">You hold ${mine} of ${detail.totalShares} shares. Transfers are recorded for everyone in the room.</div>` : ''}
+        <div id="venture-transfer-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;"></div>
+        <div style="font-size:9px; color:rgba(212,168,75,0.65);">You hold ${mine} of ${detail.totalShares} shares. Transfers are recorded for everyone in the room.</div>` : ''}
     `;
     return;
   }
@@ -1938,7 +1943,7 @@ function renderVenturesApp(): void {
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← ALL VENTURES</button>
       <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(entry?.name ?? 'Venture')}</div>
-      <div style="font-size:10px; color:rgba(212,168,75,0.5); margin-top:8px;">The Charter is kept at the registered office. Visit the venture's module to view the cap table or transfer shares.</div>
+      <div style="font-size:10px; color:rgba(212,168,75,0.8); margin-top:8px;">The Charter is kept at the registered office. Visit the venture's module to view the cap table or transfer shares.</div>
     `;
     return;
   }
@@ -1953,7 +1958,7 @@ function renderVenturesApp(): void {
     const mine = current.shares[myPub] ?? 0;
     const type = Object.keys(current.shares).length > 1 ? 'JOINT' : 'SOLE';
     rows.push(`<button type="button" data-venture-action="open" data-id="${esc(current.id)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,0.06); border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
-      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(current.name)} <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span></span>
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(current.name)} <span style="color:rgba(212,168,75,0.7); font-size:9px;">· here</span></span>
       <span style="flex-shrink:0; font-size:9px;">${type}${mine > 0 ? ` · ${Math.round((mine / current.totalShares) * 100)}%` : ''}</span>
     </button>`);
   }
@@ -1971,8 +1976,8 @@ function renderVenturesApp(): void {
   const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
   const ownThisRoom = ownerVal === getPlayerId();
   const foundBlock = !current && ownThisRoom && currentRoomId
-    ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:14px;">SIGN A CHARTER</div>
-       <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Found a venture here — this module becomes its registered office and first property. ${CHARTER_TOTAL_SHARES_LABEL} shares are issued to you; transfer them to bring in co-owners.</div>
+    ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">SIGN A CHARTER</div>
+       <div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:2px;">Found a venture here — this module becomes its registered office and first property. ${CHARTER_TOTAL_SHARES_LABEL} shares are issued to you; transfer them to bring in co-owners.</div>
        <div style="display:flex; gap:4px; margin-top:6px;">
          <input type="text" id="venture-found-name" maxlength="48" placeholder="venture name" style="flex:1; min-width:0; font-size:10px; padding:5px 8px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
          <button type="button" data-venture-action="found" style="${pill}">🖋 SIGN</button>
@@ -1997,16 +2002,16 @@ function renderVenturesApp(): void {
       ? `🚀 ${esc(d.ventureName)}${d.isOffice ? ' · OFFICE' : ''}`
       : 'SOLE';
     return `<button type="button" data-venture-action="deed-open" data-id="${esc(d.roomId)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,${here ? '0.06' : '0.04'}); border:1px solid rgba(212,168,75,${here ? '0.2' : '0.14'}); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
-      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span>' : ''}</span>
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.7); font-size:9px;">· here</span>' : ''}</span>
       <span style="flex-shrink:0; font-size:9px;">${tag}</span>
     </button>`;
   });
 
   view.innerHTML = `
-    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">YOUR STAKES</div>
-    ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
-    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:14px;">REAL ESTATE</div>
-    ${deedRows.length ? deedRows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95);">YOUR STAKES</div>
+    ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">REAL ESTATE</div>
+    ${deedRows.length ? deedRows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
     ${foundBlock}
     ${addBlock}
   `;
