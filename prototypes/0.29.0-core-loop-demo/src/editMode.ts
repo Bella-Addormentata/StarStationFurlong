@@ -400,12 +400,21 @@ class RoomEditController {
       : null;
   }
 
+  /** 🛰️ Hull scope active: camera pulled back + side walls dropped so the
+   *  OUTSIDE of the module is visible and clickable. Same edit machinery. */
+  private hullScope = false;
+  private savedCameraZoom: number | null = null;
+
   /**
    * Enter edit mode from the plain isometric room view. Reached via the wall
-   * computer's EDIT ROOM button AFTER the device focus has released
-   * (deviceFocus.releaseThen continuation) — so the ortho camera is live.
+   * computer's EDIT ROOM / EDIT HULL buttons AFTER the device focus has
+   * released (deviceFocus.releaseThen continuation) — so the ortho camera is
+   * live. `scope` 'hull' (owner request: "how do I edit the outside?") is the
+   * SAME edit mode presented differently: the ortho camera zooms out to
+   * frame the hull margin and the side walls hide, so exterior mounts and
+   * stacks can be selected, carried and placed like any furniture.
    */
-  public enter(world: World): void {
+  public enter(world: World, scope: 'interior' | 'hull' = 'interior'): void {
     if (this.active) return;
 
     const perm = canEditRoom();
@@ -418,17 +427,27 @@ class RoomEditController {
     // (same guard shape as deviceFocus.onArrived).
     const zoomView = (window as unknown as { multiScaleZoom?: { getLevel?: () => number } }).multiScaleZoom;
     const zoomLevel = zoomView?.getLevel?.() ?? 2;
-    if (zoomLevel !== 2 || !(window.gameRenderer?.camera instanceof THREE.OrthographicCamera)) {
+    const camera = window.gameRenderer?.camera;
+    if (zoomLevel !== 2 || !(camera instanceof THREE.OrthographicCamera)) {
       return;
     }
 
     this.world = world;
     this.active = true;
+    if (scope === 'hull') {
+      this.hullScope = true;
+      this.savedCameraZoom = camera.zoom;
+      camera.zoom *= 0.52; // frame the room + a hull margin on every side
+      camera.updateProjectionMatrix();
+      world.setHullEditView(true);
+    }
     this.buildRaycastIndex(world);
     window.addEventListener('mousemove', this.onMouseMove);
     world.setEditMode(true);
     this.showExitButton();
-    showHint('EDIT MODE — click furniture to select · X removes · DONE EDITING (or ESC) exits', 4000);
+    showHint(scope === 'hull'
+      ? 'HULL EDIT — drag tanks/engines onto the walls or each other · stacks cap at 3 · X removes · DONE EDITING (or ESC) exits'
+      : 'EDIT MODE — click furniture to select · X removes · DONE EDITING (or ESC) exits', 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
@@ -440,6 +459,17 @@ class RoomEditController {
     this.hideExitButton();
     window.removeEventListener('mousemove', this.onMouseMove);
     this.setCanvasCursor('');
+    // 🛰️ Undo the hull-scope presentation before the world reference drops.
+    if (this.hullScope) {
+      const camera = window.gameRenderer?.camera;
+      if (camera instanceof THREE.OrthographicCamera && this.savedCameraZoom !== null) {
+        camera.zoom = this.savedCameraZoom;
+        camera.updateProjectionMatrix();
+      }
+      this.world?.setHullEditView(false);
+      this.hullScope = false;
+      this.savedCameraZoom = null;
+    }
     this.world?.setEditMode(false);
     this.raycastTargets = [];
     this.meshToItem.clear();

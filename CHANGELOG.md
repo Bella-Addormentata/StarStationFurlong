@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.19 — 2026-07-19
+
+### 🛰️ EDIT HULL — the Outside Is a Click Away
+
+- **The room console grew an EDIT HULL 🛰️ button** beside EDIT ROOM ✎ (owner request: "I don't see how to edit the outside"). Press it and the same edit mode opens with the **camera pulled back and the walls dropped**, so the hull margin all around the module is visible and clickable — drag tanks onto walls, stack layers, mount engines, remove pieces, exactly like interior furniture. DONE EDITING (or ESC) puts the camera and walls back.
+- Both buttons share the owner-equivalence gate (venture shareholders included). The hull hint spells out the stacking rules as you enter.
+- Verified: both buttons render and gate together; hull scope pulls the ortho camera to 0.52× and keeps walls hidden through live frames; exit restores zoom exactly and re-applies the wall-section coverage rules.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.19 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.18 — 2026-07-19
 
 ### 🛰️ Hull Space Unified — Stack Your Tanks, Mount Your Engines
