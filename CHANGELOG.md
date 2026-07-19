@@ -11,6 +11,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.13 — 2026-07-18
+
+### 🎰 The Casino Opens — Cashier Chips + Roulette (#69 G1/G2)
+
+- **🎰 CASHIER ATM** (new buildable fixture): walk up for **CHIPS** — buy in (+25/+100/+500), cash out, and read **THE CAGE**, a fully public ledger: chips issued, returned, on the floor, house net, and every player's balance. The house keeps no hidden book — every number is derived from the public records, so issuance can't be quietly inflated. (Test network: the cage advances chips against your Account; real Chia buy-ins arrive with the Registry cashier — #69 G4.)
+- **🎡 ROULETTE** (new buildable table): single-zero wheel, the classic felt — straight numbers 35:1, dozens & columns 2:1, red/black · odd/even · 1–18/19–36 1:1 — chip denominations 1/5/25/100, undo/clear, live per-player "on the felt" totals. **House-banked**: the croupier (the room's owner side — in a venture-owned room, every shareholder) presses SPIN; one settle write carries the result and payouts to every client, and the wheel animation lands on the honest pocket. Fair-spin (commit-reveal) is the #69 G5 upgrade and the panel says so.
+- **BANK app** shows the chips you hold in the room you're standing in (chips stay with their casino).
+- Chips, bets and table state are room-doc records in plain language (chips · cashier · the cage — never chain jargon), shaped so the Registry-anchored chip upgrade slots in without changing a single screen.
+- Fixed a latent exterior-view guard: it claimed clicks on ANY canvas while the space view was active — now only the game canvas — so device panes with canvases of their own (game boards, the roulette felt) can never be strangled by it.
+- Verified: 22/22 payout engine cases; full table loop live (buy-in 200 → three felt bets → SPIN landed 5 RED → payout 25 credited to the chip → NEW ROUND); cage arithmetic; chips persist across reload.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.13 in place). **Frontend-only — node binaries unchanged from v0.30.6.** (Also rides along: v0.32.12's readable-text fix for the VENTURES + BANK apps, committed on the branch after that tag.)
+
 ## v0.32.12 — 2026-07-18
 
 ### 🏠 Real Estate — Deeds in the Ventures App

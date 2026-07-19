@@ -53,10 +53,20 @@ import {
 import type { ChessState, ChessColor } from './games/chess';
 import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
+// 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
+import {
+  readChips, buyInChips, cashOutChips, spendChips, creditChips,
+  readCageLedger, readTableState, writeTableState,
+  readMyBets, writeMyBets, readAllBets, subscribeCasino,
+} from './casinoDoc';
+import {
+  WHEEL_ORDER, resolveRound, betLabel, pocketColor,
+} from './games/roulette';
+import type { RouletteBet, RouletteTableState } from './games/roulette';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -1528,5 +1538,577 @@ export function createHelmUI(): DeviceUI {
     },
 
     update(): void { /* status is observer-driven; nothing per-frame */ },
+  };
+}
+
+// ── 🎰 #69 G1: the CASHIER — chips in, chips out, the cage ledger public ─────
+
+export interface CashierUIDeps {
+  /** Owner-equivalent predicate (the one-seam ownership gate, via world). */
+  isHouse: () => boolean;
+}
+
+const CH_GOLD = '#d4a84b';
+const CH_GOLD_BRIGHT = '#F0C060';
+const CH_DIM = '#4A5560';
+const CH_PINK = '#FF2D95';
+
+/**
+ * The cashier ATM's focused UI (#69 G1): YOUR CHIPS, buy-in, cash-out, and
+ * the cage ledger — issuance is PUBLIC (every player sees issued/outstanding/
+ * house net and the floor balances), which is the whole trust model of
+ * doc-recorded chips. Plain language only: chips / cashier / the cage —
+ * the Registry-anchored upgrade (G4) keeps this exact screen.
+ */
+export function createCashierUI(deps: CashierUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  const myId = getPlayerId();
+
+  const render = (): void => {
+    if (!panel) return;
+    const chips = readChips(myId);
+    const cage = readCageLedger();
+    const btn = (id: string, label: string, disabled = false): string => `
+      <button id="${id}" ${disabled ? 'disabled' : ''} style="
+        flex:1; padding: 8px 6px;
+        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
+        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
+        border-radius: 6px; color: ${disabled ? CH_DIM : CH_GOLD_BRIGHT};
+        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1px;
+        cursor: ${disabled ? 'not-allowed' : 'pointer'};
+      ">${label}</button>`;
+    const floorRows = Object.entries(cage.balances)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([pid, n]) => `
+        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
+          <span style="color:${CH_GOLD};">${readPlayerDisplayName(pid).toUpperCase()}${pid === myId ? ' (YOU)' : ''}</span>
+          <span style="color:${CH_GOLD_BRIGHT};">🪙 ${n}</span>
+        </div>`);
+    const net = cage.houseNet;
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🎰 CASHIER</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="display:flex; align-items:baseline; gap:10px;">
+        <span style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">YOUR CHIPS</span>
+        <span style="font-size:26px; font-weight:800; color:${CH_GOLD_BRIGHT};">🪙 ${chips}</span>
+      </div>
+      <div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">BUY-IN</div>
+        <div style="display:flex; gap:8px;">
+          ${btn('cashier-buy-25', '+25')}
+          ${btn('cashier-buy-100', '+100')}
+          ${btn('cashier-buy-500', '+500')}
+        </div>
+        <div style="font-size:9px; color:${CH_DIM}; margin-top:5px; line-height:1.5;">
+          Test network — the cage advances chips against your Account.
+          Real Chia buy-ins arrive with the Registry cashier.
+        </div>
+      </div>
+      <div>
+        <div style="font-size:10px; color:${CH_GOLD}; letter-spacing:2px; margin-bottom:6px;">CASH OUT</div>
+        <div style="display:flex; gap:8px;">${btn('cashier-cashout', 'RETURN ALL CHIPS TO THE CAGE', chips <= 0)}</div>
+      </div>
+      <div style="border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:10px 12px; background:rgba(10,16,24,0.6);">
+        <div style="font-size:10px; color:${CH_PINK}; letter-spacing:2px; margin-bottom:6px;">THE CAGE — PUBLIC LEDGER</div>
+        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
+          <span style="color:${CH_DIM};">CHIPS ISSUED</span><span style="color:${CH_GOLD};">${cage.issued}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
+          <span style="color:${CH_DIM};">RETURNED</span><span style="color:${CH_GOLD};">${cage.cashed}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0;">
+          <span style="color:${CH_DIM};">ON THE FLOOR</span><span style="color:${CH_GOLD};">${cage.outstanding}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; font-size:10px; padding:2px 0; border-top:1px solid rgba(212,168,75,0.12); margin-top:3px;">
+          <span style="color:${CH_DIM};">HOUSE NET</span>
+          <span style="font-weight:800; color:${net >= 0 ? '#00E676' : '#FF8A80'};">${net >= 0 ? '+' : ''}${net}</span>
+        </div>
+        ${floorRows.length ? `<div style="border-top:1px solid rgba(212,168,75,0.12); margin-top:6px; padding-top:5px;">${floorRows.join('')}</div>` : ''}
+      </div>
+      ${deps.isHouse() ? `
+      <div style="font-size:9.5px; color:${CH_PINK}; letter-spacing:0.5px;">
+        ★ YOU ARE THE HOUSE — table games pay from the cage; the ledger above is your book.
+      </div>` : ''}
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF CASINO CAGE v1 · chips are room records, ledger public · Registry chips later
+      </div>
+    `;
+    panel.querySelector<HTMLButtonElement>('#cashier-buy-25')?.addEventListener('click', () => buyInChips(myId, 25));
+    panel.querySelector<HTMLButtonElement>('#cashier-buy-100')?.addEventListener('click', () => buyInChips(myId, 100));
+    panel.querySelector<HTMLButtonElement>('#cashier-buy-500')?.addEventListener('click', () => buyInChips(myId, 500));
+    panel.querySelector<HTMLButtonElement>('#cashier-cashout')?.addEventListener('click', () => cashOutChips(myId, readChips(myId)));
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-cashier-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 380px; max-height: 90vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeCasino(() => render());
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+    },
+    update(): void { /* observer-driven; nothing per-frame */ },
+  };
+}
+
+// ── 🎡 #69 G2: ROULETTE — house-banked, croupier spins, chips on the felt ────
+
+export interface RouletteUIDeps {
+  /** Furniture item id — keys the table + bet records in the casino map. */
+  itemId: string;
+  /** Owner-equivalent predicate: the croupier side (house/venture). */
+  isHouse: () => boolean;
+}
+
+/** Seconds the wheel animates after a settle lands. */
+const RL_SPIN_SECS = 4.0;
+const RL_GREEN = '#1B6B3A';
+const RL_RED = '#C43C3C';
+const RL_BLACK = '#23252E';
+
+/** Betting-board hit region (CSS px inside the board canvas). */
+interface BoardRegion {
+  x: number; y: number; w: number; h: number;
+  label: string;
+  fill: string | null;
+  bet: { type: RouletteBet['type']; pick?: number };
+}
+
+const RL_BOARD_W = 344;
+const RL_BOARD_H = 440;
+
+/** Single source for drawing AND hit-testing the classic layout. */
+function rouletteBoardRegions(): BoardRegion[] {
+  const regions: BoardRegion[] = [];
+  const GX = 116, GY = 40, CW = 72, CH = 30; // number grid
+  regions.push({ x: GX, y: 4, w: CW * 3, h: 32, label: '0', fill: RL_GREEN, bet: { type: 'straight', pick: 0 } });
+  for (let n = 1; n <= 36; n++) {
+    const r = Math.floor((n - 1) / 3), c = (n - 1) % 3;
+    regions.push({
+      x: GX + c * CW, y: GY + r * CH, w: CW, h: CH,
+      label: String(n),
+      fill: pocketColor(n) === 'red' ? RL_RED : RL_BLACK,
+      bet: { type: 'straight', pick: n },
+    });
+  }
+  // Dozens beside the grid.
+  for (let d = 0; d < 3; d++) {
+    regions.push({
+      x: 60, y: GY + d * CH * 4, w: 52, h: CH * 4,
+      label: ['1st', '2nd', '3rd'][d] + ' 12', fill: null, bet: { type: 'dozen', pick: d },
+    });
+  }
+  // Even-money outermost.
+  const even: Array<[string, RouletteBet['type']]> = [
+    ['1–18', 'low'], ['EVEN', 'even'], ['RED', 'red'],
+    ['BLACK', 'black'], ['ODD', 'odd'], ['19–36', 'high'],
+  ];
+  even.forEach(([label, type], i) => {
+    regions.push({
+      x: 4, y: GY + i * CH * 2, w: 52, h: CH * 2,
+      label, fill: type === 'red' ? RL_RED : type === 'black' ? RL_BLACK : null,
+      bet: { type },
+    });
+  });
+  // Column bets under the grid.
+  for (let c = 0; c < 3; c++) {
+    regions.push({
+      x: GX + c * CW, y: GY + 12 * CH + 4, w: CW, h: 30,
+      label: '2:1', fill: null, bet: { type: 'column', pick: c },
+    });
+  }
+  return regions;
+}
+
+/** Uniform pocket 0–36 via rejection sampling (no modulo bias). */
+function spinPocket(): number {
+  const buf = new Uint32Array(1);
+  for (;;) {
+    crypto.getRandomValues(buf);
+    if (buf[0] < 4294967289) return buf[0] % 37; // floor(2^32/37)*37
+  }
+}
+
+/**
+ * The roulette table's focused UI (#69 G2): a live wheel, the classic betting
+ * board (straight numbers + dozens/columns + even-money), chip denominations,
+ * and the croupier controls. House-banked: stakes leave your chips when they
+ * hit the felt; the croupier (owner-equivalent client — a venture-owned house
+ * pays every shareholder's croupier duty the same way) spins, and the settle
+ * write carries result + payouts for every client to converge on. Fairness is
+ * dev-phase trust (the croupier's client rolls) — commit-reveal is the G5
+ * upgrade, and the panel says so honestly.
+ */
+export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let wheelCanvas: HTMLCanvasElement | null = null;
+  let boardCanvas: HTMLCanvasElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let denom = 5;
+  /** Round whose spin animation was already started (never replay history). */
+  let animRound = 0;
+  /** Animation progress 0..1, or null when idle. */
+  let animT: number | null = null;
+  /** One-shot notice line (e.g. "not enough chips"), cleared on next render. */
+  let flash = '';
+  const myId = getPlayerId();
+  const regions = rouletteBoardRegions();
+
+  const state = (): RouletteTableState | null => readTableState(deps.itemId);
+  const round = (): number => state()?.round ?? 1;
+  const phase = (): 'betting' | 'settled' => state()?.phase ?? 'betting';
+  const myBets = (): RouletteBet[] => readMyBets(deps.itemId, myId, round());
+
+  // ── Bet placement (stakes move at placement time — see module doc) ─────────
+
+  const placeBet = (bet: { type: RouletteBet['type']; pick?: number }): void => {
+    if (phase() !== 'betting' || animT !== null) return;
+    if (!spendChips(myId, denom)) {
+      flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
+      render();
+      return;
+    }
+    writeMyBets(deps.itemId, myId, round(), [...myBets(), { ...bet, amount: denom }]);
+  };
+
+  const undoBet = (): void => {
+    if (phase() !== 'betting') return;
+    const bets = myBets();
+    const last = bets[bets.length - 1];
+    if (!last) return;
+    creditChips(myId, last.amount);
+    writeMyBets(deps.itemId, myId, round(), bets.slice(0, -1));
+  };
+
+  const clearBets = (): void => {
+    if (phase() !== 'betting') return;
+    const total = myBets().reduce((sum, b) => sum + b.amount, 0);
+    if (total > 0) creditChips(myId, total);
+    writeMyBets(deps.itemId, myId, round(), []);
+  };
+
+  // ── Croupier: the settle write is the round's single source of truth ───────
+
+  const spin = (): void => {
+    if (!deps.isHouse() || phase() !== 'betting') return;
+    const r = round();
+    const result = spinPocket();
+    const allBets = readAllBets(deps.itemId, r);
+    const payouts = resolveRound(allBets, result);
+    writeTableState(deps.itemId, {
+      kind: 'roulette', phase: 'settled', round: r,
+      result, resultAt: Date.now(), payouts,
+    });
+    // Winners are credited by the same croupier client, right after the
+    // settle write (the payouts record is what spectators reconcile against).
+    for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
+  };
+
+  const newRound = (): void => {
+    if (!deps.isHouse() || phase() !== 'settled') return;
+    writeTableState(deps.itemId, {
+      kind: 'roulette', phase: 'betting', round: round() + 1,
+      result: null, resultAt: 0, payouts: null,
+    });
+  };
+
+  // ── Wheel drawing ──────────────────────────────────────────────────────────
+
+  const WHEEL_CSS = 200, WHEEL_RES = 400;
+
+  const drawWheel = (rotation: number): void => {
+    if (!wheelCanvas) return;
+    const ctx = wheelCanvas.getContext('2d');
+    if (!ctx) return;
+    const S = WHEEL_RES, C = S / 2, R = S / 2 - 14;
+    ctx.clearRect(0, 0, S, S);
+    const seg = (Math.PI * 2) / WHEEL_ORDER.length;
+    for (let i = 0; i < WHEEL_ORDER.length; i++) {
+      // Pocket i is CENTERED at rotation + i·seg, measured from the top.
+      const a0 = -Math.PI / 2 + rotation + i * seg - seg / 2;
+      const col = pocketColor(WHEEL_ORDER[i]);
+      ctx.beginPath();
+      ctx.moveTo(C, C);
+      ctx.arc(C, C, R, a0, a0 + seg);
+      ctx.closePath();
+      ctx.fillStyle = col === 'green' ? RL_GREEN : col === 'red' ? RL_RED : RL_BLACK;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(212,168,75,0.5)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // Number label near the rim, upright along the pocket's spoke.
+      const mid = a0 + seg / 2;
+      ctx.save();
+      ctx.translate(C + Math.cos(mid) * (R - 22), C + Math.sin(mid) * (R - 22));
+      ctx.rotate(mid + Math.PI / 2);
+      ctx.fillStyle = '#F5EFDF';
+      ctx.font = 'bold 15px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(WHEEL_ORDER[i]), 0, 0);
+      ctx.restore();
+    }
+    // Hub + rim + top pointer.
+    ctx.beginPath(); ctx.arc(C, C, 52, 0, Math.PI * 2);
+    ctx.fillStyle = '#4A2F1B'; ctx.fill();
+    ctx.lineWidth = 4; ctx.strokeStyle = '#D4A84B'; ctx.stroke();
+    ctx.beginPath(); ctx.arc(C, C, R + 6, 0, Math.PI * 2);
+    ctx.lineWidth = 6; ctx.strokeStyle = '#D4A84B'; ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(C - 12, 2); ctx.lineTo(C + 12, 2); ctx.lineTo(C, 26);
+    ctx.closePath();
+    ctx.fillStyle = '#F0C060'; ctx.fill();
+  };
+
+  /** Wheel rotation that parks `result`'s pocket under the top pointer. */
+  const restingRotation = (result: number): number => {
+    const idx = Math.max(0, WHEEL_ORDER.indexOf(result));
+    return -idx * ((Math.PI * 2) / WHEEL_ORDER.length);
+  };
+
+  const drawWheelForNow = (): void => {
+    const s = state();
+    if (animT !== null && s?.result !== null && s !== null) {
+      const ease = 1 - Math.pow(1 - animT, 3); // cubic ease-out
+      drawWheel(ease * (Math.PI * 2 * 5 + restingRotation(s.result!)));
+    } else {
+      drawWheel(s?.phase === 'settled' && s.result !== null ? restingRotation(s.result) : 0);
+    }
+  };
+
+  // ── Board drawing + clicks ─────────────────────────────────────────────────
+
+  const drawBoard = (): void => {
+    if (!boardCanvas) return;
+    const ctx = boardCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(2, 0, 0, 2, 0, 0); // backing 2x, draw in CSS units
+    ctx.clearRect(0, 0, RL_BOARD_W, RL_BOARD_H);
+    ctx.fillStyle = '#14532D';
+    ctx.fillRect(0, 0, RL_BOARD_W, RL_BOARD_H);
+    const keyOf = (b: { type: string; pick?: number }) => `${b.type}:${b.pick ?? ''}`;
+    const mine = new Map<string, number>();
+    for (const b of myBets()) mine.set(keyOf(b), (mine.get(keyOf(b)) ?? 0) + b.amount);
+    const winning = state()?.phase === 'settled' && animT === null ? state()!.result : null;
+    for (const rg of regions) {
+      ctx.fillStyle = rg.fill ?? '#1B6B3A';
+      ctx.fillRect(rg.x, rg.y, rg.w, rg.h);
+      // Winning straight cell flares gold once the wheel has landed.
+      if (winning !== null && rg.bet.type === 'straight' && rg.bet.pick === winning) {
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#F0C060';
+        ctx.strokeRect(rg.x + 2, rg.y + 2, rg.w - 4, rg.h - 4);
+      } else {
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(240, 224, 180, 0.75)';
+        ctx.strokeRect(rg.x, rg.y, rg.w, rg.h);
+      }
+      ctx.fillStyle = '#F5EFDF';
+      ctx.font = `bold ${rg.bet.type === 'straight' && rg.bet.pick !== 0 ? 13 : 11}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(rg.label, rg.x + rg.w / 2, rg.y + rg.h / 2);
+      // My chips on this region.
+      const staked = mine.get(keyOf(rg.bet));
+      if (staked) {
+        const cx = rg.x + rg.w - 14, cy = rg.y + rg.h - 12;
+        ctx.beginPath(); ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+        ctx.fillStyle = '#F0C060'; ctx.fill();
+        ctx.lineWidth = 2; ctx.strokeStyle = '#8E6A1E'; ctx.stroke();
+        ctx.fillStyle = '#1A1408';
+        ctx.font = 'bold 9px monospace';
+        ctx.fillText(String(staked), cx, cy + 0.5);
+      }
+    }
+  };
+
+  const onBoardClick = (e: MouseEvent): void => {
+    if (!boardCanvas) return;
+    const rect = boardCanvas.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * RL_BOARD_W;
+    const y = ((e.clientY - rect.top) / rect.height) * RL_BOARD_H;
+    const hit = regions.find((rg) => x >= rg.x && x < rg.x + rg.w && y >= rg.y && y < rg.y + rg.h);
+    if (hit) placeBet(hit.bet);
+  };
+
+  // ── Panel ──────────────────────────────────────────────────────────────────
+
+  const render = (): void => {
+    if (!panel) return;
+    const s = state();
+    const p = phase();
+    const chips = readChips(myId);
+    const bets = myBets();
+    const staked = bets.reduce((sum, b) => sum + b.amount, 0);
+    const house = deps.isHouse();
+    const spinning = animT !== null;
+
+    // Other players' chips on the felt (spectator/croupier context).
+    const all = readAllBets(deps.itemId, round());
+    const others = Object.entries(all)
+      .filter(([pid]) => pid !== myId)
+      .map(([pid, list]) => `${readPlayerDisplayName(pid).toUpperCase()} 🪙 ${list.reduce((t, b) => t + b.amount, 0)}`);
+
+    let statusLine: string;
+    let statusColor = GT_GOLD_BRIGHT;
+    if (spinning) {
+      statusLine = 'NO MORE BETS — THE WHEEL SPINS…';
+      statusColor = CH_PINK;
+    } else if (p === 'settled' && s?.result !== null && s) {
+      const won = s.payouts?.[myId] ?? 0;
+      const col = pocketColor(s.result!).toUpperCase();
+      statusLine = `● ${s.result} ${col}` + (staked > 0 || won > 0
+        ? (won > 0 ? ` — YOU WON 🪙 ${won}` : ' — NO WIN THIS TIME')
+        : '');
+      statusColor = won > 0 ? '#00E676' : GT_GOLD_BRIGHT;
+    } else {
+      statusLine = `ROUND ${round()} — PLACE YOUR BETS`
+        + (chips <= 0 && staked === 0 ? ' · VISIT THE CASHIER FOR CHIPS' : '');
+    }
+
+    const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
+      <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
+        padding: 6px 10px;
+        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
+        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
+        border-radius: 6px; color: ${disabled ? GT_DIM : GT_GOLD_BRIGHT};
+        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1.5px;
+        cursor: ${disabled ? 'not-allowed' : 'pointer'}; opacity: ${disabled ? '0.5' : '1'};
+      ">${label}</button>`;
+
+    const denomBtn = (n: number): string => `
+      <button data-denom="${n}" style="
+        width: 44px; height: 30px; border-radius: 15px;
+        background: ${denom === n ? 'rgba(240,192,96,0.28)' : 'rgba(212,168,75,0.07)'};
+        border: 2px solid ${denom === n ? '#F0C060' : 'rgba(212,168,75,0.35)'};
+        color: ${denom === n ? '#F0C060' : CH_GOLD};
+        font-family: inherit; font-size: 10px; font-weight: 800; cursor: pointer;
+      ">${n}</button>`;
+
+    const betRows = bets.map((b) => `${betLabel(b)} 🪙 ${b.amount}`).join(' · ');
+
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1px;">🎡 ROULETTE</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div id="rl-status" style="font-size:11px; font-weight:800; letter-spacing:1px; color:${statusColor};">${statusLine}</div>
+      ${flash ? `<div style="font-size:10px; font-weight:800; color:#FF8A80; letter-spacing:1px;">${flash}</div>` : ''}
+      <div style="display:flex; gap:14px; align-items:center;">
+        <canvas id="rl-wheel" width="${WHEEL_RES}" height="${WHEEL_RES}"
+          style="width:${WHEEL_CSS}px; height:${WHEEL_CSS}px; flex:none;"></canvas>
+        <div style="display:flex; flex-direction:column; gap:8px; min-width:0;">
+          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">YOUR CHIPS</div>
+          <div style="font-size:22px; font-weight:800; color:${GT_GOLD_BRIGHT};">🪙 ${chips}</div>
+          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">ON THE FELT</div>
+          <div style="font-size:14px; font-weight:800; color:${CH_PINK};">🪙 ${staked}</div>
+          ${others.length ? `<div style="font-size:9px; color:${GT_DIM}; line-height:1.6;">${others.join('<br>')}</div>` : ''}
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">CHIP:</span>
+        ${[1, 5, 25, 100].map(denomBtn).join('')}
+        <span style="flex:1;"></span>
+        ${btn('rl-undo', 'UNDO', p !== 'betting' || spinning || bets.length === 0, 'Take back the last chip')}
+        ${btn('rl-clear', 'CLEAR', p !== 'betting' || spinning || bets.length === 0, 'Take back all your chips')}
+      </div>
+      <canvas id="rl-board" width="${RL_BOARD_W * 2}" height="${RL_BOARD_H * 2}"
+        style="width:${RL_BOARD_W}px; height:${RL_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${p === 'betting' && !spinning ? 'pointer' : 'default'};"></canvas>
+      ${betRows ? `<div style="font-size:9.5px; color:${CH_GOLD}; line-height:1.6;">MY BETS: ${betRows}</div>` : ''}
+      <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
+        ${house
+          ? (p === 'betting'
+            ? btn('rl-spin', '🎡 SPIN', spinning, 'Close betting and spin the wheel')
+            : btn('rl-new-round', 'NEW ROUND', spinning, 'Open the felt for the next round'))
+          : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !spinning ? 'WAITING FOR THE CROUPIER TO OPEN THE NEXT ROUND' : 'THE HOUSE SPINS WHEN BETS ARE DOWN'}</span>`}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
+        SINGLE-ZERO WHEEL · straight pays 35:1 · dozens &amp; columns 2:1 · red/black odd/even 1–18/19–36 1:1
+        · house-banked, the croupier's spin settles the round · fair-spin upgrade coming
+      </div>
+    `;
+    panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
+      b.addEventListener('click', () => { denom = Number(b.dataset.denom); render(); });
+    });
+    panel.querySelector<HTMLButtonElement>('#rl-undo')?.addEventListener('click', () => undoBet());
+    panel.querySelector<HTMLButtonElement>('#rl-clear')?.addEventListener('click', () => clearBets());
+    panel.querySelector<HTMLButtonElement>('#rl-spin')?.addEventListener('click', () => { spin(); });
+    panel.querySelector<HTMLButtonElement>('#rl-new-round')?.addEventListener('click', () => newRound());
+    wheelCanvas = panel.querySelector<HTMLCanvasElement>('#rl-wheel');
+    boardCanvas = panel.querySelector<HTMLCanvasElement>('#rl-board');
+    boardCanvas?.addEventListener('click', onBoardClick);
+    flash = '';
+    drawWheelForNow();
+    drawBoard();
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-roulette-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 430px; max-height: 94vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${GT_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      // Never replay a spin that landed before we walked up.
+      const s = state();
+      animRound = s?.phase === 'settled' ? s.round : 0;
+      animT = null;
+      unsubscribe = subscribeCasino(() => {
+        // A fresh settle write starts the wheel; everything else just repaints.
+        const cur = state();
+        if (cur?.phase === 'settled' && cur.round > animRound) {
+          animRound = cur.round;
+          animT = 0;
+        }
+        render();
+      });
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+      wheelCanvas = null;
+      boardCanvas = null;
+    },
+    update(dt: number): void {
+      if (animT === null) return;
+      animT = Math.min(1, animT + Math.max(0, dt) / RL_SPIN_SECS);
+      if (animT >= 1) {
+        animT = null;
+        render(); // reveal the result banner + winning cell + settled balances
+      } else {
+        drawWheelForNow();
+      }
+    },
   };
 }

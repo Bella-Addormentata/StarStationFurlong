@@ -591,6 +591,36 @@
         min-height: 0; /* let inner scroll containers actually scroll */
       }
 
+      /* 📜 Phone scrollbars (owner request): the OS-default scrollbar clashed
+         with the dark screen — every scroll surface inside the phone (and the
+         phone-styled DM panel) gets a slim dark-gray track / light-gray thumb.
+         Modern Chromium honors the scrollbar-width/color pair and then ignores
+         the ::-webkit-* rules; those remain for older engines. */
+      #spacephone-container *,
+      #dm-panel * {
+        scrollbar-width: thin;
+        scrollbar-color: #7d838e #1c1f27; /* thumb, track */
+      }
+      #spacephone-container ::-webkit-scrollbar,
+      #dm-panel ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      #spacephone-container ::-webkit-scrollbar-track,
+      #dm-panel ::-webkit-scrollbar-track {
+        background: #1c1f27;
+        border-radius: 4px;
+      }
+      #spacephone-container ::-webkit-scrollbar-thumb,
+      #dm-panel ::-webkit-scrollbar-thumb {
+        background: #7d838e;
+        border-radius: 4px;
+      }
+      #spacephone-container ::-webkit-scrollbar-thumb:hover,
+      #dm-panel ::-webkit-scrollbar-thumb:hover {
+        background: #a0a6b1;
+      }
+
       /* Home screen app-launcher grid */
       #phone-home-screen.active {
         padding: 18px 14px;
