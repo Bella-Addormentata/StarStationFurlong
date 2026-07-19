@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.22 — 2026-07-19
+
+### 🎬 Boot Polish — a Truly Solid Curtain
+
+- **The title screen's backdrop is fully opaque now** (owner request): the frosted glass used to let the room module show through while it assembled behind the StarStation Furlong title. The curtain solidifies (same deep-space hue) the instant the auto-boot starts, so **nothing of the room is visible until the fade reveals the station from space** — the module first appears only when you ENTER ROOM from the station view.
+- Verified: the backdrop samples fully opaque from the first frame through the entire boot (no translucent frame ever), and the sequence still lands on the rotating space view with the ENTER ROOM bubble.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.22 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.21 — 2026-07-19
 
 ### 🚶 First-Person Clicks — the Floor Is a Mode Toggle Now

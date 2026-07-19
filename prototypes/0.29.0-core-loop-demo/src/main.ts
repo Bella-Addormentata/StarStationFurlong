@@ -4153,6 +4153,13 @@ function setupClickToEnter() {
   if (hasEntered) return;
   hasEntered = true;
 
+  // 🎬 Solid curtain (owner request): the title screen's frosted glass let
+  // the room module show through while it assembled. Solidify the backdrop
+  // (same hue, full opacity) the moment the auto-boot starts — NOTHING is
+  // visible until the fade reveals the station from space.
+  const curtain = document.getElementById('welcome');
+  if (curtain) curtain.style.background = 'rgb(2, 5, 16)';
+
   // Expand platform (planet → lobby morph) and bring networking up — all
   // behind the title curtain.
   world.startMorph();
