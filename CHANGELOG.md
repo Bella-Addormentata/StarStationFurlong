@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.21 — 2026-07-19
+
+### 🚶 First-Person Clicks — the Floor Is a Mode Toggle Now
+
+- **In first person, clicking bare floor no longer walks you** (owner request) — WASD is how you move. Instead, a floor click **cycles you back into free look** (mouse look, cursor hidden), completing the loop: free look → click frees the cursor → point-and-click at items → click bare floor → free look again.
+- Items stay fully clickable in point-and-click mode: **seats and bunks** walk-and-sit you exactly as before, **doors and keypads** keep their priority, and **clicking a device** still walks you over beside it (the in-FP device screen hand-off remains a future slice).
+- Room view (zoom level 2) is untouched — click-to-walk works there as always.
+- Verified live through the real click pipeline: level-2 floor click walks (regression guard); level-1 bare-floor click requests pointer lock and moves the player zero units; level-1 sofa click walked 7.4 units and seated the clone.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.21 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.20 — 2026-07-19
 
 ### 🗺️ The Station Shares Its Own Map + 🎬 A Real Opening Shot
