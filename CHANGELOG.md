@@ -11,6 +11,13 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.10 — 2026-07-18
+
+### 🚪 Small-Door Clicks Always Work Now
+
+- Fixed the "sometimes clicking a small door does nothing" bug: the small doors' walk-up spots sit in the furniture-heavy middle of the room, and when furniture covered the spot the walk silently gave up. Now the avatar **retargets to the nearest clear spot beside the doorway** and walks; if the doorway is truly walled in, you get a hint ("The doorway is blocked by furniture") instead of silence.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.10 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.9 — 2026-07-18
 
 ### 🛬 Jetbridge Vestibules — Chains Fit Reality
