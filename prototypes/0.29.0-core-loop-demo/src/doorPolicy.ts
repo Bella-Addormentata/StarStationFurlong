@@ -31,6 +31,11 @@ export type ConstructionMode = 'owner' | 'request' | 'public';
 
 export interface DoorPolicyRecord {
   passage: PassageMode;
+  /** 🚪↦ ONE-WAY travel (owner request): with passage 'public', 'in' lets
+   *  guests only ENTER through this door (their departures are refused);
+   *  'out' lets guests only EXIT (their arrivals bounce off the turnstile).
+   *  Absent = two-way. Owner-equivalents always pass BOTH ways. */
+  oneWay?: 'in' | 'out';
   construction: ConstructionMode;
   /** #67 D2: a 🔌 Docking Adapter is INSTALLED at this door — anyone may
    *  TRANSIENTLY berth a ship module here (no chains, no station-graph
@@ -97,9 +102,18 @@ export function readDoorPolicy(doorId: string): DoorPolicyRecord {
   const raw = policyMap!.get(doorId) as Partial<DoorPolicyRecord> | undefined;
   return {
     passage: raw?.passage === 'owner' ? 'owner' : 'public',
+    ...(raw?.oneWay === 'in' || raw?.oneWay === 'out' ? { oneWay: raw.oneWay } : {}),
     construction: raw?.construction === 'request' || raw?.construction === 'public' ? raw.construction : 'owner',
     adapter: raw?.adapter === true,
   };
+}
+
+/** Player-facing passage label (plain language, one string everywhere). */
+export function passageLabel(policy: DoorPolicyRecord): string {
+  if (policy.passage === 'owner') return 'OWNER';
+  if (policy.oneWay === 'in') return 'PUBLIC · IN ONLY';
+  if (policy.oneWay === 'out') return 'PUBLIC · OUT ONLY';
+  return 'PUBLIC';
 }
 
 /** Owner UI only (write-side gating is the caller's job — see module header). */
@@ -108,6 +122,7 @@ export function writeDoorPolicy(doorId: string, policy: DoorPolicyRecord): void 
   boundDoc!.transact(() => {
     policyMap!.set(doorId, {
       passage: policy.passage,
+      ...(policy.oneWay === 'in' || policy.oneWay === 'out' ? { oneWay: policy.oneWay } : {}),
       construction: policy.construction,
       adapter: policy.adapter === true,
     });

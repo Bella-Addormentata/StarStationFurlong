@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.27 — 2026-07-19
+
+### 🚪↦ One-Way Doors — Turnstiles for the Station
+
+- **Doors can be one-way now** (owner request): the keypad's PASSAGE setting cycles **PUBLIC (both ways) → PUBLIC · IN ONLY → PUBLIC · OUT ONLY → OWNER**. On an IN-only door, guests may only come *in* through it — their departures are refused at the door with a plain-language hint. On an OUT-only door, guests may only leave — a guest arriving through one walks in, gets the ⛔ hint, and is **walked right back out by the turnstile** (their return trip is exactly what OUT permits). **The owner passes both ways, always** — as do venture shareholders.
+- Built on the existing seams: the departure gate is the same `canPass` check that walkthroughs *and* first-person auto-doors already consult (an IN-only door simply won't auto-open outward for a guest); the turnstile fires only after the arrival room's records have synced, and a one-shot guard means opposing one-way doors can bounce a traveler **at most once** — never a ping-pong.
+- Verified live as a genuine non-owner: the full 4-state cycle round-trips the records, junk values are rejected by the sanitizer, and the real departure gate blocks IN-only, passes OUT-only/two-way, and blocks OWNER. The turnstile leg (cross-room arrival bounce) rides the battle-tested walkthrough machinery — give it a spin in the weekend's multi-machine tests.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.27 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.26 — 2026-07-19
 
 ### 📟 Stats Grow Up — Version, Disk Budget, and a Friendlier Default
