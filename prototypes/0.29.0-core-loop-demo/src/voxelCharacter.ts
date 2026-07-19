@@ -43,7 +43,7 @@
 import * as THREE from 'three';
 import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
 
-export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground';
+export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep';
 
 interface PoseState {
   /** World-space Y for the torso root (lower values = seated) */
@@ -52,6 +52,13 @@ interface PoseState {
   legRotX: number | null;
   /** Target X-rotation for both arms; null = computed dynamically (walk cycle) */
   armRotX: number | null;
+  /**
+   * Whole-body recline about X (🛏️ bunk beds): the torso group carries head /
+   * arms / legs / tail, so tipping it lays the entire rig down in one joint.
+   * Negative = onto the back, face up (head swings toward local -z — the
+   * OPPOSITE of the facing direction). Undefined ⇒ upright (0).
+   */
+  bodyRotX?: number;
 }
 
 // Standing rootY math (issue #21 — feet below floor): torso.y ends up at
@@ -64,6 +71,12 @@ const STATES: Record<CharacterState, PoseState> = {
   walk:       { rootY: 1.18, legRotX: null,          armRotX: null          },
   sit_chair:  { rootY: 0.5,  legRotX: -Math.PI / 2,  armRotX: -Math.PI / 6  },
   sit_ground: { rootY: -0.2, legRotX: -Math.PI / 2,  armRotX: 0             },
+  // 🛏️ Lying on the back (bunk berths): legs/arms straight so they trail the
+  // reclined torso horizontally. rootY holds the torso pivot high enough that
+  // the oversized chibi skull squishes into the pillow rather than through the
+  // mattress; the berth's elevation (top bunk) rides on the PLAYER MESH y, not
+  // here, so one pose serves both bunks.
+  sleep:      { rootY: 0.62, legRotX: 0,             armRotX: 0,            bodyRotX: -Math.PI / 2 },
 };
 
 /** Snap a continuous angle to the nearest of 8 compass directions (π/4 steps). */
@@ -981,6 +994,14 @@ export class VoxelCharacter {
       lerpSpeed
     );
 
+    // Whole-body recline (🛏️ sleep pose) — every other state converges back
+    // to upright through the same lerp, so wake-up needs no special casing.
+    this.torso.rotation.x = THREE.MathUtils.lerp(
+      this.torso.rotation.x,
+      state.bodyRotX ?? 0,
+      lerpSpeed
+    );
+
     // ── 2. Limb rotations + tail sway ────────────────────────────────────────
     if (this.currentState === 'walk') {
       const walkSpeed   = 8;
@@ -1013,8 +1034,11 @@ export class VoxelCharacter {
       this.tail.rotation.y = THREE.MathUtils.lerp(this.tail.rotation.y, idleSway, lerpSpeed);
     }
 
-    // Face expression — blink + smile
-    const blinkPulse = Math.pow(Math.max(0, Math.sin(time * 2.7)), 20);
+    // Face expression — blink + smile. Asleep ⇒ eyes held fully closed (the
+    // blink squash at its max) with a soft contented smile.
+    const blinkPulse = this.currentState === 'sleep'
+      ? 1
+      : Math.pow(Math.max(0, Math.sin(time * 2.7)), 20);
     const smileTarget = this.currentState === 'walk' ? 1.0 : 0.65;
     this.smileAmount = THREE.MathUtils.lerp(this.smileAmount, smileTarget, 8 * delta);
     this._updateFaceRig(blinkPulse, this.smileAmount);

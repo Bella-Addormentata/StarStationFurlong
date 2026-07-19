@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.14 — 2026-07-19
+
+### 🛏️ Bunk Beds — Sleep Berths
+
+- **🛏️ Bunk beds** — two lie-down sleep berths (new 'sleep' rig pose, elevated top bunk, synced to peers via tick flags bits 2/3). Click a berth to climb in: the avatar lies down, eyes closed — bottom bunk or the ladder-end top bunk — and peers see the sleeping pose at the right height. Stand up (or walk) to climb out; the bed sits flush in the room's north-east nook and a fresh one is buildable like any furniture.
+- **Wire note (additive)**: the tick byte layout is unchanged — two previously reserved flag bits now carry lying/elevated. Old clients interoperate fine and simply render a sleeping peer as a floor-level chair-sit; run matching versions on all machines for correct sleep-pose rendering.
+- Built and verified by the bunk-bed session (both berths exercised live: lie-down, top-bunk elevation, climb-down, normal sits after).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.14 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.13 — 2026-07-18
 
 ### 🎰 The Casino Opens — Cashier Chips + Roulette (#69 G1/G2)

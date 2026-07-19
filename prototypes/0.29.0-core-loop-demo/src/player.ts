@@ -137,6 +137,9 @@ export class Player {
   private sitTarget: Seat | null = null;
   /** 0→1 progress through SIT_DOWN / STAND_UP slides. */
   private sitAnim = 0;
+  /** 🛏️ Mesh y at STAND_UP start — an interrupted bunk climb descends from
+   *  wherever it actually got to, not from the full berth height. */
+  private standStartY = 0;
   private turnTimer = 0;
   private readonly SIT_ANIM_TIME = 0.35;
   private readonly STAND_ANIM_TIME = 0.28;
@@ -682,6 +685,24 @@ export class Player {
   }
 
   /**
+   * 🛏️ true while the occupied seat is a lie-down berth (bunk bed) — the
+   * movement tick broadcasts it (flags bit2) so peers render the 'sleep'
+   * pose instead of 'sit_chair'.
+   */
+  public isLying(): boolean {
+    return this.isSeated() && this.sitTarget !== null && this.sitTarget.lie;
+  }
+
+  /**
+   * 🛏️ The occupied seat's root elevation (BUNK_TOP_Y for the top bunk,
+   * BUNK_BOTTOM_Y for the bottom, 0 for every floor-level seat) — the tick
+   * quantizes it to an "elevated" bit (flags bit3) for peers.
+   */
+  public getSeatedY(): number {
+    return this.isSeated() && this.sitTarget ? this.sitTarget.sitY : 0;
+  }
+
+  /**
    * Public eviction wrapping the stand-up path (E3 of #25): the room editor
    * calls it before carrying the item the local player is sitting on. Any
    * deferred action is dropped — the sit is over, nothing should resume —
@@ -1022,14 +1043,15 @@ export class Player {
   /** Scripted slide from the front point back onto the seat (no collision). */
   private _updateSitDown(deltaTime: number): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; return; }
+    if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
 
     this.sitAnim = Math.min(1, this.sitAnim + deltaTime / this.SIT_ANIM_TIME);
     const t = this.sitAnim * this.sitAnim * (3 - 2 * this.sitAnim); // smoothstep
     const pos = this.mesh.position;
     pos.x = seat.front.x + (seat.sit.x - seat.front.x) * t;
     pos.z = seat.front.z + (seat.sit.z - seat.front.z) * t;
-    this.character.setState('sit_chair', seat.faceAngle);
+    pos.y = seat.sitY * t; // 🛏️ elevated berths (top bunk) — rises with the slide
+    this.character.setState(seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
 
     if (this.sitAnim >= 1) {
       this.sitPhase = 'SEATED';
@@ -1038,31 +1060,37 @@ export class Player {
 
   private _updateSeated(): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; return; }
-    this.character.setState('sit_chair', seat.faceAngle);
+    // 🛏️ Defensive guards that reset the phase must also ground the mesh —
+    // a lost sitTarget on an elevated berth would otherwise strand the
+    // avatar floating at mattress height.
+    if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
+    this.character.setState(seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
   }
 
   /** Begin standing: reverse slide from the seat to its front point. */
   private _beginStandUp(): void {
     if (this.sitPhase !== 'SEATED' && this.sitPhase !== 'SIT_DOWN') return;
     this.sitAnim = 0;
+    this.standStartY = this.mesh.position.y; // 🛏️ descend from the actual height
     this.sitPhase = 'STAND_UP';
   }
 
   private _updateStandUp(deltaTime: number): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; return; }
+    if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
 
     this.sitAnim = Math.min(1, this.sitAnim + deltaTime / this.STAND_ANIM_TIME);
     const t = this.sitAnim * this.sitAnim * (3 - 2 * this.sitAnim); // smoothstep
     const pos = this.mesh.position;
     pos.x = seat.sit.x + (seat.front.x - seat.sit.x) * t;
     pos.z = seat.sit.z + (seat.front.z - seat.sit.z) * t;
+    pos.y = this.standStartY * (1 - t); // 🛏️ climb back down to the floor
     this.character.setState('idle', seat.faceAngle);
 
     if (this.sitAnim >= 1) {
       pos.x = seat.front.x;
       pos.z = seat.front.z;
+      pos.y = 0;
       this.logicalAngle = seat.faceAngle;
       this.sitTarget = null;
       this.sitPhase = 'NONE';
@@ -1496,6 +1524,7 @@ export class Player {
 
     this.mesh.position.x = x;
     this.mesh.position.z = z;
+    this.mesh.position.y = 0; // 🛏️ a beam mid-bunk lands back on the floor
     this.logicalAngle = 0; // default spawn facing (constructor pose)
     this.character.setState('idle', this.logicalAngle);
     this.navMode = 'MANUAL';

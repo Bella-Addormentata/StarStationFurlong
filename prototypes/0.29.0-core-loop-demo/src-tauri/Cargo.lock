@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "ssf-node"
-version = "0.32.13"
+version = "0.32.14"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -9,7 +9,7 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt, rebuildSeats } from './seats';
 import { getDefaultRoomId } from './identity';
-import { FURNITURE, FURNITURE_DEFS, buildItemGroup } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, buildItemGroup, BUNK_TOP_Y } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { northDoorUnlocked } from './stationParts';
 import { rebuildObstacles } from './obstacles';
@@ -53,6 +53,10 @@ interface RemoteAvatar {
   seated: boolean;
   /** #63: seated world facing (tick yaw when seated) — orients the sit pose. */
   facing: number;
+  /** 🛏️ sender-reported lie-down flag (tick flags bit2) — 'sleep' pose. */
+  lying: boolean;
+  /** 🛏️ berth elevation lerp target (BUNK_TOP_Y when tick flags bit3). */
+  elevY: number;
   /** Last known 8-way facing (radians, π/4 steps). */
   heading: number;
 }
@@ -1334,7 +1338,13 @@ export class World {
     moving: boolean = false,
     seated: boolean = false,
     facing: number = 0,
+    lying: boolean = false,
+    elevated: boolean = false,
   ) {
+    // 🛏️ The tick carries elevation as ONE bit (flags bit3): bunk berths are
+    // the only elevated seats, so the bit maps straight to the top-mattress
+    // height. A future variable-height seat would need a real y on the wire.
+    const elevY = elevated ? BUNK_TOP_Y : 0;
     const avatar = this.remotePlayers.get(id);
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
@@ -1351,6 +1361,8 @@ export class World {
         moving,
         seated,
         facing,
+        lying,
+        elevY,
         heading: 0,
       });
       return;
@@ -1362,6 +1374,8 @@ export class World {
     avatar.moving = moving;
     avatar.seated = seated;
     avatar.facing = facing;
+    avatar.lying = lying;
+    avatar.elevY = elevY;
   }
 
   /**
@@ -1377,14 +1391,19 @@ export class World {
       avatar.lastZ = pos.z;
       pos.x = THREE.MathUtils.lerp(pos.x, avatar.targetX, factor);
       pos.z = THREE.MathUtils.lerp(pos.z, avatar.targetZ, factor);
+      // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
+      // settles back to the floor otherwise — same lerp cadence as x/z, so the
+      // replica's climb roughly shadows the sender's sit-down slide.
+      pos.y = THREE.MathUtils.lerp(pos.y, avatar.seated ? avatar.elevY : 0, factor);
 
       // Robust moving detection: trust the sender's flag OR the fact that we
       // are still visibly far from the target — animates even when the flag is
       // unreliable, and settles to idle on arrival.
       // #63: a seated peer renders the sit pose at the seat facing and skips the
       // motion-derived walk/idle path entirely (still lerps to the seat point).
+      // 🛏️ A lying peer (flags bit2) renders the 'sleep' pose instead.
       if (avatar.seated) {
-        avatar.rig.setState('sit_chair', avatar.facing);
+        avatar.rig.setState(avatar.lying ? 'sleep' : 'sit_chair', avatar.facing);
         avatar.rig.update();
         continue;
       }
