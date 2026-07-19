@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.12 — 2026-07-18
+
+### 🏠 Real Estate — Deeds in the Ventures App
+
+- **The VENTURES app grew a REAL ESTATE section**: every module you personally own lists there as a **deed** (and mirrors into the BANK app's new PROPERTY block). Like the station atlas and the venture ledger, the list builds by visitation — and since you can only ever have *become* an owner while standing in a room, it's complete in practice.
+- **Deed detail screen**: each deed shows its venture assignment (registered office / venture property / held outright) and docked links, with plain-language copy throughout.
+- **Hand over a deed**: transfer a module's ownership to another player — **in person, at the module** (the same rule as share trades at the office: one doc at a time). Recipient is picked from the room's keyed player records, with a two-tap ⚠ CONFIRM guard. Passes, door policies, co-hosts and a venture property link ride along to the new owner; a venture's **registered office refuses hand-over** (the Charter holds that deed — transfer shares instead).
+- Venture PROPERTY lists now show real module names (from your atlas) instead of bare ids.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.12 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.11 — 2026-07-18
 
 ### 🧱🪟 Movable Bar + Modular Walls & Windows

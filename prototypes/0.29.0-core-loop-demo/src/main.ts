@@ -37,10 +37,11 @@ import {
 import {
   bindVentures, subscribeVentures, ventureRecord, foundVenture, transferShares,
   isVentureShareholder, ventureLedger, upsertVentureLedger,
-  writeVentureLink, refreshVentureLink, removeVentureLink,
+  writeVentureLink, refreshVentureLink, removeVentureLink, isOfficeHere,
 } from './ventures';
+import { deedsLedger, upsertDeed, removeDeed } from './deeds';
 import { refreshExteriorView, setExteriorOwnerCheck, setExteriorRoomId, showEnterRoomBubble } from './exteriorView';
-import { harvestIntoAtlas } from './stationAtlas';
+import { harvestIntoAtlas, readAtlas } from './stationAtlas';
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -694,6 +695,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   bindVentures(sync.doc);
   syncVentureLedgerFromCurrentRoom();
 
+  // 🏠 #68 real estate: this room joins (or leaves) the personal deeds ledger
+  // that powers the VENTURES app's REAL ESTATE section. Also re-run from the
+  // roomInfo observer below — the owner value lands async with the sync.
+  syncDeedsLedgerFromCurrentRoom();
+
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
@@ -730,6 +736,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // open VENTURES app (a share transfer landing while both look at it).
     subscribeVentures(() => {
       syncVentureLedgerFromCurrentRoom();
+      syncDeedsLedgerFromCurrentRoom(); // a venture link (dis)appearing retags the deed
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
@@ -829,6 +836,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // players entry) can sync in after entry, moving the current room into its
     // correct section (My Rooms / Friends' / Visited) instead of Unreached.
     renderPassesList();
+    // 🏠 Real estate mirrors the same owner value: a deed hand-over landing
+    // (either direction) re-harvests the ledger and repaints an open VENTURES
+    // app — the recipient watches their new deed appear in place.
+    syncDeedsLedgerFromCurrentRoom();
+    renderVenturesApp();
     // Slice 3b: sync the advanced-chia-mesh toggle to this room's flag.
     refreshChiaModeToggle();
   };
@@ -1614,6 +1626,13 @@ function renderBankApp(): void {
     </div>
     ${header('PORTFOLIO')}
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
+    ${header('PROPERTY')}
+    ${deedsLedger().length
+      ? deedsLedger().map((d) => `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+          <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(d.name)}</span>
+          <span style="flex-shrink:0; color:#f0c060; font-size:9px;">${d.ventureName ? `🚀 ${esc(d.ventureName)}` : 'DEED HELD'}</span>
+        </div>`).join('')
+      : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No deeds yet — modules you own list here (manage them in 🚀 VENTURES → REAL ESTATE).</div>'}
     ${header('THE REGISTRY')}
     <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
       Chia account: kept by your station node (test network). Balances and
@@ -1624,13 +1643,21 @@ function renderBankApp(): void {
 }
 
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
-// Screen 1: every entity you hold a stake in (name · SOLE/JOINT · your stake).
-// Screen 2: entity detail — Charter block, OWNERS cap table, PROPERTY, actions
-// (sign a Charter here; transfer shares to a contact). Plain-language rule:
-// deeds/charters/shares/ventures only — no chain jargon, ever.
+// Screen 1: YOUR STAKES (every entity you hold shares in) + REAL ESTATE (every
+// module you personally own — the deeds ledger). Screen 2a: venture detail —
+// Charter block, OWNERS cap table, PROPERTY, actions (sign a Charter here;
+// transfer shares to a contact). Screen 2b: deed detail — venture tag, docked
+// links, HAND OVER THE DEED (in person, at the module, two-tap confirm).
+// Plain-language rule: deeds/charters/shares/ventures only — no chain jargon.
 
 /** Which detail screen is open ('' = the list). */
 let ventureDetailId = '';
+/** 🏠 Which deed detail is open ('' = none) — exclusive with ventureDetailId. */
+let deedDetailRoomId = '';
+/** Two-step hand-over guard: the recipient playerId armed by the first click;
+ *  a second click on the SAME recipient executes. Any repaint keeps it — only
+ *  back/open/select-change re-arm. */
+let deedHandoverArmed = '';
 
 function syncVentureLedgerFromCurrentRoom(): void {
   const v = ventureRecord();
@@ -1664,6 +1691,62 @@ function syncVentureLedgerFromCurrentRoom(): void {
   if (!isOffice && ledgerFresher) refreshVentureLink(entry);
 }
 
+// ── 🏠 REAL ESTATE (#68) — personal deeds, harvested by visitation ──────────
+
+/** Is the CURRENT room's `roomInfo.owner` value ME, personally? Deliberately
+ *  the RAW owner — NOT the shareholder-extended `isLocalPlayerRoomOwner` gate:
+ *  a deed belongs to the personal owner alone (venture co-owners get access,
+ *  not the right to hand the module away). Legacy 'Local-Clone' rooms count
+ *  as mine, matching `categorizeRoom`. */
+function currentRoomDeedIsMine(): boolean {
+  const ownerVal = yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined;
+  if (typeof ownerVal !== 'string' || !ownerVal) return false;
+  if (ownerVal === getPlayerId() || ownerVal === 'Local-Clone') return true;
+  const entry = yjsSync?.doc.getMap('players').get(ownerVal) as Partial<PlayerEntry> | undefined;
+  return typeof entry?.keyB64 === 'string' && entry.keyB64 === getIdentityPub();
+}
+
+/** Visitation harvest (the atlas/venture-ledger pattern): the room we're IN
+ *  upserts a deed when it names us personal owner, and drops out when it
+ *  names someone else. Called at the T0 seam and from the roomInfo/players
+ *  observers (the owner value lands async with the sync). */
+function syncDeedsLedgerFromCurrentRoom(): void {
+  const roomId = activeBootstrap?.roomId;
+  if (!roomId || !yjsSync) return;
+  const ownerVal = yjsSync.doc.getMap('roomInfo').get('owner') as string | undefined;
+  // Owner not synced yet ⇒ decide NOTHING (never drop a deed on stale silence).
+  if (typeof ownerVal !== 'string' || !ownerVal) return;
+  if (!currentRoomDeedIsMine()) { removeDeed(roomId); return; }
+  const name = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Module';
+  const v = ventureRecord();
+  upsertDeed({
+    roomId,
+    name,
+    ventureId: v?.id,
+    ventureName: v?.name,
+    isOffice: v ? v.snapshotAt === undefined : undefined,
+    lastSeen: Date.now(),
+  });
+}
+
+/** Rewrite `roomInfo.owner` to the recipient — the deed hand-over. Gated to
+ *  the room's RAW personal owner, refused at a venture's registered office
+ *  (the charter holds that deed — sell shares instead), and the recipient
+ *  must hold a KEYED players entry in THIS doc (they've been here; every
+ *  owner surface resolves their pub through that entry). All the room's
+ *  standing records — passes, policies, co-hosts, a venture property link —
+ *  ride along; the new owner can change them. */
+function executeDeedHandover(toPlayerId: string): boolean {
+  if (!yjsSync || !activeBootstrap?.roomId) return false;
+  if (!currentRoomDeedIsMine() || isOfficeHere()) return false;
+  if (!toPlayerId || toPlayerId === getPlayerId()) return false;
+  const entry = yjsSync.doc.getMap('players').get(toPlayerId) as Partial<PlayerEntry> | undefined;
+  if (!entry || typeof entry.keyB64 !== 'string' || !entry.keyB64) return false;
+  const rm = yjsSync.doc.getMap('roomInfo');
+  yjsSync.doc.transact(() => rm.set('owner', toPlayerId));
+  return true;
+}
+
 function renderVenturesApp(): void {
   const view = document.getElementById('phone-app-ventures');
   if (!view) return;
@@ -1676,8 +1759,32 @@ function renderVenturesApp(): void {
       const myPub = getIdentityPub();
       if (action === 'open') {
         ventureDetailId = el.dataset.id ?? '';
+        deedDetailRoomId = '';
+        deedHandoverArmed = '';
       } else if (action === 'back') {
         ventureDetailId = '';
+        deedDetailRoomId = '';
+        deedHandoverArmed = '';
+      } else if (action === 'deed-open') {
+        deedDetailRoomId = el.dataset.id ?? '';
+        ventureDetailId = '';
+        deedHandoverArmed = '';
+      } else if (action === 'deed-transfer') {
+        const sel = document.getElementById('deed-transfer-to') as HTMLSelectElement | null;
+        const toId = sel?.value ?? '';
+        if (!toId) return;
+        if (deedHandoverArmed !== toId) {
+          deedHandoverArmed = toId; // first click ARMS; the repaint shows CONFIRM
+        } else if (executeDeedHandover(toId)) {
+          deedHandoverArmed = '';
+          deedDetailRoomId = '';
+          syncDeedsLedgerFromCurrentRoom(); // drops the deed we just handed over
+        } else {
+          deedHandoverArmed = '';
+          const note = document.getElementById('deed-transfer-note');
+          if (note) note.textContent = 'hand-over refused — recipient must have visited this room';
+          return; // keep the screen for correction
+        }
       } else if (action === 'found') {
         const nameInput = document.getElementById('venture-found-name') as HTMLInputElement | null;
         const name = nameInput?.value.trim() ?? '';
@@ -1727,6 +1834,62 @@ function renderVenturesApp(): void {
   const ownerValIsMe = () =>
     (((yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '') === getPlayerId());
 
+  // ── 🏠 Deed detail screen (REAL ESTATE) ──
+  const deedDetail = deedDetailRoomId ? deedsLedger().find((e) => e.roomId === deedDetailRoomId) : undefined;
+  if (deedDetailRoomId && !deedDetail) deedDetailRoomId = ''; // handed over / dropped — fall to the list
+  if (deedDetail) {
+    const here = deedDetail.roomId === currentRoomId;
+    // Live doc values when standing in the module; harvested snapshot otherwise.
+    const liveV = here ? ventureRecord() : null;
+    const name = here
+      ? ((yjsSync?.doc.getMap('roomInfo').get('name') as string | undefined) || deedDetail.name)
+      : deedDetail.name;
+    const ventureName = here ? liveV?.name : deedDetail.ventureName;
+    const office = here ? (liveV !== null && liveV.snapshotAt === undefined) : !!deedDetail.isOffice;
+    const dockedLinks = Object.keys(readAtlas()[deedDetail.roomId]?.doors ?? {}).length;
+
+    let transferBlock = '';
+    if (here && currentRoomDeedIsMine()) {
+      if (office) {
+        transferBlock = `<div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:10px;">This module is ${ventureName ? `the registered office of 🚀 ${esc(ventureName)}` : 'a registered office'} — the Charter holds its deed. Bring in co-owners by transferring shares instead.</div>`;
+      } else {
+        // Recipients: every KEYED players entry in this doc except me — they
+        // have been here, so their pub resolves on every owner surface.
+        const options: string[] = [];
+        let armedName = '';
+        yjsSync?.doc.getMap('players').forEach((raw, id) => {
+          const p = raw as Partial<PlayerEntry>;
+          if (id === getPlayerId() || typeof p.keyB64 !== 'string' || !p.keyB64) return;
+          const nm = typeof p.name === 'string' && p.name ? p.name : 'Unknown-Clone';
+          if (id === deedHandoverArmed) armedName = nm;
+          options.push(`<option value="${esc(id)}"${id === deedHandoverArmed ? ' selected' : ''}>${esc(nm)}</option>`);
+        });
+        const armed = !!deedHandoverArmed && !!armedName;
+        transferBlock = options.length
+          ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">HAND OVER THE DEED</div>
+             <div style="display:flex; gap:4px; margin-top:4px;">
+               <select id="deed-transfer-to" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">${options.join('')}</select>
+               <button type="button" data-venture-action="deed-transfer" style="${pill}${armed ? ' background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;' : ''}">${armed ? '⚠ CONFIRM' : '🖋 HAND OVER'}</button>
+             </div>
+             <div id="deed-transfer-note" style="font-size:8.5px; color:#ffb300; margin-top:3px; min-height:10px;">${armed ? `Hand this module to ${esc(armedName)}? Tap CONFIRM to sign the deed over.` : ''}</div>
+             <div style="font-size:8.5px; color:rgba(212,168,75,0.35);">The new owner takes the module as it stands — passes, door policies, co-hosts${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ''} ride along. You cannot take a deed back.</div>`
+          : '<div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:10px;">No one to hand the deed to yet — the recipient must visit this module once (their key signs into the room record).</div>';
+      }
+    } else if (!here) {
+      transferBlock = `<div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:10px;">The deed is kept at the module — travel there to hand it over. Recorded ${new Date(deedDetail.lastSeen).toLocaleDateString()}.</div>`;
+    }
+
+    view.innerHTML = `
+      <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← REAL ESTATE</button>
+      <div style="font-size:14px; font-weight:800; color:#f0c060;">🏠 ${esc(name)}</div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">DEED · module ${esc(deedDetail.roomId.slice(0, 10))}… · ${here ? 'you are here' : 'held from afar'}</div>
+      <div style="font-size:10px; margin-top:10px;">${ventureName ? `🚀 Assigned to <b>${esc(ventureName)}</b>${office ? ' <span style="color:rgba(212,168,75,0.4);">· registered office</span>' : ' <span style="color:rgba(212,168,75,0.4);">· venture property</span>'}` : 'Held outright — sole personal owner.'}</div>
+      ${dockedLinks > 0 ? `<div style="font-size:10px; margin-top:4px;">🚪 ${dockedLinks} docked link${dockedLinks === 1 ? '' : 's'}</div>` : ''}
+      ${transferBlock}
+    `;
+    return;
+  }
+
   // ── Detail screen ──
   const detail = ventureDetailId
     ? (current && current.id === ventureDetailId
@@ -1754,7 +1917,7 @@ function renderVenturesApp(): void {
       <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.4);">· ${detail.snapshotAt === undefined ? 'registered office' : 'venture property'}</span></div>
       ${(ventureLedger().find((e) => e.id === detail.id)?.properties ?? [])
         .filter((rid) => rid !== (activeBootstrap?.roomId ?? ''))
-        .map((rid) => `<div style="margin-top:3px; font-size:10px;">🏘 Module <span style="color:rgba(212,168,75,0.4);">${esc(rid.slice(0, 10))}…</span></div>`).join('')}
+        .map((rid) => `<div style="margin-top:3px; font-size:10px;">🏘 ${esc(readAtlas()[rid]?.name || 'Module')} <span style="color:rgba(212,168,75,0.4);">${esc(rid.slice(0, 10))}…</span></div>`).join('')}
       <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? ' Cap table is a snapshot — trades happen at the office.' : ''}</div>
       ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ''}
       ${mine > 0 && detail.snapshotAt === undefined ? `
@@ -1822,9 +1985,28 @@ function renderVenturesApp(): void {
       <div style="margin-top:6px;"><button type="button" data-venture-action="add-property" data-id="${esc(e.id)}" style="${pill}">🏘 ADD THIS MODULE TO ${esc(e.name.toUpperCase())}</button></div>`).join('')
     : '';
 
+  // ── 🏠 REAL ESTATE — every module you personally own (deeds ledger) ──
+  const deeds = [...deedsLedger()].sort((a, b) =>
+    Number(b.roomId === currentRoomId) - Number(a.roomId === currentRoomId) || b.lastSeen - a.lastSeen);
+  const deedRows = deeds.map((d) => {
+    const here = d.roomId === currentRoomId;
+    const name = here
+      ? ((yjsSync?.doc.getMap('roomInfo').get('name') as string | undefined) || d.name)
+      : d.name;
+    const tag = d.ventureName
+      ? `🚀 ${esc(d.ventureName)}${d.isOffice ? ' · OFFICE' : ''}`
+      : 'SOLE';
+    return `<button type="button" data-venture-action="deed-open" data-id="${esc(d.roomId)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,${here ? '0.06' : '0.04'}); border:1px solid rgba(212,168,75,${here ? '0.2' : '0.14'}); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span>' : ''}</span>
+      <span style="flex-shrink:0; font-size:9px;">${tag}</span>
+    </button>`;
+  });
+
   view.innerHTML = `
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">YOUR STAKES</div>
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:14px;">REAL ESTATE</div>
+    ${deedRows.length ? deedRows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
     ${foundBlock}
     ${addBlock}
   `;
@@ -1998,7 +2180,7 @@ function setupSpacePhoneOverlay() {
     contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
     bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
     access:   { elId: 'phone-app-access',    title: '🚪 ACCESS',      subtitle: 'Room Passes · FurlongNet' },
-    ventures: { elId: 'phone-app-ventures',  title: '🚀 VENTURES',    subtitle: 'Charters & Shares · Furlong Registry' },
+    ventures: { elId: 'phone-app-ventures',  title: '🚀 VENTURES',    subtitle: 'Charters · Shares · Real Estate' },
     settings: { elId: 'phone-app-settings',          title: '⚙️ SETTINGS', subtitle: 'FurlongOS · System' },
     setnet:   { elId: 'phone-app-settings-network',  title: '🌐 NETWORK',  subtitle: 'Settings · Node & Mesh' },
     setstats: { elId: 'phone-app-settings-stats',    title: '📊 STATS',    subtitle: 'Settings · Live Readout' },
@@ -2059,7 +2241,7 @@ function setupSpacePhoneOverlay() {
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
     if (id === 'access') { refreshAccessRoomRow(); renderCoHostsSection(); }
-    if (id === 'ventures') { ventureDetailId = ''; renderVenturesApp(); }
+    if (id === 'ventures') { ventureDetailId = ''; deedDetailRoomId = ''; deedHandoverArmed = ''; renderVenturesApp(); }
     if (id === 'bank') renderBankApp();
     if (id === 'contacts') refreshContactsApp();
   };
