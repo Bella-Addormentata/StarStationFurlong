@@ -77,6 +77,13 @@ export interface FurnitureItem {
    * obstacle instead of the footprint-derived AABB (null ⇒ no obstacle).
    */
   footprintOverride?: Box | null;
+  /**
+   * 🛰️ Hull stacking (hull.ts): id of the exterior item this one is mounted
+   * ON (tank on tank, engine on the outermost tank). Absent ⇒ on the wall
+   * (or interior). `pos` stays world-absolute alongside it — LWW-safe, and
+   * an orphaned child (parent removed by a racing peer) keeps a valid pose.
+   */
+  mountParent?: string;
 }
 
 /**
@@ -147,9 +154,19 @@ export interface FurnitureDef {
    * business end, points AWAY from the room), edit-mode carry + validation
    * route to validateExteriorPlacement, and their AABB lies wholly outside
    * the walkable square so they never obstruct the interior. Absent ⇒ the
-   * normal interior floor placement.
+   * normal interior floor placement. 'both' (🛰️ hull work): the kind places
+   * on the interior floor by default AND accepts hull mounting — fuel tanks
+   * live either side of the wall.
    */
-  mount?: 'exterior-wall';
+  mount?: 'exterior-wall' | 'both';
+  /**
+   * 🛰️ Hull stacking rules (hull.ts): what this kind can sit on out there
+   * ('wall' and/or a face another item provides), and the face its own outer
+   * side offers. Capability-tag style, like `functions`: a tank accepts
+   * wall|tankFace and provides tankFace; an engine accepts both but provides
+   * nothing (bells stay outermost).
+   */
+  attach?: { accepts: Array<'wall' | 'tankFace'>; provides?: 'tankFace' };
 }
 
 // ── Warm frontier colour palette (moved from world.addLobbyFurniture) ─────────
@@ -1131,12 +1148,22 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   // ── 🚀 Ship fittings (#30 SH1) — capability = the `functions` TAG, not the
   // kind (spaceship-conversion-plan.md invariant: future part variants tag
   // the same capability; the helm/exterior count by tag). ──
-  'fuel-tank': { kind: 'fuel-tank', build: buildFuelTank, footprint: { w: 2, d: 1 }, functions: ['fuelTank'] },
+  // 🛰️ Dual-mode (hull work): tanks place on the interior floor as before AND
+  // mount on the hull — where they provide the tankFace other layers stack on.
+  'fuel-tank': {
+    kind: 'fuel-tank', build: buildFuelTank, footprint: { w: 2, d: 1 }, functions: ['fuelTank'],
+    mount: 'both', attach: { accepts: ['wall', 'tankFace'], provides: 'tankFace' },
+  },
   // 🚀 Main thrust array — EXTERIOR-WALL mounted (owner request): the engine
   // hangs on the OUTSIDE of a wall, bells pointing away from the room. The
   // capability tag is unchanged, so the helm/exterior ship checks still count
   // it; only the placement mode and the visual sculpt changed.
-  'engine-block': { kind: 'engine-block', build: buildEngineBlock, footprint: { w: 2, d: 1 }, functions: ['engine'], mount: 'exterior-wall' },
+  'engine-block': {
+    kind: 'engine-block', build: buildEngineBlock, footprint: { w: 2, d: 1 }, functions: ['engine'],
+    // 🛰️ Engines accept the wall OR a tank stack's outer face — and provide
+    // nothing: the bells stay outermost (clear exhaust, always).
+    mount: 'exterior-wall', attach: { accepts: ['wall', 'tankFace'] },
+  },
   // 🧱🪟 Modular wall sections (movable; placed on a side wall's line they
   // replace the built-in brick — see world.updateSideWallCoverage).
   'brick-wall': { kind: 'brick-wall', build: buildBrickWall, footprint: { w: 4, d: 1 } },
@@ -1986,99 +2013,10 @@ export function snapItemPos(
   return { x: snapAxis(x, extentX), z: snapAxis(z, extentZ) };
 }
 
-// ── 🚀 Exterior wall mounting (owner request — engines, future solar panels /
-// manipulator arm) ────────────────────────────────────────────────────────────
 
-/** Structural wall plane (|x| or |z|) — matches world.addSideWalls / doors. */
-export const WALL_LINE = 6;
-/** Keep the door axis + its vestibule/docking envelope clear on every wall
- *  (doors sit at the wall centre, posts/click box at |along| ≤ 1.0; paired
- *  vestibules extend straight out) — an exterior item's SPAN must stay off
- *  this band. */
-const EXT_DOOR_BAND = 1.8;
-
-export type WallSide = 'north' | 'south' | 'east' | 'west';
-
-/** Wall-derived rot: local +z (the business end — engine bells) points AWAY
- *  from the room. south wall outward = +z ⇒ rot 0; east = +x ⇒ rot 1; etc. */
-const WALL_ROT: Record<WallSide, Rot> = { south: 0, east: 1, north: 2, west: 3 };
-
-/** The wall a rot claims (inverse of WALL_ROT). */
-const ROT_WALL: Record<Rot, WallSide> = { 0: 'south', 1: 'east', 2: 'north', 3: 'west' };
-
-/**
- * Snap a free point to the nearest wall's OUTER mounting pose: the
- * perpendicular coordinate lands at WALL_LINE + d/2 (fully outside), the
- * along-wall coordinate snaps to the same parity lattice as interior items
- * and clamps so the whole span stays on the wall. Returns the wall-derived
- * rot with it — exterior items never rotate freely.
- */
-export function snapExteriorPos(
-  kind: FurnitureKind,
-  x: number,
-  z: number,
-): { x: number; z: number; rot: Rot } {
-  const fp = FURNITURE_DEFS[kind].footprint ?? { w: 1, d: 1 };
-  const dN = Math.abs(z + WALL_LINE);
-  const dS = Math.abs(z - WALL_LINE);
-  const dW = Math.abs(x + WALL_LINE);
-  const dE = Math.abs(x - WALL_LINE);
-  const min = Math.min(dN, dS, dW, dE);
-  const side: WallSide = min === dE ? 'east' : min === dW ? 'west' : min === dS ? 'south' : 'north';
-  const rot = WALL_ROT[side];
-  const halfW = fp.w / 2;
-  const out = WALL_LINE + fp.d / 2;
-  const snapAlong = (v: number) => {
-    const s = Math.round(fp.w) % 2 === 1 ? Math.floor(v) + 0.5 : Math.round(v);
-    return Math.max(-(WALL_LINE - halfW), Math.min(WALL_LINE - halfW, s));
-  };
-  switch (side) {
-    case 'south': return { x: snapAlong(x), z: out, rot };
-    case 'north': return { x: snapAlong(x), z: -out, rot };
-    case 'east':  return { x: out, z: snapAlong(z), rot };
-    case 'west':  return { x: -out, z: snapAlong(z), rot };
-  }
-}
-
-/**
- * Exterior placement verdict (the E3 drop gate's sibling): the pose must sit
- * exactly on a wall's outer lattice (i.e. came through snapExteriorPos), keep
- * its span on the wall and off the door band, and not overlap any OTHER
- * exterior-mounted item. Interior rules (bounds, obstacle overlap, player
- * clearance, connectivity) are moot out here — nothing walks on the hull.
- */
-export function validateExteriorPlacement(
-  item: FurnitureItem,
-  pos: { x: number; z: number },
-  rot: Rot,
-): { ok: true } | { ok: false; reason: string } {
-  const fp = FURNITURE_DEFS[item.kind].footprint ?? { w: 1, d: 1 };
-  const side = ROT_WALL[rot];
-  const out = WALL_LINE + fp.d / 2;
-  const perp = side === 'south' ? pos.z : side === 'north' ? -pos.z : side === 'east' ? pos.x : -pos.x;
-  const along = side === 'south' || side === 'north' ? pos.x : pos.z;
-  if (Math.abs(perp - out) > 1e-6) {
-    return { ok: false, reason: 'not on a wall mount line' };
-  }
-  const halfW = fp.w / 2;
-  if (Math.abs(along) > WALL_LINE - halfW + 1e-6) {
-    return { ok: false, reason: 'off the end of the wall' };
-  }
-  if (Math.abs(along) - halfW < EXT_DOOR_BAND) {
-    return { ok: false, reason: 'would block the door / docking envelope' };
-  }
-  const box = footprintAabb(item.kind, pos, rot)!;
-  for (const other of FURNITURE) {
-    if (other.id === item.id) continue;
-    if (FURNITURE_DEFS[other.kind].mount !== 'exterior-wall') continue;
-    const ob = footprintAabb(other.kind, other.pos, other.rot);
-    if (!ob) continue;
-    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
-      return { ok: false, reason: `overlaps ${other.id}` };
-    }
-  }
-  return { ok: true };
-}
+// 🛰️ The exterior wall-mounting machinery (WALL_LINE, snapExteriorPos,
+// validateExteriorPlacement, door lanes, stacking) moved to hull.ts — the
+// one authority for hull space shared with doors and vestibule chains.
 
 /** Derive the collision obstacle list (order = FURNITURE order). */
 export function buildObstacleList(items: FurnitureItem[]): Box[] {

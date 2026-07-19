@@ -56,7 +56,12 @@
  */
 
 import * as THREE from 'three';
-import { FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos, snapExteriorPos, validateExteriorPlacement } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos } from './furniture';
+// 🛰️ Hull space (exterior mounts + stacking) — moved out of furniture.ts.
+import {
+  snapExteriorPos, validateExteriorPlacement, isExteriorPos,
+  mountChildrenOf, mountDescendantsOf,
+} from './hull';
 import type { FurnitureItem, Rot, Box } from './furniture';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
@@ -144,8 +149,10 @@ export function validatePlacement(
 ): PlacementVerdict {
   // 🚀 Exterior-wall fittings route to the hull rules: they live OUTSIDE the
   // walkable square, so interior bounds / obstacle overlap / player clearance
-  // / connectivity are all moot — nothing walks on the hull.
-  if (FURNITURE_DEFS[item.kind].mount === 'exterior-wall') {
+  // / connectivity are all moot — nothing walks on the hull. Dual-mode
+  // ('both') kinds route by WHERE the candidate pose is.
+  const mount = FURNITURE_DEFS[item.kind].mount;
+  if (mount === 'exterior-wall' || (mount === 'both' && isExteriorPos(pos))) {
     return validateExteriorPlacement(item, pos, rot);
   }
 
@@ -269,6 +276,9 @@ class RoomEditController {
     group: THREE.Group;
     originPos: { x: number; z: number };
     originRot: Rot;
+    /** 🛰️ Stack anchor at pickup — restored on cancel (the snap writes the
+     *  CANDIDATE anchor straight onto the item so validate/commit read it). */
+    originMountParent: string | undefined;
     candidatePos: { x: number; z: number };
     candidateRot: Rot;
     valid: boolean;
@@ -571,6 +581,12 @@ class RoomEditController {
     const group = world.furnitureGroups.get(itemId);
     if (!item || !group || !item.movable) return;
 
+    // 🛰️ A stack base can't move with cargo on it — unstack outward-first.
+    if (mountChildrenOf(itemId).length > 0) {
+      showHint("CAN'T MOVE — something is mounted on it. Remove the outer layers first.", 2600);
+      return;
+    }
+
     const player = world.getPlayer();
     // Flood origin BEFORE any eviction: a player seated on the carried item
     // resolves to that seat's front point (where the stand-up slide lands).
@@ -588,6 +604,7 @@ class RoomEditController {
       group,
       originPos: { ...item.pos },
       originRot: item.rot,
+      originMountParent: item.mountParent,
       candidatePos: { ...item.pos },
       candidateRot: item.rot,
       valid: true,
@@ -612,18 +629,29 @@ class RoomEditController {
     this.raycaster.setFromCamera(this.pointerNdc, camera);
     const hits = this.raycaster.intersectObject(plane, false);
     if (hits.length === 0) return;
-    // 🚀 Exterior-wall fittings snap to the nearest wall's OUTER mount line
-    // (drag near a wall inside the room; the piece rides the outside of that
-    // wall). The rot comes with the wall — bells always face away.
-    if (FURNITURE_DEFS[c.item.kind].mount === 'exterior-wall') {
-      const s = snapExteriorPos(c.item.kind, hits[0].point.x, hits[0].point.z);
-      if (s.x === c.candidatePos.x && s.z === c.candidatePos.z && s.rot === c.candidateRot) return;
+    // 🚀 Exterior-wall fittings snap to the nearest hull anchor — a wall's
+    // OUTER mount line or a stackable item's outer face (🛰️ hull.ts). The
+    // rot comes with the anchor — bells always face away. Dual-mode ('both')
+    // kinds go exterior only while the pointer is beyond the walls.
+    const mount = FURNITURE_DEFS[c.item.kind].mount;
+    const px = hits[0].point.x, pz = hits[0].point.z;
+    if (mount === 'exterior-wall' || (mount === 'both' && isExteriorPos({ x: px, z: pz }))) {
+      const s = snapExteriorPos(c.item.kind, px, pz);
+      if (s.x === c.candidatePos.x && s.z === c.candidatePos.z && s.rot === c.candidateRot
+        && s.mountParent === c.item.mountParent) return;
       c.candidatePos = { x: s.x, z: s.z };
       c.candidateRot = s.rot;
+      // The candidate anchor lives on the item so validate/commit read it;
+      // cancelCarry restores originMountParent.
+      if (s.mountParent !== undefined) c.item.mountParent = s.mountParent;
+      else delete c.item.mountParent;
       c.group.position.set(s.x, 0, s.z);
       c.group.rotation.y = s.rot * (Math.PI / 2);
       this.revalidateCarry();
       return;
+    }
+    if (mount === 'both' && c.item.mountParent !== undefined) {
+      delete c.item.mountParent; // back inside — the anchor is gone
     }
     const snapped = snapItemPos(c.item.kind, c.candidateRot, hits[0].point.x, hits[0].point.z);
     if (snapped.x === c.candidatePos.x && snapped.z === c.candidatePos.z) return;
@@ -636,8 +664,9 @@ class RoomEditController {
   private rotateCarry(): void {
     const c = this.carrying;
     if (!c) return;
-    // 🚀 Exterior fittings can't rotate freely — the facing IS the wall's.
-    if (FURNITURE_DEFS[c.item.kind].mount === 'exterior-wall') {
+    // 🚀 Exterior fittings can't rotate freely — the facing IS the anchor's.
+    const rotMount = FURNITURE_DEFS[c.item.kind].mount;
+    if (rotMount === 'exterior-wall' || (rotMount === 'both' && isExteriorPos(c.candidatePos))) {
       showHint('EXTERIOR MOUNT — faces away from its wall automatically; drag to another wall instead.', 2600);
       return;
     }
@@ -715,6 +744,9 @@ class RoomEditController {
     if (!c) return;
     c.group.position.set(c.originPos.x, 0, c.originPos.z);
     c.group.rotation.y = c.originRot * (Math.PI / 2);
+    // 🛰️ Restore the stack anchor the snap may have rewritten mid-carry.
+    if (c.originMountParent !== undefined) c.item.mountParent = c.originMountParent;
+    else delete c.item.mountParent;
     this.carrying = null;
     if (this.selectedId === c.itemId) {
       this.applyTint(c.itemId, SELECT_EMISSIVE, SELECT_INTENSITY);
@@ -789,6 +821,24 @@ class RoomEditController {
       player.evictFromSeat();
     }
 
+    // 🛰️ 2b. REMOVAL CASCADES down the hull stack (deepest first): pulling a
+    // tank out also removes everything mounted outboard of it — each layer
+    // goes to the room inventory like the item itself, no floating orphans.
+    const cascade = mountDescendantsOf(itemId);
+    for (const child of cascade) {
+      if (this.hoveredId === child.id) this.setHovered(null);
+      const childMeshes = this.itemMeshes.get(child.id) ?? [];
+      for (const mesh of childMeshes) this.meshToItem.delete(mesh);
+      this.itemMeshes.delete(child.id);
+      const childSet = new Set<THREE.Object3D>(childMeshes);
+      this.raycastTargets = this.raycastTargets.filter((m) => !childSet.has(m));
+      world.removeFurnitureVisuals(child.id);
+      const ci = FURNITURE.findIndex((i) => i.id === child.id);
+      if (ci !== -1) FURNITURE.splice(ci, 1);
+      addToRoomInventory(activeRoomId(), child.kind);
+      deleteFurnitureItem(child.id);
+    }
+
     // 3. Selection/hover teardown while the materials still exist.
     this.setSelected(null); // restores tint, hides label + button
     if (this.hoveredId === itemId) this.setHovered(null);
@@ -819,7 +869,7 @@ class RoomEditController {
     // self-echo no-op) while remote peers apply the removal.
     deleteFurnitureItem(itemId);
 
-    showHint(`Removed ${itemId} → room inventory (DEV menu › INVENTORY re-places it).`, 3200);
+    showHint(`Removed ${itemId}${cascade.length ? ` +${cascade.length} mounted layer${cascade.length === 1 ? '' : 's'}` : ''} → room inventory (DEV menu › INVENTORY re-places it).`, 3200);
   }
 
   /** Validate the current candidate against live player positions. */
