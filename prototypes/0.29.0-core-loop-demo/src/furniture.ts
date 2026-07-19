@@ -139,6 +139,17 @@ export interface FurnitureDef {
    * become clickable focus targets via buildDeviceList() (#33 D0).
    */
   device?: DeviceTemplate;
+  /**
+   * 🚀 Placement mode (owner request — exterior fittings). 'exterior-wall'
+   * items mount on the OUTSIDE of a room wall (main engines; future solar
+   * panels / manipulator arm use the same mode): they snap to the outer wall
+   * lines via snapExteriorPos (rot derived from the wall — local +z, the
+   * business end, points AWAY from the room), edit-mode carry + validation
+   * route to validateExteriorPlacement, and their AABB lies wholly outside
+   * the walkable square so they never obstruct the interior. Absent ⇒ the
+   * normal interior floor placement.
+   */
+  mount?: 'exterior-wall';
 }
 
 // ── Warm frontier colour palette (moved from world.addLobbyFurniture) ─────────
@@ -1121,7 +1132,11 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   // kind (spaceship-conversion-plan.md invariant: future part variants tag
   // the same capability; the helm/exterior count by tag). ──
   'fuel-tank': { kind: 'fuel-tank', build: buildFuelTank, footprint: { w: 2, d: 1 }, functions: ['fuelTank'] },
-  'engine-block': { kind: 'engine-block', build: buildEngineBlock, footprint: { w: 1, d: 1 }, functions: ['engine'] },
+  // 🚀 Main thrust array — EXTERIOR-WALL mounted (owner request): the engine
+  // hangs on the OUTSIDE of a wall, bells pointing away from the room. The
+  // capability tag is unchanged, so the helm/exterior ship checks still count
+  // it; only the placement mode and the visual sculpt changed.
+  'engine-block': { kind: 'engine-block', build: buildEngineBlock, footprint: { w: 2, d: 1 }, functions: ['engine'], mount: 'exterior-wall' },
   // 🧱🪟 Modular wall sections (movable; placed on a side wall's line they
   // replace the built-in brick — see world.updateSideWallCoverage).
   'brick-wall': { kind: 'brick-wall', build: buildBrickWall, footprint: { w: 4, d: 1 } },
@@ -1212,19 +1227,66 @@ function buildFuelTank({ m, place }: BuildCtx) {
   place(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 8), m(0x8A93A0, 0.5, 0.6), 0, 1.08, 0);
 }
 
-function buildEngineBlock({ m, place }: BuildCtx) {
-  // Reactor pillar + cooling fins + glowing core ring + feed pipes.
-  place(new THREE.BoxGeometry(0.78, 0.2, 0.78), m(0x2A3444, 0.7, 0.35), 0, 0.10, 0);
-  place(new THREE.CylinderGeometry(0.3, 0.34, 1.1, 12), m(0x37474F, 0.5, 0.6), 0, 0.75, 0);
-  for (let i = 0; i < 4; i++) {
-    const fin = place(new THREE.BoxGeometry(0.06, 0.9, 0.5), m(0x2A3444, 0.6, 0.5), 0, 0.75, 0);
-    fin.rotation.y = (i / 4) * Math.PI;
+// 🚀 Main thrust array (owner request — DRASTIC rework of the old interior
+// reactor pillar). Now an EXTERIOR-WALL mount, styled after the concept art's
+// C-11 module stern: a gunmetal mounting plate flat against the hull, a
+// clustered array of engine bells pointing local +z (AWAY from the room — the
+// wall-derived rot guarantees that), orange feed-line straps lashed across
+// the cluster, and a warm idle glow deep in every throat. Local frame:
+// footprint 2×1, hull face at z = -0.5, bells reach to z ≈ +0.5.
+function buildEngineBlock(ctx: BuildCtx) {
+  const { m, flat, place, addLight } = ctx;
+  const HULL = 0x8A93A0;    // steel gray (station family)
+  const DARKM = 0x37474F;   // dark machinery
+  const BODY = 0x2A3444;    // gunmetal plate
+  const PIPE_O = 0xE8760A;  // orange feed lines (concept-art lashing)
+  const GLOW = 0xFFF0C8;    // warm idle glow in the throats
+
+  // Mounting plate + standoff frame against the hull
+  place(new THREE.BoxGeometry(1.9, 2.3, 0.10), m(BODY, 0.6, 0.4), 0, 1.2, -0.44);
+  place(new THREE.BoxGeometry(1.7, 2.1, 0.10), m(DARKM, 0.55, 0.45), 0, 1.2, -0.34);
+  for (const [bx, by] of [[-0.8, 0.25], [0.8, 0.25], [-0.8, 2.15], [0.8, 2.15]] as [number, number][]) {
+    place(new THREE.BoxGeometry(0.16, 0.16, 0.22), m(HULL, 0.5, 0.6), bx, by, -0.36); // corner standoffs
   }
-  const core = place(new THREE.TorusGeometry(0.24, 0.05, 10, 20), m(0x00E5FF, 0.3, 0.2, 0x00E5FF, 0.9), 0, 0.75, 0);
-  core.rotation.x = Math.PI / 2;
-  place(new THREE.CylinderGeometry(0.16, 0.2, 0.22, 12), m(0xD4A84B, 0.45, 0.5), 0, 1.4, 0);
-  const pipe = place(new THREE.CylinderGeometry(0.045, 0.045, 0.7, 8), m(0x8A93A0, 0.5, 0.6), 0.3, 1.2, 0);
-  pipe.rotation.z = Math.PI / 4;
+
+  // Bell cluster: 3 big bells low, 2 staggered above (hex-ish packing like
+  // the art). Each bell = gimbal block + throat + flared nozzle + rim + glow.
+  const bells: Array<[number, number, number]> = [
+    // [x, y, scale]
+    [-0.62, 0.62, 1.0],
+    [0.62, 0.62, 1.0],
+    [0, 0.55, 1.15],
+    [-0.34, 1.55, 0.85],
+    [0.34, 1.55, 0.85],
+  ];
+  for (const [bx, by, s] of bells) {
+    // Gimbal block on the plate
+    place(new THREE.BoxGeometry(0.26 * s, 0.26 * s, 0.18), m(DARKM, 0.5, 0.5), bx, by, -0.24);
+    // Throat (narrow) → nozzle (flared) — cylinder axis is y, tip toward +z
+    const throat = place(new THREE.CylinderGeometry(0.10 * s, 0.14 * s, 0.22, 12), m(HULL, 0.35, 0.75), bx, by, -0.08);
+    throat.rotation.x = Math.PI / 2;
+    const nozzle = place(new THREE.CylinderGeometry(0.30 * s, 0.11 * s, 0.55, 16, 1, true), m(DARKM, 0.4, 0.7), bx, by, 0.24);
+    nozzle.rotation.x = -Math.PI / 2;
+    (nozzle.material as THREE.MeshStandardMaterial).side = THREE.DoubleSide;
+    // Bell rim + warm glow disc recessed in the mouth
+    const rim = place(new THREE.TorusGeometry(0.30 * s, 0.028, 8, 20), m(HULL, 0.4, 0.7), bx, by, 0.51);
+    rim.rotation.x = 0; // torus already faces +z
+    place(new THREE.CircleGeometry(0.20 * s, 16), flat(GLOW), bx, by, 0.40);
+  }
+
+  // Orange feed lines lashed across the cluster (horizontal + diagonal)
+  for (const [ly, lz] of [[1.1, -0.18], [0.28, -0.20]] as [number, number][]) {
+    const line = place(new THREE.CylinderGeometry(0.035, 0.035, 1.75, 8), m(PIPE_O, 0.5, 0.4), 0, ly, lz);
+    line.rotation.z = Math.PI / 2;
+  }
+  const diag = place(new THREE.CylinderGeometry(0.03, 0.03, 1.6, 8), m(PIPE_O, 0.5, 0.4), 0.1, 1.2, -0.26);
+  diag.rotation.z = Math.PI / 3;
+  // Coolant manifold ridge along the top + amber marker strip
+  place(new THREE.BoxGeometry(1.5, 0.16, 0.30), m(HULL, 0.45, 0.65), 0, 2.32, -0.28);
+  place(new THREE.BoxGeometry(0.6, 0.06, 0.02), m(0xD4A84B, 0.4, 0.5, 0xD4A84B, 0.6), 0, 2.05, -0.285);
+
+  // Faint warm wash over the bell mouths (idle engines, not firing)
+  addLight(new THREE.PointLight(0xFFD9A0, 0, 4), 0, 1.1, 0.9, 0.9);
 }
 
 function buildHelmConsole({ m, flat, place }: BuildCtx) {
@@ -1922,6 +1984,100 @@ export function snapItemPos(
   const snapAxis = (v: number, extent: number) =>
     Math.round(extent) % 2 === 1 ? Math.floor(v) + 0.5 : Math.round(v);
   return { x: snapAxis(x, extentX), z: snapAxis(z, extentZ) };
+}
+
+// ── 🚀 Exterior wall mounting (owner request — engines, future solar panels /
+// manipulator arm) ────────────────────────────────────────────────────────────
+
+/** Structural wall plane (|x| or |z|) — matches world.addSideWalls / doors. */
+export const WALL_LINE = 6;
+/** Keep the door axis + its vestibule/docking envelope clear on every wall
+ *  (doors sit at the wall centre, posts/click box at |along| ≤ 1.0; paired
+ *  vestibules extend straight out) — an exterior item's SPAN must stay off
+ *  this band. */
+const EXT_DOOR_BAND = 1.8;
+
+export type WallSide = 'north' | 'south' | 'east' | 'west';
+
+/** Wall-derived rot: local +z (the business end — engine bells) points AWAY
+ *  from the room. south wall outward = +z ⇒ rot 0; east = +x ⇒ rot 1; etc. */
+const WALL_ROT: Record<WallSide, Rot> = { south: 0, east: 1, north: 2, west: 3 };
+
+/** The wall a rot claims (inverse of WALL_ROT). */
+const ROT_WALL: Record<Rot, WallSide> = { 0: 'south', 1: 'east', 2: 'north', 3: 'west' };
+
+/**
+ * Snap a free point to the nearest wall's OUTER mounting pose: the
+ * perpendicular coordinate lands at WALL_LINE + d/2 (fully outside), the
+ * along-wall coordinate snaps to the same parity lattice as interior items
+ * and clamps so the whole span stays on the wall. Returns the wall-derived
+ * rot with it — exterior items never rotate freely.
+ */
+export function snapExteriorPos(
+  kind: FurnitureKind,
+  x: number,
+  z: number,
+): { x: number; z: number; rot: Rot } {
+  const fp = FURNITURE_DEFS[kind].footprint ?? { w: 1, d: 1 };
+  const dN = Math.abs(z + WALL_LINE);
+  const dS = Math.abs(z - WALL_LINE);
+  const dW = Math.abs(x + WALL_LINE);
+  const dE = Math.abs(x - WALL_LINE);
+  const min = Math.min(dN, dS, dW, dE);
+  const side: WallSide = min === dE ? 'east' : min === dW ? 'west' : min === dS ? 'south' : 'north';
+  const rot = WALL_ROT[side];
+  const halfW = fp.w / 2;
+  const out = WALL_LINE + fp.d / 2;
+  const snapAlong = (v: number) => {
+    const s = Math.round(fp.w) % 2 === 1 ? Math.floor(v) + 0.5 : Math.round(v);
+    return Math.max(-(WALL_LINE - halfW), Math.min(WALL_LINE - halfW, s));
+  };
+  switch (side) {
+    case 'south': return { x: snapAlong(x), z: out, rot };
+    case 'north': return { x: snapAlong(x), z: -out, rot };
+    case 'east':  return { x: out, z: snapAlong(z), rot };
+    case 'west':  return { x: -out, z: snapAlong(z), rot };
+  }
+}
+
+/**
+ * Exterior placement verdict (the E3 drop gate's sibling): the pose must sit
+ * exactly on a wall's outer lattice (i.e. came through snapExteriorPos), keep
+ * its span on the wall and off the door band, and not overlap any OTHER
+ * exterior-mounted item. Interior rules (bounds, obstacle overlap, player
+ * clearance, connectivity) are moot out here — nothing walks on the hull.
+ */
+export function validateExteriorPlacement(
+  item: FurnitureItem,
+  pos: { x: number; z: number },
+  rot: Rot,
+): { ok: true } | { ok: false; reason: string } {
+  const fp = FURNITURE_DEFS[item.kind].footprint ?? { w: 1, d: 1 };
+  const side = ROT_WALL[rot];
+  const out = WALL_LINE + fp.d / 2;
+  const perp = side === 'south' ? pos.z : side === 'north' ? -pos.z : side === 'east' ? pos.x : -pos.x;
+  const along = side === 'south' || side === 'north' ? pos.x : pos.z;
+  if (Math.abs(perp - out) > 1e-6) {
+    return { ok: false, reason: 'not on a wall mount line' };
+  }
+  const halfW = fp.w / 2;
+  if (Math.abs(along) > WALL_LINE - halfW + 1e-6) {
+    return { ok: false, reason: 'off the end of the wall' };
+  }
+  if (Math.abs(along) - halfW < EXT_DOOR_BAND) {
+    return { ok: false, reason: 'would block the door / docking envelope' };
+  }
+  const box = footprintAabb(item.kind, pos, rot)!;
+  for (const other of FURNITURE) {
+    if (other.id === item.id) continue;
+    if (FURNITURE_DEFS[other.kind].mount !== 'exterior-wall') continue;
+    const ob = footprintAabb(other.kind, other.pos, other.rot);
+    if (!ob) continue;
+    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+      return { ok: false, reason: `overlaps ${other.id}` };
+    }
+  }
+  return { ok: true };
 }
 
 /** Derive the collision obstacle list (order = FURNITURE order). */
