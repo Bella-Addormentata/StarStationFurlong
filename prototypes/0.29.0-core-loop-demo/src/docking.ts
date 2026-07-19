@@ -24,9 +24,9 @@ import {
   consumeForSegments, refundForSegments,
 } from './stationParts';
 import {
-  readDoorPolicy, writeDoorPolicy, readDoorRequests, readDoorGrants,
+  readDoorPolicy, writeDoorPolicy, passageLabel, readDoorRequests, readDoorGrants,
   writeDoorRequest, removeDoorRequest, writeDoorGrant, removeDoorGrant,
-  hasDoorGrant, hasDoorRequest, type ConstructionMode, type PassageMode,
+  hasDoorGrant, hasDoorRequest, type ConstructionMode, type DoorPolicyRecord,
 } from './doorPolicy';
 import { getIdentityPub } from './keypair';
 import { getPlayerName } from './identity';
@@ -798,9 +798,14 @@ export class DoorDockingPortSystem {
       } else if (!this.isRoomOwner()) {
         return; // every action below is owner-only (UI gate, dev-phase posture)
       } else if (action === 'cycle-passage') {
+        // 🚪↦ Four states: PUBLIC (two-way) → IN ONLY → OUT ONLY → OWNER → …
         const p = readDoorPolicy(doorId);
-        const passage: PassageMode = p.passage === 'public' ? 'owner' : 'public';
-        writeDoorPolicy(doorId, { ...p, passage });
+        const next: DoorPolicyRecord = { ...p };
+        if (p.passage === 'owner') { next.passage = 'public'; delete next.oneWay; }
+        else if (!p.oneWay) { next.oneWay = 'in'; }
+        else if (p.oneWay === 'in') { next.oneWay = 'out'; }
+        else { next.passage = 'owner'; delete next.oneWay; }
+        writeDoorPolicy(doorId, next);
       } else if (action === 'cycle-construction') {
         const p = readDoorPolicy(doorId);
         const next: Record<ConstructionMode, ConstructionMode> = { owner: 'request', request: 'public', public: 'owner' };
@@ -872,8 +877,8 @@ export class DoorDockingPortSystem {
           <button type="button" data-policy-action="revoke-grant" data-pub="${esc(g.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>
         </div>`).join('');
       body.innerHTML = `
-        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk</span></span>
-          <button type="button" data-policy-action="cycle-passage" style="${pill}">${policy.passage.toUpperCase()}</button></div>
+        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk${policy.oneWay ? ' · one-way for guests' : ''}</span></span>
+          <button type="button" data-policy-action="cycle-passage" style="${pill}">${passageLabel(policy)}</button></div>
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
         <div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? ' — unpair first' : ''}</span></span>
@@ -903,7 +908,7 @@ export class DoorDockingPortSystem {
               : `<button type="button" data-policy-action="req-build" style="${pill} background:rgba(255,179,0,0.12); border-color:rgba(255,179,0,0.4); color:#ffb300;">🙋 REQUEST BUILD RIGHTS</button>`)
           : '<span style="color:rgba(212,168,75,0.55);">BUILD: OWNER ONLY</span>';
       body.innerHTML = `
-        <div style="${row}"><span>PASSAGE: ${policy.passage.toUpperCase()}</span>${buildLine}</div>
+        <div style="${row}"><span>PASSAGE: ${passageLabel(policy)}</span>${buildLine}</div>
         ${policy.adapter && !this.canConstruct(doorId)
           ? `<div style="color:#80d8ff;">🔌 BERTHING OPEN — enter your ship's address above and INITIATE to dock transiently</div>`
           : ''}
@@ -1530,7 +1535,14 @@ export class DoorDockingPortSystem {
   /** #67 D1: passage check for walk-through/transit (world.ts consults this
    *  before offering the door sequence). */
   public canPass(doorId: string): boolean {
-    return this.canOperateDoor(doorId);
+    // 🚪↦ ONE-WAY doors (owner request): this is the DEPARTURE/local-crossing
+    // gate (walkthroughs + FP auto-doors) — an IN-only door refuses guest
+    // departures (travelers may only come IN through it). OUT-only arrivals
+    // are the turnstile's job (world.completeAdapterArrival). Owners pass
+    // both ways, always.
+    if (this.isRoomOwner()) return true;
+    const p = readDoorPolicy(doorId);
+    return p.passage === 'public' && p.oneWay !== 'in';
   }
 
   /** 🧱 #66 S1: slide each door's 3D group (frame + leaves + keypad ride the

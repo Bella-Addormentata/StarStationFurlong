@@ -5,6 +5,8 @@
  */
 
 import * as THREE from 'three';
+// 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
+import { readDoorPolicy } from './doorPolicy';
 import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt, rebuildSeats } from './seats';
@@ -129,9 +131,15 @@ export class World {
   private cloneVats: Map<string, CloneVatHandle> = new Map();
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
-  /** 🧬 Grace before the queued spawn may fire: the #65 exterior boot flips
-   *  the zoom to level 3 a beat AFTER morph-complete, and the ceremony must
-   *  not race it and play unseen (zoom reads 2 for the first few frames). */
+  /** 🧬 True once the queued spawn has seen the exterior boot view (zoom ≥ 3)
+   *  — the PRIMARY arming signal: the reveal then fires on the zoom-in
+   *  transition, however long the v0.32.20 auto-boot's join-under-intro takes
+   *  to flip the view (a fixed grace lost that race on slow joins and the
+   *  ceremony played unseen behind the intro). */
+  private vatSawExterior = false;
+  /** 🧬 Fallback arming grace for paths where no exterior boot ever flips the
+   *  zoom (legacy boots, missing multiScaleZoom) — long, because it only
+   *  exists so the clone can't be held forever. */
   private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
@@ -1108,7 +1116,8 @@ export class World {
           vat.item.rot * (Math.PI / 2),
         );
         this.pendingVatSpawn = true;
-        this.pendingVatSpawnGrace = 0.8; // outlast the exterior-boot flip (#65)
+        this.vatSawExterior = false;
+        this.pendingVatSpawnGrace = 8; // fallback only — see the field docs
       }
     }
 
@@ -1188,12 +1197,14 @@ export class World {
 
     // 🧬 Deferred boot spawn: run the vat reveal the first frame the player
     // actually sees the room interior (zoom ≤ 2) — queued at morph-complete.
-    // The grace lets the #65 exterior boot flip the zoom to 3 first; without
-    // it the ceremony fires on the same-frame default level 2 and plays
-    // unseen behind the station-from-space view.
+    // Armed by SEEING the exterior boot view first (zoom ≥ 3), so the reveal
+    // always lands on the deliberate zoom-in no matter how long the
+    // join-under-intro flip takes; the long grace is a fallback for boots
+    // that never flip to the exterior at all.
     if (this.pendingVatSpawn && !this.isMorphing) {
+      if (zoomLevel >= 3) this.vatSawExterior = true;
       this.pendingVatSpawnGrace -= deltaTime;
-      if (this.pendingVatSpawnGrace <= 0 && zoomLevel <= 2) {
+      if ((this.vatSawExterior || this.pendingVatSpawnGrace <= 0) && zoomLevel <= 2) {
         this.pendingVatSpawn = false;
         this.respawnAtVat();
       }
@@ -1598,7 +1609,10 @@ export class World {
     // #67 D1: passage policy — an owner-restricted door refuses non-owners
     // before any walk choreography starts.
     if (!this.dockingSystem.canPass(door.id)) {
-      showHint('This door\'s passage is restricted by the room owner.');
+      const pol = readDoorPolicy(door.id);
+      showHint(pol.passage === 'public' && pol.oneWay === 'in'
+        ? 'ONE-WAY door — travelers may only come IN through it (the owner passes freely).'
+        : 'This door\'s passage is restricted by the room owner.');
       return;
     }
 
@@ -1972,8 +1986,22 @@ export class World {
     // resolveArrivalDoor); the record's farDoor and the opposite-cardinal
     // guess are fallbacks only.
     const arrival = this.resolveArrivalDoor(departureDoorId, farDoor, fromRoomId);
-    this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival));
+    // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
+    // arrivals — the traveler walks in, gets the hint, and is walked right
+    // back out (the return departure is exactly what OUT permits). The
+    // room doc is already synced here (#60 gate), so the policy read is the
+    // arrival room's truth. One-shot guard: opposing one-way doors bounce a
+    // traveler AT MOST once — never a ping-pong.
+    const pol = readDoorPolicy(arrival.id);
+    const bounce = pol.passage === 'public' && pol.oneWay === 'out'
+      && !canEditRoom().ok && !this.oneWayBounceGuard;
+    this.oneWayBounceGuard = false;
+    this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival, false, bounce ? arrival.id : undefined));
   }
+
+  /** 🚪↦ True while the CURRENT transit is a turnstile bounce — the arrival
+   *  at the far end must not bounce again (opposing one-way misconfig). */
+  private oneWayBounceGuard = false;
 
   /**
    * Arrival half of the ACCESS-app pass transport (#52, dev phase): no door
@@ -2021,7 +2049,7 @@ export class World {
    * purpose: the walk-in is the only way back INTO a room — denying it would
    * strand the avatar outside the walls.
    */
-  private _makeArrivalHooks(door: DoorTarget, endTransitOnClose = false): DoorSequenceHooks {
+  private _makeArrivalHooks(door: DoorTarget, endTransitOnClose = false, bounceOutDoorId?: string): DoorSequenceHooks {
     const ds = this.dockingSystem;
     return {
       requestOpen: (onOpened) => {
@@ -2032,6 +2060,15 @@ export class World {
       requestClose: () => {
         ds?.closeDoor(door.id);
         if (endTransitOnClose) this.endTransitVestibule();
+        // 🚪↦ Turnstile: the guest is fully inside and the door just shut —
+        // now shove them back out through it (a normal walkthrough; OUT-only
+        // permits the departure). Deferred a beat so the arrival sequence
+        // finishes cleanly before the reverse one starts.
+        if (bounceOutDoorId) {
+          showHint('⛔ ONE-WAY door — guests may only travel OUT through it. Sending you back…', 4000);
+          this.oneWayBounceGuard = true;
+          setTimeout(() => this.requestDoorWalkthrough(bounceOutDoorId), 900);
+        }
       },
       onThrough: () => { /* arrival leg never re-crosses outward */ },
     };
