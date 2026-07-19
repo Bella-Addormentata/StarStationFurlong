@@ -796,8 +796,8 @@ class RoomEditController {
    * re-places it via the spawn machinery). Steps, in dependency order:
    *
    *  1. guards — movable only (structurally guaranteed: buildRaycastIndex
-   *     only indexes movable items, so fireplace/bar/wall-computer can never
-   *     be SELECTED — but fail closed anyway), no live carry (the X handler
+   *     only indexes movable items, so the wall computer can never be
+   *     SELECTED — but fail closed anyway), no live carry (the X handler
    *     and button visibility already exclude it; re-checked here);
    *  2. a local player seated ON the item stands up first (the same
    *     evictFromSeat idiom as beginCarry, plan §4.2) — the stand-up slide
@@ -1115,9 +1115,9 @@ class RoomEditController {
    * Show the floating ✕ REMOVE button iff an item is SELECTED and no carry
    * is live (#53). The movable guard is structural — buildRaycastIndex only
    * indexes movable items, so a selected item is movable by construction
-   * (fireplace / bar / wall computer can never be selected, hence never show
-   * the button) — but re-checked so a future selectable-but-fixed item fails
-   * closed (hidden), matching the "button hidden, not disabled" rule.
+   * (the wall computer can never be selected, hence never shows the button)
+   * — but re-checked so a future selectable-but-fixed item fails closed
+   * (hidden), matching the "button hidden, not disabled" rule.
    */
   private syncRemoveButton(): void {
     const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;

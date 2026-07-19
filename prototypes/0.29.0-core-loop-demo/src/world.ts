@@ -11,7 +11,7 @@ import { Player } from './player';
 import { InputManager } from './input';
 import { findSeatAt, rebuildSeats } from './seats';
 import { getDefaultRoomId } from './identity';
-import { FURNITURE, FURNITURE_DEFS, buildItemGroup, BUNK_TOP_Y, rotXZ } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, DEFAULT_FOOTPRINT_OVERRIDES, buildItemGroup, BUNK_TOP_Y, rotXZ } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { northDoorUnlocked } from './stationParts';
 import { rebuildObstacles } from './obstacles';
@@ -26,7 +26,8 @@ import type { FurnitureRecord } from './furnitureDoc';
 import { findDoor, DOORS } from './doors';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
-import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, createCashierUI, createRouletteUI, readLiveRoomStatus } from './devices';
+import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, createCashierUI, createRouletteUI, createCloneVatUI, readLiveRoomStatus } from './devices';
+import { preferredSpawnVat, setPreferredSpawnVat } from './spawnPoint';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle, DeviceTarget } from './devices';
 import { subscribeGames, readGame } from './games/gamesDoc';
 import { deviceFocus } from './deviceFocus';
@@ -765,6 +766,14 @@ export class World {
           movable: rec.movable,
         };
         if (rec.mountParent !== undefined) item.mountParent = rec.mountParent; // 🛰️ hull stack
+        // Records can't carry hand-authored footprintOverrides — restore the
+        // authored obstacle when the item sits at its exact default pose, so
+        // a doc round-trip (cross-room travel) bakes the same walkable grid
+        // as a fresh boot (per-client grid drift otherwise).
+        const dov = DEFAULT_FOOTPRINT_OVERRIDES[id];
+        if (dov && rec.x === dov.x && rec.z === dov.z && rec.rot === dov.rot && rec.mountParent === undefined) {
+          item.footprintOverride = { ...dov.box };
+        }
         FURNITURE.push(item);
         this.registerFurnitureGroup(item, /* reveal */ true);
         changedIds.add(id);
@@ -775,7 +784,14 @@ export class World {
         existing.rot = rec.rot;
         // A moved item sheds its hand-authored obstacle override (matches
         // commitCarry) — the derived footprint is now the honest obstacle.
-        if (existing.footprintOverride !== undefined) delete existing.footprintOverride;
+        // Moved BACK to the exact default pose, it takes the authored box
+        // again (keeps every client's grid identical for default layouts).
+        const mdov = DEFAULT_FOOTPRINT_OVERRIDES[id];
+        if (mdov && rec.x === mdov.x && rec.z === mdov.z && rec.rot === mdov.rot && rec.mountParent === undefined) {
+          existing.footprintOverride = { ...mdov.box };
+        } else if (existing.footprintOverride !== undefined) {
+          delete existing.footprintOverride;
+        }
         const group = this.furnitureGroups.get(id);
         if (group) {
           group.position.set(rec.x, 0, rec.z);
@@ -2022,7 +2038,13 @@ export class World {
     deviceFocus.forceRelease();
     roomEdit.forceExit();
     this.endTransitVestibule();
-    this.player.beamTo(0, 1.5); // the Player constructor's spawn point
+    // 🧬 Owner request: pass arrivals decant from the room's vat when one
+    // exists — performRoomSwap awaits the room-state gate before arrive(),
+    // so the host's real furniture layout is already synced here. Vat-less
+    // rooms keep the legacy mid-room beam.
+    if (!this.respawnAtVat()) {
+      this.player.beamTo(0, 1.5); // the Player constructor's spawn point
+    }
   }
 
   /**
@@ -2154,6 +2176,21 @@ export class World {
       return;
     }
 
+    if (device.kind === 'cloneVat') {
+      // 🧬 The spawn-point picker: local preference per room (spawnPoint.ts).
+      // The decant choreography itself stays with respawnAtVat — this panel
+      // only decides WHICH tank it uses for me.
+      const roomId = World.activeRoomId();
+      const isMySpawn = () => preferredSpawnVat(roomId) === deviceId;
+      const ui = createCloneVatUI({
+        isMySpawn,
+        isEffectiveSpawn: () => this.findSpawnVat()?.item.id === deviceId,
+        setMySpawn: (on) => setPreferredSpawnVat(roomId, on ? deviceId : null),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
     if (device.kind === 'cashier' || device.kind === 'roulette') {
       // 🎰 #69 G1/G2: the HOUSE side (cashier book, croupier spin) rides the
       // same owner-equivalent seam as room editing — canEditRoom funnels
@@ -2212,8 +2249,17 @@ export class World {
 
   // ── 🧬 Clone-vat spawn choreography (owner request) ─────────────────────────
 
-  /** First clone-vat item with a live handle, or null (vat-less room). */
+  /** My preferred vat when saved (spawnPoint.ts — the vat panel's "wake up
+   *  here"), else the first clone-vat item with a live handle, else null
+   *  (vat-less room). */
   private findSpawnVat(): { item: FurnitureItem; handle: CloneVatHandle } | null {
+    const prefId = preferredSpawnVat(World.activeRoomId());
+    if (prefId) {
+      const item = FURNITURE.find((i) => i.kind === 'clone-vat' && i.id === prefId);
+      const handle = item ? this.cloneVats.get(item.id) : undefined;
+      if (item && handle) return { item, handle };
+      // Saved vat gone (removed/never synced) — fall through to first-found.
+    }
     for (const item of FURNITURE) {
       if (item.kind !== 'clone-vat') continue;
       const handle = this.cloneVats.get(item.id);

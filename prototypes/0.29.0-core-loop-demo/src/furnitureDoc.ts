@@ -30,7 +30,7 @@ export interface FurnitureRecord {
   x: number;
   z: number;
   rot: Rot;
-  /** false for fixed room structure (fireplace wall, bar, wall computer). */
+  /** false for fixed room structure (the wall computer). */
   movable: boolean;
   /** 🛰️ Hull stacking (hull.ts): id of the exterior item this one is mounted
    *  on. Absent ⇒ wall/interior. Plain string — LWW rides it like the rest. */

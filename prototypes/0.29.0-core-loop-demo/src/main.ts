@@ -99,6 +99,13 @@ import {
 import {
   makeIntroductions, ingestIntroduction, type Introduction,
 } from './introductions';
+// 📤 Transfer offers (brainstorming/transfer-offers-deeds-shares.md): signed,
+// portable deed/share transfers — cut anywhere, redeemed standing at the asset.
+import {
+  bindOffers, subscribeOffers, makeOffer, encodeOffer, decodeOffer, offerFileName,
+  redeemDeedOffer, redeemShareOffer, revokeOffer, nonceMark, listOfferMarks,
+  offersMade, recordOfferMade, dropOfferMade, type TransferOffer,
+} from './offers';
 import {
   initDirectMessages, openDm, sendMessage, readMessages, closeDm, closeAllDms,
   dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
@@ -753,6 +760,14 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   bindVentures(sync.doc);
   syncVentureLedgerFromCurrentRoom();
 
+  // 📤 Transfer offers: the room's one-time redemption records (nonce marks)
+  // ride the same doc — bound here so redeem/revoke and the venture-map
+  // writes can never split across docs.
+  bindOffers(sync.doc);
+  // Debug handle alongside __ssfRoomId — the live room doc for console
+  // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
+  (window as any).__ssfDoc = sync.doc;
+
   // 🏠 #68 real estate: this room joins (or leaves) the personal deeds ledger
   // that powers the VENTURES app's REAL ESTATE section. Also re-run from the
   // roomInfo observer below — the owner value lands async with the sync.
@@ -798,6 +813,9 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
+    // 📤 An offer mark landing remotely (someone redeemed/revoked while we
+    // look at the app) repaints the OFFERS OUT rows and transfer history live.
+    subscribeOffers(() => renderVenturesApp());
     // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
     // the door slide), refresh an open keypad's POSITION row, and re-dress
     // the exterior (a slid door carries its adapter collar).
@@ -1823,6 +1841,94 @@ function executeDeedHandover(toPlayerId: string): boolean {
   return true;
 }
 
+// ── 📤 Transfer offers — phone-side glue (offers.ts owns the artifact) ───────
+
+/** REDEEM box state — module-level so it survives repaints AND app re-opens:
+ *  the flow is paste → travel to the asset → redeem, and a phone toggle or a
+ *  remote doc change landing mid-journey must not eat the pasted offer. */
+let offerRedeemRaw = '';
+let offerRedeemNote = '';
+/** Feedback line for the cut-an-offer blocks (copied / saved / refused). */
+let offerCutNote = '';
+
+function parseOfferRecipient(value: string): { toPub?: string; toVentureId?: string; toVentureName?: string } {
+  if (value.startsWith('pub:')) return { toPub: value.slice(4) };
+  if (value.startsWith('vnt:')) {
+    const id = value.slice(4);
+    return { toVentureId: id, toVentureName: ventureLedger().find((e) => e.id === id)?.name };
+  }
+  return {}; // bearer — first redeemer takes it, exactly a Chia offer file
+}
+
+const OFFER_TTL_CHOICES = [
+  { value: '1d', label: 'good 1 day', ms: 24 * 60 * 60 * 1000 },
+  { value: '7d', label: 'good 7 days', ms: 7 * 24 * 60 * 60 * 1000 },
+  { value: '30d', label: 'good 30 days', ms: 30 * 24 * 60 * 60 * 1000 },
+] as const;
+
+function offerTtlMs(value: string): number {
+  return OFFER_TTL_CHOICES.find((c) => c.value === value)?.ms ?? OFFER_TTL_CHOICES[1].ms;
+}
+
+function offerExpiresIn(ts: number): string {
+  const ms = ts - Date.now();
+  if (ms <= 0) return 'expired';
+  const d = Math.floor(ms / 86400000);
+  const h = Math.floor((ms % 86400000) / 3600000);
+  if (d > 0) return `${d}d ${h}h left`;
+  const m = Math.floor((ms % 3600000) / 60000);
+  return h > 0 ? `${h}h ${m}m left` : `${Math.max(1, m)}m left`;
+}
+
+/** COPY / SAVE dispatch shared by the deed and share offer blocks. */
+function shipOffer(offer: TransferOffer, mode: 'copy' | 'save'): void {
+  recordOfferMade(offer);
+  const encoded = encodeOffer(offer);
+  if (mode === 'copy') {
+    offerCutNote = '📋 Offer signed and copied — send it to the recipient any way you like.';
+    navigator.clipboard?.writeText(encoded).then(undefined, () => {
+      // Post-repaint fallback note (the repaint already painted the optimistic one).
+      const note = document.getElementById('offer-cut-note');
+      if (note) note.textContent = 'Copy failed — use 💾 SAVE FILE instead.';
+    });
+  } else {
+    offerCutNote = '💾 Offer signed and saved as a file — send it to the recipient.';
+    const blob = new Blob([encoded], { type: 'text/plain' });
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(blob), download: offerFileName(offer),
+    });
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+}
+
+/** OFFERS OUT rows for one asset (deed detail / venture detail screens).
+ *  `atAsset` = standing in the settlement doc: marks are live and ✗ REVOKE works. */
+function offersOutRows(
+  match: (o: TransferOffer) => boolean, atAsset: boolean,
+  esc: (s: string) => string, pill: string,
+): string {
+  const rows = offersMade().filter((e) => match(e.offer));
+  if (!rows.length) return '';
+  const items = rows.map(({ offer }) => {
+    const mark = atAsset ? nonceMark(offer.nonce) : null;
+    const status = mark
+      ? (mark.status === 'redeemed' ? `✓ redeemed by ${esc(mark.byName || 'a clone')}` : '✗ revoked')
+      : offerExpiresIn(offer.expiresAt);
+    const to = offer.toPub
+      ? `to ${esc(listContacts().find((c) => c.pub === offer.toPub)?.name ?? contactFingerprint(offer.toPub))}`
+      : offer.toVentureId ? `to 🚀 ${esc(offer.toVentureName ?? 'venture')}` : '⚠ bearer';
+    const what = offer.asset.kind === 'shares' ? `${offer.asset.count} shares` : 'the deed';
+    const live = !mark && offer.expiresAt > Date.now();
+    return `<div style="display:flex; align-items:center; gap:4px; margin-top:4px; font-size:9px;">
+      <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📤 ${what} ${to} · <span style="color:rgba(212,168,75,0.7);">${status}</span></span>
+      ${live ? `<button type="button" data-venture-action="offer-recopy" data-nonce="${esc(offer.nonce)}" style="${pill}" title="copy again">📋</button>` : ''}
+      ${live && atAsset ? `<button type="button" data-venture-action="offer-revoke" data-nonce="${esc(offer.nonce)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" title="revoke">✗</button>` : ''}
+    </div>`;
+  }).join('');
+  return `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">OFFERS OUT</div>${items}${atAsset ? '' : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Revoking is done standing at the asset.</div>'}`;
+}
+
 function renderVenturesApp(): void {
   const view = document.getElementById('phone-app-ventures');
   if (!view) return;
@@ -1840,14 +1946,17 @@ function renderVenturesApp(): void {
         ventureDetailId = el.dataset.id ?? '';
         deedDetailRoomId = '';
         deedHandoverArmed = '';
+        offerCutNote = '';
       } else if (action === 'back') {
         ventureDetailId = '';
         deedDetailRoomId = '';
         deedHandoverArmed = '';
+        offerCutNote = '';
       } else if (action === 'deed-open') {
         deedDetailRoomId = el.dataset.id ?? '';
         ventureDetailId = '';
         deedHandoverArmed = '';
+        offerCutNote = '';
       } else if (action === 'deed-transfer') {
         const sel = document.getElementById('deed-transfer-to') as HTMLSelectElement | null;
         const toId = sel?.value ?? '';
@@ -1865,6 +1974,7 @@ function renderVenturesApp(): void {
           return; // keep the screen for correction
         }
       } else if (action === 'found') {
+        offerCutNote = ''; // a fresh charter screen must not inherit offer feedback
         const nameInput = document.getElementById('venture-found-name') as HTMLInputElement | null;
         const name = nameInput?.value.trim() ?? '';
         if (!name) return;
@@ -1898,6 +2008,90 @@ function renderVenturesApp(): void {
           if (note) note.textContent = 'transfer refused — check the key and your share count';
           return; // keep inputs for correction
         }
+      } else if (action === 'deed-offer-copy' || action === 'deed-offer-save') {
+        // 📤 Sign a deed transfer offer — creation is doc-free (works held-
+        // from-afar too); validity proves itself at redemption.
+        const d = deedsLedger().find((e) => e.roomId === deedDetailRoomId);
+        const sel = document.getElementById('deed-offer-to') as HTMLSelectElement | null;
+        const ttlSel = document.getElementById('deed-offer-ttl') as HTMLSelectElement | null;
+        if (!d || d.isOffice || !sel || !sel.value) return;
+        const offer = makeOffer(
+          { kind: 'deed', roomId: d.roomId, roomName: d.name },
+          getPlayerName(),
+          parseOfferRecipient(sel.value),
+          { ttlMs: offerTtlMs(ttlSel?.value ?? '7d') },
+        );
+        shipOffer(offer, action === 'deed-offer-copy' ? 'copy' : 'save');
+      } else if (action === 'share-offer-copy' || action === 'share-offer-save') {
+        const v = ventureRecord();
+        const sel = document.getElementById('share-offer-to') as HTMLSelectElement | null;
+        const ttlSel = document.getElementById('share-offer-ttl') as HTMLSelectElement | null;
+        const countInput = document.getElementById('share-offer-count') as HTMLInputElement | null;
+        const count = Math.floor(Number(countInput?.value ?? 0));
+        if (!v || v.snapshotAt !== undefined || !sel || !sel.value) return;
+        if (!(count > 0)) {
+          const note = document.getElementById('offer-cut-note');
+          if (note) note.textContent = 'Enter how many shares to offer.';
+          return; // keep inputs for correction
+        }
+        if ((v.shares[myPub] ?? 0) < count) {
+          const note = document.getElementById('offer-cut-note');
+          if (note) note.textContent = `You hold ${v.shares[myPub] ?? 0} share${(v.shares[myPub] ?? 0) === 1 ? '' : 's'} — can't offer ${count}.`;
+          return; // keep inputs for correction
+        }
+        const offer = makeOffer(
+          { kind: 'shares', ventureId: v.id, ventureName: v.name, officeRoomId: activeBootstrap?.roomId ?? v.officeRoomId ?? '', count },
+          getPlayerName(),
+          parseOfferRecipient(sel.value),
+          { ttlMs: offerTtlMs(ttlSel?.value ?? '7d') },
+        );
+        shipOffer(offer, action === 'share-offer-copy' ? 'copy' : 'save');
+      } else if (action === 'offer-recopy') {
+        const entry = offersMade().find((e) => e.offer.nonce === el.dataset.nonce);
+        if (entry) {
+          offerCutNote = '📋 Offer copied again.';
+          navigator.clipboard?.writeText(entry.encoded).then(undefined, () => {
+            const note = document.getElementById('offer-cut-note');
+            if (note) note.textContent = 'Copy failed — clipboard permission was denied.';
+          });
+        }
+      } else if (action === 'offer-revoke') {
+        // Standing in the settlement doc (the button only renders there) —
+        // the mark kills the string wherever it landed.
+        const entry = offersMade().find((e) => e.offer.nonce === el.dataset.nonce);
+        if (entry && revokeOffer(entry.offer, getPlayerName())) {
+          dropOfferMade(entry.offer.nonce);
+          offerCutNote = '✗ Offer revoked — the copied string is dead wherever it landed.';
+        }
+      } else if (action === 'offer-check') {
+        const input = document.getElementById('offer-redeem-input') as HTMLTextAreaElement | null;
+        offerRedeemRaw = input?.value.trim() ?? '';
+        offerRedeemNote = offerRedeemRaw && !decodeOffer(offerRedeemRaw)
+          ? 'That does not read as a transfer offer — check the whole string was pasted.'
+          : '';
+      } else if (action === 'offer-clear') {
+        offerRedeemRaw = '';
+        offerRedeemNote = '';
+      } else if (action === 'offer-redeem') {
+        const offer = decodeOffer(offerRedeemRaw);
+        if (!offer) return;
+        const result = offer.asset.kind === 'deed'
+          ? redeemDeedOffer(offer, {
+            currentRoomId: activeBootstrap?.roomId ?? '',
+            myPlayerId: getPlayerId(), myPub, myName: getPlayerName(),
+          })
+          : redeemShareOffer(offer, myPub, getPlayerName());
+        if (result.ok) {
+          offerRedeemRaw = '';
+          offerRedeemNote = offer.asset.kind === 'deed'
+            ? '🖋 The deed is yours — recorded at the module.'
+            : '🖋 Shares recorded in the register — the stake is yours.';
+          syncDeedsLedgerFromCurrentRoom();
+          syncVentureLedgerFromCurrentRoom();
+          logToPhoneSystem(offerRedeemNote);
+        } else {
+          offerRedeemNote = result.error;
+        }
       }
       renderVenturesApp();
     });
@@ -1906,6 +2100,8 @@ function renderVenturesApp(): void {
   const myPub = getIdentityPub();
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
   const pill = 'display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;';
+  const inputStyle = 'flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;';
+  const ttlOptions = OFFER_TTL_CHOICES.map((c) => `<option value="${c.value}"${c.value === '7d' ? ' selected' : ''}>${c.label}</option>`).join('');
   const current = ventureRecord();
   const currentRoomId = activeBootstrap?.roomId ?? null;
   /** PERSONAL room ownership (raw — deliberately NOT the shareholder-extended
@@ -1955,8 +2151,51 @@ function renderVenturesApp(): void {
           : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">No one to hand the deed to yet — the recipient must visit this module once (their key signs into the room record).</div>';
       }
     } else if (!here) {
-      transferBlock = `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">The deed is kept at the module — travel there to hand it over. Recorded ${new Date(deedDetail.lastSeen).toLocaleDateString()}.</div>`;
+      // Office deeds never transfer (the Charter holds them) — from afar the
+      // copy must not point at an offer block that won't render below.
+      transferBlock = office
+        ? `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">This module is a registered office — the Charter holds its deed; it cannot change hands. Recorded ${new Date(deedDetail.lastSeen).toLocaleDateString()}.</div>`
+        : `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">The deed is kept at the module — travel there to hand it over in person, or cut a transfer offer below. Recorded ${new Date(deedDetail.lastSeen).toLocaleDateString()}.</div>`;
     }
+
+    // ── 📤 TRANSFER OFFER — the remote path: sign it here (works held-from-
+    //    afar; creation is doc-free), send it anywhere, the recipient redeems
+    //    standing in this module. Any hand-over meanwhile voids it.
+    let offerBlock = '';
+    if (!office && (!here || currentRoomDeedIsMine())) {
+      const recipients: string[] = [];
+      for (const c of listContacts()) recipients.push(`<option value="pub:${esc(c.pub)}">👤 ${esc(c.name)}</option>`);
+      for (const e of ventureLedger()) {
+        if (e.myShares > 0 && e.capSeenAt) recipients.push(`<option value="vnt:${esc(e.id)}">🚀 ${esc(e.name)} (venture)</option>`);
+      }
+      recipients.push('<option value="bearer">⚠ anyone who holds it (bearer)</option>');
+      const ventureWarning = ventureName
+        ? `<div style="font-size:9px; color:#ffb300; margin-top:3px;">This module is 🚀 ${esc(ventureName)} property — redeemed by anyone but that venture, it leaves the company as it changes hands.</div>`
+        : '';
+      offerBlock = `
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">TRANSFER OFFER</div>
+        <div style="display:flex; gap:4px; margin-top:4px;">
+          <select id="deed-offer-to" style="${inputStyle}">${recipients.join('')}</select>
+          <select id="deed-offer-ttl" style="${inputStyle} flex:0 0 auto; width:auto;">${ttlOptions}</select>
+        </div>
+        <div style="display:flex; gap:4px; margin-top:4px;">
+          <button type="button" data-venture-action="deed-offer-copy" style="${pill}">📋 COPY OFFER</button>
+          <button type="button" data-venture-action="deed-offer-save" style="${pill}">💾 SAVE FILE</button>
+        </div>
+        <div id="offer-cut-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${esc(offerCutNote)}</div>
+        ${ventureWarning}
+        <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Signs a transfer of this deed as a gift. Send the copied offer any way you like — the recipient redeems it standing in this module, no need to be online together. You can revoke it there any time; handing the deed over meanwhile voids it.</div>`;
+    }
+    const offersOut = offersOutRows(
+      (o) => o.asset.kind === 'deed' && o.asset.roomId === deedDetail.roomId, here, esc, pill);
+    // Free auditability: the module's own `offers` map is its transfer history.
+    const historyRows = here
+      ? listOfferMarks().filter((r) => r.mark.kind === 'deed' && r.mark.status === 'redeemed').slice(0, 5)
+        .map((r) => `<div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:3px;">🖋 ${new Date(r.mark.at).toLocaleDateString()} — deed claimed by ${esc(r.mark.byName || 'a clone')} <span style="color:rgba(212,168,75,0.5);">${esc(contactFingerprint(r.mark.byPub))}</span></div>`).join('')
+      : '';
+    const historyBlock = historyRows
+      ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">TRANSFER HISTORY</div>${historyRows}`
+      : '';
 
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← REAL ESTATE</button>
@@ -1965,6 +2204,9 @@ function renderVenturesApp(): void {
       <div style="font-size:10px; margin-top:10px;">${ventureName ? `🚀 Assigned to <b>${esc(ventureName)}</b>${office ? ' <span style="color:rgba(212,168,75,0.7);">· registered office</span>' : ' <span style="color:rgba(212,168,75,0.7);">· venture property</span>'}` : 'Held outright — sole personal owner.'}</div>
       ${dockedLinks > 0 ? `<div style="font-size:10px; margin-top:4px;">🚪 ${dockedLinks} docked link${dockedLinks === 1 ? '' : 's'}</div>` : ''}
       ${transferBlock}
+      ${offerBlock}
+      ${offersOut}
+      ${historyBlock}
     `;
     return;
   }
@@ -2007,7 +2249,23 @@ function renderVenturesApp(): void {
           <button type="button" data-venture-action="transfer" style="${pill}">SEND</button>
         </div>
         <div id="venture-transfer-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;"></div>
-        <div style="font-size:9px; color:rgba(212,168,75,0.65);">You hold ${mine} of ${detail.totalShares} shares. Transfers are recorded for everyone in the room.</div>` : ''}
+        <div style="font-size:9px; color:rgba(212,168,75,0.65);">You hold ${mine} of ${detail.totalShares} shares. Transfers are recorded for everyone in the room.</div>
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">OFFER SHARES</div>
+        <div style="display:flex; gap:4px; margin-top:4px;">
+          <input type="number" id="share-offer-count" min="1" max="${mine}" placeholder="#" style="width:44px; flex:0 0 auto; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
+          <select id="share-offer-to" style="${inputStyle}">${[
+            ...listContacts().map((c) => `<option value="pub:${esc(c.pub)}">👤 ${esc(c.name)}</option>`),
+            '<option value="bearer">⚠ anyone who holds it (bearer)</option>',
+          ].join('')}</select>
+          <select id="share-offer-ttl" style="${inputStyle} flex:0 0 auto; width:auto;">${ttlOptions}</select>
+        </div>
+        <div style="display:flex; gap:4px; margin-top:4px;">
+          <button type="button" data-venture-action="share-offer-copy" style="${pill}">📋 COPY OFFER</button>
+          <button type="button" data-venture-action="share-offer-save" style="${pill}">💾 SAVE FILE</button>
+        </div>
+        <div id="offer-cut-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${esc(offerCutNote)}</div>
+        <div style="font-size:9px; color:rgba(212,168,75,0.65);">Signs a share transfer as a gift — the recipient redeems it standing at this office. No need to be online together; you can revoke it here any time.</div>` : ''}
+      ${offersOutRows((o) => o.asset.kind === 'shares' && o.asset.ventureId === detail.id, detail.snapshotAt === undefined, esc, pill)}
     `;
     return;
   }
@@ -2081,11 +2339,60 @@ function renderVenturesApp(): void {
     </button>`;
   });
 
+  // ── 📤 REDEEM AN OFFER — the app's front door for incoming transfers.
+  //    Paste anywhere; the preview is signed truth; the REDEEM button lights
+  //    up only standing in the settlement room (deed → the module, shares →
+  //    the office). The pasted string lives in module state so travelling
+  //    there (repaints, phone toggles) never eats it.
+  const pending = offerRedeemRaw ? decodeOffer(offerRedeemRaw) : null;
+  let redeemBody = '';
+  if (pending) {
+    const what = pending.asset.kind === 'deed'
+      ? `🏠 the deed to <b>${esc(pending.asset.roomName || 'a module')}</b>`
+      : `🚀 <b>${pending.asset.count}</b> share${pending.asset.count === 1 ? '' : 's'} of <b>${esc(pending.asset.ventureName)}</b>`;
+    const toMe = !pending.toPub || pending.toPub === myPub;
+    const toLine = pending.toPub
+      ? (pending.toPub === myPub ? 'made out to <b>you</b>' : 'made out to <b>someone else</b>')
+      : pending.toVentureId
+        ? `made out to 🚀 ${esc(pending.toVentureName ?? 'a venture')} — a shareholder who has visited its office accepts for it`
+        : '⚠ bearer — whoever holds it may take it';
+    const settleHere = pending.asset.kind === 'deed'
+      ? pending.asset.roomId === currentRoomId
+      : (current?.id === pending.asset.ventureId && current?.snapshotAt === undefined);
+    const whereLine = pending.asset.kind === 'deed'
+      ? (settleHere ? '✓ you are standing at the module' : `travel to <b>${esc(pending.asset.roomName || readAtlas()[pending.asset.roomId]?.name || 'the module')}</b> to redeem`)
+      : (settleHere ? '✓ you are standing at the office' : `travel to <b>${esc(pending.asset.ventureName)}</b>'s office to redeem`);
+    const mark = settleHere ? nonceMark(pending.nonce) : null;
+    const dead = pending.expiresAt <= Date.now()
+      ? 'This offer has expired.'
+      : mark ? (mark.status === 'redeemed' ? 'Already redeemed.' : 'Revoked by the maker.') : '';
+    redeemBody = `
+      <div style="border:1px solid rgba(212,168,75,0.25); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
+        <div>${what} — a <b>gift</b>${pending.price > 0 ? ' <span style="color:#ff8a80;">(asks a price — priced offers arrive with the Registry)</span>' : ''}</div>
+        <div style="margin-top:3px;">from ${esc(pending.makerName || 'a clone')} <span style="color:rgba(212,168,75,0.6);">${esc(contactFingerprint(pending.makerPub))}</span> · ${toLine}</div>
+        <div style="margin-top:3px; color:rgba(212,168,75,0.8);">${offerExpiresIn(pending.expiresAt)} · ${whereLine}</div>
+        ${dead ? `<div style="margin-top:3px; color:#ff8a80;">${dead}</div>` : ''}
+        <div style="display:flex; gap:4px; margin-top:6px;">
+          ${settleHere && !dead && toMe ? `<button type="button" data-venture-action="offer-redeem" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 REDEEM</button>` : ''}
+          <button type="button" data-venture-action="offer-clear" style="${pill}">CLEAR</button>
+        </div>
+      </div>`;
+  } else {
+    redeemBody = `
+      <textarea id="offer-redeem-input" rows="2" placeholder="paste a transfer offer (ssf://offer?…)" style="width:100%; box-sizing:border-box; margin-top:4px; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060; resize:none;">${esc(offerRedeemRaw)}</textarea>
+      <div style="margin-top:4px;"><button type="button" data-venture-action="offer-check" style="${pill}">🔎 CHECK OFFER</button></div>`;
+  }
+  const redeemBlock = `
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">REDEEM AN OFFER</div>
+    ${redeemBody}
+    <div style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${esc(offerRedeemNote)}</div>`;
+
   view.innerHTML = `
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95);">YOUR STAKES</div>
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">REAL ESTATE</div>
     ${deedRows.length ? deedRows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
+    ${redeemBlock}
     ${foundBlock}
     ${addBlock}
   `;
