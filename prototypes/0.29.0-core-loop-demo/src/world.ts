@@ -746,10 +746,12 @@ export class World {
           rot: rec.rot,
           movable: rec.movable,
         };
+        if (rec.mountParent !== undefined) item.mountParent = rec.mountParent; // 🛰️ hull stack
         FURNITURE.push(item);
         this.registerFurnitureGroup(item, /* reveal */ true);
         changedIds.add(id);
-      } else if (existing.pos.x !== rec.x || existing.pos.z !== rec.z || existing.rot !== rec.rot) {
+      } else if (existing.pos.x !== rec.x || existing.pos.z !== rec.z || existing.rot !== rec.rot
+        || existing.mountParent !== rec.mountParent) {
         this.evictAndDefocusForItem(id);
         existing.pos = { x: rec.x, z: rec.z };
         existing.rot = rec.rot;

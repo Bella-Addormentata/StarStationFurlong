@@ -13,7 +13,12 @@ import * as THREE from 'three';
 import { findDoor } from './doors';
 import type { DoorId } from './doors';
 import { getCameraYaw } from './cameraRig';
-import { projectionPoseForDoor, solveChain, type ConnectorSegment } from './adapter';
+import { projectionPoseForDoor, solveChain, foldChainEnd, type ConnectorSegment } from './adapter';
+// 🛰️ Hull space: built chains register their swept boxes so exterior mounts
+// can't be placed through a vestibule — and the assembly UI warns the other
+// way when a chain would run through mounted equipment.
+import { setChainBoxProvider, exteriorItemBoxes } from './hull';
+import type { Box } from './furniture';
 import {
   armedPreset, presetSegments, partsCount, consumePart, refundPart,
   consumeForSegments, refundForSegments,
@@ -146,6 +151,53 @@ export class DoorDockingPortSystem {
   constructor(roomsGroup: THREE.Group) {
     this.roomsGroup = roomsGroup;
     this.initializeDoorStates();
+    // 🛰️ hull.ts occupancy: exterior-mount validation consults our built
+    // chains (latest instance wins — exactly one system is live per room).
+    setChainBoxProvider(() => this.builtChainBoxes());
+  }
+
+  /**
+   * 🛰️ XZ boxes swept by every door's CURRENT chain, folded joint by joint
+   * (chain-local frame → world via the door's face + yaw — the same
+   * transform family as projectionPoseForDoor). Padded to the vestibule's
+   * half-width so a mount can't sit flush against a tube wall either.
+   */
+  private builtChainBoxes(): Box[] {
+    const out: Box[] = [];
+    for (const doorId of this.doorState.keys()) {
+      out.push(...this.chainBoxesFor(doorId));
+    }
+    return out;
+  }
+
+  /** One door's chain, folded joint by joint into padded world-XZ boxes. */
+  private chainBoxesFor(doorId: 'north' | 'south' | 'east' | 'west'): Box[] {
+    const segs = this.doorState.get(doorId)?.segments ?? [];
+    if (segs.length === 0) return [];
+    const FACE: Record<string, { x: number; z: number }> = {
+      north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 },
+    };
+    const YAW: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
+    const PAD = 0.85;
+    const face = FACE[doorId];
+    const yaw = YAW[doorId];
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const toWorld = (lx: number, lz: number) => ({
+      x: face.x + lx * c + lz * s,
+      z: face.z - lx * s + lz * c,
+    });
+    const out: Box[] = [];
+    let prev = toWorld(0, 0);
+    for (let i = 1; i <= segs.length; i++) {
+      const p = foldChainEnd(segs.slice(0, i));
+      const cur = toWorld(p.x, p.z);
+      out.push({
+        x0: Math.min(prev.x, cur.x) - PAD, z0: Math.min(prev.z, cur.z) - PAD,
+        x1: Math.max(prev.x, cur.x) + PAD, z1: Math.max(prev.z, cur.z) + PAD,
+      });
+      prev = cur;
+    }
+    return out;
   }
 
   private initializeDoorStates() {
@@ -880,6 +932,19 @@ export class DoorDockingPortSystem {
     const yawBtn = document.getElementById('docking-far-yaw');
     if (!state || !chips) return;
     const segs = state.segments ?? [];
+    // 🛰️ Hull-space honesty (the other direction of hull.ts's mount check):
+    // warn when THIS chain's fold sweeps through mounted exterior equipment.
+    const chainClash = (() => {
+      if (segs.length === 0) return null;
+      for (const cb of this.chainBoxesFor(doorId)) {
+        for (const it of exteriorItemBoxes()) {
+          if (cb.x0 < it.box.x1 && cb.x1 > it.box.x0 && cb.z0 < it.box.z1 && cb.z1 > it.box.z0) {
+            return it.id;
+          }
+        }
+      }
+      return null;
+    })();
     chips.innerHTML = segs.length === 0
       ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway</span>`
       : segs.map((s, i) => {
@@ -895,7 +960,9 @@ export class DoorDockingPortSystem {
               ${skinBtn}
               <button type="button" data-chip-action="remove" data-i="${i}" title="Remove (refunds the part)" style="background:none; border:none; color:#ff8a80; font-size:9px; cursor:pointer; padding:0 1px;">✕</button>
             </span>`;
-        }).join('');
+        }).join('') + (chainClash
+          ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ chain sweeps through mounted equipment (${chainClash}) — bend around it or move the mount</div>`
+          : '');
     if (partsNote) {
       partsNote.textContent = note
         ?? (this.canConstruct(doorId)

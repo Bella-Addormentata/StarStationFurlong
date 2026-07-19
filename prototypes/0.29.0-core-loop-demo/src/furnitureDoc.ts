@@ -32,6 +32,9 @@ export interface FurnitureRecord {
   rot: Rot;
   /** false for fixed room structure (fireplace wall, bar, wall computer). */
   movable: boolean;
+  /** 🛰️ Hull stacking (hull.ts): id of the exterior item this one is mounted
+   *  on. Absent ⇒ wall/interior. Plain string — LWW rides it like the rest. */
+  mountParent?: string;
 }
 
 let boundDoc: Y.Doc | null = null;
@@ -84,7 +87,8 @@ export function isFurnitureRecord(value: unknown): value is FurnitureRecord {
     Number.isFinite(r.x) &&
     Number.isFinite(r.z) &&
     ROT_VALUES.includes(r.rot as number) &&
-    typeof r.movable === 'boolean'
+    typeof r.movable === 'boolean' &&
+    (r.mountParent === undefined || typeof r.mountParent === 'string')
   );
 }
 
@@ -119,7 +123,11 @@ export function furnitureDocSize(): number {
 }
 
 function toRecord(item: FurnitureItem): FurnitureRecord {
-  return { kind: item.kind, x: item.pos.x, z: item.pos.z, rot: item.rot, movable: item.movable };
+  const rec: FurnitureRecord = {
+    kind: item.kind, x: item.pos.x, z: item.pos.z, rot: item.rot, movable: item.movable,
+  };
+  if (item.mountParent !== undefined) rec.mountParent = item.mountParent;
+  return rec;
 }
 
 /** Publish one item's placement (spawn / move). Owner-only in practice. */

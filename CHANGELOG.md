@@ -11,6 +11,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.18 — 2026-07-19
+
+### 🛰️ Hull Space Unified — Stack Your Tanks, Mount Your Engines
+
+- **One system now owns everything outside the walls** (new `hull.ts`): exterior mounts, the doors' docking envelopes, and vestibule chains all share one geometry-and-occupancy authority. Two honesty wins land immediately: **a mount can never be placed through a built vestibule chain**, and the keypad's assembly strip **warns when a chain would sweep through mounted equipment** ("⚠ chain sweeps through mounted equipment — bend around it or move the mount").
+- **⛽ Fuel tanks go dual-mode**: place them on the interior floor as before, or drag one past a wall in edit mode and it mounts on the hull.
+- **🥞 Stackable hull layers** (owner request): a tank on the wall offers its outer face — mount another tank on it, then an **engine on the outermost tank**. Stacks cap at 3 layers, children sit centred (no overhang), engines are always outermost (clear exhaust), and edit-mode carry snaps to walls *and* stack faces alike. **Removing a layer cascades**: everything mounted outboard of it goes to the room inventory — no floating equipment. A stack base with cargo on it refuses to move ("unstack first").
+- **The space view shows the truth now**: exterior equipment renders from its real builders at its real poses — the stack you built is the stack you see from space — and the old fake "fittings dress" (phantom bells and saddle tanks conjured from interior items) is retired.
+- Synced like all furniture (each layer is a room-doc record with its mount base id; LWW-safe); the helm's spaceworthiness checklist counts engines and tanks wherever they sit. `effectiveWallExtent()` is exposed for the jetbridge solver to respect deep stacks (wired in a future slice).
+- Verified: 12/12 hull unit cases (wall/stack/door-band/overlap/face-taken/depth-cap/cascade-order/chain-block/extent), stack round-trips through the sync reconcile, 3-layer stack renders in-room and from space, zero legacy dress meshes remain.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.18 in place). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.17 — 2026-07-19
 
 ### 🚀 Exterior Wall Mounts — Engines on the Hull
