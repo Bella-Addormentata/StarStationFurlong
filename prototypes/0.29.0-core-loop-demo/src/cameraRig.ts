@@ -95,6 +95,8 @@ let targetYaw = 0;
 let leftBtn: HTMLButtonElement | null = null;
 let rightBtn: HTMLButtonElement | null = null;
 let angleChip: HTMLDivElement | null = null;
+/** The whole rotate HUD (arrows + chip) — gated on body.in-room per frame. */
+let hudWrap: HTMLDivElement | null = null;
 /** Last availability pushed to the DOM — avoids per-frame style writes. */
 let lastEnabledState: boolean | null = null;
 
@@ -168,6 +170,13 @@ function refreshAngleChip(): void {
  * arrows' enabled/disabled styling in sync with availability.
  */
 export function updateCameraRig(deltaTime: number): void {
+  // 🧹 Owner request: the rotate HUD waits for the first room entry. JS
+  // enforcement per frame (belt) on top of the CSS body:not(.in-room) rule
+  // (braces) — the inline display here must agree with the class gate.
+  if (hudWrap) {
+    hudWrap.style.display = document.body.classList.contains('in-room') ? 'flex' : 'none';
+  }
+
   // 🎬 Space-view drift: a slow continuous yaw UNDER the detent machinery —
   // both yaws advance together so the user's 45° arrow steps still tween
   // relative to the drifting frame. Leaving the space view re-snaps the rig
@@ -226,6 +235,7 @@ export function initCameraRig(rigGuards: RigGuards): void {
   guards = rigGuards;
 
   const wrap = document.createElement('div');
+  hudWrap = wrap;
   wrap.id = 'camera-rotate-hud';
   wrap.style.cssText = `
     position: fixed;

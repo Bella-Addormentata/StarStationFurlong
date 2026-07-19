@@ -47,6 +47,44 @@ import { harvestIntoAtlas, readAtlas, bindStationAtlasDoc, pushAtlasToDoc, subsc
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from './seats';
+// 📟 Installed version for the Settings › Stats page (9th bump location).
+import { APP_VERSION } from './version';
+
+/** 📟 Settings › Stats: this device's browser-store usage vs the chosen disk
+ *  budget. navigator.storage.estimate() is the honest number available to a
+ *  web app; the budget is advisory until a pruning slice enforces it. */
+async function refreshStorageStats(): Promise<void> {
+  const usageEl = document.getElementById('ssf-disk-usage');
+  const fill = document.getElementById('ssf-disk-bar-fill');
+  if (!usageEl) return;
+  const fmt = (bytes: number) => bytes >= 1024 ** 3
+    ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
+    : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  try {
+    const est = await navigator.storage?.estimate?.();
+    const usage = est?.usage ?? 0;
+    const budgetMb = Number(localStorage.getItem('ssf-max-disk-mb') ?? '1000');
+    if (budgetMb > 0) {
+      const budgetBytes = budgetMb * 1024 ** 2;
+      const pct = Math.min(100, (usage / budgetBytes) * 100);
+      usageEl.textContent = `${fmt(usage)} of ${fmt(budgetBytes)} budget`;
+      if (fill) {
+        fill.style.width = `${pct.toFixed(1)}%`;
+        fill.style.background = pct >= 90 ? '#FF8A80' : pct >= 70 ? '#FFB300' : '#3E92B8';
+      }
+      (usageEl as HTMLElement).style.color = pct >= 90 ? '#FF8A80' : '#f0c060';
+    } else {
+      usageEl.textContent = `${fmt(usage)} · no budget${est?.quota ? ` (device allows ${fmt(est.quota)})` : ''}`;
+      if (fill) {
+        fill.style.width = est?.quota ? `${Math.min(100, (usage / est.quota) * 100).toFixed(1)}%` : '0%';
+        fill.style.background = '#3E92B8';
+      }
+      (usageEl as HTMLElement).style.color = '#f0c060';
+    }
+  } catch {
+    usageEl.textContent = 'unavailable in this browser';
+  }
+}
 import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
 import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
@@ -2259,6 +2297,50 @@ function setupSpacePhoneOverlay() {
     const statsHud = document.getElementById('debug-hud');
     const statsView = document.getElementById('phone-app-settings-stats');
     if (statsHud && statsView) statsView.appendChild(statsHud);
+    // 📟 Owner request: version + this device's mesh storage on the Stats
+    // page, with a user-selectable disk budget. Honest numbers only: usage
+    // comes from navigator.storage.estimate() (the browser store holding the
+    // room docs on THIS device); the budget guides future pruning — nothing
+    // is deleted automatically yet, and the panel says so.
+    if (statsView) {
+      const extras = document.createElement('div');
+      extras.id = 'ssf-stats-extras';
+      extras.style.cssText = 'padding:10px 12px; font-size:10px; color:#e8d5a3; display:flex; flex-direction:column; gap:6px;';
+      extras.innerHTML = `
+        <div style="display:flex; justify-content:space-between;">
+          <span style="color:rgba(212,168,75,0.6); letter-spacing:1px;">VERSION</span>
+          <span style="color:#f0c060; font-weight:800;">v${APP_VERSION}</span>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:4px;">
+          <span style="color:rgba(212,168,75,0.6); letter-spacing:1px;">MESH STORAGE (THIS DEVICE)</span>
+          <span id="ssf-disk-usage" style="color:#f0c060;">measuring…</span>
+        </div>
+        <div id="ssf-disk-bar" style="height:8px; border:1px solid rgba(212,168,75,0.25); border-radius:4px; overflow:hidden;">
+          <div id="ssf-disk-bar-fill" style="height:100%; width:0%; background:#3E92B8;"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span style="color:rgba(212,168,75,0.6); letter-spacing:1px;">DISK BUDGET</span>
+          <select id="ssf-disk-budget" style="background:#0a1220; color:#e8d5a3; border:1px solid rgba(212,168,75,0.35); border-radius:4px; font-family:inherit; font-size:10px; padding:2px 6px;">
+            <option value="250">250 MB</option>
+            <option value="1000">1 GB</option>
+            <option value="5000">5 GB</option>
+            <option value="0">Unlimited</option>
+          </select>
+        </div>
+        <div style="font-size:8.5px; color:rgba(212,168,75,0.4); line-height:1.5;">
+          Room records sync to this device's browser store. The budget guides
+          future clean-up — nothing is removed automatically yet.
+        </div>`;
+      statsView.appendChild(extras);
+      const budgetSel = extras.querySelector<HTMLSelectElement>('#ssf-disk-budget');
+      if (budgetSel) {
+        budgetSel.value = localStorage.getItem('ssf-max-disk-mb') ?? '1000';
+        budgetSel.addEventListener('change', () => {
+          localStorage.setItem('ssf-max-disk-mb', budgetSel.value);
+          void refreshStorageStats();
+        });
+      }
+    }
     const roomHud = document.getElementById('room-info-hud');
     const accessView = document.getElementById('phone-app-access');
     if (roomHud && accessView) accessView.insertBefore(roomHud, accessView.firstChild);
@@ -2294,6 +2376,7 @@ function setupSpacePhoneOverlay() {
     if (id === 'ventures') { ventureDetailId = ''; deedDetailRoomId = ''; deedHandoverArmed = ''; renderVenturesApp(); }
     if (id === 'bank') renderBankApp();
     if (id === 'contacts') refreshContactsApp();
+    if (id === 'setstats') void refreshStorageStats(); // 📟 live disk figures
   };
 
   // App tiles on the home screen route into their views
