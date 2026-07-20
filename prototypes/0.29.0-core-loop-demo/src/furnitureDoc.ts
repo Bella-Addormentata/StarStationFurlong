@@ -174,18 +174,19 @@ const DEFAULT_LAYOUT: FurnitureItem[] = FURNITURE.map((item) => ({
 
 /**
  * 🛋️ One-time floor-plan migration (owner request: nothing parked in front
- * of the paired doors): snap every DEFAULT-id item still present in the doc
- * back to the current default arrangement. Caller gates it with a roomInfo
- * marker so it runs ONCE per room; user-spawned items (unique ids) and
- * deliberately deleted defaults are untouched.
+ * of the paired doors): UPSERT every default item — snap the ones present in
+ * the doc back to the current default arrangement AND add the ones missing
+ * entirely (rooms seeded before newer defaults existed never received them:
+ * the owner's lobby predated the clone vat, so the fox's spawn tube was
+ * absent). Caller gates it with a roomInfo marker so it runs ONCE per room;
+ * user-spawned items (unique ids) are untouched, and retired defaults are
+ * purged separately right after (main.ts).
  */
 export function migrateDefaultLayout(): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
     for (const item of DEFAULT_LAYOUT) {
-      if (furnitureMap!.has(item.id)) {
-        furnitureMap!.set(item.id, toRecord(item));
-      }
+      furnitureMap!.set(item.id, toRecord(item));
     }
   });
 }

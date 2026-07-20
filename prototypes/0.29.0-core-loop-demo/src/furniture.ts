@@ -4457,7 +4457,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "sofa-front",
     kind: "sofa-front",
-    pos: { x: 0.0, z: 3.5 },
+    pos: { x: 0.0, z: 2.6 },
     rot: 0,
     movable: true,
   },
@@ -4478,21 +4478,21 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "armchair-left-2",
     kind: "armchair-left",
-    pos: { x: -3.1, z: 5.15 },
+    pos: { x: -2.0, z: 5.15 },
     rot: 1,
     movable: true,
   },
   {
     id: "armchair-left-3",
     kind: "armchair-left",
-    pos: { x: -1.6, z: 5.15 },
+    pos: { x: -0.7, z: 5.15 },
     rot: 1,
     movable: true,
   },
   {
     id: "armchair-right-0",
     kind: "armchair-right",
-    pos: { x: 0.0, z: 5.15 },
+    pos: { x: 0.6, z: 5.15 },
     rot: 1,
     movable: true,
   },
@@ -4520,7 +4520,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "coffee-table-back",
     kind: "coffee-table-back",
-    pos: { x: 0.0, z: -3.5 },
+    pos: { x: 0.0, z: -0.5 },
     rot: 0,
     movable: true,
   },
@@ -4561,7 +4561,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "lamp-table-front-left",
     kind: "lamp-table",
-    pos: { x: -4.5, z: 4.5 },
+    pos: { x: -5.05, z: 3.9 },
     rot: 0,
     movable: true,
   },
@@ -4668,13 +4668,6 @@ export const FURNITURE: FurnitureItem[] = [
   // the door frame (posts end at |x|=1.0, click box at |x|≤1.0) and the
   // keypad (at x=-1.1 after the door group's rotY=π flip); z=5.97 is the
   // bar back-panel flush-mount plane. Footprint null ⇒ never an obstacle.
-  {
-    id: "wall-computer",
-    kind: "wall-computer",
-    pos: { x: 1.8, z: 5.97 },
-    rot: 2,
-    movable: false,
-  },
   // Storage trunk on the fireplace wall's west flank (TR2 of #35). The plan's
   // berth-corner suggestion (-2.5, -5.0) overlaps the fireplace obstacle
   // (z[-6,-5]) — verified against itemAabb — so the trunk sits one tile south

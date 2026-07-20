@@ -32,9 +32,9 @@ const SIP_CYCLES = 3; // paw-to-muzzle raises across the sip
 const GULP_TIME = 0.3; // drink shrinks away (drunk!)
 const SERVE_COOLDOWN = 6; // s before the next drink can be grabbed
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
-const HAND_Y = 1.0; // fox paw height (arms hang from the 1.35 shoulder pivot)
-const MOUTH_Y = 1.9; // fox muzzle height (chibi head dominates 1.58→3.3)
-const HAND_REACH = 0.3; // drink held this far in front of the fox
+// (The glass is anchored to the fox's actual PAW via getPawWorldPos — the
+//  rig's drink-hold arm pose decides where waist/muzzle land, so no fixed
+//  hand/mouth heights are needed here.)
 const DRINK_ARC_LIFT = 0.35; // parabola apex above the fly chord
 
 /**
@@ -88,6 +88,10 @@ export class PoolWaiter {
   private servePhase: ServePhase = "NONE";
   private serveTimer = 0;
   private serveDrink: DrinkSlot | null = null;
+  /** Fox being served — its drink-hold arm pose is released on finish. */
+  private servedPlayer: Player | null = null;
+  /** Scratch vector for the paw-anchor lookup (no per-frame allocation). */
+  private pawTmp = new THREE.Vector3();
   private flyFrom = new THREE.Vector3();
   /** World scale the drink inherits from the ×ROBOT_SCALE bot when handed to
    *  the scene — the GULP shrink starts from here, and it keeps the drink the
@@ -308,6 +312,7 @@ export class PoolWaiter {
     if (dot < FACING_DOT) return;
 
     this.serveDrink = drink;
+    this.servedPlayer = player;
     this.servePhase = "OFFER";
     this.serveTimer = 0;
     this.legL.rotation.x = 0;
@@ -337,17 +342,12 @@ export class PoolWaiter {
       return;
     }
 
-    // Held point in the fox's PAW, out front along its facing; raised to the
-    // muzzle during each sip. Both track the fox, so a wandering fox carries
-    // its drink along.
-    const fa = player.getFacing();
-    const fwdX = Math.sin(fa);
-    const fwdZ = Math.cos(fa);
-    const hand = new THREE.Vector3(
-      pp.x + fwdX * HAND_REACH,
-      pp.y + HAND_Y,
-      pp.z + fwdZ * HAND_REACH,
-    );
+    // 🐾 The drink rides IN the fox's right paw: the rig's drink-hold pose
+    // raises the arm (0 = reaching forward, 1 = paw at the muzzle) and the
+    // glass is glued to the paw's world position every frame — so the whole
+    // pick-up-with-the-paw → lift-to-the-mouth → five-second sip reads on
+    // the character itself, and a wandering fox carries its drink along.
+    const paw = player.getPawWorldPos(this.pawTmp);
 
     switch (this.servePhase) {
       case "OFFER":
@@ -359,6 +359,7 @@ export class PoolWaiter {
           this.scene.attach(drink.group);
           drink.group.rotation.set(0, 0, 0);
           this.flyScale = drink.group.scale.x;
+          player.setDrinkHold(0); // 🐾 fox reaches its paw out for the glass
           this.servePhase = "FLY";
           this.serveTimer = 0;
         }
@@ -367,7 +368,7 @@ export class PoolWaiter {
         // Tray → the fox's outstretched paw.
         const t = Math.min(1, this.serveTimer / FLY_TIME);
         const s = t * t * (3 - 2 * t);
-        drink.group.position.lerpVectors(this.flyFrom, hand, s);
+        drink.group.position.lerpVectors(this.flyFrom, paw, s);
         drink.group.position.y += DRINK_ARC_LIFT * 4 * t * (1 - t);
         if (t >= 1) {
           this.servePhase = "SIP";
@@ -376,15 +377,14 @@ export class PoolWaiter {
         break;
       }
       case "SIP": {
-        // Five seconds in the paw: raised paw → muzzle SIP_CYCLES times,
-        // tipping back while up, lowered between sips.
+        // Five seconds in the paw: the ARM lifts glass-to-muzzle SIP_CYCLES
+        // times (the rig converges to the drink-hold pose), tipping the glass
+        // back while it is up, lowering it between sips.
         const t = Math.min(1, this.serveTimer / SIP_TIME);
         const raise = 0.5 - 0.5 * Math.cos(t * Math.PI * 2 * SIP_CYCLES);
-        drink.group.position.set(
-          pp.x + fwdX * (HAND_REACH - 0.14 * raise),
-          pp.y + HAND_Y + (MOUTH_Y - HAND_Y) * raise,
-          pp.z + fwdZ * (HAND_REACH - 0.14 * raise),
-        );
+        player.setDrinkHold(raise);
+        drink.group.position.copy(paw);
+        drink.group.position.y += 0.06; // glass base sits on the paw pad
         drink.group.rotation.z = 0.8 * raise; // tips back while at the muzzle
         if (t >= 1) {
           this.servePhase = "GULP";
@@ -395,7 +395,9 @@ export class PoolWaiter {
       case "GULP": {
         // Last swallow at the muzzle — the empty glass shrinks away.
         const t = Math.min(1, this.serveTimer / GULP_TIME);
-        drink.group.position.set(pp.x + fwdX * 0.16, pp.y + MOUTH_Y, pp.z + fwdZ * 0.16);
+        player.setDrinkHold(1);
+        drink.group.position.copy(paw);
+        drink.group.position.y += 0.06;
         drink.group.scale.setScalar(Math.max(0.001, this.flyScale * (1 - t)));
         if (t >= 1) this.finishServe(false);
         break;
@@ -407,6 +409,9 @@ export class PoolWaiter {
 
   /** aborted=true puts the drink back on the tray; false marks it drunk. */
   private finishServe(aborted: boolean): void {
+    // 🐾 Release the fox's drink-hold arm pose (normal animation resumes).
+    this.servedPlayer?.setDrinkHold(null);
+    this.servedPlayer = null;
     const drink = this.serveDrink;
     if (drink) {
       if (aborted) {

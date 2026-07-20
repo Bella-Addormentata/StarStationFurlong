@@ -243,6 +243,8 @@ export class World {
   private isOutdoorRoom = false;
   /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
   private poolSign: THREE.Group | null = null;
+  /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
+  private casinoSign: THREE.Group | null = null;
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
 
@@ -911,52 +913,82 @@ export class World {
    * colour and wall visibility update before the fade-in reveals the room.
    * Safe to call multiple times — fully idempotent.
    */
-  /** 🏊 Wayfinding: build the "POOL & HOT TUB" plate over the south door —
-   *  boutique-hotel style: serif, wide letter-spacing, thin double frame.
-   *  Two back-to-back planes so the text reads correctly from every angle. */
-  private ensurePoolSign(): void {
-    if (this.poolSign) return;
+  /** 🪧 Wayfinding lintels — text ENGRAVED into the wall above a door (owner
+   *  request: no floating plate/"sticker"): a shallow recessed panel sunk
+   *  into the tile wall (translucent darker wash — tiles ghost through —
+   *  with a shadowed top lip and a lit bottom lip), letters chiselled with a
+   *  dark upper edge + bright lower edge, one plane flush on the wall face.
+   *  The quiet recessed backdrop is what lets the carving read over the busy
+   *  tile grid — without it the letters dissolve into the grout lines. */
+  private makeEngravedSign(
+    title: string,
+    ink: { shadow: string; light: string; face: string },
+  ): THREE.Group {
     const cv = document.createElement("canvas");
     cv.width = 512;
     cv.height = 128;
     const c = cv.getContext("2d")!;
-    // Soft white plate.
-    c.fillStyle = "#FDFEFF";
-    c.fillRect(0, 0, 512, 128);
-    // Thin double frame — pale blue outside, whisper-blue inside.
-    c.strokeStyle = "#A4C8E7";
-    c.lineWidth = 3;
-    c.strokeRect(8, 8, 496, 112);
-    c.strokeStyle = "#D9E8F2";
-    c.lineWidth = 2;
-    c.strokeRect(16, 16, 480, 96);
-    // Elegant spaced serif capitals — deep teal, same as the pool floor tint.
-    c.fillStyle = "#1C5A74";
+    c.clearRect(0, 0, 512, 128); // transparent — the wall shows through
+    c.fillStyle = "rgba(58, 92, 116, 0.55)"; // recessed panel wash
+    c.fillRect(10, 10, 492, 108);
+    c.fillStyle = "rgba(8, 30, 44, 0.6)"; // shadowed top/left lips
+    c.fillRect(10, 10, 492, 7);
+    c.fillRect(10, 10, 7, 108);
+    c.fillStyle = "rgba(255, 255, 255, 0.55)"; // lit bottom/right lips
+    c.fillRect(10, 111, 492, 7);
+    c.fillRect(495, 10, 7, 108);
     (c as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
-      "8px";
-    c.font = '42px Georgia, "Palatino Linotype", serif';
+      "6px";
+    c.font = 'bold 44px Georgia, "Palatino Linotype", serif';
     c.textAlign = "center";
     c.textBaseline = "middle";
-    c.fillText("POOL & HOT TUB", 256, 56);
-    // Slim turquoise flourish beneath.
-    c.strokeStyle = "#4FB4C4";
-    c.lineWidth = 2.5;
-    c.beginPath();
-    c.moveTo(196, 96);
-    c.quadraticCurveTo(256, 104, 316, 96);
-    c.stroke();
+    c.fillStyle = ink.shadow; // recess shadow (upper edge)
+    c.fillText(title, 256, 49);
+    c.fillStyle = ink.light; // catch-light (lower edge)
+    c.fillText(title, 256, 56);
+    c.fillStyle = ink.face; // carved face popping off the dark recess
+    c.fillText(title, 256, 52);
+    // Slim flourish beneath, chiselled the same way.
+    const flourish = (color: string, dy: number) => {
+      c.strokeStyle = color;
+      c.lineWidth = 3;
+      c.beginPath();
+      c.moveTo(186, 92 + dy);
+      c.quadraticCurveTo(256, 101 + dy, 326, 92 + dy);
+      c.stroke();
+    };
+    flourish(ink.shadow, -3);
+    flourish(ink.face, 0);
     const tex = new THREE.CanvasTexture(cv);
     tex.colorSpace = THREE.SRGBColorSpace;
-    const geo = new THREE.PlaneGeometry(2.4, 0.6);
-    const mat = new THREE.MeshBasicMaterial({ map: tex });
-    this.poolSign = new THREE.Group();
+    // Lintel-banner proportions: wide enough to read at the room camera —
+    // smaller plates dissolve into the tile grid.
+    const geo = new THREE.PlaneGeometry(3.4, 0.66);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+    const group = new THREE.Group();
     const front = new THREE.Mesh(geo, mat); // faces INTO the room
     front.rotation.y = Math.PI;
-    const back = new THREE.Mesh(geo.clone(), mat); // faces outward
-    back.position.z = 0.012;
-    this.poolSign.add(front, back);
-    this.poolSign.position.set(0, 3.4, 5.55); // above the south door
-    this.platformGroup.add(this.poolSign);
+    group.add(front);
+    this.platformGroup.add(group);
+    return group;
+  }
+
+  private ensurePoolSign(): void {
+    if (!this.poolSign) {
+      this.poolSign = this.makeEngravedSign("POOL & HOT TUB", {
+        shadow: "rgba(5, 24, 36, 0.9)",
+        light: "rgba(235, 250, 255, 0.95)",
+        face: "#dff0f8", // pale pool-water tone
+      });
+    }
+    if (!this.casinoSign) {
+      // 🎰 GOLD lettering for the casino door (owner request).
+      this.casinoSign = this.makeEngravedSign("CASINO", {
+        shadow: "rgba(66, 40, 4, 0.95)",
+        light: "rgba(255, 244, 208, 0.95)",
+        face: "#e8bd55", // engraved gold leaf
+      });
+    }
   }
 
   private ensureCasinoDecor(): void {
@@ -1306,17 +1338,23 @@ export class World {
     // SOUTH door's PHYSICAL slot, which the paired layout moves to the north
     // wall — so place it from the live pose, not a hard-coded south spot.
     this.ensurePoolSign();
-    if (this.poolSign) {
-      const pose = physicalDoorPose("south");
-      const inset = 5.55 / 6; // sign sits just inside the wall line
-      this.poolSign.position.set(
+    // Flush on the wall's INNER face (wall box: centre ±6, 0.35 thick →
+    // face at 5.825; 0.035 proud avoids z-fighting) — engraved, not hung.
+    // y 3.66 clears the 3.4-tall door frame lintel, under the wall coping.
+    const placeLintel = (sign: THREE.Group | null, doorId: DoorId) => {
+      if (!sign) return;
+      const pose = physicalDoorPose(doorId);
+      const inset = 5.79 / 6;
+      sign.position.set(
         pose.tangent === "x" ? pose.x : pose.x * inset,
-        3.4,
+        3.66,
         pose.tangent === "x" ? pose.z * inset : pose.z,
       );
-      this.poolSign.rotation.y = pose.frameYaw + Math.PI;
-      this.poolSign.visible = !outdoor && !casino;
-    }
+      sign.rotation.y = pose.frameYaw + Math.PI;
+      sign.visible = !outdoor && !casino;
+    };
+    placeLintel(this.poolSign, "south"); // 🏊 pool door
+    placeLintel(this.casinoSign, "east"); // 🎰 casino door
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casino;
 
@@ -1395,27 +1433,30 @@ export class World {
       });
       this.dockingSystem?.setGhostDoors(false);
     } else {
-      sc.background = new THREE.Color(0x0a2a5e); // nebula night
+      // 🌅 LOBBY: bright, cheerful MORNING light (owner request — the old
+      // warm-nebula night read as dim). Soft sunrise-blue sky, gentle gold
+      // sun, airy ambient; nebula + star layers hidden.
+      sc.background = new THREE.Color(0xbfe0f2); // soft morning sky
       if (sc.fog instanceof THREE.FogExp2) {
-        sc.fog.color.setHex(0x0d3060);
-        sc.fog.density = 0.015;
+        sc.fog.color.setHex(0xcde8f5);
+        sc.fog.density = 0.005;
       }
       if (amb) {
-        amb.color.setHex(0x8899bb);
-        amb.intensity = 0.5;
+        amb.color.setHex(0xfff6e8);
+        amb.intensity = 0.95;
       }
       if (sun) {
-        sun.color.setHex(0xffffff);
-        sun.intensity = 0.9;
-      }
+        sun.color.setHex(0xffeccb);
+        sun.intensity = 1.35;
+      } // low golden morning sun
       if (hemi) {
-        hemi.color.setHex(0xaaccff);
-        hemi.groundColor.setHex(0x445566);
-        hemi.intensity = 0.4;
+        hemi.color.setHex(0xdcefff);
+        hemi.groundColor.setHex(0xd9cdbb);
+        hemi.intensity = 0.7;
       }
-      if (nebSky) nebSky.visible = true;
+      if (nebSky) nebSky.visible = false;
       starLayers.forEach((s) => {
-        s.visible = true;
+        s.visible = false;
       });
       this.dockingSystem?.setGhostDoors(false);
     }

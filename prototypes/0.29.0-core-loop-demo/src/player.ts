@@ -836,6 +836,17 @@ export class Player {
     return this.logicalAngle;
   }
 
+  /** 🍹 Waiter-bot serve: drive the fox's drink-hold arm pose (0 = reach
+   *  forward, 1 = raised to the muzzle; null = release). */
+  public setDrinkHold(raise: number | null): void {
+    this.character.setDrinkHold(raise);
+  }
+
+  /** 🍹 World position of the fox's right paw — the drink rides in it. */
+  public getPawWorldPos(target: THREE.Vector3): THREE.Vector3 {
+    return this.character.getPawWorldPos(target);
+  }
+
   /**
    * 🛏️ The occupied seat's root elevation (BUNK_TOP_Y for the top bunk,
    * BUNK_BOTTOM_Y for the bottom, 0 for every floor-level seat) — the tick
