@@ -69,6 +69,7 @@ import { VoxelCharacter } from './voxelCharacter';
 import { WaypointReticle } from './waypoint';
 import { findPath, worldToCol, worldToRow } from './pathfinding';
 import { OBSTACLES } from './obstacles';
+import { POOL_WATER_Y, POOL_SWIM_Y, DIVE_TIME, DIVE_ARC_LIFT, FURNITURE, getPoolBasin } from './furniture';
 import type { Seat } from './seats';
 import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
 import type { DeviceTarget, DeviceFocusHooks } from './devices';
@@ -103,7 +104,7 @@ function resolveObstacles(x: number, z: number): { x: number; z: number } {
 // ── Navigation mode ───────────────────────────────────────────────────────────
 type NavigationMode = 'MANUAL' | 'WAYPOINT';
 /** Sitting sequence phases (NONE = regular navigation). */
-type SitPhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'SIT_DOWN' | 'SEATED' | 'STAND_UP';
+type SitPhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'SIT_DOWN' | 'SEATED' | 'STAND_UP' | 'DIVE' | 'CLIMB_OUT';
 /** Door walk-through phases (NONE = regular navigation). ADAPTER_OUT /
  *  ADAPTER_HOLD are the departure half of an adapter transit; ARRIVE_OPEN /
  *  ARRIVE are the arrival half in the destination room (T1 of issue #30). */
@@ -144,6 +145,22 @@ export class Player {
   private readonly SIT_ANIM_TIME = 0.35;
   private readonly STAND_ANIM_TIME = 0.28;
   private readonly TURN_TIME = 0.15;
+  // ── 🏊‍♂️ Dive state ────────────────────────────────────────────────────────
+  /** Launch point captured at _beginDive (board tip, y = board height). */
+  private diveFrom: { x: number; y: number; z: number } | null = null;
+  /** 0→1 progress through the dive arc. */
+  private diveAnim = 0;
+  /** 🏊 Wired by World: splash burst at water entry (big = dive, small = slide-in). */
+  public onWaterEntry: ((x: number, y: number, z: number, big: boolean) => void) | null = null;
+  // ── 🏊 Free-swim mode ─────────────────────────────────────────────────────
+  /** True while freely swimming inside the pool basin (not seat-bound). */
+  private swimMode = false;
+  private readonly SWIM_SPEED = 1.5;
+  /** CLIMB_OUT scripted glide+hop: from the water up onto the deck edge. */
+  private climbFrom: { x: number; y: number; z: number } | null = null;
+  private climbTo: { x: number; z: number } | null = null;
+  private climbAnim = 0;
+  private climbDuration = 0.45;
   /**
    * Deferred actions to resume after STAND_UP / door RETURN / device release
    * completes. At most one is ever non-null (every setter clears the rest).
@@ -235,6 +252,8 @@ export class Player {
   navigateTo(targetX: number, targetZ: number): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
+    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
+    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
     // Engaged on a device: ask the focus controller to let go; the deferred
     // destination resumes when the release ease completes (releaseDevice).
     if (this.devicePhase === 'ENGAGED') {
@@ -252,6 +271,21 @@ export class Player {
       this.pendingDoor = null;
       this.pendingDevice = null;
       if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
+      return;
+    }
+    // 🏊 Free swim: in-basin targets are a straight swim; out-of-basin targets
+    // climb out at the nearest edge first, then resume the walk.
+    if (this.swimMode) {
+      const basin = getPoolBasin(FURNITURE);
+      if (basin && targetX >= basin.x0 && targetX <= basin.x1 && targetZ >= basin.z0 && targetZ <= basin.z1) {
+        this.swimTo(targetX, targetZ);
+      } else {
+        this.pendingDest = { x: targetX, z: targetZ };
+        this.pendingSeat = null;
+        this.pendingDoor = null;
+        this.pendingDevice = null;
+        this._beginClimbOut(targetX, targetZ);
+      }
       return;
     }
     // Door/device approaches not yet committed: abandon them and re-route.
@@ -309,6 +343,8 @@ export class Player {
   navigateToSeat(seat: Seat): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
+    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
+    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
     // Engaged on a device: release the focus first, then walk over and sit.
     if (this.devicePhase === 'ENGAGED') {
       this.pendingSeat = seat;
@@ -330,6 +366,28 @@ export class Player {
     // Door/device approaches not yet committed: abandon them and re-route.
     this._abortDoorApproach();
     this._cancelDeviceApproach();
+
+    // 🏊 Free swim: another water seat is just a spot to swim to; any other
+    // seat means climbing out at the nearest edge first.
+    if (this.swimMode) {
+      if (seat.swim) { this.swimTo(seat.sit.x, seat.sit.z); return; }
+      this.pendingSeat = seat;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      this.pendingDevice = null;
+      this._beginClimbOut(seat.front.x, seat.front.z);
+      return;
+    }
+
+    // 🏊‍♂️ High dive: seated on the board and clicking a swim seat of the SAME
+    // pool item → launch off the tip in a parabolic arc instead of climbing
+    // down and wading in. (Seat ids are `${itemId}:${n}` — compare the prefix.)
+    const itemOf = (id: string) => id.slice(0, id.lastIndexOf(':'));
+    if (this.sitPhase === 'SEATED' && this.sitTarget?.dive && seat.swim
+        && itemOf(this.sitTarget.id) === itemOf(seat.id)) {
+      this._beginDive(seat);
+      return;
+    }
 
     if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
       if (this.sitTarget && this.sitTarget.id === seat.id) return; // already here
@@ -373,6 +431,17 @@ export class Player {
   navigateToDoor(door: DoorTarget, hooks: DoorSequenceHooks): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
+    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
+    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
+    // 🏊 Free swim: climb out at the edge nearest the door, then head over.
+    if (this.swimMode) {
+      this.pendingDoor = { door, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDevice = null;
+      this._beginClimbOut(door.front.x, door.front.z);
+      return;
+    }
     // Engaged on a device: release the focus first, then walk to the door.
     if (this.devicePhase === 'ENGAGED') {
       this.pendingDoor = { door, hooks };
@@ -450,8 +519,19 @@ export class Player {
   navigateToDevice(device: DeviceTarget, hooks: DeviceFocusHooks): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
+    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
+    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
     // Already engaged on this exact device → nothing to do.
     if (this.devicePhase === 'ENGAGED' && this.deviceTarget && this.deviceTarget.id === device.id) return;
+    // 🏊 Free swim: climb out at the edge nearest the device, then walk over.
+    if (this.swimMode) {
+      this.pendingDevice = { device, hooks };
+      this.pendingSeat = null;
+      this.pendingDest = null;
+      this.pendingDoor = null;
+      this._beginClimbOut(device.front.x, device.front.z);
+      return;
+    }
     // Engaged on a different device: release the focus first, then walk over.
     if (this.devicePhase === 'ENGAGED') {
       this.pendingDevice = { device, hooks };
@@ -600,10 +680,11 @@ export class Player {
         this.pendingSeat = null;
         this.pendingDevice = null;
         this._beginDoorReturn();
-      } else if (this.doorPhase === 'RETURN' || this._inAdapterTransit()) {
-        // Scripted return / adapter transit in progress — swallow input,
-        // drop deferred actions. (During ADAPTER_*/ARRIVE_* the room under
-        // the avatar may be mid-swap; MANUAL must never run out there.)
+      } else if (this.doorPhase === 'RETURN' || this._inAdapterTransit() || this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') {
+        // Scripted return / adapter transit / 🏊‍♂️ dive arc in progress —
+        // swallow input, drop deferred actions. (During ADAPTER_*/ARRIVE_* the
+        // room under the avatar may be mid-swap; MANUAL must never run out
+        // there. The dive lands in <1 s and control returns at the water.)
         this.pendingDoor = null;
         this.pendingDest = null;
         this.pendingSeat = null;
@@ -643,6 +724,8 @@ export class Player {
         case 'SIT_DOWN':  this._updateSitDown(deltaTime);      break;
         case 'SEATED':    this._updateSeated();                break;
         case 'STAND_UP':  this._updateStandUp(deltaTime);      break;
+        case 'DIVE':      this._updateDive(deltaTime);         break;
+        case 'CLIMB_OUT': this._updateClimbOut(deltaTime);     break;
         default:
           if (this.navMode === 'MANUAL') {
             this._updateManual(deltaTime, dir);
@@ -717,6 +800,34 @@ export class Player {
    */
   public isLying(): boolean {
     return this.isSeated() && this.sitTarget !== null && this.sitTarget.lie;
+  }
+
+  /**
+   * 🏊 true while on (or sliding onto) a pool swim seat — the movement tick
+   * broadcasts it (flags bit4) so peers render the 'swim' pose at POOL_SWIM_Y.
+   */
+  public isSwimming(): boolean {
+    return this.swimMode || (this.isSeated() && this.sitTarget !== null && this.sitTarget.swim);
+  }
+
+  /** 🏊 true while in FREE-SWIM mode (open movement inside the pool basin). */
+  public isFreeSwimming(): boolean {
+    return this.swimMode;
+  }
+
+  /**
+   * 🏊‍♂️ true while mid dive arc — the movement tick broadcasts it (flags
+   * bit5); peers replay the same parabola locally (the tick carries no y).
+   * Note isSeated() is false during DIVE, so bit1 stays clear on the wire and
+   * getSeatedSeatId() returns null (the editor's evict gate never fires).
+   */
+  public isDiving(): boolean {
+    return this.sitPhase === 'DIVE';
+  }
+
+  /** 🏊‍♂️ Arc heading while diving (packed into the tick yaw field). */
+  public getDiveFacing(): number {
+    return this.logicalAngle;
   }
 
   /**
@@ -889,6 +1000,44 @@ export class Player {
     const pos  = this.mesh.position;
     const moving = dir.x !== 0 || dir.z !== 0;
 
+    // 🏊 AUTO-SWIM: standing inside the pool basin at deck height — a
+    // restored session position, a pre-obstacle walk-in, any edge case —
+    // converts to swimming on the spot. Nobody walks on water.
+    if (!this.swimMode) {
+      const basin = getPoolBasin(FURNITURE);
+      if (basin
+          && pos.x > basin.x0 && pos.x < basin.x1
+          && pos.z > basin.z0 && pos.z < basin.z1) {
+        this.swimMode = true;
+        this.onWaterEntry?.(pos.x, POOL_WATER_Y, pos.z, false);
+      }
+    }
+
+    // 🏊 Free swim: WASD paddles inside the basin — slower, clamped to the
+    // water, swim pose throughout. Obstacle resolution is skipped (the pool's
+    // own footprint AABB would eject the swimmer); the basin clamp IS the
+    // collision. Self-heals to dry land if the pool vanished under us
+    // (room swap / layout edit).
+    if (this.swimMode) {
+      const basin = getPoolBasin(FURNITURE);
+      if (!basin) {
+        this.swimMode = false;
+        pos.y = 0;
+        return;
+      }
+      if (moving) {
+        const len = Math.sqrt(dir.x * dir.x + dir.z * dir.z);
+        const nx = dir.x / len;
+        const nz = dir.z / len;
+        this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+        pos.x = Math.max(basin.x0, Math.min(basin.x1, pos.x + nx * this.SWIM_SPEED * deltaTime));
+        pos.z = Math.max(basin.z0, Math.min(basin.z1, pos.z + nz * this.SWIM_SPEED * deltaTime));
+      }
+      pos.y = POOL_SWIM_Y;
+      this.character.setState('swim', this.logicalAngle);
+      return;
+    }
+
     if (moving) {
       const len = Math.sqrt(dir.x * dir.x + dir.z * dir.z);
       const nx  = dir.x / len;
@@ -937,7 +1086,7 @@ export class Player {
         this.devicePhase = 'FINE';
         return;
       }
-      this.character.setState('idle', this.logicalAngle);
+      this.character.setState(this.swimMode ? 'swim' : 'idle', this.logicalAngle);
       this._clearPath();
       return;
     }
@@ -981,6 +1130,17 @@ export class Player {
       const nz = dz / dist;
 
       this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+
+      // 🏊 Free swim: straight-line paddle to the (basin-clamped) target —
+      // no obstacles exist inside the water, so skip resolution entirely.
+      if (this.swimMode) {
+        const step = Math.min(this.SWIM_SPEED * deltaTime, dist);
+        pos.x += nx * step;
+        pos.z += nz * step;
+        pos.y = POOL_SWIM_Y;
+        this.character.setState('swim', this.logicalAngle);
+        return;
+      }
 
       const step = Math.min(this.SPEED * deltaTime, dist);
       const candX = pos.x + nx * step;
@@ -1077,11 +1237,27 @@ export class Player {
     pos.x = seat.front.x + (seat.sit.x - seat.front.x) * t;
     pos.z = seat.front.z + (seat.sit.z - seat.front.z) * t;
     pos.y = seat.sitY * t; // 🛏️ elevated berths (top bunk) — rises with the slide
-    this.character.setState(seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
+    this.character.setState(seat.swim ? 'swim' : seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
 
     if (this.sitAnim >= 1) {
       this.sitPhase = 'SEATED';
+      // 🏊 Waded into a pool seat — splash, then hand off to FREE SWIM: the
+      // water is open movement space, not a chair.
+      if (seat.swim) {
+        this.onWaterEntry?.(seat.sit.x, POOL_WATER_Y, seat.sit.z, false);
+        this._enterSwimMode();
+      }
     }
+  }
+
+  /** 🏊 Water entries (slide-in / dive) end in free-swim, not a seat. */
+  private _enterSwimMode(): void {
+    this.sitPhase = 'NONE';
+    this.sitTarget = null;
+    this.swimMode = true;
+    this.navMode = 'MANUAL';
+    this.mesh.position.y = POOL_SWIM_Y;
+    this.character.setState('swim', this.logicalAngle);
   }
 
   private _updateSeated(): void {
@@ -1090,7 +1266,141 @@ export class Player {
     // a lost sitTarget on an elevated berth would otherwise strand the
     // avatar floating at mattress height.
     if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
-    this.character.setState(seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
+    this.character.setState(seat.swim ? 'swim' : seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
+  }
+
+  // ── 🏊‍♂️ High-dive arc (board tip → pool water) ─────────────────────────────
+
+  /** Launch off the dive board toward a swim seat of the same pool item. */
+  private _beginDive(target: Seat): void {
+    this._clearPath();
+    const pos = this.mesh.position;
+    this.diveFrom = { x: pos.x, y: pos.y, z: pos.z };
+    this.sitTarget = target;
+    this.diveAnim = 0;
+    this.sitPhase = 'DIVE';
+    // Face along the arc (the rig snaps to 8 ways visually by itself).
+    this.logicalAngle = Math.atan2(target.sit.x - pos.x, target.sit.z - pos.z);
+  }
+
+  /** 🏊 Straight-line swim to a point inside the basin (clamped). */
+  public swimTo(tx: number, tz: number): void {
+    if (!this.swimMode || this.sitPhase !== 'NONE') return;
+    const basin = getPoolBasin(FURNITURE);
+    if (!basin) return;
+    const x = Math.max(basin.x0, Math.min(basin.x1, tx));
+    const z = Math.max(basin.z0, Math.min(basin.z1, tz));
+    this._clearPath();
+    this.waypointPath = [{ x, z }];
+    this.navMode = 'WAYPOINT';
+    this.reticle = new WaypointReticle(this.scene, x, z);
+  }
+
+  /**
+   * 🏊 Scripted glide + hop from the water onto the deck edge nearest the
+   * requested target: swim-glides to the edge, rises onto the corridor in the
+   * final stretch, then resumes whatever the climb was for (pending slots).
+   */
+  private _beginClimbOut(tx: number, tz: number): void {
+    const basin = getPoolBasin(FURNITURE);
+    const pos = this.mesh.position;
+    this._clearPath();
+    let ex = pos.x, ez = pos.z;
+    if (basin) {
+      // Exit over the side with the LARGER overshoot toward the target;
+      // fall back to the nearest edge when the target is inside the basin.
+      const dxOut = tx < basin.x0 ? basin.x0 - tx : tx > basin.x1 ? tx - basin.x1 : 0;
+      const dzOut = tz < basin.z0 ? basin.z0 - tz : tz > basin.z1 ? tz - basin.z1 : 0;
+      if (dxOut === 0 && dzOut === 0) {
+        const dW = pos.x - basin.x0, dE = basin.x1 - pos.x;
+        const dN = pos.z - basin.z0, dS = basin.z1 - pos.z;
+        const min = Math.min(dW, dE, dN, dS);
+        if (min === dE) { ex = basin.exit.x1; ez = pos.z; }
+        else if (min === dW) { ex = basin.exit.x0; ez = pos.z; }
+        else if (min === dS) { ez = basin.exit.z1; ex = pos.x; }
+        else { ez = basin.exit.z0; ex = pos.x; }
+      } else if (dxOut >= dzOut) {
+        ex = tx > basin.x1 ? basin.exit.x1 : basin.exit.x0;
+        ez = Math.max(basin.z0, Math.min(basin.z1, tz));
+      } else {
+        ez = tz > basin.z1 ? basin.exit.z1 : basin.exit.z0;
+        ex = Math.max(basin.x0, Math.min(basin.x1, tx));
+      }
+    }
+    this.climbFrom = { x: pos.x, y: pos.y, z: pos.z };
+    this.climbTo = { x: ex, z: ez };
+    const dist = Math.hypot(ex - pos.x, ez - pos.z);
+    this.climbDuration = Math.max(0.35, 0.2 + dist * 0.3); // glide scales with distance
+    this.climbAnim = 0;
+    this.sitPhase = 'CLIMB_OUT';
+    this.logicalAngle = Math.atan2(ex - pos.x, ez - pos.z);
+  }
+
+  private _updateClimbOut(deltaTime: number): void {
+    const from = this.climbFrom, to = this.climbTo;
+    if (!from || !to) { this.sitPhase = 'NONE'; this.swimMode = false; this.mesh.position.y = 0; return; }
+
+    this.climbAnim = Math.min(1, this.climbAnim + deltaTime / this.climbDuration);
+    const t = this.climbAnim * this.climbAnim * (3 - 2 * this.climbAnim); // smoothstep
+    const pos = this.mesh.position;
+    pos.x = from.x + (to.x - from.x) * t;
+    pos.z = from.z + (to.z - from.z) * t;
+    // Glide at water level, rise onto the deck over the final stretch.
+    const rise = Math.max(0, (t - 0.66) / 0.34);
+    pos.y = from.y * (1 - rise);
+    this.character.setState(rise > 0 ? 'idle' : 'swim', this.logicalAngle);
+
+    if (this.climbAnim >= 1) {
+      pos.x = to.x; pos.z = to.z; pos.y = 0;
+      this.swimMode = false;
+      this.climbFrom = null;
+      this.climbTo = null;
+      this.sitPhase = 'NONE';
+      this.navMode = 'MANUAL';
+      // 💦 Exit ripple where the swimmer left the water.
+      this.onWaterEntry?.(from.x + (to.x - from.x) * 0.7, POOL_WATER_Y, from.z + (to.z - from.z) * 0.7, false);
+      // Resume whatever the climb was for (mirrors _updateStandUp).
+      if (this.pendingDevice) {
+        const next = this.pendingDevice;
+        this.pendingDevice = null;
+        this.navigateToDevice(next.device, next.hooks);
+      } else if (this.pendingDoor) {
+        const next = this.pendingDoor;
+        this.pendingDoor = null;
+        this.navigateToDoor(next.door, next.hooks);
+      } else if (this.pendingSeat) {
+        const next = this.pendingSeat;
+        this.pendingSeat = null;
+        this.navigateToSeat(next);
+      } else if (this.pendingDest) {
+        const dest = this.pendingDest;
+        this.pendingDest = null;
+        this.navigateTo(dest.x, dest.z);
+      }
+    }
+  }
+
+  /** Scripted ballistic arc: linear x/z, t² fall with a small launch lift. */
+  private _updateDive(deltaTime: number): void {
+    const seat = this.sitTarget, from = this.diveFrom;
+    if (!seat || !from) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
+
+    this.diveAnim = Math.min(1, this.diveAnim + deltaTime / DIVE_TIME);
+    const t = this.diveAnim;
+    const pos = this.mesh.position;
+    // Hops UP off the tip (4t(1-t) lift), then accelerates down (t² chord).
+    // Same constants replay the arc on remote replicas — see world.ts.
+    pos.x = from.x + (seat.sit.x - from.x) * t;
+    pos.z = from.z + (seat.sit.z - from.z) * t;
+    pos.y = from.y + (seat.sitY - from.y) * t * t + DIVE_ARC_LIFT * 4 * t * (1 - t);
+    this.character.setState('dive', this.logicalAngle);
+
+    if (t >= 1) {
+      pos.x = seat.sit.x; pos.z = seat.sit.z; pos.y = seat.sitY;
+      this.diveFrom = null;
+      this.onWaterEntry?.(pos.x, POOL_WATER_Y, pos.z, true); // 💦 big splash
+      this._enterSwimMode(); // 🏊 surfaced — free swim from here
+    }
   }
 
   /** Begin standing: reverse slide from the seat to its front point. */
