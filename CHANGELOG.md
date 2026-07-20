@@ -11,6 +11,25 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.36 — 2026-07-20
+
+### 🎰 Casino Room · 🌅 Lobby Overhaul · 🌉 Pool Rework
+
+Three big room updates land together.
+
+- **A new luxury casino room, connected to the lobby.** Red-and-gold decor with gold wall and door trim, four roulette tables, four game tables, two cashiers, and lounge seating you can sit in. Transparent sightline columns keep the room readable, and lush floral trellises (gold frames, layered vines, flowers and berries) run along the north and west wall tops. The room stays put across refreshes.
+- **The lobby got a full overhaul, built live with the owner:**
+  - **Doors paired on two walls** — the two camera-near door edges are now clear: those doors moved onto the north and west walls, grouped in pairs, so nothing blocks your sightline in. A new glassy pale-blue north wall frames them. (The outdoor pool keeps its classic four-sided doors.)
+  - **A door-clear floor plan** — the old fireplace/bookcase wall, checker table and wall terminal are retired; the clone vat (your spawn tube), storage trunk, map table, bunk bed and armchairs are rearranged so nothing sits in front of any door, and the sofas gather into a face-to-face centre lounge. Existing rooms upgrade in place — older rooms that predate the clone vat get their spawn tube back.
+  - **Morning light** — the lobby now wakes under a soft sunrise-blue sky and gold sun (the pool's daylight and the casino's night-lounge lighting are unchanged).
+  - **Engraved wayfinding** — "POOL & HOT TUB" and "CASINO" are carved into the wall above their doors instead of floating on sticker plates.
+- **Pool room rework:**
+  - **Walk the bridge into the hot tub** — clicking the hot tub now walks the fox over the arched footbridge and hops it over the rim into the water, instead of the old slide that clipped through the bridge. Standing up reverses the trip, and clicking the tub actually works now (a click-priority fix stopped the pool's wade-in zones from swallowing tub and bridge clicks).
+  - The **dive tower** moved to between the two north doors (board reaching south over the water), the decorative bar and east lookout tower are gone, and the parasol cafés are spread evenly along the east beach — all for a more open view.
+- **🤖 A drink-service robot** now patrols both the lobby aisles and the pool deck: meet it face-to-face and it hands your fox a cocktail, lifted for a few visible sips before the empty glass vanishes.
+- **Under the hood:** doors, docking, vestibules and exterior visuals route through one shared door-pose source (`doorLayout.ts`) with per-room door layouts.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.36 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.35 — 2026-07-20
 
 ### 🏊 Pool & Hot Tub Are Furniture Now
