@@ -20,8 +20,9 @@ import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
 import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
 import { setActiveDoorLayout, type DoorLayoutKind } from "./doorLayout";
 
-/** The room "type"; each can have multiple design variants (casino-1, -2, …). */
-export type TemplateCategory = "lobby" | "casino" | "pool";
+/** The room "type"; each can have multiple design variants (casino-1, -2, …).
+ *  "blank" is the empty starting point (folds in empty-by-default). */
+export type TemplateCategory = "blank" | "lobby" | "casino" | "pool";
 
 export interface RoomTemplate {
   /** Unique variant id, `${category}-${n}` (e.g. "casino-1", "pool-2"). */
@@ -51,6 +52,19 @@ function cloneItems(items: FurnitureItem[]): FurnitureItem[] {
 // pressing EXPORT (see exportCurrentRoomAsTemplate), and pasting the printed
 // manifest here as e.g. `casino-2` / `pool-2` (hot tub in the pool's centre).
 export const ROOM_TEMPLATES: RoomTemplate[] = [
+  {
+    id: "empty",
+    category: "blank",
+    name: "Empty Room",
+    description:
+      "A blank slate — just the wall-computer to edit from. Build it yourself, piece by piece.",
+    // Doors are structural (always present); the wall-computer is the in-world
+    // edit-mode entry, so an empty room stays furnishable.
+    items: [
+      { id: "wall-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: false },
+    ],
+    doorLayout: "casino-pairs",
+  },
   {
     id: "lobby-1",
     category: "lobby",
@@ -112,6 +126,18 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
   replaceAllFurniture(cloneItems(t.items));
   setActiveDoorLayout(t.doorLayout);
   return t;
+}
+
+/**
+ * Seed a freshly-minted room with a template's FURNITURE (the door layout is
+ * applied per-room by world.applyRoomVisuals on entry, so it's not set here).
+ * Used by the door-panel provisioning flow. Returns false for an unknown id.
+ */
+export function seedRoomTemplate(id: string): boolean {
+  const t = findTemplate(id);
+  if (!t) return false;
+  replaceAllFurniture(cloneItems(t.items));
+  return true;
 }
 
 /**
