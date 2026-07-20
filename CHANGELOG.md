@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.32 — 2026-07-19
+
+### 🚀 Accept an Offer for Your Company
+
+- **You can now accept a deed offer on behalf of a venture you hold a stake in** (owner request). When an offer is made out openly (to you, or bearer — not already directed at a specific company), the REDEEM preview shows an **"accept as"** picker: take the module for **yourself**, or for **any venture you're a shareholder of and whose office you've visited**. Accepting for a company lands the module as that venture's property in the same step — the same one-paste result a maker-directed company offer already gave, now the *receiver's* choice too. A maker who directed the offer at a specific company still wins (their designation stands); share offers are unaffected (companies hold shares through their members).
+- The gate is the same everywhere: only a shareholder who has actually seen the venture's cap table can accept for it, so a stranger can't file someone else's module under a company they don't belong to. Verified live — accept-for-company settles and writes the venture link, a non-shareholder venture is refused, and the picker's choice survives the phone's live repaints.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.32 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.31 — 2026-07-19
 
 ### 🔁 Two Tabs, One Truth — the Local Sync Gap Closes (+ dependency patch-up)

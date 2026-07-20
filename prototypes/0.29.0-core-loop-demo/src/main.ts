@@ -1848,6 +1848,10 @@ function executeDeedHandover(toPlayerId: string): boolean {
  *  remote doc change landing mid-journey must not eat the pasted offer. */
 let offerRedeemRaw = '';
 let offerRedeemNote = '';
+/** "Accept as" choice for an open deed offer ('' = myself, else a venture id
+ *  from my ledger) — module state so a mid-choice repaint can't silently
+ *  reset the select to "myself" before REDEEM lands. */
+let offerAcceptAs = '';
 /** Feedback line for the cut-an-offer blocks (copied / saved / refused). */
 let offerCutNote = '';
 
@@ -1937,6 +1941,13 @@ function renderVenturesApp(): void {
   view.style.color = '#e8d5a3';
   if (!view.dataset.wired) {
     view.dataset.wired = '1';
+    // "Accept as" survives repaints: stash the choice in module state on
+    // change and re-inject `selected` — otherwise a remote doc change could
+    // silently reset the select to "myself" right before REDEEM lands.
+    view.addEventListener('change', (e) => {
+      const sel = e.target as HTMLSelectElement | null;
+      if (sel?.id === 'offer-accept-as') offerAcceptAs = sel.value;
+    });
     view.addEventListener('click', (e) => {
       const el = (e.target as HTMLElement).closest<HTMLElement>('[data-venture-action]');
       if (!el) return;
@@ -2072,6 +2083,7 @@ function renderVenturesApp(): void {
       } else if (action === 'offer-clear') {
         offerRedeemRaw = '';
         offerRedeemNote = '';
+        offerAcceptAs = '';
       } else if (action === 'offer-redeem') {
         const offer = decodeOffer(offerRedeemRaw);
         if (!offer) return;
@@ -2079,13 +2091,18 @@ function renderVenturesApp(): void {
           ? redeemDeedOffer(offer, {
             currentRoomId: activeBootstrap?.roomId ?? '',
             myPlayerId: getPlayerId(), myPub, myName: getPlayerName(),
+            // ACCEPT FOR A COMPANY (owner request): only meaningful for an
+            // OPEN deed offer — a maker-directed venture wins in offers.ts.
+            acceptForVentureId: offerAcceptAs || undefined,
           })
           : redeemShareOffer(offer, myPub, getPlayerName());
         if (result.ok) {
           offerRedeemRaw = '';
+          const forVenture = offer.asset.kind === 'deed' && (offer.toVentureId || offerAcceptAs);
           offerRedeemNote = offer.asset.kind === 'deed'
-            ? '🖋 The deed is yours — recorded at the module.'
+            ? (forVenture ? '🖋 The deed is the venture\'s — recorded at the module.' : '🖋 The deed is yours — recorded at the module.')
             : '🖋 Shares recorded in the register — the stake is yours.';
+          offerAcceptAs = '';
           syncDeedsLedgerFromCurrentRoom();
           syncVentureLedgerFromCurrentRoom();
           logToPhoneSystem(offerRedeemNote);
@@ -2366,12 +2383,33 @@ function renderVenturesApp(): void {
     const dead = pending.expiresAt <= Date.now()
       ? 'This offer has expired.'
       : mark ? (mark.status === 'redeemed' ? 'Already redeemed.' : 'Revoked by the maker.') : '';
+    // ACCEPT FOR A COMPANY (owner request): an OPEN deed offer (no venture
+    // named by the maker) can be taken for myself OR for a venture I hold
+    // shares in — same shareholder + seen-cap-table gate as a directed
+    // venture offer. A maker-directed venture offer skips this (its target
+    // is fixed); share offers never company-own.
+    const canAcceptAs = pending.asset.kind === 'deed' && !pending.toVentureId && settleHere && !dead && toMe;
+    const acceptOptions = canAcceptAs
+      ? ventureLedger().filter((e) => e.myShares > 0 && e.capSeenAt)
+      : [];
+    // A stale accept-as choice (venture no longer eligible) falls back to me.
+    if (offerAcceptAs && !acceptOptions.some((e) => e.id === offerAcceptAs)) offerAcceptAs = '';
+    const acceptAsBlock = canAcceptAs && acceptOptions.length
+      ? `<div style="display:flex; align-items:center; gap:4px; margin-top:6px; font-size:9px;">
+           <span style="color:rgba(212,168,75,0.7);">accept as</span>
+           <select id="offer-accept-as" style="${inputStyle}">
+             <option value=""${offerAcceptAs === '' ? ' selected' : ''}>👤 myself</option>
+             ${acceptOptions.map((e) => `<option value="${esc(e.id)}"${e.id === offerAcceptAs ? ' selected' : ''}>🚀 ${esc(e.name)}</option>`).join('')}
+           </select>
+         </div>`
+      : '';
     redeemBody = `
       <div style="border:1px solid rgba(212,168,75,0.25); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
         <div>${what} — a <b>gift</b>${pending.price > 0 ? ' <span style="color:#ff8a80;">(asks a price — priced offers arrive with the Registry)</span>' : ''}</div>
         <div style="margin-top:3px;">from ${esc(pending.makerName || 'a clone')} <span style="color:rgba(212,168,75,0.6);">${esc(contactFingerprint(pending.makerPub))}</span> · ${toLine}</div>
         <div style="margin-top:3px; color:rgba(212,168,75,0.8);">${offerExpiresIn(pending.expiresAt)} · ${whereLine}</div>
         ${dead ? `<div style="margin-top:3px; color:#ff8a80;">${dead}</div>` : ''}
+        ${acceptAsBlock}
         <div style="display:flex; gap:4px; margin-top:6px;">
           ${settleHere && !dead && toMe ? `<button type="button" data-venture-action="offer-redeem" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 REDEEM</button>` : ''}
           <button type="button" data-venture-action="offer-clear" style="${pill}">CLEAR</button>
@@ -2680,7 +2718,7 @@ function setupSpacePhoneOverlay() {
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
     if (id === 'access') { refreshAccessRoomRow(); renderCoHostsSection(); }
-    if (id === 'ventures') { ventureDetailId = ''; deedDetailRoomId = ''; deedHandoverArmed = ''; renderVenturesApp(); }
+    if (id === 'ventures') { ventureDetailId = ''; deedDetailRoomId = ''; deedHandoverArmed = ''; offerAcceptAs = ''; renderVenturesApp(); }
     if (id === 'bank') renderBankApp();
     if (id === 'contacts') refreshContactsApp();
     if (id === 'setstats') void refreshStorageStats(); // 📟 live disk figures

@@ -277,6 +277,11 @@ export interface DeedRedeemCtx {
   myPlayerId: string;
   myPub: string;
   myName: string;
+  /** ACCEPT FOR A COMPANY (owner request): the redeemer's choice to take the
+   *  module as venture property — same shareholder + seen-cap-table gate as a
+   *  maker-directed venture offer. Ignored when the offer itself names a
+   *  venture (the maker's designation wins). */
+  acceptForVentureId?: string;
 }
 
 /** Shared preamble: signature already checked by decodeOffer; re-checked here
@@ -314,11 +319,14 @@ export function redeemDeedOffer(o: TransferOffer, ctx: DeedRedeemCtx): RedeemRes
   if (ownerEntry?.keyB64 !== o.makerPub)
     return { ok: false, error: 'The deed has changed hands since this offer was made.' };
 
-  // Company recipient: we redeem on the venture's behalf — must hold shares
-  // and have SEEN its cap table (same precondition as ADD THIS MODULE).
+  // Company recipient: the maker's designation (o.toVentureId) or, when the
+  // offer leaves it open, the REDEEMER's accept-for-a-company choice. Either
+  // way we redeem on the venture's behalf — must hold shares and have SEEN
+  // its cap table (same precondition as ADD THIS MODULE).
+  const targetVentureId = o.toVentureId ?? ctx.acceptForVentureId;
   let ventureEntry: VentureLedgerEntry | undefined;
-  if (o.toVentureId) {
-    ventureEntry = ventureLedger().find((e) => e.id === o.toVentureId && e.myShares > 0 && !!e.capSeenAt);
+  if (targetVentureId) {
+    ventureEntry = ventureLedger().find((e) => e.id === targetVentureId && e.myShares > 0 && !!e.capSeenAt);
     if (!ventureEntry)
       return { ok: false, error: `Only a shareholder of ${o.toVentureName ?? 'that venture'} who has visited its office can accept for it.` };
   }
@@ -338,10 +346,10 @@ export function redeemDeedOffer(o: TransferOffer, ctx: DeedRedeemCtx): RedeemRes
   // Venture link adjustments reuse the existing gated helpers (they transact
   // separately; acceptable — the ownership move above is the authoritative leg).
   const existing = ventureRecord();
-  if (o.toVentureId && ventureEntry) {
-    if (existing && existing.snapshotAt !== undefined && existing.id !== o.toVentureId) removeVentureLink();
+  if (targetVentureId && ventureEntry) {
+    if (existing && existing.snapshotAt !== undefined && existing.id !== targetVentureId) removeVentureLink();
     if (!ventureRecord()) writeVentureLink(ventureEntry);
-  } else if (!o.toVentureId && existing && existing.snapshotAt !== undefined) {
+  } else if (!targetVentureId && existing && existing.snapshotAt !== undefined) {
     removeVentureLink(); // company → sole: the module leaves the venture as it changes hands
   }
   return { ok: true };
