@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.41 — 2026-07-20
+
+### 🕯️ Lighting you can hang — the chandelier furniture
+
+- **A new `chandelier` furniture kind** — a two-tier gold fixture with glowing candle-bulbs and crystal drops that dangles from the ceiling and lights the room with a warm downlight. It's an ordinary placeable, movable furniture piece (spawn it from **DEV → FURNITURE → chandelier**), so a room's practical lighting becomes something you **compose and move** rather than a fixed room property — the first step toward templates that carry their own lighting.
+- **Footprint-less** (you walk right under it) and cheap to render: the candle-bulbs and crystals GLOW via emissive material rather than being real lights, so the whole ornate fixture costs the renderer just **two lights** no matter how elaborate it looks.
+- **Scope note:** a hanging fixture supplies the room's *practical* light; the sky/fog backdrop (day vs night) stays a scene-level concern, so a chandelier warms an interior but doesn't repaint an outdoor pool's horizon.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.41, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.40 — 2026-07-20
 
 ### 🏊 Classic Lido Pool — a second pool design (PR #70 revived)
