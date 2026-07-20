@@ -6027,6 +6027,15 @@ function setupZoomView() {
  * Initialize the game
  */
 async function init() {
+  // DEV: character-viewer mode (`?charview`) — boots straight into an
+  // auto-orbiting 360° turntable of the player rig for art review (zero
+  // clicks, no room / network / game UI). The normal boot is untouched.
+  if (new URLSearchParams(window.location.search).has("charview")) {
+    const { startCharView } = await import("./charview");
+    startCharView();
+    return;
+  }
+
   console.log("🚀 StarStation Furlong - Initializing...");
 
   const [rendererModule, worldModule, inputModule] = await Promise.all([

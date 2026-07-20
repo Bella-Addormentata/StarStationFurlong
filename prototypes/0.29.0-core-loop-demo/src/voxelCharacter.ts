@@ -1,31 +1,43 @@
 /**
- * VoxelCharacter — Rigged Fox Anthro State Machine (chibi-cute pass)
+ * VoxelCharacter — Rigged Fox Anthro State Machine (white reference-sheet pass)
  *
- * Pivoted from the red-panda rig to a fox because a fox's iconic silhouette
- * (pointy triangular ears, pointed muzzle, big white-tipped tail, orange-with-
- * white markings) reads as "obvious cute character" faster than the panda did.
- * The proportions have also been re-tuned toward true chibi:
+ * Rebuilt to mirror the owner's character turnaround sheet
+ * ("SPACE STATION REFERENCE IMAGE 85" — front / ¾ / side / back / face views):
+ * an all-WHITE chibi fox. Per that sheet, this pass changes the sculpt to:
  *
- *   pass 3 head-to-body ratio ≈ 1:3   (adult mascot)
- *   this build head-to-body     ≈ 1:1.5 (chibi toddler)
+ *  - All-white fur everywhere (shading comes from the toon bands, matching
+ *    the sheet's soft grey line-art shading). Dark features are ONLY the
+ *    eyes, brows, nose and mouth — charcoal, not black.
+ *  - MUCH bigger triangular ears (nearly head-height) with grey inner-ear
+ *    cavities and base fluff wisps.
+ *  - A small spiky fur tuft on top of the head between the ears.
+ *  - Spiky cheek ruffs on both sides of the head.
+ *  - A flat cute face: barely-protruding muzzle bump, small charcoal nose,
+ *    thin smile curve with one tiny fang. Big dark GLOSSY eyes (charcoal
+ *    fill + big white shines) with thin eyebrow strokes — replaces the old
+ *    cream-sclera/teal-iris anime eyes.
+ *  - Pear-shaped plump torso (narrow shoulders, round belly) with a spiky
+ *    chest-bib tuft.
+ *  - Stubby arms ending in rounded mitten paws that hang slightly outward;
+ *    no gloves, no visible pads (sheet shows plain white mittens).
+ *  - Short stub legs with rounded three-toed feet (toe clefts read through
+ *    the outline shells).
+ *  - The signature BIG flame-shaped tail: attaches at the tail-bone, sweeps
+ *    back then curls UP to chin height, serrated with fluff spikes along the
+ *    edge — replaces the old drooping three-ball stub.
  *
- * The character height is preserved — physics / camera / seat animations don't
- * change — but internally the head is much larger and the limbs are shorter
- * and stubbier so the whole thing reads as a cute plushie fox instead of a
- * chunky adult figure.
- *
- * Still keeping the shading upgrades from pass 3:
+ * Rig bones, state table, outfit system and all public API are untouched —
+ * this is a re-skin of the meshes hanging off the same skeleton:
  *  - MeshToonMaterial + 4-band gradient map for cel shading
- *  - Inverted-hull outline shell around every silhouette mesh
- *  - Higher subdivisions on curved primitives
- *  - Unlit basic-material stylistic marks (eye shines, nose highlight, blush)
+ *  - Inverted-hull outline shell around every silhouette mesh (outline is
+ *    now soft grey — dark brown lines would read harsh against white fur)
  *  - Subtle breathing scale + occasional ear twitches
  *
- * Tail: drooping natural-rest pose, roughly body-length, big fluffy base
- * tapering to a bright white tip. Sways side-to-side during walk.
- *
  * Public API preserved: constructor(scene), masterGroup, setState, update.
- * Only consumer is player.ts; NPCs use their own class.
+ * Consumers: player.ts (local) and world.ts (remote peer avatars).
+ * NOTE: applyPeerTint hue-shifts materials — a hue shift on pure white is a
+ * no-op, so while the model is all-white, peers are distinguished by their
+ * name tags / chat only. Outfit recolors still work (roles still tagged).
  *
  * Outfit system (TR3, issue #35 — ADDITIVE, frozen API untouched):
  *  - _build* meshes whose material color comes from a swappable PAL entry are
@@ -93,35 +105,40 @@ export function snapTo8Ways(angle: number): number {
   return Math.round(angle / PI_4) * PI_4;
 }
 
-// Fox palette — warm rich orange body, bright white underside, dark socks.
+/**
+ * Resting side-swing of the tail plume (radians about the tail group's local
+ * Y). The sheet's front view shows the flame peeking out BESIDE the body —
+ * a dead-centre tail hides behind the torso from the front. Idle sways
+ * around this offset; walk/swim halve it so the plume streams behind.
+ */
+const TAIL_REST_YAW = 0.85;
+
+// Reference-sheet palette — ALL-WHITE fur; the only dark marks are the face
+// features, in soft charcoal (never pure black — the sheet's linework is
+// grey). fur / furDeep / cream / accent keep SEPARATE material instances even
+// where the hex is identical, so the outfit palette-role recolors (issue #35)
+// can still dye each slot independently.
 const PAL = {
-  fur:        0xe07a2c,  // main warm orange body fur
-  furDeep:    0xb45418,  // richer deep-orange (ear back, shading accents)
-  cream:      0xfaf1d8,  // white / cream — chest, muzzle, inner ear, tail tip
-  creamSoft:  0xfffbe8,  // brightest highlight cream (chest ruff top)
-  dark:       0x2b1508,  // dark brown — socks, ear tips, feet
-  paw:        0x1a0a04,  // paw underside — deepest tone
-  pawPad:     0xa04a35,  // pink-brown paw pads
-  pawPadHi:   0xd07458,  // brighter pad accent
-  nose:       0x141010,  // nose + eye pupil
+  fur:        0xffffff,  // main white body fur (role 'fur')
+  furShade:   0xd4d8e0,  // soft cool-grey — inner-ear cavity fill (role 'furDeep')
+  furShadeLo: 0xb9c0cc,  // deeper grey — innermost ear cavity accent
+  cream:      0xffffff,  // chest bib + muzzle zone (role 'cream' — white for now)
+  paw:        0xffffff,  // mitten paws + feet (role 'accent' — white for now)
+  nose:       0x2e2c32,  // charcoal — nose, mouth line
   noseHi:     0xffffff,  // nose highlight speck
-  eyeIris:    0x27a4be,  // teal iris (cute anime tell — foxes canonically brown
-                         //             but teal reads cuter and matches earlier art)
-  eyeIrisHi:  0x64d8e8,  // iris highlight ring
-  eyeShine:   0xffffff,  // pupil highlight
-  blush:      0xe07868,  // soft pink blush on cheeks
-  fang:       0xf6efd8,  // tiny visible tooth
-  outline:    0x1e0d05,  // outline colour (soft dark brown)
+  fang:       0xffffff,  // tiny visible tooth
+  outline:    0x99a0ac,  // soft grey line-art outline (matches sheet linework)
 };
 
-// ── Toon gradient (4-band cel shading) ─────────────────────────────────────
-// A tiny 4×1 DataTexture used as MeshToonMaterial.gradientMap. Nearest-filter
-// sampling forces the shader to snap to one of four brightness bands, which
-// is what gives the flat "cartoon" look. Higher steps = softer transitions;
-// four steps is the sweet spot for chunky mascot art.
+// ── Toon gradient (8-band soft cel shading) ────────────────────────────────
+// A tiny 8×1 DataTexture used as MeshToonMaterial.gradientMap. Nearest-filter
+// sampling snaps the shader to brightness bands. The old 4-band map read as
+// harsh grey blobs on the all-white fur; eight closely-spaced bands keep the
+// stylised toon look while shading the white like the reference sheet's soft
+// airbrush greys.
 function createGradientMap(): THREE.DataTexture {
-  const data = new Uint8Array([80, 140, 200, 255]);
-  const tex = new THREE.DataTexture(data, 4, 1, THREE.RedFormat);
+  const data = new Uint8Array([110, 132, 152, 172, 196, 220, 240, 255]);
+  const tex = new THREE.DataTexture(data, 8, 1, THREE.RedFormat);
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestFilter;
   tex.needsUpdate = true;
@@ -140,7 +157,7 @@ function tmat(hex: number, opts: { emissiveBoost?: number } = {}): THREE.MeshToo
   });
 }
 
-// Basic (unlit) material — used for eye shines, nose highlight, blush.
+// Basic (unlit) material — used for the nose highlight speck.
 // These are stylistic marks that shouldn't cast/receive shading.
 function bmat(hex: number): THREE.MeshBasicMaterial {
   return new THREE.MeshBasicMaterial({ color: hex });
@@ -172,6 +189,144 @@ function outline(host: THREE.Mesh, thickness = 0.02): THREE.Mesh {
 function addWithOutline(group: THREE.Group, mesh: THREE.Mesh, thickness = 0.02): void {
   group.add(mesh);
   group.add(outline(mesh, thickness));
+}
+
+/**
+ * Soft fur-tuft geometry — a TEARDROP: round bulging base easing into a soft
+ * point. Built by pinching a sphere's upper hemisphere toward the pole (then
+ * recomputing normals), so the silhouette is a smooth continuous curve with
+ * no cone facets — the "smooth curves / natural feel" the reference sheet's
+ * fur spikes have. Every tuft on the rig (ears, head tuft, cheek ruffs,
+ * chest bib, tail flames) is one of these.
+ *
+ * The base BOTTOM is pinned at the local origin (tip at +h on local +Y), so
+ * positioning a mesh at a surface point and rotating it splays the tuft
+ * outward from that point like real fur.
+ */
+function fluffGeo(
+  r: number,
+  h: number,
+  wSeg = 24,
+  hSeg = 18,
+  baseWide = false
+): THREE.BufferGeometry {
+  const geo = new THREE.SphereGeometry(1, wSeg, hSeg);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const y = pos.getY(i);
+    // Two profiles:
+    //  - fur tuft (default): pinch only the upper hemisphere → round bulge
+    //    at mid-height easing into the point (a fur clump).
+    //  - baseWide (ears): pinch over the FULL height → widest at the domed
+    //    base, tapering continuously to the soft tip (a soft ear wedge).
+    const t = baseWide ? (y + 1) / 2 : Math.max(0, y);
+    if (t > 0) {
+      // Pinch strengthens toward the pole; exponent shapes how "clawed"
+      // the tip feels. 0.93 leaves a soft (not needle) point.
+      const pinch = 1 - Math.pow(t, baseWide ? 1.6 : 1.35) * 0.93;
+      pos.setX(i, pos.getX(i) * pinch);
+      pos.setZ(i, pos.getZ(i) * pinch);
+    }
+  }
+  geo.scale(r, h / 2, r);
+  geo.translate(0, h / 2, 0);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/**
+ * Varying-radius tube along a planar spine — the tail's ONE-PIECE flame body.
+ * A stack of overlapping spheres showed a rib line at every overlap (each
+ * outline shell cut through its neighbour); this builds a single continuous
+ * surface instead: rings of vertices perpendicular to the spine curve, radius
+ * varying per ring, closed with rounded pole caps, smooth-shaded via
+ * computeVertexNormals. One mesh → one clean silhouette → one outline shell.
+ *
+ * The spine lives in the local Y-Z plane ((y,z) pairs; X is the tube's
+ * side-to-side axis, squashed by `xSquash` for a slim side profile).
+ */
+function flameTubeGeo(
+  spine: Array<[number, number]>,
+  radii: number[],
+  radialSegs = 32,
+  xSquash = 0.86,
+  /** Optional per-vertex radial multiplier (tFrac 0..1 along spine, ring
+   *  angle rad) — used to sculpt fur scallops INTO the surface. */
+  bump?: (tFrac: number, ringAngle: number) => number
+): THREE.BufferGeometry {
+  const n = spine.length;
+  const positions: number[] = [];
+  const indices: number[] = [];
+
+  // Central-difference tangents along the spine
+  const tangents: Array<[number, number]> = [];
+  for (let i = 0; i < n; i++) {
+    const a = spine[Math.max(0, i - 1)];
+    const b = spine[Math.min(n - 1, i + 1)];
+    const dy = b[0] - a[0];
+    const dz = b[1] - a[1];
+    const l = Math.hypot(dy, dz) || 1;
+    tangents.push([dy / l, dz / l]);
+  }
+
+  // Ring frame: e1 = +X (always ⊥ a Y-Z-plane tangent); e2 = (tz, -ty).
+  for (let i = 0; i < n; i++) {
+    const [sy, sz] = spine[i];
+    const [ty, tz] = tangents[i];
+    const e2y = tz;
+    const e2z = -ty;
+    for (let j = 0; j < radialSegs; j++) {
+      const a = (j / radialSegs) * Math.PI * 2;
+      const r = radii[i] * (bump ? bump(i / (n - 1), a) : 1);
+      const cx = Math.cos(a) * r * xSquash;
+      const s = Math.sin(a) * r;
+      positions.push(cx, sy + e2y * s, sz + e2z * s);
+    }
+  }
+  // Quad strip — winding verified against the render: (a,b,c)/(b,d,c) faces
+  // OUTWARD with this frame (the first attempt with (a,c,b) showed the
+  // outline shell's interior — the whole flame rendered outline-grey).
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = 0; j < radialSegs; j++) {
+      const j2 = (j + 1) % radialSegs;
+      const a = i * radialSegs + j;
+      const b = i * radialSegs + j2;
+      const c = (i + 1) * radialSegs + j;
+      const d = (i + 1) * radialSegs + j2;
+      indices.push(a, b, c, b, d, c);
+    }
+  }
+
+  // Rounded pole caps — a single vertex pushed out along ∓tangent, fanned
+  // to the first/last ring. Both caps end up buried (root inside the body,
+  // end inside the tip fluff), so they only need to close the surface.
+  const startPole = positions.length / 3;
+  {
+    const [sy, sz] = spine[0];
+    const [ty, tz] = tangents[0];
+    positions.push(0, sy - ty * radii[0] * 0.95, sz - tz * radii[0] * 0.95);
+    for (let j = 0; j < radialSegs; j++) {
+      const j2 = (j + 1) % radialSegs;
+      indices.push(startPole, j2, j);
+    }
+  }
+  const endPole = positions.length / 3;
+  {
+    const [sy, sz] = spine[n - 1];
+    const [ty, tz] = tangents[n - 1];
+    positions.push(0, sy + ty * radii[n - 1] * 0.95, sz + tz * radii[n - 1] * 0.95);
+    const base = (n - 1) * radialSegs;
+    for (let j = 0; j < radialSegs; j++) {
+      const j2 = (j + 1) % radialSegs;
+      indices.push(endPole, base + j, base + j2);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
 }
 
 export class VoxelCharacter {
@@ -259,19 +414,20 @@ export class VoxelCharacter {
     // to each joint are re-sized so the head visually dominates and the limbs
     // read as short stubs.
     this.torso.position.y = 1.03;             // idle rootY (1.18) − 0.15 chibi offset — feet flush at spawn
-    this.head.position.y  = 0.55;             // head neck-point above torso — huge head above this
-    this.leftArm.position.set(-0.5,  0.32, 0);// shoulders — pulled inward
-    this.rightArm.position.set( 0.5,  0.32, 0);
+    this.head.position.y  = 0.46;             // head sits ON the body (sheet has no neck — skull bottom overlaps the pear top by ~0.12)
+    this.leftArm.position.set(-0.40, 0.26, 0);// shoulders — tucked into the pear so arms hug the body silhouette
+    this.rightArm.position.set( 0.40, 0.26, 0);
     this.leftLeg.position.set(-0.20, -0.30, 0); // hips — pulled inward
     this.rightLeg.position.set( 0.20, -0.30, 0);
 
-    // Tail root: attached LOW on the back (hip level) so the tail droops from
-    // the base of the spine, not the mid-back. Angled BACKWARD-AND-DOWN via
-    // negative rotation.x (right-hand rule tilts the tail group's local +Y
-    // toward -Z, behind the character). -2.05 rad ≈ 117° gets a natural fox
-    // drape without curling under the body.
+    // Tail root: attached LOW on the back (hip level) at the tail-bone.
+    // rotation.x = -1.62 rad (≈ -93°) points the tail group's local +Y
+    // straight BACK with a slight droop, and maps local +Z to UP — the
+    // spine geometry built in _buildTail curls along +Z, producing the
+    // reference sheet's back-then-up flame sweep. (The old drooping stub
+    // used -2.05; that pointed the whole plume at the floor.)
     this.tail.position.set(0, -0.30, -0.28);
-    this.tail.rotation.x = -2.05;
+    this.tail.rotation.x = -1.62;
 
     // ── 4. Build voxel geometry ───────────────────────────────────────────────
     this._buildHead();
@@ -281,7 +437,7 @@ export class VoxelCharacter {
     this._buildTail();
 
     this.clock = new THREE.Clock();
-    console.log('✅ VoxelCharacter created (chibi fox)');
+    console.log('✅ VoxelCharacter created (white reference-sheet fox)');
   }
 
   // ── Palette-role tagging (TR3, issue #35) ─────────────────────────────────
@@ -289,8 +445,8 @@ export class VoxelCharacter {
   //  materials. Tags every mesh under `root` whose material is one of them
   //  with userData.paletteRole so setOutfit can find the recolor targets.
   //  Everything else is skipped by construction: outline shells carry the
-  //  shared OUTLINE_MAT, the face decal / nose / paw pads / vertex-colored
-  //  ear cones use materials that simply aren't in the map.
+  //  shared OUTLINE_MAT, the face decal / nose / fang / grey ear-cavity
+  //  cones use materials that simply aren't in the map.
   private _tagPaletteRoles(
     root: THREE.Object3D,
     roles: Array<[THREE.Material, PaletteRole]>
@@ -305,175 +461,141 @@ export class VoxelCharacter {
   }
 
   // ── Head ─────────────────────────────────────────────────────────────────
-  //  MUCH bigger than any prior pass — dominates the character silhouette.
-  //  Pointed fox muzzle, big pointy ears, huge chibi eyes.
+  //  Reference sheet head: big round skull, FLAT cute face (barely-there
+  //  muzzle bump), small charcoal nose, thin smile + one fang, huge ears
+  //  with grey inner cavities, top-of-head tuft and spiky cheek ruffs.
   private _buildHead(): void {
-    const furMat     = tmat(PAL.fur,       { emissiveBoost: 0.10 });
-    const creamMat   = tmat(PAL.cream,     { emissiveBoost: 0.11 });
-    const creamHi    = tmat(PAL.creamSoft, { emissiveBoost: 0.13 });
-    const noseMat    = tmat(PAL.nose,      { emissiveBoost: 0.04 });
+    const furMat     = tmat(PAL.fur,        { emissiveBoost: 0.10 });
+    const creamMat   = tmat(PAL.cream,      { emissiveBoost: 0.11 });  // muzzle zone (role 'cream')
+    const shadeMat   = tmat(PAL.furShade,   { emissiveBoost: 0.08 });  // inner-ear cavity
+    const shadeLoMat = tmat(PAL.furShadeLo, { emissiveBoost: 0.06 });  // deepest cavity accent
+    const noseMat    = tmat(PAL.nose,       { emissiveBoost: 0.04 });
     const noseHiMat  = bmat(PAL.noseHi);
+    const fangMat    = tmat(PAL.fang,       { emissiveBoost: 0.10 });
 
-    // Skull — BIG rounded sphere, wider than tall for cute face silhouette
-    const skullGeo = new THREE.SphereGeometry(0.62, 40, 30);
-    skullGeo.scale(1.05, 1.02, 1.0);
+    // Skull — BIG rounded sphere, a touch wider than tall (sheet's front
+    // view). 64×44 segments: at play distance the silhouette must be a
+    // perfect curve, no polygon flats.
+    const skullGeo = new THREE.SphereGeometry(0.62, 64, 44);
+    skullGeo.scale(1.05, 1.00, 0.98);
     skullGeo.translate(0, 0.42, 0);
     const skull = new THREE.Mesh(skullGeo, furMat);
     addWithOutline(this.head, skull, 0.028);
 
-    // (Removed: cheek puffs and chin patch. These were visual noise on top
-    // of the muzzle+chin cream areas that the muzzle_bottom already provides.
-    // Cute chibi face = big eyes + rounded muzzle only; extra facial fluff
-    // fights for attention at play distance.)
+    // Muzzle — the sheet's side view shows an almost FLAT face with a small
+    // rounded bump low-center carrying the nose; the old protruding fox
+    // snout is gone. One squashed sphere, cream role (white for now).
+    const muzzleGeo = new THREE.SphereGeometry(0.16, 36, 26);
+    muzzleGeo.scale(1.25, 0.80, 0.75);
+    const muzzle = new THREE.Mesh(muzzleGeo, creamMat);
+    muzzle.position.set(0, 0.28, 0.50);
+    addWithOutline(this.head, muzzle, 0.022);
 
-    // Muzzle — POINTED forward, key fox feature. Built as a scaled cone with
-    // rounded tip so it reads pointed but not sharp. Cream on underside,
-    // orange on top.
-    const muzzleTopGeo = new THREE.SphereGeometry(0.18, 26, 20);
-    muzzleTopGeo.scale(1.0, 0.6, 1.55);
-    muzzleTopGeo.translate(0, 0.04, 0.16);
-    const muzzleTop = new THREE.Mesh(muzzleTopGeo, furMat);
-    muzzleTop.position.set(0, 0.31, 0.30);
-    addWithOutline(this.head, muzzleTop, 0.024);
-
-    const muzzleBotGeo = new THREE.SphereGeometry(0.16, 24, 18);
-    muzzleBotGeo.scale(1.0, 0.55, 1.5);
-    muzzleBotGeo.translate(0, -0.04, 0.16);
-    const muzzleBot = new THREE.Mesh(muzzleBotGeo, creamMat);
-    muzzleBot.position.set(0, 0.20, 0.30);
-    addWithOutline(this.head, muzzleBot, 0.024);
-
-    // Nose — big cute button at muzzle tip
-    const noseGeo = new THREE.SphereGeometry(0.075, 22, 18);
-    noseGeo.scale(1.35, 0.90, 0.95);
+    // Nose — small charcoal rounded-triangle read (squashed sphere)
+    const noseGeo = new THREE.SphereGeometry(0.055, 26, 20);
+    noseGeo.scale(1.30, 0.85, 0.80);
     const nose = new THREE.Mesh(noseGeo, noseMat);
-    nose.position.set(0, 0.34, 0.60);
+    nose.position.set(0, 0.315, 0.635);
     addWithOutline(this.head, nose, 0.030);
     // Nose highlight speck — unlit, tiny
     const noseHi = new THREE.Mesh(
-      new THREE.SphereGeometry(0.020, 12, 10),
+      new THREE.SphereGeometry(0.016, 14, 12),
       noseHiMat
     );
-    noseHi.position.set(-0.014, 0.365, 0.65);
+    noseHi.position.set(-0.012, 0.335, 0.672);
     this.head.add(noseHi);
 
-    // Small mouth mark — smile curve below the nose. Simple line, no fang
-    // (fang and small mouth marks fight for attention at play distance).
-    const mouthGeo = new THREE.BoxGeometry(0.11, 0.025, 0.03);
+    // Mouth — thin charcoal SMILE ARC (torus segment facing +Z), not a box.
+    // Arc spans 0.8π centred on the bottom of its circle so it reads as the
+    // sheet's gentle upturned smile; _updateFaceRig widens scale.x on walk.
+    const mouthGeo = new THREE.TorusGeometry(0.075, 0.012, 12, 32, Math.PI * 0.8);
+    mouthGeo.rotateZ(-Math.PI * 0.9);   // centre the arc about local -Y (smile)
     const mouth = new THREE.Mesh(mouthGeo, noseMat);
-    mouth.position.set(0, 0.18, 0.68);
+    mouth.position.set(0, 0.20, 0.63);
     this.head.add(mouth);
     this.mouth = mouth;
 
-    // ── FACE DECAL (canvas-drawn 2D eyes + mouth) ────────────────────────
-    // Big design change: instead of stacking 3D spheres for the eyes, paint
-    // the whole face onto a canvas texture and apply it to a flat plane in
-    // front of the head. That's how modern cute-mascot 3D games (Splatoon,
-    // Fortnite, Overwatch supports) do anime faces on 3D bodies — the face
-    // is 2D drawn, not 3D sculpted. Sidesteps every Z-fighting and
-    // visibility issue we hit with the primitive stack.
-    //
-    // The plane sits just in front of the skull surface at the face's Y-mid
-    // and its texture is drawn on-startup with pure Canvas 2D calls, so we
-    // can iterate on the face by editing lines of drawing code.
+    // Tiny fang — the sheet's ¾ and face views show ONE small tooth peeking
+    // from the smile (viewer-left of centre). A soft teardrop, not a hard
+    // cone, so the tooth reads rounded like the sheet. Separate from the
+    // mouth mesh so the smile-widening scale doesn't stretch it.
+    const fangGeo = fluffGeo(0.018, 0.052, 14, 12);
+    fangGeo.rotateX(Math.PI);           // point DOWN (base at the gum line)
+    const fang = new THREE.Mesh(fangGeo, fangMat);
+    fang.position.set(-0.055, 0.150, 0.635);   // hangs from the smile arc
+    this.head.add(fang);
+
+    // ── FACE DECAL (canvas-drawn 2D eyes + brows) ────────────────────────
+    // The eyes and eyebrows are painted onto a canvas texture on a flat
+    // plane in front of the head (the cute-mascot approach — 2D-drawn face
+    // on a 3D body). This sidesteps every Z-fighting and visibility issue a
+    // stack of eye spheres would bring, and each face dimension is a single
+    // number in _buildFaceDecal. The nose / smile arc / fang stay 3D above
+    // because they ride the muzzle bump's curvature.
     const facePlane = this._buildFaceDecal();
     this.head.add(facePlane);
     (facePlane as any).__leftEye = facePlane;   // reused by blink lerp
     this.leftEye  = facePlane;
     this.rightEye = facePlane;
-    // The mouth mark 3D box below is retained as the smile-anchor mesh.
-
-    // (Removed: eyebrow flecks and blush spots. Same reason as cheek puffs
-    // above — too much small detail on the face. Big eyes carry the read.)
+    // The smile-arc mesh built above is the smile-anchor (this.mouth).
 
     // ── Ears ─────────────────────────────────────────────────────────────
-    // BIG pointed triangular ears — signature fox feature. Pointing straight
-    // up with slight outward tilt. Cream inner, orange outer, dark tip.
+    // The sheet's dominant feature: HUGE soft-triangular ears, nearly as
+    // tall as the head ball, white outside with a grey inner cavity (and a
+    // deeper grey core for depth), plus fluff wisps at the cavity base. No
+    // dark tips — white to the point. Each layer is a base-wide fluffGeo
+    // teardrop (smooth continuous curve, rounded tip) flattened
+    // front-to-back into a slab — no cone facets anywhere.
     //
-    // Previously the ears looked like FLOATING TRIANGLES because:
-    //   1. Ear position was 3% outside the skull ellipsoid (X=±0.32, y=0.98
-    //      is outside the skull at that height) — the whole cone was above
-    //      the head with a visible gap.
-    //   2. Cone bottom is a flat disc that never blends with the round skull.
-    //
-    // Both fixed here:
-    //   1. Ear now positioned INSIDE the skull surface (X=±0.28, y=0.94) so
-    //      the base is embedded and only the pointed part sticks out.
-    //   2. A rounded ORANGE BASE TUFT half-embedded in the skull hides the
-    //      flat cone bottom and provides a smooth dome that connects ear
-    //      into head. No outline on the tuft — an outline would draw a hard
-    //      seam between the tuft and the skull; we want a seamless blend.
+    // Anti-"floating triangle" rule carried over from the previous pass:
+    // the ear group origin sits INSIDE the skull ellipsoid so the teardrop's
+    // domed base embeds seamlessly (at x=±0.30, y=0.88 the ellipsoid sum
+    // ≈ 0.77 < 1 — no gap, no visible seam).
     const buildEar = (side: -1 | 1) => {
       const g = new THREE.Group();
 
-      const EAR_H = 0.55;
+      // Outer ear — a base-wide fluff teardrop flattened front-to-back:
+      // widest at its domed base, one continuous smooth curve to a soft
+      // rounded tip (the sheet's ears are soft triangles, never sharp).
+      // The domed base doubles as the head-blend, so no separate base-tuft
+      // sphere is needed.
+      const outerGeo = fluffGeo(0.32, 1.05, 36, 28, true);
+      outerGeo.scale(1.0, 1.0, 0.42);
+      outerGeo.computeVertexNormals();
+      const outer = new THREE.Mesh(outerGeo, furMat);
+      outer.position.y = -0.08;   // sink the dome into the skull
+      addWithOutline(g, outer, 0.026);
 
-      // Ear base tuft — half-embedded orange sphere, no outline
-      const baseGeo = new THREE.SphereGeometry(0.25, 22, 16);
-      baseGeo.scale(1.0, 0.85, 0.95);
-      const base = new THREE.Mesh(baseGeo, furMat);
-      base.position.y = 0.02;
-      g.add(base);
-
-      // Outer ear cone — single cone with a VERTEX COLOUR GRADIENT painted
-      // from orange (base) to dark (tip). No separate tip mesh, no seam,
-      // no floating-triangle discontinuity — the ear is one continuous
-      // shape with a smooth colour change at the top. This is the clean
-      // fix for the earlier "floating triangle on the tip" bug.
-      const outerGeo = new THREE.ConeGeometry(0.22, EAR_H, 6);
-      outerGeo.translate(0, EAR_H * 0.5 + 0.12, 0);
-
-      // Paint per-vertex colour: orange for the bottom 65% of the cone,
-      // ramp to dark over the top 35% for the "black-tipped fox ear" look.
-      // The ramp uses pow(t, 3) to keep most of the cone orange and only
-      // the very tip dark, matching the reference fox art proportions.
-      const orangeColor = new THREE.Color(PAL.fur);
-      const darkColor   = new THREE.Color(PAL.dark);
-      const positions   = outerGeo.attributes.position;
-      const colors      = new Float32Array(positions.count * 3);
-      const coneBaseY   = 0.12;
-      for (let i = 0; i < positions.count; i++) {
-        const y = positions.getY(i);
-        const t = Math.max(0, Math.min(1, (y - coneBaseY) / EAR_H));
-        const mix = Math.pow(t, 3);   // most of cone orange, only tip dark
-        const c = new THREE.Color().lerpColors(orangeColor, darkColor, mix);
-        colors[i * 3    ] = c.r;
-        colors[i * 3 + 1] = c.g;
-        colors[i * 3 + 2] = c.b;
-      }
-      outerGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-      // Custom vertex-coloured toon material for this cone (base white so
-      // the vertex colours show through directly; low emissive so the tip
-      // stays dark under bright ambient).
-      const outerMat = new THREE.MeshToonMaterial({
-        color: 0xffffff,
-        vertexColors: true,
-        gradientMap: GRAD,
-      });
-      const outer = new THREE.Mesh(outerGeo, outerMat);
-      addWithOutline(g, outer, 0.035);
-
-      // Inner ear cone — cream, sits in front of the outer cone
-      const innerGeo = new THREE.ConeGeometry(0.14, EAR_H * 0.76, 6);
-      innerGeo.translate(0, EAR_H * 0.76 * 0.5 + 0.14, 0);
-      const inner = new THREE.Mesh(innerGeo, creamMat);
-      inner.position.z = 0.05;
+      // Inner cavity — soft grey teardrop just in front of the outer slab
+      // (the sheet shades the whole inner triangle).
+      const innerGeo = fluffGeo(0.205, 0.76, 30, 24, true);
+      innerGeo.scale(1.0, 1.0, 0.36);
+      innerGeo.computeVertexNormals();
+      const inner = new THREE.Mesh(innerGeo, shadeMat);
+      inner.position.set(0, 0.06, 0.075);
       g.add(inner);
 
-      // Ear-inner fluff wisps — 2 tiny cream tufts near the inner ear base
-      const wispGeo = new THREE.ConeGeometry(0.028, 0.08, 6);
-      const wL = new THREE.Mesh(wispGeo, creamHi);
-      const wR = new THREE.Mesh(wispGeo, creamHi);
-      wL.position.set(-0.04, 0.24, 0.09); wL.rotation.z =  0.28;
-      wR.position.set( 0.04, 0.24, 0.09); wR.rotation.z = -0.28;
-      g.add(wL, wR);
+      // Deepest cavity accent — smaller, deeper-grey teardrop inside
+      const coreGeo = fluffGeo(0.115, 0.46, 24, 18, true);
+      coreGeo.scale(1.0, 1.0, 0.34);
+      coreGeo.computeVertexNormals();
+      const core = new THREE.Mesh(coreGeo, shadeLoMat);
+      core.position.set(0, 0.12, 0.115);
+      g.add(core);
 
-      // Positioned INSIDE the skull ellipsoid so the base tuft can embed.
-      // At (x=0.28, y=0.94) the skull ellipsoid formula sums to ~0.86 (< 1
-      // = well inside). Ear tip still projects ~0.5 units above the skull.
-      g.position.set(side * 0.28, 0.94, -0.02);
-      g.rotation.z = side * -0.22;
+      // Ear-base fluff wisps — three tiny white tufts across the cavity base
+      const wL = new THREE.Mesh(fluffGeo(0.034, 0.12, 16, 12), furMat);
+      const wC = new THREE.Mesh(fluffGeo(0.030, 0.10, 16, 12), furMat);
+      const wR = new THREE.Mesh(fluffGeo(0.034, 0.12, 16, 12), furMat);
+      wL.position.set(-0.055, 0.10, 0.11); wL.rotation.z =  0.30;
+      wC.position.set( 0.000, 0.08, 0.12);
+      wR.position.set( 0.055, 0.10, 0.11); wR.rotation.z = -0.30;
+      g.add(wL, wC, wR);
+
+      // Embedded in the skull; the tip projects ~0.85 above the skull top,
+      // matching the sheet's near-head-height ears.
+      g.position.set(side * 0.30, 0.88, -0.04);
+      g.rotation.z = side * -0.18;
       g.rotation.x = -0.10;
       return g;
     };
@@ -481,389 +603,421 @@ export class VoxelCharacter {
     this.rightEar = buildEar( 1);
     this.head.add(this.leftEar, this.rightEar);
 
-    // Outfit roles: skull/muzzle-top/ear tufts = fur; muzzle underside +
-    // inner-ear cones/wisps = cream. Nose, face decal, and the vertex-colored
-    // outer ear cones stay untagged (not meaningfully swappable).
+    // ── Head tuft ────────────────────────────────────────────────────────
+    // Small fur tuft on top of the skull between the ears, leaning forward
+    // — three soft fluff teardrops with their round bases pinned at the
+    // mesh position so rotations splay them like real fur clumps.
+    const tuftSpec: Array<[number, number, number, number, number, number, number]> = [
+      // x      y     z     r      h     rotX   rotZ
+      [ 0.00, 1.00, 0.12, 0.075, 0.26, -0.55,  0.00],
+      [-0.09, 0.99, 0.09, 0.060, 0.20, -0.50,  0.30],
+      [ 0.08, 1.00, 0.10, 0.055, 0.17, -0.45, -0.25],
+    ];
+    for (const [x, y, z, r, h, rx, rz] of tuftSpec) {
+      const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
+      spike.position.set(x, y, z);
+      spike.rotation.set(rx, 0, rz);
+      addWithOutline(this.head, spike, 0.020);
+    }
+
+    // ── Cheek ruffs ──────────────────────────────────────────────────────
+    // Fluffy fur on both sides of the lower head (sheet front view). Three
+    // soft teardrops per side pointing outward-and-down, bases pinned just
+    // inside the skull surface.
+    for (const side of [-1, 1] as const) {
+      const ruffSpec: Array<[number, number, number, number, number]> = [
+        // y      z     r      h     extra outward-down tilt
+        [ 0.40, 0.04, 0.060, 0.19, 0.10],
+        [ 0.30, 0.08, 0.090, 0.34, 0.35],
+        [ 0.20, 0.12, 0.070, 0.24, 0.65],
+      ];
+      for (const [y, z, r, h, tilt] of ruffSpec) {
+        const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
+        // Base just inside the skull surface at that height
+        spike.position.set(side * 0.52, y, z);
+        // Point the teardrop's +Y outward-and-down past horizontal
+        spike.rotation.z = -side * (Math.PI / 2 + tilt);
+        addWithOutline(this.head, spike, 0.020);
+      }
+    }
+
+    // Outfit roles: skull / ears / tufts / ruffs = fur; muzzle zone = cream;
+    // BOTH grey ear-cavity cones = furDeep (keeps the furDeep outfit slot
+    // meaningful now that the fox-marking ear-backs/tail-mid are gone — an
+    // outfit override unifies the cavity two-tone, clearOutfit restores it).
+    // Nose, fang and the face decal stay untagged.
     this._tagPaletteRoles(this.head, [
       [furMat, 'fur'],
       [creamMat, 'cream'],
-      [creamHi, 'cream'],
+      [shadeMat, 'furDeep'],
+      [shadeLoMat, 'furDeep'],
     ]);
   }
 
   // ── Face decal ──────────────────────────────────────────────────────────
-  //  Canvas-drawn cute anime face (eyes + blush) on a plane in front of
-  //  the head. The plane is transparent everywhere except the drawn strokes,
-  //  so the orange fur shows through around them. The plane sits just in
-  //  front of the skull surface at y = 0.44 (upper-middle of face) — this
-  //  is the same Y the 3D eye stack used, so nose/muzzle/mouth positions
-  //  don't need to move.
+  //  Canvas-drawn reference-sheet face (dark glossy eyes + thin brows) on a
+  //  plane in front of the head. The plane is transparent everywhere except
+  //  the drawn strokes, so the white fur shows through around them. The
+  //  plane sits just in front of the skull surface at y = 0.42
+  //  (upper-middle of face); the 3D nose / smile / fang occupy the lower
+  //  face on the muzzle bump.
   //
   //  Why canvas 2D instead of stacking THREE meshes: we get clean crisp
-  //  strokes that read as anime-style eyes at any camera distance, and
-  //  every dimension is a single number I can tweak in JS instead of
-  //  three variables per THREE.Sphere.
+  //  strokes that read at any camera distance, and every dimension is a
+  //  single number here instead of three variables per THREE.Sphere.
   private _buildFaceDecal(): THREE.Mesh {
+    // 1024px backing canvas drawn in 512-space via a 2× transform — crisp
+    // eye edges at close zoom without touching any drawing coordinates.
     const SIZE = 512;
     const canvas = document.createElement('canvas');
-    canvas.width = SIZE;
-    canvas.height = SIZE;
+    canvas.width = SIZE * 2;
+    canvas.height = SIZE * 2;
     const ctx = canvas.getContext('2d')!;
+    ctx.scale(2, 2);
 
     // Transparent background — the head fur shows through everywhere the
     // face isn't drawn.
     ctx.clearRect(0, 0, SIZE, SIZE);
 
-    // Colours mirror the PAL palette so the drawn face matches the 3D fur.
-    const OUTLINE = '#1e0d05';
-    const SCLERA  = '#faf1d8';
-    const IRIS    = '#27a4be';
-    const IRIS_HI = '#64d8e8';
-    const PUPIL   = '#141010';
-    const SHINE   = '#ffffff';
-    const BLUSH   = 'rgba(224, 122, 105, 0.55)';
+    // Reference-sheet face: the eyes are DARK GLOSSY OVALS (no cream sclera,
+    // no teal iris) with big white highlights, and thin brow strokes float
+    // above them. Charcoal tones, never pure black — matches PAL.nose.
+    const EYE      = '#35333a';
+    const EYE_SOFT = '#4a4852';   // subtle lighter lower-inner sheen
+    const SHINE    = '#ffffff';
+    const BROW     = '#3a383f';
 
-    // ── Eyes ─── two mirrored cute anime eyes ────────────────────────
+    // ── Eyes ─── two mirrored dark glossy ovals ──────────────────────
     // Face coord system: (0,0) = top-left of canvas, (256, 256) = center.
-    // Positioned in the upper-middle so the mouth/muzzle 3D geometry
+    // Positioned in the upper-middle so the muzzle/mouth 3D geometry
     // occupies the lower face.
     const drawEye = (cx: number, cy: number, side: -1 | 1) => {
-      // Sclera — BIG cream oval with heavy dark outline for contrast
-      ctx.fillStyle = SCLERA;
-      ctx.strokeStyle = OUTLINE;
-      ctx.lineWidth = 12;
+      // Eye body — tall dark oval
+      ctx.fillStyle = EYE;
       ctx.beginPath();
-      ctx.ellipse(cx, cy, 85, 110, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-
-      // Iris — teal disc, larger to fill more of the sclera
-      ctx.fillStyle = IRIS;
-      ctx.beginPath();
-      ctx.ellipse(cx, cy + 8, 66, 92, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx, cy, 68, 92, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Iris bright inner ring
-      ctx.fillStyle = IRIS_HI;
+      // Soft lower sheen — slightly lighter oval sunk toward the bottom,
+      // sells the "wet glossy" ball read from the sheet.
+      ctx.fillStyle = EYE_SOFT;
       ctx.beginPath();
-      ctx.ellipse(cx, cy + 12, 42, 62, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx, cy + 26, 46, 54, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Pupil — big dark oval
-      ctx.fillStyle = PUPIL;
-      ctx.beginPath();
-      ctx.ellipse(cx, cy + 12, 24, 48, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Big shine — up-and-out white oval, THE cute signal
+      // Big shine — white oval, upper-left on BOTH eyes (single light
+      // source, exactly like the sheet).
       ctx.fillStyle = SHINE;
       ctx.beginPath();
-      ctx.ellipse(cx + side * 22, cy - 30, 20, 26, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx - 22, cy - 34, 20, 26, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Small secondary shine — down-and-in white dot
+      // Small secondary shine — lower-right dot
       ctx.beginPath();
-      ctx.ellipse(cx - side * 16, cy + 38, 9, 12, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx + 18, cy + 36, 9, 11, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Dark eyelash flourish above the outer eye — a curved arc adds
-      // "closed-eye-when-smiling" feeling to the eye's upper outline.
-      ctx.strokeStyle = OUTLINE;
-      ctx.lineWidth = 10;
+      // Thin eyebrow stroke — short gentle arc close above the eye,
+      // slightly higher at the inner end (the sheet's soft neutral brow;
+      // brows floating too high read "surprised").
+      ctx.strokeStyle = BROW;
+      ctx.lineWidth = 9;
       ctx.lineCap = 'round';
       ctx.beginPath();
-      ctx.moveTo(cx + side * 60, cy - 85);
-      ctx.quadraticCurveTo(cx + side * 90, cy - 70, cx + side * 95, cy - 40);
+      ctx.moveTo(cx - side * 40, cy - 104);
+      ctx.quadraticCurveTo(cx, cy - 120, cx + side * 34, cy - 100);
       ctx.stroke();
     };
-    // Two eyes with a nose-bridge gap. Y=220 is upper-middle of face area.
-    // Centres at ±100 from canvas centre = ~0.18 world units apart.
-    drawEye(156, 220, -1);
-    drawEye(356, 220,  1);
-
-    // ── Blush ─── soft pink translucent spots under each eye ─────────
-    ctx.fillStyle = BLUSH;
-    ctx.beginPath();
-    ctx.ellipse(90, 360, 48, 20, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(422, 360, 48, 20, 0, 0, Math.PI * 2);
-    ctx.fill();
+    // Two eyes with a nose-bridge gap. Y=228 is upper-middle of face area.
+    drawEye(166, 228, -1);
+    drawEye(346, 228,  1);
 
     // Build the texture and plane. The plane is sized 0.90 units wide so
-    // the drawn eyes end up ~0.18 wide each in world space — comparable
-    // to the previous 3D-sphere eye but crisper.
+    // the drawn eyes end up ~0.24 wide each in world space — the big dark
+    // glossy read the reference sheet leads with.
     const tex = new THREE.CanvasTexture(canvas);
     tex.magFilter = THREE.LinearFilter;
     tex.minFilter = THREE.LinearMipmapLinearFilter;
-    tex.anisotropy = 4;
+    tex.anisotropy = 8;
     // NOTE: keep default sRGB in three.js r167 (no explicit colorSpace set
     // here — the canvas is already sRGB and the renderer knows).
 
-    const geo = new THREE.PlaneGeometry(0.90, 0.90);
+    // CURVED patch, not a flat plane: a section of a sphere a hair larger
+    // than the skull, so the face hugs the head at every viewing angle (a
+    // flat plane showed as a floating sliver at profile). Angular ranges
+    // solved so the drawn eyes land at the same world height/spacing the
+    // flat 0.90-unit plane used: φ spans 1.40 rad centred on +Z, θ spans
+    // 0.82–2.32 rad (brow line → under-chin, the empty bottom is discarded
+    // by alphaTest).
+    const geo = new THREE.SphereGeometry(0.62, 48, 36, 0.871, 1.40, 0.82, 1.50);
+    geo.scale(1.058, 1.008, 0.988);   // skull scale (1.05,1.0,0.98) × ~1.008 proud
+                                      // (tighter = smaller dark sliver at profile)
     const mat = new THREE.MeshBasicMaterial({
       map: tex,
       transparent: true,
       alphaTest: 0.02,       // treat near-transparent pixels as fully clear
-      side: THREE.DoubleSide, // in case the character rotates past 90°
-      depthWrite: false,     // don't mask surrounding fur through the plane
+      side: THREE.FrontSide, // back views cull the patch (skull occludes it)
+      depthWrite: false,     // don't mask surrounding fur through the patch
     });
-    const plane = new THREE.Mesh(geo, mat);
-    // Plane centre at the upper-middle of the face. Just barely forward of
-    // the skull surface at (0, 0.44, ~0.60) so it doesn't Z-fight with fur.
-    plane.position.set(0, 0.42, 0.61);
+    const patch = new THREE.Mesh(geo, mat);
+    // Same origin as the skull sphere; blink's scale.y squash pulls the
+    // drawn eyes down toward the skull centre-line like closing lids.
+    patch.position.set(0, 0.42, 0);
     // Render after the skull so alpha compositing works cleanly.
-    plane.renderOrder = 5;
-    return plane;
+    patch.renderOrder = 5;
+    return patch;
   }
 
   // ── Torso ────────────────────────────────────────────────────────────────
-  //  SMALL, chubby, round. Cream chest patch dominates the front.
+  //  Reference sheet body: PEAR-shaped — narrow sloped shoulders widening to
+  //  a round belly — with a spiky chest-bib tuft under the chin. One lathe
+  //  profile gives a single smooth silhouette (one outline shell, no seam
+  //  where separate chest/belly spheres would overlap).
   private _buildTorso(): void {
-    const furMat   = tmat(PAL.fur,       { emissiveBoost: 0.09 });
-    const creamMat = tmat(PAL.cream,     { emissiveBoost: 0.10 });
-    const creamHi  = tmat(PAL.creamSoft, { emissiveBoost: 0.12 });
+    const furMat   = tmat(PAL.fur,   { emissiveBoost: 0.09 });
+    const creamMat = tmat(PAL.cream, { emissiveBoost: 0.11 });
 
     this.chest = new THREE.Group();
     this.torso.add(this.chest);
 
-    // Rounded plump torso — a wider-than-tall sphere for chibi silhouette
-    const torsoGeo = new THREE.SphereGeometry(0.44, 32, 24);
-    torsoGeo.scale(1.0, 0.9, 0.75);
+    // Pear profile, bottom → top (lathe revolves around Y). Control points
+    // are smoothed through a Catmull-Rom spline (36 samples × 48 radial
+    // segments) so the silhouette is one continuous curve — the widest
+    // point sits at lower-belly height; front-back flattened 18% so the
+    // body isn't a perfect ball from the side (sheet side view).
+    const pearCtrl: THREE.Vector2[] = [
+      new THREE.Vector2(0.000, -0.42),
+      new THREE.Vector2(0.240, -0.38),
+      new THREE.Vector2(0.400, -0.24),
+      new THREE.Vector2(0.455, -0.06),
+      new THREE.Vector2(0.430,  0.10),
+      new THREE.Vector2(0.345,  0.24),
+      new THREE.Vector2(0.240,  0.33),
+      new THREE.Vector2(0.000,  0.38),
+    ];
+    const pearPts = new THREE.SplineCurve(pearCtrl).getPoints(36);
+    const torsoGeo = new THREE.LatheGeometry(pearPts, 48);
+    torsoGeo.scale(1.0, 1.0, 0.82);
     const torso = new THREE.Mesh(torsoGeo, furMat);
     addWithOutline(this.chest, torso, 0.024);
 
-    // Cream chest / belly patch — big front oval
-    const bellyGeo = new THREE.SphereGeometry(0.34, 28, 22);
-    bellyGeo.scale(0.90, 1.15, 0.50);
-    const belly = new THREE.Mesh(bellyGeo, creamMat);
-    belly.position.set(0, -0.02, 0.20);
-    addWithOutline(this.chest, belly, 0.022);
+    // Chest bib — the sheet's fluffy fur tuft below the chin: a soft mound
+    // plus a fan of downward-pointing fluff teardrops across the upper
+    // chest. Cream role (white for now) so outfits can still dye the bib.
+    const bibGeo = new THREE.SphereGeometry(0.25, 32, 24);
+    bibGeo.scale(1.10, 0.62, 0.75);
+    const bib = new THREE.Mesh(bibGeo, creamMat);
+    bib.position.set(0, 0.30, 0.14);   // snug against the chest, not floating
+    addWithOutline(this.chest, bib, 0.022);
 
-    // Chest ruff — bright cream tuft under the chin (small fluff)
-    const ruffGeo = new THREE.SphereGeometry(0.24, 22, 18);
-    ruffGeo.scale(1.0, 0.65, 0.85);
-    const ruff = new THREE.Mesh(ruffGeo, creamHi);
-    ruff.position.set(0, 0.32, 0.15);
-    addWithOutline(this.chest, ruff, 0.022);
+    // A tight fan hanging off the mound — the sheet's tuft is one fluffy
+    // triangular MASS, so the teardrops overlap instead of ringing like a
+    // necklace.
+    const bibSpikes: Array<[number, number, number, number, number, number]> = [
+      // x      y     z     r      h     rotZ (splay)
+      [ 0.00, 0.32, 0.24, 0.095, 0.36,  0.00],
+      [-0.09, 0.33, 0.22, 0.075, 0.28,  0.16],
+      [ 0.09, 0.33, 0.22, 0.075, 0.28, -0.16],
+      [-0.17, 0.34, 0.19, 0.060, 0.20,  0.32],
+      [ 0.17, 0.34, 0.19, 0.060, 0.20, -0.32],
+    ];
+    for (const [x, y, z, r, h, rz] of bibSpikes) {
+      const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), creamMat);
+      spike.position.set(x, y, z);
+      // Point DOWN-and-forward with a per-spike sideways splay
+      spike.rotation.set(Math.PI * 0.88, 0, rz);
+      addWithOutline(this.chest, spike, 0.020);
+    }
 
-    // Outfit roles: torso shell = fur; belly patch + chest ruff = cream.
+    // Outfit roles: torso shell = fur; chest bib + spikes = cream.
     this._tagPaletteRoles(this.chest, [
       [furMat, 'fur'],
       [creamMat, 'cream'],
-      [creamHi, 'cream'],
     ]);
   }
 
   // ── Arms ─────────────────────────────────────────────────────────────────
-  //  STUBBY. Short arms hanging by the sides, small dark paws.
+  //  Reference sheet arms: short white stubs hanging with a slight OUTWARD
+  //  curve, ending in rounded mitten paws a touch fatter than the wrist.
+  //  No gloves, no pads — the sheet shows plain white mittens.
   private _buildArms(): void {
-    const furMat   = tmat(PAL.fur,      { emissiveBoost: 0.09 });
-    const darkMat  = tmat(PAL.dark,     { emissiveBoost: 0.05 });
-    const pawMat   = tmat(PAL.paw,      { emissiveBoost: 0.05 });
-    const padMat   = tmat(PAL.pawPad,   { emissiveBoost: 0.10 });
-    const padHi    = bmat(PAL.pawPadHi);
+    const furMat = tmat(PAL.fur, { emissiveBoost: 0.09 });
+    const pawMat = tmat(PAL.paw, { emissiveBoost: 0.09 });
 
-    const buildArm = (group: THREE.Group) => {
-      // Fur arm — short, teardrop tapering to the paw
-      const armGeo = new THREE.CylinderGeometry(0.15, 0.13, 0.50, 18);
-      armGeo.translate(0, -0.25, 0);
+    const buildArm = (group: THREE.Group, side: -1 | 1) => {
+      // Arm — short tapering stub with a domed shoulder cap so the top
+      // never shows a flat disc against the torso. Reaches the lower belly
+      // like the sheet's front view.
+      const armGeo = new THREE.CylinderGeometry(0.135, 0.115, 0.42, 28);
+      armGeo.translate(0, -0.21, 0);
       const arm = new THREE.Mesh(armGeo, furMat);
       addWithOutline(group, arm, 0.024);
+      const shoulderGeo = new THREE.SphereGeometry(0.135, 24, 18);
+      const shoulder = new THREE.Mesh(shoulderGeo, furMat);
+      shoulder.position.y = -0.02;
+      group.add(shoulder);
 
-      // Dark forearm "glove" — bottom half of arm goes dark
-      const gloveGeo = new THREE.CylinderGeometry(0.135, 0.12, 0.24, 16);
-      gloveGeo.translate(0, -0.42, 0);
-      const glove = new THREE.Mesh(gloveGeo, darkMat);
-      addWithOutline(group, glove, 0.026);
-
-      // Paw — dark rounded ball at the end
-      const pawGeo = new THREE.SphereGeometry(0.14, 22, 18);
-      pawGeo.scale(1.05, 0.9, 1.10);
+      // Mitten paw — rounded ball, slightly taller than wide
+      const pawGeo = new THREE.SphereGeometry(0.135, 32, 24);
+      pawGeo.scale(1.0, 1.08, 1.0);
       const paw = new THREE.Mesh(pawGeo, pawMat);
-      paw.position.y = -0.56;
-      addWithOutline(group, paw, 0.028);
+      paw.position.y = -0.47;
+      addWithOutline(group, paw, 0.026);
 
-      // Palm pad — soft pink underneath
-      const palmGeo = new THREE.SphereGeometry(0.055, 14, 10);
-      palmGeo.scale(1.1, 0.5, 0.85);
-      const palm = new THREE.Mesh(palmGeo, padMat);
-      palm.position.set(0, -0.60, 0.07);
-      group.add(palm);
-
-      // Palm highlight
-      const palmHiGeo = new THREE.SphereGeometry(0.022, 8, 6);
-      palmHiGeo.scale(1.4, 0.4, 1.0);
-      const palmHi = new THREE.Mesh(palmHiGeo, padHi);
-      palmHi.position.set(0, -0.595, 0.09);
-      group.add(palmHi);
-
-      // Three small finger-pad dots
-      const dotGeo = new THREE.SphereGeometry(0.018, 10, 8);
-      for (let i = -1; i <= 1; i++) {
-        const d = new THREE.Mesh(dotGeo, padMat);
-        d.position.set(i * 0.045, -0.55, 0.12);
-        group.add(d);
-      }
+      // Slight outward hang (sheet front view): a static Z-tilt on the arm
+      // group. update() only animates rotation.x, so this tilt persists
+      // through the walk/sit/paddle cycles. Rz(θ) maps the hanging tip
+      // (0,-1,0) → (sinθ, -cosθ, 0), so the left arm (-X side) needs θ<0.
+      group.rotation.z = side * 0.12;
     };
 
-    buildArm(this.leftArm);
-    buildArm(this.rightArm);
+    buildArm(this.leftArm, -1);
+    buildArm(this.rightArm, 1);
 
-    // Outfit roles: upper arm = fur; dark glove + paw ball = accent (reads
-    // as "gloves" when recolored). Pink palm pads stay untagged.
+    // Outfit roles: arm = fur; mitten paw = accent (reads as "gloves" when
+    // an outfit dyes the accent slot).
     for (const arm of [this.leftArm, this.rightArm]) {
       this._tagPaletteRoles(arm, [
         [furMat, 'fur'],
-        [darkMat, 'accent'],
         [pawMat, 'accent'],
       ]);
     }
   }
 
   // ── Legs ─────────────────────────────────────────────────────────────────
-  //  SHORT stubby legs with dark "socks" and rounded feet with pink pads.
+  //  Reference sheet legs: VERY short white stubs into rounded feet with a
+  //  three-toe front (the toe clefts read via the outline shells between the
+  //  toe balls). No socks, no pads — plain white.
+  //
+  //  Floor-flush constraint (issue #21 / rootY table): the lowest geometry
+  //  must reach y ≈ -0.733 below the leg pivot so idle rootY 1.18 keeps the
+  //  soles flush with the y=0 floor. Foot ball: -0.62 - 0.155·0.73 = -0.733.
   private _buildLegs(): void {
-    const furMat  = tmat(PAL.fur,      { emissiveBoost: 0.09 });
-    const darkMat = tmat(PAL.dark,     { emissiveBoost: 0.05 });
-    const pawMat  = tmat(PAL.paw,      { emissiveBoost: 0.05 });
-    const padMat  = tmat(PAL.pawPad,   { emissiveBoost: 0.10 });
-    const padHi   = bmat(PAL.pawPadHi);
+    const furMat = tmat(PAL.fur, { emissiveBoost: 0.09 });
+    const pawMat = tmat(PAL.paw, { emissiveBoost: 0.09 });
 
     const buildLeg = (group: THREE.Group) => {
-      // Fluffy upper thigh — fur
-      const thighGeo = new THREE.CylinderGeometry(0.20, 0.18, 0.28, 18);
-      thighGeo.translate(0, -0.14, 0);
-      const thigh = new THREE.Mesh(thighGeo, furMat);
-      addWithOutline(group, thigh, 0.024);
+      // Stub leg — short white cylinder from hip toward the foot, domed at
+      // the hip so no flat disc shows against the torso
+      const legGeo = new THREE.CylinderGeometry(0.17, 0.15, 0.34, 28);
+      legGeo.translate(0, -0.30, 0);
+      const leg = new THREE.Mesh(legGeo, furMat);
+      addWithOutline(group, leg, 0.024);
+      const hipGeo = new THREE.SphereGeometry(0.17, 24, 18);
+      const hip = new THREE.Mesh(hipGeo, furMat);
+      hip.position.y = -0.14;
+      group.add(hip);
 
-      // Dark "sock" — lower leg goes dark (iconic fox marking)
-      const sockGeo = new THREE.CylinderGeometry(0.17, 0.15, 0.28, 16);
-      sockGeo.translate(0, -0.42, 0);
-      const sock = new THREE.Mesh(sockGeo, darkMat);
-      addWithOutline(group, sock, 0.026);
-
-      // Foot — rounded dark box
-      const footGeo = new THREE.BoxGeometry(0.30, 0.16, 0.38);
-      footGeo.translate(0, -0.62, 0.06);
+      // Foot — rounded white ball, longer than wide, slightly forward
+      const footGeo = new THREE.SphereGeometry(0.155, 32, 22);
+      footGeo.scale(1.15, 0.73, 1.35);
       const foot = new THREE.Mesh(footGeo, pawMat);
-      addWithOutline(group, foot, 0.022);
+      foot.position.set(0, -0.62, 0.05);
+      addWithOutline(group, foot, 0.024);
 
-      // Rounded foot top (fills box corners for a softer silhouette)
-      const footTopGeo = new THREE.SphereGeometry(0.16, 20, 14);
-      footTopGeo.scale(1.0, 0.7, 1.15);
-      const footTop = new THREE.Mesh(footTopGeo, pawMat);
-      footTop.position.set(0, -0.60, 0.06);
-      addWithOutline(group, footTop, 0.025);
-
-      // Big pink pad underneath the foot
-      const padGeo = new THREE.SphereGeometry(0.065, 14, 10);
-      padGeo.scale(1.3, 0.35, 1.0);
-      const pad = new THREE.Mesh(padGeo, padMat);
-      pad.position.set(0, -0.71, 0.10);
-      group.add(pad);
-
-      // Pad highlight
-      const padHiGeo = new THREE.SphereGeometry(0.028, 8, 6);
-      padHiGeo.scale(1.3, 0.35, 1.0);
-      const padHiMesh = new THREE.Mesh(padHiGeo, padHi);
-      padHiMesh.position.set(0, -0.705, 0.12);
-      group.add(padHiMesh);
-
-      // Three small toe dots
-      const toeGeo = new THREE.SphereGeometry(0.02, 10, 8);
+      // Three toe balls across the foot front — their outline shells draw
+      // the clefts the sheet marks with two short lines on each foot.
+      const toeGeo = new THREE.SphereGeometry(0.062, 20, 16);
+      toeGeo.scale(1.0, 0.78, 1.1);
       for (let i = -1; i <= 1; i++) {
-        const t = new THREE.Mesh(toeGeo, padMat);
-        t.position.set(i * 0.08, -0.71, 0.22);
-        group.add(t);
+        const toe = new THREE.Mesh(toeGeo, pawMat);
+        toe.position.set(i * 0.088, -0.665, 0.235);
+        addWithOutline(group, toe, 0.022);
       }
     };
 
     buildLeg(this.leftLeg);
     buildLeg(this.rightLeg);
 
-    // Outfit roles: thigh = fur; dark sock + foot = accent (reads as
-    // "boots" when recolored). Pink foot pads / toe dots stay untagged.
+    // Outfit roles: leg stub = fur; foot + toes = accent (reads as "boots"
+    // when an outfit dyes the accent slot).
     for (const leg of [this.leftLeg, this.rightLeg]) {
       this._tagPaletteRoles(leg, [
         [furMat, 'fur'],
-        [darkMat, 'accent'],
         [pawMat, 'accent'],
       ]);
     }
   }
 
   // ── Tail ─────────────────────────────────────────────────────────────────
-  //  BIG fluffy fox tail. Droops down-and-back at rest (tail joint rotation.x
-  //  already set in constructor). Roughly body-length. Fat orange base
-  //  tapering to a BRIGHT WHITE TIP — the iconic fox marker.
+  //  The reference sheet's signature: a BIG flame-shaped tail. It leaves the
+  //  tail-bone going straight back with a slight dip, then curls UP so the
+  //  soft tip rides at chin height, and its silhouette is serrated with
+  //  fluff spikes along the top and underside edges.
   //
-  //  Built as a stack of large fluff spheres along the tail group's +Y axis,
-  //  each slightly smaller than the last, plus a couple of side fluff puffs
-  //  for volume, ending in an oversized cream tip sphere.
+  //  Coordinate frame: the tail group's rotation.x = -1.62 (constructor)
+  //  maps local +Y → world BACK and local +Z → world UP. The spine is a
+  //  parabola in the local Y-Z plane: y(t) = 0.95t (length), z(t) =
+  //  1.15t² − 0.15t (tiny initial dip, strong late rise). Overlapping
+  //  spheres of swelling-then-tapering radius fill the curve; spikes sit on
+  //  the curve's normals; the tip cone follows the end tangent.
   private _buildTail(): void {
-    const furMat   = tmat(PAL.fur,      { emissiveBoost: 0.09 });
-    const furDeep  = tmat(PAL.furDeep,  { emissiveBoost: 0.08 });
-    const creamMat = tmat(PAL.cream,    { emissiveBoost: 0.11 });
-    const creamHi  = tmat(PAL.creamSoft,{ emissiveBoost: 0.13 });
+    const furMat = tmat(PAL.fur, { emissiveBoost: 0.09 });
 
-    // Main tail spine — 3 overlapping fluff spheres. Shorter overall length
-    // than the previous 5-segment build; total spine ~0.54 units so the tail
-    // reads as a stubby-cute plume rather than a long trailing drape.
-    const SEGMENTS = 3;
-    const segH = 0.18;
-    let radius = 0.20;
-    for (let i = 0; i < SEGMENTS; i++) {
-      const geo = new THREE.SphereGeometry(radius, 24, 18);
-      geo.scale(1.0, 1.05, 1.0);
-      geo.translate(0, i * segH + segH / 2, 0);
+    const spineY = (t: number) => 0.95 * t;
+    const spineZ = (t: number) => 0.95 * t * t - 0.12 * t;
+    // Tangent of the spine curve (d/dt), for spike normals + tip direction
+    const tangent = (t: number): [number, number] => [0.95, 1.9 * t - 0.12];
 
-      // First and last segments use main fur, middle uses slightly deeper
-      // fur for subtle tonal variation.
-      const material = i === 1 ? furDeep : furMat;
-      const seg = new THREE.Mesh(geo, material);
-      addWithOutline(this.tail, seg, 0.026);
-      radius *= 0.90;
+    // Flame body — ONE continuous varying-radius tube along the parabola
+    // (16 rings × 32 radial segments). FAT like the sheet: the plume's max
+    // radius is ~0.32 (≈ 70% of the body's half-width), swelling from a
+    // narrow root and melting into the tip.
+    const radiusAt = (t: number) => {
+      const bell = Math.sin(Math.min(1, t / 0.95) * Math.PI);
+      return 0.105 + Math.pow(bell, 1.05) * 0.215;
+    };
+    // 40 rings so the fur scallops below resolve smoothly (~7 rings per
+    // scallop crest).
+    const RINGS = 40;
+    const spinePts: Array<[number, number]> = [];
+    const spineRadii: number[] = [];
+    for (let i = 0; i < RINGS; i++) {
+      const t = (i / (RINGS - 1)) * 0.95;
+      spinePts.push([spineY(t), spineZ(t)]);
+      spineRadii.push(radiusAt(t));
     }
+    // Fur serration sculpted INTO the surface: the TOP/OUTER edge of the
+    // flame waves in and out (five scallop crests fading at both ends);
+    // the underside stays smooth like the sheet. Earlier attempts glued
+    // separate teardrop meshes on — their round bases read as balls, not
+    // fur. ringAngle a: sin(a) < 0 is the top/outer side in this frame.
+    const scallop = (tFrac: number, a: number) => {
+      const topness = Math.max(0, -Math.sin(a));
+      const wave = Math.pow(Math.abs(Math.sin(tFrac * Math.PI * 5.2 + 0.4)), 0.9);
+      const fade = Math.sin(Math.min(1, tFrac) * Math.PI);
+      return 1 + 0.24 * Math.pow(topness, 1.6) * wave * fade;
+    };
+    const flame = new THREE.Mesh(
+      flameTubeGeo(spinePts, spineRadii, 32, 0.86, scallop),
+      furMat
+    );
+    addWithOutline(this.tail, flame, 0.022);
 
-    // Two side fluff puffs — one per side at the tail base for a fuller plume
-    // silhouette without adding to the tail length.
-    const sideFluff: [number, number, number, number][] = [
-      [-0.15, 0.14, 0.02, 0.12],
-      [ 0.15, 0.20, 0.02, 0.11],
-    ];
-    for (const [x, y, z, r] of sideFluff) {
-      const geo = new THREE.SphereGeometry(r, 18, 14);
-      geo.scale(0.85, 1.0, 0.85);
-      const puff = new THREE.Mesh(geo, furMat);
-      puff.position.set(x, y, z);
-      addWithOutline(this.tail, puff, 0.026);
-    }
+    // Tip — the sheet's flame ends in a SPLIT soft point: one long teardrop
+    // on the end tangent plus a shorter secondary curl just behind it.
+    const [ty, tz] = tangent(0.95);
+    const tlen = Math.hypot(ty, tz);
+    const tipDirY = ty / tlen;
+    const tipDirZ = tz / tlen;
+    const tipMain = new THREE.Mesh(fluffGeo(0.130, 0.50, 26, 20), furMat);
+    tipMain.position.set(0, spineY(0.95) - tipDirY * 0.06, spineZ(0.95) - tipDirZ * 0.06);
+    tipMain.rotation.x = Math.atan2(tipDirZ, tipDirY);
+    addWithOutline(this.tail, tipMain, 0.024);
 
-    // ── White tip — the iconic fox marker. Sized down to match the shorter
-    // tail so the tip reads as ~1/3 of the tail length instead of dominating.
-    const tipY = SEGMENTS * segH;
-    const tipMainGeo = new THREE.SphereGeometry(0.15, 24, 18);
-    tipMainGeo.scale(1.05, 1.20, 1.05);
-    const tipMain = new THREE.Mesh(tipMainGeo, creamMat);
-    tipMain.position.set(0, tipY + 0.01, 0);
-    addWithOutline(this.tail, tipMain, 0.028);
+    const tipSide = new THREE.Mesh(fluffGeo(0.085, 0.30, 20, 16), furMat);
+    // Behind and slightly under the main point, angled ~35° off it
+    tipSide.position.set(
+      0,
+      spineY(0.88) - tipDirY * 0.02,
+      spineZ(0.88) + 0.02
+    );
+    tipSide.rotation.x = Math.atan2(tipDirZ, tipDirY) - 0.62;
+    addWithOutline(this.tail, tipSide, 0.020);
 
-    // Bright secondary tip highlight
-    const tipHiGeo = new THREE.SphereGeometry(0.11, 18, 14);
-    tipHiGeo.scale(0.9, 1.0, 0.9);
-    const tipHi = new THREE.Mesh(tipHiGeo, creamHi);
-    tipHi.position.set(0, tipY + 0.07, 0.015);
-    addWithOutline(this.tail, tipHi, 0.028);
-
-    // Outfit roles: tail spine/fluff = fur, middle segment = furDeep,
-    // white tip = cream.
-    this._tagPaletteRoles(this.tail, [
-      [furMat, 'fur'],
-      [furDeep, 'furDeep'],
-      [creamMat, 'cream'],
-      [creamHi, 'cream'],
-    ]);
+    // Outfit roles: the whole plume = fur (the sheet's tail is one colour;
+    // furDeep/cream tail slots from the fox-marking era are gone).
+    this._tagPaletteRoles(this.tail, [[furMat, 'fur']]);
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -990,10 +1144,11 @@ export class VoxelCharacter {
     this.drinkHold = raise;
   }
 
-  /** World position of the right paw (the drink rides in it while sipping). */
+  /** World position of the right paw (the drink rides in it while sipping).
+   *  -0.47 = the mitten-paw centre in the reference-sheet arm build. */
   public getPawWorldPos(target: THREE.Vector3): THREE.Vector3 {
     this.rightArm.updateWorldMatrix(true, false);
-    return this.rightArm.localToWorld(target.set(0, -0.6, 0));
+    return this.rightArm.localToWorld(target.set(0, -0.47, 0));
   }
 
   update(): void {
@@ -1039,8 +1194,9 @@ export class VoxelCharacter {
 
       this.torso.position.y = (state.rootY - 0.15) + Math.abs(Math.sin(time * walkSpeed)) * 0.09;
 
-      // Tail sway — bigger amplitude on walk, tail wags side to side
-      this.tail.rotation.y = Math.sin(time * walkSpeed * 0.5) * 0.35;
+      // Tail sway — bigger amplitude on walk, tail wags side to side around
+      // a reduced rest offset (the plume streams closer to centre in motion)
+      this.tail.rotation.y = TAIL_REST_YAW * 0.5 + Math.sin(time * walkSpeed * 0.5) * 0.35;
 
     } else if (this.currentState === 'swim') {
       // 🏊 Gentle paddle: arms alternate at a lazy cadence, legs stay tucked
@@ -1055,7 +1211,7 @@ export class VoxelCharacter {
       // Water bob rides ON TOP of the root lerp from section 1.
       this.torso.position.y += Math.sin(time * 2.0) * 0.03;
       // Tail drifts slowly like it's floating behind.
-      this.tail.rotation.y = Math.sin(time * 1.2) * 0.2;
+      this.tail.rotation.y = TAIL_REST_YAW * 0.5 + Math.sin(time * 1.2) * 0.2;
 
     } else {
       const legTarget = state.legRotX ?? 0;
@@ -1066,8 +1222,10 @@ export class VoxelCharacter {
       this.leftArm.rotation.x  = THREE.MathUtils.lerp(this.leftArm.rotation.x,  armTarget, lerpSpeed);
       this.rightArm.rotation.x = THREE.MathUtils.lerp(this.rightArm.rotation.x, armTarget, lerpSpeed);
 
-      // Idle tail — slow gentle sway
-      const idleSway = Math.sin(time * 1.5) * 0.12;
+      // Idle tail — slow gentle sway around the rest offset (the sheet's
+      // front view shows the plume peeking beside the body, not hidden
+      // dead-centre behind it)
+      const idleSway = TAIL_REST_YAW + Math.sin(time * 1.5) * 0.12;
       this.tail.rotation.y = THREE.MathUtils.lerp(this.tail.rotation.y, idleSway, lerpSpeed);
     }
 
@@ -1123,7 +1281,7 @@ export class VoxelCharacter {
     this.rightEye.scale.y = eyeScaleY;
 
     this.mouth.scale.x = 1.0 + smile * 0.7;
-    this.mouth.position.y = 0.17 + smile * 0.015;
+    this.mouth.position.y = 0.20 + smile * 0.015;   // 0.20 = smile-arc build Y
   }
 
   // ── Accessory builders (TR3, issue #35) ────────────────────────────────────
