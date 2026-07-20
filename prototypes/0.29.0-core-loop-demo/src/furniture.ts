@@ -75,6 +75,9 @@ export type FurnitureKind =
   | "window-wall"
   | "cashier-atm"
   | "roulette-table"
+  | "casino-booth"
+  | "casino-gold-wall"
+  | "casino-orb-lamp"
   | "lazy-pool"
   | "hot-tub"
   | "bunk-bed"
@@ -859,6 +862,67 @@ const buildLampTable = ({ m, place, addLight }: BuildCtx) => {
     0,
   );
   addLight(new THREE.PointLight(0xffd080, 0, 7), 0, 1.1, 0, 1.0);
+};
+
+const buildCasinoBooth = ({ m, place }: BuildCtx) => {
+  const velvet = m(0x981f3f, 0.9, 0.01);
+  const velvetDark = m(0x4e0c20, 0.94, 0.01);
+  const gold = m(0xf2c258, 0.2, 0.82, 0x8a4808, 0.2);
+  place(new THREE.BoxGeometry(1.9, 0.28, 0.92), velvetDark, 0, 0.24, 0);
+  place(new THREE.BoxGeometry(1.9, 0.72, 0.24), velvetDark, 0, 0.73, -0.43);
+  for (const x of [-0.48, 0.48]) {
+    place(new THREE.BoxGeometry(0.82, 0.16, 0.72), velvet, x, 0.45, 0.03);
+    place(new THREE.BoxGeometry(0.78, 0.48, 0.16), velvet, x, 0.75, -0.31);
+    for (const bx of [-0.2, 0.2]) {
+      place(new THREE.SphereGeometry(0.035, 7, 6), gold, x + bx, 0.76, -0.22);
+    }
+  }
+  for (const x of [-0.96, 0.96]) {
+    place(new THREE.BoxGeometry(0.16, 0.52, 0.92), gold, x, 0.42, 0);
+    place(new THREE.BoxGeometry(0.24, 0.12, 1.0), gold, x, 0.7, 0);
+  }
+};
+
+const buildCasinoGoldWall = ({ m, place }: BuildCtx) => {
+  const gold = m(0xf1bd4f, 0.2, 0.84, 0x713607, 0.16);
+  const goldLight = m(0xffdc82, 0.16, 0.76, 0x9e540e, 0.22);
+  const lacquer = m(0x140d12, 0.18, 0.38);
+  const emerald = m(0x07563f, 0.3, 0.3, 0x063b2c, 0.14);
+  const crystal = m(0xffe8a8, 0.08, 0.12, 0xffc85a, 0.65);
+  place(new THREE.BoxGeometry(1.6, 2.85, 0.34), lacquer, 0, 1.425, 0);
+  place(new THREE.BoxGeometry(1.22, 2.35, 0.4), emerald, 0, 1.43, -0.01);
+  for (const y of [0.18, 1.42, 2.68]) {
+    place(new THREE.BoxGeometry(1.72, 0.12, 0.45), goldLight, 0, y, 0.02);
+  }
+  for (const x of [-0.68, 0.68]) {
+    place(new THREE.BoxGeometry(0.16, 2.65, 0.48), goldLight, x, 1.38, 0.03);
+  }
+  place(
+    new THREE.CylinderGeometry(0.44, 0.34, 0.25, 12),
+    goldLight,
+    0,
+    2.98,
+    0,
+  );
+  place(new THREE.OctahedronGeometry(0.34, 1), crystal, 0, 3.34, 0);
+  place(new THREE.TorusGeometry(0.48, 0.06, 8, 24), gold, 0, 3.34, 0);
+};
+
+const buildCasinoOrbLamp = ({ m, place, addLight }: BuildCtx) => {
+  const gold = m(0xf2c45d, 0.18, 0.84, 0x874507, 0.2);
+  const dark = m(0x1a0d14, 0.2, 0.42);
+  place(new THREE.BoxGeometry(0.58, 0.18, 0.58), gold, 0, 0.09, 0);
+  place(new THREE.BoxGeometry(0.42, 0.62, 0.42), dark, 0, 0.49, 0);
+  place(new THREE.CylinderGeometry(0.1, 0.13, 0.35, 9), gold, 0, 0.95, 0);
+  place(
+    new THREE.OctahedronGeometry(0.34, 1),
+    m(0xffe7a3, 0.08, 0.12, 0xffbd45, 1.0),
+    0,
+    1.28,
+    0,
+  );
+  place(new THREE.TorusGeometry(0.38, 0.035, 8, 24), gold, 0, 1.28, 0);
+  addLight(new THREE.PointLight(0xffc65a, 0, 6), 0, 1.35, 0, 1.8);
 };
 
 // Tall cherry blossom tree (no collision — footprint: null, documented drift).
@@ -1934,6 +1998,21 @@ const sofaFrontSeats: SeatTemplate[] = [
   },
 ];
 
+const casinoBoothSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -1, z0: -0.5, x1: 0, z1: 0.5 },
+    front: { x: -0.48, z: 1.0 },
+    sit: { x: -0.48, z: 0.03 },
+    faceAngle: 0,
+  },
+  {
+    clickBox: { x0: 0, z0: -0.5, x1: 1, z1: 0.5 },
+    front: { x: 0.48, z: 1.0 },
+    sit: { x: 0.48, z: 0.03 },
+    faceAngle: 0,
+  },
+];
+
 // 🛏️ Bunk-bed berth heights + templates — order matters: findSeatAt returns
 // the FIRST clickBox containing the floor click, so the TOP bunk's narrow
 // ladder-end strip is listed first and the bottom bunk sweeps up the rest of
@@ -2271,6 +2350,22 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     kind: "lamp-table",
     build: buildLampTable,
     footprint: { w: 1, d: 1 },
+  },
+  "casino-booth": {
+    kind: "casino-booth",
+    build: buildCasinoBooth,
+    footprint: { w: 2, d: 1 },
+    seats: casinoBoothSeats,
+  },
+  "casino-gold-wall": {
+    kind: "casino-gold-wall",
+    build: buildCasinoGoldWall,
+    footprint: null,
+  },
+  "casino-orb-lamp": {
+    kind: "casino-orb-lamp",
+    build: buildCasinoOrbLamp,
+    footprint: null,
   },
   "rug-back": { kind: "rug-back", build: buildRugBack, footprint: null },
   "rug-front": { kind: "rug-front", build: buildRugFront, footprint: null },
@@ -3325,6 +3420,49 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
     fleckGeo.rotateX(-Math.PI / 2);
     const fleck = place(fleckGeo, flat(0xffffff), sx, WATER_Y + 0.01, sz);
     (fleck.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.8;
+  }
+
+  // Buoy lines with little red flags meandering across the water (Habbo Lido
+  // marks its swim lanes with flagged buoy strings, not straight lane ropes).
+  for (const z of [-0.95, 1.05]) {
+    const rope = place(
+      new THREE.BoxGeometry(WX + HX - 0.4, 0.03, 0.03),
+      flat(0xf4fbff),
+      (HX - WX) / 2,
+      WATER_Y + 0.02,
+      z,
+    );
+    (rope.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.9;
+    let idx = 0;
+    for (let x = -4.8; x <= 3.0; x += 0.6) {
+      const c = idx % 2 === 0 ? 0xe04040 : 0xf6fafc;
+      const buoy = place(
+        new THREE.SphereGeometry(0.06, 8, 6),
+        m(c, 0.56, 0.04),
+        x,
+        WATER_Y + 0.03,
+        z,
+      );
+      buoy.scale.y = 0.6;
+      // 🚩 Every 5th buoy carries a red flag on a tiny mast.
+      if (idx % 5 === 0) {
+        place(
+          new THREE.CylinderGeometry(0.008, 0.008, 0.18, 4),
+          m(0xb9c4cc, 0.6, 0.2),
+          x,
+          WATER_Y + 0.12,
+          z,
+        );
+        place(
+          new THREE.BoxGeometry(0.1, 0.06, 0.012),
+          m(0xe03030, 0.8, 0.02),
+          x + 0.06,
+          WATER_Y + 0.17,
+          z,
+        );
+      }
+      idx++;
+    }
   }
 
   // ── Chrome ladders hooked over the deck edge into the water. ──
@@ -4574,16 +4712,12 @@ function buildCloneVat(ctx: BuildCtx) {
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
 // therefore sliding behaviour in multi-box corners) is unchanged.
 export const FURNITURE: FurnitureItem[] = [
-  // Movable since the floor-plan work (owner request): the hearth can slide
-  // aside to free the NORTH door — the door unblocks dynamically when the
-  // fireplace footprint clears its approach zone (world.updateNorthDoorForFireplace).
-  {
-    id: "fireplace-wall",
-    kind: "fireplace-wall",
-    pos: { x: 0.0, z: -5.5 },
-    rot: 0,
-    movable: true,
-  },
+  // (The default fireplace/bookcase wall was retired — owner request: the
+  //  north wall now carries the two paired doors and the glassy tile panel,
+  //  and the hearth unit covered them. The kind stays spawnable from the DEV
+  //  menu; world.updateNorthDoorForFireplace still gates north-wall doors if
+  //  one is placed in front of them. main.ts purges the retired default id
+  //  from already-seeded lobby docs on entry.)
   {
     id: "sofa-back",
     kind: "sofa-back",
@@ -4594,43 +4728,43 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "sofa-front",
     kind: "sofa-front",
-    pos: { x: 0.0, z: 3.5 },
+    pos: { x: 0.0, z: 2.6 },
     rot: 0,
     movable: true,
   },
   {
     id: "armchair-left-0",
     kind: "armchair-left",
-    pos: { x: -4.5, z: -3.5 },
+    pos: { x: -4.5, z: -0.75 },
     rot: 0,
     movable: true,
   },
   {
     id: "armchair-left-1",
     kind: "armchair-left",
-    pos: { x: -4.5, z: -1.5 },
+    pos: { x: -4.5, z: 0.75 },
     rot: 0,
     movable: true,
   },
   {
     id: "armchair-left-2",
     kind: "armchair-left",
-    pos: { x: -4.5, z: 0.5 },
-    rot: 0,
+    pos: { x: -2.0, z: 5.15 },
+    rot: 1,
     movable: true,
   },
   {
     id: "armchair-left-3",
     kind: "armchair-left",
-    pos: { x: -4.5, z: 2.5 },
-    rot: 0,
+    pos: { x: -0.7, z: 5.15 },
+    rot: 1,
     movable: true,
   },
   {
     id: "armchair-right-0",
     kind: "armchair-right",
-    pos: { x: 4.5, z: -3.5 },
-    rot: 0,
+    pos: { x: 0.6, z: 5.15 },
+    rot: 1,
     movable: true,
   },
   {
@@ -4657,7 +4791,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "coffee-table-back",
     kind: "coffee-table-back",
-    pos: { x: 0.0, z: -3.5 },
+    pos: { x: 0.0, z: -0.5 },
     rot: 0,
     movable: true,
   },
@@ -4684,21 +4818,21 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "lamp-table-back-left",
     kind: "lamp-table",
-    pos: { x: -4.5, z: -4.5 },
+    pos: { x: -1.6, z: -5.3 },
     rot: 0,
     movable: true,
   },
   {
     id: "lamp-table-back-right",
     kind: "lamp-table",
-    pos: { x: 4.5, z: -4.5 },
+    pos: { x: 1.6, z: -5.3 },
     rot: 0,
     movable: true,
   },
   {
     id: "lamp-table-front-left",
     kind: "lamp-table",
-    pos: { x: -4.5, z: 3.5 },
+    pos: { x: -5.05, z: 3.9 },
     rot: 0,
     movable: true,
   },
@@ -4725,7 +4859,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "map-table",
     kind: "map-table",
-    pos: { x: 2.0, z: -4.0 },
+    pos: { x: 0.0, z: -5.3 },
     rot: 0,
     movable: true,
   },
@@ -4754,14 +4888,14 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "cherry-tree-mid-left",
     kind: "cherry-tree",
-    pos: { x: -5.0, z: 3.0 },
+    pos: { x: -5.2, z: 0.9 },
     rot: 0,
     movable: true,
   }, // moved — bar occupies right-front corner
   {
     id: "cherry-tree-back-left",
     kind: "cherry-tree",
-    pos: { x: -4.9, z: -5.0 },
+    pos: { x: -5.3, z: -5.3 },
     rot: 0,
     movable: true,
   },
@@ -4775,14 +4909,14 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "blossom-pot-back-left",
     kind: "blossom-pot",
-    pos: { x: -4.3, z: -4.7 },
+    pos: { x: -1.15, z: -5.35 },
     rot: 0,
     movable: true,
   },
   {
     id: "blossom-pot-back-right",
     kind: "blossom-pot",
-    pos: { x: 4.3, z: -4.7 },
+    pos: { x: 1.15, z: -5.35 },
     rot: 0,
     movable: true,
   },
@@ -4822,7 +4956,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "storage-trunk",
     kind: "storage-trunk",
-    pos: { x: -2.5, z: -4.5 },
+    pos: { x: -4.0, z: 5.5 },
     rot: 0,
     movable: true,
   },
@@ -4858,7 +4992,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "bunk-bed",
     kind: "bunk-bed",
-    pos: { x: 3.5, z: -4.0 },
+    pos: { x: 4.9, z: -2.9 },
     rot: 1,
     movable: true,
   },
@@ -4872,7 +5006,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "clone-vat",
     kind: "clone-vat",
-    pos: { x: -3.5, z: -4.5 },
+    pos: { x: -4.7, z: -4.9 },
     rot: 0,
     movable: true,
   },
@@ -5111,10 +5245,215 @@ export const OUTDOOR_FURNITURE: FurnitureItem[] = [
 for (const item of OUTDOOR_FURNITURE) {
   if (item.footprintOverride) {
     DEFAULT_FOOTPRINT_OVERRIDES[item.id] = {
-      box: { ...item.footprintOverride }, x: item.pos.x, z: item.pos.z, rot: item.rot,
+      box: { ...item.footprintOverride },
+      x: item.pos.x,
+      z: item.pos.z,
+      rot: item.rot,
     };
   }
 }
+
+// ── Casino Room ─────────────────────────────────────────────────────────────
+
+/** Stable room ID for the casino connected to the lobby's east door. */
+export const CASINO_ROOM_ID = "ssf-casino-v1";
+
+/**
+ * Default casino floor. The four door approach lanes stay open, and every
+ * device front lands in a clear aisle so cashier and table focus navigation
+ * remain reachable from any entrance.
+ */
+export const CASINO_FURNITURE: FurnitureItem[] = [
+  {
+    id: "casino-cashier",
+    kind: "cashier-atm",
+    pos: { x: -4.5, z: -4.5 },
+    rot: 3,
+    movable: true,
+  },
+  {
+    id: "casino-cashier-south",
+    kind: "cashier-atm",
+    pos: { x: -4.5, z: 3.5 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-roulette-a",
+    kind: "roulette-table",
+    pos: { x: -1.5, z: -3 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-roulette-b",
+    kind: "roulette-table",
+    pos: { x: -1.5, z: -1 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-roulette-c",
+    kind: "roulette-table",
+    pos: { x: -1.5, z: 1 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-roulette-d",
+    kind: "roulette-table",
+    pos: { x: -1.5, z: 3 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-game-a",
+    kind: "game-table",
+    pos: { x: 1.5, z: -3 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-game-b",
+    kind: "game-table",
+    pos: { x: 1.5, z: -1 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-game-c",
+    kind: "game-table",
+    pos: { x: 1.5, z: 1 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-game-d",
+    kind: "game-table",
+    pos: { x: 1.5, z: 3 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-booth-w",
+    kind: "casino-booth",
+    pos: { x: -4.5, z: 0 },
+    rot: 1,
+    movable: true,
+  },
+  {
+    id: "casino-booth-e0",
+    kind: "casino-booth",
+    pos: { x: 4.5, z: -0.5 },
+    rot: 3,
+    movable: true,
+  },
+  {
+    id: "casino-booth-e1",
+    kind: "casino-booth",
+    pos: { x: 4.5, z: 2 },
+    rot: 3,
+    movable: true,
+  },
+  {
+    id: "casino-booth-s0",
+    kind: "casino-booth",
+    pos: { x: -3, z: 5 },
+    rot: 2,
+    movable: true,
+  },
+  {
+    id: "casino-booth-s1",
+    kind: "casino-booth",
+    pos: { x: 0, z: 5 },
+    rot: 2,
+    movable: true,
+  },
+  {
+    id: "casino-wall-n0",
+    kind: "casino-gold-wall",
+    pos: { x: -4.8, z: -5.78 },
+    rot: 0,
+    movable: false,
+  },
+  {
+    id: "casino-wall-n1",
+    kind: "casino-gold-wall",
+    pos: { x: 0, z: -5.78 },
+    rot: 0,
+    movable: false,
+  },
+  {
+    id: "casino-wall-n2",
+    kind: "casino-gold-wall",
+    pos: { x: 4.8, z: -5.78 },
+    rot: 0,
+    movable: false,
+  },
+  {
+    id: "casino-wall-w0",
+    kind: "casino-gold-wall",
+    pos: { x: -5.78, z: -4.8 },
+    rot: 1,
+    movable: false,
+  },
+  {
+    id: "casino-wall-w1",
+    kind: "casino-gold-wall",
+    pos: { x: -5.78, z: 0 },
+    rot: 1,
+    movable: false,
+  },
+  {
+    id: "casino-wall-w2",
+    kind: "casino-gold-wall",
+    pos: { x: -5.78, z: 4.8 },
+    rot: 1,
+    movable: false,
+  },
+  {
+    id: "casino-orb-0",
+    kind: "casino-orb-lamp",
+    pos: { x: -2.2, z: -2.2 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-orb-1",
+    kind: "casino-orb-lamp",
+    pos: { x: 2.2, z: -2.2 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-orb-2",
+    kind: "casino-orb-lamp",
+    pos: { x: -2.2, z: 2.6 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-orb-3",
+    kind: "casino-orb-lamp",
+    pos: { x: 2.2, z: 2.6 },
+    rot: 0,
+    movable: true,
+  },
+  {
+    id: "casino-terminal",
+    kind: "wall-computer",
+    pos: { x: 1.8, z: 5.97 },
+    rot: 2,
+    movable: false,
+  },
+];
+
+export const CASINO_RETIRED_FURNITURE_IDS = [
+  "casino-booth-n",
+  "casino-rug",
+  "casino-pot-nw",
+  "casino-pot-se",
+] as const;
 
 /**
  * 🏊 World-space swim rects of the first lazy-pool item, or null when the
@@ -5317,6 +5656,13 @@ function computeFront(
 
 // ── Visual construction ───────────────────────────────────────────────────────
 
+export function furnitureVisualYaw(item: FurnitureItem): number {
+  const casinoCashierOffset = item.id.startsWith("casino-cashier")
+    ? -Math.PI / 4
+    : 0;
+  return item.rot * (Math.PI / 2) + casinoCashierOffset;
+}
+
 /**
  * Build one furniture item as a THREE.Group positioned/rotated per the item.
  * Meshes start fully transparent (opacity 0) for the morph fade-in; point
@@ -5353,6 +5699,39 @@ export function buildItemGroup(item: FurnitureItem): THREE.Group {
   };
   const def = FURNITURE_DEFS[item.kind];
   def.build(ctx);
+  if (item.id.startsWith("casino-game-")) {
+    group.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      if (!(obj.material instanceof THREE.MeshStandardMaterial)) return;
+      const color = obj.material.color.getHex();
+      if (color !== WOOD && color !== DKWOOD && color !== 0xa06a32) return;
+      obj.material.color.setHex(color === DKWOOD ? 0x5e1025 : 0x180c12);
+      obj.material.metalness = 0.32;
+      obj.material.roughness = 0.2;
+    });
+    const top = group.getObjectByName("gameTableTop");
+    if (top) {
+      const trim = new THREE.MeshStandardMaterial({
+        color: 0xf0bd52,
+        emissive: 0x6f3406,
+        emissiveIntensity: 0.16,
+        metalness: 0.82,
+        roughness: 0.18,
+        transparent: true,
+        opacity: 0,
+      });
+      for (const [w, d, x, z] of [
+        [1.84, 0.035, 0, -0.44],
+        [1.84, 0.035, 0, 0.44],
+        [0.035, 0.88, -0.9, 0],
+        [0.035, 0.88, 0.9, 0],
+      ] as const) {
+        const rail = new THREE.Mesh(new THREE.BoxGeometry(w, 0.045, d), trim);
+        rail.position.set(x, 0.055, z);
+        top.add(rail);
+      }
+    }
+  }
   // Device items: tag every mesh so the main.ts raycast pass can route a
   // click anywhere on the prop into world.requestDeviceFocus(item.id).
   if (def.device) {
@@ -5365,6 +5744,6 @@ export function buildItemGroup(item: FurnitureItem): THREE.Group {
   }
   group.name = item.id;
   group.position.set(item.pos.x, 0, item.pos.z);
-  group.rotation.y = item.rot * (Math.PI / 2);
+  group.rotation.y = furnitureVisualYaw(item);
   return group;
 }

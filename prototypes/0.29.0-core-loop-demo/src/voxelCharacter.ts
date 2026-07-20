@@ -982,6 +982,20 @@ export class VoxelCharacter {
    * Advance the animation by one frame.
    * Call this inside your requestAnimationFrame / game-loop update.
    */
+  /** 🍹 Drink-hold override (waiter-bot serve): 0 = paw reaching forward at
+   *  waist height, 1 = raised to the muzzle; null = normal arm animation. */
+  private drinkHold: number | null = null;
+
+  public setDrinkHold(raise: number | null): void {
+    this.drinkHold = raise;
+  }
+
+  /** World position of the right paw (the drink rides in it while sipping). */
+  public getPawWorldPos(target: THREE.Vector3): THREE.Vector3 {
+    this.rightArm.updateWorldMatrix(true, false);
+    return this.rightArm.localToWorld(target.set(0, -0.6, 0));
+  }
+
   update(): void {
     // Clamp the frame delta: a backgrounded tab pauses rAF, so on resume
     // getDelta() returns SECONDS. lerp(a, b, t) with t > 1 EXTRAPOLATES past
@@ -1055,6 +1069,18 @@ export class VoxelCharacter {
       // Idle tail — slow gentle sway
       const idleSway = Math.sin(time * 1.5) * 0.12;
       this.tail.rotation.y = THREE.MathUtils.lerp(this.tail.rotation.y, idleSway, lerpSpeed);
+    }
+
+    // 🍹 Drink in the right paw (waiter-bot serve) — OVERRIDES the state arm
+    // pose: reaches forward to take the glass, curls up to the muzzle on each
+    // sip. Applied after the limb branch so every state converges to it.
+    if (this.drinkHold !== null) {
+      const target = -(0.9 + this.drinkHold * 1.3);
+      this.rightArm.rotation.x = THREE.MathUtils.lerp(
+        this.rightArm.rotation.x,
+        target,
+        Math.min(14 * delta, 1),
+      );
     }
 
     // Face expression — blink + smile. Asleep ⇒ eyes held fully closed (the

@@ -253,28 +253,28 @@ export class DoorDockingPortSystem {
     console.log("🚪 Constructing 4-Directional Docking Ports & Control Panels");
 
     // Configurations: [doorId, pos, rot]
-    const doorsConfig = (["north", "south", "west", "east"] as const).map(
-      (id) => {
-        const pose = physicalDoorPose(id);
-        return {
-          id,
-          pos: new THREE.Vector3(pose.x, 2, pose.z),
-          rotY: pose.frameYaw,
-          isLarge: id === "west" || id === "east",
-        };
-      },
-    );
+    const doorsConfig: Array<{ id: DoorId; isLarge: boolean }> = [
+      { id: "north", isLarge: false },
+      { id: "south", isLarge: false },
+      { id: "west", isLarge: true },
+      { id: "east", isLarge: true },
+    ];
 
     for (const cfg of doorsConfig) {
+      const pose = physicalDoorPose(cfg.id);
       const doorGroup = new THREE.Group();
-      doorGroup.position.copy(cfg.pos);
-      doorGroup.rotation.y = cfg.rotY;
+      doorGroup.position.set(pose.x, 2, pose.z);
+      doorGroup.rotation.y = pose.frameYaw;
 
       // Walkability comes from the door registry: the north port hides behind
       // the fireplace, so it gets NO click box and NO isDoorBody tags —
       // otherwise fireplace clicks would trigger it.
       const walkable = findDoor(cfg.id)?.enabled === true;
-      const bodyData = { isDoorBody: true, doorId: cfg.id };
+      const bodyData = {
+        isDoorBody: true,
+        doorId: cfg.id,
+        doorBodyCandidate: true,
+      };
 
       // Local geometry conventions: group centre sits at world y=2, so the
       // floor is local y=-2. Opening = 1.4w x 3.0h (small) / 2.4w x 3.0h (large).
@@ -298,7 +298,9 @@ export class DoorDockingPortSystem {
           FLOOR_Y + OPEN_H / 2,
           0,
         );
-        if (walkable) post.userData = { ...bodyData };
+        post.userData = walkable
+          ? { ...bodyData }
+          : { doorId: cfg.id, doorBodyCandidate: true };
         doorGroup.add(post);
       }
       const header = new THREE.Mesh(
@@ -306,7 +308,9 @@ export class DoorDockingPortSystem {
         frameMat,
       );
       header.position.set(0, FLOOR_Y + OPEN_H + 0.25, 0);
-      if (walkable) header.userData = { ...bodyData };
+      header.userData = walkable
+        ? { ...bodyData }
+        : { doorId: cfg.id, doorBodyCandidate: true };
       doorGroup.add(header);
 
       // ── 2. Emissive frame strips (status-tinted via syncLEDStatus) ─────────
@@ -409,11 +413,11 @@ export class DoorDockingPortSystem {
         kick.position.set(0, -OPEN_H / 2 + 0.2, 0.08);
         leaf.add(kick);
 
-        if (walkable) {
-          leaf.children.forEach((child) => {
-            child.userData = { ...bodyData };
-          });
-        }
+        leaf.children.forEach((child) => {
+          child.userData = walkable
+            ? { ...bodyData }
+            : { doorId: cfg.id, doorBodyCandidate: true };
+        });
         return leaf;
       };
 
@@ -443,16 +447,18 @@ export class DoorDockingPortSystem {
         doorGroup.add(guide);
       }
 
-      // ── 5. Invisible click box covering the doorway (walkable doors only) ──
-      if (walkable) {
-        const clickBox = new THREE.Mesh(
-          new THREE.BoxGeometry(openingWidth + 0.6, 3.4, 0.5),
-          new THREE.MeshBasicMaterial({ visible: false }),
-        );
-        clickBox.position.set(0, -0.3, 0);
-        clickBox.userData = { ...bodyData };
-        doorGroup.add(clickBox);
-      }
+      // ── 5. Invisible click box covering the doorway ───────────────────────
+      // Always built: a room theme may move a blocked logical door to a clear
+      // slot and enable it without rebuilding the whole platform.
+      const clickBox = new THREE.Mesh(
+        new THREE.BoxGeometry(openingWidth + 0.6, 3.4, 0.5),
+        new THREE.MeshBasicMaterial({ visible: false }),
+      );
+      clickBox.position.set(0, -0.3, 0);
+      clickBox.userData = walkable
+        ? { ...bodyData }
+        : { doorId: cfg.id, doorBodyCandidate: true };
+      doorGroup.add(clickBox);
 
       // We attach the isLarge metadata onto the group so our slider knows the correct target panning offsets
       doorGroup.userData = { isLarge: cfg.isLarge };
@@ -1884,6 +1890,11 @@ export class DoorDockingPortSystem {
     adjRoom.position.set(pose.x, 2, pose.z);
     adjRoom.rotation.y = pose.rotY;
     adjRoom.userData.poseKey = poseKey;
+    // 👻 Owner request: the grey boxes read as huge dark pillars looming over
+    // the room's open edges — keep the OBJECT (pairing/transit logic keys off
+    // adjacentRooms, and the pose still marks where the far room sits) but
+    // never render it.
+    adjRoom.visible = false;
 
     this.roomsGroup.add(adjRoom);
     this.adjacentRooms.set(doorId, adjRoom);
@@ -1978,6 +1989,16 @@ export class DoorDockingPortSystem {
       const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
       group.position.set(pose.x, 2, pose.z);
       group.rotation.y = pose.frameYaw;
+    }
+  }
+
+  public refreshDoorInteractivity(): void {
+    for (const [id, group] of this.doorObjects) {
+      const enabled = findDoor(id)?.enabled === true;
+      group.traverse((child) => {
+        if (child.userData.doorBodyCandidate !== true) return;
+        child.userData.isDoorBody = enabled;
+      });
     }
   }
 

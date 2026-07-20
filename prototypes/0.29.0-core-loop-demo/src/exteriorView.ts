@@ -27,13 +27,13 @@ import {
 } from "./exteriorDoc";
 import { readDoorPolicy } from "./doorPolicy";
 import { readDoorDeltas } from "./floorPlanDoc";
+import { physicalDoorPose } from "./doorLayout";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout } from "./stationAtlas";
 import { projectionPoseForDoor } from "./adapter";
-import { physicalDoorPose } from "./doorLayout";
 import type { DoorId } from "./doors";
 
 const HULL = 0x39445a;
@@ -221,12 +221,7 @@ function buildGroup(): THREE.Group {
   const slideDeltas = readDoorDeltas();
   for (const doorId of ["north", "south", "east", "west"] as const) {
     if (!readDoorPolicy(doorId).adapter) continue;
-    const door = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
-    const pose = {
-      x: door.x - Math.sin(door.outwardYaw) * 0.1,
-      z: door.z - Math.cos(door.outwardYaw) * 0.1,
-      ry: door.outwardYaw,
-    };
+    const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
     const collar = new THREE.Group();
     collar.name = `dockAdapter-${doorId}`;
     const softGoods = new THREE.MeshStandardMaterial({
@@ -310,7 +305,7 @@ function buildGroup(): THREE.Group {
       collar.add(strut);
     }
     collar.position.set(pose.x, 2.0, pose.z);
-    collar.rotation.y = pose.ry;
+    collar.rotation.y = pose.outwardYaw;
     // Push the collar outward along the wall normal so it hangs OFF the hull.
     collar.translateZ(0.85);
     g.add(collar);

@@ -193,12 +193,9 @@ export function buildVestibule(doorId: VestibuleDoorId): THREE.Group {
   //    outward door axis, so the vestibule spans the ~6→9 band. Floor at y=0.
   //    #66 S1: a slid door carries its vestibule anchor along the wall.
   {
-    const p = slidDoorPos(doorId);
+    const p = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
     group.position.set(p.x, 0, p.z);
-    group.rotation.y = physicalDoorPose(
-      doorId,
-      slideDeltas[doorId] ?? 0,
-    ).outwardYaw;
+    group.rotation.y = p.outwardYaw;
   }
 
   return group;
@@ -819,12 +816,6 @@ export function setDoorSlideDeltas(d: Record<VestibuleDoorId, number>): void {
   slideDeltas = { ...d };
 }
 
-/** A door's anchor point WITH its slide applied (n/s slide in x, e/w in z). */
-function slidDoorPos(doorId: VestibuleDoorId): { x: number; z: number } {
-  const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
-  return { x: pose.x, z: pose.z };
-}
-
 /**
  * Where (and at what rotation) the FAR room's gray-box projection sits for a
  * door connection — pure math, room-local coordinates (P3 replaces the
@@ -843,11 +834,12 @@ export function projectionPoseForDoor(
 ): { x: number; z: number; rotY: number } {
   const doorPose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
   const dYaw = doorPose.outwardYaw;
-  const dPos = slidDoorPos(doorId);
+  const dPos = doorPose;
   if (!segments || segments.length === 0) {
+    const distance = LEGACY_PROJECTION_OFFSET - 6;
     return {
-      x: dPos.x + Math.sin(dYaw) * LEGACY_PROJECTION_OFFSET,
-      z: dPos.z + Math.cos(dYaw) * LEGACY_PROJECTION_OFFSET,
+      x: dPos.x + Math.sin(dYaw) * distance,
+      z: dPos.z + Math.cos(dYaw) * distance,
       rotY: 0,
     };
   }
@@ -922,24 +914,9 @@ export function buildConnectorChain(
   group.add(exit);
 
   // Same wall-face placement as buildVestibule.
-  switch (doorId) {
-    case "north":
-      group.position.set(0, 0, -6);
-      group.rotation.y = Math.PI;
-      break;
-    case "south":
-      group.position.set(0, 0, 6);
-      group.rotation.y = 0;
-      break;
-    case "east":
-      group.position.set(6, 0, 0);
-      group.rotation.y = Math.PI / 2;
-      break;
-    case "west":
-      group.position.set(-6, 0, 0);
-      group.rotation.y = -Math.PI / 2;
-      break;
-  }
+  const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+  group.position.set(pose.x, 0, pose.z);
+  group.rotation.y = pose.outwardYaw;
   return group;
 }
 

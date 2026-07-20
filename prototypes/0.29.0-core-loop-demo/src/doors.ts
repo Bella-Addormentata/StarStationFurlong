@@ -17,9 +17,10 @@
  * Geometry matches the door groups placed by docking.ts buildPorts().
  */
 
-export type DoorId = "north" | "south" | "east" | "west";
-
 import { physicalDoorPose } from "./doorLayout";
+import type { PhysicalDoorId } from "./doorLayout";
+
+export type DoorId = PhysicalDoorId;
 
 export interface DoorTarget {
   id: DoorId;

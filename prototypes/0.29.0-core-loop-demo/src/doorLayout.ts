@@ -1,9 +1,12 @@
-import type { DoorId } from "./doors";
-
-export type DoorLayoutKind = "legacy" | "pool-pairs";
+export type PhysicalDoorId = "north" | "south" | "east" | "west";
+/** "casino-pairs" and "pool-pairs" are ALIASES of the same paired
+ *  arrangement (their pose tables were merged — they matched exactly):
+ *  logical SOUTH on the north wall, EAST on the west wall. Both names are
+ *  kept so each room's intent stays readable at the call site. */
+export type DoorLayoutKind = "legacy" | "casino-pairs" | "pool-pairs";
 
 export interface PhysicalDoorPose {
-  wall: DoorId;
+  wall: "north" | "south" | "east" | "west";
   x: number;
   z: number;
   outwardYaw: number;
@@ -14,7 +17,7 @@ export interface PhysicalDoorPose {
   tangent: "x" | "z";
 }
 
-const LEGACY: Record<DoorId, PhysicalDoorPose> = {
+const LEGACY: Record<PhysicalDoorId, PhysicalDoorPose> = {
   north: {
     wall: "north",
     x: 0,
@@ -61,9 +64,10 @@ const LEGACY: Record<DoorId, PhysicalDoorPose> = {
   },
 };
 
-// Keep the camera-near south and east edges clear while preserving stable
-// logical IDs for room documents and pairings.
-const POOL_PAIRS: Record<DoorId, PhysicalDoorPose> = {
+// Keep the camera-near south/east edges clear. Existing IDs remain stable for
+// room-doc pairings; only their physical slots change. Shared by the
+// "casino-pairs" AND "pool-pairs" layout kinds.
+const CASINO_PAIRS: Record<PhysicalDoorId, PhysicalDoorPose> = {
   north: {
     wall: "north",
     x: -2.7,
@@ -116,11 +120,16 @@ export function setActiveDoorLayout(layout: DoorLayoutKind): void {
   activeLayout = layout;
 }
 
+export function activeDoorLayout(): DoorLayoutKind {
+  return activeLayout;
+}
+
 export function physicalDoorPose(
-  id: DoorId,
+  id: PhysicalDoorId,
   lateralDelta = 0,
 ): PhysicalDoorPose {
-  const base = activeLayout === "pool-pairs" ? POOL_PAIRS[id] : LEGACY[id];
+  const source = activeLayout === "legacy" ? LEGACY : CASINO_PAIRS;
+  const base = source[id];
   const dx = base.tangent === "x" ? lateralDelta : 0;
   const dz = base.tangent === "z" ? lateralDelta : 0;
   return {
