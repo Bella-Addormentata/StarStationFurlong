@@ -99,6 +99,10 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     description:
       "PR #70's original — east dive tower, corner hot tub, terrace bench, sun loungers, parasol cafés.",
     items: [
+      // ☀️ Sun-lamp overhead so the deck reads as sunlit even when this pool is
+      // dropped into a windowless module (the live outdoor room keeps its own
+      // daylight sky, so it isn't in OUTDOOR_FURNITURE — only in this template).
+      { id: "pool-sun-lamp", kind: "sun-lamp", pos: { x: 0, z: 0 }, rot: 0, movable: true },
       { id: "pool-main", kind: "classic-pool", pos: { x: 0, z: 0 }, rot: 0, movable: false },
       { id: "pool-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
       { id: "otree-sw", kind: "cherry-tree", pos: { x: -4.5, z: 4.5 }, rot: 0, movable: true },
