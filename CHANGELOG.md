@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.39 — 2026-07-20
+
+### 🏗️ Provision a New Room From a Template (or Empty) at the Door Panel
+
+- **When you provision a new module at the docking panel, pick what it starts as.** A dropdown now offers **Empty Room · Grand Lobby · Luxury Casino · Infinity Pool Deck** above the ➕ PROVISION NEW MODULE button. The freshly-minted room is born furnished with that template (its doors already in the matching paired layout), so a new casino or pool is one click instead of arranging every piece.
+- **"Empty Room" is a real blank slate** — it seeds only the wall-computer (your in-world edit terminal), so the room is immediately editable and you build it up piece by piece with the furniture spawner. (This folds in the long-planned "new rooms start empty" idea as simply one of the choices.)
+- The registry is variant-keyed (`casino-1`, `pool-1`, …), so more designs per type — a `casino-2`, a `pool-2` with the hot tub in the middle — slot in and show up in the dropdown automatically.
+- Session note: the chosen template is remembered for the session; provisioning then entering the room seeds it. (Persisting the choice across a reload-before-first-entry is a small follow-up.)
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.39, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.38 — 2026-07-20
 
 ### 🏗️ Room Templates in the Dev Menu — one-click room presets

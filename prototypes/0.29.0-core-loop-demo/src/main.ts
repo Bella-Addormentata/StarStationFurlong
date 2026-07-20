@@ -55,6 +55,7 @@ import {
   writeFurnitureItem,
   deleteFurnitureItem,
 } from "./furnitureDoc";
+import { seedRoomTemplate } from "./roomTemplates";
 import {
   bindDoorsDoc,
   writeDoorPairing,
@@ -369,6 +370,12 @@ let sessionReturnRoute: {
  * Every other transit is a JOIN into someone else's room (false).
  */
 const mintedRoomIds = new Set<string>();
+/** 🏗️ Template chosen at the door panel when a module was provisioned this
+ *  session (roomId → template id). Read once at the new room's first claim to
+ *  seed its layout instead of the lobby default. Session-only for now — a
+ *  reload between provisioning and first entry falls back to the empty/lobby
+ *  seed (persisting the choice with the minted room is a follow-up). */
+const mintedRoomTemplates = new Map<string, string>();
 
 /** Staged room-list (issue #60): the passes manager is restored+warmed once,
  *  after the first join confirms the node is up. */
@@ -1224,9 +1231,20 @@ async function joinRoomAtEpoch(
   // it — an already-edited room comes back non-empty and is left untouched.
   if (claimRoomDefaults) {
     const seedEpoch = epoch;
+    // 🏗️ If this room was provisioned from a template at the door panel this
+    // session, remember which one — it seeds instead of the lobby default.
+    const provisionTemplateId = mintedRoomTemplates.get(boot.roomId);
     void sync.whenServerSynced.then(() => {
       if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
-      if (roomMap.get("owner") === getPlayerId() && furnitureDocSize() === 0) {
+      const ownsRoom = roomMap.get("owner") === getPlayerId();
+      // 🏗️ A module minted FROM A TEMPLATE is born with that template's
+      // furniture — seed it and skip the lobby default + migration + the
+      // outdoor-casino auto-pairing below (all lobby-specific).
+      if (provisionTemplateId && ownsRoom && furnitureDocSize() === 0) {
+        seedRoomTemplate(provisionTemplateId);
+        return;
+      }
+      if (ownsRoom && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }
       // 🧱 Retired default: the fireplace/bookcase wall no longer ships with
@@ -1966,7 +1984,9 @@ function wireAdapterTransit(): void {
   // in-flight swap falls through to the normal peek round-trip instead of
   // spawning a vestibule whose transit would silently early-return.
   world.isTransitBusy = () => transitInProgress;
-  const provisionModuleSeed = async (): Promise<string | null> => {
+  const provisionModuleSeed = async (
+    templateId = "empty",
+  ): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
     const roomId = `module-${Array.from(bytes)
@@ -1975,6 +1995,9 @@ function wireAdapterTransit(): void {
     const minted = await mintBootstrapLink(undefined, roomId);
     if (!minted.link) return null;
     mintedRoomIds.add(roomId);
+    // 🏗️ Remember the chosen room template so this module is born from it on
+    // first claim (see the claimRoomDefaults seed path).
+    mintedRoomTemplates.set(roomId, templateId);
     // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
     // than a clipboard that holds one) and powers auto-accept.
     addToLedger(roomId, minted.link);

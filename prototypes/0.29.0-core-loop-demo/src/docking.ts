@@ -13,6 +13,7 @@ import * as THREE from "three";
 import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
 import { physicalDoorPose } from "./doorLayout";
+import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
 import {
   projectionPoseForDoor,
@@ -171,7 +172,9 @@ export class DoorDockingPortSystem {
    * import main.ts). Resolves to the seed link, or null when the node is
    * unreachable.
    */
-  private provisionModuleCallback: (() => Promise<string | null>) | null = null;
+  private provisionModuleCallback:
+    | ((templateId: string) => Promise<string | null>)
+    | null = null;
 
   constructor(roomsGroup: THREE.Group) {
     this.roomsGroup = roomsGroup;
@@ -601,7 +604,11 @@ export class DoorDockingPortSystem {
         </div>
 
         <!-- "Buy a module" v0 (T1 of #30): mint a fresh room on the local node
-             and drop its seed into the address input, ready to pair. -->
+             and drop its seed into the address input, ready to pair. The new
+             room is born from the chosen template (🏗️ room-templates). -->
+        <select id="docking-provision-template" title="What the new room starts as" style="width:100%; margin-bottom:5px; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:5px 8px; font-size:10px; outline:none;">
+          ${ROOM_TEMPLATES.map((t) => `<option value="${t.id}">🏗️ NEW ROOM: ${t.name.toUpperCase()}</option>`).join("")}
+        </select>
         <button id="docking-provision-btn" style="width:100%; border-radius:6px; border:1px solid #d4a84b; background:rgba(212,168,75,0.12); color:#f0c060; padding:8px; font-weight:bold; cursor:pointer; text-transform:uppercase;">➕ PROVISION NEW MODULE</button>
 
         <button id="docking-request-btn" style="width:100%; border-radius:6px; border:1px solid #1e88e5; background:rgba(30,136,229,0.15); color:#90caf9; padding:8px; font-weight:bold; cursor:pointer; text-transform:uppercase;">INITIATE PORT PLUG PAIRING</button>
@@ -688,10 +695,14 @@ export class DoorDockingPortSystem {
           return;
         }
         const originalLabel = provisionBtn.textContent;
+        const templateSelect = document.getElementById(
+          "docking-provision-template",
+        ) as HTMLSelectElement | null;
+        const templateId = templateSelect?.value || "empty";
         provisionBtn.disabled = true;
         provisionBtn.textContent = "MINTING MODULE…";
         try {
-          const seed = await this.provisionModuleCallback();
+          const seed = await this.provisionModuleCallback(templateId);
           const addrInput = document.getElementById(
             "docking-addr-input",
           ) as HTMLInputElement | null;
@@ -2037,8 +2048,9 @@ export class DoorDockingPortSystem {
     this.ownerCheckCallback = cb;
   }
 
-  /** Wire the PROVISION NEW MODULE minting callback (see field docs). */
-  public onProvisionModule(cb: () => Promise<string | null>) {
+  /** Wire the PROVISION NEW MODULE minting callback (see field docs). The
+   *  chosen room template id (from the door-panel dropdown) is passed through. */
+  public onProvisionModule(cb: (templateId: string) => Promise<string | null>) {
     this.provisionModuleCallback = cb;
   }
 }
