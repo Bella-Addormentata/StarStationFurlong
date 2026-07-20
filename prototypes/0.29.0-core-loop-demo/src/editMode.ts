@@ -746,6 +746,7 @@ class RoomEditController {
     rebuildSeats();
     rebuildDevices();
     world.getPlayer().onObstaclesChanged(c.itemId);
+    world.refreshOutdoorFloor(); // 🏊 pool moved in/out → toggle the outdoor floor
 
     // E4 (issue #60): publish the new placement AFTER the local commit, so the
     // doc observer's reconcile finds local state already matching (self-echo
@@ -893,6 +894,7 @@ class RoomEditController {
     rebuildSeats();
     rebuildDevices();
     player.onObstaclesChanged(itemId);
+    world.refreshOutdoorFloor(); // 🏊 pool removed → restore the outdoor floor (no void)
 
     // E4 (issue #60): drop it from the shared layout AFTER the local removal,
     // so the doc observer's reconcile sees local state already matching (a

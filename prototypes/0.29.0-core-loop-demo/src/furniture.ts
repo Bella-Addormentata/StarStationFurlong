@@ -62,6 +62,8 @@ export type FurnitureKind =
   | 'window-wall'
   | 'cashier-atm'
   | 'roulette-table'
+  | 'lazy-pool'
+  | 'hot-tub'
   | 'bunk-bed'
   | 'clone-vat';
 
@@ -115,6 +117,14 @@ export interface SeatTemplate {
    * so faceAngle = the feet-ward axis of the berth.
    */
   lie?: boolean;
+  /** 🏊 true ⇒ the occupant renders the 'swim' pose (pool water seats). */
+  swim?: boolean;
+  /**
+   * 🏊‍♂️ true ⇒ this seat is a high-dive launch pad: clicking a swim seat of
+   * the SAME item while seated here triggers a parabolic dive instead of the
+   * usual stand-up-and-walk (see player.ts DIVE phase).
+   */
+  dive?: boolean;
 }
 
 /** Build-time helpers bound to the item's group (all coordinates local). */
@@ -1047,6 +1057,18 @@ const sofaFrontSeats: SeatTemplate[] = [
 // when the bed is tucked flush into a wall nook.
 export const BUNK_BOTTOM_Y = 0.32; // bottom mattress top surface (avatar root)
 export const BUNK_TOP_Y = 1.32;    // top mattress top surface (avatar root)
+
+// 🏊 Lido pool tuning — shared by the local dive phase (player.ts) and the
+// remote arc reconstruction (world.ts) so both ends replay the SAME trajectory
+// (the movement tick carries no y — see network/protocol.ts flag bits 4/5).
+// Habbo-Lido layout: the walkable deck (y=0) is a raised white-tile platform
+// and the water lies BELOW its edge. world.applyRoomVisuals hides the room's
+// solid floor plane in the outdoor room so the sunken water actually shows —
+// the lazy-pool item's deck slabs provide all visible flooring instead.
+export const POOL_WATER_Y  = -0.35; // water surface (splash spawn height)
+export const POOL_SWIM_Y   = -0.52; // avatar-root y while swimming (head above water)
+export const DIVE_TIME     = 0.9;   // seconds board-tip → water
+export const DIVE_ARC_LIFT = 0.55;  // parabola apex above the straight chord
 const bunkBedSeats: SeatTemplate[] = [
   { clickBox: { x0: -1.00, z0: -0.50, x1: -0.62, z1: 0.50 },
     front: { x: -1.5, z: 0 }, sit: { x: 0.05, z: 0 },
@@ -1054,6 +1076,93 @@ const bunkBedSeats: SeatTemplate[] = [
   { clickBox: { x0: -0.62, z0: -0.50, x1:  1.00, z1: 0.50 },
     front: { x: -1.5, z: 0 }, sit: { x: 0.05, z: 0 },
     faceAngle: -Math.PI / 2, sitY: BUNK_BOTTOM_Y, lie: true },
+];
+
+// ── 🏊 Pool seats — Habbo Hotel-style jump-in (lazy-pool) ───────────────────
+// Eight seats cover the full pool interior in a compass-rose layout.
+// sitY: POOL_SWIM_Y (-0.52) drops the avatar below the deck edge so only the
+// head bobs above the water plane (POOL_WATER_Y = -0.35) — Habbo Lido style.
+// The `front` points are in the 1.5 m walkable corridors around the 7×6
+// obstacle so A* can always reach them; `sit` positions are inside the pool
+// (non-walkable obstacle zone — the avatar teleports there after the walk).
+// All coordinates are in the LOCAL frame of the furniture item (pool at 0,0).
+const poolSeats: SeatTemplate[] = [
+  // 🏊‍♂️ DIVING BOARD seat — listed FIRST so it takes click priority near the tower.
+  // Player clicks tower/board area → walks to east corridor → avatar appears
+  // on the high-board tip, then can click pool water to jump in.
+  // clickBox covers the tower shaft/cabin faces AND the board's centre
+  // (x 2.6) — isDiveTower clicks route the clicked MESH's world x/z here.
+  { clickBox: { x0: 2.5, z0: -2.5, x1: 4.9, z1: -1.1 },
+    front: { x: 4.4, z: -1.75 }, sit: { x: 1.2, z: -1.75 },
+    faceAngle: -Math.PI / 2, sitY: 4.55, dive: true },
+  // ⛱️ Green lounger berths on the south deck — walk up and LIE DOWN (same
+  // lie machinery as the bunks; peers see the sleep pose via flags bit2).
+  // Head rests on the inclined backrest at the south (+z) end, so the
+  // feet-ward axis is north: faceAngle π. Listed BEFORE the water seats so
+  // clicks near a chair pick the chair, not a wade-in.
+  { clickBox: { x0: -4.4, z0: 4.0, x1: -3.2, z1: 5.2 },
+    front: { x: -3.8, z: 3.75 }, sit: { x: -3.8, z: 4.5 },
+    faceAngle: Math.PI, sitY: 0.36, lie: true },
+  { clickBox: { x0: -2.7, z0: 4.0, x1: -1.5, z1: 5.2 },
+    front: { x: -2.1, z: 3.75 }, sit: { x: -2.1, z: 4.5 },
+    faceAngle: Math.PI, sitY: 0.36, lie: true },
+  { clickBox: { x0: 1.1, z0: 4.0, x1: 2.3, z1: 5.2 },
+    front: { x: 1.7, z: 3.75 }, sit: { x: 1.7, z: 4.5 },
+    faceAngle: Math.PI, sitY: 0.36, lie: true },
+  { clickBox: { x0: 2.8, z0: 4.0, x1: 4.0, z1: 5.2 },
+    front: { x: 3.4, z: 3.75 }, sit: { x: 3.4, z: 4.5 },
+    faceAngle: Math.PI, sitY: 0.36, lie: true },
+  // East — avatar faces west toward island
+  { clickBox: { x0:  0.5, z0: -1.5, x1:  4.5, z1:  1.5 },
+    front: { x:  4.0, z:  0.0 }, sit: { x:  2.5, z:  0.0 },
+    faceAngle: -Math.PI / 2, sitY: POOL_SWIM_Y, swim: true },
+  // West — avatar faces east toward island
+  { clickBox: { x0: -4.5, z0: -1.5, x1: -0.5, z1:  1.5 },
+    front: { x: -4.0, z:  0.0 }, sit: { x: -2.5, z:  0.0 },
+    faceAngle:  Math.PI / 2, sitY: POOL_SWIM_Y, swim: true },
+  // South — avatar faces north toward island (pool is centered at z=0, south corridor z[3,5])
+  { clickBox: { x0: -1.5, z0:  0.5, x1:  1.5, z1:  4.5 },
+    front: { x:  0.0, z:  3.5 }, sit: { x:  0.0, z:  2.2 },
+    faceAngle:  Math.PI, sitY: POOL_SWIM_Y, swim: true },
+  // North — avatar faces south toward island (north corridor z[-5,-3])
+  { clickBox: { x0: -1.5, z0: -4.5, x1:  1.5, z1: -0.5 },
+    front: { x:  0.0, z: -3.5 }, sit: { x:  0.0, z: -2.2 },
+    faceAngle:  0,            sitY: POOL_SWIM_Y, swim: true },
+  // NE corner
+  { clickBox: { x0:  0.5, z0: -4.5, x1:  4.5, z1: -0.5 },
+    front: { x:  4.0, z: -3.5 }, sit: { x:  2.2, z: -2.2 },
+    faceAngle: -Math.PI * 3 / 4, sitY: POOL_SWIM_Y, swim: true },
+  // SE corner
+  { clickBox: { x0:  0.5, z0:  0.5, x1:  4.5, z1:  4.5 },
+    front: { x:  4.0, z:  3.5 }, sit: { x:  2.2, z:  2.2 },
+    faceAngle:  Math.PI * 3 / 4, sitY: POOL_SWIM_Y, swim: true },
+  // SW corner
+  { clickBox: { x0: -4.5, z0:  0.5, x1: -0.5, z1:  4.5 },
+    front: { x: -4.0, z:  3.5 }, sit: { x: -2.2, z:  2.2 },
+    faceAngle:  Math.PI / 4, sitY: POOL_SWIM_Y, swim: true },
+  // NW corner (front avoids hot-tub obstacle at world (-4,-4))
+  { clickBox: { x0: -4.5, z0: -4.5, x1: -0.5, z1: -0.5 },
+    front: { x: -4.0, z: -3.0 }, sit: { x: -2.2, z: -2.2 },
+    faceAngle: -Math.PI / 4, sitY: POOL_SWIM_Y, swim: true },
+];
+
+// ── 🛁 Hot-tub seats — soak together (hot-tub, 4 spots) ──────────────────────
+// sitY 0.28: chest above the waterline of the raised drum, legs hidden inside.
+// Fronts are just outside the 3×3 obstacle (blocked ones fall back to the
+// nearest walkable cell via computeFront); sit positions are inside the tub.
+const hotTubSeats: SeatTemplate[] = [
+  { clickBox: { x0:  0.0, z0: -1.5, x1:  1.5, z1:  1.5 },
+    front: { x:  1.85, z:  0.0 }, sit: { x:  0.62, z:  0.0 },
+    faceAngle: -Math.PI / 2, sitY: 0.28 },
+  { clickBox: { x0: -1.5, z0: -1.5, x1:  0.0, z1:  1.5 },
+    front: { x: -1.85, z:  0.0 }, sit: { x: -0.62, z:  0.0 },
+    faceAngle:  Math.PI / 2, sitY: 0.28 },
+  { clickBox: { x0: -1.5, z0:  0.0, x1:  1.5, z1:  1.5 },
+    front: { x:  0.0, z:  1.85 }, sit: { x:  0.0, z:  0.62 },
+    faceAngle:  Math.PI,       sitY: 0.28 },
+  { clickBox: { x0: -1.5, z0: -1.5, x1:  1.5, z1:  0.0 },
+    front: { x:  0.0, z: -1.85 }, sit: { x:  0.0, z: -0.62 },
+    faceAngle:  0,             sitY: 0.28 },
 ];
 
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
@@ -1171,6 +1280,22 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   // replace the built-in brick — see world.updateSideWallCoverage).
   'brick-wall': { kind: 'brick-wall', build: buildBrickWall, footprint: { w: 4, d: 1 } },
   'window-wall': { kind: 'window-wall', build: buildWindowWall, footprint: { w: 4, d: 1 } },
+  // ── 🏝️ Poolside leisure anchors for the outdoor casino zone. ──
+  // Interior leisure furniture (owner request: movable/removable like any
+  // piece). No `mount` — a 7×6 pool / 3×3 tub is not a hull fitting, so edit
+  // mode keeps them on the interior floor and never snaps them onto a wall.
+  'lazy-pool': {
+    kind: 'lazy-pool',
+    build: buildLazyPool,
+    footprint: { w: 7, d: 6 },
+    seats: poolSeats,
+  },
+  'hot-tub': {
+    kind: 'hot-tub',
+    build: buildHotTub,
+    footprint: { w: 3, d: 3 },
+    seats: hotTubSeats,
+  },
   // ── 🎰 Casino fixtures (#69 G1/G2) — device fronts face -z (helm idiom). ──
   'cashier-atm': {
     kind: 'cashier-atm',
@@ -1379,6 +1504,392 @@ function buildWindowWall({ m, place }: BuildCtx) {
   gm.opacity = 0.16;
   gm.side = THREE.DoubleSide;
   place(new THREE.BoxGeometry(4.06, 0.12, 0.36), m(0xB8C8D8, 0.75, 0.05), 0, 3.46, 0); // coping
+}
+
+// ── 🏝️ Outdoor leisure set — lazy pool + hot tub ────────────────────────────
+// These are poolside scene anchors for the outdoor casino zone. Both are
+// dual-mode mounts (`mount: 'both'`) so exterior-view rendering picks them up
+// whenever their item position sits outside the room walls.
+
+/** 🏊 White pool tile + blue-gray grout canvas (Habbo Lido idiom). The 64px
+ *  canvas holds a 2×2 tile cell; repeat is chosen so one tile ≈ 0.5 m —
+ *  i.e. pass the surface size in metres. */
+function makePoolTileTex(rx: number, ry: number, blue = false): THREE.CanvasTexture {
+  const cv = document.createElement('canvas');
+  cv.width = 64; cv.height = 64;
+  const c = cv.getContext('2d')!;
+  // 🧊 Calippo-Lido palette: soft powder-blue tile with WHITE grout on the
+  // walls; white checkerboard with a whisper of blue on the deck.
+  c.fillStyle = blue ? '#FFFFFF' : '#D9E8F2'; // grout
+  c.fillRect(0, 0, 64, 64);
+  const cols = blue
+    ? ['#A9CBE9', '#9FC4E5', '#B2D1EC', '#A4C8E7']   // pale sky-blue wall tile
+    : ['#FFFFFF', '#EDF5FB', '#FBFDFF', '#EFF6FB'];  // white/blue-white checker
+  const tiles: Array<[number, number, string]> = [
+    [0, 0, cols[0]], [32, 0, cols[1]], [0, 32, cols[3]], [32, 32, cols[2]],
+  ];
+  for (const [x, y, fill] of tiles) { c.fillStyle = fill; c.fillRect(x + 1, y + 1, 30, 30); }
+  const tex = new THREE.CanvasTexture(cv);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  // Repeat doubled: the canvas holds a 2×2 cell, so this reads as ~0.25 m
+  // tiles — the small, fine Habbo grid.
+  tex.repeat.set(rx * 2, ry * 2);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Tiled standard material wired for the morph fade-in (opacity 0 start). */
+function poolTileMat(rx: number, ry: number, blue = false): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
+    map: makePoolTileTex(rx, ry, blue), roughness: 0.86, metalness: 0.03,
+    transparent: true, opacity: 0, side: THREE.DoubleSide,
+  });
+}
+
+/** 🌊 Vertical gradient canvas — `stops` top→bottom. Used for the infinity
+ *  pool's depth-graded water and its dark overflow face. */
+function makeGradientTex(stops: string[], w = 4, h = 128): THREE.CanvasTexture {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  const c = cv.getContext('2d')!;
+  const g = c.createLinearGradient(0, 0, 0, h);
+  stops.forEach((s, i) => g.addColorStop(i / (stops.length - 1), s));
+  c.fillStyle = g;
+  c.fillRect(0, 0, w, h);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Unlit gradient material (fade-machinery wired, DoubleSide). */
+function gradientMat(stops: string[]): THREE.MeshBasicMaterial {
+  return new THREE.MeshBasicMaterial({
+    map: makeGradientTex(stops), transparent: true, opacity: 0, side: THREE.DoubleSide,
+  });
+}
+
+/** 🌊 Radial water disc material — smooth deep-centre → light-rim gradient
+ *  (stops[0] = centre). The continuous ramp is what reads as WATER, where
+ *  hard concentric rings read as paint. */
+function radialWaterMat(stops: string[]): THREE.MeshBasicMaterial {
+  const cv = document.createElement('canvas');
+  cv.width = 128; cv.height = 128;
+  const c = cv.getContext('2d')!;
+  const g = c.createRadialGradient(64, 64, 6, 64, 64, 64);
+  stops.forEach((s, i) => g.addColorStop(i / (stops.length - 1), s));
+  c.fillStyle = g;
+  c.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+}
+
+function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
+  // 🏊 Habbo-Lido look: a SUNKEN white-tiled basin cut into a white-tile deck,
+  // flat bright cyan water (near-opaque, so swimmers read as heads bobbing
+  // above the surface), chrome ladders, lane ropes, sparkles, entry steps.
+  const TILE    = 0xF3F9FB;  // white pool tile (plain faces)
+  const WATER_MID = 0x46AEBD; // submerged basin walls (visible through water)
+  const CHROME  = 0xD8E2E8;  // ladder metal
+  const SEAT_RED = 0xD8342E; // red terrace bench rows
+  const CHAIR_Y  = 0xF2C010; // yellow café chairs / parasol
+
+  // Water basin: x[-3.4,3.4] z[-2.9,2.9] — the hole just inside the 7×6
+  // footprint so the walkable corridors never overlap open water.
+  const HX = 3.4, HZ = 2.9;
+  const WATER_Y = -0.35;     // keep == POOL_WATER_Y
+  const EDGE_BOT = -0.95;    // tiled deck-edge wall reaches below the water
+
+  // 🌊 The water is ASYMMETRIC: it spans from the tiled east wall all the way
+  // WEST to the room edge (the west deck IS water), meeting TWO infinity
+  // edges — west and south — in an open L-shaped horizon corner.
+  const WX = 5.15;           // west waterline (near the room bound)
+
+  // ── Deck slabs: north + south full width, east only (no west deck).
+  place(new THREE.BoxGeometry(10.4, 0.12, 5.2 - HZ), poolTileMat(10.4, 5.2 - HZ), 0, 0.06, -(HZ + (5.2 - HZ) / 2));
+  place(new THREE.BoxGeometry(10.4, 0.12, 5.2 - HZ), poolTileMat(10.4, 5.2 - HZ), 0, 0.06,  (HZ + (5.2 - HZ) / 2));
+  place(new THREE.BoxGeometry(5.2 - HX, 0.12, HZ * 2), poolTileMat(5.2 - HX, HZ * 2),  (HX + (5.2 - HX) / 2), 0.06, 0);
+
+  // ── Deck-edge walls: tiled on north/east; gradient infinity faces on the
+  // south (weir) and WEST (open horizon into space).
+  const edgeH = 0.12 - EDGE_BOT;
+  const edgeY = (0.12 + EDGE_BOT) / 2;
+  const spanW = WX + HX;               // north/south edge length (west→east)
+  const spanC = (HX - WX) / 2;         // its centre x
+  place(new THREE.BoxGeometry(spanW, edgeH, 0.12), poolTileMat(spanW, edgeH), spanC, edgeY, -(HZ - 0.06));
+  place(new THREE.BoxGeometry(spanW, edgeH, 0.12), gradientMat(['#2A6E86', '#153B54', '#060E1C']), spanC, edgeY, (HZ - 0.06)); // 🌊 south weir
+  place(new THREE.BoxGeometry(0.12, edgeH, HZ * 2), gradientMat(['#2A6E86', '#153B54', '#060E1C']), -(WX - 0.06), edgeY, 0);  // 🌊 west horizon
+  place(new THREE.BoxGeometry(0.12, edgeH, HZ * 2), poolTileMat(HZ * 2, edgeH),  (HX - 0.06), edgeY, 0);
+  // White coping band on the DECK edges only (north + east) — both infinity
+  // edges stay bare so the waterline is the last thing you see.
+  place(new THREE.BoxGeometry(spanW + 0.3, 0.07, 0.4), m(0xFAFDFE, 0.8, 0.03), spanC, 0.155, -HZ);
+  place(new THREE.BoxGeometry(0.4, 0.07, HZ * 2), m(0xFAFDFE, 0.8, 0.03),  HX, 0.155, 0);
+
+  // ── Stepped deck peninsulas cutting into the basin — breaks the boring
+  // rectangle into the meandering Habbo pool outline. Full-height white-tile
+  // blocks inside the (unwalkable) footprint zone, purely visual.
+  const mkCut = (x0: number, z0: number, x1: number, z1: number) => {
+    const w = x1 - x0, d = z1 - z0;
+    place(new THREE.BoxGeometry(w, 0.12 - EDGE_BOT, d), poolTileMat(Math.max(w, d), 1.1),
+      (x0 + x1) / 2, (0.12 + EDGE_BOT) / 2, (z0 + z1) / 2);
+    place(new THREE.BoxGeometry(w + 0.16, 0.07, d + 0.16), m(0xFAFDFE, 0.8, 0.03),
+      (x0 + x1) / 2, 0.155, (z0 + z1) / 2);
+  };
+  mkCut(2.55, -2.9, 3.4, -2.05);   // NE corner peninsula
+
+  // ── Submerged basin lining: teal walls read through the water — the
+  // layered turquoise Habbo look. North + east only (infinity edges bare).
+  place(new THREE.BoxGeometry(WX + HX - 0.2, 0.65, 0.06), flat(WATER_MID), (HX - WX) / 2, -0.625, -(HZ - 0.15));
+  place(new THREE.BoxGeometry(0.06, 0.65, HZ * 2 - 0.1), flat(WATER_MID),  (HX - 0.15), -0.625, 0);
+
+  // Horizon tree line from the reference mood. (The old translucent sky
+  // panes are gone — the daylight scene backdrop does that job now, and
+  // they read as a stray glass panel over the hot tub.)
+  // (Tree line stops short of the NW corner — the hot tub lives there and
+  // must stay clear of planting.)
+  for (const x of [-1.4, 0.0, 1.4, 2.7, 4.0]) {
+    const treeA = place(new THREE.SphereGeometry(0.66, 10, 8), m(0x2C6A3A, 0.92, 0.02), x, 0.34, -3.98);
+    treeA.scale.set(1.0, 0.70, 0.55);
+    const treeB = place(new THREE.SphereGeometry(0.46, 8, 6), m(0x3F8A4A, 0.90, 0.02), x + 0.17, 0.46, -3.90);
+    treeB.scale.set(1.0, 0.68, 0.48);
+  }
+
+  // ── Basin floor (deep teal), then the depth-graded water: light at the
+  // deck side, sinking to deep ocean teal toward the infinity edges —
+  // the colour ramp is what sells the depth (unlit, pixel-art flat).
+  const tintGeo = new THREE.PlaneGeometry(WX + HX, HZ * 2);
+  tintGeo.rotateX(-Math.PI / 2);
+  const tint = place(tintGeo, flat(0x1C5A74), (HX - WX) / 2, EDGE_BOT + 0.01, 0);
+  (tint.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.95;
+
+  // Water extends flush OVER both infinity edges (south weir + west horizon).
+  const waterGeo = new THREE.PlaneGeometry(WX + HX + 0.02, HZ * 2 + 0.1);
+  waterGeo.rotateX(-Math.PI / 2);
+  const water = place(waterGeo, gradientMat(['#7CD8DF', '#3FA9BC', '#1F6E88']), (HX - WX) / 2 - 0.02, WATER_Y, 0.05);
+  (water.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.85;
+
+  // Sparkle flecks on the surface (fixed pseudo-random layout).
+  const sparkles: Array<[number, number]> = [
+    [-2.6, -1.9], [-1.3, -2.3], [0.4, -1.6], [1.9, -2.1], [2.8, -0.9],
+    [-2.9, 0.4], [-1.6, 1.2], [-0.2, 0.6], [1.1, 1.7], [2.4, 0.9],
+    [-2.1, 2.2], [-0.8, -0.6], [0.9, -0.2], [2.0, 2.3],
+    [-4.5, -1.8], [-4.1, 0.6], [-4.7, 1.9], [-3.8, -0.4], // west expanse
+  ];
+  for (const [sx, sz] of sparkles) {
+    const fleckGeo = new THREE.PlaneGeometry(0.09, 0.09);
+    fleckGeo.rotateX(-Math.PI / 2);
+    const fleck = place(fleckGeo, flat(0xFFFFFF), sx, WATER_Y + 0.01, sz);
+    (fleck.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.8;
+  }
+
+  // Buoy lines with little red flags meandering across the water (Habbo Lido
+  // marks its swim lanes with flagged buoy strings, not straight lane ropes).
+  for (const z of [-0.95, 1.05]) {
+    const rope = place(new THREE.BoxGeometry(WX + HX - 0.4, 0.03, 0.03), flat(0xF4FBFF), (HX - WX) / 2, WATER_Y + 0.02, z);
+    (rope.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.9;
+    let idx = 0;
+    for (let x = -4.8; x <= 3.0; x += 0.6) {
+      const c = (idx % 2 === 0) ? 0xE04040 : 0xF6FAFC;
+      const buoy = place(new THREE.SphereGeometry(0.06, 8, 6), m(c, 0.56, 0.04), x, WATER_Y + 0.03, z);
+      buoy.scale.y = 0.6;
+      // 🚩 Every 5th buoy carries a red flag on a tiny mast.
+      if (idx % 5 === 0) {
+        place(new THREE.CylinderGeometry(0.008, 0.008, 0.18, 4), m(0xB9C4CC, 0.6, 0.2), x, WATER_Y + 0.12, z);
+        place(new THREE.BoxGeometry(0.1, 0.06, 0.012), m(0xE03030, 0.8, 0.02), x + 0.06, WATER_Y + 0.17, z);
+      }
+      idx++;
+    }
+  }
+
+  // ── Chrome ladders hooked over the deck edge into the water. ──
+  const chrome = () => m(CHROME, 0.35, 0.65);
+  const mkLadder = (side: 1 | -1, lz: number) => {
+    for (const dz of [-0.18, 0.18]) {
+      // Rail dropping from deck level into the water, hugging the edge wall.
+      place(new THREE.CylinderGeometry(0.032, 0.032, 1.0, 8), chrome(), side * (HX - 0.14), -0.28, lz + dz);
+      // Hook over the coping onto the deck.
+      const hook = place(new THREE.CylinderGeometry(0.03, 0.03, 0.36, 8), chrome(), side * (HX + 0.02), 0.24, lz + dz);
+      hook.rotation.z = Math.PI / 2;
+      place(new THREE.CylinderGeometry(0.03, 0.03, 0.24, 8), chrome(), side * (HX + 0.18), 0.14, lz + dz);
+    }
+    for (const ry of [0.0, -0.3, -0.6]) {
+      const rung = place(new THREE.CylinderGeometry(0.022, 0.022, 0.4, 8), chrome(), side * (HX - 0.14), ry, lz);
+      rung.rotation.x = Math.PI / 2;
+    }
+  };
+  mkLadder(1, -1.6); // east rim only — the west edge is open water horizon
+
+  // ── Tiled steps descending from the deck into the SE corner of the water. ──
+  place(new THREE.BoxGeometry(1.1, 0.16, 0.36), m(TILE, 0.8, 0.03), 2.5, 0.0, 2.62);
+  place(new THREE.BoxGeometry(1.1, 0.16, 0.36), m(TILE, 0.8, 0.03), 2.5, -0.2, 2.30);
+  place(new THREE.BoxGeometry(1.1, 0.16, 0.36), m(TILE, 0.8, 0.03), 2.5, -0.4, 1.98);
+
+  // ── Matching white steps on the NORTH edge — pool water up toward the hot
+  // tub (mirror of the SE entry steps, same build).
+  place(new THREE.BoxGeometry(1.1, 0.16, 0.36), m(TILE, 0.8, 0.03), -3.7, 0.0, -2.62);
+  place(new THREE.BoxGeometry(1.1, 0.16, 0.36), m(TILE, 0.8, 0.03), -3.7, -0.2, -2.30);
+  place(new THREE.BoxGeometry(1.1, 0.16, 0.36), m(TILE, 0.8, 0.03), -3.7, -0.4, -1.98);
+
+  // ── Red terrace bench rows (Habbo Lido's cinema-style seating). ──
+  // Long axis along x, backrest on the north side.
+  const mkRedBenchX = (bx: number, bz: number) => {
+    place(new THREE.BoxGeometry(1.5, 0.26, 0.42), m(SEAT_RED, 0.8, 0.03), bx, 0.25, bz);
+    place(new THREE.BoxGeometry(1.5, 0.5, 0.1), m(0xA82420, 0.8, 0.03), bx, 0.5, bz - 0.24);
+  };
+  // (West deck is water now — the terrace row lives on the north deck.)
+  mkRedBenchX(-0.5, -4.8);
+
+  // ── ⛱️ Calippo-lime green sun loungers, two flanking each side of the
+  // south door (the door approach at x≈0 stays clear). Larger build.
+  const mkLounger = (bx: number, bz: number) => {
+    const GRN = 0x6FC72E, GRN_D = 0x53A81E, F = 0xB9CAD6;
+    // low frame feet
+    place(new THREE.BoxGeometry(0.64, 0.18, 0.12), m(F, 0.7, 0.1), bx, 0.09, bz - 0.78);
+    place(new THREE.BoxGeometry(0.64, 0.18, 0.12), m(F, 0.7, 0.1), bx, 0.09, bz + 0.72);
+    // solid green bed with slat grooves (darker green seams)
+    place(new THREE.BoxGeometry(0.72, 0.11, 1.7), m(GRN, 0.75, 0.04), bx, 0.24, bz);
+    for (let i = 1; i < 5; i++) {
+      place(new THREE.BoxGeometry(0.73, 0.02, 0.04), m(GRN_D, 0.8, 0.03), bx, 0.3, bz - 0.85 + i * 0.34);
+    }
+    // inclined backrest
+    const back = place(new THREE.BoxGeometry(0.72, 0.08, 0.8), m(GRN, 0.75, 0.04), bx, 0.46, bz + 0.62);
+    back.rotation.x = -0.55;
+  };
+  mkLounger(-3.8, 4.6);
+  mkLounger(-2.1, 4.6);
+  mkLounger(1.7, 4.6);
+  mkLounger(3.4, 4.6);
+
+  // ── Parasol café sets — red AND yellow canopies, round table + chairs. ──
+  const mkParasolSet = (px: number, pz: number, canopy: number) => {
+    place(new THREE.CylinderGeometry(0.045, 0.045, 1.9, 8), m(0xE8EDF0, 0.6, 0.2), px, 0.95, pz);
+    place(new THREE.ConeGeometry(0.85, 0.5, 8), m(canopy, 0.8, 0.02), px, 2.1, pz);
+    place(new THREE.SphereGeometry(0.06, 8, 6), m(0xF6FAFC, 0.7, 0.1), px, 2.4, pz);
+    place(new THREE.CylinderGeometry(0.3, 0.3, 0.05, 12), m(0xF6FAFC, 0.8, 0.04), px, 0.5, pz);
+    place(new THREE.CylinderGeometry(0.04, 0.04, 0.5, 8), m(0xB9C4CC, 0.6, 0.2), px, 0.25, pz);
+    place(new THREE.BoxGeometry(0.34, 0.3, 0.34), m(CHAIR_Y, 0.75, 0.04), px - 0.55, 0.15, pz + 0.2);
+    place(new THREE.BoxGeometry(0.34, 0.3, 0.34), m(CHAIR_Y, 0.75, 0.04), px + 0.55, 0.15, pz - 0.2);
+  };
+  mkParasolSet(4.45, -3.6, 0xF2C010); // yellow/white — NE deck corner
+  mkParasolSet(4.45, 1.3, 0xE04A3F);  // red/white
+  mkParasolSet(4.45, 3.9, 0xE04A3F);  // red/white
+
+  // ── Pale-blue tile inlay winding across the north-west deck (the wet-path
+  // motif on the Habbo Lido deck).
+  for (const [ix, iz] of [[-3.2, -3.6], [-2.7, -3.35], [-2.2, -3.6], [-1.7, -3.85], [-1.2, -3.6], [-0.7, -3.35]] as Array<[number, number]>) {
+    const patch = place(new THREE.BoxGeometry(0.5, 0.015, 0.5), flat(0xBFE4F0), ix, 0.127, iz);
+    (patch.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.9;
+  }
+
+  // ── High dive tower — Lido style: blue-tiled shaft + brown spire roof. ──
+  const towerX = 4.05;
+  const towerZ = -1.75;
+  const SPIRE = 0x7A4A26;    // brown spire roof
+  // 🏊‍♂️ Shaft + cabin carry isDiveTower: the main.ts raycast routes clicks
+  // on them to the floor point under the hit, which lands inside the dive
+  // seat's clickBox — the tall tower is the click target, not the tiny (and
+  // often door-glass-occluded) patch of deck at its base.
+  const shaft = place(new THREE.BoxGeometry(1.00, 5.20, 1.00), poolTileMat(1, 5.2, true), towerX, 2.60, towerZ);
+  shaft.userData.isDiveTower = true;
+  // Top cabin + pyramid spire (rotated 45° so the cone's 4 faces read square).
+  const cabin = place(new THREE.BoxGeometry(1.20, 0.76, 1.06), poolTileMat(1.2, 0.76, true), towerX, 4.62, towerZ);
+  cabin.userData.isDiveTower = true;
+  const spire = place(new THREE.ConeGeometry(0.85, 0.95, 4), m(SPIRE, 0.7, 0.06), towerX, 5.5, towerZ);
+  spire.rotation.y = Math.PI / 4;
+
+  // Main board over pool ("El trampolín") — wide white plank, clickable:
+  // isDiveTower routes a click on the board itself onto the board seat.
+  const board = place(new THREE.BoxGeometry(2.90, 0.08, 0.60), m(0xF6FAFC, 0.7, 0.04), towerX - 1.45, 4.55, towerZ);
+  board.userData.isDiveTower = true;
+  const boardUnder = place(new THREE.BoxGeometry(2.90, 0.03, 0.60), m(0xC9D6DD, 0.76, 0.04), towerX - 1.45, 4.49, towerZ);
+  boardUnder.userData.isDiveTower = true;
+  place(new THREE.CylinderGeometry(0.05, 0.05, 1.00, 6), m(0x6D8998, 0.56, 0.24), 2.45, 3.95, towerZ);
+  place(new THREE.CylinderGeometry(0.05, 0.05, 1.00, 6), m(0x6D8998, 0.56, 0.24), 1.75, 3.95, towerZ);
+
+  // Secondary small tower at far-right edge, same Lido dressing.
+  place(new THREE.BoxGeometry(0.82, 2.90, 0.82), poolTileMat(0.82, 2.9, true), 4.80, 1.45, -1.18);
+  const spire2 = place(new THREE.ConeGeometry(0.62, 0.7, 4), m(SPIRE, 0.7, 0.06), 4.80, 3.25, -1.18);
+  spire2.rotation.y = Math.PI / 4;
+
+  // Gentle volume lights — underwater cyan glow + tree-line/tower fill.
+  addLight(new THREE.PointLight(0x56CEFF, 0, 11.0), 0.0, -0.85, 0, 13.0);
+  addLight(new THREE.PointLight(0x2BA8E2, 0, 6.5), -2.6, -0.85, 0.2, 6.4);
+  addLight(new THREE.PointLight(0x2BA8E2, 0, 6.5), 2.6, -0.85, 0.2, 6.4);
+  addLight(new THREE.PointLight(0xB7E7FF, 0, 7.2), 0.0, 1.55, -3.98, 4.8);
+  addLight(new THREE.PointLight(0xA8E5FF, 0, 4.2), towerX, 3.20, towerZ, 3.8);
+}
+
+function buildHotTub({ m, flat, place, addLight }: BuildCtx) {
+  // ♨️ Calippo-Lido spa, SCULPTED for depth: stepped white-tile pedestal
+  // tiers lift a taller drum off the deck, a dark shadow ring reads as the
+  // basin dropping away under the rim, and the water is concentric unlit
+  // discs stepping light rim → deep centre. Clean silhouette — no rocks,
+  // no planting, nothing on the rim (foxes sit IN it).
+  const TRIM = 0xFAFDFE, GLOW = 0x69CEFF;
+
+  // Stepped pedestal + drum — clad in the SAME pale-blue tile as the dive
+  // tower (poolTileMat blue variant; repeat ≈ circumference × height).
+  place(new THREE.CylinderGeometry(1.7, 1.7, 0.14, 36), poolTileMat(10.7, 0.3, true), 0, 0.07, 0);
+  place(new THREE.CylinderGeometry(1.55, 1.55, 0.46, 36), poolTileMat(9.7, 0.46, true), 0, 0.35, 0);
+  // White cap ring.
+  const capRing = place(new THREE.TorusGeometry(1.36, 0.1, 8, 36), m(TRIM, 0.7, 0.08), 0, 0.62, 0);
+  capRing.rotation.x = Math.PI / 2;
+
+  // Dark shadow disc just under the waterline — the basin falling away.
+  const shadow = place(new THREE.CylinderGeometry(1.3, 1.3, 0.012, 36), flat(0x0F4A60), 0, 0.552, 0);
+  (shadow.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.92;
+
+  // 🌊 Water: ONE smooth radial-gradient disc — deep centre melting to a
+  // light rim, the same colour stops as the main pool's water. Continuous
+  // like real water, no ring banding.
+  const water = place(new THREE.CylinderGeometry(1.28, 1.28, 0.014, 36),
+    radialWaterMat(['#1F6E88', '#3FA9BC', '#7CD8DF']), 0, 0.565, 0);
+  (water.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.94;
+  // ♨️ CHURN — what makes it read "hot tub" and not "pond": a boiling mound
+  // at the centre, scattered surface bubbles, and white jet swirls where the
+  // nozzles churn the wall. All sit ON the layered water.
+  const boil = place(new THREE.SphereGeometry(0.22, 12, 8), m(0xF2FBFD, 0.9, 0.0), 0, 0.585, 0);
+  boil.scale.y = 0.32;
+  (boil.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.85;
+  const bubbles: Array<[number, number, number]> = [
+    [0.44, 0.13, 0.055], [-0.38, 0.31, 0.045], [0.19, -0.5, 0.055], [-0.56, -0.25, 0.045],
+    [0.69, -0.19, 0.04], [-0.19, 0.63, 0.05], [0.5, 0.5, 0.04], [-0.69, 0.44, 0.045],
+    [0.1, 0.28, 0.035], [-0.31, -0.65, 0.04], [0.85, 0.25, 0.04], [-0.8, -0.5, 0.035],
+  ];
+  for (const [bx, bz, br] of bubbles) {
+    const bub = place(new THREE.SphereGeometry(br, 8, 6), m(0xF6FDFF, 0.85, 0.0), bx, 0.59, bz);
+    bub.scale.y = 0.4;
+    (bub.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.8;
+  }
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2 + 0.3;
+    const swirl = place(new THREE.SphereGeometry(0.12, 8, 6), m(0xEFFCFF, 0.85, 0.0),
+      Math.cos(a) * 1.02, 0.585, Math.sin(a) * 1.02);
+    swirl.scale.set(1.2, 0.28, 0.6);
+    swirl.rotation.y = -a;
+    (swirl.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.75;
+  }
+
+  // Foam ring hugging the rim + cyan LED line beneath the cap.
+  const foam = place(new THREE.TorusGeometry(1.16, 0.04, 6, 36), flat(0xEFFCFF), 0, 0.575, 0);
+  foam.rotation.x = Math.PI / 2;
+  (foam.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.85;
+  const rim = place(new THREE.TorusGeometry(1.46, 0.04, 6, 36), flat(GLOW), 0, 0.5, 0);
+  rim.rotation.x = Math.PI / 2;
+  (rim.material as THREE.MeshBasicMaterial).userData.baseOpacity = 0.92;
+
+  // Steam wisps drifting over the water.
+  for (const [sx, sy, sz, sc] of [[-0.22, 0.87, -0.1, 0.11], [0.18, 0.93, 0.15, 0.1], [0.06, 0.83, -0.22, 0.09]] as [number, number, number, number][]) {
+    const puff = place(new THREE.SphereGeometry(sc, 10, 8), m(0xEAF5FB, 0.9, 0.0), sx, sy, sz);
+    (puff.material as THREE.MeshStandardMaterial).userData.baseOpacity = 0.32;
+  }
+
+  // Underwater LED glow + soft edge fill.
+  addLight(new THREE.PointLight(0x69CEFF, 0, 3.6), 0, 0.5, 0, 3.2);
+  addLight(new THREE.PointLight(0xCFE8F4, 0, 1.8), 1.1, 0.65, -0.55, 0.7);
 }
 
 // ── 🎰 Casino fixtures (#69 G1/G2) — cashier ATM + roulette table ────────────
@@ -2052,6 +2563,97 @@ export function snapItemPos(
 // validateExteriorPlacement, door lanes, stacking) moved to hull.ts — the
 // one authority for hull space shared with doors and vestibule chains.
 
+// ── 🏝️ Outdoor Casino Pool Room ───────────────────────────────────────────────
+// A separate room connected to the lobby's south door. Identified by a
+// deterministic room ID; the seed is a raw base64 bootstrap JSON written by
+// main.ts at runtime (incorporates the current node's WT URL + cert hash so
+// it's always routable). Furniture is seeded on first visit from OUTDOOR_FURNITURE.
+
+/** Stable room ID for the outdoor pool-casino room. */
+export const OUTDOOR_CASINO_ROOM_ID = 'ssf-outdoor-casino-pool-v1';
+
+/**
+ * Default furniture layout for the outdoor pool-casino room.
+ *
+ * Positions are chosen to avoid the wedge-trap rule (every sub-1.5 m gap
+ * between items or items-and-wall is a dead-end nook, never a through-route).
+ * Obstacle AABBs at rot 0 (extents: x±w/2, z±d/2):
+ *   lazy-pool  (0, 1.5) 4×3 → x[-2, 2] z[0, 3]
+ *   hot-tub    (-3,-2)  2×2 → x[-4,-2] z[-3,-1]
+ *   cashier    (3.5,-0.5) 1×1 → x[3, 4] z[-1, 0]
+ *   roulette   (3,-3.5) 2×1 → x[2, 4] z[-4,-3]
+ * Cherry trees and blossom pots have null footprints — never obstacles.
+ */
+export const OUTDOOR_FURNITURE: FurnitureItem[] = [
+  // Large lazy pool — the water spans the room's WEST HALF up to the west
+  // infinity edge (no west corridor), so the obstacle override covers
+  // x[-5.4,3.5] instead of the symmetric 7×6 footprint. Walk routes go
+  // north/east/south; the west door drops arrivals straight into the water
+  // (auto-swim catches them).
+  { id: 'pool-main',    kind: 'lazy-pool',       pos: { x:  0,   z:  0   }, rot: 0, movable: true,
+    footprintOverride: { x0: -5.4, z0: -3, x1: 3.5, z1: 3 } },
+  // Hot tub in the NW corner (nudged inward — the enlarged drum would
+  // otherwise overhang the deck edge)
+  { id: 'pool-hot-tub', kind: 'hot-tub',         pos: { x: -3.7, z: -3.7 }, rot: 0, movable: true },
+  // (Casino fixtures moved back to the lobby — the pool room is pure leisure.
+  //  main.ts deletes the old pool-cashier / pool-roulette doc entries on entry.)
+  // Cherry trees at south corners (null footprint — walkable edge décor)
+  { id: 'otree-sw',     kind: 'cherry-tree',     pos: { x: -4.5, z:  4.5 }, rot: 0, movable: true },
+  { id: 'otree-se',     kind: 'cherry-tree',     pos: { x:  4.5, z:  4.5 }, rot: 0, movable: true },
+  // Blossom pots — kept clear of the hot tub corner (nothing pink near the spa)
+  { id: 'opot-1',       kind: 'blossom-pot',     pos: { x:  2.55, z: 4.75 }, rot: 0, movable: true },
+  // (moved off the south deck — the lounger row lives there now)
+  { id: 'opot-2',       kind: 'blossom-pot',     pos: { x:  4.6, z:  2.6 }, rot: 0, movable: true },
+];
+
+// The pool's hand-authored asymmetric obstacle (its water reaches the west
+// room edge) lives in OUTDOOR_FURNITURE, which the DEFAULT_FOOTPRINT_OVERRIDES
+// capture loop above never iterated — so the override was silently dropped on
+// every doc round-trip (the walkable grid used the symmetric derived 7×6).
+// Register outdoor overrides too, so the authored obstacle applies at the
+// default pose and is restored after a move-back / cross-room round-trip
+// (same restore-at-default contract the bar relies on). Placed AFTER
+// OUTDOOR_FURNITURE's declaration — a TDZ const, can't be read in the loop above.
+for (const item of OUTDOOR_FURNITURE) {
+  if (item.footprintOverride) {
+    DEFAULT_FOOTPRINT_OVERRIDES[item.id] = {
+      box: { ...item.footprintOverride }, x: item.pos.x, z: item.pos.z, rot: item.rot,
+    };
+  }
+}
+
+/**
+ * 🏊 World-space swim rects of the first lazy-pool item, or null when the
+ * room has none. `basin` = the water the avatar may swim in (inset from the
+ * tiled edge walls — see buildLazyPool HX/HZ); `exit` = the walkable corridor
+ * line just OUTSIDE the 7×6 footprint, where a climb-out lands.
+ */
+export function getPoolBasin(
+  items: FurnitureItem[],
+): { x0: number; z0: number; x1: number; z1: number; exit: { x0: number; z0: number; x1: number; z1: number } } | null {
+  for (const item of items) {
+    if (item.kind !== 'lazy-pool') continue;
+    // ASYMMETRIC water: local -x reaches the west infinity edge (the west
+    // deck IS water — see buildLazyPool WX). Corners rotate with the item.
+    // Margin keeps the avatar's bulk off walls/edges; a "west" climb-out
+    // lands back inside the basin and the auto-swim converts it — by design
+    // (there is no deck out there, only horizon).
+    const a = rotXZ(-4.8, -2.55, item.rot);   // west/deep corner (WX - margin)
+    const b = rotXZ(3.05, 2.55, item.rot);    // east corner (HX - margin)
+    const e1 = rotXZ(-4.6, -3.25, item.rot);  // exits: corridor cell centres
+    const e2 = rotXZ(3.75, 3.25, item.rot);
+    return {
+      x0: item.pos.x + Math.min(a.x, b.x), z0: item.pos.z + Math.min(a.z, b.z),
+      x1: item.pos.x + Math.max(a.x, b.x), z1: item.pos.z + Math.max(a.z, b.z),
+      exit: {
+        x0: item.pos.x + Math.min(e1.x, e2.x), z0: item.pos.z + Math.min(e1.z, e2.z),
+        x1: item.pos.x + Math.max(e1.x, e2.x), z1: item.pos.z + Math.max(e1.z, e2.z),
+      },
+    };
+  }
+  return null;
+}
+
 /** Derive the collision obstacle list (order = FURNITURE order). */
 export function buildObstacleList(items: FurnitureItem[]): Box[] {
   const boxes: Box[] = [];
@@ -2093,6 +2695,8 @@ export function buildSeatList(
         faceAngle: t.faceAngle + item.rot * (Math.PI / 2),
         sitY: t.sitY ?? 0,
         lie: t.lie ?? false,
+        swim: t.swim ?? false,
+        dive: t.dive ?? false,
       });
     });
   }

@@ -6,4 +6,4 @@
  * tauri.conf.json, both Cargo.toml files and both Cargo.lock entries:
  *   sed -i "s/APP_VERSION = '<old>'/APP_VERSION = '<new>'/" src/version.ts
  */
-export const APP_VERSION = '0.32.34';
+export const APP_VERSION = '0.32.35';

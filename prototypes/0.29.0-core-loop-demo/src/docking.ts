@@ -1548,6 +1548,46 @@ export class DoorDockingPortSystem {
   /** 🧱 #66 S1: slide each door's 3D group (frame + leaves + keypad ride the
    *  same group) along its wall by the placement delta. Legacy group lateral
    *  is 0 for every door, so position = delta directly. */
+  /**
+   * 👻🏊 Outdoor open-air mode: ghost every door group down to a faint
+   * translucent silhouette (like the entrance glass) so the pool deck reads
+   * unobstructed — doors stay raycastable/clickable for transit. Restores the
+   * stored opacities when off. Writes userData.baseOpacity so the morph/zoom
+   * fade machinery converges to the ghost value instead of fighting it.
+   */
+  public setGhostDoors(on: boolean): void {
+    for (const [, group] of this.doorObjects) {
+      group.traverse((child) => {
+        if (!(child instanceof THREE.Mesh)) return;
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        for (const mat of mats) {
+          const m = mat as THREE.Material & { opacity: number; transparent: boolean };
+          if (on) {
+            if (m.userData.ghostPrev === undefined) {
+              m.userData.ghostPrev = {
+                opacity: m.opacity,
+                baseOpacity: m.userData.baseOpacity as number | undefined,
+                transparent: m.transparent,
+              };
+            }
+            const prev = m.userData.ghostPrev as { opacity: number; baseOpacity?: number };
+            const target = Math.min(0.16, prev.baseOpacity ?? 1);
+            m.transparent = true;
+            m.userData.baseOpacity = target;
+            m.opacity = Math.min(m.opacity, target);
+          } else if (m.userData.ghostPrev !== undefined) {
+            const prev = m.userData.ghostPrev as { opacity: number; baseOpacity?: number; transparent: boolean };
+            delete m.userData.ghostPrev;
+            m.transparent = prev.transparent;
+            if (prev.baseOpacity === undefined) delete m.userData.baseOpacity;
+            else m.userData.baseOpacity = prev.baseOpacity;
+            m.opacity = prev.opacity;
+          }
+        }
+      });
+    }
+  }
+
   public repositionDoorGroups(deltas: Record<'north' | 'south' | 'east' | 'west', number>): void {
     for (const [id, group] of this.doorObjects) {
       const d = deltas[id as 'north' | 'south' | 'east' | 'west'] ?? 0;

@@ -109,11 +109,14 @@ export function initRenderer() {
  */
 function setupLighting(scene: THREE.Scene) {
   // Ambient light - balanced to work with galaxy background
+  // ☀️ Named: world.applyRoomVisuals retunes these for the outdoor daylight room.
   const ambientLight = new THREE.AmbientLight(0x8899bb, 0.5);
+  ambientLight.name = 'light-ambient';
   scene.add(ambientLight);
-  
+
   // Main directional light - bright overhead station lights
   const directionalLight = new THREE.DirectionalLight(0xffffff, 0.9);
+  directionalLight.name = 'light-sun';
   directionalLight.position.set(5, 10, 5);
   directionalLight.castShadow = false;
   scene.add(directionalLight);
@@ -130,6 +133,7 @@ function setupLighting(scene: THREE.Scene) {
   
   // Hemisphere light for overall illumination
   const hemisphereLight = new THREE.HemisphereLight(0xaaccff, 0x445566, 0.4);
+  hemisphereLight.name = 'light-hemi';
   scene.add(hemisphereLight);
   
   console.log('✅ Lighting configured (warm nebula mode)');
@@ -270,7 +274,10 @@ function buildNebulaBackground(scene: THREE.Scene): void {
     depthWrite: false,
   });
   (skyMat as THREE.ShaderMaterial & { fog: boolean }).fog = false;
-  scene.add(new THREE.Mesh(skyGeo, skyMat));
+  // ☀️ Named: hidden by world.applyRoomVisuals while outdoor daylight is on.
+  const nebulaSky = new THREE.Mesh(skyGeo, skyMat);
+  nebulaSky.name = 'nebula-sky';
+  scene.add(nebulaSky);
 
   // ── Star field layers — three radii for visual depth ─────────────────────
   addStarField(scene, 4000, 460, 1.0); // distant: dense Milky Way carpet
@@ -337,5 +344,8 @@ function addStarField(
     depthWrite: false,
   });
   (mat as THREE.PointsMaterial & { fog: boolean }).fog = false;
-  scene.add(new THREE.Points(geo, mat));
+  // ☀️ Named: hidden by world.applyRoomVisuals while outdoor daylight is on.
+  const stars = new THREE.Points(geo, mat);
+  stars.name = 'nebula-stars';
+  scene.add(stars);
 }

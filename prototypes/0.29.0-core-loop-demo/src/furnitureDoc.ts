@@ -101,6 +101,10 @@ const MOVABLE_KIND_OVERRIDE: Partial<Record<FurnitureKind, boolean>> = {
   // Owner request (2026-07-18): the bar (stools ride along — they are part
   // of the build) moves and stows like everything else now.
   'bar-corner': true,
+  // Owner request (2026-07-20): the pool + hot tub are movable/removable
+  // furniture now — corrects any room doc still holding the old movable:false.
+  'lazy-pool': true,
+  'hot-tub': true,
 };
 
 /** Snapshot the whole layout as id → validated record (malformed entries are

@@ -35,6 +35,10 @@ export interface Seat {
   sitY: number;
   /** 🛏️ true ⇒ occupant lies down (rig 'sleep' pose) instead of sitting. */
   lie: boolean;
+  /** 🏊 true ⇒ occupant renders the 'swim' pose (pool water seat). */
+  swim: boolean;
+  /** 🏊‍♂️ true ⇒ high-dive launch pad (click pool water → parabolic dive). */
+  dive: boolean;
 }
 
 export const SEATS: Seat[] = [];

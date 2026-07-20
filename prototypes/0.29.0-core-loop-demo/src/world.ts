@@ -9,9 +9,9 @@ import * as THREE from 'three';
 import { readDoorPolicy } from './doorPolicy';
 import { Player } from './player';
 import { InputManager } from './input';
-import { findSeatAt, rebuildSeats } from './seats';
+import { findSeatAt, rebuildSeats, SEATS } from './seats';
 import { getDefaultRoomId } from './identity';
-import { FURNITURE, FURNITURE_DEFS, DEFAULT_FOOTPRINT_OVERRIDES, buildItemGroup, BUNK_TOP_Y, rotXZ } from './furniture';
+import { FURNITURE, FURNITURE_DEFS, DEFAULT_FOOTPRINT_OVERRIDES, buildItemGroup, BUNK_TOP_Y, rotXZ, OUTDOOR_CASINO_ROOM_ID, POOL_SWIM_Y, POOL_WATER_Y, DIVE_TIME, DIVE_ARC_LIFT } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { northDoorUnlocked } from './stationParts';
 import { rebuildObstacles } from './obstacles';
@@ -62,6 +62,14 @@ interface RemoteAvatar {
   elevY: number;
   /** Last known 8-way facing (radians, π/4 steps). */
   heading: number;
+  /** 🏊 sender-reported swim flag (tick flags bit4) — 'swim' pose in the pool. */
+  swimming: boolean;
+  /** 🏊‍♂️ sender-reported dive flag (tick flags bit5) — mid parabolic arc. */
+  diving: boolean;
+  /** 🏊‍♂️ local arc clock (seconds since bit5 rose); null when not diving. */
+  diveAge: number | null;
+  /** 🏊‍♂️ replica y at arc start — the receiver replays its own parabola. */
+  diveStartY: number;
 }
 
 export class World {
@@ -148,8 +156,27 @@ export class World {
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
   private particleMat: THREE.PointsMaterial | null = null;
+  // ── 💦 One-shot splash bursts (pool water entry) ──────────────────────────
+  private splashes: Array<{
+    points: THREE.Points;
+    geo: THREE.BufferGeometry;
+    mat: THREE.PointsMaterial;
+    vel: Float32Array;
+    age: number;
+    life: number;
+  }> = [];
   /** Invisible plane covering the walkable floor — used as the raycast target. */
   private clickPlane: THREE.Mesh | null = null;
+  /** 🏝️ Stored floor material for dynamic outdoor/lobby theme swap. */
+  private floorMat: THREE.MeshStandardMaterial | null = null;
+  /** Original lobby wood texture — saved once, restored on return from outdoor room. */
+  private woodTex: THREE.Texture | null = null;
+  /** Lazy-created outdoor stone tile texture (created on first outdoor entry). */
+  private outdoorFloorTex: THREE.Texture | null = null;
+  /** True while the active room is the outdoor casino pool room. */
+  private isOutdoorRoom = false;
+  /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
+  private poolSign: THREE.Group | null = null;
   
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -163,6 +190,9 @@ export class World {
     // Create player (will be shown after morph)
     this.player = new Player(this.scene);
     this.player.mesh.visible = false;
+
+    // 💦 Pool water entry → splash burst at the surface (big = dive landing).
+    this.player.onWaterEntry = (x, y, z, big) => this.spawnSplash(x, y, z, big);
 
     // Furniture layout sync (issue #60 E4): reconcile the local room to the
     // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
@@ -343,6 +373,8 @@ export class World {
       transparent: true,
       opacity: 0
     });
+    this.floorMat = floorMaterial;         // 🏝️ kept for applyRoomVisuals swaps
+    this.woodTex = floorMaterial.map;      // save original wood texture for restoration
     this.platformFloor = new THREE.Mesh(floorGeometry, floorMaterial);
     this.platformFloor.rotation.x = -Math.PI / 2;
     this.platformGroup.add(this.platformFloor);
@@ -414,54 +446,48 @@ export class World {
     const wallThick  = 0.35;
     const wallY = wallHeight / 2;
 
-    // ── Brick canvas texture ─────────────────────────────────────────────────
-    // Each brick is ~0.9u wide × 0.38u tall in world-space.
-    // Canvas resolution: 512×170 px  → 1px ≈ 0.023u
+    // ── 🧊 Wall tile canvas texture ──────────────────────────────────────────
+    // Calippo-Lido restyle (owner request): the old charcoal brick becomes a
+    // fine pale-blue tile grid with white grout — soft, airy, and matching
+    // the pool room's tiled deck/tower (furniture.ts makePoolTileTex).
     const makeBrickTexture = (): THREE.CanvasTexture => {
       const CW = 512, CH = 171;
       const cv = document.createElement('canvas');
       cv.width = CW; cv.height = CH;
       const ctx = cv.getContext('2d')!;
 
-      // mortar background — dark charcoal-slate
-      ctx.fillStyle = '#1A2835';
+      // grout background — clean white
+      ctx.fillStyle = '#FFFFFF';
       ctx.fillRect(0, 0, CW, CH);
 
-      const BW = 84;  // brick width px
-      const BH = 38;  // brick height px
-      const MO = 3;   // mortar thickness px
+      const BW = 30;  // tile width px (small square grid, no brick bond)
+      const BH = 30;  // tile height px
+      const MO = 2;   // grout thickness px
+      const cols = ['#A9CBE9', '#9FC4E5', '#B2D1EC', '#A4C8E7'];
 
       for (let row = 0; row * (BH + MO) < CH + BH; row++) {
         const y = row * (BH + MO);
-        const offset = (row % 2 === 0) ? 0 : (BW + MO) / 2;
-        for (let col = -1; col * (BW + MO) < CW + BW; col++) {
-          const x = col * (BW + MO) + offset;
-          // Frontier station wall: pale blue-stone accents among slate blue panels
-          const isLight = (row + col) % 4 === 0;
-          ctx.fillStyle = isLight ? '#B0BEC8' : (((row * 7 + col * 3) % 5 === 0) ? '#2A3848' : '#3A4E62');
+        for (let col = 0; col * (BW + MO) < CW + BW; col++) {
+          const x = col * (BW + MO);
+          ctx.fillStyle = cols[(row * 3 + col) % 4];
           ctx.fillRect(x + MO, y + MO, BW - MO, BH - MO);
-          // highlight top-left edge (brick face relief)
-          if (!isLight) {
-            ctx.fillStyle = 'rgba(255,255,255,0.09)';
-            ctx.fillRect(x + MO, y + MO, BW - MO, 3);
-            ctx.fillRect(x + MO, y + MO, 3, BH - MO);
-          }
-          // shadow bottom-right edge
-          ctx.fillStyle = 'rgba(0,0,0,0.28)';
-          ctx.fillRect(x + MO, y + BH - 4, BW - MO, 3);
-          ctx.fillRect(x + BW - 4, y + MO, 3, BH - MO);
+          // soft highlight top-left edge
+          ctx.fillStyle = 'rgba(255,255,255,0.35)';
+          ctx.fillRect(x + MO, y + MO, BW - MO, 2);
+          ctx.fillRect(x + MO, y + MO, 2, BH - MO);
         }
       }
 
       const tex = new THREE.CanvasTexture(cv);
-      // Repeat across 12-unit depth (≈ 13 bricks wide) and 4-unit height (≈ 10 rows)
+      // Repeat so a tile reads ≈ 0.25 m in world space (fine Habbo grid).
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
       tex.repeat.set(12 / ((BW + MO) * 0.023), 4 / ((BH + MO) * 0.023));
-      // Nearest-neighbour — keeps brick edges sharp in the pixelated renderer.
+      // Nearest-neighbour — keeps tile edges sharp in the pixelated renderer.
       tex.minFilter = THREE.NearestFilter;
       tex.magFilter = THREE.NearestFilter;
       tex.generateMipmaps = false;
+      tex.colorSpace = THREE.SRGBColorSpace;
       return tex;
     };
 
@@ -716,6 +742,199 @@ export class World {
     this.sideWalls.forEach((wall, i) => { wall.visible = !on && !this.sideWallCovered[i]; });
   }
 
+  /**
+   * 🏝️ Apply room-type visual theme (lobby vs. outdoor casino pool).
+   * Called from main.ts right after joinRoomAtEpoch completes so the floor
+   * colour and wall visibility update before the fade-in reveals the room.
+   * Safe to call multiple times — fully idempotent.
+   */
+  /** 🏊 Wayfinding: build the "POOL & HOT TUB" plate over the south door —
+   *  boutique-hotel style: serif, wide letter-spacing, thin double frame.
+   *  Two back-to-back planes so the text reads correctly from every angle. */
+  private ensurePoolSign(): void {
+    if (this.poolSign) return;
+    const cv = document.createElement('canvas');
+    cv.width = 512; cv.height = 128;
+    const c = cv.getContext('2d')!;
+    // Soft white plate.
+    c.fillStyle = '#FDFEFF';
+    c.fillRect(0, 0, 512, 128);
+    // Thin double frame — pale blue outside, whisper-blue inside.
+    c.strokeStyle = '#A4C8E7';
+    c.lineWidth = 3;
+    c.strokeRect(8, 8, 496, 112);
+    c.strokeStyle = '#D9E8F2';
+    c.lineWidth = 2;
+    c.strokeRect(16, 16, 480, 96);
+    // Elegant spaced serif capitals — deep teal, same as the pool floor tint.
+    c.fillStyle = '#1C5A74';
+    (c as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '8px';
+    c.font = '42px Georgia, "Palatino Linotype", serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText('POOL & HOT TUB', 256, 56);
+    // Slim turquoise flourish beneath.
+    c.strokeStyle = '#4FB4C4';
+    c.lineWidth = 2.5;
+    c.beginPath();
+    c.moveTo(196, 96);
+    c.quadraticCurveTo(256, 104, 316, 96);
+    c.stroke();
+    const tex = new THREE.CanvasTexture(cv);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const geo = new THREE.PlaneGeometry(2.4, 0.6);
+    const mat = new THREE.MeshBasicMaterial({ map: tex });
+    this.poolSign = new THREE.Group();
+    const front = new THREE.Mesh(geo, mat);        // faces INTO the room
+    front.rotation.y = Math.PI;
+    const back = new THREE.Mesh(geo.clone(), mat); // faces outward
+    back.position.z = 0.012;
+    this.poolSign.add(front, back);
+    this.poolSign.position.set(0, 3.4, 5.55); // above the south door
+    this.platformGroup.add(this.poolSign);
+  }
+
+  public applyRoomVisuals(roomId: string): void {
+    const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
+    this.isOutdoorRoom = outdoor;
+
+    // 🏊 The pool sign points the way FROM the lobby — hidden inside the pool
+    // room itself (that same door leads back home there).
+    this.ensurePoolSign();
+    if (this.poolSign) this.poolSign.visible = !outdoor;
+
+    // 🏊 Outdoor pool room: HIDE the solid y=0 floor plane and its grid — the
+    // lazy-pool item's white-tile deck slabs provide all visible flooring, and
+    // the sunken water (y<0) must show through the deck hole. The invisible
+    // clickPlane still catches walk clicks, so navigation is unaffected.
+    // Pool-GATED (owner request: the pool is removable now): if the room has
+    // no lazy-pool, the deck is gone, so SHOW the solid floor instead of
+    // leaving a void. Re-run from reconcileFurniture when the pool is
+    // added/removed. See refreshOutdoorFloor.
+    this.refreshOutdoorFloor();
+
+    // ☀️ Day/night: the outdoor pool room runs bright poolside daylight —
+    // sky-blue backdrop, warm sun, nebula + stars hidden. Every other room
+    // restores the warm-nebula night scheme (values mirror renderer.ts).
+    const sc = this.scene;
+    const amb  = sc.getObjectByName('light-ambient') as THREE.AmbientLight | undefined;
+    const sun  = sc.getObjectByName('light-sun') as THREE.DirectionalLight | undefined;
+    const hemi = sc.getObjectByName('light-hemi') as THREE.HemisphereLight | undefined;
+    const nebSky = sc.getObjectByName('nebula-sky');
+    const starLayers = sc.children.filter((o) => o.name === 'nebula-stars');
+    if (outdoor) {
+      sc.background = new THREE.Color(0x8ED4F0);            // bright day sky
+      if (sc.fog instanceof THREE.FogExp2) { sc.fog.color.setHex(0xA8DCF0); sc.fog.density = 0.006; }
+      if (amb)  { amb.color.setHex(0xFFFFFF); amb.intensity = 0.85; }
+      if (sun)  { sun.color.setHex(0xFFF4DC); sun.intensity = 1.3; } // warm noon sun
+      if (hemi) { hemi.color.setHex(0xCFE9FF); hemi.groundColor.setHex(0xBFD8CB); hemi.intensity = 0.65; }
+      if (nebSky) nebSky.visible = false;
+      starLayers.forEach((s) => { s.visible = false; });
+      // 👻 Doors ghost to faint glass silhouettes (still clickable for transit).
+      this.dockingSystem?.setGhostDoors(true);
+    } else {
+      sc.background = new THREE.Color(0x0a2a5e);            // nebula night
+      if (sc.fog instanceof THREE.FogExp2) { sc.fog.color.setHex(0x0d3060); sc.fog.density = 0.015; }
+      if (amb)  { amb.color.setHex(0x8899bb); amb.intensity = 0.5; }
+      if (sun)  { sun.color.setHex(0xffffff); sun.intensity = 0.9; }
+      if (hemi) { hemi.color.setHex(0xaaccff); hemi.groundColor.setHex(0x445566); hemi.intensity = 0.4; }
+      if (nebSky) nebSky.visible = true;
+      starLayers.forEach((s) => { s.visible = true; });
+      this.dockingSystem?.setGhostDoors(false);
+    }
+
+    if (this.floorMat) {
+      if (outdoor) {
+        // Swap to a stone-tile texture (created once, cached).
+        if (!this.outdoorFloorTex) this.outdoorFloorTex = this.makeOutdoorFloorTex();
+        this.floorMat.map     = this.outdoorFloorTex;
+        this.floorMat.color.setHex(0xffffff); // no tint — texture has its own palette
+        this.floorMat.roughness = 0.92;
+        this.floorMat.metalness = 0.0;
+      } else {
+        // Restore original lobby wood herringbone.
+        this.floorMat.map     = this.woodTex;
+        this.floorMat.color.setHex(0xffffff);
+        this.floorMat.roughness = 0.78;
+        this.floorMat.metalness = 0.0;
+      }
+      this.floorMat.needsUpdate = true;
+    }
+
+    // 🧊 Walls: the pale-blue tile wall shows in BOTH rooms (owner request —
+    // it carries the starry windows and reads light/airy at its glassy
+    // opacity). No tint — the tile texture's own palette is the look.
+    this.sideWalls.forEach((wall, i) => {
+      wall.visible = !this.hullEditView && !this.sideWallCovered[i];
+      const mat = wall.material as THREE.MeshStandardMaterial;
+      if (mat && 'color' in mat) {
+        mat.color.setHex(0xffffff);
+        mat.needsUpdate = true;
+      }
+    });
+    console.log(`🏝️ Room visuals applied: ${outdoor ? 'outdoor-casino (stone floor)' : 'lobby (wood floor)'}`);
+  }
+
+  /**
+   * 🏊 Floor visibility for the outdoor pool room. The solid y=0 floor is
+   * hidden there so the sunken water shows through the pool's deck — but only
+   * while a pool is actually present. If the pool is removed (it's movable
+   * furniture now), restore the floor so the room isn't a void. Idempotent;
+   * called from applyRoomVisuals (on entry) and reconcileFurniture (when the
+   * pool is added/removed). Non-outdoor rooms always show the floor.
+   * PUBLIC so the local edit-mode add/remove paths can call it too (reconcile
+   * covers remote changes; editMode's local splice/spawn does not).
+   */
+  public refreshOutdoorFloor(): void {
+    const hasPool = this.isOutdoorRoom && FURNITURE.some((i) => i.kind === 'lazy-pool');
+    if (this.platformFloor) this.platformFloor.visible = !hasPool;
+    if (this.platformGrid) this.platformGrid.visible = !hasPool;
+  }
+
+  /**
+   * 🏝️ Canvas stone-tile floor texture for the outdoor casino pool room.
+   * Large square tiles in warm beige/sandstone, with grout lines and subtle
+   * surface variation to distinguish from the lobby's herringbone wood.
+   * Created lazily on first outdoor entry and cached for the session.
+   */
+  private makeOutdoorFloorTex(): THREE.Texture {
+    const W = 512, H = 512;
+    const cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const c = cv.getContext('2d')!;
+
+    // 🧊 Calippo-Lido white checkerboard: fine white tiles alternating with a
+    // whisper-of-blue tile, powder blue-white grout — matches the lazy-pool's
+    // deck slabs (furniture.ts makePoolTileTex).
+    c.fillStyle = '#D9E8F2'; // grout
+    c.fillRect(0, 0, W, H);
+
+    const TW = 40, TH = 40, G = 3; // small fine grid
+    for (let row = 0; row * (TH + G) < H; row++) {
+      for (let col = 0; col * (TW + G) < W; col++) {
+        const x = col * (TW + G);
+        const y = row * (TH + G);
+        // Checkerboard: white ↔ pale blue-white
+        c.fillStyle = (row + col) % 2 === 0 ? '#FFFFFF' : '#EDF5FB';
+        c.fillRect(x + G, y + G, TW - G, TH - G);
+        // Soft highlight top-left edge
+        c.fillStyle = 'rgba(255,255,255,0.55)';
+        c.fillRect(x + G, y + G, TW - G, 2);
+        c.fillRect(x + G, y + G, 2, TH - G);
+      }
+    }
+
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(3.5, 3.5); // same repeat as the wood texture
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
   public updateNorthDoorForFireplace(): void {
     const north = findDoor('north');
     if (!north) return;
@@ -806,6 +1025,10 @@ export class World {
     // their north door must still unblock. Cheap (one AABB test).
     this.updateNorthDoorForFireplace();
     this.updateSideWallCoverage(); // 🧱🪟 wall sections replace the built-in wall
+    // 🏊 A pool added/removed toggles whether the outdoor room shows its solid
+    // floor (cheap array scan; before the no-change return so a self-echoed
+    // local removal still reveals the floor).
+    this.refreshOutdoorFloor();
 
     if (changedIds.size === 0) return;
 
@@ -1019,6 +1242,78 @@ export class World {
     this.platformGroup.add(new THREE.Points(this.particleGeo, this.particleMat));
 
     console.log('✅ Atmosphere effects built');
+  }
+
+  // ── 💦 Splash bursts — one-shot water-entry particles (Lido pool) ──────────
+
+  /**
+   * Spawn a short-lived splash burst at a pool water-entry point. Mirrors the
+   * dust-mote Points pattern above but with a finite lifetime: upward cone
+   * velocities under gravity, faded out and disposed after `life` seconds.
+   * Fired locally via player.onWaterEntry and for REMOTE peers on the tick
+   * flag edges (see updateRemotePlayer) — no extra network message needed.
+   */
+  public spawnSplash(x: number, y: number, z: number, big = true): void {
+    const count = big ? 48 : 24;
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const vel = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+      // Seed in a small disc at the entry point.
+      const seedA = Math.random() * Math.PI * 2;
+      const seedR = Math.random() * 0.15;
+      positions[i*3]   = x + Math.cos(seedA) * seedR;
+      positions[i*3+1] = y;
+      positions[i*3+2] = z + Math.sin(seedA) * seedR;
+      // Upward cone: random horizontal direction, strong vertical kick.
+      const a = Math.random() * Math.PI * 2;
+      const h = 0.3 + Math.random() * (big ? 1.4 : 0.9);
+      vel[i*3]   = Math.cos(a) * h;
+      vel[i*3+1] = 1.6 + Math.random() * 1.8;
+      vel[i*3+2] = Math.sin(a) * h;
+      // Cyan→white droplet mix.
+      const w = Math.random();
+      colors[i*3]   = 0.55 + w * 0.35;
+      colors[i*3+1] = 0.85 + w * 0.15;
+      colors[i*3+2] = 1.0;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+    const mat = new THREE.PointsMaterial({
+      size: 2.4, sizeAttenuation: false, vertexColors: true,
+      transparent: true, opacity: 0.95, depthWrite: false,
+    });
+    (mat as THREE.PointsMaterial & { fog: boolean }).fog = false;
+    const points = new THREE.Points(geo, mat);
+    this.platformGroup.add(points);
+    this.splashes.push({ points, geo, mat, vel, age: 0, life: 0.65 });
+  }
+
+  /** Advance every live splash: ballistic droplets, fade, dispose on expiry. */
+  private updateSplashes(deltaTime: number): void {
+    for (let s = this.splashes.length - 1; s >= 0; s--) {
+      const splash = this.splashes[s];
+      splash.age += deltaTime;
+      if (splash.age >= splash.life) {
+        this.platformGroup.remove(splash.points);
+        splash.geo.dispose();
+        splash.mat.dispose();
+        this.splashes.splice(s, 1);
+        continue;
+      }
+      const pos = splash.geo.attributes.position as THREE.BufferAttribute;
+      const arr = pos.array as Float32Array;
+      const n = arr.length / 3;
+      for (let i = 0; i < n; i++) {
+        arr[i*3]   += splash.vel[i*3]   * deltaTime;
+        arr[i*3+1] += splash.vel[i*3+1] * deltaTime;
+        arr[i*3+2] += splash.vel[i*3+2] * deltaTime;
+        splash.vel[i*3+1] -= 6.5 * deltaTime; // gravity
+      }
+      pos.needsUpdate = true;
+      splash.mat.opacity = 0.95 * (1 - splash.age / splash.life);
+    }
   }
 
   /**
@@ -1276,7 +1571,9 @@ export class World {
       this.furnitureMeshes.forEach(mesh => {
         mesh.visible = true;
       });
-      if (this.platformFloor) this.platformFloor.visible = true;
+      // 🏊 Outdoor pool room: the floor stays hidden (the lazy-pool's deck
+      // slabs are the visible floor; sunken water must show through).
+      if (this.platformFloor) this.platformFloor.visible = !this.isOutdoorRoom;
       // 🧱🪟 Placed wall sections REPLACE a built-in side wall — the interior
       // restore must not resurrect a covered one (nor one dropped for 🛰️
       // HULL EDIT).
@@ -1369,6 +1666,9 @@ export class World {
       (this.particleGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
     }
 
+    // 💦 Advance/cull one-shot splash bursts
+    this.updateSplashes(deltaTime);
+
     // Spin the orbital rings above the platform
     if (this.orbitRingOuter) this.orbitRingOuter.rotation.y += 0.004;
     if (this.orbitRingInner) this.orbitRingInner.rotation.y -= 0.006;
@@ -1427,17 +1727,30 @@ export class World {
     facing: number = 0,
     lying: boolean = false,
     elevated: boolean = false,
+    swimming: boolean = false,
+    diving: boolean = false,
   ) {
-    // 🛏️ The tick carries elevation as ONE bit (flags bit3): bunk berths are
-    // the only elevated seats, so the bit maps straight to the top-mattress
-    // height. A future variable-height seat would need a real y on the wire.
-    const elevY = elevated ? BUNK_TOP_Y : 0;
+    // 🏊/🛏️ The tick carries no y — derive the seat height locally: SEATS is
+    // built from the SAME synced furniture doc on every client, so the seat
+    // whose sit point matches the sender's position carries the authoritative
+    // sitY (4.55 dive board, -0.20 pool water, 1.32 top bunk). The old
+    // elevated/swim bits stay as fallbacks for a transiently out-of-sync
+    // seat list (e.g. furniture doc still loading on this end).
+    const seatHere = seated
+      ? SEATS.find(s => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35) ?? null
+      : null;
+    const elevY = seatHere ? seatHere.sitY
+      : swimming ? POOL_SWIM_Y
+      : elevated ? BUNK_TOP_Y : 0;
     const avatar = this.remotePlayers.get(id);
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
       // Parent the rig to the same scene the local player's rig lives in
       // (player.ts hands the raw scene to VoxelCharacter) so both share
       // identical transforms. Floor-anchored at y=0, like the local player.
+      // 🏊‍♂️ A peer already mid-dive when we join gets no rising edge — it
+      // replays a short low arc from y 0 and still splashes on the falling
+      // edge. Accepted ~1 s degradation; no extra protocol.
       const rig = new VoxelCharacter(this.scene);
       rig.masterGroup.position.set(x, 0, z);
       this.applyPeerTint(rig, id);
@@ -1451,8 +1764,26 @@ export class World {
         lying,
         elevY,
         heading: 0,
+        swimming,
+        diving,
+        diveAge: diving ? 0 : null,
+        diveStartY: 0,
       });
       return;
+    }
+    // 🏊‍♂️ bit5 rising edge: start the local arc replay from wherever the
+    // replica currently is (≈ board top thanks to the seat-derived elevY).
+    if (!avatar.diving && diving) {
+      avatar.diveAge = 0;
+      avatar.diveStartY = avatar.rig.masterGroup.position.y;
+    }
+    // 💦 bit5 falling edge = water entry (big splash); a swim rise WITHOUT a
+    // preceding dive = deck slide-in (small splash).
+    if (avatar.diving && !diving) {
+      avatar.diveAge = null;
+      this.spawnSplash(x, POOL_WATER_Y, z, true);
+    } else if (!avatar.swimming && swimming && !avatar.diving) {
+      this.spawnSplash(x, POOL_WATER_Y, z, false);
     }
     // Store the network target; per-frame interpolation happens in
     // updateRemoteAvatars (Task 3.4 interpolation, now frame-rate-safe).
@@ -1463,6 +1794,8 @@ export class World {
     avatar.facing = facing;
     avatar.lying = lying;
     avatar.elevY = elevY;
+    avatar.swimming = swimming;
+    avatar.diving = diving;
   }
 
   /**
@@ -1481,7 +1814,22 @@ export class World {
       // 🛏️ Berth elevation: rises onto the top bunk while seated+elevated,
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.
-      pos.y = THREE.MathUtils.lerp(pos.y, avatar.seated ? avatar.elevY : 0, factor);
+      // 🏊 A free-swimming peer (bit4 WITHOUT bit1) floats at POOL_SWIM_Y.
+      pos.y = THREE.MathUtils.lerp(pos.y, avatar.seated ? avatar.elevY : avatar.swimming ? POOL_SWIM_Y : 0, factor);
+
+      // 🏊‍♂️ Mid dive arc (flags bit5): x/z keep following the sender's 20 Hz
+      // samples via the normal lerp above; y is replayed locally with the SAME
+      // parabola constants as the sender (the tick carries no y). The yaw
+      // field carries the arc heading while diving.
+      if (avatar.diving) {
+        avatar.diveAge = (avatar.diveAge ?? 0) + deltaTime;
+        const t = Math.min(1, avatar.diveAge / DIVE_TIME);
+        pos.y = avatar.diveStartY + (POOL_SWIM_Y - avatar.diveStartY) * t * t
+              + DIVE_ARC_LIFT * 4 * t * (1 - t);
+        avatar.rig.setState('dive', avatar.facing);
+        avatar.rig.update();
+        continue;
+      }
 
       // Robust moving detection: trust the sender's flag OR the fact that we
       // are still visibly far from the target — animates even when the flag is
@@ -1489,8 +1837,11 @@ export class World {
       // #63: a seated peer renders the sit pose at the seat facing and skips the
       // motion-derived walk/idle path entirely (still lerps to the seat point).
       // 🛏️ A lying peer (flags bit2) renders the 'sleep' pose instead.
+      // 🏊 A swimming peer (flags bit4) renders the 'swim' pose at POOL_SWIM_Y.
       if (avatar.seated) {
-        avatar.rig.setState(avatar.lying ? 'sleep' : 'sit_chair', avatar.facing);
+        avatar.rig.setState(
+          avatar.swimming ? 'swim' : avatar.lying ? 'sleep' : 'sit_chair',
+          avatar.facing);
         avatar.rig.update();
         continue;
       }
@@ -1504,7 +1855,8 @@ export class World {
         avatar.heading = snapTo8Ways(Math.atan2(dx, dz));
       }
 
-      avatar.rig.setState(moving ? 'walk' : 'idle', avatar.heading);
+      // 🏊 Free-swimming peers paddle in place / glide — never 'walk' on water.
+      avatar.rig.setState(avatar.swimming ? 'swim' : moving ? 'walk' : 'idle', avatar.heading);
       avatar.rig.update(); // exactly once per frame per rig (per-instance clock)
     }
   }
@@ -1598,6 +1950,13 @@ export class World {
 
   public navigateTo(x: number, z: number) {
     if (this.isPlayerActive()) {
+      // 🏊 Free swim: the player handles in-water routing itself (straight
+      // swim vs climb-out) — seat routing would bounce the swimmer through
+      // the stand-up machinery for what is just open water.
+      if (this.player.isFreeSwimming()) {
+        this.player.navigateTo(x, z);
+        return;
+      }
       // Clicks landing on a chair/sofa footprint become sit requests:
       // walk to the seat front, turn back-to-the-chair, and sit down.
       const seat = findSeatAt(x, z);

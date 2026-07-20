@@ -26,8 +26,9 @@ import { roomEdit, setRoomEditPermission } from './editMode';
 import { bindGamesDoc } from './games/gamesDoc';
 import { bindCasinoDoc, readChips } from './casinoDoc';
 import { chipDotsHtml } from './chipDisplay';
-import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture } from './furnitureDoc';
+import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture, writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
+import { OUTDOOR_CASINO_ROOM_ID, OUTDOOR_FURNITURE } from './furniture';
 import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
 import { bindDoorPolicy, subscribeDoorPolicy, readDoorPolicy } from './doorPolicy';
 import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
@@ -910,7 +911,48 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       if (roomMap.get('owner') === getPlayerId() && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }
+      // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
+      // claim (overwrites any stale cert hash from a previous session).
+      if (activeBootstrap) {
+        const outdoorSeed = btoa(JSON.stringify({
+          ...activeBootstrap,
+          roomId: OUTDOOR_CASINO_ROOM_ID,
+        }));
+        writeDoorPairing('south', outdoorSeed);
+      }
     });
+  }
+
+  // 🏝️ Outdoor casino pool room: seed furniture on first entry (the normal
+  // claimRoomDefaults path doesn't run for transit joins, so this is the
+  // dedicated first-visit seed path). Also applies the outdoor visual theme.
+  if (boot.roomId === OUTDOOR_CASINO_ROOM_ID) {
+    const outdoorEpoch = epoch;
+    void sync.whenServerSynced.then(() => {
+      if (outdoorEpoch !== sessionEpoch) return;
+      // 🏊 Seed the pool layout ONCE per room, then let edits persist (owner
+      // request: the pool + hot tub are movable/removable furniture now, so a
+      // move or removal must survive re-entry). A dedicated marker — not the
+      // old "always rewrite" — still migrates fresh rooms AND stale casino
+      // docs from earlier prototypes (neither carries the marker), but a room
+      // that has already been seeded keeps the player's edits.
+      const roomInfo = sync.doc.getMap('roomInfo');
+      if (!roomInfo.get('poolLayoutSeeded')) {
+        for (const item of OUTDOOR_FURNITURE) {
+          writeFurnitureItem(item);
+        }
+        roomInfo.set('poolLayoutSeeded', true);
+      }
+      // 🏊 Retired items: casino fixtures moved back to the lobby — purge
+      // their stale doc entries so old room replicas drop them too (id-only,
+      // harmless when absent; safe to run every entry).
+      deleteFurnitureItem('pool-cashier');
+      deleteFurnitureItem('pool-roulette');
+    });
+    world?.applyRoomVisuals(boot.roomId);
+  } else {
+    // Returning to any non-outdoor room (lobby, etc.): restore lobby visuals.
+    world?.applyRoomVisuals(boot.roomId);
   }
 
   // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
@@ -1086,7 +1128,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       seenPeers.add(peerId);
       receivedTicks++;
       remoteLastSeen.set(peerId, performance.now());
-      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1, (tick.flags & 2) === 2, tick.yaw, (tick.flags & 4) === 4, (tick.flags & 8) === 8);
+      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1, (tick.flags & 2) === 2, tick.yaw, (tick.flags & 4) === 4, (tick.flags & 8) === 8, (tick.flags & 16) === 16, (tick.flags & 32) === 32);
     } catch (e) {
       console.warn('Error unpacking incoming remote peer datagram tick:', e);
     }
@@ -4977,6 +5019,31 @@ function onCanvasClick(event: MouseEvent): void {
     }
   }
 
+  // ── 🏊‍♂️ Dive-tower clicks → the dive-board seat. The tower's floor
+  //    clickBox is a tiny patch of deck that is ALSO screen-occluded by the
+  //    east door glass from most camera angles — so the tall shaft/cabin
+  //    meshes themselves are the click target (same affordance as the
+  //    vestibule tubes below). The hit's ground x/z lands inside the dive
+  //    seat's clickBox, so the normal floor-click routing takes over.
+  {
+    const towerMeshes: THREE.Object3D[] = [];
+    scene.traverse((child) => {
+      if (child.userData && child.userData.isDiveTower) {
+        towerMeshes.push(child);
+      }
+    });
+    const towerHits = raycaster.intersectObjects(towerMeshes, false);
+    if (towerHits.length > 0) {
+      // Route via the MESH's world centre (not the hit point): a hit on the
+      // board TIP would land outside the dive clickBox, but every tagged
+      // mesh's centre projects safely inside it.
+      const centre = new THREE.Vector3();
+      towerHits[0].object.getWorldPosition(centre);
+      world.navigateTo(centre.x, centre.z);
+      return; // Halt floor-click routing
+    }
+  }
+
   // ── Vestibule clicks → the SAME door walk-through (owner request: small
   //    doors are fiddly click targets; the tube outside them is huge). Both
   //    the plain paired vestibule and assembled connector chains carry
@@ -5226,14 +5293,22 @@ function animate() {
       // 🛏️ bunk berths ride two more reserved flag bits (byte layout unchanged —
       // old clients ignore them and degrade to a floor-level sit): bit2 = lying
       // ('sleep' pose), bit3 = elevated (top bunk ⇒ BUNK_TOP_Y on the far side).
+      // 🏊 Lido pool rides two more (same graceful degradation — a swimmer
+      // degrades to a sit-in-pool at y 0, a diver to a ~1 s walk-across-water):
+      // bit4 = swimming ('swim' pose at POOL_SWIM_Y), bit5 = diving (peers
+      // replay the parabolic arc locally; yaw carries the arc heading).
       const seated = world.getPlayer().isSeated();
       const lying = world.getPlayer().isLying();
       const elevated = world.getPlayer().getSeatedY() > 0.8;
+      const swimming = world.getPlayer().isSwimming();
+      const diving = world.getPlayer().isDiving();
       const tickData = {
-        flags: ((dir.x !== 0 || dir.z !== 0) ? 1 : 0) | (seated ? 2 : 0) | (lying ? 4 : 0) | (elevated ? 8 : 0),
+        flags: ((dir.x !== 0 || dir.z !== 0) ? 1 : 0) | (seated ? 2 : 0) | (lying ? 4 : 0)
+             | (elevated ? 8 : 0) | (swimming ? 16 : 0) | (diving ? 32 : 0),
         x: localPos.x,
         z: localPos.z,
-        yaw: seated ? world.getPlayer().getSeatedFacing() : 0,
+        yaw: seated ? world.getPlayer().getSeatedFacing()
+           : diving ? world.getPlayer().getDiveFacing() : 0,
         seq: localSeq++,
       };
       
