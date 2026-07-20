@@ -58,6 +58,7 @@ import { OBSTACLES, rebuildObstacles } from './obstacles';
 import {
   computeReachable, rebakeWalkableGrid, GRID_SIZE, worldToCol, worldToRow,
 } from './pathfinding';
+import { roomHalfExtents } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
@@ -230,7 +231,9 @@ function clearanceOk(item: FurnitureItem, pos: { x: number; z: number }, margin:
   if (margin <= 0) return true;
   const box = footprintAabb(item.kind, pos, item.rot);
   if (!box) return true; // decorative — never an obstacle, no seams to cause
-  if (box.x0 - margin < -5 || box.x1 + margin > 5 || box.z0 - margin < -5 || box.z1 + margin > 5) {
+  const { halfX, halfZ } = roomHalfExtents(); // placement box: 1 m inside walls
+  const bX = halfX - 1, bZ = halfZ - 1;        // default 2×2 ⇒ ±5
+  if (box.x0 - margin < -bX || box.x1 + margin > bX || box.z0 - margin < -bZ || box.z1 + margin > bZ) {
     return false;
   }
   for (const other of FURNITURE) {
@@ -264,12 +267,19 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
     requiredReachable: collectRequiredReachable(floodOrigin(player)),
   };
   // Dedupe raw probe points onto the snap lattice, then try nearest-first.
+  // Probe range spans the whole room from any in-bounds player pos (≈2·half);
+  // the spawn bound is 0.5 m inside each wall. 🧱 #66 R1 — default 2×2 room
+  // keeps the same in-bounds ±5.5 candidate set (wider raw range only adds
+  // out-of-bounds probes that the filter drops), so the result is unchanged.
+  const { halfX, halfZ } = roomHalfExtents();
+  const probeX = Math.ceil(2 * halfX), probeZ = Math.ceil(2 * halfZ);
+  const bX = halfX - 0.5, bZ = halfZ - 0.5;
   const seen = new Set<string>();
   const candidates: Array<{ x: number; z: number; d: number }> = [];
-  for (let dx = -11; dx <= 11; dx += 0.5) {
-    for (let dz = -11; dz <= 11; dz += 0.5) {
+  for (let dx = -probeX; dx <= probeX; dx += 0.5) {
+    for (let dz = -probeZ; dz <= probeZ; dz += 0.5) {
       const s = snapItemPos(item.kind, item.rot, p.x + dx, p.z + dz);
-      if (s.x < -5.5 || s.x > 5.5 || s.z < -5.5 || s.z > 5.5) continue;
+      if (s.x < -bX || s.x > bX || s.z < -bZ || s.z > bZ) continue;
       const key = `${s.x},${s.z}`;
       if (seen.has(key)) continue;
       seen.add(key);
