@@ -1271,8 +1271,11 @@ export class World {
     // lazy-pool item's white-tile deck slabs provide all visible flooring, and
     // the sunken water (y<0) must show through the deck hole. The invisible
     // clickPlane still catches walk clicks, so navigation is unaffected.
-    if (this.platformFloor) this.platformFloor.visible = !outdoor;
-    if (this.platformGrid) this.platformGrid.visible = !outdoor;
+    // Pool-GATED (owner request: the pool is removable now): if the room has
+    // no lazy-pool, the deck is gone, so SHOW the solid floor instead of
+    // leaving a void. Re-run from reconcileFurniture when the pool is
+    // added/removed. See refreshOutdoorFloor.
+    this.refreshOutdoorFloor();
 
     // ☀️ Day/night: the outdoor pool room runs bright poolside daylight —
     // sky-blue backdrop, warm sun, nebula + stars hidden. Every other room
@@ -1458,6 +1461,22 @@ export class World {
   }
 
   /**
+   * 🏊 Floor visibility for the outdoor pool room. The solid y=0 floor is
+   * hidden there so the sunken water shows through the pool's deck — but only
+   * while a pool is actually present. If the pool is removed (it's movable
+   * furniture now), restore the floor so the room isn't a void. Idempotent;
+   * called from applyRoomVisuals (on entry) and reconcileFurniture (when the
+   * pool is added/removed). Non-outdoor rooms always show the floor.
+   * PUBLIC so the local edit-mode add/remove paths can call it too (reconcile
+   * covers remote changes; editMode's local splice/spawn does not).
+   */
+  public refreshOutdoorFloor(): void {
+    const hasPool = this.isOutdoorRoom && FURNITURE.some((i) => i.kind === 'lazy-pool');
+    if (this.platformFloor) this.platformFloor.visible = !hasPool;
+    if (this.platformGrid) this.platformGrid.visible = !hasPool;
+  }
+
+  /**
    * 🏝️ Canvas stone-tile floor texture for the outdoor casino pool room.
    * Large square tiles in warm beige/sandstone, with grout lines and subtle
    * surface variation to distinguish from the lobby's herringbone wood.
@@ -1613,6 +1632,10 @@ export class World {
     // their north door must still unblock. Cheap (one AABB test).
     this.updateNorthDoorForFireplace();
     this.updateSideWallCoverage(); // 🧱🪟 wall sections replace the built-in wall
+    // 🏊 A pool added/removed toggles whether the outdoor room shows its solid
+    // floor (cheap array scan; before the no-change return so a self-echoed
+    // local removal still reveals the floor).
+    this.refreshOutdoorFloor();
 
     if (changedIds.size === 0) return;
 
