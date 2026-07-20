@@ -1587,17 +1587,27 @@ const SWAP_WATCHDOG_MS = 15_000;
 const SYNC_GATE_MS = 8_000;
 
 /**
- * Resolve once the freshly-joined room's shared state has converged — the
- * host's roomInfo `owner` AND `name` keys are present — or after `timeoutMs`
- * as a fallback (issue #60 P1.3). Observes the CURRENT session's doc captured
- * at call time; if a newer session/leave destroys it mid-wait, the timeout
- * still resolves so the curtain never wedges.
+ * Resolve once the freshly-joined room's shared state has converged, or after
+ * `timeoutMs` as a fallback (issue #60 P1.3). Normal rooms wait for the host's
+ * roomInfo `owner` AND `name`; authored amenity rooms have no roomInfo owner,
+ * so their node SyncStep2 is the readiness signal (their furniture seed
+ * callbacks are registered on the same promise before transit reaches here).
+ * Captures the CURRENT session's doc; if a newer session/leave destroys it
+ * mid-wait, the timeout still resolves so the curtain never wedges.
  */
-function awaitInitialRoomState(timeoutMs: number): Promise<void> {
+function awaitInitialRoomState(
+  timeoutMs: number,
+  roomId: string,
+): Promise<void> {
   const sync = yjsSync;
   if (!sync) return Promise.resolve();
+  const authoredAmenity =
+    roomId === CASINO_ROOM_ID || roomId === OUTDOOR_CASINO_ROOM_ID;
   const roomMap = sync.doc.getMap("roomInfo");
-  const ready = () => roomMap.has("owner") && roomMap.has("name");
+  const ready = () =>
+    authoredAmenity
+      ? sync.serverSynced
+      : roomMap.has("owner") && roomMap.has("name");
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -1607,16 +1617,22 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
     const finish = () => {
       if (done) return;
       done = true;
-      try {
-        roomMap.unobserve(observer);
-      } catch {
-        /* doc may be destroyed */
+      if (!authoredAmenity) {
+        try {
+          roomMap.unobserve(observer);
+        } catch {
+          /* doc may be destroyed */
+        }
       }
       window.clearTimeout(timer);
       resolve();
     };
     const timer = window.setTimeout(finish, timeoutMs);
-    roomMap.observe(observer);
+    if (authoredAmenity) {
+      void sync.whenServerSynced.then(finish);
+    } else {
+      roomMap.observe(observer);
+    }
     // Guard the race between the initial ready() check and observe() attaching.
     if (ready()) finish();
   });
@@ -1755,7 +1771,7 @@ async function performRoomSwap(
     // showing the default name/owner (symptoms 1 & 5). Only foreign joins
     // actually wait — a minted/own room already has owner+name written, and a
     // same-node transit's replica is already populated, so both resolve at once.
-    await awaitInitialRoomState(SYNC_GATE_MS);
+    await awaitInitialRoomState(SYNC_GATE_MS, target.roomId);
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);
