@@ -954,6 +954,34 @@ export class World {
       thickness: 0.12,
       depthWrite: false,
     });
+    const trellisGold = new THREE.MeshStandardMaterial({
+      color: 0xd99b2b,
+      emissive: 0x5a2604,
+      emissiveIntensity: 0.12,
+      metalness: 0.72,
+      roughness: 0.28,
+    });
+    const vine = new THREE.MeshStandardMaterial({
+      color: 0x174d24,
+      roughness: 0.88,
+    });
+    const leafMaterials = [0x246c32, 0x358642, 0x4b9b4c].map(
+      (color) =>
+        new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.82,
+        }),
+    );
+    const flowerGold = new THREE.MeshStandardMaterial({
+      color: 0xffb51d,
+      emissive: 0x8b3800,
+      emissiveIntensity: 0.22,
+      roughness: 0.48,
+    });
+    const berryRed = new THREE.MeshStandardMaterial({
+      color: 0x9e1f2f,
+      roughness: 0.5,
+    });
 
     const addBox = (
       size: [number, number, number],
@@ -1024,6 +1052,127 @@ export class World {
       addDollar([offset, 3.04, -5.79], 0);
       addDollar([-5.79, 3.04, offset], Math.PI / 2);
     }
+
+    const addStem = (
+      from: THREE.Vector3,
+      to: THREE.Vector3,
+      radius = 0.035,
+    ) => {
+      const direction = to.clone().sub(from);
+      const stem = new THREE.Mesh(
+        new THREE.CylinderGeometry(
+          radius,
+          radius * 1.08,
+          direction.length(),
+          6,
+        ),
+        vine,
+      );
+      stem.position.copy(from).add(to).multiplyScalar(0.5);
+      stem.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0),
+        direction.normalize(),
+      );
+      group.add(stem);
+    };
+
+    const addFloralTrellis = (wall: "north" | "west") => {
+      const alongX = wall === "north";
+      const wallPlane = -5.52;
+      const point = (along: number, y: number, inward = 0) =>
+        new THREE.Vector3(
+          alongX ? along : wallPlane + inward,
+          y,
+          alongX ? wallPlane + inward : along,
+        );
+
+      for (const along of [-4.8, -2.4, 0, 2.4, 4.8]) {
+        addBox(
+          alongX ? [0.07, 0.82, 0.07] : [0.07, 0.82, 0.07],
+          [alongX ? along : wallPlane, 3.72, alongX ? wallPlane : along],
+          trellisGold,
+        );
+      }
+      addBox(
+        alongX ? [10.7, 0.07, 0.07] : [0.07, 0.07, 10.7],
+        alongX ? [0, 3.48, wallPlane] : [wallPlane, 3.48, 0],
+        trellisGold,
+      );
+      addBox(
+        alongX ? [10.7, 0.07, 0.07] : [0.07, 0.07, 10.7],
+        alongX ? [0, 4.03, wallPlane] : [wallPlane, 4.03, 0],
+        trellisGold,
+      );
+
+      const vinePoints: THREE.Vector3[] = [];
+      for (let index = 0; index < 13; index++) {
+        const along = -5.1 + index * 0.85;
+        const y = 3.82 + Math.sin(index * 1.55) * 0.22;
+        const center = point(along, y, 0.08);
+        vinePoints.push(center);
+        if (index > 0) addStem(vinePoints[index - 1], center);
+
+        for (const side of [-1, 1]) {
+          const leaf = new THREE.Mesh(
+            new THREE.SphereGeometry(0.17, 7, 5),
+            leafMaterials[(index + (side > 0 ? 1 : 0)) % leafMaterials.length],
+          );
+          leaf.scale.set(1.35, 0.48, 0.72);
+          leaf.position.copy(center);
+          leaf.position.y += side * 0.12;
+          if (alongX) {
+            leaf.position.x += side * 0.19;
+            leaf.position.z += 0.09;
+            leaf.rotation.z = side * 0.55;
+          } else {
+            leaf.position.z += side * 0.19;
+            leaf.position.x += 0.09;
+            leaf.rotation.x = side * 0.55;
+          }
+          leaf.rotation.y = index * 0.72;
+          group.add(leaf);
+        }
+
+        if (index % 2 === 0) {
+          const flowerCenter = center.clone();
+          flowerCenter.y += 0.28;
+          flowerCenter.add(point(0, 0, 0.16).sub(point(0, 0, 0)));
+          for (let petal = 0; petal < 5; petal++) {
+            const angle = (petal / 5) * Math.PI * 2;
+            const bloom = new THREE.Mesh(
+              new THREE.ConeGeometry(0.09, 0.22, 6),
+              flowerGold,
+            );
+            bloom.position.copy(flowerCenter);
+            if (alongX) {
+              bloom.position.x += Math.cos(angle) * 0.1;
+              bloom.position.y += Math.sin(angle) * 0.1;
+              bloom.rotation.z = -angle + Math.PI / 2;
+            } else {
+              bloom.position.z += Math.cos(angle) * 0.1;
+              bloom.position.y += Math.sin(angle) * 0.1;
+              bloom.rotation.x = angle - Math.PI / 2;
+            }
+            group.add(bloom);
+          }
+        } else if (index % 3 === 0) {
+          for (const drop of [-0.08, 0.08]) {
+            const berry = new THREE.Mesh(
+              new THREE.SphereGeometry(0.065, 7, 5),
+              berryRed,
+            );
+            berry.position.copy(center);
+            berry.position.y -= 0.2;
+            if (alongX) berry.position.x += drop;
+            else berry.position.z += drop;
+            group.add(berry);
+          }
+        }
+      }
+    };
+
+    addFloralTrellis("north");
+    addFloralTrellis("west");
 
     // Casino doors occupy paired slots on north and west. Stamp both jambs
     // and the lintel without adding collision or narrowing the opening.
