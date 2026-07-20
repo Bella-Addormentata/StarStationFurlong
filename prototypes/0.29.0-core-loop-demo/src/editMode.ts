@@ -65,6 +65,7 @@ import {
 import type { FurnitureItem, Rot, Box } from './furniture';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
+import { roomHalfExtents } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
@@ -158,16 +159,21 @@ export function validatePlacement(
 
   const box = footprintAabb(item.kind, pos, rot);
 
+  // Placement box: 1 m inside each wall (walls at ±half). 🧱 #66 R1 — default
+  // 2×2 room ⇒ {6,6} ⇒ ±5, the legacy literal.
+  const { halfX, halfZ } = roomHalfExtents();
+  const bX = halfX - 1, bZ = halfZ - 1;
+
   // Decorative: bounds-only (position point inside the walkable square).
   if (!box) {
-    if (pos.x < -5 || pos.x > 5 || pos.z < -5 || pos.z > 5) {
+    if (pos.x < -bX || pos.x > bX || pos.z < -bZ || pos.z > bZ) {
       return { ok: false, reason: 'out of bounds' };
     }
     return { ok: true };
   }
 
   // 1. Bounds.
-  if (box.x0 < -5 || box.x1 > 5 || box.z0 < -5 || box.z1 > 5) {
+  if (box.x0 < -bX || box.x1 > bX || box.z0 < -bZ || box.z1 > bZ) {
     return { ok: false, reason: 'out of bounds' };
   }
 

@@ -15,12 +15,20 @@
 
 import { OBSTACLES } from './obstacles';
 import type { Box } from './obstacles';
+import { roomHalfExtents, ROOM_TILE_MAX, TILE_SIZE } from './floorPlanDoc';
 
 // ── Grid constants ────────────────────────────────────────────────────────────
 /** World-space size of each grid cell (metres) */
 export const CELL_SIZE = 0.5;
-/** Number of cells along each axis (covers the ±5.5 m walkable area) */
-export const GRID_SIZE = 22;
+/** The grid is SQUARE and static — sized once to cover the largest room the
+ *  envelope allows (ROOM_TILE_MAX tiles ⇒ ±MAX_HALF m walls), plus a cell of
+ *  margin, so `GRID_HALF`-as-origin-offset and the `r·GRID_SIZE+c` key math
+ *  stay valid on both axes for any room up to the limit. Cells outside the
+ *  CURRENT room's walkable box are simply baked blocked (see rebakeWalkableGrid).
+ *  Default 2×2 room: only the ±5 cells are walkable, so A* cost is unchanged. */
+const MAX_HALF = (ROOM_TILE_MAX * TILE_SIZE) / 2; // 15 m at 5×5 tiles
+/** Number of cells along each axis (covers ±(MAX_HALF+1) m, rounded to even). */
+export const GRID_SIZE = 2 * Math.ceil((MAX_HALF + 1) / CELL_SIZE);
 /** Half-extent used to convert between grid and world coordinates */
 export const GRID_HALF = GRID_SIZE / 2;
 
@@ -39,6 +47,10 @@ export const walkable: boolean[][] = [];
 
 /** Re-bake the walkable grid from the current OBSTACLES list, in place. */
 export function rebakeWalkableGrid(): void {
+  // Walkable box = 1 m inside each wall, per axis (walls at ±half ⇒ ±(half−1)).
+  // Default 2×2 room: half=6 ⇒ ±5.0, exactly the legacy boundary.
+  const { halfX, halfZ } = roomHalfExtents();
+  const boundX = halfX - 1.0, boundZ = halfZ - 1.0;
   for (let row = 0; row < GRID_SIZE; row++) {
     const cells = walkable[row] ?? (walkable[row] = []);
     for (let col = 0; col < GRID_SIZE; col++) {
@@ -52,7 +64,7 @@ export function rebakeWalkableGrid(): void {
         }
       }
       // Also mark cells outside the walkable room boundary as blocked
-      if (Math.abs(wx) > 5.0 || Math.abs(wz) > 5.0) blocked = true;
+      if (Math.abs(wx) > boundX || Math.abs(wz) > boundZ) blocked = true;
       cells[col] = !blocked;
     }
   }
@@ -224,6 +236,8 @@ export function computeReachable(
   startZ: number,
 ): boolean[][] {
   // Bake the scratch walkable grid (same rules as rebakeWalkableGrid).
+  const { halfX, halfZ } = roomHalfExtents();
+  const boundX = halfX - 1.0, boundZ = halfZ - 1.0;
   const scratch: boolean[][] = [];
   for (let row = 0; row < GRID_SIZE; row++) {
     const cells: boolean[] = [];
@@ -237,7 +251,7 @@ export function computeReachable(
           break;
         }
       }
-      if (Math.abs(wx) > 5.0 || Math.abs(wz) > 5.0) blocked = true;
+      if (Math.abs(wx) > boundX || Math.abs(wz) > boundZ) blocked = true;
       cells.push(!blocked);
     }
     scratch.push(cells);

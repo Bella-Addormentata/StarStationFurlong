@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.37 — 2026-07-20
+
+### 🧱 Room Fundamentals Derive From Size (Groundwork for Different-Sized Rooms)
+
+- **Invisible by design — every room looks and plays exactly as before.** This rebuilds the room's spatial "fundamentals" so a room's size is no longer hardcoded to today's 12×12 square: the floor, the walls (including the lobby's new north wall), the outer hull, the walkable grid, furniture-placement limits, the player's and NPCs' movement bounds, corner markers and edge lights now all derive from the room's dimensions. Today's rooms are exactly a 2×2 block of 6-metre tiles, so every one of those reproduces the current numbers to the millimetre — verified byte-identical on a live room (walls at ±6, floor 12×12, and both the standard and the paired casino/lobby door layouts unchanged). This is the foundation for rooms of different rectangular sizes (any rectangle up to 30×30 m), tracked in #66.
+- **The door system now derives its geometry from the room, in one place.** The door-layout module the casino, lobby and pool rooms already share had its poses hardcoded to a 12×12 room; they're now computed from the room size, so the same layouts — the standard four-sided one and the "paired" arrangement that groups doors on two walls — will work at any room size. Every existing room is bit-identical.
+- **A latent bug fixed in passing:** a door could theoretically be slid off the end of a very short wall in a future small room; the slide limit now derives from that wall's actual length so it can't leave the wall.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.37 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.36 — 2026-07-20
 
 ### 🎰 Casino Room · 🌅 Lobby Overhaul · 🌉 Pool Rework
