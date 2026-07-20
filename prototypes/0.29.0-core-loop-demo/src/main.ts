@@ -349,6 +349,20 @@ let phoneOverlayInitialized = false;
  *  one vestibule, and the fade/join sequence must never interleave). */
 let transitInProgress = false;
 /**
+ * 🪃 Session return route (owner bug: "the lobby I return to from the casino
+ * is an OLD lobby"). Shared hub rooms (casino / pool) keep ONE back-pointing
+ * pairing in their synced doc — whoever mirrored it first wins, so later
+ * visitors were returned to a STALE home room. This records, per successful
+ * transit, where THIS traveler actually came from; walking back out through
+ * the same arrival door prefers it over the doc record. In-memory only —
+ * scoped to the session, keyed to the exact room+door it was captured in.
+ */
+let sessionReturnRoute: {
+  roomId: string;
+  doorId: DoorId;
+  seed: string;
+} | null = null;
+/**
  * Room ids minted by THIS client THIS session via PROVISION NEW MODULE.
  * Transiting into one of them is a first-entry into a fresh room nobody
  * owns — pass claimRoomDefaults=true so the provisioner becomes the owner.
@@ -1267,12 +1281,12 @@ async function joinRoomAtEpoch(
       // old "always rewrite" — still migrates fresh rooms AND stale casino
       // docs from earlier prototypes (neither carries the marker), but a room
       // that has already been seeded keeps the player's edits.
-      const roomInfo = sync.doc.getMap('roomInfo');
-      if (!roomInfo.get('poolLayoutSeeded')) {
+      const roomInfo = sync.doc.getMap("roomInfo");
+      if (!roomInfo.get("poolLayoutSeeded")) {
         for (const item of OUTDOOR_FURNITURE) {
           writeFurnitureItem(item);
         }
-        roomInfo.set('poolLayoutSeeded', true);
+        roomInfo.set("poolLayoutSeeded", true);
       }
       // 🏊 Retired items: casino fixtures moved back to the lobby — purge
       // their stale doc entries so old room replicas drop them too (id-only,
@@ -1810,6 +1824,11 @@ async function transitTo(
       }
     : null;
   const depRoomId = activeBootstrap?.roomId ?? null;
+  const returnRoute =
+    sessionReturnRoute?.roomId === depRoomId &&
+    sessionReturnRoute.doorId === departureDoorId
+      ? sessionReturnRoute
+      : null;
 
   // Vestibule-findings fix (root cause 2): the walker's own rooms are exactly
   // the rooms NEVER in their own pass list, so passSeed alone silently killed
@@ -1829,7 +1848,7 @@ async function transitTo(
     }
   }
 
-  const result = await performRoomSwap(seedString, {
+  const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
     // 🔗 depRoomId lets the ARRIVAL room's own back-pointing record pick the
     // door (owner's octagon fix) — farDoor/opposite are fallbacks only.
     arrive: () =>
@@ -1845,6 +1864,21 @@ async function transitTo(
     return;
   }
 
+  const arrivalDoorId = world.resolveArrivalDoor(
+    departureDoorId,
+    depGeometry?.farDoor,
+    depRoomId ?? undefined,
+  ).id;
+  const arrivalRoomId = activeBootstrap?.roomId;
+  if (depPaired && depAddress && arrivalRoomId) {
+    sessionReturnRoute = {
+      roomId: arrivalRoomId,
+      doorId: arrivalDoorId,
+      seed: depAddress,
+    };
+    world.applyRoomVisuals(arrivalRoomId, arrivalDoorId);
+  }
+
   // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY
   // pairing, plain or assembled — before this, a plain pairing NEVER wrote the
   // far room's record (pre-#62 nothing did), so the return direction
@@ -1856,11 +1890,6 @@ async function transitTo(
   // Never clobbers an existing pairing on the arrival door.
   if (depPaired && depAddress) {
     // 🔗 Mirror onto the SAME door the player actually arrived through.
-    const arrivalDoorId = world.resolveArrivalDoor(
-      departureDoorId,
-      depGeometry?.farDoor,
-      depRoomId ?? undefined,
-    ).id;
     const existing = readAllDoors().get(arrivalDoorId);
     if (!existing?.paired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
