@@ -11,6 +11,14 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.34 — 2026-07-20
+
+### 📜 Every Phone App Scrolls Now
+
+- **Fixed: SpacePhone apps clipped their content instead of scrolling** (owner report: some VENTURES functionality was hidden below the fold with no way to reach it). Only ACCESS and CONTACTS had scrolling wired up; every other app (VENTURES, BANK, SETTINGS and its Network/Stats screens, the home grid) clipped once its content grew past the fixed phone screen. Scrolling is now enabled uniformly on the app-view layer, so a slim scrollbar appears automatically on **any** app whenever its content overflows — no app can hide functionality below the fold again, and future apps get it for free. The document apps also gained the same comfortable inset ACCESS/CONTACTS already had.
+- Chat is unchanged and deliberately excepted: its message log keeps scrolling on its own while the input field stays pinned at the bottom (verified it can't be scrolled out of reach).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.34 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.33 — 2026-07-19
 
 ### 🤝 Accept an Offer Without Traveling to the Module
