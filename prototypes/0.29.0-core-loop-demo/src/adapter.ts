@@ -19,6 +19,7 @@
  */
 
 import * as THREE from 'three';
+import { physicalDoorPose } from './doorLayout';
 
 export type VestibuleDoorId = 'north' | 'south' | 'east' | 'west';
 export type VestibuleLightState = 'idle' | 'cycling' | 'fault';
@@ -128,18 +129,14 @@ export function buildVestibule(doorId: VestibuleDoorId): THREE.Group {
     box(1.2, 0.08, 0.28, statusMat, 0, INNER_H + 0.22, z, 'vestibuleGlow'); // status strip
   }
 
-  // ── Orient + position per door. Door walls sit at ±6; local +Z maps to the
-  //    outward door axis, so the vestibule spans the ~6→9 band. Floor at y=0.
-  //    #66 S1: a slid door carries its vestibule anchor along the wall.
+  // ── Orient + position per door from the active layout. Local +Z maps to the
+  //    outward door axis, so the vestibule spans the ~half→half+3 band. Floor at
+  //    y=0. A slid door carries its anchor along the wall; the wall coord + yaw
+  //    follow the room size and layout.
   {
-    const p = slidDoorPos(doorId);
+    const p = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
     group.position.set(p.x, 0, p.z);
-    switch (doorId) {
-      case 'north': group.rotation.y = Math.PI; break;
-      case 'south': group.rotation.y = 0; break;
-      case 'east': group.rotation.y = Math.PI / 2; break;
-      case 'west': group.rotation.y = -Math.PI / 2; break;
-    }
+    group.rotation.y = p.outwardYaw;
   }
 
   return group;
@@ -519,40 +516,23 @@ export const CHAIN_PORTAL_MARGIN = 0.3;
 
 // ── #62 P3: far-room projection pose ─────────────────────────────────────────
 
-/** Room half-width (11.8 / 2) — the projection box's centre sits this far past
- *  the chain exit along the arrival heading (+ the exit-portal margin). */
+/** Half-size of the FAR room's projection box (its 11.8 grey box ÷ 2) — the
+ *  box centre sits this far past the chain exit so its near edge meets the
+ *  exit. This is the NEIGHBOUR's dimension; #66 R4 carries per-neighbour
+ *  farExtents. Until then it stays the default-room 5.9. */
 const ROOM_HALF = 5.9;
 /** Legacy fixed projection offset (room centre → adjoining module centre). */
 const LEGACY_PROJECTION_OFFSET = 15.2;
 
-/** Outward-normal yaw of each door in ROOM-LOCAL frame (matches the
- *  buildVestibule placement switch: south faces +Z = yaw 0). */
-const DOOR_YAW: Record<VestibuleDoorId, number> = {
-  south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2,
-};
-const DOOR_POS: Record<VestibuleDoorId, { x: number; z: number }> = {
-  south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, north: { x: 0, z: -6 }, west: { x: -6, z: 0 },
-};
-
 // ── 🧱 #66 S1: door-slide deltas (lateral along each door's wall) ────────────
 // world.reconcileDoorPlacements pushes these; every anchor in this module
-// (vestibule placement, projection poses) adds its door's delta on the wall's
-// lateral axis. 0 everywhere ⇒ bit-identical legacy math. Paired doors can't
-// slide (plan §6.2), so live chains never re-solve — the deltas matter for
-// FUTURE pairings and the unpaired-door peek.
+// (vestibule placement, projection poses) reads the door pose from doorLayout
+// WITH its delta applied. 0 everywhere, legacy layout ⇒ bit-identical legacy
+// math. Paired doors can't slide (plan §6.2), so live chains never re-solve.
 let slideDeltas: Record<VestibuleDoorId, number> = { north: 0, south: 0, east: 0, west: 0 };
 
 export function setDoorSlideDeltas(d: Record<VestibuleDoorId, number>): void {
   slideDeltas = { ...d };
-}
-
-/** A door's anchor point WITH its slide applied (n/s slide in x, e/w in z). */
-function slidDoorPos(doorId: VestibuleDoorId): { x: number; z: number } {
-  const base = DOOR_POS[doorId];
-  const d = slideDeltas[doorId] ?? 0;
-  return doorId === 'north' || doorId === 'south'
-    ? { x: base.x + d, z: base.z }
-    : { x: base.x, z: base.z + d };
 }
 
 /**
@@ -571,16 +551,18 @@ export function projectionPoseForDoor(
   segments?: ConnectorSegment[],
   farDoor?: VestibuleDoorId,
 ): { x: number; z: number; rotY: number } {
-  const dYaw = DOOR_YAW[doorId];
-  const dPos = slidDoorPos(doorId);
-  const base = DOOR_POS[doorId];
+  const doorPose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+  const dYaw = doorPose.outwardYaw;
+  const dPos = doorPose;
   if (!segments || segments.length === 0) {
-    // Legacy: centre 15.2 out along the cardinal axis; a slid door carries
-    // its projection sideways with it (lateral = the door's slide delta).
-    const northSouth = doorId === 'north' || doorId === 'south';
+    // Legacy: centre LEGACY_PROJECTION_OFFSET out from the room centre along
+    // the door's outward normal (= door centre + (OFFSET − 6)); a slid door
+    // carries its projection with it. Byte-identical to the pre-#66 cardinal
+    // pose at the default room. The −6 / OFFSET are neighbour-sized (#66 R4).
+    const distance = LEGACY_PROJECTION_OFFSET - 6;
     return {
-      x: northSouth ? dPos.x : Math.sign(base.x) * LEGACY_PROJECTION_OFFSET,
-      z: northSouth ? Math.sign(base.z) * LEGACY_PROJECTION_OFFSET : dPos.z,
+      x: dPos.x + Math.sin(dYaw) * distance,
+      z: dPos.z + Math.cos(dYaw) * distance,
       rotY: 0,
     };
   }
@@ -593,7 +575,7 @@ export function projectionPoseForDoor(
   const z = zr + Math.cos(heading) * ROOM_HALF;
   // Far room rotation: its `farDoor` faces BACK along the arrival heading.
   const rotY = farDoor !== undefined
-    ? heading + Math.PI - DOOR_YAW[farDoor]
+    ? heading + Math.PI - physicalDoorPose(farDoor).outwardYaw
     : heading;
   return { x, z, rotY };
 }
@@ -637,13 +619,11 @@ export function buildConnectorChain(doorId: VestibuleDoorId, segments: Connector
   exit.rotation.y = yaw;
   group.add(exit);
 
-  // Same wall-face placement as buildVestibule.
-  switch (doorId) {
-    case 'north': group.position.set(0, 0, -6); group.rotation.y = Math.PI; break;
-    case 'south': group.position.set(0, 0, 6); group.rotation.y = 0; break;
-    case 'east': group.position.set(6, 0, 0); group.rotation.y = Math.PI / 2; break;
-    case 'west': group.position.set(-6, 0, 0); group.rotation.y = -Math.PI / 2; break;
-  }
+  // Same wall-face placement as buildVestibule — pose from the active layout
+  // (wall coord + outward yaw), with the door's slide delta (0 for chain doors).
+  const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+  group.position.set(pose.x, 0, pose.z);
+  group.rotation.y = pose.outwardYaw;
   return group;
 }
 

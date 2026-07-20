@@ -18,7 +18,7 @@ import { rebuildObstacles } from './obstacles';
 import { rebakeWalkableGrid, walkable, worldToRow, worldToCol, colToWorld, rowToWorld } from './pathfinding';
 import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
 import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type DoorRecord } from './doorsDoc';
-import { readDoorDeltas } from './floorPlanDoc';
+import { readDoorDeltas, roomHalfExtents } from './floorPlanDoc';
 import { applyDoorSlideDeltas } from './doors';
 import { setDoorSlideDeltas } from './adapter';
 import { roomIdFromSeed } from './stationAtlas';
@@ -299,10 +299,14 @@ export class World {
    * Create the full platform (called during morph)
    */
   private createPlatform() {
-    const platformSize = 12;
+    // 🧱 #66 R1: the room is a rectangle of half-extents (halfX, halfZ) — floor
+    // and shell derive from these. Default 2×2 room ⇒ {6,6} ⇒ 12×12, so every
+    // derived value below reproduces the legacy literals bit-for-bit.
+    const { halfX, halfZ } = roomHalfExtents();
+    const platformW = 2 * halfX, platformD = 2 * halfZ;
 
     // Floor - warm light oak herringbone wood
-    const floorGeometry = new THREE.PlaneGeometry(platformSize, platformSize);
+    const floorGeometry = new THREE.PlaneGeometry(platformW, platformD);
 
     // Build a canvas herringbone wood texture
     const makeWoodTexture = (): THREE.CanvasTexture => {
@@ -357,7 +361,9 @@ export class World {
       const tex = new THREE.CanvasTexture(cv);
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
-      tex.repeat.set(3.5, 3.5);
+      // Scale the repeat with the plane so plank size stays constant in world
+      // space (3.5 over 12 m for the default room; bigger rooms tile more).
+      tex.repeat.set(3.5 * platformW / 12, 3.5 * platformD / 12);
       // Point (nearest-neighbour) sampling — preserves sharp pixel edges when
       // the low-res framebuffer is scaled up by the pixelation pass.
       tex.minFilter = THREE.NearestFilter;
@@ -382,7 +388,7 @@ export class World {
     // ── Click-navigation plane ────────────────────────────────────────────────
     // Invisible horizontal plane covering the walkable floor used as the
     // raycast hit target for point-and-click navigation.
-    const clickGeo = new THREE.PlaneGeometry(platformSize, platformSize);
+    const clickGeo = new THREE.PlaneGeometry(platformW, platformD);
     clickGeo.rotateX(-Math.PI / 2);
     const clickMat = new THREE.MeshBasicMaterial({
       visible: false,
@@ -393,8 +399,11 @@ export class World {
     this.clickPlane.userData = { isTile: true };
     this.platformGroup.add(this.clickPlane);
 
-    // Grid helper
-    this.platformGrid = new THREE.GridHelper(platformSize, 12, 0x1E88E5, 0x0A1E3A);
+    // Grid helper (invisible by default). GridHelper is square-only; size it to
+    // the larger dimension at 1 m divisions — cosmetic, never shown unless a dev
+    // toggles it, and the default room stays GridHelper(12, 12) exactly.
+    const gridSpan = Math.max(platformW, platformD);
+    this.platformGrid = new THREE.GridHelper(gridSpan, gridSpan, 0x1E88E5, 0x0A1E3A);
     this.platformGrid.position.y = 0.01;
     this.platformGrid.visible = false;
     this.platformGroup.add(this.platformGrid);
@@ -441,7 +450,8 @@ export class World {
    * Add transparent side walls on the left (X=-6) and right (X=+6) sides.
    */
   private addSideWalls() {
-    const wallDepth  = 12;
+    const { halfX, halfZ } = roomHalfExtents();
+    const wallDepth  = 2 * halfZ; // the left/right walls run the full Z span
     const wallHeight = 4;
     const wallThick  = 0.35;
     const wallY = wallHeight / 2;
@@ -479,10 +489,11 @@ export class World {
       }
 
       const tex = new THREE.CanvasTexture(cv);
-      // Repeat so a tile reads ≈ 0.25 m in world space (fine Habbo grid).
+      // Repeat so a tile reads ≈ 0.25 m in world space (fine Habbo grid) — scale
+      // with the wall run/height so tiles never stretch (12×4 for the default).
       tex.wrapS = THREE.RepeatWrapping;
       tex.wrapT = THREE.RepeatWrapping;
-      tex.repeat.set(12 / ((BW + MO) * 0.023), 4 / ((BH + MO) * 0.023));
+      tex.repeat.set(wallDepth / ((BW + MO) * 0.023), wallHeight / ((BH + MO) * 0.023));
       // Nearest-neighbour — keeps tile edges sharp in the pixelated renderer.
       tex.minFilter = THREE.NearestFilter;
       tex.magFilter = THREE.NearestFilter;
@@ -505,7 +516,7 @@ export class World {
     const wallGeo = new THREE.BoxGeometry(wallThick, wallHeight, wallDepth);
 
     const leftWall = new THREE.Mesh(wallGeo, makeMat());
-    leftWall.position.set(-6, wallY, 0);
+    leftWall.position.set(-halfX, wallY, 0);
     this.platformGroup.add(leftWall);
     this.sideWalls.push(leftWall);
 
@@ -519,7 +530,7 @@ export class World {
       opacity: 0,
     });
     const strip = new THREE.Mesh(edgeGeo, edgeMat.clone());
-    strip.position.set(-6, wallHeight + 0.05, 0);
+    strip.position.set(-halfX, wallHeight + 0.05, 0);
     this.platformGroup.add(strip);
     this.platformElements.push(strip);
   }
@@ -528,8 +539,10 @@ export class World {
    * Add complete capsule outer structure (Roof + solid outer walls for Level 3 isometric view)
    */
   private addCapsuleOuterStructure() {
+    const { halfX, halfZ } = roomHalfExtents();
+    const hullW = 2 * halfX + 0.35, hullD = 2 * halfZ + 0.35; // +0.35 hull overhang
     // 1. Sleek metallic outer roof
-    const roofGeo = new THREE.BoxGeometry(12.35, 0.28, 12.35);
+    const roofGeo = new THREE.BoxGeometry(hullW, 0.28, hullD);
     const outerMetallicMat = new THREE.MeshStandardMaterial({
       color: 0x2A3E52, // carbon structural blueprint slate
       roughness: 0.4,
@@ -542,26 +555,26 @@ export class World {
     this.platformGroup.add(this.capsuleRoof);
 
     // 2. Solid metallic outer front/back walls to block inner rendering during external views
-    const wallGeoF = new THREE.BoxGeometry(12.35, 4.0, 0.35);
+    const wallGeoF = new THREE.BoxGeometry(hullW, 4.0, 0.35);
     const frontWall = new THREE.Mesh(wallGeoF, outerMetallicMat);
-    frontWall.position.set(0, 2.0, 6.0);
+    frontWall.position.set(0, 2.0, halfZ);
     this.platformGroup.add(frontWall);
     this.capsuleOuterWalls.push(frontWall);
 
     const backWall = new THREE.Mesh(wallGeoF, outerMetallicMat);
-    backWall.position.set(0, 2.0, -6.0);
+    backWall.position.set(0, 2.0, -halfZ);
     this.platformGroup.add(backWall);
     this.capsuleOuterWalls.push(backWall);
-    
+
     // Also build a full solid left/right wall set with ports slots included
-    const wallGeoLR = new THREE.BoxGeometry(0.35, 4.0, 12.35);
+    const wallGeoLR = new THREE.BoxGeometry(0.35, 4.0, hullD);
     const rightWall = new THREE.Mesh(wallGeoLR, outerMetallicMat);
-    rightWall.position.set(6.0, 2.0, 0);
+    rightWall.position.set(halfX, 2.0, 0);
     this.platformGroup.add(rightWall);
     this.capsuleOuterWalls.push(rightWall);
 
     const leftWall = new THREE.Mesh(wallGeoLR, outerMetallicMat);
-    leftWall.position.set(-6.0, 2.0, 0);
+    leftWall.position.set(-halfX, 2.0, 0);
     this.platformGroup.add(leftWall);
     this.capsuleOuterWalls.push(leftWall);
   }
@@ -717,12 +730,15 @@ export class World {
    * furniture-drives-structure pattern as the fireplace/north door.
    */
   public updateSideWallCoverage(): void {
+    // "On a side wall's line" = within 1 m of the ±halfX wall (bricks at ±half).
+    const { halfX } = roomHalfExtents();
+    const nearWall = halfX - 1;
     this.sideWallCovered[0] = false;
     this.sideWallCovered[1] = false;
     for (const item of FURNITURE) {
       if (item.kind !== 'brick-wall' && item.kind !== 'window-wall') continue;
-      if (item.pos.x < -5) this.sideWallCovered[0] = true;
-      if (item.pos.x > 5) this.sideWallCovered[1] = true;
+      if (item.pos.x < -nearWall) this.sideWallCovered[0] = true;
+      if (item.pos.x > nearWall) this.sideWallCovered[1] = true;
     }
     // addSideWalls order: [0] = left (x=-6). The zoom machinery consults the
     // flags too (it force-restores walls at interior levels otherwise).
@@ -943,7 +959,10 @@ export class World {
     // 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid position
     // (front.x carries the slide delta), the plan §6.2 generalization seed.
     const cx = north.front.x;
-    const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
+    // The north wall sits at z = -halfZ; the zone reaches from just outside it
+    // (−0.2 m) to the door's stand-point (+1.6 m). Default room ⇒ -6.2 … -4.4.
+    const { halfZ } = roomHalfExtents();
+    const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -halfZ - 0.2, z1: -halfZ + 1.6 };
     const blocked = FURNITURE.some((item) => {
       if (item.kind !== 'fireplace-wall') return false;
       const fp = FURNITURE_DEFS[item.kind].footprint;
@@ -1351,11 +1370,14 @@ export class World {
       opacity: 0
     });
 
+    // Markers sit 0.5 m inside each corner (walls at ±half).
+    const { halfX, halfZ } = roomHalfExtents();
+    const mx = halfX - 0.5, mz = halfZ - 0.5;
     const positions = [
-      [-5.5, 0.2, -5.5],
-      [5.5, 0.2, -5.5],
-      [-5.5, 0.2, 5.5],
-      [5.5, 0.2, 5.5]
+      [-mx, 0.2, -mz],
+      [mx, 0.2, -mz],
+      [-mx, 0.2, mz],
+      [mx, 0.2, mz]
     ];
 
     positions.forEach(([x, y, z]) => {
@@ -1381,21 +1403,22 @@ export class World {
       opacity: 0
     });
 
-    const edgeGeometry = new THREE.BoxGeometry(12, 0.05, 0.1);
+    const { halfX, halfZ } = roomHalfExtents();
+    const edgeGeometry = new THREE.BoxGeometry(2 * halfX, 0.05, 0.1);
 
     const northEdge = new THREE.Mesh(edgeGeometry, edgeMaterial);
-    northEdge.position.set(0, 0.03, -6);
+    northEdge.position.set(0, 0.03, -halfZ);
     this.platformGroup.add(northEdge);
     this.platformElements.push(northEdge);
 
     const southEdge = new THREE.Mesh(edgeGeometry, edgeMaterial);
-    southEdge.position.set(0, 0.03, 6);
+    southEdge.position.set(0, 0.03, halfZ);
     this.platformGroup.add(southEdge);
     this.platformElements.push(southEdge);
 
-    const eastEdgeGeometry = new THREE.BoxGeometry(0.1, 0.05, 12);
+    const eastEdgeGeometry = new THREE.BoxGeometry(0.1, 0.05, 2 * halfZ);
     const westEdge = new THREE.Mesh(eastEdgeGeometry, edgeMaterial.clone());
-    westEdge.position.set(-6, 0.03, 0);
+    westEdge.position.set(-halfX, 0.03, 0);
     this.platformGroup.add(westEdge);
     this.platformElements.push(westEdge);
   }
@@ -2209,7 +2232,10 @@ export class World {
 
       // Threshold: pressed into the open doorway (the manual-movement clamp
       // stops the body at the wall, so "as far in as possible" IS the cross).
-      const inAperture = lateral < 0.95 && wallCoord > 5.15;
+      // The wall is at ±halfZ (n/s) or ±halfX (e/w); trip 0.85 m short of it.
+      const { halfX, halfZ } = roomHalfExtents();
+      const apThresh = (northSouth ? halfZ : halfX) - 0.85;
+      const inAperture = lateral < 0.95 && wallCoord > apThresh;
       if (inAperture) inAnyAperture = true;
       if (
         inAperture && paired && passable

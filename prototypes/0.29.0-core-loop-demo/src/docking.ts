@@ -35,6 +35,7 @@ import {
   seedFloorPlan, writeDoorPlacement, readDoorDeltas, lateralOf,
   LEGACY_PLACEMENTS, DOOR_LATTICE,
 } from './floorPlanDoc';
+import { physicalDoorPose } from './doorLayout';
 import { readAtlas, atlasLayout } from './stationAtlas';
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -174,13 +175,12 @@ export class DoorDockingPortSystem {
   private chainBoxesFor(doorId: 'north' | 'south' | 'east' | 'west'): Box[] {
     const segs = this.doorState.get(doorId)?.segments ?? [];
     if (segs.length === 0) return [];
-    const FACE: Record<string, { x: number; z: number }> = {
-      north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 },
-    };
-    const YAW: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
+    // Our door centre + outward normal come from the active layout; the chain
+    // projects outward from there. Paired doors don't slide (delta 0).
+    const pose = physicalDoorPose(doorId);
     const PAD = 0.85;
-    const face = FACE[doorId];
-    const yaw = YAW[doorId];
+    const face = { x: pose.x, z: pose.z };
+    const yaw = pose.outwardYaw;
     const c = Math.cos(yaw), s = Math.sin(yaw);
     const toWorld = (lx: number, lz: number) => ({
       x: face.x + lx * c + lz * s,
@@ -222,18 +222,21 @@ export class DoorDockingPortSystem {
   public buildPorts() {
     console.log('🚪 Constructing 4-Directional Docking Ports & Control Panels');
     
-    // Configurations: [doorId, pos, rot]
-    const doorsConfig: Array<{ id: 'north' | 'south' | 'east' | 'west'; pos: THREE.Vector3; rotY: number; isLarge: boolean }> = [
-      { id: 'north', pos: new THREE.Vector3(0, 2, -6), rotY: 0, isLarge: false }, // Small door (1.0m width)
-      { id: 'south', pos: new THREE.Vector3(0, 2, 6), rotY: Math.PI, isLarge: false }, // Small door (1.0m width)
-      { id: 'west', pos: new THREE.Vector3(-6, 2, 0), rotY: Math.PI / 2, isLarge: true }, // Large door (2.0m width)
-      { id: 'east', pos: new THREE.Vector3(6, 2, 0), rotY: -Math.PI / 2, isLarge: true }, // Large door (2.0m width)
+    // Door position + frame yaw come from the active layout (doorLayout.ts), so
+    // they follow the room size and any layout swap. Default 2×2 legacy room ⇒
+    // the legacy ±6 positions / cardinal yaws, bit-for-bit.
+    const doorsConfig: Array<{ id: 'north' | 'south' | 'east' | 'west'; isLarge: boolean }> = [
+      { id: 'north', isLarge: false }, // Small door (1.0m width)
+      { id: 'south', isLarge: false }, // Small door (1.0m width)
+      { id: 'west', isLarge: true },   // Large door (2.0m width)
+      { id: 'east', isLarge: true },   // Large door (2.0m width)
     ];
 
     for (const cfg of doorsConfig) {
+      const pose = physicalDoorPose(cfg.id);
       const doorGroup = new THREE.Group();
-      doorGroup.position.copy(cfg.pos);
-      doorGroup.rotation.y = cfg.rotY;
+      doorGroup.position.set(pose.x, 2, pose.z);
+      doorGroup.rotation.y = pose.frameYaw;
 
       // Walkability comes from the door registry: the north port hides behind
       // the fireplace, so it gets NO click box and NO isDoorBody tags —
@@ -1106,15 +1109,20 @@ export class DoorDockingPortSystem {
     // slides). Target = the matched door's face, in this door's chain frame.
     const mod = layout.find((m) => m.roomId === best!.roomId)!;
     const dyaw: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
+    // 🧱 #66: doorFaceLocal is the MATCHED NEIGHBOUR's door face in ITS frame —
+    // its size isn't known locally, so ±6 (default 2×2) holds until R4 carries
+    // per-neighbour farExtents. ourFace below IS our room ⇒ derives from ours.
     const doorFaceLocal = { north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 } }[best.door]!;
     const mc = Math.cos(mod.rotY), ms = Math.sin(mod.rotY);
     const faceWorld = {
       x: mod.x + doorFaceLocal.x * mc + doorFaceLocal.z * ms,
       z: mod.z - doorFaceLocal.x * ms + doorFaceLocal.z * mc,
     };
-    // Chain frame: origin at OUR door face, +z outward, rotated by our door's yaw.
-    const ourYaw = dyaw[doorId];
-    const ourFace = { north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 } }[doorId]!;
+    // Chain frame: origin at OUR door face, +z outward, rotated by our door's
+    // yaw — both from the active layout (neighbour's doorFaceLocal stays ±6, R4).
+    const ourPose = physicalDoorPose(doorId);
+    const ourYaw = ourPose.outwardYaw;
+    const ourFace = { x: ourPose.x, z: ourPose.z };
     const dx = faceWorld.x - ourFace.x, dz = faceWorld.z - ourFace.z;
     const oc = Math.cos(-ourYaw), os = Math.sin(-ourYaw);
     const targetLocal = {
@@ -1590,9 +1598,10 @@ export class DoorDockingPortSystem {
 
   public repositionDoorGroups(deltas: Record<'north' | 'south' | 'east' | 'west', number>): void {
     for (const [id, group] of this.doorObjects) {
-      const d = deltas[id as 'north' | 'south' | 'east' | 'west'] ?? 0;
-      if (id === 'north' || id === 'south') group.position.x = d;
-      else group.position.z = d;
+      const doorId = id as 'north' | 'south' | 'east' | 'west';
+      const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
+      group.position.set(pose.x, 2, pose.z);
+      group.rotation.y = pose.frameYaw;
     }
   }
 

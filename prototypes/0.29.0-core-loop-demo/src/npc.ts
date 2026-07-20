@@ -4,6 +4,7 @@
  */
 import * as THREE from 'three';
 import { InputManager } from './input';
+import { roomHalfExtents } from './floorPlanDoc';
 
 const W = 160, H = 240;
 
@@ -101,7 +102,13 @@ export class NPC {
   private facing = 1;
   private view: 'front'|'back'|'side' = 'front';
   private readonly SPEED = 2.2;
-  private readonly BOUND = 5.2;
+
+  /** Movement clamp: 0.8 m inside each wall, per axis (walls at ±half).
+   *  🧱 #66 R1 — default 2×2 room ⇒ ±5.2, the legacy BOUND scalar. */
+  private roomBounds(): { boundX: number; boundZ: number } {
+    const { halfX, halfZ } = roomHalfExtents();
+    return { boundX: halfX - 0.8, boundZ: halfZ - 0.8 };
+  }
 
   // Sit state
   private sitting = false;
@@ -152,9 +159,10 @@ export class NPC {
       const adx = Math.abs(nx), adz = Math.abs(nz);
       this.view = adz > adx * 1.2 ? (nz < 0 ? 'back' : 'front') : 'side';
 
-      const candX = Math.max(-this.BOUND, Math.min(this.BOUND, pos.x + nx * this.SPEED * dt));
+      const { boundX, boundZ } = this.roomBounds();
+      const candX = Math.max(-boundX, Math.min(boundX, pos.x + nx * this.SPEED * dt));
       const r1 = resolveObstacles(candX, pos.z);
-      const candZ = Math.max(-this.BOUND, Math.min(this.BOUND, pos.z + nz * this.SPEED * dt));
+      const candZ = Math.max(-boundZ, Math.min(boundZ, pos.z + nz * this.SPEED * dt));
       const r2 = resolveObstacles(r1.x, candZ);
       pos.x = r2.x; pos.z = r2.z;
       pos.y = 1.0 + Math.abs(Math.sin(this.elapsed * 6.5)) * (this.view === 'side' ? 0.058 : 0.038);

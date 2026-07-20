@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.36 — 2026-07-20
+
+### 🧱 Room Fundamentals — Rooms Can Become Any Rectangle (Groundwork)
+
+- **Invisible by design — the room looks and plays exactly as before.** This release rebuilds the room's "fundamentals" so a room's size is no longer hardcoded: every wall, the floor, the walkable grid, furniture-placement limits, the player's (and NPCs') movement bounds, and all four doors now derive from the room's dimensions instead of assuming today's 12×12 square. Today's room is exactly a 2×2 block of 6-metre tiles, so every one of those reproduces the old numbers to the millimetre — verified byte-identical on a live default room (walls at ±6, floor 12×12, door walk-targets unchanged). Nothing you can see or do changes yet; this is the foundation for rooms of different sizes (any rectangle up to 30×30 m), tracked in #66.
+- **One door system instead of three.** Where each door sits, its walk-in point, its frame yaw, and its docking connector are now computed in a single place (`doorLayout.ts`) from the room size and the room's chosen door layout — replacing three overlapping copies of that math that had drifted apart. It also lets a room re-arrange its doors (e.g. grouping them on one wall) without touching the rest of the code — the seam the upcoming casino and pool rooms plug into. Legacy layout on today's room is bit-identical.
+- **A latent bug fixed in passing:** a door could theoretically be slid off the end of a very short wall in a future small room; the slide limit now derives from that wall's actual length so it can't leave the wall.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.36 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.35 — 2026-07-20
 
 ### 🏊 Pool & Hot Tub Are Furniture Now

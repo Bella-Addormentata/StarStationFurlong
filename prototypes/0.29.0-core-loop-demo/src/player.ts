@@ -68,6 +68,7 @@ import { updateDebugHUD, showHint } from './hud';
 import { VoxelCharacter } from './voxelCharacter';
 import { WaypointReticle } from './waypoint';
 import { findPath, worldToCol, worldToRow } from './pathfinding';
+import { roomHalfExtents } from './floorPlanDoc';
 import { OBSTACLES } from './obstacles';
 import { POOL_WATER_Y, POOL_SWIM_Y, DIVE_TIME, DIVE_ARC_LIFT, FURNITURE, getPoolBasin } from './furniture';
 import type { Seat } from './seats';
@@ -121,7 +122,13 @@ export class Player {
   private character: VoxelCharacter;
   private logicalAngle = 0;
   private readonly SPEED = 2.8;
-  private readonly BOUND = 5.2;
+
+  /** Manual-movement clamp: 0.8 m inside each wall (walls at ±half), per axis.
+   *  🧱 #66 R1 — default 2×2 room ⇒ {6,6} ⇒ ±5.2, the legacy BOUND scalar. */
+  private roomBounds(): { boundX: number; boundZ: number } {
+    const { halfX, halfZ } = roomHalfExtents();
+    return { boundX: halfX - 0.8, boundZ: halfZ - 0.8 };
+  }
 
   // ── Navigation state ───────────────────────────────────────────────────────
   private navMode: NavigationMode = 'MANUAL';
@@ -1045,8 +1052,9 @@ export class Player {
 
       this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
 
-      const candX = Math.max(-this.BOUND, Math.min(this.BOUND, pos.x + nx * this.SPEED * deltaTime));
-      const candZ = Math.max(-this.BOUND, Math.min(this.BOUND, pos.z + nz * this.SPEED * deltaTime));
+      const { boundX, boundZ } = this.roomBounds();
+      const candX = Math.max(-boundX, Math.min(boundX, pos.x + nx * this.SPEED * deltaTime));
+      const candZ = Math.max(-boundZ, Math.min(boundZ, pos.z + nz * this.SPEED * deltaTime));
       
       // Separate sliding resolution over Obstacles to prevent sticking on corners during walking (AABB Sliding)
       const r1 = resolveObstacles(candX, pos.z);
@@ -1145,13 +1153,14 @@ export class Player {
       const step = Math.min(this.SPEED * deltaTime, dist);
       const candX = pos.x + nx * step;
       const candZ = pos.z + nz * step;
+      const { boundX, boundZ } = this.roomBounds();
       const r1 = resolveObstacles(
-        Math.max(-this.BOUND, Math.min(this.BOUND, candX)),
+        Math.max(-boundX, Math.min(boundX, candX)),
         pos.z,
       );
       const r2 = resolveObstacles(
         r1.x,
-        Math.max(-this.BOUND, Math.min(this.BOUND, candZ)),
+        Math.max(-boundZ, Math.min(boundZ, candZ)),
       );
       pos.x = r2.x;
       pos.z = r2.z;

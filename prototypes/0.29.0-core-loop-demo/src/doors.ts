@@ -17,6 +17,8 @@
  * Geometry matches the door groups placed by docking.ts buildPorts().
  */
 
+import { physicalDoorPose } from './doorLayout';
+
 export type DoorId = 'north' | 'south' | 'east' | 'west';
 
 export interface DoorTarget {
@@ -42,35 +44,24 @@ export function findDoor(id: string): DoorTarget | null {
   return null;
 }
 
-// ── 🧱 #66 S1: door-slide — walk targets follow the placement ────────────────
-// The DOORS values above are the LEGACY BASE (captured below before any
-// mutation); a slide applies a lateral delta along the door's wall to
-// front/through. Delta 0 ⇒ bit-identical legacy targets. `enabled` is
-// deliberately untouched — the fireplace blocking rule owns it at runtime.
+// ── 🚪 Door pose comes from doorLayout.ts (the single derived authority) ──────
+// The DOORS values above are the legacy default (used until the first
+// applyDoorSlideDeltas at boot). A slide applies a lateral delta along the
+// door's wall; physicalDoorPose() re-derives front/through/faceAngle from the
+// room size + active layout. Delta 0, legacy layout, default room ⇒ bit-
+// identical legacy targets. `enabled` is deliberately untouched — the fireplace
+// blocking rule owns it at runtime.
 
-const BASE_POINTS: Record<DoorId, { front: { x: number; z: number }; through: { x: number; z: number } }> = {
-  north: { front: { x: 0, z: -4.5 }, through: { x: 0, z: -7.0 } },
-  south: { front: { x: 0, z: 4.5 }, through: { x: 0, z: 7.0 } },
-  west: { front: { x: -4.5, z: -0.5 }, through: { x: -7.0, z: -0.5 } },
-  east: { front: { x: 4.5, z: -0.5 }, through: { x: 7.0, z: -0.5 } },
-};
-
-/** Re-derive every door's walk points from its slide delta (0 = legacy). */
+/** Re-derive every door's walk points + facing from its slide delta (0 =
+ *  legacy) via the active door layout. */
 export function applyDoorSlideDeltas(deltas: Record<DoorId, number>): void {
   for (const door of DOORS) {
-    const base = BASE_POINTS[door.id];
-    const d = deltas[door.id] ?? 0;
-    if (door.id === 'north' || door.id === 'south') {
-      door.front.x = base.front.x + d;
-      door.front.z = base.front.z;
-      door.through.x = base.through.x + d;
-      door.through.z = base.through.z;
-    } else {
-      door.front.x = base.front.x;
-      door.front.z = base.front.z + d;
-      door.through.x = base.through.x;
-      door.through.z = base.through.z + d;
-    }
+    const pose = physicalDoorPose(door.id, deltas[door.id] ?? 0);
+    door.front.x = pose.front.x;
+    door.front.z = pose.front.z;
+    door.through.x = pose.through.x;
+    door.through.z = pose.through.z;
+    door.faceAngle = pose.faceAngle;
   }
 }
 
