@@ -164,6 +164,21 @@ export function seedFurnitureDefaults(): void {
   });
 }
 
+/**
+ * 🏗️ Room templates (dev tool): atomically REPLACE the whole room layout with
+ * `items` — clear every existing record then place the template — in ONE
+ * transaction, so the furniture reconcile rebuilds the room exactly once (no
+ * per-item thrash) and every peer converges to the same layout. Owner-only in
+ * practice, like the other writers.
+ */
+export function replaceAllFurniture(items: FurnitureItem[]): void {
+  if (!docAlive()) return;
+  boundDoc!.transact(() => {
+    for (const id of [...furnitureMap!.keys()]) furnitureMap!.delete(id);
+    for (const item of items) furnitureMap!.set(item.id, toRecord(item));
+  });
+}
+
 /** Pristine copy of the default layout, captured at module load — the live
  *  FURNITURE array is reconciled to doc state afterwards, so it can't serve
  *  as the reference once a room is joined. */

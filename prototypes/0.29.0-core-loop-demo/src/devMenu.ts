@@ -52,6 +52,7 @@ import { findFreeExteriorSpot } from './hull';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
+import { ROOM_TEMPLATES, applyRoomTemplate, exportCurrentRoomAsTemplate } from './roomTemplates';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
@@ -627,6 +628,21 @@ function buildPanel(): HTMLDivElement {
     </div>
   `;
 
+  // 🏗️ Room templates — one-click place a whole authored room (RCT-style), or
+  // EXPORT the current layout to the console to seed a new template in code.
+  const templateRows = ROOM_TEMPLATES.map((t) => `
+    <div style="${ROW_STYLE}">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${t.description}">${t.name.toUpperCase()}</span>
+      <button type="button" data-dev-action="place-template" data-template="${t.id}" style="${BTN_STYLE}">PLACE</button>
+    </div>
+  `);
+  templateRows.push(`
+    <div style="${ROW_STYLE}">
+      <span>SAVE THIS ROOM → CONSOLE</span>
+      <button type="button" data-dev-action="export-template" style="${BTN_STYLE}">EXPORT</button>
+    </div>
+  `);
+
   el.innerHTML = `
     <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;
       padding:10px 12px 8px; border-bottom:2px dashed ${DEV_AMBER_DIM};">
@@ -637,6 +653,7 @@ function buildPanel(): HTMLDivElement {
       <div style="font-size:9px; color:rgba(255,179,0,0.45); letter-spacing:0.5px; padding-top:6px;">
         Free spawns for demo testing · toggle with the DEV button or the \` key · ESC closes
       </div>
+      ${sectionHtml('ROOM TEMPLATES', 'one-click place · REPLACES the room', templateRows)}
       ${sectionHtml('ITEMS', 'into the room trunk', itemRows)}
       ${sectionHtml('OUTFITS', null, outfitRows)}
       ${sectionHtml('FURNITURE', 'synced to the room (E4)', furnitureRows)}
@@ -661,6 +678,25 @@ function buildPanel(): HTMLDivElement {
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
+      case 'place-template': {
+        const w = getWorld();
+        if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        const t = applyRoomTemplate(btn.dataset.template ?? '');
+        if (!t) break;
+        // Furniture rebuilds via the doc subscription (replaceAllFurniture);
+        // now move the doors + walls to the template's layout.
+        w.reconcileDoorPlacements();
+        w.updateSideWallCoverage();
+        showHint(`DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces.`);
+        break;
+      }
+      case 'export-template': {
+        const w = getWorld();
+        if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        const n = exportCurrentRoomAsTemplate();
+        showHint(`DEV: 🏗️ ${n} pieces logged to the console.`);
+        break;
+      }
       case 'place-inventory':
         // Rows re-render synchronously on each place; a double-click's second
         // click lands on whatever row shifted up into the same spot and would

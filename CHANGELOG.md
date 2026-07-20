@@ -11,6 +11,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.38 — 2026-07-20
+
+### 🏗️ Room Templates in the Dev Menu — one-click room presets
+
+- **Place a whole designed room with one click** (dev menu → ROOM TEMPLATES). Three presets to start — **Grand Lobby**, **Luxury Casino**, and **Infinity Pool Deck** — each drops the full furniture layout AND switches the doors to the arrangement it was designed for, so the room reads correctly. The RollerCoaster-Tycoon idea: pick a ready-made room, or keep building piece-by-piece with the furniture spawner.
+- **Built for variants.** The registry is keyed `casino-1`, `pool-1`, … so multiple designs per type (a `casino-2`, a `pool-2` with the hot tub in the middle of the pool, etc.) just slot in.
+- **EXPORT** captures the current room's layout to the console as a paste-ready manifest — arrange a room by hand, export it, and promote it to a permanent template. That's how new variants get authored.
+- Dev tool for now; the plan is to surface a **template dropdown when you provision a new room at the door panel** — where "Empty" becomes one of the choices (folding in the empty-by-default idea).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.38, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.37 — 2026-07-20
 
 ### 🧱 Room Fundamentals Derive From Size (Groundwork for Different-Sized Rooms)
