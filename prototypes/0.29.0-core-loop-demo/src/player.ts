@@ -830,6 +830,12 @@ export class Player {
     return this.logicalAngle;
   }
 
+  /** 🤖 Current logical heading (atan2(nx,nz) convention) — the waiter bot
+   *  uses it to tell a fox walking UP TO the tray from one passing by. */
+  public getFacing(): number {
+    return this.logicalAngle;
+  }
+
   /**
    * 🛏️ The occupied seat's root elevation (BUNK_TOP_Y for the top bunk,
    * BUNK_BOTTOM_Y for the bottom, 0 for every floor-level seat) — the tick

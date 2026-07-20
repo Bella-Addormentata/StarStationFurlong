@@ -9,6 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import { physicalDoorPose, setActiveDoorLayout } from "./doorLayout";
 import { Player } from "./player";
+import { PoolWaiter } from "./poolWaiter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { getDefaultRoomId } from "./identity";
@@ -132,6 +133,10 @@ export class World {
   private platformGrid: THREE.GridHelper | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
+  /** 🚪 Glassy north wall backing the paired doors (no coverage rule). */
+  private northWall: THREE.Mesh | null = null;
+  /** 🤖 Drink-service waiter bot — roams the LOBBY (not pool/casino rooms). */
+  private poolWaiter: PoolWaiter | null = null;
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -172,8 +177,11 @@ export class World {
   private pairedVestibules: Map<DoorId, THREE.Group> = new Map();
   /** Door whose vestibule is lit for an in-flight transit, or null. */
   private transitVestibuleDoorId: DoorId | null = null;
-  /** Resting opacity of a paired-door vestibule when the player is far. */
-  private static readonly VESTIBULE_BASE_OPACITY = 0.25;
+  /** Resting opacity of a paired-door vestibule when the player is far.
+   *  0 — the ghost gangways read as a pile of dark capsules outside the
+   *  walls (owner request: remove them from view); the tube still fades in
+   *  on approach and goes solid during a transit. */
+  private static readonly VESTIBULE_BASE_OPACITY = 0;
   /** Proximity fade range (m from the door's front stand-point). */
   private static readonly VESTIBULE_FADE_RANGE = 4.0;
   // Lobby furniture (fades in to full opacity)
@@ -619,7 +627,17 @@ export class World {
     this.platformGroup.add(leftWall);
     this.sideWalls.push(leftWall);
 
-    // Subtle top-edge coping strip for left wall only
+    // 🚪 North wall — same glassy tile treatment. The paired door layout puts
+    // TWO doors on the north wall; without a wall panel there they floated on
+    // the room boundary (owner: "doors must read inset in a wall, like the
+    // west one"). Kept out of sideWalls: the window-wall coverage rule is
+    // side-wall (|x|>5) specific.
+    const northWallGeo = new THREE.BoxGeometry(wallDepth, wallHeight, wallThick);
+    this.northWall = new THREE.Mesh(northWallGeo, makeMat());
+    this.northWall.position.set(0, wallY, -6);
+    this.platformGroup.add(this.northWall);
+
+    // Subtle top-edge coping strips
     const edgeGeo = new THREE.BoxGeometry(
       wallThick + 0.06,
       0.1,
@@ -636,6 +654,13 @@ export class World {
     strip.position.set(-6, wallHeight + 0.05, 0);
     this.platformGroup.add(strip);
     this.platformElements.push(strip);
+    const northStrip = new THREE.Mesh(
+      new THREE.BoxGeometry(wallDepth + 0.06, 0.1, wallThick + 0.06),
+      edgeMat.clone(),
+    );
+    northStrip.position.set(0, wallHeight + 0.05, -6);
+    this.platformGroup.add(northStrip);
+    this.platformElements.push(northStrip);
   }
 
   /**
@@ -861,6 +886,7 @@ export class World {
     this.sideWalls.forEach((wall, i) => {
       wall.visible = !this.hullEditView && !this.sideWallCovered[i];
     });
+    if (this.northWall) this.northWall.visible = !this.hullEditView;
   }
 
   /** Which built-in side walls are REPLACED by placed wall sections. */
@@ -876,6 +902,7 @@ export class World {
     this.sideWalls.forEach((wall, i) => {
       wall.visible = !on && !this.sideWallCovered[i];
     });
+    if (this.northWall) this.northWall.visible = !on;
   }
 
   /**
@@ -1255,6 +1282,16 @@ export class World {
     // only the outdoor pool room keeps its legacy four-wall doors (its west
     // door intentionally drops arrivals into the water).
     setActiveDoorLayout(outdoor ? "legacy" : "casino-pairs");
+
+    // 🤖 The waiter bot roams the LOBBY aisles (owner request — same bot as
+    // the pool branch's poolside waiter, same serve interaction).
+    const lobby = !outdoor && !casino;
+    if (lobby && !this.poolWaiter) {
+      this.poolWaiter = new PoolWaiter(this.scene);
+    } else if (!lobby && this.poolWaiter) {
+      this.poolWaiter.dispose();
+      this.poolWaiter = null;
+    }
     const doorDeltas = readDoorDeltas();
     applyDoorSlideDeltas(doorDeltas);
     setDoorSlideDeltas(doorDeltas);
@@ -1412,8 +1449,12 @@ export class World {
     // 🧊 Walls: the pale-blue tile wall shows in BOTH rooms (owner request —
     // it carries the starry windows and reads light/airy at its glassy
     // opacity). No tint — the tile texture's own palette is the look.
-    this.sideWalls.forEach((wall, i) => {
-      wall.visible = !this.hullEditView && !this.sideWallCovered[i];
+    const themedWalls: THREE.Mesh[] = [...this.sideWalls];
+    if (this.northWall) themedWalls.push(this.northWall);
+    themedWalls.forEach((wall, i) => {
+      wall.visible =
+        !this.hullEditView &&
+        (wall === this.northWall || !this.sideWallCovered[i]);
       const mat = wall.material as THREE.MeshStandardMaterial;
       if (mat && "color" in mat) {
         mat.color.setHex(casino ? 0xffdfad : 0xffffff);
@@ -2221,6 +2262,10 @@ export class World {
     this.sideWalls.forEach((wall) => {
       (wall.material as THREE.MeshStandardMaterial).opacity = eased * 0.35;
     });
+    if (this.northWall) {
+      (this.northWall.material as THREE.MeshStandardMaterial).opacity =
+        eased * 0.35;
+    }
 
     // Fade in furniture to its design opacity — materials declaring a
     // userData.baseOpacity (the map table's translucent holo disc/ring, M4)
@@ -2286,6 +2331,7 @@ export class World {
       this.sideWalls.forEach((wall) => {
         wall.visible = false;
       });
+      if (this.northWall) this.northWall.visible = false;
 
       if (zoomLevel === 4) {
         // Level 4 (Space Station) uses a simpler silhouette/solid representation of the capsules
@@ -2345,6 +2391,7 @@ export class World {
       this.sideWalls.forEach((wall, i) => {
         wall.visible = !this.hullEditView && !this.sideWallCovered[i];
       });
+      if (this.northWall) this.northWall.visible = !this.hullEditView;
 
       // Completely clear and hide outer capsule roof and shielding so they don't block the camera!
       if (this.capsuleRoof) {
@@ -2397,6 +2444,12 @@ export class World {
 
     // 🧬 Advance clone-vat drain / door-spin cycles (same idiom)
     for (const vat of this.cloneVats.values()) vat.update(deltaTime);
+
+    // 🤖 Lobby waiter bot: patrols the aisles and serves the local fox.
+    this.poolWaiter?.update(
+      deltaTime,
+      this.isPlayerActive() ? this.player : null,
+    );
 
     // #51 — paired-door vestibules: spawn/dispose from pairing state, drive
     // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.
