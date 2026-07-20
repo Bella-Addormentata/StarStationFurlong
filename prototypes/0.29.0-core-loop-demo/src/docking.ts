@@ -9,33 +9,58 @@
  *   - Lightly rendered "gray box" projections of connected adjacent chambers.
  */
 
-import * as THREE from 'three';
-import { findDoor } from './doors';
-import type { DoorId } from './doors';
-import { getCameraYaw } from './cameraRig';
-import { projectionPoseForDoor, solveChain, foldChainEnd, type ConnectorSegment } from './adapter';
+import * as THREE from "three";
+import { findDoor } from "./doors";
+import type { DoorId } from "./doors";
+import { physicalDoorPose } from "./doorLayout";
+import { getCameraYaw } from "./cameraRig";
+import {
+  projectionPoseForDoor,
+  solveChain,
+  foldChainEnd,
+  type ConnectorSegment,
+} from "./adapter";
 // 🛰️ Hull space: built chains register their swept boxes so exterior mounts
 // can't be placed through a vestibule — and the assembly UI warns the other
 // way when a chain would run through mounted equipment.
-import { setChainBoxProvider, exteriorItemBoxes } from './hull';
-import type { Box } from './furniture';
+import { setChainBoxProvider, exteriorItemBoxes } from "./hull";
+import type { Box } from "./furniture";
 import {
-  armedPreset, presetSegments, partsCount, consumePart, refundPart,
-  consumeForSegments, refundForSegments,
-} from './stationParts';
+  armedPreset,
+  presetSegments,
+  partsCount,
+  consumePart,
+  refundPart,
+  consumeForSegments,
+  refundForSegments,
+} from "./stationParts";
 import {
-  readDoorPolicy, writeDoorPolicy, passageLabel, readDoorRequests, readDoorGrants,
-  writeDoorRequest, removeDoorRequest, writeDoorGrant, removeDoorGrant,
-  hasDoorGrant, hasDoorRequest, type ConstructionMode, type DoorPolicyRecord,
-} from './doorPolicy';
-import { getIdentityPub } from './keypair';
-import { getPlayerName } from './identity';
-import { deleteDoorPairing } from './doorsDoc';
+  readDoorPolicy,
+  writeDoorPolicy,
+  passageLabel,
+  readDoorRequests,
+  readDoorGrants,
+  writeDoorRequest,
+  removeDoorRequest,
+  writeDoorGrant,
+  removeDoorGrant,
+  hasDoorGrant,
+  hasDoorRequest,
+  type ConstructionMode,
+  type DoorPolicyRecord,
+} from "./doorPolicy";
+import { getIdentityPub } from "./keypair";
+import { getPlayerName } from "./identity";
+import { deleteDoorPairing } from "./doorsDoc";
 import {
-  seedFloorPlan, writeDoorPlacement, readDoorDeltas, lateralOf,
-  LEGACY_PLACEMENTS, DOOR_LATTICE,
-} from './floorPlanDoc';
-import { readAtlas, atlasLayout } from './stationAtlas';
+  seedFloorPlan,
+  writeDoorPlacement,
+  readDoorDeltas,
+  lateralOf,
+  LEGACY_PLACEMENTS,
+  DOOR_LATTICE,
+} from "./floorPlanDoc";
+import { readAtlas, atlasLayout } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -45,7 +70,7 @@ function moveToward(current: number, target: number, maxStep: number): number {
 }
 
 export interface DockingState {
-  doorId: 'north' | 'south' | 'east' | 'west';
+  doorId: "north" | "south" | "east" | "west";
   locked: boolean;
   pinCode: string;
   connectedRoomAddress: string; // Target room URL seed
@@ -55,7 +80,7 @@ export interface DockingState {
    *  connector chain + far-side geometry, mirrored from the doors doc. P3
    *  renders the chain + poses the projection from these; P2 only stores/diffs. */
   segments?: ConnectorSegment[];
-  farDoor?: 'north' | 'south' | 'east' | 'west';
+  farDoor?: "north" | "south" | "east" | "west";
   farYawDeg?: 0 | 45;
   /** #67 D2: this pairing is a TRANSIENT guest berth (docking adapter). */
   transient?: boolean;
@@ -63,17 +88,21 @@ export interface DockingState {
 
 export class DoorDockingPortSystem {
   private roomsGroup: THREE.Group;
-  private doorState: Map<'north' | 'south' | 'east' | 'west', DockingState> = new Map();
+  private doorState: Map<"north" | "south" | "east" | "west", DockingState> =
+    new Map();
   private doorObjects: Map<string, THREE.Group> = new Map();
   /** Room ENTRY policy (public doors) — distinct from the per-door pairing
    *  lock the terminal manages. Tints every door's status LED so the room's
    *  openness is legible at each threshold. Re-asserted on door (re)build. */
-  private accessMode: 'public' | 'pass' | 'keyed' = 'pass';
+  private accessMode: "public" | "pass" | "keyed" = "pass";
   private adjacentRooms: Map<string, THREE.Mesh> = new Map();
 
   // ── Update-loop-driven leaf slides ─────────────────────────────────────────
   /** In-flight slide per door; a new open/close overwrites the entry. */
-  private slideAnims = new Map<DoorId, { openTarget: number; onComplete?: () => void }>();
+  private slideAnims = new Map<
+    DoorId,
+    { openTarget: number; onComplete?: () => void }
+  >();
   /** Leaf slide speed (metres/second). */
   private readonly SLIDE_SPEED = 2.2;
 
@@ -90,17 +119,13 @@ export class DoorDockingPortSystem {
   private doorFadeOpacity: Map<DoorId, number> = new Map();
   /** Resting opacity of a camera-facing door in the isometric view. */
   private static readonly FACING_FADE_OPACITY = 0.35;
-  /** Outward wall normals (XZ) — dot against the camera azimuth direction. */
-  private static readonly DOOR_NORMALS: Record<DoorId, { x: number; z: number }> = {
-    north: { x: 0, z: -1 },
-    south: { x: 0, z: 1 },
-    east:  { x: 1, z: 0 },
-    west:  { x: -1, z: 0 },
-  };
-  
   // Handlers
-  private onConnectionRequestCallback: ((doorId: string, address: string) => void) | null = null;
-  private onPairingStatusChangedCallback: ((doorId: string, status: string) => void) | null = null;
+  private onConnectionRequestCallback:
+    | ((doorId: string, address: string) => void)
+    | null = null;
+  private onPairingStatusChangedCallback:
+    | ((doorId: string, status: string) => void)
+    | null = null;
   /** #62 P4: main.ts answers "may this address pair without a far-side human?"
    *  — true for modules THIS client minted (the ledger) when AUTO-ACCEPT MY
    *  MODULES is on. Removes 12 hop-accept-hop round trips from the octagon. */
@@ -123,15 +148,15 @@ export class DoorDockingPortSystem {
   private canConstruct(doorId: string): boolean {
     if (this.isRoomOwner()) return true;
     const mode = readDoorPolicy(doorId).construction;
-    if (mode === 'public') return true;
-    if (mode === 'request') return hasDoorGrant(doorId, getIdentityPub());
+    if (mode === "public") return true;
+    if (mode === "request") return hasDoorGrant(doorId, getIdentityPub());
     return false;
   }
 
   /** #67 D1: may the LOCAL player operate (lock/unlock) this door? Follows the
    *  PASSAGE policy — 'public' (default) keeps today's anyone-can behavior. */
   private canOperateDoor(doorId: string): boolean {
-    return this.isRoomOwner() || readDoorPolicy(doorId).passage === 'public';
+    return this.isRoomOwner() || readDoorPolicy(doorId).passage === "public";
   }
 
   /** Vestibule-findings fix (ghost residue): doors whose chain came from the
@@ -171,17 +196,15 @@ export class DoorDockingPortSystem {
   }
 
   /** One door's chain, folded joint by joint into padded world-XZ boxes. */
-  private chainBoxesFor(doorId: 'north' | 'south' | 'east' | 'west'): Box[] {
+  private chainBoxesFor(doorId: "north" | "south" | "east" | "west"): Box[] {
     const segs = this.doorState.get(doorId)?.segments ?? [];
     if (segs.length === 0) return [];
-    const FACE: Record<string, { x: number; z: number }> = {
-      north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 },
-    };
-    const YAW: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
     const PAD = 0.85;
-    const face = FACE[doorId];
-    const yaw = YAW[doorId];
-    const c = Math.cos(yaw), s = Math.sin(yaw);
+    const pose = physicalDoorPose(doorId);
+    const face = { x: pose.x, z: pose.z };
+    const yaw = pose.outwardYaw;
+    const c = Math.cos(yaw),
+      s = Math.sin(yaw);
     const toWorld = (lx: number, lz: number) => ({
       x: face.x + lx * c + lz * s,
       z: face.z - lx * s + lz * c,
@@ -192,8 +215,10 @@ export class DoorDockingPortSystem {
       const p = foldChainEnd(segs.slice(0, i));
       const cur = toWorld(p.x, p.z);
       out.push({
-        x0: Math.min(prev.x, cur.x) - PAD, z0: Math.min(prev.z, cur.z) - PAD,
-        x1: Math.max(prev.x, cur.x) + PAD, z1: Math.max(prev.z, cur.z) + PAD,
+        x0: Math.min(prev.x, cur.x) - PAD,
+        z0: Math.min(prev.z, cur.z) - PAD,
+        x1: Math.max(prev.x, cur.x) + PAD,
+        z1: Math.max(prev.z, cur.z) + PAD,
       });
       prev = cur;
     }
@@ -201,13 +226,18 @@ export class DoorDockingPortSystem {
   }
 
   private initializeDoorStates() {
-    const directions: ('north' | 'south' | 'east' | 'west')[] = ['north', 'south', 'east', 'west'];
+    const directions: ("north" | "south" | "east" | "west")[] = [
+      "north",
+      "south",
+      "east",
+      "west",
+    ];
     for (const dir of directions) {
       this.doorState.set(dir, {
         doorId: dir,
         locked: false,
-        pinCode: '',
-        connectedRoomAddress: '',
+        pinCode: "",
+        connectedRoomAddress: "",
         pairingPending: false,
         pairedSuccessfully: false,
       });
@@ -220,15 +250,20 @@ export class DoorDockingPortSystem {
    * large doors take 2 grid cells width (2.0m on wall)
    */
   public buildPorts() {
-    console.log('🚪 Constructing 4-Directional Docking Ports & Control Panels');
-    
+    console.log("🚪 Constructing 4-Directional Docking Ports & Control Panels");
+
     // Configurations: [doorId, pos, rot]
-    const doorsConfig: Array<{ id: 'north' | 'south' | 'east' | 'west'; pos: THREE.Vector3; rotY: number; isLarge: boolean }> = [
-      { id: 'north', pos: new THREE.Vector3(0, 2, -6), rotY: 0, isLarge: false }, // Small door (1.0m width)
-      { id: 'south', pos: new THREE.Vector3(0, 2, 6), rotY: Math.PI, isLarge: false }, // Small door (1.0m width)
-      { id: 'west', pos: new THREE.Vector3(-6, 2, 0), rotY: Math.PI / 2, isLarge: true }, // Large door (2.0m width)
-      { id: 'east', pos: new THREE.Vector3(6, 2, 0), rotY: -Math.PI / 2, isLarge: true }, // Large door (2.0m width)
-    ];
+    const doorsConfig = (["north", "south", "west", "east"] as const).map(
+      (id) => {
+        const pose = physicalDoorPose(id);
+        return {
+          id,
+          pos: new THREE.Vector3(pose.x, 2, pose.z),
+          rotY: pose.frameYaw,
+          isLarge: id === "west" || id === "east",
+        };
+      },
+    );
 
     for (const cfg of doorsConfig) {
       const doorGroup = new THREE.Group();
@@ -244,17 +279,25 @@ export class DoorDockingPortSystem {
       // Local geometry conventions: group centre sits at world y=2, so the
       // floor is local y=-2. Opening = 1.4w x 3.0h (small) / 2.4w x 3.0h (large).
       const openingWidth = cfg.isLarge ? 2.4 : 1.4;
-      const OPEN_H = 3.0;      // opening height (local y -2 .. 1)
-      const POST_W = 0.3;      // side post width
-      const FRAME_D = 0.5;     // frame depth
-      const FLOOR_Y = -2;      // local floor level
+      const OPEN_H = 3.0; // opening height (local y -2 .. 1)
+      const POST_W = 0.3; // side post width
+      const FRAME_D = 0.5; // frame depth
+      const FLOOR_Y = -2; // local floor level
 
       // ── 1. Frame: two grounded side posts + header (gunmetal) ──────────────
-      const frameMat = new THREE.MeshStandardMaterial({ color: 0x2A3444, roughness: 0.6, metalness: 0.35 });
+      const frameMat = new THREE.MeshStandardMaterial({
+        color: 0x2a3444,
+        roughness: 0.6,
+        metalness: 0.35,
+      });
       const postGeo = new THREE.BoxGeometry(POST_W, OPEN_H, FRAME_D);
       for (const side of [-1, 1]) {
         const post = new THREE.Mesh(postGeo, frameMat);
-        post.position.set(side * (openingWidth / 2 + POST_W / 2), FLOOR_Y + OPEN_H / 2, 0);
+        post.position.set(
+          side * (openingWidth / 2 + POST_W / 2),
+          FLOOR_Y + OPEN_H / 2,
+          0,
+        );
         if (walkable) post.userData = { ...bodyData };
         doorGroup.add(post);
       }
@@ -267,83 +310,136 @@ export class DoorDockingPortSystem {
       doorGroup.add(header);
 
       // ── 2. Emissive frame strips (status-tinted via syncLEDStatus) ─────────
-      const glowMat = new THREE.MeshBasicMaterial({ color: 0x00E5FF });
+      const glowMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
       for (const side of [-1, 1]) {
-        const strip = new THREE.Mesh(new THREE.BoxGeometry(0.06, OPEN_H, 0.06), glowMat);
-        strip.position.set(side * (openingWidth / 2 + 0.03), FLOOR_Y + OPEN_H / 2, FRAME_D / 2);
-        strip.name = 'frameGlow';
+        const strip = new THREE.Mesh(
+          new THREE.BoxGeometry(0.06, OPEN_H, 0.06),
+          glowMat,
+        );
+        strip.position.set(
+          side * (openingWidth / 2 + 0.03),
+          FLOOR_Y + OPEN_H / 2,
+          FRAME_D / 2,
+        );
+        strip.name = "frameGlow";
         doorGroup.add(strip);
       }
-      const headerStrip = new THREE.Mesh(new THREE.BoxGeometry(openingWidth, 0.06, 0.06), glowMat);
+      const headerStrip = new THREE.Mesh(
+        new THREE.BoxGeometry(openingWidth, 0.06, 0.06),
+        glowMat,
+      );
       headerStrip.position.set(0, FLOOR_Y + OPEN_H + 0.03, FRAME_D / 2);
-      headerStrip.name = 'frameGlow';
+      headerStrip.name = "frameGlow";
       doorGroup.add(headerStrip);
 
       // ── 3. Leaves as groups (slide code only touches .position.x) ──────────
       const leafWidth = openingWidth / 2;
-      const steelMat   = new THREE.MeshStandardMaterial({ color: 0x37474F, roughness: 0.5, metalness: 0.55 });
-      const grooveMat  = new THREE.MeshStandardMaterial({ color: 0x1C262E, roughness: 0.85, metalness: 0.2 });
-      const slitMat    = new THREE.MeshBasicMaterial({ color: 0x9BE7FF });
-      const chevronMat = new THREE.MeshStandardMaterial({ color: 0xD4A84B, roughness: 0.4, metalness: 0.5 });
-      const kickMat    = new THREE.MeshStandardMaterial({ color: 0x10161D, roughness: 0.9, metalness: 0.1 });
+      const steelMat = new THREE.MeshStandardMaterial({
+        color: 0x37474f,
+        roughness: 0.5,
+        metalness: 0.55,
+      });
+      const grooveMat = new THREE.MeshStandardMaterial({
+        color: 0x1c262e,
+        roughness: 0.85,
+        metalness: 0.2,
+      });
+      const slitMat = new THREE.MeshBasicMaterial({ color: 0x9be7ff });
+      const chevronMat = new THREE.MeshStandardMaterial({
+        color: 0xd4a84b,
+        roughness: 0.4,
+        metalness: 0.5,
+      });
+      const kickMat = new THREE.MeshStandardMaterial({
+        color: 0x10161d,
+        roughness: 0.9,
+        metalness: 0.1,
+      });
 
-      const buildLeaf = (name: 'leftLeaf' | 'rightLeaf', closedOffset: number): THREE.Group => {
+      const buildLeaf = (
+        name: "leftLeaf" | "rightLeaf",
+        closedOffset: number,
+      ): THREE.Group => {
         const leaf = new THREE.Group();
         leaf.name = name;
         // Grounded: panel spans local y -2 .. 1
         leaf.position.set(closedOffset, FLOOR_Y + OPEN_H / 2, 0.05);
-        const inner = name === 'leftLeaf' ? 1 : -1; // toward the centre seam
+        const inner = name === "leftLeaf" ? 1 : -1; // toward the centre seam
 
         // Base steel panel
-        const panel = new THREE.Mesh(new THREE.BoxGeometry(leafWidth, OPEN_H, 0.15), steelMat);
+        const panel = new THREE.Mesh(
+          new THREE.BoxGeometry(leafWidth, OPEN_H, 0.15),
+          steelMat,
+        );
         leaf.add(panel);
 
         // Recessed groove strips
         for (const gy of [1.05, 0.55, -0.65]) {
-          const groove = new THREE.Mesh(new THREE.BoxGeometry(leafWidth - 0.12, 0.05, 0.02), grooveMat);
+          const groove = new THREE.Mesh(
+            new THREE.BoxGeometry(leafWidth - 0.12, 0.05, 0.02),
+            grooveMat,
+          );
           groove.position.set(0, gy, 0.075);
           leaf.add(groove);
         }
 
         // Vertical emissive window slit at the INNER edge — the closed door
         // reads as a lit centre seam.
-        const slit = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.2, 0.03), slitMat);
+        const slit = new THREE.Mesh(
+          new THREE.BoxGeometry(0.08, 1.2, 0.03),
+          slitMat,
+        );
         slit.position.set(inner * (leafWidth / 2 - 0.07), 0, 0.08);
         leaf.add(slit);
 
         // Amber chevron plate, angled toward the seam
-        const chevron = new THREE.Mesh(new THREE.BoxGeometry(leafWidth * 0.55, 0.16, 0.02), chevronMat);
+        const chevron = new THREE.Mesh(
+          new THREE.BoxGeometry(leafWidth * 0.55, 0.16, 0.02),
+          chevronMat,
+        );
         chevron.position.set(0, -1.0, 0.08);
         chevron.rotation.z = inner * 0.5;
         leaf.add(chevron);
 
         // Dark kick plate near the bottom
-        const kick = new THREE.Mesh(new THREE.BoxGeometry(leafWidth, 0.35, 0.03), kickMat);
+        const kick = new THREE.Mesh(
+          new THREE.BoxGeometry(leafWidth, 0.35, 0.03),
+          kickMat,
+        );
         kick.position.set(0, -OPEN_H / 2 + 0.2, 0.08);
         leaf.add(kick);
 
         if (walkable) {
-          leaf.children.forEach((child) => { child.userData = { ...bodyData }; });
+          leaf.children.forEach((child) => {
+            child.userData = { ...bodyData };
+          });
         }
         return leaf;
       };
 
       const leftOffset = cfg.isLarge ? -0.62 : -0.37;
       const rightOffset = cfg.isLarge ? 0.62 : 0.37;
-      doorGroup.add(buildLeaf('leftLeaf', leftOffset));
-      doorGroup.add(buildLeaf('rightLeaf', rightOffset));
+      doorGroup.add(buildLeaf("leftLeaf", leftOffset));
+      doorGroup.add(buildLeaf("rightLeaf", rightOffset));
 
       // ── 4. Floor threshold plate + emissive guide strips ───────────────────
       const threshold = new THREE.Mesh(
         new THREE.BoxGeometry(openingWidth + 0.6, 0.04, 0.9),
-        new THREE.MeshStandardMaterial({ color: 0x232E3A, roughness: 0.7, metalness: 0.3 }),
+        new THREE.MeshStandardMaterial({
+          color: 0x232e3a,
+          roughness: 0.7,
+          metalness: 0.3,
+        }),
       );
       threshold.position.set(0, -1.98, 0);
       doorGroup.add(threshold);
       for (const gz of [-0.35, 0.35]) {
-        const guide = new THREE.Mesh(new THREE.BoxGeometry(openingWidth + 0.5, 0.015, 0.05), glowMat);
+        const guide = new THREE.Mesh(
+          new THREE.BoxGeometry(openingWidth + 0.5, 0.015, 0.05),
+          glowMat,
+        );
         guide.position.set(0, -1.95, gz);
-        guide.name = 'frameGlow';
+        guide.name = "frameGlow";
         doorGroup.add(guide);
       }
 
@@ -363,7 +459,10 @@ export class DoorDockingPortSystem {
 
       // 3. Interactive Keypad Box (Golden terminal highlight)
       const keypadGeo = new THREE.BoxGeometry(0.3, 0.4, 0.12);
-      const keypadMat = new THREE.MeshStandardMaterial({ color: 0xD4A84B, metalness: 0.5 });
+      const keypadMat = new THREE.MeshStandardMaterial({
+        color: 0xd4a84b,
+        metalness: 0.5,
+      });
       const keypad = new THREE.Mesh(keypadGeo, keypadMat);
       const keypadOffsetX = cfg.isLarge ? 1.6 : 1.1;
       keypad.position.set(keypadOffsetX, -0.2, 0.1);
@@ -374,10 +473,10 @@ export class DoorDockingPortSystem {
 
       // 4. Status Indicator LED Sphere
       const ledGeo = new THREE.SphereGeometry(0.06, 16, 16);
-      const ledMat = new THREE.MeshBasicMaterial({ color: 0xFF1744 }); // Default locked/red indicator
+      const ledMat = new THREE.MeshBasicMaterial({ color: 0xff1744 }); // Default locked/red indicator
       const led = new THREE.Mesh(ledGeo, ledMat);
       led.position.set(keypadOffsetX, 0.1, 0.18);
-      led.name = 'ledStatus';
+      led.name = "ledStatus";
       doorGroup.add(led);
 
       this.roomsGroup.add(doorGroup);
@@ -391,7 +490,9 @@ export class DoorDockingPortSystem {
       doorGroup.traverse((child) => {
         const mesh = child as THREE.Mesh;
         if (!mesh.isMesh) return;
-        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        const mats = Array.isArray(mesh.material)
+          ? mesh.material
+          : [mesh.material];
         for (const mat of mats) {
           if (!mat || mat.visible === false || seenMats.has(mat)) continue;
           seenMats.add(mat);
@@ -413,8 +514,8 @@ export class DoorDockingPortSystem {
    * Mount floating interactive terminal to manage Room addresses, Pin-codes and pairings
    */
   private mountInterfaceControlPanel() {
-    const pane = document.createElement('div');
-    pane.id = 'docking-control-pane';
+    const pane = document.createElement("div");
+    pane.id = "docking-control-pane";
     pane.style.cssText = `
       position: absolute;
       top: 50%;
@@ -525,42 +626,43 @@ export class DoorDockingPortSystem {
   }
 
   private setupPanelListeners() {
-    const closeBtn = document.getElementById('docking-close-btn');
-    const lockBtn = document.getElementById('docking-lock-toggle');
-    const requestBtn = document.getElementById('docking-request-btn');
-    const acceptBtn = document.getElementById('docking-accept-btn');
-    const rejectBtn = document.getElementById('docking-reject-btn');
-    const box = document.getElementById('docking-control-pane');
-    
-    if (closeBtn) closeBtn.addEventListener('click', () => {
-      // Ghost-residue fix: closing without using the prefilled chain refunds it.
-      const pane = document.getElementById('docking-control-pane');
-      const activeDoorId = pane ? (pane as any).activeDoorId : null;
-      if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
-      if (box) box.style.display = 'none';
-    });
+    const closeBtn = document.getElementById("docking-close-btn");
+    const lockBtn = document.getElementById("docking-lock-toggle");
+    const requestBtn = document.getElementById("docking-request-btn");
+    const acceptBtn = document.getElementById("docking-accept-btn");
+    const rejectBtn = document.getElementById("docking-reject-btn");
+    const box = document.getElementById("docking-control-pane");
+
+    if (closeBtn)
+      closeBtn.addEventListener("click", () => {
+        // Ghost-residue fix: closing without using the prefilled chain refunds it.
+        const pane = document.getElementById("docking-control-pane");
+        const activeDoorId = pane ? (pane as any).activeDoorId : null;
+        if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
+        if (box) box.style.display = "none";
+      });
 
     // Handle clicks inside the modal to prevent passing them to 3D world floor clicks
-    box?.addEventListener('click', (e) => e.stopPropagation());
+    box?.addEventListener("click", (e) => e.stopPropagation());
 
     // Toggle Port Lock State
     if (lockBtn) {
-      lockBtn.addEventListener('click', () => {
-        const pane = document.getElementById('docking-control-pane');
+      lockBtn.addEventListener("click", () => {
+        const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
         // #67 D1: lock/unlock follows the PASSAGE policy (this control was
         // accidentally ungated before the policy work surfaced it).
         if (!this.canOperateDoor(activeDoorId)) {
-          alert('This door\'s passage is owner-restricted.');
+          alert("This door's passage is owner-restricted.");
           return;
         }
         const state = this.doorState.get(activeDoorId);
         if (state) {
           state.locked = !state.locked;
-          lockBtn.textContent = state.locked ? 'LOCKED' : 'UNLOCKED';
-          lockBtn.style.background = state.locked ? '#ff1744' : '#00e676';
-          lockBtn.style.color = state.locked ? '#fff' : '#01020a';
+          lockBtn.textContent = state.locked ? "LOCKED" : "UNLOCKED";
+          lockBtn.style.background = state.locked ? "#ff1744" : "#00e676";
+          lockBtn.style.color = state.locked ? "#fff" : "#01020a";
           this.syncLEDStatus(activeDoorId, state);
           if (state.locked) this.closeDoor(activeDoorId);
           else this.openDoor(activeDoorId);
@@ -570,23 +672,27 @@ export class DoorDockingPortSystem {
 
     // Provision a fresh module room on the local node (T1 of #30) and fill
     // the address input with its seed — the user then pairs to it normally.
-    const provisionBtn = document.getElementById('docking-provision-btn') as HTMLButtonElement | null;
+    const provisionBtn = document.getElementById(
+      "docking-provision-btn",
+    ) as HTMLButtonElement | null;
     if (provisionBtn) {
-      provisionBtn.addEventListener('click', async () => {
+      provisionBtn.addEventListener("click", async () => {
         if (!this.provisionModuleCallback) {
-          alert('Module provisioning is not available (no local node wiring).');
+          alert("Module provisioning is not available (no local node wiring).");
           return;
         }
         const originalLabel = provisionBtn.textContent;
         provisionBtn.disabled = true;
-        provisionBtn.textContent = 'MINTING MODULE…';
+        provisionBtn.textContent = "MINTING MODULE…";
         try {
           const seed = await this.provisionModuleCallback();
-          const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
+          const addrInput = document.getElementById(
+            "docking-addr-input",
+          ) as HTMLInputElement | null;
           if (seed && addrInput) {
             addrInput.value = seed;
           } else if (!seed) {
-            alert('Could not mint a module seed — is the local node running?');
+            alert("Could not mint a module seed — is the local node running?");
           }
         } finally {
           provisionBtn.disabled = false;
@@ -597,22 +703,31 @@ export class DoorDockingPortSystem {
 
     // Initiate pairings
     if (requestBtn) {
-      requestBtn.addEventListener('click', () => {
-        const pane = document.getElementById('docking-control-pane');
+      requestBtn.addEventListener("click", () => {
+        const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
         const state = this.doorState.get(activeDoorId);
-        const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
-        const pinInput = document.getElementById('docking-pin-input') as HTMLInputElement | null;
-        
+        const addrInput = document.getElementById(
+          "docking-addr-input",
+        ) as HTMLInputElement | null;
+        const pinInput = document.getElementById(
+          "docking-pin-input",
+        ) as HTMLInputElement | null;
+
         // #67 D1/D2: construction rights per the door's policy — EXCEPT at an
         // adapter door, where anyone may TRANSIENTLY berth a ship (no chains).
         if (activeDoorId && !this.canConstruct(activeDoorId)) {
           const berthState = this.doorState.get(activeDoorId);
-          if (readDoorPolicy(activeDoorId).adapter && !(berthState?.segments?.length)) {
+          if (
+            readDoorPolicy(activeDoorId).adapter &&
+            !berthState?.segments?.length
+          ) {
             if (berthState) berthState.transient = true; // guest berth, not construction
           } else {
-            alert('No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).');
+            alert(
+              "No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).",
+            );
             return;
           }
         } else if (activeDoorId) {
@@ -625,111 +740,148 @@ export class DoorDockingPortSystem {
           state.pinCode = pinInput.value.trim();
 
           if (!state.connectedRoomAddress) {
-            alert('Please paste a target room seed link first!');
+            alert("Please paste a target room seed link first!");
             return;
           }
 
           state.pairingPending = true;
           this.syncLEDStatus(activeDoorId, state);
-          
+
           if (this.onConnectionRequestCallback) {
-            this.onConnectionRequestCallback(activeDoorId, state.connectedRoomAddress);
+            this.onConnectionRequestCallback(
+              activeDoorId,
+              state.connectedRoomAddress,
+            );
           }
           // #62 P4: modules this client minted pair instantly when auto-accept
           // is on — no far-side human exists for a freshly provisioned room.
           if (this.autoAcceptCheckCallback?.(state.connectedRoomAddress)) {
             this.completePairing(activeDoorId, true);
-            console.log(`🤝 Auto-accepted pairing on ${activeDoorId} (own minted module).`);
+            console.log(
+              `🤝 Auto-accepted pairing on ${activeDoorId} (own minted module).`,
+            );
           }
-          if (box) box.style.display = 'none';
+          if (box) box.style.display = "none";
         }
       });
     }
 
     // Accept / Reject inbound pairings
     if (acceptBtn) {
-      acceptBtn.addEventListener('click', () => {
-        const pane = document.getElementById('docking-control-pane');
+      acceptBtn.addEventListener("click", () => {
+        const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
         // #67 D1: approving a docking follows construction rights.
         if (!this.canConstruct(activeDoorId)) {
-          alert('No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).');
+          alert(
+            "No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).",
+          );
           return;
         }
         this.completePairing(activeDoorId, true);
-        if (box) box.style.display = 'none';
+        if (box) box.style.display = "none";
       });
     }
 
     if (rejectBtn) {
-      rejectBtn.addEventListener('click', () => {
-        const pane = document.getElementById('docking-control-pane');
+      rejectBtn.addEventListener("click", () => {
+        const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
         this.completePairing(activeDoorId, false);
-        if (box) box.style.display = 'none';
+        if (box) box.style.display = "none";
       });
     }
 
     // ── #62 P4: CONNECTION ASSEMBLY wiring ──────────────────────────────────
-    const activeDoor = (): ('north' | 'south' | 'east' | 'west') | null => {
-      const pane = document.getElementById('docking-control-pane');
+    const activeDoor = (): ("north" | "south" | "east" | "west") | null => {
+      const pane = document.getElementById("docking-control-pane");
       return pane ? ((pane as any).activeDoorId ?? null) : null;
     };
 
-    document.getElementById('docking-add-flex')?.addEventListener('click', () => {
-      const doorId = activeDoor();
-      const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.canConstruct(doorId)) return;
-      this.untouchedPrefills.delete(doorId); // deliberate edit — chain is intentional now
-      if (!consumePart('flex')) { this.renderAssemblyStrip(doorId, 'no FLEX parts — DEV menu › PARTS'); return; }
-      state.segments = [...(state.segments ?? []), { kind: 'flex', bendDeg: 0, stretch: 0 }];
-      this.renderAssemblyStrip(doorId);
-      this.publishIfPaired(doorId);
-    });
+    document
+      .getElementById("docking-add-flex")
+      ?.addEventListener("click", () => {
+        const doorId = activeDoor();
+        const state = doorId ? this.doorState.get(doorId) : null;
+        if (!doorId || !state || !this.canConstruct(doorId)) return;
+        this.untouchedPrefills.delete(doorId); // deliberate edit — chain is intentional now
+        if (!consumePart("flex")) {
+          this.renderAssemblyStrip(doorId, "no FLEX parts — DEV menu › PARTS");
+          return;
+        }
+        state.segments = [
+          ...(state.segments ?? []),
+          { kind: "flex", bendDeg: 0, stretch: 0 },
+        ];
+        this.renderAssemblyStrip(doorId);
+        this.publishIfPaired(doorId);
+      });
 
-    document.getElementById('docking-add-ext')?.addEventListener('click', () => {
-      const doorId = activeDoor();
-      const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.canConstruct(doorId)) return;
-      this.untouchedPrefills.delete(doorId);
-      if (!consumePart('ext')) { this.renderAssemblyStrip(doorId, 'no EXTENSION parts — DEV menu › PARTS'); return; }
-      state.segments = [...(state.segments ?? []), { kind: 'ext', bays: 4, skin: 'solid' }];
-      this.renderAssemblyStrip(doorId);
-      this.publishIfPaired(doorId);
-    });
+    document
+      .getElementById("docking-add-ext")
+      ?.addEventListener("click", () => {
+        const doorId = activeDoor();
+        const state = doorId ? this.doorState.get(doorId) : null;
+        if (!doorId || !state || !this.canConstruct(doorId)) return;
+        this.untouchedPrefills.delete(doorId);
+        if (!consumePart("ext")) {
+          this.renderAssemblyStrip(
+            doorId,
+            "no EXTENSION parts — DEV menu › PARTS",
+          );
+          return;
+        }
+        state.segments = [
+          ...(state.segments ?? []),
+          { kind: "ext", bays: 4, skin: "solid" },
+        ];
+        this.renderAssemblyStrip(doorId);
+        this.publishIfPaired(doorId);
+      });
 
-    document.getElementById('docking-clear-chain')?.addEventListener('click', () => {
-      const doorId = activeDoor();
-      const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.canConstruct(doorId)) return;
-      this.untouchedPrefills.delete(doorId);
-      if (state.segments?.length) refundForSegments(state.segments);
-      state.segments = undefined;
-      this.renderAssemblyStrip(doorId);
-      this.publishIfPaired(doorId);
-    });
+    document
+      .getElementById("docking-clear-chain")
+      ?.addEventListener("click", () => {
+        const doorId = activeDoor();
+        const state = doorId ? this.doorState.get(doorId) : null;
+        if (!doorId || !state || !this.canConstruct(doorId)) return;
+        this.untouchedPrefills.delete(doorId);
+        if (state.segments?.length) refundForSegments(state.segments);
+        state.segments = undefined;
+        this.renderAssemblyStrip(doorId);
+        this.publishIfPaired(doorId);
+      });
 
     // Chip interactions (delegated): cycle the main parameter, toggle skin,
     // or remove (with refund).
-    document.getElementById('docking-chips')?.addEventListener('click', (e) => {
-      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-chip-action]');
+    document.getElementById("docking-chips")?.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-chip-action]",
+      );
       if (!el) return;
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
       const i = Number(el.dataset.i);
-      if (!doorId || !state || !state.segments || !Number.isInteger(i) || !state.segments[i]) return;
+      if (
+        !doorId ||
+        !state ||
+        !state.segments ||
+        !Number.isInteger(i) ||
+        !state.segments[i]
+      )
+        return;
       if (!this.canConstruct(doorId)) return;
       this.untouchedPrefills.delete(doorId);
       const seg = { ...state.segments[i] };
       const action = el.dataset.chipAction;
-      if (action === 'remove') {
-        refundPart(seg.kind === 'flex' ? 'flex' : 'ext');
+      if (action === "remove") {
+        refundPart(seg.kind === "flex" ? "flex" : "ext");
         state.segments = state.segments.filter((_, k) => k !== i);
         if (state.segments.length === 0) state.segments = undefined;
-      } else if (action === 'cycle') {
-        if (seg.kind === 'flex') {
+      } else if (action === "cycle") {
+        if (seg.kind === "flex") {
           const bends = [-45, -22.5, 0, 22.5, 45];
           const at = bends.indexOf(seg.bendDeg ?? 0);
           seg.bendDeg = bends[(at + 1 + bends.length) % bends.length];
@@ -739,179 +891,241 @@ export class DoorDockingPortSystem {
           seg.bays = bays[(at + 1 + bays.length) % bays.length];
         }
         state.segments = state.segments.map((s, k) => (k === i ? seg : s));
-      } else if (action === 'skin' && seg.kind === 'ext') {
-        seg.skin = seg.skin === 'solid' ? 'ribbed' : 'solid';
+      } else if (action === "skin" && seg.kind === "ext") {
+        seg.skin = seg.skin === "solid" ? "ribbed" : "solid";
         state.segments = state.segments.map((s, k) => (k === i ? seg : s));
       }
       this.renderAssemblyStrip(doorId);
       this.publishIfPaired(doorId);
     });
 
-    (document.getElementById('docking-far-door') as HTMLSelectElement | null)?.addEventListener('change', (e) => {
+    (
+      document.getElementById("docking-far-door") as HTMLSelectElement | null
+    )?.addEventListener("change", (e) => {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.canConstruct(doorId)) return;
       const v = (e.target as HTMLSelectElement).value;
-      state.farDoor = v === 'north' || v === 'south' || v === 'east' || v === 'west' ? v : undefined;
+      state.farDoor =
+        v === "north" || v === "south" || v === "east" || v === "west"
+          ? v
+          : undefined;
       this.publishIfPaired(doorId);
     });
 
-    document.getElementById('docking-far-yaw')?.addEventListener('click', () => {
-      const doorId = activeDoor();
-      const state = doorId ? this.doorState.get(doorId) : null;
-      if (!doorId || !state || !this.canConstruct(doorId)) return;
-      // Cycle — → 0 → 45 → —
-      state.farYawDeg = state.farYawDeg === undefined ? 0 : state.farYawDeg === 0 ? 45 : undefined;
-      this.renderAssemblyStrip(doorId);
-      this.publishIfPaired(doorId);
-    });
+    document
+      .getElementById("docking-far-yaw")
+      ?.addEventListener("click", () => {
+        const doorId = activeDoor();
+        const state = doorId ? this.doorState.get(doorId) : null;
+        if (!doorId || !state || !this.canConstruct(doorId)) return;
+        // Cycle — → 0 → 45 → —
+        state.farYawDeg =
+          state.farYawDeg === undefined
+            ? 0
+            : state.farYawDeg === 0
+              ? 45
+              : undefined;
+        this.renderAssemblyStrip(doorId);
+        this.publishIfPaired(doorId);
+      });
 
     // 🗺️ Known-modules picker → fills the address input (repopulated on
     // every pane open by renderKnownModules).
-    document.getElementById('docking-known-modules')?.addEventListener('change', (e) => {
-      const sel = e.target as HTMLSelectElement;
-      const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
-      if (sel.value && addrInput) {
-        addrInput.value = sel.value;
-        addrInput.style.borderColor = 'rgba(0,230,118,0.7)';
-        setTimeout(() => { addrInput.style.borderColor = ''; }, 1600);
-      }
-      sel.selectedIndex = 0; // reads as a menu, not a state
-    });
+    document
+      .getElementById("docking-known-modules")
+      ?.addEventListener("change", (e) => {
+        const sel = e.target as HTMLSelectElement;
+        const addrInput = document.getElementById(
+          "docking-addr-input",
+        ) as HTMLInputElement | null;
+        if (sel.value && addrInput) {
+          addrInput.value = sel.value;
+          addrInput.style.borderColor = "rgba(0,230,118,0.7)";
+          setTimeout(() => {
+            addrInput.style.borderColor = "";
+          }, 1600);
+        }
+        sel.selectedIndex = 0; // reads as a menu, not a state
+      });
 
     // ── #67 D1/D1b: DOOR POLICY actions (delegated) ─────────────────────────
-    document.getElementById('docking-policy-body')?.addEventListener('click', (e) => {
-      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-policy-action]');
-      if (!el) return;
-      const doorId = activeDoor();
-      if (!doorId) return;
-      const action = el.dataset.policyAction;
-      const pub = el.dataset.pub ?? '';
-      if (action === 'req-build') {
-        // Any player may ASK (that is the point) — their own client writes it.
-        writeDoorRequest(doorId, getIdentityPub(), getPlayerName());
-      } else if (action === 'detach-berth') {
-        // #67 D2: EITHER side casts off a transient berth — no owner ceremony.
-        // The doc delete reconciles to every client (projection torn down,
-        // door re-locked) through the normal doors-doc path.
-        deleteDoorPairing(doorId);
-      } else if (!this.isRoomOwner()) {
-        return; // every action below is owner-only (UI gate, dev-phase posture)
-      } else if (action === 'cycle-passage') {
-        // 🚪↦ Four states: PUBLIC (two-way) → IN ONLY → OUT ONLY → OWNER → …
-        const p = readDoorPolicy(doorId);
-        const next: DoorPolicyRecord = { ...p };
-        if (p.passage === 'owner') { next.passage = 'public'; delete next.oneWay; }
-        else if (!p.oneWay) { next.oneWay = 'in'; }
-        else if (p.oneWay === 'in') { next.oneWay = 'out'; }
-        else { next.passage = 'owner'; delete next.oneWay; }
-        writeDoorPolicy(doorId, next);
-      } else if (action === 'cycle-construction') {
-        const p = readDoorPolicy(doorId);
-        const next: Record<ConstructionMode, ConstructionMode> = { owner: 'request', request: 'public', public: 'owner' };
-        writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
-      } else if (action === 'slide-neg' || action === 'slide-pos') {
-        // 🧱 #66 S1: slide the door 0.5 m along its wall. Owner-only (this
-        // branch), UNPAIRED-only (plan §6.2 — live chains never re-solve),
-        // snapped + clamped in floorPlanDoc on both write and read.
-        const st2 = this.doorState.get(doorId);
-        if (st2?.pairedSuccessfully) return;
-        seedFloorPlan(); // lazy first-structure-commit seed (idempotent)
-        const legacy = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
-        const current = legacy + (readDoorDeltas()[doorId] ?? 0);
-        writeDoorPlacement(doorId, current + (action === 'slide-pos' ? DOOR_LATTICE : -DOOR_LATTICE));
-      } else if (action === 'install-adapter') {
-        // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
-        if (consumePart('adapter')) {
-          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: true });
+    document
+      .getElementById("docking-policy-body")
+      ?.addEventListener("click", (e) => {
+        const el = (e.target as HTMLElement).closest<HTMLElement>(
+          "[data-policy-action]",
+        );
+        if (!el) return;
+        const doorId = activeDoor();
+        if (!doorId) return;
+        const action = el.dataset.policyAction;
+        const pub = el.dataset.pub ?? "";
+        if (action === "req-build") {
+          // Any player may ASK (that is the point) — their own client writes it.
+          writeDoorRequest(doorId, getIdentityPub(), getPlayerName());
+        } else if (action === "detach-berth") {
+          // #67 D2: EITHER side casts off a transient berth — no owner ceremony.
+          // The doc delete reconciles to every client (projection torn down,
+          // door re-locked) through the normal doors-doc path.
+          deleteDoorPairing(doorId);
+        } else if (!this.isRoomOwner()) {
+          return; // every action below is owner-only (UI gate, dev-phase posture)
+        } else if (action === "cycle-passage") {
+          // 🚪↦ Four states: PUBLIC (two-way) → IN ONLY → OUT ONLY → OWNER → …
+          const p = readDoorPolicy(doorId);
+          const next: DoorPolicyRecord = { ...p };
+          if (p.passage === "owner") {
+            next.passage = "public";
+            delete next.oneWay;
+          } else if (!p.oneWay) {
+            next.oneWay = "in";
+          } else if (p.oneWay === "in") {
+            next.oneWay = "out";
+          } else {
+            next.passage = "owner";
+            delete next.oneWay;
+          }
+          writeDoorPolicy(doorId, next);
+        } else if (action === "cycle-construction") {
+          const p = readDoorPolicy(doorId);
+          const next: Record<ConstructionMode, ConstructionMode> = {
+            owner: "request",
+            request: "public",
+            public: "owner",
+          };
+          writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
+        } else if (action === "slide-neg" || action === "slide-pos") {
+          // 🧱 #66 S1: slide the door 0.5 m along its wall. Owner-only (this
+          // branch), UNPAIRED-only (plan §6.2 — live chains never re-solve),
+          // snapped + clamped in floorPlanDoc on both write and read.
+          const st2 = this.doorState.get(doorId);
+          if (st2?.pairedSuccessfully) return;
+          seedFloorPlan(); // lazy first-structure-commit seed (idempotent)
+          const legacy = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
+          const current = legacy + (readDoorDeltas()[doorId] ?? 0);
+          writeDoorPlacement(
+            doorId,
+            current + (action === "slide-pos" ? DOOR_LATTICE : -DOOR_LATTICE),
+          );
+        } else if (action === "install-adapter") {
+          // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
+          if (consumePart("adapter")) {
+            writeDoorPolicy(doorId, {
+              ...readDoorPolicy(doorId),
+              adapter: true,
+            });
+          }
+        } else if (action === "remove-adapter") {
+          refundPart("adapter");
+          writeDoorPolicy(doorId, {
+            ...readDoorPolicy(doorId),
+            adapter: false,
+          });
+        } else if (action === "accept-req" && pub) {
+          writeDoorGrant(doorId, pub, el.dataset.name ?? "Unknown-Clone");
+        } else if (action === "deny-req" && pub) {
+          removeDoorRequest(doorId, pub);
+        } else if (action === "revoke-grant" && pub) {
+          removeDoorGrant(doorId, pub);
         }
-      } else if (action === 'remove-adapter') {
-        refundPart('adapter');
-        writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
-      } else if (action === 'accept-req' && pub) {
-        writeDoorGrant(doorId, pub, el.dataset.name ?? 'Unknown-Clone');
-      } else if (action === 'deny-req' && pub) {
-        removeDoorRequest(doorId, pub);
-      } else if (action === 'revoke-grant' && pub) {
-        removeDoorGrant(doorId, pub);
-      }
-      this.renderPolicySection(doorId);
-      this.renderAssemblyStrip(doorId); // a grant/mode change may unlock the strip
-    });
+        this.renderPolicySection(doorId);
+        this.renderAssemblyStrip(doorId); // a grant/mode change may unlock the strip
+      });
   }
 
   /** #67 D1/D1b: paint the DOOR POLICY section (policy cycles for the owner;
    *  summary + request flow for guests; live request/grant lists). */
-  private renderPolicySection(doorId: 'north' | 'south' | 'east' | 'west'): void {
-    const body = document.getElementById('docking-policy-body');
+  private renderPolicySection(
+    doorId: "north" | "south" | "east" | "west",
+  ): void {
+    const body = document.getElementById("docking-policy-body");
     if (!body) return;
     const policy = readDoorPolicy(doorId);
     const owner = this.isRoomOwner();
     const myPub = getIdentityPub();
     const pill = `display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;`;
     const row = `display:flex; align-items:center; justify-content:space-between; gap:8px;`;
-    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
 
     // #67 D2: a live transient berth shows a DETACH row to EVERYONE — either
     // side may cast off a guest ship without owner ceremony.
     const st = this.doorState.get(doorId);
-    const detachRow = st?.pairedSuccessfully && st.transient
-      ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
+    const detachRow =
+      st?.pairedSuccessfully && st.transient
+        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>`
-      : '';
+        : "";
 
     if (owner) {
       const requests = readDoorRequests(doorId);
       const grants = readDoorGrants(doorId);
-      const reqRows = requests.map((r) => `
+      const reqRows = requests
+        .map(
+          (r) => `
         <div style="${row}">
           <span style="color:#ffb300; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(r.requesterPub)}">⚠ ${esc(r.requesterName)} <span style="color:rgba(212,168,75,0.4);">${esc(r.requesterPub.slice(0, 8))}</span></span>
           <span style="flex-shrink:0; display:flex; gap:4px;">
             <button type="button" data-policy-action="accept-req" data-pub="${esc(r.requesterPub)}" data-name="${esc(r.requesterName)}" style="${pill} background:rgba(0,230,118,0.15); border-color:rgba(0,230,118,0.4); color:#00e676;">ACCEPT</button>
             <button type="button" data-policy-action="deny-req" data-pub="${esc(r.requesterPub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DENY</button>
           </span>
-        </div>`).join('');
-      const grantRows = grants.map((g) => `
+        </div>`,
+        )
+        .join("");
+      const grantRows = grants
+        .map(
+          (g) => `
         <div style="${row}">
           <span style="color:#00e676; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(g.pub)}">✔ ${esc(g.name)} <span style="color:rgba(212,168,75,0.4);">${esc(g.pub.slice(0, 8))}</span></span>
           <button type="button" data-policy-action="revoke-grant" data-pub="${esc(g.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>
-        </div>`).join('');
+        </div>`,
+        )
+        .join("");
       body.innerHTML = `
-        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk${policy.oneWay ? ' · one-way for guests' : ''}</span></span>
+        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk${policy.oneWay ? " · one-way for guests" : ""}</span></span>
           <button type="button" data-policy-action="cycle-passage" style="${pill}">${passageLabel(policy)}</button></div>
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
-        <div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? ' — unpair first' : ''}</span></span>
+        <div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
           <span style="flex-shrink:0; display:flex; gap:4px; align-items:center;">
-            <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? 'disabled' : ''} style="${pill}">◀</button>
-            <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => { const d = readDoorDeltas()[doorId] ?? 0; return d === 0 ? 'CENTER' : `${d > 0 ? '+' : ''}${d.toFixed(1)}m`; })()}</span>
-            <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? 'disabled' : ''} style="${pill}">▶</button>
+            <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">◀</button>
+            <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => {
+              const d = readDoorDeltas()[doorId] ?? 0;
+              return d === 0 ? "CENTER" : `${d > 0 ? "+" : ""}${d.toFixed(1)}m`;
+            })()}</span>
+            <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
           </span></div>
         <div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
-          ${policy.adapter
-            ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
-            : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount('adapter') === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ''}>INSTALL (×${partsCount('adapter')})</button>`}</div>
+          ${
+            policy.adapter
+              ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
+              : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
+          }</div>
         ${detachRow}
-        ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ''}
-        ${grants.length ? `<div style="font-size:9px; font-weight:800; color:rgba(0,230,118,0.6); letter-spacing:1px; margin-top:2px;">STANDING GRANTS</div>${grantRows}` : ''}
+        ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ""}
+        ${grants.length ? `<div style="font-size:9px; font-weight:800; color:rgba(0,230,118,0.6); letter-spacing:1px; margin-top:2px;">STANDING GRANTS</div>${grantRows}` : ""}
       `;
     } else {
       const granted = hasDoorGrant(doorId, myPub);
       const requested = hasDoorRequest(doorId, myPub);
-      const buildLine = policy.construction === 'public'
-        ? '<span style="color:#00e676;">BUILD: PUBLIC</span>'
-        : policy.construction === 'request'
-          ? (granted
-            ? '<span style="color:#00e676;">✔ BUILD RIGHTS GRANTED</span>'
-            : requested
-              ? '<span style="color:#ffb300;">⏳ RIGHTS REQUESTED — awaiting the owner</span>'
-              : `<button type="button" data-policy-action="req-build" style="${pill} background:rgba(255,179,0,0.12); border-color:rgba(255,179,0,0.4); color:#ffb300;">🙋 REQUEST BUILD RIGHTS</button>`)
-          : '<span style="color:rgba(212,168,75,0.55);">BUILD: OWNER ONLY</span>';
+      const buildLine =
+        policy.construction === "public"
+          ? '<span style="color:#00e676;">BUILD: PUBLIC</span>'
+          : policy.construction === "request"
+            ? granted
+              ? '<span style="color:#00e676;">✔ BUILD RIGHTS GRANTED</span>'
+              : requested
+                ? '<span style="color:#ffb300;">⏳ RIGHTS REQUESTED — awaiting the owner</span>'
+                : `<button type="button" data-policy-action="req-build" style="${pill} background:rgba(255,179,0,0.12); border-color:rgba(255,179,0,0.4); color:#ffb300;">🙋 REQUEST BUILD RIGHTS</button>`
+            : '<span style="color:rgba(212,168,75,0.55);">BUILD: OWNER ONLY</span>';
       body.innerHTML = `
         <div style="${row}"><span>PASSAGE: ${passageLabel(policy)}</span>${buildLine}</div>
-        ${policy.adapter && !this.canConstruct(doorId)
-          ? `<div style="color:#80d8ff;">🔌 BERTHING OPEN — enter your ship's address above and INITIATE to dock transiently</div>`
-          : ''}
+        ${
+          policy.adapter && !this.canConstruct(doorId)
+            ? `<div style="color:#80d8ff;">🔌 BERTHING OPEN — enter your ship's address above and INITIATE to dock transiently</div>`
+            : ""
+        }
         ${detachRow}
       `;
     }
@@ -920,21 +1134,28 @@ export class DoorDockingPortSystem {
   /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
    *  a grant landing while a guest stares at the keypad unlocks it live). */
   public refreshPolicyUI(): void {
-    const pane = document.getElementById('docking-control-pane');
-    if (!pane || pane.style.display === 'none') return;
-    const doorId = (pane as any).activeDoorId as ('north' | 'south' | 'east' | 'west') | null;
+    const pane = document.getElementById("docking-control-pane");
+    if (!pane || pane.style.display === "none") return;
+    const doorId = (pane as any).activeDoorId as
+      | ("north" | "south" | "east" | "west")
+      | null;
     if (!doorId) return;
     this.renderPolicySection(doorId);
     this.renderAssemblyStrip(doorId);
   }
 
   /** #62 P4: paint the assembly strip from the door's working chain. */
-  private renderAssemblyStrip(doorId: 'north' | 'south' | 'east' | 'west', note?: string): void {
+  private renderAssemblyStrip(
+    doorId: "north" | "south" | "east" | "west",
+    note?: string,
+  ): void {
     const state = this.doorState.get(doorId);
-    const chips = document.getElementById('docking-chips');
-    const partsNote = document.getElementById('docking-parts-note');
-    const farSel = document.getElementById('docking-far-door') as HTMLSelectElement | null;
-    const yawBtn = document.getElementById('docking-far-yaw');
+    const chips = document.getElementById("docking-chips");
+    const partsNote = document.getElementById("docking-parts-note");
+    const farSel = document.getElementById(
+      "docking-far-door",
+    ) as HTMLSelectElement | null;
+    const yawBtn = document.getElementById("docking-far-yaw");
     if (!state || !chips) return;
     const segs = state.segments ?? [];
     // 🛰️ Hull-space honesty (the other direction of hull.ts's mount check):
@@ -943,41 +1164,54 @@ export class DoorDockingPortSystem {
       if (segs.length === 0) return null;
       for (const cb of this.chainBoxesFor(doorId)) {
         for (const it of exteriorItemBoxes()) {
-          if (cb.x0 < it.box.x1 && cb.x1 > it.box.x0 && cb.z0 < it.box.z1 && cb.z1 > it.box.z0) {
+          if (
+            cb.x0 < it.box.x1 &&
+            cb.x1 > it.box.x0 &&
+            cb.z0 < it.box.z1 &&
+            cb.z1 > it.box.z0
+          ) {
             return it.id;
           }
         }
       }
       return null;
     })();
-    chips.innerHTML = segs.length === 0
-      ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway</span>`
-      : segs.map((s, i) => {
-          const label = s.kind === 'flex'
-            ? `FLEX ${(s.bendDeg ?? 0) > 0 ? '+' : ''}${s.bendDeg ?? 0}°`
-            : `EXT ×${s.bays ?? 4}`;
-          const skinBtn = s.kind === 'ext'
-            ? `<button type="button" data-chip-action="skin" data-i="${i}" title="Toggle skin" style="background:none; border:none; color:rgba(212,168,75,0.7); font-size:8px; cursor:pointer; padding:0 2px;">${s.skin === 'solid' ? 'SOLID' : 'RIBBED'}</button>`
-            : '';
-          return `
+    chips.innerHTML =
+      segs.length === 0
+        ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway</span>`
+        : segs
+            .map((s, i) => {
+              const label =
+                s.kind === "flex"
+                  ? `FLEX ${(s.bendDeg ?? 0) > 0 ? "+" : ""}${s.bendDeg ?? 0}°`
+                  : `EXT ×${s.bays ?? 4}`;
+              const skinBtn =
+                s.kind === "ext"
+                  ? `<button type="button" data-chip-action="skin" data-i="${i}" title="Toggle skin" style="background:none; border:none; color:rgba(212,168,75,0.7); font-size:8px; cursor:pointer; padding:0 2px;">${s.skin === "solid" ? "SOLID" : "RIBBED"}</button>`
+                  : "";
+              return `
             <span style="display:inline-flex; align-items:center; gap:4px; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:10px; padding:2px 8px; font-size:9px; font-weight:700;">
-              <button type="button" data-chip-action="cycle" data-i="${i}" title="Click to cycle ${s.kind === 'flex' ? 'bend' : 'length'}" style="background:none; border:none; color:#f0c060; font-size:9px; font-weight:700; cursor:pointer; padding:0;">${label}</button>
+              <button type="button" data-chip-action="cycle" data-i="${i}" title="Click to cycle ${s.kind === "flex" ? "bend" : "length"}" style="background:none; border:none; color:#f0c060; font-size:9px; font-weight:700; cursor:pointer; padding:0;">${label}</button>
               ${skinBtn}
               <button type="button" data-chip-action="remove" data-i="${i}" title="Remove (refunds the part)" style="background:none; border:none; color:#ff8a80; font-size:9px; cursor:pointer; padding:0 1px;">✕</button>
             </span>`;
-        }).join('') + (chainClash
-          ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ chain sweeps through mounted equipment (${chainClash}) — bend around it or move the mount</div>`
-          : '');
+            })
+            .join("") +
+          (chainClash
+            ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ chain sweeps through mounted equipment (${chainClash}) — bend around it or move the mount</div>`
+            : "");
     if (partsNote) {
-      partsNote.textContent = note
-        ?? (this.canConstruct(doorId)
-          ? `· stock F×${partsCount('flex')} E×${partsCount('ext')}`
-          : readDoorPolicy(doorId).construction === 'request'
-            ? '· no build rights — REQUEST below'
-            : '· owner only on this port');
+      partsNote.textContent =
+        note ??
+        (this.canConstruct(doorId)
+          ? `· stock F×${partsCount("flex")} E×${partsCount("ext")}`
+          : readDoorPolicy(doorId).construction === "request"
+            ? "· no build rights — REQUEST below"
+            : "· owner only on this port");
     }
-    if (farSel) farSel.value = state.farDoor ?? '';
-    if (yawBtn) yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? '—' : state.farYawDeg}`;
+    if (farSel) farSel.value = state.farDoor ?? "";
+    if (yawBtn)
+      yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? "—" : state.farYawDeg}`;
     // 🧲 Every chain edit re-tests whether the far end now reaches a known
     // module — the connect prompt appears/disappears as you build.
     this.detectChainContact(doorId);
@@ -985,25 +1219,30 @@ export class DoorDockingPortSystem {
 
   /** #62 P4: a post-pairing chain edit re-fires the ACCEPTED publish so the
    *  record rewrites and every client's geometry diff picks it up. */
-  private publishIfPaired(doorId: 'north' | 'south' | 'east' | 'west'): void {
+  private publishIfPaired(doorId: "north" | "south" | "east" | "west"): void {
     const state = this.doorState.get(doorId);
     if (state?.pairedSuccessfully && this.onPairingStatusChangedCallback) {
-      this.onPairingStatusChangedCallback(doorId, 'ACCEPTED');
+      this.onPairingStatusChangedCallback(doorId, "ACCEPTED");
     }
   }
 
   /**
    * Handle Click Raycasts originating in Three.js coordinates
    */
-  public handlePanelRaycast(doorId: 'north' | 'south' | 'east' | 'west') {
-    const pane = document.getElementById('docking-control-pane');
-    const title = document.getElementById('docking-pane-title');
-    const lockBtn = document.getElementById('docking-lock-toggle');
-    const pinInput = document.getElementById('docking-pin-input') as HTMLInputElement | null;
-    const addrInput = document.getElementById('docking-addr-input') as HTMLInputElement | null;
-    const noticeBox = document.getElementById('docking-pairing-box');
+  public handlePanelRaycast(doorId: "north" | "south" | "east" | "west") {
+    const pane = document.getElementById("docking-control-pane");
+    const title = document.getElementById("docking-pane-title");
+    const lockBtn = document.getElementById("docking-lock-toggle");
+    const pinInput = document.getElementById(
+      "docking-pin-input",
+    ) as HTMLInputElement | null;
+    const addrInput = document.getElementById(
+      "docking-addr-input",
+    ) as HTMLInputElement | null;
+    const noticeBox = document.getElementById("docking-pairing-box");
 
-    if (!pane || !title || !lockBtn || !pinInput || !addrInput || !noticeBox) return;
+    if (!pane || !title || !lockBtn || !pinInput || !addrInput || !noticeBox)
+      return;
 
     // Load active settings for this door
     const state = this.doorState.get(doorId);
@@ -1011,21 +1250,21 @@ export class DoorDockingPortSystem {
 
     // Expose active door context inside the modal scope
     (pane as any).activeDoorId = doorId;
-    pane.style.display = 'flex';
+    pane.style.display = "flex";
     title.textContent = `🚪 DOCKING PORT CONTROL: ${doorId.toUpperCase()}`;
-    
+
     // Set field states
-    lockBtn.textContent = state.locked ? 'LOCKED' : 'UNLOCKED';
-    lockBtn.style.background = state.locked ? '#ff1744' : '#00e676';
-    lockBtn.style.color = state.locked ? '#fff' : '#01020a';
+    lockBtn.textContent = state.locked ? "LOCKED" : "UNLOCKED";
+    lockBtn.style.background = state.locked ? "#ff1744" : "#00e676";
+    lockBtn.style.color = state.locked ? "#fff" : "#01020a";
     pinInput.value = state.pinCode;
     addrInput.value = state.connectedRoomAddress;
 
     // If there is an active inbound pairing request, reveal target controls
     if (state.pairingPending && !state.pairedSuccessfully) {
-      noticeBox.style.display = 'flex';
+      noticeBox.style.display = "flex";
     } else {
-      noticeBox.style.display = 'none';
+      noticeBox.style.display = "none";
     }
 
     // #62 P4: armed-preset prefill — an unpaired door with no working chain
@@ -1034,20 +1273,25 @@ export class DoorDockingPortSystem {
     // diamond ring room, so it defaults FAR yaw to 45. OWNER-only (vestibule
     // findings): a guest merely inspecting a keypad must not consume parts or
     // arm a ghost on someone else's room.
-    if (this.canConstruct(doorId) && !state.pairedSuccessfully && (!state.segments || state.segments.length === 0)) {
+    if (
+      this.canConstruct(doorId) &&
+      !state.pairedSuccessfully &&
+      (!state.segments || state.segments.length === 0)
+    ) {
       const preset = armedPreset();
       if (preset) {
         const segs = presetSegments(preset);
         if (consumeForSegments(segs)) {
           state.segments = segs;
-          if (preset === 'ring' && state.farYawDeg === undefined) state.farYawDeg = 45;
+          if (preset === "ring" && state.farYawDeg === undefined)
+            state.farYawDeg = 45;
           this.untouchedPrefills.add(doorId); // refunded on close unless used
         }
       }
     }
     this.renderAssemblyStrip(doorId);
     this.renderPolicySection(doorId); // #67 D1
-    this.renderKnownModules();        // 🗺️ atlas picker
+    this.renderKnownModules(); // 🗺️ atlas picker
   }
 
   /**
@@ -1060,21 +1304,45 @@ export class DoorDockingPortSystem {
    * Works for modules the atlas can PLACE (reachable through known links);
    * an island module it has never seen connected can't be matched.
    */
-  private detectChainContact(doorId: 'north' | 'south' | 'east' | 'west'): void {
-    const slot = document.getElementById('docking-dock-detect');
+  private detectChainContact(
+    doorId: "north" | "south" | "east" | "west",
+  ): void {
+    const slot = document.getElementById("docking-dock-detect");
     if (!slot) return;
-    slot.style.display = 'none';
+    slot.style.display = "none";
     const state = this.doorState.get(doorId);
-    if (!state || state.pairedSuccessfully || !state.segments || state.segments.length === 0) return;
-    const currentId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+    if (
+      !state ||
+      state.pairedSuccessfully ||
+      !state.segments ||
+      state.segments.length === 0
+    )
+      return;
+    const currentId =
+      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     if (!currentId) return;
 
     // Where would a module sit at this chain's far end? (Room-local = world
     // for the current room — the same frame atlasLayout emits.)
     const wouldBe = projectionPoseForDoor(doorId, state.segments, undefined);
-    const layout = atlasLayout(currentId, (d, s, f) => projectionPoseForDoor(d, s, f), 8);
-    let best: { roomId: string; name: string; seed?: string; dist: number; door: string } | null = null;
-    const DOOR_YAW: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
+    const layout = atlasLayout(
+      currentId,
+      (d, s, f) => projectionPoseForDoor(d, s, f),
+      8,
+    );
+    let best: {
+      roomId: string;
+      name: string;
+      seed?: string;
+      dist: number;
+      door: string;
+    } | null = null;
+    const DOOR_YAW: Record<string, number> = {
+      south: 0,
+      east: Math.PI / 2,
+      north: Math.PI,
+      west: -Math.PI / 2,
+    };
     const angDiff = (a: number, b: number) => {
       let d = (a - b) % (Math.PI * 2);
       if (d > Math.PI) d -= Math.PI * 2;
@@ -1089,12 +1357,21 @@ export class DoorDockingPortSystem {
       const arrivalFacing = wouldBe.rotY + Math.PI;
       let doorPick: string | null = null;
       let doorErr = Math.PI;
-      for (const d of ['north', 'south', 'east', 'west']) {
+      for (const d of ["north", "south", "east", "west"]) {
         const err = angDiff(mod.rotY + DOOR_YAW[d], arrivalFacing);
-        if (err < doorErr) { doorErr = err; doorPick = d; }
+        if (err < doorErr) {
+          doorErr = err;
+          doorPick = d;
+        }
       }
       if (doorPick && doorErr < Math.PI / 3) {
-        best = { roomId: mod.roomId, name: mod.name, seed: mod.seed, dist, door: doorPick };
+        best = {
+          roomId: mod.roomId,
+          name: mod.name,
+          seed: mod.seed,
+          dist,
+          door: doorPick,
+        };
       }
     }
     if (!best || !best.seed) return;
@@ -1105,23 +1382,41 @@ export class DoorDockingPortSystem {
     // reality (a 45° preset relaxes to 40°, bends equalize, the extension
     // slides). Target = the matched door's face, in this door's chain frame.
     const mod = layout.find((m) => m.roomId === best!.roomId)!;
-    const dyaw: Record<string, number> = { south: 0, east: Math.PI / 2, north: Math.PI, west: -Math.PI / 2 };
-    const doorFaceLocal = { north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 } }[best.door]!;
-    const mc = Math.cos(mod.rotY), ms = Math.sin(mod.rotY);
+    const dyaw: Record<string, number> = {
+      south: 0,
+      east: Math.PI / 2,
+      north: Math.PI,
+      west: -Math.PI / 2,
+    };
+    const doorFaceLocal = {
+      north: { x: 0, z: -6 },
+      south: { x: 0, z: 6 },
+      east: { x: 6, z: 0 },
+      west: { x: -6, z: 0 },
+    }[best.door]!;
+    const mc = Math.cos(mod.rotY),
+      ms = Math.sin(mod.rotY);
     const faceWorld = {
       x: mod.x + doorFaceLocal.x * mc + doorFaceLocal.z * ms,
       z: mod.z - doorFaceLocal.x * ms + doorFaceLocal.z * mc,
     };
     // Chain frame: origin at OUR door face, +z outward, rotated by our door's yaw.
     const ourYaw = dyaw[doorId];
-    const ourFace = { north: { x: 0, z: -6 }, south: { x: 0, z: 6 }, east: { x: 6, z: 0 }, west: { x: -6, z: 0 } }[doorId]!;
-    const dx = faceWorld.x - ourFace.x, dz = faceWorld.z - ourFace.z;
-    const oc = Math.cos(-ourYaw), os = Math.sin(-ourYaw);
+    const ourFace = {
+      north: { x: 0, z: -6 },
+      south: { x: 0, z: 6 },
+      east: { x: 6, z: 0 },
+      west: { x: -6, z: 0 },
+    }[doorId]!;
+    const dx = faceWorld.x - ourFace.x,
+      dz = faceWorld.z - ourFace.z;
+    const oc = Math.cos(-ourYaw),
+      os = Math.sin(-ourYaw);
     const targetLocal = {
       x: dx * oc + dz * os,
       z: -dx * os + dz * oc,
       // Chain exit heading must point INTO the matched door.
-      yawRad: (mod.rotY + dyaw[best.door] + Math.PI) - ourYaw,
+      yawRad: mod.rotY + dyaw[best.door] + Math.PI - ourYaw,
     };
     // Normalize the yaw into (-π, π].
     while (targetLocal.yawRad > Math.PI) targetLocal.yawRad -= Math.PI * 2;
@@ -1129,57 +1424,81 @@ export class DoorDockingPortSystem {
     const solved = solveChain(state.segments, targetLocal);
     const fits = solved.residualDist < 0.35 && solved.residualYawDeg < 4;
 
-    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
     const fitNote = fits
       ? (() => {
-        const bends = solved.segments.filter((s) => s.kind === 'flex').map((s) => `${(s.bendDeg ?? 0).toFixed(1)}°`).join('/');
-        return ` · auto-fit ${bends}`;
-      })()
-      : ' · rigid (fit out of range)';
+          const bends = solved.segments
+            .filter((s) => s.kind === "flex")
+            .map((s) => `${(s.bendDeg ?? 0).toFixed(1)}°`)
+            .join("/");
+          return ` · auto-fit ${bends}`;
+        })()
+      : " · rigid (fit out of range)";
     slot.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
         <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its ${best.door.toUpperCase()} door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
         <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
       </div>`;
-    slot.style.display = 'block';
-    document.getElementById('docking-dock-connect')?.addEventListener('click', () => {
-      const st = this.doorState.get(doorId);
-      // 🛬 Apply the SOLVED chain (exact fit) before pairing — the record
-      // then carries the fitted geometry to every client.
-      if (st && fits) {
-        st.segments = solved.segments;
-        this.renderAssemblyStrip(doorId);
-      }
-      const addr = document.getElementById('docking-addr-input') as HTMLInputElement | null;
-      const far = document.getElementById('docking-far-door') as HTMLSelectElement | null;
-      if (addr) addr.value = best!.seed!;
-      if (far) far.value = best!.door;
-      if (st) st.farDoor = best!.door as 'north' | 'south' | 'east' | 'west';
-      // Fire the normal INITIATE path (all its gates apply).
-      document.getElementById('docking-request-btn')?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    });
+    slot.style.display = "block";
+    document
+      .getElementById("docking-dock-connect")
+      ?.addEventListener("click", () => {
+        const st = this.doorState.get(doorId);
+        // 🛬 Apply the SOLVED chain (exact fit) before pairing — the record
+        // then carries the fitted geometry to every client.
+        if (st && fits) {
+          st.segments = solved.segments;
+          this.renderAssemblyStrip(doorId);
+        }
+        const addr = document.getElementById(
+          "docking-addr-input",
+        ) as HTMLInputElement | null;
+        const far = document.getElementById(
+          "docking-far-door",
+        ) as HTMLSelectElement | null;
+        if (addr) addr.value = best!.seed!;
+        if (far) far.value = best!.door;
+        if (st) st.farDoor = best!.door as "north" | "south" | "east" | "west";
+        // Fire the normal INITIATE path (all its gates apply).
+        document
+          .getElementById("docking-request-btn")
+          ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
   }
 
   /** 🗺️ Repopulate the known-modules picker from the station atlas (every
    *  entry holding an address, current room excluded, most recent first). */
   private renderKnownModules(): void {
-    const sel = document.getElementById('docking-known-modules') as HTMLSelectElement | null;
+    const sel = document.getElementById(
+      "docking-known-modules",
+    ) as HTMLSelectElement | null;
     if (!sel) return;
-    const currentId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+    const currentId =
+      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     const entries = Object.values(readAtlas())
       .filter((e) => e.seed && e.roomId !== currentId)
       .sort((a, b) => b.lastSeen - a.lastSeen)
       .slice(0, 24);
-    sel.innerHTML = '<option value="">🗺️ … or pick a KNOWN MODULE</option>'
-      + entries.map((e) => {
-        const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-        return `<option value="${esc(e.seed!)}">${esc(e.name)} · ${esc(e.roomId.slice(0, 10))}</option>`;
-      }).join('');
-    sel.style.display = entries.length > 0 ? 'block' : 'none';
+    sel.innerHTML =
+      '<option value="">🗺️ … or pick a KNOWN MODULE</option>' +
+      entries
+        .map((e) => {
+          const esc = (s: string) =>
+            s
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/"/g, "&quot;");
+          return `<option value="${esc(e.seed!)}">${esc(e.name)} · ${esc(e.roomId.slice(0, 10))}</option>`;
+        })
+        .join("");
+    sel.style.display = entries.length > 0 ? "block" : "none";
   }
 
   /** Refund + drop an untouched prefill chain (see untouchedPrefills docs). */
-  private discardUntouchedPrefill(doorId: 'north' | 'south' | 'east' | 'west'): void {
+  private discardUntouchedPrefill(
+    doorId: "north" | "south" | "east" | "west",
+  ): void {
     if (!this.untouchedPrefills.delete(doorId)) return;
     const state = this.doorState.get(doorId);
     if (!state || state.pairedSuccessfully || !state.segments?.length) return;
@@ -1192,27 +1511,33 @@ export class DoorDockingPortSystem {
    * signals, and tint the emissive 'frameGlow' strips to match:
    * pending amber, paired green, locked red, otherwise cyan.
    */
-  private syncLEDStatus(doorId: 'north' | 'south' | 'east' | 'west', state: DockingState) {
+  private syncLEDStatus(
+    doorId: "north" | "south" | "east" | "west",
+    state: DockingState,
+  ) {
     const group = this.doorObjects.get(doorId);
     if (!group) return;
 
-    let ledColor = 0x1E88E5;  // Blue (idle/unlocked)
-    let glowColor = 0x00E5FF; // Cyan (idle/unlocked)
+    let ledColor = 0x1e88e5; // Blue (idle/unlocked)
+    let glowColor = 0x00e5ff; // Cyan (idle/unlocked)
     if (state.pairingPending && !state.pairedSuccessfully) {
-      ledColor = 0xFFB300; glowColor = 0xFFB300;  // Yellow/Orange
+      ledColor = 0xffb300;
+      glowColor = 0xffb300; // Yellow/Orange
     } else if (state.pairedSuccessfully) {
-      ledColor = 0x00E676; glowColor = 0x00E676;  // Green
+      ledColor = 0x00e676;
+      glowColor = 0x00e676; // Green
     } else if (state.locked) {
-      ledColor = 0xFF1744; glowColor = 0xFF1744;  // Red
+      ledColor = 0xff1744;
+      glowColor = 0xff1744; // Red
     }
 
-    const led = group.getObjectByName('ledStatus') as THREE.Mesh | undefined;
+    const led = group.getObjectByName("ledStatus") as THREE.Mesh | undefined;
     if (led && led.material instanceof THREE.MeshBasicMaterial) {
       led.material.color.setHex(ledColor);
     }
 
     group.traverse((child) => {
-      if (child.name === 'frameGlow') {
+      if (child.name === "frameGlow") {
         const mat = (child as THREE.Mesh).material;
         if (mat instanceof THREE.MeshBasicMaterial) mat.color.setHex(glowColor);
       }
@@ -1222,19 +1547,24 @@ export class DoorDockingPortSystem {
   /**
    * Execute inbound request triggers
    */
-  public receiveInboundPairingRequest(doorId: 'north' | 'south' | 'east' | 'west', targetAddr: string) {
+  public receiveInboundPairingRequest(
+    doorId: "north" | "south" | "east" | "west",
+    targetAddr: string,
+  ) {
     const state = this.doorState.get(doorId);
     if (state) {
       state.connectedRoomAddress = targetAddr;
       state.pairingPending = true;
       this.syncLEDStatus(doorId, state);
-      
+
       // Start Flash LED animation inside tick
       this.animateBlinkingIndicator(doorId);
     }
   }
 
-  private animateBlinkingIndicator(doorId: 'north' | 'south' | 'east' | 'west') {
+  private animateBlinkingIndicator(
+    doorId: "north" | "south" | "east" | "west",
+  ) {
     let toggle = false;
     const interval = setInterval(() => {
       const state = this.doorState.get(doorId);
@@ -1244,28 +1574,31 @@ export class DoorDockingPortSystem {
       }
 
       const group = this.doorObjects.get(doorId);
-      const led = group?.getObjectByName('ledStatus') as THREE.Mesh | undefined;
+      const led = group?.getObjectByName("ledStatus") as THREE.Mesh | undefined;
       if (led && led.material instanceof THREE.MeshBasicMaterial) {
         toggle = !toggle;
-        led.material.color.setHex(toggle ? 0xFFB300 : 0x111625); // flash yellow vs dark
+        led.material.color.setHex(toggle ? 0xffb300 : 0x111625); // flash yellow vs dark
       }
     }, 450);
   }
 
-  public completePairing(doorId: 'north' | 'south' | 'east' | 'west', accept: boolean) {
+  public completePairing(
+    doorId: "north" | "south" | "east" | "west",
+    accept: boolean,
+  ) {
     const state = this.doorState.get(doorId);
     if (!state) return;
 
     state.pairingPending = false;
     state.pairedSuccessfully = accept;
-    
+
     if (accept) {
       state.locked = false; // Open door on success
       this.syncLEDStatus(doorId, state);
       this.drawAdjacentRoomProjection(doorId);
       this.openDoor(doorId);
     } else {
-      state.connectedRoomAddress = '';
+      state.connectedRoomAddress = "";
       // Vestibule-findings fix (ghost residue): a REJECTED connection's working
       // chain must not linger as a ghost tube on an unpaired door — refund the
       // parts and drop it.
@@ -1275,7 +1608,10 @@ export class DoorDockingPortSystem {
     }
 
     if (this.onPairingStatusChangedCallback) {
-      this.onPairingStatusChangedCallback(doorId, accept ? 'ACCEPTED' : 'REJECTED');
+      this.onPairingStatusChangedCallback(
+        doorId,
+        accept ? "ACCEPTED" : "REJECTED",
+      );
     }
   }
 
@@ -1290,7 +1626,12 @@ export class DoorDockingPortSystem {
   public applyRemotePairing(
     doorId: DoorId,
     address: string,
-    geometry?: { segments?: ConnectorSegment[]; farDoor?: DoorId; farYawDeg?: 0 | 45; transient?: boolean },
+    geometry?: {
+      segments?: ConnectorSegment[];
+      farDoor?: DoorId;
+      farYawDeg?: 0 | 45;
+      transient?: boolean;
+    },
   ): void {
     const state = this.doorState.get(doorId);
     if (!state) return;
@@ -1298,10 +1639,16 @@ export class DoorDockingPortSystem {
     // edit rewrites the record with the same address, and every client must
     // pick it up (P3 rebuilds the chain + reposes the projection on change).
     const sameGeometry =
-      JSON.stringify(state.segments ?? null) === JSON.stringify(geometry?.segments ?? null) &&
+      JSON.stringify(state.segments ?? null) ===
+        JSON.stringify(geometry?.segments ?? null) &&
       state.farDoor === geometry?.farDoor &&
       state.farYawDeg === geometry?.farYawDeg;
-    if (state.pairedSuccessfully && state.connectedRoomAddress === address && sameGeometry) return;
+    if (
+      state.pairedSuccessfully &&
+      state.connectedRoomAddress === address &&
+      sameGeometry
+    )
+      return;
     state.connectedRoomAddress = address;
     state.segments = geometry?.segments;
     state.farDoor = geometry?.farDoor;
@@ -1325,7 +1672,7 @@ export class DoorDockingPortSystem {
     if (!state || !state.pairedSuccessfully) return;
     state.pairedSuccessfully = false;
     state.pairingPending = false;
-    state.connectedRoomAddress = '';
+    state.connectedRoomAddress = "";
     state.segments = undefined;
     state.farDoor = undefined;
     state.farYawDeg = undefined;
@@ -1370,26 +1717,31 @@ export class DoorDockingPortSystem {
    * identity ships). Driven from the roomInfo observer; distinct from the
    * per-door pairing/lock the docking terminal manages. Idempotent.
    */
-  public setAccessMode(mode: 'public' | 'pass' | 'keyed'): void {
+  public setAccessMode(mode: "public" | "pass" | "keyed"): void {
     this.accessMode = mode;
-    const color = mode === 'public' ? 0x00e676 : mode === 'keyed' ? 0xff1744 : 0xd4a84b;
+    const color =
+      mode === "public" ? 0x00e676 : mode === "keyed" ? 0xff1744 : 0xd4a84b;
     for (const group of this.doorObjects.values()) {
-      const led = group.getObjectByName('ledStatus') as THREE.Mesh | null;
+      const led = group.getObjectByName("ledStatus") as THREE.Mesh | null;
       const mat = led?.material as THREE.MeshBasicMaterial | undefined;
       if (mat?.color) mat.color.setHex(color);
     }
   }
 
   /** The current room entry access mode (public-doors feature). */
-  public getAccessMode(): 'public' | 'pass' | 'keyed' {
+  public getAccessMode(): "public" | "pass" | "keyed" {
     return this.accessMode;
   }
 
-  private startSlide(doorId: DoorId, open: boolean, onComplete?: () => void): void {
+  private startSlide(
+    doorId: DoorId,
+    open: boolean,
+    onComplete?: () => void,
+  ): void {
     const group = this.doorObjects.get(doorId);
     if (!group) return; // no door built — the caller's timeout handles it
     const isLarge = group.userData?.isLarge === true;
-    const openTarget = open ? (isLarge ? 1.8 : 1.05) : (isLarge ? 0.62 : 0.37);
+    const openTarget = open ? (isLarge ? 1.8 : 1.05) : isLarge ? 0.62 : 0.37;
 
     // Same-direction overwrite: chain the in-flight onComplete (old first) so
     // an external open (keypad unlock, pairing accept) can't drop a waiting
@@ -1399,7 +1751,12 @@ export class DoorDockingPortSystem {
     if (prev && prev.openTarget === openTarget && prev.onComplete) {
       const prevCb = prev.onComplete;
       const nextCb = onComplete;
-      onComplete = nextCb ? () => { prevCb(); nextCb(); } : prevCb;
+      onComplete = nextCb
+        ? () => {
+            prevCb();
+            nextCb();
+          }
+        : prevCb;
     }
 
     this.slideAnims.set(doorId, { openTarget, onComplete });
@@ -1413,21 +1770,21 @@ export class DoorDockingPortSystem {
     if (this.slideAnims.size === 0) return;
     for (const [doorId, anim] of Array.from(this.slideAnims.entries())) {
       const group = this.doorObjects.get(doorId);
-      const left = group?.getObjectByName('leftLeaf');
-      const right = group?.getObjectByName('rightLeaf');
+      const left = group?.getObjectByName("leftLeaf");
+      const right = group?.getObjectByName("rightLeaf");
       if (!left || !right) {
         this.slideAnims.delete(doorId);
         continue;
       }
       const step = this.SLIDE_SPEED * deltaTime;
-      left.position.x  = moveToward(left.position.x,  -anim.openTarget, step);
-      right.position.x = moveToward(right.position.x,  anim.openTarget, step);
+      left.position.x = moveToward(left.position.x, -anim.openTarget, step);
+      right.position.x = moveToward(right.position.x, anim.openTarget, step);
       if (
         Math.abs(left.position.x + anim.openTarget) < 0.01 &&
         Math.abs(right.position.x - anim.openTarget) < 0.01
       ) {
-        left.position.x  = -anim.openTarget;
-        right.position.x =  anim.openTarget;
+        left.position.x = -anim.openTarget;
+        right.position.x = anim.openTarget;
         this.slideAnims.delete(doorId);
         if (anim.onComplete) anim.onComplete();
       }
@@ -1445,7 +1802,11 @@ export class DoorDockingPortSystem {
    *     progress restores full opacity for the crossing).
    * Called once per frame from World.update, right after update().
    */
-  public updateFacingFade(deltaTime: number, enabled: boolean, activeDoorId: DoorId | null): void {
+  public updateFacingFade(
+    deltaTime: number,
+    enabled: boolean,
+    activeDoorId: DoorId | null,
+  ): void {
     // Camera XZ direction for the current detent: the base isometric offset
     // sits on the +X/+Z diagonal (renderer/zoom convention), swung by the
     // rig's snapped yaw — x' = (cosθ+sinθ)/√2, z' = (cosθ−sinθ)/√2.
@@ -1456,13 +1817,15 @@ export class DoorDockingPortSystem {
     const camZ = (c - s) * Math.SQRT1_2;
 
     for (const [doorId, mats] of this.doorFadeMats) {
-      const n = DoorDockingPortSystem.DOOR_NORMALS[doorId];
+      const yaw = physicalDoorPose(doorId).outwardYaw;
+      const n = { x: Math.sin(yaw), z: Math.cos(yaw) };
       // 45° detents yield dots of 0 / ±0.707 / ±1 — 0.3 splits camera-facing
       // walls (0.707, 1) from side-on and far walls (0, negatives).
       const facing = n.x * camX + n.z * camZ > 0.3;
-      const target = enabled && facing && activeDoorId !== doorId
-        ? DoorDockingPortSystem.FACING_FADE_OPACITY
-        : 1.0;
+      const target =
+        enabled && facing && activeDoorId !== doorId
+          ? DoorDockingPortSystem.FACING_FADE_OPACITY
+          : 1.0;
 
       const current = this.doorFadeOpacity.get(doorId) ?? 1;
       if (current === target) continue;
@@ -1485,7 +1848,9 @@ export class DoorDockingPortSystem {
   /**
    * Render "Gray Box" Projection of the connected room outside the doorway
    */
-  private drawAdjacentRoomProjection(doorId: 'north' | 'south' | 'east' | 'west') {
+  private drawAdjacentRoomProjection(
+    doorId: "north" | "south" | "east" | "west",
+  ) {
     // #62 P3: the projection is POSED FROM THE CONNECTION RECORD — the far
     // room's box sits at the folded chain's exit (at its angle) instead of the
     // old hardcoded cardinal 15.2. Legacy pairings (no segments) get the exact
@@ -1493,7 +1858,10 @@ export class DoorDockingPortSystem {
     // re-runs this via applyRemotePairing's geometry diff, so an existing box
     // drawn with the SAME geometry stays; a different one is disposed+redrawn.
     const state = this.doorState.get(doorId);
-    const poseKey = JSON.stringify({ s: state?.segments ?? null, f: state?.farDoor ?? null });
+    const poseKey = JSON.stringify({
+      s: state?.segments ?? null,
+      f: state?.farDoor ?? null,
+    });
     const existing = this.adjacentRooms.get(doorId);
     if (existing) {
       if (existing.userData.poseKey === poseKey) return; // unchanged — keep it
@@ -1520,7 +1888,9 @@ export class DoorDockingPortSystem {
     this.roomsGroup.add(adjRoom);
     this.adjacentRooms.set(doorId, adjRoom);
 
-    console.log(`📡 Rendered "Gray Box" projection of external capsule outside ${doorId.toUpperCase()} portal`);
+    console.log(
+      `📡 Rendered "Gray Box" projection of external capsule outside ${doorId.toUpperCase()} portal`,
+    );
   }
 
   // Bind Listeners
@@ -1542,7 +1912,7 @@ export class DoorDockingPortSystem {
     // both ways, always.
     if (this.isRoomOwner()) return true;
     const p = readDoorPolicy(doorId);
-    return p.passage === 'public' && p.oneWay !== 'in';
+    return p.passage === "public" && p.oneWay !== "in";
   }
 
   /** 🧱 #66 S1: slide each door's 3D group (frame + leaves + keypad ride the
@@ -1559,9 +1929,14 @@ export class DoorDockingPortSystem {
     for (const [, group] of this.doorObjects) {
       group.traverse((child) => {
         if (!(child instanceof THREE.Mesh)) return;
-        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        const mats = Array.isArray(child.material)
+          ? child.material
+          : [child.material];
         for (const mat of mats) {
-          const m = mat as THREE.Material & { opacity: number; transparent: boolean };
+          const m = mat as THREE.Material & {
+            opacity: number;
+            transparent: boolean;
+          };
           if (on) {
             if (m.userData.ghostPrev === undefined) {
               m.userData.ghostPrev = {
@@ -1570,13 +1945,20 @@ export class DoorDockingPortSystem {
                 transparent: m.transparent,
               };
             }
-            const prev = m.userData.ghostPrev as { opacity: number; baseOpacity?: number };
+            const prev = m.userData.ghostPrev as {
+              opacity: number;
+              baseOpacity?: number;
+            };
             const target = Math.min(0.16, prev.baseOpacity ?? 1);
             m.transparent = true;
             m.userData.baseOpacity = target;
             m.opacity = Math.min(m.opacity, target);
           } else if (m.userData.ghostPrev !== undefined) {
-            const prev = m.userData.ghostPrev as { opacity: number; baseOpacity?: number; transparent: boolean };
+            const prev = m.userData.ghostPrev as {
+              opacity: number;
+              baseOpacity?: number;
+              transparent: boolean;
+            };
             delete m.userData.ghostPrev;
             m.transparent = prev.transparent;
             if (prev.baseOpacity === undefined) delete m.userData.baseOpacity;
@@ -1588,11 +1970,14 @@ export class DoorDockingPortSystem {
     }
   }
 
-  public repositionDoorGroups(deltas: Record<'north' | 'south' | 'east' | 'west', number>): void {
+  public repositionDoorGroups(
+    deltas: Record<"north" | "south" | "east" | "west", number>,
+  ): void {
     for (const [id, group] of this.doorObjects) {
-      const d = deltas[id as 'north' | 'south' | 'east' | 'west'] ?? 0;
-      if (id === 'north' || id === 'south') group.position.x = d;
-      else group.position.z = d;
+      const doorId = id as DoorId;
+      const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
+      group.position.set(pose.x, 2, pose.z);
+      group.rotation.y = pose.frameYaw;
     }
   }
 
@@ -1601,9 +1986,14 @@ export class DoorDockingPortSystem {
    *  record rewrites and every client's geometry diff rebuilds the chain.
    *  Returns false when refused (no rights / no such segment). */
   public editChainSegment(
-    doorId: 'north' | 'south' | 'east' | 'west',
+    doorId: "north" | "south" | "east" | "west",
     index: number,
-    patch: { bendDeg?: number; stretch?: number; bays?: number; skin?: 'ribbed' | 'solid' },
+    patch: {
+      bendDeg?: number;
+      stretch?: number;
+      bays?: number;
+      skin?: "ribbed" | "solid";
+    },
   ): boolean {
     const state = this.doorState.get(doorId);
     if (!state || !state.segments || !state.segments[index]) return false;

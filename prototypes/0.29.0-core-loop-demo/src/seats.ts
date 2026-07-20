@@ -22,13 +22,17 @@
  * rebakeWalkableGrid → rebuildSeats).
  */
 
-import { FURNITURE, buildSeatList } from './furniture';
+import { FURNITURE, buildSeatList, isBridgeClick } from './furniture';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 
 export interface Seat {
   id: string;
   clickBox: { x0: number; z0: number; x1: number; z1: number };
   front: { x: number; z: number };
+  /** 🌉 Optional scripted walk waypoints between `front` and the seat (the
+   *  hot-tub footbridge): walked with the walk pose, y snapping to each
+   *  point's deck height; reversed on stand-up. */
+  path?: Array<{ x: number; y: number; z: number }>;
   sit: { x: number; z: number };
   faceAngle: number;
   /** 🛏️ Avatar-root height while on the seat (bunk mattress tops); 0 = floor. */
@@ -55,13 +59,34 @@ export function rebuildSeats(): void {
 
 rebuildSeats();
 
-/** Find the seat whose click box contains the world-space floor point. */
+/** Find the seat whose click box contains the world-space floor point.
+ *
+ *  Priority (NOT plain list order): the pool's swim clickBoxes blanket the
+ *  entire water surface — including the hot-tub island and its footbridge —
+ *  and the pool item precedes the hot tub in FURNITURE order, so a single
+ *  first-hit pass would route every tub/bridge click into a wade-in swim.
+ *  1. solid seats (chairs, loungers, bunks, the hot tub, the dive board)
+ *  2. 🌉 the footbridge deck → the tub's southmost seat (facing the bridge)
+ *  3. open-water swim seats
+ */
 export function findSeatAt(x: number, z: number): Seat | null {
-  for (const seat of SEATS) {
+  const inBox = (seat: Seat) => {
     const b = seat.clickBox;
-    if (x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1) {
-      return seat;
+    return x >= b.x0 && x <= b.x1 && z >= b.z0 && z <= b.z1;
+  };
+  for (const seat of SEATS) {
+    if (!seat.swim && inBox(seat)) return seat;
+  }
+  if (isBridgeClick(FURNITURE, x, z)) {
+    let best: Seat | null = null;
+    for (const seat of SEATS) {
+      if (!seat.id.startsWith('pool-hot-tub:')) continue;
+      if (!best || seat.sit.z > best.sit.z) best = seat;
     }
+    if (best) return best;
+  }
+  for (const seat of SEATS) {
+    if (seat.swim && inBox(seat)) return seat;
   }
   return null;
 }
