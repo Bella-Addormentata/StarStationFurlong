@@ -1668,8 +1668,12 @@ export class World {
    * covers remote changes; editMode's local splice/spawn does not).
    */
   public refreshOutdoorFloor(): void {
-    const hasPool =
-      this.isOutdoorRoom && FURNITURE.some((i) => i.kind === "lazy-pool");
+    // A pool (either style) sinks its water below the floor, so hide the solid
+    // floor/grid wherever one is present — not only in the authored outdoor
+    // room (a pool template dropped into any room reveals its water too).
+    const hasPool = FURNITURE.some(
+      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+    );
     if (this.platformFloor) this.platformFloor.visible = !hasPool;
     if (this.platformGrid) this.platformGrid.visible = !hasPool;
   }

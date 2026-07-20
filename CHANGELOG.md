@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.40 — 2026-07-20
+
+### 🏊 Classic Lido Pool — a second pool design (PR #70 revived)
+
+- **A second pool template, "Classic Lido Pool" (pool-2)** — a faithful revival of the original #70 pool, rebuilt on the current code. Where the live "Infinity Pool Deck" (pool-1) centres the hot tub in the water with a bridge walk, the Classic Lido puts the **high-dive tower on the east rim**, a **standalone sculpted hot tub in the NW corner**, a red terrace bench, four green sun loungers by the south door, and red/yellow parasol cafés. Place it from the dev-menu ROOM TEMPLATES or the door-panel provisioning dropdown.
+- Both pools **swim and dive correctly** — the classic pool ships its own east dive board + swim ring, and the swim "island" now tracks the live hot tub's position instead of a fixed spot, so the corner tub is handled right.
+- A pool template dropped into **any** room now reveals its water (the solid floor hides wherever a pool is present, not only in the authored outdoor room).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.40, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.39 — 2026-07-20
 
 ### 🏗️ Provision a New Room From a Template (or Empty) at the Door Panel

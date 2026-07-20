@@ -77,7 +77,6 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   FURNITURE,
-  OUTDOOR_FURNITURE,
   getPoolBasin,
   getPoolIsland,
 } from "./furniture";
@@ -1180,7 +1179,7 @@ export class Player {
     // converts to swimming on the spot. Nobody walks on water.
     if (!this.swimMode) {
       const basin = getPoolBasin(FURNITURE);
-      const island = getPoolIsland(OUTDOOR_FURNITURE);
+      const island = getPoolIsland(FURNITURE);
       if (
         basin &&
         pos.x > basin.x0 &&
@@ -1572,7 +1571,7 @@ export class Player {
   }
 
   private _resolvePoolIsland(x: number, z: number): { x: number; z: number } {
-    const island = getPoolIsland(OUTDOOR_FURNITURE);
+    const island = getPoolIsland(FURNITURE);
     if (!island || !this._insidePoolIsland(x, z, island)) return { x, z };
     const dx = x - island.x;
     const dz = z - island.z;
@@ -1593,7 +1592,7 @@ export class Player {
     tx: number,
     tz: number,
   ): Array<{ x: number; z: number }> {
-    const island = getPoolIsland(OUTDOOR_FURNITURE);
+    const island = getPoolIsland(FURNITURE);
     const start = this.mesh.position;
     if (!island) return [{ x: tx, z: tz }];
 

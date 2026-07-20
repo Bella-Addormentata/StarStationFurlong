@@ -92,10 +92,25 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     items: OUTDOOR_FURNITURE,
     doorLayout: "pool-pairs",
   },
+  {
+    id: "pool-2",
+    category: "pool",
+    name: "Classic Lido Pool",
+    description:
+      "PR #70's original — east dive tower, corner hot tub, terrace bench, sun loungers, parasol cafés.",
+    items: [
+      { id: "pool-main", kind: "classic-pool", pos: { x: 0, z: 0 }, rot: 0, movable: false },
+      { id: "pool-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
+      { id: "otree-sw", kind: "cherry-tree", pos: { x: -4.5, z: 4.5 }, rot: 0, movable: true },
+      { id: "otree-se", kind: "cherry-tree", pos: { x: 4.5, z: 4.5 }, rot: 0, movable: true },
+      { id: "opot-1", kind: "blossom-pot", pos: { x: 2.55, z: 4.75 }, rot: 0, movable: true },
+      { id: "opot-2", kind: "blossom-pot", pos: { x: 4.6, z: 2.6 }, rot: 0, movable: true },
+    ],
+    doorLayout: "pool-pairs",
+  },
   // Planned variants (author via EXPORT, then paste here):
   //   casino-2 "Neon Slots Hall", casino-3 "High-Roller Salon",
-  //   pool-2   "Hot-Tub Island" (tub centred in the water), pool-3 "Lap Lanes",
-  //   lobby-2  "Minimal Atrium".
+  //   pool-3 "Lap Lanes", lobby-2 "Minimal Atrium".
 ];
 
 /** Distinct room types present, in registry order (for a grouped picker). */
