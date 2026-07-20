@@ -394,6 +394,80 @@ export function redeemShareOffer(o: TransferOffer, myPub: string, myName: string
   return { ok: true };
 }
 
+// ── Co-present settlement: settle a deed into an ARBITRARY module doc ─────────
+
+/** The new owner's portable identity — a keyed players entry copied from the
+ *  room where maker + receiver met into the subject module (the name↔key cert
+ *  is room-agnostic, so it verifies wherever it lands). */
+export interface DocSettleOwner {
+  playerId: string;
+  name: string;
+  keyB64: string;
+  keySig?: string;
+  outfitId?: string;
+  joinedAt?: number;
+}
+
+/**
+ * Settle a DEED offer into a doc that is NOT the module binding — the co-present
+ * path: the maker's client, standing in another room with the receiver, opens
+ * the subject module in the background and hands the deed over on their behalf.
+ * Everything is verified against the PASSED doc (owner-match, office guard,
+ * nonce). PERSONAL transfer only in v1 (company acceptance stays a settle-at-
+ * the-module flow); a maker-directed venture offer is refused here. The
+ * receiver's keyed entry is copied in so ownership resolves at the module.
+ */
+export function settleDeedInDoc(doc: Y.Doc, o: TransferOffer, owner: DocSettleOwner): RedeemResult {
+  if (o.asset.kind !== 'deed') return { ok: false, error: 'Not a deed offer.' };
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { ok: false, error: 'The module records did not load.' };
+  if (!verifyOffer(o)) return { ok: false, error: 'Offer failed verification.' };
+  if (Date.now() >= o.expiresAt) return { ok: false, error: 'This offer has expired.' };
+  if (o.price !== 0) return { ok: false, error: 'Priced offers arrive with the Registry — only gifts settle today.' };
+  if (o.toVentureId) return { ok: false, error: 'Company offers are settled at the module for now.' };
+  if (!owner.keyB64) return { ok: false, error: 'The new owner has no keyed record to carry.' };
+  if (o.toPub && o.toPub !== owner.keyB64) return { ok: false, error: 'This offer is made out to someone else.' };
+  if (o.makerPub === owner.keyB64) return { ok: false, error: 'The maker cannot accept their own offer.' };
+
+  // Already settled/revoked in the module's own record?
+  const offers = doc.getMap('offers');
+  const prior = readMark(offers.get(o.nonce));
+  if (prior) return { ok: false, error: prior.status === 'redeemed' ? 'Already redeemed.' : 'The maker revoked this offer.' };
+
+  // Office guard (lightweight read of the module's venture record).
+  const vrec = doc.getMap('venture').get('v') as { snapshotAt?: number } | undefined;
+  if (vrec && vrec.snapshotAt === undefined) return { ok: false, error: 'A registered office cannot change hands — the Charter holds its deed.' };
+
+  // Owner-match against THIS doc — the maker must still hold the deed here.
+  const ownerId = doc.getMap('roomInfo').get('owner');
+  if (typeof ownerId !== 'string' || !ownerId) return { ok: false, error: 'No owner recorded at the module yet.' };
+  const cur = doc.getMap('players').get(ownerId) as { keyB64?: string } | undefined;
+  if (cur?.keyB64 !== o.makerPub) return { ok: false, error: 'The deed has changed hands since this offer was made.' };
+
+  const cutoff = Date.now() - MARK_GC_GRACE_MS;
+  doc.transact(() => {
+    // Carry the receiver's keyed entry so owner resolution works at the module.
+    doc.getMap('players').set(owner.playerId, {
+      name: owner.name || 'Clone',
+      joinedAt: typeof owner.joinedAt === 'number' ? owner.joinedAt : Date.now(),
+      outfitId: owner.outfitId ?? '',
+      keyB64: owner.keyB64,
+      ...(owner.keySig ? { keySig: owner.keySig } : {}),
+    });
+    doc.getMap('roomInfo').set('owner', owner.playerId);
+    // Personal settle: a module that WAS venture property leaves the company.
+    if (vrec && vrec.snapshotAt !== undefined) doc.getMap('venture').delete('v');
+    offers.forEach((raw, key) => {
+      const m = readMark(raw);
+      if (m && m.exp > 0 && m.exp < cutoff) offers.delete(key);
+    });
+    offers.set(o.nonce, {
+      status: 'redeemed', byPub: owner.keyB64, byName: owner.name || 'Clone',
+      at: Date.now(), exp: o.expiresAt, kind: 'deed',
+    } satisfies OfferMark);
+  });
+  return { ok: true };
+}
+
 // ── Personal "offers I made" ledger (for the ✗ REVOKE list) ─────────────────
 
 const MADE_KEY = 'ssf-offers-made';
