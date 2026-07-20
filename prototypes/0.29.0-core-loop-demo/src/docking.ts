@@ -1911,6 +1911,11 @@ export class DoorDockingPortSystem {
     adjRoom.position.set(pose.x, 2, pose.z);
     adjRoom.rotation.y = pose.rotY;
     adjRoom.userData.poseKey = poseKey;
+    // 👻 Owner request: the grey boxes read as huge dark pillars looming over
+    // the room's open edges — keep the OBJECT (pairing/transit logic keys off
+    // adjacentRooms, and the pose still marks where the far room sits) but
+    // never render it.
+    adjRoom.visible = false;
 
     this.roomsGroup.add(adjRoom);
     this.adjacentRooms.set(doorId, adjRoom);

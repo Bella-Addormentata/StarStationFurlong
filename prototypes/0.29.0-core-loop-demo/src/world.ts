@@ -9,6 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import { physicalDoorPose, setActiveDoorLayout } from "./doorLayout";
 import { Player } from "./player";
+import { PoolWaiter } from "./poolWaiter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { getDefaultRoomId } from "./identity";
@@ -132,6 +133,10 @@ export class World {
   private platformGrid: THREE.GridHelper | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
+  /** 🚪 Glassy north wall backing the paired doors (no coverage rule). */
+  private northWall: THREE.Mesh | null = null;
+  /** 🤖 Drink-service waiter bot — roams the LOBBY (not pool/casino rooms). */
+  private poolWaiter: PoolWaiter | null = null;
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -172,8 +177,11 @@ export class World {
   private pairedVestibules: Map<DoorId, THREE.Group> = new Map();
   /** Door whose vestibule is lit for an in-flight transit, or null. */
   private transitVestibuleDoorId: DoorId | null = null;
-  /** Resting opacity of a paired-door vestibule when the player is far. */
-  private static readonly VESTIBULE_BASE_OPACITY = 0.25;
+  /** Resting opacity of a paired-door vestibule when the player is far.
+   *  0 — the ghost gangways read as a pile of dark capsules outside the
+   *  walls (owner request: remove them from view); the tube still fades in
+   *  on approach and goes solid during a transit. */
+  private static readonly VESTIBULE_BASE_OPACITY = 0;
   /** Proximity fade range (m from the door's front stand-point). */
   private static readonly VESTIBULE_FADE_RANGE = 4.0;
   // Lobby furniture (fades in to full opacity)
@@ -235,6 +243,8 @@ export class World {
   private isOutdoorRoom = false;
   /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
   private poolSign: THREE.Group | null = null;
+  /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
+  private casinoSign: THREE.Group | null = null;
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
 
@@ -619,7 +629,17 @@ export class World {
     this.platformGroup.add(leftWall);
     this.sideWalls.push(leftWall);
 
-    // Subtle top-edge coping strip for left wall only
+    // 🚪 North wall — same glassy tile treatment. The paired door layout puts
+    // TWO doors on the north wall; without a wall panel there they floated on
+    // the room boundary (owner: "doors must read inset in a wall, like the
+    // west one"). Kept out of sideWalls: the window-wall coverage rule is
+    // side-wall (|x|>5) specific.
+    const northWallGeo = new THREE.BoxGeometry(wallDepth, wallHeight, wallThick);
+    this.northWall = new THREE.Mesh(northWallGeo, makeMat());
+    this.northWall.position.set(0, wallY, -6);
+    this.platformGroup.add(this.northWall);
+
+    // Subtle top-edge coping strips
     const edgeGeo = new THREE.BoxGeometry(
       wallThick + 0.06,
       0.1,
@@ -636,6 +656,13 @@ export class World {
     strip.position.set(-6, wallHeight + 0.05, 0);
     this.platformGroup.add(strip);
     this.platformElements.push(strip);
+    const northStrip = new THREE.Mesh(
+      new THREE.BoxGeometry(wallDepth + 0.06, 0.1, wallThick + 0.06),
+      edgeMat.clone(),
+    );
+    northStrip.position.set(0, wallHeight + 0.05, -6);
+    this.platformGroup.add(northStrip);
+    this.platformElements.push(northStrip);
   }
 
   /**
@@ -861,6 +888,7 @@ export class World {
     this.sideWalls.forEach((wall, i) => {
       wall.visible = !this.hullEditView && !this.sideWallCovered[i];
     });
+    if (this.northWall) this.northWall.visible = !this.hullEditView;
   }
 
   /** Which built-in side walls are REPLACED by placed wall sections. */
@@ -876,6 +904,7 @@ export class World {
     this.sideWalls.forEach((wall, i) => {
       wall.visible = !on && !this.sideWallCovered[i];
     });
+    if (this.northWall) this.northWall.visible = !on;
   }
 
   /**
@@ -884,52 +913,82 @@ export class World {
    * colour and wall visibility update before the fade-in reveals the room.
    * Safe to call multiple times — fully idempotent.
    */
-  /** 🏊 Wayfinding: build the "POOL & HOT TUB" plate over the south door —
-   *  boutique-hotel style: serif, wide letter-spacing, thin double frame.
-   *  Two back-to-back planes so the text reads correctly from every angle. */
-  private ensurePoolSign(): void {
-    if (this.poolSign) return;
+  /** 🪧 Wayfinding lintels — text ENGRAVED into the wall above a door (owner
+   *  request: no floating plate/"sticker"): a shallow recessed panel sunk
+   *  into the tile wall (translucent darker wash — tiles ghost through —
+   *  with a shadowed top lip and a lit bottom lip), letters chiselled with a
+   *  dark upper edge + bright lower edge, one plane flush on the wall face.
+   *  The quiet recessed backdrop is what lets the carving read over the busy
+   *  tile grid — without it the letters dissolve into the grout lines. */
+  private makeEngravedSign(
+    title: string,
+    ink: { shadow: string; light: string; face: string },
+  ): THREE.Group {
     const cv = document.createElement("canvas");
     cv.width = 512;
     cv.height = 128;
     const c = cv.getContext("2d")!;
-    // Soft white plate.
-    c.fillStyle = "#FDFEFF";
-    c.fillRect(0, 0, 512, 128);
-    // Thin double frame — pale blue outside, whisper-blue inside.
-    c.strokeStyle = "#A4C8E7";
-    c.lineWidth = 3;
-    c.strokeRect(8, 8, 496, 112);
-    c.strokeStyle = "#D9E8F2";
-    c.lineWidth = 2;
-    c.strokeRect(16, 16, 480, 96);
-    // Elegant spaced serif capitals — deep teal, same as the pool floor tint.
-    c.fillStyle = "#1C5A74";
+    c.clearRect(0, 0, 512, 128); // transparent — the wall shows through
+    c.fillStyle = "rgba(58, 92, 116, 0.55)"; // recessed panel wash
+    c.fillRect(10, 10, 492, 108);
+    c.fillStyle = "rgba(8, 30, 44, 0.6)"; // shadowed top/left lips
+    c.fillRect(10, 10, 492, 7);
+    c.fillRect(10, 10, 7, 108);
+    c.fillStyle = "rgba(255, 255, 255, 0.55)"; // lit bottom/right lips
+    c.fillRect(10, 111, 492, 7);
+    c.fillRect(495, 10, 7, 108);
     (c as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
-      "8px";
-    c.font = '42px Georgia, "Palatino Linotype", serif';
+      "6px";
+    c.font = 'bold 44px Georgia, "Palatino Linotype", serif';
     c.textAlign = "center";
     c.textBaseline = "middle";
-    c.fillText("POOL & HOT TUB", 256, 56);
-    // Slim turquoise flourish beneath.
-    c.strokeStyle = "#4FB4C4";
-    c.lineWidth = 2.5;
-    c.beginPath();
-    c.moveTo(196, 96);
-    c.quadraticCurveTo(256, 104, 316, 96);
-    c.stroke();
+    c.fillStyle = ink.shadow; // recess shadow (upper edge)
+    c.fillText(title, 256, 49);
+    c.fillStyle = ink.light; // catch-light (lower edge)
+    c.fillText(title, 256, 56);
+    c.fillStyle = ink.face; // carved face popping off the dark recess
+    c.fillText(title, 256, 52);
+    // Slim flourish beneath, chiselled the same way.
+    const flourish = (color: string, dy: number) => {
+      c.strokeStyle = color;
+      c.lineWidth = 3;
+      c.beginPath();
+      c.moveTo(186, 92 + dy);
+      c.quadraticCurveTo(256, 101 + dy, 326, 92 + dy);
+      c.stroke();
+    };
+    flourish(ink.shadow, -3);
+    flourish(ink.face, 0);
     const tex = new THREE.CanvasTexture(cv);
     tex.colorSpace = THREE.SRGBColorSpace;
-    const geo = new THREE.PlaneGeometry(2.4, 0.6);
-    const mat = new THREE.MeshBasicMaterial({ map: tex });
-    this.poolSign = new THREE.Group();
+    // Lintel-banner proportions: wide enough to read at the room camera —
+    // smaller plates dissolve into the tile grid.
+    const geo = new THREE.PlaneGeometry(3.4, 0.66);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+    const group = new THREE.Group();
     const front = new THREE.Mesh(geo, mat); // faces INTO the room
     front.rotation.y = Math.PI;
-    const back = new THREE.Mesh(geo.clone(), mat); // faces outward
-    back.position.z = 0.012;
-    this.poolSign.add(front, back);
-    this.poolSign.position.set(0, 3.4, 5.55); // above the south door
-    this.platformGroup.add(this.poolSign);
+    group.add(front);
+    this.platformGroup.add(group);
+    return group;
+  }
+
+  private ensurePoolSign(): void {
+    if (!this.poolSign) {
+      this.poolSign = this.makeEngravedSign("POOL & HOT TUB", {
+        shadow: "rgba(5, 24, 36, 0.9)",
+        light: "rgba(235, 250, 255, 0.95)",
+        face: "#dff0f8", // pale pool-water tone
+      });
+    }
+    if (!this.casinoSign) {
+      // 🎰 GOLD lettering for the casino door (owner request).
+      this.casinoSign = this.makeEngravedSign("CASINO", {
+        shadow: "rgba(66, 40, 4, 0.95)",
+        light: "rgba(255, 244, 208, 0.95)",
+        face: "#e8bd55", // engraved gold leaf
+      });
+    }
   }
 
   private ensureCasinoDecor(): void {
@@ -1250,7 +1309,21 @@ export class World {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
     this.isOutdoorRoom = outdoor;
-    setActiveDoorLayout(casino ? "casino-pairs" : "legacy");
+    // 🚪 Camera-near south/east edges stay clear in the LOBBY too (owner
+    // request): every interior room runs the paired north/west door layout;
+    // only the outdoor pool room keeps its legacy four-wall doors (its west
+    // door intentionally drops arrivals into the water).
+    setActiveDoorLayout(outdoor ? "legacy" : "casino-pairs");
+
+    // 🤖 The waiter bot roams the LOBBY aisles (owner request — same bot as
+    // the pool branch's poolside waiter, same serve interaction).
+    const lobby = !outdoor && !casino;
+    if (lobby && !this.poolWaiter) {
+      this.poolWaiter = new PoolWaiter(this.scene);
+    } else if (!lobby && this.poolWaiter) {
+      this.poolWaiter.dispose();
+      this.poolWaiter = null;
+    }
     const doorDeltas = readDoorDeltas();
     applyDoorSlideDeltas(doorDeltas);
     setDoorSlideDeltas(doorDeltas);
@@ -1261,9 +1334,27 @@ export class World {
     this.dockingSystem?.refreshDoorInteractivity();
 
     // 🏊 The pool sign points the way FROM the lobby — hidden inside the pool
-    // room itself (that same door leads back home there).
+    // room itself (that same door leads back home there). It hangs over the
+    // SOUTH door's PHYSICAL slot, which the paired layout moves to the north
+    // wall — so place it from the live pose, not a hard-coded south spot.
     this.ensurePoolSign();
-    if (this.poolSign) this.poolSign.visible = !outdoor && !casino;
+    // Flush on the wall's INNER face (wall box: centre ±6, 0.35 thick →
+    // face at 5.825; 0.035 proud avoids z-fighting) — engraved, not hung.
+    // y 3.66 clears the 3.4-tall door frame lintel, under the wall coping.
+    const placeLintel = (sign: THREE.Group | null, doorId: DoorId) => {
+      if (!sign) return;
+      const pose = physicalDoorPose(doorId);
+      const inset = 5.79 / 6;
+      sign.position.set(
+        pose.tangent === "x" ? pose.x : pose.x * inset,
+        3.66,
+        pose.tangent === "x" ? pose.z * inset : pose.z,
+      );
+      sign.rotation.y = pose.frameYaw + Math.PI;
+      sign.visible = !outdoor && !casino;
+    };
+    placeLintel(this.poolSign, "south"); // 🏊 pool door
+    placeLintel(this.casinoSign, "east"); // 🎰 casino door
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casino;
 
@@ -1342,27 +1433,30 @@ export class World {
       });
       this.dockingSystem?.setGhostDoors(false);
     } else {
-      sc.background = new THREE.Color(0x0a2a5e); // nebula night
+      // 🌅 LOBBY: bright, cheerful MORNING light (owner request — the old
+      // warm-nebula night read as dim). Soft sunrise-blue sky, gentle gold
+      // sun, airy ambient; nebula + star layers hidden.
+      sc.background = new THREE.Color(0xbfe0f2); // soft morning sky
       if (sc.fog instanceof THREE.FogExp2) {
-        sc.fog.color.setHex(0x0d3060);
-        sc.fog.density = 0.015;
+        sc.fog.color.setHex(0xcde8f5);
+        sc.fog.density = 0.005;
       }
       if (amb) {
-        amb.color.setHex(0x8899bb);
-        amb.intensity = 0.5;
+        amb.color.setHex(0xfff6e8);
+        amb.intensity = 0.95;
       }
       if (sun) {
-        sun.color.setHex(0xffffff);
-        sun.intensity = 0.9;
-      }
+        sun.color.setHex(0xffeccb);
+        sun.intensity = 1.35;
+      } // low golden morning sun
       if (hemi) {
-        hemi.color.setHex(0xaaccff);
-        hemi.groundColor.setHex(0x445566);
-        hemi.intensity = 0.4;
+        hemi.color.setHex(0xdcefff);
+        hemi.groundColor.setHex(0xd9cdbb);
+        hemi.intensity = 0.7;
       }
-      if (nebSky) nebSky.visible = true;
+      if (nebSky) nebSky.visible = false;
       starLayers.forEach((s) => {
-        s.visible = true;
+        s.visible = false;
       });
       this.dockingSystem?.setGhostDoors(false);
     }
@@ -1396,8 +1490,12 @@ export class World {
     // 🧊 Walls: the pale-blue tile wall shows in BOTH rooms (owner request —
     // it carries the starry windows and reads light/airy at its glassy
     // opacity). No tint — the tile texture's own palette is the look.
-    this.sideWalls.forEach((wall, i) => {
-      wall.visible = !this.hullEditView && !this.sideWallCovered[i];
+    const themedWalls: THREE.Mesh[] = [...this.sideWalls];
+    if (this.northWall) themedWalls.push(this.northWall);
+    themedWalls.forEach((wall, i) => {
+      wall.visible =
+        !this.hullEditView &&
+        (wall === this.northWall || !this.sideWallCovered[i]);
       const mat = wall.material as THREE.MeshStandardMaterial;
       if (mat && "color" in mat) {
         mat.color.setHex(casino ? 0xffdfad : 0xffffff);
@@ -1525,27 +1623,36 @@ export class World {
   }
 
   public updateNorthDoorForFireplace(): void {
-    const north = findDoor("north");
-    if (!north) return;
-    // Approach zone in front of the north wall opening (opening ~1.4 wide at
-    // z=-6; the zone reaches to the door's `front` stand-point at z=-4.5).
-    // 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid position
-    // (front.x carries the slide delta), the plan §6.2 generalization seed.
-    const cx = north.front.x;
-    const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
-    const blocked = FURNITURE.some((item) => {
-      if (item.kind !== "fireplace-wall") return false;
-      const fp = FURNITURE_DEFS[item.kind].footprint;
-      if (!fp) return false; // footprint-less def — nothing to block with
-      const w = item.rot % 2 === 0 ? fp.w : fp.d;
-      const d = item.rot % 2 === 0 ? fp.d : fp.w;
-      const x0 = item.pos.x - w / 2,
-        x1 = item.pos.x + w / 2;
-      const z0 = item.pos.z - d / 2,
-        z1 = item.pos.z + d / 2;
-      return x0 < zone.x1 && x1 > zone.x0 && z0 < zone.z1 && z1 > zone.z0;
-    });
-    north.enabled = northDoorUnlocked() || !blocked;
+    // Every door whose PHYSICAL slot sits on the north wall is gated by the
+    // hearth (the paired layout moves the logical SOUTH door up there too):
+    // move the fireplace aside and the covered door opens; move it back and
+    // it disables again. The DEV NORTH DOOR toggle still force-enables the
+    // north door regardless (walkthrough tool).
+    for (const id of ["north", "south"] as const) {
+      if (physicalDoorPose(id).wall !== "north") continue;
+      const door = findDoor(id);
+      if (!door) continue;
+      // Approach zone in front of the north wall opening (opening ~1.4 wide
+      // at z=-6; the zone reaches to the door's `front` stand-point at
+      // z=-4.5). 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid
+      // position (front.x carries the slide delta).
+      const cx = door.front.x;
+      const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
+      const blocked = FURNITURE.some((item) => {
+        if (item.kind !== "fireplace-wall") return false;
+        const fp = FURNITURE_DEFS[item.kind].footprint;
+        if (!fp) return false; // footprint-less def — nothing to block with
+        const w = item.rot % 2 === 0 ? fp.w : fp.d;
+        const d = item.rot % 2 === 0 ? fp.d : fp.w;
+        const x0 = item.pos.x - w / 2,
+          x1 = item.pos.x + w / 2;
+        const z0 = item.pos.z - d / 2,
+          z1 = item.pos.z + d / 2;
+        return x0 < zone.x1 && x1 > zone.x0 && z0 < zone.z1 && z1 > zone.z0;
+      });
+      const unlocked = id === "north" && northDoorUnlocked();
+      door.enabled = unlocked || !blocked;
+    }
   }
 
   public reconcileFurniture(records: Map<string, FurnitureRecord>): void {
@@ -2196,6 +2303,10 @@ export class World {
     this.sideWalls.forEach((wall) => {
       (wall.material as THREE.MeshStandardMaterial).opacity = eased * 0.35;
     });
+    if (this.northWall) {
+      (this.northWall.material as THREE.MeshStandardMaterial).opacity =
+        eased * 0.35;
+    }
 
     // Fade in furniture to its design opacity — materials declaring a
     // userData.baseOpacity (the map table's translucent holo disc/ring, M4)
@@ -2261,6 +2372,7 @@ export class World {
       this.sideWalls.forEach((wall) => {
         wall.visible = false;
       });
+      if (this.northWall) this.northWall.visible = false;
 
       if (zoomLevel === 4) {
         // Level 4 (Space Station) uses a simpler silhouette/solid representation of the capsules
@@ -2320,6 +2432,7 @@ export class World {
       this.sideWalls.forEach((wall, i) => {
         wall.visible = !this.hullEditView && !this.sideWallCovered[i];
       });
+      if (this.northWall) this.northWall.visible = !this.hullEditView;
 
       // Completely clear and hide outer capsule roof and shielding so they don't block the camera!
       if (this.capsuleRoof) {
@@ -2372,6 +2485,12 @@ export class World {
 
     // 🧬 Advance clone-vat drain / door-spin cycles (same idiom)
     for (const vat of this.cloneVats.values()) vat.update(deltaTime);
+
+    // 🤖 Lobby waiter bot: patrols the aisles and serves the local fox.
+    this.poolWaiter?.update(
+      deltaTime,
+      this.isPlayerActive() ? this.player : null,
+    );
 
     // #51 — paired-door vestibules: spawn/dispose from pairing state, drive
     // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.

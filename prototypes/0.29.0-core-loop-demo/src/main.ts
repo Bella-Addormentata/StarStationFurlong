@@ -49,6 +49,7 @@ import { chipDotsHtml } from "./chipDisplay";
 import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
+  migrateDefaultLayout,
   furnitureDocSize,
   subscribeFurniture,
   writeFurnitureItem,
@@ -1213,6 +1214,24 @@ async function joinRoomAtEpoch(
       if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
       if (roomMap.get("owner") === getPlayerId() && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
+      }
+      // 🧱 Retired default: the fireplace/bookcase wall no longer ships with
+      // the lobby (the paired doors + glassy tile panel own the north wall).
+      // Purge the DEFAULT id from already-seeded docs — DEV-spawned hearths
+      // use unique ids and are untouched (id-only, harmless when absent).
+      deleteFurnitureItem("fireplace-wall");
+      // ♟️ Retired defaults: the checker table and the south-wall status
+      // terminal left the lobby too (owner request — the terminal read as a
+      // useless dark panel on the now-open south edge).
+      deleteFurnitureItem("game-table");
+      deleteFurnitureItem("wall-computer");
+      // 🛋️ One-time migration to the door-clear floor plan: reposition
+      // DEFAULT-id furniture in already-seeded lobbies (marker-gated so a
+      // player's later edits persist). V5: upserts MISSING defaults too — old
+      // rooms seeded before the clone vat existed get the spawn tube back.
+      if (!roomMap.get("lobbyDoorClearV5")) {
+        migrateDefaultLayout();
+        roomMap.set("lobbyDoorClearV5", true);
       }
       // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
       // claim (overwrites any stale cert hash from a previous session).

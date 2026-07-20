@@ -74,3 +74,6 @@ coverage/
 
 # Tauri generated schemas
 src-tauri/gen/schemas/
+
+# node_modules as a SYMLINK too (a stray link once slipped past the dir-only pattern)
+node_modules

@@ -4441,16 +4441,12 @@ function buildCloneVat(ctx: BuildCtx) {
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
 // therefore sliding behaviour in multi-box corners) is unchanged.
 export const FURNITURE: FurnitureItem[] = [
-  // Movable since the floor-plan work (owner request): the hearth can slide
-  // aside to free the NORTH door — the door unblocks dynamically when the
-  // fireplace footprint clears its approach zone (world.updateNorthDoorForFireplace).
-  {
-    id: "fireplace-wall",
-    kind: "fireplace-wall",
-    pos: { x: 0.0, z: -5.5 },
-    rot: 0,
-    movable: true,
-  },
+  // (The default fireplace/bookcase wall was retired — owner request: the
+  //  north wall now carries the two paired doors and the glassy tile panel,
+  //  and the hearth unit covered them. The kind stays spawnable from the DEV
+  //  menu; world.updateNorthDoorForFireplace still gates north-wall doors if
+  //  one is placed in front of them. main.ts purges the retired default id
+  //  from already-seeded lobby docs on entry.)
   {
     id: "sofa-back",
     kind: "sofa-back",
@@ -4461,43 +4457,43 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "sofa-front",
     kind: "sofa-front",
-    pos: { x: 0.0, z: 3.5 },
+    pos: { x: 0.0, z: 2.6 },
     rot: 0,
     movable: true,
   },
   {
     id: "armchair-left-0",
     kind: "armchair-left",
-    pos: { x: -4.5, z: -3.5 },
+    pos: { x: -4.5, z: -0.75 },
     rot: 0,
     movable: true,
   },
   {
     id: "armchair-left-1",
     kind: "armchair-left",
-    pos: { x: -4.5, z: -1.5 },
+    pos: { x: -4.5, z: 0.75 },
     rot: 0,
     movable: true,
   },
   {
     id: "armchair-left-2",
     kind: "armchair-left",
-    pos: { x: -4.5, z: 0.5 },
-    rot: 0,
+    pos: { x: -2.0, z: 5.15 },
+    rot: 1,
     movable: true,
   },
   {
     id: "armchair-left-3",
     kind: "armchair-left",
-    pos: { x: -4.5, z: 2.5 },
-    rot: 0,
+    pos: { x: -0.7, z: 5.15 },
+    rot: 1,
     movable: true,
   },
   {
     id: "armchair-right-0",
     kind: "armchair-right",
-    pos: { x: 4.5, z: -3.5 },
-    rot: 0,
+    pos: { x: 0.6, z: 5.15 },
+    rot: 1,
     movable: true,
   },
   {
@@ -4524,7 +4520,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "coffee-table-back",
     kind: "coffee-table-back",
-    pos: { x: 0.0, z: -3.5 },
+    pos: { x: 0.0, z: -0.5 },
     rot: 0,
     movable: true,
   },
@@ -4551,21 +4547,21 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "lamp-table-back-left",
     kind: "lamp-table",
-    pos: { x: -4.5, z: -4.5 },
+    pos: { x: -1.6, z: -5.3 },
     rot: 0,
     movable: true,
   },
   {
     id: "lamp-table-back-right",
     kind: "lamp-table",
-    pos: { x: 4.5, z: -4.5 },
+    pos: { x: 1.6, z: -5.3 },
     rot: 0,
     movable: true,
   },
   {
     id: "lamp-table-front-left",
     kind: "lamp-table",
-    pos: { x: -4.5, z: 3.5 },
+    pos: { x: -5.05, z: 3.9 },
     rot: 0,
     movable: true,
   },
@@ -4592,7 +4588,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "map-table",
     kind: "map-table",
-    pos: { x: 2.0, z: -4.0 },
+    pos: { x: 0.0, z: -5.3 },
     rot: 0,
     movable: true,
   },
@@ -4621,14 +4617,14 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "cherry-tree-mid-left",
     kind: "cherry-tree",
-    pos: { x: -5.0, z: 3.0 },
+    pos: { x: -5.2, z: 0.9 },
     rot: 0,
     movable: true,
   }, // moved — bar occupies right-front corner
   {
     id: "cherry-tree-back-left",
     kind: "cherry-tree",
-    pos: { x: -4.9, z: -5.0 },
+    pos: { x: -5.3, z: -5.3 },
     rot: 0,
     movable: true,
   },
@@ -4642,14 +4638,14 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "blossom-pot-back-left",
     kind: "blossom-pot",
-    pos: { x: -4.3, z: -4.7 },
+    pos: { x: -1.15, z: -5.35 },
     rot: 0,
     movable: true,
   },
   {
     id: "blossom-pot-back-right",
     kind: "blossom-pot",
-    pos: { x: 4.3, z: -4.7 },
+    pos: { x: 1.15, z: -5.35 },
     rot: 0,
     movable: true,
   },
@@ -4672,13 +4668,6 @@ export const FURNITURE: FurnitureItem[] = [
   // the door frame (posts end at |x|=1.0, click box at |x|≤1.0) and the
   // keypad (at x=-1.1 after the door group's rotY=π flip); z=5.97 is the
   // bar back-panel flush-mount plane. Footprint null ⇒ never an obstacle.
-  {
-    id: "wall-computer",
-    kind: "wall-computer",
-    pos: { x: 1.8, z: 5.97 },
-    rot: 2,
-    movable: false,
-  },
   // Storage trunk on the fireplace wall's west flank (TR2 of #35). The plan's
   // berth-corner suggestion (-2.5, -5.0) overlaps the fireplace obstacle
   // (z[-6,-5]) — verified against itemAabb — so the trunk sits one tile south
@@ -4689,7 +4678,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "storage-trunk",
     kind: "storage-trunk",
-    pos: { x: -2.5, z: -4.5 },
+    pos: { x: -4.0, z: 5.5 },
     rot: 0,
     movable: true,
   },
@@ -4704,13 +4693,6 @@ export const FURNITURE: FurnitureItem[] = [
   // door (posts/click box |x|≤1.0 — our x1=-3) and of the sofa-front AABB
   // (x[-1.5,1.5] z[3,4]). Front point (-4, 4.5) is open aisle floor; parity:
   // w=2 even → x integer, d=1 odd → z at n+0.5. Overlaps dev-asserted below.
-  {
-    id: "game-table",
-    kind: "game-table",
-    pos: { x: -4.0, z: 5.5 },
-    rot: 0,
-    movable: true,
-  },
   // 🛏️ Bunk bed in the NE nook: rot 1 AABB x[3,4] z[-5,-3] fills the
   // DEAD-END pocket documented on the map-table entry above (east corridor
   // x[3,4] z[-5,-3] — never a route) FLUSH on three sides: map-table x[1,3]
@@ -4725,7 +4707,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "bunk-bed",
     kind: "bunk-bed",
-    pos: { x: 3.5, z: -4.0 },
+    pos: { x: 4.9, z: -2.9 },
     rot: 1,
     movable: true,
   },
@@ -4739,7 +4721,7 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "clone-vat",
     kind: "clone-vat",
-    pos: { x: -3.5, z: -4.5 },
+    pos: { x: -4.7, z: -4.9 },
     rot: 0,
     movable: true,
   },
