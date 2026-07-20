@@ -9,7 +9,12 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import { physicalDoorPose, setActiveDoorLayout } from "./doorLayout";
 import { Player } from "./player";
-import { PoolWaiter, POOL_PATROL, LOBBY_PATROL } from "./poolWaiter";
+import {
+  PoolWaiter,
+  POOL_PATROL,
+  LOBBY_PATROL,
+  CASINO_PATROL,
+} from "./poolWaiter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { getDefaultRoomId } from "./identity";
@@ -248,6 +253,10 @@ export class World {
   private poolSign: THREE.Group | null = null;
   /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
   private casinoSign: THREE.Group | null = null;
+  /** Return-wayfinding engraving for the lobby door in casino/pool rooms. */
+  private lobbySign: THREE.Group | null = null;
+  /** Text-only LOBBY carving applied directly to the casino return door. */
+  private casinoLobbySign: THREE.Group | null = null;
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
 
@@ -654,7 +663,11 @@ export class World {
     // the room boundary (owner: "doors must read inset in a wall, like the
     // west one"). Kept out of sideWalls: the window-wall coverage rule is
     // side-wall (|x|>5) specific.
-    const northWallGeo = new THREE.BoxGeometry(wallSpanX, wallHeight, wallThick);
+    const northWallGeo = new THREE.BoxGeometry(
+      wallSpanX,
+      wallHeight,
+      wallThick,
+    );
     this.northWall = new THREE.Mesh(northWallGeo, makeMat());
     this.northWall.position.set(0, wallY, -halfZ);
     this.platformGroup.add(this.northWall);
@@ -951,20 +964,23 @@ export class World {
   private makeEngravedSign(
     title: string,
     ink: { shadow: string; light: string; face: string },
+    recessedPanel = true,
   ): THREE.Group {
     const cv = document.createElement("canvas");
     cv.width = 512;
     cv.height = 128;
     const c = cv.getContext("2d")!;
     c.clearRect(0, 0, 512, 128); // transparent — the wall shows through
-    c.fillStyle = "rgba(58, 92, 116, 0.55)"; // recessed panel wash
-    c.fillRect(10, 10, 492, 108);
-    c.fillStyle = "rgba(8, 30, 44, 0.6)"; // shadowed top/left lips
-    c.fillRect(10, 10, 492, 7);
-    c.fillRect(10, 10, 7, 108);
-    c.fillStyle = "rgba(255, 255, 255, 0.55)"; // lit bottom/right lips
-    c.fillRect(10, 111, 492, 7);
-    c.fillRect(495, 10, 7, 108);
+    if (recessedPanel) {
+      c.fillStyle = "rgba(58, 92, 116, 0.55)"; // recessed panel wash
+      c.fillRect(10, 10, 492, 108);
+      c.fillStyle = "rgba(8, 30, 44, 0.6)"; // shadowed top/left lips
+      c.fillRect(10, 10, 492, 7);
+      c.fillRect(10, 10, 7, 108);
+      c.fillStyle = "rgba(255, 255, 255, 0.55)"; // lit bottom/right lips
+      c.fillRect(10, 111, 492, 7);
+      c.fillRect(495, 10, 7, 108);
+    }
     (c as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
       "6px";
     c.font = 'bold 44px Georgia, "Palatino Linotype", serif';
@@ -992,10 +1008,16 @@ export class World {
     // Lintel-banner proportions: wide enough to read at the room camera —
     // smaller plates dissolve into the tile grid.
     const geo = new THREE.PlaneGeometry(3.4, 0.66);
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+    const mat = new THREE.MeshBasicMaterial({
+      map: tex,
+      transparent: true,
+      depthTest: recessedPanel,
+      depthWrite: recessedPanel,
+    });
     const group = new THREE.Group();
     const front = new THREE.Mesh(geo, mat); // faces INTO the room
     front.rotation.y = Math.PI;
+    front.renderOrder = recessedPanel ? 0 : 20;
     group.add(front);
     this.platformGroup.add(group);
     return group;
@@ -1003,19 +1025,49 @@ export class World {
 
   private ensurePoolSign(): void {
     if (!this.poolSign) {
-      this.poolSign = this.makeEngravedSign("POOL & HOT TUB", {
-        shadow: "rgba(5, 24, 36, 0.9)",
-        light: "rgba(235, 250, 255, 0.95)",
-        face: "#dff0f8", // pale pool-water tone
-      });
+      this.poolSign = this.makeEngravedSign(
+        "POOL & HOT TUB",
+        {
+          shadow: "rgba(4, 48, 24, 0.98)",
+          light: "rgba(226, 255, 235, 0.98)",
+          face: "#72f59a",
+        },
+        false,
+      );
     }
     if (!this.casinoSign) {
-      // 🎰 GOLD lettering for the casino door (owner request).
-      this.casinoSign = this.makeEngravedSign("CASINO", {
-        shadow: "rgba(66, 40, 4, 0.95)",
-        light: "rgba(255, 244, 208, 0.95)",
-        face: "#e8bd55", // engraved gold leaf
-      });
+      // High-contrast green matches every directional door engraving.
+      this.casinoSign = this.makeEngravedSign(
+        "CASINO",
+        {
+          shadow: "rgba(4, 48, 24, 0.98)",
+          light: "rgba(226, 255, 235, 0.98)",
+          face: "#72f59a",
+        },
+        false,
+      );
+    }
+    if (!this.lobbySign) {
+      this.lobbySign = this.makeEngravedSign(
+        "LOBBY",
+        {
+          shadow: "rgba(4, 48, 24, 0.98)",
+          light: "rgba(226, 255, 235, 0.98)",
+          face: "#72f59a",
+        },
+        false,
+      );
+    }
+    if (!this.casinoLobbySign) {
+      this.casinoLobbySign = this.makeEngravedSign(
+        "LOBBY",
+        {
+          shadow: "rgba(4, 48, 24, 0.98)",
+          light: "rgba(226, 255, 235, 0.98)",
+          face: "#72f59a",
+        },
+        false,
+      );
     }
   }
 
@@ -1333,7 +1385,7 @@ export class World {
     this.platformGroup.add(group);
   }
 
-  public applyRoomVisuals(roomId: string): void {
+  public applyRoomVisuals(roomId: string, returnDoorId?: DoorId): void {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
     this.isOutdoorRoom = outdoor;
@@ -1343,10 +1395,14 @@ export class World {
     // on the west wall; the dive tower stands between the two north doors).
     setActiveDoorLayout(outdoor ? "pool-pairs" : "casino-pairs");
 
-    // 🤖 The drink-service waiter bot roams the LOBBY aisles and the POOL
-    // deck (not the casino) — same bot, per-room patrol route. Recreate on a
-    // route change so a lobby→pool transit swaps the floor plan.
-    const waiterPatrol = outdoor ? POOL_PATROL : !casino ? LOBBY_PATROL : null;
+    // 🤖 One drink-service waiter implementation serves every authored room;
+    // each room supplies a route through its own open aisles. Recreate on a
+    // route change so transits swap the floor plan without duplicating logic.
+    const waiterPatrol = outdoor
+      ? POOL_PATROL
+      : casino
+        ? CASINO_PATROL
+        : LOBBY_PATROL;
     if (this.poolWaiter && this.poolWaiterPatrol !== waiterPatrol) {
       this.poolWaiter.dispose();
       this.poolWaiter = null;
@@ -1370,23 +1426,34 @@ export class World {
     // SOUTH door's PHYSICAL slot, which the paired layout moves to the north
     // wall — so place it from the live pose, not a hard-coded south spot.
     this.ensurePoolSign();
-    // Flush on the wall's INNER face (wall box: centre ±6, 0.35 thick →
-    // face at 5.825; 0.035 proud avoids z-fighting) — engraved, not hung.
-    // y 3.66 clears the 3.4-tall door frame lintel, under the wall coping.
-    const placeLintel = (sign: THREE.Group | null, doorId: DoorId) => {
+    const placeOnDoor = (
+      sign: THREE.Group | null,
+      doorId: DoorId,
+      visible: boolean,
+    ) => {
       if (!sign) return;
       const pose = physicalDoorPose(doorId);
-      const inset = 5.79 / 6;
+      const doorFaceOffset = 0.14;
       sign.position.set(
-        pose.tangent === "x" ? pose.x : pose.x * inset,
-        3.66,
-        pose.tangent === "x" ? pose.z * inset : pose.z,
+        pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
+        2.08,
+        pose.z + Math.cos(pose.frameYaw) * doorFaceOffset,
       );
       sign.rotation.y = pose.frameYaw + Math.PI;
-      sign.visible = !outdoor && !casino;
+      sign.scale.setScalar(
+        doorId === "north" || doorId === "south" ? 0.36 : 0.62,
+      );
+      sign.visible = visible;
     };
-    placeLintel(this.poolSign, "south"); // 🏊 pool door
-    placeLintel(this.casinoSign, "east"); // 🎰 casino door
+    placeOnDoor(this.poolSign, "south", !outdoor && !casino); // 🏊 pool door
+    placeOnDoor(this.casinoSign, "east", !outdoor && !casino); // 🎰 casino door
+    const pairedDoorId =
+      returnDoorId ??
+      ([...readAllDoors()].find(([, record]) => record.paired)?.[0] as
+        | DoorId
+        | undefined);
+    placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
+    placeOnDoor(this.casinoLobbySign, pairedDoorId ?? "west", casino);
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casino;
 
@@ -1601,7 +1668,8 @@ export class World {
    * covers remote changes; editMode's local splice/spawn does not).
    */
   public refreshOutdoorFloor(): void {
-    const hasPool = this.isOutdoorRoom && FURNITURE.some((i) => i.kind === 'lazy-pool');
+    const hasPool =
+      this.isOutdoorRoom && FURNITURE.some((i) => i.kind === "lazy-pool");
     if (this.platformFloor) this.platformFloor.visible = !hasPool;
     if (this.platformGrid) this.platformGrid.visible = !hasPool;
   }

@@ -72,6 +72,17 @@ export const POOL_PATROL: Array<[number, number]> = [
   [-4.6, -3.9],
 ];
 
+/** 🎰 CASINO patrol route (world coords, ping-pong). The central floor is
+ * occupied by two dense table columns, so service stays in the open east
+ * aisle and turns along the north/south promenades without clipping booths. */
+export const CASINO_PATROL: Array<[number, number]> = [
+  [3.25, -4.2],
+  [3.4, -2.2],
+  [3.4, 0],
+  [3.4, 2.2],
+  [3.25, 4.15],
+];
+
 /** Cocktail colours (glass body / garnish) — matches the reference tray. */
 const DRINKS: Array<{ body: number; garnish: number }> = [
   { body: 0xd94a4a, garnish: 0x74c04e }, // strawberry red / lime
@@ -122,7 +133,10 @@ export class PoolWaiter {
   /** Waypoint loop this bot walks (ping-pong) — per-room floor plan. */
   private patrol: Array<[number, number]>;
 
-  constructor(scene: THREE.Scene, patrol: Array<[number, number]> = LOBBY_PATROL) {
+  constructor(
+    scene: THREE.Scene,
+    patrol: Array<[number, number]> = LOBBY_PATROL,
+  ) {
     this.scene = scene;
     this.patrol = patrol;
     this.group.name = "pool-waiter";
@@ -135,8 +149,16 @@ export class PoolWaiter {
 
   // ── Voxel build (front = +z at rotation 0) ─────────────────────────────────
 
-  private mat(color: number, rough = 0.7, metal = 0.25): THREE.MeshStandardMaterial {
-    return new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal });
+  private mat(
+    color: number,
+    rough = 0.7,
+    metal = 0.25,
+  ): THREE.MeshStandardMaterial {
+    return new THREE.MeshStandardMaterial({
+      color,
+      roughness: rough,
+      metalness: metal,
+    });
   }
 
   private box(
@@ -187,20 +209,65 @@ export class PoolWaiter {
     this.box(this.body, 0.52, 0.42, 0.33, SHIRT, 0, 1.11, 0); // polo torso
     this.box(this.body, 0.54, 0.07, 0.35, COLLAR, 0, 1.3, 0); // collar band
     // Name badge + logo chip on the chest (white on the black polo).
-    this.box(this.body, 0.12, 0.09, 0.02, this.mat(0xf2f5f7, 0.9, 0), -0.15, 1.19, 0.17);
-    this.box(this.body, 0.09, 0.07, 0.02, this.mat(0x111417, 0.9, 0), 0.16, 1.19, 0.17);
+    this.box(
+      this.body,
+      0.12,
+      0.09,
+      0.02,
+      this.mat(0xf2f5f7, 0.9, 0),
+      -0.15,
+      1.19,
+      0.17,
+    );
+    this.box(
+      this.body,
+      0.09,
+      0.07,
+      0.02,
+      this.mat(0x111417, 0.9, 0),
+      0.16,
+      1.19,
+      0.17,
+    );
     // Shoulder caps + arms, permanently posed to carry the tray out front.
     for (const side of [-1, 1] as const) {
       this.box(this.body, 0.14, 0.14, 0.16, COLLAR, side * 0.33, 1.26, 0);
-      const upper = this.box(this.body, 0.11, 0.3, 0.13, STEEL, side * 0.34, 1.1, 0.1);
+      const upper = this.box(
+        this.body,
+        0.11,
+        0.3,
+        0.13,
+        STEEL,
+        side * 0.34,
+        1.1,
+        0.1,
+      );
       upper.rotation.x = -0.55; // upper arm angled forward-down
-      const fore = this.box(this.body, 0.1, 0.28, 0.11, JOINT, side * 0.3, 0.93, 0.28);
+      const fore = this.box(
+        this.body,
+        0.1,
+        0.28,
+        0.11,
+        JOINT,
+        side * 0.3,
+        0.93,
+        0.28,
+      );
       fore.rotation.x = -1.35; // forearm reaching level to the tray
       this.box(this.body, 0.09, 0.08, 0.1, STEEL, side * 0.27, 0.93, 0.4); // hand
     }
     // Backpack power unit.
     this.box(this.body, 0.36, 0.4, 0.14, JOINT, 0, 1.1, -0.22);
-    this.box(this.body, 0.1, 0.14, 0.04, this.mat(0xf5f7f9, 0.6, 0.1), 0.08, 1.16, -0.3);
+    this.box(
+      this.body,
+      0.1,
+      0.14,
+      0.04,
+      this.mat(0xf5f7f9, 0.6, 0.1),
+      0.08,
+      1.16,
+      -0.3,
+    );
     // Head: grey block, black sunglasses visor, side bolts, antenna.
     this.box(this.body, 0.32, 0.28, 0.3, STEEL, 0, 1.52, 0);
     this.box(this.body, 0.3, 0.08, 0.06, VISOR, 0, 1.55, 0.15); // 😎
@@ -357,7 +424,10 @@ export class PoolWaiter {
     if (dist > 0.01) this.turnToward(Math.atan2(dx / dist, dz / dist), dt);
 
     // Fox wandered off before the sip — quietly put everything back.
-    if (dist > ABORT_RANGE && (this.servePhase === "OFFER" || this.servePhase === "FLY")) {
+    if (
+      dist > ABORT_RANGE &&
+      (this.servePhase === "OFFER" || this.servePhase === "FLY")
+    ) {
       this.finishServe(true);
       return;
     }
