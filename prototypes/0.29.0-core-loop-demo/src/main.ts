@@ -1214,6 +1214,11 @@ async function joinRoomAtEpoch(
       if (roomMap.get("owner") === getPlayerId() && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }
+      // 🧱 Retired default: the fireplace/bookcase wall no longer ships with
+      // the lobby (the paired doors + glassy tile panel own the north wall).
+      // Purge the DEFAULT id from already-seeded docs — DEV-spawned hearths
+      // use unique ids and are untouched (id-only, harmless when absent).
+      deleteFurnitureItem("fireplace-wall");
       // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
       // claim (overwrites any stale cert hash from a previous session).
       if (activeBootstrap) {

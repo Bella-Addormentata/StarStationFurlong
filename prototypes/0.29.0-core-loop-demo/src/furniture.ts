@@ -4441,16 +4441,12 @@ function buildCloneVat(ctx: BuildCtx) {
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
 // therefore sliding behaviour in multi-box corners) is unchanged.
 export const FURNITURE: FurnitureItem[] = [
-  // Movable since the floor-plan work (owner request): the hearth can slide
-  // aside to free the NORTH door — the door unblocks dynamically when the
-  // fireplace footprint clears its approach zone (world.updateNorthDoorForFireplace).
-  {
-    id: "fireplace-wall",
-    kind: "fireplace-wall",
-    pos: { x: 0.0, z: -5.5 },
-    rot: 0,
-    movable: true,
-  },
+  // (The default fireplace/bookcase wall was retired — owner request: the
+  //  north wall now carries the two paired doors and the glassy tile panel,
+  //  and the hearth unit covered them. The kind stays spawnable from the DEV
+  //  menu; world.updateNorthDoorForFireplace still gates north-wall doors if
+  //  one is placed in front of them. main.ts purges the retired default id
+  //  from already-seeded lobby docs on entry.)
   {
     id: "sofa-back",
     kind: "sofa-back",
