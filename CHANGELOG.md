@@ -11,6 +11,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.35 — 2026-07-20
+
+### 🏊 Pool & Hot Tub Are Furniture Now
+
+- **The pool and hot tub can be moved and removed like any other furniture** (owner request). In the outdoor Lido room's edit mode you can now select either one and pick it up, stow it, or clear it — they were locked room fixtures before. Both were already built as furniture pieces internally; this unlocks them and adds the supporting fixes so it's safe.
+- **Removing the pool no longer leaves a hole in the room.** The pool's tiled deck used to double as the room's floor (the solid floor was hidden so the sunken water showed through). Now that the pool is removable, the room shows its own solid floor whenever no pool is present — take the pool out and you get a normal deck, not a void. Adding one back sinks the water in again.
+- **Edits to the pool room persist.** That room used to re-stamp its whole layout from scratch on every visit, so any change reverted. It now seeds once (still migrating older casino-era rooms and fresh rooms) and then keeps your changes — a moved hot tub or a removed pool stays that way across re-entry.
+- Neither piece can be accidentally mounted onto the ship's exterior hull anymore, and the pool's hand-authored water footprint is now correctly preserved (fixing a latent bug where its west-edge obstacle was silently dropped).
+- **On the "adaptable to different sizes" idea:** I kept this release to the movable/removable conversion and its safety net, verified end to end. Reshaping the pool into a clean rectangular, resizable piece for future bigger rooms is a focused geometry rewrite (it touches the water, edges, swim seats, and dive tower, and wants proper visual checking) — I'd recommend it as its own next slice, ideally alongside the different-room-sizes work it serves. The pieces move and remove cleanly today; relocating the big infinity pool within its room still looks best at its home spot by design.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.35 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.34 — 2026-07-20
 
 ### 📜 Every Phone App Scrolls Now

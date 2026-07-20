@@ -343,6 +343,7 @@ function commitSpawn(world: World, item: FurnitureItem): void {
   rebuildSeats();
   rebuildDevices();
   world.getPlayer().onObstaclesChanged();
+  world.refreshOutdoorFloor(); // 🏊 a spawned pool hides the outdoor floor
   // E4 (issue #60): publish the spawned piece so it syncs to everyone. AFTER
   // the local commit — the doc observer's reconcile then no-ops on the echo.
   writeFurnitureItem(item);
