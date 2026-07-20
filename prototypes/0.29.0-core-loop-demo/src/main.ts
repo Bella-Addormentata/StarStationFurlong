@@ -930,13 +930,22 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     const outdoorEpoch = epoch;
     void sync.whenServerSynced.then(() => {
       if (outdoorEpoch !== sessionEpoch) return;
-      // Always write outdoor furniture so layout stays in sync with code
-      // (also resets stale docs from earlier prototype versions).
-      for (const item of OUTDOOR_FURNITURE) {
-        writeFurnitureItem(item);
+      // 🏊 Seed the pool layout ONCE per room, then let edits persist (owner
+      // request: the pool + hot tub are movable/removable furniture now, so a
+      // move or removal must survive re-entry). A dedicated marker — not the
+      // old "always rewrite" — still migrates fresh rooms AND stale casino
+      // docs from earlier prototypes (neither carries the marker), but a room
+      // that has already been seeded keeps the player's edits.
+      const roomInfo = sync.doc.getMap('roomInfo');
+      if (!roomInfo.get('poolLayoutSeeded')) {
+        for (const item of OUTDOOR_FURNITURE) {
+          writeFurnitureItem(item);
+        }
+        roomInfo.set('poolLayoutSeeded', true);
       }
       // 🏊 Retired items: casino fixtures moved back to the lobby — purge
-      // their stale doc entries so old room replicas drop them too.
+      // their stale doc entries so old room replicas drop them too (id-only,
+      // harmless when absent; safe to run every entry).
       deleteFurnitureItem('pool-cashier');
       deleteFurnitureItem('pool-roulette');
     });

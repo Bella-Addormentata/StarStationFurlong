@@ -1281,18 +1281,19 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   'brick-wall': { kind: 'brick-wall', build: buildBrickWall, footprint: { w: 4, d: 1 } },
   'window-wall': { kind: 'window-wall', build: buildWindowWall, footprint: { w: 4, d: 1 } },
   // ── 🏝️ Poolside leisure anchors for the outdoor casino zone. ──
+  // Interior leisure furniture (owner request: movable/removable like any
+  // piece). No `mount` — a 7×6 pool / 3×3 tub is not a hull fitting, so edit
+  // mode keeps them on the interior floor and never snaps them onto a wall.
   'lazy-pool': {
     kind: 'lazy-pool',
     build: buildLazyPool,
     footprint: { w: 7, d: 6 },
-    mount: 'both',
     seats: poolSeats,
   },
   'hot-tub': {
     kind: 'hot-tub',
     build: buildHotTub,
     footprint: { w: 3, d: 3 },
-    mount: 'both',
     seats: hotTubSeats,
   },
   // ── 🎰 Casino fixtures (#69 G1/G2) — device fronts face -z (helm idiom). ──
@@ -2589,11 +2590,11 @@ export const OUTDOOR_FURNITURE: FurnitureItem[] = [
   // x[-5.4,3.5] instead of the symmetric 7×6 footprint. Walk routes go
   // north/east/south; the west door drops arrivals straight into the water
   // (auto-swim catches them).
-  { id: 'pool-main',    kind: 'lazy-pool',       pos: { x:  0,   z:  0   }, rot: 0, movable: false,
+  { id: 'pool-main',    kind: 'lazy-pool',       pos: { x:  0,   z:  0   }, rot: 0, movable: true,
     footprintOverride: { x0: -5.4, z0: -3, x1: 3.5, z1: 3 } },
   // Hot tub in the NW corner (nudged inward — the enlarged drum would
   // otherwise overhang the deck edge)
-  { id: 'pool-hot-tub', kind: 'hot-tub',         pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
+  { id: 'pool-hot-tub', kind: 'hot-tub',         pos: { x: -3.7, z: -3.7 }, rot: 0, movable: true },
   // (Casino fixtures moved back to the lobby — the pool room is pure leisure.
   //  main.ts deletes the old pool-cashier / pool-roulette doc entries on entry.)
   // Cherry trees at south corners (null footprint — walkable edge décor)
@@ -2604,6 +2605,22 @@ export const OUTDOOR_FURNITURE: FurnitureItem[] = [
   // (moved off the south deck — the lounger row lives there now)
   { id: 'opot-2',       kind: 'blossom-pot',     pos: { x:  4.6, z:  2.6 }, rot: 0, movable: true },
 ];
+
+// The pool's hand-authored asymmetric obstacle (its water reaches the west
+// room edge) lives in OUTDOOR_FURNITURE, which the DEFAULT_FOOTPRINT_OVERRIDES
+// capture loop above never iterated — so the override was silently dropped on
+// every doc round-trip (the walkable grid used the symmetric derived 7×6).
+// Register outdoor overrides too, so the authored obstacle applies at the
+// default pose and is restored after a move-back / cross-room round-trip
+// (same restore-at-default contract the bar relies on). Placed AFTER
+// OUTDOOR_FURNITURE's declaration — a TDZ const, can't be read in the loop above.
+for (const item of OUTDOOR_FURNITURE) {
+  if (item.footprintOverride) {
+    DEFAULT_FOOTPRINT_OVERRIDES[item.id] = {
+      box: { ...item.footprintOverride }, x: item.pos.x, z: item.pos.z, rot: item.rot,
+    };
+  }
+}
 
 /**
  * 🏊 World-space swim rects of the first lazy-pool item, or null when the
