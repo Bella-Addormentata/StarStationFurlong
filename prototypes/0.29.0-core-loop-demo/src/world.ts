@@ -4,39 +4,90 @@
  * Includes a click-navigation plane for point-and-click pathfinding.
  */
 
-import * as THREE from 'three';
+import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
-import { readDoorPolicy } from './doorPolicy';
-import { Player } from './player';
-import { InputManager } from './input';
-import { findSeatAt, rebuildSeats, SEATS } from './seats';
-import { getDefaultRoomId } from './identity';
-import { FURNITURE, FURNITURE_DEFS, DEFAULT_FOOTPRINT_OVERRIDES, buildItemGroup, BUNK_TOP_Y, rotXZ, OUTDOOR_CASINO_ROOM_ID, POOL_SWIM_Y, POOL_WATER_Y, DIVE_TIME, DIVE_ARC_LIFT } from './furniture';
-import type { FurnitureItem } from './furniture';
-import { northDoorUnlocked } from './stationParts';
-import { rebuildObstacles } from './obstacles';
-import { rebakeWalkableGrid, walkable, worldToRow, worldToCol, colToWorld, rowToWorld } from './pathfinding';
-import { subscribeFurniture, readAllFurniture } from './furnitureDoc';
-import { subscribeDoors, readAllDoors, writeDoorPairing, deleteDoorPairing, type DoorRecord } from './doorsDoc';
-import { readDoorDeltas } from './floorPlanDoc';
-import { applyDoorSlideDeltas } from './doors';
-import { setDoorSlideDeltas } from './adapter';
-import { roomIdFromSeed } from './stationAtlas';
-import type { FurnitureRecord } from './furnitureDoc';
-import { findDoor, DOORS } from './doors';
-import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
-import { buildVestibule, buildConnectorChain, setVestibuleLightState, setVestibuleOpacity } from './adapter';
-import { findDevice, rebuildDevices, createRoomTerminalUI, createMapTableUI, createStorageTrunkUI, createGameTableUI, createHelmUI, createCashierUI, createRouletteUI, createCloneVatUI, readLiveRoomStatus } from './devices';
-import { preferredSpawnVat, setPreferredSpawnVat } from './spawnPoint';
-import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle, DeviceTarget } from './devices';
-import { subscribeGames, readGame } from './games/gamesDoc';
-import { deviceFocus } from './deviceFocus';
-import { roomEdit, canEditRoom } from './editMode';
-import { showHint } from './hud';
-import { DoorDockingPortSystem } from './docking';
-import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from './voxelCharacter';
-import { getOutfitById, saveOutfitId } from './outfits';
-import type { OutfitDef } from './outfits';
+import { readDoorPolicy } from "./doorPolicy";
+import { physicalDoorPose, setActiveDoorLayout } from "./doorLayout";
+import { Player } from "./player";
+import { InputManager } from "./input";
+import { findSeatAt, rebuildSeats, SEATS } from "./seats";
+import { getDefaultRoomId } from "./identity";
+import {
+  FURNITURE,
+  FURNITURE_DEFS,
+  DEFAULT_FOOTPRINT_OVERRIDES,
+  buildItemGroup,
+  furnitureVisualYaw,
+  BUNK_TOP_Y,
+  rotXZ,
+  CASINO_ROOM_ID,
+  OUTDOOR_CASINO_ROOM_ID,
+  POOL_SWIM_Y,
+  POOL_WATER_Y,
+  DIVE_TIME,
+  DIVE_ARC_LIFT,
+} from "./furniture";
+import type { FurnitureItem } from "./furniture";
+import { northDoorUnlocked } from "./stationParts";
+import { rebuildObstacles } from "./obstacles";
+import {
+  rebakeWalkableGrid,
+  walkable,
+  worldToRow,
+  worldToCol,
+  colToWorld,
+  rowToWorld,
+} from "./pathfinding";
+import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
+import {
+  subscribeDoors,
+  readAllDoors,
+  writeDoorPairing,
+  deleteDoorPairing,
+  type DoorRecord,
+} from "./doorsDoc";
+import { readDoorDeltas } from "./floorPlanDoc";
+import { applyDoorSlideDeltas } from "./doors";
+import { setDoorSlideDeltas } from "./adapter";
+import { roomIdFromSeed } from "./stationAtlas";
+import type { FurnitureRecord } from "./furnitureDoc";
+import { findDoor, DOORS } from "./doors";
+import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
+import {
+  buildVestibule,
+  buildConnectorChain,
+  setVestibuleLightState,
+  setVestibuleOpacity,
+} from "./adapter";
+import {
+  findDevice,
+  rebuildDevices,
+  createRoomTerminalUI,
+  createMapTableUI,
+  createStorageTrunkUI,
+  createGameTableUI,
+  createHelmUI,
+  createCashierUI,
+  createRouletteUI,
+  createCloneVatUI,
+  readLiveRoomStatus,
+} from "./devices";
+import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
+import type {
+  WallScreenHandle,
+  TrunkLidHandle,
+  GameTableTopHandle,
+  CloneVatHandle,
+  DeviceTarget,
+} from "./devices";
+import { subscribeGames, readGame } from "./games/gamesDoc";
+import { deviceFocus } from "./deviceFocus";
+import { roomEdit, canEditRoom } from "./editMode";
+import { showHint } from "./hud";
+import { DoorDockingPortSystem } from "./docking";
+import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
+import { getOutfitById, saveOutfitId } from "./outfits";
+import type { OutfitDef } from "./outfits";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -100,7 +151,9 @@ export class World {
    * door id when the avatar reaches the vestibule hold point (mid-HOLD).
    * Transit is only offered on paired doors when this is non-null.
    */
-  public onAdapterTransit: ((seed: string, departureDoorId: DoorId) => void) | null = null;
+  public onAdapterTransit:
+    | ((seed: string, departureDoorId: DoorId) => void)
+    | null = null;
   /**
    * Transit-latch mirror, wired by main.ts beside onAdapterTransit (review
    * fix F4): true while a swap is in flight. A paired-door click then falls
@@ -125,7 +178,10 @@ export class World {
   private static readonly VESTIBULE_FADE_RANGE = 4.0;
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
-  private furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }> = [];
+  private furnitureLights: Array<{
+    light: THREE.PointLight;
+    targetIntensity: number;
+  }> = [];
   /** One group per furniture item, keyed by item id (selection/movement — E2+). */
   public furnitureGroups: Map<string, THREE.Group> = new Map();
   /** Live wall-computer screens, keyed by item id (M1 — driven at ~1 Hz). */
@@ -173,20 +229,24 @@ export class World {
   private woodTex: THREE.Texture | null = null;
   /** Lazy-created outdoor stone tile texture (created on first outdoor entry). */
   private outdoorFloorTex: THREE.Texture | null = null;
+  /** Lazy-created casino carpet texture (created on first casino entry). */
+  private casinoFloorTex: THREE.Texture | null = null;
   /** True while the active room is the outdoor casino pool room. */
   private isOutdoorRoom = false;
   /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
   private poolSign: THREE.Group | null = null;
-  
+  /** Casino-only marquee and colored ceiling lights (lazy-built). */
+  private casinoDecor: THREE.Group | null = null;
+
   constructor(scene: THREE.Scene) {
     this.scene = scene;
     this.platformGroup = new THREE.Group();
     this.platformGroup.position.set(0, 0, 0);
     this.scene.add(this.platformGroup);
-    
+
     // Create the station as a mini planet initially
     this.createStationPlanet();
-    
+
     // Create player (will be shown after morph)
     this.player = new Player(this.scene);
     this.player.mesh.visible = false;
@@ -206,28 +266,28 @@ export class World {
     // docking system exists.
     subscribeDoors(() => this.reconcileDoors(readAllDoors()));
 
-    console.log('✅ World initialized - Station planet ready');
+    console.log("✅ World initialized - Station planet ready");
   }
-  
+
   /**
    * Create station as a mini planet hanging on the galaxy spiral
    */
   private createStationPlanet() {
     // Load Mars texture
     const textureLoader = new THREE.TextureLoader();
-    
+
     // Create a small glowing planet (Mars-style station)
     const planetGeometry = new THREE.SphereGeometry(2, 64, 64);
     const planetMaterial = new THREE.MeshStandardMaterial({
       roughness: 0.9,
       metalness: 0.1,
       emissive: 0x331100,
-      emissiveIntensity: 0.2
+      emissiveIntensity: 0.2,
     });
-    
+
     // Load Mars texture asynchronously
     textureLoader.load(
-      '/assets/mars.png',
+      "/assets/mars.png",
       (texture) => {
         // Nearest-neighbour keeps the texture crisp in the pixelated renderer.
         texture.minFilter = THREE.NearestFilter;
@@ -235,42 +295,42 @@ export class World {
         texture.generateMipmaps = false;
         planetMaterial.map = texture;
         planetMaterial.needsUpdate = true;
-        console.log('✅ Mars texture loaded');
+        console.log("✅ Mars texture loaded");
       },
       undefined,
       (_error) => {
-        console.warn('⚠️ Mars texture not found, using fallback color');
+        console.warn("⚠️ Mars texture not found, using fallback color");
         planetMaterial.color.setHex(0xd84315);
-      }
+      },
     );
-    
+
     this.stationPlanet = new THREE.Mesh(planetGeometry, planetMaterial);
     this.stationPlanet.position.set(0, 0, 0);
     this.platformGroup.add(this.stationPlanet);
-    
+
     // Add subtle atmosphere glow (Mars-like)
     const glowGeometry = new THREE.SphereGeometry(2.15, 32, 32);
     const glowMaterial = new THREE.MeshBasicMaterial({
       color: 0xff6644,
       transparent: true,
       opacity: 0.15,
-      side: THREE.BackSide
+      side: THREE.BackSide,
     });
     const glow = new THREE.Mesh(glowGeometry, glowMaterial);
     this.stationPlanet.add(glow);
-    
+
     // Add ring around planet (station orbit ring)
     const ringGeometry = new THREE.RingGeometry(2.5, 2.7, 64);
     const ringMaterial = new THREE.MeshBasicMaterial({
-      color: 0x1E88E5,
+      color: 0x1e88e5,
       transparent: true,
       opacity: 0.4,
-      side: THREE.DoubleSide
+      side: THREE.DoubleSide,
     });
     const ring = new THREE.Mesh(ringGeometry, ringMaterial);
     ring.rotation.x = Math.PI / 2;
     this.stationPlanet.add(ring);
-    
+
     // Add subtle point light (Mars doesn't emit much light)
     const planetLight = new THREE.PointLight(0xff6633, 0.3, 15);
     planetLight.position.set(0, 0, 0);
@@ -279,22 +339,36 @@ export class World {
     // Orbital rings — children of Mars so they follow its position
     this.orbitRingOuter = new THREE.Mesh(
       new THREE.TorusGeometry(3.2, 0.22, 20, 80),
-      new THREE.MeshBasicMaterial({ color: 0x00ffee, transparent: true, opacity: 0.75, depthWrite: false, side: THREE.DoubleSide })
+      new THREE.MeshBasicMaterial({
+        color: 0x00ffee,
+        transparent: true,
+        opacity: 0.75,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
     );
     this.orbitRingOuter.rotation.x = Math.PI * 0.28; // tilted orbital plane
     this.stationPlanet.add(this.orbitRingOuter);
 
     this.orbitRingInner = new THREE.Mesh(
       new THREE.TorusGeometry(2.5, 0.16, 20, 80),
-      new THREE.MeshBasicMaterial({ color: 0xff8800, transparent: true, opacity: 0.65, depthWrite: false, side: THREE.DoubleSide })
+      new THREE.MeshBasicMaterial({
+        color: 0xff8800,
+        transparent: true,
+        opacity: 0.65,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
     );
     this.orbitRingInner.rotation.x = -Math.PI * 0.18;
     this.orbitRingInner.rotation.z = Math.PI * 0.12;
     this.stationPlanet.add(this.orbitRingInner);
 
-    console.log('✅ Station planet created (Mars-style) - hanging on galaxy spiral');
+    console.log(
+      "✅ Station planet created (Mars-style) - hanging on galaxy spiral",
+    );
   }
-  
+
   /**
    * Create the full platform (called during morph)
    */
@@ -306,21 +380,33 @@ export class World {
 
     // Build a canvas herringbone wood texture
     const makeWoodTexture = (): THREE.CanvasTexture => {
-      const CW = 512, CH = 512;
-      const cv = document.createElement('canvas');
-      cv.width = CW; cv.height = CH;
-      const ctx = cv.getContext('2d')!;
+      const CW = 512,
+        CH = 512;
+      const cv = document.createElement("canvas");
+      cv.width = CW;
+      cv.height = CH;
+      const ctx = cv.getContext("2d")!;
 
       // plank tile: 96px wide × 32px tall
-      const PW = 96, PH = 32, GAP = 2;
+      const PW = 96,
+        PH = 32,
+        GAP = 2;
       // base fill
-      ctx.fillStyle = '#D4A86A';
+      ctx.fillStyle = "#D4A86A";
       ctx.fillRect(0, 0, CW, CH);
 
-      const drawPlank = (x: number, y: number, w: number, h: number, seed: number) => {
+      const drawPlank = (
+        x: number,
+        y: number,
+        w: number,
+        h: number,
+        seed: number,
+      ) => {
         // base plank colour — vary slightly per plank for realism
         const v = (seed % 5) * 8;
-        const r = 196 + v, g = 154 + v * 0.6 | 0, b = 88 + v * 0.3 | 0;
+        const r = 196 + v,
+          g = (154 + v * 0.6) | 0,
+          b = (88 + v * 0.3) | 0;
         ctx.fillStyle = `rgb(${r},${g},${b})`;
         ctx.fillRect(x + GAP, y + GAP, w - GAP, h - GAP);
         // grain lines
@@ -328,22 +414,27 @@ export class World {
         ctx.lineWidth = 0.8;
         for (let i = 1; i < 4; i++) {
           const gx = x + GAP + (w - GAP) * (i / 4);
-          ctx.beginPath(); ctx.moveTo(gx, y + GAP); ctx.lineTo(gx + 2, y + h); ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(gx, y + GAP);
+          ctx.lineTo(gx + 2, y + h);
+          ctx.stroke();
         }
         // highlight top edge
-        ctx.fillStyle = 'rgba(255,255,230,0.12)';
+        ctx.fillStyle = "rgba(255,255,230,0.12)";
         ctx.fillRect(x + GAP, y + GAP, w - GAP, 3);
         // shadow bottom edge
-        ctx.fillStyle = 'rgba(0,0,0,0.10)';
+        ctx.fillStyle = "rgba(0,0,0,0.10)";
         ctx.fillRect(x + GAP, y + h - 3, w - GAP, 3);
       };
 
       // Herringbone: alternating horizontal and vertical planks in 2×1 tiles
-      const TW = PW, TH = PH; // horizontal plank size
+      const TW = PW,
+        TH = PH; // horizontal plank size
       let seed = 0;
       for (let row = -1; row * TH < CH + TH; row++) {
         for (let col = -1; col * TW < CW + TW; col++) {
-          const tx = col * TW, ty = row * TH;
+          const tx = col * TW,
+            ty = row * TH;
           if ((row + col) % 2 === 0) {
             // horizontal plank
             drawPlank(tx, ty, PW, PH, seed++);
@@ -371,10 +462,10 @@ export class World {
       roughness: 0.78,
       metalness: 0.0,
       transparent: true,
-      opacity: 0
+      opacity: 0,
     });
-    this.floorMat = floorMaterial;         // 🏝️ kept for applyRoomVisuals swaps
-    this.woodTex = floorMaterial.map;      // save original wood texture for restoration
+    this.floorMat = floorMaterial; // 🏝️ kept for applyRoomVisuals swaps
+    this.woodTex = floorMaterial.map; // save original wood texture for restoration
     this.platformFloor = new THREE.Mesh(floorGeometry, floorMaterial);
     this.platformFloor.rotation.x = -Math.PI / 2;
     this.platformGroup.add(this.platformFloor);
@@ -394,7 +485,12 @@ export class World {
     this.platformGroup.add(this.clickPlane);
 
     // Grid helper
-    this.platformGrid = new THREE.GridHelper(platformSize, 12, 0x1E88E5, 0x0A1E3A);
+    this.platformGrid = new THREE.GridHelper(
+      platformSize,
+      12,
+      0x1e88e5,
+      0x0a1e3a,
+    );
     this.platformGrid.position.y = 0.01;
     this.platformGrid.visible = false;
     this.platformGroup.add(this.platformGrid);
@@ -406,7 +502,7 @@ export class World {
     this.addCapsuleOuterStructure();
     this.addLobbyFurniture();
     this.addAtmosphereEffects();
-    
+
     // Construct and build 4-Directional sliding door docking ports natively!
     this.initializeDockingPorts();
 
@@ -421,14 +517,25 @@ export class World {
     {
       const ambient = new THREE.Mesh(
         new THREE.SphereGeometry(16, 32, 24),
-        new THREE.MeshStandardMaterial({ color: 0x2a5a8f, roughness: 0.9, metalness: 0.05, emissive: 0x0c2038, emissiveIntensity: 0.55 }),
+        new THREE.MeshStandardMaterial({
+          color: 0x2a5a8f,
+          roughness: 0.9,
+          metalness: 0.05,
+          emissive: 0x0c2038,
+          emissiveIntensity: 0.55,
+        }),
       );
-      ambient.name = 'ambientPlanet';
+      ambient.name = "ambientPlanet";
       ambient.position.set(-70, -10, -28);
       this.platformGroup.add(ambient);
       const glow = new THREE.Mesh(
         new THREE.SphereGeometry(16.8, 32, 24),
-        new THREE.MeshBasicMaterial({ color: 0x7fb8ff, transparent: true, opacity: 0.08, side: THREE.BackSide }),
+        new THREE.MeshBasicMaterial({
+          color: 0x7fb8ff,
+          transparent: true,
+          opacity: 0.08,
+          side: THREE.BackSide,
+        }),
       );
       glow.position.copy(ambient.position);
       this.platformGroup.add(glow);
@@ -441,9 +548,9 @@ export class World {
    * Add transparent side walls on the left (X=-6) and right (X=+6) sides.
    */
   private addSideWalls() {
-    const wallDepth  = 12;
+    const wallDepth = 12;
     const wallHeight = 4;
-    const wallThick  = 0.35;
+    const wallThick = 0.35;
     const wallY = wallHeight / 2;
 
     // ── 🧊 Wall tile canvas texture ──────────────────────────────────────────
@@ -451,19 +558,21 @@ export class World {
     // fine pale-blue tile grid with white grout — soft, airy, and matching
     // the pool room's tiled deck/tower (furniture.ts makePoolTileTex).
     const makeBrickTexture = (): THREE.CanvasTexture => {
-      const CW = 512, CH = 171;
-      const cv = document.createElement('canvas');
-      cv.width = CW; cv.height = CH;
-      const ctx = cv.getContext('2d')!;
+      const CW = 512,
+        CH = 171;
+      const cv = document.createElement("canvas");
+      cv.width = CW;
+      cv.height = CH;
+      const ctx = cv.getContext("2d")!;
 
       // grout background — clean white
-      ctx.fillStyle = '#FFFFFF';
+      ctx.fillStyle = "#FFFFFF";
       ctx.fillRect(0, 0, CW, CH);
 
-      const BW = 30;  // tile width px (small square grid, no brick bond)
-      const BH = 30;  // tile height px
-      const MO = 2;   // grout thickness px
-      const cols = ['#A9CBE9', '#9FC4E5', '#B2D1EC', '#A4C8E7'];
+      const BW = 30; // tile width px (small square grid, no brick bond)
+      const BH = 30; // tile height px
+      const MO = 2; // grout thickness px
+      const cols = ["#A9CBE9", "#9FC4E5", "#B2D1EC", "#A4C8E7"];
 
       for (let row = 0; row * (BH + MO) < CH + BH; row++) {
         const y = row * (BH + MO);
@@ -472,7 +581,7 @@ export class World {
           ctx.fillStyle = cols[(row * 3 + col) % 4];
           ctx.fillRect(x + MO, y + MO, BW - MO, BH - MO);
           // soft highlight top-left edge
-          ctx.fillStyle = 'rgba(255,255,255,0.35)';
+          ctx.fillStyle = "rgba(255,255,255,0.35)";
           ctx.fillRect(x + MO, y + MO, BW - MO, 2);
           ctx.fillRect(x + MO, y + MO, 2, BH - MO);
         }
@@ -493,14 +602,15 @@ export class World {
 
     const brickTex = makeBrickTexture();
 
-    const makeMat = () => new THREE.MeshStandardMaterial({
-      map: brickTex,
-      roughness: 0.85,
-      metalness: 0.0,
-      transparent: true,
-      opacity: 0,
-      side: THREE.DoubleSide,
-    });
+    const makeMat = () =>
+      new THREE.MeshStandardMaterial({
+        map: brickTex,
+        roughness: 0.85,
+        metalness: 0.0,
+        transparent: true,
+        opacity: 0,
+        side: THREE.DoubleSide,
+      });
 
     const wallGeo = new THREE.BoxGeometry(wallThick, wallHeight, wallDepth);
 
@@ -510,9 +620,13 @@ export class World {
     this.sideWalls.push(leftWall);
 
     // Subtle top-edge coping strip for left wall only
-    const edgeGeo = new THREE.BoxGeometry(wallThick + 0.06, 0.10, wallDepth + 0.06);
+    const edgeGeo = new THREE.BoxGeometry(
+      wallThick + 0.06,
+      0.1,
+      wallDepth + 0.06,
+    );
     const edgeMat = new THREE.MeshStandardMaterial({
-      color: 0xB8C8D8,
+      color: 0xb8c8d8,
       roughness: 0.75,
       metalness: 0.05,
       transparent: true,
@@ -531,7 +645,7 @@ export class World {
     // 1. Sleek metallic outer roof
     const roofGeo = new THREE.BoxGeometry(12.35, 0.28, 12.35);
     const outerMetallicMat = new THREE.MeshStandardMaterial({
-      color: 0x2A3E52, // carbon structural blueprint slate
+      color: 0x2a3e52, // carbon structural blueprint slate
       roughness: 0.4,
       metalness: 0.8,
       transparent: true,
@@ -552,7 +666,7 @@ export class World {
     backWall.position.set(0, 2.0, -6.0);
     this.platformGroup.add(backWall);
     this.capsuleOuterWalls.push(backWall);
-    
+
     // Also build a full solid left/right wall set with ports slots included
     const wallGeoLR = new THREE.BoxGeometry(0.35, 4.0, 12.35);
     const rightWall = new THREE.Mesh(wallGeoLR, outerMetallicMat);
@@ -615,23 +729,32 @@ export class World {
       if (obj instanceof THREE.Mesh) {
         this.furnitureMeshes.push(obj);
         if (obj.userData.wallScreen) {
-          this.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
+          this.wallScreens.set(
+            item.id,
+            obj.userData.wallScreen as WallScreenHandle,
+          );
         }
-        if (typeof obj.userData.holoSpin === 'number') {
+        if (typeof obj.userData.holoSpin === "number") {
           this.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin });
         }
         if (obj.userData.trunkLid) {
           this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
         }
         if (obj.userData.gameTableTop) {
-          this.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
+          this.gameTableTops.set(
+            item.id,
+            obj.userData.gameTableTop as GameTableTopHandle,
+          );
         }
         if (obj.userData.cloneVat) {
           this.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
         }
         if (reveal) {
-          const mat = obj.material as THREE.Material & { opacity: number; userData: { baseOpacity?: number } };
-          if ('opacity' in mat) mat.opacity = mat.userData.baseOpacity ?? 1;
+          const mat = obj.material as THREE.Material & {
+            opacity: number;
+            userData: { baseOpacity?: number };
+          };
+          if ("opacity" in mat) mat.opacity = mat.userData.baseOpacity ?? 1;
         }
       } else if (obj instanceof THREE.PointLight) {
         const targetIntensity = (obj.userData.targetIntensity as number) ?? 0;
@@ -666,18 +789,27 @@ export class World {
    */
   public reconcileDoors(records: Map<string, DoorRecord>): void {
     if (!this.dockingSystem) return; // docking ports not built yet
-    const doors: Array<'north' | 'south' | 'east' | 'west'> = ['north', 'south', 'east', 'west'];
+    const doors: Array<"north" | "south" | "east" | "west"> = [
+      "north",
+      "south",
+      "east",
+      "west",
+    ];
     for (const doorId of doors) {
       const rec = records.get(doorId);
       if (rec && rec.paired && rec.connectedRoomAddress) {
         // #62 P2: geometry (sanitized by readAllDoors) rides along; the diff
         // inside applyRemotePairing catches chain edits on a same-address record.
-        this.dockingSystem.applyRemotePairing(doorId, rec.connectedRoomAddress, {
-          segments: rec.segments,
-          farDoor: rec.farDoor,
-          farYawDeg: rec.farYawDeg,
-          transient: rec.transient, // #67 D2
-        });
+        this.dockingSystem.applyRemotePairing(
+          doorId,
+          rec.connectedRoomAddress,
+          {
+            segments: rec.segments,
+            farDoor: rec.farDoor,
+            farYawDeg: rec.farYawDeg,
+            transient: rec.transient, // #67 D2
+          },
+        );
       } else {
         this.dockingSystem.clearRemotePairing(doorId);
       }
@@ -720,13 +852,15 @@ export class World {
     this.sideWallCovered[0] = false;
     this.sideWallCovered[1] = false;
     for (const item of FURNITURE) {
-      if (item.kind !== 'brick-wall' && item.kind !== 'window-wall') continue;
+      if (item.kind !== "brick-wall" && item.kind !== "window-wall") continue;
       if (item.pos.x < -5) this.sideWallCovered[0] = true;
       if (item.pos.x > 5) this.sideWallCovered[1] = true;
     }
     // addSideWalls order: [0] = left (x=-6). The zoom machinery consults the
     // flags too (it force-restores walls at interior levels otherwise).
-    this.sideWalls.forEach((wall, i) => { wall.visible = !this.hullEditView && !this.sideWallCovered[i]; });
+    this.sideWalls.forEach((wall, i) => {
+      wall.visible = !this.hullEditView && !this.sideWallCovered[i];
+    });
   }
 
   /** Which built-in side walls are REPLACED by placed wall sections. */
@@ -739,7 +873,9 @@ export class World {
 
   public setHullEditView(on: boolean): void {
     this.hullEditView = on;
-    this.sideWalls.forEach((wall, i) => { wall.visible = !on && !this.sideWallCovered[i]; });
+    this.sideWalls.forEach((wall, i) => {
+      wall.visible = !on && !this.sideWallCovered[i];
+    });
   }
 
   /**
@@ -753,28 +889,30 @@ export class World {
    *  Two back-to-back planes so the text reads correctly from every angle. */
   private ensurePoolSign(): void {
     if (this.poolSign) return;
-    const cv = document.createElement('canvas');
-    cv.width = 512; cv.height = 128;
-    const c = cv.getContext('2d')!;
+    const cv = document.createElement("canvas");
+    cv.width = 512;
+    cv.height = 128;
+    const c = cv.getContext("2d")!;
     // Soft white plate.
-    c.fillStyle = '#FDFEFF';
+    c.fillStyle = "#FDFEFF";
     c.fillRect(0, 0, 512, 128);
     // Thin double frame — pale blue outside, whisper-blue inside.
-    c.strokeStyle = '#A4C8E7';
+    c.strokeStyle = "#A4C8E7";
     c.lineWidth = 3;
     c.strokeRect(8, 8, 496, 112);
-    c.strokeStyle = '#D9E8F2';
+    c.strokeStyle = "#D9E8F2";
     c.lineWidth = 2;
     c.strokeRect(16, 16, 480, 96);
     // Elegant spaced serif capitals — deep teal, same as the pool floor tint.
-    c.fillStyle = '#1C5A74';
-    (c as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = '8px';
+    c.fillStyle = "#1C5A74";
+    (c as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "8px";
     c.font = '42px Georgia, "Palatino Linotype", serif';
-    c.textAlign = 'center';
-    c.textBaseline = 'middle';
-    c.fillText('POOL & HOT TUB', 256, 56);
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.fillText("POOL & HOT TUB", 256, 56);
     // Slim turquoise flourish beneath.
-    c.strokeStyle = '#4FB4C4';
+    c.strokeStyle = "#4FB4C4";
     c.lineWidth = 2.5;
     c.beginPath();
     c.moveTo(196, 96);
@@ -785,7 +923,7 @@ export class World {
     const geo = new THREE.PlaneGeometry(2.4, 0.6);
     const mat = new THREE.MeshBasicMaterial({ map: tex });
     this.poolSign = new THREE.Group();
-    const front = new THREE.Mesh(geo, mat);        // faces INTO the room
+    const front = new THREE.Mesh(geo, mat); // faces INTO the room
     front.rotation.y = Math.PI;
     const back = new THREE.Mesh(geo.clone(), mat); // faces outward
     back.position.z = 0.012;
@@ -794,14 +932,340 @@ export class World {
     this.platformGroup.add(this.poolSign);
   }
 
+  private ensureCasinoDecor(): void {
+    if (this.casinoDecor) return;
+    const group = new THREE.Group();
+    group.name = "casino-theme-decor";
+
+    const gold = new THREE.MeshStandardMaterial({
+      color: 0xf4c45e,
+      emissive: 0x7a3b08,
+      emissiveIntensity: 0.18,
+      metalness: 0.82,
+      roughness: 0.2,
+    });
+    const crystalGlass = new THREE.MeshPhysicalMaterial({
+      color: 0xffe9b0,
+      metalness: 0,
+      roughness: 0.08,
+      transmission: 0.82,
+      transparent: true,
+      opacity: 0.24,
+      thickness: 0.12,
+      depthWrite: false,
+    });
+    const trellisGold = new THREE.MeshStandardMaterial({
+      color: 0xd99b2b,
+      emissive: 0x5a2604,
+      emissiveIntensity: 0.12,
+      metalness: 0.72,
+      roughness: 0.28,
+    });
+    const vine = new THREE.MeshStandardMaterial({
+      color: 0x174d24,
+      roughness: 0.88,
+    });
+    const leafMaterials = [0x246c32, 0x358642, 0x4b9b4c].map(
+      (color) =>
+        new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.82,
+        }),
+    );
+    const flowerGold = new THREE.MeshStandardMaterial({
+      color: 0xffb51d,
+      emissive: 0x8b3800,
+      emissiveIntensity: 0.22,
+      roughness: 0.48,
+    });
+    const berryRed = new THREE.MeshStandardMaterial({
+      color: 0x9e1f2f,
+      roughness: 0.5,
+    });
+
+    const addBox = (
+      size: [number, number, number],
+      position: [number, number, number],
+      material: THREE.Material,
+    ) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), material);
+      mesh.position.set(...position);
+      group.add(mesh);
+    };
+
+    const dollarCanvas = document.createElement("canvas");
+    dollarCanvas.width = 128;
+    dollarCanvas.height = 128;
+    const dollarCtx = dollarCanvas.getContext("2d")!;
+    dollarCtx.clearRect(0, 0, 128, 128);
+    dollarCtx.font = "900 104px Georgia";
+    dollarCtx.textAlign = "center";
+    dollarCtx.textBaseline = "middle";
+    dollarCtx.lineWidth = 8;
+    dollarCtx.strokeStyle = "#6f3500";
+    dollarCtx.strokeText("$", 64, 66);
+    dollarCtx.fillStyle = "#ffd96b";
+    dollarCtx.fillText("$", 64, 66);
+    const dollarTexture = new THREE.CanvasTexture(dollarCanvas);
+    dollarTexture.colorSpace = THREE.SRGBColorSpace;
+    dollarTexture.minFilter = THREE.LinearMipmapLinearFilter;
+    const dollarMaterial = new THREE.MeshBasicMaterial({
+      map: dollarTexture,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+    });
+    const addDollar = (
+      position: [number, number, number],
+      rotationY: number,
+      size = 0.34,
+    ) => {
+      const symbol = new THREE.Mesh(
+        new THREE.PlaneGeometry(size, size),
+        dollarMaterial,
+      );
+      symbol.position.set(...position);
+      symbol.rotation.y = rotationY;
+      symbol.renderOrder = 3;
+      group.add(symbol);
+    };
+
+    // Camera-facing east and south walls become a layered grand-salon shell.
+    addBox([0.16, 0.2, 11.2], [5.7, 3.22, 0], gold);
+    addBox([11.2, 0.2, 0.16], [0, 3.22, 5.7], gold);
+    addBox([0.16, 0.2, 11.2], [-5.7, 3.22, 0], gold);
+    addBox([11.2, 0.2, 0.16], [0, 3.22, -5.7], gold);
+    addBox([0.12, 0.12, 11.0], [5.64, 0.18, 0], gold);
+    addBox([11.0, 0.12, 0.12], [0, 0.18, 5.64], gold);
+    for (const offset of [-3.7, 0, 3.7]) {
+      addBox([0.24, 2.66, 0.42], [5.56, 1.65, offset], crystalGlass);
+      addBox([0.34, 0.18, 0.58], [5.56, 0.28, offset], gold);
+      addBox([0.34, 0.18, 0.58], [5.56, 3.02, offset], gold);
+      addBox([0.42, 2.66, 0.24], [offset, 1.65, 5.56], crystalGlass);
+      addBox([0.58, 0.18, 0.34], [offset, 0.28, 5.56], gold);
+      addBox([0.58, 0.18, 0.34], [offset, 3.02, 5.56], gold);
+    }
+
+    // Gold-dollar crown moulding on the north and west door walls only.
+    for (let offset = -5.1; offset <= 5.1; offset += 0.85) {
+      addDollar([offset, 3.04, -5.79], 0);
+      addDollar([-5.79, 3.04, offset], Math.PI / 2);
+    }
+
+    const addStem = (
+      from: THREE.Vector3,
+      to: THREE.Vector3,
+      radius = 0.035,
+    ) => {
+      const direction = to.clone().sub(from);
+      const stem = new THREE.Mesh(
+        new THREE.CylinderGeometry(
+          radius,
+          radius * 1.08,
+          direction.length(),
+          6,
+        ),
+        vine,
+      );
+      stem.position.copy(from).add(to).multiplyScalar(0.5);
+      stem.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0),
+        direction.normalize(),
+      );
+      group.add(stem);
+    };
+
+    const addFloralTrellis = (wall: "north" | "west") => {
+      const alongX = wall === "north";
+      const wallPlane = -5.52;
+      const point = (along: number, y: number, inward = 0) =>
+        new THREE.Vector3(
+          alongX ? along : wallPlane + inward,
+          y,
+          alongX ? wallPlane + inward : along,
+        );
+
+      for (const along of [-4.8, -2.4, 0, 2.4, 4.8]) {
+        addBox(
+          alongX ? [0.07, 0.82, 0.07] : [0.07, 0.82, 0.07],
+          [alongX ? along : wallPlane, 3.72, alongX ? wallPlane : along],
+          trellisGold,
+        );
+      }
+      addBox(
+        alongX ? [10.7, 0.07, 0.07] : [0.07, 0.07, 10.7],
+        alongX ? [0, 3.48, wallPlane] : [wallPlane, 3.48, 0],
+        trellisGold,
+      );
+      addBox(
+        alongX ? [10.7, 0.07, 0.07] : [0.07, 0.07, 10.7],
+        alongX ? [0, 4.03, wallPlane] : [wallPlane, 4.03, 0],
+        trellisGold,
+      );
+
+      const vinePoints: THREE.Vector3[] = [];
+      for (let index = 0; index < 13; index++) {
+        const along = -5.1 + index * 0.85;
+        const y = 3.82 + Math.sin(index * 1.55) * 0.22;
+        const center = point(along, y, 0.08);
+        vinePoints.push(center);
+        if (index > 0) addStem(vinePoints[index - 1], center);
+
+        for (const side of [-1, 1]) {
+          const leaf = new THREE.Mesh(
+            new THREE.SphereGeometry(0.17, 7, 5),
+            leafMaterials[(index + (side > 0 ? 1 : 0)) % leafMaterials.length],
+          );
+          leaf.scale.set(1.35, 0.48, 0.72);
+          leaf.position.copy(center);
+          leaf.position.y += side * 0.12;
+          if (alongX) {
+            leaf.position.x += side * 0.19;
+            leaf.position.z += 0.09;
+            leaf.rotation.z = side * 0.55;
+          } else {
+            leaf.position.z += side * 0.19;
+            leaf.position.x += 0.09;
+            leaf.rotation.x = side * 0.55;
+          }
+          leaf.rotation.y = index * 0.72;
+          group.add(leaf);
+        }
+
+        if (index % 2 === 0) {
+          const flowerCenter = center.clone();
+          flowerCenter.y += 0.28;
+          flowerCenter.add(point(0, 0, 0.16).sub(point(0, 0, 0)));
+          for (let petal = 0; petal < 5; petal++) {
+            const angle = (petal / 5) * Math.PI * 2;
+            const bloom = new THREE.Mesh(
+              new THREE.ConeGeometry(0.09, 0.22, 6),
+              flowerGold,
+            );
+            bloom.position.copy(flowerCenter);
+            if (alongX) {
+              bloom.position.x += Math.cos(angle) * 0.1;
+              bloom.position.y += Math.sin(angle) * 0.1;
+              bloom.rotation.z = -angle + Math.PI / 2;
+            } else {
+              bloom.position.z += Math.cos(angle) * 0.1;
+              bloom.position.y += Math.sin(angle) * 0.1;
+              bloom.rotation.x = angle - Math.PI / 2;
+            }
+            group.add(bloom);
+          }
+        } else if (index % 3 === 0) {
+          for (const drop of [-0.08, 0.08]) {
+            const berry = new THREE.Mesh(
+              new THREE.SphereGeometry(0.065, 7, 5),
+              berryRed,
+            );
+            berry.position.copy(center);
+            berry.position.y -= 0.2;
+            if (alongX) berry.position.x += drop;
+            else berry.position.z += drop;
+            group.add(berry);
+          }
+        }
+      }
+    };
+
+    addFloralTrellis("north");
+    addFloralTrellis("west");
+
+    // Casino doors occupy paired slots on north and west. Stamp both jambs
+    // and the lintel without adding collision or narrowing the opening.
+    for (const doorId of ["north", "south", "west", "east"] as const) {
+      const pose = physicalDoorPose(doorId);
+      const northSouth = pose.wall === "north" || pose.wall === "south";
+      const inward =
+        pose.wall === "north" || pose.wall === "west" ? 0.19 : -0.19;
+      const faceYaw = northSouth ? 0 : Math.PI / 2;
+      for (const side of [-1, 1]) {
+        for (const y of [0.5, 1.2, 1.9, 2.6]) {
+          addDollar(
+            northSouth
+              ? [pose.x + side * 1.27, y, pose.z + inward]
+              : [pose.x + inward, y, pose.z + side * 1.27],
+            faceYaw,
+            0.3,
+          );
+        }
+      }
+      for (const along of [-0.9, -0.3, 0.3, 0.9]) {
+        addDollar(
+          northSouth
+            ? [pose.x + along, 3.02, pose.z + inward]
+            : [pose.x + inward, 3.02, pose.z + along],
+          faceYaw,
+          0.3,
+        );
+      }
+    }
+
+    const lightColors = [0xffbf48, 0xffd976, 0xffbf48, 0xffd976];
+    const lightPositions = [
+      [-3.3, 3.45, -2.8],
+      [3.3, 3.45, -2.8],
+      [-3.3, 3.45, 2.8],
+      [3.3, 3.45, 2.8],
+    ] as const;
+    lightPositions.forEach(([x, y, z], index) => {
+      const color = lightColors[index];
+      const canopy = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.3, 0.38, 0.1, 16),
+        gold,
+      );
+      canopy.position.set(x, y + 0.18, z);
+      group.add(canopy);
+      for (let tier = 0; tier < 3; tier++) {
+        const crystal = new THREE.Mesh(
+          new THREE.OctahedronGeometry(0.13 - tier * 0.02, 0),
+          new THREE.MeshPhysicalMaterial({
+            color: 0xffe5a3,
+            emissive: color,
+            emissiveIntensity: 0.65,
+            metalness: 0.05,
+            roughness: 0.08,
+            transmission: 0.35,
+            transparent: true,
+            opacity: 0.9,
+          }),
+        );
+        crystal.position.set(x, y - tier * 0.19, z);
+        crystal.rotation.y = tier * (Math.PI / 4);
+        group.add(crystal);
+      }
+      const light = new THREE.PointLight(color, 2.8, 6.5, 1.45);
+      light.position.set(x, y - 0.22, z);
+      group.add(light);
+    });
+
+    this.casinoDecor = group;
+    this.platformGroup.add(group);
+  }
+
   public applyRoomVisuals(roomId: string): void {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
+    const casino = roomId === CASINO_ROOM_ID;
     this.isOutdoorRoom = outdoor;
+    setActiveDoorLayout(casino ? "casino-pairs" : "legacy");
+    const doorDeltas = readDoorDeltas();
+    applyDoorSlideDeltas(doorDeltas);
+    setDoorSlideDeltas(doorDeltas);
+    this.dockingSystem?.repositionDoorGroups(doorDeltas);
+    const north = findDoor("north");
+    if (casino && north) north.enabled = true;
+    else this.updateNorthDoorForFireplace();
+    this.dockingSystem?.refreshDoorInteractivity();
 
     // 🏊 The pool sign points the way FROM the lobby — hidden inside the pool
     // room itself (that same door leads back home there).
     this.ensurePoolSign();
-    if (this.poolSign) this.poolSign.visible = !outdoor;
+    if (this.poolSign) this.poolSign.visible = !outdoor && !casino;
+    this.ensureCasinoDecor();
+    if (this.casinoDecor) this.casinoDecor.visible = casino;
 
     // 🏊 Outdoor pool room: HIDE the solid y=0 floor plane and its grid — the
     // lazy-pool item's white-tile deck slabs provide all visible flooring, and
@@ -817,43 +1281,111 @@ export class World {
     // sky-blue backdrop, warm sun, nebula + stars hidden. Every other room
     // restores the warm-nebula night scheme (values mirror renderer.ts).
     const sc = this.scene;
-    const amb  = sc.getObjectByName('light-ambient') as THREE.AmbientLight | undefined;
-    const sun  = sc.getObjectByName('light-sun') as THREE.DirectionalLight | undefined;
-    const hemi = sc.getObjectByName('light-hemi') as THREE.HemisphereLight | undefined;
-    const nebSky = sc.getObjectByName('nebula-sky');
-    const starLayers = sc.children.filter((o) => o.name === 'nebula-stars');
+    const amb = sc.getObjectByName("light-ambient") as
+      | THREE.AmbientLight
+      | undefined;
+    const sun = sc.getObjectByName("light-sun") as
+      | THREE.DirectionalLight
+      | undefined;
+    const hemi = sc.getObjectByName("light-hemi") as
+      | THREE.HemisphereLight
+      | undefined;
+    const nebSky = sc.getObjectByName("nebula-sky");
+    const starLayers = sc.children.filter((o) => o.name === "nebula-stars");
     if (outdoor) {
-      sc.background = new THREE.Color(0x8ED4F0);            // bright day sky
-      if (sc.fog instanceof THREE.FogExp2) { sc.fog.color.setHex(0xA8DCF0); sc.fog.density = 0.006; }
-      if (amb)  { amb.color.setHex(0xFFFFFF); amb.intensity = 0.85; }
-      if (sun)  { sun.color.setHex(0xFFF4DC); sun.intensity = 1.3; } // warm noon sun
-      if (hemi) { hemi.color.setHex(0xCFE9FF); hemi.groundColor.setHex(0xBFD8CB); hemi.intensity = 0.65; }
+      sc.background = new THREE.Color(0x8ed4f0); // bright day sky
+      if (sc.fog instanceof THREE.FogExp2) {
+        sc.fog.color.setHex(0xa8dcf0);
+        sc.fog.density = 0.006;
+      }
+      if (amb) {
+        amb.color.setHex(0xffffff);
+        amb.intensity = 0.85;
+      }
+      if (sun) {
+        sun.color.setHex(0xfff4dc);
+        sun.intensity = 1.3;
+      } // warm noon sun
+      if (hemi) {
+        hemi.color.setHex(0xcfe9ff);
+        hemi.groundColor.setHex(0xbfd8cb);
+        hemi.intensity = 0.65;
+      }
       if (nebSky) nebSky.visible = false;
-      starLayers.forEach((s) => { s.visible = false; });
+      starLayers.forEach((s) => {
+        s.visible = false;
+      });
       // 👻 Doors ghost to faint glass silhouettes (still clickable for transit).
       this.dockingSystem?.setGhostDoors(true);
+    } else if (casino) {
+      sc.background = new THREE.Color(0x3b101b);
+      if (sc.fog instanceof THREE.FogExp2) {
+        sc.fog.color.setHex(0x5a1b28);
+        sc.fog.density = 0.004;
+      }
+      if (amb) {
+        amb.color.setHex(0xffe0b0);
+        amb.intensity = 1.08;
+      }
+      if (sun) {
+        sun.color.setHex(0xffd98a);
+        sun.intensity = 1.85;
+      }
+      if (hemi) {
+        hemi.color.setHex(0xffedcf);
+        hemi.groundColor.setHex(0x6d1728);
+        hemi.intensity = 0.72;
+      }
+      if (nebSky) nebSky.visible = false;
+      starLayers.forEach((s) => {
+        s.visible = false;
+      });
+      this.dockingSystem?.setGhostDoors(false);
     } else {
-      sc.background = new THREE.Color(0x0a2a5e);            // nebula night
-      if (sc.fog instanceof THREE.FogExp2) { sc.fog.color.setHex(0x0d3060); sc.fog.density = 0.015; }
-      if (amb)  { amb.color.setHex(0x8899bb); amb.intensity = 0.5; }
-      if (sun)  { sun.color.setHex(0xffffff); sun.intensity = 0.9; }
-      if (hemi) { hemi.color.setHex(0xaaccff); hemi.groundColor.setHex(0x445566); hemi.intensity = 0.4; }
+      sc.background = new THREE.Color(0x0a2a5e); // nebula night
+      if (sc.fog instanceof THREE.FogExp2) {
+        sc.fog.color.setHex(0x0d3060);
+        sc.fog.density = 0.015;
+      }
+      if (amb) {
+        amb.color.setHex(0x8899bb);
+        amb.intensity = 0.5;
+      }
+      if (sun) {
+        sun.color.setHex(0xffffff);
+        sun.intensity = 0.9;
+      }
+      if (hemi) {
+        hemi.color.setHex(0xaaccff);
+        hemi.groundColor.setHex(0x445566);
+        hemi.intensity = 0.4;
+      }
       if (nebSky) nebSky.visible = true;
-      starLayers.forEach((s) => { s.visible = true; });
+      starLayers.forEach((s) => {
+        s.visible = true;
+      });
       this.dockingSystem?.setGhostDoors(false);
     }
 
     if (this.floorMat) {
       if (outdoor) {
         // Swap to a stone-tile texture (created once, cached).
-        if (!this.outdoorFloorTex) this.outdoorFloorTex = this.makeOutdoorFloorTex();
-        this.floorMat.map     = this.outdoorFloorTex;
+        if (!this.outdoorFloorTex)
+          this.outdoorFloorTex = this.makeOutdoorFloorTex();
+        this.floorMat.map = this.outdoorFloorTex;
         this.floorMat.color.setHex(0xffffff); // no tint — texture has its own palette
         this.floorMat.roughness = 0.92;
         this.floorMat.metalness = 0.0;
+      } else if (casino) {
+        if (!this.casinoFloorTex)
+          this.casinoFloorTex = this.makeCasinoFloorTex();
+        this.floorMat.map = this.casinoFloorTex;
+        this.floorMat.color.setHex(0xffffff);
+        this.floorMat.roughness = 0.48;
+        this.floorMat.metalness = 0.08;
       } else {
         // Restore original lobby wood herringbone.
-        this.floorMat.map     = this.woodTex;
+        this.floorMat.map = this.woodTex;
         this.floorMat.color.setHex(0xffffff);
         this.floorMat.roughness = 0.78;
         this.floorMat.metalness = 0.0;
@@ -867,12 +1399,65 @@ export class World {
     this.sideWalls.forEach((wall, i) => {
       wall.visible = !this.hullEditView && !this.sideWallCovered[i];
       const mat = wall.material as THREE.MeshStandardMaterial;
-      if (mat && 'color' in mat) {
-        mat.color.setHex(0xffffff);
+      if (mat && "color" in mat) {
+        mat.color.setHex(casino ? 0xffdfad : 0xffffff);
+        mat.roughness = casino ? 0.5 : 0.72;
+        mat.metalness = casino ? 0.08 : 0;
         mat.needsUpdate = true;
       }
     });
-    console.log(`🏝️ Room visuals applied: ${outdoor ? 'outdoor-casino (stone floor)' : 'lobby (wood floor)'}`);
+    const theme = outdoor
+      ? "outdoor-casino (stone floor)"
+      : casino
+        ? "casino (festival carpet)"
+        : "lobby (wood floor)";
+    console.log(`🏝️ Room visuals applied: ${theme}`);
+  }
+
+  private makeCasinoFloorTex(): THREE.Texture {
+    const size = 512;
+    const cv = document.createElement("canvas");
+    cv.width = size;
+    cv.height = size;
+    const c = cv.getContext("2d")!;
+    c.fillStyle = "#5A1018";
+    c.fillRect(0, 0, size, size);
+
+    const tile = 64;
+    for (let row = 0; row < size / tile; row++) {
+      for (let col = 0; col < size / tile; col++) {
+        const cx = col * tile + tile / 2;
+        const cy = row * tile + tile / 2;
+        c.fillStyle = (row + col) % 2 === 0 ? "#9E2633" : "#741A25";
+        c.fillRect(col * tile + 4, row * tile + 4, tile - 8, tile - 8);
+        c.fillStyle = "#D7A236";
+        c.fillRect(cx - 7, cy - 7, 14, 14);
+        c.fillStyle = "#4A9A3A";
+        c.fillRect(cx - 3, cy - 3, 6, 6);
+      }
+    }
+    c.strokeStyle = "#B77B24";
+    c.lineWidth = 4;
+    for (let p = 0; p <= size; p += tile) {
+      c.beginPath();
+      c.moveTo(p, 0);
+      c.lineTo(p, size);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(0, p);
+      c.lineTo(size, p);
+      c.stroke();
+    }
+
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(2.5, 2.5);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
   }
 
   /**
@@ -898,27 +1483,31 @@ export class World {
    * Created lazily on first outdoor entry and cached for the session.
    */
   private makeOutdoorFloorTex(): THREE.Texture {
-    const W = 512, H = 512;
-    const cv = document.createElement('canvas');
-    cv.width = W; cv.height = H;
-    const c = cv.getContext('2d')!;
+    const W = 512,
+      H = 512;
+    const cv = document.createElement("canvas");
+    cv.width = W;
+    cv.height = H;
+    const c = cv.getContext("2d")!;
 
     // 🧊 Calippo-Lido white checkerboard: fine white tiles alternating with a
     // whisper-of-blue tile, powder blue-white grout — matches the lazy-pool's
     // deck slabs (furniture.ts makePoolTileTex).
-    c.fillStyle = '#D9E8F2'; // grout
+    c.fillStyle = "#D9E8F2"; // grout
     c.fillRect(0, 0, W, H);
 
-    const TW = 40, TH = 40, G = 3; // small fine grid
+    const TW = 40,
+      TH = 40,
+      G = 3; // small fine grid
     for (let row = 0; row * (TH + G) < H; row++) {
       for (let col = 0; col * (TW + G) < W; col++) {
         const x = col * (TW + G);
         const y = row * (TH + G);
         // Checkerboard: white ↔ pale blue-white
-        c.fillStyle = (row + col) % 2 === 0 ? '#FFFFFF' : '#EDF5FB';
+        c.fillStyle = (row + col) % 2 === 0 ? "#FFFFFF" : "#EDF5FB";
         c.fillRect(x + G, y + G, TW - G, TH - G);
         // Soft highlight top-left edge
-        c.fillStyle = 'rgba(255,255,255,0.55)';
+        c.fillStyle = "rgba(255,255,255,0.55)";
         c.fillRect(x + G, y + G, TW - G, 2);
         c.fillRect(x + G, y + G, 2, TH - G);
       }
@@ -936,7 +1525,7 @@ export class World {
   }
 
   public updateNorthDoorForFireplace(): void {
-    const north = findDoor('north');
+    const north = findDoor("north");
     if (!north) return;
     // Approach zone in front of the north wall opening (opening ~1.4 wide at
     // z=-6; the zone reaches to the door's `front` stand-point at z=-4.5).
@@ -945,13 +1534,15 @@ export class World {
     const cx = north.front.x;
     const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
     const blocked = FURNITURE.some((item) => {
-      if (item.kind !== 'fireplace-wall') return false;
+      if (item.kind !== "fireplace-wall") return false;
       const fp = FURNITURE_DEFS[item.kind].footprint;
       if (!fp) return false; // footprint-less def — nothing to block with
       const w = item.rot % 2 === 0 ? fp.w : fp.d;
       const d = item.rot % 2 === 0 ? fp.d : fp.w;
-      const x0 = item.pos.x - w / 2, x1 = item.pos.x + w / 2;
-      const z0 = item.pos.z - d / 2, z1 = item.pos.z + d / 2;
+      const x0 = item.pos.x - w / 2,
+        x1 = item.pos.x + w / 2;
+      const z0 = item.pos.z - d / 2,
+        z1 = item.pos.z + d / 2;
       return x0 < zone.x1 && x1 > zone.x0 && z0 < zone.z1 && z1 > zone.z0;
     });
     north.enabled = northDoorUnlocked() || !blocked;
@@ -990,14 +1581,24 @@ export class World {
         // a doc round-trip (cross-room travel) bakes the same walkable grid
         // as a fresh boot (per-client grid drift otherwise).
         const dov = DEFAULT_FOOTPRINT_OVERRIDES[id];
-        if (dov && rec.x === dov.x && rec.z === dov.z && rec.rot === dov.rot && rec.mountParent === undefined) {
+        if (
+          dov &&
+          rec.x === dov.x &&
+          rec.z === dov.z &&
+          rec.rot === dov.rot &&
+          rec.mountParent === undefined
+        ) {
           item.footprintOverride = { ...dov.box };
         }
         FURNITURE.push(item);
         this.registerFurnitureGroup(item, /* reveal */ true);
         changedIds.add(id);
-      } else if (existing.pos.x !== rec.x || existing.pos.z !== rec.z || existing.rot !== rec.rot
-        || existing.mountParent !== rec.mountParent) {
+      } else if (
+        existing.pos.x !== rec.x ||
+        existing.pos.z !== rec.z ||
+        existing.rot !== rec.rot ||
+        existing.mountParent !== rec.mountParent
+      ) {
         this.evictAndDefocusForItem(id);
         existing.pos = { x: rec.x, z: rec.z };
         existing.rot = rec.rot;
@@ -1006,7 +1607,13 @@ export class World {
         // Moved BACK to the exact default pose, it takes the authored box
         // again (keeps every client's grid identical for default layouts).
         const mdov = DEFAULT_FOOTPRINT_OVERRIDES[id];
-        if (mdov && rec.x === mdov.x && rec.z === mdov.z && rec.rot === mdov.rot && rec.mountParent === undefined) {
+        if (
+          mdov &&
+          rec.x === mdov.x &&
+          rec.z === mdov.z &&
+          rec.rot === mdov.rot &&
+          rec.mountParent === undefined
+        ) {
           existing.footprintOverride = { ...mdov.box };
         } else if (existing.footprintOverride !== undefined) {
           delete existing.footprintOverride;
@@ -1014,7 +1621,7 @@ export class World {
         const group = this.furnitureGroups.get(id);
         if (group) {
           group.position.set(rec.x, 0, rec.z);
-          group.rotation.y = rec.rot * (Math.PI / 2);
+          group.rotation.y = furnitureVisualYaw(existing);
         }
         changedIds.add(id);
       }
@@ -1124,7 +1731,9 @@ export class World {
         disposed.add(mesh.geometry);
         mesh.geometry.dispose();
       }
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const mats = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
       for (const mat of mats) {
         if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
         disposed.add(mat);
@@ -1133,9 +1742,15 @@ export class World {
         mat.dispose();
       }
     });
-    this.furnitureMeshes = this.furnitureMeshes.filter((m) => !groupMeshes.has(m));
-    this.furnitureLights = this.furnitureLights.filter(({ light }) => !groupLights.has(light));
-    this.holoSpinners = this.holoSpinners.filter(({ mesh }) => !groupMeshes.has(mesh));
+    this.furnitureMeshes = this.furnitureMeshes.filter(
+      (m) => !groupMeshes.has(m),
+    );
+    this.furnitureLights = this.furnitureLights.filter(
+      ({ light }) => !groupLights.has(light),
+    );
+    this.holoSpinners = this.holoSpinners.filter(
+      ({ mesh }) => !groupMeshes.has(mesh),
+    );
     return true;
   }
 
@@ -1144,12 +1759,31 @@ export class World {
    * space-view windows, floating particles.
    */
   private addAtmosphereEffects() {
-    const m = (color: number, rough = 0.72, metal = 0.06, em = 0x000000, emI = 0) =>
-      new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal,
-        emissive: em, emissiveIntensity: emI, transparent: true, opacity: 0 });
+    const m = (
+      color: number,
+      rough = 0.72,
+      metal = 0.06,
+      em = 0x000000,
+      emI = 0,
+    ) =>
+      new THREE.MeshStandardMaterial({
+        color,
+        roughness: rough,
+        metalness: metal,
+        emissive: em,
+        emissiveIntensity: emI,
+        transparent: true,
+        opacity: 0,
+      });
 
-    const place = (geo: THREE.BufferGeometry, mat: THREE.Material,
-                   x: number, y: number, z: number, ry = 0): THREE.Mesh => {
+    const place = (
+      geo: THREE.BufferGeometry,
+      mat: THREE.Material,
+      x: number,
+      y: number,
+      z: number,
+      ry = 0,
+    ): THREE.Mesh => {
       const mesh = new THREE.Mesh(geo, mat);
       mesh.position.set(x, y, z);
       if (ry) mesh.rotation.y = ry;
@@ -1158,7 +1792,13 @@ export class World {
       return mesh;
     };
 
-    const addLight = (light: THREE.PointLight, x: number, y: number, z: number, ti: number) => {
+    const addLight = (
+      light: THREE.PointLight,
+      x: number,
+      y: number,
+      z: number,
+      ti: number,
+    ) => {
       light.position.set(x, y, z);
       this.platformGroup.add(light);
       this.furnitureLights.push({ light, targetIntensity: ti });
@@ -1166,22 +1806,44 @@ export class World {
 
     // ── SPACE-VIEW WINDOWS on side walls ──────────────────────────────────────
     const makeStarTex = (top: string, bot: string): THREE.CanvasTexture => {
-      const cv = document.createElement('canvas'); cv.width = 256; cv.height = 192;
-      const ctx = cv.getContext('2d')!;
+      const cv = document.createElement("canvas");
+      cv.width = 256;
+      cv.height = 192;
+      const ctx = cv.getContext("2d")!;
       const g = ctx.createLinearGradient(0, 0, 0, 192);
-      g.addColorStop(0, top); g.addColorStop(1, bot);
-      ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 192);
+      g.addColorStop(0, top);
+      g.addColorStop(1, bot);
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 256, 192);
       for (let i = 0; i < 140; i++) {
         ctx.beginPath();
-        ctx.arc(Math.random() * 256, Math.random() * 192, Math.random() * 1.3, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(255,255,255,${0.35 + Math.random() * 0.65})`; ctx.fill();
+        ctx.arc(
+          Math.random() * 256,
+          Math.random() * 192,
+          Math.random() * 1.3,
+          0,
+          Math.PI * 2,
+        );
+        ctx.fillStyle = `rgba(255,255,255,${0.35 + Math.random() * 0.65})`;
+        ctx.fill();
       }
       // Soft nebula bloom
       for (let i = 0; i < 2; i++) {
-        const gr = ctx.createRadialGradient(Math.random()*256, Math.random()*192, 4, 128, 96, 70);
-        gr.addColorStop(0, i === 0 ? 'rgba(80,170,255,0.20)' : 'rgba(255,150,70,0.14)');
-        gr.addColorStop(1, 'rgba(0,0,0,0)');
-        ctx.fillStyle = gr; ctx.fillRect(0, 0, 256, 192);
+        const gr = ctx.createRadialGradient(
+          Math.random() * 256,
+          Math.random() * 192,
+          4,
+          128,
+          96,
+          70,
+        );
+        gr.addColorStop(
+          0,
+          i === 0 ? "rgba(80,170,255,0.20)" : "rgba(255,150,70,0.14)",
+        );
+        gr.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = gr;
+        ctx.fillRect(0, 0, 256, 192);
       }
       const starTex = new THREE.CanvasTexture(cv);
       // Nearest-neighbour keeps the tiny pixel stars crisply rendered.
@@ -1193,17 +1855,30 @@ export class World {
 
     const winGeo = new THREE.PlaneGeometry(2.2, 1.65);
     const winZs = [-2.8, 0.6];
-    winZs.forEach(wz => {
+    winZs.forEach((wz) => {
       // Left wall — cool cerulean tint
-      const winL = new THREE.Mesh(winGeo.clone(),
-        new THREE.MeshBasicMaterial({ map: makeStarTex('#010d22','#041530'),
-          transparent: true, opacity: 0, side: THREE.DoubleSide })
+      const winL = new THREE.Mesh(
+        winGeo.clone(),
+        new THREE.MeshBasicMaterial({
+          map: makeStarTex("#010d22", "#041530"),
+          transparent: true,
+          opacity: 0,
+          side: THREE.DoubleSide,
+        }),
       );
-      winL.rotation.y = Math.PI / 2; winL.position.set(-5.81, 2.1, wz);
-      this.platformGroup.add(winL); this.furnitureMeshes.push(winL);
+      winL.rotation.y = Math.PI / 2;
+      winL.position.set(-5.81, 2.1, wz);
+      this.platformGroup.add(winL);
+      this.furnitureMeshes.push(winL);
       // Frame
-      place(new THREE.BoxGeometry(0.06, 1.85, 2.42), m(0x8899AA, 0.48, 0.62), -5.84, 2.1, wz);
-      addLight(new THREE.PointLight(0x3388FF, 0, 4.5), -5.5, 2.1, wz, 0.5);
+      place(
+        new THREE.BoxGeometry(0.06, 1.85, 2.42),
+        m(0x8899aa, 0.48, 0.62),
+        -5.84,
+        2.1,
+        wz,
+      );
+      addLight(new THREE.PointLight(0x3388ff, 0, 4.5), -5.5, 2.1, wz, 0.5);
 
       // Right wall removed — no paintings or frames on that side
     });
@@ -1213,35 +1888,70 @@ export class World {
     // ── AMBIENT WALL LIGHT STRIPS — glowing accents at ceiling edge ───────────
     // Thin emissive strips along the top of each side wall (z axis, y=3.9)
     const stripMat = (col: number) =>
-      new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0 });
-    place(new THREE.BoxGeometry(0.04, 0.06, 10.8), stripMat(0x2266CC), -5.76, 3.92, 0); // left  — blue
-    addLight(new THREE.PointLight(0x1155BB, 0, 14), -5.5, 3.8,  0, 0.55);
+      new THREE.MeshBasicMaterial({
+        color: col,
+        transparent: true,
+        opacity: 0,
+      });
+    place(
+      new THREE.BoxGeometry(0.04, 0.06, 10.8),
+      stripMat(0x2266cc),
+      -5.76,
+      3.92,
+      0,
+    ); // left  — blue
+    addLight(new THREE.PointLight(0x1155bb, 0, 14), -5.5, 3.8, 0, 0.55);
 
     // ── FLOATING DUST MOTES ───────────────────────────────────────────────────
     const COUNT = 220;
     this.particlePositions = new Float32Array(COUNT * 3);
     const pCols = new Float32Array(COUNT * 3);
     for (let i = 0; i < COUNT; i++) {
-      this.particlePositions[i*3]   = (Math.random() - 0.5) * 10.5;
-      this.particlePositions[i*3+1] = Math.random() * 3.8 + 0.1;
-      this.particlePositions[i*3+2] = (Math.random() - 0.5) * 10.5;
+      this.particlePositions[i * 3] = (Math.random() - 0.5) * 10.5;
+      this.particlePositions[i * 3 + 1] = Math.random() * 3.8 + 0.1;
+      this.particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 10.5;
       const rc = Math.random();
-      if      (rc < 0.38) { pCols[i*3]=0.92; pCols[i*3+1]=0.78; pCols[i*3+2]=0.38; } // gold
-      else if (rc < 0.62) { pCols[i*3]=0.25; pCols[i*3+1]=0.62; pCols[i*3+2]=1.00; } // blue
-      else if (rc < 0.80) { pCols[i*3]=0.92; pCols[i*3+1]=0.42; pCols[i*3+2]=0.35; } // rose
-      else                { pCols[i*3]=1.00; pCols[i*3+1]=0.95; pCols[i*3+2]=0.85; } // warm white
+      if (rc < 0.38) {
+        pCols[i * 3] = 0.92;
+        pCols[i * 3 + 1] = 0.78;
+        pCols[i * 3 + 2] = 0.38;
+      } // gold
+      else if (rc < 0.62) {
+        pCols[i * 3] = 0.25;
+        pCols[i * 3 + 1] = 0.62;
+        pCols[i * 3 + 2] = 1.0;
+      } // blue
+      else if (rc < 0.8) {
+        pCols[i * 3] = 0.92;
+        pCols[i * 3 + 1] = 0.42;
+        pCols[i * 3 + 2] = 0.35;
+      } // rose
+      else {
+        pCols[i * 3] = 1.0;
+        pCols[i * 3 + 1] = 0.95;
+        pCols[i * 3 + 2] = 0.85;
+      } // warm white
     }
     this.particleGeo = new THREE.BufferGeometry();
-    this.particleGeo.setAttribute('position', new THREE.BufferAttribute(this.particlePositions, 3));
-    this.particleGeo.setAttribute('color',    new THREE.BufferAttribute(pCols, 3));
+    this.particleGeo.setAttribute(
+      "position",
+      new THREE.BufferAttribute(this.particlePositions, 3),
+    );
+    this.particleGeo.setAttribute("color", new THREE.BufferAttribute(pCols, 3));
     this.particleMat = new THREE.PointsMaterial({
-      size: 1.8, sizeAttenuation: false, vertexColors: true,
-      transparent: true, opacity: 0, depthWrite: false
+      size: 1.8,
+      sizeAttenuation: false,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
     });
     (this.particleMat as THREE.PointsMaterial & { fog: boolean }).fog = false;
-    this.platformGroup.add(new THREE.Points(this.particleGeo, this.particleMat));
+    this.platformGroup.add(
+      new THREE.Points(this.particleGeo, this.particleMat),
+    );
 
-    console.log('✅ Atmosphere effects built');
+    console.log("✅ Atmosphere effects built");
   }
 
   // ── 💦 Splash bursts — one-shot water-entry particles (Lido pool) ──────────
@@ -1262,27 +1972,31 @@ export class World {
       // Seed in a small disc at the entry point.
       const seedA = Math.random() * Math.PI * 2;
       const seedR = Math.random() * 0.15;
-      positions[i*3]   = x + Math.cos(seedA) * seedR;
-      positions[i*3+1] = y;
-      positions[i*3+2] = z + Math.sin(seedA) * seedR;
+      positions[i * 3] = x + Math.cos(seedA) * seedR;
+      positions[i * 3 + 1] = y;
+      positions[i * 3 + 2] = z + Math.sin(seedA) * seedR;
       // Upward cone: random horizontal direction, strong vertical kick.
       const a = Math.random() * Math.PI * 2;
       const h = 0.3 + Math.random() * (big ? 1.4 : 0.9);
-      vel[i*3]   = Math.cos(a) * h;
-      vel[i*3+1] = 1.6 + Math.random() * 1.8;
-      vel[i*3+2] = Math.sin(a) * h;
+      vel[i * 3] = Math.cos(a) * h;
+      vel[i * 3 + 1] = 1.6 + Math.random() * 1.8;
+      vel[i * 3 + 2] = Math.sin(a) * h;
       // Cyan→white droplet mix.
       const w = Math.random();
-      colors[i*3]   = 0.55 + w * 0.35;
-      colors[i*3+1] = 0.85 + w * 0.15;
-      colors[i*3+2] = 1.0;
+      colors[i * 3] = 0.55 + w * 0.35;
+      colors[i * 3 + 1] = 0.85 + w * 0.15;
+      colors[i * 3 + 2] = 1.0;
     }
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute('color',    new THREE.BufferAttribute(colors, 3));
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     const mat = new THREE.PointsMaterial({
-      size: 2.4, sizeAttenuation: false, vertexColors: true,
-      transparent: true, opacity: 0.95, depthWrite: false,
+      size: 2.4,
+      sizeAttenuation: false,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
     });
     (mat as THREE.PointsMaterial & { fog: boolean }).fog = false;
     const points = new THREE.Points(geo, mat);
@@ -1306,10 +2020,10 @@ export class World {
       const arr = pos.array as Float32Array;
       const n = arr.length / 3;
       for (let i = 0; i < n; i++) {
-        arr[i*3]   += splash.vel[i*3]   * deltaTime;
-        arr[i*3+1] += splash.vel[i*3+1] * deltaTime;
-        arr[i*3+2] += splash.vel[i*3+2] * deltaTime;
-        splash.vel[i*3+1] -= 6.5 * deltaTime; // gravity
+        arr[i * 3] += splash.vel[i * 3] * deltaTime;
+        arr[i * 3 + 1] += splash.vel[i * 3 + 1] * deltaTime;
+        arr[i * 3 + 2] += splash.vel[i * 3 + 2] * deltaTime;
+        splash.vel[i * 3 + 1] -= 6.5 * deltaTime; // gravity
       }
       pos.needsUpdate = true;
       splash.mat.opacity = 0.95 * (1 - splash.age / splash.life);
@@ -1329,11 +2043,12 @@ export class World {
     roomEdit.forceExit();
     // #51: paired-door vestibules belong to the docking system being rebuilt
     // by createPlatform — dispose them all (clears the transit latch too).
-    for (const doorId of [...this.pairedVestibules.keys()]) this.disposeVestibule(doorId);
+    for (const doorId of [...this.pairedVestibules.keys()])
+      this.disposeVestibule(doorId);
     this.isMorphing = true;
     this.morphProgress = 0;
     this.createPlatform();
-    console.log('🔄 Morphing station planet into platform...');
+    console.log("🔄 Morphing station planet into platform...");
   }
 
   /**
@@ -1342,20 +2057,20 @@ export class World {
   private addCornerMarkers() {
     const markerGeometry = new THREE.CylinderGeometry(0.08, 0.08, 0.4, 8);
     const markerMaterial = new THREE.MeshStandardMaterial({
-      color: 0xFFAA22,
-      emissive: 0xFFAA22,
+      color: 0xffaa22,
+      emissive: 0xffaa22,
       emissiveIntensity: 0.9,
       metalness: 0.8,
       roughness: 0.2,
       transparent: true,
-      opacity: 0
+      opacity: 0,
     });
 
     const positions = [
       [-5.5, 0.2, -5.5],
       [5.5, 0.2, -5.5],
       [-5.5, 0.2, 5.5],
-      [5.5, 0.2, 5.5]
+      [5.5, 0.2, 5.5],
     ];
 
     positions.forEach(([x, y, z]) => {
@@ -1364,7 +2079,7 @@ export class World {
       this.platformGroup.add(marker);
       this.platformElements.push(marker);
 
-      const cornerLight = new THREE.PointLight(0xFFAA22, 0, 5);
+      const cornerLight = new THREE.PointLight(0xffaa22, 0, 5);
       cornerLight.position.set(x, y, z);
       this.platformGroup.add(cornerLight);
       this.platformElements.push(cornerLight);
@@ -1376,9 +2091,9 @@ export class World {
    */
   private addPlatformEdgeLights() {
     const edgeMaterial = new THREE.MeshBasicMaterial({
-      color: 0x1E88E5,
+      color: 0x1e88e5,
       transparent: true,
-      opacity: 0
+      opacity: 0,
     });
 
     const edgeGeometry = new THREE.BoxGeometry(12, 0.05, 0.1);
@@ -1413,7 +2128,7 @@ export class World {
       this.isMorphing = false;
       this.player.mesh.visible = true;
       this.platformGroup.position.set(0, 0, 0);
-      console.log('✅ Morph complete - Platform active');
+      console.log("✅ Morph complete - Platform active");
       // 🧬 Diegetic boot spawn: if this room has a clone vat, the fresh
       // avatar materialises INSIDE it (held, tank full) and the reveal cycle
       // is deferred until the player actually looks at the room (update()'s
@@ -1441,8 +2156,10 @@ export class World {
     if (this.stationPlanet) {
       const scale = 1 - eased;
       this.stationPlanet.scale.setScalar(scale);
-      (this.stationPlanet.material as THREE.MeshStandardMaterial).opacity = scale;
-      (this.stationPlanet.material as THREE.MeshStandardMaterial).transparent = true;
+      (this.stationPlanet.material as THREE.MeshStandardMaterial).opacity =
+        scale;
+      (this.stationPlanet.material as THREE.MeshStandardMaterial).transparent =
+        true;
       if (this.morphProgress >= 1) {
         this.platformGroup.remove(this.stationPlanet);
         this.stationPlanet = null;
@@ -1453,7 +2170,8 @@ export class World {
 
     // Fade in platform floor
     if (this.platformFloor) {
-      (this.platformFloor.material as THREE.MeshStandardMaterial).opacity = eased * 0.9;
+      (this.platformFloor.material as THREE.MeshStandardMaterial).opacity =
+        eased * 0.9;
     }
 
     // The platform grid is an EDIT-MODE affordance (E2 of #25) — it no
@@ -1461,10 +2179,12 @@ export class World {
     // (It sat under the near-opaque wooden floor anyway.)
 
     // Fade in all platform elements
-    this.platformElements.forEach(element => {
+    this.platformElements.forEach((element) => {
       if (element instanceof THREE.Mesh && element.material) {
-        const material = element.material as THREE.MeshStandardMaterial | THREE.MeshBasicMaterial;
-        if ('opacity' in material) {
+        const material = element.material as
+          | THREE.MeshStandardMaterial
+          | THREE.MeshBasicMaterial;
+        if ("opacity" in material) {
           material.opacity = eased * 0.6;
         }
       } else if (element instanceof THREE.PointLight) {
@@ -1473,16 +2193,19 @@ export class World {
     });
 
     // Fade in side walls — semi-transparent glass feel
-    this.sideWalls.forEach(wall => {
+    this.sideWalls.forEach((wall) => {
       (wall.material as THREE.MeshStandardMaterial).opacity = eased * 0.35;
     });
 
     // Fade in furniture to its design opacity — materials declaring a
     // userData.baseOpacity (the map table's translucent holo disc/ring, M4)
     // fade toward that instead of 1.0 (same contract as zoom.ts's avatar fade).
-    this.furnitureMeshes.forEach(mesh => {
-      const mat = mesh.material as THREE.MeshStandardMaterial | THREE.MeshBasicMaterial;
-      if ('opacity' in mat) mat.opacity = eased * ((mat.userData.baseOpacity as number) ?? 1);
+    this.furnitureMeshes.forEach((mesh) => {
+      const mat = mesh.material as
+        | THREE.MeshStandardMaterial
+        | THREE.MeshBasicMaterial;
+      if ("opacity" in mat)
+        mat.opacity = eased * ((mat.userData.baseOpacity as number) ?? 1);
     });
 
     // Fade in lobby point lights
@@ -1491,7 +2214,7 @@ export class World {
     });
 
     // Fade in floating particles
-    if (this.particleMat) this.particleMat.opacity = eased * 0.70;
+    if (this.particleMat) this.particleMat.opacity = eased * 0.7;
   }
 
   /**
@@ -1504,7 +2227,11 @@ export class World {
 
     // Retrieve active zoom level to adjust interior vs exterior capsule visibility selectively (Level 3 optimization)
     const zoomView = (window as any).multiScaleZoom;
-    const zoomLevel = zoomView ? (typeof zoomView.getLevel === 'function' ? zoomView.getLevel() : 2) : 2;
+    const zoomLevel = zoomView
+      ? typeof zoomView.getLevel === "function"
+        ? zoomView.getLevel()
+        : 2
+      : 2;
 
     // 🧬 Deferred boot spawn: run the vat reveal the first frame the player
     // actually sees the room interior (zoom ≤ 2) — queued at morph-complete.
@@ -1515,7 +2242,10 @@ export class World {
     if (this.pendingVatSpawn && !this.isMorphing) {
       if (zoomLevel >= 3) this.vatSawExterior = true;
       this.pendingVatSpawnGrace -= deltaTime;
-      if ((this.vatSawExterior || this.pendingVatSpawnGrace <= 0) && zoomLevel <= 2) {
+      if (
+        (this.vatSawExterior || this.pendingVatSpawnGrace <= 0) &&
+        zoomLevel <= 2
+      ) {
         this.pendingVatSpawn = false;
         this.respawnAtVat();
       }
@@ -1523,12 +2253,12 @@ export class World {
 
     if (zoomLevel >= 3) {
       // Hide interior furniture so it is not visible through walls or wastes render power
-      this.furnitureMeshes.forEach(mesh => {
+      this.furnitureMeshes.forEach((mesh) => {
         mesh.visible = false;
       });
       // Hide side walls & flooring (which is cut off by the capsule envelope)
       if (this.platformFloor) this.platformFloor.visible = false;
-      this.sideWalls.forEach(wall => {
+      this.sideWalls.forEach((wall) => {
         wall.visible = false;
       });
 
@@ -1537,14 +2267,19 @@ export class World {
         if (this.capsuleRoof) {
           this.capsuleRoof.visible = true;
           // Apply a matte structural slate gray style to represent a simplified silhouette unit
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).color.setHex(0x1B2835);
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).roughness = 0.9;
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).metalness = 0.1;
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).opacity = 1.0;
+          (
+            this.capsuleRoof.material as THREE.MeshStandardMaterial
+          ).color.setHex(0x1b2835);
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).roughness =
+            0.9;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).metalness =
+            0.1;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).opacity =
+            1.0;
         }
-        this.capsuleOuterWalls.forEach(wall => {
+        this.capsuleOuterWalls.forEach((wall) => {
           wall.visible = true;
-          (wall.material as THREE.MeshStandardMaterial).color.setHex(0x1B2835);
+          (wall.material as THREE.MeshStandardMaterial).color.setHex(0x1b2835);
           (wall.material as THREE.MeshStandardMaterial).roughness = 0.9;
           (wall.material as THREE.MeshStandardMaterial).metalness = 0.1;
           (wall.material as THREE.MeshStandardMaterial).opacity = 1.0;
@@ -1553,14 +2288,19 @@ export class World {
         // Level 3 (Outside Room) uses the high-fidelity metal capsule texture mapping
         if (this.capsuleRoof) {
           this.capsuleRoof.visible = true;
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).color.setHex(0x2A3E52);
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).roughness = 0.4;
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).metalness = 0.8;
-          (this.capsuleRoof.material as THREE.MeshStandardMaterial).opacity = 1.0;
+          (
+            this.capsuleRoof.material as THREE.MeshStandardMaterial
+          ).color.setHex(0x2a3e52);
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).roughness =
+            0.4;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).metalness =
+            0.8;
+          (this.capsuleRoof.material as THREE.MeshStandardMaterial).opacity =
+            1.0;
         }
-        this.capsuleOuterWalls.forEach(wall => {
+        this.capsuleOuterWalls.forEach((wall) => {
           wall.visible = true;
-          (wall.material as THREE.MeshStandardMaterial).color.setHex(0x2A3E52);
+          (wall.material as THREE.MeshStandardMaterial).color.setHex(0x2a3e52);
           (wall.material as THREE.MeshStandardMaterial).roughness = 0.4;
           (wall.material as THREE.MeshStandardMaterial).metalness = 0.8;
           (wall.material as THREE.MeshStandardMaterial).opacity = 1.0;
@@ -1568,7 +2308,7 @@ export class World {
       }
     } else {
       // Restore interior rendering when playing inside levels <= 2 (Room / First-Person)
-      this.furnitureMeshes.forEach(mesh => {
+      this.furnitureMeshes.forEach((mesh) => {
         mesh.visible = true;
       });
       // 🏊 Outdoor pool room: the floor stays hidden (the lazy-pool's deck
@@ -1585,7 +2325,7 @@ export class World {
       if (this.capsuleRoof) {
         this.capsuleRoof.visible = false;
       }
-      this.capsuleOuterWalls.forEach(wall => {
+      this.capsuleOuterWalls.forEach((wall) => {
         wall.visible = false;
       });
     }
@@ -1613,8 +2353,15 @@ export class World {
       // live (zoom 2–4 — visually it only matters at 2), never during the
       // morph, first person (level 1) or a device-focus camera.
       const fadeEnabled =
-        !this.isMorphing && zoomLevel >= 2 && zoomLevel <= 4 && !deviceFocus.isActive();
-      this.dockingSystem.updateFacingFade(deltaTime, fadeEnabled, this.player.getActiveDoorId());
+        !this.isMorphing &&
+        zoomLevel >= 2 &&
+        zoomLevel <= 4 &&
+        !deviceFocus.isActive();
+      this.dockingSystem.updateFacingFade(
+        deltaTime,
+        fadeEnabled,
+        this.player.getActiveDoorId(),
+      );
     }
 
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
@@ -1656,14 +2403,16 @@ export class World {
     if (this.particlePositions && this.particleGeo) {
       const n = this.particlePositions.length / 3;
       for (let i = 0; i < n; i++) {
-        this.particlePositions[i*3+1] += deltaTime * 0.09;
-        if (this.particlePositions[i*3+1] > 4.0) {
-          this.particlePositions[i*3+1] = 0.05;
-          this.particlePositions[i*3]   = (Math.random() - 0.5) * 10.5;
-          this.particlePositions[i*3+2] = (Math.random() - 0.5) * 10.5;
+        this.particlePositions[i * 3 + 1] += deltaTime * 0.09;
+        if (this.particlePositions[i * 3 + 1] > 4.0) {
+          this.particlePositions[i * 3 + 1] = 0.05;
+          this.particlePositions[i * 3] = (Math.random() - 0.5) * 10.5;
+          this.particlePositions[i * 3 + 2] = (Math.random() - 0.5) * 10.5;
         }
       }
-      (this.particleGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+      (
+        this.particleGeo.attributes.position as THREE.BufferAttribute
+      ).needsUpdate = true;
     }
 
     // 💦 Advance/cull one-shot splash bursts
@@ -1705,7 +2454,9 @@ export class World {
     rig.masterGroup.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
       if (!mesh.isMesh) return;
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const mats = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
       for (const mat of mats) {
         if (!mat || mat === OUTLINE_MAT || seen.has(mat)) continue;
         seen.add(mat);
@@ -1737,11 +2488,15 @@ export class World {
     // elevated/swim bits stay as fallbacks for a transiently out-of-sync
     // seat list (e.g. furniture doc still loading on this end).
     const seatHere = seated
-      ? SEATS.find(s => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35) ?? null
+      ? (SEATS.find((s) => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35) ?? null)
       : null;
-    const elevY = seatHere ? seatHere.sitY
-      : swimming ? POOL_SWIM_Y
-      : elevated ? BUNK_TOP_Y : 0;
+    const elevY = seatHere
+      ? seatHere.sitY
+      : swimming
+        ? POOL_SWIM_Y
+        : elevated
+          ? BUNK_TOP_Y
+          : 0;
     const avatar = this.remotePlayers.get(id);
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
@@ -1756,8 +2511,10 @@ export class World {
       this.applyPeerTint(rig, id);
       this.remotePlayers.set(id, {
         rig,
-        targetX: x, targetZ: z,
-        lastX: x, lastZ: z,
+        targetX: x,
+        targetZ: z,
+        lastX: x,
+        lastZ: z,
         moving,
         seated,
         facing,
@@ -1815,7 +2572,11 @@ export class World {
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.
       // 🏊 A free-swimming peer (bit4 WITHOUT bit1) floats at POOL_SWIM_Y.
-      pos.y = THREE.MathUtils.lerp(pos.y, avatar.seated ? avatar.elevY : avatar.swimming ? POOL_SWIM_Y : 0, factor);
+      pos.y = THREE.MathUtils.lerp(
+        pos.y,
+        avatar.seated ? avatar.elevY : avatar.swimming ? POOL_SWIM_Y : 0,
+        factor,
+      );
 
       // 🏊‍♂️ Mid dive arc (flags bit5): x/z keep following the sender's 20 Hz
       // samples via the normal lerp above; y is replayed locally with the SAME
@@ -1824,9 +2585,11 @@ export class World {
       if (avatar.diving) {
         avatar.diveAge = (avatar.diveAge ?? 0) + deltaTime;
         const t = Math.min(1, avatar.diveAge / DIVE_TIME);
-        pos.y = avatar.diveStartY + (POOL_SWIM_Y - avatar.diveStartY) * t * t
-              + DIVE_ARC_LIFT * 4 * t * (1 - t);
-        avatar.rig.setState('dive', avatar.facing);
+        pos.y =
+          avatar.diveStartY +
+          (POOL_SWIM_Y - avatar.diveStartY) * t * t +
+          DIVE_ARC_LIFT * 4 * t * (1 - t);
+        avatar.rig.setState("dive", avatar.facing);
         avatar.rig.update();
         continue;
       }
@@ -1840,13 +2603,17 @@ export class World {
       // 🏊 A swimming peer (flags bit4) renders the 'swim' pose at POOL_SWIM_Y.
       if (avatar.seated) {
         avatar.rig.setState(
-          avatar.swimming ? 'swim' : avatar.lying ? 'sleep' : 'sit_chair',
-          avatar.facing);
+          avatar.swimming ? "swim" : avatar.lying ? "sleep" : "sit_chair",
+          avatar.facing,
+        );
         avatar.rig.update();
         continue;
       }
 
-      const remaining = Math.hypot(avatar.targetX - pos.x, avatar.targetZ - pos.z);
+      const remaining = Math.hypot(
+        avatar.targetX - pos.x,
+        avatar.targetZ - pos.z,
+      );
       const moving = avatar.moving || remaining > 0.05;
 
       const dx = pos.x - avatar.lastX;
@@ -1856,7 +2623,10 @@ export class World {
       }
 
       // 🏊 Free-swimming peers paddle in place / glide — never 'walk' on water.
-      avatar.rig.setState(avatar.swimming ? 'swim' : moving ? 'walk' : 'idle', avatar.heading);
+      avatar.rig.setState(
+        avatar.swimming ? "swim" : moving ? "walk" : "idle",
+        avatar.heading,
+      );
       avatar.rig.update(); // exactly once per frame per rig (per-instance clock)
     }
   }
@@ -1875,7 +2645,11 @@ export class World {
 
   /** 💬 Chat bubbles: live snapshot of every remote avatar's rendered position
    *  (keyed by lane-derived peer id — the bubble anchor). */
-  public getRemoteAvatarSnapshots(): Array<{ id: string; x: number; z: number }> {
+  public getRemoteAvatarSnapshots(): Array<{
+    id: string;
+    x: number;
+    z: number;
+  }> {
     const out: Array<{ id: string; x: number; z: number }> = [];
     for (const [id, avatar] of this.remotePlayers) {
       const pos = avatar.rig.masterGroup.position;
@@ -1902,7 +2676,9 @@ export class World {
         disposed.add(mesh.geometry);
         mesh.geometry.dispose();
       }
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const mats = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
       for (const mat of mats) {
         if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
         disposed.add(mat);
@@ -1977,7 +2753,7 @@ export class World {
     if (!door || !this.isPlayerActive() || !this.dockingSystem) return;
 
     if (!door.enabled) {
-      showHint('This port is blocked by the hearth.');
+      showHint("This port is blocked by the hearth.");
       return;
     }
 
@@ -1985,9 +2761,11 @@ export class World {
     // before any walk choreography starts.
     if (!this.dockingSystem.canPass(door.id)) {
       const pol = readDoorPolicy(door.id);
-      showHint(pol.passage === 'public' && pol.oneWay === 'in'
-        ? 'ONE-WAY door — travelers may only come IN through it (the owner passes freely).'
-        : 'This door\'s passage is restricted by the room owner.');
+      showHint(
+        pol.passage === "public" && pol.oneWay === "in"
+          ? "ONE-WAY door — travelers may only come IN through it (the owner passes freely)."
+          : "This door's passage is restricted by the room owner.",
+      );
       return;
     }
 
@@ -1999,19 +2777,21 @@ export class World {
     // approach axis) instead of giving up. Large doors' wall-hugging fronts
     // rarely need this; now neither kind ever no-ops.
     const walkableDoor = ((): DoorTarget => {
-      const r = worldToRow(door.front.z), c = worldToCol(door.front.x);
+      const r = worldToRow(door.front.z),
+        c = worldToCol(door.front.x);
       if (walkable[r]?.[c]) return door;
       let best: { x: number; z: number; d: number } | null = null;
       for (let dr = -3; dr <= 3; dr++) {
         for (let dc = -3; dc <= 3; dc++) {
           if (!walkable[r + dr]?.[c + dc]) continue;
-          const wx = colToWorld(c + dc), wz = rowToWorld(r + dr);
+          const wx = colToWorld(c + dc),
+            wz = rowToWorld(r + dr);
           const d = Math.hypot(wx - door.front.x, wz - door.front.z);
           if (d <= 1.6 && (!best || d < best.d)) best = { x: wx, z: wz, d };
         }
       }
       if (!best) {
-        showHint('The doorway is blocked by furniture.');
+        showHint("The doorway is blocked by furniture.");
         return door; // let the old behavior stand as the final fallback
       }
       return { ...door, front: { x: best.x, z: best.z } };
@@ -2025,14 +2805,16 @@ export class World {
     const transitReady = () => {
       if (this.isTransitBusy && this.isTransitBusy()) return false;
       const state = ds.getDockingState(door.id);
-      return !!(state && state.pairedSuccessfully && state.connectedRoomAddress)
-        && this.onAdapterTransit !== null;
+      return (
+        !!(state && state.pairedSuccessfully && state.connectedRoomAddress) &&
+        this.onAdapterTransit !== null
+      );
     };
     this.player.navigateToDoor(walkableDoor, {
       requestOpen: (onOpened) => {
         const state = ds.getDockingState(door.id);
         if (state && state.locked) {
-          showHint('Docking port is LOCKED. Use the keypad.');
+          showHint("Docking port is LOCKED. Use the keypad.");
           return false;
         }
         ds.openDoor(door.id, onOpened);
@@ -2046,7 +2828,7 @@ export class World {
             ? `Dock seal engaged at ${door.id.toUpperCase()} — cycling airlock…`
             : state && state.pairedSuccessfully
               ? `Docked room detected at ${door.id.toUpperCase()} — transit coming soon.`
-              : 'No room docked at this port — heading back.',
+              : "No room docked at this port — heading back.",
         );
       },
       // ── T1 adapter transit branch (consulted at the THROUGH completion) ──
@@ -2064,7 +2846,7 @@ export class World {
       // Avatar reached the vestibule hold point — run the swap (main.ts).
       onAdapterHold: () => {
         const state = ds.getDockingState(door.id);
-        const seed = state?.connectedRoomAddress ?? '';
+        const seed = state?.connectedRoomAddress ?? "";
         this.onAdapterTransit?.(seed, door.id);
       },
     });
@@ -2086,9 +2868,10 @@ export class World {
    *  otherwise. The geometry key on userData drives rebuild-on-diff. */
   private buildDoorConnector(doorId: DoorId): THREE.Group {
     const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
-    const group = segments && segments.length > 0
-      ? buildConnectorChain(doorId, segments)
-      : buildVestibule(doorId);
+    const group =
+      segments && segments.length > 0
+        ? buildConnectorChain(doorId, segments)
+        : buildVestibule(doorId);
     group.userData.segmentsKey = JSON.stringify(segments ?? null);
     return group;
   }
@@ -2101,7 +2884,7 @@ export class World {
       this.platformGroup.add(vestibule);
       this.pairedVestibules.set(doorId, vestibule);
     }
-    setVestibuleLightState(vestibule, 'cycling');
+    setVestibuleLightState(vestibule, "cycling");
     this.transitVestibuleDoorId = doorId;
   }
 
@@ -2115,7 +2898,7 @@ export class World {
     this.transitVestibuleDoorId = null;
     if (!doorId) return;
     const vestibule = this.pairedVestibules.get(doorId);
-    if (vestibule) setVestibuleLightState(vestibule, 'idle');
+    if (vestibule) setVestibuleLightState(vestibule, "idle");
   }
 
   /** Remove and dispose one paired-door vestibule (geometries + materials). */
@@ -2123,7 +2906,8 @@ export class World {
     const vestibule = this.pairedVestibules.get(doorId);
     if (!vestibule) return;
     this.pairedVestibules.delete(doorId);
-    if (this.transitVestibuleDoorId === doorId) this.transitVestibuleDoorId = null;
+    if (this.transitVestibuleDoorId === doorId)
+      this.transitVestibuleDoorId = null;
     vestibule.parent?.remove(vestibule);
     const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
     vestibule.traverse((obj) => {
@@ -2133,7 +2917,9 @@ export class World {
         disposed.add(mesh.geometry);
         mesh.geometry.dispose();
       }
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const mats = Array.isArray(mesh.material)
+        ? mesh.material
+        : [mesh.material];
       for (const mat of mats) {
         if (!mat || disposed.has(mat)) continue;
         disposed.add(mat);
@@ -2189,17 +2975,28 @@ export class World {
     let inAnyAperture = false;
     for (const door of DOORS) {
       // Aperture frame: lateral offset along the wall vs distance INTO it.
-      const northSouth = door.id === 'north' || door.id === 'south';
-      const lateral = Math.abs(northSouth ? p.x - door.front.x : p.z - door.front.z);
+      const northSouth = door.id === "north" || door.id === "south";
+      const lateral = Math.abs(
+        northSouth ? p.x - door.front.x : p.z - door.front.z,
+      );
       const wallCoord = Math.abs(northSouth ? p.z : p.x);
       const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
 
       const state = ds.getDockingState(door.id);
-      const paired = !!(state && state.pairedSuccessfully && state.connectedRoomAddress);
+      const paired = !!(
+        state &&
+        state.pairedSuccessfully &&
+        state.connectedRoomAddress
+      );
       const passable = door.enabled && !state?.locked && ds.canPass(door.id);
 
       // Slide open on approach; slide shut once the player retreats.
-      if (paired && passable && approachDist < 2.2 && !this.fpAutoOpened.has(door.id)) {
+      if (
+        paired &&
+        passable &&
+        approachDist < 2.2 &&
+        !this.fpAutoOpened.has(door.id)
+      ) {
         ds.openDoor(door.id);
         this.fpAutoOpened.add(door.id);
       } else if (this.fpAutoOpened.has(door.id) && approachDist > 3.0) {
@@ -2212,11 +3009,13 @@ export class World {
       const inAperture = lateral < 0.95 && wallCoord > 5.15;
       if (inAperture) inAnyAperture = true;
       if (
-        inAperture && paired && passable
-        && this.fpTransitArmed
-        && now > this.fpArrivalCooldownUntil
-        && !(this.isTransitBusy && this.isTransitBusy())
-        && this.onAdapterTransit !== null
+        inAperture &&
+        paired &&
+        passable &&
+        this.fpTransitArmed &&
+        now > this.fpArrivalCooldownUntil &&
+        !(this.isTransitBusy && this.isTransitBusy()) &&
+        this.onAdapterTransit !== null
       ) {
         this.fpTransitArmed = false; // step clear to re-arm
         deviceFocus.forceRelease();
@@ -2248,7 +3047,11 @@ export class World {
         // this door — mid-PEEK the avatar physically stands in the gangway,
         // and an unpair must not pop the tube out around them (review L1;
         // mirrors the activeDoorId exemption in the opacity branch below).
-        if (vestibule && this.transitVestibuleDoorId !== door.id && activeDoorId !== door.id) {
+        if (
+          vestibule &&
+          this.transitVestibuleDoorId !== door.id &&
+          activeDoorId !== door.id
+        ) {
           this.disposeVestibule(door.id);
         }
         continue;
@@ -2260,8 +3063,10 @@ export class World {
       // the door sequence ends picks the rebuild up).
       const wantKey = JSON.stringify(state?.segments ?? null);
       if (
-        vestibule && vestibule.userData.segmentsKey !== wantKey &&
-        this.transitVestibuleDoorId !== door.id && activeDoorId !== door.id
+        vestibule &&
+        vestibule.userData.segmentsKey !== wantKey &&
+        this.transitVestibuleDoorId !== door.id &&
+        activeDoorId !== door.id
       ) {
         this.disposeVestibule(door.id);
         vestibule = undefined;
@@ -2282,12 +3087,23 @@ export class World {
       let target: number;
       if (ghost) {
         target = 0.35; // #62 P4: armed-but-unpaired chain — fixed ghost preview
-      } else if (this.transitVestibuleDoorId === door.id || activeDoorId === door.id) {
+      } else if (
+        this.transitVestibuleDoorId === door.id ||
+        activeDoorId === door.id
+      ) {
         target = 1.0; // transit / walk-through in progress — fully material
       } else {
-        const dist = Math.hypot(playerPos.x - door.front.x, playerPos.z - door.front.z);
-        const t = THREE.MathUtils.clamp(1 - dist / World.VESTIBULE_FADE_RANGE, 0, 1);
-        target = World.VESTIBULE_BASE_OPACITY + t * (1 - World.VESTIBULE_BASE_OPACITY);
+        const dist = Math.hypot(
+          playerPos.x - door.front.x,
+          playerPos.z - door.front.z,
+        );
+        const t = THREE.MathUtils.clamp(
+          1 - dist / World.VESTIBULE_FADE_RANGE,
+          0,
+          1,
+        );
+        target =
+          World.VESTIBULE_BASE_OPACITY + t * (1 - World.VESTIBULE_BASE_OPACITY);
       }
 
       const current = (vestibule.userData.opacity as number) ?? 0;
@@ -2306,7 +3122,11 @@ export class World {
    * falls back to EAST (the canonical large door). East/west departures can
    * never hit the fallback.
    */
-  public resolveArrivalDoor(departureDoorId: DoorId, farDoor?: DoorId, fromRoomId?: string): DoorTarget {
+  public resolveArrivalDoor(
+    departureDoorId: DoorId,
+    farDoor?: DoorId,
+    fromRoomId?: string,
+  ): DoorTarget {
     // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
     // records — the door whose pairing points BACK at the room we came from.
     // This survives every other keypad/vestibule change on either side: a
@@ -2336,11 +3156,14 @@ export class World {
       if (preferred && preferred.enabled) return preferred;
     }
     const opposite: Record<DoorId, DoorId> = {
-      north: 'south', south: 'north', east: 'west', west: 'east',
+      north: "south",
+      south: "north",
+      east: "west",
+      west: "east",
     };
     const candidate = findDoor(opposite[departureDoorId]);
     if (candidate && candidate.enabled) return candidate;
-    return findDoor('east')!; // north is the only disabled door; east always exists
+    return findDoor("east")!; // north is the only disabled door; east always exists
   }
 
   /**
@@ -2349,7 +3172,11 @@ export class World {
    * (vestibule back to 'idle' — it persists while its door stays paired,
    * #51) and script the walk-in through the arrival door.
    */
-  public completeAdapterArrival(departureDoorId: DoorId, farDoor?: DoorId, fromRoomId?: string): void {
+  public completeAdapterArrival(
+    departureDoorId: DoorId,
+    farDoor?: DoorId,
+    fromRoomId?: string,
+  ): void {
     this.endTransitVestibule();
     // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
     // its aperture — grace period + disarm so the return leg needs a real,
@@ -2360,7 +3187,11 @@ export class World {
     // 🔗 The arrival room's own back-pointing record picks the door (see
     // resolveArrivalDoor); the record's farDoor and the opposite-cardinal
     // guess are fallbacks only.
-    const arrival = this.resolveArrivalDoor(departureDoorId, farDoor, fromRoomId);
+    const arrival = this.resolveArrivalDoor(
+      departureDoorId,
+      farDoor,
+      fromRoomId,
+    );
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
     // arrivals — the traveler walks in, gets the hint, and is walked right
     // back out (the return departure is exactly what OUT permits). The
@@ -2368,10 +3199,16 @@ export class World {
     // arrival room's truth. One-shot guard: opposing one-way doors bounce a
     // traveler AT MOST once — never a ping-pong.
     const pol = readDoorPolicy(arrival.id);
-    const bounce = pol.passage === 'public' && pol.oneWay === 'out'
-      && !canEditRoom().ok && !this.oneWayBounceGuard;
+    const bounce =
+      pol.passage === "public" &&
+      pol.oneWay === "out" &&
+      !canEditRoom().ok &&
+      !this.oneWayBounceGuard;
     this.oneWayBounceGuard = false;
-    this.player.enterFromDoor(arrival, this._makeArrivalHooks(arrival, false, bounce ? arrival.id : undefined));
+    this.player.enterFromDoor(
+      arrival,
+      this._makeArrivalHooks(arrival, false, bounce ? arrival.id : undefined),
+    );
   }
 
   /** 🚪↦ True while the CURRENT transit is a turnstile bounce — the arrival
@@ -2415,9 +3252,12 @@ export class World {
    */
   public failAdapterTransit(departureDoorId: DoorId): void {
     const vestibule = this.pairedVestibules.get(departureDoorId);
-    if (vestibule) setVestibuleLightState(vestibule, 'fault');
+    if (vestibule) setVestibuleLightState(vestibule, "fault");
     const door = findDoor(departureDoorId);
-    if (!door) { this.endTransitVestibule(); return; }
+    if (!door) {
+      this.endTransitVestibule();
+      return;
+    }
     this.player.enterFromDoor(
       door,
       this._makeArrivalHooks(door, /* endTransitOnClose */ true),
@@ -2430,11 +3270,18 @@ export class World {
    * purpose: the walk-in is the only way back INTO a room — denying it would
    * strand the avatar outside the walls.
    */
-  private _makeArrivalHooks(door: DoorTarget, endTransitOnClose = false, bounceOutDoorId?: string): DoorSequenceHooks {
+  private _makeArrivalHooks(
+    door: DoorTarget,
+    endTransitOnClose = false,
+    bounceOutDoorId?: string,
+  ): DoorSequenceHooks {
     const ds = this.dockingSystem;
     return {
       requestOpen: (onOpened) => {
-        if (!ds) { onOpened(); return true; }
+        if (!ds) {
+          onOpened();
+          return true;
+        }
         ds.openDoor(door.id, onOpened);
         return true;
       },
@@ -2446,12 +3293,17 @@ export class World {
         // permits the departure). Deferred a beat so the arrival sequence
         // finishes cleanly before the reverse one starts.
         if (bounceOutDoorId) {
-          showHint('⛔ ONE-WAY door — guests may only travel OUT through it. Sending you back…', 4000);
+          showHint(
+            "⛔ ONE-WAY door — guests may only travel OUT through it. Sending you back…",
+            4000,
+          );
           this.oneWayBounceGuard = true;
           setTimeout(() => this.requestDoorWalkthrough(bounceOutDoorId), 900);
         }
       },
-      onThrough: () => { /* arrival leg never re-crosses outward */ },
+      onThrough: () => {
+        /* arrival leg never re-crosses outward */
+      },
     };
   }
 
@@ -2465,7 +3317,7 @@ export class World {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
 
-    if (device.kind === 'roomTerminal') {
+    if (device.kind === "roomTerminal") {
       const screen = this.wallScreens.get(deviceId) ?? null;
       const ui = createRoomTerminalUI({
         dockingSystem: this.dockingSystem,
@@ -2480,21 +3332,24 @@ export class World {
           request: () => deviceFocus.releaseThen(() => roomEdit.enter(this)),
           // 🛰️ Same machinery, hull presentation — camera pulls back and the
           // walls drop so the OUTSIDE is visible and clickable.
-          requestHull: () => deviceFocus.releaseThen(() => roomEdit.enter(this, 'hull')),
+          requestHull: () =>
+            deviceFocus.releaseThen(() => roomEdit.enter(this, "hull")),
         },
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 
-    if (device.kind === 'mapTable') {
+    if (device.kind === "mapTable") {
       // M4: the solar map, diegetic — mounted inside the focus overlay.
-      const ui = createMapTableUI({ requestRelease: () => deviceFocus.release() });
+      const ui = createMapTableUI({
+        requestRelease: () => deviceFocus.release(),
+      });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 
-    if (device.kind === 'storageTrunk') {
+    if (device.kind === "storageTrunk") {
       const ui = createStorageTrunkUI({
         itemId: deviceId,
         roomId: World.activeRoomId(),
@@ -2507,16 +3362,16 @@ export class World {
       const lid = this.trunkLids.get(deviceId);
       const target: DeviceTarget = lid
         ? {
-          ...device,
-          prepare: (onReady) => lid.openLid(onReady),
-          onRelease: () => lid.closeLid(),
-        }
+            ...device,
+            prepare: (onReady) => lid.openLid(onReady),
+            onRelease: () => lid.closeLid(),
+          }
         : device;
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 
-    if (device.kind === 'gameTable') {
+    if (device.kind === "gameTable") {
       // #45 v1: flippable surface + doc-synced checkers. The flip is a UI
       // affordance (button), not focus choreography — no prepare hook; the
       // top handle simply rides along so FLIP can drive the tween.
@@ -2528,14 +3383,14 @@ export class World {
       return;
     }
 
-    if (device.kind === 'helm') {
+    if (device.kind === "helm") {
       // 🚀 #30 SH1: ship-status readout (flight controls come with the
       // flight slices — the panel says so).
       deviceFocus.beginFocus(this.player, device, createHelmUI());
       return;
     }
 
-    if (device.kind === 'cloneVat') {
+    if (device.kind === "cloneVat") {
       // 🧬 The spawn-point picker: local preference per room (spawnPoint.ts).
       // The decant choreography itself stays with respawnAtVat — this panel
       // only decides WHICH tank it uses for me.
@@ -2550,21 +3405,22 @@ export class World {
       return;
     }
 
-    if (device.kind === 'cashier' || device.kind === 'roulette') {
+    if (device.kind === "cashier" || device.kind === "roulette") {
       // 🎰 #69 G1/G2: the HOUSE side (cashier book, croupier spin) rides the
       // same owner-equivalent seam as room editing — canEditRoom funnels
       // main.ts's isLocalPlayerRoomOwner, so a venture-owned room makes every
       // shareholder the house (the #68 V1 rule, applied to the casino).
       const isHouse = () => canEditRoom().ok;
-      const ui = device.kind === 'cashier'
-        ? createCashierUI({ isHouse })
-        : createRouletteUI({ itemId: deviceId, isHouse });
+      const ui =
+        device.kind === "cashier"
+          ? createCashierUI({ isHouse })
+          : createRouletteUI({ itemId: deviceId, isHouse });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 
     // The desk computer UI arrives with M3.
-    showHint('This device is not operational yet.');
+    showHint("This device is not operational yet.");
   }
 
   /**
@@ -2574,7 +3430,7 @@ export class World {
    */
   private static activeRoomId(): string {
     const id = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
-    return typeof id === 'string' && id.length > 0 ? id : getDefaultRoomId();
+    return typeof id === "string" && id.length > 0 ? id : getDefaultRoomId();
   }
 
   /**
@@ -2586,14 +3442,17 @@ export class World {
    * to direct rig application otherwise.
    */
   private applyLocalOutfit(outfitId: string): boolean {
-    const viaMain = (window as unknown as { __setOutfit?: (id: string) => boolean }).__setOutfit;
-    if (typeof viaMain === 'function') return viaMain(outfitId);
+    const viaMain = (
+      window as unknown as { __setOutfit?: (id: string) => boolean }
+    ).__setOutfit;
+    if (typeof viaMain === "function") return viaMain(outfitId);
     const outfit = getOutfitById(outfitId);
     if (!outfit) return false;
     // Player keeps its rig private; reach through for this cosmetic path
     // (same escape hatch main.ts uses — frozen player/character public API).
-    (this.player as unknown as { character: { setOutfit(o: OutfitDef): void } })
-      .character.setOutfit(outfit);
+    (
+      this.player as unknown as { character: { setOutfit(o: OutfitDef): void } }
+    ).character.setOutfit(outfit);
     saveOutfitId(outfitId);
     return true;
   }
@@ -2611,16 +3470,21 @@ export class World {
   /** My preferred vat when saved (spawnPoint.ts — the vat panel's "wake up
    *  here"), else the first clone-vat item with a live handle, else null
    *  (vat-less room). */
-  private findSpawnVat(): { item: FurnitureItem; handle: CloneVatHandle } | null {
+  private findSpawnVat(): {
+    item: FurnitureItem;
+    handle: CloneVatHandle;
+  } | null {
     const prefId = preferredSpawnVat(World.activeRoomId());
     if (prefId) {
-      const item = FURNITURE.find((i) => i.kind === 'clone-vat' && i.id === prefId);
+      const item = FURNITURE.find(
+        (i) => i.kind === "clone-vat" && i.id === prefId,
+      );
       const handle = item ? this.cloneVats.get(item.id) : undefined;
       if (item && handle) return { item, handle };
       // Saved vat gone (removed/never synced) — fall through to first-found.
     }
     for (const item of FURNITURE) {
-      if (item.kind !== 'clone-vat') continue;
+      if (item.kind !== "clone-vat") continue;
       const handle = this.cloneVats.get(item.id);
       if (handle) return { item, handle };
     }
@@ -2665,7 +3529,9 @@ export class World {
     // this the mesh-visibility gate silently disabled all first-person WASD.
     const zoomView = (window as any).multiScaleZoom;
     const firstPerson =
-      !!zoomView && typeof zoomView.getLevel === 'function' && zoomView.getLevel() === 1;
+      !!zoomView &&
+      typeof zoomView.getLevel === "function" &&
+      zoomView.getLevel() === 1;
     return (
       (this.player.mesh.visible || deviceFocus.isActive() || firstPerson) &&
       !this.isMorphing
@@ -2678,7 +3544,9 @@ export class World {
 
     // Hook P2P sync routing events (Task: Room pairings over Yjs awareness)
     this.dockingSystem.onConnectionRequest((doorId, address) => {
-      console.log(`[Docking Pipeline] Dispatching connection handshake: ${doorId} -> ${address}`);
+      console.log(
+        `[Docking Pipeline] Dispatching connection handshake: ${doorId} -> ${address}`,
+      );
     });
 
     // #64: publish a completed local pairing to the shared `doors` doc so every
@@ -2687,8 +3555,10 @@ export class World {
     // single publish point; the reconcile path (applyRemotePairing) deliberately
     // does NOT fire this callback, so applying a remote pairing never re-publishes.
     this.dockingSystem.onPairingStatusChanged((doorId, status) => {
-      if (status === 'ACCEPTED') {
-        const st = this.dockingSystem?.getDockingState(doorId as 'north' | 'south' | 'east' | 'west');
+      if (status === "ACCEPTED") {
+        const st = this.dockingSystem?.getDockingState(
+          doorId as "north" | "south" | "east" | "west",
+        );
         if (st?.connectedRoomAddress) {
           // #62 P2: an assembled chain publishes its geometry with the pairing
           // (absent on plain pairings — the legacy record shape, v0.30.x-safe).
@@ -2699,7 +3569,7 @@ export class World {
             transient: st.transient, // #67 D2: guest berths carry the flag
           });
         }
-      } else if (status === 'REJECTED') {
+      } else if (status === "REJECTED") {
         deleteDoorPairing(doorId);
       }
     });

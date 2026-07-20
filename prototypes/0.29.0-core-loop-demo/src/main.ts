@@ -3,127 +3,271 @@
  * Main entry point — orthographic camera + hybrid WASD / point-and-click nav.
  */
 
-import * as THREE from 'three';
-import './style.css';
-import { updateDebugHUD, showHint } from './hud';
-import type { World } from './world';
-import type { DoorId } from './doors';
-import type { InputManager } from './input';
-import type * as Y from 'yjs';
-import { NetworkProvider } from './network/NetworkProvider';
-import { YjsSync } from './network/YjsSync';
-import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_BYTES, type MovementTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
-import { MultiScaleZoomView } from './zoom';
-import { initCameraRig, updateCameraRig } from './cameraRig';
-import { getOutfitById, loadSavedOutfitId, saveOutfitId } from './outfits';
-import { deviceFocus, isDeviceFocusActive } from './deviceFocus';
-import { getPlayerId, getPlayerName, setPlayerName, PLAYER_NAME_MAX_LENGTH, getDefaultRoomId } from './identity';
+import * as THREE from "three";
+import "./style.css";
+import { updateDebugHUD, showHint } from "./hud";
+import type { World } from "./world";
+import type { DoorId } from "./doors";
+import type { InputManager } from "./input";
+import type * as Y from "yjs";
+import { NetworkProvider } from "./network/NetworkProvider";
+import { YjsSync } from "./network/YjsSync";
 import {
-  getIdentityPub, getIdentityFingerprint, signNameCert, verifyNameCert,
-  exportRecoveryKey, importRecoveryKey, ysyncSigner,
-} from './keypair';
-import { roomEdit, setRoomEditPermission } from './editMode';
-import { bindGamesDoc } from './games/gamesDoc';
-import { bindCasinoDoc, readChips } from './casinoDoc';
-import { chipDotsHtml } from './chipDisplay';
-import { bindFurnitureDoc, seedFurnitureDefaults, furnitureDocSize, subscribeFurniture, writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
-import { bindDoorsDoc, writeDoorPairing, readAllDoors, subscribeDoors } from './doorsDoc';
-import { OUTDOOR_CASINO_ROOM_ID, OUTDOOR_FURNITURE } from './furniture';
-import { addToLedger, ledgerHasRoom, moduleLedger, autoAcceptEnabled, mirrorSegments } from './stationParts';
-import { bindDoorPolicy, subscribeDoorPolicy, readDoorPolicy } from './doorPolicy';
-import { bindExteriorDoc, subscribeExterior } from './exteriorDoc';
-import { bindFloorPlan, subscribeFloorPlan } from './floorPlanDoc';
+  packTick,
+  unpackTick,
+  unpackAddressedTick,
+  ADDRESSED_TICK_BYTES,
+  TICK_BYTES,
+  type MovementTick,
+  type RoomBootstrap,
+  type RoomMemberHint,
+} from "./network/protocol";
+import { MultiScaleZoomView } from "./zoom";
+import { initCameraRig, updateCameraRig } from "./cameraRig";
+import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
+import { deviceFocus, isDeviceFocusActive } from "./deviceFocus";
 import {
-  bindRoomRoles, subscribeRoomRoles, readCoHostRequests, readCoHosts,
-  writeCoHostRequest, removeCoHostRequest, writeCoHost, removeCoHost,
-  isCoHost, hasCoHostRequest,
-} from './roomRoles';
+  getPlayerId,
+  getPlayerName,
+  setPlayerName,
+  PLAYER_NAME_MAX_LENGTH,
+  getDefaultRoomId,
+} from "./identity";
 import {
-  bindVentures, subscribeVentures, ventureRecord, foundVenture, transferShares,
-  isVentureShareholder, ventureLedger, upsertVentureLedger,
-  writeVentureLink, refreshVentureLink, removeVentureLink, isOfficeHere,
-} from './ventures';
-import { deedsLedger, upsertDeed, removeDeed } from './deeds';
-import { refreshExteriorView, setExteriorOwnerCheck, setExteriorRoomId, showEnterRoomBubble, isExteriorActive, tickExterior } from './exteriorView';
-import { harvestIntoAtlas, readAtlas, bindStationAtlasDoc, pushAtlasToDoc, subscribeSharedAtlas } from './stationAtlas';
+  getIdentityPub,
+  getIdentityFingerprint,
+  signNameCert,
+  verifyNameCert,
+  exportRecoveryKey,
+  importRecoveryKey,
+  ysyncSigner,
+} from "./keypair";
+import { roomEdit, setRoomEditPermission } from "./editMode";
+import { bindGamesDoc } from "./games/gamesDoc";
+import { bindCasinoDoc, readChips } from "./casinoDoc";
+import { chipDotsHtml } from "./chipDisplay";
+import {
+  bindFurnitureDoc,
+  seedFurnitureDefaults,
+  furnitureDocSize,
+  subscribeFurniture,
+  writeFurnitureItem,
+  deleteFurnitureItem,
+} from "./furnitureDoc";
+import {
+  bindDoorsDoc,
+  writeDoorPairing,
+  readAllDoors,
+  subscribeDoors,
+} from "./doorsDoc";
+import {
+  CASINO_FURNITURE,
+  CASINO_RETIRED_FURNITURE_IDS,
+  CASINO_ROOM_ID,
+  OUTDOOR_CASINO_ROOM_ID,
+  OUTDOOR_FURNITURE,
+} from "./furniture";
+import {
+  addToLedger,
+  ledgerHasRoom,
+  moduleLedger,
+  autoAcceptEnabled,
+  mirrorSegments,
+} from "./stationParts";
+import {
+  bindDoorPolicy,
+  subscribeDoorPolicy,
+  readDoorPolicy,
+} from "./doorPolicy";
+import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
+import { bindFloorPlan, subscribeFloorPlan } from "./floorPlanDoc";
+import {
+  bindRoomRoles,
+  subscribeRoomRoles,
+  readCoHostRequests,
+  readCoHosts,
+  writeCoHostRequest,
+  removeCoHostRequest,
+  writeCoHost,
+  removeCoHost,
+  isCoHost,
+  hasCoHostRequest,
+} from "./roomRoles";
+import {
+  bindVentures,
+  subscribeVentures,
+  ventureRecord,
+  foundVenture,
+  transferShares,
+  isVentureShareholder,
+  ventureLedger,
+  upsertVentureLedger,
+  writeVentureLink,
+  refreshVentureLink,
+  removeVentureLink,
+  isOfficeHere,
+} from "./ventures";
+import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
+import {
+  refreshExteriorView,
+  setExteriorOwnerCheck,
+  setExteriorRoomId,
+  showEnterRoomBubble,
+  isExteriorActive,
+  tickExterior,
+} from "./exteriorView";
+import {
+  harvestIntoAtlas,
+  readAtlas,
+  bindStationAtlasDoc,
+  pushAtlasToDoc,
+  subscribeSharedAtlas,
+} from "./stationAtlas";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
-import { findSeatAt } from './seats';
+import { findSeatAt } from "./seats";
 // 📟 Installed version for the Settings › Stats page (9th bump location).
-import { APP_VERSION } from './version';
+import { APP_VERSION } from "./version";
 
 /** 📟 Settings › Stats: this device's browser-store usage vs the chosen disk
  *  budget. navigator.storage.estimate() is the honest number available to a
  *  web app; the budget is advisory until a pruning slice enforces it. */
 async function refreshStorageStats(): Promise<void> {
-  const usageEl = document.getElementById('ssf-disk-usage');
-  const fill = document.getElementById('ssf-disk-bar-fill');
+  const usageEl = document.getElementById("ssf-disk-usage");
+  const fill = document.getElementById("ssf-disk-bar-fill");
   if (!usageEl) return;
-  const fmt = (bytes: number) => bytes >= 1024 ** 3
-    ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
-    : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  const fmt = (bytes: number) =>
+    bytes >= 1024 ** 3
+      ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
+      : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   try {
     const est = await navigator.storage?.estimate?.();
     const usage = est?.usage ?? 0;
-    const budgetMb = Number(localStorage.getItem('ssf-max-disk-mb') ?? '1000');
+    const budgetMb = Number(localStorage.getItem("ssf-max-disk-mb") ?? "1000");
     if (budgetMb > 0) {
       const budgetBytes = budgetMb * 1024 ** 2;
       const pct = Math.min(100, (usage / budgetBytes) * 100);
       usageEl.textContent = `${fmt(usage)} of ${fmt(budgetBytes)} budget`;
       if (fill) {
         fill.style.width = `${pct.toFixed(1)}%`;
-        fill.style.background = pct >= 90 ? '#FF8A80' : pct >= 70 ? '#FFB300' : '#3E92B8';
+        fill.style.background =
+          pct >= 90 ? "#FF8A80" : pct >= 70 ? "#FFB300" : "#3E92B8";
       }
-      (usageEl as HTMLElement).style.color = pct >= 90 ? '#FF8A80' : '#f0c060';
+      (usageEl as HTMLElement).style.color = pct >= 90 ? "#FF8A80" : "#f0c060";
     } else {
-      usageEl.textContent = `${fmt(usage)} · no budget${est?.quota ? ` (device allows ${fmt(est.quota)})` : ''}`;
+      usageEl.textContent = `${fmt(usage)} · no budget${est?.quota ? ` (device allows ${fmt(est.quota)})` : ""}`;
       if (fill) {
-        fill.style.width = est?.quota ? `${Math.min(100, (usage / est.quota) * 100).toFixed(1)}%` : '0%';
-        fill.style.background = '#3E92B8';
+        fill.style.width = est?.quota
+          ? `${Math.min(100, (usage / est.quota) * 100).toFixed(1)}%`
+          : "0%";
+        fill.style.background = "#3E92B8";
       }
-      (usageEl as HTMLElement).style.color = '#f0c060';
+      (usageEl as HTMLElement).style.color = "#f0c060";
     }
   } catch {
-    usageEl.textContent = 'unavailable in this browser';
+    usageEl.textContent = "unavailable in this browser";
   }
 }
-import { initChatBubbles, spawnChatBubble, updateChatBubbles, clearChatBubbles } from './chatBubbles';
-import { restoreRoomSnapshot, attachRoomCache, type RoomCacheHandle } from './roomCache';
 import {
-  initRoomPasses, addPass, listPasses, passState, subscribePasses,
-  setActivePassRoom, removePass, passRoomInfo, passSeed, type PassState,
-} from './roomPasses';
+  initChatBubbles,
+  spawnChatBubble,
+  updateChatBubbles,
+  clearChatBubbles,
+} from "./chatBubbles";
 import {
-  initContacts, listContacts, listFriends, subscribeContacts, contactFingerprint,
-  encodeMyCard, addContactFromCard, addContactFromRoomEntry, setFriend, removeContact,
-  getContact, isDiscoverable, setDiscoverable, reconstructCard, type ContactCard,
-} from './contacts';
+  restoreRoomSnapshot,
+  attachRoomCache,
+  type RoomCacheHandle,
+} from "./roomCache";
 import {
-  makeIntroductions, ingestIntroduction, type Introduction,
-} from './introductions';
+  initRoomPasses,
+  addPass,
+  listPasses,
+  passState,
+  subscribePasses,
+  setActivePassRoom,
+  removePass,
+  passRoomInfo,
+  passSeed,
+  type PassState,
+} from "./roomPasses";
+import {
+  initContacts,
+  listContacts,
+  listFriends,
+  subscribeContacts,
+  contactFingerprint,
+  encodeMyCard,
+  addContactFromCard,
+  addContactFromRoomEntry,
+  setFriend,
+  removeContact,
+  getContact,
+  isDiscoverable,
+  setDiscoverable,
+  reconstructCard,
+  type ContactCard,
+} from "./contacts";
+import {
+  makeIntroductions,
+  ingestIntroduction,
+  type Introduction,
+} from "./introductions";
 // 📤 Transfer offers (brainstorming/transfer-offers-deeds-shares.md): signed,
 // portable deed/share transfers — cut anywhere, redeemed standing at the asset.
 import {
-  bindOffers, subscribeOffers, makeOffer, encodeOffer, decodeOffer, offerFileName,
-  redeemDeedOffer, redeemShareOffer, revokeOffer, nonceMark, listOfferMarks,
-  offersMade, recordOfferMade, dropOfferMade, settleDeedInDoc,
+  bindOffers,
+  subscribeOffers,
+  makeOffer,
+  encodeOffer,
+  decodeOffer,
+  offerFileName,
+  redeemDeedOffer,
+  redeemShareOffer,
+  revokeOffer,
+  nonceMark,
+  listOfferMarks,
+  offersMade,
+  recordOfferMade,
+  dropOfferMade,
+  settleDeedInDoc,
   type TransferOffer,
-} from './offers';
+} from "./offers";
 // 🤝 Co-present settlement: the maker hands a deed over from a shared room when
 // the receiver can't travel to the module (offers.ts §4.1 amendment).
 import {
-  postSettleRequest, resolveSettleRequest, clearSettleRequest, readSettleRequest,
-  listSettleRequests, subscribeSettleReq, buildSettleRequest, verifiedRequestOwner,
-} from './copresent';
+  postSettleRequest,
+  resolveSettleRequest,
+  clearSettleRequest,
+  readSettleRequest,
+  listSettleRequests,
+  subscribeSettleReq,
+  buildSettleRequest,
+  verifiedRequestOwner,
+} from "./copresent";
 import {
-  initDirectMessages, openDm, sendMessage, readMessages, closeDm, closeAllDms,
-  dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
-} from './directMessages';
+  initDirectMessages,
+  openDm,
+  sendMessage,
+  readMessages,
+  closeDm,
+  closeAllDms,
+  dmRoomIdFor,
+  dmRoomKeyFor,
+  type DmSession,
+  type DirectMessage,
+} from "./directMessages";
 import {
-  initPeerStore, recordPeer, hintsFor, peerCount, listPeers, subscribePeers, getPeer,
-} from './peerStore';
+  initPeerStore,
+  recordPeer,
+  hintsFor,
+  peerCount,
+  listPeers,
+  subscribePeers,
+  getPeer,
+} from "./peerStore";
 
-type RendererModule = typeof import('./renderer');
+type RendererModule = typeof import("./renderer");
 
 // Game state
 let world: World;
@@ -138,7 +282,7 @@ let multiScaleZoom: MultiScaleZoomView;
 
 // ── Raycasting (point-and-click navigation) ───────────────────────────────────
 const raycaster = new THREE.Raycaster();
-const mouse     = new THREE.Vector2();
+const mouse = new THREE.Vector2();
 
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
@@ -161,7 +305,11 @@ const networkProvider = new NetworkProvider();
 // DM pair-derivation debug hook (deterministic room/key from a peer pubkey).
 (window as any).__ssfDM = { roomIdFor: dmRoomIdFor, roomKeyFor: dmRoomKeyFor };
 // 🕸️ Mesh peer-store debug hook (§7 M1).
-(window as any).__ssfMesh = { count: () => peerCount(), list: () => listPeers(), hintsFor };
+(window as any).__ssfMesh = {
+  count: () => peerCount(),
+  list: () => listPeers(),
+  hintsFor,
+};
 let yjsSync: YjsSync | null = null;
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
 let roomCacheHandle: RoomCacheHandle | null = null;
@@ -232,16 +380,16 @@ interface LocalFingerprint {
   iroh_port?: number;
 }
 let localFingerprint: LocalFingerprint | null = null;
-const BOOTSTRAP_ADDRESS_STORAGE_KEY = 'ssf-bootstrap-address';
-const LEGACY_BOOTSTRAP_ADDRESS_KEY = 'ssf-host-address';
-const ROOM_KEY_STORAGE_PREFIX = 'ssf-roomkey:';
+const BOOTSTRAP_ADDRESS_STORAGE_KEY = "ssf-bootstrap-address";
+const LEGACY_BOOTSTRAP_ADDRESS_KEY = "ssf-host-address";
+const ROOM_KEY_STORAGE_PREFIX = "ssf-roomkey:";
 
 function toBase64Url(bytes: Uint8Array): string {
-  let s = '';
+  let s = "";
   for (let i = 0; i < bytes.length; i++) {
     s += String.fromCharCode(bytes[i]);
   }
-  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function generateRoomKeyB64(): string {
@@ -267,13 +415,15 @@ function getOrCreateRoomKeyB64(roomId: string): string {
 
 function normalizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+  return value.filter(
+    (entry): entry is string => typeof entry === "string" && entry.length > 0,
+  );
 }
 
 function normalizeMemberHint(value: unknown): RoomMemberHint | null {
-  if (!value || typeof value !== 'object') return null;
+  if (!value || typeof value !== "object") return null;
   const entry = value as Record<string, unknown>;
-  if (typeof entry.irohNodeId !== 'string' || entry.irohNodeId.length === 0) {
+  if (typeof entry.irohNodeId !== "string" || entry.irohNodeId.length === 0) {
     return null;
   }
   const relayHints = normalizeStringArray(entry.irohRelayUrls);
@@ -285,7 +435,9 @@ function normalizeMemberHint(value: unknown): RoomMemberHint | null {
   };
 }
 
-function collectMemberHints(boot: RoomBootstrap | null | undefined): RoomMemberHint[] {
+function collectMemberHints(
+  boot: RoomBootstrap | null | undefined,
+): RoomMemberHint[] {
   if (!boot) return [];
   const hints: RoomMemberHint[] = [];
 
@@ -317,14 +469,24 @@ function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
       if (!existing) {
         merged.set(hint.irohNodeId, {
           irohNodeId: hint.irohNodeId,
-          irohRelayUrls: hint.irohRelayUrls ? [...hint.irohRelayUrls] : undefined,
-          irohDirectAddrs: hint.irohDirectAddrs ? [...hint.irohDirectAddrs] : undefined,
+          irohRelayUrls: hint.irohRelayUrls
+            ? [...hint.irohRelayUrls]
+            : undefined,
+          irohDirectAddrs: hint.irohDirectAddrs
+            ? [...hint.irohDirectAddrs]
+            : undefined,
         });
         continue;
       }
 
-      const relays = new Set([...(existing.irohRelayUrls ?? []), ...(hint.irohRelayUrls ?? [])]);
-      const addrs = new Set([...(existing.irohDirectAddrs ?? []), ...(hint.irohDirectAddrs ?? [])]);
+      const relays = new Set([
+        ...(existing.irohRelayUrls ?? []),
+        ...(hint.irohRelayUrls ?? []),
+      ]);
+      const addrs = new Set([
+        ...(existing.irohDirectAddrs ?? []),
+        ...(hint.irohDirectAddrs ?? []),
+      ]);
       existing.irohRelayUrls = relays.size ? Array.from(relays) : undefined;
       existing.irohDirectAddrs = addrs.size ? Array.from(addrs) : undefined;
     }
@@ -332,7 +494,9 @@ function mergeMemberHints(...hintLists: RoomMemberHint[][]): RoomMemberHint[] {
   return Array.from(merged.values());
 }
 
-function getLocalNodeHint(fingerprint: LocalFingerprint): RoomMemberHint | null {
+function getLocalNodeHint(
+  fingerprint: LocalFingerprint,
+): RoomMemberHint | null {
   if (!fingerprint.iroh_node_id) return null;
   const relayHints = normalizeStringArray(fingerprint.iroh_relay_urls);
   const directHints = normalizeStringArray(fingerprint.iroh_direct_addrs);
@@ -353,20 +517,31 @@ function setNetworkRow(id: string, value: string, color?: string): void {
 }
 
 /** Classify a hostname/IP into loopback / private (LAN) / public. */
-function classifyAddress(hostname: string): 'loopback' | 'private' | 'public' {
-  const h = hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (h === 'localhost' || h === '::1' || h.startsWith('127.')) return 'loopback';
-  const isV6 = h.includes(':');
-  if (isV6 && (h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80'))) return 'private';
-  if (/^10\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)
-      || /^169\.254\./.test(h) || h.endsWith('.local')) return 'private';
-  return 'public';
+function classifyAddress(hostname: string): "loopback" | "private" | "public" {
+  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (h === "localhost" || h === "::1" || h.startsWith("127."))
+    return "loopback";
+  const isV6 = h.includes(":");
+  if (
+    isV6 &&
+    (h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80"))
+  )
+    return "private";
+  if (
+    /^10\./.test(h) ||
+    /^192\.168\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+    /^169\.254\./.test(h) ||
+    h.endsWith(".local")
+  )
+    return "private";
+  return "public";
 }
 
 const ADDRESS_TYPE_LABEL: Record<ReturnType<typeof classifyAddress>, string> = {
-  loopback: 'LOOPBACK (this device only)',
-  private: 'LAN (private range)',
-  public: 'PUBLIC (internet)',
+  loopback: "LOOPBACK (this device only)",
+  private: "LAN (private range)",
+  public: "PUBLIC (internet)",
 };
 
 // ── R1 reachability readout ───────────────────────────────────────────────────
@@ -375,7 +550,9 @@ const ADDRESS_TYPE_LABEL: Record<ReturnType<typeof classifyAddress>, string> = {
 const DEFAULT_IROH_UDP_PORT = 44442;
 
 function reachabilityUdpPort(fp: LocalFingerprint | null): number {
-  return fp?.iroh_port && fp.iroh_port > 0 ? fp.iroh_port : DEFAULT_IROH_UDP_PORT;
+  return fp?.iroh_port && fp.iroh_port > 0
+    ? fp.iroh_port
+    : DEFAULT_IROH_UDP_PORT;
 }
 
 /** R1: REACHABILITY row — the node's live self-classification. 'advertised'
@@ -384,29 +561,45 @@ function reachabilityUdpPort(fp: LocalFingerprint | null): number {
  *  usually works once the router forward exists, not a guarantee. */
 function renderReachabilityRow(fp: LocalFingerprint | null): void {
   if (!fp) {
-    setNetworkRow('network-reachability', 'NO NODE', '#ff1744');
+    setNetworkRow("network-reachability", "NO NODE", "#ff1744");
     return;
   }
   const port = reachabilityUdpPort(fp);
   switch (fp.reachability) {
-    case 'port-mapped':
+    case "port-mapped":
       // "LIKELY": the public route may be a portmapper mapping (inbound works)
       // or a peer-observed reflexive address (inbound may still be blocked) —
       // provenance is inferred, so don't overclaim OPEN (R1 review M1).
-      setNetworkRow('network-reachability', `LIKELY OPEN — public route detected (UDP ${port})`, '#7ddc5a');
+      setNetworkRow(
+        "network-reachability",
+        `LIKELY OPEN — public route detected (UDP ${port})`,
+        "#7ddc5a",
+      );
       break;
-    case 'advertised':
-      setNetworkRow('network-reachability', `ADVERTISED — forward UDP ${port} if joins fail`, '#ffb300');
+    case "advertised":
+      setNetworkRow(
+        "network-reachability",
+        `ADVERTISED — forward UDP ${port} if joins fail`,
+        "#ffb300",
+      );
       break;
-    case 'cgnat':
-      setNetworkRow('network-reachability', 'CGNAT — direct dials impossible, needs relay', '#ff1744');
+    case "cgnat":
+      setNetworkRow(
+        "network-reachability",
+        "CGNAT — direct dials impossible, needs relay",
+        "#ff1744",
+      );
       break;
-    case 'local-only':
-      setNetworkRow('network-reachability', `LAN ONLY — set up UDP ${port} forward`, '#ff1744');
+    case "local-only":
+      setNetworkRow(
+        "network-reachability",
+        `LAN ONLY — set up UDP ${port} forward`,
+        "#ff1744",
+      );
       break;
     default:
       // Older node / Tauri fallback listener: no classification available.
-      setNetworkRow('network-reachability', '--');
+      setNetworkRow("network-reachability", "--");
       break;
   }
 }
@@ -418,7 +611,7 @@ function bootstrapHasPublicIPv4(boot: RoomBootstrap): boolean {
   for (const hint of collectMemberHints(boot)) {
     for (const addr of hint.irohDirectAddrs ?? []) {
       const v4 = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(addr);
-      if (v4 && classifyAddress(v4[1]) === 'public') return true;
+      if (v4 && classifyAddress(v4[1]) === "public") return true;
     }
   }
   return false;
@@ -431,25 +624,35 @@ function bootstrapHasPublicIPv4(boot: RoomBootstrap): boolean {
  *  decision: reliability over minimalism; DHT re-resolution keeps them
  *  refreshable), so a missing public v4 here is an honest LAN/IPv6-only
  *  signal. Returns null when the pass looks internet-dialable. */
-function inviteReachabilityWarning(boot: RoomBootstrap | undefined): string | null {
-  return boot && !bootstrapHasPublicIPv4(boot) && localFingerprint?.reachability !== 'port-mapped'
+function inviteReachabilityWarning(
+  boot: RoomBootstrap | undefined,
+): string | null {
+  return boot &&
+    !bootstrapHasPublicIPv4(boot) &&
+    localFingerprint?.reachability !== "port-mapped"
     ? `⚠ This pass has no internet-reachable IPv4 — LAN/IPv6 only. Forward UDP ${reachabilityUdpPort(localFingerprint)} on the router (auto-advertising is on by default).`
     : null;
 }
 
 /** Best-effort physical connection type (Network Information API, Chromium). */
 function detectConnectionType(): string {
-  const conn = (navigator as { connection?: { type?: string; effectiveType?: string } }).connection;
-  if (!conn) return '--';
+  const conn = (
+    navigator as { connection?: { type?: string; effectiveType?: string } }
+  ).connection;
+  if (!conn) return "--";
   const parts = [conn.type, conn.effectiveType].filter(Boolean);
-  return parts.length ? parts.join(' · ') : '--';
+  return parts.length ? parts.join(" · ") : "--";
 }
 
 function refreshConnectionTypeRow(): void {
   const label = detectConnectionType();
-  setNetworkRow('network-connection-type', label);
-  if (label.includes('cellular')) {
-    setNetworkRow('network-seeding-status', 'LIKELY CGNAT · LAN seeding only', '#ffb300');
+  setNetworkRow("network-connection-type", label);
+  if (label.includes("cellular")) {
+    setNetworkRow(
+      "network-seeding-status",
+      "LIKELY CGNAT · LAN seeding only",
+      "#ffb300",
+    );
   }
 }
 
@@ -460,7 +663,7 @@ async function bootstrapNetworking() {
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
     const override = pendingBootstrapOverride;
-    let boot = override ?? await fetchDefaultBootstrap();
+    let boot = override ?? (await fetchDefaultBootstrap());
     // Stale-cert self-dial guard (node-restart bug): an override captured
     // before the local node restarted still carries the OLD WT cert hash, so
     // a loopback dial with it fails the TLS handshake on every Retry. The
@@ -470,22 +673,34 @@ async function bootstrapNetworking() {
     // non-loopback dial failures keep their RESTRICTED? diagnostics below.
     if (override) {
       try {
-        if (classifyAddress(new URL(override.wtUrl).hostname) === 'loopback') {
+        if (classifyAddress(new URL(override.wtUrl).hostname) === "loopback") {
           const fp = await awaitLocalNodeFingerprint();
           if (fp && fp.base64) {
             const wtUrl = new URL(override.wtUrl);
             wtUrl.port = String(fp.port);
-            boot = { ...override, wtUrl: wtUrl.toString(), certHashesB64: [fp.base64] };
+            boot = {
+              ...override,
+              wtUrl: wtUrl.toString(),
+              certHashesB64: [fp.base64],
+            };
             pendingBootstrapOverride = boot; // future retries stay coherent
           }
         }
-      } catch { /* malformed wtUrl → the normal dial-failure path reports it */ }
+      } catch {
+        /* malformed wtUrl → the normal dial-failure path reports it */
+      }
     }
     if (!boot) {
-      console.warn('⚠️ No running Rust node found. Seamlessly falling back to offline mode.');
-      updateHUDNode('OFFLINE', '#ff1744');
-      updateHUDP2P('OFFLINE', '#ff1744');
-      setNetworkRow('network-seeding-status', 'BASIC · join-only (no local node)', '#ffb300');
+      console.warn(
+        "⚠️ No running Rust node found. Seamlessly falling back to offline mode.",
+      );
+      updateHUDNode("OFFLINE", "#ff1744");
+      updateHUDP2P("OFFLINE", "#ff1744");
+      setNetworkRow(
+        "network-seeding-status",
+        "BASIC · join-only (no local node)",
+        "#ffb300",
+      );
       return;
     }
 
@@ -505,25 +720,36 @@ async function bootstrapNetworking() {
     // this catch (superseded joins return silently from joinRoom), so the
     // epoch bump inside leaveRoom cannot cancel a newer in-flight join.
     await leaveRoom();
-    console.warn('Failed to bootstrap connection link:', err);
-    updateHUDP2P('OFFLINE', '#ff1744');
+    console.warn("Failed to bootstrap connection link:", err);
+    updateHUDP2P("OFFLINE", "#ff1744");
     const fp = await fetchLocalFingerprint();
     if (fp) {
-      updateHUDNode('ONLINE', '#00e676');
+      updateHUDNode("ONLINE", "#00e676");
     } else {
-      updateHUDNode('OFFLINE', '#ff1744');
+      updateHUDNode("OFFLINE", "#ff1744");
     }
     // Distinguish "couldn't reach a REMOTE seed" — the classic locked-down
     // network signature (campus/corporate firewalls drop outbound UDP/QUIC
     // while normal web traffic still works).
     try {
       const attempted = pendingBootstrapOverride ?? activeBootstrap;
-      if (attempted && classifyAddress(new URL(attempted.wtUrl).hostname) !== 'loopback') {
-        setNetworkRow('network-seeding-status', 'RESTRICTED? · UDP/QUIC dial failed', '#ff1744');
-        const feedback = document.getElementById('network-link-feedback');
-        if (feedback) feedback.textContent = 'Could not dial the peer. Networks like universities/offices often block UDP — web pages load, but QUIC games cannot connect.';
+      if (
+        attempted &&
+        classifyAddress(new URL(attempted.wtUrl).hostname) !== "loopback"
+      ) {
+        setNetworkRow(
+          "network-seeding-status",
+          "RESTRICTED? · UDP/QUIC dial failed",
+          "#ff1744",
+        );
+        const feedback = document.getElementById("network-link-feedback");
+        if (feedback)
+          feedback.textContent =
+            "Could not dial the peer. Networks like universities/offices often block UDP — web pages load, but QUIC games cannot connect.";
       }
-    } catch { /* diagnostic only */ }
+    } catch {
+      /* diagnostic only */
+    }
   }
 }
 
@@ -535,7 +761,10 @@ async function bootstrapNetworking() {
  * NetworkProvider.onEnvelope/onTick hold a single handler slot, so the
  * re-registration below replaces (never stacks) the previous room's handlers.
  */
-async function joinRoom(boot: RoomBootstrap, claimRoomDefaults: boolean): Promise<void> {
+async function joinRoom(
+  boot: RoomBootstrap,
+  claimRoomDefaults: boolean,
+): Promise<void> {
   // Claim a fresh session epoch (see the sessionEpoch declaration): only the
   // newest join/leave owns the shared provider + module state.
   const epoch = ++sessionEpoch;
@@ -558,7 +787,11 @@ async function joinRoom(boot: RoomBootstrap, claimRoomDefaults: boolean): Promis
  *  re-checks the epoch and unwinds whatever it created if superseded.
  *  `claimRoomDefaults`: true only on the own-room default-bootstrap path —
  *  gates the roomInfo owner/name default writes (see below). */
-async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefaults: boolean): Promise<void> {
+async function joinRoomAtEpoch(
+  boot: RoomBootstrap,
+  epoch: number,
+  claimRoomDefaults: boolean,
+): Promise<void> {
   // 2. Connect Network link over WebTransport raw certhash (Task 3.2)
   seenPeers.clear();
   receivedTicks = 0;
@@ -570,7 +803,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // the right room; sequential re-joins overwrite correctly. The bootstrap
   // roomId, NOT the editable display name.
   (window as any).__ssfRoomId = boot.roomId;
-  updateHUDNode('ONLINE', '#00e676');
+  updateHUDNode("ONLINE", "#00e676");
   // Connect with a cert-refresh retry on the LOCAL loopback dial: the node's WT
   // cert regenerates every launch, so a stale hash fails the handshake — on
   // failure we re-read the CURRENT cert and retry before surfacing OFFLINE.
@@ -578,7 +811,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // RESTRICTED? diagnostics in bootstrapNetworking own that path).
   let connectBoot = boot;
   const isLoopback = (() => {
-    try { return classifyAddress(new URL(boot.wtUrl).hostname) === 'loopback'; } catch { return false; }
+    try {
+      return classifyAddress(new URL(boot.wtUrl).hostname) === "loopback";
+    } catch {
+      return false;
+    }
   })();
   let connected = false;
   for (let attempt = 0; attempt < 3 && !connected; attempt++) {
@@ -590,7 +827,11 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       if (!isLoopback || attempt === 2) throw e;
       const fp = await refreshLocalFingerprint();
       if (fp && fp.base64) {
-        connectBoot = { ...connectBoot, wtUrl: `https://127.0.0.1:${fp.port}`, certHashesB64: [fp.base64] };
+        connectBoot = {
+          ...connectBoot,
+          wtUrl: `https://127.0.0.1:${fp.port}`,
+          certHashesB64: [fp.base64],
+        };
       }
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -600,7 +841,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   await syncAccessPass();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
-  updateHUDP2P('CONNECTED', '#00e676');
+  updateHUDP2P("CONNECTED", "#00e676");
 
   // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
   // every player is part of the hosting fabric unless their connection
@@ -608,17 +849,29 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   const seedingFingerprint = await fetchLocalFingerprint();
   if (epoch !== sessionEpoch) return; // superseded — skip UI writes meant for this session
   if (seedingFingerprint) {
-    setNetworkRow('network-seeding-status', 'SEEDING · untested — run Self-Test', '#d4a84b');
+    setNetworkRow(
+      "network-seeding-status",
+      "SEEDING · untested — run Self-Test",
+      "#d4a84b",
+    );
   } else {
-    setNetworkRow('network-seeding-status', 'BASIC · join-only (no local node)', '#ffb300');
+    setNetworkRow(
+      "network-seeding-status",
+      "BASIC · join-only (no local node)",
+      "#ffb300",
+    );
   }
 
   // 3. Initiate yrs state document handshake over Stream (Task 3.3)
-  const channel = await networkProvider.openChannel('ysync');
+  const channel = await networkProvider.openChannel("ysync");
   if (epoch !== sessionEpoch) {
     // Superseded mid-handshake — release the channel we just opened
     // (best-effort; the transport may already be torn down).
-    try { await channel.writable.close(); } catch { /* superseded transport */ }
+    try {
+      await channel.writable.close();
+    } catch {
+      /* superseded transport */
+    }
     return;
   }
   const sync = new YjsSync({
@@ -637,9 +890,17 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   const restoredFromCache = await restoreRoomSnapshot(sync.doc, boot.roomId);
   if (epoch !== sessionEpoch) {
     // Superseded during the cache read — same unwind as the post-start guard.
-    const docWasDestroyed = (sync.doc as { isDestroyed?: boolean }).isDestroyed === true;
-    try { await sync.stop(); } catch { /* superseded transport */ }
-    if (!docWasDestroyed && (sync.doc as { isDestroyed?: boolean }).isDestroyed) {
+    const docWasDestroyed =
+      (sync.doc as { isDestroyed?: boolean }).isDestroyed === true;
+    try {
+      await sync.stop();
+    } catch {
+      /* superseded transport */
+    }
+    if (
+      !docWasDestroyed &&
+      (sync.doc as { isDestroyed?: boolean }).isDestroyed
+    ) {
       ssfDocStats.destroyed++; // doc-lifecycle counter (see declaration)
     }
     if (yjsSync === sync) yjsSync = null;
@@ -650,9 +911,17 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // Superseded while the sync spun up. A concurrent leaveRoom may already
     // have stopped us (then this is a harmless double-stop); count the doc
     // as destroyed only if THIS unwind is what actually destroyed it.
-    const docWasDestroyed = (sync.doc as { isDestroyed?: boolean }).isDestroyed === true;
-    try { await sync.stop(); } catch { /* superseded transport */ }
-    if (!docWasDestroyed && (sync.doc as { isDestroyed?: boolean }).isDestroyed) {
+    const docWasDestroyed =
+      (sync.doc as { isDestroyed?: boolean }).isDestroyed === true;
+    try {
+      await sync.stop();
+    } catch {
+      /* superseded transport */
+    }
+    if (
+      !docWasDestroyed &&
+      (sync.doc as { isDestroyed?: boolean }).isDestroyed
+    ) {
       ssfDocStats.destroyed++; // doc-lifecycle counter (see declaration)
     }
     if (yjsSync === sync) yjsSync = null;
@@ -666,7 +935,10 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // `owned` is sampled at write time — ownership can resolve after join.
   roomCacheHandle?.detach(); // stale handle from a superseded session, if any
   roomCacheHandle = attachRoomCache(sync.doc, boot.roomId, () =>
-    isLocalPlayerRoomOwner((sync.doc.getMap('roomInfo').get('owner') as string) || ''));
+    isLocalPlayerRoomOwner(
+      (sync.doc.getMap("roomInfo").get("owner") as string) || "",
+    ),
+  );
   {
     const cacheEpoch = epoch;
     void sync.whenServerSynced.then(() => {
@@ -677,40 +949,60 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // 3b. Route NODE-INITIATED envelopes (🐛 0.16.0 blocker fix): remote peers'
   // updates are bridged to us on node-opened streams — feed ysync frames into
   // the shared doc and surface bridge dial-status instead of failing silently.
-  networkProvider.onEnvelope((env: { kind?: string; payload?: string; room?: string }) => {
-    if (env.kind === 'ysync') {
-      yjsSync?.ingestEnvelope(env);
-      return;
-    }
-    if (env.kind === 'bridge' && typeof env.payload === 'string') {
-      try {
-        const status = JSON.parse(atob(env.payload)) as { target?: string; status?: string; detail?: string };
-        const shortTarget = (status.target ?? '').slice(0, 8);
-        if (status.status === 'dialing') {
-          setNetworkRow('network-bridge-status', `DIALING → ${shortTarget}…`, '#d4a84b');
-        } else if (status.status === 'connected') {
-          setNetworkRow('network-bridge-status', `LINKED ↔ ${shortTarget}`, '#00e676');
-          logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
-          // The peer JUST linked — but our opening SyncStep1 fired before the
-          // dial finished and was relayed to an empty neighbor set, so the host
-          // never sent its (static) room state. Re-issue SyncStep1 now that the
-          // host is a live neighbor to pull the roster / room name / furniture.
-          yjsSync?.resync();
-        } else if (status.status === 'failed') {
-          setNetworkRow('network-bridge-status', `FAILED → ${shortTarget} (see node log)`, '#ff1744');
-          logToPhoneSystem(`⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? 'unknown error'}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`);
-        }
-      } catch (e) {
-        console.warn('Unparseable bridge status envelope:', e);
+  networkProvider.onEnvelope(
+    (env: { kind?: string; payload?: string; room?: string }) => {
+      if (env.kind === "ysync") {
+        yjsSync?.ingestEnvelope(env);
+        return;
       }
-    }
-  });
+      if (env.kind === "bridge" && typeof env.payload === "string") {
+        try {
+          const status = JSON.parse(atob(env.payload)) as {
+            target?: string;
+            status?: string;
+            detail?: string;
+          };
+          const shortTarget = (status.target ?? "").slice(0, 8);
+          if (status.status === "dialing") {
+            setNetworkRow(
+              "network-bridge-status",
+              `DIALING → ${shortTarget}…`,
+              "#d4a84b",
+            );
+          } else if (status.status === "connected") {
+            setNetworkRow(
+              "network-bridge-status",
+              `LINKED ↔ ${shortTarget}`,
+              "#00e676",
+            );
+            logToPhoneSystem(`🎉 P2P bridge linked to station ${shortTarget}…`);
+            // The peer JUST linked — but our opening SyncStep1 fired before the
+            // dial finished and was relayed to an empty neighbor set, so the host
+            // never sent its (static) room state. Re-issue SyncStep1 now that the
+            // host is a live neighbor to pull the roster / room name / furniture.
+            yjsSync?.resync();
+          } else if (status.status === "failed") {
+            setNetworkRow(
+              "network-bridge-status",
+              `FAILED → ${shortTarget} (see node log)`,
+              "#ff1744",
+            );
+            logToPhoneSystem(
+              `⚠️ P2P dial to ${shortTarget}… failed: ${status.detail ?? "unknown error"}. If both stations are behind home routers, one side needs to forward UDP 44442 on their router (the node's default pinned port; SSF_IROH_PORT overrides) or use a relay (SSF_RELAYS).`,
+            );
+          }
+        } catch (e) {
+          console.warn("Unparseable bridge status envelope:", e);
+        }
+      }
+    },
+  );
 
   // Bind shared players map (issue #20 S2): stable per-install identity in
   // the room doc. Rebinds per join like roomInfo/chat below (T0 seam) — the
   // observer attaches to the FRESH doc and our entry is re-upserted, keyed by
   // player id so a Use-link rejoin overwrites instead of duplicating.
-  const playersMap = sync.doc.getMap('players');
+  const playersMap = sync.doc.getMap("players");
   (window as any).__players = playersMap; // debug handle (permanent, like __setOutfit)
 
   // Bind the shared games map (issue #45): per-table game state (checkers
@@ -731,8 +1023,10 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // passage policy is public.
   bindStationAtlasDoc(sync.doc, {
     roomId: boot.roomId,
-    isPassagePublic: () => (['north', 'south', 'east', 'west'] as const)
-      .some((d) => readDoorPolicy(d).passage === 'public'),
+    isPassagePublic: () =>
+      (["north", "south", "east", "west"] as const).some(
+        (d) => readDoorPolicy(d).passage === "public",
+      ),
   });
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
@@ -785,7 +1079,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   settleReqUnsub?.();
   copresentHandled.clear();
   copresentPinged.clear();
-  offerCopresentPending = '';
+  offerCopresentPending = "";
   {
     const settleDoc = sync.doc;
     settleReqUnsub = subscribeSettleReq(settleDoc, () => {
@@ -806,14 +1100,21 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
   if (!roomPassesInited) {
     roomPassesInited = true;
-    initRoomPasses({ decode: decodeBootstrapInput, resolve: resolveBridgeBootstrap });
+    initRoomPasses({
+      decode: decodeBootstrapInput,
+      resolve: resolveBridgeBootstrap,
+    });
     // Contacts (keyed identity §8): our card embeds our node reachability (the
     // same local hint passes carry) so a friend can dial us for a DM / mesh link.
     initContacts({
       myName: () => getPlayerName(),
-      myHints: () => (localFingerprint ? getLocalNodeHint(localFingerprint) : null),
+      myHints: () =>
+        localFingerprint ? getLocalNodeHint(localFingerprint) : null,
     });
-    initDirectMessages({ resolve: resolveBridgeBootstrap, myName: () => getPlayerName() });
+    initDirectMessages({
+      resolve: resolveBridgeBootstrap,
+      myName: () => getPlayerName(),
+    });
     // 🕸️ Mesh peer store (§7 M1): harvest every contact/friend into the durable
     // trust-weighted pool, and re-harvest whenever contacts change.
     initPeerStore({ selfPub: () => getIdentityPub() });
@@ -861,7 +1162,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       refreshExteriorView();
     });
     // The exterior's atlas walk starts from the CURRENT room.
-    setExteriorRoomId(() => activeBootstrap?.roomId ?? '');
+    setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -869,14 +1170,16 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     // in live as the doc syncs (usually within the first second of joining).
     subscribeSharedAtlas(() => refreshExteriorView());
     setExteriorOwnerCheck(() => {
-      const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+      const ownerVal =
+        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+        "";
       return isLocalPlayerRoomOwner(ownerVal);
     });
   }
   setActivePassRoom(boot.roomId);
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
-  const roomMap = sync.doc.getMap('roomInfo');
+  const roomMap = sync.doc.getMap("roomInfo");
   // Ownership-claim race guard (S2 review fix): `roomMap.has('owner')` runs
   // SYNCHRONOUSLY after sync.start(), but start() only SENDS SyncStep1 — the
   // SyncStep2 carrying the room's established state arrives async in the
@@ -889,12 +1192,12 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // gap (pre-existing, unchanged): the OWN-room claim itself still races the
   // initial sync, so an owner who renamed their room can see the name revert
   // on reload — fixing that needs a sync-complete signal from YjsSync.
-  if (claimRoomDefaults && !roomMap.has('owner')) {
+  if (claimRoomDefaults && !roomMap.has("owner")) {
     sync.doc.transact(() => {
       // S2: the owner is a player ID (stable across reloads), not a display
       // name. Legacy rooms hold 'Local-Clone' here — see isLocalPlayerRoomOwner.
-      roomMap.set('owner', getPlayerId());
-      roomMap.set('name', boot.roomId || 'Lobby');
+      roomMap.set("owner", getPlayerId());
+      roomMap.set("name", boot.roomId || "Lobby");
     });
   }
   // E4 furniture seed (issue #60): the owner publishes the initial layout so
@@ -908,17 +1211,26 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
     const seedEpoch = epoch;
     void sync.whenServerSynced.then(() => {
       if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
-      if (roomMap.get('owner') === getPlayerId() && furnitureDocSize() === 0) {
+      if (roomMap.get("owner") === getPlayerId() && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }
       // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
       // claim (overwrites any stale cert hash from a previous session).
       if (activeBootstrap) {
-        const outdoorSeed = btoa(JSON.stringify({
-          ...activeBootstrap,
-          roomId: OUTDOOR_CASINO_ROOM_ID,
-        }));
-        writeDoorPairing('south', outdoorSeed);
+        const outdoorSeed = btoa(
+          JSON.stringify({
+            ...activeBootstrap,
+            roomId: OUTDOOR_CASINO_ROOM_ID,
+          }),
+        );
+        writeDoorPairing("south", outdoorSeed);
+        const casinoSeed = btoa(
+          JSON.stringify({
+            ...activeBootstrap,
+            roomId: CASINO_ROOM_ID,
+          }),
+        );
+        writeDoorPairing("east", casinoSeed);
       }
     });
   }
@@ -946,8 +1258,20 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       // 🏊 Retired items: casino fixtures moved back to the lobby — purge
       // their stale doc entries so old room replicas drop them too (id-only,
       // harmless when absent; safe to run every entry).
-      deleteFurnitureItem('pool-cashier');
-      deleteFurnitureItem('pool-roulette');
+      deleteFurnitureItem("pool-cashier");
+      deleteFurnitureItem("pool-roulette");
+    });
+    world?.applyRoomVisuals(boot.roomId);
+  } else if (boot.roomId === CASINO_ROOM_ID) {
+    const casinoEpoch = epoch;
+    void sync.whenServerSynced.then(() => {
+      if (casinoEpoch !== sessionEpoch) return;
+      for (const item of CASINO_FURNITURE) {
+        writeFurnitureItem(item);
+      }
+      for (const id of CASINO_RETIRED_FURNITURE_IDS) {
+        deleteFurnitureItem(id);
+      }
     });
     world?.applyRoomVisuals(boot.roomId);
   } else {
@@ -965,13 +1289,13 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   });
 
   const updateRoomUI = () => {
-    const nameVal = roomMap.get('name') as string || 'Lobby';
-    const ownerVal = roomMap.get('owner') as string || 'Local-Clone';
+    const nameVal = (roomMap.get("name") as string) || "Lobby";
+    const ownerVal = (roomMap.get("owner") as string) || "Local-Clone";
 
-    const nameEl = document.getElementById('room-name-display');
-    const ownerEl = document.getElementById('room-owner-display');
+    const nameEl = document.getElementById("room-name-display");
+    const ownerEl = document.getElementById("room-owner-display");
 
-    if (nameEl && !document.getElementById('room-name-input')) {
+    if (nameEl && !document.getElementById("room-name-input")) {
       nameEl.textContent = nameVal;
     }
     if (ownerEl) {
@@ -1033,7 +1357,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       // from cache, keep the bounded resync cadence running for the full window
       // (idempotent SyncStep1s, ~15 tiny frames worst case) instead of stopping
       // on the cache's own echo. Freshness still lands via the normal SyncStep2.
-      if (!restoredFromCache && roomMap.has('owner')) return; // host state arrived — done
+      if (!restoredFromCache && roomMap.has("owner")) return; // host state arrived — done
       if (performance.now() >= backfillDeadline) return;
       yjsSync?.resync();
       window.setTimeout(backfillTick, 2_000);
@@ -1042,28 +1366,29 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   }
 
   // Bind shared chat array updates to SpacePhone interface (Task Task 3.3/4.1)
-  const sharedChat = sync.doc.getArray('chat');
+  const sharedChat = sync.doc.getArray("chat");
   const rebuildChatLog = () => {
     // Re-populate our scroll container whenever sync modifications occur
-    const container = document.getElementById('chat-messages-container');
+    const container = document.getElementById("chat-messages-container");
     if (container) {
       // Safe clear except original system greet is fine
       container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
       const items: any[] = sharedChat.toArray();
-      items.forEach(item => {
+      items.forEach((item) => {
         // S2: classify by stable authorId. Pre-S2 messages carry no authorId
         // and EVERY pre-S2 sender wrote the literal authorName 'Local-Clone',
         // so the fallback renders all legacy messages as 'me' — exactly the
         // pre-S2 behavior (no regression, no improvement). The 2+ player
         // me/them fix only applies to messages written with an authorId.
-        const isMe = typeof item.authorId === 'string'
-          ? item.authorId === getPlayerId()
-          : item.authorName === 'Local-Clone';
-        const bubble = document.createElement('div');
-        bubble.className = `chat-bubble ${isMe ? 'outbound' : 'inbound'}`;
+        const isMe =
+          typeof item.authorId === "string"
+            ? item.authorId === getPlayerId()
+            : item.authorName === "Local-Clone";
+        const bubble = document.createElement("div");
+        bubble.className = `chat-bubble ${isMe ? "outbound" : "inbound"}`;
 
-        const nameSpan = document.createElement('span');
-        nameSpan.className = 'chat-sender-name';
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "chat-sender-name";
         nameSpan.textContent = item.authorName;
 
         const textNode = document.createTextNode(item.text);
@@ -1086,13 +1411,22 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
           const inserted = (op as { insert?: unknown[] }).insert;
           if (!Array.isArray(inserted)) continue;
           for (const item of inserted) {
-            const msg = item as { authorId?: string; text?: string; atX?: number; atZ?: number };
-            if (typeof msg?.text !== 'string') continue;
-            const isSelf = typeof msg.authorId === 'string' && msg.authorId === getPlayerId();
+            const msg = item as {
+              authorId?: string;
+              text?: string;
+              atX?: number;
+              atZ?: number;
+            };
+            if (typeof msg?.text !== "string") continue;
+            const isSelf =
+              typeof msg.authorId === "string" &&
+              msg.authorId === getPlayerId();
             spawnChatBubble(msg.text, isSelf, msg.atX, msg.atZ);
           }
         }
-      } catch { /* bubbles are cosmetic — never break the chat log */ }
+      } catch {
+        /* bubbles are cosmetic — never break the chat log */
+      }
     }
     rebuildChatLog();
   });
@@ -1120,7 +1454,7 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
         // Legacy un-addressed tick (pre-0.23.0 node or embedded fallback
         // listener): no sender identity on the wire — collapse into one slot
         // rather than fabricate ids from the seq counter.
-        peerId = 'peer-legacy';
+        peerId = "peer-legacy";
         tick = unpackTick(buf);
       } else {
         return; // unknown datagram framing — ignore
@@ -1128,9 +1462,20 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
       seenPeers.add(peerId);
       receivedTicks++;
       remoteLastSeen.set(peerId, performance.now());
-      world.updateRemotePlayer(peerId, tick.x, tick.z, (tick.flags & 1) === 1, (tick.flags & 2) === 2, tick.yaw, (tick.flags & 4) === 4, (tick.flags & 8) === 8, (tick.flags & 16) === 16, (tick.flags & 32) === 32);
+      world.updateRemotePlayer(
+        peerId,
+        tick.x,
+        tick.z,
+        (tick.flags & 1) === 1,
+        (tick.flags & 2) === 2,
+        tick.yaw,
+        (tick.flags & 4) === 4,
+        (tick.flags & 8) === 8,
+        (tick.flags & 16) === 16,
+        (tick.flags & 32) === 32,
+      );
     } catch (e) {
-      console.warn('Error unpacking incoming remote peer datagram tick:', e);
+      console.warn("Error unpacking incoming remote peer datagram tick:", e);
     }
   });
 }
@@ -1164,25 +1509,29 @@ async function leaveRoom(): Promise<void> {
   if (sync) {
     // 💾 Tier A: final snapshot BEFORE stop() destroys the doc (encode is
     // synchronous; the IndexedDB put is fire-and-forget and survives us).
-    try { roomCacheHandle?.flushNow(); } catch { /* cache is never fatal */ }
+    try {
+      roomCacheHandle?.flushNow();
+    } catch {
+      /* cache is never fatal */
+    }
     roomCacheHandle?.detach();
     roomCacheHandle = null;
     const oldDoc = sync.doc;
     try {
       await sync.stop(); // closes the ysync writer + doc.destroy()
     } catch (err) {
-      console.warn('Error stopping yjs room sync:', err);
+      console.warn("Error stopping yjs room sync:", err);
     }
     if ((oldDoc as { isDestroyed?: boolean }).isDestroyed) {
       ssfDocStats.destroyed++; // doc-lifecycle counter (see declaration)
     } else {
-      console.warn('leaveRoom: previous Y.Doc was not destroyed by stop()');
+      console.warn("leaveRoom: previous Y.Doc was not destroyed by stop()");
     }
   }
   try {
     await networkProvider.disconnect();
   } catch (err) {
-    console.warn('Error disconnecting prior network link:', err);
+    console.warn("Error disconnecting prior network link:", err);
   }
 }
 
@@ -1214,16 +1563,22 @@ const SYNC_GATE_MS = 8_000;
 function awaitInitialRoomState(timeoutMs: number): Promise<void> {
   const sync = yjsSync;
   if (!sync) return Promise.resolve();
-  const roomMap = sync.doc.getMap('roomInfo');
-  const ready = () => roomMap.has('owner') && roomMap.has('name');
+  const roomMap = sync.doc.getMap("roomInfo");
+  const ready = () => roomMap.has("owner") && roomMap.has("name");
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
-    const observer = () => { if (ready()) finish(); };
+    const observer = () => {
+      if (ready()) finish();
+    };
     const finish = () => {
       if (done) return;
       done = true;
-      try { roomMap.unobserve(observer); } catch { /* doc may be destroyed */ }
+      try {
+        roomMap.unobserve(observer);
+      } catch {
+        /* doc may be destroyed */
+      }
       window.clearTimeout(timer);
       resolve();
     };
@@ -1239,8 +1594,8 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
  *  event is droppable when the tab is backgrounded mid-transit). */
 function transitFadeTo(opaque: boolean): Promise<void> {
   if (!transitFadeEl) {
-    transitFadeEl = document.createElement('div');
-    transitFadeEl.id = 'transit-fade';
+    transitFadeEl = document.createElement("div");
+    transitFadeEl.id = "transit-fade";
     transitFadeEl.style.cssText = `
       position: fixed;
       inset: 0;
@@ -1256,16 +1611,18 @@ function transitFadeTo(opaque: boolean): Promise<void> {
   }
   const el = transitFadeEl;
   // Swallow clicks while covered (nothing behind the curtain is clickable).
-  el.style.pointerEvents = opaque ? 'auto' : 'none';
-  el.style.opacity = opaque ? '1' : '0';
-  return new Promise((resolve) => window.setTimeout(resolve, TRANSIT_FADE_MS + 50));
+  el.style.pointerEvents = opaque ? "auto" : "none";
+  el.style.opacity = opaque ? "1" : "0";
+  return new Promise((resolve) =>
+    window.setTimeout(resolve, TRANSIT_FADE_MS + 50),
+  );
 }
 
 /** Outcome of a curtain-covered room swap: 'ok', 'busy' (another swap holds
  *  the transit latch — nothing happened), or the failure that was recovered
  *  from (the original room was restored, or torn down to offline when even
  *  the restore failed). */
-type RoomSwapResult = 'ok' | 'busy' | Error;
+type RoomSwapResult = "ok" | "busy" | Error;
 
 /** A swap failure that ALSO left us with no room at all (the pass was used
  *  before the first join completed, or the departure-room rejoin failed):
@@ -1294,8 +1651,11 @@ interface RoomSwapChoreography {
  * before leaving) and the failure choreography runs — the fade covers both
  * directions. One swap at a time (transitInProgress latch).
  */
-async function performRoomSwap(seedString: string, choreography: RoomSwapChoreography): Promise<RoomSwapResult> {
-  if (transitInProgress) return 'busy';
+async function performRoomSwap(
+  seedString: string,
+  choreography: RoomSwapChoreography,
+): Promise<RoomSwapResult> {
+  if (transitInProgress) return "busy";
   transitInProgress = true;
   // Snapshot BEFORE leaving: leaveRoom keeps activeBootstrap as last-room
   // memory, but joinRoom(target) overwrites it — this is the way back.
@@ -1304,7 +1664,7 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
   try {
     const imported = decodeBootstrapInput(seedString);
     if (!imported) {
-      throw new Error('Unreadable room seed');
+      throw new Error("Unreadable room seed");
     }
     const target = await resolveBridgeBootstrap(imported);
     // Rooms WE minted this session (PROVISION NEW MODULE) are first-entries
@@ -1323,14 +1683,21 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
     })();
     // Detached-rejection guard: if the watchdog wins the race, the late swap
     // rejection must not surface as an unhandled-rejection console error.
-    swapPromise.catch(() => { /* reported through the race */ });
+    swapPromise.catch(() => {
+      /* reported through the race */
+    });
     let watchdogId = 0;
     try {
       await Promise.race([
         swapPromise,
         new Promise<never>((_, reject) => {
           watchdogId = window.setTimeout(
-            () => reject(new Error(`Dock swap watchdog: no arrival within ${SWAP_WATCHDOG_MS / 1000} s`)),
+            () =>
+              reject(
+                new Error(
+                  `Dock swap watchdog: no arrival within ${SWAP_WATCHDOG_MS / 1000} s`,
+                ),
+              ),
             SWAP_WATCHDOG_MS,
           );
         }),
@@ -1359,9 +1726,9 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);
-    return 'ok';
+    return "ok";
   } catch (err) {
-    console.warn('Room swap failed — restoring the departure room:', err);
+    console.warn("Room swap failed — restoring the departure room:", err);
     await transitFadeTo(true); // no-op visually if already opaque
     let stranded = false;
     if (leftOriginalRoom) {
@@ -1372,18 +1739,21 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
         try {
           await joinRoom(originalBoot, /* claimRoomDefaults */ false);
         } catch (rejoinErr) {
-          console.warn('Could not rejoin the departure room after a failed transit:', rejoinErr);
+          console.warn(
+            "Could not rejoin the departure room after a failed transit:",
+            rejoinErr,
+          );
           await leaveRoom();
-          updateHUDNode('OFFLINE', '#ff1744');
-          updateHUDP2P('OFFLINE', '#ff1744');
+          updateHUDNode("OFFLINE", "#ff1744");
+          updateHUDP2P("OFFLINE", "#ff1744");
           stranded = true;
         }
       } else {
         // No departure room existed (pass used before the first join
         // completed / bootstrap never succeeded) — we are genuinely roomless
         // now; say so on the HUD instead of pretending a restore happened.
-        updateHUDNode('OFFLINE', '#ff1744');
-        updateHUDP2P('OFFLINE', '#ff1744');
+        updateHUDNode("OFFLINE", "#ff1744");
+        updateHUDP2P("OFFLINE", "#ff1744");
         stranded = true;
       }
     }
@@ -1404,14 +1774,21 @@ async function performRoomSwap(seedString: string, choreography: RoomSwapChoreog
  * through the departure door on failure. A busy latch stays silent (the
  * door machine falls through to the peek round-trip — review fix F4).
  */
-async function transitTo(seedString: string, departureDoorId: DoorId): Promise<void> {
+async function transitTo(
+  seedString: string,
+  departureDoorId: DoorId,
+): Promise<void> {
   // #62 P4: capture the departure connection BEFORE the swap tears the room
   // down — the arrival choreography wants the record's farDoor, and the lazy
   // mirror write needs the departure room's own address.
   const depState = world.dockingSystem?.getDockingState(departureDoorId);
   const depPaired = depState?.pairedSuccessfully === true;
   const depGeometry = depState?.segments?.length
-    ? { segments: depState.segments, farDoor: depState.farDoor, farYawDeg: depState.farYawDeg }
+    ? {
+        segments: depState.segments,
+        farDoor: depState.farDoor,
+        farYawDeg: depState.farYawDeg,
+      }
     : null;
   const depRoomId = activeBootstrap?.roomId ?? null;
 
@@ -1420,26 +1797,32 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
   // most mirrors. Resolution ladder: pass list → minted-module ledger → mint a
   // fresh link (local node op; done PRE-swap while the departure room's state
   // is definitely alive).
-  let depAddress = depRoomId ? passSeed(depRoomId) ?? null : null;
+  let depAddress = depRoomId ? (passSeed(depRoomId) ?? null) : null;
   if (depPaired && depRoomId && !depAddress) {
-    depAddress = moduleLedger().find((e) => e.roomId === depRoomId)?.seed ?? null;
+    depAddress =
+      moduleLedger().find((e) => e.roomId === depRoomId)?.seed ?? null;
   }
   if (depPaired && depRoomId && !depAddress) {
     try {
       depAddress = (await mintBootstrapLink(undefined, depRoomId)).link ?? null;
     } catch (e) {
-      console.warn('🪞 Mirror: could not mint a departure-room link:', e);
+      console.warn("🪞 Mirror: could not mint a departure-room link:", e);
     }
   }
 
   const result = await performRoomSwap(seedString, {
     // 🔗 depRoomId lets the ARRIVAL room's own back-pointing record pick the
     // door (owner's octagon fix) — farDoor/opposite are fallbacks only.
-    arrive: () => world.completeAdapterArrival(departureDoorId, depGeometry?.farDoor, depRoomId ?? undefined),
+    arrive: () =>
+      world.completeAdapterArrival(
+        departureDoorId,
+        depGeometry?.farDoor,
+        depRoomId ?? undefined,
+      ),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
   if (result instanceof Error) {
-    showHint('Dock seal failed.');
+    showHint("Dock seal failed.");
     return;
   }
 
@@ -1454,21 +1837,31 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
   // Never clobbers an existing pairing on the arrival door.
   if (depPaired && depAddress) {
     // 🔗 Mirror onto the SAME door the player actually arrived through.
-    const arrivalDoorId = world.resolveArrivalDoor(departureDoorId, depGeometry?.farDoor, depRoomId ?? undefined).id;
+    const arrivalDoorId = world.resolveArrivalDoor(
+      departureDoorId,
+      depGeometry?.farDoor,
+      depRoomId ?? undefined,
+    ).id;
     const existing = readAllDoors().get(arrivalDoorId);
     if (!existing?.paired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
-        segments: depGeometry ? mirrorSegments(depGeometry.segments) : undefined,
+        segments: depGeometry
+          ? mirrorSegments(depGeometry.segments)
+          : undefined,
         farDoor: departureDoorId,
         farYawDeg: depGeometry?.farYawDeg,
         // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
         // detaching either side casts the whole connection off.
         transient: depState?.transient,
       });
-      console.log(`🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`);
+      console.log(
+        `🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`,
+      );
     }
   } else if (depPaired) {
-    console.warn(`🪞 Mirror SKIPPED: no resolvable address for departure room ${depRoomId} — the return direction will refuse until one side pairs manually.`);
+    console.warn(
+      `🪞 Mirror SKIPPED: no resolvable address for departure room ${depRoomId} — the return direction will refuse until one side pairs manually.`,
+    );
   }
 }
 
@@ -1484,10 +1877,14 @@ async function transitTo(seedString: string, departureDoorId: DoorId): Promise<v
  * permission attached — travel then goes through the map/doors, and this
  * instant beam retires with the dev phase.
  */
-async function accessBeamTransport(seedString: string): Promise<RoomSwapResult> {
+async function accessBeamTransport(
+  seedString: string,
+): Promise<RoomSwapResult> {
   return performRoomSwap(seedString, {
     arrive: () => world.completeAccessBeamIn(),
-    fail: () => { /* the avatar never left the origin room — nothing to restage */ },
+    fail: () => {
+      /* the avatar never left the origin room — nothing to restage */
+    },
   });
 }
 
@@ -1508,7 +1905,9 @@ function wireAdapterTransit(): void {
   const provisionModuleSeed = async (): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
-    const roomId = `module-${Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')}`;
+    const roomId = `module-${Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")}`;
     const minted = await mintBootstrapLink(undefined, roomId);
     if (!minted.link) return null;
     mintedRoomIds.add(roomId);
@@ -1526,7 +1925,9 @@ function wireAdapterTransit(): void {
   // edit mode use. Legacy 'Local-Clone' rooms stay editable by everyone, per
   // the S2 convention inside isLocalPlayerRoomOwner.
   world.dockingSystem?.onOwnerCheck(() => {
-    const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+    const ownerVal =
+      (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+      "";
     return isLocalPlayerRoomOwner(ownerVal);
   });
   world.dockingSystem?.onAutoAcceptCheck((address) => {
@@ -1535,7 +1936,11 @@ function wireAdapterTransit(): void {
       const boot = decodeBootstrapInput(address);
       const rid = boot?.roomId;
       if (!rid) return false;
-      return ledgerHasRoom(rid) || mintedRoomIds.has(rid) || rid === activeBootstrap?.roomId;
+      return (
+        ledgerHasRoom(rid) ||
+        mintedRoomIds.has(rid) ||
+        rid === activeBootstrap?.roomId
+      );
     } catch {
       return false;
     }
@@ -1571,14 +1976,14 @@ interface PlayerEntry {
 function updateLocalPlayerEntry(): void {
   const sync = yjsSync;
   if (!sync) return;
-  const players = sync.doc.getMap('players');
+  const players = sync.doc.getMap("players");
   const id = getPlayerId();
   const prev = players.get(id) as Partial<PlayerEntry> | undefined;
   const name = getPlayerName();
   const entry: PlayerEntry = {
     name,
-    joinedAt: typeof prev?.joinedAt === 'number' ? prev.joinedAt : Date.now(),
-    outfitId: loadSavedOutfitId() ?? 'default',
+    joinedAt: typeof prev?.joinedAt === "number" ? prev.joinedAt : Date.now(),
+    outfitId: loadSavedOutfitId() ?? "default",
     // Self-signed name↔key cert (Slice 1): proves the identity key holder
     // claims this name. Re-signed on every upsert so a name edit re-certs.
     keyB64: getIdentityPub(),
@@ -1596,8 +2001,10 @@ function updateLocalPlayerEntry(): void {
  * players entry yet renders shortened rather than as a full UUID.
  */
 function resolveOwnerLabel(owner: string): string {
-  const entry = yjsSync?.doc.getMap('players').get(owner) as Partial<PlayerEntry> | undefined;
-  if (entry && typeof entry.name === 'string' && entry.name) {
+  const entry = yjsSync?.doc.getMap("players").get(owner) as
+    | Partial<PlayerEntry>
+    | undefined;
+  if (entry && typeof entry.name === "string" && entry.name) {
     return entry.name;
   }
   return owner.length > 16 ? `${owner.slice(0, 8)}…` : owner;
@@ -1609,8 +2016,11 @@ function resolveOwnerLabel(owner: string): string {
  *  its shares (joint owners are owner-equivalent everywhere: docking, edit
  *  mode, policies, co-hosts — every gate funnels through this check). */
 function isLocalPlayerRoomOwner(owner: string): boolean {
-  return owner === getPlayerId() || owner === 'Local-Clone'
-    || isVentureShareholder(getIdentityPub());
+  return (
+    owner === getPlayerId() ||
+    owner === "Local-Clone" ||
+    isVentureShareholder(getIdentityPub())
+  );
 }
 
 /**
@@ -1630,25 +2040,25 @@ function isLocalPlayerRoomOwner(owner: string): boolean {
  * would be a guess for 2+ remote players.
  */
 function renderPhonePlayersList(): void {
-  const countEl = document.getElementById('phone-players-count');
-  const listEl = document.getElementById('phone-players-list');
+  const countEl = document.getElementById("phone-players-count");
+  const listEl = document.getElementById("phone-players-list");
   if (!countEl || !listEl) return;
-  listEl.textContent = '';
+  listEl.textContent = "";
 
   const sync = yjsSync;
   if (!sync) {
-    countEl.textContent = '--';
-    const offline = document.createElement('li');
-    offline.className = 'phone-players-empty';
-    offline.textContent = 'OFFLINE · no room link';
+    countEl.textContent = "--";
+    const offline = document.createElement("li");
+    offline.className = "phone-players-empty";
+    offline.textContent = "OFFLINE · no room link";
     listEl.appendChild(offline);
     return;
   }
 
-  const players = sync.doc.getMap('players');
+  const players = sync.doc.getMap("players");
   const rows: Array<{ id: string; entry: Partial<PlayerEntry> }> = [];
   players.forEach((value, key) => {
-    if (value && typeof value === 'object') {
+    if (value && typeof value === "object") {
       rows.push({ id: key, entry: value as Partial<PlayerEntry> });
     }
   });
@@ -1657,16 +2067,21 @@ function renderPhonePlayersList(): void {
   countEl.textContent = String(rows.length);
   const myId = getPlayerId();
   for (const { id, entry } of rows) {
-    const li = document.createElement('li');
-    li.className = 'phone-players-row';
-    const nameSpan = document.createElement('span');
-    nameSpan.className = 'phone-players-name';
-    nameSpan.textContent = (entry.name || 'Unknown-Clone') + (id === myId ? ' (you)' : '');
-    const sinceSpan = document.createElement('span');
-    sinceSpan.className = 'phone-players-since';
-    sinceSpan.textContent = typeof entry.joinedAt === 'number'
-      ? new Date(entry.joinedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      : '--:--';
+    const li = document.createElement("li");
+    li.className = "phone-players-row";
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "phone-players-name";
+    nameSpan.textContent =
+      (entry.name || "Unknown-Clone") + (id === myId ? " (you)" : "");
+    const sinceSpan = document.createElement("span");
+    sinceSpan.className = "phone-players-since";
+    sinceSpan.textContent =
+      typeof entry.joinedAt === "number"
+        ? new Date(entry.joinedAt).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "--:--";
     li.appendChild(nameSpan);
     li.appendChild(sinceSpan);
 
@@ -1676,32 +2091,42 @@ function renderPhonePlayersList(): void {
     // keyless entries get no button (nothing verifiable to add). The contacts
     // subscriber re-renders this list, so a successful add swaps the button for
     // the ★ FRIEND badge (and the room list recategorizes into Friends' Rooms).
-    if (id !== myId && typeof entry.keyB64 === 'string' && entry.keyB64 && typeof entry.keySig === 'string' && entry.keySig) {
+    if (
+      id !== myId &&
+      typeof entry.keyB64 === "string" &&
+      entry.keyB64 &&
+      typeof entry.keySig === "string" &&
+      entry.keySig
+    ) {
       const pub = entry.keyB64;
       const keySig = entry.keySig;
-      const entryName = entry.name || 'Unknown-Clone';
+      const entryName = entry.name || "Unknown-Clone";
       const existing = getContact(pub);
       if (existing?.friend) {
-        const badge = document.createElement('span');
-        badge.className = 'phone-players-friend-badge';
-        badge.textContent = '★ FRIEND';
+        const badge = document.createElement("span");
+        badge.className = "phone-players-friend-badge";
+        badge.textContent = "★ FRIEND";
         badge.title = `Friend · key ${contactFingerprint(pub)}`;
         li.appendChild(badge);
       } else {
-        const btn = document.createElement('button');
-        btn.className = 'phone-players-friend-btn';
-        btn.textContent = existing ? '★ BEFRIEND' : '+ FRIEND';
+        const btn = document.createElement("button");
+        btn.className = "phone-players-friend-btn";
+        btn.textContent = existing ? "★ BEFRIEND" : "+ FRIEND";
         btn.title = existing
           ? `Promote this contact to a friend · key ${contactFingerprint(pub)}`
           : `Add to Contacts as a friend · key ${contactFingerprint(pub)}`;
-        btn.addEventListener('click', (e) => {
+        btn.addEventListener("click", (e) => {
           e.stopPropagation();
-          const res = addContactFromRoomEntry(pub, entryName, keySig, { friend: true });
+          const res = addContactFromRoomEntry(pub, entryName, keySig, {
+            friend: true,
+          });
           if (res.ok) {
-            logToPhoneSystem(`⭐ ${entryName} added to your friends (key ${contactFingerprint(pub)}).`);
+            logToPhoneSystem(
+              `⭐ ${entryName} added to your friends (key ${contactFingerprint(pub)}).`,
+            );
             // contacts notify() re-renders this list → badge replaces button.
           } else {
-            btn.textContent = '✗ UNVERIFIED';
+            btn.textContent = "✗ UNVERIFIED";
             btn.disabled = true;
             btn.title = res.error;
           }
@@ -1721,8 +2146,11 @@ function renderPhonePlayersList(): void {
 function harvestStationAtlas(): void {
   const roomId = activeBootstrap?.roomId;
   if (!roomId) return;
-  const name = (yjsSync?.doc.getMap('roomInfo').get('name') as string | undefined) || 'Module';
-  const seed = passSeed(roomId) ?? moduleLedger().find((e) => e.roomId === roomId)?.seed;
+  const name =
+    (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) ||
+    "Module";
+  const seed =
+    passSeed(roomId) ?? moduleLedger().find((e) => e.roomId === roomId)?.seed;
   const doors = [...readAllDoors().entries()]
     .filter(([, r]) => r.paired && r.connectedRoomAddress)
     .map(([doorId, r]) => ({
@@ -1745,28 +2173,37 @@ function harvestStationAtlas(): void {
 // panel says so honestly instead of faking a number.
 
 function renderBankApp(): void {
-  const view = document.getElementById('phone-app-bank');
+  const view = document.getElementById("phone-app-bank");
   if (!view) return;
   // Same black-inheritance fix as the VENTURES app (portfolio/property rows).
-  view.style.color = '#e8d5a3';
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  view.style.color = "#e8d5a3";
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
   const myPub = getIdentityPub();
-  const header = (t: string) => `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+  const header = (t: string) =>
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
 
   const current = ventureRecord();
   const ledger = ventureLedger();
   const seen = new Set<string>();
   const rows: string[] = [];
-  const stakeRow = (name: string, mine: number, total: number, here: boolean) => {
+  const stakeRow = (
+    name: string,
+    mine: number,
+    total: number,
+    here: boolean,
+  ) => {
     const pct = total > 0 ? Math.round((mine / total) * 100) : 0;
     return `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
-      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span>' : ''}</span>
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.4); font-size:9px;">· here</span>' : ""}</span>
       <span style="flex-shrink:0; color:#f0c060;">${mine} shares <span style="color:rgba(212,168,75,0.5);">(${pct}%)</span></span>
     </div>`;
   };
   if (current && (current.shares[myPub] ?? 0) > 0) {
     seen.add(current.id);
-    rows.push(stakeRow(current.name, current.shares[myPub], current.totalShares, true));
+    rows.push(
+      stakeRow(current.name, current.shares[myPub], current.totalShares, true),
+    );
   }
   for (const e of ledger) {
     if (seen.has(e.id) || e.myShares <= 0) continue;
@@ -1780,26 +2217,36 @@ function renderBankApp(): void {
       <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:3px;" title="Your account key — share it to receive shares">KEY ${esc(contactFingerprint(myPub))}</div>
       <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px; word-break:break-all;">${esc(myPub)}</div>
     </div>
-    ${header('PORTFOLIO')}
-    ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
+    ${header("PORTFOLIO")}
+    ${rows.length ? rows.join("") : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No holdings yet — found a venture (🚀 VENTURES) or receive shares from one.</div>'}
     ${(() => {
       // 🎰 #69: chips are PER-CASINO records — and PHYSICAL (owner rule):
       // the BANK shows the chips themselves, never a total. Count them, or
       // walk to the room's CASHIER for the number.
       const chips = readChips(getPlayerId());
-      return chips > 0 ? `${header('CHIPS')}
+      return chips > 0
+        ? `${header("CHIPS")}
         <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
         <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
-        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>` : '';
+        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>`
+        : "";
     })()}
-    ${header('PROPERTY')}
-    ${deedsLedger().length
-      ? deedsLedger().map((d) => `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+    ${header("PROPERTY")}
+    ${
+      deedsLedger().length
+        ? deedsLedger()
+            .map(
+              (
+                d,
+              ) => `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
           <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(d.name)}</span>
-          <span style="flex-shrink:0; color:#f0c060; font-size:9px;">${d.ventureName ? `🚀 ${esc(d.ventureName)}` : 'DEED HELD'}</span>
-        </div>`).join('')
-      : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No deeds yet — modules you own list here (manage them in 🚀 VENTURES → REAL ESTATE).</div>'}
-    ${header('THE REGISTRY')}
+          <span style="flex-shrink:0; color:#f0c060; font-size:9px;">${d.ventureName ? `🚀 ${esc(d.ventureName)}` : "DEED HELD"}</span>
+        </div>`,
+            )
+            .join("")
+        : '<div style="font-size:10px; color:rgba(212,168,75,0.4); margin-top:5px;">No deeds yet — modules you own list here (manage them in 🚀 VENTURES → REAL ESTATE).</div>'
+    }
+    ${header("THE REGISTRY")}
     <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; line-height:1.6;">
       Chia account: kept by your station node (test network). Balances and
       on-Registry share trading appear here when the node's account service
@@ -1817,13 +2264,13 @@ function renderBankApp(): void {
 // Plain-language rule: deeds/charters/shares/ventures only — no chain jargon.
 
 /** Which detail screen is open ('' = the list). */
-let ventureDetailId = '';
+let ventureDetailId = "";
 /** 🏠 Which deed detail is open ('' = none) — exclusive with ventureDetailId. */
-let deedDetailRoomId = '';
+let deedDetailRoomId = "";
 /** Two-step hand-over guard: the recipient playerId armed by the first click;
  *  a second click on the SAME recipient executes. Any repaint keeps it — only
  *  back/open/select-change re-arm. */
-let deedHandoverArmed = '';
+let deedHandoverArmed = "";
 
 function syncVentureLedgerFromCurrentRoom(): void {
   const v = ventureRecord();
@@ -1844,7 +2291,8 @@ function syncVentureLedgerFromCurrentRoom(): void {
   const entry = {
     id: v.id,
     name: v.name,
-    officeRoomId: v.officeRoomId ?? (isOffice ? roomId : prior?.officeRoomId ?? ''),
+    officeRoomId:
+      v.officeRoomId ?? (isOffice ? roomId : (prior?.officeRoomId ?? "")),
     myShares: ledgerFresher ? (prior!.shares?.[myPub] ?? mine) : mine,
     totalShares: v.totalShares,
     lastSeenAt: Date.now(),
@@ -1865,11 +2313,15 @@ function syncVentureLedgerFromCurrentRoom(): void {
  *  not the right to hand the module away). Legacy 'Local-Clone' rooms count
  *  as mine, matching `categorizeRoom`. */
 function currentRoomDeedIsMine(): boolean {
-  const ownerVal = yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined;
-  if (typeof ownerVal !== 'string' || !ownerVal) return false;
-  if (ownerVal === getPlayerId() || ownerVal === 'Local-Clone') return true;
-  const entry = yjsSync?.doc.getMap('players').get(ownerVal) as Partial<PlayerEntry> | undefined;
-  return typeof entry?.keyB64 === 'string' && entry.keyB64 === getIdentityPub();
+  const ownerVal = yjsSync?.doc.getMap("roomInfo").get("owner") as
+    | string
+    | undefined;
+  if (typeof ownerVal !== "string" || !ownerVal) return false;
+  if (ownerVal === getPlayerId() || ownerVal === "Local-Clone") return true;
+  const entry = yjsSync?.doc.getMap("players").get(ownerVal) as
+    | Partial<PlayerEntry>
+    | undefined;
+  return typeof entry?.keyB64 === "string" && entry.keyB64 === getIdentityPub();
 }
 
 /** Visitation harvest (the atlas/venture-ledger pattern): the room we're IN
@@ -1879,11 +2331,18 @@ function currentRoomDeedIsMine(): boolean {
 function syncDeedsLedgerFromCurrentRoom(): void {
   const roomId = activeBootstrap?.roomId;
   if (!roomId || !yjsSync) return;
-  const ownerVal = yjsSync.doc.getMap('roomInfo').get('owner') as string | undefined;
+  const ownerVal = yjsSync.doc.getMap("roomInfo").get("owner") as
+    | string
+    | undefined;
   // Owner not synced yet ⇒ decide NOTHING (never drop a deed on stale silence).
-  if (typeof ownerVal !== 'string' || !ownerVal) return;
-  if (!currentRoomDeedIsMine()) { removeDeed(roomId); return; }
-  const name = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Module';
+  if (typeof ownerVal !== "string" || !ownerVal) return;
+  if (!currentRoomDeedIsMine()) {
+    removeDeed(roomId);
+    return;
+  }
+  const name =
+    (yjsSync.doc.getMap("roomInfo").get("name") as string | undefined) ||
+    "Module";
   const v = ventureRecord();
   upsertDeed({
     roomId,
@@ -1906,10 +2365,12 @@ function executeDeedHandover(toPlayerId: string): boolean {
   if (!yjsSync || !activeBootstrap?.roomId) return false;
   if (!currentRoomDeedIsMine() || isOfficeHere()) return false;
   if (!toPlayerId || toPlayerId === getPlayerId()) return false;
-  const entry = yjsSync.doc.getMap('players').get(toPlayerId) as Partial<PlayerEntry> | undefined;
-  if (!entry || typeof entry.keyB64 !== 'string' || !entry.keyB64) return false;
-  const rm = yjsSync.doc.getMap('roomInfo');
-  yjsSync.doc.transact(() => rm.set('owner', toPlayerId));
+  const entry = yjsSync.doc.getMap("players").get(toPlayerId) as
+    | Partial<PlayerEntry>
+    | undefined;
+  if (!entry || typeof entry.keyB64 !== "string" || !entry.keyB64) return false;
+  const rm = yjsSync.doc.getMap("roomInfo");
+  yjsSync.doc.transact(() => rm.set("owner", toPlayerId));
   return true;
 }
 
@@ -1918,18 +2379,18 @@ function executeDeedHandover(toPlayerId: string): boolean {
 /** REDEEM box state — module-level so it survives repaints AND app re-opens:
  *  the flow is paste → travel to the asset → redeem, and a phone toggle or a
  *  remote doc change landing mid-journey must not eat the pasted offer. */
-let offerRedeemRaw = '';
-let offerRedeemNote = '';
+let offerRedeemRaw = "";
+let offerRedeemNote = "";
 /** "Accept as" choice for an open deed offer ('' = myself, else a venture id
  *  from my ledger) — module state so a mid-choice repaint can't silently
  *  reset the select to "myself" before REDEEM lands. */
-let offerAcceptAs = '';
+let offerAcceptAs = "";
 /** Feedback line for the cut-an-offer blocks (copied / saved / refused). */
-let offerCutNote = '';
+let offerCutNote = "";
 /** 🤝 The nonce of a co-present settle request I (the receiver) have posted and
  *  am waiting on — module state so the preview keeps showing "waiting" across
  *  repaints and app re-opens until it flips to settled/refused. */
-let offerCopresentPending = '';
+let offerCopresentPending = "";
 /** 🤝 Nonces the maker's client is actively settling — guards double-settle
  *  (re-entrant observer fires); claimed synchronously before the first await. */
 const copresentHandled = new Set<string>();
@@ -1944,11 +2405,14 @@ function notifyNewCopresentRequests(): void {
   if (!yjsSync) return;
   const myPub = getIdentityPub();
   for (const { nonce, req } of listSettleRequests(yjsSync.doc)) {
-    if (req.status !== 'pending' || copresentPinged.has(nonce)) continue;
+    if (req.status !== "pending" || copresentPinged.has(nonce)) continue;
     const offer = decodeOffer(req.offer);
-    if (!offer || offer.asset.kind !== 'deed' || offer.makerPub !== myPub) continue;
+    if (!offer || offer.asset.kind !== "deed" || offer.makerPub !== myPub)
+      continue;
     copresentPinged.add(nonce);
-    logToPhoneSystem(`🤝 ${req.requesterName} is here and wants ${offer.asset.roomName || 'your module'} — settle it in VENTURES.`);
+    logToPhoneSystem(
+      `🤝 ${req.requesterName} is here and wants ${offer.asset.roomName || "your module"} — settle it in VENTURES.`,
+    );
   }
 }
 
@@ -1959,7 +2423,8 @@ function notifyNewCopresentRequests(): void {
 
 /** Read a player's keyed entry from the CURRENT room doc, as the portable owner
  *  record to carry into the module (the name↔key cert is room-agnostic). */
-const delay = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+const delay = (ms: number) =>
+  new Promise<void>((r) => window.setTimeout(r, ms));
 
 /**
  * Open a room's doc in the BACKGROUND (its own provider + YjsSync, the
@@ -1975,7 +2440,10 @@ const delay = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms))
  * (not gated on owner being empty), and refuses (null) if the owner never
  * arrives rather than acting on a blank doc.
  */
-async function withBackgroundRoom<T>(seed: string, fn: (doc: Y.Doc) => T): Promise<T | null> {
+async function withBackgroundRoom<T>(
+  seed: string,
+  fn: (doc: Y.Doc) => T,
+): Promise<T | null> {
   const decoded = decodeBootstrapInput(seed);
   if (!decoded) return null;
   let provider: NetworkProvider | null = null;
@@ -1985,8 +2453,13 @@ async function withBackgroundRoom<T>(seed: string, fn: (doc: Y.Doc) => T): Promi
     const boot = await resolveBridgeBootstrap(decoded);
     provider = new NetworkProvider();
     await provider.connect(boot);
-    const channel = await provider.openChannel('ysync');
-    sync = new YjsSync({ roomId: boot.roomId, channel, ...ysyncSigner(), bootRecord: () => provider!.getBootRecord() });
+    const channel = await provider.openChannel("ysync");
+    sync = new YjsSync({
+      roomId: boot.roomId,
+      channel,
+      ...ysyncSigner(),
+      bootRecord: () => provider!.getBootRecord(),
+    });
     // NOTE: no restoreRoomSnapshot — the owner-match must see network truth.
     cache = attachRoomCache(sync.doc, boot.roomId, () => true);
     await sync.start();
@@ -1998,18 +2471,30 @@ async function withBackgroundRoom<T>(seed: string, fn: (doc: Y.Doc) => T): Promi
     await delay(2000);
     // Refuse rather than act on a doc whose owner never arrived (a blank owner
     // would make settleDeedInDoc bail, but be explicit).
-    if (!sync.doc.getMap('roomInfo').get('owner')) return null;
+    if (!sync.doc.getMap("roomInfo").get("owner")) return null;
     const result = fn(sync.doc);
     cache.flushNow(); // persist locally
     await delay(1800); // no send-confirmation API — let the write reach the node
     return result;
   } catch (e) {
-    console.warn('[copresent] background room open failed:', e);
+    console.warn("[copresent] background room open failed:", e);
     return null;
   } finally {
-    try { cache?.detach(); } catch { /* ignore */ }
-    try { await sync?.stop(); } catch { /* doc may be gone */ }
-    try { await provider?.disconnect(); } catch { /* transport may be gone */ }
+    try {
+      cache?.detach();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await sync?.stop();
+    } catch {
+      /* doc may be gone */
+    }
+    try {
+      await provider?.disconnect();
+    } catch {
+      /* transport may be gone */
+    }
   }
 }
 
@@ -2025,49 +2510,89 @@ async function executeCopresentSettle(nonce: string): Promise<void> {
   // must target THIS room even if the maker changes rooms during the
   // background settle, or the receiver is never told the deed moved.
   const roomDoc = yjsSync.doc;
-  const roomId = activeBootstrap?.roomId ?? ''; // the room the request lives in (verify runs before any await)
+  const roomId = activeBootstrap?.roomId ?? ""; // the room the request lives in (verify runs before any await)
   const req = readSettleRequest(roomDoc, nonce);
-  if (!req || req.status !== 'pending') return;
+  if (!req || req.status !== "pending") return;
   copresentHandled.add(nonce); // claim it — released in finally so a retry can re-run
   const alive = () => !(roomDoc as { isDestroyed?: boolean }).isDestroyed;
-  const resolve = (status: 'settled' | 'refused', error?: string) => { if (alive()) resolveSettleRequest(roomDoc, nonce, status, error); };
+  const resolve = (status: "settled" | "refused", error?: string) => {
+    if (alive()) resolveSettleRequest(roomDoc, nonce, status, error);
+  };
   try {
     const offer = decodeOffer(req.offer);
-    if (!offer || offer.asset.kind !== 'deed') { resolve('refused', 'That offer no longer reads as a deed transfer.'); return; }
+    if (!offer || offer.asset.kind !== "deed") {
+      resolve("refused", "That offer no longer reads as a deed transfer.");
+      return;
+    }
     // The request's map key MUST be the offer's own nonce — otherwise a present
     // client could pair a victim's signed tuple with a different offer.
-    if (offer.nonce !== nonce) { resolve('refused', 'This request does not match its offer.'); return; }
-    if (offer.makerPub !== getIdentityPub()) { resolve('refused', 'That is not your offer to settle.'); return; }
+    if (offer.nonce !== nonce) {
+      resolve("refused", "This request does not match its offer.");
+      return;
+    }
+    if (offer.makerPub !== getIdentityPub()) {
+      resolve("refused", "That is not your offer to settle.");
+      return;
+    }
     // Trust boundary: the owner comes from the SIGNED request (proves the
     // receiver holds the key + signed for THIS room/nonce), NOT from an
     // attacker-writable players lookup.
     const owner = verifiedRequestOwner(roomId, nonce, req);
-    if (!owner) { resolve('refused', 'The request could not be verified — ask them to send it again.'); return; }
+    if (!owner) {
+      resolve(
+        "refused",
+        "The request could not be verified — ask them to send it again.",
+      );
+      return;
+    }
     // Directed offers: the proven key must be the one it was made out to.
-    if (offer.toPub && offer.toPub !== owner.keyB64) { resolve('refused', 'This offer is made out to someone else.'); return; }
+    if (offer.toPub && offer.toPub !== owner.keyB64) {
+      resolve("refused", "This offer is made out to someone else.");
+      return;
+    }
 
     const moduleId = offer.asset.roomId;
     // Reachable module: I'm standing in it, or I hold a saved pass for it.
     if (moduleId === activeBootstrap?.roomId) {
       const r = settleDeedInDoc(roomDoc, offer, owner);
-      resolve(r.ok ? 'settled' : 'refused', r.ok ? undefined : r.error);
-      if (r.ok) { logToPhoneSystem(`🤝 Handed ${offer.asset.roomName || 'the module'} to ${owner.name}.`); syncDeedsLedgerFromCurrentRoom(); }
+      resolve(r.ok ? "settled" : "refused", r.ok ? undefined : r.error);
+      if (r.ok) {
+        logToPhoneSystem(
+          `🤝 Handed ${offer.asset.roomName || "the module"} to ${owner.name}.`,
+        );
+        syncDeedsLedgerFromCurrentRoom();
+      }
       return;
     }
     const seed = passSeed(moduleId);
     if (!seed) {
-      resolve('refused', `Can't reach ${offer.asset.roomName || 'that module'} from here — keep a pass to it in your room list to settle remotely.`);
+      resolve(
+        "refused",
+        `Can't reach ${offer.asset.roomName || "that module"} from here — keep a pass to it in your room list to settle remotely.`,
+      );
       return;
     }
-    logToPhoneSystem(`🤝 Settling ${offer.asset.roomName || 'the module'} for ${owner.name}…`);
-    const result = await withBackgroundRoom(seed, (doc) => settleDeedInDoc(doc, offer, owner));
+    logToPhoneSystem(
+      `🤝 Settling ${offer.asset.roomName || "the module"} for ${owner.name}…`,
+    );
+    const result = await withBackgroundRoom(seed, (doc) =>
+      settleDeedInDoc(doc, offer, owner),
+    );
     if (!result) {
-      resolve('refused', `Couldn't reach ${offer.asset.roomName || 'the module'} to settle — try again in a moment.`);
+      resolve(
+        "refused",
+        `Couldn't reach ${offer.asset.roomName || "the module"} to settle — try again in a moment.`,
+      );
       return;
     }
-    resolve(result.ok ? 'settled' : 'refused', result.ok ? undefined : result.error);
+    resolve(
+      result.ok ? "settled" : "refused",
+      result.ok ? undefined : result.error,
+    );
     if (result.ok) {
-      logToPhoneSystem(`🤝 Handed ${offer.asset.roomName || 'the module'} to ${owner.name}.`);
+      logToPhoneSystem(
+        `🤝 Handed ${offer.asset.roomName || "the module"} to ${owner.name}.`,
+      );
       removeDeed(moduleId); // I no longer own it — drop it from my REAL ESTATE list
     }
   } finally {
@@ -2081,32 +2606,43 @@ async function executeCopresentSettle(nonce: string): Promise<void> {
 // dev-phase posture; stripped from production builds).
 if (import.meta.env.DEV) {
   (window as unknown as { __ssfCopresentTest?: unknown }).__ssfCopresentTest = {
-    withBackgroundRoom, executeCopresentSettle,
+    withBackgroundRoom,
+    executeCopresentSettle,
   };
 }
 
-function parseOfferRecipient(value: string): { toPub?: string; toVentureId?: string; toVentureName?: string } {
-  if (value.startsWith('pub:')) return { toPub: value.slice(4) };
-  if (value.startsWith('vnt:')) {
+function parseOfferRecipient(value: string): {
+  toPub?: string;
+  toVentureId?: string;
+  toVentureName?: string;
+} {
+  if (value.startsWith("pub:")) return { toPub: value.slice(4) };
+  if (value.startsWith("vnt:")) {
     const id = value.slice(4);
-    return { toVentureId: id, toVentureName: ventureLedger().find((e) => e.id === id)?.name };
+    return {
+      toVentureId: id,
+      toVentureName: ventureLedger().find((e) => e.id === id)?.name,
+    };
   }
   return {}; // bearer — first redeemer takes it, exactly a Chia offer file
 }
 
 const OFFER_TTL_CHOICES = [
-  { value: '1d', label: 'good 1 day', ms: 24 * 60 * 60 * 1000 },
-  { value: '7d', label: 'good 7 days', ms: 7 * 24 * 60 * 60 * 1000 },
-  { value: '30d', label: 'good 30 days', ms: 30 * 24 * 60 * 60 * 1000 },
+  { value: "1d", label: "good 1 day", ms: 24 * 60 * 60 * 1000 },
+  { value: "7d", label: "good 7 days", ms: 7 * 24 * 60 * 60 * 1000 },
+  { value: "30d", label: "good 30 days", ms: 30 * 24 * 60 * 60 * 1000 },
 ] as const;
 
 function offerTtlMs(value: string): number {
-  return OFFER_TTL_CHOICES.find((c) => c.value === value)?.ms ?? OFFER_TTL_CHOICES[1].ms;
+  return (
+    OFFER_TTL_CHOICES.find((c) => c.value === value)?.ms ??
+    OFFER_TTL_CHOICES[1].ms
+  );
 }
 
 function offerExpiresIn(ts: number): string {
   const ms = ts - Date.now();
-  if (ms <= 0) return 'expired';
+  if (ms <= 0) return "expired";
   const d = Math.floor(ms / 86400000);
   const h = Math.floor((ms % 86400000) / 3600000);
   if (d > 0) return `${d}d ${h}h left`;
@@ -2115,21 +2651,24 @@ function offerExpiresIn(ts: number): string {
 }
 
 /** COPY / SAVE dispatch shared by the deed and share offer blocks. */
-function shipOffer(offer: TransferOffer, mode: 'copy' | 'save'): void {
+function shipOffer(offer: TransferOffer, mode: "copy" | "save"): void {
   recordOfferMade(offer);
   const encoded = encodeOffer(offer);
-  if (mode === 'copy') {
-    offerCutNote = '📋 Offer signed and copied — send it to the recipient any way you like.';
+  if (mode === "copy") {
+    offerCutNote =
+      "📋 Offer signed and copied — send it to the recipient any way you like.";
     navigator.clipboard?.writeText(encoded).then(undefined, () => {
       // Post-repaint fallback note (the repaint already painted the optimistic one).
-      const note = document.getElementById('offer-cut-note');
-      if (note) note.textContent = 'Copy failed — use 💾 SAVE FILE instead.';
+      const note = document.getElementById("offer-cut-note");
+      if (note) note.textContent = "Copy failed — use 💾 SAVE FILE instead.";
     });
   } else {
-    offerCutNote = '💾 Offer signed and saved as a file — send it to the recipient.';
-    const blob = new Blob([encoded], { type: 'text/plain' });
-    const a = Object.assign(document.createElement('a'), {
-      href: URL.createObjectURL(blob), download: offerFileName(offer),
+    offerCutNote =
+      "💾 Offer signed and saved as a file — send it to the recipient.";
+    const blob = new Blob([encoded], { type: "text/plain" });
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(blob),
+      download: offerFileName(offer),
     });
     a.click();
     URL.revokeObjectURL(a.href);
@@ -2139,238 +2678,332 @@ function shipOffer(offer: TransferOffer, mode: 'copy' | 'save'): void {
 /** OFFERS OUT rows for one asset (deed detail / venture detail screens).
  *  `atAsset` = standing in the settlement doc: marks are live and ✗ REVOKE works. */
 function offersOutRows(
-  match: (o: TransferOffer) => boolean, atAsset: boolean,
-  esc: (s: string) => string, pill: string,
+  match: (o: TransferOffer) => boolean,
+  atAsset: boolean,
+  esc: (s: string) => string,
+  pill: string,
 ): string {
   const rows = offersMade().filter((e) => match(e.offer));
-  if (!rows.length) return '';
-  const items = rows.map(({ offer }) => {
-    const mark = atAsset ? nonceMark(offer.nonce) : null;
-    const status = mark
-      ? (mark.status === 'redeemed' ? `✓ redeemed by ${esc(mark.byName || 'a clone')}` : '✗ revoked')
-      : offerExpiresIn(offer.expiresAt);
-    const to = offer.toPub
-      ? `to ${esc(listContacts().find((c) => c.pub === offer.toPub)?.name ?? contactFingerprint(offer.toPub))}`
-      : offer.toVentureId ? `to 🚀 ${esc(offer.toVentureName ?? 'venture')}` : '⚠ bearer';
-    const what = offer.asset.kind === 'shares' ? `${offer.asset.count} shares` : 'the deed';
-    const live = !mark && offer.expiresAt > Date.now();
-    return `<div style="display:flex; align-items:center; gap:4px; margin-top:4px; font-size:9px;">
+  if (!rows.length) return "";
+  const items = rows
+    .map(({ offer }) => {
+      const mark = atAsset ? nonceMark(offer.nonce) : null;
+      const status = mark
+        ? mark.status === "redeemed"
+          ? `✓ redeemed by ${esc(mark.byName || "a clone")}`
+          : "✗ revoked"
+        : offerExpiresIn(offer.expiresAt);
+      const to = offer.toPub
+        ? `to ${esc(listContacts().find((c) => c.pub === offer.toPub)?.name ?? contactFingerprint(offer.toPub))}`
+        : offer.toVentureId
+          ? `to 🚀 ${esc(offer.toVentureName ?? "venture")}`
+          : "⚠ bearer";
+      const what =
+        offer.asset.kind === "shares"
+          ? `${offer.asset.count} shares`
+          : "the deed";
+      const live = !mark && offer.expiresAt > Date.now();
+      return `<div style="display:flex; align-items:center; gap:4px; margin-top:4px; font-size:9px;">
       <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📤 ${what} ${to} · <span style="color:rgba(212,168,75,0.7);">${status}</span></span>
-      ${live ? `<button type="button" data-venture-action="offer-recopy" data-nonce="${esc(offer.nonce)}" style="${pill}" title="copy again">📋</button>` : ''}
-      ${live && atAsset ? `<button type="button" data-venture-action="offer-revoke" data-nonce="${esc(offer.nonce)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" title="revoke">✗</button>` : ''}
+      ${live ? `<button type="button" data-venture-action="offer-recopy" data-nonce="${esc(offer.nonce)}" style="${pill}" title="copy again">📋</button>` : ""}
+      ${live && atAsset ? `<button type="button" data-venture-action="offer-revoke" data-nonce="${esc(offer.nonce)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" title="revoke">✗</button>` : ""}
     </div>`;
-  }).join('');
-  return `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">OFFERS OUT</div>${items}${atAsset ? '' : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Revoking is done standing at the asset.</div>'}`;
+    })
+    .join("");
+  return `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">OFFERS OUT</div>${items}${atAsset ? "" : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Revoking is done standing at the asset.</div>'}`;
 }
 
 function renderVenturesApp(): void {
-  const view = document.getElementById('phone-app-ventures');
+  const view = document.getElementById("phone-app-ventures");
   if (!view) return;
   // Readable default: template lines without an explicit color used to
   // inherit BLACK on the near-black screen (cap-table names, property rows).
-  view.style.color = '#e8d5a3';
+  view.style.color = "#e8d5a3";
   if (!view.dataset.wired) {
-    view.dataset.wired = '1';
+    view.dataset.wired = "1";
     // "Accept as" survives repaints: stash the choice in module state on
     // change and re-inject `selected` — otherwise a remote doc change could
     // silently reset the select to "myself" right before REDEEM lands.
-    view.addEventListener('change', (e) => {
+    view.addEventListener("change", (e) => {
       const sel = e.target as HTMLSelectElement | null;
-      if (sel?.id === 'offer-accept-as') offerAcceptAs = sel.value;
+      if (sel?.id === "offer-accept-as") offerAcceptAs = sel.value;
     });
-    view.addEventListener('click', (e) => {
-      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-venture-action]');
+    view.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-venture-action]",
+      );
       if (!el) return;
       const action = el.dataset.ventureAction;
       const myPub = getIdentityPub();
-      if (action === 'open') {
-        ventureDetailId = el.dataset.id ?? '';
-        deedDetailRoomId = '';
-        deedHandoverArmed = '';
-        offerCutNote = '';
-      } else if (action === 'back') {
-        ventureDetailId = '';
-        deedDetailRoomId = '';
-        deedHandoverArmed = '';
-        offerCutNote = '';
-      } else if (action === 'deed-open') {
-        deedDetailRoomId = el.dataset.id ?? '';
-        ventureDetailId = '';
-        deedHandoverArmed = '';
-        offerCutNote = '';
-      } else if (action === 'deed-transfer') {
-        const sel = document.getElementById('deed-transfer-to') as HTMLSelectElement | null;
-        const toId = sel?.value ?? '';
+      if (action === "open") {
+        ventureDetailId = el.dataset.id ?? "";
+        deedDetailRoomId = "";
+        deedHandoverArmed = "";
+        offerCutNote = "";
+      } else if (action === "back") {
+        ventureDetailId = "";
+        deedDetailRoomId = "";
+        deedHandoverArmed = "";
+        offerCutNote = "";
+      } else if (action === "deed-open") {
+        deedDetailRoomId = el.dataset.id ?? "";
+        ventureDetailId = "";
+        deedHandoverArmed = "";
+        offerCutNote = "";
+      } else if (action === "deed-transfer") {
+        const sel = document.getElementById(
+          "deed-transfer-to",
+        ) as HTMLSelectElement | null;
+        const toId = sel?.value ?? "";
         if (!toId) return;
         if (deedHandoverArmed !== toId) {
           deedHandoverArmed = toId; // first click ARMS; the repaint shows CONFIRM
         } else if (executeDeedHandover(toId)) {
-          deedHandoverArmed = '';
-          deedDetailRoomId = '';
+          deedHandoverArmed = "";
+          deedDetailRoomId = "";
           syncDeedsLedgerFromCurrentRoom(); // drops the deed we just handed over
         } else {
-          deedHandoverArmed = '';
-          const note = document.getElementById('deed-transfer-note');
-          if (note) note.textContent = 'hand-over refused — recipient must have visited this room';
+          deedHandoverArmed = "";
+          const note = document.getElementById("deed-transfer-note");
+          if (note)
+            note.textContent =
+              "hand-over refused — recipient must have visited this room";
           return; // keep the screen for correction
         }
-      } else if (action === 'found') {
-        offerCutNote = ''; // a fresh charter screen must not inherit offer feedback
-        const nameInput = document.getElementById('venture-found-name') as HTMLInputElement | null;
-        const name = nameInput?.value.trim() ?? '';
+      } else if (action === "found") {
+        offerCutNote = ""; // a fresh charter screen must not inherit offer feedback
+        const nameInput = document.getElementById(
+          "venture-found-name",
+        ) as HTMLInputElement | null;
+        const name = nameInput?.value.trim() ?? "";
         if (!name) return;
-        if (foundVenture(name, myPub, getPlayerName(), activeBootstrap?.roomId)) {
+        if (
+          foundVenture(name, myPub, getPlayerName(), activeBootstrap?.roomId)
+        ) {
           syncVentureLedgerFromCurrentRoom();
           const v = ventureRecord();
           if (v) ventureDetailId = v.id;
         }
-      } else if (action === 'add-property') {
+      } else if (action === "add-property") {
         // 🏠 V2: assign MY unchartered room to a venture I hold shares in —
         // the link snapshots the freshest cap table my ledger has seen.
         const entry = ventureLedger().find((e) => e.id === el.dataset.id);
-        if (entry && writeVentureLink(entry)) syncVentureLedgerFromCurrentRoom();
-      } else if (action === 'detach-property') {
+        if (entry && writeVentureLink(entry))
+          syncVentureLedgerFromCurrentRoom();
+      } else if (action === "detach-property") {
         // Personal owner of a property room casts it out of the venture.
         removeVentureLink();
-      } else if (action === 'transfer') {
-        const pubInput = document.getElementById('venture-transfer-pub') as HTMLInputElement | null;
-        const countInput = document.getElementById('venture-transfer-count') as HTMLInputElement | null;
-        const toPub = pubInput?.value.trim() ?? '';
+      } else if (action === "transfer") {
+        const pubInput = document.getElementById(
+          "venture-transfer-pub",
+        ) as HTMLInputElement | null;
+        const countInput = document.getElementById(
+          "venture-transfer-count",
+        ) as HTMLInputElement | null;
+        const toPub = pubInput?.value.trim() ?? "";
         const count = Math.floor(Number(countInput?.value ?? 0));
         if (!toPub || !(count > 0)) return;
         // Recipient display name from contacts when we know them (pub-keyed).
         const known = listContacts().find((c) => c.pub === toPub);
-        if (transferShares(getIdentityPub(), toPub, known?.name ?? 'Unknown-Clone', count)) {
+        if (
+          transferShares(
+            getIdentityPub(),
+            toPub,
+            known?.name ?? "Unknown-Clone",
+            count,
+          )
+        ) {
           syncVentureLedgerFromCurrentRoom();
-          if (pubInput) pubInput.value = '';
-          if (countInput) countInput.value = '';
+          if (pubInput) pubInput.value = "";
+          if (countInput) countInput.value = "";
         } else {
-          const note = document.getElementById('venture-transfer-note');
-          if (note) note.textContent = 'transfer refused — check the key and your share count';
+          const note = document.getElementById("venture-transfer-note");
+          if (note)
+            note.textContent =
+              "transfer refused — check the key and your share count";
           return; // keep inputs for correction
         }
-      } else if (action === 'deed-offer-copy' || action === 'deed-offer-save') {
+      } else if (action === "deed-offer-copy" || action === "deed-offer-save") {
         // 📤 Sign a deed transfer offer — creation is doc-free (works held-
         // from-afar too); validity proves itself at redemption.
         const d = deedsLedger().find((e) => e.roomId === deedDetailRoomId);
-        const sel = document.getElementById('deed-offer-to') as HTMLSelectElement | null;
-        const ttlSel = document.getElementById('deed-offer-ttl') as HTMLSelectElement | null;
+        const sel = document.getElementById(
+          "deed-offer-to",
+        ) as HTMLSelectElement | null;
+        const ttlSel = document.getElementById(
+          "deed-offer-ttl",
+        ) as HTMLSelectElement | null;
         if (!d || d.isOffice || !sel || !sel.value) return;
         const offer = makeOffer(
-          { kind: 'deed', roomId: d.roomId, roomName: d.name },
+          { kind: "deed", roomId: d.roomId, roomName: d.name },
           getPlayerName(),
           parseOfferRecipient(sel.value),
-          { ttlMs: offerTtlMs(ttlSel?.value ?? '7d') },
+          { ttlMs: offerTtlMs(ttlSel?.value ?? "7d") },
         );
-        shipOffer(offer, action === 'deed-offer-copy' ? 'copy' : 'save');
-      } else if (action === 'share-offer-copy' || action === 'share-offer-save') {
+        shipOffer(offer, action === "deed-offer-copy" ? "copy" : "save");
+      } else if (
+        action === "share-offer-copy" ||
+        action === "share-offer-save"
+      ) {
         const v = ventureRecord();
-        const sel = document.getElementById('share-offer-to') as HTMLSelectElement | null;
-        const ttlSel = document.getElementById('share-offer-ttl') as HTMLSelectElement | null;
-        const countInput = document.getElementById('share-offer-count') as HTMLInputElement | null;
+        const sel = document.getElementById(
+          "share-offer-to",
+        ) as HTMLSelectElement | null;
+        const ttlSel = document.getElementById(
+          "share-offer-ttl",
+        ) as HTMLSelectElement | null;
+        const countInput = document.getElementById(
+          "share-offer-count",
+        ) as HTMLInputElement | null;
         const count = Math.floor(Number(countInput?.value ?? 0));
         if (!v || v.snapshotAt !== undefined || !sel || !sel.value) return;
         if (!(count > 0)) {
-          const note = document.getElementById('offer-cut-note');
-          if (note) note.textContent = 'Enter how many shares to offer.';
+          const note = document.getElementById("offer-cut-note");
+          if (note) note.textContent = "Enter how many shares to offer.";
           return; // keep inputs for correction
         }
         if ((v.shares[myPub] ?? 0) < count) {
-          const note = document.getElementById('offer-cut-note');
-          if (note) note.textContent = `You hold ${v.shares[myPub] ?? 0} share${(v.shares[myPub] ?? 0) === 1 ? '' : 's'} — can't offer ${count}.`;
+          const note = document.getElementById("offer-cut-note");
+          if (note)
+            note.textContent = `You hold ${v.shares[myPub] ?? 0} share${(v.shares[myPub] ?? 0) === 1 ? "" : "s"} — can't offer ${count}.`;
           return; // keep inputs for correction
         }
         const offer = makeOffer(
-          { kind: 'shares', ventureId: v.id, ventureName: v.name, officeRoomId: activeBootstrap?.roomId ?? v.officeRoomId ?? '', count },
+          {
+            kind: "shares",
+            ventureId: v.id,
+            ventureName: v.name,
+            officeRoomId: activeBootstrap?.roomId ?? v.officeRoomId ?? "",
+            count,
+          },
           getPlayerName(),
           parseOfferRecipient(sel.value),
-          { ttlMs: offerTtlMs(ttlSel?.value ?? '7d') },
+          { ttlMs: offerTtlMs(ttlSel?.value ?? "7d") },
         );
-        shipOffer(offer, action === 'share-offer-copy' ? 'copy' : 'save');
-      } else if (action === 'offer-recopy') {
-        const entry = offersMade().find((e) => e.offer.nonce === el.dataset.nonce);
+        shipOffer(offer, action === "share-offer-copy" ? "copy" : "save");
+      } else if (action === "offer-recopy") {
+        const entry = offersMade().find(
+          (e) => e.offer.nonce === el.dataset.nonce,
+        );
         if (entry) {
-          offerCutNote = '📋 Offer copied again.';
+          offerCutNote = "📋 Offer copied again.";
           navigator.clipboard?.writeText(entry.encoded).then(undefined, () => {
-            const note = document.getElementById('offer-cut-note');
-            if (note) note.textContent = 'Copy failed — clipboard permission was denied.';
+            const note = document.getElementById("offer-cut-note");
+            if (note)
+              note.textContent =
+                "Copy failed — clipboard permission was denied.";
           });
         }
-      } else if (action === 'offer-revoke') {
+      } else if (action === "offer-revoke") {
         // Standing in the settlement doc (the button only renders there) —
         // the mark kills the string wherever it landed.
-        const entry = offersMade().find((e) => e.offer.nonce === el.dataset.nonce);
+        const entry = offersMade().find(
+          (e) => e.offer.nonce === el.dataset.nonce,
+        );
         if (entry && revokeOffer(entry.offer, getPlayerName())) {
           dropOfferMade(entry.offer.nonce);
-          offerCutNote = '✗ Offer revoked — the copied string is dead wherever it landed.';
+          offerCutNote =
+            "✗ Offer revoked — the copied string is dead wherever it landed.";
         }
-      } else if (action === 'offer-check') {
-        const input = document.getElementById('offer-redeem-input') as HTMLTextAreaElement | null;
-        offerRedeemRaw = input?.value.trim() ?? '';
-        offerRedeemNote = offerRedeemRaw && !decodeOffer(offerRedeemRaw)
-          ? 'That does not read as a transfer offer — check the whole string was pasted.'
-          : '';
-      } else if (action === 'offer-clear') {
-        offerRedeemRaw = '';
-        offerRedeemNote = '';
-        offerAcceptAs = '';
-      } else if (action === 'offer-redeem') {
+      } else if (action === "offer-check") {
+        const input = document.getElementById(
+          "offer-redeem-input",
+        ) as HTMLTextAreaElement | null;
+        offerRedeemRaw = input?.value.trim() ?? "";
+        offerRedeemNote =
+          offerRedeemRaw && !decodeOffer(offerRedeemRaw)
+            ? "That does not read as a transfer offer — check the whole string was pasted."
+            : "";
+      } else if (action === "offer-clear") {
+        offerRedeemRaw = "";
+        offerRedeemNote = "";
+        offerAcceptAs = "";
+      } else if (action === "offer-redeem") {
         const offer = decodeOffer(offerRedeemRaw);
         if (!offer) return;
-        const result = offer.asset.kind === 'deed'
-          ? redeemDeedOffer(offer, {
-            currentRoomId: activeBootstrap?.roomId ?? '',
-            myPlayerId: getPlayerId(), myPub, myName: getPlayerName(),
-            // ACCEPT FOR A COMPANY (owner request): only meaningful for an
-            // OPEN deed offer — a maker-directed venture wins in offers.ts.
-            acceptForVentureId: offerAcceptAs || undefined,
-          })
-          : redeemShareOffer(offer, myPub, getPlayerName());
+        const result =
+          offer.asset.kind === "deed"
+            ? redeemDeedOffer(offer, {
+                currentRoomId: activeBootstrap?.roomId ?? "",
+                myPlayerId: getPlayerId(),
+                myPub,
+                myName: getPlayerName(),
+                // ACCEPT FOR A COMPANY (owner request): only meaningful for an
+                // OPEN deed offer — a maker-directed venture wins in offers.ts.
+                acceptForVentureId: offerAcceptAs || undefined,
+              })
+            : redeemShareOffer(offer, myPub, getPlayerName());
         if (result.ok) {
-          offerRedeemRaw = '';
-          const forVenture = offer.asset.kind === 'deed' && (offer.toVentureId || offerAcceptAs);
-          offerRedeemNote = offer.asset.kind === 'deed'
-            ? (forVenture ? '🖋 The deed is the venture\'s — recorded at the module.' : '🖋 The deed is yours — recorded at the module.')
-            : '🖋 Shares recorded in the register — the stake is yours.';
-          offerAcceptAs = '';
+          offerRedeemRaw = "";
+          const forVenture =
+            offer.asset.kind === "deed" && (offer.toVentureId || offerAcceptAs);
+          offerRedeemNote =
+            offer.asset.kind === "deed"
+              ? forVenture
+                ? "🖋 The deed is the venture's — recorded at the module."
+                : "🖋 The deed is yours — recorded at the module."
+              : "🖋 Shares recorded in the register — the stake is yours.";
+          offerAcceptAs = "";
           syncDeedsLedgerFromCurrentRoom();
           syncVentureLedgerFromCurrentRoom();
           logToPhoneSystem(offerRedeemNote);
         } else {
           offerRedeemNote = result.error;
         }
-      } else if (action === 'offer-copresent') {
+      } else if (action === "offer-copresent") {
         // 🤝 Receiver: ask the co-present maker to hand the deed over here. The
         // request is SIGNED (proves I hold the key it will land on), so a third
         // party writing the shared settleReq map can't dictate the new owner.
         const offer = decodeOffer(offerRedeemRaw);
-        if (!offer || offer.asset.kind !== 'deed' || !yjsSync || !activeBootstrap?.roomId) return;
-        postSettleRequest(yjsSync.doc, offer.nonce,
-          buildSettleRequest(activeBootstrap.roomId, offer.nonce, offerRedeemRaw.trim(), getPlayerId(), getPlayerName()));
+        if (
+          !offer ||
+          offer.asset.kind !== "deed" ||
+          !yjsSync ||
+          !activeBootstrap?.roomId
+        )
+          return;
+        postSettleRequest(
+          yjsSync.doc,
+          offer.nonce,
+          buildSettleRequest(
+            activeBootstrap.roomId,
+            offer.nonce,
+            offerRedeemRaw.trim(),
+            getPlayerId(),
+            getPlayerName(),
+          ),
+        );
         offerCopresentPending = offer.nonce;
         // offerRedeemNote is esc()'d at render — keep it raw here.
-        offerRedeemNote = `Asked ${offer.makerName || 'the maker'} to hand it over — waiting for them to settle.`;
-      } else if (action === 'offer-copresent-cancel') {
+        offerRedeemNote = `Asked ${offer.makerName || "the maker"} to hand it over — waiting for them to settle.`;
+      } else if (action === "offer-copresent-cancel") {
         // Receiver: withdraw a pending ask.
-        if (yjsSync && offerCopresentPending) clearSettleRequest(yjsSync.doc, offerCopresentPending);
-        offerCopresentPending = '';
-        offerRedeemNote = '';
-      } else if (action === 'offer-copresent-ack') {
+        if (yjsSync && offerCopresentPending)
+          clearSettleRequest(yjsSync.doc, offerCopresentPending);
+        offerCopresentPending = "";
+        offerRedeemNote = "";
+      } else if (action === "offer-copresent-ack") {
         // Receiver: acknowledge a settled/refused request (clears it from the doc).
-        if (yjsSync && el.dataset.nonce) clearSettleRequest(yjsSync.doc, el.dataset.nonce);
-        offerCopresentPending = '';
-        offerRedeemRaw = '';
-        offerRedeemNote = '';
-      } else if (action === 'copresent-settle') {
+        if (yjsSync && el.dataset.nonce)
+          clearSettleRequest(yjsSync.doc, el.dataset.nonce);
+        offerCopresentPending = "";
+        offerRedeemRaw = "";
+        offerRedeemNote = "";
+      } else if (action === "copresent-settle") {
         // 🤝 Maker: hand the deed over (reaches the module in the background).
         const nonce = el.dataset.nonce;
         if (nonce) void executeCopresentSettle(nonce);
-      } else if (action === 'copresent-dismiss') {
+      } else if (action === "copresent-dismiss") {
         // Maker: decline a request (marks it refused for the receiver).
         const nonce = el.dataset.nonce;
         if (nonce && yjsSync) {
           copresentHandled.add(nonce);
-          resolveSettleRequest(yjsSync.doc, nonce, 'refused', 'The maker declined for now.');
+          resolveSettleRequest(
+            yjsSync.doc,
+            nonce,
+            "refused",
+            "The maker declined for now.",
+          );
         }
       }
       renderVenturesApp();
@@ -2378,56 +3011,74 @@ function renderVenturesApp(): void {
   }
 
   const myPub = getIdentityPub();
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-  const pill = 'display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;';
-  const inputStyle = 'flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;';
-  const ttlOptions = OFFER_TTL_CHOICES.map((c) => `<option value="${c.value}"${c.value === '7d' ? ' selected' : ''}>${c.label}</option>`).join('');
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const pill =
+    "display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;";
+  const inputStyle =
+    "flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;";
+  const ttlOptions = OFFER_TTL_CHOICES.map(
+    (c) =>
+      `<option value="${c.value}"${c.value === "7d" ? " selected" : ""}>${c.label}</option>`,
+  ).join("");
   const current = ventureRecord();
   const currentRoomId = activeBootstrap?.roomId ?? null;
   /** PERSONAL room ownership (raw — deliberately NOT the shareholder-extended
    *  gate: assigning/detaching property is the personal owner's call). */
   const ownerValIsMe = () =>
-    (((yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '') === getPlayerId());
+    ((yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+      "") === getPlayerId();
 
   // ── 🏠 Deed detail screen (REAL ESTATE) ──
-  const deedDetail = deedDetailRoomId ? deedsLedger().find((e) => e.roomId === deedDetailRoomId) : undefined;
-  if (deedDetailRoomId && !deedDetail) deedDetailRoomId = ''; // handed over / dropped — fall to the list
+  const deedDetail = deedDetailRoomId
+    ? deedsLedger().find((e) => e.roomId === deedDetailRoomId)
+    : undefined;
+  if (deedDetailRoomId && !deedDetail) deedDetailRoomId = ""; // handed over / dropped — fall to the list
   if (deedDetail) {
     const here = deedDetail.roomId === currentRoomId;
     // Live doc values when standing in the module; harvested snapshot otherwise.
     const liveV = here ? ventureRecord() : null;
     const name = here
-      ? ((yjsSync?.doc.getMap('roomInfo').get('name') as string | undefined) || deedDetail.name)
+      ? (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) ||
+        deedDetail.name
       : deedDetail.name;
     const ventureName = here ? liveV?.name : deedDetail.ventureName;
-    const office = here ? (liveV !== null && liveV.snapshotAt === undefined) : !!deedDetail.isOffice;
-    const dockedLinks = Object.keys(readAtlas()[deedDetail.roomId]?.doors ?? {}).length;
+    const office = here
+      ? liveV !== null && liveV.snapshotAt === undefined
+      : !!deedDetail.isOffice;
+    const dockedLinks = Object.keys(
+      readAtlas()[deedDetail.roomId]?.doors ?? {},
+    ).length;
 
-    let transferBlock = '';
+    let transferBlock = "";
     if (here && currentRoomDeedIsMine()) {
       if (office) {
-        transferBlock = `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">This module is ${ventureName ? `the registered office of 🚀 ${esc(ventureName)}` : 'a registered office'} — the Charter holds its deed. Bring in co-owners by transferring shares instead.</div>`;
+        transferBlock = `<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">This module is ${ventureName ? `the registered office of 🚀 ${esc(ventureName)}` : "a registered office"} — the Charter holds its deed. Bring in co-owners by transferring shares instead.</div>`;
       } else {
         // Recipients: every KEYED players entry in this doc except me — they
         // have been here, so their pub resolves on every owner surface.
         const options: string[] = [];
-        let armedName = '';
-        yjsSync?.doc.getMap('players').forEach((raw, id) => {
+        let armedName = "";
+        yjsSync?.doc.getMap("players").forEach((raw, id) => {
           const p = raw as Partial<PlayerEntry>;
-          if (id === getPlayerId() || typeof p.keyB64 !== 'string' || !p.keyB64) return;
-          const nm = typeof p.name === 'string' && p.name ? p.name : 'Unknown-Clone';
+          if (id === getPlayerId() || typeof p.keyB64 !== "string" || !p.keyB64)
+            return;
+          const nm =
+            typeof p.name === "string" && p.name ? p.name : "Unknown-Clone";
           if (id === deedHandoverArmed) armedName = nm;
-          options.push(`<option value="${esc(id)}"${id === deedHandoverArmed ? ' selected' : ''}>${esc(nm)}</option>`);
+          options.push(
+            `<option value="${esc(id)}"${id === deedHandoverArmed ? " selected" : ""}>${esc(nm)}</option>`,
+          );
         });
         const armed = !!deedHandoverArmed && !!armedName;
         transferBlock = options.length
           ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">HAND OVER THE DEED</div>
              <div style="display:flex; gap:4px; margin-top:4px;">
-               <select id="deed-transfer-to" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">${options.join('')}</select>
-               <button type="button" data-venture-action="deed-transfer" style="${pill}${armed ? ' background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;' : ''}">${armed ? '⚠ CONFIRM' : '🖋 HAND OVER'}</button>
+               <select id="deed-transfer-to" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">${options.join("")}</select>
+               <button type="button" data-venture-action="deed-transfer" style="${pill}${armed ? " background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;" : ""}">${armed ? "⚠ CONFIRM" : "🖋 HAND OVER"}</button>
              </div>
-             <div id="deed-transfer-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${armed ? `Hand this module to ${esc(armedName)}? Tap CONFIRM to sign the deed over.` : ''}</div>
-             <div style="font-size:9px; color:rgba(212,168,75,0.65);">The new owner takes the module as it stands — passes, door policies, co-hosts${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ''} ride along. You cannot take a deed back.</div>`
+             <div id="deed-transfer-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${armed ? `Hand this module to ${esc(armedName)}? Tap CONFIRM to sign the deed over.` : ""}</div>
+             <div style="font-size:9px; color:rgba(212,168,75,0.65);">The new owner takes the module as it stands — passes, door policies, co-hosts${ventureName ? ` and its 🚀 ${esc(ventureName)} link` : ""} ride along. You cannot take a deed back.</div>`
           : '<div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:10px;">No one to hand the deed to yet — the recipient must visit this module once (their key signs into the room record).</div>';
       }
     } else if (!here) {
@@ -2441,21 +3092,29 @@ function renderVenturesApp(): void {
     // ── 📤 TRANSFER OFFER — the remote path: sign it here (works held-from-
     //    afar; creation is doc-free), send it anywhere, the recipient redeems
     //    standing in this module. Any hand-over meanwhile voids it.
-    let offerBlock = '';
+    let offerBlock = "";
     if (!office && (!here || currentRoomDeedIsMine())) {
       const recipients: string[] = [];
-      for (const c of listContacts()) recipients.push(`<option value="pub:${esc(c.pub)}">👤 ${esc(c.name)}</option>`);
+      for (const c of listContacts())
+        recipients.push(
+          `<option value="pub:${esc(c.pub)}">👤 ${esc(c.name)}</option>`,
+        );
       for (const e of ventureLedger()) {
-        if (e.myShares > 0 && e.capSeenAt) recipients.push(`<option value="vnt:${esc(e.id)}">🚀 ${esc(e.name)} (venture)</option>`);
+        if (e.myShares > 0 && e.capSeenAt)
+          recipients.push(
+            `<option value="vnt:${esc(e.id)}">🚀 ${esc(e.name)} (venture)</option>`,
+          );
       }
-      recipients.push('<option value="bearer">⚠ anyone who holds it (bearer)</option>');
+      recipients.push(
+        '<option value="bearer">⚠ anyone who holds it (bearer)</option>',
+      );
       const ventureWarning = ventureName
         ? `<div style="font-size:9px; color:#ffb300; margin-top:3px;">This module is 🚀 ${esc(ventureName)} property — redeemed by anyone but that venture, it leaves the company as it changes hands.</div>`
-        : '';
+        : "";
       offerBlock = `
         <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">TRANSFER OFFER</div>
         <div style="display:flex; gap:4px; margin-top:4px;">
-          <select id="deed-offer-to" style="${inputStyle}">${recipients.join('')}</select>
+          <select id="deed-offer-to" style="${inputStyle}">${recipients.join("")}</select>
           <select id="deed-offer-ttl" style="${inputStyle} flex:0 0 auto; width:auto;">${ttlOptions}</select>
         </div>
         <div style="display:flex; gap:4px; margin-top:4px;">
@@ -2467,22 +3126,32 @@ function renderVenturesApp(): void {
         <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Signs a transfer of this deed as a gift. Send the copied offer any way you like — the recipient redeems it standing in this module, no need to be online together. You can revoke it there any time; handing the deed over meanwhile voids it.</div>`;
     }
     const offersOut = offersOutRows(
-      (o) => o.asset.kind === 'deed' && o.asset.roomId === deedDetail.roomId, here, esc, pill);
+      (o) => o.asset.kind === "deed" && o.asset.roomId === deedDetail.roomId,
+      here,
+      esc,
+      pill,
+    );
     // Free auditability: the module's own `offers` map is its transfer history.
     const historyRows = here
-      ? listOfferMarks().filter((r) => r.mark.kind === 'deed' && r.mark.status === 'redeemed').slice(0, 5)
-        .map((r) => `<div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:3px;">🖋 ${new Date(r.mark.at).toLocaleDateString()} — deed claimed by ${esc(r.mark.byName || 'a clone')} <span style="color:rgba(212,168,75,0.5);">${esc(contactFingerprint(r.mark.byPub))}</span></div>`).join('')
-      : '';
+      ? listOfferMarks()
+          .filter((r) => r.mark.kind === "deed" && r.mark.status === "redeemed")
+          .slice(0, 5)
+          .map(
+            (r) =>
+              `<div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:3px;">🖋 ${new Date(r.mark.at).toLocaleDateString()} — deed claimed by ${esc(r.mark.byName || "a clone")} <span style="color:rgba(212,168,75,0.5);">${esc(contactFingerprint(r.mark.byPub))}</span></div>`,
+          )
+          .join("")
+      : "";
     const historyBlock = historyRows
       ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">TRANSFER HISTORY</div>${historyRows}`
-      : '';
+      : "";
 
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← REAL ESTATE</button>
       <div style="font-size:14px; font-weight:800; color:#f0c060;">🏠 ${esc(name)}</div>
-      <div style="font-size:9px; color:rgba(212,168,75,0.8); margin-top:2px;">DEED · module ${esc(deedDetail.roomId.slice(0, 10))}… · ${here ? 'you are here' : 'held from afar'}</div>
-      <div style="font-size:10px; margin-top:10px;">${ventureName ? `🚀 Assigned to <b>${esc(ventureName)}</b>${office ? ' <span style="color:rgba(212,168,75,0.7);">· registered office</span>' : ' <span style="color:rgba(212,168,75,0.7);">· venture property</span>'}` : 'Held outright — sole personal owner.'}</div>
-      ${dockedLinks > 0 ? `<div style="font-size:10px; margin-top:4px;">🚪 ${dockedLinks} docked link${dockedLinks === 1 ? '' : 's'}</div>` : ''}
+      <div style="font-size:9px; color:rgba(212,168,75,0.8); margin-top:2px;">DEED · module ${esc(deedDetail.roomId.slice(0, 10))}… · ${here ? "you are here" : "held from afar"}</div>
+      <div style="font-size:10px; margin-top:10px;">${ventureName ? `🚀 Assigned to <b>${esc(ventureName)}</b>${office ? ' <span style="color:rgba(212,168,75,0.7);">· registered office</span>' : ' <span style="color:rgba(212,168,75,0.7);">· venture property</span>'}` : "Held outright — sole personal owner."}</div>
+      ${dockedLinks > 0 ? `<div style="font-size:10px; margin-top:4px;">🚪 ${dockedLinks} docked link${dockedLinks === 1 ? "" : "s"}</div>` : ""}
       ${transferBlock}
       ${offerBlock}
       ${offersOut}
@@ -2493,21 +3162,23 @@ function renderVenturesApp(): void {
 
   // ── Detail screen ──
   const detail = ventureDetailId
-    ? (current && current.id === ventureDetailId
+    ? current && current.id === ventureDetailId
       ? current
-      : null)
+      : null
     : null;
   if (ventureDetailId && detail) {
     const holders = Object.entries(detail.shares).sort((a, b) => b[1] - a[1]);
     const mine = detail.shares[myPub] ?? 0;
-    const capTable = holders.map(([pub, n]) => {
-      const pct = Math.round((n / detail.totalShares) * 100);
-      const name = detail.holderNames[pub] ?? 'Unknown-Clone';
-      return `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px;">
-        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(pub)}">${pub === myPub ? '⭐' : '👤'} ${esc(name)} <span style="color:rgba(212,168,75,0.7);">${esc(pub.slice(0, 8))}</span></span>
+    const capTable = holders
+      .map(([pub, n]) => {
+        const pct = Math.round((n / detail.totalShares) * 100);
+        const name = detail.holderNames[pub] ?? "Unknown-Clone";
+        return `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px;">
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(pub)}">${pub === myPub ? "⭐" : "👤"} ${esc(name)} <span style="color:rgba(212,168,75,0.7);">${esc(pub.slice(0, 8))}</span></span>
         <span style="flex-shrink:0; color:#f0c060;">${n} <span style="color:rgba(212,168,75,0.8);">(${pct}%)</span></span>
       </div>`;
-    }).join('');
+      })
+      .join("");
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← ALL VENTURES</button>
       <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(detail.name)}</div>
@@ -2515,13 +3186,19 @@ function renderVenturesApp(): void {
       <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">OWNERS</div>
       ${capTable}
       <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">PROPERTY</div>
-      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.7);">· ${detail.snapshotAt === undefined ? 'registered office' : 'venture property'}</span></div>
+      <div style="margin-top:4px; font-size:10px;">🏠 This module <span style="color:rgba(212,168,75,0.7);">· ${detail.snapshotAt === undefined ? "registered office" : "venture property"}</span></div>
       ${(ventureLedger().find((e) => e.id === detail.id)?.properties ?? [])
-        .filter((rid) => rid !== (activeBootstrap?.roomId ?? ''))
-        .map((rid) => `<div style="margin-top:3px; font-size:10px;">🏘 ${esc(readAtlas()[rid]?.name || 'Module')} <span style="color:rgba(212,168,75,0.7);">${esc(rid.slice(0, 10))}…</span></div>`).join('')}
-      <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? ' Cap table is a snapshot — trades happen at the office.' : ''}</div>
-      ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ''}
-      ${mine > 0 && detail.snapshotAt === undefined ? `
+        .filter((rid) => rid !== (activeBootstrap?.roomId ?? ""))
+        .map(
+          (rid) =>
+            `<div style="margin-top:3px; font-size:10px;">🏘 ${esc(readAtlas()[rid]?.name || "Module")} <span style="color:rgba(212,168,75,0.7);">${esc(rid.slice(0, 10))}…</span></div>`,
+        )
+        .join("")}
+      <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? " Cap table is a snapshot — trades happen at the office." : ""}</div>
+      ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ""}
+      ${
+        mine > 0 && detail.snapshotAt === undefined
+          ? `
         <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:12px;">TRANSFER SHARES</div>
         <div style="display:flex; gap:4px; margin-top:4px;">
           <input type="text" id="venture-transfer-pub" placeholder="recipient's key (from CONTACTS)" style="flex:1; min-width:0; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
@@ -2534,9 +3211,12 @@ function renderVenturesApp(): void {
         <div style="display:flex; gap:4px; margin-top:4px;">
           <input type="number" id="share-offer-count" min="1" max="${mine}" placeholder="#" style="width:44px; flex:0 0 auto; font-size:9px; padding:4px 6px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
           <select id="share-offer-to" style="${inputStyle}">${[
-            ...listContacts().map((c) => `<option value="pub:${esc(c.pub)}">👤 ${esc(c.name)}</option>`),
+            ...listContacts().map(
+              (c) =>
+                `<option value="pub:${esc(c.pub)}">👤 ${esc(c.name)}</option>`,
+            ),
             '<option value="bearer">⚠ anyone who holds it (bearer)</option>',
-          ].join('')}</select>
+          ].join("")}</select>
           <select id="share-offer-ttl" style="${inputStyle} flex:0 0 auto; width:auto;">${ttlOptions}</select>
         </div>
         <div style="display:flex; gap:4px; margin-top:4px;">
@@ -2544,8 +3224,10 @@ function renderVenturesApp(): void {
           <button type="button" data-venture-action="share-offer-save" style="${pill}">💾 SAVE FILE</button>
         </div>
         <div id="offer-cut-note" style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${esc(offerCutNote)}</div>
-        <div style="font-size:9px; color:rgba(212,168,75,0.65);">Signs a share transfer as a gift — the recipient redeems it standing at this office. No need to be online together; you can revoke it here any time.</div>` : ''}
-      ${offersOutRows((o) => o.asset.kind === 'shares' && o.asset.ventureId === detail.id, detail.snapshotAt === undefined, esc, pill)}
+        <div style="font-size:9px; color:rgba(212,168,75,0.65);">Signs a share transfer as a gift — the recipient redeems it standing at this office. No need to be online together; you can revoke it here any time.</div>`
+          : ""
+      }
+      ${offersOutRows((o) => o.asset.kind === "shares" && o.asset.ventureId === detail.id, detail.snapshotAt === undefined, esc, pill)}
     `;
     return;
   }
@@ -2554,7 +3236,7 @@ function renderVenturesApp(): void {
     const entry = ventureLedger().find((e) => e.id === ventureDetailId);
     view.innerHTML = `
       <button type="button" data-venture-action="back" style="${pill} margin-bottom:8px;">← ALL VENTURES</button>
-      <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(entry?.name ?? 'Venture')}</div>
+      <div style="font-size:14px; font-weight:800; color:#f0c060;">🚀 ${esc(entry?.name ?? "Venture")}</div>
       <div style="font-size:10px; color:rgba(212,168,75,0.8); margin-top:8px;">The Charter is kept at the registered office. Visit the venture's module to view the cap table or transfer shares.</div>
     `;
     return;
@@ -2568,16 +3250,17 @@ function renderVenturesApp(): void {
   if (current) {
     seen.add(current.id);
     const mine = current.shares[myPub] ?? 0;
-    const type = Object.keys(current.shares).length > 1 ? 'JOINT' : 'SOLE';
+    const type = Object.keys(current.shares).length > 1 ? "JOINT" : "SOLE";
     rows.push(`<button type="button" data-venture-action="open" data-id="${esc(current.id)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,0.06); border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(current.name)} <span style="color:rgba(212,168,75,0.7); font-size:9px;">· here</span></span>
-      <span style="flex-shrink:0; font-size:9px;">${type}${mine > 0 ? ` · ${Math.round((mine / current.totalShares) * 100)}%` : ''}</span>
+      <span style="flex-shrink:0; font-size:9px;">${type}${mine > 0 ? ` · ${Math.round((mine / current.totalShares) * 100)}%` : ""}</span>
     </button>`);
   }
   for (const e of ledger) {
     if (seen.has(e.id)) continue;
-    const pct = e.totalShares > 0 ? Math.round((e.myShares / e.totalShares) * 100) : 0;
-    const type = e.myShares >= e.totalShares ? 'SOLE' : 'JOINT';
+    const pct =
+      e.totalShares > 0 ? Math.round((e.myShares / e.totalShares) * 100) : 0;
+    const type = e.myShares >= e.totalShares ? "SOLE" : "JOINT";
     rows.push(`<button type="button" data-venture-action="open" data-id="${esc(e.id)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,0.04); border:1px solid rgba(212,168,75,0.14); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🚀 ${esc(e.name)}</span>
       <span style="flex-shrink:0; font-size:9px;">${type} · ${pct}%</span>
@@ -2585,36 +3268,48 @@ function renderVenturesApp(): void {
   }
 
   // Founding is offered when this room is OURS outright and unchartered.
-  const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+  const ownerVal =
+    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
   const ownThisRoom = ownerVal === getPlayerId();
-  const foundBlock = !current && ownThisRoom && currentRoomId
-    ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">SIGN A CHARTER</div>
+  const foundBlock =
+    !current && ownThisRoom && currentRoomId
+      ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">SIGN A CHARTER</div>
        <div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:2px;">Found a venture here — this module becomes its registered office and first property. ${CHARTER_TOTAL_SHARES_LABEL} shares are issued to you; transfer them to bring in co-owners.</div>
        <div style="display:flex; gap:4px; margin-top:6px;">
          <input type="text" id="venture-found-name" maxlength="48" placeholder="venture name" style="flex:1; min-width:0; font-size:10px; padding:5px 8px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;">
          <button type="button" data-venture-action="found" style="${pill}">🖋 SIGN</button>
        </div>`
-    : '';
+      : "";
 
   // 🏠 V2: my unchartered room can JOIN a venture I hold shares in.
-  const addBlock = !current && ownerValIsMe() && currentRoomId
-    ? ventureLedger().filter((e) => e.myShares > 0 && e.capSeenAt).map((e) => `
-      <div style="margin-top:6px;"><button type="button" data-venture-action="add-property" data-id="${esc(e.id)}" style="${pill}">🏘 ADD THIS MODULE TO ${esc(e.name.toUpperCase())}</button></div>`).join('')
-    : '';
+  const addBlock =
+    !current && ownerValIsMe() && currentRoomId
+      ? ventureLedger()
+          .filter((e) => e.myShares > 0 && e.capSeenAt)
+          .map(
+            (e) => `
+      <div style="margin-top:6px;"><button type="button" data-venture-action="add-property" data-id="${esc(e.id)}" style="${pill}">🏘 ADD THIS MODULE TO ${esc(e.name.toUpperCase())}</button></div>`,
+          )
+          .join("")
+      : "";
 
   // ── 🏠 REAL ESTATE — every module you personally own (deeds ledger) ──
-  const deeds = [...deedsLedger()].sort((a, b) =>
-    Number(b.roomId === currentRoomId) - Number(a.roomId === currentRoomId) || b.lastSeen - a.lastSeen);
+  const deeds = [...deedsLedger()].sort(
+    (a, b) =>
+      Number(b.roomId === currentRoomId) - Number(a.roomId === currentRoomId) ||
+      b.lastSeen - a.lastSeen,
+  );
   const deedRows = deeds.map((d) => {
     const here = d.roomId === currentRoomId;
     const name = here
-      ? ((yjsSync?.doc.getMap('roomInfo').get('name') as string | undefined) || d.name)
+      ? (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) ||
+        d.name
       : d.name;
     const tag = d.ventureName
-      ? `🚀 ${esc(d.ventureName)}${d.isOffice ? ' · OFFICE' : ''}`
-      : 'SOLE';
-    return `<button type="button" data-venture-action="deed-open" data-id="${esc(d.roomId)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,${here ? '0.06' : '0.04'}); border:1px solid rgba(212,168,75,${here ? '0.2' : '0.14'}); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
-      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.7); font-size:9px;">· here</span>' : ''}</span>
+      ? `🚀 ${esc(d.ventureName)}${d.isOffice ? " · OFFICE" : ""}`
+      : "SOLE";
+    return `<button type="button" data-venture-action="deed-open" data-id="${esc(d.roomId)}" style="display:flex; width:100%; justify-content:space-between; gap:8px; text-align:left; background:rgba(212,168,75,${here ? "0.06" : "0.04"}); border:1px solid rgba(212,168,75,${here ? "0.2" : "0.14"}); border-radius:8px; padding:8px 10px; margin-top:6px; color:#f0c060; cursor:pointer;">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🏠 ${esc(name)}${here ? ' <span style="color:rgba(212,168,75,0.7); font-size:9px;">· here</span>' : ""}</span>
       <span style="flex-shrink:0; font-size:9px;">${tag}</span>
     </button>`;
   });
@@ -2625,84 +3320,112 @@ function renderVenturesApp(): void {
   //    the office). The pasted string lives in module state so travelling
   //    there (repaints, phone toggles) never eats it.
   const pending = offerRedeemRaw ? decodeOffer(offerRedeemRaw) : null;
-  let redeemBody = '';
+  let redeemBody = "";
   if (pending) {
-    const what = pending.asset.kind === 'deed'
-      ? `🏠 the deed to <b>${esc(pending.asset.roomName || 'a module')}</b>`
-      : `🚀 <b>${pending.asset.count}</b> share${pending.asset.count === 1 ? '' : 's'} of <b>${esc(pending.asset.ventureName)}</b>`;
+    const what =
+      pending.asset.kind === "deed"
+        ? `🏠 the deed to <b>${esc(pending.asset.roomName || "a module")}</b>`
+        : `🚀 <b>${pending.asset.count}</b> share${pending.asset.count === 1 ? "" : "s"} of <b>${esc(pending.asset.ventureName)}</b>`;
     const toMe = !pending.toPub || pending.toPub === myPub;
     const toLine = pending.toPub
-      ? (pending.toPub === myPub ? 'made out to <b>you</b>' : 'made out to <b>someone else</b>')
+      ? pending.toPub === myPub
+        ? "made out to <b>you</b>"
+        : "made out to <b>someone else</b>"
       : pending.toVentureId
-        ? `made out to 🚀 ${esc(pending.toVentureName ?? 'a venture')} — a shareholder who has visited its office accepts for it`
-        : '⚠ bearer — whoever holds it may take it';
-    const settleHere = pending.asset.kind === 'deed'
-      ? pending.asset.roomId === currentRoomId
-      : (current?.id === pending.asset.ventureId && current?.snapshotAt === undefined);
-    const whereLine = pending.asset.kind === 'deed'
-      ? (settleHere ? '✓ you are standing at the module' : `travel to <b>${esc(pending.asset.roomName || readAtlas()[pending.asset.roomId]?.name || 'the module')}</b> to redeem`)
-      : (settleHere ? '✓ you are standing at the office' : `travel to <b>${esc(pending.asset.ventureName)}</b>'s office to redeem`);
+        ? `made out to 🚀 ${esc(pending.toVentureName ?? "a venture")} — a shareholder who has visited its office accepts for it`
+        : "⚠ bearer — whoever holds it may take it";
+    const settleHere =
+      pending.asset.kind === "deed"
+        ? pending.asset.roomId === currentRoomId
+        : current?.id === pending.asset.ventureId &&
+          current?.snapshotAt === undefined;
+    const whereLine =
+      pending.asset.kind === "deed"
+        ? settleHere
+          ? "✓ you are standing at the module"
+          : `travel to <b>${esc(pending.asset.roomName || readAtlas()[pending.asset.roomId]?.name || "the module")}</b> to redeem`
+        : settleHere
+          ? "✓ you are standing at the office"
+          : `travel to <b>${esc(pending.asset.ventureName)}</b>'s office to redeem`;
     const mark = settleHere ? nonceMark(pending.nonce) : null;
-    const dead = pending.expiresAt <= Date.now()
-      ? 'This offer has expired.'
-      : mark ? (mark.status === 'redeemed' ? 'Already redeemed.' : 'Revoked by the maker.') : '';
+    const dead =
+      pending.expiresAt <= Date.now()
+        ? "This offer has expired."
+        : mark
+          ? mark.status === "redeemed"
+            ? "Already redeemed."
+            : "Revoked by the maker."
+          : "";
     // ACCEPT FOR A COMPANY (owner request): an OPEN deed offer (no venture
     // named by the maker) can be taken for myself OR for a venture I hold
     // shares in — same shareholder + seen-cap-table gate as a directed
     // venture offer. A maker-directed venture offer skips this (its target
     // is fixed); share offers never company-own.
-    const canAcceptAs = pending.asset.kind === 'deed' && !pending.toVentureId && settleHere && !dead && toMe;
+    const canAcceptAs =
+      pending.asset.kind === "deed" &&
+      !pending.toVentureId &&
+      settleHere &&
+      !dead &&
+      toMe;
     const acceptOptions = canAcceptAs
       ? ventureLedger().filter((e) => e.myShares > 0 && e.capSeenAt)
       : [];
     // A stale accept-as choice (venture no longer eligible) falls back to me.
-    if (offerAcceptAs && !acceptOptions.some((e) => e.id === offerAcceptAs)) offerAcceptAs = '';
-    const acceptAsBlock = canAcceptAs && acceptOptions.length
-      ? `<div style="display:flex; align-items:center; gap:4px; margin-top:6px; font-size:9px;">
+    if (offerAcceptAs && !acceptOptions.some((e) => e.id === offerAcceptAs))
+      offerAcceptAs = "";
+    const acceptAsBlock =
+      canAcceptAs && acceptOptions.length
+        ? `<div style="display:flex; align-items:center; gap:4px; margin-top:6px; font-size:9px;">
            <span style="color:rgba(212,168,75,0.7);">accept as</span>
            <select id="offer-accept-as" style="${inputStyle}">
-             <option value=""${offerAcceptAs === '' ? ' selected' : ''}>👤 myself</option>
-             ${acceptOptions.map((e) => `<option value="${esc(e.id)}"${e.id === offerAcceptAs ? ' selected' : ''}>🚀 ${esc(e.name)}</option>`).join('')}
+             <option value=""${offerAcceptAs === "" ? " selected" : ""}>👤 myself</option>
+             ${acceptOptions.map((e) => `<option value="${esc(e.id)}"${e.id === offerAcceptAs ? " selected" : ""}>🚀 ${esc(e.name)}</option>`).join("")}
            </select>
          </div>`
-      : '';
+        : "";
     // 🤝 CO-PRESENT: a deed offer to me that I can't settle here, but whose
     // MAKER has been in THIS room — ask them to hand it over from where we
     // both stand (they reach the module with their own pass). Live status of
     // my pending ask rides the shared doc.
     let makerHere = false;
-    if (pending.asset.kind === 'deed' && !settleHere && !dead && toMe) {
-      yjsSync?.doc.getMap('players').forEach((raw) => {
-        if ((raw as Partial<PlayerEntry>).keyB64 === pending.makerPub) makerHere = true;
+    if (pending.asset.kind === "deed" && !settleHere && !dead && toMe) {
+      yjsSync?.doc.getMap("players").forEach((raw) => {
+        if ((raw as Partial<PlayerEntry>).keyB64 === pending.makerPub)
+          makerHere = true;
       });
     }
-    const myReq = (offerCopresentPending === pending.nonce && yjsSync)
-      ? readSettleRequest(yjsSync.doc, pending.nonce) : null;
-    if (offerCopresentPending === pending.nonce && !myReq) offerCopresentPending = ''; // request gone (expired)
-    let copresentBlock = '';
+    const myReq =
+      offerCopresentPending === pending.nonce && yjsSync
+        ? readSettleRequest(yjsSync.doc, pending.nonce)
+        : null;
+    if (offerCopresentPending === pending.nonce && !myReq)
+      offerCopresentPending = ""; // request gone (expired)
+    let copresentBlock = "";
     if (myReq) {
-      copresentBlock = myReq.status === 'settled'
-        ? `<div style="margin-top:6px; font-size:9px; color:#69f0ae;">🖋 ${esc(pending.asset.kind === 'deed' ? (pending.asset.roomName || 'The module') : 'It')} is yours — the maker handed it over. Ask them for a pass if you'd like to visit.
+      copresentBlock =
+        myReq.status === "settled"
+          ? `<div style="margin-top:6px; font-size:9px; color:#69f0ae;">🖋 ${esc(pending.asset.kind === "deed" ? pending.asset.roomName || "The module" : "It")} is yours — the maker handed it over. Ask them for a pass if you'd like to visit.
              <div style="margin-top:4px;"><button type="button" data-venture-action="offer-copresent-ack" data-nonce="${esc(pending.nonce)}" style="${pill}">OK</button></div></div>`
-        : myReq.status === 'refused'
-          ? `<div style="margin-top:6px; font-size:9px; color:#ff8a80;">${esc(myReq.error || 'The maker didn\'t settle it.')}
+          : myReq.status === "refused"
+            ? `<div style="margin-top:6px; font-size:9px; color:#ff8a80;">${esc(myReq.error || "The maker didn't settle it.")}
              <div style="margin-top:4px;"><button type="button" data-venture-action="offer-copresent-ack" data-nonce="${esc(pending.nonce)}" style="${pill}">OK</button></div></div>`
-          : `<div style="margin-top:6px; font-size:9px; color:rgba(212,168,75,0.8);">⏳ Waiting for ${esc(pending.makerName || 'the maker')} to settle it here…
+            : `<div style="margin-top:6px; font-size:9px; color:rgba(212,168,75,0.8);">⏳ Waiting for ${esc(pending.makerName || "the maker")} to settle it here…
              <div style="margin-top:4px;"><button type="button" data-venture-action="offer-copresent-cancel" style="${pill}">CANCEL</button></div></div>`;
     }
-    const askButton = (makerHere && !myReq && pending.asset.kind === 'deed')
-      ? `<button type="button" data-venture-action="offer-copresent" style="${pill} background:rgba(0,230,118,0.08); border-color:rgba(0,230,118,0.3); color:#69f0ae;">🤝 ASK ${esc((pending.makerName || 'MAKER').toUpperCase())} TO HAND IT OVER</button>`
-      : '';
+    const askButton =
+      makerHere && !myReq && pending.asset.kind === "deed"
+        ? `<button type="button" data-venture-action="offer-copresent" style="${pill} background:rgba(0,230,118,0.08); border-color:rgba(0,230,118,0.3); color:#69f0ae;">🤝 ASK ${esc((pending.makerName || "MAKER").toUpperCase())} TO HAND IT OVER</button>`
+        : "";
     redeemBody = `
       <div style="border:1px solid rgba(212,168,75,0.25); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
-        <div>${what} — a <b>gift</b>${pending.price > 0 ? ' <span style="color:#ff8a80;">(asks a price — priced offers arrive with the Registry)</span>' : ''}</div>
-        <div style="margin-top:3px;">from ${esc(pending.makerName || 'a clone')} <span style="color:rgba(212,168,75,0.6);">${esc(contactFingerprint(pending.makerPub))}</span> · ${toLine}</div>
-        <div style="margin-top:3px; color:rgba(212,168,75,0.8);">${offerExpiresIn(pending.expiresAt)} · ${whereLine}${makerHere && !settleHere ? ' · 🤝 the maker is in this room' : ''}</div>
-        ${dead ? `<div style="margin-top:3px; color:#ff8a80;">${dead}</div>` : ''}
+        <div>${what} — a <b>gift</b>${pending.price > 0 ? ' <span style="color:#ff8a80;">(asks a price — priced offers arrive with the Registry)</span>' : ""}</div>
+        <div style="margin-top:3px;">from ${esc(pending.makerName || "a clone")} <span style="color:rgba(212,168,75,0.6);">${esc(contactFingerprint(pending.makerPub))}</span> · ${toLine}</div>
+        <div style="margin-top:3px; color:rgba(212,168,75,0.8);">${offerExpiresIn(pending.expiresAt)} · ${whereLine}${makerHere && !settleHere ? " · 🤝 the maker is in this room" : ""}</div>
+        ${dead ? `<div style="margin-top:3px; color:#ff8a80;">${dead}</div>` : ""}
         ${acceptAsBlock}
         ${copresentBlock}
         <div style="display:flex; gap:4px; margin-top:6px;">
-          ${settleHere && !dead && toMe ? `<button type="button" data-venture-action="offer-redeem" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 REDEEM</button>` : ''}
+          ${settleHere && !dead && toMe ? `<button type="button" data-venture-action="offer-redeem" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 REDEEM</button>` : ""}
           ${askButton}
           <button type="button" data-venture-action="offer-clear" style="${pill}">CLEAR</button>
         </div>
@@ -2722,33 +3445,50 @@ function renderVenturesApp(): void {
   // hold a pass) / DECLINE; settled/refused ones linger briefly as receipts.
   const inboxReqs = yjsSync
     ? listSettleRequests(yjsSync.doc)
-      .map(({ nonce, req }) => ({ nonce, req, offer: decodeOffer(req.offer) }))
-      .filter((x) => x.offer && x.offer.asset.kind === 'deed' && x.offer.makerPub === myPub)
+        .map(({ nonce, req }) => ({
+          nonce,
+          req,
+          offer: decodeOffer(req.offer),
+        }))
+        .filter(
+          (x) =>
+            x.offer &&
+            x.offer.asset.kind === "deed" &&
+            x.offer.makerPub === myPub,
+        )
     : [];
   const inboxBlock = inboxReqs.length
     ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">HAND-OVER REQUESTS</div>
-       ${inboxReqs.map(({ nonce, req, offer }) => {
-      const mod = offer && offer.asset.kind === 'deed' ? (offer.asset.roomName || 'your module') : 'your module';
-      if (req.status === 'pending') {
-        const reachable = !!offer && offer.asset.kind === 'deed'
-          && (offer.asset.roomId === (activeBootstrap?.roomId ?? '') || !!passSeed(offer.asset.roomId));
-        return `<div style="border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
+       ${inboxReqs
+         .map(({ nonce, req, offer }) => {
+           const mod =
+             offer && offer.asset.kind === "deed"
+               ? offer.asset.roomName || "your module"
+               : "your module";
+           if (req.status === "pending") {
+             const reachable =
+               !!offer &&
+               offer.asset.kind === "deed" &&
+               (offer.asset.roomId === (activeBootstrap?.roomId ?? "") ||
+                 !!passSeed(offer.asset.roomId));
+             return `<div style="border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
           <div>👤 <b>${esc(req.requesterName)}</b> wants 🏠 ${esc(mod)}</div>
-          ${reachable ? '' : '<div style="margin-top:3px; font-size:9px; color:#ff8a80;">Keep a pass to that module in your room list to settle it from here.</div>'}
+          ${reachable ? "" : '<div style="margin-top:3px; font-size:9px; color:#ff8a80;">Keep a pass to that module in your room list to settle it from here.</div>'}
           <div style="display:flex; gap:4px; margin-top:6px;">
-            ${reachable ? `<button type="button" data-venture-action="copresent-settle" data-nonce="${esc(nonce)}" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 HAND IT OVER</button>` : ''}
+            ${reachable ? `<button type="button" data-venture-action="copresent-settle" data-nonce="${esc(nonce)}" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 HAND IT OVER</button>` : ""}
             <button type="button" data-venture-action="copresent-dismiss" data-nonce="${esc(nonce)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DECLINE</button>
           </div></div>`;
-      }
-      return `<div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:4px;">${req.status === 'settled' ? '🖋' : '✗'} ${esc(mod)} — ${req.status === 'settled' ? `handed to ${esc(req.requesterName)}` : 'declined'}</div>`;
-    }).join('')}`
-    : '';
+           }
+           return `<div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:4px;">${req.status === "settled" ? "🖋" : "✗"} ${esc(mod)} — ${req.status === "settled" ? `handed to ${esc(req.requesterName)}` : "declined"}</div>`;
+         })
+         .join("")}`
+    : "";
 
   view.innerHTML = `
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95);">YOUR STAKES</div>
-    ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
+    ${rows.length ? rows.join("") : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">REAL ESTATE</div>
-    ${deedRows.length ? deedRows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
+    ${deedRows.length ? deedRows.join("") : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
     ${inboxBlock}
     ${redeemBlock}
     ${foundBlock}
@@ -2764,67 +3504,86 @@ const CHARTER_TOTAL_SHARES_LABEL = 100;
 // co-hosts do NOT pass owner gates.
 
 function renderCoHostsSection(): void {
-  const accessView = document.getElementById('phone-app-access');
+  const accessView = document.getElementById("phone-app-access");
   if (!accessView) return;
-  let section = document.getElementById('access-cohosts-section');
+  let section = document.getElementById("access-cohosts-section");
   if (!section) {
-    section = document.createElement('div');
-    section.id = 'access-cohosts-section';
-    section.style.cssText = 'margin-top:14px; padding-top:10px; border-top:1px solid rgba(212,168,75,0.14); font-size:10px;';
+    section = document.createElement("div");
+    section.id = "access-cohosts-section";
+    section.style.cssText =
+      "margin-top:14px; padding-top:10px; border-top:1px solid rgba(212,168,75,0.14); font-size:10px;";
     accessView.appendChild(section);
     // Delegated actions (bound once; survives re-renders).
-    section.addEventListener('click', (e) => {
-      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-cohost-action]');
+    section.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-cohost-action]",
+      );
       if (!el) return;
-      const pub = el.dataset.pub ?? '';
+      const pub = el.dataset.pub ?? "";
       const action = el.dataset.cohostAction;
-      const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+      const ownerVal =
+        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+        "";
       const amOwner = isLocalPlayerRoomOwner(ownerVal);
-      if (action === 'volunteer') {
+      if (action === "volunteer") {
         writeCoHostRequest(getIdentityPub(), getPlayerName());
-      } else if (action === 'withdraw') {
+      } else if (action === "withdraw") {
         removeCoHostRequest(getIdentityPub());
       } else if (!amOwner) {
         return; // accept/deny/revoke are owner-only (UI gate, dev-phase posture)
-      } else if (action === 'accept' && pub) {
-        writeCoHost(pub, el.dataset.name ?? 'Unknown-Clone');
-      } else if (action === 'deny' && pub) {
+      } else if (action === "accept" && pub) {
+        writeCoHost(pub, el.dataset.name ?? "Unknown-Clone");
+      } else if (action === "deny" && pub) {
         removeCoHostRequest(pub);
-      } else if (action === 'revoke' && pub) {
+      } else if (action === "revoke" && pub) {
         removeCoHost(pub);
       }
       renderCoHostsSection();
     });
   }
 
-  const ownerVal = (yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined) ?? '';
+  const ownerVal =
+    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
   const amOwner = isLocalPlayerRoomOwner(ownerVal);
   const myPub = getIdentityPub();
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-  const pill = 'display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;';
-  const rowStyle = 'display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:5px;';
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const pill =
+    "display:inline-block; padding:2px 8px; border-radius:6px; font-size:9px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;";
+  const rowStyle =
+    "display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:5px;";
   const coHosts = readCoHosts();
   const requests = readCoHostRequests();
 
   const header = `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">🤝 CO-HOSTS <span style="font-weight:400; color:rgba(212,168,75,0.4);">· room keepers</span></div>
     <div style="font-size:8.5px; color:rgba(212,168,75,0.4); margin-top:2px;">Trusted members who help keep this room alive when the owner is away. Designation now — node-side serving lands in the next node update.</div>`;
 
-  const coHostRows = coHosts.map((c) => `
+  const coHostRows = coHosts
+    .map(
+      (c) => `
     <div style="${rowStyle}">
-      <span style="color:#00e676; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(c.pub)}">✔ ${esc(c.name)} <span style="color:rgba(212,168,75,0.4);">${esc(c.pub.slice(0, 8))}</span>${c.pub === myPub ? ' <span style="color:rgba(0,230,118,0.6);">(you)</span>' : ''}</span>
-      ${amOwner ? `<button type="button" data-cohost-action="revoke" data-pub="${esc(c.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>` : ''}
-    </div>`).join('');
+      <span style="color:#00e676; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(c.pub)}">✔ ${esc(c.name)} <span style="color:rgba(212,168,75,0.4);">${esc(c.pub.slice(0, 8))}</span>${c.pub === myPub ? ' <span style="color:rgba(0,230,118,0.6);">(you)</span>' : ""}</span>
+      ${amOwner ? `<button type="button" data-cohost-action="revoke" data-pub="${esc(c.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">REVOKE</button>` : ""}
+    </div>`,
+    )
+    .join("");
 
-  const requestRows = amOwner ? requests.map((r) => `
+  const requestRows = amOwner
+    ? requests
+        .map(
+          (r) => `
     <div style="${rowStyle}">
       <span style="color:#ffb300; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="key ${esc(r.pub)}">⚠ ${esc(r.name)} <span style="color:rgba(212,168,75,0.4);">${esc(r.pub.slice(0, 8))}</span></span>
       <span style="flex-shrink:0; display:flex; gap:4px;">
         <button type="button" data-cohost-action="accept" data-pub="${esc(r.pub)}" data-name="${esc(r.name)}" style="${pill} background:rgba(0,230,118,0.15); border-color:rgba(0,230,118,0.4); color:#00e676;">ACCEPT</button>
         <button type="button" data-cohost-action="deny" data-pub="${esc(r.pub)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DENY</button>
       </span>
-    </div>`).join('') : '';
+    </div>`,
+        )
+        .join("")
+    : "";
 
-  let memberLine = '';
+  let memberLine = "";
   if (!amOwner) {
     memberLine = isCoHost(myPub)
       ? '<div style="margin-top:6px; color:#00e676;">✔ You are a co-host of this room.</div>'
@@ -2833,11 +3592,13 @@ function renderCoHostsSection(): void {
         : `<div style="margin-top:6px;"><button type="button" data-cohost-action="volunteer" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#00e676;">🤝 VOLUNTEER AS CO-HOST</button></div>`;
   }
 
-  const emptyState = amOwner && coHosts.length === 0 && requests.length === 0
-    ? '<div style="margin-top:6px; color:rgba(212,168,75,0.4);">No co-hosts yet — members can volunteer from this app.</div>'
-    : '';
+  const emptyState =
+    amOwner && coHosts.length === 0 && requests.length === 0
+      ? '<div style="margin-top:6px; color:rgba(212,168,75,0.4);">No co-hosts yet — members can volunteer from this app.</div>'
+      : "";
 
-  section.innerHTML = header + coHostRows + requestRows + memberLine + emptyState;
+  section.innerHTML =
+    header + coHostRows + requestRows + memberLine + emptyState;
 }
 
 // ── 💬 QUICK CHAT (owner request, v2: ON the phone) ──────────────────────────
@@ -2857,42 +3618,46 @@ let miniChatOpen = false;
  *  `.peek` sliver shows exactly bezel + hint + field. Created once; clicks
  *  already stay off the canvas via the container's own click guard. */
 function phonePeekSlot(): HTMLDivElement | null {
-  let slot = document.getElementById('phone-peek-chat') as HTMLDivElement | null;
+  let slot = document.getElementById(
+    "phone-peek-chat",
+  ) as HTMLDivElement | null;
   if (!slot) {
-    const bezel = document.getElementById('phone-bezel');
+    const bezel = document.getElementById("phone-bezel");
     if (!bezel) return null;
-    slot = document.createElement('div');
-    slot.id = 'phone-peek-chat';
+    slot = document.createElement("div");
+    slot.id = "phone-peek-chat";
     slot.innerHTML = `<div id="phone-peek-chat-hint">💬 QUICK CHAT · ENTER sends · blank ENTER closes · TAB full history</div>`;
-    bezel.insertAdjacentElement('afterend', slot);
+    bezel.insertAdjacentElement("afterend", slot);
   }
   return slot;
 }
 
 function openMiniChat(): void {
   if (miniChatOpen) return;
-  const form = document.getElementById('chat-form');
-  const phone = document.getElementById('spacephone-container');
+  const form = document.getElementById("chat-form");
+  const phone = document.getElementById("spacephone-container");
   const slot = phonePeekSlot();
   if (!form || !phone || !slot) return;
   miniChatOpen = true;
   slot.appendChild(form);
-  phone.classList.add('peek');
+  phone.classList.add("peek");
   // preventScroll: focusing the input while the phone is still mid-slide
   // (offscreen) otherwise scrolls the WHOLE page up to reveal it — shifting
   // the game canvas 400+px and leaving the layout broken.
-  (document.getElementById('chat-input') as HTMLInputElement | null)?.focus({ preventScroll: true });
+  (document.getElementById("chat-input") as HTMLInputElement | null)?.focus({
+    preventScroll: true,
+  });
 }
 
 function closeMiniChat(): void {
   if (!miniChatOpen) return;
   miniChatOpen = false;
-  document.getElementById('spacephone-container')?.classList.remove('peek');
+  document.getElementById("spacephone-container")?.classList.remove("peek");
   // The form goes home under the messages list (its listeners travel with it).
-  const form = document.getElementById('chat-form');
-  const chatView = document.getElementById('phone-app-chat');
+  const form = document.getElementById("chat-form");
+  const chatView = document.getElementById("phone-app-chat");
   if (form && chatView) chatView.appendChild(form);
-  (document.getElementById('chat-input') as HTMLInputElement | null)?.blur();
+  (document.getElementById("chat-input") as HTMLInputElement | null)?.blur();
 }
 
 function setupSpacePhoneOverlay() {
@@ -2907,41 +3672,97 @@ function setupSpacePhoneOverlay() {
   initChatBubbles({
     camera: () => (window as any).gameRenderer?.camera,
     localPos: () => {
-      try { return world?.getPlayer()?.getPosition() ?? null; } catch { return null; }
+      try {
+        return world?.getPlayer()?.getPosition() ?? null;
+      } catch {
+        return null;
+      }
     },
     remotes: () => {
-      try { return world?.getRemoteAvatarSnapshots() ?? []; } catch { return []; }
+      try {
+        return world?.getRemoteAvatarSnapshots() ?? [];
+      } catch {
+        return [];
+      }
     },
     zoomLevel: () => {
       const zv = (window as any).multiScaleZoom;
-      return zv && typeof zv.getLevel === 'function' ? zv.getLevel() : 2;
+      return zv && typeof zv.getLevel === "function" ? zv.getLevel() : 2;
     },
   });
 
-  const container = document.getElementById('spacephone-container');
-  const chatInput = document.getElementById('chat-input') as HTMLInputElement;
-  const chatForm = document.getElementById('chat-form');
-  const tipIndicator = document.getElementById('phone-tip-indicator');
+  const container = document.getElementById("spacephone-container");
+  const chatInput = document.getElementById("chat-input") as HTMLInputElement;
+  const chatForm = document.getElementById("chat-form");
+  const tipIndicator = document.getElementById("phone-tip-indicator");
 
   // 📱 Phone shell view router (issue #20 S1) — home screen + per-app views.
   // Policy: Tab always opens the phone to the HOME screen (deterministic,
   // one tap to any app) rather than restoring the last open view.
-  type PhoneViewId = 'home' | 'chat' | 'contacts' | 'bank' | 'access' | 'ventures' | 'settings' | 'setnet' | 'setstats';
-  const phoneViewMeta: Record<PhoneViewId, { elId: string; title: string; subtitle: string }> = {
-    home:     { elId: 'phone-home-screen',   title: '📱 HOME',        subtitle: 'FurlongOS · Select App' },
-    chat:     { elId: 'phone-app-chat',      title: '👨‍🚀 CLONE CHAT', subtitle: 'Room: Furlong Lobby' },
-    contacts: { elId: 'phone-app-contacts',  title: '👥 CONTACTS',    subtitle: 'FurlongNet Directory' },
-    bank:     { elId: 'phone-app-bank',      title: '🏦 BANK',        subtitle: 'Furlong Credit Union' },
-    access:   { elId: 'phone-app-access',    title: '🚪 ACCESS',      subtitle: 'Room Passes · FurlongNet' },
-    ventures: { elId: 'phone-app-ventures',  title: '🚀 VENTURES',    subtitle: 'Charters · Shares · Real Estate' },
-    settings: { elId: 'phone-app-settings',          title: '⚙️ SETTINGS', subtitle: 'FurlongOS · System' },
-    setnet:   { elId: 'phone-app-settings-network',  title: '🌐 NETWORK',  subtitle: 'Settings · Node & Mesh' },
-    setstats: { elId: 'phone-app-settings-stats',    title: '📊 STATS',    subtitle: 'Settings · Live Readout' },
+  type PhoneViewId =
+    | "home"
+    | "chat"
+    | "contacts"
+    | "bank"
+    | "access"
+    | "ventures"
+    | "settings"
+    | "setnet"
+    | "setstats";
+  const phoneViewMeta: Record<
+    PhoneViewId,
+    { elId: string; title: string; subtitle: string }
+  > = {
+    home: {
+      elId: "phone-home-screen",
+      title: "📱 HOME",
+      subtitle: "FurlongOS · Select App",
+    },
+    chat: {
+      elId: "phone-app-chat",
+      title: "👨‍🚀 CLONE CHAT",
+      subtitle: "Room: Furlong Lobby",
+    },
+    contacts: {
+      elId: "phone-app-contacts",
+      title: "👥 CONTACTS",
+      subtitle: "FurlongNet Directory",
+    },
+    bank: {
+      elId: "phone-app-bank",
+      title: "🏦 BANK",
+      subtitle: "Furlong Credit Union",
+    },
+    access: {
+      elId: "phone-app-access",
+      title: "🚪 ACCESS",
+      subtitle: "Room Passes · FurlongNet",
+    },
+    ventures: {
+      elId: "phone-app-ventures",
+      title: "🚀 VENTURES",
+      subtitle: "Charters · Shares · Real Estate",
+    },
+    settings: {
+      elId: "phone-app-settings",
+      title: "⚙️ SETTINGS",
+      subtitle: "FurlongOS · System",
+    },
+    setnet: {
+      elId: "phone-app-settings-network",
+      title: "🌐 NETWORK",
+      subtitle: "Settings · Node & Mesh",
+    },
+    setstats: {
+      elId: "phone-app-settings-stats",
+      title: "📊 STATS",
+      subtitle: "Settings · Live Readout",
+    },
   };
   /** Sub-views return to their parent on BACK instead of jumping home. */
   const phoneViewParent: Partial<Record<PhoneViewId, PhoneViewId>> = {
-    setnet: 'settings',
-    setstats: 'settings',
+    setnet: "settings",
+    setstats: "settings",
   };
 
   // 📦 De-overlay (owner request): the Network Details, stats and room-info
@@ -2949,18 +3770,18 @@ function setupSpacePhoneOverlay() {
   // runtime with their ids intact, so every live-updater (updateDebugHUD,
   // setNetworkRow, the room-name editor, chia toggle, RETRY) works unchanged.
   {
-    const netHud = document.getElementById('network-details-hud');
-    const netView = document.getElementById('phone-app-settings-network');
+    const netHud = document.getElementById("network-details-hud");
+    const netView = document.getElementById("phone-app-settings-network");
     if (netHud && netView) {
       netView.appendChild(netHud);
       // Inside the phone the panel is always expanded — the collapse chevron
       // was an overlay-space concern. (Its listener no-ops on a hidden button.)
-      netHud.classList.remove('collapsed');
-      const chevron = document.getElementById('network-details-toggle');
-      if (chevron) chevron.style.display = 'none';
+      netHud.classList.remove("collapsed");
+      const chevron = document.getElementById("network-details-toggle");
+      if (chevron) chevron.style.display = "none";
     }
-    const statsHud = document.getElementById('debug-hud');
-    const statsView = document.getElementById('phone-app-settings-stats');
+    const statsHud = document.getElementById("debug-hud");
+    const statsView = document.getElementById("phone-app-settings-stats");
     if (statsHud && statsView) statsView.appendChild(statsHud);
     // 📟 Owner request: version + this device's mesh storage on the Stats
     // page, with a user-selectable disk budget. Honest numbers only: usage
@@ -2968,9 +3789,10 @@ function setupSpacePhoneOverlay() {
     // room docs on THIS device); the budget guides future pruning — nothing
     // is deleted automatically yet, and the panel says so.
     if (statsView) {
-      const extras = document.createElement('div');
-      extras.id = 'ssf-stats-extras';
-      extras.style.cssText = 'padding:10px 12px; font-size:10px; color:#e8d5a3; display:flex; flex-direction:column; gap:6px;';
+      const extras = document.createElement("div");
+      extras.id = "ssf-stats-extras";
+      extras.style.cssText =
+        "padding:10px 12px; font-size:10px; color:#e8d5a3; display:flex; flex-direction:column; gap:6px;";
       extras.innerHTML = `
         <div style="display:flex; justify-content:space-between;">
           <span style="color:rgba(212,168,75,0.6); letter-spacing:1px;">VERSION</span>
@@ -2997,39 +3819,41 @@ function setupSpacePhoneOverlay() {
           future clean-up — nothing is removed automatically yet.
         </div>`;
       statsView.appendChild(extras);
-      const budgetSel = extras.querySelector<HTMLSelectElement>('#ssf-disk-budget');
+      const budgetSel =
+        extras.querySelector<HTMLSelectElement>("#ssf-disk-budget");
       if (budgetSel) {
-        budgetSel.value = localStorage.getItem('ssf-max-disk-mb') ?? '1000';
-        budgetSel.addEventListener('change', () => {
-          localStorage.setItem('ssf-max-disk-mb', budgetSel.value);
+        budgetSel.value = localStorage.getItem("ssf-max-disk-mb") ?? "1000";
+        budgetSel.addEventListener("change", () => {
+          localStorage.setItem("ssf-max-disk-mb", budgetSel.value);
           void refreshStorageStats();
         });
       }
     }
-    const roomHud = document.getElementById('room-info-hud');
-    const accessView = document.getElementById('phone-app-access');
-    if (roomHud && accessView) accessView.insertBefore(roomHud, accessView.firstChild);
+    const roomHud = document.getElementById("room-info-hud");
+    const accessView = document.getElementById("phone-app-access");
+    if (roomHud && accessView)
+      accessView.insertBefore(roomHud, accessView.firstChild);
   }
-  let currentPhoneView: PhoneViewId = 'home';
-  const backBtn = document.getElementById('phone-back-btn');
-  const appTitle = document.getElementById('phone-app-title');
-  const appSubtitle = document.getElementById('phone-app-subtitle');
+  let currentPhoneView: PhoneViewId = "home";
+  const backBtn = document.getElementById("phone-back-btn");
+  const appTitle = document.getElementById("phone-app-title");
+  const appSubtitle = document.getElementById("phone-app-subtitle");
 
   const showPhoneView = (id: PhoneViewId) => {
     currentPhoneView = id;
     (Object.keys(phoneViewMeta) as PhoneViewId[]).forEach((viewId) => {
       const el = document.getElementById(phoneViewMeta[viewId].elId);
-      if (el) el.classList.toggle('active', viewId === id);
+      if (el) el.classList.toggle("active", viewId === id);
     });
     if (appTitle) appTitle.textContent = phoneViewMeta[id].title;
     if (appSubtitle) appSubtitle.textContent = phoneViewMeta[id].subtitle;
     // Back chevron only makes sense inside an app view
-    if (backBtn) backBtn.style.display = id === 'home' ? 'none' : 'flex';
+    if (backBtn) backBtn.style.display = id === "home" ? "none" : "flex";
     // Chat input focus lives in the chat-view-open path (was: on phone open)
-    if (id === 'chat') {
+    if (id === "chat") {
       chatInput?.focus();
       // Hidden views report scrollHeight 0 — restore tail-scroll on re-entry
-      const messages = document.getElementById('chat-messages-container');
+      const messages = document.getElementById("chat-messages-container");
       if (messages) messages.scrollTop = messages.scrollHeight;
     } else {
       chatInput?.blur();
@@ -3037,26 +3861,37 @@ function setupSpacePhoneOverlay() {
     // ACCESS (#52): MY PASS shows the CURRENT room — repaint on every open
     // (the per-join observers keep it live afterwards; this covers the
     // offline/pre-join state and the first open).
-    if (id === 'access') { refreshAccessRoomRow(); renderCoHostsSection(); }
-    if (id === 'ventures') { ventureDetailId = ''; deedDetailRoomId = ''; deedHandoverArmed = ''; offerAcceptAs = ''; renderVenturesApp(); }
-    if (id === 'bank') renderBankApp();
-    if (id === 'contacts') refreshContactsApp();
-    if (id === 'setstats') void refreshStorageStats(); // 📟 live disk figures
+    if (id === "access") {
+      refreshAccessRoomRow();
+      renderCoHostsSection();
+    }
+    if (id === "ventures") {
+      ventureDetailId = "";
+      deedDetailRoomId = "";
+      deedHandoverArmed = "";
+      offerAcceptAs = "";
+      renderVenturesApp();
+    }
+    if (id === "bank") renderBankApp();
+    if (id === "contacts") refreshContactsApp();
+    if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
   };
 
   // App tiles on the home screen route into their views
-  document.querySelectorAll<HTMLButtonElement>('.phone-app-tile').forEach((tile) => {
-    tile.addEventListener('click', () => {
-      const target = tile.dataset.phoneApp as PhoneViewId | undefined;
-      if (target && target in phoneViewMeta) {
-        showPhoneView(target);
-      }
+  document
+    .querySelectorAll<HTMLButtonElement>(".phone-app-tile")
+    .forEach((tile) => {
+      tile.addEventListener("click", () => {
+        const target = tile.dataset.phoneApp as PhoneViewId | undefined;
+        if (target && target in phoneViewMeta) {
+          showPhoneView(target);
+        }
+      });
     });
-  });
 
   if (backBtn) {
-    backBtn.addEventListener('click', () => {
-      showPhoneView(phoneViewParent[currentPhoneView] ?? 'home');
+    backBtn.addEventListener("click", () => {
+      showPhoneView(phoneViewParent[currentPhoneView] ?? "home");
     });
   }
 
@@ -3066,63 +3901,67 @@ function setupSpacePhoneOverlay() {
   // document.activeElement — because the editor's Escape branch replaceWith()s
   // the focused input before the event bubbles here, leaving activeElement
   // pointing at <body>; e.target stays the original input.)
-  window.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
     // 💬 QUICK CHAT: Esc dismisses the mini bar (even while typing in it).
     if (miniChatOpen) {
       e.preventDefault();
       closeMiniChat();
       return;
     }
-    if (!container || !container.classList.contains('active')) return;
+    if (!container || !container.classList.contains("active")) return;
     const target = e.target as HTMLElement | null;
     if (
-      target && target !== chatInput &&
-      (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')
+      target &&
+      target !== chatInput &&
+      (target.tagName === "INPUT" || target.tagName === "TEXTAREA")
     ) {
       return; // e.g. room-name editor owns Escape for cancel
     }
-    if (currentPhoneView !== 'home') {
+    if (currentPhoneView !== "home") {
       e.preventDefault();
-      showPhoneView('home');
+      showPhoneView("home");
     }
   });
 
   const removeTipIndicator = () => {
     if (tipIndicator) {
-      tipIndicator.style.opacity = '0';
+      tipIndicator.style.opacity = "0";
       setTimeout(() => {
         tipIndicator.remove();
       }, 500);
       try {
-        localStorage.setItem('ssf-spacephone-tipped', 'true');
+        localStorage.setItem("ssf-spacephone-tipped", "true");
       } catch {}
     }
   };
 
   // Check if tip has been closed globally before
   try {
-    if (localStorage.getItem('ssf-spacephone-tipped') === 'true' && tipIndicator) {
+    if (
+      localStorage.getItem("ssf-spacephone-tipped") === "true" &&
+      tipIndicator
+    ) {
       tipIndicator.remove();
     }
   } catch {}
 
   if (tipIndicator) {
     // Permit clicking on the indicator itself to pop the SpacePhone as a fallback
-    tipIndicator.style.cursor = 'pointer';
-    tipIndicator.addEventListener('click', (e) => {
+    tipIndicator.style.cursor = "pointer";
+    tipIndicator.addEventListener("click", (e) => {
       e.stopPropagation();
       removeTipIndicator();
       if (container) {
-        container.classList.add('active');
-        showPhoneView('home');
-        logToPhoneSystem('Entering SpacePhone net...');
+        container.classList.add("active");
+        showPhoneView("home");
+        logToPhoneSystem("Entering SpacePhone net...");
       }
     });
   }
 
   if (container) {
-    container.addEventListener('click', (e) => {
+    container.addEventListener("click", (e) => {
       e.stopPropagation();
     });
   }
@@ -3130,21 +3969,21 @@ function setupSpacePhoneOverlay() {
   // 💬 QUICK CHAT opener: Enter (with game focus) pops the mini chat bar.
   // Guards: never while typing in any field, never with the phone or welcome
   // screen open, never during edit mode / device focus (they own the keys).
-  window.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || miniChatOpen) return;
-    if (container?.classList.contains('active')) return;
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || miniChatOpen) return;
+    if (container?.classList.contains("active")) return;
     const t = e.target as HTMLElement | null;
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
-    const welcome = document.getElementById('welcome');
-    if (welcome && getComputedStyle(welcome).display !== 'none') return;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    const welcome = document.getElementById("welcome");
+    if (welcome && getComputedStyle(welcome).display !== "none") return;
     if (roomEdit.isEditModeActive() || isDeviceFocusActive()) return;
     e.preventDefault();
     openMiniChat();
   });
 
   // Open/Close phone toggle binding Tab key
-  window.addEventListener('keydown', (e) => {
-    if (e.key === 'Tab') {
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Tab") {
       // Suppress the browser's focus-cycling so Tab acts as a pure toggle,
       // and let it close the phone even while the chat input has focus.
       e.preventDefault();
@@ -3157,10 +3996,10 @@ function setupSpacePhoneOverlay() {
       // CHAT app (scrollable history) instead of the home-screen toggle.
       if (miniChatOpen) {
         closeMiniChat();
-        if (container && !container.classList.contains('active')) {
-          container.classList.add('active');
-          showPhoneView('chat');
-          logToPhoneSystem('Entering SpacePhone net...');
+        if (container && !container.classList.contains("active")) {
+          container.classList.add("active");
+          showPhoneView("chat");
+          logToPhoneSystem("Entering SpacePhone net...");
         }
         return;
       }
@@ -3171,12 +4010,16 @@ function setupSpacePhoneOverlay() {
         // edit-mode ESC handler (editMode.ts) AND the +/- first-person keys
         // (zoom.ts), stranding the player in edit mode with no working exit.
         // Tab may still CLOSE an already-open phone.
-        if (roomEdit.isEditModeActive() && !container.classList.contains('active')) return;
-        container.classList.toggle('active');
-        if (container.classList.contains('active')) {
+        if (
+          roomEdit.isEditModeActive() &&
+          !container.classList.contains("active")
+        )
+          return;
+        container.classList.toggle("active");
+        if (container.classList.contains("active")) {
           // Always land on the home screen (see view-router policy note above)
-          showPhoneView('home');
-          logToPhoneSystem('Entering SpacePhone net...');
+          showPhoneView("home");
+          logToPhoneSystem("Entering SpacePhone net...");
         } else {
           chatInput?.blur();
         }
@@ -3186,9 +4029,12 @@ function setupSpacePhoneOverlay() {
 
   // Keep phone date-stamp live
   const updatePhoneTime = () => {
-    const elTime = document.getElementById('phone-time');
+    const elTime = document.getElementById("phone-time");
     if (elTime) {
-      elTime.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      elTime.textContent = new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
     }
   };
   setInterval(updatePhoneTime, 10000);
@@ -3199,11 +4045,11 @@ function setupSpacePhoneOverlay() {
   // via setPlayerName and pushes the change into the room doc's players map;
   // Escape cancels (the phone's own Escape-to-home handler above already
   // ignores keydowns targeted at non-chat inputs, same as the room-name editor).
-  const playerNameEl = document.getElementById('phone-player-name');
-  const playerNameEditBtn = document.getElementById('phone-player-name-edit');
+  const playerNameEl = document.getElementById("phone-player-name");
+  const playerNameEditBtn = document.getElementById("phone-player-name-edit");
   const refreshIdentityRow = () => {
     if (playerNameEl) playerNameEl.textContent = getPlayerName();
-    const keyEl = document.getElementById('phone-identity-key');
+    const keyEl = document.getElementById("phone-identity-key");
     if (keyEl) {
       keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
       keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
@@ -3211,10 +4057,11 @@ function setupSpacePhoneOverlay() {
   };
   refreshIdentityRow();
   const beginPlayerNameEdit = () => {
-    if (!playerNameEl || document.getElementById('phone-player-name-input')) return;
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.id = 'phone-player-name-input';
+    if (!playerNameEl || document.getElementById("phone-player-name-input"))
+      return;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = "phone-player-name-input";
     input.value = getPlayerName();
     input.maxLength = PLAYER_NAME_MAX_LENGTH;
     playerNameEl.replaceWith(input);
@@ -3229,17 +4076,17 @@ function setupSpacePhoneOverlay() {
       refreshIdentityRow();
       if (save) updateLocalPlayerEntry(); // mirror into the room doc (no-op offline)
     };
-    input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') {
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
         closeEditor(true);
-      } else if (ev.key === 'Escape') {
+      } else if (ev.key === "Escape") {
         closeEditor(false);
       }
     });
-    input.addEventListener('blur', () => closeEditor(true));
+    input.addEventListener("blur", () => closeEditor(true));
   };
-  playerNameEl?.addEventListener('click', beginPlayerNameEdit);
-  playerNameEditBtn?.addEventListener('click', beginPlayerNameEdit);
+  playerNameEl?.addEventListener("click", beginPlayerNameEdit);
+  playerNameEditBtn?.addEventListener("click", beginPlayerNameEdit);
 
   // Roster section starts in the offline placeholder state; the per-join
   // players-map observer repaints it once a doc is bound.
@@ -3249,33 +4096,41 @@ function setupSpacePhoneOverlay() {
   // MY PASS: mint an invite for the current room (the network panel's old
   // Copy Invite pipeline, R1 pre-flight warning included) and copy it.
   // ENTER WITH PASS: accept a pass — dev-phase ruling: instant transport.
-  const accessGenerateBtn = document.getElementById('access-generate-btn');
-  const accessOutput = document.getElementById('access-pass-output') as HTMLInputElement | null;
-  const accessInput = document.getElementById('access-pass-input') as HTMLInputElement | null;
-  const accessUseBtn = document.getElementById('access-use-btn');
+  const accessGenerateBtn = document.getElementById("access-generate-btn");
+  const accessOutput = document.getElementById(
+    "access-pass-output",
+  ) as HTMLInputElement | null;
+  const accessInput = document.getElementById(
+    "access-pass-input",
+  ) as HTMLInputElement | null;
+  const accessUseBtn = document.getElementById("access-use-btn");
   const setAccessFeedback = (msg: string) => {
-    const el = document.getElementById('access-feedback');
+    const el = document.getElementById("access-feedback");
     if (el) el.textContent = msg;
   };
 
   if (accessGenerateBtn) {
-    accessGenerateBtn.addEventListener('click', async () => {
+    accessGenerateBtn.addEventListener("click", async () => {
       const minted = await mintBootstrapLink();
       if (!minted.link) {
-        setAccessFeedback(minted.error ?? 'Pass is not available yet.');
+        setAccessFeedback(minted.error ?? "Pass is not available yet.");
         return;
       }
       if (accessOutput) accessOutput.value = minted.link;
       const warning = inviteReachabilityWarning(minted.boot);
       try {
         await navigator.clipboard.writeText(minted.link);
-        setAccessFeedback(warning
-          ? `Pass copied. ${warning}`
-          : 'Pass copied. Share this one pass with everyone.');
+        setAccessFeedback(
+          warning
+            ? `Pass copied. ${warning}`
+            : "Pass copied. Share this one pass with everyone.",
+        );
       } catch {
-        setAccessFeedback(warning
-          ? `Pass ready above (clipboard permission was denied). ${warning}`
-          : 'Pass ready above. Clipboard permission was denied.');
+        setAccessFeedback(
+          warning
+            ? `Pass ready above (clipboard permission was denied). ${warning}`
+            : "Pass ready above. Clipboard permission was denied.",
+        );
       }
     });
   }
@@ -3284,10 +4139,10 @@ function setupSpacePhoneOverlay() {
   // and warmed in the background — it no longer beams you mid-connect. You
   // enter from the list once the room reads READY.
   if (accessUseBtn && accessInput) {
-    accessUseBtn.addEventListener('click', () => {
+    accessUseBtn.addEventListener("click", () => {
       const raw = accessInput.value.trim();
       if (!raw) {
-        setAccessFeedback('Paste a pass first.');
+        setAccessFeedback("Paste a pass first.");
         return;
       }
       const result = addPass(raw);
@@ -3295,7 +4150,7 @@ function setupSpacePhoneOverlay() {
         setAccessFeedback(result.error);
         return;
       }
-      accessInput.value = '';
+      accessInput.value = "";
       // Streamlined "join now": pasting a pass IS a request to enter that room,
       // so arm an auto-enter — we still wait for it to warm to READY (the
       // sync-before-enter gate, #60) before swapping, so you never land in a
@@ -3303,7 +4158,7 @@ function setupSpacePhoneOverlay() {
       autoEnterRoomId = result.roomId;
       setAccessFeedback(
         `🛰️ Connecting to that room — you'll be taken in automatically once it's ready. ` +
-        `A first cross-internet connect can take up to ~30s.`,
+          `A first cross-internet connect can take up to ~30s.`,
       );
     });
   }
@@ -3321,20 +4176,20 @@ function setupSpacePhoneOverlay() {
     if (!autoEnterRoomId) return;
     const rid = autoEnterRoomId;
     const state = passState(rid);
-    if (state === 'ready') {
+    if (state === "ready") {
       autoEnterRoomId = null;
       const seed = passSeed(rid);
       if (seed) {
-        container?.classList.remove('active');
+        container?.classList.remove("active");
         void enterRoomFromPass(seed);
       }
-    } else if (state === 'offline') {
+    } else if (state === "offline") {
       autoEnterRoomId = null;
       setAccessFeedback(
         `Couldn't reach that room yet — it may be offline or still hole-punching. ` +
-        `It's saved in your list; tap ENTER to retry.`,
+          `It's saved in your list; tap ENTER to retry.`,
       );
-    } else if (state === 'current') {
+    } else if (state === "current") {
       autoEnterRoomId = null; // already there
     }
   });
@@ -3342,10 +4197,12 @@ function setupSpacePhoneOverlay() {
   // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
   // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
   // owner-gated, so a non-owner click is inert).
-  const accessModeRow = document.getElementById('access-mode-row');
+  const accessModeRow = document.getElementById("access-mode-row");
   if (accessModeRow) {
-    accessModeRow.addEventListener('click', (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('.access-mode-btn');
+    accessModeRow.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
+        ".access-mode-btn",
+      );
       if (!btn || btn.disabled) return;
       setRoomAccessMode(btn.dataset.accessMode as AccessMode);
       applyAccessModeUI(getRoomAccessMode());
@@ -3358,14 +4215,14 @@ function setupSpacePhoneOverlay() {
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
     // Standardize behavior and prevent focused inputs from scrolling/shifting window viewports
-    chatInput.addEventListener('focus', () => {
+    chatInput.addEventListener("focus", () => {
       setTimeout(() => {
         window.scrollTo(0, 0);
         document.body.scrollTop = 0;
       }, 0);
     });
 
-    chatInput.addEventListener('blur', () => {
+    chatInput.addEventListener("blur", () => {
       setTimeout(() => {
         window.scrollTo(0, 0);
         document.body.scrollTop = 0;
@@ -3373,13 +4230,17 @@ function setupSpacePhoneOverlay() {
     });
 
     // Window scroll reset guard: absolute prevention of focus shifts or keyboard offsets
-    window.addEventListener('scroll', () => {
-      if (window.scrollY !== 0 || window.scrollX !== 0) {
-        window.scrollTo(0, 0);
-      }
-    }, { passive: true });
+    window.addEventListener(
+      "scroll",
+      () => {
+        if (window.scrollY !== 0 || window.scrollX !== 0) {
+          window.scrollTo(0, 0);
+        }
+      },
+      { passive: true },
+    );
 
-    chatForm.addEventListener('submit', (e) => {
+    chatForm.addEventListener("submit", (e) => {
       e.preventDefault();
       const val = chatInput.value.trim();
       if (!val) {
@@ -3389,30 +4250,34 @@ function setupSpacePhoneOverlay() {
         return;
       }
 
-      chatInput.value = '';
+      chatInput.value = "";
 
       if (yjsSync) {
-        const sharedChat = yjsSync.doc.getArray('chat');
+        const sharedChat = yjsSync.doc.getArray("chat");
         // Transact safe transactional delta block append (Task 3.3 / 4.1)
         yjsSync.doc.transact(() => {
-          sharedChat.push([{
-            // S2: authorId is the stable identity (isMe check); authorName is
-            // denormalized for display + legacy readers.
-            authorId: getPlayerId(),
-            authorName: getPlayerName(),
-            text: val,
-            atTick: localSeq,
-            scope: 'global',
-            // 💬 Bubble anchor (additive; legacy readers ignore): the sender's
-            // position at send time — remote clients pop the bubble over the
-            // avatar nearest this spot (no lane↔player mapping exists yet).
-            ...((): { atX?: number; atZ?: number } => {
-              try {
-                const p = world?.getPlayer()?.getPosition();
-                return p ? { atX: p.x, atZ: p.z } : {};
-              } catch { return {}; }
-            })(),
-          }]);
+          sharedChat.push([
+            {
+              // S2: authorId is the stable identity (isMe check); authorName is
+              // denormalized for display + legacy readers.
+              authorId: getPlayerId(),
+              authorName: getPlayerName(),
+              text: val,
+              atTick: localSeq,
+              scope: "global",
+              // 💬 Bubble anchor (additive; legacy readers ignore): the sender's
+              // position at send time — remote clients pop the bubble over the
+              // avatar nearest this spot (no lane↔player mapping exists yet).
+              ...((): { atX?: number; atZ?: number } => {
+                try {
+                  const p = world?.getPlayer()?.getPosition();
+                  return p ? { atX: p.x, atZ: p.z } : {};
+                } catch {
+                  return {};
+                }
+              })(),
+            },
+          ]);
           // 💾 Tier A (plan §3.3): cap chat IN THE DOC so the room doc — and its
           // cached snapshot, and every sync — stays bounded. Concurrent trims
           // delete overlapping ranges idempotently (CRDT-safe).
@@ -3438,12 +4303,14 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
  *  panel re-polls this on an interval — a one-shot startup snapshot would
  *  pin the row (and freshly-minted invite hints) to a stale state. */
 async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
-  let fingerprint: LocalFingerprint = { hex: '', base64: '', port: 4443 };
+  let fingerprint: LocalFingerprint = { hex: "", base64: "", port: 4443 };
   try {
-    const res = await fetch('http://127.0.0.1:8080/api/fingerprint');
+    const res = await fetch("http://127.0.0.1:8080/api/fingerprint");
     fingerprint = await res.json();
   } catch {
-    const res = await fetch('http://127.0.0.1:8081/api/fingerprint').catch(() => null);
+    const res = await fetch("http://127.0.0.1:8081/api/fingerprint").catch(
+      () => null,
+    );
     if (res) {
       fingerprint = await res.json();
     }
@@ -3455,8 +4322,12 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     renderReachabilityRow(localFingerprint);
     return localFingerprint;
   }
-  fingerprint.iroh_relay_urls = normalizeStringArray(fingerprint.iroh_relay_urls);
-  fingerprint.iroh_direct_addrs = normalizeStringArray(fingerprint.iroh_direct_addrs);
+  fingerprint.iroh_relay_urls = normalizeStringArray(
+    fingerprint.iroh_relay_urls,
+  );
+  fingerprint.iroh_direct_addrs = normalizeStringArray(
+    fingerprint.iroh_direct_addrs,
+  );
   localFingerprint = fingerprint;
   renderReachabilityRow(fingerprint);
   return fingerprint;
@@ -3468,7 +4339,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
  *  a cached/stale hash would fail the loopback handshake. Without this retry a
  *  startup race between the WebView and the node dropped us straight to NODE
  *  OFFLINE with no recovery (the recurring "node offline" on launch). */
-async function awaitLocalNodeFingerprint(attempts = 12, delayMs = 600): Promise<LocalFingerprint | null> {
+async function awaitLocalNodeFingerprint(
+  attempts = 12,
+  delayMs = 600,
+): Promise<LocalFingerprint | null> {
   for (let i = 0; i < attempts; i++) {
     const fp = await refreshLocalFingerprint();
     if (fp && fp.base64) return fp;
@@ -3483,7 +4357,8 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
     return null;
   }
   const roomId = activeBootstrap?.roomId ?? getDefaultRoomId();
-  const roomKeyB64 = activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
+  const roomKeyB64 =
+    activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
   const localHint = getLocalNodeHint(fingerprint);
   return {
     v: 2,
@@ -3498,15 +4373,20 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   };
 }
 
-function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerprint, roomIdOverride?: string): RoomBootstrap {
+function buildOutgoingBootstrap(
+  parsedWtUrl: string,
+  fingerprint: LocalFingerprint,
+  roomIdOverride?: string,
+): RoomBootstrap {
   // roomIdOverride (T1 of #30): mint against a FRESH room on our own node
   // (PROVISION NEW MODULE) instead of the currently-joined room. The room key
   // is minted+persisted per roomId, so re-provisioning the same id (never
   // happens — ids are random) or later rejoining reuses the same key.
-  const roomId = roomIdOverride ?? activeBootstrap?.roomId ?? getDefaultRoomId();
+  const roomId =
+    roomIdOverride ?? activeBootstrap?.roomId ?? getDefaultRoomId();
   const roomKeyB64 = roomIdOverride
     ? getOrCreateRoomKeyB64(roomId)
-    : activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
+    : (activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId));
 
   const localHint = getLocalNodeHint(fingerprint);
   const mergedHints = mergeMemberHints(
@@ -3529,31 +4409,44 @@ function buildOutgoingBootstrap(parsedWtUrl: string, fingerprint: LocalFingerpri
   };
 }
 
-async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): Promise<{ link?: string; error?: string; scope?: ReturnType<typeof classifyAddress>; boot?: RoomBootstrap }> {
+async function mintBootstrapLink(
+  rawAddress?: string,
+  roomIdOverride?: string,
+): Promise<{
+  link?: string;
+  error?: string;
+  scope?: ReturnType<typeof classifyAddress>;
+  boot?: RoomBootstrap;
+}> {
   const fingerprint = await fetchLocalFingerprint();
   if (!fingerprint) {
-    return { error: 'Local node not reachable — launch the app (or Rust node) first.' };
+    return {
+      error: "Local node not reachable — launch the app (or Rust node) first.",
+    };
   }
 
-  const override = (rawAddress ?? '').trim();
+  const override = (rawAddress ?? "").trim();
   let wtUrl = `https://127.0.0.1:${fingerprint.port}`;
-  let scope: ReturnType<typeof classifyAddress> = 'loopback';
+  let scope: ReturnType<typeof classifyAddress> = "loopback";
 
   if (override) {
     const parsed = parseHostAddress(override, fingerprint.port);
     if (!parsed) {
-      return { error: 'Enter a valid override address (LAN IP, public IP, or DNS name).' };
+      return {
+        error:
+          "Enter a valid override address (LAN IP, public IP, or DNS name).",
+      };
     }
     wtUrl = parsed.wtUrl;
     scope = classifyAddress(new URL(parsed.wtUrl).hostname);
-    setNetworkRow('network-address-type', ADDRESS_TYPE_LABEL[scope]);
+    setNetworkRow("network-address-type", ADDRESS_TYPE_LABEL[scope]);
     try {
       localStorage.setItem(BOOTSTRAP_ADDRESS_STORAGE_KEY, override);
     } catch {
       // Storage is optional for this flow.
     }
   } else {
-    setNetworkRow('network-address-type', 'AUTO (node hints)');
+    setNetworkRow("network-address-type", "AUTO (node hints)");
   }
 
   const boot = buildOutgoingBootstrap(wtUrl, fingerprint, roomIdOverride);
@@ -3563,9 +4456,10 @@ async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): 
   // browser. Mint a scheme-neutral ssf:// carrier instead (the import box
   // parses any URL with a ?seed= param); dev-server origins stay clickable.
   const origin = window.location.origin;
-  const isShareableHttpOrigin = origin.startsWith('http')
-    && !origin.includes('tauri.localhost')
-    && !origin.startsWith('tauri://');
+  const isShareableHttpOrigin =
+    origin.startsWith("http") &&
+    !origin.includes("tauri.localhost") &&
+    !origin.startsWith("tauri://");
   const seedParam = `seed=${encodeURIComponent(encodeBootstrapSeed(boot))}`;
   return {
     link: isShareableHttpOrigin
@@ -3582,11 +4476,17 @@ async function mintBootstrapLink(rawAddress?: string, roomIdOverride?: string): 
  * Normalise a user-entered host ("192.168.1.20", "my.ddns.net:5000", "::1")
  * into a WebTransport URL, defaulting to the local node's port.
  */
-function parseHostAddress(raw: string, defaultPort: number): { wtUrl: string } | null {
-  let input = raw.trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+function parseHostAddress(
+  raw: string,
+  defaultPort: number,
+): { wtUrl: string } | null {
+  let input = raw
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/.*$/, "");
   if (!input) return null;
   // Bare IPv6 literals (more than one ':' and no brackets) need bracketing.
-  if (input.split(':').length > 2 && !input.includes('[')) {
+  if (input.split(":").length > 2 && !input.includes("[")) {
     input = `[${input}]`;
   }
   try {
@@ -3605,7 +4505,10 @@ function parseHostAddress(raw: string, defaultPort: number): { wtUrl: string } |
  * connection required. Primary flow is zero-typing and relies on node hints.
  * Manual address override remains available in diagnostics only.
  */
-export async function generateBootstrapLink(): Promise<{ link?: string; error?: string }> {
+export async function generateBootstrapLink(): Promise<{
+  link?: string;
+  error?: string;
+}> {
   return mintBootstrapLink();
 }
 
@@ -3615,39 +4518,69 @@ export async function generateBootstrapLink(): Promise<{ link?: string; error?: 
  * reachability directly; public addresses are only a heuristic because many
  * routers refuse hairpin dials from inside the network.
  */
-async function testOwnReachability(): Promise<{ ok: boolean; scope: 'loopback' | 'private' | 'public'; error?: string }> {
+async function testOwnReachability(): Promise<{
+  ok: boolean;
+  scope: "loopback" | "private" | "public";
+  error?: string;
+}> {
   const fingerprint = await fetchLocalFingerprint();
   if (!fingerprint) {
-    return { ok: false, scope: 'public', error: 'Local node not reachable — launch the app (or Rust node) first.' };
+    return {
+      ok: false,
+      scope: "public",
+      error: "Local node not reachable — launch the app (or Rust node) first.",
+    };
   }
-  const addressInput = document.getElementById('network-bootstrap-address') as HTMLInputElement | null;
-  const parsed = parseHostAddress(addressInput?.value ?? '', fingerprint.port);
+  const addressInput = document.getElementById(
+    "network-bootstrap-address",
+  ) as HTMLInputElement | null;
+  const parsed = parseHostAddress(addressInput?.value ?? "", fingerprint.port);
   if (!parsed) {
-    return { ok: false, scope: 'public', error: 'Enter your reachable address first.' };
+    return {
+      ok: false,
+      scope: "public",
+      error: "Enter your reachable address first.",
+    };
   }
   const scope = classifyAddress(new URL(parsed.wtUrl).hostname);
-  setNetworkRow('network-address-type', ADDRESS_TYPE_LABEL[scope]);
+  setNetworkRow("network-address-type", ADDRESS_TYPE_LABEL[scope]);
   let wt: { ready: Promise<void>; close: () => void } | null = null;
   try {
-    const hashes = [{
-      algorithm: 'sha-256',
-      value: Uint8Array.from(atob(fingerprint.base64), c => c.charCodeAt(0)),
-    }];
+    const hashes = [
+      {
+        algorithm: "sha-256",
+        value: Uint8Array.from(atob(fingerprint.base64), (c) =>
+          c.charCodeAt(0),
+        ),
+      },
+    ];
     // @ts-ignore — WebTransport types not in lib.dom for this TS config
     wt = new WebTransport(parsed.wtUrl, { serverCertificateHashes: hashes });
     await Promise.race([
       wt!.ready,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout after 4s')), 4000)),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout after 4s")), 4000),
+      ),
     ]);
     return { ok: true, scope };
   } catch (err) {
-    return { ok: false, scope, error: err instanceof Error ? err.message : String(err) };
+    return {
+      ok: false,
+      scope,
+      error: err instanceof Error ? err.message : String(err),
+    };
   } finally {
-    try { wt?.close(); } catch { /* already closed */ }
+    try {
+      wt?.close();
+    } catch {
+      /* already closed */
+    }
   }
 }
 
-async function resolveBridgeBootstrap(imported: RoomBootstrap): Promise<RoomBootstrap> {
+async function resolveBridgeBootstrap(
+  imported: RoomBootstrap,
+): Promise<RoomBootstrap> {
   const localBoot = await fetchDefaultBootstrap();
   if (!localBoot) {
     return imported;
@@ -3655,14 +4588,20 @@ async function resolveBridgeBootstrap(imported: RoomBootstrap): Promise<RoomBoot
 
   const roomId = imported.roomId || localBoot.roomId || getDefaultRoomId();
   const importedHints = collectMemberHints(imported);
-  const mergedHints = mergeMemberHints(importedHints, collectMemberHints(localBoot));
+  const mergedHints = mergeMemberHints(
+    importedHints,
+    collectMemberHints(localBoot),
+  );
   const remoteHint = importedHints[0];
 
   return {
     ...localBoot,
     v: 2,
     roomId,
-    roomKeyB64: imported.roomKeyB64 || localBoot.roomKeyB64 || getOrCreateRoomKeyB64(roomId),
+    roomKeyB64:
+      imported.roomKeyB64 ||
+      localBoot.roomKeyB64 ||
+      getOrCreateRoomKeyB64(roomId),
     challenge: imported.challenge ?? localBoot.challenge,
     memberHints: mergedHints.length ? mergedHints : undefined,
     irohNodeId: remoteHint?.irohNodeId,
@@ -3679,17 +4618,23 @@ async function resolveBridgeBootstrap(imported: RoomBootstrap): Promise<RoomBoot
 // panel setup. The flag is per-room in localStorage (`ssf-chia-mode-<roomId>`),
 // matching how NetworkProvider reads it at connect and the node stores it per-room.
 function refreshChiaModeToggle() {
-  const toggle = document.getElementById('chia-mode-toggle') as HTMLInputElement | null;
-  const state = document.getElementById('chia-mode-state');
+  const toggle = document.getElementById(
+    "chia-mode-toggle",
+  ) as HTMLInputElement | null;
+  const state = document.getElementById("chia-mode-state");
   if (!toggle) return;
   const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
   let on = false;
   if (roomId) {
-    try { on = localStorage.getItem(`ssf-chia-mode-${roomId}`) === '1'; } catch { /* privacy mode */ }
+    try {
+      on = localStorage.getItem(`ssf-chia-mode-${roomId}`) === "1";
+    } catch {
+      /* privacy mode */
+    }
   }
   toggle.checked = on;
   toggle.disabled = !roomId; // no room context yet -> nothing to toggle
-  if (state) state.textContent = on ? 'ON' : 'OFF';
+  if (state) state.textContent = on ? "ON" : "OFF";
 }
 
 function setupNetworkDetailsPanel() {
@@ -3699,24 +4644,26 @@ function setupNetworkDetailsPanel() {
   // #52: the invite mint (Copy Invite) and accept (Use Link) widgets MOVED
   // to the SpacePhone ACCESS app — this panel keeps diagnostics, node status
   // and the reachability rows only (plus a thin moved-note pointer).
-  const panel = document.getElementById('network-details-hud');
-  const toggle = document.getElementById('network-details-toggle');
-  const retryBtn = document.getElementById('network-retry-node-btn');
-  const feedback = document.getElementById('network-link-feedback');
+  const panel = document.getElementById("network-details-hud");
+  const toggle = document.getElementById("network-details-toggle");
+  const retryBtn = document.getElementById("network-retry-node-btn");
+  const feedback = document.getElementById("network-link-feedback");
 
   if (retryBtn) {
-    retryBtn.addEventListener('click', async (e) => {
+    retryBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
       // Review fix F5: the transit curtain blocks pointer events but not
       // keyboard activation (Enter on a focused button) — a concurrent
       // leave/join here would leave the transit's arrival choreography
       // running against the wrong live session.
       if (transitInProgress) {
-        if (feedback) feedback.textContent = 'Adapter transit in progress — try again in a moment.';
+        if (feedback)
+          feedback.textContent =
+            "Adapter transit in progress — try again in a moment.";
         return;
       }
       localFingerprint = null;
-      if (feedback) feedback.textContent = 'Retrying local node handshake...';
+      if (feedback) feedback.textContent = "Retrying local node handshake...";
       // Full session teardown (issue #30 T0): stop the old YjsSync (destroys
       // its Y.Doc) before reconnecting, instead of a bare disconnect().
       await leaveRoom();
@@ -3725,18 +4672,18 @@ function setupNetworkDetailsPanel() {
   }
 
   // Room Name editing flow (Task: Edit Room Name)
-  const nameEl = document.getElementById('room-name-display');
+  const nameEl = document.getElementById("room-name-display");
   if (nameEl) {
-    nameEl.addEventListener('click', (e) => {
+    nameEl.addEventListener("click", (e) => {
       e.stopPropagation();
-      const inputExists = document.getElementById('room-name-input');
+      const inputExists = document.getElementById("room-name-input");
       if (inputExists) return;
 
-      const currentName = nameEl.textContent || 'Lobby';
-      
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.id = 'room-name-input';
+      const currentName = nameEl.textContent || "Lobby";
+
+      const input = document.createElement("input");
+      input.type = "text";
+      input.id = "room-name-input";
       input.value = currentName;
       input.maxLength = 24;
 
@@ -3747,17 +4694,20 @@ function setupNetworkDetailsPanel() {
         const newVal = input.value.trim();
         if (newVal) {
           if (yjsSync) {
-            const rMap = yjsSync.doc.getMap('roomInfo');
-            const ownerVal = rMap.get('owner') as string || 'Local-Clone';
+            const rMap = yjsSync.doc.getMap("roomInfo");
+            const ownerVal = (rMap.get("owner") as string) || "Local-Clone";
             // S2 gate: owner is our player id, or a legacy pre-S2 room
             // ('Local-Clone' owner) — those stay editable by everyone.
             if (isLocalPlayerRoomOwner(ownerVal)) {
               yjsSync.doc.transact(() => {
-                rMap.set('name', newVal);
+                rMap.set("name", newVal);
               });
             } else {
-              if (feedback) feedback.textContent = `Only the owner (${resolveOwnerLabel(ownerVal)}) can edit the room name.`;
-              setTimeout(() => { if (feedback) feedback.textContent = ''; }, 4000);
+              if (feedback)
+                feedback.textContent = `Only the owner (${resolveOwnerLabel(ownerVal)}) can edit the room name.`;
+              setTimeout(() => {
+                if (feedback) feedback.textContent = "";
+              }, 4000);
             }
           } else {
             nameEl.textContent = newVal;
@@ -3770,57 +4720,72 @@ function setupNetworkDetailsPanel() {
         // exists — so without this the display kept the pre-edit name until
         // the next unrelated doc change.
         if (yjsSync) {
-          nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string) || 'Lobby';
+          nameEl.textContent =
+            (yjsSync.doc.getMap("roomInfo").get("name") as string) || "Lobby";
         }
       };
 
-      input.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter') {
+      input.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
           saveChanges();
-        } else if (ev.key === 'Escape') {
+        } else if (ev.key === "Escape") {
           input.replaceWith(nameEl);
         }
       });
 
-      input.addEventListener('blur', () => {
+      input.addEventListener("blur", () => {
         saveChanges();
       });
     });
   }
 
   if (panel) {
-    panel.addEventListener('click', (e) => {
+    panel.addEventListener("click", (e) => {
       e.stopPropagation();
     });
   }
 
   if (panel && toggle) {
-    toggle.addEventListener('click', () => {
-      panel.classList.toggle('collapsed');
-      toggle.textContent = panel.classList.contains('collapsed') ? '▼' : '▲';
-      toggle.setAttribute('aria-label', panel.classList.contains('collapsed') ? 'Expand network details' : 'Collapse network details');
+    toggle.addEventListener("click", () => {
+      panel.classList.toggle("collapsed");
+      toggle.textContent = panel.classList.contains("collapsed") ? "▼" : "▲";
+      toggle.setAttribute(
+        "aria-label",
+        panel.classList.contains("collapsed")
+          ? "Expand network details"
+          : "Collapse network details",
+      );
     });
   }
 
   // ChiaHub Slice 3b: the "advanced Chia mesh mode" switch. Writes the per-room
   // flag and re-sends the room cap so the node picks it up live (no reconnect).
-  const chiaToggle = document.getElementById('chia-mode-toggle') as HTMLInputElement | null;
+  const chiaToggle = document.getElementById(
+    "chia-mode-toggle",
+  ) as HTMLInputElement | null;
   if (chiaToggle) {
-    chiaToggle.addEventListener('change', () => {
-      const roomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+    chiaToggle.addEventListener("change", () => {
+      const roomId = (window as unknown as { __ssfRoomId?: string })
+        .__ssfRoomId;
       const on = chiaToggle.checked;
-      const state = document.getElementById('chia-mode-state');
-      if (state) state.textContent = on ? 'ON' : 'OFF';
+      const state = document.getElementById("chia-mode-state");
+      if (state) state.textContent = on ? "ON" : "OFF";
       if (roomId) {
-        try { localStorage.setItem(`ssf-chia-mode-${roomId}`, on ? '1' : '0'); } catch { /* privacy mode */ }
+        try {
+          localStorage.setItem(`ssf-chia-mode-${roomId}`, on ? "1" : "0");
+        } catch {
+          /* privacy mode */
+        }
       }
       // Apply live — re-send this room's cap to the local node with the new flag.
       void networkProvider.resendRoomCap(on);
       if (feedback) {
         feedback.textContent = on
-          ? 'Advanced Chia mesh mode ON for this room (experimental — needs a chia-lane node + funded testnet wallet; otherwise a harmless no-op).'
-          : 'Advanced Chia mesh mode OFF for this room.';
-        setTimeout(() => { if (feedback) feedback.textContent = ''; }, 5000);
+          ? "Advanced Chia mesh mode ON for this room (experimental — needs a chia-lane node + funded testnet wallet; otherwise a harmless no-op)."
+          : "Advanced Chia mesh mode OFF for this room.";
+        setTimeout(() => {
+          if (feedback) feedback.textContent = "";
+        }, 5000);
       }
     });
     refreshChiaModeToggle();
@@ -3828,17 +4793,20 @@ function setupNetworkDetailsPanel() {
 
   // ?seed= deep-link import (unchanged bootstrap path — only the input it
   // echoes into moved to the phone with #52).
-  const urlSeed = new URL(window.location.href).searchParams.get('seed');
+  const urlSeed = new URL(window.location.href).searchParams.get("seed");
   if (urlSeed) {
     const imported = decodeBootstrapSeed(urlSeed);
     if (imported) {
-      resolveBridgeBootstrap(imported).then(resolved => {
+      resolveBridgeBootstrap(imported).then((resolved) => {
         pendingBootstrapOverride = resolved;
         if (feedback) {
-          feedback.textContent = 'Zero-config P2P Seed loaded from URL. Entering lobby...';
+          feedback.textContent =
+            "Zero-config P2P Seed loaded from URL. Entering lobby...";
         }
       });
-      const accessPassInput = document.getElementById('access-pass-input') as HTMLInputElement | null;
+      const accessPassInput = document.getElementById(
+        "access-pass-input",
+      ) as HTMLInputElement | null;
       if (accessPassInput) {
         accessPassInput.value = window.location.href;
       }
@@ -3849,59 +4817,97 @@ function setupNetworkDetailsPanel() {
   //  ACCESS app now — setupSpacePhoneOverlay + inviteReachabilityWarning.)
 
   // — Bootstrap-a-network controls (sovereign origin; every node seeds) —
-  const bootstrapBtn = document.getElementById('network-bootstrap-link-btn');
-  const bootstrapAddrInput = document.getElementById('network-bootstrap-address') as HTMLInputElement | null;
+  const bootstrapBtn = document.getElementById("network-bootstrap-link-btn");
+  const bootstrapAddrInput = document.getElementById(
+    "network-bootstrap-address",
+  ) as HTMLInputElement | null;
   if (bootstrapAddrInput) {
     try {
-      const saved = localStorage.getItem(BOOTSTRAP_ADDRESS_STORAGE_KEY)
-        ?? localStorage.getItem(LEGACY_BOOTSTRAP_ADDRESS_KEY);
+      const saved =
+        localStorage.getItem(BOOTSTRAP_ADDRESS_STORAGE_KEY) ??
+        localStorage.getItem(LEGACY_BOOTSTRAP_ADDRESS_KEY);
       if (saved && !bootstrapAddrInput.value) {
         bootstrapAddrInput.value = saved;
       }
-    } catch { /* storage unavailable — non-fatal */ }
+    } catch {
+      /* storage unavailable — non-fatal */
+    }
   }
   if (bootstrapBtn) {
-    bootstrapBtn.addEventListener('click', async () => {
-      const minted = await mintBootstrapLink(bootstrapAddrInput?.value ?? '');
+    bootstrapBtn.addEventListener("click", async () => {
+      const minted = await mintBootstrapLink(bootstrapAddrInput?.value ?? "");
       if (!minted.link) {
-        if (feedback) feedback.textContent = minted.error ?? 'Override invite generation failed.';
+        if (feedback)
+          feedback.textContent =
+            minted.error ?? "Override invite generation failed.";
         return;
       }
 
       // #52: the shareable field lives in the ACCESS app now — write the
       // override-minted pass there so diagnostics keep a copyable artifact.
-      const passOutput = document.getElementById('access-pass-output') as HTMLInputElement | null;
+      const passOutput = document.getElementById(
+        "access-pass-output",
+      ) as HTMLInputElement | null;
       if (passOutput) {
         passOutput.value = minted.link;
       }
 
       if (feedback) {
-        feedback.textContent = 'Override invite written to the phone ACCESS app (diagnostics mode).';
+        feedback.textContent =
+          "Override invite written to the phone ACCESS app (diagnostics mode).";
       }
     });
   }
 
-  const testBtn = document.getElementById('network-test-reach-btn');
+  const testBtn = document.getElementById("network-test-reach-btn");
   if (testBtn) {
-    testBtn.addEventListener('click', async () => {
-      if (feedback) feedback.textContent = 'Self-testing reachability…';
-      setNetworkRow('network-seeding-status', 'TESTING…', '#d4a84b');
+    testBtn.addEventListener("click", async () => {
+      if (feedback) feedback.textContent = "Self-testing reachability…";
+      setNetworkRow("network-seeding-status", "TESTING…", "#d4a84b");
       const { ok, scope, error } = await testOwnReachability();
-      if (ok && scope === 'private') {
-        setNetworkRow('network-seeding-status', 'SEEDING · verified on LAN', '#00e676');
-        if (feedback) feedback.textContent = 'Reachable on your LAN. Friends outside your network need a public address or port-forward (UDP 4443).';
-      } else if (ok && scope === 'public') {
-        setNetworkRow('network-seeding-status', 'SEEDING · verified (internet)', '#00e676');
-        if (feedback) feedback.textContent = 'Self-test reached your node via the public address — internet peers should too.';
+      if (ok && scope === "private") {
+        setNetworkRow(
+          "network-seeding-status",
+          "SEEDING · verified on LAN",
+          "#00e676",
+        );
+        if (feedback)
+          feedback.textContent =
+            "Reachable on your LAN. Friends outside your network need a public address or port-forward (UDP 4443).";
+      } else if (ok && scope === "public") {
+        setNetworkRow(
+          "network-seeding-status",
+          "SEEDING · verified (internet)",
+          "#00e676",
+        );
+        if (feedback)
+          feedback.textContent =
+            "Self-test reached your node via the public address — internet peers should too.";
       } else if (ok) {
-        setNetworkRow('network-seeding-status', 'NODE UP · loopback only', '#d4a84b');
-        if (feedback) feedback.textContent = 'That address only works on this device — enter your LAN or public address.';
-      } else if (scope === 'public') {
-        setNetworkRow('network-seeding-status', 'UNVERIFIED · self-test inconclusive', '#ffb300');
-        if (feedback) feedback.textContent = `Could not reach your public address from inside (${error ?? 'no response'}). Many routers block hairpin dials — ask a friend to try the link, and check UDP 4443 forwarding.`;
+        setNetworkRow(
+          "network-seeding-status",
+          "NODE UP · loopback only",
+          "#d4a84b",
+        );
+        if (feedback)
+          feedback.textContent =
+            "That address only works on this device — enter your LAN or public address.";
+      } else if (scope === "public") {
+        setNetworkRow(
+          "network-seeding-status",
+          "UNVERIFIED · self-test inconclusive",
+          "#ffb300",
+        );
+        if (feedback)
+          feedback.textContent = `Could not reach your public address from inside (${error ?? "no response"}). Many routers block hairpin dials — ask a friend to try the link, and check UDP 4443 forwarding.`;
       } else {
-        setNetworkRow('network-seeding-status', 'BLOCKED · not reachable', '#ff1744');
-        if (feedback) feedback.textContent = `Self-test failed (${error ?? 'no response'}). Check the address and that your firewall allows UDP 4443 in.`;
+        setNetworkRow(
+          "network-seeding-status",
+          "BLOCKED · not reachable",
+          "#ff1744",
+        );
+        if (feedback)
+          feedback.textContent = `Self-test failed (${error ?? "no response"}). Check the address and that your firewall allows UDP 4443 in.`;
       }
     });
   }
@@ -3909,13 +4915,15 @@ function setupNetworkDetailsPanel() {
   // Passive network-type readout (Network Information API where available)
   refreshConnectionTypeRow();
   const conn = (navigator as { connection?: EventTarget }).connection;
-  conn?.addEventListener?.('change', refreshConnectionTypeRow);
+  conn?.addEventListener?.("change", refreshConnectionTypeRow);
 
   // R1: keep the REACHABILITY row (and the cached fingerprint feeding invite
   // hints) live. Portmapper mappings and the echo advert appear/heal minutes
   // after node startup, and the node classifies per request — poll gently.
   void refreshLocalFingerprint();
-  window.setInterval(() => { void refreshLocalFingerprint(); }, 60_000);
+  window.setInterval(() => {
+    void refreshLocalFingerprint();
+  }, 60_000);
 
   // (The Use Link accept path moved to the ACCESS app with #52 — USE PASS
   //  runs the curtain-covered swap via accessBeamTransport, which already
@@ -3927,7 +4935,9 @@ function setupNetworkDetailsPanel() {
  *  so after a transit/beam the visible pass always belongs to the CURRENT
  *  room without pressing GENERATE. */
 async function syncAccessPass(): Promise<void> {
-  const passOutput = document.getElementById('access-pass-output') as HTMLInputElement | null;
+  const passOutput = document.getElementById(
+    "access-pass-output",
+  ) as HTMLInputElement | null;
   if (!passOutput) {
     return;
   }
@@ -3936,7 +4946,9 @@ async function syncAccessPass(): Promise<void> {
   if (minted.link) {
     passOutput.value = minted.link;
   } else {
-    passOutput.value = minted.error ?? 'Local node not reachable — launch the app (or Rust node) first.';
+    passOutput.value =
+      minted.error ??
+      "Local node not reachable — launch the app (or Rust node) first.";
   }
 }
 
@@ -3949,28 +4961,30 @@ async function syncAccessPass(): Promise<void> {
 // + the ACCESS app. PUBLIC = anyone enters; PASS = anyone with the link
 // (today's default); KEYED = granted keys only (enforced once keyed identity
 // ships — see brainstorming/keyed-identity-contacts-plan.md §9). Owner-set.
-type AccessMode = 'public' | 'pass' | 'keyed';
+type AccessMode = "public" | "pass" | "keyed";
 
 const ACCESS_MODE_COPY: Record<AccessMode, string> = {
-  public: 'PUBLIC · anyone can enter this room.',
-  pass: 'PASS · anyone with the link can enter (default).',
-  keyed: 'KEYED · granted keys only (enforced once keyed identity ships).',
+  public: "PUBLIC · anyone can enter this room.",
+  pass: "PASS · anyone with the link can enter (default).",
+  keyed: "KEYED · granted keys only (enforced once keyed identity ships).",
 };
 
 function getRoomAccessMode(): AccessMode {
-  const m = yjsSync?.doc.getMap('roomInfo').get('accessMode');
-  return m === 'public' || m === 'keyed' ? m : 'pass';
+  const m = yjsSync?.doc.getMap("roomInfo").get("accessMode");
+  return m === "public" || m === "keyed" ? m : "pass";
 }
 
 function isLocalOwnerOfCurrentRoom(): boolean {
-  const owner = yjsSync?.doc.getMap('roomInfo').get('owner') as string | undefined;
+  const owner = yjsSync?.doc.getMap("roomInfo").get("owner") as
+    | string
+    | undefined;
   return !!owner && isLocalPlayerRoomOwner(owner);
 }
 
 function setRoomAccessMode(mode: AccessMode): void {
   if (!yjsSync || !isLocalOwnerOfCurrentRoom()) return; // owner-gated
-  const rm = yjsSync.doc.getMap('roomInfo');
-  yjsSync.doc.transact(() => rm.set('accessMode', mode));
+  const rm = yjsSync.doc.getMap("roomInfo");
+  yjsSync.doc.transact(() => rm.set("accessMode", mode));
 }
 
 /** Reflect the current access mode: tint the door LEDs + paint the ACCESS
@@ -3978,31 +4992,40 @@ function setRoomAccessMode(mode: AccessMode): void {
 function applyAccessModeUI(mode: AccessMode): void {
   world.dockingSystem?.setAccessMode(mode);
   const isOwner = isLocalOwnerOfCurrentRoom();
-  const row = document.getElementById('access-mode-row');
+  const row = document.getElementById("access-mode-row");
   if (row) {
-    for (const btn of row.querySelectorAll<HTMLButtonElement>('.access-mode-btn')) {
+    for (const btn of row.querySelectorAll<HTMLButtonElement>(
+      ".access-mode-btn",
+    )) {
       const btnMode = btn.dataset.accessMode as AccessMode;
-      btn.setAttribute('aria-checked', String(btnMode === mode));
+      btn.setAttribute("aria-checked", String(btnMode === mode));
       btn.disabled = !isOwner;
-      btn.classList.toggle('is-disabled', !isOwner);
-      btn.title = isOwner ? `Set room access to ${btnMode}` : 'Only the room owner can change access mode';
+      btn.classList.toggle("is-disabled", !isOwner);
+      btn.title = isOwner
+        ? `Set room access to ${btnMode}`
+        : "Only the room owner can change access mode";
     }
   }
-  const note = document.getElementById('access-mode-note');
-  if (note) note.textContent = isOwner ? ACCESS_MODE_COPY[mode] : `${ACCESS_MODE_COPY[mode]} (owner-set)`;
+  const note = document.getElementById("access-mode-note");
+  if (note)
+    note.textContent = isOwner
+      ? ACCESS_MODE_COPY[mode]
+      : `${ACCESS_MODE_COPY[mode]} (owner-set)`;
 }
 
 function refreshAccessRoomRow(): void {
   applyAccessModeUI(getRoomAccessMode());
-  const nameEl = document.getElementById('access-room-name');
-  const idEl = document.getElementById('access-room-id');
+  const nameEl = document.getElementById("access-room-name");
+  const idEl = document.getElementById("access-room-id");
   if (!nameEl || !idEl) return;
   if (!yjsSync) {
-    nameEl.textContent = 'OFFLINE';
-    idEl.textContent = 'no room joined';
+    nameEl.textContent = "OFFLINE";
+    idEl.textContent = "no room joined";
     return;
   }
-  nameEl.textContent = (yjsSync.doc.getMap('roomInfo').get('name') as string | undefined) || 'Lobby';
+  nameEl.textContent =
+    (yjsSync.doc.getMap("roomInfo").get("name") as string | undefined) ||
+    "Lobby";
   idEl.textContent = activeBootstrap?.roomId ?? getDefaultRoomId();
 }
 
@@ -4011,9 +5034,9 @@ function refreshAccessRoomRow(): void {
 /** Repaint the phone identity row (name + key fingerprint). Module-level so
  *  actions outside setupSpacePhoneOverlay (identity restore) can refresh it. */
 function refreshIdentityKeyRow(): void {
-  const nameEl = document.getElementById('phone-player-name');
+  const nameEl = document.getElementById("phone-player-name");
   if (nameEl) nameEl.textContent = getPlayerName();
-  const keyEl = document.getElementById('phone-identity-key');
+  const keyEl = document.getElementById("phone-identity-key");
   if (keyEl) {
     keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
     keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
@@ -4023,7 +5046,7 @@ function refreshIdentityKeyRow(): void {
 let contactsAppInited = false;
 
 function setContactsFeedback(msg: string): void {
-  const el = document.getElementById('contacts-feedback');
+  const el = document.getElementById("contacts-feedback");
   if (el) el.textContent = msg;
 }
 
@@ -4033,92 +5056,161 @@ function setupContactsApp(): void {
   if (contactsAppInited) return;
   contactsAppInited = true;
 
-  const discoverableBox = document.getElementById('contacts-discoverable') as HTMLInputElement | null;
+  const discoverableBox = document.getElementById(
+    "contacts-discoverable",
+  ) as HTMLInputElement | null;
   if (discoverableBox) {
     discoverableBox.checked = isDiscoverable();
-    discoverableBox.addEventListener('change', () => {
+    discoverableBox.addEventListener("change", () => {
       setDiscoverable(discoverableBox.checked);
-      setContactsFeedback(discoverableBox.checked
-        ? 'Discoverable — re-share your card so friends can introduce you.'
-        : 'No longer discoverable. New cards you share opt out.');
+      setContactsFeedback(
+        discoverableBox.checked
+          ? "Discoverable — re-share your card so friends can introduce you."
+          : "No longer discoverable. New cards you share opt out.",
+      );
     });
   }
 
-  document.getElementById('contacts-share-btn')?.addEventListener('click', () => {
-    const card = encodeMyCard();
-    const out = document.getElementById('contacts-my-card') as HTMLInputElement | null;
-    if (out) { out.value = card; out.select(); }
-    navigator.clipboard?.writeText(card).then(
-      () => setContactsFeedback('Your card is copied — share it however you like.'),
-      () => setContactsFeedback('Your card is shown above — copy it manually.'),
+  document
+    .getElementById("contacts-share-btn")
+    ?.addEventListener("click", () => {
+      const card = encodeMyCard();
+      const out = document.getElementById(
+        "contacts-my-card",
+      ) as HTMLInputElement | null;
+      if (out) {
+        out.value = card;
+        out.select();
+      }
+      navigator.clipboard?.writeText(card).then(
+        () =>
+          setContactsFeedback(
+            "Your card is copied — share it however you like.",
+          ),
+        () =>
+          setContactsFeedback("Your card is shown above — copy it manually."),
+      );
+    });
+
+  const addBtn = document.getElementById("contacts-add-btn");
+  const addInput = document.getElementById(
+    "contacts-add-input",
+  ) as HTMLInputElement | null;
+  addBtn?.addEventListener("click", () => {
+    const raw = addInput?.value.trim();
+    if (!raw) {
+      setContactsFeedback("Paste a contact card first.");
+      return;
+    }
+    const result = addContactFromCard(raw);
+    if (!result.ok) {
+      setContactsFeedback(result.error);
+      return;
+    }
+    if (addInput) addInput.value = "";
+    setContactsFeedback(
+      result.isSelf
+        ? "That's your own card."
+        : `Added ${result.name} · 🔑 ${contactFingerprint(result.pub)}. Verify the fingerprint out-of-band.`,
     );
   });
 
-  const addBtn = document.getElementById('contacts-add-btn');
-  const addInput = document.getElementById('contacts-add-input') as HTMLInputElement | null;
-  addBtn?.addEventListener('click', () => {
-    const raw = addInput?.value.trim();
-    if (!raw) { setContactsFeedback('Paste a contact card first.'); return; }
-    const result = addContactFromCard(raw);
-    if (!result.ok) { setContactsFeedback(result.error); return; }
-    if (addInput) addInput.value = '';
-    setContactsFeedback(result.isSelf
-      ? "That's your own card."
-      : `Added ${result.name} · 🔑 ${contactFingerprint(result.pub)}. Verify the fingerprint out-of-band.`);
-  });
-
   // Recovery: reveal export / restore (destructive — swaps your identity).
-  document.getElementById('contacts-export-btn')?.addEventListener('click', () => {
-    const out = document.getElementById('contacts-recovery-out') as HTMLInputElement | null;
-    if (out) { out.value = (window as any).__ssfIdentity.exportRecoveryKey(); out.select(); }
-    setContactsFeedback('Recovery key revealed — store it somewhere only you control.');
-  });
-  document.getElementById('contacts-import-key-btn')?.addEventListener('click', () => {
-    const inp = document.getElementById('contacts-recovery-in') as HTMLInputElement | null;
-    const raw = inp?.value.trim();
-    if (!raw) { setContactsFeedback('Paste a recovery key to restore.'); return; }
-    const newPub = (window as any).__ssfIdentity.importRecoveryKey(raw);
-    if (!newPub) { setContactsFeedback('That is not a valid recovery key.'); return; }
-    if (inp) inp.value = '';
-    // The old identity's DM rooms are derived from the OLD pubkey pair and would
-    // sign/verify-mismatch under the new key — tear them down (review LOW).
-    closeDmOverlay();
-    void closeAllDms();
-    // Re-assert the restored identity into the current room's player entry.
-    updateLocalPlayerEntry();
-    refreshIdentityKeyRow();
-    refreshContactsApp();
-    setContactsFeedback('Identity restored. Your key fingerprint updated.');
-  });
+  document
+    .getElementById("contacts-export-btn")
+    ?.addEventListener("click", () => {
+      const out = document.getElementById(
+        "contacts-recovery-out",
+      ) as HTMLInputElement | null;
+      if (out) {
+        out.value = (window as any).__ssfIdentity.exportRecoveryKey();
+        out.select();
+      }
+      setContactsFeedback(
+        "Recovery key revealed — store it somewhere only you control.",
+      );
+    });
+  document
+    .getElementById("contacts-import-key-btn")
+    ?.addEventListener("click", () => {
+      const inp = document.getElementById(
+        "contacts-recovery-in",
+      ) as HTMLInputElement | null;
+      const raw = inp?.value.trim();
+      if (!raw) {
+        setContactsFeedback("Paste a recovery key to restore.");
+        return;
+      }
+      const newPub = (window as any).__ssfIdentity.importRecoveryKey(raw);
+      if (!newPub) {
+        setContactsFeedback("That is not a valid recovery key.");
+        return;
+      }
+      if (inp) inp.value = "";
+      // The old identity's DM rooms are derived from the OLD pubkey pair and would
+      // sign/verify-mismatch under the new key — tear them down (review LOW).
+      closeDmOverlay();
+      void closeAllDms();
+      // Re-assert the restored identity into the current room's player entry.
+      updateLocalPlayerEntry();
+      refreshIdentityKeyRow();
+      refreshContactsApp();
+      setContactsFeedback("Identity restored. Your key fingerprint updated.");
+    });
 
   // Delegated list actions (friend toggle, DM, remove) for both lists.
   const onListClick = (e: Event) => {
-    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-contact-act]');
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
+      "button[data-contact-act]",
+    );
     if (!btn) return;
     const pub = btn.dataset.contactPub;
     if (!pub) return;
     switch (btn.dataset.contactAct) {
-      case 'friend': setFriend(pub, true); setContactsFeedback('Added to friends.'); break;
-      case 'unfriend': setFriend(pub, false); setContactsFeedback('Removed from friends.'); break;
-      case 'remove': removeContact(pub); setContactsFeedback('Contact removed.'); break;
-      case 'dm': openDirectMessage(pub); break;
+      case "friend":
+        setFriend(pub, true);
+        setContactsFeedback("Added to friends.");
+        break;
+      case "unfriend":
+        setFriend(pub, false);
+        setContactsFeedback("Removed from friends.");
+        break;
+      case "remove":
+        removeContact(pub);
+        setContactsFeedback("Contact removed.");
+        break;
+      case "dm":
+        openDirectMessage(pub);
+        break;
     }
   };
-  document.getElementById('contacts-friends-list')?.addEventListener('click', onListClick);
-  document.getElementById('contacts-all-list')?.addEventListener('click', onListClick);
+  document
+    .getElementById("contacts-friends-list")
+    ?.addEventListener("click", onListClick);
+  document
+    .getElementById("contacts-all-list")
+    ?.addEventListener("click", onListClick);
 
   // Keep the app live while it (or anything) mutates the contacts store or the
   // mesh peer store (room harvest densifies the mesh while you're in a room).
-  subscribeContacts(() => { if (isContactsAppOpen()) refreshContactsApp(); });
-  subscribePeers(() => { if (isContactsAppOpen()) refreshContactsApp(); });
+  subscribeContacts(() => {
+    if (isContactsAppOpen()) refreshContactsApp();
+  });
+  subscribePeers(() => {
+    if (isContactsAppOpen()) refreshContactsApp();
+  });
 }
 
 function isContactsAppOpen(): boolean {
-  const el = document.getElementById('phone-app-contacts');
-  return !!el && el.classList.contains('active');
+  const el = document.getElementById("phone-app-contacts");
+  return !!el && el.classList.contains("active");
 }
 
-function contactRowHtml(name: string, pub: string, opts: { friend: boolean }): string {
+function contactRowHtml(
+  name: string,
+  pub: string,
+  opts: { friend: boolean },
+): string {
   const fp = contactFingerprint(pub);
   const safeName = escapeHtml(name);
   const safePub = escapeHtml(pub); // defense-in-depth: pub is canonical b64url today, but never trust it into HTML
@@ -4127,7 +5219,7 @@ function contactRowHtml(name: string, pub: string, opts: { friend: boolean }): s
     : `<button type="button" data-contact-act="friend" data-contact-pub="${safePub}" title="Add to friends">☆</button>`;
   const dmBtn = opts.friend
     ? `<button type="button" data-contact-act="dm" data-contact-pub="${safePub}" title="Direct message">💬</button>`
-    : '';
+    : "";
   return `<div class="contact-row" role="listitem">
     <span class="contact-name" title="${safePub}">${safeName}</span>
     <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
@@ -4136,39 +5228,51 @@ function contactRowHtml(name: string, pub: string, opts: { friend: boolean }): s
 }
 
 function refreshContactsApp(): void {
-  const nameEl = document.getElementById('contacts-my-name');
-  const fpEl = document.getElementById('contacts-my-fp');
+  const nameEl = document.getElementById("contacts-my-name");
+  const fpEl = document.getElementById("contacts-my-fp");
   if (nameEl) nameEl.textContent = getPlayerName();
   if (fpEl) fpEl.textContent = `🔑 ${getIdentityFingerprint()}`;
 
   const friends = listFriends();
   const all = listContacts();
-  const friendsList = document.getElementById('contacts-friends-list');
-  const allList = document.getElementById('contacts-all-list');
+  const friendsList = document.getElementById("contacts-friends-list");
+  const allList = document.getElementById("contacts-all-list");
   if (friendsList) {
     friendsList.innerHTML = friends.length
-      ? friends.map((c) => contactRowHtml(c.name, c.pub, { friend: true })).join('')
+      ? friends
+          .map((c) => contactRowHtml(c.name, c.pub, { friend: true }))
+          .join("")
       : '<div class="phone-access-note">No friends yet — add a contact, then tap ☆ to make them a friend.</div>';
   }
   if (allList) {
     allList.innerHTML = all.length
-      ? all.map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend })).join('')
+      ? all
+          .map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend }))
+          .join("")
       : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
   }
-  const meshNote = document.getElementById('contacts-mesh-note');
+  const meshNote = document.getElementById("contacts-mesh-note");
   if (meshNote) {
     const n = peerCount();
     const routable = listPeers().filter((p) => p.hints != null).length;
     meshNote.textContent = n
-      ? `${n} peer${n === 1 ? '' : 's'} known · ${routable} with a live route. Every verified identity you meet strengthens the network.`
-      : 'Every verified identity you meet strengthens the peer network.';
+      ? `${n} peer${n === 1 ? "" : "s"} known · ${routable} with a live route. Every verified identity you meet strengthens the network.`
+      : "Every verified identity you meet strengthens the peer network.";
   }
 }
 
 function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (ch) => (
-    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : '&#39;'
-  ));
+  return s.replace(/[&<>"']/g, (ch) =>
+    ch === "&"
+      ? "&amp;"
+      : ch === "<"
+        ? "&lt;"
+        : ch === ">"
+          ? "&gt;"
+          : ch === '"'
+            ? "&quot;"
+            : "&#39;",
+  );
 }
 
 /** 🕸️ Mesh harvest (§7 M1): fold every contact/friend into the peer store.
@@ -4179,7 +5283,7 @@ function harvestContactsIntoMesh(): void {
       pub: c.pub,
       name: c.name,
       hints: (c.hints as RoomMemberHint | undefined) ?? null,
-      trust: c.friend ? 'friend' : 'contact',
+      trust: c.friend ? "friend" : "contact",
     });
   }
 }
@@ -4190,7 +5294,9 @@ function harvestContactsIntoMesh(): void {
  *  identity, not a route, so it seeds the graph at 'room' trust until a card or
  *  introduction supplies reachability. */
 const verifiedCertCache = new Set<string>(); // memo of (keyB64|name|keySig) already verified
-function harvestRoomPlayersIntoMesh(players: { forEach: (cb: (v: unknown) => void) => void }): void {
+function harvestRoomPlayersIntoMesh(players: {
+  forEach: (cb: (v: unknown) => void) => void;
+}): void {
   players.forEach((value) => {
     const e = value as Partial<PlayerEntry>;
     if (!e.keyB64 || !e.keySig || !e.name) return;
@@ -4200,7 +5306,7 @@ function harvestRoomPlayersIntoMesh(players: { forEach: (cb: (v: unknown) => voi
     if (verifiedCertCache.has(cacheKey)) return; // verified + recorded already
     if (!verifyNameCert(e.name, e.keyB64, e.keySig)) return;
     verifiedCertCache.add(cacheKey);
-    recordPeer({ pub: e.keyB64, name: e.name, hints: null, trust: 'room' });
+    recordPeer({ pub: e.keyB64, name: e.name, hints: null, trust: "room" });
   });
 }
 
@@ -4214,45 +5320,60 @@ let dmObserver: (() => void) | null = null;
 function setupDmOverlay(): void {
   if (dmOverlayInited) return;
   dmOverlayInited = true;
-  document.getElementById('dm-close')?.addEventListener('click', closeDmOverlay);
-  const form = document.getElementById('dm-form') as HTMLFormElement | null;
-  const input = document.getElementById('dm-input') as HTMLInputElement | null;
-  form?.addEventListener('submit', (e) => {
+  document
+    .getElementById("dm-close")
+    ?.addEventListener("click", closeDmOverlay);
+  const form = document.getElementById("dm-form") as HTMLFormElement | null;
+  const input = document.getElementById("dm-input") as HTMLInputElement | null;
+  form?.addEventListener("submit", (e) => {
     e.preventDefault();
-    const text = input?.value ?? '';
+    const text = input?.value ?? "";
     if (!text.trim() || !dmActiveSession) return;
     sendMessage(dmActiveSession, text);
-    if (input) input.value = '';
+    if (input) input.value = "";
     renderDmMessages(); // local echo is immediate; the observer covers remote
   });
   // Esc closes the DM (capture so it beats the phone's Esc-to-home handler).
-  window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !document.getElementById('dm-overlay')?.hasAttribute('hidden')) {
-      e.stopPropagation();
-      closeDmOverlay();
-    }
-  }, true);
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (
+        e.key === "Escape" &&
+        !document.getElementById("dm-overlay")?.hasAttribute("hidden")
+      ) {
+        e.stopPropagation();
+        closeDmOverlay();
+      }
+    },
+    true,
+  );
 }
 
 function setDmStatus(text: string): void {
-  const el = document.getElementById('dm-status');
+  const el = document.getElementById("dm-status");
   if (el) el.textContent = text;
 }
 
 function renderDmMessages(): void {
-  const list = document.getElementById('dm-messages');
+  const list = document.getElementById("dm-messages");
   if (!list || !dmActiveSession) return;
   const me = getIdentityPub();
   const msgs: DirectMessage[] = readMessages(dmActiveSession);
   if (!msgs.length) {
-    list.innerHTML = '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
+    list.innerHTML =
+      '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
     return;
   }
-  list.innerHTML = msgs.map((m) => {
-    const mine = m.author === me;
-    const time = new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    return `<div class="dm-msg ${mine ? 'dm-mine' : 'dm-theirs'}">${escapeHtml(m.text)}<span class="dm-msg-meta">${escapeHtml(mine ? 'you' : m.authorName)} · ${time}</span></div>`;
-  }).join('');
+  list.innerHTML = msgs
+    .map((m) => {
+      const mine = m.author === me;
+      const time = new Date(m.ts).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      return `<div class="dm-msg ${mine ? "dm-mine" : "dm-theirs"}">${escapeHtml(m.text)}<span class="dm-msg-meta">${escapeHtml(mine ? "you" : m.authorName)} · ${time}</span></div>`;
+    })
+    .join("");
   list.scrollTop = list.scrollHeight;
 }
 
@@ -4261,45 +5382,53 @@ function renderDmMessages(): void {
 function openDirectMessage(pub: string): void {
   setupDmOverlay();
   const contact = getContact(pub);
-  const overlay = document.getElementById('dm-overlay');
-  const nameEl = document.getElementById('dm-peer-name');
-  const fpEl = document.getElementById('dm-peer-fp');
-  if (nameEl) nameEl.textContent = contact?.name ?? 'Contact';
+  const overlay = document.getElementById("dm-overlay");
+  const nameEl = document.getElementById("dm-peer-name");
+  const fpEl = document.getElementById("dm-peer-fp");
+  if (nameEl) nameEl.textContent = contact?.name ?? "Contact";
   if (fpEl) fpEl.textContent = `🔑 ${contactFingerprint(pub)}`;
   dmActivePeer = pub;
-  overlay?.removeAttribute('hidden');
-  document.getElementById('dm-messages')!.innerHTML = '<div id="dm-empty">Connecting…</div>';
-  setDmStatus('connecting');
-  (document.getElementById('dm-input') as HTMLInputElement | null)?.focus();
+  overlay?.removeAttribute("hidden");
+  document.getElementById("dm-messages")!.innerHTML =
+    '<div id="dm-empty">Connecting…</div>';
+  setDmStatus("connecting");
+  (document.getElementById("dm-input") as HTMLInputElement | null)?.focus();
 
   // Prefer the contact card's own route; fall back to the mesh peer store
   // (§7 M1 consume) — a route another encounter/introduction supplied.
-  const hints = (contact?.hints as RoomMemberHint | undefined) ?? hintsFor(pub) ?? null;
+  const hints =
+    (contact?.hints as RoomMemberHint | undefined) ?? hintsFor(pub) ?? null;
   openDm(pub, hints).then(
     (session) => {
       if (dmActivePeer !== pub) return; // user already navigated away
       dmActiveSession = session;
       (window as any).__ssfDM.active = session; // debug hook (matches __players etc.)
-      setDmStatus('connected');
+      setDmStatus("connected");
       gossipIntroductions(session); // §7 M2: densify the mesh over this friend link
       renderDmMessages();
       // Live updates: re-render on any change to the conversation array.
-      const obs = () => { if (dmActivePeer === pub) renderDmMessages(); };
+      const obs = () => {
+        if (dmActivePeer === pub) renderDmMessages();
+      };
       session.messages.observe(obs);
       dmObserver = () => session.messages.unobserve(obs);
     },
     (err) => {
       if (dmActivePeer !== pub) return;
-      setDmStatus('offline');
-      const list = document.getElementById('dm-messages');
-      if (list) list.innerHTML = `<div id="dm-empty">Could not reach ${escapeHtml(contact?.name ?? 'contact')} — they may be offline. ${escapeHtml(String(err?.message ?? ''))}</div>`;
+      setDmStatus("offline");
+      const list = document.getElementById("dm-messages");
+      if (list)
+        list.innerHTML = `<div id="dm-empty">Could not reach ${escapeHtml(contact?.name ?? "contact")} — they may be offline. ${escapeHtml(String(err?.message ?? ""))}</div>`;
     },
   );
 }
 
 function closeDmOverlay(): void {
-  document.getElementById('dm-overlay')?.setAttribute('hidden', '');
-  if (dmObserver) { dmObserver(); dmObserver = null; }
+  document.getElementById("dm-overlay")?.setAttribute("hidden", "");
+  if (dmObserver) {
+    dmObserver();
+    dmObserver = null;
+  }
   const peer = dmActivePeer;
   dmActivePeer = null;
   dmActiveSession = null;
@@ -4319,14 +5448,19 @@ const gossipedSessions = new WeakSet<DmSession>();
 function gossipIntroductions(session: DmSession): void {
   if (gossipedSessions.has(session)) return; // once per session (re-open/double-tap guard)
   gossipedSessions.add(session);
-  const introsArr = session.sync.doc.getArray<Introduction>('intros');
+  const introsArr = session.sync.doc.getArray<Introduction>("intros");
 
   // Publish OUR discoverable contacts' introductions once — each carries the
   // subject's OWN signed card (reconstructCard), so consent is subject-proven.
   const mine = makeIntroductions(
-    listContacts().map(reconstructCard).filter((c): c is ContactCard => !!c),
+    listContacts()
+      .map(reconstructCard)
+      .filter((c): c is ContactCard => !!c),
   );
-  if (mine.length) session.sync.doc.transact(() => { introsArr.push(mine); });
+  if (mine.length)
+    session.sync.doc.transact(() => {
+      introsArr.push(mine);
+    });
 
   // Delta-ingest: process only entries past the cursor on each fire (no O(n^2)
   // full re-verify), deduped by (subjectPub, introducerPub).
@@ -4336,7 +5470,8 @@ function gossipIntroductions(session: DmSession): void {
     const all = introsArr.toArray();
     for (; cursor < all.length; cursor++) {
       const intro = all[cursor];
-      const key = intro && intro.card ? `${intro.card.pub}|${intro.introducerPub}` : '';
+      const key =
+        intro && intro.card ? `${intro.card.pub}|${intro.introducerPub}` : "";
       if (!key || seen.has(key)) continue;
       seen.add(key);
       ingestIntroduction(intro, {
@@ -4345,10 +5480,10 @@ function gossipIntroductions(session: DmSession): void {
         isTrustedIntroducer: (introPub) => {
           if (introPub === session.peerPub) return true;
           const p = getPeer(introPub);
-          return !!p && (p.trust === 'friend' || p.trust === 'contact');
+          return !!p && (p.trust === "friend" || p.trust === "contact");
         },
         record: ({ pub, name, hints, introducer }) =>
-          recordPeer({ pub, name, hints, trust: 'introduced', introducer }),
+          recordPeer({ pub, name, hints, trust: "introduced", introducer }),
       });
     }
   };
@@ -4368,56 +5503,76 @@ let autoEnterRoomId: string | null = null;
  *  "jump now" path (immediate, before READY). */
 async function enterRoomFromPass(seed: string): Promise<void> {
   const setAccessFeedback = (msg: string) => {
-    const el = document.getElementById('access-feedback');
+    const el = document.getElementById("access-feedback");
     if (el) el.textContent = msg;
   };
   if (world.getPlayer().isInAdapterTransit()) {
-    setAccessFeedback('Docking transit in progress — enter once you are through.');
+    setAccessFeedback(
+      "Docking transit in progress — enter once you are through.",
+    );
     return;
   }
-  setAccessFeedback('Entering room…');
+  setAccessFeedback("Entering room…");
   const result = await accessBeamTransport(seed);
-  if (result === 'busy') {
-    setAccessFeedback('A transit is already in progress — try again in a moment.');
+  if (result === "busy") {
+    setAccessFeedback(
+      "A transit is already in progress — try again in a moment.",
+    );
     return;
   }
   if (result instanceof Error) {
-    setAccessFeedback(result instanceof StrandedOfflineError
-      ? `Entry failed — ${result.message}. No room to return to — node OFFLINE.`
-      : `Entry failed — ${result.message}. Returned to your room.`);
+    setAccessFeedback(
+      result instanceof StrandedOfflineError
+        ? `Entry failed — ${result.message}. No room to return to — node OFFLINE.`
+        : `Entry failed — ${result.message}. Returned to your room.`,
+    );
     return;
   }
-  setAccessFeedback('Welcome aboard.');
+  setAccessFeedback("Welcome aboard.");
   refreshAccessRoomRow();
 }
 
 function passStatusLabel(state: PassState): string {
   switch (state) {
-    case 'connecting': return '<span class="access-room-spinner"></span>CONNECTING…';
-    case 'loading': return '<span class="access-room-spinner"></span>LOADING…';
-    case 'ready': return 'READY';
-    case 'current': return 'YOU ARE HERE';
+    case "connecting":
+      return '<span class="access-room-spinner"></span>CONNECTING…';
+    case "loading":
+      return '<span class="access-room-spinner"></span>LOADING…';
+    case "ready":
+      return "READY";
+    case "current":
+      return "YOU ARE HERE";
     // "UNREACHABLE", not "NODE OFFLINE": when a warm times out it's almost always
     // the HOST that couldn't be reached (offline / behind NAT), NOT the local
     // node — the old label made people think their own node was broken.
-    case 'offline': return 'UNREACHABLE';
+    case "offline":
+      return "UNREACHABLE";
   }
 }
 
 // ── Room categorisation: My Rooms / Friends' Rooms / Visited / Unreached ──────
-type RoomCategory = 'mine' | 'friend' | 'visited' | 'unreached';
+type RoomCategory = "mine" | "friend" | "visited" | "unreached";
 
 /** Owner of a room by roomId. The room you're CURRENTLY in reads from the live
  *  session doc; any other (saved-pass) room reads from its background prefetch
  *  doc (empty until it has synced). */
-function roomOwnerInfo(roomId: string): { ownerId?: string; ownerPub?: string } {
-  const currentRoomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+function roomOwnerInfo(roomId: string): {
+  ownerId?: string;
+  ownerPub?: string;
+} {
+  const currentRoomId = (window as unknown as { __ssfRoomId?: string })
+    .__ssfRoomId;
   if (roomId === currentRoomId && yjsSync) {
     const doc = yjsSync.doc;
-    const ownerId = doc.getMap('roomInfo').get('owner');
-    if (typeof ownerId !== 'string' || !ownerId) return {};
-    const entry = doc.getMap('players').get(ownerId) as { keyB64?: string } | undefined;
-    return { ownerId, ownerPub: typeof entry?.keyB64 === 'string' ? entry.keyB64 : undefined };
+    const ownerId = doc.getMap("roomInfo").get("owner");
+    if (typeof ownerId !== "string" || !ownerId) return {};
+    const entry = doc.getMap("players").get(ownerId) as
+      | { keyB64?: string }
+      | undefined;
+    return {
+      ownerId,
+      ownerPub: typeof entry?.keyB64 === "string" ? entry.keyB64 : undefined,
+    };
   }
   return passRoomInfo(roomId);
 }
@@ -4427,13 +5582,17 @@ function roomOwnerInfo(roomId: string): { ownerId?: string; ownerPub?: string } 
  *  (computed once per render) rather than re-derived per room. */
 function categorizeRoom(roomId: string, friendPubs: Set<string>): RoomCategory {
   const { ownerId, ownerPub } = roomOwnerInfo(roomId);
-  if (!ownerId) return 'unreached';
+  if (!ownerId) return "unreached";
   // 'Local-Clone' is the legacy self-owned marker (pre-keyed-identity rooms).
-  if (ownerId === getPlayerId() || ownerId === 'Local-Clone' || (ownerPub && ownerPub === getIdentityPub())) {
-    return 'mine';
+  if (
+    ownerId === getPlayerId() ||
+    ownerId === "Local-Clone" ||
+    (ownerPub && ownerPub === getIdentityPub())
+  ) {
+    return "mine";
   }
-  if (ownerPub && friendPubs.has(ownerPub)) return 'friend';
-  return 'visited';
+  if (ownerPub && friendPubs.has(ownerPub)) return "friend";
+  return "visited";
 }
 
 interface RoomEntry {
@@ -4446,74 +5605,82 @@ interface RoomEntry {
 }
 
 function currentRoomDisplayName(): string {
-  const name = yjsSync?.doc.getMap('roomInfo').get('name');
-  return (typeof name === 'string' && name) ? name : 'Your room';
+  const name = yjsSync?.doc.getMap("roomInfo").get("name");
+  return typeof name === "string" && name ? name : "Your room";
 }
 
 /** A room's LIVE display name: for the room you're currently IN, read the active
  *  session doc so a local rename shows instantly; otherwise use the pass's stored
  *  name (kept current by roomPasses' roomInfo observer) or the roomId. */
 function liveRoomName(roomId: string, fallback: string): string {
-  const currentRoomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+  const currentRoomId = (window as unknown as { __ssfRoomId?: string })
+    .__ssfRoomId;
   if (roomId === currentRoomId && yjsSync) {
-    const n = yjsSync.doc.getMap('roomInfo').get('name');
-    if (typeof n === 'string' && n) return n;
+    const n = yjsSync.doc.getMap("roomInfo").get("name");
+    if (typeof n === "string" && n) return n;
   }
   return fallback;
 }
 
 function buildRoomRow(e: RoomEntry): HTMLElement {
-  const row = document.createElement('div');
+  const row = document.createElement("div");
   row.className = `access-room-item is-${e.state}`;
-  row.setAttribute('role', 'listitem');
+  row.setAttribute("role", "listitem");
 
-  const info = document.createElement('div');
-  info.className = 'access-room-info';
-  const title = document.createElement('div');
-  title.className = 'access-room-title';
+  const info = document.createElement("div");
+  info.className = "access-room-info";
+  const title = document.createElement("div");
+  title.className = "access-room-title";
   title.textContent = e.name || e.roomId;
   title.title = e.roomId;
-  const status = document.createElement('div');
-  status.className = 'access-room-status';
+  const status = document.createElement("div");
+  status.className = "access-room-status";
   status.innerHTML = passStatusLabel(e.state);
   info.append(title, status);
 
-  const actions = document.createElement('div');
-  actions.className = 'access-room-actions';
-  if (e.state !== 'current') {
-    const enter = document.createElement('button');
-    enter.className = 'access-room-btn' + (e.state === 'ready' ? '' : ' is-disabled');
-    enter.textContent = 'ENTER';
-    enter.setAttribute('aria-label', `Enter ${e.name}`);
-    if (e.state === 'ready') {
-      enter.addEventListener('click', () => { autoEnterRoomId = null; void enterRoomFromPass(e.seed); });
+  const actions = document.createElement("div");
+  actions.className = "access-room-actions";
+  if (e.state !== "current") {
+    const enter = document.createElement("button");
+    enter.className =
+      "access-room-btn" + (e.state === "ready" ? "" : " is-disabled");
+    enter.textContent = "ENTER";
+    enter.setAttribute("aria-label", `Enter ${e.name}`);
+    if (e.state === "ready") {
+      enter.addEventListener("click", () => {
+        autoEnterRoomId = null;
+        void enterRoomFromPass(e.seed);
+      });
     }
     actions.append(enter);
     // DEV escape hatch: jump immediately, before the room finishes loading.
-    const jump = document.createElement('button');
-    jump.className = 'access-room-btn access-room-dev';
-    jump.textContent = 'JUMP';
-    jump.title = 'DEV: jump immediately (before READY)';
-    jump.setAttribute('aria-label', `DEV jump to ${e.name} now`);
-    jump.addEventListener('click', () => { autoEnterRoomId = null; void enterRoomFromPass(e.seed); });
+    const jump = document.createElement("button");
+    jump.className = "access-room-btn access-room-dev";
+    jump.textContent = "JUMP";
+    jump.title = "DEV: jump immediately (before READY)";
+    jump.setAttribute("aria-label", `DEV jump to ${e.name} now`);
+    jump.addEventListener("click", () => {
+      autoEnterRoomId = null;
+      void enterRoomFromPass(e.seed);
+    });
     actions.append(jump);
   }
 
   row.append(info, actions);
   if (e.removable) {
-    const remove = document.createElement('button');
-    remove.className = 'access-room-remove';
-    remove.textContent = '✕';
-    remove.title = 'Remove this pass';
-    remove.setAttribute('aria-label', `Remove pass for ${e.name}`);
-    remove.addEventListener('click', () => removePass(e.roomId));
+    const remove = document.createElement("button");
+    remove.className = "access-room-remove";
+    remove.textContent = "✕";
+    remove.title = "Remove this pass";
+    remove.setAttribute("aria-label", `Remove pass for ${e.name}`);
+    remove.addEventListener("click", () => removePass(e.roomId));
     row.append(remove);
   }
   return row;
 }
 
 function renderPassesList(): void {
-  const container = document.getElementById('access-rooms-list');
+  const container = document.getElementById("access-rooms-list");
   if (!container) return;
 
   const passes = listPasses();
@@ -4527,38 +5694,46 @@ function renderPassesList(): void {
   // Always surface the room you're currently in, in its owner's section (your
   // home room → My Rooms; a friend's room you're visiting → Friends'), unless
   // it's already a saved pass (passState marks that one 'current' already).
-  const currentRoomId = (window as unknown as { __ssfRoomId?: string }).__ssfRoomId;
+  const currentRoomId = (window as unknown as { __ssfRoomId?: string })
+    .__ssfRoomId;
   if (currentRoomId && !passes.some((p) => p.roomId === currentRoomId)) {
     entries.push({
       roomId: currentRoomId,
       name: currentRoomDisplayName(),
-      seed: '',
-      state: 'current',
+      seed: "",
+      state: "current",
       removable: false,
     });
   }
 
   if (entries.length === 0) {
-    container.innerHTML = '<div id="access-rooms-empty">No rooms yet — add a pass above.</div>';
+    container.innerHTML =
+      '<div id="access-rooms-empty">No rooms yet — add a pass above.</div>';
     return;
   }
 
   const friendPubs = new Set(listFriends().map((f) => f.pub));
-  const buckets: Record<RoomCategory, RoomEntry[]> = { mine: [], friend: [], visited: [], unreached: [] };
-  for (const e of entries) buckets[categorizeRoom(e.roomId, friendPubs)].push(e);
+  const buckets: Record<RoomCategory, RoomEntry[]> = {
+    mine: [],
+    friend: [],
+    visited: [],
+    unreached: [],
+  };
+  for (const e of entries)
+    buckets[categorizeRoom(e.roomId, friendPubs)].push(e);
 
   const sections: Array<[RoomCategory, string]> = [
-    ['mine', 'MY ROOMS'],
-    ['friend', "FRIENDS' ROOMS"],
-    ['visited', 'VISITED'],
-    ['unreached', 'UNREACHED'],
+    ["mine", "MY ROOMS"],
+    ["friend", "FRIENDS' ROOMS"],
+    ["visited", "VISITED"],
+    ["unreached", "UNREACHED"],
   ];
 
-  container.textContent = '';
+  container.textContent = "";
   for (const [cat, label] of sections) {
     const list = buckets[cat];
     if (list.length === 0) continue;
-    const head = document.createElement('div');
+    const head = document.createElement("div");
     head.className = `access-rooms-subhead is-${cat}`;
     head.textContent = `${label} · ${list.length}`;
     container.append(head);
@@ -4579,12 +5754,13 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
     // our current room (ADD PASS appeared to refresh your own room instead of
     // adding the pasted one, and startPrefetch no-oped because it was active).
     // Reject instead, so a malformed pass surfaces as "Invalid pass".
-    const roomId = typeof parsed.roomId === 'string' && parsed.roomId.length > 0
-      ? parsed.roomId
-      : null;
+    const roomId =
+      typeof parsed.roomId === "string" && parsed.roomId.length > 0
+        ? parsed.roomId
+        : null;
     if (!roomId) return null;
 
-    const rawWtUrl = typeof parsed.wtUrl === 'string' ? parsed.wtUrl : '';
+    const rawWtUrl = typeof parsed.wtUrl === "string" ? parsed.wtUrl : "";
     const certHashesB64 = normalizeStringArray(parsed.certHashesB64);
 
     const parsedHints: RoomMemberHint[] = [];
@@ -4597,18 +5773,21 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
       }
     }
 
-    if (typeof parsed.irohNodeId === 'string' && parsed.irohNodeId.length > 0) {
+    if (typeof parsed.irohNodeId === "string" && parsed.irohNodeId.length > 0) {
       parsedHints.push({
         irohNodeId: parsed.irohNodeId,
-        irohRelayUrls: normalizeStringArray(parsed.irohRelayUrls ?? parsed.relays),
+        irohRelayUrls: normalizeStringArray(
+          parsed.irohRelayUrls ?? parsed.relays,
+        ),
         irohDirectAddrs: normalizeStringArray(parsed.irohDirectAddrs),
       });
     }
 
     const memberHints = mergeMemberHints(parsedHints);
-    const inferredV2 = parsed.v === 2
-      || (typeof parsed.roomKeyB64 === 'string' && parsed.roomKeyB64.length > 0)
-      || memberHints.length > 0;
+    const inferredV2 =
+      parsed.v === 2 ||
+      (typeof parsed.roomKeyB64 === "string" && parsed.roomKeyB64.length > 0) ||
+      memberHints.length > 0;
 
     let wtUrl = rawWtUrl;
     if (wtUrl) {
@@ -4618,7 +5797,7 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
       } catch {
         return null;
       }
-      if (parsedWtUrl.protocol !== 'https:') {
+      if (parsedWtUrl.protocol !== "https:") {
         return null;
       }
     } else if (!inferredV2) {
@@ -4627,7 +5806,7 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
 
     if (!wtUrl) {
       // v2 room-key-first invites can omit transport details and rely on always-bridge.
-      wtUrl = 'https://127.0.0.1:4443';
+      wtUrl = "https://127.0.0.1:4443";
     }
 
     if (!inferredV2 && certHashesB64.length === 0) {
@@ -4635,11 +5814,12 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
     }
 
     const primaryHint = memberHints[0];
-    const roomKeyB64 = typeof parsed.roomKeyB64 === 'string' && parsed.roomKeyB64.length > 0
-      ? parsed.roomKeyB64
-      : inferredV2
-        ? getOrCreateRoomKeyB64(roomId)
-        : undefined;
+    const roomKeyB64 =
+      typeof parsed.roomKeyB64 === "string" && parsed.roomKeyB64.length > 0
+        ? parsed.roomKeyB64
+        : inferredV2
+          ? getOrCreateRoomKeyB64(roomId)
+          : undefined;
 
     return {
       v: inferredV2 ? 2 : 1,
@@ -4651,9 +5831,14 @@ function decodeBootstrapSeed(seed: string): RoomBootstrap | null {
       irohNodeId: primaryHint?.irohNodeId,
       irohRelayUrls: primaryHint?.irohRelayUrls,
       irohDirectAddrs: primaryHint?.irohDirectAddrs,
-      issuedAt: typeof parsed.issuedAt === 'number' ? parsed.issuedAt : undefined,
-      expiresAt: typeof parsed.expiresAt === 'number' ? parsed.expiresAt : undefined,
-      sigB64: typeof parsed.sigB64 === 'string' && parsed.sigB64.length > 0 ? parsed.sigB64 : undefined,
+      issuedAt:
+        typeof parsed.issuedAt === "number" ? parsed.issuedAt : undefined,
+      expiresAt:
+        typeof parsed.expiresAt === "number" ? parsed.expiresAt : undefined,
+      sigB64:
+        typeof parsed.sigB64 === "string" && parsed.sigB64.length > 0
+          ? parsed.sigB64
+          : undefined,
     };
   } catch {
     return null;
@@ -4664,7 +5849,7 @@ function decodeBootstrapInput(input: string): RoomBootstrap | null {
   if (!input) return null;
   try {
     const parsedUrl = new URL(input);
-    const seed = parsedUrl.searchParams.get('seed');
+    const seed = parsedUrl.searchParams.get("seed");
     if (seed) {
       return decodeBootstrapSeed(seed);
     }
@@ -4675,10 +5860,10 @@ function decodeBootstrapInput(input: string): RoomBootstrap | null {
 }
 
 function logToPhoneSystem(msg: string) {
-  const container = document.getElementById('chat-messages-container');
+  const container = document.getElementById("chat-messages-container");
   if (container) {
-    const div = document.createElement('div');
-    div.className = 'chat-bubble system';
+    const div = document.createElement("div");
+    div.className = "chat-bubble system";
     div.textContent = msg;
     container.appendChild(div);
     container.scrollTop = container.scrollHeight;
@@ -4688,14 +5873,14 @@ function logToPhoneSystem(msg: string) {
 function simulateLocalMessage(val: string) {
   // 💬 Offline path never touches the doc, so pop the overhead bubble directly.
   spawnChatBubble(val, /* isSelf */ true);
-  const container = document.getElementById('chat-messages-container');
+  const container = document.getElementById("chat-messages-container");
   if (container) {
-    const ourBubble = document.createElement('div');
-    ourBubble.className = 'chat-bubble outbound';
+    const ourBubble = document.createElement("div");
+    ourBubble.className = "chat-bubble outbound";
     // S2: label offline-sim bubbles with the real display name. Built via
     // textContent — both the name and the message are user-typed strings.
-    const senderSpan = document.createElement('span');
-    senderSpan.className = 'chat-sender-name';
+    const senderSpan = document.createElement("span");
+    senderSpan.className = "chat-sender-name";
     senderSpan.textContent = getPlayerName();
     ourBubble.appendChild(senderSpan);
     ourBubble.appendChild(document.createTextNode(val));
@@ -4703,14 +5888,14 @@ function simulateLocalMessage(val: string) {
 
     // Cute simulated server response after 1.5 seconds
     setTimeout(() => {
-      const resp = document.createElement('div');
-      resp.className = 'chat-bubble inbound';
+      const resp = document.createElement("div");
+      resp.className = "chat-bubble inbound";
       const hints = [
         "Furlong Station: Status clean. Carry on.",
         "Clone-42: Nice voxel suit! Where did you secure it?",
         "Oracle: Keep walking the path, clone. Reaching coordinates...",
         "System: Seeding allowlisted topics.",
-        "Spacephone Net: High atmosphere density observed."
+        "Spacephone Net: High atmosphere density observed.",
       ];
       const randomHint = hints[Math.floor(Math.random() * hints.length)];
       resp.innerHTML = `<span class="chat-sender-name">Remote-Clone</span>${randomHint}`;
@@ -4723,7 +5908,7 @@ function simulateLocalMessage(val: string) {
 }
 
 function updateHUDNode(status: string, color: string) {
-  const nodeEl = document.getElementById('node-status');
+  const nodeEl = document.getElementById("node-status");
   if (nodeEl) {
     nodeEl.textContent = status;
     nodeEl.style.color = color;
@@ -4731,7 +5916,7 @@ function updateHUDNode(status: string, color: string) {
 }
 
 function updateHUDP2P(status: string, color: string) {
-  const p2pEl = document.getElementById('p2p-status');
+  const p2pEl = document.getElementById("p2p-status");
   if (p2pEl) {
     p2pEl.textContent = status;
     p2pEl.style.color = color;
@@ -4755,18 +5940,18 @@ function setupZoomView() {
  * Initialize the game
  */
 async function init() {
-  console.log('🚀 StarStation Furlong - Initializing...');
+  console.log("🚀 StarStation Furlong - Initializing...");
 
   const [rendererModule, worldModule, inputModule] = await Promise.all([
-    import('./renderer'),
-    import('./world'),
-    import('./input'),
+    import("./renderer"),
+    import("./world"),
+    import("./input"),
   ]);
   rendererApi = rendererModule;
-  
+
   // Initialize renderer
   const { scene } = rendererModule.initRenderer();
-  
+
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
@@ -4777,10 +5962,15 @@ async function init() {
   // resolves the owner's display name through the players map.
   setRoomEditPermission(() => {
     if (!yjsSync) return { ok: true }; // offline: your room
-    const owner = (yjsSync.doc.getMap('roomInfo').get('owner') as string | undefined) ?? 'Local-Clone';
+    const owner =
+      (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+      "Local-Clone";
     return isLocalPlayerRoomOwner(owner)
       ? { ok: true }
-      : { ok: false, reason: `Only the owner (${resolveOwnerLabel(owner)}) can edit this room.` };
+      : {
+          ok: false,
+          reason: `Only the owner (${resolveOwnerLabel(owner)}) can edit this room.`,
+        };
   });
 
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
@@ -4791,7 +5981,10 @@ async function init() {
   // map entries without that mapping would be a guess for 2+ remotes).
   const applyOutfitById = (id: string): boolean => {
     const outfit = getOutfitById(id);
-    if (!outfit) { console.warn(`[outfit] unknown outfit id: ${id}`); return false; }
+    if (!outfit) {
+      console.warn(`[outfit] unknown outfit id: ${id}`);
+      return false;
+    }
     // Player keeps its rig private; reach through for this cosmetic path
     // instead of widening the frozen player/character public API.
     (world.getPlayer() as any).character.setOutfit(outfit);
@@ -4801,30 +5994,41 @@ async function init() {
   };
   (window as any).__setOutfit = applyOutfitById; // debug handle (permanent)
   const savedOutfitId = loadSavedOutfitId();
-  if (savedOutfitId && savedOutfitId !== 'default' && !applyOutfitById(savedOutfitId)) {
-    saveOutfitId('default'); // self-heal a stale/unknown saved id — warn once, not every boot
+  if (
+    savedOutfitId &&
+    savedOutfitId !== "default" &&
+    !applyOutfitById(savedOutfitId)
+  ) {
+    saveOutfitId("default"); // self-heal a stale/unknown saved id — warn once, not every boot
   }
 
   // ── Dev-only preview flag (PR-A of #30): `?vestibule=<north|south|east|west>`
   // renders the docking-adapter vestibule outside that door for visual
   // iteration. No gameplay/network/docking wiring — cosmetic preview only.
-  const vestibuleDoor = new URLSearchParams(location.search).get('vestibule');
-  if (vestibuleDoor === 'north' || vestibuleDoor === 'south' || vestibuleDoor === 'east' || vestibuleDoor === 'west') {
+  const vestibuleDoor = new URLSearchParams(location.search).get("vestibule");
+  if (
+    vestibuleDoor === "north" ||
+    vestibuleDoor === "south" ||
+    vestibuleDoor === "east" ||
+    vestibuleDoor === "west"
+  ) {
     try {
-      const adapter = await import('./adapter');
+      const adapter = await import("./adapter");
       const vestibule = adapter.buildVestibule(vestibuleDoor);
       scene.add(vestibule);
       (window as any).__vestibule = vestibule; // console handle for visual iteration
-      (window as any).__setVestibuleLightState = (s: 'idle' | 'cycling' | 'fault') =>
-        adapter.setVestibuleLightState(vestibule, s);
+      (window as any).__setVestibuleLightState = (
+        s: "idle" | "cycling" | "fault",
+      ) => adapter.setVestibuleLightState(vestibule, s);
       // Honor the zoom-hide convention (world.ts hides interior detail at zoom >= 3)
       setInterval(() => {
         const zv = (window as any).multiScaleZoom;
-        vestibule.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
+        vestibule.visible =
+          !zv || typeof zv.getLevel !== "function" || zv.getLevel() < 3;
       }, 250);
     } catch (e) {
       // A failed preview chunk load must never take the whole app down.
-      console.warn('vestibule preview failed to load:', e);
+      console.warn("vestibule preview failed to load:", e);
     }
   }
 
@@ -4851,15 +6055,15 @@ async function init() {
   // DEV1: temporary Development menu (owner request, demo phase — will be
   // phased out). Removal = delete src/devMenu.ts, the #dev-menu-btn line in
   // index.html, and these three lines.
-  const { initDevMenu } = await import('./devMenu');
+  const { initDevMenu } = await import("./devMenu");
   initDevMenu(() => world);
-  
+
   // Single click: expand the platform and enter the lobby
   setupClickToEnter();
-  
-  console.log('✅ Initialization complete');
-  console.log('👆 Click to Enter');
-  
+
+  console.log("✅ Initialization complete");
+  console.log("👆 Click to Enter");
+
   // Start game loop
   animate();
 }
@@ -4886,21 +6090,29 @@ function setupClickToEnter() {
     // 🎬 Pre-entry ends with the curtain: HUD elements gated on it (the
     // SpacePhone tip) become eligible again — the exterior-active gate keeps
     // them hidden until the player actually enters the room.
-    document.body.classList.remove('pre-entry');
-    const welcome = document.getElementById('welcome');
+    document.body.classList.remove("pre-entry");
+    const welcome = document.getElementById("welcome");
     if (welcome) {
-      welcome.style.transition = 'opacity 0.9s ease';
-      welcome.style.opacity = '0';
-      setTimeout(() => { welcome.style.display = 'none'; }, 950);
+      welcome.style.transition = "opacity 0.9s ease";
+      welcome.style.opacity = "0";
+      setTimeout(() => {
+        welcome.style.display = "none";
+      }, 950);
     }
     // Point-and-click navigation arms only once the world is actually
     // visible — intro clicks can never raycast through the curtain.
-    window.addEventListener('click', onCanvasClick);
+    window.addEventListener("click", onCanvasClick);
   };
 
-  setTimeout(() => { dwellDone = true; maybeFade(); }, MIN_DWELL_MS);
-  const skipDwell = () => { dwellDone = true; maybeFade(); };
-  window.addEventListener('click', skipDwell, { once: true });
+  setTimeout(() => {
+    dwellDone = true;
+    maybeFade();
+  }, MIN_DWELL_MS);
+  const skipDwell = () => {
+    dwellDone = true;
+    maybeFade();
+  };
+  window.addEventListener("click", skipDwell, { once: true });
 
   if (hasEntered) return;
   hasEntered = true;
@@ -4911,9 +6123,9 @@ function setupClickToEnter() {
   // visible until the fade reveals the station from space. body.pre-entry
   // gates HUD elements (the SpacePhone tip) that must not float over the
   // title; maybeFade removes it.
-  document.body.classList.add('pre-entry');
-  const curtain = document.getElementById('welcome');
-  if (curtain) curtain.style.background = 'rgb(2, 5, 16)';
+  document.body.classList.add("pre-entry");
+  const curtain = document.getElementById("welcome");
+  if (curtain) curtain.style.background = "rgb(2, 5, 16)";
 
   // Expand platform (planet → lobby morph) and bring networking up — all
   // behind the title curtain.
@@ -4928,10 +6140,13 @@ function setupClickToEnter() {
   // bubble over the dome. Clicking it rides the normal zoom-in path (level
   // 3 → 2), the same as pressing [+].
   const bootExterior = () => {
-    if (world.isMorphActive()) { setTimeout(bootExterior, 200); return; }
+    if (world.isMorphActive()) {
+      setTimeout(bootExterior, 200);
+      return;
+    }
     multiScaleZoom?.bootIntoExterior();
     showEnterRoomBubble(() => {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '+' }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "+" }));
     });
     exteriorReady = true;
     maybeFade();
@@ -4946,8 +6161,11 @@ function onCanvasClick(event: MouseEvent): void {
   //    mousedown that freed the cursor from pointer lock is swallowed — its
   //    coordinates are frozen at the lock point and must not raycast.
   //    Subsequent unlocked clicks fall through and interact normally.
-  if (multiScaleZoom && multiScaleZoom.getLevel() === 1
-      && multiScaleZoom.consumeFirstPersonUnlockClick()) {
+  if (
+    multiScaleZoom &&
+    multiScaleZoom.getLevel() === 1 &&
+    multiScaleZoom.consumeFirstPersonUnlockClick()
+  ) {
     return;
   }
 
@@ -4974,7 +6192,7 @@ function onCanvasClick(event: MouseEvent): void {
   if (!clickPlane) return;
 
   // Normalised device coordinates
-  mouse.x =  (event.clientX / window.innerWidth)  * 2 - 1;
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
   raycaster.setFromCamera(mouse, camera);
@@ -4991,9 +6209,15 @@ function onCanvasClick(event: MouseEvent): void {
     const keypadHits = raycaster.intersectObjects(interactables, true);
     if (keypadHits.length > 0) {
       const hit = keypadHits[0];
-      const doorId = hit.object.userData.doorId as 'north' | 'south' | 'east' | 'west';
+      const doorId = hit.object.userData.doorId as
+        | "north"
+        | "south"
+        | "east"
+        | "west";
       if (doorId) {
-        console.log(`[Raycast Intercept] Golden Terminal Keypad Click on: ${doorId.toUpperCase()}`);
+        console.log(
+          `[Raycast Intercept] Golden Terminal Keypad Click on: ${doorId.toUpperCase()}`,
+        );
         world.dockingSystem.handlePanelRaycast(doorId);
         return; // Halt navigation routing so player does not walk into the door
       }
@@ -5063,14 +6287,19 @@ function onCanvasClick(event: MouseEvent): void {
     if (!insideRoom) {
       const vestibuleGroups: THREE.Object3D[] = [];
       scene.traverse((child) => {
-        if (child.userData && child.userData.isVestibule && child.userData.doorId) {
+        if (
+          child.userData &&
+          child.userData.isVestibule &&
+          child.userData.doorId
+        ) {
           vestibuleGroups.push(child);
         }
       });
       const vestibuleHits = raycaster.intersectObjects(vestibuleGroups, true);
       if (vestibuleHits.length > 0) {
         let node: THREE.Object3D | null = vestibuleHits[0].object;
-        while (node && !(node.userData && node.userData.isVestibule)) node = node.parent;
+        while (node && !(node.userData && node.userData.isVestibule))
+          node = node.parent;
         const doorId = node?.userData?.doorId as string | undefined;
         if (doorId) {
           world.requestDoorWalkthrough(doorId);
@@ -5124,9 +6353,10 @@ function onCanvasClick(event: MouseEvent): void {
       // MODE TOGGLE back to free look — never a walk command. Seats (chairs,
       // bunks) remain clickable items, and device clicks walk you over.
       if (
-        multiScaleZoom && multiScaleZoom.getLevel() === 1
-        && !fpDeviceClicked
-        && !findSeatAt(hit.point.x, hit.point.z)
+        multiScaleZoom &&
+        multiScaleZoom.getLevel() === 1 &&
+        !fpDeviceClicked &&
+        !findSeatAt(hit.point.x, hit.point.z)
       ) {
         if (event.target === window.gameRenderer?.renderer?.domElement) {
           multiScaleZoom.requestFirstPersonPointerLock();
@@ -5144,7 +6374,8 @@ function onCanvasClick(event: MouseEvent): void {
   //    arrows, panels — which also stopPropagation) can never steal the
   //    cursor. This click is also the user activation the lock request needs.
   if (
-    multiScaleZoom && multiScaleZoom.getLevel() === 1 &&
+    multiScaleZoom &&
+    multiScaleZoom.getLevel() === 1 &&
     event.target === window.gameRenderer?.renderer?.domElement
   ) {
     multiScaleZoom.requestFirstPersonPointerLock();
@@ -5162,7 +6393,7 @@ function animate() {
   if (!rendererApi) {
     return;
   }
-  
+
   const currentTime = performance.now();
   // Clamped: a backgrounded tab pauses rAF, so the first resumed frame sees
   // SECONDS of elapsed time — unclamped, that teleports the player a full
@@ -5174,17 +6405,18 @@ function animate() {
   // a lively drift; the camera orbits, the ENTER bubble tracks).
   if (isExteriorActive()) tickExterior(deltaTime);
   lastTime = currentTime;
-  
+
   // Update FPS counter
   frameCount++;
   fpsUpdateTime += deltaTime;
-  if (fpsUpdateTime >= 0.5) { // Update every 0.5 seconds
+  if (fpsUpdateTime >= 0.5) {
+    // Update every 0.5 seconds
     const fps = Math.round(frameCount / fpsUpdateTime);
-    updateDebugHUD('fps', fps.toString());
+    updateDebugHUD("fps", fps.toString());
     frameCount = 0;
     fpsUpdateTime = 0;
   }
-  
+
   // Get renderer state
   const { renderer, camera, scene } = window.gameRenderer;
 
@@ -5209,9 +6441,9 @@ function animate() {
   updateCameraRig(deltaTime);
 
   if (hasEntered && !controlsHintShown && world.isPlayerActive()) {
-    const controls = document.getElementById('controls');
+    const controls = document.getElementById("controls");
     if (controls) {
-      controls.style.animation = 'pulse 1s ease-in-out 3';
+      controls.style.animation = "pulse 1s ease-in-out 3";
     }
     controlsHintShown = true;
   }
@@ -5228,36 +6460,53 @@ function animate() {
   }
 
   // ── Datagram tick sender & stats HUD (Task 3.2 / 3.4)
-  const elProvider = document.getElementById('phone-provider');
-  const elSignalBars = document.getElementById('phone-signal-bars');
+  const elProvider = document.getElementById("phone-provider");
+  const elSignalBars = document.getElementById("phone-signal-bars");
 
-  if (networkProvider.mode() !== 'offline') {
+  if (networkProvider.mode() !== "offline") {
     const stats = networkProvider.stats();
     const debug = networkProvider.debugInfo();
-    updateDebugHUD('rtt', `${isNaN(stats.rttMs) ? '--' : Math.round(stats.rttMs)} ms`);
-    updateDebugHUD('loss', `${isNaN(stats.loss) ? '--' : Math.round(stats.loss * 100)} %`);
-    updateDebugHUD('net-peers-seen', seenPeers.size.toString());
-    updateDebugHUD('net-ticks-recv', receivedTicks.toString());
-    updateDebugHUD('net-ping-pong', `${debug.pingSent}/${debug.pongRecv}`);
-    updateDebugHUD('net-datagrams', debug.datagramsRecv.toString());
-    updateDebugHUD('net-uptime', debug.connectedForMs > 0 ? `${Math.round(debug.connectedForMs / 1000)}s` : '--');
-    updateDebugHUD('net-endpoint', debug.endpointUrl.replace('https://', ''));
+    updateDebugHUD(
+      "rtt",
+      `${isNaN(stats.rttMs) ? "--" : Math.round(stats.rttMs)} ms`,
+    );
+    updateDebugHUD(
+      "loss",
+      `${isNaN(stats.loss) ? "--" : Math.round(stats.loss * 100)} %`,
+    );
+    updateDebugHUD("net-peers-seen", seenPeers.size.toString());
+    updateDebugHUD("net-ticks-recv", receivedTicks.toString());
+    updateDebugHUD("net-ping-pong", `${debug.pingSent}/${debug.pongRecv}`);
+    updateDebugHUD("net-datagrams", debug.datagramsRecv.toString());
+    updateDebugHUD(
+      "net-uptime",
+      debug.connectedForMs > 0
+        ? `${Math.round(debug.connectedForMs / 1000)}s`
+        : "--",
+    );
+    updateDebugHUD("net-endpoint", debug.endpointUrl.replace("https://", ""));
 
     // Expose the active Iroh Dial Key in the informational rows
-    const keyRow = document.getElementById('net-iroh-key');
+    const keyRow = document.getElementById("net-iroh-key");
     if (keyRow) {
-      const fullId = localFingerprint?.iroh_node_id || '--';
-      keyRow.textContent = fullId.length > 20 ? `${fullId.slice(0, 10)}...${fullId.slice(-10)}` : fullId;
+      const fullId = localFingerprint?.iroh_node_id || "--";
+      keyRow.textContent =
+        fullId.length > 20
+          ? `${fullId.slice(0, 10)}...${fullId.slice(-10)}`
+          : fullId;
       keyRow.title = fullId; // hovering shows full robust public key
     }
 
     // Dynamic SpacePhone connection tier + signal bars indicator (LTE vs 3G, No Signal fallback)
-    const seedingSpan = document.getElementById('network-seeding-status');
-    const seedingStatus = seedingSpan?.textContent || '';
-    const hasOpenPorts = seedingStatus.includes('verified') || seedingStatus.includes('PUBLIC');
+    const seedingSpan = document.getElementById("network-seeding-status");
+    const seedingStatus = seedingSpan?.textContent || "";
+    const hasOpenPorts =
+      seedingStatus.includes("verified") || seedingStatus.includes("PUBLIC");
 
     if (elProvider) {
-      elProvider.textContent = hasOpenPorts ? 'FurlongNet LTE' : 'FurlongNet 3G';
+      elProvider.textContent = hasOpenPorts
+        ? "FurlongNet LTE"
+        : "FurlongNet 3G";
     }
 
     if (elSignalBars) {
@@ -5271,18 +6520,18 @@ function animate() {
         else if (rtt < 150) activeBars = 3;
         else if (rtt < 300) activeBars = 2;
       }
-      
+
       const barsDivs = elSignalBars.children;
       for (let i = 0; i < barsDivs.length; i++) {
         const bar = barsDivs[i] as HTMLElement;
         if (i < activeBars) {
-          bar.style.backgroundColor = '#00e676'; // vibrant green active bars
+          bar.style.backgroundColor = "#00e676"; // vibrant green active bars
         } else {
-          bar.style.backgroundColor = 'rgba(255, 255, 255, 0.2)'; // dimmed background bars
+          bar.style.backgroundColor = "rgba(255, 255, 255, 0.2)"; // dimmed background bars
         }
       }
     }
-    
+
     // Broadcast movement ticks at 20 Hz (50 ms interval) when moving
     if (world.isPlayerActive() && currentTime - lastTickSent >= 50) {
       const localPos = world.getPlayer().getPosition();
@@ -5303,48 +6552,56 @@ function animate() {
       const swimming = world.getPlayer().isSwimming();
       const diving = world.getPlayer().isDiving();
       const tickData = {
-        flags: ((dir.x !== 0 || dir.z !== 0) ? 1 : 0) | (seated ? 2 : 0) | (lying ? 4 : 0)
-             | (elevated ? 8 : 0) | (swimming ? 16 : 0) | (diving ? 32 : 0),
+        flags:
+          (dir.x !== 0 || dir.z !== 0 ? 1 : 0) |
+          (seated ? 2 : 0) |
+          (lying ? 4 : 0) |
+          (elevated ? 8 : 0) |
+          (swimming ? 16 : 0) |
+          (diving ? 32 : 0),
         x: localPos.x,
         z: localPos.z,
-        yaw: seated ? world.getPlayer().getSeatedFacing()
-           : diving ? world.getPlayer().getDiveFacing() : 0,
+        yaw: seated
+          ? world.getPlayer().getSeatedFacing()
+          : diving
+            ? world.getPlayer().getDiveFacing()
+            : 0,
         seq: localSeq++,
       };
-      
+
       const packed = packTick(tickData);
       networkProvider.sendTick(packed);
       lastTickSent = currentTime;
     }
   } else {
-    updateDebugHUD('net-uptime', '--');
-    updateDebugHUD('net-endpoint', '--');
-    updateDebugHUD('rtt', '--');
-    updateDebugHUD('loss', '--');
-    updateDebugHUD('net-peers-seen', '--');
-    updateDebugHUD('net-ticks-recv', '--');
-    updateDebugHUD('net-ping-pong', '--');
-    updateDebugHUD('net-datagrams', '--');
+    updateDebugHUD("net-uptime", "--");
+    updateDebugHUD("net-endpoint", "--");
+    updateDebugHUD("rtt", "--");
+    updateDebugHUD("loss", "--");
+    updateDebugHUD("net-peers-seen", "--");
+    updateDebugHUD("net-ticks-recv", "--");
+    updateDebugHUD("net-ping-pong", "--");
+    updateDebugHUD("net-datagrams", "--");
 
-    const keyRow = document.getElementById('net-iroh-key');
+    const keyRow = document.getElementById("net-iroh-key");
     if (keyRow) {
-      keyRow.textContent = '--';
+      keyRow.textContent = "--";
     }
 
     // Offline / No Signal fallback representation
     if (elProvider) {
-      elProvider.textContent = 'NO SIGNAL';
+      elProvider.textContent = "NO SIGNAL";
     }
 
     if (elSignalBars) {
       const barsDivs = elSignalBars.children;
       for (let i = 0; i < barsDivs.length; i++) {
         const bar = barsDivs[i] as HTMLElement;
-        bar.style.backgroundColor = 'rgba(255, 255, 255, 0.15)'; // all bars faded on offline
+        bar.style.backgroundColor = "rgba(255, 255, 255, 0.15)"; // all bars faded on offline
       }
     }
   }
-  
+
   // Render — camera stays locked except for the rig's 45° view detents
   renderer.render(scene, camera);
 }

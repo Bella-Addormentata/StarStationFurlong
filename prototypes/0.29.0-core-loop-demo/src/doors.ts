@@ -17,21 +17,48 @@
  * Geometry matches the door groups placed by docking.ts buildPorts().
  */
 
-export type DoorId = 'north' | 'south' | 'east' | 'west';
+import { physicalDoorPose } from "./doorLayout";
+import type { PhysicalDoorId } from "./doorLayout";
+
+export type DoorId = PhysicalDoorId;
 
 export interface DoorTarget {
   id: DoorId;
-  enabled: boolean;            // false = visible but not walkable (north/fireplace)
-  front:   { x: number; z: number };   // walkable stand point
-  through: { x: number; z: number };   // scripted point past threshold
-  faceAngle: number;           // 8-way facing toward door from front
+  enabled: boolean; // false = visible but not walkable (north/fireplace)
+  front: { x: number; z: number }; // walkable stand point
+  through: { x: number; z: number }; // scripted point past threshold
+  faceAngle: number; // 8-way facing toward door from front
 }
 
 export const DOORS: DoorTarget[] = [
-  { id: 'north', enabled: false, front: { x: 0,    z: -4.5 }, through: { x: 0,    z: -7.0 }, faceAngle: Math.PI },
-  { id: 'south', enabled: true,  front: { x: 0,    z:  4.5 }, through: { x: 0,    z:  7.0 }, faceAngle: 0 },
-  { id: 'west',  enabled: true,  front: { x: -4.5, z: -0.5 }, through: { x: -7.0, z: -0.5 }, faceAngle: -Math.PI / 2 },
-  { id: 'east',  enabled: true,  front: { x:  4.5, z: -0.5 }, through: { x:  7.0, z: -0.5 }, faceAngle:  Math.PI / 2 },
+  {
+    id: "north",
+    enabled: false,
+    front: { x: 0, z: -4.5 },
+    through: { x: 0, z: -7.0 },
+    faceAngle: Math.PI,
+  },
+  {
+    id: "south",
+    enabled: true,
+    front: { x: 0, z: 4.5 },
+    through: { x: 0, z: 7.0 },
+    faceAngle: 0,
+  },
+  {
+    id: "west",
+    enabled: true,
+    front: { x: -4.5, z: -0.5 },
+    through: { x: -7.0, z: -0.5 },
+    faceAngle: -Math.PI / 2,
+  },
+  {
+    id: "east",
+    enabled: true,
+    front: { x: 4.5, z: -0.5 },
+    through: { x: 7.0, z: -0.5 },
+    faceAngle: Math.PI / 2,
+  },
 ];
 
 /** Find a door by its id, or null when the id is unknown. */
@@ -48,29 +75,15 @@ export function findDoor(id: string): DoorTarget | null {
 // front/through. Delta 0 ⇒ bit-identical legacy targets. `enabled` is
 // deliberately untouched — the fireplace blocking rule owns it at runtime.
 
-const BASE_POINTS: Record<DoorId, { front: { x: number; z: number }; through: { x: number; z: number } }> = {
-  north: { front: { x: 0, z: -4.5 }, through: { x: 0, z: -7.0 } },
-  south: { front: { x: 0, z: 4.5 }, through: { x: 0, z: 7.0 } },
-  west: { front: { x: -4.5, z: -0.5 }, through: { x: -7.0, z: -0.5 } },
-  east: { front: { x: 4.5, z: -0.5 }, through: { x: 7.0, z: -0.5 } },
-};
-
 /** Re-derive every door's walk points from its slide delta (0 = legacy). */
 export function applyDoorSlideDeltas(deltas: Record<DoorId, number>): void {
   for (const door of DOORS) {
-    const base = BASE_POINTS[door.id];
-    const d = deltas[door.id] ?? 0;
-    if (door.id === 'north' || door.id === 'south') {
-      door.front.x = base.front.x + d;
-      door.front.z = base.front.z;
-      door.through.x = base.through.x + d;
-      door.through.z = base.through.z;
-    } else {
-      door.front.x = base.front.x;
-      door.front.z = base.front.z + d;
-      door.through.x = base.through.x;
-      door.through.z = base.through.z + d;
-    }
+    const pose = physicalDoorPose(door.id, deltas[door.id] ?? 0);
+    door.front.x = pose.front.x;
+    door.front.z = pose.front.z;
+    door.through.x = pose.through.x;
+    door.through.z = pose.through.z;
+    door.faceAngle = pose.faceAngle;
   }
 }
 
