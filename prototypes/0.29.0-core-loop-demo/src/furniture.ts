@@ -79,6 +79,10 @@ export type FurnitureKind =
   | "casino-gold-wall"
   | "casino-orb-lamp"
   | "chandelier"
+  | "pendant-lamp"
+  | "paper-lantern"
+  | "neon-ring"
+  | "sun-lamp"
   | "lazy-pool"
   | "hot-tub"
   | "classic-pool"
@@ -976,6 +980,76 @@ const buildChandelier = ({ m, place, addLight }: BuildCtx) => {
   // soft up-glow so the ceiling around the canopy reads as lit.
   addLight(new THREE.PointLight(0xffd39a, 0, 16), 0, 2.7, 0, 3.4);
   addLight(new THREE.PointLight(0xffb968, 0, 6), 0, 3.6, 0, 0.9);
+};
+
+// 🪔 Modern pendant — a slim rod and a shallow metal dome shade with a warm
+// glowing underside. Understated; reads "contemporary lounge". Same ceiling-
+// hung convention as the chandelier (footprint null, meshes high, one light).
+const buildPendantLamp = ({ m, place, addLight }: BuildCtx) => {
+  const metal = m(0x2a2f38, 0.35, 0.7);
+  const rim = m(0xc9ccd2, 0.3, 0.8);
+  const glow = m(0xffe9c4, 0.1, 0.0, 0xffcf87, 1.0);
+
+  place(new THREE.CylinderGeometry(0.16, 0.18, 0.06, 12), metal, 0, 3.95, 0);
+  place(new THREE.CylinderGeometry(0.025, 0.025, 0.8, 8), metal, 0, 3.53, 0);
+  // Shallow dome shade (cone, wide side down), a bright rim, and the glowing bulb.
+  place(new THREE.ConeGeometry(0.52, 0.34, 24, 1, true), metal, 0, 3.16, 0);
+  place(new THREE.TorusGeometry(0.5, 0.02, 8, 28), rim, 0, 3.0, 0, Math.PI / 2);
+  place(new THREE.SphereGeometry(0.13, 12, 12), glow, 0, 3.05, 0);
+  addLight(new THREE.PointLight(0xffd6a0, 0, 13), 0, 2.95, 0, 2.7);
+};
+
+// 🏮 Paper lantern — a soft glowing warm globe on a cord. Cheap and cozy; the
+// whole ball is emissive so it reads as lit paper even before its gentle light.
+const buildPaperLantern = ({ m, place, addLight }: BuildCtx) => {
+  const cap = m(0x3b2a1c, 0.6, 0.05);
+  const paper = m(0xffe4b0, 0.5, 0.0, 0xffd18a, 0.9);
+
+  place(new THREE.CylinderGeometry(0.012, 0.012, 0.7, 6), cap, 0, 3.55, 0);
+  place(new THREE.CylinderGeometry(0.09, 0.11, 0.05, 12), cap, 0, 3.2, 0);
+  place(new THREE.SphereGeometry(0.4, 18, 14), paper, 0, 2.78, 0);
+  place(new THREE.CylinderGeometry(0.09, 0.07, 0.05, 12), cap, 0, 2.38, 0);
+  addLight(new THREE.PointLight(0xffca82, 0, 10), 0, 2.78, 0, 1.9);
+};
+
+// 🎰 Neon ring — a suspended halo of glowing tube, casino/nightlife energy. Two
+// concentric emissive rings (cyan + magenta) and a cool bright ring light.
+const buildNeonRing = ({ m, place, addLight }: BuildCtx) => {
+  const mount = m(0x14181f, 0.4, 0.6);
+  const cyan = m(0x1a3a44, 0.2, 0.1, 0x2fe6ff, 1.4);
+  const magenta = m(0x3a1a30, 0.2, 0.1, 0xff4fd8, 1.2);
+
+  place(new THREE.CylinderGeometry(0.14, 0.16, 0.06, 12), mount, 0, 3.95, 0);
+  // Three thin drop wires out to the ring so it reads as suspended.
+  for (let i = 0; i < 3; i++) {
+    const a = (i / 3) * Math.PI * 2;
+    place(new THREE.CylinderGeometry(0.01, 0.01, 0.95, 6), mount,
+      Math.cos(a) * 0.45, 3.5, Math.sin(a) * 0.45);
+  }
+  place(new THREE.TorusGeometry(0.92, 0.05, 12, 48), cyan, 0, 3.02, 0, Math.PI / 2);
+  place(new THREE.TorusGeometry(0.58, 0.04, 12, 40), magenta, 0, 3.02, 0, Math.PI / 2);
+  addLight(new THREE.PointLight(0x59e6ff, 0, 15), 0, 2.9, 0, 2.4);
+  addLight(new THREE.PointLight(0xff6fdf, 0, 8), 0, 2.9, 0, 1.0);
+};
+
+// ☀️ Sun-lamp — a bright, cool-white skylight panel. Unlike the warm fixtures
+// this floods the room with DAYLIGHT-temperature light, so a pool or bright
+// venue placed in a windowless module still reads as sunlit (the sky backdrop
+// stays a scene concern, but the DECK is lit). Big flat emissive panel + frame.
+const buildSunLamp = ({ m, place, addLight }: BuildCtx) => {
+  const frame = m(0xd8dde4, 0.3, 0.7);
+  const panel = m(0xf3f8ff, 0.1, 0.0, 0xeaf3ff, 1.0);
+
+  // Frame border (four bars) + the glowing panel just below the ceiling.
+  const B = 0.9;
+  place(new THREE.BoxGeometry(2 * B + 0.12, 0.08, 0.12), frame, 0, 3.9, B);
+  place(new THREE.BoxGeometry(2 * B + 0.12, 0.08, 0.12), frame, 0, 3.9, -B);
+  place(new THREE.BoxGeometry(0.12, 0.08, 2 * B + 0.12), frame, B, 3.9, 0);
+  place(new THREE.BoxGeometry(0.12, 0.08, 2 * B + 0.12), frame, -B, 3.9, 0);
+  place(new THREE.BoxGeometry(2 * B, 0.05, 2 * B), panel, 0, 3.86, 0);
+  // Bright cool daylight flooding down, plus a soft fill.
+  addLight(new THREE.PointLight(0xdcebff, 0, 20), 0, 3.6, 0, 5.0);
+  addLight(new THREE.PointLight(0xffffff, 0, 10), 0, 2.6, 0, 1.4);
 };
 
 // Tall cherry blossom tree (no collision — footprint: null, documented drift).
@@ -2483,6 +2557,26 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "chandelier": {
     kind: "chandelier",
     build: buildChandelier,
+    footprint: null,
+  },
+  "pendant-lamp": {
+    kind: "pendant-lamp",
+    build: buildPendantLamp,
+    footprint: null,
+  },
+  "paper-lantern": {
+    kind: "paper-lantern",
+    build: buildPaperLantern,
+    footprint: null,
+  },
+  "neon-ring": {
+    kind: "neon-ring",
+    build: buildNeonRing,
+    footprint: null,
+  },
+  "sun-lamp": {
+    kind: "sun-lamp",
+    build: buildSunLamp,
     footprint: null,
   },
   "rug-back": { kind: "rug-back", build: buildRugBack, footprint: null },
@@ -4849,6 +4943,15 @@ export const FURNITURE: FurnitureItem[] = [
   //  menu; world.updateNorthDoorForFireplace still gates north-wall doors if
   //  one is placed in front of them. main.ts purges the retired default id
   //  from already-seeded lobby docs on entry.)
+  // 🕯️ Ceiling chandelier over the lounge — the lobby's practical light as a
+  // placeable fixture (footprint null, hangs at the ceiling above the sofas).
+  {
+    id: "lobby-chandelier",
+    kind: "chandelier",
+    pos: { x: 0.0, z: 0.5 },
+    rot: 0,
+    movable: true,
+  },
   {
     id: "sofa-back",
     kind: "sofa-back",
@@ -5395,6 +5498,15 @@ export const CASINO_ROOM_ID = "ssf-casino-v1";
  * remain reachable from any entrance.
  */
 export const CASINO_FURNITURE: FurnitureItem[] = [
+  // 🎰 Neon halo over the gaming floor — the casino's light as a placeable
+  // fixture (footprint null, hangs at the ceiling above the tables).
+  {
+    id: "casino-neon-ring",
+    kind: "neon-ring",
+    pos: { x: 0.0, z: 0.0 },
+    rot: 0,
+    movable: true,
+  },
   {
     id: "casino-cashier",
     kind: "cashier-atm",

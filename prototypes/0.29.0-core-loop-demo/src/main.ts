@@ -1265,6 +1265,20 @@ async function joinRoomAtEpoch(
         migrateDefaultLayout();
         roomMap.set("lobbyDoorClearV5", true);
       }
+      // 🕯️ Additive one-time: give already-migrated lobbies the new ceiling
+      // chandelier WITHOUT re-snapping the rest of the layout (a full
+      // re-migrate would undo players' furniture moves). Its own marker, so a
+      // player who later removes it keeps it gone — deletion persists.
+      if (!roomMap.get("lobbyChandelierV1")) {
+        writeFurnitureItem({
+          id: "lobby-chandelier",
+          kind: "chandelier",
+          pos: { x: 0, z: 0.5 },
+          rot: 0,
+          movable: true,
+        });
+        roomMap.set("lobbyChandelierV1", true);
+      }
       // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
       // claim (overwrites any stale cert hash from a previous session).
       if (activeBootstrap) {

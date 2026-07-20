@@ -11,6 +11,24 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.42 — 2026-07-20
+
+### 💡 A light for every room — four new ceiling fixtures, wired in
+
+Building on the chandelier (v0.32.41), lighting-as-furniture now has a full palette, and the authored rooms carry their own hanging light.
+
+- **Four new ceiling fixtures**, all footprint-less (walk under them) and cheap to render (they glow via emissive material, so each costs the renderer only one or two real lights):
+  - **☀️ Sun-lamp** — a bright, cool-white skylight panel that floods a room with daylight-temperature light. For pools and bright venues placed in windowless modules.
+  - **🎰 Neon ring** — a suspended cyan + magenta halo; casino/nightlife energy.
+  - **🪔 Pendant lamp** — a modern metal dome with a warm glow; understated lounge light.
+  - **🏮 Paper lantern** — a soft glowing warm globe; cozy and cheap.
+- **The rooms come pre-lit now:**
+  - The **Grand Lobby** gets a **chandelier** over the lounge. Existing lobbies gain it automatically via a one-time additive migration that leaves the rest of your furniture untouched — and it stays gone if you remove it.
+  - The **Luxury Casino** gets a **neon ring** over the gaming floor (re-applied on entry with the rest of the casino layout).
+  - The **Classic Lido pool** template carries a **sun-lamp**, so that pool reads as sunlit even in a dark module — while the live daylit outdoor pool is left exactly as it was.
+- Every fixture is ordinary spawnable, movable furniture — mix and match from **DEV → FURNITURE**.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.42, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.41 — 2026-07-20
 
 ### 🕯️ Lighting you can hang — the chandelier furniture
