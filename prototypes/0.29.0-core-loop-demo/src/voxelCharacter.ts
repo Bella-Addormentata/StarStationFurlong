@@ -43,7 +43,7 @@
 import * as THREE from 'three';
 import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
 
-export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep';
+export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep' | 'swim' | 'dive';
 
 interface PoseState {
   /** World-space Y for the torso root (lower values = seated) */
@@ -77,6 +77,14 @@ const STATES: Record<CharacterState, PoseState> = {
   // mattress; the berth's elevation (top bunk) rides on the PLAYER MESH y, not
   // here, so one pose serves both bunks.
   sleep:      { rootY: 0.62, legRotX: 0,             armRotX: 0,            bodyRotX: -Math.PI / 2 },
+  // 🏊 Swimming (pool seats): the PLAYER MESH y sits at POOL_SWIM_Y (-0.20),
+  // so a low rootY sinks the torso beneath the water plane (y≈-0.03) and
+  // leaves the chibi head bobbing above the surface — Habbo Lido style. Legs
+  // tuck forward; arms paddle in a dedicated update() branch (null = dynamic).
+  swim:       { rootY: -0.05, legRotX: -Math.PI / 2, armRotX: null          },
+  // 🏊‍♂️ Dive arc: face-down superman — POSITIVE bodyRotX tips onto the FRONT
+  // (sleep's -π/2 is onto the back), arms stretched past the head.
+  dive:       { rootY: 0.9,  legRotX: 0,             armRotX: -Math.PI * 0.85, bodyRotX: Math.PI * 0.45 },
 };
 
 /** Snap a continuous angle to the nearest of 8 compass directions (π/4 steps). */
@@ -1019,6 +1027,21 @@ export class VoxelCharacter {
 
       // Tail sway — bigger amplitude on walk, tail wags side to side
       this.tail.rotation.y = Math.sin(time * walkSpeed * 0.5) * 0.35;
+
+    } else if (this.currentState === 'swim') {
+      // 🏊 Gentle paddle: arms alternate at a lazy cadence, legs stay tucked
+      // (table value), torso bobs with the water. Same clamped-lerp discipline
+      // as walk so an alt-tab resume can't extrapolate.
+      const paddle = Math.sin(time * 3.0) * 0.45;
+      const legTarget = state.legRotX ?? 0;
+      this.leftLeg.rotation.x  = THREE.MathUtils.lerp(this.leftLeg.rotation.x,  legTarget, lerpSpeed);
+      this.rightLeg.rotation.x = THREE.MathUtils.lerp(this.rightLeg.rotation.x, legTarget, lerpSpeed);
+      this.leftArm.rotation.x  = THREE.MathUtils.lerp(this.leftArm.rotation.x,  paddle,  lerpSpeed);
+      this.rightArm.rotation.x = THREE.MathUtils.lerp(this.rightArm.rotation.x, -paddle, lerpSpeed);
+      // Water bob rides ON TOP of the root lerp from section 1.
+      this.torso.position.y += Math.sin(time * 2.0) * 0.03;
+      // Tail drifts slowly like it's floating behind.
+      this.tail.rotation.y = Math.sin(time * 1.2) * 0.2;
 
     } else {
       const legTarget = state.legRotX ?? 0;

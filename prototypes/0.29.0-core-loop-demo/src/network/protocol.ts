@@ -170,6 +170,8 @@ export interface ChatMessage {
 // Layout (little-endian) — adjustable in Sprint 3, budget is fixed at 13 bytes:
 //   [0]      u8   flags (bit0: moving, bit1: seated [#63], bit2: lying —
 //                 'sleep' pose, bit3: elevated berth — top bunk [🛏️],
+//                 bit4: swimming — pool seat, 'swim' pose [🏊],
+//                 bit5: diving — mid dive arc, yaw = arc heading [🏊‍♂️],
 //                 rest reserved)
 //   [1..5)   f32  x
 //   [5..9)   f32  z
