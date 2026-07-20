@@ -11,6 +11,15 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.33 — 2026-07-19
+
+### 🤝 Accept an Offer Without Traveling to the Module
+
+- **A deed offer can now be settled where the maker and receiver stand together** (owner request: an accepter may not be able to travel to the module). If you hold a deed offer for a module you can't easily reach, and you're in a room with the person who made it, the REDEEM preview shows **🤝 ASK [MAKER] TO HAND IT OVER**. The maker gets a request in their VENTURES app (**HAND-OVER REQUESTS**) and taps **HAND IT OVER** — their client reaches the module (it's their own; they use their own saved pass) and signs the deed to you, no need for either of you to be at the module. Instant-only, as chosen: if the maker doesn't keep a pass to that module in their room list, the request comes back "can't reach it from here" rather than silently waiting.
+- **The deed is the ownership record** — after a co-present hand-over you own the module; ask the maker for a pass if you'd like to visit it. Personal transfers in v1 (accepting for a company still settles at the module).
+- **Built and hardened carefully**, because this hands ownership across rooms. The request is **cryptographically signed** by the receiver — it proves they hold the key the deed will land on and binds the room + offer, so no one else present can redirect a hand-over or replay it elsewhere. The maker's client judges the module's **live owner from the network** (never a stale local copy) before signing it over, so a deed that already changed hands can't be handed over twice. An independent adversarial review of the first cut caught two serious holes (a third-party "confused deputy" redirect and a stale-cache double-spend); both were closed and re-reviewed clean before this shipped.
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.33 in place, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.32 — 2026-07-19
 
 ### 🚀 Accept an Offer for Your Company

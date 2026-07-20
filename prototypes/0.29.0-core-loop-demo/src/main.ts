@@ -9,6 +9,7 @@ import { updateDebugHUD, showHint } from './hud';
 import type { World } from './world';
 import type { DoorId } from './doors';
 import type { InputManager } from './input';
+import type * as Y from 'yjs';
 import { NetworkProvider } from './network/NetworkProvider';
 import { YjsSync } from './network/YjsSync';
 import { packTick, unpackTick, unpackAddressedTick, ADDRESSED_TICK_BYTES, TICK_BYTES, type MovementTick, type RoomBootstrap, type RoomMemberHint } from './network/protocol';
@@ -104,8 +105,15 @@ import {
 import {
   bindOffers, subscribeOffers, makeOffer, encodeOffer, decodeOffer, offerFileName,
   redeemDeedOffer, redeemShareOffer, revokeOffer, nonceMark, listOfferMarks,
-  offersMade, recordOfferMade, dropOfferMade, type TransferOffer,
+  offersMade, recordOfferMade, dropOfferMade, settleDeedInDoc,
+  type TransferOffer,
 } from './offers';
+// 🤝 Co-present settlement: the maker hands a deed over from a shared room when
+// the receiver can't travel to the module (offers.ts §4.1 amendment).
+import {
+  postSettleRequest, resolveSettleRequest, clearSettleRequest, readSettleRequest,
+  listSettleRequests, subscribeSettleReq, buildSettleRequest, verifiedRequestOwner,
+} from './copresent';
 import {
   initDirectMessages, openDm, sendMessage, readMessages, closeDm, closeAllDms,
   dmRoomIdFor, dmRoomKeyFor, type DmSession, type DirectMessage,
@@ -768,6 +776,25 @@ async function joinRoomAtEpoch(boot: RoomBootstrap, epoch: number, claimRoomDefa
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
   (window as any).__ssfDoc = sync.doc;
 
+  // 🤝 Co-present settlement requests ride THIS room's doc — observe per-join
+  // (the doc changes each room), tearing down the prior room's observer. When
+  // a request lands: the maker auto-picks-up pending ones addressed to their
+  // offers, and the app repaints so the receiver sees status + the maker sees
+  // the inbox. copresentHandled is reset so a new room starts clean.
+  settleReqUnsub?.();
+  copresentHandled.clear();
+  copresentPinged.clear();
+  offerCopresentPending = '';
+  {
+    const settleDoc = sync.doc;
+    settleReqUnsub = subscribeSettleReq(settleDoc, () => {
+      if (yjsSync?.doc === settleDoc) {
+        notifyNewCopresentRequests();
+        renderVenturesApp();
+      }
+    });
+  }
+
   // 🏠 #68 real estate: this room joins (or leaves) the personal deeds ledger
   // that powers the VENTURES app's REAL ESTATE section. Also re-run from the
   // roomInfo observer below — the owner value lands async with the sync.
@@ -1085,6 +1112,9 @@ async function leaveRoom(): Promise<void> {
   setActivePassRoom(null);
   // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
   clearChatBubbles();
+  // 🤝 Detach this room's settleReq observer before its doc is destroyed.
+  settleReqUnsub?.();
+  settleReqUnsub = null;
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -1854,6 +1884,164 @@ let offerRedeemNote = '';
 let offerAcceptAs = '';
 /** Feedback line for the cut-an-offer blocks (copied / saved / refused). */
 let offerCutNote = '';
+/** 🤝 The nonce of a co-present settle request I (the receiver) have posted and
+ *  am waiting on — module state so the preview keeps showing "waiting" across
+ *  repaints and app re-opens until it flips to settled/refused. */
+let offerCopresentPending = '';
+/** 🤝 Nonces the maker's client is actively settling — guards double-settle
+ *  (re-entrant observer fires); claimed synchronously before the first await. */
+const copresentHandled = new Set<string>();
+/** 🤝 Nonces already announced to the maker (one chat-bubble ping per request). */
+const copresentPinged = new Set<string>();
+/** 🤝 Teardown for THIS room's settleReq observer (re-wired every join). */
+let settleReqUnsub: (() => void) | null = null;
+
+/** Maker: one chat-bubble ping when a NEW pending request for one of my offers
+ *  lands — so I notice even without the VENTURES app open. */
+function notifyNewCopresentRequests(): void {
+  if (!yjsSync) return;
+  const myPub = getIdentityPub();
+  for (const { nonce, req } of listSettleRequests(yjsSync.doc)) {
+    if (req.status !== 'pending' || copresentPinged.has(nonce)) continue;
+    const offer = decodeOffer(req.offer);
+    if (!offer || offer.asset.kind !== 'deed' || offer.makerPub !== myPub) continue;
+    copresentPinged.add(nonce);
+    logToPhoneSystem(`🤝 ${req.requesterName} is here and wants ${offer.asset.roomName || 'your module'} — settle it in VENTURES.`);
+  }
+}
+
+// ── 🤝 Co-present settlement (owner request): the maker hands a deed over from
+//    a shared room when the receiver can't travel to the subject module. The
+//    maker's client reaches the module with its OWN saved pass (instant-only —
+//    if it can't, the request is refused "unreachable"). ────────────────────
+
+/** Read a player's keyed entry from the CURRENT room doc, as the portable owner
+ *  record to carry into the module (the name↔key cert is room-agnostic). */
+const delay = (ms: number) => new Promise<void>((r) => window.setTimeout(r, ms));
+
+/**
+ * Open a room's doc in the BACKGROUND (its own provider + YjsSync, the
+ * roomPasses.warm pattern), run `fn` against the synced doc, let the write
+ * flush, then tear it all down. Returns fn's result, or null if the room can't
+ * be reached / never delivered its owner. `seed` is the maker's OWN saved pass
+ * for the module (no seed ever comes from the offer).
+ *
+ * A settle must judge the module's owner from NETWORK truth, so this
+ * DELIBERATELY does not restore the local room-cache snapshot — a stale cached
+ * owner could otherwise pass settleDeedInDoc's owner-match and double-spend a
+ * deed that changed hands elsewhere. It also always waits for a fresh sync
+ * (not gated on owner being empty), and refuses (null) if the owner never
+ * arrives rather than acting on a blank doc.
+ */
+async function withBackgroundRoom<T>(seed: string, fn: (doc: Y.Doc) => T): Promise<T | null> {
+  const decoded = decodeBootstrapInput(seed);
+  if (!decoded) return null;
+  let provider: NetworkProvider | null = null;
+  let sync: YjsSync | null = null;
+  let cache: RoomCacheHandle | null = null;
+  try {
+    const boot = await resolveBridgeBootstrap(decoded);
+    provider = new NetworkProvider();
+    await provider.connect(boot);
+    const channel = await provider.openChannel('ysync');
+    sync = new YjsSync({ roomId: boot.roomId, channel, ...ysyncSigner(), bootRecord: () => provider!.getBootRecord() });
+    // NOTE: no restoreRoomSnapshot — the owner-match must see network truth.
+    cache = attachRoomCache(sync.doc, boot.roomId, () => true);
+    await sync.start();
+    // Converge with the node (which hosts the maker's module), then ALWAYS
+    // pull once more and wait — the first SyncStep2 can reflect a partially
+    // synced replica, so this maximizes the chance of the freshest owner.
+    await Promise.race([sync.whenServerSynced, delay(8000)]);
+    sync.resync();
+    await delay(2000);
+    // Refuse rather than act on a doc whose owner never arrived (a blank owner
+    // would make settleDeedInDoc bail, but be explicit).
+    if (!sync.doc.getMap('roomInfo').get('owner')) return null;
+    const result = fn(sync.doc);
+    cache.flushNow(); // persist locally
+    await delay(1800); // no send-confirmation API — let the write reach the node
+    return result;
+  } catch (e) {
+    console.warn('[copresent] background room open failed:', e);
+    return null;
+  } finally {
+    try { cache?.detach(); } catch { /* ignore */ }
+    try { await sync?.stop(); } catch { /* doc may be gone */ }
+    try { await provider?.disconnect(); } catch { /* transport may be gone */ }
+  }
+}
+
+/**
+ * Maker side: settle a co-present request. Verifies the offer is genuinely mine
+ * and unspent, reads the requester's keyed entry from the shared room, reaches
+ * the subject module (its current doc if I'm in it, else my saved pass in the
+ * background), hands the deed over, and marks the request settled/refused.
+ */
+async function executeCopresentSettle(nonce: string): Promise<void> {
+  if (!yjsSync || copresentHandled.has(nonce)) return;
+  // Capture the request's OWN doc — the resolution (and any teardown check)
+  // must target THIS room even if the maker changes rooms during the
+  // background settle, or the receiver is never told the deed moved.
+  const roomDoc = yjsSync.doc;
+  const roomId = activeBootstrap?.roomId ?? ''; // the room the request lives in (verify runs before any await)
+  const req = readSettleRequest(roomDoc, nonce);
+  if (!req || req.status !== 'pending') return;
+  copresentHandled.add(nonce); // claim it — released in finally so a retry can re-run
+  const alive = () => !(roomDoc as { isDestroyed?: boolean }).isDestroyed;
+  const resolve = (status: 'settled' | 'refused', error?: string) => { if (alive()) resolveSettleRequest(roomDoc, nonce, status, error); };
+  try {
+    const offer = decodeOffer(req.offer);
+    if (!offer || offer.asset.kind !== 'deed') { resolve('refused', 'That offer no longer reads as a deed transfer.'); return; }
+    // The request's map key MUST be the offer's own nonce — otherwise a present
+    // client could pair a victim's signed tuple with a different offer.
+    if (offer.nonce !== nonce) { resolve('refused', 'This request does not match its offer.'); return; }
+    if (offer.makerPub !== getIdentityPub()) { resolve('refused', 'That is not your offer to settle.'); return; }
+    // Trust boundary: the owner comes from the SIGNED request (proves the
+    // receiver holds the key + signed for THIS room/nonce), NOT from an
+    // attacker-writable players lookup.
+    const owner = verifiedRequestOwner(roomId, nonce, req);
+    if (!owner) { resolve('refused', 'The request could not be verified — ask them to send it again.'); return; }
+    // Directed offers: the proven key must be the one it was made out to.
+    if (offer.toPub && offer.toPub !== owner.keyB64) { resolve('refused', 'This offer is made out to someone else.'); return; }
+
+    const moduleId = offer.asset.roomId;
+    // Reachable module: I'm standing in it, or I hold a saved pass for it.
+    if (moduleId === activeBootstrap?.roomId) {
+      const r = settleDeedInDoc(roomDoc, offer, owner);
+      resolve(r.ok ? 'settled' : 'refused', r.ok ? undefined : r.error);
+      if (r.ok) { logToPhoneSystem(`🤝 Handed ${offer.asset.roomName || 'the module'} to ${owner.name}.`); syncDeedsLedgerFromCurrentRoom(); }
+      return;
+    }
+    const seed = passSeed(moduleId);
+    if (!seed) {
+      resolve('refused', `Can't reach ${offer.asset.roomName || 'that module'} from here — keep a pass to it in your room list to settle remotely.`);
+      return;
+    }
+    logToPhoneSystem(`🤝 Settling ${offer.asset.roomName || 'the module'} for ${owner.name}…`);
+    const result = await withBackgroundRoom(seed, (doc) => settleDeedInDoc(doc, offer, owner));
+    if (!result) {
+      resolve('refused', `Couldn't reach ${offer.asset.roomName || 'the module'} to settle — try again in a moment.`);
+      return;
+    }
+    resolve(result.ok ? 'settled' : 'refused', result.ok ? undefined : result.error);
+    if (result.ok) {
+      logToPhoneSystem(`🤝 Handed ${offer.asset.roomName || 'the module'} to ${owner.name}.`);
+      removeDeed(moduleId); // I no longer own it — drop it from my REAL ESTATE list
+    }
+  } finally {
+    // Release the latch so a genuine RE-ASK (new pending request for this nonce)
+    // can be settled; an already-resolved request short-circuits on status.
+    copresentHandled.delete(nonce);
+  }
+}
+
+// Dev-only test handle for the co-present machinery (like __ssfDoc / __ssfIdentity —
+// dev-phase posture; stripped from production builds).
+if (import.meta.env.DEV) {
+  (window as unknown as { __ssfCopresentTest?: unknown }).__ssfCopresentTest = {
+    withBackgroundRoom, executeCopresentSettle,
+  };
+}
 
 function parseOfferRecipient(value: string): { toPub?: string; toVentureId?: string; toVentureName?: string } {
   if (value.startsWith('pub:')) return { toPub: value.slice(4) };
@@ -2108,6 +2296,39 @@ function renderVenturesApp(): void {
           logToPhoneSystem(offerRedeemNote);
         } else {
           offerRedeemNote = result.error;
+        }
+      } else if (action === 'offer-copresent') {
+        // 🤝 Receiver: ask the co-present maker to hand the deed over here. The
+        // request is SIGNED (proves I hold the key it will land on), so a third
+        // party writing the shared settleReq map can't dictate the new owner.
+        const offer = decodeOffer(offerRedeemRaw);
+        if (!offer || offer.asset.kind !== 'deed' || !yjsSync || !activeBootstrap?.roomId) return;
+        postSettleRequest(yjsSync.doc, offer.nonce,
+          buildSettleRequest(activeBootstrap.roomId, offer.nonce, offerRedeemRaw.trim(), getPlayerId(), getPlayerName()));
+        offerCopresentPending = offer.nonce;
+        // offerRedeemNote is esc()'d at render — keep it raw here.
+        offerRedeemNote = `Asked ${offer.makerName || 'the maker'} to hand it over — waiting for them to settle.`;
+      } else if (action === 'offer-copresent-cancel') {
+        // Receiver: withdraw a pending ask.
+        if (yjsSync && offerCopresentPending) clearSettleRequest(yjsSync.doc, offerCopresentPending);
+        offerCopresentPending = '';
+        offerRedeemNote = '';
+      } else if (action === 'offer-copresent-ack') {
+        // Receiver: acknowledge a settled/refused request (clears it from the doc).
+        if (yjsSync && el.dataset.nonce) clearSettleRequest(yjsSync.doc, el.dataset.nonce);
+        offerCopresentPending = '';
+        offerRedeemRaw = '';
+        offerRedeemNote = '';
+      } else if (action === 'copresent-settle') {
+        // 🤝 Maker: hand the deed over (reaches the module in the background).
+        const nonce = el.dataset.nonce;
+        if (nonce) void executeCopresentSettle(nonce);
+      } else if (action === 'copresent-dismiss') {
+        // Maker: decline a request (marks it refused for the receiver).
+        const nonce = el.dataset.nonce;
+        if (nonce && yjsSync) {
+          copresentHandled.add(nonce);
+          resolveSettleRequest(yjsSync.doc, nonce, 'refused', 'The maker declined for now.');
         }
       }
       renderVenturesApp();
@@ -2403,15 +2624,44 @@ function renderVenturesApp(): void {
            </select>
          </div>`
       : '';
+    // 🤝 CO-PRESENT: a deed offer to me that I can't settle here, but whose
+    // MAKER has been in THIS room — ask them to hand it over from where we
+    // both stand (they reach the module with their own pass). Live status of
+    // my pending ask rides the shared doc.
+    let makerHere = false;
+    if (pending.asset.kind === 'deed' && !settleHere && !dead && toMe) {
+      yjsSync?.doc.getMap('players').forEach((raw) => {
+        if ((raw as Partial<PlayerEntry>).keyB64 === pending.makerPub) makerHere = true;
+      });
+    }
+    const myReq = (offerCopresentPending === pending.nonce && yjsSync)
+      ? readSettleRequest(yjsSync.doc, pending.nonce) : null;
+    if (offerCopresentPending === pending.nonce && !myReq) offerCopresentPending = ''; // request gone (expired)
+    let copresentBlock = '';
+    if (myReq) {
+      copresentBlock = myReq.status === 'settled'
+        ? `<div style="margin-top:6px; font-size:9px; color:#69f0ae;">🖋 ${esc(pending.asset.kind === 'deed' ? (pending.asset.roomName || 'The module') : 'It')} is yours — the maker handed it over. Ask them for a pass if you'd like to visit.
+             <div style="margin-top:4px;"><button type="button" data-venture-action="offer-copresent-ack" data-nonce="${esc(pending.nonce)}" style="${pill}">OK</button></div></div>`
+        : myReq.status === 'refused'
+          ? `<div style="margin-top:6px; font-size:9px; color:#ff8a80;">${esc(myReq.error || 'The maker didn\'t settle it.')}
+             <div style="margin-top:4px;"><button type="button" data-venture-action="offer-copresent-ack" data-nonce="${esc(pending.nonce)}" style="${pill}">OK</button></div></div>`
+          : `<div style="margin-top:6px; font-size:9px; color:rgba(212,168,75,0.8);">⏳ Waiting for ${esc(pending.makerName || 'the maker')} to settle it here…
+             <div style="margin-top:4px;"><button type="button" data-venture-action="offer-copresent-cancel" style="${pill}">CANCEL</button></div></div>`;
+    }
+    const askButton = (makerHere && !myReq && pending.asset.kind === 'deed')
+      ? `<button type="button" data-venture-action="offer-copresent" style="${pill} background:rgba(0,230,118,0.08); border-color:rgba(0,230,118,0.3); color:#69f0ae;">🤝 ASK ${esc((pending.makerName || 'MAKER').toUpperCase())} TO HAND IT OVER</button>`
+      : '';
     redeemBody = `
       <div style="border:1px solid rgba(212,168,75,0.25); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
         <div>${what} — a <b>gift</b>${pending.price > 0 ? ' <span style="color:#ff8a80;">(asks a price — priced offers arrive with the Registry)</span>' : ''}</div>
         <div style="margin-top:3px;">from ${esc(pending.makerName || 'a clone')} <span style="color:rgba(212,168,75,0.6);">${esc(contactFingerprint(pending.makerPub))}</span> · ${toLine}</div>
-        <div style="margin-top:3px; color:rgba(212,168,75,0.8);">${offerExpiresIn(pending.expiresAt)} · ${whereLine}</div>
+        <div style="margin-top:3px; color:rgba(212,168,75,0.8);">${offerExpiresIn(pending.expiresAt)} · ${whereLine}${makerHere && !settleHere ? ' · 🤝 the maker is in this room' : ''}</div>
         ${dead ? `<div style="margin-top:3px; color:#ff8a80;">${dead}</div>` : ''}
         ${acceptAsBlock}
+        ${copresentBlock}
         <div style="display:flex; gap:4px; margin-top:6px;">
           ${settleHere && !dead && toMe ? `<button type="button" data-venture-action="offer-redeem" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 REDEEM</button>` : ''}
+          ${askButton}
           <button type="button" data-venture-action="offer-clear" style="${pill}">CLEAR</button>
         </div>
       </div>`;
@@ -2425,11 +2675,39 @@ function renderVenturesApp(): void {
     ${redeemBody}
     <div style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${esc(offerRedeemNote)}</div>`;
 
+  // 🤝 Maker's inbox: co-present hand-over requests for MY deed offers. A
+  // pending one shows HAND IT OVER (when I can reach the module — I'm in it or
+  // hold a pass) / DECLINE; settled/refused ones linger briefly as receipts.
+  const inboxReqs = yjsSync
+    ? listSettleRequests(yjsSync.doc)
+      .map(({ nonce, req }) => ({ nonce, req, offer: decodeOffer(req.offer) }))
+      .filter((x) => x.offer && x.offer.asset.kind === 'deed' && x.offer.makerPub === myPub)
+    : [];
+  const inboxBlock = inboxReqs.length
+    ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">HAND-OVER REQUESTS</div>
+       ${inboxReqs.map(({ nonce, req, offer }) => {
+      const mod = offer && offer.asset.kind === 'deed' ? (offer.asset.roomName || 'your module') : 'your module';
+      if (req.status === 'pending') {
+        const reachable = !!offer && offer.asset.kind === 'deed'
+          && (offer.asset.roomId === (activeBootstrap?.roomId ?? '') || !!passSeed(offer.asset.roomId));
+        return `<div style="border:1px solid rgba(212,168,75,0.2); border-radius:8px; padding:8px 10px; margin-top:6px; font-size:10px;">
+          <div>👤 <b>${esc(req.requesterName)}</b> wants 🏠 ${esc(mod)}</div>
+          ${reachable ? '' : '<div style="margin-top:3px; font-size:9px; color:#ff8a80;">Keep a pass to that module in your room list to settle it from here.</div>'}
+          <div style="display:flex; gap:4px; margin-top:6px;">
+            ${reachable ? `<button type="button" data-venture-action="copresent-settle" data-nonce="${esc(nonce)}" style="${pill} background:rgba(0,230,118,0.10); border-color:rgba(0,230,118,0.35); color:#69f0ae;">🖋 HAND IT OVER</button>` : ''}
+            <button type="button" data-venture-action="copresent-dismiss" data-nonce="${esc(nonce)}" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">DECLINE</button>
+          </div></div>`;
+      }
+      return `<div style="font-size:9px; color:rgba(212,168,75,0.7); margin-top:4px;">${req.status === 'settled' ? '🖋' : '✗'} ${esc(mod)} — ${req.status === 'settled' ? `handed to ${esc(req.requesterName)}` : 'declined'}</div>`;
+    }).join('')}`
+    : '';
+
   view.innerHTML = `
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95);">YOUR STAKES</div>
     ${rows.length ? rows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No stakes yet. Own a module? Sign a Charter below. Otherwise ask a founder to transfer you shares — any share makes you a full co-owner.</div>'}
     <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">REAL ESTATE</div>
     ${deedRows.length ? deedRows.join('') : '<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">No deeds yet — modules you personally own list here after you visit them.</div>'}
+    ${inboxBlock}
     ${redeemBlock}
     ${foundBlock}
     ${addBlock}
