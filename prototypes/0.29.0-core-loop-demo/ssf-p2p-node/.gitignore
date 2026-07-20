@@ -1,0 +1,4 @@
+# Node-local runtime state — never commit.
+rooms/
+iroh_node_id.key
+target/
