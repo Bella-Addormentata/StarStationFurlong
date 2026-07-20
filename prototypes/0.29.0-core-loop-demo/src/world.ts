@@ -9,7 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import { physicalDoorPose, setActiveDoorLayout } from "./doorLayout";
 import { Player } from "./player";
-import { PoolWaiter } from "./poolWaiter";
+import { PoolWaiter, POOL_PATROL, LOBBY_PATROL } from "./poolWaiter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { getDefaultRoomId } from "./identity";
@@ -27,6 +27,7 @@ import {
   POOL_WATER_Y,
   DIVE_TIME,
   DIVE_ARC_LIFT,
+  bridgeDeckY,
 } from "./furniture";
 import type { FurnitureItem } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -137,6 +138,8 @@ export class World {
   private northWall: THREE.Mesh | null = null;
   /** 🤖 Drink-service waiter bot — roams the LOBBY (not pool/casino rooms). */
   private poolWaiter: PoolWaiter | null = null;
+  /** Route the live waiter was built with — a change recreates the bot. */
+  private poolWaiterPatrol: Array<[number, number]> | null = null;
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -1309,21 +1312,25 @@ export class World {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
     this.isOutdoorRoom = outdoor;
-    // 🚪 Camera-near south/east edges stay clear in the LOBBY too (owner
-    // request): every interior room runs the paired north/west door layout;
-    // only the outdoor pool room keeps its legacy four-wall doors (its west
-    // door intentionally drops arrivals into the water).
-    setActiveDoorLayout(outdoor ? "legacy" : "casino-pairs");
+    // 🚪 Camera-near south/east edges stay clear EVERYWHERE: the lobby and
+    // the casino run "casino-pairs", the outdoor pool room "pool-pairs" —
+    // aliases of the same paired arrangement (SOUTH on the north wall, EAST
+    // on the west wall; the dive tower stands between the two north doors).
+    setActiveDoorLayout(outdoor ? "pool-pairs" : "casino-pairs");
 
-    // 🤖 The waiter bot roams the LOBBY aisles (owner request — same bot as
-    // the pool branch's poolside waiter, same serve interaction).
-    const lobby = !outdoor && !casino;
-    if (lobby && !this.poolWaiter) {
-      this.poolWaiter = new PoolWaiter(this.scene);
-    } else if (!lobby && this.poolWaiter) {
+    // 🤖 The drink-service waiter bot roams the LOBBY aisles and the POOL
+    // deck (not the casino) — same bot, per-room patrol route. Recreate on a
+    // route change so a lobby→pool transit swaps the floor plan.
+    const waiterPatrol = outdoor ? POOL_PATROL : !casino ? LOBBY_PATROL : null;
+    if (this.poolWaiter && this.poolWaiterPatrol !== waiterPatrol) {
       this.poolWaiter.dispose();
       this.poolWaiter = null;
     }
+    if (waiterPatrol && !this.poolWaiter) {
+      this.poolWaiter = new PoolWaiter(this.scene, waiterPatrol);
+    }
+    this.poolWaiterPatrol = waiterPatrol;
+
     const doorDeltas = readDoorDeltas();
     applyDoorSlideDeltas(doorDeltas);
     setDoorSlideDeltas(doorDeltas);
@@ -2691,9 +2698,12 @@ export class World {
       // settles back to the floor otherwise — same lerp cadence as x/z, so the
       // replica's climb roughly shadows the sender's sit-down slide.
       // 🏊 A free-swimming peer (bit4 WITHOUT bit1) floats at POOL_SWIM_Y.
+      // 🌉 A walking peer on the hot-tub footbridge arcs up the deck height,
+      // derived locally from its xz — the movement tick carries no y.
+      const groundY = bridgeDeckY(FURNITURE, pos.x, pos.z) ?? 0;
       pos.y = THREE.MathUtils.lerp(
         pos.y,
-        avatar.seated ? avatar.elevY : avatar.swimming ? POOL_SWIM_Y : 0,
+        avatar.seated ? avatar.elevY : avatar.swimming ? POOL_SWIM_Y : groundY,
         factor,
       );
 

@@ -62,17 +62,27 @@
  * ENGAGED (WASD requests a camera release; movement resumes right after).
  */
 
-import * as THREE from 'three';
-import { InputManager } from './input';
-import { updateDebugHUD, showHint } from './hud';
-import { VoxelCharacter } from './voxelCharacter';
-import { WaypointReticle } from './waypoint';
-import { findPath, worldToCol, worldToRow } from './pathfinding';
-import { OBSTACLES } from './obstacles';
-import { POOL_WATER_Y, POOL_SWIM_Y, DIVE_TIME, DIVE_ARC_LIFT, FURNITURE, getPoolBasin } from './furniture';
-import type { Seat } from './seats';
-import type { DoorId, DoorTarget, DoorSequenceHooks } from './doors';
-import type { DeviceTarget, DeviceFocusHooks } from './devices';
+import * as THREE from "three";
+import { InputManager } from "./input";
+import { updateDebugHUD, showHint } from "./hud";
+import { VoxelCharacter } from "./voxelCharacter";
+import { WaypointReticle } from "./waypoint";
+import { findPath, worldToCol, worldToRow } from "./pathfinding";
+import { OBSTACLES } from "./obstacles";
+import {
+  POOL_WATER_Y,
+  POOL_SWIM_Y,
+  HOT_TUB_WATER_Y,
+  DIVE_TIME,
+  DIVE_ARC_LIFT,
+  FURNITURE,
+  OUTDOOR_FURNITURE,
+  getPoolBasin,
+  getPoolIsland,
+} from "./furniture";
+import type { Seat } from "./seats";
+import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
+import type { DeviceTarget, DeviceFocusHooks } from "./devices";
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
 /** Collision radius — exported for the E3 move-furniture player-overlap check. */
@@ -85,34 +95,60 @@ function snapTo8Ways(angle: number): number {
 }
 
 function resolveObstacles(x: number, z: number): { x: number; z: number } {
-  let rx = x, rz = z;
+  let rx = x,
+    rz = z;
   for (const b of OBSTACLES) {
-    const ex0 = b.x0 - PLAYER_R, ex1 = b.x1 + PLAYER_R;
-    const ez0 = b.z0 - PLAYER_R, ez1 = b.z1 + PLAYER_R;
+    const ex0 = b.x0 - PLAYER_R,
+      ex1 = b.x1 + PLAYER_R;
+    const ez0 = b.z0 - PLAYER_R,
+      ez1 = b.z1 + PLAYER_R;
     if (rx > ex0 && rx < ex1 && rz > ez0 && rz < ez1) {
-      const dL = rx - ex0, dR = ex1 - rx, dT = rz - ez0, dB = ez1 - rz;
+      const dL = rx - ex0,
+        dR = ex1 - rx,
+        dT = rz - ez0,
+        dB = ez1 - rz;
       const m = Math.min(dL, dR, dT, dB);
-      if      (m === dL) rx = ex0;
+      if (m === dL) rx = ex0;
       else if (m === dR) rx = ex1;
       else if (m === dT) rz = ez0;
-      else               rz = ez1;
+      else rz = ez1;
     }
   }
   return { x: rx, z: rz };
 }
 
 // ── Navigation mode ───────────────────────────────────────────────────────────
-type NavigationMode = 'MANUAL' | 'WAYPOINT';
+type NavigationMode = "MANUAL" | "WAYPOINT";
 /** Sitting sequence phases (NONE = regular navigation). */
-type SitPhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'SIT_DOWN' | 'SEATED' | 'STAND_UP' | 'DIVE' | 'CLIMB_OUT';
+type SitPhase =
+  | "NONE"
+  | "APPROACH"
+  | "FINE"
+  | "TURN"
+  | "SIT_DOWN"
+  | "SEATED"
+  | "STAND_UP"
+  | "DIVE"
+  | "CLIMB_OUT"
+  | "BRIDGE_IN"
+  | "BRIDGE_OUT";
 /** Door walk-through phases (NONE = regular navigation). ADAPTER_OUT /
  *  ADAPTER_HOLD are the departure half of an adapter transit; ARRIVE_OPEN /
  *  ARRIVE are the arrival half in the destination room (T1 of issue #30). */
 type DoorPhase =
-  | 'NONE' | 'APPROACH' | 'FINE' | 'WAIT_OPEN' | 'THROUGH' | 'PEEK' | 'RETURN'
-  | 'ADAPTER_OUT' | 'ADAPTER_HOLD' | 'ARRIVE_OPEN' | 'ARRIVE';
+  | "NONE"
+  | "APPROACH"
+  | "FINE"
+  | "WAIT_OPEN"
+  | "THROUGH"
+  | "PEEK"
+  | "RETURN"
+  | "ADAPTER_OUT"
+  | "ADAPTER_HOLD"
+  | "ARRIVE_OPEN"
+  | "ARRIVE";
 /** Device-focus phases (NONE = regular navigation). Mirrors DoorPhase. */
-type DevicePhase = 'NONE' | 'APPROACH' | 'FINE' | 'TURN' | 'ENGAGED';
+type DevicePhase = "NONE" | "APPROACH" | "FINE" | "TURN" | "ENGAGED";
 export class Player {
   /** Root group — consumed by World to toggle visibility and read position. */
   public mesh: THREE.Group;
@@ -124,7 +160,7 @@ export class Player {
   private readonly BOUND = 5.2;
 
   // ── Navigation state ───────────────────────────────────────────────────────
-  private navMode: NavigationMode = 'MANUAL';
+  private navMode: NavigationMode = "MANUAL";
   /** Ordered list of world-space waypoints remaining in the current path. */
   private waypointPath: Array<{ x: number; z: number }> = [];
   /** Arrival threshold (metres) — close enough to snap to the next node. */
@@ -133,7 +169,7 @@ export class Player {
   /** Active reticle shown at the final destination, or null when idle. */
   private reticle: WaypointReticle | null = null;
   // ── Sitting state ──────────────────────────────────────────────────────────────────────
-  private sitPhase: SitPhase = 'NONE';
+  private sitPhase: SitPhase = "NONE";
   /** Seat being approached or occupied. */
   private sitTarget: Seat | null = null;
   /** 0→1 progress through SIT_DOWN / STAND_UP slides. */
@@ -141,6 +177,16 @@ export class Player {
   /** 🛏️ Mesh y at STAND_UP start — an interrupted bunk climb descends from
    *  wherever it actually got to, not from the full berth height. */
   private standStartY = 0;
+  // ── 🌉 Scripted bridge walk (hot-tub seats with a `path`) ──────────────────
+  /** Index into sitTarget.path during BRIDGE_IN / BRIDGE_OUT; -1 on the
+   *  BRIDGE_OUT tail leg back to seat.front. */
+  private sitPathIndex = 0;
+  /** SIT_DOWN slide origin / STAND_UP return target when the seat was reached
+   *  over a scripted path (the bridge crest); null ⇒ seat.front at floor y. */
+  private sitSlideFrom: { x: number; y: number; z: number } | null = null;
+  /** Hop apex above the straight crest→tub chord — clears the drum rim
+   *  (cap ring torus top ≈ 0.72). */
+  private readonly TUB_HOP_LIFT = 0.35;
   private turnTimer = 0;
   private readonly SIT_ANIM_TIME = 0.35;
   private readonly STAND_ANIM_TIME = 0.28;
@@ -151,7 +197,9 @@ export class Player {
   /** 0→1 progress through the dive arc. */
   private diveAnim = 0;
   /** 🏊 Wired by World: splash burst at water entry (big = dive, small = slide-in). */
-  public onWaterEntry: ((x: number, y: number, z: number, big: boolean) => void) | null = null;
+  public onWaterEntry:
+    | ((x: number, y: number, z: number, big: boolean) => void)
+    | null = null;
   // ── 🏊 Free-swim mode ─────────────────────────────────────────────────────
   /** True while freely swimming inside the pool basin (not seat-bound). */
   private swimMode = false;
@@ -167,11 +215,15 @@ export class Player {
    */
   private pendingDest: { x: number; z: number } | null = null;
   private pendingSeat: Seat | null = null;
-  private pendingDoor: { door: DoorTarget; hooks: DoorSequenceHooks } | null = null;
-  private pendingDevice: { device: DeviceTarget; hooks: DeviceFocusHooks } | null = null;
+  private pendingDoor: { door: DoorTarget; hooks: DoorSequenceHooks } | null =
+    null;
+  private pendingDevice: {
+    device: DeviceTarget;
+    hooks: DeviceFocusHooks;
+  } | null = null;
 
   // ── Door walk-through state ────────────────────────────────────────────────
-  private doorPhase: DoorPhase = 'NONE';
+  private doorPhase: DoorPhase = "NONE";
   /** Door being approached / walked through. */
   private doorTarget: DoorTarget | null = null;
   /** Hooks wired by World — open/close the physical door, fire hints. */
@@ -203,7 +255,7 @@ export class Player {
   private readonly ADAPTER_HOLD_TIMEOUT = 8.0;
 
   // ── Device-focus state (#33 D0) ─────────────────────────────────────────────
-  private devicePhase: DevicePhase = 'NONE';
+  private devicePhase: DevicePhase = "NONE";
   /** Device being approached / engaged. */
   private deviceTarget: DeviceTarget | null = null;
   /** Hooks wired by the DeviceFocusController — arrival + release requests. */
@@ -213,7 +265,7 @@ export class Player {
 
   // ── 🧬 Clone-vat spawn state (owner request — diegetic spawn point) ────────
   /** HOLD = frozen inside the tube; WALK_OUT = scripted straight exit walk. */
-  private vatPhase: 'NONE' | 'HOLD' | 'WALK_OUT' = 'NONE';
+  private vatPhase: "NONE" | "HOLD" | "WALK_OUT" = "NONE";
   private vatExit: { x: number; z: number } | null = null;
   private vatFacing = 0;
   private vatDone: (() => void) | null = null;
@@ -235,9 +287,9 @@ export class Player {
   private readonly FINE_STUCK_EPS = 0.005;
 
   constructor(scene: THREE.Scene) {
-    this.scene     = scene;
+    this.scene = scene;
     this.character = new VoxelCharacter(scene);
-    this.mesh      = this.character.masterGroup;
+    this.mesh = this.character.masterGroup;
     this.mesh.position.set(0, 0, 1.5);
   }
 
@@ -252,11 +304,12 @@ export class Player {
   navigateTo(targetX: number, targetZ: number): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
-    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
-    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
+    // 🏊‍♂️ Mid dive arc / climb-out / 🌉 bridge walk (short scripted pool
+    // moves) — swallow, same rule.
+    if (this._inScriptedPoolMove()) return;
     // Engaged on a device: ask the focus controller to let go; the deferred
     // destination resumes when the release ease completes (releaseDevice).
-    if (this.devicePhase === 'ENGAGED') {
+    if (this.devicePhase === "ENGAGED") {
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
       this.pendingDoor = null;
@@ -265,19 +318,29 @@ export class Player {
       return;
     }
     // Mid door walk-through: defer until the scripted RETURN leg finishes.
-    if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
+    if (
+      this.doorPhase === "THROUGH" ||
+      this.doorPhase === "PEEK" ||
+      this.doorPhase === "RETURN"
+    ) {
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
       this.pendingDoor = null;
       this.pendingDevice = null;
-      if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
+      if (this.doorPhase !== "RETURN") this._beginDoorReturn();
       return;
     }
     // 🏊 Free swim: in-basin targets are a straight swim; out-of-basin targets
     // climb out at the nearest edge first, then resume the walk.
     if (this.swimMode) {
       const basin = getPoolBasin(FURNITURE);
-      if (basin && targetX >= basin.x0 && targetX <= basin.x1 && targetZ >= basin.z0 && targetZ <= basin.z1) {
+      if (
+        basin &&
+        targetX >= basin.x0 &&
+        targetX <= basin.x1 &&
+        targetZ >= basin.z0 &&
+        targetZ <= basin.z1
+      ) {
         this.swimTo(targetX, targetZ);
       } else {
         this.pendingDest = { x: targetX, z: targetZ };
@@ -292,7 +355,7 @@ export class Player {
     this._abortDoorApproach();
     this._cancelDeviceApproach();
 
-    if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
+    if (this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN") {
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
       this.pendingDoor = null;
@@ -300,7 +363,7 @@ export class Player {
       this._beginStandUp();
       return;
     }
-    if (this.sitPhase === 'STAND_UP') {
+    if (this.sitPhase === "STAND_UP") {
       // Re-target while standing: just swap the deferred destination.
       this.pendingDest = { x: targetX, z: targetZ };
       this.pendingSeat = null;
@@ -312,8 +375,10 @@ export class Player {
 
     const pos = this.mesh.position;
     const path = findPath(
-      worldToRow(pos.z), worldToCol(pos.x),
-      worldToRow(targetZ), worldToCol(targetX),
+      worldToRow(pos.z),
+      worldToCol(pos.x),
+      worldToRow(targetZ),
+      worldToCol(targetX),
     );
     if (path.length === 0) {
       // Unreachable — but any door/sit approach cancelled above left its
@@ -324,7 +389,7 @@ export class Player {
     }
 
     this.waypointPath = path;
-    this.navMode      = 'WAYPOINT';
+    this.navMode = "WAYPOINT";
 
     // Replace reticle at the final destination
     if (this.reticle) {
@@ -343,10 +408,11 @@ export class Player {
   navigateToSeat(seat: Seat): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
-    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
-    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
+    // 🏊‍♂️ Mid dive arc / climb-out / 🌉 bridge walk (short scripted pool
+    // moves) — swallow, same rule.
+    if (this._inScriptedPoolMove()) return;
     // Engaged on a device: release the focus first, then walk over and sit.
-    if (this.devicePhase === 'ENGAGED') {
+    if (this.devicePhase === "ENGAGED") {
       this.pendingSeat = seat;
       this.pendingDest = null;
       this.pendingDoor = null;
@@ -355,12 +421,16 @@ export class Player {
       return;
     }
     // Mid door walk-through: defer until the scripted RETURN leg finishes.
-    if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
+    if (
+      this.doorPhase === "THROUGH" ||
+      this.doorPhase === "PEEK" ||
+      this.doorPhase === "RETURN"
+    ) {
       this.pendingSeat = seat;
       this.pendingDest = null;
       this.pendingDoor = null;
       this.pendingDevice = null;
-      if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
+      if (this.doorPhase !== "RETURN") this._beginDoorReturn();
       return;
     }
     // Door/device approaches not yet committed: abandon them and re-route.
@@ -370,7 +440,10 @@ export class Player {
     // 🏊 Free swim: another water seat is just a spot to swim to; any other
     // seat means climbing out at the nearest edge first.
     if (this.swimMode) {
-      if (seat.swim) { this.swimTo(seat.sit.x, seat.sit.z); return; }
+      if (seat.swim) {
+        this.swimTo(seat.sit.x, seat.sit.z);
+        return;
+      }
       this.pendingSeat = seat;
       this.pendingDest = null;
       this.pendingDoor = null;
@@ -382,14 +455,18 @@ export class Player {
     // 🏊‍♂️ High dive: seated on the board and clicking a swim seat of the SAME
     // pool item → launch off the tip in a parabolic arc instead of climbing
     // down and wading in. (Seat ids are `${itemId}:${n}` — compare the prefix.)
-    const itemOf = (id: string) => id.slice(0, id.lastIndexOf(':'));
-    if (this.sitPhase === 'SEATED' && this.sitTarget?.dive && seat.swim
-        && itemOf(this.sitTarget.id) === itemOf(seat.id)) {
+    const itemOf = (id: string) => id.slice(0, id.lastIndexOf(":"));
+    if (
+      this.sitPhase === "SEATED" &&
+      this.sitTarget?.dive &&
+      seat.swim &&
+      itemOf(this.sitTarget.id) === itemOf(seat.id)
+    ) {
       this._beginDive(seat);
       return;
     }
 
-    if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
+    if (this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN") {
       if (this.sitTarget && this.sitTarget.id === seat.id) return; // already here
       this.pendingSeat = seat;
       this.pendingDest = null;
@@ -398,7 +475,7 @@ export class Player {
       this._beginStandUp();
       return;
     }
-    if (this.sitPhase === 'STAND_UP') {
+    if (this.sitPhase === "STAND_UP") {
       this.pendingSeat = seat;
       this.pendingDest = null;
       this.pendingDoor = null;
@@ -408,15 +485,17 @@ export class Player {
 
     this._clearPath();
     this.sitTarget = seat;
-    this.sitPhase  = 'APPROACH';
-    this.navMode   = 'WAYPOINT';
+    this.sitPhase = "APPROACH";
+    this.navMode = "WAYPOINT";
 
     const pos = this.mesh.position;
     // May legitimately return an empty path when we're already standing on
     // the front cell — the APPROACH handler falls straight through to FINE.
     this.waypointPath = findPath(
-      worldToRow(pos.z), worldToCol(pos.x),
-      worldToRow(seat.front.z), worldToCol(seat.front.x),
+      worldToRow(pos.z),
+      worldToCol(pos.x),
+      worldToRow(seat.front.z),
+      worldToCol(seat.front.x),
     );
 
     this.reticle = new WaypointReticle(this.scene, seat.front.x, seat.front.z);
@@ -431,8 +510,9 @@ export class Player {
   navigateToDoor(door: DoorTarget, hooks: DoorSequenceHooks): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
-    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
-    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
+    // 🏊‍♂️ Mid dive arc / climb-out / 🌉 bridge walk (short scripted pool
+    // moves) — swallow, same rule.
+    if (this._inScriptedPoolMove()) return;
     // 🏊 Free swim: climb out at the edge nearest the door, then head over.
     if (this.swimMode) {
       this.pendingDoor = { door, hooks };
@@ -443,7 +523,7 @@ export class Player {
       return;
     }
     // Engaged on a device: release the focus first, then walk to the door.
-    if (this.devicePhase === 'ENGAGED') {
+    if (this.devicePhase === "ENGAGED") {
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
@@ -451,7 +531,7 @@ export class Player {
       this.deviceHooks?.requestRelease();
       return;
     }
-    if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
+    if (this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN") {
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
@@ -459,7 +539,7 @@ export class Player {
       this._beginStandUp();
       return;
     }
-    if (this.sitPhase === 'STAND_UP') {
+    if (this.sitPhase === "STAND_UP") {
       // Re-target while standing: just swap the deferred action.
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
@@ -471,18 +551,23 @@ export class Player {
     // re-click on the same door defers below and queues a fresh walk-through
     // that the RETURN-completion resume path picks up.)
     if (
-      this.doorPhase !== 'NONE' &&
-      this.doorPhase !== 'RETURN' &&
+      this.doorPhase !== "NONE" &&
+      this.doorPhase !== "RETURN" &&
       this.doorTarget &&
       this.doorTarget.id === door.id
-    ) return;
+    )
+      return;
     // Mid walk-through of a different door: return inside first, then go.
-    if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
+    if (
+      this.doorPhase === "THROUGH" ||
+      this.doorPhase === "PEEK" ||
+      this.doorPhase === "RETURN"
+    ) {
       this.pendingDoor = { door, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
       this.pendingDevice = null;
-      if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
+      if (this.doorPhase !== "RETURN") this._beginDoorReturn();
       return;
     }
 
@@ -494,15 +579,17 @@ export class Player {
     this.doorSeq++;
     this.doorTarget = door;
     this.doorHooks = hooks;
-    this.doorPhase = 'APPROACH';
-    this.navMode = 'WAYPOINT';
+    this.doorPhase = "APPROACH";
+    this.navMode = "WAYPOINT";
 
     const pos = this.mesh.position;
     // May legitimately return an empty path when we're already standing on
     // the front cell — the APPROACH handler falls straight through to FINE.
     this.waypointPath = findPath(
-      worldToRow(pos.z), worldToCol(pos.x),
-      worldToRow(door.front.z), worldToCol(door.front.x),
+      worldToRow(pos.z),
+      worldToCol(pos.x),
+      worldToRow(door.front.z),
+      worldToCol(door.front.x),
     );
 
     this.reticle = new WaypointReticle(this.scene, door.front.x, door.front.z);
@@ -519,10 +606,16 @@ export class Player {
   navigateToDevice(device: DeviceTarget, hooks: DeviceFocusHooks): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
     if (this._inAdapterTransit()) return;
-    // 🏊‍♂️ Mid dive arc / climb-out (<1 s scripted) — swallow, same rule.
-    if (this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') return;
+    // 🏊‍♂️ Mid dive arc / climb-out / 🌉 bridge walk (short scripted pool
+    // moves) — swallow, same rule.
+    if (this._inScriptedPoolMove()) return;
     // Already engaged on this exact device → nothing to do.
-    if (this.devicePhase === 'ENGAGED' && this.deviceTarget && this.deviceTarget.id === device.id) return;
+    if (
+      this.devicePhase === "ENGAGED" &&
+      this.deviceTarget &&
+      this.deviceTarget.id === device.id
+    )
+      return;
     // 🏊 Free swim: climb out at the edge nearest the device, then walk over.
     if (this.swimMode) {
       this.pendingDevice = { device, hooks };
@@ -533,7 +626,7 @@ export class Player {
       return;
     }
     // Engaged on a different device: release the focus first, then walk over.
-    if (this.devicePhase === 'ENGAGED') {
+    if (this.devicePhase === "ENGAGED") {
       this.pendingDevice = { device, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
@@ -542,15 +635,19 @@ export class Player {
       return;
     }
     // Mid door walk-through: defer until the scripted RETURN leg finishes.
-    if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK' || this.doorPhase === 'RETURN') {
+    if (
+      this.doorPhase === "THROUGH" ||
+      this.doorPhase === "PEEK" ||
+      this.doorPhase === "RETURN"
+    ) {
       this.pendingDevice = { device, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
       this.pendingDoor = null;
-      if (this.doorPhase !== 'RETURN') this._beginDoorReturn();
+      if (this.doorPhase !== "RETURN") this._beginDoorReturn();
       return;
     }
-    if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
+    if (this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN") {
       this.pendingDevice = { device, hooks };
       this.pendingSeat = null;
       this.pendingDest = null;
@@ -558,7 +655,7 @@ export class Player {
       this._beginStandUp();
       return;
     }
-    if (this.sitPhase === 'STAND_UP') {
+    if (this.sitPhase === "STAND_UP") {
       // Re-target while standing: just swap the deferred action.
       this.pendingDevice = { device, hooks };
       this.pendingSeat = null;
@@ -570,7 +667,11 @@ export class Player {
     // (a re-click bumps the controller's deviceSeq — keeping the old closure
     // would make onArrived fire with a stale token and strand the avatar
     // ENGAGED with no camera) and keep walking.
-    if (this.devicePhase !== 'NONE' && this.deviceTarget && this.deviceTarget.id === device.id) {
+    if (
+      this.devicePhase !== "NONE" &&
+      this.deviceTarget &&
+      this.deviceTarget.id === device.id
+    ) {
       this.deviceHooks = hooks;
       return;
     }
@@ -582,18 +683,24 @@ export class Player {
 
     this.deviceTarget = device;
     this.deviceHooks = hooks;
-    this.devicePhase = 'APPROACH';
-    this.navMode = 'WAYPOINT';
+    this.devicePhase = "APPROACH";
+    this.navMode = "WAYPOINT";
 
     const pos = this.mesh.position;
     // May legitimately return an empty path when we're already standing on
     // the front cell — the APPROACH handler falls straight through to FINE.
     this.waypointPath = findPath(
-      worldToRow(pos.z), worldToCol(pos.x),
-      worldToRow(device.front.z), worldToCol(device.front.x),
+      worldToRow(pos.z),
+      worldToCol(pos.x),
+      worldToRow(device.front.z),
+      worldToCol(device.front.x),
     );
 
-    this.reticle = new WaypointReticle(this.scene, device.front.x, device.front.z);
+    this.reticle = new WaypointReticle(
+      this.scene,
+      device.front.x,
+      device.front.z,
+    );
   }
 
   /**
@@ -602,17 +709,17 @@ export class Player {
    * device engagement/approach and resumes whatever interrupted it.
    */
   releaseDevice(): void {
-    if (this.devicePhase === 'NONE') return;
-    if (this.devicePhase !== 'ENGAGED') {
+    if (this.devicePhase === "NONE") return;
+    if (this.devicePhase !== "ENGAGED") {
       // Approach never engaged — just abandon it (no pendings to resume:
       // anything that queued a pending also left APPROACH/FINE/TURN).
       this._cancelDeviceApproach();
       return;
     }
-    this.devicePhase = 'NONE';
+    this.devicePhase = "NONE";
     this.deviceTarget = null;
     this.deviceHooks = null;
-    this.navMode = 'MANUAL';
+    this.navMode = "MANUAL";
 
     // Resume whatever interrupted the engagement.
     if (this.pendingDevice) {
@@ -650,12 +757,12 @@ export class Player {
     //    tube while it drains/opens, then the straight walk-out). Input is
     //    swallowed like the adapter transit; control returns to MANUAL when
     //    the walk-out completes (or the HOLD watchdog releases it).
-    if (this.vatPhase !== 'NONE') {
+    if (this.vatPhase !== "NONE") {
       this._updateVatPhase(deltaTime);
       this.character.update();
       const vpos = this.mesh.position;
-      updateDebugHUD('position', `${vpos.x.toFixed(1)}, ${vpos.z.toFixed(1)}`);
-      updateDebugHUD('navmode', `VAT:${this.vatPhase}`);
+      updateDebugHUD("position", `${vpos.x.toFixed(1)}, ${vpos.z.toFixed(1)}`);
+      updateDebugHUD("navmode", `VAT:${this.vatPhase}`);
       return;
     }
 
@@ -663,7 +770,7 @@ export class Player {
     // (Outside the room — THROUGH/PEEK/RETURN — it triggers/awaits the
     //  scripted RETURN leg instead, so MANUAL never runs out there.)
     if (manualInput) {
-      if (this.devicePhase === 'ENGAGED') {
+      if (this.devicePhase === "ENGAGED") {
         // Swallow movement; ask the focus controller to let go (repeat calls
         // while the release ease runs are no-ops). Movement resumes as soon
         // as the controller calls releaseDevice(). Deferred actions drop —
@@ -673,14 +780,18 @@ export class Player {
         this.pendingSeat = null;
         this.pendingDevice = null;
         this.deviceHooks?.requestRelease();
-      } else if (this.doorPhase === 'THROUGH' || this.doorPhase === 'PEEK') {
+      } else if (this.doorPhase === "THROUGH" || this.doorPhase === "PEEK") {
         // Head back inside; input resumes once RETURN completes.
         this.pendingDoor = null;
         this.pendingDest = null;
         this.pendingSeat = null;
         this.pendingDevice = null;
         this._beginDoorReturn();
-      } else if (this.doorPhase === 'RETURN' || this._inAdapterTransit() || this.sitPhase === 'DIVE' || this.sitPhase === 'CLIMB_OUT') {
+      } else if (
+        this.doorPhase === "RETURN" ||
+        this._inAdapterTransit() ||
+        this._inScriptedPoolMove()
+      ) {
         // Scripted return / adapter transit / 🏊‍♂️ dive arc in progress —
         // swallow input, drop deferred actions. (During ADAPTER_*/ARRIVE_* the
         // room under the avatar may be mid-swap; MANUAL must never run out
@@ -692,42 +803,60 @@ export class Player {
       } else {
         // Door APPROACH / FINE / WAIT_OPEN and device APPROACH / FINE / TURN
         // (all safely inside the room, nothing engaged yet) — abort.
-        if (this.doorPhase !== 'NONE') this._abortDoorApproach();
-        if (this.devicePhase !== 'NONE') this._cancelDeviceApproach();
-        if (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') {
+        if (this.doorPhase !== "NONE") this._abortDoorApproach();
+        if (this.devicePhase !== "NONE") this._cancelDeviceApproach();
+        if (this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN") {
           // Stand up at the chair front first; movement resumes right after.
           this.pendingDest = null;
           this.pendingSeat = null;
           this.pendingDoor = null;
           this.pendingDevice = null;
           this._beginStandUp();
-        } else if (this.sitPhase !== 'STAND_UP') {
-          this.navMode = 'MANUAL';
+        } else if (this.sitPhase !== "STAND_UP") {
+          this.navMode = "MANUAL";
           this._clearPath();
           this._cancelSit();
         }
       }
     }
 
-    if (this.doorPhase !== 'NONE' && this.doorPhase !== 'APPROACH') {
+    if (this.doorPhase !== "NONE" && this.doorPhase !== "APPROACH") {
       // FINE / WAIT_OPEN / THROUGH / PEEK / RETURN are door-driven.
       // (Door APPROACH reuses the regular waypoint follower below.)
       this._updateDoorPhase(deltaTime);
-    } else if (this.devicePhase !== 'NONE' && this.devicePhase !== 'APPROACH') {
+    } else if (this.devicePhase !== "NONE" && this.devicePhase !== "APPROACH") {
       // FINE / TURN / ENGAGED are device-driven.
       // (Device APPROACH reuses the regular waypoint follower below.)
       this._updateDevicePhase(deltaTime);
     } else {
       switch (this.sitPhase) {
-        case 'FINE':      this._updateFineApproach(deltaTime); break;
-        case 'TURN':      this._updateTurn(deltaTime);         break;
-        case 'SIT_DOWN':  this._updateSitDown(deltaTime);      break;
-        case 'SEATED':    this._updateSeated();                break;
-        case 'STAND_UP':  this._updateStandUp(deltaTime);      break;
-        case 'DIVE':      this._updateDive(deltaTime);         break;
-        case 'CLIMB_OUT': this._updateClimbOut(deltaTime);     break;
+        case "FINE":
+          this._updateFineApproach(deltaTime);
+          break;
+        case "TURN":
+          this._updateTurn(deltaTime);
+          break;
+        case "SIT_DOWN":
+          this._updateSitDown(deltaTime);
+          break;
+        case "SEATED":
+          this._updateSeated();
+          break;
+        case "STAND_UP":
+          this._updateStandUp(deltaTime);
+          break;
+        case "DIVE":
+          this._updateDive(deltaTime);
+          break;
+        case "CLIMB_OUT":
+          this._updateClimbOut(deltaTime);
+          break;
+        case "BRIDGE_IN":
+        case "BRIDGE_OUT":
+          this._updateBridgeWalk(deltaTime);
+          break;
         default:
-          if (this.navMode === 'MANUAL') {
+          if (this.navMode === "MANUAL") {
             this._updateManual(deltaTime, dir);
           } else {
             this._updateWaypoint(deltaTime);
@@ -749,14 +878,16 @@ export class Player {
 
     // Push the HUD
     const pos = this.mesh.position;
-    updateDebugHUD('position', `${pos.x.toFixed(1)}, ${pos.z.toFixed(1)}`);
+    updateDebugHUD("position", `${pos.x.toFixed(1)}, ${pos.z.toFixed(1)}`);
     updateDebugHUD(
-      'navmode',
-      this.doorPhase !== 'NONE'
+      "navmode",
+      this.doorPhase !== "NONE"
         ? `DOOR:${this.doorPhase}`
-        : this.devicePhase !== 'NONE'
+        : this.devicePhase !== "NONE"
           ? `DEVICE:${this.devicePhase}`
-          : (this.sitPhase !== 'NONE' ? this.sitPhase : this.navMode),
+          : this.sitPhase !== "NONE"
+            ? this.sitPhase
+            : this.navMode,
     );
   }
 
@@ -771,7 +902,8 @@ export class Player {
    * sitting on" (seat ids are `${itemId}:${templateIndex}`).
    */
   public getSeatedSeatId(): string | null {
-    return (this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN') && this.sitTarget
+    return (this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN") &&
+      this.sitTarget
       ? this.sitTarget.id
       : null;
   }
@@ -782,7 +914,7 @@ export class Player {
    * an idle stand at the chair.
    */
   public isSeated(): boolean {
-    return this.sitPhase === 'SEATED' || this.sitPhase === 'SIT_DOWN';
+    return this.sitPhase === "SEATED" || this.sitPhase === "SIT_DOWN";
   }
 
   /**
@@ -807,7 +939,10 @@ export class Player {
    * broadcasts it (flags bit4) so peers render the 'swim' pose at POOL_SWIM_Y.
    */
   public isSwimming(): boolean {
-    return this.swimMode || (this.isSeated() && this.sitTarget !== null && this.sitTarget.swim);
+    return (
+      this.swimMode ||
+      (this.isSeated() && this.sitTarget !== null && this.sitTarget.swim)
+    );
   }
 
   /** 🏊 true while in FREE-SWIM mode (open movement inside the pool basin). */
@@ -822,7 +957,7 @@ export class Player {
    * getSeatedSeatId() returns null (the editor's evict gate never fires).
    */
   public isDiving(): boolean {
-    return this.sitPhase === 'DIVE';
+    return this.sitPhase === "DIVE";
   }
 
   /** 🏊‍♂️ Arc heading while diving (packed into the tick yaw field). */
@@ -863,7 +998,7 @@ export class Player {
    * and control returns to MANUAL once the stand-up slide completes.
    */
   public evictFromSeat(): void {
-    if (this.sitPhase !== 'SEATED' && this.sitPhase !== 'SIT_DOWN') return;
+    if (this.sitPhase !== "SEATED" && this.sitPhase !== "SIT_DOWN") return;
     this.pendingDest = null;
     this.pendingSeat = null;
     this.pendingDoor = null;
@@ -884,7 +1019,9 @@ export class Player {
    */
   private _updateFineWatchdog(deltaTime: number): void {
     const inFine =
-      this.sitPhase === 'FINE' || this.doorPhase === 'FINE' || this.devicePhase === 'FINE';
+      this.sitPhase === "FINE" ||
+      this.doorPhase === "FINE" ||
+      this.devicePhase === "FINE";
     const pos = this.mesh.position;
     if (!inFine) {
       this.fineStuckTimer = 0;
@@ -892,7 +1029,10 @@ export class Player {
       this.fineLastPos.z = pos.z;
       return;
     }
-    const moved = Math.hypot(pos.x - this.fineLastPos.x, pos.z - this.fineLastPos.z);
+    const moved = Math.hypot(
+      pos.x - this.fineLastPos.x,
+      pos.z - this.fineLastPos.z,
+    );
     this.fineLastPos.x = pos.x;
     this.fineLastPos.z = pos.z;
     if (moved > this.FINE_STUCK_EPS) {
@@ -908,7 +1048,7 @@ export class Player {
     this._cancelDeviceApproach();
     this._cancelSit();
     this._clearPath();
-    this.navMode = 'MANUAL';
+    this.navMode = "MANUAL";
     showHint("Can't reach that spot.");
   }
 
@@ -965,37 +1105,48 @@ export class Player {
     // 1. Cancel in-flight approaches whose target item moved.
     if (
       movedItemId !== undefined &&
-      (this.devicePhase === 'APPROACH' || this.devicePhase === 'FINE' || this.devicePhase === 'TURN') &&
-      this.deviceTarget && this.deviceTarget.id === movedItemId
+      (this.devicePhase === "APPROACH" ||
+        this.devicePhase === "FINE" ||
+        this.devicePhase === "TURN") &&
+      this.deviceTarget &&
+      this.deviceTarget.id === movedItemId
     ) {
       this._cancelDeviceApproach();
-      this.navMode = 'MANUAL';
+      this.navMode = "MANUAL";
     }
     if (
       movedItemId !== undefined &&
-      (this.sitPhase === 'APPROACH' || this.sitPhase === 'FINE' || this.sitPhase === 'TURN') &&
-      this.sitTarget && this.sitTarget.id.startsWith(`${movedItemId}:`)
+      (this.sitPhase === "APPROACH" ||
+        this.sitPhase === "FINE" ||
+        this.sitPhase === "TURN") &&
+      this.sitTarget &&
+      this.sitTarget.id.startsWith(`${movedItemId}:`)
     ) {
       this._cancelSit();
       this._clearPath();
-      this.navMode = 'MANUAL';
+      this.navMode = "MANUAL";
     }
     // (Door approaches: nothing to cancel — see doc comment — fall through
     //  to the replan below.)
 
     // 2. Replan a surviving WAYPOINT leg across the new grid.
-    if (this.navMode !== 'WAYPOINT' || this.waypointPath.length === 0) return;
+    if (this.navMode !== "WAYPOINT" || this.waypointPath.length === 0) return;
 
     const goal =
-      this.sitPhase === 'APPROACH' && this.sitTarget ? this.sitTarget.front
-      : this.doorPhase === 'APPROACH' && this.doorTarget ? this.doorTarget.front
-      : this.devicePhase === 'APPROACH' && this.deviceTarget ? this.deviceTarget.front
-      : this.waypointPath[this.waypointPath.length - 1];
+      this.sitPhase === "APPROACH" && this.sitTarget
+        ? this.sitTarget.front
+        : this.doorPhase === "APPROACH" && this.doorTarget
+          ? this.doorTarget.front
+          : this.devicePhase === "APPROACH" && this.deviceTarget
+            ? this.deviceTarget.front
+            : this.waypointPath[this.waypointPath.length - 1];
 
     const pos = this.mesh.position;
     const path = findPath(
-      worldToRow(pos.z), worldToCol(pos.x),
-      worldToRow(goal.z), worldToCol(goal.x),
+      worldToRow(pos.z),
+      worldToCol(pos.x),
+      worldToRow(goal.z),
+      worldToCol(goal.x),
     );
     if (path.length === 0) {
       // Destination unreachable in the new layout (or we already stand on
@@ -1005,7 +1156,7 @@ export class Player {
       this._cancelDeviceApproach();
       this._cancelSit();
       this._clearPath();
-      this.navMode = 'MANUAL';
+      this.navMode = "MANUAL";
       return;
     }
     this.waypointPath = path;
@@ -1014,7 +1165,7 @@ export class Player {
   // ── Private helpers ────────────────────────────────────────────────────────
 
   private _updateManual(deltaTime: number, dir: THREE.Vector3): void {
-    const pos  = this.mesh.position;
+    const pos = this.mesh.position;
     const moving = dir.x !== 0 || dir.z !== 0;
 
     // 🏊 AUTO-SWIM: standing inside the pool basin at deck height — a
@@ -1022,9 +1173,15 @@ export class Player {
     // converts to swimming on the spot. Nobody walks on water.
     if (!this.swimMode) {
       const basin = getPoolBasin(FURNITURE);
-      if (basin
-          && pos.x > basin.x0 && pos.x < basin.x1
-          && pos.z > basin.z0 && pos.z < basin.z1) {
+      const island = getPoolIsland(OUTDOOR_FURNITURE);
+      if (
+        basin &&
+        pos.x > basin.x0 &&
+        pos.x < basin.x1 &&
+        pos.z > basin.z0 &&
+        pos.z < basin.z1 &&
+        (!island || !this._insidePoolIsland(pos.x, pos.z, island))
+      ) {
         this.swimMode = true;
         this.onWaterEntry?.(pos.x, POOL_WATER_Y, pos.z, false);
       }
@@ -1047,28 +1204,43 @@ export class Player {
         const nx = dir.x / len;
         const nz = dir.z / len;
         this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
-        pos.x = Math.max(basin.x0, Math.min(basin.x1, pos.x + nx * this.SWIM_SPEED * deltaTime));
-        pos.z = Math.max(basin.z0, Math.min(basin.z1, pos.z + nz * this.SWIM_SPEED * deltaTime));
+        const nextX = Math.max(
+          basin.x0,
+          Math.min(basin.x1, pos.x + nx * this.SWIM_SPEED * deltaTime),
+        );
+        const nextZ = Math.max(
+          basin.z0,
+          Math.min(basin.z1, pos.z + nz * this.SWIM_SPEED * deltaTime),
+        );
+        const resolved = this._resolvePoolIsland(nextX, nextZ);
+        pos.x = resolved.x;
+        pos.z = resolved.z;
       }
       pos.y = POOL_SWIM_Y;
-      this.character.setState('swim', this.logicalAngle);
+      this.character.setState("swim", this.logicalAngle);
       return;
     }
 
     if (moving) {
       const len = Math.sqrt(dir.x * dir.x + dir.z * dir.z);
-      const nx  = dir.x / len;
-      const nz  = dir.z / len;
+      const nx = dir.x / len;
+      const nz = dir.z / len;
 
       this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
 
-      const candX = Math.max(-this.BOUND, Math.min(this.BOUND, pos.x + nx * this.SPEED * deltaTime));
-      const candZ = Math.max(-this.BOUND, Math.min(this.BOUND, pos.z + nz * this.SPEED * deltaTime));
-      
+      const candX = Math.max(
+        -this.BOUND,
+        Math.min(this.BOUND, pos.x + nx * this.SPEED * deltaTime),
+      );
+      const candZ = Math.max(
+        -this.BOUND,
+        Math.min(this.BOUND, pos.z + nz * this.SPEED * deltaTime),
+      );
+
       // Separate sliding resolution over Obstacles to prevent sticking on corners during walking (AABB Sliding)
       const r1 = resolveObstacles(candX, pos.z);
       const r2 = resolveObstacles(pos.x, candZ);
-      
+
       // Apply movement independently if free on that vector
       if (r1.x === candX) {
         pos.x = candX;
@@ -1077,42 +1249,45 @@ export class Player {
         pos.z = candZ;
       }
 
-      this.character.setState('walk', this.logicalAngle);
+      this.character.setState("walk", this.logicalAngle);
     } else {
-      this.character.setState('idle', this.logicalAngle);
+      this.character.setState("idle", this.logicalAngle);
     }
   }
 
   private _updateWaypoint(deltaTime: number): void {
     if (this.waypointPath.length === 0) {
-      if (this.sitPhase === 'APPROACH') {
+      if (this.sitPhase === "APPROACH") {
         // Arrived at (or started on) the seat's front cell — fine-step next.
         this._removeReticle();
-        this.sitPhase = 'FINE';
+        this.sitPhase = "FINE";
         return;
       }
-      if (this.doorPhase === 'APPROACH') {
+      if (this.doorPhase === "APPROACH") {
         // Arrived at (or started on) the door's front cell — fine-step next.
         this._removeReticle();
-        this.doorPhase = 'FINE';
+        this.doorPhase = "FINE";
         return;
       }
-      if (this.devicePhase === 'APPROACH') {
+      if (this.devicePhase === "APPROACH") {
         // Arrived at (or started on) the device's front cell — fine-step next.
         this._removeReticle();
-        this.devicePhase = 'FINE';
+        this.devicePhase = "FINE";
         return;
       }
-      this.character.setState(this.swimMode ? 'swim' : 'idle', this.logicalAngle);
+      this.character.setState(
+        this.swimMode ? "swim" : "idle",
+        this.logicalAngle,
+      );
       this._clearPath();
       return;
     }
 
-    const pos    = this.mesh.position;
+    const pos = this.mesh.position;
     const target = this.waypointPath[0];
 
-    const dx   = target.x - pos.x;
-    const dz   = target.z - pos.z;
+    const dx = target.x - pos.x;
+    const dz = target.z - pos.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
 
     if (dist < this.ARRIVE_DIST) {
@@ -1122,22 +1297,22 @@ export class Player {
       this.waypointPath.shift();
 
       if (this.waypointPath.length === 0) {
-        if (this.sitPhase === 'APPROACH') {
+        if (this.sitPhase === "APPROACH") {
           this._removeReticle();
-          this.sitPhase = 'FINE';
+          this.sitPhase = "FINE";
           return;
         }
-        if (this.doorPhase === 'APPROACH') {
+        if (this.doorPhase === "APPROACH") {
           this._removeReticle();
-          this.doorPhase = 'FINE';
+          this.doorPhase = "FINE";
           return;
         }
-        if (this.devicePhase === 'APPROACH') {
+        if (this.devicePhase === "APPROACH") {
           this._removeReticle();
-          this.devicePhase = 'FINE';
+          this.devicePhase = "FINE";
           return;
         }
-        this.character.setState('idle', this.logicalAngle);
+        this.character.setState("idle", this.logicalAngle);
         this._clearPath();
         return;
       }
@@ -1152,10 +1327,14 @@ export class Player {
       // no obstacles exist inside the water, so skip resolution entirely.
       if (this.swimMode) {
         const step = Math.min(this.SWIM_SPEED * deltaTime, dist);
-        pos.x += nx * step;
-        pos.z += nz * step;
+        const resolved = this._resolvePoolIsland(
+          pos.x + nx * step,
+          pos.z + nz * step,
+        );
+        pos.x = resolved.x;
+        pos.z = resolved.z;
         pos.y = POOL_SWIM_Y;
-        this.character.setState('swim', this.logicalAngle);
+        this.character.setState("swim", this.logicalAngle);
         return;
       }
 
@@ -1173,7 +1352,7 @@ export class Player {
       pos.x = r2.x;
       pos.z = r2.z;
 
-      this.character.setState('walk', this.logicalAngle);
+      this.character.setState("walk", this.logicalAngle);
     }
   }
 
@@ -1194,8 +1373,12 @@ export class Player {
 
   /** Abandon any in-flight sit approach (does NOT stand up a seated player). */
   private _cancelSit(): void {
-    if (this.sitPhase === 'APPROACH' || this.sitPhase === 'FINE' || this.sitPhase === 'TURN') {
-      this.sitPhase = 'NONE';
+    if (
+      this.sitPhase === "APPROACH" ||
+      this.sitPhase === "FINE" ||
+      this.sitPhase === "TURN"
+    ) {
+      this.sitPhase = "NONE";
       this.sitTarget = null;
     }
   }
@@ -1203,21 +1386,32 @@ export class Player {
   /** Walk straight from the last path cell onto the seat's exact front point. */
   private _updateFineApproach(deltaTime: number): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; return; }
+    if (!seat) {
+      this.sitPhase = "NONE";
+      return;
+    }
 
-    const pos  = this.mesh.position;
-    const dx   = seat.front.x - pos.x;
-    const dz   = seat.front.z - pos.z;
+    const pos = this.mesh.position;
+    const dx = seat.front.x - pos.x;
+    const dz = seat.front.z - pos.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
 
     if (dist < 0.06) {
       pos.x = seat.front.x;
       pos.z = seat.front.z;
+      // 🌉 Seat reached over a scripted path (hot-tub bridge): WALK the
+      // waypoints instead — the TURN pause is skipped, the crest hop into the
+      // tub replaces it.
+      if (seat.path && seat.path.length > 0) {
+        this.sitPathIndex = 0;
+        this.sitPhase = "BRIDGE_IN";
+        return;
+      }
       // Turn so the avatar's BACK faces the chair (i.e. face away from it).
       this.logicalAngle = seat.faceAngle;
       this.turnTimer = 0;
-      this.sitPhase = 'TURN';
-      this.character.setState('idle', this.logicalAngle);
+      this.sitPhase = "TURN";
+      this.character.setState("idle", this.logicalAngle);
       return;
     }
 
@@ -1228,36 +1422,64 @@ export class Player {
     const r = resolveObstacles(pos.x + nx * step, pos.z + nz * step);
     pos.x = r.x;
     pos.z = r.z;
-    this.character.setState('walk', this.logicalAngle);
+    this.character.setState("walk", this.logicalAngle);
   }
 
   /** Brief pause while the facing snaps to back-to-the-chair. */
   private _updateTurn(deltaTime: number): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; return; }
-    this.character.setState('idle', seat.faceAngle);
+    if (!seat) {
+      this.sitPhase = "NONE";
+      return;
+    }
+    this.character.setState("idle", seat.faceAngle);
     this.turnTimer += deltaTime;
     if (this.turnTimer >= this.TURN_TIME) {
       this.sitAnim = 0;
-      this.sitPhase = 'SIT_DOWN';
+      this.sitPhase = "SIT_DOWN";
     }
   }
 
   /** Scripted slide from the front point back onto the seat (no collision). */
   private _updateSitDown(deltaTime: number): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
+    if (!seat) {
+      this.sitPhase = "NONE";
+      this.sitSlideFrom = null;
+      this.mesh.position.y = 0;
+      return;
+    }
 
+    // 🌉 Bridge seats slide from the crest (sitSlideFrom); everything else
+    // from the floor-level front point.
+    const from = this.sitSlideFrom ?? {
+      x: seat.front.x,
+      y: 0,
+      z: seat.front.z,
+    };
     this.sitAnim = Math.min(1, this.sitAnim + deltaTime / this.SIT_ANIM_TIME);
     const t = this.sitAnim * this.sitAnim * (3 - 2 * this.sitAnim); // smoothstep
     const pos = this.mesh.position;
-    pos.x = seat.front.x + (seat.sit.x - seat.front.x) * t;
-    pos.z = seat.front.z + (seat.sit.z - seat.front.z) * t;
-    pos.y = seat.sitY * t; // 🛏️ elevated berths (top bunk) — rises with the slide
-    this.character.setState(seat.swim ? 'swim' : seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
+    pos.x = from.x + (seat.sit.x - from.x) * t;
+    pos.z = from.z + (seat.sit.z - from.z) * t;
+    // 🛏️ elevated berths rise with the slide; 🌉 a crest origin adds a
+    // parabolic hop that clears the tub rim on the way in.
+    pos.y =
+      from.y +
+      (seat.sitY - from.y) * t +
+      (this.sitSlideFrom ? this.TUB_HOP_LIFT * 4 * t * (1 - t) : 0);
+    this.character.setState(
+      seat.swim ? "swim" : seat.lie ? "sleep" : "sit_chair",
+      seat.faceAngle,
+    );
 
     if (this.sitAnim >= 1) {
-      this.sitPhase = 'SEATED';
+      this.sitPhase = "SEATED";
+      // 🌉 Plopped over the rim into the hot tub — a small splash at the tub
+      // waterline sells the landing.
+      if (this.sitSlideFrom) {
+        this.onWaterEntry?.(seat.sit.x, HOT_TUB_WATER_Y, seat.sit.z, false);
+      }
       // 🏊 Waded into a pool seat — splash, then hand off to FREE SWIM: the
       // water is open movement space, not a chair.
       if (seat.swim) {
@@ -1269,12 +1491,13 @@ export class Player {
 
   /** 🏊 Water entries (slide-in / dive) end in free-swim, not a seat. */
   private _enterSwimMode(): void {
-    this.sitPhase = 'NONE';
+    this.sitPhase = "NONE";
     this.sitTarget = null;
+    this.sitSlideFrom = null;
     this.swimMode = true;
-    this.navMode = 'MANUAL';
+    this.navMode = "MANUAL";
     this.mesh.position.y = POOL_SWIM_Y;
-    this.character.setState('swim', this.logicalAngle);
+    this.character.setState("swim", this.logicalAngle);
   }
 
   private _updateSeated(): void {
@@ -1282,8 +1505,16 @@ export class Player {
     // 🛏️ Defensive guards that reset the phase must also ground the mesh —
     // a lost sitTarget on an elevated berth would otherwise strand the
     // avatar floating at mattress height.
-    if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
-    this.character.setState(seat.swim ? 'swim' : seat.lie ? 'sleep' : 'sit_chair', seat.faceAngle);
+    if (!seat) {
+      this.sitPhase = "NONE";
+      this.sitSlideFrom = null;
+      this.mesh.position.y = 0;
+      return;
+    }
+    this.character.setState(
+      seat.swim ? "swim" : seat.lie ? "sleep" : "sit_chair",
+      seat.faceAngle,
+    );
   }
 
   // ── 🏊‍♂️ High-dive arc (board tip → pool water) ─────────────────────────────
@@ -1295,22 +1526,108 @@ export class Player {
     this.diveFrom = { x: pos.x, y: pos.y, z: pos.z };
     this.sitTarget = target;
     this.diveAnim = 0;
-    this.sitPhase = 'DIVE';
+    this.sitPhase = "DIVE";
     // Face along the arc (the rig snaps to 8 ways visually by itself).
     this.logicalAngle = Math.atan2(target.sit.x - pos.x, target.sit.z - pos.z);
   }
 
   /** 🏊 Straight-line swim to a point inside the basin (clamped). */
   public swimTo(tx: number, tz: number): void {
-    if (!this.swimMode || this.sitPhase !== 'NONE') return;
+    if (!this.swimMode || this.sitPhase !== "NONE") return;
     const basin = getPoolBasin(FURNITURE);
     if (!basin) return;
-    const x = Math.max(basin.x0, Math.min(basin.x1, tx));
-    const z = Math.max(basin.z0, Math.min(basin.z1, tz));
+    const clampedX = Math.max(basin.x0, Math.min(basin.x1, tx));
+    const clampedZ = Math.max(basin.z0, Math.min(basin.z1, tz));
+    const destination = this._resolvePoolIsland(clampedX, clampedZ);
     this._clearPath();
-    this.waypointPath = [{ x, z }];
-    this.navMode = 'WAYPOINT';
-    this.reticle = new WaypointReticle(this.scene, x, z);
+    this.waypointPath = this._swimPathAroundIsland(
+      destination.x,
+      destination.z,
+    );
+    this.navMode = "WAYPOINT";
+    this.reticle = new WaypointReticle(
+      this.scene,
+      destination.x,
+      destination.z,
+    );
+  }
+
+  private _insidePoolIsland(
+    x: number,
+    z: number,
+    island: { x: number; z: number; rx: number; rz: number },
+  ): boolean {
+    const dx = (x - island.x) / island.rx;
+    const dz = (z - island.z) / island.rz;
+    return dx * dx + dz * dz < 1;
+  }
+
+  private _resolvePoolIsland(x: number, z: number): { x: number; z: number } {
+    const island = getPoolIsland(OUTDOOR_FURNITURE);
+    if (!island || !this._insidePoolIsland(x, z, island)) return { x, z };
+    const dx = x - island.x;
+    const dz = z - island.z;
+    const angle =
+      dx === 0 && dz === 0
+        ? Math.atan2(
+            this.mesh.position.z - island.z,
+            this.mesh.position.x - island.x,
+          )
+        : Math.atan2(dz / island.rz, dx / island.rx);
+    return {
+      x: island.x + Math.cos(angle) * island.rx,
+      z: island.z + Math.sin(angle) * island.rz,
+    };
+  }
+
+  private _swimPathAroundIsland(
+    tx: number,
+    tz: number,
+  ): Array<{ x: number; z: number }> {
+    const island = getPoolIsland(OUTDOOR_FURNITURE);
+    const start = this.mesh.position;
+    if (!island) return [{ x: tx, z: tz }];
+
+    let crossesIsland = false;
+    for (let i = 1; i < 16; i++) {
+      const t = i / 16;
+      if (
+        this._insidePoolIsland(
+          start.x + (tx - start.x) * t,
+          start.z + (tz - start.z) * t,
+          island,
+        )
+      ) {
+        crossesIsland = true;
+        break;
+      }
+    }
+    if (!crossesIsland) return [{ x: tx, z: tz }];
+
+    const startAngle = Math.atan2(
+      (start.z - island.z) / island.rz,
+      (start.x - island.x) / island.rx,
+    );
+    const endAngle = Math.atan2(
+      (tz - island.z) / island.rz,
+      (tx - island.x) / island.rx,
+    );
+    const clockwise =
+      ((endAngle - startAngle + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    const points: Array<{ x: number; z: number }> = [];
+    const segments = Math.max(
+      3,
+      Math.ceil(Math.abs(clockwise) / (Math.PI / 5)),
+    );
+    for (let i = 1; i < segments; i++) {
+      const angle = startAngle + clockwise * (i / segments);
+      points.push({
+        x: island.x + Math.cos(angle) * (island.rx + 0.18),
+        z: island.z + Math.sin(angle) * (island.rz + 0.18),
+      });
+    }
+    points.push({ x: tx, z: tz });
+    return points;
   }
 
   /**
@@ -1322,20 +1639,34 @@ export class Player {
     const basin = getPoolBasin(FURNITURE);
     const pos = this.mesh.position;
     this._clearPath();
-    let ex = pos.x, ez = pos.z;
+    let ex = pos.x,
+      ez = pos.z;
     if (basin) {
       // Exit over the side with the LARGER overshoot toward the target;
       // fall back to the nearest edge when the target is inside the basin.
-      const dxOut = tx < basin.x0 ? basin.x0 - tx : tx > basin.x1 ? tx - basin.x1 : 0;
-      const dzOut = tz < basin.z0 ? basin.z0 - tz : tz > basin.z1 ? tz - basin.z1 : 0;
+      const dxOut =
+        tx < basin.x0 ? basin.x0 - tx : tx > basin.x1 ? tx - basin.x1 : 0;
+      const dzOut =
+        tz < basin.z0 ? basin.z0 - tz : tz > basin.z1 ? tz - basin.z1 : 0;
       if (dxOut === 0 && dzOut === 0) {
-        const dW = pos.x - basin.x0, dE = basin.x1 - pos.x;
-        const dN = pos.z - basin.z0, dS = basin.z1 - pos.z;
+        const dW = pos.x - basin.x0,
+          dE = basin.x1 - pos.x;
+        const dN = pos.z - basin.z0,
+          dS = basin.z1 - pos.z;
         const min = Math.min(dW, dE, dN, dS);
-        if (min === dE) { ex = basin.exit.x1; ez = pos.z; }
-        else if (min === dW) { ex = basin.exit.x0; ez = pos.z; }
-        else if (min === dS) { ez = basin.exit.z1; ex = pos.x; }
-        else { ez = basin.exit.z0; ex = pos.x; }
+        if (min === dE) {
+          ex = basin.exit.x1;
+          ez = pos.z;
+        } else if (min === dW) {
+          ex = basin.exit.x0;
+          ez = pos.z;
+        } else if (min === dS) {
+          ez = basin.exit.z1;
+          ex = pos.x;
+        } else {
+          ez = basin.exit.z0;
+          ex = pos.x;
+        }
       } else if (dxOut >= dzOut) {
         ex = tx > basin.x1 ? basin.exit.x1 : basin.exit.x0;
         ez = Math.max(basin.z0, Math.min(basin.z1, tz));
@@ -1349,15 +1680,24 @@ export class Player {
     const dist = Math.hypot(ex - pos.x, ez - pos.z);
     this.climbDuration = Math.max(0.35, 0.2 + dist * 0.3); // glide scales with distance
     this.climbAnim = 0;
-    this.sitPhase = 'CLIMB_OUT';
+    this.sitPhase = "CLIMB_OUT";
     this.logicalAngle = Math.atan2(ex - pos.x, ez - pos.z);
   }
 
   private _updateClimbOut(deltaTime: number): void {
-    const from = this.climbFrom, to = this.climbTo;
-    if (!from || !to) { this.sitPhase = 'NONE'; this.swimMode = false; this.mesh.position.y = 0; return; }
+    const from = this.climbFrom,
+      to = this.climbTo;
+    if (!from || !to) {
+      this.sitPhase = "NONE";
+      this.swimMode = false;
+      this.mesh.position.y = 0;
+      return;
+    }
 
-    this.climbAnim = Math.min(1, this.climbAnim + deltaTime / this.climbDuration);
+    this.climbAnim = Math.min(
+      1,
+      this.climbAnim + deltaTime / this.climbDuration,
+    );
     const t = this.climbAnim * this.climbAnim * (3 - 2 * this.climbAnim); // smoothstep
     const pos = this.mesh.position;
     pos.x = from.x + (to.x - from.x) * t;
@@ -1365,17 +1705,24 @@ export class Player {
     // Glide at water level, rise onto the deck over the final stretch.
     const rise = Math.max(0, (t - 0.66) / 0.34);
     pos.y = from.y * (1 - rise);
-    this.character.setState(rise > 0 ? 'idle' : 'swim', this.logicalAngle);
+    this.character.setState(rise > 0 ? "idle" : "swim", this.logicalAngle);
 
     if (this.climbAnim >= 1) {
-      pos.x = to.x; pos.z = to.z; pos.y = 0;
+      pos.x = to.x;
+      pos.z = to.z;
+      pos.y = 0;
       this.swimMode = false;
       this.climbFrom = null;
       this.climbTo = null;
-      this.sitPhase = 'NONE';
-      this.navMode = 'MANUAL';
+      this.sitPhase = "NONE";
+      this.navMode = "MANUAL";
       // 💦 Exit ripple where the swimmer left the water.
-      this.onWaterEntry?.(from.x + (to.x - from.x) * 0.7, POOL_WATER_Y, from.z + (to.z - from.z) * 0.7, false);
+      this.onWaterEntry?.(
+        from.x + (to.x - from.x) * 0.7,
+        POOL_WATER_Y,
+        from.z + (to.z - from.z) * 0.7,
+        false,
+      );
       // Resume whatever the climb was for (mirrors _updateStandUp).
       if (this.pendingDevice) {
         const next = this.pendingDevice;
@@ -1399,8 +1746,13 @@ export class Player {
 
   /** Scripted ballistic arc: linear x/z, t² fall with a small launch lift. */
   private _updateDive(deltaTime: number): void {
-    const seat = this.sitTarget, from = this.diveFrom;
-    if (!seat || !from) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
+    const seat = this.sitTarget,
+      from = this.diveFrom;
+    if (!seat || !from) {
+      this.sitPhase = "NONE";
+      this.mesh.position.y = 0;
+      return;
+    }
 
     this.diveAnim = Math.min(1, this.diveAnim + deltaTime / DIVE_TIME);
     const t = this.diveAnim;
@@ -1409,11 +1761,14 @@ export class Player {
     // Same constants replay the arc on remote replicas — see world.ts.
     pos.x = from.x + (seat.sit.x - from.x) * t;
     pos.z = from.z + (seat.sit.z - from.z) * t;
-    pos.y = from.y + (seat.sitY - from.y) * t * t + DIVE_ARC_LIFT * 4 * t * (1 - t);
-    this.character.setState('dive', this.logicalAngle);
+    pos.y =
+      from.y + (seat.sitY - from.y) * t * t + DIVE_ARC_LIFT * 4 * t * (1 - t);
+    this.character.setState("dive", this.logicalAngle);
 
     if (t >= 1) {
-      pos.x = seat.sit.x; pos.z = seat.sit.z; pos.y = seat.sitY;
+      pos.x = seat.sit.x;
+      pos.z = seat.sit.z;
+      pos.y = seat.sitY;
       this.diveFrom = null;
       this.onWaterEntry?.(pos.x, POOL_WATER_Y, pos.z, true); // 💦 big splash
       this._enterSwimMode(); // 🏊 surfaced — free swim from here
@@ -1422,52 +1777,150 @@ export class Player {
 
   /** Begin standing: reverse slide from the seat to its front point. */
   private _beginStandUp(): void {
-    if (this.sitPhase !== 'SEATED' && this.sitPhase !== 'SIT_DOWN') return;
+    if (this.sitPhase !== "SEATED" && this.sitPhase !== "SIT_DOWN") return;
     this.sitAnim = 0;
     this.standStartY = this.mesh.position.y; // 🛏️ descend from the actual height
-    this.sitPhase = 'STAND_UP';
+    this.sitPhase = "STAND_UP";
   }
 
   private _updateStandUp(deltaTime: number): void {
     const seat = this.sitTarget;
-    if (!seat) { this.sitPhase = 'NONE'; this.mesh.position.y = 0; return; }
+    if (!seat) {
+      this.sitPhase = "NONE";
+      this.sitSlideFrom = null;
+      this.mesh.position.y = 0;
+      return;
+    }
 
+    // 🌉 Bridge seats hop back OUT to the crest first; everything else steps
+    // straight down to the floor-level front point.
+    const to = this.sitSlideFrom ?? { x: seat.front.x, y: 0, z: seat.front.z };
     this.sitAnim = Math.min(1, this.sitAnim + deltaTime / this.STAND_ANIM_TIME);
     const t = this.sitAnim * this.sitAnim * (3 - 2 * this.sitAnim); // smoothstep
     const pos = this.mesh.position;
-    pos.x = seat.sit.x + (seat.front.x - seat.sit.x) * t;
-    pos.z = seat.sit.z + (seat.front.z - seat.sit.z) * t;
-    pos.y = this.standStartY * (1 - t); // 🛏️ climb back down to the floor
-    this.character.setState('idle', seat.faceAngle);
+    pos.x = seat.sit.x + (to.x - seat.sit.x) * t;
+    pos.z = seat.sit.z + (to.z - seat.sit.z) * t;
+    // 🛏️ climb back down; 🌉 with the same rim-clearing hop, reversed.
+    pos.y =
+      this.standStartY +
+      (to.y - this.standStartY) * t +
+      (this.sitSlideFrom ? this.TUB_HOP_LIFT * 4 * t * (1 - t) : 0);
+    this.character.setState("idle", seat.faceAngle);
 
     if (this.sitAnim >= 1) {
-      pos.x = seat.front.x;
-      pos.z = seat.front.z;
-      pos.y = 0;
-      this.logicalAngle = seat.faceAngle;
-      this.sitTarget = null;
-      this.sitPhase = 'NONE';
-      this.navMode = 'MANUAL';
-
-      // Resume whatever interrupted the sit.
-      if (this.pendingDevice) {
-        const next = this.pendingDevice;
-        this.pendingDevice = null;
-        this.navigateToDevice(next.device, next.hooks);
-      } else if (this.pendingDoor) {
-        const next = this.pendingDoor;
-        this.pendingDoor = null;
-        this.navigateToDoor(next.door, next.hooks);
-      } else if (this.pendingSeat) {
-        const next = this.pendingSeat;
-        this.pendingSeat = null;
-        this.navigateToSeat(next);
-      } else if (this.pendingDest) {
-        const dest = this.pendingDest;
-        this.pendingDest = null;
-        this.navigateTo(dest.x, dest.z);
+      pos.x = to.x;
+      pos.z = to.z;
+      pos.y = to.y;
+      if (this.sitSlideFrom && seat.path && seat.path.length > 0) {
+        // 🌉 Back on the crest — walk the arch down to the shore, then the
+        // front point (BRIDGE_OUT finishes the stand and resumes pendings).
+        this.sitSlideFrom = null;
+        this.sitPathIndex = seat.path.length - 2;
+        this.sitPhase = "BRIDGE_OUT";
+        return;
       }
+      this.logicalAngle = seat.faceAngle;
+      this._finishStand();
     }
+  }
+
+  /**
+   * Common tail of STAND_UP / BRIDGE_OUT: ground the avatar where it stands
+   * (the seat's front point) and resume whatever interrupted the sit.
+   */
+  private _finishStand(): void {
+    this.mesh.position.y = 0;
+    this.sitTarget = null;
+    this.sitSlideFrom = null;
+    this.sitPhase = "NONE";
+    this.navMode = "MANUAL";
+
+    // Resume whatever interrupted the sit.
+    if (this.pendingDevice) {
+      const next = this.pendingDevice;
+      this.pendingDevice = null;
+      this.navigateToDevice(next.device, next.hooks);
+    } else if (this.pendingDoor) {
+      const next = this.pendingDoor;
+      this.pendingDoor = null;
+      this.navigateToDoor(next.door, next.hooks);
+    } else if (this.pendingSeat) {
+      const next = this.pendingSeat;
+      this.pendingSeat = null;
+      this.navigateToSeat(next);
+    } else if (this.pendingDest) {
+      const dest = this.pendingDest;
+      this.pendingDest = null;
+      this.navigateTo(dest.x, dest.z);
+    }
+  }
+
+  /**
+   * 🌉 Scripted bridge walk (no collision resolution — the deck crosses the
+   * river/tub obstacle AABBs). BRIDGE_IN walks seat.path shore → crest, then
+   * hands off to the SIT_DOWN rim hop; BRIDGE_OUT walks crest → shore → the
+   * seat's front point and finishes the stand. y eases toward each
+   * waypoint's deck height, so the fox visibly climbs and descends the arch.
+   */
+  private _updateBridgeWalk(deltaTime: number): void {
+    const seat = this.sitTarget;
+    const path = seat?.path;
+    if (!seat || !path || path.length === 0) {
+      // Defensive — a lost target mid-bridge grounds the mesh (mirrors the
+      // other sit-phase guards).
+      this.sitPhase = "NONE";
+      this.sitTarget = null;
+      this.sitSlideFrom = null;
+      this.mesh.position.y = 0;
+      return;
+    }
+
+    const inbound = this.sitPhase === "BRIDGE_IN";
+    const pos = this.mesh.position;
+    // BRIDGE_OUT's tail leg (index -1) returns to the front point on the shore.
+    const target =
+      this.sitPathIndex >= 0
+        ? path[this.sitPathIndex]
+        : { x: seat.front.x, y: 0, z: seat.front.z };
+
+    const dx = target.x - pos.x;
+    const dz = target.z - pos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const step = this.SPEED * deltaTime;
+
+    if (dist > step) {
+      const nx = dx / dist;
+      const nz = dz / dist;
+      this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
+      pos.x += nx * step;
+      pos.z += nz * step;
+      pos.y += (target.y - pos.y) * (step / dist); // ease along the arch
+      this.character.setState("walk", this.logicalAngle);
+      return;
+    }
+
+    // Waypoint reached — snap (including deck height) and advance.
+    pos.x = target.x;
+    pos.z = target.z;
+    pos.y = target.y;
+
+    if (inbound) {
+      if (this.sitPathIndex < path.length - 1) {
+        this.sitPathIndex++;
+        return;
+      }
+      // Crest reached — hop from here over the rim into the tub.
+      this.sitSlideFrom = { ...path[path.length - 1] };
+      this.sitAnim = 0;
+      this.sitPhase = "SIT_DOWN";
+      return;
+    }
+
+    if (this.sitPathIndex >= 0) {
+      this.sitPathIndex--; // next waypoint down the arch (front point at -1)
+      return;
+    }
+    this._finishStand();
   }
 
   // ── Door walk-through sequence ──────────────────────────────────────────────
@@ -1478,12 +1931,12 @@ export class Player {
    */
   private _cancelDoor(): void {
     if (
-      this.doorPhase === 'APPROACH' ||
-      this.doorPhase === 'FINE' ||
-      this.doorPhase === 'WAIT_OPEN'
+      this.doorPhase === "APPROACH" ||
+      this.doorPhase === "FINE" ||
+      this.doorPhase === "WAIT_OPEN"
     ) {
       this.doorSeq++;
-      this.doorPhase = 'NONE';
+      this.doorPhase = "NONE";
       this.doorTarget = null;
       this.doorHooks = null;
       this._removeReticle();
@@ -1492,7 +1945,7 @@ export class Player {
 
   /** _cancelDoor, but first re-closes a door we already asked to open. */
   private _abortDoorApproach(): void {
-    if (this.doorPhase === 'WAIT_OPEN' && this.doorHooks) {
+    if (this.doorPhase === "WAIT_OPEN" && this.doorHooks) {
       this.doorHooks.requestClose();
     }
     this._cancelDoor();
@@ -1500,10 +1953,10 @@ export class Player {
 
   /** Turn around (scripted) and start walking back to the door's front point. */
   private _beginDoorReturn(): void {
-    if (this.doorPhase !== 'THROUGH' && this.doorPhase !== 'PEEK') return;
+    if (this.doorPhase !== "THROUGH" && this.doorPhase !== "PEEK") return;
     if (!this.doorTarget) return;
     this.logicalAngle = snapTo8Ways(this.doorTarget.faceAngle + Math.PI);
-    this.doorPhase = 'RETURN';
+    this.doorPhase = "RETURN";
   }
 
   /** Drive the FINE / WAIT_OPEN / THROUGH / PEEK / RETURN door phases. */
@@ -1512,7 +1965,7 @@ export class Player {
     const hooks = this.doorHooks;
     if (!door || !hooks) {
       // Defensive: should be unreachable (state is only cleared with phase).
-      this.doorPhase = 'NONE';
+      this.doorPhase = "NONE";
       this.doorTarget = null;
       this.doorHooks = null;
       return;
@@ -1522,7 +1975,7 @@ export class Player {
 
     switch (this.doorPhase) {
       // ── Straight-step onto the exact front point (collision ON) ───────────
-      case 'FINE': {
+      case "FINE": {
         const dx = door.front.x - pos.x;
         const dz = door.front.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1531,20 +1984,20 @@ export class Player {
           pos.x = door.front.x;
           pos.z = door.front.z;
           this.logicalAngle = door.faceAngle;
-          this.character.setState('idle', this.logicalAngle);
-          this.doorPhase = 'WAIT_OPEN';
+          this.character.setState("idle", this.logicalAngle);
+          this.doorPhase = "WAIT_OPEN";
           this.doorTimer = 0;
 
           const seq = this.doorSeq;
           const accepted = hooks.requestOpen(() => {
             // Ignore stale completions from a cancelled/replaced sequence.
-            if (seq !== this.doorSeq || this.doorPhase !== 'WAIT_OPEN') return;
-            this.doorPhase = 'THROUGH';
+            if (seq !== this.doorSeq || this.doorPhase !== "WAIT_OPEN") return;
+            this.doorPhase = "THROUGH";
           });
           if (!accepted) {
             // Denied (locked) — the hook already surfaced a hint.
             this._cancelDoor();
-            this.navMode = 'MANUAL';
+            this.navMode = "MANUAL";
           }
           return;
         }
@@ -1556,25 +2009,25 @@ export class Player {
         const r = resolveObstacles(pos.x + nx * step, pos.z + nz * step);
         pos.x = r.x;
         pos.z = r.z;
-        this.character.setState('walk', this.logicalAngle);
+        this.character.setState("walk", this.logicalAngle);
         return;
       }
 
       // ── Idle facing the door until it signals fully-open (3s timeout) ─────
-      case 'WAIT_OPEN': {
-        this.character.setState('idle', this.logicalAngle);
+      case "WAIT_OPEN": {
+        this.character.setState("idle", this.logicalAngle);
         this.doorTimer += deltaTime;
         if (this.doorTimer > this.DOOR_WAIT_TIMEOUT) {
           hooks.requestClose();
           this._cancelDoor();
-          this.navMode = 'MANUAL';
+          this.navMode = "MANUAL";
         }
         return;
       }
 
       // ── Scripted walk past the threshold (no collision, no BOUND clamp —
       //    same precedent as the SIT_DOWN slide) ───────────────────────────────
-      case 'THROUGH': {
+      case "THROUGH": {
         const dx = door.through.x - pos.x;
         const dz = door.through.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1583,7 +2036,7 @@ export class Player {
           pos.x = door.through.x;
           pos.z = door.through.z;
           this.doorTimer = 0;
-          this.character.setState('idle', door.faceAngle);
+          this.character.setState("idle", door.faceAngle);
           hooks.onThrough();
           // T1 branch point: a paired door begins the adapter transit —
           // walk onward into the vestibule instead of the peek look-around.
@@ -1594,9 +2047,9 @@ export class Player {
               x: door.through.x + ox * this.ADAPTER_OUT_DIST,
               z: door.through.z + oz * this.ADAPTER_OUT_DIST,
             };
-            this.doorPhase = 'ADAPTER_OUT';
+            this.doorPhase = "ADAPTER_OUT";
           } else {
-            this.doorPhase = 'PEEK';
+            this.doorPhase = "PEEK";
           }
           return;
         }
@@ -1607,13 +2060,13 @@ export class Player {
         const step = Math.min(this.SPEED * deltaTime, dist);
         pos.x += nx * step;
         pos.z += nz * step;
-        this.character.setState('walk', this.logicalAngle);
+        this.character.setState("walk", this.logicalAngle);
         return;
       }
 
       // ── Brief look outside, then turn back ─────────────────────────────────
-      case 'PEEK': {
-        this.character.setState('idle', door.faceAngle);
+      case "PEEK": {
+        this.character.setState("idle", door.faceAngle);
         this.doorTimer += deltaTime;
         if (this.doorTimer >= this.DOOR_PEEK_TIME) {
           this._beginDoorReturn();
@@ -1622,7 +2075,7 @@ export class Player {
       }
 
       // ── Scripted walk back inside to the front point (no collision) ────────
-      case 'RETURN': {
+      case "RETURN": {
         const dx = door.front.x - pos.x;
         const dz = door.front.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1630,11 +2083,11 @@ export class Player {
         if (dist < 0.06) {
           pos.x = door.front.x;
           pos.z = door.front.z;
-          this.doorPhase = 'NONE';
+          this.doorPhase = "NONE";
           this.doorTarget = null;
           this.doorHooks = null;
-          this.navMode = 'MANUAL';
-          this.character.setState('idle', this.logicalAngle);
+          this.navMode = "MANUAL";
+          this.character.setState("idle", this.logicalAngle);
           hooks.requestClose();
 
           // Resume whatever interrupted the walk-through.
@@ -1664,16 +2117,16 @@ export class Player {
         const step = Math.min(this.SPEED * deltaTime, dist);
         pos.x += nx * step;
         pos.z += nz * step;
-        this.character.setState('walk', this.logicalAngle);
+        this.character.setState("walk", this.logicalAngle);
         return;
       }
 
       // ── T1: scripted walk onward into the vestibule (no collision) ─────────
-      case 'ADAPTER_OUT': {
+      case "ADAPTER_OUT": {
         const target = this.adapterOutTarget;
         if (!target) {
           // Defensive: target is always set with the phase.
-          this.doorPhase = 'ADAPTER_HOLD';
+          this.doorPhase = "ADAPTER_HOLD";
           this.doorTimer = 0;
           hooks.onAdapterHold?.();
           return;
@@ -1686,9 +2139,9 @@ export class Player {
           pos.x = target.x;
           pos.z = target.z;
           this.adapterOutTarget = null;
-          this.doorPhase = 'ADAPTER_HOLD';
+          this.doorPhase = "ADAPTER_HOLD";
           this.doorTimer = 0;
-          this.character.setState('idle', door.faceAngle);
+          this.character.setState("idle", door.faceAngle);
           // Seal the departure door behind us; the swap runs during HOLD.
           hooks.requestClose();
           hooks.onAdapterHold?.();
@@ -1701,40 +2154,42 @@ export class Player {
         const step = Math.min(this.SPEED * deltaTime, dist);
         pos.x += nx * step;
         pos.z += nz * step;
-        this.character.setState('walk', this.logicalAngle);
+        this.character.setState("walk", this.logicalAngle);
         return;
       }
 
       // ── T1: idle at the hold point while the room swap runs ────────────────
-      case 'ADAPTER_HOLD': {
-        this.character.setState('idle', door.faceAngle);
+      case "ADAPTER_HOLD": {
+        this.character.setState("idle", door.faceAngle);
         this.doorTimer += deltaTime;
         if (this.doorTimer > this.ADAPTER_HOLD_TIMEOUT) {
           // Defensive cap — the swap never resolved. Re-open the door and
           // walk back inside (RETURN's completion closes it and restores
           // MANUAL). enterFromDoor still takes over cleanly if the transit
           // driver eventually resolves (it bumps doorSeq and re-targets).
-          hooks.requestOpen(() => { /* fire-and-forget re-open */ });
+          hooks.requestOpen(() => {
+            /* fire-and-forget re-open */
+          });
           this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI);
-          this.doorPhase = 'RETURN';
+          this.doorPhase = "RETURN";
         }
         return;
       }
 
       // ── T1 arrival: idle at `through` (outside) while the door opens ───────
-      case 'ARRIVE_OPEN': {
-        this.character.setState('idle', this.logicalAngle);
+      case "ARRIVE_OPEN": {
+        this.character.setState("idle", this.logicalAngle);
         this.doorTimer += deltaTime;
         if (this.doorTimer > this.DOOR_WAIT_TIMEOUT) {
           // Door never signalled open — walk in anyway (scripted stretch;
           // being stuck outside the room would be strictly worse).
-          this.doorPhase = 'ARRIVE';
+          this.doorPhase = "ARRIVE";
         }
         return;
       }
 
       // ── T1 arrival: scripted walk in from `through` to `front` ─────────────
-      case 'ARRIVE': {
+      case "ARRIVE": {
         const dx = door.front.x - pos.x;
         const dz = door.front.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1743,11 +2198,11 @@ export class Player {
           pos.x = door.front.x;
           pos.z = door.front.z;
           this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI); // face into the room
-          this.doorPhase = 'NONE';
+          this.doorPhase = "NONE";
           this.doorTarget = null;
           this.doorHooks = null;
-          this.navMode = 'MANUAL';
-          this.character.setState('idle', this.logicalAngle);
+          this.navMode = "MANUAL";
+          this.character.setState("idle", this.logicalAngle);
           hooks.requestClose();
           // No pending resumes: everything queued before/during a transit is
           // deliberately dropped (enterFromDoor clears the pending slots).
@@ -1760,7 +2215,7 @@ export class Player {
         const step = Math.min(this.SPEED * deltaTime, dist);
         pos.x += nx * step;
         pos.z += nz * step;
-        this.character.setState('walk', this.logicalAngle);
+        this.character.setState("walk", this.logicalAngle);
         return;
       }
     }
@@ -1770,12 +2225,23 @@ export class Player {
 
   /** True while any adapter-transit door phase is active (departure hold or
    *  arrival walk-in) — all input and click navigation is swallowed then. */
+  /** 🏊/🌉 Short scripted pool moves (dive arc, climb-out, bridge walk) —
+   *  clicks and WASD are swallowed until they land (<~1.5 s). */
+  private _inScriptedPoolMove(): boolean {
+    return (
+      this.sitPhase === "DIVE" ||
+      this.sitPhase === "CLIMB_OUT" ||
+      this.sitPhase === "BRIDGE_IN" ||
+      this.sitPhase === "BRIDGE_OUT"
+    );
+  }
+
   private _inAdapterTransit(): boolean {
     return (
-      this.doorPhase === 'ADAPTER_OUT' ||
-      this.doorPhase === 'ADAPTER_HOLD' ||
-      this.doorPhase === 'ARRIVE_OPEN' ||
-      this.doorPhase === 'ARRIVE'
+      this.doorPhase === "ADAPTER_OUT" ||
+      this.doorPhase === "ADAPTER_HOLD" ||
+      this.doorPhase === "ARRIVE_OPEN" ||
+      this.doorPhase === "ARRIVE"
     );
   }
 
@@ -1796,7 +2262,9 @@ export class Player {
    * player approaches / crosses it).
    */
   public getActiveDoorId(): DoorId | null {
-    return this.doorPhase !== 'NONE' && this.doorTarget ? this.doorTarget.id : null;
+    return this.doorPhase !== "NONE" && this.doorTarget
+      ? this.doorTarget.id
+      : null;
   }
 
   /**
@@ -1808,7 +2276,11 @@ export class Player {
    * door, and hand back MANUAL control. Deferred actions are dropped: a
    * transit is a hard scene change, nothing queued before it survives.
    */
-  enterFromDoor(door: DoorTarget, hooks: DoorSequenceHooks, spawnAtThrough = true): void {
+  enterFromDoor(
+    door: DoorTarget,
+    hooks: DoorSequenceHooks,
+    spawnAtThrough = true,
+  ): void {
     this.doorSeq++; // invalidate any in-flight requestOpen completion
     this._cancelSit();
     this._cancelDeviceApproach();
@@ -1826,15 +2298,15 @@ export class Player {
       this.mesh.position.z = door.through.z;
     }
     this.logicalAngle = snapTo8Ways(door.faceAngle + Math.PI); // face inward
-    this.character.setState('idle', this.logicalAngle);
+    this.character.setState("idle", this.logicalAngle);
     this.doorTimer = 0;
-    this.doorPhase = 'ARRIVE_OPEN';
+    this.doorPhase = "ARRIVE_OPEN";
 
     const seq = this.doorSeq;
     hooks.requestOpen(() => {
       // Ignore stale completions from a cancelled/replaced sequence.
-      if (seq !== this.doorSeq || this.doorPhase !== 'ARRIVE_OPEN') return;
-      this.doorPhase = 'ARRIVE';
+      if (seq !== this.doorSeq || this.doorPhase !== "ARRIVE_OPEN") return;
+      this.doorPhase = "ARRIVE";
     });
   }
 
@@ -1862,14 +2334,16 @@ export class Player {
     this.pendingDevice = null;
     this._clearPath();
     // Sit teardown: _cancelSit only covers the approach phases — drop
-    // SIT_DOWN / SEATED / STAND_UP too (idle pose restored below).
-    this.sitPhase = 'NONE';
+    // SIT_DOWN / SEATED / STAND_UP / 🌉 bridge walks too (idle pose restored
+    // below).
+    this.sitPhase = "NONE";
     this.sitTarget = null;
+    this.sitSlideFrom = null;
     this.sitAnim = 0;
     // Door/adapter teardown: close whatever leaf a mid-walk leg left open
     // (closeDoor is idempotent), then drop the leg entirely.
-    if (this.doorPhase !== 'NONE') this.doorHooks?.requestClose();
-    this.doorPhase = 'NONE';
+    if (this.doorPhase !== "NONE") this.doorHooks?.requestClose();
+    this.doorPhase = "NONE";
     this.doorTarget = null;
     this.doorHooks = null;
     this.adapterOutTarget = null;
@@ -1879,8 +2353,8 @@ export class Player {
     this.mesh.position.z = z;
     this.mesh.position.y = 0; // 🛏️ a beam mid-bunk lands back on the floor
     this.logicalAngle = 0; // default spawn facing (constructor pose)
-    this.character.setState('idle', this.logicalAngle);
-    this.navMode = 'MANUAL';
+    this.character.setState("idle", this.logicalAngle);
+    this.navMode = "MANUAL";
   }
 
   // ── 🧬 Clone-vat spawn choreography ─────────────────────────────────────────
@@ -1892,15 +2366,18 @@ export class Player {
    * completes. World sequences the vat animation and calls walkOutOfVat when
    * the doorway is clear.
    */
-  public beginVatSpawn(inside: { x: number; z: number }, faceAngle: number): void {
+  public beginVatSpawn(
+    inside: { x: number; z: number },
+    faceAngle: number,
+  ): void {
     this.beamTo(inside.x, inside.z);
-    this.vatPhase = 'HOLD';
+    this.vatPhase = "HOLD";
     this.vatExit = null;
     this.vatDone = null;
     this.vatHoldTimer = 0;
     this.vatFacing = faceAngle;
     this.logicalAngle = faceAngle;
-    this.character.setState('idle', faceAngle);
+    this.character.setState("idle", faceAngle);
   }
 
   /**
@@ -1908,16 +2385,19 @@ export class Player {
    * the vat's own footprint is an obstacle, exactly like the seat slides).
    * onDone fires once on arrival; control returns to MANUAL.
    */
-  public walkOutOfVat(exit: { x: number; z: number }, onDone?: () => void): void {
-    if (this.vatPhase === 'NONE') return; // aborted meanwhile — stay released
-    this.vatPhase = 'WALK_OUT';
+  public walkOutOfVat(
+    exit: { x: number; z: number },
+    onDone?: () => void,
+  ): void {
+    if (this.vatPhase === "NONE") return; // aborted meanwhile — stay released
+    this.vatPhase = "WALK_OUT";
     this.vatExit = exit;
     this.vatDone = onDone ?? null;
   }
 
   /** True while the spawn choreography owns the avatar (HOLD or WALK_OUT). */
   public isVatSpawning(): boolean {
-    return this.vatPhase !== 'NONE';
+    return this.vatPhase !== "NONE";
   }
 
   /**
@@ -1926,16 +2406,16 @@ export class Player {
    * over, nothing should resume.
    */
   public abortVatSpawn(): void {
-    this.vatPhase = 'NONE';
+    this.vatPhase = "NONE";
     this.vatExit = null;
     this.vatDone = null;
-    this.navMode = 'MANUAL';
+    this.navMode = "MANUAL";
   }
 
   private _updateVatPhase(deltaTime: number): void {
     const pos = this.mesh.position;
-    if (this.vatPhase === 'HOLD') {
-      this.character.setState('idle', this.vatFacing);
+    if (this.vatPhase === "HOLD") {
+      this.character.setState("idle", this.vatFacing);
       this.vatHoldTimer += deltaTime;
       if (this.vatHoldTimer >= this.VAT_HOLD_TIMEOUT) {
         // Watchdog: the vat never opened (handle lost mid-cycle?) — release
@@ -1946,7 +2426,10 @@ export class Player {
     }
     // WALK_OUT — straight constant-speed exit, no collision, no pathfinding.
     const exit = this.vatExit;
-    if (!exit) { this.abortVatSpawn(); return; }
+    if (!exit) {
+      this.abortVatSpawn();
+      return;
+    }
     const dx = exit.x - pos.x;
     const dz = exit.z - pos.z;
     const dist = Math.hypot(dx, dz);
@@ -1955,7 +2438,7 @@ export class Player {
       pos.x = exit.x;
       pos.z = exit.z;
       this.logicalAngle = this.vatFacing;
-      this.character.setState('idle', this.logicalAngle);
+      this.character.setState("idle", this.logicalAngle);
       const done = this.vatDone;
       this.abortVatSpawn(); // clears state, MANUAL
       done?.();
@@ -1964,7 +2447,7 @@ export class Player {
     this.logicalAngle = snapTo8Ways(Math.atan2(dx / dist, dz / dist));
     pos.x += (dx / dist) * step;
     pos.z += (dz / dist) * step;
-    this.character.setState('walk', this.logicalAngle);
+    this.character.setState("walk", this.logicalAngle);
   }
 
   // ── Device-focus sequence (#33 D0) ──────────────────────────────────────────
@@ -1977,11 +2460,11 @@ export class Player {
    */
   private _cancelDeviceApproach(): void {
     if (
-      this.devicePhase === 'APPROACH' ||
-      this.devicePhase === 'FINE' ||
-      this.devicePhase === 'TURN'
+      this.devicePhase === "APPROACH" ||
+      this.devicePhase === "FINE" ||
+      this.devicePhase === "TURN"
     ) {
-      this.devicePhase = 'NONE';
+      this.devicePhase = "NONE";
       this.deviceTarget = null;
       this.deviceHooks = null;
       this._removeReticle();
@@ -1994,7 +2477,7 @@ export class Player {
     const hooks = this.deviceHooks;
     if (!device || !hooks) {
       // Defensive: should be unreachable (state is only cleared with phase).
-      this.devicePhase = 'NONE';
+      this.devicePhase = "NONE";
       this.deviceTarget = null;
       this.deviceHooks = null;
       return;
@@ -2004,7 +2487,7 @@ export class Player {
 
     switch (this.devicePhase) {
       // ── Straight-step onto the exact front point (collision ON) ───────────
-      case 'FINE': {
+      case "FINE": {
         const dx = device.front.x - pos.x;
         const dz = device.front.z - pos.z;
         const dist = Math.sqrt(dx * dx + dz * dz);
@@ -2014,9 +2497,9 @@ export class Player {
           pos.z = device.front.z;
           // Turn TOWARD the device (opposite of seats' back-to-chair rule).
           this.logicalAngle = device.faceAngle;
-          this.character.setState('idle', this.logicalAngle);
+          this.character.setState("idle", this.logicalAngle);
           this.deviceTimer = 0;
-          this.devicePhase = 'TURN';
+          this.devicePhase = "TURN";
           return;
         }
 
@@ -2027,26 +2510,26 @@ export class Player {
         const r = resolveObstacles(pos.x + nx * step, pos.z + nz * step);
         pos.x = r.x;
         pos.z = r.z;
-        this.character.setState('walk', this.logicalAngle);
+        this.character.setState("walk", this.logicalAngle);
         return;
       }
 
       // ── Brief pause while the facing snaps toward the device ──────────────
-      case 'TURN': {
-        this.character.setState('idle', device.faceAngle);
+      case "TURN": {
+        this.character.setState("idle", device.faceAngle);
         this.deviceTimer += deltaTime;
         if (this.deviceTimer >= this.TURN_TIME) {
           // ENGAGED before onArrived: the one-way TURN→ENGAGED transition is
           // what makes the arrival callback fire exactly once.
-          this.devicePhase = 'ENGAGED';
+          this.devicePhase = "ENGAGED";
           hooks.onArrived();
         }
         return;
       }
 
       // ── Idle at the device until the controller releases us ───────────────
-      case 'ENGAGED': {
-        this.character.setState('idle', device.faceAngle);
+      case "ENGAGED": {
+        this.character.setState("idle", device.faceAngle);
         return;
       }
     }

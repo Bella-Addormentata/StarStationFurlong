@@ -119,17 +119,6 @@ export class DoorDockingPortSystem {
   private doorFadeOpacity: Map<DoorId, number> = new Map();
   /** Resting opacity of a camera-facing door in the isometric view. */
   private static readonly FACING_FADE_OPACITY = 0.35;
-  /** Outward wall normals (XZ) — dot against the camera azimuth direction. */
-  private static readonly DOOR_NORMALS: Record<
-    DoorId,
-    { x: number; z: number }
-  > = {
-    north: { x: 0, z: -1 },
-    south: { x: 0, z: 1 },
-    east: { x: 1, z: 0 },
-    west: { x: -1, z: 0 },
-  };
-
   // Handlers
   private onConnectionRequestCallback:
     | ((doorId: string, address: string) => void)
@@ -210,21 +199,10 @@ export class DoorDockingPortSystem {
   private chainBoxesFor(doorId: "north" | "south" | "east" | "west"): Box[] {
     const segs = this.doorState.get(doorId)?.segments ?? [];
     if (segs.length === 0) return [];
-    const FACE: Record<string, { x: number; z: number }> = {
-      north: { x: 0, z: -6 },
-      south: { x: 0, z: 6 },
-      east: { x: 6, z: 0 },
-      west: { x: -6, z: 0 },
-    };
-    const YAW: Record<string, number> = {
-      south: 0,
-      east: Math.PI / 2,
-      north: Math.PI,
-      west: -Math.PI / 2,
-    };
     const PAD = 0.85;
-    const face = FACE[doorId];
-    const yaw = YAW[doorId];
+    const pose = physicalDoorPose(doorId);
+    const face = { x: pose.x, z: pose.z };
+    const yaw = pose.outwardYaw;
     const c = Math.cos(yaw),
       s = Math.sin(yaw);
     const toWorld = (lx: number, lz: number) => ({
@@ -1845,7 +1823,8 @@ export class DoorDockingPortSystem {
     const camZ = (c - s) * Math.SQRT1_2;
 
     for (const [doorId, mats] of this.doorFadeMats) {
-      const n = DoorDockingPortSystem.DOOR_NORMALS[doorId];
+      const yaw = physicalDoorPose(doorId).outwardYaw;
+      const n = { x: Math.sin(yaw), z: Math.cos(yaw) };
       // 45° detents yield dots of 0 / ±0.707 / ±1 — 0.3 splits camera-facing
       // walls (0.707, 1) from side-on and far walls (0, negatives).
       const facing = n.x * camX + n.z * camZ > 0.3;

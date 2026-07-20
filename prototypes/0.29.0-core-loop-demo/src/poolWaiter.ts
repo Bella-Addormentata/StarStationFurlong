@@ -52,6 +52,26 @@ export const LOBBY_PATROL: Array<[number, number]> = [
   [-2.4, 4.3],
 ];
 
+/**
+ * 🏝️ POOL-ROOM patrol route (world coords, ping-pong). Hand-authored on the
+ * open deck: south promenade in front of the loungers → east lane INSIDE the
+ * parasol café sets (poles at x 4.6) → north deck, passing in FRONT of the
+ * dive tower (base at 0, -4.35). The west edge is the infinity drop — no
+ * corridor there.
+ */
+export const POOL_PATROL: Array<[number, number]> = [
+  [-4.2, 3.9],
+  [1.2, 4.05],
+  [3.7, 3.8],
+  [3.95, 2.6],
+  [3.95, -2.6],
+  [3.3, -3.95],
+  [1.2, -3.5],
+  [-1.2, -3.5],
+  [-3.2, -3.9],
+  [-4.6, -3.9],
+];
+
 /** Cocktail colours (glass body / garnish) — matches the reference tray. */
 const DRINKS: Array<{ body: number; garnish: number }> = [
   { body: 0xd94a4a, garnish: 0x74c04e }, // strawberry red / lime

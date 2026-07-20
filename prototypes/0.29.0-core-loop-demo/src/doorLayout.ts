@@ -1,5 +1,9 @@
 export type PhysicalDoorId = "north" | "south" | "east" | "west";
-export type DoorLayoutKind = "legacy" | "casino-pairs";
+/** "casino-pairs" and "pool-pairs" are ALIASES of the same paired
+ *  arrangement (their pose tables were merged — they matched exactly):
+ *  logical SOUTH on the north wall, EAST on the west wall. Both names are
+ *  kept so each room's intent stays readable at the call site. */
+export type DoorLayoutKind = "legacy" | "casino-pairs" | "pool-pairs";
 
 export interface PhysicalDoorPose {
   wall: "north" | "south" | "east" | "west";
@@ -61,7 +65,8 @@ const LEGACY: Record<PhysicalDoorId, PhysicalDoorPose> = {
 };
 
 // Keep the camera-near south/east edges clear. Existing IDs remain stable for
-// room-doc pairings; only their physical slots change inside the casino.
+// room-doc pairings; only their physical slots change. Shared by the
+// "casino-pairs" AND "pool-pairs" layout kinds.
 const CASINO_PAIRS: Record<PhysicalDoorId, PhysicalDoorPose> = {
   north: {
     wall: "north",
@@ -123,7 +128,7 @@ export function physicalDoorPose(
   id: PhysicalDoorId,
   lateralDelta = 0,
 ): PhysicalDoorPose {
-  const source = activeLayout === "casino-pairs" ? CASINO_PAIRS : LEGACY;
+  const source = activeLayout === "legacy" ? LEGACY : CASINO_PAIRS;
   const base = source[id];
   const dx = base.tangent === "x" ? lateralDelta : 0;
   const dz = base.tangent === "z" ? lateralDelta : 0;

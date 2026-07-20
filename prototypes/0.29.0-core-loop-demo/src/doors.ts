@@ -70,11 +70,8 @@ export function findDoor(id: string): DoorTarget | null {
 }
 
 // ── 🧱 #66 S1: door-slide — walk targets follow the placement ────────────────
-// The DOORS values above are the LEGACY BASE (captured below before any
-// mutation); a slide applies a lateral delta along the door's wall to
-// front/through. Delta 0 ⇒ bit-identical legacy targets. `enabled` is
-// deliberately untouched — the fireplace blocking rule owns it at runtime.
-
+// The active room layout owns each physical wall pose; floor-plan deltas move
+// that pose along its wall. `enabled` remains owned by room behavior.
 /** Re-derive every door's walk points from its slide delta (0 = legacy). */
 export function applyDoorSlideDeltas(deltas: Record<DoorId, number>): void {
   for (const door of DOORS) {
