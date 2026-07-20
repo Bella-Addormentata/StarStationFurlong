@@ -1250,7 +1250,11 @@ export class World {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
     this.isOutdoorRoom = outdoor;
-    setActiveDoorLayout(casino ? "casino-pairs" : "legacy");
+    // 🚪 Camera-near south/east edges stay clear in the LOBBY too (owner
+    // request): every interior room runs the paired north/west door layout;
+    // only the outdoor pool room keeps its legacy four-wall doors (its west
+    // door intentionally drops arrivals into the water).
+    setActiveDoorLayout(outdoor ? "legacy" : "casino-pairs");
     const doorDeltas = readDoorDeltas();
     applyDoorSlideDeltas(doorDeltas);
     setDoorSlideDeltas(doorDeltas);
@@ -1261,9 +1265,21 @@ export class World {
     this.dockingSystem?.refreshDoorInteractivity();
 
     // 🏊 The pool sign points the way FROM the lobby — hidden inside the pool
-    // room itself (that same door leads back home there).
+    // room itself (that same door leads back home there). It hangs over the
+    // SOUTH door's PHYSICAL slot, which the paired layout moves to the north
+    // wall — so place it from the live pose, not a hard-coded south spot.
     this.ensurePoolSign();
-    if (this.poolSign) this.poolSign.visible = !outdoor && !casino;
+    if (this.poolSign) {
+      const pose = physicalDoorPose("south");
+      const inset = 5.55 / 6; // sign sits just inside the wall line
+      this.poolSign.position.set(
+        pose.tangent === "x" ? pose.x : pose.x * inset,
+        3.4,
+        pose.tangent === "x" ? pose.z * inset : pose.z,
+      );
+      this.poolSign.rotation.y = pose.frameYaw + Math.PI;
+      this.poolSign.visible = !outdoor && !casino;
+    }
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casino;
 
@@ -1525,27 +1541,36 @@ export class World {
   }
 
   public updateNorthDoorForFireplace(): void {
-    const north = findDoor("north");
-    if (!north) return;
-    // Approach zone in front of the north wall opening (opening ~1.4 wide at
-    // z=-6; the zone reaches to the door's `front` stand-point at z=-4.5).
-    // 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid position
-    // (front.x carries the slide delta), the plan §6.2 generalization seed.
-    const cx = north.front.x;
-    const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
-    const blocked = FURNITURE.some((item) => {
-      if (item.kind !== "fireplace-wall") return false;
-      const fp = FURNITURE_DEFS[item.kind].footprint;
-      if (!fp) return false; // footprint-less def — nothing to block with
-      const w = item.rot % 2 === 0 ? fp.w : fp.d;
-      const d = item.rot % 2 === 0 ? fp.d : fp.w;
-      const x0 = item.pos.x - w / 2,
-        x1 = item.pos.x + w / 2;
-      const z0 = item.pos.z - d / 2,
-        z1 = item.pos.z + d / 2;
-      return x0 < zone.x1 && x1 > zone.x0 && z0 < zone.z1 && z1 > zone.z0;
-    });
-    north.enabled = northDoorUnlocked() || !blocked;
+    // Every door whose PHYSICAL slot sits on the north wall is gated by the
+    // hearth (the paired layout moves the logical SOUTH door up there too):
+    // move the fireplace aside and the covered door opens; move it back and
+    // it disables again. The DEV NORTH DOOR toggle still force-enables the
+    // north door regardless (walkthrough tool).
+    for (const id of ["north", "south"] as const) {
+      if (physicalDoorPose(id).wall !== "north") continue;
+      const door = findDoor(id);
+      if (!door) continue;
+      // Approach zone in front of the north wall opening (opening ~1.4 wide
+      // at z=-6; the zone reaches to the door's `front` stand-point at
+      // z=-4.5). 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid
+      // position (front.x carries the slide delta).
+      const cx = door.front.x;
+      const zone = { x0: cx - 1.4, x1: cx + 1.4, z0: -6.2, z1: -4.4 };
+      const blocked = FURNITURE.some((item) => {
+        if (item.kind !== "fireplace-wall") return false;
+        const fp = FURNITURE_DEFS[item.kind].footprint;
+        if (!fp) return false; // footprint-less def — nothing to block with
+        const w = item.rot % 2 === 0 ? fp.w : fp.d;
+        const d = item.rot % 2 === 0 ? fp.d : fp.w;
+        const x0 = item.pos.x - w / 2,
+          x1 = item.pos.x + w / 2;
+        const z0 = item.pos.z - d / 2,
+          z1 = item.pos.z + d / 2;
+        return x0 < zone.x1 && x1 > zone.x0 && z0 < zone.z1 && z1 > zone.z0;
+      });
+      const unlocked = id === "north" && northDoorUnlocked();
+      door.enabled = unlocked || !blocked;
+    }
   }
 
   public reconcileFurniture(records: Map<string, FurnitureRecord>): void {
