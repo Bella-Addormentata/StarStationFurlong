@@ -78,6 +78,7 @@ export type FurnitureKind =
   | "casino-booth"
   | "casino-gold-wall"
   | "casino-orb-lamp"
+  | "chandelier"
   | "lazy-pool"
   | "hot-tub"
   | "classic-pool"
@@ -925,6 +926,56 @@ const buildCasinoOrbLamp = ({ m, place, addLight }: BuildCtx) => {
   );
   place(new THREE.TorusGeometry(0.38, 0.035, 8, 24), gold, 0, 1.28, 0);
   addLight(new THREE.PointLight(0xffc65a, 0, 6), 0, 1.35, 0, 1.8);
+};
+
+// 🕯️ Ceiling chandelier — a HANGING light fixture. Footprint null (you walk
+// under it), and its meshes live HIGH in the local frame (y ≈ 2.6–4.0) so the
+// item's floor x,z drops it above that spot and it dangles from the ~4 m
+// ceiling. It carries the room's PRACTICAL light — two warm point lights that
+// ride the morph fade-in like every furniture light — turning "room lighting"
+// into a placeable, movable object. (The sky/fog backdrop stays a scene-level
+// concern; a fixture lights the room, it doesn't repaint the horizon.) The
+// candle-bulbs GLOW via emissive material rather than being real lights, so a
+// chandelier costs the renderer only 2 lights no matter how ornate it looks.
+const buildChandelier = ({ m, place, addLight }: BuildCtx) => {
+  const gold = m(0xf2c45d, 0.22, 0.85, 0x6a3d05, 0.22);
+  const wax = m(0xfff2dc, 0.6, 0.02);
+  const flame = m(0xffe6b0, 0.1, 0.0, 0xffbe55, 1.0);
+  const crystal = m(0xdfeeff, 0.05, 0.12, 0x9cc4ff, 0.35);
+
+  // Ceiling canopy + slim suspension rod down to the fixture body.
+  place(new THREE.CylinderGeometry(0.2, 0.24, 0.09, 16), gold, 0, 3.95, 0);
+  place(new THREE.CylinderGeometry(0.035, 0.035, 0.86, 8), gold, 0, 3.5, 0);
+
+  // Two gold tier rings + a central column and finial.
+  place(new THREE.TorusGeometry(0.58, 0.045, 10, 32), gold, 0, 3.05, 0, Math.PI / 2);
+  place(new THREE.TorusGeometry(0.36, 0.04, 10, 28), gold, 0, 2.82, 0, Math.PI / 2);
+  place(new THREE.CylinderGeometry(0.06, 0.09, 0.42, 12), gold, 0, 2.86, 0);
+  place(new THREE.SphereGeometry(0.09, 12, 12), gold, 0, 2.66, 0);
+
+  // Candle-bulbs around each ring (wax cup + emissive flame — no real light).
+  const ring = (n: number, radius: number, y: number) => {
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const x = Math.cos(a) * radius;
+      const z = Math.sin(a) * radius;
+      place(new THREE.CylinderGeometry(0.035, 0.045, 0.16, 8), wax, x, y + 0.08, z);
+      place(new THREE.SphereGeometry(0.05, 8, 8), flame, x, y + 0.2, z);
+    }
+  };
+  ring(8, 0.58, 3.05);
+  ring(5, 0.36, 2.82);
+
+  // Crystal drops dangling below the outer ring (glow faintly, not lights).
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2 + Math.PI / 8;
+    place(new THREE.OctahedronGeometry(0.06, 0), crystal, Math.cos(a) * 0.5, 2.72, Math.sin(a) * 0.5);
+  }
+
+  // The actual room lighting: a warm downlight that reaches the walls, plus a
+  // soft up-glow so the ceiling around the canopy reads as lit.
+  addLight(new THREE.PointLight(0xffd39a, 0, 16), 0, 2.7, 0, 3.4);
+  addLight(new THREE.PointLight(0xffb968, 0, 6), 0, 3.6, 0, 0.9);
 };
 
 // Tall cherry blossom tree (no collision — footprint: null, documented drift).
@@ -2427,6 +2478,11 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "casino-orb-lamp": {
     kind: "casino-orb-lamp",
     build: buildCasinoOrbLamp,
+    footprint: null,
+  },
+  "chandelier": {
+    kind: "chandelier",
+    build: buildChandelier,
     footprint: null,
   },
   "rug-back": { kind: "rug-back", build: buildRugBack, footprint: null },
