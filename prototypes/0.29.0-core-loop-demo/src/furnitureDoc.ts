@@ -163,3 +163,29 @@ export function seedFurnitureDefaults(): void {
     }
   });
 }
+
+/** Pristine copy of the default layout, captured at module load — the live
+ *  FURNITURE array is reconciled to doc state afterwards, so it can't serve
+ *  as the reference once a room is joined. */
+const DEFAULT_LAYOUT: FurnitureItem[] = FURNITURE.map((item) => ({
+  ...item,
+  pos: { ...item.pos },
+}));
+
+/**
+ * 🛋️ One-time floor-plan migration (owner request: nothing parked in front
+ * of the paired doors): snap every DEFAULT-id item still present in the doc
+ * back to the current default arrangement. Caller gates it with a roomInfo
+ * marker so it runs ONCE per room; user-spawned items (unique ids) and
+ * deliberately deleted defaults are untouched.
+ */
+export function migrateDefaultLayout(): void {
+  if (!docAlive()) return;
+  boundDoc!.transact(() => {
+    for (const item of DEFAULT_LAYOUT) {
+      if (furnitureMap!.has(item.id)) {
+        furnitureMap!.set(item.id, toRecord(item));
+      }
+    }
+  });
+}

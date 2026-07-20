@@ -48,8 +48,8 @@ export const LOBBY_PATROL: Array<[number, number]> = [
   [-2.6, -2.8],
   [2.6, -2.8],
   [2.6, 2.3],
-  [2.2, 4.6],
-  [-2.6, 4.6],
+  [2.2, 4.3], // south promenade — clear of the relocated armchairs (z 5.15)
+  [-2.4, 4.3],
 ];
 
 /** Cocktail colours (glass body / garnish) — matches the reference tray. */

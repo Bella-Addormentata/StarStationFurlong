@@ -49,6 +49,7 @@ import { chipDotsHtml } from "./chipDisplay";
 import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
+  migrateDefaultLayout,
   furnitureDocSize,
   subscribeFurniture,
   writeFurnitureItem,
@@ -1219,6 +1220,16 @@ async function joinRoomAtEpoch(
       // Purge the DEFAULT id from already-seeded docs — DEV-spawned hearths
       // use unique ids and are untouched (id-only, harmless when absent).
       deleteFurnitureItem("fireplace-wall");
+      // ♟️ Retired default: the checker table left the lobby too (owner
+      // request) — the storage trunk takes its spot.
+      deleteFurnitureItem("game-table");
+      // 🛋️ One-time migration to the door-clear floor plan: reposition
+      // DEFAULT-id furniture in already-seeded lobbies (marker-gated so a
+      // player's later edits persist).
+      if (!roomMap.get("lobbyDoorClearV2")) {
+        migrateDefaultLayout();
+        roomMap.set("lobbyDoorClearV2", true);
+      }
       // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
       // claim (overwrites any stale cert hash from a previous session).
       if (activeBootstrap) {
