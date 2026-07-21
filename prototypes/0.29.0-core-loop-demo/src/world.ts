@@ -145,6 +145,10 @@ interface RemoteAvatar {
   diveStartY: number;
 }
 
+/** 🤖 #77C: robot-map key for the single theme robot a dockless authored room
+ *  still shows (rooms WITH docks get one robot per dock instead). */
+const AMBIENT_ROBOT_KEY = "__ambient-robot";
+
 export class World {
   private scene: THREE.Scene;
   private player: Player;
@@ -156,14 +160,19 @@ export class World {
   private sideWalls: THREE.Mesh[] = [];
   /** 🚪 Glassy north wall backing the paired doors (no coverage rule). */
   private northWall: THREE.Mesh | null = null;
-  /** 🤖 Drink-service waiter bot — roams the LOBBY (not pool/casino rooms). */
-  private poolWaiter: PoolWaiter | null = null;
-  /** Route the live waiter was built with — a change recreates the bot. */
-  private poolWaiterPatrol: Array<[number, number]> | null = null;
+  /** 🤖 #77C: service/croupier robots, keyed by the CHARGING-DOCK item id they
+   *  belong to (one robot per placed dock), or the sentinel `AMBIENT_ROBOT_KEY`
+   *  for the single theme robot a dockless authored room still shows. */
+  private robots = new Map<string, PoolWaiter>();
+  /** Route the live robots were built with — a change rebuilds them all. */
+  private robotsPatrol: Array<[number, number]> | null = null;
   /** 🎰🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
   private croupierNarrated = new Map<string, string>();
+  /** 🤖 #77C: which robot (dock key) is the current croupier — sticky so a
+   *  second robot doesn't dance toward the wheel before one "wins" nearest. */
+  private croupierRobotKey: string | null = null;
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -1506,29 +1515,9 @@ export class World {
       : casinoTheme
         ? CASINO_PATROL
         : LOBBY_PATROL;
-    if (this.poolWaiter && this.poolWaiterPatrol !== waiterPatrol) {
-      this.poolWaiter.dispose();
-      this.poolWaiter = null;
-    }
-    if (waiterPatrol && !this.poolWaiter) {
-      this.poolWaiter = new PoolWaiter(this.scene, waiterPatrol);
-    }
-    this.poolWaiterPatrol = waiterPatrol;
-    // 🔌 #77 Phase A: hand the waiter its charging dock (if the room has one),
-    // so it returns there to recharge when idle. Re-read each apply so a moved
-    // or removed dock is reflected; the bot faces the room centre while docked.
-    if (this.poolWaiter) {
-      const dock = FURNITURE.find((i) => i.kind === "charging-dock");
-      this.poolWaiter.setDock(
-        dock
-          ? {
-              x: dock.pos.x,
-              z: dock.pos.z,
-              faceAngle: Math.atan2(-dock.pos.x, -dock.pos.z),
-            }
-          : null,
-      );
-    }
+    // 🤖 #77C: reconcile the robot SET (one per placed charging-dock, else a
+    // single ambient theme robot) against the current furniture.
+    this.reconcileRobots(waiterPatrol);
 
     const doorDeltas = readDoorDeltas();
     applyDoorSlideDeltas(doorDeltas);
@@ -2038,6 +2027,9 @@ export class World {
     rebuildSeats();
     rebuildStands();
     rebuildDevices();
+    // 🤖 #77C: a placed/removed/moved charging-dock spawns/disposes/repositions
+    // its robot (uses the route the room was last set up with).
+    this.reconcileRobots(this.robotsPatrol);
     // Replan per changed item (review fix): onObstaclesChanged only cancels an
     // in-flight APPROACH/FINE/TURN toward the item when given that item's id —
     // a no-arg call left a joiner walking to (and sitting/focusing onto) where
@@ -2789,11 +2781,9 @@ export class World {
     // 🧬 Advance clone-vat drain / door-spin cycles (same idiom)
     for (const vat of this.cloneVats.values()) vat.update(deltaTime);
 
-    // 🤖 Lobby waiter bot: patrols the aisles and serves the local fox.
-    this.poolWaiter?.update(
-      deltaTime,
-      this.isPlayerActive() ? this.player : null,
-    );
+    // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
+    const activePlayer = this.isPlayerActive() ? this.player : null;
+    for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
 
     // 🎰🤖 #77B: post the robot at the roulette wheel-head, narrate the calls
     // (all clients), and drive the betting timer (the elected operator only).
@@ -3813,6 +3803,64 @@ export class World {
    *    the betting timer for each table and refresh the liveness heartbeat.
    * The robot's walk/pose is local ambience; the game writes are single-writer.
    */
+  /**
+   * 🤖 #77C: bring the live robot SET in line with the room. ONE robot per
+   * placed charging-dock (spawned at + returning to ITS dock); if the room has
+   * NO dock but its theme still wants an ambient waiter, keep a single dockless
+   * patroller (the pre-#77C behaviour). A patrol-route change (a transit) or a
+   * roomless route rebuilds all robots; otherwise it just spawns/disposes the
+   * delta, so it is cheap to call on every furniture change (add/remove a dock).
+   */
+  private reconcileRobots(waiterPatrol: Array<[number, number]> | null): void {
+    if (this.robotsPatrol !== waiterPatrol) {
+      for (const bot of this.robots.values()) bot.dispose();
+      this.robots.clear();
+      this.robotsPatrol = waiterPatrol;
+    }
+    if (!waiterPatrol) {
+      for (const bot of this.robots.values()) bot.dispose();
+      this.robots.clear();
+      return;
+    }
+    const docks = FURNITURE.filter((i) => i.kind === "charging-dock");
+    const wanted =
+      docks.length > 0 ? docks.map((d) => d.id) : [AMBIENT_ROBOT_KEY];
+    // Dispose robots whose dock is gone.
+    for (const [key, bot] of [...this.robots]) {
+      if (!wanted.includes(key)) {
+        bot.dispose();
+        this.robots.delete(key);
+      }
+    }
+    // Spawn missing robots (a dock robot starts AT its dock).
+    for (const key of wanted) {
+      if (this.robots.has(key)) continue;
+      const dock = docks.find((d) => d.id === key);
+      this.robots.set(
+        key,
+        new PoolWaiter(
+          this.scene,
+          waiterPatrol,
+          dock ? { x: dock.pos.x, z: dock.pos.z } : undefined,
+        ),
+      );
+    }
+    // (Re)point each dock robot at ITS dock (a moved/rotated dock is reflected);
+    // the ambient robot has no dock and simply patrols.
+    for (const [key, bot] of this.robots) {
+      const dock = docks.find((d) => d.id === key);
+      bot.setDock(
+        dock
+          ? {
+              x: dock.pos.x,
+              z: dock.pos.z,
+              faceAngle: Math.atan2(-dock.pos.x, -dock.pos.z),
+            }
+          : null,
+      );
+    }
+  }
+
   private updateCroupier(): void {
     const tables = FURNITURE.filter((i) => i.kind === "roulette-table");
 
@@ -3830,19 +3878,36 @@ export class World {
       }
     }
 
-    // Robot post (all clients): only when a robot croupier is actually LIVE
-    // (a fresh heartbeat) — so in manual venture/legacy rooms with no operator
-    // the waiter keeps serving/patrolling instead of standing mute at the wheel.
-    if (this.poolWaiter) {
-      const head =
-        tables.length && isCroupierLive(tables[0].id)
-          ? standsForItem(tables[0].id).find((s) => s.role === "wheelHead")
-          : undefined;
-      this.poolWaiter.setCroupierPost(
-        head
-          ? { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle }
-          : null,
-      );
+    // Robot post (all clients): assign the NEAREST robot to the live table's
+    // wheel-head and release every other robot to serve/dock. Only when a
+    // croupier is actually LIVE (a fresh heartbeat) — manual venture/legacy
+    // rooms keep the robots serving instead of standing mute at the wheel.
+    let post: { x: number; z: number; faceAngle: number } | null = null;
+    if (tables.length && isCroupierLive(tables[0].id)) {
+      const head = standsForItem(tables[0].id).find((s) => s.role === "wheelHead");
+      if (head) {
+        post = { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle };
+      }
+    }
+    if (!post) {
+      this.croupierRobotKey = null;
+    } else if (!this.croupierRobotKey || !this.robots.has(this.croupierRobotKey)) {
+      // Pick the nearest robot ONCE, then keep it (sticky) so the others head
+      // straight to their docks instead of drifting toward the wheel.
+      let bestKey: string | null = null;
+      let best = Infinity;
+      for (const [key, bot] of this.robots) {
+        const bp = bot.getPosition();
+        const d = Math.hypot(bp.x - post.x, bp.z - post.z);
+        if (d < best) {
+          best = d;
+          bestKey = key;
+        }
+      }
+      this.croupierRobotKey = bestKey;
+    }
+    for (const [key, bot] of this.robots) {
+      bot.setCroupierPost(key === this.croupierRobotKey ? post : null);
     }
 
     // Narration (all clients): edge-detect each table's synced phase beat and
