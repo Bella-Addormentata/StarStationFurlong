@@ -12,6 +12,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.17 — 2026-07-21
+
+### 🚪🔩 Split each door into port-hardware vs door-leaves (#28 decouple, slice 4b)
+
+Structural groundwork with **zero behaviour change**: every docking-port group is now split into two halves — the **port hardware** (keypad + status LED, one per berth) and the **door leaves** (frame, sliding panels, threshold, click box). This is the last piece before a door can be moved independently of its port.
+
+- Both halves sit at the group origin under the unchanged top-level group, so every child's world transform — and thus render, slide, camera-facing fade, and raycast — is **bit-identical** to before. `isLarge` stays on the top group (the slide reads it non-recursively); every other accessor is recursive and finds its target through the new sub-groups.
+- Why it matters next: in slice 5, a freely-placed door's *leaves* can slide/move while its *port hardware* stays anchored at the berth — now a one-line retarget instead of re-plumbing the whole group.
+- Verified live: all four doors render identically (frames, lit seams, keypads, glow strips, faded camera-facing doors); the LED sits in `portHardware` and the leaves in `doorLeaves`; `leftLeaf`/`ledStatus`/`keypad`/all 5 `frameGlow` strips still resolve; opening a door slides its leaves correctly; `tsc` clean; no console errors.
+- **Release line:** version bumped to 0.33.17, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.16 — 2026-07-21
 
 ### 🚪 Doors become data-driven (#28 decouple, slice 4a)
