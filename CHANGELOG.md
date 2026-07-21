@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.18 — 2026-07-21
+
+### 🚪 Build each door from a record — extraction for free doors (#28 decouple, slice 5a)
+
+A behaviour-preserving refactor that makes the door-building code able to build *any* door (not just the fixed 4), setting up the add/remove of doors in the next slice.
+
+- **`buildDoorGroup(record)`** is extracted from `buildPorts` so a single door can be built from a layout record. `buildPorts` now loops the 4 cardinal defaults and calls it — bit-identical, because the old loop variable is reconstructed so the body is unchanged.
+- **`poseForDoor(id)`** centralises a door's world pose: a cardinal door routes through the legacy path exactly (preserving the east/west quirk + pairs layout); a future free door will derive from its wall + along-wall position (stashed on the group). The two per-frame / per-reconcile pose lookups (camera-facing fade, reposition) now go through it, so they won't assume a fixed cardinal.
+- Each built door seeds its own docking state (so a future door's LED / keypad / slide work), and the id types are widened from the 4 cardinals to strings — all internal, no wire change.
+- **Model note:** this is under the confirmed "a door is the object; docking is an add-on" model — no separate movable "port". The next slice (5b) adds the actual add/remove of doors from the synced map.
+- Verified live: the app boots, all four doors render with bit-identical positions (pairs layout), the port-hardware/door-leaves split survives the extraction, every door's docking state is seeded, arrival routing + slide work, `tsc` clean, no console errors.
+- **Release line:** version bumped to 0.33.18, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.17 — 2026-07-21
 
 ### 🚪🔩 Split each door into port-hardware vs door-leaves (#28 decouple, slice 4b)
