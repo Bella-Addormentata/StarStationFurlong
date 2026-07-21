@@ -151,6 +151,31 @@ export interface SeatTemplate {
   dive?: boolean;
 }
 
+/**
+ * 🎰 A designated STANDING position at a table (#76) — authored in the item's
+ * LOCAL rot-0 frame, like SeatTemplate. Unlike a seat there is no sit slide:
+ * the avatar just walks to the point and faces the table. Multiple stands ring
+ * one table (roulette: 6, chess: 2) so several players can gather.
+ */
+export interface StandTemplate {
+  /** Stand-point offset in the item's local rot-0 frame. */
+  stand: { x: number; z: number };
+  /** World facing while standing (atan2(nx,nz): +z=0, +x=π/2, -z=π, -x=-π/2)
+   *  — points TOWARD the table. */
+  faceAngle: number;
+  /** 🎰 'wheelHead' = the spin position, reserved for the room owner or the
+   *  owner's robot (see #76 / #77). Regular stands are open to anyone. */
+  role?: "wheelHead";
+}
+
+/** A StandTemplate derived into world space (see buildStandList). */
+export interface StandSlot {
+  id: string;
+  front: { x: number; z: number };
+  faceAngle: number;
+  role?: "wheelHead";
+}
+
 /** Build-time helpers bound to the item's group (all coordinates local). */
 export interface BuildCtx {
   m: (
@@ -192,6 +217,9 @@ export interface FurnitureDef {
   /** Tile footprint (metres). null ⇒ decorative: never an obstacle. */
   footprint: { w: number; d: number } | null;
   seats?: SeatTemplate[];
+  /** 🎰 Designated standing positions ringing a table (#76) — see StandTemplate.
+   *  Present on the game tables (roulette, chess). */
+  stands?: StandTemplate[];
   /** Capability tags — #30 plan §1.2: capabilities = function-tagged furniture. */
   functions?: string[];
   /**
@@ -2505,6 +2533,25 @@ const classicHotTubSeats: SeatTemplate[] = [
     faceAngle: 0, sitY: 0.28 },
 ];
 
+// 🎰 Roulette table (2×1 footprint): 6 standing positions ringing it. The -x
+// SHORT END is the WHEEL HEAD — reserved for the owner / their croupier robot.
+// Two positions on each long (z) face + one on the +x end make up the other 5.
+// faceAngle points toward the table centre (atan2(nx,nz): +z=0,+x=π/2,-z=π,-x=-π/2).
+const rouletteStands: StandTemplate[] = [
+  { stand: { x: -1.55, z: 0.0 }, faceAngle: Math.PI / 2, role: "wheelHead" },
+  { stand: { x: 1.55, z: 0.0 }, faceAngle: -Math.PI / 2 },
+  { stand: { x: -0.6, z: -1.2 }, faceAngle: 0 },
+  { stand: { x: 0.6, z: -1.2 }, faceAngle: 0 },
+  { stand: { x: -0.6, z: 1.2 }, faceAngle: Math.PI },
+  { stand: { x: 0.6, z: 1.2 }, faceAngle: Math.PI },
+];
+
+// ♟️ Chess / game table (2×1): 2 positions facing off across the board.
+const gameTableStands: StandTemplate[] = [
+  { stand: { x: 0.0, z: -1.2 }, faceAngle: 0 },
+  { stand: { x: 0.0, z: 1.2 }, faceAngle: Math.PI },
+];
+
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "fireplace-wall": {
     kind: "fireplace-wall",
@@ -2691,6 +2738,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     build: buildGameTable,
     footprint: { w: 2, d: 1 },
     functions: ["gameTable"],
+    stands: gameTableStands,
     device: {
       kind: "gameTable",
       front: { x: 0, z: -1.0 },
@@ -2786,6 +2834,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     build: buildRouletteTable,
     footprint: { w: 2, d: 1 },
     functions: ["rouletteTable"],
+    stands: rouletteStands,
     device: {
       kind: "roulette",
       front: { x: 0, z: -1.0 },
@@ -6154,6 +6203,34 @@ export function buildDeviceList(
     });
   }
   return devices;
+}
+
+/**
+ * 🎰 Derive world-space standing positions from the furniture registry — one
+ * StandSlot per StandTemplate on each item's def, rotated + translated into the
+ * room like buildDeviceList. `front` is computeFront-snapped so it's walkable
+ * and A*-reachable; faceAngle points toward the table. id `${item.id}:s${n}`.
+ */
+export function buildStandList(
+  items: FurnitureItem[],
+  isWalkable: (x: number, z: number) => boolean,
+): StandSlot[] {
+  const stands: StandSlot[] = [];
+  for (const item of items) {
+    const tmpls = FURNITURE_DEFS[item.kind].stands;
+    if (!tmpls) continue;
+    tmpls.forEach((t, n) => {
+      const s = rotXZ(t.stand.x, t.stand.z, item.rot);
+      const preferred = { x: item.pos.x + s.x, z: item.pos.z + s.z };
+      stands.push({
+        id: `${item.id}:s${n}`,
+        front: computeFront(preferred, itemAabb(item), isWalkable),
+        faceAngle: normalizeAngle(t.faceAngle + item.rot * (Math.PI / 2)),
+        ...(t.role ? { role: t.role } : {}),
+      });
+    });
+  }
+  return stands;
 }
 
 /** Wrap an angle to (-π, π] so rotated facings stay in canonical range. */

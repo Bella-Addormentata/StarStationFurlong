@@ -17,6 +17,7 @@ import {
 } from "./poolWaiter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
+import { STANDS, rebuildStands } from "./stands";
 import { getDefaultRoomId } from "./identity";
 import {
   FURNITURE,
@@ -259,6 +260,11 @@ export class World {
    *  the station orbits, seen up through the skylights. Built once, spun slowly,
    *  shown only for the deck theme. */
   private deckPlanet: THREE.Group | null = null;
+  /** 🎰 Edit-mode-only floor rings marking table STANDING positions (#76): one
+   *  ring per STANDS slot (amber = reserved wheel-head, cyan = open), shown
+   *  ONLY while room-editing so the owner sees where the stand slots land as a
+   *  table is moved. A reused pool of rings; positioned from STANDS each frame. */
+  private standMarkers: THREE.Group | null = null;
   /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
   private poolSign: THREE.Group | null = null;
   /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
@@ -1761,6 +1767,59 @@ export class World {
   }
 
   /**
+   * 🎰 #76: while ROOM-EDITING, draw a flat ring on the floor at every table
+   * standing position (STANDS) so the owner can see where the stand slots land
+   * — and watch them move as they drag a table. Amber = the reserved wheel-head
+   * (owner / owner's robot); cyan = an open position. Hidden outside edit mode.
+   * A reused pool of rings lives in platformGroup (room space, like furniture)
+   * and is repositioned from STANDS each frame; STANDS itself is re-derived on
+   * every furniture reconcile, so a moved table drags its rings along.
+   */
+  private updateStandMarkers(): void {
+    const editing = roomEdit.isEditModeActive();
+    if (!editing) {
+      if (this.standMarkers) this.standMarkers.visible = false;
+      return;
+    }
+    if (!this.standMarkers) {
+      this.standMarkers = new THREE.Group();
+      this.standMarkers.name = "standMarkers";
+      this.platformGroup.add(this.standMarkers);
+    }
+    const group = this.standMarkers;
+    group.visible = true;
+    // Grow the ring pool to cover every stand slot.
+    while (group.children.length < STANDS.length) {
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(0.26, 0.4, 28),
+        new THREE.MeshBasicMaterial({
+          transparent: true,
+          opacity: 0.6,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
+      );
+      ring.rotation.x = -Math.PI / 2; // lie flat on the floor
+      ring.renderOrder = 3; // over the floor, under furniture picks
+      group.add(ring);
+    }
+    // Position + colour one ring per stand slot; hide any surplus.
+    group.children.forEach((child, i) => {
+      const ring = child as THREE.Mesh;
+      if (i >= STANDS.length) {
+        ring.visible = false;
+        return;
+      }
+      const slot = STANDS[i];
+      ring.visible = true;
+      ring.position.set(slot.front.x, 0.05, slot.front.z);
+      (ring.material as THREE.MeshBasicMaterial).color.setHex(
+        slot.role === "wheelHead" ? 0xffb733 : 0x35e0ff,
+      );
+    });
+  }
+
+  /**
    * 🏝️ Canvas stone-tile floor texture for the outdoor casino pool room.
    * Large square tiles in warm beige/sandstone, with grout lines and subtle
    * surface variation to distinguish from the lobby's herringbone wood.
@@ -1945,6 +2004,7 @@ export class World {
     rebuildObstacles();
     rebakeWalkableGrid();
     rebuildSeats();
+    rebuildStands();
     rebuildDevices();
     // Replan per changed item (review fix): onObstaclesChanged only cancels an
     // in-flight APPROACH/FINE/TURN toward the item when given that item's id —
@@ -2707,6 +2767,10 @@ export class World {
     // Drive room-edit mode (E2 of #25): force-exit when the view leaves the
     // plain isometric room (zoom ≠ 2 / solar map) + selection-label tracking.
     roomEdit.update();
+
+    // 🎰 Show the table standing-position rings only while room-editing, so the
+    // owner can see where the stand slots land as they move a table (#76).
+    this.updateStandMarkers();
 
     // 1 Hz idle status on wall-computer screens (M1 — the permanent home of
     // PR #36's dev-hook wiring; same live values, same cadence).
