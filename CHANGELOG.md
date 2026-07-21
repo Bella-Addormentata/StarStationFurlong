@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.7 — 2026-07-21
+
+### 🎰🤖 The owner's robot runs the roulette table (#77 Phase B)
+
+Drop a roulette table in your room and your service robot walks to the head of the wheel and **runs the game itself** — calling the bets, spinning, and paying out on a rhythm — so a table plays without anyone clicking a button.
+
+- **A self-running betting cycle.** The moment the first chip lands, an **18 s "place your bets" countdown** arms (a live timer in the panel); then **"no more bets,"** the wheel spins, winners are paid, and the next round opens. A quiet table stays quiet — the clock only arms on a real bet, so nothing spins to an empty room.
+- **The robot croupier is diegetic.** It leaves patrol/serving to stand at the reserved **wheel-head** slot (the one #76 keeps clear of players), faces the wheel, and speaks the calls — **"🎲 Place your bets!", "✋ No more bets!", "🎡 17 RED — winners paid!"** — as floating bubbles over its head, in sync for everyone in the room.
+- **Exactly one operator, by construction.** Only the room's **deed holder** drives the timer, rolls the pocket, and credits winners — so a jointly-owned venture room can never double-pay. Venture / legacy shared rooms fall back to the **manual SPIN** control (unchanged), and a solo/offline room just works. A synced heartbeat tells every client when a live robot croupier is present (hiding the manual controls) versus not (showing them).
+- **Safe teardown.** Deleting a table mid-round **refunds every outstanding stake** and clears its records — no vanished chips, no orphaned state. A stranded round (if the operator drops off mid-spin) self-heals when they return, and a returning house member can settle it manually.
+- **Built on** the shared `casino` doc + the #76 stand slots + the #77 Phase A dock robot. Adversarially reviewed (7 findings, all addressed or scoped); a known cosmetic follow-up is the robot straight-lining to the wheel on room entry (it ignores collision, like the patrol/dock bots).
+- **Release line:** version bumped to 0.33.7, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.6 — 2026-07-21
 
 ### 🎰 Walk to an open spot at a table (#76)

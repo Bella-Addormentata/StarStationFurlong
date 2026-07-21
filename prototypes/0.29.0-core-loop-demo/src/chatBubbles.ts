@@ -38,10 +38,13 @@ interface BubbleDeps {
 
 interface LiveBubble {
   el: HTMLDivElement;
-  /** 'local' or a remote avatar id. */
+  /** 'local', a remote avatar id, or a caller-supplied key for a fixed anchor. */
   anchorId: string;
   bornAt: number;
   fading: boolean;
+  /** 🤖 #77B: a FIXED world point (the robot croupier isn't an avatar, so it
+   *  can't be resolved through remotes()) — the bubble hangs over this spot. */
+  fixed?: { x: number; z: number };
 }
 
 let deps: BubbleDeps | null = null;
@@ -100,6 +103,24 @@ export function spawnChatBubble(text: string, isSelf: boolean, atX?: number, atZ
   bubbles.set(anchorId, { el, anchorId, bornAt: performance.now(), fading: false });
 }
 
+/**
+ * 🤖 #77B: pop a bubble anchored to a FIXED world point (the robot croupier at
+ * the wheel-head). Same lifetime/projection as a chat bubble, but the anchor is
+ * a stationary spot rather than an avatar — so it survives in first person and
+ * needs no lane↔player resolution. `anchorId` keys it (a newer call replaces).
+ */
+export function spawnFixedBubble(anchorId: string, text: string, x: number, z: number): void {
+  if (!deps || !container) return;
+  const clean = String(text ?? '').trim();
+  if (!clean || !Number.isFinite(x) || !Number.isFinite(z)) return;
+  removeBubble(anchorId);
+  const el = document.createElement('div');
+  el.className = 'overhead-chat-bubble';
+  el.textContent = clean.length > MAX_TEXT ? `${clean.slice(0, MAX_TEXT - 1)}…` : clean;
+  container.appendChild(el);
+  bubbles.set(anchorId, { el, anchorId, bornAt: performance.now(), fading: false, fixed: { x, z } });
+}
+
 /** Per-frame: reposition every bubble over its avatar's head; age + fade. */
 export function updateChatBubbles(): void {
   if (!deps || bubbles.size === 0) return;
@@ -117,9 +138,11 @@ export function updateChatBubbles(): void {
       b.el.style.opacity = '0';
     }
 
-    // Anchor position (avatar may have left).
+    // Anchor position (avatar may have left; a fixed anchor never moves).
     let pos: { x: number; z: number } | null = null;
-    if (anchorId === 'local') {
+    if (b.fixed) {
+      pos = b.fixed; // 🤖 #77B robot croupier — visible even in first person
+    } else if (anchorId === 'local') {
       pos = deps.localPos();
       if (zoom === 1) { b.el.style.display = 'none'; continue; } // inside own head
     } else {

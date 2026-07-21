@@ -18,6 +18,17 @@ import {
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
+import { readTableState } from "./casinoDoc";
+import {
+  beatCroupier,
+  canRunCroupier,
+  closeTable,
+  croupierBeatLine,
+  HEARTBEAT_MS,
+  isCroupierLive,
+  tickAutoCroupier,
+} from "./croupier";
+import { spawnFixedBubble } from "./chatBubbles";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
@@ -149,6 +160,10 @@ export class World {
   private poolWaiter: PoolWaiter | null = null;
   /** Route the live waiter was built with — a change recreates the bot. */
   private poolWaiterPatrol: Array<[number, number]> | null = null;
+  /** 🎰🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
+   *  the last narration beat spoken per table (edge-detect one bubble per beat). */
+  private croupierLastBeatAt = 0;
+  private croupierNarrated = new Map<string, string>();
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -2087,6 +2102,14 @@ export class World {
     // handle — update() tweens against disposed meshes and the games-map
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
+    // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
+    this.croupierNarrated.delete(itemId);
+    // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
+    // operator) and wipe its casino keys — else bettors' debited chips vanish
+    // and table:/bets: records orphan. Runs pre-splice, so the kind is still known.
+    if (FURNITURE.find((i) => i.id === itemId)?.kind === "roulette-table") {
+      closeTable(itemId);
+    }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
     if (this.cloneVats.delete(itemId) && this.player.isVatSpawning()) {
@@ -2771,6 +2794,10 @@ export class World {
       deltaTime,
       this.isPlayerActive() ? this.player : null,
     );
+
+    // 🎰🤖 #77B: post the robot at the roulette wheel-head, narrate the calls
+    // (all clients), and drive the betting timer (the elected operator only).
+    this.updateCroupier();
 
     // #51 — paired-door vestibules: spawn/dispose from pairing state, drive
     // the proximity/transit opacity, honor zoom-hide (≥3) and the morph.
@@ -3776,6 +3803,65 @@ export class World {
         Math.hypot(b.front.x - me.x, b.front.z - me.z),
     );
     return free[0];
+  }
+
+  /**
+   * 🎰🤖 #77 Phase B — the owner-robot croupier. Runs every frame:
+   *  • ALL clients: post the robot at the first roulette table's wheel-head slot
+   *    (or release it), and narrate the synced betting calls over that spot.
+   *  • The ELECTED OPERATOR only (canRunCroupier — the room's deed holder): drive
+   *    the betting timer for each table and refresh the liveness heartbeat.
+   * The robot's walk/pose is local ambience; the game writes are single-writer.
+   */
+  private updateCroupier(): void {
+    const tables = FURNITURE.filter((i) => i.kind === "roulette-table");
+
+    // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
+    // FIRST so the operator's own fresh beat marks the table live this frame.
+    // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
+    // dt would wedge an accumulator forever while tickAutoCroupier kept running).
+    if (tables.length && canRunCroupier()) {
+      const now = Date.now();
+      const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
+      if (beatNow) this.croupierLastBeatAt = now;
+      for (const t of tables) {
+        if (beatNow) beatCroupier(t.id);
+        tickAutoCroupier(t.id);
+      }
+    }
+
+    // Robot post (all clients): only when a robot croupier is actually LIVE
+    // (a fresh heartbeat) — so in manual venture/legacy rooms with no operator
+    // the waiter keeps serving/patrolling instead of standing mute at the wheel.
+    if (this.poolWaiter) {
+      const head =
+        tables.length && isCroupierLive(tables[0].id)
+          ? standsForItem(tables[0].id).find((s) => s.role === "wheelHead")
+          : undefined;
+      this.poolWaiter.setCroupierPost(
+        head
+          ? { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle }
+          : null,
+      );
+    }
+
+    // Narration (all clients): edge-detect each table's synced phase beat and
+    // pop one bubble over the wheel-head — only while a robot croupier is live.
+    for (const t of tables) {
+      if (!isCroupierLive(t.id)) {
+        this.croupierNarrated.delete(t.id);
+        continue;
+      }
+      const s = readTableState(t.id);
+      if (!s) continue;
+      const beat = croupierBeatLine(s);
+      if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;
+      this.croupierNarrated.set(t.id, beat.key);
+      const head = standsForItem(t.id).find((x) => x.role === "wheelHead");
+      if (head) {
+        spawnFixedBubble(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
+      }
+    }
   }
 
   /**

@@ -56,13 +56,16 @@ import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
   readChips, buyInChips, cashOutChips, spendChips, creditChips,
-  readCageLedger, readTableState, writeTableState,
+  readCageLedger, readTableState,
   readMyBets, writeMyBets, readAllBets, subscribeCasino,
 } from './casinoDoc';
 import {
-  WHEEL_ORDER, resolveRound, pocketColor,
+  WHEEL_ORDER, pocketColor,
 } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
+// 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
+// NEW ROUND buttons delegate to the same implementation) + operator liveness.
+import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
@@ -1886,15 +1889,6 @@ function rouletteBoardRegions(): BoardRegion[] {
   return regions;
 }
 
-/** Uniform pocket 0–36 via rejection sampling (no modulo bias). */
-function spinPocket(): number {
-  const buf = new Uint32Array(1);
-  for (;;) {
-    crypto.getRandomValues(buf);
-    if (buf[0] < 4294967289) return buf[0] % 37; // floor(2^32/37)*37
-  }
-}
-
 /**
  * The roulette table's focused UI (#69 G2): a live wheel, the classic betting
  * board (straight numbers + dozens/columns + even-money), chip denominations,
@@ -1922,13 +1916,20 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
 
   const state = (): RouletteTableState | null => readTableState(deps.itemId);
   const round = (): number => state()?.round ?? 1;
-  const phase = (): 'betting' | 'settled' => state()?.phase ?? 'betting';
+  const phase = (): 'betting' | 'closing' | 'settled' => state()?.phase ?? 'betting';
   const myBets = (): RouletteBet[] => readMyBets(deps.itemId, myId, round());
+  /** Betting is CLOSED once the phase leaves 'betting' OR the auto-croupier's
+   *  window deadline has passed (a chip must not land after "no more bets"). */
+  const bettingOpen = (): boolean => {
+    const s = state();
+    if ((s?.phase ?? 'betting') !== 'betting') return false;
+    return s?.phaseDeadline == null || Date.now() < s.phaseDeadline;
+  };
 
   // ── Bet placement (stakes move at placement time — see module doc) ─────────
 
   const placeBet = (bet: { type: RouletteBet['type']; pick?: number }): void => {
-    if (phase() !== 'betting' || animT !== null) return;
+    if (!bettingOpen() || animT !== null) return;
     if (!spendChips(myId, denom)) {
       flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
       render();
@@ -1938,7 +1939,7 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
   };
 
   const undoBet = (): void => {
-    if (phase() !== 'betting') return;
+    if (!bettingOpen()) return; // symmetric with placeBet — no take-back past the deadline
     const bets = myBets();
     const last = bets[bets.length - 1];
     if (!last) return;
@@ -1947,35 +1948,28 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
   };
 
   const clearBets = (): void => {
-    if (phase() !== 'betting') return;
+    if (!bettingOpen()) return;
     const total = myBets().reduce((sum, b) => sum + b.amount, 0);
     if (total > 0) creditChips(myId, total);
     writeMyBets(deps.itemId, myId, round(), []);
   };
 
   // ── Croupier: the settle write is the round's single source of truth ───────
+  // Manual house controls (venture / legacy rooms with no live robot croupier).
+  // They delegate to the SAME settle/open implementation the auto-croupier runs,
+  // with no phaseDeadline — the house clicks NEW ROUND rather than a timer.
 
   const spin = (): void => {
-    if (!deps.isHouse() || phase() !== 'betting') return;
-    const r = round();
-    const result = spinPocket();
-    const allBets = readAllBets(deps.itemId, r);
-    const payouts = resolveRound(allBets, result);
-    writeTableState(deps.itemId, {
-      kind: 'roulette', phase: 'settled', round: r,
-      result, resultAt: Date.now(), payouts,
-    });
-    // Winners are credited by the same croupier client, right after the
-    // settle write (the payouts record is what spectators reconcile against).
-    for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
+    // Manual settle from betting OR a stranded 'closing' (rescues a table the
+    // auto-croupier left mid-spin when its operator dropped off — the button is
+    // only shown once the heartbeat goes stale, so there is no double-settle).
+    if (!deps.isHouse() || (phase() !== 'betting' && phase() !== 'closing')) return;
+    rollAndSettle(deps.itemId, round());
   };
 
   const newRound = (): void => {
     if (!deps.isHouse() || phase() !== 'settled') return;
-    writeTableState(deps.itemId, {
-      kind: 'roulette', phase: 'betting', round: round() + 1,
-      result: null, resultAt: 0, payouts: null,
-    });
+    openBetting(deps.itemId, round() + 1);
   };
 
   // ── Wheel drawing ──────────────────────────────────────────────────────────
@@ -2110,34 +2104,60 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
 
   // ── Panel ──────────────────────────────────────────────────────────────────
 
+  /** The status line + colour for the current instant. Recomputed each frame by
+   *  update(dt) so the auto-croupier's betting countdown ticks live (the doc
+   *  only changes at phase edges). */
+  const computeStatus = (): { line: string; color: string } => {
+    const s = state();
+    const p = phase();
+    const staked = myBets().reduce((sum, b) => sum + b.amount, 0);
+    // 'No more bets' the instant betting is closed — either the synced 'closing'
+    // phase OR the local deadline already passed (before the operator's write).
+    if (animT !== null || p === 'closing'
+        || (p === 'betting' && s?.phaseDeadline != null && Date.now() >= s.phaseDeadline)) {
+      return { line: 'NO MORE BETS — THE WHEEL SPINS…', color: CH_PINK };
+    }
+    if (p === 'settled' && s?.result != null) {
+      // 🪙 Physical-chips rule: the win shows as CHIPS (the YOUR WIN tray),
+      // never as a number — the pocket label is the wheel's, not money.
+      const won = s.payouts?.[myId] ?? 0;
+      const col = pocketColor(s.result).toUpperCase();
+      const line = `● ${s.result} ${col}` + (staked > 0 || won > 0
+        ? (won > 0 ? ' — YOU WIN' : ' — NO WIN THIS TIME')
+        : '');
+      return { line, color: won > 0 ? '#00E676' : GT_GOLD_BRIGHT };
+    }
+    const chips = readChips(myId);
+    const remain = s?.phaseDeadline != null
+      ? Math.max(0, Math.ceil((s.phaseDeadline - Date.now()) / 1000))
+      : null;
+    const line = `ROUND ${round()} — PLACE YOUR BETS`
+      + (remain != null ? ` · ${remain}s` : '')
+      + (chips <= 0 && staked === 0 ? ' · VISIT THE CASHIER FOR CHIPS' : '');
+    return { line, color: GT_GOLD_BRIGHT };
+  };
+
+  /** Cheap per-frame refresh of just the status text (no full re-render). */
+  const syncStatusEl = (): void => {
+    const el = panel?.querySelector<HTMLDivElement>('#rl-status');
+    if (!el) return;
+    const { line, color } = computeStatus();
+    el.textContent = line;
+    el.style.color = color;
+  };
+
   const render = (): void => {
     if (!panel) return;
     const s = state();
     const p = phase();
     const chips = readChips(myId);
     const bets = myBets();
-    const staked = bets.reduce((sum, b) => sum + b.amount, 0);
     const house = deps.isHouse();
     const spinning = animT !== null;
-
-    let statusLine: string;
-    let statusColor = GT_GOLD_BRIGHT;
-    if (spinning) {
-      statusLine = 'NO MORE BETS — THE WHEEL SPINS…';
-      statusColor = CH_PINK;
-    } else if (p === 'settled' && s?.result !== null && s) {
-      // 🪙 Physical-chips rule: the win shows as CHIPS (the YOUR WIN tray),
-      // never as a number — the pocket label is the wheel's, not money.
-      const won = s.payouts?.[myId] ?? 0;
-      const col = pocketColor(s.result!).toUpperCase();
-      statusLine = `● ${s.result} ${col}` + (staked > 0 || won > 0
-        ? (won > 0 ? ' — YOU WIN' : ' — NO WIN THIS TIME')
-        : '');
-      statusColor = won > 0 ? '#00E676' : GT_GOLD_BRIGHT;
-    } else {
-      statusLine = `ROUND ${round()} — PLACE YOUR BETS`
-        + (chips <= 0 && staked === 0 ? ' · VISIT THE CASHIER FOR CHIPS' : '');
-    }
+    // 🤖 #77B: a live robot croupier drives the timer + hides the manual house
+    // controls; without one (venture / legacy rooms), the house buttons stand.
+    const autoRun = isCroupierLive(deps.itemId);
+    const { line: statusLine, color: statusColor } = computeStatus();
 
     const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
       <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
@@ -2183,16 +2203,18 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
         <span style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">CHIP:</span>
         ${[1, 5, 25, 100].map(denomBtn).join('')}
         <span style="flex:1;"></span>
-        ${btn('rl-undo', 'UNDO', p !== 'betting' || spinning || bets.length === 0, 'Take back the last chip')}
-        ${btn('rl-clear', 'CLEAR', p !== 'betting' || spinning || bets.length === 0, 'Take back all your chips')}
+        ${btn('rl-undo', 'UNDO', !bettingOpen() || spinning || bets.length === 0, 'Take back the last chip')}
+        ${btn('rl-clear', 'CLEAR', !bettingOpen() || spinning || bets.length === 0, 'Take back all your chips')}
       </div>
       <canvas id="rl-board" width="${RL_BOARD_W * 2}" height="${RL_BOARD_H * 2}"
-        style="width:${RL_BOARD_W}px; height:${RL_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${p === 'betting' && !spinning ? 'pointer' : 'default'};"></canvas>
+        style="width:${RL_BOARD_W}px; height:${RL_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${bettingOpen() && !spinning ? 'pointer' : 'default'};"></canvas>
       <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
-        ${house
-          ? (p === 'betting'
-            ? btn('rl-spin', '🎡 SPIN', spinning, 'Close betting and spin the wheel')
-            : btn('rl-new-round', 'NEW ROUND', spinning, 'Open the felt for the next round'))
+        ${autoRun
+          ? `<span style="font-size:9.5px; color:${CH_GOLD};">🤖 THE ROBO-CROUPIER RUNS THIS TABLE</span>`
+          : house
+          ? (p === 'settled'
+            ? btn('rl-new-round', 'NEW ROUND', spinning, 'Open the felt for the next round')
+            : btn('rl-spin', '🎡 SPIN', spinning, 'Close betting and spin the wheel'))
           : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !spinning ? 'WAITING FOR THE CROUPIER TO OPEN THE NEXT ROUND' : 'THE HOUSE SPINS WHEN BETS ARE DOWN'}</span>`}
       </div>
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
@@ -2270,6 +2292,12 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
       boardCanvas = null;
     },
     update(dt: number): void {
+      // 🤖 #77B: tick the auto-croupier's betting/closing countdown live — the
+      // doc only changes at phase edges, so the seconds are refreshed here.
+      const s = state();
+      if (animT === null && s?.phaseDeadline != null && s.phase !== 'settled') {
+        syncStatusEl();
+      }
       if (animT === null) return;
       animT = Math.min(1, animT + Math.max(0, dt) / RL_SPIN_SECS);
       if (animT >= 1) {

@@ -44,7 +44,9 @@ export interface RouletteBet {
  *  writes it. */
 export interface RouletteTableState {
   kind: 'roulette';
-  phase: 'betting' | 'settled';
+  /** betting → closing ("no more bets") → settled. 'closing' only appears on a
+   *  robot-driven table (#77B auto-croupier); manual tables jump betting→settled. */
+  phase: 'betting' | 'closing' | 'settled';
   round: number;
   /** Winning pocket 0–36 once settled, null while betting. */
   result: number | null;
@@ -52,6 +54,11 @@ export interface RouletteTableState {
   resultAt: number;
   /** playerId → total chips RETURNED this round (stakes included), settled only. */
   payouts: Record<string, number> | null;
+  /** 🤖 #77B auto-croupier: absolute croupier-clock ms at which THIS phase
+   *  advances (the operator's Date.now() is the reference — everyone else's
+   *  countdown is display-only). Absent ⇒ a manual/idle table with no timer,
+   *  so legacy and un-driven tables validate and behave exactly as before. */
+  phaseDeadline?: number;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -81,11 +88,13 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
   if (typeof value !== 'object' || value === null) return false;
   const s = value as Partial<RouletteTableState>;
   return s.kind === 'roulette'
-    && (s.phase === 'betting' || s.phase === 'settled')
+    && (s.phase === 'betting' || s.phase === 'closing' || s.phase === 'settled')
     && Number.isInteger(s.round) && (s.round as number) >= 1
     && (s.result === null || (Number.isInteger(s.result) && (s.result as number) >= 0 && (s.result as number) <= 36))
     && typeof s.resultAt === 'number'
-    && (s.payouts === null || typeof s.payouts === 'object');
+    && (s.payouts === null || typeof s.payouts === 'object')
+    && (s.phaseDeadline === undefined
+        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
 }
 
 /** Layout column of a number (0/1/2 = bottom/middle/top row of the classic
