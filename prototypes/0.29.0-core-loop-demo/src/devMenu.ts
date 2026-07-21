@@ -93,6 +93,13 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
   'fireplace-wall', 'bar-corner', 'wall-computer',
 ]);
 
+/** 🤖 Friendly dev-menu labels for kinds whose id doesn't read obviously. The
+ *  charging dock IS how you place a robot — a placed dock spawns one robot at it
+ *  (world.reconcileRobots), so label it so it's findable. */
+const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
+  'charging-dock': '🤖 ROBOT DOCK',
+};
+
 type GetWorld = () => World | null;
 
 /**
@@ -355,6 +362,9 @@ function commitSpawn(world: World, item: FurnitureItem): void {
   rebuildDevices();
   world.getPlayer().onObstaclesChanged();
   world.refreshOutdoorFloor(); // 🏊 a spawned pool hides the outdoor floor
+  // 🤖 a placed charging-dock must spawn its robot NOW — the doc-echo reconcile
+  // no-ops on this local add, so trigger the robot reconcile explicitly.
+  if (item.kind === 'charging-dock') world.refreshRobots();
   // E4 (issue #60): publish the spawned piece so it syncs to everyone. AFTER
   // the local commit — the doc observer's reconcile then no-ops on the echo.
   writeFurnitureItem(item);
@@ -624,7 +634,7 @@ function buildPanel(): HTMLDivElement {
     .filter((kind) => !NON_SPAWNABLE.has(kind));
   const furnitureRows = spawnableKinds.map((kind) => `
     <div style="${ROW_STYLE}">
-      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${kind.toUpperCase()}</span>
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${KIND_LABELS[kind] ?? kind.toUpperCase()}</span>
       <button type="button" data-dev-action="spawn-furniture" data-kind="${kind}" style="${BTN_STYLE}">+</button>
     </div>
   `);
