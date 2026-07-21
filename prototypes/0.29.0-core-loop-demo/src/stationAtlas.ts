@@ -224,6 +224,90 @@ export function atlasLayout(
   return [...placed.values()];
 }
 
+// ── 🛰️ Module-overlap guard (#28 doors decouple, slice 2) ────────────────────
+//
+// The "automatic vestibule connector" (detectChainContact) is a match-to-
+// CONNECT probe, NOT an anti-overlap guard — nothing today stops a new module
+// being provisioned on top of an existing one. This tests a candidate module's
+// footprint against the composed atlas poses. It keys off PORTS / atlas
+// geometry (the same poses the exterior renders) — free doors never enter it.
+
+/** A module's rendered footprint half-extent. Matches the exterior view's
+ *  uniform 11.8 box (exteriorView.ts) and adapter ROOM_HALF (5.9), so the
+ *  overlap test agrees with what-you-see-is-what's-docked. Rectangular/resized
+ *  modules render — and here test — at this uniform size; per-module true dims
+ *  would need the atlas to gossip room size (a refinement for the S6 BLOCK). */
+const MODULE_HALF = 5.9;
+
+/** How close a candidate centre must be to an existing module centre to count
+ *  as CONNECTING to that berth rather than colliding with a different module —
+ *  mirrors detectChainContact's 4.5 m match radius (docking.ts). */
+const MODULE_CONNECT_DIST = 4.5;
+
+interface OrientedSquare { x: number; z: number; rotY: number }
+
+/** Separating-Axis overlap of two equal-size rotated squares. Strict
+ *  separation (touching faces do NOT count) so flush berths / shared edges read
+ *  as clear. Exact at any rotation — no inflated-AABB false positives for the
+ *  45° ring modules. */
+function squaresOverlap(a: OrientedSquare, b: OrientedSquare, half: number): boolean {
+  const cornersOf = (c: OrientedSquare): Array<{ x: number; z: number }> => {
+    const co = Math.cos(c.rotY), si = Math.sin(c.rotY);
+    const out: Array<{ x: number; z: number }> = [];
+    for (const [sx, sz] of [[-half, -half], [half, -half], [half, half], [-half, half]] as const) {
+      out.push({ x: c.x + sx * co - sz * si, z: c.z + sx * si + sz * co });
+    }
+    return out;
+  };
+  const A = cornersOf(a), B = cornersOf(b);
+  const axes = [a.rotY, a.rotY + Math.PI / 2, b.rotY, b.rotY + Math.PI / 2];
+  const EPS = 1e-3; // flush contact separates cleanly despite fp noise
+  for (const ang of axes) {
+    const ax = Math.cos(ang), az = Math.sin(ang);
+    let aMin = Infinity, aMax = -Infinity, bMin = Infinity, bMax = -Infinity;
+    for (const p of A) { const d = p.x * ax + p.z * az; if (d < aMin) aMin = d; if (d > aMax) aMax = d; }
+    for (const p of B) { const d = p.x * ax + p.z * az; if (d < bMin) bMin = d; if (d > bMax) bMax = d; }
+    if (aMax <= bMin + EPS || bMax <= aMin + EPS) return false; // found a separating axis
+  }
+  return true;
+}
+
+/**
+ * Would a module placed at `candidate` (a pose in the CURRENT room's frame —
+ * e.g. projectionPoseForDoor's far-end pose) OVERLAP an existing station
+ * module? Returns the clashed module ({roomId, name}) or null.
+ *
+ * A module within the connect radius of the candidate is the berth being
+ * JOINED (skipped — that's a connection, not a collision, and matches
+ * detectChainContact's match); a clash is a footprint overlap with a DIFFERENT,
+ * farther module, or with the current room's own hull at the origin.
+ */
+export function moduleOverlapAt(
+  currentRoomId: string,
+  candidate: { x: number; z: number; rotY: number },
+  poseForDoor: (
+    doorId: DoorId,
+    segments?: ConnectorSegment[],
+    farDoor?: DoorId,
+  ) => { x: number; z: number; rotY: number },
+  opts?: { connectDist?: number; maxHops?: number; moduleHalf?: number },
+): { roomId: string; name: string } | null {
+  if (!currentRoomId) return null;
+  const connectDist = opts?.connectDist ?? MODULE_CONNECT_DIST;
+  const half = opts?.moduleHalf ?? MODULE_HALF;
+  const atlas = readAtlas();
+  const modules: Array<{ roomId: string; name: string; x: number; z: number; rotY: number }> = [
+    { roomId: currentRoomId, name: atlas[currentRoomId]?.name ?? 'this module', x: 0, z: 0, rotY: 0 },
+    ...atlasLayout(currentRoomId, poseForDoor, opts?.maxHops ?? 8),
+  ];
+  for (const mod of modules) {
+    const isCurrent = mod.roomId === currentRoomId;
+    if (!isCurrent && Math.hypot(mod.x - candidate.x, mod.z - candidate.z) <= connectDist) continue;
+    if (squaresOverlap(candidate, mod, half)) return { roomId: mod.roomId, name: mod.name };
+  }
+  return null;
+}
+
 // ── 🛰️ Shared station atlas — the `atlas` room-doc map (see module header) ───
 
 /** Doc-side entry (plain JSON, keyed by roomId, whole-value LWW). */

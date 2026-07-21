@@ -61,7 +61,7 @@ import {
   LEGACY_PLACEMENTS,
   DOOR_LATTICE,
 } from "./floorPlanDoc";
-import { readAtlas, atlasLayout } from "./stationAtlas";
+import { readAtlas, atlasLayout, moduleOverlapAt } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -1193,6 +1193,23 @@ export class DoorDockingPortSystem {
       }
       return null;
     })();
+    // 🛰️ #28 S2: warn when the module this chain would project lands ON an
+    // existing station module (a footprint overlap with a DIFFERENT, farther
+    // module — the connect target within 4.5 m is excluded). Advisory here;
+    // the docking BLOCK arrives with the free-door editor (S6).
+    const moduleClash = (() => {
+      if (segs.length === 0) return null;
+      const currentId =
+        (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+      if (!currentId) return null;
+      const wouldBe = projectionPoseForDoor(doorId, segs, state.farDoor);
+      const hit = moduleOverlapAt(currentId, wouldBe, (d, s, f) =>
+        projectionPoseForDoor(d, s, f),
+      );
+      return hit ? hit.name : null;
+    })();
+    const escName = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
     chips.innerHTML =
       segs.length === 0
         ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway</span>`
@@ -1216,6 +1233,9 @@ export class DoorDockingPortSystem {
             .join("") +
           (chainClash
             ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ chain sweeps through mounted equipment (${chainClash}) — bend around it or move the mount</div>`
+            : "") +
+          (moduleClash
+            ? `<div style="font-size:9px; color:#FF7043; margin-top:4px;">⛔ would overlap <b>${escName(moduleClash)}</b> — this module can't dock here; re-route the chain</div>`
             : "");
     if (partsNote) {
       partsNote.textContent =
