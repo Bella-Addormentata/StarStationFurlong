@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.23 — 2026-07-21
+
+### 🚪✏️ Place and remove doors in edit mode (#28 decouple, slice 6b — the door editor)
+
+The payoff of the doors-from-docking decouple: you can now **add and remove doors** yourself, in edit mode — doors are furniture-like placeable passages at last.
+
+- **＋ DOOR** enters a placement mode where a translucent door **ghost follows your cursor** along the nearest wall, snapping to the same floor grid furniture uses (small door on the half-tile, large on the tile). It's **green** where the spot is valid and **red** where it isn't (over furniture, or too close to a corner). Click on green to place the door — it appears for everyone and sits at the wall's edge.
+- **Select a door** in edit mode (it tints gold) and **remove** it with the REMOVE button or the X / Delete key. A door with a live docked module is protected — you're asked to unpair it first, exactly like the slide control.
+- Everything syncs (the room's door set rides the shared `doorLayout` map) and the four default cardinal doors are preserved when you add your first one.
+- Under the hood this rests on slices 1–6a: one pose generator, the module-overlap guard (now a hard block), the door↔port seam, data-driven doors, the port-hardware/door-leaves split, and the live add/remove machinery.
+- **Coming next (slice 6c):** drag an existing door along its wall to move it, reusing this same ghost.
+- **Release line:** version bumped to 0.33.23, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.22 — 2026-07-21
 
 ### 🤖⏸ Park a robot with a STOP/START button (#77 follow-up)

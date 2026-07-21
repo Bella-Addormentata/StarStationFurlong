@@ -1,4 +1,5 @@
 import { roomHalfExtents } from "./floorPlanDoc";
+import type { DoorWall } from "./doorLayoutDoc";
 
 export type PhysicalDoorId = "north" | "south" | "east" | "west";
 /** "casino-pairs" and "pool-pairs" are ALIASES of the same paired
@@ -103,6 +104,42 @@ export function poseFromWall(
         tangent: "z",
       };
   }
+}
+
+/**
+ * 🚪 #28 S6b (door editor): snap an along-wall lateral to the floor's 1 m parity
+ * grid — the SAME rule furniture uses (furniture.ts snapAxis). A small door has
+ * opening extent 1 (odd) → its centre lands on n+0.5; a large door has extent 2
+ * (even) → its centre lands on the integer n. Mirrors snapItemPos' parity so a
+ * door and a piece of furniture on the same wall never straddle half a tile.
+ */
+export function snapDoorLateral(size: "small" | "large", lateral: number): number {
+  return size === "large" ? Math.round(lateral) : Math.floor(lateral) + 0.5;
+}
+
+/**
+ * 🚪 #28 S6b: the INVERSE of poseFromWall — given a clicked floor point, pick the
+ * nearest wall and the along-wall lateral of that point. Distance to each wall
+ * from the current room half-extents (walls at ±half): north |pz+halfZ|, south
+ * |pz−halfZ|, west |px+halfX|, east |px−halfX|; the argmin wins. The lateral is
+ * the point's coordinate ALONG that wall (x for n/s, z for e/w) — the raw value
+ * the editor then snaps + clamps before placing a door.
+ */
+export function wallAndLateralFromPoint(
+  px: number,
+  pz: number,
+): { wall: DoorWall; lateral: number } {
+  const { halfX, halfZ } = roomHalfExtents();
+  const dists: Array<{ wall: DoorWall; d: number }> = [
+    { wall: "north", d: Math.abs(pz + halfZ) },
+    { wall: "south", d: Math.abs(pz - halfZ) },
+    { wall: "west", d: Math.abs(px + halfX) },
+    { wall: "east", d: Math.abs(px - halfX) },
+  ];
+  let best = dists[0];
+  for (const cand of dists) if (cand.d < best.d) best = cand;
+  const lateral = best.wall === "north" || best.wall === "south" ? px : pz;
+  return { wall: best.wall, lateral };
 }
 
 /** A cardinal door's fixed slot in a layout: which physical wall it sits on and

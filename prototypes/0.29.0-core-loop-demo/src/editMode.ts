@@ -65,10 +65,16 @@ import {
 import type { FurnitureItem, Rot, Box } from './furniture';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
-import { roomHalfExtents } from './floorPlanDoc';
+import { roomHalfExtents, doorLateralLimitForWall, readDoorDeltas } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
+import type { DoorId } from './doors';
+import { snapDoorLateral, wallAndLateralFromPoint, poseFromWall } from './doorLayout';
+import {
+  writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
+} from './doorLayoutDoc';
+import type { DoorWall } from './doorLayoutDoc';
 import { PLAYER_R } from './player';
 import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
@@ -235,6 +241,119 @@ export function validatePlacement(
   return { ok: true };
 }
 
+// ── Door placement validity (#28 S6b — the door editor's add/tint gate) ───────
+
+/** Mint a fresh free-door id suffix — crypto.randomUUID with the identity.ts
+ *  fallback (unavailable outside secure contexts / on old engines; uniqueness,
+ *  not security, is all we need). Callers prefix `d:` to mark a FREE door. */
+function mintDoorId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch { /* fall through to the non-crypto shape */ }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * The door OPENING footprint as a world-space AABB — a `w`-wide span along the
+ * wall (w = large ? 2 : 1) at the wall coordinate (±half), with a ~1 m deep band
+ * INTO the room. Used to test a candidate door against the live furniture
+ * footprints (a door can't open into a sofa). #28 S6b.
+ */
+function doorOpeningAabb(wall: DoorWall, lateral: number, size: 'small' | 'large'): Box {
+  const { halfX, halfZ } = roomHalfExtents();
+  const w = size === 'large' ? 2 : 1;
+  const DEPTH = 1.0; // shallow band into the room from the wall line
+  switch (wall) {
+    case 'north': // wall at z = -halfZ; band runs +z into the room
+      return { x0: lateral - w / 2, x1: lateral + w / 2, z0: -halfZ, z1: -halfZ + DEPTH };
+    case 'south': // wall at z = +halfZ; band runs -z into the room
+      return { x0: lateral - w / 2, x1: lateral + w / 2, z0: halfZ - DEPTH, z1: halfZ };
+    case 'west': // wall at x = -halfX; band runs +x into the room
+      return { x0: -halfX, x1: -halfX + DEPTH, z0: lateral - w / 2, z1: lateral + w / 2 };
+    case 'east': // wall at x = +halfX; band runs -x into the room
+      return { x0: halfX - DEPTH, x1: halfX, z0: lateral - w / 2, z1: lateral + w / 2 };
+  }
+}
+
+/**
+ * Every door's CURRENT opening as {wall, lateral, size} — the set a new/edited
+ * door must not overlap on its wall. Free doors own their lateral in the layout
+ * record; a cardinal's LIVE centre lateral is its floor-plan slide (readDoorDeltas
+ * — the record's `lateral` is only the seed snapshot). Also folds in the 4
+ * cardinals that physically exist but aren't in the map yet (an UNSEEDED room,
+ * before the editor's seed-first write). #28 S6b.
+ */
+function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: number; size: 'small' | 'large' }> {
+  const openings: Array<{ id: string; wall: DoorWall; lateral: number; size: 'small' | 'large' }> = [];
+  const records = readAllDoorLayout();
+  const deltas = readDoorDeltas();
+  const seen = new Set<string>();
+  for (const rec of records.values()) {
+    const isCardinal = rec.id === 'north' || rec.id === 'south' || rec.id === 'east' || rec.id === 'west';
+    const lateral = isCardinal ? (deltas[rec.id as DoorId] ?? 0) : rec.lateral;
+    openings.push({ id: rec.id, wall: rec.wall, lateral, size: rec.size ?? 'small' });
+    seen.add(rec.id);
+  }
+  for (const id of ['north', 'south', 'east', 'west'] as const) {
+    if (seen.has(id)) continue;
+    openings.push({
+      id, wall: id, lateral: deltas[id] ?? 0,
+      size: id === 'east' || id === 'west' ? 'large' : 'small',
+    });
+  }
+  return openings;
+}
+
+export type DoorPlacementVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * May a door of `size` sit on `wall` at along-wall `lateral`? Checks, in order:
+ *  1. within the wall's lateral clamp (doorLateralLimitForWall — off the wall /
+ *     too near a corner);
+ *  2. its opening footprint clears every live furniture footprint (strict-
+ *     inequality AABB overlap — a flush edge is fine, same rule as furniture);
+ *  3. its opening clears every OTHER door on the SAME wall (1-D interval gap:
+ *     centres must be ≥ (w+w')/2 apart), excluding `excludeId`.
+ * Pure; drives both the ADD gate and (future) the red/green editor tint. #28 S6b.
+ */
+export function validateDoorPlacement(
+  wall: DoorWall,
+  lateral: number,
+  size: 'small' | 'large',
+  excludeId?: string,
+): DoorPlacementVerdict {
+  // 1. On the wall, clear of the corners.
+  if (Math.abs(lateral) > doorLateralLimitForWall(wall) + 1e-6) {
+    return { ok: false, reason: 'too close to a corner' };
+  }
+
+  // 2. No furniture in the opening.
+  const box = doorOpeningAabb(wall, lateral, size);
+  for (const item of FURNITURE) {
+    const ob = itemAabb(item);
+    if (!ob) continue;
+    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+      return { ok: false, reason: `blocked by ${item.id}` };
+    }
+  }
+
+  // 3. No other door overlapping on the same wall (both openings share the wall
+  //    axis, so overlap is a 1-D span test on the along-wall centres).
+  const w = size === 'large' ? 2 : 1;
+  for (const other of currentDoorOpenings()) {
+    if (other.id === excludeId) continue;
+    if (other.wall !== wall) continue;
+    const ow = other.size === 'large' ? 2 : 1;
+    if (Math.abs(other.lateral - lateral) < (w + ow) / 2) {
+      return { ok: false, reason: 'overlaps another door' };
+    }
+  }
+
+  return { ok: true };
+}
+
 // ── Highlight tints ───────────────────────────────────────────────────────────
 
 /** Hover: soft gold emissive wash (docking-terminal palette). */
@@ -261,12 +380,30 @@ class RoomEditController {
   private active = false;
   private world: World | null = null;
 
-  /** Raycastable meshes of MOVABLE items only, rebuilt on every enter(). */
+  /** Raycastable meshes of MOVABLE items AND door groups, rebuilt on enter(). */
   private raycastTargets: THREE.Mesh[] = [];
-  /** mesh → owning furniture item id (movable items only). */
+  /** mesh → owning furniture item id OR door id (see doorIds to disambiguate). */
   private meshToItem: Map<THREE.Object3D, string> = new Map();
-  /** item id → that item's meshes (tint application/removal). */
+  /** id → that item/door's meshes (tint application/removal). */
   private itemMeshes: Map<string, THREE.Mesh[]> = new Map();
+  /** 🚪 #28 S6b: the ids in the index that are DOORS (not furniture) — so
+   *  select/hover/remove branch to the door path (writeDoorLayout / deleteDoorLayout,
+   *  no OBSTACLES/seat/inventory teardown). Rebuilt with the door raycast slice. */
+  private doorIds: Set<string> = new Set();
+  /** 🚪 #28 S6b: ADD-door sub-mode — the next floor click PLACES a door instead
+   *  of selecting. Toggled by the ＋ DOOR button; reset on place / exit. */
+  private addDoorMode = false;
+  /** 🚪 #28 S6b/ghost: the translucent door PREVIEW that follows the pointer
+   *  while add-door is armed — a single reusable box mesh (built on arm, hidden
+   *  on disarm, disposed on exit), tinted GREEN(valid)/RED(invalid) exactly like
+   *  the furniture carry so doors and furniture feel the same. It is NEVER added
+   *  to the raycast index or written to the door doc — pure transient visual. */
+  private doorGhost: THREE.Mesh | null = null;
+  /** 🚪 #28 S6b/ghost: the ghost's current snapped placement + its last verdict.
+   *  The click commit reads THIS (not a fresh recompute) so the door drops
+   *  exactly where the preview showed. Null while the ghost is hidden / the
+   *  pointer is off the floor plane. */
+  private ghostDoor: { wall: DoorWall; lateral: number; verdict: DoorPlacementVerdict } | null = null;
 
   private hoveredId: string | null = null;
   private selectedId: string | null = null;
@@ -312,6 +449,9 @@ class RoomEditController {
    *  (edit mode previously advertised only a transient "ESC exits" hint, so a
    *  swallowed Esc left the player with no obvious way out). */
   private exitBtnEl: HTMLButtonElement | null = null;
+  /** 🚪 #28 S6b: persistent ＋ DOOR button (under DONE EDITING) — toggles the
+   *  add-door sub-mode; its border/colour flip to green while armed. */
+  private addDoorBtnEl: HTMLButtonElement | null = null;
   private labelAnchor = new THREE.Vector3();
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
@@ -342,6 +482,11 @@ class RoomEditController {
       // a second Esc then exits edit mode as before.
       if (this.carrying) {
         this.cancelCarry(true);
+        return;
+      }
+      // 🚪 #28 S6b: an armed add-door sub-mode consumes the first Esc too.
+      if (this.addDoorMode) {
+        this.setAddDoorMode(false);
         return;
       }
       this.exit();
@@ -451,18 +596,24 @@ class RoomEditController {
     window.addEventListener('mousemove', this.onMouseMove);
     world.setEditMode(true);
     this.showExitButton();
+    // 🚪 #28 S6b: the ＋ DOOR affordance is interior-scope only (doors live on the
+    // room walls, not the hull margin).
+    if (scope !== 'hull') this.showAddDoorButton();
     showHint(scope === 'hull'
       ? 'HULL EDIT — drag tanks/engines onto the walls or each other · stacks cap at 3 · X removes · DONE EDITING (or ESC) exits'
-      : 'EDIT MODE — click furniture to select · X removes · DONE EDITING (or ESC) exits', 4000);
+      : 'EDIT MODE — click furniture or a door to select · ＋ DOOR adds · X removes · DONE EDITING (or ESC) exits', 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
   public exit(): void {
     if (!this.active) return;
     this.cancelCarry(false); // E3: never exit with an item in hand
+    this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
     this.setHovered(null);
     this.setSelected(null);
     this.hideExitButton();
+    this.hideAddDoorButton();
+    this.disposeDoorGhost(); // 🚪 #28 S6b/ghost: no leaked preview after the session
     window.removeEventListener('mousemove', this.onMouseMove);
     this.setCanvasCursor('');
     // 🛰️ Undo the hull-scope presentation before the world reference drops.
@@ -480,6 +631,7 @@ class RoomEditController {
     this.raycastTargets = [];
     this.meshToItem.clear();
     this.itemMeshes.clear();
+    this.doorIds.clear();
     this.savedEmissive.clear();
     this.world = null;
     this.active = false;
@@ -516,6 +668,15 @@ class RoomEditController {
       // e.g. synthetic clicks — must still place AT the click).
       this.updateCarryFromPointer(event.clientX, event.clientY);
       this.commitCarry();
+      return;
+    }
+
+    // 🚪 #28 S6b: ADD-door sub-mode consumes the next canvas click to PLACE a
+    // door at the (snapped) clicked wall point, instead of selecting.
+    if (this.addDoorMode) {
+      const canvas = window.gameRenderer?.renderer?.domElement;
+      if (canvas && event.target !== canvas) return;
+      this.tryPlaceDoorAt(event.clientX, event.clientY);
       return;
     }
 
@@ -556,11 +717,13 @@ class RoomEditController {
 
   // ── Private helpers ─────────────────────────────────────────────────────────
 
-  /** Index the meshes of every MOVABLE furniture group for raycasting. */
+  /** Index the meshes of every MOVABLE furniture group AND every door group for
+   *  raycasting (#28 S6b: doors are hoverable / selectable / removable too). */
   private buildRaycastIndex(world: World): void {
     this.raycastTargets = [];
     this.meshToItem.clear();
     this.itemMeshes.clear();
+    this.doorIds.clear();
     for (const item of FURNITURE) {
       if (!item.movable) continue;
       const group = world.furnitureGroups.get(item.id);
@@ -575,6 +738,83 @@ class RoomEditController {
       });
       this.itemMeshes.set(item.id, meshes);
     }
+    this.indexDoorGroups(world);
+  }
+
+  /**
+   * 🚪 #28 S6b: add every door group's meshes to the raycast index (invisible
+   * click box included — it still raycasts). Kept SEPARATE from the furniture
+   * loop so onDoorLayoutChanged can rebuild just this slice after an add/remove
+   * without disturbing furniture selection. Door ids land in `doorIds` so
+   * select/hover/remove branch to the door path.
+   */
+  private indexDoorGroups(world: World): void {
+    const groups = world.dockingSystem?.getDoorGroups();
+    if (!groups) return;
+    for (const [doorId, group] of groups) {
+      const meshes: THREE.Mesh[] = [];
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          meshes.push(obj);
+          this.meshToItem.set(obj, doorId);
+          this.raycastTargets.push(obj);
+        }
+      });
+      this.itemMeshes.set(doorId, meshes);
+      this.doorIds.add(doorId);
+    }
+  }
+
+  /**
+   * 🚪 #28 S6b: rebuild ONLY the door slice of the raycast index from the current
+   * door groups, preserving the current selection by id — called by
+   * world.reconcileDoorLayout after a local/remote add/remove/rebuild (the door
+   * doc observer fires it synchronously). Materials of a REMOVED door were
+   * already disposed by syncDoorGroups, so this only drops stale map entries (no
+   * tint restore on dead handles); a SURVIVING selected door keeps its
+   * saved-emissive entry and gets its select tint re-asserted (its group may
+   * have been rebuilt). Unlike the furniture reconcile's forceExit+enter, the
+   * selection is NOT dropped on every edit.
+   */
+  public onDoorLayoutChanged(): void {
+    const world = this.world;
+    if (!this.active || !world) return;
+
+    // Drop the previous door slice (map entries only — see method doc).
+    const doorMeshSet = new Set<THREE.Object3D>();
+    for (const id of this.doorIds) {
+      const meshes = this.itemMeshes.get(id);
+      if (meshes) for (const m of meshes) doorMeshSet.add(m);
+      this.itemMeshes.delete(id);
+    }
+    for (const m of doorMeshSet) this.meshToItem.delete(m);
+    this.raycastTargets = this.raycastTargets.filter((m) => !doorMeshSet.has(m));
+    this.doorIds.clear();
+
+    // Re-index the current door groups.
+    this.indexDoorGroups(world);
+
+    // A hovered/selected DOOR that vanished must let go of its (now disposed)
+    // handles; a surviving selected door re-asserts its select tint.
+    if (this.hoveredId && !this.isKnownId(this.hoveredId)) this.hoveredId = null;
+    if (this.selectedId && !world.furnitureGroups.has(this.selectedId)) {
+      if (this.doorIds.has(this.selectedId)) {
+        this.applyTint(this.selectedId, SELECT_EMISSIVE, SELECT_INTENSITY);
+      } else {
+        this.setSelected(null);
+      }
+    }
+  }
+
+  /** True when `id` is an indexed furniture item or door. */
+  private isKnownId(id: string): boolean {
+    return this.itemMeshes.has(id);
+  }
+
+  /** The 3D group for a furniture id or a door id (label anchor / bounds). */
+  private groupForId(id: string): THREE.Group | undefined {
+    return this.world?.furnitureGroups.get(id)
+      ?? this.world?.dockingSystem?.getDoorGroups().get(id);
   }
 
   /** Raycast the movable-furniture meshes at a screen point → item id | null. */
@@ -597,11 +837,23 @@ class RoomEditController {
     const canvas = window.gameRenderer?.renderer?.domElement;
     if (canvas && e.target !== canvas) {
       this.setHovered(null);
+      // 🚪 #28 S6b/ghost: a door preview must not linger under a HUD panel —
+      // hide it while the pointer is off the canvas.
+      if (this.addDoorMode) this.hideDoorGhost();
       return;
     }
     // E3: while carrying, the pointer drives the held item, not hover.
     if (this.carrying) {
       this.updateCarryFromPointer(e.clientX, e.clientY);
+      return;
+    }
+    // 🚪 #28 S6b: in ADD-door mode the pointer is arming a placement, not
+    // hovering — keep the crosshair, don't tint anything under it, and drive
+    // the translucent green/red door ghost (S6b/ghost) that follows the wall.
+    if (this.addDoorMode) {
+      this.setHovered(null);
+      this.setCanvasCursor('crosshair');
+      this.updateDoorGhostFromPointer(e.clientX, e.clientY);
       return;
     }
     this.setHovered(this.pickItemAt(e.clientX, e.clientY));
@@ -840,6 +1092,15 @@ class RoomEditController {
     const world = this.world;
     const itemId = this.selectedId;
     if (!world || !itemId || this.carrying) return;
+
+    // 🚪 #28 S6b: a DOOR removal is its own, much shorter path — drop the layout
+    // record (the reconcile removes the 3D group + walk target); NO
+    // OBSTACLES/seat/inventory teardown, and gated on the door being unpaired.
+    if (this.doorIds.has(itemId)) {
+      this.removeSelectedDoor(itemId);
+      return;
+    }
+
     const item = FURNITURE.find((i) => i.id === itemId);
     if (!item) return;
     if (!item.movable) {
@@ -908,6 +1169,179 @@ class RoomEditController {
     deleteFurnitureItem(itemId);
 
     showHint(`Removed ${itemId}${cascade.length ? ` +${cascade.length} mounted layer${cascade.length === 1 ? '' : 's'}` : ''} → room inventory (DEV menu › INVENTORY re-places it).`, 3200);
+  }
+
+  // ── Door add / remove (#28 S6b — the door editor MVP) ───────────────────────
+
+  /**
+   * Remove the SELECTED door from the shared layout. Gated: a PAIRED door can't
+   * be removed ("unpair first" — the same rule the slide code enforces, so #62
+   * chain math never re-solves around a vanished door). Otherwise: restore its
+   * tint + drop it from the index while its materials still exist, then
+   * seedDoorLayoutDefaults() (idempotent — SEED-FIRST is critical: reconcile
+   * removes any group not in the map, so a delete against an UNSEEDED room would
+   * wipe all 4 cardinals) and deleteDoorLayout(). The doc observer's reconcile
+   * then removes the 3D group + walk target and calls onDoorLayoutChanged.
+   */
+  private removeSelectedDoor(doorId: string): void {
+    const world = this.world;
+    if (!world) return;
+    if (world.dockingSystem?.isDoorPaired(doorId)) {
+      showHint('Unpair this door first (open its keypad), then remove it.', 2800);
+      return;
+    }
+
+    // Selection/hover teardown BEFORE the delete disposes the door's materials
+    // (setSelected(null) → clearTint restores saved emissive on live handles).
+    this.setSelected(null);
+    if (this.hoveredId === doorId) this.setHovered(null);
+    const meshes = this.itemMeshes.get(doorId) ?? [];
+    for (const mesh of meshes) this.meshToItem.delete(mesh);
+    this.itemMeshes.delete(doorId);
+    const meshSet = new Set<THREE.Object3D>(meshes);
+    this.raycastTargets = this.raycastTargets.filter((m) => !meshSet.has(m));
+    this.doorIds.delete(doorId);
+
+    // Publish the removal (seed-first — see method doc). The reconcile fired by
+    // deleteDoorLayout also re-runs onDoorLayoutChanged, a harmless no-op now.
+    seedDoorLayoutDefaults();
+    deleteDoorLayout(doorId);
+    showHint(`Removed door ${doorId}.`, 2000);
+  }
+
+  /**
+   * Commit the ADD-door sub-mode at the GHOST's current spot. The green/red
+   * ghost (S6b/ghost) already did the raycast → wall → snap → clamp → validate
+   * every mousemove and stashed it in `ghostDoor`; a click just re-derives that
+   * from the pointer (so a synthetic click with no preceding mousemove still
+   * commits AT the pointer — mirrors commitCarry's updateCarryFromPointer-first
+   * pattern) and drops the door. On success: seedDoorLayoutDefaults() (SEED-FIRST
+   * — see removeSelectedDoor) then writeDoorLayout with a fresh `d:`-prefixed free
+   * id, and leave add-mode (which hides the ghost). On failure: hint the reason
+   * and STAY armed, keeping the (red) ghost so the owner can nudge to a clearer
+   * spot.
+   */
+  private tryPlaceDoorAt(clientX: number, clientY: number): void {
+    // Re-derive the ghost pose at the click point (see method doc), then commit
+    // from the stashed snapped wall/lateral so the door lands where it showed.
+    this.updateDoorGhostFromPointer(clientX, clientY);
+    const ghost = this.ghostDoor;
+    if (!ghost) return; // pointer wasn't over the floor plane — nothing to place
+    if (!ghost.verdict.ok) {
+      showHint(`CAN'T ADD DOOR — ${ghost.verdict.reason}`, 2400);
+      return; // stay armed so the owner can nudge to a clearer spot
+    }
+
+    seedDoorLayoutDefaults();
+    writeDoorLayout({
+      id: `d:${mintDoorId()}`,
+      wall: ghost.wall,
+      lateral: ghost.lateral,
+      size: 'small',
+      enabled: true,
+    });
+    this.setAddDoorMode(false); // hides the ghost (existing exit-add behaviour)
+    showHint(`Door added on the ${ghost.wall} wall.`, 2000);
+  }
+
+  // ── Door ghost preview (#28 S6b/ghost — furniture-like green/red follow) ─────
+
+  /**
+   * Lazily build (once) the reusable translucent door ghost and parent it to
+   * the SAME group the real door groups + click plane live in — platformGroup,
+   * reached via the click plane's parent so no new world API is needed (door
+   * groups, furniture groups and the click plane are all children of it, and
+   * its origin is the world origin, so poseFromWall's x/z map straight through).
+   *
+   * The box is sized like the small-door OPENING (1.4 w × 3.0 h, docking.ts
+   * buildDoorGroup) with a shallow depth, and its geometry is shifted DOWN 0.5 m
+   * so the mesh ORIGIN coincides with the real door group's origin (that group
+   * sits at world y=2 with its floor at local y=−2, i.e. opening centre at local
+   * y=−0.5). Positioning the ghost at (pose.x, 2, pose.z) — exactly like the
+   * door group — then drops it into the opening. MeshBasicMaterial (transparent,
+   * unlit) coloured with the furniture carry's exact valid/invalid hexes, so the
+   * preview reads the same as a carried piece. Returns null only if the world /
+   * click plane isn't ready (never, while add-door is armed).
+   */
+  private ensureDoorGhost(): THREE.Mesh | null {
+    if (this.doorGhost) return this.doorGhost;
+    const parent = this.world?.getClickPlane()?.parent;
+    if (!parent) return null;
+    const geo = new THREE.BoxGeometry(1.4, 3.0, 0.5);
+    geo.translate(0, -0.5, 0); // mesh origin → door-group origin (world y=2)
+    const mat = new THREE.MeshBasicMaterial({
+      color: CARRY_VALID_EMISSIVE, // furniture carry's green; flipped red on invalid
+      transparent: true,
+      opacity: 0.4,
+      depthWrite: false, // a wash, not an occluder — don't z-fight the wall
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.visible = false;
+    mesh.renderOrder = 3; // draw over the wall so the tint reads through
+    parent.add(mesh);
+    this.doorGhost = mesh;
+    return mesh;
+  }
+
+  /**
+   * Follow the pointer while add-door is armed: raycast the click plane → nearest
+   * wall + along-wall lateral (wallAndLateralFromPoint) → snap to the parity grid
+   * (snapDoorLateral) → clamp to the wall's corner-clear limit → pose the ghost
+   * (poseFromWall) → validate (validateDoorPlacement) and tint green/red. Cheap
+   * enough to run per mousemove — it reuses the one ghost mesh (no geometry
+   * rebuild) and validateDoorPlacement is pure. Off the plane → hide the ghost.
+   * Stashes {wall, lateral, verdict} in `ghostDoor` for the click commit.
+   */
+  private updateDoorGhostFromPointer(clientX: number, clientY: number): void {
+    const world = this.world;
+    const camera = window.gameRenderer?.camera;
+    const plane = world?.getClickPlane();
+    if (!world || !camera || !plane) return;
+    const ghost = this.ensureDoorGhost();
+    if (!ghost) return;
+    this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
+    this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointerNdc, camera);
+    const hits = this.raycaster.intersectObject(plane, false);
+    if (hits.length === 0) { this.hideDoorGhost(); return; }
+
+    const { wall, lateral } = wallAndLateralFromPoint(hits[0].point.x, hits[0].point.z);
+    const snapped = snapDoorLateral('small', lateral);
+    const limit = doorLateralLimitForWall(wall);
+    const clamped = Math.max(-limit, Math.min(limit, snapped));
+    const pose = poseFromWall(wall, clamped);
+    ghost.position.set(pose.x, 2, pose.z); // world y=2 — matches the door group
+    ghost.rotation.y = pose.frameYaw;
+    ghost.visible = true;
+
+    const verdict = validateDoorPlacement(wall, clamped, 'small');
+    this.setDoorGhostColor(verdict.ok);
+    this.ghostDoor = { wall, lateral: clamped, verdict };
+  }
+
+  /** Flip the ghost between the furniture carry's exact green (valid) and red
+   *  (invalid) hexes. */
+  private setDoorGhostColor(valid: boolean): void {
+    const mat = this.doorGhost?.material as THREE.MeshBasicMaterial | undefined;
+    if (mat) mat.color.setHex(valid ? CARRY_VALID_EMISSIVE : CARRY_INVALID_EMISSIVE);
+  }
+
+  /** Hide the reusable ghost (disarm / off-plane) — instance kept for re-arm. */
+  private hideDoorGhost(): void {
+    if (this.doorGhost) this.doorGhost.visible = false;
+    this.ghostDoor = null;
+  }
+
+  /** Fully tear down the ghost (leaving edit mode): unparent + dispose the
+   *  one-off geometry/material so nothing leaks after the session. */
+  private disposeDoorGhost(): void {
+    if (this.doorGhost) {
+      this.doorGhost.parent?.remove(this.doorGhost);
+      this.doorGhost.geometry.dispose();
+      (this.doorGhost.material as THREE.Material).dispose();
+      this.doorGhost = null;
+    }
+    this.ghostDoor = null;
   }
 
   /** Validate the current candidate against live player positions. */
@@ -1108,7 +1542,7 @@ class RoomEditController {
     this.labelEl.textContent = itemId;
     this.labelEl.style.display = 'block';
 
-    const group = this.world?.furnitureGroups.get(itemId);
+    const group = this.groupForId(itemId);
     this.selectedTopY = group
       ? new THREE.Box3().setFromObject(group).max.y
       : 1.0;
@@ -1128,8 +1562,11 @@ class RoomEditController {
    * (hidden), matching the "button hidden, not disabled" rule.
    */
   private syncRemoveButton(): void {
+    // 🚪 #28 S6b: a selected DOOR shows the REMOVE button too (movable furniture
+    // OR any door — the two selectable classes in the index).
+    const isDoor = this.selectedId ? this.doorIds.has(this.selectedId) : false;
     const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;
-    const show = this.active && !this.carrying && !!item && item.movable;
+    const show = this.active && !this.carrying && (isDoor || (!!item && item.movable));
     if (!this.removeBtnEl) {
       if (!show) return;
       this.removeBtnEl = document.createElement('button');
@@ -1219,10 +1656,97 @@ class RoomEditController {
     if (this.exitBtnEl) this.exitBtnEl.style.display = 'none';
   }
 
+  /**
+   * 🚪 #28 S6b: the persistent ＋ DOOR button (under DONE EDITING). Toggles the
+   * add-door sub-mode; while armed its border/colour flip to green and the label
+   * reads ✕ CANCEL DOOR. stopPropagation keeps the click off the window
+   * canvas-click routing (same rule as the REMOVE / DONE EDITING buttons).
+   */
+  private showAddDoorButton(): void {
+    if (!this.addDoorBtnEl) {
+      this.addDoorBtnEl = document.createElement('button');
+      this.addDoorBtnEl.id = 'room-edit-add-door-btn';
+      this.addDoorBtnEl.type = 'button';
+      this.addDoorBtnEl.title = 'Add a door — then click a wall to place it';
+      this.addDoorBtnEl.style.cssText = `
+        position: fixed;
+        top: 56px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 6px 18px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(240, 192, 96, 0.7);
+        border-radius: 8px;
+        color: #f0c060;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      this.addDoorBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.setAddDoorMode(!this.addDoorMode);
+      });
+      document.body.appendChild(this.addDoorBtnEl);
+    }
+    this.addDoorBtnEl.style.display = 'block';
+    this.syncAddDoorButton();
+  }
+
+  private hideAddDoorButton(): void {
+    if (this.addDoorBtnEl) this.addDoorBtnEl.style.display = 'none';
+  }
+
+  /** Reflect the armed/idle add-door state onto the ＋ DOOR button. */
+  private syncAddDoorButton(): void {
+    const btn = this.addDoorBtnEl;
+    if (!btn) return;
+    if (this.addDoorMode) {
+      btn.textContent = '✕ CANCEL DOOR';
+      btn.style.color = '#35d06a';
+      btn.style.borderColor = 'rgba(53, 208, 106, 0.85)';
+    } else {
+      btn.textContent = '＋ DOOR';
+      btn.style.color = '#f0c060';
+      btn.style.borderColor = 'rgba(240, 192, 96, 0.7)';
+    }
+  }
+
+  /**
+   * 🚪 #28 S6b: arm / disarm the add-door sub-mode. Arming clears any selection
+   * (the next click PLACES, it doesn't select) and shows the how-to hint;
+   * disarming restores the pointer cursor.
+   */
+  private setAddDoorMode(on: boolean): void {
+    if (this.addDoorMode === on) {
+      this.syncAddDoorButton();
+      return;
+    }
+    this.addDoorMode = on;
+    if (on) {
+      this.setSelected(null);
+      this.setHovered(null);
+      this.setCanvasCursor('crosshair');
+      // 🚪 #28 S6b/ghost: build the reusable preview now (invisible until the
+      // first pointer move positions it on a wall).
+      this.ensureDoorGhost();
+      showHint('ADD DOOR — move to a wall (green = ok, red = blocked) · click to place · ＋/✕ to cancel', 3500);
+    } else {
+      this.setCanvasCursor('');
+      // 🚪 #28 S6b/ghost: drop the preview when disarming (kept for re-arm).
+      this.hideDoorGhost();
+    }
+    this.syncAddDoorButton();
+  }
+
   /** Reproject the label (above) + REMOVE button (below) every frame. */
   private updateLabelPosition(): void {
     if (!this.labelEl || !this.selectedId || this.labelEl.style.display === 'none') return;
-    const group = this.world?.furnitureGroups.get(this.selectedId);
+    const group = this.groupForId(this.selectedId);
     const camera = window.gameRenderer?.camera;
     if (!group || !camera) return;
     this.labelAnchor.set(group.position.x, this.selectedTopY + 0.12, group.position.z);
