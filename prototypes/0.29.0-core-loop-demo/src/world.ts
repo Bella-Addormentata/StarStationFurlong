@@ -1016,8 +1016,9 @@ export class World {
   public reconcileDoorLayout(records: Map<string, DoorLayoutRecord>): void {
     if (records.size === 0) return; // unseeded → keep the local cardinal defaults
     if (!this.dockingSystem) return; // docking ports not built yet
-    rebuildDoors(records);
-    this.reconcileDoorPlacements();
+    rebuildDoors(records); // walk-target membership (makes findDoor correct first)
+    this.dockingSystem.syncDoorGroups(records); // 3D group add/remove/rebuild
+    this.reconcileDoorPlacements(); // position the (possibly new) groups
     this.dockingSystem.refreshDoorInteractivity();
   }
 
