@@ -12,6 +12,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.13 — 2026-07-21
+
+### 🚪↔🛰️ One pose generator for doors and docking ports (#28 decouple, slice 1)
+
+Groundwork for making doors freely placeable (add/remove/move like furniture) while keeping the module-mesh intact: this splits the shared geometry into a single generator, with **zero behaviour change**.
+
+- Today one cardinal id (`north`/`south`/`east`/`west`) is the join key for five things at once — door placement, walk geometry, 3D hardware, passage policy, **and** the module-mesh pairing. This slice extracts the pure geometry into one function, `poseFromWall(wall, centreLateral, standLateral?)`, that every door **and** docking port will derive its pose from.
+- `physicalDoorPose` and the legacy/pairs layout tables are now expressed on top of that generator instead of hardcoded coordinate tables — proven **bit-for-bit identical** to the old tables by a golden test (420 comparisons across ids × layouts × slide deltas × room sizes, 0 mismatches). The legacy east/west −0.5 stand-offset quirk is preserved faithfully.
+- Introduces the `PortId` type and a `physicalPortPose` alias to name the structural **docking-port** seam. Ports stay the 4 cardinal ids for now, so **no wire-format change** — later slices split the pairing/mesh (which keys off ports) from the free-door layer.
+- No visible change: the exterior, room, and all four doors render exactly as before; `tsc` clean.
+- **Release line:** version bumped to 0.33.13, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.12 — 2026-07-21
 
 ### 🛰️ Dev: jump into a fresh standalone room (#79 P3 groundwork)
