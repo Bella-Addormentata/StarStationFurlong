@@ -1208,18 +1208,16 @@ export class VoxelCharacter {
       const paw = new THREE.Mesh(pawGeo, pawMat);
       addWithOutline(pawG, paw, 0.026);
 
-      const fingerSpec: Array<[number, number, number, number]> = [
-        // x       y       z      r
-        [-0.055, -0.105, 0.075, 0.040],
-        [ 0.000, -0.112, 0.085, 0.044],
-        [ 0.055, -0.105, 0.075, 0.040],
-      ];
-      for (const [fx, fy, fz, fr] of fingerSpec) {
-        const fGeo = new THREE.SphereGeometry(fr, 16, 12);
-        fGeo.scale(1.0, 0.85, 1.05);
-        const finger = new THREE.Mesh(fGeo, pawMat);
-        finger.position.set(fx, fy, fz);
-        addWithOutline(pawG, finger, 0.020);
+      // Hand CLEFTS — same rule as the feet: the sheet's mitten fingers
+      // are faint slice LINES on the lower front of the paw, not bump
+      // volumes. Two short thin strokes, half-buried.
+      const handCleftMat = bmat(PAL.outline);
+      for (const cx of [-0.028, 0.028]) {
+        const cleftGeo = new THREE.CylinderGeometry(0.005, 0.005, 0.055, 8);
+        const cleft = new THREE.Mesh(cleftGeo, handCleftMat);
+        cleft.position.set(cx, -0.118, 0.062);
+        cleft.rotation.x = 0.45;   // mostly vertical, following the
+        pawG.add(cleft);           // mitten's lower-front curve
       }
 
       // Outward hang (sheet front view): reduced to 0.10 — the tube's
@@ -1294,22 +1292,21 @@ export class VoxelCharacter {
       const foot = new THREE.Mesh(footGeo, pawMat);
       addWithOutline(footG, foot, 0.024);
 
-      // Three toe MOUNDS — the sheet's foot front gently scallops with
-      // three soft lobes (middle largest and slightly forward); the two
-      // cleft lines between them come from the outline shells and run
-      // back over the foot's top edge.
-      const toeSpec: Array<[number, number, number, number]> = [
-        // x       y       z      r
-        [-0.082, -0.048, 0.205, 0.056],
-        [ 0.000, -0.052, 0.225, 0.062],
-        [ 0.082, -0.048, 0.205, 0.056],
-      ];
-      for (const [tx, ty, tz, tr] of toeSpec) {
-        const toeGeo = new THREE.SphereGeometry(tr, 20, 16);
-        toeGeo.scale(1.0, 0.75, 1.15);
-        const toe = new THREE.Mesh(toeGeo, pawMat);
-        toe.position.set(tx, ty, tz);
-        addWithOutline(footG, toe, 0.022);
+      // Toe CLEFTS — the sheet's toes are NOT protruding volumes: the foot
+      // is ONE smooth mound and the toes are two short slice LINES cut
+      // into the front-top surface. Rendered like the smile arc: thin
+      // grey strokes half-buried in the surface, running from the front
+      // edge back over the top.
+      const cleftMat = bmat(PAL.outline);
+      for (const cx of [-0.041, 0.041]) {
+        const cleftGeo = new THREE.CylinderGeometry(0.0065, 0.0065, 0.095, 8);
+        const cleft = new THREE.Mesh(cleftGeo, cleftMat);
+        cleft.position.set(cx, 0.005, 0.21);
+        // Wrap the foot's front EDGE (≈60° tilt): reads as a short
+        // vertical slice from the front — the sheet's view — and a short
+        // line over the top from above. Flatter strokes showed as dots.
+        cleft.rotation.x = 1.05;
+        footG.add(cleft);
       }
     };
 
