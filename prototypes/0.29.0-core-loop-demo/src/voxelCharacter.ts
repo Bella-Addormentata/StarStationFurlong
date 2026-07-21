@@ -117,21 +117,26 @@ export function snapTo8Ways(angle: number): number {
  */
 const TAIL_REST_YAW = -0.45;
 
-// Reference-sheet palette — ALL-WHITE fur; the only dark marks are the face
-// features, in soft charcoal (never pure black — the sheet's linework is
-// grey). fur / furDeep / cream / accent keep SEPARATE material instances even
-// where the hex is identical, so the outfit palette-role recolors (issue #35)
-// can still dye each slot independently.
+// TEMPORARY FOX COLORWAY over the reference-sheet sculpt (owner call at
+// the checkpoint: "color in the model temporarily as a fox"). The all-white
+// sheet palette remains the base design — restoring it is a hex swap here.
+// Classic fox mapping: warm orange fur, cream muzzle/chest/tail-tip,
+// dark-brown socks & mittens, cream inner ears, warm dark linework.
+// fur / furDeep / cream / accent keep SEPARATE material instances even
+// where hexes match, so outfit palette-role recolors (issue #35) still dye
+// each slot independently — and the per-peer hue tint (world.ts
+// applyPeerTint) is visibly live again on these saturated colors.
 const PAL = {
-  fur:        0xffffff,  // main white body fur (role 'fur')
-  furShade:   0xd4d8e0,  // soft cool-grey — inner-ear cavity fill (role 'furDeep')
-  furShadeLo: 0xb9c0cc,  // deeper grey — innermost ear cavity accent
-  cream:      0xffffff,  // chest bib + muzzle zone (role 'cream' — white for now)
-  paw:        0xffffff,  // mitten paws + feet (role 'accent' — white for now)
+  fur:        0xe07a2c,  // warm orange body fur (role 'fur')
+  furShade:   0xf2e6cd,  // cream inner-ear cavity fill (role 'furDeep')
+  furShadeLo: 0xdfcfae,  // deeper cream — innermost ear cavity accent
+  cream:      0xfaf1d8,  // chest bib + muzzle zone + tail tip (role 'cream')
+  paw:        0x3a2214,  // dark-brown mitten paws + feet (role 'accent')
   nose:       0x2e2c32,  // charcoal — nose, mouth line
   noseHi:     0xffffff,  // nose highlight speck
   fang:       0xffffff,  // tiny visible tooth
-  outline:    0x99a0ac,  // soft grey line-art outline (matches sheet linework)
+  outline:    0x5a3a28,  // warm dark-brown line-art outline
+  pawLine:    0x1c100a,  // toe/finger cleft strokes (darker than the paws)
 };
 
 // ── Toon gradient (smooth airbrush ramp) ───────────────────────────────────
@@ -904,11 +909,11 @@ export class VoxelCharacter {
     // face isn't drawn.
     ctx.clearRect(0, 0, SIZE, SIZE);
 
-    // Reference-sheet face: the eyes are DARK GLOSSY OVALS (no cream sclera,
-    // no teal iris) with big white highlights, and thin brow strokes float
-    // above them. Charcoal tones, never pure black — matches PAL.nose.
-    const EYE      = '#35333a';
-    const EYE_SOFT = '#4a4852';   // subtle lighter lower-inner sheen
+    // Reference-sheet face structure (big glossy ovals, dual shines, thin
+    // brows) in the fox colorway's BLUE (owner call at the checkpoint —
+    // the sheet's charcoal was '#35333a'/'#4a4852').
+    const EYE      = '#2f5fa8';
+    const EYE_SOFT = '#4a80c8';   // subtle lighter lower-inner sheen
     const SHINE    = '#ffffff';
     const BROW     = '#3a383f';
 
@@ -1211,7 +1216,7 @@ export class VoxelCharacter {
       // Hand CLEFTS — same rule as the feet: the sheet's mitten fingers
       // are faint slice LINES on the lower front of the paw, not bump
       // volumes. Two short thin strokes, half-buried.
-      const handCleftMat = bmat(PAL.outline);
+      const handCleftMat = bmat(PAL.pawLine);
       for (const cx of [-0.028, 0.028]) {
         const cleftGeo = new THREE.CylinderGeometry(0.005, 0.005, 0.055, 8);
         const cleft = new THREE.Mesh(cleftGeo, handCleftMat);
@@ -1297,7 +1302,7 @@ export class VoxelCharacter {
       // into the front-top surface. Rendered like the smile arc: thin
       // grey strokes half-buried in the surface, running from the front
       // edge back over the top.
-      const cleftMat = bmat(PAL.outline);
+      const cleftMat = bmat(PAL.pawLine);
       for (const cx of [-0.041, 0.041]) {
         const cleftGeo = new THREE.CylinderGeometry(0.0065, 0.0065, 0.095, 8);
         const cleft = new THREE.Mesh(cleftGeo, cleftMat);
@@ -1338,6 +1343,9 @@ export class VoxelCharacter {
   //  the curve; the tip teardrops follow the end tangent.
   private _buildTail(): void {
     const furMat = tmat(PAL.fur, { emissiveBoost: 0.09 });
+    // Cream tip — the fox's iconic white tail tip (fox colorway); rides
+    // the 'cream' outfit role so palette swaps keep dyeing it.
+    const creamMat = tmat(PAL.cream, { emissiveBoost: 0.06 });
 
     // LOW-SLUNG BRUSH (sheet-checked, third pass): in every reference view
     // the tail's mass DROOPS to leg height — off the tailbone it heads
@@ -1530,7 +1538,7 @@ export class VoxelCharacter {
     // sibling locks. (The earlier long thin outlined teardrop stuck
     // straight out along the tangent and read as a hard cone spike at the
     // very tip of the tail.)
-    const tipMain = new THREE.Mesh(fluffGeo(0.155, 0.30, 26, 20), furMat);
+    const tipMain = new THREE.Mesh(fluffGeo(0.155, 0.30, 26, 20), creamMat);
     tipMain.position.set(
       0,
       spineY(0.95) - spineY(JOINT_TIP) - tipDirY * 0.10,
@@ -1544,7 +1552,7 @@ export class VoxelCharacter {
     // outline shells: a shell on a barely-embedded fluff draws a grey halo
     // leaf around its insertion (that was the grey patch at the bend
     // crook), and shell-less white-on-white locks need no linework.
-    const tipSide = new THREE.Mesh(fluffGeo(0.100, 0.23, 20, 16), furMat);
+    const tipSide = new THREE.Mesh(fluffGeo(0.100, 0.23, 20, 16), creamMat);
     tipSide.position.set(
       0,
       spineY(0.88) - spineY(JOINT_TIP) - tipDirY * 0.04,
@@ -1553,7 +1561,7 @@ export class VoxelCharacter {
     tipSide.rotation.x = Math.atan2(tipDirZ, tipDirY) - 0.62;
     tailTip.add(tipSide);
 
-    const tipThird = new THREE.Mesh(fluffGeo(0.070, 0.18, 18, 14), furMat);
+    const tipThird = new THREE.Mesh(fluffGeo(0.070, 0.18, 18, 14), creamMat);
     tipThird.position.set(
       0,
       spineY(0.92) - spineY(JOINT_TIP) - tipDirY * 0.03,
@@ -1578,7 +1586,7 @@ export class VoxelCharacter {
 
     // Outfit roles: the whole plume = fur (the sheet's tail is one colour;
     // furDeep/cream tail slots from the fox-marking era are gone).
-    this._tagPaletteRoles(this.tail, [[furMat, 'fur']]);
+    this._tagPaletteRoles(this.tail, [[furMat, 'fur'], [creamMat, 'cream']]);
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
