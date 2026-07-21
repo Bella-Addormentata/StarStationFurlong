@@ -31,6 +31,8 @@ const SIP_TIME = 5.0; // held in the paw, sipped over five seconds
 const SIP_CYCLES = 3; // paw-to-muzzle raises across the sip
 const GULP_TIME = 0.3; // drink shrinks away (drunk!)
 const SERVE_COOLDOWN = 6; // s before the next drink can be grabbed
+const DOCK_AFTER_SECS = 12; // 🔌 idle this long with no fox near → return to dock
+const DOCK_WAKE_RANGE = 4.5; // 🔌 a fox this close wakes the bot off the dock
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
 // (The glass is anchored to the fox's actual PAW via getPawWorldPos — the
 //  rig's drink-hold arm pose decides where waist/muzzle land, so no fixed
@@ -132,6 +134,14 @@ export class PoolWaiter {
 
   /** Waypoint loop this bot walks (ping-pong) — per-room floor plan. */
   private patrol: Array<[number, number]>;
+
+  /** 🔌 #77 Phase A: charging-dock target (world pos + facing), set per room by
+   *  the world from a placed 'charging-dock' item; null ⇒ pure patrol (no dock
+   *  behaviour). When idle past DOCK_AFTER_SECS with no fox near, the bot walks
+   *  here and plays a charge pose until a fox approaches. */
+  private dockTarget: { x: number; z: number; faceAngle: number } | null = null;
+  private activity: "PATROL" | "DOCK" = "PATROL";
+  private idleTimer = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -339,8 +349,70 @@ export class PoolWaiter {
       return;
     }
 
-    this.updatePatrol(dt);
-    if (player) this.maybeBeginServe(player);
+    // 🔌 #77 Phase A: idle→dock. A fox within range (or no dock at all) keeps
+    // the bot awake on patrol/serve; otherwise idle accrues and, past the
+    // threshold, the bot heads to its charging dock and holds a charge pose.
+    const foxNear = !!player && this.foxDistance(player) < DOCK_WAKE_RANGE;
+    if (foxNear || !this.dockTarget) {
+      this.idleTimer = 0;
+      this.activity = "PATROL";
+    } else {
+      this.idleTimer += dt;
+      if (this.idleTimer > DOCK_AFTER_SECS) this.activity = "DOCK";
+    }
+
+    if (this.activity === "DOCK") {
+      this.updateDock(dt);
+    } else {
+      this.updatePatrol(dt);
+      if (player) this.maybeBeginServe(player);
+    }
+  }
+
+  /** 🔌 Point the bot at a charging dock (world pos + facing). The world calls
+   *  this after locating a 'charging-dock' item; a room without one stays on
+   *  pure patrol. Passing null clears the dock and returns the bot to patrol. */
+  public setDock(dock: { x: number; z: number; faceAngle: number } | null): void {
+    this.dockTarget = dock;
+    if (!dock && this.activity === "DOCK") {
+      this.activity = "PATROL";
+      this.idleTimer = 0;
+    }
+  }
+
+  private foxDistance(player: Player): number {
+    const p = player.getPosition();
+    return Math.hypot(p.x - this.group.position.x, p.z - this.group.position.z);
+  }
+
+  /** 🔌 Walk to the dock, then hold a charge pose (legs still, slow recharge
+   *  bob, facing the dock). Yields the moment a fox comes near (handled in
+   *  update, which flips activity back to PATROL). */
+  private updateDock(dt: number): void {
+    const dock = this.dockTarget;
+    if (!dock) return;
+    const pos = this.group.position;
+    const dx = dock.x - pos.x;
+    const dz = dock.z - pos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist > 0.1) {
+      const nx = dx / dist;
+      const nz = dz / dist;
+      this.turnToward(Math.atan2(nx, nz), dt);
+      const step = Math.min(WALK_SPEED * dt, dist);
+      pos.x += nx * step;
+      pos.z += nz * step;
+      const swing = Math.sin(this.time * 5.2) * 0.45;
+      this.legL.rotation.x = swing;
+      this.legR.rotation.x = -swing;
+      this.body.position.y = Math.abs(Math.sin(this.time * 5.2)) * 0.025;
+    } else {
+      // Charging: face the dock, legs settle, a slow recharge bob.
+      this.turnToward(dock.faceAngle, dt);
+      this.legL.rotation.x = 0;
+      this.legR.rotation.x = 0;
+      this.body.position.y = Math.sin(this.time * 1.6) * 0.012;
+    }
   }
 
   private updatePatrol(dt: number): void {

@@ -1497,6 +1497,21 @@ export class World {
       this.poolWaiter = new PoolWaiter(this.scene, waiterPatrol);
     }
     this.poolWaiterPatrol = waiterPatrol;
+    // 🔌 #77 Phase A: hand the waiter its charging dock (if the room has one),
+    // so it returns there to recharge when idle. Re-read each apply so a moved
+    // or removed dock is reflected; the bot faces the room centre while docked.
+    if (this.poolWaiter) {
+      const dock = FURNITURE.find((i) => i.kind === "charging-dock");
+      this.poolWaiter.setDock(
+        dock
+          ? {
+              x: dock.pos.x,
+              z: dock.pos.z,
+              faceAngle: Math.atan2(-dock.pos.x, -dock.pos.z),
+            }
+          : null,
+      );
+    }
 
     const doorDeltas = readDoorDeltas();
     applyDoorSlideDeltas(doorDeltas);

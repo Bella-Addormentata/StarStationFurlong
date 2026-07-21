@@ -84,6 +84,7 @@ export type FurnitureKind =
   | "neon-ring"
   | "sun-lamp"
   | "skylight"
+  | "charging-dock"
   | "lazy-pool"
   | "hot-tub"
   | "classic-pool"
@@ -1108,6 +1109,23 @@ const buildSkylight = ({ m, place, addLight }: BuildCtx) => {
   place(new THREE.BoxGeometry(2 * B, 0.03, 2 * B), glass, 0, 3.86, 0);
   // Warm flood so the deck reads sunlit even before the backdrop is seen.
   addLight(new THREE.PointLight(0xffe9c4, 0, 22), 0, 3.5, 0, 4.5);
+};
+
+// 🔌 Charging dock (#77) — a low pad + a back post with a green charge light
+// where the robot servant returns to recharge when idle. Footprint null (a low
+// pad you can step over); the bot stands on it. The world hands its world pose
+// to the PoolWaiter, which walks here after DOCK_AFTER_SECS of no fox nearby.
+const buildChargingDock = ({ m, place }: BuildCtx) => {
+  const metal = m(0x3a4048, 0.4, 0.7);
+  const dark = m(0x14181e, 0.5, 0.5);
+  const glow = m(0x2fe6a0, 0.2, 0.1, 0x2fe6a0, 1.2); // charge-green indicator
+  place(new THREE.CylinderGeometry(0.55, 0.62, 0.08, 20), metal, 0, 0.04, 0); // pad
+  place(new THREE.CylinderGeometry(0.42, 0.42, 0.02, 20), dark, 0, 0.09, 0); // inlay
+  place(new THREE.TorusGeometry(0.34, 0.03, 8, 28), glow, 0, 0.1, 0, Math.PI / 2); // ring
+  place(new THREE.BoxGeometry(0.16, 0.92, 0.16), metal, 0, 0.5, -0.5); // post
+  place(new THREE.BoxGeometry(0.26, 0.26, 0.03), dark, 0, 0.62, -0.42); // plate
+  place(new THREE.BoxGeometry(0.09, 0.18, 0.05), glow, -0.03, 0.66, -0.4); // ⚡ bolt
+  place(new THREE.BoxGeometry(0.09, 0.18, 0.05), glow, 0.03, 0.58, -0.4);
 };
 
 // Tall cherry blossom tree (no collision — footprint: null, documented drift).
@@ -2660,6 +2678,12 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     kind: "skylight",
     build: buildSkylight,
     footprint: null,
+  },
+  "charging-dock": {
+    kind: "charging-dock",
+    build: buildChargingDock,
+    footprint: null,
+    functions: ["robotDock"],
   },
   "rug-back": { kind: "rug-back", build: buildRugBack, footprint: null },
   "rug-front": { kind: "rug-front", build: buildRugFront, footprint: null },
@@ -5609,6 +5633,15 @@ export function legacyThemeFromRoomId(roomId: string): RoomTheme {
  * remain reachable from any entrance.
  */
 export const CASINO_FURNITURE: FurnitureItem[] = [
+  // 🔌 Robot charging dock in a back corner — the waiter returns here to
+  // recharge when the floor is quiet (#77). Footprint null; the bot stands on it.
+  {
+    id: "casino-charging-dock",
+    kind: "charging-dock",
+    pos: { x: 4.5, z: 4.5 },
+    rot: 0,
+    movable: true,
+  },
   // 🎰 Neon halo over the gaming floor — the casino's light as a placeable
   // fixture (footprint null, hangs at the ceiling above the tables).
   {
