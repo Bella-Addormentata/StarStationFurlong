@@ -150,10 +150,6 @@ interface RemoteAvatar {
   diveStartY: number;
 }
 
-/** 🤖 #77C: robot-map key for the single theme robot a dockless authored room
- *  still shows (rooms WITH docks get one robot per dock instead). */
-const AMBIENT_ROBOT_KEY = "__ambient-robot";
-
 export class World {
   private scene: THREE.Scene;
   private player: Player;
@@ -166,8 +162,8 @@ export class World {
   /** 🚪 Glassy north wall backing the paired doors (no coverage rule). */
   private northWall: THREE.Mesh | null = null;
   /** 🤖 #77C: service/croupier robots, keyed by the CHARGING-DOCK item id they
-   *  belong to (one robot per placed dock), or the sentinel `AMBIENT_ROBOT_KEY`
-   *  for the single theme robot a dockless authored room still shows. */
+   *  belong to — one robot per placed dock. A room with NO dock has NO robot
+   *  (owner request 2026-07-21: robots come ONLY from the docking system). */
   private robots = new Map<string, PoolWaiter>();
   /** Route the live robots were built with — a change rebuilds them all. */
   private robotsPatrol: Array<[number, number]> | null = null;
@@ -3847,6 +3843,14 @@ export class World {
    * roomless route rebuilds all robots; otherwise it just spawns/disposes the
    * delta, so it is cheap to call on every furniture change (add/remove a dock).
    */
+  /** 🤖 Re-run the robot reconcile against the CURRENT furniture — the local
+   *  add path (dev-menu spawn) needs this because the doc-echo furniture
+   *  reconcile no-ops on a piece that's already been added locally, so a placed
+   *  charging-dock would otherwise not spawn its robot. Idempotent + cheap. */
+  public refreshRobots(): void {
+    this.reconcileRobots(this.robotsPatrol);
+  }
+
   private reconcileRobots(waiterPatrol: Array<[number, number]> | null): void {
     if (this.robotsPatrol !== waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
@@ -3859,8 +3863,10 @@ export class World {
       return;
     }
     const docks = FURNITURE.filter((i) => i.kind === "charging-dock");
-    const wanted =
-      docks.length > 0 ? docks.map((d) => d.id) : [AMBIENT_ROBOT_KEY];
+    // 🤖 Robots come ONLY from placed charging-docks (owner request) — one per
+    // dock, and NONE when the room has no dock. (Previously a dockless room
+    // showed a single ambient theme robot; that fallback is removed.)
+    const wanted = docks.map((d) => d.id);
     // Dispose robots whose dock is gone.
     for (const [key, bot] of [...this.robots]) {
       if (!wanted.includes(key)) {
@@ -3898,12 +3904,12 @@ export class World {
     this.applyRobotRoutines();
   }
 
-  /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (the
-   *  ambient robot has no config → default 'serve'). Cheap; also run on every
-   *  robotDoc change so a console edit re-drives behaviour without a reconcile. */
+  /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
+   *  unconfigured dock defaults to 'serve'). Cheap; also run on every robotDoc
+   *  change so a console edit re-drives behaviour without a reconcile. */
   private applyRobotRoutines(): void {
     for (const [key, bot] of this.robots) {
-      const cfg = key === AMBIENT_ROBOT_KEY ? null : readRobotConfig(key);
+      const cfg = readRobotConfig(key);
       bot.setRoutine(cfg?.routine ?? "serve");
       bot.setScript(cfg?.script ?? []);
       // 🤖 #77C s4: a custom-script 'say' step pops a bubble over the bot (one
@@ -3943,10 +3949,10 @@ export class World {
       }
     }
     // 🤖 #77C s3: routine-aware election. A dock robot programmed 'croupier' is
-    // preferred; if none is, a non-'idle' (serve/ambient) robot fills in so a
-    // default casino still gets a dealer; an 'idle' robot never croupiers.
+    // preferred; if none is, a non-'idle' (serve) robot fills in so a default
+    // casino still gets a dealer; an 'idle' robot never croupiers.
     const routineOf = (key: string): RobotRoutine =>
-      key === AMBIENT_ROBOT_KEY ? "serve" : readRobotConfig(key)?.routine ?? "serve";
+      readRobotConfig(key)?.routine ?? "serve";
     const hasDedicated = [...this.robots.keys()].some(
       (k) => routineOf(k) === "croupier",
     );
