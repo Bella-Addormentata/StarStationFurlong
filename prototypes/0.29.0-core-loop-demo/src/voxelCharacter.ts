@@ -619,18 +619,22 @@ export class VoxelCharacter {
       // their inner base edges stop ~0.12 either side of the centreline
       // (the head tuft fills the gap). Inner bound here is -0.18 in ear
       // space; with the group at ±0.30 the inner edge lands at ±0.12.
+      // SHEET RULE: the ear's BASE LINE SLOPES DOWN THE DOME — the inner
+      // base corner sits high near the crown while the outer corner rides
+      // low, meeting the head's silhouette edge. A level base left the
+      // outer side hovering in air beside the skull ("floating ears").
       const s = side;
       const outerShape = new THREE.Shape();
-      outerShape.moveTo(-0.18 * s, 0.02);
+      outerShape.moveTo(-0.18 * s, 0.06);
       // inner edge — near vertical, slight outward lean toward the tip
       outerShape.quadraticCurveTo(-0.20 * s, 0.55, -0.03 * s, 0.93);
       // POINTED tip (tiny rounding only — a domed tip reads rabbit, not fox)
       outerShape.quadraticCurveTo(0.03 * s, 1.00, 0.07 * s, 0.90);
-      // outer edge — long concave flare down to the wide base corner
-      outerShape.quadraticCurveTo(0.28 * s, 0.48, 0.46 * s, 0.02);
-      // base curve dips WELL below y=0 so the whole width embeds in the
-      // skull dome (floating outer corners were visible in the first cut)
-      outerShape.quadraticCurveTo(0.10 * s, -0.26, -0.18 * s, 0.02);
+      // outer edge — long concave flare down to the LOW outer base corner
+      outerShape.quadraticCurveTo(0.26 * s, 0.44, 0.36 * s, -0.10);
+      // diagonal base sweep back up to the inner corner, dipping below the
+      // dome line so the whole foot embeds in the skull
+      outerShape.quadraticCurveTo(0.04 * s, -0.34, -0.18 * s, 0.06);
 
       const outerGeo = new THREE.ExtrudeGeometry(outerShape, {
         depth: 0.10,
@@ -642,10 +646,13 @@ export class VoxelCharacter {
       });
       outerGeo.translate(0, 0, -0.05);   // centre the slab front-to-back
 
-      // WEDGE taper — a uniform extrusion reads as a flat board edge-on;
-      // the sheet's side view shows the ear thinning continuously toward
-      // the tip. Scales each vertex's depth by height (optionally pulling
-      // it backward so the cavity panels follow the shrinking front face).
+      // WEDGE taper + DOME CUP — a uniform flat extrusion reads as a board
+      // edge-on and its side edges stand off the skull's front-back curve.
+      // Per vertex: (1) depth scales down with height (thin toward the
+      // tip, like the sheet's side view); (2) a parabolic x² cup pulls the
+      // lateral edges backward so the ear hugs the dome (and gives the
+      // natural cupped-forward ear look); optional `pull` shifts the
+      // cavity panels back to follow the shrinking front face.
       const taperEar = (
         geo: THREE.BufferGeometry,
         h: number,
@@ -654,8 +661,10 @@ export class VoxelCharacter {
         const pos = geo.attributes.position;
         for (let i = 0; i < pos.count; i++) {
           const yy = Math.max(0, pos.getY(i));
+          const xx = pos.getX(i);
           const f = 1 - 0.68 * Math.min(1, yy / h);
-          pos.setZ(i, pos.getZ(i) * f - pull * Math.min(1, yy / h));
+          const cup = (xx * xx) / 2.0;
+          pos.setZ(i, (pos.getZ(i) - cup) * f - pull * Math.min(1, yy / h));
         }
         geo.computeVertexNormals();
       };
@@ -667,11 +676,11 @@ export class VoxelCharacter {
       // just in front of the outer slab (the sheet shades the whole inner
       // triangle with a clear rim of white around it).
       const cavShape = new THREE.Shape();
-      cavShape.moveTo(-0.090 * s, 0.12);
-      cavShape.quadraticCurveTo(-0.100 * s, 0.50, 0.000, 0.80);
+      cavShape.moveTo(-0.090 * s, 0.16);
+      cavShape.quadraticCurveTo(-0.100 * s, 0.52, 0.000, 0.80);
       cavShape.quadraticCurveTo(0.030 * s, 0.85, 0.060 * s, 0.77);
-      cavShape.quadraticCurveTo(0.190 * s, 0.44, 0.290 * s, 0.10);
-      cavShape.quadraticCurveTo(0.060 * s, 0.00, -0.090 * s, 0.12);
+      cavShape.quadraticCurveTo(0.180 * s, 0.42, 0.240 * s, 0.02);
+      cavShape.quadraticCurveTo(0.040 * s, -0.02, -0.090 * s, 0.16);
       const cavGeo = new THREE.ExtrudeGeometry(cavShape, {
         depth: 0.02,
         bevelEnabled: true,
@@ -687,11 +696,11 @@ export class VoxelCharacter {
 
       // Deepest cavity accent — smaller inset, deeper grey
       const coreShape = new THREE.Shape();
-      coreShape.moveTo(-0.030 * s, 0.22);
-      coreShape.quadraticCurveTo(-0.035 * s, 0.45, 0.010 * s, 0.64);
+      coreShape.moveTo(-0.030 * s, 0.24);
+      coreShape.quadraticCurveTo(-0.035 * s, 0.46, 0.010 * s, 0.64);
       coreShape.quadraticCurveTo(0.035 * s, 0.68, 0.055 * s, 0.62);
-      coreShape.quadraticCurveTo(0.115 * s, 0.42, 0.160 * s, 0.20);
-      coreShape.quadraticCurveTo(0.050 * s, 0.13, -0.030 * s, 0.22);
+      coreShape.quadraticCurveTo(0.105 * s, 0.40, 0.130 * s, 0.14);
+      coreShape.quadraticCurveTo(0.040 * s, 0.10, -0.030 * s, 0.24);
       const coreGeo = new THREE.ExtrudeGeometry(coreShape, {
         depth: 0.015,
         bevelEnabled: true,
@@ -731,10 +740,13 @@ export class VoxelCharacter {
       // Base sunk INTO the skull dome and tilted outward so the wide outer
       // corner tucks along the head's curve instead of hovering over it.
       // At ±0.30 the inner base edges clear the centreline by 0.12 each —
-      // the sheet's ears never touch in the middle.
+      // the sheet's ears never touch in the middle. Group-level y-squash
+      // sets the final ear height (owner call: less tall than the drawn
+      // 1.0 ear-space unit) without redrawing the outlines.
       g.position.set(side * 0.30, 0.82, -0.04);
       g.rotation.z = side * -0.16;
       g.rotation.x = -0.10;
+      g.scale.y = 0.82;
       return g;
     };
     this.leftEar  = buildEar(-1);
