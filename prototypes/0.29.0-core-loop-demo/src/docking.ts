@@ -72,6 +72,13 @@ function moveToward(current: number, target: number, maxStep: number): number {
   return current + Math.sign(d) * maxStep;
 }
 
+/** True for the 4 structural cardinal door ids (the docking berths). Free/genId
+ *  doors are NOT cardinal — the cardinal-only pose helpers (physicalDoorPose /
+ *  projectionPoseForDoor) must never be called with a free id. */
+function isCardinalDoorId(id: string): id is DoorId {
+  return id === "north" || id === "south" || id === "east" || id === "west";
+}
+
 export interface DockingState {
   doorId: "north" | "south" | "east" | "west";
   locked: boolean;
@@ -896,6 +903,37 @@ export class DoorDockingPortSystem {
             return;
           }
 
+          // 🛰️ #28 S6a: BLOCK a pairing whose module would dock ON TOP of an
+          // existing station module (the WARN's hard-stop half). Only when a
+          // chain projects the module, and only for a cardinal berth (the pose
+          // helper is cardinal-only); the connect target within the match radius
+          // is excluded by moduleOverlapAt. Keys off ports/atlas, never doors.
+          if (
+            isCardinalDoorId(activeDoorId) &&
+            state.segments &&
+            state.segments.length > 0
+          ) {
+            const currentId =
+              (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+            const clash = currentId
+              ? moduleOverlapAt(
+                  currentId,
+                  projectionPoseForDoor(
+                    activeDoorId,
+                    state.segments,
+                    state.farDoor,
+                  ),
+                  (d, s, f) => projectionPoseForDoor(d, s, f),
+                )
+              : null;
+            if (clash) {
+              alert(
+                `Can't dock here — the module would overlap ${clash.name}. Re-route the connector chain to a clear berth.`,
+              );
+              return;
+            }
+          }
+
           state.pairingPending = true;
           this.syncLEDStatus(activeDoorId, state);
 
@@ -1333,7 +1371,9 @@ export class DoorDockingPortSystem {
     // module — the connect target within 4.5 m is excluded). Advisory here;
     // the docking BLOCK arrives with the free-door editor (S6).
     const moduleClash = (() => {
-      if (segs.length === 0) return null;
+      // Cardinal berths only — projectionPoseForDoor is cardinal-only, so a
+      // free/genId door's keypad must not reach it (would throw).
+      if (segs.length === 0 || !isCardinalDoorId(doorId)) return null;
       const currentId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
       if (!currentId) return null;
