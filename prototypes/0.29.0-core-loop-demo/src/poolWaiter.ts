@@ -16,6 +16,7 @@
  */
 import * as THREE from "three";
 import type { Player } from "./player";
+import { CELL_SIZE, findPath, worldToCol, worldToRow } from "./pathfinding";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -147,6 +148,11 @@ export class PoolWaiter {
   private croupierPost: { x: number; z: number; faceAngle: number } | null = null;
   private activity: "PATROL" | "DOCK" | "CROUPIER" = "PATROL";
   private idleTimer = 0;
+  /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
+   *  walk goal (routes around furniture / through door openings instead of
+   *  clipping straight through), and the goal they were computed for. */
+  private path: Array<{ x: number; z: number }> = [];
+  private pathGoalKey = "";
 
   constructor(
     scene: THREE.Scene,
@@ -350,6 +356,7 @@ export class PoolWaiter {
     this.refill();
 
     if (this.servePhase !== "NONE") {
+      this.tray.visible = true; // 🍹 the tray only shows while serving drinks
       this.updateServe(dt, player);
       return;
     }
@@ -358,6 +365,7 @@ export class PoolWaiter {
     // (the room has a roulette table), the bot walks to the head of the wheel and
     // stands the table — no patrol, no dock, no serving.
     if (this.croupierPost) {
+      this.tray.visible = false; // a croupier carries no drink tray
       this.activity = "CROUPIER";
       this.updateCroupierPost(dt);
       return;
@@ -376,8 +384,10 @@ export class PoolWaiter {
     }
 
     if (this.activity === "DOCK") {
+      this.tray.visible = false; // docked/charging — tray stowed
       this.updateDock(dt);
     } else {
+      this.tray.visible = true; // patrolling/serve-ready — tray out
       this.updatePatrol(dt);
       if (player) this.maybeBeginServe(player);
     }
@@ -408,15 +418,57 @@ export class PoolWaiter {
   }
 
   /** 🎰 Walk to the wheel-head, then stand it: face the wheel with a small
-   *  "dealing" idle bob. Mirrors updateDock's walk-then-hold movement. */
+   *  "dealing" idle bob. */
   private updateCroupierPost(dt: number): void {
     const post = this.croupierPost;
     if (!post) return;
+    if (this.walkTo(dt, post.x, post.z, 0.12)) {
+      // Posted: face the wheel, legs settle, a small croupier idle.
+      this.turnToward(post.faceAngle, dt);
+      this.legL.rotation.x = 0;
+      this.legR.rotation.x = 0;
+      this.body.position.y = Math.sin(this.time * 2.2) * 0.02;
+    }
+  }
+
+  /**
+   * 🧭 #77C: walk toward (tx,tz) along an A*-routed path so the bot rounds
+   * furniture / passes through door openings instead of clipping straight
+   * through — the review's straight-line-through-tables gap. Recomputes the
+   * route only when the goal changes; if no path exists (target behind a wall,
+   * or the bot is off-grid) it falls back to a direct line so it never freezes.
+   * Returns true once within `arriveDist`; animates the leg swing while moving.
+   */
+  private walkTo(dt: number, tx: number, tz: number, arriveDist: number): boolean {
     const pos = this.group.position;
-    const dx = post.x - pos.x;
-    const dz = post.z - pos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-    if (dist > 0.1) {
+    if (Math.hypot(tx - pos.x, tz - pos.z) < arriveDist) {
+      this.path = [];
+      return true;
+    }
+    const key = `${tx.toFixed(1)},${tz.toFixed(1)}`;
+    if (key !== this.pathGoalKey) {
+      this.pathGoalKey = key;
+      this.path = findPath(
+        worldToRow(pos.z),
+        worldToCol(pos.x),
+        worldToRow(tz),
+        worldToCol(tx),
+      );
+    }
+    // Drop waypoints already reached, then aim at the next one (or the goal
+    // directly when the route is empty — the straight-line fallback).
+    let target = this.path[0] ?? { x: tx, z: tz };
+    let dx = target.x - pos.x;
+    let dz = target.z - pos.z;
+    let dist = Math.hypot(dx, dz);
+    while (this.path.length > 0 && dist < CELL_SIZE * 0.5) {
+      this.path.shift();
+      target = this.path[0] ?? { x: tx, z: tz };
+      dx = target.x - pos.x;
+      dz = target.z - pos.z;
+      dist = Math.hypot(dx, dz);
+    }
+    if (dist > 0.001) {
       const nx = dx / dist;
       const nz = dz / dist;
       this.turnToward(Math.atan2(nx, nz), dt);
@@ -427,13 +479,8 @@ export class PoolWaiter {
       this.legL.rotation.x = swing;
       this.legR.rotation.x = -swing;
       this.body.position.y = Math.abs(Math.sin(this.time * 5.2)) * 0.025;
-    } else {
-      // Posted: face the wheel, legs settle, a small croupier idle.
-      this.turnToward(post.faceAngle, dt);
-      this.legL.rotation.x = 0;
-      this.legR.rotation.x = 0;
-      this.body.position.y = Math.sin(this.time * 2.2) * 0.02;
     }
+    return false;
   }
 
   private foxDistance(player: Player): number {
@@ -447,22 +494,7 @@ export class PoolWaiter {
   private updateDock(dt: number): void {
     const dock = this.dockTarget;
     if (!dock) return;
-    const pos = this.group.position;
-    const dx = dock.x - pos.x;
-    const dz = dock.z - pos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-    if (dist > 0.1) {
-      const nx = dx / dist;
-      const nz = dz / dist;
-      this.turnToward(Math.atan2(nx, nz), dt);
-      const step = Math.min(WALK_SPEED * dt, dist);
-      pos.x += nx * step;
-      pos.z += nz * step;
-      const swing = Math.sin(this.time * 5.2) * 0.45;
-      this.legL.rotation.x = swing;
-      this.legR.rotation.x = -swing;
-      this.body.position.y = Math.abs(Math.sin(this.time * 5.2)) * 0.025;
-    } else {
+    if (this.walkTo(dt, dock.x, dock.z, 0.12)) {
       // Charging: face the dock, legs settle, a slow recharge bob.
       this.turnToward(dock.faceAngle, dt);
       this.legL.rotation.x = 0;
@@ -472,32 +504,14 @@ export class PoolWaiter {
   }
 
   private updatePatrol(dt: number): void {
-    const pos = this.group.position;
     const [tx, tz] = this.patrol[this.patrolIndex];
-    const dx = tx - pos.x;
-    const dz = tz - pos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-
-    if (dist < 0.08) {
+    if (this.walkTo(dt, tx, tz, 0.1)) {
+      // Reached this waypoint → ping-pong to the next.
       const next = this.patrolIndex + this.patrolDir;
       if (next < 0 || next >= this.patrol.length)
         this.patrolDir = -this.patrolDir as 1 | -1;
       this.patrolIndex += this.patrolDir;
-      return;
     }
-
-    const nx = dx / dist;
-    const nz = dz / dist;
-    this.turnToward(Math.atan2(nx, nz), dt);
-    const step = Math.min(WALK_SPEED * dt, dist);
-    pos.x += nx * step;
-    pos.z += nz * step;
-
-    // Leg swing + gentle body bob — the tray rides the body but stays level.
-    const swing = Math.sin(this.time * 5.2) * 0.45;
-    this.legL.rotation.x = swing;
-    this.legR.rotation.x = -swing;
-    this.body.position.y = Math.abs(Math.sin(this.time * 5.2)) * 0.025;
   }
 
   private turnToward(target: number, dt: number): void {

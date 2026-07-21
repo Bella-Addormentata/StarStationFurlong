@@ -12,6 +12,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.8 — 2026-07-21
+
+### 🤖🧭 The robot puts its tray away and stops walking through the furniture (#77 Phase C, slice 1)
+
+Two polish fixes to the service robot, ahead of the bigger "robots as placeable programmable furniture" work:
+
+- **The drink tray is stowed when the robot isn't serving.** A robot standing at a roulette wheel as croupier, or parked on its charging dock, no longer holds a tray of cocktails — the tray only appears while it's patrolling/serving drinks.
+- **The robot now routes around furniture.** Its walk (to a charging dock, to a roulette wheel-head, or along its patrol) follows an **A\*-pathfound route** through the room instead of a straight line, so it rounds tables and passes through door openings rather than clipping through them (closes the clip-through-tables gap flagged in the v0.33.7 review). If a target has no walkable route it falls back to a direct line, so the robot never freezes.
+- **Release line:** version bumped to 0.33.8, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.7 — 2026-07-21
 
 ### 🎰🤖 The owner's robot runs the roulette table (#77 Phase B)
