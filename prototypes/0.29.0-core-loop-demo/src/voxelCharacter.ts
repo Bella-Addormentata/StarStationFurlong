@@ -387,6 +387,11 @@ export class VoxelCharacter {
   // Torso "chest" group used for the subtle breathing scale
   private chest:    THREE.Group | null = null;
 
+  /** Skull profile deformation, shared with the face patch so the drawn
+   *  eyes keep hugging the sculpted (non-spherical) head front. Set in
+   *  _buildHead before _buildFaceDecal runs. */
+  private _sculptSkullProfile: ((geo: THREE.BufferGeometry) => void) | null = null;
+
   // ── Face + expression meshes (kept as refs for blink / smile lerp) ────────
   private leftEye:   THREE.Mesh | null = null;
   private rightEye:  THREE.Mesh | null = null;
@@ -509,14 +514,41 @@ export class VoxelCharacter {
     const noseHiMat  = bmat(PAL.noseHi);
     const fangMat    = tmat(PAL.fang,       { emissiveBoost: 0.10 });
 
-    // Skull — BIG rounded sphere, a touch wider than tall (sheet's front
+    // Skull — BIG rounded ball, a touch wider than tall (sheet's front
     // view). 64×44 segments: at play distance the silhouette must be a
     // perfect curve, no polygon flats.
+    //
+    // PROFILE SCULPT (sheet side view): the head is NOT a sphere from the
+    // side — the face front (brow→jaw) is nearly VERTICAL, flattened, with
+    // the nose riding proud of it, while the BACK of the skull bulges full
+    // and round, overhanging the nape. One shared vertex op shapes the
+    // skull AND the face patch so the drawn eyes keep hugging the surface.
+    // Both curves are quadratic (C1 at their start planes — no shading
+    // crease) and monotonic (no fold).
+    const sculptSkullProfile = (geo: THREE.BufferGeometry): void => {
+      const p = geo.attributes.position;
+      for (let i = 0; i < p.count; i++) {
+        const z = p.getZ(i);
+        if (z > 0.22) {
+          // flatten the face front (front pole 0.61 → ≈0.47)
+          p.setZ(i, z - (0.55 / 0.62) * Math.pow(z - 0.22, 2));
+        } else if (z < -0.15) {
+          // fuller occiput (back pole -0.61 → ≈-0.68)
+          p.setZ(i, z - (0.22 / 0.62) * Math.pow(z + 0.15, 2));
+        }
+      }
+      geo.computeVertexNormals();
+    };
+
     const skullGeo = new THREE.SphereGeometry(0.62, 64, 44);
     skullGeo.scale(1.08, 1.00, 0.98);   // sheet head reads ~1.1× wider than tall
+    sculptSkullProfile(skullGeo);
     skullGeo.translate(0, 0.42, 0);
     const skull = new THREE.Mesh(skullGeo, furMat);
     addWithOutline(this.head, skull, 0.028);
+    // Face-patch geometry applies the same sculpt in _buildFaceDecal via
+    // this hook (the patch is built later in this constructor pass).
+    this._sculptSkullProfile = sculptSkullProfile;
 
     // Muzzle — the sheet's side view shows a compact rounded snout mass
     // low-center on the face: a central bump carrying the nose, a soft
@@ -529,38 +561,42 @@ export class VoxelCharacter {
     // No outline shell on the muzzle mass — the sheet's face has NO
     // boundary line around the muzzle; the nose/smile float on the face
     // with soft shading only (an outlined circle read as a snout patch).
+    // The whole lower-face cluster rides the FLATTENED face plane (front
+    // ≈0.47 after the profile sculpt) — the nose stays the foremost point
+    // of the head like the sheet's side view, with the sheet's subtle
+    // step-back from nose → mouth → receding chin.
     const muzzleGeo = new THREE.SphereGeometry(0.16, 36, 26);
     muzzleGeo.scale(1.15, 0.82, 0.80);
     const muzzle = new THREE.Mesh(muzzleGeo, creamMat);
-    muzzle.position.set(0, 0.29, 0.50);
+    muzzle.position.set(0, 0.29, 0.455);
     this.head.add(muzzle);
 
     const cheekGeo = new THREE.SphereGeometry(0.105, 28, 20);
     cheekGeo.scale(1.20, 0.85, 0.72);
     for (const cs of [-1, 1] as const) {
       const cheekBulge = new THREE.Mesh(cheekGeo, creamMat);
-      cheekBulge.position.set(cs * 0.135, 0.265, 0.475);
+      cheekBulge.position.set(cs * 0.135, 0.265, 0.435);
       this.head.add(cheekBulge);   // no outline — blends into the muzzle mass
     }
 
     const chinGeo = new THREE.SphereGeometry(0.062, 22, 16);
     chinGeo.scale(1.25, 0.70, 0.85);
     const chin = new THREE.Mesh(chinGeo, creamMat);
-    chin.position.set(0, 0.115, 0.51);
+    chin.position.set(0, 0.115, 0.465);
     this.head.add(chin);
 
     // Nose — small charcoal rounded-triangle read (squashed sphere)
     const noseGeo = new THREE.SphereGeometry(0.055, 26, 20);
     noseGeo.scale(1.30, 0.85, 0.80);
     const nose = new THREE.Mesh(noseGeo, noseMat);
-    nose.position.set(0, 0.33, 0.635);
+    nose.position.set(0, 0.33, 0.575);
     addWithOutline(this.head, nose, 0.030);
     // Nose highlight speck — unlit, tiny
     const noseHi = new THREE.Mesh(
       new THREE.SphereGeometry(0.016, 14, 12),
       noseHiMat
     );
-    noseHi.position.set(-0.012, 0.35, 0.672);
+    noseHi.position.set(-0.012, 0.35, 0.612);
     this.head.add(noseHi);
 
     // Mouth — thin charcoal SMILE ARC (torus segment facing +Z), not a box.
@@ -569,7 +605,7 @@ export class VoxelCharacter {
     const mouthGeo = new THREE.TorusGeometry(0.075, 0.012, 12, 32, Math.PI * 0.8);
     mouthGeo.rotateZ(-Math.PI * 0.9);   // centre the arc about local -Y (smile)
     const mouth = new THREE.Mesh(mouthGeo, noseMat);
-    mouth.position.set(0, 0.215, 0.63);
+    mouth.position.set(0, 0.215, 0.572);
     this.head.add(mouth);
     this.mouth = mouth;
 
@@ -580,7 +616,7 @@ export class VoxelCharacter {
     const fangGeo = fluffGeo(0.018, 0.052, 14, 12);
     fangGeo.rotateX(Math.PI);           // point DOWN (base at the gum line)
     const fang = new THREE.Mesh(fangGeo, fangMat);
-    fang.position.set(-0.055, 0.165, 0.635);   // hangs from the smile arc
+    fang.position.set(-0.055, 0.165, 0.577);   // hangs from the smile arc
     this.head.add(fang);
 
     // ── FACE DECAL (canvas-drawn 2D eyes + brows) ────────────────────────
@@ -748,7 +784,9 @@ export class VoxelCharacter {
       // the sheet's ears never touch in the middle. Group-level y-squash
       // sets the final ear height (owner call: less tall than the drawn
       // 1.0 ear-space unit) without redrawing the outlines.
-      g.position.set(side * 0.30, 0.82, -0.04);
+      // z -0.10: the sheet's side view seats the ears on the BACK HALF of
+      // the crown, not centred over it.
+      g.position.set(side * 0.30, 0.82, -0.10);
       g.rotation.z = side * -0.16;
       g.rotation.x = -0.10;
       g.scale.y = 0.82;
@@ -763,13 +801,15 @@ export class VoxelCharacter {
     // — three soft fluff teardrops with their round bases pinned at the
     // mesh position so rotations splay them like real fur clumps.
     // All locks sweep the SAME direction (rotZ ≥ 0) — the sheet's tuft
-    // flops to one side as a single combed clump, not a symmetric splay.
+    // flops to one side as a single combed clump, not a symmetric splay —
+    // and hangs OVER THE FOREHEAD (side view: the flop breaks the crown
+    // line at the FRONT, bangs-like), hence the forward z shift + lean.
     const tuftSpec: Array<[number, number, number, number, number, number, number]> = [
       // x      y     z     r      h     rotX   rotZ   (fat plush clumps)
-      [ 0.00, 0.99, 0.14, 0.115, 0.32, -0.65,  0.10],
-      [-0.11, 0.98, 0.10, 0.090, 0.25, -0.60,  0.35],
-      [ 0.09, 0.99, 0.11, 0.085, 0.21, -0.55, -0.05],
-      [-0.04, 1.00, 0.16, 0.070, 0.17, -0.75,  0.22],
+      [ 0.00, 0.98, 0.18, 0.115, 0.32, -0.85,  0.10],
+      [-0.11, 0.97, 0.14, 0.090, 0.25, -0.75,  0.35],
+      [ 0.09, 0.98, 0.15, 0.085, 0.21, -0.70, -0.05],
+      [-0.04, 0.99, 0.20, 0.070, 0.17, -0.95,  0.22],
     ];
     for (const [x, y, z, r, h, rx, rz] of tuftSpec) {
       const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
@@ -799,6 +839,14 @@ export class VoxelCharacter {
         spike.rotation.z = -side * (Math.PI / 2 + tilt);
         addWithOutline(this.head, spike, 0.020);
       }
+
+      // Jaw lock — the sheet's PROFILE shows one fur lock breaking the
+      // lower-cheek line toward the back of the jaw; aimed out-down-back.
+      // No outline (barely-embedded fluff shells halo — see rump note).
+      const jaw = new THREE.Mesh(fluffGeo(0.075, 0.20, 18, 14), furMat);
+      jaw.position.set(side * 0.40, 0.16, -0.10);
+      jaw.rotation.set(-2.6, 0, -side * 0.55);
+      this.head.add(jaw);
     }
 
     // Outfit roles: skull / ears / tufts / ruffs = fur; muzzle zone = cream;
@@ -914,6 +962,10 @@ export class VoxelCharacter {
     const geo = new THREE.SphereGeometry(0.62, 48, 36, 0.871, 1.40, 0.82, 1.50);
     geo.scale(1.089, 1.008, 0.988);   // skull scale (1.08,1.0,0.98) × ~1.008 proud
                                       // (tighter = smaller dark sliver at profile)
+    // Follow the skull's flattened-face profile sculpt so the eyes stay on
+    // the surface (identical op on a ~0.8%-larger sphere ⇒ stays ~0.8%
+    // proud everywhere for this gentle deformation).
+    if (this._sculptSkullProfile) this._sculptSkullProfile(geo);
     const mat = new THREE.MeshBasicMaterial({
       map: tex,
       transparent: true,
@@ -960,6 +1012,18 @@ export class VoxelCharacter {
     const pearPts = new THREE.SplineCurve(pearCtrl).getPoints(36);
     const torsoGeo = new THREE.LatheGeometry(pearPts, 48);
     torsoGeo.scale(1.0, 1.0, 0.82);
+    // BELLY-FORWARD ASYMMETRY (sheet side view): the back line is flatter
+    // and straighter than the belly, which bows clearly forward — a
+    // symmetric lathe reads egg-like from the side. Front half +6%, back
+    // half −10% depth.
+    {
+      const tp = torsoGeo.attributes.position;
+      for (let i = 0; i < tp.count; i++) {
+        const z = tp.getZ(i);
+        tp.setZ(i, z * (z >= 0 ? 1.06 : 0.90));
+      }
+      torsoGeo.computeVertexNormals();
+    }
     const torso = new THREE.Mesh(torsoGeo, furMat);
     addWithOutline(this.chest, torso, 0.024);
 
