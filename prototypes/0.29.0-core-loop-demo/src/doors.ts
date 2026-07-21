@@ -19,6 +19,7 @@
 
 import { physicalDoorPose } from "./doorLayout";
 import type { PhysicalDoorId } from "./doorLayout";
+import type { DoorLayoutRecord } from "./doorLayoutDoc";
 
 export type DoorId = PhysicalDoorId;
 
@@ -60,6 +61,32 @@ export const DOORS: DoorTarget[] = [
     faceAngle: Math.PI / 2,
   },
 ];
+
+/**
+ * 🚪↔🛰️ #28 S4: reconcile DOORS MEMBERSHIP from the synced door-layout map
+ * (doorLayoutDoc). Remove doors absent from the registry, add new ones; leave
+ * existing entries alone — their position is (re)set by applyDoorSlideDeltas and
+ * their runtime `enabled` is owned by the room (updateNorthDoorForFireplace /
+ * casino). DOORS is mutated IN PLACE — never reassigned — because it is imported
+ * as a live binding across the app (world / devMenu / editMode). For the steady
+ * 4-cardinal state this is a no-op, so behaviour is identical to the old literal.
+ */
+export function rebuildDoors(records: Map<string, DoorLayoutRecord>): void {
+  for (let i = DOORS.length - 1; i >= 0; i--) {
+    if (!records.has(DOORS[i].id)) DOORS.splice(i, 1);
+  }
+  for (const rec of records.values()) {
+    if (DOORS.some((d) => d.id === rec.id)) continue; // existing — untouched
+    const pose = physicalDoorPose(rec.id as DoorId, 0);
+    DOORS.push({
+      id: rec.id as DoorId,
+      enabled: rec.enabled ?? true,
+      front: { x: pose.front.x, z: pose.front.z },
+      through: { x: pose.through.x, z: pose.through.z },
+      faceAngle: pose.faceAngle,
+    });
+  }
+}
 
 /** Find a door by its id, or null when the id is unknown. */
 export function findDoor(id: string): DoorTarget | null {
