@@ -11,6 +11,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
+## v0.32.43 — 2026-07-20
+
+### 🌌 Make the indoors feel outdoors — real space through a glass ceiling
+
+A room can now become an open-air **outdoor deck**: you look UP through real structural glass at the same space the station exterior shows, under bright warm light. Space-station-consistent — no fake Earth sky.
+
+- **🪟 New `skylight` fixture** — a metal-framed glass ceiling panel (2×2 panes, faint transparent glazing) plus a warm flood light. Footprint-less (walk under it), spawnable, and its glass uses the morph-safe `baseOpacity` so it never snaps opaque.
+- **🌌 Room `theme` system** — `applyRoomVisuals` now paints from a room's theme (`interior` / `casino` / `outdoor-deck`), resolved from `roomInfo` with a legacy fall-back so the authored rooms paint right at the first frame. An `outdoor-deck` un-hides the **real animated nebula + starfield + a new orbiting ocean-planet** and switches to warm, bright "beach daylight," via a single centralized backdrop toggle that self-cleans on leave — no space leaks into the lobby or casino.
+- **🏝️ The outdoor pool room is now a space deck** — its old flat sky-blue is replaced by real space + ceiling skylights + the ocean-planet.
+- **Composable** — pool templates carry skylights + the deck theme; a new **"Sky Deck"** template turns any provisioned module into an open-air terrace; provisioning stamps the theme so casino / pool / deck modules paint their FULL look (floor, walls, decor, lighting, backdrop — not a half-theme).
+- **Release line:** `prototypes/0.29.0-core-loop-demo/` (version bumped to 0.32.43, all nine locations). **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.32.42 — 2026-07-20
 
 ### 💡 A light for every room — four new ceiling fixtures, wired in
