@@ -68,6 +68,21 @@ export function getIdentityPub(): string {
   return b64urlEncode(getPubBytes());
 }
 
+/**
+ * 🆕 #79: is there ALREADY a stored identity seed? True ⇒ a returning install.
+ * READ-ONLY — never mints (unlike getIdentityPub), so the boot can detect a
+ * genuine first run before anything lazily creates the seed. In privacy mode
+ * (no localStorage) we can't tell, so treat it as "not stored" (first run).
+ */
+export function hasStoredIdentity(): boolean {
+  if (cachedSeed) return true;
+  try {
+    return localStorage.getItem(SEED_STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
 /** Short human fingerprint of our identity (first 8 hex chars of the pubkey). */
 export function getIdentityFingerprint(): string {
   return ed.etc.bytesToHex(getPubBytes()).slice(0, 8);
