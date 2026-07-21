@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.11 — 2026-07-21
+
+### 🤖📝 Write your robot a custom script (#77 Phase C, slice 4 — Phase C complete)
+
+The dock console gains a fourth routine — **Custom script** — with a little step editor, so a robot can do more than the presets: walk a route and talk.
+
+- **A bounded step list the robot loops:** **Go to (x, z)** (it A\*-walks there), **Say "…"** (a speech bubble pops over its head), and **Wait N s**. Add / edit / remove steps in the console; up to 16 steps.
+- **Synced + owner-only**, like the routine presets — the script rides the shared `robot` map, so every client's copy of the robot runs the same loop (a greeter that paces a lobby, a tour guide that stops and announces, a patroller with lines).
+- **Safe:** every step is validated on read (a malformed peer write just falls back to Serve), and `say` text is escaped in the editor and rendered as plain text in the bubble.
+- Verified live: a `go-to → say → wait` script walks the robot to the waypoint, pops its line, waits, and loops; the editor's add/edit/remove all persist.
+- **This completes #77 Phase C** — robots are now placeable furniture (one per dock), programmable with routine presets *or* a custom script, they stow their tray off-duty, and they pathfind around the room.
+- **Release line:** version bumped to 0.33.11, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.10 — 2026-07-21
 
 ### 🤖🖥️ Program the robot at its dock (#77 Phase C, slice 3)

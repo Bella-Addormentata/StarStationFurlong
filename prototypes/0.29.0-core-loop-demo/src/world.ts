@@ -3876,6 +3876,12 @@ export class World {
     for (const [key, bot] of this.robots) {
       const cfg = key === AMBIENT_ROBOT_KEY ? null : readRobotConfig(key);
       bot.setRoutine(cfg?.routine ?? "serve");
+      bot.setScript(cfg?.script ?? []);
+      // 🤖 #77C s4: a custom-script 'say' step pops a bubble over the bot (one
+      // per robot, replaced each line) — local, like the croupier's narration.
+      bot.setSayHandler((text, x, z) =>
+        spawnFixedBubble(`robotsay:${key}`, text, x, z),
+      );
     }
   }
 
@@ -3918,6 +3924,7 @@ export class World {
     const eligible = (k: string): boolean =>
       this.robots.has(k) &&
       routineOf(k) !== "idle" &&
+      routineOf(k) !== "custom" &&
       (!hasDedicated || routineOf(k) === "croupier");
     if (!post) {
       this.croupierRobotKey = null;
