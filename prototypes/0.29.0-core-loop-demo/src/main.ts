@@ -41,6 +41,7 @@ import {
   exportRecoveryKey,
   importRecoveryKey,
   ysyncSigner,
+  hasStoredIdentity,
 } from "./keypair";
 import { roomEdit, setRoomEditPermission } from "./editMode";
 import { bindGamesDoc } from "./games/gamesDoc";
@@ -6236,8 +6237,14 @@ function setupClickToEnter() {
   let exteriorReady = false;
   let faded = false;
 
+  // 🆕 #79 P1: a genuine first run (no stored identity seed) holds the title on
+  // a New Player / Load-from-Backup choice before the station reveals; a
+  // returning install auto-reveals its station as before (proceedChosen = true).
+  const firstRun = !hasStoredIdentity();
+  let proceedChosen = !firstRun;
+
   const maybeFade = () => {
-    if (faded || !dwellDone || !exteriorReady) return;
+    if (faded || !dwellDone || !exteriorReady || !proceedChosen) return;
     faded = true;
     // 🎬 Pre-entry ends with the curtain: HUD elements gated on it (the
     // SpacePhone tip) become eligible again — the exterior-active gate keeps
@@ -6255,6 +6262,56 @@ function setupClickToEnter() {
     // visible — intro clicks can never raycast through the curtain.
     window.addEventListener("click", onCanvasClick);
   };
+
+  // 🆕 #79 P1: on a first run, replace the "Click to Enter" hint with the
+  // New Player / Load-from-Backup choice. New Player reveals the station now;
+  // Load-from-Backup's restore is wired in the next slice (no key handling
+  // here). A returning install skips this and auto-reveals as before.
+  if (firstRun) {
+    const content = document.getElementById("welcome-content");
+    const hint = content?.querySelector<HTMLElement>(".hint") ?? null;
+    if (hint) hint.style.display = "none";
+    if (content) {
+      const primary =
+        "padding:12px 30px; font:700 15px/1 inherit; letter-spacing:1.5px; color:#1a1206; " +
+        "background:linear-gradient(180deg,#ffd879,#f0b429); border:2px solid #ffe9a8; " +
+        "border-radius:12px; cursor:pointer; box-shadow:0 4px 18px rgba(240,180,41,0.4);";
+      const secondary =
+        "padding:9px 22px; font:600 12px/1 inherit; letter-spacing:1px; color:#f0d090; " +
+        "background:rgba(20,14,6,0.55); border:1px solid rgba(240,180,41,0.4); " +
+        "border-radius:10px; cursor:pointer;";
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "display:flex; flex-direction:column; gap:12px; margin-top:24px; align-items:center;";
+      const btnNew = document.createElement("button");
+      btnNew.type = "button";
+      btnNew.textContent = "🚀  NEW PLAYER";
+      btnNew.style.cssText = primary;
+      btnNew.addEventListener("click", (e) => {
+        e.stopPropagation();
+        wrap.remove();
+        dwellDone = true; // proceed at once — don't wait out the intro dwell
+        proceedChosen = true;
+        maybeFade();
+      });
+      const btnLoad = document.createElement("button");
+      btnLoad.type = "button";
+      btnLoad.textContent = "🔑  LOAD FROM BACKUP";
+      btnLoad.style.cssText = secondary;
+      const note = document.createElement("div");
+      note.style.cssText =
+        "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.75); min-height:15px; max-width:280px; text-align:center;";
+      btnLoad.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // Next slice wires this to the existing recovery-key restore
+        // (keypair.importRecoveryKey) — intentionally no key handling yet.
+        note.textContent =
+          "Restore from your recovery key is coming next — choose New Player to start.";
+      });
+      wrap.append(btnNew, btnLoad, note);
+      content.appendChild(wrap);
+    }
+  }
 
   setTimeout(() => {
     dwellDone = true;
