@@ -154,6 +154,9 @@ export class PoolWaiter {
    *  roulette table (else wait at the dock); 'idle' = just wait at the dock;
    *  'custom' = loop the owner-authored `script`. */
   private routine: RobotRoutine = "serve";
+  /** 🤖 STOP/START: when true the bot parks on its dock (off), overriding the
+   *  routine + croupier duty. Set from the dock console via the world. */
+  private parked = false;
   /** 🤖 #77C s4: the custom step list (routine 'custom') + loop cursor/timer, and
    *  the world-provided handler that renders a 'say' bubble over the bot. */
   private script: RobotStep[] = [];
@@ -383,6 +386,17 @@ export class PoolWaiter {
       return;
     }
 
+    // 🤖 STOP/START (owner request): a PARKED bot walks back to its dock and
+    // stands on it, OFF — overriding routine + croupier duty. (A mid-serve above
+    // finishes first, then the next frame parks.)
+    if (this.parked) {
+      this.tray.visible = false;
+      this.activity = "DOCK";
+      if (this.dockTarget) this.updateDock(dt);
+      else this.idlePose();
+      return;
+    }
+
     // 🎰🤖 #77 Phase B: croupier duty takes priority. With a wheel-head post set
     // (the room has a roulette table), the bot walks to the head of the wheel and
     // stands the table — no patrol, no dock, no serving.
@@ -448,6 +462,13 @@ export class PoolWaiter {
   /** 🤖 #77C s3: set the owner-programmed routine (from the dock's console). */
   public setRoutine(routine: RobotRoutine): void {
     this.routine = routine;
+  }
+
+  /** 🤖 STOP/START: park the bot on its dock (true) or release it to its routine
+   *  (false). Parking heads it to the dock immediately. */
+  public setParked(parked: boolean): void {
+    if (parked && !this.parked) this.activity = "DOCK";
+    this.parked = parked;
   }
 
   /** 🤖 #77C s4: set the custom step list. Resets the loop only when the script

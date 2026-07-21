@@ -1893,6 +1893,17 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       return `<div style="display:flex; align-items:center; gap:6px; font-size:10px; color:${CH_GOLD};">${body}${del}</div>`;
     };
     const script = curScript();
+    // 🤖 STOP/START (owner request): a big toggle to park the robot on its dock.
+    const parked = cfg?.parked === true;
+    const parkBtn = `<button data-park="1" ${owner ? '' : 'disabled'} style="
+      display:flex; justify-content:center; align-items:center;
+      padding:10px 12px; width:100%;
+      background:${parked ? 'rgba(47,230,160,0.16)' : 'rgba(255,138,80,0.12)'};
+      border:1px solid ${parked ? '#2fe6a0' : '#ff8a50'};
+      border-radius:7px; color:${parked ? '#2fe6a0' : '#ff8a50'};
+      font-family:inherit; font-size:12px; font-weight:800; letter-spacing:0.5px;
+      cursor:${owner ? 'pointer' : 'default'};
+    ">${parked ? '▶ START · resume routine' : '⏸ STOP · park at dock'}</button>`;
     const addBtn = (kind: string, label: string): string =>
       `<button data-add="${kind}" style="flex:1; padding:6px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,0.35); border-radius:6px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; font-weight:800; cursor:pointer;">${label}</button>`;
     const editor =
@@ -1913,6 +1924,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🤖 ROBOT PROGRAM</span>
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
+      ${parkBtn}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">ROUTINE</div>
       <div style="display:flex; flex-direction:column; gap:8px;">
         ${ROBOT_ROUTINES.map(routineBtn).join('')}
@@ -1928,12 +1940,23 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       </div>
     `;
     if (!owner) return;
+    // 🤖 STOP/START: toggle parked, preserving routine + script.
+    panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
+      const c = readRobotConfig(deps.itemId);
+      writeRobotConfig(deps.itemId, {
+        routine: c?.routine ?? 'serve',
+        ...(c?.script?.length ? { script: c.script } : {}),
+        parked: !(c?.parked === true),
+      });
+    });
     panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
       b.addEventListener('click', () => {
-        // Keep any authored script when switching routines.
+        // Keep any authored script AND the parked state when switching routines.
+        const c = readRobotConfig(deps.itemId);
         writeRobotConfig(deps.itemId, {
           routine: b.dataset.routine as RobotRoutine,
           ...(script.length ? { script } : {}),
+          ...(c?.parked ? { parked: true } : {}),
         });
       });
     });
