@@ -31,6 +31,10 @@ export interface RobotConfig {
   routine: RobotRoutine;
   /** Only meaningful when routine === 'custom'. */
   script?: RobotStep[];
+  /** 🤖 STOP/START (owner request): parked = the robot walks back to its dock and
+   *  stands on it, OFF, overriding the routine. START (parked false/absent)
+   *  resumes the routine. Independent of `routine` so it survives a routine edit. */
+  parked?: boolean;
 }
 
 export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom'];
@@ -105,6 +109,7 @@ function isRobotConfig(value: unknown): value is RobotConfig {
     if (!Array.isArray(c.script) || c.script.length > MAX_SCRIPT_STEPS) return false;
     if (!c.script.every(isRobotStep)) return false;
   }
+  if (c.parked !== undefined && typeof c.parked !== 'boolean') return false;
   return true;
 }
 

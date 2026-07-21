@@ -12,6 +12,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.22 — 2026-07-21
+
+### 🤖⏸ Park a robot with a STOP/START button (#77 follow-up)
+
+The dock's robot console gains a big **STOP / START** toggle so you can park a robot when you don't want it active.
+
+- **STOP** parks the robot: it walks back to its dock and stands on it, off — overriding whatever routine it's running (serve / croupier / custom). **START** releases it back to its routine.
+- Parking is **independent of the routine** (a synced `parked` flag on the dock config), so it survives a routine change and syncs to everyone in the room, like the rest of the console.
+- Verified live: setting a robot to parked walks it to its dock and stands it there (arrived within 0.1 m of the dock), and clearing it resumes the routine; `tsc` clean; no console errors. (The button itself sits in the dock's robot console alongside the routine buttons — owner-to-eyeball, as the console couldn't be opened in the test harness.)
+- **Release line:** version bumped to 0.33.22, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.21 — 2026-07-21
 
 ### 🤖 Robots come only from placed docks (#77 follow-up)

@@ -3912,6 +3912,7 @@ export class World {
       const cfg = readRobotConfig(key);
       bot.setRoutine(cfg?.routine ?? "serve");
       bot.setScript(cfg?.script ?? []);
+      bot.setParked(cfg?.parked ?? false); // 🤖 STOP/START park override
       // 🤖 #77C s4: a custom-script 'say' step pops a bubble over the bot (one
       // per robot, replaced each line) — local, like the croupier's narration.
       bot.setSayHandler((text, x, z) =>
