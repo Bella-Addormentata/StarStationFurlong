@@ -115,6 +115,9 @@ import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
+import { buildOctagonHull } from "./octagonHull";
+import type { OctagonHull } from "./octagonHull";
+import { getCameraYaw } from "./cameraRig";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -150,6 +153,13 @@ interface RemoteAvatar {
   diveStartY: number;
 }
 
+/** 🛑📐 #80 S1: render each room as an OCTAGON barrel (walls + 45° roof +
+ *  basement) instead of the flat open-top box. Preview-gated OFF by default —
+ *  `?octagon=1` turns it on so collaborators can see the new shell without
+ *  changing any existing room. Same URL-flag idiom as ?devzoom / ?vestibule. */
+const OCTAGON_HULL =
+  new URLSearchParams(window.location.search).get("octagon") === "1";
+
 export class World {
   private scene: THREE.Scene;
   private player: Player;
@@ -184,6 +194,8 @@ export class World {
   // Dynamic outer structural elements (Roof & complete outer hull walls for Level 3 visual context)
   private capsuleRoof: THREE.Mesh | null = null;
   private capsuleOuterWalls: THREE.Mesh[] = [];
+  // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
+  private octagonHull: OctagonHull | null = null;
   // Active interactive docking doors subsystem
   public dockingSystem: DoorDockingPortSystem | null = null;
   // ── Adapter transit (T1 of issue #30) ───────────────────────────────────────
@@ -582,7 +594,14 @@ export class World {
     // Add corner markers and edges
     this.addCornerMarkers();
     this.addPlatformEdgeLights();
-    this.addSideWalls();
+    // 🛑📐 #80 S1: the octagon hull REPLACES the two flat interior side walls
+    // with the full barrel (walls + 45° roof + basement) when previewing.
+    // The exterior capsule (zoom ≥ 3) is left untouched either way.
+    if (OCTAGON_HULL) {
+      this.addOctagonHull();
+    } else {
+      this.addSideWalls();
+    }
     this.addCapsuleOuterStructure();
     this.addLobbyFurniture();
     this.addAtmosphereEffects();
@@ -847,6 +866,25 @@ export class World {
     leftWall.position.set(-halfX, 2.0, 0);
     this.platformGroup.add(leftWall);
     this.capsuleOuterWalls.push(leftWall);
+  }
+
+  /**
+   * 🛑📐 #80 S1: build the octagon hull barrel (walls + 45° roof + basement)
+   * from the room's half-extents and add it to the platform. Preview only
+   * (`?octagon=1`) — the camera-facing wall fade is driven each frame in
+   * update(); the barrel hides at exterior zoom (≥3) like the interior walls.
+   */
+  private addOctagonHull() {
+    // Idempotent: a morph restart re-runs createPlatform, so drop any prior
+    // barrel before rebuilding (mirrors the vestibule dispose discipline).
+    if (this.octagonHull) {
+      this.platformGroup.remove(this.octagonHull.group);
+      this.octagonHull.dispose();
+      this.octagonHull = null;
+    }
+    const { halfX, halfZ } = roomHalfExtents();
+    this.octagonHull = buildOctagonHull({ halfX, halfZ });
+    this.platformGroup.add(this.octagonHull.group);
   }
 
   /**
@@ -2698,6 +2736,9 @@ export class World {
         wall.visible = false;
       });
       if (this.northWall) this.northWall.visible = false;
+      // 🛑📐 #80 S1: the interior octagon barrel gives way to the exterior
+      // capsule at zoom ≥ 3 (same as the interior side walls).
+      if (this.octagonHull) this.octagonHull.group.visible = false;
 
       if (zoomLevel === 4) {
         // Level 4 (Space Station) uses a simpler silhouette/solid representation of the capsules
@@ -2758,6 +2799,8 @@ export class World {
         wall.visible = !this.hullEditView && !this.sideWallCovered[i];
       });
       if (this.northWall) this.northWall.visible = !this.hullEditView;
+      // 🛑📐 #80 S1: restore the interior octagon barrel at room/first-person.
+      if (this.octagonHull) this.octagonHull.group.visible = !this.hullEditView;
 
       // Completely clear and hide outer capsule roof and shielding so they don't block the camera!
       if (this.capsuleRoof) {
@@ -2804,6 +2847,18 @@ export class World {
         fadeEnabled,
         this.player.getActiveDoorId(),
       );
+    }
+
+    // 🛑📐 #80 S1: drive the octagon hull's camera-facing wall transparency —
+    // near faces (outside skin toward the camera) fade so the iso view sees
+    // into the room; far faces stay glassy showing their inside surface. In
+    // first person (zoom ≤ 1) every wall stays solid. Same camera-XZ math as
+    // the #51 door fade above.
+    if (this.octagonHull) {
+      const yaw = getCameraYaw();
+      const camX = (Math.cos(yaw) + Math.sin(yaw)) * Math.SQRT1_2;
+      const camZ = (Math.cos(yaw) - Math.sin(yaw)) * Math.SQRT1_2;
+      this.octagonHull.updateFacing(camX, camZ, zoomLevel <= 1);
     }
 
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
