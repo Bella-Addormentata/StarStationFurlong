@@ -528,14 +528,31 @@ export class VoxelCharacter {
     const sculptSkullProfile = (geo: THREE.BufferGeometry): void => {
       const p = geo.attributes.position;
       for (let i = 0; i < p.count; i++) {
-        const z = p.getZ(i);
+        const x = p.getX(i);
+        const y = p.getY(i);
+        let z = p.getZ(i);
         if (z > 0.22) {
           // flatten the face front (front pole 0.61 → ≈0.47)
-          p.setZ(i, z - (0.55 / 0.62) * Math.pow(z - 0.22, 2));
+          z = z - (0.55 / 0.62) * Math.pow(z - 0.22, 2);
+          // BROW-STOP: the sheet's profile has a tiny concave dip where
+          // the forehead meets the nose bridge (a gaussian band at brow
+          // height, front faces only)
+          z -= 0.018 * Math.exp(-Math.pow((y - 0.50) / 0.10, 2));
         } else if (z < -0.15) {
           // fuller occiput (back pole -0.61 → ≈-0.68)
-          p.setZ(i, z - (0.22 / 0.62) * Math.pow(z + 0.15, 2));
+          z = z - (0.22 / 0.62) * Math.pow(z + 0.15, 2);
         }
+        p.setZ(i, z);
+        // CROWN FLATTEN: the sheet's front view tops the head with a
+        // gentle flat between the ears, not a dome peak
+        if (y > 0.45) {
+          p.setY(i, y - (0.50 / 0.62) * Math.pow(y - 0.45, 2));
+        }
+        // CHEEK-LEVEL WIDTH: the head is WIDEST below the eye line (the
+        // sheet's face is a soft rounded-square, fullest at the cheeks) —
+        // a gaussian width band, max +5% at cheek height
+        const band = Math.exp(-Math.pow((y - 0.10) / 0.22, 2));
+        p.setX(i, x * (1 + 0.05 * band));
       }
       geo.computeVertexNormals();
     };
@@ -999,8 +1016,11 @@ export class VoxelCharacter {
     // segments) so the silhouette is one continuous curve — the widest
     // point sits at lower-belly height; front-back flattened 18% so the
     // body isn't a perfect ball from the side (sheet side view).
+    // Bottom two points make the sheet's belly-to-crotch S-tuck (the
+    // underside curls in before meeting the legs, not a flat cap).
     const pearCtrl: THREE.Vector2[] = [
-      new THREE.Vector2(0.000, -0.42),
+      new THREE.Vector2(0.000, -0.445),
+      new THREE.Vector2(0.130, -0.425),
       new THREE.Vector2(0.240, -0.38),
       new THREE.Vector2(0.400, -0.24),
       new THREE.Vector2(0.455, -0.06),
@@ -1012,15 +1032,22 @@ export class VoxelCharacter {
     const pearPts = new THREE.SplineCurve(pearCtrl).getPoints(36);
     const torsoGeo = new THREE.LatheGeometry(pearPts, 48);
     torsoGeo.scale(1.0, 1.0, 0.82);
-    // BELLY-FORWARD ASYMMETRY (sheet side view): the back line is flatter
-    // and straighter than the belly, which bows clearly forward — a
-    // symmetric lathe reads egg-like from the side. Front half +6%, back
-    // half −10% depth.
+    // BELLY-FORWARD ASYMMETRY + BACK-S (sheet side view): the belly bows
+    // clearly forward (+6% depth) while the back is NOT one flat line —
+    // it's an S: flat across the shoulder-blades (−13%), easing into a
+    // RUMP BULGE below the waist (−3%) before the tail. The front/back
+    // factors blend through a smoothstep band across z=0 so the side seam
+    // is C1 (a hard two-branch scale left a derivative kink — audit note).
     {
       const tp = torsoGeo.attributes.position;
       for (let i = 0; i < tp.count; i++) {
+        const y = tp.getY(i);
         const z = tp.getZ(i);
-        tp.setZ(i, z * (z >= 0 ? 1.06 : 0.90));
+        const rump = Math.min(1, Math.max(0, (-y - 0.05) / 0.25));
+        const backF = 0.87 + 0.10 * rump;
+        const s = Math.min(1, Math.max(0, (z + 0.06) / 0.12));
+        const blend = s * s * (3 - 2 * s);
+        tp.setZ(i, z * (backF + (1.06 - backF) * blend));
       }
       torsoGeo.computeVertexNormals();
     }
@@ -1053,6 +1080,22 @@ export class VoxelCharacter {
       // Point DOWN-and-forward with a per-spike sideways splay
       spike.rotation.set(Math.PI * 0.88, 0, rz);
       addWithOutline(this.chest, spike, 0.020);
+    }
+
+    // Second (upper) bib row — the sheet layers the chest tuft in TWO
+    // rows: a short row of locks tucked right under the chin overlapping
+    // the big fan. No shells (halo rule).
+    const bibRow2: Array<[number, number, number, number, number, number]> = [
+      // x      y     z     r      h     rotZ
+      [ 0.00, 0.40, 0.20, 0.072, 0.18,  0.00],
+      [-0.10, 0.41, 0.18, 0.058, 0.14,  0.20],
+      [ 0.10, 0.41, 0.18, 0.058, 0.14, -0.20],
+    ];
+    for (const [x, y, z, r, h, rz] of bibRow2) {
+      const lock = new THREE.Mesh(fluffGeo(r, h, 18, 14), creamMat);
+      lock.position.set(x, y, z);
+      lock.rotation.set(Math.PI * 0.86, 0, rz);
+      this.chest.add(lock);
     }
 
     // Rump fluff — the sheet's back view shows a fur burst where the tail
@@ -1116,11 +1159,23 @@ export class VoxelCharacter {
     const pawMat = tmat(PAL.paw, { emissiveBoost: 0.09 });
 
     const buildArm = (group: THREE.Group, side: -1 | 1) => {
-      // Arm — short tapering stub with a domed shoulder cap so the top
-      // never shows a flat disc against the torso. Reaches the lower belly
-      // like the sheet's front view.
-      const armGeo = new THREE.CylinderGeometry(0.135, 0.115, 0.42, 28);
-      armGeo.translate(0, -0.21, 0);
+      // Arm — a BENT varying-radius tube, not a straight cylinder: the
+      // sheet's arms bow gently OUTWARD at the elbow and return inline at
+      // the wrist (a true S against the body). Built with the tail's tube
+      // helper: spine along +Y with the bow in the z-slot, flipped down
+      // (rotateZ π keeps the proven outward winding) and the bow rotated
+      // to point outward (rotateY ±90°). Tapers 0.135 → 0.112.
+      const ARM_RINGS = 12;
+      const armSpine: Array<[number, number]> = [];
+      const armRadii: number[] = [];
+      for (let i = 0; i < ARM_RINGS; i++) {
+        const t = i / (ARM_RINGS - 1);
+        armSpine.push([0.42 * t, 0.038 * Math.sin(Math.PI * t)]);
+        armRadii.push(0.135 - 0.023 * t);
+      }
+      const armGeo = flameTubeGeo(armSpine, armRadii, 24, 1.0, undefined, 0.6);
+      armGeo.rotateZ(Math.PI);                 // +Y spine → hangs down -Y
+      armGeo.rotateY(side * Math.PI * 0.5);    // elbow bow → outward ±X
       const arm = new THREE.Mesh(armGeo, furMat);
       addWithOutline(group, arm, 0.024);
       const shoulderGeo = new THREE.SphereGeometry(0.135, 24, 18);
@@ -1128,24 +1183,50 @@ export class VoxelCharacter {
       shoulder.position.y = -0.02;
       group.add(shoulder);
 
-      // Mitten paw — rounded ball, slightly taller than wide. Offset a
-      // touch toward the body + forward: with the outward shoulder tilt
-      // this makes the sheet's subtle arm S-curve (out at the shoulder,
-      // wrist turning gently back in). getPawWorldPos keeps the plain
-      // (0,-0.47,0) anchor — the 2 cm offset is inside the drink-hold
-      // tolerance.
+      // Mitten paw — a sculpted SCOOP, not a plain ball: narrower at the
+      // wrist, bulging wider and deeper toward the fingertips like the
+      // sheet's bean-shaped mittens, with three subtle finger mounds
+      // whose shells draw the sheet's faint hand-cleft lines. Offset a
+      // touch toward the body + forward for the arm's S. getPawWorldPos
+      // keeps the plain (0,-0.47,0) anchor — offsets are inside the
+      // drink-hold tolerance.
+      const pawG = new THREE.Group();
+      pawG.position.set(side * -0.022, -0.47, 0.012);
+      group.add(pawG);
+
       const pawGeo = new THREE.SphereGeometry(0.135, 32, 24);
       pawGeo.scale(1.0, 1.08, 1.0);
+      {
+        const pp = pawGeo.attributes.position;
+        for (let i = 0; i < pp.count; i++) {
+          const tipness = Math.min(1, Math.max(0, -pp.getY(i) / 0.146));
+          pp.setX(i, pp.getX(i) * (1 + 0.12 * tipness));
+          pp.setZ(i, pp.getZ(i) * (1 + 0.10 * tipness));
+        }
+        pawGeo.computeVertexNormals();
+      }
       const paw = new THREE.Mesh(pawGeo, pawMat);
-      paw.position.set(side * -0.022, -0.47, 0.012);
-      addWithOutline(group, paw, 0.026);
+      addWithOutline(pawG, paw, 0.026);
 
-      // Outward hang (sheet front view): a static Z-tilt on the arm group.
-      // update() only animates rotation.x, so this tilt persists through
-      // the walk/sit/paddle cycles. Rz(θ) maps the hanging tip (0,-1,0) →
-      // (sinθ, -cosθ, 0), so the left arm (-X side) needs θ<0. 0.18 keeps
-      // the mitten paws clear of the fattest belly section in ¾ views.
-      group.rotation.z = side * 0.18;
+      const fingerSpec: Array<[number, number, number, number]> = [
+        // x       y       z      r
+        [-0.055, -0.105, 0.075, 0.040],
+        [ 0.000, -0.112, 0.085, 0.044],
+        [ 0.055, -0.105, 0.075, 0.040],
+      ];
+      for (const [fx, fy, fz, fr] of fingerSpec) {
+        const fGeo = new THREE.SphereGeometry(fr, 16, 12);
+        fGeo.scale(1.0, 0.85, 1.05);
+        const finger = new THREE.Mesh(fGeo, pawMat);
+        finger.position.set(fx, fy, fz);
+        addWithOutline(pawG, finger, 0.020);
+      }
+
+      // Outward hang (sheet front view): reduced to 0.10 — the tube's
+      // built-in elbow bow now supplies most of the outward read, and the
+      // wrist returns inline so the paws sit against the belly like the
+      // sheet. update() only animates rotation.x, so this persists.
+      group.rotation.z = side * 0.10;
     };
 
     buildArm(this.leftArm, -1);
@@ -1173,10 +1254,12 @@ export class VoxelCharacter {
     const furMat = tmat(PAL.fur, { emissiveBoost: 0.09 });
     const pawMat = tmat(PAL.paw, { emissiveBoost: 0.09 });
 
-    const buildLeg = (group: THREE.Group) => {
+    const buildLeg = (group: THREE.Group, side: -1 | 1) => {
       // Stub leg — short white cylinder from hip toward the foot, domed at
-      // the hip so no flat disc shows against the torso
-      const legGeo = new THREE.CylinderGeometry(0.17, 0.15, 0.34, 28);
+      // the hip so no flat disc shows against the torso. Stronger taper
+      // (0.175 → 0.135): the sheet's legs narrow clearly at the ankle
+      // before the foot flares.
+      const legGeo = new THREE.CylinderGeometry(0.175, 0.135, 0.34, 28);
       legGeo.translate(0, -0.30, 0);
       const leg = new THREE.Mesh(legGeo, furMat);
       addWithOutline(group, leg, 0.024);
@@ -1185,31 +1268,53 @@ export class VoxelCharacter {
       hip.position.y = -0.14;
       group.add(hip);
 
-      // Foot — rounded white ball, longer than wide; scale-z 1.42 with a
-      // small forward offset leaves a round HEEL behind the leg line like
-      // the sheet's side view. Scale-x 1.30: the sheet's feet FLARE wider
-      // than the ankle column (~1.4× the leg width).
+      // Foot assembly — its own sub-group so the whole foot (loaf + toes)
+      // angles slightly OUTWARD like the sheet's toe direction.
+      const footG = new THREE.Group();
+      footG.position.set(0, -0.62, 0.04);
+      footG.rotation.y = side * 0.09;
+      group.add(footG);
+
+      // Foot loaf — SCULPTED, not a plain ellipsoid: tall round heel and
+      // ankle SLOPING DOWN and WIDENING toward the toes (the sheet's
+      // wedge-with-round-curves side profile). Heel keeps the floor-flush
+      // bottom (-0.733 leg-local); the toe zone rises a hair off the
+      // ground the way the sheet draws it.
       const footGeo = new THREE.SphereGeometry(0.155, 32, 22);
       footGeo.scale(1.30, 0.73, 1.42);
+      {
+        const fp = footGeo.attributes.position;
+        for (let i = 0; i < fp.count; i++) {
+          const frontness = Math.min(1, Math.max(0, fp.getZ(i) / 0.22));
+          fp.setY(i, fp.getY(i) * (1 - 0.20 * frontness) - 0.012 * frontness);
+          fp.setX(i, fp.getX(i) * (1 + 0.08 * frontness));
+        }
+        footGeo.computeVertexNormals();
+      }
       const foot = new THREE.Mesh(footGeo, pawMat);
-      foot.position.set(0, -0.62, 0.04);
-      addWithOutline(group, foot, 0.024);
+      addWithOutline(footG, foot, 0.024);
 
-      // Toe balls TUCKED INSIDE the foot dome: the sheet's foot silhouette
-      // is ONE smooth blob — the toe clefts are interior lines only, drawn
-      // here by the shells between the barely-proud balls. Big toe balls
-      // lobed the outline; these stay just under the surface.
-      const toeGeo = new THREE.SphereGeometry(0.052, 20, 16);
-      toeGeo.scale(1.0, 0.78, 1.1);
-      for (let i = -1; i <= 1; i++) {
+      // Three toe MOUNDS — the sheet's foot front gently scallops with
+      // three soft lobes (middle largest and slightly forward); the two
+      // cleft lines between them come from the outline shells and run
+      // back over the foot's top edge.
+      const toeSpec: Array<[number, number, number, number]> = [
+        // x       y       z      r
+        [-0.082, -0.048, 0.205, 0.056],
+        [ 0.000, -0.052, 0.225, 0.062],
+        [ 0.082, -0.048, 0.205, 0.056],
+      ];
+      for (const [tx, ty, tz, tr] of toeSpec) {
+        const toeGeo = new THREE.SphereGeometry(tr, 20, 16);
+        toeGeo.scale(1.0, 0.75, 1.15);
         const toe = new THREE.Mesh(toeGeo, pawMat);
-        toe.position.set(i * 0.075, -0.672, 0.215);
-        addWithOutline(group, toe, 0.022);
+        toe.position.set(tx, ty, tz);
+        addWithOutline(footG, toe, 0.022);
       }
     };
 
-    buildLeg(this.leftLeg);
-    buildLeg(this.rightLeg);
+    buildLeg(this.leftLeg, -1);
+    buildLeg(this.rightLeg, 1);
 
     // Outfit roles: leg stub = fur; foot + toes = accent (reads as "boots"
     // when an outfit dyes the accent slot).
@@ -1416,21 +1521,26 @@ export class VoxelCharacter {
     );
     this.tailTip = tailTip;
 
-    // Tip fluff — the sheet's flame ends in a SPLIT soft point: one long
-    // teardrop on the end tangent plus a shorter curl just behind it. Both
-    // ride the tip joint so they whip with the follow-through.
+    // Tip fluff — the sheet's brush ends in a SPLIT soft point: a rounded
+    // curling lock plus shorter curls behind it. All ride the tip joint so
+    // they whip with the follow-through.
     const [ty, tz] = tangent(0.95);
     const tlen = Math.hypot(ty, tz);
     const tipDirY = ty / tlen;
     const tipDirZ = tz / tlen;
-    const tipMain = new THREE.Mesh(fluffGeo(0.140, 0.38, 26, 20), furMat);
+    // Main lock: SHORT and FAT, sunk deep into the tube end, angled 20%
+    // past the tangent so it CURLS with the hook — and shell-less like its
+    // sibling locks. (The earlier long thin outlined teardrop stuck
+    // straight out along the tangent and read as a hard cone spike at the
+    // very tip of the tail.)
+    const tipMain = new THREE.Mesh(fluffGeo(0.155, 0.30, 26, 20), furMat);
     tipMain.position.set(
       0,
-      spineY(0.95) - spineY(JOINT_TIP) - tipDirY * 0.05,
-      spineZ(0.95) - spineZ(JOINT_TIP) - tipDirZ * 0.05
+      spineY(0.95) - spineY(JOINT_TIP) - tipDirY * 0.10,
+      spineZ(0.95) - spineZ(JOINT_TIP) - tipDirZ * 0.10
     );
-    tipMain.rotation.x = Math.atan2(tipDirZ, tipDirY);
-    addWithOutline(tailTip, tipMain, 0.024);
+    tipMain.rotation.x = Math.atan2(tipDirZ, tipDirY) + 0.20;
+    tailTip.add(tipMain);
 
     // Secondary + tertiary curls beside the main point — the sheet's tip
     // splits into THREE soft paintbrush locks. Both are added WITHOUT
