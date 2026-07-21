@@ -1002,9 +1002,12 @@ export class VoxelCharacter {
     for (const [x, y, z, r, h, rz] of rumpSpec) {
       const lock = new THREE.Mesh(fluffGeo(r, h, 18, 14), furMat);
       lock.position.set(x, y, z);
-      // Drape DOWN-and-back over the tail root
+      // Drape DOWN-and-back over the tail root. NO outline shells: a shell
+      // on a barely-embedded fluff draws a grey halo leaf around its
+      // insertion — this was the persistent "grey patch at the tail" that
+      // was misread as a tail-tube artifact three fixes running.
       lock.rotation.set(-Math.PI * 0.82, 0, rz);
-      addWithOutline(this.chest, lock, 0.018);
+      this.chest.add(lock);
     }
 
     // Hip tufts — small locks flicking down-and-out where the belly meets
@@ -1013,7 +1016,7 @@ export class VoxelCharacter {
       const hip = new THREE.Mesh(fluffGeo(0.070, 0.16, 18, 14), furMat);
       hip.position.set(hs * 0.40, -0.24, 0.02);
       hip.rotation.z = -hs * 2.5;   // tip points down-and-out
-      addWithOutline(this.chest, hip, 0.018);
+      this.chest.add(hip);          // no shell — halo risk (see rump note)
     }
 
     // Nape ruff — the sheet's BACK view shows a fur collar where the head
@@ -1030,7 +1033,7 @@ export class VoxelCharacter {
       lock.position.set(x, y, z);
       // Drape DOWN-and-back over the shoulder blades
       lock.rotation.set(-2.55, 0, rz);
-      addWithOutline(this.chest, lock, 0.018);
+      this.chest.add(lock);         // no shell — halo risk (see rump note)
     }
 
     // Outfit roles: torso shell = fur; chest bib + spikes = cream.
@@ -1120,9 +1123,10 @@ export class VoxelCharacter {
 
       // Foot — rounded white ball, longer than wide; scale-z 1.42 with a
       // small forward offset leaves a round HEEL behind the leg line like
-      // the sheet's side view.
+      // the sheet's side view. Scale-x 1.30: the sheet's feet FLARE wider
+      // than the ankle column (~1.4× the leg width).
       const footGeo = new THREE.SphereGeometry(0.155, 32, 22);
-      footGeo.scale(1.15, 0.73, 1.42);
+      footGeo.scale(1.30, 0.73, 1.42);
       const foot = new THREE.Mesh(footGeo, pawMat);
       foot.position.set(0, -0.62, 0.04);
       addWithOutline(group, foot, 0.024);
@@ -1177,26 +1181,32 @@ export class VoxelCharacter {
     // height — both wrong.) Local frame: +Y = back, +Z = up.
     //   y(t): backward run.  z(t): parabolic dip (max ≈ −0.27 at mid) with
     //   a t⁶ up-flick that only bites near the tip.
-    // Up-flick uses t^3.5 (not a higher power): the bend stays SPREAD over
-    // the last half — a tighter bend made consecutive tube rings intersect
-    // and fold the surface inside-out at the kink. 0.34 amplitude lifts
-    // the tip toward mid-back height (sheet side view).
+    // The sheet's tail end is a J-HOOK: the last quarter turns up hard and
+    // the very tip points up/slightly back-over. Two flick terms build it —
+    // t^3.5 spreads the main rise over the back half (a single tight bend
+    // folded tube rings inside-out in an early build), and a small t^9 term
+    // bites only at the very end for the hook. Tip tops out around
+    // mid-back/neck height like the sheet's side view. Curvature check:
+    // k·r ≈ 0.05 at the hook — far under the ring-fold threshold.
     const spineY = (t: number) => 0.62 * t;
-    const spineZ = (t: number) => -1.1 * t * (1 - t) + 0.34 * Math.pow(t, 3.5);
+    const spineZ = (t: number) =>
+      -1.1 * t * (1 - t) + 0.45 * Math.pow(t, 3.5) + 0.10 * Math.pow(t, 9);
     // Tangent of the spine curve (d/dt), for scallop frames + tip direction
     const tangent = (t: number): [number, number] =>
-      [0.62, -1.1 * (1 - 2 * t) + 1.19 * Math.pow(t, 2.5)];
+      [0.62, -1.1 * (1 - 2 * t) + 1.575 * Math.pow(t, 2.5) + 0.9 * Math.pow(t, 8)];
 
     // Flame body — ONE continuous varying-radius tube along the parabola
     // (16 rings × 32 radial segments). FAT like the sheet: the plume's max
     // radius is ~0.32 (≈ 70% of the body's half-width), swelling from a
     // narrow root and melting into the tip.
-    // Bell stretched past the domain end (t/1.08) so the tube stays ~0.19
-    // fat at t=0.95 — a thin end let the tip lock's 0.13 bulb poke through
-    // the surface and expose its outline shell as a grey patch in the crook.
+    // Bell stretched past the domain end (t/1.08) so the tube stays fat at
+    // t=0.95 — a thin end let the tip lock's bulb poke through the surface
+    // and expose its outline shell as a grey patch in the crook. Root floor
+    // 0.16: the sheet's brush emerges from behind the body ALREADY CHUNKY —
+    // no thin stalk at the tail-bone.
     const radiusAt = (t: number) => {
       const bell = Math.sin(Math.min(1, t / 1.08) * Math.PI);
-      return 0.115 + Math.pow(bell, 1.05) * 0.215;
+      return 0.16 + Math.pow(bell, 0.95) * 0.18;
     };
     // ── Three chained sections (root → mid → tip joints) ─────────────────
     // The flame is split at t = 0.35 and 0.68 into three tube sections on
@@ -1228,29 +1238,39 @@ export class VoxelCharacter {
     };
 
     const sectionTube = (
-      t0: number,
-      t1: number,
+      tList: number[],
       base: number,
-      rings: number,
       capScale = 0.95
     ): THREE.BufferGeometry => {
       const pts: Array<[number, number]> = [];
       const radii: number[] = [];
-      for (let i = 0; i < rings; i++) {
-        const t = t0 + (i / (rings - 1)) * (t1 - t0);
+      for (const t of tList) {
         pts.push([spineY(t) - spineY(base), spineZ(t) - spineZ(base)]);
         radii.push(radiusAt(t));
       }
       // 0.95 xSquash: near-round cross-section — the sheet's brush is a
       // full fluffy volume, not a flattened fin.
-      return flameTubeGeo(pts, radii, 32, 0.95, scallopFor(t0, t1), capScale);
+      return flameTubeGeo(
+        pts,
+        radii,
+        32,
+        0.95,
+        scallopFor(tList[0], tList[tList.length - 1]),
+        capScale
+      );
     };
 
     // Each section's SURFACE overlaps its joints (t0..t1) so bends never
     // open the skin — but its outline SHELL is built from the TRIMMED
-    // domain (shellT0..shellT1) only. A shell over the overlap rings sat
-    // 1.2% proud of the NEIGHBOUR section's identical surface there and
-    // showed as a grey band at every joint; trimmed shells tile instead.
+    // domain (shellT0..shellT1) only. Two hard-won rules here:
+    //  1. Trimmed shells: a shell over the overlap rings sat 1.2% proud of
+    //     the NEIGHBOUR section's identical surface and showed as a grey
+    //     band at every joint.
+    //  2. The shell's rings are FILTERED FROM THE SURFACE'S OWN t-grid —
+    //     never resampled. A shell on its own grid samples the fur
+    //     scallops at shifted phases, and its aliased crests poked grey
+    //     through the surface's troughs (the zigzag at the hook crook).
+    //     Same grid ⇒ shell = surface × 1.012 everywhere ⇒ can't cross.
     const buildSection = (
       parent: THREE.Object3D,
       t0: number,
@@ -1260,33 +1280,59 @@ export class VoxelCharacter {
       shellT0: number,
       shellT1: number
     ): void => {
-      const mesh = new THREE.Mesh(sectionTube(t0, t1, base, rings), furMat);
+      const tsAll: number[] = [];
+      for (let i = 0; i < rings; i++) {
+        tsAll.push(t0 + (i / (rings - 1)) * (t1 - t0));
+      }
+      const mesh = new THREE.Mesh(sectionTube(tsAll, base), furMat);
       parent.add(mesh);
-      const shellRings = Math.max(
-        4,
-        Math.round((rings * (shellT1 - shellT0)) / (t1 - t0))
+
+      const tsShell = tsAll.filter(
+        (t) => t >= shellT0 - 1e-6 && t <= shellT1 + 1e-6
       );
       // Near-flat caps (0.1) — a domed shell cap bulges past the joint and
       // pokes grey out of the neighbouring section's crook.
-      const shell = new THREE.Mesh(
-        sectionTube(shellT0, shellT1, base, shellRings, 0.1),
-        OUTLINE_MAT
-      );
-      shell.scale.multiplyScalar(1 + 0.022 * OUTLINE_FINENESS);
+      const shellGeo = sectionTube(tsShell, base, 0.1);
+      // NORMAL-OFFSET shell, not origin-scaling: scaling about the section
+      // origin pushes the shell radially, which in the dip's CONCAVE top
+      // lifts it up out of the white surface — the last of the grey-patch
+      // family. A constant offset along vertex normals keeps the shell a
+      // uniform 8 mm proud and provably inside any concavity shallower
+      // than the curvature radius (~0.8 here ≫ 0.008).
+      const sPos = shellGeo.attributes.position;
+      const sNrm = shellGeo.attributes.normal;
+      const SHELL_D = 0.008;
+      for (let i = 0; i < sPos.count; i++) {
+        sPos.setXYZ(
+          i,
+          sPos.getX(i) + sNrm.getX(i) * SHELL_D,
+          sPos.getY(i) + sNrm.getY(i) * SHELL_D,
+          sPos.getZ(i) + sNrm.getZ(i) * SHELL_D
+        );
+      }
+      const shell = new THREE.Mesh(shellGeo, OUTLINE_MAT);
       shell.renderOrder = -1;
       parent.add(shell);
     };
 
-    // Root section rides the tail group itself
-    buildSection(this.tail, 0.0, JOINT_MID + 0.05, 0.0, 18, 0.0, JOINT_MID);
+    // Root section rides the tail group itself. Surface overlaps reach
+    // ±0.06-0.08 t past each joint — the follow-through bends SIDEWAYS
+    // (rotation.z), and the earlier ±0.03 overlap was thinner than the
+    // worst-case bend excursion, flashing the shell's grey interior at the
+    // joint's side faces mid-sway.
+    buildSection(this.tail, 0.0, JOINT_MID + 0.08, 0.0, 18, 0.0, JOINT_MID);
 
     // Mid joint at the t=0.35 spine point
     const tailMid = new THREE.Group();
     tailMid.position.set(0, spineY(JOINT_MID), spineZ(JOINT_MID));
     this.tail.add(tailMid);
+    // Mid shell ends 0.01 short of the tip joint — with the J-hook the
+    // bend concentrates right at this joint, and butted flat shell caps
+    // peeked grey out of the concave crook; the tiny outline gap hides in
+    // the concavity.
     buildSection(
-      tailMid, JOINT_MID - 0.03, JOINT_TIP + 0.05, JOINT_MID, 16,
-      JOINT_MID, JOINT_TIP
+      tailMid, JOINT_MID - 0.06, JOINT_TIP + 0.08, JOINT_MID, 18,
+      JOINT_MID, JOINT_TIP - 0.01
     );
     this.tailMid = tailMid;
 
@@ -1298,8 +1344,12 @@ export class VoxelCharacter {
       spineZ(JOINT_TIP) - spineZ(JOINT_MID)
     );
     tailMid.add(tailTip);
-    // 18 rings here — the up-flick concentrates curvature in this section
-    buildSection(tailTip, JOINT_TIP - 0.03, 0.95, JOINT_TIP, 18, JOINT_TIP, 0.95);
+    // 18 rings here — the up-flick concentrates curvature in this section.
+    // Shell starts 0.02 past the joint (see the mid-shell note above).
+    buildSection(
+      tailTip, JOINT_TIP - 0.06, 0.95, JOINT_TIP, 20,
+      JOINT_TIP + 0.02, 0.95
+    );
     this.tailTip = tailTip;
 
     // Tip fluff — the sheet's flame ends in a SPLIT soft point: one long
@@ -1318,18 +1368,42 @@ export class VoxelCharacter {
     tipMain.rotation.x = Math.atan2(tipDirZ, tipDirY);
     addWithOutline(tailTip, tipMain, 0.024);
 
-    // Secondary curl behind the main point, angled ~35° off it. Bulb sunk
-    // WELL into the tube and added WITHOUT an outline shell — a shell on a
-    // barely-embedded fluff draws a grey halo leaf around its insertion
-    // (that was the grey patch at the bend crook).
+    // Secondary + tertiary curls beside the main point — the sheet's tip
+    // splits into THREE soft paintbrush locks. Both are added WITHOUT
+    // outline shells: a shell on a barely-embedded fluff draws a grey halo
+    // leaf around its insertion (that was the grey patch at the bend
+    // crook), and shell-less white-on-white locks need no linework.
     const tipSide = new THREE.Mesh(fluffGeo(0.100, 0.23, 20, 16), furMat);
     tipSide.position.set(
       0,
-      spineY(0.88) - spineY(JOINT_TIP) - tipDirY * 0.06,
-      spineZ(0.88) - spineZ(JOINT_TIP) - 0.05
+      spineY(0.88) - spineY(JOINT_TIP) - tipDirY * 0.04,
+      spineZ(0.88) - spineZ(JOINT_TIP) - 0.02
     );
     tipSide.rotation.x = Math.atan2(tipDirZ, tipDirY) - 0.62;
     tailTip.add(tipSide);
+
+    const tipThird = new THREE.Mesh(fluffGeo(0.070, 0.18, 18, 14), furMat);
+    tipThird.position.set(
+      0,
+      spineY(0.92) - spineY(JOINT_TIP) - tipDirY * 0.03,
+      spineZ(0.92) - spineZ(JOINT_TIP) + 0.02
+    );
+    tipThird.rotation.x = Math.atan2(tipDirZ, tipDirY) + 0.45;
+    tailTip.add(tipThird);
+
+    // Crook filler — fur bunches on the inside of a bend. The J-hook's
+    // concave V between the mid tube and the rising tip opened a sliver
+    // that showed the outline shell's grey interior behind it; this white
+    // lock nestles in the crook (bulb overlapping both tubes, no outline)
+    // and closes the gap the way the sheet's fur actually behaves.
+    const crookFill = new THREE.Mesh(fluffGeo(0.105, 0.26, 20, 16), furMat);
+    crookFill.position.set(
+      0,
+      spineY(0.71) - spineY(JOINT_TIP),
+      spineZ(0.71) - spineZ(JOINT_TIP) + 0.05
+    );
+    crookFill.rotation.x = 1.15;   // points up-back along the bend bisector
+    tailTip.add(crookFill);
 
     // Outfit roles: the whole plume = fur (the sheet's tail is one colour;
     // furDeep/cream tail slots from the fox-marking era are gone).
