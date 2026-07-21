@@ -526,11 +526,14 @@ export class VoxelCharacter {
     // SHEET RULE: the nose sits just under the eye line on the muzzle
     // mass, with the smile directly beneath it — the whole lower-face
     // cluster rides ~0.015 higher than the first sculpt.
+    // No outline shell on the muzzle mass — the sheet's face has NO
+    // boundary line around the muzzle; the nose/smile float on the face
+    // with soft shading only (an outlined circle read as a snout patch).
     const muzzleGeo = new THREE.SphereGeometry(0.16, 36, 26);
     muzzleGeo.scale(1.15, 0.82, 0.80);
     const muzzle = new THREE.Mesh(muzzleGeo, creamMat);
     muzzle.position.set(0, 0.29, 0.50);
-    addWithOutline(this.head, muzzle, 0.022);
+    this.head.add(muzzle);
 
     const cheekGeo = new THREE.SphereGeometry(0.105, 28, 20);
     cheekGeo.scale(1.20, 0.85, 0.72);
@@ -1058,11 +1061,16 @@ export class VoxelCharacter {
       shoulder.position.y = -0.02;
       group.add(shoulder);
 
-      // Mitten paw — rounded ball, slightly taller than wide
+      // Mitten paw — rounded ball, slightly taller than wide. Offset a
+      // touch toward the body + forward: with the outward shoulder tilt
+      // this makes the sheet's subtle arm S-curve (out at the shoulder,
+      // wrist turning gently back in). getPawWorldPos keeps the plain
+      // (0,-0.47,0) anchor — the 2 cm offset is inside the drink-hold
+      // tolerance.
       const pawGeo = new THREE.SphereGeometry(0.135, 32, 24);
       pawGeo.scale(1.0, 1.08, 1.0);
       const paw = new THREE.Mesh(pawGeo, pawMat);
-      paw.position.y = -0.47;
+      paw.position.set(side * -0.022, -0.47, 0.012);
       addWithOutline(group, paw, 0.026);
 
       // Outward hang (sheet front view): a static Z-tilt on the arm group.
@@ -1110,20 +1118,24 @@ export class VoxelCharacter {
       hip.position.y = -0.14;
       group.add(hip);
 
-      // Foot — rounded white ball, longer than wide, slightly forward
+      // Foot — rounded white ball, longer than wide; scale-z 1.42 with a
+      // small forward offset leaves a round HEEL behind the leg line like
+      // the sheet's side view.
       const footGeo = new THREE.SphereGeometry(0.155, 32, 22);
-      footGeo.scale(1.15, 0.73, 1.35);
+      footGeo.scale(1.15, 0.73, 1.42);
       const foot = new THREE.Mesh(footGeo, pawMat);
-      foot.position.set(0, -0.62, 0.05);
+      foot.position.set(0, -0.62, 0.04);
       addWithOutline(group, foot, 0.024);
 
-      // Three toe balls across the foot front — their outline shells draw
-      // the clefts the sheet marks with two short lines on each foot.
-      const toeGeo = new THREE.SphereGeometry(0.062, 20, 16);
+      // Toe balls TUCKED INSIDE the foot dome: the sheet's foot silhouette
+      // is ONE smooth blob — the toe clefts are interior lines only, drawn
+      // here by the shells between the barely-proud balls. Big toe balls
+      // lobed the outline; these stay just under the surface.
+      const toeGeo = new THREE.SphereGeometry(0.052, 20, 16);
       toeGeo.scale(1.0, 0.78, 1.1);
       for (let i = -1; i <= 1; i++) {
         const toe = new THREE.Mesh(toeGeo, pawMat);
-        toe.position.set(i * 0.088, -0.665, 0.235);
+        toe.position.set(i * 0.075, -0.672, 0.215);
         addWithOutline(group, toe, 0.022);
       }
     };
