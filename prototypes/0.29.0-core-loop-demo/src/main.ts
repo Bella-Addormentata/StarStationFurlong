@@ -6300,13 +6300,54 @@ function setupClickToEnter() {
       btnLoad.style.cssText = secondary;
       const note = document.createElement("div");
       note.style.cssText =
-        "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.75); min-height:15px; max-width:280px; text-align:center;";
+        "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.75); min-height:15px; max-width:300px; text-align:center;";
+      // 🔑 #79 P2: Load-from-Backup reveals a paste box wired to the EXISTING
+      // recovery-key restore (keypair.importRecoveryKey — the same seam the
+      // SpacePhone's "Restore identity" uses). The recovery key is the private
+      // identity: it is stored ONLY via importRecoveryKey (localStorage, exactly
+      // like a returning install), never logged, and cleared from the field the
+      // instant it's applied. A valid key reboots into that identity's station.
+      let restoreOpen = false;
       btnLoad.addEventListener("click", (e) => {
         e.stopPropagation();
-        // Next slice wires this to the existing recovery-key restore
-        // (keypair.importRecoveryKey) — intentionally no key handling yet.
+        if (restoreOpen) return;
+        restoreOpen = true;
+        btnLoad.style.display = "none";
+        const box = document.createElement("div");
+        box.style.cssText =
+          "display:flex; flex-direction:column; gap:8px; align-items:center; width:300px;";
+        const ta = document.createElement("textarea");
+        ta.rows = 2;
+        ta.placeholder = "Paste your recovery key…";
+        ta.autocomplete = "off";
+        ta.spellcheck = false;
+        ta.style.cssText =
+          "width:100%; box-sizing:border-box; resize:none; font:400 11px/1.4 monospace; " +
+          "padding:8px; border-radius:8px; border:1px solid rgba(240,180,41,0.4); " +
+          "background:rgba(10,7,3,0.75); color:#f0e0b0;";
+        ta.addEventListener("click", (ev) => ev.stopPropagation());
+        const doRestore = document.createElement("button");
+        doRestore.type = "button";
+        doRestore.textContent = "↩  RESTORE MY IDENTITY";
+        doRestore.style.cssText = primary;
+        doRestore.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const pub = importRecoveryKey(ta.value);
+          if (!pub) {
+            note.textContent =
+              "That isn't a valid recovery key — check it and paste again.";
+            return;
+          }
+          ta.value = ""; // scrub the private key from the DOM immediately
+          note.textContent = `Identity ${getIdentityFingerprint()} restored — loading your station…`;
+          doRestore.disabled = true;
+          setTimeout(() => window.location.reload(), 700);
+        });
+        box.append(ta, doRestore);
+        wrap.insertBefore(box, note);
         note.textContent =
-          "Restore from your recovery key is coming next — choose New Player to start.";
+          "Paste the recovery key you saved from Settings → Backup / restore identity.";
+        ta.focus();
       });
       wrap.append(btnNew, btnLoad, note);
       content.appendChild(wrap);
