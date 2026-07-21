@@ -12,7 +12,9 @@
 import * as THREE from "three";
 import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
-import { physicalDoorPose, portForDoor } from "./doorLayout";
+import { physicalDoorPose, portForDoor, poseFromWall } from "./doorLayout";
+import type { PhysicalDoorPose } from "./doorLayout";
+import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
 import {
@@ -252,6 +254,22 @@ export class DoorDockingPortSystem {
    * conformed precisely to the grid: small doors take 1 grid cell width (1.0m on wall)
    * large doors take 2 grid cells width (2.0m on wall)
    */
+  /**
+   * 🚪↔🛰️ #28 S5a: the world pose of a door by id. A CARDINAL door routes
+   * through physicalDoorPose (legacy east/west quirk + pairs layout preserved
+   * EXACTLY); a free/genId door derives from poseFromWall using the wall +
+   * lateral stashed on its group's userData. `delta` is the live slide offset.
+   */
+  private poseForDoor(id: string, delta = 0): PhysicalDoorPose {
+    if (id === "north" || id === "south" || id === "east" || id === "west") {
+      return physicalDoorPose(id, delta);
+    }
+    const ud = this.doorObjects.get(id)?.userData as
+      | { wall?: DoorWall; lateral?: number }
+      | undefined;
+    return poseFromWall(ud?.wall ?? "north", (ud?.lateral ?? 0) + delta);
+  }
+
   public buildPorts() {
     console.log("🚪 Constructing 4-Directional Docking Ports & Control Panels");
 
@@ -264,7 +282,44 @@ export class DoorDockingPortSystem {
     ];
 
     for (const cfg of doorsConfig) {
-      const pose = physicalDoorPose(cfg.id);
+      // At build time (World construction) the doorLayout doc is not bound yet,
+      // so the default 4 come from this local config; the slice-5b reconcile
+      // adds/removes groups from the synced map afterward. e/w = large keeps it
+      // bit-identical (readAllDoorLayout would be empty here and default small).
+      this.buildDoorGroup({
+        id: cfg.id,
+        wall: cfg.id,
+        lateral: 0,
+        size: cfg.isLarge ? "large" : "small",
+        enabled: findDoor(cfg.id)?.enabled === true,
+      });
+    }
+
+    this.mountInterfaceControlPanel();
+  }
+
+  /**
+   * 🚪↔🛰️ #28 S5a: build ONE door group from a layout record — extracted from
+   * buildPorts so the reconcile can add/remove doors (slice 5b). Bit-identical
+   * for the 4 cardinals: `cfg` reconstructs the old loop variable so the body is
+   * unchanged, and the pose routes through poseForDoor (cardinal →
+   * physicalDoorPose exactly, preserving the legacy east/west quirk + pairs).
+   */
+  private buildDoorGroup(record: DoorLayoutRecord): void {
+    const cfg = { id: record.id as DoorId, isLarge: record.size === "large" };
+    const pose = this.poseForDoor(cfg.id);
+    // A new door needs its own pairing state so its LED / keypad / slide work
+    // (the 4 cardinals are already seeded by initializeDoorStates → no-op).
+    if (!this.doorState.has(cfg.id)) {
+      this.doorState.set(cfg.id, {
+        doorId: cfg.id,
+        locked: false,
+        pinCode: "",
+        connectedRoomAddress: "",
+        pairingPending: false,
+        pairedSuccessfully: false,
+      });
+    }
       const doorGroup = new THREE.Group();
       doorGroup.position.set(pose.x, 2, pose.z);
       doorGroup.rotation.y = pose.frameYaw;
@@ -532,9 +587,11 @@ export class DoorDockingPortSystem {
       // Paint LED + frame glow from the door's initial state
       const state = this.doorState.get(cfg.id);
       if (state) this.syncLEDStatus(cfg.id, state);
-    }
 
-    this.mountInterfaceControlPanel();
+      // #28 S5a: stash the pose basis so poseForDoor can reposition a free /
+      // genId door (reconcile + fade) without a cardinal lookup — onto {isLarge}.
+      doorGroup.userData.wall = record.wall;
+      doorGroup.userData.lateral = record.lateral;
   }
 
   /**
@@ -1872,7 +1929,7 @@ export class DoorDockingPortSystem {
     const camZ = (c - s) * Math.SQRT1_2;
 
     for (const [doorId, mats] of this.doorFadeMats) {
-      const yaw = physicalDoorPose(doorId).outwardYaw;
+      const yaw = this.poseForDoor(doorId).outwardYaw;
       const n = { x: Math.sin(yaw), z: Math.cos(yaw) };
       // 45° detents yield dots of 0 / ±0.707 / ±1 — 0.3 splits camera-facing
       // walls (0.707, 1) from side-on and far walls (0, negatives).
@@ -2039,7 +2096,7 @@ export class DoorDockingPortSystem {
   ): void {
     for (const [id, group] of this.doorObjects) {
       const doorId = id as DoorId;
-      const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
+      const pose = this.poseForDoor(id, deltas[doorId] ?? 0);
       group.position.set(pose.x, 2, pose.z);
       group.rotation.y = pose.frameYaw;
     }
