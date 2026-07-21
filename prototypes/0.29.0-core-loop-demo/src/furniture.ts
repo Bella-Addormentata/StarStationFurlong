@@ -2688,6 +2688,15 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     build: buildChargingDock,
     footprint: null,
     functions: ["robotDock"],
+    // 🤖 #77C s3: clicking the dock opens the robot PROGRAMMING panel. Approach
+    // from the pad's +z side and face the control post (at local -z, plate y≈0.62).
+    device: {
+      kind: "robotDock",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.2, z: 0.85 },
+      anchor: { x: 0, y: 0.62, z: -0.4 },
+    },
   },
   "rug-back": { kind: "rug-back", build: buildRugBack, footprint: null },
   "rug-front": { kind: "rug-front", build: buildRugFront, footprint: null },

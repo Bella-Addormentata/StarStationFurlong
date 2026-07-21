@@ -66,13 +66,19 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
+// 🤖 #77C s3: per-dock robot routine config (the programming console).
+import {
+  readRobotConfig, writeRobotConfig, subscribeRobot,
+  ROBOT_ROUTINES, ROUTINE_LABELS,
+} from './robotDoc';
+import type { RobotRoutine } from './robotDoc';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'cloneVat';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'cloneVat' | 'robotDock';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -1817,6 +1823,98 @@ export function createCashierUI(deps: CashierUIDeps): DeviceUI {
       panel = null;
     },
     update(): void { /* observer-driven; nothing per-frame */ },
+  };
+}
+
+// ── 🤖 #77C s3: ROBOT DOCK — program the dock's robot (routine console) ───────
+
+export interface RobotDockUIDeps {
+  /** Charging-dock item id — keys this robot's routine in the robot map. */
+  itemId: string;
+  /** Owner gate — only the room owner may program the robot. */
+  canEdit: () => boolean;
+}
+
+/**
+ * The charging dock's focused UI (#77C s3): choose the robot's ROUTINE from a
+ * short menu — Serve drinks / Roulette croupier / Idle at dock. The choice is
+ * written to the synced `robot` map (owner-only) so every client runs this
+ * dock's robot the same way. Custom scripting is the next slice.
+ */
+export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+
+  const render = (): void => {
+    if (!panel) return;
+    const current = readRobotConfig(deps.itemId)?.routine ?? 'serve';
+    const owner = deps.canEdit();
+    const routineBtn = (r: RobotRoutine): string => {
+      const on = r === current;
+      return `<button data-routine="${r}" ${owner ? '' : 'disabled'} style="
+        display:flex; justify-content:space-between; align-items:center; gap:8px;
+        padding:9px 12px; text-align:left;
+        background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
+        border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
+        border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
+        font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
+        cursor:${owner ? 'pointer' : 'default'};
+      "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
+    };
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🤖 ROBOT PROGRAM</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">ROUTINE</div>
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        ${ROBOT_ROUTINES.map(routineBtn).join('')}
+      </div>
+      <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
+        ${owner
+          ? 'Pick what this dock&apos;s robot does. Custom scripting is coming next.'
+          : 'Only the room owner can program this robot.'}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF ROBOT CONSOLE v1 · one robot per dock · the routine syncs to everyone in the room
+      </div>
+    `;
+    if (owner) {
+      panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
+        b.addEventListener('click', () => {
+          writeRobotConfig(deps.itemId, { routine: b.dataset.routine as RobotRoutine });
+        });
+      });
+    }
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-robotdock-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 340px; max-height: 90vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeRobot(() => render());
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+    },
+    update(): void {
+      /* observer-driven; nothing per-frame */
+    },
   };
 }
 

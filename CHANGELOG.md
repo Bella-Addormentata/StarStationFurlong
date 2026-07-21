@@ -12,6 +12,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.10 — 2026-07-21
+
+### 🤖🖥️ Program the robot at its dock (#77 Phase C, slice 3)
+
+Robots are now **programmable**. Walk up to a **charging dock** and click it to open its console — a short menu that decides what that dock's robot does:
+
+- **Routine dropdown** — **Serve drinks** (patrol + serve + dock when idle), **Roulette croupier** (run a roulette table; wait at the dock when there's none), or **Idle at dock** (just wait). Behaviour is now *configured*, not guessed from what's in the room.
+- **Owner-programmed, synced to everyone.** Only the room owner can set a routine (others see the console read-only); the choice writes to a shared `robot` map so every client runs that dock's robot identically. Change it and the robot switches behaviour live.
+- **The croupier respects the program.** A dock robot set to *croupier* is preferred to run a live table; if none is set, a serving/ambient robot fills in so a default casino still has a dealer, and an *idle* robot never gets pulled to the wheel.
+- **Next:** a custom-script editor (a bounded go-to / say / wait / operate step list) for robots that need more than a preset.
+- **Release line:** version bumped to 0.33.10, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.9 — 2026-07-21
 
 ### 🤖🔌 Robots become furniture — one per charging dock (#77 Phase C, slice 2)
