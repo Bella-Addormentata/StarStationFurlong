@@ -349,6 +349,13 @@ export class VoxelCharacter {
   private leftEar:  THREE.Group | null = null;
   private rightEar: THREE.Group | null = null;
 
+  // Tail chain joints (built in _buildTail): the flame is split into three
+  // chained sections — this.tail (root) → tailMid → tailTip — so sway can
+  // travel down the plume with follow-through lag instead of waving one
+  // rigid piece.
+  private tailMid: THREE.Group | null = null;
+  private tailTip: THREE.Group | null = null;
+
   // Torso "chest" group used for the subtle breathing scale
   private chest:    THREE.Group | null = null;
 
@@ -477,7 +484,7 @@ export class VoxelCharacter {
     // view). 64×44 segments: at play distance the silhouette must be a
     // perfect curve, no polygon flats.
     const skullGeo = new THREE.SphereGeometry(0.62, 64, 44);
-    skullGeo.scale(1.05, 1.00, 0.98);
+    skullGeo.scale(1.08, 1.00, 0.98);   // sheet head reads ~1.1× wider than tall
     skullGeo.translate(0, 0.42, 0);
     const skull = new THREE.Mesh(skullGeo, furMat);
     addWithOutline(this.head, skull, 0.028);
@@ -750,7 +757,7 @@ export class VoxelCharacter {
     // 0.82–2.32 rad (brow line → under-chin, the empty bottom is discarded
     // by alphaTest).
     const geo = new THREE.SphereGeometry(0.62, 48, 36, 0.871, 1.40, 0.82, 1.50);
-    geo.scale(1.058, 1.008, 0.988);   // skull scale (1.05,1.0,0.98) × ~1.008 proud
+    geo.scale(1.089, 1.008, 0.988);   // skull scale (1.08,1.0,0.98) × ~1.008 proud
                                       // (tighter = smaller dark sliver at profile)
     const mat = new THREE.MeshBasicMaterial({
       map: tex,
@@ -967,53 +974,92 @@ export class VoxelCharacter {
       const bell = Math.sin(Math.min(1, t / 0.95) * Math.PI);
       return 0.105 + Math.pow(bell, 1.05) * 0.215;
     };
-    // 40 rings so the fur scallops below resolve smoothly (~7 rings per
-    // scallop crest).
-    const RINGS = 40;
-    const spinePts: Array<[number, number]> = [];
-    const spineRadii: number[] = [];
-    for (let i = 0; i < RINGS; i++) {
-      const t = (i / (RINGS - 1)) * 0.95;
-      spinePts.push([spineY(t), spineZ(t)]);
-      spineRadii.push(radiusAt(t));
-    }
-    // Fur serration sculpted INTO the surface: the TOP/OUTER edge of the
-    // flame waves in and out (five scallop crests fading at both ends);
-    // the underside stays smooth like the sheet. Earlier attempts glued
-    // separate teardrop meshes on — their round bases read as balls, not
-    // fur. ringAngle a: sin(a) < 0 is the top/outer side in this frame.
-    const scallop = (tFrac: number, a: number) => {
-      const topness = Math.max(0, -Math.sin(a));
-      const wave = Math.pow(Math.abs(Math.sin(tFrac * Math.PI * 5.2 + 0.4)), 0.9);
-      const fade = Math.sin(Math.min(1, tFrac) * Math.PI);
-      return 1 + 0.24 * Math.pow(topness, 1.6) * wave * fade;
+    // ── Three chained sections (root → mid → tip joints) ─────────────────
+    // The flame is split at t = 0.35 and 0.68 into three tube sections on
+    // chained groups, so update() can lag the mid/tip sway behind the root
+    // for whip-like follow-through. Sections OVERLAP their joints by a few
+    // hundredths of t — the overlap rings tuck inside the next section, so
+    // the modest joint bends (≤ ~0.22 rad) never open a visible seam.
+    //
+    // Fur serration is sculpted INTO each surface: the TOP/OUTER edge waves
+    // in and out (five scallop crests over the full tail, fading at both
+    // ends) while the underside stays smooth like the sheet. Earlier
+    // attempts glued separate teardrop meshes on — their round bases read
+    // as balls, not fur. ringAngle a: sin(a) < 0 is the top/outer side.
+    const JOINT_MID = 0.35;
+    const JOINT_TIP = 0.68;
+    const buildSection = (
+      parent: THREE.Object3D,
+      t0: number,
+      t1: number,
+      base: number,
+      rings: number
+    ): void => {
+      const pts: Array<[number, number]> = [];
+      const radii: number[] = [];
+      for (let i = 0; i < rings; i++) {
+        const t = t0 + (i / (rings - 1)) * (t1 - t0);
+        pts.push([spineY(t) - spineY(base), spineZ(t) - spineZ(base)]);
+        radii.push(radiusAt(t));
+      }
+      const scallop = (frac: number, a: number) => {
+        const tGlobal = t0 + frac * (t1 - t0);
+        const topness = Math.max(0, -Math.sin(a));
+        const wave = Math.pow(Math.abs(Math.sin(tGlobal * Math.PI * 5.2 + 0.4)), 0.9);
+        const fade = Math.sin(Math.min(1, tGlobal / 0.95) * Math.PI);
+        return 1 + 0.24 * Math.pow(topness, 1.6) * wave * fade;
+      };
+      const mesh = new THREE.Mesh(flameTubeGeo(pts, radii, 32, 0.86, scallop), furMat);
+      parent.add(mesh);
+      parent.add(outline(mesh, 0.022));
     };
-    const flame = new THREE.Mesh(
-      flameTubeGeo(spinePts, spineRadii, 32, 0.86, scallop),
-      furMat
-    );
-    addWithOutline(this.tail, flame, 0.022);
 
-    // Tip — the sheet's flame ends in a SPLIT soft point: one long teardrop
-    // on the end tangent plus a shorter secondary curl just behind it.
+    // Root section rides the tail group itself
+    buildSection(this.tail, 0.0, JOINT_MID + 0.05, 0.0, 18);
+
+    // Mid joint at the t=0.35 spine point
+    const tailMid = new THREE.Group();
+    tailMid.position.set(0, spineY(JOINT_MID), spineZ(JOINT_MID));
+    this.tail.add(tailMid);
+    buildSection(tailMid, JOINT_MID - 0.03, JOINT_TIP + 0.05, JOINT_MID, 16);
+    this.tailMid = tailMid;
+
+    // Tip joint at the t=0.68 spine point (position relative to the mid)
+    const tailTip = new THREE.Group();
+    tailTip.position.set(
+      0,
+      spineY(JOINT_TIP) - spineY(JOINT_MID),
+      spineZ(JOINT_TIP) - spineZ(JOINT_MID)
+    );
+    tailMid.add(tailTip);
+    buildSection(tailTip, JOINT_TIP - 0.03, 0.95, JOINT_TIP, 14);
+    this.tailTip = tailTip;
+
+    // Tip fluff — the sheet's flame ends in a SPLIT soft point: one long
+    // teardrop on the end tangent plus a shorter curl just behind it. Both
+    // ride the tip joint so they whip with the follow-through.
     const [ty, tz] = tangent(0.95);
     const tlen = Math.hypot(ty, tz);
     const tipDirY = ty / tlen;
     const tipDirZ = tz / tlen;
     const tipMain = new THREE.Mesh(fluffGeo(0.130, 0.50, 26, 20), furMat);
-    tipMain.position.set(0, spineY(0.95) - tipDirY * 0.06, spineZ(0.95) - tipDirZ * 0.06);
+    tipMain.position.set(
+      0,
+      spineY(0.95) - spineY(JOINT_TIP) - tipDirY * 0.06,
+      spineZ(0.95) - spineZ(JOINT_TIP) - tipDirZ * 0.06
+    );
     tipMain.rotation.x = Math.atan2(tipDirZ, tipDirY);
-    addWithOutline(this.tail, tipMain, 0.024);
+    addWithOutline(tailTip, tipMain, 0.024);
 
     const tipSide = new THREE.Mesh(fluffGeo(0.085, 0.30, 20, 16), furMat);
     // Behind and slightly under the main point, angled ~35° off it
     tipSide.position.set(
       0,
-      spineY(0.88) - tipDirY * 0.02,
-      spineZ(0.88) + 0.02
+      spineY(0.88) - spineY(JOINT_TIP) - tipDirY * 0.02,
+      spineZ(0.88) - spineZ(JOINT_TIP) + 0.02
     );
     tipSide.rotation.x = Math.atan2(tipDirZ, tipDirY) - 0.62;
-    addWithOutline(this.tail, tipSide, 0.020);
+    addWithOutline(tailTip, tipSide, 0.020);
 
     // Outfit roles: the whole plume = fur (the sheet's tail is one colour;
     // furDeep/cream tail slots from the fox-marking era are gone).
@@ -1228,6 +1274,44 @@ export class VoxelCharacter {
       const idleSway = TAIL_REST_YAW + Math.sin(time * 1.5) * 0.12;
       this.tail.rotation.y = THREE.MathUtils.lerp(this.tail.rotation.y, idleSway, lerpSpeed);
     }
+
+    // Tail follow-through — the mid/tip joints lag the root sway (phase
+    // offsets ≈0.5/1.0 rad) so the plume WHIPS fluidly down its length
+    // instead of waving as one rigid piece. Amplitudes shrink toward the
+    // tip; frequencies match each state's root-sway write above.
+    if (this.tailMid && this.tailTip) {
+      let midTarget: number;
+      let tipTarget: number;
+      if (this.currentState === 'walk') {
+        midTarget = Math.sin(time * 4 - 0.45) * 0.22;
+        tipTarget = Math.sin(time * 4 - 0.90) * 0.18;
+      } else if (this.currentState === 'swim') {
+        midTarget = Math.sin(time * 1.2 - 0.50) * 0.10;
+        tipTarget = Math.sin(time * 1.2 - 1.00) * 0.08;
+      } else {
+        midTarget = Math.sin(time * 1.5 - 0.55) * 0.07;
+        tipTarget = Math.sin(time * 1.5 - 1.10) * 0.06;
+      }
+      this.tailMid.rotation.y = THREE.MathUtils.lerp(this.tailMid.rotation.y, midTarget, lerpSpeed);
+      this.tailTip.rotation.y = THREE.MathUtils.lerp(this.tailTip.rotation.y, tipTarget, lerpSpeed);
+    }
+
+    // Head life — subtle sway/bob so the oversized skull never reads frozen:
+    // a gentle two-axis drift at idle/swim, a stride-locked bob on walk.
+    // Other states (seats, sleep, dive) lerp back to neutral because the
+    // pose owns the silhouette there.
+    const headLifeX = this.currentState === 'walk'
+      ? Math.sin(time * 8) * 0.05
+      : this.currentState === 'idle' || this.currentState === 'swim'
+        ? Math.sin(time * 1.4) * 0.02
+        : 0;
+    const headLifeZ = this.currentState === 'walk'
+      ? Math.sin(time * 4) * 0.04
+      : this.currentState === 'idle' || this.currentState === 'swim'
+        ? Math.sin(time * 0.9) * 0.03
+        : 0;
+    this.head.rotation.x = THREE.MathUtils.lerp(this.head.rotation.x, headLifeX, lerpSpeed);
+    this.head.rotation.z = THREE.MathUtils.lerp(this.head.rotation.z, headLifeZ, lerpSpeed);
 
     // 🍹 Drink in the right paw (waiter-bot serve) — OVERRIDES the state arm
     // pose: reaches forward to take the glass, curls up to the muzzle on each
