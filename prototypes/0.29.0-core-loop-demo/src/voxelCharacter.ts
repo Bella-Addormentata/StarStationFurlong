@@ -109,11 +109,13 @@ export function snapTo8Ways(angle: number): number {
  * Resting side-set of the tail brush (radians about the tail group's local
  * Z — which maps to a yaw about world-up, swinging the WHOLE drooping brush
  * sideways; rotating local Y would twist a drooped tail's plane instead).
- * POSITIVE puts the brush on the character's RIGHT (viewer-left in the
- * sheet's front view, matching every reference pose). Idle sways around
+ * NEGATIVE puts the brush on the character's LEFT, which reads as
+ * VIEWER-RIGHT when the character faces the camera — matching where the
+ * sheet draws the tail in its front and ¾ hero views. (The sheet's back
+ * view mirrors it for composition; the hero views win.) Idle sways around
  * this offset; walk/swim halve it so the brush streams behind.
  */
-const TAIL_REST_YAW = 0.45;
+const TAIL_REST_YAW = -0.45;
 
 // Reference-sheet palette — ALL-WHITE fur; the only dark marks are the face
 // features, in soft charcoal (never pure black — the sheet's linework is
@@ -757,12 +759,14 @@ export class VoxelCharacter {
     // Small fur tuft on top of the skull between the ears, leaning forward
     // — three soft fluff teardrops with their round bases pinned at the
     // mesh position so rotations splay them like real fur clumps.
+    // All locks sweep the SAME direction (rotZ ≥ 0) — the sheet's tuft
+    // flops to one side as a single combed clump, not a symmetric splay.
     const tuftSpec: Array<[number, number, number, number, number, number, number]> = [
       // x      y     z     r      h     rotX   rotZ   (fat plush clumps)
-      [ 0.00, 0.99, 0.14, 0.115, 0.32, -0.65,  0.00],
-      [-0.11, 0.98, 0.10, 0.090, 0.25, -0.60,  0.32],
-      [ 0.09, 0.99, 0.11, 0.085, 0.21, -0.55, -0.28],
-      [-0.04, 1.00, 0.16, 0.070, 0.17, -0.75,  0.12],
+      [ 0.00, 0.99, 0.14, 0.115, 0.32, -0.65,  0.10],
+      [-0.11, 0.98, 0.10, 0.090, 0.25, -0.60,  0.35],
+      [ 0.09, 0.99, 0.11, 0.085, 0.21, -0.55, -0.05],
+      [-0.04, 1.00, 0.16, 0.070, 0.17, -0.75,  0.22],
     ];
     for (const [x, y, z, r, h, rx, rz] of tuftSpec) {
       const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
@@ -776,11 +780,13 @@ export class VoxelCharacter {
     // soft teardrops per side pointing outward-and-down, bases pinned just
     // inside the skull surface.
     for (const side of [-1, 1] as const) {
+      // The sheet's cheek fan projects near-HORIZONTALLY at eye level
+      // (middle lock longest); drooping tilts read as jowls, not fluff.
       const ruffSpec: Array<[number, number, number, number, number]> = [
-        // y      z     r      h     extra outward-down tilt (fat clumps)
-        [ 0.43, 0.04, 0.085, 0.20, 0.08],
-        [ 0.31, 0.08, 0.125, 0.34, 0.35],
-        [ 0.20, 0.12, 0.100, 0.25, 0.68],
+        // y      z     r      h     tilt past horizontal (fat clumps)
+        [ 0.43, 0.04, 0.085, 0.20, -0.10],
+        [ 0.31, 0.08, 0.125, 0.34,  0.10],
+        [ 0.20, 0.12, 0.100, 0.25,  0.42],
       ];
       for (const [y, z, r, h, tilt] of ruffSpec) {
         const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
@@ -880,9 +886,10 @@ export class VoxelCharacter {
       ctx.stroke();
     };
     // Two eyes with a WIDE nose-bridge gap — the sheet spaces the eyes
-    // about half an eye-width apart. Y=228 is upper-middle of face area.
-    drawEye(158, 228, -1);
-    drawEye(354, 228,  1);
+    // about half an eye-width apart, and centres them slightly BELOW the
+    // head ball's midline (238 in canvas space lands there).
+    drawEye(158, 238, -1);
+    drawEye(354, 238,  1);
 
     // Build the texture and plane. The plane is sized 0.90 units wide so
     // the drawn eyes end up ~0.24 wide each in world space — the big dark
@@ -1004,6 +1011,23 @@ export class VoxelCharacter {
       hip.position.set(hs * 0.40, -0.24, 0.02);
       hip.rotation.z = -hs * 2.5;   // tip points down-and-out
       addWithOutline(this.chest, hip, 0.018);
+    }
+
+    // Nape ruff — the sheet's BACK view shows a fur collar where the head
+    // meets the shoulders: three locks draping down over the shoulder
+    // blades (the bib's counterpart around the back).
+    const napeSpec: Array<[number, number, number, number, number, number]> = [
+      // x      y     z      r      h     rotZ splay
+      [ 0.00, 0.32, -0.24, 0.085, 0.22,  0.00],
+      [-0.12, 0.31, -0.22, 0.070, 0.18,  0.25],
+      [ 0.12, 0.31, -0.22, 0.070, 0.18, -0.25],
+    ];
+    for (const [x, y, z, r, h, rz] of napeSpec) {
+      const lock = new THREE.Mesh(fluffGeo(r, h, 18, 14), furMat);
+      lock.position.set(x, y, z);
+      // Drape DOWN-and-back over the shoulder blades
+      lock.rotation.set(-2.55, 0, rz);
+      addWithOutline(this.chest, lock, 0.018);
     }
 
     // Outfit roles: torso shell = fur; chest bib + spikes = cream.
@@ -1141,14 +1165,15 @@ export class VoxelCharacter {
     // height — both wrong.) Local frame: +Y = back, +Z = up.
     //   y(t): backward run.  z(t): parabolic dip (max ≈ −0.27 at mid) with
     //   a t⁶ up-flick that only bites near the tip.
-    // Up-flick uses t^3.5 (not a higher power): the same tip height with
-    // the bend SPREAD over the last half — a tighter bend made consecutive
-    // tube rings intersect and fold the surface inside-out at the kink.
+    // Up-flick uses t^3.5 (not a higher power): the bend stays SPREAD over
+    // the last half — a tighter bend made consecutive tube rings intersect
+    // and fold the surface inside-out at the kink. 0.34 amplitude lifts
+    // the tip toward mid-back height (sheet side view).
     const spineY = (t: number) => 0.62 * t;
-    const spineZ = (t: number) => -1.1 * t * (1 - t) + 0.26 * Math.pow(t, 3.5);
+    const spineZ = (t: number) => -1.1 * t * (1 - t) + 0.34 * Math.pow(t, 3.5);
     // Tangent of the spine curve (d/dt), for scallop frames + tip direction
     const tangent = (t: number): [number, number] =>
-      [0.62, -1.1 * (1 - 2 * t) + 0.91 * Math.pow(t, 2.5)];
+      [0.62, -1.1 * (1 - 2 * t) + 1.19 * Math.pow(t, 2.5)];
 
     // Flame body — ONE continuous varying-radius tube along the parabola
     // (16 rings × 32 radial segments). FAT like the sheet: the plume's max
