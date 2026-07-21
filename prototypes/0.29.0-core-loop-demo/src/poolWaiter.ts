@@ -17,7 +17,7 @@
 import * as THREE from "three";
 import type { Player } from "./player";
 import { CELL_SIZE, findPath, worldToCol, worldToRow } from "./pathfinding";
-import type { RobotRoutine } from "./robotDoc";
+import type { RobotRoutine, RobotStep } from "./robotDoc";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -151,8 +151,16 @@ export class PoolWaiter {
   private idleTimer = 0;
   /** 🤖 #77C s3: owner-programmed routine (the dock's console writes it, synced).
    *  'serve' = patrol + serve + dock when idle (default); 'croupier' = only run a
-   *  roulette table (else wait at the dock); 'idle' = just wait at the dock. */
+   *  roulette table (else wait at the dock); 'idle' = just wait at the dock;
+   *  'custom' = loop the owner-authored `script`. */
   private routine: RobotRoutine = "serve";
+  /** 🤖 #77C s4: the custom step list (routine 'custom') + loop cursor/timer, and
+   *  the world-provided handler that renders a 'say' bubble over the bot. */
+  private script: RobotStep[] = [];
+  private scriptIndex = 0;
+  private scriptTimer = 0;
+  private saidThisStep = false;
+  private sayHandler: ((text: string, x: number, z: number) => void) | null = null;
   /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
    *  walk goal (routes around furniture / through door openings instead of
    *  clipping straight through), and the goal they were computed for. */
@@ -385,6 +393,14 @@ export class PoolWaiter {
       return;
     }
 
+    // 🤖 #77C s4: a 'custom' robot runs its owner-authored step loop (walk / say /
+    // wait) — never serves or croupiers.
+    if (this.routine === "custom") {
+      this.tray.visible = false;
+      this.updateScript(dt);
+      return;
+    }
+
     // 🤖 #77C s3: OFF-DUTY per routine → wait at the dock. An 'idle' robot always
     // waits; a 'croupier' robot waits whenever it has no wheel to run. Only a
     // 'serve' robot falls through to the patrol/serve behaviour below.
@@ -432,6 +448,57 @@ export class PoolWaiter {
   /** 🤖 #77C s3: set the owner-programmed routine (from the dock's console). */
   public setRoutine(routine: RobotRoutine): void {
     this.routine = routine;
+  }
+
+  /** 🤖 #77C s4: set the custom step list. Resets the loop only when the script
+   *  actually changed, so a re-apply mid-loop doesn't restart it. */
+  public setScript(steps: RobotStep[]): void {
+    if (JSON.stringify(steps) === JSON.stringify(this.script)) return;
+    this.script = steps;
+    this.scriptIndex = 0;
+    this.scriptTimer = 0;
+    this.saidThisStep = false;
+    this.path = [];
+    this.pathGoalKey = "";
+  }
+
+  /** 🤖 #77C s4: the world provides the 'say' renderer (a bubble over the bot). */
+  public setSayHandler(fn: (text: string, x: number, z: number) => void): void {
+    this.sayHandler = fn;
+  }
+
+  /** 🤖 #77C s4: advance the custom step loop (walk / say / wait). */
+  private updateScript(dt: number): void {
+    if (this.script.length === 0) {
+      this.idlePose();
+      return;
+    }
+    const step = this.script[this.scriptIndex % this.script.length];
+    const advance = (): void => {
+      this.scriptIndex = (this.scriptIndex + 1) % this.script.length;
+      this.scriptTimer = 0;
+      this.saidThisStep = false;
+      this.path = [];
+      this.pathGoalKey = "";
+    };
+    if (step.kind === "goto") {
+      if (this.walkTo(dt, step.x, step.z, 0.15)) advance();
+    } else if (step.kind === "say") {
+      if (!this.saidThisStep) {
+        this.saidThisStep = true;
+        const p = this.group.position;
+        this.sayHandler?.(step.text, p.x, p.z);
+      }
+      // Hold the pose briefly so the line is readable before the next step.
+      this.idlePose();
+      this.scriptTimer += dt;
+      if (this.scriptTimer >= 2.5) advance();
+    } else {
+      // wait
+      this.idlePose();
+      this.scriptTimer += dt;
+      if (this.scriptTimer >= step.secs) advance();
+    }
   }
 
   /** Stand still (a dockless off-duty robot) — legs settled, a slow idle bob. */

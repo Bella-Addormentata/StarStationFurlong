@@ -15,19 +15,32 @@
 
 import * as Y from 'yjs';
 
-export type RobotRoutine = 'serve' | 'croupier' | 'idle';
+export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom';
+
+/** 🤖 #77C s4: one bounded step of an owner-authored routine (a chip list, NOT
+ *  a DSL). The robot loops the list: walk to a spot, say a line, or pause. */
+export type RobotStep =
+  | { kind: 'goto'; x: number; z: number }
+  | { kind: 'say'; text: string }
+  | { kind: 'wait'; secs: number };
+
+/** Hard cap on a custom script (keeps the synced record small + the loop cheap). */
+export const MAX_SCRIPT_STEPS = 16;
 
 export interface RobotConfig {
   routine: RobotRoutine;
+  /** Only meaningful when routine === 'custom'. */
+  script?: RobotStep[];
 }
 
-export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle'];
+export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom'];
 
 /** Human labels for the routine dropdown. */
 export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
   serve: 'Serve drinks',
   croupier: 'Roulette croupier',
   idle: 'Idle at dock',
+  custom: 'Custom script',
 };
 
 let boundDoc: Y.Doc | null = null;
@@ -69,13 +82,30 @@ export function subscribeRobot(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Step guard — the script crosses the room-doc trust boundary (peer writes). */
+export function isRobotStep(value: unknown): value is RobotStep {
+  if (typeof value !== 'object' || value === null) return false;
+  const s = value as { kind?: unknown; x?: unknown; z?: unknown; text?: unknown; secs?: unknown };
+  if (s.kind === 'goto') return Number.isFinite(s.x) && Number.isFinite(s.z);
+  if (s.kind === 'say') return typeof s.text === 'string';
+  if (s.kind === 'wait') return Number.isFinite(s.secs) && (s.secs as number) >= 0;
+  return false;
+}
+
 function isRobotConfig(value: unknown): value is RobotConfig {
   if (typeof value !== 'object' || value === null) return false;
   const c = value as Partial<RobotConfig>;
-  return (
-    typeof c.routine === 'string' &&
-    (ROBOT_ROUTINES as readonly string[]).includes(c.routine)
-  );
+  if (
+    typeof c.routine !== 'string' ||
+    !(ROBOT_ROUTINES as readonly string[]).includes(c.routine)
+  ) {
+    return false;
+  }
+  if (c.script !== undefined) {
+    if (!Array.isArray(c.script) || c.script.length > MAX_SCRIPT_STEPS) return false;
+    if (!c.script.every(isRobotStep)) return false;
+  }
+  return true;
 }
 
 /** The dock's configured routine, or null if never programmed (defaults apply). */

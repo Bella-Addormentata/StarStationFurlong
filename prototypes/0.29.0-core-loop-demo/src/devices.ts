@@ -69,9 +69,9 @@ import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
 // 🤖 #77C s3: per-dock robot routine config (the programming console).
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
-  ROBOT_ROUTINES, ROUTINE_LABELS,
+  ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
 } from './robotDoc';
-import type { RobotRoutine } from './robotDoc';
+import type { RobotRoutine, RobotStep } from './robotDoc';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
@@ -1835,19 +1835,32 @@ export interface RobotDockUIDeps {
   canEdit: () => boolean;
 }
 
+/** HTML-attribute escape for owner-authored 'say' text (rendered in the editor
+ *  on every client's owner view — never trust the value even from a peer). */
+function escAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
 /**
- * The charging dock's focused UI (#77C s3): choose the robot's ROUTINE from a
- * short menu — Serve drinks / Roulette croupier / Idle at dock. The choice is
- * written to the synced `robot` map (owner-only) so every client runs this
- * dock's robot the same way. Custom scripting is the next slice.
+ * The charging dock's focused UI (#77C s3/s4): choose the robot's ROUTINE from a
+ * short menu — Serve drinks / Roulette croupier / Idle at dock / Custom script —
+ * and, for a custom routine, edit a bounded step list (go-to / say / wait) the
+ * robot loops. Written to the synced `robot` map (owner-only) so every client
+ * runs this dock's robot the same way.
  */
 export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
 
+  const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
+    writeRobotConfig(deps.itemId, { routine, script });
+  };
+  const curScript = (): RobotStep[] => readRobotConfig(deps.itemId)?.script ?? [];
+
   const render = (): void => {
     if (!panel) return;
-    const current = readRobotConfig(deps.itemId)?.routine ?? 'serve';
+    const cfg = readRobotConfig(deps.itemId);
+    const current = cfg?.routine ?? 'serve';
     const owner = deps.canEdit();
     const routineBtn = (r: RobotRoutine): string => {
       const on = r === current;
@@ -1861,6 +1874,40 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         cursor:${owner ? 'pointer' : 'default'};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
+    const inp = (idx: number, field: string, val: string, w: string, type = 'text'): string =>
+      `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${owner ? '' : 'disabled'} style="
+        width:${w}; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
+        border-radius:4px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:3px 5px;">`;
+    const stepRow = (step: RobotStep, idx: number): string => {
+      const del = owner
+        ? `<button data-del="${idx}" title="Remove" style="margin-left:auto; background:none; border:none; color:#FF8A80; font-size:14px; cursor:pointer;">×</button>`
+        : '';
+      let body: string;
+      if (step.kind === 'goto') {
+        body = `🚶 GO TO ${inp(idx, 'x', String(step.x), '46px', 'number')} , ${inp(idx, 'z', String(step.z), '46px', 'number')}`;
+      } else if (step.kind === 'say') {
+        body = `💬 SAY ${inp(idx, 'text', escAttr(step.text), '150px')}`;
+      } else {
+        body = `⏱ WAIT ${inp(idx, 'secs', String(step.secs), '46px', 'number')} s`;
+      }
+      return `<div style="display:flex; align-items:center; gap:6px; font-size:10px; color:${CH_GOLD};">${body}${del}</div>`;
+    };
+    const script = curScript();
+    const addBtn = (kind: string, label: string): string =>
+      `<button data-add="${kind}" style="flex:1; padding:6px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,0.35); border-radius:6px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; font-weight:800; cursor:pointer;">${label}</button>`;
+    const editor =
+      current === 'custom'
+        ? `
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SCRIPT — loops top to bottom</div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        ${script.length ? script.map(stepRow).join('') : `<span style="font-size:10px; color:#4A5560;">No steps yet.${owner ? ' Add some below.' : ''}</span>`}
+      </div>
+      ${owner
+          ? script.length < MAX_SCRIPT_STEPS
+            ? `<div style="display:flex; gap:6px;">${addBtn('goto', '+ Go to')}${addBtn('say', '+ Say')}${addBtn('wait', '+ Wait')}</div>`
+            : `<span style="font-size:9px; color:#4A5560;">Max ${MAX_SCRIPT_STEPS} steps.</span>`
+          : ''}`
+        : '';
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🤖 ROBOT PROGRAM</span>
@@ -1870,22 +1917,56 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       <div style="display:flex; flex-direction:column; gap:8px;">
         ${ROBOT_ROUTINES.map(routineBtn).join('')}
       </div>
+      ${editor}
       <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
         ${owner
-          ? 'Pick what this dock&apos;s robot does. Custom scripting is coming next.'
+          ? 'Program this dock&apos;s robot. Custom = a step loop it walks and speaks.'
           : 'Only the room owner can program this robot.'}
       </div>
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF ROBOT CONSOLE v1 · one robot per dock · the routine syncs to everyone in the room
+        SSF ROBOT CONSOLE v1 · one robot per dock · syncs to everyone in the room
       </div>
     `;
-    if (owner) {
-      panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
-        b.addEventListener('click', () => {
-          writeRobotConfig(deps.itemId, { routine: b.dataset.routine as RobotRoutine });
+    if (!owner) return;
+    panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
+      b.addEventListener('click', () => {
+        // Keep any authored script when switching routines.
+        writeRobotConfig(deps.itemId, {
+          routine: b.dataset.routine as RobotRoutine,
+          ...(script.length ? { script } : {}),
         });
       });
-    }
+    });
+    panel.querySelectorAll<HTMLButtonElement>('[data-add]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const kind = b.dataset.add;
+        const step: RobotStep =
+          kind === 'goto'
+            ? { kind: 'goto', x: 0, z: 0 }
+            : kind === 'say'
+              ? { kind: 'say', text: 'Hello!' }
+              : { kind: 'wait', secs: 2 };
+        writeScript('custom', [...curScript(), step].slice(0, MAX_SCRIPT_STEPS));
+      });
+    });
+    panel.querySelectorAll<HTMLButtonElement>('[data-del]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const i = Number(b.dataset.del);
+        writeScript('custom', curScript().filter((_, n) => n !== i));
+      });
+    });
+    panel.querySelectorAll<HTMLInputElement>('[data-idx]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const i = Number(el.dataset.idx);
+        const f = el.dataset.f!;
+        const script2 = curScript().map((s, n) => {
+          if (n !== i) return s;
+          if (f === 'text') return { ...s, text: el.value };
+          return { ...s, [f]: Number(el.value) };
+        });
+        writeScript('custom', script2 as RobotStep[]);
+      });
+    });
   };
 
   return {
