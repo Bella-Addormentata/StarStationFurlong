@@ -12,6 +12,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.20 — 2026-07-21
+
+### ⛔ Docking on top of another module is now blocked (#28 decouple, slice 6a)
+
+The module-overlap guard graduates from a warning to a **hard stop** — the "prevent modules overlapping" system you asked for is now enforced.
+
+- When you INITIATE a pairing whose connector chain would land the new module **on top of** an existing station module, the dock is **refused** with `Can't dock here — the module would overlap <module>. Re-route the connector chain to a clear berth.` — no pairing happens. The module you're actually connecting to (the berth at the chain's end) is still excluded, so only a genuine collision is blocked.
+- It keys off the ports / atlas geometry (the same poses the exterior renders), never off doors — the decouple-clean split.
+- Also hardened the earlier overlap *warning* so a future free-door keypad can't hit the cardinal-only pose helper (guarded to the 4 cardinal berths).
+- Verified live: with an overlapping neighbour seeded, INITIATE shows the block alert, leaves the pairing uncommitted, and suppresses the connection callback; no false block when there's no collision; `tsc` clean; no console errors.
+- **Release line:** version bumped to 0.33.20, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.19 — 2026-07-21
 
 ### 🚪➕➖ Doors can be added and removed live (#28 decouple, slice 5b)
