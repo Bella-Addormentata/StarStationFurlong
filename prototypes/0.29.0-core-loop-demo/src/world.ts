@@ -29,6 +29,8 @@ import {
   tickAutoCroupier,
 } from "./croupier";
 import { spawnFixedBubble } from "./chatBubbles";
+import { readRobotConfig, subscribeRobot } from "./robotDoc";
+import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
@@ -91,6 +93,7 @@ import {
   createHelmUI,
   createCashierUI,
   createRouletteUI,
+  createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
@@ -314,6 +317,10 @@ export class World {
     // Create player (will be shown after morph)
     this.player = new Player(this.scene);
     this.player.mesh.visible = false;
+
+    // 🤖 #77C s3: re-drive robot routines the instant a dock console edit syncs
+    // (no furniture reconcile needed). Lifetime subscription (one World).
+    subscribeRobot(() => this.applyRobotRoutines());
 
     // 💦 Pool water entry → splash burst at the surface (big = dive landing).
     this.player.onWaterEntry = (x, y, z, big) => this.spawnSplash(x, y, z, big);
@@ -3859,6 +3866,17 @@ export class World {
           : null,
       );
     }
+    this.applyRobotRoutines();
+  }
+
+  /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (the
+   *  ambient robot has no config → default 'serve'). Cheap; also run on every
+   *  robotDoc change so a console edit re-drives behaviour without a reconcile. */
+  private applyRobotRoutines(): void {
+    for (const [key, bot] of this.robots) {
+      const cfg = key === AMBIENT_ROBOT_KEY ? null : readRobotConfig(key);
+      bot.setRoutine(cfg?.routine ?? "serve");
+    }
   }
 
   private updateCroupier(): void {
@@ -3889,14 +3907,27 @@ export class World {
         post = { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle };
       }
     }
+    // 🤖 #77C s3: routine-aware election. A dock robot programmed 'croupier' is
+    // preferred; if none is, a non-'idle' (serve/ambient) robot fills in so a
+    // default casino still gets a dealer; an 'idle' robot never croupiers.
+    const routineOf = (key: string): RobotRoutine =>
+      key === AMBIENT_ROBOT_KEY ? "serve" : readRobotConfig(key)?.routine ?? "serve";
+    const hasDedicated = [...this.robots.keys()].some(
+      (k) => routineOf(k) === "croupier",
+    );
+    const eligible = (k: string): boolean =>
+      this.robots.has(k) &&
+      routineOf(k) !== "idle" &&
+      (!hasDedicated || routineOf(k) === "croupier");
     if (!post) {
       this.croupierRobotKey = null;
-    } else if (!this.croupierRobotKey || !this.robots.has(this.croupierRobotKey)) {
-      // Pick the nearest robot ONCE, then keep it (sticky) so the others head
-      // straight to their docks instead of drifting toward the wheel.
+    } else if (!this.croupierRobotKey || !eligible(this.croupierRobotKey)) {
+      // Pick the nearest eligible robot ONCE, then keep it (sticky) so the others
+      // head straight to their docks instead of drifting toward the wheel.
       let bestKey: string | null = null;
       let best = Infinity;
       for (const [key, bot] of this.robots) {
+        if (!eligible(key)) continue;
         const bp = bot.getPosition();
         const d = Math.hypot(bp.x - post.x, bp.z - post.z);
         if (d < best) {
@@ -4043,6 +4074,17 @@ export class World {
       const target =
         device.kind === "roulette" ? this.standTarget(device) : device;
       deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    if (device.kind === "robotDock") {
+      // 🤖 #77C s3: program the dock's robot. Owner-gated (only the room owner
+      // may set the routine); anyone can open it to see the current program.
+      const ui = createRobotDockUI({
+        itemId: deviceId,
+        canEdit: () => canEditRoom().ok,
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

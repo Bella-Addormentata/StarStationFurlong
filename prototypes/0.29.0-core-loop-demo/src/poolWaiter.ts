@@ -17,6 +17,7 @@
 import * as THREE from "three";
 import type { Player } from "./player";
 import { CELL_SIZE, findPath, worldToCol, worldToRow } from "./pathfinding";
+import type { RobotRoutine } from "./robotDoc";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -148,6 +149,10 @@ export class PoolWaiter {
   private croupierPost: { x: number; z: number; faceAngle: number } | null = null;
   private activity: "PATROL" | "DOCK" | "CROUPIER" = "PATROL";
   private idleTimer = 0;
+  /** 🤖 #77C s3: owner-programmed routine (the dock's console writes it, synced).
+   *  'serve' = patrol + serve + dock when idle (default); 'croupier' = only run a
+   *  roulette table (else wait at the dock); 'idle' = just wait at the dock. */
+  private routine: RobotRoutine = "serve";
   /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
    *  walk goal (routes around furniture / through door openings instead of
    *  clipping straight through), and the goal they were computed for. */
@@ -380,6 +385,17 @@ export class PoolWaiter {
       return;
     }
 
+    // 🤖 #77C s3: OFF-DUTY per routine → wait at the dock. An 'idle' robot always
+    // waits; a 'croupier' robot waits whenever it has no wheel to run. Only a
+    // 'serve' robot falls through to the patrol/serve behaviour below.
+    if (this.routine === "idle" || this.routine === "croupier") {
+      this.tray.visible = false;
+      this.activity = "DOCK";
+      if (this.dockTarget) this.updateDock(dt);
+      else this.idlePose();
+      return;
+    }
+
     // 🔌 #77 Phase A: idle→dock. A fox within range (or no dock at all) keeps
     // the bot awake on patrol/serve; otherwise idle accrues and, past the
     // threshold, the bot heads to its charging dock and holds a charge pose.
@@ -411,6 +427,18 @@ export class PoolWaiter {
       this.activity = "PATROL";
       this.idleTimer = 0;
     }
+  }
+
+  /** 🤖 #77C s3: set the owner-programmed routine (from the dock's console). */
+  public setRoutine(routine: RobotRoutine): void {
+    this.routine = routine;
+  }
+
+  /** Stand still (a dockless off-duty robot) — legs settled, a slow idle bob. */
+  private idlePose(): void {
+    this.legL.rotation.x = 0;
+    this.legR.rotation.x = 0;
+    this.body.position.y = Math.sin(this.time * 1.6) * 0.01;
   }
 
   /** 🎰🤖 Point the bot at a roulette wheel-head (world pos + facing). The world

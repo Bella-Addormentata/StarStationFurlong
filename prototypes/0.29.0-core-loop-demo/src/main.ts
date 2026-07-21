@@ -47,6 +47,7 @@ import { roomEdit, setRoomEditPermission } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
   bindFurnitureDoc,
@@ -1085,6 +1086,9 @@ async function joinRoomAtEpoch(
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
   bindCasinoDoc(sync.doc);
+
+  // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
+  bindRobotDoc(sync.doc);
 
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the
