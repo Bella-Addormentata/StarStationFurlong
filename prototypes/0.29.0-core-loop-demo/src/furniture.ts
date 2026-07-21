@@ -2555,19 +2555,23 @@ const classicHotTubSeats: SeatTemplate[] = [
 // SHORT END is the WHEEL HEAD — reserved for the owner / their croupier robot.
 // Two positions on each long (z) face + one on the +x end make up the other 5.
 // faceAngle points toward the table centre (atan2(nx,nz): +z=0,+x=π/2,-z=π,-x=-π/2).
+// Offsets clear the table's collision zone so the avatar can stand exactly on
+// each front (a front INSIDE the collision inflation leaves it stranded ~0.2 m
+// short, which blocks the device-focus arrival). Long faces sit 1.0 m beyond
+// the ±0.5 z-edge; the ends 0.9 m beyond the ±1.0 x-edge.
 const rouletteStands: StandTemplate[] = [
-  { stand: { x: -1.55, z: 0.0 }, faceAngle: Math.PI / 2, role: "wheelHead" },
-  { stand: { x: 1.55, z: 0.0 }, faceAngle: -Math.PI / 2 },
-  { stand: { x: -0.6, z: -1.2 }, faceAngle: 0 },
-  { stand: { x: 0.6, z: -1.2 }, faceAngle: 0 },
-  { stand: { x: -0.6, z: 1.2 }, faceAngle: Math.PI },
-  { stand: { x: 0.6, z: 1.2 }, faceAngle: Math.PI },
+  { stand: { x: -1.9, z: 0.0 }, faceAngle: Math.PI / 2, role: "wheelHead" },
+  { stand: { x: 1.9, z: 0.0 }, faceAngle: -Math.PI / 2 },
+  { stand: { x: -0.7, z: -1.5 }, faceAngle: 0 },
+  { stand: { x: 0.7, z: -1.5 }, faceAngle: 0 },
+  { stand: { x: -0.7, z: 1.5 }, faceAngle: Math.PI },
+  { stand: { x: 0.7, z: 1.5 }, faceAngle: Math.PI },
 ];
 
 // ♟️ Chess / game table (2×1): 2 positions facing off across the board.
 const gameTableStands: StandTemplate[] = [
-  { stand: { x: 0.0, z: -1.2 }, faceAngle: 0 },
-  { stand: { x: 0.0, z: 1.2 }, faceAngle: Math.PI },
+  { stand: { x: 0.0, z: -1.5 }, faceAngle: 0 },
+  { stand: { x: 0.0, z: 1.5 }, faceAngle: Math.PI },
 ];
 
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
