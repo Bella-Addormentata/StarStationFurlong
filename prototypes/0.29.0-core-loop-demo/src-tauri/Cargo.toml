@@ -1,6 +1,6 @@
 [package]
 name = "ssf-node"
-version = "0.33.16"
+version = "0.33.17"
 edition = "2021"
 publish = false
 description = "StarStation Furlong - Tauri Client & Node Host"

@@ -269,6 +269,19 @@ export class DoorDockingPortSystem {
       doorGroup.position.set(pose.x, 2, pose.z);
       doorGroup.rotation.y = pose.frameYaw;
 
+      // 🚪↔🛰️ #28 S4b: split each group into the structural PORT HARDWARE (keypad
+      // + status LED — one per berth) and the DOOR LEAVES (frame, sliding panels,
+      // threshold, click box). Both sit at the group origin, so every child's
+      // world transform — and thus render / slide / fade / raycast — is identical
+      // to before. The split just lets slice 5 move a free door's leaves while its
+      // port hardware stays at the berth. Every group accessor (getObjectByName,
+      // traverse) is recursive, so nothing else changes; only startSlide reads
+      // userData non-recursively, so isLarge stays on the TOP group below.
+      const doorLeaves = new THREE.Group();
+      doorLeaves.name = "doorLeaves";
+      const portHardware = new THREE.Group();
+      portHardware.name = "portHardware";
+
       // Walkability comes from the door registry: the north port hides behind
       // the fireplace, so it gets NO click box and NO isDoorBody tags —
       // otherwise fireplace clicks would trigger it.
@@ -304,7 +317,7 @@ export class DoorDockingPortSystem {
         post.userData = walkable
           ? { ...bodyData }
           : { doorId: cfg.id, doorBodyCandidate: true };
-        doorGroup.add(post);
+        doorLeaves.add(post);
       }
       const header = new THREE.Mesh(
         new THREE.BoxGeometry(openingWidth + POST_W * 2, 0.5, FRAME_D),
@@ -314,7 +327,7 @@ export class DoorDockingPortSystem {
       header.userData = walkable
         ? { ...bodyData }
         : { doorId: cfg.id, doorBodyCandidate: true };
-      doorGroup.add(header);
+      doorLeaves.add(header);
 
       // ── 2. Emissive frame strips (status-tinted via syncLEDStatus) ─────────
       const glowMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
@@ -329,7 +342,7 @@ export class DoorDockingPortSystem {
           FRAME_D / 2,
         );
         strip.name = "frameGlow";
-        doorGroup.add(strip);
+        doorLeaves.add(strip);
       }
       const headerStrip = new THREE.Mesh(
         new THREE.BoxGeometry(openingWidth, 0.06, 0.06),
@@ -337,7 +350,7 @@ export class DoorDockingPortSystem {
       );
       headerStrip.position.set(0, FLOOR_Y + OPEN_H + 0.03, FRAME_D / 2);
       headerStrip.name = "frameGlow";
-      doorGroup.add(headerStrip);
+      doorLeaves.add(headerStrip);
 
       // ── 3. Leaves as groups (slide code only touches .position.x) ──────────
       const leafWidth = openingWidth / 2;
@@ -426,8 +439,8 @@ export class DoorDockingPortSystem {
 
       const leftOffset = cfg.isLarge ? -0.62 : -0.37;
       const rightOffset = cfg.isLarge ? 0.62 : 0.37;
-      doorGroup.add(buildLeaf("leftLeaf", leftOffset));
-      doorGroup.add(buildLeaf("rightLeaf", rightOffset));
+      doorLeaves.add(buildLeaf("leftLeaf", leftOffset));
+      doorLeaves.add(buildLeaf("rightLeaf", rightOffset));
 
       // ── 4. Floor threshold plate + emissive guide strips ───────────────────
       const threshold = new THREE.Mesh(
@@ -439,7 +452,7 @@ export class DoorDockingPortSystem {
         }),
       );
       threshold.position.set(0, -1.98, 0);
-      doorGroup.add(threshold);
+      doorLeaves.add(threshold);
       for (const gz of [-0.35, 0.35]) {
         const guide = new THREE.Mesh(
           new THREE.BoxGeometry(openingWidth + 0.5, 0.015, 0.05),
@@ -447,7 +460,7 @@ export class DoorDockingPortSystem {
         );
         guide.position.set(0, -1.95, gz);
         guide.name = "frameGlow";
-        doorGroup.add(guide);
+        doorLeaves.add(guide);
       }
 
       // ── 5. Invisible click box covering the doorway ───────────────────────
@@ -461,7 +474,7 @@ export class DoorDockingPortSystem {
       clickBox.userData = walkable
         ? { ...bodyData }
         : { doorId: cfg.id, doorBodyCandidate: true };
-      doorGroup.add(clickBox);
+      doorLeaves.add(clickBox);
 
       // We attach the isLarge metadata onto the group so our slider knows the correct target panning offsets
       doorGroup.userData = { isLarge: cfg.isLarge };
@@ -478,7 +491,7 @@ export class DoorDockingPortSystem {
       keypad.name = `keypad_${cfg.id}`;
       // Store reference inside trigger metadata
       keypad.userData = { isControlPanel: true, doorId: cfg.id };
-      doorGroup.add(keypad);
+      portHardware.add(keypad);
 
       // 4. Status Indicator LED Sphere
       const ledGeo = new THREE.SphereGeometry(0.06, 16, 16);
@@ -486,7 +499,12 @@ export class DoorDockingPortSystem {
       const led = new THREE.Mesh(ledGeo, ledMat);
       led.position.set(keypadOffsetX, 0.1, 0.18);
       led.name = "ledStatus";
-      doorGroup.add(led);
+      portHardware.add(led);
+
+      // Attach both halves; the top group is still what doorObjects tracks and
+      // what repositionDoorGroups / the fade traverse operate on.
+      doorGroup.add(doorLeaves);
+      doorGroup.add(portHardware);
 
       this.roomsGroup.add(doorGroup);
       this.doorObjects.set(cfg.id, doorGroup);
