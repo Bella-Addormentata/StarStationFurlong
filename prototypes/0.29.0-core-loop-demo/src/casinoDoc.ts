@@ -187,6 +187,42 @@ export function writeTableState(tableId: string, state: RouletteTableState): voi
   });
 }
 
+/** 🎰 Wipe every casino key for a table (its state, croupier heartbeat, and all
+ *  per-player bets) — the removal teardown so a deleted table leaves no orphan
+ *  records. Refunding outstanding stakes is the CALLER's job (croupier.closeTable),
+ *  done before this so the bet records are still readable. One transact. */
+export function clearTableKeys(tableId: string): void {
+  const map = ensureMap();
+  const betPrefix = `bets:${tableId}:`;
+  boundDoc!.transact(() => {
+    map.delete(`table:${tableId}`);
+    map.delete(`croupier:${tableId}`);
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(betPrefix)) map.delete(key);
+    }
+  });
+}
+
+// ── 🤖 #77B croupier heartbeat ───────────────────────────────────────────────
+// The elected operator (deed holder) refreshes `croupier:<tableId>` while it is
+// auto-running a table. A FRESH beat is how every client tells "a robot croupier
+// is live on this table" (→ show the countdown, hide the manual controls, let
+// the robot narrate) from "no operator here" (→ the legacy manual house buttons).
+// It is a bare ms timestamp; the cage ledger ignores it (no bought:/cashed:/bal:
+// prefix), and it never collides with the table: / bets: keys.
+
+export function readCroupierBeat(tableId: string): number | null {
+  const v = ensureMap().get(`croupier:${tableId}`);
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+export function writeCroupierBeat(tableId: string, beatAt: number): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`croupier:${tableId}`, beatAt);
+  });
+}
+
 function isTableBets(value: unknown): value is TableBets {
   if (typeof value !== 'object' || value === null) return false;
   const t = value as Partial<TableBets>;
@@ -226,4 +262,5 @@ export function readAllBets(tableId: string, round: number): Record<string, Roul
 (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
   readChips, buyInChips, cashOutChips, spendChips, creditChips,
   readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
+  readCroupierBeat, writeCroupierBeat,
 };

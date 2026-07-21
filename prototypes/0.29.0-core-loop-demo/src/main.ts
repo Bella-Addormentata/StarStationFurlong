@@ -44,6 +44,7 @@ import {
   hasStoredIdentity,
 } from "./keypair";
 import { roomEdit, setRoomEditPermission } from "./editMode";
+import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -6168,6 +6169,18 @@ async function init() {
           ok: false,
           reason: `Only the owner (${resolveOwnerLabel(owner)}) can edit this room.`,
         };
+  });
+
+  // 🎰🤖 #77B: elect the SOLE auto-croupier operator. Unlike the edit gate above
+  // (owner-equivalent — every venture shareholder passes), this is the RAW deed
+  // holder, so a personal/solo room has exactly ONE operator and no double-settle.
+  // Venture / legacy 'Local-Clone' rooms make everyone owner ⇒ NO auto-operator;
+  // they keep the manual SPIN button. Offline (no sync) ⇒ we are the only client.
+  setSoleCroupierPredicate(() => {
+    if (!yjsSync) return true;
+    const owner = yjsSync.doc.getMap("roomInfo").get("owner");
+    if (owner === "Local-Clone") return false;
+    return currentRoomDeedIsMine();
   });
 
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and

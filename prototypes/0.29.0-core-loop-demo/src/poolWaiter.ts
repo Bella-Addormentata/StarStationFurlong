@@ -140,7 +140,12 @@ export class PoolWaiter {
    *  behaviour). When idle past DOCK_AFTER_SECS with no fox near, the bot walks
    *  here and plays a charge pose until a fox approaches. */
   private dockTarget: { x: number; z: number; faceAngle: number } | null = null;
-  private activity: "PATROL" | "DOCK" = "PATROL";
+  /** 🎰🤖 #77 Phase B: the roulette wheel-head post (world pos + facing). When
+   *  set (the room has a roulette table), the bot leaves patrol/dock, walks to
+   *  the head of the wheel, and stands the table as the croupier. Overrides dock
+   *  and serving — one bot per client, croupier duty first. */
+  private croupierPost: { x: number; z: number; faceAngle: number } | null = null;
+  private activity: "PATROL" | "DOCK" | "CROUPIER" = "PATROL";
   private idleTimer = 0;
 
   constructor(
@@ -349,6 +354,15 @@ export class PoolWaiter {
       return;
     }
 
+    // 🎰🤖 #77 Phase B: croupier duty takes priority. With a wheel-head post set
+    // (the room has a roulette table), the bot walks to the head of the wheel and
+    // stands the table — no patrol, no dock, no serving.
+    if (this.croupierPost) {
+      this.activity = "CROUPIER";
+      this.updateCroupierPost(dt);
+      return;
+    }
+
     // 🔌 #77 Phase A: idle→dock. A fox within range (or no dock at all) keeps
     // the bot awake on patrol/serve; otherwise idle accrues and, past the
     // threshold, the bot heads to its charging dock and holds a charge pose.
@@ -377,6 +391,48 @@ export class PoolWaiter {
     if (!dock && this.activity === "DOCK") {
       this.activity = "PATROL";
       this.idleTimer = 0;
+    }
+  }
+
+  /** 🎰🤖 Point the bot at a roulette wheel-head (world pos + facing). The world
+   *  calls this after locating the table's `role:'wheelHead'` stand; null clears
+   *  it and returns the bot to patrol/dock. Croupier duty overrides both. */
+  public setCroupierPost(
+    post: { x: number; z: number; faceAngle: number } | null,
+  ): void {
+    this.croupierPost = post;
+    if (!post && this.activity === "CROUPIER") {
+      this.activity = "PATROL";
+      this.idleTimer = 0;
+    }
+  }
+
+  /** 🎰 Walk to the wheel-head, then stand it: face the wheel with a small
+   *  "dealing" idle bob. Mirrors updateDock's walk-then-hold movement. */
+  private updateCroupierPost(dt: number): void {
+    const post = this.croupierPost;
+    if (!post) return;
+    const pos = this.group.position;
+    const dx = post.x - pos.x;
+    const dz = post.z - pos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist > 0.1) {
+      const nx = dx / dist;
+      const nz = dz / dist;
+      this.turnToward(Math.atan2(nx, nz), dt);
+      const step = Math.min(WALK_SPEED * dt, dist);
+      pos.x += nx * step;
+      pos.z += nz * step;
+      const swing = Math.sin(this.time * 5.2) * 0.45;
+      this.legL.rotation.x = swing;
+      this.legR.rotation.x = -swing;
+      this.body.position.y = Math.abs(Math.sin(this.time * 5.2)) * 0.025;
+    } else {
+      // Posted: face the wheel, legs settle, a small croupier idle.
+      this.turnToward(post.faceAngle, dt);
+      this.legL.rotation.x = 0;
+      this.legR.rotation.x = 0;
+      this.body.position.y = Math.sin(this.time * 2.2) * 0.02;
     }
   }
 
