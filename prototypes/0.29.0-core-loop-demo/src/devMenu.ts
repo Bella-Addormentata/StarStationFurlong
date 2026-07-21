@@ -482,6 +482,29 @@ async function provisionModule(): Promise<void> {
   }
 }
 
+// 🛰️ #79 P3 DEV: provision a FRESH standalone room (not docked to the current
+// one) and beam into it as its OWNER — for authoring a new shared station.
+function provisionStationAvailable(): boolean {
+  return typeof (window as unknown as { __ssfProvisionStation?: unknown }).__ssfProvisionStation === 'function';
+}
+
+async function provisionStation(): Promise<void> {
+  const fn = (window as unknown as { __ssfProvisionStation?: () => Promise<boolean> }).__ssfProvisionStation;
+  if (typeof fn !== 'function') {
+    showHint('DEV: new-station provisioning requires a transit build (T1 of #30).');
+    return;
+  }
+  try {
+    const ok = await fn();
+    showHint(ok
+      ? 'DEV: 🛰️ jumped into a fresh blank room you OWN — author it (add a clone-vat, keep one door), then Copy Invite to share it.'
+      : 'DEV: new-station jump failed (busy or offline) — see console.');
+  } catch (e) {
+    console.warn('[devMenu] new-station provisioning failed:', e);
+    showHint('DEV: new-station provisioning failed — see console.');
+  }
+}
+
 // ── VESTIBULE: toggle the PR-A preview outside the east door ─────────────────
 
 async function toggleVestibule(): Promise<void> {
@@ -613,6 +636,14 @@ function buildPanel(): HTMLDivElement {
     </div>
   `;
 
+  // 🛰️ #79 P3: a FRESH standalone room (not docked here) you own, beamed into.
+  const stationRow = `
+    <div style="${ROW_STYLE}">
+      <span id="dev-station-note" style="min-width:0;">🛰️ NEW STATION</span>
+      <button type="button" id="dev-station-btn" data-dev-action="provision-station" style="${BTN_STYLE}">+ JUMP</button>
+    </div>
+  `;
+
   const vestibuleRow = `
     <div style="${ROW_STYLE}">
       <span>EAST-DOOR VESTIBULE (COSMETIC)</span>
@@ -659,7 +690,7 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('FURNITURE', 'synced to the room (E4)', furnitureRows)}
       ${sectionHtml('INVENTORY', 'removed furniture · local only', ['<div id="dev-inventory-rows"></div>'])}
       ${sectionHtml('CLONE', 'respawn at the vat (🧬)', [cloneRow])}
-      ${sectionHtml('MODULES', null, [moduleRow])}
+      ${sectionHtml('MODULES', null, [moduleRow, stationRow])}
       ${sectionHtml('PARTS', 'station construction (#62)', ['<div id="dev-parts-rows"></div>'])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
     </div>
@@ -713,6 +744,7 @@ function buildPanel(): HTMLDivElement {
         break;
       }
       case 'provision-module': void provisionModule(); break;
+      case 'provision-station': void provisionStation(); break;
       case 'toggle-vestibule': void toggleVestibule(); break;
       // ── #62 P4 PARTS actions ──
       case 'add-flex': addParts('flex', 4); refreshPartsRows(); break;
@@ -848,6 +880,17 @@ function refreshDynamicRows(): void {
     moduleNote.innerHTML = available
       ? 'MODULE SEED'
       : 'MODULE SEED <span style="color:rgba(255,179,0,0.4);">· requires transit build</span>';
+  }
+  const stationBtn = panel.querySelector<HTMLButtonElement>('#dev-station-btn');
+  const stationNote = panel.querySelector<HTMLElement>('#dev-station-note');
+  if (stationBtn && stationNote) {
+    const available = provisionStationAvailable();
+    stationBtn.disabled = !available;
+    stationBtn.style.opacity = available ? '1' : '0.35';
+    stationBtn.style.cursor = available ? 'pointer' : 'not-allowed';
+    stationNote.innerHTML = available
+      ? '🛰️ NEW STATION'
+      : '🛰️ NEW STATION <span style="color:rgba(255,179,0,0.4);">· requires transit build</span>';
   }
   const vestibuleBtn = panel.querySelector<HTMLButtonElement>('#dev-vestibule-btn');
   if (vestibuleBtn) vestibuleBtn.textContent = vestibule ? 'REMOVE' : 'PREVIEW';

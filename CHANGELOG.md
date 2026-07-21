@@ -12,6 +12,16 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.12 — 2026-07-21
+
+### 🛰️ Dev: jump into a fresh standalone room (#79 P3 groundwork)
+
+Setting up the shared default station starts with authoring a fresh room you own — this adds the tool for that.
+
+- **Dev menu → MODULES → 🛰️ NEW STATION · JUMP** provisions a **brand-new blank room that is NOT docked to your current one**, and beams you straight into it as its **owner** — so you can author it (drop a clone-vat, keep one door) and then **Copy Invite** to share its pass. It reuses the existing provision-a-module machinery (the room is claimed + seeded empty on entry) plus the beam-in transit, so it rides all the same proven paths.
+- **Groundwork:** also lands `src/station.ts` — the (inert, unconfigured) shared-default-station identity module for #79 P3a. It's imported nowhere yet, so there is **zero behaviour change** until a station id/key/host-hint is baked in; it just documents the plan and reserves the slots.
+- **Release line:** version bumped to 0.33.12, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.11 — 2026-07-21
 
 ### 🤖📝 Write your robot a custom script (#77 Phase C, slice 4 — Phase C complete)

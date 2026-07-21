@@ -2140,6 +2140,25 @@ function wireAdapterTransit(): void {
   });
   // DEV1 dev-menu hook: the MODULES row self-enables when this handle exists.
   (window as any).__ssfProvisionModule = provisionModuleSeed;
+
+  // 🛰️ #79 P3 DEV: provision a FRESH standalone room (NOT docked to the current
+  // one) and beam into it as its OWNER — so it can be authored + hosted as a new
+  // shared station. Mints like a module (claimed on first entry, seeded empty),
+  // then beam-swaps in via the #52 ACCESS choreography. Returns true on arrival.
+  const provisionAndEnterStation = async (): Promise<boolean> => {
+    const link = await provisionModuleSeed("empty");
+    if (!link) return false;
+    const result = await performRoomSwap(link, {
+      arrive: () => world.completeAccessBeamIn(),
+      fail: () => {
+        /* the avatar never left the origin room — nothing to restage */
+      },
+    });
+    return result === "ok";
+  };
+  (window as unknown as {
+    __ssfProvisionStation?: () => Promise<boolean>;
+  }).__ssfProvisionStation = provisionAndEnterStation;
 }
 
 // ── Player identity in the room doc (issue #20 S2) ───────────────────────────
