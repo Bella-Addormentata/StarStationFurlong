@@ -28,13 +28,14 @@ import {
   rotXZ,
   CASINO_ROOM_ID,
   OUTDOOR_CASINO_ROOM_ID,
+  legacyThemeFromRoomId,
   POOL_SWIM_Y,
   POOL_WATER_Y,
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
 } from "./furniture";
-import type { FurnitureItem } from "./furniture";
+import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
 import { rebuildObstacles } from "./obstacles";
 import {
@@ -249,6 +250,15 @@ export class World {
   private casinoFloorTex: THREE.Texture | null = null;
   /** True while the active room is the outdoor casino pool room. */
   private isOutdoorRoom = false;
+  /** 🌌 True while the active room's THEME is 'outdoor-deck' (space seen through
+   *  the glass ceiling + warm bright light). Independent of isOutdoorRoom —
+   *  ANY module can be a deck via its roomInfo theme. Drives the space backdrop
+   *  visibility toggle in applyRoomVisuals. */
+  private isOutdoorDeck = false;
+  /** 🪐 Overhead ocean-planet for the outdoor-deck backdrop — the "beach" world
+   *  the station orbits, seen up through the skylights. Built once, spun slowly,
+   *  shown only for the deck theme. */
+  private deckPlanet: THREE.Group | null = null;
   /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
   private poolSign: THREE.Group | null = null;
   /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
@@ -570,6 +580,57 @@ export class World {
       );
       glow.position.copy(ambient.position);
       this.platformGroup.add(glow);
+    }
+
+    // 🪐 Overhead OCEAN-PLANET for the outdoor-deck theme: a big blue world the
+    // station orbits, hanging high in the +y sky so it's seen up through the
+    // skylights (and looms in the upper backdrop at the iso view). Its ocean
+    // blue is the "beach" note while staying 100% space-consistent. fog=false
+    // so it stays crisp; hidden until applyRoomVisuals flips the deck theme on.
+    {
+      const deck = new THREE.Group();
+      deck.name = "deckPlanet";
+      const planet = new THREE.Mesh(
+        new THREE.SphereGeometry(60, 48, 36),
+        new THREE.MeshStandardMaterial({
+          color: 0x2f6aa0,
+          roughness: 0.85,
+          metalness: 0.04,
+          emissive: 0x143a63,
+          emissiveIntensity: 0.6,
+          fog: false,
+        } as THREE.MeshStandardMaterialParameters & { fog: boolean }),
+      );
+      // Faint swirled cloud band (a lighter shell, additive-ish via low opacity).
+      const clouds = new THREE.Mesh(
+        new THREE.SphereGeometry(60.6, 48, 36),
+        new THREE.MeshStandardMaterial({
+          color: 0xbfe4ff,
+          roughness: 1.0,
+          metalness: 0.0,
+          transparent: true,
+          opacity: 0.16,
+          fog: false,
+        } as THREE.MeshStandardMaterialParameters & { fog: boolean }),
+      );
+      // Soft atmosphere halo.
+      const halo = new THREE.Mesh(
+        new THREE.SphereGeometry(64, 48, 36),
+        new THREE.MeshBasicMaterial({
+          color: 0x7fc8ff,
+          transparent: true,
+          opacity: 0.14,
+          side: THREE.BackSide,
+          fog: false,
+        } as THREE.MeshBasicMaterialParameters & { fog: boolean }),
+      );
+      deck.add(planet, clouds, halo);
+      // High and toward the back so it's seen up through the skylights in first
+      // person AND looms in the upper backdrop at the iso view.
+      deck.position.set(14, 60, -84);
+      deck.visible = false;
+      this.deckPlanet = deck;
+      this.platformGroup.add(deck);
     }
 
     // (orbital rings live on the Mars sphere — created in createStationPlanet)
@@ -1385,10 +1446,23 @@ export class World {
     this.platformGroup.add(group);
   }
 
-  public applyRoomVisuals(roomId: string, returnDoorId?: DoorId): void {
+  public applyRoomVisuals(
+    roomId: string,
+    returnDoorId?: DoorId,
+    theme?: RoomTheme,
+  ): void {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
     this.isOutdoorRoom = outdoor;
+    // 🌌 Resolve the VISUAL theme (backdrop + lighting) — an explicit roomInfo
+    // theme (passed by the caller) wins; otherwise fall back to the room's
+    // identity. This is SEPARATE from the roomId-keyed MECHANICS below (door
+    // layout, waiter, floor, signs stay keyed on outdoor/casino), so the pool
+    // room keeps its pool plumbing while its backdrop becomes real space.
+    const resolvedTheme: RoomTheme = theme ?? legacyThemeFromRoomId(roomId);
+    const deck = resolvedTheme === "outdoor-deck";
+    const casinoTheme = resolvedTheme === "casino";
+    this.isOutdoorDeck = deck;
     // 🚪 Camera-near south/east edges stay clear EVERYWHERE: the lobby and
     // the casino run "casino-pairs", the outdoor pool room "pool-pairs" —
     // aliases of the same paired arrangement (SOUTH on the north wall, EAST
@@ -1398,9 +1472,15 @@ export class World {
     // 🤖 One drink-service waiter implementation serves every authored room;
     // each room supplies a route through its own open aisles. Recreate on a
     // route change so transits swap the floor plan without duplicating logic.
-    const waiterPatrol = outdoor
+    // Keyed on pool PRESENCE (like refreshOutdoorFloor), not the roomId — a
+    // pool template dropped into a minted module runs the pool route too, while
+    // a poolless sky deck (theme outdoor-deck, no pool) stays on the lobby route.
+    const hasPoolForPatrol = FURNITURE.some(
+      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+    );
+    const waiterPatrol = hasPoolForPatrol
       ? POOL_PATROL
-      : casino
+      : casinoTheme
         ? CASINO_PATROL
         : LOBBY_PATROL;
     if (this.poolWaiter && this.poolWaiterPatrol !== waiterPatrol) {
@@ -1455,7 +1535,7 @@ export class World {
     placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
     placeOnDoor(this.casinoLobbySign, pairedDoorId ?? "west", casino);
     this.ensureCasinoDecor();
-    if (this.casinoDecor) this.casinoDecor.visible = casino;
+    if (this.casinoDecor) this.casinoDecor.visible = casinoTheme;
 
     // 🏊 Outdoor pool room: HIDE the solid y=0 floor plane and its grid — the
     // lazy-pool item's white-tile deck slabs provide all visible flooring, and
@@ -1482,32 +1562,31 @@ export class World {
       | undefined;
     const nebSky = sc.getObjectByName("nebula-sky");
     const starLayers = sc.children.filter((o) => o.name === "nebula-stars");
-    if (outdoor) {
-      sc.background = new THREE.Color(0x8ed4f0); // bright day sky
+    if (deck) {
+      // 🌌 OUTDOOR DECK: deep-space backdrop (the REAL nebula + star layers +
+      // the orbiting ocean-planet, un-hidden by the centralized toggle below)
+      // with warm, BRIGHT "sunward" light for the beach feel. Fog stays very
+      // low so the interior reads crisp and airy (the nebula/star materials
+      // ignore fog anyway — this just keeps the room itself un-hazed).
+      sc.background = new THREE.Color(0x05070f); // deep space
       if (sc.fog instanceof THREE.FogExp2) {
-        sc.fog.color.setHex(0xa8dcf0);
-        sc.fog.density = 0.006;
+        sc.fog.color.setHex(0x0a1420);
+        sc.fog.density = 0.0016;
       }
       if (amb) {
-        amb.color.setHex(0xffffff);
-        amb.intensity = 0.85;
+        amb.color.setHex(0xfff2e0);
+        amb.intensity = 1.05;
       }
       if (sun) {
-        sun.color.setHex(0xfff4dc);
-        sun.intensity = 1.3;
-      } // warm noon sun
+        sun.color.setHex(0xfff0d0);
+        sun.intensity = 1.75;
+      } // warm sunward flood — bright beach daylight
       if (hemi) {
-        hemi.color.setHex(0xcfe9ff);
-        hemi.groundColor.setHex(0xbfd8cb);
-        hemi.intensity = 0.65;
+        hemi.color.setHex(0x9fd0ff); // soft ocean-planet sky glow
+        hemi.groundColor.setHex(0xe8d8b8); // warm sand bounce
+        hemi.intensity = 0.95;
       }
-      if (nebSky) nebSky.visible = false;
-      starLayers.forEach((s) => {
-        s.visible = false;
-      });
-      // 👻 Doors ghost to faint glass silhouettes (still clickable for transit).
-      this.dockingSystem?.setGhostDoors(true);
-    } else if (casino) {
+    } else if (casinoTheme) {
       sc.background = new THREE.Color(0x3b101b);
       if (sc.fog instanceof THREE.FogExp2) {
         sc.fog.color.setHex(0x5a1b28);
@@ -1526,15 +1605,10 @@ export class World {
         hemi.groundColor.setHex(0x6d1728);
         hemi.intensity = 0.72;
       }
-      if (nebSky) nebSky.visible = false;
-      starLayers.forEach((s) => {
-        s.visible = false;
-      });
-      this.dockingSystem?.setGhostDoors(false);
     } else {
-      // 🌅 LOBBY: bright, cheerful MORNING light (owner request — the old
-      // warm-nebula night read as dim). Soft sunrise-blue sky, gentle gold
-      // sun, airy ambient; nebula + star layers hidden.
+      // 🌅 LOBBY / INTERIOR: bright, cheerful MORNING light (owner request —
+      // the old warm-nebula night read as dim). Soft sunrise-blue sky, gentle
+      // gold sun, airy ambient.
       sc.background = new THREE.Color(0xbfe0f2); // soft morning sky
       if (sc.fog instanceof THREE.FogExp2) {
         sc.fog.color.setHex(0xcde8f5);
@@ -1553,12 +1627,18 @@ export class World {
         hemi.groundColor.setHex(0xd9cdbb);
         hemi.intensity = 0.7;
       }
-      if (nebSky) nebSky.visible = false;
-      starLayers.forEach((s) => {
-        s.visible = false;
-      });
-      this.dockingSystem?.setGhostDoors(false);
     }
+    // 🌌 Backdrop visibility — ONE centralized toggle AFTER the if/else (never
+    // per-branch, so no branch can forget it and leaving a deck self-cleans):
+    // the real nebula sky, the star layers, and the overhead ocean-planet show
+    // ONLY on a deck. Doors ghost to faint glass on the open-air deck too.
+    const showSpace = deck;
+    if (nebSky) nebSky.visible = showSpace;
+    starLayers.forEach((s) => {
+      s.visible = showSpace;
+    });
+    if (this.deckPlanet) this.deckPlanet.visible = showSpace;
+    this.dockingSystem?.setGhostDoors(deck);
 
     if (this.floorMat) {
       if (outdoor) {
@@ -1569,7 +1649,7 @@ export class World {
         this.floorMat.color.setHex(0xffffff); // no tint — texture has its own palette
         this.floorMat.roughness = 0.92;
         this.floorMat.metalness = 0.0;
-      } else if (casino) {
+      } else if (casinoTheme) {
         if (!this.casinoFloorTex)
           this.casinoFloorTex = this.makeCasinoFloorTex();
         this.floorMat.map = this.casinoFloorTex;
@@ -1597,18 +1677,20 @@ export class World {
         (wall === this.northWall || !this.sideWallCovered[i]);
       const mat = wall.material as THREE.MeshStandardMaterial;
       if (mat && "color" in mat) {
-        mat.color.setHex(casino ? 0xffdfad : 0xffffff);
-        mat.roughness = casino ? 0.5 : 0.72;
-        mat.metalness = casino ? 0.08 : 0;
+        mat.color.setHex(casinoTheme ? 0xffdfad : 0xffffff);
+        mat.roughness = casinoTheme ? 0.5 : 0.72;
+        mat.metalness = casinoTheme ? 0.08 : 0;
         mat.needsUpdate = true;
       }
     });
-    const theme = outdoor
+    const themeLabel = outdoor
       ? "outdoor-casino (stone floor)"
       : casino
         ? "casino (festival carpet)"
         : "lobby (wood floor)";
-    console.log(`🏝️ Room visuals applied: ${theme}`);
+    console.log(
+      `🏝️ Room visuals applied: ${themeLabel} · theme=${resolvedTheme}`,
+    );
   }
 
   private makeCasinoFloorTex(): THREE.Texture {
@@ -2565,6 +2647,10 @@ export class World {
       this.stationPlanet.rotation.y += deltaTime * 0.3;
       this.stationPlanet.rotation.x = Math.sin(this.time * 0.5) * 0.05;
       this.stationPlanet.position.y = Math.sin(this.time * 0.8) * 0.15;
+    }
+    // 🪐 Overhead deck ocean-planet: a slow, calm spin (only while on a deck).
+    if (this.isOutdoorDeck && this.deckPlanet) {
+      this.deckPlanet.rotation.y += deltaTime * 0.015;
     }
 
     // Keep updating while device-FOCUSED too: the mesh is hidden then, but

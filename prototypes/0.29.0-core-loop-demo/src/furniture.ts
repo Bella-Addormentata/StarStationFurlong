@@ -83,6 +83,7 @@ export type FurnitureKind =
   | "paper-lantern"
   | "neon-ring"
   | "sun-lamp"
+  | "skylight"
   | "lazy-pool"
   | "hot-tub"
   | "classic-pool"
@@ -1050,6 +1051,35 @@ const buildSunLamp = ({ m, place, addLight }: BuildCtx) => {
   // Bright cool daylight flooding down, plus a soft fill.
   addLight(new THREE.PointLight(0xdcebff, 0, 20), 0, 3.6, 0, 5.0);
   addLight(new THREE.PointLight(0xffffff, 0, 10), 0, 2.6, 0, 1.4);
+};
+
+// 🪟 Skylight — a REAL structural glass ceiling panel: metal mullion frame with
+// a 2×2 pane grid + faint transparent glazing that looks out at the space
+// backdrop (nebula + stars + orbiting planet, un-hidden by the outdoor-deck
+// theme), plus one warm "sunlight through the glass" flood for the beach feel.
+// Footprint null (overhead — you walk right under it). CRITICAL: the glass sets
+// material.userData.baseOpacity (NOT raw .opacity) so the morph/reveal keeps it
+// translucent instead of snapping it opaque — the latent buildWindowWall bug.
+const buildSkylight = ({ m, place, addLight }: BuildCtx) => {
+  const frameMat = m(0x9aa6b4, 0.4, 0.72); // hull-slate mullions
+  const B = 1.1;
+  // Outer frame (four bars) at the ceiling line.
+  place(new THREE.BoxGeometry(2 * B + 0.14, 0.1, 0.14), frameMat, 0, 3.92, B);
+  place(new THREE.BoxGeometry(2 * B + 0.14, 0.1, 0.14), frameMat, 0, 3.92, -B);
+  place(new THREE.BoxGeometry(0.14, 0.1, 2 * B + 0.14), frameMat, B, 3.92, 0);
+  place(new THREE.BoxGeometry(0.14, 0.1, 2 * B + 0.14), frameMat, -B, 3.92, 0);
+  // Mullion cross-bars → a 2×2 pane grid.
+  place(new THREE.BoxGeometry(2 * B, 0.06, 0.06), frameMat, 0, 3.9, 0);
+  place(new THREE.BoxGeometry(0.06, 0.06, 2 * B), frameMat, 0, 3.9, 0);
+  // The glass: barely-there blue tint, transparent both sides, no depth write —
+  // the space view beyond is the point. baseOpacity, never raw opacity.
+  const glass = m(0x9bd4e8, 0.05, 0.0, 0x0a1a2a, 0.06);
+  glass.side = THREE.DoubleSide;
+  glass.depthWrite = false;
+  glass.userData.baseOpacity = 0.14;
+  place(new THREE.BoxGeometry(2 * B, 0.03, 2 * B), glass, 0, 3.86, 0);
+  // Warm flood so the deck reads sunlit even before the backdrop is seen.
+  addLight(new THREE.PointLight(0xffe9c4, 0, 22), 0, 3.5, 0, 4.5);
 };
 
 // Tall cherry blossom tree (no collision — footprint: null, documented drift).
@@ -2577,6 +2607,11 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "sun-lamp": {
     kind: "sun-lamp",
     build: buildSunLamp,
+    footprint: null,
+  },
+  "skylight": {
+    kind: "skylight",
+    build: buildSkylight,
     footprint: null,
   },
   "rug-back": { kind: "rug-back", build: buildRugBack, footprint: null },
@@ -5407,6 +5442,12 @@ export const OUTDOOR_CASINO_ROOM_ID = "ssf-outdoor-casino-pool-v1";
  * Cherry trees and blossom pots have null footprints — never obstacles.
  */
 export const OUTDOOR_FURNITURE: FurnitureItem[] = [
+  // 🪟 Glass-ceiling skylights over the deck — real structural windows looking
+  // up at the orbiting ocean-planet + stars (the outdoor-deck theme un-hides
+  // the space backdrop). Footprint null; they hang overhead and never block a
+  // walk route. Movable, so the owner can rearrange the ceiling.
+  { id: "pool-skylight-n", kind: "skylight", pos: { x: 0, z: -2.8 }, rot: 0, movable: true },
+  { id: "pool-skylight-s", kind: "skylight", pos: { x: 0, z: 2.8 }, rot: 0, movable: true },
   // Large lazy pool — the water spans the room's WEST HALF up to the west
   // infinity edge (no west corridor), so the obstacle override covers
   // x[-5.4,3.5] instead of the symmetric 7×6 footprint. Walk routes go
@@ -5491,6 +5532,27 @@ for (const item of OUTDOOR_FURNITURE) {
 
 /** Stable room ID for the casino connected to the lobby's east door. */
 export const CASINO_ROOM_ID = "ssf-casino-v1";
+
+// ── 🌌 Room visual theme ─────────────────────────────────────────────────────
+/**
+ * A room's VISUAL biome — what backdrop + lighting scheme applyRoomVisuals
+ * paints. Independent of the room's furniture/mechanics: any module can be an
+ * 'outdoor-deck' (real space seen through a glass ceiling + warm bright light),
+ * not just the authored pool. Stored per-room in roomInfo['theme']; absent ⇒
+ * fall back to the room's identity via legacyThemeFromRoomId.
+ */
+export type RoomTheme = "interior" | "casino" | "outdoor-deck";
+
+/**
+ * Theme for a room that hasn't stamped an explicit roomInfo['theme'] — derived
+ * from the authored room-id constants so the flagship rooms paint correctly at
+ * the synchronous first frame (no dependency on the roomInfo sync race).
+ */
+export function legacyThemeFromRoomId(roomId: string): RoomTheme {
+  if (roomId === OUTDOOR_CASINO_ROOM_ID) return "outdoor-deck";
+  if (roomId === CASINO_ROOM_ID) return "casino";
+  return "interior";
+}
 
 /**
  * Default casino floor. The four door approach lanes stay open, and every

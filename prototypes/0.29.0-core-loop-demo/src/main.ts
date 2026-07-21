@@ -55,7 +55,7 @@ import {
   writeFurnitureItem,
   deleteFurnitureItem,
 } from "./furnitureDoc";
-import { seedRoomTemplate } from "./roomTemplates";
+import { seedRoomTemplate, findTemplate } from "./roomTemplates";
 import {
   bindDoorsDoc,
   writeDoorPairing,
@@ -68,7 +68,9 @@ import {
   CASINO_ROOM_ID,
   OUTDOOR_CASINO_ROOM_ID,
   OUTDOOR_FURNITURE,
+  legacyThemeFromRoomId,
 } from "./furniture";
+import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
   ledgerHasRoom,
@@ -1242,6 +1244,11 @@ async function joinRoomAtEpoch(
       // outdoor-casino auto-pairing below (all lobby-specific).
       if (provisionTemplateId && ownsRoom && furnitureDocSize() === 0) {
         seedRoomTemplate(provisionTemplateId);
+        // 🌌 Stamp the template's visual theme so the module paints as an
+        // outdoor-deck (space + warm bright light) — or interior — on this and
+        // every future entry, via the roomInfo-theme resolution below.
+        const tpl = findTemplate(provisionTemplateId);
+        if (tpl) roomMap.set("theme", tpl.theme);
         return;
       }
       if (ownsRoom && furnitureDocSize() === 0) {
@@ -1300,6 +1307,16 @@ async function joinRoomAtEpoch(
     });
   }
 
+  // 🌌 Resolve this room's VISUAL theme: an explicit roomInfo['theme'] (stamped
+  // by a template on provision, synced from the host) wins; otherwise fall back
+  // to the room's identity so the flagship rooms paint right at the first frame
+  // even before roomInfo syncs. `appliedTheme` tracks what we last painted so
+  // the roomMap observer only re-applies when the theme genuinely changes.
+  const resolveTheme = (): RoomTheme =>
+    (roomMap.get("theme") as RoomTheme | undefined) ??
+    legacyThemeFromRoomId(boot.roomId);
+  let appliedTheme: RoomTheme = resolveTheme();
+
   // 🏝️ Outdoor casino pool room: seed furniture on first entry (the normal
   // claimRoomDefaults path doesn't run for transit joins, so this is the
   // dedicated first-visit seed path). Also applies the outdoor visual theme.
@@ -1320,13 +1337,21 @@ async function joinRoomAtEpoch(
         }
         roomInfo.set("poolLayoutSeeded", true);
       }
+      // 🪟 Additive one-time: existing pool rooms (already past poolLayoutSeeded)
+      // gain the new ceiling skylights once, without re-seeding the rest — own
+      // marker, so a removed skylight stays gone (deletion persists).
+      if (!roomInfo.get("poolSkylightsV1")) {
+        writeFurnitureItem({ id: "pool-skylight-n", kind: "skylight", pos: { x: 0, z: -2.8 }, rot: 0, movable: true });
+        writeFurnitureItem({ id: "pool-skylight-s", kind: "skylight", pos: { x: 0, z: 2.8 }, rot: 0, movable: true });
+        roomInfo.set("poolSkylightsV1", true);
+      }
       // 🏊 Retired items: casino fixtures moved back to the lobby — purge
       // their stale doc entries so old room replicas drop them too (id-only,
       // harmless when absent; safe to run every entry).
       deleteFurnitureItem("pool-cashier");
       deleteFurnitureItem("pool-roulette");
     });
-    world?.applyRoomVisuals(boot.roomId);
+    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme());
   } else if (boot.roomId === CASINO_ROOM_ID) {
     const casinoEpoch = epoch;
     void sync.whenServerSynced.then(() => {
@@ -1338,10 +1363,10 @@ async function joinRoomAtEpoch(
         deleteFurnitureItem(id);
       }
     });
-    world?.applyRoomVisuals(boot.roomId);
+    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme());
   } else {
     // Returning to any non-outdoor room (lobby, etc.): restore lobby visuals.
-    world?.applyRoomVisuals(boot.roomId);
+    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme());
   }
 
   // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
@@ -1384,6 +1409,15 @@ async function joinRoomAtEpoch(
 
   roomMap.observe((_event) => {
     updateRoomUI();
+    // 🌌 Re-paint the room's backdrop + lighting when its theme syncs in or an
+    // owner flips it (a provisioned deck arrives 'interior' pre-sync, then the
+    // host's roomInfo['theme'] lands — repaint to outdoor-deck). Guarded so
+    // ordinary roomInfo edits (name, owner, access) don't churn the visuals.
+    const t = resolveTheme();
+    if (t !== appliedTheme) {
+      appliedTheme = t;
+      world?.applyRoomVisuals(boot.roomId, undefined, t);
+    }
   });
 
   // Players-map changes re-render the phone roster AND the room HUD — the
@@ -1924,7 +1958,15 @@ async function transitTo(
       doorId: arrivalDoorId,
       seed: depAddress,
     };
-    world.applyRoomVisuals(arrivalRoomId, arrivalDoorId);
+    // 🌌 Resolve the arrival room's theme here too (the arrival doc is bound +
+    // synced by now). Passing NO theme would fall back to legacyThemeFromRoomId,
+    // which returns 'interior' for a provisioned deck/casino module (its id is
+    // never an authored constant) — clobbering the correct backdrop the room
+    // observer already painted and desyncing appliedTheme so it can't self-heal.
+    const arrivalTheme =
+      (yjsSync?.doc.getMap("roomInfo").get("theme") as RoomTheme | undefined) ??
+      legacyThemeFromRoomId(arrivalRoomId);
+    world.applyRoomVisuals(arrivalRoomId, arrivalDoorId, arrivalTheme);
   }
 
   // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY
