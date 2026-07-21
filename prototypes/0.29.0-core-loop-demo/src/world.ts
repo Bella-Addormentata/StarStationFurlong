@@ -1016,6 +1016,12 @@ export class World {
     this.dockingSystem.syncDoorGroups(records); // 3D group add/remove/rebuild
     this.reconcileDoorPlacements(); // position the (possibly new) groups
     this.dockingSystem.refreshDoorInteractivity();
+    // 🚪 #28 S6b: keep a live edit session's raycast index in sync with the door
+    // groups just added / removed / rebuilt — a TARGETED door-slice rebuild that
+    // preserves the current selection by id. Deliberately NOT the furniture
+    // reconcile's forceExit+enter (~2076): that would deselect on every local
+    // door edit (add/remove fire this synchronously via the doc observer).
+    if (roomEdit.isEditModeActive()) roomEdit.onDoorLayoutChanged();
   }
 
   /**

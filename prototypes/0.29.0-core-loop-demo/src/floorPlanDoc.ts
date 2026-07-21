@@ -135,6 +135,18 @@ function doorLateralLimit(doorId: DoorId): number {
   return Math.max(0, Math.min(DOOR_LATERAL_LIMIT, half - DOOR_LATERAL_CLEARANCE));
 }
 
+/** 🚪 #28 S6b (door editor): the same along-wall clamp keyed by WALL rather than
+ *  a cardinal door id — a FREE door has no cardinal id, only its wall. n/s doors
+ *  slide in X (run 2·halfX), e/w in Z (run 2·halfZ); opening + posts stay ~2 m
+ *  clear of the corner and never exceed the legacy cap. Default 2×2 room ⇒ 4.0. */
+export function doorLateralLimitForWall(
+  wall: 'north' | 'south' | 'east' | 'west',
+): number {
+  const { halfX, halfZ } = roomHalfExtents();
+  const half = wall === 'north' || wall === 'south' ? halfX : halfZ;
+  return Math.max(0, Math.min(DOOR_LATERAL_LIMIT, half - DOOR_LATERAL_CLEARANCE));
+}
+
 /** A door's default (un-slid) placement for the CURRENT room size: the derived
  *  wall coord plus the legacy lateral base. The read-side fallback — so an
  *  absent/malformed record degrades to THIS room's wall, not the old ±6. */

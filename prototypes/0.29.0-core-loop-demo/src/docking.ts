@@ -602,6 +602,25 @@ export class DoorDockingPortSystem {
   }
 
   /**
+   * 🚪 #28 S6b (door editor): the live door GROUPS by id — the edit-mode raycast
+   * index traverses each group's meshes so a door can be hovered / selected /
+   * removed like furniture. The invisible click box (material.visible:false)
+   * still raycasts, so every door is a fat, reliable target.
+   */
+  public getDoorGroups(): Map<string, THREE.Group> {
+    return this.doorObjects;
+  }
+
+  /**
+   * 🚪 #28 S6b: is this door part of a live pairing? The editor refuses to
+   * REMOVE a paired door ("unpair first") so #62 chain math never re-solves
+   * around a door that vanished mid-connection (same guard the slide code uses).
+   */
+  public isDoorPaired(id: string): boolean {
+    return this.doorState.get(id as DoorId)?.pairedSuccessfully === true;
+  }
+
+  /**
    * 🚪↔🛰️ #28 S5b: remove a door group (reconcile deletion / editor remove).
    * Disposes its geometry + materials (materials are per-door, so dedupe-and-
    * dispose is safe) and clears every per-door map entry so nothing leaks.
