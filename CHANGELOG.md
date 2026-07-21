@@ -10,6 +10,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 ## Unreleased
 
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
+- **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
+
+## v0.33.6 — 2026-07-21
+
+### 🎰 Walk to an open spot at a table (#76)
+
+Clicking a gaming table now walks your avatar to an **open standing position on the table's ring** instead of always the same front — so a crowd naturally spreads around a roulette or game table rather than stacking on one square.
+
+- **Nearest free + reachable slot.** Each table has a ring of authored standing slots (roulette: 6, one of them the reserved wheel-head; game table: its own set). A click routes you to the closest slot that is both **unoccupied** (no other avatar within 0.7 m) and **A\*-reachable** from where you stand; the operator's **wheel-head** slot is never auto-picked. You face the table on arrival.
+- **Never worse than before.** If no ring slot is cleanly reachable — e.g. the table is jammed against a wall so its ring fronts fall on blocked cells — it falls back to the table's original single approach front, exactly the pre-#76 behaviour. Safe by construction.
+- **Reachability judged from solid ground.** If you happen to be standing on a non-walkable cell (the clone-vat spawn cell is one), the path search now snaps its start to the nearest walkable cell first, so a genuinely reachable slot isn't spuriously dropped.
+- **Completes the #76 slice** begun in v0.33.1 (the edit-mode standing-position rings — amber wheel-head + cyan open-slot markers shown while you move a table). Verified live: from walkable ground the avatar walks the ring and lands exactly on the picked slot.
+- **Release line:** version bumped to 0.33.6, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
 
 ## v0.32.43 — 2026-07-20
 

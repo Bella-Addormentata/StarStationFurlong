@@ -17,7 +17,8 @@ import {
 } from "./poolWaiter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
-import { STANDS, rebuildStands } from "./stands";
+import { STANDS, rebuildStands, standsForItem } from "./stands";
+import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
   FURNITURE,
@@ -46,6 +47,7 @@ import {
   worldToCol,
   colToWorld,
   rowToWorld,
+  findPath,
 } from "./pathfinding";
 import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
@@ -3715,6 +3717,68 @@ export class World {
   }
 
   /**
+   * 🎰 #76: retarget a table's device focus to a free STANDING slot so the
+   * avatar walks up to an OPEN position (auto-bumping past taken ones) facing
+   * the table, then the game/betting UI opens — instead of everyone stacking on
+   * the single fixed device front. The reserved wheel-head is never auto-picked
+   * (it's the owner's croupier robot's spot); falls back to the device's own
+   * front when every open slot is occupied. Occupancy is inferred from remote
+   * avatar positions (Phase 1 — a synced claim map lands in a later slice).
+   */
+  private standTarget(device: DeviceTarget): DeviceTarget {
+    const stand = this.pickFreeStand(device.id);
+    return stand
+      ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
+      : device;
+  }
+
+  /** Nearest open, REACHABLE (non-wheel-head) stand slot for the item, or null.
+   *  "Taken" = a remote avatar within 0.7 m of the slot front. A slot must also
+   *  be A*-reachable from the player — otherwise picking it would strand the
+   *  avatar short of the table (worse than the legacy single front), so an
+   *  unreachable slot is skipped and the caller falls back to the device front. */
+  private pickFreeStand(itemId: string): StandSlot | null {
+    const slots = standsForItem(itemId).filter((s) => s.role !== "wheelHead");
+    if (slots.length === 0) return null;
+    const others = this.getRemoteAvatarSnapshots();
+    const me = this.player.getPosition();
+    let mr = worldToRow(me.z);
+    let mc = worldToCol(me.x);
+    // The player can be standing ON a non-walkable cell (the clone-vat spawn
+    // cell is one) — findPath from a non-walkable start returns spuriously empty,
+    // which would drop EVERY slot to the fallback front. Snap the start to the
+    // nearest walkable cell first so reachability is judged from solid ground.
+    if (!walkable[mr]?.[mc]) {
+      for (let rad = 1, done = false; rad <= 3 && !done; rad++) {
+        for (let dr = -rad; dr <= rad && !done; dr++) {
+          for (let dc = -rad; dc <= rad && !done; dc++) {
+            if (walkable[mr + dr]?.[mc + dc]) {
+              mr += dr;
+              mc += dc;
+              done = true;
+            }
+          }
+        }
+      }
+    }
+    const reachable = (s: StandSlot) =>
+      Math.hypot(s.front.x - me.x, s.front.z - me.z) < 0.6 ||
+      findPath(mr, mc, worldToRow(s.front.z), worldToCol(s.front.x)).length > 0;
+    const free = slots.filter(
+      (s) =>
+        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
+        reachable(s),
+    );
+    if (free.length === 0) return null;
+    free.sort(
+      (a, b) =>
+        Math.hypot(a.front.x - me.x, a.front.z - me.z) -
+        Math.hypot(b.front.x - me.x, b.front.z - me.z),
+    );
+    return free[0];
+  }
+
+  /**
    * Route a device click into the walk-to + first-person focus sequence
    * (#33 D0/M1 — mirrors requestDoorWalkthrough): find the DeviceTarget,
    * build the kind-appropriate focused UI, and hand both to the
@@ -3786,7 +3850,8 @@ export class World {
         itemId: deviceId,
         top: this.gameTableTops.get(deviceId) ?? null,
       });
-      deviceFocus.beginFocus(this.player, device, ui);
+      // 🎰 #76: walk to an open STANDING position at the table, then the UI opens.
+      deviceFocus.beginFocus(this.player, this.standTarget(device), ui);
       return;
     }
 
@@ -3822,7 +3887,11 @@ export class World {
         device.kind === "cashier"
           ? createCashierUI({ isHouse })
           : createRouletteUI({ itemId: deviceId, isHouse });
-      deviceFocus.beginFocus(this.player, device, ui);
+      // 🎰 #76: the roulette table gathers players at its open standing slots
+      // (the cashier is not a table — it keeps its single front).
+      const target =
+        device.kind === "roulette" ? this.standTarget(device) : device;
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 
