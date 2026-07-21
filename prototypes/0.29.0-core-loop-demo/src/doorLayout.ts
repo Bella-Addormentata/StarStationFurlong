@@ -176,3 +176,15 @@ export function physicalPortPose(
 ): PhysicalDoorPose {
   return physicalDoorPose(id as PhysicalDoorId, lateralDelta);
 }
+
+/**
+ * 🚪↔🛰️ #28 S3: the DOOR → PORT map — which structural docking port a door
+ * serves. Today doors ARE the 4 cardinal ports, so this is identity. Slice 5
+ * makes it geometric: a free door resolves to the port it ALIGNS to (same wall,
+ * lateral within tolerance), or stays itself when it already is a port / aligns
+ * to none. Pairing + transit reads route the door through this one hop, so the
+ * door↔port alignment becomes a single-function change when doors go free.
+ */
+export function portForDoor(doorId: PortId): PortId {
+  return doorId;
+}

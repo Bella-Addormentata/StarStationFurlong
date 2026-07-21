@@ -12,6 +12,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.15 — 2026-07-21
+
+### 🚪↔🛰️ The door→port seam + transit robustness (#28 decouple, slice 3)
+
+Behaviour-preserving groundwork so a future free-door set can't break transit. Much of what this slice was scoped to do (splitting the module-mesh *pairing* onto the port) turned out to already be true in the codebase — the pairing lives in the synced door records + the docking state, both already keyed by the stable cardinal *port*, and the arrival router already prefers the arrival room's own back-pointing record. So this slice lands the two genuinely-missing pieces:
+
+- **One door→port hop.** New `portForDoor(doorId)` (identity today) names the single place a door resolves to the docking **port** it serves. `getDockingState` now reads pairing/lock/transit through it, so when slice 5 makes it geometric (a free door aligning to a port), every pairing + transit read re-keys onto the correct port as a **single-function change** — no call-site churn.
+- **No hardcoded cardinal in arrival routing.** The arrival resolver's last-ditch fallback no longer asserts a specific `east` door exists (it would crash once doors are freely placed). It keeps today's exact behaviour — canonical east fallback for the fireplace-blocked south departure — but degrades to *any enabled door → any door* instead of throwing when that cardinal is absent.
+- Verified: `tsc` clean; live parity — arrival routing returns the same doors (opposite cardinals / east fallback), `getDockingState` resolves all four ports through the seam, a door walk-through runs with no error, no console errors.
+- **Release line:** version bumped to 0.33.15, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.14 — 2026-07-21
 
 ### 🛰️ Warn before a new module docks on top of another (#28 decouple, slice 2)

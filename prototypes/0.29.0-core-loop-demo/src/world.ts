@@ -3596,7 +3596,11 @@ export class World {
     };
     const candidate = findDoor(opposite[departureDoorId]);
     if (candidate && candidate.enabled) return candidate;
-    return findDoor("east")!; // north is the only disabled door; east always exists
+    // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
+    // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
+    // south departure, but degrade to any enabled door / any door at all instead
+    // of throwing when east is absent. DOORS is always non-empty (≥1 door).
+    return findDoor("east") ?? DOORS.find((d) => d.enabled) ?? DOORS[0]!;
   }
 
   /**
