@@ -17,7 +17,7 @@
  * Geometry matches the door groups placed by docking.ts buildPorts().
  */
 
-import { physicalDoorPose } from "./doorLayout";
+import { physicalDoorPose, poseFromWall } from "./doorLayout";
 import type { PhysicalDoorId } from "./doorLayout";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
 
@@ -77,7 +77,16 @@ export function rebuildDoors(records: Map<string, DoorLayoutRecord>): void {
   }
   for (const rec of records.values()) {
     if (DOORS.some((d) => d.id === rec.id)) continue; // existing — untouched
-    const pose = physicalDoorPose(rec.id as DoorId, 0);
+    // Cardinal doors keep the legacy pose (east/west quirk + pairs layout); a
+    // free/genId door derives from its wall + along-wall position.
+    const isCardinal =
+      rec.id === "north" ||
+      rec.id === "south" ||
+      rec.id === "east" ||
+      rec.id === "west";
+    const pose = isCardinal
+      ? physicalDoorPose(rec.id as DoorId, 0)
+      : poseFromWall(rec.wall, rec.lateral);
     DOORS.push({
       id: rec.id as DoorId,
       enabled: rec.enabled ?? true,
@@ -102,6 +111,15 @@ export function findDoor(id: string): DoorTarget | null {
 /** Re-derive every door's walk points from its slide delta (0 = legacy). */
 export function applyDoorSlideDeltas(deltas: Record<DoorId, number>): void {
   for (const door of DOORS) {
+    // Free/genId doors don't slide via the floor plan (their along-wall position
+    // lives in their layout record) — only the 4 cardinal doors re-derive here.
+    if (
+      door.id !== "north" &&
+      door.id !== "south" &&
+      door.id !== "east" &&
+      door.id !== "west"
+    )
+      continue;
     const pose = physicalDoorPose(door.id, deltas[door.id] ?? 0);
     door.front.x = pose.front.x;
     door.front.z = pose.front.z;

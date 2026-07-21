@@ -595,6 +595,66 @@ export class DoorDockingPortSystem {
   }
 
   /**
+   * 🚪↔🛰️ #28 S5b: remove a door group (reconcile deletion / editor remove).
+   * Disposes its geometry + materials (materials are per-door, so dedupe-and-
+   * dispose is safe) and clears every per-door map entry so nothing leaks.
+   */
+  public removeDoorGroup(id: string): void {
+    const group = this.doorObjects.get(id);
+    if (!group) return;
+    this.roomsGroup.remove(group);
+    const seen = new Set<THREE.Material>();
+    group.traverse((child) => {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      mesh.geometry?.dispose();
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const mat of mats) {
+        if (mat && !seen.has(mat)) {
+          seen.add(mat);
+          mat.dispose();
+        }
+      }
+    });
+    this.doorObjects.delete(id);
+    this.doorFadeMats.delete(id as DoorId);
+    this.doorFadeOpacity.delete(id as DoorId);
+    this.doorState.delete(id as DoorId);
+    this.slideAnims.delete(id as DoorId);
+    this.removeAdjacentRoomProjection(id as DoorId); // tear down any projection
+    this.untouchedPrefills.delete(id);
+  }
+
+  /**
+   * 🚪↔🛰️ #28 S5b: reconcile the 3D door GROUPS to a layout snapshot — add a
+   * group for a new record, remove one whose id left the map, rebuild one whose
+   * SIZE changed (leaf width differs), and refresh the stashed pose basis for a
+   * moved door. Position is applied afterward by reconcileDoorPlacements. For the
+   * 4 seeded cardinals every group already exists at the same size → a no-op.
+   */
+  public syncDoorGroups(records: Map<string, DoorLayoutRecord>): void {
+    // Removals first — ids present in the scene but gone from the map.
+    for (const id of [...this.doorObjects.keys()]) {
+      if (!records.has(id)) this.removeDoorGroup(id);
+    }
+    // Adds + size-change rebuilds + moved-door basis refresh.
+    for (const record of records.values()) {
+      const group = this.doorObjects.get(record.id);
+      if (!group) {
+        this.buildDoorGroup(record);
+        continue;
+      }
+      if (group.userData.isLarge !== (record.size === "large")) {
+        this.removeDoorGroup(record.id);
+        this.buildDoorGroup(record);
+      } else {
+        group.userData.wall = record.wall;
+        group.userData.lateral = record.lateral;
+      }
+    }
+  }
+
+  /**
    * Mount floating interactive terminal to manage Room addresses, Pin-codes and pairings
    */
   private mountInterfaceControlPanel() {

@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.19 — 2026-07-21
+
+### 🚪➕➖ Doors can be added and removed live (#28 decouple, slice 5b)
+
+The door count can finally **vary** — dropping a door into the synced map makes it appear for everyone; deleting it makes it disappear. This is the machinery the door editor drives next.
+
+- **`syncDoorGroups`** reconciles the 3D door groups to the layout map on every change: builds a group for a new door, disposes the group (geometry + materials) and clears all its state for a removed one, and rebuilds one whose size changed. Wired into the door-layout reconcile after the walk-target rebuild.
+- A **free door follows its own position**: a door placed on a wall at an along-wall offset renders exactly there (e.g. a door added on the east wall at lateral −3 appears off-centre on that wall) — the "module follows the door" model. Each free door gets its own docking state, so its LED / keypad / slide work like any door.
+- Fixed two spots that assumed the fixed 4 cardinal doors and would have thrown on a free door (the walk-target rebuild and the slide re-derive now route a free door through its wall + position instead of the cardinal-only pose).
+- Verified live: adding a free door to the map renders it at its wall + lateral with the full frame/leaves/hardware and its own state; removing it disposes the group and clears its state with no leak; the 4 cardinals stay bit-identical throughout; `tsc` clean; no console errors.
+- **Next (slice 6):** the edit-mode editor — click a wall to add a door (snapped to the floor grid, like furniture), drag it along the wall, remove it — plus the overlap guard flipped to a hard BLOCK.
+- **Release line:** version bumped to 0.33.19, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.18 — 2026-07-21
 
 ### 🚪 Build each door from a record — extraction for free doors (#28 decouple, slice 5a)
