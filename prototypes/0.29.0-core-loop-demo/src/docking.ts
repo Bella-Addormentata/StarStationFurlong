@@ -12,7 +12,7 @@
 import * as THREE from "three";
 import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
-import { physicalDoorPose } from "./doorLayout";
+import { physicalDoorPose, portForDoor } from "./doorLayout";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
 import {
@@ -1877,9 +1877,13 @@ export class DoorDockingPortSystem {
     }
   }
 
-  /** Read-only access to a door's docking state (doorState map is private). */
+  /** Read-only access to the PORT pairing a door serves (doorState map is
+   *  private). 🚪↔🛰️ #28 S3: pairing/lock/transit are PORT concerns — resolve
+   *  the door to its port through portForDoor (identity today; geometric door↔
+   *  port alignment in slice 5), so every caller reads port-keyed state via
+   *  this one hop and the alignment lands as a single-function change. */
   public getDockingState(doorId: DoorId): DockingState | null {
-    return this.doorState.get(doorId) ?? null;
+    return this.doorState.get(portForDoor(doorId) as DoorId) ?? null;
   }
 
   /**
