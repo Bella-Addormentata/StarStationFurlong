@@ -12,6 +12,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.14 — 2026-07-21
+
+### 🛰️ Warn before a new module docks on top of another (#28 decouple, slice 2)
+
+The docking assembly gains the module-overlap guard you asked for — a system that detects when a new module would collide with an existing one. Advisory for now; it becomes a hard block with the door editor.
+
+- **What it catches:** as you build a docking chain, if the module it would project lands on top of a **different** existing station module, the assembly strip shows a `⛔ would overlap <module>` warning. The module you're actually *connecting to* (the berth at the chain's end) is correctly excluded — only a genuine collision with a farther module (or the current room's own hull) warns.
+- **How:** a new `moduleOverlapAt` in the station atlas composes the candidate module's footprint against every known module's pose (the same poses the exterior view renders) using an exact **Separating-Axis** test between the rotated square footprints — so the 45° ring modules judge correctly with no inflated-box false positives. It keys off the docking **ports / mesh geometry**, never off doors (a decouple-clean split).
+- Verified: SAT unit test 18/18 (flush berths clear, real overlaps caught, rotation exact); an end-to-end test against the live atlas (connect-target skipped, real clash flagged, clear gap + origin-hull handled); and the warning renders correctly in the actual docking pane with no false positive in an empty room.
+- **Known limit (noted for the S6 block):** modules are tested at the exterior view's uniform footprint; per-module true sizes for resized rooms would need the atlas to gossip room dimensions.
+- **Release line:** version bumped to 0.33.14, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.13 — 2026-07-21
 
 ### 🚪↔🛰️ One pose generator for doors and docking ports (#28 decouple, slice 1)
