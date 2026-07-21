@@ -106,12 +106,14 @@ export function snapTo8Ways(angle: number): number {
 }
 
 /**
- * Resting side-swing of the tail plume (radians about the tail group's local
- * Y). The sheet's front view shows the flame peeking out BESIDE the body —
- * a dead-centre tail hides behind the torso from the front. Idle sways
- * around this offset; walk/swim halve it so the plume streams behind.
+ * Resting side-set of the tail brush (radians about the tail group's local
+ * Z — which maps to a yaw about world-up, swinging the WHOLE drooping brush
+ * sideways; rotating local Y would twist a drooped tail's plane instead).
+ * POSITIVE puts the brush on the character's RIGHT (viewer-left in the
+ * sheet's front view, matching every reference pose). Idle sways around
+ * this offset; walk/swim halve it so the brush streams behind.
  */
-const TAIL_REST_YAW = 0.85;
+const TAIL_REST_YAW = 0.45;
 
 // Reference-sheet palette — ALL-WHITE fur; the only dark marks are the face
 // features, in soft charcoal (never pure black — the sheet's linework is
@@ -130,29 +132,40 @@ const PAL = {
   outline:    0x99a0ac,  // soft grey line-art outline (matches sheet linework)
 };
 
-// ── Toon gradient (8-band soft cel shading) ────────────────────────────────
-// A tiny 8×1 DataTexture used as MeshToonMaterial.gradientMap. Nearest-filter
-// sampling snaps the shader to brightness bands. The old 4-band map read as
-// harsh grey blobs on the all-white fur; eight closely-spaced bands keep the
-// stylised toon look while shading the white like the reference sheet's soft
-// airbrush greys.
+// ── Toon gradient (smooth airbrush ramp) ───────────────────────────────────
+// A 64×1 DataTexture used as MeshToonMaterial.gradientMap, LINEAR-filtered.
+// Hard nearest-filter bands (4-step, then 8-step) read as flat grey blobs on
+// the all-white fur — nothing like the sheet. A smooth ramp with lifted
+// shadows (floor 118, soft-knee curve) gives the sheet's soft airbrushed
+// grey shading while still clamping how dark the white fur can fall.
 function createGradientMap(): THREE.DataTexture {
-  const data = new Uint8Array([110, 132, 152, 172, 196, 220, 240, 255]);
-  const tex = new THREE.DataTexture(data, 8, 1, THREE.RedFormat);
-  tex.magFilter = THREE.NearestFilter;
-  tex.minFilter = THREE.NearestFilter;
+  const STEPS = 64;
+  const data = new Uint8Array(STEPS);
+  for (let i = 0; i < STEPS; i++) {
+    const t = i / (STEPS - 1);
+    // Soft-knee lift: shadows bottom out at 96, highlights reach 255. The
+    // earlier 118 floor (plus heavy emissive) left the white fur nearly
+    // shadeless — flat paper. A deeper toe gives the volumetric form
+    // shading that makes the model read 3D like the sheet.
+    data[i] = Math.round(96 + 159 * Math.pow(t, 0.9));
+  }
+  const tex = new THREE.DataTexture(data, STEPS, 1, THREE.RedFormat);
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearFilter;
   tex.needsUpdate = true;
   return tex;
 }
 const GRAD = createGradientMap();
 
 // Toon material factory — cel-shaded with a subtle emissive tint so colours
-// stay readable in dim light.
+// stay readable in dim light. Emissive is kept LOW: it adds flat unshaded
+// brightness, and on white fur anything above ~0.06 washes out the form
+// shading that makes the model read 3D.
 function tmat(hex: number, opts: { emissiveBoost?: number } = {}): THREE.MeshToonMaterial {
   return new THREE.MeshToonMaterial({
     color: hex,
     emissive: hex,
-    emissiveIntensity: opts.emissiveBoost ?? 0.08,
+    emissiveIntensity: Math.min(opts.emissiveBoost ?? 0.05, 0.06),
     gradientMap: GRAD,
   });
 }
@@ -172,13 +185,21 @@ export const OUTLINE_MAT = new THREE.MeshBasicMaterial({
 });
 
 /**
+ * Global linework weight. The sheet's outlines are thin and delicate; the
+ * caller-supplied thicknesses date from the chunky-mascot pass, so one knob
+ * scales every shell down uniformly (accessories included) instead of
+ * retuning ~40 call sites.
+ */
+const OUTLINE_FINENESS = 0.55;
+
+/**
  * Build an inverted-hull outline shell for a mesh. Renders only back faces
- * of a scaled-up copy of the mesh, giving a clean dark border wherever the
+ * of a scaled-up copy of the mesh, giving a clean grey border wherever the
  * silhouette turns away from the camera.
  */
 function outline(host: THREE.Mesh, thickness = 0.02): THREE.Mesh {
   const shell = new THREE.Mesh(host.geometry, OUTLINE_MAT);
-  shell.scale.multiplyScalar(1 + thickness);
+  shell.scale.multiplyScalar(1 + thickness * OUTLINE_FINENESS);
   shell.position.copy(host.position);
   shell.rotation.copy(host.rotation);
   shell.renderOrder = -1;
@@ -221,9 +242,10 @@ function fluffGeo(
     //    base, tapering continuously to the soft tip (a soft ear wedge).
     const t = baseWide ? (y + 1) / 2 : Math.max(0, y);
     if (t > 0) {
-      // Pinch strengthens toward the pole; exponent shapes how "clawed"
-      // the tip feels. 0.93 leaves a soft (not needle) point.
-      const pinch = 1 - Math.pow(t, baseWide ? 1.6 : 1.35) * 0.93;
+      // Pinch strengthens toward the pole. Exponent 1.5 keeps the clump
+      // FAT for most of its length and 0.86 leaves a rounded (not sharp)
+      // tip — thin pointy locks read "spiky"; the sheet's fur is plush.
+      const pinch = 1 - Math.pow(t, baseWide ? 1.6 : 1.5) * 0.86;
       pos.setX(i, pos.getX(i) * pinch);
       pos.setZ(i, pos.getZ(i) * pinch);
     }
@@ -252,7 +274,11 @@ function flameTubeGeo(
   xSquash = 0.86,
   /** Optional per-vertex radial multiplier (tFrac 0..1 along spine, ring
    *  angle rad) — used to sculpt fur scallops INTO the surface. */
-  bump?: (tFrac: number, ringAngle: number) => number
+  bump?: (tFrac: number, ringAngle: number) => number,
+  /** Pole-cap dome length as a fraction of the end radius. 0.95 = round
+   *  cap; outline SHELL tubes pass ~0.1 (near-flat) — a domed shell cap
+   *  bulges past its joint and pokes out of the neighbouring surface. */
+  capScale = 0.95
 ): THREE.BufferGeometry {
   const n = spine.length;
   const positions: number[] = [];
@@ -304,7 +330,7 @@ function flameTubeGeo(
   {
     const [sy, sz] = spine[0];
     const [ty, tz] = tangents[0];
-    positions.push(0, sy - ty * radii[0] * 0.95, sz - tz * radii[0] * 0.95);
+    positions.push(0, sy - ty * radii[0] * capScale, sz - tz * radii[0] * capScale);
     for (let j = 0; j < radialSegs; j++) {
       const j2 = (j + 1) % radialSegs;
       indices.push(startPole, j2, j);
@@ -314,7 +340,7 @@ function flameTubeGeo(
   {
     const [sy, sz] = spine[n - 1];
     const [ty, tz] = tangents[n - 1];
-    positions.push(0, sy + ty * radii[n - 1] * 0.95, sz + tz * radii[n - 1] * 0.95);
+    positions.push(0, sy + ty * radii[n - 1] * capScale, sz + tz * radii[n - 1] * capScale);
     const base = (n - 1) * radialSegs;
     for (let j = 0; j < radialSegs; j++) {
       const j2 = (j + 1) % radialSegs;
@@ -422,17 +448,18 @@ export class VoxelCharacter {
     // read as short stubs.
     this.torso.position.y = 1.03;             // idle rootY (1.18) − 0.15 chibi offset — feet flush at spawn
     this.head.position.y  = 0.46;             // head sits ON the body (sheet has no neck — skull bottom overlaps the pear top by ~0.12)
-    this.leftArm.position.set(-0.40, 0.26, 0);// shoulders — tucked into the pear so arms hug the body silhouette
-    this.rightArm.position.set( 0.40, 0.26, 0);
-    this.leftLeg.position.set(-0.20, -0.30, 0); // hips — pulled inward
-    this.rightLeg.position.set( 0.20, -0.30, 0);
+    this.leftArm.position.set(-0.42, 0.26, 0);// shoulders — snug to the pear; paws must clear the belly (¾ views buried them at 0.40)
+    this.rightArm.position.set( 0.42, 0.26, 0);
+    this.leftLeg.position.set(-0.17, -0.30, 0); // hips — narrow stance; the sheet's feet nearly touch
+    this.rightLeg.position.set( 0.17, -0.30, 0);
 
     // Tail root: attached LOW on the back (hip level) at the tail-bone.
     // rotation.x = -1.62 rad (≈ -93°) points the tail group's local +Y
-    // straight BACK with a slight droop, and maps local +Z to UP — the
-    // spine geometry built in _buildTail curls along +Z, producing the
-    // reference sheet's back-then-up flame sweep. (The old drooping stub
-    // used -2.05; that pointed the whole plume at the floor.)
+    // straight BACK with a slight droop and maps local +Z to UP. The spine
+    // in _buildTail dips along −Z then flicks up — the sheet's low-slung
+    // brush. Side-set/sway happens on rotation.z (Euler XYZ applies Rz
+    // first, i.e. in the pre-tilt frame, which yaws the whole brush around
+    // world-up — rotation.y here would TWIST a drooped brush's plane).
     this.tail.position.set(0, -0.30, -0.28);
     this.tail.rotation.x = -1.62;
 
@@ -489,27 +516,46 @@ export class VoxelCharacter {
     const skull = new THREE.Mesh(skullGeo, furMat);
     addWithOutline(this.head, skull, 0.028);
 
-    // Muzzle — the sheet's side view shows an almost FLAT face with a small
-    // rounded bump low-center carrying the nose; the old protruding fox
-    // snout is gone. One squashed sphere, cream role (white for now).
+    // Muzzle — the sheet's side view shows a compact rounded snout mass
+    // low-center on the face: a central bump carrying the nose, a soft
+    // cheek bulge either side of it, and a small chin below the mouth.
+    // Sculpting it as four overlapping volumes (instead of one squashed
+    // sphere) is what makes the lower face read 3D instead of flat.
+    // SHEET RULE: the nose sits just under the eye line on the muzzle
+    // mass, with the smile directly beneath it — the whole lower-face
+    // cluster rides ~0.015 higher than the first sculpt.
     const muzzleGeo = new THREE.SphereGeometry(0.16, 36, 26);
-    muzzleGeo.scale(1.25, 0.80, 0.75);
+    muzzleGeo.scale(1.15, 0.82, 0.80);
     const muzzle = new THREE.Mesh(muzzleGeo, creamMat);
-    muzzle.position.set(0, 0.28, 0.50);
+    muzzle.position.set(0, 0.29, 0.50);
     addWithOutline(this.head, muzzle, 0.022);
+
+    const cheekGeo = new THREE.SphereGeometry(0.105, 28, 20);
+    cheekGeo.scale(1.20, 0.85, 0.72);
+    for (const cs of [-1, 1] as const) {
+      const cheekBulge = new THREE.Mesh(cheekGeo, creamMat);
+      cheekBulge.position.set(cs * 0.135, 0.265, 0.475);
+      this.head.add(cheekBulge);   // no outline — blends into the muzzle mass
+    }
+
+    const chinGeo = new THREE.SphereGeometry(0.062, 22, 16);
+    chinGeo.scale(1.25, 0.70, 0.85);
+    const chin = new THREE.Mesh(chinGeo, creamMat);
+    chin.position.set(0, 0.115, 0.51);
+    this.head.add(chin);
 
     // Nose — small charcoal rounded-triangle read (squashed sphere)
     const noseGeo = new THREE.SphereGeometry(0.055, 26, 20);
     noseGeo.scale(1.30, 0.85, 0.80);
     const nose = new THREE.Mesh(noseGeo, noseMat);
-    nose.position.set(0, 0.315, 0.635);
+    nose.position.set(0, 0.33, 0.635);
     addWithOutline(this.head, nose, 0.030);
     // Nose highlight speck — unlit, tiny
     const noseHi = new THREE.Mesh(
       new THREE.SphereGeometry(0.016, 14, 12),
       noseHiMat
     );
-    noseHi.position.set(-0.012, 0.335, 0.672);
+    noseHi.position.set(-0.012, 0.35, 0.672);
     this.head.add(noseHi);
 
     // Mouth — thin charcoal SMILE ARC (torus segment facing +Z), not a box.
@@ -518,7 +564,7 @@ export class VoxelCharacter {
     const mouthGeo = new THREE.TorusGeometry(0.075, 0.012, 12, 32, Math.PI * 0.8);
     mouthGeo.rotateZ(-Math.PI * 0.9);   // centre the arc about local -Y (smile)
     const mouth = new THREE.Mesh(mouthGeo, noseMat);
-    mouth.position.set(0, 0.20, 0.63);
+    mouth.position.set(0, 0.215, 0.63);
     this.head.add(mouth);
     this.mouth = mouth;
 
@@ -529,7 +575,7 @@ export class VoxelCharacter {
     const fangGeo = fluffGeo(0.018, 0.052, 14, 12);
     fangGeo.rotateX(Math.PI);           // point DOWN (base at the gum line)
     const fang = new THREE.Mesh(fangGeo, fangMat);
-    fang.position.set(-0.055, 0.150, 0.635);   // hangs from the smile arc
+    fang.position.set(-0.055, 0.165, 0.635);   // hangs from the smile arc
     this.head.add(fang);
 
     // ── FACE DECAL (canvas-drawn 2D eyes + brows) ────────────────────────
@@ -547,62 +593,147 @@ export class VoxelCharacter {
     // The smile-arc mesh built above is the smile-anchor (this.mouth).
 
     // ── Ears ─────────────────────────────────────────────────────────────
-    // The sheet's dominant feature: HUGE soft-triangular ears, nearly as
-    // tall as the head ball, white outside with a grey inner cavity (and a
+    // The sheet's dominant feature: HUGE wide-flared ears, nearly as tall
+    // as the head ball, white outside with a grey inner cavity (and a
     // deeper grey core for depth), plus fluff wisps at the cavity base. No
-    // dark tips — white to the point. Each layer is a base-wide fluffGeo
-    // teardrop (smooth continuous curve, rounded tip) flattened
-    // front-to-back into a slab — no cone facets anywhere.
+    // dark tips — white to the point. Built from exact 2D outlines
+    // (ExtrudeGeometry with bevelled rims) because the sheet's silhouette
+    // is asymmetric — near-vertical inner edge, long concave outer flare —
+    // which no symmetric cone/teardrop can express.
     //
     // Anti-"floating triangle" rule carried over from the previous pass:
-    // the ear group origin sits INSIDE the skull ellipsoid so the teardrop's
-    // domed base embeds seamlessly (at x=±0.30, y=0.88 the ellipsoid sum
-    // ≈ 0.77 < 1 — no gap, no visible seam).
+    // the ear group origin sits inside the skull surface and the outline's
+    // base curve dips below y=0, so the slab embeds seamlessly — no gap,
+    // no visible seam.
     const buildEar = (side: -1 | 1) => {
       const g = new THREE.Group();
 
-      // Outer ear — a base-wide fluff teardrop flattened front-to-back:
-      // widest at its domed base, one continuous smooth curve to a soft
-      // rounded tip (the sheet's ears are soft triangles, never sharp).
-      // The domed base doubles as the head-blend, so no separate base-tuft
-      // sphere is needed.
-      const outerGeo = fluffGeo(0.32, 1.05, 36, 28, true);
-      outerGeo.scale(1.0, 1.0, 0.42);
-      outerGeo.computeVertexNormals();
+      // The sheet's ear silhouette is ASYMMETRIC: a wide base whose inner
+      // edge rises near-vertical from close to the head's centreline, while
+      // the OUTER edge is one long concave flare sweeping up to a soft tip
+      // that points up-and-slightly-out. A symmetric cone/teardrop can't
+      // produce that, so each ear layer is drawn as an exact 2D outline
+      // (+x = toward the ear's outer side) and extruded with generous
+      // bevels for the soft slab rim. `s` mirrors the outline per side.
+      // SHEET RULE: the two ears must NOT touch at the middle of the head —
+      // their inner base edges stop ~0.12 either side of the centreline
+      // (the head tuft fills the gap). Inner bound here is -0.18 in ear
+      // space; with the group at ±0.30 the inner edge lands at ±0.12.
+      const s = side;
+      const outerShape = new THREE.Shape();
+      outerShape.moveTo(-0.18 * s, 0.02);
+      // inner edge — near vertical, slight outward lean toward the tip
+      outerShape.quadraticCurveTo(-0.20 * s, 0.55, -0.03 * s, 0.93);
+      // POINTED tip (tiny rounding only — a domed tip reads rabbit, not fox)
+      outerShape.quadraticCurveTo(0.03 * s, 1.00, 0.07 * s, 0.90);
+      // outer edge — long concave flare down to the wide base corner
+      outerShape.quadraticCurveTo(0.28 * s, 0.48, 0.46 * s, 0.02);
+      // base curve dips WELL below y=0 so the whole width embeds in the
+      // skull dome (floating outer corners were visible in the first cut)
+      outerShape.quadraticCurveTo(0.10 * s, -0.26, -0.18 * s, 0.02);
+
+      const outerGeo = new THREE.ExtrudeGeometry(outerShape, {
+        depth: 0.10,
+        bevelEnabled: true,
+        bevelThickness: 0.05,
+        bevelSize: 0.04,
+        bevelSegments: 5,
+        curveSegments: 28,
+      });
+      outerGeo.translate(0, 0, -0.05);   // centre the slab front-to-back
+
+      // WEDGE taper — a uniform extrusion reads as a flat board edge-on;
+      // the sheet's side view shows the ear thinning continuously toward
+      // the tip. Scales each vertex's depth by height (optionally pulling
+      // it backward so the cavity panels follow the shrinking front face).
+      const taperEar = (
+        geo: THREE.BufferGeometry,
+        h: number,
+        pull = 0
+      ): void => {
+        const pos = geo.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+          const yy = Math.max(0, pos.getY(i));
+          const f = 1 - 0.68 * Math.min(1, yy / h);
+          pos.setZ(i, pos.getZ(i) * f - pull * Math.min(1, yy / h));
+        }
+        geo.computeVertexNormals();
+      };
+      taperEar(outerGeo, 1.0);
       const outer = new THREE.Mesh(outerGeo, furMat);
-      outer.position.y = -0.08;   // sink the dome into the skull
-      addWithOutline(g, outer, 0.026);
+      addWithOutline(g, outer, 0.024);
 
-      // Inner cavity — soft grey teardrop just in front of the outer slab
-      // (the sheet shades the whole inner triangle).
-      const innerGeo = fluffGeo(0.205, 0.76, 30, 24, true);
-      innerGeo.scale(1.0, 1.0, 0.36);
-      innerGeo.computeVertexNormals();
-      const inner = new THREE.Mesh(innerGeo, shadeMat);
-      inner.position.set(0, 0.06, 0.075);
-      g.add(inner);
+      // Inner cavity — inset copy of the outline, thin extrusion floating
+      // just in front of the outer slab (the sheet shades the whole inner
+      // triangle with a clear rim of white around it).
+      const cavShape = new THREE.Shape();
+      cavShape.moveTo(-0.090 * s, 0.12);
+      cavShape.quadraticCurveTo(-0.100 * s, 0.50, 0.000, 0.80);
+      cavShape.quadraticCurveTo(0.030 * s, 0.85, 0.060 * s, 0.77);
+      cavShape.quadraticCurveTo(0.190 * s, 0.44, 0.290 * s, 0.10);
+      cavShape.quadraticCurveTo(0.060 * s, 0.00, -0.090 * s, 0.12);
+      const cavGeo = new THREE.ExtrudeGeometry(cavShape, {
+        depth: 0.02,
+        bevelEnabled: true,
+        bevelThickness: 0.02,
+        bevelSize: 0.02,
+        bevelSegments: 4,
+        curveSegments: 24,
+      });
+      taperEar(cavGeo, 0.85, 0.075);   // follow the wedge's receding front
+      const cavity = new THREE.Mesh(cavGeo, shadeMat);
+      cavity.position.set(0, 0.04, 0.115);   // lifted — its base edge peeked
+      g.add(cavity);                         // past the outer slab's base dip
 
-      // Deepest cavity accent — smaller, deeper-grey teardrop inside
-      const coreGeo = fluffGeo(0.115, 0.46, 24, 18, true);
-      coreGeo.scale(1.0, 1.0, 0.34);
-      coreGeo.computeVertexNormals();
+      // Deepest cavity accent — smaller inset, deeper grey
+      const coreShape = new THREE.Shape();
+      coreShape.moveTo(-0.030 * s, 0.22);
+      coreShape.quadraticCurveTo(-0.035 * s, 0.45, 0.010 * s, 0.64);
+      coreShape.quadraticCurveTo(0.035 * s, 0.68, 0.055 * s, 0.62);
+      coreShape.quadraticCurveTo(0.115 * s, 0.42, 0.160 * s, 0.20);
+      coreShape.quadraticCurveTo(0.050 * s, 0.13, -0.030 * s, 0.22);
+      const coreGeo = new THREE.ExtrudeGeometry(coreShape, {
+        depth: 0.015,
+        bevelEnabled: true,
+        bevelThickness: 0.015,
+        bevelSize: 0.015,
+        bevelSegments: 3,
+        curveSegments: 20,
+      });
+      taperEar(coreGeo, 0.68, 0.085);   // follow the wedge's receding front
       const core = new THREE.Mesh(coreGeo, shadeLoMat);
-      core.position.set(0, 0.12, 0.115);
+      core.position.set(0, 0.04, 0.135);
       g.add(core);
 
-      // Ear-base fluff wisps — three tiny white tufts across the cavity base
-      const wL = new THREE.Mesh(fluffGeo(0.034, 0.12, 16, 12), furMat);
-      const wC = new THREE.Mesh(fluffGeo(0.030, 0.10, 16, 12), furMat);
-      const wR = new THREE.Mesh(fluffGeo(0.034, 0.12, 16, 12), furMat);
-      wL.position.set(-0.055, 0.10, 0.11); wL.rotation.z =  0.30;
-      wC.position.set( 0.000, 0.08, 0.12);
-      wR.position.set( 0.055, 0.10, 0.11); wR.rotation.z = -0.30;
-      g.add(wL, wC, wR);
+      // Ear-base fluff wisps — three tiny white tufts overlapping the
+      // cavity base (the sheet tucks head-fur locks into each ear opening)
+      const wA = new THREE.Mesh(fluffGeo(0.040, 0.15, 16, 12), furMat);
+      const wB = new THREE.Mesh(fluffGeo(0.034, 0.12, 16, 12), furMat);
+      const wC = new THREE.Mesh(fluffGeo(0.040, 0.15, 16, 12), furMat);
+      // Raised to overlap the cavity panel's lower bevel edge (its grey
+      // side face showed as small dashes from the front)
+      wA.position.set(-0.07 * s, 0.11, 0.15); wA.rotation.z =  0.30 * s;
+      wB.position.set( 0.01 * s, 0.09, 0.16);
+      wC.position.set( 0.09 * s, 0.12, 0.15); wC.rotation.z = -0.30 * s;
+      g.add(wA, wB, wC);
 
-      // Embedded in the skull; the tip projects ~0.85 above the skull top,
-      // matching the sheet's near-head-height ears.
-      g.position.set(side * 0.30, 0.88, -0.04);
-      g.rotation.z = side * -0.18;
+      // Inner-ear fold — the sheet draws a soft vertical ridge along the
+      // cavity's inner edge; a flattened white lock leaning up the inner
+      // side gives that fold in 3D.
+      const foldGeo = fluffGeo(0.05, 0.32, 16, 14);
+      foldGeo.scale(1.0, 1.0, 0.5);
+      foldGeo.computeVertexNormals();
+      const fold = new THREE.Mesh(foldGeo, furMat);
+      fold.position.set(-0.13 * s, 0.16, 0.13);
+      fold.rotation.z = 0.14 * s;
+      g.add(fold);
+
+      // Base sunk INTO the skull dome and tilted outward so the wide outer
+      // corner tucks along the head's curve instead of hovering over it.
+      // At ±0.30 the inner base edges clear the centreline by 0.12 each —
+      // the sheet's ears never touch in the middle.
+      g.position.set(side * 0.30, 0.82, -0.04);
+      g.rotation.z = side * -0.16;
       g.rotation.x = -0.10;
       return g;
     };
@@ -615,10 +746,11 @@ export class VoxelCharacter {
     // — three soft fluff teardrops with their round bases pinned at the
     // mesh position so rotations splay them like real fur clumps.
     const tuftSpec: Array<[number, number, number, number, number, number, number]> = [
-      // x      y     z     r      h     rotX   rotZ
-      [ 0.00, 1.00, 0.12, 0.075, 0.26, -0.55,  0.00],
-      [-0.09, 0.99, 0.09, 0.060, 0.20, -0.50,  0.30],
-      [ 0.08, 1.00, 0.10, 0.055, 0.17, -0.45, -0.25],
+      // x      y     z     r      h     rotX   rotZ   (fat plush clumps)
+      [ 0.00, 0.99, 0.14, 0.115, 0.32, -0.65,  0.00],
+      [-0.11, 0.98, 0.10, 0.090, 0.25, -0.60,  0.32],
+      [ 0.09, 0.99, 0.11, 0.085, 0.21, -0.55, -0.28],
+      [-0.04, 1.00, 0.16, 0.070, 0.17, -0.75,  0.12],
     ];
     for (const [x, y, z, r, h, rx, rz] of tuftSpec) {
       const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
@@ -633,10 +765,10 @@ export class VoxelCharacter {
     // inside the skull surface.
     for (const side of [-1, 1] as const) {
       const ruffSpec: Array<[number, number, number, number, number]> = [
-        // y      z     r      h     extra outward-down tilt
-        [ 0.40, 0.04, 0.060, 0.19, 0.10],
-        [ 0.30, 0.08, 0.090, 0.34, 0.35],
-        [ 0.20, 0.12, 0.070, 0.24, 0.65],
+        // y      z     r      h     extra outward-down tilt (fat clumps)
+        [ 0.43, 0.04, 0.085, 0.20, 0.08],
+        [ 0.31, 0.08, 0.125, 0.34, 0.35],
+        [ 0.20, 0.12, 0.100, 0.25, 0.68],
       ];
       for (const [y, z, r, h, tilt] of ruffSpec) {
         const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), furMat);
@@ -735,9 +867,10 @@ export class VoxelCharacter {
       ctx.quadraticCurveTo(cx, cy - 120, cx + side * 34, cy - 100);
       ctx.stroke();
     };
-    // Two eyes with a nose-bridge gap. Y=228 is upper-middle of face area.
-    drawEye(166, 228, -1);
-    drawEye(346, 228,  1);
+    // Two eyes with a WIDE nose-bridge gap — the sheet spaces the eyes
+    // about half an eye-width apart. Y=228 is upper-middle of face area.
+    drawEye(158, 228, -1);
+    drawEye(354, 228,  1);
 
     // Build the texture and plane. The plane is sized 0.90 units wide so
     // the drawn eyes end up ~0.24 wide each in world space — the big dark
@@ -821,12 +954,12 @@ export class VoxelCharacter {
     // triangular MASS, so the teardrops overlap instead of ringing like a
     // necklace.
     const bibSpikes: Array<[number, number, number, number, number, number]> = [
-      // x      y     z     r      h     rotZ (splay)
-      [ 0.00, 0.32, 0.24, 0.095, 0.36,  0.00],
-      [-0.09, 0.33, 0.22, 0.075, 0.28,  0.16],
-      [ 0.09, 0.33, 0.22, 0.075, 0.28, -0.16],
-      [-0.17, 0.34, 0.19, 0.060, 0.20,  0.32],
-      [ 0.17, 0.34, 0.19, 0.060, 0.20, -0.32],
+      // x      y     z     r      h     rotZ (splay) — fat plush clumps
+      [ 0.00, 0.32, 0.24, 0.120, 0.34,  0.00],
+      [-0.09, 0.33, 0.22, 0.095, 0.27,  0.16],
+      [ 0.09, 0.33, 0.22, 0.095, 0.27, -0.16],
+      [-0.17, 0.34, 0.19, 0.075, 0.19,  0.32],
+      [ 0.17, 0.34, 0.19, 0.075, 0.19, -0.32],
     ];
     for (const [x, y, z, r, h, rz] of bibSpikes) {
       const spike = new THREE.Mesh(fluffGeo(r, h, 20, 16), creamMat);
@@ -834,6 +967,31 @@ export class VoxelCharacter {
       // Point DOWN-and-forward with a per-spike sideways splay
       spike.rotation.set(Math.PI * 0.88, 0, rz);
       addWithOutline(this.chest, spike, 0.020);
+    }
+
+    // Rump fluff — the sheet's back view shows a fur burst where the tail
+    // meets the body; three locks draping down over the tail root.
+    const rumpSpec: Array<[number, number, number, number, number, number]> = [
+      // x      y      z      r      h     rotZ splay — fat plush clumps
+      [ 0.00, -0.16, -0.30, 0.088, 0.21,  0.00],
+      [-0.10, -0.14, -0.28, 0.070, 0.16,  0.28],
+      [ 0.10, -0.14, -0.28, 0.070, 0.16, -0.28],
+    ];
+    for (const [x, y, z, r, h, rz] of rumpSpec) {
+      const lock = new THREE.Mesh(fluffGeo(r, h, 18, 14), furMat);
+      lock.position.set(x, y, z);
+      // Drape DOWN-and-back over the tail root
+      lock.rotation.set(-Math.PI * 0.82, 0, rz);
+      addWithOutline(this.chest, lock, 0.018);
+    }
+
+    // Hip tufts — small locks flicking down-and-out where the belly meets
+    // the legs (subtle silhouette breaks the sheet shows at the hips).
+    for (const hs of [-1, 1] as const) {
+      const hip = new THREE.Mesh(fluffGeo(0.070, 0.16, 18, 14), furMat);
+      hip.position.set(hs * 0.40, -0.24, 0.02);
+      hip.rotation.z = -hs * 2.5;   // tip points down-and-out
+      addWithOutline(this.chest, hip, 0.018);
     }
 
     // Outfit roles: torso shell = fur; chest bib + spikes = cream.
@@ -871,11 +1029,12 @@ export class VoxelCharacter {
       paw.position.y = -0.47;
       addWithOutline(group, paw, 0.026);
 
-      // Slight outward hang (sheet front view): a static Z-tilt on the arm
-      // group. update() only animates rotation.x, so this tilt persists
-      // through the walk/sit/paddle cycles. Rz(θ) maps the hanging tip
-      // (0,-1,0) → (sinθ, -cosθ, 0), so the left arm (-X side) needs θ<0.
-      group.rotation.z = side * 0.12;
+      // Outward hang (sheet front view): a static Z-tilt on the arm group.
+      // update() only animates rotation.x, so this tilt persists through
+      // the walk/sit/paddle cycles. Rz(θ) maps the hanging tip (0,-1,0) →
+      // (sinθ, -cosθ, 0), so the left arm (-X side) needs θ<0. 0.18 keeps
+      // the mitten paws clear of the fattest belly section in ¾ views.
+      group.rotation.z = side * 0.18;
     };
 
     buildArm(this.leftArm, -1);
@@ -947,32 +1106,48 @@ export class VoxelCharacter {
   }
 
   // ── Tail ─────────────────────────────────────────────────────────────────
-  //  The reference sheet's signature: a BIG flame-shaped tail. It leaves the
-  //  tail-bone going straight back with a slight dip, then curls UP so the
-  //  soft tip rides at chin height, and its silhouette is serrated with
-  //  fluff spikes along the top and underside edges.
+  //  The reference sheet's signature: a BIG low-slung fox brush. Off the
+  //  tail-bone it heads down-and-back, the fat fluffy mass lies at LEG
+  //  height beside the body (resting on the character's right in every
+  //  sheet view), and the final quarter swooshes UP so the soft split tip
+  //  flicks to about hip height. Top edge serrated with sculpted fur
+  //  scallops; underside smooth.
   //
   //  Coordinate frame: the tail group's rotation.x = -1.62 (constructor)
-  //  maps local +Y → world BACK and local +Z → world UP. The spine is a
-  //  parabola in the local Y-Z plane: y(t) = 0.95t (length), z(t) =
-  //  1.15t² − 0.15t (tiny initial dip, strong late rise). Overlapping
-  //  spheres of swelling-then-tapering radius fill the curve; spikes sit on
-  //  the curve's normals; the tip cone follows the end tangent.
+  //  maps local +Y → world BACK and local +Z → world UP; the spine dips
+  //  along −Z (droop) with a t⁶ up-flick at the end. One continuous
+  //  varying-radius tube (split into three chained joint sections) fills
+  //  the curve; the tip teardrops follow the end tangent.
   private _buildTail(): void {
     const furMat = tmat(PAL.fur, { emissiveBoost: 0.09 });
 
-    const spineY = (t: number) => 0.95 * t;
-    const spineZ = (t: number) => 0.95 * t * t - 0.12 * t;
-    // Tangent of the spine curve (d/dt), for spike normals + tip direction
-    const tangent = (t: number): [number, number] => [0.95, 1.9 * t - 0.12];
+    // LOW-SLUNG BRUSH (sheet-checked, third pass): in every reference view
+    // the tail's mass DROOPS to leg height — off the tailbone it heads
+    // down-and-back, the fat brush lies low beside the legs, and only the
+    // final quarter swooshes UP so the soft tip flicks to about hip height.
+    // (Pass 1 streamed a long flame far behind; pass 2 curled up to chest
+    // height — both wrong.) Local frame: +Y = back, +Z = up.
+    //   y(t): backward run.  z(t): parabolic dip (max ≈ −0.27 at mid) with
+    //   a t⁶ up-flick that only bites near the tip.
+    // Up-flick uses t^3.5 (not a higher power): the same tip height with
+    // the bend SPREAD over the last half — a tighter bend made consecutive
+    // tube rings intersect and fold the surface inside-out at the kink.
+    const spineY = (t: number) => 0.62 * t;
+    const spineZ = (t: number) => -1.1 * t * (1 - t) + 0.26 * Math.pow(t, 3.5);
+    // Tangent of the spine curve (d/dt), for scallop frames + tip direction
+    const tangent = (t: number): [number, number] =>
+      [0.62, -1.1 * (1 - 2 * t) + 0.91 * Math.pow(t, 2.5)];
 
     // Flame body — ONE continuous varying-radius tube along the parabola
     // (16 rings × 32 radial segments). FAT like the sheet: the plume's max
     // radius is ~0.32 (≈ 70% of the body's half-width), swelling from a
     // narrow root and melting into the tip.
+    // Bell stretched past the domain end (t/1.08) so the tube stays ~0.19
+    // fat at t=0.95 — a thin end let the tip lock's 0.13 bulb poke through
+    // the surface and expose its outline shell as a grey patch in the crook.
     const radiusAt = (t: number) => {
-      const bell = Math.sin(Math.min(1, t / 0.95) * Math.PI);
-      return 0.105 + Math.pow(bell, 1.05) * 0.215;
+      const bell = Math.sin(Math.min(1, t / 1.08) * Math.PI);
+      return 0.115 + Math.pow(bell, 1.05) * 0.215;
     };
     // ── Three chained sections (root → mid → tip joints) ─────────────────
     // The flame is split at t = 0.35 and 0.68 into three tube sections on
@@ -988,13 +1163,28 @@ export class VoxelCharacter {
     // as balls, not fur. ringAngle a: sin(a) < 0 is the top/outer side.
     const JOINT_MID = 0.35;
     const JOINT_TIP = 0.68;
-    const buildSection = (
-      parent: THREE.Object3D,
+
+    // Fur serration shared by surface + shells. Primary crests (four over
+    // the brush) + a fine second harmonic — the sheet's brush outline has
+    // both big locks and small flicks. ringAngle a: sin(a) < 0 = top edge.
+    const scallopFor = (t0: number, t1: number) => (frac: number, a: number) => {
+      const tGlobal = t0 + frac * (t1 - t0);
+      const topness = Math.max(0, -Math.sin(a));
+      const fade = Math.sin(Math.min(1, tGlobal / 0.95) * Math.PI);
+      const wave = Math.pow(Math.abs(Math.sin(tGlobal * Math.PI * 4.0 + 0.4)), 0.9);
+      const micro = Math.pow(Math.abs(Math.sin(tGlobal * Math.PI * 9.0 + 1.3)), 1.1);
+      return 1
+        + 0.24 * Math.pow(topness, 1.6) * wave * fade
+        + 0.08 * Math.pow(topness, 1.9) * micro * fade;
+    };
+
+    const sectionTube = (
       t0: number,
       t1: number,
       base: number,
-      rings: number
-    ): void => {
+      rings: number,
+      capScale = 0.95
+    ): THREE.BufferGeometry => {
       const pts: Array<[number, number]> = [];
       const radii: number[] = [];
       for (let i = 0; i < rings; i++) {
@@ -1002,26 +1192,53 @@ export class VoxelCharacter {
         pts.push([spineY(t) - spineY(base), spineZ(t) - spineZ(base)]);
         radii.push(radiusAt(t));
       }
-      const scallop = (frac: number, a: number) => {
-        const tGlobal = t0 + frac * (t1 - t0);
-        const topness = Math.max(0, -Math.sin(a));
-        const wave = Math.pow(Math.abs(Math.sin(tGlobal * Math.PI * 5.2 + 0.4)), 0.9);
-        const fade = Math.sin(Math.min(1, tGlobal / 0.95) * Math.PI);
-        return 1 + 0.24 * Math.pow(topness, 1.6) * wave * fade;
-      };
-      const mesh = new THREE.Mesh(flameTubeGeo(pts, radii, 32, 0.86, scallop), furMat);
+      // 0.95 xSquash: near-round cross-section — the sheet's brush is a
+      // full fluffy volume, not a flattened fin.
+      return flameTubeGeo(pts, radii, 32, 0.95, scallopFor(t0, t1), capScale);
+    };
+
+    // Each section's SURFACE overlaps its joints (t0..t1) so bends never
+    // open the skin — but its outline SHELL is built from the TRIMMED
+    // domain (shellT0..shellT1) only. A shell over the overlap rings sat
+    // 1.2% proud of the NEIGHBOUR section's identical surface there and
+    // showed as a grey band at every joint; trimmed shells tile instead.
+    const buildSection = (
+      parent: THREE.Object3D,
+      t0: number,
+      t1: number,
+      base: number,
+      rings: number,
+      shellT0: number,
+      shellT1: number
+    ): void => {
+      const mesh = new THREE.Mesh(sectionTube(t0, t1, base, rings), furMat);
       parent.add(mesh);
-      parent.add(outline(mesh, 0.022));
+      const shellRings = Math.max(
+        4,
+        Math.round((rings * (shellT1 - shellT0)) / (t1 - t0))
+      );
+      // Near-flat caps (0.1) — a domed shell cap bulges past the joint and
+      // pokes grey out of the neighbouring section's crook.
+      const shell = new THREE.Mesh(
+        sectionTube(shellT0, shellT1, base, shellRings, 0.1),
+        OUTLINE_MAT
+      );
+      shell.scale.multiplyScalar(1 + 0.022 * OUTLINE_FINENESS);
+      shell.renderOrder = -1;
+      parent.add(shell);
     };
 
     // Root section rides the tail group itself
-    buildSection(this.tail, 0.0, JOINT_MID + 0.05, 0.0, 18);
+    buildSection(this.tail, 0.0, JOINT_MID + 0.05, 0.0, 18, 0.0, JOINT_MID);
 
     // Mid joint at the t=0.35 spine point
     const tailMid = new THREE.Group();
     tailMid.position.set(0, spineY(JOINT_MID), spineZ(JOINT_MID));
     this.tail.add(tailMid);
-    buildSection(tailMid, JOINT_MID - 0.03, JOINT_TIP + 0.05, JOINT_MID, 16);
+    buildSection(
+      tailMid, JOINT_MID - 0.03, JOINT_TIP + 0.05, JOINT_MID, 16,
+      JOINT_MID, JOINT_TIP
+    );
     this.tailMid = tailMid;
 
     // Tip joint at the t=0.68 spine point (position relative to the mid)
@@ -1032,7 +1249,8 @@ export class VoxelCharacter {
       spineZ(JOINT_TIP) - spineZ(JOINT_MID)
     );
     tailMid.add(tailTip);
-    buildSection(tailTip, JOINT_TIP - 0.03, 0.95, JOINT_TIP, 14);
+    // 18 rings here — the up-flick concentrates curvature in this section
+    buildSection(tailTip, JOINT_TIP - 0.03, 0.95, JOINT_TIP, 18, JOINT_TIP, 0.95);
     this.tailTip = tailTip;
 
     // Tip fluff — the sheet's flame ends in a SPLIT soft point: one long
@@ -1042,24 +1260,27 @@ export class VoxelCharacter {
     const tlen = Math.hypot(ty, tz);
     const tipDirY = ty / tlen;
     const tipDirZ = tz / tlen;
-    const tipMain = new THREE.Mesh(fluffGeo(0.130, 0.50, 26, 20), furMat);
+    const tipMain = new THREE.Mesh(fluffGeo(0.140, 0.38, 26, 20), furMat);
     tipMain.position.set(
       0,
-      spineY(0.95) - spineY(JOINT_TIP) - tipDirY * 0.06,
-      spineZ(0.95) - spineZ(JOINT_TIP) - tipDirZ * 0.06
+      spineY(0.95) - spineY(JOINT_TIP) - tipDirY * 0.05,
+      spineZ(0.95) - spineZ(JOINT_TIP) - tipDirZ * 0.05
     );
     tipMain.rotation.x = Math.atan2(tipDirZ, tipDirY);
     addWithOutline(tailTip, tipMain, 0.024);
 
-    const tipSide = new THREE.Mesh(fluffGeo(0.085, 0.30, 20, 16), furMat);
-    // Behind and slightly under the main point, angled ~35° off it
+    // Secondary curl behind the main point, angled ~35° off it. Bulb sunk
+    // WELL into the tube and added WITHOUT an outline shell — a shell on a
+    // barely-embedded fluff draws a grey halo leaf around its insertion
+    // (that was the grey patch at the bend crook).
+    const tipSide = new THREE.Mesh(fluffGeo(0.100, 0.23, 20, 16), furMat);
     tipSide.position.set(
       0,
-      spineY(0.88) - spineY(JOINT_TIP) - tipDirY * 0.02,
-      spineZ(0.88) - spineZ(JOINT_TIP) + 0.02
+      spineY(0.88) - spineY(JOINT_TIP) - tipDirY * 0.06,
+      spineZ(0.88) - spineZ(JOINT_TIP) - 0.05
     );
     tipSide.rotation.x = Math.atan2(tipDirZ, tipDirY) - 0.62;
-    addWithOutline(tailTip, tipSide, 0.020);
+    tailTip.add(tipSide);
 
     // Outfit roles: the whole plume = fur (the sheet's tail is one colour;
     // furDeep/cream tail slots from the fox-marking era are gone).
@@ -1241,8 +1462,8 @@ export class VoxelCharacter {
       this.torso.position.y = (state.rootY - 0.15) + Math.abs(Math.sin(time * walkSpeed)) * 0.09;
 
       // Tail sway — bigger amplitude on walk, tail wags side to side around
-      // a reduced rest offset (the plume streams closer to centre in motion)
-      this.tail.rotation.y = TAIL_REST_YAW * 0.5 + Math.sin(time * walkSpeed * 0.5) * 0.35;
+      // a reduced rest offset (the brush streams closer to centre in motion)
+      this.tail.rotation.z = TAIL_REST_YAW * 0.5 + Math.sin(time * walkSpeed * 0.5) * 0.35;
 
     } else if (this.currentState === 'swim') {
       // 🏊 Gentle paddle: arms alternate at a lazy cadence, legs stay tucked
@@ -1257,7 +1478,7 @@ export class VoxelCharacter {
       // Water bob rides ON TOP of the root lerp from section 1.
       this.torso.position.y += Math.sin(time * 2.0) * 0.03;
       // Tail drifts slowly like it's floating behind.
-      this.tail.rotation.y = TAIL_REST_YAW * 0.5 + Math.sin(time * 1.2) * 0.2;
+      this.tail.rotation.z = TAIL_REST_YAW * 0.5 + Math.sin(time * 1.2) * 0.2;
 
     } else {
       const legTarget = state.legRotX ?? 0;
@@ -1269,10 +1490,10 @@ export class VoxelCharacter {
       this.rightArm.rotation.x = THREE.MathUtils.lerp(this.rightArm.rotation.x, armTarget, lerpSpeed);
 
       // Idle tail — slow gentle sway around the rest offset (the sheet's
-      // front view shows the plume peeking beside the body, not hidden
-      // dead-centre behind it)
+      // front view shows the brush resting beside the legs on the
+      // character's right, not hidden dead-centre behind them)
       const idleSway = TAIL_REST_YAW + Math.sin(time * 1.5) * 0.12;
-      this.tail.rotation.y = THREE.MathUtils.lerp(this.tail.rotation.y, idleSway, lerpSpeed);
+      this.tail.rotation.z = THREE.MathUtils.lerp(this.tail.rotation.z, idleSway, lerpSpeed);
     }
 
     // Tail follow-through — the mid/tip joints lag the root sway (phase
@@ -1292,8 +1513,8 @@ export class VoxelCharacter {
         midTarget = Math.sin(time * 1.5 - 0.55) * 0.07;
         tipTarget = Math.sin(time * 1.5 - 1.10) * 0.06;
       }
-      this.tailMid.rotation.y = THREE.MathUtils.lerp(this.tailMid.rotation.y, midTarget, lerpSpeed);
-      this.tailTip.rotation.y = THREE.MathUtils.lerp(this.tailTip.rotation.y, tipTarget, lerpSpeed);
+      this.tailMid.rotation.z = THREE.MathUtils.lerp(this.tailMid.rotation.z, midTarget, lerpSpeed);
+      this.tailTip.rotation.z = THREE.MathUtils.lerp(this.tailTip.rotation.z, tipTarget, lerpSpeed);
     }
 
     // Head life — subtle sway/bob so the oversized skull never reads frozen:
@@ -1365,7 +1586,7 @@ export class VoxelCharacter {
     this.rightEye.scale.y = eyeScaleY;
 
     this.mouth.scale.x = 1.0 + smile * 0.7;
-    this.mouth.position.y = 0.20 + smile * 0.015;   // 0.20 = smile-arc build Y
+    this.mouth.position.y = 0.215 + smile * 0.015;  // 0.215 = smile-arc build Y
   }
 
   // ── Accessory builders (TR3, issue #35) ────────────────────────────────────

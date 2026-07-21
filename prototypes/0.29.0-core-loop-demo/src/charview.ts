@@ -36,16 +36,18 @@ export function startCharView(): void {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x272e3c); // neutral slate — white fur pops
 
-  // Three-point studio lighting tuned for the white toon fur: hemisphere
-  // base, warmish key, cool fill, strong rim for edge separation.
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x39445a, 0.85));
-  const key = new THREE.DirectionalLight(0xffffff, 1.9);
+  // Three-point studio lighting tuned for the white toon fur: LOW ambient
+  // with a strong key so the form shading actually models the volumes (a
+  // bright hemisphere flattened everything), cool fill, strong rim for
+  // edge separation.
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x39445a, 0.5));
+  const key = new THREE.DirectionalLight(0xffffff, 2.5);
   key.position.set(3.5, 6.0, 4.5);
   scene.add(key);
-  const fill = new THREE.DirectionalLight(0x9fb4d8, 0.5);
+  const fill = new THREE.DirectionalLight(0x9fb4d8, 0.45);
   fill.position.set(-4.0, 2.5, -1.0);
   scene.add(fill);
-  const rim = new THREE.DirectionalLight(0xffffff, 1.0);
+  const rim = new THREE.DirectionalLight(0xffffff, 1.15);
   rim.position.set(-2.5, 4.0, -4.5);
   scene.add(rim);
 
