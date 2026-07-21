@@ -12,6 +12,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.9 — 2026-07-21
+
+### 🤖🔌 Robots become furniture — one per charging dock (#77 Phase C, slice 2)
+
+The service robot is no longer a single fixture baked into the room theme — it now belongs to a **charging dock you place**. Drop a charging dock and a robot spawns at it; place several and you get **several robots** (your "room of robot docks"); remove a dock and its robot is cleaned up.
+
+- **One robot per placed charging dock**, each spawned at and bound to its own dock (it returns there to recharge when idle). Adding, moving, or removing a dock spawns / repositions / disposes exactly that robot, with no leaks.
+- **Authored rooms keep their ambient waiter.** A room with no dock but a theme that wants a robot (lobby / pool / casino) still shows a single roaming waiter, exactly as before — so nothing regresses; docks simply give you *more* robots to place.
+- **The croupier picks one robot.** When a roulette table is live, the nearest robot is elected (stickily) to run the wheel while the rest keep serving and docking — so a room can have a croupier *and* a drink waiter at the same time.
+- **Groundwork for programming.** This is the lifecycle foundation for the next slices: a programming panel on the dock (choose a routine — serve / croupier / idle) and a custom-script editor.
+- **Release line:** version bumped to 0.33.9, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.8 — 2026-07-21
 
 ### 🤖🧭 The robot puts its tray away and stops walking through the furniture (#77 Phase C, slice 1)

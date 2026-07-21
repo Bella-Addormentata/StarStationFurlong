@@ -157,15 +157,24 @@ export class PoolWaiter {
   constructor(
     scene: THREE.Scene,
     patrol: Array<[number, number]> = LOBBY_PATROL,
+    spawnPos?: { x: number; z: number },
   ) {
     this.scene = scene;
     this.patrol = patrol;
     this.group.name = "pool-waiter";
     this.build();
     this.group.scale.setScalar(ROBOT_SCALE);
-    const [sx, sz] = this.patrol[0];
+    // #77C: a dock robot spawns AT its dock; the ambient waiter starts on its
+    // patrol route.
+    const [sx, sz] = spawnPos ? [spawnPos.x, spawnPos.z] : this.patrol[0];
     this.group.position.set(sx, 0, sz);
     scene.add(this.group);
+  }
+
+  /** World-space footprint of the bot (x,z) — used to pick the nearest robot
+   *  for a croupier post (#77C multi-robot). */
+  public getPosition(): { x: number; z: number } {
+    return { x: this.group.position.x, z: this.group.position.z };
   }
 
   // ── Voxel build (front = +z at rotation 0) ─────────────────────────────────
