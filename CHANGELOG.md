@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.16 — 2026-07-21
+
+### 🚪 Doors become data-driven (#28 decouple, slice 4a)
+
+The set of doors a room has is now **synced state**, not a hardcoded constant — the foundation for adding/removing doors later. Behaviour is identical: still exactly the four cardinal doors, each over its port.
+
+- **New `doorLayout` room-doc map** (id → `{wall, lateral, size, enabled}`), cloned from the proven furniture-sync pattern, seeded once per owned room from the current door set (idempotent, owner-gated). It's kept **deliberately separate** from the door-*pairing* map (`doorsDoc`) and the door-*position* store (`floorPlan`) — those still own docking and slide respectively and are untouched.
+- **`DOORS` is reconciled from the map** instead of being a fixed literal: `rebuildDoors` mutates the door list in place as the map changes (add/remove membership), while position stays sourced from `floorPlan` and runtime `enabled` stays owned by the room (fireplace / casino). For the four-cardinal steady state this reconcile is a no-op, so nothing moves.
+- **Un-migrated rooms keep the local defaults** — the reconcile early-returns on an empty map, so an old room with no `doorLayout` entry renders exactly as before. Wire format is unchanged (pairing map + atlas untouched).
+- Verified: `tsc` clean; live — seeding the real doc's `doorLayout` map fires the reconcile and door behaviour (arrival routing, all four doors) stays identical, clearing it keeps the doors, the four doors render, no console errors.
+- **Next (slice 4b):** make the 3D door-group build (`buildPorts`) source from the same map and split it into port-hardware vs door-leaves — the last step before doors can be freely placed.
+- **Release line:** version bumped to 0.33.16, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.15 — 2026-07-21
 
 ### 🚪↔🛰️ The door→port seam + transit robustness (#28 decouple, slice 3)

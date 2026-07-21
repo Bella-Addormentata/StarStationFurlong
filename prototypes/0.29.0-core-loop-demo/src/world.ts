@@ -75,8 +75,10 @@ import { applyDoorSlideDeltas } from "./doors";
 import { setDoorSlideDeltas } from "./adapter";
 import { roomIdFromSeed } from "./stationAtlas";
 import type { FurnitureRecord } from "./furnitureDoc";
-import { findDoor, DOORS } from "./doors";
+import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
+import { subscribeDoorLayout, readAllDoorLayout } from "./doorLayoutDoc";
+import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
   buildVestibule,
   buildConnectorChain,
@@ -336,6 +338,12 @@ export class World {
     // re-notifies on every room (re)bind, and reconcile is a no-op until the
     // docking system exists.
     subscribeDoors(() => this.reconcileDoors(readAllDoors()));
+
+    // Door-LAYOUT sync (#28 S4): reconcile WHICH doors the room has from the
+    // shared `doorLayout` map. Subscribed ONCE here — doorLayoutDoc re-notifies
+    // on every room (re)bind, and reconcile no-ops until the docking system
+    // exists / the map is seeded (un-migrated rooms keep the cardinal defaults).
+    subscribeDoorLayout(() => this.reconcileDoorLayout(readAllDoorLayout()));
 
     console.log("✅ World initialized - Station planet ready");
   }
@@ -995,6 +1003,22 @@ export class World {
     setDoorSlideDeltas(deltas);
     this.dockingSystem?.repositionDoorGroups(deltas);
     this.updateNorthDoorForFireplace();
+  }
+
+  /**
+   * 🚪↔🛰️ #28 S4: reconcile WHICH doors the room has from the shared
+   * `doorLayout` map (doorLayoutDoc). MEMBERSHIP only — rebuildDoors adds/removes
+   * DOORS entries; positions are then set by reconcileDoorPlacements and the
+   * click bodies re-tagged. An UNSEEDED room (empty map) keeps the local cardinal
+   * defaults, so un-migrated rooms are byte-identical. No-op until ports exist.
+   * (Distinct from reconcileDoors, which is the door-PAIRING reconcile.)
+   */
+  public reconcileDoorLayout(records: Map<string, DoorLayoutRecord>): void {
+    if (records.size === 0) return; // unseeded → keep the local cardinal defaults
+    if (!this.dockingSystem) return; // docking ports not built yet
+    rebuildDoors(records);
+    this.reconcileDoorPlacements();
+    this.dockingSystem.refreshDoorInteractivity();
   }
 
   /**

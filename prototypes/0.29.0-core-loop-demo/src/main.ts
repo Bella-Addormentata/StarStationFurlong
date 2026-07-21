@@ -89,6 +89,11 @@ import {
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import { bindFloorPlan, subscribeFloorPlan } from "./floorPlanDoc";
 import {
+  bindDoorLayoutDoc,
+  seedDoorLayoutDefaults,
+  doorLayoutDocSize,
+} from "./doorLayoutDoc";
+import {
   bindRoomRoles,
   subscribeRoomRoles,
   readCoHostRequests,
@@ -1128,6 +1133,12 @@ async function joinRoomAtEpoch(
   bindFloorPlan(sync.doc);
   world?.reconcileDoorPlacements();
 
+  // 🚪↔🛰️ #28 S4: the door-LAYOUT map (WHICH doors the room has) rides the doc,
+  // separate from the pairing map + floor-plan position. Binding re-notifies →
+  // world.reconcileDoorLayout runs immediately (a joiner sees the host's door
+  // set); an unseeded room keeps the local cardinal defaults.
+  bindDoorLayoutDoc(sync.doc);
+
   // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
   harvestStationAtlas();
 
@@ -1303,6 +1314,12 @@ async function joinRoomAtEpoch(
       }
       if (ownsRoom && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
+      }
+      // 🚪↔🛰️ #28 S4: publish the current cardinal door set so joiners converge
+      // (idempotent — no-op once seeded). Position stays in floorPlan; this is
+      // membership only. Un-seeded rooms keep the local defaults regardless.
+      if (ownsRoom && doorLayoutDocSize() === 0) {
+        seedDoorLayoutDefaults();
       }
       // 🧱 Retired default: the fireplace/bookcase wall no longer ships with
       // the lobby (the paired doors + glassy tile panel own the north wall).
