@@ -346,6 +346,8 @@ const REMOTE_REAPER_SWEEP_MS = 2_000;
 let lastReaperSweep = 0;
 let pendingBootstrapOverride: RoomBootstrap | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
+/** 🆕 #79 P4: guards a single home-fallback if resuming the last room fails. */
+let resumeRetried = false;
 let networkPanelInitialized = false;
 let phoneOverlayInitialized = false;
 // ── Adapter transit state (T1 of issue #30) ──────────────────────────────────
@@ -682,11 +684,28 @@ function refreshConnectionTypeRow(): void {
 }
 
 async function bootstrapNetworking() {
+  // 🆕 #79 P4: true while this boot is resuming a persisted last room, so a
+  // dial failure (that room's host offline) can fall back to home once.
+  let resumingLastRoom = false;
   try {
     // One-time UI init: phone input behaviors, hooks, and date-stamps
     // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
+    // 🆕 #79 P4: resume the room the player last shut down in (persisted on
+    // entry). Only when there's no explicit override — a ?seed=/Use-link import
+    // always wins — and it becomes a normal JOIN into that room.
+    if (!pendingBootstrapOverride) {
+      try {
+        const saved = localStorage.getItem("ssf-last-room");
+        if (saved) {
+          pendingBootstrapOverride = JSON.parse(atob(saved)) as RoomBootstrap;
+          resumingLastRoom = true;
+        }
+      } catch {
+        localStorage.removeItem("ssf-last-room");
+      }
+    }
     const override = pendingBootstrapOverride;
     let boot = override ?? (await fetchDefaultBootstrap());
     // Stale-cert self-dial guard (node-restart bug): an override captured
@@ -745,6 +764,17 @@ async function bootstrapNetworking() {
     // this catch (superseded joins return silently from joinRoom), so the
     // epoch bump inside leaveRoom cannot cancel a newer in-flight join.
     await leaveRoom();
+    // 🆕 #79 P4: if the RESUME into the last room failed (its host is offline),
+    // forget it and fall back to the home station — once (resumeRetried guards
+    // an infinite loop if home also fails). A normal pass-import failure is NOT
+    // a resume, so it keeps its existing offline diagnostics below.
+    if (resumingLastRoom && !resumeRetried) {
+      resumeRetried = true;
+      localStorage.removeItem("ssf-last-room");
+      pendingBootstrapOverride = null;
+      console.warn("Resume into last room failed — falling back to home.");
+      return bootstrapNetworking();
+    }
     console.warn("Failed to bootstrap connection link:", err);
     updateHUDP2P("OFFLINE", "#ff1744");
     const fp = await fetchLocalFingerprint();
@@ -867,6 +897,20 @@ async function joinRoomAtEpoch(
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
   updateHUDP2P("CONNECTED", "#00e676");
+
+  // 🆕 #79 P4: remember this room so a returning boot resumes here. The home
+  // room reconnects from the LIVE local node (its loopback cert drifts across
+  // restarts), so persist ONLY non-home rooms; entering home clears the resume
+  // target. Stored as a base64 RoomBootstrap — the same shape a pass carries.
+  try {
+    if (boot.roomId === getDefaultRoomId()) {
+      localStorage.removeItem("ssf-last-room");
+    } else {
+      localStorage.setItem("ssf-last-room", btoa(JSON.stringify(boot)));
+    }
+  } catch {
+    /* privacy mode — resume is best-effort */
+  }
 
   // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
   // every player is part of the hosting fabric unless their connection
