@@ -3647,24 +3647,9 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
 
   // ── Lazy river: an irregular outer bank curls around the central hot-tub
   // island. The established swim bounds stay intact for multiplayer state.
-  const makeLazyRiver = () => {
-    const river = new THREE.Shape();
-    river.moveTo(-4.85, -1.35);
-    river.bezierCurveTo(-5.15, -2.35, -3.7, -2.9, -2.45, -2.58);
-    river.bezierCurveTo(-1.25, -2.28, -0.45, -2.88, 0.82, -2.62);
-    river.bezierCurveTo(2.15, -2.35, 3.4, -1.95, 3.2, -0.92);
-    river.bezierCurveTo(3.02, -0.05, 2.65, 0.48, 3.18, 1.18);
-    river.bezierCurveTo(3.62, 2.0, 2.05, 2.82, 0.72, 2.5);
-    river.bezierCurveTo(-0.48, 2.22, -1.2, 2.82, -2.52, 2.55);
-    river.bezierCurveTo(-3.82, 2.28, -5.0, 1.55, -4.68, 0.52);
-    river.bezierCurveTo(-4.42, -0.25, -5.08, -0.62, -4.85, -1.35);
-    river.closePath();
-
-    const island = new THREE.Path();
-    island.absellipse(0, 0, 1.55, 1.28, 0, Math.PI * 2, true);
-    river.holes.push(island);
-    return river;
-  };
+  // Hoisted to module scope (lazyRiverShape) so poolHoleCells cuts the floor to
+  // the SAME curve — the water and the hole always agree.
+  const makeLazyRiver = lazyRiverShape;
 
   // 🕳️ #80: solid rect pool BOTTOM across the full water footprint. With the
   // octagon floor hole cut, looking down the hole you see a real basin bottom
@@ -6167,11 +6152,72 @@ export function getPoolBasin(items: FurnitureItem[]): {
   return null;
 }
 
+/** 🌊 The lazy-river water outline (irregular bank + central island hole) in
+ *  the pool item's LOCAL frame. Shared by buildLazyPool (the water mesh) and
+ *  poolHoleCells (the floor hole), so the hole always matches the water. */
+function lazyRiverShape(): THREE.Shape {
+  const river = new THREE.Shape();
+  river.moveTo(-4.85, -1.35);
+  river.bezierCurveTo(-5.15, -2.35, -3.7, -2.9, -2.45, -2.58);
+  river.bezierCurveTo(-1.25, -2.28, -0.45, -2.88, 0.82, -2.62);
+  river.bezierCurveTo(2.15, -2.35, 3.4, -1.95, 3.2, -0.92);
+  river.bezierCurveTo(3.02, -0.05, 2.65, 0.48, 3.18, 1.18);
+  river.bezierCurveTo(3.62, 2.0, 2.05, 2.82, 0.72, 2.5);
+  river.bezierCurveTo(-0.48, 2.22, -1.2, 2.82, -2.52, 2.55);
+  river.bezierCurveTo(-3.82, 2.28, -5.0, 1.55, -4.68, 0.52);
+  river.bezierCurveTo(-4.42, -0.25, -5.08, -0.62, -4.85, -1.35);
+  river.closePath();
+  const island = new THREE.Path();
+  island.absellipse(0, 0, 1.55, 1.28, 0, Math.PI * 2, true);
+  river.holes.push(island);
+  return river;
+}
+
+/** Even-odd point-in-polygon (ray cast). `poly` is a closed ring of {x,y}. */
+function pointInPoly(px: number, py: number, poly: Array<{ x: number; y: number }>): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i],
+      b = poly[j];
+    if (a.y > py !== b.y > py && px < ((b.x - a.x) * (py - a.y)) / (b.y - a.y) + a.x)
+      inside = !inside;
+  }
+  return inside;
+}
+
 /**
- * 🕳️ #80: the world XZ rectangle to cut from the SOLID octagon floor for a
- * pool — the FULL water footprint (west waterline → east tile wall × ±halfZ),
- * so the solid floor never caps the outer water. Rotates/offsets with the item
- * (cardinal rots only, like getPoolBasin). Null when there's no pool.
+ * 🕳️ #80: the set of 1 m FLOOR CELLS (`"i,j"`, cell = world [i,i+1]×[j,j+1])
+ * the pool water actually covers — sampled against the lazy-river outline so
+ * the floor is punched to the water's TRUE shape (deck cells keep their floor),
+ * not a bounding box. The water Shape's y maps to local −z (the mesh is
+ * rotateX(−π/2)), so we test (localX, −localZ). Empty when there's no pool.
+ */
+export function poolHoleCells(items: FurnitureItem[]): Set<string> {
+  const cells = new Set<string>();
+  const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+  if (!pool) return cells;
+  const shape = lazyRiverShape();
+  const outer = shape.getPoints(64).map((p) => ({ x: p.x, y: p.y }));
+  const island = (shape.holes[0]?.getPoints(48) ?? []).map((p) => ({ x: p.x, y: p.y }));
+  const rect = poolHoleRect(items)!; // world bbox of the water footprint
+  const inv = ((4 - pool.rot) % 4) as Rot;
+  for (let i = Math.floor(rect.x0); i < Math.ceil(rect.x1); i++) {
+    for (let j = Math.floor(rect.z0); j < Math.ceil(rect.z1); j++) {
+      // cell CENTRE in world → pool LOCAL (inverse pose) → water shape coords
+      const l = rotXZ(i + 0.5 - pool.pos.x, j + 0.5 - pool.pos.z, inv);
+      if (pointInPoly(l.x, -l.z, outer) && !pointInPoly(l.x, -l.z, island)) {
+        cells.add(`${i},${j}`);
+      }
+    }
+  }
+  return cells;
+}
+
+/**
+ * 🕳️ #80: the world XZ rectangle bounding a pool's water footprint (west
+ * waterline → east tile wall × ±halfZ). Used for the water-cell scan bounds and
+ * the rect basin bottom. Rotates/offsets with the item (cardinal rots only,
+ * like getPoolBasin). Null when there's no pool.
  */
 export function poolHoleRect(
   items: FurnitureItem[],
