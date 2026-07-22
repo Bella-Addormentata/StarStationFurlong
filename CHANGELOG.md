@@ -12,6 +12,40 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.27 — 2026-07-22
+
+### 📸 Photo décor — six real-photo furniture pieces (bouquets + balloons)
+
+A new décor category: the owner's own product photos as placeable furniture.
+Four flower bouquets, a floor balloon bunch, and a wall-hung balloon variant —
+all spawnable from the DEV menu's FURNITURE list, movable/deletable with the
+right-click context menu, decorative (footprint null, never an obstacle).
+
+- **The set:** 😊 SMILEY BOUQUET (1.45 m) · 🌹 ROSE BOUQUET (1.45 m) ·
+  💜 PURPLE BOUQUET (1.35 m) · 🪻 LAVENDER BOUQUET (1.45 m) ·
+  🎈 BIRTHDAY BALLOONS (1.5 m, the tallest) · 🎈 BALLOONS (WALL-HUNG)
+  (1.2 m single plane at wall height).
+- **One engine, `buildPhotoStandee(ctx, spec)`:** crossed planes (the
+  Minecraft-flower idiom) or a single wall plane; the white studio backdrop is
+  keyed at load by a **border flood fill** — only background-CONNECTED
+  near-white pixels turn transparent, so interior whites (white daisies, glass
+  highlights, foil balloons) survive; +15 % brightness lift and the map doubles
+  as a soft emissiveMap so photos stay vivid under dim room light; smooth
+  filtering + mipmaps + max anisotropy keep fine print (balloon lettering)
+  legible — NearestFilter shredded it (owner feedback "not clear").
+- **Wall hanging via `zOff`:** decorative placement clamps the item ORIGIN to
+  ≥1 m inside the walls, so the wall variant's plane reaches 0.95 m out of the
+  origin — park the item on the lattice line nearest a wall, R-rotate, and the
+  picture lands on the wall face (5 cm proud, no z-fighting).
+- Adding another photo piece is now four small steps: drop a JPEG in
+  `public/assets/`, one union entry, a two-line builder off the shared
+  `PHOTO_DECOR` spec, one DEFS entry.
+- Verified live: all six spawn, move, delete and sync; backgrounds key cleanly
+  (glass vase reads as real transparency); the wall balloons hang on any of the
+  four walls; missing-asset loads warn instead of failing silently; `tsc` clean.
+- **Release line:** version bumped to 0.33.27, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
 ## v0.33.26 — 2026-07-22
 
 ### ⏏ UNDOCK a permanently docked module from the door panel

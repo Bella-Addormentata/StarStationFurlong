@@ -1,6 +1,6 @@
 [package]
 name = "ssf-p2p-node"
-version = "0.33.26"
+version = "0.33.27"
 edition = "2021"
 publish = false
 description = "Sovereign P2P Swarm Node & WebTransport Router (Phase 2 P2P Backbone)"

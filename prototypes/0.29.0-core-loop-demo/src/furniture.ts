@@ -64,6 +64,12 @@ export type FurnitureKind =
   | "rug-front"
   | "cherry-tree"
   | "blossom-pot"
+  | "smiley-bouquet"
+  | "rose-bouquet"
+  | "purple-bouquet"
+  | "lavender-bouquet"
+  | "birthday-balloons"
+  | "birthday-balloons-wall"
   | "wall-computer"
   | "map-table"
   | "storage-trunk"
@@ -1182,6 +1188,165 @@ const buildCherryTree = ({ m, place }: BuildCtx) => {
 
 // Small cherry blossom accent (sits at lamp-table top height).
 const buildBlossomPot = (ctx: BuildCtx) => roundPlant(ctx, 0, 0.56, 0);
+
+// 📸 Photo décor (owner request 2026-07-22): a real photo as furniture — the
+// owner's JPEG on crossed planes (the Minecraft-flower idiom) or a single
+// wall-hung plane. A voxel remodel of the first one read as ugly; the photo
+// IS the wanted look. Product photos ship on a white studio backdrop, so each
+// is keyed at load: a flood fill FROM THE BORDERS marks the background-
+// connected near-white pixels transparent (interior whites — white daisies,
+// glass highlights, foil balloons — are unreachable from the border and
+// survive), then the canvas becomes the texture, smooth-filtered so fine
+// print stays legible (see the filter note at the texture).
+
+/** One photo-décor piece — consumed by buildPhotoStandee. */
+interface PhotoDecorSpec {
+  url: string;
+  /** Plane width in metres (height = width × aspect). */
+  width: number;
+  /** Photo height / width. */
+  aspect: number;
+  /** >1 lifts the photo's RGB at key time (clamped at 255). */
+  brightness?: number;
+  /** Bottom edge's height above the floor — wall/hanging décor. */
+  lift?: number;
+  /** false ⇒ a SINGLE plane (flat wall décor); default: crossed pair. */
+  crossed?: boolean;
+  /**
+   * Local +z reach of the plane from the item origin. Wall décor needs it:
+   * decorative placement clamps the ORIGIN to ≥1 m inside the walls
+   * (validatePlacement's halfX-1 bounds), so a 0.95 reach parks the plane
+   * on the wall face when the item sits on the closest lattice line and is
+   * R-rotated to face it (5 cm proud — no z-fighting with the wall).
+   */
+  zOff?: number;
+}
+
+const buildPhotoStandee = (ctx: BuildCtx, spec: PhotoDecorSpec) => {
+  const { m, place } = ctx;
+  const {
+    url,
+    width: W,
+    aspect,
+    brightness = 1,
+    lift = 0,
+    crossed = true,
+    zOff = 0,
+  } = spec;
+  const H = W * aspect;
+  const cy = lift + H / 2; // plane centre height
+
+  // Crossed planes read from every isometric angle (floor standees); flat
+  // wall décor uses a single plane the player turns against a wall with R.
+  // One shared material: unmapped (white) until the async key finishes, then
+  // the CanvasTexture lands via needsUpdate — the mars.png loading pattern.
+  // alphaTest hard-clips the keyed edge so the planes never alpha-sort
+  // against each other. The map doubles as a soft emissiveMap so the photo
+  // stays vivid under dim room light (owner request: brighter).
+  const mat = m(0xffffff, 0.85, 0.0, 0xffffff, 0.32);
+  mat.transparent = true;
+  mat.alphaTest = 0.4;
+  mat.side = THREE.DoubleSide;
+  const plane = new THREE.PlaneGeometry(W, H);
+  place(plane, mat, 0, cy, zOff);
+  if (crossed) place(plane.clone(), mat, 0, cy, zOff, Math.PI / 2);
+
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const g = canvas.getContext('2d');
+    if (!g) return; // no 2D context → the white standee stays; nothing breaks
+    g.drawImage(img, 0, 0);
+    const px = g.getImageData(0, 0, canvas.width, canvas.height);
+    const d = px.data;
+    const wpx = canvas.width;
+    const hpx = canvas.height;
+    // Backdrop test: bright and unsaturated (white wall + the soft grey
+    // product shadow both pass; yellows/greens never do).
+    const isBackdrop = (i: number): boolean => {
+      const r = d[i * 4];
+      const gr = d[i * 4 + 1];
+      const b = d[i * 4 + 2];
+      return (
+        Math.min(r, gr, b) > 190 && Math.max(r, gr, b) - Math.min(r, gr, b) < 26
+      );
+    };
+    // Border flood fill (4-neighbour): only background-CONNECTED pixels key.
+    const visited = new Uint8Array(wpx * hpx);
+    const stack: number[] = [];
+    for (let x = 0; x < wpx; x++) stack.push(x, (hpx - 1) * wpx + x);
+    for (let y = 0; y < hpx; y++) stack.push(y * wpx, y * wpx + wpx - 1);
+    while (stack.length > 0) {
+      const p = stack.pop()!;
+      if (visited[p] || !isBackdrop(p)) continue;
+      visited[p] = 1;
+      d[p * 4 + 3] = 0;
+      const x = p % wpx;
+      if (x > 0) stack.push(p - 1);
+      if (x < wpx - 1) stack.push(p + 1);
+      if (p >= wpx) stack.push(p - wpx);
+      if (p < wpx * (hpx - 1)) stack.push(p + wpx);
+    }
+    // Brightness lift (after the key, surviving pixels only).
+    if (brightness !== 1) {
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] === 0) continue;
+        d[i] = Math.min(255, d[i] * brightness);
+        d[i + 1] = Math.min(255, d[i + 1] * brightness);
+        d[i + 2] = Math.min(255, d[i + 2] * brightness);
+      }
+    }
+    g.putImageData(px, 0, 0);
+    const tex = new THREE.CanvasTexture(canvas);
+    // Smooth filtering, NOT mars.png's NearestFilter: photos carry fine
+    // detail (balloon lettering) that nearest-neighbour shreds into noise —
+    // owner feedback "not clear". Mipmaps + max anisotropy keep the print
+    // legible at the isometric viewing angle and distance.
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.generateMipmaps = true;
+    tex.anisotropy =
+      window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    mat.map = tex;
+    mat.emissiveMap = tex; // self-lit photo — vivid even in a dim room
+    mat.needsUpdate = true;
+  };
+  img.onerror = () =>
+    console.warn(`📸 photo décor: could not load ${url} — white placeholder stays`);
+  img.src = url;
+};
+
+// The photo-décor set — the owner's 590×689 product photos, statement-sized
+// and brightness-lifted (owner requests: bigger than life, brighter colours).
+// Four bouquets, a floor balloon bunch, and a wall-hung balloon variant.
+const PHOTO_DECOR = { aspect: 689 / 590, brightness: 1.15 } as const;
+
+const buildSmileyBouquet = (ctx: BuildCtx) =>
+  buildPhotoStandee(ctx, { ...PHOTO_DECOR, url: '/assets/smiley-bouquet.jpg', width: 1.45 });
+const buildRoseBouquet = (ctx: BuildCtx) =>
+  buildPhotoStandee(ctx, { ...PHOTO_DECOR, url: '/assets/rose-bouquet.jpg', width: 1.45 });
+const buildPurpleBouquet = (ctx: BuildCtx) =>
+  buildPhotoStandee(ctx, { ...PHOTO_DECOR, url: '/assets/purple-bouquet.jpg', width: 1.35 });
+const buildLavenderBouquet = (ctx: BuildCtx) =>
+  buildPhotoStandee(ctx, { ...PHOTO_DECOR, url: '/assets/lavender-bouquet.jpg', width: 1.45 });
+// 🎈 Balloons float, so the bunch gets the tallest cut.
+const buildBirthdayBalloons = (ctx: BuildCtx) =>
+  buildPhotoStandee(ctx, { ...PHOTO_DECOR, url: '/assets/birthday-balloons.jpg', width: 1.5 });
+// 🎈 Wall-hung variant: a single flat plane at wall height, reaching 0.95 m
+// out of the origin — MOVE it to the lattice line nearest a wall and R-rotate
+// until the picture lands ON the wall face (see PhotoDecorSpec.zOff).
+const buildBirthdayBalloonsWall = (ctx: BuildCtx) =>
+  buildPhotoStandee(ctx, {
+    ...PHOTO_DECOR,
+    url: '/assets/birthday-balloons.jpg',
+    width: 1.2,
+    lift: 0.9,
+    crossed: false,
+    zOff: 0.95,
+  });
 
 // Bar corner (right-front, hugging x=+6 wall) — composite, moves as ONE unit.
 const buildBarCorner = (ctx: BuildCtx) => {
@@ -2723,6 +2888,36 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "blossom-pot": {
     kind: "blossom-pot",
     build: buildBlossomPot,
+    footprint: null,
+  },
+  "smiley-bouquet": {
+    kind: "smiley-bouquet",
+    build: buildSmileyBouquet,
+    footprint: null,
+  },
+  "rose-bouquet": {
+    kind: "rose-bouquet",
+    build: buildRoseBouquet,
+    footprint: null,
+  },
+  "purple-bouquet": {
+    kind: "purple-bouquet",
+    build: buildPurpleBouquet,
+    footprint: null,
+  },
+  "lavender-bouquet": {
+    kind: "lavender-bouquet",
+    build: buildLavenderBouquet,
+    footprint: null,
+  },
+  "birthday-balloons": {
+    kind: "birthday-balloons",
+    build: buildBirthdayBalloons,
+    footprint: null,
+  },
+  "birthday-balloons-wall": {
+    kind: "birthday-balloons-wall",
+    build: buildBirthdayBalloonsWall,
     footprint: null,
   },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the

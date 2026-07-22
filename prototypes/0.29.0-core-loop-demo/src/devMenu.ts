@@ -98,6 +98,12 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
  *  (world.reconcileRobots), so label it so it's findable. */
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
+  'smiley-bouquet': '😊 SMILEY BOUQUET',
+  'rose-bouquet': '🌹 ROSE BOUQUET',
+  'purple-bouquet': '💜 PURPLE BOUQUET (BIG)',
+  'lavender-bouquet': '🪻 LAVENDER BOUQUET',
+  'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
+  'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
 };
 
 type GetWorld = () => World | null;
