@@ -84,6 +84,10 @@ import {
 import {
   writeWindowLayout, deleteWindowLayout, readAllWindowLayout, WINDOW_DEFAULT,
 } from './windowLayoutDoc';
+import { writeWallpaper, readAllWallpaper } from './wallpaperLayoutDoc';
+import {
+  WALLPAPER_PRESETS, WALLPAPER_LABELS, type WallpaperPresetId,
+} from './wallpaper';
 import { SURFACES } from './hullSection';
 import type { HullSurface } from './hullSection';
 import { PLAYER_R } from './player';
@@ -561,6 +565,17 @@ class RoomEditController {
   /** 🪟 #80 S4: persistent ＋ WINDOW button (under ＋ DOOR) — toggles the
    *  add-window sub-mode; only shown under the octagon-hull preview. */
   private addWindowBtnEl: HTMLButtonElement | null = null;
+  /** 🖼️ #80 S6: persistent 🖼 WALLPAPER button (under ＋ WINDOW) — toggles the
+   *  wall-covering sub-mode; only shown under the octagon-hull preview. */
+  private wallpaperBtnEl: HTMLButtonElement | null = null;
+  /** 🖼️ #80 S6: the wall-covering editor is armed (pick a surface + preset —
+   *  applies live to the hull). Exclusive with add-door / add-window. */
+  private wallpaperMode = false;
+  /** The surface being re-skinned (any of the 8 strips). */
+  private wallpaperSurface: HullSurface = 'wall-neg';
+  /** Whether the 🖼 WALLPAPER button belongs on screen for the current scope
+   *  (interior + octagon) — so disarming add-window can restore it. */
+  private wallpaperEligible = false;
   private labelAnchor = new THREE.Vector3();
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
@@ -608,6 +623,11 @@ class RoomEditController {
       // 🪟 #80 S4: ditto an armed add-window sub-mode.
       if (this.addWindowMode) {
         this.setAddWindowMode(false);
+        return;
+      }
+      // 🖼️ #80 S6: ditto an armed wallpaper sub-mode.
+      if (this.wallpaperMode) {
+        this.setWallpaperMode(false);
         return;
       }
       this.exit();
@@ -761,9 +781,14 @@ class RoomEditController {
     // 🪟 #80 S4: the ＋ WINDOW affordance rides the octagon-hull preview only
     // (windows are holes in the octagon side walls) and is interior-scope.
     if (scope !== 'hull' && OCTAGON_HULL) this.showAddWindowButton();
+    // 🖼️ #80 S6: the 🖼 WALLPAPER affordance is octagon-only + interior-scope too.
+    if (scope !== 'hull' && OCTAGON_HULL) {
+      this.wallpaperEligible = true;
+      this.showWallpaperButton();
+    }
     showHint(scope === 'hull'
       ? 'HULL EDIT — drag tanks/engines onto the walls or each other · stacks cap at 3 · X removes · DONE EDITING (or ESC) exits'
-      : `EDIT MODE — click furniture / a door${OCTAGON_HULL ? ' / a window' : ''} to select · ＋ DOOR${OCTAGON_HULL ? ' / ＋ WINDOW' : ''} adds · X removes · DONE EDITING (or ESC) exits`, 4000);
+      : `EDIT MODE — click furniture / a door${OCTAGON_HULL ? ' / a window' : ''} to select · ＋ DOOR${OCTAGON_HULL ? ' / ＋ WINDOW / 🖼 WALLPAPER' : ''} · X removes · DONE EDITING (or ESC) exits`, 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
@@ -772,11 +797,14 @@ class RoomEditController {
     this.cancelCarry(false); // E3: never exit with an item in hand
     this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
     this.setAddWindowMode(false); // 🪟 #80 S4: drop any armed add-window sub-mode
+    this.setWallpaperMode(false); // 🖼️ #80 S6: drop any armed wallpaper sub-mode
+    this.wallpaperEligible = false;
     this.setHovered(null);
     this.setSelected(null);
     this.hideExitButton();
     this.hideAddDoorButton();
     this.hideAddWindowButton();
+    this.hideWallpaperButton();
     this.disposeDoorGhost(); // 🚪 #28 S6b/ghost: no leaked preview after the session
     this.disposeWindowGhost(); // 🪟 #80 S4/ghost: ditto the window preview
     window.removeEventListener('mousemove', this.onMouseMove);
@@ -2284,7 +2312,8 @@ class RoomEditController {
     }
     this.addDoorMode = on;
     if (on) {
-      this.setAddWindowMode(false); // 🪟 the two add sub-modes are exclusive
+      this.setAddWindowMode(false); // 🪟 the add/wallpaper sub-modes are exclusive
+      this.setWallpaperMode(false); // 🖼️ #80 S6
       this.setSelected(null);
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
@@ -2373,7 +2402,11 @@ class RoomEditController {
     }
     this.addWindowMode = on;
     if (on) {
-      this.setAddDoorMode(false); // 🚪 the two add sub-modes are exclusive
+      this.setAddDoorMode(false); // 🚪 the add/wallpaper sub-modes are exclusive
+      this.setWallpaperMode(false); // 🖼️ #80 S6
+      // The window surface selector sits where the 🖼 WALLPAPER button lives —
+      // hide the button while armed so they don't overlap (restored on disarm).
+      this.hideWallpaperButton();
       this.setSelected(null);
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
@@ -2386,6 +2419,7 @@ class RoomEditController {
       this.setCanvasCursor('');
       this.hideWindowGhost();
       this.hideWindowSurfaceSelector();
+      if (this.wallpaperEligible) this.showWallpaperButton(); // restore the 🖼 row
       this.windowSizeOverride = null; // next arm starts at the surface auto-fit
       // Drop the stale pointer sample so a re-arm + surface-cycle before the
       // next mousemove doesn't re-pose the ghost to an old screen point.
@@ -2480,6 +2514,203 @@ class RoomEditController {
     if (this.lastPointer.has) {
       this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
     }
+  }
+
+  // ── 🖼 WALLPAPER button + wall-covering sub-mode (#80 S6) ────────────────────
+
+  /**
+   * 🖼️ #80 S6: the persistent 🖼 WALLPAPER button (under ＋ WINDOW). Toggles the
+   * wall-covering sub-mode; while armed its border/colour flip to green and the
+   * label reads ✕ CANCEL WALLPAPER. Octagon-only + interior-scope.
+   */
+  private showWallpaperButton(): void {
+    if (!this.wallpaperBtnEl) {
+      this.wallpaperBtnEl = document.createElement('button');
+      this.wallpaperBtnEl.id = 'room-edit-wallpaper-btn';
+      this.wallpaperBtnEl.type = 'button';
+      this.wallpaperBtnEl.title = 'Re-skin a hull wall — pick a surface + covering';
+      this.wallpaperBtnEl.style.cssText = `
+        position: fixed;
+        top: 128px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 6px 18px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(201, 163, 255, 0.7);
+        border-radius: 8px;
+        color: #c9a3ff;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      this.wallpaperBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.setWallpaperMode(!this.wallpaperMode);
+      });
+      document.body.appendChild(this.wallpaperBtnEl);
+    }
+    this.wallpaperBtnEl.style.display = 'block';
+    this.syncWallpaperButton();
+  }
+
+  private hideWallpaperButton(): void {
+    if (this.wallpaperBtnEl) this.wallpaperBtnEl.style.display = 'none';
+  }
+
+  /** Reflect the armed/idle wallpaper state onto the 🖼 WALLPAPER button. */
+  private syncWallpaperButton(): void {
+    const btn = this.wallpaperBtnEl;
+    if (!btn) return;
+    if (this.wallpaperMode) {
+      btn.textContent = '✕ CANCEL WALLPAPER';
+      btn.style.color = '#35d06a';
+      btn.style.borderColor = 'rgba(53, 208, 106, 0.85)';
+    } else {
+      btn.textContent = '🖼 WALLPAPER';
+      btn.style.color = '#c9a3ff';
+      btn.style.borderColor = 'rgba(201, 163, 255, 0.7)';
+    }
+  }
+
+  /**
+   * 🖼️ #80 S6: arm / disarm the wallpaper sub-mode. Arming disarms add-door /
+   * add-window (all exclusive), clears any selection and shows the surface +
+   * covering panel; a covering applies LIVE (writeWallpaper → the hull rebuilds
+   * via world.reconcileWallpaper). Disarming just hides the panel.
+   */
+  private setWallpaperMode(on: boolean): void {
+    if (this.wallpaperMode === on) {
+      this.syncWallpaperButton();
+      return;
+    }
+    this.wallpaperMode = on;
+    if (on) {
+      this.setAddDoorMode(false);
+      this.setAddWindowMode(false);
+      this.setSelected(null);
+      this.setHovered(null);
+      this.showWallpaperPanel();
+      showHint('WALLPAPER — ◀ ▶ pick a surface + covering · applies live · 🖼/✕ to cancel', 4200);
+    } else {
+      this.hideWallpaperPanel();
+    }
+    this.syncWallpaperButton();
+  }
+
+  /** The floating two-row panel (Surface / Covering) shown while armed. */
+  private wallpaperPanelEl: HTMLDivElement | null = null;
+
+  private showWallpaperPanel(): void {
+    if (!this.wallpaperPanelEl) {
+      const panel = document.createElement('div');
+      panel.id = 'room-edit-wallpaper-panel';
+      panel.style.cssText = `
+        position: fixed;
+        top: 164px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        padding: 6px 8px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(201, 163, 255, 0.6);
+        border-radius: 8px;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        color: #c9a3ff;
+        z-index: 4700;
+        white-space: nowrap;
+      `;
+      const mkRow = (
+        tag: string,
+        labelId: string,
+        onArrow: (delta: number) => void,
+      ): HTMLDivElement => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; align-items: center; gap: 8px;';
+        const mkArrow = (txt: string, delta: number): HTMLButtonElement => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = txt;
+          b.style.cssText = `
+            background: rgba(201, 163, 255, 0.14);
+            border: 1px solid rgba(201, 163, 255, 0.5);
+            border-radius: 5px;
+            color: #c9a3ff;
+            font: inherit;
+            padding: 2px 8px;
+            cursor: pointer;
+          `;
+          b.addEventListener('click', (e) => {
+            e.stopPropagation();
+            (e.currentTarget as HTMLButtonElement).blur();
+            onArrow(delta);
+          });
+          return b;
+        };
+        const tagEl = document.createElement('span');
+        tagEl.textContent = tag;
+        tagEl.style.cssText = 'min-width: 62px; opacity: 0.75;';
+        const label = document.createElement('span');
+        label.id = labelId;
+        label.style.cssText = 'min-width: 120px; text-align: center;';
+        row.appendChild(tagEl);
+        row.appendChild(mkArrow('◀', -1));
+        row.appendChild(label);
+        row.appendChild(mkArrow('▶', 1));
+        return row;
+      };
+      panel.appendChild(
+        mkRow('Surface', 'room-edit-wp-surface', (d) => this.cycleWallpaperSurface(d)),
+      );
+      panel.appendChild(
+        mkRow('Covering', 'room-edit-wp-preset', (d) => this.cycleWallpaperPreset(d)),
+      );
+      document.body.appendChild(panel);
+      this.wallpaperPanelEl = panel;
+    }
+    this.wallpaperPanelEl.style.display = 'flex';
+    this.syncWallpaperPanel();
+  }
+
+  private hideWallpaperPanel(): void {
+    if (this.wallpaperPanelEl) this.wallpaperPanelEl.style.display = 'none';
+  }
+
+  /** The covering currently painted on the active surface (`plain` if none). */
+  private currentWallpaperPreset(): WallpaperPresetId {
+    return readAllWallpaper().get(this.wallpaperSurface) ?? 'plain';
+  }
+
+  private syncWallpaperPanel(): void {
+    const surfLabel = document.getElementById('room-edit-wp-surface');
+    if (surfLabel) surfLabel.textContent = SURFACE_LABEL[this.wallpaperSurface];
+    const presetLabel = document.getElementById('room-edit-wp-preset');
+    if (presetLabel) presetLabel.textContent = WALLPAPER_LABELS[this.currentWallpaperPreset()];
+  }
+
+  /** Cycle which surface we're re-skinning (wraps); reloads its covering label. */
+  private cycleWallpaperSurface(delta: number): void {
+    const i = SURFACES.indexOf(this.wallpaperSurface);
+    this.wallpaperSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
+    this.syncWallpaperPanel();
+  }
+
+  /** Cycle the active surface's covering (wraps) and APPLY it live to the hull. */
+  private cycleWallpaperPreset(delta: number): void {
+    const cur = this.currentWallpaperPreset();
+    const i = WALLPAPER_PRESETS.indexOf(cur);
+    const next = WALLPAPER_PRESETS[(i + delta + WALLPAPER_PRESETS.length) % WALLPAPER_PRESETS.length];
+    writeWallpaper(this.wallpaperSurface, next); // → world.reconcileWallpaper rebuilds
+    this.syncWallpaperPanel();
   }
 
   /** Reproject the label (above) + REMOVE button (below) every frame. */

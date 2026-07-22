@@ -36,6 +36,7 @@ import {
   type StripEdge,
   type HullSurface,
 } from './hullSection';
+import { resolveWallpaper, type WallpaperPresetId, type WallpaperSpec } from './wallpaper';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
 /** First-person resting opacities (you're INSIDE — see everything). The roof is
@@ -95,14 +96,20 @@ export interface WindowOpening {
 /** Openings per hull surface (any of the 8 barrel strips). */
 export type HullWindows = Partial<Record<HullSurface, WindowOpening[]>>;
 
+/** 🖼️ #80 S6: a wall-covering preset per hull surface (any of the 8 strips).
+ *  Absent / `plain` → the bare hull colour. Painted on by the wallpaper editor. */
+export type HullWallpapers = Partial<Record<HullSurface, WallpaperPresetId>>;
+
 /**
  * Build the octagon hull for the given room half-extents (+ optional tuning).
  * `windows` cuts rounded-rect openings in the two side walls (look outside).
+ * `wallpapers` paints a covering texture onto individual strips (#80 S6).
  * `world.ts` calls this behind the flag and adds `.group` to platformGroup.
  */
 export function buildOctagonHull(
   opts: HullSectionOpts,
   windows: HullWindows = {},
+  wallpapers: HullWallpapers = {},
 ): OctagonHull {
   const profile = computeOctagonProfile(opts);
   const {
@@ -126,11 +133,16 @@ export function buildOctagonHull(
   const roofMeshes: HullMesh[] = [];
   const basementMeshes: HullMesh[] = [];
 
-  const mkMat = (color: number, depthWrite = true) => {
+  // A hull face material. With a wallpaper `wp` it wears that covering's texture
+  // + finish (the map tiles in strip-local metres — see wallpaper.ts); without
+  // one it's the flat hull colour. Either way it stays transparent + DoubleSide
+  // so updateFacing's per-frame opacity/visibility cutaway drives it unchanged.
+  const mkMat = (color: number, depthWrite = true, wp: WallpaperSpec | null = null) => {
     const mat = new THREE.MeshStandardMaterial({
-      color,
-      roughness: 0.55,
-      metalness: 0.15,
+      color: wp ? wp.color : color,
+      map: wp ? wp.map : null,
+      roughness: wp ? wp.roughness : 0.55,
+      metalness: wp ? wp.metalness : 0.15,
       transparent: true,
       opacity: 1,
       side: THREE.DoubleSide, // far wall shows its INSIDE face toward the camera
@@ -147,6 +159,8 @@ export function buildOctagonHull(
   edges.forEach((edge, edgeIndex) => {
     const surface = SURFACE_BY_EDGE[edgeIndex];
     const strip = surfaceEdge(profile, surface);
+    // 🖼️ this strip's optional wall covering (null when plain / absent).
+    const wp = resolveWallpaper(wallpapers[surface] ?? 'plain');
     // Clamp openings to fit the strip ONCE (drops any too big to fit), so the
     // hole and its glass share identical, in-bounds coordinates.
     const openings = clampedOpenings(windows[surface], strip, longHalf);
@@ -171,20 +185,20 @@ export function buildOctagonHull(
     }
 
     if (edge.kind === 'wall') {
-      const mat = mkMat(HULL_COLOR.wall);
+      const mat = mkMat(HULL_COLOR.wall, true, wp);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = 'octagon-wall';
       group.add(mesh);
       const which = surface === 'wall-neg' ? 'wall-neg' : 'wall-pos';
       wallFaces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which), glass });
     } else if (edge.kind.startsWith('roof')) {
-      const mat = mkMat(HULL_COLOR.roof);
+      const mat = mkMat(HULL_COLOR.roof, true, wp);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = `octagon-${edge.kind}`;
       group.add(mesh);
       roofMeshes.push({ mesh, material: mat, glass });
     } else {
-      const mat = mkMat(HULL_COLOR.basement);
+      const mat = mkMat(HULL_COLOR.basement, true, wp);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = `octagon-${edge.kind}`;
       group.add(mesh);
@@ -567,11 +581,20 @@ function stripGeometry(
 ): THREE.BufferGeometry {
   const { p0, dir, edgeLen } = strip;
   if (openings.length === 0) {
+    // Strip-local UVs in METRES (u = along, v = across) so a wallpaper texture
+    // tiles at a fixed per-metre scale — matching the ShapeGeometry path below,
+    // whose UVs are the shape's own (along, across) coords.
     return quadGeometry(
       stripToWorld(narrowAxis, strip, -longHalf, 0),
       stripToWorld(narrowAxis, strip, -longHalf, edgeLen),
       stripToWorld(narrowAxis, strip, longHalf, edgeLen),
       stripToWorld(narrowAxis, strip, longHalf, 0),
+      [
+        { u: -longHalf, v: 0 },
+        { u: -longHalf, v: edgeLen },
+        { u: longHalf, v: edgeLen },
+        { u: longHalf, v: 0 },
+      ],
     );
   }
   const shape = new THREE.Shape();
@@ -586,12 +609,20 @@ function stripGeometry(
   return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, p0, dir);
 }
 
-/** A double-sided quad (two triangles) from four world corners. */
+/** A double-sided quad (two triangles a-b-c / a-c-d) from four world corners.
+ *  Optional `uvs` (per corner a,b,c,d) attach a UV attribute in the same winding
+ *  — used to tile a wallpaper texture; omit for the untextured caps. */
 function quadGeometry(
   a: { x: number; y: number; z: number },
   b: { x: number; y: number; z: number },
   c: { x: number; y: number; z: number },
   d: { x: number; y: number; z: number },
+  uvs?: [
+    { u: number; v: number },
+    { u: number; v: number },
+    { u: number; v: number },
+    { u: number; v: number },
+  ],
 ): THREE.BufferGeometry {
   const geo = new THREE.BufferGeometry();
   const pos = new Float32Array([
@@ -599,6 +630,19 @@ function quadGeometry(
     a.x, a.y, a.z, c.x, c.y, c.z, d.x, d.y, d.z,
   ]);
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  if (uvs) {
+    const [ua, ub, uc, ud] = uvs;
+    geo.setAttribute(
+      'uv',
+      new THREE.BufferAttribute(
+        new Float32Array([
+          ua.u, ua.v, ub.u, ub.v, uc.u, uc.v,
+          ua.u, ua.v, uc.u, uc.v, ud.u, ud.v,
+        ]),
+        2,
+      ),
+    );
+  }
   geo.computeVertexNormals();
   return geo;
 }

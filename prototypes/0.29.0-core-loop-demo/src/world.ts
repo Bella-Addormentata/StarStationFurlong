@@ -117,11 +117,15 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull } from "./octagonHull";
-import type { OctagonHull } from "./octagonHull";
+import type { OctagonHull, HullWallpapers } from "./octagonHull";
 import {
   readAllWindowLayout,
   subscribeWindowLayout,
 } from "./windowLayoutDoc";
+import {
+  readAllWallpaper,
+  subscribeWallpaperLayout,
+} from "./wallpaperLayoutDoc";
 import {
   surfaceCenterWorld,
   surfaceBasis,
@@ -387,6 +391,8 @@ export class World {
     subscribeDoorLayout(() => this.reconcileDoorLayout(readAllDoorLayout()));
     // 🪟 #80: rebuild the octagon hull (holes + glass) when windows change.
     subscribeWindowLayout(() => this.reconcileWindowLayout());
+    // 🖼️ #80 S6: rebuild the hull (wall coverings) when wallpaper changes.
+    subscribeWallpaperLayout(() => this.reconcileWallpaper());
 
     console.log("✅ World initialized - Station planet ready");
   }
@@ -944,10 +950,19 @@ export class World {
     this.octagonHull = buildOctagonHull(
       { halfX, halfZ },
       collectWindowOpenings(),
+      this.collectWallpaper(),
     );
     this.platformGroup.add(this.octagonHull.group);
     // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
     this.rebuildWindowClickBoxes();
+  }
+
+  /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
+   *  hull to paint (readAllWallpaper Map → the record buildOctagonHull wants). */
+  private collectWallpaper(): HullWallpapers {
+    const out: HullWallpapers = {};
+    for (const [surface, preset] of readAllWallpaper()) out[surface] = preset;
+    return out;
   }
 
   /** 🪟 #80 S4: live window click-boxes by id — the edit-mode raycast index
@@ -1091,6 +1106,17 @@ export class World {
     // 🪟 keep a live edit session's raycast index in sync with the window
     // boxes just rebuilt — a targeted window-slice rebuild that preserves the
     // current selection by id (mirrors reconcileDoorLayout → onDoorLayoutChanged).
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+  }
+
+  /**
+   * 🖼️ #80 S6: rebuild the octagon hull when the shared wall-covering set
+   * changes (paint / clear) — mirrors reconcileWindowLayout. The rebuild
+   * re-reads collectWallpaper so each strip's material follows the doc.
+   */
+  private reconcileWallpaper(): void {
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes
     if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
   }
 
@@ -1352,29 +1378,19 @@ export class World {
    * Called after every furniture reconcile and at platform build.
    */
   /**
-   * 🧱🪟 Modular walls (owner request): when a brick-wall / window-wall
-   * furniture item sits ON a structural side wall's line (|x| > 5 — the
-   * built-in bricks live at ±6), that side's built-in wall HIDES — the
-   * placed sections become the wall, and a window section becomes a real
-   * view out (stars, the planet, docked-module projections through the
-   * glass). Remove the sections and the built-in wall returns. Same
-   * furniture-drives-structure pattern as the fireplace/north door.
+   * 🖼️ #80 S6: the freestanding brick-wall / window-wall SEGMENTS that used to
+   * REPLACE a structural side wall are retired (the octagon hull is the wall now,
+   * re-skinnable via the wallpaper editor), so nothing covers the legacy side
+   * walls any more — `sideWallCovered` stays all-false. Kept only for the
+   * `?octagon=0` fallback path (the legacy box room); a no-op under the octagon
+   * default (sideWalls is empty). Still called after furniture reconciles / at
+   * platform build so the legacy walls track the hull-edit view.
    */
   public updateSideWallCoverage(): void {
-    // "On a side wall's line" = within 1 m of the ±halfX wall (default ±5).
-    const { halfX } = roomHalfExtents();
-    const nearWall = halfX - 1;
     this.sideWallCovered[0] = false;
     this.sideWallCovered[1] = false;
-    for (const item of FURNITURE) {
-      if (item.kind !== "brick-wall" && item.kind !== "window-wall") continue;
-      if (item.pos.x < -nearWall) this.sideWallCovered[0] = true;
-      if (item.pos.x > nearWall) this.sideWallCovered[1] = true;
-    }
-    // addSideWalls order: [0] = left (x=-6). The zoom machinery consults the
-    // flags too (it force-restores walls at interior levels otherwise).
-    this.sideWalls.forEach((wall, i) => {
-      wall.visible = !this.hullEditView && !this.sideWallCovered[i];
+    this.sideWalls.forEach((wall) => {
+      wall.visible = !this.hullEditView;
     });
     if (this.northWall) this.northWall.visible = !this.hullEditView;
   }

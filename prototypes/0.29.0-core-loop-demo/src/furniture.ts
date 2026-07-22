@@ -71,8 +71,6 @@ export type FurnitureKind =
   | "fuel-tank"
   | "engine-block"
   | "helm-console"
-  | "brick-wall"
-  | "window-wall"
   | "cashier-atm"
   | "roulette-table"
   | "casino-booth"
@@ -2828,18 +2826,9 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     mount: "exterior-wall",
     attach: { accepts: ["wall", "tankFace"] },
   },
-  // 🧱🪟 Modular wall sections (movable; placed on a side wall's line they
-  // replace the built-in brick — see world.updateSideWallCoverage).
-  "brick-wall": {
-    kind: "brick-wall",
-    build: buildBrickWall,
-    footprint: { w: 4, d: 1 },
-  },
-  "window-wall": {
-    kind: "window-wall",
-    build: buildWindowWall,
-    footprint: { w: 4, d: 1 },
-  },
+  // 🖼️ #80 S6: the old freestanding brick-wall / window-wall SEGMENTS retired —
+  // the octagon hull is the wall now, re-skinnable via the wallpaper editor
+  // (their brick look lives on as the `brick` wallpaper preset). See wallpaper.ts.
   // ── 🏝️ Poolside leisure anchors for the outdoor casino zone. ──
   // Interior leisure furniture (owner request: movable/removable like any
   // piece). No `mount` — a 7×6 pool / 3×3 tub is not a hull fitting, so edit
@@ -3202,89 +3191,9 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
 }
 
 // ── 🧱🪟 Modular wall sections (owner request) ────────────────────────────────
-// Placeable wall pieces: a solid brick section and a WINDOW section with real
-// glass. Placed along a structural side wall's line, they REPLACE it (world
-// hides the built-in brick wall for that side — see updateSideWallCoverage),
-// so a window section becomes a genuine view out: stars, the planet, and
-// the docked-module projections beyond the glass.
-
-function buildBrickWall({ m, place }: BuildCtx) {
-  // Brick slab + mortar grooves + coping cap (matches the built-in wall look).
-  place(new THREE.BoxGeometry(4, 3.4, 0.3), m(0x8a4a3a, 0.85, 0.05), 0, 1.7, 0);
-  for (const gy of [0.6, 1.25, 1.9, 2.55]) {
-    place(
-      new THREE.BoxGeometry(3.96, 0.05, 0.32),
-      m(0x1a2835, 0.9, 0.02),
-      0,
-      gy,
-      0,
-    );
-  }
-  place(
-    new THREE.BoxGeometry(4.06, 0.12, 0.36),
-    m(0xb8c8d8, 0.75, 0.05),
-    0,
-    3.46,
-    0,
-  );
-}
-
-function buildWindowWall({ m, place }: BuildCtx) {
-  // Brick frame around a big glazed opening (1.0..2.6 high, 3.0 wide).
-  place(new THREE.BoxGeometry(4, 1.0, 0.3), m(0x8a4a3a, 0.85, 0.05), 0, 0.5, 0); // sill course
-  place(new THREE.BoxGeometry(4, 0.8, 0.3), m(0x8a4a3a, 0.85, 0.05), 0, 3.0, 0); // header course
-  for (const sx of [-1.75, 1.75]) {
-    place(
-      new THREE.BoxGeometry(0.5, 1.6, 0.3),
-      m(0x8a4a3a, 0.85, 0.05),
-      sx,
-      1.8,
-      0,
-    ); // jamb piers
-  }
-  place(
-    new THREE.BoxGeometry(3.1, 0.1, 0.34),
-    m(0x2a3444, 0.6, 0.4),
-    0,
-    1.02,
-    0,
-  ); // frame sill
-  place(
-    new THREE.BoxGeometry(3.1, 0.1, 0.34),
-    m(0x2a3444, 0.6, 0.4),
-    0,
-    2.58,
-    0,
-  ); // frame head
-  for (const sx of [-1.5, 0, 1.5]) {
-    place(
-      new THREE.BoxGeometry(0.08, 1.56, 0.34),
-      m(0x2a3444, 0.6, 0.4),
-      sx,
-      1.8,
-      0,
-    ); // mullions
-  }
-  // The glass: barely-there blue, transparent both sides — the view is the point.
-  const glass = place(
-    new THREE.PlaneGeometry(3.0, 1.5),
-    m(0x9bd4e8, 0.05, 0.1),
-    0,
-    1.8,
-    0,
-  );
-  const gm = glass.material as THREE.MeshStandardMaterial;
-  gm.transparent = true;
-  gm.opacity = 0.16;
-  gm.side = THREE.DoubleSide;
-  place(
-    new THREE.BoxGeometry(4.06, 0.12, 0.36),
-    m(0xb8c8d8, 0.75, 0.05),
-    0,
-    3.46,
-    0,
-  ); // coping
-}
+// 🖼️ #80 S6: buildBrickWall / buildWindowWall retired — see the wallpaper editor
+// (their brick + glazed looks are the `brick` wallpaper preset + the window
+// editor now). The octagon hull is the standard wall.
 
 // ── 🏝️ Outdoor leisure set — lazy pool + hot tub ────────────────────────────
 // These are poolside scene anchors for the outdoor casino zone. Both are

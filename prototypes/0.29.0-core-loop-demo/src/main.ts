@@ -94,6 +94,7 @@ import {
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
+import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
   bindRoomRoles,
   subscribeRoomRoles,
@@ -1141,6 +1142,8 @@ async function joinRoomAtEpoch(
   bindDoorLayoutDoc(sync.doc);
   // 🪟 #80: window layout syncs the same way (rebinds per join at the T0 seam).
   bindWindowLayoutDoc(sync.doc);
+  // 🖼️ #80 S6: wall coverings (surface → wallpaper preset) ride the doc too.
+  bindWallpaperLayoutDoc(sync.doc);
 
   // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
   harvestStationAtlas();
