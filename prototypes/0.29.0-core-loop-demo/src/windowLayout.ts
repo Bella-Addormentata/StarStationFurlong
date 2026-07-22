@@ -17,7 +17,7 @@ import * as THREE from 'three';
 import { computeOctagonProfile, sectionToWorld, surfaceEdge } from './hullSection';
 import type { HullSurface } from './hullSection';
 import { roomHalfExtents } from './floorPlanDoc';
-import { readAllWindowLayout } from './windowLayoutDoc';
+import { readAllWindowLayout, WINDOW_DEFAULT } from './windowLayoutDoc';
 import type { HullWindows, WindowOpening } from './octagonHull';
 
 /** Keep an opening this far off the strip ends (matches octagonHull's clamp). */
@@ -102,6 +102,32 @@ export function surfaceEdgeLen(surface: HullSurface): number {
 export function windowFitsSurface(surface: HullSurface, w: number, h: number): boolean {
   const p = profile();
   return w <= 2 * p.longHalf - 0.1 && h <= surfaceEdge(p, surface).edgeLen - 0.1;
+}
+
+/** Border kept between an auto-fit roof skylight and the panel seams (per side). */
+const ROOF_SKYLIGHT_BORDER = 0.5;
+
+/** Roof panels (the two 45° eaves + the flat ridge) — auto-fit their height. */
+function isRoofSurface(s: HullSurface): boolean {
+  return s === 'roof-neg' || s === 'roof-pos' || s === 'ridge';
+}
+
+/**
+ * 🪟 #80 S4: the AUTO size of a window on `surface` — the first rule of the
+ * resize system (placement size is now a per-surface POLICY, not a fixed
+ * constant, so more rules / manual override can layer on later). ROOF panels
+ * (eaves + ridge) fill their ACROSS span (up-slope for an eave, across-peak for
+ * the ridge) minus a small border so a skylight spans the panel; the WIDTH
+ * (along the room) stays the default. Every other surface keeps the default h.
+ */
+export function autoWindowSize(surface: HullSurface): { w: number; h: number } {
+  const w = WINDOW_DEFAULT.w; // default width on every surface
+  if (isRoofSurface(surface)) {
+    const edgeLen = surfaceEdge(profile(), surface).edgeLen;
+    // fill the panel minus a border; never below a usable minimum
+    return { w, h: Math.max(0.4, edgeLen - 2 * ROOF_SKYLIGHT_BORDER) };
+  }
+  return { w, h: WINDOW_DEFAULT.h };
 }
 
 /**

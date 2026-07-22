@@ -78,7 +78,7 @@ import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
 import {
   snapWindowAlong, clampWindowAlong, clampWindowAcross, windowFitsSurface,
-  surfaceCenterWorld, surfaceBasis, WINDOW_BOX_THICKNESS,
+  surfaceCenterWorld, surfaceBasis, autoWindowSize, WINDOW_BOX_THICKNESS,
 } from './windowLayout';
 import {
   writeWindowLayout, deleteWindowLayout, readAllWindowLayout, WINDOW_DEFAULT,
@@ -487,6 +487,9 @@ class RoomEditController {
    *  while add-window is armed — one reusable box (built on arm, re-oriented on
    *  surface switch, hidden on disarm, disposed on exit). */
   private windowGhost: THREE.Mesh | null = null;
+  /** 🪟 #80 S4: the ghost box's current geometry size, so it only rebuilds when
+   *  the auto-fit size changes (per surface). */
+  private windowGhostSize = { w: 0, h: 0 };
   /** 🪟 #80 S4: the window ghost's current snapped placement + last verdict; the
    *  click commit reads THIS so the window drops where the preview showed. */
   private ghostWindow:
@@ -1614,13 +1617,14 @@ class RoomEditController {
       return; // stay armed so the owner can nudge to a clearer spot
     }
 
+    const size = autoWindowSize(ghost.surface); // roof panels auto-fit their height
     writeWindowLayout({
       id: `w:${mintDoorId()}`, // a plain uuid; the `w:` marks a window record
       surface: ghost.surface,
       along: ghost.along,
       across: ghost.across,
-      w: WINDOW_DEFAULT.w,
-      h: WINDOW_DEFAULT.h,
+      w: size.w,
+      h: size.h,
       r: WINDOW_DEFAULT.r,
       enabled: true,
     });
@@ -1642,7 +1646,9 @@ class RoomEditController {
     const parent = this.world?.getClickPlane()?.parent;
     if (!parent) return null;
     // local x=w along uDir, y=h along vDir, z=thickness along the surface normal
-    const geo = new THREE.BoxGeometry(WINDOW_DEFAULT.w, WINDOW_DEFAULT.h, WINDOW_BOX_THICKNESS);
+    const size = autoWindowSize(this.windowSurface);
+    const geo = new THREE.BoxGeometry(size.w, size.h, WINDOW_BOX_THICKNESS);
+    this.windowGhostSize = { ...size };
     const mat = new THREE.MeshBasicMaterial({
       color: CARRY_VALID_EMISSIVE, // green; flipped red on invalid
       transparent: true,
@@ -1666,6 +1672,18 @@ class RoomEditController {
     ghost.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(uDir, vDir, normal));
   }
 
+  /** Rebuild the ghost box geometry when the active surface's AUTO size changes
+   *  (roof panels auto-fit their height, so the ghost grows/shrinks per surface). */
+  private resizeWindowGhost(): void {
+    const ghost = this.windowGhost;
+    if (!ghost) return;
+    const size = autoWindowSize(this.windowSurface);
+    if (size.w === this.windowGhostSize.w && size.h === this.windowGhostSize.h) return;
+    ghost.geometry.dispose();
+    ghost.geometry = new THREE.BoxGeometry(size.w, size.h, WINDOW_BOX_THICKNESS);
+    this.windowGhostSize = { ...size };
+  }
+
   /**
    * Follow the pointer while add-window is armed: intersect the pointer ray with
    * the ACTIVE surface's MATH PLANE (a plane raycast reaches every surface —
@@ -1687,6 +1705,8 @@ class RoomEditController {
     this.raycaster.setFromCamera(this.pointerNdc, camera);
 
     const surface = this.windowSurface;
+    const size = autoWindowSize(surface); // roof panels auto-fit their height
+    this.resizeWindowGhost();
     const { uDir, vDir, normal } = surfaceBasis(surface);
     const a = surfaceCenterWorld(surface, 0, 0);
     const anchor = this.windowAnchor.set(a.x, a.y, a.z);
@@ -1695,14 +1715,14 @@ class RoomEditController {
     if (!hit) { this.hideWindowGhost(); return; } // ray parallel to the surface
 
     const rel = hit.sub(anchor); // hit is windowHit; mutate in place
-    const along = clampWindowAlong(snapWindowAlong(rel.dot(uDir)), WINDOW_DEFAULT.w);
-    const across = clampWindowAcross(surface, snapWindowAlong(rel.dot(vDir)), WINDOW_DEFAULT.h);
+    const along = clampWindowAlong(snapWindowAlong(rel.dot(uDir)), size.w);
+    const across = clampWindowAcross(surface, snapWindowAlong(rel.dot(vDir)), size.h);
     const c = surfaceCenterWorld(surface, along, across);
     ghost.position.set(c.x, c.y, c.z);
     this.orientWindowGhost();
     ghost.visible = true;
 
-    const verdict = validateWindowPlacement(surface, along, across, WINDOW_DEFAULT.w, WINDOW_DEFAULT.h);
+    const verdict = validateWindowPlacement(surface, along, across, size.w, size.h);
     this.setWindowGhostColor(verdict.ok);
     this.ghostWindow = { surface, along, across, verdict };
   }
@@ -2237,6 +2257,7 @@ class RoomEditController {
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
       this.ensureWindowGhost();
+      this.resizeWindowGhost(); // match the active surface's auto-fit size
       this.orientWindowGhost();
       this.showWindowSurfaceSelector();
       showHint('ADD WINDOW — ◀ ▶ (or [ ]) picks the surface · move to aim (green = ok, red = blocked) · click to place · ＋/✕ to cancel', 4200);
@@ -2331,6 +2352,7 @@ class RoomEditController {
     const i = SURFACES.indexOf(this.windowSurface);
     this.windowSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
     this.syncWindowSurfaceSelector();
+    this.resizeWindowGhost(); // roof panels auto-fit → the ghost grows/shrinks
     this.orientWindowGhost();
     if (this.lastPointer.has) {
       this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
