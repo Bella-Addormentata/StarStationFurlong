@@ -368,8 +368,9 @@ export function validateDoorPlacement(
 // ── Window placement validity (#80 S4 — the window editor's add/tint gate) ─────
 
 /** 🪟 #80: windows are holes in the octagon side walls, so the ＋ WINDOW
- *  affordance rides the same `?octagon=1` preview flag world.ts reads. */
-const OCTAGON_HULL = new URLSearchParams(window.location.search).get('octagon') === '1';
+ *  affordance rides the same octagon flag world.ts reads. Octagon is now the
+ *  DEFAULT hull — disable with `?octagon=0` (e.g. to compare the legacy box). */
+const OCTAGON_HULL = new URLSearchParams(window.location.search).get('octagon') !== '0';
 
 export type WindowPlacementVerdict = { ok: true } | { ok: false; reason: string };
 

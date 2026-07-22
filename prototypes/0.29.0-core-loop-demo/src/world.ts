@@ -166,12 +166,12 @@ interface RemoteAvatar {
   diveStartY: number;
 }
 
-/** 🛑📐 #80 S1: render each room as an OCTAGON barrel (walls + 45° roof +
- *  basement) instead of the flat open-top box. Preview-gated OFF by default —
- *  `?octagon=1` turns it on so collaborators can see the new shell without
- *  changing any existing room. Same URL-flag idiom as ?devzoom / ?vestibule. */
+/** 🛑📐 #80: render each room as an OCTAGON barrel (walls + 45° roof + basement)
+ *  instead of the flat open-top box. Now the DEFAULT hull — pass `?octagon=0` to
+ *  fall back to the legacy flat box (e.g. to compare). Client-side render only;
+ *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
-  new URLSearchParams(window.location.search).get("octagon") === "1";
+  new URLSearchParams(window.location.search).get("octagon") !== "0";
 
 export class World {
   private scene: THREE.Scene;

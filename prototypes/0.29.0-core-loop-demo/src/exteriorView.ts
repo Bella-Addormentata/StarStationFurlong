@@ -47,10 +47,10 @@ import { collectWindowOpenings } from "./windowLayout";
 import { roomHalfExtents } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
- *  (the new cross-section) instead of the flat box. Preview-gated OFF; same
- *  `?octagon=1` flag world.ts reads for the interior barrel. */
+ *  (the new cross-section) instead of the flat box. Now the DEFAULT — disable
+ *  with `?octagon=0`; same flag world.ts reads for the interior barrel. */
 const OCTAGON_HULL =
-  new URLSearchParams(window.location.search).get("octagon") === "1";
+  new URLSearchParams(window.location.search).get("octagon") !== "0";
 
 const HULL = 0x39445a;
 const HULL_DARK = 0x2a3444;

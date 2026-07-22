@@ -2240,12 +2240,13 @@ export const POOL_SWIM_Y = -0.52; // avatar-root y while swimming (head above wa
 export const DIVE_TIME = 0.9; // seconds board-tip → water
 export const DIVE_ARC_LIFT = 0.55; // parabola apex above the straight chord
 
-/** 🛑📐 #80: same `?octagon=1` preview flag world.ts reads. When on, the pool
- *  sinks into the BASEMENT through a real floor hole (a solid rect basin bottom
- *  is drawn in) instead of the legacy hidden-whole-floor trick. */
+/** 🛑📐 #80: same octagon flag world.ts reads (now the DEFAULT — disable with
+ *  `?octagon=0`). When on, the pool sinks into the BASEMENT through a real floor
+ *  hole (a solid rect basin bottom is drawn in) instead of the legacy
+ *  hidden-whole-floor trick. */
 const OCTAGON_HULL =
   typeof window !== "undefined" &&
-  new URLSearchParams(window.location.search).get("octagon") === "1";
+  new URLSearchParams(window.location.search).get("octagon") !== "0";
 
 /** 🏊 Lazy-pool water footprint in the item's LOCAL frame (west waterline →
  *  east tile wall × ±halfZ). buildLazyPool aliases these to WX/HX/HZ; the
