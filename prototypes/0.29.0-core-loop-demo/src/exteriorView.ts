@@ -35,6 +35,14 @@ import { isExteriorItem } from "./hull";
 import { atlasLayout } from "./stationAtlas";
 import { projectionPoseForDoor } from "./adapter";
 import type { DoorId } from "./doors";
+import { buildOctagonShell } from "./octagonHull";
+import { roomHalfExtents } from "./floorPlanDoc";
+
+/** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
+ *  (the new cross-section) instead of the flat box. Preview-gated OFF; same
+ *  `?octagon=1` flag world.ts reads for the interior barrel. */
+const OCTAGON_HULL =
+  new URLSearchParams(window.location.search).get("octagon") === "1";
 
 const HULL = 0x39445a;
 const HULL_DARK = 0x2a3444;
@@ -124,6 +132,14 @@ function buildGroup(): THREE.Group {
   const g = new THREE.Group();
   g.name = "exteriorView";
 
+  // 🛑📐 #80: FROM SPACE the current module reads as an OCTAGON shell when the
+  // preview flag is on. We skip the flat roof plating + dome/antennas/solar
+  // dress (all authored for a flat 4.14 roof); dock collars + real exterior
+  // items below stay put.
+  if (OCTAGON_HULL) {
+    const { halfX, halfZ } = roomHalfExtents();
+    g.add(buildOctagonShell({ halfX, halfZ }).group);
+  } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
   box(g, 11.8, 0.28, 11.8, HULL, 0, 4.14, 0);
@@ -213,6 +229,7 @@ function buildGroup(): THREE.Group {
     panel.position.set(p.x, 4.28, p.z);
     g.add(panel);
   }
+  } // end !OCTAGON_HULL current-module dress
 
   // 🔌 IDA-style docking collars at adapter doors (#67 D2 — built to the
   // owner's pixel-art reference): white soft-goods torus, black capture
@@ -368,47 +385,57 @@ function buildGroup(): THREE.Group {
         seed: pose.seed ?? "",
         label: pose.name,
       };
-      const hullMat = new THREE.MeshStandardMaterial({
-        color: 0x3a4556,
-        roughness: 0.7,
-        metalness: 0.4,
-        transparent: true,
-        opacity: 0.82,
-      });
-      const body = new THREE.Mesh(
-        new THREE.BoxGeometry(11.8, 4.0, 11.8),
-        hullMat,
-      );
-      body.position.y = 2.0;
-      mod.add(body);
-      const roof = new THREE.Mesh(
-        new THREE.BoxGeometry(11.8, 0.24, 11.8),
-        new THREE.MeshStandardMaterial({
-          color: 0x2f3a4c,
-          roughness: 0.6,
-          metalness: 0.5,
+      if (OCTAGON_HULL) {
+        // 🛑📐 #80: neighbours read as translucent octagon shells too. Dims of
+        // other rooms aren't carried in the atlas pose, so assume the default
+        // (matches today's 11.8 box assumption); the click-to-connect userData
+        // stays on `mod`.
+        mod.add(
+          buildOctagonShell({ halfX: 6, halfZ: 6 }, { opacity: 0.82 }).group,
+        );
+      } else {
+        const hullMat = new THREE.MeshStandardMaterial({
+          color: 0x3a4556,
+          roughness: 0.7,
+          metalness: 0.4,
           transparent: true,
-          opacity: 0.85,
-        }),
-      );
-      roof.position.y = 4.12;
-      mod.add(roof);
-      // Amber corner clamps echo the live hull's look at a glance.
-      for (const sx of [-1, 1])
-        for (const sz of [-1, 1]) {
-          const clamp = new THREE.Mesh(
-            new THREE.BoxGeometry(0.45, 0.18, 0.45),
-            new THREE.MeshStandardMaterial({
-              color: ACCENT,
-              roughness: 0.6,
-              metalness: 0.4,
-              transparent: true,
-              opacity: 0.9,
-            }),
-          );
-          clamp.position.set(sx * 5.4, 4.3, sz * 5.4);
-          mod.add(clamp);
-        }
+          opacity: 0.82,
+        });
+        const body = new THREE.Mesh(
+          new THREE.BoxGeometry(11.8, 4.0, 11.8),
+          hullMat,
+        );
+        body.position.y = 2.0;
+        mod.add(body);
+        const roof = new THREE.Mesh(
+          new THREE.BoxGeometry(11.8, 0.24, 11.8),
+          new THREE.MeshStandardMaterial({
+            color: 0x2f3a4c,
+            roughness: 0.6,
+            metalness: 0.5,
+            transparent: true,
+            opacity: 0.85,
+          }),
+        );
+        roof.position.y = 4.12;
+        mod.add(roof);
+        // Amber corner clamps echo the live hull's look at a glance.
+        for (const sx of [-1, 1])
+          for (const sz of [-1, 1]) {
+            const clamp = new THREE.Mesh(
+              new THREE.BoxGeometry(0.45, 0.18, 0.45),
+              new THREE.MeshStandardMaterial({
+                color: ACCENT,
+                roughness: 0.6,
+                metalness: 0.4,
+                transparent: true,
+                opacity: 0.9,
+              }),
+            );
+            clamp.position.set(sx * 5.4, 4.3, sz * 5.4);
+            mod.add(clamp);
+          }
+      }
       mod.position.set(pose.x, 0, pose.z);
       mod.rotation.y = pose.rotY;
       g.add(mod);
@@ -446,13 +473,17 @@ function buildGroup(): THREE.Group {
 function disposeGroup(g: THREE.Group): void {
   const seen = new Set<THREE.BufferGeometry | THREE.Material>();
   g.traverse((o) => {
-    const mesh = o as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    if (mesh.geometry && !seen.has(mesh.geometry)) {
-      seen.add(mesh.geometry);
-      mesh.geometry.dispose();
+    // Meshes AND LineSegments (the octagon-shell seam outline) carry
+    // geometry/material — dispose either.
+    const drawable = o as THREE.Mesh & THREE.LineSegments;
+    const geo = drawable.geometry as THREE.BufferGeometry | undefined;
+    if (geo && !seen.has(geo)) {
+      seen.add(geo);
+      geo.dispose();
     }
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const matField = drawable.material as THREE.Material | THREE.Material[] | undefined;
+    if (!matField) return;
+    const mats = Array.isArray(matField) ? matField : [matField];
     for (const m of mats)
       if (m && !seen.has(m)) {
         seen.add(m);

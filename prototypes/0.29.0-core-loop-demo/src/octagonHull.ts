@@ -191,6 +191,117 @@ export function buildOctagonHull(opts: HullSectionOpts): OctagonHull {
   return { group, profile, updateFacing, dispose };
 }
 
+export interface OctagonShellStyle {
+  /** Wall + end-cap colour. */
+  hull?: number;
+  /** Roof (eave + ridge) colour. */
+  roof?: number;
+  /** Basement (chamfer + floor) colour. */
+  basement?: number;
+  /** Seam-edge colour. */
+  edge?: number;
+  /** <1 makes the whole shell translucent (atlas neighbours read as ghosts). */
+  opacity?: number;
+}
+
+export interface OctagonShell {
+  group: THREE.Group;
+  dispose(): void;
+}
+
+/**
+ * 🛑🛰️ Build a SOLID octagon shell — the module seen FROM OUTSIDE at zoom ≥ 3
+ * (the exterior / atlas view). Opaque metallic faces (roof / walls / basement
+ * tinted apart) plus a seam outline so the 8-sided barrel reads at a glance.
+ * Unlike `buildOctagonHull` (the translucent, camera-faded interior barrel),
+ * this is a plain outward-facing hull with no per-frame fade.
+ */
+export function buildOctagonShell(
+  opts: HullSectionOpts,
+  style: OctagonShellStyle = {},
+): OctagonShell {
+  const profile = computeOctagonProfile(opts);
+  const { narrowAxis, longHalf, outline, edges } = profile;
+  const hull = style.hull ?? 0x3a4556;
+  const roofC = style.roof ?? 0x2f3a4c;
+  const baseC = style.basement ?? 0x27303d;
+  const edgeC = style.edge ?? 0x9fb4d0;
+  const opacity = style.opacity ?? 1;
+  const transparent = opacity < 1;
+
+  const group = new THREE.Group();
+  group.name = 'octagonShell';
+  const geometries: THREE.BufferGeometry[] = [];
+  const materials: THREE.Material[] = [];
+
+  const mk = (color: number) => {
+    const m = new THREE.MeshStandardMaterial({
+      color,
+      roughness: 0.6,
+      metalness: 0.5,
+      transparent,
+      opacity,
+      side: THREE.DoubleSide,
+    });
+    materials.push(m);
+    return m;
+  };
+  const faceColor = (kind: SectionEdge['kind']) =>
+    kind.startsWith('roof') ? roofC : kind.startsWith('basement') ? baseC : hull;
+
+  for (const edge of edges) {
+    const p0 = outline[edge.from];
+    const p1 = outline[edge.to];
+    const c0 = sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf);
+    const c1 = sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf);
+    const c2 = sectionToWorld(narrowAxis, p1.a, p1.y, longHalf);
+    const c3 = sectionToWorld(narrowAxis, p0.a, p0.y, longHalf);
+    const geo = quadGeometry(c0, c1, c2, c3);
+    geometries.push(geo);
+    const mesh = new THREE.Mesh(geo, mk(faceColor(edge.kind)));
+    mesh.name = `octagon-shell-${edge.kind}`;
+    group.add(mesh);
+  }
+  for (const sign of [-1, 1] as const) {
+    const geo = capGeometry(profile, sign * longHalf);
+    geometries.push(geo);
+    const mesh = new THREE.Mesh(geo, mk(hull));
+    mesh.name = 'octagon-shell-cap';
+    group.add(mesh);
+  }
+
+  // Seam outline (both octagon rings + longitudinal connectors) — depth-tested,
+  // so it reads as edge trim on the solid hull rather than an x-ray overlay.
+  {
+    const pts: number[] = [];
+    const push = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) =>
+      pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    const n = outline.length;
+    for (let i = 0; i < n; i++) {
+      const p = outline[i];
+      const q = outline[(i + 1) % n];
+      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, q.a, q.y, -longHalf));
+      push(sectionToWorld(narrowAxis, p.a, p.y, longHalf), sectionToWorld(narrowAxis, q.a, q.y, longHalf));
+      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, p.a, p.y, longHalf));
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
+    geometries.push(geo);
+    const mat = new THREE.LineBasicMaterial({ color: edgeC, transparent, opacity: Math.min(1, opacity + 0.1) });
+    materials.push(mat);
+    const lines = new THREE.LineSegments(geo, mat);
+    lines.name = 'octagon-shell-edges';
+    group.add(lines);
+  }
+
+  const dispose = () => {
+    for (const g of geometries) g.dispose();
+    for (const m of materials) m.dispose();
+    group.clear();
+  };
+  return { group, dispose };
+}
+
 /** Colour/opacity/depthWrite for a strip by its edge kind. */
 function stripStyle(edge: SectionEdge): {
   color: number;

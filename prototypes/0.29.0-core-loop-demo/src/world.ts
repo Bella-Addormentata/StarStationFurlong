@@ -2784,6 +2784,14 @@ export class World {
           (wall.material as THREE.MeshStandardMaterial).opacity = 1.0;
         });
       }
+      // 🛑📐 #80 S1 preview: hide the flat box capsule so the exterior OCTAGON
+      // shell (built by exteriorView at zoom 3) is the module's outside skin.
+      if (OCTAGON_HULL) {
+        if (this.capsuleRoof) this.capsuleRoof.visible = false;
+        this.capsuleOuterWalls.forEach((wall) => {
+          wall.visible = false;
+        });
+      }
     } else {
       // Restore interior rendering when playing inside levels <= 2 (Room / First-Person)
       this.furnitureMeshes.forEach((mesh) => {
