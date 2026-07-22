@@ -222,6 +222,10 @@ export class World {
   // edit-mode raycast index (material.visible:false, still raycasts), so a
   // window is selectable + removable like a door. Rebuilt with the hull.
   private windowGroups: Map<string, THREE.Group> = new Map();
+  // 🪟 #80: `skylight` furniture PANEL meshes (not lights) — they follow the
+  // octagon roof cutaway (shown in first person, hidden in the iso view), so a
+  // ceiling skylight doesn't float on the "roof" looking in. Rebuilt on reconcile.
+  private skylightMeshes: THREE.Mesh[] = [];
   // Active interactive docking doors subsystem
   public dockingSystem: DoorDockingPortSystem | null = null;
   // ── Adapter transit (T1 of issue #30) ───────────────────────────────────────
@@ -1010,6 +1014,27 @@ export class World {
       group.add(box);
       this.platformGroup.add(group);
       this.windowGroups.set(rec.id, group);
+    }
+  }
+
+  /**
+   * 🪟 #80: collect the visible PANEL meshes (frame + glass, NOT the light) of
+   * every `skylight` furniture item, so the per-frame facing pass can hide them
+   * in the iso view exactly like the octagon roof — they're ceiling glass that
+   * would otherwise float on the "roof" when you look into the room from above.
+   * The skylight's PointLight is left out so the room stays lit in every view.
+   * Rebuilt on furniture reconcile (skylights can be added / moved / removed).
+   */
+  private rebuildSkylightMeshList(): void {
+    this.skylightMeshes = [];
+    if (!OCTAGON_HULL) return; // legacy: no roof, skylights are the ceiling
+    for (const item of FURNITURE) {
+      if (item.kind !== "skylight") continue;
+      const group = this.furnitureGroups.get(item.id);
+      if (!group) continue;
+      group.traverse((o) => {
+        if (o instanceof THREE.Mesh) this.skylightMeshes.push(o);
+      });
     }
   }
 
@@ -2313,6 +2338,7 @@ export class World {
     rebuildSeats();
     rebuildStands();
     rebuildDevices();
+    this.rebuildSkylightMeshList(); // 🪟 skylight panels follow the roof cutaway
     // 🤖 #77C: a placed/removed/moved charging-dock spawns/disposes/repositions
     // its robot (uses the route the room was last set up with).
     this.reconcileRobots(this.robotsPatrol);
@@ -3085,7 +3111,13 @@ export class World {
       const yaw = getCameraYaw();
       const camX = (Math.cos(yaw) + Math.sin(yaw)) * Math.SQRT1_2;
       const camZ = (Math.cos(yaw) - Math.sin(yaw)) * Math.SQRT1_2;
-      this.octagonHull.updateFacing(camX, camZ, zoomLevel <= 1);
+      const firstPerson = zoomLevel <= 1;
+      this.octagonHull.updateFacing(camX, camZ, firstPerson);
+      // 🪟 #80: skylight glass follows the roof cutaway — visible only in first
+      // person (looking out at the sky), hidden in the iso view where the roof
+      // is culled (otherwise the panels float on the "roof" looking in). Cheap
+      // (a handful of meshes); the panels' PointLight stays on in every view.
+      for (const mesh of this.skylightMeshes) mesh.visible = firstPerson;
     }
 
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)
