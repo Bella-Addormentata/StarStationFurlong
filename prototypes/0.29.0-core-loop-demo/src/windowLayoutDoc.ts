@@ -14,25 +14,30 @@
  */
 
 import * as Y from 'yjs';
+import { SURFACES } from './hullSection';
+import type { HullSurface } from './hullSection';
 
-/** The two octagon SIDE walls (narrow-axis ∓/± faces) a window can sit on.
- *  Stored as the octagon SIDE, not a cardinal, so a window survives a room
- *  resize (which can flip which cardinals are the side walls). The editor maps
- *  the clicked cardinal → side at placement time. */
-export type WindowWall = 'neg' | 'pos';
+/** Which octagon SURFACE a window sits on — any of the 8 barrel strips (walls,
+ *  roof eaves, ridge, basement chamfers, basement floor). Stored as the surface
+ *  id (not a cardinal) so a window survives a room resize. Re-exported for the
+ *  editor + hull, which key everything off the same 8-value list. */
+export type { HullSurface };
 
-/** Default window size (metres) + corner radius — the editor seeds these. */
-export const WINDOW_DEFAULT = { w: 3, h: 1.8, r: 0.4, y: 2 };
+/** Default window size (metres) + corner radius. `across` (position along the
+ *  surface edge) is only a fallback default — the editor sets it per placement. */
+export const WINDOW_DEFAULT = { w: 3, h: 1.8, r: 0.4, across: 2 };
 
 /** Serializable window record — one per window id (`w:<uuid>`). Plain JSON. */
 export interface WindowLayoutRecord {
   id: string;
-  wall: WindowWall;
-  /** Along-wall position (world coord on the wall's long axis). */
+  /** The hull surface this window is cut into. */
+  surface: HullSurface;
+  /** Position along the strip's EXTRUDE (long) axis — world coord, ±longHalf. */
   along: number;
-  /** Centre height above the floor. */
-  y: number;
-  /** Opening width / height / corner radius. */
+  /** Position across the strip, i.e. distance along its cross-section edge from
+   *  the surface's p0 (walls: height above the floor; eaves: up-slope distance). */
+  across: number;
+  /** Opening width (along) / height (across) / corner radius. */
   w: number;
   h: number;
   r: number;
@@ -73,19 +78,19 @@ function docAlive(): boolean {
   );
 }
 
-const WALLS: readonly WindowWall[] = ['neg', 'pos'];
-
-/** Shape guard (doc reads cross a trust boundary — see module header). */
+/** Shape guard (doc reads cross a trust boundary — see module header). A stale
+ *  peer on the OLD {wall,y} schema fails this and is silently dropped — the
+ *  intended peer-trust behaviour (windows are preview-only + start empty). */
 export function isWindowLayoutRecord(value: unknown): value is WindowLayoutRecord {
   if (typeof value !== 'object' || value === null) return false;
   const r = value as Partial<WindowLayoutRecord>;
   return (
     typeof r.id === 'string' &&
     r.id.length > 0 &&
-    typeof r.wall === 'string' &&
-    WALLS.includes(r.wall as WindowWall) &&
+    typeof r.surface === 'string' &&
+    SURFACES.includes(r.surface as HullSurface) &&
     Number.isFinite(r.along) &&
-    Number.isFinite(r.y) &&
+    Number.isFinite(r.across) &&
     Number.isFinite(r.w) &&
     (r.w as number) > 0 &&
     Number.isFinite(r.h) &&

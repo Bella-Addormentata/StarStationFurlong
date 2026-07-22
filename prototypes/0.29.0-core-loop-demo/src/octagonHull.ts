@@ -27,10 +27,14 @@ import {
   computeOctagonProfile,
   sectionToWorld,
   verticalFaceNormal,
+  surfaceEdge,
+  SURFACE_BY_EDGE,
   type HullSectionOpts,
   type OctagonProfile,
   type SectionEdge,
   type NarrowAxis,
+  type StripEdge,
+  type HullSurface,
 } from './hullSection';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
@@ -43,15 +47,18 @@ const FP_OPACITY = { roof: 1, wall: 0.9 };
  *  the camera (its outside is toward us). Same idiom as the #51 door fade. */
 const NEAR_DOT = 0.25;
 
-/** A vertical hull face (side wall or end-cap wall band) — camera-facing culled. */
+/** A vertical hull face (side wall or end-cap wall band) — camera-facing culled.
+ *  `glass` = the window panes on this face, toggled visible with it. */
 interface WallFace {
   mesh: THREE.Mesh;
   material: THREE.MeshStandardMaterial;
   normal: { x: number; z: number };
+  glass?: THREE.Mesh[];
 }
 interface HullMesh {
   mesh: THREE.Mesh;
   material: THREE.MeshStandardMaterial;
+  glass?: THREE.Mesh[];
 }
 
 export interface OctagonHull {
@@ -73,22 +80,20 @@ export interface OctagonHull {
   dispose(): void;
 }
 
-/** 🪟 #80: a rounded-rect WINDOW opening cut from a side wall, in that wall's
- *  local frame: `along` = position along the wall (world coord on the long
- *  axis), `y` = centre height, `w`×`h` = size, `r` = corner radius. Same idea
- *  as the pool's floor holes, applied to a vertical wall. */
+/** 🪟 #80: a rounded-rect WINDOW opening cut from a hull STRIP, in that strip's
+ *  local frame: `along` = position along the extrude (long) axis, `across` =
+ *  position along the strip's cross-section edge (walls: height; eaves: up-slope
+ *  distance…), `w`×`h` = size, `r` = corner radius. Same idea as the pool's
+ *  floor holes, generalised to any of the 8 octagon surfaces. */
 export interface WindowOpening {
   along: number;
-  y: number;
+  across: number;
   w: number;
   h: number;
   r: number;
 }
-/** Openings per side wall (narrow-axis ∓/± walls). */
-export interface HullWindows {
-  neg?: WindowOpening[];
-  pos?: WindowOpening[];
-}
+/** Openings per hull surface (any of the 8 barrel strips). */
+export type HullWindows = Partial<Record<HullSurface, WindowOpening[]>>;
 
 /**
  * Build the octagon hull for the given room half-extents (+ optional tuning).
@@ -103,7 +108,6 @@ export function buildOctagonHull(
   const {
     narrowAxis,
     longHalf,
-    outline,
     edges,
     narrowHalf,
     ridgeHalf,
@@ -137,68 +141,54 @@ export function buildOctagonHull(
   };
 
   // ── The 8 extruded strips (one per octagon edge), sorted into wall / roof /
-  //    basement so the cutaway can treat each region differently. ────────────
-  let wallIndex = 0; // 0 = negative-a wall, 1 = positive-a wall (edge order)
-  for (const edge of edges) {
-    const p0 = outline[edge.from];
-    const p1 = outline[edge.to];
+  //    basement so the cutaway can treat each region differently. Every strip
+  //    now takes the SAME hole-aware path (stripGeometry): a plain quad when it
+  //    has no windows, else a ShapeGeometry with rounded-rect openings. ───────
+  edges.forEach((edge, edgeIndex) => {
+    const surface = SURFACE_BY_EDGE[edgeIndex];
+    const strip = surfaceEdge(profile, surface);
+    const openings = windows[surface];
+    const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
+    geometries.push(geo);
+
+    // 🪟 translucent glass filling each opening (barely-there blue — the view
+    // through it is the point; depthWrite off so it never occludes the sky).
+    // Collected so the cutaway toggles each pane with its owning face.
+    const glass: THREE.Mesh[] = [];
+    if (openings) {
+      for (const o of openings) {
+        const gGeo = stripGlassGeometry(narrowAxis, strip, o);
+        geometries.push(gGeo);
+        const gMat = newGlassMaterial();
+        materials.push(gMat);
+        const gMesh = new THREE.Mesh(gGeo, gMat);
+        gMesh.name = 'octagon-window-glass';
+        group.add(gMesh);
+        glass.push(gMesh);
+      }
+    }
+
     if (edge.kind === 'wall') {
-      // Side wall — a hole-aware geometry (rounded-rect window openings) so we
-      // can look outside; plain quad when the wall has no windows.
-      const openings = wallIndex === 0 ? windows.neg : windows.pos;
-      const geo = wallGeometry(narrowAxis, p0.a, longHalf, wallHeight, openings);
-      geometries.push(geo);
       const mat = mkMat(HULL_COLOR.wall);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = 'octagon-wall';
       group.add(mesh);
-      const which = wallIndex === 0 ? 'wall-neg' : 'wall-pos';
-      wallFaces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which) });
-      // 🪟 translucent glass filling each opening (barely-there blue — the view
-      // through it is the point; depthWrite off so it never occludes the sky).
-      if (openings) {
-        for (const o of openings) {
-          const gGeo = glassGeometry(narrowAxis, p0.a, o);
-          geometries.push(gGeo);
-          const gMat = new THREE.MeshStandardMaterial({
-            color: 0x9bd4e8,
-            roughness: 0.1,
-            metalness: 0.2,
-            transparent: true,
-            opacity: 0.18,
-            side: THREE.DoubleSide,
-            depthWrite: false,
-          });
-          materials.push(gMat);
-          const gMesh = new THREE.Mesh(gGeo, gMat);
-          gMesh.name = 'octagon-window-glass';
-          group.add(gMesh);
-        }
-      }
-      wallIndex++;
-      continue;
-    }
-    const geo = quadGeometry(
-      sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf),
-      sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf),
-      sectionToWorld(narrowAxis, p1.a, p1.y, longHalf),
-      sectionToWorld(narrowAxis, p0.a, p0.y, longHalf),
-    );
-    geometries.push(geo);
-    if (edge.kind.startsWith('roof')) {
+      const which = surface === 'wall-neg' ? 'wall-neg' : 'wall-pos';
+      wallFaces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which), glass });
+    } else if (edge.kind.startsWith('roof')) {
       const mat = mkMat(HULL_COLOR.roof);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = `octagon-${edge.kind}`;
       group.add(mesh);
-      roofMeshes.push({ mesh, material: mat });
+      roofMeshes.push({ mesh, material: mat, glass });
     } else {
       const mat = mkMat(HULL_COLOR.basement);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = `octagon-${edge.kind}`;
       group.add(mesh);
-      basementMeshes.push({ mesh, material: mat });
+      basementMeshes.push({ mesh, material: mat, glass });
     }
-  }
+  });
 
   // ── The 2 octagon END CAPS (gable ends) — split into wall band / roof gable /
   //    basement gable so each obeys the same cutaway rule as the strips. ──────
@@ -270,10 +260,21 @@ export function buildOctagonHull(
     }
   }
 
-  const setMesh = (m: HullMesh, visible: boolean, opacity: number) => {
+  // Each strip's window glass is toggled visible WITH its owning face — else a
+  // culled roof's skylight glass would float, or a hidden near-wall's pane show
+  // through. Visibility only; the glass keeps its 0.18 opacity.
+  const setGlass = (m: { glass?: THREE.Mesh[] }, visible: boolean) => {
+    if (m.glass) for (const g of m.glass) g.visible = visible;
+  };
+  const setMesh = (
+    m: { mesh: THREE.Mesh; material: THREE.MeshStandardMaterial; glass?: THREE.Mesh[] },
+    visible: boolean,
+    opacity: number,
+  ) => {
     m.mesh.visible = visible;
     m.material.opacity = opacity;
     m.material.transparent = opacity < 0.999;
+    setGlass(m, visible);
   };
 
   const updateFacing = (camDirX: number, camDirZ: number, firstPerson: boolean) => {
@@ -286,12 +287,18 @@ export function buildOctagonHull(
     }
     // Iso cutaway: no roof; solid basement hull; near/side walls fully hidden;
     // far walls opaque (their inside surface faces the camera).
-    for (const m of roofMeshes) m.mesh.visible = false;
+    for (const m of roofMeshes) {
+      m.mesh.visible = false;
+      setGlass(m, false);
+    }
     for (const m of basementMeshes) setMesh(m, true, 1);
     for (const f of wallFaces) {
       const dot = f.normal.x * camDirX + f.normal.z * camDirZ;
       if (dot < -NEAR_DOT) setMesh(f, true, 1); // FAR — show inside, opaque
-      else f.mesh.visible = false; // NEAR or side-on — completely transparent
+      else {
+        f.mesh.visible = false; // NEAR or side-on — completely transparent
+        setGlass(f, false);
+      }
     }
   };
 
@@ -332,6 +339,7 @@ export interface OctagonShell {
 export function buildOctagonShell(
   opts: HullSectionOpts,
   style: OctagonShellStyle = {},
+  windows: HullWindows = {},
 ): OctagonShell {
   const profile = computeOctagonProfile(opts);
   const { narrowAxis, longHalf, outline, edges } = profile;
@@ -362,19 +370,29 @@ export function buildOctagonShell(
   const faceColor = (kind: SectionEdge['kind']) =>
     kind.startsWith('roof') ? roofC : kind.startsWith('basement') ? baseC : hull;
 
-  for (const edge of edges) {
-    const p0 = outline[edge.from];
-    const p1 = outline[edge.to];
-    const c0 = sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf);
-    const c1 = sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf);
-    const c2 = sectionToWorld(narrowAxis, p1.a, p1.y, longHalf);
-    const c3 = sectionToWorld(narrowAxis, p0.a, p0.y, longHalf);
-    const geo = quadGeometry(c0, c1, c2, c3);
+  edges.forEach((edge, edgeIndex) => {
+    const surface = SURFACE_BY_EDGE[edgeIndex];
+    const strip = surfaceEdge(profile, surface);
+    const openings = windows[surface];
+    const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(faceColor(edge.kind)));
     mesh.name = `octagon-shell-${edge.kind}`;
     group.add(mesh);
-  }
+    // 🪟 the CURRENT room's windows show as holes + glass on the solid exterior
+    // barrel (no cutaway here, so every surface's panes render plainly).
+    if (openings) {
+      for (const o of openings) {
+        const gGeo = stripGlassGeometry(narrowAxis, strip, o);
+        geometries.push(gGeo);
+        const gMat = newGlassMaterial();
+        materials.push(gMat);
+        const gMesh = new THREE.Mesh(gGeo, gMat);
+        gMesh.name = 'octagon-shell-window-glass';
+        group.add(gMesh);
+      }
+    }
+  });
   for (const sign of [-1, 1] as const) {
     const geo = capGeometry(profile, sign * longHalf);
     geometries.push(geo);
@@ -439,13 +457,46 @@ function roundedRectPath(cx: number, cy: number, w: number, h: number, r: number
   return p;
 }
 
-/** Remap a ShapeGeometry built in wall-local (u=along=x, v=height=y) onto the
- *  side wall at narrow-axis coord `a`: each vertex → sectionToWorld(a, v, u). */
-function remapWallToWorld(geo: THREE.BufferGeometry, narrowAxis: NarrowAxis, a: number): THREE.BufferGeometry {
+/** A fresh translucent glass material (barely-there blue; depthWrite off so a
+ *  pane never occludes the sky/planet behind it). One per pane. */
+function newGlassMaterial(): THREE.MeshStandardMaterial {
+  return new THREE.MeshStandardMaterial({
+    color: 0x9bd4e8,
+    roughness: 0.1,
+    metalness: 0.2,
+    transparent: true,
+    opacity: 0.18,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+}
+
+/** World position of a strip-local point (u=along-extrude, v=across-edge). */
+function stripToWorld(
+  narrowAxis: NarrowAxis,
+  strip: StripEdge,
+  u: number,
+  v: number,
+): { x: number; y: number; z: number } {
+  return sectionToWorld(narrowAxis, strip.p0.a + strip.dir.a * v, strip.p0.y + strip.dir.y * v, u);
+}
+
+/** Remap a ShapeGeometry built in strip-local (u=along=x, v=across=y) onto the
+ *  strip (p0, dir): a = p0.a + dir.a·v, y = p0.y + dir.y·v, world =
+ *  sectionToWorld(narrowAxis, a, y, u). Reduces exactly to the old constant-`a`
+ *  wall remap for a vertical wall (p0.a const, y=v). */
+function remapStripToWorld(
+  geo: THREE.BufferGeometry,
+  narrowAxis: NarrowAxis,
+  p0: { a: number; y: number },
+  dir: { a: number; y: number },
+): THREE.BufferGeometry {
   const pos = geo.attributes.position;
   const world = new Float32Array(pos.count * 3);
   for (let i = 0; i < pos.count; i++) {
-    const w = sectionToWorld(narrowAxis, a, pos.getY(i), pos.getX(i));
+    const u = pos.getX(i);
+    const v = pos.getY(i);
+    const w = sectionToWorld(narrowAxis, p0.a + dir.a * v, p0.y + dir.y * v, u);
     world[i * 3] = w.x;
     world[i * 3 + 1] = w.y;
     world[i * 3 + 2] = w.z;
@@ -455,49 +506,51 @@ function remapWallToWorld(geo: THREE.BufferGeometry, narrowAxis: NarrowAxis, a: 
   return geo;
 }
 
-/** 🪟 The glass pane filling one window opening, on the side wall at `a`. */
-function glassGeometry(narrowAxis: NarrowAxis, a: number, o: WindowOpening): THREE.BufferGeometry {
+/** 🪟 The glass pane filling one window opening, on the strip (p0, dir). */
+function stripGlassGeometry(narrowAxis: NarrowAxis, strip: StripEdge, o: WindowOpening): THREE.BufferGeometry {
   const shape = new THREE.Shape();
-  applyRoundedRect(shape, o.along, o.y, o.w, o.h, o.r);
-  return remapWallToWorld(new THREE.ShapeGeometry(shape), narrowAxis, a);
+  applyRoundedRect(shape, o.along, o.across, o.w, o.h, o.r);
+  return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, strip.p0, strip.dir);
 }
 
 /**
- * 🪟 A side-wall face at narrow-axis coord `a`, spanning the long axis
- * [−longHalf, longHalf] × height [0, wallHeight]. No openings ⇒ a plain quad;
- * with openings ⇒ a ShapeGeometry (wall rect minus rounded-rect window holes),
- * triangulated in wall-local (u=along, v=height) then each vertex mapped to
- * world via sectionToWorld — no orientation math to get wrong.
+ * 🪟 A hull STRIP face, spanning the extrude axis [−longHalf, longHalf] × across
+ * [0, edgeLen]. No openings ⇒ a plain quad (the same 4 world corners as the
+ * legacy per-edge quad); with openings ⇒ a ShapeGeometry (strip rect minus
+ * rounded-rect window holes), triangulated in strip-local (u=along, v=across)
+ * then each vertex mapped to world via remapStripToWorld — no orientation math
+ * to get wrong. Works for every surface: vertical walls, 45° eaves/chamfers,
+ * and the horizontal ridge / basement floor alike.
  */
-function wallGeometry(
+function stripGeometry(
   narrowAxis: NarrowAxis,
-  a: number,
+  strip: StripEdge,
   longHalf: number,
-  wallHeight: number,
   openings: WindowOpening[] | undefined,
 ): THREE.BufferGeometry {
+  const { p0, dir, edgeLen } = strip;
   if (!openings || openings.length === 0) {
     return quadGeometry(
-      sectionToWorld(narrowAxis, a, 0, -longHalf),
-      sectionToWorld(narrowAxis, a, wallHeight, -longHalf),
-      sectionToWorld(narrowAxis, a, wallHeight, longHalf),
-      sectionToWorld(narrowAxis, a, 0, longHalf),
+      stripToWorld(narrowAxis, strip, -longHalf, 0),
+      stripToWorld(narrowAxis, strip, -longHalf, edgeLen),
+      stripToWorld(narrowAxis, strip, longHalf, edgeLen),
+      stripToWorld(narrowAxis, strip, longHalf, 0),
     );
   }
   const shape = new THREE.Shape();
   shape.moveTo(-longHalf, 0);
   shape.lineTo(longHalf, 0);
-  shape.lineTo(longHalf, wallHeight);
-  shape.lineTo(-longHalf, wallHeight);
+  shape.lineTo(longHalf, edgeLen);
+  shape.lineTo(-longHalf, edgeLen);
   shape.closePath();
   for (const o of openings) {
-    // clamp the opening inside the wall run + height so the hole never breaks
-    // the outline
+    // clamp the opening inside the strip run (along) + edge span (across) so the
+    // hole never breaks the outline (thin strips just centre it)
     const along = Math.max(-longHalf + o.w / 2 + 0.05, Math.min(longHalf - o.w / 2 - 0.05, o.along));
-    const cy = Math.max(o.h / 2 + 0.05, Math.min(wallHeight - o.h / 2 - 0.05, o.y));
-    shape.holes.push(roundedRectPath(along, cy, o.w, o.h, o.r));
+    const across = Math.max(o.h / 2 + 0.05, Math.min(edgeLen - o.h / 2 - 0.05, o.across));
+    shape.holes.push(roundedRectPath(along, across, o.w, o.h, o.r));
   }
-  return remapWallToWorld(new THREE.ShapeGeometry(shape), narrowAxis, a);
+  return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, p0, dir);
 }
 
 /** A double-sided quad (two triangles) from four world corners. */

@@ -118,16 +118,18 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull } from "./octagonHull";
-import type {
-  OctagonHull,
-  HullWindows,
-  WindowOpening,
-} from "./octagonHull";
+import type { OctagonHull } from "./octagonHull";
 import {
   readAllWindowLayout,
   subscribeWindowLayout,
 } from "./windowLayoutDoc";
-import { windowCenterWorld, windowBoxDims } from "./windowLayout";
+import {
+  surfaceCenterWorld,
+  surfaceBasis,
+  collectWindowOpenings,
+  WINDOW_BOX_THICKNESS,
+} from "./windowLayout";
+import type { OctagonProfile } from "./hullSection";
 import { getCameraYaw } from "./cameraRig";
 
 /**
@@ -934,7 +936,7 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     this.octagonHull = buildOctagonHull(
       { halfX, halfZ },
-      this.collectWindowOpenings(),
+      collectWindowOpenings(),
     );
     this.platformGroup.add(this.octagonHull.group);
     // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
@@ -945,6 +947,12 @@ export class World {
    *  (mirrors dockingSystem.getDoorGroups()). Invisible, but still raycasts. */
   public getWindowGroups(): Map<string, THREE.Group> {
     return this.windowGroups;
+  }
+
+  /** 🪟 #80 S4: the current octagon profile (for the editor's surface math), or
+   *  null when the octagon hull isn't built. */
+  public getOctagonProfile(): OctagonProfile | null {
+    return this.octagonHull?.profile ?? null;
   }
 
   /**
@@ -958,8 +966,9 @@ export class World {
    *
    * Rebuilt with the hull so the targets track every add / move / remove. The
    * boxes live in platformGroup beside the hull geometry (world-origin frame —
-   * windowCenterWorld maps straight through) and are only ever raycast BY edit
-   * mode, so they never intercept a normal floor click.
+   * surfaceCenterWorld maps straight through) and are only ever raycast BY edit
+   * mode, so they never intercept a normal floor click. Each box is ORIENTED to
+   * its surface (surfaceBasis) so eave / ridge / floor windows get a snug target.
    */
   private rebuildWindowClickBoxes(): void {
     for (const g of this.windowGroups.values()) {
@@ -974,10 +983,11 @@ export class World {
     this.windowGroups.clear();
     if (!OCTAGON_HULL) return;
     for (const rec of readAllWindowLayout().values()) {
-      const dims = windowBoxDims(rec.w, rec.h);
-      const c = windowCenterWorld(rec.wall, rec.along, rec.y);
+      const c = surfaceCenterWorld(rec.surface, rec.along, rec.across);
+      const { uDir, vDir, normal } = surfaceBasis(rec.surface);
       const box = new THREE.Mesh(
-        new THREE.BoxGeometry(dims.sx, dims.sy, dims.sz),
+        // local x=w along uDir, y=h along vDir, z=thickness along normal
+        new THREE.BoxGeometry(rec.w, rec.h, WINDOW_BOX_THICKNESS),
         new THREE.MeshBasicMaterial({
           color: 0xf0c060,
           transparent: true,
@@ -988,6 +998,9 @@ export class World {
         }),
       );
       box.position.set(c.x, c.y, c.z);
+      box.quaternion.setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(uDir, vDir, normal),
+      );
       box.name = `window-clickbox-${rec.id}`;
       const group = new THREE.Group();
       group.name = `window-${rec.id}`;
@@ -995,37 +1008,6 @@ export class World {
       this.platformGroup.add(group);
       this.windowGroups.set(rec.id, group);
     }
-  }
-
-  /**
-   * 🪟 #80: rounded-rect window openings cut from the octagon side walls (look
-   * outside). A demo opening rides `?octagon=1&window=1`; movable `window`
-   * furniture items map to openings here in a later slice (item world pos →
-   * which side wall + along-wall coord), the same way the pool drives floor
-   * holes. Rebuilt with the hull (addOctagonHull) whenever windows change.
-   */
-  private collectWindowOpenings(): HullWindows {
-    const neg: WindowOpening[] = [];
-    const pos: WindowOpening[] = [];
-    // Records store the octagon SIDE ('neg'/'pos') directly, so no cardinal
-    // mapping — resize-stable. Each record IS a WindowOpening plus id+wall.
-    for (const rec of readAllWindowLayout().values()) {
-      (rec.wall === "neg" ? neg : pos).push({
-        along: rec.along,
-        y: rec.y,
-        w: rec.w,
-        h: rec.h,
-        r: rec.r,
-      });
-    }
-    // Standalone demo window (?octagon=1&window=1) for quick preview.
-    if (new URLSearchParams(window.location.search).get("window") === "1") {
-      neg.push({ along: 0, y: 2, w: 3, h: 1.8, r: 0.5 });
-    }
-    return {
-      neg: neg.length ? neg : undefined,
-      pos: pos.length ? pos : undefined,
-    };
   }
 
   /**

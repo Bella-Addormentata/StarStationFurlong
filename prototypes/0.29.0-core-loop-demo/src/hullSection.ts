@@ -217,3 +217,91 @@ export function verticalFaceNormal(
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
+
+// ── Hull SURFACES (#80 S4 — windows on ANY strip) ────────────────────────────
+
+/**
+ * The 8 extruded strips of the octagon barrel, one per cross-section edge — the
+ * surfaces a window (rounded-rect hole + glass) can sit on. Named by region +
+ * side so they survive a room resize (the coordinates scale; the surface set
+ * and their order never change). Index-aligned to `SURFACE_BY_EDGE`.
+ */
+export type HullSurface =
+  | 'wall-neg'
+  | 'roof-neg'
+  | 'ridge'
+  | 'roof-pos'
+  | 'wall-pos'
+  | 'basement-pos'
+  | 'floor'
+  | 'basement-neg';
+
+/** All 8 surfaces (schema guard + editor selector cycle). */
+export const SURFACES: readonly HullSurface[] = [
+  'wall-neg',
+  'roof-neg',
+  'ridge',
+  'roof-pos',
+  'wall-pos',
+  'basement-pos',
+  'floor',
+  'basement-neg',
+];
+
+/** Edge index (in `OctagonProfile.edges` order) → the surface on that strip. */
+export const SURFACE_BY_EDGE: readonly HullSurface[] = [
+  'wall-neg', // 0 wall (−narrowHalf)
+  'roof-neg', // 1 roof-eave (−a)
+  'ridge', // 2 roof-ridge
+  'roof-pos', // 3 roof-eave (+a)
+  'wall-pos', // 4 wall (+narrowHalf)
+  'basement-pos', // 5 basement-chamfer (+a)
+  'floor', // 6 basement-floor
+  'basement-neg', // 7 basement-chamfer (−a)
+];
+
+/** A hull surface's cross-section edge, oriented for the `across` coordinate. */
+export interface StripEdge {
+  /** Reference origin in the cross-section (a, y): `across`=0 sits here. */
+  p0: SectionPoint;
+  /** Unit direction of INCREASING `across` in the (a, y) plane. */
+  dir: SectionPoint;
+  /** Length of the strip's cross-section edge (m): `across` ∈ [0, edgeLen]. */
+  edgeLen: number;
+}
+
+/**
+ * The cross-section edge of one hull surface, oriented so `across` reads
+ * intuitively: WALLS 0..wallHeight up from the floor (byte-identical to the old
+ * per-wall `y`); ROOF eaves up-slope from the wall top; BASEMENT chamfers
+ * down-slope from the floor edge; RIDGE / FLOOR from the −a end to the +a end.
+ *
+ * Pure and side-effect-free. A window at (along, across) on `surface` maps to
+ * world by: a = p0.a + dir.a·across, y = p0.y + dir.y·across, then
+ * sectionToWorld(narrowAxis, a, y, along). `p0 + dir·edgeLen` lands exactly on
+ * the matching outline vertex for every surface (golden-tested).
+ */
+export function surfaceEdge(profile: OctagonProfile, surface: HullSurface): StripEdge {
+  const { narrowHalf, wallHeight, ridgeHalf, ridgeY, basementHalf, basementDepth } = profile;
+  const s2 = Math.SQRT1_2; // 45° eave / chamfer components
+  const eaveLen = profile.eaveRun * Math.SQRT2;
+  const chamferLen = basementDepth * Math.SQRT2;
+  switch (surface) {
+    case 'wall-neg':
+      return { p0: { a: -narrowHalf, y: 0 }, dir: { a: 0, y: 1 }, edgeLen: wallHeight };
+    case 'wall-pos':
+      return { p0: { a: narrowHalf, y: 0 }, dir: { a: 0, y: 1 }, edgeLen: wallHeight };
+    case 'roof-neg':
+      return { p0: { a: -narrowHalf, y: wallHeight }, dir: { a: s2, y: s2 }, edgeLen: eaveLen };
+    case 'roof-pos':
+      return { p0: { a: narrowHalf, y: wallHeight }, dir: { a: -s2, y: s2 }, edgeLen: eaveLen };
+    case 'ridge':
+      return { p0: { a: -ridgeHalf, y: ridgeY }, dir: { a: 1, y: 0 }, edgeLen: 2 * ridgeHalf };
+    case 'basement-pos':
+      return { p0: { a: narrowHalf, y: 0 }, dir: { a: -s2, y: -s2 }, edgeLen: chamferLen };
+    case 'basement-neg':
+      return { p0: { a: -narrowHalf, y: 0 }, dir: { a: s2, y: -s2 }, edgeLen: chamferLen };
+    case 'floor':
+      return { p0: { a: -basementHalf, y: -basementDepth }, dir: { a: 1, y: 0 }, edgeLen: 2 * basementHalf };
+  }
+}

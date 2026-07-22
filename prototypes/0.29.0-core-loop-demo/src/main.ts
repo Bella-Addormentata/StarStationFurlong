@@ -93,7 +93,7 @@ import {
   seedDoorLayoutDefaults,
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
-import { bindWindowLayoutDoc } from "./windowLayoutDoc";
+import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import {
   bindRoomRoles,
   subscribeRoomRoles,
@@ -1244,6 +1244,9 @@ async function joinRoomAtEpoch(
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
     // tanks appear in the exterior as fittings land inside).
     subscribeFurniture(() => refreshExteriorView());
+    // 🪟 #80 S4: window changes recut the CURRENT room's exterior shell (holes +
+    // glass) while at zoom 3 — refreshExteriorView early-returns off-level.
+    subscribeWindowLayout(() => refreshExteriorView());
     // 🗺️ #62 P5: door changes update the atlas + the whole-station render.
     subscribeDoors(() => {
       harvestStationAtlas();

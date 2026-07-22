@@ -43,6 +43,7 @@ import {
 import type { VestibuleDoorId } from "./adapter";
 import type { DoorId } from "./doors";
 import { buildOctagonShell } from "./octagonHull";
+import { collectWindowOpenings } from "./windowLayout";
 import { roomHalfExtents } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
@@ -145,7 +146,10 @@ function buildGroup(): THREE.Group {
   // items below stay put.
   if (OCTAGON_HULL) {
     const { halfX, halfZ } = roomHalfExtents();
-    g.add(buildOctagonShell({ halfX, halfZ }).group);
+    // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
+    // exterior barrel (neighbour shells below stay windowless — other modules'
+    // windows aren't loaded here, by design).
+    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings()).group);
   } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.

@@ -77,13 +77,14 @@ import {
 import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
 import {
-  wallAndAlongFromPoint, snapWindowAlong, clampWindowAlong,
-  windowCenterWorld, windowBoxDims,
+  snapWindowAlong, clampWindowAlong, clampWindowAcross,
+  surfaceCenterWorld, surfaceBasis, WINDOW_BOX_THICKNESS,
 } from './windowLayout';
 import {
   writeWindowLayout, deleteWindowLayout, readAllWindowLayout, WINDOW_DEFAULT,
 } from './windowLayoutDoc';
-import type { WindowWall } from './windowLayoutDoc';
+import { SURFACES } from './hullSection';
+import type { HullSurface } from './hullSection';
 import { PLAYER_R } from './player';
 import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
@@ -371,25 +372,42 @@ const OCTAGON_HULL = new URLSearchParams(window.location.search).get('octagon') 
 
 export type WindowPlacementVerdict = { ok: true } | { ok: false; reason: string };
 
+/** Friendly labels for the surface selector chip. */
+const SURFACE_LABEL: Record<HullSurface, string> = {
+  'wall-neg': 'Wall −',
+  'wall-pos': 'Wall +',
+  'roof-neg': 'Eave −',
+  'roof-pos': 'Eave +',
+  ridge: 'Ridge (skylight)',
+  'basement-neg': 'Chamfer −',
+  'basement-pos': 'Chamfer +',
+  floor: 'Floor (pool bottom)',
+};
+
 /**
- * May a `w`-wide window sit on side wall `wall` at along-wall `along`? A window
- * only needs to clear the OTHER windows on the SAME wall (1-D interval gap on the
- * along-axis centres — centres must be ≥ (w+w')/2 apart), excluding `excludeId`.
- * The wall-run clamp (off the gable corners) is applied by the caller before
- * this, and octagonHull clamps again when it cuts the hole. Furniture is
- * irrelevant — a window is a hole high on the wall, not a floor obstacle. Pure;
- * drives both the ADD gate and the ghost's red/green.
+ * May a `w`×`h` window sit on `surface` at (along, across)? A window only needs
+ * to clear the OTHER windows on the SAME surface — a 2-D interval-overlap test
+ * on their centres (|Δalong| < (w+w')/2 AND |Δacross| < (h+h')/2), since windows
+ * can now stack on tall strips. `excludeId` skips the window being edited. The
+ * run/edge clamps are applied by the caller before this, and octagonHull clamps
+ * again when it cuts the hole. Furniture is irrelevant. Pure; drives both the
+ * ADD gate and the ghost's red/green.
  */
 export function validateWindowPlacement(
-  wall: WindowWall,
+  surface: HullSurface,
   along: number,
+  across: number,
   w: number,
+  h: number,
   excludeId?: string,
 ): WindowPlacementVerdict {
   for (const rec of readAllWindowLayout().values()) {
     if (rec.id === excludeId) continue;
-    if (rec.wall !== wall) continue;
-    if (Math.abs(rec.along - along) < (w + rec.w) / 2) {
+    if (rec.surface !== surface) continue;
+    if (
+      Math.abs(rec.along - along) < (w + rec.w) / 2 &&
+      Math.abs(rec.across - across) < (h + rec.h) / 2
+    ) {
       return { ok: false, reason: 'overlaps another window' };
     }
   }
@@ -451,16 +469,23 @@ class RoomEditController {
    *  select/hover/remove branch to the window path (writeWindowLayout /
    *  deleteWindowLayout). Rebuilt with the window raycast slice. */
   private windowIds: Set<string> = new Set();
-  /** 🪟 #80 S4: ADD-window sub-mode — the next floor click PLACES a window on the
-   *  clicked octagon side wall instead of selecting. Toggled by ＋ WINDOW. */
+  /** 🪟 #80 S4: ADD-window sub-mode — the next click PLACES a window on the
+   *  ACTIVE surface (windowSurface) instead of selecting. Toggled by ＋ WINDOW. */
   private addWindowMode = false;
+  /** 🪟 #80 S4: the hull surface the next window lands on. The pointer positions
+   *  the window ON this surface's plane; the SURFACE selector chip cycles it.
+   *  Fixed-iso camera (yaw only, no pitch) can't reach the horizontal ridge /
+   *  floor by picking geometry, so the surface is chosen explicitly. */
+  private windowSurface: HullSurface = 'wall-neg';
   /** 🪟 #80 S4: the translucent green/red window PREVIEW following the pointer
-   *  while add-window is armed — one reusable box (built on arm, hidden on
-   *  disarm, disposed on exit), exactly like the door ghost. */
+   *  while add-window is armed — one reusable box (built on arm, re-oriented on
+   *  surface switch, hidden on disarm, disposed on exit). */
   private windowGhost: THREE.Mesh | null = null;
   /** 🪟 #80 S4: the window ghost's current snapped placement + last verdict; the
    *  click commit reads THIS so the window drops where the preview showed. */
-  private ghostWindow: { wall: WindowWall; along: number; verdict: WindowPlacementVerdict } | null = null;
+  private ghostWindow:
+    | { surface: HullSurface; along: number; across: number; verdict: WindowPlacementVerdict }
+    | null = null;
 
   private hoveredId: string | null = null;
   private selectedId: string | null = null;
@@ -518,6 +543,13 @@ class RoomEditController {
 
   private raycaster = new THREE.Raycaster();
   private pointerNdc = new THREE.Vector2();
+  /** 🪟 #80 S4: scratch for the surface math-plane raycast (reused per move). */
+  private windowPlane = new THREE.Plane();
+  private windowAnchor = new THREE.Vector3();
+  private windowHit = new THREE.Vector3();
+  /** Last pointer position (client px) — lets the surface selector re-pose the
+   *  ghost immediately on a surface switch, without waiting for a mousemove. */
+  private lastPointer = { x: 0, y: 0, has: false };
 
   constructor() {
     // Esc precedence — same e.target guards as the phone (#31) and
@@ -562,6 +594,16 @@ class RoomEditController {
       if (!this.active || !this.carrying) return;
       e.preventDefault();
       this.cancelCarry(true);
+    });
+
+    // 🪟 #80 S4: [ / ] cycle the active window surface while add-window is armed.
+    window.addEventListener('keydown', (e) => {
+      if (!this.active || !this.addWindowMode) return;
+      if (e.key !== '[' && e.key !== ']') return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      e.preventDefault();
+      this.cycleWindowSurface(e.key === ']' ? 1 : -1);
     });
 
     // E3: R rotates the carried item a quarter-turn CCW (cheap on the
@@ -1550,7 +1592,7 @@ class RoomEditController {
   private tryPlaceWindowAt(clientX: number, clientY: number): void {
     this.updateWindowGhostFromPointer(clientX, clientY);
     const ghost = this.ghostWindow;
-    if (!ghost) return; // pointer wasn't over the floor plane
+    if (!ghost) return; // pointer wasn't over the surface plane
     if (!ghost.verdict.ok) {
       showHint(`CAN'T ADD WINDOW — ${ghost.verdict.reason}`, 2400);
       return; // stay armed so the owner can nudge to a clearer spot
@@ -1558,16 +1600,16 @@ class RoomEditController {
 
     writeWindowLayout({
       id: `w:${mintDoorId()}`, // a plain uuid; the `w:` marks a window record
-      wall: ghost.wall,
+      surface: ghost.surface,
       along: ghost.along,
-      y: WINDOW_DEFAULT.y,
+      across: ghost.across,
       w: WINDOW_DEFAULT.w,
       h: WINDOW_DEFAULT.h,
       r: WINDOW_DEFAULT.r,
       enabled: true,
     });
     this.setAddWindowMode(false); // hides the ghost
-    showHint('Window added — look outside.', 2000);
+    showHint(`Window added on ${SURFACE_LABEL[ghost.surface]} — look outside.`, 2200);
   }
 
   // ── Window ghost preview (#80 S4/ghost — furniture-like green/red follow) ────
@@ -1575,16 +1617,16 @@ class RoomEditController {
   /**
    * Lazily build (once) the reusable translucent window ghost, parented to the
    * SAME group the hull + click plane live in (platformGroup, via the click
-   * plane's parent — world-origin frame, so windowCenterWorld maps straight
-   * through). Sized like the default opening (windowBoxDims orients it to the
-   * room's narrow axis), coloured with the furniture carry's valid/invalid hexes.
+   * plane's parent — world-origin frame, so surfaceCenterWorld maps straight
+   * through). A default-sized box, coloured with the furniture carry's
+   * valid/invalid hexes; ORIENTED to the active surface each frame.
    */
   private ensureWindowGhost(): THREE.Mesh | null {
     if (this.windowGhost) return this.windowGhost;
     const parent = this.world?.getClickPlane()?.parent;
     if (!parent) return null;
-    const d = windowBoxDims(WINDOW_DEFAULT.w, WINDOW_DEFAULT.h);
-    const geo = new THREE.BoxGeometry(d.sx, d.sy, d.sz);
+    // local x=w along uDir, y=h along vDir, z=thickness along the surface normal
+    const geo = new THREE.BoxGeometry(WINDOW_DEFAULT.w, WINDOW_DEFAULT.h, WINDOW_BOX_THICKNESS);
     const mat = new THREE.MeshBasicMaterial({
       color: CARRY_VALID_EMISSIVE, // green; flipped red on invalid
       transparent: true,
@@ -1600,36 +1642,53 @@ class RoomEditController {
     return mesh;
   }
 
+  /** Orient the ghost box to the ACTIVE surface's world frame (surfaceBasis). */
+  private orientWindowGhost(): void {
+    const ghost = this.windowGhost;
+    if (!ghost) return;
+    const { uDir, vDir, normal } = surfaceBasis(this.windowSurface);
+    ghost.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(uDir, vDir, normal));
+  }
+
   /**
-   * Follow the pointer while add-window is armed: raycast the click plane →
-   * nearest side wall + along (wallAndAlongFromPoint) → snap to the 1 m lattice
-   * (snapWindowAlong) → clamp off the caps (clampWindowAlong) → pose the ghost at
-   * the opening centre (windowCenterWorld) → validate (validateWindowPlacement)
-   * and tint green/red. Off the plane → hide. Stashes {wall, along, verdict} in
-   * `ghostWindow` for the click commit.
+   * Follow the pointer while add-window is armed: intersect the pointer ray with
+   * the ACTIVE surface's MATH PLANE (a plane raycast reaches every surface —
+   * incl. the horizontal ridge / floor — regardless of occlusion, which a
+   * geometry raycast can't under the fixed-iso, yaw-only camera). Decompose the
+   * hit into (along, across) via the surface basis, snap to the 1 m lattice,
+   * clamp, pose + orient the ghost, validate, tint green/red. Off the plane →
+   * hide. Stashes {surface, along, across, verdict} for the click commit.
    */
   private updateWindowGhostFromPointer(clientX: number, clientY: number): void {
     const world = this.world;
     const camera = window.gameRenderer?.camera;
-    const plane = world?.getClickPlane();
-    if (!world || !camera || !plane) return;
+    if (!world || !camera) return;
     const ghost = this.ensureWindowGhost();
     if (!ghost) return;
+    this.lastPointer = { x: clientX, y: clientY, has: true };
     this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
     this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
     this.raycaster.setFromCamera(this.pointerNdc, camera);
-    const hits = this.raycaster.intersectObject(plane, false);
-    if (hits.length === 0) { this.hideWindowGhost(); return; }
 
-    const { wall, along } = wallAndAlongFromPoint(hits[0].point.x, hits[0].point.z);
-    const snapped = clampWindowAlong(snapWindowAlong(along), WINDOW_DEFAULT.w);
-    const c = windowCenterWorld(wall, snapped, WINDOW_DEFAULT.y);
+    const surface = this.windowSurface;
+    const { uDir, vDir, normal } = surfaceBasis(surface);
+    const a = surfaceCenterWorld(surface, 0, 0);
+    const anchor = this.windowAnchor.set(a.x, a.y, a.z);
+    const plane = this.windowPlane.setFromNormalAndCoplanarPoint(normal, anchor);
+    const hit = this.raycaster.ray.intersectPlane(plane, this.windowHit);
+    if (!hit) { this.hideWindowGhost(); return; } // ray parallel to the surface
+
+    const rel = hit.sub(anchor); // hit is windowHit; mutate in place
+    const along = clampWindowAlong(snapWindowAlong(rel.dot(uDir)), WINDOW_DEFAULT.w);
+    const across = clampWindowAcross(surface, snapWindowAlong(rel.dot(vDir)), WINDOW_DEFAULT.h);
+    const c = surfaceCenterWorld(surface, along, across);
     ghost.position.set(c.x, c.y, c.z);
+    this.orientWindowGhost();
     ghost.visible = true;
 
-    const verdict = validateWindowPlacement(wall, snapped, WINDOW_DEFAULT.w);
+    const verdict = validateWindowPlacement(surface, along, across, WINDOW_DEFAULT.w, WINDOW_DEFAULT.h);
     this.setWindowGhostColor(verdict.ok);
-    this.ghostWindow = { wall, along: snapped, verdict };
+    this.ghostWindow = { surface, along, across, verdict };
   }
 
   /** Flip the ghost between the furniture carry's green (valid) / red (invalid). */
@@ -2162,12 +2221,101 @@ class RoomEditController {
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
       this.ensureWindowGhost();
-      showHint('ADD WINDOW — move to a side wall (green = ok, red = blocked) · click to place · ＋/✕ to cancel', 3500);
+      this.orientWindowGhost();
+      this.showWindowSurfaceSelector();
+      showHint('ADD WINDOW — ◀ ▶ (or [ ]) picks the surface · move to aim (green = ok, red = blocked) · click to place · ＋/✕ to cancel', 4200);
     } else {
       this.setCanvasCursor('');
       this.hideWindowGhost();
+      this.hideWindowSurfaceSelector();
     }
     this.syncAddWindowButton();
+  }
+
+  // ── Window SURFACE selector (#80 S4 — reach all 8 strips) ───────────────────
+
+  /** The floating ◀ [surface] ▶ chip shown while add-window is armed. */
+  private windowSurfaceEl: HTMLDivElement | null = null;
+
+  private showWindowSurfaceSelector(): void {
+    if (!this.windowSurfaceEl) {
+      const bar = document.createElement('div');
+      bar.id = 'room-edit-window-surface';
+      bar.style.cssText = `
+        position: fixed;
+        top: 128px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(155, 212, 232, 0.6);
+        border-radius: 8px;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        color: #9bd4e8;
+        z-index: 4700;
+        white-space: nowrap;
+      `;
+      const mkArrow = (txt: string, delta: number): HTMLButtonElement => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = txt;
+        b.style.cssText = `
+          background: rgba(155, 212, 232, 0.14);
+          border: 1px solid rgba(155, 212, 232, 0.5);
+          border-radius: 5px;
+          color: #9bd4e8;
+          font: inherit;
+          padding: 2px 8px;
+          cursor: pointer;
+        `;
+        b.addEventListener('click', (e) => {
+          e.stopPropagation();
+          (e.currentTarget as HTMLButtonElement).blur();
+          this.cycleWindowSurface(delta);
+        });
+        return b;
+      };
+      const label = document.createElement('span');
+      label.id = 'room-edit-window-surface-label';
+      label.style.cssText = 'min-width: 120px; text-align: center;';
+      bar.appendChild(mkArrow('◀', -1));
+      bar.appendChild(label);
+      bar.appendChild(mkArrow('▶', 1));
+      document.body.appendChild(bar);
+      this.windowSurfaceEl = bar;
+    }
+    this.windowSurfaceEl.style.display = 'flex';
+    this.syncWindowSurfaceSelector();
+  }
+
+  private hideWindowSurfaceSelector(): void {
+    if (this.windowSurfaceEl) this.windowSurfaceEl.style.display = 'none';
+  }
+
+  private syncWindowSurfaceSelector(): void {
+    const label = document.getElementById('room-edit-window-surface-label');
+    if (label) label.textContent = SURFACE_LABEL[this.windowSurface];
+  }
+
+  /**
+   * Cycle the active window surface by `delta` (wraps). Re-orients the ghost and
+   * re-poses it at the last pointer position (so the preview jumps to the new
+   * surface immediately, no mousemove needed).
+   */
+  private cycleWindowSurface(delta: number): void {
+    const i = SURFACES.indexOf(this.windowSurface);
+    this.windowSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
+    this.syncWindowSurfaceSelector();
+    this.orientWindowGhost();
+    if (this.lastPointer.has) {
+      this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
+    }
   }
 
   /** Reproject the label (above) + REMOVE button (below) every frame. */
