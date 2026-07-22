@@ -166,6 +166,9 @@ export class World {
   private platformGroup: THREE.Group;
   private stationPlanet: THREE.Mesh | null = null;
   private platformFloor: THREE.Mesh | null = null;
+  /** 🛑📐 #80: XZ rectangles cut out of the solid floor (a pool sinks into the
+   *  basement through the hole). Empty ⇒ a plain solid floor plane. */
+  private floorHoles: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
   private platformGrid: THREE.GridHelper | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
@@ -467,8 +470,8 @@ export class World {
     const platformW = 2 * halfX,
       platformD = 2 * halfZ;
 
-    // Floor - warm light oak herringbone wood
-    const floorGeometry = new THREE.PlaneGeometry(platformW, platformD);
+    // Floor - warm light oak herringbone wood (solid, minus any pool holes)
+    const floorGeometry = this.makeFloorGeometry();
 
     // Build a canvas herringbone wood texture
     const makeWoodTexture = (): THREE.CanvasTexture => {
@@ -563,6 +566,25 @@ export class World {
     this.platformFloor = new THREE.Mesh(floorGeometry, floorMaterial);
     this.platformFloor.rotation.x = -Math.PI / 2;
     this.platformGroup.add(this.platformFloor);
+
+    // 🛑📐 #80: pool-hole cutter — exposed for testing + a demo hole under
+    // `?octagon=1&hole=1` (the floor is solid otherwise). The pool furniture /
+    // template will drive this for real in a later slice.
+    (
+      window as unknown as {
+        __ssfSetFloorHoles?: (
+          h: Array<{ x0: number; z0: number; x1: number; z1: number }>,
+        ) => void;
+      }
+    ).__ssfSetFloorHoles = (h) => this.setFloorHoles(h ?? []);
+    if (
+      OCTAGON_HULL &&
+      new URLSearchParams(window.location.search).get("hole") === "1"
+    ) {
+      this.setFloorHoles([
+        { x0: -halfX + 1, z0: -halfZ + 1.5, x1: -0.6, z1: halfZ - 1.5 },
+      ]);
+    }
 
     // ── Click-navigation plane ────────────────────────────────────────────────
     // Invisible horizontal plane covering the walkable floor used as the
@@ -885,6 +907,64 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     this.octagonHull = buildOctagonHull({ halfX, halfZ });
     this.platformGroup.add(this.octagonHull.group);
+  }
+
+  /**
+   * 🛑📐 #80: the floor plane — SOLID by default, with any `floorHoles` cut out
+   * (a pool sinks into the basement through the hole). No holes ⇒ a plain
+   * PlaneGeometry (bit-identical to the legacy floor). The outline is authored
+   * in plane coords (x, y=−z) so it lays flat under the mesh's rotation.x=−π/2,
+   * and UVs are remapped to 0..1 so the wood texture tiles exactly as before.
+   */
+  private makeFloorGeometry(): THREE.BufferGeometry {
+    const { halfX, halfZ } = roomHalfExtents();
+    const w = 2 * halfX,
+      d = 2 * halfZ;
+    if (this.floorHoles.length === 0) return new THREE.PlaneGeometry(w, d);
+    const shape = new THREE.Shape();
+    shape.moveTo(-halfX, -halfZ);
+    shape.lineTo(halfX, -halfZ);
+    shape.lineTo(halfX, halfZ);
+    shape.lineTo(-halfX, halfZ);
+    shape.closePath();
+    for (const h of this.floorHoles) {
+      const path = new THREE.Path();
+      const py0 = -h.z1,
+        py1 = -h.z0; // world z → plane y (the mesh is rotated -π/2)
+      path.moveTo(h.x0, py0);
+      path.lineTo(h.x1, py0);
+      path.lineTo(h.x1, py1);
+      path.lineTo(h.x0, py1);
+      path.closePath();
+      shape.holes.push(path);
+    }
+    const geo = new THREE.ShapeGeometry(shape);
+    // ShapeGeometry UVs are raw shape coords; remap to 0..1 across the floor so
+    // the wood texture's repeat matches the PlaneGeometry mapping.
+    const pos = geo.attributes.position;
+    const uv = new Float32Array(pos.count * 2);
+    for (let i = 0; i < pos.count; i++) {
+      uv[i * 2] = (pos.getX(i) + halfX) / w;
+      uv[i * 2 + 1] = (pos.getY(i) + halfZ) / d;
+    }
+    geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+    return geo;
+  }
+
+  /**
+   * 🛑📐 #80: set the pool holes cut from the solid floor (world XZ rects) and
+   * rebuild the floor mesh. Empty restores a solid floor. The invisible
+   * click-navigation plane is left intact (walking over a hole still resolves;
+   * the swim/sink-into-basement mechanic is a later slice).
+   */
+  public setFloorHoles(
+    holes: Array<{ x0: number; z0: number; x1: number; z1: number }>,
+  ): void {
+    this.floorHoles = holes.slice();
+    if (!this.platformFloor) return;
+    const old = this.platformFloor.geometry;
+    this.platformFloor.geometry = this.makeFloorGeometry();
+    old.dispose();
   }
 
   /**
@@ -2800,9 +2880,9 @@ export class World {
       // 🏊 Outdoor pool room: the floor stays hidden (the lazy-pool's deck
       // slabs are the visible floor; sunken water must show through).
       if (this.platformFloor) this.platformFloor.visible = !this.isOutdoorRoom;
-      // 🛑📐 #80 S1 preview: drop the opaque wood floor so the basement void
-      // below reads (the whole point of the sub-floor space). Preview-only.
-      if (OCTAGON_HULL && this.platformFloor) this.platformFloor.visible = false;
+      // 🛑📐 #80: the octagon floor is SOLID by default now (basement hidden
+      // beneath it); a hole is cut only where a pool sinks into the basement
+      // (setFloorHoles → makeFloorGeometry). No blanket hide.
       // 🧱🪟 Placed wall sections REPLACE a built-in side wall — the interior
       // restore must not resurrect a covered one (nor one dropped for 🛰️
       // HULL EDIT).
