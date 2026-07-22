@@ -6284,24 +6284,19 @@ export function getPoolIsland(items: FurnitureItem[]): {
 export function buildObstacleList(items: FurnitureItem[]): Box[] {
   const boxes: Box[] = [];
   for (const item of items) {
-    if (
-      OCTAGON_HULL &&
-      (item.kind === "lazy-pool" || item.kind === "classic-pool")
-    ) {
-      // 🕳️ #80: block only the GRID CELLS the water actually covers (merged),
-      // so the deck around the organic pool stays walkable — you SWIM over the
-      // water cells and WALK the deck. These are the SAME cells the floor hole
-      // cuts, so a hole is never walkable. Replaces the whole-water-rect
-      // footprintOverride obstacle. (Seat sit-points inside the water are
-      // teleport targets, not walked-to; the deck front-points stay reachable.)
-      boxes.push(...mergeCellsToRects(poolHoleCells([item])));
-      continue;
-    }
     const box = itemAabb(item);
     if (box) boxes.push(box);
   }
   return boxes;
 }
+// 🕳️ #80 NOTE: the pool's obstacle stays the (safe, established) water rect
+// footprintOverride — which fully CONTAINS the precise water-cell floor holes,
+// so you can never walk on a hole ("swim not walk" holds) and swim entry keeps
+// working via the seat jump-in + getPoolBasin auto-swim. Making the obstacle
+// itself cell-precise was walked back: it freed deck cells INSIDE the basin
+// rect, and the auto-swim net (keyed on that rect) would then swim a walker on
+// dry tile. Reconciling auto-swim to poolHoleCells is a follow-up (needs a live
+// pool room to verify the swim/jump-in against the true water cells).
 
 /**
  * Derive the world-space Seat list. `isWalkable(x, z)` samples the baked
