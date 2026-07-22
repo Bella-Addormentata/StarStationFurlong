@@ -6,16 +6,19 @@
  *   • 2 vertical SIDE WALLS  (the "central box" doors branch off)
  *   • 3 ROOF sections        (two 45° eaves + a flat ridge — equal length)
  *   • 3 BASEMENT sections    (two 45° chamfers + a flat basement floor)
- *   • 2 octagon END CAPS     (the gable ends at ±longHalf)
+ *   • 2 octagon END CAPS     — split into a wall band / roof gable / basement
+ *                              gable so each obeys the cutaway rule below
+ *
+ * Two builders share the geometry:
+ *   • `buildOctagonHull`  — the INTERIOR barrel (zoom ≤ 2). A one-way cutaway
+ *     (see `updateFacing`): in the iso view the near hull we look through is
+ *     fully hidden, the far vertical walls show their INSIDE surface, the roof
+ *     is gone, and the basement is a solid hull below; in first person you're
+ *     inside so everything (incl. the roof) is visible.
+ *   • `buildOctagonShell` — the EXTERIOR barrel (zoom ≥ 3), a plain solid hull.
  *
  * Faces are built from explicit corner vertices (a tiny BufferGeometry per
- * quad) so the geometry is EXACT — no rotation math to get subtly wrong — and
- * every vertical face carries its outward XZ normal for the camera-facing
- * transparency fade (`updateFacing`), a first cut at issue #80's requirement 4
- * ("near hull outside face invisible, far inside surface visible" in the iso
- * view; walls stay solid in first person). The full per-slice transparency +
- * neighbour-through-window work is a later slice — this is the preview.
- *
+ * quad) so the geometry is EXACT — no rotation math to get subtly wrong.
  * Gated behind `?octagon=1` in world.ts; nothing here runs by default.
  */
 
@@ -29,25 +32,23 @@ import {
   type SectionEdge,
 } from './hullSection';
 
-/** Resting opacities. FAR walls read as faint glass (matching the legacy 0.35
- *  tile-wall look); NEAR walls all but vanish so the iso camera sees inside. */
-const OPACITY = {
-  roof: 0.34,
-  basement: 0.92,
-  wallFar: 0.42,
-  wallNear: 0.05,
-  wallFirstPerson: 0.85,
-};
+const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
+/** First-person resting opacities (you're INSIDE — see everything). */
+const FP_OPACITY = { roof: 0.4, wall: 0.9 };
 
-/** Same split threshold the #51 door fade uses (docking.ts) — a face whose
- *  outward normal dots the camera direction above this is "near" the camera. */
-const NEAR_DOT = 0.3;
+/** A face whose outward normal dots the camera direction above this is "near"
+ *  the camera (its outside is toward us). Same idiom as the #51 door fade. */
+const NEAR_DOT = 0.25;
 
-/** A vertical hull face that participates in the camera-facing fade. */
-interface OctagonFace {
+/** A vertical hull face (side wall or end-cap wall band) — camera-facing culled. */
+interface WallFace {
   mesh: THREE.Mesh;
   material: THREE.MeshStandardMaterial;
   normal: { x: number; z: number };
+}
+interface HullMesh {
+  mesh: THREE.Mesh;
+  material: THREE.MeshStandardMaterial;
 }
 
 export interface OctagonHull {
@@ -55,9 +56,14 @@ export interface OctagonHull {
   group: THREE.Group;
   profile: OctagonProfile;
   /**
-   * Drive per-face transparency for the current camera. `camDirX/Z` is the
-   * (unit) XZ direction from the room origin toward the camera; `firstPerson`
-   * keeps every wall solid (you are inside, looking around).
+   * Drive the cutaway for the current camera. `camDirX/Z` is the (unit) XZ
+   * direction from the room origin toward the camera.
+   *  - ISO (firstPerson=false): a one-way cutaway — the NEAR hull we look
+   *    through is FULLY hidden, the FAR vertical walls render their INSIDE
+   *    surface (opaque), the ROOF is gone entirely, and the BASEMENT stays a
+   *    solid hull below. Recomputed each frame so it tracks the rig rotation.
+   *  - FIRST PERSON (firstPerson=true): you're inside — all walls solid, the
+   *    roof visible (translucent, #80 wants the roof seen in first person).
    */
   updateFacing(camDirX: number, camDirZ: number, firstPerson: boolean): void;
   /** Dispose all geometry + materials. */
@@ -70,115 +76,170 @@ export interface OctagonHull {
  */
 export function buildOctagonHull(opts: HullSectionOpts): OctagonHull {
   const profile = computeOctagonProfile(opts);
-  const { narrowAxis, longHalf, outline, edges } = profile;
+  const {
+    narrowAxis,
+    longHalf,
+    outline,
+    edges,
+    narrowHalf,
+    ridgeHalf,
+    wallHeight,
+    ridgeY,
+    basementHalf,
+    basementDepth,
+  } = profile;
 
   const group = new THREE.Group();
   group.name = 'octagonHull';
 
   const geometries: THREE.BufferGeometry[] = [];
   const materials: THREE.Material[] = [];
-  const faces: OctagonFace[] = [];
+  const wallFaces: WallFace[] = [];
+  const roofMeshes: HullMesh[] = [];
+  const basementMeshes: HullMesh[] = [];
 
-  const mkMat = (color: number, opacity: number, depthWrite: boolean) => {
+  const mkMat = (color: number, depthWrite = true) => {
     const mat = new THREE.MeshStandardMaterial({
       color,
       roughness: 0.55,
       metalness: 0.15,
       transparent: true,
-      opacity,
-      side: THREE.DoubleSide,
+      opacity: 1,
+      side: THREE.DoubleSide, // far wall shows its INSIDE face toward the camera
       depthWrite,
     });
-    mat.userData.baseOpacity = opacity;
     materials.push(mat);
     return mat;
   };
 
-  // ── The 8 extruded strips (one per octagon edge) ───────────────────────────
+  // ── The 8 extruded strips (one per octagon edge), sorted into wall / roof /
+  //    basement so the cutaway can treat each region differently. ────────────
   let wallIndex = 0; // 0 = negative-a wall, 1 = positive-a wall (edge order)
   for (const edge of edges) {
     const p0 = outline[edge.from];
     const p1 = outline[edge.to];
-    // Quad corners, CCW looking from outside: near-end bottom, near-end top,
-    // far-end top, far-end bottom (bottom = edge.from, top = edge.to).
-    const c0 = sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf);
-    const c1 = sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf);
-    const c2 = sectionToWorld(narrowAxis, p1.a, p1.y, longHalf);
-    const c3 = sectionToWorld(narrowAxis, p0.a, p0.y, longHalf);
-
-    const { color, opacity, depthWrite } = stripStyle(edge);
-    const mat = mkMat(color, opacity, depthWrite);
-    const geo = quadGeometry(c0, c1, c2, c3);
+    const geo = quadGeometry(
+      sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf),
+      sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf),
+      sectionToWorld(narrowAxis, p1.a, p1.y, longHalf),
+      sectionToWorld(narrowAxis, p0.a, p0.y, longHalf),
+    );
     geometries.push(geo);
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.name = `octagon-${edge.kind}`;
-    group.add(mesh);
-
     if (edge.kind === 'wall') {
+      const mat = mkMat(HULL_COLOR.wall);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.name = 'octagon-wall';
+      group.add(mesh);
       const which = wallIndex === 0 ? 'wall-neg' : 'wall-pos';
-      faces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which) });
+      wallFaces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which) });
       wallIndex++;
+    } else if (edge.kind.startsWith('roof')) {
+      const mat = mkMat(HULL_COLOR.roof, false);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.name = `octagon-${edge.kind}`;
+      group.add(mesh);
+      roofMeshes.push({ mesh, material: mat });
+    } else {
+      const mat = mkMat(HULL_COLOR.basement);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.name = `octagon-${edge.kind}`;
+      group.add(mesh);
+      basementMeshes.push({ mesh, material: mat });
     }
   }
 
-  // ── The 2 octagon end caps (gable ends), fan-triangulated ──────────────────
+  // ── The 2 octagon END CAPS (gable ends) — split into wall band / roof gable /
+  //    basement gable so each obeys the same cutaway rule as the strips. ──────
   for (const sign of [-1, 1] as const) {
-    const mat = mkMat(0x2f4256, sign > 0 ? OPACITY.wallFar : OPACITY.wallNear, true);
-    const geo = capGeometry(profile, sign * longHalf);
-    geometries.push(geo);
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.name = 'octagon-end-cap';
-    group.add(mesh);
-    faces.push({
-      mesh,
-      material: mat,
-      normal: verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg'),
-    });
+    const b = sign * longHalf;
+    const normal = verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg');
+    const capQuad = (
+      pa: { a: number; y: number },
+      pb: { a: number; y: number },
+      pc: { a: number; y: number },
+      pd: { a: number; y: number },
+    ) => {
+      const geo = quadGeometry(
+        sectionToWorld(narrowAxis, pa.a, pa.y, b),
+        sectionToWorld(narrowAxis, pb.a, pb.y, b),
+        sectionToWorld(narrowAxis, pc.a, pc.y, b),
+        sectionToWorld(narrowAxis, pd.a, pd.y, b),
+      );
+      geometries.push(geo);
+      return geo;
+    };
+    // wall band (vertical [0, wallHeight])
+    {
+      const mat = mkMat(HULL_COLOR.wall);
+      const mesh = new THREE.Mesh(
+        capQuad(
+          { a: -narrowHalf, y: 0 },
+          { a: -narrowHalf, y: wallHeight },
+          { a: narrowHalf, y: wallHeight },
+          { a: narrowHalf, y: 0 },
+        ),
+        mat,
+      );
+      mesh.name = 'octagon-cap-wall';
+      group.add(mesh);
+      wallFaces.push({ mesh, material: mat, normal });
+    }
+    // roof gable (trapezoid above the walls)
+    {
+      const mat = mkMat(HULL_COLOR.roof, false);
+      const mesh = new THREE.Mesh(
+        capQuad(
+          { a: -narrowHalf, y: wallHeight },
+          { a: -ridgeHalf, y: ridgeY },
+          { a: ridgeHalf, y: ridgeY },
+          { a: narrowHalf, y: wallHeight },
+        ),
+        mat,
+      );
+      mesh.name = 'octagon-cap-roof';
+      group.add(mesh);
+      roofMeshes.push({ mesh, material: mat });
+    }
+    // basement gable (trapezoid below the floor)
+    {
+      const mat = mkMat(HULL_COLOR.basement);
+      const mesh = new THREE.Mesh(
+        capQuad(
+          { a: -narrowHalf, y: 0 },
+          { a: narrowHalf, y: 0 },
+          { a: basementHalf, y: -basementDepth },
+          { a: -basementHalf, y: -basementDepth },
+        ),
+        mat,
+      );
+      mesh.name = 'octagon-cap-basement';
+      group.add(mesh);
+      basementMeshes.push({ mesh, material: mat });
+    }
   }
 
-  // ── Bright edge outline — draws OVER everything (depthTest off) so the 8-sided
-  //    octagon barrel is unmistakable even where the faces are see-through and
-  //    even the basement edges read THROUGH the floor. (Preview affordance.)
-  {
-    const linePts: number[] = [];
-    const push = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => {
-      linePts.push(a.x, a.y, a.z, b.x, b.y, b.z);
-    };
-    const n = outline.length;
-    for (let i = 0; i < n; i++) {
-      const p = outline[i];
-      const q = outline[(i + 1) % n];
-      // the two octagon rings (near + far end caps)
-      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, q.a, q.y, -longHalf));
-      push(sectionToWorld(narrowAxis, p.a, p.y, longHalf), sectionToWorld(narrowAxis, q.a, q.y, longHalf));
-      // the longitudinal connector at this vertex
-      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, p.a, p.y, longHalf));
-    }
-    const edgeGeo = new THREE.BufferGeometry();
-    edgeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(linePts), 3));
-    geometries.push(edgeGeo);
-    const edgeMat = new THREE.LineBasicMaterial({
-      color: 0x5fe6ff,
-      transparent: true,
-      opacity: 0.9,
-      depthTest: false,
-      depthWrite: false,
-    });
-    materials.push(edgeMat);
-    const edgeLines = new THREE.LineSegments(edgeGeo, edgeMat);
-    edgeLines.name = 'octagon-edges';
-    edgeLines.renderOrder = 10; // draw on top
-    group.add(edgeLines);
-  }
+  const setMesh = (m: HullMesh, visible: boolean, opacity: number) => {
+    m.mesh.visible = visible;
+    m.material.opacity = opacity;
+    m.material.transparent = opacity < 0.999;
+  };
 
   const updateFacing = (camDirX: number, camDirZ: number, firstPerson: boolean) => {
-    for (const face of faces) {
-      if (firstPerson) {
-        face.material.opacity = OPACITY.wallFirstPerson;
-        continue;
-      }
-      const dot = face.normal.x * camDirX + face.normal.z * camDirZ;
-      face.material.opacity = dot > NEAR_DOT ? OPACITY.wallNear : OPACITY.wallFar;
+    if (firstPerson) {
+      // Inside: everything visible; roof translucent, walls near-solid.
+      for (const m of roofMeshes) setMesh(m, true, FP_OPACITY.roof);
+      for (const m of wallFaces) setMesh(m, true, FP_OPACITY.wall);
+      for (const m of basementMeshes) setMesh(m, true, 1);
+      return;
+    }
+    // Iso cutaway: no roof; solid basement hull; near/side walls fully hidden;
+    // far walls opaque (their inside surface faces the camera).
+    for (const m of roofMeshes) m.mesh.visible = false;
+    for (const m of basementMeshes) setMesh(m, true, 1);
+    for (const f of wallFaces) {
+      const dot = f.normal.x * camDirX + f.normal.z * camDirZ;
+      if (dot < -NEAR_DOT) setMesh(f, true, 1); // FAR — show inside, opaque
+      else f.mesh.visible = false; // NEAR or side-on — completely transparent
     }
   };
 
@@ -213,8 +274,8 @@ export interface OctagonShell {
  * 🛑🛰️ Build a SOLID octagon shell — the module seen FROM OUTSIDE at zoom ≥ 3
  * (the exterior / atlas view). Opaque metallic faces (roof / walls / basement
  * tinted apart) plus a seam outline so the 8-sided barrel reads at a glance.
- * Unlike `buildOctagonHull` (the translucent, camera-faded interior barrel),
- * this is a plain outward-facing hull with no per-frame fade.
+ * Unlike `buildOctagonHull` (the interior cutaway barrel), this is a plain
+ * outward-facing hull with no per-frame fade.
  */
 export function buildOctagonShell(
   opts: HullSectionOpts,
@@ -300,29 +361,6 @@ export function buildOctagonShell(
     group.clear();
   };
   return { group, dispose };
-}
-
-/** Colour/opacity/depthWrite for a strip by its edge kind. */
-function stripStyle(edge: SectionEdge): {
-  color: number;
-  opacity: number;
-  depthWrite: boolean;
-} {
-  switch (edge.kind) {
-    case 'roof-eave':
-    case 'roof-ridge':
-      // Glassy blue roof — translucent, always visible; depthWrite off so the
-      // interior reads through it cleanly.
-      return { color: 0x9bd4e8, opacity: OPACITY.roof, depthWrite: false };
-    case 'basement-chamfer':
-    case 'basement-floor':
-      // Slate basement pit — near-opaque so it reads as a real void below.
-      return { color: 0x24313f, opacity: OPACITY.basement, depthWrite: true };
-    case 'wall':
-    default:
-      // Side walls start at the FAR opacity; updateFacing overrides per frame.
-      return { color: 0x2f4256, opacity: OPACITY.wallFar, depthWrite: true };
-  }
 }
 
 /** A double-sided quad (two triangles) from four world corners. */
