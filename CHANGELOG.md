@@ -12,6 +12,34 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.26 — 2026-07-22
+
+### ⏏ UNDOCK a permanently docked module from the door panel
+
+The missing inverse of PROVISION / INITIATE: the door panel can now **remove a
+permanently docked module**. Until now only transient guest berths had a DETACH —
+a provisioned or paired module was station-graph-permanent with no way back (the
+POSITION row even said "unpair first" with no way to unpair).
+
+- The docking panel's DOOR POLICY section gains a **🧩 DOCKED MODULE · <address>**
+  row with an **⏏ UNDOCK** button whenever that door holds a live PERMANENT
+  pairing. **Owner-only** — transient berths keep their own everyone-visible
+  DETACH row, and the two rows are mutually exclusive by construction.
+- **Two-click arm/confirm:** the first click flips the row to a red
+  **⚠ REALLY UNDOCK? / ⏏ CONFIRM** state; only the second click executes. Arming
+  never survives a pane re-open, and the handler re-checks the live pairing state
+  before acting (a stale row click is a no-op).
+- Undocking **deletes the door-pairing record** from the shared doors doc — the
+  same reconcile path the transient DETACH uses (`clearRemotePairing`) tears down
+  the projection and re-locks the door on every client. **The module's room doc
+  survives on the node**: re-dock its address (KNOWN MODULES / MODULE LEDGER) to
+  restore it, furniture intact.
+- Verified live: a provisioned module's door shows the row; first click arms,
+  second click detaches (projection gone, door re-locked, LED off green); the
+  detached room re-docks by address; `tsc` clean.
+- **Release line:** version bumped to 0.33.26, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
 ## v0.33.25 — 2026-07-22
 
 ### 🧭 Dev-menu guardrails — 🏠 GO HOME + a confirm on room templates
