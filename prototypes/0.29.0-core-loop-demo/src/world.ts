@@ -997,13 +997,16 @@ export class World {
           visible: false, // shown only while hovered / selected in edit mode
         }),
       );
-      box.position.set(c.x, c.y, c.z);
       box.quaternion.setFromRotationMatrix(
         new THREE.Matrix4().makeBasis(uDir, vDir, normal),
       );
       box.name = `window-clickbox-${rec.id}`;
       const group = new THREE.Group();
       group.name = `window-${rec.id}`;
+      // The world offset lives on the GROUP (box stays at local origin), so
+      // group.position IS the window centre — matching the furniture/door
+      // convention the edit-mode label/REMOVE anchor (updateLabelPosition) reads.
+      group.position.set(c.x, c.y, c.z);
       group.add(box);
       this.platformGroup.add(group);
       this.windowGroups.set(rec.id, group);

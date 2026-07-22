@@ -96,6 +96,14 @@ export function surfaceEdgeLen(surface: HullSurface): number {
   return surfaceEdge(profile(), surface).edgeLen;
 }
 
+/** Whether a `w`×`h` window physically fits on `surface` (else the editor must
+ *  reject it — a hole bigger than the strip breaks the hull triangulation, so
+ *  octagonHull drops it too). Matches octagonHull.clampOpening's fit test. */
+export function windowFitsSurface(surface: HullSurface, w: number, h: number): boolean {
+  const p = profile();
+  return w <= 2 * p.longHalf - 0.1 && h <= surfaceEdge(p, surface).edgeLen - 0.1;
+}
+
 /**
  * Convenience: map a clicked FLOOR point (world x, z) to the nearer of the two
  * vertical SIDE walls — the sane default surface when arming the editor. The

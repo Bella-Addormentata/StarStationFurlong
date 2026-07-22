@@ -77,7 +77,7 @@ import {
 import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
 import {
-  snapWindowAlong, clampWindowAlong, clampWindowAcross,
+  snapWindowAlong, clampWindowAlong, clampWindowAcross, windowFitsSurface,
   surfaceCenterWorld, surfaceBasis, WINDOW_BOX_THICKNESS,
 } from './windowLayout';
 import {
@@ -401,6 +401,12 @@ export function validateWindowPlacement(
   h: number,
   excludeId?: string,
 ): WindowPlacementVerdict {
+  // A window bigger than the strip can't be cut (the hull drops overflowing
+  // holes to avoid broken triangulation), so reject it here — the ghost reads
+  // red instead of committing a window that would silently fail to render.
+  if (!windowFitsSurface(surface, w, h)) {
+    return { ok: false, reason: 'too big for this surface' };
+  }
   for (const rec of readAllWindowLayout().values()) {
     if (rec.id === excludeId) continue;
     if (rec.surface !== surface) continue;
@@ -981,9 +987,19 @@ class RoomEditController {
     this.indexWindowGroups(world);
 
     // A hovered window that vanished lets go of its (disposed) handle; a
-    // surviving selected window re-asserts its highlight, and a selected window
+    // surviving hovered window re-asserts its wash (its box was rebuilt fresh /
+    // un-washed, and the next setHovered would early-return on the unchanged id).
+    if (this.hoveredId && !this.isKnownId(this.hoveredId)) {
+      this.hoveredId = null;
+    } else if (
+      this.hoveredId &&
+      this.windowIds.has(this.hoveredId) &&
+      this.hoveredId !== this.selectedId
+    ) {
+      this.applyTint(this.hoveredId, HOVER_EMISSIVE, HOVER_INTENSITY);
+    }
+    // A surviving selected window re-asserts its highlight, and a selected window
     // that was removed (gone from every index) drops its selection.
-    if (this.hoveredId && !this.isKnownId(this.hoveredId)) this.hoveredId = null;
     if (this.selectedId && this.windowIds.has(this.selectedId)) {
       this.applyTint(this.selectedId, SELECT_EMISSIVE, SELECT_INTENSITY);
     } else if (
@@ -2228,6 +2244,9 @@ class RoomEditController {
       this.setCanvasCursor('');
       this.hideWindowGhost();
       this.hideWindowSurfaceSelector();
+      // Drop the stale pointer sample so a re-arm + surface-cycle before the
+      // next mousemove doesn't re-pose the ghost to an old screen point.
+      this.lastPointer.has = false;
     }
     this.syncAddWindowButton();
   }

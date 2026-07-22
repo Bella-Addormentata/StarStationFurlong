@@ -147,7 +147,9 @@ export function buildOctagonHull(
   edges.forEach((edge, edgeIndex) => {
     const surface = SURFACE_BY_EDGE[edgeIndex];
     const strip = surfaceEdge(profile, surface);
-    const openings = windows[surface];
+    // Clamp openings to fit the strip ONCE (drops any too big to fit), so the
+    // hole and its glass share identical, in-bounds coordinates.
+    const openings = clampedOpenings(windows[surface], strip, longHalf);
     const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
     geometries.push(geo);
 
@@ -155,7 +157,7 @@ export function buildOctagonHull(
     // through it is the point; depthWrite off so it never occludes the sky).
     // Collected so the cutaway toggles each pane with its owning face.
     const glass: THREE.Mesh[] = [];
-    if (openings) {
+    {
       for (const o of openings) {
         const gGeo = stripGlassGeometry(narrowAxis, strip, o);
         geometries.push(gGeo);
@@ -373,7 +375,7 @@ export function buildOctagonShell(
   edges.forEach((edge, edgeIndex) => {
     const surface = SURFACE_BY_EDGE[edgeIndex];
     const strip = surfaceEdge(profile, surface);
-    const openings = windows[surface];
+    const openings = clampedOpenings(windows[surface], strip, longHalf);
     const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(faceColor(edge.kind)));
@@ -381,16 +383,14 @@ export function buildOctagonShell(
     group.add(mesh);
     // 🪟 the CURRENT room's windows show as holes + glass on the solid exterior
     // barrel (no cutaway here, so every surface's panes render plainly).
-    if (openings) {
-      for (const o of openings) {
-        const gGeo = stripGlassGeometry(narrowAxis, strip, o);
-        geometries.push(gGeo);
-        const gMat = newGlassMaterial();
-        materials.push(gMat);
-        const gMesh = new THREE.Mesh(gGeo, gMat);
-        gMesh.name = 'octagon-shell-window-glass';
-        group.add(gMesh);
-      }
+    for (const o of openings) {
+      const gGeo = stripGlassGeometry(narrowAxis, strip, o);
+      geometries.push(gGeo);
+      const gMat = newGlassMaterial();
+      materials.push(gMat);
+      const gMesh = new THREE.Mesh(gGeo, gMat);
+      gMesh.name = 'octagon-shell-window-glass';
+      group.add(gMesh);
     }
   });
   for (const sign of [-1, 1] as const) {
@@ -513,6 +513,42 @@ function stripGlassGeometry(narrowAxis: NarrowAxis, strip: StripEdge, o: WindowO
   return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, strip.p0, strip.dir);
 }
 
+/** Inset keeping an opening off the strip ends (so the hole stays strictly
+ *  inside the outline — ShapeGeometry triangulation requires it). */
+const WINDOW_INSET = 0.05;
+
+/**
+ * 🪟 Clamp one opening to fit the strip, returning in-bounds (along, across) — or
+ * null when the opening is simply too big for the strip (a thin ridge / floor /
+ * eave, or a room resize shrank the surface below the stored window size). A
+ * hole that overflows the outline breaks THREE.ShapeUtils.triangulateShape
+ * (self-intersecting triangles → a garbled/missing face), so we DROP it rather
+ * than emit a broken pane. The hole and its glass both consume this result, so
+ * they can never diverge.
+ */
+function clampOpening(strip: StripEdge, longHalf: number, o: WindowOpening): WindowOpening | null {
+  if (o.w > 2 * longHalf - 2 * WINDOW_INSET || o.h > strip.edgeLen - 2 * WINDOW_INSET) return null;
+  const along = Math.max(-longHalf + o.w / 2 + WINDOW_INSET, Math.min(longHalf - o.w / 2 - WINDOW_INSET, o.along));
+  const across = Math.max(o.h / 2 + WINDOW_INSET, Math.min(strip.edgeLen - o.h / 2 - WINDOW_INSET, o.across));
+  return { ...o, along, across };
+}
+
+/** Map + clamp a surface's raw openings to the ones that actually fit. */
+function clampedOpenings(
+  raw: WindowOpening[] | undefined,
+  strip: StripEdge,
+  longHalf: number,
+): WindowOpening[] {
+  const out: WindowOpening[] = [];
+  if (raw) {
+    for (const o of raw) {
+      const c = clampOpening(strip, longHalf, o);
+      if (c) out.push(c);
+    }
+  }
+  return out;
+}
+
 /**
  * 🪟 A hull STRIP face, spanning the extrude axis [−longHalf, longHalf] × across
  * [0, edgeLen]. No openings ⇒ a plain quad (the same 4 world corners as the
@@ -520,16 +556,17 @@ function stripGlassGeometry(narrowAxis: NarrowAxis, strip: StripEdge, o: WindowO
  * rounded-rect window holes), triangulated in strip-local (u=along, v=across)
  * then each vertex mapped to world via remapStripToWorld — no orientation math
  * to get wrong. Works for every surface: vertical walls, 45° eaves/chamfers,
- * and the horizontal ridge / basement floor alike.
+ * and the horizontal ridge / basement floor alike. `openings` are already
+ * clamped-to-fit (clampedOpenings) by the caller.
  */
 function stripGeometry(
   narrowAxis: NarrowAxis,
   strip: StripEdge,
   longHalf: number,
-  openings: WindowOpening[] | undefined,
+  openings: WindowOpening[],
 ): THREE.BufferGeometry {
   const { p0, dir, edgeLen } = strip;
-  if (!openings || openings.length === 0) {
+  if (openings.length === 0) {
     return quadGeometry(
       stripToWorld(narrowAxis, strip, -longHalf, 0),
       stripToWorld(narrowAxis, strip, -longHalf, edgeLen),
@@ -544,11 +581,7 @@ function stripGeometry(
   shape.lineTo(-longHalf, edgeLen);
   shape.closePath();
   for (const o of openings) {
-    // clamp the opening inside the strip run (along) + edge span (across) so the
-    // hole never breaks the outline (thin strips just centre it)
-    const along = Math.max(-longHalf + o.w / 2 + 0.05, Math.min(longHalf - o.w / 2 - 0.05, o.along));
-    const across = Math.max(o.h / 2 + 0.05, Math.min(edgeLen - o.h / 2 - 0.05, o.across));
-    shape.holes.push(roundedRectPath(along, across, o.w, o.h, o.r));
+    shape.holes.push(roundedRectPath(o.along, o.across, o.w, o.h, o.r));
   }
   return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, p0, dir);
 }
