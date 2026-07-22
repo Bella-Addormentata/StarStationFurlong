@@ -6288,6 +6288,42 @@ export function mergeCellsToRects(cells: Set<string>): Box[] {
 }
 
 /**
+ * 🕳️ #80: the pool water OUTLINE as world-XZ points — the EXACT floor-hole
+ * shape, so no solid floor peeks over the water (the blocky 1 m cell holes
+ * couldn't match the organic curve). Lazy pool → the lazy-river OUTER curve;
+ * classic pool → the water rect. Transformed by the pool's pose. The floor hole
+ * is purely visual (the pool OBSTACLE is a separate rect — buildObstacleList),
+ * so an organic hole is safe for pathfinding. Null when there's no pool.
+ */
+export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: number }> | null {
+  const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+  if (!pool) return null;
+  let local: Array<{ x: number; z: number }>;
+  if (pool.kind === "classic-pool") {
+    // Rectangular water footprint.
+    local = [
+      { x: -POOL_WATER_WEST, z: -POOL_WATER_HALFZ },
+      { x: POOL_WATER_EAST, z: -POOL_WATER_HALFZ },
+      { x: POOL_WATER_EAST, z: POOL_WATER_HALFZ },
+      { x: -POOL_WATER_WEST, z: POOL_WATER_HALFZ },
+    ];
+  } else {
+    // Lazy-river OUTER curve, sampled at the SAME resolution as the water mesh
+    // (ShapeGeometry(shape, 48)) so the hole edge coincides with the water edge —
+    // no floor sliver, no over-cut. The water mesh is rotateX(−π/2), so a shape
+    // point (x, y) maps to world-local (x, −y) — the mapping poolHoleCells uses.
+    local = lazyRiverShape()
+      .getPoints(48)
+      .map((p) => ({ x: p.x, z: -p.y }));
+  }
+  // Local → world by the pool's pose (cardinal rot + offset).
+  return local.map((p) => {
+    const r = rotXZ(p.x, p.z, pool.rot);
+    return { x: pool.pos.x + r.x, z: pool.pos.z + r.z };
+  });
+}
+
+/**
  * 🕳️ #80: the world XZ rectangle bounding a pool's water footprint (west
  * waterline → east tile wall × ±halfZ). Used for the water-cell scan bounds and
  * the rect basin bottom. Rotates/offsets with the item (cardinal rots only,

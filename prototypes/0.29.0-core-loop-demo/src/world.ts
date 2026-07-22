@@ -49,8 +49,7 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
-  poolHoleCells,
-  mergeCellsToRects,
+  poolHoleOutline,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -182,6 +181,9 @@ export class World {
   /** 🛑📐 #80: XZ rectangles cut out of the solid floor (a pool sinks into the
    *  basement through the hole). Empty ⇒ a plain solid floor plane. */
   private floorHoles: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
+  /** 🕳️ #80: arbitrary POLYGON holes cut from the floor (world XZ) — the pool's
+   *  exact water outline, so no floor peeks over the organic water. */
+  private floorHoleOutlines: Array<Array<{ x: number; z: number }>> = [];
   /** JSON of the last-applied floorHoles ("[]" = the initial solid floor) —
    *  skips redundant geometry rebuilds. */
   private floorHolesKey = "[]";
@@ -1063,7 +1065,9 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     const w = 2 * halfX,
       d = 2 * halfZ;
-    if (this.floorHoles.length === 0) return new THREE.PlaneGeometry(w, d);
+    if (this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+      return new THREE.PlaneGeometry(w, d);
+    }
     const shape = new THREE.Shape();
     shape.moveTo(-halfX, -halfZ);
     shape.lineTo(halfX, -halfZ);
@@ -1078,6 +1082,16 @@ export class World {
       path.lineTo(h.x1, py0);
       path.lineTo(h.x1, py1);
       path.lineTo(h.x0, py1);
+      path.closePath();
+      shape.holes.push(path);
+    }
+    // 🕳️ #80: arbitrary polygon holes (the pool's exact water outline). Same
+    // world-XZ → plane (x, −z) mapping as the rects.
+    for (const poly of this.floorHoleOutlines) {
+      if (poly.length < 3) continue;
+      const path = new THREE.Path();
+      path.moveTo(poly[0].x, -poly[0].z);
+      for (let i = 1; i < poly.length; i++) path.lineTo(poly[i].x, -poly[i].z);
       path.closePath();
       shape.holes.push(path);
     }
@@ -1102,11 +1116,13 @@ export class World {
    */
   public setFloorHoles(
     holes: Array<{ x0: number; z0: number; x1: number; z1: number }>,
+    outlines: Array<Array<{ x: number; z: number }>> = [],
   ): void {
-    const key = JSON.stringify(holes);
+    const key = JSON.stringify(holes) + "|" + JSON.stringify(outlines);
     if (key === this.floorHolesKey) return; // no change — skip the rebuild
     this.floorHolesKey = key;
     this.floorHoles = holes.slice();
+    this.floorHoleOutlines = outlines.map((p) => p.slice());
     if (!this.platformFloor) return;
     const old = this.platformFloor.geometry;
     this.platformFloor.geometry = this.makeFloorGeometry();
@@ -2080,14 +2096,16 @@ export class World {
       (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
     );
     if (OCTAGON_HULL) {
-      // 🛑📐 #80: keep the floor SOLID and cut holes only in the GRID CELLS the
-      // pool water actually covers (merged into rects) — the deck keeps its
-      // floor. The pool's basin (with its drawn-in bottom) sinks into the
-      // basement through the hole. No pool ⇒ no holes, plus any demo hole.
-      const holes: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
-      if (hasPool) holes.push(...mergeCellsToRects(poolHoleCells(FURNITURE)));
-      if (this.demoFloorHole) holes.push(this.demoFloorHole);
-      this.setFloorHoles(holes);
+      // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the pool water
+      // is — the deck keeps its floor. The hole is the water's EXACT outline
+      // (poolHoleOutline), so no solid floor peeks over the organic water (the
+      // old 1 m cell holes couldn't match the curve). The pool's basin (with its
+      // drawn-in bottom) sinks into the basement through the hole. No pool ⇒ no
+      // holes, plus any demo rect hole.
+      const rects: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
+      if (this.demoFloorHole) rects.push(this.demoFloorHole);
+      const outline = hasPool ? poolHoleOutline(FURNITURE) : null;
+      this.setFloorHoles(rects, outline ? [outline] : []);
       if (this.platformFloor) this.platformFloor.visible = true;
       if (this.platformGrid) this.platformGrid.visible = !hasPool;
       return;
