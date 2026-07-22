@@ -12,6 +12,36 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.24 — 2026-07-22
+
+### 🖱️ Right-click furniture — MOVE / DELETE context menu
+
+Furniture management without the wall-computer ceremony: **right-click any movable
+piece** — in the plain room view or in edit mode — and a small context menu offers
+**✥ MOVE** and **🗑 DELETE**. Owner-gated like every other edit.
+
+- **✥ MOVE** picks the piece up on the spot: from the plain view it silently enters
+  edit mode, starts the standard carry (full placement validation — green/red tint,
+  R rotates, click drops, Esc / right-click cancels back to the origin) and **leaves
+  edit mode again once the drop lands or cancels**. From an already-open edit session
+  the menu is a shortcut and the session stays open.
+- **🗑 DELETE** runs the exact #53 remove-to-inventory path (despawn + deregister +
+  rebake + shared-doc delete + stow in the room inventory — the DEV menu's INVENTORY
+  re-places it), including the hull-stack cascade.
+- **FIX: deleting a charging-dock now disposes its robot immediately.** The local
+  removal self-echoes as an empty furniture-doc diff, so the observer's
+  `reconcileRobots` never ran on the deleting client and a ghost robot lingered
+  until the next full reconcile — the exact mirror of v0.33.21's commitSpawn dock
+  fix, now applied to the remove path (cascade included).
+- Boundaries: movable furniture only — doors keep their own panel/editor, fixed
+  structure (wall computer) is excluded, robots follow their dock. A right-click on
+  a mounted-stack base refuses MOVE with the usual unstack-first hint.
+- Verified live: right-click menu opens on furniture in both views; MOVE follows the
+  pointer and commits/cancels with auto exit; DELETE stows to inventory and a deleted
+  dock takes its robot with it; menu dismisses on outside click / Esc; `tsc` clean.
+- **Release line:** version bumped to 0.33.24, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
 ## v0.33.23 — 2026-07-21
 
 ### 🚪✏️ Place and remove doors in edit mode (#28 decouple, slice 6b — the door editor)

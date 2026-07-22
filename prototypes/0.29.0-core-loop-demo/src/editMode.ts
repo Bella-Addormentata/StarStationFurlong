@@ -121,6 +121,18 @@ export function canEditRoom(): RoomEditPermission {
   return ownerPredicate();
 }
 
+/**
+ * 🖱️ Context-menu world access: the right-click menu works OUTSIDE edit mode
+ * (right-click an item in the plain room view → MOVE / DELETE), so it can't
+ * rely on the `world` reference enter() captures. main.ts registers the live
+ * world here at init, same idiom as setRoomEditPermission above.
+ */
+let worldProvider: (() => World | null) | null = null;
+
+export function setEditWorldProvider(provider: () => World | null): void {
+  worldProvider = provider;
+}
+
 // ── Placement validity (E3 of #25 — pure, reused by E4 remote-apply) ──────────
 
 export interface PlacementContext {
@@ -580,6 +592,15 @@ class RoomEditController {
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
 
+  /** 🖱️ Right-click context menu (MOVE / DELETE on a movable item). */
+  private ctxMenuEl: HTMLDivElement | null = null;
+  /** Dismiss listeners live only while the menu is open. */
+  private ctxDismissPointer: ((e: PointerEvent) => void) | null = null;
+  private ctxDismissKey: ((e: KeyboardEvent) => void) | null = null;
+  /** Edit mode was auto-entered by a context-menu action — auto-exit when
+   *  that action resolves (drop committed / cancelled / delete done). */
+  private autoEntered = false;
+
   private raycaster = new THREE.Raycaster();
   private pointerNdc = new THREE.Vector2();
   /** 🪟 #80 S4: scratch for the surface math-plane raycast (reused per move). */
@@ -634,10 +655,36 @@ class RoomEditController {
     });
 
     // E3: right-click cancels a live carry (same restore path as Esc).
+    // 🖱️ Otherwise, right-click on a movable item — in edit mode OR the plain
+    // room view — opens the MOVE / DELETE context menu (owner-gated).
     window.addEventListener('contextmenu', (e) => {
-      if (!this.active || !this.carrying) return;
+      if (this.active && this.carrying) {
+        e.preventDefault();
+        this.cancelCarry(true);
+        return;
+      }
+      this.hideContextMenu();
+      // Only right-clicks landing on the game canvas, in the plain isometric
+      // view (zoom 2, ortho camera — the same preconditions as enter()).
+      const canvas = window.gameRenderer?.renderer?.domElement;
+      if (!canvas || e.target !== canvas) return;
+      const zoomView = (window as unknown as { multiScaleZoom?: { getLevel?: () => number } }).multiScaleZoom;
+      const camera = window.gameRenderer?.camera;
+      if ((zoomView?.getLevel?.() ?? 2) !== 2 || !(camera instanceof THREE.OrthographicCamera)) return;
+      const world = this.world ?? worldProvider?.();
+      if (!world) return;
+      const hit = this.active
+        ? this.pickItemAt(e.clientX, e.clientY)
+        : this.pickMovableItemAt(world, e.clientX, e.clientY);
+      if (!hit || this.doorIds.has(hit)) return; // furniture only — doors have their own panel
+      const perm = canEditRoom();
+      if (!perm.ok) {
+        e.preventDefault();
+        showHint(perm.reason);
+        return;
+      }
       e.preventDefault();
-      this.cancelCarry(true);
+      this.showContextMenu(hit, e.clientX, e.clientY);
     });
 
     // 🪟 #80 S4: [ / ] cycle the active window surface while add-window is armed.
@@ -794,6 +841,8 @@ class RoomEditController {
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
   public exit(): void {
     if (!this.active) return;
+    this.autoEntered = false; // 🖱️ any explicit exit ends a context-menu session
+    this.hideContextMenu();
     this.cancelCarry(false); // E3: never exit with an item in hand
     this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
     this.setAddWindowMode(false); // 🪟 #80 S4: drop any armed add-window sub-mode
@@ -1113,6 +1162,149 @@ class RoomEditController {
     return this.meshToItem.get(hits[0].object) ?? null;
   }
 
+  /** 🖱️ Ad-hoc raycast for the context menu OUTSIDE edit mode — the persistent
+   *  index (buildRaycastIndex) only exists while active, so build a throwaway
+   *  one over the movable furniture groups. Cheap: right-clicks are rare. */
+  private pickMovableItemAt(world: World, clientX: number, clientY: number): string | null {
+    const camera = window.gameRenderer?.camera;
+    if (!camera) return null;
+    this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
+    this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointerNdc, camera);
+    const targets: THREE.Mesh[] = [];
+    const meshToId = new Map<THREE.Object3D, string>();
+    for (const item of FURNITURE) {
+      if (!item.movable) continue;
+      const group = world.furnitureGroups.get(item.id);
+      if (!group) continue;
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          targets.push(obj);
+          meshToId.set(obj, item.id);
+        }
+      });
+    }
+    const hits = this.raycaster.intersectObjects(targets, false);
+    if (hits.length === 0) return null;
+    return meshToId.get(hits[0].object) ?? null;
+  }
+
+  // ── 🖱️ Right-click context menu (MOVE / DELETE) ────────────────────────────
+
+  private showContextMenu(itemId: string, clientX: number, clientY: number): void {
+    this.hideContextMenu();
+    const item = FURNITURE.find((i) => i.id === itemId);
+    if (!item) return;
+
+    const menu = document.createElement('div');
+    menu.id = 'edit-context-menu';
+    menu.style.cssText = `
+      position:fixed; left:${clientX}px; top:${clientY}px; z-index:10000;
+      min-width:150px; padding:6px; border-radius:8px;
+      background:rgba(8,10,22,0.94); border:1px solid rgba(212,168,75,0.45);
+      box-shadow:0 6px 24px rgba(0,0,0,0.55);
+      font-family:monospace; font-size:11px; color:#f0c060;
+      user-select:none;`;
+    const btn = `display:block; width:100%; text-align:left; margin-top:4px;
+      padding:6px 8px; border-radius:6px; cursor:pointer; font:inherit;
+      background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;`;
+    menu.innerHTML = `
+      <div style="font-size:9px; letter-spacing:1px; color:rgba(212,168,75,0.55); padding:2px 4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📦 ${item.kind.toUpperCase()}</div>
+      <button type="button" data-ctx-action="move" style="${btn}">✥ MOVE</button>
+      <button type="button" data-ctx-action="delete" style="${btn} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">🗑 DELETE</button>`;
+
+    // Keep menu clicks OUT of the window-level click routing (onCanvasClick
+    // would raycast "through" the menu and deselect / navigate). contextmenu
+    // also needs preventDefault or a right-click ON the menu pops the native
+    // browser menu over ours.
+    for (const type of ['click', 'pointerdown', 'contextmenu'] as const) {
+      menu.addEventListener(type, (ev) => {
+        ev.stopPropagation();
+        if (type === 'contextmenu') ev.preventDefault();
+      });
+    }
+    menu.addEventListener('click', (ev) => {
+      const el = (ev.target as HTMLElement).closest<HTMLElement>('[data-ctx-action]');
+      if (!el) return;
+      const action = el.dataset.ctxAction;
+      this.hideContextMenu();
+      if (action === 'move') this.ctxMove(itemId, ev.clientX, ev.clientY);
+      else if (action === 'delete') this.ctxDelete(itemId);
+    });
+    document.body.appendChild(menu);
+
+    // Clamp inside the viewport once the size is known.
+    const r = menu.getBoundingClientRect();
+    if (r.right > window.innerWidth) menu.style.left = `${Math.max(0, window.innerWidth - r.width - 4)}px`;
+    if (r.bottom > window.innerHeight) menu.style.top = `${Math.max(0, window.innerHeight - r.height - 4)}px`;
+    this.ctxMenuEl = menu;
+
+    // Dismiss on any outside pointerdown (capture — before the game reacts)
+    // or Esc; both listeners live only while the menu is open.
+    this.ctxDismissPointer = (ev: PointerEvent) => {
+      if (this.ctxMenuEl && ev.target instanceof Node && this.ctxMenuEl.contains(ev.target)) return;
+      this.hideContextMenu();
+    };
+    this.ctxDismissKey = (ev: KeyboardEvent) => {
+      if (ev.key !== 'Escape') return;
+      ev.stopPropagation(); // the menu's Esc must not also exit edit mode
+      this.hideContextMenu();
+    };
+    window.addEventListener('pointerdown', this.ctxDismissPointer, true);
+    window.addEventListener('keydown', this.ctxDismissKey, true);
+  }
+
+  private hideContextMenu(): void {
+    if (this.ctxDismissPointer) {
+      window.removeEventListener('pointerdown', this.ctxDismissPointer, true);
+      this.ctxDismissPointer = null;
+    }
+    if (this.ctxDismissKey) {
+      window.removeEventListener('keydown', this.ctxDismissKey, true);
+      this.ctxDismissKey = null;
+    }
+    this.ctxMenuEl?.remove();
+    this.ctxMenuEl = null;
+  }
+
+  /** MOVE from the context menu: enter edit mode if needed, pick the item up,
+   *  and snap it to the pointer right away — from there the normal carry flow
+   *  owns it (mousemove follows, click commits, Esc/right-click cancels). */
+  private ctxMove(itemId: string, clientX: number, clientY: number): void {
+    const world = this.world ?? worldProvider?.();
+    if (!world) return;
+    if (!this.active) {
+      this.enter(world);
+      if (!this.active) return; // enter()'s own guards refused (hint already shown)
+      this.autoEntered = true;
+    }
+    this.setSelected(itemId);
+    this.beginCarry(itemId);
+    if (!this.carrying) {
+      // beginCarry refused (e.g. cargo mounted on it) — undo an auto-enter.
+      if (this.autoEntered) {
+        this.autoEntered = false;
+        this.exit();
+      }
+      return;
+    }
+    this.updateCarryFromPointer(clientX, clientY);
+  }
+
+  /** DELETE from the context menu — the exact #53 remove-to-inventory path. */
+  private ctxDelete(itemId: string): void {
+    const world = this.world ?? worldProvider?.();
+    if (!world) return;
+    const auto = !this.active;
+    if (auto) {
+      this.enter(world);
+      if (!this.active) return;
+    }
+    this.setSelected(itemId);
+    this.removeSelected();
+    if (auto) this.exit();
+  }
+
   private onMouseMove = (e: MouseEvent): void => {
     if (!this.active) return;
     // Only hover-test pointer positions actually over the game canvas —
@@ -1316,6 +1508,13 @@ class RoomEditController {
     this.syncRemoveButton(); // #53: selection persists → button returns
     this.setCanvasCursor('');
     showHint('Placed.', 1400);
+
+    // 🖱️ A context-menu MOVE auto-entered edit mode — leave it again now the
+    // drop landed (a wall-computer entry keeps the session open as before).
+    if (this.autoEntered) {
+      this.autoEntered = false;
+      this.exit();
+    }
   }
 
   /**
@@ -1339,6 +1538,15 @@ class RoomEditController {
     this.syncRemoveButton(); // #53: selection persists → button returns
     this.setCanvasCursor('');
     if (announce) showHint('Move cancelled.', 1400);
+
+    // 🖱️ USER-cancelled a context-menu MOVE (Esc / right-click) → also leave
+    // the auto-entered edit session. announce distinguishes a user cancel
+    // from the teardown paths (exit/forceExit call with false — they are
+    // already exiting, and exit()'s own cancelCarry(false) must not recurse).
+    if (announce && this.autoEntered) {
+      this.autoEntered = false;
+      this.exit();
+    }
   }
 
   // ── Remove to room inventory (#53) ──────────────────────────────────────────
@@ -1464,6 +1672,13 @@ class RoomEditController {
     rebuildDevices();
     player.onObstaclesChanged(itemId);
     world.refreshOutdoorFloor(); // 🏊 pool removed → restore the outdoor floor (no void)
+    // 🤖 A removed charging-dock must dispose its robot NOW — the local
+    // removal self-echoes as an empty doc diff, so the observer's
+    // reconcileRobots never runs on THIS client (the exact mirror of the
+    // commitSpawn dock fix in devMenu.ts; remote peers reconcile normally).
+    if (item.kind === 'charging-dock' || cascade.some((c) => c.kind === 'charging-dock')) {
+      world.refreshRobots();
+    }
 
     // E4 (issue #60): drop it from the shared layout AFTER the local removal,
     // so the doc observer's reconcile sees local state already matching (a
