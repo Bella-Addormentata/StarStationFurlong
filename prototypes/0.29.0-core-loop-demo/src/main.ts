@@ -93,6 +93,7 @@ import {
   seedDoorLayoutDefaults,
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
+import { bindWindowLayoutDoc } from "./windowLayoutDoc";
 import {
   bindRoomRoles,
   subscribeRoomRoles,
@@ -1138,6 +1139,8 @@ async function joinRoomAtEpoch(
   // world.reconcileDoorLayout runs immediately (a joiner sees the host's door
   // set); an unseeded room keeps the local cardinal defaults.
   bindDoorLayoutDoc(sync.doc);
+  // 🪟 #80: window layout syncs the same way (rebinds per join at the T0 seam).
+  bindWindowLayoutDoc(sync.doc);
 
   // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
   harvestStationAtlas();

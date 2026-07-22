@@ -123,6 +123,10 @@ import type {
   HullWindows,
   WindowOpening,
 } from "./octagonHull";
+import {
+  readAllWindowLayout,
+  subscribeWindowLayout,
+} from "./windowLayoutDoc";
 import { getCameraYaw } from "./cameraRig";
 
 /**
@@ -367,6 +371,8 @@ export class World {
     // on every room (re)bind, and reconcile no-ops until the docking system
     // exists / the map is seeded (un-migrated rooms keep the cardinal defaults).
     subscribeDoorLayout(() => this.reconcileDoorLayout(readAllDoorLayout()));
+    // 🪟 #80: rebuild the octagon hull (holes + glass) when windows change.
+    subscribeWindowLayout(() => this.reconcileWindowLayout());
 
     console.log("✅ World initialized - Station planet ready");
   }
@@ -938,15 +944,35 @@ export class World {
   private collectWindowOpenings(): HullWindows {
     const neg: WindowOpening[] = [];
     const pos: WindowOpening[] = [];
-    if (
-      new URLSearchParams(window.location.search).get("window") === "1"
-    ) {
+    // Records store the octagon SIDE ('neg'/'pos') directly, so no cardinal
+    // mapping — resize-stable. Each record IS a WindowOpening plus id+wall.
+    for (const rec of readAllWindowLayout().values()) {
+      (rec.wall === "neg" ? neg : pos).push({
+        along: rec.along,
+        y: rec.y,
+        w: rec.w,
+        h: rec.h,
+        r: rec.r,
+      });
+    }
+    // Standalone demo window (?octagon=1&window=1) for quick preview.
+    if (new URLSearchParams(window.location.search).get("window") === "1") {
       neg.push({ along: 0, y: 2, w: 3, h: 1.8, r: 0.5 });
     }
     return {
       neg: neg.length ? neg : undefined,
       pos: pos.length ? pos : undefined,
     };
+  }
+
+  /**
+   * 🪟 #80: rebuild the octagon hull when the shared window set changes (add /
+   * move / remove) — mirrors reconcileDoorLayout / refreshOutdoorFloor. The
+   * rebuild re-reads collectWindowOpenings so holes + glass follow the doc.
+   */
+  private reconcileWindowLayout(): void {
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    this.addOctagonHull();
   }
 
   /**

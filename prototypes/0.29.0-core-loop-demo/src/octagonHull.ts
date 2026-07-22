@@ -154,6 +154,27 @@ export function buildOctagonHull(
       group.add(mesh);
       const which = wallIndex === 0 ? 'wall-neg' : 'wall-pos';
       wallFaces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which) });
+      // 🪟 translucent glass filling each opening (barely-there blue — the view
+      // through it is the point; depthWrite off so it never occludes the sky).
+      if (openings) {
+        for (const o of openings) {
+          const gGeo = glassGeometry(narrowAxis, p0.a, o);
+          geometries.push(gGeo);
+          const gMat = new THREE.MeshStandardMaterial({
+            color: 0x9bd4e8,
+            roughness: 0.1,
+            metalness: 0.2,
+            transparent: true,
+            opacity: 0.18,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          materials.push(gMat);
+          const gMesh = new THREE.Mesh(gGeo, gMat);
+          gMesh.name = 'octagon-window-glass';
+          group.add(gMesh);
+        }
+      }
       wallIndex++;
       continue;
     }
@@ -394,12 +415,11 @@ export function buildOctagonShell(
   return { group, dispose };
 }
 
-/** A rounded-rect Path in 2D (u, v) centred at (cx, cy). */
-function roundedRectPath(cx: number, cy: number, w: number, h: number, r: number): THREE.Path {
+/** Trace a rounded-rect (centred cx,cy) onto a Path or Shape. */
+function applyRoundedRect(p: THREE.Path, cx: number, cy: number, w: number, h: number, r: number): void {
   const hw = w / 2,
     hh = h / 2;
   const rr = Math.max(0, Math.min(r, hw, hh));
-  const p = new THREE.Path();
   p.moveTo(cx - hw + rr, cy - hh);
   p.lineTo(cx + hw - rr, cy - hh);
   p.quadraticCurveTo(cx + hw, cy - hh, cx + hw, cy - hh + rr);
@@ -410,7 +430,36 @@ function roundedRectPath(cx: number, cy: number, w: number, h: number, r: number
   p.lineTo(cx - hw, cy - hh + rr);
   p.quadraticCurveTo(cx - hw, cy - hh, cx - hw + rr, cy - hh);
   p.closePath();
+}
+
+/** A rounded-rect Path (hole), 2D (u=along, v=height). */
+function roundedRectPath(cx: number, cy: number, w: number, h: number, r: number): THREE.Path {
+  const p = new THREE.Path();
+  applyRoundedRect(p, cx, cy, w, h, r);
   return p;
+}
+
+/** Remap a ShapeGeometry built in wall-local (u=along=x, v=height=y) onto the
+ *  side wall at narrow-axis coord `a`: each vertex → sectionToWorld(a, v, u). */
+function remapWallToWorld(geo: THREE.BufferGeometry, narrowAxis: NarrowAxis, a: number): THREE.BufferGeometry {
+  const pos = geo.attributes.position;
+  const world = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const w = sectionToWorld(narrowAxis, a, pos.getY(i), pos.getX(i));
+    world[i * 3] = w.x;
+    world[i * 3 + 1] = w.y;
+    world[i * 3 + 2] = w.z;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(world, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/** 🪟 The glass pane filling one window opening, on the side wall at `a`. */
+function glassGeometry(narrowAxis: NarrowAxis, a: number, o: WindowOpening): THREE.BufferGeometry {
+  const shape = new THREE.Shape();
+  applyRoundedRect(shape, o.along, o.y, o.w, o.h, o.r);
+  return remapWallToWorld(new THREE.ShapeGeometry(shape), narrowAxis, a);
 }
 
 /**
@@ -448,18 +497,7 @@ function wallGeometry(
     const cy = Math.max(o.h / 2 + 0.05, Math.min(wallHeight - o.h / 2 - 0.05, o.y));
     shape.holes.push(roundedRectPath(along, cy, o.w, o.h, o.r));
   }
-  const geo = new THREE.ShapeGeometry(shape);
-  const pos = geo.attributes.position;
-  const world = new Float32Array(pos.count * 3);
-  for (let i = 0; i < pos.count; i++) {
-    const w = sectionToWorld(narrowAxis, a, pos.getY(i), pos.getX(i)); // (a, v=y, u=along)
-    world[i * 3] = w.x;
-    world[i * 3 + 1] = w.y;
-    world[i * 3 + 2] = w.z;
-  }
-  geo.setAttribute('position', new THREE.BufferAttribute(world, 3));
-  geo.computeVertexNormals();
-  return geo;
+  return remapWallToWorld(new THREE.ShapeGeometry(shape), narrowAxis, a);
 }
 
 /** A double-sided quad (two triangles) from four world corners. */
