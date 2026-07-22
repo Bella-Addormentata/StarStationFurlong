@@ -74,7 +74,8 @@ import {
 import { readDoorDeltas, roomHalfExtents } from "./floorPlanDoc";
 import { applyDoorSlideDeltas } from "./doors";
 import { setDoorSlideDeltas } from "./adapter";
-import { roomIdFromSeed } from "./stationAtlas";
+import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
+import type { AtlasDoor } from "./stationAtlas";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -85,7 +86,9 @@ import {
   buildConnectorChain,
   setVestibuleLightState,
   setVestibuleOpacity,
+  projectionPoseForDoor,
 } from "./adapter";
+import type { VestibuleDoorId } from "./adapter";
 import {
   findDevice,
   rebuildDevices,
@@ -116,7 +119,7 @@ import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
-import { buildOctagonHull } from "./octagonHull";
+import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
 import type { OctagonHull, HullWallpapers } from "./octagonHull";
 import {
   readAllWindowLayout,
@@ -225,6 +228,10 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
   private octagonHull: OctagonHull | null = null;
+  /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
+   *  + their connector tubes, posed around the current room; shown ONLY in first
+   *  person (update() gate) so looking OUT a window shows the real station. */
+  private fpNeighbourShells: THREE.Group | null = null;
   // 🪟 #80 S4: invisible click-boxes for the placed windows, by id — the
   // edit-mode raycast index (material.visible:false, still raycasts), so a
   // window is selectable + removable like a door. Rebuilt with the hull.
@@ -667,6 +674,10 @@ export class World {
       this.addSideWalls();
     }
     this.addCapsuleOuterStructure();
+    // 🛑🛰️ #80 S5: the station-through-the-window shells (neighbour modules +
+    // connector tubes). Built here so a morph restart re-poses them; shown only
+    // in first person by the update() gate.
+    this.addFpNeighbourShells();
     this.addLobbyFurniture();
     this.addAtmosphereEffects();
 
@@ -963,6 +974,155 @@ export class World {
     const out: HullWallpapers = {};
     for (const [surface, preset] of readAllWallpaper()) out[surface] = preset;
     return out;
+  }
+
+  /**
+   * 🛑🛰️ #80 S5: build the STATION AS SEEN FROM INSIDE — every neighbour module
+   * the atlas knows, as a translucent octagon SHELL posed in world space around
+   * the current room (which sits at the platform origin), plus the neighbour↔
+   * neighbour connector tubes. The update() gate shows this ONLY in first person,
+   * so looking OUT a window shows the real station laid out beyond the glass
+   * instead of just the space backdrop. Idempotent — mirrors addOctagonHull's
+   * dispose-prior discipline (createPlatform re-runs per morph).
+   */
+  private addFpNeighbourShells(): void {
+    if (this.fpNeighbourShells) {
+      this.platformGroup.remove(this.fpNeighbourShells);
+      this.disposeObject3D(this.fpNeighbourShells);
+      this.fpNeighbourShells = null;
+    }
+    if (!OCTAGON_HULL) return; // the shells ARE the octagon cross-section
+    const currentRoomId = World.activeRoomId(); // never empty (getDefaultRoomId)
+    // Each pose is already in the current room's frame: atlasLayout seeds the
+    // current room at {0,0,0} and drops it from the output. Reuse the EXACT
+    // exteriorView compose (do not negate rotY / swap sin signs — that mirrors
+    // the whole ring). maxHops 8 = the full station, not a one-window peek.
+    const poses = atlasLayout(
+      currentRoomId,
+      (doorId, segments, farDoor) =>
+        projectionPoseForDoor(doorId as DoorId, segments, farDoor),
+      8,
+    );
+    const g = new THREE.Group();
+    g.name = "fpNeighbourShells";
+    for (const pose of poses) {
+      const nd = pose.dims ?? { cols: 2, rows: 2 };
+      const mod = new THREE.Group();
+      mod.name = `fpAtlasModule-${pose.roomId}`;
+      // Pure BACKDROP — deliberately NOT `isAtlasModule` (that flag routes the
+      // exterior view's click-to-connect); you can't interact with a neighbour
+      // from inside your own room, so it must never become a click target.
+      mod.userData = { isFpNeighbour: true, roomId: pose.roomId };
+      const shell = buildOctagonShell(
+        { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
+        { opacity: 0.85 },
+      );
+      this.disableFog(shell.group); // stay crisp at station distances
+      mod.add(shell.group);
+      mod.position.set(pose.x, 0, pose.z);
+      mod.rotation.y = pose.rotY;
+      g.add(mod);
+    }
+    // 🔗 neighbour↔neighbour connector tubes. The current room's OWN tubes are
+    // already drawn into platformGroup (paired-vestibule path) and show through
+    // the window for free, so skip every edge touching this room; dedupe the
+    // rest. Built in the FROM module's local frame, wrapped at its world pose.
+    const atlas = readAtlas();
+    const poseByRoom = new Map<string, { x: number; z: number; rotY: number }>();
+    poseByRoom.set(currentRoomId, { x: 0, z: 0, rotY: 0 });
+    for (const p of poses) poseByRoom.set(p.roomId, { x: p.x, z: p.z, rotY: p.rotY });
+    const drawnEdges = new Set<string>();
+    for (const [fromId, entry] of Object.entries(atlas)) {
+      const fromPose = poseByRoom.get(fromId);
+      if (!fromPose) continue; // module not placed in this layout
+      for (const [doorId, door] of Object.entries(entry.doors) as Array<
+        [VestibuleDoorId, AtlasDoor | undefined]
+      >) {
+        const toId = door?.targetRoomId;
+        if (!door || !toId || !poseByRoom.has(toId)) continue;
+        if (fromId === currentRoomId || toId === currentRoomId) continue;
+        const key = fromId < toId ? `${fromId}|${toId}` : `${toId}|${fromId}`;
+        if (drawnEdges.has(key)) continue;
+        drawnEdges.add(key);
+        const chain =
+          door.segments && door.segments.length > 0
+            ? buildConnectorChain(doorId, door.segments)
+            : buildVestibule(doorId);
+        // Pure BACKDROP: strip every interactive flag. `isConnectorChain` is
+        // what the bend editor keys on; `isVestibule` + `doorId` are what the
+        // level-2 vestibule-click handler collects (scene.traverse) then
+        // raycasts — and three.js ignores `.visible`, so an INVISIBLE tube (this
+        // group hides at L2) would still be hit by an empty-space click and fire
+        // a phantom walkthrough of the current room's same-named door. These
+        // tubes carry OTHER rooms' door cardinals, so they must not be targets.
+        const cu = chain.userData as {
+          isConnectorChain?: boolean;
+          isVestibule?: boolean;
+          doorId?: unknown;
+        };
+        cu.isConnectorChain = false;
+        cu.isVestibule = false;
+        delete cu.doorId;
+        setVestibuleOpacity(chain, 1.0);
+        this.disableFog(chain);
+        const wrap = new THREE.Group();
+        wrap.name = `fpAtlasConnector-${fromId}-${doorId}`;
+        wrap.add(chain);
+        wrap.position.set(fromPose.x, 0, fromPose.z);
+        wrap.rotation.y = fromPose.rotY;
+        g.add(wrap);
+      }
+    }
+    this.fpNeighbourShells = g;
+    this.platformGroup.add(g);
+  }
+
+  /** 🛑🛰️ #80 S5: rebuild the FP neighbour shells when the atlas changes (a
+   *  visitor watches the station fill in). Mirror of refreshExteriorView. */
+  public refreshFpNeighbourShells(): void {
+    this.addFpNeighbourShells();
+  }
+
+  /** 🌫️ #80 S5: turn scene fog OFF on every material under `obj` — the neighbour
+   *  shells must stay crisp at station distances (fog would haze out far modules;
+   *  the sky/planets already do this). Needs `needsUpdate` to recompile the shader. */
+  private disableFog(obj: THREE.Object3D): void {
+    obj.traverse((o) => {
+      const matField = (o as THREE.Mesh).material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (!matField) return;
+      for (const m of Array.isArray(matField) ? matField : [matField]) {
+        (m as THREE.Material & { fog?: boolean }).fog = false;
+        m.needsUpdate = true;
+      }
+    });
+  }
+
+  /** Dispose every geometry + material under `obj` (Mesh AND LineSegments — the
+   *  octagon seam outline — deduped), mirroring exteriorView.disposeGroup. */
+  private disposeObject3D(obj: THREE.Object3D): void {
+    const seen = new Set<THREE.BufferGeometry | THREE.Material>();
+    obj.traverse((o) => {
+      const drawable = o as THREE.Mesh & THREE.LineSegments;
+      const geo = drawable.geometry as THREE.BufferGeometry | undefined;
+      if (geo && !seen.has(geo)) {
+        seen.add(geo);
+        geo.dispose();
+      }
+      const matField = drawable.material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (!matField) return;
+      for (const m of Array.isArray(matField) ? matField : [matField]) {
+        if (m && !seen.has(m)) {
+          seen.add(m);
+          m.dispose();
+        }
+      }
+    });
   }
 
   /** 🪟 #80 S4: live window click-boxes by id — the edit-mode raycast index
@@ -3142,6 +3302,16 @@ export class World {
       this.capsuleOuterWalls.forEach((wall) => {
         wall.visible = false;
       });
+    }
+
+    // 🛑🛰️ #80 S5: the neighbour-module shells (the station seen OUT a window)
+    // show ONLY in first person — hidden in the iso room view (zoomLevel 2) and
+    // the exterior atlas (zoomLevel ≥ 3, which draws its own shells), and during
+    // the morph lerp / hull-edit. `zoomLevel <= 1` is the same L1-vs-L2
+    // discriminator the skylight/roof cutaway uses.
+    if (this.fpNeighbourShells) {
+      this.fpNeighbourShells.visible =
+        zoomLevel <= 1 && !this.isMorphing && !this.hullEditView;
     }
 
     // Animate station planet (rotation + gentle floating)

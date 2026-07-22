@@ -1254,6 +1254,9 @@ async function joinRoomAtEpoch(
     subscribeDoors(() => {
       harvestStationAtlas();
       refreshExteriorView();
+      // 🛑🛰️ #80 S5: the local room's own edges just changed the atlas → re-pose
+      // the station-through-the-window shells (they depend only on the atlas).
+      world?.refreshFpNeighbourShells();
     });
     // The exterior's atlas walk starts from the CURRENT room.
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
@@ -1262,7 +1265,11 @@ async function joinRoomAtEpoch(
     subscribeExterior(() => refreshExteriorView());
     // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
     // in live as the doc syncs (usually within the first second of joining).
-    subscribeSharedAtlas(() => refreshExteriorView());
+    subscribeSharedAtlas(() => {
+      refreshExteriorView();
+      // 🛑🛰️ #80 S5: … and the station-through-the-window shells fill in with it.
+      world?.refreshFpNeighbourShells();
+    });
     setExteriorOwnerCheck(() => {
       const ownerVal =
         (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
