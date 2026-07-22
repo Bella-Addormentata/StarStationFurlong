@@ -49,6 +49,7 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
+  poolHoleRect,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -169,6 +170,12 @@ export class World {
   /** 🛑📐 #80: XZ rectangles cut out of the solid floor (a pool sinks into the
    *  basement through the hole). Empty ⇒ a plain solid floor plane. */
   private floorHoles: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
+  /** JSON of the last-applied floorHoles ("[]" = the initial solid floor) —
+   *  skips redundant geometry rebuilds. */
+  private floorHolesKey = "[]";
+  /** A standalone demo hole (`?octagon=1&hole=1`), merged with the pool hole by
+   *  refreshOutdoorFloor so both survive its rebuilds. */
+  private demoFloorHole: { x0: number; z0: number; x1: number; z1: number } | null = null;
   private platformGrid: THREE.GridHelper | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
@@ -581,9 +588,13 @@ export class World {
       OCTAGON_HULL &&
       new URLSearchParams(window.location.search).get("hole") === "1"
     ) {
-      this.setFloorHoles([
-        { x0: -halfX + 1, z0: -halfZ + 1.5, x1: -0.6, z1: halfZ - 1.5 },
-      ]);
+      this.demoFloorHole = {
+        x0: -halfX + 1,
+        z0: -halfZ + 1.5,
+        x1: -0.6,
+        z1: halfZ - 1.5,
+      };
+      this.refreshOutdoorFloor();
     }
 
     // ── Click-navigation plane ────────────────────────────────────────────────
@@ -960,6 +971,9 @@ export class World {
   public setFloorHoles(
     holes: Array<{ x0: number; z0: number; x1: number; z1: number }>,
   ): void {
+    const key = JSON.stringify(holes);
+    if (key === this.floorHolesKey) return; // no change — skip the rebuild
+    this.floorHolesKey = key;
     this.floorHoles = holes.slice();
     if (!this.platformFloor) return;
     const old = this.platformFloor.geometry;
@@ -1929,12 +1943,26 @@ export class World {
    * covers remote changes; editMode's local splice/spawn does not).
    */
   public refreshOutdoorFloor(): void {
-    // A pool (either style) sinks its water below the floor, so hide the solid
-    // floor/grid wherever one is present — not only in the authored outdoor
-    // room (a pool template dropped into any room reveals its water too).
+    // A pool (either style) sinks its water below the floor.
     const hasPool = FURNITURE.some(
       (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
     );
+    if (OCTAGON_HULL) {
+      // 🛑📐 #80: keep the floor SOLID and cut a hole over the pool footprint —
+      // the pool's basin (with its drawn-in bottom) sinks into the basement
+      // through the hole. No pool ⇒ no holes (fully solid floor), plus any
+      // standalone demo hole.
+      const holes: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
+      const hole = hasPool ? poolHoleRect(FURNITURE) : null;
+      if (hole) holes.push(hole);
+      if (this.demoFloorHole) holes.push(this.demoFloorHole);
+      this.setFloorHoles(holes);
+      if (this.platformFloor) this.platformFloor.visible = true;
+      if (this.platformGrid) this.platformGrid.visible = !hasPool;
+      return;
+    }
+    // Legacy (no octagon): hide the whole floor/grid wherever a pool is present
+    // — the pool's deck slabs provide the visible flooring instead.
     if (this.platformFloor) this.platformFloor.visible = !hasPool;
     if (this.platformGrid) this.platformGrid.visible = !hasPool;
   }
@@ -2877,9 +2905,11 @@ export class World {
       this.furnitureMeshes.forEach((mesh) => {
         mesh.visible = true;
       });
-      // 🏊 Outdoor pool room: the floor stays hidden (the lazy-pool's deck
-      // slabs are the visible floor; sunken water must show through).
-      if (this.platformFloor) this.platformFloor.visible = !this.isOutdoorRoom;
+      // 🏊 Outdoor pool room: legacy hides the floor (deck slabs are the floor;
+      // sunken water shows through). Under the octagon flag the floor stays
+      // SOLID with a pool hole cut (refreshOutdoorFloor), so keep it visible.
+      if (this.platformFloor)
+        this.platformFloor.visible = OCTAGON_HULL || !this.isOutdoorRoom;
       // 🛑📐 #80: the octagon floor is SOLID by default now (basement hidden
       // beneath it); a hole is cut only where a pool sinks into the basement
       // (setFloorHoles → makeFloorGeometry). No blanket hide.

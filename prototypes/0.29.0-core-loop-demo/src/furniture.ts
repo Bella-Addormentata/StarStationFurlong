@@ -2238,6 +2238,20 @@ export const POOL_SWIM_Y = -0.52; // avatar-root y while swimming (head above wa
 export const DIVE_TIME = 0.9; // seconds board-tip → water
 export const DIVE_ARC_LIFT = 0.55; // parabola apex above the straight chord
 
+/** 🛑📐 #80: same `?octagon=1` preview flag world.ts reads. When on, the pool
+ *  sinks into the BASEMENT through a real floor hole (a solid rect basin bottom
+ *  is drawn in) instead of the legacy hidden-whole-floor trick. */
+const OCTAGON_HULL =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).get("octagon") === "1";
+
+/** 🏊 Lazy-pool water footprint in the item's LOCAL frame (west waterline →
+ *  east tile wall × ±halfZ). buildLazyPool aliases these to WX/HX/HZ; the
+ *  floor-hole cutter (poolHoleRect) + the rect basin bottom use them too. */
+export const POOL_WATER_WEST = 5.15; // WX — west waterline (near the room bound)
+export const POOL_WATER_EAST = 3.4; // HX — east tile wall
+export const POOL_WATER_HALFZ = 2.9; // HZ
+
 // ── 🌉 Hot-tub footbridge geometry — single source of truth shared by the
 // lazy-pool builder (visual planks), the hot-tub seat approach path (the fox
 // WALKS the arch instead of gliding through it) and the remote-replica y
@@ -3396,15 +3410,15 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
 
   // Water basin: x[-3.4,3.4] z[-2.9,2.9] — the hole just inside the 7×6
   // footprint so the walkable corridors never overlap open water.
-  const HX = 3.4,
-    HZ = 2.9;
+  const HX = POOL_WATER_EAST,
+    HZ = POOL_WATER_HALFZ;
   const WATER_Y = -0.35; // keep == POOL_WATER_Y
   const EDGE_BOT = -0.95; // tiled deck-edge wall reaches below the water
 
   // 🌊 The water is ASYMMETRIC: it spans from the tiled east wall all the way
   // WEST to the room edge (the west deck IS water), meeting TWO infinity
   // edges — west and south — in an open L-shaped horizon corner.
-  const WX = 5.15; // west waterline (near the room bound)
+  const WX = POOL_WATER_WEST; // west waterline (near the room bound)
 
   // ── Deck slabs: north + south full width, east only (no west deck).
   place(
@@ -3651,6 +3665,21 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
     river.holes.push(island);
     return river;
   };
+
+  // 🕳️ #80: solid rect pool BOTTOM across the full water footprint. With the
+  // octagon floor hole cut, looking down the hole you see a real basin bottom
+  // sinking into the basement instead of the void; without the octagon flag the
+  // legacy hidden-floor pool is unchanged (skip it). Sits just under the
+  // organic lazy-river tint, which the rect can't reach in the corners.
+  if (OCTAGON_HULL) {
+    place(
+      new THREE.BoxGeometry(WX + HX, 0.08, HZ * 2),
+      m(0x0e3244, 0.98, 0.02),
+      (HX - WX) / 2,
+      EDGE_BOT - 0.02,
+      0,
+    );
+  }
 
   const tintGeo = new THREE.ShapeGeometry(makeLazyRiver(), 48);
   tintGeo.rotateX(-Math.PI / 2);
@@ -5881,7 +5910,7 @@ function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
     HZ = 2.9;
   const WATER_Y = -0.35; // keep == POOL_WATER_Y
   const EDGE_BOT = -0.95; // tiled deck-edge wall reaches below the water
-  const WX = 5.15; // west waterline (near the room bound)
+  const WX = POOL_WATER_WEST; // west waterline (near the room bound)
 
   // ── Deck slabs: north + south full width, east only (no west deck).
   place(new THREE.BoxGeometry(10.4, 0.12, 5.2 - HZ), poolTileMat(10.4, 5.2 - HZ), 0, 0.06, -(HZ + (5.2 - HZ) / 2));
@@ -6133,6 +6162,29 @@ export function getPoolBasin(items: FurnitureItem[]): {
         x1: item.pos.x + Math.max(e1.x, e2.x),
         z1: item.pos.z + Math.max(e1.z, e2.z),
       },
+    };
+  }
+  return null;
+}
+
+/**
+ * 🕳️ #80: the world XZ rectangle to cut from the SOLID octagon floor for a
+ * pool — the FULL water footprint (west waterline → east tile wall × ±halfZ),
+ * so the solid floor never caps the outer water. Rotates/offsets with the item
+ * (cardinal rots only, like getPoolBasin). Null when there's no pool.
+ */
+export function poolHoleRect(
+  items: FurnitureItem[],
+): { x0: number; z0: number; x1: number; z1: number } | null {
+  for (const item of items) {
+    if (item.kind !== "lazy-pool" && item.kind !== "classic-pool") continue;
+    const a = rotXZ(-POOL_WATER_WEST, -POOL_WATER_HALFZ, item.rot);
+    const b = rotXZ(POOL_WATER_EAST, POOL_WATER_HALFZ, item.rot);
+    return {
+      x0: item.pos.x + Math.min(a.x, b.x),
+      z0: item.pos.z + Math.min(a.z, b.z),
+      x1: item.pos.x + Math.max(a.x, b.x),
+      z1: item.pos.z + Math.max(a.z, b.z),
     };
   }
   return null;
