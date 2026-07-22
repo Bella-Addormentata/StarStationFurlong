@@ -2230,9 +2230,11 @@ export const BUNK_TOP_Y = 1.32; // top mattress top surface (avatar root)
 // remote arc reconstruction (world.ts) so both ends replay the SAME trajectory
 // (the movement tick carries no y — see network/protocol.ts flag bits 4/5).
 // Habbo-Lido layout: the walkable deck (y=0) is a raised white-tile platform
-// and the water lies BELOW its edge. world.applyRoomVisuals hides the room's
-// solid floor plane in the outdoor room so the sunken water actually shows —
-// the lazy-pool item's deck slabs provide all visible flooring instead.
+// and the water lies BELOW its edge. Under `?octagon=1` (#80) the room floor
+// STAYS solid and only the water cells are punched out (world.refreshOutdoorFloor
+// → poolHoleCells), so the water sinks into the basement through a real hole with
+// a drawn-in basin bottom. The legacy (flag-off) path instead HIDES the whole
+// floor plane in the outdoor room and lets the pool's deck slabs be the flooring.
 export const POOL_WATER_Y = -0.35; // water surface (splash spawn height)
 export const POOL_SWIM_Y = -0.52; // avatar-root y while swimming (head above water)
 export const DIVE_TIME = 0.9; // seconds board-tip → water
@@ -5935,6 +5937,22 @@ function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
     treeB.scale.set(1.0, 0.68, 0.48);
   }
 
+  // 🕳️ #80: solid rect pool BOTTOM across the full water footprint — mirrors
+  // the lazy pool. With the octagon floor hole cut, looking down the hole shows
+  // a real basin bottom sinking into the basement instead of the void; without
+  // the octagon flag the legacy hidden-floor pool is unchanged. The classic
+  // water is a full rect, so this rect bottom backs it completely (no organic
+  // corners to leak — no extra tint fill needed beyond the existing plane).
+  if (OCTAGON_HULL) {
+    place(
+      new THREE.BoxGeometry(WX + HX, 0.08, HZ * 2),
+      m(0x0e3244, 0.98, 0.02),
+      (HX - WX) / 2,
+      EDGE_BOT - 0.02,
+      0,
+    );
+  }
+
   // ── Basin floor + depth-graded water.
   const tintGeo = new THREE.PlaneGeometry(WX + HX, HZ * 2);
   tintGeo.rotateX(-Math.PI / 2);
@@ -6187,19 +6205,42 @@ function pointInPoly(px: number, py: number, poly: Array<{ x: number; y: number 
 
 /**
  * 🕳️ #80: the set of 1 m FLOOR CELLS (`"i,j"`, cell = world [i,i+1]×[j,j+1])
- * the pool water actually covers — sampled against the lazy-river outline so
- * the floor is punched to the water's TRUE shape (deck cells keep their floor),
- * not a bounding box. The water Shape's y maps to local −z (the mesh is
- * rotateX(−π/2)), so we test (localX, −localZ). Empty when there's no pool.
+ * the pool water actually covers, so the floor is punched to the water's shape
+ * (deck cells keep their floor), not a loose bounding box. KIND-AWARE so the
+ * hole always matches the water it's cut for:
+ *   • classic-pool — a full RECTANGLE (its water is a rect PlaneGeometry), so
+ *     every cell in the footprint rect is cut (no organic corners to leak, no
+ *     island patch left uncut under the water);
+ *   • lazy-pool — the organic lazy-river curve minus the central island, sampled
+ *     point-in-poly (the water Shape's y maps to local −z, mesh rotateX(−π/2), so
+ *     we test (localX, −localZ)).
+ * Empty when there's no pool.
  */
 export function poolHoleCells(items: FurnitureItem[]): Set<string> {
   const cells = new Set<string>();
   const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
   if (!pool) return cells;
+  const rect = poolHoleRect(items)!; // world bbox of the water footprint
+
+  if (pool.kind === "classic-pool") {
+    // Rectangular water ⇒ rectangular hole: cut cells whose CENTRE lies inside
+    // the water rect (the same centre-in-shape rule the lazy sampling uses), so
+    // the holes stay ⊆ the water (and ⊆ the pool obstacle — never a walkable hole).
+    for (let i = Math.floor(rect.x0); i < Math.ceil(rect.x1); i++) {
+      for (let j = Math.floor(rect.z0); j < Math.ceil(rect.z1); j++) {
+        const cx = i + 0.5;
+        const cz = j + 0.5;
+        if (cx >= rect.x0 && cx <= rect.x1 && cz >= rect.z0 && cz <= rect.z1) {
+          cells.add(`${i},${j}`);
+        }
+      }
+    }
+    return cells;
+  }
+
   const shape = lazyRiverShape();
   const outer = shape.getPoints(64).map((p) => ({ x: p.x, y: p.y }));
   const island = (shape.holes[0]?.getPoints(48) ?? []).map((p) => ({ x: p.x, y: p.y }));
-  const rect = poolHoleRect(items)!; // world bbox of the water footprint
   const inv = ((4 - pool.rot) % 4) as Rot;
   for (let i = Math.floor(rect.x0); i < Math.ceil(rect.x1); i++) {
     for (let j = Math.floor(rect.z0); j < Math.ceil(rect.z1); j++) {

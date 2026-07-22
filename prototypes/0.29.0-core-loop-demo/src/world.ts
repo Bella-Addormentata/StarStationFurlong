@@ -1837,14 +1837,14 @@ export class World {
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casinoTheme;
 
-    // 🏊 Outdoor pool room: HIDE the solid y=0 floor plane and its grid — the
-    // lazy-pool item's white-tile deck slabs provide all visible flooring, and
-    // the sunken water (y<0) must show through the deck hole. The invisible
-    // clickPlane still catches walk clicks, so navigation is unaffected.
-    // Pool-GATED (owner request: the pool is removable now): if the room has
-    // no lazy-pool, the deck is gone, so SHOW the solid floor instead of
-    // leaving a void. Re-run from reconcileFurniture when the pool is
-    // added/removed. See refreshOutdoorFloor.
+    // 🏊 Outdoor pool room floor — refreshOutdoorFloor decides how the sunken
+    // water shows. Under `?octagon=1` (#80) the solid floor STAYS and only the
+    // pool's water cells are punched out (poolHoleCells → the water sinks into
+    // the basement through a real hole with a drawn-in basin bottom). The legacy
+    // (flag-off) path HIDES the whole y=0 floor + grid so the pool's deck slabs
+    // are the flooring; if the room has no pool, the solid floor is shown so
+    // there's no void. The invisible clickPlane always catches walk clicks, so
+    // navigation is unaffected. Re-run from reconcileFurniture on pool add/remove.
     this.refreshOutdoorFloor();
 
     // ☀️ Day/night: the outdoor pool room runs bright poolside daylight —

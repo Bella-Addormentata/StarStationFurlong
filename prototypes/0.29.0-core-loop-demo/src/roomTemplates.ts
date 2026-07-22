@@ -119,7 +119,17 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       { id: "pool-skylight-n", kind: "skylight", pos: { x: 0, z: -3 }, rot: 0, movable: true },
       { id: "pool-skylight-s", kind: "skylight", pos: { x: 0, z: 3 }, rot: 0, movable: true },
       { id: "pool-sun-lamp", kind: "sun-lamp", pos: { x: 0, z: 0 }, rot: 0, movable: true },
-      { id: "pool-main", kind: "classic-pool", pos: { x: 0, z: 0 }, rot: 0, movable: false },
+      // 🕳️ #80: same water footprint as the lazy pool, so the same obstacle
+      // override — it must CONTAIN the rectangular floor hole (poolHoleCells) so
+      // a walker can never stand on a cut cell ("swim, not walk").
+      {
+        id: "pool-main",
+        kind: "classic-pool",
+        pos: { x: 0, z: 0 },
+        rot: 0,
+        movable: false,
+        footprintOverride: { x0: -5.4, z0: -3, x1: 3.5, z1: 3 },
+      },
       { id: "pool-hot-tub", kind: "classic-hot-tub", pos: { x: -3.7, z: -3.7 }, rot: 0, movable: false },
       { id: "otree-sw", kind: "cherry-tree", pos: { x: -4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "otree-se", kind: "cherry-tree", pos: { x: 4.5, z: 4.5 }, rot: 0, movable: true },
