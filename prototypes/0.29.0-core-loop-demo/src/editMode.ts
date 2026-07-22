@@ -1826,7 +1826,12 @@ class RoomEditController {
     this.orientWindowGhost();
     ghost.visible = true;
 
-    const verdict = validateWindowPlacement(surface, along, across, size.w, size.h);
+    let verdict = validateWindowPlacement(surface, along, across, size.w, size.h);
+    // 🚪 A window on a side wall must clear the doors on that wall (checked
+    // against the ACTUAL door groups, so it's right even for odd door layouts).
+    if (verdict.ok && this.world && !this.world.windowClearsDoors(surface, along, size.w)) {
+      verdict = { ok: false, reason: 'overlaps a door' };
+    }
     this.setWindowGhostColor(verdict.ok);
     this.ghostWindow = { surface, along, across, verdict };
   }

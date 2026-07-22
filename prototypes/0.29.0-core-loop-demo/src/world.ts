@@ -128,7 +128,8 @@ import {
   collectWindowOpenings,
   WINDOW_BOX_THICKNESS,
 } from "./windowLayout";
-import type { OctagonProfile } from "./hullSection";
+import { computeOctagonProfile } from "./hullSection";
+import type { OctagonProfile, HullSurface } from "./hullSection";
 import { getCameraYaw } from "./cameraRig";
 
 /**
@@ -959,6 +960,41 @@ export class World {
    *  null when the octagon hull isn't built. */
   public getOctagonProfile(): OctagonProfile | null {
     return this.octagonHull?.profile ?? null;
+  }
+
+  /**
+   * 🚪🪟 #80: does a `w`-wide window at `along` on side wall `surface` (wall-neg /
+   * wall-pos) CLEAR every door on that wall (with a margin)? Read from the ACTUAL
+   * door groups (the rendered truth — door records don't always match the placed
+   * position, e.g. the pool layout). Non-side-wall surfaces (roof/floor) have no
+   * doors → always clear.
+   */
+  public windowClearsDoors(surface: HullSurface, along: number, w: number): boolean {
+    if (surface !== "wall-neg" && surface !== "wall-pos") return true;
+    const groups = this.dockingSystem?.getDoorGroups();
+    if (!groups) return true;
+    const { halfX, halfZ } = roomHalfExtents();
+    const { narrowAxis, narrowHalf } = computeOctagonProfile({ halfX, halfZ });
+    const wallCoord = surface === "wall-neg" ? -narrowHalf : narrowHalf;
+    const MARGIN = 0.4; // clearance between a window and a door on the same wall
+    const ON_WALL = 0.8; // a door counts as "on this wall" within this of the wall
+    const wLo = along - w / 2 - MARGIN;
+    const wHi = along + w / 2 + MARGIN;
+    const box = new THREE.Box3();
+    for (const [, g] of groups) {
+      box.setFromObject(g);
+      if (box.isEmpty()) continue;
+      // perpendicular (narrow-axis) centre: is this door on THIS side wall?
+      const perp = narrowAxis === "x"
+        ? (box.min.x + box.max.x) / 2
+        : (box.min.z + box.max.z) / 2;
+      if (Math.abs(perp - wallCoord) > ON_WALL) continue;
+      // along-range = the door's extrude-axis span (frame + clickbox extent).
+      const a0 = narrowAxis === "x" ? box.min.z : box.min.x;
+      const a1 = narrowAxis === "x" ? box.max.z : box.max.x;
+      if (wLo < a1 && wHi > a0) return false; // overlap
+    }
+    return true;
   }
 
   /**
@@ -2576,35 +2612,41 @@ export class World {
       return starTex;
     };
 
-    const winGeo = new THREE.PlaneGeometry(2.2, 1.65);
-    const winZs = [-2.8, 0.6];
-    winZs.forEach((wz) => {
-      // Left wall — cool cerulean tint
-      const winL = new THREE.Mesh(
-        winGeo.clone(),
-        new THREE.MeshBasicMaterial({
-          map: makeStarTex("#010d22", "#041530"),
-          transparent: true,
-          opacity: 0,
-          side: THREE.DoubleSide,
-        }),
-      );
-      winL.rotation.y = Math.PI / 2;
-      winL.position.set(-5.81, 2.1, wz);
-      this.platformGroup.add(winL);
-      this.furnitureMeshes.push(winL);
-      // Frame
-      place(
-        new THREE.BoxGeometry(0.06, 1.85, 2.42),
-        m(0x8899aa, 0.48, 0.62),
-        -5.84,
-        2.1,
-        wz,
-      );
-      addLight(new THREE.PointLight(0x3388ff, 0, 4.5), -5.5, 2.1, wz, 0.5);
+    // 🪟 #80: the octagon hull carries REAL window holes now (walls/roof/floor via
+    // windowLayout.collectWindowOpenings), so the legacy flat star-window PANES on
+    // the west wall are retired under octagon — they'd otherwise sit against the
+    // octagon wall. Kept for the legacy flat-box room (?octagon=0).
+    if (!OCTAGON_HULL) {
+      const winGeo = new THREE.PlaneGeometry(2.2, 1.65);
+      const winZs = [-2.8, 0.6];
+      winZs.forEach((wz) => {
+        // Left wall — cool cerulean tint
+        const winL = new THREE.Mesh(
+          winGeo.clone(),
+          new THREE.MeshBasicMaterial({
+            map: makeStarTex("#010d22", "#041530"),
+            transparent: true,
+            opacity: 0,
+            side: THREE.DoubleSide,
+          }),
+        );
+        winL.rotation.y = Math.PI / 2;
+        winL.position.set(-5.81, 2.1, wz);
+        this.platformGroup.add(winL);
+        this.furnitureMeshes.push(winL);
+        // Frame
+        place(
+          new THREE.BoxGeometry(0.06, 1.85, 2.42),
+          m(0x8899aa, 0.48, 0.62),
+          -5.84,
+          2.1,
+          wz,
+        );
+        addLight(new THREE.PointLight(0x3388ff, 0, 4.5), -5.5, 2.1, wz, 0.5);
 
-      // Right wall removed — no paintings or frames on that side
-    });
+        // Right wall removed — no paintings or frames on that side
+      });
+    }
 
     // (Coloured throw cushions moved into the sofa builders — furniture.ts.)
 

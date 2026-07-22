@@ -161,12 +161,9 @@ export function collectWindowOpenings(): HullWindows {
   const push = (surface: HullSurface, o: WindowOpening) => {
     (out[surface] ??= []).push(o);
   };
+  // User-placed (synced) windows from the editor.
   for (const rec of readAllWindowLayout().values()) {
     push(rec.surface, { along: rec.along, across: rec.across, w: rec.w, h: rec.h, r: rec.r });
-  }
-  // Standalone demo window (?octagon=1&window=1) for a quick preview.
-  if (new URLSearchParams(window.location.search).get('window') === '1') {
-    push('wall-neg', { along: 0, across: 2, w: 3, h: 1.8, r: 0.5 });
   }
   return out;
 }
