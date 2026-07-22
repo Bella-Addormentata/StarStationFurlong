@@ -118,7 +118,11 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull } from "./octagonHull";
-import type { OctagonHull } from "./octagonHull";
+import type {
+  OctagonHull,
+  HullWindows,
+  WindowOpening,
+} from "./octagonHull";
 import { getCameraYaw } from "./cameraRig";
 
 /**
@@ -917,8 +921,32 @@ export class World {
       this.octagonHull = null;
     }
     const { halfX, halfZ } = roomHalfExtents();
-    this.octagonHull = buildOctagonHull({ halfX, halfZ });
+    this.octagonHull = buildOctagonHull(
+      { halfX, halfZ },
+      this.collectWindowOpenings(),
+    );
     this.platformGroup.add(this.octagonHull.group);
+  }
+
+  /**
+   * 🪟 #80: rounded-rect window openings cut from the octagon side walls (look
+   * outside). A demo opening rides `?octagon=1&window=1`; movable `window`
+   * furniture items map to openings here in a later slice (item world pos →
+   * which side wall + along-wall coord), the same way the pool drives floor
+   * holes. Rebuilt with the hull (addOctagonHull) whenever windows change.
+   */
+  private collectWindowOpenings(): HullWindows {
+    const neg: WindowOpening[] = [];
+    const pos: WindowOpening[] = [];
+    if (
+      new URLSearchParams(window.location.search).get("window") === "1"
+    ) {
+      neg.push({ along: 0, y: 2, w: 3, h: 1.8, r: 0.5 });
+    }
+    return {
+      neg: neg.length ? neg : undefined,
+      pos: pos.length ? pos : undefined,
+    };
   }
 
   /**

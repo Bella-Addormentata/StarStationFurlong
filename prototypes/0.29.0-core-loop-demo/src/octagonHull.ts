@@ -30,6 +30,7 @@ import {
   type HullSectionOpts,
   type OctagonProfile,
   type SectionEdge,
+  type NarrowAxis,
 } from './hullSection';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
@@ -70,11 +71,32 @@ export interface OctagonHull {
   dispose(): void;
 }
 
+/** 🪟 #80: a rounded-rect WINDOW opening cut from a side wall, in that wall's
+ *  local frame: `along` = position along the wall (world coord on the long
+ *  axis), `y` = centre height, `w`×`h` = size, `r` = corner radius. Same idea
+ *  as the pool's floor holes, applied to a vertical wall. */
+export interface WindowOpening {
+  along: number;
+  y: number;
+  w: number;
+  h: number;
+  r: number;
+}
+/** Openings per side wall (narrow-axis ∓/± walls). */
+export interface HullWindows {
+  neg?: WindowOpening[];
+  pos?: WindowOpening[];
+}
+
 /**
  * Build the octagon hull for the given room half-extents (+ optional tuning).
+ * `windows` cuts rounded-rect openings in the two side walls (look outside).
  * `world.ts` calls this behind the flag and adds `.group` to platformGroup.
  */
-export function buildOctagonHull(opts: HullSectionOpts): OctagonHull {
+export function buildOctagonHull(
+  opts: HullSectionOpts,
+  windows: HullWindows = {},
+): OctagonHull {
   const profile = computeOctagonProfile(opts);
   const {
     narrowAxis,
@@ -118,14 +140,12 @@ export function buildOctagonHull(opts: HullSectionOpts): OctagonHull {
   for (const edge of edges) {
     const p0 = outline[edge.from];
     const p1 = outline[edge.to];
-    const geo = quadGeometry(
-      sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf),
-      sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf),
-      sectionToWorld(narrowAxis, p1.a, p1.y, longHalf),
-      sectionToWorld(narrowAxis, p0.a, p0.y, longHalf),
-    );
-    geometries.push(geo);
     if (edge.kind === 'wall') {
+      // Side wall — a hole-aware geometry (rounded-rect window openings) so we
+      // can look outside; plain quad when the wall has no windows.
+      const openings = wallIndex === 0 ? windows.neg : windows.pos;
+      const geo = wallGeometry(narrowAxis, p0.a, longHalf, wallHeight, openings);
+      geometries.push(geo);
       const mat = mkMat(HULL_COLOR.wall);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = 'octagon-wall';
@@ -133,7 +153,16 @@ export function buildOctagonHull(opts: HullSectionOpts): OctagonHull {
       const which = wallIndex === 0 ? 'wall-neg' : 'wall-pos';
       wallFaces.push({ mesh, material: mat, normal: verticalFaceNormal(narrowAxis, which) });
       wallIndex++;
-    } else if (edge.kind.startsWith('roof')) {
+      continue;
+    }
+    const geo = quadGeometry(
+      sectionToWorld(narrowAxis, p0.a, p0.y, -longHalf),
+      sectionToWorld(narrowAxis, p1.a, p1.y, -longHalf),
+      sectionToWorld(narrowAxis, p1.a, p1.y, longHalf),
+      sectionToWorld(narrowAxis, p0.a, p0.y, longHalf),
+    );
+    geometries.push(geo);
+    if (edge.kind.startsWith('roof')) {
       const mat = mkMat(HULL_COLOR.roof, false);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = `octagon-${edge.kind}`;
@@ -361,6 +390,74 @@ export function buildOctagonShell(
     group.clear();
   };
   return { group, dispose };
+}
+
+/** A rounded-rect Path in 2D (u, v) centred at (cx, cy). */
+function roundedRectPath(cx: number, cy: number, w: number, h: number, r: number): THREE.Path {
+  const hw = w / 2,
+    hh = h / 2;
+  const rr = Math.max(0, Math.min(r, hw, hh));
+  const p = new THREE.Path();
+  p.moveTo(cx - hw + rr, cy - hh);
+  p.lineTo(cx + hw - rr, cy - hh);
+  p.quadraticCurveTo(cx + hw, cy - hh, cx + hw, cy - hh + rr);
+  p.lineTo(cx + hw, cy + hh - rr);
+  p.quadraticCurveTo(cx + hw, cy + hh, cx + hw - rr, cy + hh);
+  p.lineTo(cx - hw + rr, cy + hh);
+  p.quadraticCurveTo(cx - hw, cy + hh, cx - hw, cy + hh - rr);
+  p.lineTo(cx - hw, cy - hh + rr);
+  p.quadraticCurveTo(cx - hw, cy - hh, cx - hw + rr, cy - hh);
+  p.closePath();
+  return p;
+}
+
+/**
+ * 🪟 A side-wall face at narrow-axis coord `a`, spanning the long axis
+ * [−longHalf, longHalf] × height [0, wallHeight]. No openings ⇒ a plain quad;
+ * with openings ⇒ a ShapeGeometry (wall rect minus rounded-rect window holes),
+ * triangulated in wall-local (u=along, v=height) then each vertex mapped to
+ * world via sectionToWorld — no orientation math to get wrong.
+ */
+function wallGeometry(
+  narrowAxis: NarrowAxis,
+  a: number,
+  longHalf: number,
+  wallHeight: number,
+  openings: WindowOpening[] | undefined,
+): THREE.BufferGeometry {
+  if (!openings || openings.length === 0) {
+    return quadGeometry(
+      sectionToWorld(narrowAxis, a, 0, -longHalf),
+      sectionToWorld(narrowAxis, a, wallHeight, -longHalf),
+      sectionToWorld(narrowAxis, a, wallHeight, longHalf),
+      sectionToWorld(narrowAxis, a, 0, longHalf),
+    );
+  }
+  const shape = new THREE.Shape();
+  shape.moveTo(-longHalf, 0);
+  shape.lineTo(longHalf, 0);
+  shape.lineTo(longHalf, wallHeight);
+  shape.lineTo(-longHalf, wallHeight);
+  shape.closePath();
+  for (const o of openings) {
+    // clamp the opening inside the wall run + height so the hole never breaks
+    // the outline
+    const along = Math.max(-longHalf + o.w / 2 + 0.05, Math.min(longHalf - o.w / 2 - 0.05, o.along));
+    const cy = Math.max(o.h / 2 + 0.05, Math.min(wallHeight - o.h / 2 - 0.05, o.y));
+    shape.holes.push(roundedRectPath(along, cy, o.w, o.h, o.r));
+  }
+  const geo = new THREE.ShapeGeometry(shape);
+  const pos = geo.attributes.position;
+  const world = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const w = sectionToWorld(narrowAxis, a, pos.getY(i), pos.getX(i)); // (a, v=y, u=along)
+    world[i * 3] = w.x;
+    world[i * 3 + 1] = w.y;
+    world[i * 3 + 2] = w.z;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(world, 3));
+  geo.computeVertexNormals();
+  return geo;
 }
 
 /** A double-sided quad (two triangles) from four world corners. */
