@@ -50,6 +50,7 @@ import {
   DIVE_ARC_LIFT,
   bridgeDeckY,
   poolHoleCells,
+  mergeCellsToRects,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -968,39 +969,6 @@ export class World {
    * click-navigation plane is left intact (walking over a hole still resolves;
    * the swim/sink-into-basement mechanic is a later slice).
    */
-  /**
-   * 🕳️ #80: greedy-merge a set of 1 m hole cells ("i,j", cell = world
-   * [i,i+1]×[j,j+1]) into maximal world rects — far fewer ShapeGeometry holes
-   * than one-per-cell, while still following the water's grid-cell shape.
-   */
-  private mergeHoleCellsToRects(
-    cells: Set<string>,
-  ): Array<{ x0: number; z0: number; x1: number; z1: number }> {
-    const remaining = new Set(cells);
-    const rects: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
-    const sorted = [...remaining]
-      .map((k) => {
-        const [i, j] = k.split(",").map(Number);
-        return { i, j };
-      })
-      .sort((a, b) => a.j - b.j || a.i - b.i);
-    for (const { i, j } of sorted) {
-      if (!remaining.has(`${i},${j}`)) continue;
-      let w = 1;
-      while (remaining.has(`${i + w},${j}`)) w++;
-      let h = 1;
-      grow: for (;;) {
-        for (let dx = 0; dx < w; dx++)
-          if (!remaining.has(`${i + dx},${j + h}`)) break grow;
-        h++;
-      }
-      for (let dz = 0; dz < h; dz++)
-        for (let dx = 0; dx < w; dx++) remaining.delete(`${i + dx},${j + dz}`);
-      rects.push({ x0: i, z0: j, x1: i + w, z1: j + h });
-    }
-    return rects;
-  }
-
   public setFloorHoles(
     holes: Array<{ x0: number; z0: number; x1: number; z1: number }>,
   ): void {
@@ -1986,8 +1954,7 @@ export class World {
       // floor. The pool's basin (with its drawn-in bottom) sinks into the
       // basement through the hole. No pool ⇒ no holes, plus any demo hole.
       const holes: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
-      if (hasPool)
-        holes.push(...this.mergeHoleCellsToRects(poolHoleCells(FURNITURE)));
+      if (hasPool) holes.push(...mergeCellsToRects(poolHoleCells(FURNITURE)));
       if (this.demoFloorHole) holes.push(this.demoFloorHole);
       this.setFloorHoles(holes);
       if (this.platformFloor) this.platformFloor.visible = true;

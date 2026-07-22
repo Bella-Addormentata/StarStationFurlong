@@ -6214,6 +6214,38 @@ export function poolHoleCells(items: FurnitureItem[]): Set<string> {
 }
 
 /**
+ * 🕳️ #80: greedy-merge a set of 1 m cells ("i,j", cell = world [i,i+1]×[j,j+1])
+ * into maximal world rects — SHARED by the floor-hole cut (world.ts) and the
+ * pool obstacle (buildObstacleList) so the hole and the non-walkable region are
+ * byte-identical (you can never walk on a hole).
+ */
+export function mergeCellsToRects(cells: Set<string>): Box[] {
+  const remaining = new Set(cells);
+  const rects: Box[] = [];
+  const sorted = [...remaining]
+    .map((k) => {
+      const [i, j] = k.split(",").map(Number);
+      return { i, j };
+    })
+    .sort((a, b) => a.j - b.j || a.i - b.i);
+  for (const { i, j } of sorted) {
+    if (!remaining.has(`${i},${j}`)) continue;
+    let w = 1;
+    while (remaining.has(`${i + w},${j}`)) w++;
+    let h = 1;
+    grow: for (;;) {
+      for (let dx = 0; dx < w; dx++)
+        if (!remaining.has(`${i + dx},${j + h}`)) break grow;
+      h++;
+    }
+    for (let dz = 0; dz < h; dz++)
+      for (let dx = 0; dx < w; dx++) remaining.delete(`${i + dx},${j + dz}`);
+    rects.push({ x0: i, z0: j, x1: i + w, z1: j + h });
+  }
+  return rects;
+}
+
+/**
  * 🕳️ #80: the world XZ rectangle bounding a pool's water footprint (west
  * waterline → east tile wall × ±halfZ). Used for the water-cell scan bounds and
  * the rect basin bottom. Rotates/offsets with the item (cardinal rots only,
@@ -6252,6 +6284,19 @@ export function getPoolIsland(items: FurnitureItem[]): {
 export function buildObstacleList(items: FurnitureItem[]): Box[] {
   const boxes: Box[] = [];
   for (const item of items) {
+    if (
+      OCTAGON_HULL &&
+      (item.kind === "lazy-pool" || item.kind === "classic-pool")
+    ) {
+      // 🕳️ #80: block only the GRID CELLS the water actually covers (merged),
+      // so the deck around the organic pool stays walkable — you SWIM over the
+      // water cells and WALK the deck. These are the SAME cells the floor hole
+      // cuts, so a hole is never walkable. Replaces the whole-water-rect
+      // footprintOverride obstacle. (Seat sit-points inside the water are
+      // teleport targets, not walked-to; the deck front-points stay reachable.)
+      boxes.push(...mergeCellsToRects(poolHoleCells([item])));
+      continue;
+    }
     const box = itemAabb(item);
     if (box) boxes.push(box);
   }
