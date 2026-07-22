@@ -3669,6 +3669,31 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
     );
   }
 
+  // 🏖️ #80: sand BEACH filling the strip between the organic water and the deck
+  // rectangle. Once the floor hole is cut to the water's EXACT outline (#80), the
+  // bare room floor shows through that strip; legacy hid the whole floor so it
+  // never did. The pool rect MINUS the water outline, in sand, just above the
+  // floor — so the beach reads continuous from the water edge out to the deck.
+  {
+    const beach = new THREE.Shape();
+    beach.moveTo(-WX, -HZ);
+    beach.lineTo(HX, -HZ);
+    beach.lineTo(HX, HZ);
+    beach.lineTo(-WX, HZ);
+    beach.closePath();
+    const waterHole = new THREE.Path();
+    const bp = makeLazyRiver().getPoints(48); // outer water contour (island excluded)
+    waterHole.moveTo(bp[0].x, bp[0].y);
+    for (let i = 1; i < bp.length; i++) waterHole.lineTo(bp[i].x, bp[i].y);
+    waterHole.closePath();
+    beach.holes.push(waterHole);
+    const beachGeo = new THREE.ShapeGeometry(beach, 48);
+    beachGeo.rotateX(-Math.PI / 2);
+    const beachMat = m(SAND, 0.98, 0);
+    beachMat.side = THREE.DoubleSide; // face up regardless of winding
+    place(beachGeo, beachMat, 0, 0.02, 0);
+  }
+
   const tintGeo = new THREE.ShapeGeometry(makeLazyRiver(), 48);
   tintGeo.rotateX(-Math.PI / 2);
   const tint = place(tintGeo, flat(0x1c5a74), 0, EDGE_BOT + 0.01, 0);
