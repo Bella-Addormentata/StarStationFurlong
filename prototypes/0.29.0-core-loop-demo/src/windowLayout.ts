@@ -104,6 +104,13 @@ export function windowFitsSurface(surface: HullSurface, w: number, h: number): b
   return w <= 2 * p.longHalf - 0.1 && h <= surfaceEdge(p, surface).edgeLen - 0.1;
 }
 
+/** The largest w×h a window can be on `surface` before it can't be cut (matches
+ *  windowFitsSurface / octagonHull.clampOpening). The manual resize clamps here. */
+export function windowSizeLimits(surface: HullSurface): { maxW: number; maxH: number } {
+  const p = profile();
+  return { maxW: 2 * p.longHalf - 0.1, maxH: surfaceEdge(p, surface).edgeLen - 0.1 };
+}
+
 /** Border kept between an auto-fit roof skylight and the panel seams (per side). */
 const ROOF_SKYLIGHT_BORDER = 0.5;
 

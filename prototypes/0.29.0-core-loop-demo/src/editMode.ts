@@ -78,7 +78,8 @@ import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
 import {
   snapWindowAlong, clampWindowAlong, clampWindowAcross, windowFitsSurface,
-  surfaceCenterWorld, surfaceBasis, autoWindowSize, WINDOW_BOX_THICKNESS,
+  surfaceCenterWorld, surfaceBasis, autoWindowSize, windowSizeLimits,
+  WINDOW_BOX_THICKNESS,
 } from './windowLayout';
 import {
   writeWindowLayout, deleteWindowLayout, readAllWindowLayout, WINDOW_DEFAULT,
@@ -372,6 +373,15 @@ const OCTAGON_HULL = new URLSearchParams(window.location.search).get('octagon') 
 
 export type WindowPlacementVerdict = { ok: true } | { ok: false; reason: string };
 
+/** 🪟 #80 S4/resize: metres per resize-key press, and the smallest a window may
+ *  shrink to. The manual resize clamps to [MIN, surface limit]. */
+const WINDOW_RESIZE_STEP = 0.25;
+const WINDOW_MIN_SIZE = 0.5;
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
 /** Friendly labels for the surface selector chip. */
 const SURFACE_LABEL: Record<HullSurface, string> = {
   'wall-neg': 'Wall −',
@@ -488,8 +498,12 @@ class RoomEditController {
    *  surface switch, hidden on disarm, disposed on exit). */
   private windowGhost: THREE.Mesh | null = null;
   /** 🪟 #80 S4: the ghost box's current geometry size, so it only rebuilds when
-   *  the auto-fit size changes (per surface). */
+   *  the size changes (per surface / manual resize). */
   private windowGhostSize = { w: 0, h: 0 };
+  /** 🪟 #80 S4/resize: a MANUAL size override for the ghost (null ⇒ auto-fit per
+   *  surface). Set by the resize keys while arming; cleared on cycle / disarm /
+   *  F. The committed window stores this size. */
+  private windowSizeOverride: { w: number; h: number } | null = null;
   /** 🪟 #80 S4: the window ghost's current snapped placement + last verdict; the
    *  click commit reads THIS so the window drops where the preview showed. */
   private ghostWindow:
@@ -613,6 +627,34 @@ class RoomEditController {
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
       e.preventDefault();
       this.cycleWindowSurface(e.key === ']' ? 1 : -1);
+    });
+
+    // 🪟 #80 S4/resize: , . resize width · ↑ ↓ resize height · F re-apply auto-fit.
+    // Active while ADD-window is armed (resizes the ghost) OR a window is selected
+    // (resizes it live). Bare , . only — Shift+, . is the camera-rotation chord.
+    window.addEventListener('keydown', (e) => {
+      if (!this.active) return;
+      const armed = this.addWindowMode;
+      const selWin = !!this.selectedId && this.windowIds.has(this.selectedId);
+      if (!armed && !selWin) return;
+      let dw = 0;
+      let dh = 0;
+      let auto = false;
+      if (e.key === ',' && !e.shiftKey) dw = -WINDOW_RESIZE_STEP;
+      else if (e.key === '.' && !e.shiftKey) dw = WINDOW_RESIZE_STEP;
+      else if (e.key === 'ArrowUp') dh = WINDOW_RESIZE_STEP;
+      else if (e.key === 'ArrowDown') dh = -WINDOW_RESIZE_STEP;
+      else if (e.key === 'f' || e.key === 'F') auto = true;
+      else return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      e.preventDefault();
+      if (armed) {
+        if (auto) this.resetGhostAuto();
+        else this.resizeGhost(dw, dh);
+      } else {
+        this.resizeSelectedWindow(dw, dh, auto);
+      }
     });
 
     // E3: R rotates the carried item a quarter-turn CCW (cheap on the
@@ -818,6 +860,10 @@ class RoomEditController {
       return;
     }
     this.setSelected(hit);
+    // 🪟 #80 S4/resize: advertise the resize keys when a window is selected.
+    if (hit && this.windowIds.has(hit)) {
+      showHint('Window selected — , . / ↑ ↓ resize · F auto-fit · X removes', 3000);
+    }
   }
 
   /**
@@ -1617,7 +1663,7 @@ class RoomEditController {
       return; // stay armed so the owner can nudge to a clearer spot
     }
 
-    const size = autoWindowSize(ghost.surface); // roof panels auto-fit their height
+    const size = this.ghostSize(); // manual override, else roof auto-fit
     writeWindowLayout({
       id: `w:${mintDoorId()}`, // a plain uuid; the `w:` marks a window record
       surface: ghost.surface,
@@ -1646,7 +1692,7 @@ class RoomEditController {
     const parent = this.world?.getClickPlane()?.parent;
     if (!parent) return null;
     // local x=w along uDir, y=h along vDir, z=thickness along the surface normal
-    const size = autoWindowSize(this.windowSurface);
+    const size = this.ghostSize();
     const geo = new THREE.BoxGeometry(size.w, size.h, WINDOW_BOX_THICKNESS);
     this.windowGhostSize = { ...size };
     const mat = new THREE.MeshBasicMaterial({
@@ -1672,16 +1718,73 @@ class RoomEditController {
     ghost.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(uDir, vDir, normal));
   }
 
-  /** Rebuild the ghost box geometry when the active surface's AUTO size changes
-   *  (roof panels auto-fit their height, so the ghost grows/shrinks per surface). */
+  /** The ghost/placement size: a manual override, else the surface's auto-fit. */
+  private ghostSize(): { w: number; h: number } {
+    return this.windowSizeOverride ?? autoWindowSize(this.windowSurface);
+  }
+
+  /** Rebuild the ghost box geometry when its size changes (surface auto-fit or a
+   *  manual resize). Roof panels auto-fit, so the ghost grows/shrinks per surface. */
   private resizeWindowGhost(): void {
     const ghost = this.windowGhost;
     if (!ghost) return;
-    const size = autoWindowSize(this.windowSurface);
+    const size = this.ghostSize();
     if (size.w === this.windowGhostSize.w && size.h === this.windowGhostSize.h) return;
     ghost.geometry.dispose();
     ghost.geometry = new THREE.BoxGeometry(size.w, size.h, WINDOW_BOX_THICKNESS);
     this.windowGhostSize = { ...size };
+  }
+
+  // ── Manual resize (#80 S4/resize — keys ,/. width · ↑/↓ height · F auto-fit) ──
+
+  /** Adjust the ARMED ghost's manual size by (dw, dh), clamped to the surface's
+   *  limits, then re-pose. Sets windowSizeOverride so the committed window keeps it. */
+  private resizeGhost(dw: number, dh: number): void {
+    const base = this.ghostSize();
+    const lim = windowSizeLimits(this.windowSurface);
+    const w = clampNum(base.w + dw, WINDOW_MIN_SIZE, lim.maxW);
+    const h = clampNum(base.h + dh, WINDOW_MIN_SIZE, lim.maxH);
+    this.windowSizeOverride = { w, h };
+    this.resizeWindowGhost();
+    if (this.lastPointer.has) this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
+    else this.orientWindowGhost();
+    showHint(`Window ${w.toFixed(2)} × ${h.toFixed(2)} m · , . width · ↑ ↓ height · F auto-fit`, 1800);
+  }
+
+  /** F while arming: drop the override → back to the surface's auto-fit size. */
+  private resetGhostAuto(): void {
+    this.windowSizeOverride = null;
+    this.resizeWindowGhost();
+    if (this.lastPointer.has) this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
+    else this.orientWindowGhost();
+    const s = this.ghostSize();
+    showHint(`Auto-fit ${s.w.toFixed(2)} × ${s.h.toFixed(2)} m`, 1500);
+  }
+
+  /**
+   * Resize the SELECTED window by (dw, dh) — or re-apply auto-fit when `auto`.
+   * Updates the record's w/h (clamped to the surface) and re-clamps its
+   * along/across so a grown opening stays inside the strip, then writeWindowLayout
+   * → the reconcile re-renders the hull + click-box live (selection persists).
+   */
+  private resizeSelectedWindow(dw: number, dh: number, auto: boolean): void {
+    const id = this.selectedId;
+    if (!id || !this.windowIds.has(id)) return;
+    const rec = readAllWindowLayout().get(id);
+    if (!rec) return;
+    let w: number;
+    let h: number;
+    if (auto) {
+      ({ w, h } = autoWindowSize(rec.surface));
+    } else {
+      const lim = windowSizeLimits(rec.surface);
+      w = clampNum(rec.w + dw, WINDOW_MIN_SIZE, lim.maxW);
+      h = clampNum(rec.h + dh, WINDOW_MIN_SIZE, lim.maxH);
+    }
+    const along = clampWindowAlong(rec.along, w);
+    const across = clampWindowAcross(rec.surface, rec.across, h);
+    writeWindowLayout({ ...rec, w, h, along, across });
+    showHint(`Window ${w.toFixed(2)} × ${h.toFixed(2)} m${auto ? ' (auto-fit)' : ''}`, 1600);
   }
 
   /**
@@ -1705,7 +1808,7 @@ class RoomEditController {
     this.raycaster.setFromCamera(this.pointerNdc, camera);
 
     const surface = this.windowSurface;
-    const size = autoWindowSize(surface); // roof panels auto-fit their height
+    const size = this.ghostSize(); // manual override, else roof auto-fit
     this.resizeWindowGhost();
     const { uDir, vDir, normal } = surfaceBasis(surface);
     const a = surfaceCenterWorld(surface, 0, 0);
@@ -2260,11 +2363,12 @@ class RoomEditController {
       this.resizeWindowGhost(); // match the active surface's auto-fit size
       this.orientWindowGhost();
       this.showWindowSurfaceSelector();
-      showHint('ADD WINDOW — ◀ ▶ (or [ ]) picks the surface · move to aim (green = ok, red = blocked) · click to place · ＋/✕ to cancel', 4200);
+      showHint('ADD WINDOW — ◀ ▶ (or [ ]) surface · , . / ↑ ↓ resize · F auto-fit · move to aim · click to place · ＋/✕ cancel', 4600);
     } else {
       this.setCanvasCursor('');
       this.hideWindowGhost();
       this.hideWindowSurfaceSelector();
+      this.windowSizeOverride = null; // next arm starts at the surface auto-fit
       // Drop the stale pointer sample so a re-arm + surface-cycle before the
       // next mousemove doesn't re-pose the ghost to an old screen point.
       this.lastPointer.has = false;
@@ -2351,6 +2455,7 @@ class RoomEditController {
   private cycleWindowSurface(delta: number): void {
     const i = SURFACES.indexOf(this.windowSurface);
     this.windowSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
+    this.windowSizeOverride = null; // each surface starts at its auto-fit size
     this.syncWindowSurfaceSelector();
     this.resizeWindowGhost(); // roof panels auto-fit → the ghost grows/shrinks
     this.orientWindowGhost();
