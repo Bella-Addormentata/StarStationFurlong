@@ -34,8 +34,10 @@ import {
 } from './hullSection';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
-/** First-person resting opacities (you're INSIDE — see everything). */
-const FP_OPACITY = { roof: 0.4, wall: 0.9 };
+/** First-person resting opacities (you're INSIDE — see everything). The roof is
+ *  OPAQUE so it reads as a real ceiling (its inside surface), not see-through
+ *  glass you look at the sky through. Roof windows are separate holes. */
+const FP_OPACITY = { roof: 1, wall: 0.9 };
 
 /** A face whose outward normal dots the camera direction above this is "near"
  *  the camera (its outside is toward us). Same idiom as the #51 door fade. */
@@ -163,7 +165,7 @@ export function buildOctagonHull(
     );
     geometries.push(geo);
     if (edge.kind.startsWith('roof')) {
-      const mat = mkMat(HULL_COLOR.roof, false);
+      const mat = mkMat(HULL_COLOR.roof);
       const mesh = new THREE.Mesh(geo, mat);
       mesh.name = `octagon-${edge.kind}`;
       group.add(mesh);
@@ -215,7 +217,7 @@ export function buildOctagonHull(
     }
     // roof gable (trapezoid above the walls)
     {
-      const mat = mkMat(HULL_COLOR.roof, false);
+      const mat = mkMat(HULL_COLOR.roof);
       const mesh = new THREE.Mesh(
         capQuad(
           { a: -narrowHalf, y: wallHeight },
