@@ -75,6 +75,15 @@ import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
 } from './doorLayoutDoc';
 import type { DoorWall } from './doorLayoutDoc';
+// 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
+import {
+  wallAndAlongFromPoint, snapWindowAlong, clampWindowAlong,
+  windowCenterWorld, windowBoxDims,
+} from './windowLayout';
+import {
+  writeWindowLayout, deleteWindowLayout, readAllWindowLayout, WINDOW_DEFAULT,
+} from './windowLayoutDoc';
+import type { WindowWall } from './windowLayoutDoc';
 import { PLAYER_R } from './player';
 import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
@@ -354,6 +363,39 @@ export function validateDoorPlacement(
   return { ok: true };
 }
 
+// ── Window placement validity (#80 S4 — the window editor's add/tint gate) ─────
+
+/** 🪟 #80: windows are holes in the octagon side walls, so the ＋ WINDOW
+ *  affordance rides the same `?octagon=1` preview flag world.ts reads. */
+const OCTAGON_HULL = new URLSearchParams(window.location.search).get('octagon') === '1';
+
+export type WindowPlacementVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * May a `w`-wide window sit on side wall `wall` at along-wall `along`? A window
+ * only needs to clear the OTHER windows on the SAME wall (1-D interval gap on the
+ * along-axis centres — centres must be ≥ (w+w')/2 apart), excluding `excludeId`.
+ * The wall-run clamp (off the gable corners) is applied by the caller before
+ * this, and octagonHull clamps again when it cuts the hole. Furniture is
+ * irrelevant — a window is a hole high on the wall, not a floor obstacle. Pure;
+ * drives both the ADD gate and the ghost's red/green.
+ */
+export function validateWindowPlacement(
+  wall: WindowWall,
+  along: number,
+  w: number,
+  excludeId?: string,
+): WindowPlacementVerdict {
+  for (const rec of readAllWindowLayout().values()) {
+    if (rec.id === excludeId) continue;
+    if (rec.wall !== wall) continue;
+    if (Math.abs(rec.along - along) < (w + rec.w) / 2) {
+      return { ok: false, reason: 'overlaps another window' };
+    }
+  }
+  return { ok: true };
+}
+
 // ── Highlight tints ───────────────────────────────────────────────────────────
 
 /** Hover: soft gold emissive wash (docking-terminal palette). */
@@ -405,6 +447,21 @@ class RoomEditController {
    *  pointer is off the floor plane. */
   private ghostDoor: { wall: DoorWall; lateral: number; verdict: DoorPlacementVerdict } | null = null;
 
+  /** 🪟 #80 S4: the ids in the index that are WINDOWS (not furniture/doors) — so
+   *  select/hover/remove branch to the window path (writeWindowLayout /
+   *  deleteWindowLayout). Rebuilt with the window raycast slice. */
+  private windowIds: Set<string> = new Set();
+  /** 🪟 #80 S4: ADD-window sub-mode — the next floor click PLACES a window on the
+   *  clicked octagon side wall instead of selecting. Toggled by ＋ WINDOW. */
+  private addWindowMode = false;
+  /** 🪟 #80 S4: the translucent green/red window PREVIEW following the pointer
+   *  while add-window is armed — one reusable box (built on arm, hidden on
+   *  disarm, disposed on exit), exactly like the door ghost. */
+  private windowGhost: THREE.Mesh | null = null;
+  /** 🪟 #80 S4: the window ghost's current snapped placement + last verdict; the
+   *  click commit reads THIS so the window drops where the preview showed. */
+  private ghostWindow: { wall: WindowWall; along: number; verdict: WindowPlacementVerdict } | null = null;
+
   private hoveredId: string | null = null;
   private selectedId: string | null = null;
 
@@ -452,6 +509,9 @@ class RoomEditController {
   /** 🚪 #28 S6b: persistent ＋ DOOR button (under DONE EDITING) — toggles the
    *  add-door sub-mode; its border/colour flip to green while armed. */
   private addDoorBtnEl: HTMLButtonElement | null = null;
+  /** 🪟 #80 S4: persistent ＋ WINDOW button (under ＋ DOOR) — toggles the
+   *  add-window sub-mode; only shown under the octagon-hull preview. */
+  private addWindowBtnEl: HTMLButtonElement | null = null;
   private labelAnchor = new THREE.Vector3();
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
@@ -487,6 +547,11 @@ class RoomEditController {
       // 🚪 #28 S6b: an armed add-door sub-mode consumes the first Esc too.
       if (this.addDoorMode) {
         this.setAddDoorMode(false);
+        return;
+      }
+      // 🪟 #80 S4: ditto an armed add-window sub-mode.
+      if (this.addWindowMode) {
+        this.setAddWindowMode(false);
         return;
       }
       this.exit();
@@ -599,9 +664,12 @@ class RoomEditController {
     // 🚪 #28 S6b: the ＋ DOOR affordance is interior-scope only (doors live on the
     // room walls, not the hull margin).
     if (scope !== 'hull') this.showAddDoorButton();
+    // 🪟 #80 S4: the ＋ WINDOW affordance rides the octagon-hull preview only
+    // (windows are holes in the octagon side walls) and is interior-scope.
+    if (scope !== 'hull' && OCTAGON_HULL) this.showAddWindowButton();
     showHint(scope === 'hull'
       ? 'HULL EDIT — drag tanks/engines onto the walls or each other · stacks cap at 3 · X removes · DONE EDITING (or ESC) exits'
-      : 'EDIT MODE — click furniture or a door to select · ＋ DOOR adds · X removes · DONE EDITING (or ESC) exits', 4000);
+      : `EDIT MODE — click furniture / a door${OCTAGON_HULL ? ' / a window' : ''} to select · ＋ DOOR${OCTAGON_HULL ? ' / ＋ WINDOW' : ''} adds · X removes · DONE EDITING (or ESC) exits`, 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
@@ -609,11 +677,14 @@ class RoomEditController {
     if (!this.active) return;
     this.cancelCarry(false); // E3: never exit with an item in hand
     this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
+    this.setAddWindowMode(false); // 🪟 #80 S4: drop any armed add-window sub-mode
     this.setHovered(null);
     this.setSelected(null);
     this.hideExitButton();
     this.hideAddDoorButton();
+    this.hideAddWindowButton();
     this.disposeDoorGhost(); // 🚪 #28 S6b/ghost: no leaked preview after the session
+    this.disposeWindowGhost(); // 🪟 #80 S4/ghost: ditto the window preview
     window.removeEventListener('mousemove', this.onMouseMove);
     this.setCanvasCursor('');
     // 🛰️ Undo the hull-scope presentation before the world reference drops.
@@ -632,6 +703,7 @@ class RoomEditController {
     this.meshToItem.clear();
     this.itemMeshes.clear();
     this.doorIds.clear();
+    this.windowIds.clear();
     this.savedEmissive.clear();
     this.world = null;
     this.active = false;
@@ -680,6 +752,15 @@ class RoomEditController {
       return;
     }
 
+    // 🪟 #80 S4: ADD-window sub-mode consumes the next canvas click to PLACE a
+    // window at the (snapped) clicked side-wall point, instead of selecting.
+    if (this.addWindowMode) {
+      const canvas = window.gameRenderer?.renderer?.domElement;
+      if (canvas && event.target !== canvas) return;
+      this.tryPlaceWindowAt(event.clientX, event.clientY);
+      return;
+    }
+
     const hit = this.pickItemAt(event.clientX, event.clientY);
     if (hit && hit === this.selectedId) {
       this.beginCarry(hit);
@@ -724,6 +805,7 @@ class RoomEditController {
     this.meshToItem.clear();
     this.itemMeshes.clear();
     this.doorIds.clear();
+    this.windowIds.clear();
     for (const item of FURNITURE) {
       if (!item.movable) continue;
       const group = world.furnitureGroups.get(item.id);
@@ -739,6 +821,7 @@ class RoomEditController {
       this.itemMeshes.set(item.id, meshes);
     }
     this.indexDoorGroups(world);
+    this.indexWindowGroups(world);
   }
 
   /**
@@ -806,15 +889,80 @@ class RoomEditController {
     }
   }
 
-  /** True when `id` is an indexed furniture item or door. */
+  /**
+   * 🪟 #80 S4: add every window click-box to the raycast index (the box is
+   * invisible until hovered/selected but always raycasts). Kept SEPARATE from
+   * the furniture/door loops so onWindowLayoutChanged can rebuild just this
+   * slice after an add/remove. Window ids land in `windowIds` so select / hover
+   * / remove branch to the window path.
+   */
+  private indexWindowGroups(world: World): void {
+    for (const [windowId, group] of world.getWindowGroups()) {
+      const meshes: THREE.Mesh[] = [];
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          meshes.push(obj);
+          this.meshToItem.set(obj, windowId);
+          this.raycastTargets.push(obj);
+        }
+      });
+      this.itemMeshes.set(windowId, meshes);
+      this.windowIds.add(windowId);
+    }
+  }
+
+  /**
+   * 🪟 #80 S4: rebuild ONLY the window slice of the raycast index from the
+   * current window boxes — called by world.reconcileWindowLayout after a
+   * local/remote add/remove (the window doc observer fires it synchronously).
+   * The boxes are rebuilt FRESH (old geometry/material disposed), so this drops
+   * the stale slice then re-indexes; a surviving selected window re-asserts its
+   * highlight (its box was replaced). Mirrors onDoorLayoutChanged — the
+   * selection is NOT dropped on every edit.
+   */
+  public onWindowLayoutChanged(): void {
+    const world = this.world;
+    if (!this.active || !world) return;
+
+    // Drop the previous window slice (map entries only — handles already gone).
+    const windowMeshSet = new Set<THREE.Object3D>();
+    for (const id of this.windowIds) {
+      const meshes = this.itemMeshes.get(id);
+      if (meshes) for (const m of meshes) windowMeshSet.add(m);
+      this.itemMeshes.delete(id);
+    }
+    for (const m of windowMeshSet) this.meshToItem.delete(m);
+    this.raycastTargets = this.raycastTargets.filter((m) => !windowMeshSet.has(m));
+    this.windowIds.clear();
+
+    // Re-index the current window boxes.
+    this.indexWindowGroups(world);
+
+    // A hovered window that vanished lets go of its (disposed) handle; a
+    // surviving selected window re-asserts its highlight, and a selected window
+    // that was removed (gone from every index) drops its selection.
+    if (this.hoveredId && !this.isKnownId(this.hoveredId)) this.hoveredId = null;
+    if (this.selectedId && this.windowIds.has(this.selectedId)) {
+      this.applyTint(this.selectedId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else if (
+      this.selectedId &&
+      !this.isKnownId(this.selectedId) &&
+      !world.furnitureGroups.has(this.selectedId)
+    ) {
+      this.setSelected(null);
+    }
+  }
+
+  /** True when `id` is an indexed furniture item, door or window. */
   private isKnownId(id: string): boolean {
     return this.itemMeshes.has(id);
   }
 
-  /** The 3D group for a furniture id or a door id (label anchor / bounds). */
+  /** The 3D group for a furniture / door / window id (label anchor / bounds). */
   private groupForId(id: string): THREE.Group | undefined {
     return this.world?.furnitureGroups.get(id)
-      ?? this.world?.dockingSystem?.getDoorGroups().get(id);
+      ?? this.world?.dockingSystem?.getDoorGroups().get(id)
+      ?? this.world?.getWindowGroups().get(id);
   }
 
   /** Raycast the movable-furniture meshes at a screen point → item id | null. */
@@ -840,6 +988,8 @@ class RoomEditController {
       // 🚪 #28 S6b/ghost: a door preview must not linger under a HUD panel —
       // hide it while the pointer is off the canvas.
       if (this.addDoorMode) this.hideDoorGhost();
+      // 🪟 #80 S4/ghost: ditto the window preview.
+      if (this.addWindowMode) this.hideWindowGhost();
       return;
     }
     // E3: while carrying, the pointer drives the held item, not hover.
@@ -854,6 +1004,14 @@ class RoomEditController {
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
       this.updateDoorGhostFromPointer(e.clientX, e.clientY);
+      return;
+    }
+    // 🪟 #80 S4: in ADD-window mode the pointer arms a placement — drive the
+    // translucent green/red window ghost that follows the side wall.
+    if (this.addWindowMode) {
+      this.setHovered(null);
+      this.setCanvasCursor('crosshair');
+      this.updateWindowGhostFromPointer(e.clientX, e.clientY);
       return;
     }
     this.setHovered(this.pickItemAt(e.clientX, e.clientY));
@@ -1101,6 +1259,14 @@ class RoomEditController {
       return;
     }
 
+    // 🪟 #80 S4: a WINDOW removal is its own short path — drop the layout record
+    // (the reconcile removes the hole + glass + click-box); no OBSTACLES / seat /
+    // inventory teardown, and no pairing gate (windows are passive).
+    if (this.windowIds.has(itemId)) {
+      this.removeSelectedWindow(itemId);
+      return;
+    }
+
     const item = FURNITURE.find((i) => i.id === itemId);
     if (!item) return;
     if (!item.movable) {
@@ -1344,6 +1510,175 @@ class RoomEditController {
     this.ghostDoor = null;
   }
 
+  // ── Window add / remove (#80 S4 — the window editor MVP) ────────────────────
+
+  /**
+   * 🪟 #80 S4: remove the SELECTED window from the shared layout. No pairing gate
+   * (windows are passive holes, unlike doors) and no seed-first hazard (windows
+   * have no defaults — an empty map means no windows). Restore its highlight +
+   * drop it from the index while its box still exists, then deleteWindowLayout();
+   * the doc observer's reconcile rebuilds the hull (hole + glass gone) + the
+   * click-boxes and re-runs onWindowLayoutChanged.
+   */
+  private removeSelectedWindow(windowId: string): void {
+    const world = this.world;
+    if (!world) return;
+
+    // Teardown BEFORE the delete disposes the box's material (setSelected(null)
+    // → clearTint hides the live box).
+    this.setSelected(null);
+    if (this.hoveredId === windowId) this.setHovered(null);
+    const meshes = this.itemMeshes.get(windowId) ?? [];
+    for (const mesh of meshes) this.meshToItem.delete(mesh);
+    this.itemMeshes.delete(windowId);
+    const meshSet = new Set<THREE.Object3D>(meshes);
+    this.raycastTargets = this.raycastTargets.filter((m) => !meshSet.has(m));
+    this.windowIds.delete(windowId);
+
+    deleteWindowLayout(windowId);
+    showHint(`Removed window ${windowId}.`, 2000);
+  }
+
+  /**
+   * 🪟 #80 S4: commit the ADD-window sub-mode at the GHOST's current spot. Like
+   * tryPlaceDoorAt, a click re-derives the ghost from the pointer (so a synthetic
+   * click with no preceding mousemove still commits AT the pointer) then writes
+   * the record. On success: writeWindowLayout with a fresh `w:`-prefixed id at the
+   * default size, and leave add-mode (hides the ghost). On failure: hint + STAY
+   * armed, keeping the red ghost so the owner can nudge to a clearer spot.
+   */
+  private tryPlaceWindowAt(clientX: number, clientY: number): void {
+    this.updateWindowGhostFromPointer(clientX, clientY);
+    const ghost = this.ghostWindow;
+    if (!ghost) return; // pointer wasn't over the floor plane
+    if (!ghost.verdict.ok) {
+      showHint(`CAN'T ADD WINDOW — ${ghost.verdict.reason}`, 2400);
+      return; // stay armed so the owner can nudge to a clearer spot
+    }
+
+    writeWindowLayout({
+      id: `w:${mintDoorId()}`, // a plain uuid; the `w:` marks a window record
+      wall: ghost.wall,
+      along: ghost.along,
+      y: WINDOW_DEFAULT.y,
+      w: WINDOW_DEFAULT.w,
+      h: WINDOW_DEFAULT.h,
+      r: WINDOW_DEFAULT.r,
+      enabled: true,
+    });
+    this.setAddWindowMode(false); // hides the ghost
+    showHint('Window added — look outside.', 2000);
+  }
+
+  // ── Window ghost preview (#80 S4/ghost — furniture-like green/red follow) ────
+
+  /**
+   * Lazily build (once) the reusable translucent window ghost, parented to the
+   * SAME group the hull + click plane live in (platformGroup, via the click
+   * plane's parent — world-origin frame, so windowCenterWorld maps straight
+   * through). Sized like the default opening (windowBoxDims orients it to the
+   * room's narrow axis), coloured with the furniture carry's valid/invalid hexes.
+   */
+  private ensureWindowGhost(): THREE.Mesh | null {
+    if (this.windowGhost) return this.windowGhost;
+    const parent = this.world?.getClickPlane()?.parent;
+    if (!parent) return null;
+    const d = windowBoxDims(WINDOW_DEFAULT.w, WINDOW_DEFAULT.h);
+    const geo = new THREE.BoxGeometry(d.sx, d.sy, d.sz);
+    const mat = new THREE.MeshBasicMaterial({
+      color: CARRY_VALID_EMISSIVE, // green; flipped red on invalid
+      transparent: true,
+      opacity: 0.4,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.visible = false;
+    mesh.renderOrder = 3; // draw over the wall/glass so the tint reads through
+    parent.add(mesh);
+    this.windowGhost = mesh;
+    return mesh;
+  }
+
+  /**
+   * Follow the pointer while add-window is armed: raycast the click plane →
+   * nearest side wall + along (wallAndAlongFromPoint) → snap to the 1 m lattice
+   * (snapWindowAlong) → clamp off the caps (clampWindowAlong) → pose the ghost at
+   * the opening centre (windowCenterWorld) → validate (validateWindowPlacement)
+   * and tint green/red. Off the plane → hide. Stashes {wall, along, verdict} in
+   * `ghostWindow` for the click commit.
+   */
+  private updateWindowGhostFromPointer(clientX: number, clientY: number): void {
+    const world = this.world;
+    const camera = window.gameRenderer?.camera;
+    const plane = world?.getClickPlane();
+    if (!world || !camera || !plane) return;
+    const ghost = this.ensureWindowGhost();
+    if (!ghost) return;
+    this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
+    this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointerNdc, camera);
+    const hits = this.raycaster.intersectObject(plane, false);
+    if (hits.length === 0) { this.hideWindowGhost(); return; }
+
+    const { wall, along } = wallAndAlongFromPoint(hits[0].point.x, hits[0].point.z);
+    const snapped = clampWindowAlong(snapWindowAlong(along), WINDOW_DEFAULT.w);
+    const c = windowCenterWorld(wall, snapped, WINDOW_DEFAULT.y);
+    ghost.position.set(c.x, c.y, c.z);
+    ghost.visible = true;
+
+    const verdict = validateWindowPlacement(wall, snapped, WINDOW_DEFAULT.w);
+    this.setWindowGhostColor(verdict.ok);
+    this.ghostWindow = { wall, along: snapped, verdict };
+  }
+
+  /** Flip the ghost between the furniture carry's green (valid) / red (invalid). */
+  private setWindowGhostColor(valid: boolean): void {
+    const mat = this.windowGhost?.material as THREE.MeshBasicMaterial | undefined;
+    if (mat) mat.color.setHex(valid ? CARRY_VALID_EMISSIVE : CARRY_INVALID_EMISSIVE);
+  }
+
+  /** Hide the reusable ghost (disarm / off-plane) — instance kept for re-arm. */
+  private hideWindowGhost(): void {
+    if (this.windowGhost) this.windowGhost.visible = false;
+    this.ghostWindow = null;
+  }
+
+  /** Fully tear down the window ghost (leaving edit mode). */
+  private disposeWindowGhost(): void {
+    if (this.windowGhost) {
+      this.windowGhost.parent?.remove(this.windowGhost);
+      this.windowGhost.geometry.dispose();
+      (this.windowGhost.material as THREE.Material).dispose();
+      this.windowGhost = null;
+    }
+    this.ghostWindow = null;
+  }
+
+  /**
+   * 🪟 #80 S4: a window's only per-id mesh is its (normally hidden) click-box, so
+   * highlight it by flipping that box's own translucent material on/off with the
+   * hover/select colour — the window analogue of a door's emissive tint.
+   * `intensity` doubles as the wash opacity (HOVER 0.28 / SELECT 0.65 read well);
+   * 0 clears it back to hidden. Routed here from applyTint/clearTint by windowId.
+   */
+  private setWindowBoxTint(id: string, hex: number, intensity: number): void {
+    const group = this.world?.getWindowGroups().get(id);
+    if (!group) return;
+    group.traverse((o) => {
+      if (!(o instanceof THREE.Mesh)) return;
+      const m = o.material as THREE.MeshBasicMaterial;
+      if (intensity <= 0) {
+        m.visible = false;
+        m.opacity = 0;
+        return;
+      }
+      m.color.setHex(hex);
+      m.opacity = Math.min(0.6, intensity);
+      m.visible = true;
+    });
+  }
+
   /** Validate the current candidate against live player positions. */
   private currentCarryVerdict(): PlacementVerdict {
     const c = this.carrying;
@@ -1483,6 +1818,8 @@ class RoomEditController {
    * but guard anyway (#27's shared-material lesson).
    */
   private applyTint(itemId: string, emissive: number, intensity: number): void {
+    // 🪟 #80 S4: windows have no emissive mesh — highlight their click-box wash.
+    if (this.windowIds.has(itemId)) { this.setWindowBoxTint(itemId, emissive, intensity); return; }
     const meshes = this.itemMeshes.get(itemId);
     if (!meshes) return;
     const touched = new Set<THREE.Material>();
@@ -1504,6 +1841,8 @@ class RoomEditController {
 
   /** Restore the exact saved emissive state of every material of an item. */
   private clearTint(itemId: string): void {
+    // 🪟 #80 S4: a window's highlight lives on its click-box — hide it again.
+    if (this.windowIds.has(itemId)) { this.setWindowBoxTint(itemId, 0, 0); return; }
     const meshes = this.itemMeshes.get(itemId);
     if (!meshes) return;
     for (const mesh of meshes) {
@@ -1562,11 +1901,12 @@ class RoomEditController {
    * (hidden), matching the "button hidden, not disabled" rule.
    */
   private syncRemoveButton(): void {
-    // 🚪 #28 S6b: a selected DOOR shows the REMOVE button too (movable furniture
-    // OR any door — the two selectable classes in the index).
+    // 🚪 #28 S6b / 🪟 #80 S4: a selected DOOR or WINDOW shows the REMOVE button
+    // too (movable furniture OR any door OR any window — the selectable classes).
     const isDoor = this.selectedId ? this.doorIds.has(this.selectedId) : false;
+    const isWindow = this.selectedId ? this.windowIds.has(this.selectedId) : false;
     const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;
-    const show = this.active && !this.carrying && (isDoor || (!!item && item.movable));
+    const show = this.active && !this.carrying && (isDoor || isWindow || (!!item && item.movable));
     if (!this.removeBtnEl) {
       if (!show) return;
       this.removeBtnEl = document.createElement('button');
@@ -1728,6 +2068,7 @@ class RoomEditController {
     }
     this.addDoorMode = on;
     if (on) {
+      this.setAddWindowMode(false); // 🪟 the two add sub-modes are exclusive
       this.setSelected(null);
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
@@ -1741,6 +2082,92 @@ class RoomEditController {
       this.hideDoorGhost();
     }
     this.syncAddDoorButton();
+  }
+
+  // ── ＋ WINDOW button + add-window sub-mode (#80 S4) ──────────────────────────
+
+  /**
+   * 🪟 #80 S4: the persistent ＋ WINDOW button (under ＋ DOOR). Toggles the
+   * add-window sub-mode; while armed its border/colour flip to green and the
+   * label reads ✕ CANCEL WINDOW. Only shown under the octagon-hull preview.
+   */
+  private showAddWindowButton(): void {
+    if (!this.addWindowBtnEl) {
+      this.addWindowBtnEl = document.createElement('button');
+      this.addWindowBtnEl.id = 'room-edit-add-window-btn';
+      this.addWindowBtnEl.type = 'button';
+      this.addWindowBtnEl.title = 'Add a window — then click a side wall to place it';
+      this.addWindowBtnEl.style.cssText = `
+        position: fixed;
+        top: 92px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 6px 18px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(155, 212, 232, 0.7);
+        border-radius: 8px;
+        color: #9bd4e8;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      this.addWindowBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.setAddWindowMode(!this.addWindowMode);
+      });
+      document.body.appendChild(this.addWindowBtnEl);
+    }
+    this.addWindowBtnEl.style.display = 'block';
+    this.syncAddWindowButton();
+  }
+
+  private hideAddWindowButton(): void {
+    if (this.addWindowBtnEl) this.addWindowBtnEl.style.display = 'none';
+  }
+
+  /** Reflect the armed/idle add-window state onto the ＋ WINDOW button. */
+  private syncAddWindowButton(): void {
+    const btn = this.addWindowBtnEl;
+    if (!btn) return;
+    if (this.addWindowMode) {
+      btn.textContent = '✕ CANCEL WINDOW';
+      btn.style.color = '#35d06a';
+      btn.style.borderColor = 'rgba(53, 208, 106, 0.85)';
+    } else {
+      btn.textContent = '＋ WINDOW';
+      btn.style.color = '#9bd4e8';
+      btn.style.borderColor = 'rgba(155, 212, 232, 0.7)';
+    }
+  }
+
+  /**
+   * 🪟 #80 S4: arm / disarm the add-window sub-mode. Arming disarms add-door (the
+   * two are exclusive), clears any selection (the next click PLACES) and shows
+   * the how-to hint; disarming restores the pointer cursor + hides the ghost.
+   */
+  private setAddWindowMode(on: boolean): void {
+    if (this.addWindowMode === on) {
+      this.syncAddWindowButton();
+      return;
+    }
+    this.addWindowMode = on;
+    if (on) {
+      this.setAddDoorMode(false); // 🚪 the two add sub-modes are exclusive
+      this.setSelected(null);
+      this.setHovered(null);
+      this.setCanvasCursor('crosshair');
+      this.ensureWindowGhost();
+      showHint('ADD WINDOW — move to a side wall (green = ok, red = blocked) · click to place · ＋/✕ to cancel', 3500);
+    } else {
+      this.setCanvasCursor('');
+      this.hideWindowGhost();
+    }
+    this.syncAddWindowButton();
   }
 
   /** Reproject the label (above) + REMOVE button (below) every frame. */

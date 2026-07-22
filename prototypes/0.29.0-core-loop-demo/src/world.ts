@@ -127,6 +127,7 @@ import {
   readAllWindowLayout,
   subscribeWindowLayout,
 } from "./windowLayoutDoc";
+import { windowCenterWorld, windowBoxDims } from "./windowLayout";
 import { getCameraYaw } from "./cameraRig";
 
 /**
@@ -215,6 +216,10 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
   private octagonHull: OctagonHull | null = null;
+  // 🪟 #80 S4: invisible click-boxes for the placed windows, by id — the
+  // edit-mode raycast index (material.visible:false, still raycasts), so a
+  // window is selectable + removable like a door. Rebuilt with the hull.
+  private windowGroups: Map<string, THREE.Group> = new Map();
   // Active interactive docking doors subsystem
   public dockingSystem: DoorDockingPortSystem | null = null;
   // ── Adapter transit (T1 of issue #30) ───────────────────────────────────────
@@ -932,6 +937,64 @@ export class World {
       this.collectWindowOpenings(),
     );
     this.platformGroup.add(this.octagonHull.group);
+    // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
+    this.rebuildWindowClickBoxes();
+  }
+
+  /** 🪟 #80 S4: live window click-boxes by id — the edit-mode raycast index
+   *  (mirrors dockingSystem.getDoorGroups()). Invisible, but still raycasts. */
+  public getWindowGroups(): Map<string, THREE.Group> {
+    return this.windowGroups;
+  }
+
+  /**
+   * 🪟 #80 S4: rebuild the window click-boxes from the shared window set — one
+   * fat box per record sitting IN its opening on the side wall. The box is a
+   * reliable raycast target (raycasting ignores visibility) that stays HIDDEN
+   * until edit mode tints it: its own translucent material starts `visible:false`
+   * and edit-mode's hover/select flips it on (gold wash) — the window analogue
+   * of a door's emissive highlight, since a window has no other per-id mesh to
+   * tint. Own material per box (not shared) so highlights are independent.
+   *
+   * Rebuilt with the hull so the targets track every add / move / remove. The
+   * boxes live in platformGroup beside the hull geometry (world-origin frame —
+   * windowCenterWorld maps straight through) and are only ever raycast BY edit
+   * mode, so they never intercept a normal floor click.
+   */
+  private rebuildWindowClickBoxes(): void {
+    for (const g of this.windowGroups.values()) {
+      this.platformGroup.remove(g);
+      g.traverse((o) => {
+        if (o instanceof THREE.Mesh) {
+          o.geometry.dispose();
+          (o.material as THREE.Material).dispose();
+        }
+      });
+    }
+    this.windowGroups.clear();
+    if (!OCTAGON_HULL) return;
+    for (const rec of readAllWindowLayout().values()) {
+      const dims = windowBoxDims(rec.w, rec.h);
+      const c = windowCenterWorld(rec.wall, rec.along, rec.y);
+      const box = new THREE.Mesh(
+        new THREE.BoxGeometry(dims.sx, dims.sy, dims.sz),
+        new THREE.MeshBasicMaterial({
+          color: 0xf0c060,
+          transparent: true,
+          opacity: 0,
+          depthWrite: false, // a highlight wash, not an occluder
+          side: THREE.DoubleSide,
+          visible: false, // shown only while hovered / selected in edit mode
+        }),
+      );
+      box.position.set(c.x, c.y, c.z);
+      box.name = `window-clickbox-${rec.id}`;
+      const group = new THREE.Group();
+      group.name = `window-${rec.id}`;
+      group.add(box);
+      this.platformGroup.add(group);
+      this.windowGroups.set(rec.id, group);
+    }
   }
 
   /**
@@ -972,7 +1035,11 @@ export class World {
    */
   private reconcileWindowLayout(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull();
+    this.addOctagonHull(); // rebuilds hull holes + glass AND the click-boxes
+    // 🪟 keep a live edit session's raycast index in sync with the window
+    // boxes just rebuilt — a targeted window-slice rebuild that preserves the
+    // current selection by id (mirrors reconcileDoorLayout → onDoorLayoutChanged).
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
   }
 
   /**
