@@ -2792,6 +2792,9 @@ export class World {
       // 🏊 Outdoor pool room: the floor stays hidden (the lazy-pool's deck
       // slabs are the visible floor; sunken water must show through).
       if (this.platformFloor) this.platformFloor.visible = !this.isOutdoorRoom;
+      // 🛑📐 #80 S1 preview: drop the opaque wood floor so the basement void
+      // below reads (the whole point of the sub-floor space). Preview-only.
+      if (OCTAGON_HULL && this.platformFloor) this.platformFloor.visible = false;
       // 🧱🪟 Placed wall sections REPLACE a built-in side wall — the interior
       // restore must not resurrect a covered one (nor one dropped for 🛰️
       // HULL EDIT).

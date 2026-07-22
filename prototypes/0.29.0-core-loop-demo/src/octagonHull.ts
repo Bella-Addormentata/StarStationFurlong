@@ -136,6 +136,41 @@ export function buildOctagonHull(opts: HullSectionOpts): OctagonHull {
     });
   }
 
+  // ── Bright edge outline — draws OVER everything (depthTest off) so the 8-sided
+  //    octagon barrel is unmistakable even where the faces are see-through and
+  //    even the basement edges read THROUGH the floor. (Preview affordance.)
+  {
+    const linePts: number[] = [];
+    const push = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) => {
+      linePts.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    };
+    const n = outline.length;
+    for (let i = 0; i < n; i++) {
+      const p = outline[i];
+      const q = outline[(i + 1) % n];
+      // the two octagon rings (near + far end caps)
+      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, q.a, q.y, -longHalf));
+      push(sectionToWorld(narrowAxis, p.a, p.y, longHalf), sectionToWorld(narrowAxis, q.a, q.y, longHalf));
+      // the longitudinal connector at this vertex
+      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, p.a, p.y, longHalf));
+    }
+    const edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(linePts), 3));
+    geometries.push(edgeGeo);
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: 0x5fe6ff,
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false,
+      depthWrite: false,
+    });
+    materials.push(edgeMat);
+    const edgeLines = new THREE.LineSegments(edgeGeo, edgeMat);
+    edgeLines.name = 'octagon-edges';
+    edgeLines.renderOrder = 10; // draw on top
+    group.add(edgeLines);
+  }
+
   const updateFacing = (camDirX: number, camDirZ: number, firstPerson: boolean) => {
     for (const face of faces) {
       if (firstPerson) {
