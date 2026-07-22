@@ -982,14 +982,18 @@ export class World {
     const wHi = along + w / 2 + MARGIN;
     const box = new THREE.Box3();
     for (const [, g] of groups) {
-      box.setFromObject(g);
+      // Bound the DOORWAY only (frame + leaves + clickbox), NOT the port
+      // hardware — the keypad sticks out to one side (always +local-x) and would
+      // inflate the span asymmetrically, falsely rejecting windows on that side.
+      const doorway = g.getObjectByName("doorLeaves") ?? g;
+      box.setFromObject(doorway);
       if (box.isEmpty()) continue;
       // perpendicular (narrow-axis) centre: is this door on THIS side wall?
       const perp = narrowAxis === "x"
         ? (box.min.x + box.max.x) / 2
         : (box.min.z + box.max.z) / 2;
       if (Math.abs(perp - wallCoord) > ON_WALL) continue;
-      // along-range = the door's extrude-axis span (frame + clickbox extent).
+      // along-range = the doorway's extrude-axis span.
       const a0 = narrowAxis === "x" ? box.min.z : box.min.x;
       const a1 = narrowAxis === "x" ? box.max.z : box.max.x;
       if (wLo < a1 && wHi > a0) return false; // overlap

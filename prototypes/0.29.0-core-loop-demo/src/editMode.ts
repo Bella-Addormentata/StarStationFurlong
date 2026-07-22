@@ -1784,6 +1784,18 @@ class RoomEditController {
     }
     const along = clampWindowAlong(rec.along, w);
     const across = clampWindowAcross(rec.surface, rec.across, h);
+    // Gate the resize the SAME way as placement: a grown window must still clear
+    // the other windows AND the doors on its wall (else '.' could grow it over a
+    // door / neighbour). On reject, keep the current size + hint the reason.
+    const verdict = validateWindowPlacement(rec.surface, along, across, w, h, id);
+    if (!verdict.ok) {
+      showHint(`Can't resize — ${verdict.reason}.`, 1800);
+      return;
+    }
+    if (this.world && !this.world.windowClearsDoors(rec.surface, along, w)) {
+      showHint("Can't resize — would overlap a door.", 1800);
+      return;
+    }
     writeWindowLayout({ ...rec, w, h, along, across });
     showHint(`Window ${w.toFixed(2)} × ${h.toFixed(2)} m${auto ? ' (auto-fit)' : ''}`, 1600);
   }

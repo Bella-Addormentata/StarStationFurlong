@@ -153,8 +153,8 @@ export function frontWallFromPoint(px: number, pz: number): { surface: HullSurfa
 /**
  * 🪟 The current room's window openings, bucketed by hull surface — the ONE
  * source for both the interior hull (octagonHull) and the exterior shell
- * (exteriorView), plus the `?octagon=1&window=1` demo pane. Reads the synced
- * layout doc; malformed records are already dropped by readAllWindowLayout.
+ * (exteriorView). Reads the synced layout doc (the editor-placed windows);
+ * malformed records are already dropped by readAllWindowLayout.
  */
 export function collectWindowOpenings(): HullWindows {
   const out: HullWindows = {};
