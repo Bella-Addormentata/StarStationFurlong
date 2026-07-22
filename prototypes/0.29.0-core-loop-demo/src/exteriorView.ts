@@ -386,12 +386,16 @@ function buildGroup(): THREE.Group {
         label: pose.name,
       };
       if (OCTAGON_HULL) {
-        // 🛑📐 #80: neighbours read as translucent octagon shells too. Dims of
-        // other rooms aren't carried in the atlas pose, so assume the default
-        // (matches today's 11.8 box assumption); the click-to-connect userData
+        // 🛑📐 #80: neighbours read as translucent octagon shells too — at their
+        // TRUE size when the atlas learned it (visited rooms gossip dims), else
+        // the default 2×2 (matches today's 11.8 box). Click-to-connect userData
         // stays on `mod`.
+        const nd = pose.dims ?? { cols: 2, rows: 2 };
         mod.add(
-          buildOctagonShell({ halfX: 6, halfZ: 6 }, { opacity: 0.82 }).group,
+          buildOctagonShell(
+            { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
+            { opacity: 0.82 },
+          ).group,
         );
       } else {
         const hullMat = new THREE.MeshStandardMaterial({

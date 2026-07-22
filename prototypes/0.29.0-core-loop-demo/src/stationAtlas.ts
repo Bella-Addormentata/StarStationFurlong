@@ -48,6 +48,10 @@ export interface AtlasEntry {
   name: string;
   /** A seed link that reaches THIS room, when we hold one (ledger/passes). */
   seed?: string;
+  /** 🛑📐 #80: the room's tile dimensions, learned while we were IN it — lets
+   *  the exterior view render each module at its TRUE size. Absent for rooms we
+   *  only know as neighbours (stub entries) → the renderer falls back. */
+  dims?: { cols: number; rows: number };
   doors: Partial<Record<DoorId, AtlasDoor>>;
   lastSeen: number;
 }
@@ -104,6 +108,7 @@ export function harvestIntoAtlas(entry: {
   roomId: string;
   name: string;
   seed?: string;
+  dims?: { cols: number; rows: number };
   doors: Array<{ doorId: DoorId; targetSeed: string; segments?: ConnectorSegment[]; farDoor?: DoorId; farYawDeg?: 0 | 45 }>;
 }): void {
   if (!entry.roomId) return;
@@ -123,6 +128,7 @@ export function harvestIntoAtlas(entry: {
     roomId: entry.roomId,
     name: entry.name || prior?.name || 'Module',
     seed: entry.seed ?? prior?.seed,
+    dims: entry.dims ?? prior?.dims,
     doors,
     lastSeen: Date.now(),
   };
@@ -160,6 +166,9 @@ export interface AtlasPose {
   roomId: string;
   name: string;
   seed?: string;
+  /** The module's true tile dims when known (learned by visiting it); absent
+   *  for neighbours we've only heard about — the renderer falls back. */
+  dims?: { cols: number; rows: number };
   x: number;
   z: number;
   rotY: number;
@@ -212,6 +221,7 @@ export function atlasLayout(
         roomId: door.targetRoomId,
         name: target?.name ?? 'Module',
         seed: target?.seed ?? door.targetSeed,
+        dims: target?.dims,
         x: wx,
         z: wz,
         rotY: from.rotY + local.rotY,

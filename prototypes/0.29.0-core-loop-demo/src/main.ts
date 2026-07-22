@@ -87,7 +87,7 @@ import {
   readDoorPolicy,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
-import { bindFloorPlan, subscribeFloorPlan } from "./floorPlanDoc";
+import { bindFloorPlan, subscribeFloorPlan, readRoomDims } from "./floorPlanDoc";
 import {
   bindDoorLayoutDoc,
   seedDoorLayoutDefaults,
@@ -2389,7 +2389,7 @@ function harvestStationAtlas(): void {
       farDoor: r.farDoor,
       farYawDeg: r.farYawDeg,
     }));
-  harvestIntoAtlas({ roomId, name, seed, doors });
+  harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
   pushAtlasToDoc();
