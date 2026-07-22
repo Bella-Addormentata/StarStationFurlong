@@ -32,8 +32,15 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
-import { atlasLayout } from "./stationAtlas";
-import { projectionPoseForDoor } from "./adapter";
+import { atlasLayout, readAtlas } from "./stationAtlas";
+import type { AtlasDoor } from "./stationAtlas";
+import {
+  projectionPoseForDoor,
+  buildConnectorChain,
+  buildVestibule,
+  setVestibuleOpacity,
+} from "./adapter";
+import type { VestibuleDoorId } from "./adapter";
 import type { DoorId } from "./doors";
 import { buildOctagonShell } from "./octagonHull";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -443,6 +450,55 @@ function buildGroup(): THREE.Group {
       mod.position.set(pose.x, 0, pose.z);
       mod.rotation.y = pose.rotY;
       g.add(mod);
+    }
+
+    // 🔗 #80: draw EVERY known connection in the atlas — the FULL ring, not
+    // just the current room's. world.ts already renders the current room's own
+    // paired-door tubes at level 3, and the reverse of one of those is the SAME
+    // physical tube, so we skip any edge touching the current room and dedupe
+    // each remaining neighbour↔neighbour link. The chain is built in the FROM
+    // module's local frame (buildConnectorChain / straight gangway fallback)
+    // and wrapped at that module's world pose. (Uses the current room's slide
+    // deltas + wall extents for the chain frame — a preview approximation that
+    // reads fine for same-size modules.)
+    const atlas = readAtlas();
+    const poseByRoom = new Map<
+      string,
+      { x: number; z: number; rotY: number }
+    >();
+    poseByRoom.set(currentRoomId, { x: 0, z: 0, rotY: 0 });
+    for (const p of poses)
+      poseByRoom.set(p.roomId, { x: p.x, z: p.z, rotY: p.rotY });
+    const drawnEdges = new Set<string>();
+    for (const [fromId, entry] of Object.entries(atlas)) {
+      const fromPose = poseByRoom.get(fromId);
+      if (!fromPose) continue; // module not placed in this layout
+      for (const [doorId, door] of Object.entries(entry.doors) as Array<
+        [VestibuleDoorId, AtlasDoor | undefined]
+      >) {
+        const toId = door?.targetRoomId;
+        if (!door || !toId || !poseByRoom.has(toId)) continue;
+        // world draws every current-room tube (and the reverse is the same one)
+        if (fromId === currentRoomId || toId === currentRoomId) continue;
+        const key = fromId < toId ? `${fromId}|${toId}` : `${toId}|${fromId}`;
+        if (drawnEdges.has(key)) continue;
+        drawnEdges.add(key);
+        const chain =
+          door.segments && door.segments.length > 0
+            ? buildConnectorChain(doorId, door.segments)
+            : buildVestibule(doorId);
+        // Not editable from the atlas — the bend editor targets the CURRENT
+        // room's chain, so clear the flag its click-routing keys on.
+        (chain.userData as { isConnectorChain?: boolean }).isConnectorChain =
+          false;
+        setVestibuleOpacity(chain, 1.0);
+        const wrap = new THREE.Group();
+        wrap.name = `atlasConnector-${fromId}-${doorId}`;
+        wrap.add(chain);
+        wrap.position.set(fromPose.x, 0, fromPose.z);
+        wrap.rotation.y = fromPose.rotY;
+        g.add(wrap);
+      }
     }
   }
 
