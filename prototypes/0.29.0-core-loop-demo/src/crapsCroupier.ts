@@ -164,7 +164,9 @@ export function crapsBeatLine(
   if (s.phase === 'settled' && s.dice != null && s.result != null) {
     const [a, b] = s.dice;
     const paid = s.payouts != null && Object.keys(s.payouts).length > 0;
-    const tail = s.result === 7 && s.point == null ? ' — seven out'
+    // sevenOut distinguishes a point-phase 7 (hand over) from a come-out 7
+    // (natural — line WINS); the post-roll point is null for both.
+    const tail = s.sevenOut ? ' — seven out, new shooter'
       : paid ? ' — winners paid!' : ' — house collects';
     return { key: `${s.round}:settle`, text: `🎲 ${a}+${b} = ${s.result}${tail}` };
   }

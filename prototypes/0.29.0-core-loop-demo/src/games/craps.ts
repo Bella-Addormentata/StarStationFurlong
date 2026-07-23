@@ -66,6 +66,13 @@ export interface CrapsTableState {
   resultAt: number;
   /** playerId → total chips CREDITED this roll (see convention), settled only. */
   payouts: Record<string, number> | null;
+  /** True when THIS roll was a SEVEN-OUT (a 7 with a point on) — the shooter's
+   *  hand ends and the dice pass. Distinguishes a point-phase 7 (line loses, hand
+   *  over) from a come-out 7 (a NATURAL, line wins), which the post-roll `point`
+   *  alone cannot — both leave `point` null. Settled rolls only; absent on
+   *  legacy/betting states ⇒ treated as false. The shooter-hand NETTING boundary
+   *  (see the Chia backend plan) and the "new shooter" narration read it. */
+  sevenOut?: boolean;
   /** 🤖 auto-stickman: absolute operator-clock ms at which THIS phase advances
    *  (the operator's Date.now() is the reference; everyone else's countdown is
    *  display-only). Absent ⇒ a manual/idle table with no timer. */
@@ -113,6 +120,7 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && (s.result === null || (Number.isInteger(s.result) && (s.result as number) >= 2 && (s.result as number) <= 12))
     && typeof s.resultAt === 'number'
     && (s.payouts === null || typeof s.payouts === 'object')
+    && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
 }
@@ -124,6 +132,15 @@ export function nextPoint(pointBefore: number | null, sum: number): number | nul
   if (pointBefore === null) return POINT_NUMBERS.has(sum) ? sum : null;
   if (sum === pointBefore || sum === 7) return null;
   return pointBefore;
+}
+
+/** Does THIS roll end the shooter's hand? A hand ends ONLY on a SEVEN-OUT — a 7
+ *  rolled while a point is on. A come-out 7/11 (natural) or 2/3/12 (craps) keeps
+ *  the SAME shooter coming out again, and making the point re-opens the come-out
+ *  for the same shooter — so only the point-phase 7 passes the dice. This is the
+ *  shooter-hand netting/checkpoint boundary and the "new shooter" beat. */
+export function shooterHandOver(pointBefore: number | null, sum: number): boolean {
+  return pointBefore !== null && sum === 7;
 }
 
 /** Whether a NEW bet of this type may be placed given the point in force.

@@ -62,6 +62,34 @@ These resolve the §10 open questions; the rest of the doc is the standing desig
 4. **Runtime = Rust engine in the node + thin webview bridge**, *not* WASM-in-webview
    (§4c). Keeps key custody in the node, trust boundary unchanged.
 
+## 0b. Implementation status (2026-07-23)
+
+Shipped on the craps PR so far (default-local, zero wagering, no wallet/chain):
+
+- **The backend seam** (§5) — `crapsBackend.ts`: `CrapsBackend` interface,
+  `LocalCrapsBackend` (default), `ChiaCrapsBackend` stub, per-table toggle. ✅
+- **The provably-fair CORE** (`games/fairDice.ts`) — the commit-reveal +
+  block-beacon dice math of decision 1, PURE and unit-tested (determinism,
+  verify-good/tampered across seed/beacon/round/dice, the classic 2–12 dice
+  pyramid over 6 000 draws). This is the reference the ChiaLisp referee must
+  reproduce. **Not yet wired into the live roll loop** — the honest scheme needs
+  the async commit→beacon→reveal flow and a real `header_hash` source, so wiring a
+  placeholder beacon now would overclaim "provably fair". Exposed via
+  `__ssfCrapsFair` for audit; the wiring is the next slice (§7 G5b). ✅ (core)
+- **The shooter-hand boundary** — `shooterHandOver(pointBefore, sum)` +
+  a `sevenOut` flag on the settled table state (the §4a netting/checkpoint anchor
+  and the "new shooter" beat). Its first use also **fixed a narration bug**: a
+  come-out 7 is a *natural* (line wins), not a seven-out, but the post-roll point
+  is null for both — the panel/robot now read `sevenOut` instead of guessing from
+  the point, so a come-out 7 no longer mis-announces "seven out". ✅
+
+Next feasible step without the wallet is **G5b wiring**: split a roll into
+commit-at-open → reveal-at-settle inside `LocalCrapsBackend`, recording the
+transcript in the table state so players can `verifyRoll` — using a clearly
+labelled *dev* beacon until the node exposes a real block `header_hash`. That
+alone gives "the house can't change the dice after bets" verifiability with no
+chain dependency; the block beacon then removes house foreknowledge.
+
 ## 2. Why craps fits chia-gaming unusually well
 
 chia-gaming (Alpha 0.3, June 2026): *"Players fund a shared channel coin on the

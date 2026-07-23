@@ -34,7 +34,7 @@ import {
   writeMyCrapsBets,
 } from './casinoDoc';
 import type { CrapsBackendKind } from './casinoDoc';
-import { nextPoint, resolveCrapsRound } from './games/craps';
+import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 
 export type { CrapsBackendKind };
 
@@ -103,6 +103,7 @@ class LocalCrapsBackend implements CrapsBackend {
       result: sum,
       resultAt: now,
       payouts,
+      sevenOut: shooterHandOver(pointBefore, sum),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);

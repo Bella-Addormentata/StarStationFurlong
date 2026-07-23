@@ -2848,9 +2848,10 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     }
     if (p === 'settled' && s?.dice != null && s.result != null) {
       const won = s.payouts?.[myId] ?? 0;
-      const sevenOut = s.result === 7 && s.point == null;
+      // s.sevenOut = a point-phase 7 (hand over); a come-out 7 is a natural (win),
+      // not a seven-out, though both leave the post-roll point null.
       const line = `● ${s.dice[0]}+${s.dice[1]} = ${s.result}`
-        + (sevenOut ? ' — SEVEN OUT' : '')
+        + (s.sevenOut ? ' — SEVEN OUT' : '')
         + (staked > 0 || won > 0 ? (won > 0 ? ' — YOU WIN' : '') : '');
       return { line, color: won > 0 ? '#00E676' : GT_GOLD_BRIGHT };
     }
