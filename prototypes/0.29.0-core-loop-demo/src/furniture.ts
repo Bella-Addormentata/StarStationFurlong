@@ -1341,9 +1341,11 @@ const buildPhotoStandee = (ctx: BuildCtx, spec: PhotoDecorSpec) => {
   mat.transparent = true;
   mat.alphaTest = 0.4;
   mat.side = THREE.DoubleSide;
+  // One geometry for both crossed meshes — place() only sets mesh-level
+  // transform, and removeFurnitureVisuals dedupes disposal, so sharing is safe.
   const plane = new THREE.PlaneGeometry(W, H);
   place(plane, mat, 0, cy, zOff);
-  if (crossed) place(plane.clone(), mat, 0, cy, zOff, Math.PI / 2);
+  if (crossed) place(plane, mat, 0, cy, zOff, Math.PI / 2);
 
   loadKeyedPhotoTexture(url, brightness)
     .then((tex) => {
