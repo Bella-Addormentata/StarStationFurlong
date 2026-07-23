@@ -100,7 +100,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
   'rose-bouquet': '🌹 ROSE BOUQUET',
-  'purple-bouquet': '💜 PURPLE BOUQUET (BIG)',
+  'purple-bouquet': '💜 PURPLE BOUQUET',
   'lavender-bouquet': '🪻 LAVENDER BOUQUET',
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',

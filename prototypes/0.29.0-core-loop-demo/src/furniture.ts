@@ -1222,6 +1222,94 @@ interface PhotoDecorSpec {
   zOff?: number;
 }
 
+/** 📸 Processed cutout textures keyed by `url|brightness`. The flood-fill key
+ *  + brightness pass is hundreds of thousands of pixel ops per image, and the
+ *  two balloon kinds share one photo — instances must reuse ONE CanvasTexture.
+ *  Caching the PROMISE also dedupes in-flight loads; a failed load evicts so a
+ *  later spawn can retry. */
+const keyedPhotoTexCache = new Map<string, Promise<THREE.CanvasTexture>>();
+
+const loadKeyedPhotoTexture = (
+  url: string,
+  brightness: number,
+): Promise<THREE.CanvasTexture> => {
+  const key = `${url}|${brightness}`;
+  const hit = keyedPhotoTexCache.get(key);
+  if (hit) return hit;
+  const p = new Promise<THREE.CanvasTexture>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const g = canvas.getContext('2d');
+      if (!g) {
+        reject(new Error('no 2D context')); // the white standee stays
+        return;
+      }
+      g.drawImage(img, 0, 0);
+      const px = g.getImageData(0, 0, canvas.width, canvas.height);
+      const d = px.data;
+      const wpx = canvas.width;
+      const hpx = canvas.height;
+      // Backdrop test: bright and unsaturated (white wall + the soft grey
+      // product shadow both pass; yellows/greens never do).
+      const isBackdrop = (i: number): boolean => {
+        const r = d[i * 4];
+        const gr = d[i * 4 + 1];
+        const b = d[i * 4 + 2];
+        return (
+          Math.min(r, gr, b) > 190 &&
+          Math.max(r, gr, b) - Math.min(r, gr, b) < 26
+        );
+      };
+      // Border flood fill (4-neighbour): only background-CONNECTED pixels key.
+      const visited = new Uint8Array(wpx * hpx);
+      const stack: number[] = [];
+      for (let x = 0; x < wpx; x++) stack.push(x, (hpx - 1) * wpx + x);
+      for (let y = 0; y < hpx; y++) stack.push(y * wpx, y * wpx + wpx - 1);
+      while (stack.length > 0) {
+        const p2 = stack.pop()!;
+        if (visited[p2] || !isBackdrop(p2)) continue;
+        visited[p2] = 1;
+        d[p2 * 4 + 3] = 0;
+        const x = p2 % wpx;
+        if (x > 0) stack.push(p2 - 1);
+        if (x < wpx - 1) stack.push(p2 + 1);
+        if (p2 >= wpx) stack.push(p2 - wpx);
+        if (p2 < wpx * (hpx - 1)) stack.push(p2 + wpx);
+      }
+      // Brightness lift (after the key, surviving pixels only).
+      if (brightness !== 1) {
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i + 3] === 0) continue;
+          d[i] = Math.min(255, d[i] * brightness);
+          d[i + 1] = Math.min(255, d[i + 1] * brightness);
+          d[i + 2] = Math.min(255, d[i + 2] * brightness);
+        }
+      }
+      g.putImageData(px, 0, 0);
+      const tex = new THREE.CanvasTexture(canvas);
+      // Smooth filtering, NOT mars.png's NearestFilter: photos carry fine
+      // detail (balloon lettering) that nearest-neighbour shreds into noise —
+      // owner feedback "not clear". Mipmaps + max anisotropy keep the print
+      // legible at the isometric viewing angle and distance.
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = true;
+      tex.anisotropy =
+        window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+      tex.colorSpace = THREE.SRGBColorSpace;
+      resolve(tex);
+    };
+    img.onerror = () => reject(new Error(`could not load ${url}`));
+    img.src = url;
+  });
+  p.catch(() => keyedPhotoTexCache.delete(key));
+  keyedPhotoTexCache.set(key, p);
+  return p;
+};
+
 const buildPhotoStandee = (ctx: BuildCtx, spec: PhotoDecorSpec) => {
   const { m, place } = ctx;
   const {
@@ -1254,72 +1342,17 @@ const buildPhotoStandee = (ctx: BuildCtx, spec: PhotoDecorSpec) => {
   place(plane, mat, 0, cy, zOff);
   if (crossed) place(plane.clone(), mat, 0, cy, zOff, Math.PI / 2);
 
-  const img = new Image();
-  img.onload = () => {
-    const canvas = document.createElement('canvas');
-    canvas.width = img.width;
-    canvas.height = img.height;
-    const g = canvas.getContext('2d');
-    if (!g) return; // no 2D context → the white standee stays; nothing breaks
-    g.drawImage(img, 0, 0);
-    const px = g.getImageData(0, 0, canvas.width, canvas.height);
-    const d = px.data;
-    const wpx = canvas.width;
-    const hpx = canvas.height;
-    // Backdrop test: bright and unsaturated (white wall + the soft grey
-    // product shadow both pass; yellows/greens never do).
-    const isBackdrop = (i: number): boolean => {
-      const r = d[i * 4];
-      const gr = d[i * 4 + 1];
-      const b = d[i * 4 + 2];
-      return (
-        Math.min(r, gr, b) > 190 && Math.max(r, gr, b) - Math.min(r, gr, b) < 26
-      );
-    };
-    // Border flood fill (4-neighbour): only background-CONNECTED pixels key.
-    const visited = new Uint8Array(wpx * hpx);
-    const stack: number[] = [];
-    for (let x = 0; x < wpx; x++) stack.push(x, (hpx - 1) * wpx + x);
-    for (let y = 0; y < hpx; y++) stack.push(y * wpx, y * wpx + wpx - 1);
-    while (stack.length > 0) {
-      const p = stack.pop()!;
-      if (visited[p] || !isBackdrop(p)) continue;
-      visited[p] = 1;
-      d[p * 4 + 3] = 0;
-      const x = p % wpx;
-      if (x > 0) stack.push(p - 1);
-      if (x < wpx - 1) stack.push(p + 1);
-      if (p >= wpx) stack.push(p - wpx);
-      if (p < wpx * (hpx - 1)) stack.push(p + wpx);
-    }
-    // Brightness lift (after the key, surviving pixels only).
-    if (brightness !== 1) {
-      for (let i = 0; i < d.length; i += 4) {
-        if (d[i + 3] === 0) continue;
-        d[i] = Math.min(255, d[i] * brightness);
-        d[i + 1] = Math.min(255, d[i + 1] * brightness);
-        d[i + 2] = Math.min(255, d[i + 2] * brightness);
-      }
-    }
-    g.putImageData(px, 0, 0);
-    const tex = new THREE.CanvasTexture(canvas);
-    // Smooth filtering, NOT mars.png's NearestFilter: photos carry fine
-    // detail (balloon lettering) that nearest-neighbour shreds into noise —
-    // owner feedback "not clear". Mipmaps + max anisotropy keep the print
-    // legible at the isometric viewing angle and distance.
-    tex.minFilter = THREE.LinearMipmapLinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-    tex.generateMipmaps = true;
-    tex.anisotropy =
-      window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
-    tex.colorSpace = THREE.SRGBColorSpace;
-    mat.map = tex;
-    mat.emissiveMap = tex; // self-lit photo — vivid even in a dim room
-    mat.needsUpdate = true;
-  };
-  img.onerror = () =>
-    console.warn(`📸 photo décor: could not load ${url} — white placeholder stays`);
-  img.src = url;
+  loadKeyedPhotoTexture(url, brightness)
+    .then((tex) => {
+      mat.map = tex;
+      mat.emissiveMap = tex; // self-lit photo — vivid even in a dim room
+      mat.needsUpdate = true;
+    })
+    .catch(() =>
+      console.warn(
+        `📸 photo décor: could not load ${url} — white placeholder stays`,
+      ),
+    );
 };
 
 // The photo-décor set — the owner's 590×689 product photos, statement-sized
