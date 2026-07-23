@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.28 — 2026-07-23
+
+### 🚪↔️ Drag a door along its wall to move it (#28 decouple, slice 6c)
+
+The door editor learns MOVE: pick up a placed door in edit mode and slide it along its wall, exactly like moving a furniture item.
+
+- **Click a selected door** (gold tint) to pick it up — the actual door slides live under your cursor along **its own wall** (wall-locked: cross-wall moves stay remove + re-add), snapping to the same floor grid as placement (small door on the half-tile, large on the tile) and clamped to the wall's slide range. **Green** where the drop is valid, **red** where it isn't; click on green to drop, Esc / right-click to cancel back to where it was.
+- A door with a live docked module is protected — unpair it first, same as remove.
+- **Split write under the hood:** the four cardinal doors ride the legacy floor-plan slide store (the same one the wall computer's slider uses, so the existing cross-client reconcile just works), while free doors update their `doorLayout` record — never both.
+- **Doors now respect windows** (both placing and moving): the octagon hull's windows only checked clearance in the window→door direction; the door editor's validity check now refuses a spot that collides with a window, mirroring the window side's margin.
+- **Moved free doors keep working walk-throughs:** their walk targets (front/through points) re-derive from the layout record on reconcile — previously only cardinal doors repositioned.
+- **Release line:** version bumped to 0.33.28, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.23 — 2026-07-21
 
 ### 🚪✏️ Place and remove doors in edit mode (#28 decouple, slice 6b — the door editor)
