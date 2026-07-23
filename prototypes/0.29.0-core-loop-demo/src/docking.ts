@@ -106,6 +106,13 @@ export class DoorDockingPortSystem {
    *  openness is legible at each threshold. Re-asserted on door (re)build. */
   private accessMode: "public" | "pass" | "keyed" = "pass";
   private adjacentRooms: Map<string, THREE.Mesh> = new Map();
+  /** Doors whose UNDOCK button is in the armed (confirm) state, keyed to the
+   *  connected room address the arm was FOR — a permanent module removal is
+   *  destructive, so it takes two clicks, and the arm must not survive the
+   *  pairing changing under the open pane (remove → new module re-dock would
+   *  otherwise render pre-armed). Cleared on execute, on pane re-open, and by
+   *  render when the live address no longer matches. */
+  private undockArmed = new Map<string, string>();
 
   // ── Update-loop-driven leaf slides ─────────────────────────────────────────
   /** In-flight slide per door; a new open/close overwrites the entry. */
@@ -1231,6 +1238,22 @@ export class DoorDockingPortSystem {
             ...readDoorPolicy(doorId),
             adapter: false,
           });
+        } else if (action === "undock-module") {
+          // ⏏ Owner removes a PERMANENT docked module (transient berths have
+          // their own DETACH row above the owner gate). Two-click arm/confirm.
+          // The doc delete reconciles everywhere through the normal doors-doc
+          // path (clearRemotePairing): projection torn down, door re-locked.
+          // The module's room doc survives on the node — re-dock its address
+          // to get it back.
+          const stu = this.doorState.get(doorId);
+          if (!stu?.pairedSuccessfully || stu.transient) return;
+          if (this.undockArmed.get(doorId) === stu.connectedRoomAddress) {
+            this.undockArmed.delete(doorId);
+            deleteDoorPairing(doorId);
+          } else {
+            // arm FOR this pairing — a different armed address is stale
+            this.undockArmed.set(doorId, stu.connectedRoomAddress);
+          }
         } else if (action === "accept-req" && pub) {
           writeDoorGrant(doorId, pub, el.dataset.name ?? "Unknown-Clone");
         } else if (action === "deny-req" && pub) {
@@ -1265,6 +1288,32 @@ export class DoorDockingPortSystem {
       st?.pairedSuccessfully && st.transient
         ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>`
+        : "";
+
+    // ⏏ Owner-only UNDOCK for a PERMANENT docked module (the transient berth
+    // has its own everyone-visible DETACH row above). Destructive → two-click
+    // arm/confirm. The module's room doc survives on the node; re-docking its
+    // address restores it.
+    // The arm is only live while the SAME permanent pairing it was set for
+    // still exists — drop it the moment the pairing is removed, turns
+    // transient, or swaps to a different module under the open pane.
+    if (
+      this.undockArmed.has(doorId) &&
+      (!st?.pairedSuccessfully ||
+        st.transient ||
+        this.undockArmed.get(doorId) !== st.connectedRoomAddress)
+    ) {
+      this.undockArmed.delete(doorId);
+    }
+    const undockArmed = this.undockArmed.has(doorId);
+    const undockRow =
+      st?.pairedSuccessfully && !st.transient
+        ? `<div style="${row}"><span style="color:${undockArmed ? "#ff8a80" : "rgba(212,168,75,0.7)"};">${
+            undockArmed
+              ? "⚠ REALLY UNDOCK? Module detaches from the station (its data survives — re-dock the address to restore)"
+              : `🧩 DOCKED MODULE <span style="color:rgba(212,168,75,0.4);" title="${esc(st.connectedRoomAddress)}">· ${esc(st.connectedRoomAddress.slice(0, 10))}…</span>`
+          }</span>
+           <button type="button" data-policy-action="undock-module" style="${pill} background:rgba(255,23,68,${undockArmed ? "0.25" : "0.10"}); border-color:rgba(255,23,68,${undockArmed ? "0.7" : "0.35"}); color:#ff8a80;">${undockArmed ? "⏏ CONFIRM" : "⏏ UNDOCK"}</button></div>`
         : "";
 
     if (owner) {
@@ -1311,6 +1360,7 @@ export class DoorDockingPortSystem {
               ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
               : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
           }</div>
+        ${undockRow}
         ${detachRow}
         ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ""}
         ${grants.length ? `<div style="font-size:9px; font-weight:800; color:rgba(0,230,118,0.6); letter-spacing:1px; margin-top:2px;">STANDING GRANTS</div>${grantRows}` : ""}
@@ -1521,6 +1571,7 @@ export class DoorDockingPortSystem {
       }
     }
     this.renderAssemblyStrip(doorId);
+    this.undockArmed.delete(doorId); // ⏏ arming never survives a pane re-open
     this.renderPolicySection(doorId); // #67 D1
     this.renderKnownModules(); // 🗺️ atlas picker
   }
