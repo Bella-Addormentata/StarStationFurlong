@@ -679,7 +679,7 @@ class RoomEditController {
       const hit = this.active
         ? this.pickItemAt(e.clientX, e.clientY)
         : this.pickMovableItemAt(world, e.clientX, e.clientY);
-      if (!hit || this.doorIds.has(hit)) return; // furniture only — doors have their own panel
+      if (!hit || this.doorIds.has(hit) || this.windowIds.has(hit)) return; // furniture only — doors/windows have their own editors
       const perm = canEditRoom();
       if (!perm.ok) {
         showHint(perm.reason);
