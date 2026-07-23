@@ -395,6 +395,14 @@ behind.
   testnet11 (clone `publish_presence`/`resolve_by_room_key` with the new hint +
   payload). Acceptance: a commit lands, a reveal lands, `verifyRoll` passes from
   the resolved transcript. No browser, no beacon yet.
+  **STATUS (2026-07-23): code built + compile/test-verified.** `ssf-p2p-node/src/
+  chia_craps_fair.rs` (+ `SSF_CHIA_CRAPS_FAIR_TEST=1` hook in main.rs) reuses the
+  presence spend-to-self with a PUBLIC plaintext payload. `cargo check --features
+  chia-lane` clean; Rust unit tests pass **including a golden-vector cross-check
+  that `commit_to_seed`/`derive_dice` match the browser `fairDice.ts` byte-for-byte**
+  (commit `e2e81d…63d1`, dice `(2,1)` for the pinned inputs). **Not yet run on
+  testnet11** — that needs the funded dev wallet + the chia-lane build on-machine
+  (§12.5); run it with the command in the PR notes.
 - **T2** — node: read a testnet11 block `header_hash` at a target height; fold it
   into the derivation. Acceptance: `deriveDice(seed, header_hash, …)` matches the
   browser's `fairDice` for the same inputs (differential test across the bridge).

@@ -108,7 +108,7 @@ async fn resolve_one_hint(
     Ok(None)
 }
 
-async fn fetch_coin_spend(
+pub(crate) async fn fetch_coin_spend(
     client: &CoinsetClient,
     coin_id: Bytes32,
     height: u32,
@@ -125,7 +125,7 @@ async fn fetch_coin_spend(
 
 /// Run the parent spend and return the ciphertext (2nd memo) of the create_coin
 /// whose FIRST memo is our `hint` — the ecosystem hint convention we published with.
-fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Result<Option<Vec<u8>>> {
+pub(crate) fn extract_ciphertext(coin_spend: &CoinSpend, hint: Bytes32) -> Result<Option<Vec<u8>>> {
     let mut allocator = Allocator::new();
     let puzzle: NodePtr = coin_spend
         .puzzle_reveal

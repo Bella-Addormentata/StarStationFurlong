@@ -22,6 +22,8 @@ mod chia_wallet;
 mod chia_publish;
 #[cfg(feature = "chia-lane")]
 mod chia_resolve;
+#[cfg(feature = "chia-lane")]
+mod chia_craps_fair;
 
 mod b64 {
     use base64::prelude::*;
@@ -1123,13 +1125,27 @@ async fn main() -> Result<()> {
                     let iroh_sk = secret_key.clone();
                     let addrs = iroh_direct_addrs.clone();
                     let test_room_key = blake3::derive_key("ssf-chia-test-room-v1", b"slice4");
+                    let chia_sk_pub = chia_sk.clone();
                     tokio::spawn(async move {
-                        match chia_publish::publish_presence(&iroh_sk, &chia_sk, &test_room_key, &addrs).await {
+                        match chia_publish::publish_presence(&iroh_sk, &chia_sk_pub, &test_room_key, &addrs).await {
                             Ok(hint) => println!(
                                 "⛓️ ChiaHub PUBLISH ok — testnet11 presence record written at hint {}",
                                 hex::encode(&hint.to_bytes()[..8])
                             ),
                             Err(e) => eprintln!("⛓️ ChiaHub PUBLISH failed: {e:#}"),
+                        }
+                    });
+                }
+                // 🎲⛓️ Craps fairness T1 hook (SSF_CHIA_CRAPS_FAIR_TEST=1, plan §12):
+                // publish a commit + reveal for a throwaway (table, round) on
+                // testnet11, then resolve + re-derive + verify the dice. Reuses the
+                // presence spend-to-self primitive with a PUBLIC (plaintext) payload.
+                // Spawned so it never blocks startup; logs each step + PASS/FAIL.
+                if std::env::var("SSF_CHIA_CRAPS_FAIR_TEST").ok().as_deref() == Some("1") {
+                    let chia_sk_fair = chia_sk.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = chia_craps_fair::craps_fair_selftest(&chia_sk_fair).await {
+                            eprintln!("🎲⛓️ craps-fair selftest FAILED: {e:#}");
                         }
                     });
                 }
