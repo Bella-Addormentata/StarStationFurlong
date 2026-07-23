@@ -141,8 +141,14 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && (s.point === null || POINT_NUMBERS.has(s.point as number))
     && (s.dice === null || isDicePair(s.dice))
     && (s.result === null || (Number.isInteger(s.result) && (s.result as number) >= 2 && (s.result as number) <= 12))
-    && typeof s.resultAt === 'number'
-    && (s.payouts === null || typeof s.payouts === 'object')
+    && typeof s.resultAt === 'number' && Number.isFinite(s.resultAt as number)
+    && (s.payouts === null || (
+        typeof s.payouts === 'object'
+        && !Array.isArray(s.payouts)
+        && Object.values(s.payouts).every(
+            (v) => Number.isInteger(v) && (v as number) >= 0,
+        )
+    ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
     && (s.fairness === undefined || (typeof s.fairness === 'object' && s.fairness !== null))
     && (s.phaseDeadline === undefined
@@ -262,10 +268,28 @@ export function resolveCrapsRound(
   for (const [pid, bets] of Object.entries(betsByPlayer)) {
     let total = 0;
     const kept: CrapsBet[] = [];
+    // Aggregate stake per PLACE pick so payout rounding applies to the full stack,
+    // not to each chip individually (e.g. six $1 chips on PLACE 6 should pay 7, not 6).
+    const placeStake = new Map<number, number>();
+    for (const bet of bets) {
+      if (bet.type === 'place' && bet.pick != null) {
+        placeStake.set(bet.pick, (placeStake.get(bet.pick) ?? 0) + bet.amount);
+      }
+    }
+    const placePaidPick = new Set<number>();
     for (const bet of bets) {
       const r = resolveCrapsBet(bet, d1, d2, pointBefore);
-      total += r.credited;
       if (r.keep) kept.push(bet);
+      if (bet.type === 'place' && bet.pick != null && r.outcome === 'win') {
+        // Credit the aggregate payout once per pick number to avoid per-chip floor loss.
+        if (!placePaidPick.has(bet.pick)) {
+          placePaidPick.add(bet.pick);
+          const [num, den] = PLACE_ODDS[bet.pick] ?? [1, 1];
+          total += Math.floor(((placeStake.get(bet.pick) ?? bet.amount) * num) / den);
+        }
+      } else {
+        total += r.credited;
+      }
     }
     if (total > 0) payouts[pid] = total;
     remaining[pid] = kept;

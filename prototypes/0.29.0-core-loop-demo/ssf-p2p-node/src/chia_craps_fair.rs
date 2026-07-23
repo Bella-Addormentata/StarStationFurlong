@@ -113,10 +113,11 @@ async fn push_fair_record(
     Ok(())
 }
 
-/// Poll until the wallet's spendable coin is one OTHER than `spent` (i.e. the
-/// spend of `spent` confirmed and its recreated coin — or another coin — is
-/// available). Returns that coin. Guards against re-spending `spent` before its
-/// spend confirms (which would be a double-spend). ~200 s bound.
+/// Poll until `spent` is no longer in the unspent set, then return the largest
+/// remaining spendable coin. Waiting for `spent` to disappear (rather than
+/// simply returning the first coin that differs from it) is safe when the wallet
+/// has multiple coins: a larger coin could be returned before `spent`'s spend
+/// confirms, violating the commit→reveal ordering assumption. ~200 s bound.
 async fn wait_for_next_coin(
     client: &CoinsetClient,
     our_ph: Bytes32,
@@ -124,9 +125,24 @@ async fn wait_for_next_coin(
 ) -> Result<Coin> {
     for attempt in 0..40u32 {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        if let Some(coin) = find_spendable_coin(client, our_ph).await? {
-            if &coin != spent {
-                return Ok(coin);
+        let resp = client
+            .get_coin_records_by_puzzle_hash(our_ph, None, None, Some(false), None)
+            .await
+            .map_err(|e| anyhow!("coinset get_coin_records_by_puzzle_hash failed: {e}"))?;
+        if !resp.success {
+            return Err(anyhow!("coin lookup unsuccessful: {:?}", resp.error));
+        }
+        let unspent: Vec<Coin> = resp
+            .coin_records
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| !r.spent)
+            .map(|r| r.coin)
+            .collect();
+        // Only proceed once `spent` is confirmed gone from the unspent set.
+        if !unspent.iter().any(|c| c == spent) {
+            if let Some(next) = unspent.into_iter().max_by_key(|c| c.amount) {
+                return Ok(next);
             }
         }
         if attempt % 4 == 3 {
