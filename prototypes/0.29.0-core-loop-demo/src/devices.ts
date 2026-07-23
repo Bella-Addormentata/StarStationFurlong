@@ -1850,7 +1850,7 @@ function escAttr(s: string): string {
 
 /**
  * The charging dock's focused UI (#77C s3/s4): choose the robot's ROUTINE from a
- * short menu — Serve drinks / Roulette croupier / Idle at dock / Custom script —
+ * short menu — Serve drinks / Table croupier / Idle at dock / Custom script —
  * and, for a custom routine, edit a bounded step list (go-to / say / wait) the
  * robot loops. Written to the synced `robot` map (owner-only) so every client
  * runs this dock's robot the same way.

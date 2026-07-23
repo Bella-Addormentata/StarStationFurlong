@@ -42,7 +42,7 @@ export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'id
 /** Human labels for the routine dropdown. */
 export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
   serve: 'Serve drinks',
-  croupier: 'Roulette croupier',
+  croupier: 'Table croupier',
   idle: 'Idle at dock',
   custom: 'Custom script',
 };

@@ -221,9 +221,11 @@ export class World {
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
   private croupierNarrated = new Map<string, string>();
-  /** 🤖 #77C: which robot (dock key) is the current croupier — sticky so a
-   *  second robot doesn't dance toward the wheel before one "wins" nearest. */
-  private croupierRobotKey: string | null = null;
+  /** 🤖 #77C / #69 G3: robot (dock key) → the table id it is currently
+   *  operating. One robot per table, sticky (a bot keeps its table so bots don't
+   *  swap frame to frame). The owner adds a charging dock per table game, so a
+   *  floor of tables can each get their own dealer at its wheel-head / stickman. */
+  private croupierAssign = new Map<string, string>();
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -4528,22 +4530,16 @@ export class World {
       }
     }
 
-    // Robot post (all clients): assign the NEAREST robot to the FIRST live
-    // table's reserved operator slot and release every other robot to
-    // serve/dock. Only when a croupier is actually LIVE (a fresh heartbeat) —
-    // manual venture/legacy rooms keep the robots serving instead of standing
-    // mute at the table.
-    let post: { x: number; z: number; faceAngle: number } | null = null;
-    const liveTable = tables.find((t) => isCroupierLive(t.id));
-    if (liveTable) {
-      const head = standsForItem(liveTable.id).find((s) => s.role != null);
-      if (head) {
-        post = { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle };
-      }
-    }
-    // 🤖 #77C s3: routine-aware election. A dock robot programmed 'croupier' is
-    // preferred; if none is, a non-'idle' (serve) robot fills in so a default
-    // casino still gets a dealer; an 'idle' robot never croupiers.
+    // Robot post (all clients): stand ONE eligible robot at EACH live table's
+    // reserved operator slot (roulette wheel-head / craps stickman). The owner
+    // adds a charging dock per table game, so a floor of tables can each get
+    // their own dealer. Assignments are sticky (a robot keeps its table so bots
+    // don't swap tables frame to frame); a freed table pulls the nearest
+    // unassigned eligible robot. Only LIVE tables (a fresh operator heartbeat)
+    // get a body — manual venture/legacy rooms keep the robots serving.
+    // 🤖 #77C s3: routine-aware eligibility. A dock robot programmed 'croupier'
+    // is preferred; if none is, a non-'idle' (serve) robot fills in so a default
+    // casino still gets a dealer; an 'idle'/'custom' robot never croupiers.
     const routineOf = (key: string): RobotRoutine =>
       readRobotConfig(key)?.routine ?? "serve";
     const hasDedicated = [...this.robots.keys()].some(
@@ -4554,26 +4550,50 @@ export class World {
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
       (!hasDedicated || routineOf(k) === "croupier");
-    if (!post) {
-      this.croupierRobotKey = null;
-    } else if (!this.croupierRobotKey || !eligible(this.croupierRobotKey)) {
-      // Pick the nearest eligible robot ONCE, then keep it (sticky) so the others
-      // head straight to their docks instead of drifting toward the wheel.
+    const operatorPost = (
+      tableId: string,
+    ): { x: number; z: number; faceAngle: number } | null => {
+      const head = standsForItem(tableId).find((s) => s.role != null);
+      return head
+        ? { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle }
+        : null;
+    };
+    const liveTableIds = tables
+      .filter((t) => isCroupierLive(t.id) && operatorPost(t.id))
+      .map((t) => t.id);
+    const liveIdSet = new Set(liveTableIds);
+    // Drop stale assignments (robot gone/ineligible, or its table no longer live).
+    for (const [key, tid] of [...this.croupierAssign]) {
+      if (!eligible(key) || !liveIdSet.has(tid)) this.croupierAssign.delete(key);
+    }
+    // Fill each still-unmanned live table with the nearest free eligible robot.
+    const takenTables = new Set(this.croupierAssign.values());
+    const freeRobots = [...this.robots.keys()].filter(
+      (k) => eligible(k) && !this.croupierAssign.has(k),
+    );
+    for (const tid of liveTableIds) {
+      if (takenTables.has(tid)) continue;
+      const post = operatorPost(tid)!;
       let bestKey: string | null = null;
       let best = Infinity;
-      for (const [key, bot] of this.robots) {
-        if (!eligible(key)) continue;
-        const bp = bot.getPosition();
+      for (const key of freeRobots) {
+        const bp = this.robots.get(key)!.getPosition();
         const d = Math.hypot(bp.x - post.x, bp.z - post.z);
         if (d < best) {
           best = d;
           bestKey = key;
         }
       }
-      this.croupierRobotKey = bestKey;
+      if (bestKey) {
+        this.croupierAssign.set(bestKey, tid);
+        takenTables.add(tid);
+        freeRobots.splice(freeRobots.indexOf(bestKey), 1);
+      }
     }
+    // Post every robot at its assigned table's operator slot (or release it).
     for (const [key, bot] of this.robots) {
-      bot.setCroupierPost(key === this.croupierRobotKey ? post : null);
+      const tid = this.croupierAssign.get(key);
+      bot.setCroupierPost(tid ? operatorPost(tid) : null);
     }
 
     // Narration (all clients): edge-detect each table's synced phase beat and
