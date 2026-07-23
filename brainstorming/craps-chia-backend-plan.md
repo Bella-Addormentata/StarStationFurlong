@@ -315,3 +315,90 @@ dispute-window trade-off; and the referee puzzle's timeout/refund parameters
 - **[[REVIEW-20260710-ChiaHub]]** supplies the block-as-clock primitive the
   beacon dice reuses, and the `SSF_CHIA_*` env-flag opt-in discipline the backend
   toggle should follow at the node layer.
+
+## 12. On-chain fairness on testnet11 — reusing the SHIPPED presence primitive
+
+*Owner question (2026-07-23): "can we build any of the craps system on the Chia
+testnet, similar to the ATM chips?"*
+
+**Premise corrected first.** The ATM chips are **not** on-chain today — they are
+room-doc integers (`casinoDoc`); the issuer CAT is design-only (G4,
+[[chia-authority-architecture]]). So there is no "chips on testnet" to mirror for
+the *chips*. **But** the node already ships — and **verified live on testnet11
+(2026-07-16, [[ssf-chia-dev-wallet]])** — the ChiaHub *presence lane*: a signed
+**spend-to-self carrying `[hint, ciphertext]` memos**, plus **resolve-by-hint**.
+That primitive is exactly what an on-chain *fairness transcript* needs, and it is
+the part of craps that fits testnet11 **now** — the fairness layer, not the chips.
+
+### 12.1 The shipped fns to reuse (`ssf-p2p-node/src`)
+
+- `chia_wallet.rs` — BLS key + `txch1…` testnet11 address + faucet funding (the
+  funded dev wallet already exists).
+- `chia_publish.rs::build_publish_bundle` — spend a coin back to self at
+  `amount − fee`, MEMOS = `[hint, ciphertext]`, signed for testnet11.
+- `chia_resolve.rs::resolve_by_room_key` — `derive_hint →
+  get_coin_records_by_hint → parent puzzle/solution → pull the memos`.
+
+### 12.2 The slice — G5b on real testnet11, independent of the B-7 wallet gate
+
+1. **Commit (roll-open, before bets).** The house node publishes a *commit record*
+   `{table, round, commit = commitToSeed(seed)}` via `build_publish_bundle` under a
+   **craps-fairness hint** (`derive_hint("ssf-craps-fair", table‖round)`).
+   Tamper-evident and timestamped by the block it lands in.
+2. **Beacon (after betting closes).** The node reads a testnet11 block
+   **`header_hash`** at a height past the commit's confirmation + the betting
+   window — the peak via the coinset RPC (`get_blockchain_state` /
+   `get_block_record_by_height`, **[VERIFY]** the exact call on `CoinsetClient`).
+   Unpredictable at commit time → the option-(b) beacon.
+3. **Reveal (settle).** The node publishes a *reveal record* `{table, round, seed}`
+   the same way; `dice = deriveDice(seed, header_hash, table, round)` — the **same
+   `games/fairDice.ts::deriveDice`** the browser already ships + tests.
+4. **Verify (anyone).** Resolve both records by the craps-fairness hint, read the
+   beacon block, run `verifyRoll` → proves the house committed *before* bets and
+   the dice match `seed ‖ beacon`. Publicly auditable on testnet11.
+
+### 12.3 Why this dodges the B-7 gate
+
+It is the **same spend-to-self** the presence lane already runs — no CAT
+mint/melt, no channel coins, no arbitrary-recipient spends. The general wallet SDK
+(spike **B-7**) gates the *chips/wagering* (CATs) and the *player↔house channels*,
+**not** a self-recreating fairness memo. So the fairness transcript is buildable on
+testnet11 today; the chips are not — same gate the ATM's own on-chain CAT waits
+behind.
+
+### 12.4 What is genuinely new (node-side Rust)
+
+- a craps-fairness **hint domain + memo payload** (commit/reveal JSON in place of
+  the presence ciphertext) — a thin variant of `publish_presence` /
+  `resolve_by_room_key`;
+- a block-`header_hash` **read at settle** (**[VERIFY]** the coinset RPC surface);
+- a **browser↔node bridge** — the `__ssfChiaGaming` shim the `ChiaCrapsBackend`
+  stub already targets — so the browser hands the node `{table, round}` at
+  open/settle and receives `{commit}` then `{seed, beacon, dice}` to publish into
+  the synced table state (the presentation is unchanged, per §6).
+
+### 12.5 Honest boundaries
+
+- **Verification.** This is node Rust that must run against the funded dev wallet
+  from `…\ssf-chia-dev\` on the **chia-lane build** (Windows-GNU link quirks,
+  [[ssf-chia-node-build]]). It **cannot be exercised from the browser-prototype
+  session** — it needs an on-machine testnet run to confirm, exactly like the
+  2026-07-16 presence verification. Nothing here is run-verified yet.
+- **Scope.** Fairness records prove the *transcript*, not settlement. **Chips stay
+  room-doc integers**; on-chain CATs + channels remain B-7-gated (§8).
+- **Residual.** A house that also farms testnet netspace could still grind/withhold
+  the beacon block (option (c) hardening) — unchanged from §0.
+
+### 12.6 Suggested testnet slice order
+
+- **T1** — node: publish + resolve a *craps-fairness* commit/reveal record on
+  testnet11 (clone `publish_presence`/`resolve_by_room_key` with the new hint +
+  payload). Acceptance: a commit lands, a reveal lands, `verifyRoll` passes from
+  the resolved transcript. No browser, no beacon yet.
+- **T2** — node: read a testnet11 block `header_hash` at a target height; fold it
+  into the derivation. Acceptance: `deriveDice(seed, header_hash, …)` matches the
+  browser's `fairDice` for the same inputs (differential test across the bridge).
+- **T3** — bridge: expose `__ssfChiaGaming` so `ChiaCrapsBackend` drives commit at
+  roll-open and reveal+dice at settle, writing the transcript into the table state;
+  the focused UI shows a "verify this roll" affordance. Acceptance: a table set to
+  the Chia backend plays a full round whose transcript verifies on testnet11.
