@@ -98,6 +98,12 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
  *  (world.reconcileRobots), so label it so it's findable. */
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
+  'smiley-bouquet': '😊 SMILEY BOUQUET',
+  'rose-bouquet': '🌹 ROSE BOUQUET',
+  'purple-bouquet': '💜 PURPLE BOUQUET',
+  'lavender-bouquet': '🪻 LAVENDER BOUQUET',
+  'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
+  'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
 };
 
 type GetWorld = () => World | null;
@@ -339,6 +345,9 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;
       }
+      // 📸 same as World's reveal: alpha-tested cutouts render opaque —
+      // alphaTest handles the keying without the transparent pass.
+      if (mat.alphaTest > 0) mat.transparent = false;
     } else if (obj instanceof THREE.PointLight) {
       const targetIntensity = (obj.userData.targetIntensity as number) ?? 0;
       w.furnitureLights.push({ light: obj, targetIntensity });

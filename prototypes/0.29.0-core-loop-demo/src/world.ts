@@ -1430,6 +1430,10 @@ export class World {
             userData: { baseOpacity?: number };
           };
           if ("opacity" in mat) mat.opacity = mat.userData.baseOpacity ?? 1;
+          // 📸 same as the morph-complete pass: revealed alpha-tested cutouts
+          // render opaque — alphaTest handles the keying without the
+          // transparent pass's depth-sort risk on the crossed planes.
+          if (mat.alphaTest > 0) mat.transparent = false;
         }
       } else if (obj instanceof THREE.PointLight) {
         const targetIntensity = (obj.userData.targetIntensity as number) ?? 0;
@@ -2676,8 +2680,12 @@ export class World {
       for (const mat of mats) {
         if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
         disposed.add(mat);
+        // 📸 cached photo-décor textures are SHARED across instances
+        // (furniture.ts keyedPhotoTexCache) — disposing one item's map would
+        // yank the GPU texture from every surviving copy. They live for the
+        // session (bounded: one per photo).
         const map = (mat as THREE.MeshBasicMaterial).map;
-        if (map) map.dispose();
+        if (map && !map.userData.sharedCache) map.dispose();
         mat.dispose();
       }
     });
@@ -3079,6 +3087,14 @@ export class World {
       this.player.mesh.visible = true;
       this.platformGroup.position.set(0, 0, 0);
       console.log("✅ Morph complete - Platform active");
+      // 📸 Alpha-tested cutouts (photo standees) ride the fade as transparent
+      // like every furniture material, but must not STAY in the depth-sorted
+      // transparent pass — the crossed planes risk ordering artifacts there
+      // and alphaTest alone handles the keying. Opaque once fully faded in.
+      this.furnitureMeshes.forEach((mesh) => {
+        const mat = mesh.material as THREE.Material;
+        if (mat.alphaTest > 0) mat.transparent = false;
+      });
       // 🧬 Diegetic boot spawn: if this room has a clone vat, the fresh
       // avatar materialises INSIDE it (held, tank full) and the reveal cycle
       // is deferred until the player actually looks at the room (update()'s
