@@ -1,6 +1,6 @@
 {
   "productName": "StarStationFurlong",
-  "version": "0.33.24",
+  "version": "0.33.25",
   "identifier": "com.starstationfurlong.coreloop",
   "build": {
     "beforeDevCommand": "npm run dev",

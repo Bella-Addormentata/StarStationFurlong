@@ -703,6 +703,12 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('MODULES', null, [moduleRow, stationRow])}
       ${sectionHtml('PARTS', 'station construction (#62)', ['<div id="dev-parts-rows"></div>'])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
+      ${sectionHtml('NAVIGATION', 'lost? beam straight home', [`
+        <div style="${ROW_STYLE}">
+          <span>🏠 GO HOME <span style="color:rgba(255,179,0,0.5);">· reload into your home station</span></span>
+          <button type="button" data-dev-action="go-home" style="${BTN_STYLE}">GO</button>
+        </div>
+      `])}
     </div>
   `;
 
@@ -716,12 +722,44 @@ function buildPanel(): HTMLDivElement {
     btn.blur(); // keep focus off buttons so Space/Enter can't re-trigger them
     switch (btn.dataset.devAction) {
       case 'close': setOpen(false); break;
+      case 'go-home':
+        // 🏠 Beam home: drop the resume-at-last-location pointer and reload
+        // into a CLEAN URL. Stripping query + hash matters as much as the
+        // localStorage key: a lingering ?seed= from an earlier link-visit
+        // outranks the home fallback in bootstrapNetworking (URL import →
+        // last-room → default), so a plain reload() would beam the player
+        // right back into the foreign room they are trying to escape.
+        try { localStorage.removeItem('ssf-last-room'); } catch { /* private mode */ }
+        location.href = location.origin + location.pathname;
+        break;
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
       case 'place-template': {
         const w = getWorld();
         if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        // ⚠️ Destructive: one click REPLACES every piece in the room, and one
+        // stray click has already wiped a furnished home. Two-click arm/confirm:
+        // the first click arms for 3 s (red ⚠), the second click executes.
+        if (btn.dataset.armed !== '1') {
+          btn.dataset.armed = '1';
+          const prevText = btn.textContent;
+          const prevCss = btn.style.cssText;
+          btn.textContent = '⚠ REPLACE ROOM?';
+          btn.style.background = 'rgba(255,23,68,0.18)';
+          btn.style.borderColor = 'rgba(255,23,68,0.5)';
+          btn.style.color = '#ff8a80';
+          window.setTimeout(() => {
+            if (btn.dataset.armed !== '1') return; // already executed
+            btn.dataset.armed = '';
+            btn.textContent = prevText;
+            btn.style.cssText = prevCss;
+          }, 3000);
+          break;
+        }
+        btn.dataset.armed = '';
+        btn.textContent = 'PLACE'; // restore from the armed look (timeout skips executed buttons)
+        btn.style.cssText = BTN_STYLE;
         const t = applyRoomTemplate(btn.dataset.template ?? '');
         if (!t) break;
         // Furniture rebuilds via the doc subscription (replaceAllFurniture);

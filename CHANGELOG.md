@@ -12,6 +12,29 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.25 — 2026-07-22
+
+### 🧭 Dev-menu guardrails — 🏠 GO HOME + a confirm on room templates
+
+Two quality-of-life guards for the demo-phase DEV menu, both born from a live
+play session that went sideways.
+
+- **🏠 GO HOME (new NAVIGATION section):** one button that beams you back to your
+  own home station — it drops the resume-at-last-location pointer AND reloads into
+  a **clean URL** (query + hash stripped). The URL half matters: a lingering
+  `?seed=` from an earlier link-visit outranks the home fallback in
+  bootstrapNetworking (URL import → last-room → default), so a plain reload kept
+  beaming a lost player right back into the foreign station they were escaping.
+- **⚠ Room templates now confirm before replacing:** the one-click PLACE of a room
+  template REPLACES every piece in the room, and one stray click wiped a furnished
+  home. PLACE now arms for 3 s (red **⚠ REPLACE ROOM?**) and only a second click
+  executes; the button restores itself on timeout.
+- Verified live: GO HOME lands in the player's own home with a clean address bar;
+  an armed PLACE reverts after 3 s untouched and executes on the second click;
+  `tsc` clean.
+- **Release line:** version bumped to 0.33.25, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
 ## v0.33.24 — 2026-07-22
 
 ### 🖱️ Right-click furniture — MOVE / DELETE context menu
