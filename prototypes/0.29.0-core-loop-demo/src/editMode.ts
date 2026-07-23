@@ -668,6 +668,9 @@ class RoomEditController {
       // view (zoom 2, ortho camera — the same preconditions as enter()).
       const canvas = window.gameRenderer?.renderer?.domElement;
       if (!canvas || e.target !== canvas) return;
+      // The native context menu is never useful over the game canvas — suppress
+      // it for every canvas right-click, including the early-return cases below.
+      e.preventDefault();
       const zoomView = (window as unknown as { multiScaleZoom?: { getLevel?: () => number } }).multiScaleZoom;
       const camera = window.gameRenderer?.camera;
       if ((zoomView?.getLevel?.() ?? 2) !== 2 || !(camera instanceof THREE.OrthographicCamera)) return;
@@ -679,11 +682,9 @@ class RoomEditController {
       if (!hit || this.doorIds.has(hit)) return; // furniture only — doors have their own panel
       const perm = canEditRoom();
       if (!perm.ok) {
-        e.preventDefault();
         showHint(perm.reason);
         return;
       }
-      e.preventDefault();
       this.showContextMenu(hit, e.clientX, e.clientY);
     });
 
