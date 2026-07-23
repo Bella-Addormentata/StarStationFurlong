@@ -106,10 +106,13 @@ export class DoorDockingPortSystem {
    *  openness is legible at each threshold. Re-asserted on door (re)build. */
   private accessMode: "public" | "pass" | "keyed" = "pass";
   private adjacentRooms: Map<string, THREE.Mesh> = new Map();
-  /** Doors whose UNDOCK button is in the armed (confirm) state — a permanent
-   *  module removal is destructive, so it takes two clicks. Cleared on execute
-   *  and on pane re-open (arming does not survive a door switch). */
-  private undockArmed = new Set<string>();
+  /** Doors whose UNDOCK button is in the armed (confirm) state, keyed to the
+   *  connected room address the arm was FOR — a permanent module removal is
+   *  destructive, so it takes two clicks, and the arm must not survive the
+   *  pairing changing under the open pane (remove → new module re-dock would
+   *  otherwise render pre-armed). Cleared on execute, on pane re-open, and by
+   *  render when the live address no longer matches. */
+  private undockArmed = new Map<string, string>();
 
   // ── Update-loop-driven leaf slides ─────────────────────────────────────────
   /** In-flight slide per door; a new open/close overwrites the entry. */
@@ -1244,11 +1247,12 @@ export class DoorDockingPortSystem {
           // to get it back.
           const stu = this.doorState.get(doorId);
           if (!stu?.pairedSuccessfully || stu.transient) return;
-          if (this.undockArmed.has(doorId)) {
+          if (this.undockArmed.get(doorId) === stu.connectedRoomAddress) {
             this.undockArmed.delete(doorId);
             deleteDoorPairing(doorId);
           } else {
-            this.undockArmed.add(doorId);
+            // arm FOR this pairing — a different armed address is stale
+            this.undockArmed.set(doorId, stu.connectedRoomAddress);
           }
         } else if (action === "accept-req" && pub) {
           writeDoorGrant(doorId, pub, el.dataset.name ?? "Unknown-Clone");
@@ -1290,6 +1294,17 @@ export class DoorDockingPortSystem {
     // has its own everyone-visible DETACH row above). Destructive → two-click
     // arm/confirm. The module's room doc survives on the node; re-docking its
     // address restores it.
+    // The arm is only live while the SAME permanent pairing it was set for
+    // still exists — drop it the moment the pairing is removed, turns
+    // transient, or swaps to a different module under the open pane.
+    if (
+      this.undockArmed.has(doorId) &&
+      (!st?.pairedSuccessfully ||
+        st.transient ||
+        this.undockArmed.get(doorId) !== st.connectedRoomAddress)
+    ) {
+      this.undockArmed.delete(doorId);
+    }
     const undockArmed = this.undockArmed.has(doorId);
     const undockRow =
       st?.pairedSuccessfully && !st.transient
