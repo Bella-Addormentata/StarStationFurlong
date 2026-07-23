@@ -39,11 +39,21 @@
 import * as Y from 'yjs';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
+import { isCrapsBet, isCrapsTableState } from './games/craps';
+import type { CrapsBet, CrapsTableState } from './games/craps';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
   round: number;
   bets: RouletteBet[];
+}
+
+/** 🎲 One player's craps bets. Unlike roulette these PERSIST across rolls (a
+ *  pass line rides its point; a place bet stays working), so there is no round
+ *  stamp — the stickman prunes the list at each settle (see games/craps.ts). */
+export interface CrapsTableBets {
+  kind: 'craps';
+  bets: CrapsBet[];
 }
 
 let boundDoc: Y.Doc | null = null;
@@ -257,10 +267,61 @@ export function readAllBets(tableId: string, round: number): Record<string, Roul
   return out;
 }
 
+// ── 🎲 Craps table state + bets (#69 G3) ─────────────────────────────────────
+// Same casino-map keys as roulette (`table:<id>`, `bets:<id>:<pid>`) — a given
+// table is one game, so the shapes never collide, and clearTableKeys /
+// creditChips / the croupier heartbeat are already game-agnostic. Craps bets are
+// NOT round-stamped: they carry across rolls until the stickman prunes them.
+
+export function readCrapsTableState(tableId: string): CrapsTableState | null {
+  const value = ensureMap().get(`table:${tableId}`);
+  return isCrapsTableState(value) ? value : null;
+}
+
+/** Stickman-only in practice (the UI gates on the house predicate). */
+export function writeCrapsTableState(tableId: string, state: CrapsTableState): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`table:${tableId}`, state);
+  });
+}
+
+function isCrapsTableBets(value: unknown): value is CrapsTableBets {
+  if (typeof value !== 'object' || value === null) return false;
+  const t = value as Partial<CrapsTableBets>;
+  return t.kind === 'craps' && Array.isArray(t.bets) && t.bets.every(isCrapsBet);
+}
+
+export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
+  const value = ensureMap().get(`bets:${tableId}:${playerId}`);
+  return isCrapsTableBets(value) ? value.bets : [];
+}
+
+export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsBet[]): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`bets:${tableId}:${playerId}`, { kind: 'craps', bets });
+  });
+}
+
+/** Every player's standing craps bets on one table (the stickman's settle read;
+ *  also drives the "on the felt" spectator view). Empty lists are omitted. */
+export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
+  const prefix = `bets:${tableId}:`;
+  const out: Record<string, CrapsBet[]> = {};
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix)) continue;
+    if (!isCrapsTableBets(value) || value.bets.length === 0) continue;
+    out[key.slice(prefix.length)] = value.bets;
+  }
+  return out;
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing.
 (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
   readChips, buyInChips, cashOutChips, spendChips, creditChips,
   readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
   readCroupierBeat, writeCroupierBeat,
+  readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
 };

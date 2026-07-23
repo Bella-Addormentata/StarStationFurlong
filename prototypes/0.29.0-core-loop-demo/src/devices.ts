@@ -58,14 +58,21 @@ import {
   readChips, buyInChips, cashOutChips, spendChips, creditChips,
   readCageLedger, readTableState,
   readMyBets, writeMyBets, readAllBets, subscribeCasino,
+  readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
 } from './casinoDoc';
 import {
   WHEEL_ORDER, pocketColor,
 } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
+// 🎲 #69 G3: the craps engine (pure payout math) + its table state.
+import { canPlaceBet } from './games/craps';
+import type { CrapsBet, CrapsTableState } from './games/craps';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
+// 🎲🤖 #69 G3: the auto-stickman's shared settle/open helpers (manual ROLL /
+// NEXT ROLL delegate to the same implementation).
+import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
 // 🤖 #77C s3: per-dock robot routine config (the programming console).
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
@@ -78,7 +85,7 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'cloneVat' | 'robotDock';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -2507,6 +2514,519 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
         render(); // reveal the result banner + winning cell + settled balances
       } else {
         drawWheelForNow();
+      }
+    },
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 🎲 Craps table (#69 G3)
+// ══════════════════════════════════════════════════════════════════════════════
+
+export interface CrapsUIDeps {
+  /** Furniture item id — keys the table + bet records in the casino map. */
+  itemId: string;
+  /** Owner-equivalent predicate: the stickman side (house/venture). */
+  isHouse: () => boolean;
+}
+
+/** Seconds the dice tumble after a settle lands. */
+const CR_ROLL_SECS = 1.6;
+const CR_BOARD_W = 360;
+const CR_BOARD_H = 186;
+const CR_GREEN = '#1B6B3A';
+const CR_RED = '#7A1E1E';
+
+interface CrapsRegion {
+  x: number; y: number; w: number; h: number;
+  label: string;
+  fill: string | null;
+  bet: { type: CrapsBet['type']; pick?: number };
+}
+
+/** Single source for drawing AND hit-testing the craps felt (CSS px). */
+function crapsBoardRegions(): CrapsRegion[] {
+  const r: CrapsRegion[] = [];
+  r.push({ x: 6, y: 6, w: 232, h: 34, label: 'PASS LINE · 1:1', fill: null, bet: { type: 'pass' } });
+  r.push({ x: 242, y: 6, w: 112, h: 34, label: "DON'T PASS", fill: CR_RED, bet: { type: 'dontpass' } });
+  r.push({ x: 6, y: 44, w: 348, h: 44, label: 'FIELD · 2 3 4 9 10 11 12 · 2 & 12 DOUBLE', fill: null, bet: { type: 'field' } });
+  [4, 5, 6, 8, 9, 10].forEach((n, i) => {
+    r.push({
+      x: 6 + i * 58, y: 92, w: 54, h: 46,
+      label: String(n),
+      fill: CR_GREEN,
+      bet: { type: 'place', pick: n },
+    });
+  });
+  r.push({ x: 6, y: 144, w: 170, h: 34, label: 'ANY 7 · 4:1', fill: null, bet: { type: 'anyseven' } });
+  r.push({ x: 184, y: 144, w: 170, h: 34, label: 'ANY CRAPS · 7:1', fill: null, bet: { type: 'anycraps' } });
+  return r;
+}
+
+/** Pip offsets (unit square −1..1) for a die face 1–6. */
+const DIE_PIPS: Record<number, Array<[number, number]>> = {
+  1: [[0, 0]],
+  2: [[-0.5, -0.5], [0.5, 0.5]],
+  3: [[-0.5, -0.5], [0, 0], [0.5, 0.5]],
+  4: [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [0.5, 0.5]],
+  5: [[-0.5, -0.5], [0.5, -0.5], [0, 0], [-0.5, 0.5], [0.5, 0.5]],
+  6: [[-0.5, -0.5], [0.5, -0.5], [-0.5, 0], [0.5, 0], [-0.5, 0.5], [0.5, 0.5]],
+};
+
+/** Draw one white die with black pips, centred at (cx,cy), side `s`. */
+function drawDie(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number, value: number, tilt = 0): void {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(tilt);
+  const r = s * 0.18;
+  ctx.fillStyle = '#F4EFE2';
+  ctx.strokeStyle = '#C9BE9E';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-s / 2 + r, -s / 2);
+  ctx.arcTo(s / 2, -s / 2, s / 2, s / 2, r);
+  ctx.arcTo(s / 2, s / 2, -s / 2, s / 2, r);
+  ctx.arcTo(-s / 2, s / 2, -s / 2, -s / 2, r);
+  ctx.arcTo(-s / 2, -s / 2, s / 2, -s / 2, r);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#23252E';
+  const pipR = s * 0.09;
+  for (const [px, py] of DIE_PIPS[value] ?? []) {
+    ctx.beginPath();
+    ctx.arc(px * s * 0.56, py * s * 0.56, pipR, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/**
+ * The craps table's focused UI (#69 G3): the two dice, the classic felt (pass /
+ * don't pass / field / place 4-5-6-8-9-10 / any 7 / any craps), the ON/OFF point
+ * puck, chip denominations, and the stickman controls. House-banked, exactly
+ * like roulette: stakes leave your chips when they hit the felt; the stickman
+ * (owner-equivalent client, or their robot) throws, and the settle write carries
+ * the dice + payouts + the pruned felt for every client to converge on. Craps
+ * carries state across rolls — a pass line rides its point, a place bet stays
+ * working — so a bet you placed on a PRIOR window is locked (only what you put
+ * down THIS window is yours to take back). Fairness is dev-phase trust; the
+ * commit-reveal upgrade is G5 and the panel says so.
+ */
+export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let diceCanvas: HTMLCanvasElement | null = null;
+  let boardCanvas: HTMLCanvasElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let denom = 5;
+  /** Round whose dice tumble was already started (never replay history). */
+  let animRound = 0;
+  /** Animation progress 0..1, or null when idle. */
+  let animT: number | null = null;
+  /** One-shot notice line, cleared on next render. */
+  let flash = '';
+  /** Bets I placed in the CURRENT betting window — the only ones UNDO/CLEAR may
+   *  take back (standing pass/place bets from prior rolls are contract-locked). */
+  let addedThisWindow: CrapsBet[] = [];
+  let windowRound = 0;
+  const myId = getPlayerId();
+  const regions = crapsBoardRegions();
+
+  const state = (): CrapsTableState | null => readCrapsTableState(deps.itemId);
+  const phase = (): 'betting' | 'closing' | 'settled' => state()?.phase ?? 'betting';
+  const point = (): number | null => state()?.point ?? null;
+  const round = (): number => state()?.round ?? 1;
+  const myBets = (): CrapsBet[] => readMyCrapsBets(deps.itemId, myId);
+  const bettingOpen = (): boolean => {
+    const s = state();
+    if ((s?.phase ?? 'betting') !== 'betting') return false;
+    return s?.phaseDeadline == null || Date.now() < s.phaseDeadline;
+  };
+
+  /** Reset the "mine this window" tracker whenever the betting window turns over
+   *  (a new round after a settle) so contract bets from the last roll lock. */
+  const syncWindow = (): void => {
+    const r = round();
+    if (r !== windowRound) {
+      windowRound = r;
+      addedThisWindow = [];
+    }
+  };
+
+  // ── Bet placement (stakes move at placement time — see module doc) ─────────
+
+  const placeBet = (bet: { type: CrapsBet['type']; pick?: number }): void => {
+    if (!bettingOpen() || animT !== null) return;
+    if (!canPlaceBet(bet.type, point())) {
+      flash = 'THE LINE IS CLOSED — A POINT IS ON';
+      render();
+      return;
+    }
+    if (!spendChips(myId, denom)) {
+      flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
+      render();
+      return;
+    }
+    const full: CrapsBet = { ...bet, amount: denom };
+    writeMyCrapsBets(deps.itemId, myId, [...myBets(), full]);
+    addedThisWindow.push(full);
+  };
+
+  const undoBet = (): void => {
+    if (!bettingOpen() || addedThisWindow.length === 0) return;
+    const bets = myBets();
+    const last = bets[bets.length - 1];
+    if (!last) return;
+    creditChips(myId, last.amount);
+    writeMyCrapsBets(deps.itemId, myId, bets.slice(0, -1));
+    addedThisWindow.pop();
+  };
+
+  const clearBets = (): void => {
+    if (!bettingOpen() || addedThisWindow.length === 0) return;
+    const n = addedThisWindow.length;
+    const refund = addedThisWindow.reduce((sum, b) => sum + b.amount, 0);
+    if (refund > 0) creditChips(myId, refund);
+    const bets = myBets();
+    writeMyCrapsBets(deps.itemId, myId, bets.slice(0, Math.max(0, bets.length - n)));
+    addedThisWindow = [];
+  };
+
+  // ── Stickman: the settle write is the roll's single source of truth ────────
+  // Manual house controls (venture / legacy rooms with no live robot stickman)
+  // delegate to the SAME settle/open the auto-stickman runs, with no deadline.
+
+  const roll = (): void => {
+    if (!deps.isHouse() || (phase() !== 'betting' && phase() !== 'closing')) return;
+    rollAndSettleCraps(deps.itemId, round(), point());
+  };
+
+  const nextRoll = (): void => {
+    if (!deps.isHouse() || phase() !== 'settled') return;
+    openCrapsBetting(deps.itemId, round() + 1, point());
+  };
+
+  // ── Dice + puck drawing ────────────────────────────────────────────────────
+
+  const DICE_W = 168, DICE_H = 84;
+
+  const drawDiceForNow = (): void => {
+    if (!diceCanvas) return;
+    const ctx = diceCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(2, 0, 0, 2, 0, 0); // 2x backing, draw in CSS units
+    ctx.clearRect(0, 0, DICE_W, DICE_H);
+    const s = state();
+    const tumbling = animT !== null;
+    let d1 = 1, d2 = 1;
+    if (tumbling) {
+      d1 = 1 + Math.floor(Math.random() * 6);
+      d2 = 1 + Math.floor(Math.random() * 6);
+    } else if (s?.phase === 'settled' && s.dice) {
+      [d1, d2] = s.dice;
+    } else {
+      // Idle / come-out with no roll yet — show a neutral pair of aces.
+      d1 = d2 = 1;
+    }
+    const tilt = tumbling ? (Math.random() - 0.5) * 0.6 : 0;
+    drawDie(ctx, 38, 42, 52, d1, tilt);
+    drawDie(ctx, 100, 42, 52, d2, tumbling ? (Math.random() - 0.5) * 0.6 : 0);
+    // ON/OFF point puck at the right.
+    const pt = s?.point ?? null;
+    const px = 148, py = 42, pr = 17;
+    ctx.beginPath();
+    ctx.arc(px, py, pr, 0, Math.PI * 2);
+    ctx.fillStyle = pt != null ? '#F4EFE2' : '#12161F';
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = pt != null ? '#00E676' : '#4A5560';
+    ctx.stroke();
+    ctx.fillStyle = pt != null ? '#12321E' : '#8894A2';
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(pt != null ? 'ON' : 'OFF', px, pt != null ? py - 4 : py);
+    if (pt != null) {
+      ctx.font = 'bold 13px monospace';
+      ctx.fillText(String(pt), px, py + 6);
+    }
+  };
+
+  // ── Board drawing + clicks ─────────────────────────────────────────────────
+
+  const drawBoard = (): void => {
+    if (!boardCanvas) return;
+    const ctx = boardCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(2, 0, 0, 2, 0, 0);
+    ctx.clearRect(0, 0, CR_BOARD_W, CR_BOARD_H);
+    ctx.fillStyle = '#14532D';
+    ctx.fillRect(0, 0, CR_BOARD_W, CR_BOARD_H);
+    const keyOf = (b: { type: string; pick?: number }) => `${b.type}:${b.pick ?? ''}`;
+    const mineChips = new Map<string, number[]>();
+    for (const b of myBets()) {
+      const k = keyOf(b);
+      mineChips.set(k, [...(mineChips.get(k) ?? []), b.amount]);
+    }
+    const otherChips = new Map<string, number[]>();
+    for (const [pid, list] of Object.entries(readAllCrapsBets(deps.itemId))) {
+      if (pid === myId) continue;
+      for (const b of list) {
+        const k = keyOf(b);
+        otherChips.set(k, [...(otherChips.get(k) ?? []), b.amount]);
+      }
+    }
+    // The rolled number flares once the dice have landed (informative even to a
+    // spectator): the matching place box + the field when it hit.
+    const settled = state()?.phase === 'settled' && animT === null;
+    const rolled = settled ? state()!.result : null;
+    const fieldSet = new Set([2, 3, 4, 9, 10, 11, 12]);
+    for (const rg of regions) {
+      ctx.fillStyle = rg.fill ?? '#1B6B3A';
+      ctx.fillRect(rg.x, rg.y, rg.w, rg.h);
+      const flare = rolled != null && (
+        (rg.bet.type === 'place' && rg.bet.pick === rolled) ||
+        (rg.bet.type === 'field' && fieldSet.has(rolled)) ||
+        (rg.bet.type === 'anyseven' && rolled === 7) ||
+        (rg.bet.type === 'anycraps' && (rolled === 2 || rolled === 3 || rolled === 12))
+      );
+      if (flare) {
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#F0C060';
+        ctx.strokeRect(rg.x + 1.5, rg.y + 1.5, rg.w - 3, rg.h - 3);
+      } else {
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(240, 224, 180, 0.75)';
+        ctx.strokeRect(rg.x, rg.y, rg.w, rg.h);
+      }
+      ctx.fillStyle = '#F5EFDF';
+      ctx.font = `bold ${rg.bet.type === 'place' ? 17 : 10}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const cy = rg.bet.type === 'place' ? rg.y + 16 : rg.y + rg.h / 2;
+      ctx.fillText(rg.label, rg.x + rg.w / 2, cy);
+      if (rg.bet.type === 'place') {
+        ctx.font = '7px monospace';
+        ctx.fillStyle = 'rgba(240,224,180,0.7)';
+        ctx.fillText(
+          rg.bet.pick === 6 || rg.bet.pick === 8 ? '7:6' : rg.bet.pick === 5 || rg.bet.pick === 9 ? '7:5' : '9:5',
+          rg.x + rg.w / 2, rg.y + 32,
+        );
+      }
+      const theirs = otherChips.get(keyOf(rg.bet));
+      if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
+      const placed = mineChips.get(keyOf(rg.bet));
+      if (placed) {
+        const cols = Math.ceil(placed.length / 8);
+        drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
+      }
+    }
+  };
+
+  const onBoardClick = (e: MouseEvent): void => {
+    if (!boardCanvas) return;
+    const rect = boardCanvas.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * CR_BOARD_W;
+    const y = ((e.clientY - rect.top) / rect.height) * CR_BOARD_H;
+    const hit = regions.find((rg) => x >= rg.x && x < rg.x + rg.w && y >= rg.y && y < rg.y + rg.h);
+    if (hit) placeBet(hit.bet);
+  };
+
+  // ── Status line ────────────────────────────────────────────────────────────
+
+  const computeStatus = (): { line: string; color: string } => {
+    const s = state();
+    const p = phase();
+    const staked = myBets().reduce((sum, b) => sum + b.amount, 0);
+    if (animT !== null || p === 'closing'
+        || (p === 'betting' && s?.phaseDeadline != null && Date.now() >= s.phaseDeadline)) {
+      return { line: 'NO MORE BETS — THE DICE ARE OUT…', color: CH_PINK };
+    }
+    if (p === 'settled' && s?.dice != null && s.result != null) {
+      const won = s.payouts?.[myId] ?? 0;
+      const sevenOut = s.result === 7 && s.point == null;
+      const line = `● ${s.dice[0]}+${s.dice[1]} = ${s.result}`
+        + (sevenOut ? ' — SEVEN OUT' : '')
+        + (staked > 0 || won > 0 ? (won > 0 ? ' — YOU WIN' : '') : '');
+      return { line, color: won > 0 ? '#00E676' : GT_GOLD_BRIGHT };
+    }
+    const chips = readChips(myId);
+    const remain = s?.phaseDeadline != null
+      ? Math.max(0, Math.ceil((s.phaseDeadline - Date.now()) / 1000))
+      : null;
+    const pt = point();
+    const head = pt == null ? 'COME OUT — PLACE YOUR BETS' : `POINT IS ${pt} — PLACE YOUR BETS`;
+    const line = head
+      + (remain != null ? ` · ${remain}s` : '')
+      + (chips <= 0 && staked === 0 ? ' · VISIT THE CASHIER FOR CHIPS' : '');
+    return { line, color: GT_GOLD_BRIGHT };
+  };
+
+  const syncStatusEl = (): void => {
+    const el = panel?.querySelector<HTMLDivElement>('#cr-status');
+    if (!el) return;
+    const { line, color } = computeStatus();
+    el.textContent = line;
+    el.style.color = color;
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    syncWindow();
+    const s = state();
+    const p = phase();
+    const chips = readChips(myId);
+    const bets = myBets();
+    const house = deps.isHouse();
+    const rolling = animT !== null;
+    const autoRun = isCroupierLive(deps.itemId);
+    const { line: statusLine, color: statusColor } = computeStatus();
+
+    const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
+      <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
+        padding: 6px 10px;
+        background: rgba(212, 168, 75, ${disabled ? '0.04' : '0.10'});
+        border: 1px solid rgba(212, 168, 75, ${disabled ? '0.18' : '0.45'});
+        border-radius: 6px; color: ${disabled ? GT_DIM : GT_GOLD_BRIGHT};
+        font-family: inherit; font-size: 10px; font-weight: 800; letter-spacing: 1.5px;
+        cursor: ${disabled ? 'not-allowed' : 'pointer'}; opacity: ${disabled ? '0.5' : '1'};
+      ">${label}</button>`;
+
+    const denomBtn = (n: number): string => `
+      <button data-denom="${n}" style="
+        width: 44px; height: 30px; border-radius: 15px;
+        background: ${denom === n ? 'rgba(240,192,96,0.28)' : 'rgba(212,168,75,0.07)'};
+        border: 2px solid ${denom === n ? '#F0C060' : 'rgba(212,168,75,0.35)'};
+        color: ${denom === n ? '#F0C060' : CH_GOLD};
+        font-family: inherit; font-size: 10px; font-weight: 800; cursor: pointer;
+      ">${n}</button>`;
+
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1px;">🎲 CRAPS</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div id="cr-status" style="font-size:11px; font-weight:800; letter-spacing:1px; color:${statusColor};">${statusLine}</div>
+      ${flash ? `<div style="font-size:10px; font-weight:800; color:#FF8A80; letter-spacing:1px;">${flash}</div>` : ''}
+      <div style="display:flex; gap:14px; align-items:flex-start;">
+        <div style="display:flex; flex-direction:column; gap:6px; flex:none;">
+          <canvas id="cr-dice" width="${DICE_W * 2}" height="${DICE_H * 2}"
+            style="width:${DICE_W}px; height:${DICE_H}px; background:rgba(0,0,0,0.25); border-radius:8px;"></canvas>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; min-width:0; flex:1;">
+          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">YOUR CHIPS — COUNT THEM</div>
+          <canvas id="cr-rack" width="380" height="132" style="width:190px; height:66px;"></canvas>
+          <div style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">ON THE FELT</div>
+          <canvas id="cr-felt-rack" width="380" height="88" style="width:190px; height:44px;"></canvas>
+          ${p === 'settled' && !rolling && (s?.payouts?.[myId] ?? 0) > 0 ? `
+          <div style="font-size:10px; color:#00E676; letter-spacing:1.5px;">YOUR WIN</div>
+          <canvas id="cr-won" width="380" height="88" style="width:190px; height:44px;"></canvas>` : ''}
+        </div>
+      </div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:10px; color:${GT_DIM}; letter-spacing:1.5px;">CHIP:</span>
+        ${[1, 5, 25, 100].map(denomBtn).join('')}
+        <span style="flex:1;"></span>
+        ${btn('cr-undo', 'UNDO', !bettingOpen() || rolling || addedThisWindow.length === 0, 'Take back the last chip you placed this window')}
+        ${btn('cr-clear', 'CLEAR', !bettingOpen() || rolling || addedThisWindow.length === 0, 'Take back every chip you placed this window')}
+      </div>
+      <canvas id="cr-board" width="${CR_BOARD_W * 2}" height="${CR_BOARD_H * 2}"
+        style="width:${CR_BOARD_W}px; height:${CR_BOARD_H}px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${bettingOpen() && !rolling ? 'pointer' : 'default'};"></canvas>
+      <div style="display:flex; gap:8px; justify-content:flex-end; align-items:center;">
+        ${autoRun
+          ? `<span style="font-size:9.5px; color:${CH_GOLD};">🤖 THE ROBO-STICKMAN RUNS THIS TABLE</span>`
+          : house
+          ? (p === 'settled'
+            ? btn('cr-next', 'NEXT ROLL', rolling, 'Open the felt for the next roll')
+            : btn('cr-roll', '🎲 ROLL', rolling, 'Close betting and throw the dice'))
+          : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !rolling ? 'WAITING FOR THE STICKMAN TO OPEN THE NEXT ROLL' : 'THE HOUSE THROWS WHEN BETS ARE DOWN'}</span>`}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
+        BANK CRAPS · pass/don't-pass 1:1 (come-out only) · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6
+        · any 7 4:1 · any craps 7:1 · place bets ride until a 7, the pass line rides its point
+        · house-banked, the stickman's throw settles the roll · fair-dice upgrade coming
+        · chips are physical at the table — count them; the CASHIER's screen shows the number
+      </div>
+    `;
+    panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
+      b.addEventListener('click', () => { denom = Number(b.dataset.denom); render(); });
+    });
+    panel.querySelector<HTMLButtonElement>('#cr-undo')?.addEventListener('click', () => undoBet());
+    panel.querySelector<HTMLButtonElement>('#cr-clear')?.addEventListener('click', () => clearBets());
+    panel.querySelector<HTMLButtonElement>('#cr-roll')?.addEventListener('click', () => { roll(); });
+    panel.querySelector<HTMLButtonElement>('#cr-next')?.addEventListener('click', () => nextRoll());
+    diceCanvas = panel.querySelector<HTMLCanvasElement>('#cr-dice');
+    boardCanvas = panel.querySelector<HTMLCanvasElement>('#cr-board');
+    boardCanvas?.addEventListener('click', onBoardClick);
+    flash = '';
+    drawDiceForNow();
+    drawBoard();
+    const paintTray = (id: string, tray: number[], cssW: number, cssH: number, emptyText?: string) => {
+      const cv = panel!.querySelector<HTMLCanvasElement>(`#${id}`);
+      const c2 = cv?.getContext('2d');
+      if (!cv || !c2) return;
+      c2.setTransform(2, 0, 0, 2, 0, 0);
+      c2.clearRect(0, 0, cssW, cssH);
+      drawChips(c2, tray, 0, 0, cssW, cssH, { emptyText });
+    };
+    paintTray('cr-rack', chipsFor(chips), 190, 66, 'NO CHIPS — VISIT THE CASHIER');
+    paintTray('cr-felt-rack', bets.map((b) => b.amount), 190, 44, 'NOTHING ON THE FELT');
+    if (p === 'settled' && !rolling) {
+      paintTray('cr-won', chipsFor(s?.payouts?.[myId] ?? 0), 190, 44);
+    }
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-craps-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 430px; max-height: 94vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${GT_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      // Never replay a throw that landed before we walked up.
+      const s = state();
+      animRound = s?.phase === 'settled' ? s.round : 0;
+      windowRound = s?.round ?? 0;
+      animT = null;
+      unsubscribe = subscribeCasino(() => {
+        // A fresh settle write starts the dice tumble; everything else repaints.
+        const cur = state();
+        if (cur?.phase === 'settled' && cur.round > animRound) {
+          animRound = cur.round;
+          animT = 0;
+        }
+        render();
+      });
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+      diceCanvas = null;
+      boardCanvas = null;
+    },
+    update(dt: number): void {
+      const s = state();
+      if (animT === null && s?.phaseDeadline != null && s.phase !== 'settled') {
+        syncStatusEl();
+      }
+      if (animT === null) return;
+      animT = Math.min(1, animT + Math.max(0, dt) / CR_ROLL_SECS);
+      if (animT >= 1) {
+        animT = null;
+        render(); // reveal the dice + payouts + settled balances
+      } else {
+        drawDiceForNow(); // tumble
       }
     },
   };

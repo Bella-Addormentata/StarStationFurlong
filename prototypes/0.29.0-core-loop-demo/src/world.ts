@@ -18,7 +18,7 @@ import {
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
-import { readTableState } from "./casinoDoc";
+import { readTableState, readCrapsTableState } from "./casinoDoc";
 import {
   beatCroupier,
   canRunCroupier,
@@ -28,6 +28,13 @@ import {
   isCroupierLive,
   tickAutoCroupier,
 } from "./croupier";
+// 🎲 #69 G3: the craps auto-stickman (parallel to the roulette croupier) +
+// its narration + teardown refund.
+import {
+  closeCrapsTable,
+  crapsBeatLine,
+  tickAutoStickman,
+} from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
@@ -99,6 +106,7 @@ import {
   createHelmUI,
   createCashierUI,
   createRouletteUI,
+  createCrapsUI,
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
@@ -2379,8 +2387,10 @@ export class World {
       const slot = STANDS[i];
       ring.visible = true;
       ring.position.set(slot.front.x, 0.05, slot.front.z);
+      // Any reserved operator slot (roulette wheelHead / craps stickman) rings
+      // gold; open player stands ring cyan.
       (ring.material as THREE.MeshBasicMaterial).color.setHex(
-        slot.role === "wheelHead" ? 0xffb733 : 0x35e0ff,
+        slot.role ? 0xffb733 : 0x35e0ff,
       );
     });
   }
@@ -2645,8 +2655,11 @@ export class World {
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
     // operator) and wipe its casino keys — else bettors' debited chips vanish
     // and table:/bets: records orphan. Runs pre-splice, so the kind is still known.
-    if (FURNITURE.find((i) => i.id === itemId)?.kind === "roulette-table") {
+    const removedKind = FURNITURE.find((i) => i.id === itemId)?.kind;
+    if (removedKind === "roulette-table") {
       closeTable(itemId);
+    } else if (removedKind === "craps-table") {
+      closeCrapsTable(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -4357,7 +4370,9 @@ export class World {
    *  avatar short of the table (worse than the legacy single front), so an
    *  unreachable slot is skipped and the caller falls back to the device front. */
   private pickFreeStand(itemId: string): StandSlot | null {
-    const slots = standsForItem(itemId).filter((s) => s.role !== "wheelHead");
+    // Skip any reserved operator slot (roulette wheelHead / craps stickman) —
+    // that's the owner's croupier robot's spot, never auto-picked for a walk-up.
+    const slots = standsForItem(itemId).filter((s) => !s.role);
     if (slots.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
     const me = this.player.getPosition();
@@ -4492,7 +4507,11 @@ export class World {
   }
 
   private updateCroupier(): void {
-    const tables = FURNITURE.filter((i) => i.kind === "roulette-table");
+    // Both banked house games ring an operator slot the robot posts to: the
+    // roulette wheel-head and the craps stickman. Drive each by its kind.
+    const rouletteTables = FURNITURE.filter((i) => i.kind === "roulette-table");
+    const crapsTables = FURNITURE.filter((i) => i.kind === "craps-table");
+    const tables = [...rouletteTables, ...crapsTables];
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.
@@ -4504,17 +4523,20 @@ export class World {
       if (beatNow) this.croupierLastBeatAt = now;
       for (const t of tables) {
         if (beatNow) beatCroupier(t.id);
-        tickAutoCroupier(t.id);
+        if (t.kind === "craps-table") tickAutoStickman(t.id);
+        else tickAutoCroupier(t.id);
       }
     }
 
-    // Robot post (all clients): assign the NEAREST robot to the live table's
-    // wheel-head and release every other robot to serve/dock. Only when a
-    // croupier is actually LIVE (a fresh heartbeat) — manual venture/legacy
-    // rooms keep the robots serving instead of standing mute at the wheel.
+    // Robot post (all clients): assign the NEAREST robot to the FIRST live
+    // table's reserved operator slot and release every other robot to
+    // serve/dock. Only when a croupier is actually LIVE (a fresh heartbeat) —
+    // manual venture/legacy rooms keep the robots serving instead of standing
+    // mute at the table.
     let post: { x: number; z: number; faceAngle: number } | null = null;
-    if (tables.length && isCroupierLive(tables[0].id)) {
-      const head = standsForItem(tables[0].id).find((s) => s.role === "wheelHead");
+    const liveTable = tables.find((t) => isCroupierLive(t.id));
+    if (liveTable) {
+      const head = standsForItem(liveTable.id).find((s) => s.role != null);
       if (head) {
         post = { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle };
       }
@@ -4555,18 +4577,24 @@ export class World {
     }
 
     // Narration (all clients): edge-detect each table's synced phase beat and
-    // pop one bubble over the wheel-head — only while a robot croupier is live.
+    // pop one bubble over the operator slot — only while a robot croupier is
+    // live. Dispatch the beat line by game kind.
     for (const t of tables) {
       if (!isCroupierLive(t.id)) {
         this.croupierNarrated.delete(t.id);
         continue;
       }
-      const s = readTableState(t.id);
-      if (!s) continue;
-      const beat = croupierBeatLine(s);
+      let beat: { key: string; text: string } | null = null;
+      if (t.kind === "craps-table") {
+        const s = readCrapsTableState(t.id);
+        beat = s ? crapsBeatLine(s) : null;
+      } else {
+        const s = readTableState(t.id);
+        beat = s ? croupierBeatLine(s) : null;
+      }
       if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;
       this.croupierNarrated.set(t.id, beat.key);
-      const head = standsForItem(t.id).find((x) => x.role === "wheelHead");
+      const head = standsForItem(t.id).find((x) => x.role != null);
       if (head) {
         spawnFixedBubble(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
       }
@@ -4672,20 +4700,23 @@ export class World {
       return;
     }
 
-    if (device.kind === "cashier" || device.kind === "roulette") {
-      // 🎰 #69 G1/G2: the HOUSE side (cashier book, croupier spin) rides the
-      // same owner-equivalent seam as room editing — canEditRoom funnels
-      // main.ts's isLocalPlayerRoomOwner, so a venture-owned room makes every
-      // shareholder the house (the #68 V1 rule, applied to the casino).
+    if (device.kind === "cashier" || device.kind === "roulette" || device.kind === "craps") {
+      // 🎰 #69 G1/G2/G3: the HOUSE side (cashier book, croupier spin, stickman
+      // throw) rides the same owner-equivalent seam as room editing —
+      // canEditRoom funnels main.ts's isLocalPlayerRoomOwner, so a venture-owned
+      // room makes every shareholder the house (the #68 V1 rule, applied to the
+      // casino).
       const isHouse = () => canEditRoom().ok;
       const ui =
         device.kind === "cashier"
           ? createCashierUI({ isHouse })
+          : device.kind === "craps"
+          ? createCrapsUI({ itemId: deviceId, isHouse })
           : createRouletteUI({ itemId: deviceId, isHouse });
-      // 🎰 #76: the roulette table gathers players at its open standing slots
-      // (the cashier is not a table — it keeps its single front).
+      // 🎰 #76: the game tables gather players at their open standing slots (the
+      // cashier is not a table — it keeps its single front).
       const target =
-        device.kind === "roulette" ? this.standTarget(device) : device;
+        device.kind === "cashier" ? device : this.standTarget(device);
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
