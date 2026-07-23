@@ -2680,8 +2680,12 @@ export class World {
       for (const mat of mats) {
         if (!mat || mat === OUTLINE_MAT || disposed.has(mat)) continue;
         disposed.add(mat);
+        // 📸 cached photo-décor textures are SHARED across instances
+        // (furniture.ts keyedPhotoTexCache) — disposing one item's map would
+        // yank the GPU texture from every surviving copy. They live for the
+        // session (bounded: one per photo).
         const map = (mat as THREE.MeshBasicMaterial).map;
-        if (map) map.dispose();
+        if (map && !map.userData.sharedCache) map.dispose();
         mat.dispose();
       }
     });

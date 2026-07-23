@@ -1300,6 +1300,9 @@ const loadKeyedPhotoTexture = (
       tex.anisotropy =
         window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
       tex.colorSpace = THREE.SRGBColorSpace;
+      // Instances SHARE this texture — flag it so removeFurnitureVisuals'
+      // per-item cleanup skips disposing it out from under the survivors.
+      tex.userData.sharedCache = true;
       resolve(tex);
     };
     img.onerror = () => reject(new Error(`could not load ${url}`));
