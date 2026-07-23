@@ -1243,6 +1243,9 @@ const buildPhotoStandee = (ctx: BuildCtx, spec: PhotoDecorSpec) => {
   // alphaTest hard-clips the keyed edge so the planes never alpha-sort
   // against each other. The map doubles as a soft emissiveMap so the photo
   // stays vivid under dim room light (owner request: brighter).
+  // transparent stays true only for the morph fade-in (ctx.m contract) —
+  // world.ts flips alphaTest>0 materials opaque at reveal/morph-complete, so
+  // the cutout never lingers in the depth-sorted transparent pass.
   const mat = m(0xffffff, 0.85, 0.0, 0xffffff, 0.32);
   mat.transparent = true;
   mat.alphaTest = 0.4;
