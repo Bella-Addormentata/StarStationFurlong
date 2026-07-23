@@ -317,6 +317,27 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
   return out;
 }
 
+// ── 🎲🔗 Craps settlement backend preference (#69 G5 seam) ────────────────────
+// Which backend settles a craps table — 'local' (crypto RNG + these room-doc
+// chips, the default) or 'chia' (per-player↔house state channels + a shared
+// beacon-anchored dice; see brainstorming/craps-chia-backend-plan.md). Owner-set,
+// synced so every client agrees which backend the elected operator runs. Plain
+// string in the casino map (`cfg:backend:<tableId>`); a bad/absent value reads as
+// 'local', so legacy tables and un-set tables behave exactly as before.
+
+export type CrapsBackendKind = 'local' | 'chia';
+
+export function readCrapsBackendPref(tableId: string): CrapsBackendKind {
+  return ensureMap().get(`cfg:backend:${tableId}`) === 'chia' ? 'chia' : 'local';
+}
+
+export function writeCrapsBackendPref(tableId: string, kind: CrapsBackendKind): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`cfg:backend:${tableId}`, kind === 'chia' ? 'chia' : 'local');
+  });
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing.
 (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
@@ -324,4 +345,5 @@ export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
   readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
   readCroupierBeat, writeCroupierBeat,
   readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
+  readCrapsBackendPref, writeCrapsBackendPref,
 };

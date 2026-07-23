@@ -33,10 +33,11 @@ import {
   readAllCrapsBets,
   readCrapsTableState,
   writeCrapsTableState,
-  writeMyCrapsBets,
 } from './casinoDoc';
-import { nextPoint, resolveCrapsRound } from './games/craps';
 import type { CrapsTableState } from './games/craps';
+// 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
+// chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
+import { selectCrapsBackend } from './crapsBackend';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -47,58 +48,26 @@ export const CRAPS_CLOSING_MS = 2_500;
  *  (≥ the local dice-tumble animation, so the number lingers after it stops). */
 export const CRAPS_SHOW_MS = 6_000;
 
-// ── Random dice (operator-side; dev-phase trust — G5 adds commit-reveal) ──────
-
-/** One fair die 1–6 via rejection sampling (no modulo bias). */
-function rollDie(): number {
-  const buf = new Uint32Array(1);
-  for (;;) {
-    crypto.getRandomValues(buf);
-    if (buf[0] < 4294967292) return (buf[0] % 6) + 1; // floor(2^32/6)*6
-  }
-}
-
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
 /** Throw the dice, resolve the roll, publish the settled record, credit winners,
- *  and PRUNE each player's felt. Called by the operator's timer (with `autoShowMs`
- *  so it auto-opens the next window) AND by the manual ROLL button (no
- *  `autoShowMs` — the house clicks NEXT ROLL). Returns the two dice. */
+ *  and PRUNE each player's felt — via the table's SELECTED settlement backend
+ *  (local, or an optional Chia backend when wired + chosen). Called by the
+ *  operator's timer (with `autoShowMs` so it auto-opens the next window) AND by
+ *  the manual ROLL button (no `autoShowMs` — the house clicks NEXT ROLL).
+ *  Returns the two dice. */
 export function rollAndSettleCraps(
   tableId: string,
   round: number,
   pointBefore: number | null,
   autoShowMs?: number,
 ): [number, number] {
-  const d1 = rollDie();
-  const d2 = rollDie();
-  const sum = d1 + d2;
-  const { payouts, remaining } = resolveCrapsRound(
-    readAllCrapsBets(tableId),
-    d1,
-    d2,
-    pointBefore,
-  );
-  const now = Date.now();
-  writeCrapsTableState(tableId, {
-    kind: 'craps',
-    phase: 'settled',
+  return selectCrapsBackend(tableId).rollAndSettle(
+    tableId,
     round,
-    point: nextPoint(pointBefore, sum),
-    dice: [d1, d2],
-    result: sum,
-    resultAt: now,
-    payouts,
-    ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
-  });
-  for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
-  // Prune the felt: rewrite each player's list to only the bets that survived
-  // (standing pass/place). Empty ⇒ their felt clears. Owner-key write by the
-  // operator — see module header on why the disjoint window makes it safe.
-  for (const [pid, bets] of Object.entries(remaining)) {
-    writeMyCrapsBets(tableId, pid, bets);
-  }
-  return [d1, d2];
+    pointBefore,
+    autoShowMs,
+  );
 }
 
 /** Open a fresh betting window carrying the point forward (idle — no timer until

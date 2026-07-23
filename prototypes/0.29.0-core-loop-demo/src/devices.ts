@@ -59,7 +59,11 @@ import {
   readCageLedger, readTableState,
   readMyBets, writeMyBets, readAllBets, subscribeCasino,
   readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
+  readCrapsBackendPref, writeCrapsBackendPref,
 } from './casinoDoc';
+// 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
+// the house-only toggle in the craps panel flips the per-table preference.
+import { crapsBackend } from './crapsBackend';
 import {
   WHEEL_ORDER, pocketColor,
 } from './games/roulette';
@@ -2880,6 +2884,10 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     const house = deps.isHouse();
     const rolling = animT !== null;
     const autoRun = isCroupierLive(deps.itemId);
+    // 🎲🔗 #69 G5 seam: the house-only settlement toggle (local / optional Chia).
+    const backendPref = readCrapsBackendPref(deps.itemId);
+    const backendObj = crapsBackend(backendPref);
+    const backendReady = backendObj.isAvailable();
     const { line: statusLine, color: statusColor } = computeStatus();
 
     const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
@@ -2941,6 +2949,16 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
             : btn('cr-roll', '🎲 ROLL', rolling, 'Close betting and throw the dice'))
           : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !rolling ? 'WAITING FOR THE STICKMAN TO OPEN THE NEXT ROLL' : 'THE HOUSE THROWS WHEN BETS ARE DOWN'}</span>`}
       </div>
+      ${house ? `
+      <div style="display:flex; gap:8px; justify-content:space-between; align-items:center;">
+        <span style="font-size:9px; color:${GT_DIM}; letter-spacing:1.5px;">SETTLEMENT · HOUSE</span>
+        <button id="cr-backend" title="How this table settles: LOCAL play chips, or the optional Chia gaming backend (per-player↔house state channels sharing one fair dice). Off by default; the in-world game is identical either way. Selecting Chia before it is wired keeps playing on LOCAL." style="
+          padding:4px 9px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,${backendPref === 'chia' ? '0.55' : '0.4'});
+          border-radius:6px; color:${backendPref === 'chia' && !backendReady ? '#FFC107' : GT_GOLD_BRIGHT};
+          font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">
+          ${backendObj.label.toUpperCase()}${backendPref === 'chia' && !backendReady ? ' · FALLS BACK TO LOCAL' : ''}
+        </button>
+      </div>` : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
         BANK CRAPS · pass/don't-pass 1:1 (come-out only) · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6
         · any 7 4:1 · any craps 7:1 · place bets ride until a 7, the pass line rides its point
@@ -2955,6 +2973,11 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#cr-clear')?.addEventListener('click', () => clearBets());
     panel.querySelector<HTMLButtonElement>('#cr-roll')?.addEventListener('click', () => { roll(); });
     panel.querySelector<HTMLButtonElement>('#cr-next')?.addEventListener('click', () => nextRoll());
+    panel.querySelector<HTMLButtonElement>('#cr-backend')?.addEventListener('click', () => {
+      if (!deps.isHouse()) return;
+      writeCrapsBackendPref(deps.itemId, backendPref === 'chia' ? 'local' : 'chia');
+      render();
+    });
     diceCanvas = panel.querySelector<HTMLCanvasElement>('#cr-dice');
     boardCanvas = panel.querySelector<HTMLCanvasElement>('#cr-board');
     boardCanvas?.addEventListener('click', onBoardClick);
