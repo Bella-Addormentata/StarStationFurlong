@@ -33,6 +33,35 @@ changing gameplay? Research + options + the seam to build now. -->
   later, gated on the same two spikes [[games-plan]] Phase 5 already names: the
   **B-7 wallet spike** and a **chia-gaming integration spike**.
 
+## 0. Decisions (owner, 2026-07-23)
+
+These resolve the §10 open questions; the rest of the doc is the standing design.
+
+1. **Shared dice = option (b): house commit + Chia block-hash beacon.** Concrete
+   mechanism (§3, confirmed against Chia consensus): the operator node watches the
+   peak (`get_blockchain_state` / the full-node new-peak signal); at the committed
+   target height `H` it reads that block's **`header_hash`** (which commits to the
+   infused VDF output + all prior blocks → unpredictable) and derives
+   `dice = f(houseSeed ‖ header_hash[H] ‖ tableId ‖ round)`. **Use the *infused*
+   block's `header_hash`, not the signage-point challenge** — Chia reveals a
+   block's challenge ≈30 s before infusion ([signage/infusion points](https://docs.chia.net/chia-blockchain/consensus/chains/signage-and-infusion-points/)),
+   so deriving from the challenge would leak the roll early; the finalized
+   `header_hash` does not. **Honest residual:** a *large colluding farmer* could
+   grind/withhold the beacon block. The house-seed commit blocks the other
+   direction (house can't pick the seed after seeing the block); fully closing the
+   farmer angle is exactly what player entropy (option (c)) buys — a later
+   hardening, not needed for testnet bank craps.
+2. **Netting = whole shooter-hand** (§4a below). Bets still *resolve* at their
+   correct roll; netting only batches the on-chain commit to the hand boundary
+   (seven-out) or cash-out. **Don't-pass is the clean case, not a problem** — the
+   seven-out that ends a hand is exactly when don't-pass contract bets win, so the
+   netting boundary *is* their payout moment.
+3. **Chips stay on the shared `casinoDoc` ledger** (the same one roulette uses) for
+   now — already unified. Swappable to CATs later purely inside the backend (§4b),
+   zero gameplay change.
+4. **Runtime = Rust engine in the node + thin webview bridge**, *not* WASM-in-webview
+   (§4c). Keeps key custody in the node, trust boundary unchanged.
+
 ## 2. Why craps fits chia-gaming unusually well
 
 chia-gaming (Alpha 0.3, June 2026): *"Players fund a shared channel coin on the
@@ -95,6 +124,54 @@ alone, see §7 G5b).
   ruleset. The TS engine stays the golden spec; the ChiaLisp port is
   differential-tested against it (the payout table is small and already
   console-tested). This keeps the chain logic honest and the two in lockstep.
+
+### 4a. Netting granularity — the whole shooter-hand (decision 2)
+
+A **shooter-hand** runs come-out → (points made, same shooter keeps rolling) →
+**seven-out** (a 7 with a point on ends the hand and passes the dice). We net a
+whole hand rather than settle each roll on-chain.
+
+- **Resolution vs commit are separate.** Every bet still *resolves* at its correct
+  roll per `games/craps.ts` (pass on point-made/seven-out, place until a 7, field
+  each roll, etc.). What netting changes is only *when the outcome is committed
+  on-chain*: the channel carries a **signed running balance updated every roll
+  off-chain** (potato-protocol messages are free), and we **checkpoint on-chain at
+  the hand boundary** or on cash-out.
+- **Don't-pass is the clean case.** The seven-out that ends a hand is exactly when
+  don't-pass contract bets *win*, so the netting boundary **aligns with** the
+  don't-pass payout. A hand can contain several point cycles; a don't-pass bet that
+  *lost* mid-hand (a point was made) is already captured in the running tally
+  before the final seven-out — netting never changes the outcome, only the commit
+  cadence. Contract-bet locking (can't pull a don't-pass once a point is on) is
+  already enforced by the UI's "only take back what you placed this window" rule.
+- **No locked funds.** A player may cash out mid-hand via a **channel close at the
+  current signed balance** — netting is a checkpoint cadence, not a lock.
+- **Local backend** already credits/debits per roll (free, in-doc); the hand
+  boundary is a no-op there, so the *presentation* (and a future "new shooter"
+  narration beat) can read the same `seven-out` signal the Chia netting checkpoints
+  on. A tiny pure helper (`shooterHandOver(pointBefore, sum)`) is the shared anchor
+  when this is built.
+
+### 4b. Chips stay on the shared ledger, swappable behind the seam (decision 3)
+
+Craps already uses the **same chip ledger as roulette** — `casinoDoc`
+`bal/bought/cashed` via `readChips`/`spendChips`/`creditChips`. Keep it there now.
+Because credit/debit happen *inside* the backend (`LocalCrapsBackend`), moving
+chips to issuer **CATs** / channel balances later is a `ChiaCrapsBackend`-internal
+change with **zero gameplay impact** — and G4 already promises `casinoDoc`'s
+read/write shape is unchanged when chips become CATs. The seam is the exact swap
+point.
+
+### 4c. Runtime — Rust engine in the node, thin webview bridge (decision 4)
+
+Run chia-gaming's **Rust core in/beside the node** (`ssf-p2p-node`, which already
+builds `chia-sdk-driver`); the potato-protocol transport rides the node's existing
+iroh stream lane. The **Tauri webview hosts only presentation + a thin bridge** —
+the `__ssfChiaGaming` shim `ChiaCrapsBackend` already targets — reached via the
+node's RPC/IPC. This keeps **key custody in the node and the browser BLS-free**
+([[chia-authority-architecture]]). WASM-in-webview would duplicate key custody in
+the browser and is rejected; chia-gaming's WASM/TS bindings are for glue/
+presentation, not custody.
 
 ## 5. The on/off seam (what we build now)
 
@@ -182,16 +259,19 @@ dependency, because reading a block hash is not a spend.
   whole shooter-hand (come-out → seven-out) into fewer signed updates — an
   optimisation, not a correctness issue (open question §10).
 
-## 10. Open questions for the owner
+## 10. Open questions for the owner — RESOLVED (see §0)
 
-1. **Fairness bar** — is house commit + block-beacon (§3b) enough, or do you want
-   player entropy (§3c) despite the griefing/timeout cost?
-2. **Settlement granularity** — per-roll channel updates (simple, chatty) vs
-   per-shooter-hand netting (fewer messages, more bookkeeping)?
-3. **Chips** — keep room-doc integers under `local` forever and only CAT-ize under
-   `chia`, or unify everything on CATs once G4 lands?
-4. **Runtime** — WASM chia-gaming inside the Tauri webview, or a native sidecar
-   process beside the p2p node?
+1. **Fairness bar** → **(b)** house commit + block-hash beacon; player entropy (c)
+   noted as an optional later hardening against a farming house.
+2. **Settlement granularity** → **whole shooter-hand** netting (§4a).
+3. **Chips** → **stay on the shared `casinoDoc` ledger** now; CAT-ize later inside
+   the backend (§4b).
+4. **Runtime** → **Rust engine in the node + thin webview bridge** (§4c).
+
+Remaining to settle at implementation time: the exact `f()` (hash construction +
+domain separation) for the beacon dice; the on-chain checkpoint frequency vs
+dispute-window trade-off; and the referee puzzle's timeout/refund parameters
+(mirror `closeCrapsTable`'s no-roll refund).
 
 ## 11. Relationship to existing plans
 
