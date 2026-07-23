@@ -49,6 +49,7 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
+  poolHoleOutline,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -73,7 +74,8 @@ import {
 import { readDoorDeltas, roomHalfExtents } from "./floorPlanDoc";
 import { applyDoorSlideDeltas } from "./doors";
 import { setDoorSlideDeltas } from "./adapter";
-import { roomIdFromSeed } from "./stationAtlas";
+import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
+import type { AtlasDoor } from "./stationAtlas";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -84,7 +86,9 @@ import {
   buildConnectorChain,
   setVestibuleLightState,
   setVestibuleOpacity,
+  projectionPoseForDoor,
 } from "./adapter";
+import type { VestibuleDoorId } from "./adapter";
 import {
   findDevice,
   rebuildDevices,
@@ -115,6 +119,25 @@ import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
+import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
+import type { OctagonHull, HullWallpapers } from "./octagonHull";
+import {
+  readAllWindowLayout,
+  subscribeWindowLayout,
+} from "./windowLayoutDoc";
+import {
+  readAllWallpaper,
+  subscribeWallpaperLayout,
+} from "./wallpaperLayoutDoc";
+import {
+  surfaceCenterWorld,
+  surfaceBasis,
+  collectWindowOpenings,
+  WINDOW_BOX_THICKNESS,
+} from "./windowLayout";
+import { computeOctagonProfile } from "./hullSection";
+import type { OctagonProfile, HullSurface } from "./hullSection";
+import { getCameraYaw } from "./cameraRig";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -150,12 +173,31 @@ interface RemoteAvatar {
   diveStartY: number;
 }
 
+/** 🛑📐 #80: render each room as an OCTAGON barrel (walls + 45° roof + basement)
+ *  instead of the flat open-top box. Now the DEFAULT hull — pass `?octagon=0` to
+ *  fall back to the legacy flat box (e.g. to compare). Client-side render only;
+ *  no wire/protocol change, so it stays compatible with any peer. */
+const OCTAGON_HULL =
+  new URLSearchParams(window.location.search).get("octagon") !== "0";
+
 export class World {
   private scene: THREE.Scene;
   private player: Player;
   private platformGroup: THREE.Group;
   private stationPlanet: THREE.Mesh | null = null;
   private platformFloor: THREE.Mesh | null = null;
+  /** 🛑📐 #80: XZ rectangles cut out of the solid floor (a pool sinks into the
+   *  basement through the hole). Empty ⇒ a plain solid floor plane. */
+  private floorHoles: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
+  /** 🕳️ #80: arbitrary POLYGON holes cut from the floor (world XZ) — the pool's
+   *  exact water outline, so no floor peeks over the organic water. */
+  private floorHoleOutlines: Array<Array<{ x: number; z: number }>> = [];
+  /** JSON of the last-applied floorHoles ("[]" = the initial solid floor) —
+   *  skips redundant geometry rebuilds. */
+  private floorHolesKey = "[]";
+  /** A standalone demo hole (`?octagon=1&hole=1`), merged with the pool hole by
+   *  refreshOutdoorFloor so both survive its rebuilds. */
+  private demoFloorHole: { x0: number; z0: number; x1: number; z1: number } | null = null;
   private platformGrid: THREE.GridHelper | null = null;
   private platformElements: THREE.Object3D[] = [];
   private sideWalls: THREE.Mesh[] = [];
@@ -184,6 +226,20 @@ export class World {
   // Dynamic outer structural elements (Roof & complete outer hull walls for Level 3 visual context)
   private capsuleRoof: THREE.Mesh | null = null;
   private capsuleOuterWalls: THREE.Mesh[] = [];
+  // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
+  private octagonHull: OctagonHull | null = null;
+  /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
+   *  + their connector tubes, posed around the current room; shown ONLY in first
+   *  person (update() gate) so looking OUT a window shows the real station. */
+  private fpNeighbourShells: THREE.Group | null = null;
+  // 🪟 #80 S4: invisible click-boxes for the placed windows, by id — the
+  // edit-mode raycast index (material.visible:false, still raycasts), so a
+  // window is selectable + removable like a door. Rebuilt with the hull.
+  private windowGroups: Map<string, THREE.Group> = new Map();
+  // 🪟 #80: `skylight` furniture PANEL meshes (not lights) — they follow the
+  // octagon roof cutaway (shown in first person, hidden in the iso view), so a
+  // ceiling skylight doesn't float on the "roof" looking in. Rebuilt on reconcile.
+  private skylightMeshes: THREE.Mesh[] = [];
   // Active interactive docking doors subsystem
   public dockingSystem: DoorDockingPortSystem | null = null;
   // ── Adapter transit (T1 of issue #30) ───────────────────────────────────────
@@ -340,6 +396,10 @@ export class World {
     // on every room (re)bind, and reconcile no-ops until the docking system
     // exists / the map is seeded (un-migrated rooms keep the cardinal defaults).
     subscribeDoorLayout(() => this.reconcileDoorLayout(readAllDoorLayout()));
+    // 🪟 #80: rebuild the octagon hull (holes + glass) when windows change.
+    subscribeWindowLayout(() => this.reconcileWindowLayout());
+    // 🖼️ #80 S6: rebuild the hull (wall coverings) when wallpaper changes.
+    subscribeWallpaperLayout(() => this.reconcileWallpaper());
 
     console.log("✅ World initialized - Station planet ready");
   }
@@ -455,8 +515,8 @@ export class World {
     const platformW = 2 * halfX,
       platformD = 2 * halfZ;
 
-    // Floor - warm light oak herringbone wood
-    const floorGeometry = new THREE.PlaneGeometry(platformW, platformD);
+    // Floor - warm light oak herringbone wood (solid, minus any pool holes)
+    const floorGeometry = this.makeFloorGeometry();
 
     // Build a canvas herringbone wood texture
     const makeWoodTexture = (): THREE.CanvasTexture => {
@@ -552,6 +612,29 @@ export class World {
     this.platformFloor.rotation.x = -Math.PI / 2;
     this.platformGroup.add(this.platformFloor);
 
+    // 🛑📐 #80: pool-hole cutter — exposed for testing + a demo hole under
+    // `?octagon=1&hole=1` (the floor is solid otherwise). The pool furniture /
+    // template will drive this for real in a later slice.
+    (
+      window as unknown as {
+        __ssfSetFloorHoles?: (
+          h: Array<{ x0: number; z0: number; x1: number; z1: number }>,
+        ) => void;
+      }
+    ).__ssfSetFloorHoles = (h) => this.setFloorHoles(h ?? []);
+    if (
+      OCTAGON_HULL &&
+      new URLSearchParams(window.location.search).get("hole") === "1"
+    ) {
+      this.demoFloorHole = {
+        x0: -halfX + 1,
+        z0: -halfZ + 1.5,
+        x1: -0.6,
+        z1: halfZ - 1.5,
+      };
+      this.refreshOutdoorFloor();
+    }
+
     // ── Click-navigation plane ────────────────────────────────────────────────
     // Invisible horizontal plane covering the walkable floor used as the
     // raycast hit target for point-and-click navigation.
@@ -582,8 +665,19 @@ export class World {
     // Add corner markers and edges
     this.addCornerMarkers();
     this.addPlatformEdgeLights();
-    this.addSideWalls();
+    // 🛑📐 #80 S1: the octagon hull REPLACES the two flat interior side walls
+    // with the full barrel (walls + 45° roof + basement) when previewing.
+    // The exterior capsule (zoom ≥ 3) is left untouched either way.
+    if (OCTAGON_HULL) {
+      this.addOctagonHull();
+    } else {
+      this.addSideWalls();
+    }
     this.addCapsuleOuterStructure();
+    // 🛑🛰️ #80 S5: the station-through-the-window shells (neighbour modules +
+    // connector tubes). Built here so a morph restart re-poses them; shown only
+    // in first person by the update() gate.
+    this.addFpNeighbourShells();
     this.addLobbyFurniture();
     this.addAtmosphereEffects();
 
@@ -850,6 +944,418 @@ export class World {
   }
 
   /**
+   * 🛑📐 #80 S1: build the octagon hull barrel (walls + 45° roof + basement)
+   * from the room's half-extents and add it to the platform. Preview only
+   * (`?octagon=1`) — the camera-facing wall fade is driven each frame in
+   * update(); the barrel hides at exterior zoom (≥3) like the interior walls.
+   */
+  private addOctagonHull() {
+    // Idempotent: a morph restart re-runs createPlatform, so drop any prior
+    // barrel before rebuilding (mirrors the vestibule dispose discipline).
+    if (this.octagonHull) {
+      this.platformGroup.remove(this.octagonHull.group);
+      this.octagonHull.dispose();
+      this.octagonHull = null;
+    }
+    const { halfX, halfZ } = roomHalfExtents();
+    this.octagonHull = buildOctagonHull(
+      { halfX, halfZ },
+      collectWindowOpenings(),
+      this.collectWallpaper(),
+    );
+    this.platformGroup.add(this.octagonHull.group);
+    // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
+    this.rebuildWindowClickBoxes();
+  }
+
+  /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
+   *  hull to paint (readAllWallpaper Map → the record buildOctagonHull wants). */
+  private collectWallpaper(): HullWallpapers {
+    const out: HullWallpapers = {};
+    for (const [surface, preset] of readAllWallpaper()) out[surface] = preset;
+    return out;
+  }
+
+  /**
+   * 🛑🛰️ #80 S5: build the STATION AS SEEN FROM INSIDE — every neighbour module
+   * the atlas knows, as a translucent octagon SHELL posed in world space around
+   * the current room (which sits at the platform origin), plus the neighbour↔
+   * neighbour connector tubes. The update() gate shows this ONLY in first person,
+   * so looking OUT a window shows the real station laid out beyond the glass
+   * instead of just the space backdrop. Idempotent — mirrors addOctagonHull's
+   * dispose-prior discipline (createPlatform re-runs per morph).
+   */
+  private addFpNeighbourShells(): void {
+    if (this.fpNeighbourShells) {
+      this.platformGroup.remove(this.fpNeighbourShells);
+      this.disposeObject3D(this.fpNeighbourShells);
+      this.fpNeighbourShells = null;
+    }
+    if (!OCTAGON_HULL) return; // the shells ARE the octagon cross-section
+    const currentRoomId = World.activeRoomId(); // never empty (getDefaultRoomId)
+    // Each pose is already in the current room's frame: atlasLayout seeds the
+    // current room at {0,0,0} and drops it from the output. Reuse the EXACT
+    // exteriorView compose (do not negate rotY / swap sin signs — that mirrors
+    // the whole ring). maxHops 8 = the full station, not a one-window peek.
+    const poses = atlasLayout(
+      currentRoomId,
+      (doorId, segments, farDoor) =>
+        projectionPoseForDoor(doorId as DoorId, segments, farDoor),
+      8,
+    );
+    const g = new THREE.Group();
+    g.name = "fpNeighbourShells";
+    for (const pose of poses) {
+      const nd = pose.dims ?? { cols: 2, rows: 2 };
+      const mod = new THREE.Group();
+      mod.name = `fpAtlasModule-${pose.roomId}`;
+      // Pure BACKDROP — deliberately NOT `isAtlasModule` (that flag routes the
+      // exterior view's click-to-connect); you can't interact with a neighbour
+      // from inside your own room, so it must never become a click target.
+      mod.userData = { isFpNeighbour: true, roomId: pose.roomId };
+      const shell = buildOctagonShell(
+        { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
+        { opacity: 0.85 },
+      );
+      this.disableFog(shell.group); // stay crisp at station distances
+      mod.add(shell.group);
+      mod.position.set(pose.x, 0, pose.z);
+      mod.rotation.y = pose.rotY;
+      g.add(mod);
+    }
+    // 🔗 neighbour↔neighbour connector tubes. The current room's OWN tubes are
+    // already drawn into platformGroup (paired-vestibule path) and show through
+    // the window for free, so skip every edge touching this room; dedupe the
+    // rest. Built in the FROM module's local frame, wrapped at its world pose.
+    const atlas = readAtlas();
+    const poseByRoom = new Map<string, { x: number; z: number; rotY: number }>();
+    poseByRoom.set(currentRoomId, { x: 0, z: 0, rotY: 0 });
+    for (const p of poses) poseByRoom.set(p.roomId, { x: p.x, z: p.z, rotY: p.rotY });
+    const drawnEdges = new Set<string>();
+    for (const [fromId, entry] of Object.entries(atlas)) {
+      const fromPose = poseByRoom.get(fromId);
+      if (!fromPose) continue; // module not placed in this layout
+      for (const [doorId, door] of Object.entries(entry.doors) as Array<
+        [VestibuleDoorId, AtlasDoor | undefined]
+      >) {
+        const toId = door?.targetRoomId;
+        if (!door || !toId || !poseByRoom.has(toId)) continue;
+        if (fromId === currentRoomId || toId === currentRoomId) continue;
+        const key = fromId < toId ? `${fromId}|${toId}` : `${toId}|${fromId}`;
+        if (drawnEdges.has(key)) continue;
+        drawnEdges.add(key);
+        const chain =
+          door.segments && door.segments.length > 0
+            ? buildConnectorChain(doorId, door.segments)
+            : buildVestibule(doorId);
+        // Pure BACKDROP: strip every interactive flag. `isConnectorChain` is
+        // what the bend editor keys on; `isVestibule` + `doorId` are what the
+        // level-2 vestibule-click handler collects (scene.traverse) then
+        // raycasts — and three.js ignores `.visible`, so an INVISIBLE tube (this
+        // group hides at L2) would still be hit by an empty-space click and fire
+        // a phantom walkthrough of the current room's same-named door. These
+        // tubes carry OTHER rooms' door cardinals, so they must not be targets.
+        const cu = chain.userData as {
+          isConnectorChain?: boolean;
+          isVestibule?: boolean;
+          doorId?: unknown;
+        };
+        cu.isConnectorChain = false;
+        cu.isVestibule = false;
+        delete cu.doorId;
+        setVestibuleOpacity(chain, 1.0);
+        this.disableFog(chain);
+        const wrap = new THREE.Group();
+        wrap.name = `fpAtlasConnector-${fromId}-${doorId}`;
+        wrap.add(chain);
+        wrap.position.set(fromPose.x, 0, fromPose.z);
+        wrap.rotation.y = fromPose.rotY;
+        g.add(wrap);
+      }
+    }
+    this.fpNeighbourShells = g;
+    this.platformGroup.add(g);
+  }
+
+  /** 🛑🛰️ #80 S5: rebuild the FP neighbour shells when the atlas changes (a
+   *  visitor watches the station fill in). Mirror of refreshExteriorView. */
+  public refreshFpNeighbourShells(): void {
+    this.addFpNeighbourShells();
+  }
+
+  /** 🌫️ #80 S5: turn scene fog OFF on every material under `obj` — the neighbour
+   *  shells must stay crisp at station distances (fog would haze out far modules;
+   *  the sky/planets already do this). Needs `needsUpdate` to recompile the shader. */
+  private disableFog(obj: THREE.Object3D): void {
+    obj.traverse((o) => {
+      const matField = (o as THREE.Mesh).material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (!matField) return;
+      for (const m of Array.isArray(matField) ? matField : [matField]) {
+        (m as THREE.Material & { fog?: boolean }).fog = false;
+        m.needsUpdate = true;
+      }
+    });
+  }
+
+  /** Dispose every geometry + material under `obj` (Mesh AND LineSegments — the
+   *  octagon seam outline — deduped), mirroring exteriorView.disposeGroup. */
+  private disposeObject3D(obj: THREE.Object3D): void {
+    const seen = new Set<THREE.BufferGeometry | THREE.Material>();
+    obj.traverse((o) => {
+      const drawable = o as THREE.Mesh & THREE.LineSegments;
+      const geo = drawable.geometry as THREE.BufferGeometry | undefined;
+      if (geo && !seen.has(geo)) {
+        seen.add(geo);
+        geo.dispose();
+      }
+      const matField = drawable.material as
+        | THREE.Material
+        | THREE.Material[]
+        | undefined;
+      if (!matField) return;
+      for (const m of Array.isArray(matField) ? matField : [matField]) {
+        if (m && !seen.has(m)) {
+          seen.add(m);
+          m.dispose();
+        }
+      }
+    });
+  }
+
+  /** 🪟 #80 S4: live window click-boxes by id — the edit-mode raycast index
+   *  (mirrors dockingSystem.getDoorGroups()). Invisible, but still raycasts. */
+  public getWindowGroups(): Map<string, THREE.Group> {
+    return this.windowGroups;
+  }
+
+  /** 🪟 #80 S4: the current octagon profile (for the editor's surface math), or
+   *  null when the octagon hull isn't built. */
+  public getOctagonProfile(): OctagonProfile | null {
+    return this.octagonHull?.profile ?? null;
+  }
+
+  /**
+   * 🚪🪟 #80: does a `w`-wide window at `along` on side wall `surface` (wall-neg /
+   * wall-pos) CLEAR every door on that wall (with a margin)? Read from the ACTUAL
+   * door groups (the rendered truth — door records don't always match the placed
+   * position, e.g. the pool layout). Non-side-wall surfaces (roof/floor) have no
+   * doors → always clear.
+   */
+  public windowClearsDoors(surface: HullSurface, along: number, w: number): boolean {
+    if (surface !== "wall-neg" && surface !== "wall-pos") return true;
+    const groups = this.dockingSystem?.getDoorGroups();
+    if (!groups) return true;
+    const { halfX, halfZ } = roomHalfExtents();
+    const { narrowAxis, narrowHalf } = computeOctagonProfile({ halfX, halfZ });
+    const wallCoord = surface === "wall-neg" ? -narrowHalf : narrowHalf;
+    const MARGIN = 0.4; // clearance between a window and a door on the same wall
+    const ON_WALL = 0.8; // a door counts as "on this wall" within this of the wall
+    const wLo = along - w / 2 - MARGIN;
+    const wHi = along + w / 2 + MARGIN;
+    const box = new THREE.Box3();
+    for (const [, g] of groups) {
+      // Bound the DOORWAY only (frame + leaves + clickbox), NOT the port
+      // hardware — the keypad sticks out to one side (always +local-x) and would
+      // inflate the span asymmetrically, falsely rejecting windows on that side.
+      const doorway = g.getObjectByName("doorLeaves") ?? g;
+      box.setFromObject(doorway);
+      if (box.isEmpty()) continue;
+      // perpendicular (narrow-axis) centre: is this door on THIS side wall?
+      const perp = narrowAxis === "x"
+        ? (box.min.x + box.max.x) / 2
+        : (box.min.z + box.max.z) / 2;
+      if (Math.abs(perp - wallCoord) > ON_WALL) continue;
+      // along-range = the doorway's extrude-axis span.
+      const a0 = narrowAxis === "x" ? box.min.z : box.min.x;
+      const a1 = narrowAxis === "x" ? box.max.z : box.max.x;
+      if (wLo < a1 && wHi > a0) return false; // overlap
+    }
+    return true;
+  }
+
+  /**
+   * 🪟 #80 S4: rebuild the window click-boxes from the shared window set — one
+   * fat box per record sitting IN its opening on the side wall. The box is a
+   * reliable raycast target (raycasting ignores visibility) that stays HIDDEN
+   * until edit mode tints it: its own translucent material starts `visible:false`
+   * and edit-mode's hover/select flips it on (gold wash) — the window analogue
+   * of a door's emissive highlight, since a window has no other per-id mesh to
+   * tint. Own material per box (not shared) so highlights are independent.
+   *
+   * Rebuilt with the hull so the targets track every add / move / remove. The
+   * boxes live in platformGroup beside the hull geometry (world-origin frame —
+   * surfaceCenterWorld maps straight through) and are only ever raycast BY edit
+   * mode, so they never intercept a normal floor click. Each box is ORIENTED to
+   * its surface (surfaceBasis) so eave / ridge / floor windows get a snug target.
+   */
+  private rebuildWindowClickBoxes(): void {
+    for (const g of this.windowGroups.values()) {
+      this.platformGroup.remove(g);
+      g.traverse((o) => {
+        if (o instanceof THREE.Mesh) {
+          o.geometry.dispose();
+          (o.material as THREE.Material).dispose();
+        }
+      });
+    }
+    this.windowGroups.clear();
+    if (!OCTAGON_HULL) return;
+    for (const rec of readAllWindowLayout().values()) {
+      const c = surfaceCenterWorld(rec.surface, rec.along, rec.across);
+      const { uDir, vDir, normal } = surfaceBasis(rec.surface);
+      const box = new THREE.Mesh(
+        // local x=w along uDir, y=h along vDir, z=thickness along normal
+        new THREE.BoxGeometry(rec.w, rec.h, WINDOW_BOX_THICKNESS),
+        new THREE.MeshBasicMaterial({
+          color: 0xf0c060,
+          transparent: true,
+          opacity: 0,
+          depthWrite: false, // a highlight wash, not an occluder
+          side: THREE.DoubleSide,
+          visible: false, // shown only while hovered / selected in edit mode
+        }),
+      );
+      box.quaternion.setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(uDir, vDir, normal),
+      );
+      box.name = `window-clickbox-${rec.id}`;
+      const group = new THREE.Group();
+      group.name = `window-${rec.id}`;
+      // The world offset lives on the GROUP (box stays at local origin), so
+      // group.position IS the window centre — matching the furniture/door
+      // convention the edit-mode label/REMOVE anchor (updateLabelPosition) reads.
+      group.position.set(c.x, c.y, c.z);
+      group.add(box);
+      this.platformGroup.add(group);
+      this.windowGroups.set(rec.id, group);
+    }
+  }
+
+  /**
+   * 🪟 #80: collect the visible PANEL meshes (frame + glass, NOT the light) of
+   * every `skylight` furniture item, so the per-frame facing pass can hide them
+   * in the iso view exactly like the octagon roof — they're ceiling glass that
+   * would otherwise float on the "roof" when you look into the room from above.
+   * The skylight's PointLight is left out so the room stays lit in every view.
+   * Rebuilt on furniture reconcile (skylights can be added / moved / removed).
+   */
+  private rebuildSkylightMeshList(): void {
+    this.skylightMeshes = [];
+    if (!OCTAGON_HULL) return; // legacy: no roof, skylights are the ceiling
+    for (const item of FURNITURE) {
+      if (item.kind !== "skylight") continue;
+      const group = this.furnitureGroups.get(item.id);
+      if (!group) continue;
+      group.traverse((o) => {
+        if (o instanceof THREE.Mesh) this.skylightMeshes.push(o);
+      });
+    }
+  }
+
+  /**
+   * 🪟 #80: rebuild the octagon hull when the shared window set changes (add /
+   * move / remove) — mirrors reconcileDoorLayout / refreshOutdoorFloor. The
+   * rebuild re-reads collectWindowOpenings so holes + glass follow the doc.
+   */
+  private reconcileWindowLayout(): void {
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    this.addOctagonHull(); // rebuilds hull holes + glass AND the click-boxes
+    // 🪟 keep a live edit session's raycast index in sync with the window
+    // boxes just rebuilt — a targeted window-slice rebuild that preserves the
+    // current selection by id (mirrors reconcileDoorLayout → onDoorLayoutChanged).
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+  }
+
+  /**
+   * 🖼️ #80 S6: rebuild the octagon hull when the shared wall-covering set
+   * changes (paint / clear) — mirrors reconcileWindowLayout. The rebuild
+   * re-reads collectWallpaper so each strip's material follows the doc.
+   */
+  private reconcileWallpaper(): void {
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+  }
+
+  /**
+   * 🛑📐 #80: the floor plane — SOLID by default, with any `floorHoles` cut out
+   * (a pool sinks into the basement through the hole). No holes ⇒ a plain
+   * PlaneGeometry (bit-identical to the legacy floor). The outline is authored
+   * in plane coords (x, y=−z) so it lays flat under the mesh's rotation.x=−π/2,
+   * and UVs are remapped to 0..1 so the wood texture tiles exactly as before.
+   */
+  private makeFloorGeometry(): THREE.BufferGeometry {
+    const { halfX, halfZ } = roomHalfExtents();
+    const w = 2 * halfX,
+      d = 2 * halfZ;
+    if (this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+      return new THREE.PlaneGeometry(w, d);
+    }
+    const shape = new THREE.Shape();
+    shape.moveTo(-halfX, -halfZ);
+    shape.lineTo(halfX, -halfZ);
+    shape.lineTo(halfX, halfZ);
+    shape.lineTo(-halfX, halfZ);
+    shape.closePath();
+    for (const h of this.floorHoles) {
+      const path = new THREE.Path();
+      const py0 = -h.z1,
+        py1 = -h.z0; // world z → plane y (the mesh is rotated -π/2)
+      path.moveTo(h.x0, py0);
+      path.lineTo(h.x1, py0);
+      path.lineTo(h.x1, py1);
+      path.lineTo(h.x0, py1);
+      path.closePath();
+      shape.holes.push(path);
+    }
+    // 🕳️ #80: arbitrary polygon holes (the pool's exact water outline). Same
+    // world-XZ → plane (x, −z) mapping as the rects.
+    for (const poly of this.floorHoleOutlines) {
+      if (poly.length < 3) continue;
+      const path = new THREE.Path();
+      path.moveTo(poly[0].x, -poly[0].z);
+      for (let i = 1; i < poly.length; i++) path.lineTo(poly[i].x, -poly[i].z);
+      path.closePath();
+      shape.holes.push(path);
+    }
+    const geo = new THREE.ShapeGeometry(shape);
+    // ShapeGeometry UVs are raw shape coords; remap to 0..1 across the floor so
+    // the wood texture's repeat matches the PlaneGeometry mapping.
+    const pos = geo.attributes.position;
+    const uv = new Float32Array(pos.count * 2);
+    for (let i = 0; i < pos.count; i++) {
+      uv[i * 2] = (pos.getX(i) + halfX) / w;
+      uv[i * 2 + 1] = (pos.getY(i) + halfZ) / d;
+    }
+    geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+    return geo;
+  }
+
+  /**
+   * 🛑📐 #80: set the pool holes cut from the solid floor (world XZ rects) and
+   * rebuild the floor mesh. Empty restores a solid floor. The invisible
+   * click-navigation plane is left intact (walking over a hole still resolves;
+   * the swim/sink-into-basement mechanic is a later slice).
+   */
+  public setFloorHoles(
+    holes: Array<{ x0: number; z0: number; x1: number; z1: number }>,
+    outlines: Array<Array<{ x: number; z: number }>> = [],
+  ): void {
+    const key = JSON.stringify(holes) + "|" + JSON.stringify(outlines);
+    if (key === this.floorHolesKey) return; // no change — skip the rebuild
+    this.floorHolesKey = key;
+    this.floorHoles = holes.slice();
+    this.floorHoleOutlines = outlines.map((p) => p.slice());
+    if (!this.platformFloor) return;
+    const old = this.platformFloor.geometry;
+    this.platformFloor.geometry = this.makeFloorGeometry();
+    old.dispose();
+  }
+
+  /**
    * Add lobby furniture — sofas, coffee table, side tables, cabinets, fireplace.
    * All pieces start at opacity 0 and are stored in furnitureMeshes for morph fade-in.
    */
@@ -1032,29 +1538,19 @@ export class World {
    * Called after every furniture reconcile and at platform build.
    */
   /**
-   * 🧱🪟 Modular walls (owner request): when a brick-wall / window-wall
-   * furniture item sits ON a structural side wall's line (|x| > 5 — the
-   * built-in bricks live at ±6), that side's built-in wall HIDES — the
-   * placed sections become the wall, and a window section becomes a real
-   * view out (stars, the planet, docked-module projections through the
-   * glass). Remove the sections and the built-in wall returns. Same
-   * furniture-drives-structure pattern as the fireplace/north door.
+   * 🖼️ #80 S6: the freestanding brick-wall / window-wall SEGMENTS that used to
+   * REPLACE a structural side wall are retired (the octagon hull is the wall now,
+   * re-skinnable via the wallpaper editor), so nothing covers the legacy side
+   * walls any more — `sideWallCovered` stays all-false. Kept only for the
+   * `?octagon=0` fallback path (the legacy box room); a no-op under the octagon
+   * default (sideWalls is empty). Still called after furniture reconciles / at
+   * platform build so the legacy walls track the hull-edit view.
    */
   public updateSideWallCoverage(): void {
-    // "On a side wall's line" = within 1 m of the ±halfX wall (default ±5).
-    const { halfX } = roomHalfExtents();
-    const nearWall = halfX - 1;
     this.sideWallCovered[0] = false;
     this.sideWallCovered[1] = false;
-    for (const item of FURNITURE) {
-      if (item.kind !== "brick-wall" && item.kind !== "window-wall") continue;
-      if (item.pos.x < -nearWall) this.sideWallCovered[0] = true;
-      if (item.pos.x > nearWall) this.sideWallCovered[1] = true;
-    }
-    // addSideWalls order: [0] = left (x=-6). The zoom machinery consults the
-    // flags too (it force-restores walls at interior levels otherwise).
-    this.sideWalls.forEach((wall, i) => {
-      wall.visible = !this.hullEditView && !this.sideWallCovered[i];
+    this.sideWalls.forEach((wall) => {
+      wall.visible = !this.hullEditView;
     });
     if (this.northWall) this.northWall.visible = !this.hullEditView;
   }
@@ -1598,14 +2094,14 @@ export class World {
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casinoTheme;
 
-    // 🏊 Outdoor pool room: HIDE the solid y=0 floor plane and its grid — the
-    // lazy-pool item's white-tile deck slabs provide all visible flooring, and
-    // the sunken water (y<0) must show through the deck hole. The invisible
-    // clickPlane still catches walk clicks, so navigation is unaffected.
-    // Pool-GATED (owner request: the pool is removable now): if the room has
-    // no lazy-pool, the deck is gone, so SHOW the solid floor instead of
-    // leaving a void. Re-run from reconcileFurniture when the pool is
-    // added/removed. See refreshOutdoorFloor.
+    // 🏊 Outdoor pool room floor — refreshOutdoorFloor decides how the sunken
+    // water shows. Under `?octagon=1` (#80) the solid floor STAYS and only the
+    // pool's water cells are punched out (poolHoleCells → the water sinks into
+    // the basement through a real hole with a drawn-in basin bottom). The legacy
+    // (flag-off) path HIDES the whole y=0 floor + grid so the pool's deck slabs
+    // are the flooring; if the room has no pool, the solid floor is shown so
+    // there's no void. The invisible clickPlane always catches walk clicks, so
+    // navigation is unaffected. Re-run from reconcileFurniture on pool add/remove.
     this.refreshOutdoorFloor();
 
     // ☀️ Day/night: the outdoor pool room runs bright poolside daylight —
@@ -1811,12 +2307,27 @@ export class World {
    * covers remote changes; editMode's local splice/spawn does not).
    */
   public refreshOutdoorFloor(): void {
-    // A pool (either style) sinks its water below the floor, so hide the solid
-    // floor/grid wherever one is present — not only in the authored outdoor
-    // room (a pool template dropped into any room reveals its water too).
+    // A pool (either style) sinks its water below the floor.
     const hasPool = FURNITURE.some(
       (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
     );
+    if (OCTAGON_HULL) {
+      // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the pool water
+      // is — the deck keeps its floor. The hole is the water's EXACT outline
+      // (poolHoleOutline), so no solid floor peeks over the organic water (the
+      // old 1 m cell holes couldn't match the curve). The pool's basin (with its
+      // drawn-in bottom) sinks into the basement through the hole. No pool ⇒ no
+      // holes, plus any demo rect hole.
+      const rects: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
+      if (this.demoFloorHole) rects.push(this.demoFloorHole);
+      const outline = hasPool ? poolHoleOutline(FURNITURE) : null;
+      this.setFloorHoles(rects, outline ? [outline] : []);
+      if (this.platformFloor) this.platformFloor.visible = true;
+      if (this.platformGrid) this.platformGrid.visible = !hasPool;
+      return;
+    }
+    // Legacy (no octagon): hide the whole floor/grid wherever a pool is present
+    // — the pool's deck slabs provide the visible flooring instead.
     if (this.platformFloor) this.platformFloor.visible = !hasPool;
     if (this.platformGrid) this.platformGrid.visible = !hasPool;
   }
@@ -2061,6 +2572,7 @@ export class World {
     rebuildSeats();
     rebuildStands();
     rebuildDevices();
+    this.rebuildSkylightMeshList(); // 🪟 skylight panels follow the roof cutaway
     // 🤖 #77C: a placed/removed/moved charging-dock spawns/disposes/repositions
     // its robot (uses the route the room was last set up with).
     this.reconcileRobots(this.robotsPatrol);
@@ -2280,35 +2792,41 @@ export class World {
       return starTex;
     };
 
-    const winGeo = new THREE.PlaneGeometry(2.2, 1.65);
-    const winZs = [-2.8, 0.6];
-    winZs.forEach((wz) => {
-      // Left wall — cool cerulean tint
-      const winL = new THREE.Mesh(
-        winGeo.clone(),
-        new THREE.MeshBasicMaterial({
-          map: makeStarTex("#010d22", "#041530"),
-          transparent: true,
-          opacity: 0,
-          side: THREE.DoubleSide,
-        }),
-      );
-      winL.rotation.y = Math.PI / 2;
-      winL.position.set(-5.81, 2.1, wz);
-      this.platformGroup.add(winL);
-      this.furnitureMeshes.push(winL);
-      // Frame
-      place(
-        new THREE.BoxGeometry(0.06, 1.85, 2.42),
-        m(0x8899aa, 0.48, 0.62),
-        -5.84,
-        2.1,
-        wz,
-      );
-      addLight(new THREE.PointLight(0x3388ff, 0, 4.5), -5.5, 2.1, wz, 0.5);
+    // 🪟 #80: the octagon hull carries REAL window holes now (walls/roof/floor via
+    // windowLayout.collectWindowOpenings), so the legacy flat star-window PANES on
+    // the west wall are retired under octagon — they'd otherwise sit against the
+    // octagon wall. Kept for the legacy flat-box room (?octagon=0).
+    if (!OCTAGON_HULL) {
+      const winGeo = new THREE.PlaneGeometry(2.2, 1.65);
+      const winZs = [-2.8, 0.6];
+      winZs.forEach((wz) => {
+        // Left wall — cool cerulean tint
+        const winL = new THREE.Mesh(
+          winGeo.clone(),
+          new THREE.MeshBasicMaterial({
+            map: makeStarTex("#010d22", "#041530"),
+            transparent: true,
+            opacity: 0,
+            side: THREE.DoubleSide,
+          }),
+        );
+        winL.rotation.y = Math.PI / 2;
+        winL.position.set(-5.81, 2.1, wz);
+        this.platformGroup.add(winL);
+        this.furnitureMeshes.push(winL);
+        // Frame
+        place(
+          new THREE.BoxGeometry(0.06, 1.85, 2.42),
+          m(0x8899aa, 0.48, 0.62),
+          -5.84,
+          2.1,
+          wz,
+        );
+        addLight(new THREE.PointLight(0x3388ff, 0, 4.5), -5.5, 2.1, wz, 0.5);
 
-      // Right wall removed — no paintings or frames on that side
-    });
+        // Right wall removed — no paintings or frames on that side
+      });
+    }
 
     // (Coloured throw cushions moved into the sofa builders — furniture.ts.)
 
@@ -2698,6 +3216,9 @@ export class World {
         wall.visible = false;
       });
       if (this.northWall) this.northWall.visible = false;
+      // 🛑📐 #80 S1: the interior octagon barrel gives way to the exterior
+      // capsule at zoom ≥ 3 (same as the interior side walls).
+      if (this.octagonHull) this.octagonHull.group.visible = false;
 
       if (zoomLevel === 4) {
         // Level 4 (Space Station) uses a simpler silhouette/solid representation of the capsules
@@ -2743,14 +3264,27 @@ export class World {
           (wall.material as THREE.MeshStandardMaterial).opacity = 1.0;
         });
       }
+      // 🛑📐 #80 S1 preview: hide the flat box capsule so the exterior OCTAGON
+      // shell (built by exteriorView at zoom 3) is the module's outside skin.
+      if (OCTAGON_HULL) {
+        if (this.capsuleRoof) this.capsuleRoof.visible = false;
+        this.capsuleOuterWalls.forEach((wall) => {
+          wall.visible = false;
+        });
+      }
     } else {
       // Restore interior rendering when playing inside levels <= 2 (Room / First-Person)
       this.furnitureMeshes.forEach((mesh) => {
         mesh.visible = true;
       });
-      // 🏊 Outdoor pool room: the floor stays hidden (the lazy-pool's deck
-      // slabs are the visible floor; sunken water must show through).
-      if (this.platformFloor) this.platformFloor.visible = !this.isOutdoorRoom;
+      // 🏊 Outdoor pool room: legacy hides the floor (deck slabs are the floor;
+      // sunken water shows through). Under the octagon flag the floor stays
+      // SOLID with a pool hole cut (refreshOutdoorFloor), so keep it visible.
+      if (this.platformFloor)
+        this.platformFloor.visible = OCTAGON_HULL || !this.isOutdoorRoom;
+      // 🛑📐 #80: the octagon floor is SOLID by default now (basement hidden
+      // beneath it); a hole is cut only where a pool sinks into the basement
+      // (setFloorHoles → makeFloorGeometry). No blanket hide.
       // 🧱🪟 Placed wall sections REPLACE a built-in side wall — the interior
       // restore must not resurrect a covered one (nor one dropped for 🛰️
       // HULL EDIT).
@@ -2758,6 +3292,8 @@ export class World {
         wall.visible = !this.hullEditView && !this.sideWallCovered[i];
       });
       if (this.northWall) this.northWall.visible = !this.hullEditView;
+      // 🛑📐 #80 S1: restore the interior octagon barrel at room/first-person.
+      if (this.octagonHull) this.octagonHull.group.visible = !this.hullEditView;
 
       // Completely clear and hide outer capsule roof and shielding so they don't block the camera!
       if (this.capsuleRoof) {
@@ -2766,6 +3302,16 @@ export class World {
       this.capsuleOuterWalls.forEach((wall) => {
         wall.visible = false;
       });
+    }
+
+    // 🛑🛰️ #80 S5: the neighbour-module shells (the station seen OUT a window)
+    // show ONLY in first person — hidden in the iso room view (zoomLevel 2) and
+    // the exterior atlas (zoomLevel ≥ 3, which draws its own shells), and during
+    // the morph lerp / hull-edit. `zoomLevel <= 1` is the same L1-vs-L2
+    // discriminator the skylight/roof cutaway uses.
+    if (this.fpNeighbourShells) {
+      this.fpNeighbourShells.visible =
+        zoomLevel <= 1 && !this.isMorphing && !this.hullEditView;
     }
 
     // Animate station planet (rotation + gentle floating)
@@ -2804,6 +3350,24 @@ export class World {
         fadeEnabled,
         this.player.getActiveDoorId(),
       );
+    }
+
+    // 🛑📐 #80 S1: drive the octagon hull's camera-facing wall transparency —
+    // near faces (outside skin toward the camera) fade so the iso view sees
+    // into the room; far faces stay glassy showing their inside surface. In
+    // first person (zoom ≤ 1) every wall stays solid. Same camera-XZ math as
+    // the #51 door fade above.
+    if (this.octagonHull) {
+      const yaw = getCameraYaw();
+      const camX = (Math.cos(yaw) + Math.sin(yaw)) * Math.SQRT1_2;
+      const camZ = (Math.cos(yaw) - Math.sin(yaw)) * Math.SQRT1_2;
+      const firstPerson = zoomLevel <= 1;
+      this.octagonHull.updateFacing(camX, camZ, firstPerson);
+      // 🪟 #80: skylight glass follows the roof cutaway — visible only in first
+      // person (looking out at the sky), hidden in the iso view where the roof
+      // is culled (otherwise the panels float on the "roof" looking in). Cheap
+      // (a handful of meshes); the panels' PointLight stays on in every view.
+      for (const mesh of this.skylightMeshes) mesh.visible = firstPerson;
     }
 
     // Advance trunk lid swings (TR2 — same update-loop-driven idiom)

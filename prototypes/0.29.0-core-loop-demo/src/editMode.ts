@@ -75,6 +75,21 @@ import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
 } from './doorLayoutDoc';
 import type { DoorWall } from './doorLayoutDoc';
+// 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
+import {
+  snapWindowAlong, clampWindowAlong, clampWindowAcross, windowFitsSurface,
+  surfaceCenterWorld, surfaceBasis, autoWindowSize, windowSizeLimits,
+  WINDOW_BOX_THICKNESS,
+} from './windowLayout';
+import {
+  writeWindowLayout, deleteWindowLayout, readAllWindowLayout, WINDOW_DEFAULT,
+} from './windowLayoutDoc';
+import { writeWallpaper, readAllWallpaper } from './wallpaperLayoutDoc';
+import {
+  WALLPAPER_PRESETS, WALLPAPER_LABELS, type WallpaperPresetId,
+} from './wallpaper';
+import { SURFACES } from './hullSection';
+import type { HullSurface } from './hullSection';
 import { PLAYER_R } from './player';
 import type { Player } from './player';
 import { OUTLINE_MAT } from './voxelCharacter';
@@ -354,6 +369,72 @@ export function validateDoorPlacement(
   return { ok: true };
 }
 
+// ── Window placement validity (#80 S4 — the window editor's add/tint gate) ─────
+
+/** 🪟 #80: windows are holes in the octagon side walls, so the ＋ WINDOW
+ *  affordance rides the same octagon flag world.ts reads. Octagon is now the
+ *  DEFAULT hull — disable with `?octagon=0` (e.g. to compare the legacy box). */
+const OCTAGON_HULL = new URLSearchParams(window.location.search).get('octagon') !== '0';
+
+export type WindowPlacementVerdict = { ok: true } | { ok: false; reason: string };
+
+/** 🪟 #80 S4/resize: metres per resize-key press, and the smallest a window may
+ *  shrink to. The manual resize clamps to [MIN, surface limit]. */
+const WINDOW_RESIZE_STEP = 0.25;
+const WINDOW_MIN_SIZE = 0.5;
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+/** Friendly labels for the surface selector chip. */
+const SURFACE_LABEL: Record<HullSurface, string> = {
+  'wall-neg': 'Wall −',
+  'wall-pos': 'Wall +',
+  'roof-neg': 'Eave −',
+  'roof-pos': 'Eave +',
+  ridge: 'Ridge (skylight)',
+  'basement-neg': 'Chamfer −',
+  'basement-pos': 'Chamfer +',
+  floor: 'Floor (pool bottom)',
+};
+
+/**
+ * May a `w`×`h` window sit on `surface` at (along, across)? A window only needs
+ * to clear the OTHER windows on the SAME surface — a 2-D interval-overlap test
+ * on their centres (|Δalong| < (w+w')/2 AND |Δacross| < (h+h')/2), since windows
+ * can now stack on tall strips. `excludeId` skips the window being edited. The
+ * run/edge clamps are applied by the caller before this, and octagonHull clamps
+ * again when it cuts the hole. Furniture is irrelevant. Pure; drives both the
+ * ADD gate and the ghost's red/green.
+ */
+export function validateWindowPlacement(
+  surface: HullSurface,
+  along: number,
+  across: number,
+  w: number,
+  h: number,
+  excludeId?: string,
+): WindowPlacementVerdict {
+  // A window bigger than the strip can't be cut (the hull drops overflowing
+  // holes to avoid broken triangulation), so reject it here — the ghost reads
+  // red instead of committing a window that would silently fail to render.
+  if (!windowFitsSurface(surface, w, h)) {
+    return { ok: false, reason: 'too big for this surface' };
+  }
+  for (const rec of readAllWindowLayout().values()) {
+    if (rec.id === excludeId) continue;
+    if (rec.surface !== surface) continue;
+    if (
+      Math.abs(rec.along - along) < (w + rec.w) / 2 &&
+      Math.abs(rec.across - across) < (h + rec.h) / 2
+    ) {
+      return { ok: false, reason: 'overlaps another window' };
+    }
+  }
+  return { ok: true };
+}
+
 // ── Highlight tints ───────────────────────────────────────────────────────────
 
 /** Hover: soft gold emissive wash (docking-terminal palette). */
@@ -405,6 +486,35 @@ class RoomEditController {
    *  pointer is off the floor plane. */
   private ghostDoor: { wall: DoorWall; lateral: number; verdict: DoorPlacementVerdict } | null = null;
 
+  /** 🪟 #80 S4: the ids in the index that are WINDOWS (not furniture/doors) — so
+   *  select/hover/remove branch to the window path (writeWindowLayout /
+   *  deleteWindowLayout). Rebuilt with the window raycast slice. */
+  private windowIds: Set<string> = new Set();
+  /** 🪟 #80 S4: ADD-window sub-mode — the next click PLACES a window on the
+   *  ACTIVE surface (windowSurface) instead of selecting. Toggled by ＋ WINDOW. */
+  private addWindowMode = false;
+  /** 🪟 #80 S4: the hull surface the next window lands on. The pointer positions
+   *  the window ON this surface's plane; the SURFACE selector chip cycles it.
+   *  Fixed-iso camera (yaw only, no pitch) can't reach the horizontal ridge /
+   *  floor by picking geometry, so the surface is chosen explicitly. */
+  private windowSurface: HullSurface = 'wall-neg';
+  /** 🪟 #80 S4: the translucent green/red window PREVIEW following the pointer
+   *  while add-window is armed — one reusable box (built on arm, re-oriented on
+   *  surface switch, hidden on disarm, disposed on exit). */
+  private windowGhost: THREE.Mesh | null = null;
+  /** 🪟 #80 S4: the ghost box's current geometry size, so it only rebuilds when
+   *  the size changes (per surface / manual resize). */
+  private windowGhostSize = { w: 0, h: 0 };
+  /** 🪟 #80 S4/resize: a MANUAL size override for the ghost (null ⇒ auto-fit per
+   *  surface). Set by the resize keys while arming; cleared on cycle / disarm /
+   *  F. The committed window stores this size. */
+  private windowSizeOverride: { w: number; h: number } | null = null;
+  /** 🪟 #80 S4: the window ghost's current snapped placement + last verdict; the
+   *  click commit reads THIS so the window drops where the preview showed. */
+  private ghostWindow:
+    | { surface: HullSurface; along: number; across: number; verdict: WindowPlacementVerdict }
+    | null = null;
+
   private hoveredId: string | null = null;
   private selectedId: string | null = null;
 
@@ -452,12 +562,33 @@ class RoomEditController {
   /** 🚪 #28 S6b: persistent ＋ DOOR button (under DONE EDITING) — toggles the
    *  add-door sub-mode; its border/colour flip to green while armed. */
   private addDoorBtnEl: HTMLButtonElement | null = null;
+  /** 🪟 #80 S4: persistent ＋ WINDOW button (under ＋ DOOR) — toggles the
+   *  add-window sub-mode; only shown under the octagon-hull preview. */
+  private addWindowBtnEl: HTMLButtonElement | null = null;
+  /** 🖼️ #80 S6: persistent 🖼 WALLPAPER button (under ＋ WINDOW) — toggles the
+   *  wall-covering sub-mode; only shown under the octagon-hull preview. */
+  private wallpaperBtnEl: HTMLButtonElement | null = null;
+  /** 🖼️ #80 S6: the wall-covering editor is armed (pick a surface + preset —
+   *  applies live to the hull). Exclusive with add-door / add-window. */
+  private wallpaperMode = false;
+  /** The surface being re-skinned (any of the 8 strips). */
+  private wallpaperSurface: HullSurface = 'wall-neg';
+  /** Whether the 🖼 WALLPAPER button belongs on screen for the current scope
+   *  (interior + octagon) — so disarming add-window can restore it. */
+  private wallpaperEligible = false;
   private labelAnchor = new THREE.Vector3();
   /** Top of the selected item's bounding box (label anchor height). */
   private selectedTopY = 0;
 
   private raycaster = new THREE.Raycaster();
   private pointerNdc = new THREE.Vector2();
+  /** 🪟 #80 S4: scratch for the surface math-plane raycast (reused per move). */
+  private windowPlane = new THREE.Plane();
+  private windowAnchor = new THREE.Vector3();
+  private windowHit = new THREE.Vector3();
+  /** Last pointer position (client px) — lets the surface selector re-pose the
+   *  ghost immediately on a surface switch, without waiting for a mousemove. */
+  private lastPointer = { x: 0, y: 0, has: false };
 
   constructor() {
     // Esc precedence — same e.target guards as the phone (#31) and
@@ -489,6 +620,16 @@ class RoomEditController {
         this.setAddDoorMode(false);
         return;
       }
+      // 🪟 #80 S4: ditto an armed add-window sub-mode.
+      if (this.addWindowMode) {
+        this.setAddWindowMode(false);
+        return;
+      }
+      // 🖼️ #80 S6: ditto an armed wallpaper sub-mode.
+      if (this.wallpaperMode) {
+        this.setWallpaperMode(false);
+        return;
+      }
       this.exit();
     });
 
@@ -497,6 +638,44 @@ class RoomEditController {
       if (!this.active || !this.carrying) return;
       e.preventDefault();
       this.cancelCarry(true);
+    });
+
+    // 🪟 #80 S4: [ / ] cycle the active window surface while add-window is armed.
+    window.addEventListener('keydown', (e) => {
+      if (!this.active || !this.addWindowMode) return;
+      if (e.key !== '[' && e.key !== ']') return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      e.preventDefault();
+      this.cycleWindowSurface(e.key === ']' ? 1 : -1);
+    });
+
+    // 🪟 #80 S4/resize: , . resize width · ↑ ↓ resize height · F re-apply auto-fit.
+    // Active while ADD-window is armed (resizes the ghost) OR a window is selected
+    // (resizes it live). Bare , . only — Shift+, . is the camera-rotation chord.
+    window.addEventListener('keydown', (e) => {
+      if (!this.active) return;
+      const armed = this.addWindowMode;
+      const selWin = !!this.selectedId && this.windowIds.has(this.selectedId);
+      if (!armed && !selWin) return;
+      let dw = 0;
+      let dh = 0;
+      let auto = false;
+      if (e.key === ',' && !e.shiftKey) dw = -WINDOW_RESIZE_STEP;
+      else if (e.key === '.' && !e.shiftKey) dw = WINDOW_RESIZE_STEP;
+      else if (e.key === 'ArrowUp') dh = WINDOW_RESIZE_STEP;
+      else if (e.key === 'ArrowDown') dh = -WINDOW_RESIZE_STEP;
+      else if (e.key === 'f' || e.key === 'F') auto = true;
+      else return;
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      e.preventDefault();
+      if (armed) {
+        if (auto) this.resetGhostAuto();
+        else this.resizeGhost(dw, dh);
+      } else {
+        this.resizeSelectedWindow(dw, dh, auto);
+      }
     });
 
     // E3: R rotates the carried item a quarter-turn CCW (cheap on the
@@ -599,9 +778,17 @@ class RoomEditController {
     // 🚪 #28 S6b: the ＋ DOOR affordance is interior-scope only (doors live on the
     // room walls, not the hull margin).
     if (scope !== 'hull') this.showAddDoorButton();
+    // 🪟 #80 S4: the ＋ WINDOW affordance rides the octagon-hull preview only
+    // (windows are holes in the octagon side walls) and is interior-scope.
+    if (scope !== 'hull' && OCTAGON_HULL) this.showAddWindowButton();
+    // 🖼️ #80 S6: the 🖼 WALLPAPER affordance is octagon-only + interior-scope too.
+    if (scope !== 'hull' && OCTAGON_HULL) {
+      this.wallpaperEligible = true;
+      this.showWallpaperButton();
+    }
     showHint(scope === 'hull'
       ? 'HULL EDIT — drag tanks/engines onto the walls or each other · stacks cap at 3 · X removes · DONE EDITING (or ESC) exits'
-      : 'EDIT MODE — click furniture or a door to select · ＋ DOOR adds · X removes · DONE EDITING (or ESC) exits', 4000);
+      : `EDIT MODE — click furniture / a door${OCTAGON_HULL ? ' / a window' : ''} to select · ＋ DOOR${OCTAGON_HULL ? ' / ＋ WINDOW / 🖼 WALLPAPER' : ''} · X removes · DONE EDITING (or ESC) exits`, 4000);
   }
 
   /** Leave edit mode: restore every tint, hide grid + label, detach hover. */
@@ -609,11 +796,17 @@ class RoomEditController {
     if (!this.active) return;
     this.cancelCarry(false); // E3: never exit with an item in hand
     this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
+    this.setAddWindowMode(false); // 🪟 #80 S4: drop any armed add-window sub-mode
+    this.setWallpaperMode(false); // 🖼️ #80 S6: drop any armed wallpaper sub-mode
+    this.wallpaperEligible = false;
     this.setHovered(null);
     this.setSelected(null);
     this.hideExitButton();
     this.hideAddDoorButton();
+    this.hideAddWindowButton();
+    this.hideWallpaperButton();
     this.disposeDoorGhost(); // 🚪 #28 S6b/ghost: no leaked preview after the session
+    this.disposeWindowGhost(); // 🪟 #80 S4/ghost: ditto the window preview
     window.removeEventListener('mousemove', this.onMouseMove);
     this.setCanvasCursor('');
     // 🛰️ Undo the hull-scope presentation before the world reference drops.
@@ -632,6 +825,7 @@ class RoomEditController {
     this.meshToItem.clear();
     this.itemMeshes.clear();
     this.doorIds.clear();
+    this.windowIds.clear();
     this.savedEmissive.clear();
     this.world = null;
     this.active = false;
@@ -680,12 +874,25 @@ class RoomEditController {
       return;
     }
 
+    // 🪟 #80 S4: ADD-window sub-mode consumes the next canvas click to PLACE a
+    // window at the (snapped) clicked side-wall point, instead of selecting.
+    if (this.addWindowMode) {
+      const canvas = window.gameRenderer?.renderer?.domElement;
+      if (canvas && event.target !== canvas) return;
+      this.tryPlaceWindowAt(event.clientX, event.clientY);
+      return;
+    }
+
     const hit = this.pickItemAt(event.clientX, event.clientY);
     if (hit && hit === this.selectedId) {
       this.beginCarry(hit);
       return;
     }
     this.setSelected(hit);
+    // 🪟 #80 S4/resize: advertise the resize keys when a window is selected.
+    if (hit && this.windowIds.has(hit)) {
+      showHint('Window selected — , . / ↑ ↓ resize · F auto-fit · X removes', 3000);
+    }
   }
 
   /**
@@ -724,6 +931,7 @@ class RoomEditController {
     this.meshToItem.clear();
     this.itemMeshes.clear();
     this.doorIds.clear();
+    this.windowIds.clear();
     for (const item of FURNITURE) {
       if (!item.movable) continue;
       const group = world.furnitureGroups.get(item.id);
@@ -739,6 +947,7 @@ class RoomEditController {
       this.itemMeshes.set(item.id, meshes);
     }
     this.indexDoorGroups(world);
+    this.indexWindowGroups(world);
   }
 
   /**
@@ -806,15 +1015,90 @@ class RoomEditController {
     }
   }
 
-  /** True when `id` is an indexed furniture item or door. */
+  /**
+   * 🪟 #80 S4: add every window click-box to the raycast index (the box is
+   * invisible until hovered/selected but always raycasts). Kept SEPARATE from
+   * the furniture/door loops so onWindowLayoutChanged can rebuild just this
+   * slice after an add/remove. Window ids land in `windowIds` so select / hover
+   * / remove branch to the window path.
+   */
+  private indexWindowGroups(world: World): void {
+    for (const [windowId, group] of world.getWindowGroups()) {
+      const meshes: THREE.Mesh[] = [];
+      group.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          meshes.push(obj);
+          this.meshToItem.set(obj, windowId);
+          this.raycastTargets.push(obj);
+        }
+      });
+      this.itemMeshes.set(windowId, meshes);
+      this.windowIds.add(windowId);
+    }
+  }
+
+  /**
+   * 🪟 #80 S4: rebuild ONLY the window slice of the raycast index from the
+   * current window boxes — called by world.reconcileWindowLayout after a
+   * local/remote add/remove (the window doc observer fires it synchronously).
+   * The boxes are rebuilt FRESH (old geometry/material disposed), so this drops
+   * the stale slice then re-indexes; a surviving selected window re-asserts its
+   * highlight (its box was replaced). Mirrors onDoorLayoutChanged — the
+   * selection is NOT dropped on every edit.
+   */
+  public onWindowLayoutChanged(): void {
+    const world = this.world;
+    if (!this.active || !world) return;
+
+    // Drop the previous window slice (map entries only — handles already gone).
+    const windowMeshSet = new Set<THREE.Object3D>();
+    for (const id of this.windowIds) {
+      const meshes = this.itemMeshes.get(id);
+      if (meshes) for (const m of meshes) windowMeshSet.add(m);
+      this.itemMeshes.delete(id);
+    }
+    for (const m of windowMeshSet) this.meshToItem.delete(m);
+    this.raycastTargets = this.raycastTargets.filter((m) => !windowMeshSet.has(m));
+    this.windowIds.clear();
+
+    // Re-index the current window boxes.
+    this.indexWindowGroups(world);
+
+    // A hovered window that vanished lets go of its (disposed) handle; a
+    // surviving hovered window re-asserts its wash (its box was rebuilt fresh /
+    // un-washed, and the next setHovered would early-return on the unchanged id).
+    if (this.hoveredId && !this.isKnownId(this.hoveredId)) {
+      this.hoveredId = null;
+    } else if (
+      this.hoveredId &&
+      this.windowIds.has(this.hoveredId) &&
+      this.hoveredId !== this.selectedId
+    ) {
+      this.applyTint(this.hoveredId, HOVER_EMISSIVE, HOVER_INTENSITY);
+    }
+    // A surviving selected window re-asserts its highlight, and a selected window
+    // that was removed (gone from every index) drops its selection.
+    if (this.selectedId && this.windowIds.has(this.selectedId)) {
+      this.applyTint(this.selectedId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else if (
+      this.selectedId &&
+      !this.isKnownId(this.selectedId) &&
+      !world.furnitureGroups.has(this.selectedId)
+    ) {
+      this.setSelected(null);
+    }
+  }
+
+  /** True when `id` is an indexed furniture item, door or window. */
   private isKnownId(id: string): boolean {
     return this.itemMeshes.has(id);
   }
 
-  /** The 3D group for a furniture id or a door id (label anchor / bounds). */
+  /** The 3D group for a furniture / door / window id (label anchor / bounds). */
   private groupForId(id: string): THREE.Group | undefined {
     return this.world?.furnitureGroups.get(id)
-      ?? this.world?.dockingSystem?.getDoorGroups().get(id);
+      ?? this.world?.dockingSystem?.getDoorGroups().get(id)
+      ?? this.world?.getWindowGroups().get(id);
   }
 
   /** Raycast the movable-furniture meshes at a screen point → item id | null. */
@@ -840,6 +1124,8 @@ class RoomEditController {
       // 🚪 #28 S6b/ghost: a door preview must not linger under a HUD panel —
       // hide it while the pointer is off the canvas.
       if (this.addDoorMode) this.hideDoorGhost();
+      // 🪟 #80 S4/ghost: ditto the window preview.
+      if (this.addWindowMode) this.hideWindowGhost();
       return;
     }
     // E3: while carrying, the pointer drives the held item, not hover.
@@ -854,6 +1140,14 @@ class RoomEditController {
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
       this.updateDoorGhostFromPointer(e.clientX, e.clientY);
+      return;
+    }
+    // 🪟 #80 S4: in ADD-window mode the pointer arms a placement — drive the
+    // translucent green/red window ghost that follows the side wall.
+    if (this.addWindowMode) {
+      this.setHovered(null);
+      this.setCanvasCursor('crosshair');
+      this.updateWindowGhostFromPointer(e.clientX, e.clientY);
       return;
     }
     this.setHovered(this.pickItemAt(e.clientX, e.clientY));
@@ -1101,6 +1395,14 @@ class RoomEditController {
       return;
     }
 
+    // 🪟 #80 S4: a WINDOW removal is its own short path — drop the layout record
+    // (the reconcile removes the hole + glass + click-box); no OBSTACLES / seat /
+    // inventory teardown, and no pairing gate (windows are passive).
+    if (this.windowIds.has(itemId)) {
+      this.removeSelectedWindow(itemId);
+      return;
+    }
+
     const item = FURNITURE.find((i) => i.id === itemId);
     if (!item) return;
     if (!item.movable) {
@@ -1344,6 +1646,283 @@ class RoomEditController {
     this.ghostDoor = null;
   }
 
+  // ── Window add / remove (#80 S4 — the window editor MVP) ────────────────────
+
+  /**
+   * 🪟 #80 S4: remove the SELECTED window from the shared layout. No pairing gate
+   * (windows are passive holes, unlike doors) and no seed-first hazard (windows
+   * have no defaults — an empty map means no windows). Restore its highlight +
+   * drop it from the index while its box still exists, then deleteWindowLayout();
+   * the doc observer's reconcile rebuilds the hull (hole + glass gone) + the
+   * click-boxes and re-runs onWindowLayoutChanged.
+   */
+  private removeSelectedWindow(windowId: string): void {
+    const world = this.world;
+    if (!world) return;
+
+    // Teardown BEFORE the delete disposes the box's material (setSelected(null)
+    // → clearTint hides the live box).
+    this.setSelected(null);
+    if (this.hoveredId === windowId) this.setHovered(null);
+    const meshes = this.itemMeshes.get(windowId) ?? [];
+    for (const mesh of meshes) this.meshToItem.delete(mesh);
+    this.itemMeshes.delete(windowId);
+    const meshSet = new Set<THREE.Object3D>(meshes);
+    this.raycastTargets = this.raycastTargets.filter((m) => !meshSet.has(m));
+    this.windowIds.delete(windowId);
+
+    deleteWindowLayout(windowId);
+    showHint(`Removed window ${windowId}.`, 2000);
+  }
+
+  /**
+   * 🪟 #80 S4: commit the ADD-window sub-mode at the GHOST's current spot. Like
+   * tryPlaceDoorAt, a click re-derives the ghost from the pointer (so a synthetic
+   * click with no preceding mousemove still commits AT the pointer) then writes
+   * the record. On success: writeWindowLayout with a fresh `w:`-prefixed id at the
+   * default size, and leave add-mode (hides the ghost). On failure: hint + STAY
+   * armed, keeping the red ghost so the owner can nudge to a clearer spot.
+   */
+  private tryPlaceWindowAt(clientX: number, clientY: number): void {
+    this.updateWindowGhostFromPointer(clientX, clientY);
+    const ghost = this.ghostWindow;
+    if (!ghost) return; // pointer wasn't over the surface plane
+    if (!ghost.verdict.ok) {
+      showHint(`CAN'T ADD WINDOW — ${ghost.verdict.reason}`, 2400);
+      return; // stay armed so the owner can nudge to a clearer spot
+    }
+
+    const size = this.ghostSize(); // manual override, else roof auto-fit
+    writeWindowLayout({
+      id: `w:${mintDoorId()}`, // a plain uuid; the `w:` marks a window record
+      surface: ghost.surface,
+      along: ghost.along,
+      across: ghost.across,
+      w: size.w,
+      h: size.h,
+      r: WINDOW_DEFAULT.r,
+      enabled: true,
+    });
+    this.setAddWindowMode(false); // hides the ghost
+    showHint(`Window added on ${SURFACE_LABEL[ghost.surface]} — look outside.`, 2200);
+  }
+
+  // ── Window ghost preview (#80 S4/ghost — furniture-like green/red follow) ────
+
+  /**
+   * Lazily build (once) the reusable translucent window ghost, parented to the
+   * SAME group the hull + click plane live in (platformGroup, via the click
+   * plane's parent — world-origin frame, so surfaceCenterWorld maps straight
+   * through). A default-sized box, coloured with the furniture carry's
+   * valid/invalid hexes; ORIENTED to the active surface each frame.
+   */
+  private ensureWindowGhost(): THREE.Mesh | null {
+    if (this.windowGhost) return this.windowGhost;
+    const parent = this.world?.getClickPlane()?.parent;
+    if (!parent) return null;
+    // local x=w along uDir, y=h along vDir, z=thickness along the surface normal
+    const size = this.ghostSize();
+    const geo = new THREE.BoxGeometry(size.w, size.h, WINDOW_BOX_THICKNESS);
+    this.windowGhostSize = { ...size };
+    const mat = new THREE.MeshBasicMaterial({
+      color: CARRY_VALID_EMISSIVE, // green; flipped red on invalid
+      transparent: true,
+      opacity: 0.4,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.visible = false;
+    mesh.renderOrder = 3; // draw over the wall/glass so the tint reads through
+    parent.add(mesh);
+    this.windowGhost = mesh;
+    return mesh;
+  }
+
+  /** Orient the ghost box to the ACTIVE surface's world frame (surfaceBasis). */
+  private orientWindowGhost(): void {
+    const ghost = this.windowGhost;
+    if (!ghost) return;
+    const { uDir, vDir, normal } = surfaceBasis(this.windowSurface);
+    ghost.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(uDir, vDir, normal));
+  }
+
+  /** The ghost/placement size: a manual override, else the surface's auto-fit. */
+  private ghostSize(): { w: number; h: number } {
+    return this.windowSizeOverride ?? autoWindowSize(this.windowSurface);
+  }
+
+  /** Rebuild the ghost box geometry when its size changes (surface auto-fit or a
+   *  manual resize). Roof panels auto-fit, so the ghost grows/shrinks per surface. */
+  private resizeWindowGhost(): void {
+    const ghost = this.windowGhost;
+    if (!ghost) return;
+    const size = this.ghostSize();
+    if (size.w === this.windowGhostSize.w && size.h === this.windowGhostSize.h) return;
+    ghost.geometry.dispose();
+    ghost.geometry = new THREE.BoxGeometry(size.w, size.h, WINDOW_BOX_THICKNESS);
+    this.windowGhostSize = { ...size };
+  }
+
+  // ── Manual resize (#80 S4/resize — keys ,/. width · ↑/↓ height · F auto-fit) ──
+
+  /** Adjust the ARMED ghost's manual size by (dw, dh), clamped to the surface's
+   *  limits, then re-pose. Sets windowSizeOverride so the committed window keeps it. */
+  private resizeGhost(dw: number, dh: number): void {
+    const base = this.ghostSize();
+    const lim = windowSizeLimits(this.windowSurface);
+    const w = clampNum(base.w + dw, WINDOW_MIN_SIZE, lim.maxW);
+    const h = clampNum(base.h + dh, WINDOW_MIN_SIZE, lim.maxH);
+    this.windowSizeOverride = { w, h };
+    this.resizeWindowGhost();
+    if (this.lastPointer.has) this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
+    else this.orientWindowGhost();
+    showHint(`Window ${w.toFixed(2)} × ${h.toFixed(2)} m · , . width · ↑ ↓ height · F auto-fit`, 1800);
+  }
+
+  /** F while arming: drop the override → back to the surface's auto-fit size. */
+  private resetGhostAuto(): void {
+    this.windowSizeOverride = null;
+    this.resizeWindowGhost();
+    if (this.lastPointer.has) this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
+    else this.orientWindowGhost();
+    const s = this.ghostSize();
+    showHint(`Auto-fit ${s.w.toFixed(2)} × ${s.h.toFixed(2)} m`, 1500);
+  }
+
+  /**
+   * Resize the SELECTED window by (dw, dh) — or re-apply auto-fit when `auto`.
+   * Updates the record's w/h (clamped to the surface) and re-clamps its
+   * along/across so a grown opening stays inside the strip, then writeWindowLayout
+   * → the reconcile re-renders the hull + click-box live (selection persists).
+   */
+  private resizeSelectedWindow(dw: number, dh: number, auto: boolean): void {
+    const id = this.selectedId;
+    if (!id || !this.windowIds.has(id)) return;
+    const rec = readAllWindowLayout().get(id);
+    if (!rec) return;
+    let w: number;
+    let h: number;
+    if (auto) {
+      ({ w, h } = autoWindowSize(rec.surface));
+    } else {
+      const lim = windowSizeLimits(rec.surface);
+      w = clampNum(rec.w + dw, WINDOW_MIN_SIZE, lim.maxW);
+      h = clampNum(rec.h + dh, WINDOW_MIN_SIZE, lim.maxH);
+    }
+    const along = clampWindowAlong(rec.along, w);
+    const across = clampWindowAcross(rec.surface, rec.across, h);
+    // Gate the resize the SAME way as placement: a grown window must still clear
+    // the other windows AND the doors on its wall (else '.' could grow it over a
+    // door / neighbour). On reject, keep the current size + hint the reason.
+    const verdict = validateWindowPlacement(rec.surface, along, across, w, h, id);
+    if (!verdict.ok) {
+      showHint(`Can't resize — ${verdict.reason}.`, 1800);
+      return;
+    }
+    if (this.world && !this.world.windowClearsDoors(rec.surface, along, w)) {
+      showHint("Can't resize — would overlap a door.", 1800);
+      return;
+    }
+    writeWindowLayout({ ...rec, w, h, along, across });
+    showHint(`Window ${w.toFixed(2)} × ${h.toFixed(2)} m${auto ? ' (auto-fit)' : ''}`, 1600);
+  }
+
+  /**
+   * Follow the pointer while add-window is armed: intersect the pointer ray with
+   * the ACTIVE surface's MATH PLANE (a plane raycast reaches every surface —
+   * incl. the horizontal ridge / floor — regardless of occlusion, which a
+   * geometry raycast can't under the fixed-iso, yaw-only camera). Decompose the
+   * hit into (along, across) via the surface basis, snap to the 1 m lattice,
+   * clamp, pose + orient the ghost, validate, tint green/red. Off the plane →
+   * hide. Stashes {surface, along, across, verdict} for the click commit.
+   */
+  private updateWindowGhostFromPointer(clientX: number, clientY: number): void {
+    const world = this.world;
+    const camera = window.gameRenderer?.camera;
+    if (!world || !camera) return;
+    const ghost = this.ensureWindowGhost();
+    if (!ghost) return;
+    this.lastPointer = { x: clientX, y: clientY, has: true };
+    this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
+    this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointerNdc, camera);
+
+    const surface = this.windowSurface;
+    const size = this.ghostSize(); // manual override, else roof auto-fit
+    this.resizeWindowGhost();
+    const { uDir, vDir, normal } = surfaceBasis(surface);
+    const a = surfaceCenterWorld(surface, 0, 0);
+    const anchor = this.windowAnchor.set(a.x, a.y, a.z);
+    const plane = this.windowPlane.setFromNormalAndCoplanarPoint(normal, anchor);
+    const hit = this.raycaster.ray.intersectPlane(plane, this.windowHit);
+    if (!hit) { this.hideWindowGhost(); return; } // ray parallel to the surface
+
+    const rel = hit.sub(anchor); // hit is windowHit; mutate in place
+    const along = clampWindowAlong(snapWindowAlong(rel.dot(uDir)), size.w);
+    const across = clampWindowAcross(surface, snapWindowAlong(rel.dot(vDir)), size.h);
+    const c = surfaceCenterWorld(surface, along, across);
+    ghost.position.set(c.x, c.y, c.z);
+    this.orientWindowGhost();
+    ghost.visible = true;
+
+    let verdict = validateWindowPlacement(surface, along, across, size.w, size.h);
+    // 🚪 A window on a side wall must clear the doors on that wall (checked
+    // against the ACTUAL door groups, so it's right even for odd door layouts).
+    if (verdict.ok && this.world && !this.world.windowClearsDoors(surface, along, size.w)) {
+      verdict = { ok: false, reason: 'overlaps a door' };
+    }
+    this.setWindowGhostColor(verdict.ok);
+    this.ghostWindow = { surface, along, across, verdict };
+  }
+
+  /** Flip the ghost between the furniture carry's green (valid) / red (invalid). */
+  private setWindowGhostColor(valid: boolean): void {
+    const mat = this.windowGhost?.material as THREE.MeshBasicMaterial | undefined;
+    if (mat) mat.color.setHex(valid ? CARRY_VALID_EMISSIVE : CARRY_INVALID_EMISSIVE);
+  }
+
+  /** Hide the reusable ghost (disarm / off-plane) — instance kept for re-arm. */
+  private hideWindowGhost(): void {
+    if (this.windowGhost) this.windowGhost.visible = false;
+    this.ghostWindow = null;
+  }
+
+  /** Fully tear down the window ghost (leaving edit mode). */
+  private disposeWindowGhost(): void {
+    if (this.windowGhost) {
+      this.windowGhost.parent?.remove(this.windowGhost);
+      this.windowGhost.geometry.dispose();
+      (this.windowGhost.material as THREE.Material).dispose();
+      this.windowGhost = null;
+    }
+    this.ghostWindow = null;
+  }
+
+  /**
+   * 🪟 #80 S4: a window's only per-id mesh is its (normally hidden) click-box, so
+   * highlight it by flipping that box's own translucent material on/off with the
+   * hover/select colour — the window analogue of a door's emissive tint.
+   * `intensity` doubles as the wash opacity (HOVER 0.28 / SELECT 0.65 read well);
+   * 0 clears it back to hidden. Routed here from applyTint/clearTint by windowId.
+   */
+  private setWindowBoxTint(id: string, hex: number, intensity: number): void {
+    const group = this.world?.getWindowGroups().get(id);
+    if (!group) return;
+    group.traverse((o) => {
+      if (!(o instanceof THREE.Mesh)) return;
+      const m = o.material as THREE.MeshBasicMaterial;
+      if (intensity <= 0) {
+        m.visible = false;
+        m.opacity = 0;
+        return;
+      }
+      m.color.setHex(hex);
+      m.opacity = Math.min(0.6, intensity);
+      m.visible = true;
+    });
+  }
+
   /** Validate the current candidate against live player positions. */
   private currentCarryVerdict(): PlacementVerdict {
     const c = this.carrying;
@@ -1483,6 +2062,8 @@ class RoomEditController {
    * but guard anyway (#27's shared-material lesson).
    */
   private applyTint(itemId: string, emissive: number, intensity: number): void {
+    // 🪟 #80 S4: windows have no emissive mesh — highlight their click-box wash.
+    if (this.windowIds.has(itemId)) { this.setWindowBoxTint(itemId, emissive, intensity); return; }
     const meshes = this.itemMeshes.get(itemId);
     if (!meshes) return;
     const touched = new Set<THREE.Material>();
@@ -1504,6 +2085,8 @@ class RoomEditController {
 
   /** Restore the exact saved emissive state of every material of an item. */
   private clearTint(itemId: string): void {
+    // 🪟 #80 S4: a window's highlight lives on its click-box — hide it again.
+    if (this.windowIds.has(itemId)) { this.setWindowBoxTint(itemId, 0, 0); return; }
     const meshes = this.itemMeshes.get(itemId);
     if (!meshes) return;
     for (const mesh of meshes) {
@@ -1562,11 +2145,12 @@ class RoomEditController {
    * (hidden), matching the "button hidden, not disabled" rule.
    */
   private syncRemoveButton(): void {
-    // 🚪 #28 S6b: a selected DOOR shows the REMOVE button too (movable furniture
-    // OR any door — the two selectable classes in the index).
+    // 🚪 #28 S6b / 🪟 #80 S4: a selected DOOR or WINDOW shows the REMOVE button
+    // too (movable furniture OR any door OR any window — the selectable classes).
     const isDoor = this.selectedId ? this.doorIds.has(this.selectedId) : false;
+    const isWindow = this.selectedId ? this.windowIds.has(this.selectedId) : false;
     const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;
-    const show = this.active && !this.carrying && (isDoor || (!!item && item.movable));
+    const show = this.active && !this.carrying && (isDoor || isWindow || (!!item && item.movable));
     if (!this.removeBtnEl) {
       if (!show) return;
       this.removeBtnEl = document.createElement('button');
@@ -1728,6 +2312,8 @@ class RoomEditController {
     }
     this.addDoorMode = on;
     if (on) {
+      this.setAddWindowMode(false); // 🪟 the add/wallpaper sub-modes are exclusive
+      this.setWallpaperMode(false); // 🖼️ #80 S6
       this.setSelected(null);
       this.setHovered(null);
       this.setCanvasCursor('crosshair');
@@ -1741,6 +2327,390 @@ class RoomEditController {
       this.hideDoorGhost();
     }
     this.syncAddDoorButton();
+  }
+
+  // ── ＋ WINDOW button + add-window sub-mode (#80 S4) ──────────────────────────
+
+  /**
+   * 🪟 #80 S4: the persistent ＋ WINDOW button (under ＋ DOOR). Toggles the
+   * add-window sub-mode; while armed its border/colour flip to green and the
+   * label reads ✕ CANCEL WINDOW. Only shown under the octagon-hull preview.
+   */
+  private showAddWindowButton(): void {
+    if (!this.addWindowBtnEl) {
+      this.addWindowBtnEl = document.createElement('button');
+      this.addWindowBtnEl.id = 'room-edit-add-window-btn';
+      this.addWindowBtnEl.type = 'button';
+      this.addWindowBtnEl.title = 'Add a window — then click a side wall to place it';
+      this.addWindowBtnEl.style.cssText = `
+        position: fixed;
+        top: 92px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 6px 18px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(155, 212, 232, 0.7);
+        border-radius: 8px;
+        color: #9bd4e8;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      this.addWindowBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.setAddWindowMode(!this.addWindowMode);
+      });
+      document.body.appendChild(this.addWindowBtnEl);
+    }
+    this.addWindowBtnEl.style.display = 'block';
+    this.syncAddWindowButton();
+  }
+
+  private hideAddWindowButton(): void {
+    if (this.addWindowBtnEl) this.addWindowBtnEl.style.display = 'none';
+  }
+
+  /** Reflect the armed/idle add-window state onto the ＋ WINDOW button. */
+  private syncAddWindowButton(): void {
+    const btn = this.addWindowBtnEl;
+    if (!btn) return;
+    if (this.addWindowMode) {
+      btn.textContent = '✕ CANCEL WINDOW';
+      btn.style.color = '#35d06a';
+      btn.style.borderColor = 'rgba(53, 208, 106, 0.85)';
+    } else {
+      btn.textContent = '＋ WINDOW';
+      btn.style.color = '#9bd4e8';
+      btn.style.borderColor = 'rgba(155, 212, 232, 0.7)';
+    }
+  }
+
+  /**
+   * 🪟 #80 S4: arm / disarm the add-window sub-mode. Arming disarms add-door (the
+   * two are exclusive), clears any selection (the next click PLACES) and shows
+   * the how-to hint; disarming restores the pointer cursor + hides the ghost.
+   */
+  private setAddWindowMode(on: boolean): void {
+    if (this.addWindowMode === on) {
+      this.syncAddWindowButton();
+      return;
+    }
+    this.addWindowMode = on;
+    if (on) {
+      this.setAddDoorMode(false); // 🚪 the add/wallpaper sub-modes are exclusive
+      this.setWallpaperMode(false); // 🖼️ #80 S6
+      // The window surface selector sits where the 🖼 WALLPAPER button lives —
+      // hide the button while armed so they don't overlap (restored on disarm).
+      this.hideWallpaperButton();
+      this.setSelected(null);
+      this.setHovered(null);
+      this.setCanvasCursor('crosshair');
+      this.ensureWindowGhost();
+      this.resizeWindowGhost(); // match the active surface's auto-fit size
+      this.orientWindowGhost();
+      this.showWindowSurfaceSelector();
+      showHint('ADD WINDOW — ◀ ▶ (or [ ]) surface · , . / ↑ ↓ resize · F auto-fit · move to aim · click to place · ＋/✕ cancel', 4600);
+    } else {
+      this.setCanvasCursor('');
+      this.hideWindowGhost();
+      this.hideWindowSurfaceSelector();
+      if (this.wallpaperEligible) this.showWallpaperButton(); // restore the 🖼 row
+      this.windowSizeOverride = null; // next arm starts at the surface auto-fit
+      // Drop the stale pointer sample so a re-arm + surface-cycle before the
+      // next mousemove doesn't re-pose the ghost to an old screen point.
+      this.lastPointer.has = false;
+    }
+    this.syncAddWindowButton();
+  }
+
+  // ── Window SURFACE selector (#80 S4 — reach all 8 strips) ───────────────────
+
+  /** The floating ◀ [surface] ▶ chip shown while add-window is armed. */
+  private windowSurfaceEl: HTMLDivElement | null = null;
+
+  private showWindowSurfaceSelector(): void {
+    if (!this.windowSurfaceEl) {
+      const bar = document.createElement('div');
+      bar.id = 'room-edit-window-surface';
+      bar.style.cssText = `
+        position: fixed;
+        top: 128px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 8px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(155, 212, 232, 0.6);
+        border-radius: 8px;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        color: #9bd4e8;
+        z-index: 4700;
+        white-space: nowrap;
+      `;
+      const mkArrow = (txt: string, delta: number): HTMLButtonElement => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = txt;
+        b.style.cssText = `
+          background: rgba(155, 212, 232, 0.14);
+          border: 1px solid rgba(155, 212, 232, 0.5);
+          border-radius: 5px;
+          color: #9bd4e8;
+          font: inherit;
+          padding: 2px 8px;
+          cursor: pointer;
+        `;
+        b.addEventListener('click', (e) => {
+          e.stopPropagation();
+          (e.currentTarget as HTMLButtonElement).blur();
+          this.cycleWindowSurface(delta);
+        });
+        return b;
+      };
+      const label = document.createElement('span');
+      label.id = 'room-edit-window-surface-label';
+      label.style.cssText = 'min-width: 120px; text-align: center;';
+      bar.appendChild(mkArrow('◀', -1));
+      bar.appendChild(label);
+      bar.appendChild(mkArrow('▶', 1));
+      document.body.appendChild(bar);
+      this.windowSurfaceEl = bar;
+    }
+    this.windowSurfaceEl.style.display = 'flex';
+    this.syncWindowSurfaceSelector();
+  }
+
+  private hideWindowSurfaceSelector(): void {
+    if (this.windowSurfaceEl) this.windowSurfaceEl.style.display = 'none';
+  }
+
+  private syncWindowSurfaceSelector(): void {
+    const label = document.getElementById('room-edit-window-surface-label');
+    if (label) label.textContent = SURFACE_LABEL[this.windowSurface];
+  }
+
+  /**
+   * Cycle the active window surface by `delta` (wraps). Re-orients the ghost and
+   * re-poses it at the last pointer position (so the preview jumps to the new
+   * surface immediately, no mousemove needed).
+   */
+  private cycleWindowSurface(delta: number): void {
+    const i = SURFACES.indexOf(this.windowSurface);
+    this.windowSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
+    this.windowSizeOverride = null; // each surface starts at its auto-fit size
+    this.syncWindowSurfaceSelector();
+    this.resizeWindowGhost(); // roof panels auto-fit → the ghost grows/shrinks
+    this.orientWindowGhost();
+    if (this.lastPointer.has) {
+      this.updateWindowGhostFromPointer(this.lastPointer.x, this.lastPointer.y);
+    }
+  }
+
+  // ── 🖼 WALLPAPER button + wall-covering sub-mode (#80 S6) ────────────────────
+
+  /**
+   * 🖼️ #80 S6: the persistent 🖼 WALLPAPER button (under ＋ WINDOW). Toggles the
+   * wall-covering sub-mode; while armed its border/colour flip to green and the
+   * label reads ✕ CANCEL WALLPAPER. Octagon-only + interior-scope.
+   */
+  private showWallpaperButton(): void {
+    if (!this.wallpaperBtnEl) {
+      this.wallpaperBtnEl = document.createElement('button');
+      this.wallpaperBtnEl.id = 'room-edit-wallpaper-btn';
+      this.wallpaperBtnEl.type = 'button';
+      this.wallpaperBtnEl.title = 'Re-skin a hull wall — pick a surface + covering';
+      this.wallpaperBtnEl.style.cssText = `
+        position: fixed;
+        top: 128px;
+        left: 50%;
+        transform: translateX(-50%);
+        padding: 6px 18px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(201, 163, 255, 0.7);
+        border-radius: 8px;
+        color: #c9a3ff;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        white-space: nowrap;
+        z-index: 4700;
+        cursor: pointer;
+      `;
+      this.wallpaperBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        (e.currentTarget as HTMLButtonElement).blur();
+        this.setWallpaperMode(!this.wallpaperMode);
+      });
+      document.body.appendChild(this.wallpaperBtnEl);
+    }
+    this.wallpaperBtnEl.style.display = 'block';
+    this.syncWallpaperButton();
+  }
+
+  private hideWallpaperButton(): void {
+    if (this.wallpaperBtnEl) this.wallpaperBtnEl.style.display = 'none';
+  }
+
+  /** Reflect the armed/idle wallpaper state onto the 🖼 WALLPAPER button. */
+  private syncWallpaperButton(): void {
+    const btn = this.wallpaperBtnEl;
+    if (!btn) return;
+    if (this.wallpaperMode) {
+      btn.textContent = '✕ CANCEL WALLPAPER';
+      btn.style.color = '#35d06a';
+      btn.style.borderColor = 'rgba(53, 208, 106, 0.85)';
+    } else {
+      btn.textContent = '🖼 WALLPAPER';
+      btn.style.color = '#c9a3ff';
+      btn.style.borderColor = 'rgba(201, 163, 255, 0.7)';
+    }
+  }
+
+  /**
+   * 🖼️ #80 S6: arm / disarm the wallpaper sub-mode. Arming disarms add-door /
+   * add-window (all exclusive), clears any selection and shows the surface +
+   * covering panel; a covering applies LIVE (writeWallpaper → the hull rebuilds
+   * via world.reconcileWallpaper). Disarming just hides the panel.
+   */
+  private setWallpaperMode(on: boolean): void {
+    if (this.wallpaperMode === on) {
+      this.syncWallpaperButton();
+      return;
+    }
+    this.wallpaperMode = on;
+    if (on) {
+      this.setAddDoorMode(false);
+      this.setAddWindowMode(false);
+      this.setSelected(null);
+      this.setHovered(null);
+      this.showWallpaperPanel();
+      showHint('WALLPAPER — ◀ ▶ pick a surface + covering · applies live · 🖼/✕ to cancel', 4200);
+    } else {
+      this.hideWallpaperPanel();
+    }
+    this.syncWallpaperButton();
+  }
+
+  /** The floating two-row panel (Surface / Covering) shown while armed. */
+  private wallpaperPanelEl: HTMLDivElement | null = null;
+
+  private showWallpaperPanel(): void {
+    if (!this.wallpaperPanelEl) {
+      const panel = document.createElement('div');
+      panel.id = 'room-edit-wallpaper-panel';
+      panel.style.cssText = `
+        position: fixed;
+        top: 164px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        padding: 6px 8px;
+        background: rgba(4, 8, 22, 0.94);
+        border: 1px solid rgba(201, 163, 255, 0.6);
+        border-radius: 8px;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        color: #c9a3ff;
+        z-index: 4700;
+        white-space: nowrap;
+      `;
+      const mkRow = (
+        tag: string,
+        labelId: string,
+        onArrow: (delta: number) => void,
+      ): HTMLDivElement => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; align-items: center; gap: 8px;';
+        const mkArrow = (txt: string, delta: number): HTMLButtonElement => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = txt;
+          b.style.cssText = `
+            background: rgba(201, 163, 255, 0.14);
+            border: 1px solid rgba(201, 163, 255, 0.5);
+            border-radius: 5px;
+            color: #c9a3ff;
+            font: inherit;
+            padding: 2px 8px;
+            cursor: pointer;
+          `;
+          b.addEventListener('click', (e) => {
+            e.stopPropagation();
+            (e.currentTarget as HTMLButtonElement).blur();
+            onArrow(delta);
+          });
+          return b;
+        };
+        const tagEl = document.createElement('span');
+        tagEl.textContent = tag;
+        tagEl.style.cssText = 'min-width: 62px; opacity: 0.75;';
+        const label = document.createElement('span');
+        label.id = labelId;
+        label.style.cssText = 'min-width: 120px; text-align: center;';
+        row.appendChild(tagEl);
+        row.appendChild(mkArrow('◀', -1));
+        row.appendChild(label);
+        row.appendChild(mkArrow('▶', 1));
+        return row;
+      };
+      panel.appendChild(
+        mkRow('Surface', 'room-edit-wp-surface', (d) => this.cycleWallpaperSurface(d)),
+      );
+      panel.appendChild(
+        mkRow('Covering', 'room-edit-wp-preset', (d) => this.cycleWallpaperPreset(d)),
+      );
+      document.body.appendChild(panel);
+      this.wallpaperPanelEl = panel;
+    }
+    this.wallpaperPanelEl.style.display = 'flex';
+    this.syncWallpaperPanel();
+  }
+
+  private hideWallpaperPanel(): void {
+    if (this.wallpaperPanelEl) this.wallpaperPanelEl.style.display = 'none';
+  }
+
+  /** The covering currently painted on the active surface (`plain` if none). */
+  private currentWallpaperPreset(): WallpaperPresetId {
+    return readAllWallpaper().get(this.wallpaperSurface) ?? 'plain';
+  }
+
+  private syncWallpaperPanel(): void {
+    const surfLabel = document.getElementById('room-edit-wp-surface');
+    if (surfLabel) surfLabel.textContent = SURFACE_LABEL[this.wallpaperSurface];
+    const presetLabel = document.getElementById('room-edit-wp-preset');
+    if (presetLabel) presetLabel.textContent = WALLPAPER_LABELS[this.currentWallpaperPreset()];
+  }
+
+  /** Cycle which surface we're re-skinning (wraps); reloads its covering label. */
+  private cycleWallpaperSurface(delta: number): void {
+    const i = SURFACES.indexOf(this.wallpaperSurface);
+    this.wallpaperSurface = SURFACES[(i + delta + SURFACES.length) % SURFACES.length];
+    this.syncWallpaperPanel();
+  }
+
+  /** Cycle the active surface's covering (wraps) and APPLY it live to the hull. */
+  private cycleWallpaperPreset(delta: number): void {
+    const cur = this.currentWallpaperPreset();
+    const i = WALLPAPER_PRESETS.indexOf(cur);
+    const next = WALLPAPER_PRESETS[(i + delta + WALLPAPER_PRESETS.length) % WALLPAPER_PRESETS.length];
+    writeWallpaper(this.wallpaperSurface, next); // → world.reconcileWallpaper rebuilds
+    this.syncWallpaperPanel();
   }
 
   /** Reproject the label (above) + REMOVE button (below) every frame. */

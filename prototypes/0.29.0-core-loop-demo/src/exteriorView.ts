@@ -32,9 +32,25 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
-import { atlasLayout } from "./stationAtlas";
-import { projectionPoseForDoor } from "./adapter";
+import { atlasLayout, readAtlas } from "./stationAtlas";
+import type { AtlasDoor } from "./stationAtlas";
+import {
+  projectionPoseForDoor,
+  buildConnectorChain,
+  buildVestibule,
+  setVestibuleOpacity,
+} from "./adapter";
+import type { VestibuleDoorId } from "./adapter";
 import type { DoorId } from "./doors";
+import { buildOctagonShell } from "./octagonHull";
+import { collectWindowOpenings } from "./windowLayout";
+import { roomHalfExtents } from "./floorPlanDoc";
+
+/** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
+ *  (the new cross-section) instead of the flat box. Now the DEFAULT — disable
+ *  with `?octagon=0`; same flag world.ts reads for the interior barrel. */
+const OCTAGON_HULL =
+  new URLSearchParams(window.location.search).get("octagon") !== "0";
 
 const HULL = 0x39445a;
 const HULL_DARK = 0x2a3444;
@@ -124,6 +140,17 @@ function buildGroup(): THREE.Group {
   const g = new THREE.Group();
   g.name = "exteriorView";
 
+  // 🛑📐 #80: FROM SPACE the current module reads as an OCTAGON shell when the
+  // preview flag is on. We skip the flat roof plating + dome/antennas/solar
+  // dress (all authored for a flat 4.14 roof); dock collars + real exterior
+  // items below stay put.
+  if (OCTAGON_HULL) {
+    const { halfX, halfZ } = roomHalfExtents();
+    // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
+    // exterior barrel (neighbour shells below stay windowless — other modules'
+    // windows aren't loaded here, by design).
+    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings()).group);
+  } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
   box(g, 11.8, 0.28, 11.8, HULL, 0, 4.14, 0);
@@ -213,6 +240,7 @@ function buildGroup(): THREE.Group {
     panel.position.set(p.x, 4.28, p.z);
     g.add(panel);
   }
+  } // end !OCTAGON_HULL current-module dress
 
   // 🔌 IDA-style docking collars at adapter doors (#67 D2 — built to the
   // owner's pixel-art reference): white soft-goods torus, black capture
@@ -368,50 +396,113 @@ function buildGroup(): THREE.Group {
         seed: pose.seed ?? "",
         label: pose.name,
       };
-      const hullMat = new THREE.MeshStandardMaterial({
-        color: 0x3a4556,
-        roughness: 0.7,
-        metalness: 0.4,
-        transparent: true,
-        opacity: 0.82,
-      });
-      const body = new THREE.Mesh(
-        new THREE.BoxGeometry(11.8, 4.0, 11.8),
-        hullMat,
-      );
-      body.position.y = 2.0;
-      mod.add(body);
-      const roof = new THREE.Mesh(
-        new THREE.BoxGeometry(11.8, 0.24, 11.8),
-        new THREE.MeshStandardMaterial({
-          color: 0x2f3a4c,
-          roughness: 0.6,
-          metalness: 0.5,
+      if (OCTAGON_HULL) {
+        // 🛑📐 #80: neighbours read as translucent octagon shells too — at their
+        // TRUE size when the atlas learned it (visited rooms gossip dims), else
+        // the default 2×2 (matches today's 11.8 box). Click-to-connect userData
+        // stays on `mod`.
+        const nd = pose.dims ?? { cols: 2, rows: 2 };
+        mod.add(
+          buildOctagonShell(
+            { halfX: nd.cols * 3, halfZ: nd.rows * 3 },
+            { opacity: 0.82 },
+          ).group,
+        );
+      } else {
+        const hullMat = new THREE.MeshStandardMaterial({
+          color: 0x3a4556,
+          roughness: 0.7,
+          metalness: 0.4,
           transparent: true,
-          opacity: 0.85,
-        }),
-      );
-      roof.position.y = 4.12;
-      mod.add(roof);
-      // Amber corner clamps echo the live hull's look at a glance.
-      for (const sx of [-1, 1])
-        for (const sz of [-1, 1]) {
-          const clamp = new THREE.Mesh(
-            new THREE.BoxGeometry(0.45, 0.18, 0.45),
-            new THREE.MeshStandardMaterial({
-              color: ACCENT,
-              roughness: 0.6,
-              metalness: 0.4,
-              transparent: true,
-              opacity: 0.9,
-            }),
-          );
-          clamp.position.set(sx * 5.4, 4.3, sz * 5.4);
-          mod.add(clamp);
-        }
+          opacity: 0.82,
+        });
+        const body = new THREE.Mesh(
+          new THREE.BoxGeometry(11.8, 4.0, 11.8),
+          hullMat,
+        );
+        body.position.y = 2.0;
+        mod.add(body);
+        const roof = new THREE.Mesh(
+          new THREE.BoxGeometry(11.8, 0.24, 11.8),
+          new THREE.MeshStandardMaterial({
+            color: 0x2f3a4c,
+            roughness: 0.6,
+            metalness: 0.5,
+            transparent: true,
+            opacity: 0.85,
+          }),
+        );
+        roof.position.y = 4.12;
+        mod.add(roof);
+        // Amber corner clamps echo the live hull's look at a glance.
+        for (const sx of [-1, 1])
+          for (const sz of [-1, 1]) {
+            const clamp = new THREE.Mesh(
+              new THREE.BoxGeometry(0.45, 0.18, 0.45),
+              new THREE.MeshStandardMaterial({
+                color: ACCENT,
+                roughness: 0.6,
+                metalness: 0.4,
+                transparent: true,
+                opacity: 0.9,
+              }),
+            );
+            clamp.position.set(sx * 5.4, 4.3, sz * 5.4);
+            mod.add(clamp);
+          }
+      }
       mod.position.set(pose.x, 0, pose.z);
       mod.rotation.y = pose.rotY;
       g.add(mod);
+    }
+
+    // 🔗 #80: draw EVERY known connection in the atlas — the FULL ring, not
+    // just the current room's. world.ts already renders the current room's own
+    // paired-door tubes at level 3, and the reverse of one of those is the SAME
+    // physical tube, so we skip any edge touching the current room and dedupe
+    // each remaining neighbour↔neighbour link. The chain is built in the FROM
+    // module's local frame (buildConnectorChain / straight gangway fallback)
+    // and wrapped at that module's world pose. (Uses the current room's slide
+    // deltas + wall extents for the chain frame — a preview approximation that
+    // reads fine for same-size modules.)
+    const atlas = readAtlas();
+    const poseByRoom = new Map<
+      string,
+      { x: number; z: number; rotY: number }
+    >();
+    poseByRoom.set(currentRoomId, { x: 0, z: 0, rotY: 0 });
+    for (const p of poses)
+      poseByRoom.set(p.roomId, { x: p.x, z: p.z, rotY: p.rotY });
+    const drawnEdges = new Set<string>();
+    for (const [fromId, entry] of Object.entries(atlas)) {
+      const fromPose = poseByRoom.get(fromId);
+      if (!fromPose) continue; // module not placed in this layout
+      for (const [doorId, door] of Object.entries(entry.doors) as Array<
+        [VestibuleDoorId, AtlasDoor | undefined]
+      >) {
+        const toId = door?.targetRoomId;
+        if (!door || !toId || !poseByRoom.has(toId)) continue;
+        // world draws every current-room tube (and the reverse is the same one)
+        if (fromId === currentRoomId || toId === currentRoomId) continue;
+        const key = fromId < toId ? `${fromId}|${toId}` : `${toId}|${fromId}`;
+        if (drawnEdges.has(key)) continue;
+        drawnEdges.add(key);
+        const chain =
+          door.segments && door.segments.length > 0
+            ? buildConnectorChain(doorId, door.segments)
+            : buildVestibule(doorId);
+        // Not editable from the atlas — the bend editor targets the CURRENT
+        // room's chain, so clear the flag its click-routing keys on.
+        (chain.userData as { isConnectorChain?: boolean }).isConnectorChain =
+          false;
+        setVestibuleOpacity(chain, 1.0);
+        const wrap = new THREE.Group();
+        wrap.name = `atlasConnector-${fromId}-${doorId}`;
+        wrap.add(chain);
+        wrap.position.set(fromPose.x, 0, fromPose.z);
+        wrap.rotation.y = fromPose.rotY;
+        g.add(wrap);
+      }
     }
   }
 
@@ -446,13 +537,17 @@ function buildGroup(): THREE.Group {
 function disposeGroup(g: THREE.Group): void {
   const seen = new Set<THREE.BufferGeometry | THREE.Material>();
   g.traverse((o) => {
-    const mesh = o as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    if (mesh.geometry && !seen.has(mesh.geometry)) {
-      seen.add(mesh.geometry);
-      mesh.geometry.dispose();
+    // Meshes AND LineSegments (the octagon-shell seam outline) carry
+    // geometry/material — dispose either.
+    const drawable = o as THREE.Mesh & THREE.LineSegments;
+    const geo = drawable.geometry as THREE.BufferGeometry | undefined;
+    if (geo && !seen.has(geo)) {
+      seen.add(geo);
+      geo.dispose();
     }
-    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const matField = drawable.material as THREE.Material | THREE.Material[] | undefined;
+    if (!matField) return;
+    const mats = Array.isArray(matField) ? matField : [matField];
     for (const m of mats)
       if (m && !seen.has(m)) {
         seen.add(m);

@@ -87,12 +87,14 @@ import {
   readDoorPolicy,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
-import { bindFloorPlan, subscribeFloorPlan } from "./floorPlanDoc";
+import { bindFloorPlan, subscribeFloorPlan, readRoomDims } from "./floorPlanDoc";
 import {
   bindDoorLayoutDoc,
   seedDoorLayoutDefaults,
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
+import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
+import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
   bindRoomRoles,
   subscribeRoomRoles,
@@ -1138,6 +1140,10 @@ async function joinRoomAtEpoch(
   // world.reconcileDoorLayout runs immediately (a joiner sees the host's door
   // set); an unseeded room keeps the local cardinal defaults.
   bindDoorLayoutDoc(sync.doc);
+  // 🪟 #80: window layout syncs the same way (rebinds per join at the T0 seam).
+  bindWindowLayoutDoc(sync.doc);
+  // 🖼️ #80 S6: wall coverings (surface → wallpaper preset) ride the doc too.
+  bindWallpaperLayoutDoc(sync.doc);
 
   // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
   harvestStationAtlas();
@@ -1241,10 +1247,16 @@ async function joinRoomAtEpoch(
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
     // tanks appear in the exterior as fittings land inside).
     subscribeFurniture(() => refreshExteriorView());
+    // 🪟 #80 S4: window changes recut the CURRENT room's exterior shell (holes +
+    // glass) while at zoom 3 — refreshExteriorView early-returns off-level.
+    subscribeWindowLayout(() => refreshExteriorView());
     // 🗺️ #62 P5: door changes update the atlas + the whole-station render.
     subscribeDoors(() => {
       harvestStationAtlas();
       refreshExteriorView();
+      // 🛑🛰️ #80 S5: the local room's own edges just changed the atlas → re-pose
+      // the station-through-the-window shells (they depend only on the atlas).
+      world?.refreshFpNeighbourShells();
     });
     // The exterior's atlas walk starts from the CURRENT room.
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
@@ -1253,7 +1265,11 @@ async function joinRoomAtEpoch(
     subscribeExterior(() => refreshExteriorView());
     // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
     // in live as the doc syncs (usually within the first second of joining).
-    subscribeSharedAtlas(() => refreshExteriorView());
+    subscribeSharedAtlas(() => {
+      refreshExteriorView();
+      // 🛑🛰️ #80 S5: … and the station-through-the-window shells fill in with it.
+      world?.refreshFpNeighbourShells();
+    });
     setExteriorOwnerCheck(() => {
       const ownerVal =
         (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
@@ -2389,7 +2405,7 @@ function harvestStationAtlas(): void {
       farDoor: r.farDoor,
       farYawDeg: r.farYawDeg,
     }));
-  harvestIntoAtlas({ roomId, name, seed, doors });
+  harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
   pushAtlasToDoc();
