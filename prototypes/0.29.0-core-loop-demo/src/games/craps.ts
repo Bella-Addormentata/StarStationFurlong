@@ -73,10 +73,33 @@ export interface CrapsTableState {
    *  legacy/betting states ⇒ treated as false. The shooter-hand NETTING boundary
    *  (see the Chia backend plan) and the "new shooter" narration read it. */
   sevenOut?: boolean;
+  /** 🎲🔒 How this roll's dice were produced + its verifiable transcript (absent
+   *  for 'rng'). Settled rolls only; lets any client re-derive and check the dice. */
+  fairness?: FairnessTranscript;
   /** 🤖 auto-stickman: absolute operator-clock ms at which THIS phase advances
    *  (the operator's Date.now() is the reference; everyone else's countdown is
    *  display-only). Absent ⇒ a manual/idle table with no timer. */
   phaseDeadline?: number;
+}
+
+/** Which fairness scheme produced a table's dice (see diceFairness.ts). All four
+ *  coexist in dev; switch via `setCrapsFairnessMode` / the per-table pref. */
+export type FairnessMode = 'rng' | 'commit-reveal' | 'multiparty' | 'block-beacon';
+
+/** Public, verifiable transcript of HOW a settled roll's dice were produced —
+ *  stored on the settled state so any client can re-derive and check them.
+ *  Absent for 'rng' (no proof possible). `simulated` = dev-phase entropy/beacon
+ *  generated locally: the mechanism is real and verifiable, but the trust
+ *  property (independent parties / a real chain beacon) is not yet wired. */
+export interface FairnessTranscript {
+  mode: FairnessMode;
+  /** commit-reveal / multiparty: each party's H(seed); block-beacon: [houseCommit]. */
+  commits?: string[];
+  /** the revealed seeds (commit-reveal / multiparty), or [houseSeed] (block-beacon). */
+  seeds?: string[];
+  /** block-beacon: the block hash the dice mixed in. */
+  beacon?: string;
+  simulated?: boolean;
 }
 
 export function initialCrapsState(): CrapsTableState {
@@ -121,6 +144,7 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     && typeof s.resultAt === 'number'
     && (s.payouts === null || typeof s.payouts === 'object')
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
+    && (s.fairness === undefined || (typeof s.fairness === 'object' && s.fairness !== null))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
 }

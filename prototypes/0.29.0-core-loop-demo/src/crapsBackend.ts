@@ -30,11 +30,15 @@ import {
   creditChips,
   readAllCrapsBets,
   readCrapsBackendPref,
+  readCrapsFairnessPref,
   writeCrapsTableState,
   writeMyCrapsBets,
 } from './casinoDoc';
 import type { CrapsBackendKind } from './casinoDoc';
 import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
+// 🎲🔀 The dice-fairness mode drives HOW the roll is produced (rng / commit-reveal
+// / multiparty / block-beacon) — switchable per table; see games/diceFairness.ts.
+import { getCrapsFairnessMode, produceRoll } from './games/diceFairness';
 
 export type { CrapsBackendKind };
 
@@ -46,29 +50,21 @@ export interface CrapsBackend {
    *  chia-gaming are wired — the selector falls back to local when false. */
   isAvailable(): boolean;
   /**
-   * Produce the roll, resolve every player's wagers, publish the settled table
-   * state, credit winners, and prune each felt. Same contract as the shipped
-   * rollAndSettleCraps: `autoShowMs` set ⇒ auto-open the next window on a timer;
-   * absent ⇒ the manual house clicks NEXT ROLL. Returns the two dice.
+   * Produce the roll (via the table's fairness mode), resolve every player's
+   * wagers, publish the settled table state, credit winners, and prune each felt.
+   * `autoShowMs` set ⇒ auto-open the next window on a timer; absent ⇒ the manual
+   * house clicks NEXT ROLL. ASYNC — the fairness modes hash (SubtleCrypto); the
+   * dispatcher (crapsCroupier.rollAndSettleCraps) guards against re-entry.
    */
   rollAndSettle(
     tableId: string,
     round: number,
     pointBefore: number | null,
     autoShowMs?: number,
-  ): [number, number];
+  ): Promise<[number, number]>;
 }
 
-// ── Local backend — crypto RNG + room-doc chips (the shipped behaviour) ───────
-
-/** One fair die 1–6 via rejection sampling (no modulo bias). */
-function rollDie(): number {
-  const buf = new Uint32Array(1);
-  for (;;) {
-    crypto.getRandomValues(buf);
-    if (buf[0] < 4294967292) return (buf[0] % 6) + 1; // floor(2^32/6)*6
-  }
-}
+// ── Local backend — the selected fairness mode + room-doc chips ───────────────
 
 class LocalCrapsBackend implements CrapsBackend {
   readonly kind = 'local' as const;
@@ -78,14 +74,17 @@ class LocalCrapsBackend implements CrapsBackend {
     return true;
   }
 
-  rollAndSettle(
+  async rollAndSettle(
     tableId: string,
     round: number,
     pointBefore: number | null,
     autoShowMs?: number,
-  ): [number, number] {
-    const d1 = rollDie();
-    const d2 = rollDie();
+  ): Promise<[number, number]> {
+    // HOW the dice are produced is the table's fairness mode (rng / commit-reveal
+    // / multiparty / block-beacon), per-table override or the global default.
+    const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
+    const { dice, transcript } = await produceRoll(mode, tableId, round);
+    const [d1, d2] = dice;
     const sum = d1 + d2;
     const { payouts, remaining } = resolveCrapsRound(
       readAllCrapsBets(tableId),
@@ -104,6 +103,7 @@ class LocalCrapsBackend implements CrapsBackend {
       resultAt: now,
       payouts,
       sevenOut: shooterHandOver(pointBefore, sum),
+      ...(transcript ? { fairness: transcript } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
@@ -137,7 +137,7 @@ class ChiaCrapsBackend implements CrapsBackend {
     return chiaBridge() !== null;
   }
 
-  rollAndSettle(): [number, number] {
+  async rollAndSettle(): Promise<[number, number]> {
     // Eventual flow (brainstorming/craps-chia-backend-plan.md §3–§4):
     //   1. Reveal the house seed committed at roll-open; combine with the target
     //      block hash beacon → the shared dice (identical for every channel).

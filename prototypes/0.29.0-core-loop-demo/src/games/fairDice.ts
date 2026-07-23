@@ -79,7 +79,18 @@ export async function deriveDice(
   tableId: string,
   round: number,
 ): Promise<[number, number]> {
-  const base = `ssf-craps-dice-v1|${seedHex}|${beaconHex}|${tableId}|${round}`;
+  return diceFromMaterial(`ssf-craps-dice-v1|${seedHex}|${beaconHex}|${tableId}|${round}`);
+}
+
+/**
+ * Two unbiased dice (each 1–6) DETERMINISTICALLY from an arbitrary domain string
+ * — the shared extraction behind every fairness mode (block-beacon derivation and
+ * the commit-reveal / multiparty seed-combination in diceFairness.ts). Rejection
+ * sampling removes modulo bias; re-hashes with an incrementing block counter if a
+ * hash block is exhausted. Same `base` ⇒ same dice, which is what makes any mode's
+ * roll publicly verifiable.
+ */
+export async function diceFromMaterial(base: string): Promise<[number, number]> {
   const dice: number[] = [];
   let block = 0;
   let bytes = await sha256Bytes(`${base}|${block++}`);

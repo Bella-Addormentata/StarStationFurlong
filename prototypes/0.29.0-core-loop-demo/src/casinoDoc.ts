@@ -40,7 +40,7 @@ import * as Y from 'yjs';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { isCrapsBet, isCrapsTableState } from './games/craps';
-import type { CrapsBet, CrapsTableState } from './games/craps';
+import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -338,6 +338,28 @@ export function writeCrapsBackendPref(tableId: string, kind: CrapsBackendKind): 
   });
 }
 
+// 🎲🔀 Per-table dice-fairness MODE override (dev phase, plan §fairness modes) —
+// which strategy produces this table's dice (see games/diceFairness.ts). Owner-set
+// + synced so every client agrees. Absent ⇒ the global default (getCrapsFairnessMode).
+
+const FAIRNESS_MODES: readonly FairnessMode[] = [
+  'rng', 'commit-reveal', 'multiparty', 'block-beacon',
+];
+
+export function readCrapsFairnessPref(tableId: string): FairnessMode | null {
+  const v = ensureMap().get(`cfg:fairness:${tableId}`);
+  return typeof v === 'string' && (FAIRNESS_MODES as readonly string[]).includes(v)
+    ? (v as FairnessMode)
+    : null;
+}
+
+export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`cfg:fairness:${tableId}`, mode);
+  });
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing.
 (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
@@ -346,4 +368,5 @@ export function writeCrapsBackendPref(tableId: string, kind: CrapsBackendKind): 
   readCroupierBeat, writeCroupierBeat,
   readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
   readCrapsBackendPref, writeCrapsBackendPref,
+  readCrapsFairnessPref, writeCrapsFairnessPref,
 };

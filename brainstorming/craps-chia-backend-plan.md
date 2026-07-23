@@ -90,6 +90,44 @@ labelled *dev* beacon until the node exposes a real block `header_hash`. That
 alone gives "the house can't change the dice after bets" verifiability with no
 chain dependency; the block beacon then removes house foreknowledge.
 
+## 0c. Instant fairness — the mode menu (BUILT + switchable, 2026-07-23)
+
+The block beacon (§3b) is trustless but ~1 block slow. The owner asked whether we
+can produce fair dice *instantly*. We can — via **commit-reveal**, which is what
+chia-gaming itself uses (off-chain, ~network latency), not a block. So dice
+fairness is now a **switchable mode**, all coexisting in dev
+(`games/diceFairness.ts`, per-table pref + `setCrapsFairnessMode`, house-only
+toggle in the panel):
+
+| Mode | Latency | Trust model | Diegetic |
+|---|---|---|---|
+| **rng** | instant | none — trust the operator (default; today's behaviour) | — |
+| **commit-reveal** ⭐ | **instant** | house + the SHOOTER each commit then reveal; fair unless *they collude* | ✅ the shooter really makes the roll |
+| **multiparty** | instant* | every bettor adds entropy; ≥1 honest suffices | — |
+| **block-beacon** | ~1 block | house commit + a Chia block hash; **no** collusion vector | — |
+
+**Recommended default for a lively table: `commit-reveal` (house + shooter).**
+Real craps already has a designated shooter, so house+shooter each committing a
+seed then revealing (`dice = combine(both)`) is instant, off-chain, and *diegetic*
+— the shooter's own entropy is in the roll. The only hole is **house+shooter
+collusion** against third-party bettors; mitigate with **shooter rotation** (real
+craps rotates the shooter) and the house-game trust model. `multiparty` closes the
+collusion hole (all bettors contribute) but is **liveness-fragile** — a
+non-revealer stalls the roll and the last revealer can grief, so it needs
+timeouts/forfeit-bonds when wired for real (*the asterisk). `block-beacon` is the
+zero-2-party-trust option, at the block-latency cost.
+
+**STATUS: the mode LOGIC is built, switchable, and browser-verified** — all four
+produce dice; commit-reveal/multiparty/block-beacon each emit a transcript that
+`verifyTranscript` confirms; the settle is now async (with a re-entrancy guard)
+and records the transcript on the settled state; the panel shows a "🔒 provably
+fair · <mode> · ✓ verified" badge. **Dev caveat:** the "other party" seeds and the
+block hash are **simulated locally** for now (`simulated:true`) — the *scheme*
+runs and verifies, but the *trust* property only becomes real once the network
+half (collect the shooter's independent commit over the wire) or the chain half
+(a real `header_hash`) is wired. That wiring is the next slice; the crypto + the
+switch are done.
+
 ## 2. Why craps fits chia-gaming unusually well
 
 chia-gaming (Alpha 0.3, June 2026): *"Players fund a shared channel coin on the

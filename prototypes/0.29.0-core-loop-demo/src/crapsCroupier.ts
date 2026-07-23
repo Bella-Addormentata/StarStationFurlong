@@ -50,24 +50,31 @@ export const CRAPS_SHOW_MS = 6_000;
 
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
-/** Throw the dice, resolve the roll, publish the settled record, credit winners,
- *  and PRUNE each player's felt — via the table's SELECTED settlement backend
- *  (local, or an optional Chia backend when wired + chosen). Called by the
- *  operator's timer (with `autoShowMs` so it auto-opens the next window) AND by
- *  the manual ROLL button (no `autoShowMs` — the house clicks NEXT ROLL).
- *  Returns the two dice. */
+/** Tables mid-settle — guards the fire-and-forget async settle from re-entry.
+ *  The operator's per-frame tick would otherwise call rollAndSettleCraps every
+ *  frame while the phase is still 'closing' (the settled write lands a few ms
+ *  later, after the fairness hashing), double-rolling. */
+const settling = new Set<string>();
+
+/** Throw the dice (via the table's fairness mode + settlement backend), resolve
+ *  the roll, publish the settled record, credit winners, and PRUNE each felt.
+ *  FIRE-AND-FORGET: the fairness modes hash (async), so this kicks off the settle
+ *  and returns; the settled state lands when it completes and every client
+ *  re-renders on the doc change. Re-entrant calls (same table, still settling)
+ *  are ignored. Called by the operator's timer (with `autoShowMs`) AND the manual
+ *  ROLL button (no `autoShowMs` — the house clicks NEXT ROLL). */
 export function rollAndSettleCraps(
   tableId: string,
   round: number,
   pointBefore: number | null,
   autoShowMs?: number,
-): [number, number] {
-  return selectCrapsBackend(tableId).rollAndSettle(
-    tableId,
-    round,
-    pointBefore,
-    autoShowMs,
-  );
+): void {
+  if (settling.has(tableId)) return;
+  settling.add(tableId);
+  selectCrapsBackend(tableId)
+    .rollAndSettle(tableId, round, pointBefore, autoShowMs)
+    .catch((err) => console.error('[craps] settle failed:', err))
+    .finally(() => settling.delete(tableId));
 }
 
 /** Open a fresh betting window carrying the point forward (idle — no timer until

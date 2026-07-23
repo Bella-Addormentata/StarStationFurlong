@@ -60,10 +60,18 @@ import {
   readMyBets, writeMyBets, readAllBets, subscribeCasino,
   readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
   readCrapsBackendPref, writeCrapsBackendPref,
+  readCrapsFairnessPref, writeCrapsFairnessPref,
 } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
 import { crapsBackend } from './crapsBackend';
+// 🎲🔀 The dice-fairness modes (rng / commit-reveal / multiparty / block-beacon) —
+// a house-only cycle button flips the per-table mode; settled rolls show a
+// verifiable "provably fair" badge.
+import {
+  FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript,
+} from './games/diceFairness';
+import type { FairnessMode } from './games/craps';
 import {
   WHEEL_ORDER, pocketColor,
 } from './games/roulette';
@@ -2889,6 +2897,10 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     const backendPref = readCrapsBackendPref(deps.itemId);
     const backendObj = crapsBackend(backendPref);
     const backendReady = backendObj.isAvailable();
+    // 🎲🔀 The house-only fairness-mode toggle (rng / commit-reveal / multiparty /
+    // block-beacon), per-table override or the global default.
+    const fairnessMode = readCrapsFairnessPref(deps.itemId) ?? getCrapsFairnessMode();
+    const fairInfo = FAIRNESS_MODES[fairnessMode];
     const { line: statusLine, color: statusColor } = computeStatus();
 
     const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
@@ -2959,6 +2971,19 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
           font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">
           ${backendObj.label.toUpperCase()}${backendPref === 'chia' && !backendReady ? ' · FALLS BACK TO LOCAL' : ''}
         </button>
+      </div>
+      <div style="display:flex; gap:8px; justify-content:space-between; align-items:center;">
+        <span style="font-size:9px; color:${GT_DIM}; letter-spacing:1.5px;">FAIRNESS · HOUSE</span>
+        <button id="cr-fairness" title="${fairInfo.blurb}${fairInfo.needsSecondParty || fairInfo.needsChain ? ' — DEV: entropy/beacon simulated locally until the network/chain half is wired' : ''}" style="
+          padding:4px 9px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,${fairnessMode === 'rng' ? '0.4' : '0.55'});
+          border-radius:6px; color:${fairnessMode === 'rng' ? GT_GOLD_BRIGHT : '#7CF5B0'};
+          font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">
+          ${fairInfo.label.toUpperCase()}${fairInfo.instant ? '' : ' · ~1 BLOCK'}
+        </button>
+      </div>` : ''}
+      ${p === 'settled' && !rolling && s?.fairness ? `
+      <div id="cr-fair-badge" style="font-size:9px; color:#7CF5B0; letter-spacing:1px;">
+        🔒 provably fair · ${(s.fairness.mode as string).toUpperCase()}${s.fairness.simulated ? ' (dev-simulated)' : ''} · verifying…
       </div>` : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
         BANK CRAPS · pass/don't-pass 1:1 (come-out only) · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6
@@ -2974,6 +2999,27 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#cr-clear')?.addEventListener('click', () => clearBets());
     panel.querySelector<HTMLButtonElement>('#cr-roll')?.addEventListener('click', () => { roll(); });
     panel.querySelector<HTMLButtonElement>('#cr-next')?.addEventListener('click', () => nextRoll());
+    panel.querySelector<HTMLButtonElement>('#cr-fairness')?.addEventListener('click', () => {
+      if (!deps.isHouse()) return;
+      const order: FairnessMode[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
+      const next = order[(order.indexOf(fairnessMode) + 1) % order.length];
+      writeCrapsFairnessPref(deps.itemId, next);
+      render();
+    });
+    // 🔒 Verify a settled roll's transcript and stamp the badge (async — anyone
+    // can re-derive the dice from the public transcript).
+    if (p === 'settled' && !rolling && s?.fairness && s.dice) {
+      const badge = panel.querySelector<HTMLDivElement>('#cr-fair-badge');
+      const dice = s.dice;
+      const fx = s.fairness;
+      verifyTranscript(fx, deps.itemId, s.round, dice).then((ok) => {
+        if (!badge || !panel) return;
+        badge.textContent = `🔒 provably fair · ${(fx.mode as string).toUpperCase()}`
+          + (fx.simulated ? ' (dev-simulated)' : '')
+          + (ok ? ' · ✓ verified' : ' · ✗ FAILED');
+        badge.style.color = ok ? '#7CF5B0' : '#FF8A80';
+      });
+    }
     panel.querySelector<HTMLButtonElement>('#cr-backend')?.addEventListener('click', () => {
       if (!deps.isHouse()) return;
       writeCrapsBackendPref(deps.itemId, backendPref === 'chia' ? 'local' : 'chia');
