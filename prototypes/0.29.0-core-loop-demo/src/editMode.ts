@@ -1229,7 +1229,10 @@ class RoomEditController {
       if (!el) return;
       const action = el.dataset.ctxAction;
       this.hideContextMenu();
-      if (action === 'move') this.ctxMove(itemId, ev.clientX, ev.clientY);
+      // MOVE picks the item up at the ORIGINAL right-click point (closure
+      // clientX/clientY) — the button click's own coords are the menu's screen
+      // position, and keyboard-activated clicks report (0,0).
+      if (action === 'move') this.ctxMove(itemId, clientX, clientY);
       else if (action === 'delete') this.ctxDelete(itemId);
     });
     document.body.appendChild(menu);
