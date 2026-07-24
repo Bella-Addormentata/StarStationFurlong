@@ -43,7 +43,7 @@ import {
   ysyncSigner,
   hasStoredIdentity,
 } from "./keypair";
-import { roomEdit, setRoomEditPermission } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
@@ -6209,6 +6209,10 @@ async function init() {
   // Create world
   world = new worldModule.World(scene);
   (window as any).world = world;
+
+  // 🖱️ Right-click context menu (MOVE / DELETE on furniture) needs the world
+  // OUTSIDE an edit session — same registration idiom as the owner gate below.
+  setEditWorldProvider(() => world);
 
   // ── Room-edit owner gate (E2 of #25, plan §1), on S2's identity:
   // isLocalPlayerRoomOwner accepts the local playerId AND the legacy
