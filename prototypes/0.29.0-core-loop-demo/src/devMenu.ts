@@ -407,6 +407,36 @@ function spawnFurniture(kind: FurnitureKind): void {
   showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — synced to the room (E4).`);
 }
 
+/**
+ * DEV rescue: restore the room's wall computer — the edit-mode entry point —
+ * at its canonical south-wall flush mount (roomTemplates.ts). Fixed structure,
+ * so the generic spawner deliberately excludes it (NON_SPAWNABLE); without it
+ * a room that lost its computer has no way back into EDIT ROOM. A unique id is
+ * essential: main.ts purges the DEFAULT id "wall-computer" from seeded docs on
+ * every load (the retired south-wall terminal), so restoring under that id
+ * would vanish on the next reload.
+ */
+function spawnWallComputer(): void {
+  const world = getWorld();
+  if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
+    showHint('DEV: enter the room first.');
+    return;
+  }
+  if (FURNITURE.some((i) => i.kind === 'wall-computer')) {
+    showHint('DEV: this room already has a wall computer.');
+    return;
+  }
+  const item: FurnitureItem = {
+    id: uniqueSpawnId('wall-computer'),
+    kind: 'wall-computer',
+    pos: { x: 1.8, z: 5.97 },
+    rot: 2,
+    movable: false,
+  };
+  commitSpawn(world, item);
+  showHint('DEV: 🖥️ wall computer restored on the south wall.');
+}
+
 // ── INVENTORY: re-place furniture removed to the room inventory (#53) ────────
 
 /**
@@ -638,6 +668,14 @@ function buildPanel(): HTMLDivElement {
       <button type="button" data-dev-action="spawn-furniture" data-kind="${kind}" style="${BTN_STYLE}">+</button>
     </div>
   `);
+  // 🖥️ Rescue row: the wall computer is fixed structure (NON_SPAWNABLE), but a
+  // room that lost it needs a way back into EDIT ROOM.
+  furnitureRows.unshift(`
+    <div style="${ROW_STYLE}">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ WALL COMPUTER <span style="color:rgba(255,179,0,0.4);">· restore</span></span>
+      <button type="button" data-dev-action="spawn-wall-computer" style="${BTN_STYLE}">+</button>
+    </div>
+  `);
 
   const moduleRow = `
     <div style="${ROW_STYLE}">
@@ -719,6 +757,7 @@ function buildPanel(): HTMLDivElement {
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
+      case 'spawn-wall-computer': spawnWallComputer(); break;
       case 'place-template': {
         const w = getWorld();
         if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
