@@ -22,7 +22,7 @@ env:
 jobs:
   frontend-typecheck:
     name: 🟦 Frontend tsc --noEmit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
@@ -44,7 +44,7 @@ jobs:
 
   node-check:
     name: 🦀 Node cargo check + test (default & chia-lane)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
