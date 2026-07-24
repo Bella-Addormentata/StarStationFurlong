@@ -207,6 +207,11 @@ export function clearTableKeys(tableId: string): void {
   boundDoc!.transact(() => {
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
+    // 🎲 The per-table config keys ride the same map — a removed table must
+    // not leave orphaned settings behind (harmless no-op for roulette, which
+    // never writes them).
+    map.delete(`cfg:backend:${tableId}`);
+    map.delete(`cfg:fairness:${tableId}`);
     for (const key of [...map.keys()]) {
       if (key.startsWith(betPrefix)) map.delete(key);
     }
