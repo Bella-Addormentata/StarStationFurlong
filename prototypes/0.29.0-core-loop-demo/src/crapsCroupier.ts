@@ -71,6 +71,22 @@ export function rollAndSettleCraps(
 ): void {
   if (settling.has(tableId)) return;
   settling.add(tableId);
+  // ✋ Slam the window BEFORE the async settle (#87 review): the manual ROLL
+  // fires from 'betting', and the fairness hashing keeps the settled write
+  // ms-to-seconds away — without an immediate 'closing' write, every client
+  // keeps accepting bets while the dice are already out. Mirror the auto
+  // path's closing shape (same deadline beat) so a live operator's tick
+  // treats it exactly like its own transition; the settle landing first
+  // (typical) makes the deadline moot. The auto path arrives already
+  // 'closing', so this is a no-op there.
+  const s = readCrapsTableState(tableId);
+  if (s?.phase === 'betting') {
+    writeCrapsTableState(tableId, {
+      ...s,
+      phase: 'closing',
+      phaseDeadline: Date.now() + CRAPS_CLOSING_MS,
+    });
+  }
   selectCrapsBackend(tableId)
     .rollAndSettle(tableId, round, pointBefore, autoShowMs)
     .catch((err) => console.error('[craps] settle failed:', err))
