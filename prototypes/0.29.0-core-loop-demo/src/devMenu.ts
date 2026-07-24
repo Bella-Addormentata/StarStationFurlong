@@ -98,6 +98,12 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
  *  (world.reconcileRobots), so label it so it's findable. */
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
+  'smiley-bouquet': '😊 SMILEY BOUQUET',
+  'rose-bouquet': '🌹 ROSE BOUQUET',
+  'purple-bouquet': '💜 PURPLE BOUQUET',
+  'lavender-bouquet': '🪻 LAVENDER BOUQUET',
+  'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
+  'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
 };
 
 type GetWorld = () => World | null;
@@ -339,6 +345,9 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;
       }
+      // 📸 same as World's reveal: alpha-tested cutouts render opaque —
+      // alphaTest handles the keying without the transparent pass.
+      if (mat.alphaTest > 0) mat.transparent = false;
     } else if (obj instanceof THREE.PointLight) {
       const targetIntensity = (obj.userData.targetIntensity as number) ?? 0;
       w.furnitureLights.push({ light: obj, targetIntensity });
@@ -405,6 +414,40 @@ function spawnFurniture(kind: FurnitureKind): void {
   if (spot.mountParent !== undefined) item.mountParent = spot.mountParent;
   commitSpawn(world, item);
   showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — synced to the room (E4).`);
+}
+
+/**
+ * DEV rescue: restore the room's wall computer — the edit-mode entry point —
+ * at its canonical south-wall flush mount (roomTemplates.ts). Fixed structure,
+ * so the generic spawner deliberately excludes it (NON_SPAWNABLE); without it
+ * a room that lost its computer has no way back into EDIT ROOM. A unique id is
+ * essential: main.ts purges the DEFAULT id "wall-computer" from seeded docs on
+ * every load (the retired south-wall terminal), so restoring under that id
+ * would vanish on the next reload.
+ */
+function spawnWallComputer(): void {
+  const world = getWorld();
+  if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
+    showHint('DEV: enter the room first.');
+    return;
+  }
+  if (FURNITURE.some((i) => i.kind === 'wall-computer')) {
+    showHint('DEV: this room already has a wall computer.');
+    return;
+  }
+  // Flush with THIS room's south wall — rooms resize via floorPlan (#66), so
+  // the canonical z=5.97 (default halfZ 6 − 0.03 m mount inset) is derived,
+  // not hard-coded, and x backs off the corner in narrow rooms.
+  const { halfX, halfZ } = roomHalfExtents();
+  const item: FurnitureItem = {
+    id: uniqueSpawnId('wall-computer'),
+    kind: 'wall-computer',
+    pos: { x: Math.min(1.8, Math.max(0, halfX - 1.0)), z: halfZ - 0.03 },
+    rot: 2,
+    movable: false,
+  };
+  commitSpawn(world, item);
+  showHint('DEV: 🖥️ wall computer restored on the south wall.');
 }
 
 // ── INVENTORY: re-place furniture removed to the room inventory (#53) ────────
@@ -638,6 +681,14 @@ function buildPanel(): HTMLDivElement {
       <button type="button" data-dev-action="spawn-furniture" data-kind="${kind}" style="${BTN_STYLE}">+</button>
     </div>
   `);
+  // 🖥️ Rescue row: the wall computer is fixed structure (NON_SPAWNABLE), but a
+  // room that lost it needs a way back into EDIT ROOM.
+  furnitureRows.unshift(`
+    <div style="${ROW_STYLE}">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ WALL COMPUTER <span style="color:rgba(255,179,0,0.4);">· restore</span></span>
+      <button type="button" data-dev-action="spawn-wall-computer" style="${BTN_STYLE}">+</button>
+    </div>
+  `);
 
   const moduleRow = `
     <div style="${ROW_STYLE}">
@@ -703,6 +754,12 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('MODULES', null, [moduleRow, stationRow])}
       ${sectionHtml('PARTS', 'station construction (#62)', ['<div id="dev-parts-rows"></div>'])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
+      ${sectionHtml('NAVIGATION', 'lost? beam straight home', [`
+        <div style="${ROW_STYLE}">
+          <span>🏠 GO HOME <span style="color:rgba(255,179,0,0.5);">· reload into your home station</span></span>
+          <button type="button" data-dev-action="go-home" style="${BTN_STYLE}">GO</button>
+        </div>
+      `])}
     </div>
   `;
 
@@ -716,12 +773,45 @@ function buildPanel(): HTMLDivElement {
     btn.blur(); // keep focus off buttons so Space/Enter can't re-trigger them
     switch (btn.dataset.devAction) {
       case 'close': setOpen(false); break;
+      case 'go-home':
+        // 🏠 Beam home: drop the resume-at-last-location pointer and reload
+        // into a CLEAN URL. Stripping query + hash matters as much as the
+        // localStorage key: a lingering ?seed= from an earlier link-visit
+        // outranks the home fallback in bootstrapNetworking (URL import →
+        // last-room → default), so a plain reload() would beam the player
+        // right back into the foreign room they are trying to escape.
+        try { localStorage.removeItem('ssf-last-room'); } catch { /* private mode */ }
+        location.href = location.origin + location.pathname;
+        break;
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
+      case 'spawn-wall-computer': spawnWallComputer(); break;
       case 'place-template': {
         const w = getWorld();
         if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        // ⚠️ Destructive: one click REPLACES every piece in the room, and one
+        // stray click has already wiped a furnished home. Two-click arm/confirm:
+        // the first click arms for 3 s (red ⚠), the second click executes.
+        if (btn.dataset.armed !== '1') {
+          btn.dataset.armed = '1';
+          const prevText = btn.textContent;
+          const prevCss = btn.style.cssText;
+          btn.textContent = '⚠ REPLACE ROOM?';
+          btn.style.background = 'rgba(255,23,68,0.18)';
+          btn.style.borderColor = 'rgba(255,23,68,0.5)';
+          btn.style.color = '#ff8a80';
+          window.setTimeout(() => {
+            if (btn.dataset.armed !== '1') return; // already executed
+            btn.dataset.armed = '';
+            btn.textContent = prevText;
+            btn.style.cssText = prevCss;
+          }, 3000);
+          break;
+        }
+        btn.dataset.armed = '';
+        btn.textContent = 'PLACE'; // restore from the armed look (timeout skips executed buttons)
+        btn.style.cssText = BTN_STYLE;
         const t = applyRoomTemplate(btn.dataset.template ?? '');
         if (!t) break;
         // Furniture rebuilds via the doc subscription (replaceAllFurniture);

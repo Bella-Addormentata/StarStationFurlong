@@ -12,6 +12,133 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.28 — 2026-07-23
+
+### 🚪↔️ Drag a door along its wall to move it (#28 decouple, slice 6c)
+
+The door editor learns MOVE: pick up a placed door in edit mode and slide it along its wall, exactly like moving a furniture item.
+
+- **Click a selected door** (gold tint) to pick it up — the actual door slides live under your cursor along **its own wall** (wall-locked: cross-wall moves stay remove + re-add), snapping to the same floor grid as placement (small door on the half-tile, large on the tile) and clamped to the wall's slide range. **Green** where the drop is valid, **red** where it isn't; click on green to drop, Esc / right-click to cancel back to where it was.
+- A door with a live docked module is protected — unpair it first, same as remove.
+- **Split write under the hood:** the four cardinal doors ride the legacy floor-plan slide store (the same one the wall computer's slider uses, so the existing cross-client reconcile just works), while free doors update their `doorLayout` record — never both.
+- **Doors now respect windows** (both placing and moving): the octagon hull's windows only checked clearance in the window→door direction; the door editor's validity check now refuses a spot that collides with a window, mirroring the window side's margin.
+- **Moved free doors keep working walk-throughs:** their walk targets (front/through points) re-derive from the layout record on reconcile — previously only cardinal doors repositioned.
+- **Release line:** version bumped to 0.33.28, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+## v0.33.27 — 2026-07-22
+
+### 📸 Photo décor — six real-photo furniture pieces (bouquets + balloons)
+
+A new décor category: the owner's own product photos as placeable furniture.
+Four flower bouquets, a floor balloon bunch, and a wall-hung balloon variant —
+all spawnable from the DEV menu's FURNITURE list, movable/deletable with the
+right-click context menu, decorative (footprint null, never an obstacle).
+
+- **The set:** 😊 SMILEY BOUQUET (1.45 m) · 🌹 ROSE BOUQUET (1.45 m) ·
+  💜 PURPLE BOUQUET (1.35 m) · 🪻 LAVENDER BOUQUET (1.45 m) ·
+  🎈 BIRTHDAY BALLOONS (1.5 m, the tallest) · 🎈 BALLOONS (WALL-HUNG)
+  (1.2 m single plane at wall height).
+- **One engine, `buildPhotoStandee(ctx, spec)`:** crossed planes (the
+  Minecraft-flower idiom) or a single wall plane; the white studio backdrop is
+  keyed at load by a **border flood fill** — only background-CONNECTED
+  near-white pixels turn transparent, so interior whites (white daisies, glass
+  highlights, foil balloons) survive; +15 % brightness lift and the map doubles
+  as a soft emissiveMap so photos stay vivid under dim room light; smooth
+  filtering + mipmaps + max anisotropy keep fine print (balloon lettering)
+  legible — NearestFilter shredded it (owner feedback "not clear").
+- **Wall hanging via `zOff`:** decorative placement clamps the item ORIGIN to
+  ≥1 m inside the walls, so the wall variant's plane reaches 0.95 m out of the
+  origin — park the item on the lattice line nearest a wall, R-rotate, and the
+  picture lands on the wall face (5 cm proud, no z-fighting).
+- Adding another photo piece is now four small steps: drop a JPEG in
+  `public/assets/`, one union entry, a two-line builder off the shared
+  `PHOTO_DECOR` spec, one DEFS entry.
+- Verified live: all six spawn, move, delete and sync; backgrounds key cleanly
+  (glass vase reads as real transparency); the wall balloons hang on any of the
+  four walls; missing-asset loads warn instead of failing silently; `tsc` clean.
+- **Release line:** version bumped to 0.33.27, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
+## v0.33.26 — 2026-07-22
+
+### ⏏ UNDOCK a permanently docked module from the door panel
+
+The missing inverse of PROVISION / INITIATE: the door panel can now **remove a
+permanently docked module**. Until now only transient guest berths had a DETACH —
+a provisioned or paired module was station-graph-permanent with no way back (the
+POSITION row even said "unpair first" with no way to unpair).
+
+- The docking panel's DOOR POLICY section gains a **🧩 DOCKED MODULE · <address>**
+  row with an **⏏ UNDOCK** button whenever that door holds a live PERMANENT
+  pairing. **Owner-only** — transient berths keep their own everyone-visible
+  DETACH row, and the two rows are mutually exclusive by construction.
+- **Two-click arm/confirm:** the first click flips the row to a red
+  **⚠ REALLY UNDOCK? / ⏏ CONFIRM** state; only the second click executes. Arming
+  never survives a pane re-open, and the handler re-checks the live pairing state
+  before acting (a stale row click is a no-op).
+- Undocking **deletes the door-pairing record** from the shared doors doc — the
+  same reconcile path the transient DETACH uses (`clearRemotePairing`) tears down
+  the projection and re-locks the door on every client. **The module's room doc
+  survives on the node**: re-dock its address (KNOWN MODULES / MODULE LEDGER) to
+  restore it, furniture intact.
+- Verified live: a provisioned module's door shows the row; first click arms,
+  second click detaches (projection gone, door re-locked, LED off green); the
+  detached room re-docks by address; `tsc` clean.
+- **Release line:** version bumped to 0.33.26, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
+## v0.33.25 — 2026-07-22
+
+### 🧭 Dev-menu guardrails — 🏠 GO HOME + a confirm on room templates
+
+Two quality-of-life guards for the demo-phase DEV menu, both born from a live
+play session that went sideways.
+
+- **🏠 GO HOME (new NAVIGATION section):** one button that beams you back to your
+  own home station — it drops the resume-at-last-location pointer AND reloads into
+  a **clean URL** (query + hash stripped). The URL half matters: a lingering
+  `?seed=` from an earlier link-visit outranks the home fallback in
+  bootstrapNetworking (URL import → last-room → default), so a plain reload kept
+  beaming a lost player right back into the foreign station they were escaping.
+- **⚠ Room templates now confirm before replacing:** the one-click PLACE of a room
+  template REPLACES every piece in the room, and one stray click wiped a furnished
+  home. PLACE now arms for 3 s (red **⚠ REPLACE ROOM?**) and only a second click
+  executes; the button restores itself on timeout.
+- Verified live: GO HOME lands in the player's own home with a clean address bar;
+  an armed PLACE reverts after 3 s untouched and executes on the second click;
+  `tsc` clean.
+- **Release line:** version bumped to 0.33.25, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
+## v0.33.24 — 2026-07-22
+
+### 🖱️ Right-click furniture — MOVE / DELETE context menu
+
+Furniture management without the wall-computer ceremony: **right-click any movable
+piece** — in the plain room view or in edit mode — and a small context menu offers
+**✥ MOVE** and **🗑 DELETE**. Owner-gated like every other edit.
+
+- **✥ MOVE** picks the piece up on the spot: from the plain view it silently enters
+  edit mode, starts the standard carry (full placement validation — green/red tint,
+  R rotates, click drops, Esc / right-click cancels back to the origin) and **leaves
+  edit mode again once the drop lands or cancels**. From an already-open edit session
+  the menu is a shortcut and the session stays open.
+- **🗑 DELETE** runs the exact #53 remove-to-inventory path (despawn + deregister +
+  rebake + shared-doc delete + stow in the room inventory — the DEV menu's INVENTORY
+  re-places it), including the hull-stack cascade.
+- **FIX: deleting a charging-dock now disposes its robot immediately.** The local
+  removal self-echoes as an empty furniture-doc diff, so the observer's
+  `reconcileRobots` never ran on the deleting client and a ghost robot lingered
+  until the next full reconcile — the exact mirror of v0.33.21's commitSpawn dock
+  fix, now applied to the remove path (cascade included).
+- Boundaries: movable furniture only — doors keep their own panel/editor, fixed
+  structure (wall computer) is excluded, robots follow their dock. A right-click on
+  a mounted-stack base refuses MOVE with the usual unstack-first hint.
+- Verified live: right-click menu opens on furniture in both views; MOVE follows the
+  pointer and commits/cancels with auto exit; DELETE stows to inventory and a deleted
+  dock takes its robot with it; menu dismisses on outside click / Esc; `tsc` clean.
+- **Release line:** version bumped to 0.33.24, all nine locations. **Frontend-only —
+  node binaries unchanged from v0.30.6.**
+
 ## v0.33.23 — 2026-07-21
 
 ### 🚪✏️ Place and remove doors in edit mode (#28 decouple, slice 6b — the door editor)

@@ -76,7 +76,6 @@ export function rebuildDoors(records: Map<string, DoorLayoutRecord>): void {
     if (!records.has(DOORS[i].id)) DOORS.splice(i, 1);
   }
   for (const rec of records.values()) {
-    if (DOORS.some((d) => d.id === rec.id)) continue; // existing — untouched
     // Cardinal doors keep the legacy pose (east/west quirk + pairs layout); a
     // free/genId door derives from its wall + along-wall position.
     const isCardinal =
@@ -84,6 +83,23 @@ export function rebuildDoors(records: Map<string, DoorLayoutRecord>): void {
       rec.id === "south" ||
       rec.id === "east" ||
       rec.id === "west";
+    const existing = DOORS.find((d) => d.id === rec.id);
+    if (existing) {
+      // 🚪 #28 S6c: a FREE door's along-wall position lives in ITS layout
+      // record (the floorPlan slide store only knows cardinals), so a MOVED
+      // free door must re-derive its walk points here — applyDoorSlideDeltas,
+      // which repositions the cardinals, deliberately skips free ids. Runtime
+      // `enabled` stays owned by the room, and cardinals stay untouched.
+      if (!isCardinal) {
+        const pose = poseFromWall(rec.wall, rec.lateral);
+        existing.front.x = pose.front.x;
+        existing.front.z = pose.front.z;
+        existing.through.x = pose.through.x;
+        existing.through.z = pose.through.z;
+        existing.faceAngle = pose.faceAngle;
+      }
+      continue;
+    }
     const pose = isCardinal
       ? physicalDoorPose(rec.id as DoorId, 0)
       : poseFromWall(rec.wall, rec.lateral);
