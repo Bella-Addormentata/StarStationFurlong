@@ -1,0 +1,67 @@
+name: "✅ PR Checks"
+
+# PR-time compile gate — the checks we previously only ran by hand (or that the
+# release workflow only ran at tag time). Three lanes:
+#   1. Frontend `tsc --noEmit` — the repo's long-standing "tsc clean" bar.
+#   2. `cargo check` on the sovereign node with DEFAULT features — what a local
+#      `cargo check` compiles.
+#   3. `cargo check`/`cargo test` with `--features chia-lane` — the feature-gated
+#      chia modules (chia_publish / chia_resolve / chia_craps_fair) are INVISIBLE
+#      to a default check, so a PR could break them without anyone noticing until
+#      the tag-time release build (#87's near-miss: a review fix to the gated
+#      module shipped without ever having been compiled).
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Mirror of release.yml's RELEASE_FRONTEND — the prototype the app ships.
+  RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
+
+jobs:
+  frontend-typecheck:
+    name: 🟦 Frontend tsc --noEmit
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '${{ env.RELEASE_FRONTEND }}/package-lock.json'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+        working-directory: ${{ env.RELEASE_FRONTEND }}
+
+      - name: 🔎 tsc --noEmit
+        run: npx tsc --noEmit
+        working-directory: ${{ env.RELEASE_FRONTEND }}
+
+  node-check:
+    name: 🦀 Node cargo check + test (default & chia-lane)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🦀 Setup Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 💾 Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+
+      - name: 🔎 cargo check (default features)
+        run: cargo check --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      - name: 🔎 cargo check --features chia-lane
+        run: cargo check --features chia-lane --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
+
+      - name: 🧪 cargo test --features chia-lane
+        run: cargo test --features chia-lane --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
