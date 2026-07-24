@@ -492,6 +492,14 @@ const CARRY_VALID_INTENSITY = 0.55;
 const CARRY_INVALID_EMISSIVE = 0xe03636;
 const CARRY_INVALID_INTENSITY = 0.6;
 
+/** Door-parity grid rounding (large: whole tiles, small: half-tile centres) —
+ *  inward floor/ceil for aligning the drag clamp's edges onto the grid, so a
+ *  clamped-at-the-edge lateral still round-trips the store snap exactly. */
+const doorGridFloor = (size: 'small' | 'large', v: number): number =>
+  size === 'large' ? Math.floor(v) : Math.floor(v + 0.5) - 0.5;
+const doorGridCeil = (size: 'small' | 'large', v: number): number =>
+  size === 'large' ? Math.ceil(v) : Math.ceil(v - 0.5) + 0.5;
+
 /** A material we can emissive-tint (MeshStandardMaterial and friends). */
 type EmissiveMaterial = THREE.Material & { emissive: THREE.Color; emissiveIntensity: number };
 
@@ -608,6 +616,13 @@ class RoomEditController {
      *  0 in the legacy layout and for every free door). candidate − base is
      *  the floorPlan DELTA currency the cardinal write path speaks. */
     baseCentre: number;
+    /** Cardinal ⇒ baseCentre − the legacy store base: the offset between the
+     *  world-centre and floorPlan-STORED currencies. The pairs slots (±2.7)
+     *  sit 0.2 off the store's 0.5 lattice, so the drag snaps/clamps in
+     *  STORED currency (centre − storeShift) — a plain world-grid snap would
+     *  not round-trip writeDoorPlacement's own snap and the door would jump
+     *  on drop. 0 for free doors and the legacy cardinal layout. */
+    storeShift: number;
     originLateral: number;
     candidateLateral: number;
     valid: boolean;
@@ -1806,6 +1821,10 @@ class RoomEditController {
     // Cardinal opening.lateral is the floorPlan DELTA; free doors carry their
     // world lateral directly (baseCentre 0) — both sum to the world centre.
     const originLateral = baseCentre + opening.lateral;
+    // Store-currency offset for the drag's snap/clamp (see the struct doc).
+    const storeShift = isCardinal
+      ? baseCentre - lateralOf(doorId as DoorId, LEGACY_PLACEMENTS[doorId as DoorId])
+      : 0;
 
     this.doorDrag = {
       doorId,
@@ -1814,6 +1833,7 @@ class RoomEditController {
       size: opening.size,
       isCardinal,
       baseCentre,
+      storeShift,
       originLateral,
       candidateLateral: originLateral,
       valid: true,
@@ -1845,18 +1865,24 @@ class RoomEditController {
    * The drag's lateral clamp. Free doors: the wall's corner-clear limit, the
    * same bound the ADD ghost uses. Cardinals round-trip through the legacy
    * floorPlan store, whose OWN clamp bounds the STORED lateral (= delta +
-   * legacy base; the e/w base is −0.5) — tighten the drag range to what stores
-   * and reads back EXACTLY, so the preview never shows a spot the commit would
-   * shift half a metre off (the west/east door at its full-negative slide).
+   * legacy base; the e/w base is −0.5) — so the bounds are computed in STORED
+   * currency (|stored| ≤ limit ∩ |centre| ≤ limit) and aligned INWARD onto the
+   * door's parity grid: even a clamped-at-the-edge candidate then stores and
+   * reads back EXACTLY, and the preview never shows a spot the commit would
+   * shift off (the west/east door at its full-negative slide, or any pairs
+   * slot whose ±2.7 base sits 0.2 off the store's 0.5 lattice).
    */
   private doorDragClamp(
-    d: { doorId: string; wall: DoorWall; isCardinal: boolean; baseCentre: number },
+    d: { wall: DoorWall; size: 'small' | 'large'; isCardinal: boolean; storeShift: number },
   ): { lo: number; hi: number } {
     const limit = doorLateralLimitForWall(d.wall);
     if (!d.isCardinal) return { lo: -limit, hi: limit };
-    const base = lateralOf(d.doorId as DoorId, LEGACY_PLACEMENTS[d.doorId as DoorId]);
-    const shift = d.baseCentre - base; // centre ∈ shift ± limit keeps |stored| ≤ limit
-    return { lo: Math.max(-limit, shift - limit), hi: Math.min(limit, shift + limit) };
+    const sLo = Math.max(-limit, -limit - d.storeShift);
+    const sHi = Math.min(limit, limit - d.storeShift);
+    return {
+      lo: doorGridCeil(d.size, sLo) + d.storeShift,
+      hi: doorGridFloor(d.size, sHi) + d.storeShift,
+    };
   }
 
   /**
@@ -1878,7 +1904,11 @@ class RoomEditController {
     if (hits.length === 0) return;
 
     const raw = d.wall === 'north' || d.wall === 'south' ? hits[0].point.x : hits[0].point.z;
-    const snapped = snapDoorLateral(d.size, raw);
+    // Snap in the currency the drop will persist: stored = centre − storeShift
+    // (a pairs-slot cardinal's grid is 0.2 off the store's 0.5 lattice, so a
+    // world snap would shift on the post-drop reconcile). Free doors and the
+    // legacy layout: storeShift 0 — a plain world-grid snap, as before.
+    const snapped = snapDoorLateral(d.size, raw - d.storeShift) + d.storeShift;
     const { lo, hi } = this.doorDragClamp(d);
     const clamped = Math.max(lo, Math.min(hi, snapped));
     if (clamped === d.candidateLateral) return;
