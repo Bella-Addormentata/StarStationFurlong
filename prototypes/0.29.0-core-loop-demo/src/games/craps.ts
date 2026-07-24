@@ -104,8 +104,16 @@ export interface FairnessTranscript {
 
 const FAIRNESS_MODES: readonly string[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
 
-function isStringArray(v: unknown): v is string[] {
-  return Array.isArray(v) && v.every((s) => typeof s === 'string');
+/** Bounds for peer-written transcripts: real ones carry 64-hex sha256 commits /
+ *  seeds and at most one party per stand (8) + the house — the UI auto-verifies
+ *  by hashing every entry, so unbounded arrays/strings from a hostile peer
+ *  would freeze it. Generous ceilings, tight enough to keep hashing trivial. */
+const FAIRNESS_MAX_PARTIES = 16;
+const FAIRNESS_MAX_STRING = 128;
+
+function isBoundedStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.length <= FAIRNESS_MAX_PARTIES
+    && v.every((s) => typeof s === 'string' && s.length <= FAIRNESS_MAX_STRING);
 }
 
 /** Shape guard for a peer-written fairness transcript — the UI dereferences
@@ -115,9 +123,9 @@ export function isFairnessTranscript(value: unknown): value is FairnessTranscrip
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const f = value as Partial<FairnessTranscript>;
   return typeof f.mode === 'string' && FAIRNESS_MODES.includes(f.mode)
-    && (f.commits === undefined || isStringArray(f.commits))
-    && (f.seeds === undefined || isStringArray(f.seeds))
-    && (f.beacon === undefined || typeof f.beacon === 'string')
+    && (f.commits === undefined || isBoundedStringArray(f.commits))
+    && (f.seeds === undefined || isBoundedStringArray(f.seeds))
+    && (f.beacon === undefined || (typeof f.beacon === 'string' && f.beacon.length <= FAIRNESS_MAX_STRING))
     && (f.simulated === undefined || typeof f.simulated === 'boolean');
 }
 

@@ -31,6 +31,7 @@ import {
   readAllCrapsBets,
   readCrapsBackendPref,
   readCrapsFairnessPref,
+  readCrapsTableState,
   writeCrapsTableState,
   writeMyCrapsBets,
 } from './casinoDoc';
@@ -84,6 +85,11 @@ class LocalCrapsBackend implements CrapsBackend {
     // / multiparty / block-beacon), per-table override or the global default.
     const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
     const { dice, transcript } = await produceRoll(mode, tableId, round);
+    // The hashing yielded — the table may have been REMOVED meanwhile
+    // (closeCrapsTable refunded every felt and wiped the table keys, #87
+    // review). Writing now would resurrect the dead table's state and pay
+    // out bets that were already refunded — abort instead.
+    if (readCrapsTableState(tableId) == null) return dice;
     const [d1, d2] = dice;
     const sum = d1 + d2;
     const { payouts, remaining } = resolveCrapsRound(
