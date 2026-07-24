@@ -65,12 +65,16 @@ import {
 import type { FurnitureItem, Rot, Box } from './furniture';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
 import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
-import { roomHalfExtents, doorLateralLimitForWall, readDoorDeltas } from './floorPlanDoc';
+import {
+  roomHalfExtents, doorLateralLimitForWall, readDoorDeltas,
+  seedFloorPlan, writeDoorPlacement, lateralOf, LEGACY_PLACEMENTS,
+} from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
 import type { DoorId } from './doors';
-import { snapDoorLateral, wallAndLateralFromPoint, poseFromWall } from './doorLayout';
+import { snapDoorLateral, wallAndLateralFromPoint, poseFromWall, physicalDoorPose } from './doorLayout';
+import type { PhysicalDoorPose } from './doorLayout';
 import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
 } from './doorLayoutDoc';
@@ -88,7 +92,7 @@ import { writeWallpaper, readAllWallpaper } from './wallpaperLayoutDoc';
 import {
   WALLPAPER_PRESETS, WALLPAPER_LABELS, type WallpaperPresetId,
 } from './wallpaper';
-import { SURFACES } from './hullSection';
+import { SURFACES, narrowAxisFor } from './hullSection';
 import type { HullSurface } from './hullSection';
 import { PLAYER_R } from './player';
 import type { Player } from './player';
@@ -270,6 +274,13 @@ export function validatePlacement(
 
 // ── Door placement validity (#28 S6b — the door editor's add/tint gate) ───────
 
+/** 🚪 #28 S6c: the 4 cardinal ids ride the LEGACY floorPlan slide store
+ *  (`door:${id}`); everything else (`d:` uuids) is a free door whose position
+ *  lives in its doorLayout record. The split-write seam in one predicate. */
+function isCardinalDoorId(id: string): id is DoorId {
+  return id === 'north' || id === 'south' || id === 'east' || id === 'west';
+}
+
 /** Mint a fresh free-door id suffix — crypto.randomUUID with the identity.ts
  *  fallback (unavailable outside secure contexts / on old engines; uniqueness,
  *  not security, is all we need). Callers prefix `d:` to mark a FREE door. */
@@ -317,18 +328,32 @@ function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: num
   const records = readAllDoorLayout();
   const deltas = readDoorDeltas();
   const seen = new Set<string>();
+  // Cardinals speak PHYSICAL currency here — the pose's wall and world-centre
+  // lateral (physicalDoorPose folds in the pairs slots' ±2.7 base and the
+  // legacy e/w −0.5 stand), NOT the record's logical wall + floorPlan delta.
+  // validateDoorPlacement compares candidates in physical currency, so a
+  // logical-wall/delta report would hide a pairs door from the overlap check
+  // (logical south rides the north wall) and offset every e/w comparison
+  // (#86 review). Free doors' records already carry the physical pose.
+  const cardinalOpening = (id: DoorId) => {
+    const pose = physicalDoorPose(id, deltas[id] ?? 0);
+    const lateral = pose.wall === 'north' || pose.wall === 'south' ? pose.x : pose.z;
+    // Size is a fixed cardinal invariant (e/w large, n/s small — the seed's own
+    // rule), NOT the record's field: a stale/malformed record must not skew the
+    // overlap width or the MOVE snap parity (#86 review).
+    return { id, wall: pose.wall, lateral, size: id === 'east' || id === 'west' ? 'large' as const : 'small' as const };
+  };
   for (const rec of records.values()) {
-    const isCardinal = rec.id === 'north' || rec.id === 'south' || rec.id === 'east' || rec.id === 'west';
-    const lateral = isCardinal ? (deltas[rec.id as DoorId] ?? 0) : rec.lateral;
-    openings.push({ id: rec.id, wall: rec.wall, lateral, size: rec.size ?? 'small' });
+    openings.push(
+      isCardinalDoorId(rec.id)
+        ? cardinalOpening(rec.id as DoorId)
+        : { id: rec.id, wall: rec.wall, lateral: rec.lateral, size: rec.size ?? 'small' },
+    );
     seen.add(rec.id);
   }
   for (const id of ['north', 'south', 'east', 'west'] as const) {
     if (seen.has(id)) continue;
-    openings.push({
-      id, wall: id, lateral: deltas[id] ?? 0,
-      size: id === 'east' || id === 'west' ? 'large' : 'small',
-    });
+    openings.push(cardinalOpening(id));
   }
   return openings;
 }
@@ -342,8 +367,12 @@ export type DoorPlacementVerdict = { ok: true } | { ok: false; reason: string };
  *  2. its opening footprint clears every live furniture footprint (strict-
  *     inequality AABB overlap — a flush edge is fine, same rule as furniture);
  *  3. its opening clears every OTHER door on the SAME wall (1-D interval gap:
- *     centres must be ≥ (w+w')/2 apart), excluding `excludeId`.
- * Pure; drives both the ADD gate and (future) the red/green editor tint. #28 S6b.
+ *     centres must be ≥ (w+w')/2 apart), excluding `excludeId`;
+ *  4. 🪟 #80: its doorway (opening + posts) clears every WINDOW on that wall —
+ *     the door-side mirror of world.windowClearsDoors (same 0.4 m margin),
+ *     which only guards the WINDOW placement path; without this an added or
+ *     moved door could slide under an existing window's cut.
+ * Pure; drives the ADD gate and the S6c move drag's red/green tint. #28 S6b/S6c.
  */
 export function validateDoorPlacement(
   wall: DoorWall,
@@ -375,6 +404,33 @@ export function validateDoorPlacement(
     const ow = other.size === 'large' ? 2 : 1;
     if (Math.abs(other.lateral - lateral) < (w + ow) / 2) {
       return { ok: false, reason: 'overlaps another door' };
+    }
+  }
+
+  // 4. 🪟 #80: no window over the doorway. Windows only exist on the octagon
+  //    SIDE walls (wall-neg / wall-pos on the narrow axis — square rooms:
+  //    west / east); the door walls on the extrude axis are the hull's end
+  //    caps and carry no windows. Reads the pure window records (this
+  //    validator must stay pure) with the doorway span windowClearsDoors
+  //    measures off the built group — half the physical opening (docking.ts
+  //    buildDoorGroup: 1.4 small / 2.4 large) plus a 0.3 side post — and the
+  //    same 0.4 m margin; `across` is ignored on both sides (any window on
+  //    the wall claims its full along-span).
+  if (OCTAGON_HULL) {
+    const { halfX, halfZ } = roomHalfExtents();
+    const sideSurface =
+      narrowAxisFor(halfX, halfZ) === 'x'
+        ? (wall === 'west' ? 'wall-neg' : wall === 'east' ? 'wall-pos' : null)
+        : (wall === 'north' ? 'wall-neg' : wall === 'south' ? 'wall-pos' : null);
+    if (sideSurface !== null) {
+      const doorHalf = (size === 'large' ? 2.4 : 1.4) / 2 + 0.3; // opening + post
+      const WINDOW_MARGIN = 0.4; // windowClearsDoors' MARGIN, mirrored
+      for (const rec of readAllWindowLayout().values()) {
+        if (rec.surface !== sideSurface) continue;
+        if (Math.abs(rec.along - lateral) < doorHalf + rec.w / 2 + WINDOW_MARGIN) {
+          return { ok: false, reason: 'a window is in the way' };
+        }
+      }
     }
   }
 
@@ -461,6 +517,14 @@ const CARRY_VALID_INTENSITY = 0.55;
 /** Carrying, current spot invalid: red wash. */
 const CARRY_INVALID_EMISSIVE = 0xe03636;
 const CARRY_INVALID_INTENSITY = 0.6;
+
+/** Door-parity grid rounding (large: whole tiles, small: half-tile centres) —
+ *  inward floor/ceil for aligning the drag clamp's edges onto the grid, so a
+ *  clamped-at-the-edge lateral still round-trips the store snap exactly. */
+const doorGridFloor = (size: 'small' | 'large', v: number): number =>
+  size === 'large' ? Math.floor(v) : Math.floor(v + 0.5) - 0.5;
+const doorGridCeil = (size: 'small' | 'large', v: number): number =>
+  size === 'large' ? Math.ceil(v) : Math.ceil(v - 0.5) + 0.5;
 
 /** A material we can emissive-tint (MeshStandardMaterial and friends). */
 type EmissiveMaterial = THREE.Material & { emissive: THREE.Color; emissiveIntensity: number };
@@ -556,6 +620,41 @@ class RoomEditController {
   } | null = null;
 
   /**
+   * 🚪 #28 S6c: live door MOVE (drag-along-wall), or null. The furniture carry's
+   * shape reduced to 1-D: while non-null the ACTUAL door group slides along its
+   * OWN wall following the pointer (snapped + clamped), tinted with the same
+   * green/red carry emissive. WALL-LOCKED by owner decision — the wall never
+   * changes mid-drag (cross-wall moves are remove + re-add). Nothing is written
+   * until the drop, so cancel is a pure re-pose from `originLateral`.
+   */
+  private doorDrag: {
+    doorId: string;
+    group: THREE.Group;
+    /** The door's PHYSICAL wall — fixed for the whole drag (wall-locked).
+     *  For cardinals this is the pose's wall, not the record's logical id
+     *  (the pairs layout parks logical south/east on the north/west walls). */
+    wall: DoorWall;
+    size: 'small' | 'large';
+    /** Cardinal ⇒ the drop writes the legacy floorPlan slide store; free ⇒
+     *  the doorLayout record. The SPLIT-WRITE seam (see commitDoorDrag). */
+    isCardinal: boolean;
+    /** The un-slid base CENTRE lateral (pairs slots park cardinals off-centre;
+     *  0 in the legacy layout and for every free door). candidate − base is
+     *  the floorPlan DELTA currency the cardinal write path speaks. */
+    baseCentre: number;
+    /** Cardinal ⇒ baseCentre − the legacy store base: the offset between the
+     *  world-centre and floorPlan-STORED currencies. The pairs slots (±2.7)
+     *  sit 0.2 off the store's 0.5 lattice, so the drag snaps/clamps in
+     *  STORED currency (centre − storeShift) — a plain world-grid snap would
+     *  not round-trip writeDoorPlacement's own snap and the door would jump
+     *  on drop. 0 for free doors and the legacy cardinal layout. */
+    storeShift: number;
+    originLateral: number;
+    candidateLateral: number;
+    valid: boolean;
+  } | null = null;
+
+  /**
    * Original emissive state, saved ONCE per material on first tint and
    * restored EXACTLY on clear (dedupe map — several meshes of one item may
    * share a material instance). Furniture materials only ever land here, but
@@ -636,6 +735,12 @@ class RoomEditController {
         this.cancelCarry(true);
         return;
       }
+      // 🚪 #28 S6c: a live door drag consumes the first Esc the same way
+      // (cancel back to the origin lateral).
+      if (this.doorDrag) {
+        this.cancelDoorDrag(true);
+        return;
+      }
       // 🚪 #28 S6b: an armed add-door sub-mode consumes the first Esc too.
       if (this.addDoorMode) {
         this.setAddDoorMode(false);
@@ -655,12 +760,14 @@ class RoomEditController {
     });
 
     // E3: right-click cancels a live carry (same restore path as Esc).
+    // 🚪 #28 S6c: ditto a live door drag.
     // 🖱️ Otherwise, right-click on a movable item — in edit mode OR the plain
     // room view — opens the MOVE / DELETE context menu (owner-gated).
     window.addEventListener('contextmenu', (e) => {
-      if (this.active && this.carrying) {
+      if (this.active && (this.carrying || this.doorDrag)) {
         e.preventDefault();
-        this.cancelCarry(true);
+        if (this.carrying) this.cancelCarry(true);
+        else this.cancelDoorDrag(true);
         return;
       }
       this.hideContextMenu();
@@ -738,11 +845,12 @@ class RoomEditController {
     });
 
     // #53: X / Delete removes the SELECTED item to the room inventory.
-    // Not while carrying — a held item must be placed or cancelled first
-    // (Esc / right-click own that path), so the origin restore stays a pure
-    // visual concern and removal always acts on a committed registry pose.
+    // Not while carrying (nor mid door drag — 🚪 #28 S6c) — a held item must
+    // be placed or cancelled first (Esc / right-click own that path), so the
+    // origin restore stays a pure visual concern and removal always acts on a
+    // committed registry pose.
     window.addEventListener('keydown', (e) => {
-      if (!this.active || this.carrying || !this.selectedId) return;
+      if (!this.active || this.carrying || this.doorDrag || !this.selectedId) return;
       if (e.key !== 'x' && e.key !== 'X' && e.key !== 'Delete') return;
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
@@ -775,6 +883,18 @@ class RoomEditController {
   public getCarryCandidate(): { x: number; z: number; rot: Rot } | null {
     return this.carrying
       ? { ...this.carrying.candidatePos, rot: this.carrying.candidateRot }
+      : null;
+  }
+
+  /** 🚪 #28 S6c: id of the door being dragged along its wall, or null. */
+  public getDoorDragId(): string | null {
+    return this.doorDrag?.doorId ?? null;
+  }
+
+  /** 🚪 #28 S6c: current snapped drag lateral + validity (debug/verification). */
+  public getDoorDragCandidate(): { lateral: number; valid: boolean } | null {
+    return this.doorDrag
+      ? { lateral: this.doorDrag.candidateLateral, valid: this.doorDrag.valid }
       : null;
   }
 
@@ -845,6 +965,7 @@ class RoomEditController {
     this.autoEntered = false; // 🖱️ any explicit exit ends a context-menu session
     this.hideContextMenu();
     this.cancelCarry(false); // E3: never exit with an item in hand
+    this.cancelDoorDrag(false); // 🚪 #28 S6c: nor with a door in hand
     this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
     this.setAddWindowMode(false); // 🪟 #80 S4: drop any armed add-window sub-mode
     this.setWallpaperMode(false); // 🖼️ #80 S6: drop any armed wallpaper sub-mode
@@ -915,6 +1036,17 @@ class RoomEditController {
       return;
     }
 
+    // 🚪 #28 S6c: a live door drag — the click is a DROP attempt at the snapped
+    // wall point (track first, mirroring the carry: a synthetic click with no
+    // preceding mousemove must still drop AT the click).
+    if (this.doorDrag) {
+      const canvas = window.gameRenderer?.renderer?.domElement;
+      if (canvas && event.target !== canvas) return;
+      this.updateDoorDragFromPointer(event.clientX, event.clientY);
+      this.commitDoorDrag();
+      return;
+    }
+
     // 🚪 #28 S6b: ADD-door sub-mode consumes the next canvas click to PLACE a
     // door at the (snapped) clicked wall point, instead of selecting.
     if (this.addDoorMode) {
@@ -935,7 +1067,12 @@ class RoomEditController {
 
     const hit = this.pickItemAt(event.clientX, event.clientY);
     if (hit && hit === this.selectedId) {
-      this.beginCarry(hit);
+      // 🚪 #28 S6c: clicking the already-selected DOOR picks it up — the same
+      // click-to-carry gesture as furniture, constrained to the door's wall.
+      // (A selected WINDOW falls through to beginCarry, which no-ops on a
+      // non-furniture id — windows don't drag.)
+      if (this.doorIds.has(hit)) this.beginDoorDrag(hit);
+      else this.beginCarry(hit);
       return;
     }
     this.setSelected(hit);
@@ -1038,6 +1175,15 @@ class RoomEditController {
   public onDoorLayoutChanged(): void {
     const world = this.world;
     if (!this.active || !world) return;
+
+    // 🚪 #28 S6c: a doorLayout change landing MID-DRAG is a REMOTE edit (our
+    // own drop ends the drag before writing, so its echo never gets here with
+    // one live). The reconcile that fired us may have re-posed, rebuilt or
+    // disposed the dragged group, so the stashed origin is no longer the truth
+    // to restore — drop the drag WITHOUT re-posing (abortDoorDrag) and let the
+    // doc-derived pose stand. Runs BEFORE the slice re-index below drops the
+    // old mesh handles, so the tint restore still finds them.
+    this.abortDoorDrag();
 
     // Drop the previous door slice (map entries only — see method doc).
     const doorMeshSet = new Set<THREE.Object3D>();
@@ -1329,6 +1475,11 @@ class RoomEditController {
       this.updateCarryFromPointer(e.clientX, e.clientY);
       return;
     }
+    // 🚪 #28 S6c: while a door drag is live, the pointer slides the door.
+    if (this.doorDrag) {
+      this.updateDoorDragFromPointer(e.clientX, e.clientY);
+      return;
+    }
     // 🚪 #28 S6b: in ADD-door mode the pointer is arming a placement, not
     // hovering — keep the crosshair, don't tint anything under it, and drive
     // the translucent green/red door ghost (S6b/ghost) that follows the wall.
@@ -1597,7 +1748,7 @@ class RoomEditController {
   private removeSelected(): void {
     const world = this.world;
     const itemId = this.selectedId;
-    if (!world || !itemId || this.carrying) return;
+    if (!world || !itemId || this.carrying || this.doorDrag) return;
 
     // 🚪 #28 S6b: a DOOR removal is its own, much shorter path — drop the layout
     // record (the reconcile removes the 3D group + walk target); NO
@@ -1863,6 +2014,278 @@ class RoomEditController {
       this.doorGhost = null;
     }
     this.ghostDoor = null;
+  }
+
+  // ── Door move (#28 S6c — drag an existing door along its wall) ───────────────
+
+  /**
+   * Pick up the (already selected) door — enter the 1-D drag. The furniture
+   * beginCarry reduced to a wall: gated on the door being UNPAIRED (a docked
+   * module follows its door — moving it would tear the pairing; the same rule
+   * REMOVE and the keypad slider enforce), then the ACTUAL group becomes the
+   * live preview, tinted with the carry green/red. The origin lateral is
+   * stashed so Esc / right-click restores the exact pose with no doc write.
+   *
+   * Editor currency: `lateral` is always the door's world CENTRE along its
+   * wall. currentDoorOpenings speaks DELTAS for cardinals, so the pickup adds
+   * the un-slid base centre back (0 in the legacy layout — the two currencies
+   * coincide for every player-built room).
+   */
+  private beginDoorDrag(doorId: string): void {
+    const world = this.world;
+    if (!world || this.carrying || this.doorDrag) return;
+    if (world.dockingSystem?.isDoorPaired(doorId)) {
+      showHint('Unpair this door first (open its keypad), then move it.', 2800);
+      return;
+    }
+    const group = world.dockingSystem?.getDoorGroups().get(doorId);
+    const opening = currentDoorOpenings().find((o) => o.id === doorId);
+    if (!group || !opening) return;
+
+    const isCardinal = isCardinalDoorId(doorId);
+    // WALL-LOCK to the PHYSICAL wall — currentDoorOpenings speaks physical
+    // currency for every door (a cardinal's pose wall: the pairs layout parks
+    // logical south/east on the north/west walls). This is the wall the whole
+    // drag projects onto, and opening.lateral is already the world centre.
+    const wall = opening.wall;
+    const basePose = isCardinal ? physicalDoorPose(doorId as DoorId, 0) : null;
+    const baseCentre = basePose
+      ? (wall === 'north' || wall === 'south' ? basePose.x : basePose.z)
+      : 0;
+    const originLateral = opening.lateral;
+    // Store-currency offset for the drag's snap/clamp (see the struct doc).
+    const storeShift = isCardinal
+      ? baseCentre - lateralOf(doorId as DoorId, LEGACY_PLACEMENTS[doorId as DoorId])
+      : 0;
+
+    this.doorDrag = {
+      doorId,
+      group,
+      wall,
+      size: opening.size,
+      isCardinal,
+      baseCentre,
+      storeShift,
+      originLateral,
+      candidateLateral: originLateral,
+      valid: true,
+    };
+    this.setHovered(null);
+    this.syncRemoveButton(); // no removal mid-drag — hide the button (#53 rule)
+    this.revalidateDoorDrag(true);
+    this.setCanvasCursor('grabbing');
+    showHint('MOVING DOOR — slides along its wall · click to place · ESC cancel', 5000);
+  }
+
+  /**
+   * The world pose for a dragged door at a centre `lateral`. Cardinals route
+   * through physicalDoorPose with the DELTA (candidate − base centre) so the
+   * legacy e/w −0.5 stand quirk and the pairs slots come out exactly as the
+   * post-drop reconcile will re-derive them; free doors are pure poseFromWall.
+   * Mirrors docking.ts poseForDoor — the drag preview and the doc echo agree.
+   */
+  private doorDragPose(
+    d: { doorId: string; wall: DoorWall; isCardinal: boolean; baseCentre: number },
+    lateral: number,
+  ): PhysicalDoorPose {
+    return d.isCardinal
+      ? physicalDoorPose(d.doorId as DoorId, lateral - d.baseCentre)
+      : poseFromWall(d.wall, lateral);
+  }
+
+  /**
+   * The drag's lateral clamp. Free doors: the wall's corner-clear limit, the
+   * same bound the ADD ghost uses. Cardinals round-trip through the legacy
+   * floorPlan store, whose OWN clamp bounds the STORED lateral (= delta +
+   * legacy base; the e/w base is −0.5) — so the bounds are computed in STORED
+   * currency (|stored| ≤ limit ∩ |centre| ≤ limit) and aligned INWARD onto the
+   * door's parity grid: even a clamped-at-the-edge candidate then stores and
+   * reads back EXACTLY, and the preview never shows a spot the commit would
+   * shift off (the west/east door at its full-negative slide, or any pairs
+   * slot whose ±2.7 base sits 0.2 off the store's 0.5 lattice).
+   */
+  private doorDragClamp(
+    d: { wall: DoorWall; size: 'small' | 'large'; isCardinal: boolean; storeShift: number },
+  ): { lo: number; hi: number } {
+    const limit = doorLateralLimitForWall(d.wall);
+    if (!d.isCardinal) return { lo: -limit, hi: limit };
+    const sLo = Math.max(-limit, -limit - d.storeShift);
+    const sHi = Math.min(limit, limit - d.storeShift);
+    return {
+      lo: doorGridCeil(d.size, sLo) + d.storeShift,
+      hi: doorGridFloor(d.size, sHi) + d.storeShift,
+    };
+  }
+
+  /**
+   * Follow the pointer: raycast the click plane, project the hit onto the
+   * door's OWN wall axis (n/s walls slide in x, e/w in z — which wall the
+   * pointer is NEAREST is deliberately ignored; the wall never changes
+   * mid-drag), snap to the door-size parity grid, clamp, re-pose the group and
+   * re-validate. The furniture updateCarryFromPointer collapsed to 1-D.
+   */
+  private updateDoorDragFromPointer(clientX: number, clientY: number): void {
+    const d = this.doorDrag;
+    const camera = window.gameRenderer?.camera;
+    const plane = this.world?.getClickPlane();
+    if (!d || !camera || !plane) return;
+    this.pointerNdc.x = (clientX / window.innerWidth) * 2 - 1;
+    this.pointerNdc.y = -(clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointerNdc, camera);
+    const hits = this.raycaster.intersectObject(plane, false);
+    if (hits.length === 0) return;
+
+    const raw = d.wall === 'north' || d.wall === 'south' ? hits[0].point.x : hits[0].point.z;
+    // Snap in the currency the drop will persist: stored = centre − storeShift
+    // (a pairs-slot cardinal's grid is 0.2 off the store's 0.5 lattice, so a
+    // world snap would shift on the post-drop reconcile). Free doors and the
+    // legacy layout: storeShift 0 — a plain world-grid snap, as before.
+    const snapped = snapDoorLateral(d.size, raw - d.storeShift) + d.storeShift;
+    const { lo, hi } = this.doorDragClamp(d);
+    const clamped = Math.max(lo, Math.min(hi, snapped));
+    if (clamped === d.candidateLateral) return;
+    d.candidateLateral = clamped;
+    const pose = this.doorDragPose(d, clamped);
+    d.group.position.set(pose.x, 2, pose.z); // world y=2 — the door-group height
+    d.group.rotation.y = pose.frameYaw;
+    this.revalidateDoorDrag();
+  }
+
+  /** Re-check the candidate spot (self-excluded — the door must not collide
+   *  with its own current opening) and retint on a verdict flip. */
+  private revalidateDoorDrag(forceTint = false): void {
+    const d = this.doorDrag;
+    if (!d) return;
+    const ok = validateDoorPlacement(d.wall, d.candidateLateral, d.size, d.doorId).ok;
+    if (ok !== d.valid || forceTint) {
+      d.valid = ok;
+      this.applyTint(
+        d.doorId,
+        ok ? CARRY_VALID_EMISSIVE : CARRY_INVALID_EMISSIVE,
+        ok ? CARRY_VALID_INTENSITY : CARRY_INVALID_INTENSITY,
+      );
+    }
+  }
+
+  /**
+   * Drop the door at the current candidate lateral. A FRESH verdict gates the
+   * drop (mirror of commitCarry — never trust the cached tint); an invalid
+   * spot refuses with a hint and STAYS in the drag, exactly like furniture.
+   *
+   * On success the drag ends CLEANLY BEFORE the doc write: the write fires the
+   * reconcile synchronously (repositionDoorGroups / reconcileDoorLayout →
+   * onDoorLayoutChanged), and a still-live drag would read as "remote edit
+   * mid-drag" and abort against our own echo. The group already sits at the
+   * candidate pose, so the echo's re-position is a visual no-op — local
+   * end-of-drag state never fights the reconcile.
+   *
+   * SPLIT WRITE (owner decision): a CARDINAL rides the LEGACY floorPlan
+   * `door:${id}` slide store — the same currency, seed and clamp as the
+   * wall-computer keypad slider, keeping the cross-client cardinal reconcile
+   * and the doors wire format untouched. A FREE door rewrites its doorLayout
+   * record. Never both stores for one door.
+   */
+  private commitDoorDrag(): void {
+    const d = this.doorDrag;
+    const world = this.world;
+    if (!d || !world) return;
+
+    const verdict = validateDoorPlacement(d.wall, d.candidateLateral, d.size, d.doorId);
+    if (!verdict.ok) {
+      d.valid = false;
+      this.applyTint(d.doorId, CARRY_INVALID_EMISSIVE, CARRY_INVALID_INTENSITY);
+      showHint(`CAN'T PLACE — ${verdict.reason}`, 2200);
+      return;
+    }
+
+    const { doorId, wall, size, isCardinal, baseCentre, candidateLateral } = d;
+    this.doorDrag = null;
+    // Back to the plain selected state (the door stays selected, like a
+    // placed furniture item).
+    if (this.selectedId === doorId) {
+      this.applyTint(doorId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else {
+      this.clearTint(doorId);
+    }
+    this.syncRemoveButton();
+    this.setCanvasCursor('');
+
+    if (isCardinal) {
+      const id = doorId as DoorId;
+      seedFloorPlan(); // lazy first-structure-commit seed (idempotent — the slider's rule)
+      // Stored currency: delta from the base centre, plus the legacy base
+      // lateral (n/s 0, e/w −0.5). doorDragClamp guaranteed this round-trips.
+      writeDoorPlacement(id, candidateLateral - baseCentre + lateralOf(id, LEGACY_PLACEMENTS[id]));
+    } else {
+      // SEED-FIRST trap: the reconcile removes any group not in the map, so a
+      // layout write against an UNSEEDED room would wipe the 4 cardinal
+      // defaults. Idempotent — same rule as add/remove (S6b).
+      seedDoorLayoutDefaults();
+      const rec = readAllDoorLayout().get(doorId);
+      writeDoorLayout(rec
+        ? { ...rec, lateral: candidateLateral }
+        // A free door always has a record (it was created by one); rebuild it
+        // from the drag stash anyway so a racing remote delete degrades to a
+        // re-add at the dropped spot rather than a lost write.
+        : { id: doorId, wall, lateral: candidateLateral, size, enabled: true });
+    }
+    showHint('Door moved.', 1400);
+  }
+
+  /**
+   * Cancel back to the exact origin lateral (Esc / right-click / exit).
+   * Nothing was written during the drag, so this is a pure visual re-pose —
+   * the mirror of cancelCarry.
+   */
+  private cancelDoorDrag(announce: boolean): void {
+    const d = this.doorDrag;
+    if (!d) return;
+    const pose = this.doorDragPose(d, d.originLateral);
+    d.group.position.set(pose.x, 2, pose.z);
+    d.group.rotation.y = pose.frameYaw;
+    this.doorDrag = null;
+    if (this.selectedId === d.doorId) {
+      this.applyTint(d.doorId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else {
+      this.clearTint(d.doorId);
+    }
+    this.syncRemoveButton();
+    this.setCanvasCursor('');
+    if (announce) showHint('Move cancelled.', 1400);
+  }
+
+  /**
+   * Drop a live drag WITHOUT re-posing the group — for doc-driven reconciles
+   * (onDoorLayoutChanged), where the reconcile's pose is authoritative and the
+   * stashed origin may describe a door that was just moved, rebuilt or removed
+   * by a remote peer. Tint restore only (harmless on disposed materials).
+   */
+  /**
+   * 🚪 #28 S6c (#86 review): a floorPlan door-placement change landing MID-DRAG
+   * is a REMOTE slide of a cardinal — the wall-computer slider or another
+   * client's drag; our own drop ends the drag BEFORE the write, so its echo
+   * never gets here with one live. world.reconcileDoorPlacements has just
+   * re-posed the door groups underneath the drag, so the stashed origin is no
+   * longer the truth Esc would restore. Mirror onDoorLayoutChanged: drop a live
+   * CARDINAL drag without re-posing and let the doc-derived pose stand. A FREE
+   * door's drag survives — the placement reconcile never touches free groups.
+   */
+  public onDoorPlacementsChanged(): void {
+    if (this.doorDrag?.isCardinal) this.abortDoorDrag();
+  }
+
+  private abortDoorDrag(): void {
+    const d = this.doorDrag;
+    if (!d) return;
+    this.doorDrag = null;
+    if (this.selectedId === d.doorId) {
+      this.applyTint(d.doorId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else {
+      this.clearTint(d.doorId);
+    }
+    this.syncRemoveButton();
+    this.setCanvasCursor('');
+    showHint('Door move interrupted by a room edit.', 2000);
   }
 
   // ── Window add / remove (#80 S4 — the window editor MVP) ────────────────────
@@ -2369,7 +2792,8 @@ class RoomEditController {
     const isDoor = this.selectedId ? this.doorIds.has(this.selectedId) : false;
     const isWindow = this.selectedId ? this.windowIds.has(this.selectedId) : false;
     const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;
-    const show = this.active && !this.carrying && (isDoor || isWindow || (!!item && item.movable));
+    const show = this.active && !this.carrying && !this.doorDrag
+      && (isDoor || isWindow || (!!item && item.movable));
     if (!this.removeBtnEl) {
       if (!show) return;
       this.removeBtnEl = document.createElement('button');
@@ -2448,6 +2872,7 @@ class RoomEditController {
         // Mirror the Esc two-stage semantics: a click WHILE carrying cancels the
         // move back to origin first; the next click then leaves edit mode.
         if (this.carrying) { this.cancelCarry(true); return; }
+        if (this.doorDrag) { this.cancelDoorDrag(true); return; } // 🚪 #28 S6c
         this.exit();
       });
       document.body.appendChild(this.exitBtnEl);
