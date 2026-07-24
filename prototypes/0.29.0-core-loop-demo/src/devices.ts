@@ -2641,6 +2641,9 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
    *  take back (standing pass/place bets from prior rolls are contract-locked). */
   let addedThisWindow: CrapsBet[] = [];
   let windowRound = 0;
+  /** round → transcript verdict, so re-renders stamp the badge from cache
+   *  instead of re-hashing the whole transcript every time (#87 review). */
+  const verifiedVerdicts = new Map<number, boolean>();
   const myId = getPlayerId();
   const regions = crapsBoardRegions();
 
@@ -3007,18 +3010,34 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
       render();
     });
     // 🔒 Verify a settled roll's transcript and stamp the badge (async — anyone
-    // can re-derive the dice from the public transcript).
+    // can re-derive the dice from the public transcript). The verdict is cached
+    // per round, and the stamp re-queries the LIVE badge and re-checks the
+    // round (#87 review): render() replaces panel.innerHTML, so a node captured
+    // before the await would be detached — and a slow promise from round N must
+    // never stamp round N+1's badge.
     if (p === 'settled' && !rolling && s?.fairness && s.dice) {
-      const badge = panel.querySelector<HTMLDivElement>('#cr-fair-badge');
       const dice = s.dice;
       const fx = s.fairness;
-      verifyTranscript(fx, deps.itemId, s.round, dice).then((ok) => {
-        if (!badge || !panel) return;
+      const forRound = s.round;
+      const stamp = (ok: boolean): void => {
+        if (!panel || round() !== forRound) return;
+        const badge = panel.querySelector<HTMLDivElement>('#cr-fair-badge');
+        if (!badge) return;
         badge.textContent = `🔒 provably fair · ${(fx.mode as string).toUpperCase()}`
           + (fx.simulated ? ' (dev-simulated)' : '')
           + (ok ? ' · ✓ verified' : ' · ✗ FAILED');
         badge.style.color = ok ? '#7CF5B0' : '#FF8A80';
-      });
+      };
+      const cached = verifiedVerdicts.get(forRound);
+      if (cached !== undefined) {
+        stamp(cached);
+      } else {
+        verifyTranscript(fx, deps.itemId, forRound, dice).then((ok) => {
+          if (verifiedVerdicts.size > 32) verifiedVerdicts.clear(); // old rounds never re-render
+          verifiedVerdicts.set(forRound, ok);
+          stamp(ok);
+        });
+      }
     }
     panel.querySelector<HTMLButtonElement>('#cr-backend')?.addEventListener('click', () => {
       if (!deps.isHouse()) return;
