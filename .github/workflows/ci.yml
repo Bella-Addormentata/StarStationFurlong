@@ -56,6 +56,10 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: '${{ env.RELEASE_FRONTEND }}/ssf-p2p-node -> target'
+          # The default key ignores the image version — a cache built on another
+          # ubuntu image restores as a broken target dir (E0463 "can't find
+          # crate"), so scope it to the pinned runner.
+          key: ubuntu-22.04
 
       - name: 🔎 cargo check (default features)
         run: cargo check --manifest-path ${{ env.RELEASE_FRONTEND }}/ssf-p2p-node/Cargo.toml
