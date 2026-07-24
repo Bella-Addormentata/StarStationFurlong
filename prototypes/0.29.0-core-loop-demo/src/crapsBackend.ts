@@ -137,7 +137,12 @@ class ChiaCrapsBackend implements CrapsBackend {
     return chiaBridge() !== null;
   }
 
-  async rollAndSettle(): Promise<[number, number]> {
+  async rollAndSettle(
+    _tableId: string,
+    _round: number,
+    _pointBefore: number | null,
+    _autoShowMs?: number,
+  ): Promise<[number, number]> {
     // Eventual flow (brainstorming/craps-chia-backend-plan.md §3–§4):
     //   1. Reveal the house seed committed at roll-open; combine with the target
     //      block hash beacon → the shared dice (identical for every channel).
