@@ -12,6 +12,18 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.29 — 2026-07-24
+
+### 🎲 Craps — the second house game (#69 G3)
+
+Bank craps joins roulette as a fully playable, house-banked table, following the same client/operator split, physical-chips rule, and walk-up standing slots.
+
+- **The table:** a new 3×1 `craps-table` furniture piece — eight standing positions, the middle of one long side reserved for the STICKMAN (the owner or their croupier robot), placed as the marquee table in the casino's south half.
+- **The game** (`games/craps.ts`, pure + console-testable): pass line & don't pass, field, place 4/5/6/8/9/10, any-7, any-craps at true casino odds. State carries across rolls — the pass line travels with the POINT, place bets stay working until a seven-out; PLACE stacks pay on the aggregate stake (no per-chip rounding loss).
+- **Integration mirrors roulette:** parallel craps accessors on the casino doc (shape-guarded so a table is one game), an auto-stickman croupier with the same deed-holder election/heartbeat, a focused board UI (tumbling dice, ON/OFF point puck, felt, chip trays), and the walk-up gather generalised to any reserved operator role.
+- **Dice fairness (testnet11, dev-phase):** switchable modes — rng / commit-reveal / multiparty / block-beacon — with T1 commit/reveal records pushed through the node; `wait_for_next_coin` waits for the spent coin to leave the unspent set before reusing the wallet (multi-coin safe).
+- **Release line:** version bumped to 0.33.29, all nine locations. **⚠ Node binaries CHANGED** — this release adds Rust node code (`chia_craps_fair.rs` + new deps), so the release workflow's node build is required (first node change since v0.30.6).
+
 ## v0.33.28 — 2026-07-23
 
 ### 🚪↔️ Drag a door along its wall to move it (#28 decouple, slice 6c)
