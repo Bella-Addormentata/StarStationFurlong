@@ -102,6 +102,25 @@ export interface FairnessTranscript {
   simulated?: boolean;
 }
 
+const FAIRNESS_MODES: readonly string[] = ['rng', 'commit-reveal', 'multiparty', 'block-beacon'];
+
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((s) => typeof s === 'string');
+}
+
+/** Shape guard for a peer-written fairness transcript — the UI dereferences
+ *  `fairness.mode` (badge render + verification), so a malformed object from a
+ *  peer must be rejected here, not crash there. */
+export function isFairnessTranscript(value: unknown): value is FairnessTranscript {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const f = value as Partial<FairnessTranscript>;
+  return typeof f.mode === 'string' && FAIRNESS_MODES.includes(f.mode)
+    && (f.commits === undefined || isStringArray(f.commits))
+    && (f.seeds === undefined || isStringArray(f.seeds))
+    && (f.beacon === undefined || typeof f.beacon === 'string')
+    && (f.simulated === undefined || typeof f.simulated === 'boolean');
+}
+
 export function initialCrapsState(): CrapsTableState {
   return {
     kind: 'craps', phase: 'betting', round: 1, point: null,
@@ -150,7 +169,7 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
         )
     ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
-    && (s.fairness === undefined || (typeof s.fairness === 'object' && s.fairness !== null))
+    && (s.fairness === undefined || isFairnessTranscript(s.fairness))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
 }

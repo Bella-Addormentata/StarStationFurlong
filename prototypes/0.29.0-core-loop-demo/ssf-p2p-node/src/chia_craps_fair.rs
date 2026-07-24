@@ -278,7 +278,7 @@ mod tests {
     // seed="ab"×32, beacon="cd"×32, table="t", round=3. Pinned here so the Rust
     // port is proven byte-for-byte identical to the TS spec (and can't drift).
     #[test]
-    fn matches_the_browser_faircdice_golden_vectors() {
+    fn matches_the_browser_fairdice_golden_vectors() {
         let seed = "ab".repeat(32);
         let beacon = "cd".repeat(32);
         assert_eq!(
