@@ -435,10 +435,14 @@ function spawnWallComputer(): void {
     showHint('DEV: this room already has a wall computer.');
     return;
   }
+  // Flush with THIS room's south wall — rooms resize via floorPlan (#66), so
+  // the canonical z=5.97 (default halfZ 6 − 0.03 m mount inset) is derived,
+  // not hard-coded, and x backs off the corner in narrow rooms.
+  const { halfX, halfZ } = roomHalfExtents();
   const item: FurnitureItem = {
     id: uniqueSpawnId('wall-computer'),
     kind: 'wall-computer',
-    pos: { x: 1.8, z: 5.97 },
+    pos: { x: Math.min(1.8, Math.max(0, halfX - 1.0)), z: halfZ - 0.03 },
     rot: 2,
     movable: false,
   };
