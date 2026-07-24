@@ -323,22 +323,25 @@ function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: num
   // logical-wall/delta report would hide a pairs door from the overlap check
   // (logical south rides the north wall) and offset every e/w comparison
   // (#86 review). Free doors' records already carry the physical pose.
-  const cardinalOpening = (id: DoorId, size: 'small' | 'large') => {
+  const cardinalOpening = (id: DoorId) => {
     const pose = physicalDoorPose(id, deltas[id] ?? 0);
     const lateral = pose.wall === 'north' || pose.wall === 'south' ? pose.x : pose.z;
-    return { id, wall: pose.wall, lateral, size };
+    // Size is a fixed cardinal invariant (e/w large, n/s small — the seed's own
+    // rule), NOT the record's field: a stale/malformed record must not skew the
+    // overlap width or the MOVE snap parity (#86 review).
+    return { id, wall: pose.wall, lateral, size: id === 'east' || id === 'west' ? 'large' as const : 'small' as const };
   };
   for (const rec of records.values()) {
     openings.push(
       isCardinalDoorId(rec.id)
-        ? cardinalOpening(rec.id as DoorId, rec.size ?? 'small')
+        ? cardinalOpening(rec.id as DoorId)
         : { id: rec.id, wall: rec.wall, lateral: rec.lateral, size: rec.size ?? 'small' },
     );
     seen.add(rec.id);
   }
   for (const id of ['north', 'south', 'east', 'west'] as const) {
     if (seen.has(id)) continue;
-    openings.push(cardinalOpening(id, id === 'east' || id === 'west' ? 'large' : 'small'));
+    openings.push(cardinalOpening(id));
   }
   return openings;
 }
