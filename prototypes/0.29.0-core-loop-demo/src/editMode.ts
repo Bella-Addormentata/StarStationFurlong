@@ -316,18 +316,29 @@ function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: num
   const records = readAllDoorLayout();
   const deltas = readDoorDeltas();
   const seen = new Set<string>();
+  // Cardinals speak PHYSICAL currency here — the pose's wall and world-centre
+  // lateral (physicalDoorPose folds in the pairs slots' ±2.7 base and the
+  // legacy e/w −0.5 stand), NOT the record's logical wall + floorPlan delta.
+  // validateDoorPlacement compares candidates in physical currency, so a
+  // logical-wall/delta report would hide a pairs door from the overlap check
+  // (logical south rides the north wall) and offset every e/w comparison
+  // (#86 review). Free doors' records already carry the physical pose.
+  const cardinalOpening = (id: DoorId, size: 'small' | 'large') => {
+    const pose = physicalDoorPose(id, deltas[id] ?? 0);
+    const lateral = pose.wall === 'north' || pose.wall === 'south' ? pose.x : pose.z;
+    return { id, wall: pose.wall, lateral, size };
+  };
   for (const rec of records.values()) {
-    const isCardinal = isCardinalDoorId(rec.id);
-    const lateral = isCardinal ? (deltas[rec.id as DoorId] ?? 0) : rec.lateral;
-    openings.push({ id: rec.id, wall: rec.wall, lateral, size: rec.size ?? 'small' });
+    openings.push(
+      isCardinalDoorId(rec.id)
+        ? cardinalOpening(rec.id as DoorId, rec.size ?? 'small')
+        : { id: rec.id, wall: rec.wall, lateral: rec.lateral, size: rec.size ?? 'small' },
+    );
     seen.add(rec.id);
   }
   for (const id of ['north', 'south', 'east', 'west'] as const) {
     if (seen.has(id)) continue;
-    openings.push({
-      id, wall: id, lateral: deltas[id] ?? 0,
-      size: id === 'east' || id === 'west' ? 'large' : 'small',
-    });
+    openings.push(cardinalOpening(id, id === 'east' || id === 'west' ? 'large' : 'small'));
   }
   return openings;
 }
@@ -1810,17 +1821,16 @@ class RoomEditController {
     if (!group || !opening) return;
 
     const isCardinal = isCardinalDoorId(doorId);
-    // WALL-LOCK to the PHYSICAL wall: a cardinal's pose wall (the pairs layout
-    // parks logical south/east on the north/west walls), a free door's record
-    // wall. This is the wall the whole drag projects onto.
+    // WALL-LOCK to the PHYSICAL wall — currentDoorOpenings speaks physical
+    // currency for every door (a cardinal's pose wall: the pairs layout parks
+    // logical south/east on the north/west walls). This is the wall the whole
+    // drag projects onto, and opening.lateral is already the world centre.
+    const wall = opening.wall;
     const basePose = isCardinal ? physicalDoorPose(doorId as DoorId, 0) : null;
-    const wall = basePose ? basePose.wall : opening.wall;
     const baseCentre = basePose
       ? (wall === 'north' || wall === 'south' ? basePose.x : basePose.z)
       : 0;
-    // Cardinal opening.lateral is the floorPlan DELTA; free doors carry their
-    // world lateral directly (baseCentre 0) — both sum to the world centre.
-    const originLateral = baseCentre + opening.lateral;
+    const originLateral = opening.lateral;
     // Store-currency offset for the drag's snap/clamp (see the struct doc).
     const storeShift = isCardinal
       ? baseCentre - lateralOf(doorId as DoorId, LEGACY_PLACEMENTS[doorId as DoorId])
