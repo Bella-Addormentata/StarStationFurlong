@@ -18,7 +18,7 @@ import {
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
-import { readTableState } from "./casinoDoc";
+import { readTableState, readCrapsTableState } from "./casinoDoc";
 import {
   beatCroupier,
   canRunCroupier,
@@ -28,6 +28,13 @@ import {
   isCroupierLive,
   tickAutoCroupier,
 } from "./croupier";
+// 🎲 #69 G3: the craps auto-stickman (parallel to the roulette croupier) +
+// its narration + teardown refund.
+import {
+  closeCrapsTable,
+  crapsBeatLine,
+  tickAutoStickman,
+} from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
@@ -99,6 +106,7 @@ import {
   createHelmUI,
   createCashierUI,
   createRouletteUI,
+  createCrapsUI,
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
@@ -213,9 +221,11 @@ export class World {
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
   private croupierNarrated = new Map<string, string>();
-  /** 🤖 #77C: which robot (dock key) is the current croupier — sticky so a
-   *  second robot doesn't dance toward the wheel before one "wins" nearest. */
-  private croupierRobotKey: string | null = null;
+  /** 🤖 #77C / #69 G3: robot (dock key) → the table id it is currently
+   *  operating. One robot per table, sticky (a bot keeps its table so bots don't
+   *  swap frame to frame). The owner adds a charging dock per table game, so a
+   *  floor of tables can each get their own dealer at its wheel-head / stickman. */
+  private croupierAssign = new Map<string, string>();
   private morphProgress = 0;
   private isMorphing = false;
   private morphDuration = 2.0; // seconds
@@ -2388,8 +2398,10 @@ export class World {
       const slot = STANDS[i];
       ring.visible = true;
       ring.position.set(slot.front.x, 0.05, slot.front.z);
+      // Any reserved operator slot (roulette wheelHead / craps stickman) rings
+      // gold; open player stands ring cyan.
       (ring.material as THREE.MeshBasicMaterial).color.setHex(
-        slot.role === "wheelHead" ? 0xffb733 : 0x35e0ff,
+        slot.role ? 0xffb733 : 0x35e0ff,
       );
     });
   }
@@ -2654,8 +2666,11 @@ export class World {
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
     // operator) and wipe its casino keys — else bettors' debited chips vanish
     // and table:/bets: records orphan. Runs pre-splice, so the kind is still known.
-    if (FURNITURE.find((i) => i.id === itemId)?.kind === "roulette-table") {
+    const removedKind = FURNITURE.find((i) => i.id === itemId)?.kind;
+    if (removedKind === "roulette-table") {
       closeTable(itemId);
+    } else if (removedKind === "craps-table") {
+      closeCrapsTable(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -4378,7 +4393,9 @@ export class World {
    *  avatar short of the table (worse than the legacy single front), so an
    *  unreachable slot is skipped and the caller falls back to the device front. */
   private pickFreeStand(itemId: string): StandSlot | null {
-    const slots = standsForItem(itemId).filter((s) => s.role !== "wheelHead");
+    // Skip any reserved operator slot (roulette wheelHead / craps stickman) —
+    // that's the owner's croupier robot's spot, never auto-picked for a walk-up.
+    const slots = standsForItem(itemId).filter((s) => !s.role);
     if (slots.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
     const me = this.player.getPosition();
@@ -4513,7 +4530,11 @@ export class World {
   }
 
   private updateCroupier(): void {
-    const tables = FURNITURE.filter((i) => i.kind === "roulette-table");
+    // Both banked house games ring an operator slot the robot posts to: the
+    // roulette wheel-head and the craps stickman. Drive each by its kind.
+    const rouletteTables = FURNITURE.filter((i) => i.kind === "roulette-table");
+    const crapsTables = FURNITURE.filter((i) => i.kind === "craps-table");
+    const tables = [...rouletteTables, ...crapsTables];
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.
@@ -4525,24 +4546,21 @@ export class World {
       if (beatNow) this.croupierLastBeatAt = now;
       for (const t of tables) {
         if (beatNow) beatCroupier(t.id);
-        tickAutoCroupier(t.id);
+        if (t.kind === "craps-table") tickAutoStickman(t.id);
+        else tickAutoCroupier(t.id);
       }
     }
 
-    // Robot post (all clients): assign the NEAREST robot to the live table's
-    // wheel-head and release every other robot to serve/dock. Only when a
-    // croupier is actually LIVE (a fresh heartbeat) — manual venture/legacy
-    // rooms keep the robots serving instead of standing mute at the wheel.
-    let post: { x: number; z: number; faceAngle: number } | null = null;
-    if (tables.length && isCroupierLive(tables[0].id)) {
-      const head = standsForItem(tables[0].id).find((s) => s.role === "wheelHead");
-      if (head) {
-        post = { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle };
-      }
-    }
-    // 🤖 #77C s3: routine-aware election. A dock robot programmed 'croupier' is
-    // preferred; if none is, a non-'idle' (serve) robot fills in so a default
-    // casino still gets a dealer; an 'idle' robot never croupiers.
+    // Robot post (all clients): stand ONE eligible robot at EACH live table's
+    // reserved operator slot (roulette wheel-head / craps stickman). The owner
+    // adds a charging dock per table game, so a floor of tables can each get
+    // their own dealer. Assignments are sticky (a robot keeps its table so bots
+    // don't swap tables frame to frame); a freed table pulls the nearest
+    // unassigned eligible robot. Only LIVE tables (a fresh operator heartbeat)
+    // get a body — manual venture/legacy rooms keep the robots serving.
+    // 🤖 #77C s3: routine-aware eligibility. A dock robot programmed 'croupier'
+    // is preferred; if none is, a non-'idle' (serve) robot fills in so a default
+    // casino still gets a dealer; an 'idle'/'custom' robot never croupiers.
     const routineOf = (key: string): RobotRoutine =>
       readRobotConfig(key)?.routine ?? "serve";
     const hasDedicated = [...this.robots.keys()].some(
@@ -4553,41 +4571,71 @@ export class World {
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
       (!hasDedicated || routineOf(k) === "croupier");
-    if (!post) {
-      this.croupierRobotKey = null;
-    } else if (!this.croupierRobotKey || !eligible(this.croupierRobotKey)) {
-      // Pick the nearest eligible robot ONCE, then keep it (sticky) so the others
-      // head straight to their docks instead of drifting toward the wheel.
+    const operatorPost = (
+      tableId: string,
+    ): { x: number; z: number; faceAngle: number } | null => {
+      const head = standsForItem(tableId).find((s) => s.role != null);
+      return head
+        ? { x: head.front.x, z: head.front.z, faceAngle: head.faceAngle }
+        : null;
+    };
+    const liveTableIds = tables
+      .filter((t) => isCroupierLive(t.id) && operatorPost(t.id))
+      .map((t) => t.id);
+    const liveIdSet = new Set(liveTableIds);
+    // Drop stale assignments (robot gone/ineligible, or its table no longer live).
+    for (const [key, tid] of [...this.croupierAssign]) {
+      if (!eligible(key) || !liveIdSet.has(tid)) this.croupierAssign.delete(key);
+    }
+    // Fill each still-unmanned live table with the nearest free eligible robot.
+    const takenTables = new Set(this.croupierAssign.values());
+    const freeRobots = [...this.robots.keys()].filter(
+      (k) => eligible(k) && !this.croupierAssign.has(k),
+    );
+    for (const tid of liveTableIds) {
+      if (takenTables.has(tid)) continue;
+      const post = operatorPost(tid)!;
       let bestKey: string | null = null;
       let best = Infinity;
-      for (const [key, bot] of this.robots) {
-        if (!eligible(key)) continue;
-        const bp = bot.getPosition();
+      for (const key of freeRobots) {
+        const bp = this.robots.get(key)!.getPosition();
         const d = Math.hypot(bp.x - post.x, bp.z - post.z);
         if (d < best) {
           best = d;
           bestKey = key;
         }
       }
-      this.croupierRobotKey = bestKey;
+      if (bestKey) {
+        this.croupierAssign.set(bestKey, tid);
+        takenTables.add(tid);
+        freeRobots.splice(freeRobots.indexOf(bestKey), 1);
+      }
     }
+    // Post every robot at its assigned table's operator slot (or release it).
     for (const [key, bot] of this.robots) {
-      bot.setCroupierPost(key === this.croupierRobotKey ? post : null);
+      const tid = this.croupierAssign.get(key);
+      bot.setCroupierPost(tid ? operatorPost(tid) : null);
     }
 
     // Narration (all clients): edge-detect each table's synced phase beat and
-    // pop one bubble over the wheel-head — only while a robot croupier is live.
+    // pop one bubble over the operator slot — only while a robot croupier is
+    // live. Dispatch the beat line by game kind.
     for (const t of tables) {
       if (!isCroupierLive(t.id)) {
         this.croupierNarrated.delete(t.id);
         continue;
       }
-      const s = readTableState(t.id);
-      if (!s) continue;
-      const beat = croupierBeatLine(s);
+      let beat: { key: string; text: string } | null = null;
+      if (t.kind === "craps-table") {
+        const s = readCrapsTableState(t.id);
+        beat = s ? crapsBeatLine(s) : null;
+      } else {
+        const s = readTableState(t.id);
+        beat = s ? croupierBeatLine(s) : null;
+      }
       if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;
       this.croupierNarrated.set(t.id, beat.key);
-      const head = standsForItem(t.id).find((x) => x.role === "wheelHead");
+      const head = standsForItem(t.id).find((x) => x.role != null);
       if (head) {
         spawnFixedBubble(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
       }
@@ -4693,20 +4741,23 @@ export class World {
       return;
     }
 
-    if (device.kind === "cashier" || device.kind === "roulette") {
-      // 🎰 #69 G1/G2: the HOUSE side (cashier book, croupier spin) rides the
-      // same owner-equivalent seam as room editing — canEditRoom funnels
-      // main.ts's isLocalPlayerRoomOwner, so a venture-owned room makes every
-      // shareholder the house (the #68 V1 rule, applied to the casino).
+    if (device.kind === "cashier" || device.kind === "roulette" || device.kind === "craps") {
+      // 🎰 #69 G1/G2/G3: the HOUSE side (cashier book, croupier spin, stickman
+      // throw) rides the same owner-equivalent seam as room editing —
+      // canEditRoom funnels main.ts's isLocalPlayerRoomOwner, so a venture-owned
+      // room makes every shareholder the house (the #68 V1 rule, applied to the
+      // casino).
       const isHouse = () => canEditRoom().ok;
       const ui =
         device.kind === "cashier"
           ? createCashierUI({ isHouse })
+          : device.kind === "craps"
+          ? createCrapsUI({ itemId: deviceId, isHouse })
           : createRouletteUI({ itemId: deviceId, isHouse });
-      // 🎰 #76: the roulette table gathers players at its open standing slots
-      // (the cashier is not a table — it keeps its single front).
+      // 🎰 #76: the game tables gather players at their open standing slots (the
+      // cashier is not a table — it keeps its single front).
       const target =
-        device.kind === "roulette" ? this.standTarget(device) : device;
+        device.kind === "cashier" ? device : this.standTarget(device);
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }

@@ -79,6 +79,7 @@ export type FurnitureKind =
   | "helm-console"
   | "cashier-atm"
   | "roulette-table"
+  | "craps-table"
   | "casino-booth"
   | "casino-gold-wall"
   | "casino-orb-lamp"
@@ -168,9 +169,11 @@ export interface StandTemplate {
   /** World facing while standing (atan2(nx,nz): +z=0, +x=π/2, -z=π, -x=-π/2)
    *  — points TOWARD the table. */
   faceAngle: number;
-  /** 🎰 'wheelHead' = the spin position, reserved for the room owner or the
-   *  owner's robot (see #76 / #77). Regular stands are open to anyone. */
-  role?: "wheelHead";
+  /** 🎰 The reserved OPERATOR position, held for the room owner or the owner's
+   *  robot (see #76 / #77): 'wheelHead' spins the roulette wheel, 'stickman'
+   *  throws the craps dice. Regular stands are open to anyone; any operator role
+   *  is auto-skipped by the walk-up picker and is where the robot croupier posts. */
+  role?: "wheelHead" | "stickman";
 }
 
 /** A StandTemplate derived into world space (see buildStandList). */
@@ -178,7 +181,7 @@ export interface StandSlot {
   id: string;
   front: { x: number; z: number };
   faceAngle: number;
-  role?: "wheelHead";
+  role?: "wheelHead" | "stickman";
 }
 
 /** Build-time helpers bound to the item's group (all coordinates local). */
@@ -2789,6 +2792,26 @@ const rouletteStands: StandTemplate[] = [
   { stand: { x: 0.7, z: 1.5 }, faceAngle: Math.PI },
 ];
 
+// 🎲 Craps table (3×1 footprint — 50% longer than roulette): 8 standing
+// positions ringing it. Players line the two LONG (±z) faces, three per side,
+// with one at each SHORT (±x) end. The MIDDLE of the +z long face is the
+// STICKMAN — the reserved operator spot (owner / croupier robot) who works the
+// dice stick. faceAngle points toward the table centre (atan2(nx,nz)): the +z
+// side faces -z (π), the -z side faces +z (0), the +x end faces -x (-π/2), the
+// -x end faces +x (π/2). Long faces sit 1.0 m beyond the ±0.5 z-edge; the ends
+// 0.5 m beyond the ±1.5 x-edge — clear of the collision inflation so the avatar
+// lands exactly on each front (same clearance rule as the roulette stands).
+const crapsStands: StandTemplate[] = [
+  { stand: { x: 0.0, z: 1.5 }, faceAngle: Math.PI, role: "stickman" },
+  { stand: { x: -0.9, z: 1.5 }, faceAngle: Math.PI },
+  { stand: { x: 0.9, z: 1.5 }, faceAngle: Math.PI },
+  { stand: { x: -0.9, z: -1.5 }, faceAngle: 0 },
+  { stand: { x: 0.0, z: -1.5 }, faceAngle: 0 },
+  { stand: { x: 0.9, z: -1.5 }, faceAngle: 0 },
+  { stand: { x: -2.0, z: 0.0 }, faceAngle: Math.PI / 2 },
+  { stand: { x: 2.0, z: 0.0 }, faceAngle: -Math.PI / 2 },
+];
+
 // ♟️ Chess / game table (2×1): 2 positions facing off across the board.
 const gameTableStands: StandTemplate[] = [
   { stand: { x: 0.0, z: -1.5 }, faceAngle: 0 },
@@ -3119,6 +3142,24 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       front: { x: 0, z: -1.0 },
       faceAngle: 0,
       eye: { x: 0, y: 1.7, z: -0.95 },
+      anchor: { x: 0, y: 0.85, z: 0 },
+    },
+  },
+  // 🎲 #69 G3: the craps table — a 3×1 footprint (50% longer than roulette),
+  // eight standing positions with a reserved STICKMAN operator spot. Device
+  // front is the -z player rail; the walk-up picker gathers players at the open
+  // stands and posts the robot at the stickman slot.
+  "craps-table": {
+    kind: "craps-table",
+    build: buildCrapsTable,
+    footprint: { w: 3, d: 1 },
+    functions: ["crapsTable"],
+    stands: crapsStands,
+    device: {
+      kind: "craps",
+      front: { x: 0, z: -1.4 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.7, z: -1.3 },
       anchor: { x: 0, y: 0.85, z: 0 },
     },
   },
@@ -4856,6 +4897,136 @@ function buildRouletteTable(ctx: BuildCtx) {
   });
 }
 
+/** Craps felt (canvas 768×256, a 3:1 table): green baize with the classic
+ *  layout schematic — PASS LINE / DON'T PASS along the rails, the number boxes
+ *  and FIELD across the centre. Painted once; the LIVE board is the focused UI. */
+function drawCrapsFelt(c2d: CanvasRenderingContext2D): void {
+  const W = 768, H = 256;
+  c2d.fillStyle = "#14532D";
+  c2d.fillRect(0, 0, W, H);
+  c2d.fillStyle = "#1B6B3A";
+  c2d.fillRect(10, 10, W - 20, H - 20);
+  c2d.strokeStyle = "rgba(240, 224, 180, 0.85)";
+  c2d.lineWidth = 3;
+  c2d.strokeRect(10, 10, W - 20, H - 20);
+  c2d.fillStyle = "#F0E6C8";
+  c2d.textAlign = "center";
+  c2d.textBaseline = "middle";
+  // The point-number boxes across the top (4 5 6 8 9 10 — the felt's spine).
+  const nums = [4, 5, 6, 8, 9, 10];
+  const bw = 108, bx0 = 44, by = 34, bh = 74;
+  nums.forEach((n, i) => {
+    const bx = bx0 + i * bw;
+    c2d.strokeRect(bx, by, bw - 8, bh);
+    c2d.font = "bold 40px monospace";
+    c2d.fillText(String(n), bx + (bw - 8) / 2, by + bh / 2);
+  });
+  // FIELD strip.
+  c2d.strokeRect(44, 128, W - 88, 44);
+  c2d.font = "bold 24px monospace";
+  c2d.fillText("FIELD  ·  2  3  4  9  10  11  12", W / 2, 150);
+  // PASS / DON'T PASS rails along the bottom.
+  c2d.strokeRect(44, 186, (W - 96) / 2, 44);
+  c2d.strokeRect(52 + (W - 96) / 2, 186, (W - 96) / 2, 44);
+  c2d.font = "bold 26px monospace";
+  c2d.fillText("PASS  LINE", 44 + (W - 96) / 4, 208);
+  c2d.fillText("DON'T  PASS", 52 + (W - 96) * 0.75, 208);
+}
+
+/** 🎲 Craps table (#69 G3): a long green baize table — 50% longer than the
+ *  roulette table (3×1 vs 2×1) — with a padded rail, the layout felt, chip rails
+ *  along both long sides, and the STICKMAN's dice stick resting on the +z rail. */
+function buildCrapsTable(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const HALF_X = 1.43; // top slab half-width along x (~2.86 → inside the 3×1 footprint)
+  const HALF_Z = 0.48;
+  // Base apron.
+  place(
+    new THREE.BoxGeometry(HALF_X * 2 - 0.1, 0.14, 0.86),
+    m(0x4a2f1b, 0.55, 0.15),
+    0, 0.62, 0,
+  );
+  // Six legs (a long table needs a middle pair).
+  (
+    [
+      [-1.28, -0.35], [-1.28, 0.35],
+      [0.0, -0.35], [0.0, 0.35],
+      [1.28, -0.35], [1.28, 0.35],
+    ] as [number, number][]
+  ).forEach(([lx, lz]) => {
+    place(new THREE.BoxGeometry(0.12, 0.62, 0.12), m(0x3a2417, 0.55, 0.18), lx, 0.31, lz);
+    place(new THREE.BoxGeometry(0.15, 0.04, 0.15), m(0x4a2f1b, 0.5, 0.2), lx, 0.02, lz);
+  });
+  // Top slab + padded rim.
+  place(
+    new THREE.BoxGeometry(HALF_X * 2, 0.07, HALF_Z * 2),
+    m(0x4a2f1b, 0.5, 0.2),
+    0, 0.775, 0,
+  );
+  for (const [w, d, lx, lz] of [
+    [HALF_X * 2, 0.08, 0, -HALF_Z],
+    [HALF_X * 2, 0.08, 0, HALF_Z],
+    [0.08, HALF_Z * 2, -HALF_X, 0],
+    [0.08, HALF_Z * 2, HALF_X, 0],
+  ] as [number, number, number, number][]) {
+    place(new THREE.BoxGeometry(w, 0.09, d), m(0x3a2417, 0.6, 0.1), lx, 0.845, lz);
+  }
+  // Felt (canvas) across the top.
+  const feltCv = document.createElement("canvas");
+  feltCv.width = 768;
+  feltCv.height = 256;
+  drawCrapsFelt(feltCv.getContext("2d")!);
+  const feltTex = new THREE.CanvasTexture(feltCv);
+  feltTex.minFilter = THREE.NearestFilter;
+  feltTex.magFilter = THREE.NearestFilter;
+  feltTex.generateMipmaps = false;
+  feltTex.colorSpace = THREE.SRGBColorSpace;
+  const feltGeo = new THREE.PlaneGeometry(HALF_X * 2 - 0.12, HALF_Z * 2 - 0.12);
+  feltGeo.rotateX(-Math.PI / 2);
+  place(
+    feltGeo,
+    new THREE.MeshBasicMaterial({ map: feltTex, transparent: true, opacity: 0 }),
+    0, 0.812, 0,
+  );
+  // Chip rails along both long sides (raised troughs).
+  for (const rz of [-HALF_Z + 0.06, HALF_Z - 0.06]) {
+    place(new THREE.BoxGeometry(HALF_X * 2 - 0.3, 0.03, 0.07), m(0x3a2417, 0.6, 0.1), 0, 0.86, rz);
+  }
+  // Deco chip stacks in the rails.
+  const chipColors = [0xc43c3c, 0x3e92b8, 0xf0c060, 0x2e7d46];
+  chipColors.forEach((col, i) => {
+    place(
+      new THREE.CylinderGeometry(0.045, 0.045, 0.06, 12),
+      m(col, 0.5, 0.25),
+      -1.0 + i * 0.12,
+      0.9,
+      HALF_Z - 0.06,
+    );
+  });
+  // 🎲 The STICKMAN's dice stick — a slim curved stick resting on the +z rail at
+  // the middle (the reserved operator's tool). A shaft + a small hook at the end.
+  const stick = place(
+    new THREE.CylinderGeometry(0.014, 0.014, 0.9, 8),
+    m(0x8a5a2a, 0.5, 0.2),
+    0.0, 0.905, HALF_Z - 0.02,
+  );
+  stick.rotation.z = Math.PI / 2; // lie flat along x
+  const hook = place(
+    new THREE.TorusGeometry(0.05, 0.012, 6, 12, Math.PI),
+    m(0x8a5a2a, 0.5, 0.2),
+    0.45, 0.905, HALF_Z - 0.02,
+  );
+  hook.rotation.x = Math.PI / 2;
+  // Two dice resting at the stickman's spot (deco).
+  for (const dx of [-0.05, 0.05]) {
+    place(
+      new THREE.BoxGeometry(0.05, 0.05, 0.05),
+      m(0xf4efe2, 0.4, 0.1),
+      dx, 0.87, HALF_Z - 0.14,
+    );
+  }
+}
+
 // ── 🛏️ Bunk bed (owner request) — two stacked sleep berths ───────────────────
 // Concept-art-faithful crew berth: light station-gray frame, gray-green
 // mattress pads with orange + blue sleep-restraint straps (micro-gravity
@@ -5879,17 +6050,15 @@ export const CASINO_FURNITURE: FurnitureItem[] = [
     rot: 0,
     movable: true,
   },
+  // 🎲 #69 G3: the craps pit — the marquee table takes the south half of the
+  // floor (the z=1/z=3 column tables moved aside to give its eight standing
+  // positions and the stickman's dice-stick spot clear room). 3×1 footprint at
+  // (0, 2.8); stands ring out to z∈[1.3,4.3] · x∈[-2,2], clear of every wall
+  // (±6) and door centre.
   {
-    id: "casino-roulette-c",
-    kind: "roulette-table",
-    pos: { x: -1.5, z: 1 },
-    rot: 0,
-    movable: true,
-  },
-  {
-    id: "casino-roulette-d",
-    kind: "roulette-table",
-    pos: { x: -1.5, z: 3 },
+    id: "casino-craps",
+    kind: "craps-table",
+    pos: { x: 0, z: 2.8 },
     rot: 0,
     movable: true,
   },
@@ -5904,20 +6073,6 @@ export const CASINO_FURNITURE: FurnitureItem[] = [
     id: "casino-game-b",
     kind: "game-table",
     pos: { x: 1.5, z: -1 },
-    rot: 0,
-    movable: true,
-  },
-  {
-    id: "casino-game-c",
-    kind: "game-table",
-    pos: { x: 1.5, z: 1 },
-    rot: 0,
-    movable: true,
-  },
-  {
-    id: "casino-game-d",
-    kind: "game-table",
-    pos: { x: 1.5, z: 3 },
     rot: 0,
     movable: true,
   },

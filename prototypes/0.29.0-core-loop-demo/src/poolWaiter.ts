@@ -529,9 +529,10 @@ export class PoolWaiter {
     this.body.position.y = Math.sin(this.time * 1.6) * 0.01;
   }
 
-  /** 🎰🤖 Point the bot at a roulette wheel-head (world pos + facing). The world
-   *  calls this after locating the table's `role:'wheelHead'` stand; null clears
-   *  it and returns the bot to patrol/dock. Croupier duty overrides both. */
+  /** 🎰🤖 Point the bot at a table's operator slot (world pos + facing) — the
+   *  roulette wheel-head or the craps stickman. The world calls this after
+   *  locating the table's reserved (`role`) stand; null clears it and returns
+   *  the bot to patrol/dock. Croupier duty overrides both. */
   public setCroupierPost(
     post: { x: number; z: number; faceAngle: number } | null,
   ): void {

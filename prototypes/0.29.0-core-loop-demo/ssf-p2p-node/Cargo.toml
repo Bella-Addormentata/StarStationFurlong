@@ -1,6 +1,6 @@
 [package]
 name = "ssf-p2p-node"
-version = "0.33.28"
+version = "0.33.29"
 edition = "2021"
 publish = false
 description = "Sovereign P2P Swarm Node & WebTransport Router (Phase 2 P2P Backbone)"
@@ -64,6 +64,9 @@ clvmr = { version = "0.16", optional = true }
 # Slice 5 (resolve): ToClvm/FromClvm traits to run the parent spend and decode the
 # create_coin memos back out (already transitive; direct dep makes them nameable).
 clvm-traits = { version = "0.36", optional = true }
+# Craps fairness (plan §12 / T1): SHA-256 for the commit-reveal + beacon dice
+# derivation, byte-for-byte identical to the browser's src/games/fairDice.ts.
+sha2 = { version = "0.10", optional = true }
 
 [features]
 # Off by default. Turns on the Chia introduction-lane chain IO (wallet address,
@@ -71,5 +74,5 @@ clvm-traits = { version = "0.36", optional = true }
 chia-lane = [
     "dep:chia-bls", "dep:chia-protocol", "dep:chia-puzzle-types", "dep:chia-sdk-utils",
     "dep:chia-sdk-driver", "dep:chia-sdk-types", "dep:chia-sdk-signer", "dep:chia-sdk-coinset",
-    "dep:clvmr", "dep:clvm-traits",
+    "dep:clvmr", "dep:clvm-traits", "dep:sha2",
 ]

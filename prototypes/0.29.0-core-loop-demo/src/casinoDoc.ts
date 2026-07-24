@@ -39,11 +39,21 @@
 import * as Y from 'yjs';
 import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
+import { isCrapsBet, isCrapsTableState } from './games/craps';
+import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
   round: number;
   bets: RouletteBet[];
+}
+
+/** 🎲 One player's craps bets. Unlike roulette these PERSIST across rolls (a
+ *  pass line rides its point; a place bet stays working), so there is no round
+ *  stamp — the stickman prunes the list at each settle (see games/craps.ts). */
+export interface CrapsTableBets {
+  kind: 'craps';
+  bets: CrapsBet[];
 }
 
 let boundDoc: Y.Doc | null = null;
@@ -197,6 +207,11 @@ export function clearTableKeys(tableId: string): void {
   boundDoc!.transact(() => {
     map.delete(`table:${tableId}`);
     map.delete(`croupier:${tableId}`);
+    // 🎲 The per-table config keys ride the same map — a removed table must
+    // not leave orphaned settings behind (harmless no-op for roulette, which
+    // never writes them).
+    map.delete(`cfg:backend:${tableId}`);
+    map.delete(`cfg:fairness:${tableId}`);
     for (const key of [...map.keys()]) {
       if (key.startsWith(betPrefix)) map.delete(key);
     }
@@ -257,10 +272,106 @@ export function readAllBets(tableId: string, round: number): Record<string, Roul
   return out;
 }
 
+// ── 🎲 Craps table state + bets (#69 G3) ─────────────────────────────────────
+// Same casino-map keys as roulette (`table:<id>`, `bets:<id>:<pid>`) — a given
+// table is one game, so the shapes never collide, and clearTableKeys /
+// creditChips / the croupier heartbeat are already game-agnostic. Craps bets are
+// NOT round-stamped: they carry across rolls until the stickman prunes them.
+
+export function readCrapsTableState(tableId: string): CrapsTableState | null {
+  const value = ensureMap().get(`table:${tableId}`);
+  return isCrapsTableState(value) ? value : null;
+}
+
+/** Stickman-only in practice (the UI gates on the house predicate). */
+export function writeCrapsTableState(tableId: string, state: CrapsTableState): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`table:${tableId}`, state);
+  });
+}
+
+function isCrapsTableBets(value: unknown): value is CrapsTableBets {
+  if (typeof value !== 'object' || value === null) return false;
+  const t = value as Partial<CrapsTableBets>;
+  return t.kind === 'craps' && Array.isArray(t.bets) && t.bets.every(isCrapsBet);
+}
+
+export function readMyCrapsBets(tableId: string, playerId: string): CrapsBet[] {
+  const value = ensureMap().get(`bets:${tableId}:${playerId}`);
+  return isCrapsTableBets(value) ? value.bets : [];
+}
+
+export function writeMyCrapsBets(tableId: string, playerId: string, bets: CrapsBet[]): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`bets:${tableId}:${playerId}`, { kind: 'craps', bets });
+  });
+}
+
+/** Every player's standing craps bets on one table (the stickman's settle read;
+ *  also drives the "on the felt" spectator view). Empty lists are omitted. */
+export function readAllCrapsBets(tableId: string): Record<string, CrapsBet[]> {
+  const prefix = `bets:${tableId}:`;
+  const out: Record<string, CrapsBet[]> = {};
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix)) continue;
+    if (!isCrapsTableBets(value) || value.bets.length === 0) continue;
+    out[key.slice(prefix.length)] = value.bets;
+  }
+  return out;
+}
+
+// ── 🎲🔗 Craps settlement backend preference (#69 G5 seam) ────────────────────
+// Which backend settles a craps table — 'local' (crypto RNG + these room-doc
+// chips, the default) or 'chia' (per-player↔house state channels + a shared
+// beacon-anchored dice; see brainstorming/craps-chia-backend-plan.md). Owner-set,
+// synced so every client agrees which backend the elected operator runs. Plain
+// string in the casino map (`cfg:backend:<tableId>`); a bad/absent value reads as
+// 'local', so legacy tables and un-set tables behave exactly as before.
+
+export type CrapsBackendKind = 'local' | 'chia';
+
+export function readCrapsBackendPref(tableId: string): CrapsBackendKind {
+  return ensureMap().get(`cfg:backend:${tableId}`) === 'chia' ? 'chia' : 'local';
+}
+
+export function writeCrapsBackendPref(tableId: string, kind: CrapsBackendKind): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`cfg:backend:${tableId}`, kind === 'chia' ? 'chia' : 'local');
+  });
+}
+
+// 🎲🔀 Per-table dice-fairness MODE override (dev phase, plan §fairness modes) —
+// which strategy produces this table's dice (see games/diceFairness.ts). Owner-set
+// + synced so every client agrees. Absent ⇒ the global default (getCrapsFairnessMode).
+
+const FAIRNESS_MODES: readonly FairnessMode[] = [
+  'rng', 'commit-reveal', 'multiparty', 'block-beacon',
+];
+
+export function readCrapsFairnessPref(tableId: string): FairnessMode | null {
+  const v = ensureMap().get(`cfg:fairness:${tableId}`);
+  return typeof v === 'string' && (FAIRNESS_MODES as readonly string[]).includes(v)
+    ? (v as FairnessMode)
+    : null;
+}
+
+export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`cfg:fairness:${tableId}`, mode);
+  });
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing.
 (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
   readChips, buyInChips, cashOutChips, spendChips, creditChips,
   readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
   readCroupierBeat, writeCroupierBeat,
+  readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
+  readCrapsBackendPref, writeCrapsBackendPref,
+  readCrapsFairnessPref, writeCrapsFairnessPref,
 };

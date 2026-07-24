@@ -4735,7 +4735,7 @@ dependencies = [
 
 [[package]]
 name = "ssf-p2p-node"
-version = "0.33.28"
+version = "0.33.29"
 dependencies = [
  "anyhow",
  "base64",
@@ -4758,6 +4758,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "wtransport",
  "yrs",
