@@ -1505,6 +1505,11 @@ export class World {
     setDoorSlideDeltas(deltas);
     this.dockingSystem?.repositionDoorGroups(deltas);
     this.updateNorthDoorForFireplace();
+    // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
+    // drag when the placement changed remotely (slider / another client's drag)
+    // — the drag's stashed origin is stale now, so the editor drops it and the
+    // doc-derived pose stands, mirroring the doorLayout mid-drag abort.
+    roomEdit.onDoorPlacementsChanged();
   }
 
   /**

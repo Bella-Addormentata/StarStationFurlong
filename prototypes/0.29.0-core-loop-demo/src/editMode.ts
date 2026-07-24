@@ -2038,6 +2038,20 @@ class RoomEditController {
    * stashed origin may describe a door that was just moved, rebuilt or removed
    * by a remote peer. Tint restore only (harmless on disposed materials).
    */
+  /**
+   * 🚪 #28 S6c (#86 review): a floorPlan door-placement change landing MID-DRAG
+   * is a REMOTE slide of a cardinal — the wall-computer slider or another
+   * client's drag; our own drop ends the drag BEFORE the write, so its echo
+   * never gets here with one live. world.reconcileDoorPlacements has just
+   * re-posed the door groups underneath the drag, so the stashed origin is no
+   * longer the truth Esc would restore. Mirror onDoorLayoutChanged: drop a live
+   * CARDINAL drag without re-posing and let the doc-derived pose stand. A FREE
+   * door's drag survives — the placement reconcile never touches free groups.
+   */
+  public onDoorPlacementsChanged(): void {
+    if (this.doorDrag?.isCardinal) this.abortDoorDrag();
+  }
+
   private abortDoorDrag(): void {
     const d = this.doorDrag;
     if (!d) return;
