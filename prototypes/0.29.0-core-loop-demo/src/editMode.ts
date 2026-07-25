@@ -70,6 +70,7 @@ import {
   seedFloorPlan, writeDoorPlacement, lateralOf, LEGACY_PLACEMENTS,
 } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
+import { rebuildStands } from './stands';
 import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
 import type { DoorId } from './doors';
@@ -1610,8 +1611,9 @@ class RoomEditController {
    * Commit the carry at the current candidate: registry write-through, then
    * the full rebake pipeline in the order the derivations depend on each
    * other — rebuildObstacles → rebakeWalkableGrid → rebuildSeats →
-   * rebuildDevices (seats AND devices bake world-space fronts/poses off the
-   * fresh grid — the #33 review's coordination point) — then
+   * rebuildStands → rebuildDevices (seats, stands, AND devices bake
+   * world-space fronts/poses off the fresh grid — the #33 review's
+   * coordination point) — then
    * player.onObstaclesChanged(). Invalid spots reject with a hint and stay
    * in carry mode.
    */
@@ -1643,6 +1645,7 @@ class RoomEditController {
     rebuildObstacles();
     rebakeWalkableGrid();
     rebuildSeats();
+    rebuildStands();
     rebuildDevices();
     world.getPlayer().onObstaclesChanged(c.itemId);
     world.refreshOutdoorFloor(); // 🏊 pool moved in/out → toggle the outdoor floor
@@ -1819,11 +1822,12 @@ class RoomEditController {
     // 5. Stow in the per-room furniture inventory.
     addToRoomInventory(activeRoomId(), item.kind);
 
-    // 6. The exact commit rebake pipeline (commitCarry's order — seats AND
-    //    devices bake world-space fronts/poses off the fresh grid).
+    // 6. The exact commit rebake pipeline (commitCarry's order — seats,
+    //    stands, AND devices bake world-space fronts/poses off the fresh grid).
     rebuildObstacles();
     rebakeWalkableGrid();
     rebuildSeats();
+    rebuildStands();
     rebuildDevices();
     player.onObstaclesChanged(itemId);
     world.refreshOutdoorFloor(); // 🏊 pool removed → restore the outdoor floor (no void)
