@@ -91,9 +91,12 @@ import { bindFloorPlan, subscribeFloorPlan, readRoomDims } from "./floorPlanDoc"
 import {
   bindDoorLayoutDoc,
   seedDoorLayoutDefaults,
+  seedDoorLayoutSingle,
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
+import type { DoorWall } from "./doorLayoutDoc";
 import { isCardinalDoorId } from "./doorLayout";
+import type { DoorLayoutKind } from "./doorLayout";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
@@ -385,12 +388,19 @@ let sessionReturnRoute: {
  * Every other transit is a JOIN into someone else's room (false).
  */
 const mintedRoomIds = new Set<string>();
-/** 🏗️ Template chosen at the door panel when a module was provisioned this
- *  session (roomId → template id). Read once at the new room's first claim to
- *  seed its layout instead of the lobby default. Session-only for now — a
+/** 🏗️ What was chosen at the door panel when a module was provisioned this
+ *  session (roomId → provision record). Read once at the new room's first claim
+ *  to seed its layout instead of the lobby default. Session-only for now — a
  *  reload between provisioning and first entry falls back to the empty/lobby
  *  seed (persisting the choice with the minted room is a follow-up). */
-const mintedRoomTemplates = new Map<string, string>();
+interface MintedModule {
+  templateId: string;
+  /** 🛰️🚪 The wall the module's ONE door is born on — its way back to the room
+   *  it was added from. Absent for a module minted with no parent berth (the
+   *  dev menu, the standalone-station flow), which keeps the 4-door default. */
+  birthWall?: DoorWall;
+}
+const mintedRoomTemplates = new Map<string, MintedModule>();
 
 /** Staged room-list (issue #60): the passes manager is restored+warmed once,
  *  after the first join confirms the node is up. */
@@ -1301,6 +1311,24 @@ async function joinRoomAtEpoch(
       roomMap.set("owner", getPlayerId());
       roomMap.set("name", boot.roomId || "Lobby");
     });
+    // 🛰️🚪 A module added from a berth is born with ONE door. This runs HERE,
+    // in the synchronous claim, and not with the other seeds below: those wait
+    // on whenServerSynced, while awaitInitialRoomState returns as soon as
+    // owner+name exist (which the transaction above just wrote). The walk-in is
+    // therefore already being scripted against reconcileDoorLayout's four-door
+    // fallback — a seed landing later would delete doors out from under it,
+    // possibly the very one the avatar is walking through. Claiming a room this
+    // client minted this session cannot clobber remote state, which is the same
+    // argument that licenses the owner/name write above.
+    const mintedHere = mintedRoomTemplates.get(boot.roomId);
+    if (mintedHere?.birthWall && doorLayoutDocSize() === 0) {
+      seedDoorLayoutSingle(mintedHere.birthWall);
+      // A single door must sit CENTRED on its wall, which only the "legacy"
+      // layout does — the paired layouts park every cardinal ±PAIR_OFFSET off
+      // centre. Stamped into roomInfo so it holds on every future entry and
+      // for every joiner, the same way the template's theme is.
+      roomMap.set("doorLayout", "legacy");
+    }
   }
   // E4 furniture seed (issue #60): the owner publishes the initial layout so
   // joiners converge to it — but DEFERRED past the node's initial-state sync.
@@ -1313,7 +1341,7 @@ async function joinRoomAtEpoch(
     const seedEpoch = epoch;
     // 🏗️ If this room was provisioned from a template at the door panel this
     // session, remember which one — it seeds instead of the lobby default.
-    const provisionTemplateId = mintedRoomTemplates.get(boot.roomId);
+    const provisionTemplateId = mintedRoomTemplates.get(boot.roomId)?.templateId;
     void sync.whenServerSynced.then(() => {
       if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
       const ownsRoom = roomMap.get("owner") === getPlayerId();
@@ -1403,6 +1431,14 @@ async function joinRoomAtEpoch(
   const resolveTheme = (): RoomTheme =>
     (roomMap.get("theme") as RoomTheme | undefined) ??
     legacyThemeFromRoomId(boot.roomId);
+  // 🛰️🚪 A room may name its own door arrangement (a module born with one
+  // door asks for legacy so that door sits centred). Absent ⇒ world picks.
+  const resolveDoorLayout = (): DoorLayoutKind | undefined => {
+    const v = roomMap.get("doorLayout");
+    return v === "legacy" || v === "casino-pairs" || v === "pool-pairs"
+      ? v
+      : undefined;
+  };
   let appliedTheme: RoomTheme = resolveTheme();
 
   // 🏝️ Outdoor casino pool room: seed furniture on first entry (the normal
@@ -1439,7 +1475,7 @@ async function joinRoomAtEpoch(
       deleteFurnitureItem("pool-cashier");
       deleteFurnitureItem("pool-roulette");
     });
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme());
+    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
   } else if (boot.roomId === CASINO_ROOM_ID) {
     const casinoEpoch = epoch;
     void sync.whenServerSynced.then(() => {
@@ -1451,10 +1487,10 @@ async function joinRoomAtEpoch(
         deleteFurnitureItem(id);
       }
     });
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme());
+    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
   } else {
     // Returning to any non-outdoor room (lobby, etc.): restore lobby visuals.
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme());
+    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
   }
 
   // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
@@ -1504,7 +1540,7 @@ async function joinRoomAtEpoch(
     const t = resolveTheme();
     if (t !== appliedTheme) {
       appliedTheme = t;
-      world?.applyRoomVisuals(boot.roomId, undefined, t);
+      world?.applyRoomVisuals(boot.roomId, undefined, t, resolveDoorLayout());
     }
   });
 
@@ -2054,7 +2090,21 @@ async function transitTo(
     const arrivalTheme =
       (yjsSync?.doc.getMap("roomInfo").get("theme") as RoomTheme | undefined) ??
       legacyThemeFromRoomId(arrivalRoomId);
-    world.applyRoomVisuals(arrivalRoomId, arrivalDoorId, arrivalTheme);
+    // 🛰️🚪 …and its door arrangement, for the same reason: a module born with
+    // one door names "legacy" so that door renders centred on its wall.
+    const arrivalLayoutRaw = yjsSync?.doc.getMap("roomInfo").get("doorLayout");
+    const arrivalLayout: DoorLayoutKind | undefined =
+      arrivalLayoutRaw === "legacy" ||
+      arrivalLayoutRaw === "casino-pairs" ||
+      arrivalLayoutRaw === "pool-pairs"
+        ? arrivalLayoutRaw
+        : undefined;
+    world.applyRoomVisuals(
+      arrivalRoomId,
+      arrivalDoorId,
+      arrivalTheme,
+      arrivalLayout,
+    );
   }
 
   // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY
@@ -2140,6 +2190,7 @@ function wireAdapterTransit(): void {
   world.isTransitBusy = () => transitInProgress;
   const provisionModuleSeed = async (
     templateId = "empty",
+    parentDoorId?: string,
   ): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
@@ -2149,9 +2200,21 @@ function wireAdapterTransit(): void {
     const minted = await mintBootstrapLink(undefined, roomId);
     if (!minted.link) return null;
     mintedRoomIds.add(roomId);
+    // 🛰️🚪 A module added from a BERTH is born with exactly ONE door — its way
+    // back to this room — centred on a wall that carries the octagon
+    // cross-section. For a square room those are west and east
+    // (hullSection.narrowAxisFor returns 'x', so the barrel's flat END CAPS are
+    // north/south); the module's hull is built from its OWN half-extents, so
+    // that holds whichever wall of ours it was added from. `west` is the pick:
+    // it is an octagon wall and it maps to the same physical wall under every
+    // door layout. Which room it LEADS BACK to is the pairing's job, not the
+    // compass — so a fixed wall is right for all four parent berths.
+    // Minted with no berth (dev menu / standalone station) ⇒ no birthWall, and
+    // the room keeps the normal 4-door default: it has nothing to lead back to.
+    const birthWall: DoorWall | undefined = parentDoorId ? "west" : undefined;
     // 🏗️ Remember the chosen room template so this module is born from it on
     // first claim (see the claimRoomDefaults seed path).
-    mintedRoomTemplates.set(roomId, templateId);
+    mintedRoomTemplates.set(roomId, { templateId, birthWall });
     // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
     // than a clipboard that holds one) and powers auto-accept.
     addToLedger(roomId, minted.link);

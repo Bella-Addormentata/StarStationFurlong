@@ -26,6 +26,15 @@ Doors are locked to the floor grid, there is now **one door** instead of two siz
 - **Doors you can actually reach.** Placement now refuses a spot where furniture stands on the door's walk-in point — that used to validate green and then simply never work.
 - **Travel directions.** Arrival picks the door on the **facing wall** rather than by name — walking north now brings you in through the far room's south side. (See the note below: rooms whose doors all sit on two walls still can't offer a facing door.)
 - **Also fixed:** clicking a placed door's keypad no longer throws (free doors have no terminal — they're passages); permissions on a placed door are no longer silently discarded; an **undocked** module stays undocked instead of re-pairing itself on the next walk-through; a removed door takes its connector tube with it; the hearth blocks any door in front of it, not just the built-in one; a docking chain's clash warnings follow a slid door; and editing a door no longer deselects a window you were working on.
+### 🛰️🚪 A new module is born with ONE door — the way back
+
+Provisioning a module from a door panel used to give the new room a full set of four doors, inherited from whatever room you were standing in. Now it gets exactly the one it needs.
+
+- The new module has **one door: the way back to the room you added it from**. It sits **centred on its wall**, on one of the walls carrying the **octagon cross-section** (the room's own geometry decides which — for a square room, west/east; north and south are the barrel's flat end caps).
+- Because a single door only reads right when it's centred, a module asks for the one-door-per-wall arrangement and records that in the room, so it holds for everyone and on every later visit. Authored rooms (lobby, casino, pool) are untouched and keep their paired arrangement.
+- A module minted with **no** parent berth — the dev menu, or the standalone-station flow — still gets the normal four, since it has nothing to lead back to.
+- The door set is published the moment the room is claimed rather than after the first sync, so the walk-in can't be scripted through a door that is about to be removed.
+
 - **Release line:** version bumped to 0.33.30, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
 
 ## v0.33.29 — 2026-07-24

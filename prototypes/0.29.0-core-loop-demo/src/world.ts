@@ -11,6 +11,7 @@ import {
   physicalDoorPose, setActiveDoorLayout, isCardinalDoorId,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
+import type { DoorLayoutKind } from "./doorLayout";
 import { Player } from "./player";
 import {
   PoolWaiter,
@@ -2172,6 +2173,7 @@ export class World {
     roomId: string,
     returnDoorId?: DoorId,
     theme?: RoomTheme,
+    doorLayout?: DoorLayoutKind,
   ): void {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
@@ -2204,7 +2206,15 @@ export class World {
     // (armchairs on the south + east runs, the map table on the north), so
     // flipping it means re-arranging every authored room. Owner's call —
     // raised on the #91 PR rather than changed silently.
-    setActiveDoorLayout(outdoor ? "pool-pairs" : "casino-pairs");
+    //
+    // 🛰️🚪 A room CAN name its own arrangement (roomInfo `doorLayout`, passed
+    // in by the caller). A module born with one door does exactly that: it
+    // asks for "legacy" so its single door sits CENTRED on its wall instead of
+    // ±PAIR_OFFSET off it. Nothing is arranged around a new module's walls, so
+    // the furniture objection above doesn't apply there.
+    setActiveDoorLayout(
+      doorLayout ?? (outdoor ? "pool-pairs" : "casino-pairs"),
+    );
 
     // 🤖 One drink-service waiter implementation serves every authored room;
     // each room supplies a route through its own open aisles. Recreate on a

@@ -193,7 +193,7 @@ export class DoorDockingPortSystem {
    * unreachable.
    */
   private provisionModuleCallback:
-    | ((templateId: string) => Promise<string | null>)
+    | ((templateId: string, parentDoorId?: string) => Promise<string | null>)
     | null = null;
 
   constructor(roomsGroup: THREE.Group) {
@@ -890,7 +890,19 @@ export class DoorDockingPortSystem {
         provisionBtn.disabled = true;
         provisionBtn.textContent = "MINTING MODULE…";
         try {
-          const seed = await this.provisionModuleCallback(templateId);
+          // 🛰️🚪 Hand the minting side the BERTH this module is being added
+          // from. That is what lets the new room be born with exactly one
+          // door — the one leading back here — instead of inheriting a full
+          // set of cardinals. Same source the INITIATE handler below reads.
+          const pane = document.getElementById("docking-control-pane");
+          const parentDoorId = pane
+            ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ??
+              undefined)
+            : undefined;
+          const seed = await this.provisionModuleCallback(
+            templateId,
+            parentDoorId,
+          );
           const addrInput = document.getElementById(
             "docking-addr-input",
           ) as HTMLInputElement | null;
@@ -2373,7 +2385,9 @@ export class DoorDockingPortSystem {
 
   /** Wire the PROVISION NEW MODULE minting callback (see field docs). The
    *  chosen room template id (from the door-panel dropdown) is passed through. */
-  public onProvisionModule(cb: (templateId: string) => Promise<string | null>) {
+  public onProvisionModule(
+    cb: (templateId: string, parentDoorId?: string) => Promise<string | null>,
+  ) {
     this.provisionModuleCallback = cb;
   }
 }

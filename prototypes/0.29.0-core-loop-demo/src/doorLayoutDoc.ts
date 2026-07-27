@@ -165,6 +165,31 @@ export function deleteDoorLayout(id: string): void {
  * behind the hearth) — no force-true fallback, so a door can never come back
  * walkable that was not.
  */
+/**
+ * 🛰️🚪 A freshly provisioned MODULE is born with exactly ONE door — the one
+ * leading back to the room it was added from — centred on its wall (owner
+ * ruling). Shares seedDoorLayoutDefaults' idempotency contract: a no-op once
+ * the map has any entry, so it can never fight a live edit.
+ *
+ * `wall` must be one of the room's OCTAGON-cross-section walls (west/east on a
+ * square room — see hullSection.narrowAxisFor); the caller picks it. The record
+ * uses lateral 0 so the door sits dead-centre, which requires the room to run
+ * the "legacy" door layout — the paired layouts park a cardinal ±PAIR_OFFSET
+ * off-centre. main.ts stamps that on the module at claim time.
+ */
+export function seedDoorLayoutSingle(wall: DoorWall): void {
+  if (!docAlive() || doorLayoutMap!.size > 0) return;
+  boundDoc!.transact(() => {
+    doorLayoutMap!.set(wall, {
+      id: wall,
+      wall,
+      lateral: 0,
+      size: 'large',
+      enabled: true,
+    });
+  });
+}
+
 export function seedDoorLayoutDefaults(): void {
   if (!docAlive() || doorLayoutMap!.size > 0) return;
   const deltas = readDoorDeltas();
