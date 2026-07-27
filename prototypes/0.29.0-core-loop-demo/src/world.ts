@@ -311,6 +311,8 @@ export class World {
   private pairedVestibules: Map<DoorId, THREE.Group> = new Map();
   /** Door whose vestibule is lit for an in-flight transit, or null. */
   private transitVestibuleDoorId: DoorId | null = null;
+  /** 🚪 #91: tubes of removed doors awaiting a safe frame to dispose. */
+  private orphanVestibules: Set<DoorId> = new Set();
   /** Resting opacity of a paired-door vestibule when the player is far.
    *  0 — the ghost gangways read as a pile of dark capsules outside the
    *  walls (owner request: remove them from view); the tube still fades in
@@ -1579,6 +1581,26 @@ export class World {
    * door no longer exists. An UNSEEDED room (empty map) still has its four
    * built-in cardinals — the same convention the reconcile itself uses.
    */
+  /**
+   * 🚪 #91: dispose the connector tubes of doors that no longer exist, but not
+   * while the avatar is inside one. updatePairedVestibules' own deferral can't
+   * cover these — it iterates DOORS, and a vanished door isn't in it — so the
+   * ids are parked here and this runs again every frame until each is safe.
+   */
+  private drainOrphanVestibules(): void {
+    if (this.orphanVestibules.size === 0) return;
+    const activeDoorId = this.player.getActiveDoorId();
+    for (const id of [...this.orphanVestibules]) {
+      if (!this.pairedVestibules.has(id)) {
+        this.orphanVestibules.delete(id);
+        continue;
+      }
+      if (this.transitVestibuleDoorId === id || activeDoorId === id) continue;
+      this.disposeVestibule(id);
+      this.orphanVestibules.delete(id);
+    }
+  }
+
   private refreshDoorSigns(): void {
     const ctx = this.doorSignContext;
     if (!ctx) return; // no room visuals applied yet — nothing to hang
@@ -1593,6 +1615,14 @@ export class World {
       visible: boolean,
     ) => {
       if (!sign) return;
+      // A sign hangs over a cardinal BERTH. `doorId` can be an arrival door,
+      // and an arrival can now land on a free `d:` door — physicalDoorPose has
+      // no slot for one and would throw, poisoning doorSignContext so every
+      // later reconcile threw too (nothing repositioned, nothing clickable).
+      if (!isCardinalDoorId(doorId)) {
+        sign.visible = false;
+        return;
+      }
       const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
       const doorFaceOffset = 0.14;
       sign.position.set(
@@ -1640,9 +1670,14 @@ export class World {
     // deletion arriving from a peer lands straight here, and updatePairedVestibules
     // can never clean up afterwards because it iterates DOORS — which no longer
     // contains the id. The mesh would sit in the room forever.
+    // Mid-walk-through the avatar is physically standing INSIDE the gangway
+    // (review L1), so those are queued and drained by updatePairedVestibules on
+    // a later frame instead of popping the tube out around them.
     for (const id of [...this.pairedVestibules.keys()]) {
-      if (!records.has(id)) this.disposeVestibule(id);
+      if (records.has(id)) continue;
+      this.orphanVestibules.add(id);
     }
+    this.drainOrphanVestibules();
     rebuildDoors(records); // walk-target membership (makes findDoor correct first)
     this.dockingSystem.syncDoorGroups(records); // 3D group add/remove/rebuild
     this.reconcileDoorPlacements(); // position the (possibly new) groups
@@ -4199,6 +4234,7 @@ export class World {
   private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
     const ds = this.dockingSystem;
     if (!ds) return;
+    this.drainOrphanVestibules(); // 🚪 #91: retry deferred removed-door tubes
     const playerPos = this.player.getPosition();
     const activeDoorId = this.player.getActiveDoorId();
 
@@ -4349,8 +4385,14 @@ export class World {
     // and straight back out of the next room's north door: "traveling into a
     // north door … exiting out of the north door of the other room, instead of
     // exiting the south door heading north" (#91). Walls always mirror.
+    // Restricted to CARDINAL berths on purpose: the pairing wire is keyed to
+    // the four of them, so arriving at a free door would strand the return
+    // (no record can be written for it — see the mirror gate in main.ts).
+    // Pairing free doors is the deferred #28 S6d work.
     const want = oppositeWall(this.wallOfDoor(departureDoorId));
-    const facing = DOORS.find((d) => d.enabled && this.wallOfDoor(d.id) === want);
+    const facing = DOORS.find(
+      (d) => d.enabled && isCardinalDoorId(d.id) && this.wallOfDoor(d.id) === want,
+    );
     if (facing) return facing;
     // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
     // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
