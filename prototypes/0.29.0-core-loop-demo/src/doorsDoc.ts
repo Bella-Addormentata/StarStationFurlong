@@ -189,10 +189,14 @@ export function deleteDoorPairing(doorId: string): void {
  * silently undid the undock for everyone. A present-but-unpaired record renders
  * exactly like an absent one — reconcileDoors routes it to clearRemotePairing —
  * but it is proof the connection was deliberately taken down.
+ *
+ * It keeps the RETIRED ADDRESS so it can refuse precisely that module and no
+ * other: an address-less tombstone would suppress the mirror on this door
+ * forever, stranding any future connection built from the far side.
  */
-export function writeDoorTombstone(doorId: string): void {
+export function writeDoorTombstone(doorId: string, retiredAddress = ''): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
-    doorsMap!.set(doorId, { connectedRoomAddress: '', paired: false });
+    doorsMap!.set(doorId, { connectedRoomAddress: retiredAddress, paired: false });
   });
 }

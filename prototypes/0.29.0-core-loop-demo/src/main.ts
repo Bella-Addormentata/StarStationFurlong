@@ -2069,14 +2069,17 @@ async function transitTo(
   if (depPaired && depAddress) {
     // 🔗 Mirror onto the SAME door the player actually arrived through.
     const existing = readAllDoors().get(arrivalDoorId);
-    // ⏏ #91: `!existing` — not `!existing?.paired`. An UNDOCKED door now
-    // leaves a tombstone (a present, unpaired record), and re-pairing it here
-    // would undo the owner's undock on the next walk-through. Only a door with
-    // NO record at all is a genuinely un-mirrored one.
+    // ⏏ #91: an UNDOCKED door leaves a tombstone (a present, unpaired record
+    // naming the module that was cast off), and re-pairing it here would undo
+    // the owner's undock on the next walk-through. Refuse the mirror only for
+    // THAT module: a tombstone must not strand a different connection built
+    // later on the same door.
     // 🚪 #91: and only a CARDINAL id — the pairing wire is keyed to the four
     // berths, so a mirror written under a free `d:` id is a permanent orphan
     // no client can ever read back.
-    if (!existing && isCardinalDoorId(arrivalDoorId)) {
+    const retired =
+      existing && !existing.paired && existing.connectedRoomAddress === depAddress;
+    if (!existing?.paired && !retired && isCardinalDoorId(arrivalDoorId)) {
       writeDoorPairing(arrivalDoorId, depAddress, {
         segments: depGeometry
           ? mirrorSegments(depGeometry.segments)

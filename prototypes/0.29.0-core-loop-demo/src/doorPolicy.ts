@@ -64,13 +64,17 @@ export const DEFAULT_DOOR_POLICY: DoorPolicyRecord = { passage: 'public', constr
 const DOOR_IDS = ['north', 'south', 'east', 'west'] as const;
 
 /**
- * 🚪 #91: policy applies to ANY door the room actually has — the 4 cardinal
- * berths plus every free door the editor placed (#28). This gate used to be
- * the cardinal list alone, so for a `d:` door readDoorPolicy always returned
- * the default and writeDoorPolicy was a silent no-op: the keypad rendered its
- * PASSAGE / CONSTRUCTION cycles, the click appeared to work, and the setting
- * reverted on the next re-render while canPass stayed pinned to "public".
- * Unknown ids are still rejected, so a stale id can't spawn a policy record.
+ * 🚪 #91: policy is keyed by ANY door the room actually has — the 4 cardinal
+ * berths plus every free door the editor placed (#28) — not by the cardinal
+ * list alone, which silently dropped every write for a `d:` id and pinned its
+ * canPass to "public". Unknown ids are still rejected, so a stale id can't
+ * spawn a policy record.
+ *
+ * NOTE the WRITE side has no UI yet: free doors are passages with no terminal
+ * (that keypad drove cardinal-only pose math and threw), so today nothing calls
+ * writeDoorPolicy for one and a placed door is effectively public two-way. The
+ * read side honouring free ids is what makes an affordance — the deferred #28
+ * S6d work — a UI-only change rather than another store migration.
  */
 function isKnownDoorId(doorId: string): boolean {
   if ((DOOR_IDS as readonly string[]).includes(doorId)) return true;

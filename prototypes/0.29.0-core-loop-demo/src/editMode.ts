@@ -1893,6 +1893,16 @@ class RoomEditController {
       showHint('Unpair this door first (open its keypad), then remove it.', 2800);
       return;
     }
+    // 🚪 #91: never empty the map. An empty doorLayout means "this room was
+    // never migrated" everywhere it is read (the reconcile substitutes the
+    // cardinal defaults, the seed republishes them, placement folds them back
+    // in as blockers) — so removing the LAST door would silently resurrect all
+    // four, for everyone. A room needs a way out anyway.
+    const layout = readAllDoorLayout();
+    if (layout.size === 1 && layout.has(doorId)) {
+      showHint('A room needs at least one door — add another first.', 2800);
+      return;
+    }
 
     // Selection/hover teardown BEFORE the delete disposes the door's materials
     // (setSelected(null) → clearTint restores saved emissive on live handles).

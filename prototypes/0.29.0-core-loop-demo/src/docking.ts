@@ -65,6 +65,7 @@ import {
   readDoorDeltas,
   lateralOf,
   LEGACY_PLACEMENTS,
+  doorLateralLimitForWall,
 } from "./floorPlanDoc";
 import { readAtlas, atlasLayout, moduleOverlapAt } from "./stationAtlas";
 
@@ -1245,8 +1246,20 @@ export class DoorDockingPortSystem {
           const centre = physicalDoorPose(doorId, readDoorDeltas()[doorId] ?? 0);
           const centreLateral =
             centre.wall === "north" || centre.wall === "south" ? centre.x : centre.z;
-          const stepped =
-            Math.round(centreLateral) + (action === "slide-pos" ? 1 : -1);
+          // Bound in WORLD-CENTRE currency as well. writeDoorPlacement's own
+          // clamp is expressed in STORED units, which are relative to the
+          // LEGACY slot — under a pairs layout the live slot is ±PAIR_OFFSET
+          // away, so an in-bounds stored value could park the door at a centre
+          // of ±7 on a wall that only runs ±6. (The editor's drag intersects
+          // both bounds; the slider never did.)
+          const wallLimit = doorLateralLimitForWall(centre.wall);
+          const stepped = Math.max(
+            -wallLimit,
+            Math.min(
+              wallLimit,
+              Math.round(centreLateral) + (action === "slide-pos" ? 1 : -1),
+            ),
+          );
           // The store speaks base-relative laterals; convert the new centre back.
           const baseCentre = physicalDoorPose(doorId, 0);
           const baseLateral =
@@ -1281,8 +1294,9 @@ export class DoorDockingPortSystem {
             this.undockArmed.delete(doorId);
             // ⏏ #91: TOMBSTONE, not delete — the far room's mirror record still
             // points here and would re-pair this door on the next walk-through
-            // back, silently undoing the undock. See writeDoorTombstone.
-            writeDoorTombstone(doorId);
+            // back, silently undoing the undock. It names the retired module so
+            // it refuses only that one. See writeDoorTombstone.
+            writeDoorTombstone(doorId, stu.connectedRoomAddress);
           } else {
             // arm FOR this pairing — a different armed address is stale
             this.undockArmed.set(doorId, stu.connectedRoomAddress);

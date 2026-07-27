@@ -4172,7 +4172,13 @@ export class World {
     let inAnyAperture = false;
     for (const door of DOORS) {
       // Aperture frame: lateral offset along the wall vs distance INTO it.
-      const northSouth = door.id === "north" || door.id === "south";
+      // 🚪 #91: the aperture frame comes from the door's PHYSICAL wall, not its
+      // logical id. The ids happen to agree for the cardinals under both
+      // layouts, but every free `d:` door read as east/west — so one on the
+      // north or south wall could never trip the threshold and was impossible
+      // to walk through in first person.
+      const doorWall = this.wallOfDoor(door.id);
+      const northSouth = doorWall === "north" || doorWall === "south";
       const lateral = Math.abs(
         northSouth ? p.x - door.front.x : p.z - door.front.z,
       );
@@ -4394,6 +4400,21 @@ export class World {
       (d) => d.enabled && isCardinalDoorId(d.id) && this.wallOfDoor(d.id) === want,
     );
     if (facing) return facing;
+    // 🚪 #91: no door on the facing wall — which is the NORM under the paired
+    // layouts, where all four cardinals share the north and west walls. Fall
+    // back to the pre-#91 id-opposite pairing so each departure still resolves
+    // to its OWN door; without this tier every arrival collapses onto the one
+    // `east` fallback below, dropping the traveler at the same spot no matter
+    // where they came from (and, at PAIR_OFFSET 3.0, inside the casino's
+    // authored furniture).
+    const oppositeId: Record<DoorId, DoorId> = {
+      north: "south",
+      south: "north",
+      east: "west",
+      west: "east",
+    };
+    const counterpart = findDoor(oppositeId[departureDoorId]);
+    if (counterpart && counterpart.enabled) return counterpart;
     // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
     // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
     // south departure, but degrade to any enabled door / any door at all instead
