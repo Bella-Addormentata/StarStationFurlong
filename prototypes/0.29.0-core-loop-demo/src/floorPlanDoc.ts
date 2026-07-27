@@ -158,14 +158,39 @@ function defaultPlacement(doorId: DoorId): { x: number; z: number } {
     : { x: wall, z: legacy.z };
 }
 
+/**
+ * 🚪 #91: the on-GRID lattice for a stored lateral. Stored values are
+ * base-relative (delta = stored − legacy base), and a door's world centre is
+ * `slotCentre + delta` — so a centre lands on an integer grid line exactly when
+ * `stored − base` is an integer. For n/s the base is 0 (stored IS the centre);
+ * for e/w the base is −0.5, so the on-grid stored values are the half-integers.
+ * Note this parity depends only on the base, never on the active layout, so it
+ * holds in the pairs layouts too.
+ */
+function snapStoredLateral(doorId: DoorId, lateral: number): number {
+  const base = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
+  return Math.round(lateral - base) + base;
+}
+
+/** The same lattice, rounded TOWARD ZERO — for clamping. Snapping first and
+ *  clamping second can land exactly ON the limit and off the lattice (the e/w
+ *  lattice is the half-integers, the limit is a whole number); repairing that
+ *  on read would then push it back OUT past the limit. Clamp inward instead. */
+function clampStoredLateral(doorId: DoorId, lateral: number, limit: number): number {
+  const base = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
+  if (lateral > limit) return Math.floor(limit - base) + base;
+  if (lateral < -limit) return Math.ceil(-limit - base) + base;
+  return lateral;
+}
+
 /** Owner UI: place a door's opening centre (lateral along its wall; the wall
  *  coordinate is pinned by the facing AND the room size). Snapped + clamped
  *  here as well as on read — write-side prevention, read-side repair. */
 export function writeDoorPlacement(doorId: DoorId, lateral: number): void {
   if (!docAlive() || !Number.isFinite(lateral)) return;
-  const snapped = Math.round(lateral / DOOR_LATTICE) * DOOR_LATTICE;
+  const snapped = snapStoredLateral(doorId, lateral);
   const limit = doorLateralLimit(doorId);
-  const clamped = Math.max(-limit, Math.min(limit, snapped));
+  const clamped = clampStoredLateral(doorId, snapped, limit);
   const wall = doorWallCoord(doorId);
   const p = doorId === 'north' || doorId === 'south'
     ? { x: clamped, z: wall }
@@ -187,8 +212,18 @@ export function readDoorPlacement(doorId: DoorId): { x: number; z: number } {
   const wall = northSouth ? raw.z : raw.x;
   const lateral = northSouth ? raw.x : raw.z;
   if (wall !== doorWallCoord(doorId)) return fallback;
-  if (!Number.isInteger(lateral * 2) || Math.abs(lateral) > doorLateralLimit(doorId)) return fallback;
-  return { ...raw } as { x: number; z: number };
+  if (!Number.isFinite(lateral) || Math.abs(lateral) > doorLateralLimit(doorId)) return fallback;
+  // 🚪 #91 READ-SIDE REPAIR: snap onto the on-grid lattice rather than trusting
+  // whatever half-step the pre-#91 slider stored. A room authored before this
+  // release keeps its doors — they just come back ON the grid line, without
+  // needing a write (visitors have no write access to someone else's room).
+  const repaired = clampStoredLateral(
+    doorId,
+    snapStoredLateral(doorId, lateral),
+    doorLateralLimit(doorId),
+  );
+  if (repaired === lateral) return { ...raw } as { x: number; z: number };
+  return northSouth ? { x: repaired, z: wall } : { x: wall, z: repaired };
 }
 
 /**

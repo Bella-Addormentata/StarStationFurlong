@@ -177,3 +177,22 @@ export function deleteDoorPairing(doorId: string): void {
     doorsMap!.delete(doorId);
   });
 }
+
+/**
+ * ⏏ #91: UNDOCK leaves a TOMBSTONE — an explicit "this door is not paired"
+ * record — rather than deleting the entry.
+ *
+ * Only one room doc is bound at a time, so an undock can never reach the far
+ * room's mirror record. That stale mirror still offers transit back; on arrival
+ * the lazy mirror-write saw NO record here (a plain delete is indistinguishable
+ * from "never docked") and helpfully re-created the pairing. One walk-through
+ * silently undid the undock for everyone. A present-but-unpaired record renders
+ * exactly like an absent one — reconcileDoors routes it to clearRemotePairing —
+ * but it is proof the connection was deliberately taken down.
+ */
+export function writeDoorTombstone(doorId: string): void {
+  if (!docAlive()) return;
+  boundDoc!.transact(() => {
+    doorsMap!.set(doorId, { connectedRoomAddress: '', paired: false });
+  });
+}

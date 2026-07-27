@@ -35,7 +35,9 @@ export interface DoorLayoutRecord {
   /** Along-wall slide (forward-compat / the slice-5 hand-off; NOT the live
    *  position in slice 4 — floorPlan owns that). Seeded from the current delta. */
   lateral: number;
-  /** Leaf-width class; default 'small'. */
+  /** Leaf-width class. #91 collapsed doors to ONE size: this is still accepted
+   *  (and still written) for backward/forward compat, but readAllDoorLayout
+   *  normalizes every record to 'large' — nothing downstream branches on it. */
   size?: 'small' | 'large';
   /** SEED walkability only — runtime `enabled` is owned by the room
    *  (updateNorthDoorForFireplace / casino force-enable / DEV toggle). */
@@ -97,13 +99,25 @@ export function isDoorLayoutRecord(value: unknown): value is DoorLayoutRecord {
   );
 }
 
-/** Snapshot the whole door set as id → validated record (malformed entries are
- *  skipped — a bad peer write degrades to "that door is absent"). */
+/**
+ * Snapshot the whole door set as id → validated record (malformed entries are
+ * skipped — a bad peer write degrades to "that door is absent").
+ *
+ * 🚪 #91 READ-NORMALIZATION: every record is coerced to the one door size and
+ * an on-grid centre here, at the read boundary. Rooms authored before #91 hold
+ * `size:'small'` records at mid-cell laterals (n+0.5); rewriting them would
+ * need owner write access in every room, so instead the whole app simply never
+ * SEES the old shape — a visitor in someone else's stale room renders the same
+ * on-grid doors the owner does. The shape guard still ACCEPTS 'small' (never
+ * reject stored data); it just stops propagating past this line.
+ */
 export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
   const out = new Map<string, DoorLayoutRecord>();
   if (!docAlive()) return out;
   for (const [id, value] of doorLayoutMap!.entries()) {
-    if (isDoorLayoutRecord(value) && value.id === id) out.set(id, value);
+    if (isDoorLayoutRecord(value) && value.id === id) {
+      out.set(id, { ...value, size: 'large', lateral: Math.round(value.lateral) });
+    }
   }
   return out;
 }
@@ -111,6 +125,13 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
 /** Number of entries (0 ⇒ unseeded — reconcile keeps the local cardinal defaults). */
 export function doorLayoutDocSize(): number {
   return docAlive() ? doorLayoutMap!.size : 0;
+}
+
+/** Cheap membership test — no snapshot, no allocation. Some callers ask this
+ *  per door per FRAME (the first-person auto-door pass reaches it through
+ *  canPass → readDoorPolicy), so they must not build a whole Map to find out. */
+export function hasDoorLayout(id: string): boolean {
+  return docAlive() && doorLayoutMap!.has(id);
 }
 
 /** Publish one door's membership (add / move — slice 5+). Owner-only in practice. */
@@ -132,9 +153,17 @@ export function deleteDoorLayout(id: string): void {
 /**
  * Owner-only seed: on the first claim of a room, publish the current cardinal
  * door set so joiners converge to it. Idempotent — a no-op once the map has any
- * entry, so re-entering an already-seeded room never clobbers live edits. Size
- * defaults match buildPorts' config (east/west large, north/south small);
- * `enabled` snapshots the current door state (north sits behind the hearth).
+ * entry, so re-entering an already-seeded room never clobbers live edits.
+ *
+ * 🚪 #91 QUAD-ADD FIX: seed only the cardinals that ACTUALLY EXIST right now
+ * (`findDoor` non-null). This function is the SEED-FIRST partner of every
+ * editor write, so it used to fire in rooms showing fewer than four doors and
+ * publish all four anyway — the reconcile then materialized up to four extra
+ * doors alongside the one the owner was placing ("adding a door adds 4 doors").
+ * Publishing exactly the visible set makes the seed a visual no-op, which is
+ * what seed-first always meant. `enabled` snapshots live door state (north sits
+ * behind the hearth) — no force-true fallback, so a door can never come back
+ * walkable that was not.
  */
 export function seedDoorLayoutDefaults(): void {
   if (!docAlive() || doorLayoutMap!.size > 0) return;
@@ -142,12 +171,13 @@ export function seedDoorLayoutDefaults(): void {
   boundDoc!.transact(() => {
     for (const wall of WALLS) {
       const door = findDoor(wall);
+      if (!door) continue;
       doorLayoutMap!.set(wall, {
         id: wall,
         wall,
         lateral: deltas[wall] ?? 0,
-        size: wall === 'east' || wall === 'west' ? 'large' : 'small',
-        enabled: door ? door.enabled : true,
+        size: 'large',
+        enabled: door.enabled,
       });
     }
   });

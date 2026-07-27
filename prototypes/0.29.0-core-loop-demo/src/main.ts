@@ -93,6 +93,7 @@ import {
   seedDoorLayoutDefaults,
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
+import { isCardinalDoorId } from "./doorLayout";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
@@ -1316,6 +1317,16 @@ async function joinRoomAtEpoch(
     void sync.whenServerSynced.then(() => {
       if (seedEpoch !== sessionEpoch) return; // superseded by a newer session
       const ownsRoom = roomMap.get("owner") === getPlayerId();
+      // 🚪↔🛰️ #28 S4: publish the current cardinal door set so joiners converge
+      // (idempotent — no-op once seeded). Position stays in floorPlan; this is
+      // membership only.
+      // 🚪 #91: hoisted ABOVE the template branch, which returns early — a
+      // module provisioned from a template therefore never published its door
+      // set at all, and stayed in the "unseeded" state that made the next door
+      // edit resurrect a full set of cardinals.
+      if (ownsRoom && doorLayoutDocSize() === 0) {
+        seedDoorLayoutDefaults();
+      }
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
       // furniture — seed it and skip the lobby default + migration + the
       // outdoor-casino auto-pairing below (all lobby-specific).
@@ -1330,12 +1341,6 @@ async function joinRoomAtEpoch(
       }
       if (ownsRoom && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
-      }
-      // 🚪↔🛰️ #28 S4: publish the current cardinal door set so joiners converge
-      // (idempotent — no-op once seeded). Position stays in floorPlan; this is
-      // membership only. Un-seeded rooms keep the local defaults regardless.
-      if (ownsRoom && doorLayoutDocSize() === 0) {
-        seedDoorLayoutDefaults();
       }
       // 🧱 Retired default: the fireplace/bookcase wall no longer ships with
       // the lobby (the paired doors + glassy tile panel own the north wall).
@@ -2064,7 +2069,14 @@ async function transitTo(
   if (depPaired && depAddress) {
     // 🔗 Mirror onto the SAME door the player actually arrived through.
     const existing = readAllDoors().get(arrivalDoorId);
-    if (!existing?.paired) {
+    // ⏏ #91: `!existing` — not `!existing?.paired`. An UNDOCKED door now
+    // leaves a tombstone (a present, unpaired record), and re-pairing it here
+    // would undo the owner's undock on the next walk-through. Only a door with
+    // NO record at all is a genuinely un-mirrored one.
+    // 🚪 #91: and only a CARDINAL id — the pairing wire is keyed to the four
+    // berths, so a mirror written under a free `d:` id is a permanent orphan
+    // no client can ever read back.
+    if (!existing && isCardinalDoorId(arrivalDoorId)) {
       writeDoorPairing(arrivalDoorId, depAddress, {
         segments: depGeometry
           ? mirrorSegments(depGeometry.segments)

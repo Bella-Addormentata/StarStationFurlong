@@ -25,6 +25,7 @@
  */
 
 import * as Y from 'yjs';
+import { hasDoorLayout } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -62,6 +63,20 @@ export const DEFAULT_DOOR_POLICY: DoorPolicyRecord = { passage: 'public', constr
 
 const DOOR_IDS = ['north', 'south', 'east', 'west'] as const;
 
+/**
+ * 🚪 #91: policy applies to ANY door the room actually has — the 4 cardinal
+ * berths plus every free door the editor placed (#28). This gate used to be
+ * the cardinal list alone, so for a `d:` door readDoorPolicy always returned
+ * the default and writeDoorPolicy was a silent no-op: the keypad rendered its
+ * PASSAGE / CONSTRUCTION cycles, the click appeared to work, and the setting
+ * reverted on the next re-render while canPass stayed pinned to "public".
+ * Unknown ids are still rejected, so a stale id can't spawn a policy record.
+ */
+function isKnownDoorId(doorId: string): boolean {
+  if ((DOOR_IDS as readonly string[]).includes(doorId)) return true;
+  return hasDoorLayout(doorId);
+}
+
 let boundDoc: Y.Doc | null = null;
 let policyMap: Y.Map<unknown> | null = null;
 let requestsMap: Y.Map<unknown> | null = null;
@@ -98,7 +113,7 @@ function docAlive(): boolean {
 
 /** Sanitized read; unknown/missing values fall back to the defaults. */
 export function readDoorPolicy(doorId: string): DoorPolicyRecord {
-  if (!docAlive() || !(DOOR_IDS as readonly string[]).includes(doorId)) return { ...DEFAULT_DOOR_POLICY };
+  if (!docAlive() || !isKnownDoorId(doorId)) return { ...DEFAULT_DOOR_POLICY };
   const raw = policyMap!.get(doorId) as Partial<DoorPolicyRecord> | undefined;
   return {
     passage: raw?.passage === 'owner' ? 'owner' : 'public',
@@ -118,7 +133,7 @@ export function passageLabel(policy: DoorPolicyRecord): string {
 
 /** Owner UI only (write-side gating is the caller's job — see module header). */
 export function writeDoorPolicy(doorId: string, policy: DoorPolicyRecord): void {
-  if (!docAlive() || !(DOOR_IDS as readonly string[]).includes(doorId)) return;
+  if (!docAlive() || !isKnownDoorId(doorId)) return;
   boundDoc!.transact(() => {
     policyMap!.set(doorId, {
       passage: policy.passage,

@@ -27,19 +27,57 @@ export interface PhysicalDoorPose {
  *  will both derive their pose from `poseFromWall` in later slices. */
 export type PortId = string;
 
+/** 🚪 The cardinal/free split in one predicate: the 4 cardinal ids are the
+ *  structural berths (legacy pose tables, floorPlan slide store, pairing wire);
+ *  everything else is a free `d:` door that owns its position in its layout
+ *  record. #91 hoisted this here — docking.ts and editMode.ts each had a
+ *  private copy and world.ts/main.ts had none, which is how free door ids kept
+ *  reaching cardinal-only code and throwing. */
+export function isCardinalDoorId(id: string): id is PhysicalDoorId {
+  return id === "north" || id === "south" || id === "east" || id === "west";
+}
+
 // 🧱 #66 R1 + #28 S1: door/port poses DERIVE from the room's half-extents
 // (walls at ±half) instead of hardcoding ±6, so the layout scales with a
 // rectangular room. Insets: stand-point 1.5 m inside the wall, through-point
 // 1.0 m outside. Default 2×2 room ⇒ {6,6} reproduces the legacy ±6 / ±4.5 / ±7
 // tables bit-for-bit. PAIR_OFFSET spaces the two doors that share a wall in the
-// pairs layout. EW_LATERAL is a legacy quirk: e/w doors sit their STAND point
-// −0.5 off the door centre (n/s and the pairs layout have no such offset), so
-// centre-lateral and stand-lateral are tracked separately below to preserve it.
+// pairs layout — an INTEGER (was 2.7), because #91 locks every door centre to
+// the grid lines (see the geometry contract below); 3.0 keeps the paired doors
+// 6 m apart. The old EW_LATERAL quirk (e/w STAND points −0.5 off the door
+// centre, so the avatar walked through half a metre off the visible opening)
+// is retired with #91: stand === centre for every door. The stand-vs-centre
+// SEAM in poseFromWall is kept — synced pairs data and future asymmetric
+// layouts still speak through it.
 const FRONT_INSET = 1.5;
 const THROUGH_OUTSET = 1.0;
-const EW_LATERAL = -0.5;
-const PAIR_OFFSET = 2.7;
+const PAIR_OFFSET = 3.0;
 const HALF_PI = Math.PI / 2;
+
+// ── 🚪 #91: THE door's physical grid contract ────────────────────────────────
+// One door size (the big door — the small door is removed for now, owner
+// ruling on #91), and its centre is LOCKED to the floor grid: grid lines sit
+// at INTEGER world coordinates (GridHelper spans are multiples of TILE_SIZE=6;
+// furniture snapAxis shares the phase), so a door centre is always an integer
+// and the 2.0 m opening spans [n−1, n+1] — exactly 2 grid cells, flush on the
+// lines. Every consumer (frame geometry, validators, blocking zones, aperture
+// checks, the terminal wireframe) derives from THESE constants so the physical
+// door and the editor's collision model can never drift apart again (the old
+// 2.4/1.4 openings matched NO whole number of cells while the validators
+// assumed 2/1).
+/** Opening width — exactly 2 grid cells; centre on an integer grid line. */
+export const DOOR_OPENING_WIDTH = 2.0;
+/** Side-post width, one each side of the opening. */
+export const DOOR_POST_WIDTH = 0.3;
+/** Full frame width (opening + both posts) = 2.6. */
+export const DOOR_FRAME_WIDTH = DOOR_OPENING_WIDTH + 2 * DOOR_POST_WIDTH;
+/** One sliding leaf covers half the opening. */
+export const DOOR_LEAF_WIDTH = DOOR_OPENING_WIDTH / 2;
+/** Leaf-centre offset when SHUT: the two leaves meet with a 0.02 seam overlap
+ *  (the old 0.62-for-2.4 / 0.37-for-1.4 literals encoded exactly this). */
+export const DOOR_LEAF_SHUT_OFFSET = DOOR_LEAF_WIDTH / 2 + 0.02;
+/** Leaf-centre offset when OPEN — the leaf has cleared the opening. */
+export const DOOR_LEAF_OPEN_OFFSET = DOOR_LEAF_SHUT_OFFSET + DOOR_LEAF_WIDTH - 0.02;
 
 /**
  * The single pose generator. Given a wall, the along-wall lateral of the door
@@ -107,14 +145,14 @@ export function poseFromWall(
 }
 
 /**
- * 🚪 #28 S6b (door editor): snap an along-wall lateral to the floor's 1 m parity
- * grid — the SAME rule furniture uses (furniture.ts snapAxis). A small door has
- * opening extent 1 (odd) → its centre lands on n+0.5; a large door has extent 2
- * (even) → its centre lands on the integer n. Mirrors snapItemPos' parity so a
- * door and a piece of furniture on the same wall never straddle half a tile.
+ * 🚪 #28 S6b / #91: snap an along-wall lateral to the floor's 1 m grid — the
+ * SAME lattice furniture uses (furniture.ts snapAxis). With ONE door size whose
+ * opening is an even 2 cells, the centre always lands on the integer n, i.e.
+ * ON the line between two grid squares (the #91 rule). The `size` parameter is
+ * kept so old records still type-check while they are read-normalized away.
  */
-export function snapDoorLateral(size: "small" | "large", lateral: number): number {
-  return size === "large" ? Math.round(lateral) : Math.floor(lateral) + 0.5;
+export function snapDoorLateral(_size: "small" | "large", lateral: number): number {
+  return Math.round(lateral);
 }
 
 /**
@@ -150,8 +188,11 @@ interface DoorSlot {
   stand: number;
 }
 
-/** Legacy layout: the 4 doors on their own cardinal walls; e/w carry the
- *  −0.5 stand offset (EW_LATERAL). */
+/** Legacy layout: the 4 doors on their own cardinal walls, centred.
+ *  #91 retired the e/w −0.5 stand offset — the avatar now walks through the
+ *  middle of the opening it can see. NOTE the floorPlan STORE still encodes
+ *  e/w placements against a −0.5 base (floorPlanDoc LEGACY_PLACEMENTS): that
+ *  is wire data and stays put; only these walk/stand points moved. */
 function legacySlot(id: PhysicalDoorId): DoorSlot {
   switch (id) {
     case "north":
@@ -159,9 +200,9 @@ function legacySlot(id: PhysicalDoorId): DoorSlot {
     case "south":
       return { wall: "south", centre: 0, stand: 0 };
     case "west":
-      return { wall: "west", centre: 0, stand: EW_LATERAL };
+      return { wall: "west", centre: 0, stand: 0 };
     case "east":
-      return { wall: "east", centre: 0, stand: EW_LATERAL };
+      return { wall: "east", centre: 0, stand: 0 };
   }
 }
 
