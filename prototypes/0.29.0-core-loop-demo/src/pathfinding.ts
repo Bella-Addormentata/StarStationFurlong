@@ -93,6 +93,32 @@ export function rowToWorld(row: number): number {
   return (row - GRID_HALF + 0.5) * CELL_SIZE;
 }
 
+/**
+ * Nearest walkable cell to a WORLD point, searched in expanding Chebyshev
+ * rings (ring 0 = the cell itself), returned as a world-space centre — or
+ * null if nothing is walkable within `maxRing`. The one grid-snap primitive
+ * (🏋️ the coach stage uses it; world.ts's older inline scans can migrate).
+ */
+export function nearestWalkableCell(
+  wx: number,
+  wz: number,
+  maxRing: number,
+): { x: number; z: number } | null {
+  const r0 = worldToRow(wz);
+  const c0 = worldToCol(wx);
+  for (let ring = 0; ring <= maxRing; ring++) {
+    for (let dr = -ring; dr <= ring; dr++) {
+      for (let dc = -ring; dc <= ring; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue;
+        if (walkable[r0 + dr]?.[c0 + dc]) {
+          return { x: colToWorld(c0 + dc), z: rowToWorld(r0 + dr) };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // ── A* implementation ─────────────────────────────────────────────────────────
 interface Node {
   row: number;

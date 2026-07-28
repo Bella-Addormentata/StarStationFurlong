@@ -112,6 +112,18 @@ export function getCameraYaw(): number {
 }
 
 /**
+ * Yaw of the camera-forward direction on the GROUND plane, from the snapped
+ * detent yaw: the base iso offset (1,1)/√2 rotated by the rig's yaw reduces
+ * to `yaw + π/4` (its XZ unit vector is `(sin, cos)` of this). Exported so
+ * facing-the-camera consumers (🏋️ the coach's stage) stop hand-inlining the
+ * `(cos±sin)·√½` transform — world.ts/docking.ts's fade math are older copies
+ * that can adopt this too.
+ */
+export function getCameraForwardYaw(): number {
+  return targetYaw + Math.PI / 4;
+}
+
+/**
  * Rotate a base isometric offset by the rig's CURRENT (eased) yaw.
  * Non-mutating: `base` is copied into `out` (fresh vector by default).
  * Camera-flight code (zoom.ts first-person dive, deviceFocus eases) uses
