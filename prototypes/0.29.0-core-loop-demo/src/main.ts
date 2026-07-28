@@ -192,6 +192,7 @@ import {
   updateChatBubbles,
   clearChatBubbles,
 } from "./chatBubbles";
+import { initRobotVoice } from "./robotVoice";
 import {
   restoreRoomSnapshot,
   attachRoomCache,
@@ -3991,16 +3992,18 @@ function setupSpacePhoneOverlay() {
   phoneOverlayInitialized = true;
 
   // 💬 Overhead chat bubbles — live-closure deps (world/camera resolve lazily,
-  // so init order doesn't matter; every getter null-guards).
+  // so init order doesn't matter; every getter null-guards). localPos is
+  // shared with the robot-voice init below.
+  const localPlayerPos = () => {
+    try {
+      return world?.getPlayer()?.getPosition() ?? null;
+    } catch {
+      return null;
+    }
+  };
   initChatBubbles({
     camera: () => (window as any).gameRenderer?.camera,
-    localPos: () => {
-      try {
-        return world?.getPlayer()?.getPosition() ?? null;
-      } catch {
-        return null;
-      }
-    },
+    localPos: localPlayerPos,
     remotes: () => {
       try {
         return world?.getRemoteAvatarSnapshots() ?? [];
@@ -4013,6 +4016,10 @@ function setupSpacePhoneOverlay() {
       return zv && typeof zv.getLevel === "function" ? zv.getLevel() : 2;
     },
   });
+
+  // 🤖🔊 Robot voice (#77 small talk) — robot lines speak through the
+  // speakers with distance falloff off the same localPos dep.
+  initRobotVoice({ localPos: localPlayerPos });
 
   const container = document.getElementById("spacephone-container");
   const chatInput = document.getElementById("chat-input") as HTMLInputElement;

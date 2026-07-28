@@ -40,6 +40,7 @@ import {
   tickAutoStickman,
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
+import { speakRobotLine } from "./robotVoice";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
@@ -4717,6 +4718,14 @@ export class World {
     this.applyRobotRoutines();
   }
 
+  /** 🤖💬 THE robot-speech seam: overhead bubble + speaker voice, together.
+   *  Every robot line (script 'say', small talk, serve lines, croupier beats)
+   *  must go through here so no source can get bubble-without-voice. */
+  private robotSay(anchorId: string, text: string, x: number, z: number): void {
+    spawnFixedBubble(anchorId, text, x, z);
+    speakRobotLine(text, x, z);
+  }
+
   /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
    *  unconfigured dock defaults to 'serve'). Cheap; also run on every robotDoc
    *  change so a console edit re-drives behaviour without a reconcile. */
@@ -4728,9 +4737,7 @@ export class World {
       bot.setParked(cfg?.parked ?? false); // 🤖 STOP/START park override
       // 🤖 #77C s4: a custom-script 'say' step pops a bubble over the bot (one
       // per robot, replaced each line) — local, like the croupier's narration.
-      bot.setSayHandler((text, x, z) =>
-        spawnFixedBubble(`robotsay:${key}`, text, x, z),
-      );
+      bot.setSayHandler((text, x, z) => this.robotSay(`robotsay:${key}`, text, x, z));
     }
   }
 
@@ -4842,7 +4849,7 @@ export class World {
       this.croupierNarrated.set(t.id, beat.key);
       const head = standsForItem(t.id).find((x) => x.role != null);
       if (head) {
-        spawnFixedBubble(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
+        this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
       }
     }
   }

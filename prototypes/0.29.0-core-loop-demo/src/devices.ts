@@ -91,6 +91,7 @@ import {
   ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
+import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
@@ -1925,6 +1926,19 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     ">${parked ? '▶ START · resume routine' : '⏸ STOP · park at dock'}</button>`;
     const addBtn = (kind: string, label: string): string =>
       `<button data-add="${kind}" style="flex:1; padding:6px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,0.35); border-radius:6px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; font-weight:800; cursor:pointer;">${label}</button>`;
+    // 🔊 Robot VOICE — a LOCAL listener preference (this device's speakers),
+    // so it sits OUTSIDE the owner gate: guests toggle their own. One fixed
+    // style — see robotVoice.ts.
+    const voiceOn = isRobotVoiceEnabled();
+    const voiceBtn = `<button data-voice="1" style="
+      display:flex; justify-content:space-between; align-items:center; gap:8px;
+      padding:9px 12px; text-align:left;
+      background:${voiceOn ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
+      border:1px solid ${voiceOn ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
+      border-radius:7px; color:${voiceOn ? '#2fe6a0' : CH_GOLD};
+      font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
+      cursor:pointer;
+    "><span>${voiceOn ? '🔊 VOICE ON' : '🔇 VOICE OFF'}</span><span style="font-size:9px; color:rgba(212,168,75,0.5);">this device</span></button>`;
     const editor =
       current === 'custom'
         ? `
@@ -1948,6 +1962,8 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       <div style="display:flex; flex-direction:column; gap:8px;">
         ${ROBOT_ROUTINES.map(routineBtn).join('')}
       </div>
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
+      ${voiceBtn}
       ${editor}
       <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
         ${owner
@@ -1958,6 +1974,13 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         SSF ROBOT CONSOLE v1 · one robot per dock · syncs to everyone in the room
       </div>
     `;
+    // 🔊 VOICE toggles for EVERYONE (local speakers, not the synced config) —
+    // wired before the owner gate below. Local change → re-render by hand
+    // (the subscribeRobot observer only fires on doc writes).
+    panel.querySelector<HTMLButtonElement>('[data-voice]')?.addEventListener('click', () => {
+      setRobotVoiceEnabled(!isRobotVoiceEnabled());
+      render();
+    });
     if (!owner) return;
     // 🤖 STOP/START: toggle parked, preserving routine + script.
     panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
