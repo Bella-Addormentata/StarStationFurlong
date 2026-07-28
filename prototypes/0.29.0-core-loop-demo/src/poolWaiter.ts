@@ -36,6 +36,8 @@ const SERVE_COOLDOWN = 6; // s before the next drink can be grabbed
 const DOCK_AFTER_SECS = 12; // 🔌 idle this long with no fox near → return to dock
 const DOCK_WAKE_RANGE = 4.5; // 🔌 a fox this close wakes the bot off the dock
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
+const SMALLTALK_RANGE = 3.2; // 🗨️ #77: fox newly this close → one greeting line
+const SMALLTALK_COOLDOWN_SECS = 45; // per bot — greet, don't pester
 // (The glass is anchored to the fox's actual PAW via getPawWorldPos — the
 //  rig's drink-hold arm pose decides where waist/muzzle land, so no fixed
 //  hand/mouth heights are needed here.)
@@ -85,6 +87,34 @@ export const CASINO_PATROL: Array<[number, number]> = [
   [3.4, 0],
   [3.4, 2.2],
   [3.25, 4.15],
+];
+
+/** 🗨️ #77 small talk — one line, edge-triggered, when a fox first steps into
+ *  SMALLTALK_RANGE (per-bot cooldown). Spoken through the sayHandler, so it
+ *  rides the same bubble + speaker-voice pipeline as scripted 'say' lines.
+ *  Pool picked by what the bot is doing; croupier/custom/parked bots never
+ *  small-talk (their paths return before the patrol/dock tail). */
+const SMALLTALK_PATROL: readonly string[] = [
+  "Welcome aboard, traveler!",
+  "Lovely orbit tonight, isn't it?",
+  "Care for a drink? Just wave me down.",
+  "The wheel's been lucky today. Feeling bold?",
+  "Enjoy your stay on Furlong Station!",
+];
+const SMALLTALK_CHARGING: readonly string[] = [
+  "Recharging… back on duty in a jiffy.",
+  "Low on volts, high on spirits.",
+  "Just topping up my cells — don't mind me.",
+];
+/** 🍹 Spoken once as a serve begins (the OFFER turn-to-face) — the #77
+ *  "stopping to ask if a person would like a drink" beat. One line per serve;
+ *  SERVE_COOLDOWN already spaces repeat serves. */
+const SERVE_LINES: readonly string[] = [
+  "Care for a drink? Fresh off the tray!",
+  "One cosmic cooler, just for you.",
+  "You look thirsty — here you go!",
+  "A refreshment for the distinguished guest.",
+  "Compliments of the house — enjoy!",
 ];
 
 /** Cocktail colours (glass body / garnish) — matches the reference tray. */
@@ -164,6 +194,9 @@ export class PoolWaiter {
   private scriptTimer = 0;
   private saidThisStep = false;
   private sayHandler: ((text: string, x: number, z: number) => void) | null = null;
+  /** 🗨️ #77 small talk: greet once when a fox newly enters range, then hold off. */
+  private smalltalkCooldown = 0;
+  private foxWasNear = false;
   /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
    *  walk goal (routes around furniture / through door openings instead of
    *  clipping straight through), and the goal they were computed for. */
@@ -378,7 +411,14 @@ export class PoolWaiter {
   update(dt: number, player: Player | null): void {
     this.time += dt;
     if (this.cooldown > 0) this.cooldown = Math.max(0, this.cooldown - dt);
+    if (this.smalltalkCooldown > 0)
+      this.smalltalkCooldown = Math.max(0, this.smalltalkCooldown - dt);
     this.refill();
+
+    // One player↔bot distance per frame — shared by small talk and the
+    // dock-wake check below (foxDistance is allocation-free).
+    const foxDist = player ? this.foxDistance(player) : Infinity;
+    this.maybeSmalltalk(foxDist);
 
     if (this.servePhase !== "NONE") {
       this.tray.visible = true; // 🍹 the tray only shows while serving drinks
@@ -429,7 +469,7 @@ export class PoolWaiter {
     // 🔌 #77 Phase A: idle→dock. A fox within range (or no dock at all) keeps
     // the bot awake on patrol/serve; otherwise idle accrues and, past the
     // threshold, the bot heads to its charging dock and holds a charge pose.
-    const foxNear = !!player && this.foxDistance(player) < DOCK_WAKE_RANGE;
+    const foxNear = foxDist < DOCK_WAKE_RANGE;
     if (foxNear || !this.dockTarget) {
       this.idleTimer = 0;
       this.activity = "PATROL";
@@ -446,6 +486,36 @@ export class PoolWaiter {
       this.updatePatrol(dt);
       if (player) this.maybeBeginServe(player);
     }
+  }
+
+  /** 🗨️ #77: greet a fox the moment it steps into range — edge-triggered on
+   *  the far→near transition (so standing beside the bot doesn't re-fire)
+   *  with a per-bot cooldown. Runs every frame so `foxWasNear` tracks reality
+   *  on every routine path; the speak itself is gated on an EXPLICIT idle
+   *  predicate — only a 'serve' bot that isn't mid-serve, parked or standing
+   *  a table makes small talk. */
+  private maybeSmalltalk(foxDist: number): void {
+    const near = foxDist < SMALLTALK_RANGE;
+    const entered = near && !this.foxWasNear;
+    this.foxWasNear = near;
+    if (!entered || this.smalltalkCooldown > 0) return;
+    if (
+      this.servePhase !== "NONE" ||
+      this.parked ||
+      this.croupierPost ||
+      this.routine !== "serve"
+    ) {
+      return;
+    }
+    this.smalltalkCooldown = SMALLTALK_COOLDOWN_SECS;
+    this.sayRandom(this.activity === "DOCK" ? SMALLTALK_CHARGING : SMALLTALK_PATROL);
+  }
+
+  /** One random line from `pool`, through the world's bubble+voice seam. */
+  private sayRandom(pool: readonly string[]): void {
+    if (!this.sayHandler) return;
+    const p = this.group.position;
+    this.sayHandler(pool[Math.floor(Math.random() * pool.length)], p.x, p.z);
   }
 
   /** 🔌 Point the bot at a charging dock (world pos + facing). The world calls
@@ -610,7 +680,9 @@ export class PoolWaiter {
   }
 
   private foxDistance(player: Player): number {
-    const p = player.getPosition();
+    // Read the mesh position directly (getPosition() clones a Vector3, and
+    // this runs per frame per bot).
+    const p = player.mesh.position;
     return Math.hypot(p.x - this.group.position.x, p.z - this.group.position.z);
   }
 
@@ -673,6 +745,9 @@ export class PoolWaiter {
     this.legL.rotation.x = 0;
     this.legR.rotation.x = 0;
     this.body.position.y = 0;
+    // 🍹 One service line as the bot turns to offer (#77 "ask if a person
+    // would like a drink").
+    this.sayRandom(SERVE_LINES);
   }
 
   private updateServe(dt: number, player: Player | null): void {
