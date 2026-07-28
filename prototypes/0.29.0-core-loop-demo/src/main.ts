@@ -6661,11 +6661,7 @@ function onCanvasClick(event: MouseEvent): void {
     const keypadHits = raycaster.intersectObjects(interactables, true);
     if (keypadHits.length > 0) {
       const hit = keypadHits[0];
-      const doorId = hit.object.userData.doorId as
-        | "north"
-        | "south"
-        | "east"
-        | "west";
+      const doorId = hit.object.userData.doorId as string;
       if (doorId) {
         console.log(
           `[Raycast Intercept] Golden Terminal Keypad Click on: ${doorId.toUpperCase()}`,

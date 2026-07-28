@@ -84,7 +84,7 @@ function isCardinalDoorId(id: string): id is DoorId {
 }
 
 export interface DockingState {
-  doorId: "north" | "south" | "east" | "west";
+  doorId: string;
   locked: boolean;
   pinCode: string;
   connectedRoomAddress: string; // Target room URL seed
@@ -102,7 +102,7 @@ export interface DockingState {
 
 export class DoorDockingPortSystem {
   private roomsGroup: THREE.Group;
-  private doorState: Map<"north" | "south" | "east" | "west", DockingState> =
+  private doorState: Map<string, DockingState> =
     new Map();
   private doorObjects: Map<string, THREE.Group> = new Map();
   /** Room ENTRY policy (public doors) — distinct from the per-door pairing
@@ -213,7 +213,7 @@ export class DoorDockingPortSystem {
   private builtChainBoxes(): Box[] {
     const out: Box[] = [];
     for (const doorId of this.doorState.keys()) {
-      out.push(...this.chainBoxesFor(doorId));
+      if (isCardinalDoorId(doorId)) out.push(...this.chainBoxesFor(doorId));
     }
     return out;
   }
@@ -559,24 +559,25 @@ export class DoorDockingPortSystem {
       // We attach the isLarge metadata onto the group so our slider knows the correct target panning offsets
       doorGroup.userData = { isLarge: cfg.isLarge };
 
-      // 3+4. PORT HARDWARE — keypad + status LED. 🚪 #91: only the 4 CARDINAL
-      // berths get it. Per #28's own model a port is a cardinal berth, and the
-      // whole pane behind this keypad is cardinal-only underneath: the POSITION
-      // slider, the pairing/projection math and the assembly strip all reach for
-      // LEGACY_PLACEMENTS / physicalDoorPose, which return undefined for a free
-      // `d:` id and threw uncaught TypeErrors mid-click (one of them leaving a
-      // half-paired local-only door that could never open). Free doors are
-      // passages; they keep their frame glow and simply have no terminal.
-      if (isCardinalDoorId(cfg.id)) {
+      // 3+4. PORT HARDWARE — keypad + status LED. Every door (including free
+      // `d:` doors) gets a panel mounted on the FRONT FACE of the door post so
+      // the control is an integral part of the door and requires no separate
+      // wall mount. Cardinal doors open the full docking pane; free doors open
+      // a simplified settings panel (lock state + PIN + passage policy).
+      {
         const keypadGeo = new THREE.BoxGeometry(0.3, 0.4, 0.12);
         const keypadMat = new THREE.MeshStandardMaterial({
           color: 0xd4a84b,
           metalness: 0.5,
         });
         const keypad = new THREE.Mesh(keypadGeo, keypadMat);
-        // Clear of the post, whose outer face is at opening/2 + POST_W = 1.3.
-        const keypadOffsetX = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH + 0.15;
-        keypad.position.set(keypadOffsetX, -0.2, 0.1);
+        // Centre on the right post, flush with the room-interior-facing surface.
+        // Local +z points into the room for every door orientation (frameYaw
+        // rotates so that the room side is always +z), so FRAME_D/2 is the
+        // front face. The keypad (depth 0.12) is centred at FRAME_D/2 + 0.07
+        // so its back face sits just proud of the post surface.
+        const onFaceX = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH / 2;
+        keypad.position.set(onFaceX, -0.2, FRAME_D / 2 + 0.07);
         keypad.name = `keypad_${cfg.id}`;
         // Store reference inside trigger metadata
         keypad.userData = { isControlPanel: true, doorId: cfg.id };
@@ -585,7 +586,7 @@ export class DoorDockingPortSystem {
         const ledGeo = new THREE.SphereGeometry(0.06, 16, 16);
         const ledMat = new THREE.MeshBasicMaterial({ color: 0xff1744 }); // Default locked/red indicator
         const led = new THREE.Mesh(ledGeo, ledMat);
-        led.position.set(keypadOffsetX, 0.1, 0.18);
+        led.position.set(onFaceX, 0.1, FRAME_D / 2 + 0.08);
         led.name = "ledStatus";
         portHardware.add(led);
       }
@@ -644,7 +645,7 @@ export class DoorDockingPortSystem {
    * around a door that vanished mid-connection (same guard the slide code uses).
    */
   public isDoorPaired(id: string): boolean {
-    return this.doorState.get(id as DoorId)?.pairedSuccessfully === true;
+    return this.doorState.get(id)?.pairedSuccessfully === true;
   }
 
   /**
@@ -1327,11 +1328,10 @@ export class DoorDockingPortSystem {
 
   /** #67 D1/D1b: paint the DOOR POLICY section (policy cycles for the owner;
    *  summary + request flow for guests; live request/grant lists). */
-  private renderPolicySection(
-    doorId: "north" | "south" | "east" | "west",
-  ): void {
+  private renderPolicySection(doorId: string): void {
     const body = document.getElementById("docking-policy-body");
     if (!body) return;
+    const isCardinal = isCardinalDoorId(doorId);
     const policy = readDoorPolicy(doorId);
     const owner = this.isRoomOwner();
     const myPub = getIdentityPub();
@@ -1375,6 +1375,28 @@ export class DoorDockingPortSystem {
            <button type="button" data-policy-action="undock-module" style="${pill} background:rgba(255,23,68,${undockArmed ? "0.25" : "0.10"}); border-color:rgba(255,23,68,${undockArmed ? "0.7" : "0.35"}); color:#ff8a80;">${undockArmed ? "⏏ CONFIRM" : "⏏ UNDOCK"}</button></div>`
         : "";
 
+    // Cardinal-only rows: POSITION slider and DOCK ADAPTER (both use cardinal-
+    // specific floor-plan / pairing machinery unavailable on free `d:` doors).
+    const positionRow = isCardinal
+      ? `<div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
+          <span style="flex-shrink:0; display:flex; gap:4px; align-items:center;">
+            <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">◀</button>
+            <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => {
+              const d = readDoorDeltas()[doorId as DoorId] ?? 0;
+              return d === 0 ? "CENTER" : `${d > 0 ? "+" : ""}${d.toFixed(1)}m`;
+            })()}</span>
+            <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
+          </span></div>`
+      : "";
+    const adapterRow = isCardinal
+      ? `<div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
+          ${
+            policy.adapter
+              ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
+              : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
+          }</div>`
+      : "";
+
     if (owner) {
       const requests = readDoorRequests(doorId);
       const grants = readDoorGrants(doorId);
@@ -1404,21 +1426,8 @@ export class DoorDockingPortSystem {
           <button type="button" data-policy-action="cycle-passage" style="${pill}">${passageLabel(policy)}</button></div>
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
-        <div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
-          <span style="flex-shrink:0; display:flex; gap:4px; align-items:center;">
-            <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">◀</button>
-            <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => {
-              const d = readDoorDeltas()[doorId] ?? 0;
-              return d === 0 ? "CENTER" : `${d > 0 ? "+" : ""}${d.toFixed(1)}m`;
-            })()}</span>
-            <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
-          </span></div>
-        <div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
-          ${
-            policy.adapter
-              ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
-              : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
-          }</div>
+        ${positionRow}
+        ${adapterRow}
         ${undockRow}
         ${detachRow}
         ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ""}
@@ -1440,7 +1449,7 @@ export class DoorDockingPortSystem {
       body.innerHTML = `
         <div style="${row}"><span>PASSAGE: ${passageLabel(policy)}</span>${buildLine}</div>
         ${
-          policy.adapter && !this.canConstruct(doorId)
+          isCardinal && policy.adapter && !this.canConstruct(doorId)
             ? `<div style="color:#80d8ff;">🔌 BERTHING OPEN — enter your ship's address above and INITIATE to dock transiently</div>`
             : ""
         }
@@ -1454,12 +1463,10 @@ export class DoorDockingPortSystem {
   public refreshPolicyUI(): void {
     const pane = document.getElementById("docking-control-pane");
     if (!pane || pane.style.display === "none") return;
-    const doorId = (pane as any).activeDoorId as
-      | ("north" | "south" | "east" | "west")
-      | null;
+    const doorId = (pane as any).activeDoorId as string | null;
     if (!doorId) return;
     this.renderPolicySection(doorId);
-    this.renderAssemblyStrip(doorId);
+    if (isCardinalDoorId(doorId)) this.renderAssemblyStrip(doorId);
   }
 
   /** #62 P4: paint the assembly strip from the door's working chain. */
@@ -1569,13 +1576,8 @@ export class DoorDockingPortSystem {
   /**
    * Handle Click Raycasts originating in Three.js coordinates
    */
-  public handlePanelRaycast(doorId: "north" | "south" | "east" | "west") {
-    // 🚪 #91: the caller (main.ts' click intercept) hands us whatever doorId a
-    // keypad mesh carries — the cardinal type here is a claim, not a filter.
-    // Free doors no longer BUILD a keypad, but a scene that predates that (or
-    // any future non-cardinal control surface) must not reach the cardinal-only
-    // pose math below, which throws on an unknown id.
-    if (!isCardinalDoorId(doorId)) return;
+  public handlePanelRaycast(doorId: string) {
+    const isCardinal = isCardinalDoorId(doorId);
     const pane = document.getElementById("docking-control-pane");
     const title = document.getElementById("docking-pane-title");
     const lockBtn = document.getElementById("docking-lock-toggle");
@@ -1594,10 +1596,33 @@ export class DoorDockingPortSystem {
     const state = this.doorState.get(doorId);
     if (!state) return;
 
+    // Cardinal-only sections: connection assembly, address input, provision, INITIATE.
+    // For free (non-cardinal) doors these features are not available — hide them.
+    const assemblyEl = document.getElementById("docking-assembly");
+    const addrSection = addrInput.closest("div") as HTMLElement | null;
+    const provisionTemplate = document.getElementById(
+      "docking-provision-template",
+    ) as HTMLElement | null;
+    const provisionBtn = document.getElementById(
+      "docking-provision-btn",
+    ) as HTMLElement | null;
+    const requestBtn = document.getElementById(
+      "docking-request-btn",
+    ) as HTMLElement | null;
+    if (assemblyEl) assemblyEl.style.display = isCardinal ? "" : "none";
+    if (addrSection) addrSection.style.display = isCardinal ? "" : "none";
+    if (provisionTemplate) provisionTemplate.style.display = isCardinal ? "" : "none";
+    if (provisionBtn) provisionBtn.style.display = isCardinal ? "" : "none";
+    if (requestBtn) requestBtn.style.display = isCardinal ? "" : "none";
+
     // Expose active door context inside the modal scope
     (pane as any).activeDoorId = doorId;
     pane.style.display = "flex";
-    title.textContent = `🚪 DOCKING PORT CONTROL: ${doorId.toUpperCase()}`;
+    if (isCardinal) {
+      title.textContent = `🚪 DOCKING PORT CONTROL: ${doorId.toUpperCase()}`;
+    } else {
+      title.textContent = `🚪 DOOR SETTINGS: ${doorId.replace(/^d:/, "").slice(0, 8).toUpperCase()}`;
+    }
 
     // Set field states
     lockBtn.textContent = state.locked ? "LOCKED" : "UNLOCKED";
@@ -1613,32 +1638,34 @@ export class DoorDockingPortSystem {
       noticeBox.style.display = "none";
     }
 
-    // #62 P4: armed-preset prefill — an unpaired door with no working chain
-    // opens with the DEV-armed preset's chips already placed (parts consumed
-    // atomically; silently skipped when stock is short). RING targets a
-    // diamond ring room, so it defaults FAR yaw to 45. OWNER-only (vestibule
-    // findings): a guest merely inspecting a keypad must not consume parts or
-    // arm a ghost on someone else's room.
-    if (
-      this.canConstruct(doorId) &&
-      !state.pairedSuccessfully &&
-      (!state.segments || state.segments.length === 0)
-    ) {
-      const preset = armedPreset();
-      if (preset) {
-        const segs = presetSegments(preset);
-        if (consumeForSegments(segs)) {
-          state.segments = segs;
-          if (preset === "ring" && state.farYawDeg === undefined)
-            state.farYawDeg = 45;
-          this.untouchedPrefills.add(doorId); // refunded on close unless used
+    if (isCardinal) {
+      // #62 P4: armed-preset prefill — an unpaired door with no working chain
+      // opens with the DEV-armed preset's chips already placed (parts consumed
+      // atomically; silently skipped when stock is short). RING targets a
+      // diamond ring room, so it defaults FAR yaw to 45. OWNER-only (vestibule
+      // findings): a guest merely inspecting a keypad must not consume parts or
+      // arm a ghost on someone else's room.
+      if (
+        this.canConstruct(doorId) &&
+        !state.pairedSuccessfully &&
+        (!state.segments || state.segments.length === 0)
+      ) {
+        const preset = armedPreset();
+        if (preset) {
+          const segs = presetSegments(preset);
+          if (consumeForSegments(segs)) {
+            state.segments = segs;
+            if (preset === "ring" && state.farYawDeg === undefined)
+              state.farYawDeg = 45;
+            this.untouchedPrefills.add(doorId); // refunded on close unless used
+          }
         }
       }
+      this.renderAssemblyStrip(doorId);
+      this.undockArmed.delete(doorId); // ⏏ arming never survives a pane re-open
+      this.renderKnownModules(); // 🗺️ atlas picker
     }
-    this.renderAssemblyStrip(doorId);
-    this.undockArmed.delete(doorId); // ⏏ arming never survives a pane re-open
     this.renderPolicySection(doorId); // #67 D1
-    this.renderKnownModules(); // 🗺️ atlas picker
   }
 
   /**
