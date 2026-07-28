@@ -44,8 +44,18 @@ const STORAGE_KEY = 'ssf-robot-voice';
  *  through to any en-* voice below). */
 const PREFERRED_NAMES = ['Samantha', 'Karen', 'Moira', 'Martha', 'Tessa'];
 /** Bubbles keep their emoji (🎲 Place your bets!) but the engine must not
- *  read them aloud ("game die place your bets") — spoken form only. */
-const PICTOGRAPH_RE = /[\p{Extended_Pictographic}️]/gu;
+ *  read them aloud ("game die place your bets") — spoken form only. Built
+ *  dynamically: \p{Extended_Pictographic} needs Unicode property escapes, and
+ *  a regex LITERAL would take this whole module down at parse time on an
+ *  engine without them (the build transpiles syntax but never regexes) — an
+ *  old browser degrades to "emoji may be spoken" instead of a dead app. */
+const PICTOGRAPH_RE: RegExp | null = (() => {
+  try {
+    return new RegExp('[\\p{Extended_Pictographic}\\uFE0F]', 'gu');
+  } catch {
+    return null;
+  }
+})();
 
 interface VoiceDeps {
   /** Local player world position (null while no world — line is skipped). */
@@ -113,7 +123,7 @@ export function speakRobotLine(text: string, x: number, z: number): void {
   // current utterance, and drops once that waiter slot is taken.
   if (synth.pending) return;
 
-  const spoken = text.replace(PICTOGRAPH_RE, '').trim();
+  const spoken = (PICTOGRAPH_RE ? text.replace(PICTOGRAPH_RE, '') : text).trim();
   if (!spoken) return;
   const u = new SpeechSynthesisUtterance(spoken);
   const v = pickVoice();
