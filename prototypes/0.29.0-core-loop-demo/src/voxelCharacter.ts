@@ -57,6 +57,23 @@ import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
 
 export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep' | 'swim' | 'dive';
 
+/** 🏋️ One frame of follow-the-coach pose (#77 coach routine) — produced by
+ *  the coach bot (PoolWaiter.getFollowerPose), scaled to the chibi fox. */
+export interface WorkoutPose {
+  /** Torso Y offset — the squat sink / jack hop (applied after the root lerp). */
+  dip: number;
+  /** Per-arm forward raise (rad, absolute — the lunge drives them apart). */
+  armLX: number;
+  armRX: number;
+  /** Sideways arm sweep magnitude (rad, mirrored per side). */
+  armZ: number;
+  /** Leg splay magnitude (rad, mirrored per side). */
+  legZ: number;
+  /** Per-leg X overrides — the lunge split; omit to keep the state pose. */
+  legLX?: number;
+  legRX?: number;
+}
+
 interface PoseState {
   /** World-space Y for the torso root (lower values = seated) */
   rootY: number;
@@ -1708,9 +1725,32 @@ export class VoxelCharacter {
   /** 🍹 Drink-hold override (waiter-bot serve): 0 = paw reaching forward at
    *  waist height, 1 = raised to the muzzle; null = normal arm animation. */
   private drinkHold: number | null = null;
+  /** 🏋️ Live follow-the-coach pose, or null (see setWorkoutPose). */
+  private workoutPose: WorkoutPose | null = null;
 
   public setDrinkHold(raise: number | null): void {
     this.drinkHold = raise;
+  }
+
+  /** Current animation state (read-only — follow-the-coach gates on 'idle'). */
+  public getState(): CharacterState {
+    return this.currentState;
+  }
+
+  /** 🏋️ Follow-the-coach override (#77): while set AND the fox is simply
+   *  standing (state 'idle'), the workout pose wins over the state limb
+   *  targets — the same post-branch slot as the drink hold. Walking, sitting
+   *  or swimming naturally breaks the follow. Arm/leg Z rotations aren't
+   *  state-managed, so clearing the pose zeroes them explicitly (X targets
+   *  converge back through the per-frame state lerps on their own). */
+  public setWorkoutPose(pose: WorkoutPose | null): void {
+    if (pose === null && this.workoutPose !== null) {
+      this.leftArm.rotation.z = 0;
+      this.rightArm.rotation.z = 0;
+      this.leftLeg.rotation.z = 0;
+      this.rightLeg.rotation.z = 0;
+    }
+    this.workoutPose = pose;
   }
 
   /** World position of the right paw (the drink rides in it while sipping).
@@ -1835,6 +1875,23 @@ export class VoxelCharacter {
         : 0;
     this.head.rotation.x = THREE.MathUtils.lerp(this.head.rotation.x, headLifeX, lerpSpeed);
     this.head.rotation.z = THREE.MathUtils.lerp(this.head.rotation.z, headLifeZ, lerpSpeed);
+
+    // 🏋️ Follow-the-coach (#77) — mirrors the coach's demo while the fox is
+    // simply standing; any other state (walk/sit/swim) ignores the pose, so
+    // stepping away breaks the follow with no bookkeeping. Applied before the
+    // drink hold: a fox holding a drink does the one-armed version.
+    if (this.workoutPose && this.currentState === 'idle') {
+      const w = this.workoutPose;
+      this.torso.position.y += w.dip;
+      this.leftArm.rotation.x = w.armLX;
+      this.rightArm.rotation.x = w.armRX;
+      this.leftArm.rotation.z = -w.armZ;
+      this.rightArm.rotation.z = w.armZ;
+      this.leftLeg.rotation.z = -w.legZ;
+      this.rightLeg.rotation.z = w.legZ;
+      if (w.legLX !== undefined) this.leftLeg.rotation.x = w.legLX;
+      if (w.legRX !== undefined) this.rightLeg.rotation.x = w.legRX;
+    }
 
     // 🍹 Drink in the right paw (waiter-bot serve) — OVERRIDES the state arm
     // pose: reaches forward to take the glass, curls up to the muzzle on each
