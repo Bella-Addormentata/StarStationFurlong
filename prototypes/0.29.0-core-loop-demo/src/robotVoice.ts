@@ -107,7 +107,11 @@ export function speakRobotLine(text: string, x: number, z: number): void {
   const dist = Math.hypot(x - p.x, z - p.z);
   if (dist >= FAR_RANGE) return;
   const synth = window.speechSynthesis;
-  if (synth.pending) return; // one waiter max — drop, don't pile up
+  // `pending` counts only utterances queued BEHIND the one being spoken — a
+  // speaking synth with an empty queue reports pending=false (verified in
+  // Chromium). So this admits exactly ONE waiter: a line may queue behind the
+  // current utterance, and drops once that waiter slot is taken.
+  if (synth.pending) return;
 
   const spoken = text.replace(PICTOGRAPH_RE, '').trim();
   if (!spoken) return;
