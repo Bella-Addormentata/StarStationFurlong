@@ -12,7 +12,11 @@
 import * as THREE from "three";
 import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
-import { physicalDoorPose, portForDoor, poseFromWall } from "./doorLayout";
+import {
+  physicalDoorPose, portForDoor, poseFromWall,
+  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
+} from "./doorLayout";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import { ROOM_TEMPLATES } from "./roomTemplates";
@@ -54,14 +58,14 @@ import {
 } from "./doorPolicy";
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
-import { deleteDoorPairing } from "./doorsDoc";
+import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
 import {
   seedFloorPlan,
   writeDoorPlacement,
   readDoorDeltas,
   lateralOf,
   LEGACY_PLACEMENTS,
-  DOOR_LATTICE,
+  doorLateralLimitForWall,
 } from "./floorPlanDoc";
 import { readAtlas, atlasLayout, moduleOverlapAt } from "./stationAtlas";
 
@@ -189,7 +193,7 @@ export class DoorDockingPortSystem {
    * unreachable.
    */
   private provisionModuleCallback:
-    | ((templateId: string) => Promise<string | null>)
+    | ((templateId: string, parentDoorId?: string) => Promise<string | null>)
     | null = null;
 
   constructor(roomsGroup: THREE.Group) {
@@ -219,7 +223,11 @@ export class DoorDockingPortSystem {
     const segs = this.doorState.get(doorId)?.segments ?? [];
     if (segs.length === 0) return [];
     const PAD = 0.85;
-    const pose = physicalDoorPose(doorId);
+    // 🚪 #91: anchor on the door's LIVE pose (slide delta included). Without
+    // the delta these occupancy/clash boxes sat at the unslid position while
+    // buildConnectorChain drew the tube at the slid one — the warnings and the
+    // thing on screen disagreed.
+    const pose = this.poseForDoor(doorId, readDoorDeltas()[doorId] ?? 0);
     const face = { x: pose.x, z: pose.z };
     const yaw = pose.outwardYaw;
     const c = Math.cos(yaw),
@@ -287,25 +295,17 @@ export class DoorDockingPortSystem {
   public buildPorts() {
     console.log("🚪 Constructing 4-Directional Docking Ports & Control Panels");
 
-    // Configurations: [doorId, pos, rot]
-    const doorsConfig: Array<{ id: DoorId; isLarge: boolean }> = [
-      { id: "north", isLarge: false },
-      { id: "south", isLarge: false },
-      { id: "west", isLarge: true },
-      { id: "east", isLarge: true },
-    ];
-
-    for (const cfg of doorsConfig) {
+    // 🚪 #91: one door size — the config is just the 4 cardinal berths now.
+    for (const id of ["north", "south", "west", "east"] as const) {
       // At build time (World construction) the doorLayout doc is not bound yet,
       // so the default 4 come from this local config; the slice-5b reconcile
-      // adds/removes groups from the synced map afterward. e/w = large keeps it
-      // bit-identical (readAllDoorLayout would be empty here and default small).
+      // adds/removes groups from the synced map afterward.
       this.buildDoorGroup({
-        id: cfg.id,
-        wall: cfg.id,
+        id,
+        wall: id,
         lateral: 0,
-        size: cfg.isLarge ? "large" : "small",
-        enabled: findDoor(cfg.id)?.enabled === true,
+        size: "large",
+        enabled: findDoor(id)?.enabled === true,
       });
     }
 
@@ -321,7 +321,14 @@ export class DoorDockingPortSystem {
    */
   private buildDoorGroup(record: DoorLayoutRecord): void {
     const cfg = { id: record.id as DoorId, isLarge: record.size === "large" };
-    const pose = this.poseForDoor(cfg.id);
+    // 🚪 #91: derive the pose from the RECORD, not from poseForDoor(id) — a
+    // brand-new free door is not in doorObjects yet, so poseForDoor's userData
+    // lookup missed and every one was born mid-north-wall (it self-healed only
+    // because reconcileDoorPlacements re-posed it microseconds later).
+    // Cardinals still route through poseForDoor so the layout tables own them.
+    const pose = isCardinalDoorId(record.id)
+      ? this.poseForDoor(record.id)
+      : poseFromWall(record.wall, record.lateral);
     // A new door needs its own pairing state so its LED / keypad / slide work
     // (the 4 cardinals are already seeded by initializeDoorStates → no-op).
     if (!this.doorState.has(cfg.id)) {
@@ -362,10 +369,16 @@ export class DoorDockingPortSystem {
       };
 
       // Local geometry conventions: group centre sits at world y=2, so the
-      // floor is local y=-2. Opening = 1.4w x 3.0h (small) / 2.4w x 3.0h (large).
-      const openingWidth = cfg.isLarge ? 2.4 : 1.4;
+      // floor is local y=-2. 🚪 #91: ONE door size, REDRAWN onto the grid —
+      // the opening is exactly 2 grid cells (2.0 m) so a door centred on a
+      // grid line sits flush between two squares. Everything below derives
+      // from the shared constants in doorLayout.ts, which the editor's
+      // validators read too — geometry and collision model cannot drift apart
+      // again (they did: the old 2.4/1.4 openings matched no whole number of
+      // cells while the validators assumed 2/1).
+      const openingWidth = DOOR_OPENING_WIDTH;
       const OPEN_H = 3.0; // opening height (local y -2 .. 1)
-      const POST_W = 0.3; // side post width
+      const POST_W = DOOR_POST_WIDTH; // side post width
       const FRAME_D = 0.5; // frame depth
       const FLOOR_Y = -2; // local floor level
 
@@ -506,10 +519,8 @@ export class DoorDockingPortSystem {
         return leaf;
       };
 
-      const leftOffset = cfg.isLarge ? -0.62 : -0.37;
-      const rightOffset = cfg.isLarge ? 0.62 : 0.37;
-      doorLeaves.add(buildLeaf("leftLeaf", leftOffset));
-      doorLeaves.add(buildLeaf("rightLeaf", rightOffset));
+      doorLeaves.add(buildLeaf("leftLeaf", -DOOR_LEAF_SHUT_OFFSET));
+      doorLeaves.add(buildLeaf("rightLeaf", DOOR_LEAF_SHUT_OFFSET));
 
       // ── 4. Floor threshold plate + emissive guide strips ───────────────────
       const threshold = new THREE.Mesh(
@@ -548,27 +559,36 @@ export class DoorDockingPortSystem {
       // We attach the isLarge metadata onto the group so our slider knows the correct target panning offsets
       doorGroup.userData = { isLarge: cfg.isLarge };
 
-      // 3. Interactive Keypad Box (Golden terminal highlight)
-      const keypadGeo = new THREE.BoxGeometry(0.3, 0.4, 0.12);
-      const keypadMat = new THREE.MeshStandardMaterial({
-        color: 0xd4a84b,
-        metalness: 0.5,
-      });
-      const keypad = new THREE.Mesh(keypadGeo, keypadMat);
-      const keypadOffsetX = cfg.isLarge ? 1.6 : 1.1;
-      keypad.position.set(keypadOffsetX, -0.2, 0.1);
-      keypad.name = `keypad_${cfg.id}`;
-      // Store reference inside trigger metadata
-      keypad.userData = { isControlPanel: true, doorId: cfg.id };
-      portHardware.add(keypad);
+      // 3+4. PORT HARDWARE — keypad + status LED. 🚪 #91: only the 4 CARDINAL
+      // berths get it. Per #28's own model a port is a cardinal berth, and the
+      // whole pane behind this keypad is cardinal-only underneath: the POSITION
+      // slider, the pairing/projection math and the assembly strip all reach for
+      // LEGACY_PLACEMENTS / physicalDoorPose, which return undefined for a free
+      // `d:` id and threw uncaught TypeErrors mid-click (one of them leaving a
+      // half-paired local-only door that could never open). Free doors are
+      // passages; they keep their frame glow and simply have no terminal.
+      if (isCardinalDoorId(cfg.id)) {
+        const keypadGeo = new THREE.BoxGeometry(0.3, 0.4, 0.12);
+        const keypadMat = new THREE.MeshStandardMaterial({
+          color: 0xd4a84b,
+          metalness: 0.5,
+        });
+        const keypad = new THREE.Mesh(keypadGeo, keypadMat);
+        // Clear of the post, whose outer face is at opening/2 + POST_W = 1.3.
+        const keypadOffsetX = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH + 0.15;
+        keypad.position.set(keypadOffsetX, -0.2, 0.1);
+        keypad.name = `keypad_${cfg.id}`;
+        // Store reference inside trigger metadata
+        keypad.userData = { isControlPanel: true, doorId: cfg.id };
+        portHardware.add(keypad);
 
-      // 4. Status Indicator LED Sphere
-      const ledGeo = new THREE.SphereGeometry(0.06, 16, 16);
-      const ledMat = new THREE.MeshBasicMaterial({ color: 0xff1744 }); // Default locked/red indicator
-      const led = new THREE.Mesh(ledGeo, ledMat);
-      led.position.set(keypadOffsetX, 0.1, 0.18);
-      led.name = "ledStatus";
-      portHardware.add(led);
+        const ledGeo = new THREE.SphereGeometry(0.06, 16, 16);
+        const ledMat = new THREE.MeshBasicMaterial({ color: 0xff1744 }); // Default locked/red indicator
+        const led = new THREE.Mesh(ledGeo, ledMat);
+        led.position.set(keypadOffsetX, 0.1, 0.18);
+        led.name = "ledStatus";
+        portHardware.add(led);
+      }
 
       // Attach both halves; the top group is still what doorObjects tracks and
       // what repositionDoorGroups / the fade traverse operate on.
@@ -870,7 +890,19 @@ export class DoorDockingPortSystem {
         provisionBtn.disabled = true;
         provisionBtn.textContent = "MINTING MODULE…";
         try {
-          const seed = await this.provisionModuleCallback(templateId);
+          // 🛰️🚪 Hand the minting side the BERTH this module is being added
+          // from. That is what lets the new room be born with exactly one
+          // door — the one leading back here — instead of inheriting a full
+          // set of cardinals. Same source the INITIATE handler below reads.
+          const pane = document.getElementById("docking-control-pane");
+          const parentDoorId = pane
+            ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ??
+              undefined)
+            : undefined;
+          const seed = await this.provisionModuleCallback(
+            templateId,
+            parentDoorId,
+          );
           const addrInput = document.getElementById(
             "docking-addr-input",
           ) as HTMLInputElement | null;
@@ -1212,18 +1244,41 @@ export class DoorDockingPortSystem {
           };
           writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
         } else if (action === "slide-neg" || action === "slide-pos") {
-          // 🧱 #66 S1: slide the door 0.5 m along its wall. Owner-only (this
-          // branch), UNPAIRED-only (plan §6.2 — live chains never re-solve),
-          // snapped + clamped in floorPlanDoc on both write and read.
+          // 🧱 #66 S1: slide the door along its wall. Owner-only (this branch),
+          // UNPAIRED-only (plan §6.2 — live chains never re-solve), snapped +
+          // clamped in floorPlanDoc on both write and read.
+          // 🚪 #91: step ONE GRID CELL, in door-CENTRE currency. It used to
+          // step DOOR_LATTICE (0.5 m), so every other click parked the door
+          // mid-cell, straddling a grid line. Rounding the centre first also
+          // re-snaps a door that a pre-#91 build left off-grid.
           const st2 = this.doorState.get(doorId);
-          if (st2?.pairedSuccessfully) return;
+          if (st2?.pairedSuccessfully || !isCardinalDoorId(doorId)) return;
           seedFloorPlan(); // lazy first-structure-commit seed (idempotent)
-          const legacy = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
-          const current = legacy + (readDoorDeltas()[doorId] ?? 0);
-          writeDoorPlacement(
-            doorId,
-            current + (action === "slide-pos" ? DOOR_LATTICE : -DOOR_LATTICE),
+          const base = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
+          const centre = physicalDoorPose(doorId, readDoorDeltas()[doorId] ?? 0);
+          const centreLateral =
+            centre.wall === "north" || centre.wall === "south" ? centre.x : centre.z;
+          // Bound in WORLD-CENTRE currency as well. writeDoorPlacement's own
+          // clamp is expressed in STORED units, which are relative to the
+          // LEGACY slot — under a pairs layout the live slot is ±PAIR_OFFSET
+          // away, so an in-bounds stored value could park the door at a centre
+          // of ±7 on a wall that only runs ±6. (The editor's drag intersects
+          // both bounds; the slider never did.)
+          const wallLimit = doorLateralLimitForWall(centre.wall);
+          const stepped = Math.max(
+            -wallLimit,
+            Math.min(
+              wallLimit,
+              Math.round(centreLateral) + (action === "slide-pos" ? 1 : -1),
+            ),
           );
+          // The store speaks base-relative laterals; convert the new centre back.
+          const baseCentre = physicalDoorPose(doorId, 0);
+          const baseLateral =
+            baseCentre.wall === "north" || baseCentre.wall === "south"
+              ? baseCentre.x
+              : baseCentre.z;
+          writeDoorPlacement(doorId, stepped - baseLateral + base);
         } else if (action === "install-adapter") {
           // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
           if (consumePart("adapter")) {
@@ -1249,7 +1304,11 @@ export class DoorDockingPortSystem {
           if (!stu?.pairedSuccessfully || stu.transient) return;
           if (this.undockArmed.get(doorId) === stu.connectedRoomAddress) {
             this.undockArmed.delete(doorId);
-            deleteDoorPairing(doorId);
+            // ⏏ #91: TOMBSTONE, not delete — the far room's mirror record still
+            // points here and would re-pair this door on the next walk-through
+            // back, silently undoing the undock. It names the retired module so
+            // it refuses only that one. See writeDoorTombstone.
+            writeDoorTombstone(doorId, stu.connectedRoomAddress);
           } else {
             // arm FOR this pairing — a different armed address is stale
             this.undockArmed.set(doorId, stu.connectedRoomAddress);
@@ -1511,6 +1570,12 @@ export class DoorDockingPortSystem {
    * Handle Click Raycasts originating in Three.js coordinates
    */
   public handlePanelRaycast(doorId: "north" | "south" | "east" | "west") {
+    // 🚪 #91: the caller (main.ts' click intercept) hands us whatever doorId a
+    // keypad mesh carries — the cardinal type here is a claim, not a filter.
+    // Free doors no longer BUILD a keypad, but a scene that predates that (or
+    // any future non-cardinal control surface) must not reach the cardinal-only
+    // pose math below, which throws on an unknown id.
+    if (!isCardinalDoorId(doorId)) return;
     const pane = document.getElementById("docking-control-pane");
     const title = document.getElementById("docking-pane-title");
     const lockBtn = document.getElementById("docking-lock-toggle");
@@ -2022,8 +2087,9 @@ export class DoorDockingPortSystem {
   ): void {
     const group = this.doorObjects.get(doorId);
     if (!group) return; // no door built — the caller's timeout handles it
-    const isLarge = group.userData?.isLarge === true;
-    const openTarget = open ? (isLarge ? 1.8 : 1.05) : isLarge ? 0.62 : 0.37;
+    // 🚪 #91: one door size, so the slide targets are shared constants derived
+    // from the opening width (they used to be per-size literals here).
+    const openTarget = open ? DOOR_LEAF_OPEN_OFFSET : DOOR_LEAF_SHUT_OFFSET;
 
     // Same-direction overwrite: chain the in-flight onComplete (old first) so
     // an external open (keypad unlock, pairing accept) can't drop a waiting
@@ -2319,7 +2385,9 @@ export class DoorDockingPortSystem {
 
   /** Wire the PROVISION NEW MODULE minting callback (see field docs). The
    *  chosen room template id (from the door-panel dropdown) is passed through. */
-  public onProvisionModule(cb: (templateId: string) => Promise<string | null>) {
+  public onProvisionModule(
+    cb: (templateId: string, parentDoorId?: string) => Promise<string | null>,
+  ) {
     this.provisionModuleCallback = cb;
   }
 }

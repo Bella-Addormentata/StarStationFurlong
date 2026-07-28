@@ -7,7 +7,11 @@
 import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
-import { physicalDoorPose, setActiveDoorLayout } from "./doorLayout";
+import {
+  physicalDoorPose, setActiveDoorLayout, isCardinalDoorId,
+  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+} from "./doorLayout";
+import type { DoorLayoutKind } from "./doorLayout";
 import { Player } from "./player";
 import {
   PoolWaiter,
@@ -87,6 +91,7 @@ import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import { subscribeDoorLayout, readAllDoorLayout } from "./doorLayoutDoc";
+import type { DoorWall } from "./doorLayoutDoc";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
   buildVestibule,
@@ -188,6 +193,33 @@ interface RemoteAvatar {
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
 
+/**
+ * 🚪 #91: the door set an UNSEEDED room presents — the four cardinal berths
+ * docking.buildPorts constructs at boot. Used by reconcileDoorLayout so a room
+ * with no synced layout shows ITS OWN defaults instead of whatever the last
+ * room reconciled to (World and its door groups outlive any single room).
+ * `enabled` is left to the room (updateNorthDoorForFireplace / casino).
+ */
+function defaultDoorLayoutRecords(): Map<string, DoorLayoutRecord> {
+  const out = new Map<string, DoorLayoutRecord>();
+  for (const id of ["north", "south", "east", "west"] as const) {
+    out.set(id, { id, wall: id, lateral: 0, size: "large", enabled: true });
+  }
+  return out;
+}
+
+/** 🚪 #91: the wall physically facing a given wall. Walking out of a room's
+ *  north side must bring you in through the next room's south side. */
+function oppositeWall(wall: DoorWall): DoorWall {
+  return wall === "north"
+    ? "south"
+    : wall === "south"
+      ? "north"
+      : wall === "east"
+        ? "west"
+        : "east";
+}
+
 export class World {
   private scene: THREE.Scene;
   private player: Player;
@@ -280,6 +312,8 @@ export class World {
   private pairedVestibules: Map<DoorId, THREE.Group> = new Map();
   /** Door whose vestibule is lit for an in-flight transit, or null. */
   private transitVestibuleDoorId: DoorId | null = null;
+  /** 🚪 #91: tubes of removed doors awaiting a safe frame to dispose. */
+  private orphanVestibules: Set<DoorId> = new Set();
   /** Resting opacity of a paired-door vestibule when the player is far.
    *  0 — the ghost gangways read as a pile of dark capsules outside the
    *  walls (owner request: remove them from view); the tube still fades in
@@ -362,6 +396,13 @@ export class World {
   private poolSign: THREE.Group | null = null;
   /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
   private casinoSign: THREE.Group | null = null;
+  /** 🚪 #91: which room we're in, for refreshDoorSigns — stashed by
+   *  applyRoomVisuals so the signs can be re-hung on any door change. */
+  private doorSignContext: {
+    outdoor: boolean;
+    casino: boolean;
+    returnDoorId?: DoorId;
+  } | null = null;
   /** Return-wayfinding engraving for the lobby door in casino/pool rooms. */
   private lobbySign: THREE.Group | null = null;
   /** Text-only LOBBY carving applied directly to the casino return door. */
@@ -1519,6 +1560,7 @@ export class World {
     setDoorSlideDeltas(deltas);
     this.dockingSystem?.repositionDoorGroups(deltas);
     this.updateNorthDoorForFireplace();
+    this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
     // drag when the placement changed remotely (slider / another client's drag)
     // — the drag's stashed origin is stale now, so the editor drops it and the
@@ -1527,16 +1569,116 @@ export class World {
   }
 
   /**
+   * 🚪 #91: (re)hang the room's engraved wayfinding signs over their doors.
+   *
+   * These are hard-coded local meshes (CASINO / POOL / LOBBY), pinned to a
+   * cardinal door's pose. They used to be placed ONCE per room join, from the
+   * UN-SLID pose and with visibility keyed only on which room you were in — so
+   * once the door editor could move or delete a door, the sign stayed floating
+   * at the old slot with nothing behind it and no way to remove it ("there's a
+   * remnant from one of the old doors that had the casino label on it", #91).
+   * Now it re-runs from reconcileDoorPlacements (which fires on both the layout
+   * and the slide stores), reads the LIVE slid pose, and hides a sign whose
+   * door no longer exists. An UNSEEDED room (empty map) still has its four
+   * built-in cardinals — the same convention the reconcile itself uses.
+   */
+  /**
+   * 🚪 #91: dispose the connector tubes of doors that no longer exist, but not
+   * while the avatar is inside one. updatePairedVestibules' own deferral can't
+   * cover these — it iterates DOORS, and a vanished door isn't in it — so the
+   * ids are parked here and this runs again every frame until each is safe.
+   */
+  private drainOrphanVestibules(): void {
+    if (this.orphanVestibules.size === 0) return;
+    const activeDoorId = this.player.getActiveDoorId();
+    for (const id of [...this.orphanVestibules]) {
+      if (!this.pairedVestibules.has(id)) {
+        this.orphanVestibules.delete(id);
+        continue;
+      }
+      if (this.transitVestibuleDoorId === id || activeDoorId === id) continue;
+      this.disposeVestibule(id);
+      this.orphanVestibules.delete(id);
+    }
+  }
+
+  private refreshDoorSigns(): void {
+    const ctx = this.doorSignContext;
+    if (!ctx) return; // no room visuals applied yet — nothing to hang
+    const { outdoor, casino, returnDoorId } = ctx;
+    const layout = readAllDoorLayout();
+    const doorExists = (id: DoorId): boolean =>
+      layout.size === 0 ? findDoor(id) !== null : layout.has(id);
+    const deltas = readDoorDeltas();
+    const placeOnDoor = (
+      sign: THREE.Group | null,
+      doorId: DoorId,
+      visible: boolean,
+    ) => {
+      if (!sign) return;
+      // A sign hangs over a cardinal BERTH. `doorId` can be an arrival door,
+      // and an arrival can now land on a free `d:` door — physicalDoorPose has
+      // no slot for one and would throw, poisoning doorSignContext so every
+      // later reconcile threw too (nothing repositioned, nothing clickable).
+      if (!isCardinalDoorId(doorId)) {
+        sign.visible = false;
+        return;
+      }
+      const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
+      const doorFaceOffset = 0.14;
+      sign.position.set(
+        pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
+        2.08,
+        pose.z + Math.cos(pose.frameYaw) * doorFaceOffset,
+      );
+      sign.rotation.y = pose.frameYaw + Math.PI;
+      sign.scale.setScalar(
+        doorId === "north" || doorId === "south" ? 0.36 : 0.62,
+      );
+      sign.visible = visible && doorExists(doorId);
+    };
+    placeOnDoor(this.poolSign, "south", !outdoor && !casino); // 🏊 pool door
+    placeOnDoor(this.casinoSign, "east", !outdoor && !casino); // 🎰 casino door
+    const pairedDoorId =
+      returnDoorId ??
+      ([...readAllDoors()].find(([, record]) => record.paired)?.[0] as
+        | DoorId
+        | undefined);
+    placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
+    placeOnDoor(this.casinoLobbySign, pairedDoorId ?? "west", casino);
+  }
+
+  /**
    * 🚪↔🛰️ #28 S4: reconcile WHICH doors the room has from the shared
    * `doorLayout` map (doorLayoutDoc). MEMBERSHIP only — rebuildDoors adds/removes
    * DOORS entries; positions are then set by reconcileDoorPlacements and the
-   * click bodies re-tagged. An UNSEEDED room (empty map) keeps the local cardinal
-   * defaults, so un-migrated rooms are byte-identical. No-op until ports exist.
-   * (Distinct from reconcileDoors, which is the door-PAIRING reconcile.)
+   * click bodies re-tagged. (Distinct from reconcileDoors, the door-PAIRING
+   * reconcile.)
+   *
+   * 🚪 #91: an UNSEEDED room (empty map) reconciles against the four built-in
+   * cardinal DEFAULTS. It used to return early, "keeping the local defaults" —
+   * but the World and its door groups are built once at boot and never reset
+   * per room, so what it actually kept was the LAST room's door set. Walk from
+   * a room where you had removed doors into any un-migrated room and you
+   * inherited the gap; the next edit there re-seeded four cardinals and they
+   * all popped into being at once. Now every room presents its true default.
    */
   public reconcileDoorLayout(records: Map<string, DoorLayoutRecord>): void {
-    if (records.size === 0) return; // unseeded → keep the local cardinal defaults
     if (!this.dockingSystem) return; // docking ports not built yet
+    if (records.size === 0) records = defaultDoorLayoutRecords();
+    // 🚪 #91: a door that VANISHED takes its connector tube with it. The
+    // editor's "unpair it first" rule guards only the removing client; a
+    // deletion arriving from a peer lands straight here, and updatePairedVestibules
+    // can never clean up afterwards because it iterates DOORS — which no longer
+    // contains the id. The mesh would sit in the room forever.
+    // Mid-walk-through the avatar is physically standing INSIDE the gangway
+    // (review L1), so those are queued and drained by updatePairedVestibules on
+    // a later frame instead of popping the tube out around them.
+    for (const id of [...this.pairedVestibules.keys()]) {
+      if (records.has(id)) continue;
+      this.orphanVestibules.add(id);
+    }
+    this.drainOrphanVestibules();
     rebuildDoors(records); // walk-target membership (makes findDoor correct first)
     this.dockingSystem.syncDoorGroups(records); // 3D group add/remove/rebuild
     this.reconcileDoorPlacements(); // position the (possibly new) groups
@@ -2031,6 +2173,7 @@ export class World {
     roomId: string,
     returnDoorId?: DoorId,
     theme?: RoomTheme,
+    doorLayout?: DoorLayoutKind,
   ): void {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
@@ -2048,7 +2191,30 @@ export class World {
     // the casino run "casino-pairs", the outdoor pool room "pool-pairs" —
     // aliases of the same paired arrangement (SOUTH on the north wall, EAST
     // on the west wall; the dive tower stands between the two north doors).
-    setActiveDoorLayout(outdoor ? "pool-pairs" : "casino-pairs");
+    //
+    // 🚪 #91 — READ THIS BEFORE CHANGING IT. This layout is ALSO the reason
+    // travel directions read wrong: a paired room has doors on its north and
+    // west walls ONLY, so no arrival can ever come in through a south or east
+    // door. Walk north out of room A into room B and B can only put you at a
+    // north-wall door — "traveling into a north door … exiting out of the
+    // north door of the other room, instead of exiting the south door heading
+    // north". resolveArrivalDoor now picks by facing WALL (see it), which is
+    // correct the moment a room HAS a facing door; under this layout there
+    // simply is none. The honest fix is `legacy` (one door per wall) for
+    // ordinary rooms — but the authored lounge is arranged AROUND these
+    // walls: with legacy, all four default doorways land behind furniture
+    // (armchairs on the south + east runs, the map table on the north), so
+    // flipping it means re-arranging every authored room. Owner's call —
+    // raised on the #91 PR rather than changed silently.
+    //
+    // 🛰️🚪 A room CAN name its own arrangement (roomInfo `doorLayout`, passed
+    // in by the caller). A module born with one door does exactly that: it
+    // asks for "legacy" so its single door sits CENTRED on its wall instead of
+    // ±PAIR_OFFSET off it. Nothing is arranged around a new module's walls, so
+    // the furniture objection above doesn't apply there.
+    setActiveDoorLayout(
+      doorLayout ?? (outdoor ? "pool-pairs" : "casino-pairs"),
+    );
 
     // 🤖 One drink-service waiter implementation serves every authored room;
     // each room supplies a route through its own open aisles. Recreate on a
@@ -2082,34 +2248,10 @@ export class World {
     // SOUTH door's PHYSICAL slot, which the paired layout moves to the north
     // wall — so place it from the live pose, not a hard-coded south spot.
     this.ensurePoolSign();
-    const placeOnDoor = (
-      sign: THREE.Group | null,
-      doorId: DoorId,
-      visible: boolean,
-    ) => {
-      if (!sign) return;
-      const pose = physicalDoorPose(doorId);
-      const doorFaceOffset = 0.14;
-      sign.position.set(
-        pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
-        2.08,
-        pose.z + Math.cos(pose.frameYaw) * doorFaceOffset,
-      );
-      sign.rotation.y = pose.frameYaw + Math.PI;
-      sign.scale.setScalar(
-        doorId === "north" || doorId === "south" ? 0.36 : 0.62,
-      );
-      sign.visible = visible;
-    };
-    placeOnDoor(this.poolSign, "south", !outdoor && !casino); // 🏊 pool door
-    placeOnDoor(this.casinoSign, "east", !outdoor && !casino); // 🎰 casino door
-    const pairedDoorId =
-      returnDoorId ??
-      ([...readAllDoors()].find(([, record]) => record.paired)?.[0] as
-        | DoorId
-        | undefined);
-    placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
-    placeOnDoor(this.casinoLobbySign, pairedDoorId ?? "west", casino);
+    // 🚪 #91: the sign context is stashed so refreshDoorSigns can re-run on
+    // every door change — see that method.
+    this.doorSignContext = { outdoor, casino, returnDoorId };
+    this.refreshDoorSigns();
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casinoTheme;
 
@@ -2463,18 +2605,26 @@ export class World {
     // North wall sits at z = -halfZ (default -6); the zone spans from just
     // outside it (−0.2 m) to the door's stand-point (+1.6 m).
     const { halfZ } = roomHalfExtents();
-    for (const id of ["north", "south"] as const) {
-      if (physicalDoorPose(id).wall !== "north") continue;
-      const door = findDoor(id);
-      if (!door) continue;
-      // Approach zone in front of the north wall opening (opening ~1.4 wide
-      // at z=-halfZ; the zone reaches to the door's `front` stand-point).
-      // 🧱 #66 S1: the zone FOLLOWS the door — centred on its slid position
-      // (front.x carries the slide delta).
+    // 🚪 #91: gate EVERY door physically on the north wall, not just the two
+    // cardinal ids. An editor-placed free door up there used to stay walkable
+    // with the hearth in front of it, and its scripted walk-through then took
+    // the avatar straight through the fireplace. Cardinals resolve their wall
+    // through the layout tables; a free door carries it in its record.
+    const layout = readAllDoorLayout();
+    for (const door of DOORS) {
+      const id = door.id as string;
+      const wall = isCardinalDoorId(id)
+        ? physicalDoorPose(id as DoorId).wall
+        : layout.get(id)?.wall;
+      if (wall !== "north") continue;
+      // Approach zone in front of the north wall opening (the zone reaches to
+      // the door's `front` stand-point). 🧱 #66 S1: the zone FOLLOWS the door —
+      // centred on its slid position (front.x carries the slide delta).
       const cx = door.front.x;
+      const half = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH; // the full frame
       const zone = {
-        x0: cx - 1.4,
-        x1: cx + 1.4,
+        x0: cx - half,
+        x1: cx + half,
         z0: -halfZ - 0.2,
         z1: -halfZ + 1.6,
       };
@@ -4032,7 +4182,13 @@ export class World {
     let inAnyAperture = false;
     for (const door of DOORS) {
       // Aperture frame: lateral offset along the wall vs distance INTO it.
-      const northSouth = door.id === "north" || door.id === "south";
+      // 🚪 #91: the aperture frame comes from the door's PHYSICAL wall, not its
+      // logical id. The ids happen to agree for the cardinals under both
+      // layouts, but every free `d:` door read as east/west — so one on the
+      // north or south wall could never trip the threshold and was impossible
+      // to walk through in first person.
+      const doorWall = this.wallOfDoor(door.id);
+      const northSouth = doorWall === "north" || doorWall === "south";
       const lateral = Math.abs(
         northSouth ? p.x - door.front.x : p.z - door.front.z,
       );
@@ -4066,7 +4222,11 @@ export class World {
       // Wall is at ±halfZ (n/s) or ±halfX (e/w); trip 0.85 m short of it.
       const { halfX, halfZ } = roomHalfExtents();
       const apThresh = (northSouth ? halfZ : halfX) - 0.85;
-      const inAperture = lateral < 0.95 && wallCoord > apThresh;
+      // 🚪 #91: the crossable band is the door's actual opening (half-width),
+      // derived rather than the old 0.95 literal that was sized for the
+      // retired small door — with the 2 m opening it left the edges of the
+      // doorway un-crossable.
+      const inAperture = lateral < DOOR_OPENING_WIDTH / 2 && wallCoord > apThresh;
       if (inAperture) inAnyAperture = true;
       if (
         inAperture &&
@@ -4090,6 +4250,7 @@ export class World {
   private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
     const ds = this.dockingSystem;
     if (!ds) return;
+    this.drainOrphanVestibules(); // 🚪 #91: retry deferred removed-door tubes
     const playerPos = this.player.getPosition();
     const activeDoorId = this.player.getActiveDoorId();
 
@@ -4182,6 +4343,17 @@ export class World {
    * falls back to EAST (the canonical large door). East/west departures can
    * never hit the fallback.
    */
+  /**
+   * 🚪 #91: which PHYSICAL wall a door sits on. A cardinal id is a logical slot
+   * whose wall the active layout decides (pairs layouts hang logical south on
+   * the north wall); a free door carries its wall in its record. Anything
+   * unknown reads as its own id — the pre-#91 assumption, kept as a floor.
+   */
+  private wallOfDoor(id: string): DoorWall {
+    if (isCardinalDoorId(id)) return physicalDoorPose(id).wall;
+    return readAllDoorLayout().get(id)?.wall ?? "north";
+  }
+
   public resolveArrivalDoor(
     departureDoorId: DoorId,
     farDoor?: DoorId,
@@ -4203,9 +4375,16 @@ export class World {
       }
       if (backs.length === 1) return backs[0];
       if (backs.length > 1) {
-        // Same room docked twice — let the record's farDoor break the tie.
+        // Same room docked twice — let the record's farDoor break the tie, and
+        // failing that the door OPPOSITE the one we departed through. 🚪 #91:
+        // the old `?? backs[0]` fell back to doors-map iteration order, which
+        // always starts at 'north' — so both directions of a double-docked
+        // loop came out the same door.
         const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
-        return named ?? backs[0];
+        const facing = backs.find(
+          (b) => this.wallOfDoor(b.id) === oppositeWall(this.wallOfDoor(departureDoorId)),
+        );
+        return named ?? facing ?? backs[0];
       }
     }
     // #62 P2: an assembled connection knows exactly which far door it lands on
@@ -4215,19 +4394,45 @@ export class World {
       const preferred = findDoor(farDoor);
       if (preferred && preferred.enabled) return preferred;
     }
-    const opposite: Record<DoorId, DoorId> = {
+    // 🚪 #91: come out the door on the OPPOSITE WALL — matched by physical
+    // wall, not by door id. Door ids are logical slots, and a layout can park
+    // them anywhere (the pairs layouts put logical 'south' on the NORTH wall),
+    // so the old id→id opposite table would send you in through the north door
+    // and straight back out of the next room's north door: "traveling into a
+    // north door … exiting out of the north door of the other room, instead of
+    // exiting the south door heading north" (#91). Walls always mirror.
+    // Restricted to CARDINAL berths on purpose: the pairing wire is keyed to
+    // the four of them, so arriving at a free door would strand the return
+    // (no record can be written for it — see the mirror gate in main.ts).
+    // Pairing free doors is the deferred #28 S6d work.
+    const want = oppositeWall(this.wallOfDoor(departureDoorId));
+    const facing = DOORS.find(
+      (d) => d.enabled && isCardinalDoorId(d.id) && this.wallOfDoor(d.id) === want,
+    );
+    if (facing) return facing;
+    // 🚪 #91: no door on the facing wall — which is the NORM under the paired
+    // layouts, where all four cardinals share the north and west walls. Fall
+    // back to the pre-#91 id-opposite pairing so each departure still resolves
+    // to its OWN door; without this tier every arrival collapses onto the one
+    // `east` fallback below, dropping the traveler at the same spot no matter
+    // where they came from (and, at PAIR_OFFSET 3.0, inside the casino's
+    // authored furniture).
+    const oppositeId: Record<DoorId, DoorId> = {
       north: "south",
       south: "north",
       east: "west",
       west: "east",
     };
-    const candidate = findDoor(opposite[departureDoorId]);
-    if (candidate && candidate.enabled) return candidate;
+    const counterpart = findDoor(oppositeId[departureDoorId]);
+    if (counterpart && counterpart.enabled) return counterpart;
     // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
     // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
     // south departure, but degrade to any enabled door / any door at all instead
     // of throwing when east is absent. DOORS is always non-empty (≥1 door).
-    return findDoor("east") ?? DOORS.find((d) => d.enabled) ?? DOORS[0]!;
+    const east = findDoor("east");
+    // ...and only when it is actually walkable — an arrival scripted through a
+    // DISABLED door walks the avatar through whatever is blocking it (#91).
+    return (east?.enabled ? east : undefined) ?? DOORS.find((d) => d.enabled) ?? DOORS[0]!;
   }
 
   /**

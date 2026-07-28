@@ -25,6 +25,7 @@
  */
 
 import * as Y from 'yjs';
+import { hasDoorLayout } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -62,6 +63,24 @@ export const DEFAULT_DOOR_POLICY: DoorPolicyRecord = { passage: 'public', constr
 
 const DOOR_IDS = ['north', 'south', 'east', 'west'] as const;
 
+/**
+ * 🚪 #91: policy is keyed by ANY door the room actually has — the 4 cardinal
+ * berths plus every free door the editor placed (#28) — not by the cardinal
+ * list alone, which silently dropped every write for a `d:` id and pinned its
+ * canPass to "public". Unknown ids are still rejected, so a stale id can't
+ * spawn a policy record.
+ *
+ * NOTE the WRITE side has no UI yet: free doors are passages with no terminal
+ * (that keypad drove cardinal-only pose math and threw), so today nothing calls
+ * writeDoorPolicy for one and a placed door is effectively public two-way. The
+ * read side honouring free ids is what makes an affordance — the deferred #28
+ * S6d work — a UI-only change rather than another store migration.
+ */
+function isKnownDoorId(doorId: string): boolean {
+  if ((DOOR_IDS as readonly string[]).includes(doorId)) return true;
+  return hasDoorLayout(doorId);
+}
+
 let boundDoc: Y.Doc | null = null;
 let policyMap: Y.Map<unknown> | null = null;
 let requestsMap: Y.Map<unknown> | null = null;
@@ -98,7 +117,7 @@ function docAlive(): boolean {
 
 /** Sanitized read; unknown/missing values fall back to the defaults. */
 export function readDoorPolicy(doorId: string): DoorPolicyRecord {
-  if (!docAlive() || !(DOOR_IDS as readonly string[]).includes(doorId)) return { ...DEFAULT_DOOR_POLICY };
+  if (!docAlive() || !isKnownDoorId(doorId)) return { ...DEFAULT_DOOR_POLICY };
   const raw = policyMap!.get(doorId) as Partial<DoorPolicyRecord> | undefined;
   return {
     passage: raw?.passage === 'owner' ? 'owner' : 'public',
@@ -118,7 +137,7 @@ export function passageLabel(policy: DoorPolicyRecord): string {
 
 /** Owner UI only (write-side gating is the caller's job — see module header). */
 export function writeDoorPolicy(doorId: string, policy: DoorPolicyRecord): void {
-  if (!docAlive() || !(DOOR_IDS as readonly string[]).includes(doorId)) return;
+  if (!docAlive() || !isKnownDoorId(doorId)) return;
   boundDoc!.transact(() => {
     policyMap!.set(doorId, {
       passage: policy.passage,

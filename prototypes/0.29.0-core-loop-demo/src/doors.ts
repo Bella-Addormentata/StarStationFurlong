@@ -47,17 +47,20 @@ export const DOORS: DoorTarget[] = [
     faceAngle: 0,
   },
   {
+    // 🚪 #91: the e/w stand points used to sit at z −0.5 (the retired
+    // EW_LATERAL quirk) — half a metre off the opening the player can see.
+    // They are centred now, matching doorLayout.legacySlot.
     id: "west",
     enabled: true,
-    front: { x: -4.5, z: -0.5 },
-    through: { x: -7.0, z: -0.5 },
+    front: { x: -4.5, z: 0 },
+    through: { x: -7.0, z: 0 },
     faceAngle: -Math.PI / 2,
   },
   {
     id: "east",
     enabled: true,
-    front: { x: 4.5, z: -0.5 },
-    through: { x: 7.0, z: -0.5 },
+    front: { x: 4.5, z: 0 },
+    through: { x: 7.0, z: 0 },
     faceAngle: Math.PI / 2,
   },
 ];

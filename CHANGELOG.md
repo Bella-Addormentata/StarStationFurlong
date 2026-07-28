@@ -12,6 +12,31 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.30 — 2026-07-27
+
+### 🚪📐 Doors on the grid — one door size, and a pile of door fixes (#91)
+
+Doors are locked to the floor grid, there is now **one door** instead of two sizes, and a stack of door bugs the owner reported (and a few they hadn't found yet) are gone.
+
+- **On the grid.** Every door's centre now sits **on a line between two floor squares**, everywhere it can be set: placing, dragging, the keypad's POSITION slider, and the built-in doors of every room. The slider used to step half a tile, so every other click parked a door mid-square; dragging an east or west door snapped it permanently half a tile off (and it could never be dragged back); and doors near a corner could commit off-grid. Rooms authored before this release are corrected as they load — no re-editing needed.
+- **The big door, redrawn.** The small door is retired; every door is the big one, and its opening was redrawn to **exactly 2 grid cells** (2.0 m) so it sits flush between the lines. Frame, leaves, threshold, click box, keypad and slide distances all derive from that one measurement now, so the door you see and the space the editor reserves for it can't drift apart again — they had: the built opening was 2.4 m while the editor reserved 2 m, which let two doors overlap by a metre.
+- **The stranded CASINO sign is gone.** Wayfinding signs are re-hung whenever doors change, follow a door that slides, and disappear with a door that's removed. They used to be placed once on entry, so a removed door left its label floating forever with no way to clear it.
+- **That old spot is placeable again.** A deleted door no longer blocks its own former position: the placement check was still counting the four built-in doors as present even in rooms that had explicitly removed one.
+- **Adding one door adds one door.** Placing a door in a room that showed fewer than four could resurrect a full set of cardinals. The seed now publishes exactly the doors you can see, module rooms publish theirs on first claim, and a room with no saved doors shows *its own* defaults instead of inheriting the last room's.
+- **Doors you can actually reach.** Placement now refuses a spot where furniture stands on the door's walk-in point — that used to validate green and then simply never work.
+- **Travel directions.** Arrival picks the door on the **facing wall** rather than by name — walking north now brings you in through the far room's south side. (See the note below: rooms whose doors all sit on two walls still can't offer a facing door.)
+- **Also fixed:** clicking a placed door's keypad no longer throws (free doors have no terminal — they're passages); permissions on a placed door are no longer silently discarded; an **undocked** module stays undocked instead of re-pairing itself on the next walk-through; a removed door takes its connector tube with it; the hearth blocks any door in front of it, not just the built-in one; a docking chain's clash warnings follow a slid door; and editing a door no longer deselects a window you were working on.
+### 🛰️🚪 A new module is born with ONE door — the way back
+
+Provisioning a module from a door panel used to give the new room a full set of four doors, inherited from whatever room you were standing in. Now it gets exactly the one it needs.
+
+- The new module has **one door: the way back to the room you added it from**. It sits **centred on its wall**, on one of the walls carrying the **octagon cross-section** (the room's own geometry decides which — for a square room, west/east; north and south are the barrel's flat end caps).
+- Because a single door only reads right when it's centred, a module asks for the one-door-per-wall arrangement and records that in the room, so it holds for everyone and on every later visit. Authored rooms (lobby, casino, pool) are untouched and keep their paired arrangement.
+- A module minted with **no** parent berth — the dev menu, or the standalone-station flow — still gets the normal four, since it has nothing to lead back to.
+- The door set is published the moment the room is claimed rather than after the first sync, so the walk-in can't be scripted through a door that is about to be removed.
+
+- **Release line:** version bumped to 0.33.30, all nine locations. **Frontend-only — node binaries unchanged from v0.30.6.**
+
 ## v0.33.29 — 2026-07-24
 
 ### 🎲 Craps — the second house game (#69 G3)

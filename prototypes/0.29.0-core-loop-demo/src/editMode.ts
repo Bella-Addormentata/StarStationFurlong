@@ -74,7 +74,10 @@ import { rebuildStands } from './stands';
 import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
 import type { DoorId } from './doors';
-import { snapDoorLateral, wallAndLateralFromPoint, poseFromWall, physicalDoorPose } from './doorLayout';
+import {
+  snapDoorLateral, wallAndLateralFromPoint, poseFromWall, physicalDoorPose,
+  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+} from './doorLayout';
 import type { PhysicalDoorPose } from './doorLayout';
 import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
@@ -295,14 +298,18 @@ function mintDoorId(): string {
 }
 
 /**
- * The door OPENING footprint as a world-space AABB — a `w`-wide span along the
- * wall (w = large ? 2 : 1) at the wall coordinate (±half), with a ~1 m deep band
- * INTO the room. Used to test a candidate door against the live furniture
- * footprints (a door can't open into a sofa). #28 S6b.
+ * The door OPENING footprint as a world-space AABB — the opening's span along
+ * the wall at the wall coordinate (±half), with a band INTO the room.
+ *
+ * 🚪 #91: the width is now the REAL opening (DOOR_OPENING_WIDTH), not the
+ * aspirational 2/1 this used to assume while the built frame was 2.4/1.4 wide —
+ * geometry and collision model finally agree. Depth stays shallow: this box
+ * asks "is the DOORWAY itself clear". Whether the door can be REACHED is a
+ * separate, tighter question — see doorStandBlocked.
  */
-function doorOpeningAabb(wall: DoorWall, lateral: number, size: 'small' | 'large'): Box {
+function doorOpeningAabb(wall: DoorWall, lateral: number): Box {
   const { halfX, halfZ } = roomHalfExtents();
-  const w = size === 'large' ? 2 : 1;
+  const w = DOOR_OPENING_WIDTH;
   const DEPTH = 1.0; // shallow band into the room from the wall line
   switch (wall) {
     case 'north': // wall at z = -halfZ; band runs +z into the room
@@ -317,44 +324,44 @@ function doorOpeningAabb(wall: DoorWall, lateral: number, size: 'small' | 'large
 }
 
 /**
- * Every door's CURRENT opening as {wall, lateral, size} — the set a new/edited
- * door must not overlap on its wall. Free doors own their lateral in the layout
+ * Every door's CURRENT opening as {wall, lateral} — the set a new/edited door
+ * must not overlap on its wall. Free doors own their lateral in the layout
  * record; a cardinal's LIVE centre lateral is its floor-plan slide (readDoorDeltas
- * — the record's `lateral` is only the seed snapshot). Also folds in the 4
- * cardinals that physically exist but aren't in the map yet (an UNSEEDED room,
- * before the editor's seed-first write). #28 S6b.
+ * — the record's `lateral` is only the seed snapshot). #28 S6b.
  */
-function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: number; size: 'small' | 'large' }> {
-  const openings: Array<{ id: string; wall: DoorWall; lateral: number; size: 'small' | 'large' }> = [];
+function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: number }> {
+  const openings: Array<{ id: string; wall: DoorWall; lateral: number }> = [];
   const records = readAllDoorLayout();
   const deltas = readDoorDeltas();
-  const seen = new Set<string>();
   // Cardinals speak PHYSICAL currency here — the pose's wall and world-centre
-  // lateral (physicalDoorPose folds in the pairs slots' ±2.7 base and the
-  // legacy e/w −0.5 stand), NOT the record's logical wall + floorPlan delta.
-  // validateDoorPlacement compares candidates in physical currency, so a
-  // logical-wall/delta report would hide a pairs door from the overlap check
-  // (logical south rides the north wall) and offset every e/w comparison
+  // lateral (physicalDoorPose folds in the pairs slots' base offset), NOT the
+  // record's logical wall + floorPlan delta. validateDoorPlacement compares
+  // candidates in physical currency, so a logical-wall/delta report would hide
+  // a pairs door from the overlap check (logical south rides the north wall)
   // (#86 review). Free doors' records already carry the physical pose.
   const cardinalOpening = (id: DoorId) => {
     const pose = physicalDoorPose(id, deltas[id] ?? 0);
     const lateral = pose.wall === 'north' || pose.wall === 'south' ? pose.x : pose.z;
-    // Size is a fixed cardinal invariant (e/w large, n/s small — the seed's own
-    // rule), NOT the record's field: a stale/malformed record must not skew the
-    // overlap width or the MOVE snap parity (#86 review).
-    return { id, wall: pose.wall, lateral, size: id === 'east' || id === 'west' ? 'large' as const : 'small' as const };
+    return { id, wall: pose.wall, lateral };
   };
   for (const rec of records.values()) {
     openings.push(
       isCardinalDoorId(rec.id)
         ? cardinalOpening(rec.id as DoorId)
-        : { id: rec.id, wall: rec.wall, lateral: rec.lateral, size: rec.size ?? 'small' },
+        : { id: rec.id, wall: rec.wall, lateral: rec.lateral },
     );
-    seen.add(rec.id);
   }
-  for (const id of ['north', 'south', 'east', 'west'] as const) {
-    if (seen.has(id)) continue;
-    openings.push(cardinalOpening(id));
+  // 🚪 #91 PHANTOM OPENINGS: fold in the physical cardinal defaults ONLY when
+  // the room is UNSEEDED (empty map ⇒ the 4 built-in doors still exist — the
+  // same convention reconcileDoorLayout uses). This used to run for SEEDED
+  // rooms too, so a cardinal the owner had DELETED went on blocking its old
+  // slot forever: "there's a remnant of the old door and it stops me placing
+  // one there" (#91). A seeded map is authoritative — a cardinal absent from
+  // it does not exist. Read-path only, so it heals rooms already in that state.
+  if (records.size === 0) {
+    for (const id of ['north', 'south', 'east', 'west'] as const) {
+      openings.push(cardinalOpening(id));
+    }
   }
   return openings;
 }
@@ -378,7 +385,6 @@ export type DoorPlacementVerdict = { ok: true } | { ok: false; reason: string };
 export function validateDoorPlacement(
   wall: DoorWall,
   lateral: number,
-  size: 'small' | 'large',
   excludeId?: string,
 ): DoorPlacementVerdict {
   // 1. On the wall, clear of the corners.
@@ -386,8 +392,8 @@ export function validateDoorPlacement(
     return { ok: false, reason: 'too close to a corner' };
   }
 
-  // 2. No furniture in the opening.
-  const box = doorOpeningAabb(wall, lateral, size);
+  // 2. No furniture in the opening…
+  const box = doorOpeningAabb(wall, lateral);
   for (const item of FURNITURE) {
     const ob = itemAabb(item);
     if (!ob) continue;
@@ -396,14 +402,35 @@ export function validateDoorPlacement(
     }
   }
 
+  // 2b. 🚪 #91 …and the door must be REACHABLE. Its walk target sits
+  //     FRONT_INSET (1.5 m) inside the wall — deeper than the opening band —
+  //     so a piece could clear the doorway and still stand exactly where the
+  //     walk-through wants to put the player. The door then validated green,
+  //     placed fine, and could never be used: the walk stalls at the obstacle
+  //     and the watchdog abandons it. Same clearance the player collides at.
+  const front = poseFromWall(wall, lateral).front;
+  const reach = PLAYER_R + 0.06; // player radius + the FINE arrival epsilon
+  for (const item of FURNITURE) {
+    const ob = itemAabb(item);
+    if (!ob) continue;
+    if (
+      front.x > ob.x0 - reach && front.x < ob.x1 + reach &&
+      front.z > ob.z0 - reach && front.z < ob.z1 + reach
+    ) {
+      return { ok: false, reason: `${item.id} blocks the way in` };
+    }
+  }
+
   // 3. No other door overlapping on the same wall (both openings share the wall
-  //    axis, so overlap is a 1-D span test on the along-wall centres).
-  const w = size === 'large' ? 2 : 1;
+  //    axis, so overlap is a 1-D span test on the along-wall centres). 🚪 #91:
+  //    the gap is measured between FRAMES — opening + a post each side — so two
+  //    doors can sit 3 m apart but never 2 (which used to pass while their
+  //    physical 2.4 m frames overlapped by a metre).
+  const minGap = DOOR_OPENING_WIDTH + 2 * DOOR_POST_WIDTH;
   for (const other of currentDoorOpenings()) {
     if (other.id === excludeId) continue;
     if (other.wall !== wall) continue;
-    const ow = other.size === 'large' ? 2 : 1;
-    if (Math.abs(other.lateral - lateral) < (w + ow) / 2) {
+    if (Math.abs(other.lateral - lateral) < minGap - 1e-6) {
       return { ok: false, reason: 'overlaps another door' };
     }
   }
@@ -413,10 +440,9 @@ export function validateDoorPlacement(
   //    west / east); the door walls on the extrude axis are the hull's end
   //    caps and carry no windows. Reads the pure window records (this
   //    validator must stay pure) with the doorway span windowClearsDoors
-  //    measures off the built group — half the physical opening (docking.ts
-  //    buildDoorGroup: 1.4 small / 2.4 large) plus a 0.3 side post — and the
-  //    same 0.4 m margin; `across` is ignored on both sides (any window on
-  //    the wall claims its full along-span).
+  //    measures off the built group — half the physical opening plus a side
+  //    post — and the same 0.4 m margin; `across` is ignored on both sides
+  //    (any window on the wall claims its full along-span).
   if (OCTAGON_HULL) {
     const { halfX, halfZ } = roomHalfExtents();
     const sideSurface =
@@ -424,7 +450,7 @@ export function validateDoorPlacement(
         ? (wall === 'west' ? 'wall-neg' : wall === 'east' ? 'wall-pos' : null)
         : (wall === 'north' ? 'wall-neg' : wall === 'south' ? 'wall-pos' : null);
     if (sideSurface !== null) {
-      const doorHalf = (size === 'large' ? 2.4 : 1.4) / 2 + 0.3; // opening + post
+      const doorHalf = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH; // opening + post
       const WINDOW_MARGIN = 0.4; // windowClearsDoors' MARGIN, mirrored
       for (const rec of readAllWindowLayout().values()) {
         if (rec.surface !== sideSurface) continue;
@@ -519,13 +545,10 @@ const CARRY_VALID_INTENSITY = 0.55;
 const CARRY_INVALID_EMISSIVE = 0xe03636;
 const CARRY_INVALID_INTENSITY = 0.6;
 
-/** Door-parity grid rounding (large: whole tiles, small: half-tile centres) —
- *  inward floor/ceil for aligning the drag clamp's edges onto the grid, so a
- *  clamped-at-the-edge lateral still round-trips the store snap exactly. */
-const doorGridFloor = (size: 'small' | 'large', v: number): number =>
-  size === 'large' ? Math.floor(v) : Math.floor(v + 0.5) - 0.5;
-const doorGridCeil = (size: 'small' | 'large', v: number): number =>
-  size === 'large' ? Math.ceil(v) : Math.ceil(v - 0.5) + 0.5;
+/** 🚪 #91: door centres live on the integer grid lines, so aligning a clamp
+ *  edge inward is a plain floor/ceil. (Used to branch on door size.) */
+const doorGridFloor = (v: number): number => Math.floor(v);
+const doorGridCeil = (v: number): number => Math.ceil(v);
 
 /** A material we can emissive-tint (MeshStandardMaterial and friends). */
 type EmissiveMaterial = THREE.Material & { emissive: THREE.Color; emissiveIntensity: number };
@@ -635,7 +658,6 @@ class RoomEditController {
      *  For cardinals this is the pose's wall, not the record's logical id
      *  (the pairs layout parks logical south/east on the north/west walls). */
     wall: DoorWall;
-    size: 'small' | 'large';
     /** Cardinal ⇒ the drop writes the legacy floorPlan slide store; free ⇒
      *  the doorLayout record. The SPLIT-WRITE seam (see commitDoorDrag). */
     isCardinal: boolean;
@@ -644,11 +666,10 @@ class RoomEditController {
      *  the floorPlan DELTA currency the cardinal write path speaks. */
     baseCentre: number;
     /** Cardinal ⇒ baseCentre − the legacy store base: the offset between the
-     *  world-centre and floorPlan-STORED currencies. The pairs slots (±2.7)
-     *  sit 0.2 off the store's 0.5 lattice, so the drag snaps/clamps in
-     *  STORED currency (centre − storeShift) — a plain world-grid snap would
-     *  not round-trip writeDoorPlacement's own snap and the door would jump
-     *  on drop. 0 for free doors and the legacy cardinal layout. */
+     *  world-centre and floorPlan-STORED currencies (e/w: +0.5). #91 snaps in
+     *  WORLD currency — every slot base is an integer now and the store snaps
+     *  base-relative, so centres round-trip — but the store's own clamp is
+     *  still expressed in stored units, so the drag CLAMP needs this. */
     storeShift: number;
     originLateral: number;
     candidateLateral: number;
@@ -1201,14 +1222,20 @@ class RoomEditController {
     this.indexDoorGroups(world);
 
     // A hovered/selected DOOR that vanished must let go of its (now disposed)
-    // handles; a surviving selected door re-asserts its select tint.
+    // handles; a surviving selected door re-asserts its select tint. 🚪 #91:
+    // the "did it survive?" test is class-agnostic (isKnownId) — it used to
+    // recognise only furniture and doors, so ANY door change (including a
+    // remote one, or our own slide echo) silently dropped a selected WINDOW
+    // whose index entry the door-slice rebuild never touched.
     if (this.hoveredId && !this.isKnownId(this.hoveredId)) this.hoveredId = null;
-    if (this.selectedId && !world.furnitureGroups.has(this.selectedId)) {
-      if (this.doorIds.has(this.selectedId)) {
-        this.applyTint(this.selectedId, SELECT_EMISSIVE, SELECT_INTENSITY);
-      } else {
-        this.setSelected(null);
-      }
+    if (this.selectedId && this.doorIds.has(this.selectedId)) {
+      this.applyTint(this.selectedId, SELECT_EMISSIVE, SELECT_INTENSITY);
+    } else if (
+      this.selectedId &&
+      !this.isKnownId(this.selectedId) &&
+      !world.furnitureGroups.has(this.selectedId)
+    ) {
+      this.setSelected(null);
     }
   }
 
@@ -1866,6 +1893,16 @@ class RoomEditController {
       showHint('Unpair this door first (open its keypad), then remove it.', 2800);
       return;
     }
+    // 🚪 #91: never empty the map. An empty doorLayout means "this room was
+    // never migrated" everywhere it is read (the reconcile substitutes the
+    // cardinal defaults, the seed republishes them, placement folds them back
+    // in as blockers) — so removing the LAST door would silently resurrect all
+    // four, for everyone. A room needs a way out anyway.
+    const layout = readAllDoorLayout();
+    if (layout.size === 1 && layout.has(doorId)) {
+      showHint('A room needs at least one door — add another first.', 2800);
+      return;
+    }
 
     // Selection/hover teardown BEFORE the delete disposes the door's materials
     // (setSelected(null) → clearTint restores saved emissive on live handles).
@@ -1913,7 +1950,7 @@ class RoomEditController {
       id: `d:${mintDoorId()}`,
       wall: ghost.wall,
       lateral: ghost.lateral,
-      size: 'small',
+      size: 'large',
       enabled: true,
     });
     this.setAddDoorMode(false); // hides the ghost (existing exit-add behaviour)
@@ -1929,8 +1966,8 @@ class RoomEditController {
    * groups, furniture groups and the click plane are all children of it, and
    * its origin is the world origin, so poseFromWall's x/z map straight through).
    *
-   * The box is sized like the small-door OPENING (1.4 w × 3.0 h, docking.ts
-   * buildDoorGroup) with a shallow depth, and its geometry is shifted DOWN 0.5 m
+   * The box is sized like the door OPENING (docking.ts buildDoorGroup — #91's
+   * single 2 m size) with a shallow depth, and its geometry is shifted DOWN 0.5 m
    * so the mesh ORIGIN coincides with the real door group's origin (that group
    * sits at world y=2 with its floor at local y=−2, i.e. opening centre at local
    * y=−0.5). Positioning the ghost at (pose.x, 2, pose.z) — exactly like the
@@ -1943,7 +1980,7 @@ class RoomEditController {
     if (this.doorGhost) return this.doorGhost;
     const parent = this.world?.getClickPlane()?.parent;
     if (!parent) return null;
-    const geo = new THREE.BoxGeometry(1.4, 3.0, 0.5);
+    const geo = new THREE.BoxGeometry(DOOR_OPENING_WIDTH, 3.0, 0.5);
     geo.translate(0, -0.5, 0); // mesh origin → door-group origin (world y=2)
     const mat = new THREE.MeshBasicMaterial({
       color: CARRY_VALID_EMISSIVE, // furniture carry's green; flipped red on invalid
@@ -1982,15 +2019,19 @@ class RoomEditController {
     if (hits.length === 0) { this.hideDoorGhost(); return; }
 
     const { wall, lateral } = wallAndLateralFromPoint(hits[0].point.x, hits[0].point.z);
-    const snapped = snapDoorLateral('small', lateral);
+    const snapped = snapDoorLateral('large', lateral);
     const limit = doorLateralLimitForWall(wall);
-    const clamped = Math.max(-limit, Math.min(limit, snapped));
+    // 🚪 #91: clamp INWARD onto the grid. A plain min/max against the limit
+    // could hand back an off-grid lateral near a corner (the limit is not
+    // necessarily a grid line for every room size), and that value was written
+    // verbatim — one door half a tile out of step with all the others.
+    const clamped = Math.max(doorGridCeil(-limit), Math.min(doorGridFloor(limit), snapped));
     const pose = poseFromWall(wall, clamped);
     ghost.position.set(pose.x, 2, pose.z); // world y=2 — matches the door group
     ghost.rotation.y = pose.frameYaw;
     ghost.visible = true;
 
-    const verdict = validateDoorPlacement(wall, clamped, 'small');
+    const verdict = validateDoorPlacement(wall, clamped);
     this.setDoorGhostColor(verdict.ok);
     this.ghostDoor = { wall, lateral: clamped, verdict };
   }
@@ -2066,7 +2107,6 @@ class RoomEditController {
       doorId,
       group,
       wall,
-      size: opening.size,
       isCardinal,
       baseCentre,
       storeShift,
@@ -2098,26 +2138,21 @@ class RoomEditController {
   }
 
   /**
-   * The drag's lateral clamp. Free doors: the wall's corner-clear limit, the
-   * same bound the ADD ghost uses. Cardinals round-trip through the legacy
-   * floorPlan store, whose OWN clamp bounds the STORED lateral (= delta +
-   * legacy base; the e/w base is −0.5) — so the bounds are computed in STORED
-   * currency (|stored| ≤ limit ∩ |centre| ≤ limit) and aligned INWARD onto the
-   * door's parity grid: even a clamped-at-the-edge candidate then stores and
-   * reads back EXACTLY, and the preview never shows a spot the commit would
-   * shift off (the west/east door at its full-negative slide, or any pairs
-   * slot whose ±2.7 base sits 0.2 off the store's 0.5 lattice).
+   * The drag's lateral clamp, in world-CENTRE currency and aligned inward onto
+   * the grid so a clamped-at-the-edge candidate is still a legal door centre.
+   * Free doors are bounded by the wall's corner-clear limit alone. A cardinal
+   * also round-trips through the legacy floorPlan store, whose OWN clamp bounds
+   * the STORED lateral (= centre − storeShift), so its range is the
+   * intersection of the two.
    */
   private doorDragClamp(
-    d: { wall: DoorWall; size: 'small' | 'large'; isCardinal: boolean; storeShift: number },
+    d: { wall: DoorWall; isCardinal: boolean; storeShift: number },
   ): { lo: number; hi: number } {
     const limit = doorLateralLimitForWall(d.wall);
-    if (!d.isCardinal) return { lo: -limit, hi: limit };
-    const sLo = Math.max(-limit, -limit - d.storeShift);
-    const sHi = Math.min(limit, limit - d.storeShift);
+    if (!d.isCardinal) return { lo: doorGridCeil(-limit), hi: doorGridFloor(limit) };
     return {
-      lo: doorGridCeil(d.size, sLo) + d.storeShift,
-      hi: doorGridFloor(d.size, sHi) + d.storeShift,
+      lo: doorGridCeil(Math.max(-limit, d.storeShift - limit)),
+      hi: doorGridFloor(Math.min(limit, d.storeShift + limit)),
     };
   }
 
@@ -2140,11 +2175,14 @@ class RoomEditController {
     if (hits.length === 0) return;
 
     const raw = d.wall === 'north' || d.wall === 'south' ? hits[0].point.x : hits[0].point.z;
-    // Snap in the currency the drop will persist: stored = centre − storeShift
-    // (a pairs-slot cardinal's grid is 0.2 off the store's 0.5 lattice, so a
-    // world snap would shift on the post-drop reconcile). Free doors and the
-    // legacy layout: storeShift 0 — a plain world-grid snap, as before.
-    const snapped = snapDoorLateral(d.size, raw - d.storeShift) + d.storeShift;
+    // 🚪 #91: snap the world CENTRE straight onto the grid line. The #86 review
+    // moved this into store currency to survive the round-trip, but for east /
+    // west that shifted every snap by half a tile (storeShift is 0.5 there, not
+    // the 0 the commit assumed) — a dragged e/w door could never sit ON a grid
+    // line again, not even back at its default. The store now snaps
+    // base-relative and every slot base is an integer, so a world-grid centre
+    // round-trips exactly and the currency detour is gone.
+    const snapped = snapDoorLateral('large', raw);
     const { lo, hi } = this.doorDragClamp(d);
     const clamped = Math.max(lo, Math.min(hi, snapped));
     if (clamped === d.candidateLateral) return;
@@ -2160,7 +2198,7 @@ class RoomEditController {
   private revalidateDoorDrag(forceTint = false): void {
     const d = this.doorDrag;
     if (!d) return;
-    const ok = validateDoorPlacement(d.wall, d.candidateLateral, d.size, d.doorId).ok;
+    const ok = validateDoorPlacement(d.wall, d.candidateLateral, d.doorId).ok;
     if (ok !== d.valid || forceTint) {
       d.valid = ok;
       this.applyTint(
@@ -2194,7 +2232,7 @@ class RoomEditController {
     const world = this.world;
     if (!d || !world) return;
 
-    const verdict = validateDoorPlacement(d.wall, d.candidateLateral, d.size, d.doorId);
+    const verdict = validateDoorPlacement(d.wall, d.candidateLateral, d.doorId);
     if (!verdict.ok) {
       d.valid = false;
       this.applyTint(d.doorId, CARRY_INVALID_EMISSIVE, CARRY_INVALID_INTENSITY);
@@ -2202,7 +2240,7 @@ class RoomEditController {
       return;
     }
 
-    const { doorId, wall, size, isCardinal, baseCentre, candidateLateral } = d;
+    const { doorId, wall, isCardinal, baseCentre, candidateLateral } = d;
     this.doorDrag = null;
     // Back to the plain selected state (the door stays selected, like a
     // placed furniture item).
@@ -2231,7 +2269,7 @@ class RoomEditController {
         // A free door always has a record (it was created by one); rebuild it
         // from the drag stash anyway so a racing remote delete degrades to a
         // re-add at the dropped spot rather than a lost write.
-        : { id: doorId, wall, lateral: candidateLateral, size, enabled: true });
+        : { id: doorId, wall, lateral: candidateLateral, size: 'large', enabled: true });
     }
     showHint('Door moved.', 1400);
   }
