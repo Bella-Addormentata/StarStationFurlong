@@ -16,7 +16,10 @@
  */
 import * as THREE from "three";
 import type { Player } from "./player";
-import { CELL_SIZE, findPath, worldToCol, worldToRow } from "./pathfinding";
+import {
+  CELL_SIZE, findPath, worldToCol, worldToRow, nearestWalkableCell,
+} from "./pathfinding";
+import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
@@ -24,6 +27,13 @@ const TURN_RATE = 9; // exponential turn smoothing factor
 /** Whole-bot scale: native build is 1.8 tall; ×1.4 ≈ 2.5 = 75% of the fox's
  *  measured 3.33 bbox height. The tray + drinks ride the same scale. */
 const ROBOT_SCALE = 1.4;
+/** 🦵 Hip pivot height — squats drop the hips (and torso) by the thigh-fold
+ *  shortening so the feet stay planted while the knees bend. */
+const HIP_Y = 0.98;
+/** 🗨️ World-space anchor for the bot's overhead lines — just above the
+ *  scaled antenna (≈3.1), co-owned with the geometry so a rebuild that
+ *  changes the bot's height updates the bubbles with it. */
+export const ROBOT_BUBBLE_Y = 3.3;
 const SERVE_RANGE = 1.6; // fox this close AND facing the bot → serve
 const FACING_DOT = 0.55; // min cos(angle fox-heading → bot) to count as 迎面
 const ABORT_RANGE = 3.0; // fox wandered off before the sip → finish quietly
@@ -106,6 +116,45 @@ const SMALLTALK_CHARGING: readonly string[] = [
   "Low on volts, high on spirits.",
   "Just topping up my cells — don't mind me.",
 ];
+/** 🏋️ #77 coach routine — the demo class the bot loops: announce a move,
+ *  demonstrate its reps, rest, next move. `repSecs` paces ONE full rep; every
+ *  rep's pose derives from a half-sine so it starts and ends at neutral. */
+const COACH_MOVES = [
+  { name: 'squat', call: 'Squats — follow me! Eight reps!', reps: 8, repSecs: 2.0 },
+  { name: 'jack', call: 'Jumping jacks! Arms up — eight!', reps: 8, repSecs: 0.9 },
+  { name: 'lunge', call: 'Lunges — alternate legs, nice and low!', reps: 8, repSecs: 1.8 },
+] as const;
+/** Rep count words, spoken as each rep begins ("One!" … "Eight!"). */
+const COUNT_WORDS: readonly string[] = [
+  'One!', 'Two!', 'Three!', 'Four!', 'Five!', 'Six!', 'Seven!', 'Eight!',
+];
+/** Squat/lunge pacing: ease DOWN (40%), HOLD at the bottom (25%), ease back
+ *  UP (35%) — the hold is what makes the rep read as a real squat instead of
+ *  a bounce. Jumping jacks keep a plain half-sine (they ARE a bounce). */
+function holdCurve(t: number): number {
+  if (t < 0.4) return Math.sin((t / 0.4) * (Math.PI / 2));
+  if (t > 0.65) return Math.sin(((1 - t) / 0.35) * (Math.PI / 2));
+  return 1;
+}
+/** THE per-move rep curve — one source for the robot's demo and the fox's
+ *  mirror, so the two rigs can't fall out of step. */
+function curveFor(name: (typeof COACH_MOVES)[number]['name'], t: number): number {
+  return name === 'jack' ? Math.sin(Math.PI * t) : holdCurve(t);
+}
+const COACH_ANNOUNCE_SECS = 1.6; // beat between the call and the first rep
+const COACH_REST_SECS = 4;
+const COACH_REST_LINES: readonly string[] = [
+  'And done — shake it out!',
+  'Great set! Breathe…',
+  'Nice form! Quick breather.',
+];
+/** Proximity invite (the coach's flavour of small talk). */
+const COACH_INVITES: readonly string[] = [
+  'Join me for a set?',
+  'Workout time — follow along if you like!',
+  'A fit clone is a happy clone. Care to try?',
+];
+
 /** 🍹 Spoken once as a serve begins (the OFFER turn-to-face) — the #77
  *  "stopping to ask if a person would like a drink" beat. One line per serve;
  *  SERVE_COOLDOWN already spaces repeat serves. */
@@ -143,6 +192,12 @@ export class PoolWaiter {
   private legR!: THREE.Group;
   private body!: THREE.Group;
   private tray!: THREE.Group;
+  /** 🏋️ Shoulder-pivoted arm groups (rotation zero = tray-carry pose). */
+  private armL!: THREE.Group;
+  private armR!: THREE.Group;
+  /** 🦵 Knee-pivoted shin subgroups (inside legL/legR) — squat knee bend. */
+  private shinL!: THREE.Group;
+  private shinR!: THREE.Group;
   private drinks: DrinkSlot[] = [];
 
   private time = 0;
@@ -193,10 +248,23 @@ export class PoolWaiter {
   private scriptIndex = 0;
   private scriptTimer = 0;
   private saidThisStep = false;
-  private sayHandler: ((text: string, x: number, z: number) => void) | null = null;
+  /** Returns whether the line was actually delivered (the world drops lines
+   *  during its room-entry quiet window) — droppers must not burn cooldowns. */
+  private sayHandler: ((text: string, x: number, z: number) => boolean) | null = null;
   /** 🗨️ #77 small talk: greet once when a fox newly enters range, then hold off. */
   private smalltalkCooldown = 0;
   private foxWasNear = false;
+  /** 🏋️ coach-routine state: which move, where in its announce/reps/rest
+   *  cycle, and the once-per-phase say latch. */
+  private coachMove = 0;
+  private coachPhase: 'announce' | 'reps' | 'rest' = 'announce';
+  private coachTimer = 0;
+  private coachRep = 0;
+  private coachSaid = false;
+  /** 🎥 Camera-facing yaw while coaching (world-provided; null = dock facing). */
+  private stageYaw: number | null = null;
+  /** 🏋️ The class stage — open floor nearest room centre (lazy, per class). */
+  private coachStage: { x: number; z: number } | null = null;
   /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
    *  walk goal (routes around furniture / through door openings instead of
    *  clipping straight through), and the goal they were computed for. */
@@ -257,86 +325,112 @@ export class PoolWaiter {
     return mesh;
   }
 
+  /** 🏋️ Cylindrical limb segment (owner request: rounded, high-contrast limbs
+   *  so the coach's exercise moves read clearly). Same contract as box(). */
+  private tube(
+    parent: THREE.Object3D,
+    radius: number,
+    height: number,
+    mat: THREE.Material,
+    x: number,
+    y: number,
+    z: number,
+  ): THREE.Mesh {
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius, radius, height, 12),
+      mat,
+    );
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+    parent.add(mesh);
+    return mesh;
+  }
+
   private build(): void {
     // ⬛⬜ Monochrome livery: white chassis panels, black joints/servos,
     // black polo with white collar + badge, white shorts, black visor.
     const STEEL = this.mat(0xf1f3f5, 0.55, 0.35); // white chassis
     const JOINT = this.mat(0x191c20, 0.6, 0.4); // black joints
-    const SHIRT = this.mat(0x24272c, 0.85, 0.02); // black polo
     const COLLAR = this.mat(0xf1f3f5, 0.85, 0.02); // white collar
     const SHORTS = this.mat(0xe8ebee, 0.8, 0.08); // white shorts
     const VISOR = this.mat(0x14181c, 0.35, 0.1); // sunglasses band
     const WOODY = this.mat(0x8a5a2e, 0.8, 0.05); // tray timber
+    // 🏋️ High-contrast limb colours (owner request): coral arms, sky-blue
+    // legs — each limb reads at a glance mid-exercise.
+    const ARM = this.mat(0xff7043, 0.55, 0.15); // coral sleeves
+    const LEG = this.mat(0x36c6f0, 0.55, 0.15); // sky-blue tights
 
     // Legs — hip-pivoted groups so they can swing while walking.
     for (const side of [-1, 1] as const) {
       const leg = new THREE.Group();
-      leg.position.set(side * 0.15, 0.68, 0);
-      this.box(leg, 0.17, 0.34, 0.2, STEEL, 0, -0.17, 0); // thigh
-      this.box(leg, 0.1, 0.1, 0.12, JOINT, 0, -0.36, 0); // knee servo
-      this.box(leg, 0.15, 0.26, 0.17, STEEL, 0, -0.5, 0); // shin
-      this.box(leg, 0.18, 0.09, 0.3, JOINT, 0, -0.645, 0.05); // foot
+      leg.position.set(side * 0.15, HIP_Y, 0); // 🏋️ athletic legs — hip pivot
+      this.tube(leg, 0.075, 0.46, LEG, 0, -0.23, 0); // thigh
+      this.tube(leg, 0.05, 0.1, JOINT, 0, -0.47, 0); // knee servo
+      // 🦵 Shin subgroup pivoted at the KNEE so a squat bends like a human
+      // leg — thigh folds forward, shin counter-rotates to stay upright.
+      const shin = new THREE.Group();
+      shin.position.set(0, -0.48, 0);
+      leg.add(shin);
+      this.tube(shin, 0.065, 0.36, LEG, 0, -0.24, 0); // shin
+      this.box(shin, 0.18, 0.09, 0.3, JOINT, 0, -0.455, 0.05); // foot
       this.group.add(leg);
-      if (side < 0) this.legL = leg;
-      else this.legR = leg;
+      if (side < 0) {
+        this.legL = leg;
+        this.shinL = shin;
+      } else {
+        this.legR = leg;
+        this.shinR = shin;
+      }
     }
 
-    // Body group (shorts → torso → head) — bobs as one while walking.
+    // Body group (shorts → abs chassis → head) — bobs as one while walking.
+    // 🏋️ Athletic rebuild (owner request): FLAT slab torso (not a barrel) in
+    // a V-taper — broad flat chest over a narrow waist — with a sculpted
+    // SIX-PACK front: two pec plates up top, a 2×3 grid of ab pads below.
+    // Slim waist, longer legs; limbs stay the coloured tubes.
     this.body = new THREE.Group();
     this.group.add(this.body);
-    this.box(this.body, 0.48, 0.24, 0.3, SHORTS, 0, 0.8, 0);
-    this.box(this.body, 0.52, 0.42, 0.33, SHIRT, 0, 1.11, 0); // polo torso
-    this.box(this.body, 0.54, 0.07, 0.35, COLLAR, 0, 1.3, 0); // collar band
-    // Name badge + logo chip on the chest (white on the black polo).
-    this.box(
-      this.body,
-      0.12,
-      0.09,
-      0.02,
-      this.mat(0xf2f5f7, 0.9, 0),
-      -0.15,
-      1.19,
-      0.17,
-    );
-    this.box(
-      this.body,
-      0.09,
-      0.07,
-      0.02,
-      this.mat(0x111417, 0.9, 0),
-      0.16,
-      1.19,
-      0.17,
-    );
-    // Shoulder caps + arms, permanently posed to carry the tray out front.
+    this.box(this.body, 0.4, 0.18, 0.2, SHORTS, 0, 1.06, 0); // shorts
+    this.box(this.body, 0.38, 0.22, 0.17, STEEL, 0, 1.26, 0); // waist slab
+    this.box(this.body, 0.52, 0.24, 0.2, STEEL, 0, 1.49, 0); // chest slab (V-taper)
+    this.tube(this.body, 0.07, 0.1, COLLAR, 0, 1.65, 0); // neck
+    const ABS = this.mat(0xd8dee4, 0.5, 0.3); // sculpted muscle plating
     for (const side of [-1, 1] as const) {
-      this.box(this.body, 0.14, 0.14, 0.16, COLLAR, side * 0.33, 1.26, 0);
-      const upper = this.box(
-        this.body,
-        0.11,
-        0.3,
-        0.13,
-        STEEL,
-        side * 0.34,
-        1.1,
-        0.1,
-      );
-      upper.rotation.x = -0.55; // upper arm angled forward-down
-      const fore = this.box(
-        this.body,
-        0.1,
-        0.28,
-        0.11,
-        JOINT,
-        side * 0.3,
-        0.93,
-        0.28,
-      );
-      fore.rotation.x = -1.35; // forearm reaching level to the tray
-      this.box(this.body, 0.09, 0.08, 0.1, STEEL, side * 0.27, 0.93, 0.4); // hand
+      this.box(this.body, 0.19, 0.12, 0.03, ABS, side * 0.11, 1.51, 0.105); // pec
     }
-    // Backpack power unit.
-    this.box(this.body, 0.36, 0.4, 0.14, JOINT, 0, 1.1, -0.22);
+    for (let row = 0; row < 3; row++) {
+      for (const side of [-1, 1] as const) {
+        this.box(
+          this.body,
+          0.09,
+          0.075,
+          0.03,
+          ABS,
+          side * 0.06,
+          1.36 - row * 0.085,
+          0.09,
+        ); // ab pad
+      }
+    }
+    // Shoulder caps + arms. 🏋️ The arm boxes live in a per-side GROUP pivoted
+    // at the shoulder so the coach routine can raise/swing them; group
+    // rotation (0,0,0) is the sculpted tray-carry pose (same offsets as the
+    // old body-attached boxes, rebased to the shoulder pivot).
+    for (const side of [-1, 1] as const) {
+      this.box(this.body, 0.14, 0.14, 0.16, COLLAR, side * 0.3, 1.52, 0);
+      const arm = new THREE.Group();
+      arm.position.set(side * 0.31, 1.5, 0);
+      this.body.add(arm);
+      const upper = this.tube(arm, 0.06, 0.3, ARM, 0, -0.16, 0.1);
+      upper.rotation.x = -0.55; // upper arm angled forward-down
+      const fore = this.tube(arm, 0.055, 0.28, ARM, side * -0.04, -0.33, 0.28);
+      fore.rotation.x = -1.35; // forearm reaching level to the tray
+      this.tube(arm, 0.05, 0.08, JOINT, side * -0.07, -0.33, 0.4); // hand
+      if (side < 0) this.armL = arm;
+      else this.armR = arm;
+    }
+    // Backpack power unit — snug against the flat back.
+    this.box(this.body, 0.34, 0.32, 0.12, JOINT, 0, 1.42, -0.16);
     this.box(
       this.body,
       0.1,
@@ -344,22 +438,28 @@ export class PoolWaiter {
       0.04,
       this.mat(0xf5f7f9, 0.6, 0.1),
       0.08,
-      1.16,
-      -0.3,
+      1.46,
+      -0.24,
     );
-    // Head: grey block, black sunglasses visor, side bolts, antenna.
-    this.box(this.body, 0.32, 0.28, 0.3, STEEL, 0, 1.52, 0);
-    this.box(this.body, 0.3, 0.08, 0.06, VISOR, 0, 1.55, 0.15); // 😎
-    this.box(this.body, 0.1, 0.03, 0.02, JOINT, 0, 1.44, 0.16); // mouth slit
+    // Head: 🏋️ a clear, distinct head above the neck — compact flat-faced
+    // block (matches the slab torso), front sunglasses visor, side bolts and
+    // the antenna.
+    this.box(this.body, 0.3, 0.26, 0.26, STEEL, 0, 1.83, 0);
+    this.box(this.body, 0.28, 0.08, 0.05, VISOR, 0, 1.86, 0.13); // 😎 visor
+    this.box(this.body, 0.1, 0.03, 0.02, JOINT, 0, 1.76, 0.135); // mouth slit
     for (const side of [-1, 1] as const) {
-      this.box(this.body, 0.05, 0.1, 0.1, JOINT, side * 0.185, 1.52, 0);
+      this.tube(this.body, 0.045, 0.06, JOINT, side * 0.17, 1.83, 0).rotation.z =
+        Math.PI / 2; // ear bolts
     }
-    this.box(this.body, 0.03, 0.12, 0.03, JOINT, 0.1, 1.71, -0.05); // antenna
-    this.box(this.body, 0.06, 0.04, 0.06, STEEL, 0.1, 1.78, -0.05);
+    this.tube(this.body, 0.015, 0.12, JOINT, 0.1, 2.02, -0.05); // antenna
+    const antennaTip = new THREE.Mesh(new THREE.SphereGeometry(0.03, 10, 8), STEEL);
+    antennaTip.position.set(0.1, 2.09, -0.05);
+    antennaTip.castShadow = true;
+    this.body.add(antennaTip);
 
     // Tray held out front, with four cocktails.
     this.tray = new THREE.Group();
-    this.tray.position.set(0, 0.98, 0.46);
+    this.tray.position.set(0, 1.22, 0.46);
     this.body.add(this.tray);
     this.box(this.tray, 0.6, 0.035, 0.38, WOODY, 0, 0, 0);
     this.box(this.tray, 0.6, 0.05, 0.03, WOODY, 0, 0.02, 0.185);
@@ -447,6 +547,14 @@ export class PoolWaiter {
       return;
     }
 
+    // 🏋️ #77: a 'coach' robot runs its class — never serves or croupiers
+    // (world's croupier eligibility skips it too).
+    if (this.routine === "coach") {
+      this.tray.visible = false;
+      this.updateCoach(dt);
+      return;
+    }
+
     // 🤖 #77C s4: a 'custom' robot runs its owner-authored step loop (walk / say /
     // wait) — never serves or croupiers.
     if (this.routine === "custom") {
@@ -503,19 +611,228 @@ export class PoolWaiter {
       this.servePhase !== "NONE" ||
       this.parked ||
       this.croupierPost ||
-      this.routine !== "serve"
+      (this.routine !== "serve" && this.routine !== "coach")
     ) {
       return;
     }
-    this.smalltalkCooldown = SMALLTALK_COOLDOWN_SECS;
-    this.sayRandom(this.activity === "DOCK" ? SMALLTALK_CHARGING : SMALLTALK_PATROL);
+    // 🏋️ A coach invites you to the class; a server makes small talk.
+    // 🔇 A line dropped by the room-entry quiet window burns nothing: re-arm
+    // the edge so the greeting retries — it lands right as the window opens
+    // (the "speak ~1 s after entering" behaviour, owner request).
+    const delivered = this.sayRandom(
+      this.routine === "coach"
+        ? COACH_INVITES
+        : this.activity === "DOCK"
+          ? SMALLTALK_CHARGING
+          : SMALLTALK_PATROL,
+    );
+    if (delivered) this.smalltalkCooldown = SMALLTALK_COOLDOWN_SECS;
+    else this.foxWasNear = false;
   }
 
-  /** One random line from `pool`, through the world's bubble+voice seam. */
-  private sayRandom(pool: readonly string[]): void {
-    if (!this.sayHandler) return;
+  /** One line through the world's bubble+voice seam. Returns whether it was
+   *  actually delivered (false ⇒ the room-entry quiet window dropped it). */
+  private say(text: string): boolean {
+    if (!this.sayHandler) return false;
     const p = this.group.position;
-    this.sayHandler(pool[Math.floor(Math.random() * pool.length)], p.x, p.z);
+    return this.sayHandler(text, p.x, p.z);
+  }
+
+  /** One random line from `pool`. */
+  private sayRandom(pool: readonly string[]): boolean {
+    return this.say(pool[Math.floor(Math.random() * pool.length)]);
+  }
+
+  /** 🏋️ The coach's stage: the open floor nearest the ROOM CENTRE (owner
+   *  request — the class happens mid-room, not beside the charger). Ring-
+   *  search the walkable grid outward from (0,0); computed once per class
+   *  (reset when the routine changes) so a furniture edit mid-class doesn't
+   *  teleport the stage. */
+  private findCoachStage(): { x: number; z: number } {
+    return (
+      nearestWalkableCell(0, 0, 12) ?? {
+        x: this.group.position.x,
+        z: this.group.position.z,
+      }
+    );
+  }
+
+  /** 🏋️ Walk to the stage (room centre), then loop the class: announce a
+   *  move → demonstrate its reps → rest → next move. Call-outs ride the say
+   *  seam, so they bubble AND speak. */
+  private updateCoach(dt: number): void {
+    if (!this.coachStage) this.coachStage = this.findCoachStage();
+    if (!this.walkTo(dt, this.coachStage.x, this.coachStage.z, 0.15)) {
+      this.resetExercisePose();
+      return;
+    }
+    // 🎥 The class is staged for the SCREEN: face the camera when the world
+    // provides the stage yaw (workout-video framing), else fall back to the
+    // dock's room-facing.
+    const face = this.stageYaw ?? this.dockTarget?.faceAngle;
+    if (face !== undefined) this.turnToward(face, dt);
+
+    this.coachTimer += dt;
+    const move = COACH_MOVES[this.coachMove];
+    switch (this.coachPhase) {
+      case "announce":
+        if (!this.coachSaid) {
+          this.coachSaid = true;
+          this.say(move.call);
+        }
+        this.idlePose();
+        if (this.coachTimer >= COACH_ANNOUNCE_SECS) this.setCoachPhase("reps");
+        break;
+      case "reps": {
+        // Count the rep as it begins — "One!" … "Eight!" (owner request).
+        if (!this.coachSaid) {
+          this.coachSaid = true;
+          this.say(COUNT_WORDS[Math.min(this.coachRep, COUNT_WORDS.length - 1)]);
+        }
+        const t = Math.min(1, this.coachTimer / move.repSecs);
+        this.animateMove(move.name, curveFor(move.name, t));
+        if (t >= 1) {
+          this.coachRep += 1;
+          this.coachTimer = 0;
+          this.coachSaid = false; // re-arm the count for the next rep
+          if (this.coachRep >= move.reps) this.setCoachPhase("rest");
+        }
+        break;
+      }
+      case "rest":
+        if (!this.coachSaid) {
+          this.coachSaid = true;
+          this.resetExercisePose();
+          this.sayRandom(COACH_REST_LINES);
+        }
+        this.idlePose();
+        if (this.coachTimer >= COACH_REST_SECS) {
+          this.coachMove = (this.coachMove + 1) % COACH_MOVES.length;
+          this.setCoachPhase("announce");
+        }
+        break;
+    }
+  }
+
+  /** 🎥 Camera-facing yaw for the coach's class (set per frame by the world;
+   *  null = face the dock's room direction). */
+  public setStageYaw(yaw: number | null): void {
+    this.stageYaw = yaw;
+  }
+
+  /** 🏋️ Whether this bot is running the coach routine (drives stage facing
+   *  and the follow-the-coach slot in the world). */
+  public isCoaching(): boolean {
+    return this.routine === "coach";
+  }
+
+  /** 🏋️ The fox follower's mirror of the CURRENT rep (#77 follow-the-coach)
+   *  — non-null only mid-reps. Chibi-scaled amplitudes live HERE, beside
+   *  animateMove's robot numbers, so retuning a move can't desync the two
+   *  rigs. The world adds only follower policy (who mirrors, when). */
+  public getFollowerPose(): WorkoutPose | null {
+    if (this.routine !== "coach" || this.coachPhase !== "reps") return null;
+    const move = COACH_MOVES[this.coachMove];
+    const t = Math.min(1, this.coachTimer / move.repSecs);
+    const k = curveFor(move.name, t);
+    if (move.name === "squat") {
+      // Deep sink + arms straight out; no torso lean — on the big-headed
+      // chibi fox a lean reads as a bow, not a rep (owner feedback).
+      return { dip: -0.18 * k, armLX: -1.4 * k, armRX: -1.4 * k, armZ: 0, legZ: 0 };
+    }
+    if (move.name === "jack") {
+      return { dip: 0.05 * k, armLX: 0, armRX: 0, armZ: 2.1 * k, legZ: 0.3 * k };
+    }
+    // Lunge — same split/arm-drive pattern as the robot's rep.
+    const frontIsL = this.coachRep % 2 === 0;
+    return {
+      dip: -0.14 * k,
+      armZ: 0,
+      legZ: 0,
+      legLX: (frontIsL ? -0.85 : 0.55) * k,
+      legRX: (frontIsL ? 0.55 : -0.85) * k,
+      armLX: (frontIsL ? 0.45 : -0.9) * k,
+      armRX: (frontIsL ? -0.9 : 0.45) * k,
+    };
+  }
+
+  /** 🏋️ The class's line-up spots — one either side of the coach, spaced
+   *  along the stage (perpendicular to the camera), formation owned by the
+   *  class itself. Callers filter for walkability/pathing. */
+  public getFollowerSlots(): Array<{ x: number; z: number }> {
+    const yaw = this.stageYaw ?? 0;
+    const p = this.group.position;
+    return [1, -1].map((side) => ({
+      x: p.x + Math.sin(yaw + side * (Math.PI / 2)) * 1.9,
+      z: p.z + Math.cos(yaw + side * (Math.PI / 2)) * 1.9,
+    }));
+  }
+
+  private setCoachPhase(phase: "announce" | "reps" | "rest"): void {
+    this.coachPhase = phase;
+    this.coachTimer = 0;
+    this.coachSaid = false;
+    if (phase === "reps") this.coachRep = 0;
+  }
+
+  /** One rep of `move`, `t` ∈ [0,1] through it. Squat/lunge ride holdCurve
+   *  (down–hold–up, like a real rep); jacks ride a bouncy half-sine. Every
+   *  curve returns to 0, so each rep starts and ends at the neutral stance. */
+  private animateMove(name: (typeof COACH_MOVES)[number]["name"], t: number): void {
+    if (name === "squat") {
+      // 🦵 A HUMAN squat: thighs fold forward, shins counter-rotate to stay
+      // upright, and hips + torso drop by the thigh-fold shortening so the
+      // feet stay planted. Arms come straight out for counterbalance.
+      const k = holdCurve(t);
+      const bend = 1.05 * k; // thigh fold angle
+      const drop = 0.48 * (1 - Math.cos(bend)); // fold shortening ⇒ hip drop
+      this.legL.rotation.x = -bend;
+      this.legR.rotation.x = -bend;
+      this.shinL.rotation.x = bend;
+      this.shinR.rotation.x = bend;
+      this.legL.position.y = HIP_Y - drop;
+      this.legR.position.y = HIP_Y - drop;
+      this.body.position.y = -drop;
+      this.armL.rotation.x = -1.4 * k;
+      this.armR.rotation.x = -1.4 * k;
+    } else if (name === "jack") {
+      const k = Math.sin(Math.PI * t);
+      this.body.position.y = 0.08 * k; // the hop
+      this.legL.rotation.z = -0.4 * k; // legs splay outward
+      this.legR.rotation.z = 0.4 * k;
+      this.armL.rotation.z = -2.4 * k; // arms sweep sideways overhead
+      this.armR.rotation.z = 2.4 * k;
+    } else {
+      // lunge — alternate the leading leg each rep, held low at the bottom,
+      // with a bent front knee and a runner's opposite-arm drive.
+      const k = holdCurve(t);
+      const frontIsL = this.coachRep % 2 === 0;
+      const front = frontIsL ? this.legL : this.legR;
+      const back = frontIsL ? this.legR : this.legL;
+      const frontShin = frontIsL ? this.shinL : this.shinR;
+      front.rotation.x = -0.85 * k;
+      frontShin.rotation.x = 0.55 * k; // 🦵 front knee bends into the step
+      back.rotation.x = 0.55 * k;
+      const driveArm = frontIsL ? this.armR : this.armL;
+      const trailArm = frontIsL ? this.armL : this.armR;
+      driveArm.rotation.x = -0.9 * k;
+      trailArm.rotation.x = 0.45 * k;
+      this.body.position.y = -0.18 * k;
+    }
+  }
+
+  /** Clear every joint an exercise touches (walk/idle manage leg X). */
+  private resetExercisePose(): void {
+    this.armL.rotation.set(0, 0, 0);
+    this.armR.rotation.set(0, 0, 0);
+    this.legL.rotation.z = 0;
+    this.legR.rotation.z = 0;
+    this.shinL.rotation.x = 0;
+    this.shinR.rotation.x = 0;
+    this.legL.position.y = HIP_Y;
+    this.legR.position.y = HIP_Y;
+    this.body.position.y = 0;
+    this.body.rotation.x = 0;
   }
 
   /** 🔌 Point the bot at a charging dock (world pos + facing). The world calls
@@ -531,6 +848,15 @@ export class PoolWaiter {
 
   /** 🤖 #77C s3: set the owner-programmed routine (from the dock's console). */
   public setRoutine(routine: RobotRoutine): void {
+    if (routine !== this.routine) {
+      // 🏋️ Leaving coach mid-rep must not strand raised arms / splayed legs;
+      // entering restarts the class from the first move's announce, with the
+      // stage re-picked (furniture may have moved since the last class).
+      this.resetExercisePose();
+      this.setCoachPhase("announce");
+      this.coachMove = 0;
+      this.coachStage = null;
+    }
     this.routine = routine;
   }
 
@@ -553,8 +879,9 @@ export class PoolWaiter {
     this.pathGoalKey = "";
   }
 
-  /** 🤖 #77C s4: the world provides the 'say' renderer (a bubble over the bot). */
-  public setSayHandler(fn: (text: string, x: number, z: number) => void): void {
+  /** 🤖 #77C s4: the world provides the 'say' renderer (a bubble over the
+   *  bot). It returns whether the line was delivered (false ⇒ quiet window). */
+  public setSayHandler(fn: (text: string, x: number, z: number) => boolean): void {
     this.sayHandler = fn;
   }
 

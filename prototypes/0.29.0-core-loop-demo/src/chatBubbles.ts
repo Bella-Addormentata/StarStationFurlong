@@ -43,8 +43,9 @@ interface LiveBubble {
   bornAt: number;
   fading: boolean;
   /** 🤖 #77B: a FIXED world point (the robot croupier isn't an avatar, so it
-   *  can't be resolved through remotes()) — the bubble hangs over this spot. */
-  fixed?: { x: number; z: number };
+   *  can't be resolved through remotes()) — the bubble hangs over this spot,
+   *  at `y` if given (taller anchors) else HEAD_Y. */
+  fixed?: { x: number; z: number; y?: number };
 }
 
 let deps: BubbleDeps | null = null;
@@ -109,7 +110,13 @@ export function spawnChatBubble(text: string, isSelf: boolean, atX?: number, atZ
  * a stationary spot rather than an avatar — so it survives in first person and
  * needs no lane↔player resolution. `anchorId` keys it (a newer call replaces).
  */
-export function spawnFixedBubble(anchorId: string, text: string, x: number, z: number): void {
+export function spawnFixedBubble(
+  anchorId: string,
+  text: string,
+  x: number,
+  z: number,
+  y?: number,
+): void {
   if (!deps || !container) return;
   const clean = String(text ?? '').trim();
   if (!clean || !Number.isFinite(x) || !Number.isFinite(z)) return;
@@ -118,7 +125,9 @@ export function spawnFixedBubble(anchorId: string, text: string, x: number, z: n
   el.className = 'overhead-chat-bubble';
   el.textContent = clean.length > MAX_TEXT ? `${clean.slice(0, MAX_TEXT - 1)}…` : clean;
   container.appendChild(el);
-  bubbles.set(anchorId, { el, anchorId, bornAt: performance.now(), fading: false, fixed: { x, z } });
+  // 🤖 Optional anchor height: the robot is taller than the fox's HEAD_Y, so
+  // its lines hang above its head instead of covering it.
+  bubbles.set(anchorId, { el, anchorId, bornAt: performance.now(), fading: false, fixed: { x, z, y } });
 }
 
 /** Per-frame: reposition every bubble over its avatar's head; age + fade. */
@@ -151,7 +160,7 @@ export function updateChatBubbles(): void {
     if (!pos || !camera || zoom >= 3) { b.el.style.display = 'none'; continue; }
 
     // World → screen.
-    projected.set(pos.x, HEAD_Y, pos.z).project(camera);
+    projected.set(pos.x, b.fixed?.y ?? HEAD_Y, pos.z).project(camera);
     if (projected.z > 1 || projected.z < -1) { b.el.style.display = 'none'; continue; }
     const sx = (projected.x * 0.5 + 0.5) * window.innerWidth;
     const sy = (-projected.y * 0.5 + 0.5) * window.innerHeight;
