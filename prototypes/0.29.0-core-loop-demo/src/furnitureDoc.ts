@@ -105,6 +105,12 @@ const MOVABLE_KIND_OVERRIDE: Partial<Record<FurnitureKind, boolean>> = {
   // furniture now — corrects any room doc still holding the old movable:false.
   'lazy-pool': true,
   'hot-tub': true,
+  // 🖥️ Owner request: the room terminal is selectable + movable in edit mode
+  // (wall-snapped — snapInteriorWall). Every room seeded before this shipped
+  // holds `movable: false` for it, and without the override those rooms could
+  // never move theirs. Movable ≠ removable: editMode.removeSelected still
+  // refuses, because this panel is the only way back into EDIT ROOM.
+  'wall-computer': true,
 };
 
 /** Snapshot the whole layout as id → validated record (malformed entries are

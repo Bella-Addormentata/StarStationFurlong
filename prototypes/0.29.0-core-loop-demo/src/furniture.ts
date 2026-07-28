@@ -38,6 +38,11 @@ import type {
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
+// 🖥️ Interior wall mounts need the live room size to find the wall planes.
+// (floorPlanDoc imports neither this module nor anything that leads back to
+// it, and DoorWall is type-only — no cycle either way.)
+import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import type { DoorWall } from "./doorLayoutDoc";
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box {
@@ -256,6 +261,19 @@ export interface FurnitureDef {
    * nothing (bells stay outermost).
    */
   attach?: { accepts: Array<"wall" | "tankFace">; provides?: "tankFace" };
+  /**
+   * 🖥️ INTERIOR wall mount (the room terminal). The mirror image of `mount:
+   * 'exterior-wall'`: the item hangs on the INSIDE face of a wall instead of
+   * standing on the floor, so a carry snaps it to the nearest wall's mount
+   * plane and takes its rotation from that wall (screen always faces into the
+   * room) rather than honouring R — see snapInteriorWall.
+   *
+   * `halfW` is the panel's half-width along the wall. It is only used for the
+   * clearance checks (doorways, windows, other furniture): a wall-mounted kind
+   * keeps `footprint: null` and never becomes an obstacle, because it hangs
+   * above head height and nothing walks into it.
+   */
+  wallMount?: { halfW: number };
 }
 
 // ── Warm frontier colour palette (moved from world.addLobbyFurniture) ─────────
@@ -2995,6 +3013,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     kind: "wall-computer",
     build: buildWallComputer,
     footprint: null,
+    wallMount: { halfW: WC_W / 2 },
     functions: ["roomTerminal"],
     device: {
       kind: "roomTerminal",
@@ -5651,13 +5670,18 @@ export const FURNITURE: FurnitureItem[] = [
   // rot 2 flips the +z-facing screen to face -z into the room. x=1.8 clears
   // the door frame (posts end at |x|=1.0, click box at |x|≤1.0) and the
   // keypad (at x=-1.1 after the door group's rotY=π flip); z=5.97 is the
-  // bar back-panel flush-mount plane. Footprint null ⇒ never an obstacle.
+  // wall's flush-mount plane. Footprint null ⇒ never an obstacle.
+  // 🖥️ movable: the owner can re-hang it on any wall in edit mode — a carry
+  // snaps it to the nearest wall and takes its rotation from that wall
+  // (snapInteriorWall), the way a door drag is locked to its wall. It can
+  // never be REMOVED though: its focused UI is the EDIT ROOM entry point
+  // (editMode.removeSelected).
   {
     id: "wall-computer",
     kind: "wall-computer",
     pos: { x: 1.8, z: 5.97 },
     rot: 2,
-    movable: false,
+    movable: true,
   },
   // Storage trunk on the fireplace wall's west flank (TR2 of #35). The plan's
   // berth-corner suggestion (-2.5, -5.0) overlaps the fireplace obstacle
@@ -6186,7 +6210,7 @@ export const CASINO_FURNITURE: FurnitureItem[] = [
     kind: "wall-computer",
     pos: { x: 1.8, z: 5.97 },
     rot: 2,
-    movable: false,
+    movable: true, // 🖥️ wall-snapped in edit mode; never removable
   },
 ];
 
@@ -6683,6 +6707,152 @@ export function getPoolIsland(items: FurnitureItem[]): {
   return { x: hotTub.pos.x, z: hotTub.pos.z, rx: 1.72, rz: 1.48 };
 }
 
+// ── 🖥️ Interior wall mounts (the room terminal) ───────────────────────────────
+
+/** Does this kind hang on an interior wall rather than stand on the floor? */
+export function isWallMounted(kind: FurnitureKind): boolean {
+  return FURNITURE_DEFS[kind].wallMount !== undefined;
+}
+
+/** Gap from the wall plane to a mounted panel's origin — the flush-mount
+ *  inset the wall computer has always used (its 0.12 m housing straddles the
+ *  plane, so the screen face ends up just inside the room). */
+const WALL_MOUNT_INSET = 0.03;
+
+/**
+ * The rot that faces a wall-mounted panel INTO the room, per wall. The panel's
+ * local +z is its screen, and rot is a CCW quarter-turn about +y, so: north
+ * wall (z=-half) wants +z ⇒ rot 0; east (x=+half) wants -x ⇒ rot 3; south
+ * (z=+half) wants -z ⇒ rot 2; west (x=-half) wants +x ⇒ rot 1.
+ */
+const WALL_MOUNT_ROT: Record<DoorWall, Rot> = {
+  north: 0,
+  east: 3,
+  south: 2,
+  west: 1,
+};
+
+/** Which wall a wall-mounted item at `rot` is hanging on (inverse of the map
+ *  above) — lets the validators ask "is this the north wall?" from a pose. */
+export function wallOfMountRot(rot: Rot): DoorWall {
+  return rot === 0 ? "north" : rot === 3 ? "east" : rot === 2 ? "south" : "west";
+}
+
+/**
+ * Snap a raw floor point to the nearest wall for a wall-mounted kind. The item
+ * lands on that wall's flush-mount plane, its along-wall coordinate snaps to
+ * the 0.5 m half-grid (clamped so the whole panel stays on the wall), and its
+ * rotation is DERIVED from the wall so the screen always faces into the room.
+ *
+ * The exact interior mirror of hull.snapExteriorPos — and, like a door drag,
+ * the pose is 1-D: you choose a wall and a position along it, never a free
+ * point in the room. Returns null for kinds that aren't wall-mounted.
+ */
+export function snapInteriorWall(
+  kind: FurnitureKind,
+  x: number,
+  z: number,
+): { x: number; z: number; rot: Rot } | null {
+  const spec = FURNITURE_DEFS[kind].wallMount;
+  if (!spec) return null;
+  const { halfX, halfZ } = roomHalfExtents();
+
+  // Nearest wall wins. Ties fall through to the z walls (north/south), which
+  // is where the terminal lives by default.
+  const dNorth = Math.abs(z + halfZ);
+  const dSouth = Math.abs(halfZ - z);
+  const dWest = Math.abs(x + halfX);
+  const dEast = Math.abs(halfX - x);
+  const min = Math.min(dNorth, dSouth, dWest, dEast);
+  const wall: DoorWall =
+    min === dSouth ? "south" : min === dNorth ? "north" : min === dEast ? "east" : "west";
+
+  // Along-wall snap, clamped to the last half-grid stop that (a) keeps the
+  // panel fully on the wall and (b) leaves the panel's stand-point on a
+  // WALKABLE cell.
+  //
+  // (b) is not decoration. The device front sits at the same along-coordinate
+  // as the panel, and worldToCol/Row floor(), so a point on the 0.5 m lattice
+  // always resolves to the cell whose centre is 0.25 m FURTHER OUT. Clamping
+  // only by (a) therefore hands the user a stop whose front cell is outside
+  // the walkable bound — and only at the +x/+z end, since the floor() bias is
+  // one-directional. The result was a wall whose east half accepted the
+  // terminal and whose west half silently refused it (or vice versa),
+  // including at the very stop the clamp itself offered.
+  const alongHalf = wall === "north" || wall === "south" ? halfX : halfZ;
+  const { boundX, boundZ } = roomWalkBounds();
+  const alongBound = wall === "north" || wall === "south" ? boundX : boundZ;
+  const stop = Math.min(
+    Math.floor((alongHalf - spec.halfW) * 2) / 2,
+    Math.floor((alongBound - CELL / 2) * 2) / 2,
+  );
+  const along = Math.max(-stop, Math.min(stop, Math.round((wall === "north" || wall === "south" ? x : z) * 2) / 2));
+
+  const plane = (h: number) => h - WALL_MOUNT_INSET;
+  const rot = WALL_MOUNT_ROT[wall];
+  switch (wall) {
+    case "north": return { x: along, z: -plane(halfZ), rot };
+    case "south": return { x: along, z: plane(halfZ), rot };
+    case "west": return { x: -plane(halfX), z: along, rot };
+    case "east": return { x: plane(halfX), z: along, rot };
+  }
+}
+
+/**
+ * The thin slab a wall-mounted panel occupies on its wall. NOT an obstacle —
+ * wall-mounted kinds keep `footprint: null` and never block the floor — this
+ * is only the volume the placement gate tests against doorways, windows and
+ * other furniture, so the terminal can't be re-hung inside a bookcase, behind
+ * the bar, or across a door frame. Depth is generous (±0.15) so a flush mount
+ * still registers as overlapping whatever it is buried in.
+ */
+export function wallMountBox(
+  kind: FurnitureKind,
+  pos: { x: number; z: number },
+  rot: Rot,
+): Box | null {
+  const spec = FURNITURE_DEFS[kind].wallMount;
+  if (!spec) return null;
+  const D = 0.15;
+  const alongX = rot % 2 === 0; // north/south walls run along x
+  const hw = alongX ? spec.halfW : D;
+  const hd = alongX ? D : spec.halfW;
+  return { x0: pos.x - hw, z0: pos.z - hd, x1: pos.x + hw, z1: pos.z + hd };
+}
+
+/** A wall-mounted panel's half-width along its wall (0 for other kinds) — the
+ *  span the doorway/window clearance checks measure against. */
+export function wallMountHalfWidth(kind: FurnitureKind): number {
+  return FURNITURE_DEFS[kind].wallMount?.halfW ?? 0;
+}
+
+/** Is this kind the ROOM TERMINAL — the device whose focused UI hosts the
+ *  EDIT ROOM button, and therefore the one piece of furniture that must never
+ *  be removable (see editMode.removeSelected)? */
+export function isRoomTerminalKind(kind: FurnitureKind): boolean {
+  return FURNITURE_DEFS[kind].device?.kind === "roomTerminal";
+}
+
+/**
+ * The device stand-point this kind WOULD have at (pos, rot) — the same
+ * derivation buildDeviceList performs after a commit (rotated template front,
+ * with computeFront's nearest-usable fallback), exposed so the placement gate
+ * can check that a moved device still has somewhere to be used from. Returns
+ * null for kinds with no device template.
+ */
+export function deviceFrontFor(
+  kind: FurnitureKind,
+  pos: { x: number; z: number },
+  rot: Rot,
+  aabb: Box | null,
+  isWalkable: (x: number, z: number) => boolean,
+): { x: number; z: number } | null {
+  const t = FURNITURE_DEFS[kind].device;
+  if (!t) return null;
+  const fr = rotXZ(t.front.x, t.front.z, rot);
+  return computeFront({ x: pos.x + fr.x, z: pos.z + fr.z }, aabb, isWalkable);
+}
+
 /** Derive the collision obstacle list (order = FURNITURE order). */
 export function buildObstacleList(items: FurnitureItem[]): Box[] {
   const boxes: Box[] = [];
@@ -6772,14 +6942,16 @@ export function buildDeviceList(
   for (const item of items) {
     const t = FURNITURE_DEFS[item.kind].device;
     if (!t) continue;
-    const fr = rotXZ(t.front.x, t.front.z, item.rot);
     const eye = rotXZ(t.eye.x, t.eye.z, item.rot);
     const anchor = rotXZ(t.anchor.x, t.anchor.z, item.rot);
-    const preferred = { x: item.pos.x + fr.x, z: item.pos.z + fr.z };
     devices.push({
       id: item.id,
       kind: t.kind,
-      front: computeFront(preferred, itemAabb(item), isWalkable),
+      // Via deviceFrontFor, NOT a second inline copy of the same derivation:
+      // the edit-mode placement gate calls it to predict where this line will
+      // put the stand-point after a commit, and that prediction is only worth
+      // anything while both sides are literally the same code.
+      front: deviceFrontFor(item.kind, item.pos, item.rot, itemAabb(item), isWalkable)!,
       faceAngle: normalizeAngle(t.faceAngle + item.rot * (Math.PI / 2)),
       eye: new THREE.Vector3(item.pos.x + eye.x, t.eye.y, item.pos.z + eye.z),
       anchor: new THREE.Vector3(

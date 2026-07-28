@@ -71,7 +71,13 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     // Doors are structural (always present); the wall-computer is the in-world
     // edit-mode entry, so an empty room stays furnishable.
     items: [
-      { id: "wall-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: false },
+      // NOT the id "wall-computer": main.ts purges that reserved default id
+      // from every already-seeded doc on load (the retired lobby terminal), and
+      // this template's terminal is the room's ONLY item — losing it leaves no
+      // in-world way back into EDIT ROOM. Latent before, reachable now that the
+      // panel is movable and therefore written to the doc under its own id.
+      // The deck-1 template already avoids the collision the same way.
+      { id: "empty-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
     ],
     doorLayout: "casino-pairs",
     theme: "interior",
@@ -149,7 +155,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       { id: "deck-skylight-n", kind: "skylight", pos: { x: 0, z: -2.6 }, rot: 0, movable: true },
       { id: "deck-skylight-s", kind: "skylight", pos: { x: 0, z: 2.6 }, rot: 0, movable: true },
       { id: "deck-sun-lamp", kind: "sun-lamp", pos: { x: 0, z: 0 }, rot: 0, movable: true },
-      { id: "deck-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: false },
+      { id: "deck-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
       { id: "deck-tree-sw", kind: "cherry-tree", pos: { x: -4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "deck-tree-se", kind: "cherry-tree", pos: { x: 4.5, z: 4.5 }, rot: 0, movable: true },
       { id: "deck-tree-nw", kind: "cherry-tree", pos: { x: -4.5, z: -4.5 }, rot: 0, movable: true },

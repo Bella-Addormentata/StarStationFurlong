@@ -59,7 +59,7 @@ import { OBSTACLES, rebuildObstacles } from './obstacles';
 import {
   computeReachable, rebakeWalkableGrid, GRID_SIZE, worldToCol, worldToRow,
 } from './pathfinding';
-import { roomHalfExtents } from './floorPlanDoc';
+import { roomHalfExtents, roomPlaceBounds } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
@@ -245,8 +245,8 @@ function clearanceOk(item: FurnitureItem, pos: { x: number; z: number }, margin:
   if (margin <= 0) return true;
   const box = footprintAabb(item.kind, pos, item.rot);
   if (!box) return true; // decorative — never an obstacle, no seams to cause
-  const { halfX, halfZ } = roomHalfExtents(); // placement box: 1 m inside walls
-  const bX = halfX - 1, bZ = halfZ - 1;        // default 2×2 ⇒ ±5
+  // Placement box: the shared furniture-placement box (default 2×2 ⇒ ±5).
+  const { boundX: bX, boundZ: bZ } = roomPlaceBounds();
   if (box.x0 - margin < -bX || box.x1 + margin > bX || box.z0 - margin < -bZ || box.z1 + margin > bZ) {
     return false;
   }
@@ -282,9 +282,9 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
   };
   // Dedupe raw probe points onto the snap lattice, then try nearest-first.
   // Probe range spans the whole room from any in-bounds player pos (≈2·half);
-  // the spawn bound is 0.5 m inside each wall. 🧱 #66 R1 — default 2×2 room
-  // keeps the same in-bounds ±5.5 candidate set (wider raw range only adds
-  // out-of-bounds probes that the filter drops), so the result is unchanged.
+  // the spawn bound is 0.5 m inside each wall — a deliberately LOOSER
+  // pre-filter than validatePlacement's placement box, which then rejects the
+  // extra candidates. 🧱 #66 R1 — default 2×2 room ⇒ ±5.5.
   const { halfX, halfZ } = roomHalfExtents();
   const probeX = Math.ceil(2 * halfX), probeZ = Math.ceil(2 * halfZ);
   const bX = halfX - 0.5, bZ = halfZ - 0.5;
@@ -418,9 +418,11 @@ function spawnFurniture(kind: FurnitureKind): void {
 
 /**
  * DEV rescue: restore the room's wall computer — the edit-mode entry point —
- * at its canonical south-wall flush mount (roomTemplates.ts). Fixed structure,
- * so the generic spawner deliberately excludes it (NON_SPAWNABLE); without it
- * a room that lost its computer has no way back into EDIT ROOM. A unique id is
+ * at its canonical south-wall flush mount (roomTemplates.ts). One per room and
+ * wall-mounted, so the generic floor spawner deliberately excludes it
+ * (NON_SPAWNABLE); without this button a room that lost its computer has no
+ * way back into EDIT ROOM. (Once placed it IS movable — edit mode wall-snaps
+ * it to any wall — but never removable.) A unique id is
  * essential: main.ts purges the DEFAULT id "wall-computer" from seeded docs on
  * every load (the retired south-wall terminal), so restoring under that id
  * would vanish on the next reload.
@@ -444,7 +446,7 @@ function spawnWallComputer(): void {
     kind: 'wall-computer',
     pos: { x: Math.min(1.8, Math.max(0, halfX - 1.0)), z: halfZ - 0.03 },
     rot: 2,
-    movable: false,
+    movable: true, // 🖥️ wall-snapped in edit mode; never removable
   };
   commitSpawn(world, item);
   showHint('DEV: 🖥️ wall computer restored on the south wall.');

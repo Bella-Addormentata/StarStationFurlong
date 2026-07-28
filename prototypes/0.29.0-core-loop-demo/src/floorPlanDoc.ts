@@ -270,6 +270,68 @@ function recomputeRoomHalf(): void {
   roomHalf = { halfX: cols * TILE_SIZE / 2, halfZ: rows * TILE_SIZE / 2 };
 }
 
+/**
+ * 🧍 Clearance the avatar (and interior furniture) keeps from each wall plane,
+ * in metres — the ONE number that decides how much of the rendered floor is
+ * actually usable.
+ *
+ * It used to be 1.0 m, spread across three call sites that each re-derived it
+ * (grid bake, player clamp, placement gate) with slightly different values.
+ * At 0.5 m cell centres that put the outermost WALKABLE cell centre at
+ * ±(half−1.25) while the floor mesh, the click plane and the edit grid all
+ * render out to ±half — so the entire outer ring of grid tiles was drawn,
+ * clickable-looking, and permanently dead. 0.5 m opens that ring: the
+ * outermost cell centre lands at ±(half−0.75) and the room reads as one floor.
+ *
+ * 0.5 is safe against the shell: the octagon hull's vertical side walls and
+ * end-cap wall bands are zero-thickness planes standing at exactly ±half from
+ * y=0 to wallHeight (hullSection.computeOctagonProfile — the 45° chamfers are
+ * roof and basement, above and below the avatar), so half a metre is pure
+ * clearance at body height. Door frames sit in the wall plane and their
+ * threshold plates are floor-flush.
+ */
+export const WALL_CLEARANCE = 0.5;
+
+/**
+ * The WALKABLE box: WALL_CLEARANCE inside each wall, per axis. Shared by the
+ * A* grid bake (pathfinding), the manual-movement clamps (player, npc) and the
+ * first-person door threshold (world), so those can never drift apart again.
+ * Default 2×2 room ⇒ {6,6} ⇒ ±5.5.
+ */
+export function roomWalkBounds(): { boundX: number; boundZ: number } {
+  const { halfX, halfZ } = roomHalf;
+  return { boundX: halfX - WALL_CLEARANCE, boundZ: halfZ - WALL_CLEARANCE };
+}
+
+/**
+ * The FURNITURE PLACEMENT box — deliberately 1 m inside each wall, i.e. a half
+ * metre tighter than the walkable box, and unchanged by the walkable widening.
+ *
+ * Keeping these two separate matters. Opening the outer ring to WALKING is the
+ * point of the change; opening it to PLACEMENT would buy nothing and break
+ * things:
+ *  - it buys nothing for real furniture, because every FURNITURE_DEFS footprint
+ *    declares integer tile extents and snapItemPos snaps them to an integer
+ *    lattice, so every candidate AABB has integer edges — the largest edge
+ *    inside ±5.5 is still ±5.0, exactly this bound;
+ *  - it actively breaks the EXTENT-LESS kinds (footprint: null — rugs, cherry
+ *    trees, wall decor), which are bounds-checked at their ORIGIN POINT with no
+ *    AABB to catch their real size. Wall-hung photo decor documents its
+ *    dependence on this exact number (see PhotoDecorSpec.zOff in furniture.ts:
+ *    a 0.95 m reach parks the plane on the wall face only because the origin is
+ *    clamped ≥1 m inside), and a rug or a tree canopy dropped at ±5.5 punches
+ *    through the hull;
+ *  - the door editor reserves a 1.0 m band into the room from each wall
+ *    (doorOpeningAabb) and refuses doors whose band hits furniture — but the
+ *    reverse test does not exist for extent-less items, since itemAabb returns
+ *    null for them. A tree dropped at the wall would sit inside the sliding
+ *    door leaves with no validator able to see it.
+ */
+export function roomPlaceBounds(): { boundX: number; boundZ: number } {
+  const { halfX, halfZ } = roomHalf;
+  return { boundX: halfX - 1.0, boundZ: halfZ - 1.0 };
+}
+
 /** Owner UI: set the room's rectangular size in 6 m tiles. Sanitized here as
  *  well as on read. Bumps meta.v→2 + minClient so a pre-rectangle client that
  *  loads a resized room is warned (it would render the legacy 2×2 walls). */
