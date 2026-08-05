@@ -169,7 +169,12 @@ export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
 
 /**
  * May `item` be placed at (pos, rot)? Checks, in order (plan §E3):
- *  1. footprint within the shared walkable box (roomWalkBounds)
+ *  1. bounds — within the shared PLACEMENT box (roomPlaceBounds: 1 m inside
+ *     each wall, ±5 in the default room, deliberately TIGHTER than the
+ *     walkable box). The footprint AABB is tested when the kind has one;
+ *     extent-less kinds are tested at their origin point instead; wall mounts
+ *     are exempt, because their origin sits on the wall plane and check 1b
+ *     owns their rules
  *  1b. 🖥️ wall-mounted panels (the room terminal): the panel must clear the
  *     doorways and windows on its wall and must not be hung inside another
  *     item — see wallMountVerdict
@@ -185,17 +190,22 @@ export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
  *  5. connectivity: flood-fill a scratch grid with the moved footprint
  *     applied — every requiredReachable point must stay reachable from the
  *     local player's cell
- *  6. 🖥️ self-approach: a DEVICE must keep a stand-point of its own. Its front
- *     is excluded from requiredReachable (it gets rebaked at the new spot), so
- *     without this a device could be walled into a pocket it can never be used
- *     from — and for the room terminal that means losing edit mode itself, the
- *     one surface that could undo the move.
+ *  6. 🖥️ self-approach, WALL MOUNTS ONLY: a hung panel must keep a stand-point
+ *     of its own. Its front is excluded from requiredReachable (it gets rebaked
+ *     at the new spot), so without this the room terminal could be hung where
+ *     it can be seen but never used — and that means losing edit mode itself,
+ *     the one surface that could undo the move. Floor-standing devices are NOT
+ *     gated here; the note at the check says why.
  *
  * The candidate box derives from the def footprint (footprintAabb), NOT a
  * per-item footprintOverride — a moved item sheds its legacy world-space
  * override on commit. Decorative items (footprint null — rugs, trees, pots)
- * skip the footprint-only checks 2–4: they never obstruct, so overlap and
- * player clearance are moot (E5 refines their layering/raycast niceties).
+ * get ONLY the bounds check and then return early: they never obstruct, so
+ * overlap, player clearance, stand-point clearance AND connectivity are all
+ * moot, and skipping the flood keeps them O(1) per carry frame (E5 refines
+ * their layering/raycast niceties). The one footprint-null kind that does not
+ * return early is the wall-mounted terminal: it skips 2–4 but still runs 1b,
+ * 5 and 6.
  *
  * Pure: reads FURNITURE for the other items' current boxes, mutates nothing.
  */
@@ -317,17 +327,31 @@ export function validatePlacement(
   //    the one surface that could undo the move.
   //
   //    Scoped to wall mounts on purpose. The same wedge is possible for the
-  //    FLOOR-standing devices (map table, storage trunk, game table), but that
-  //    is pre-existing behaviour and widening the gate to them risks refusing
-  //    placements those items accept today — including their own current
-  //    spots. Worth a follow-up; not smuggled into this change.
+  //    FLOOR-standing devices (map table, storage trunk, game table, the casino
+  //    tables, the clone vat, the helm console), but that is pre-existing
+  //    behaviour and belongs in its own change.
   //
-  //    No predicate mismatch here: a wall mount has no AABB, so computeFront
-  //    returns the preferred point unchanged and cannot fall back to a
-  //    different cell than the post-commit buildDeviceList picks.
-  const ownFront = deviceFrontFor(item.kind, pos, rot, box, isReachable);
-  if (ownFront && !isReachable(ownFront.x, ownFront.z)) {
-    return { ok: false, reason: 'nothing could stand in front of it there' };
+  //    The guard is load-bearing, not just a scoping preference — it is what
+  //    keeps this check SOUND. A wall mount has no AABB, and computeFront
+  //    returns the preferred point unchanged when aabb is null, under ANY
+  //    predicate, so this gate and the post-commit buildDeviceList necessarily
+  //    resolve the SAME point. A footprint device does have an AABB, and there
+  //    the two disagree: this gate resolves the front against `isReachable`
+  //    while buildDeviceList resolves it against `walkable`, a strict superset.
+  //    A preferred front that is walkable-but-sealed therefore makes the gate
+  //    fall back to some other reachable cell and PASS, while the commit keeps
+  //    the sealed preferred point — approving the exact state the check exists
+  //    to refuse. Widening to floor devices means fixing that first (predict
+  //    the front against the scratch WALKABLE grid, then test reachability),
+  //    which needs computeReachable to expose the grid it bakes internally.
+  if (isWallMounted(item.kind)) {
+    // `box` is null here by construction (wall-mounted kinds declare
+    // footprint: null); it is passed through so this call reads as literally
+    // the same derivation buildDeviceList performs.
+    const ownFront = deviceFrontFor(item.kind, pos, rot, box, isReachable);
+    if (ownFront && !isReachable(ownFront.x, ownFront.z)) {
+      return { ok: false, reason: 'nothing could stand in front of it there' };
+    }
   }
 
   return { ok: true };
@@ -338,11 +362,12 @@ export function validatePlacement(
  * unchanged when its own cell is already walkable.
  *
  * computeReachable documents that flooding from a blocked cell makes EVERY
- * cell read unreachable — and both consumers fail open on that, silently:
- * collectRequiredReachable returns an empty required-points set (so the
- * connectivity gate stops protecting anything and a large item can be dropped
- * across the only corridor, tinted green), while validatePlacement check 6
- * refuses every position for a device.
+ * cell read unreachable — and both consumers break on that silently, in
+ * OPPOSITE directions: collectRequiredReachable fails OPEN, returning an empty
+ * required-points set (so the connectivity gate stops protecting anything and
+ * a large item can be dropped across the only corridor, tinted green), while
+ * validatePlacement check 6 fails CLOSED, refusing every position for a wall
+ * mount.
  *
  * The player can genuinely stand on a blocked cell: the manual-movement clamp
  * stops them at exactly ±bound, and bound is always a multiple of 0.5 — i.e. a
@@ -350,9 +375,13 @@ export function validatePlacement(
  * grid bake marks blocked. Walking flush into the east or south wall and then
  * opening edit mode was enough to trigger it.
  *
- * The search is a widening ring over cell centres, so the substitute is the
- * nearest walkable cell in any direction (and the caller's own position, being
- * inside the room, always has one within a cell or two).
+ * The search is a widening Chebyshev ring over cell centres, each ring scanned
+ * in raster order, returning the first walkable hit — so the substitute comes
+ * from the smallest ring that has one, though not necessarily the nearest by
+ * straight-line distance (a diagonal at 0.71 m is taken over an orthogonal
+ * neighbour at 0.50 m). Immaterial here: every cell in the same connected
+ * component floods identically, and the caller's own position, being inside
+ * the room, always has a walkable cell within a ring or two.
  */
 function nudgeToWalkable(p: { x: number; z: number }): { x: number; z: number } {
   const row = worldToRow(p.z), col = worldToCol(p.x);
@@ -368,23 +397,42 @@ function nudgeToWalkable(p: { x: number; z: number }): { x: number; z: number } 
       }
     }
   }
-  return p; // nothing walkable nearby — the caller's checks fail closed
+  // Nothing walkable within 6 rings — hand back the blocked point. Per the note
+  // above this is the silent-failure case, and it is asymmetric: the required-
+  // points set comes back EMPTY, so checks 4 and 5 iterate nothing and pass
+  // trivially (the connectivity gate protects nothing and tints green); only
+  // check 6 fails closed, and only for a wall mount. Unreachable in practice —
+  // the search covers ~3 m in every direction from a point inside the room.
+  return p;
 }
 
 /**
  * 🖥️ The wall-mount half of the drop gate — a no-op verdict for every kind
  * that isn't wall-mounted. A hung panel is not an obstacle, so none of the
  * footprint machinery applies to it; what it CAN do is end up somewhere
- * nonsensical, and these are the three ways:
+ * nonsensical.
+ *
+ * Rule 0 comes first and pins the pose to the wall its rot names:
+ * validatePlacement exempts wall mounts from the interior bounds check, so
+ * nothing else does, and every clearance test below measures against THAT
+ * wall. Past that, these are the four ways:
  *
  *  1. across a DOORWAY — it would sit in the sliding leaves and the keypad.
  *     Measured against the live door set (currentDoorOpenings), so it tracks
  *     doors the owner has since added, moved or deleted;
  *  2. over a WINDOW — the same conflict the door editor already guards from
  *     the other side (validateDoorPlacement check 4), same 0.4 m margin;
- *  3. INSIDE another piece of furniture — flush against the bar's back panel,
- *     buried in the fireplace bookcase. Tested with the panel's swept slab
- *     (wallMountBox) against the other items' real footprints;
+ *  3. INSIDE another piece of furniture — the wall-flush pieces, whose boxes
+ *     reach the wall plane: the bar's cabinet and shelf stack on the east
+ *     wall, the storage trunk and game table on the south. Tested with the
+ *     panel's swept slab (wallMountBox — the wall plane, inset 0.03 and 0.15
+ *     deep either side) against the other items' itemAabb boxes. Note the
+ *     reach of this rule: the gate caps every PLACED footprint at
+ *     roomPlaceBounds (±5.0), a full 0.82 m short of the slab, so only
+ *     hand-authored seed poses can ever trip it. It relies on those boxes
+ *     being honest — the bar's legacy stool-strip override stopped at x=5.0
+ *     while its mesh really reaches x=6.0, which hid it from this rule
+ *     entirely until the override was dropped;
  *  4. somewhere it can be SEEN but never USED. Its stand-point is a fixed 1 m
  *     straight out from the panel, on the same 0.5 m lattice the wall snap
  *     uses, so it lands on a furniture edge remarkably often — an armchair at

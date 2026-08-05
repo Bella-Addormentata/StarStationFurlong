@@ -270,8 +270,17 @@ export interface FurnitureDef {
    *
    * `halfW` is the panel's half-width along the wall. It is only used for the
    * clearance checks (doorways, windows, other furniture): a wall-mounted kind
-   * keeps `footprint: null` and never becomes an obstacle, because it hangs
-   * above head height and nothing walks into it.
+   * keeps `footprint: null` and never becomes an obstacle.
+   *
+   * NOT because it is out of reach vertically — the terminal's housing spans
+   * y 1.25–1.95 (WC_Y 1.6 ± WC_H/2), squarely at head height, and deliberately
+   * at its own device eye level (y 1.45): it is a screen you stand and look at.
+   * What keeps it clear is plan-view geometry. It flush-mounts WALL_MOUNT_INSET
+   * (0.03 m) inside the wall plane and reaches only ~0.1 m into the room, while
+   * WALL_CLEARANCE (0.5 m) holds every walker's centre off that plane — so
+   * there is ~0.4 m of air in front of the panel and nothing can path or clamp
+   * into it. Shrinking WALL_CLEARANCE, or adding a wall kind that protrudes
+   * further, is what would break this; mounting height has nothing to do with it.
    */
   wallMount?: { halfW: number };
 }
@@ -5534,7 +5543,23 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 0,
     movable: true,
   },
-  // Bar obstacle covers the 1x2-tile stool strip (parity with original list).
+  // 🍸 The E1 legacy footprintOverride is GONE, so the def footprint (2×3 ⇒
+  // x[4.24,6.24] z[1.6,4.6]) now applies from the start instead of only after
+  // the bar's first move. The override described the 1×2-tile STOOL STRIP
+  // (x[4,5] z[3,5]) rather than the bar itself, whose mesh runs x[4.40,6.00]
+  // z[1.61,4.59] — counter, cabinet, back panel and shelf stack. That was
+  // harmless while the walkable floor stopped at ±5.0, because everything the
+  // override missed was outside the walkable box anyway. Opening the outer
+  // ring (roomWalkBounds) moved the boundary to ±5.5 and left five cells —
+  // (5.25, 1.75) through (5.25, 4.25) — walkable INSIDE the cabinet, so the
+  // avatar could stroll through the bar. The def footprint is the honest box
+  // and is what the item would have got the moment anyone moved it.
+  //
+  // It also closes a false negative in the wall-mount gate: the terminal's
+  // panel slab reaches x=6.12 on the east wall, which the old override
+  // (x1=5.0) could not see, so the room terminal could be hung inside the
+  // bar's shelves at z≈1.5–2.5. The honest box overlaps the slab and refuses.
+  //
   // movable:true completes the v0.32.11 "movable bar" migration — the
   // MOVABLE_KIND_OVERRIDE (furnitureDoc.ts) only reaches doc READS; edit
   // mode's raycast index consults THIS registry default (stools/bottles/
@@ -5545,7 +5570,6 @@ export const FURNITURE: FurnitureItem[] = [
     pos: { x: 5.24, z: 3.1 },
     rot: 0,
     movable: true,
-    footprintOverride: { x0: 4.0, z0: 3.0, x1: 5.0, z1: 5.0 },
   },
   {
     id: "lamp-table-back-left",

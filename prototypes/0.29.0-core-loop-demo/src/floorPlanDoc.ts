@@ -271,13 +271,16 @@ function recomputeRoomHalf(): void {
 }
 
 /**
- * 🧍 Clearance the avatar (and interior furniture) keeps from each wall plane,
- * in metres — the ONE number that decides how much of the rendered floor is
- * actually usable.
+ * 🧍 Clearance the AVATAR keeps from each wall plane, in metres — the one
+ * number that decides how much of the rendered floor is actually WALKABLE.
+ * Furniture placement is a separate and deliberately tighter number:
+ * roomPlaceBounds() below stays at 1 m and this constant does not touch it.
  *
- * It used to be 1.0 m, spread across three call sites that each re-derived it
- * (grid bake, player clamp, placement gate) with slightly different values.
- * At 0.5 m cell centres that put the outermost WALKABLE cell centre at
+ * It replaces five call sites that each re-derived their own wall margin, at
+ * three different values: the A* grid bake and computeReachable at half−1.0
+ * (pathfinding), the player and NPC movement clamps at half−0.8 (player.ts,
+ * npc.ts), and the first-person door threshold at half−0.85 (world.ts).
+ * At 0.5 m cell centres the old grid bound put the outermost WALKABLE cell at
  * ±(half−1.25) while the floor mesh, the click plane and the edit grid all
  * render out to ±half — so the entire outer ring of grid tiles was drawn,
  * clickable-looking, and permanently dead. 0.5 m opens that ring: the
