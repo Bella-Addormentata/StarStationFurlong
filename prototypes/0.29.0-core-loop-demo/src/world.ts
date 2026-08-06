@@ -3695,14 +3695,28 @@ export class World {
     const seatHere = seated
       ? (SEATS.find((s) => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35) ?? null)
       : null;
+    const priorAvatar = this.remotePlayers.get(id);
     const elevY = seatHere
       ? seatHere.sitY
       : swimming
         ? POOL_SWIM_Y
         : elevated
           ? BUNK_TOP_Y
-          : 0;
-    const avatar = this.remotePlayers.get(id);
+          : // 🪑 Seated but the seat lookup missed. Do NOT fall to the floor:
+            // isSeated() is true from the first frame of the SIT_DOWN slide, so
+            // the sender flags "seated" while its broadcast x/z is still a metre
+            // or more from the seat's sit point — well outside the 0.35 m match
+            // radius. Dropping to 0 there made the replica sit on the floor for
+            // most of the slide and then pop up at the end, and it dropped a
+            // settled peer to the floor whenever the two clients' SEATS lists
+            // disagreed (furniture doc still loading, a mid-drag edit). Holding
+            // the last known height keeps the replica where it was until a real
+            // seat match or a stand-up (seated=false) resolves it. Invisible
+            // before chairs carried a real sitY, since every value was 0.
+            seated && priorAvatar
+            ? priorAvatar.elevY
+            : 0;
+    const avatar = priorAvatar;
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
       // Parent the rig to the same scene the local player's rig lives in

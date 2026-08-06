@@ -65,7 +65,7 @@
 import * as THREE from "three";
 import { InputManager } from "./input";
 import { updateDebugHUD, showHint } from "./hud";
-import { VoxelCharacter } from "./voxelCharacter";
+import { VoxelCharacter, POSE_ROOT_Y, STAND_ROOT_Y } from "./voxelCharacter";
 import { WaypointReticle } from "./waypoint";
 import { findPath, worldToCol, worldToRow } from "./pathfinding";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -87,6 +87,13 @@ import type { DeviceTarget, DeviceFocusHooks } from "./devices";
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
 /** Collision radius — exported for the E3 move-furniture player-overlap check. */
 export const PLAYER_R = 0.38;
+
+/**
+ * 👁️ First-person eye height above the mesh root while STANDING. The historical
+ * zoom.ts literal, kept as the reference the seated offsets are measured from
+ * (see Player.getEyeOffset).
+ */
+export const STAND_EYE_OFFSET = 1.25;
 
 const SNAP_INCREMENT = Math.PI / 4;
 
@@ -995,6 +1002,26 @@ export class Player {
    */
   public getSeatedY(): number {
     return this.isSeated() && this.sitTarget ? this.sitTarget.sitY : 0;
+  }
+
+  /**
+   * 👁️ Eye height ABOVE the mesh root, for the first-person camera.
+   *
+   * Not a constant, because the rig's head is not at a fixed height above the
+   * root: each pose sets its own rootY (voxelCharacter STATES) and the whole
+   * skeleton hangs off it, so a seated fox's head is (STAND_ROOT_Y − poseRootY)
+   * lower than a standing one's. zoom.ts used a flat 1.25, which was invisible
+   * only while every chair sat at mesh y 0 — the two errors cancelled. Now that
+   * chairs carry a real sitY the camera would float ~0.6 m above the head, so
+   * the offset has to track the pose the way the rig does.
+   *
+   * Seats that use a different pose get its drop: `lie` (bunks) uses 'sleep',
+   * `swim` uses 'swim'. The dive pose is transient and keeps the standing eye.
+   */
+  public getEyeOffset(): number {
+    if (!this.isSeated() || !this.sitTarget) return STAND_EYE_OFFSET;
+    const pose = this.sitTarget.swim ? 'swim' : this.sitTarget.lie ? 'sleep' : 'sit_chair';
+    return STAND_EYE_OFFSET - (STAND_ROOT_Y - POSE_ROOT_Y[pose]);
   }
 
   /**

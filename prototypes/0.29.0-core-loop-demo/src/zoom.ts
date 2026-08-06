@@ -21,10 +21,26 @@ import * as THREE from 'three';
 import { setExteriorActive } from './exteriorView';
 import { isDeviceFocusActive } from './deviceFocus';
 import { rotateIsoOffset } from './cameraRig';
+import { STAND_EYE_OFFSET } from './player';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
 // so every level snap below lands on whatever angle the player rotated to.
+/**
+ * 👁️ First-person eye height above the player's mesh root.
+ *
+ * Delegates to the Player, which knows the active pose: the rig hangs off a
+ * per-pose rootY, so a seated fox's head sits lower relative to its mesh root
+ * than a standing one's. A flat 1.25 was correct only while every chair left
+ * the mesh root on the floor and the two errors cancelled; chairs now carry a
+ * real sitY, so the camera has to follow the pose. Falls back to the standing
+ * offset whenever the player handle is not up yet.
+ */
+function eyeOffset(): number {
+  const p = (window as any).world?.getPlayer?.();
+  return typeof p?.getEyeOffset === 'function' ? p.getEyeOffset() : STAND_EYE_OFFSET;
+}
+
 const ISO_BASE_L2 = new THREE.Vector3(22, 26, 22);
 const ISO_BASE_L3 = new THREE.Vector3(34, 38, 34);
 const ISO_BASE_L4 = new THREE.Vector3(48, 54, 48);
@@ -450,8 +466,11 @@ export class MultiScaleZoomView {
 
           rotateIsoOffset(ISO_BASE_L2, transitionStartPos).add(playerPos);
 
-          // Target is the eye position of the clone (Y=1.25) looking slightly ahead
-          transitionTargetPos.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
+          // 👁️ Target is the clone's EYE. The offset tracks the rig's pose
+          // rather than assuming the standing skeleton — a seated fox's head
+          // is lower relative to its mesh root, and its mesh root is now up on
+          // the cushion (Player.getEyeOffset).
+          transitionTargetPos.set(playerPos.x, playerPos.y + eyeOffset(), playerPos.z);
         }
       }
       this.currentLevel--;
@@ -589,8 +608,9 @@ export class MultiScaleZoomView {
           perspectiveCamera.position.copy(currentPos);
 
           // Smoothly look at the back of the head during initial approach, then shift to yaw orientation
+          const eyeY = playerPos.y + eyeOffset();
           const lookStart = new THREE.Vector3(playerPos.x, playerPos.y + 0.6, playerPos.z);
-          const lookEnd = new THREE.Vector3(playerPos.x + Math.sin(yaw) * Math.cos(pitch), playerPos.y + 1.25 + Math.sin(pitch), playerPos.z + Math.cos(yaw) * Math.cos(pitch));
+          const lookEnd = new THREE.Vector3(playerPos.x + Math.sin(yaw) * Math.cos(pitch), eyeY + Math.sin(pitch), playerPos.z + Math.cos(yaw) * Math.cos(pitch));
           const currentLookTarget = new THREE.Vector3().lerpVectors(lookStart, lookEnd, ratio);
           perspectiveCamera.lookAt(currentLookTarget);
 
@@ -610,11 +630,12 @@ export class MultiScaleZoomView {
             });
           }
         } else {
-          perspectiveCamera.position.set(playerPos.x, playerPos.y + 1.25, playerPos.z);
-          
+          const fpEyeY = playerPos.y + eyeOffset();
+          perspectiveCamera.position.set(playerPos.x, fpEyeY, playerPos.z);
+
           // Calculate target looking point based on yaw and pitch
           const targetX = playerPos.x + Math.sin(yaw) * Math.cos(pitch);
-          const targetY = playerPos.y + 1.25 + Math.sin(pitch);
+          const targetY = fpEyeY + Math.sin(pitch);
           const targetZ = playerPos.z + Math.cos(yaw) * Math.cos(pitch);
 
           perspectiveCamera.lookAt(targetX, targetY, targetZ);

@@ -2354,12 +2354,42 @@ const buildGameTable = (ctx: BuildCtx) => {
 };
 
 // ── Definitions ───────────────────────────────────────────────────────────────
+/**
+ * 🪑 Seat-height helper: the sitY that puts an occupant's BACKSIDE on a seat
+ * surface `topY` metres above the floor.
+ *
+ * sitY is the avatar's MESH-ROOT height, not its contact height, and in the
+ * `sit_chair` pose the two differ by a fixed 0.125 m. The chain, all in
+ * voxelCharacter.ts: torso.y = rootY − 0.15, so sit_chair (rootY 0.5) puts the
+ * torso at root + 0.35; the leg groups hang at torso − 0.30, i.e. the hip
+ * pivots sit at root + 0.05; and legRotX = −π/2 swings each leg to horizontal,
+ * which maps the leg's LOCAL Z extent to vertical — so the thigh cylinder's
+ * hip-end radius (0.175) becomes the drop from pivot to thigh underside.
+ *   0.05 − 0.175 = −0.125.
+ * Measured on the running rig to confirm: hip pivots at world y 0.050 with a
+ * mesh y of 0, exactly as above.
+ *
+ * The pose is authored as a FLOOR sit (contact 0.125 m BELOW the mesh root),
+ * which is why every chair that omitted sitY sank its occupant to the floor —
+ * the reported bug. Do NOT fix that by raising STATES.sit_chair.rootY: the hot
+ * tub (0.28) and both dive boards (4.55) share this pose and are already tuned
+ * against the current value, so the correction belongs per-seat, here.
+ */
+const SIT_CONTACT_DROP = 0.125;
+const seatOn = (topY: number): number => +(topY + SIT_CONTACT_DROP).toFixed(3);
+
+/** Armchair + sofa cushion tops: a 0.13-tall pad centred at y 0.39 over the
+ *  0.24-tall base slab (buildArmchair / buildSofa3). Verified against the
+ *  built meshes in the running room, not just the source. */
+const SOFT_SEAT_TOP = 0.455;
+
 const armchairLeftSeats: SeatTemplate[] = [
   {
     clickBox: { x0: -0.5, z0: -0.5, x1: 0.5, z1: 0.5 },
     front: { x: 1.0, z: 0 },
     sit: { x: 0, z: 0 },
     faceAngle: Math.PI / 2,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
 ];
 const armchairRightSeats: SeatTemplate[] = [
@@ -2368,6 +2398,7 @@ const armchairRightSeats: SeatTemplate[] = [
     front: { x: -1.0, z: 0 },
     sit: { x: 0, z: 0 },
     faceAngle: -Math.PI / 2,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
 ];
 // Back sofa: 3 cushions, faces +z (toward the entrance).
@@ -2377,18 +2408,21 @@ const sofaBackSeats: SeatTemplate[] = [
     front: { x: -1.0, z: 1.0 },
     sit: { x: -1.0, z: 0 },
     faceAngle: 0,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
   {
     clickBox: { x0: -0.5, z0: -0.5, x1: 0.5, z1: 0.5 },
     front: { x: 0.0, z: 1.0 },
     sit: { x: 0.0, z: 0 },
     faceAngle: 0,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
   {
     clickBox: { x0: 0.5, z0: -0.5, x1: 1.5, z1: 0.5 },
     front: { x: 1.0, z: 1.0 },
     sit: { x: 1.0, z: 0 },
     faceAngle: 0,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
 ];
 // Front sofa: 2 wide halves, faces -z; fronts approach from the SIDES because
@@ -2399,14 +2433,21 @@ const sofaFrontSeats: SeatTemplate[] = [
     front: { x: -2.0, z: 0 },
     sit: { x: -1.0, z: 0 },
     faceAngle: Math.PI,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
   {
     clickBox: { x0: 0.0, z0: -0.5, x1: 1.5, z1: 0.5 },
     front: { x: 2.0, z: 0 },
     sit: { x: 1.0, z: 0 },
     faceAngle: Math.PI,
+    sitY: seatOn(SOFT_SEAT_TOP),
   },
 ];
+
+/** Casino booth cushion top: a 0.16-tall pad centred at y 0.45 over the
+ *  0.28-tall velvet bench slab (buildCasinoBooth) — a taller seat than the
+ *  lounge furniture, so it gets its own number. */
+const BOOTH_SEAT_TOP = 0.53;
 
 const casinoBoothSeats: SeatTemplate[] = [
   {
@@ -2414,12 +2455,14 @@ const casinoBoothSeats: SeatTemplate[] = [
     front: { x: -0.48, z: 1.0 },
     sit: { x: -0.48, z: 0.03 },
     faceAngle: 0,
+    sitY: seatOn(BOOTH_SEAT_TOP),
   },
   {
     clickBox: { x0: 0, z0: -0.5, x1: 1, z1: 0.5 },
     front: { x: 0.48, z: 1.0 },
     sit: { x: 0.48, z: 0.03 },
     faceAngle: 0,
+    sitY: seatOn(BOOTH_SEAT_TOP),
   },
 ];
 
