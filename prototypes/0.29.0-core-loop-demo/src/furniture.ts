@@ -2570,8 +2570,20 @@ export function isBridgeClick(
   );
 }
 const bunkBedSeats: SeatTemplate[] = [
+  // 🛏️ The bed splits down the middle of its LONG axis: the FOOT half — the end
+  // the ladder is on — claims the TOP berth, the HEAD half (pillow at local
+  // +0.62) claims the bottom one. Climb the ladder end to get up top.
+  //
+  // The foot zone used to be a 0.38 m strip against the very end of a 2 m bed
+  // (x[-1.0,-0.62]) — the right idea, but under a fifth of the bed, so in
+  // practice almost every click landed on the bottom berth and the top one was
+  // close to unreachable. An even half is a target you can actually hit.
+  //
+  // Order still matters: findSeatAt returns the FIRST clickBox containing the
+  // point, and the two boxes share the x=0 edge, so listing TOP first makes
+  // that seam resolve deterministically upward.
   {
-    clickBox: { x0: -1.0, z0: -0.5, x1: -0.62, z1: 0.5 },
+    clickBox: { x0: -1.0, z0: -0.5, x1: 0.0, z1: 0.5 },
     front: { x: -1.5, z: 0 },
     sit: { x: 0.05, z: 0 },
     faceAngle: -Math.PI / 2,
@@ -2579,7 +2591,7 @@ const bunkBedSeats: SeatTemplate[] = [
     lie: true,
   },
   {
-    clickBox: { x0: -0.62, z0: -0.5, x1: 1.0, z1: 0.5 },
+    clickBox: { x0: 0.0, z0: -0.5, x1: 1.0, z1: 0.5 },
     front: { x: -1.5, z: 0 },
     sit: { x: 0.05, z: 0 },
     faceAngle: -Math.PI / 2,

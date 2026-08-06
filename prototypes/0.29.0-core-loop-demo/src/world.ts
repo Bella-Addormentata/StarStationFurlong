@@ -3692,9 +3692,22 @@ export class World {
     // sitY (4.55 dive board, -0.20 pool water, 1.32 top bunk). The old
     // elevated/swim bits stay as fallbacks for a transiently out-of-sync
     // seat list (e.g. furniture doc still loading on this end).
-    const seatHere = seated
-      ? (SEATS.find((s) => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35) ?? null)
-      : null;
+    // 🛏️ Several seats can share ONE sit point: both bunk berths lie at the
+    // same x/z and differ only in sitY (1.32 vs 0.32), because they are stacked.
+    // Matching on distance alone always returned the first — the TOP berth — so
+    // a peer in the BOTTOM bunk rendered a metre too high, inside the upper
+    // mattress. The `elevated` wire bit exists precisely to break that tie
+    // (main.ts sets it from getSeatedY() > 0.8, which separates 1.32 from 0.32
+    // cleanly), so consult it whenever the match is ambiguous. It was dead code
+    // before: the lookup consumed every case and the bit was only ever reached
+    // as an else-branch.
+    const nearby = seated
+      ? SEATS.filter((s) => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35)
+      : [];
+    const seatHere =
+      nearby.length > 1
+        ? (nearby.find((s) => s.sitY > 0.8 === elevated) ?? nearby[0])
+        : (nearby[0] ?? null);
     const priorAvatar = this.remotePlayers.get(id);
     const elevY = seatHere
       ? seatHere.sitY
