@@ -99,6 +99,21 @@ const STATES: Record<CharacterState, PoseState> = {
   dive:       { rootY: 0.9,  legRotX: 0,             armRotX: -Math.PI * 0.85, bodyRotX: Math.PI * 0.45 },
 };
 
+/**
+ * 👁️ Per-pose root heights, published so callers that place things RELATIVE to
+ * the rig's head (the first-person camera) can track the pose instead of
+ * assuming the standing skeleton. The whole rig hangs off rootY, so a pose
+ * that lowers it lowers the head by exactly the same amount.
+ */
+export const POSE_ROOT_Y: Readonly<Record<CharacterState, number>> = Object.freeze(
+  Object.fromEntries(
+    (Object.keys(STATES) as CharacterState[]).map((k) => [k, STATES[k].rootY]),
+  ) as Record<CharacterState, number>,
+);
+
+/** The standing root height every other pose is measured against. */
+export const STAND_ROOT_Y = STATES.idle.rootY;
+
 /** Snap a continuous angle to the nearest of 8 compass directions (π/4 steps). */
 export function snapTo8Ways(angle: number): number {
   const PI_4 = Math.PI / 4;

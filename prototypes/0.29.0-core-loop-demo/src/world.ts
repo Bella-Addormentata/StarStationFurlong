@@ -3615,17 +3615,44 @@ export class World {
     // sitY (4.55 dive board, -0.20 pool water, 1.32 top bunk). The old
     // elevated/swim bits stay as fallbacks for a transiently out-of-sync
     // seat list (e.g. furniture doc still loading on this end).
-    const seatHere = seated
-      ? (SEATS.find((s) => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35) ?? null)
-      : null;
+    // 🛏️ Several seats can share ONE sit point: both bunk berths lie at the
+    // same x/z and differ only in sitY (1.32 vs 0.32), because they are stacked.
+    // Matching on distance alone always returned the first — the TOP berth — so
+    // a peer in the BOTTOM bunk rendered a metre too high, inside the upper
+    // mattress. The `elevated` wire bit exists precisely to break that tie
+    // (main.ts sets it from getSeatedY() > 0.8, which separates 1.32 from 0.32
+    // cleanly), so consult it whenever the match is ambiguous. It was dead code
+    // before: the lookup consumed every case and the bit was only ever reached
+    // as an else-branch.
+    const nearby = seated
+      ? SEATS.filter((s) => Math.hypot(s.sit.x - x, s.sit.z - z) < 0.35)
+      : [];
+    const seatHere =
+      nearby.length > 1
+        ? (nearby.find((s) => s.sitY > 0.8 === elevated) ?? nearby[0])
+        : (nearby[0] ?? null);
+    const priorAvatar = this.remotePlayers.get(id);
     const elevY = seatHere
       ? seatHere.sitY
       : swimming
         ? POOL_SWIM_Y
         : elevated
           ? BUNK_TOP_Y
-          : 0;
-    const avatar = this.remotePlayers.get(id);
+          : // 🪑 Seated but the seat lookup missed. Do NOT fall to the floor:
+            // isSeated() is true from the first frame of the SIT_DOWN slide, so
+            // the sender flags "seated" while its broadcast x/z is still a metre
+            // or more from the seat's sit point — well outside the 0.35 m match
+            // radius. Dropping to 0 there made the replica sit on the floor for
+            // most of the slide and then pop up at the end, and it dropped a
+            // settled peer to the floor whenever the two clients' SEATS lists
+            // disagreed (furniture doc still loading, a mid-drag edit). Holding
+            // the last known height keeps the replica where it was until a real
+            // seat match or a stand-up (seated=false) resolves it. Invisible
+            // before chairs carried a real sitY, since every value was 0.
+            seated && priorAvatar
+            ? priorAvatar.elevY
+            : 0;
+    const avatar = priorAvatar;
     if (!avatar) {
       console.log(`🤖 Spawning remote player fox avatar: ${id}`);
       // Parent the rig to the same scene the local player's rig lives in
