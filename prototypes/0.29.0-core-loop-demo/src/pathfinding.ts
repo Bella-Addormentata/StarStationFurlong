@@ -15,7 +15,7 @@
 
 import { OBSTACLES } from './obstacles';
 import type { Box } from './obstacles';
-import { roomHalfExtents, ROOM_TILE_MAX, TILE_SIZE } from './floorPlanDoc';
+import { roomWalkBounds, ROOM_TILE_MAX, TILE_SIZE } from './floorPlanDoc';
 
 // ── Grid constants ────────────────────────────────────────────────────────────
 /** World-space size of each grid cell (metres) */
@@ -25,7 +25,7 @@ export const CELL_SIZE = 0.5;
  *  margin, so `GRID_HALF`-as-origin-offset and the `r·GRID_SIZE+c` key math
  *  stay valid on both axes for any room up to the limit. Cells outside the
  *  CURRENT room's walkable box are simply baked blocked (see rebakeWalkableGrid).
- *  Default 2×2 room: only the ±5 cells are walkable, so A* cost is unchanged. */
+ *  Default 2×2 room: only the ±5.5 cells are walkable, so A* cost is unchanged. */
 const MAX_HALF = (ROOM_TILE_MAX * TILE_SIZE) / 2; // 15 m at 5×5 tiles
 /** Number of cells along each axis (covers ±(MAX_HALF+1) m, rounded to even). */
 export const GRID_SIZE = 2 * Math.ceil((MAX_HALF + 1) / CELL_SIZE);
@@ -47,10 +47,11 @@ export const walkable: boolean[][] = [];
 
 /** Re-bake the walkable grid from the current OBSTACLES list, in place. */
 export function rebakeWalkableGrid(): void {
-  // Walkable box = 1 m inside each wall, per axis (walls at ±half ⇒ ±(half−1)).
-  // Default 2×2 room: half=6 ⇒ ±5.0, exactly the legacy boundary.
-  const { halfX, halfZ } = roomHalfExtents();
-  const boundX = halfX - 1.0, boundZ = halfZ - 1.0;
+  // Walkable box = WALL_CLEARANCE inside each wall, per axis (floorPlanDoc —
+  // the shared source the player/npc clamps and the placement gate also read).
+  // Default 2×2 room: half=6 ⇒ ±5.5, so the outermost cell centres (±5.25)
+  // are walkable and the floor's outer ring is no longer dead space.
+  const { boundX, boundZ } = roomWalkBounds();
   for (let row = 0; row < GRID_SIZE; row++) {
     const cells = walkable[row] ?? (walkable[row] = []);
     for (let col = 0; col < GRID_SIZE; col++) {
@@ -221,7 +222,7 @@ export function findPath(
  * candidate furniture layout can be probed without committing it.
  *
  * The scratch bake uses the exact rebakeWalkableGrid() rules (cell-centre
- * containment + the ±5.0 room boundary) and the flood fill expands with the
+ * containment + the roomWalkBounds() boundary) and the flood fill expands with the
  * same 8-directional + corner-cut rule as findPath (a diagonal step requires
  * both flanking cardinal cells to be walkable), so "reachable" here means
  * precisely "A* could route there".
@@ -236,8 +237,7 @@ export function computeReachable(
   startZ: number,
 ): boolean[][] {
   // Bake the scratch walkable grid (same rules as rebakeWalkableGrid).
-  const { halfX, halfZ } = roomHalfExtents();
-  const boundX = halfX - 1.0, boundZ = halfZ - 1.0;
+  const { boundX, boundZ } = roomWalkBounds();
   const scratch: boolean[][] = [];
   for (let row = 0; row < GRID_SIZE; row++) {
     const cells: boolean[] = [];

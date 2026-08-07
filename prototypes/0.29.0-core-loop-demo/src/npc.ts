@@ -4,7 +4,7 @@
  */
 import * as THREE from 'three';
 import { InputManager } from './input';
-import { roomHalfExtents } from './floorPlanDoc';
+import { roomWalkBounds } from './floorPlanDoc';
 
 const W = 160, H = 240;
 
@@ -103,11 +103,11 @@ export class NPC {
   private view: 'front'|'back'|'side' = 'front';
   private readonly SPEED = 2.2;
 
-  /** Movement clamp: 0.8 m inside each wall, per axis (walls at ±half).
-   *  🧱 #66 R1 — default 2×2 room ⇒ ±5.2, the legacy BOUND scalar. */
+  /** Movement clamp — the shared walkable box (floorPlanDoc.roomWalkBounds),
+   *  same as the player's. NPCs path on the same grid, so a looser or tighter
+   *  clamp here would strand them against the boundary cells. */
   private roomBounds(): { boundX: number; boundZ: number } {
-    const { halfX, halfZ } = roomHalfExtents();
-    return { boundX: halfX - 0.8, boundZ: halfZ - 0.8 };
+    return roomWalkBounds();
   }
 
   // Sit state

@@ -56,7 +56,12 @@
  */
 
 import * as THREE from 'three';
-import { FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos } from './furniture';
+import {
+  FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos,
+  // 🖥️ Interior wall mounts (the room terminal).
+  isWallMounted, snapInteriorWall, wallMountBox, wallMountHalfWidth,
+  wallOfMountRot, isRoomTerminalKind, deviceFrontFor,
+} from './furniture';
 // 🛰️ Hull space (exterior mounts + stacking) — moved out of furniture.ts.
 import {
   snapExteriorPos, validateExteriorPlacement, isExteriorPos,
@@ -64,9 +69,12 @@ import {
 } from './hull';
 import type { FurnitureItem, Rot, Box } from './furniture';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
-import { computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE, worldToCol, worldToRow } from './pathfinding';
 import {
-  roomHalfExtents, doorLateralLimitForWall, readDoorDeltas,
+  computeReachable, rebakeWalkableGrid, walkable, GRID_SIZE,
+  worldToCol, worldToRow, colToWorld, rowToWorld,
+} from './pathfinding';
+import {
+  roomHalfExtents, roomPlaceBounds, doorLateralLimitForWall, readDoorDeltas,
   seedFloorPlan, writeDoorPlacement, lateralOf, LEGACY_PLACEMENTS,
 } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
@@ -161,7 +169,15 @@ export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
 
 /**
  * May `item` be placed at (pos, rot)? Checks, in order (plan §E3):
- *  1. footprint within the [−5,5]² walkable bounds
+ *  1. bounds — within the shared PLACEMENT box (roomPlaceBounds: 1 m inside
+ *     each wall, ±5 in the default room, deliberately TIGHTER than the
+ *     walkable box). The footprint AABB is tested when the kind has one;
+ *     extent-less kinds are tested at their origin point instead; wall mounts
+ *     are exempt, because their origin sits on the wall plane and check 1b
+ *     owns their rules
+ *  1b. 🖥️ wall-mounted panels (the room terminal): the panel must clear the
+ *     doorways and windows on its wall and must not be hung inside another
+ *     item — see wallMountVerdict
  *  2. no AABB overlap with any OTHER item's current footprint (touching
  *     edges are fine — the trunk sits flush against the hearth by design)
  *  3. no player inside the footprint inflated by PLAYER_R (0.38)
@@ -174,12 +190,22 @@ export type PlacementVerdict = { ok: true } | { ok: false; reason: string };
  *  5. connectivity: flood-fill a scratch grid with the moved footprint
  *     applied — every requiredReachable point must stay reachable from the
  *     local player's cell
+ *  6. 🖥️ self-approach, WALL MOUNTS ONLY: a hung panel must keep a stand-point
+ *     of its own. Its front is excluded from requiredReachable (it gets rebaked
+ *     at the new spot), so without this the room terminal could be hung where
+ *     it can be seen but never used — and that means losing edit mode itself,
+ *     the one surface that could undo the move. Floor-standing devices are NOT
+ *     gated here; the note at the check says why.
  *
  * The candidate box derives from the def footprint (footprintAabb), NOT a
  * per-item footprintOverride — a moved item sheds its legacy world-space
  * override on commit. Decorative items (footprint null — rugs, trees, pots)
- * only get the bounds check: they never obstruct, so overlap/connectivity
- * are moot (E5 refines their layering/raycast niceties).
+ * get ONLY the bounds check and then return early: they never obstruct, so
+ * overlap, player clearance, stand-point clearance AND connectivity are all
+ * moot, and skipping the flood keeps them O(1) per carry frame (E5 refines
+ * their layering/raycast niceties). The one footprint-null kind that does not
+ * return early is the wall-mounted terminal: it skips 2–4 but still runs 1b,
+ * 5 and 6.
  *
  * Pure: reads FURNITURE for the other items' current boxes, mutates nothing.
  */
@@ -200,76 +226,299 @@ export function validatePlacement(
 
   const box = footprintAabb(item.kind, pos, rot);
 
-  // Placement box: 1 m inside each wall (walls at ±half). 🧱 #66 R1 — default
-  // 2×2 room ⇒ {6,6} ⇒ ±5, the legacy literal.
-  const { halfX, halfZ } = roomHalfExtents();
-  const bX = halfX - 1, bZ = halfZ - 1;
+  // Placement box: 1 m inside each wall (floorPlanDoc.roomPlaceBounds —
+  // deliberately tighter than the WALKABLE box; that function explains why).
+  // 🧱 #66 R1 — default 2×2 room ⇒ {6,6} ⇒ ±5, the legacy literal.
+  const { boundX: bX, boundZ: bZ } = roomPlaceBounds();
 
-  // Decorative: bounds-only (position point inside the walkable square).
-  if (!box) {
+  // 1. Bounds — the footprint, or (decorative / wall-mounted) the origin point.
+  //    A wall-mounted panel's origin sits ON the wall plane, outside the
+  //    walkable box by construction, so it is exempt: snapInteriorWall already
+  //    clamps it to the wall and wallMountVerdict below owns its rules.
+  if (box) {
+    if (box.x0 < -bX || box.x1 > bX || box.z0 < -bZ || box.z1 > bZ) {
+      return { ok: false, reason: 'out of bounds' };
+    }
+  } else if (!isWallMounted(item.kind)) {
     if (pos.x < -bX || pos.x > bX || pos.z < -bZ || pos.z > bZ) {
       return { ok: false, reason: 'out of bounds' };
     }
-    return { ok: true };
   }
 
-  // 1. Bounds.
-  if (box.x0 < -bX || box.x1 > bX || box.z0 < -bZ || box.z1 > bZ) {
-    return { ok: false, reason: 'out of bounds' };
-  }
+  // 1b. 🖥️ Wall-mounted panel rules (doorways, windows, other furniture).
+  const wallVerdict = wallMountVerdict(item, pos, rot);
+  if (!wallVerdict.ok) return wallVerdict;
 
-  // 2. Overlap with every other item's CURRENT footprint.
-  for (const other of FURNITURE) {
-    if (other.id === item.id) continue;
-    const ob = itemAabb(other);
-    if (!ob) continue;
-    if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
-      return { ok: false, reason: `overlaps ${other.id}` };
+  if (box) {
+    // 2. Overlap with every other item's CURRENT footprint.
+    for (const other of FURNITURE) {
+      if (other.id === item.id) continue;
+      const ob = itemAabb(other);
+      if (!ob) continue;
+      if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+        return { ok: false, reason: `overlaps ${other.id}` };
+      }
+    }
+
+    // 3. Player clearance (footprint inflated by the collision radius).
+    for (const p of ctx.playerPositions) {
+      if (
+        p.x > box.x0 - PLAYER_R && p.x < box.x1 + PLAYER_R &&
+        p.z > box.z0 - PLAYER_R && p.z < box.z1 + PLAYER_R
+      ) {
+        return { ok: false, reason: 'a player is in the way' };
+      }
+    }
+
+    // 4. Stand-point clearance (review F1): the FINE approach phases need to
+    //    land within 0.06 of the EXACT front point while resolveObstacles
+    //    keeps the player PLAYER_R away from every box — a candidate whose
+    //    inflated extent swallows a protected front point is physically
+    //    un-standable even when the point's grid cell stays walkable
+    //    (concrete pre-fix wedge: armchair at (2.5,4.5) put its edge 0.03 m
+    //    from the wall computer's front (1.8,4.97) — edit mode itself became
+    //    unreachable, with no way to undo).
+    const STAND_R = PLAYER_R + 0.06;
+    for (const pt of ctx.requiredReachable) {
+      if (
+        pt.x > box.x0 - STAND_R && pt.x < box.x1 + STAND_R &&
+        pt.z > box.z0 - STAND_R && pt.z < box.z1 + STAND_R
+      ) {
+        return { ok: false, reason: 'would block a stand-point' };
+      }
     }
   }
 
-  // 3. Player clearance (footprint inflated by the collision radius).
-  for (const p of ctx.playerPositions) {
-    if (
-      p.x > box.x0 - PLAYER_R && p.x < box.x1 + PLAYER_R &&
-      p.z > box.z0 - PLAYER_R && p.z < box.z1 + PLAYER_R
-    ) {
-      return { ok: false, reason: 'a player is in the way' };
-    }
-  }
-
-  // 4. Stand-point clearance (review F1): the FINE approach phases need to
-  //    land within 0.06 of the EXACT front point while resolveObstacles
-  //    keeps the player PLAYER_R away from every box — a candidate whose
-  //    inflated extent swallows a protected front point is physically
-  //    un-standable even when the point's grid cell stays walkable
-  //    (concrete pre-fix wedge: armchair at (2.5,4.5) put its edge 0.03 m
-  //    from the wall computer's front (1.8,4.97) — edit mode itself became
-  //    unreachable, with no way to undo).
-  const STAND_R = PLAYER_R + 0.06;
-  for (const pt of ctx.requiredReachable) {
-    if (
-      pt.x > box.x0 - STAND_R && pt.x < box.x1 + STAND_R &&
-      pt.z > box.z0 - STAND_R && pt.z < box.z1 + STAND_R
-    ) {
-      return { ok: false, reason: 'would block a stand-point' };
-    }
-  }
+  // An item that is not an obstacle can never be rejected for an obstruction
+  // reason, so the remaining checks are skipped for it — the early-out the
+  // footprint-less branch has always had. WALL MOUNTS are the exception: they
+  // have no footprint, but check 6 has to confirm the panel can still be
+  // walked up to. Without this guard, dragging a rug or a cherry tree would
+  // bake a 64×64 scratch grid and flood-fill it EVERY FRAME of the carry
+  // (revalidateCarry runs from update()), and devMenu's spawn search would do
+  // it for each of ~500 candidates × 3 margin passes — all to compute a grid
+  // that, with no candidate box in it, is identical to the pre-move one.
+  if (!box && !isWallMounted(item.kind)) return { ok: true };
 
   // 5. Connectivity on a scratch grid: candidate box + every OTHER item's
   //    current box (the original spot is vacated, the candidate is applied).
-  const scratch: Box[] = [box];
+  const scratch: Box[] = box ? [box] : [];
   for (const other of FURNITURE) {
     if (other.id === item.id) continue;
     const ob = itemAabb(other);
     if (ob) scratch.push(ob);
   }
   const reachable = computeReachable(scratch, ctx.floodFrom.x, ctx.floodFrom.z);
+  const isReachable = (x: number, z: number): boolean => {
+    const row = worldToRow(z);
+    const col = worldToCol(x);
+    return row >= 0 && row < GRID_SIZE && col >= 0 && col < GRID_SIZE && reachable[row][col];
+  };
   for (const pt of ctx.requiredReachable) {
-    const row = worldToRow(pt.z);
-    const col = worldToCol(pt.x);
-    if (row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE || !reachable[row][col]) {
+    if (!isReachable(pt.x, pt.z)) {
       return { ok: false, reason: 'would seal off part of the room' };
+    }
+  }
+
+  // 6. 🖥️ A WALL MOUNT's own stand-point must stay reachable. Its front is
+  //    excluded from requiredReachable (it gets rebaked at the new spot), so
+  //    without this the room terminal could be hung somewhere it can be seen
+  //    but never used — and losing the terminal means losing edit mode itself,
+  //    the one surface that could undo the move.
+  //
+  //    Scoped to wall mounts on purpose. The same wedge is possible for the
+  //    FLOOR-standing devices (map table, storage trunk, game table, the casino
+  //    tables, the clone vat, the helm console), but that is pre-existing
+  //    behaviour and belongs in its own change.
+  //
+  //    The guard is load-bearing, not just a scoping preference — it is what
+  //    keeps this check SOUND. A wall mount has no AABB, and computeFront
+  //    returns the preferred point unchanged when aabb is null, under ANY
+  //    predicate, so this gate and the post-commit buildDeviceList necessarily
+  //    resolve the SAME point. A footprint device does have an AABB, and there
+  //    the two disagree: this gate resolves the front against `isReachable`
+  //    while buildDeviceList resolves it against `walkable`, a strict superset.
+  //    A preferred front that is walkable-but-sealed therefore makes the gate
+  //    fall back to some other reachable cell and PASS, while the commit keeps
+  //    the sealed preferred point — approving the exact state the check exists
+  //    to refuse. Widening to floor devices means fixing that first (predict
+  //    the front against the scratch WALKABLE grid, then test reachability),
+  //    which needs computeReachable to expose the grid it bakes internally.
+  if (isWallMounted(item.kind)) {
+    // `box` is null here by construction (wall-mounted kinds declare
+    // footprint: null); it is passed through so this call reads as literally
+    // the same derivation buildDeviceList performs.
+    const ownFront = deviceFrontFor(item.kind, pos, rot, box, isReachable);
+    if (ownFront && !isReachable(ownFront.x, ownFront.z)) {
+      return { ok: false, reason: 'nothing could stand in front of it there' };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Nudge a connectivity flood origin onto a WALKABLE cell, returning the point
+ * unchanged when its own cell is already walkable.
+ *
+ * computeReachable documents that flooding from a blocked cell makes EVERY
+ * cell read unreachable — and both consumers break on that silently, in
+ * OPPOSITE directions: collectRequiredReachable fails OPEN, returning an empty
+ * required-points set (so the connectivity gate stops protecting anything and
+ * a large item can be dropped across the only corridor, tinted green), while
+ * validatePlacement check 6 fails CLOSED, refusing every position for a wall
+ * mount.
+ *
+ * The player can genuinely stand on a blocked cell: the manual-movement clamp
+ * stops them at exactly ±bound, and bound is always a multiple of 0.5 — i.e. a
+ * cell EDGE — so worldToCol maps it to the cell 0.25 m further out, which the
+ * grid bake marks blocked. Walking flush into the east or south wall and then
+ * opening edit mode was enough to trigger it.
+ *
+ * The search is a widening Chebyshev ring over cell centres, each ring scanned
+ * in raster order, returning the first walkable hit — so the substitute comes
+ * from the smallest ring that has one, though not necessarily the nearest by
+ * straight-line distance (a diagonal at 0.71 m is taken over an orthogonal
+ * neighbour at 0.50 m). Immaterial here: every cell in the same connected
+ * component floods identically, and the caller's own position, being inside
+ * the room, always has a walkable cell within a ring or two.
+ */
+function nudgeToWalkable(p: { x: number; z: number }): { x: number; z: number } {
+  const row = worldToRow(p.z), col = worldToCol(p.x);
+  const inGrid = (r: number, c: number) => r >= 0 && r < GRID_SIZE && c >= 0 && c < GRID_SIZE;
+  if (inGrid(row, col) && walkable[row][col]) return p;
+  for (let ring = 1; ring <= 6; ring++) {
+    for (let dr = -ring; dr <= ring; dr++) {
+      for (let dc = -ring; dc <= ring; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue; // ring edge only
+        const r = row + dr, c = col + dc;
+        if (!inGrid(r, c) || !walkable[r][c]) continue;
+        return { x: colToWorld(c), z: rowToWorld(r) };
+      }
+    }
+  }
+  // Nothing walkable within 6 rings — hand back the blocked point. Per the note
+  // above this is the silent-failure case, and it is asymmetric: the required-
+  // points set comes back EMPTY, so checks 4 and 5 iterate nothing and pass
+  // trivially (the connectivity gate protects nothing and tints green); only
+  // check 6 fails closed, and only for a wall mount. Unreachable in practice —
+  // the search covers ~3 m in every direction from a point inside the room.
+  return p;
+}
+
+/**
+ * 🖥️ The wall-mount half of the drop gate — a no-op verdict for every kind
+ * that isn't wall-mounted. A hung panel is not an obstacle, so none of the
+ * footprint machinery applies to it; what it CAN do is end up somewhere
+ * nonsensical.
+ *
+ * Rule 0 comes first and pins the pose to the wall its rot names:
+ * validatePlacement exempts wall mounts from the interior bounds check, so
+ * nothing else does, and every clearance test below measures against THAT
+ * wall. Past that, these are the four ways:
+ *
+ *  1. across a DOORWAY — it would sit in the sliding leaves and the keypad.
+ *     Measured against the live door set (currentDoorOpenings), so it tracks
+ *     doors the owner has since added, moved or deleted;
+ *  2. over a WINDOW — the same conflict the door editor already guards from
+ *     the other side (validateDoorPlacement check 4), same 0.4 m margin;
+ *  3. INSIDE another piece of furniture — the wall-flush pieces, whose boxes
+ *     reach the wall plane: the bar's cabinet and shelf stack on the east
+ *     wall, the storage trunk and game table on the south. Tested with the
+ *     panel's swept slab (wallMountBox — the wall plane, inset 0.03 and 0.15
+ *     deep either side) against the other items' itemAabb boxes. Note the
+ *     reach of this rule: the gate caps every PLACED footprint at
+ *     roomPlaceBounds (±5.0), a full 0.82 m short of the slab, so only
+ *     hand-authored seed poses can ever trip it. It relies on those boxes
+ *     being honest — the bar's legacy stool-strip override stopped at x=5.0
+ *     while its mesh really reaches x=6.0, which hid it from this rule
+ *     entirely until the override was dropped;
+ *  4. somewhere it can be SEEN but never USED. Its stand-point is a fixed 1 m
+ *     straight out from the panel, on the same 0.5 m lattice the wall snap
+ *     uses, so it lands on a furniture edge remarkably often — an armchair at
+ *     (4.5, 0.5) has the box x[4,5] z[0,1], and a terminal hung at z=1 on the
+ *     east wall puts its front on that box's exact corner. The cell stays
+ *     grid-walkable (validatePlacement check 6 passes) but the FINE approach
+ *     drives to the EXACT point with collision on, so the avatar wedges 0.4 m
+ *     short and the focus never engages — verified in the running app before
+ *     this check existed. Same clearance, and the same reasoning, as the door
+ *     editor's "must be REACHABLE" rule (validateDoorPlacement check 2b).
+ *
+ * Pure — it only reads the registry and the layout docs.
+ */
+function wallMountVerdict(
+  item: FurnitureItem,
+  pos: { x: number; z: number },
+  rot: Rot,
+): PlacementVerdict {
+  const panel = wallMountBox(item.kind, pos, rot);
+  if (!panel) return { ok: true };
+
+  const wall = wallOfMountRot(rot);
+  const alongWall = wall === 'north' || wall === 'south' ? pos.x : pos.z;
+  const halfW = wallMountHalfWidth(item.kind);
+
+  // 0. The pose must actually BE on the wall its rot claims. validatePlacement
+  //    exempts wall mounts from the interior bounds check (their origin sits on
+  //    the wall plane, outside the placement box by construction), so this is
+  //    the only thing standing between a stale pose and a green tint: a room
+  //    resized after the terminal was placed, or a doc-reconciled pose from a
+  //    peer, leaves the panel hanging in mid-air with a rot that still names a
+  //    wall. Everything below measures clearance against THAT wall, so an
+  //    unanchored pose would be validated against geometry it is nowhere near.
+  const { halfX, halfZ } = roomHalfExtents();
+  const wallPlane = wall === 'north' ? -halfZ : wall === 'south' ? halfZ
+    : wall === 'west' ? -halfX : halfX;
+  const across = wall === 'north' || wall === 'south' ? pos.z : pos.x;
+  if (Math.abs(Math.abs(across) - Math.abs(wallPlane)) > 0.5 || Math.sign(across) !== Math.sign(wallPlane)) {
+    return { ok: false, reason: 'it has to hang on a wall' };
+  }
+
+  // 1. Doorways on this wall. The reserved span is the real opening plus a
+  //    post each side — the same frame width validateDoorPlacement measures
+  //    door-to-door gaps with.
+  const doorHalf = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH;
+  for (const opening of currentDoorOpenings()) {
+    if (opening.wall !== wall) continue;
+    if (Math.abs(opening.lateral - alongWall) < doorHalf + halfW) {
+      return { ok: false, reason: 'a doorway needs that stretch of wall' };
+    }
+  }
+
+  // 2. Windows on this wall (octagon side walls only — the end caps carry
+  //    none). Window records are indexed by hull SURFACE and furniture by
+  //    wall, so both directions of this rule go through wallForSideSurface,
+  //    which owns that translation; the window editor runs the mirror test.
+  if (OCTAGON_HULL) {
+    for (const rec of readAllWindowLayout().values()) {
+      if (wallForSideSurface(rec.surface) !== wall) continue;
+      if (Math.abs(rec.along - alongWall) < halfW + rec.w / 2 + WINDOW_PANEL_MARGIN) {
+        return { ok: false, reason: 'a window is in the way' };
+      }
+    }
+  }
+
+  // 3 + 4. Furniture occupying that stretch of wall, and furniture pinching
+  //        the stand-point the panel would be used from. `() => true` as the
+  //        walkable predicate makes deviceFrontFor return the PREFERRED front
+  //        unchanged: a wall mount's front is a fixed offset straight out from
+  //        the screen, and a fallback somewhere off to the side would face the
+  //        avatar at a wall, not at the device.
+  const front = deviceFrontFor(item.kind, pos, rot, null, () => true);
+  const reach = PLAYER_R + 0.06; // player radius + the FINE arrival epsilon
+  for (const other of FURNITURE) {
+    if (other.id === item.id) continue;
+    const ob = itemAabb(other);
+    if (!ob) continue;
+    if (panel.x0 < ob.x1 && panel.x1 > ob.x0 && panel.z0 < ob.z1 && panel.z1 > ob.z0) {
+      return { ok: false, reason: `${other.id} is against that wall` };
+    }
+    if (
+      front &&
+      front.x > ob.x0 - reach && front.x < ob.x1 + reach &&
+      front.z > ob.z0 - reach && front.z < ob.z1 + reach
+    ) {
+      return { ok: false, reason: `${other.id} blocks the way up to it` };
     }
   }
 
@@ -395,7 +644,12 @@ export function validateDoorPlacement(
   // 2. No furniture in the opening…
   const box = doorOpeningAabb(wall, lateral);
   for (const item of FURNITURE) {
-    const ob = itemAabb(item);
+    // 🖥️ itemAabb is null for a WALL-MOUNTED panel (it is not a floor
+    // obstacle), so it would slip through this loop invisibly — and then a
+    // door could be added or dragged straight onto the hung room terminal,
+    // the mirror image of the state wallMountVerdict rule 1 refuses. Test the
+    // panel's own swept slab instead.
+    const ob = itemAabb(item) ?? wallMountBox(item.kind, item.pos, item.rot);
     if (!ob) continue;
     if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
       return { ok: false, reason: `blocked by ${item.id}` };
@@ -527,7 +781,44 @@ export function validateWindowPlacement(
       return { ok: false, reason: 'overlaps another window' };
     }
   }
+  // 🖥️ …and no cutting a hole through a hung panel. Furniture is otherwise
+  // irrelevant to windows (they are holes in the shell, well above the floor),
+  // but a WALL-MOUNTED panel hangs at that height on that surface — and it is
+  // invisible to every furniture check here because its footprint is null.
+  // The mirror of wallMountVerdict rule 2, which stops the panel moving onto a
+  // window; without this the window could simply be cut over the panel.
+  const wall = wallForSideSurface(surface);
+  if (wall !== null) {
+    for (const item of FURNITURE) {
+      if (!isWallMounted(item.kind)) continue;
+      if (wallOfMountRot(item.rot) !== wall) continue;
+      const itemAlong = wall === 'north' || wall === 'south' ? item.pos.x : item.pos.z;
+      if (Math.abs(itemAlong - along) < w / 2 + wallMountHalfWidth(item.kind) + WINDOW_PANEL_MARGIN) {
+        return { ok: false, reason: `${item.id} is on that wall` };
+      }
+    }
+  }
   return { ok: true };
+}
+
+/** Clear margin between a window cut and a wall-mounted panel (metres) — the
+ *  same 0.4 m the door/window rules use between a doorway and a window. */
+const WINDOW_PANEL_MARGIN = 0.4;
+
+/**
+ * The room wall a hull SIDE surface corresponds to, or null for the surfaces
+ * that carry no wall-mounted furniture (roof, basement, and the end caps on
+ * the extrude axis). Windows are indexed by hull surface while furniture is
+ * placed against walls, so the two vocabularies have to meet somewhere; this
+ * is the single place they do. Mirrors the sideSurface derivation in
+ * validateDoorPlacement check 4 and wallMountVerdict rule 2, read backwards.
+ */
+function wallForSideSurface(surface: HullSurface): DoorWall | null {
+  const { halfX, halfZ } = roomHalfExtents();
+  const narrowIsX = narrowAxisFor(halfX, halfZ) === 'x';
+  if (surface === 'wall-neg') return narrowIsX ? 'west' : 'north';
+  if (surface === 'wall-pos') return narrowIsX ? 'east' : 'south';
+  return null;
 }
 
 // ── Highlight tints ───────────────────────────────────────────────────────────
@@ -1383,10 +1674,16 @@ class RoomEditController {
     const btn = `display:block; width:100%; text-align:left; margin-top:4px;
       padding:6px 8px; border-radius:6px; cursor:pointer; font:inherit;
       background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); color:#f0c060;`;
+    // 🖥️ The room terminal moves but never deletes (removeSelected explains
+    // why) — offer MOVE only, rather than a DELETE that always refuses. Same
+    // rule the floating REMOVE button follows: hidden, not disabled.
+    const deleteBtn = isRoomTerminalKind(item.kind)
+      ? ''
+      : `<button type="button" data-ctx-action="delete" style="${btn} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">🗑 DELETE</button>`;
     menu.innerHTML = `
       <div style="font-size:9px; letter-spacing:1px; color:rgba(212,168,75,0.55); padding:2px 4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📦 ${item.kind.toUpperCase()}</div>
       <button type="button" data-ctx-action="move" style="${btn}">✥ MOVE</button>
-      <button type="button" data-ctx-action="delete" style="${btn} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">🗑 DELETE</button>`;
+      ${deleteBtn}`;
 
     // Keep menu clicks OUT of the window-level click routing (onCanvasClick
     // would raycast "through" the menu and deselect / navigate). contextmenu
@@ -1592,6 +1889,22 @@ class RoomEditController {
     // kinds go exterior only while the pointer is beyond the walls.
     const mount = FURNITURE_DEFS[c.item.kind].mount;
     const px = hits[0].point.x, pz = hits[0].point.z;
+    // 🖥️ INTERIOR wall mounts (the room terminal) are the mirror image: the
+    // pointer picks a WALL, not a floor tile, and the rotation comes with the
+    // wall so the screen always faces into the room. Same 1-D gesture as a
+    // door drag — except the wall itself can change mid-carry, since a panel
+    // (unlike a doorway) has no hole in the shell to keep aligned.
+    if (isWallMounted(c.item.kind)) {
+      const m = snapInteriorWall(c.item.kind, px, pz);
+      if (!m) return;
+      if (m.x === c.candidatePos.x && m.z === c.candidatePos.z && m.rot === c.candidateRot) return;
+      c.candidatePos = { x: m.x, z: m.z };
+      c.candidateRot = m.rot;
+      c.group.position.set(m.x, 0, m.z);
+      c.group.rotation.y = m.rot * (Math.PI / 2);
+      this.revalidateCarry();
+      return;
+    }
     if (mount === 'exterior-wall' || (mount === 'both' && isExteriorPos({ x: px, z: pz }))) {
       const s = snapExteriorPos(c.item.kind, px, pz);
       if (s.x === c.candidatePos.x && s.z === c.candidatePos.z && s.rot === c.candidateRot
@@ -1621,6 +1934,11 @@ class RoomEditController {
   private rotateCarry(): void {
     const c = this.carrying;
     if (!c) return;
+    // 🖥️ Nor can wall-mounted panels — their facing IS their wall's.
+    if (isWallMounted(c.item.kind)) {
+      showHint('WALL MOUNT — faces into the room automatically; drag it to another wall instead.', 2600);
+      return;
+    }
     // 🚀 Exterior fittings can't rotate freely — the facing IS the anchor's.
     const rotMount = FURNITURE_DEFS[c.item.kind].mount;
     if (rotMount === 'exterior-wall' || (rotMount === 'both' && isExteriorPos(c.candidatePos))) {
@@ -1800,6 +2118,14 @@ class RoomEditController {
     if (!item) return;
     if (!item.movable) {
       showHint("CAN'T REMOVE — fixed room structure.", 2200);
+      return;
+    }
+    // 🖥️ The room terminal is MOVABLE but never removable: its focused UI
+    // hosts the EDIT ROOM button, so stowing it in the inventory would leave
+    // the owner with no way back in to re-place it (only the DEV rescue
+    // spawner could recover the room).
+    if (isRoomTerminalKind(item.kind)) {
+      showHint("CAN'T REMOVE — the room terminal is the way back into edit mode.", 2600);
       return;
     }
     if (import.meta.env.DEV && isDeviceFocusActive()) {
@@ -2653,16 +2979,19 @@ class RoomEditController {
   /**
    * The local player's connectivity origin: their position — or, while
    * seated (the sit point is INSIDE a footprint, so its cell is blocked),
-   * the occupied seat's front point.
+   * the occupied seat's front point. Either way the result is nudged onto a
+   * WALKABLE cell (nudgeToWalkable), because computeReachable flooding from a
+   * blocked cell returns an all-false grid, and that failure is silent in the
+   * worst possible direction — see collectRequiredReachable.
    */
   private localFloodOrigin(player: Player): { x: number; z: number } {
     const seatedId = player.getSeatedSeatId();
     if (seatedId) {
       const seat = SEATS.find((s) => s.id === seatedId);
-      if (seat) return { x: seat.front.x, z: seat.front.z };
+      if (seat) return nudgeToWalkable({ x: seat.front.x, z: seat.front.z });
     }
     const pos = player.getPosition();
-    return { x: pos.x, z: pos.z };
+    return nudgeToWalkable({ x: pos.x, z: pos.z });
   }
 
   /**
@@ -2823,10 +3152,11 @@ class RoomEditController {
   /**
    * Show the floating ✕ REMOVE button iff an item is SELECTED and no carry
    * is live (#53). The movable guard is structural — buildRaycastIndex only
-   * indexes movable items, so a selected item is movable by construction
-   * (the wall computer can never be selected, hence never shows the button)
-   * — but re-checked so a future selectable-but-fixed item fails closed
+   * indexes movable items, so a selected item is movable by construction —
+   * but re-checked so a future selectable-but-fixed item fails closed
    * (hidden), matching the "button hidden, not disabled" rule.
+   * 🖥️ The room terminal is the one selectable, movable item that is NOT
+   * removable (removeSelected explains why), so it is excluded explicitly.
    */
   private syncRemoveButton(): void {
     // 🚪 #28 S6b / 🪟 #80 S4: a selected DOOR or WINDOW shows the REMOVE button
@@ -2834,8 +3164,9 @@ class RoomEditController {
     const isDoor = this.selectedId ? this.doorIds.has(this.selectedId) : false;
     const isWindow = this.selectedId ? this.windowIds.has(this.selectedId) : false;
     const item = this.selectedId ? FURNITURE.find((i) => i.id === this.selectedId) : undefined;
+    const removableItem = !!item && item.movable && !isRoomTerminalKind(item.kind);
     const show = this.active && !this.carrying && !this.doorDrag
-      && (isDoor || isWindow || (!!item && item.movable));
+      && (isDoor || isWindow || removableItem);
     if (!this.removeBtnEl) {
       if (!show) return;
       this.removeBtnEl = document.createElement('button');

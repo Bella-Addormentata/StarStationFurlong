@@ -83,7 +83,7 @@ import {
   deleteDoorPairing,
   type DoorRecord,
 } from "./doorsDoc";
-import { readDoorDeltas, roomHalfExtents } from "./floorPlanDoc";
+import { readDoorDeltas, roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { applyDoorSlideDeltas } from "./doors";
 import { setDoorSlideDeltas } from "./adapter";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
@@ -714,9 +714,10 @@ export class World {
     this.platformGrid.visible = false;
     this.platformGroup.add(this.platformGrid);
 
-    // Add corner markers and edges
-    this.addCornerMarkers();
-    this.addPlatformEdgeLights();
+    // (Retired: the amber corner floor markers and the blue platform-edge
+    //  bars. Both drew a "platform boundary" that the room no longer has —
+    //  the octagon hull's walls are the edge — and both stood in the outer
+    //  ring of floor that is now walkable, so they read as junk underfoot.)
     // 🛑📐 #80 S1: the octagon hull REPLACES the two flat interior side walls
     // with the full barrel (walls + 45° roof + basement) when previewing.
     // The exterior capsule (zoom ≥ 3) is left untouched either way.
@@ -3009,21 +3010,12 @@ export class World {
 
     // (Coloured throw cushions moved into the sofa builders — furniture.ts.)
 
-    // ── AMBIENT WALL LIGHT STRIPS — glowing accents at ceiling edge ───────────
-    // Thin emissive strips along the top of each side wall (z axis, y=3.9)
-    const stripMat = (col: number) =>
-      new THREE.MeshBasicMaterial({
-        color: col,
-        transparent: true,
-        opacity: 0,
-      });
-    place(
-      new THREE.BoxGeometry(0.04, 0.06, 10.8),
-      stripMat(0x2266cc),
-      -5.76,
-      3.92,
-      0,
-    ); // left  — blue
+    // ── AMBIENT WALL FILL — cool bounce light at the ceiling edge ─────────────
+    // The emissive blue strip that used to mark this line is retired: it was a
+    // fixed 10.8 m bar at x=-5.76 that never scaled with the room, so under the
+    // octagon hull it floated free of any wall — a stray blue bar up in the
+    // roof. Only its soft fill light remains, so the west side keeps its cool
+    // wash with no visible fixture.
     addLight(new THREE.PointLight(0x1155bb, 0, 14), -5.5, 3.8, 0, 0.55);
 
     // ── FLOATING DUST MOTES ───────────────────────────────────────────────────
@@ -3173,75 +3165,6 @@ export class World {
     this.morphProgress = 0;
     this.createPlatform();
     console.log("🔄 Morphing station planet into platform...");
-  }
-
-  /**
-   * Add glowing corner markers for sci-fi feel
-   */
-  private addCornerMarkers() {
-    const markerGeometry = new THREE.CylinderGeometry(0.08, 0.08, 0.4, 8);
-    const markerMaterial = new THREE.MeshStandardMaterial({
-      color: 0xffaa22,
-      emissive: 0xffaa22,
-      emissiveIntensity: 0.9,
-      metalness: 0.8,
-      roughness: 0.2,
-      transparent: true,
-      opacity: 0,
-    });
-
-    // Markers sit 0.5 m inside each corner (walls at ±half). Default ±5.5.
-    const { halfX, halfZ } = roomHalfExtents();
-    const mx = halfX - 0.5,
-      mz = halfZ - 0.5;
-    const positions = [
-      [-mx, 0.2, -mz],
-      [mx, 0.2, -mz],
-      [-mx, 0.2, mz],
-      [mx, 0.2, mz],
-    ];
-
-    positions.forEach(([x, y, z]) => {
-      const marker = new THREE.Mesh(markerGeometry, markerMaterial);
-      marker.position.set(x, y, z);
-      this.platformGroup.add(marker);
-      this.platformElements.push(marker);
-
-      const cornerLight = new THREE.PointLight(0xffaa22, 0, 5);
-      cornerLight.position.set(x, y, z);
-      this.platformGroup.add(cornerLight);
-      this.platformElements.push(cornerLight);
-    });
-  }
-
-  /**
-   * Add edge lights to mark platform boundaries
-   */
-  private addPlatformEdgeLights() {
-    const edgeMaterial = new THREE.MeshBasicMaterial({
-      color: 0x1e88e5,
-      transparent: true,
-      opacity: 0,
-    });
-
-    const { halfX, halfZ } = roomHalfExtents();
-    const edgeGeometry = new THREE.BoxGeometry(2 * halfX, 0.05, 0.1);
-
-    const northEdge = new THREE.Mesh(edgeGeometry, edgeMaterial);
-    northEdge.position.set(0, 0.03, -halfZ);
-    this.platformGroup.add(northEdge);
-    this.platformElements.push(northEdge);
-
-    const southEdge = new THREE.Mesh(edgeGeometry, edgeMaterial);
-    southEdge.position.set(0, 0.03, halfZ);
-    this.platformGroup.add(southEdge);
-    this.platformElements.push(southEdge);
-
-    const eastEdgeGeometry = new THREE.BoxGeometry(0.1, 0.05, 2 * halfZ);
-    const westEdge = new THREE.Mesh(eastEdgeGeometry, edgeMaterial.clone());
-    westEdge.position.set(-halfX, 0.03, 0);
-    this.platformGroup.add(westEdge);
-    this.platformElements.push(westEdge);
   }
 
   /**
@@ -4220,9 +4143,15 @@ export class World {
 
       // Threshold: pressed into the open doorway (the manual-movement clamp
       // stops the body at the wall, so "as far in as possible" IS the cross).
-      // Wall is at ±halfZ (n/s) or ±halfX (e/w); trip 0.85 m short of it.
-      const { halfX, halfZ } = roomHalfExtents();
-      const apThresh = (northSouth ? halfZ : halfX) - 0.85;
+      // Derived from the CLAMP, not from the wall: the trip point has to be the
+      // last few centimetres of travel, or ordinary walking along the wall
+      // crosses it. (It was `half - 0.85` against a `half - 0.8` clamp — a 5 cm
+      // sliver you could only enter by pressing in. When the walkable box was
+      // widened to `half - WALL_CLEARANCE` that literal silently became a 35 cm
+      // strip of normal floor, so strolling past a paired door in first person
+      // fired an unrequested transit.)
+      const { boundX, boundZ } = roomWalkBounds();
+      const apThresh = (northSouth ? boundZ : boundX) - 0.05;
       // 🚪 #91: the crossable band is the door's actual opening (half-width),
       // derived rather than the old 0.95 literal that was sized for the
       // retired small door — with the 2 m opening it left the edges of the

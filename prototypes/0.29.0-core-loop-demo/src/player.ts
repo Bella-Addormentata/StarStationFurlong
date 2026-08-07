@@ -68,7 +68,7 @@ import { updateDebugHUD, showHint } from "./hud";
 import { VoxelCharacter } from "./voxelCharacter";
 import { WaypointReticle } from "./waypoint";
 import { findPath, worldToCol, worldToRow } from "./pathfinding";
-import { roomHalfExtents } from "./floorPlanDoc";
+import { roomWalkBounds } from "./floorPlanDoc";
 import { OBSTACLES } from "./obstacles";
 import {
   POOL_WATER_Y,
@@ -158,11 +158,12 @@ export class Player {
   private logicalAngle = 0;
   private readonly SPEED = 2.8;
 
-  /** Manual-movement clamp: 0.8 m inside each wall (walls at ±half), per axis.
-   *  🧱 #66 R1 — default 2×2 room ⇒ {6,6} ⇒ ±5.2, the legacy BOUND scalar. */
+  /** Manual-movement clamp — the SAME box the A* grid calls walkable
+   *  (floorPlanDoc.roomWalkBounds: WALL_CLEARANCE inside each wall). Keeping
+   *  WASD and click-nav on one number means every tile you can path to is a
+   *  tile you can also walk to by hand. Default 2×2 room ⇒ {6,6} ⇒ ±5.5. */
   private roomBounds(): { boundX: number; boundZ: number } {
-    const { halfX, halfZ } = roomHalfExtents();
-    return { boundX: halfX - 0.8, boundZ: halfZ - 0.8 };
+    return roomWalkBounds();
   }
 
   // ── Navigation state ───────────────────────────────────────────────────────
