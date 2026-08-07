@@ -12,6 +12,22 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.33.31 — 2026-08-07
+
+### 🪑🧍 Sit on the furniture, walk the whole floor, and hang the terminal where you like
+
+A room-comfort release: the floor got bigger, the seating got a lot less embarrassing, and the wall terminal is furniture now. Plus the robots found their voice.
+
+- **🪑 The fox sits ON the chair.** Sitting in an armchair, a sofa or a casino booth used to drop the avatar to the floor, half-swallowed by the cushions. Every seat now declares the height of the surface you actually sit on, so the fox's backside lands on the cushion. The seat-height field already existed for the bunk berths; the lounge furniture simply never used it, and a pose authored as a *floor* sit did the rest. Fixed for everyone in the room too, not just for you — peers derive a sitter's height from the same shared layout.
+- **🛏️ Both bunks are reachable.** The bunk bed splits down the middle now: the ladder end takes you to the **top** berth, the pillow end to the **bottom** one. The top berth was technically clickable before — through a strip under a fifth of the bed's length — so in practice almost every click put you on the bottom bunk. Peers also see you in the berth you're actually in; a bottom-bunk sleeper used to render a metre too high, inside the upper mattress.
+- **👁️ First person sits down with you.** The first-person camera used to float about half a metre above the fox's head whenever you were seated, on a bunk or on the dive board — it added a *standing* eye height to wherever the body was. It now follows the pose.
+- **🧍 The outer ring of floor is walkable.** Every room drew a full floor and a full edit grid, then stopped you a metre short of the walls — the outermost ring of tiles was rendered, looked clickable, and was dead space. It's yours now: walk it, path to it, and place furniture up to the old limit. That's about 18% more usable floor in a standard room.
+- **🧹 Cleaner rooms.** The amber corner markers on the floor, the blue bars along the floor edge and the stray blue bar up in the roof are gone. They drew a "platform boundary" the room hasn't had since the octagon hull arrived, and two of them stood in the floor this release opens up.
+- **🖥️ The room terminal is movable.** Select it in edit mode and drag it to any wall; it snaps to the wall and always faces into the room, the way a door drag is locked to its wall. It refuses spots that would bury it in a doorway, a window or the furniture, or leave it somewhere you can't walk up to. It can't be *deleted*, though — it's the only way back into edit mode.
+- **🍸 You can't walk through the bar any more.** Opening the outer ring exposed that the bar's collision box described its stool strip rather than the bar, leaving five floor cells walkable straight through the cabinet.
+- **🤖🔊 Robots speak** (#77) — voice for small talk, serve lines and croupier calls.
+- **Release line:** version bumped to 0.33.31, all nine locations. **Node binaries UNCHANGED** — this release is frontend-only (TypeScript), so no Rust node code changed since v0.33.30.
+
 ## v0.33.30 — 2026-07-27
 
 ### 🚪📐 Doors on the grid — one door size, and a pile of door fixes (#91)
