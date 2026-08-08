@@ -719,6 +719,7 @@ export class DoorDockingPortSystem {
       left: 50%;
       transform: translate(-50%, -50%);
       width: 380px;
+      max-height: 80vh;
       background: rgba(4, 8, 22, 0.95);
       border: 1px solid rgba(212, 168, 75, 0.28);
       border-radius: 12px;
@@ -727,6 +728,7 @@ export class DoorDockingPortSystem {
       display: none;
       flex-direction: column;
       gap: 16px;
+      overflow: hidden;
       color: #d4a84b;
       font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
       z-index: 6000;
@@ -734,10 +736,19 @@ export class DoorDockingPortSystem {
     `;
 
     pane.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:10px;">
+      <div style="flex:0 0 auto; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:10px;">
         <span id="docking-pane-title" style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚪 DOCKING PORT CONTROL</span>
         <button id="docking-close-btn" style="background:rgba(212,168,75,0.1); border:1px solid rgba(212,168,75,0.3); border-radius:6px; color:#d4a84b; font-size:10px; padding:4px 8px; cursor:pointer;">X</button>
       </div>
+
+      <!-- 📜 Scroll region. The pane caps at 80vh and this is the part that
+           scrolls, so the header — and with it the X, the ONLY way to close the
+           pane (there is no Esc handler) — stays pinned. min-height:0 is what
+           actually lets a flex child shrink below its content and scroll;
+           without it the child keeps its full intrinsic height and the pane
+           overflows its own max-height instead. margin/padding-right give the
+           scrollbar its own gutter so it never sits on top of the controls. -->
+      <div id="docking-pane-scroll" style="flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:16px; margin-right:-10px; padding-right:10px;">
 
       <div style="display:flex; flex-direction:column; gap:12px; font-size:11px;">
         <!-- Lock config -->
@@ -820,6 +831,8 @@ export class DoorDockingPortSystem {
           <button id="docking-reject-btn" style="flex:1; background:#ff1744; border:none; border-radius:4px; color:#fff; font-weight:bold; padding:6px; cursor:pointer; font-size:10px;">REJECT</button>
         </div>
       </div>
+
+      </div><!-- /#docking-pane-scroll -->
     `;
 
     document.body.appendChild(pane);
