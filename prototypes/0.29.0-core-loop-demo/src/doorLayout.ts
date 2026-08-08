@@ -2,11 +2,6 @@ import { roomHalfExtents } from "./floorPlanDoc";
 import type { DoorWall } from "./doorLayoutDoc";
 
 export type PhysicalDoorId = "north" | "south" | "east" | "west";
-/** "casino-pairs" and "pool-pairs" are ALIASES of the same paired
- *  arrangement (their pose tables were merged — they matched exactly):
- *  logical SOUTH on the north wall, EAST on the west wall. Both names are
- *  kept so each room's intent stays readable at the call site. */
-export type DoorLayoutKind = "legacy" | "casino-pairs" | "pool-pairs";
 
 export interface PhysicalDoorPose {
   wall: "north" | "south" | "east" | "west";
@@ -27,12 +22,12 @@ export interface PhysicalDoorPose {
  *  will both derive their pose from `poseFromWall` in later slices. */
 export type PortId = string;
 
-/** 🚪 The cardinal/free split in one predicate: the 4 cardinal ids are the
- *  structural berths (legacy pose tables, floorPlan slide store, pairing wire);
- *  everything else is a free `d:` door that owns its position in its layout
- *  record. #91 hoisted this here — docking.ts and editMode.ts each had a
- *  private copy and world.ts/main.ts had none, which is how free door ids kept
- *  reaching cardinal-only code and throwing. */
+/** 🚪 The cardinal/free split in one predicate. It no longer decides where a
+ *  door IS — every door poses from its own layout record now — but the 4
+ *  cardinal ids are still the structural berths: the floorPlan slide store and
+ *  the pairing wire are keyed on them. #91 hoisted this here — docking.ts and
+ *  editMode.ts each had a private copy and world.ts/main.ts had none, which is
+ *  how free door ids kept reaching cardinal-only code and throwing. */
 export function isCardinalDoorId(id: string): id is PhysicalDoorId {
   return id === "north" || id === "south" || id === "east" || id === "west";
 }
@@ -41,17 +36,13 @@ export function isCardinalDoorId(id: string): id is PhysicalDoorId {
 // (walls at ±half) instead of hardcoding ±6, so the layout scales with a
 // rectangular room. Insets: stand-point 1.5 m inside the wall, through-point
 // 1.0 m outside. Default 2×2 room ⇒ {6,6} reproduces the legacy ±6 / ±4.5 / ±7
-// tables bit-for-bit. PAIR_OFFSET spaces the two doors that share a wall in the
-// pairs layout — an INTEGER (was 2.7), because #91 locks every door centre to
-// the grid lines (see the geometry contract below); 3.0 keeps the paired doors
-// 6 m apart. The old EW_LATERAL quirk (e/w STAND points −0.5 off the door
-// centre, so the avatar walked through half a metre off the visible opening)
-// is retired with #91: stand === centre for every door. The stand-vs-centre
-// SEAM in poseFromWall is kept — synced pairs data and future asymmetric
-// layouts still speak through it.
+// tables bit-for-bit. The old EW_LATERAL quirk (e/w STAND points −0.5 off the
+// door centre, so the avatar walked through half a metre off the visible
+// opening) is retired with #91: stand === centre for every door. The
+// stand-vs-centre SEAM in poseFromWall is kept — synced data and future
+// asymmetric openings still speak through it.
 const FRONT_INSET = 1.5;
 const THROUGH_OUTSET = 1.0;
-const PAIR_OFFSET = 3.0;
 const HALF_PI = Math.PI / 2;
 
 // ── 🚪 #91: THE door's physical grid contract ────────────────────────────────
@@ -83,8 +74,8 @@ export const DOOR_LEAF_OPEN_OFFSET = DOOR_LEAF_SHUT_OFFSET + DOOR_LEAF_WIDTH - 0
  * The single pose generator. Given a wall, the along-wall lateral of the door
  * CENTRE, and (optionally, for the legacy e/w quirk) a distinct lateral for the
  * stand/through points, derive the full pose from the current room half-extents.
- * For every clean door `standLateral === centreLateral`. This reproduces
- * `legacyTable`/`pairsTable` bit-for-bit for the 4 cardinals (see poseFromSlot).
+ * For every clean door `standLateral === centreLateral`. This is now THE pose
+ * generator for every door in the room, cardinal or free.
  */
 export function poseFromWall(
   wall: PhysicalDoorId,
@@ -180,68 +171,45 @@ export function wallAndLateralFromPoint(
   return { wall: best.wall, lateral };
 }
 
-/** A cardinal door's fixed slot in a layout: which physical wall it sits on and
- *  its base centre/stand lateral (before any owner slide delta). */
-interface DoorSlot {
-  wall: PhysicalDoorId;
-  centre: number;
-  stand: number;
+/**
+ * 🚪 The room's live door records, pushed here by world.reconcileDoorLayout —
+ * which already receives exactly this map (stored records, or the room's
+ * defaults when unseeded) on bind and on every door change, so there is no new
+ * subscription and no import cycle back into the doc layer.
+ *
+ * This replaces the module global that used to hold a LAYOUT KIND. That global
+ * was the whole reason a "casino door" was a different thing from a regular
+ * door: `physicalDoorPose` switched on it to pick one of two four-slot tables,
+ * which can express neither an empty wall nor a wall with three doors on it.
+ * A record per door expresses both, and one code path serves every door.
+ */
+let doorRecords: ReadonlyMap<string, { wall: PhysicalDoorId; lateral: number }> =
+  new Map();
+
+export function setDoorRecords(
+  records: ReadonlyMap<string, { wall: PhysicalDoorId; lateral: number }>,
+): void {
+  doorRecords = records;
 }
 
-/** Legacy layout: the 4 doors on their own cardinal walls, centred.
- *  #91 retired the e/w −0.5 stand offset — the avatar now walks through the
- *  middle of the opening it can see. NOTE the floorPlan STORE still encodes
- *  e/w placements against a −0.5 base (floorPlanDoc LEGACY_PLACEMENTS): that
- *  is wire data and stays put; only these walk/stand points moved. */
-function legacySlot(id: PhysicalDoorId): DoorSlot {
-  switch (id) {
-    case "north":
-      return { wall: "north", centre: 0, stand: 0 };
-    case "south":
-      return { wall: "south", centre: 0, stand: 0 };
-    case "west":
-      return { wall: "west", centre: 0, stand: 0 };
-    case "east":
-      return { wall: "east", centre: 0, stand: 0 };
-  }
-}
-
-/** Paired layout ("casino-pairs" / "pool-pairs" aliases): logical south rides
- *  the north wall and logical east rides the west wall, spaced ±PAIR_OFFSET.
- *  Keeps the camera-near south/east edges clear. Stand === centre (no quirk). */
-function pairsSlot(id: PhysicalDoorId): DoorSlot {
-  switch (id) {
-    case "north":
-      return { wall: "north", centre: -PAIR_OFFSET, stand: -PAIR_OFFSET };
-    case "south":
-      return { wall: "north", centre: PAIR_OFFSET, stand: PAIR_OFFSET };
-    case "west":
-      return { wall: "west", centre: -PAIR_OFFSET, stand: -PAIR_OFFSET };
-    case "east":
-      return { wall: "west", centre: PAIR_OFFSET, stand: PAIR_OFFSET };
-  }
-}
-
-let activeLayout: DoorLayoutKind = "legacy";
-
-export function setActiveDoorLayout(layout: DoorLayoutKind): void {
-  activeLayout = layout;
-}
-
-export function activeDoorLayout(): DoorLayoutKind {
-  return activeLayout;
-}
-
+/**
+ * Where a door physically is: its own record's wall and base lateral, plus the
+ * owner's floor-plan slide passed in by the caller.
+ *
+ * Before a room's first reconcile the map is empty — reachable only at boot,
+ * when docking.buildPorts constructs the four berths before any room is
+ * entered. The fallback poses a cardinal centred on its own wall, which is
+ * exactly what the retired global's "legacy" default produced there, so boot
+ * geometry is unchanged.
+ */
 export function physicalDoorPose(
   id: PhysicalDoorId,
   lateralDelta = 0,
 ): PhysicalDoorPose {
-  const slot = activeLayout === "legacy" ? legacySlot(id) : pairsSlot(id);
-  return poseFromWall(
-    slot.wall,
-    slot.centre + lateralDelta,
-    slot.stand + lateralDelta,
-  );
+  const rec = doorRecords.get(id);
+  const wall = rec?.wall ?? id;
+  const lateral = (rec?.lateral ?? 0) + lateralDelta;
+  return poseFromWall(wall, lateral, lateral);
 }
 
 /** 🛰️ #28 S1: the structural PORT pose. Ports are, for now, exactly the 4

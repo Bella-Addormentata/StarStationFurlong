@@ -18,7 +18,10 @@
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
 import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
-import { setActiveDoorLayout, type DoorLayoutKind } from "./doorLayout";
+import {
+  setLegacyRoomDoorLayout,
+  type LegacyLayoutKind,
+} from "./doorLayoutDoc";
 
 /** The room "type"; each can have multiple design variants (casino-1, -2, …).
  *  "blank" is the empty starting point (folds in empty-by-default); "deck" is
@@ -42,7 +45,7 @@ export interface RoomTemplate {
   /** The furniture layout to place (cloned on apply — the source is never mutated). */
   items: FurnitureItem[];
   /** The door arrangement the layout was designed for. */
-  doorLayout: DoorLayoutKind;
+  doorLayout: LegacyLayoutKind;
   /** 🌌 Visual theme stamped into the room's roomInfo on provision — an
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
@@ -196,7 +199,7 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
   replaceAllFurniture(cloneItems(t.items));
-  setActiveDoorLayout(t.doorLayout);
+  setLegacyRoomDoorLayout(t.doorLayout);
   return t;
 }
 

@@ -94,9 +94,9 @@ import {
   seedDoorLayoutSingle,
   doorLayoutDocSize,
 } from "./doorLayoutDoc";
-import type { DoorWall } from "./doorLayoutDoc";
+import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
+import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
 import { isCardinalDoorId } from "./doorLayout";
-import type { DoorLayoutKind } from "./doorLayout";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
@@ -1324,10 +1324,13 @@ async function joinRoomAtEpoch(
     const mintedHere = mintedRoomTemplates.get(boot.roomId);
     if (mintedHere?.birthWall && doorLayoutDocSize() === 0) {
       seedDoorLayoutSingle(mintedHere.birthWall);
-      // A single door must sit CENTRED on its wall, which only the "legacy"
-      // layout does — the paired layouts park every cardinal ±PAIR_OFFSET off
-      // centre. Stamped into roomInfo so it holds on every future entry and
-      // for every joiner, the same way the template's theme is.
+      // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
+      // so the door sits centred on `birthWall` whatever the room is called.
+      // This stamp used to be load-bearing — a single door only landed centred
+      // under the "legacy" arrangement, and the paired ones would have parked
+      // it ±PAIR_OFFSET off, or for id 'south' on another wall entirely. It is
+      // kept only so an OLD client entering this module still poses its door
+      // correctly; drop it with the compat shim in doorLayoutDoc.
       roomMap.set("doorLayout", "legacy");
     }
   }
@@ -1432,13 +1435,12 @@ async function joinRoomAtEpoch(
   const resolveTheme = (): RoomTheme =>
     (roomMap.get("theme") as RoomTheme | undefined) ??
     legacyThemeFromRoomId(boot.roomId);
-  // 🛰️🚪 A room may name its own door arrangement (a module born with one
-  // door asks for legacy so that door sits centred). Absent ⇒ world picks.
-  const resolveDoorLayout = (): DoorLayoutKind | undefined => {
+  // 🛰️🚪 The room's RETIRED door arrangement, kept only so the doc layer can
+  // read records written before doors became individually placed. Absent ⇒
+  // world picks the default. See the compat shim in doorLayoutDoc.
+  const resolveDoorLayout = (): LegacyLayoutKind | undefined => {
     const v = roomMap.get("doorLayout");
-    return v === "legacy" || v === "casino-pairs" || v === "pool-pairs"
-      ? v
-      : undefined;
+    return isLegacyDoorLayoutKind(v) ? v : undefined;
   };
   let appliedTheme: RoomTheme = resolveTheme();
 
@@ -2091,15 +2093,13 @@ async function transitTo(
     const arrivalTheme =
       (yjsSync?.doc.getMap("roomInfo").get("theme") as RoomTheme | undefined) ??
       legacyThemeFromRoomId(arrivalRoomId);
-    // 🛰️🚪 …and its door arrangement, for the same reason: a module born with
-    // one door names "legacy" so that door renders centred on its wall.
+    // 🛰️🚪 …and its retired door arrangement, for the same compat reason.
     const arrivalLayoutRaw = yjsSync?.doc.getMap("roomInfo").get("doorLayout");
-    const arrivalLayout: DoorLayoutKind | undefined =
-      arrivalLayoutRaw === "legacy" ||
-      arrivalLayoutRaw === "casino-pairs" ||
-      arrivalLayoutRaw === "pool-pairs"
-        ? arrivalLayoutRaw
-        : undefined;
+    const arrivalLayout: LegacyLayoutKind | undefined = isLegacyDoorLayoutKind(
+      arrivalLayoutRaw,
+    )
+      ? arrivalLayoutRaw
+      : undefined;
     world.applyRoomVisuals(
       arrivalRoomId,
       arrivalDoorId,

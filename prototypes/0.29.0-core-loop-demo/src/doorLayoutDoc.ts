@@ -10,12 +10,18 @@
  * DELIBERATELY SEPARATE from two neighbours that sound the same:
  *  - the door PAIRING store (doorsDoc.ts, the `doors` map) — which room a port
  *    is docked to. Untouched; keyed by the stable cardinal PORT.
- *  - the door POSITION store (floorPlanDoc.ts `door:${id}` lateral) — the live
- *    slide. Untouched; still the sole source of a door's position.
- * This map answers only "which doors exist, on which wall". In slice 4 the
- * `lateral`/`enabled` values are SEED defaults + forward-compat for free doors;
- * position stays owned by floorPlan and runtime `enabled` stays owned by the
- * room (fireplace / casino), so behaviour is identical to the old literal.
+ *  - the door SLIDE store (floorPlanDoc.ts `door:${id}`) — the owner's drag,
+ *    applied ON TOP of a record's base lateral. Still separate, for now.
+ *
+ * 🚪 A record's `wall` + `lateral` are now the door's BASE POSITION, for every
+ * door. That is what retired the door-LAYOUT KINDS: a cardinal's physical slot
+ * used to come from a four-entry table chosen per room ("legacy" / the paired
+ * arrangements), so `south` meant whatever the table said and a wall could hold
+ * exactly one door of each name — it could express neither an empty wall nor a
+ * wall with three doors on it. Owner's ruling: a wall carries zero or many
+ * doors and they all run the same code. The tables survive only as the compat
+ * shim below, translating records written before that. Runtime `enabled` is
+ * still owned by the room (fireplace / casino force-enable / DEV toggle).
  *
  * Rebinds per join like furniture / games / roomInfo (main.ts T0 seam). Reads
  * cross the peer trust boundary → shape-guarded by isDoorLayoutRecord.
@@ -23,17 +29,18 @@
 
 import * as Y from 'yjs';
 import { findDoor } from './doors';
-import { readDoorDeltas } from './floorPlanDoc';
 
 export type DoorWall = 'north' | 'south' | 'east' | 'west';
+
+const WALLS: readonly DoorWall[] = ['north', 'south', 'east', 'west'];
 
 /** Serializable door-membership record — one per door id. Plain JSON, the same
  *  discipline as the furniture map. */
 export interface DoorLayoutRecord {
   id: string;
   wall: DoorWall;
-  /** Along-wall slide (forward-compat / the slice-5 hand-off; NOT the live
-   *  position in slice 4 — floorPlan owns that). Seeded from the current delta. */
+  /** The door's BASE centre along `wall`. Authoritative (see `placed`); the
+   *  owner's floor-plan slide is added on top by the caller. */
   lateral: number;
   /** Leaf-width class. #91 collapsed doors to ONE size: this is still accepted
    *  (and still written) for backward/forward compat, but readAllDoorLayout
@@ -56,7 +63,103 @@ export interface DoorLayoutRecord {
    * Trimmed and length-capped at the write boundary; absent or empty ⇒ no sign.
    */
   label?: string;
+  /**
+   * 🚪 This record's `wall`/`lateral` are AUTHORITATIVE — pose the door from
+   * them and nothing else.
+   *
+   * Free `d:` doors have always been authoritative; they had no other store to
+   * be overridden by. The four cardinals did: their physical slot came from a
+   * per-room LAYOUT KIND ("legacy" put each on its own wall centred, the paired
+   * kinds put logical south on the NORTH wall and east on the WEST wall,
+   * ±PAIR_OFFSET), so a room's `south` door was wherever the table said, and
+   * this record's wall said "south" while the door stood on the north wall.
+   *
+   * The owner's ruling is that a wall may carry zero or many doors and all of
+   * them run the same code, which a four-slot table cannot express. So the
+   * table is now a READ-TIME COMPAT SHIM (below) that fires only for a cardinal
+   * record WITHOUT this flag — i.e. one written before the migration, in a room
+   * whose owner has not re-seeded it. Every fresh write sets it, and when no
+   * stale rooms remain the shim deletes in one file.
+   */
+  placed?: boolean;
 }
+
+// ── 🚪 COMPAT SHIM: the retired door-LAYOUT KINDS ────────────────────────────
+// Everything below exists ONLY to translate records written before doors became
+// individually placeable. No other module may read it: the rest of the app sees
+// a door as {wall, lateral} and nothing else. Delete the whole block once no
+// un-migrated room docs remain in the wild.
+
+/** The one paired arrangement, under both of its old names. */
+export type LegacyLayoutKind = 'legacy' | 'casino-pairs' | 'pool-pairs';
+
+/** Spacing between the two doors that shared a wall in the paired kinds. */
+const PAIR_OFFSET = 3.0;
+
+/** Where a cardinal id physically stood under each retired kind. */
+function legacySlotFor(
+  id: DoorWall,
+  kind: LegacyLayoutKind,
+): { wall: DoorWall; lateral: number } {
+  if (kind === 'legacy') return { wall: id, lateral: 0 };
+  switch (id) {
+    case 'north': return { wall: 'north', lateral: -PAIR_OFFSET };
+    case 'south': return { wall: 'north', lateral: PAIR_OFFSET };
+    case 'west': return { wall: 'west', lateral: -PAIR_OFFSET };
+    case 'east': return { wall: 'west', lateral: PAIR_OFFSET };
+  }
+}
+
+/**
+ * Which retired kind the CURRENT room was authored under. Set from roomInfo by
+ * world.applyRoomVisuals — the same single call site the old
+ * `setActiveDoorLayout` had, so the ordering characteristics are unchanged
+ * (notably: it runs after an adapter arrival completes, exactly as before).
+ *
+ * 'legacy' is the boot default because that is what the retired module global
+ * defaulted to, which keeps pre-first-room poses bit-identical.
+ */
+let compatKind: LegacyLayoutKind = 'legacy';
+
+export function setLegacyRoomDoorLayout(kind: LegacyLayoutKind): void {
+  compatKind = kind;
+}
+
+export function isLegacyDoorLayoutKind(v: unknown): v is LegacyLayoutKind {
+  return v === 'legacy' || v === 'casino-pairs' || v === 'pool-pairs';
+}
+
+/** Apply the shim to one record: an un-migrated CARDINAL gets the wall and
+ *  lateral its retired kind put it at, so a visitor to somebody else's stale
+ *  room sees exactly the doors that room's owner sees. Free doors and migrated
+ *  cardinals pass through untouched. */
+function withCompatSlot(rec: DoorLayoutRecord): DoorLayoutRecord {
+  if (rec.placed) return rec;
+  if (!WALLS.includes(rec.id as DoorWall)) return rec; // free door — already authoritative
+  const slot = legacySlotFor(rec.id as DoorWall, compatKind);
+  return { ...rec, wall: slot.wall, lateral: slot.lateral };
+}
+
+/**
+ * 🚪 The door set an UNSEEDED room presents — the four cardinal berths, posed
+ * through the shim so an un-migrated room's defaults match what its owner had.
+ * (Lived in world.ts; moved here so the defaults and the stored records go
+ * through one normalizer rather than two that can drift.)
+ */
+export function defaultDoorLayoutRecords(): Map<string, DoorLayoutRecord> {
+  const out = new Map<string, DoorLayoutRecord>();
+  for (const id of WALLS) {
+    out.set(id, withCompatSlot({ id, wall: id, lateral: 0, size: 'large', enabled: true }));
+  }
+  return out;
+}
+
+/** The wall + lateral a cardinal should be MIGRATED to — its current physical
+ *  slot, so writing it moves nothing. */
+export function migratedCardinalSlot(id: DoorWall): { wall: DoorWall; lateral: number } {
+  return legacySlotFor(id, compatKind);
+}
+// ── end compat shim ─────────────────────────────────────────────────────────
 
 /** 🪧 Longest wayfinding label we will store or render. Long enough for
  *  "OBSERVATION DECK", short enough to stay legible on a door plaque. */
@@ -108,7 +211,6 @@ function docAlive(): boolean {
   );
 }
 
-const WALLS: readonly DoorWall[] = ['north', 'south', 'east', 'west'];
 
 /** Shape guard (doc reads cross a trust boundary — see module header). */
 export function isDoorLayoutRecord(value: unknown): value is DoorLayoutRecord {
@@ -125,7 +227,8 @@ export function isDoorLayoutRecord(value: unknown): value is DoorLayoutRecord {
     // 🪧 Accept any string (never reject stored data — the #91 discipline);
     // readAllDoorLayout normalizes it below so an over-long or whitespace-only
     // label from a hostile or older peer can never reach the renderer.
-    (r.label === undefined || typeof r.label === 'string')
+    (r.label === undefined || typeof r.label === 'string') &&
+    (r.placed === undefined || typeof r.placed === 'boolean')
   );
 }
 
@@ -146,7 +249,13 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
   if (!docAlive()) return out;
   for (const [id, value] of doorLayoutMap!.entries()) {
     if (isDoorLayoutRecord(value) && value.id === id) {
-      out.set(id, { ...value, size: 'large', lateral: Math.round(value.lateral) });
+      // 🚪 withCompatSlot LAST: it substitutes the retired layout table's wall
+      // and lateral for an un-migrated cardinal, and those are already on-grid,
+      // so it must not be rounded back through the #91 normalization above.
+      out.set(
+        id,
+        withCompatSlot({ ...value, size: 'large', lateral: Math.round(value.lateral) }),
+      );
     }
   }
   return out;
@@ -216,23 +325,39 @@ export function seedDoorLayoutSingle(wall: DoorWall): void {
       lateral: 0,
       size: 'large',
       enabled: true,
+      // 🚪 `placed`: this door means what it says — centred on `wall`. It used
+      // to need the room stamped "legacy" for that to hold (the paired kinds
+      // would have parked it ±PAIR_OFFSET off-centre, and for id 'south' on a
+      // different wall entirely); main.ts did that stamping at claim time.
+      // Being authoritative, it no longer cares what the room was authored as.
+      placed: true,
     });
   });
 }
 
 export function seedDoorLayoutDefaults(): void {
   if (!docAlive() || doorLayoutMap!.size > 0) return;
-  const deltas = readDoorDeltas();
   boundDoc!.transact(() => {
     for (const wall of WALLS) {
       const door = findDoor(wall);
       if (!door) continue;
+      // 🚪 Seed each cardinal at the slot it PHYSICALLY occupies right now, so
+      // the room it is being seeded from does not move a single door — then
+      // flag it authoritative so the compat shim leaves it alone forever after.
+      //
+      // This used to write `lateral: deltas[wall]` — the owner's floor-plan
+      // SLIDE — into a field that nothing then read for a cardinal (the slot
+      // table decided the position). The slide still lives in floorPlan and is
+      // still applied on top; what changes is that `lateral` now means the
+      // door's base centre, the same thing it has always meant for free doors.
+      const slot = migratedCardinalSlot(wall);
       doorLayoutMap!.set(wall, {
         id: wall,
-        wall,
-        lateral: deltas[wall] ?? 0,
+        wall: slot.wall,
+        lateral: slot.lateral,
         size: 'large',
         enabled: door.enabled,
+        placed: true,
       });
     }
   });

@@ -8,10 +8,9 @@ import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
 import {
-  physicalDoorPose, setActiveDoorLayout, isCardinalDoorId, poseFromWall,
+  physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
-import type { DoorLayoutKind } from "./doorLayout";
 import { Player } from "./player";
 import {
   PoolWaiter,
@@ -93,8 +92,9 @@ import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import {
   subscribeDoorLayout, readAllDoorLayout, sanitizeDoorLabel,
+  setLegacyRoomDoorLayout, defaultDoorLayoutRecords,
 } from "./doorLayoutDoc";
-import type { DoorWall } from "./doorLayoutDoc";
+import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
   buildVestibule,
@@ -195,21 +195,6 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
-
-/**
- * 🚪 #91: the door set an UNSEEDED room presents — the four cardinal berths
- * docking.buildPorts constructs at boot. Used by reconcileDoorLayout so a room
- * with no synced layout shows ITS OWN defaults instead of whatever the last
- * room reconciled to (World and its door groups outlive any single room).
- * `enabled` is left to the room (updateNorthDoorForFireplace / casino).
- */
-function defaultDoorLayoutRecords(): Map<string, DoorLayoutRecord> {
-  const out = new Map<string, DoorLayoutRecord>();
-  for (const id of ["north", "south", "east", "west"] as const) {
-    out.set(id, { id, wall: id, lateral: 0, size: "large", enabled: true });
-  }
-  return out;
-}
 
 /** 🚪 #91: the wall physically facing a given wall. Walking out of a room's
  *  north side must bring you in through the next room's south side. */
@@ -1768,6 +1753,12 @@ export class World {
   public reconcileDoorLayout(records: Map<string, DoorLayoutRecord>): void {
     if (!this.dockingSystem) return; // docking ports not built yet
     if (records.size === 0) records = defaultDoorLayoutRecords();
+    // 🚪 Publish the door set to the pose layer FIRST — physicalDoorPose reads
+    // it, and everything below (rebuildDoors, syncDoorGroups,
+    // reconcileDoorPlacements, the editor's slice rebuild) poses doors. This
+    // is the single push point that replaced the layout-kind global: it fires
+    // on bind and on every door change, which is exactly when a pose can move.
+    setDoorRecords(records);
     // 🚪 #91: a door that VANISHED takes its connector tube with it. The
     // editor's "unpair it first" rule guards only the removing client; a
     // deletion arriving from a peer lands straight here, and updatePairedVestibules
@@ -2275,7 +2266,7 @@ export class World {
     roomId: string,
     returnDoorId?: DoorId,
     theme?: RoomTheme,
-    doorLayout?: DoorLayoutKind,
+    doorLayout?: LegacyLayoutKind,
   ): void {
     const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
     const casino = roomId === CASINO_ROOM_ID;
@@ -2289,34 +2280,28 @@ export class World {
     const deck = resolvedTheme === "outdoor-deck";
     const casinoTheme = resolvedTheme === "casino";
     this.isOutdoorDeck = deck;
-    // 🚪 Camera-near south/east edges stay clear EVERYWHERE: the lobby and
-    // the casino run "casino-pairs", the outdoor pool room "pool-pairs" —
-    // aliases of the same paired arrangement (SOUTH on the north wall, EAST
-    // on the west wall; the dive tower stands between the two north doors).
+    // 🚪 The room's RETIRED door-layout kind — compat only. A door's physical
+    // slot now comes from its own layout record (wall + lateral), which is what
+    // lets a wall carry zero or many doors; this line only tells the doc layer
+    // how to read a record written BEFORE that, in a room whose owner has not
+    // re-seeded it. See the compat shim in doorLayoutDoc, which is where the
+    // "casino-pairs"/"pool-pairs"/"legacy" tables now live and where they die.
     //
-    // 🚪 #91 — READ THIS BEFORE CHANGING IT. This layout is ALSO the reason
-    // travel directions read wrong: a paired room has doors on its north and
-    // west walls ONLY, so no arrival can ever come in through a south or east
-    // door. Walk north out of room A into room B and B can only put you at a
-    // north-wall door — "traveling into a north door … exiting out of the
-    // north door of the other room, instead of exiting the south door heading
-    // north". resolveArrivalDoor now picks by facing WALL (see it), which is
-    // correct the moment a room HAS a facing door; under this layout there
-    // simply is none. The honest fix is `legacy` (one door per wall) for
-    // ordinary rooms — but the authored lounge is arranged AROUND these
-    // walls: with legacy, all four default doorways land behind furniture
-    // (armchairs on the south + east runs, the map table on the north), so
-    // flipping it means re-arranging every authored room. Owner's call —
-    // raised on the #91 PR rather than changed silently.
-    //
-    // 🛰️🚪 A room CAN name its own arrangement (roomInfo `doorLayout`, passed
-    // in by the caller). A module born with one door does exactly that: it
-    // asks for "legacy" so its single door sits CENTRED on its wall instead of
-    // ±PAIR_OFFSET off it. Nothing is arranged around a new module's walls, so
-    // the furniture objection above doesn't apply there.
-    setActiveDoorLayout(
+    // Nothing downstream branches on this any more. In particular a module born
+    // with one door no longer has to ask for "legacy" to get its door centred:
+    // seedDoorLayoutSingle writes an authoritative record and the shim skips it.
+    setLegacyRoomDoorLayout(
       doorLayout ?? (outdoor ? "pool-pairs" : "casino-pairs"),
     );
+    // …and re-publish the door set, because the shim's output depends on the
+    // kind just set. The retired global was read LAZILY inside every pose call,
+    // so a kind change took effect on the next pose with no help; a pushed
+    // snapshot does not, and applyRoomVisuals is not followed by a door
+    // reconcile (its caller runs reconcileDoorPlacements BEFORE binding the
+    // layout doc). Without this line an un-migrated room entered through a
+    // transit would pose its cardinals with the DEPARTURE room's kind.
+    const applied = readAllDoorLayout();
+    setDoorRecords(applied.size ? applied : defaultDoorLayoutRecords());
 
     // 🤖 One drink-service waiter implementation serves every authored room;
     // each room supplies a route through its own open aisles. Recreate on a
