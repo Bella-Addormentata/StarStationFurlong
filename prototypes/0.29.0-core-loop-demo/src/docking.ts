@@ -1322,7 +1322,7 @@ export class DoorDockingPortSystem {
           removeDoorGrant(doorId, pub);
         }
         this.renderPolicySection(doorId);
-        this.renderAssemblyStrip(doorId); // a grant/mode change may unlock the strip
+        if (isCardinalDoorId(doorId)) this.renderAssemblyStrip(doorId); // a grant/mode change may unlock the strip
       });
   }
 
@@ -1618,11 +1618,10 @@ export class DoorDockingPortSystem {
     // Expose active door context inside the modal scope
     (pane as any).activeDoorId = doorId;
     pane.style.display = "flex";
-    if (isCardinal) {
-      title.textContent = `🚪 DOCKING PORT CONTROL: ${doorId.toUpperCase()}`;
-    } else {
-      title.textContent = `🚪 DOOR SETTINGS: ${doorId.replace(/^d:/, "").slice(0, 8).toUpperCase()}`;
-    }
+    const wallLabel = this.poseForDoor(doorId).wall.toUpperCase();
+    title.textContent = isCardinal
+      ? `🚪 DOCKING PORT CONTROL: ${wallLabel} WALL`
+      : `🚪 DOOR SETTINGS: ${wallLabel} WALL`;
 
     // Set field states
     lockBtn.textContent = state.locked ? "LOCKED" : "UNLOCKED";
