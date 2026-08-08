@@ -657,6 +657,31 @@
         background: #a0a6b1;
       }
 
+      /* 📜🚪 Door control pane scrollbar. Same treatment as the phone above, in
+         the pane's own amber instead of the phone's gray — the pane caps at
+         80vh and scrolls its body (docking.ts #docking-pane-scroll), and an
+         OS-default bar reads as a foreign white slab against the near-black
+         panel. Scoped to the scroll region so nothing else in the pane is
+         affected. */
+      #docking-pane-scroll {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(212, 168, 75, 0.45) rgba(212, 168, 75, 0.08); /* thumb, track */
+      }
+      #docking-pane-scroll::-webkit-scrollbar {
+        width: 6px;
+      }
+      #docking-pane-scroll::-webkit-scrollbar-track {
+        background: rgba(212, 168, 75, 0.08);
+        border-radius: 4px;
+      }
+      #docking-pane-scroll::-webkit-scrollbar-thumb {
+        background: rgba(212, 168, 75, 0.45);
+        border-radius: 4px;
+      }
+      #docking-pane-scroll::-webkit-scrollbar-thumb:hover {
+        background: rgba(212, 168, 75, 0.7);
+      }
+
       /* Home screen app-launcher grid */
       #phone-home-screen.active {
         padding: 18px 14px;
