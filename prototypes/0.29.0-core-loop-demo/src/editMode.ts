@@ -3135,7 +3135,7 @@ class RoomEditController {
       `;
       document.body.appendChild(this.labelEl);
     }
-    this.labelEl.textContent = itemId;
+    this.labelEl.textContent = this.labelTextForItem(itemId);
     this.labelEl.style.display = 'block';
 
     const group = this.groupForId(itemId);
@@ -3143,6 +3143,14 @@ class RoomEditController {
       ? new THREE.Box3().setFromObject(group).max.y
       : 1.0;
     this.updateLabelPosition();
+  }
+
+  private labelTextForItem(itemId: string): string {
+    if (!this.doorIds.has(itemId)) return itemId;
+    const wall = (this.doorDrag?.doorId === itemId
+      ? this.doorDrag.wall
+      : currentDoorOpenings().find((opening) => opening.id === itemId)?.wall);
+    return wall ? `DOOR · ${wall.toUpperCase()} WALL` : `DOOR · ${itemId.toUpperCase()}`;
   }
 
   private hideLabel(): void {
