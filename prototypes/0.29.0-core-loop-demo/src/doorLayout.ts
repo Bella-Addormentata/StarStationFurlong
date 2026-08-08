@@ -203,13 +203,65 @@ export function setDoorRecords(
  * geometry is unchanged.
  */
 export function physicalDoorPose(
-  id: PhysicalDoorId,
+  // `string`, not PhysicalDoorId: free `d:` ids already reach here through
+  // casts at the call sites, so the narrow type was advertising a guarantee it
+  // did not have. Widening it makes the guard below the real contract.
+  id: string,
   lateralDelta = 0,
 ): PhysicalDoorPose {
+  return physicalDoorPoseOrNull(id, lateralDelta) ?? fallbackPose(id);
+}
+
+/**
+ * 🚪 The same lookup, but honest about a miss: `null` means "this client does
+ * not know where that door is", which is a real state and NOT the same as "it
+ * is on the north wall". Callers that would otherwise make a decision from a
+ * guessed pose — module-overlap clash tests, exterior projections of a FAR
+ * room's door — must use this and degrade permissively, because a confident
+ * wrong answer there refuses a legitimate dock or draws a module in the wrong
+ * place. Callers that only need *some* pose to render local scenery can keep
+ * using physicalDoorPose.
+ */
+export function physicalDoorPoseOrNull(
+  id: string,
+  lateralDelta = 0,
+): PhysicalDoorPose | null {
   const rec = doorRecords.get(id);
-  const wall = rec?.wall ?? id;
-  const lateral = (rec?.lateral ?? 0) + lateralDelta;
-  return poseFromWall(wall, lateral, lateral);
+  if (rec) {
+    const lateral = rec.lateral + lateralDelta;
+    return poseFromWall(rec.wall, lateral, lateral);
+  }
+  // No record. A CARDINAL id is still self-describing — it names its own wall,
+  // which is what the retired layout global's "legacy" default produced at boot
+  // before any room is entered, so that path stays bit-identical.
+  if (isCardinalDoorId(id)) return poseFromWall(id, lateralDelta, lateralDelta);
+  return null;
+}
+
+/**
+ * 🚪 TOTALITY GUARD. `poseFromWall`'s switch has no `default` arm — deliberately,
+ * so the compiler proves every legitimate caller passes a doc-validated wall —
+ * which means handing it a door ID that is not a wall name returns `undefined`
+ * and the first property read throws.
+ *
+ * That is reachable: a free `d:` id belonging to a room this client is not in
+ * (a far room's door, or a key gossiped by a peer) is absent from the record
+ * snapshot, and the old `rec?.wall ?? id` fell straight through to
+ * `poseFromWall("d:abc", …)`. The blast radius is the whole exterior render,
+ * per frame, from a value that persists in localStorage — so it must degrade,
+ * loudly, not crash.
+ */
+const warnedUnknownDoors = new Set<string>();
+function fallbackPose(id: string): PhysicalDoorPose {
+  if (!warnedUnknownDoors.has(id)) {
+    warnedUnknownDoors.add(id);
+    console.warn(
+      `[doorLayout] no pose for door "${id}" — it is not a cardinal and has no ` +
+        `record in this room. Rendering it at the north wall centre. This is a ` +
+        `bug in whatever supplied the id, not in the door.`,
+    );
+  }
+  return poseFromWall("north", 0, 0);
 }
 
 /** 🛰️ #28 S1: the structural PORT pose. Ports are, for now, exactly the 4

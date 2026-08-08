@@ -28,6 +28,7 @@ import {
 import { readDoorPolicy } from "./doorPolicy";
 import { readDoorDeltas } from "./floorPlanDoc";
 import { physicalDoorPose } from "./doorLayout";
+import { readAllDoorLayout } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
@@ -247,9 +248,21 @@ function buildGroup(): THREE.Group {
   // latches around the rim, concentric silver guide rings with an X brace,
   // a flank equipment box, and BLUE truss struts back to the hull.
   const slideDeltas = readDoorDeltas();
-  for (const doorId of ["north", "south", "east", "west"] as const) {
+  // 🔌 Iterate the room's REAL door set, not the four cardinal names: an
+  // adapter can now be installed on a free `d:` door, and it has to grow a
+  // collar out on the hull like any other.
+  //
+  // The unseeded fallback matters (same convention as editMode's door-opening
+  // enumeration): readAllDoorLayout is empty for any room whose owner never
+  // touched the door editor, and iterating it bare would silently delete the
+  // collar from every such room — a regression with no error to notice.
+  const layout = readAllDoorLayout();
+  const doorIds: string[] = layout.size
+    ? [...layout.keys()]
+    : ["north", "south", "east", "west"];
+  for (const doorId of doorIds) {
     if (!readDoorPolicy(doorId).adapter) continue;
-    const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+    const pose = physicalDoorPose(doorId, slideDeltas[doorId as DoorId] ?? 0);
     const collar = new THREE.Group();
     collar.name = `dockAdapter-${doorId}`;
     const softGoods = new THREE.MeshStandardMaterial({

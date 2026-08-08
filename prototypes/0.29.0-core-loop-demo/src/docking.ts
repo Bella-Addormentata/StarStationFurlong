@@ -1451,14 +1451,20 @@ export class DoorDockingPortSystem {
             <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
           </span></div>`
       : "";
-    const adapterRow = isCardinal
-      ? `<div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
+    // 🔌 EVERY door, cardinal or free (owner's ruling: "any door should allow a
+    // vestibule or docking adapter"). Deliberately NOT gated on isCardinal like
+    // positionRow above, and it needs no store work to get here: doorPolicy has
+    // been free-door native on both sides since #91 — isKnownDoorId accepts any
+    // id in the room's layout (doorPolicy.ts), and its own comment records that
+    // the remaining gap was "a UI-only change rather than another store
+    // migration". This is that change. The adapter is a per-door capability
+    // flag, so nothing about it was ever cardinal except this ternary.
+    const adapterRow = `<div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
           ${
             policy.adapter
               ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
               : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
-          }</div>`
-      : "";
+          }</div>`;
 
     if (owner) {
       const requests = readDoorRequests(doorId);
