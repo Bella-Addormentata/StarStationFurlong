@@ -738,7 +738,13 @@ export class DoorDockingPortSystem {
     pane.innerHTML = `
       <div style="flex:0 0 auto; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:10px;">
         <span id="docking-pane-title" style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚪 DOCKING PORT CONTROL</span>
-        <button id="docking-close-btn" style="background:rgba(212,168,75,0.1); border:1px solid rgba(212,168,75,0.3); border-radius:6px; color:#d4a84b; font-size:10px; padding:4px 8px; cursor:pointer;">X</button>
+        <!-- type=button: this pane is built inside no form today, but the HTML
+             default is submit, and a bare <button> that ever ends up in one
+             reloads the page. aria-label/title because the glyph is the entire
+             label: a screen reader would otherwise announce "X", and this is
+             the ONLY way to dismiss the pane (no Esc handler), which is exactly
+             why the header is pinned above the scroll region. -->
+        <button id="docking-close-btn" type="button" aria-label="Close door control panel" title="Close" style="background:rgba(212,168,75,0.1); border:1px solid rgba(212,168,75,0.3); border-radius:6px; color:#d4a84b; font-size:10px; padding:4px 8px; cursor:pointer;">X</button>
       </div>
 
       <!-- 📜 Scroll region. The pane caps at 80vh and this is the part that
