@@ -21,7 +21,14 @@
 import * as THREE from "three";
 import { physicalDoorPose } from "./doorLayout";
 
-export type VestibuleDoorId = "north" | "south" | "east" | "west";
+/**
+ * 🚪 A door a vestibule/gangway can hang off. Now `string`: the geometry here
+ * was never cardinal — buildVestibule and the connector chain need only a
+ * POSE (x, z, outwardYaw), which every door has from its layout record. The
+ * narrow type was the only thing saying otherwise, and the owner's ruling is
+ * that any door takes a vestibule.
+ */
+export type VestibuleDoorId = string;
 export type VestibuleLightState = "idle" | "cycling" | "fault";
 
 // ── Palette (matches the lobby's gunmetal / dark-fabric / cyan / amber read)

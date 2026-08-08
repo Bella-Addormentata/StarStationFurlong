@@ -238,6 +238,21 @@ export function readDoorDeltas(): Record<DoorId, number> {
   return out;
 }
 
+/**
+ * 🚪 The floor-plan SLIDE for any door id — 0 for a free `d:` door.
+ *
+ * This store is keyed to the four structural berths and always was: a free
+ * door has no delta because its position IS its layout record's `lateral`,
+ * with nothing to be relative to. Callers that now accept any door id need to
+ * ask without narrowing the id first, and `readDoorDeltas()[id]` does not
+ * type-check for a `string` — this is that lookup, in one place, so the
+ * "free doors have no slide" rule is stated once instead of at every call.
+ */
+export function doorSlideDelta(id: string): number {
+  const deltas = readDoorDeltas() as Record<string, number | undefined>;
+  return deltas[id] ?? 0;
+}
+
 // ── 📐 Room dimensions read/write (R0 — no consumers yet) ────────────────────
 
 function sanitizeTileCount(n: unknown): number | null {

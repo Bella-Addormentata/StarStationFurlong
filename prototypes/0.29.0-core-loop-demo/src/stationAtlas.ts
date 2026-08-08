@@ -39,7 +39,8 @@ export interface AtlasDoor {
   /** Far room id parsed from the seed link (graph key), '' if unparseable. */
   targetRoomId: string;
   segments?: ConnectorSegment[];
-  farDoor?: DoorId;
+  /** May name a free `d:` door in the far room. */
+  farDoor?: string;
   farYawDeg?: 0 | 45;
 }
 
@@ -52,7 +53,8 @@ export interface AtlasEntry {
    *  the exterior view render each module at its TRUE size. Absent for rooms we
    *  only know as neighbours (stub entries) → the renderer falls back. */
   dims?: { cols: number; rows: number };
-  doors: Partial<Record<DoorId, AtlasDoor>>;
+  /** Keyed by DOOR ID — cardinal or free `d:`. */
+  doors: Record<string, AtlasDoor>;
   lastSeen: number;
 }
 
@@ -109,12 +111,12 @@ export function harvestIntoAtlas(entry: {
   name: string;
   seed?: string;
   dims?: { cols: number; rows: number };
-  doors: Array<{ doorId: DoorId; targetSeed: string; segments?: ConnectorSegment[]; farDoor?: DoorId; farYawDeg?: 0 | 45 }>;
+  doors: Array<{ doorId: string; targetSeed: string; segments?: ConnectorSegment[]; farDoor?: string; farYawDeg?: 0 | 45 }>;
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
   const prior = atlas[entry.roomId];
-  const doors: Partial<Record<DoorId, AtlasDoor>> = {};
+  const doors: Record<string, AtlasDoor> = {};
   for (const d of entry.doors) {
     doors[d.doorId] = {
       targetSeed: d.targetSeed,
@@ -185,7 +187,7 @@ export interface AtlasPose {
  */
 export function atlasLayout(
   currentRoomId: string,
-  poseForDoor: (doorId: DoorId, segments?: ConnectorSegment[], farDoor?: DoorId) => { x: number; z: number; rotY: number },
+  poseForDoor: (doorId: string, segments?: ConnectorSegment[], farDoor?: string) => { x: number; z: number; rotY: number },
   maxHops = 10,
 ): AtlasPose[] {
   const atlas = readAtlas();
@@ -210,7 +212,7 @@ export function atlasLayout(
       // infer it from the graph before composing the hop.
       const farDoor = door.farDoor
         ?? (Object.entries(atlas[door.targetRoomId]?.doors ?? {})
-          .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === fromId)?.[0] as DoorId | undefined);
+          .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === fromId)?.[0]);
       // The hop's pose in the FROM room's local frame → compose into world.
       const local = poseForDoor(doorId, door.segments, farDoor);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
@@ -296,9 +298,9 @@ export function moduleOverlapAt(
   currentRoomId: string,
   candidate: { x: number; z: number; rotY: number },
   poseForDoor: (
-    doorId: DoorId,
+    doorId: string,
     segments?: ConnectorSegment[],
-    farDoor?: DoorId,
+    farDoor?: string,
   ) => { x: number; z: number; rotY: number },
   opts?: { connectDist?: number; maxHops?: number; moduleHalf?: number },
 ): { roomId: string; name: string } | null {
@@ -329,7 +331,7 @@ interface SharedAtlasEntry {
     /** Present ONLY on a doc's own-room entry (doorsDoc exposes it anyway). */
     targetSeed?: string;
     segments?: ConnectorSegment[];
-    farDoor?: DoorId;
+    farDoor?: string;
     farYawDeg?: 0 | 45;
   }>>;
   /** Present ONLY on a doc's own-room entry while passage policy is public. */
@@ -403,7 +405,7 @@ function pullSharedAtlas(): void {
     if (prior
       && prior.lastSeen >= value.updatedAt
       && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
-    const doors: Partial<Record<DoorId, AtlasDoor>> = {};
+    const doors: Record<string, AtlasDoor> = {};
     for (const [d, door] of Object.entries(value.doors) as Array<[DoorId, NonNullable<SharedAtlasEntry['doors'][DoorId]>]>) {
       if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
       doors[d] = {

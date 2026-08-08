@@ -36,8 +36,11 @@ export interface DoorRecord {
   /** Ordered connector chain (flex joints + extensions). Absent ⇒ legacy
    *  straight vestibule. Unknown segment kinds fail sanitize ⇒ legacy. */
   segments?: ConnectorSegment[];
-  /** The FAR room's door this connection lands on (arrival-door override). */
-  farDoor?: 'north' | 'south' | 'east' | 'west';
+  /** The FAR room's door this connection lands on (arrival-door override).
+   *  A `string`, not the cardinal enum: the far room may land the connection
+   *  on a free `d:` door of its own. Bounded at the read boundary below —
+   *  this value crosses the peer trust seam (module header). */
+  farDoor?: string;
   /** Far room ring-orientation: 0 = square, 45 = diamond (octagon ring). */
   farYawDeg?: 0 | 45;
   /** #67 D2: TRANSIENT guest berth (docking-adapter pairing) — no chains, no
@@ -127,7 +130,11 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
     }
     if (ok) out.segments = clean;
   }
-  if (r.farDoor === 'north' || r.farDoor === 'south' || r.farDoor === 'east' || r.farDoor === 'west') {
+  // 🚪 Bounded, not enumerated: same shape rule as a pairing KEY, so a peer
+  // cannot smuggle an arbitrary string into the pose and arrival paths.
+  // Every consumer degrades safely on a miss anyway — findDoor returns null
+  // and the adapter falls back to the departure heading.
+  if (typeof r.farDoor === 'string' && isAcceptableDoorKey(r.farDoor)) {
     out.farDoor = r.farDoor;
   }
   if (r.farYawDeg === 0 || r.farYawDeg === 45) out.farYawDeg = r.farYawDeg;
@@ -135,13 +142,42 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
   return out;
 }
 
-/** Snapshot every valid door pairing as id → SANITIZED record (only the four
- *  real door ids; malformed entries are skipped, not fatal). */
+/** A door id we will accept as a pairing key: one of the four structural
+ *  berths, or an editor-minted free door. Deliberately an id-SHAPE test and
+ *  NOT `hasDoorLayout(id)` — bindDoorsDoc runs notify() synchronously and
+ *  main.ts binds it BEFORE bindDoorLayoutDoc, so a cross-doc lookup here is
+ *  false on every join and would silently drop every free-door pairing, with
+ *  no recovery (reconcileDoorLayout never re-runs reconcileDoors). */
+function isAcceptableDoorKey(id: string): boolean {
+  if (id.length > MAX_KEY_LEN) return false;
+  return (DOOR_IDS as readonly string[]).includes(id) || id.startsWith('d:');
+}
+
+/** Bounds replacing the DoS fence the fixed four-id loop gave us for free:
+ *  before, whatever a peer wrote we read exactly four entries. Mirrors the
+ *  station atlas's MAX_ENTRIES discipline. */
+const MAX_KEY_LEN = 64;
+const MAX_PAIRINGS = 64;
+
+/**
+ * Snapshot every valid door pairing as id → SANITIZED record (malformed
+ * entries are skipped, not fatal).
+ *
+ * 🚪 This loop WAS the four-door keyspace. Nothing on the wire ever constrained
+ * it — `doors` is a plain string-keyed Y.Map and writeDoorPairing /
+ * deleteDoorPairing / writeDoorTombstone all take `doorId: string` unvalidated
+ * — so a free door's pairing was already being written and gossiped, and read
+ * by nobody, including its own author after a rejoin. A silent write-only black
+ * hole rather than a throw, which is why nothing ever surfaced it. Iterating
+ * the map is what makes a free door dockable; every cardinal-ism downstream
+ * (reconcileDoors, the arrival mirror, the atlas harvest) reads through here.
+ */
 export function readAllDoors(): Map<string, DoorRecord> {
   const out = new Map<string, DoorRecord>();
   if (!docAlive()) return out;
-  for (const id of DOOR_IDS) {
-    const value = doorsMap!.get(id);
+  for (const [id, value] of doorsMap!.entries()) {
+    if (out.size >= MAX_PAIRINGS) break;
+    if (!isAcceptableDoorKey(id)) continue;
     if (isDoorRecord(value)) out.set(id, sanitizeDoorGeometry(value));
   }
   return out;
@@ -168,6 +204,36 @@ export function writeDoorPairing(doorId: string, address: string, geometry?: Doo
   boundDoc!.transact(() => {
     doorsMap!.set(doorId, record);
   });
+}
+
+/**
+ * 🧹 Reap pairing records whose DOOR no longer exists.
+ *
+ * removeSelectedDoor only calls deleteDoorLayout, so before free doors could
+ * pair this was harmless — a deleted door had no pairing. Now it matters: an
+ * orphan record keeps publishing a phantom neighbour to every peer's exterior
+ * view and offering transit into it, forever.
+ *
+ * A reaper rather than an inline delete in the editor, because a door deletion
+ * also arrives from a PEER, which removeSelectedDoor never sees.
+ *
+ * Cardinals are never reaped. They are structural berths that exist whether or
+ * not the layout doc has been seeded, and an unseeded room legitimately reads
+ * as "no records at all" — reaping on that would wipe every pairing in the
+ * room the first time someone joined before the layout doc bound.
+ */
+export function reapOrphanPairings(liveDoorIds: ReadonlySet<string>): string[] {
+  if (!docAlive()) return [];
+  const dead: string[] = [];
+  for (const id of doorsMap!.keys()) {
+    if ((DOOR_IDS as readonly string[]).includes(id)) continue;
+    if (!liveDoorIds.has(id)) dead.push(id);
+  }
+  if (dead.length === 0) return [];
+  boundDoc!.transact(() => {
+    for (const id of dead) doorsMap!.delete(id);
+  });
+  return dead;
 }
 
 /** Remove a door's pairing from the shared layout (reject / unpair). */

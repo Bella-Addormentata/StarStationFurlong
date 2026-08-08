@@ -96,7 +96,6 @@ import {
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
-import { isCardinalDoorId } from "./doorLayout";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
@@ -2125,12 +2124,17 @@ async function transitTo(
     // the owner's undock on the next walk-through. Refuse the mirror only for
     // THAT module: a tombstone must not strand a different connection built
     // later on the same door.
-    // 🚪 #91: and only a CARDINAL id — the pairing wire is keyed to the four
-    // berths, so a mirror written under a free `d:` id is a permanent orphan
-    // no client can ever read back.
+    // 🚪 The cardinal-only conjunct is gone: readAllDoors iterates the map now,
+    // so a mirror written under a free `d:` id IS read back, by this client and
+    // by every peer. It was never the WIRE that could not hold it.
+    //
+    // ⚠️ Note what this exercises harder: the write below goes into the ARRIVAL
+    // room's doc — a doc this client does not own. That cross-room write is an
+    // existing property of the lazy-mirror design, not something introduced
+    // here, but free doors make it fire on many more doors.
     const retired =
       existing && !existing.paired && existing.connectedRoomAddress === depAddress;
-    if (!existing?.paired && !retired && isCardinalDoorId(arrivalDoorId)) {
+    if (!existing?.paired && !retired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
         segments: depGeometry
           ? mirrorSegments(depGeometry.segments)

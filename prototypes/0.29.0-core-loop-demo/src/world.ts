@@ -9,6 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import {
   physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
+  type PhysicalDoorId,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import { Player } from "./player";
@@ -80,6 +81,7 @@ import {
   readAllDoors,
   writeDoorPairing,
   deleteDoorPairing,
+  reapOrphanPairings,
   type DoorRecord,
 } from "./doorsDoc";
 import { readDoorDeltas, roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
@@ -297,11 +299,12 @@ export class World {
    * A transit rides the SAME instance (no separate transit vestibule) — the
    * 'cycling'/'fault' lights only run while the transit is in flight.
    */
-  private pairedVestibules: Map<DoorId, THREE.Group> = new Map();
+  /** Keyed by DOOR ID — cardinal or free `d:`; a vestibule needs only a pose. */
+  private pairedVestibules: Map<string, THREE.Group> = new Map();
   /** Door whose vestibule is lit for an in-flight transit, or null. */
-  private transitVestibuleDoorId: DoorId | null = null;
+  private transitVestibuleDoorId: string | null = null;
   /** 🚪 #91: tubes of removed doors awaiting a safe frame to dispose. */
-  private orphanVestibules: Set<DoorId> = new Set();
+  private orphanVestibules: Set<string> = new Set();
   /** Resting opacity of a paired-door vestibule when the player is far.
    *  0 — the ghost gangways read as a pile of dark capsules outside the
    *  walls (owner request: remove them from view); the tube still fades in
@@ -1515,12 +1518,21 @@ export class World {
    */
   public reconcileDoors(records: Map<string, DoorRecord>): void {
     if (!this.dockingSystem) return; // docking ports not built yet
-    const doors: Array<"north" | "south" | "east" | "west"> = [
+    // 🚪 Every door the room HAS, union every door that currently claims a
+    // pairing. The union matters in both directions: a door with a record but
+    // no pairing needs clearRemotePairing (that is what the old fixed list
+    // did), and a pairing whose door was deleted must still be cleared, or its
+    // gangway tube outlives the door. Cardinals are always included even when
+    // the layout doc is unseeded, matching the four-door fallback everywhere
+    // else.
+    const doors = new Set<string>([
       "north",
       "south",
       "east",
       "west",
-    ];
+      ...readAllDoorLayout().keys(),
+      ...records.keys(),
+    ]);
     for (const doorId of doors) {
       const rec = records.get(doorId);
       if (rec && rec.paired && rec.connectedRoomAddress) {
@@ -1643,9 +1655,17 @@ export class World {
     };
     placeOnDoor(this.poolSign, "south", !outdoor && !casino); // 🏊 pool door
     placeOnDoor(this.casinoSign, "east", !outdoor && !casino); // 🎰 casino door
+    // 🚪 ORDER-INDEPENDENT on purpose. This used to take the first paired
+    // record out of readAllDoors, which enumerated the four cardinals in a
+    // fixed order; it now iterates the Y.Map, whose order is insertion order.
+    // Left alone, the return sign would silently hop to a different door — and
+    // if that door were a free `d:` one, placeOnDoor's non-cardinal guard below
+    // would hide the sign entirely with nothing in the console. Prefer a
+    // cardinal, then fall back, so the choice cannot depend on map order.
+    const paired = [...readAllDoors()].filter(([, record]) => record.paired);
     const pairedDoorId =
       returnDoorId ??
-      ([...readAllDoors()].find(([, record]) => record.paired)?.[0] as
+      ((paired.find(([id]) => isCardinalDoorId(id)) ?? paired[0])?.[0] as
         | DoorId
         | undefined);
     placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
@@ -1754,7 +1774,18 @@ export class World {
    */
   public reconcileDoorLayout(records: Map<string, DoorLayoutRecord>): void {
     if (!this.dockingSystem) return; // docking ports not built yet
-    if (records.size === 0) records = defaultDoorLayoutRecords();
+    const unseeded = records.size === 0;
+    if (unseeded) records = defaultDoorLayoutRecords();
+    // 🧹 A free door that was deleted (here or by a peer) must not leave its
+    // pairing behind — an orphan record publishes a phantom neighbour to every
+    // client's exterior view and still offers transit into it. Skipped for an
+    // UNSEEDED room: there, `records` is a synthesized default set, not
+    // evidence that the owner's free doors are gone.
+    if (!unseeded) {
+      const reaped = reapOrphanPairings(new Set(records.keys()));
+      if (reaped.length)
+        console.info(`[doors] reaped orphan pairings: ${reaped.join(", ")}`);
+    }
     // 🚪 Publish the door set to the pose layer FIRST — physicalDoorPose reads
     // it, and everything below (rebuildDoors, syncDoorGroups,
     // reconcileDoorPlacements, the editor's slice rebuild) poses doors. This
@@ -4147,7 +4178,7 @@ export class World {
   }
 
   /** Remove and dispose one paired-door vestibule (geometries + materials). */
-  private disposeVestibule(doorId: DoorId): void {
+  private disposeVestibule(doorId: string): void {
     const vestibule = this.pairedVestibules.get(doorId);
     if (!vestibule) return;
     this.pairedVestibules.delete(doorId);
@@ -4399,8 +4430,8 @@ export class World {
   }
 
   public resolveArrivalDoor(
-    departureDoorId: DoorId,
-    farDoor?: DoorId,
+    departureDoorId: string,
+    farDoor?: string,
     fromRoomId?: string,
   ): DoorTarget {
     // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
@@ -4445,14 +4476,17 @@ export class World {
     // and straight back out of the next room's north door: "traveling into a
     // north door … exiting out of the north door of the other room, instead of
     // exiting the south door heading north" (#91). Walls always mirror.
-    // Restricted to CARDINAL berths on purpose: the pairing wire is keyed to
-    // the four of them, so arriving at a free door would strand the return
-    // (no record can be written for it — see the mirror gate in main.ts).
-    // Pairing free doors is the deferred #28 S6d work.
+    // Any door on that wall, free or cardinal. The old cardinal restriction
+    // existed because a mirror could not be written for a free arrival door, so
+    // arriving at one stranded the return; readAllDoors now iterates the map
+    // and main.ts writes the mirror for any id, so the restriction is retired.
+    // Prefer a cardinal when several doors share the facing wall, purely so the
+    // choice does not depend on DOORS insertion order.
     const want = oppositeWall(this.wallOfDoor(departureDoorId));
-    const facing = DOORS.find(
-      (d) => d.enabled && isCardinalDoorId(d.id) && this.wallOfDoor(d.id) === want,
+    const onWall = DOORS.filter(
+      (d) => d.enabled && this.wallOfDoor(d.id) === want,
     );
+    const facing = onWall.find((d) => isCardinalDoorId(d.id)) ?? onWall[0];
     if (facing) return facing;
     // 🚪 #91: no door on the facing wall — which is the NORM under the paired
     // layouts, where all four cardinals share the north and west walls. Fall
@@ -4461,14 +4495,22 @@ export class World {
     // `east` fallback below, dropping the traveler at the same spot no matter
     // where they came from (and, at PAIR_OFFSET 3.0, inside the casino's
     // authored furniture).
-    const oppositeId: Record<DoorId, DoorId> = {
+    // 🚪 A CARDINAL-only tier by construction: it maps an id to its opposite
+    // ID, which only means anything for the four berths. A free door has no
+    // id-opposite — it is matched by WALL in the tier above, which is the
+    // honest test and already ran. Left in place for cardinals rather than
+    // deleted, because it is what rescues the fireplace-blocked south
+    // departure when no door sits on the facing wall.
+    const oppositeId: Record<PhysicalDoorId, PhysicalDoorId> = {
       north: "south",
       south: "north",
       east: "west",
       west: "east",
     };
-    const counterpart = findDoor(oppositeId[departureDoorId]);
-    if (counterpart && counterpart.enabled) return counterpart;
+    if (isCardinalDoorId(departureDoorId)) {
+      const counterpart = findDoor(oppositeId[departureDoorId]);
+      if (counterpart && counterpart.enabled) return counterpart;
+    }
     // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
     // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
     // south departure, but degrade to any enabled door / any door at all instead
@@ -4486,8 +4528,8 @@ export class World {
    * #51) and script the walk-in through the arrival door.
    */
   public completeAdapterArrival(
-    departureDoorId: DoorId,
-    farDoor?: DoorId,
+    departureDoorId: string,
+    farDoor?: string,
     fromRoomId?: string,
   ): void {
     this.endTransitVestibule();
@@ -4563,7 +4605,7 @@ export class World {
    * end the transit (lights back to 'idle') once the door closes behind the
    * player — the vestibule persists, the door is still paired (#51).
    */
-  public failAdapterTransit(departureDoorId: DoorId): void {
+  public failAdapterTransit(departureDoorId: string): void {
     const vestibule = this.pairedVestibules.get(departureDoorId);
     if (vestibule) setVestibuleLightState(vestibule, "fault");
     const door = findDoor(departureDoorId);
