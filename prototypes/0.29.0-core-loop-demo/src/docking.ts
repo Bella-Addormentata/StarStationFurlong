@@ -19,6 +19,13 @@ import {
 } from "./doorLayout";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
+import {
+  DOOR_LABEL_MAX,
+  sanitizeDoorLabel,
+  readAllDoorLayout,
+  writeDoorLayout,
+  seedDoorLayoutDefaults,
+} from "./doorLayoutDoc";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
 import {
@@ -758,6 +765,19 @@ export class DoorDockingPortSystem {
       <div id="docking-pane-scroll" style="flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:16px; margin-right:-10px; padding-right:10px;">
 
       <div style="display:flex; flex-direction:column; gap:12px; font-size:11px;">
+        <!-- 🪧 DOOR SIGN — the owner's ruling: instead of the app deciding what
+             a door leads to from its cardinal ID (the pool sign was welded to
+             the door called "south", the casino sign to "east"), the room
+             author types it. Works on EVERY door, cardinal or free d: —
+             deliberately outside the isCardinal show/hide block below, because
+             a user-placed door is exactly the one nobody can otherwise label.
+             maxlength mirrors DOOR_LABEL_MAX; sanitizeDoorLabel is still the
+             authority at the write boundary (paste bypasses maxlength). -->
+        <div id="docking-label-row">
+          <label for="docking-label-input" style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">🪧 DOOR SIGN <span id="docking-label-note" style="color:rgba(212,168,75,0.38); font-size:9px;">· what is on the other side</span></label>
+          <input type="text" id="docking-label-input" maxlength="${DOOR_LABEL_MAX}" placeholder="e.g. POOL, CASINO, DOCK 3 — blank for none" style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace; box-sizing:border-box;">
+        </div>
+
         <!-- Lock config -->
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <span>LOCK STATE CONFIG:</span>
@@ -1061,6 +1081,33 @@ export class DoorDockingPortSystem {
         if (box) box.style.display = "none";
       });
     }
+
+    // ── 🪧 DOOR SIGN wiring ─────────────────────────────────────────────────
+    // `change` (not `input`): one doc write when the field is committed —
+    // Enter or blur — rather than one per keystroke, which would spam every
+    // peer's reconcile and rebuild the plaque texture on each letter.
+    const labelInput = document.getElementById(
+      "docking-label-input",
+    ) as HTMLInputElement | null;
+    labelInput?.addEventListener("change", () => {
+      const pane = document.getElementById("docking-control-pane");
+      const doorId = pane ? ((pane as any).activeDoorId as string | null) : null;
+      if (!doorId || !this.canConstruct(doorId)) return;
+      const label = sanitizeDoorLabel(labelInput.value);
+      labelInput.value = label ?? ""; // show what was actually stored
+      // SEED-FIRST (the editMode drag rule): the layout reconcile removes any
+      // door not in the map, so writing one record into an UNSEEDED room would
+      // erase the other three cardinals. Idempotent.
+      seedDoorLayoutDefaults();
+      const rec = readAllDoorLayout().get(doorId);
+      if (!rec) return; // door vanished under an open pane — nothing to label
+      // Drop the key entirely when cleared, so a blank sign costs no bytes on
+      // the wire and reads identically to a door that never had one.
+      const next: DoorLayoutRecord = { ...rec };
+      if (label) next.label = label;
+      else delete next.label;
+      writeDoorLayout(next);
+    });
 
     // ── #62 P4: CONNECTION ASSEMBLY wiring ──────────────────────────────────
     const activeDoor = (): ("north" | "south" | "east" | "west") | null => {
@@ -1648,6 +1695,24 @@ export class DoorDockingPortSystem {
     lockBtn.style.color = state.locked ? "#fff" : "#01020a";
     pinInput.value = state.pinCode;
     addrInput.value = state.connectedRoomAddress;
+
+    // 🪧 DOOR SIGN — every door, cardinal or free. Read-only without build
+    // rights: signage is construction, so it follows the same gate as docking
+    // and assembly rather than the (public-by-default) lock.
+    const labelInput = document.getElementById(
+      "docking-label-input",
+    ) as HTMLInputElement | null;
+    const labelNote = document.getElementById("docking-label-note");
+    if (labelInput) {
+      const mayLabel = this.canConstruct(doorId);
+      labelInput.value = readAllDoorLayout().get(doorId)?.label ?? "";
+      labelInput.readOnly = !mayLabel;
+      labelInput.style.opacity = mayLabel ? "1" : "0.5";
+      if (labelNote)
+        labelNote.textContent = mayLabel
+          ? "· what is on the other side"
+          : "· no build rights on this door";
+    }
 
     // If there is an active inbound pairing request, reveal target controls
     if (state.pairingPending && !state.pairedSuccessfully) {

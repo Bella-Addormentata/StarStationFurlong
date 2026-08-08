@@ -42,6 +42,32 @@ export interface DoorLayoutRecord {
   /** SEED walkability only — runtime `enabled` is owned by the room
    *  (updateNorthDoorForFireplace / casino force-enable / DEV toggle). */
   enabled?: boolean;
+  /**
+   * 🪧 Wayfinding label — what is on the OTHER side of this door, authored by
+   * the room owner in the door panel ("POOL", "CASINO", "LOBBY", "DOCK 3").
+   *
+   * This is what replaces hanging signs off a door's cardinal ID. The wayfinding
+   * signs used to be pinned to literal ids — the pool sign on the door called
+   * "south", the casino sign on "east" (world.refreshDoorSigns) — which meant a
+   * sign could not follow a door that moved, could not exist at all on a
+   * user-placed `d:` door (they were force-hidden), and encoded the room author's
+   * intent in a field that also claims to be a compass direction.
+   *
+   * Trimmed and length-capped at the write boundary; absent or empty ⇒ no sign.
+   */
+  label?: string;
+}
+
+/** 🪧 Longest wayfinding label we will store or render. Long enough for
+ *  "OBSERVATION DECK", short enough to stay legible on a door plaque. */
+export const DOOR_LABEL_MAX = 18;
+
+/** Normalize a user-typed label: collapse whitespace, trim, cap length.
+ *  Returns undefined for anything that should clear the label. */
+export function sanitizeDoorLabel(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const clean = raw.replace(/\s+/g, ' ').trim().slice(0, DOOR_LABEL_MAX);
+  return clean.length > 0 ? clean : undefined;
 }
 
 let boundDoc: Y.Doc | null = null;
@@ -95,7 +121,11 @@ export function isDoorLayoutRecord(value: unknown): value is DoorLayoutRecord {
     WALLS.includes(r.wall as DoorWall) &&
     Number.isFinite(r.lateral) &&
     (r.size === undefined || r.size === 'small' || r.size === 'large') &&
-    (r.enabled === undefined || typeof r.enabled === 'boolean')
+    (r.enabled === undefined || typeof r.enabled === 'boolean') &&
+    // 🪧 Accept any string (never reject stored data — the #91 discipline);
+    // readAllDoorLayout normalizes it below so an over-long or whitespace-only
+    // label from a hostile or older peer can never reach the renderer.
+    (r.label === undefined || typeof r.label === 'string')
   );
 }
 

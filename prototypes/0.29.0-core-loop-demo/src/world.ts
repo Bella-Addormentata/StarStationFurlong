@@ -8,7 +8,7 @@ import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
 import {
-  physicalDoorPose, setActiveDoorLayout, isCardinalDoorId,
+  physicalDoorPose, setActiveDoorLayout, isCardinalDoorId, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import type { DoorLayoutKind } from "./doorLayout";
@@ -91,7 +91,9 @@ import type { AtlasDoor } from "./stationAtlas";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
-import { subscribeDoorLayout, readAllDoorLayout } from "./doorLayoutDoc";
+import {
+  subscribeDoorLayout, readAllDoorLayout, sanitizeDoorLabel,
+} from "./doorLayoutDoc";
 import type { DoorWall } from "./doorLayoutDoc";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
@@ -408,6 +410,13 @@ export class World {
   private lobbySign: THREE.Group | null = null;
   /** Text-only LOBBY carving applied directly to the casino return door. */
   private casinoLobbySign: THREE.Group | null = null;
+  /** 🪧 AUTHORED door signs — door id → its plaque, built from the room's own
+   *  `doorLayout` records. Unlike the four fields above (welded to a theme and
+   *  a cardinal id at compile time) these are created and destroyed as the
+   *  owner types, and a free `d:` door gets one exactly like a cardinal does.
+   *  Each group stashes `userData.labelText` so a re-render only redraws the
+   *  canvas when the text actually changed. */
+  private doorLabelSigns = new Map<string, THREE.Group>();
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
 
@@ -1612,12 +1621,20 @@ export class World {
     const doorExists = (id: DoorId): boolean =>
       layout.size === 0 ? findDoor(id) !== null : layout.has(id);
     const deltas = readDoorDeltas();
+    // 🪧 Authored labels win over the built-in theme signs on the same door:
+    // the owner typing "GYM" on the lobby's south door means that door leads to
+    // the gym now, and two plaques would otherwise z-fight in the same slot.
+    const labelled = this.refreshAuthoredDoorLabels(layout, deltas);
     const placeOnDoor = (
       sign: THREE.Group | null,
       doorId: DoorId,
       visible: boolean,
     ) => {
       if (!sign) return;
+      if (labelled.has(doorId)) {
+        sign.visible = false;
+        return;
+      }
       // A sign hangs over a cardinal BERTH. `doorId` can be an arrival door,
       // and an arrival can now land on a free `d:` door — physicalDoorPose has
       // no slot for one and would throw, poisoning doorSignContext so every
@@ -1648,6 +1665,89 @@ export class World {
         | undefined);
     placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
     placeOnDoor(this.casinoLobbySign, pairedDoorId ?? "west", casino);
+  }
+
+  /**
+   * 🪧 Hang the OWNER-AUTHORED sign on every door whose layout record carries a
+   * label, and take down the ones that no longer do. Returns the set of door
+   * ids now wearing an authored plaque, so refreshDoorSigns can stand the
+   * built-in theme signs down where one has taken over.
+   *
+   * This is the general form of what the four hard-coded signs above do, and
+   * the reason it exists: those are pinned to literal cardinal ids ("the pool
+   * sign lives on the door called south"), which meant a sign could not follow
+   * a door the owner moved to another wall, and a user-placed `d:` door could
+   * never carry one at all — placeOnDoor force-hides those. A record-driven
+   * plaque has neither limit, because the pose comes from the door's own
+   * wall + lateral rather than from what its id happens to be called.
+   */
+  private refreshAuthoredDoorLabels(
+    layout: Map<string, DoorLayoutRecord>,
+    deltas: Partial<Record<DoorId, number>>,
+  ): Set<string> {
+    const wanted = new Map<string, string>();
+    for (const [id, rec] of layout) {
+      // Sanitize at the RENDER boundary too, not just on write: a label can
+      // arrive straight from a peer's doc without passing through our input.
+      const label = sanitizeDoorLabel(rec.label);
+      if (label) wanted.set(id, label);
+    }
+
+    // Drop plaques for doors that lost their label, were deleted, or had the
+    // text edited — the canvas texture is baked at build time, so changed text
+    // means a new sign rather than a mutation.
+    for (const [id, sign] of [...this.doorLabelSigns]) {
+      if (wanted.get(id) === (sign.userData.labelText as string)) continue;
+      this.platformGroup.remove(sign);
+      sign.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.isMesh) return;
+        m.geometry.dispose();
+        const mat = m.material as THREE.MeshBasicMaterial;
+        mat.map?.dispose();
+        mat.dispose();
+      });
+      this.doorLabelSigns.delete(id);
+    }
+
+    for (const [id, text] of wanted) {
+      let sign = this.doorLabelSigns.get(id);
+      if (!sign) {
+        sign = this.makeEngravedSign(
+          text,
+          {
+            shadow: "rgba(4, 48, 24, 0.98)",
+            light: "rgba(226, 255, 235, 0.98)",
+            face: "#72f59a",
+          },
+          false,
+        );
+        sign.userData.labelText = text;
+        this.doorLabelSigns.set(id, sign);
+      }
+      const rec = layout.get(id)!;
+      // Cardinals keep routing through physicalDoorPose so the layout tables
+      // stay the single owner of where a cardinal berth physically sits (the
+      // paired layouts move `south` to the north wall); free doors have no
+      // table and are already stored as the wall + lateral poseFromWall wants.
+      const pose = isCardinalDoorId(id)
+        ? physicalDoorPose(id, deltas[id] ?? 0)
+        : poseFromWall(rec.wall, rec.lateral);
+      const doorFaceOffset = 0.14;
+      sign.position.set(
+        pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
+        2.08,
+        pose.z + Math.cos(pose.frameYaw) * doorFaceOffset,
+      );
+      sign.rotation.y = pose.frameYaw + Math.PI;
+      // Match the built-in signs' per-wall sizing: the 3.4 m banner overruns a
+      // door on the short (north/south) walls, where the room is narrower.
+      sign.scale.setScalar(
+        pose.wall === "north" || pose.wall === "south" ? 0.36 : 0.62,
+      );
+      sign.visible = true;
+    }
+    return new Set(wanted.keys());
   }
 
   /**
