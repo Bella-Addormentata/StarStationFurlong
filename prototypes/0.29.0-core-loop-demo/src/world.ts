@@ -1672,8 +1672,10 @@ export class World {
   ): Set<string> {
     const wanted = new Map<string, string>();
     for (const [id, rec] of layout) {
-      // Sanitize at the RENDER boundary too, not just on write: a label can
-      // arrive straight from a peer's doc without passing through our input.
+      // readAllDoorLayout already sanitized this (that is the read boundary a
+      // peer's doc crosses). Re-running it here is a cheap guard for any future
+      // caller that hands us records from somewhere else, and it doubles as the
+      // empty-string → no-sign test the loop needs anyway.
       const label = sanitizeDoorLabel(rec.label);
       if (label) wanted.set(id, label);
     }

@@ -252,10 +252,21 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
       // 🚪 withCompatSlot LAST: it substitutes the retired layout table's wall
       // and lateral for an un-migrated cardinal, and those are already on-grid,
       // so it must not be rounded back through the #91 normalization above.
-      out.set(
-        id,
-        withCompatSlot({ ...value, size: 'large', lateral: Math.round(value.lateral) }),
-      );
+      const norm = withCompatSlot({
+        ...value,
+        size: 'large',
+        lateral: Math.round(value.lateral),
+      });
+      // 🪧 …and the label, for the same reason the size and lateral are done
+      // here: the shape guard accepts any string so stored data is never
+      // rejected, which means an over-long, padded or whitespace-only label
+      // from an older or hostile peer would otherwise reach the renderer
+      // untouched. Normalizing at the read boundary makes every consumer safe
+      // without each of them having to remember (PR #103 review).
+      const label = sanitizeDoorLabel(norm.label);
+      if (label) norm.label = label;
+      else delete norm.label;
+      out.set(id, norm);
     }
   }
   return out;
@@ -278,6 +289,32 @@ export function writeDoorLayout(rec: DoorLayoutRecord): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
     doorLayoutMap!.set(rec.id, rec);
+  });
+}
+
+/**
+ * 🪧 Set (or clear, with undefined) ONE door's sign, touching nothing else.
+ *
+ * Deliberately not `writeDoorLayout({ ...readAllDoorLayout().get(id), label })`
+ * (PR #103 review): `readAllDoorLayout` is a READ-NORMALIZER — it forces
+ * size:'large', rounds `lateral`, and runs the compat shim that substitutes a
+ * cardinal's physical wall. Round-tripping a record through it to change a
+ * label would write all of that back as though the owner had edited the door's
+ * POSITION. It happens to be idempotent today, but "renaming a sign rewrites
+ * the door's geometry fields" is a bug waiting for its first non-idempotent
+ * normalization. Read the RAW stored entry and set one key instead.
+ */
+export function writeDoorLabel(id: string, label: string | undefined): void {
+  if (!docAlive()) return;
+  const raw = doorLayoutMap!.get(id);
+  if (!isDoorLayoutRecord(raw) || raw.id !== id) return; // door gone / malformed
+  const clean = sanitizeDoorLabel(label);
+  if (clean === raw.label) return; // no-op — do not churn the doc or peers
+  const next: DoorLayoutRecord = { ...raw };
+  if (clean) next.label = clean;
+  else delete next.label;
+  boundDoc!.transact(() => {
+    doorLayoutMap!.set(id, next);
   });
 }
 

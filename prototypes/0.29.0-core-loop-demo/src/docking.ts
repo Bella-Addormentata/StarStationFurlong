@@ -23,7 +23,7 @@ import {
   DOOR_LABEL_MAX,
   sanitizeDoorLabel,
   readAllDoorLayout,
-  writeDoorLayout,
+  writeDoorLabel,
   seedDoorLayoutDefaults,
 } from "./doorLayoutDoc";
 import { ROOM_TEMPLATES } from "./roomTemplates";
@@ -1099,14 +1099,11 @@ export class DoorDockingPortSystem {
       // door not in the map, so writing one record into an UNSEEDED room would
       // erase the other three cardinals. Idempotent.
       seedDoorLayoutDefaults();
-      const rec = readAllDoorLayout().get(doorId);
-      if (!rec) return; // door vanished under an open pane — nothing to label
-      // Drop the key entirely when cleared, so a blank sign costs no bytes on
-      // the wire and reads identically to a door that never had one.
-      const next: DoorLayoutRecord = { ...rec };
-      if (label) next.label = label;
-      else delete next.label;
-      writeDoorLayout(next);
+      // writeDoorLabel, not a read-modify-write through readAllDoorLayout:
+      // that is a read-NORMALIZER (size, lateral, the cardinal compat shim),
+      // so round-tripping a record through it to change a label would write
+      // the door's geometry fields back too. See its doc comment.
+      writeDoorLabel(doorId, label);
     });
 
     // ── #62 P4: CONNECTION ASSEMBLY wiring ──────────────────────────────────
