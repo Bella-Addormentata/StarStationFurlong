@@ -103,7 +103,6 @@ import {
   buildConnectorChain,
   setVestibuleLightState,
   setVestibuleOpacity,
-  projectionPoseForDoor,
 } from "./adapter";
 import type { VestibuleDoorId } from "./adapter";
 import {
@@ -198,6 +197,20 @@ interface RemoteAvatar {
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
 
+/** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
+ *  falls back to the id-based pose (old gossip without wall data). Anchoring a
+ *  NEIGHBOUR's tube by id would pose it from the CURRENT room's snapshot while
+ *  atlasLayout places the module from harvested geometry — the tube would
+ *  detach from the module it connects. */
+function doorAnchor(door: {
+  wall?: DoorWall;
+  lateral?: number;
+}): { wall: DoorWall; lateral: number } | undefined {
+  return door.wall !== undefined
+    ? { wall: door.wall, lateral: door.lateral ?? 0 }
+    : undefined;
+}
+
 /** 🚪 #91: the wall physically facing a given wall. Walking out of a room's
  *  north side must bring you in through the next room's south side. */
 function oppositeWall(wall: DoorWall): DoorWall {
@@ -282,7 +295,7 @@ export class World {
    * Transit is only offered on paired doors when this is non-null.
    */
   public onAdapterTransit:
-    | ((seed: string, departureDoorId: DoorId) => void)
+    | ((seed: string, departureDoorId: string) => void)
     | null = null;
   /**
    * Transit-latch mirror, wired by main.ts beside onAdapterTransit (review
@@ -1047,12 +1060,7 @@ export class World {
     // current room at {0,0,0} and drops it from the output. Reuse the EXACT
     // exteriorView compose (do not negate rotY / swap sin signs — that mirrors
     // the whole ring). maxHops 8 = the full station, not a one-window peek.
-    const poses = atlasLayout(
-      currentRoomId,
-      (doorId, segments, farDoor) =>
-        projectionPoseForDoor(doorId as DoorId, segments, farDoor),
-      8,
-    );
+    const poses = atlasLayout(currentRoomId, 8);
     const g = new THREE.Group();
     g.name = "fpNeighbourShells";
     for (const pose of poses) {
@@ -1096,8 +1104,8 @@ export class World {
         drawnEdges.add(key);
         const chain =
           door.segments && door.segments.length > 0
-            ? buildConnectorChain(doorId, door.segments)
-            : buildVestibule(doorId);
+            ? buildConnectorChain(doorId, door.segments, doorAnchor(door))
+            : buildVestibule(doorId, doorAnchor(door));
         // Pure BACKDROP: strip every interactive flag. `isConnectorChain` is
         // what the bend editor keys on; `isVestibule` + `doorId` are what the
         // level-2 vestibule-click handler collects (scene.traverse) then
@@ -1545,6 +1553,8 @@ export class World {
           {
             segments: rec.segments,
             farDoor: rec.farDoor,
+            farWall: rec.farWall,
+            farLateral: rec.farLateral,
             farYawDeg: rec.farYawDeg,
             transient: rec.transient, // #67 D2
           },
@@ -4442,7 +4452,15 @@ export class World {
     departureDoorId: string,
     farDoor?: string,
     fromRoomId?: string,
+    // 🧭 The wall the traveler DEPARTED through, captured in the departure
+    // room before the swap. Without it this method inferred the wall from the
+    // id via the ARRIVAL room's records — wrong whenever the two rooms park
+    // the same id on different walls, and always wrong for a free door, whose
+    // id exists in no other room. Falls back to the old inference when the
+    // caller has nothing better (e.g. a stale session-restore route).
+    departureWall?: DoorWall,
   ): DoorTarget | null {
+    const depWall = departureWall ?? this.wallOfDoor(departureDoorId);
     // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
     // records — the door whose pairing points BACK at the room we came from.
     // This survives every other keypad/vestibule change on either side: a
@@ -4466,7 +4484,7 @@ export class World {
         // loop came out the same door.
         const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
         const facing = backs.find(
-          (b) => this.wallOfDoor(b.id) === oppositeWall(this.wallOfDoor(departureDoorId)),
+          (b) => this.wallOfDoor(b.id) === oppositeWall(depWall),
         );
         return named ?? facing ?? backs[0];
       }
@@ -4491,7 +4509,7 @@ export class World {
     // and main.ts writes the mirror for any id, so the restriction is retired.
     // Prefer a cardinal when several doors share the facing wall, purely so the
     // choice does not depend on DOORS insertion order.
-    const want = oppositeWall(this.wallOfDoor(departureDoorId));
+    const want = oppositeWall(depWall);
     const onWall = DOORS.filter(
       (d) => d.enabled && this.wallOfDoor(d.id) === want,
     );
@@ -4545,6 +4563,7 @@ export class World {
     departureDoorId: string,
     farDoor?: string,
     fromRoomId?: string,
+    departureWall?: DoorWall,
   ): void {
     this.endTransitVestibule();
     // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
@@ -4560,6 +4579,7 @@ export class World {
       departureDoorId,
       farDoor,
       fromRoomId,
+      departureWall,
     );
     if (!arrival) {
       // Doorless arrival room: nothing to walk in through. Unreachable while
@@ -5237,6 +5257,8 @@ export class World {
           writeDoorPairing(doorId, st.connectedRoomAddress, {
             segments: st.segments,
             farDoor: st.farDoor,
+            farWall: st.farWall,
+            farLateral: st.farLateral,
             farYawDeg: st.farYawDeg,
             transient: st.transient, // #67 D2: guest berths carry the flag
           });

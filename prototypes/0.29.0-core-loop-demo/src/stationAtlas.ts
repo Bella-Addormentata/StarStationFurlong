@@ -32,6 +32,8 @@ import * as Y from 'yjs';
 import type { DoorId } from './doors';
 import type { ConnectorSegment } from './adapter';
 import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
+import type { DoorWall } from './doorLayoutDoc';
+import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -42,7 +44,17 @@ export interface AtlasDoor {
   segments?: ConnectorSegment[];
   /** May name a free `d:` door in the far room. */
   farDoor?: string;
+  /** The far door's WALL (from the pairing record) — orients the far module. */
+  farWall?: DoorWall;
+  /** The far door's along-wall centre — shifts the far module sideways. */
+  farLateral?: number;
   farYawDeg?: 0 | 45;
+  /** 🧭 This door's OWN physical pose, harvested live by a client standing in
+   *  the room that owns it. What lets everyone ELSE compose the station graph
+   *  through this room: a hop used to pose a neighbour's door from the CURRENT
+   *  room's snapshot, which was only ever right by coincidence. */
+  wall?: DoorWall;
+  lateral?: number;
 }
 
 export interface AtlasEntry {
@@ -112,7 +124,11 @@ export function harvestIntoAtlas(entry: {
   name: string;
   seed?: string;
   dims?: { cols: number; rows: number };
-  doors: Array<{ doorId: string; targetSeed: string; segments?: ConnectorSegment[]; farDoor?: string; farYawDeg?: 0 | 45 }>;
+  doors: Array<{
+    doorId: string; targetSeed: string; segments?: ConnectorSegment[];
+    farDoor?: string; farWall?: DoorWall; farLateral?: number; farYawDeg?: 0 | 45;
+    wall?: DoorWall; lateral?: number;
+  }>;
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
@@ -124,7 +140,11 @@ export function harvestIntoAtlas(entry: {
       targetRoomId: roomIdFromSeed(d.targetSeed),
       segments: d.segments,
       farDoor: d.farDoor,
+      farWall: d.farWall,
+      farLateral: d.farLateral,
       farYawDeg: d.farYawDeg,
+      wall: d.wall,
+      lateral: d.lateral,
     };
   }
   atlas[entry.roomId] = {
@@ -186,11 +206,7 @@ export interface AtlasPose {
  * the world — the exterior renders these; the current room's real hull
  * stands at the origin.
  */
-export function atlasLayout(
-  currentRoomId: string,
-  poseForDoor: (doorId: string, segments?: ConnectorSegment[], farDoor?: string) => { x: number; z: number; rotY: number },
-  maxHops = 10,
-): AtlasPose[] {
+export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
   const atlas = readAtlas();
   if (!atlas[currentRoomId]) return [];
   const placed = new Map<string, AtlasPose>();
@@ -211,11 +227,26 @@ export function atlasLayout(
       // seven 18.6 m hops and one 78 m chasm, the scattered-boxes render).
       // But the FAR room's own record pointing back at us NAMES the door —
       // infer it from the graph before composing the hop.
-      const farDoor = door.farDoor
+      const farDoorId = door.farDoor
         ?? (Object.entries(atlas[door.targetRoomId]?.doors ?? {})
           .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === fromId)?.[0]);
+      // 🧭 The far door's WALL, never guessed from its id: the pairing record's
+      // farWall, else the far room's own gossiped door geometry, else unknown
+      // (⇒ the hop faces the arrival heading — no invented rotation).
+      const farWall = door.farWall
+        ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.wall : undefined)
+        ?? null;
+      const farLateral = door.farLateral
+        ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.lateral : undefined)
+        ?? 0;
       // The hop's pose in the FROM room's local frame → compose into world.
-      const local = poseForDoor(doorId, door.segments, farDoor);
+      // The CURRENT room's own doors use the LIVE pose (slide included); a
+      // NEIGHBOUR room's door poses from its harvested wall+lateral — this
+      // client's snapshot knows nothing about it. Old gossip without geometry
+      // falls back to the live-pose path, which is the pre-redo behaviour.
+      const local = fromId !== currentRoomId && door.wall !== undefined
+        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral)
+        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
@@ -298,11 +329,6 @@ function squaresOverlap(a: OrientedSquare, b: OrientedSquare, half: number): boo
 export function moduleOverlapAt(
   currentRoomId: string,
   candidate: { x: number; z: number; rotY: number },
-  poseForDoor: (
-    doorId: string,
-    segments?: ConnectorSegment[],
-    farDoor?: string,
-  ) => { x: number; z: number; rotY: number },
   opts?: { connectDist?: number; maxHops?: number; moduleHalf?: number },
 ): { roomId: string; name: string } | null {
   if (!currentRoomId) return null;
@@ -311,7 +337,7 @@ export function moduleOverlapAt(
   const atlas = readAtlas();
   const modules: Array<{ roomId: string; name: string; x: number; z: number; rotY: number }> = [
     { roomId: currentRoomId, name: atlas[currentRoomId]?.name ?? 'this module', x: 0, z: 0, rotY: 0 },
-    ...atlasLayout(currentRoomId, poseForDoor, opts?.maxHops ?? 8),
+    ...atlasLayout(currentRoomId, opts?.maxHops ?? 8),
   ];
   for (const mod of modules) {
     const isCurrent = mod.roomId === currentRoomId;
@@ -327,14 +353,19 @@ export function moduleOverlapAt(
 interface SharedAtlasEntry {
   roomId: string;
   name: string;
-  doors: Partial<Record<DoorId, {
+  doors: Record<string, {
     targetRoomId: string;
     /** Present ONLY on a doc's own-room entry (doorsDoc exposes it anyway). */
     targetSeed?: string;
     segments?: ConnectorSegment[];
     farDoor?: string;
+    farWall?: DoorWall;
+    farLateral?: number;
     farYawDeg?: 0 | 45;
-  }>>;
+    /** 🧭 This door's own physical pose — see AtlasDoor. */
+    wall?: DoorWall;
+    lateral?: number;
+  }>;
   /** 🛑📐 The module's true tile size. PUBLIC by owner ruling — anyone may see
    *  a module's outside: its size, its position and its connections. Only the
    *  SEED (the credential that dials you in) is access-controlled. */
@@ -428,14 +459,31 @@ function pullSharedAtlas(): void {
       && prior.lastSeen >= value.updatedAt
       && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
     const doors: Record<string, AtlasDoor> = {};
-    for (const [d, door] of Object.entries(value.doors) as Array<[DoorId, NonNullable<SharedAtlasEntry['doors'][DoorId]>]>) {
+    for (const [d, door] of Object.entries(value.doors)) {
       if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
+      // 🧭 Wall/lateral drive GEOMETRY straight into the exterior renderer and
+      // arrive from a peer — exact wall names and a finite lateral or they are
+      // dropped to "unknown" (the renderer's honest fallback). Same discipline
+      // as dims. Preserved from prior on a miss so gossip from an OLD client
+      // cannot erase geometry a NEW one already published.
+      const okWall = (w: unknown): w is DoorWall =>
+        w === 'north' || w === 'south' || w === 'east' || w === 'west';
       doors[d] = {
         targetSeed: door.targetSeed ?? prior?.doors[d]?.targetSeed ?? '',
         targetRoomId: door.targetRoomId,
         segments: door.segments,
         farDoor: door.farDoor,
+        farWall: okWall(door.farWall) ? door.farWall : prior?.doors[d]?.farWall,
+        farLateral: Number.isFinite(door.farLateral) && Math.abs(door.farLateral as number) <= 32
+          ? (door.farLateral as number)
+          : prior?.doors[d]?.farLateral,
         farYawDeg: door.farYawDeg,
+        wall: okWall(door.wall) ? door.wall : prior?.doors[d]?.wall,
+        // Bounded like dims and farLateral (F7): |lateral| ≤ 32 covers the
+        // largest room's wall run; outside it, keep what we knew.
+        lateral: Number.isFinite(door.lateral) && Math.abs(door.lateral as number) <= 32
+          ? (door.lateral as number)
+          : prior?.doors[d]?.lateral,
       };
     }
     // ⚠️ This REBUILDS the entry rather than merging into it, so every field
@@ -483,7 +531,11 @@ export function pushAtlasToDoc(): void {
           targetRoomId: door.targetRoomId,
           segments: door.segments,
           farDoor: door.farDoor,
+          farWall: door.farWall,
+          farLateral: door.farLateral,
           farYawDeg: door.farYawDeg,
+          wall: door.wall,
+          lateral: door.lateral,
           ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
         };
       }
@@ -496,7 +548,11 @@ export function pushAtlasToDoc(): void {
         // size, so the station's shape was only ever right for rooms you had
         // walked through yourself.
         ...(entry.dims ? { dims: entry.dims } : {}),
-        updatedAt: entry.lastSeen,
+        // 🧭 F5 (redo review): MONOTONIC, not just lastSeen. A corrective
+        // re-push with the same second's stamp would lose the LWW tie against
+        // the poisoned entry it is correcting (pull skips on >=); bumping past
+        // the known stamp guarantees a content change always propagates.
+        updatedAt: known ? Math.max(entry.lastSeen, known.updatedAt + 1) : entry.lastSeen,
       };
       if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = entry.seed;
       if (known

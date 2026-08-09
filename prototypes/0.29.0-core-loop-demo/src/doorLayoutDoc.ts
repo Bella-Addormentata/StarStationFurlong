@@ -412,7 +412,7 @@ export function deleteDoorLayout(id: string): void {
  * the "legacy" door layout — the paired layouts park a cardinal ±PAIR_OFFSET
  * off-centre. main.ts stamps that on the module at claim time.
  */
-export function seedDoorLayoutSingle(wall: DoorWall): void {
+export function seedDoorLayoutSingle(wall: DoorWall, lateral = 0): void {
   if (!docAlive() || doorLayoutDocSize() > 0) return;
   boundDoc!.transact(() => {
     // 🚪 One transaction: the marker and the door land together, so no joiner
@@ -421,7 +421,9 @@ export function seedDoorLayoutSingle(wall: DoorWall): void {
     doorLayoutMap!.set(wall, {
       id: wall,
       wall,
-      lateral: 0,
+      // 🧭 The owner PICKED this spot in the provision placement editor —
+      // it is no longer always the wall centre.
+      lateral: Math.round(lateral),
       size: 'large',
       enabled: true,
       // 🚪 `placed`: this door means what it says — centred on `wall`. It used

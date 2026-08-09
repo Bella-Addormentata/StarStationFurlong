@@ -29,6 +29,7 @@ import { readDoorPolicy } from "./doorPolicy";
 import { readDoorDeltas } from "./floorPlanDoc";
 import { physicalDoorPose } from "./doorLayout";
 import { readAllDoorLayout, doorSetIsAuthoritative } from "./doorLayoutDoc";
+import type { DoorWall } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
@@ -36,7 +37,6 @@ import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
 import {
-  projectionPoseForDoor,
   buildConnectorChain,
   buildVestibule,
   setVestibuleOpacity,
@@ -52,6 +52,21 @@ import { roomHalfExtents } from "./floorPlanDoc";
  *  with `?octagon=0`; same flag world.ts reads for the interior barrel. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
+
+/** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
+ *  falls back to the id-based pose (old gossip without wall data). Anchoring a
+ *  NEIGHBOUR's tube by id would pose it from the CURRENT room's snapshot while
+ *  atlasLayout places the module from harvested geometry — the tube would
+ *  detach from the module it connects. */
+function doorAnchor(door: {
+  wall?: DoorWall;
+  lateral?: number;
+}): { wall: DoorWall; lateral: number } | undefined {
+  return door.wall !== undefined
+    ? { wall: door.wall, lateral: door.lateral ?? 0 }
+    : undefined;
+}
+
 
 const HULL = 0x39445a;
 const HULL_DARK = 0x2a3444;
@@ -390,12 +405,9 @@ function buildGroup(): THREE.Group {
   const currentRoomId = roomIdGetter();
   lastStationExtent = 0;
   if (currentRoomId) {
-    const poses = atlasLayout(
-      currentRoomId,
-      (doorId, segments, farDoor) =>
-        projectionPoseForDoor(doorId as DoorId, segments, farDoor),
-      8,
-    );
+    // atlasLayout composes its own hop geometry now — near poses from each
+    // room's gossiped wall+lateral, far rotation from the record's farWall.
+    const poses = atlasLayout(currentRoomId, 8);
     for (const pose of poses) {
       lastStationExtent = Math.max(
         lastStationExtent,
@@ -502,8 +514,8 @@ function buildGroup(): THREE.Group {
         drawnEdges.add(key);
         const chain =
           door.segments && door.segments.length > 0
-            ? buildConnectorChain(doorId, door.segments)
-            : buildVestibule(doorId);
+            ? buildConnectorChain(doorId, door.segments, doorAnchor(door))
+            : buildVestibule(doorId, doorAnchor(door));
         // Not editable from the atlas — the bend editor targets the CURRENT
         // room's chain, so clear the flag its click-routing keys on.
         (chain.userData as { isConnectorChain?: boolean }).isConnectorChain =
