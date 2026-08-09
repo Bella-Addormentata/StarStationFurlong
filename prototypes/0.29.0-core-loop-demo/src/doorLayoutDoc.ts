@@ -168,6 +168,35 @@ export function migratedCardinalSlot(id: DoorWall): { wall: DoorWall; lateral: n
  *  "OBSERVATION DECK", short enough to stay legible on a door plaque. */
 export const DOOR_LABEL_MAX = 18;
 
+/**
+ * 🪧 What to CALL a door in front of a user. The authored label wins; a door
+ * without one gets a name generated from its CURRENT position — "WEST DOOR",
+ * or "WEST DOOR 2" when the wall carries several, ordered along the wall.
+ *
+ * Display only, recomputed at render time, never stored — deliberately. A
+ * name derived from position adapts when the door moves or its wall-mates
+ * change, precisely BECAUSE it is not the door's identity. Identity stays the
+ * opaque id, which is what lets a door keep its sign, its policy, its grants
+ * and its pairing while the owner slides it (owner question 2026-08-09:
+ * coordinate-derived IDS would re-fuse name to position — the cardinal
+ * disease this branch just cured — and let a new door inherit a dead door's
+ * tombstone and PIN by standing in the same spot).
+ */
+export function doorDisplayName(id: string): string {
+  const records = readAllDoorLayout();
+  const rec = records.get(id);
+  const label = rec ? sanitizeDoorLabel(rec.label) : undefined;
+  if (label) return label;
+  const wall = rec?.wall ?? (WALLS.includes(id as DoorWall) ? (id as DoorWall) : null);
+  if (!wall) return id.length > 12 ? `${id.slice(0, 12)}…` : id;
+  const onWall = [...records.values()]
+    .filter((r) => r.wall === wall)
+    .sort((a, b) => a.lateral - b.lateral);
+  const idx = onWall.findIndex((r) => r.id === id);
+  const name = `${wall.toUpperCase()} DOOR`;
+  return onWall.length > 1 && idx >= 0 ? `${name} ${idx + 1}` : name;
+}
+
 /** Normalize a user-typed label: collapse whitespace, trim, cap length.
  *  Returns undefined for anything that should clear the label. */
 export function sanitizeDoorLabel(raw: unknown): string | undefined {

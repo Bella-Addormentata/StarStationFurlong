@@ -95,6 +95,7 @@ import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import {
   subscribeDoorLayout, readAllDoorLayout, sanitizeDoorLabel,
   setLegacyRoomDoorLayout, defaultDoorLayoutRecords, doorSetIsAuthoritative,
+  doorDisplayName,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
@@ -4118,9 +4119,9 @@ export class World {
         const state = ds.getDockingState(door.id);
         showHint(
           transitReady()
-            ? `Dock seal engaged at ${door.id.toUpperCase()} — cycling airlock…`
+            ? `Dock seal engaged at ${doorDisplayName(door.id)} — cycling airlock…`
             : state && state.pairedSuccessfully
-              ? `Docked room detected at ${door.id.toUpperCase()} — transit coming soon.`
+              ? `Docked room detected at ${doorDisplayName(door.id)} — transit coming soon.`
               : "No room docked at this port — heading back.",
         );
       },

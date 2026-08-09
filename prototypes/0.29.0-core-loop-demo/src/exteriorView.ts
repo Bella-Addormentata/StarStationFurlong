@@ -28,7 +28,9 @@ import {
 import { readDoorPolicy } from "./doorPolicy";
 import { readDoorDeltas } from "./floorPlanDoc";
 import { physicalDoorPose } from "./doorLayout";
-import { readAllDoorLayout, doorSetIsAuthoritative } from "./doorLayoutDoc";
+import {
+  readAllDoorLayout, doorSetIsAuthoritative, doorDisplayName,
+} from "./doorLayoutDoc";
 import type { DoorWall } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
@@ -645,7 +647,7 @@ function openBendEditor(
   editor.addEventListener("click", (e) => e.stopPropagation());
   const bends = [-45, -22.5, 0, 22.5, 45];
   editor.innerHTML = `
-    <div id="exterior-bend-title">🪗 FLEX JOINT · ${doorId.toUpperCase()} chain #${index + 1} <button type="button" id="exterior-bend-close">✕</button></div>
+    <div id="exterior-bend-title">🪗 FLEX JOINT · ${doorDisplayName(doorId)} chain #${index + 1} <button type="button" id="exterior-bend-close">✕</button></div>
     <div id="exterior-bend-row">${bends
       .map(
         (b) =>

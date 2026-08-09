@@ -89,7 +89,7 @@ import {
 import type { PhysicalDoorPose } from './doorLayout';
 import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
-  doorSetIsAuthoritative,
+  doorSetIsAuthoritative, doorDisplayName,
 } from './doorLayoutDoc';
 import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
@@ -2271,7 +2271,7 @@ class RoomEditController {
     // deleteDoorLayout also re-runs onDoorLayoutChanged, a harmless no-op now.
     seedDoorLayoutDefaults();
     deleteDoorLayout(doorId);
-    showHint(`Removed door ${doorId}.`, 2000);
+    showHint(`Removed ${doorDisplayName(doorId)}.`, 2000);
   }
 
   /**
@@ -3173,10 +3173,12 @@ class RoomEditController {
 
   private labelTextForItem(itemId: string): string {
     if (!this.doorIds.has(itemId)) return itemId;
-    const wall = (this.doorDrag?.doorId === itemId
-      ? this.doorDrag.wall
-      : currentDoorOpenings().find((opening) => opening.id === itemId)?.wall);
-    return wall ? `DOOR · ${wall.toUpperCase()} WALL` : `DOOR · ${itemId.toUpperCase()}`;
+    // Mid-drag the wall comes from the drag (the record lags the pointer);
+    // otherwise the display name speaks for the door — authored label first,
+    // generated wall name second, never a raw id.
+    if (this.doorDrag?.doorId === itemId)
+      return `DOOR · ${this.doorDrag.wall.toUpperCase()} WALL`;
+    return `🚪 ${doorDisplayName(itemId)}`;
   }
 
   private hideLabel(): void {
