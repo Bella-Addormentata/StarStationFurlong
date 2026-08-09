@@ -31,6 +31,7 @@
 import * as Y from 'yjs';
 import type { DoorId } from './doors';
 import type { ConnectorSegment } from './adapter';
+import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -334,7 +335,13 @@ interface SharedAtlasEntry {
     farDoor?: string;
     farYawDeg?: 0 | 45;
   }>>;
-  /** Present ONLY on a doc's own-room entry while passage policy is public. */
+  /** 🛑📐 The module's true tile size. PUBLIC by owner ruling — anyone may see
+   *  a module's outside: its size, its position and its connections. Only the
+   *  SEED (the credential that dials you in) is access-controlled. */
+  dims?: { cols: number; rows: number };
+  /** The dial-in credential. Rides only while a door that ACTUALLY EXISTS is
+   *  set to public passage — this is the access restriction, and it is
+   *  deliberately NOT the same question as "may you see this module". */
   seed?: string;
   updatedAt: number;
 }
@@ -358,7 +365,22 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     && typeof e.name === 'string'
     && typeof e.doors === 'object' && e.doors !== null
     && typeof e.updatedAt === 'number'
-    && (e.seed === undefined || typeof e.seed === 'string');
+    && (e.seed === undefined || typeof e.seed === 'string')
+    // 🛑📐 dims drives GEOMETRY straight into the exterior renderer, and this
+    // value came off the wire from a peer. Bounded to the same envelope the
+    // room editor enforces, so a hostile or buggy entry degrades to "we don't
+    // know this module's size" (the renderer's existing fallback) instead of
+    // asking Three.js for a 10-billion-tile hull.
+    && (e.dims === undefined || isSaneDims(e.dims));
+}
+
+function isSaneDims(d: unknown): d is { cols: number; rows: number } {
+  if (typeof d !== 'object' || d === null) return false;
+  const v = d as { cols?: unknown; rows?: unknown };
+  const ok = (n: unknown) =>
+    typeof n === 'number' && Number.isInteger(n)
+    && n >= ROOM_TILE_MIN && n <= ROOM_TILE_MAX;
+  return ok(v.cols) && ok(v.rows);
 }
 
 /**
@@ -416,10 +438,16 @@ function pullSharedAtlas(): void {
         farYawDeg: door.farYawDeg,
       };
     }
+    // ⚠️ This REBUILDS the entry rather than merging into it, so every field
+    // must be named explicitly or it is destroyed. `dims` was not, which meant
+    // a size learned by actually visiting a room was wiped the moment any peer
+    // gossiped an entry for it. Prefer the incoming value, fall back to what we
+    // already knew, and never regress to undefined.
     atlas[rid] = {
       roomId: rid,
       name: value.name || prior?.name || 'Module',
       seed: value.seed ?? prior?.seed,
+      dims: value.dims ?? prior?.dims,
       doors,
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
     };
@@ -463,6 +491,11 @@ export function pushAtlasToDoc(): void {
         roomId: entry.roomId,
         name: entry.name,
         doors,
+        // 🛑📐 Size travels with the connection graph. Without this a peer
+        // renders every module it has not personally visited at the fallback
+        // size, so the station's shape was only ever right for rooms you had
+        // walked through yourself.
+        ...(entry.dims ? { dims: entry.dims } : {}),
         updatedAt: entry.lastSeen,
       };
       if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = entry.seed;

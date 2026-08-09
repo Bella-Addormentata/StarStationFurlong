@@ -1494,9 +1494,22 @@ export class DoorDockingPortSystem {
         </div>`,
         )
         .join("");
+      // 🔑 PASSAGE is the room's ACCESS control, and this panel is where it
+      // lives (owner ruling). It does two things at once and the label now says
+      // so: it decides who may WALK THROUGH (canPass), and — because a room is
+      // reachable exactly when some door admits strangers — whether the room's
+      // dial-in SEED is published to the station at all. Setting every door to
+      // OWNER makes the module unlisted. It never hides the module's OUTSIDE:
+      // size, position and connections gossip unconditionally, by design.
+      const anyPublic = [...readAllDoorLayout().keys()]
+        .some((id) => readDoorPolicy(id).passage === "public");
+      const reachNote = anyPublic
+        ? `<div style="font-size:9px; color:rgba(212,168,75,0.45); line-height:1.35; margin:-2px 0 2px;">🔑 A public door publishes this room's dial-in address. Its outside — size, position, connections — is visible to everyone either way.</div>`
+        : `<div style="font-size:9px; color:#80d8ff; line-height:1.35; margin:-2px 0 2px;">🔒 UNLISTED — no door admits strangers, so this room's address is not published. Its outside stays visible; only entry is closed.</div>`;
       body.innerHTML = `
-        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk${policy.oneWay ? " · one-way for guests" : ""}</span></span>
+        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· who may walk through${policy.oneWay ? " · one-way for guests" : ""}</span></span>
           <button type="button" data-policy-action="cycle-passage" style="${pill}">${passageLabel(policy)}</button></div>
+        ${reachNote}
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
         ${positionRow}

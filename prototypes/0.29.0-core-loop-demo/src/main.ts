@@ -93,6 +93,7 @@ import {
   seedDoorLayoutDefaults,
   seedDoorLayoutSingle,
   doorLayoutDocSize,
+  readAllDoorLayout,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -1115,10 +1116,25 @@ async function joinRoomAtEpoch(
   // passage policy is public.
   bindStationAtlasDoc(sync.doc, {
     roomId: boot.roomId,
-    isPassagePublic: () =>
-      (["north", "south", "east", "west"] as const).some(
-        (d) => readDoorPolicy(d).passage === "public",
-      ),
+    // 🔑 ACCESS, and only access. Owner ruling: anyone may see a module's
+    // OUTSIDE — its size, its position, its connections — so all of that
+    // gossips unconditionally (stationAtlas pushAtlasToDoc). What this gates is
+    // the SEED: the credential that lets a stranger dial in. It is set per
+    // door, in the door's own control panel (PASSAGE), and the same setting is
+    // what canPass enforces when someone tries to walk through.
+    //
+    // This used to iterate the four cardinal NAMES, and readDoorPolicy returns
+    // the default `public` for a cardinal the room does not even have — so the
+    // predicate was ALWAYS TRUE and no room could be unlisted. Iterate the
+    // doors the room actually has, and fail CLOSED when it has none public.
+    isPassagePublic: () => {
+      const ids = [...readAllDoorLayout().keys()];
+      // An unseeded room presents the four cardinal defaults everywhere else,
+      // so treat it the same here rather than making "never opened the door
+      // editor" mean "unreachable".
+      const doors = ids.length ? ids : ["north", "south", "east", "west"];
+      return doors.some((d) => readDoorPolicy(d).passage === "public");
+    },
   });
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
