@@ -84,7 +84,7 @@ import { DOORS } from './doors';
 import type { DoorId } from './doors';
 import {
   snapDoorLateral, wallAndLateralFromPoint, poseFromWall, physicalDoorPose,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH, MIN_DOOR_GAP,
 } from './doorLayout';
 import type { PhysicalDoorPose } from './doorLayout';
 import {
@@ -675,17 +675,24 @@ export function validateDoorPlacement(
     }
   }
 
-  // 3. No other door overlapping on the same wall (both openings share the wall
-  //    axis, so overlap is a 1-D span test on the along-wall centres). 🚪 #91:
-  //    the gap is measured between FRAMES — opening + a post each side — so two
-  //    doors can sit 3 m apart but never 2 (which used to pass while their
-  //    physical 2.4 m frames overlapped by a metre).
-  const minGap = DOOR_OPENING_WIDTH + 2 * DOOR_POST_WIDTH;
+  // 3. Doors on the same wall must be MIN_DOOR_GAP apart, centre to centre
+  //    (both openings share the wall axis, so this is a 1-D span test).
+  //
+  //    🚪 The rule used to be frame width — 2.6 m, just enough that two frames
+  //    do not overlap inside the room. That was sufficient while only the four
+  //    structural berths could dock. Now ANY door can grow a vestibule or take
+  //    a docking adapter, and a door claims an exterior corridor as well as an
+  //    interior opening, so the binding constraint moved outside: two docking
+  //    envelopes need 2 × hull.EXT_DOOR_BAND = 3.6 m. The old rule approved
+  //    pairs of doors that could never both be used.
   for (const other of currentDoorOpenings()) {
     if (other.id === excludeId) continue;
     if (other.wall !== wall) continue;
-    if (Math.abs(other.lateral - lateral) < minGap - 1e-6) {
-      return { ok: false, reason: 'overlaps another door' };
+    if (Math.abs(other.lateral - lateral) < MIN_DOOR_GAP - 1e-6) {
+      return {
+        ok: false,
+        reason: `too close to another door — doors need ${MIN_DOOR_GAP} m between centres so their docking envelopes clear`,
+      };
     }
   }
 

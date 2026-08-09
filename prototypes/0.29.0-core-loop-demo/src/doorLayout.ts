@@ -71,6 +71,32 @@ export const DOOR_LEAF_SHUT_OFFSET = DOOR_LEAF_WIDTH / 2 + 0.02;
 export const DOOR_LEAF_OPEN_OFFSET = DOOR_LEAF_SHUT_OFFSET + DOOR_LEAF_WIDTH - 0.02;
 
 /**
+ * 🚪↔🚪 Minimum distance between two door CENTRES on the same wall.
+ *
+ * The old rule was DOOR_FRAME_WIDTH (2.6) — enough that two frames do not
+ * overlap INSIDE the room, and nothing more. That was the whole requirement
+ * back when only the four structural berths could dock, because the editor
+ * only ever placed free doors and free doors could not grow anything outside.
+ *
+ * Now any door can take a vestibule or a docking adapter, so a door also
+ * claims an EXTERIOR corridor: hull.EXT_DOOR_BAND (1.8) each side of its axis,
+ * the strip a gangway tube or a berthed ship occupies. Two adjacent doors
+ * therefore need 2 × 1.8 = 3.6 m between centres before their docking
+ * envelopes stop intersecting — which the 2.6 m rule happily allowed. The
+ * editor was approving pairs of doors that could never both be used.
+ *
+ * 4.0 rather than 3.6 (owner's ruling), and the grid agrees: snapDoorLateral
+ * locks every centre to an integer, so the realizable gaps are whole metres
+ * and the first one clearing 3.6 IS 4. Stating 4 makes the constant match what
+ * the editor can actually produce, with a metre of daylight rather than 0.4.
+ *
+ * Kept here beside the rest of the door geometry contract, not in hull.ts, so
+ * a placement validator does not have to import the exterior system to know
+ * how far apart doors go. The coupling is asserted below.
+ */
+export const MIN_DOOR_GAP = 4.0;
+
+/**
  * The single pose generator. Given a wall, the along-wall lateral of the door
  * CENTRE, and (optionally, for the legacy e/w quirk) a distinct lateral for the
  * stand/through points, derive the full pose from the current room half-extents.

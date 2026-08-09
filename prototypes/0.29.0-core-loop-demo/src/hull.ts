@@ -37,6 +37,7 @@
  */
 
 import { FURNITURE, FURNITURE_DEFS, footprintAabb } from './furniture';
+import { MIN_DOOR_GAP } from './doorLayout';
 import type { FurnitureItem, FurnitureKind, Rot, Box } from './furniture';
 
 /** Structural wall plane (|x| or |z|) — matches world.addSideWalls / doors. */
@@ -46,6 +47,20 @@ export const WALL_LINE = 6;
  *  vestibule/docking envelope (posts/click box at |along| ≤ 1.0; paired
  *  chains extend straight out). Value unchanged from the mount work. */
 export const EXT_DOOR_BAND = 1.8;
+
+// 🚪↔🚪 The exterior lane is HALF of why doors must be spaced apart: two
+// adjacent doors' envelopes stop intersecting only past 2 × EXT_DOOR_BAND.
+// doorLayout.MIN_DOOR_GAP states the editor's rule and must stay ≥ that, or
+// the editor would approve two doors whose docking envelopes overlap and only
+// one of them could ever be used. Asserted here rather than in doorLayout so
+// the exterior system owns the number that constrains it.
+if (MIN_DOOR_GAP < 2 * EXT_DOOR_BAND) {
+  console.error(
+    `[hull] MIN_DOOR_GAP (${MIN_DOOR_GAP}) is below two docking envelopes ` +
+      `(${2 * EXT_DOOR_BAND}) — the door editor will approve placements whose ` +
+      `vestibules or berthed ships intersect.`,
+  );
+}
 
 /** Maximum stack layers on a wall (wall item = layer 1). */
 export const STACK_DEPTH_MAX = 3;
