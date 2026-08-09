@@ -217,16 +217,22 @@ export function writeDoorPairing(doorId: string, address: string, geometry?: Doo
  * A reaper rather than an inline delete in the editor, because a door deletion
  * also arrives from a PEER, which removeSelectedDoor never sees.
  *
- * Cardinals are never reaped. They are structural berths that exist whether or
- * not the layout doc has been seeded, and an unseeded room legitimately reads
- * as "no records at all" — reaping on that would wipe every pairing in the
- * room the first time someone joined before the layout doc bound.
+ * `liveDoorIds` must be the room's REAL door set. The caller is responsible for
+ * not calling this for an UNSEEDED room, where "no records" means "this room
+ * predates the store" rather than "every door was deleted" — reaping there
+ * would wipe every pairing in the room the first time anyone joined.
  */
 export function reapOrphanPairings(liveDoorIds: ReadonlySet<string>): string[] {
   if (!docAlive()) return [];
   const dead: string[] = [];
   for (const id of doorsMap!.keys()) {
-    if ((DOOR_IDS as readonly string[]).includes(id)) continue;
+    // No cardinal exemption. It was here to stop an UNSEEDED room — which
+    // reads as "no records at all" — from looking like every door had been
+    // deleted; but the caller already refuses to reap in that state, so all
+    // the exemption actually did was make a deleted CARDINAL door keep its
+    // pairing forever, publishing a phantom neighbour to every peer's
+    // exterior and offering transit into it. Exactly the defect the reaper
+    // exists to prevent, exempted for the doors most likely to have one.
     if (!liveDoorIds.has(id)) dead.push(id);
   }
   if (dead.length === 0) return [];
