@@ -89,6 +89,7 @@ import {
 import type { PhysicalDoorPose } from './doorLayout';
 import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
+  doorSetIsAuthoritative,
 } from './doorLayoutDoc';
 import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
@@ -607,7 +608,10 @@ function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: num
   // slot forever: "there's a remnant of the old door and it stops me placing
   // one there" (#91). A seeded map is authoritative — a cardinal absent from
   // it does not exist. Read-path only, so it heals rooms already in that state.
-  if (records.size === 0) {
+  // 🚪 Only an UN-MIGRATED room conjures the four defaults. A room that has
+  // declared an empty door set genuinely has no openings, and inventing four
+  // would block the owner from placing their first door in any of those spots.
+  if (!doorSetIsAuthoritative()) {
     for (const id of ['north', 'south', 'east', 'west'] as const) {
       openings.push(cardinalOpening(id));
     }
@@ -872,6 +876,9 @@ class RoomEditController {
   /** 🚪 #28 S6b: ADD-door sub-mode — the next floor click PLACES a door instead
    *  of selecting. Toggled by the ＋ DOOR button; reset on place / exit. */
   private addDoorMode = false;
+  /** Door id armed for a LAST-door removal (two-click confirm) — see
+   *  removeSelectedDoor. Cleared on any other removal or on exit. */
+  private lastDoorRemovalArmed: string | null = null;
   /** 🚪 #28 S6b/ghost: the translucent door PREVIEW that follows the pointer
    *  while add-door is armed — a single reusable box mesh (built on arm, hidden
    *  on disarm, disposed on exit), tinted GREEN(valid)/RED(invalid) exactly like
@@ -2226,16 +2233,28 @@ class RoomEditController {
       showHint('Unpair this door first (open its keypad), then remove it.', 2800);
       return;
     }
-    // 🚪 #91: never empty the map. An empty doorLayout means "this room was
-    // never migrated" everywhere it is read (the reconcile substitutes the
-    // cardinal defaults, the seed republishes them, placement folds them back
-    // in as blockers) — so removing the LAST door would silently resurrect all
-    // four, for everyone. A room needs a way out anyway.
+    // 🚪 Removing the LAST door used to be refused outright, because an empty
+    // doorLayout meant "this room was never migrated" everywhere it was read —
+    // so emptying the map silently resurrected all four cardinals, for
+    // everyone. The door-set marker tells those two states apart now, and a
+    // fresh standalone station is BORN doorless, so refusing to reach zero by
+    // deletion would forbid a state the app itself creates.
+    //
+    // Kept as a warning rather than a block: it is still a footgun (a doorless
+    // room can only be left by beaming), so make the owner do it deliberately —
+    // seed-first below guarantees the marker is written, so the delete can
+    // never be mistaken for an un-migrated room.
     const layout = readAllDoorLayout();
-    if (layout.size === 1 && layout.has(doorId)) {
-      showHint('A room needs at least one door — add another first.', 2800);
+    const isLastDoor = layout.size === 1 && layout.has(doorId);
+    if (isLastDoor && !this.lastDoorRemovalArmed) {
+      this.lastDoorRemovalArmed = doorId;
+      showHint(
+        'This is the room’s only door — removing it leaves no way to walk in or out. Click REMOVE again to confirm.',
+        3600,
+      );
       return;
     }
+    this.lastDoorRemovalArmed = null;
 
     // Selection/hover teardown BEFORE the delete disposes the door's materials
     // (setSelected(null) → clearTint restores saved emissive on live handles).

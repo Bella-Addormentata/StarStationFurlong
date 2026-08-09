@@ -94,7 +94,7 @@ import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import {
   subscribeDoorLayout, readAllDoorLayout, sanitizeDoorLabel,
-  setLegacyRoomDoorLayout, defaultDoorLayoutRecords,
+  setLegacyRoomDoorLayout, defaultDoorLayoutRecords, doorSetIsAuthoritative,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
@@ -1525,11 +1525,12 @@ export class World {
     // gangway tube outlives the door. Cardinals are always included even when
     // the layout doc is unseeded, matching the four-door fallback everywhere
     // else.
+    // The room's real doors, union every door claiming a pairing. The four
+    // cardinal names ride along ONLY while the room has not stated its own door
+    // set — otherwise a doorless room would resurrect four phantom ports to
+    // clear pairings on.
     const doors = new Set<string>([
-      "north",
-      "south",
-      "east",
-      "west",
+      ...(doorSetIsAuthoritative() ? [] : ["north", "south", "east", "west"]),
       ...readAllDoorLayout().keys(),
       ...records.keys(),
     ]);
@@ -1615,8 +1616,11 @@ export class World {
     if (!ctx) return; // no room visuals applied yet — nothing to hang
     const { outdoor, casino, returnDoorId } = ctx;
     const layout = readAllDoorLayout();
+    // An empty layout means "no doors" once the room has said so; only an
+    // un-migrated room falls back to asking the built-in DOORS table.
+    const layoutAuthoritative = doorSetIsAuthoritative();
     const doorExists = (id: DoorId): boolean =>
-      layout.size === 0 ? findDoor(id) !== null : layout.has(id);
+      layoutAuthoritative ? layout.has(id) : findDoor(id) !== null;
     const deltas = readDoorDeltas();
     // 🪧 Authored labels win over the built-in theme signs on the same door:
     // the owner typing "GYM" on the lobby's south door means that door leads to
@@ -1774,7 +1778,10 @@ export class World {
    */
   public reconcileDoorLayout(records: Map<string, DoorLayoutRecord>): void {
     if (!this.dockingSystem) return; // docking ports not built yet
-    const unseeded = records.size === 0;
+    // 🚪 Empty means one of TWO things now, and the marker tells them apart:
+    // an un-migrated room (fall back to the four defaults) versus a room that
+    // has genuinely declared it has NO doors — a fresh standalone station.
+    const unseeded = records.size === 0 && !doorSetIsAuthoritative();
     if (unseeded) records = defaultDoorLayoutRecords();
     // 🧹 A free door that was deleted (here or by a peer) must not leave its
     // pairing behind — an orphan record publishes a phantom neighbour to every
@@ -4429,11 +4436,13 @@ export class World {
     return readAllDoorLayout().get(id)?.wall ?? "north";
   }
 
+  /** The door a traveler arrives through, or NULL when the room has none — a
+   *  doorless station is now a real state, so this can no longer promise one. */
   public resolveArrivalDoor(
     departureDoorId: string,
     farDoor?: string,
     fromRoomId?: string,
-  ): DoorTarget {
+  ): DoorTarget | null {
     // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
     // records — the door whose pairing points BACK at the room we came from.
     // This survives every other keypad/vestibule change on either side: a
@@ -4518,7 +4527,12 @@ export class World {
     const east = findDoor("east");
     // ...and only when it is actually walkable — an arrival scripted through a
     // DISABLED door walks the avatar through whatever is blocking it (#91).
-    return (east?.enabled ? east : undefined) ?? DOORS.find((d) => d.enabled) ?? DOORS[0]!;
+    // 🚪 DOORS can now legitimately be EMPTY (a doorless station), so the old
+    // `DOORS[0]!` non-emptiness assumption would deref undefined. You cannot
+    // WALK into a doorless room — transit needs a paired door — so this is
+    // unreachable in practice; returning null rather than asserting means a
+    // future caller that finds a way here fails a check instead of crashing.
+    return (east?.enabled ? east : undefined) ?? DOORS.find((d) => d.enabled) ?? DOORS[0] ?? null;
   }
 
   /**
@@ -4547,6 +4561,13 @@ export class World {
       farDoor,
       fromRoomId,
     );
+    if (!arrival) {
+      // Doorless arrival room: nothing to walk in through. Unreachable while
+      // transit requires a paired door, but the type now admits it, so say so
+      // instead of dereferencing null.
+      console.warn("[doors] arrival room has no doors — skipping the walk-in.");
+      return;
+    }
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
     // arrivals — the traveler walks in, gets the hint, and is walked right
     // back out (the return departure is exactly what OUT permits). The

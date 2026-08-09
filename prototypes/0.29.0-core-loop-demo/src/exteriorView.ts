@@ -28,7 +28,7 @@ import {
 import { readDoorPolicy } from "./doorPolicy";
 import { readDoorDeltas } from "./floorPlanDoc";
 import { physicalDoorPose } from "./doorLayout";
-import { readAllDoorLayout } from "./doorLayoutDoc";
+import { readAllDoorLayout, doorSetIsAuthoritative } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
@@ -257,7 +257,7 @@ function buildGroup(): THREE.Group {
   // touched the door editor, and iterating it bare would silently delete the
   // collar from every such room — a regression with no error to notice.
   const layout = readAllDoorLayout();
-  const doorIds: string[] = layout.size
+  const doorIds: string[] = doorSetIsAuthoritative()
     ? [...layout.keys()]
     : ["north", "south", "east", "west"];
   for (const doorId of doorIds) {

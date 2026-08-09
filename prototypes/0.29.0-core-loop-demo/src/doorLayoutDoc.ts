@@ -34,6 +34,9 @@ export type DoorWall = 'north' | 'south' | 'east' | 'west';
 
 const WALLS: readonly DoorWall[] = ['north', 'south', 'east', 'west'];
 
+/** Marker key in the doorLayout map — see the DOOR-SET MARKER block below. */
+const META_KEY = '__meta';
+
 /** Serializable door-membership record — one per door id. Plain JSON, the same
  *  discipline as the furniture map. */
 export interface DoorLayoutRecord {
@@ -274,7 +277,63 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
 
 /** Number of entries (0 ⇒ unseeded — reconcile keeps the local cardinal defaults). */
 export function doorLayoutDocSize(): number {
-  return docAlive() ? doorLayoutMap!.size : 0;
+  return docAlive() ? doorLayoutMap!.size - (doorLayoutMap!.has(META_KEY) ? 1 : 0) : 0;
+}
+
+// ── 🚪 The DOOR-SET MARKER — what makes "no doors" sayable ───────────────────
+//
+// An empty map used to mean ONE thing: "this room predates the doorLayout
+// store, fall back to the four cardinal defaults". That overloading is why a
+// room could never have zero doors, and it reached a long way — the reconcile's
+// default substitution, the editor's phantom door openings, the exterior collar
+// loop, the sign existence test, the seed-visibility gate, and five SEED-FIRST
+// defusals whose only job was to stop a single write looking like a wipe.
+//
+// The marker splits the two meanings apart. Present ⇒ this room's door set is
+// AUTHORITATIVE, whatever its size, including zero. Absent ⇒ un-migrated, keep
+// the old fallback. Every seed writes it, so the fallback is self-retiring.
+//
+// It lives in the same map (rather than roomInfo) so it lands in the SAME
+// transaction as the records it describes — a joiner can never observe the
+// records without the marker, or the marker without the records.
+
+/** Declare this room's door set authoritative — including an EMPTY one. */
+export function markDoorSetAuthoritative(): void {
+  if (!docAlive()) return;
+  boundDoc!.transact(() => {
+    doorLayoutMap!.set(META_KEY, { v: 1 });
+  });
+}
+
+/**
+ * True once the room has stated its own door set.
+ *
+ * ANY record makes it authoritative — the un-migrated fallback only ever fired
+ * on an EMPTY map, so a room with doors was already speaking for itself and
+ * needs no marker to prove it. That matters for rooms seeded before the marker
+ * existed: they carry records but no marker, and demanding one would have made
+ * them un-migrated again.
+ *
+ * So the marker's only job is to disambiguate the empty case: empty + marker
+ * means "this room has NO doors", a real and renderable state; empty without
+ * one means "this room predates the store", keep the four defaults.
+ */
+export function doorSetIsAuthoritative(): boolean {
+  if (!docAlive()) return false;
+  if (doorLayoutDocSize() > 0) return true;
+  const m = doorLayoutMap!.get(META_KEY);
+  return typeof m === 'object' && m !== null && (m as { v?: unknown }).v === 1;
+}
+
+/**
+ * 🛰️ Claim a room as having NO doors at all — a fresh standalone station,
+ * which is connected to nothing and so should present nothing to walk through
+ * until its owner places one. Idempotent, and deliberately refuses to run over
+ * a room that already has doors so it can never be a wipe.
+ */
+export function seedDoorLayoutEmpty(): void {
+  if (!docAlive() || doorLayoutDocSize() > 0) return;
+  markDoorSetAuthoritative();
 }
 
 /** Cheap membership test — no snapshot, no allocation. Some callers ask this
@@ -354,8 +413,11 @@ export function deleteDoorLayout(id: string): void {
  * off-centre. main.ts stamps that on the module at claim time.
  */
 export function seedDoorLayoutSingle(wall: DoorWall): void {
-  if (!docAlive() || doorLayoutMap!.size > 0) return;
+  if (!docAlive() || doorLayoutDocSize() > 0) return;
   boundDoc!.transact(() => {
+    // 🚪 One transaction: the marker and the door land together, so no joiner
+    // can see an authoritative-but-empty room that is really a one-door module.
+    doorLayoutMap!.set(META_KEY, { v: 1 });
     doorLayoutMap!.set(wall, {
       id: wall,
       wall,
@@ -373,8 +435,19 @@ export function seedDoorLayoutSingle(wall: DoorWall): void {
 }
 
 export function seedDoorLayoutDefaults(): void {
-  if (!docAlive() || doorLayoutMap!.size > 0) return;
+  if (!docAlive()) return;
+  if (doorLayoutDocSize() > 0) {
+    // Already has doors, so there is nothing to seed — but STAMP it. A room
+    // seeded before the marker existed holds records and no marker, and
+    // without this its owner could delete every door and have four spring
+    // back, because empty-and-unmarked still reads as un-migrated. Every door
+    // edit runs seed-first, so this upgrades a room the first time anyone
+    // touches its doors.
+    markDoorSetAuthoritative();
+    return;
+  }
   boundDoc!.transact(() => {
+    doorLayoutMap!.set(META_KEY, { v: 1 }); // same transaction as the records
     for (const wall of WALLS) {
       const door = findDoor(wall);
       if (!door) continue;

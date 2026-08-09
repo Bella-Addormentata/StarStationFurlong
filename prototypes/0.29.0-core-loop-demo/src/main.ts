@@ -94,6 +94,8 @@ import {
   seedDoorLayoutSingle,
   doorLayoutDocSize,
   readAllDoorLayout,
+  doorSetIsAuthoritative,
+  seedDoorLayoutEmpty,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -1129,10 +1131,15 @@ async function joinRoomAtEpoch(
     // doors the room actually has, and fail CLOSED when it has none public.
     isPassagePublic: () => {
       const ids = [...readAllDoorLayout().keys()];
-      // An unseeded room presents the four cardinal defaults everywhere else,
-      // so treat it the same here rather than making "never opened the door
-      // editor" mean "unreachable".
-      const doors = ids.length ? ids : ["north", "south", "east", "west"];
+      // An UN-MIGRATED room presents the four cardinal defaults everywhere
+      // else, so treat it the same here rather than making "never opened the
+      // door editor" mean "unreachable". A room that has DECLARED an empty
+      // door set is a different thing: nobody can walk in, so nobody should be
+      // handed its address either — that falls out of `some` over an empty
+      // list, which is exactly the fail-closed answer.
+      const doors = doorSetIsAuthoritative()
+        ? ids
+        : ["north", "south", "east", "west"];
       return doors.some((d) => readDoorPolicy(d).passage === "public");
     },
   });
@@ -1337,6 +1344,13 @@ async function joinRoomAtEpoch(
     // client minted this session cannot clobber remote state, which is the same
     // argument that licenses the owner/name write above.
     const mintedHere = mintedRoomTemplates.get(boot.roomId);
+    // 🛰️ A room minted with NO berth is a fresh standalone station: it is
+    // connected to nothing, so it starts with NO doors and its owner places
+    // the first one. Claiming that explicitly is what stops the reconcile
+    // reading "empty map" as "un-migrated" and conjuring four cardinals.
+    if (mintedHere && !mintedHere.birthWall && doorLayoutDocSize() === 0) {
+      seedDoorLayoutEmpty();
+    }
     if (mintedHere?.birthWall && doorLayoutDocSize() === 0) {
       seedDoorLayoutSingle(mintedHere.birthWall);
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
@@ -2088,11 +2102,16 @@ async function transitTo(
     return;
   }
 
+  // 🚪 A doorless arrival room has no door to come in through. The mirror
+  // write below is keyed on that door, so with none there is nothing to write
+  // — and nothing to walk through either (world.completeAdapterArrival warns
+  // and skips its own walk-in for the same reason).
   const arrivalDoorId = world.resolveArrivalDoor(
     departureDoorId,
     depGeometry?.farDoor,
     depRoomId ?? undefined,
-  ).id;
+  )?.id;
+  if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
   if (depPaired && depAddress && arrivalRoomId) {
     sessionReturnRoute = {
