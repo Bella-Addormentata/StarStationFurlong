@@ -19,7 +19,7 @@
  */
 
 import * as THREE from "three";
-import { physicalDoorPose } from "./doorLayout";
+import { physicalDoorPose, physicalDoorPoseOrNull } from "./doorLayout";
 
 /**
  * 🚪 A door a vestibule/gangway can hang off. Now `string`: the geometry here
@@ -858,10 +858,22 @@ export function projectionPoseForDoor(
   const x = xr + Math.sin(heading) * ROOM_HALF;
   const z = zr + Math.cos(heading) * ROOM_HALF;
   // Far room rotation: its `farDoor` faces BACK along the arrival heading.
-  const rotY =
-    farDoor !== undefined
-      ? heading + Math.PI - physicalDoorPose(farDoor).outwardYaw
-      : heading;
+  //
+  // ⚠️ `farDoor` names a door in the FAR room, which is not in this client's
+  // record snapshot — so the ONLY way we can know which wall it is on is if the
+  // id itself says so, i.e. if it is a cardinal. That is the last thing a
+  // cardinal id carries that nothing else supplies, and it is why free doors
+  // need a `farWall` on the pairing record before this can be correct for them.
+  //
+  // Until then, be HONEST about not knowing: physicalDoorPose would have
+  // substituted the north wall (its documented fallback) and quietly produced a
+  // confident wrong rotation for every module reached through a free door.
+  // physicalDoorPoseOrNull returns null instead, and an unknown far wall means
+  // we simply do not rotate — same arithmetic result the fallback happened to
+  // give here, but stated rather than stumbled into, and with no bogus warning.
+  const farPose =
+    farDoor !== undefined ? physicalDoorPoseOrNull(farDoor) : null;
+  const rotY = farPose ? heading + Math.PI - farPose.outwardYaw : heading;
   return { x, z, rotY };
 }
 
