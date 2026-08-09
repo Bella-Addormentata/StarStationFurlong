@@ -25,6 +25,8 @@ import {
   readAllDoorLayout,
   writeDoorLabel,
   seedDoorLayoutDefaults,
+  doorDisplayName,
+  doorOrdinals,
 } from "./doorLayoutDoc";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
@@ -903,12 +905,13 @@ export class DoorDockingPortSystem {
             <button id="docking-clear-chain" style="background:rgba(255,23,68,0.08); border:1px solid rgba(255,23,68,0.3); border-radius:5px; color:#ff8a80; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">CLEAR</button>
             <span style="flex:1;"></span>
             <span style="font-size:9px; color:rgba(212,168,75,0.55);">FAR:</span>
+            <!-- 🧭 Populated per-TARGET with the far module's REAL doors
+                 (renderFarDoorOptions) — the four hardcoded compass options
+                 were guesses about a stranger's room, meaningless once doors
+                 move and modules rotate. "auto" always works: the first
+                 walk-through's mirror names the door precisely. -->
             <select id="docking-far-door" style="background:rgba(0,0,0,0.3); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#d4a84b; font-size:9px; padding:2px 4px;">
               <option value="">auto</option>
-              <option value="north">north</option>
-              <option value="south">south</option>
-              <option value="east">east</option>
-              <option value="west">west</option>
             </select>
             <button id="docking-far-yaw" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">YAW —</button>
           </div>
@@ -1240,6 +1243,8 @@ export class DoorDockingPortSystem {
       if (!st || st.pairedSuccessfully) return;
       st.farWall = undefined;
       st.farLateral = undefined;
+      // …and the FAR options follow the new target's real door set.
+      if (doorId) this.renderFarDoorOptions(doorId);
     });
 
     // ── 🧭 NEW-MODULE PLACEMENT wiring (⟳ / ◀ ▶ + live ghost) ───────────────
@@ -1247,7 +1252,11 @@ export class DoorDockingPortSystem {
     const placeLat = document.getElementById("docking-place-lat");
     const paintPlacement = (doorId: string) => {
       const c = this.choiceFor(doorId);
-      if (placeRotate) placeRotate.textContent = `⟳ ${c.wall.toUpperCase()}`;
+      // 🧭 Degrees, not walls — the ghost shows the orientation; the button
+      // reports how far the module is turned from its default.
+      const order: DoorWall[] = ["west", "north", "east", "south"];
+      if (placeRotate)
+        placeRotate.textContent = `⟳ ${order.indexOf(c.wall) * 90}°`;
       if (placeLat)
         placeLat.textContent =
           c.lateral === 0
@@ -1720,6 +1729,44 @@ export class DoorDockingPortSystem {
     }
   }
 
+  /**
+   * 🧭 Fill the FAR select with the TARGET module's real doors, numbered with
+   * the same perimeter rule every other surface speaks. Target = the address
+   * box (pre-INITIATE) or the live pairing. A module the atlas has no door
+   * geometry for offers only "auto" — which is never wrong: the mirror names
+   * the actual arrival door on the first walk-through.
+   */
+  private renderFarDoorOptions(doorId: string): void {
+    const farSel = document.getElementById(
+      "docking-far-door",
+    ) as HTMLSelectElement | null;
+    if (!farSel) return;
+    const st = this.doorState.get(doorId);
+    const addr =
+      (document.getElementById("docking-addr-input") as HTMLInputElement | null)
+        ?.value || st?.connectedRoomAddress || "";
+    const rid = addr ? roomIdFromSeed(addr) : "";
+    const doors = rid ? readAtlas()[rid]?.doors ?? {} : {};
+    const entries = Object.entries(doors).map(([id, d]) => ({
+      id, wall: d?.wall, lateral: d?.lateral,
+    }));
+    const ordinals = doorOrdinals(entries);
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    const prev = farSel.value;
+    farSel.innerHTML =
+      `<option value="">auto</option>` +
+      entries
+        .sort((a, b) => (ordinals.get(a.id) ?? 9) - (ordinals.get(b.id) ?? 9))
+        .map((e) => `<option value="${esc(e.id)}">DOOR ${ordinals.get(e.id)}</option>`)
+        .join("");
+    // Keep the current selection when it survives the repopulation; a farDoor
+    // naming a door the atlas does not list yet degrades to auto IN THE UI
+    // while the state keeps the precise id (the mirror wrote it).
+    farSel.value = prev;
+    if (farSel.value !== prev) farSel.value = "";
+  }
+
   /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
    *  a grant landing while a guest stares at the keypad unlocks it live). */
   public refreshPolicyUI(): void {
@@ -1811,6 +1858,7 @@ export class DoorDockingPortSystem {
             ? "· no build rights — REQUEST below"
             : "· owner only on this port");
     }
+    this.renderFarDoorOptions(doorId);
     if (farSel) farSel.value = state.farDoor ?? "";
     if (yawBtn)
       yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? "—" : state.farYawDeg}`;
@@ -1878,8 +1926,9 @@ export class DoorDockingPortSystem {
     // Expose active door context inside the modal scope
     (pane as any).activeDoorId = doorId;
     pane.style.display = "flex";
-    const wallLabel = this.poseForDoor(doorId).wall.toUpperCase();
-    title.textContent = `🚪 DOCKING PORT CONTROL: ${wallLabel} WALL`;
+    // 🧭 The door's NAME, never a wall: modules render at any angle, so
+    // compass words are meaningless to the person reading this.
+    title.textContent = `🚪 DOCKING PORT CONTROL: ${doorDisplayName(doorId)}`;
 
     // Set field states
     lockBtn.textContent = state.locked ? "LOCKED" : "UNLOCKED";
@@ -2113,7 +2162,7 @@ export class DoorDockingPortSystem {
       : " · rigid (fit out of range)";
     slot.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
-        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its ${esc(best.door.wall.toUpperCase())}-wall door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
+        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its facing door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
         <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
       </div>`;
     slot.style.display = "block";

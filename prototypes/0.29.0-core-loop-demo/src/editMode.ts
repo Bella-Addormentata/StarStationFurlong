@@ -2298,15 +2298,17 @@ class RoomEditController {
     }
 
     seedDoorLayoutDefaults();
+    const newDoorId = `d:${mintDoorId()}`;
     writeDoorLayout({
-      id: `d:${mintDoorId()}`,
+      id: newDoorId,
       wall: ghost.wall,
       lateral: ghost.lateral,
       size: 'large',
       enabled: true,
+      placed: true,
     });
     this.setAddDoorMode(false); // hides the ghost (existing exit-add behaviour)
-    showHint(`Door added on the ${ghost.wall} wall.`, 2000);
+    showHint(`Added ${doorDisplayName(newDoorId)}.`, 2000);
   }
 
   // ── Door ghost preview (#28 S6b/ghost — furniture-like green/red follow) ─────
@@ -3176,8 +3178,7 @@ class RoomEditController {
     // Mid-drag the wall comes from the drag (the record lags the pointer);
     // otherwise the display name speaks for the door — authored label first,
     // generated wall name second, never a raw id.
-    if (this.doorDrag?.doorId === itemId)
-      return `DOOR · ${this.doorDrag.wall.toUpperCase()} WALL`;
+    if (this.doorDrag?.doorId === itemId) return "🚪 MOVING…";
     return `🚪 ${doorDisplayName(itemId)}`;
   }
 

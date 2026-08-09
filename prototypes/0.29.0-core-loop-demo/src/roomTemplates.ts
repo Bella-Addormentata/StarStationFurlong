@@ -110,7 +110,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     category: "pool",
     name: "Infinity Pool Deck",
     description:
-      "Infinity pool, bridge to the hot tub, dive tower between the north doors, beach cafés — under open space with skylights.",
+      "Infinity pool, bridge to the hot tub, dive tower between the twin doors, beach cafés — under open space with skylights.",
     // OUTDOOR_FURNITURE already carries the pool + its ceiling skylights.
     items: OUTDOOR_FURNITURE,
     doorLayout: "pool-pairs",
@@ -121,7 +121,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     category: "pool",
     name: "Classic Lido Pool",
     description:
-      "PR #70's original — east dive tower, corner hot tub, terrace bench, sun loungers, parasol cafés, glass-ceiling skylights.",
+      "PR #70's original — corner dive tower, corner hot tub, terrace bench, sun loungers, parasol cafés, glass-ceiling skylights.",
     items: [
       // 🪟☀️ Ceiling glass + a sun-lamp so the deck reads sunlit under real space
       // even when dropped into a windowless module.

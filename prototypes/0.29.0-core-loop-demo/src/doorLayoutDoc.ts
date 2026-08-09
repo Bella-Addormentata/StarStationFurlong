@@ -183,18 +183,45 @@ export const DOOR_LABEL_MAX = 18;
  * tombstone and PIN by standing in the same spot).
  */
 export function doorDisplayName(id: string): string {
-  const records = readAllDoorLayout();
+  // 🧭 An UNSEEDED room presents the four synthesized defaults everywhere else
+  // — number those too, or a cardinal id would fall through the ordinal miss
+  // and reach the user VERBATIM ("north"), the exact word this function
+  // exists to keep off the screen (sweep finding, 2026-08-09).
+  const stored = readAllDoorLayout();
+  const records = stored.size > 0 ? stored : defaultDoorLayoutRecords();
   const rec = records.get(id);
   const label = rec ? sanitizeDoorLabel(rec.label) : undefined;
   if (label) return label;
-  const wall = rec?.wall ?? (WALLS.includes(id as DoorWall) ? (id as DoorWall) : null);
-  if (!wall) return id.length > 12 ? `${id.slice(0, 12)}…` : id;
-  const onWall = [...records.values()]
-    .filter((r) => r.wall === wall)
-    .sort((a, b) => a.lateral - b.lateral);
-  const idx = onWall.findIndex((r) => r.id === id);
-  const name = `${wall.toUpperCase()} DOOR`;
-  return onWall.length > 1 && idx >= 0 ? `${name} ${idx + 1}` : name;
+  // 🧭 NO COMPASS WORDS (owner ruling): a module renders at any angle now, so
+  // "WEST DOOR" is meaningless the moment its module rotates. Doors are
+  // NUMBERED — walked around the room's own perimeter, an ordering every
+  // client derives identically and that survives any world rotation because
+  // it never references one.
+  const n = doorOrdinals([...records.values()]).get(id);
+  if (n !== undefined) return `DOOR ${n}`;
+  return id.length > 12 ? `${id.slice(0, 12)}…` : id;
+}
+
+/**
+ * 🔢 Stable 1-based numbering for a door set: walk the room's own perimeter —
+ * the four sides in fixed local order, then along each side — so every client
+ * numbers identically from the same records, with the id as the final
+ * tie-break. Takes a plain array (not the doc) so the FAR room's gossiped
+ * atlas doors can be numbered with the same rule the near room uses.
+ * Display currency only; identity remains the opaque id.
+ */
+export function doorOrdinals(
+  doors: Array<{ id: string; wall?: DoorWall; lateral?: number }>,
+): Map<string, number> {
+  const order: Record<string, number> = { north: 0, east: 1, south: 2, west: 3 };
+  const sorted = [...doors].sort((a, b) =>
+    (order[a.wall ?? ''] ?? 9) - (order[b.wall ?? ''] ?? 9)
+    || (a.lateral ?? 0) - (b.lateral ?? 0)
+    || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  );
+  const out = new Map<string, number>();
+  sorted.forEach((d, i) => out.set(d.id, i + 1));
+  return out;
 }
 
 /** Normalize a user-typed label: collapse whitespace, trim, cap length.
