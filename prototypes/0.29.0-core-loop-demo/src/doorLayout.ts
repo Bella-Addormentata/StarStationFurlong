@@ -1,10 +1,11 @@
 import { roomHalfExtents } from "./floorPlanDoc";
 import type { DoorWall } from "./doorLayoutDoc";
+import { LEGACY_ID_WALL } from "./doorLayoutDoc";
 
 export type PhysicalDoorId = "north" | "south" | "east" | "west";
 
 export interface PhysicalDoorPose {
-  wall: "north" | "south" | "east" | "west";
+  wall: DoorWall;
   x: number;
   z: number;
   outwardYaw: number;
@@ -104,13 +105,13 @@ export const MIN_DOOR_GAP = 4.0;
  * generator for every door in the room, cardinal or free.
  */
 export function poseFromWall(
-  wall: PhysicalDoorId,
+  wall: DoorWall,
   centreLateral: number,
   standLateral: number = centreLateral,
 ): PhysicalDoorPose {
   const { halfX, halfZ } = roomHalfExtents();
   switch (wall) {
-    case "north":
+    case "y-": // plan −Y = engine −Z (the old north)
       return {
         wall,
         x: centreLateral,
@@ -122,7 +123,7 @@ export function poseFromWall(
         faceAngle: Math.PI,
         tangent: "x",
       };
-    case "south":
+    case "y+": // plan +Y = engine +Z (the old south)
       return {
         wall,
         x: centreLateral,
@@ -134,7 +135,7 @@ export function poseFromWall(
         faceAngle: 0,
         tangent: "x",
       };
-    case "west":
+    case "x-": // plan −X = engine −X (the old west)
       return {
         wall,
         x: -halfX,
@@ -146,7 +147,7 @@ export function poseFromWall(
         faceAngle: -HALF_PI,
         tangent: "z",
       };
-    case "east":
+    case "x+": // plan +X = engine +X (the old east)
       return {
         wall,
         x: halfX,
@@ -186,15 +187,15 @@ export function wallAndLateralFromPoint(
 ): { wall: DoorWall; lateral: number } {
   const { halfX, halfZ } = roomHalfExtents();
   const dists: Array<{ wall: DoorWall; d: number }> = [
-    { wall: "north", d: Math.abs(pz + halfZ) },
-    { wall: "south", d: Math.abs(pz - halfZ) },
-    { wall: "west", d: Math.abs(px + halfX) },
-    { wall: "east", d: Math.abs(px - halfX) },
+    { wall: "y-", d: Math.abs(pz + halfZ) },
+    { wall: "y+", d: Math.abs(pz - halfZ) },
+    { wall: "x-", d: Math.abs(px + halfX) },
+    { wall: "x+", d: Math.abs(px - halfX) },
   ];
-  let best = dists[0];
-  for (const cand of dists) if (cand.d < best.d) best = cand;
-  const lateral = best.wall === "north" || best.wall === "south" ? px : pz;
-  return { wall: best.wall, lateral };
+  dists.sort((a, b) => a.d - b.d);
+  const wall = dists[0].wall;
+  const lateral = wall === "y-" || wall === "y+" ? px : pz;
+  return { wall, lateral };
 }
 
 /**
@@ -209,11 +210,11 @@ export function wallAndLateralFromPoint(
  * which can express neither an empty wall nor a wall with three doors on it.
  * A record per door expresses both, and one code path serves every door.
  */
-let doorRecords: ReadonlyMap<string, { wall: PhysicalDoorId; lateral: number }> =
+let doorRecords: ReadonlyMap<string, { wall: DoorWall; lateral: number }> =
   new Map();
 
 export function setDoorRecords(
-  records: ReadonlyMap<string, { wall: PhysicalDoorId; lateral: number }>,
+  records: ReadonlyMap<string, { wall: DoorWall; lateral: number }>,
 ): void {
   doorRecords = records;
 }
@@ -257,10 +258,11 @@ export function physicalDoorPoseOrNull(
     const lateral = rec.lateral + lateralDelta;
     return poseFromWall(rec.wall, lateral, lateral);
   }
-  // No record. A CARDINAL id is still self-describing — it names its own wall,
-  // which is what the retired layout global's "legacy" default produced at boot
-  // before any room is entered, so that path stays bit-identical.
-  if (isCardinalDoorId(id)) return poseFromWall(id, lateralDelta, lateralDelta);
+  // No record. A LEGACY id is still self-describing — the four old ids were
+  // born on the wall of the same name (LEGACY_ID_WALL), which is what the boot
+  // path produced before any room is entered, so it stays bit-identical.
+  const w = LEGACY_ID_WALL[id];
+  if (w) return poseFromWall(w, lateralDelta, lateralDelta);
   return null;
 }
 
@@ -287,7 +289,7 @@ function fallbackPose(id: string): PhysicalDoorPose {
         `bug in whatever supplied the id, not in the door.`,
     );
   }
-  return poseFromWall("north", 0, 0);
+  return poseFromWall("y-", 0, 0);
 }
 
 /** 🛰️ #28 S1: the structural PORT pose. Ports are, for now, exactly the 4

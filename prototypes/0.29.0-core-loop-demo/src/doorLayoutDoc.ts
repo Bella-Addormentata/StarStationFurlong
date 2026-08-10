@@ -30,9 +30,46 @@
 import * as Y from 'yjs';
 import { findDoor } from './doors';
 
-export type DoorWall = 'north' | 'south' | 'east' | 'west';
+/**
+ * 🧭 AXIS WALL LABELS (owner ruling 2026-08-09): the room's four sides named by
+ * the PLAN-VIEW axes — x+/x- and y+/y-, with z+ the roof and z- the floor
+ * (reserved; doors never sit on those). The room's CENTRE is the origin, so a
+ * wall label is literally "the side where that coordinate is positive".
+ *
+ * These replace the compass words, which were lies twice over: they claimed a
+ * world orientation modules no longer have (a module renders at any angle),
+ * and they collided with the four LEGACY DOOR IDS ('north'…), which are names
+ * of doors, not places. The mapping to the old words — and to the ENGINE's
+ * axes, which are Y-up (three.js), so a plan-view y± wall sits on the engine's
+ * Z axis — is stated once, here:
+ *
+ *   'x+' = old east  = engine +X      'y+' = old south = engine +Z
+ *   'x-' = old west  = engine −X      'y-' = old north = engine −Z
+ */
+export type DoorWall = 'x+' | 'x-' | 'y+' | 'y-';
 
-const WALLS: readonly DoorWall[] = ['north', 'south', 'east', 'west'];
+const WALLS: readonly DoorWall[] = ['x+', 'x-', 'y+', 'y-'];
+
+/** Old compass wall values → axis labels. READ boundary only: stored rooms are
+ *  full of 'north' walls, and dropping them would strip every door from every
+ *  pre-rename room. Writes always emit axis labels. */
+const LEGACY_WALL: Record<string, DoorWall> = {
+  east: 'x+', west: 'x-', south: 'y+', north: 'y-',
+};
+
+/** A LEGACY DOOR ID's self-described wall — the four old ids were born on the
+ *  wall of the same name. Ids are opaque names and stay as they are; only the
+ *  geometry vocabulary changed. */
+export const LEGACY_ID_WALL: Record<string, DoorWall> = {
+  east: 'x+', west: 'x-', south: 'y+', north: 'y-',
+};
+
+/** Accept a stored wall value in either vocabulary; undefined for junk. */
+export function normalizeWall(v: unknown): DoorWall | undefined {
+  if (typeof v !== 'string') return undefined;
+  if ((WALLS as readonly string[]).includes(v)) return v as DoorWall;
+  return LEGACY_WALL[v];
+}
 
 /** Marker key in the doorLayout map — see the DOOR-SET MARKER block below. */
 const META_KEY = '__meta';
@@ -99,17 +136,21 @@ export type LegacyLayoutKind = 'legacy' | 'casino-pairs' | 'pool-pairs';
 /** Spacing between the two doors that shared a wall in the paired kinds. */
 const PAIR_OFFSET = 3.0;
 
-/** Where a cardinal id physically stood under each retired kind. */
+/** Where a LEGACY DOOR ID physically stood under each retired kind. The
+ *  parameter was typed as a wall before the axis rename, which was exactly the
+ *  id/wall conflation the rename splits: this takes the ID ('north'…), and
+ *  answers in axis walls. */
 function legacySlotFor(
-  id: DoorWall,
+  id: string,
   kind: LegacyLayoutKind,
 ): { wall: DoorWall; lateral: number } {
-  if (kind === 'legacy') return { wall: id, lateral: 0 };
+  if (kind === 'legacy')
+    return { wall: LEGACY_ID_WALL[id] ?? 'y-', lateral: 0 };
   switch (id) {
-    case 'north': return { wall: 'north', lateral: -PAIR_OFFSET };
-    case 'south': return { wall: 'north', lateral: PAIR_OFFSET };
-    case 'west': return { wall: 'west', lateral: -PAIR_OFFSET };
-    case 'east': return { wall: 'west', lateral: PAIR_OFFSET };
+    case 'north': return { wall: 'y-', lateral: -PAIR_OFFSET };
+    case 'south': return { wall: 'y-', lateral: PAIR_OFFSET };
+    case 'west': return { wall: 'x-', lateral: -PAIR_OFFSET };
+    default: return { wall: 'x-', lateral: PAIR_OFFSET }; // 'east'
   }
 }
 
@@ -138,8 +179,8 @@ export function isLegacyDoorLayoutKind(v: unknown): v is LegacyLayoutKind {
  *  cardinals pass through untouched. */
 function withCompatSlot(rec: DoorLayoutRecord): DoorLayoutRecord {
   if (rec.placed) return rec;
-  if (!WALLS.includes(rec.id as DoorWall)) return rec; // free door — already authoritative
-  const slot = legacySlotFor(rec.id as DoorWall, compatKind);
+  if (!(rec.id in LEGACY_ID_WALL)) return rec; // free door — already authoritative
+  const slot = legacySlotFor(rec.id, compatKind);
   return { ...rec, wall: slot.wall, lateral: slot.lateral };
 }
 
@@ -151,15 +192,17 @@ function withCompatSlot(rec: DoorLayoutRecord): DoorLayoutRecord {
  */
 export function defaultDoorLayoutRecords(): Map<string, DoorLayoutRecord> {
   const out = new Map<string, DoorLayoutRecord>();
-  for (const id of WALLS) {
-    out.set(id, withCompatSlot({ id, wall: id, lateral: 0, size: 'large', enabled: true }));
+  for (const id of Object.keys(LEGACY_ID_WALL)) {
+    out.set(id, withCompatSlot({
+      id, wall: LEGACY_ID_WALL[id], lateral: 0, size: 'large', enabled: true,
+    }));
   }
   return out;
 }
 
 /** The wall + lateral a cardinal should be MIGRATED to — its current physical
  *  slot, so writing it moves nothing. */
-export function migratedCardinalSlot(id: DoorWall): { wall: DoorWall; lateral: number } {
+export function migratedCardinalSlot(id: string): { wall: DoorWall; lateral: number } {
   return legacySlotFor(id, compatKind);
 }
 // ── end compat shim ─────────────────────────────────────────────────────────
@@ -278,8 +321,7 @@ export function isDoorLayoutRecord(value: unknown): value is DoorLayoutRecord {
   return (
     typeof r.id === 'string' &&
     r.id.length > 0 &&
-    typeof r.wall === 'string' &&
-    WALLS.includes(r.wall as DoorWall) &&
+    normalizeWall(r.wall) !== undefined &&
     Number.isFinite(r.lateral) &&
     (r.size === undefined || r.size === 'small' || r.size === 'large') &&
     (r.enabled === undefined || typeof r.enabled === 'boolean') &&
@@ -313,6 +355,9 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
       // so it must not be rounded back through the #91 normalization above.
       const norm = withCompatSlot({
         ...value,
+        // 🧭 Stored walls may still speak compass — normalize to axis labels
+        // at the read boundary, like every other legacy value.
+        wall: normalizeWall(value.wall) ?? value.wall,
         size: 'large',
         lateral: Math.round(value.lateral),
       });
@@ -506,21 +551,15 @@ export function seedDoorLayoutDefaults(): void {
   }
   boundDoc!.transact(() => {
     doorLayoutMap!.set(META_KEY, { v: 1 }); // same transaction as the records
-    for (const wall of WALLS) {
-      const door = findDoor(wall);
+    for (const id of Object.keys(LEGACY_ID_WALL)) {
+      const door = findDoor(id);
       if (!door) continue;
-      // 🚪 Seed each cardinal at the slot it PHYSICALLY occupies right now, so
-      // the room it is being seeded from does not move a single door — then
-      // flag it authoritative so the compat shim leaves it alone forever after.
-      //
-      // This used to write `lateral: deltas[wall]` — the owner's floor-plan
-      // SLIDE — into a field that nothing then read for a cardinal (the slot
-      // table decided the position). The slide still lives in floorPlan and is
-      // still applied on top; what changes is that `lateral` now means the
-      // door's base centre, the same thing it has always meant for free doors.
-      const slot = migratedCardinalSlot(wall);
-      doorLayoutMap!.set(wall, {
-        id: wall,
+      // 🚪 Seed each door at the slot it PHYSICALLY occupies right now, so the
+      // room being seeded does not move a single door — then flag it
+      // authoritative so the compat shim leaves it alone forever after.
+      const slot = migratedCardinalSlot(id);
+      doorLayoutMap!.set(id, {
+        id,
         wall: slot.wall,
         lateral: slot.lateral,
         size: 'large',

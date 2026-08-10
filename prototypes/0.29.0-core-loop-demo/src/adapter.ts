@@ -938,7 +938,7 @@ function shiftByFarLateral(
 ): { x: number; z: number } {
   if (!farLateral) return centre;
   const t =
-    farWall === "north" || farWall === "south"
+    farWall === "y-" || farWall === "y+"
       ? { x: farLateral, z: 0 }
       : { x: 0, z: farLateral };
   const c = Math.cos(rotY),

@@ -27,6 +27,7 @@ import {
   seedDoorLayoutDefaults,
   doorDisplayName,
   doorOrdinals,
+  LEGACY_ID_WALL,
 } from "./doorLayoutDoc";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
@@ -230,7 +231,7 @@ export class DoorDockingPortSystem {
   private choiceFor(doorId: string): { wall: DoorWall; lateral: number } {
     let c = this.provisionChoice.get(doorId);
     if (!c) {
-      c = { wall: "west", lateral: 0 }; // the old hardcoded birth door
+      c = { wall: "x-", lateral: 0 }; // the old default birth door (was west)
       this.provisionChoice.set(doorId, c);
     }
     return c;
@@ -269,7 +270,7 @@ export class DoorDockingPortSystem {
     edges.position.y = 2;
     g.add(edges);
     // The birth door: a green slab on the chosen wall, module-local.
-    const ns = choice.wall === "north" || choice.wall === "south";
+    const ns = choice.wall === "y-" || choice.wall === "y+";
     const slab = new THREE.Mesh(
       new THREE.BoxGeometry(ns ? 2.0 : 0.24, 2.5, ns ? 0.24 : 2.0),
       new THREE.MeshBasicMaterial({
@@ -279,9 +280,9 @@ export class DoorDockingPortSystem {
       }),
     );
     slab.position.set(
-      choice.wall === "east" ? H : choice.wall === "west" ? -H : choice.lateral,
+      choice.wall === "x+" ? H : choice.wall === "x-" ? -H : choice.lateral,
       1.25,
-      choice.wall === "south" ? H : choice.wall === "north" ? -H : choice.lateral,
+      choice.wall === "y+" ? H : choice.wall === "y-" ? -H : choice.lateral,
     );
     g.add(slab);
     g.position.set(pose.x, 0, pose.z);
@@ -399,7 +400,7 @@ export class DoorDockingPortSystem {
     const ud = this.doorObjects.get(id)?.userData as
       | { wall?: DoorWall; lateral?: number }
       | undefined;
-    return poseFromWall(ud?.wall ?? "north", (ud?.lateral ?? 0) + delta);
+    return poseFromWall(ud?.wall ?? "y-", (ud?.lateral ?? 0) + delta);
   }
 
   public buildPorts() {
@@ -412,7 +413,7 @@ export class DoorDockingPortSystem {
       // adds/removes groups from the synced map afterward.
       this.buildDoorGroup({
         id,
-        wall: id,
+        wall: LEGACY_ID_WALL[id],
         lateral: 0,
         size: "large",
         enabled: findDoor(id)?.enabled === true,
@@ -1254,7 +1255,7 @@ export class DoorDockingPortSystem {
       const c = this.choiceFor(doorId);
       // 🧭 Degrees, not walls — the ghost shows the orientation; the button
       // reports how far the module is turned from its default.
-      const order: DoorWall[] = ["west", "north", "east", "south"];
+      const order: DoorWall[] = ["x-", "y-", "x+", "y+"];
       if (placeRotate)
         placeRotate.textContent = `⟳ ${order.indexOf(c.wall) * 90}°`;
       if (placeLat)
@@ -1271,7 +1272,7 @@ export class DoorDockingPortSystem {
       const doorId = activeDoor();
       if (!doorId || !this.canConstruct(doorId)) return;
       const c = this.choiceFor(doorId);
-      const order: DoorWall[] = ["west", "north", "east", "south"];
+      const order: DoorWall[] = ["x-", "y-", "x+", "y+"];
       c.wall = order[(order.indexOf(c.wall) + 1) % 4];
       paintPlacement(doorId);
     });
@@ -1402,10 +1403,10 @@ export class DoorDockingPortSystem {
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.canConstruct(doorId)) return;
       const v = (e.target as HTMLSelectElement).value;
-      state.farDoor =
-        v === "north" || v === "south" || v === "east" || v === "west"
-          ? v
-          : undefined;
+      // Any real door id from the per-target options ('' = auto). The old
+      // four-name filter silently discarded a free `d:` selection to auto —
+      // exactly the class of cardinal gate this rename exists to end.
+      state.farDoor = v || undefined;
       // 🧭 The stashed farWall/farLateral described the PREVIOUS far door —
       // clearing them makes farWallFor re-resolve from the atlas for the new
       // one instead of republishing a confidently wrong wall to every client.
@@ -1510,7 +1511,7 @@ export class DoorDockingPortSystem {
           const base = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
           const centre = physicalDoorPose(doorId, doorSlideDelta(doorId));
           const centreLateral =
-            centre.wall === "north" || centre.wall === "south" ? centre.x : centre.z;
+            centre.wall === "y-" || centre.wall === "y+" ? centre.x : centre.z;
           // Bound in WORLD-CENTRE currency as well. writeDoorPlacement's own
           // clamp is expressed in STORED units, which are relative to the
           // LEGACY slot — under a pairs layout the live slot is ±PAIR_OFFSET
@@ -1528,7 +1529,7 @@ export class DoorDockingPortSystem {
           // The store speaks base-relative laterals; convert the new centre back.
           const baseCentre = physicalDoorPose(doorId, 0);
           const baseLateral =
-            baseCentre.wall === "north" || baseCentre.wall === "south"
+            baseCentre.wall === "y-" || baseCentre.wall === "y+"
               ? baseCentre.x
               : baseCentre.z;
           writeDoorPlacement(doorId, stepped - baseLateral + base);
@@ -2041,10 +2042,10 @@ export class DoorDockingPortSystem {
     } | null = null;
     // The outward yaw of each wall — poseFromWall's values, stated once.
     const WALL_YAW: Record<DoorWall, number> = {
-      south: 0,
-      east: Math.PI / 2,
-      north: Math.PI,
-      west: -Math.PI / 2,
+      'y+': 0,
+      'x+': Math.PI / 2,
+      'y-': Math.PI,
+      'x-': -Math.PI / 2,
     };
     const angDiff = (a: number, b: number) => {
       let d = (a - b) % (Math.PI * 2);
@@ -2074,8 +2075,8 @@ export class DoorDockingPortSystem {
       // The four wall-centre hypotheticals — the pre-redo candidate set. A
       // room can grow a door anywhere, so CONNECT may aim at a wall centre;
       // the far owner's seed/editor takes it from there.
-      for (const w of ["north", "south", "east", "west"] as const) {
-        out.push({ id: w, wall: w, lateral: 0 });
+      for (const [id, wall] of Object.entries(LEGACY_ID_WALL)) {
+        out.push({ id, wall, lateral: 0 });
       }
       return out;
     };
@@ -2117,9 +2118,9 @@ export class DoorDockingPortSystem {
     // matching the exterior's uniform shells.)
     const pick = best.door;
     const doorFaceLocal =
-      pick.wall === "north" ? { x: pick.lateral, z: -6 }
-      : pick.wall === "south" ? { x: pick.lateral, z: 6 }
-      : pick.wall === "east" ? { x: 6, z: pick.lateral }
+      pick.wall === "y-" ? { x: pick.lateral, z: -6 }
+      : pick.wall === "y+" ? { x: pick.lateral, z: 6 }
+      : pick.wall === "x+" ? { x: 6, z: pick.lateral }
       : { x: -6, z: pick.lateral };
     const mc = Math.cos(mod.rotY),
       ms = Math.sin(mod.rotY);

@@ -140,10 +140,10 @@ function doorLateralLimit(doorId: DoorId): number {
  *  slide in X (run 2·halfX), e/w in Z (run 2·halfZ); opening + posts stay ~2 m
  *  clear of the corner and never exceed the legacy cap. Default 2×2 room ⇒ 4.0. */
 export function doorLateralLimitForWall(
-  wall: 'north' | 'south' | 'east' | 'west',
+  wall: 'x+' | 'x-' | 'y+' | 'y-',
 ): number {
   const { halfX, halfZ } = roomHalfExtents();
-  const half = wall === 'north' || wall === 'south' ? halfX : halfZ;
+  const half = wall === 'y-' || wall === 'y+' ? halfX : halfZ;
   return Math.max(0, Math.min(DOOR_LATERAL_LIMIT, half - DOOR_LATERAL_CLEARANCE));
 }
 

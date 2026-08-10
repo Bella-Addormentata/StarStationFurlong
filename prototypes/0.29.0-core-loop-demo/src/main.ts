@@ -2289,7 +2289,7 @@ function wireAdapterTransit(): void {
     // placement editor; 'west' centred is only the default. A module minted
     // with no parent berth has nothing to lead back to and is born doorless.
     const birthWall: DoorWall | undefined = parentDoorId
-      ? (placement?.wall ?? "west")
+      ? (placement?.wall ?? "x-")
       : undefined;
     // 🏗️ Remember the chosen room template so this module is born from it on
     // first claim (see the claimRoomDefaults seed path).
@@ -2594,7 +2594,7 @@ function harvestStationAtlas(): void {
         ...(pose
           ? {
               wall: pose.wall,
-              lateral: pose.wall === "north" || pose.wall === "south" ? pose.x : pose.z,
+              lateral: pose.wall === "y-" || pose.wall === "y+" ? pose.x : pose.z,
             }
           : {}),
       }];

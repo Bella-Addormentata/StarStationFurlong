@@ -6805,16 +6805,16 @@ const WALL_MOUNT_INSET = 0.03;
  * (z=+half) wants -z ⇒ rot 2; west (x=-half) wants +x ⇒ rot 1.
  */
 const WALL_MOUNT_ROT: Record<DoorWall, Rot> = {
-  north: 0,
-  east: 3,
-  south: 2,
-  west: 1,
+  'y-': 0, // engine −Z wall wants +z ⇒ rot 0
+  'x+': 3,
+  'y+': 2,
+  'x-': 1,
 };
 
 /** Which wall a wall-mounted item at `rot` is hanging on (inverse of the map
  *  above) — lets the validators ask "is this the north wall?" from a pose. */
 export function wallOfMountRot(rot: Rot): DoorWall {
-  return rot === 0 ? "north" : rot === 3 ? "east" : rot === 2 ? "south" : "west";
+  return rot === 0 ? "y-" : rot === 3 ? "x+" : rot === 2 ? "y+" : "x-";
 }
 
 /**
@@ -6838,13 +6838,13 @@ export function snapInteriorWall(
 
   // Nearest wall wins. Ties fall through to the z walls (north/south), which
   // is where the terminal lives by default.
-  const dNorth = Math.abs(z + halfZ);
-  const dSouth = Math.abs(halfZ - z);
-  const dWest = Math.abs(x + halfX);
-  const dEast = Math.abs(halfX - x);
-  const min = Math.min(dNorth, dSouth, dWest, dEast);
+  const dYneg = Math.abs(z + halfZ);
+  const dYpos = Math.abs(halfZ - z);
+  const dXneg = Math.abs(x + halfX);
+  const dXpos = Math.abs(halfX - x);
+  const min = Math.min(dYneg, dYpos, dXneg, dXpos);
   const wall: DoorWall =
-    min === dSouth ? "south" : min === dNorth ? "north" : min === dEast ? "east" : "west";
+    min === dYpos ? "y+" : min === dYneg ? "y-" : min === dXpos ? "x+" : "x-";
 
   // Along-wall snap, clamped to the last half-grid stop that (a) keeps the
   // panel fully on the wall and (b) leaves the panel's stand-point on a
@@ -6858,22 +6858,22 @@ export function snapInteriorWall(
   // one-directional. The result was a wall whose east half accepted the
   // terminal and whose west half silently refused it (or vice versa),
   // including at the very stop the clamp itself offered.
-  const alongHalf = wall === "north" || wall === "south" ? halfX : halfZ;
+  const alongHalf = wall === "y-" || wall === "y+" ? halfX : halfZ;
   const { boundX, boundZ } = roomWalkBounds();
-  const alongBound = wall === "north" || wall === "south" ? boundX : boundZ;
+  const alongBound = wall === "y-" || wall === "y+" ? boundX : boundZ;
   const stop = Math.min(
     Math.floor((alongHalf - spec.halfW) * 2) / 2,
     Math.floor((alongBound - CELL / 2) * 2) / 2,
   );
-  const along = Math.max(-stop, Math.min(stop, Math.round((wall === "north" || wall === "south" ? x : z) * 2) / 2));
+  const along = Math.max(-stop, Math.min(stop, Math.round((wall === "y-" || wall === "y+" ? x : z) * 2) / 2));
 
   const plane = (h: number) => h - WALL_MOUNT_INSET;
   const rot = WALL_MOUNT_ROT[wall];
   switch (wall) {
-    case "north": return { x: along, z: -plane(halfZ), rot };
-    case "south": return { x: along, z: plane(halfZ), rot };
-    case "west": return { x: -plane(halfX), z: along, rot };
-    case "east": return { x: plane(halfX), z: along, rot };
+    case "y-": return { x: along, z: -plane(halfZ), rot };
+    case "y+": return { x: along, z: plane(halfZ), rot };
+    case "x-": return { x: -plane(halfX), z: along, rot };
+    case "x+": return { x: plane(halfX), z: along, rot };
   }
 }
 

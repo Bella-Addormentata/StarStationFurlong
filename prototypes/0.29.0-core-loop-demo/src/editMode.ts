@@ -456,7 +456,7 @@ function wallMountVerdict(
   if (!panel) return { ok: true };
 
   const wall = wallOfMountRot(rot);
-  const alongWall = wall === 'north' || wall === 'south' ? pos.x : pos.z;
+  const alongWall = wall === 'y-' || wall === 'y+' ? pos.x : pos.z;
   const halfW = wallMountHalfWidth(item.kind);
 
   // 0. The pose must actually BE on the wall its rot claims. validatePlacement
@@ -468,9 +468,9 @@ function wallMountVerdict(
   //    wall. Everything below measures clearance against THAT wall, so an
   //    unanchored pose would be validated against geometry it is nowhere near.
   const { halfX, halfZ } = roomHalfExtents();
-  const wallPlane = wall === 'north' ? -halfZ : wall === 'south' ? halfZ
-    : wall === 'west' ? -halfX : halfX;
-  const across = wall === 'north' || wall === 'south' ? pos.z : pos.x;
+  const wallPlane = wall === 'y-' ? -halfZ : wall === 'y+' ? halfZ
+    : wall === 'x-' ? -halfX : halfX;
+  const across = wall === 'y-' || wall === 'y+' ? pos.z : pos.x;
   if (Math.abs(Math.abs(across) - Math.abs(wallPlane)) > 0.5 || Math.sign(across) !== Math.sign(wallPlane)) {
     return { ok: false, reason: 'it has to hang on a wall' };
   }
@@ -562,13 +562,13 @@ function doorOpeningAabb(wall: DoorWall, lateral: number): Box {
   const w = DOOR_OPENING_WIDTH;
   const DEPTH = 1.0; // shallow band into the room from the wall line
   switch (wall) {
-    case 'north': // wall at z = -halfZ; band runs +z into the room
+    case 'y-': // wall at z = -halfZ; band runs +z into the room
       return { x0: lateral - w / 2, x1: lateral + w / 2, z0: -halfZ, z1: -halfZ + DEPTH };
-    case 'south': // wall at z = +halfZ; band runs -z into the room
+    case 'y+': // wall at z = +halfZ; band runs -z into the room
       return { x0: lateral - w / 2, x1: lateral + w / 2, z0: halfZ - DEPTH, z1: halfZ };
-    case 'west': // wall at x = -halfX; band runs +x into the room
+    case 'x-': // wall at x = -halfX; band runs +x into the room
       return { x0: -halfX, x1: -halfX + DEPTH, z0: lateral - w / 2, z1: lateral + w / 2 };
-    case 'east': // wall at x = +halfX; band runs -x into the room
+    case 'x+': // wall at x = +halfX; band runs -x into the room
       return { x0: halfX - DEPTH, x1: halfX, z0: lateral - w / 2, z1: lateral + w / 2 };
   }
 }
@@ -591,7 +591,7 @@ function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: num
   // (#86 review). Free doors' records already carry the physical pose.
   const cardinalOpening = (id: DoorId) => {
     const pose = physicalDoorPose(id, deltas[id] ?? 0);
-    const lateral = pose.wall === 'north' || pose.wall === 'south' ? pose.x : pose.z;
+    const lateral = pose.wall === 'y-' || pose.wall === 'y+' ? pose.x : pose.z;
     return { id, wall: pose.wall, lateral };
   };
   for (const rec of records.values()) {
@@ -712,8 +712,8 @@ export function validateDoorPlacement(
     const { halfX, halfZ } = roomHalfExtents();
     const sideSurface =
       narrowAxisFor(halfX, halfZ) === 'x'
-        ? (wall === 'west' ? 'wall-neg' : wall === 'east' ? 'wall-pos' : null)
-        : (wall === 'north' ? 'wall-neg' : wall === 'south' ? 'wall-pos' : null);
+        ? (wall === 'x-' ? 'wall-neg' : wall === 'x+' ? 'wall-pos' : null)
+        : (wall === 'y-' ? 'wall-neg' : wall === 'y+' ? 'wall-pos' : null);
     if (sideSurface !== null) {
       const doorHalf = DOOR_OPENING_WIDTH / 2 + DOOR_POST_WIDTH; // opening + post
       const WINDOW_MARGIN = 0.4; // windowClearsDoors' MARGIN, mirrored
@@ -803,7 +803,7 @@ export function validateWindowPlacement(
     for (const item of FURNITURE) {
       if (!isWallMounted(item.kind)) continue;
       if (wallOfMountRot(item.rot) !== wall) continue;
-      const itemAlong = wall === 'north' || wall === 'south' ? item.pos.x : item.pos.z;
+      const itemAlong = wall === 'y-' || wall === 'y+' ? item.pos.x : item.pos.z;
       if (Math.abs(itemAlong - along) < w / 2 + wallMountHalfWidth(item.kind) + WINDOW_PANEL_MARGIN) {
         return { ok: false, reason: `${item.id} is on that wall` };
       }
@@ -827,8 +827,8 @@ const WINDOW_PANEL_MARGIN = 0.4;
 function wallForSideSurface(surface: HullSurface): DoorWall | null {
   const { halfX, halfZ } = roomHalfExtents();
   const narrowIsX = narrowAxisFor(halfX, halfZ) === 'x';
-  if (surface === 'wall-neg') return narrowIsX ? 'west' : 'north';
-  if (surface === 'wall-pos') return narrowIsX ? 'east' : 'south';
+  if (surface === 'wall-neg') return narrowIsX ? 'x-' : 'y-';
+  if (surface === 'wall-pos') return narrowIsX ? 'x+' : 'y+';
   return null;
 }
 
@@ -2449,7 +2449,7 @@ class RoomEditController {
     const wall = opening.wall;
     const basePose = isCardinal ? physicalDoorPose(doorId as DoorId, 0) : null;
     const baseCentre = basePose
-      ? (wall === 'north' || wall === 'south' ? basePose.x : basePose.z)
+      ? (wall === 'y-' || wall === 'y+' ? basePose.x : basePose.z)
       : 0;
     const originLateral = opening.lateral;
     // Store-currency offset for the drag's snap/clamp (see the struct doc).
@@ -2528,7 +2528,7 @@ class RoomEditController {
     const hits = this.raycaster.intersectObject(plane, false);
     if (hits.length === 0) return;
 
-    const raw = d.wall === 'north' || d.wall === 'south' ? hits[0].point.x : hits[0].point.z;
+    const raw = d.wall === 'y-' || d.wall === 'y+' ? hits[0].point.x : hits[0].point.z;
     // 🚪 #91: snap the world CENTRE straight onto the grid line. The #86 review
     // moved this into store currency to survive the round-trip, but for east /
     // west that shifted every snap by half a tile (storeShift is 0.5 there, not

@@ -32,7 +32,7 @@ import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState } from './docking';
 import {
-  readAllDoorLayout, doorOrdinals, doorDisplayName,
+  readAllDoorLayout, doorOrdinals, doorDisplayName, LEGACY_ID_WALL,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
 import { doorSlideDelta } from './floorPlanDoc';
@@ -353,8 +353,8 @@ function livePortView(): Array<{
   const records = [...readAllDoorLayout().values()];
   const doors = records.length
     ? records
-    : (['north', 'south', 'east', 'west'] as const).map((w) => ({
-        id: w, wall: w, lateral: 0, label: undefined,
+    : Object.entries(LEGACY_ID_WALL).map(([id, wall]) => ({
+        id, wall, lateral: 0, label: undefined,
       }));
   const ordinals = doorOrdinals(doors);
   return doors.map((d) => {
@@ -364,7 +364,7 @@ function livePortView(): Array<{
       x: pose.x,
       z: pose.z,
       w: DOOR_OPENING_WIDTH,
-      horizontal: pose.wall === 'north' || pose.wall === 'south',
+      horizontal: pose.wall === 'y-' || pose.wall === 'y+',
       label: String(ordinals.get(d.id) ?? '?'),
     };
   });

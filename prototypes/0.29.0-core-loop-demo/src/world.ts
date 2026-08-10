@@ -212,16 +212,17 @@ function doorAnchor(door: {
     : undefined;
 }
 
-/** 🚪 #91: the wall physically facing a given wall. Walking out of a room's
- *  north side must bring you in through the next room's south side. */
+/** 🚪 #91: the wall physically facing a given wall — the same axis, the
+ *  opposite sign. Walking out of a room's y− side must bring you in through
+ *  the next room's y+ side. */
 function oppositeWall(wall: DoorWall): DoorWall {
-  return wall === "north"
-    ? "south"
-    : wall === "south"
-      ? "north"
-      : wall === "east"
-        ? "west"
-        : "east";
+  return wall === "y-"
+    ? "y+"
+    : wall === "y+"
+      ? "y-"
+      : wall === "x+"
+        ? "x-"
+        : "x+";
 }
 
 export class World {
@@ -1765,7 +1766,7 @@ export class World {
       // Match the built-in signs' per-wall sizing: the 3.4 m banner overruns a
       // door on the short (north/south) walls, where the room is narrower.
       sign.scale.setScalar(
-        pose.wall === "north" || pose.wall === "south" ? 0.36 : 0.62,
+        pose.wall === "y-" || pose.wall === "y+" ? 0.36 : 0.62,
       );
       sign.visible = true;
     }
@@ -2245,9 +2246,9 @@ export class World {
     // and the lintel without adding collision or narrowing the opening.
     for (const doorId of ["north", "south", "west", "east"] as const) {
       const pose = physicalDoorPose(doorId);
-      const northSouth = pose.wall === "north" || pose.wall === "south";
+      const northSouth = pose.wall === "y-" || pose.wall === "y+";
       const inward =
-        pose.wall === "north" || pose.wall === "west" ? 0.19 : -0.19;
+        pose.wall === "y-" || pose.wall === "x-" ? 0.19 : -0.19;
       const faceYaw = northSouth ? 0 : Math.PI / 2;
       for (const side of [-1, 1]) {
         for (const y of [0.5, 1.2, 1.9, 2.6]) {
@@ -2754,7 +2755,7 @@ export class World {
       const wall = isCardinalDoorId(id)
         ? physicalDoorPose(id as DoorId).wall
         : layout.get(id)?.wall;
-      if (wall !== "north") continue;
+      if (wall !== "y-") continue;
       // Approach zone in front of the north wall opening (the zone reaches to
       // the door's `front` stand-point). 🧱 #66 S1: the zone FOLLOWS the door —
       // centred on its slid position (front.x carries the slide delta).
@@ -4275,7 +4276,7 @@ export class World {
       // north or south wall could never trip the threshold and was impossible
       // to walk through in first person.
       const doorWall = this.wallOfDoor(door.id);
-      const northSouth = doorWall === "north" || doorWall === "south";
+      const northSouth = doorWall === "y-" || doorWall === "y+";
       const lateral = Math.abs(
         northSouth ? p.x - door.front.x : p.z - door.front.z,
       );
@@ -4444,7 +4445,7 @@ export class World {
    */
   private wallOfDoor(id: string): DoorWall {
     if (isCardinalDoorId(id)) return physicalDoorPose(id).wall;
-    return readAllDoorLayout().get(id)?.wall ?? "north";
+    return readAllDoorLayout().get(id)?.wall ?? "y-";
   }
 
   /** The door a traveler arrives through, or NULL when the room has none — a
