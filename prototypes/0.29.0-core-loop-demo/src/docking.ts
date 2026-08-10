@@ -28,7 +28,10 @@ import {
   doorDisplayName,
   doorOrdinals,
   LEGACY_ID_WALL,
+  writeDoorLayout,
+  defaultDoorLayoutRecords,
 } from "./doorLayoutDoc";
+import { validateDoorPlacement } from "./editMode";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
 import {
@@ -69,14 +72,7 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
-import {
-  seedFloorPlan,
-  writeDoorPlacement,
-  doorSlideDelta,
-  lateralOf,
-  LEGACY_PLACEMENTS,
-  doorLateralLimitForWall,
-} from "./floorPlanDoc";
+import { doorLateralLimitForWall, clearDoorSlide } from "./floorPlanDoc";
 import {
   readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed,
 } from "./stationAtlas";
@@ -338,7 +334,7 @@ export class DoorDockingPortSystem {
     // the delta these occupancy/clash boxes sat at the unslid position while
     // buildConnectorChain drew the tube at the slid one — the warnings and the
     // thing on screen disagreed.
-    const pose = this.poseForDoor(doorId, doorSlideDelta(doorId));
+    const pose = this.poseForDoor(doorId);
     const face = { x: pose.x, z: pose.z };
     const yaw = pose.outwardYaw;
     const c = Math.cos(yaw),
@@ -391,16 +387,16 @@ export class DoorDockingPortSystem {
    * 🚪↔🛰️ #28 S5a: the world pose of a door by id. A CARDINAL door routes
    * through physicalDoorPose (legacy east/west quirk + pairs layout preserved
    * EXACTLY); a free/genId door derives from poseFromWall using the wall +
-   * lateral stashed on its group's userData. `delta` is the live slide offset.
+   * lateral stashed on its group's userData.
    */
-  private poseForDoor(id: string, delta = 0): PhysicalDoorPose {
+  private poseForDoor(id: string): PhysicalDoorPose {
     if (id === "north" || id === "south" || id === "east" || id === "west") {
-      return physicalDoorPose(id, delta);
+      return physicalDoorPose(id);
     }
     const ud = this.doorObjects.get(id)?.userData as
       | { wall?: DoorWall; lateral?: number }
       | undefined;
-    return poseFromWall(ud?.wall ?? "y-", (ud?.lateral ?? 0) + delta);
+    return poseFromWall(ud?.wall ?? "y-", ud?.lateral ?? 0);
   }
 
   public buildPorts() {
@@ -1498,41 +1494,35 @@ export class DoorDockingPortSystem {
           };
           writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
         } else if (action === "slide-neg" || action === "slide-pos") {
-          // 🧱 #66 S1: slide the door along its wall. Owner-only (this branch),
-          // UNPAIRED-only (plan §6.2 — live chains never re-solve), snapped +
-          // clamped in floorPlanDoc on both write and read.
-          // 🚪 #91: step ONE GRID CELL, in door-CENTRE currency. It used to
-          // step DOOR_LATTICE (0.5 m), so every other click parked the door
-          // mid-cell, straddling a grid line. Rounding the centre first also
-          // re-snaps a door that a pre-#91 build left off-grid.
+          // 🧱 Slide the door one grid cell along its wall. Owner-only (this
+          // branch), UNPAIRED-only (plan §6.2 — live chains never re-solve).
+          // 🚪 #18: EVERY door, one write path — the record. The cardinal-only
+          // gate existed because this control drove the retired floorPlan
+          // slide store; with the record the sole position, the free-door
+          // keypad finally gets the nudge buttons too.
           const st2 = this.doorState.get(doorId);
-          if (st2?.pairedSuccessfully || !isCardinalDoorId(doorId)) return;
-          seedFloorPlan(); // lazy first-structure-commit seed (idempotent)
-          const base = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
-          const centre = physicalDoorPose(doorId, doorSlideDelta(doorId));
-          const centreLateral =
-            centre.wall === "y-" || centre.wall === "y+" ? centre.x : centre.z;
-          // Bound in WORLD-CENTRE currency as well. writeDoorPlacement's own
-          // clamp is expressed in STORED units, which are relative to the
-          // LEGACY slot — under a pairs layout the live slot is ±PAIR_OFFSET
-          // away, so an in-bounds stored value could park the door at a centre
-          // of ±7 on a wall that only runs ±6. (The editor's drag intersects
-          // both bounds; the slider never did.)
-          const wallLimit = doorLateralLimitForWall(centre.wall);
+          if (st2?.pairedSuccessfully) return;
+          seedDoorLayoutDefaults(); // seed-first — same rule as every door edit
+          const rec = readAllDoorLayout().get(doorId);
+          if (!rec) return; // door vanished under the open pane
+          const wallLimit = doorLateralLimitForWall(rec.wall);
           const stepped = Math.max(
             -wallLimit,
             Math.min(
               wallLimit,
-              Math.round(centreLateral) + (action === "slide-pos" ? 1 : -1),
+              Math.round(rec.lateral) + (action === "slide-pos" ? 1 : -1),
             ),
           );
-          // The store speaks base-relative laterals; convert the new centre back.
-          const baseCentre = physicalDoorPose(doorId, 0);
-          const baseLateral =
-            baseCentre.wall === "y-" || baseCentre.wall === "y+"
-              ? baseCentre.x
-              : baseCentre.z;
-          writeDoorPlacement(doorId, stepped - baseLateral + base);
+          // Same gate the drag editor's drop uses (fold review F1): without
+          // it a couple of nudges could park a door inside a wall-mate's
+          // opening, a window cut or a furniture band, persisting an overlap
+          // the editor would have refused — the drag and the slider must
+          // agree on what a legal spot is.
+          if (!validateDoorPlacement(rec.wall, stepped, doorId).ok) return;
+          writeDoorLayout({ ...rec, lateral: stepped, placed: true });
+          // The record is the sole position — clear legacy slide residue, or
+          // the read-boundary fold re-adds the old drag on top (door jump).
+          clearDoorSlide(doorId);
         } else if (action === "install-adapter") {
           // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
           if (consumePart("adapter")) {
@@ -1628,19 +1618,18 @@ export class DoorDockingPortSystem {
            <button type="button" data-policy-action="undock-module" style="${pill} background:rgba(255,23,68,${undockArmed ? "0.25" : "0.10"}); border-color:rgba(255,23,68,${undockArmed ? "0.7" : "0.35"}); color:#ff8a80;">${undockArmed ? "⏏ CONFIRM" : "⏏ UNDOCK"}</button></div>`
         : "";
 
-    // Cardinal-only rows: POSITION slider and DOCK ADAPTER (both use cardinal-
-    // specific floor-plan / pairing machinery unavailable on free `d:` doors).
-    const positionRow = isCardinal
-      ? `<div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
+    // 🚪 #18: POSITION nudges for EVERY door — the last cardinal-gated
+    // control. The readout is the record's along-wall centre.
+    const positionRow = `<div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
           <span style="flex-shrink:0; display:flex; gap:4px; align-items:center;">
             <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">◀</button>
             <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => {
-              const d = doorSlideDelta(doorId);
-              return d === 0 ? "CENTER" : `${d > 0 ? "+" : ""}${d.toFixed(1)}m`;
+              const recs = readAllDoorLayout();
+              const l = (recs.size ? recs : defaultDoorLayoutRecords()).get(doorId)?.lateral ?? 0;
+              return l === 0 ? "CENTRE" : `${l > 0 ? "+" : ""}${l.toFixed(1)}m`;
             })()}</span>
             <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
-          </span></div>`
-      : "";
+          </span></div>`;
     // 🔌 EVERY door, cardinal or free (owner's ruling: "any door should allow a
     // vestibule or docking adapter"). Deliberately NOT gated on isCardinal like
     // positionRow above, and it needs no store work to get here: doorPolicy has
@@ -2131,7 +2120,7 @@ export class DoorDockingPortSystem {
     // Chain frame: origin at OUR door face, +z outward, rotated by our door's
     // yaw — the door's LIVE pose, not a hardcoded wall-centre table, so a slid
     // cardinal or a free door anywhere on any wall solves correctly.
-    const ourPose = this.poseForDoor(doorId, doorSlideDelta(doorId));
+    const ourPose = this.poseForDoor(doorId);
     const ourYaw = ourPose.outwardYaw;
     const ourFace = { x: ourPose.x, z: ourPose.z };
     const dx = faceWorld.x - ourFace.x,
@@ -2759,11 +2748,10 @@ export class DoorDockingPortSystem {
   }
 
   public repositionDoorGroups(
-    deltas: Record<"north" | "south" | "east" | "west", number>,
   ): void {
+    // 🚪 #18: no delta parameter — every group re-poses from the records.
     for (const [id, group] of this.doorObjects) {
-      const doorId = id as DoorId;
-      const pose = this.poseForDoor(id, deltas[doorId] ?? 0);
+      const pose = this.poseForDoor(id);
       group.position.set(pose.x, 2, pose.z);
       group.rotation.y = pose.frameYaw;
     }

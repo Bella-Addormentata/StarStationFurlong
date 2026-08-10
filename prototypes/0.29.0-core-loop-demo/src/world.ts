@@ -84,9 +84,8 @@ import {
   reapOrphanPairings,
   type DoorRecord,
 } from "./doorsDoc";
-import { readDoorDeltas, roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
-import { applyDoorSlideDeltas } from "./doors";
-import { setDoorSlideDeltas } from "./adapter";
+import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
 import type { FurnitureRecord } from "./furnitureDoc";
@@ -1580,10 +1579,15 @@ export class World {
    * bit-identical legacy behavior.
    */
   public reconcileDoorPlacements(): void {
-    const deltas = readDoorDeltas();
-    applyDoorSlideDeltas(deltas);
-    setDoorSlideDeltas(deltas);
-    this.dockingSystem?.repositionDoorGroups(deltas);
+    // 🚪 #18: re-push the records FIRST — the read boundary folds any LEGACY
+    // slide residue into them, and this method is what a floorPlan change
+    // (an old peer still writing `door:` keys, or a room resize) fires. The
+    // pushed snapshot is what physicalDoorPose reads, so it must be refreshed
+    // before anything below poses.
+    const stored = readAllDoorLayout();
+    setDoorRecords(stored.size ? stored : defaultDoorLayoutRecords());
+    reposeDoorTargets();
+    this.dockingSystem?.repositionDoorGroups();
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
@@ -1637,11 +1641,10 @@ export class World {
     const layoutAuthoritative = doorSetIsAuthoritative();
     const doorExists = (id: DoorId): boolean =>
       layoutAuthoritative ? layout.has(id) : findDoor(id) !== null;
-    const deltas = readDoorDeltas();
     // 🪧 Authored labels win over the built-in theme signs on the same door:
     // the owner typing "GYM" on the lobby's south door means that door leads to
     // the gym now, and two plaques would otherwise z-fight in the same slot.
-    const labelled = this.refreshAuthoredDoorLabels(layout, deltas);
+    const labelled = this.refreshAuthoredDoorLabels(layout);
     const placeOnDoor = (
       sign: THREE.Group | null,
       doorId: DoorId,
@@ -1660,7 +1663,7 @@ export class World {
         sign.visible = false;
         return;
       }
-      const pose = physicalDoorPose(doorId, deltas[doorId] ?? 0);
+      const pose = physicalDoorPose(doorId);
       const doorFaceOffset = 0.14;
       sign.position.set(
         pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
@@ -1721,7 +1724,6 @@ export class World {
    */
   private refreshAuthoredDoorLabels(
     layout: Map<string, DoorLayoutRecord>,
-    deltas: Partial<Record<DoorId, number>>,
   ): Set<string> {
     const wanted = new Map<string, string>();
     for (const [id, rec] of layout) {
@@ -1767,12 +1769,9 @@ export class World {
       }
       const rec = layout.get(id)!;
       // Cardinals keep routing through physicalDoorPose so the layout tables
-      // stay the single owner of where a cardinal berth physically sits (the
-      // paired layouts move `south` to the north wall); free doors have no
-      // table and are already stored as the wall + lateral poseFromWall wants.
-      const pose = isCardinalDoorId(id)
-        ? physicalDoorPose(id, deltas[id] ?? 0)
-        : poseFromWall(rec.wall, rec.lateral);
+      // 🚪 #18: one currency — every record's wall+lateral IS the live pose
+      // (the read boundary folds legacy slide residue in).
+      const pose = poseFromWall(rec.wall, rec.lateral);
       const doorFaceOffset = 0.14;
       sign.position.set(
         pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
@@ -2390,10 +2389,8 @@ export class World {
     // single ambient theme robot) against the current furniture.
     this.reconcileRobots(waiterPatrol);
 
-    const doorDeltas = readDoorDeltas();
-    applyDoorSlideDeltas(doorDeltas);
-    setDoorSlideDeltas(doorDeltas);
-    this.dockingSystem?.repositionDoorGroups(doorDeltas);
+    reposeDoorTargets(); // 🚪 #18: one currency — poses from the records
+    this.dockingSystem?.repositionDoorGroups();
     const north = findDoor("north");
     if (casino && north) north.enabled = true;
     else this.updateNorthDoorForFireplace();

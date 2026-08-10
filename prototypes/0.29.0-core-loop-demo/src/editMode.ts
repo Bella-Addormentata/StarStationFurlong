@@ -74,22 +74,20 @@ import {
   worldToCol, worldToRow, colToWorld, rowToWorld,
 } from './pathfinding';
 import {
-  roomHalfExtents, roomPlaceBounds, doorLateralLimitForWall, readDoorDeltas,
-  seedFloorPlan, writeDoorPlacement, lateralOf, LEGACY_PLACEMENTS,
+  roomHalfExtents, roomPlaceBounds, doorLateralLimitForWall, clearDoorSlide,
 } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { rebuildStands } from './stands';
 import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
-import type { DoorId } from './doors';
 import {
-  snapDoorLateral, wallAndLateralFromPoint, poseFromWall, physicalDoorPose,
+  snapDoorLateral, wallAndLateralFromPoint, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH, MIN_DOOR_GAP,
 } from './doorLayout';
 import type { PhysicalDoorPose } from './doorLayout';
 import {
   writeDoorLayout, deleteDoorLayout, readAllDoorLayout, seedDoorLayoutDefaults,
-  doorSetIsAuthoritative, doorDisplayName,
+  doorSetIsAuthoritative, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import type { DoorWall } from './doorLayoutDoc';
 // 🪟 #80 S4: the window editor — placement math (windowLayout) + the synced set.
@@ -528,13 +526,6 @@ function wallMountVerdict(
 
 // ── Door placement validity (#28 S6b — the door editor's add/tint gate) ───────
 
-/** 🚪 #28 S6c: the 4 cardinal ids ride the LEGACY floorPlan slide store
- *  (`door:${id}`); everything else (`d:` uuids) is a free door whose position
- *  lives in its doorLayout record. The split-write seam in one predicate. */
-function isCardinalDoorId(id: string): id is DoorId {
-  return id === 'north' || id === 'south' || id === 'east' || id === 'west';
-}
-
 /** Mint a fresh free-door id suffix — crypto.randomUUID with the identity.ts
  *  fallback (unavailable outside secure contexts / on old engines; uniqueness,
  *  not security, is all we need). Callers prefix `d:` to mark a FREE door. */
@@ -574,32 +565,18 @@ function doorOpeningAabb(wall: DoorWall, lateral: number): Box {
 }
 
 /**
- * Every door's CURRENT opening as {wall, lateral} — the set a new/edited door
- * must not overlap on its wall. Free doors own their lateral in the layout
- * record; a cardinal's LIVE centre lateral is its floor-plan slide (readDoorDeltas
- * — the record's `lateral` is only the seed snapshot). #28 S6b.
+ * Every door's CURRENT opening as {wall, lateral}. 🚪 #18: one currency — a
+ * record's wall+lateral IS the live physical pose for every door (the read
+ * boundary shims un-migrated slots and folds legacy slide residue). #28 S6b.
  */
 function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: number }> {
   const openings: Array<{ id: string; wall: DoorWall; lateral: number }> = [];
+  // 🚪 #18: one currency — a record's wall+lateral IS the live physical pose
+  // (the read boundary shims un-migrated slots and folds legacy slide
+  // residue), so the old cardinal-only physical-pose detour is gone.
   const records = readAllDoorLayout();
-  const deltas = readDoorDeltas();
-  // Cardinals speak PHYSICAL currency here — the pose's wall and world-centre
-  // lateral (physicalDoorPose folds in the pairs slots' base offset), NOT the
-  // record's logical wall + floorPlan delta. validateDoorPlacement compares
-  // candidates in physical currency, so a logical-wall/delta report would hide
-  // a pairs door from the overlap check (logical south rides the north wall)
-  // (#86 review). Free doors' records already carry the physical pose.
-  const cardinalOpening = (id: DoorId) => {
-    const pose = physicalDoorPose(id, deltas[id] ?? 0);
-    const lateral = pose.wall === 'y-' || pose.wall === 'y+' ? pose.x : pose.z;
-    return { id, wall: pose.wall, lateral };
-  };
   for (const rec of records.values()) {
-    openings.push(
-      isCardinalDoorId(rec.id)
-        ? cardinalOpening(rec.id as DoorId)
-        : { id: rec.id, wall: rec.wall, lateral: rec.lateral },
-    );
+    openings.push({ id: rec.id, wall: rec.wall, lateral: rec.lateral });
   }
   // 🚪 #91 PHANTOM OPENINGS: fold in the physical cardinal defaults ONLY when
   // the room is UNSEEDED (empty map ⇒ the 4 built-in doors still exist — the
@@ -612,8 +589,8 @@ function currentDoorOpenings(): Array<{ id: string; wall: DoorWall; lateral: num
   // declared an empty door set genuinely has no openings, and inventing four
   // would block the owner from placing their first door in any of those spots.
   if (!doorSetIsAuthoritative()) {
-    for (const id of ['north', 'south', 'east', 'west'] as const) {
-      openings.push(cardinalOpening(id));
+    for (const [id, rec] of defaultDoorLayoutRecords()) {
+      openings.push({ id, wall: rec.wall, lateral: rec.lateral });
     }
   }
   return openings;
@@ -960,22 +937,8 @@ class RoomEditController {
     doorId: string;
     group: THREE.Group;
     /** The door's PHYSICAL wall — fixed for the whole drag (wall-locked).
-     *  For cardinals this is the pose's wall, not the record's logical id
-     *  (the pairs layout parks logical south/east on the north/west walls). */
+     *  Physical currency for every door — the record's wall. */
     wall: DoorWall;
-    /** Cardinal ⇒ the drop writes the legacy floorPlan slide store; free ⇒
-     *  the doorLayout record. The SPLIT-WRITE seam (see commitDoorDrag). */
-    isCardinal: boolean;
-    /** The un-slid base CENTRE lateral (pairs slots park cardinals off-centre;
-     *  0 in the legacy layout and for every free door). candidate − base is
-     *  the floorPlan DELTA currency the cardinal write path speaks. */
-    baseCentre: number;
-    /** Cardinal ⇒ baseCentre − the legacy store base: the offset between the
-     *  world-centre and floorPlan-STORED currencies (e/w: +0.5). #91 snaps in
-     *  WORLD currency — every slot base is an integer now and the store snaps
-     *  base-relative, so centres round-trip — but the store's own clamp is
-     *  still expressed in stored units, so the drag CLAMP needs this. */
-    storeShift: number;
     originLateral: number;
     candidateLateral: number;
     valid: boolean;
@@ -2426,9 +2389,8 @@ class RoomEditController {
    * stashed so Esc / right-click restores the exact pose with no doc write.
    *
    * Editor currency: `lateral` is always the door's world CENTRE along its
-   * wall. currentDoorOpenings speaks DELTAS for cardinals, so the pickup adds
-   * the un-slid base centre back (0 in the legacy layout — the two currencies
-   * coincide for every player-built room).
+   * wall — which is exactly what the record stores (#18, one currency), so
+   * the pickup reads the opening verbatim.
    */
   private beginDoorDrag(doorId: string): void {
     const world = this.world;
@@ -2441,29 +2403,17 @@ class RoomEditController {
     const opening = currentDoorOpenings().find((o) => o.id === doorId);
     if (!group || !opening) return;
 
-    const isCardinal = isCardinalDoorId(doorId);
-    // WALL-LOCK to the PHYSICAL wall — currentDoorOpenings speaks physical
-    // currency for every door (a cardinal's pose wall: the pairs layout parks
-    // logical south/east on the north/west walls). This is the wall the whole
-    // drag projects onto, and opening.lateral is already the world centre.
+    // WALL-LOCK to the door's wall; opening.lateral is the world centre.
+    // 🚪 #18: ONE currency — the record — for every door. The cardinal branch
+    // that stashed baseCentre/storeShift to round-trip the retired floorPlan
+    // slide store is gone with the store itself.
     const wall = opening.wall;
-    const basePose = isCardinal ? physicalDoorPose(doorId as DoorId, 0) : null;
-    const baseCentre = basePose
-      ? (wall === 'y-' || wall === 'y+' ? basePose.x : basePose.z)
-      : 0;
     const originLateral = opening.lateral;
-    // Store-currency offset for the drag's snap/clamp (see the struct doc).
-    const storeShift = isCardinal
-      ? baseCentre - lateralOf(doorId as DoorId, LEGACY_PLACEMENTS[doorId as DoorId])
-      : 0;
 
     this.doorDrag = {
       doorId,
       group,
       wall,
-      isCardinal,
-      baseCentre,
-      storeShift,
       originLateral,
       candidateLateral: originLateral,
       valid: true,
@@ -2476,38 +2426,27 @@ class RoomEditController {
   }
 
   /**
-   * The world pose for a dragged door at a centre `lateral`. Cardinals route
-   * through physicalDoorPose with the DELTA (candidate − base centre) so the
-   * legacy e/w −0.5 stand quirk and the pairs slots come out exactly as the
-   * post-drop reconcile will re-derive them; free doors are pure poseFromWall.
-   * Mirrors docking.ts poseForDoor — the drag preview and the doc echo agree.
+   * The world pose for a dragged door at a centre `lateral` — pure
+   * poseFromWall for every door (#18): the post-drop reconcile derives the
+   * same pose from the same record, so the preview and the doc echo agree.
    */
   private doorDragPose(
-    d: { doorId: string; wall: DoorWall; isCardinal: boolean; baseCentre: number },
+    d: { wall: DoorWall },
     lateral: number,
   ): PhysicalDoorPose {
-    return d.isCardinal
-      ? physicalDoorPose(d.doorId as DoorId, lateral - d.baseCentre)
-      : poseFromWall(d.wall, lateral);
+    return poseFromWall(d.wall, lateral);
   }
 
   /**
-   * The drag's lateral clamp, in world-CENTRE currency and aligned inward onto
+   * The drag's lateral clamp: the wall's corner-clear run, aligned inward onto
    * the grid so a clamped-at-the-edge candidate is still a legal door centre.
-   * Free doors are bounded by the wall's corner-clear limit alone. A cardinal
-   * also round-trips through the legacy floorPlan store, whose OWN clamp bounds
-   * the STORED lateral (= centre − storeShift), so its range is the
-   * intersection of the two.
    */
-  private doorDragClamp(
-    d: { wall: DoorWall; isCardinal: boolean; storeShift: number },
-  ): { lo: number; hi: number } {
+  private doorDragClamp(d: { wall: DoorWall }): { lo: number; hi: number } {
+    // 🚪 #18: the full wall run for every door. The cardinal intersection with
+    // the retired store's own clamp — which silently cost every cardinal door
+    // 3–4 m of an 8 m wall — died with the store.
     const limit = doorLateralLimitForWall(d.wall);
-    if (!d.isCardinal) return { lo: doorGridCeil(-limit), hi: doorGridFloor(limit) };
-    return {
-      lo: doorGridCeil(Math.max(-limit, d.storeShift - limit)),
-      hi: doorGridFloor(Math.min(limit, d.storeShift + limit)),
-    };
+    return { lo: doorGridCeil(-limit), hi: doorGridFloor(limit) };
   }
 
   /**
@@ -2575,11 +2514,10 @@ class RoomEditController {
    * candidate pose, so the echo's re-position is a visual no-op — local
    * end-of-drag state never fights the reconcile.
    *
-   * SPLIT WRITE (owner decision): a CARDINAL rides the LEGACY floorPlan
-   * `door:${id}` slide store — the same currency, seed and clamp as the
-   * wall-computer keypad slider, keeping the cross-client cardinal reconcile
-   * and the doors wire format untouched. A FREE door rewrites its doorLayout
-   * record. Never both stores for one door.
+   * 🚪 #18 ONE WRITE for every door: the record (absolute lateral, placed) —
+   * plus clearDoorSlide, so the read boundary's legacy fold cannot re-add a
+   * stale drag on top. The split-write seam this block used to document (a
+   * cardinal riding the retired floorPlan slide store) is deleted.
    */
   private commitDoorDrag(): void {
     const d = this.doorDrag;
@@ -2594,7 +2532,7 @@ class RoomEditController {
       return;
     }
 
-    const { doorId, wall, isCardinal, baseCentre, candidateLateral } = d;
+    const { doorId, wall, candidateLateral } = d;
     this.doorDrag = null;
     // Back to the plain selected state (the door stays selected, like a
     // placed furniture item).
@@ -2606,25 +2544,22 @@ class RoomEditController {
     this.syncRemoveButton();
     this.setCanvasCursor('');
 
-    if (isCardinal) {
-      const id = doorId as DoorId;
-      seedFloorPlan(); // lazy first-structure-commit seed (idempotent — the slider's rule)
-      // Stored currency: delta from the base centre, plus the legacy base
-      // lateral (n/s 0, e/w −0.5). doorDragClamp guaranteed this round-trips.
-      writeDoorPlacement(id, candidateLateral - baseCentre + lateralOf(id, LEGACY_PLACEMENTS[id]));
-    } else {
-      // SEED-FIRST trap: the reconcile removes any group not in the map, so a
-      // layout write against an UNSEEDED room would wipe the 4 cardinal
-      // defaults. Idempotent — same rule as add/remove (S6b).
-      seedDoorLayoutDefaults();
-      const rec = readAllDoorLayout().get(doorId);
-      writeDoorLayout(rec
-        ? { ...rec, lateral: candidateLateral }
-        // A free door always has a record (it was created by one); rebuild it
-        // from the drag stash anyway so a racing remote delete degrades to a
-        // re-add at the dropped spot rather than a lost write.
-        : { id: doorId, wall, lateral: candidateLateral, size: 'large', enabled: true });
-    }
+    // SEED-FIRST trap: the reconcile removes any group not in the map, so a
+    // layout write against an UNSEEDED room would wipe the built-in defaults.
+    // Idempotent — same rule as add/remove (S6b).
+    seedDoorLayoutDefaults();
+    const rec = readAllDoorLayout().get(doorId);
+    writeDoorLayout({
+      ...(rec ?? { id: doorId, size: 'large' as const, enabled: true }),
+      id: doorId,
+      wall,
+      lateral: candidateLateral,
+      placed: true,
+    });
+    // 🚪 #18: the record is the sole position now — clear any residual slide
+    // for a legacy id, or the read-boundary fold would re-add the old drag on
+    // top of the freshly written absolute lateral and the door would jump.
+    clearDoorSlide(doorId);
     showHint('Door moved.', 1400);
   }
 
@@ -2667,7 +2602,9 @@ class RoomEditController {
    * door's drag survives — the placement reconcile never touches free groups.
    */
   public onDoorPlacementsChanged(): void {
-    if (this.doorDrag?.isCardinal) this.abortDoorDrag();
+    // A remote floorPlan change re-poses doors under any live drag (the fold
+    // reads it) — same abort rule for every door now.
+    if (this.doorDrag) this.abortDoorDrag();
   }
 
   private abortDoorDrag(): void {

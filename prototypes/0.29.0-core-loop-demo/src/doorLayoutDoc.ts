@@ -29,6 +29,7 @@
 
 import * as Y from 'yjs';
 import { findDoor } from './doors';
+import { doorSlideDelta } from './floorPlanDoc';
 
 /**
  * 🧭 AXIS WALL LABELS (owner ruling 2026-08-09): the room's four sides named by
@@ -193,9 +194,13 @@ function withCompatSlot(rec: DoorLayoutRecord): DoorLayoutRecord {
 export function defaultDoorLayoutRecords(): Map<string, DoorLayoutRecord> {
   const out = new Map<string, DoorLayoutRecord>();
   for (const id of Object.keys(LEGACY_ID_WALL)) {
-    out.set(id, withCompatSlot({
+    const rec = withCompatSlot({
       id, wall: LEGACY_ID_WALL[id], lateral: 0, size: 'large', enabled: true,
-    }));
+    });
+    // 🚪 #18: an un-migrated room's slid doors keep their slide (same fold as
+    // readAllDoorLayout — the synthesized defaults are that room's truth).
+    rec.lateral += doorSlideDelta(id);
+    out.set(id, rec);
   }
   return out;
 }
@@ -256,7 +261,10 @@ export function doorDisplayName(id: string): string {
 export function doorOrdinals(
   doors: Array<{ id: string; wall?: DoorWall; lateral?: number }>,
 ): Map<string, number> {
-  const order: Record<string, number> = { north: 0, east: 1, south: 2, west: 3 };
+  // Axis labels — the compass keys this held before the wall rename made the
+  // whole wall tier rank 9, silently demoting the perimeter walk to a plain
+  // lateral sort (fold review, found in passing).
+  const order: Record<string, number> = { 'y-': 0, 'x+': 1, 'y+': 2, 'x-': 3 };
   const sorted = [...doors].sort((a, b) =>
     (order[a.wall ?? ''] ?? 9) - (order[b.wall ?? ''] ?? 9)
     || (a.lateral ?? 0) - (b.lateral ?? 0)
@@ -361,6 +369,12 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
         size: 'large',
         lateral: Math.round(value.lateral),
       });
+      // 🚪 #18 THE FOLD: the retired floorPlan slide store's residue joins the
+      // record's lateral HERE, once, at the read boundary — after the compat
+      // shim, whose substituted slot the old pose path also added the slide on
+      // top of. Every consumer now poses from the record alone; nothing else
+      // may read the slide store, or the door doubles its own drag.
+      if (id in LEGACY_ID_WALL) norm.lateral += doorSlideDelta(id);
       // 🪧 …and the label, for the same reason the size and lateral are done
       // here: the shape guard accepts any string so stored data is never
       // rejected, which means an over-long, padded or whitespace-only label

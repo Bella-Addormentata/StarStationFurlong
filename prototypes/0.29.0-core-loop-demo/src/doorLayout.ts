@@ -229,14 +229,8 @@ export function setDoorRecords(
  * exactly what the retired global's "legacy" default produced there, so boot
  * geometry is unchanged.
  */
-export function physicalDoorPose(
-  // `string`, not PhysicalDoorId: free `d:` ids already reach here through
-  // casts at the call sites, so the narrow type was advertising a guarantee it
-  // did not have. Widening it makes the guard below the real contract.
-  id: string,
-  lateralDelta = 0,
-): PhysicalDoorPose {
-  return physicalDoorPoseOrNull(id, lateralDelta) ?? fallbackPose(id);
+export function physicalDoorPose(id: string): PhysicalDoorPose {
+  return physicalDoorPoseOrNull(id) ?? fallbackPose(id);
 }
 
 /**
@@ -249,20 +243,19 @@ export function physicalDoorPose(
  * place. Callers that only need *some* pose to render local scenery can keep
  * using physicalDoorPose.
  */
-export function physicalDoorPoseOrNull(
-  id: string,
-  lateralDelta = 0,
-): PhysicalDoorPose | null {
+export function physicalDoorPoseOrNull(id: string): PhysicalDoorPose | null {
+  // 🚪 #18: no delta parameter — the record's lateral IS the live position
+  // (the read boundary folds any legacy slide residue in). Deleting the
+  // parameter is deliberate over defaulting it: the double-slide bug is one
+  // "helpful" caller away, and a parameter that no longer exists cannot be
+  // passed twice.
   const rec = doorRecords.get(id);
-  if (rec) {
-    const lateral = rec.lateral + lateralDelta;
-    return poseFromWall(rec.wall, lateral, lateral);
-  }
+  if (rec) return poseFromWall(rec.wall, rec.lateral, rec.lateral);
   // No record. A LEGACY id is still self-describing — the four old ids were
   // born on the wall of the same name (LEGACY_ID_WALL), which is what the boot
   // path produced before any room is entered, so it stays bit-identical.
   const w = LEGACY_ID_WALL[id];
-  if (w) return poseFromWall(w, lateralDelta, lateralDelta);
+  if (w) return poseFromWall(w, 0, 0);
   return null;
 }
 
@@ -296,11 +289,8 @@ function fallbackPose(id: string): PhysicalDoorPose {
  *  cardinal berths, so this aliases `physicalDoorPose`. Later slices split the
  *  pairing/mesh (which keys off ports) from the free-door layer; keeping this
  *  name lets those call sites read against "port" while the wire stays cardinal. */
-export function physicalPortPose(
-  id: PortId,
-  lateralDelta = 0,
-): PhysicalDoorPose {
-  return physicalDoorPose(id as PhysicalDoorId, lateralDelta);
+export function physicalPortPose(id: PortId): PhysicalDoorPose {
+  return physicalDoorPose(id);
 }
 
 /**

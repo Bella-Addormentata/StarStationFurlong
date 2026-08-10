@@ -239,18 +239,29 @@ export function readDoorDeltas(): Record<DoorId, number> {
 }
 
 /**
- * 🚪 The floor-plan SLIDE for any door id — 0 for a free `d:` door.
+ * 🚪 LEGACY READ ONLY — the retired slide store's residual value for a door.
  *
- * This store is keyed to the four structural berths and always was: a free
- * door has no delta because its position IS its layout record's `lateral`,
- * with nothing to be relative to. Callers that now accept any door id need to
- * ask without narrowing the id first, and `readDoorDeltas()[id]` does not
- * type-check for a `string` — this is that lookup, in one place, so the
- * "free doors have no slide" rule is stated once instead of at every call.
+ * The `door:` keys used to be the live drag position for the four old door
+ * ids, a SECOND position store beside the layout record. The fold (#18)
+ * retired it: readAllDoorLayout adds this residue into a legacy-id record's
+ * `lateral` at the read boundary, every consumer poses from the record alone,
+ * and any NEW move writes the record and CLEARS this key. So this function's
+ * only caller is the fold itself; when no pre-fold docs remain, it and the
+ * `door:` keys delete together.
  */
 export function doorSlideDelta(id: string): number {
   const deltas = readDoorDeltas() as Record<string, number | undefined>;
   return deltas[id] ?? 0;
+}
+
+/** 🚪 #18: a door's move now writes its RECORD; the old slide entry must go
+ *  with it, or the read-boundary fold would re-add the stale slide on top of
+ *  the freshly written absolute lateral and the door would jump. */
+export function clearDoorSlide(doorId: string): void {
+  if (!docAlive()) return;
+  boundDoc!.transact(() => {
+    planMap!.delete(`door:${doorId}`);
+  });
 }
 
 // ── 📐 Room dimensions read/write (R0 — no consumers yet) ────────────────────

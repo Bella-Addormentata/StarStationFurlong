@@ -211,7 +211,7 @@ export function buildVestibule(
   {
     const p = at
       ? poseFromWall(at.wall, at.lateral, at.lateral)
-      : physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+      : physicalDoorPose(doorId);
     group.position.set(p.x, 0, p.z);
     group.rotation.y = p.outwardYaw;
   }
@@ -817,22 +817,9 @@ const LEGACY_PROJECTION_OFFSET = 15.2;
 
 /** Outward-normal yaw of each door in ROOM-LOCAL frame (matches the
  *  buildVestibule placement switch: south faces +Z = yaw 0). */
-// ── 🧱 #66 S1: door-slide deltas (lateral along each door's wall) ────────────
-// world.reconcileDoorPlacements pushes these; every anchor in this module
-// (vestibule placement, projection poses) adds its door's delta on the wall's
-// lateral axis. 0 everywhere ⇒ bit-identical legacy math. Paired doors can't
-// slide (plan §6.2), so live chains never re-solve — the deltas matter for
-// FUTURE pairings and the unpaired-door peek.
-let slideDeltas: Record<VestibuleDoorId, number> = {
-  north: 0,
-  south: 0,
-  east: 0,
-  west: 0,
-};
-
-export function setDoorSlideDeltas(d: Record<VestibuleDoorId, number>): void {
-  slideDeltas = { ...d };
-}
+// 🚪 #18: the door-slide delta plumbing is GONE — a record's lateral is the
+// live position, folded at the read boundary. This module poses doors with
+// plain physicalDoorPose and needs no pushed state.
 
 /**
  * Where (and at what rotation) the FAR room's gray-box projection sits for a
@@ -851,7 +838,7 @@ export function projectionPoseForDoor(
   farWall?: DoorWall | null,
   farLateral = 0,
 ): { x: number; z: number; rotY: number } {
-  const p = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+  const p = physicalDoorPose(doorId);
   return projectionPoseFromWall(
     p.wall,
     p.tangent === "x" ? p.x : p.z,
@@ -1008,7 +995,7 @@ export function buildConnectorChain(
   // Same wall-face placement as buildVestibule (or the atlas anchor override).
   const pose = at
     ? poseFromWall(at.wall, at.lateral, at.lateral)
-    : physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+    : physicalDoorPose(doorId);
   group.position.set(pose.x, 0, pose.z);
   group.rotation.y = pose.outwardYaw;
   return group;

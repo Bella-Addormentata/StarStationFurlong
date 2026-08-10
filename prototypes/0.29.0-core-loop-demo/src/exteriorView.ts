@@ -26,7 +26,6 @@ import {
   writeExteriorSlot,
 } from "./exteriorDoc";
 import { readDoorPolicy } from "./doorPolicy";
-import { readDoorDeltas } from "./floorPlanDoc";
 import { physicalDoorPose } from "./doorLayout";
 import {
   readAllDoorLayout, doorSetIsAuthoritative, doorDisplayName,
@@ -44,7 +43,6 @@ import {
   setVestibuleOpacity,
 } from "./adapter";
 import type { VestibuleDoorId } from "./adapter";
-import type { DoorId } from "./doors";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -264,7 +262,6 @@ function buildGroup(): THREE.Group {
   // owner's pixel-art reference): white soft-goods torus, black capture
   // latches around the rim, concentric silver guide rings with an X brace,
   // a flank equipment box, and BLUE truss struts back to the hull.
-  const slideDeltas = readDoorDeltas();
   // 🔌 Iterate the room's REAL door set, not the four cardinal names: an
   // adapter can now be installed on a free `d:` door, and it has to grow a
   // collar out on the hull like any other.
@@ -279,7 +276,7 @@ function buildGroup(): THREE.Group {
     : ["north", "south", "east", "west"];
   for (const doorId of doorIds) {
     if (!readDoorPolicy(doorId).adapter) continue;
-    const pose = physicalDoorPose(doorId, slideDeltas[doorId as DoorId] ?? 0);
+    const pose = physicalDoorPose(doorId);
     const collar = new THREE.Group();
     collar.name = `dockAdapter-${doorId}`;
     const softGoods = new THREE.MeshStandardMaterial({

@@ -32,10 +32,9 @@ import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState } from './docking';
 import {
-  readAllDoorLayout, doorOrdinals, doorDisplayName, LEGACY_ID_WALL,
+  readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
-import { doorSlideDelta } from './floorPlanDoc';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -350,15 +349,16 @@ export interface RoomTerminalDeps {
 function livePortView(): Array<{
   id: string; x: number; z: number; w: number; horizontal: boolean; label: string;
 }> {
-  const records = [...readAllDoorLayout().values()];
-  const doors = records.length
-    ? records
-    : Object.entries(LEGACY_ID_WALL).map(([id, wall]) => ({
-        id, wall, lateral: 0, label: undefined,
-      }));
+  // The SAME folded fallback every other surface uses (fold review F3): a
+  // synthesized lateral-0 set numbered differently from doorDisplayName's,
+  // so the wireframe's captions could disagree with the pane's names.
+  const stored = readAllDoorLayout();
+  const doors = stored.size
+    ? [...stored.values()]
+    : [...defaultDoorLayoutRecords().values()];
   const ordinals = doorOrdinals(doors);
   return doors.map((d) => {
-    const pose = physicalDoorPose(d.id, doorSlideDelta(d.id));
+    const pose = physicalDoorPose(d.id);
     return {
       id: d.id,
       x: pose.x,

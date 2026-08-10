@@ -88,7 +88,7 @@ import {
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
-  bindFloorPlan, subscribeFloorPlan, readRoomDims, doorSlideDelta,
+  bindFloorPlan, subscribeFloorPlan, readRoomDims,
 } from "./floorPlanDoc";
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
@@ -2589,7 +2589,7 @@ function harvestStationAtlas(): void {
       // which is only right by coincidence. The harvest-armed gate guarantees
       // the pose snapshot and the doors map describe the SAME room here (F5);
       // a cardinal id can still pose from its name if the snapshot misses.
-      const pose = physicalDoorPoseOrNull(doorId, doorSlideDelta(doorId));
+      const pose = physicalDoorPoseOrNull(doorId);
       return [{
         doorId,
         targetSeed: r.connectedRoomAddress,
