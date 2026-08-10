@@ -96,6 +96,7 @@ import {
   seedDoorLayoutDefaults,
   seedDoorLayoutSingle,
   doorLayoutDocSize,
+  seedDoorLayoutCentred,
   readAllDoorLayout,
   doorSetIsAuthoritative,
   seedDoorLayoutEmpty,
@@ -1396,7 +1397,13 @@ async function joinRoomAtEpoch(
       // set at all, and stayed in the "unseeded" state that made the next door
       // edit resurrect a full set of cardinals.
       if (ownsRoom && doorLayoutDocSize() === 0) {
-        seedDoorLayoutDefaults();
+        // 🧭 A room MINTED THIS SESSION is provably newborn — no client has
+        // ever rendered defaults in it — so it is born with one centred door
+        // per wall instead of capturing the retired paired arrangement.
+        // Anything else being claim-seeded may have history: capture what it
+        // physically shows, moving nothing.
+        if (mintedRoomTemplates.has(boot.roomId)) seedDoorLayoutCentred();
+        else seedDoorLayoutDefaults();
       }
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
       // furniture — seed it and skip the lobby default + migration + the

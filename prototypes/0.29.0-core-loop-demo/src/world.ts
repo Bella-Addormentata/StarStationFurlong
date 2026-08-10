@@ -1565,6 +1565,10 @@ export class World {
         this.dockingSystem.clearRemotePairing(doorId);
       }
     }
+    // 🧭 The built-in wayfinding plaques key off PAIRINGS now (the door that
+    // actually leads to the pool), so a pairing change must re-hang them —
+    // the old id-keyed signs never needed this, which is why it was missing.
+    this.refreshDoorSigns();
   }
 
   /**
@@ -1669,8 +1673,21 @@ export class World {
       );
       sign.visible = visible && doorExists(doorId);
     };
-    placeOnDoor(this.poolSign, "south", !outdoor && !casino); // 🏊 pool door
-    placeOnDoor(this.casinoSign, "east", !outdoor && !casino); // 🎰 casino door
+    // 🧭 The built-in wayfinding plaques hang on the door whose PAIRING
+    // actually leads there — not on a door id. The ids 'south'/'east' were the
+    // last id-keyed signage: correct only in a room whose auto-pair happened
+    // to land there, silently wrong the moment the owner re-paired a door.
+    // (Authored labels still override both — refreshAuthoredDoorLabels.)
+    const doorPairedTo = (roomId: string): DoorId | undefined =>
+      [...readAllDoors()].find(
+        ([, r]) => r.paired && roomIdFromSeed(r.connectedRoomAddress) === roomId,
+      )?.[0] as DoorId | undefined;
+    const poolDoor = doorPairedTo(OUTDOOR_CASINO_ROOM_ID);
+    const casinoDoor = doorPairedTo(CASINO_ROOM_ID);
+    if (poolDoor) placeOnDoor(this.poolSign, poolDoor, !outdoor && !casino);
+    else if (this.poolSign) this.poolSign.visible = false;
+    if (casinoDoor) placeOnDoor(this.casinoSign, casinoDoor, !outdoor && !casino);
+    else if (this.casinoSign) this.casinoSign.visible = false;
     // 🚪 ORDER-INDEPENDENT on purpose. This used to take the first paired
     // record out of readAllDoors, which enumerated the four cardinals in a
     // fixed order; it now iterates the Y.Map, whose order is insertion order.

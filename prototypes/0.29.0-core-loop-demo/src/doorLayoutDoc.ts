@@ -537,6 +537,33 @@ export function seedDoorLayoutSingle(wall: DoorWall, lateral = 0): void {
   });
 }
 
+/**
+ * 🧭 Seed a NEWBORN room: one door per wall, CENTRED. Only for rooms with no
+ * visual history (the caller proves it — e.g. minted this session), because a
+ * room that has ever RENDERED the un-migrated defaults must be seeded at the
+ * slots it physically shows (seedDoorLayoutDefaults below) or its doors jump.
+ * This is what retires the paired arrangement for every room created from now
+ * on — and with it the 3–4 m of drag travel every cardinal door lost to the
+ * two-stores intersection, and (for new rooms) the arrival resolver's
+ * id-opposite last resort: a centred set always has a facing-wall door.
+ */
+export function seedDoorLayoutCentred(): void {
+  if (!docAlive() || doorLayoutDocSize() > 0) return;
+  boundDoc!.transact(() => {
+    doorLayoutMap!.set(META_KEY, { v: 1 });
+    for (const [id, wall] of Object.entries(LEGACY_ID_WALL)) {
+      doorLayoutMap!.set(id, {
+        id,
+        wall,
+        lateral: 0,
+        size: 'large',
+        enabled: true,
+        placed: true,
+      });
+    }
+  });
+}
+
 export function seedDoorLayoutDefaults(): void {
   if (!docAlive()) return;
   if (doorLayoutDocSize() > 0) {
