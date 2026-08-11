@@ -12,6 +12,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.34.2 — 2026-08-11
+
+### 🚪 Modules stop vanishing — and the placement ghost shows its spin
+
+Fixes the two problems reported on v0.34.1's module round trip (#105).
+
+- **🧩 A module you visited stays.** Add a module, walk in, walk back — the module and its vestibule used to disappear from the room you returned to, though the connection was never actually lost. Leaving a room threw away its doors' local pairing state, and on the way back the pairing news arrived a beat before the doors were rebuilt, so it landed on nothing and was dropped. The pairing now takes hold whichever order the room comes back in — and the door finishes the way it always looks after a fresh load: green LED, leaves standing open.
+- **⟳ The rotate button visibly works.** Turning the new-module ghost always did change which wall gets the door — but you couldn't see it: the preview was a symmetric wireframe box, counter-rotated so the chosen wall always faces the corridor, so every 90° press drew the exact same picture. The ghost is now a translucent **octagon hull** like the ones in the station map — its sloped roof gives it a visible grain, so each press turns a shape you can actually watch turn, while the green door slab stays put at the corridor mouth (the door always faces you; the module rotates behind it — that's the geometry the station really builds).
+- **Honest limits.** The ghost previews the standard module shell at the standard size; a template with different dims still ghosts at the default footprint until provisioned.
+- **Release line:** version bumped to 0.34.2, all nine locations. **Node binaries UNCHANGED** — frontend-only (TypeScript); no Rust node code changed since v0.33.30.
+
 ## v0.34.1 — 2026-08-10
 
 ### 🧭 The way home works again — and you keep your bearings walking through
