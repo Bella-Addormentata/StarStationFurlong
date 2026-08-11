@@ -92,6 +92,45 @@ let currentYaw = 0;
 /** Yaw the tween is chasing: stepIndex * STEP_RAD (radians). */
 let targetYaw = 0;
 
+// ── 🧭 STATION BIAS (owner's R2: keep your facing across room transits) ──────
+//
+// The continuous rotation the STATION has accumulated under this traveler:
+// walk out heading one way and in through a door on a differently-oriented
+// wall, and the world "turned" by the difference — the module you saw rotated
+// through the doorway arrives rendered axis-aligned. The bias rotates the
+// CAMERA by that same difference, so on-screen your heading is continuous.
+//
+// DELIBERATELY a separate accumulator, never folded into targetYaw/stepIndex:
+// the space-view drift re-snap does `stepIndex = Math.round(targetYaw /
+// STEP_RAD)`, and a bias living inside targetYaw would be silently deleted by
+// one trip to the space view. User detents stay quantised to 45°; the station
+// frame stays continuous underneath them. Per-viewer by design — two players
+// who arrived by different routes legitimately hold different headings.
+/** Bias the tween is chasing. */
+let stationBias = 0;
+/** Eased bias applied this frame. */
+let currentBias = 0;
+
+const TAU = Math.PI * 2;
+function normalizeAngle(a: number): number {
+  let r = a % TAU;
+  if (r > Math.PI) r -= TAU;
+  if (r <= -Math.PI) r += TAU;
+  return r;
+}
+
+/** 🧭 Accumulate a transit's rotation (radians) into the station frame. */
+export function addStationBias(delta: number): void {
+  stationBias = normalizeAngle(stationBias + delta);
+}
+
+/** 🧭 Zero the station frame — beam-ins and fresh joins have no transit
+ *  history to preserve, and zero is the honest heading for them. */
+export function resetStationBias(): void {
+  stationBias = 0;
+  currentBias = 0;
+}
+
 let leftBtn: HTMLButtonElement | null = null;
 let rightBtn: HTMLButtonElement | null = null;
 let angleChip: HTMLDivElement | null = null;
@@ -108,7 +147,10 @@ let lastEnabledState: boolean | null = null;
  * moment a detent is chosen, not 0.3 s later.
  */
 export function getCameraYaw(): number {
-  return targetYaw;
+  // Bias included: WASD screen-mapping and the facing fades must speak the
+  // yaw the camera is actually AT, or keys drift off screen-relative the
+  // moment a transit rotates the frame.
+  return targetYaw + stationBias;
 }
 
 /**
@@ -122,7 +164,7 @@ export function rotateIsoOffset(
   base: THREE.Vector3,
   out: THREE.Vector3 = new THREE.Vector3()
 ): THREE.Vector3 {
-  return out.copy(base).applyAxisAngle(UP, currentYaw);
+  return out.copy(base).applyAxisAngle(UP, currentYaw + currentBias);
 }
 
 // ── Rotation control ──────────────────────────────────────────────────────────
@@ -199,6 +241,15 @@ export function updateCameraRig(deltaTime: number): void {
   } else {
     currentYaw = targetYaw;
   }
+  // The station bias eases the same way, on its own track — a transit's turn
+  // settles as smoothly as a detent click, and neither tween disturbs the
+  // other's target.
+  const biasRemaining = stationBias - currentBias;
+  if (Math.abs(biasRemaining) > SNAP_EPS) {
+    currentBias += biasRemaining * Math.min(1, EASE_RATE * deltaTime);
+  } else {
+    currentBias = stationBias;
+  }
 
   // Reflect availability in the HUD arrows (only touch DOM on flips).
   const enabled = canRotate();
@@ -220,7 +271,7 @@ export function updateCameraRig(deltaTime: number): void {
   const camera = window.gameRenderer?.camera;
   if (!(camera instanceof THREE.OrthographicCamera)) return;
 
-  camera.position.copy(base).applyAxisAngle(UP, currentYaw);
+  camera.position.copy(base).applyAxisAngle(UP, currentYaw + currentBias);
   camera.lookAt(0, 0, 0);
 }
 

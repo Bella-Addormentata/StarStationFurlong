@@ -409,6 +409,9 @@ interface MintedModule {
   /** 🧭 …and where along that wall — the owner picked it in the provision
    *  placement editor. 0 = centred (the old behaviour). */
   birthLateral?: number;
+  /** The birth door's ID, minted at provision time so the near room's pairing
+   *  names the exact far door before anyone has walked through. */
+  birthDoorId?: string;
 }
 const mintedRoomTemplates = new Map<string, MintedModule>();
 
@@ -1363,7 +1366,11 @@ async function joinRoomAtEpoch(
       seedDoorLayoutEmpty();
     }
     if (mintedHere?.birthWall && doorLayoutDocSize() === 0) {
-      seedDoorLayoutSingle(mintedHere.birthWall, mintedHere.birthLateral ?? 0);
+      seedDoorLayoutSingle(
+        mintedHere.birthWall,
+        mintedHere.birthLateral ?? 0,
+        mintedHere.birthDoorId,
+      );
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
       // so the door sits centred on `birthWall` whatever the room is called.
       // This stamp used to be load-bearing — a single door only landed centred
@@ -2271,7 +2278,7 @@ function wireAdapterTransit(): void {
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,
-    placement?: { wall: DoorWall; lateral: number },
+    placement?: { wall: DoorWall; lateral: number; doorId?: string },
   ): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
@@ -2304,6 +2311,7 @@ function wireAdapterTransit(): void {
       templateId,
       birthWall,
       birthLateral: placement?.lateral ?? 0,
+      birthDoorId: placement?.doorId,
     });
     // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
     // than a clipboard that holds one) and powers auto-accept.

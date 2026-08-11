@@ -154,7 +154,7 @@ import {
 } from "./windowLayout";
 import { computeOctagonProfile } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
-import { getCameraYaw } from "./cameraRig";
+import { getCameraYaw, addStationBias, resetStationBias } from "./cameraRig";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -4604,6 +4604,22 @@ export class World {
       console.warn("[doors] arrival room has no doors — skipping the walk-in.");
       return;
     }
+    // 🧭 R2 (owner): KEEP YOUR FACING across the transit. You depart heading
+    // out of one wall and arrive heading in through another; if those walls
+    // are not opposite, the world just rotated under you by the difference —
+    // exactly the rotation the door's ghost/projection showed the far module
+    // at. Rotating the CAMERA by that same delta keeps your on-screen heading
+    // continuous: walk "up-screen" out, you are still walking "up-screen" in.
+    //   departure heading  h_dep = outwardYaw(departure wall)
+    //   arrival heading    h_arr = outwardYaw(arrival wall) + π
+    //   camera delta       Δ     = h_arr − h_dep   (= −rotY of the far module)
+    // Unknown departure wall ⇒ NO rotation — an honest zero, never a guess
+    // (owner decision: a guessed heading is a silent R2 violation).
+    if (departureWall) {
+      const hDep = poseFromWall(departureWall, 0, 0).outwardYaw;
+      const hArr = physicalDoorPose(arrival.id).outwardYaw + Math.PI;
+      addStationBias(hArr - hDep);
+    }
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
     // arrivals — the traveler walks in, gets the hint, and is walked right
     // back out (the return departure is exactly what OUT permits). The
@@ -4646,6 +4662,9 @@ export class World {
     deviceFocus.forceRelease();
     roomEdit.forceExit();
     this.endTransitVestibule();
+    // 🧭 A beam-in has no transit history to preserve — zero is the honest
+    // station heading (owner decision #4 on the oriented-transit design).
+    resetStationBias();
     // 🧬 Owner request: pass arrivals decant from the room's vat when one
     // exists — performRoomSwap awaits the room-state gate before arrive(),
     // so the host's real furniture layout is already synced here. Vat-less

@@ -33,6 +33,7 @@ import type { DoorId } from './doors';
 import type { ConnectorSegment } from './adapter';
 import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
+import { normalizeWall } from './doorLayoutDoc';
 import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 
 export interface AtlasDoor {
@@ -466,19 +467,20 @@ function pullSharedAtlas(): void {
       // dropped to "unknown" (the renderer's honest fallback). Same discipline
       // as dims. Preserved from prior on a miss so gossip from an OLD client
       // cannot erase geometry a NEW one already published.
-      const okWall = (w: unknown): w is DoorWall =>
-        w === 'north' || w === 'south' || w === 'east' || w === 'west';
+      // Either vocabulary in, axis labels out — this was compass-only after
+      // the axis rename, so gossiped door geometry was being dropped.
+      const okWall = (w: unknown): DoorWall | undefined => normalizeWall(w);
       doors[d] = {
         targetSeed: door.targetSeed ?? prior?.doors[d]?.targetSeed ?? '',
         targetRoomId: door.targetRoomId,
         segments: door.segments,
         farDoor: door.farDoor,
-        farWall: okWall(door.farWall) ? door.farWall : prior?.doors[d]?.farWall,
+        farWall: okWall(door.farWall) ?? prior?.doors[d]?.farWall,
         farLateral: Number.isFinite(door.farLateral) && Math.abs(door.farLateral as number) <= 32
           ? (door.farLateral as number)
           : prior?.doors[d]?.farLateral,
         farYawDeg: door.farYawDeg,
-        wall: okWall(door.wall) ? door.wall : prior?.doors[d]?.wall,
+        wall: okWall(door.wall) ?? prior?.doors[d]?.wall,
         // Bounded like dims and farLateral (F7): |lateral| ≤ 32 covers the
         // largest room's wall run; outside it, keep what we knew.
         lateral: Number.isFinite(door.lateral) && Math.abs(door.lateral as number) <= 32

@@ -22,6 +22,7 @@ import {
   clampExtBays, clampFlexBendFine, clampFlexStretch, clampExtStretch, type ConnectorSegment,
 } from './adapter';
 import type { DoorWall } from './doorLayoutDoc';
+import { normalizeWall } from './doorLayoutDoc';
 
 /**
  * Serializable pairing record — one per door id. Plain JSON (no nested Y
@@ -134,8 +135,6 @@ export function isDoorRecord(value: unknown): value is DoorRecord {
  *  malformed list drops the WHOLE chain (⇒ legacy straight-gangway render,
  *  never a crash, identical on every client), and farDoor/farYawDeg must be
  *  exact enum values or they vanish. */
-const WALL_NAMES: readonly string[] = ['north', 'south', 'east', 'west'];
-
 function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
   // Tombstones carry no geometry — pass through as-is (the guard already
   // proved the shape).
@@ -177,11 +176,12 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
     out.farDoor = r.farDoor;
   }
   // farWall drives the far module's ROTATION straight into the renderer and
-  // arrives from a peer — exact wall name or it vanishes ("unknown"), which
-  // every consumer renders as no rotation rather than a guess.
-  if (typeof r.farWall === 'string' && WALL_NAMES.includes(r.farWall)) {
-    out.farWall = r.farWall as DoorWall;
-  }
+  // arrives from a peer — a real wall in either vocabulary (normalizeWall maps
+  // legacy compass values) or it vanishes ("unknown"), which every consumer
+  // renders as no rotation rather than a guess. This list was compass-only
+  // after the axis rename, so every farWall written since was being STRIPPED.
+  const fw = normalizeWall(r.farWall);
+  if (fw) out.farWall = fw;
   // Same discipline as farWall: geometry from a peer, bounded or dropped.
   // ±32 comfortably covers the largest room's wall run (5 tiles = ±15).
   if (typeof r.farLateral === 'number' && Number.isFinite(r.farLateral)
@@ -201,8 +201,21 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
  *  no recovery (reconcileDoorLayout never re-runs reconcileDoors). */
 function isAcceptableDoorKey(id: string): boolean {
   if (id.length > MAX_KEY_LEN) return false;
-  return (DOOR_IDS as readonly string[]).includes(id) || id.startsWith('d:');
+  return (
+    (DOOR_IDS as readonly string[]).includes(id) ||
+    // 🧭 Axis-label ids: seedDoorLayoutSingle names a module's birth door
+    // after its wall, which the axis rename turned into 'x-'/'y+'… — and this
+    // filter, still speaking only legacy names and d:, silently DROPPED every
+    // pairing keyed by one. The write-only black hole came back for exactly
+    // the newest doors: walk into a fresh module and the mirror written for
+    // the way home was unreadable — "There is no module connected" (owner
+    // report, 2026-08-10). Ids are opaque names; all three shapes are legal.
+    (AXIS_IDS as readonly string[]).includes(id) ||
+    id.startsWith('d:')
+  );
 }
+
+const AXIS_IDS = ['x+', 'x-', 'y+', 'y-'] as const;
 
 /** Bounds replacing the DoS fence the fixed four-id loop gave us for free:
  *  before, whatever a peer wrote we read exactly four entries. Mirrors the

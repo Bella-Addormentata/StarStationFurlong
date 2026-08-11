@@ -209,7 +209,7 @@ export class DoorDockingPortSystem {
     | ((
         templateId: string,
         parentDoorId?: string,
-        placement?: { wall: DoorWall; lateral: number },
+        placement?: { wall: DoorWall; lateral: number; doorId?: string },
       ) => Promise<string | null>)
     | null = null;
 
@@ -1054,10 +1054,17 @@ export class DoorDockingPortSystem {
               undefined)
             : undefined;
           const choice = parentDoorId ? this.choiceFor(parentDoorId) : undefined;
+          // 🧭 Mint the birth door's ID here, where the pairing that will name
+          // it lives — an opaque d: uuid, not the wall label (which the axis
+          // rename turned into 'x-'-style ids that the pairing read loop was
+          // filtering out: the "no module connected" return bug).
+          const birthDoorId = choice
+            ? `d:${crypto.randomUUID().slice(0, 8)}`
+            : undefined;
           const seed = await this.provisionModuleCallback(
             templateId,
             parentDoorId,
-            choice ? { ...choice } : undefined,
+            choice ? { ...choice, doorId: birthDoorId } : undefined,
           );
           // 🧭 The pairing this address is about to INITIATE already knows the
           // far side exactly — it is the door we just chose. Stash it so the
@@ -1066,7 +1073,7 @@ export class DoorDockingPortSystem {
           if (seed && parentDoorId && choice) {
             const st = this.doorState.get(parentDoorId);
             if (st) {
-              st.farDoor = choice.wall;
+              st.farDoor = birthDoorId;
               st.farWall = choice.wall;
               st.farLateral = choice.lateral;
             }
@@ -2808,7 +2815,7 @@ export class DoorDockingPortSystem {
     cb: (
       templateId: string,
       parentDoorId?: string,
-      placement?: { wall: DoorWall; lateral: number },
+      placement?: { wall: DoorWall; lateral: number; doorId?: string },
     ) => Promise<string | null>,
   ) {
     this.provisionModuleCallback = cb;
