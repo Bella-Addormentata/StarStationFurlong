@@ -44,6 +44,7 @@ import {
 // can't be placed through a vestibule — and the assembly UI warns the other
 // way when a chain would run through mounted equipment.
 import { setChainBoxProvider, exteriorItemBoxes } from "./hull";
+import { buildOctagonShell } from "./octagonHull";
 import type { Box } from "./furniture";
 import {
   armedPreset,
@@ -255,16 +256,16 @@ export class DoorDockingPortSystem {
     const g = new THREE.Group();
     g.name = "provision-ghost";
     const H = 5.9; // uniform module half — matches the projection's ROOM_HALF
-    const edges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(new THREE.BoxGeometry(H * 2, 4, H * 2)),
-      new THREE.LineBasicMaterial({
-        color: 0xd4a84b,
-        transparent: true,
-        opacity: 0.55,
-      }),
+    // 🧭 The body must be an octagon shell, not a box: the projection rotates
+    // the module so the chosen wall always faces the tube, which means on a
+    // symmetric box every ⟳ step rendered IDENTICALLY (slab facing the tube,
+    // square silhouette) and the rotate button read as dead. The shell's
+    // barrel runs along a definite axis, so turning the hypothesis is visible.
+    const shell = buildOctagonShell(
+      { halfX: H, halfZ: H },
+      { opacity: 0.35, edge: 0xd4a84b },
     );
-    edges.position.y = 2;
-    g.add(edges);
+    g.add(shell.group);
     // The birth door: a green slab on the chosen wall, module-local.
     const ns = choice.wall === "y-" || choice.wall === "y+";
     const slab = new THREE.Mesh(
@@ -366,16 +367,27 @@ export class DoorDockingPortSystem {
       "east",
       "west",
     ];
-    for (const dir of directions) {
-      this.doorState.set(dir, {
-        doorId: dir,
+    for (const dir of directions) this.ensureDoorState(dir);
+  }
+
+  /** The one canonical default `DockingState`. Every site that may need to
+   *  create a door's state (cardinal seeding, layout rebuild, a remote pairing
+   *  arriving before the group exists) goes through here, so the default shape
+   *  cannot drift between them. An existing state is returned untouched. */
+  private ensureDoorState(doorId: string): DockingState {
+    let state = this.doorState.get(doorId);
+    if (!state) {
+      state = {
+        doorId,
         locked: false,
         pinCode: "",
         connectedRoomAddress: "",
         pairingPending: false,
         pairedSuccessfully: false,
-      });
+      };
+      this.doorState.set(doorId, state);
     }
+    return state;
   }
 
   /**
@@ -438,16 +450,7 @@ export class DoorDockingPortSystem {
       : poseFromWall(record.wall, record.lateral);
     // A new door needs its own pairing state so its LED / keypad / slide work
     // (the 4 cardinals are already seeded by initializeDoorStates → no-op).
-    if (!this.doorState.has(cfg.id)) {
-      this.doorState.set(cfg.id, {
-        doorId: cfg.id,
-        locked: false,
-        pinCode: "",
-        connectedRoomAddress: "",
-        pairingPending: false,
-        pairedSuccessfully: false,
-      });
-    }
+    this.ensureDoorState(cfg.id);
       const doorGroup = new THREE.Group();
       doorGroup.position.set(pose.x, 2, pose.z);
       doorGroup.rotation.y = pose.frameYaw;
@@ -726,9 +729,17 @@ export class DoorDockingPortSystem {
       this.doorFadeMats.set(cfg.id, fadeMats);
       this.doorFadeOpacity.set(cfg.id, 1);
 
-      // Paint LED + frame glow from the door's initial state
+      // Paint LED + frame glow from the door's initial state — and if the
+      // RETAINED state says paired (apply-then-rebuild: the remote pairing
+      // landed before this rebuild replaced the group), slide the fresh
+      // leaves open too. Cold load and rebuild-then-apply both end in
+      // applyRemotePairing's openDoor, so this makes the third ordering
+      // converge to the same visual instead of a shut-but-green door.
       const state = this.doorState.get(cfg.id);
-      if (state) this.syncLEDStatus(cfg.id, state);
+      if (state) {
+        this.syncLEDStatus(cfg.id, state);
+        if (state.pairedSuccessfully && !state.locked) this.openDoor(cfg.id);
+      }
 
       // #28 S5a: stash the pose basis so poseForDoor can reposition a free /
       // genId door (reconcile + fade) without a cardinal lookup — onto {isLarge}.
@@ -2371,8 +2382,20 @@ export class DoorDockingPortSystem {
       transient?: boolean;
     },
   ): void {
-    const state = this.doorState.get(doorId);
-    if (!state) return;
+    // 🚪 CREATE the state when it is missing rather than silently dropping the
+    // pairing (repro'd owner bug, 2026-08-11: module round trip). The door
+    // STATE map is a singleton across rooms, and entering another room removes
+    // this room's door groups — removeDoorGroup deletes their states with
+    // them. On the way back the sync burst fires the doors observer BEFORE the
+    // layout observer, so this ran against a deleted state and no-opped; the
+    // layout reconcile then rebuilt the door with a FRESH unpaired state and
+    // nothing ever re-applied — doc paired, room showing "no module
+    // connected", vestibule and projection gone. Creating the state here makes
+    // the two observer orders converge: apply-then-rebuild keeps this state
+    // (buildDoorGroup only seeds when absent, and reopens the leaves of a
+    // retained PAIRED state); rebuild-then-apply fills the fresh one and the
+    // openDoor below finds a live group.
+    const state = this.ensureDoorState(doorId);
     // #62 P2: idempotency must diff the GEOMETRY too — a post-pairing chain
     // edit rewrites the record with the same address, and every client must
     // pick it up (P3 rebuilds the chain + reposes the projection on change).
