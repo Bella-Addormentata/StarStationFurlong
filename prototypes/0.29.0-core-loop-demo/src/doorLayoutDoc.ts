@@ -527,14 +527,22 @@ export function deleteDoorLayout(id: string): void {
  * the "legacy" door layout — the paired layouts park a cardinal ±PAIR_OFFSET
  * off-centre. main.ts stamps that on the module at claim time.
  */
-export function seedDoorLayoutSingle(wall: DoorWall, lateral = 0): void {
+export function seedDoorLayoutSingle(
+  wall: DoorWall,
+  lateral = 0,
+  // 🧭 The door's ID, minted at PROVISION time (a d: uuid) so the near room's
+  // pairing can name the exact far door from birth. Defaulting to the wall
+  // label is what put ids like 'x-' on the wire after the axis rename — legal
+  // keys now, but new doors get honest opaque ids.
+  id: string = wall,
+): void {
   if (!docAlive() || doorLayoutDocSize() > 0) return;
   boundDoc!.transact(() => {
     // 🚪 One transaction: the marker and the door land together, so no joiner
     // can see an authoritative-but-empty room that is really a one-door module.
     doorLayoutMap!.set(META_KEY, { v: 1 });
-    doorLayoutMap!.set(wall, {
-      id: wall,
+    doorLayoutMap!.set(id, {
+      id,
       wall,
       // 🧭 The owner PICKED this spot in the provision placement editor —
       // it is no longer always the wall centre.
