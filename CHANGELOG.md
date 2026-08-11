@@ -12,6 +12,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.34.1 — 2026-08-10
+
+### 🧭 The way home works again — and you keep your bearings walking through
+
+Fixes the two problems reported on v0.34.0's new-module flow (#104).
+
+- **🚪 Going back works.** Travel to a freshly provisioned module and the door you came through knows the way home again. The connection record written on your arrival was being saved and then filtered out by a reader that didn't recognise the new door names — the way back existed, but nothing would look at it. **Modules already stranded by this heal themselves**: the record was always there, and it's read correctly now — no rebuilding, no re-pairing.
+- **🧭 The camera keeps your heading through a door.** Arriving in a module that sits at an angle used to leave the camera pointing the way it had been, so "forward" changed meaning mid-transit. The camera now turns with the transit by exactly the angle the connection bends — walk out heading up-screen and you arrive still heading up-screen. Your ⟲ ⟳ rotate buttons still step in clean 45° increments on top of this; a round trip returns your view precisely to where it started; and beaming (rather than walking) into a room resets to a fresh heading.
+- **Honest limits.** The heading carry-over applies to the overhead room views; the first-person camera still picks its own direction after a transit. The on-screen angle chip still shows your 45° step rather than the combined station heading.
+- **Release line:** version bumped to 0.34.1, all nine locations. **Node binaries UNCHANGED** — frontend-only (TypeScript); no Rust node code changed since v0.33.30.
+
 ## v0.34.0 — 2026-08-10
 
 ### 🚪🧭 A door is a door — any wall, any dock, and the compass is gone
