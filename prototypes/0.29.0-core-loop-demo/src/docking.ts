@@ -44,6 +44,7 @@ import {
 // can't be placed through a vestibule — and the assembly UI warns the other
 // way when a chain would run through mounted equipment.
 import { setChainBoxProvider, exteriorItemBoxes } from "./hull";
+import { buildOctagonShell } from "./octagonHull";
 import type { Box } from "./furniture";
 import {
   armedPreset,
@@ -255,16 +256,16 @@ export class DoorDockingPortSystem {
     const g = new THREE.Group();
     g.name = "provision-ghost";
     const H = 5.9; // uniform module half — matches the projection's ROOM_HALF
-    const edges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(new THREE.BoxGeometry(H * 2, 4, H * 2)),
-      new THREE.LineBasicMaterial({
-        color: 0xd4a84b,
-        transparent: true,
-        opacity: 0.55,
-      }),
+    // 🧭 The body must be an octagon shell, not a box: the projection rotates
+    // the module so the chosen wall always faces the tube, which means on a
+    // symmetric box every ⟳ step rendered IDENTICALLY (slab facing the tube,
+    // square silhouette) and the rotate button read as dead. The shell's
+    // barrel runs along a definite axis, so turning the hypothesis is visible.
+    const shell = buildOctagonShell(
+      { halfX: H, halfZ: H },
+      { opacity: 0.35, edge: 0xd4a84b },
     );
-    edges.position.y = 2;
-    g.add(edges);
+    g.add(shell.group);
     // The birth door: a green slab on the chosen wall, module-local.
     const ns = choice.wall === "y-" || choice.wall === "y+";
     const slab = new THREE.Mesh(
