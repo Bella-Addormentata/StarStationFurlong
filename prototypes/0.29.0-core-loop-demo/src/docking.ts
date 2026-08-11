@@ -2371,8 +2371,30 @@ export class DoorDockingPortSystem {
       transient?: boolean;
     },
   ): void {
-    const state = this.doorState.get(doorId);
-    if (!state) return;
+    // 🚪 CREATE the state when it is missing rather than silently dropping the
+    // pairing (repro'd owner bug, 2026-08-11: module round trip). The door
+    // STATE map is a singleton across rooms, and entering another room removes
+    // this room's door groups — removeDoorGroup deletes their states with
+    // them. On the way back the sync burst fires the doors observer BEFORE the
+    // layout observer, so this ran against a deleted state and no-opped; the
+    // layout reconcile then rebuilt the door with a FRESH unpaired state and
+    // nothing ever re-applied — doc paired, room showing "no module
+    // connected", vestibule and projection gone. Creating the state here makes
+    // the two observer orders converge: apply-then-rebuild keeps this state
+    // (buildDoorGroup only seeds when absent); rebuild-then-apply fills the
+    // fresh one.
+    let state = this.doorState.get(doorId);
+    if (!state) {
+      state = {
+        doorId,
+        locked: false,
+        pinCode: "",
+        connectedRoomAddress: "",
+        pairingPending: false,
+        pairedSuccessfully: false,
+      };
+      this.doorState.set(doorId, state);
+    }
     // #62 P2: idempotency must diff the GEOMETRY too — a post-pairing chain
     // edit rewrites the record with the same address, and every client must
     // pick it up (P3 rebuilds the chain + reposes the projection on change).
