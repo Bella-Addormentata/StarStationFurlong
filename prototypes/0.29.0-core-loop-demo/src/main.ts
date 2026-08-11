@@ -87,16 +87,22 @@ import {
   readDoorPolicy,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
-import { bindFloorPlan, subscribeFloorPlan, readRoomDims } from "./floorPlanDoc";
+import {
+  bindFloorPlan, subscribeFloorPlan, readRoomDims,
+} from "./floorPlanDoc";
+import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
   bindDoorLayoutDoc,
   seedDoorLayoutDefaults,
   seedDoorLayoutSingle,
   doorLayoutDocSize,
+  seedDoorLayoutCentred,
+  readAllDoorLayout,
+  doorSetIsAuthoritative,
+  seedDoorLayoutEmpty,
 } from "./doorLayoutDoc";
-import type { DoorWall } from "./doorLayoutDoc";
-import { isCardinalDoorId } from "./doorLayout";
-import type { DoorLayoutKind } from "./doorLayout";
+import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
+import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
 import {
@@ -398,8 +404,11 @@ interface MintedModule {
   templateId: string;
   /** 🛰️🚪 The wall the module's ONE door is born on — its way back to the room
    *  it was added from. Absent for a module minted with no parent berth (the
-   *  dev menu, the standalone-station flow), which keeps the 4-door default. */
+   *  dev menu, the standalone-station flow), which is born DOORLESS. */
   birthWall?: DoorWall;
+  /** 🧭 …and where along that wall — the owner picked it in the provision
+   *  placement editor. 0 = centred (the old behaviour). */
+  birthLateral?: number;
 }
 const mintedRoomTemplates = new Map<string, MintedModule>();
 
@@ -1116,10 +1125,30 @@ async function joinRoomAtEpoch(
   // passage policy is public.
   bindStationAtlasDoc(sync.doc, {
     roomId: boot.roomId,
-    isPassagePublic: () =>
-      (["north", "south", "east", "west"] as const).some(
-        (d) => readDoorPolicy(d).passage === "public",
-      ),
+    // 🔑 ACCESS, and only access. Owner ruling: anyone may see a module's
+    // OUTSIDE — its size, its position, its connections — so all of that
+    // gossips unconditionally (stationAtlas pushAtlasToDoc). What this gates is
+    // the SEED: the credential that lets a stranger dial in. It is set per
+    // door, in the door's own control panel (PASSAGE), and the same setting is
+    // what canPass enforces when someone tries to walk through.
+    //
+    // This used to iterate the four cardinal NAMES, and readDoorPolicy returns
+    // the default `public` for a cardinal the room does not even have — so the
+    // predicate was ALWAYS TRUE and no room could be unlisted. Iterate the
+    // doors the room actually has, and fail CLOSED when it has none public.
+    isPassagePublic: () => {
+      const ids = [...readAllDoorLayout().keys()];
+      // An UN-MIGRATED room presents the four cardinal defaults everywhere
+      // else, so treat it the same here rather than making "never opened the
+      // door editor" mean "unreachable". A room that has DECLARED an empty
+      // door set is a different thing: nobody can walk in, so nobody should be
+      // handed its address either — that falls out of `some` over an empty
+      // list, which is exactly the fail-closed answer.
+      const doors = doorSetIsAuthoritative()
+        ? ids
+        : ["north", "south", "east", "west"];
+      return doors.some((d) => readDoorPolicy(d).passage === "public");
+    },
   });
 
   // Bind the shared furniture-layout map (issue #60 E4): keyed by furniture
@@ -1158,6 +1187,10 @@ async function joinRoomAtEpoch(
   bindWallpaperLayoutDoc(sync.doc);
 
   // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
+  // Armed HERE — every doc this harvest reads (doors, doorLayout, floorPlan)
+  // is bound above, so the pose snapshot and the pairing map finally describe
+  // the same room.
+  setAtlasHarvestArmed(true);
   harvestStationAtlas();
 
   // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
@@ -1322,12 +1355,22 @@ async function joinRoomAtEpoch(
     // client minted this session cannot clobber remote state, which is the same
     // argument that licenses the owner/name write above.
     const mintedHere = mintedRoomTemplates.get(boot.roomId);
+    // 🛰️ A room minted with NO berth is a fresh standalone station: it is
+    // connected to nothing, so it starts with NO doors and its owner places
+    // the first one. Claiming that explicitly is what stops the reconcile
+    // reading "empty map" as "un-migrated" and conjuring four cardinals.
+    if (mintedHere && !mintedHere.birthWall && doorLayoutDocSize() === 0) {
+      seedDoorLayoutEmpty();
+    }
     if (mintedHere?.birthWall && doorLayoutDocSize() === 0) {
-      seedDoorLayoutSingle(mintedHere.birthWall);
-      // A single door must sit CENTRED on its wall, which only the "legacy"
-      // layout does — the paired layouts park every cardinal ±PAIR_OFFSET off
-      // centre. Stamped into roomInfo so it holds on every future entry and
-      // for every joiner, the same way the template's theme is.
+      seedDoorLayoutSingle(mintedHere.birthWall, mintedHere.birthLateral ?? 0);
+      // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
+      // so the door sits centred on `birthWall` whatever the room is called.
+      // This stamp used to be load-bearing — a single door only landed centred
+      // under the "legacy" arrangement, and the paired ones would have parked
+      // it ±PAIR_OFFSET off, or for id 'south' on another wall entirely. It is
+      // kept only so an OLD client entering this module still poses its door
+      // correctly; drop it with the compat shim in doorLayoutDoc.
       roomMap.set("doorLayout", "legacy");
     }
   }
@@ -1354,7 +1397,13 @@ async function joinRoomAtEpoch(
       // set at all, and stayed in the "unseeded" state that made the next door
       // edit resurrect a full set of cardinals.
       if (ownsRoom && doorLayoutDocSize() === 0) {
-        seedDoorLayoutDefaults();
+        // 🧭 A room MINTED THIS SESSION is provably newborn — no client has
+        // ever rendered defaults in it — so it is born with one centred door
+        // per wall instead of capturing the retired paired arrangement.
+        // Anything else being claim-seeded may have history: capture what it
+        // physically shows, moving nothing.
+        if (mintedRoomTemplates.has(boot.roomId)) seedDoorLayoutCentred();
+        else seedDoorLayoutDefaults();
       }
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
       // furniture — seed it and skip the lobby default + migration + the
@@ -1432,13 +1481,12 @@ async function joinRoomAtEpoch(
   const resolveTheme = (): RoomTheme =>
     (roomMap.get("theme") as RoomTheme | undefined) ??
     legacyThemeFromRoomId(boot.roomId);
-  // 🛰️🚪 A room may name its own door arrangement (a module born with one
-  // door asks for legacy so that door sits centred). Absent ⇒ world picks.
-  const resolveDoorLayout = (): DoorLayoutKind | undefined => {
+  // 🛰️🚪 The room's RETIRED door arrangement, kept only so the doc layer can
+  // read records written before doors became individually placed. Absent ⇒
+  // world picks the default. See the compat shim in doorLayoutDoc.
+  const resolveDoorLayout = (): LegacyLayoutKind | undefined => {
     const v = roomMap.get("doorLayout");
-    return v === "legacy" || v === "casino-pairs" || v === "pool-pairs"
-      ? v
-      : undefined;
+    return isLegacyDoorLayoutKind(v) ? v : undefined;
   };
   let appliedTheme: RoomTheme = resolveTheme();
 
@@ -1716,6 +1764,10 @@ async function joinRoomAtEpoch(
 async function leaveRoom(): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   sessionEpoch++;
+  // 🧭 F5: no atlas harvests until the next room's docs are ALL bound — the
+  // doors doc binds before the layout/floor-plan docs, and a harvest in that
+  // window reads the new room's doors at the OLD room's walls.
+  setAtlasHarvestArmed(false);
   // We are now roomless (issue #60 review): clear the active-pass room so a
   // swap that leaves but never re-joins (stranded) can't wedge a pass showing
   // YOU-ARE-HERE with no way to re-enter. A successful join re-sets it; the
@@ -2016,13 +2068,23 @@ async function performRoomSwap(
  */
 async function transitTo(
   seedString: string,
-  departureDoorId: DoorId,
+  departureDoorId: string,
 ): Promise<void> {
   // #62 P4: capture the departure connection BEFORE the swap tears the room
   // down — the arrival choreography wants the record's farDoor, and the lazy
   // mirror write needs the departure room's own address.
   const depState = world.dockingSystem?.getDockingState(departureDoorId);
   const depPaired = depState?.pairedSuccessfully === true;
+  // 🧭 The departure door's WALL, captured while the departure room's records
+  // are still bound. After the swap only the door's ID survives, and an id
+  // says nothing about position — the arrival used to re-derive this wall
+  // from the ARRIVAL room's records under the same id, which is wrong
+  // whenever the two rooms disagree and always wrong for a free door.
+  const depPose = physicalDoorPoseOrNull(departureDoorId);
+  const depWall = depPose?.wall;
+  const depLateral = depPose
+    ? depPose.tangent === "x" ? depPose.x : depPose.z
+    : undefined;
   const depGeometry = depState?.segments?.length
     ? {
         segments: depState.segments,
@@ -2063,6 +2125,7 @@ async function transitTo(
         departureDoorId,
         depGeometry?.farDoor,
         depRoomId ?? undefined,
+        depWall,
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
@@ -2071,11 +2134,17 @@ async function transitTo(
     return;
   }
 
+  // 🚪 A doorless arrival room has no door to come in through. The mirror
+  // write below is keyed on that door, so with none there is nothing to write
+  // — and nothing to walk through either (world.completeAdapterArrival warns
+  // and skips its own walk-in for the same reason).
   const arrivalDoorId = world.resolveArrivalDoor(
     departureDoorId,
     depGeometry?.farDoor,
     depRoomId ?? undefined,
-  ).id;
+    depWall,
+  )?.id;
+  if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
   if (depPaired && depAddress && arrivalRoomId) {
     sessionReturnRoute = {
@@ -2091,15 +2160,13 @@ async function transitTo(
     const arrivalTheme =
       (yjsSync?.doc.getMap("roomInfo").get("theme") as RoomTheme | undefined) ??
       legacyThemeFromRoomId(arrivalRoomId);
-    // 🛰️🚪 …and its door arrangement, for the same reason: a module born with
-    // one door names "legacy" so that door renders centred on its wall.
+    // 🛰️🚪 …and its retired door arrangement, for the same compat reason.
     const arrivalLayoutRaw = yjsSync?.doc.getMap("roomInfo").get("doorLayout");
-    const arrivalLayout: DoorLayoutKind | undefined =
-      arrivalLayoutRaw === "legacy" ||
-      arrivalLayoutRaw === "casino-pairs" ||
-      arrivalLayoutRaw === "pool-pairs"
-        ? arrivalLayoutRaw
-        : undefined;
+    const arrivalLayout: LegacyLayoutKind | undefined = isLegacyDoorLayoutKind(
+      arrivalLayoutRaw,
+    )
+      ? arrivalLayoutRaw
+      : undefined;
     world.applyRoomVisuals(
       arrivalRoomId,
       arrivalDoorId,
@@ -2125,17 +2192,29 @@ async function transitTo(
     // the owner's undock on the next walk-through. Refuse the mirror only for
     // THAT module: a tombstone must not strand a different connection built
     // later on the same door.
-    // 🚪 #91: and only a CARDINAL id — the pairing wire is keyed to the four
-    // berths, so a mirror written under a free `d:` id is a permanent orphan
-    // no client can ever read back.
+    // 🚪 The cardinal-only conjunct is gone: readAllDoors iterates the map now,
+    // so a mirror written under a free `d:` id IS read back, by this client and
+    // by every peer. It was never the WIRE that could not hold it.
+    //
+    // ⚠️ Note what this exercises harder: the write below goes into the ARRIVAL
+    // room's doc — a doc this client does not own. That cross-room write is an
+    // existing property of the lazy-mirror design, not something introduced
+    // here, but free doors make it fire on many more doors.
     const retired =
-      existing && !existing.paired && existing.connectedRoomAddress === depAddress;
-    if (!existing?.paired && !retired && isCardinalDoorId(arrivalDoorId)) {
+      existing && !existing.paired && existing.retiredAddress === depAddress;
+    if (!existing?.paired && !retired) {
       writeDoorPairing(arrivalDoorId, depAddress, {
         segments: depGeometry
           ? mirrorSegments(depGeometry.segments)
           : undefined,
         farDoor: departureDoorId,
+        // 🧭 The mirror is the one writer that KNOWS the far wall exactly: the
+        // traveler just departed through that door and captured its wall
+        // before the swap tore the departure room down. This is how a pairing
+        // whose INITIATE could not know the far side (free door, unvisited
+        // room) becomes fully described after one walk-through.
+        farWall: depWall,
+        farLateral: depLateral,
         farYawDeg: depGeometry?.farYawDeg,
         // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
         // detaching either side casts the whole connection off.
@@ -2192,6 +2271,7 @@ function wireAdapterTransit(): void {
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,
+    placement?: { wall: DoorWall; lateral: number },
   ): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
@@ -2212,10 +2292,19 @@ function wireAdapterTransit(): void {
     // compass — so a fixed wall is right for all four parent berths.
     // Minted with no berth (dev menu / standalone station) ⇒ no birthWall, and
     // the room keeps the normal 4-door default: it has nothing to lead back to.
-    const birthWall: DoorWall | undefined = parentDoorId ? "west" : undefined;
+    // 🧭 The owner picks the birth door's wall + lateral in the pane's
+    // placement editor; 'west' centred is only the default. A module minted
+    // with no parent berth has nothing to lead back to and is born doorless.
+    const birthWall: DoorWall | undefined = parentDoorId
+      ? (placement?.wall ?? "x-")
+      : undefined;
     // 🏗️ Remember the chosen room template so this module is born from it on
     // first claim (see the claimRoomDefaults seed path).
-    mintedRoomTemplates.set(roomId, { templateId, birthWall });
+    mintedRoomTemplates.set(roomId, {
+      templateId,
+      birthWall,
+      birthLateral: placement?.lateral ?? 0,
+    });
     // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
     // than a clipboard that holds one) and powers auto-accept.
     addToLedger(roomId, minted.link);
@@ -2467,7 +2556,22 @@ function renderPhonePlayersList(): void {
 // atlas — the exterior view's whole-station render and click-to-connect feed
 // from it. Called at the T0 seam and on every doors-doc change.
 
+/**
+ * 🧭 F5 (redo review): harvest reads each door's LIVE POSE, and the
+ * subscribeDoors listener fires inside bindDoorsDoc's bind-time notify — a
+ * moment when activeBootstrap already names the NEW room but the doorLayout /
+ * floorPlan docs still hold the DEPARTURE room's state. Harvesting there
+ * gossips the new room's doors at the old room's walls. The T0 seam arms this
+ * flag only after every doc is bound (right before its own explicit harvest),
+ * and disarms it when a join begins.
+ */
+let atlasHarvestArmed = false;
+export function setAtlasHarvestArmed(on: boolean): void {
+  atlasHarvestArmed = on;
+}
+
 function harvestStationAtlas(): void {
+  if (!atlasHarvestArmed) return;
   const roomId = activeBootstrap?.roomId;
   if (!roomId) return;
   const name =
@@ -2476,14 +2580,32 @@ function harvestStationAtlas(): void {
   const seed =
     passSeed(roomId) ?? moduleLedger().find((e) => e.roomId === roomId)?.seed;
   const doors = [...readAllDoors().entries()]
-    .filter(([, r]) => r.paired && r.connectedRoomAddress)
-    .map(([doorId, r]) => ({
-      doorId: doorId as DoorId,
-      targetSeed: r.connectedRoomAddress,
-      segments: r.segments,
-      farDoor: r.farDoor,
-      farYawDeg: r.farYawDeg,
-    }));
+    .flatMap(([doorId, r]) => {
+      if (!r.paired || !r.connectedRoomAddress) return [];
+      // 🧭 The door's LIVE physical pose rides into the atlas — its wall and
+      // its along-wall centre. This is what lets a peer who has never stood in
+      // this room compose the station graph through it: an atlas hop used to
+      // pose a neighbour room's door from the CURRENT room's record snapshot,
+      // which is only right by coincidence. The harvest-armed gate guarantees
+      // the pose snapshot and the doors map describe the SAME room here (F5);
+      // a cardinal id can still pose from its name if the snapshot misses.
+      const pose = physicalDoorPoseOrNull(doorId);
+      return [{
+        doorId,
+        targetSeed: r.connectedRoomAddress,
+        segments: r.segments,
+        farDoor: r.farDoor,
+        farWall: r.farWall,
+        farLateral: r.farLateral,
+        farYawDeg: r.farYawDeg,
+        ...(pose
+          ? {
+              wall: pose.wall,
+              lateral: pose.wall === "y-" || pose.wall === "y+" ? pose.x : pose.z,
+            }
+          : {}),
+      }];
+    });
   harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).

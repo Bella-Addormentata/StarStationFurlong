@@ -18,7 +18,10 @@
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
 import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
-import { setActiveDoorLayout, type DoorLayoutKind } from "./doorLayout";
+import {
+  setLegacyRoomDoorLayout,
+  type LegacyLayoutKind,
+} from "./doorLayoutDoc";
 
 /** The room "type"; each can have multiple design variants (casino-1, -2, …).
  *  "blank" is the empty starting point (folds in empty-by-default); "deck" is
@@ -42,7 +45,7 @@ export interface RoomTemplate {
   /** The furniture layout to place (cloned on apply — the source is never mutated). */
   items: FurnitureItem[];
   /** The door arrangement the layout was designed for. */
-  doorLayout: DoorLayoutKind;
+  doorLayout: LegacyLayoutKind;
   /** 🌌 Visual theme stamped into the room's roomInfo on provision — an
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
@@ -107,7 +110,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     category: "pool",
     name: "Infinity Pool Deck",
     description:
-      "Infinity pool, bridge to the hot tub, dive tower between the north doors, beach cafés — under open space with skylights.",
+      "Infinity pool, bridge to the hot tub, dive tower between the twin doors, beach cafés — under open space with skylights.",
     // OUTDOOR_FURNITURE already carries the pool + its ceiling skylights.
     items: OUTDOOR_FURNITURE,
     doorLayout: "pool-pairs",
@@ -118,7 +121,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     category: "pool",
     name: "Classic Lido Pool",
     description:
-      "PR #70's original — east dive tower, corner hot tub, terrace bench, sun loungers, parasol cafés, glass-ceiling skylights.",
+      "PR #70's original — corner dive tower, corner hot tub, terrace bench, sun loungers, parasol cafés, glass-ceiling skylights.",
     items: [
       // 🪟☀️ Ceiling glass + a sun-lamp so the deck reads sunlit under real space
       // even when dropped into a windowless module.
@@ -196,7 +199,7 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
   replaceAllFurniture(cloneItems(t.items));
-  setActiveDoorLayout(t.doorLayout);
+  setLegacyRoomDoorLayout(t.doorLayout);
   return t;
 }
 

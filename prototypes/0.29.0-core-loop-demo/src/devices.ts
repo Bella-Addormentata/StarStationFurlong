@@ -31,7 +31,10 @@ import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc'
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState } from './docking';
-import type { DoorId } from './doors';
+import {
+  readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
+} from './doorLayoutDoc';
+import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -335,13 +338,37 @@ export interface RoomTerminalDeps {
   };
 }
 
-/** Door port geometry for the wireframe view (docking.ts buildPorts widths). */
-const PORT_VIEW: Array<{ id: DoorId; x: number; z: number; w: number; horizontal: boolean; label: string }> = [
-  { id: 'north', x: 0, z: -6, w: 1.4, horizontal: true, label: 'N' },
-  { id: 'south', x: 0, z: 6, w: 1.4, horizontal: true, label: 'S' },
-  { id: 'west', x: -6, z: 0, w: 2.4, horizontal: false, label: 'W' },
-  { id: 'east', x: 6, z: 0, w: 2.4, horizontal: false, label: 'E' },
-];
+/**
+ * 🧭 The wireframe view's door ports, derived LIVE from the room's real door
+ * set — id, pose and all. This retired a hard-coded four-cardinal table with
+ * N/S/W/E captions (and pre-#91 widths): the room can have any number of
+ * doors anywhere now, and compass letters are meaningless once modules render
+ * at angles — ports are captioned with the same DOOR NUMBERS every other
+ * surface speaks (doorOrdinals), or the door's authored label initial.
+ */
+function livePortView(): Array<{
+  id: string; x: number; z: number; w: number; horizontal: boolean; label: string;
+}> {
+  // The SAME folded fallback every other surface uses (fold review F3): a
+  // synthesized lateral-0 set numbered differently from doorDisplayName's,
+  // so the wireframe's captions could disagree with the pane's names.
+  const stored = readAllDoorLayout();
+  const doors = stored.size
+    ? [...stored.values()]
+    : [...defaultDoorLayoutRecords().values()];
+  const ordinals = doorOrdinals(doors);
+  return doors.map((d) => {
+    const pose = physicalDoorPose(d.id);
+    return {
+      id: d.id,
+      x: pose.x,
+      z: pose.z,
+      w: DOOR_OPENING_WIDTH,
+      horizontal: pose.wall === 'y-' || pose.wall === 'y+',
+      label: String(ordinals.get(d.id) ?? '?'),
+    };
+  });
+}
 
 /**
  * The wall computer's focused DOM UI (plan §2 M1). Honest data only: room
@@ -383,11 +410,11 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     // report pairing status honestly (plan M1: 'NO ADJACENT MODULE DATA').
     const adjEl = panel.querySelector<HTMLElement>('#device-terminal-adjacent');
     if (adjEl) {
-      const paired = PORT_VIEW
+      const paired = livePortView()
         .filter((p) => deps.dockingSystem?.getDockingState(p.id)?.pairedSuccessfully)
-        .map((p) => p.id.toUpperCase());
+        .map((p) => doorDisplayName(p.id));
       adjEl.textContent = paired.length
-        ? `PORT ${paired.join(', ')} PAIRED — NO ADJACENT MODULE DATA`
+        ? `${paired.join(', ')} PAIRED — NO ADJACENT MODULE DATA`
         : 'NO ADJACENT MODULE DATA';
     }
 
@@ -457,7 +484,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     ctx.font = 'bold 22px monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    for (const port of PORT_VIEW) {
+    for (const port of livePortView()) {
       const state = deps.dockingSystem?.getDockingState(port.id) ?? null;
       ctx.fillStyle = doorStateColor(state);
       const wpx = port.w * scale;

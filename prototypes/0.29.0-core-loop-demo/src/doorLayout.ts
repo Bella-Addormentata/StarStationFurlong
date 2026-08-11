@@ -1,15 +1,11 @@
 import { roomHalfExtents } from "./floorPlanDoc";
 import type { DoorWall } from "./doorLayoutDoc";
+import { LEGACY_ID_WALL } from "./doorLayoutDoc";
 
 export type PhysicalDoorId = "north" | "south" | "east" | "west";
-/** "casino-pairs" and "pool-pairs" are ALIASES of the same paired
- *  arrangement (their pose tables were merged — they matched exactly):
- *  logical SOUTH on the north wall, EAST on the west wall. Both names are
- *  kept so each room's intent stays readable at the call site. */
-export type DoorLayoutKind = "legacy" | "casino-pairs" | "pool-pairs";
 
 export interface PhysicalDoorPose {
-  wall: "north" | "south" | "east" | "west";
+  wall: DoorWall;
   x: number;
   z: number;
   outwardYaw: number;
@@ -27,12 +23,12 @@ export interface PhysicalDoorPose {
  *  will both derive their pose from `poseFromWall` in later slices. */
 export type PortId = string;
 
-/** 🚪 The cardinal/free split in one predicate: the 4 cardinal ids are the
- *  structural berths (legacy pose tables, floorPlan slide store, pairing wire);
- *  everything else is a free `d:` door that owns its position in its layout
- *  record. #91 hoisted this here — docking.ts and editMode.ts each had a
- *  private copy and world.ts/main.ts had none, which is how free door ids kept
- *  reaching cardinal-only code and throwing. */
+/** 🚪 The cardinal/free split in one predicate. It no longer decides where a
+ *  door IS — every door poses from its own layout record now — but the 4
+ *  cardinal ids are still the structural berths: the floorPlan slide store and
+ *  the pairing wire are keyed on them. #91 hoisted this here — docking.ts and
+ *  editMode.ts each had a private copy and world.ts/main.ts had none, which is
+ *  how free door ids kept reaching cardinal-only code and throwing. */
 export function isCardinalDoorId(id: string): id is PhysicalDoorId {
   return id === "north" || id === "south" || id === "east" || id === "west";
 }
@@ -41,17 +37,13 @@ export function isCardinalDoorId(id: string): id is PhysicalDoorId {
 // (walls at ±half) instead of hardcoding ±6, so the layout scales with a
 // rectangular room. Insets: stand-point 1.5 m inside the wall, through-point
 // 1.0 m outside. Default 2×2 room ⇒ {6,6} reproduces the legacy ±6 / ±4.5 / ±7
-// tables bit-for-bit. PAIR_OFFSET spaces the two doors that share a wall in the
-// pairs layout — an INTEGER (was 2.7), because #91 locks every door centre to
-// the grid lines (see the geometry contract below); 3.0 keeps the paired doors
-// 6 m apart. The old EW_LATERAL quirk (e/w STAND points −0.5 off the door
-// centre, so the avatar walked through half a metre off the visible opening)
-// is retired with #91: stand === centre for every door. The stand-vs-centre
-// SEAM in poseFromWall is kept — synced pairs data and future asymmetric
-// layouts still speak through it.
+// tables bit-for-bit. The old EW_LATERAL quirk (e/w STAND points −0.5 off the
+// door centre, so the avatar walked through half a metre off the visible
+// opening) is retired with #91: stand === centre for every door. The
+// stand-vs-centre SEAM in poseFromWall is kept — synced data and future
+// asymmetric openings still speak through it.
 const FRONT_INSET = 1.5;
 const THROUGH_OUTSET = 1.0;
-const PAIR_OFFSET = 3.0;
 const HALF_PI = Math.PI / 2;
 
 // ── 🚪 #91: THE door's physical grid contract ────────────────────────────────
@@ -80,20 +72,46 @@ export const DOOR_LEAF_SHUT_OFFSET = DOOR_LEAF_WIDTH / 2 + 0.02;
 export const DOOR_LEAF_OPEN_OFFSET = DOOR_LEAF_SHUT_OFFSET + DOOR_LEAF_WIDTH - 0.02;
 
 /**
+ * 🚪↔🚪 Minimum distance between two door CENTRES on the same wall.
+ *
+ * The old rule was DOOR_FRAME_WIDTH (2.6) — enough that two frames do not
+ * overlap INSIDE the room, and nothing more. That was the whole requirement
+ * back when only the four structural berths could dock, because the editor
+ * only ever placed free doors and free doors could not grow anything outside.
+ *
+ * Now any door can take a vestibule or a docking adapter, so a door also
+ * claims an EXTERIOR corridor: hull.EXT_DOOR_BAND (1.8) each side of its axis,
+ * the strip a gangway tube or a berthed ship occupies. Two adjacent doors
+ * therefore need 2 × 1.8 = 3.6 m between centres before their docking
+ * envelopes stop intersecting — which the 2.6 m rule happily allowed. The
+ * editor was approving pairs of doors that could never both be used.
+ *
+ * 4.0 rather than 3.6 (owner's ruling), and the grid agrees: snapDoorLateral
+ * locks every centre to an integer, so the realizable gaps are whole metres
+ * and the first one clearing 3.6 IS 4. Stating 4 makes the constant match what
+ * the editor can actually produce, with a metre of daylight rather than 0.4.
+ *
+ * Kept here beside the rest of the door geometry contract, not in hull.ts, so
+ * a placement validator does not have to import the exterior system to know
+ * how far apart doors go. The coupling is asserted below.
+ */
+export const MIN_DOOR_GAP = 4.0;
+
+/**
  * The single pose generator. Given a wall, the along-wall lateral of the door
  * CENTRE, and (optionally, for the legacy e/w quirk) a distinct lateral for the
  * stand/through points, derive the full pose from the current room half-extents.
- * For every clean door `standLateral === centreLateral`. This reproduces
- * `legacyTable`/`pairsTable` bit-for-bit for the 4 cardinals (see poseFromSlot).
+ * For every clean door `standLateral === centreLateral`. This is now THE pose
+ * generator for every door in the room, cardinal or free.
  */
 export function poseFromWall(
-  wall: PhysicalDoorId,
+  wall: DoorWall,
   centreLateral: number,
   standLateral: number = centreLateral,
 ): PhysicalDoorPose {
   const { halfX, halfZ } = roomHalfExtents();
   switch (wall) {
-    case "north":
+    case "y-": // plan −Y = engine −Z (the old north)
       return {
         wall,
         x: centreLateral,
@@ -105,7 +123,7 @@ export function poseFromWall(
         faceAngle: Math.PI,
         tangent: "x",
       };
-    case "south":
+    case "y+": // plan +Y = engine +Z (the old south)
       return {
         wall,
         x: centreLateral,
@@ -117,7 +135,7 @@ export function poseFromWall(
         faceAngle: 0,
         tangent: "x",
       };
-    case "west":
+    case "x-": // plan −X = engine −X (the old west)
       return {
         wall,
         x: -halfX,
@@ -129,7 +147,7 @@ export function poseFromWall(
         faceAngle: -HALF_PI,
         tangent: "z",
       };
-    case "east":
+    case "x+": // plan +X = engine +X (the old east)
       return {
         wall,
         x: halfX,
@@ -169,90 +187,110 @@ export function wallAndLateralFromPoint(
 ): { wall: DoorWall; lateral: number } {
   const { halfX, halfZ } = roomHalfExtents();
   const dists: Array<{ wall: DoorWall; d: number }> = [
-    { wall: "north", d: Math.abs(pz + halfZ) },
-    { wall: "south", d: Math.abs(pz - halfZ) },
-    { wall: "west", d: Math.abs(px + halfX) },
-    { wall: "east", d: Math.abs(px - halfX) },
+    { wall: "y-", d: Math.abs(pz + halfZ) },
+    { wall: "y+", d: Math.abs(pz - halfZ) },
+    { wall: "x-", d: Math.abs(px + halfX) },
+    { wall: "x+", d: Math.abs(px - halfX) },
   ];
-  let best = dists[0];
-  for (const cand of dists) if (cand.d < best.d) best = cand;
-  const lateral = best.wall === "north" || best.wall === "south" ? px : pz;
-  return { wall: best.wall, lateral };
+  dists.sort((a, b) => a.d - b.d);
+  const wall = dists[0].wall;
+  const lateral = wall === "y-" || wall === "y+" ? px : pz;
+  return { wall, lateral };
 }
 
-/** A cardinal door's fixed slot in a layout: which physical wall it sits on and
- *  its base centre/stand lateral (before any owner slide delta). */
-interface DoorSlot {
-  wall: PhysicalDoorId;
-  centre: number;
-  stand: number;
+/**
+ * 🚪 The room's live door records, pushed here by world.reconcileDoorLayout —
+ * which already receives exactly this map (stored records, or the room's
+ * defaults when unseeded) on bind and on every door change, so there is no new
+ * subscription and no import cycle back into the doc layer.
+ *
+ * This replaces the module global that used to hold a LAYOUT KIND. That global
+ * was the whole reason a "casino door" was a different thing from a regular
+ * door: `physicalDoorPose` switched on it to pick one of two four-slot tables,
+ * which can express neither an empty wall nor a wall with three doors on it.
+ * A record per door expresses both, and one code path serves every door.
+ */
+let doorRecords: ReadonlyMap<string, { wall: DoorWall; lateral: number }> =
+  new Map();
+
+export function setDoorRecords(
+  records: ReadonlyMap<string, { wall: DoorWall; lateral: number }>,
+): void {
+  doorRecords = records;
 }
 
-/** Legacy layout: the 4 doors on their own cardinal walls, centred.
- *  #91 retired the e/w −0.5 stand offset — the avatar now walks through the
- *  middle of the opening it can see. NOTE the floorPlan STORE still encodes
- *  e/w placements against a −0.5 base (floorPlanDoc LEGACY_PLACEMENTS): that
- *  is wire data and stays put; only these walk/stand points moved. */
-function legacySlot(id: PhysicalDoorId): DoorSlot {
-  switch (id) {
-    case "north":
-      return { wall: "north", centre: 0, stand: 0 };
-    case "south":
-      return { wall: "south", centre: 0, stand: 0 };
-    case "west":
-      return { wall: "west", centre: 0, stand: 0 };
-    case "east":
-      return { wall: "east", centre: 0, stand: 0 };
+/**
+ * Where a door physically is: its own record's wall and base lateral, plus the
+ * owner's floor-plan slide passed in by the caller.
+ *
+ * Before a room's first reconcile the map is empty — reachable only at boot,
+ * when docking.buildPorts constructs the four berths before any room is
+ * entered. The fallback poses a cardinal centred on its own wall, which is
+ * exactly what the retired global's "legacy" default produced there, so boot
+ * geometry is unchanged.
+ */
+export function physicalDoorPose(id: string): PhysicalDoorPose {
+  return physicalDoorPoseOrNull(id) ?? fallbackPose(id);
+}
+
+/**
+ * 🚪 The same lookup, but honest about a miss: `null` means "this client does
+ * not know where that door is", which is a real state and NOT the same as "it
+ * is on the north wall". Callers that would otherwise make a decision from a
+ * guessed pose — module-overlap clash tests, exterior projections of a FAR
+ * room's door — must use this and degrade permissively, because a confident
+ * wrong answer there refuses a legitimate dock or draws a module in the wrong
+ * place. Callers that only need *some* pose to render local scenery can keep
+ * using physicalDoorPose.
+ */
+export function physicalDoorPoseOrNull(id: string): PhysicalDoorPose | null {
+  // 🚪 #18: no delta parameter — the record's lateral IS the live position
+  // (the read boundary folds any legacy slide residue in). Deleting the
+  // parameter is deliberate over defaulting it: the double-slide bug is one
+  // "helpful" caller away, and a parameter that no longer exists cannot be
+  // passed twice.
+  const rec = doorRecords.get(id);
+  if (rec) return poseFromWall(rec.wall, rec.lateral, rec.lateral);
+  // No record. A LEGACY id is still self-describing — the four old ids were
+  // born on the wall of the same name (LEGACY_ID_WALL), which is what the boot
+  // path produced before any room is entered, so it stays bit-identical.
+  const w = LEGACY_ID_WALL[id];
+  if (w) return poseFromWall(w, 0, 0);
+  return null;
+}
+
+/**
+ * 🚪 TOTALITY GUARD. `poseFromWall`'s switch has no `default` arm — deliberately,
+ * so the compiler proves every legitimate caller passes a doc-validated wall —
+ * which means handing it a door ID that is not a wall name returns `undefined`
+ * and the first property read throws.
+ *
+ * That is reachable: a free `d:` id belonging to a room this client is not in
+ * (a far room's door, or a key gossiped by a peer) is absent from the record
+ * snapshot, and the old `rec?.wall ?? id` fell straight through to
+ * `poseFromWall("d:abc", …)`. The blast radius is the whole exterior render,
+ * per frame, from a value that persists in localStorage — so it must degrade,
+ * loudly, not crash.
+ */
+const warnedUnknownDoors = new Set<string>();
+function fallbackPose(id: string): PhysicalDoorPose {
+  if (!warnedUnknownDoors.has(id)) {
+    warnedUnknownDoors.add(id);
+    console.warn(
+      `[doorLayout] no pose for door "${id}" — it is not a cardinal and has no ` +
+        `record in this room. Rendering it at the north wall centre. This is a ` +
+        `bug in whatever supplied the id, not in the door.`,
+    );
   }
-}
-
-/** Paired layout ("casino-pairs" / "pool-pairs" aliases): logical south rides
- *  the north wall and logical east rides the west wall, spaced ±PAIR_OFFSET.
- *  Keeps the camera-near south/east edges clear. Stand === centre (no quirk). */
-function pairsSlot(id: PhysicalDoorId): DoorSlot {
-  switch (id) {
-    case "north":
-      return { wall: "north", centre: -PAIR_OFFSET, stand: -PAIR_OFFSET };
-    case "south":
-      return { wall: "north", centre: PAIR_OFFSET, stand: PAIR_OFFSET };
-    case "west":
-      return { wall: "west", centre: -PAIR_OFFSET, stand: -PAIR_OFFSET };
-    case "east":
-      return { wall: "west", centre: PAIR_OFFSET, stand: PAIR_OFFSET };
-  }
-}
-
-let activeLayout: DoorLayoutKind = "legacy";
-
-export function setActiveDoorLayout(layout: DoorLayoutKind): void {
-  activeLayout = layout;
-}
-
-export function activeDoorLayout(): DoorLayoutKind {
-  return activeLayout;
-}
-
-export function physicalDoorPose(
-  id: PhysicalDoorId,
-  lateralDelta = 0,
-): PhysicalDoorPose {
-  const slot = activeLayout === "legacy" ? legacySlot(id) : pairsSlot(id);
-  return poseFromWall(
-    slot.wall,
-    slot.centre + lateralDelta,
-    slot.stand + lateralDelta,
-  );
+  return poseFromWall("y-", 0, 0);
 }
 
 /** 🛰️ #28 S1: the structural PORT pose. Ports are, for now, exactly the 4
  *  cardinal berths, so this aliases `physicalDoorPose`. Later slices split the
  *  pairing/mesh (which keys off ports) from the free-door layer; keeping this
  *  name lets those call sites read against "port" while the wire stays cardinal. */
-export function physicalPortPose(
-  id: PortId,
-  lateralDelta = 0,
-): PhysicalDoorPose {
-  return physicalDoorPose(id as PhysicalDoorId, lateralDelta);
+export function physicalPortPose(id: PortId): PhysicalDoorPose {
+  return physicalDoorPose(id);
 }
 
 /**

@@ -19,6 +19,19 @@ import {
 } from "./doorLayout";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
+import {
+  DOOR_LABEL_MAX,
+  sanitizeDoorLabel,
+  readAllDoorLayout,
+  writeDoorLabel,
+  seedDoorLayoutDefaults,
+  doorDisplayName,
+  doorOrdinals,
+  LEGACY_ID_WALL,
+  writeDoorLayout,
+  defaultDoorLayoutRecords,
+} from "./doorLayoutDoc";
+import { validateDoorPlacement } from "./editMode";
 import { ROOM_TEMPLATES } from "./roomTemplates";
 import { getCameraYaw } from "./cameraRig";
 import {
@@ -59,15 +72,10 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
+import { doorLateralLimitForWall, clearDoorSlide } from "./floorPlanDoc";
 import {
-  seedFloorPlan,
-  writeDoorPlacement,
-  readDoorDeltas,
-  lateralOf,
-  LEGACY_PLACEMENTS,
-  doorLateralLimitForWall,
-} from "./floorPlanDoc";
-import { readAtlas, atlasLayout, moduleOverlapAt } from "./stationAtlas";
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed,
+} from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
 function moveToward(current: number, target: number, maxStep: number): number {
@@ -94,7 +102,12 @@ export interface DockingState {
    *  connector chain + far-side geometry, mirrored from the doors doc. P3
    *  renders the chain + poses the projection from these; P2 only stores/diffs. */
   segments?: ConnectorSegment[];
-  farDoor?: "north" | "south" | "east" | "west";
+  /** May name a free `d:` door in the far room. */
+  farDoor?: string;
+  /** The far door's WALL — mirrored from the record; orients the projection. */
+  farWall?: DoorWall;
+  /** The far door's along-wall centre — shifts the far module sideways. */
+  farLateral?: number;
   farYawDeg?: 0 | 45;
   /** #67 D2: this pairing is a TRANSIENT guest berth (docking adapter). */
   transient?: boolean;
@@ -121,7 +134,7 @@ export class DoorDockingPortSystem {
   // ── Update-loop-driven leaf slides ─────────────────────────────────────────
   /** In-flight slide per door; a new open/close overwrites the entry. */
   private slideAnims = new Map<
-    DoorId,
+    string,
     { openTarget: number; onComplete?: () => void }
   >();
   /** Leaf slide speed (metres/second). */
@@ -193,8 +206,99 @@ export class DoorDockingPortSystem {
    * unreachable.
    */
   private provisionModuleCallback:
-    | ((templateId: string, parentDoorId?: string) => Promise<string | null>)
+    | ((
+        templateId: string,
+        parentDoorId?: string,
+        placement?: { wall: DoorWall; lateral: number },
+      ) => Promise<string | null>)
     | null = null;
+
+  /** 🧭 Per-door NEW-MODULE placement choice (the pane's ⟳/◀▶ editor): which
+   *  wall of the module-to-be carries its door, and where along it. Drives the
+   *  in-world ghost, the mint's birth door, and the pairing's far geometry. */
+  private provisionChoice = new Map<string, { wall: DoorWall; lateral: number }>();
+  /** The live placement ghost — a wireframe module + green door slab at the
+   *  chain's end. One at a time; rebuilt on every choice/chain edit. */
+  private provisionGhost: THREE.Group | null = null;
+  /** Paints the placement row + ghost — set by setupPanelListeners' closure,
+   *  called from handlePanelRaycast when the pane opens. */
+  private paintPlacement: ((doorId: string) => void) | null = null;
+
+  private choiceFor(doorId: string): { wall: DoorWall; lateral: number } {
+    let c = this.provisionChoice.get(doorId);
+    if (!c) {
+      c = { wall: "x-", lateral: 0 }; // the old default birth door (was west)
+      this.provisionChoice.set(doorId, c);
+    }
+    return c;
+  }
+
+  /**
+   * 🧭 Build (or re-pose) the NEW-MODULE placement ghost for `doorId`: the
+   * module-to-be as a wireframe box at the vestibule's end, its birth door as
+   * a green slab on the chosen wall at the chosen lateral. Uses the SAME pose
+   * math the real projection uses, so what you see is what the station gets.
+   * Removed when the pane closes or the door pairs (the real module replaces
+   * the hypothesis).
+   */
+  private updateProvisionGhost(doorId: string): void {
+    this.removeProvisionGhost();
+    const state = this.doorState.get(doorId);
+    if (!state || state.pairedSuccessfully) return;
+    const choice = this.choiceFor(doorId);
+    const pose = projectionPoseForDoor(
+      doorId,
+      state.segments,
+      choice.wall,
+      choice.lateral,
+    );
+    const g = new THREE.Group();
+    g.name = "provision-ghost";
+    const H = 5.9; // uniform module half — matches the projection's ROOM_HALF
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(H * 2, 4, H * 2)),
+      new THREE.LineBasicMaterial({
+        color: 0xd4a84b,
+        transparent: true,
+        opacity: 0.55,
+      }),
+    );
+    edges.position.y = 2;
+    g.add(edges);
+    // The birth door: a green slab on the chosen wall, module-local.
+    const ns = choice.wall === "y-" || choice.wall === "y+";
+    const slab = new THREE.Mesh(
+      new THREE.BoxGeometry(ns ? 2.0 : 0.24, 2.5, ns ? 0.24 : 2.0),
+      new THREE.MeshBasicMaterial({
+        color: 0x00e676,
+        transparent: true,
+        opacity: 0.5,
+      }),
+    );
+    slab.position.set(
+      choice.wall === "x+" ? H : choice.wall === "x-" ? -H : choice.lateral,
+      1.25,
+      choice.wall === "y+" ? H : choice.wall === "y-" ? -H : choice.lateral,
+    );
+    g.add(slab);
+    g.position.set(pose.x, 0, pose.z);
+    g.rotation.y = pose.rotY;
+    this.roomsGroup.add(g);
+    this.provisionGhost = g;
+  }
+
+  private removeProvisionGhost(): void {
+    const g = this.provisionGhost;
+    if (!g) return;
+    this.provisionGhost = null;
+    this.roomsGroup.remove(g);
+    g.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.geometry) m.geometry.dispose();
+      const mat = (m as { material?: THREE.Material }).material;
+      if (mat) mat.dispose();
+    });
+  }
 
   constructor(roomsGroup: THREE.Group) {
     this.roomsGroup = roomsGroup;
@@ -212,14 +316,17 @@ export class DoorDockingPortSystem {
    */
   private builtChainBoxes(): Box[] {
     const out: Box[] = [];
+    // 🛰️ EVERY door with a chain, not just cardinals: a free door can grow a
+    // gangway now, and a tube that reserves no exterior space lets a solar
+    // panel be mounted straight through it.
     for (const doorId of this.doorState.keys()) {
-      if (isCardinalDoorId(doorId)) out.push(...this.chainBoxesFor(doorId));
+      out.push(...this.chainBoxesFor(doorId));
     }
     return out;
   }
 
   /** One door's chain, folded joint by joint into padded world-XZ boxes. */
-  private chainBoxesFor(doorId: "north" | "south" | "east" | "west"): Box[] {
+  private chainBoxesFor(doorId: string): Box[] {
     const segs = this.doorState.get(doorId)?.segments ?? [];
     if (segs.length === 0) return [];
     const PAD = 0.85;
@@ -227,7 +334,7 @@ export class DoorDockingPortSystem {
     // the delta these occupancy/clash boxes sat at the unslid position while
     // buildConnectorChain drew the tube at the slid one — the warnings and the
     // thing on screen disagreed.
-    const pose = this.poseForDoor(doorId, readDoorDeltas()[doorId] ?? 0);
+    const pose = this.poseForDoor(doorId);
     const face = { x: pose.x, z: pose.z };
     const yaw = pose.outwardYaw;
     const c = Math.cos(yaw),
@@ -280,16 +387,16 @@ export class DoorDockingPortSystem {
    * 🚪↔🛰️ #28 S5a: the world pose of a door by id. A CARDINAL door routes
    * through physicalDoorPose (legacy east/west quirk + pairs layout preserved
    * EXACTLY); a free/genId door derives from poseFromWall using the wall +
-   * lateral stashed on its group's userData. `delta` is the live slide offset.
+   * lateral stashed on its group's userData.
    */
-  private poseForDoor(id: string, delta = 0): PhysicalDoorPose {
+  private poseForDoor(id: string): PhysicalDoorPose {
     if (id === "north" || id === "south" || id === "east" || id === "west") {
-      return physicalDoorPose(id, delta);
+      return physicalDoorPose(id);
     }
     const ud = this.doorObjects.get(id)?.userData as
       | { wall?: DoorWall; lateral?: number }
       | undefined;
-    return poseFromWall(ud?.wall ?? "north", (ud?.lateral ?? 0) + delta);
+    return poseFromWall(ud?.wall ?? "y-", ud?.lateral ?? 0);
   }
 
   public buildPorts() {
@@ -302,7 +409,7 @@ export class DoorDockingPortSystem {
       // adds/removes groups from the synced map afterward.
       this.buildDoorGroup({
         id,
-        wall: id,
+        wall: LEGACY_ID_WALL[id],
         lateral: 0,
         size: "large",
         enabled: findDoor(id)?.enabled === true,
@@ -674,7 +781,7 @@ export class DoorDockingPortSystem {
     this.doorFadeMats.delete(id as DoorId);
     this.doorFadeOpacity.delete(id as DoorId);
     this.doorState.delete(id as DoorId);
-    this.slideAnims.delete(id as DoorId);
+    this.slideAnims.delete(id);
     this.removeAdjacentRoomProjection(id as DoorId); // tear down any projection
     this.untouchedPrefills.delete(id);
   }
@@ -758,6 +865,19 @@ export class DoorDockingPortSystem {
       <div id="docking-pane-scroll" style="flex:1 1 auto; min-height:0; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:16px; margin-right:-10px; padding-right:10px;">
 
       <div style="display:flex; flex-direction:column; gap:12px; font-size:11px;">
+        <!-- 🪧 DOOR SIGN — the owner's ruling: instead of the app deciding what
+             a door leads to from its cardinal ID (the pool sign was welded to
+             the door called "south", the casino sign to "east"), the room
+             author types it. Works on EVERY door, cardinal or free d: —
+             deliberately outside the isCardinal show/hide block below, because
+             a user-placed door is exactly the one nobody can otherwise label.
+             maxlength mirrors DOOR_LABEL_MAX; sanitizeDoorLabel is still the
+             authority at the write boundary (paste bypasses maxlength). -->
+        <div id="docking-label-row">
+          <label for="docking-label-input" style="display:block; margin-bottom:4px; color:rgba(212,168,75,0.6);">🪧 DOOR SIGN <span id="docking-label-note" style="color:rgba(212,168,75,0.38); font-size:9px;">· what is on the other side</span></label>
+          <input type="text" id="docking-label-input" maxlength="${DOOR_LABEL_MAX}" placeholder="e.g. POOL, CASINO, DOCK 3 — blank for none" style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace; box-sizing:border-box;">
+        </div>
+
         <!-- Lock config -->
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <span>LOCK STATE CONFIG:</span>
@@ -782,12 +902,13 @@ export class DoorDockingPortSystem {
             <button id="docking-clear-chain" style="background:rgba(255,23,68,0.08); border:1px solid rgba(255,23,68,0.3); border-radius:5px; color:#ff8a80; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">CLEAR</button>
             <span style="flex:1;"></span>
             <span style="font-size:9px; color:rgba(212,168,75,0.55);">FAR:</span>
+            <!-- 🧭 Populated per-TARGET with the far module's REAL doors
+                 (renderFarDoorOptions) — the four hardcoded compass options
+                 were guesses about a stranger's room, meaningless once doors
+                 move and modules rotate. "auto" always works: the first
+                 walk-through's mirror names the door precisely. -->
             <select id="docking-far-door" style="background:rgba(0,0,0,0.3); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#d4a84b; font-size:9px; padding:2px 4px;">
               <option value="">auto</option>
-              <option value="north">north</option>
-              <option value="south">south</option>
-              <option value="east">east</option>
-              <option value="west">west</option>
             </select>
             <button id="docking-far-yaw" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">YAW —</button>
           </div>
@@ -815,6 +936,18 @@ export class DoorDockingPortSystem {
         <select id="docking-provision-template" title="What the new room starts as" style="width:100%; margin-bottom:5px; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:5px 8px; font-size:10px; outline:none;">
           ${ROOM_TEMPLATES.map((t) => `<option value="${t.id}">🏗️ NEW ROOM: ${t.name.toUpperCase()}</option>`).join("")}
         </select>
+        <!-- 🧭 NEW-MODULE DOOR PLACEMENT (owner ask): before committing the
+             module, ROTATE which of its walls carries the birth door and SHIFT
+             the door along that wall — a live wireframe ghost at the chain's
+             end shows exactly what the station gets. -->
+        <div id="docking-provision-place" style="display:flex; align-items:center; gap:6px; margin-bottom:5px; font-size:10px;">
+          <span style="color:rgba(212,168,75,0.6);">NEW MODULE DOOR:</span>
+          <button id="docking-place-rotate" type="button" title="Rotate the new module — which of its walls carries the door" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">⟳ WEST</button>
+          <span style="flex:1;"></span>
+          <button id="docking-place-left" type="button" title="Shift the door along its wall" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">◀</button>
+          <span id="docking-place-lat" style="min-width:44px; text-align:center; color:rgba(212,168,75,0.7); font-size:9px;">CENTRE</span>
+          <button id="docking-place-right" type="button" title="Shift the door along its wall" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">▶</button>
+        </div>
         <button id="docking-provision-btn" style="width:100%; border-radius:6px; border:1px solid #d4a84b; background:rgba(212,168,75,0.12); color:#f0c060; padding:8px; font-weight:bold; cursor:pointer; text-transform:uppercase;">➕ PROVISION NEW MODULE</button>
 
         <button id="docking-request-btn" style="width:100%; border-radius:6px; border:1px solid #1e88e5; background:rgba(30,136,229,0.15); color:#90caf9; padding:8px; font-weight:bold; cursor:pointer; text-transform:uppercase;">INITIATE PORT PLUG PAIRING</button>
@@ -860,6 +993,7 @@ export class DoorDockingPortSystem {
         const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
+        this.removeProvisionGhost(); // the placement hypothesis dies with the pane
         if (box) box.style.display = "none";
       });
 
@@ -919,10 +1053,24 @@ export class DoorDockingPortSystem {
             ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ??
               undefined)
             : undefined;
+          const choice = parentDoorId ? this.choiceFor(parentDoorId) : undefined;
           const seed = await this.provisionModuleCallback(
             templateId,
             parentDoorId,
+            choice ? { ...choice } : undefined,
           );
+          // 🧭 The pairing this address is about to INITIATE already knows the
+          // far side exactly — it is the door we just chose. Stash it so the
+          // published record is fully described from birth, no walk-through
+          // needed. (The birth door's id IS its wall name — seedDoorLayoutSingle.)
+          if (seed && parentDoorId && choice) {
+            const st = this.doorState.get(parentDoorId);
+            if (st) {
+              st.farDoor = choice.wall;
+              st.farWall = choice.wall;
+              st.farLateral = choice.lateral;
+            }
+          }
           const addrInput = document.getElementById(
             "docking-addr-input",
           ) as HTMLInputElement | null;
@@ -986,11 +1134,7 @@ export class DoorDockingPortSystem {
           // chain projects the module, and only for a cardinal berth (the pose
           // helper is cardinal-only); the connect target within the match radius
           // is excluded by moduleOverlapAt. Keys off ports/atlas, never doors.
-          if (
-            isCardinalDoorId(activeDoorId) &&
-            state.segments &&
-            state.segments.length > 0
-          ) {
+          if (state.segments && state.segments.length > 0) {
             const currentId =
               (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
             const clash = currentId
@@ -999,9 +1143,8 @@ export class DoorDockingPortSystem {
                   projectionPoseForDoor(
                     activeDoorId,
                     state.segments,
-                    state.farDoor,
+                    this.farWallFor(state),
                   ),
-                  (d, s, f) => projectionPoseForDoor(d, s, f),
                 )
               : null;
             if (clash) {
@@ -1062,8 +1205,90 @@ export class DoorDockingPortSystem {
       });
     }
 
+    // ── 🪧 DOOR SIGN wiring ─────────────────────────────────────────────────
+    // `change` (not `input`): one doc write when the field is committed —
+    // Enter or blur — rather than one per keystroke, which would spam every
+    // peer's reconcile and rebuild the plaque texture on each letter.
+    const labelInput = document.getElementById(
+      "docking-label-input",
+    ) as HTMLInputElement | null;
+    labelInput?.addEventListener("change", () => {
+      const pane = document.getElementById("docking-control-pane");
+      const doorId = pane ? ((pane as any).activeDoorId as string | null) : null;
+      if (!doorId || !this.canConstruct(doorId)) return;
+      const label = sanitizeDoorLabel(labelInput.value);
+      labelInput.value = label ?? ""; // show what was actually stored
+      // SEED-FIRST (the editMode drag rule): the layout reconcile removes any
+      // door not in the map, so writing one record into an UNSEEDED room would
+      // erase the other three cardinals. Idempotent.
+      seedDoorLayoutDefaults();
+      // writeDoorLabel, not a read-modify-write through readAllDoorLayout:
+      // that is a read-NORMALIZER (size, lateral, the cardinal compat shim),
+      // so round-tripping a record through it to change a label would write
+      // the door's geometry fields back too. See its doc comment.
+      writeDoorLabel(doorId, label);
+    });
+
+    // 🧭 F2c (redo review): manually editing the target address invalidates a
+    // CONNECT-stashed far geometry — it described the PREVIOUS target, and a
+    // subsequent INITIATE to a different module must not publish it.
+    (
+      document.getElementById("docking-addr-input") as HTMLInputElement | null
+    )?.addEventListener("input", () => {
+      const doorId = activeDoor();
+      const st = doorId ? this.doorState.get(doorId) : null;
+      if (!st || st.pairedSuccessfully) return;
+      st.farWall = undefined;
+      st.farLateral = undefined;
+      // …and the FAR options follow the new target's real door set.
+      if (doorId) this.renderFarDoorOptions(doorId);
+    });
+
+    // ── 🧭 NEW-MODULE PLACEMENT wiring (⟳ / ◀ ▶ + live ghost) ───────────────
+    const placeRotate = document.getElementById("docking-place-rotate");
+    const placeLat = document.getElementById("docking-place-lat");
+    const paintPlacement = (doorId: string) => {
+      const c = this.choiceFor(doorId);
+      // 🧭 Degrees, not walls — the ghost shows the orientation; the button
+      // reports how far the module is turned from its default.
+      const order: DoorWall[] = ["x-", "y-", "x+", "y+"];
+      if (placeRotate)
+        placeRotate.textContent = `⟳ ${order.indexOf(c.wall) * 90}°`;
+      if (placeLat)
+        placeLat.textContent =
+          c.lateral === 0
+            ? "CENTRE"
+            : `${c.lateral > 0 ? "+" : ""}${c.lateral} m`;
+      this.updateProvisionGhost(doorId);
+    };
+    // expose for handlePanelRaycast (defined in this closure, used there via a
+    // stashed reference — the pane is a singleton, same trick as activeDoorId)
+    this.paintPlacement = paintPlacement;
+    placeRotate?.addEventListener("click", () => {
+      const doorId = activeDoor();
+      if (!doorId || !this.canConstruct(doorId)) return;
+      const c = this.choiceFor(doorId);
+      const order: DoorWall[] = ["x-", "y-", "x+", "y+"];
+      c.wall = order[(order.indexOf(c.wall) + 1) % 4];
+      paintPlacement(doorId);
+    });
+    const shift = (d: number) => {
+      const doorId = activeDoor();
+      if (!doorId || !this.canConstruct(doorId)) return;
+      const c = this.choiceFor(doorId);
+      // ±4 — the same corner clearance the door editor enforces on a 2×2 room.
+      c.lateral = Math.max(-4, Math.min(4, c.lateral + d));
+      paintPlacement(doorId);
+    };
+    document
+      .getElementById("docking-place-left")
+      ?.addEventListener("click", () => shift(-1));
+    document
+      .getElementById("docking-place-right")
+      ?.addEventListener("click", () => shift(1));
+
     // ── #62 P4: CONNECTION ASSEMBLY wiring ──────────────────────────────────
-    const activeDoor = (): ("north" | "south" | "east" | "west") | null => {
+    const activeDoor = (): string | null => {
       const pane = document.getElementById("docking-control-pane");
       return pane ? ((pane as any).activeDoorId ?? null) : null;
     };
@@ -1174,10 +1399,15 @@ export class DoorDockingPortSystem {
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.canConstruct(doorId)) return;
       const v = (e.target as HTMLSelectElement).value;
-      state.farDoor =
-        v === "north" || v === "south" || v === "east" || v === "west"
-          ? v
-          : undefined;
+      // Any real door id from the per-target options ('' = auto). The old
+      // four-name filter silently discarded a free `d:` selection to auto —
+      // exactly the class of cardinal gate this rename exists to end.
+      state.farDoor = v || undefined;
+      // 🧭 The stashed farWall/farLateral described the PREVIOUS far door —
+      // clearing them makes farWallFor re-resolve from the atlas for the new
+      // one instead of republishing a confidently wrong wall to every client.
+      state.farWall = undefined;
+      state.farLateral = undefined;
       this.publishIfPaired(doorId);
     });
 
@@ -1264,41 +1494,35 @@ export class DoorDockingPortSystem {
           };
           writeDoorPolicy(doorId, { ...p, construction: next[p.construction] });
         } else if (action === "slide-neg" || action === "slide-pos") {
-          // 🧱 #66 S1: slide the door along its wall. Owner-only (this branch),
-          // UNPAIRED-only (plan §6.2 — live chains never re-solve), snapped +
-          // clamped in floorPlanDoc on both write and read.
-          // 🚪 #91: step ONE GRID CELL, in door-CENTRE currency. It used to
-          // step DOOR_LATTICE (0.5 m), so every other click parked the door
-          // mid-cell, straddling a grid line. Rounding the centre first also
-          // re-snaps a door that a pre-#91 build left off-grid.
+          // 🧱 Slide the door one grid cell along its wall. Owner-only (this
+          // branch), UNPAIRED-only (plan §6.2 — live chains never re-solve).
+          // 🚪 #18: EVERY door, one write path — the record. The cardinal-only
+          // gate existed because this control drove the retired floorPlan
+          // slide store; with the record the sole position, the free-door
+          // keypad finally gets the nudge buttons too.
           const st2 = this.doorState.get(doorId);
-          if (st2?.pairedSuccessfully || !isCardinalDoorId(doorId)) return;
-          seedFloorPlan(); // lazy first-structure-commit seed (idempotent)
-          const base = lateralOf(doorId, LEGACY_PLACEMENTS[doorId]);
-          const centre = physicalDoorPose(doorId, readDoorDeltas()[doorId] ?? 0);
-          const centreLateral =
-            centre.wall === "north" || centre.wall === "south" ? centre.x : centre.z;
-          // Bound in WORLD-CENTRE currency as well. writeDoorPlacement's own
-          // clamp is expressed in STORED units, which are relative to the
-          // LEGACY slot — under a pairs layout the live slot is ±PAIR_OFFSET
-          // away, so an in-bounds stored value could park the door at a centre
-          // of ±7 on a wall that only runs ±6. (The editor's drag intersects
-          // both bounds; the slider never did.)
-          const wallLimit = doorLateralLimitForWall(centre.wall);
+          if (st2?.pairedSuccessfully) return;
+          seedDoorLayoutDefaults(); // seed-first — same rule as every door edit
+          const rec = readAllDoorLayout().get(doorId);
+          if (!rec) return; // door vanished under the open pane
+          const wallLimit = doorLateralLimitForWall(rec.wall);
           const stepped = Math.max(
             -wallLimit,
             Math.min(
               wallLimit,
-              Math.round(centreLateral) + (action === "slide-pos" ? 1 : -1),
+              Math.round(rec.lateral) + (action === "slide-pos" ? 1 : -1),
             ),
           );
-          // The store speaks base-relative laterals; convert the new centre back.
-          const baseCentre = physicalDoorPose(doorId, 0);
-          const baseLateral =
-            baseCentre.wall === "north" || baseCentre.wall === "south"
-              ? baseCentre.x
-              : baseCentre.z;
-          writeDoorPlacement(doorId, stepped - baseLateral + base);
+          // Same gate the drag editor's drop uses (fold review F1): without
+          // it a couple of nudges could park a door inside a wall-mate's
+          // opening, a window cut or a furniture band, persisting an overlap
+          // the editor would have refused — the drag and the slider must
+          // agree on what a legal spot is.
+          if (!validateDoorPlacement(rec.wall, stepped, doorId).ok) return;
+          writeDoorLayout({ ...rec, lateral: stepped, placed: true });
+          // The record is the sole position — clear legacy slide residue, or
+          // the read-boundary fold re-adds the old drag on top (door jump).
+          clearDoorSlide(doorId);
         } else if (action === "install-adapter") {
           // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
           if (consumePart("adapter")) {
@@ -1394,27 +1618,32 @@ export class DoorDockingPortSystem {
            <button type="button" data-policy-action="undock-module" style="${pill} background:rgba(255,23,68,${undockArmed ? "0.25" : "0.10"}); border-color:rgba(255,23,68,${undockArmed ? "0.7" : "0.35"}); color:#ff8a80;">${undockArmed ? "⏏ CONFIRM" : "⏏ UNDOCK"}</button></div>`
         : "";
 
-    // Cardinal-only rows: POSITION slider and DOCK ADAPTER (both use cardinal-
-    // specific floor-plan / pairing machinery unavailable on free `d:` doors).
-    const positionRow = isCardinal
-      ? `<div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
+    // 🚪 #18: POSITION nudges for EVERY door — the last cardinal-gated
+    // control. The readout is the record's along-wall centre.
+    const positionRow = `<div style="${row}"><span>🧱 POSITION <span style="color:rgba(212,168,75,0.4);">· slide along wall${st?.pairedSuccessfully ? " — unpair first" : ""}</span></span>
           <span style="flex-shrink:0; display:flex; gap:4px; align-items:center;">
             <button type="button" data-policy-action="slide-neg" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">◀</button>
             <span style="font-size:9px; color:rgba(212,168,75,0.6); min-width:34px; text-align:center;">${(() => {
-              const d = readDoorDeltas()[doorId as DoorId] ?? 0;
-              return d === 0 ? "CENTER" : `${d > 0 ? "+" : ""}${d.toFixed(1)}m`;
+              const recs = readAllDoorLayout();
+              const l = (recs.size ? recs : defaultDoorLayoutRecords()).get(doorId)?.lateral ?? 0;
+              return l === 0 ? "CENTRE" : `${l > 0 ? "+" : ""}${l.toFixed(1)}m`;
             })()}</span>
             <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
-          </span></div>`
-      : "";
-    const adapterRow = isCardinal
-      ? `<div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
+          </span></div>`;
+    // 🔌 EVERY door, cardinal or free (owner's ruling: "any door should allow a
+    // vestibule or docking adapter"). Deliberately NOT gated on isCardinal like
+    // positionRow above, and it needs no store work to get here: doorPolicy has
+    // been free-door native on both sides since #91 — isKnownDoorId accepts any
+    // id in the room's layout (doorPolicy.ts), and its own comment records that
+    // the remaining gap was "a UI-only change rather than another store
+    // migration". This is that change. The adapter is a per-door capability
+    // flag, so nothing about it was ever cardinal except this ternary.
+    const adapterRow = `<div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
           ${
             policy.adapter
               ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
               : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
-          }</div>`
-      : "";
+          }</div>`;
 
     if (owner) {
       const requests = readDoorRequests(doorId);
@@ -1440,9 +1669,22 @@ export class DoorDockingPortSystem {
         </div>`,
         )
         .join("");
+      // 🔑 PASSAGE is the room's ACCESS control, and this panel is where it
+      // lives (owner ruling). It does two things at once and the label now says
+      // so: it decides who may WALK THROUGH (canPass), and — because a room is
+      // reachable exactly when some door admits strangers — whether the room's
+      // dial-in SEED is published to the station at all. Setting every door to
+      // OWNER makes the module unlisted. It never hides the module's OUTSIDE:
+      // size, position and connections gossip unconditionally, by design.
+      const anyPublic = [...readAllDoorLayout().keys()]
+        .some((id) => readDoorPolicy(id).passage === "public");
+      const reachNote = anyPublic
+        ? `<div style="font-size:9px; color:rgba(212,168,75,0.45); line-height:1.35; margin:-2px 0 2px;">🔑 A public door publishes this room's dial-in address. Its outside — size, position, connections — is visible to everyone either way.</div>`
+        : `<div style="font-size:9px; color:#80d8ff; line-height:1.35; margin:-2px 0 2px;">🔒 UNLISTED — no door admits strangers, so this room's address is not published. Its outside stays visible; only entry is closed.</div>`;
       body.innerHTML = `
-        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· open/close/walk${policy.oneWay ? " · one-way for guests" : ""}</span></span>
+        <div style="${row}"><span>PASSAGE <span style="color:rgba(212,168,75,0.4);">· who may walk through${policy.oneWay ? " · one-way for guests" : ""}</span></span>
           <button type="button" data-policy-action="cycle-passage" style="${pill}">${passageLabel(policy)}</button></div>
+        ${reachNote}
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
         ${positionRow}
@@ -1477,6 +1719,44 @@ export class DoorDockingPortSystem {
     }
   }
 
+  /**
+   * 🧭 Fill the FAR select with the TARGET module's real doors, numbered with
+   * the same perimeter rule every other surface speaks. Target = the address
+   * box (pre-INITIATE) or the live pairing. A module the atlas has no door
+   * geometry for offers only "auto" — which is never wrong: the mirror names
+   * the actual arrival door on the first walk-through.
+   */
+  private renderFarDoorOptions(doorId: string): void {
+    const farSel = document.getElementById(
+      "docking-far-door",
+    ) as HTMLSelectElement | null;
+    if (!farSel) return;
+    const st = this.doorState.get(doorId);
+    const addr =
+      (document.getElementById("docking-addr-input") as HTMLInputElement | null)
+        ?.value || st?.connectedRoomAddress || "";
+    const rid = addr ? roomIdFromSeed(addr) : "";
+    const doors = rid ? readAtlas()[rid]?.doors ?? {} : {};
+    const entries = Object.entries(doors).map(([id, d]) => ({
+      id, wall: d?.wall, lateral: d?.lateral,
+    }));
+    const ordinals = doorOrdinals(entries);
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    const prev = farSel.value;
+    farSel.innerHTML =
+      `<option value="">auto</option>` +
+      entries
+        .sort((a, b) => (ordinals.get(a.id) ?? 9) - (ordinals.get(b.id) ?? 9))
+        .map((e) => `<option value="${esc(e.id)}">DOOR ${ordinals.get(e.id)}</option>`)
+        .join("");
+    // Keep the current selection when it survives the repopulation; a farDoor
+    // naming a door the atlas does not list yet degrades to auto IN THE UI
+    // while the state keeps the precise id (the mirror wrote it).
+    farSel.value = prev;
+    if (farSel.value !== prev) farSel.value = "";
+  }
+
   /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
    *  a grant landing while a guest stares at the keypad unlocks it live). */
   public refreshPolicyUI(): void {
@@ -1489,10 +1769,7 @@ export class DoorDockingPortSystem {
   }
 
   /** #62 P4: paint the assembly strip from the door's working chain. */
-  private renderAssemblyStrip(
-    doorId: "north" | "south" | "east" | "west",
-    note?: string,
-  ): void {
+  private renderAssemblyStrip(doorId: string, note?: string): void {
     const state = this.doorState.get(doorId);
     const chips = document.getElementById("docking-chips");
     const partsNote = document.getElementById("docking-parts-note");
@@ -1525,16 +1802,12 @@ export class DoorDockingPortSystem {
     // module — the connect target within 4.5 m is excluded). Advisory here;
     // the docking BLOCK arrives with the free-door editor (S6).
     const moduleClash = (() => {
-      // Cardinal berths only — projectionPoseForDoor is cardinal-only, so a
-      // free/genId door's keypad must not reach it (would throw).
-      if (segs.length === 0 || !isCardinalDoorId(doorId)) return null;
+      if (segs.length === 0) return null;
       const currentId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
       if (!currentId) return null;
-      const wouldBe = projectionPoseForDoor(doorId, segs, state.farDoor);
-      const hit = moduleOverlapAt(currentId, wouldBe, (d, s, f) =>
-        projectionPoseForDoor(d, s, f),
-      );
+      const wouldBe = projectionPoseForDoor(doorId, segs, this.farWallFor(state));
+      const hit = moduleOverlapAt(currentId, wouldBe);
       return hit ? hit.name : null;
     })();
     const escName = (s: string) =>
@@ -1575,17 +1848,21 @@ export class DoorDockingPortSystem {
             ? "· no build rights — REQUEST below"
             : "· owner only on this port");
     }
+    this.renderFarDoorOptions(doorId);
     if (farSel) farSel.value = state.farDoor ?? "";
     if (yawBtn)
       yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? "—" : state.farYawDeg}`;
     // 🧲 Every chain edit re-tests whether the far end now reaches a known
     // module — the connect prompt appears/disappears as you build.
     this.detectChainContact(doorId);
+    // …and carries the placement ghost with it: the ghost sits at the chain's
+    // END, so every +FLEX/+EXT/chip edit moves where the module would land.
+    if (this.provisionGhost) this.updateProvisionGhost(doorId);
   }
 
   /** #62 P4: a post-pairing chain edit re-fires the ACCEPTED publish so the
    *  record rewrites and every client's geometry diff picks it up. */
-  private publishIfPaired(doorId: "north" | "south" | "east" | "west"): void {
+  private publishIfPaired(doorId: string): void {
     const state = this.doorState.get(doorId);
     if (state?.pairedSuccessfully && this.onPairingStatusChangedCallback) {
       this.onPairingStatusChangedCallback(doorId, "ACCEPTED");
@@ -1596,7 +1873,6 @@ export class DoorDockingPortSystem {
    * Handle Click Raycasts originating in Three.js coordinates
    */
   public handlePanelRaycast(doorId: string) {
-    const isCardinal = isCardinalDoorId(doorId);
     const pane = document.getElementById("docking-control-pane");
     const title = document.getElementById("docking-pane-title");
     const lockBtn = document.getElementById("docking-lock-toggle");
@@ -1615,8 +1891,14 @@ export class DoorDockingPortSystem {
     const state = this.doorState.get(doorId);
     if (!state) return;
 
-    // Cardinal-only sections: connection assembly, address input, provision, INITIATE.
-    // For free (non-cardinal) doors these features are not available — hide them.
+    // 🚪 EVERY door gets the full terminal now — connection assembly, target
+    // address, provisioning and INITIATE (owner: "any door should allow a
+    // vestibule or docking adapter"). These were hidden for free doors because
+    // a pairing written under a `d:` id was unreadable: readAllDoors iterated a
+    // fixed four-id list, so the record went onto the wire and was read by
+    // nobody, including its own author after a rejoin. With that loop iterating
+    // the map, a free-door pairing is as real as a cardinal one, and the
+    // vestibule geometry never cared — it needs a pose, which every door has.
     const assemblyEl = document.getElementById("docking-assembly");
     const addrSection = addrInput.closest("div") as HTMLElement | null;
     const provisionTemplate = document.getElementById(
@@ -1628,19 +1910,15 @@ export class DoorDockingPortSystem {
     const requestBtn = document.getElementById(
       "docking-request-btn",
     ) as HTMLElement | null;
-    if (assemblyEl) assemblyEl.style.display = isCardinal ? "" : "none";
-    if (addrSection) addrSection.style.display = isCardinal ? "" : "none";
-    if (provisionTemplate) provisionTemplate.style.display = isCardinal ? "" : "none";
-    if (provisionBtn) provisionBtn.style.display = isCardinal ? "" : "none";
-    if (requestBtn) requestBtn.style.display = isCardinal ? "" : "none";
+    for (const el of [assemblyEl, addrSection, provisionTemplate, provisionBtn, requestBtn])
+      if (el) el.style.display = "";
 
     // Expose active door context inside the modal scope
     (pane as any).activeDoorId = doorId;
     pane.style.display = "flex";
-    const wallLabel = this.poseForDoor(doorId).wall.toUpperCase();
-    title.textContent = isCardinal
-      ? `🚪 DOCKING PORT CONTROL: ${wallLabel} WALL`
-      : `🚪 DOOR SETTINGS: ${wallLabel} WALL`;
+    // 🧭 The door's NAME, never a wall: modules render at any angle, so
+    // compass words are meaningless to the person reading this.
+    title.textContent = `🚪 DOCKING PORT CONTROL: ${doorDisplayName(doorId)}`;
 
     // Set field states
     lockBtn.textContent = state.locked ? "LOCKED" : "UNLOCKED";
@@ -1649,6 +1927,24 @@ export class DoorDockingPortSystem {
     pinInput.value = state.pinCode;
     addrInput.value = state.connectedRoomAddress;
 
+    // 🪧 DOOR SIGN — every door, cardinal or free. Read-only without build
+    // rights: signage is construction, so it follows the same gate as docking
+    // and assembly rather than the (public-by-default) lock.
+    const labelInput = document.getElementById(
+      "docking-label-input",
+    ) as HTMLInputElement | null;
+    const labelNote = document.getElementById("docking-label-note");
+    if (labelInput) {
+      const mayLabel = this.canConstruct(doorId);
+      labelInput.value = readAllDoorLayout().get(doorId)?.label ?? "";
+      labelInput.readOnly = !mayLabel;
+      labelInput.style.opacity = mayLabel ? "1" : "0.5";
+      if (labelNote)
+        labelNote.textContent = mayLabel
+          ? "· what is on the other side"
+          : "· no build rights on this door";
+    }
+
     // If there is an active inbound pairing request, reveal target controls
     if (state.pairingPending && !state.pairedSuccessfully) {
       noticeBox.style.display = "flex";
@@ -1656,7 +1952,17 @@ export class DoorDockingPortSystem {
       noticeBox.style.display = "none";
     }
 
-    if (isCardinal) {
+    // 🧭 NEW-MODULE placement editor: only meaningful while this berth could
+    // still take a new module — hidden once paired (the real module replaced
+    // the hypothesis) and for visitors without build rights.
+    const placeRow = document.getElementById("docking-provision-place");
+    const mayProvision =
+      this.canConstruct(doorId) && !state.pairedSuccessfully;
+    if (placeRow) placeRow.style.display = mayProvision ? "flex" : "none";
+    if (mayProvision) this.paintPlacement?.(doorId);
+    else this.removeProvisionGhost();
+
+    {
       // #62 P4: armed-preset prefill — an unpaired door with no working chain
       // opens with the DEV-armed preset's chips already placed (parts consumed
       // atomically; silently skipped when stock is short). RING targets a
@@ -1696,9 +2002,7 @@ export class DoorDockingPortSystem {
    * Works for modules the atlas can PLACE (reachable through known links);
    * an island module it has never seen connected can't be matched.
    */
-  private detectChainContact(
-    doorId: "north" | "south" | "east" | "west",
-  ): void {
+  private detectChainContact(doorId: string): void {
     const slot = document.getElementById("docking-dock-detect");
     if (!slot) return;
     slot.style.display = "none";
@@ -1716,24 +2020,21 @@ export class DoorDockingPortSystem {
 
     // Where would a module sit at this chain's far end? (Room-local = world
     // for the current room — the same frame atlasLayout emits.)
-    const wouldBe = projectionPoseForDoor(doorId, state.segments, undefined);
-    const layout = atlasLayout(
-      currentId,
-      (d, s, f) => projectionPoseForDoor(d, s, f),
-      8,
-    );
+    const wouldBe = projectionPoseForDoor(doorId, state.segments, null);
+    const layout = atlasLayout(currentId, 8);
     let best: {
       roomId: string;
       name: string;
       seed?: string;
       dist: number;
-      door: string;
+      door: { id: string; wall: DoorWall; lateral: number };
     } | null = null;
-    const DOOR_YAW: Record<string, number> = {
-      south: 0,
-      east: Math.PI / 2,
-      north: Math.PI,
-      west: -Math.PI / 2,
+    // The outward yaw of each wall — poseFromWall's values, stated once.
+    const WALL_YAW: Record<DoorWall, number> = {
+      'y+': 0,
+      'x+': Math.PI / 2,
+      'y-': Math.PI,
+      'x-': -Math.PI / 2,
     };
     const angDiff = (a: number, b: number) => {
       let d = (a - b) % (Math.PI * 2);
@@ -1741,16 +2042,43 @@ export class DoorDockingPortSystem {
       if (d < -Math.PI) d += Math.PI * 2;
       return Math.abs(d);
     };
+    // 🧭 A module's candidate doors are its REAL gossiped door set — id, wall
+    // and lateral from the atlas, so a free `d:` door is as connectable as any
+    // cardinal. Only a module whose gossip predates door geometry falls back to
+    // the four hypothetical wall-centre doors the matcher used to assume.
+    const candidateDoors = (
+      roomId: string,
+    ): Array<{ id: string; wall: DoorWall; lateral: number }> => {
+      const out: Array<{ id: string; wall: DoorWall; lateral: number }> = [];
+      // Real doors the atlas knows about — but a door with a targetRoomId is
+      // PAIRED, i.e. an occupied berth, not a candidate for a NEW connection.
+      // (Today the atlas learns doors only FROM pairings, so this arm is empty
+      // until full-layout gossip ships; it is here so free unpaired doors
+      // become candidates the moment that lands. Redo review F1: an
+      // atlas-only candidate set could offer nothing but occupied doors and
+      // broke ring-closing entirely.)
+      for (const [did, ad] of Object.entries(readAtlas()[roomId]?.doors ?? {})) {
+        if (ad?.wall && !ad.targetRoomId)
+          out.push({ id: did, wall: ad.wall, lateral: ad.lateral ?? 0 });
+      }
+      // The four wall-centre hypotheticals — the pre-redo candidate set. A
+      // room can grow a door anywhere, so CONNECT may aim at a wall centre;
+      // the far owner's seed/editor takes it from there.
+      for (const [id, wall] of Object.entries(LEGACY_ID_WALL)) {
+        out.push({ id, wall, lateral: 0 });
+      }
+      return out;
+    };
     for (const mod of layout) {
       const dist = Math.hypot(mod.x - wouldBe.x, mod.z - wouldBe.z);
       if (dist > 4.5 || (best && dist >= best.dist)) continue;
-      // The chain arrives heading wouldBe.rotY (no farDoor ⇒ rotY = heading);
+      // The chain arrives heading wouldBe.rotY (no far wall ⇒ rotY = heading);
       // the matching door of the module faces BACK along it.
       const arrivalFacing = wouldBe.rotY + Math.PI;
-      let doorPick: string | null = null;
+      let doorPick: { id: string; wall: DoorWall; lateral: number } | null = null;
       let doorErr = Math.PI;
-      for (const d of ["north", "south", "east", "west"]) {
-        const err = angDiff(mod.rotY + DOOR_YAW[d], arrivalFacing);
+      for (const d of candidateDoors(mod.roomId)) {
+        const err = angDiff(mod.rotY + WALL_YAW[d.wall], arrivalFacing);
         if (err < doorErr) {
           doorErr = err;
           doorPick = d;
@@ -1774,32 +2102,27 @@ export class DoorDockingPortSystem {
     // reality (a 45° preset relaxes to 40°, bends equalize, the extension
     // slides). Target = the matched door's face, in this door's chain frame.
     const mod = layout.find((m) => m.roomId === best!.roomId)!;
-    const dyaw: Record<string, number> = {
-      south: 0,
-      east: Math.PI / 2,
-      north: Math.PI,
-      west: -Math.PI / 2,
-    };
-    const doorFaceLocal = {
-      north: { x: 0, z: -6 },
-      south: { x: 0, z: 6 },
-      east: { x: 6, z: 0 },
-      west: { x: -6, z: 0 },
-    }[best.door]!;
+    // The matched door's face in ITS module's local frame: on its wall, at its
+    // lateral. (Uniform module half — per-module dims are a later refinement,
+    // matching the exterior's uniform shells.)
+    const pick = best.door;
+    const doorFaceLocal =
+      pick.wall === "y-" ? { x: pick.lateral, z: -6 }
+      : pick.wall === "y+" ? { x: pick.lateral, z: 6 }
+      : pick.wall === "x+" ? { x: 6, z: pick.lateral }
+      : { x: -6, z: pick.lateral };
     const mc = Math.cos(mod.rotY),
       ms = Math.sin(mod.rotY);
     const faceWorld = {
       x: mod.x + doorFaceLocal.x * mc + doorFaceLocal.z * ms,
       z: mod.z - doorFaceLocal.x * ms + doorFaceLocal.z * mc,
     };
-    // Chain frame: origin at OUR door face, +z outward, rotated by our door's yaw.
-    const ourYaw = dyaw[doorId];
-    const ourFace = {
-      north: { x: 0, z: -6 },
-      south: { x: 0, z: 6 },
-      east: { x: 6, z: 0 },
-      west: { x: -6, z: 0 },
-    }[doorId]!;
+    // Chain frame: origin at OUR door face, +z outward, rotated by our door's
+    // yaw — the door's LIVE pose, not a hardcoded wall-centre table, so a slid
+    // cardinal or a free door anywhere on any wall solves correctly.
+    const ourPose = this.poseForDoor(doorId);
+    const ourYaw = ourPose.outwardYaw;
+    const ourFace = { x: ourPose.x, z: ourPose.z };
     const dx = faceWorld.x - ourFace.x,
       dz = faceWorld.z - ourFace.z;
     const oc = Math.cos(-ourYaw),
@@ -1808,7 +2131,7 @@ export class DoorDockingPortSystem {
       x: dx * oc + dz * os,
       z: -dx * os + dz * oc,
       // Chain exit heading must point INTO the matched door.
-      yawRad: mod.rotY + dyaw[best.door] + Math.PI - ourYaw,
+      yawRad: mod.rotY + WALL_YAW[pick.wall] + Math.PI - ourYaw,
     };
     // Normalize the yaw into (-π, π].
     while (targetLocal.yawRad > Math.PI) targetLocal.yawRad -= Math.PI * 2;
@@ -1829,7 +2152,7 @@ export class DoorDockingPortSystem {
       : " · rigid (fit out of range)";
     slot.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
-        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its ${best.door.toUpperCase()} door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
+        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its facing door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
         <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
       </div>`;
     slot.style.display = "block";
@@ -1850,8 +2173,14 @@ export class DoorDockingPortSystem {
           "docking-far-door",
         ) as HTMLSelectElement | null;
         if (addr) addr.value = best!.seed!;
-        if (far) far.value = best!.door;
-        if (st) st.farDoor = best!.door as "north" | "south" | "east" | "west";
+        if (far) far.value = best!.door.id; // no-op for a free id (4 options)
+        if (st) {
+          st.farDoor = best!.door.id;
+          // 🧭 The matcher KNOWS the far wall — it just aimed the chain at it.
+          // Stashing it here is what makes the published pairing fully
+          // described before anyone ever walks through.
+          st.farWall = best!.door.wall;
+        }
         // Fire the normal INITIATE path (all its gates apply).
         document
           .getElementById("docking-request-btn")
@@ -1903,10 +2232,7 @@ export class DoorDockingPortSystem {
    * signals, and tint the emissive 'frameGlow' strips to match:
    * pending amber, paired green, locked red, otherwise cyan.
    */
-  private syncLEDStatus(
-    doorId: "north" | "south" | "east" | "west",
-    state: DockingState,
-  ) {
+  private syncLEDStatus(doorId: string, state: DockingState) {
     const group = this.doorObjects.get(doorId);
     if (!group) return;
 
@@ -1985,7 +2311,14 @@ export class DoorDockingPortSystem {
     state.pairedSuccessfully = accept;
 
     if (accept) {
+      this.removeProvisionGhost(); // the real module replaces the hypothesis
       state.locked = false; // Open door on success
+      // 🧭 Best-effort far wall at pairing time: the atlas may already gossip
+      // the far room's door geometry (someone stood there and harvested it).
+      // Resolved BEFORE the publish below fires, so the record leaves this
+      // client fully described when it can; the first walk-through's mirror
+      // fills it in when it cannot.
+      if (!state.farWall) state.farWall = this.farWallFor(state) ?? undefined;
       this.syncLEDStatus(doorId, state);
       this.drawAdjacentRoomProjection(doorId);
       this.openDoor(doorId);
@@ -1993,9 +2326,13 @@ export class DoorDockingPortSystem {
       state.connectedRoomAddress = "";
       // Vestibule-findings fix (ghost residue): a REJECTED connection's working
       // chain must not linger as a ghost tube on an unpaired door — refund the
-      // parts and drop it.
+      // parts and drop it. The far geometry goes with it — it described the
+      // connection that was just refused (F2, redo review).
       if (state.segments?.length) refundForSegments(state.segments);
       state.segments = undefined;
+      state.farDoor = undefined;
+      state.farWall = undefined;
+      state.farLateral = undefined;
       this.syncLEDStatus(doorId, state);
     }
 
@@ -2016,11 +2353,13 @@ export class DoorDockingPortSystem {
    * pairing is a no-op (drawAdjacentRoomProjection guards on adjacentRooms.has).
    */
   public applyRemotePairing(
-    doorId: DoorId,
+    doorId: string,
     address: string,
     geometry?: {
       segments?: ConnectorSegment[];
-      farDoor?: DoorId;
+      farDoor?: string;
+      farWall?: DoorWall;
+      farLateral?: number;
       farYawDeg?: 0 | 45;
       transient?: boolean;
     },
@@ -2034,6 +2373,11 @@ export class DoorDockingPortSystem {
       JSON.stringify(state.segments ?? null) ===
         JSON.stringify(geometry?.segments ?? null) &&
       state.farDoor === geometry?.farDoor &&
+      // farWall in the diff, or the record gaining a wall (the first
+      // walk-through's mirror enriching an auto pairing) would never re-apply
+      // and the projection would keep its unrotated pose until a reload.
+      state.farWall === geometry?.farWall &&
+      state.farLateral === geometry?.farLateral &&
       state.farYawDeg === geometry?.farYawDeg;
     if (
       state.pairedSuccessfully &&
@@ -2044,6 +2388,8 @@ export class DoorDockingPortSystem {
     state.connectedRoomAddress = address;
     state.segments = geometry?.segments;
     state.farDoor = geometry?.farDoor;
+    state.farWall = geometry?.farWall;
+    state.farLateral = geometry?.farLateral;
     state.farYawDeg = geometry?.farYawDeg;
     state.transient = geometry?.transient === true; // #67 D2
     state.pairingPending = false;
@@ -2059,7 +2405,7 @@ export class DoorDockingPortSystem {
    * projection down, close + re-lock the door. No-op on an already-unpaired door,
    * and (like applyRemotePairing) never fires the publish callback.
    */
-  public clearRemotePairing(doorId: DoorId): void {
+  public clearRemotePairing(doorId: string): void {
     const state = this.doorState.get(doorId);
     if (!state || !state.pairedSuccessfully) return;
     state.pairedSuccessfully = false;
@@ -2067,6 +2413,8 @@ export class DoorDockingPortSystem {
     state.connectedRoomAddress = "";
     state.segments = undefined;
     state.farDoor = undefined;
+    state.farWall = undefined;
+    state.farLateral = undefined;
     state.farYawDeg = undefined;
     state.transient = false;
     state.locked = true;
@@ -2077,7 +2425,7 @@ export class DoorDockingPortSystem {
 
   /** Remove + dispose the adjacent-module gray-box projection (inverse of
    *  drawAdjacentRoomProjection). */
-  private removeAdjacentRoomProjection(doorId: DoorId): void {
+  private removeAdjacentRoomProjection(doorId: string): void {
     const adj = this.adjacentRooms.get(doorId);
     if (!adj) return;
     this.roomsGroup.remove(adj);
@@ -2092,12 +2440,12 @@ export class DoorDockingPortSystem {
    * on the same door overwrites the in-flight slide (its onComplete is
    * dropped); a same-direction request chains the callbacks instead.
    */
-  public openDoor(doorId: DoorId, onComplete?: () => void): void {
+  public openDoor(doorId: string, onComplete?: () => void): void {
     this.startSlide(doorId, true, onComplete);
   }
 
   /** Request the door leaves to slide closed. */
-  public closeDoor(doorId: DoorId, onComplete?: () => void): void {
+  public closeDoor(doorId: string, onComplete?: () => void): void {
     this.startSlide(doorId, false, onComplete);
   }
 
@@ -2126,7 +2474,7 @@ export class DoorDockingPortSystem {
   }
 
   private startSlide(
-    doorId: DoorId,
+    doorId: string,
     open: boolean,
     onComplete?: () => void,
   ): void {
@@ -2238,16 +2586,14 @@ export class DoorDockingPortSystem {
    *  the door to its port through portForDoor (identity today; geometric door↔
    *  port alignment in slice 5), so every caller reads port-keyed state via
    *  this one hop and the alignment lands as a single-function change. */
-  public getDockingState(doorId: DoorId): DockingState | null {
-    return this.doorState.get(portForDoor(doorId) as DoorId) ?? null;
+  public getDockingState(doorId: string): DockingState | null {
+    return this.doorState.get(portForDoor(doorId)) ?? null;
   }
 
   /**
    * Render "Gray Box" Projection of the connected room outside the doorway
    */
-  private drawAdjacentRoomProjection(
-    doorId: "north" | "south" | "east" | "west",
-  ) {
+  private drawAdjacentRoomProjection(doorId: string) {
     // #62 P3: the projection is POSED FROM THE CONNECTION RECORD — the far
     // room's box sits at the folded chain's exit (at its angle) instead of the
     // old hardcoded cardinal 15.2. Legacy pairings (no segments) get the exact
@@ -2255,9 +2601,15 @@ export class DoorDockingPortSystem {
     // re-runs this via applyRemotePairing's geometry diff, so an existing box
     // drawn with the SAME geometry stays; a different one is disposed+redrawn.
     const state = this.doorState.get(doorId);
+    // The key must include everything the POSE depends on — a record gaining
+    // its far wall (the first walk-through's mirror enriching an auto pairing)
+    // re-applies precisely so this redraw can re-pose it (F6, redo review).
+    const farWall = this.farWallFor(state);
     const poseKey = JSON.stringify({
       s: state?.segments ?? null,
       f: state?.farDoor ?? null,
+      w: farWall,
+      l: state?.farLateral ?? 0,
     });
     const existing = this.adjacentRooms.get(doorId);
     if (existing) {
@@ -2277,7 +2629,12 @@ export class DoorDockingPortSystem {
     });
 
     const adjRoom = new THREE.Mesh(roomGeo, roomMat);
-    const pose = projectionPoseForDoor(doorId, state?.segments, state?.farDoor);
+    const pose = projectionPoseForDoor(
+      doorId,
+      state?.segments,
+      farWall, // resolved once above — the same value the poseKey hashed
+      state?.farLateral ?? 0,
+    );
     adjRoom.position.set(pose.x, 2, pose.z);
     adjRoom.rotation.y = pose.rotY;
     adjRoom.userData.poseKey = poseKey;
@@ -2302,6 +2659,24 @@ export class DoorDockingPortSystem {
 
   public onPairingStatusChanged(cb: (doorId: string, status: string) => void) {
     this.onPairingStatusChangedCallback = cb;
+  }
+
+  /**
+   * 🧭 The far door's WALL for a pairing: the record's own farWall when a
+   * walk-through's mirror (or an informed INITIATE) wrote one, else the far
+   * room's gossiped door geometry from the atlas, else null — "unknown", which
+   * renders as no rotation. NEVER inferred from the far door's id: an id names
+   * a door, it does not place one.
+   */
+  private farWallFor(state: DockingState | undefined): DoorWall | null {
+    if (!state) return null;
+    if (state.farWall) return state.farWall;
+    if (state.farDoor && state.connectedRoomAddress) {
+      const rid = roomIdFromSeed(state.connectedRoomAddress);
+      const w = readAtlas()[rid]?.doors[state.farDoor]?.wall;
+      if (w) return w;
+    }
+    return null;
   }
 
   /** #67 D1: passage check for walk-through/transit (world.ts consults this
@@ -2373,11 +2748,10 @@ export class DoorDockingPortSystem {
   }
 
   public repositionDoorGroups(
-    deltas: Record<"north" | "south" | "east" | "west", number>,
   ): void {
+    // 🚪 #18: no delta parameter — every group re-poses from the records.
     for (const [id, group] of this.doorObjects) {
-      const doorId = id as DoorId;
-      const pose = this.poseForDoor(id, deltas[doorId] ?? 0);
+      const pose = this.poseForDoor(id);
       group.position.set(pose.x, 2, pose.z);
       group.rotation.y = pose.frameYaw;
     }
@@ -2431,7 +2805,11 @@ export class DoorDockingPortSystem {
   /** Wire the PROVISION NEW MODULE minting callback (see field docs). The
    *  chosen room template id (from the door-panel dropdown) is passed through. */
   public onProvisionModule(
-    cb: (templateId: string, parentDoorId?: string) => Promise<string | null>,
+    cb: (
+      templateId: string,
+      parentDoorId?: string,
+      placement?: { wall: DoorWall; lateral: number },
+    ) => Promise<string | null>,
   ) {
     this.provisionModuleCallback = cb;
   }

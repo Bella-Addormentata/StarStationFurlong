@@ -19,9 +19,17 @@
  */
 
 import * as THREE from "three";
-import { physicalDoorPose } from "./doorLayout";
+import { physicalDoorPose, poseFromWall } from "./doorLayout";
+import type { DoorWall } from "./doorLayoutDoc";
 
-export type VestibuleDoorId = "north" | "south" | "east" | "west";
+/**
+ * 🚪 A door a vestibule/gangway can hang off. Now `string`: the geometry here
+ * was never cardinal — buildVestibule and the connector chain need only a
+ * POSE (x, z, outwardYaw), which every door has from its layout record. The
+ * narrow type was the only thing saying otherwise, and the owner's ruling is
+ * that any door takes a vestibule.
+ */
+export type VestibuleDoorId = string;
 export type VestibuleLightState = "idle" | "cycling" | "fault";
 
 // ── Palette (matches the lobby's gunmetal / dark-fabric / cyan / amber read)
@@ -47,7 +55,15 @@ const DEPTH = 3.0;
  * it extends OUTWARD from the door wall along the door axis, floor at y=0.
  * Locally it is built along +Z: z=0 is the wall face, z=DEPTH the outer end.
  */
-export function buildVestibule(doorId: VestibuleDoorId): THREE.Group {
+export function buildVestibule(
+  doorId: VestibuleDoorId,
+  // 🧭 Anchor override for NEIGHBOUR rooms' tubes (exterior/backdrop): a
+  // neighbour's door is not in this client's pose snapshot, so anchoring by
+  // its ID would hit the fallback (north wall) while atlasLayout places the
+  // module itself from harvested geometry — the tube would visibly detach
+  // from the module it connects. Same wall+lateral currency as the atlas.
+  at?: { wall: DoorWall; lateral: number },
+): THREE.Group {
   const group = new THREE.Group();
   group.name = "dockingVestibule";
   group.userData = { doorId, isVestibule: true, lightState: "idle" };
@@ -193,7 +209,9 @@ export function buildVestibule(doorId: VestibuleDoorId): THREE.Group {
   //    outward door axis, so the vestibule spans the ~6→9 band. Floor at y=0.
   //    #66 S1: a slid door carries its vestibule anchor along the wall.
   {
-    const p = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+    const p = at
+      ? poseFromWall(at.wall, at.lateral, at.lateral)
+      : physicalDoorPose(doorId);
     group.position.set(p.x, 0, p.z);
     group.rotation.y = p.outwardYaw;
   }
@@ -799,22 +817,9 @@ const LEGACY_PROJECTION_OFFSET = 15.2;
 
 /** Outward-normal yaw of each door in ROOM-LOCAL frame (matches the
  *  buildVestibule placement switch: south faces +Z = yaw 0). */
-// ── 🧱 #66 S1: door-slide deltas (lateral along each door's wall) ────────────
-// world.reconcileDoorPlacements pushes these; every anchor in this module
-// (vestibule placement, projection poses) adds its door's delta on the wall's
-// lateral axis. 0 everywhere ⇒ bit-identical legacy math. Paired doors can't
-// slide (plan §6.2), so live chains never re-solve — the deltas matter for
-// FUTURE pairings and the unpaired-door peek.
-let slideDeltas: Record<VestibuleDoorId, number> = {
-  north: 0,
-  south: 0,
-  east: 0,
-  west: 0,
-};
-
-export function setDoorSlideDeltas(d: Record<VestibuleDoorId, number>): void {
-  slideDeltas = { ...d };
-}
+// 🚪 #18: the door-slide delta plumbing is GONE — a record's lateral is the
+// live position, folded at the read boundary. This module poses doors with
+// plain physicalDoorPose and needs no pushed state.
 
 /**
  * Where (and at what rotation) the FAR room's gray-box projection sits for a
@@ -830,32 +835,105 @@ export function setDoorSlideDeltas(d: Record<VestibuleDoorId, number>): void {
 export function projectionPoseForDoor(
   doorId: VestibuleDoorId,
   segments?: ConnectorSegment[],
-  farDoor?: VestibuleDoorId,
+  farWall?: DoorWall | null,
+  farLateral = 0,
 ): { x: number; z: number; rotY: number } {
-  const doorPose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+  const p = physicalDoorPose(doorId);
+  return projectionPoseFromWall(
+    p.wall,
+    p.tangent === "x" ? p.x : p.z,
+    segments,
+    farWall,
+    farLateral,
+  );
+}
+
+/**
+ * The pose core, in pure {wall, lateral} currency — no door ids anywhere.
+ *
+ * REDONE with the pairing record: the third parameter used to be the far
+ * door's ID, and this function guessed its wall from its name. An id names a
+ * door; it does not place one (a room's record can put "east" on the west
+ * wall, and a free door's id places nothing at all). The far WALL now arrives
+ * from the pairing record / atlas — data written by someone who actually knew
+ * — and an absent wall means "unknown": the box faces the arrival heading
+ * rather than a guessed direction.
+ *
+ * Taking the NEAR side as wall+lateral (not an id) is what lets atlas hops
+ * compose: a neighbour room's door is not in this client's pose snapshot, but
+ * its harvested wall+lateral travel with the atlas entry.
+ */
+export function projectionPoseFromWall(
+  nearWall: DoorWall,
+  nearLateral: number,
+  segments?: ConnectorSegment[],
+  farWall?: DoorWall | null,
+  farLateral = 0,
+): { x: number; z: number; rotY: number } {
+  const doorPose = poseFromWall(nearWall, nearLateral, nearLateral);
   const dYaw = doorPose.outwardYaw;
   const dPos = doorPose;
   if (!segments || segments.length === 0) {
+    // Straight-gangway pairing. Historically rotY was hard 0 — right only for
+    // the opposite-wall case. A known far wall orients it honestly now, and
+    // exactly reproduces the old pose when the far wall IS opposite (rotY
+    // computes to 0 there), so classic renders are bit-identical.
     const distance = LEGACY_PROJECTION_OFFSET - 6;
-    return {
+    const centre = {
       x: dPos.x + Math.sin(dYaw) * distance,
       z: dPos.z + Math.cos(dYaw) * distance,
-      rotY: 0,
     };
+    const rotY0 = farWall
+      ? dYaw + Math.PI - poseFromWall(farWall, 0, 0).outwardYaw
+      : 0;
+    return farWall
+      ? { ...shiftByFarLateral(centre, rotY0, farWall, farLateral), rotY: rotY0 }
+      : { ...centre, rotY: rotY0 };
   }
   const exit = foldChainEnd(segments);
   // Chain-local exit → room frame (rotate by the door's outward yaw).
   const xr = dPos.x + exit.x * Math.cos(dYaw) + exit.z * Math.sin(dYaw);
   const zr = dPos.z - exit.x * Math.sin(dYaw) + exit.z * Math.cos(dYaw);
   const heading = dYaw + exit.yawRad; // world heading at the chain exit
-  const x = xr + Math.sin(heading) * ROOM_HALF;
-  const z = zr + Math.cos(heading) * ROOM_HALF;
-  // Far room rotation: its `farDoor` faces BACK along the arrival heading.
-  const rotY =
-    farDoor !== undefined
-      ? heading + Math.PI - physicalDoorPose(farDoor).outwardYaw
-      : heading;
-  return { x, z, rotY };
+  const centre = {
+    x: xr + Math.sin(heading) * ROOM_HALF,
+    z: zr + Math.cos(heading) * ROOM_HALF,
+  };
+  // Far room rotation: its far door faces BACK along the arrival heading.
+  const rotY = farWall
+    ? heading + Math.PI - poseFromWall(farWall, 0, 0).outwardYaw
+    : heading;
+  return farWall
+    ? { ...shiftByFarLateral(centre, rotY, farWall, farLateral), rotY }
+    : { ...centre, rotY };
+}
+
+/**
+ * 🧭 An OFF-CENTRE far door slides the whole far module sideways: the tube
+ * lands on the door, so a door 2 m along its wall puts the module centre 2 m
+ * the other way. Pure tangent shift — the radial (outward) part of the pose is
+ * untouched, so farLateral 0 reproduces the unshifted pose exactly.
+ * The tangent is module-local (+x along n/s walls, +z along e/w), rotated into
+ * the near room's frame by the module's rotY using the same rotation
+ * convention atlasLayout composes with.
+ */
+function shiftByFarLateral(
+  centre: { x: number; z: number },
+  rotY: number,
+  farWall: DoorWall,
+  farLateral: number,
+): { x: number; z: number } {
+  if (!farLateral) return centre;
+  const t =
+    farWall === "y-" || farWall === "y+"
+      ? { x: farLateral, z: 0 }
+      : { x: 0, z: farLateral };
+  const c = Math.cos(rotY),
+    s = Math.sin(rotY);
+  return {
+    x: centre.x - (t.x * c + t.z * s),
+    z: centre.z - (-t.x * s + t.z * c),
+  };
 }
 
 /**
@@ -868,6 +946,7 @@ export function projectionPoseForDoor(
 export function buildConnectorChain(
   doorId: VestibuleDoorId,
   segments: ConnectorSegment[],
+  at?: { wall: DoorWall; lateral: number }, // see buildVestibule
 ): THREE.Group {
   const group = new THREE.Group();
   group.name = "dockingVestibule"; // world.ts treats chains exactly like vestibules
@@ -913,8 +992,10 @@ export function buildConnectorChain(
   exit.rotation.y = yaw;
   group.add(exit);
 
-  // Same wall-face placement as buildVestibule.
-  const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+  // Same wall-face placement as buildVestibule (or the atlas anchor override).
+  const pose = at
+    ? poseFromWall(at.wall, at.lateral, at.lateral)
+    : physicalDoorPose(doorId);
   group.position.set(pose.x, 0, pose.z);
   group.rotation.y = pose.outwardYaw;
   return group;

@@ -26,8 +26,11 @@ import {
   writeExteriorSlot,
 } from "./exteriorDoc";
 import { readDoorPolicy } from "./doorPolicy";
-import { readDoorDeltas } from "./floorPlanDoc";
 import { physicalDoorPose } from "./doorLayout";
+import {
+  readAllDoorLayout, doorSetIsAuthoritative, doorDisplayName,
+} from "./doorLayoutDoc";
+import type { DoorWall } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
 // hull-equipment block below) instead of the retired fittings dress.
@@ -35,13 +38,11 @@ import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
 import {
-  projectionPoseForDoor,
   buildConnectorChain,
   buildVestibule,
   setVestibuleOpacity,
 } from "./adapter";
 import type { VestibuleDoorId } from "./adapter";
-import type { DoorId } from "./doors";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -51,6 +52,21 @@ import { roomHalfExtents } from "./floorPlanDoc";
  *  with `?octagon=0`; same flag world.ts reads for the interior barrel. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
+
+/** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
+ *  falls back to the id-based pose (old gossip without wall data). Anchoring a
+ *  NEIGHBOUR's tube by id would pose it from the CURRENT room's snapshot while
+ *  atlasLayout places the module from harvested geometry — the tube would
+ *  detach from the module it connects. */
+function doorAnchor(door: {
+  wall?: DoorWall;
+  lateral?: number;
+}): { wall: DoorWall; lateral: number } | undefined {
+  return door.wall !== undefined
+    ? { wall: door.wall, lateral: door.lateral ?? 0 }
+    : undefined;
+}
+
 
 const HULL = 0x39445a;
 const HULL_DARK = 0x2a3444;
@@ -246,10 +262,21 @@ function buildGroup(): THREE.Group {
   // owner's pixel-art reference): white soft-goods torus, black capture
   // latches around the rim, concentric silver guide rings with an X brace,
   // a flank equipment box, and BLUE truss struts back to the hull.
-  const slideDeltas = readDoorDeltas();
-  for (const doorId of ["north", "south", "east", "west"] as const) {
+  // 🔌 Iterate the room's REAL door set, not the four cardinal names: an
+  // adapter can now be installed on a free `d:` door, and it has to grow a
+  // collar out on the hull like any other.
+  //
+  // The unseeded fallback matters (same convention as editMode's door-opening
+  // enumeration): readAllDoorLayout is empty for any room whose owner never
+  // touched the door editor, and iterating it bare would silently delete the
+  // collar from every such room — a regression with no error to notice.
+  const layout = readAllDoorLayout();
+  const doorIds: string[] = doorSetIsAuthoritative()
+    ? [...layout.keys()]
+    : ["north", "south", "east", "west"];
+  for (const doorId of doorIds) {
     if (!readDoorPolicy(doorId).adapter) continue;
-    const pose = physicalDoorPose(doorId, slideDeltas[doorId] ?? 0);
+    const pose = physicalDoorPose(doorId);
     const collar = new THREE.Group();
     collar.name = `dockAdapter-${doorId}`;
     const softGoods = new THREE.MeshStandardMaterial({
@@ -377,12 +404,9 @@ function buildGroup(): THREE.Group {
   const currentRoomId = roomIdGetter();
   lastStationExtent = 0;
   if (currentRoomId) {
-    const poses = atlasLayout(
-      currentRoomId,
-      (doorId, segments, farDoor) =>
-        projectionPoseForDoor(doorId as DoorId, segments, farDoor),
-      8,
-    );
+    // atlasLayout composes its own hop geometry now — near poses from each
+    // room's gossiped wall+lateral, far rotation from the record's farWall.
+    const poses = atlasLayout(currentRoomId, 8);
     for (const pose of poses) {
       lastStationExtent = Math.max(
         lastStationExtent,
@@ -489,8 +513,8 @@ function buildGroup(): THREE.Group {
         drawnEdges.add(key);
         const chain =
           door.segments && door.segments.length > 0
-            ? buildConnectorChain(doorId, door.segments)
-            : buildVestibule(doorId);
+            ? buildConnectorChain(doorId, door.segments, doorAnchor(door))
+            : buildVestibule(doorId, doorAnchor(door));
         // Not editable from the atlas — the bend editor targets the CURRENT
         // room's chain, so clear the flag its click-routing keys on.
         (chain.userData as { isConnectorChain?: boolean }).isConnectorChain =
@@ -620,7 +644,7 @@ function openBendEditor(
   editor.addEventListener("click", (e) => e.stopPropagation());
   const bends = [-45, -22.5, 0, 22.5, 45];
   editor.innerHTML = `
-    <div id="exterior-bend-title">🪗 FLEX JOINT · ${doorId.toUpperCase()} chain #${index + 1} <button type="button" id="exterior-bend-close">✕</button></div>
+    <div id="exterior-bend-title">🪗 FLEX JOINT · ${doorDisplayName(doorId)} chain #${index + 1} <button type="button" id="exterior-bend-close">✕</button></div>
     <div id="exterior-bend-row">${bends
       .map(
         (b) =>

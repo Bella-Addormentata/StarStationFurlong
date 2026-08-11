@@ -37,6 +37,7 @@
  */
 
 import { FURNITURE, FURNITURE_DEFS, footprintAabb } from './furniture';
+import { MIN_DOOR_GAP } from './doorLayout';
 import type { FurnitureItem, FurnitureKind, Rot, Box } from './furniture';
 
 /** Structural wall plane (|x| or |z|) — matches world.addSideWalls / doors. */
@@ -47,17 +48,33 @@ export const WALL_LINE = 6;
  *  chains extend straight out). Value unchanged from the mount work. */
 export const EXT_DOOR_BAND = 1.8;
 
+// 🚪↔🚪 The exterior lane is HALF of why doors must be spaced apart: two
+// adjacent doors' envelopes stop intersecting only past 2 × EXT_DOOR_BAND.
+// doorLayout.MIN_DOOR_GAP states the editor's rule and must stay ≥ that, or
+// the editor would approve two doors whose docking envelopes overlap and only
+// one of them could ever be used. Asserted here rather than in doorLayout so
+// the exterior system owns the number that constrains it.
+if (MIN_DOOR_GAP < 2 * EXT_DOOR_BAND) {
+  console.error(
+    `[hull] MIN_DOOR_GAP (${MIN_DOOR_GAP}) is below two docking envelopes ` +
+      `(${2 * EXT_DOOR_BAND}) — the door editor will approve placements whose ` +
+      `vestibules or berthed ships intersect.`,
+  );
+}
+
 /** Maximum stack layers on a wall (wall item = layer 1). */
 export const STACK_DEPTH_MAX = 3;
 
-export type WallSide = 'north' | 'south' | 'east' | 'west';
+/** 🧭 Axis wall labels — same vocabulary as DoorWall (doorLayoutDoc): the
+ *  plan-view sides x±/y±, where a y± wall sits on the engine's Z axis. */
+export type WallSide = 'x+' | 'x-' | 'y+' | 'y-';
 
 /** Wall-derived rot: local +z (the business end — engine bells) points AWAY
  *  from the room. south outward = +z ⇒ rot 0; east = +x ⇒ rot 1; etc. */
-export const WALL_ROT: Record<WallSide, Rot> = { south: 0, east: 1, north: 2, west: 3 };
+export const WALL_ROT: Record<WallSide, Rot> = { 'y+': 0, 'x+': 1, 'y-': 2, 'x-': 3 };
 
 /** The wall a rot claims (inverse of WALL_ROT). */
-export const ROT_WALL: Record<Rot, WallSide> = { 0: 'south', 1: 'east', 2: 'north', 3: 'west' };
+export const ROT_WALL: Record<Rot, WallSide> = { 0: 'y+', 1: 'x+', 2: 'y-', 3: 'x-' };
 
 /** Is this world position outside the interior square? */
 export function isExteriorPos(pos: { x: number; z: number }): boolean {
@@ -86,21 +103,21 @@ function fpOf(kind: FurnitureKind): { w: number; d: number } {
 
 /** Signed outward (perpendicular) coordinate of a pose on `side`'s axis. */
 function perpOf(side: WallSide, pos: { x: number; z: number }): number {
-  return side === 'south' ? pos.z : side === 'north' ? -pos.z : side === 'east' ? pos.x : -pos.x;
+  return side === 'y+' ? pos.z : side === 'y-' ? -pos.z : side === 'x+' ? pos.x : -pos.x;
 }
 
 /** Along-wall coordinate of a pose on `side`. */
 function alongOf(side: WallSide, pos: { x: number; z: number }): number {
-  return side === 'south' || side === 'north' ? pos.x : pos.z;
+  return side === 'y+' || side === 'y-' ? pos.x : pos.z;
 }
 
 /** World position from (side, along, perp). */
 function poseFrom(side: WallSide, along: number, perp: number): { x: number; z: number } {
   switch (side) {
-    case 'south': return { x: along, z: perp };
-    case 'north': return { x: along, z: -perp };
-    case 'east':  return { x: perp, z: along };
-    case 'west':  return { x: -perp, z: along };
+    case 'y+': return { x: along, z: perp };
+    case 'y-': return { x: along, z: -perp };
+    case 'x+': return { x: perp, z: along };
+    case 'x-': return { x: -perp, z: along };
   }
 }
 
@@ -222,7 +239,7 @@ export function snapExteriorPos(kind: FurnitureKind, x: number, z: number): Exte
   const dW = Math.abs(x + WALL_LINE);
   const dE = Math.abs(x - WALL_LINE);
   const min = Math.min(dN, dS, dW, dE);
-  const side: WallSide = min === dE ? 'east' : min === dW ? 'west' : min === dS ? 'south' : 'north';
+  const side: WallSide = min === dE ? 'x+' : min === dW ? 'x-' : min === dS ? 'y+' : 'y-';
   const rot = WALL_ROT[side];
   const halfW = fp.w / 2;
   const out = WALL_LINE + fp.d / 2;
@@ -230,7 +247,7 @@ export function snapExteriorPos(kind: FurnitureKind, x: number, z: number): Exte
     const s = Math.round(fp.w) % 2 === 1 ? Math.floor(v) + 0.5 : Math.round(v);
     return Math.max(-(WALL_LINE - halfW), Math.min(WALL_LINE - halfW, s));
   };
-  const along = snapAlong(side === 'south' || side === 'north' ? x : z);
+  const along = snapAlong(side === 'y+' || side === 'y-' ? x : z);
   const wallPose: ExteriorPose = { ...poseFrom(side, along, out), rot };
 
   // Stack anchors: nearest wins against the wall pose.

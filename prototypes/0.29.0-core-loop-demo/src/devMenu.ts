@@ -449,7 +449,7 @@ function spawnWallComputer(): void {
     movable: true, // 🖥️ wall-snapped in edit mode; never removable
   };
   commitSpawn(world, item);
-  showHint('DEV: 🖥️ wall computer restored on the south wall.');
+  showHint('DEV: 🖥️ wall computer restored.');
 }
 
 // ── INVENTORY: re-place furniture removed to the room inventory (#53) ────────
@@ -606,7 +606,7 @@ async function toggleVestibule(): Promise<void> {
       if (vestibule) vestibule.visible = !zv || typeof zv.getLevel !== 'function' || zv.getLevel() < 3;
     }, 250);
     refreshDynamicRows();
-    showHint('DEV: vestibule preview spawned outside the east door.');
+    showHint('DEV: vestibule preview spawned outside its door.');
   } catch (e) {
     console.warn('[devMenu] vestibule preview failed to load:', e);
     showHint('DEV: vestibule preview failed to load.');
@@ -869,7 +869,7 @@ function buildPanel(): HTMLDivElement {
         const north = DOORS.find((d) => d.id === 'north');
         if (north) north.enabled = northDoorUnlocked();
         refreshPartsRows();
-        showHint(northDoorUnlocked() ? 'DEV: NORTH door enabled (fireplace overlap is cosmetic).' : 'DEV: NORTH door disabled.');
+        showHint(northDoorUnlocked() ? 'DEV: fireplace door enabled (overlap is cosmetic).' : 'DEV: fireplace door disabled.');
         break;
       }
       case 'copy-seed': {
@@ -959,7 +959,7 @@ function refreshPartsRows(): void {
       <button type="button" data-dev-action="toggle-auto-accept" style="${BTN_STYLE}">${onOff(autoAcceptEnabled())}</button>
     </div>
     <div style="${ROW_STYLE}">
-      <span>🚪 NORTH DOOR (FIREPLACE)</span>
+      <span>🚪 FIREPLACE DOOR</span>
       <button type="button" data-dev-action="toggle-north-door" style="${BTN_STYLE}">${onOff(northDoorUnlocked())}</button>
     </div>
     <div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.55); letter-spacing:1px; margin-top:6px;">MODULE LEDGER</div>

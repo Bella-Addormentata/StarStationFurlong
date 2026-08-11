@@ -17,7 +17,9 @@
  * Geometry matches the door groups placed by docking.ts buildPorts().
  */
 
-import { physicalDoorPose, poseFromWall } from "./doorLayout";
+import {
+  physicalDoorPose, physicalDoorPoseOrNull, poseFromWall,
+} from "./doorLayout";
 import type { PhysicalDoorId } from "./doorLayout";
 import type { DoorLayoutRecord } from "./doorLayoutDoc";
 
@@ -104,7 +106,7 @@ export function rebuildDoors(records: Map<string, DoorLayoutRecord>): void {
       continue;
     }
     const pose = isCardinal
-      ? physicalDoorPose(rec.id as DoorId, 0)
+      ? physicalDoorPose(rec.id)
       : poseFromWall(rec.wall, rec.lateral);
     DOORS.push({
       id: rec.id as DoorId,
@@ -128,18 +130,18 @@ export function findDoor(id: string): DoorTarget | null {
 // The active room layout owns each physical wall pose; floor-plan deltas move
 // that pose along its wall. `enabled` remains owned by room behavior.
 /** Re-derive every door's walk points from its slide delta (0 = legacy). */
-export function applyDoorSlideDeltas(deltas: Record<DoorId, number>): void {
+/** 🚪 #18: re-derive every walk target from the pose snapshot — one currency
+ *  (the record) for every door, where the old delta applier re-posed only the
+ *  four legacy ids from the retired slide store. */
+export function reposeDoorTargets(): void {
   for (const door of DOORS) {
-    // Free/genId doors don't slide via the floor plan (their along-wall position
-    // lives in their layout record) — only the 4 cardinal doors re-derive here.
-    if (
-      door.id !== "north" &&
-      door.id !== "south" &&
-      door.id !== "east" &&
-      door.id !== "west"
-    )
-      continue;
-    const pose = physicalDoorPose(door.id, deltas[door.id] ?? 0);
+    // Honest lookup, skip a miss (fold review F4): at the transit seam this
+    // runs against the DEPARTED room's membership before rebuildDoors prunes
+    // it — its free ids are in no snapshot, and the old delta applier
+    // tolerated exactly that by skipping non-cardinals. The corrected state
+    // lands synchronously two binds later; never warn or mangle meanwhile.
+    const pose = physicalDoorPoseOrNull(door.id);
+    if (!pose) continue;
     door.front.x = pose.front.x;
     door.front.z = pose.front.z;
     door.through.x = pose.through.x;

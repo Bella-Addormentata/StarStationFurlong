@@ -140,10 +140,10 @@ function doorLateralLimit(doorId: DoorId): number {
  *  slide in X (run 2·halfX), e/w in Z (run 2·halfZ); opening + posts stay ~2 m
  *  clear of the corner and never exceed the legacy cap. Default 2×2 room ⇒ 4.0. */
 export function doorLateralLimitForWall(
-  wall: 'north' | 'south' | 'east' | 'west',
+  wall: 'x+' | 'x-' | 'y+' | 'y-',
 ): number {
   const { halfX, halfZ } = roomHalfExtents();
-  const half = wall === 'north' || wall === 'south' ? halfX : halfZ;
+  const half = wall === 'y-' || wall === 'y+' ? halfX : halfZ;
   return Math.max(0, Math.min(DOOR_LATERAL_LIMIT, half - DOOR_LATERAL_CLEARANCE));
 }
 
@@ -236,6 +236,32 @@ export function readDoorDeltas(): Record<DoorId, number> {
     out[id] = lateralOf(id, readDoorPlacement(id)) - lateralOf(id, LEGACY_PLACEMENTS[id]);
   }
   return out;
+}
+
+/**
+ * 🚪 LEGACY READ ONLY — the retired slide store's residual value for a door.
+ *
+ * The `door:` keys used to be the live drag position for the four old door
+ * ids, a SECOND position store beside the layout record. The fold (#18)
+ * retired it: readAllDoorLayout adds this residue into a legacy-id record's
+ * `lateral` at the read boundary, every consumer poses from the record alone,
+ * and any NEW move writes the record and CLEARS this key. So this function's
+ * only caller is the fold itself; when no pre-fold docs remain, it and the
+ * `door:` keys delete together.
+ */
+export function doorSlideDelta(id: string): number {
+  const deltas = readDoorDeltas() as Record<string, number | undefined>;
+  return deltas[id] ?? 0;
+}
+
+/** 🚪 #18: a door's move now writes its RECORD; the old slide entry must go
+ *  with it, or the read-boundary fold would re-add the stale slide on top of
+ *  the freshly written absolute lateral and the door would jump. */
+export function clearDoorSlide(doorId: string): void {
+  if (!docAlive()) return;
+  boundDoc!.transact(() => {
+    planMap!.delete(`door:${doorId}`);
+  });
 }
 
 // ── 📐 Room dimensions read/write (R0 — no consumers yet) ────────────────────
