@@ -367,16 +367,27 @@ export class DoorDockingPortSystem {
       "east",
       "west",
     ];
-    for (const dir of directions) {
-      this.doorState.set(dir, {
-        doorId: dir,
+    for (const dir of directions) this.ensureDoorState(dir);
+  }
+
+  /** The one canonical default `DockingState`. Every site that may need to
+   *  create a door's state (cardinal seeding, layout rebuild, a remote pairing
+   *  arriving before the group exists) goes through here, so the default shape
+   *  cannot drift between them. An existing state is returned untouched. */
+  private ensureDoorState(doorId: string): DockingState {
+    let state = this.doorState.get(doorId);
+    if (!state) {
+      state = {
+        doorId,
         locked: false,
         pinCode: "",
         connectedRoomAddress: "",
         pairingPending: false,
         pairedSuccessfully: false,
-      });
+      };
+      this.doorState.set(doorId, state);
     }
+    return state;
   }
 
   /**
@@ -439,16 +450,7 @@ export class DoorDockingPortSystem {
       : poseFromWall(record.wall, record.lateral);
     // A new door needs its own pairing state so its LED / keypad / slide work
     // (the 4 cardinals are already seeded by initializeDoorStates → no-op).
-    if (!this.doorState.has(cfg.id)) {
-      this.doorState.set(cfg.id, {
-        doorId: cfg.id,
-        locked: false,
-        pinCode: "",
-        connectedRoomAddress: "",
-        pairingPending: false,
-        pairedSuccessfully: false,
-      });
-    }
+    this.ensureDoorState(cfg.id);
       const doorGroup = new THREE.Group();
       doorGroup.position.set(pose.x, 2, pose.z);
       doorGroup.rotation.y = pose.frameYaw;
@@ -727,9 +729,17 @@ export class DoorDockingPortSystem {
       this.doorFadeMats.set(cfg.id, fadeMats);
       this.doorFadeOpacity.set(cfg.id, 1);
 
-      // Paint LED + frame glow from the door's initial state
+      // Paint LED + frame glow from the door's initial state — and if the
+      // RETAINED state says paired (apply-then-rebuild: the remote pairing
+      // landed before this rebuild replaced the group), slide the fresh
+      // leaves open too. Cold load and rebuild-then-apply both end in
+      // applyRemotePairing's openDoor, so this makes the third ordering
+      // converge to the same visual instead of a shut-but-green door.
       const state = this.doorState.get(cfg.id);
-      if (state) this.syncLEDStatus(cfg.id, state);
+      if (state) {
+        this.syncLEDStatus(cfg.id, state);
+        if (state.pairedSuccessfully && !state.locked) this.openDoor(cfg.id);
+      }
 
       // #28 S5a: stash the pose basis so poseForDoor can reposition a free /
       // genId door (reconcile + fade) without a cardinal lookup — onto {isLarge}.
@@ -2382,20 +2392,10 @@ export class DoorDockingPortSystem {
     // nothing ever re-applied — doc paired, room showing "no module
     // connected", vestibule and projection gone. Creating the state here makes
     // the two observer orders converge: apply-then-rebuild keeps this state
-    // (buildDoorGroup only seeds when absent); rebuild-then-apply fills the
-    // fresh one.
-    let state = this.doorState.get(doorId);
-    if (!state) {
-      state = {
-        doorId,
-        locked: false,
-        pinCode: "",
-        connectedRoomAddress: "",
-        pairingPending: false,
-        pairedSuccessfully: false,
-      };
-      this.doorState.set(doorId, state);
-    }
+    // (buildDoorGroup only seeds when absent, and reopens the leaves of a
+    // retained PAIRED state); rebuild-then-apply fills the fresh one and the
+    // openDoor below finds a live group.
+    const state = this.ensureDoorState(doorId);
     // #62 P2: idempotency must diff the GEOMETRY too — a post-pairing chain
     // edit rewrites the record with the same address, and every client must
     // pick it up (P3 rebuilds the chain + reposes the projection on change).
