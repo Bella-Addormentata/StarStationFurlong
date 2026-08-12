@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.34.4 — 2026-08-12
+
+### 🛑📐 Placement you can actually read — your room shows its true shape
+
+Fixes your report that the room looked misaligned while adding a module (#107). Every position and rotation in the data was verified correct — what was broken was what the screen let you see.
+
+- **🛑📐 Your room's real hull appears while you place.** The room view normally draws the interior as an open box, so there was nothing to tell you which way your room's octagon actually faces — exactly when the new module's ghost needed to be read against it. While the placement ghost is up, your room now renders its own translucent octagon shell (true size and orientation), so "my door is on the octagon wall" is visible instead of remembered.
+- **🚂 New modules couple sensibly by default.** Docking off your room's octagon-shaped end now proposes the new module end-to-end — barrels lined up like train cars — instead of the old fixed default that could arrive turned 90° with its door on a flat side wall. Docking off a flat side proposes side-to-side. The ⟳ button still cycles all four orientations, and its angle now always starts at 0° for the proposed default.
+- **🔭 The zoom no longer drifts.** Opening the placement view, riding up to the space view, and closing the panel out there could quietly corrupt the camera zoom — each later placement pulled back further and further (the "zoomed out view is wrong" feeling). The placement framing now hands the camera back before the space view takes over, and picks up again when you return.
+- **🧹 Nothing follows you through a door.** The placement preview (ghost, shell, wide framing, panel) is fully dismissed when you travel to another room, when a pairing is accepted or rejected — locally or by the other side — and whenever the panel hides.
+- **Honest limits.** The translucent room shell shows the hull without its window cutouts; the ghost still previews the standard module footprint until provisioned.
+- **Release line:** version bumped to 0.34.4, all nine locations. **Node binaries UNCHANGED** — frontend-only (TypeScript); no Rust node code changed since v0.33.30.
+
 ## v0.34.3 — 2026-08-11
 
 ### 🔭 The room steps back while you place a module
