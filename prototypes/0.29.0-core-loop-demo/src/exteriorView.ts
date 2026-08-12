@@ -131,6 +131,17 @@ export function setExteriorOwnerCheck(cb: () => boolean): void {
   ownerCheck = cb;
 }
 
+/** 🔭 Injected release for the docking pane's placement framing (same
+ *  injection idiom as the getters above). MUST run before this view
+ *  snapshots `camera.zoom`: the pane deliberately survives into the space
+ *  view, and a baseline captured with the placement factor still applied
+ *  would be restored on descent — dirty zoom that COMPOUNDS on the next
+ *  placement (0.45 → 0.2 → …). */
+let placementFramingRelease: (() => void) | null = null;
+export function setPlacementFramingRelease(cb: () => void): void {
+  placementFramingRelease = cb;
+}
+
 // ── Build ────────────────────────────────────────────────────────────────────
 
 function box(
@@ -879,6 +890,9 @@ export function setExteriorActive(on: boolean): void {
     scene?.add(group);
     renderToolbar();
     if (camera && typeof camera.zoom === "number") {
+      // 🔭 Un-wide the placement framing FIRST so the baseline saved here is
+      // the true room-view zoom (see setPlacementFramingRelease).
+      placementFramingRelease?.();
       savedZoom = camera.zoom;
       applyExteriorZoom(); // frames the whole KNOWN station (atlas extent)
     }
