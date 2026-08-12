@@ -12,6 +12,17 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.34.3 — 2026-08-11
+
+### 🔭 The room steps back while you place a module
+
+One feature, one owner ask (#106): placing a new module is a neighbourhood decision, so the game now shows you the neighbourhood.
+
+- **🔭 Automatic wide framing.** The moment the new-module placement ghost appears, the room view zooms out so your room, the ghost at the end of its connector, **and the surrounding docked modules** are all on screen — rotate and slide the ghost with the full context visible. The instant the ghost goes away (panel closed, module provisioned, door paired), the view returns to exactly where it was.
+- The pull-back is sized so the ghost fits fully in frame at every rotation, with the same feel as the hull-edit framing you already know.
+- **Honest limits.** The wide framing engages from the standard room view only — first person and the dev zoom levels keep their own cameras. The ghost previews the standard module footprint; unusual template sizes still ghost at the default footprint until provisioned.
+- **Release line:** version bumped to 0.34.3, all nine locations. **Node binaries UNCHANGED** — frontend-only (TypeScript); no Rust node code changed since v0.33.30.
+
 ## v0.34.2 — 2026-08-11
 
 ### 🚪 Modules stop vanishing — and the placement ghost shows its spin
