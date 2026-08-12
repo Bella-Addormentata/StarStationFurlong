@@ -3565,6 +3565,11 @@ export class World {
       });
     }
 
+    // 🛑📐 Placement-view sync: the room-shell aid shows only in the iso
+    // room view, and the wide framing re-arms on return to it (it releases
+    // before the exterior view snapshots its own zoom baseline).
+    this.dockingSystem?.syncPlacementView(zoomLevel);
+
     // 🛑🛰️ #80 S5: the neighbour-module shells (the station seen OUT a window)
     // show ONLY in first person — hidden in the iso room view (zoomLevel 2) and
     // the exterior atlas (zoomLevel ≥ 3, which draws its own shells), and during

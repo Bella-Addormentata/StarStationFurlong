@@ -136,6 +136,7 @@ import {
   refreshExteriorView,
   setExteriorOwnerCheck,
   setExteriorRoomId,
+  setPlacementFramingRelease,
   showEnterRoomBubble,
   isExteriorActive,
   tickExterior,
@@ -1311,6 +1312,12 @@ async function joinRoomAtEpoch(
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
+    // 🔭 The space view snapshots camera.zoom on activation — the placement
+    // framing must release FIRST or its wide factor pollutes that baseline
+    // and compounds on every later placement (see setPlacementFramingRelease).
+    setPlacementFramingRelease(() =>
+      world?.dockingSystem?.releasePlacementFraming(),
+    );
     // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
     // in live as the doc syncs (usually within the first second of joining).
     subscribeSharedAtlas(() => {
@@ -1771,6 +1778,11 @@ async function joinRoomAtEpoch(
 async function leaveRoom(): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   sessionEpoch++;
+  // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,
+  // wide framing) must not follow the player into the next room: the docking
+  // system is a boot-time singleton, so nothing else tears these down on a
+  // swap (adversarial review of the placement-context change, 2026-08-12).
+  world?.dockingSystem?.dismissPanel();
   // 🧭 F5: no atlas harvests until the next room's docs are ALL bound — the
   // doors doc binds before the layout/floor-plan docs, and a harvest in that
   // window reads the new room's doors at the OLD room's walls.

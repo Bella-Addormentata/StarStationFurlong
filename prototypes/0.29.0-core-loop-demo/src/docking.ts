@@ -73,7 +73,12 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
-import { doorLateralLimitForWall, clearDoorSlide } from "./floorPlanDoc";
+import {
+  doorLateralLimitForWall,
+  clearDoorSlide,
+  roomHalfExtents,
+} from "./floorPlanDoc";
+import { narrowAxisFor } from "./hullSection";
 import {
   readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed,
 } from "./stationAtlas";
@@ -236,6 +241,29 @@ export class DoorDockingPortSystem {
     camera: THREE.OrthographicCamera;
     zoom: number;
   } | null = null;
+  /** 🛑📐 The room's OWN translucent shell, shown while the ghost lives so
+   *  the hypothesis can be read against the station's true orientation. */
+  private provisionRoomShell: THREE.Group | null = null;
+
+  /** 🔭 Exterior-view hook: un-wide the camera BEFORE the space view
+   *  snapshots its own zoom baseline (see setPlacementFramingRelease in
+   *  exteriorView.ts). The hypothesis itself stays alive. */
+  public releasePlacementFraming(): void {
+    this.restorePlacementFraming();
+  }
+
+  /** 🛑📐 Per-frame sync from world.update: the room-shell aid is an
+   *  ISO-ROOM-VIEW visual only (at zoom ≥ 3 the exterior view draws the
+   *  room's REAL shell at the same origin — z-fight + plugged window holes;
+   *  in first person it sits coplanar with the interior barrel), and the
+   *  wide framing RE-ARMS when the room view returns with a live hypothesis
+   *  (it was released before the exterior view snapshotted its baseline). */
+  public syncPlacementView(zoomLevel: number): void {
+    if (this.provisionRoomShell)
+      this.provisionRoomShell.visible = zoomLevel === 2;
+    if (zoomLevel === 2 && this.provisionGhost && !this.savedFraming)
+      this.applyPlacementFraming();
+  }
 
   private applyPlacementFraming(): void {
     if (this.savedFraming !== null) return; // already wide
@@ -269,10 +297,30 @@ export class DoorDockingPortSystem {
   private choiceFor(doorId: string): { wall: DoorWall; lateral: number } {
     let c = this.provisionChoice.get(doorId);
     if (!c) {
-      c = { wall: "x-", lateral: 0 }; // the old default birth door (was west)
+      c = { wall: this.defaultBirthWall(doorId), lateral: 0 };
       this.provisionChoice.set(doorId, c);
     }
     return c;
+  }
+
+  /** 🧭 Default birth wall MIRRORS the near wall's KIND: docking off the
+   *  room's octagon END gets the module's own end (barrels collinear — train
+   *  coupling), docking off a flat barrel side gets the module's side. The
+   *  old hardcoded 'x-' coupled end-to-side whenever the near door sat on an
+   *  octagon face, which read as the new module arriving turned 90° from the
+   *  station (owner report, 2026-08-12). ⟳ still cycles all four walls. */
+  private defaultBirthWall(doorId: string): DoorWall {
+    const near = this.poseForDoor(doorId).wall;
+    const { halfX, halfZ } = roomHalfExtents();
+    // The near room's octagon ENDS lie on its extrude axis: narrowAxis 'x'
+    // ⇒ barrel runs along z ⇒ the ends are the y± walls (and vice versa).
+    const nearIsEnd =
+      narrowAxisFor(halfX, halfZ) === "x"
+        ? near === "y-" || near === "y+"
+        : near === "x-" || near === "x+";
+    // The module is the standard square shell (narrowAxis ties to 'x'):
+    // ITS ends are y±, its flat barrel sides x±.
+    return nearIsEnd ? "y-" : "x-";
   }
 
   /**
@@ -296,6 +344,9 @@ export class DoorDockingPortSystem {
     );
     const g = new THREE.Group();
     g.name = "provision-ghost";
+    // Which door this hypothesis belongs to — the remote-accept path uses it
+    // to clear a ghost whose door just paired (no pane repaint runs there).
+    g.userData.doorId = doorId;
     const H = 5.9; // uniform module half — matches the projection's ROOM_HALF
     // 🧭 The body must be an octagon shell, not a box: the projection rotates
     // the module so the chosen wall always faces the tube, which means on a
@@ -327,6 +378,22 @@ export class DoorDockingPortSystem {
     g.rotation.y = pose.rotY;
     this.roomsGroup.add(g);
     this.provisionGhost = g;
+    // 🛑📐 The room's OWN hull, translucent at the room origin: the iso room
+    // view renders the interior as an open box (the real barrel is hidden),
+    // so without this the station's true orientation is invisible exactly
+    // when the ghost must be read against it (owner report: "the old room
+    // is misaligned with its actual orientation"). Raycast-inert so door and
+    // floor clicks pass straight through it.
+    const { halfX, halfZ } = roomHalfExtents();
+    const own = buildOctagonShell(
+      { halfX, halfZ },
+      { opacity: 0.2, edge: 0xd4a84b },
+    );
+    own.group.traverse((o) => {
+      o.raycast = () => {};
+    });
+    this.roomsGroup.add(own.group);
+    this.provisionRoomShell = own.group;
     // 🔭 Pull the room view back while the hypothesis lives. Rebuilds pass
     // through removeProvisionGhost first (restore → re-apply, same values),
     // both synchronous — no frame renders between, so nothing flickers.
@@ -335,6 +402,17 @@ export class DoorDockingPortSystem {
 
   private removeProvisionGhost(): void {
     this.restorePlacementFraming();
+    const shell = this.provisionRoomShell;
+    if (shell) {
+      this.provisionRoomShell = null;
+      this.roomsGroup.remove(shell);
+      shell.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (m.geometry) m.geometry.dispose();
+        const mat = (m as { material?: THREE.Material }).material;
+        if (mat) mat.dispose();
+      });
+    }
     const g = this.provisionGhost;
     if (!g) return;
     this.provisionGhost = null;
@@ -1044,15 +1122,7 @@ export class DoorDockingPortSystem {
     const rejectBtn = document.getElementById("docking-reject-btn");
     const box = document.getElementById("docking-control-pane");
 
-    if (closeBtn)
-      closeBtn.addEventListener("click", () => {
-        // Ghost-residue fix: closing without using the prefilled chain refunds it.
-        const pane = document.getElementById("docking-control-pane");
-        const activeDoorId = pane ? (pane as any).activeDoorId : null;
-        if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
-        this.removeProvisionGhost(); // the placement hypothesis dies with the pane
-        if (box) box.style.display = "none";
-      });
+    if (closeBtn) closeBtn.addEventListener("click", () => this.dismissPanel());
 
     // Handle clicks inside the modal to prevent passing them to 3D world floor clicks
     box?.addEventListener("click", (e) => e.stopPropagation());
@@ -1236,6 +1306,10 @@ export class DoorDockingPortSystem {
               `🤝 Auto-accepted pairing on ${activeDoorId} (own minted module).`,
             );
           }
+          // The hypothesis dies with the pane on EVERY hide path — a ghost
+          // (+ room shell + wide framing) left behind here had no pane to
+          // dismiss it until the next pane-open repaint.
+          this.removeProvisionGhost();
           if (box) box.style.display = "none";
         }
       });
@@ -1255,6 +1329,7 @@ export class DoorDockingPortSystem {
           return;
         }
         this.completePairing(activeDoorId, true);
+        this.removeProvisionGhost(); // hypothesis dies with the pane
         if (box) box.style.display = "none";
       });
     }
@@ -1265,6 +1340,7 @@ export class DoorDockingPortSystem {
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
         this.completePairing(activeDoorId, false);
+        this.removeProvisionGhost(); // hypothesis dies with the pane
         if (box) box.style.display = "none";
       });
     }
@@ -1314,10 +1390,13 @@ export class DoorDockingPortSystem {
     const paintPlacement = (doorId: string) => {
       const c = this.choiceFor(doorId);
       // 🧭 Degrees, not walls — the ghost shows the orientation; the button
-      // reports how far the module is turned from its default.
+      // reports how far the module is turned FROM THIS DOOR'S DEFAULT (the
+      // default wall varies by near-wall kind now, so absolute indices
+      // would open some panes at "90°" untouched).
       const order: DoorWall[] = ["x-", "y-", "x+", "y+"];
+      const base = order.indexOf(this.defaultBirthWall(doorId));
       if (placeRotate)
-        placeRotate.textContent = `⟳ ${order.indexOf(c.wall) * 90}°`;
+        placeRotate.textContent = `⟳ ${((order.indexOf(c.wall) - base + 4) % 4) * 90}°`;
       if (placeLat)
         placeLat.textContent =
           c.lateral === 0
@@ -1936,6 +2015,21 @@ export class DoorDockingPortSystem {
   /**
    * Handle Click Raycasts originating in Three.js coordinates
    */
+  /** 🚪 Close the pane AND kill the placement hypothesis (ghost + room shell
+   *  + wide framing). The CLOSE button routes here, and so must every
+   *  programmatic dismissal — this system is a SINGLETON across rooms, so a
+   *  hypothesis left alive at leaveRoom would follow the player into the
+   *  next room as a full-size orphaned shell with the camera still wide
+   *  (adversarial review of the placement-context change, 2026-08-12). */
+  public dismissPanel(): void {
+    const pane = document.getElementById("docking-control-pane");
+    const activeDoorId = pane ? ((pane as any).activeDoorId ?? null) : null;
+    // Ghost-residue fix: closing without using the prefilled chain refunds it.
+    if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
+    this.removeProvisionGhost(); // the placement hypothesis dies with the pane
+    if (pane) pane.style.display = "none";
+  }
+
   public handlePanelRaycast(doorId: string) {
     const pane = document.getElementById("docking-control-pane");
     const title = document.getElementById("docking-pane-title");
@@ -1980,6 +2074,12 @@ export class DoorDockingPortSystem {
     // Expose active door context inside the modal scope
     (pane as any).activeDoorId = doorId;
     pane.style.display = "flex";
+    // 🧭 A fresh pane starts from a fresh placement default: the memoized
+    // choice would otherwise replay a default computed for ANOTHER room
+    // (this system is a singleton across rooms and cardinal ids recur) or
+    // for a wall the door has since been moved away from. Rotations made
+    // while the pane is open still stick — they die with the pane.
+    this.provisionChoice.delete(doorId);
     // 🧭 The door's NAME, never a wall: modules render at any angle, so
     // compass words are meaningless to the person reading this.
     title.textContent = `🚪 DOCKING PORT CONTROL: ${doorDisplayName(doorId)}`;
@@ -2471,6 +2571,11 @@ export class DoorDockingPortSystem {
     state.pairingPending = false;
     state.pairedSuccessfully = true;
     state.locked = false;
+    // 🧭 A remote accept replaces this door's placement hypothesis with the
+    // real module — the local INITIATE path clears it in completePairing,
+    // but no pane repaint runs on this path, so clear it here.
+    if (this.provisionGhost?.userData.doorId === doorId)
+      this.removeProvisionGhost();
     this.syncLEDStatus(doorId, state);
     this.drawAdjacentRoomProjection(doorId);
     this.openDoor(doorId);
@@ -2889,4 +2994,5 @@ export class DoorDockingPortSystem {
   ) {
     this.provisionModuleCallback = cb;
   }
+
 }
