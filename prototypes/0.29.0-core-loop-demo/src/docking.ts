@@ -224,6 +224,47 @@ export class DoorDockingPortSystem {
   /** Paints the placement row + ghost — set by setupPanelListeners' closure,
    *  called from handlePanelRaycast when the pane opens. */
   private paintPlacement: ((doorId: string) => void) | null = null;
+  /** 🔭 Camera framing saved while the placement ghost holds the room view
+   *  WIDE — placing a module is a neighbourhood decision, so the view pulls
+   *  back to show the surrounding modules while the ghost lives (owner ask).
+   *  Same save/scale/restore idiom as hull-edit (editMode.enter('hull')),
+   *  with its own wider factor (see applyPlacementFraming). The CAMERA
+   *  REFERENCE is captured alongside the zoom: a first-person dive swaps the
+   *  live camera slot, and a restore that re-read the slot would strand the
+   *  ortho camera wide (and a later apply would compound the factor). */
+  private savedFraming: {
+    camera: THREE.OrthographicCamera;
+    zoom: number;
+  } | null = null;
+
+  private applyPlacementFraming(): void {
+    if (this.savedFraming !== null) return; // already wide
+    // Only from the plain isometric room view (same guard shape as edit mode):
+    // FP and the dev views own their own cameras/framing.
+    const zoomView = (
+      window as unknown as { multiScaleZoom?: { getLevel?: () => number } }
+    ).multiScaleZoom;
+    if ((zoomView?.getLevel?.() ?? 2) !== 2) return;
+    const camera = window.gameRenderer?.camera;
+    if (!(camera instanceof THREE.OrthographicCamera)) return;
+    this.savedFraming = { camera, zoom: camera.zoom };
+    // 0.45, a notch wider than hull-edit's 0.52: the ghost module's far edge
+    // sits a full room + tube beyond the wall (~22 m out), and at 0.52 its
+    // outer corner still clipped the frame (NDC 1.11, verified numerically).
+    camera.zoom *= 0.45;
+    camera.updateProjectionMatrix();
+  }
+
+  private restorePlacementFraming(): void {
+    const saved = this.savedFraming;
+    if (!saved) return;
+    this.savedFraming = null;
+    // The CAPTURED camera, never the live slot — restoring while a different
+    // camera is live (level-1 dive mid-placement) is exactly the case that
+    // must still un-wide the room view for the return to level 2.
+    saved.camera.zoom = saved.zoom;
+    saved.camera.updateProjectionMatrix();
+  }
 
   private choiceFor(doorId: string): { wall: DoorWall; lateral: number } {
     let c = this.provisionChoice.get(doorId);
@@ -286,9 +327,14 @@ export class DoorDockingPortSystem {
     g.rotation.y = pose.rotY;
     this.roomsGroup.add(g);
     this.provisionGhost = g;
+    // 🔭 Pull the room view back while the hypothesis lives. Rebuilds pass
+    // through removeProvisionGhost first (restore → re-apply, same values),
+    // both synchronous — no frame renders between, so nothing flickers.
+    this.applyPlacementFraming();
   }
 
   private removeProvisionGhost(): void {
+    this.restorePlacementFraming();
     const g = this.provisionGhost;
     if (!g) return;
     this.provisionGhost = null;
