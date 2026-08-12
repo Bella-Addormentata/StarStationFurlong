@@ -224,6 +224,40 @@ export class DoorDockingPortSystem {
   /** Paints the placement row + ghost — set by setupPanelListeners' closure,
    *  called from handlePanelRaycast when the pane opens. */
   private paintPlacement: ((doorId: string) => void) | null = null;
+  /** 🔭 Camera zoom saved while the placement ghost frames WIDE — placing a
+   *  module is a neighbourhood decision, so the room view pulls back to show
+   *  the surrounding modules while the ghost lives (owner ask). Same idiom +
+   *  factor as hull-edit's framing (editMode.enter('hull')); restored when
+   *  the ghost dies. */
+  private savedCameraZoom: number | null = null;
+
+  private applyPlacementFraming(): void {
+    if (this.savedCameraZoom !== null) return; // already wide
+    // Only from the plain isometric room view (same guard shape as edit mode):
+    // FP and the dev views own their own cameras/framing.
+    const zoomView = (
+      window as unknown as { multiScaleZoom?: { getLevel?: () => number } }
+    ).multiScaleZoom;
+    if ((zoomView?.getLevel?.() ?? 2) !== 2) return;
+    const camera = window.gameRenderer?.camera;
+    if (!(camera instanceof THREE.OrthographicCamera)) return;
+    this.savedCameraZoom = camera.zoom;
+    // 0.45, a notch wider than hull-edit's 0.52: the ghost module's far edge
+    // sits a full room + tube beyond the wall (~22 m out), and at 0.52 its
+    // outer corner still clipped the frame (NDC 1.11, verified numerically).
+    camera.zoom *= 0.45;
+    camera.updateProjectionMatrix();
+  }
+
+  private restorePlacementFraming(): void {
+    if (this.savedCameraZoom === null) return;
+    const camera = window.gameRenderer?.camera;
+    if (camera instanceof THREE.OrthographicCamera) {
+      camera.zoom = this.savedCameraZoom;
+      camera.updateProjectionMatrix();
+    }
+    this.savedCameraZoom = null;
+  }
 
   private choiceFor(doorId: string): { wall: DoorWall; lateral: number } {
     let c = this.provisionChoice.get(doorId);
@@ -286,9 +320,14 @@ export class DoorDockingPortSystem {
     g.rotation.y = pose.rotY;
     this.roomsGroup.add(g);
     this.provisionGhost = g;
+    // 🔭 Pull the room view back while the hypothesis lives. Rebuilds pass
+    // through removeProvisionGhost first (restore → re-apply, same values),
+    // both synchronous — no frame renders between, so nothing flickers.
+    this.applyPlacementFraming();
   }
 
   private removeProvisionGhost(): void {
+    this.restorePlacementFraming();
     const g = this.provisionGhost;
     if (!g) return;
     this.provisionGhost = null;
