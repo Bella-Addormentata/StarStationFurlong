@@ -58,21 +58,17 @@ import {
   writeFurnitureItem,
   deleteFurnitureItem,
 } from "./furnitureDoc";
-import { seedRoomTemplate, findTemplate } from "./roomTemplates";
+import {
+  seedRoomTemplate,
+  findTemplate,
+  setRoomThemeWriter,
+} from "./roomTemplates";
 import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
   subscribeDoors,
 } from "./doorsDoc";
-import {
-  CASINO_FURNITURE,
-  CASINO_RETIRED_FURNITURE_IDS,
-  CASINO_ROOM_ID,
-  OUTDOOR_CASINO_ROOM_ID,
-  OUTDOOR_FURNITURE,
-  legacyThemeFromRoomId,
-} from "./furniture";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1316,6 +1312,11 @@ async function joinRoomAtEpoch(
     setPlacementFramingRelease(() =>
       world?.dockingSystem?.releasePlacementFraming(),
     );
+    // 🌌 Applying a template makes the room BE that thing: stamp the theme
+    // into its own doc so the choice persists and reaches every peer.
+    setRoomThemeWriter((theme) =>
+      yjsSync?.doc.getMap("roomInfo").set("theme", theme),
+    );
     // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
     // in live as the doc syncs (usually within the first second of joining).
     subscribeSharedAtlas(() => {
@@ -1485,9 +1486,12 @@ async function joinRoomAtEpoch(
   // to the room's identity so the flagship rooms paint right at the first frame
   // even before roomInfo syncs. `appliedTheme` tracks what we last painted so
   // the roomMap observer only re-applies when the theme genuinely changes.
+  // 🌌 A room's look is a SETTING it carries, like its name — stamped by the
+  // template that made it (or by the owner), never inferred from which room
+  // this is. Unstamped rooms are plain interiors until someone decides
+  // otherwise, which they can do in one click from the template picker.
   const resolveTheme = (): RoomTheme =>
-    (roomMap.get("theme") as RoomTheme | undefined) ??
-    legacyThemeFromRoomId(boot.roomId);
+    (roomMap.get("theme") as RoomTheme | undefined) ?? "interior";
   // 🛰️🚪 The room's RETIRED door arrangement, kept only so the doc layer can
   // read records written before doors became individually placed. Absent ⇒
   // world picks the default. See the compat shim in doorLayoutDoc.
@@ -1500,54 +1504,13 @@ async function joinRoomAtEpoch(
   // 🏝️ Outdoor casino pool room: seed furniture on first entry (the normal
   // claimRoomDefaults path doesn't run for transit joins, so this is the
   // dedicated first-visit seed path). Also applies the outdoor visual theme.
-  if (boot.roomId === OUTDOOR_CASINO_ROOM_ID) {
-    const outdoorEpoch = epoch;
-    void sync.whenServerSynced.then(() => {
-      if (outdoorEpoch !== sessionEpoch) return;
-      // 🏊 Seed the pool layout ONCE per room, then let edits persist (owner
-      // request: the pool + hot tub are movable/removable furniture now, so a
-      // move or removal must survive re-entry). A dedicated marker — not the
-      // old "always rewrite" — still migrates fresh rooms AND stale casino
-      // docs from earlier prototypes (neither carries the marker), but a room
-      // that has already been seeded keeps the player's edits.
-      const roomInfo = sync.doc.getMap("roomInfo");
-      if (!roomInfo.get("poolLayoutSeeded")) {
-        for (const item of OUTDOOR_FURNITURE) {
-          writeFurnitureItem(item);
-        }
-        roomInfo.set("poolLayoutSeeded", true);
-      }
-      // 🪟 Additive one-time: existing pool rooms (already past poolLayoutSeeded)
-      // gain the new ceiling skylights once, without re-seeding the rest — own
-      // marker, so a removed skylight stays gone (deletion persists).
-      if (!roomInfo.get("poolSkylightsV1")) {
-        writeFurnitureItem({ id: "pool-skylight-n", kind: "skylight", pos: { x: 0, z: -2.8 }, rot: 0, movable: true });
-        writeFurnitureItem({ id: "pool-skylight-s", kind: "skylight", pos: { x: 0, z: 2.8 }, rot: 0, movable: true });
-        roomInfo.set("poolSkylightsV1", true);
-      }
-      // 🏊 Retired items: casino fixtures moved back to the lobby — purge
-      // their stale doc entries so old room replicas drop them too (id-only,
-      // harmless when absent; safe to run every entry).
-      deleteFurnitureItem("pool-cashier");
-      deleteFurnitureItem("pool-roulette");
-    });
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
-  } else if (boot.roomId === CASINO_ROOM_ID) {
-    const casinoEpoch = epoch;
-    void sync.whenServerSynced.then(() => {
-      if (casinoEpoch !== sessionEpoch) return;
-      for (const item of CASINO_FURNITURE) {
-        writeFurnitureItem(item);
-      }
-      for (const id of CASINO_RETIRED_FURNITURE_IDS) {
-        deleteFurnitureItem(id);
-      }
-    });
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
-  } else {
-    // Returning to any non-outdoor room (lobby, etc.): restore lobby visuals.
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
-  }
+  // 🛰️ ONE entry path for every room (owner ruling: no room types). Two rooms
+  // used to re-seed their own furniture here on entry, keyed on their ids —
+  // "this room IS the pool", "this room IS the casino" — which is precisely
+  // what a template does now, on demand, in any module: the pool-1/pool-2 and
+  // casino-1 templates carry those exact manifests. A room's contents are its
+  // doc's business; entering only paints what is already there.
+  world?.applyRoomVisuals(undefined, resolveTheme(), resolveDoorLayout());
 
   // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
   // so our KEYED entry (keyB64 + self-cert) wins over any stale pre-Slice-1
@@ -1596,7 +1559,7 @@ async function joinRoomAtEpoch(
     const t = resolveTheme();
     if (t !== appliedTheme) {
       appliedTheme = t;
-      world?.applyRoomVisuals(boot.roomId, undefined, t, resolveDoorLayout());
+      world?.applyRoomVisuals(undefined, t, resolveDoorLayout());
     }
   });
 
@@ -2184,13 +2147,12 @@ async function transitTo(
       seed: depAddress,
     };
     // 🌌 Resolve the arrival room's theme here too (the arrival doc is bound +
-    // synced by now). Passing NO theme would fall back to legacyThemeFromRoomId,
-    // which returns 'interior' for a provisioned deck/casino module (its id is
-    // never an authored constant) — clobbering the correct backdrop the room
-    // observer already painted and desyncing appliedTheme so it can't self-heal.
+    // synced by now) — passing NO theme would repaint it as a plain interior,
+    // clobbering the backdrop the room observer already applied and desyncing
+    // appliedTheme so it could not self-heal.
     const arrivalTheme =
       (yjsSync?.doc.getMap("roomInfo").get("theme") as RoomTheme | undefined) ??
-      legacyThemeFromRoomId(arrivalRoomId);
+      "interior";
     // 🛰️🚪 …and its retired door arrangement, for the same compat reason.
     const arrivalLayoutRaw = yjsSync?.doc.getMap("roomInfo").get("doorLayout");
     const arrivalLayout: LegacyLayoutKind | undefined = isLegacyDoorLayoutKind(
@@ -2198,12 +2160,7 @@ async function transitTo(
     )
       ? arrivalLayoutRaw
       : undefined;
-    world.applyRoomVisuals(
-      arrivalRoomId,
-      arrivalDoorId,
-      arrivalTheme,
-      arrivalLayout,
-    );
+    world.applyRoomVisuals(arrivalDoorId, arrivalTheme, arrivalLayout);
   }
 
   // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY

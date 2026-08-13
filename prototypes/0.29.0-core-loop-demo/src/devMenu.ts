@@ -817,7 +817,9 @@ function buildPanel(): HTMLDivElement {
         const t = applyRoomTemplate(btn.dataset.template ?? '');
         if (!t) break;
         // Furniture rebuilds via the doc subscription (replaceAllFurniture);
-        // now move the doors + walls to the template's layout.
+        // re-derive the door anchors + wall coverage against the new layout.
+        // The DOORS themselves stay put — a template furnishes a room, it does
+        // not re-cut the station's connections (no room types).
         w.reconcileDoorPlacements();
         w.updateSideWallCoverage();
         showHint(`DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces.`);

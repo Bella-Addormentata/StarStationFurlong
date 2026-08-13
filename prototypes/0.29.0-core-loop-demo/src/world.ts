@@ -53,7 +53,6 @@ import {
   furnitureVisualYaw,
   BUNK_TOP_Y,
   rotXZ,
-  legacyThemeFromRoomId,
   POOL_SWIM_Y,
   POOL_WATER_Y,
   DIVE_TIME,
@@ -2212,8 +2211,11 @@ export class World {
     this.platformGroup.add(group);
   }
 
+  /** Paint the room and re-derive everything that depends on its contents.
+   *  Takes NO room id — after the no-room-types ruling there is nothing here
+   *  that may ask which room this is; the look comes from `theme` (the room's
+   *  own setting) and every mechanic from the furniture actually present. */
   public applyRoomVisuals(
-    roomId: string,
     returnDoorId?: DoorId,
     theme?: RoomTheme,
     doorLayout?: LegacyLayoutKind,
@@ -2222,9 +2224,10 @@ export class World {
     // KIND of room this is. Every mechanic that used to key on the two
     // flagship room ids is now driven by what the room CONTAINS — a pool is
     // pool plumbing wherever it sits, a casino is casino furniture wherever
-    // it sits, and one room can hold both. The remaining `roomId` use is the
-    // theme FALLBACK below, which is paint, not mechanics.
-    const resolvedTheme: RoomTheme = theme ?? legacyThemeFromRoomId(roomId);
+    // it sits, and one room can hold both. The room's LOOK is a setting it
+    // carries (stamped by a template or its owner); unstamped ⇒ plain
+    // interior. `roomId` is now only ever logged from here.
+    const resolvedTheme: RoomTheme = theme ?? "interior";
     const deck = resolvedTheme === "outdoor-deck";
     const casinoTheme = resolvedTheme === "casino";
     this.isOutdoorDeck = deck;

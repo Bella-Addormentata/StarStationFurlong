@@ -5973,8 +5973,8 @@ export function snapItemPos(
 // main.ts at runtime (incorporates the current node's WT URL + cert hash so
 // it's always routable). Furniture is seeded on first visit from OUTDOOR_FURNITURE.
 
-/** Stable room ID for the outdoor pool-casino room. */
-export const OUTDOOR_CASINO_ROOM_ID = "ssf-outdoor-casino-pool-v1";
+// 🛰️ RETIRED: OUTDOOR_CASINO_ROOM_ID. This manifest is a TEMPLATE's furniture
+// now (pool-1), placeable in any module — no room id means "the pool room".
 
 /**
  * Default furniture layout for the outdoor pool-casino room.
@@ -6077,29 +6077,19 @@ for (const item of OUTDOOR_FURNITURE) {
 
 // ── Casino Room ─────────────────────────────────────────────────────────────
 
-/** Stable room ID for the casino connected to the lobby's east door. */
-export const CASINO_ROOM_ID = "ssf-casino-v1";
+// 🛰️ RETIRED: CASINO_ROOM_ID — see above. CASINO_FURNITURE is the casino-1
+// template's manifest; a module is a casino because it holds these pieces.
 
 // ── 🌌 Room visual theme ─────────────────────────────────────────────────────
 /**
  * A room's VISUAL biome — what backdrop + lighting scheme applyRoomVisuals
- * paints. Independent of the room's furniture/mechanics: any module can be an
- * 'outdoor-deck' (real space seen through a glass ceiling + warm bright light),
- * not just the authored pool. Stored per-room in roomInfo['theme']; absent ⇒
- * fall back to the room's identity via legacyThemeFromRoomId.
+ * paints. A per-room SETTING, stored in roomInfo['theme'] and stamped by the
+ * template that furnished the room (or by its owner); absent ⇒ 'interior'.
+ * Any module can be an 'outdoor-deck' (real space through a glass ceiling +
+ * warm bright light) or a 'casino' — there is no room whose id means either
+ * (owner ruling 2026-08-13: no room types).
  */
 export type RoomTheme = "interior" | "casino" | "outdoor-deck";
-
-/**
- * Theme for a room that hasn't stamped an explicit roomInfo['theme'] — derived
- * from the authored room-id constants so the flagship rooms paint correctly at
- * the synchronous first frame (no dependency on the roomInfo sync race).
- */
-export function legacyThemeFromRoomId(roomId: string): RoomTheme {
-  if (roomId === OUTDOOR_CASINO_ROOM_ID) return "outdoor-deck";
-  if (roomId === CASINO_ROOM_ID) return "casino";
-  return "interior";
-}
 
 /**
  * Default casino floor. The four door approach lanes stay open, and every
