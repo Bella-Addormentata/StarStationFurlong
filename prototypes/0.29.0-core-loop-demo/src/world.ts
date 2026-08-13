@@ -53,8 +53,6 @@ import {
   furnitureVisualYaw,
   BUNK_TOP_Y,
   rotXZ,
-  CASINO_ROOM_ID,
-  OUTDOOR_CASINO_ROOM_ID,
   legacyThemeFromRoomId,
   POOL_SWIM_Y,
   POOL_WATER_Y,
@@ -397,27 +395,18 @@ export class World {
    *  ONLY while room-editing so the owner sees where the stand slots land as a
    *  table is moved. A reused pool of rings; positioned from STANDS each frame. */
   private standMarkers: THREE.Group | null = null;
-  /** 🏊 "POOL & HOT TUB" sign over the lobby's south door (lazy-built). */
-  private poolSign: THREE.Group | null = null;
-  /** 🎰 Gold "CASINO" lintel over the east door's physical slot. */
-  private casinoSign: THREE.Group | null = null;
-  /** 🚪 #91: which room we're in, for refreshDoorSigns — stashed by
-   *  applyRoomVisuals so the signs can be re-hung on any door change. */
+  /** 🚪 Set once room visuals have been applied, so refreshDoorSigns knows the
+   *  room is ready. It used to carry which of the two flagship rooms we were
+   *  standing in, for signage that asserted room types — see refreshDoorSigns. */
   private doorSignContext: {
-    outdoor: boolean;
-    casino: boolean;
     returnDoorId?: DoorId;
   } | null = null;
-  /** Return-wayfinding engraving for the lobby door in casino/pool rooms. */
-  private lobbySign: THREE.Group | null = null;
-  /** Text-only LOBBY carving applied directly to the casino return door. */
-  private casinoLobbySign: THREE.Group | null = null;
   /** 🪧 AUTHORED door signs — door id → its plaque, built from the room's own
-   *  `doorLayout` records. Unlike the four fields above (welded to a theme and
-   *  a cardinal id at compile time) these are created and destroyed as the
-   *  owner types, and a free `d:` door gets one exactly like a cardinal does.
-   *  Each group stashes `userData.labelText` so a re-render only redraws the
-   *  canvas when the text actually changed. */
+   *  `doorLayout` records. These are THE door signs now (the four built-in
+   *  POOL/CASINO/LOBBY plaques retired with the room types): created and
+   *  destroyed as the owner types, and a free `d:` door gets one exactly like
+   *  a cardinal does. Each group stashes `userData.labelText` so a re-render
+   *  only redraws the canvas when the text actually changed. */
   private doorLabelSigns = new Map<string, THREE.Group>();
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
@@ -1631,81 +1620,22 @@ export class World {
     }
   }
 
+  /**
+   * 🪧 Every door wears the sign its OWNER gave it — and nothing else.
+   *
+   * The four built-in plaques that used to hang here (POOL, CASINO, and two
+   * "back to the LOBBY" engravings) were the last place the world asserted
+   * that a particular room IS a pool or IS a casino: they were hung by
+   * matching a door's pairing against two hard-coded room ids, and shown or
+   * hidden by which of those rooms you were standing in. Any module can be a
+   * pool, a casino, both, or neither (owner ruling 2026-08-13), so that
+   * question no longer has an answer. Authored labels — which already
+   * outranked the built-ins on any door that had one — are the whole story
+   * now, and they work on every door including free `d:` ones.
+   */
   private refreshDoorSigns(): void {
-    const ctx = this.doorSignContext;
-    if (!ctx) return; // no room visuals applied yet — nothing to hang
-    const { outdoor, casino, returnDoorId } = ctx;
-    const layout = readAllDoorLayout();
-    // An empty layout means "no doors" once the room has said so; only an
-    // un-migrated room falls back to asking the built-in DOORS table.
-    const layoutAuthoritative = doorSetIsAuthoritative();
-    const doorExists = (id: DoorId): boolean =>
-      layoutAuthoritative ? layout.has(id) : findDoor(id) !== null;
-    // 🪧 Authored labels win over the built-in theme signs on the same door:
-    // the owner typing "GYM" on the lobby's south door means that door leads to
-    // the gym now, and two plaques would otherwise z-fight in the same slot.
-    const labelled = this.refreshAuthoredDoorLabels(layout);
-    const placeOnDoor = (
-      sign: THREE.Group | null,
-      doorId: DoorId,
-      visible: boolean,
-    ) => {
-      if (!sign) return;
-      if (labelled.has(doorId)) {
-        sign.visible = false;
-        return;
-      }
-      // A sign hangs over a cardinal BERTH. `doorId` can be an arrival door,
-      // and an arrival can now land on a free `d:` door — physicalDoorPose has
-      // no slot for one and would throw, poisoning doorSignContext so every
-      // later reconcile threw too (nothing repositioned, nothing clickable).
-      if (!isCardinalDoorId(doorId)) {
-        sign.visible = false;
-        return;
-      }
-      const pose = physicalDoorPose(doorId);
-      const doorFaceOffset = 0.14;
-      sign.position.set(
-        pose.x + Math.sin(pose.frameYaw) * doorFaceOffset,
-        2.08,
-        pose.z + Math.cos(pose.frameYaw) * doorFaceOffset,
-      );
-      sign.rotation.y = pose.frameYaw + Math.PI;
-      sign.scale.setScalar(
-        doorId === "north" || doorId === "south" ? 0.36 : 0.62,
-      );
-      sign.visible = visible && doorExists(doorId);
-    };
-    // 🧭 The built-in wayfinding plaques hang on the door whose PAIRING
-    // actually leads there — not on a door id. The ids 'south'/'east' were the
-    // last id-keyed signage: correct only in a room whose auto-pair happened
-    // to land there, silently wrong the moment the owner re-paired a door.
-    // (Authored labels still override both — refreshAuthoredDoorLabels.)
-    const doorPairedTo = (roomId: string): DoorId | undefined =>
-      [...readAllDoors()].find(
-        ([, r]) => r.paired && roomIdFromSeed(r.connectedRoomAddress) === roomId,
-      )?.[0] as DoorId | undefined;
-    const poolDoor = doorPairedTo(OUTDOOR_CASINO_ROOM_ID);
-    const casinoDoor = doorPairedTo(CASINO_ROOM_ID);
-    if (poolDoor) placeOnDoor(this.poolSign, poolDoor, !outdoor && !casino);
-    else if (this.poolSign) this.poolSign.visible = false;
-    if (casinoDoor) placeOnDoor(this.casinoSign, casinoDoor, !outdoor && !casino);
-    else if (this.casinoSign) this.casinoSign.visible = false;
-    // 🚪 ORDER-INDEPENDENT on purpose. This used to take the first paired
-    // record out of readAllDoors, which enumerated the four cardinals in a
-    // fixed order; it now iterates the Y.Map, whose order is insertion order.
-    // Left alone, the return sign would silently hop to a different door — and
-    // if that door were a free `d:` one, placeOnDoor's non-cardinal guard below
-    // would hide the sign entirely with nothing in the console. Prefer a
-    // cardinal, then fall back, so the choice cannot depend on map order.
-    const paired = [...readAllDoors()].filter(([, record]) => record.paired);
-    const pairedDoorId =
-      returnDoorId ??
-      ((paired.find(([id]) => isCardinalDoorId(id)) ?? paired[0])?.[0] as
-        | DoorId
-        | undefined);
-    placeOnDoor(this.lobbySign, pairedDoorId ?? "north", outdoor);
-    placeOnDoor(this.casinoLobbySign, pairedDoorId ?? "west", casino);
+    if (!this.doorSignContext) return; // no room visuals applied yet
+    this.refreshAuthoredDoorLabels(readAllDoorLayout());
   }
 
   /**
@@ -1966,54 +1896,6 @@ export class World {
     group.add(front);
     this.platformGroup.add(group);
     return group;
-  }
-
-  private ensurePoolSign(): void {
-    if (!this.poolSign) {
-      this.poolSign = this.makeEngravedSign(
-        "POOL & HOT TUB",
-        {
-          shadow: "rgba(4, 48, 24, 0.98)",
-          light: "rgba(226, 255, 235, 0.98)",
-          face: "#72f59a",
-        },
-        false,
-      );
-    }
-    if (!this.casinoSign) {
-      // High-contrast green matches every directional door engraving.
-      this.casinoSign = this.makeEngravedSign(
-        "CASINO",
-        {
-          shadow: "rgba(4, 48, 24, 0.98)",
-          light: "rgba(226, 255, 235, 0.98)",
-          face: "#72f59a",
-        },
-        false,
-      );
-    }
-    if (!this.lobbySign) {
-      this.lobbySign = this.makeEngravedSign(
-        "LOBBY",
-        {
-          shadow: "rgba(4, 48, 24, 0.98)",
-          light: "rgba(226, 255, 235, 0.98)",
-          face: "#72f59a",
-        },
-        false,
-      );
-    }
-    if (!this.casinoLobbySign) {
-      this.casinoLobbySign = this.makeEngravedSign(
-        "LOBBY",
-        {
-          shadow: "rgba(4, 48, 24, 0.98)",
-          light: "rgba(226, 255, 235, 0.98)",
-          face: "#72f59a",
-        },
-        false,
-      );
-    }
   }
 
   private ensureCasinoDecor(): void {
@@ -2336,14 +2218,12 @@ export class World {
     theme?: RoomTheme,
     doorLayout?: LegacyLayoutKind,
   ): void {
-    const outdoor = roomId === OUTDOOR_CASINO_ROOM_ID;
-    const casino = roomId === CASINO_ROOM_ID;
-    this.isOutdoorRoom = outdoor;
-    // 🌌 Resolve the VISUAL theme (backdrop + lighting) — an explicit roomInfo
-    // theme (passed by the caller) wins; otherwise fall back to the room's
-    // identity. This is SEPARATE from the roomId-keyed MECHANICS below (door
-    // layout, waiter, floor, signs stay keyed on outdoor/casino), so the pool
-    // room keeps its pool plumbing while its backdrop becomes real space.
+    // 🛰️ NO ROOM TYPES (owner ruling 2026-08-13): nothing below may ask what
+    // KIND of room this is. Every mechanic that used to key on the two
+    // flagship room ids is now driven by what the room CONTAINS — a pool is
+    // pool plumbing wherever it sits, a casino is casino furniture wherever
+    // it sits, and one room can hold both. The remaining `roomId` use is the
+    // theme FALLBACK below, which is paint, not mechanics.
     const resolvedTheme: RoomTheme = theme ?? legacyThemeFromRoomId(roomId);
     const deck = resolvedTheme === "outdoor-deck";
     const casinoTheme = resolvedTheme === "casino";
@@ -2358,9 +2238,10 @@ export class World {
     // Nothing downstream branches on this any more. In particular a module born
     // with one door no longer has to ask for "legacy" to get its door centred:
     // seedDoorLayoutSingle writes an authoritative record and the shim skips it.
-    setLegacyRoomDoorLayout(
-      doorLayout ?? (outdoor ? "pool-pairs" : "casino-pairs"),
-    );
+    // The room's OWN stamp only — the id-keyed default ("pool-pairs" for the
+    // pool room, "casino-pairs" for everything else) was room-typing, and it
+    // decided how a legacy record is read, which is a mechanic.
+    setLegacyRoomDoorLayout(doorLayout);
     // …and re-publish the door set, because the shim's output depends on the
     // kind just set. The retired global was read LAZILY inside every pose call,
     // so a kind change took effect on the next pose with no help; a pushed
@@ -2391,19 +2272,17 @@ export class World {
 
     reposeDoorTargets(); // 🚪 #18: one currency — poses from the records
     this.dockingSystem?.repositionDoorGroups();
-    const north = findDoor("north");
-    if (casino && north) north.enabled = true;
-    else this.updateNorthDoorForFireplace();
+    // 🚪 One rule for every room: a door is walkable unless something is
+    // physically in front of it (the fireplace). The casino used to force
+    // its north door enabled purely because of its room id.
+    this.updateNorthDoorForFireplace();
     this.dockingSystem?.refreshDoorInteractivity();
 
-    // 🏊 The pool sign points the way FROM the lobby — hidden inside the pool
-    // room itself (that same door leads back home there). It hangs over the
-    // SOUTH door's PHYSICAL slot, which the paired layout moves to the north
-    // wall — so place it from the live pose, not a hard-coded south spot.
-    this.ensurePoolSign();
     // 🚪 #91: the sign context is stashed so refreshDoorSigns can re-run on
-    // every door change — see that method.
-    this.doorSignContext = { outdoor, casino, returnDoorId };
+    // every door change — see that method. The built-in POOL/CASINO plaques
+    // are gone with the room types: a door says what its OWNER named it
+    // (authored labels, which already won over the built-ins anyway).
+    this.doorSignContext = { returnDoorId };
     this.refreshDoorSigns();
     this.ensureCasinoDecor();
     if (this.casinoDecor) this.casinoDecor.visible = casinoTheme;
@@ -2512,7 +2391,7 @@ export class World {
     this.dockingSystem?.setGhostDoors(deck);
 
     if (this.floorMat) {
-      if (outdoor) {
+      if (deck) {
         // Swap to a stone-tile texture (created once, cached).
         if (!this.outdoorFloorTex)
           this.outdoorFloorTex = this.makeOutdoorFloorTex();
@@ -2554,11 +2433,11 @@ export class World {
         mat.needsUpdate = true;
       }
     });
-    const themeLabel = outdoor
-      ? "outdoor-casino (stone floor)"
-      : casino
-        ? "casino (festival carpet)"
-        : "lobby (wood floor)";
+    const themeLabel = deck
+      ? "stone deck floor"
+      : casinoTheme
+        ? "festival carpet"
+        : "wood floor";
     console.log(
       `🏝️ Room visuals applied: ${themeLabel} · theme=${resolvedTheme}`,
     );

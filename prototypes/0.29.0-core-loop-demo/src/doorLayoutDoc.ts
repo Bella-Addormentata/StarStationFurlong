@@ -166,8 +166,13 @@ function legacySlotFor(
  */
 let compatKind: LegacyLayoutKind = 'legacy';
 
-export function setLegacyRoomDoorLayout(kind: LegacyLayoutKind): void {
-  compatKind = kind;
+/** A room states its retired arrangement in its own doc, or states nothing —
+ *  in which case 'legacy' (the boot default) reads its records. The caller
+ *  used to substitute a kind based on WHICH ROOM this was; that was
+ *  room-typing in the one place that decides how a stored door is read
+ *  (owner ruling 2026-08-13: no room types). */
+export function setLegacyRoomDoorLayout(kind?: LegacyLayoutKind): void {
+  compatKind = kind ?? 'legacy';
 }
 
 export function isLegacyDoorLayoutKind(v: unknown): v is LegacyLayoutKind {

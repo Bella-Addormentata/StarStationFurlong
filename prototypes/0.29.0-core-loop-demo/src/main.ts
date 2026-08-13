@@ -93,10 +93,8 @@ import {
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
   bindDoorLayoutDoc,
-  seedDoorLayoutDefaults,
   seedDoorLayoutSingle,
   doorLayoutDocSize,
-  seedDoorLayoutCentred,
   readAllDoorLayout,
   doorSetIsAuthoritative,
   seedDoorLayoutEmpty,
@@ -1410,25 +1408,16 @@ async function joinRoomAtEpoch(
       // module provisioned from a template therefore never published its door
       // set at all, and stayed in the "unseeded" state that made the next door
       // edit resurrect a full set of cardinals.
-      if (ownsRoom && doorLayoutDocSize() === 0) {
-        // 🧭 A room MINTED THIS SESSION is provably newborn — no client has
-        // ever rendered defaults in it — so it is born with one centred door
-        // per wall instead of capturing the retired paired arrangement.
-        // Anything else being claim-seeded may have history: capture what it
-        // physically shows, moving nothing.
-        if (mintedRoomTemplates.has(boot.roomId)) seedDoorLayoutCentred();
-        // 🛰️🚪 A `module-` id was PROVISIONED FROM A BERTH — it is never a
-        // lobby. mintedRoomTemplates only remembers mints from THIS session,
-        // so after a reload (or node data loss) an empty module doc used to
-        // fall through to the LOBBY defaults below: four paired-arrangement
-        // doors, lobby furniture migrations, and the pool/casino
-        // auto-pairings — a module doc rebuilt as a contaminated lobby
-        // (observed live: module-ff0ab8 carrying south→pool, east→casino).
-        // Doorless is the honest floor: its pairing partner still knows the
-        // birth door, and the owner can place doors.
-        else if (boot.roomId.startsWith("module-")) seedDoorLayoutEmpty();
-        else seedDoorLayoutDefaults();
-      }
+      // 🚪 A room whose door doc is EMPTY gets NO doors — one rule for every
+      // room (owner ruling 2026-08-13: modules are universal, so nothing may
+      // key off what KIND of room this is). The old branch guessed from
+      // identity — session-minted rooms got one centred door per wall,
+      // everything else got four cardinals in the retired paired
+      // arrangement — which is how a reloaded module rebuilt itself as a
+      // lobby. Doorless is the honest floor: a connection re-seeds its own
+      // door on arrival (the healing in transitTo), and the owner places the
+      // rest. A room that already has doors is untouched.
+      if (ownsRoom && doorLayoutDocSize() === 0) seedDoorLayoutEmpty();
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
       // furniture — seed it and skip the lobby default + migration + the
       // outdoor-casino auto-pairing below (all lobby-specific).
@@ -1441,11 +1430,10 @@ async function joinRoomAtEpoch(
         if (tpl) roomMap.set("theme", tpl.theme);
         return;
       }
-      // 🛰️ Same module- guard for everything below: the furniture default,
-      // the migrations, and the pool/casino auto-pairings are all
-      // LOBBY-specific — writing them into a provisioned module's doc is the
-      // contamination path this guard closes.
-      if (boot.roomId.startsWith("module-")) return;
+      // 🪑 The default furnishing of a NEW room. Universal by ruling: this is
+      // "what an unfurnished module comes with", not "what a lobby is" — a
+      // room-kind guard here would be the same mistake as the retired
+      // auto-pairings. Only ever runs on a genuinely empty furniture doc.
       if (ownsRoom && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }
@@ -1481,24 +1469,14 @@ async function joinRoomAtEpoch(
         });
         roomMap.set("lobbyChandelierV1", true);
       }
-      // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
-      // claim (overwrites any stale cert hash from a previous session).
-      if (activeBootstrap) {
-        const outdoorSeed = btoa(
-          JSON.stringify({
-            ...activeBootstrap,
-            roomId: OUTDOOR_CASINO_ROOM_ID,
-          }),
-        );
-        writeDoorPairing("south", outdoorSeed);
-        const casinoSeed = btoa(
-          JSON.stringify({
-            ...activeBootstrap,
-            roomId: CASINO_ROOM_ID,
-          }),
-        );
-        writeDoorPairing("east", casinoSeed);
-      }
+      // 🛰️ RETIRED (owner ruling 2026-08-13, "no defined rooms to the
+      // mechanics of modules"): the claim used to auto-pair this room's
+      // 'south' door to the pool room and 'east' to the casino. That wrote
+      // two other rooms' identities into whatever room was being claimed —
+      // pure room-typing, and the source of the phantom atlas edges (a
+      // provisioned module carrying south→pool / east→casino links it never
+      // had). Connections are made by the owner at a door's terminal now,
+      // exactly like every other connection in the station.
     });
   }
 
@@ -1865,26 +1843,25 @@ const SYNC_GATE_MS = 8_000;
 
 /**
  * Resolve once the freshly-joined room's shared state has converged, or after
- * `timeoutMs` as a fallback (issue #60 P1.3). Normal rooms wait for the host's
- * roomInfo `owner` AND `name`; authored amenity rooms have no roomInfo owner,
- * so their node SyncStep2 is the readiness signal (their furniture seed
- * callbacks are registered on the same promise before transit reaches here).
+ * `timeoutMs` as a fallback (issue #60 P1.3). Ready on EITHER the host's
+ * roomInfo `owner`+`name` arriving OR the node's SyncStep2 landing — one rule
+ * for every room, since "this room has no owner recorded" is a state, not a
+ * kind of room (owner ruling: no room types).
  * Captures the CURRENT session's doc; if a newer session/leave destroys it
  * mid-wait, the timeout still resolves so the curtain never wedges.
  */
-function awaitInitialRoomState(
-  timeoutMs: number,
-  roomId: string,
-): Promise<void> {
+function awaitInitialRoomState(timeoutMs: number): Promise<void> {
   const sync = yjsSync;
   if (!sync) return Promise.resolve();
-  const authoredAmenity =
-    roomId === CASINO_ROOM_ID || roomId === OUTDOOR_CASINO_ROOM_ID;
   const roomMap = sync.doc.getMap("roomInfo");
+  // 🛰️ Ready on EITHER signal, for every room alike (owner ruling: no room
+  // types). The gate used to name the two flagship rooms as the ones with no
+  // owner/name to wait for — but "has no owner yet" is a state any room can
+  // be in, not a kind of room, and a room that never gets those keys used to
+  // stall the curtain for the full timeout. Keys present ⇒ we know the room;
+  // server synced ⇒ we know there are no keys coming.
   const ready = () =>
-    authoredAmenity
-      ? sync.serverSynced
-      : roomMap.has("owner") && roomMap.has("name");
+    sync.serverSynced || (roomMap.has("owner") && roomMap.has("name"));
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -1894,22 +1871,18 @@ function awaitInitialRoomState(
     const finish = () => {
       if (done) return;
       done = true;
-      if (!authoredAmenity) {
-        try {
-          roomMap.unobserve(observer);
-        } catch {
-          /* doc may be destroyed */
-        }
+      try {
+        roomMap.unobserve(observer);
+      } catch {
+        /* doc may be destroyed */
       }
       window.clearTimeout(timer);
       resolve();
     };
     const timer = window.setTimeout(finish, timeoutMs);
-    if (authoredAmenity) {
-      void sync.whenServerSynced.then(finish);
-    } else {
-      roomMap.observe(observer);
-    }
+    // Both signals, always — whichever lands first opens the curtain.
+    void sync.whenServerSynced.then(finish);
+    roomMap.observe(observer);
     // Guard the race between the initial ready() check and observe() attaching.
     if (ready()) finish();
   });
@@ -2048,7 +2021,7 @@ async function performRoomSwap(
     // showing the default name/owner (symptoms 1 & 5). Only foreign joins
     // actually wait — a minted/own room already has owner+name written, and a
     // same-node transit's replica is already populated, so both resolve at once.
-    await awaitInitialRoomState(SYNC_GATE_MS, target.roomId);
+    await awaitInitialRoomState(SYNC_GATE_MS);
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);
@@ -2166,6 +2139,30 @@ async function transitTo(
   if (result instanceof Error) {
     showHint("Dock seal failed.");
     return;
+  }
+
+  // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
+  // data loss, or the doorless claim that replaced the lobby-contamination
+  // path — arrives with ZERO door records, but the DEPARTURE pairing still
+  // knows exactly which door this connection enters through: farDoor was
+  // minted at provision, farWall/farLateral ride the record. Re-seed that
+  // one door before resolving the arrival so the walk-in and the way back
+  // both work. Gated purely on DATA (a `d:` far door + a genuinely doorless
+  // doc — the marker doesn't count toward doorLayoutDocSize), never on a
+  // room id: there are no room types (owner ruling, 2026-08-13).
+  if (
+    depState?.farDoor?.startsWith("d:") &&
+    depState.farWall &&
+    doorLayoutDocSize() === 0
+  ) {
+    seedDoorLayoutSingle(
+      depState.farWall,
+      depState.farLateral ?? 0,
+      depState.farDoor,
+    );
+    console.log(
+      `🩹 Healed doorless arrival: re-seeded ${depState.farDoor} on ${depState.farWall}.`,
+    );
   }
 
   // 🚪 A doorless arrival room has no door to come in through. The mirror
