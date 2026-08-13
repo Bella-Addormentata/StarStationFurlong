@@ -1417,6 +1417,16 @@ async function joinRoomAtEpoch(
         // Anything else being claim-seeded may have history: capture what it
         // physically shows, moving nothing.
         if (mintedRoomTemplates.has(boot.roomId)) seedDoorLayoutCentred();
+        // 🛰️🚪 A `module-` id was PROVISIONED FROM A BERTH — it is never a
+        // lobby. mintedRoomTemplates only remembers mints from THIS session,
+        // so after a reload (or node data loss) an empty module doc used to
+        // fall through to the LOBBY defaults below: four paired-arrangement
+        // doors, lobby furniture migrations, and the pool/casino
+        // auto-pairings — a module doc rebuilt as a contaminated lobby
+        // (observed live: module-ff0ab8 carrying south→pool, east→casino).
+        // Doorless is the honest floor: its pairing partner still knows the
+        // birth door, and the owner can place doors.
+        else if (boot.roomId.startsWith("module-")) seedDoorLayoutEmpty();
         else seedDoorLayoutDefaults();
       }
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
@@ -1431,6 +1441,11 @@ async function joinRoomAtEpoch(
         if (tpl) roomMap.set("theme", tpl.theme);
         return;
       }
+      // 🛰️ Same module- guard for everything below: the furniture default,
+      // the migrations, and the pool/casino auto-pairings are all
+      // LOBBY-specific — writing them into a provisioned module's doc is the
+      // contamination path this guard closes.
+      if (boot.roomId.startsWith("module-")) return;
       if (ownsRoom && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }

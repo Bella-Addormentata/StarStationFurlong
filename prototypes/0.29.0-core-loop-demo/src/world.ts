@@ -4421,6 +4421,16 @@ export class World {
       let target: number;
       if (ghost) {
         target = 0.35; // #62 P4: armed-but-unpaired chain — fixed ghost preview
+      } else if (zoomLevel >= 3) {
+        // 🛰️ Exterior/atlas view: the tube is the station's connective tissue
+        // seen from space — the proximity fade below is a ROOM-view
+        // affordance (resting opacity 0 removes the "pile of dark capsules"
+        // at the walls), but out here the avatar is never near a door, so it
+        // made exactly the CURRENT room's vestibules invisible while the
+        // neighbour↔neighbour links drew solid (owner report 2026-08-13:
+        // "a few of the vestibules are missing or invisible … it seems to
+        // change based on which module you are in").
+        target = 1.0;
       } else if (
         this.transitVestibuleDoorId === door.id ||
         activeDoorId === door.id
