@@ -71,6 +71,13 @@ function b64ToU8(b64: string): Uint8Array {
   return bytes;
 }
 
+/** Constant-length byte equality (both are 32-byte pubkeys in practice). */
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export class YjsSync {
   readonly doc: Y.Doc;
   /**
@@ -88,10 +95,44 @@ export class YjsSync {
   #serverSynced = false;
   #active = false;
 
+  /** 🛰️ Resolves once the doc has applied a frame (SyncStep2 OR Update) from
+   *  the LINKED HOST — correlated by a VERIFIED signature, not timing, not a
+   *  bare author field. The plain `whenServerSynced` fires on the FIRST
+   *  SyncStep2, which commonly lands before the P2P host dial and carries an
+   *  empty replica. Worse, the post-link `resync()` is ALSO answered by the
+   *  local node from its own (still possibly empty) replica. The node's frame
+   *  is UNSIGNED (it holds no identity key); the host browser SIGNS every frame
+   *  it emits (YjsSync.#emitEnvelope). So this gate opens only on a post-link
+   *  frame whose signature cryptographically verified against a non-self author
+   *  — proof the bytes came from the host's live replica, not the node's, and
+   *  not a forgery carrying an unsigned nonzero author. Update frames count too:
+   *  a node-served room's host pushes its state as a signed Update. Never
+   *  rejects; if no verified host frame arrives (ownerless room / solo station)
+   *  the caller's timeout is the fallback, which is safe. */
+  readonly whenLinkedSynced: Promise<void>;
+  #resolveLinkedSynced!: () => void;
+  #linkedSynced = false;
+  #peerLinked = false;
+
   /** True once the node's initial SyncStep2 has applied (the promise above,
    *  as a synchronous probe — Tier A's backfill logic reads it). */
   get serverSynced(): boolean {
     return this.#serverSynced;
+  }
+
+  /** True once a VERIFIED host frame (SyncStep2 or Update) has applied — the
+   *  synchronous probe form of `whenLinkedSynced`. */
+  get linkedSynced(): boolean {
+    return this.#linkedSynced;
+  }
+
+  /** Record that the P2P bridge to the room host has linked (called from the
+   *  bridge `connected` handler, alongside `resync()`). From this point we watch
+   *  for the host's OWN SyncStep2 — a SIGNED one — to open the readiness gate.
+   *  The local node answers every SyncStep1 from its own (possibly empty)
+   *  replica with an UNSIGNED frame, so an unsigned SyncStep2 is never enough. */
+  markPeerLinked(): void {
+    this.#peerLinked = true;
   }
   #writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #seq = 1;
@@ -100,6 +141,9 @@ export class YjsSync {
     this.doc = new Y.Doc();
     this.whenServerSynced = new Promise<void>((resolve) => {
       this.#resolveServerSynced = resolve;
+    });
+    this.whenLinkedSynced = new Promise<void>((resolve) => {
+      this.#resolveLinkedSynced = resolve;
     });
   }
 
@@ -156,35 +200,42 @@ export class YjsSync {
     if (!this.#active) return;
     if (wireEnvelope.kind !== 'ysync' || typeof wireEnvelope.payload !== 'string') return;
     if (wireEnvelope.room && wireEnvelope.room !== this.opts.roomId) return;
-    if (!this.#verifyEnvelope(wireEnvelope)) return; // Slice 2: drop signed-but-invalid
+    const ver = this.#verifyEnvelope(wireEnvelope);
+    if (ver === null) return; // Slice 2: drop signed-but-invalid
     try {
-      this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
+      this.#processInboundYsync(
+        b64ToU8(wireEnvelope.payload),
+        this.#envelopeAuthor(wireEnvelope),
+        ver.verified,
+      );
     } catch (e) {
       console.warn('YjsSync failed ingesting bridged envelope:', e);
     }
   }
 
-  /** Slice 2 verify-before-apply: true if the envelope may be applied. An
-   *  envelope with no author/sig — a legacy client, or the local node's own
-   *  SyncStep2 (the node holds no identity key) — is allowed; a SIGNED envelope
-   *  must verify against its author over the canonical bytes or it's dropped. No
-   *  verify hook wired (prefetch/legacy construction) = allow everything. */
-  #verifyEnvelope(env: { v?: number; kind?: string; seq?: number; author?: string; payload?: string; sig?: string }): boolean {
-    if (!this.opts.verify) return true;
-    if (typeof env.sig !== 'string' || typeof env.author !== 'string' || typeof env.payload !== 'string') return true;
+  /** Slice 2 verify-before-apply. Returns NULL when the envelope must be
+   *  DROPPED (a signed envelope whose signature fails); otherwise a
+   *  `verified` flag: true only when a real signature was cryptographically
+   *  checked against its author — the caller may then TRUST that author as a
+   *  host identity. An unsigned/legacy/local-node envelope is allowed through
+   *  but `verified` is FALSE, so a forged nonzero author with a MISSING sig can
+   *  never be mistaken for the host (PR #108 review). */
+  #verifyEnvelope(env: { v?: number; kind?: string; seq?: number; author?: string; payload?: string; sig?: string }): { verified: boolean } | null {
+    if (!this.opts.verify) return { verified: false }; // legacy/prefetch: applied, never trusted as host
+    if (typeof env.sig !== 'string' || typeof env.author !== 'string' || typeof env.payload !== 'string') return { verified: false }; // unsigned → allow, but not host-proof
     let authorBytes: Uint8Array;
-    try { authorBytes = b64ToU8(env.author); } catch { return true; }
+    try { authorBytes = b64ToU8(env.author); } catch { return { verified: false }; }
     // A 32-byte all-zero author is the Phase-1 dummy → treat as unsigned/legacy.
-    if (authorBytes.length !== 32 || authorBytes.every((b) => b === 0)) return true;
+    if (authorBytes.length !== 32 || authorBytes.every((b) => b === 0)) return { verified: false };
     try {
       const payload = b64ToU8(env.payload);
       const canonical = canonicalSignBytes(env.v ?? 1, this.opts.roomId, env.kind ?? 'ysync', env.seq ?? 0, payload);
       const ok = this.opts.verify(authorBytes, canonical, b64ToU8(env.sig));
       if (!ok) console.warn(`[YjsSync] dropped envelope with INVALID signature (room ${this.opts.roomId}, seq ${env.seq})`);
-      return ok;
+      return ok ? { verified: true } : null; // signed+valid ⇒ trusted author; signed+invalid ⇒ drop
     } catch (e) {
       console.warn('[YjsSync] verify error, dropping envelope:', e);
-      return false;
+      return null;
     }
   }
 
@@ -365,8 +416,15 @@ export class YjsSync {
           // Decode SsfEnvelope from base64 representation on the wire safely
           const wireEnvelope = JSON.parse(new TextDecoder().decode(payloadBytes));
 
-          if (wireEnvelope.kind === 'ysync' && this.#verifyEnvelope(wireEnvelope)) {
-            this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
+          if (wireEnvelope.kind === 'ysync') {
+            const ver = this.#verifyEnvelope(wireEnvelope);
+            if (ver !== null) {
+              this.#processInboundYsync(
+                b64ToU8(wireEnvelope.payload),
+                this.#envelopeAuthor(wireEnvelope),
+                ver.verified,
+              );
+            }
           }
         }
       }
@@ -377,7 +435,18 @@ export class YjsSync {
     }
   }
 
-  #processInboundYsync(payload: Uint8Array) {
+  /** Decode an envelope's author pubkey bytes, or null when absent/dummy —
+   *  the local node holds no identity key, so ITS SyncStep2 always decodes to
+   *  null here; the host browser's frames carry its real (signed) pubkey. */
+  #envelopeAuthor(env: { author?: string }): Uint8Array | null {
+    if (typeof env.author !== 'string') return null;
+    let bytes: Uint8Array;
+    try { bytes = b64ToU8(env.author); } catch { return null; }
+    if (bytes.length !== 32 || bytes.every((b) => b === 0)) return null;
+    return bytes;
+  }
+
+  #processInboundYsync(payload: Uint8Array, author: Uint8Array | null = null, verified = false) {
     let cursor = 0;
 
     const readVarUint = (): number => {
@@ -416,6 +485,24 @@ export class YjsSync {
       if (subtype === 1 && !this.#serverSynced) {
         this.#serverSynced = true;
         this.#resolveServerSynced();
+      }
+      // 🛰️ The readiness gate opens only on a frame from the LINKED HOST —
+      // correlated by a VERIFIED signature, not timing, not a bare author field.
+      // The local node also answers the post-link resync() from its own
+      // (possibly still-empty) replica, and its frame is UNSIGNED; a forged
+      // envelope can carry a nonzero author with NO signature and pass the old
+      // check. Requiring `verified` (a real signature that passed
+      // #verifyEnvelope) proves the bytes came from the host's live replica.
+      // Both SyncStep2 AND Update count: a node-served ownerless room may never
+      // send a signed SyncStep2, but its host pushes the room state as a signed
+      // Update — accepting either is what lets those rooms converge at all.
+      const fromHost =
+        verified &&
+        author !== null &&
+        !bytesEq(author, this.opts.authorPub?.() ?? new Uint8Array(32));
+      if ((subtype === 1 || subtype === 2) && this.#peerLinked && fromHost && !this.#linkedSynced) {
+        this.#linkedSynced = true;
+        this.#resolveLinkedSynced();
       }
       console.log(`✅ YjsSync Handshake Complete for Y.Doc room replica!`);
     }

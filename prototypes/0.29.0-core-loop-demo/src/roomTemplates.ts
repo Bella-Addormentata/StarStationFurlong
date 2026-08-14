@@ -1,27 +1,35 @@
-/**
+﻿/**
  * 🏗️ Room templates — RollerCoaster-Tycoon-style one-click room presets.
  *
- * Each template is a FULL room design: a furniture layout plus the door
- * arrangement it was authored for. Placing one REPLACES the current room's
- * furniture and switches the door layout to match (so the camera-near edges
- * line up with the design). Build piece-by-piece with the dev menu's furniture
- * spawner instead when you want to compose your own room.
+ * Each template is a FULL room design: a furniture layout plus the visual
+ * theme it was authored for. Placing one REPLACES the current room's furniture
+ * and stamps its theme; the room's DOORS are left exactly as they are, because
+ * doors belong to the station's shape, not to the furniture in a room. Build
+ * piece-by-piece with the dev menu's furniture spawner instead when you want to
+ * compose your own room.
  *
- * The three built-ins reuse the EXACT manifests the authored rooms already ship
- * (lobby / casino / pool), so a template is guaranteed to match its room.
+ * Templates are how a module BECOMES something. There are no room types in the
+ * mechanics (owner ruling 2026-08-13) — a room is a casino because it holds
+ * casino furniture, a pool because it holds a pool, and it can hold both. This
+ * registry is the one-click way to get that furniture in, and applying one
+ * STAMPS the room's theme so the choice persists like any other room setting.
+ * The lobby / casino / pool built-ins reuse the EXACT manifests the two
+ * originally-authored rooms shipped, so provisioning one reproduces them.
  *
- * Dev tool for now (wired into the DEV menu). Not yet: persisting a placed
- * layout's door arrangement across reload, the lighting/waiter theme swap
- * (still roomId-keyed in world.applyRoomVisuals), and R2 room-size presets.
+ * Not yet: R2 room-size presets.
  */
 
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
 import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
-import {
-  setLegacyRoomDoorLayout,
-  type LegacyLayoutKind,
-} from "./doorLayoutDoc";
+
+/** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
+ *  room's theme into its own roomInfo doc, so "this module is a casino now"
+ *  survives a reload and reaches every peer. Absent until init. */
+let roomThemeWriter: ((theme: RoomTheme) => void) | null = null;
+export function setRoomThemeWriter(cb: (theme: RoomTheme) => void): void {
+  roomThemeWriter = cb;
+}
 
 /** The room "type"; each can have multiple design variants (casino-1, -2, …).
  *  "blank" is the empty starting point (folds in empty-by-default); "deck" is
@@ -44,8 +52,6 @@ export interface RoomTemplate {
   description: string;
   /** The furniture layout to place (cloned on apply — the source is never mutated). */
   items: FurnitureItem[];
-  /** The door arrangement the layout was designed for. */
-  doorLayout: LegacyLayoutKind;
   /** 🌌 Visual theme stamped into the room's roomInfo on provision — an
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
@@ -82,7 +88,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       // The deck-1 template already avoids the collision the same way.
       { id: "empty-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
     ],
-    doorLayout: "casino-pairs",
+
     theme: "interior",
   },
   {
@@ -92,7 +98,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     description:
       "Clone-vat lounge — centre sofa cluster, map table, bunk, storage, paired doors.",
     items: FURNITURE,
-    doorLayout: "casino-pairs",
+
     theme: "interior",
   },
   {
@@ -102,7 +108,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     description:
       "Roulette + game tables, two cashiers, lounge seating, gold trim, paired doors.",
     items: CASINO_FURNITURE,
-    doorLayout: "casino-pairs",
+
     theme: "casino",
   },
   {
@@ -113,7 +119,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       "Infinity pool, bridge to the hot tub, dive tower between the twin doors, beach cafés — under open space with skylights.",
     // OUTDOOR_FURNITURE already carries the pool + its ceiling skylights.
     items: OUTDOOR_FURNITURE,
-    doorLayout: "pool-pairs",
+
     theme: "outdoor-deck",
   },
   {
@@ -145,7 +151,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       { id: "opot-1", kind: "blossom-pot", pos: { x: 2.55, z: 4.75 }, rot: 0, movable: true },
       { id: "opot-2", kind: "blossom-pot", pos: { x: 4.6, z: 2.6 }, rot: 0, movable: true },
     ],
-    doorLayout: "pool-pairs",
+
     theme: "outdoor-deck",
   },
   {
@@ -165,7 +171,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       { id: "deck-pot-1", kind: "blossom-pot", pos: { x: 3, z: -2 }, rot: 0, movable: true },
       { id: "deck-pot-2", kind: "blossom-pot", pos: { x: -3, z: 2 }, rot: 0, movable: true },
     ],
-    doorLayout: "casino-pairs",
+
     theme: "outdoor-deck",
   },
   // Planned variants (author via EXPORT, then paste here):
@@ -191,22 +197,30 @@ export function findTemplate(id: string): RoomTemplate | null {
 
 /**
  * Place a template into the CURRENT room: atomically replace all furniture with
- * the template's layout and switch to its door arrangement. Returns the applied
- * template (or null for an unknown id). The caller refreshes the door geometry
- * afterwards (world.reconcileDoorPlacements) so the doors move to the new slots.
+ * the template's layout and stamp its theme into the room's roomInfo doc. The
+ * room's DOORS are deliberately left untouched — a template furnishes a room,
+ * it does not re-cut the station's connections (no room types; doors belong to
+ * the station's shape, not to the furniture in a room). Returns the applied
+ * template (or null for an unknown id). The caller re-derives door anchors and
+ * wall coverage afterwards (world.reconcileDoorPlacements) so the geometry
+ * matches the (unchanged) door set against the new layout.
  */
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
   replaceAllFurniture(cloneItems(t.items));
-  setLegacyRoomDoorLayout(t.doorLayout);
+  // 🌌 …and the room IS this now: stamping the theme makes the change
+  // persistent and shared, instead of a look that lasted until the next
+  // reload re-resolved it from nothing.
+  roomThemeWriter?.(t.theme);
   return t;
 }
 
 /**
- * Seed a freshly-minted room with a template's FURNITURE (the door layout is
- * applied per-room by world.applyRoomVisuals on entry, so it's not set here).
- * Used by the door-panel provisioning flow. Returns false for an unknown id.
+ * Seed a freshly-minted room with a template's FURNITURE. Only the furniture
+ * is placed — the room's doors are left untouched (a template furnishes a
+ * room, it does not re-cut the station's connections: no room types). Used by
+ * the door-panel provisioning flow. Returns false for an unknown id.
  */
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);

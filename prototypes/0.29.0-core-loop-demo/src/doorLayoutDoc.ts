@@ -166,8 +166,13 @@ function legacySlotFor(
  */
 let compatKind: LegacyLayoutKind = 'legacy';
 
-export function setLegacyRoomDoorLayout(kind: LegacyLayoutKind): void {
-  compatKind = kind;
+/** A room states its retired arrangement in its own doc, or states nothing —
+ *  in which case 'legacy' (the boot default) reads its records. The caller
+ *  used to substitute a kind based on WHICH ROOM this was; that was
+ *  room-typing in the one place that decides how a stored door is read
+ *  (owner ruling 2026-08-13: no room types). */
+export function setLegacyRoomDoorLayout(kind?: LegacyLayoutKind): void {
+  compatKind = kind ?? 'legacy';
 }
 
 export function isLegacyDoorLayoutKind(v: unknown): v is LegacyLayoutKind {
@@ -436,6 +441,22 @@ export function markDoorSetAuthoritative(): void {
 export function doorSetIsAuthoritative(): boolean {
   if (!docAlive()) return false;
   if (doorLayoutDocSize() > 0) return true;
+  const m = doorLayoutMap!.get(META_KEY);
+  return typeof m === 'object' && m !== null && (m as { v?: unknown }).v === 1;
+}
+
+/**
+ * True ONLY for an authoritative-EMPTY room: the marker is present and there
+ * are no door records. This is the one case birth-door healing may repair —
+ * the room has stated "I have no doors", and a connection's farDoor record is
+ * the evidence that one was lost. A legacy UNMARKED empty room returns false
+ * here: its missing marker means "un-migrated; render the four defaults", and
+ * seeding it would convert that legacy fallback into an authoritative one-door
+ * set (reaping the other three). Never heal the unmarked case.
+ */
+export function doorSetIsMarkedEmpty(): boolean {
+  if (!docAlive()) return false;
+  if (doorLayoutDocSize() > 0) return false;
   const m = doorLayoutMap!.get(META_KEY);
   return typeof m === 'object' && m !== null && (m as { v?: unknown }).v === 1;
 }

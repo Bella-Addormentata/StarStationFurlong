@@ -58,21 +58,17 @@ import {
   writeFurnitureItem,
   deleteFurnitureItem,
 } from "./furnitureDoc";
-import { seedRoomTemplate, findTemplate } from "./roomTemplates";
+import {
+  seedRoomTemplate,
+  findTemplate,
+  setRoomThemeWriter,
+} from "./roomTemplates";
 import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
   subscribeDoors,
 } from "./doorsDoc";
-import {
-  CASINO_FURNITURE,
-  CASINO_RETIRED_FURNITURE_IDS,
-  CASINO_ROOM_ID,
-  OUTDOOR_CASINO_ROOM_ID,
-  OUTDOOR_FURNITURE,
-  legacyThemeFromRoomId,
-} from "./furniture";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -93,13 +89,13 @@ import {
 import { physicalDoorPoseOrNull } from "./doorLayout";
 import {
   bindDoorLayoutDoc,
-  seedDoorLayoutDefaults,
   seedDoorLayoutSingle,
   doorLayoutDocSize,
-  seedDoorLayoutCentred,
   readAllDoorLayout,
   doorSetIsAuthoritative,
+  doorSetIsMarkedEmpty,
   seedDoorLayoutEmpty,
+  seedDoorLayoutDefaults,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -1083,6 +1079,11 @@ async function joinRoomAtEpoch(
             // dial finished and was relayed to an empty neighbor set, so the host
             // never sent its (static) room state. Re-issue SyncStep1 now that the
             // host is a live neighbor to pull the roster / room name / furniture.
+            // Mark the link first so the SyncStep2 this resync pulls is the one
+            // that opens the post-link readiness gate (whenLinkedSynced) — the
+            // arrival curtain + birth-door healing wait on THAT, not the empty
+            // pre-link handshake.
+            yjsSync?.markPeerLinked();
             yjsSync?.resync();
           } else if (status.status === "failed") {
             setNetworkRow(
@@ -1318,6 +1319,11 @@ async function joinRoomAtEpoch(
     setPlacementFramingRelease(() =>
       world?.dockingSystem?.releasePlacementFraming(),
     );
+    // 🌌 Applying a template makes the room BE that thing: stamp the theme
+    // into its own doc so the choice persists and reaches every peer.
+    setRoomThemeWriter((theme) =>
+      yjsSync?.doc.getMap("roomInfo").set("theme", theme),
+    );
     // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
     // in live as the doc syncs (usually within the first second of joining).
     subscribeSharedAtlas(() => {
@@ -1410,14 +1416,23 @@ async function joinRoomAtEpoch(
       // module provisioned from a template therefore never published its door
       // set at all, and stayed in the "unseeded" state that made the next door
       // edit resurrect a full set of cardinals.
+      // 🚪 An empty door doc means ONE of two things, and getting it wrong is
+      // destructive (PR #108 review): marking it AUTHORITATIVE-empty makes
+      // reconcileDoorLayout's non-unseeded path reap every existing pairing —
+      // so an owner RELOADING a legacy room would erase all its connections.
+      //
+      // • PROVABLY FRESH room (minted this session — it has a provision record
+      //   or a claimed berth): born with no doors of its own, so mark it empty.
+      //   A connection re-seeds its own door on arrival (the healing in
+      //   transitTo), and the owner places the rest.
+      // • LEGACY room (no minted record — it predates the doorLayout store):
+      //   its empty map means "un-migrated; render the four defaults", NOT
+      //   "no doors". MIGRATE it: write the visible default records so the set
+      //   becomes authoritative WITHOUT reaping the pairings those doors carry.
+      const mintedHere = mintedRoomTemplates.get(boot.roomId);
       if (ownsRoom && doorLayoutDocSize() === 0) {
-        // 🧭 A room MINTED THIS SESSION is provably newborn — no client has
-        // ever rendered defaults in it — so it is born with one centred door
-        // per wall instead of capturing the retired paired arrangement.
-        // Anything else being claim-seeded may have history: capture what it
-        // physically shows, moving nothing.
-        if (mintedRoomTemplates.has(boot.roomId)) seedDoorLayoutCentred();
-        else seedDoorLayoutDefaults();
+        if (mintedHere) seedDoorLayoutEmpty();
+        else seedDoorLayoutDefaults(); // legacy: keep the visible four, marked authoritative
       }
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
       // furniture — seed it and skip the lobby default + migration + the
@@ -1431,6 +1446,10 @@ async function joinRoomAtEpoch(
         if (tpl) roomMap.set("theme", tpl.theme);
         return;
       }
+      // 🪑 The default furnishing of a NEW room. Universal by ruling: this is
+      // "what an unfurnished module comes with", not "what a lobby is" — a
+      // room-kind guard here would be the same mistake as the retired
+      // auto-pairings. Only ever runs on a genuinely empty furniture doc.
       if (ownsRoom && furnitureDocSize() === 0) {
         seedFurnitureDefaults();
       }
@@ -1466,24 +1485,14 @@ async function joinRoomAtEpoch(
         });
         roomMap.set("lobbyChandelierV1", true);
       }
-      // 🏝️ Auto-pair the south door to the outdoor casino pool room on every
-      // claim (overwrites any stale cert hash from a previous session).
-      if (activeBootstrap) {
-        const outdoorSeed = btoa(
-          JSON.stringify({
-            ...activeBootstrap,
-            roomId: OUTDOOR_CASINO_ROOM_ID,
-          }),
-        );
-        writeDoorPairing("south", outdoorSeed);
-        const casinoSeed = btoa(
-          JSON.stringify({
-            ...activeBootstrap,
-            roomId: CASINO_ROOM_ID,
-          }),
-        );
-        writeDoorPairing("east", casinoSeed);
-      }
+      // 🛰️ RETIRED (owner ruling 2026-08-13, "no defined rooms to the
+      // mechanics of modules"): the claim used to auto-pair this room's
+      // 'south' door to the pool room and 'east' to the casino. That wrote
+      // two other rooms' identities into whatever room was being claimed —
+      // pure room-typing, and the source of the phantom atlas edges (a
+      // provisioned module carrying south→pool / east→casino links it never
+      // had). Connections are made by the owner at a door's terminal now,
+      // exactly like every other connection in the station.
     });
   }
 
@@ -1492,9 +1501,12 @@ async function joinRoomAtEpoch(
   // to the room's identity so the flagship rooms paint right at the first frame
   // even before roomInfo syncs. `appliedTheme` tracks what we last painted so
   // the roomMap observer only re-applies when the theme genuinely changes.
+  // 🌌 A room's look is a SETTING it carries, like its name — stamped by the
+  // template that made it (or by the owner), never inferred from which room
+  // this is. Unstamped rooms are plain interiors until someone decides
+  // otherwise, which they can do in one click from the template picker.
   const resolveTheme = (): RoomTheme =>
-    (roomMap.get("theme") as RoomTheme | undefined) ??
-    legacyThemeFromRoomId(boot.roomId);
+    (roomMap.get("theme") as RoomTheme | undefined) ?? "interior";
   // 🛰️🚪 The room's RETIRED door arrangement, kept only so the doc layer can
   // read records written before doors became individually placed. Absent ⇒
   // world picks the default. See the compat shim in doorLayoutDoc.
@@ -1503,58 +1515,22 @@ async function joinRoomAtEpoch(
     return isLegacyDoorLayoutKind(v) ? v : undefined;
   };
   let appliedTheme: RoomTheme = resolveTheme();
+  // 🚪 Track the applied door-layout KIND too: a fresh join paints before the
+  //  host's roomInfo['doorLayout'] stamp syncs in, so a later layout-only
+  //  update (theme still 'interior') would otherwise be ignored — leaving
+  //  compatKind at 'legacy' and posing old records with the wrong arrangement.
+  let appliedLayout: LegacyLayoutKind | undefined = resolveDoorLayout();
 
   // 🏝️ Outdoor casino pool room: seed furniture on first entry (the normal
   // claimRoomDefaults path doesn't run for transit joins, so this is the
   // dedicated first-visit seed path). Also applies the outdoor visual theme.
-  if (boot.roomId === OUTDOOR_CASINO_ROOM_ID) {
-    const outdoorEpoch = epoch;
-    void sync.whenServerSynced.then(() => {
-      if (outdoorEpoch !== sessionEpoch) return;
-      // 🏊 Seed the pool layout ONCE per room, then let edits persist (owner
-      // request: the pool + hot tub are movable/removable furniture now, so a
-      // move or removal must survive re-entry). A dedicated marker — not the
-      // old "always rewrite" — still migrates fresh rooms AND stale casino
-      // docs from earlier prototypes (neither carries the marker), but a room
-      // that has already been seeded keeps the player's edits.
-      const roomInfo = sync.doc.getMap("roomInfo");
-      if (!roomInfo.get("poolLayoutSeeded")) {
-        for (const item of OUTDOOR_FURNITURE) {
-          writeFurnitureItem(item);
-        }
-        roomInfo.set("poolLayoutSeeded", true);
-      }
-      // 🪟 Additive one-time: existing pool rooms (already past poolLayoutSeeded)
-      // gain the new ceiling skylights once, without re-seeding the rest — own
-      // marker, so a removed skylight stays gone (deletion persists).
-      if (!roomInfo.get("poolSkylightsV1")) {
-        writeFurnitureItem({ id: "pool-skylight-n", kind: "skylight", pos: { x: 0, z: -2.8 }, rot: 0, movable: true });
-        writeFurnitureItem({ id: "pool-skylight-s", kind: "skylight", pos: { x: 0, z: 2.8 }, rot: 0, movable: true });
-        roomInfo.set("poolSkylightsV1", true);
-      }
-      // 🏊 Retired items: casino fixtures moved back to the lobby — purge
-      // their stale doc entries so old room replicas drop them too (id-only,
-      // harmless when absent; safe to run every entry).
-      deleteFurnitureItem("pool-cashier");
-      deleteFurnitureItem("pool-roulette");
-    });
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
-  } else if (boot.roomId === CASINO_ROOM_ID) {
-    const casinoEpoch = epoch;
-    void sync.whenServerSynced.then(() => {
-      if (casinoEpoch !== sessionEpoch) return;
-      for (const item of CASINO_FURNITURE) {
-        writeFurnitureItem(item);
-      }
-      for (const id of CASINO_RETIRED_FURNITURE_IDS) {
-        deleteFurnitureItem(id);
-      }
-    });
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
-  } else {
-    // Returning to any non-outdoor room (lobby, etc.): restore lobby visuals.
-    world?.applyRoomVisuals(boot.roomId, undefined, resolveTheme(), resolveDoorLayout());
-  }
+  // 🛰️ ONE entry path for every room (owner ruling: no room types). Two rooms
+  // used to re-seed their own furniture here on entry, keyed on their ids —
+  // "this room IS the pool", "this room IS the casino" — which is precisely
+  // what a template does now, on demand, in any module: the pool-1/pool-2 and
+  // casino-1 templates carry those exact manifests. A room's contents are its
+  // doc's business; entering only paints what is already there.
+  world?.applyRoomVisuals(undefined, resolveTheme(), resolveDoorLayout());
 
   // Keyed-identity Slice 1: re-assert our player entry AFTER the initial sync,
   // so our KEYED entry (keyB64 + self-cert) wins over any stale pre-Slice-1
@@ -1601,9 +1577,11 @@ async function joinRoomAtEpoch(
     // host's roomInfo['theme'] lands — repaint to outdoor-deck). Guarded so
     // ordinary roomInfo edits (name, owner, access) don't churn the visuals.
     const t = resolveTheme();
-    if (t !== appliedTheme) {
+    const layout = resolveDoorLayout();
+    if (t !== appliedTheme || layout !== appliedLayout) {
       appliedTheme = t;
-      world?.applyRoomVisuals(boot.roomId, undefined, t, resolveDoorLayout());
+      appliedLayout = layout;
+      world?.applyRoomVisuals(undefined, t, layout);
     }
   });
 
@@ -1850,26 +1828,33 @@ const SYNC_GATE_MS = 8_000;
 
 /**
  * Resolve once the freshly-joined room's shared state has converged, or after
- * `timeoutMs` as a fallback (issue #60 P1.3). Normal rooms wait for the host's
- * roomInfo `owner` AND `name`; authored amenity rooms have no roomInfo owner,
- * so their node SyncStep2 is the readiness signal (their furniture seed
- * callbacks are registered on the same promise before transit reaches here).
+ * `timeoutMs` as a fallback (issue #60 P1.3). Ready on EITHER the host's
+ * roomInfo `owner`+`name` arriving OR a POST-LINK SyncStep2 landing — one rule
+ * for every room, since "this room has no owner recorded" is a state, not a
+ * kind of room (owner ruling: no room types).
  * Captures the CURRENT session's doc; if a newer session/leave destroys it
  * mid-wait, the timeout still resolves so the curtain never wedges.
  */
-function awaitInitialRoomState(
-  timeoutMs: number,
-  roomId: string,
-): Promise<void> {
+function awaitInitialRoomState(timeoutMs: number): Promise<void> {
   const sync = yjsSync;
   if (!sync) return Promise.resolve();
-  const authoredAmenity =
-    roomId === CASINO_ROOM_ID || roomId === OUTDOOR_CASINO_ROOM_ID;
   const roomMap = sync.doc.getMap("roomInfo");
+  // 🛰️ Ready on EITHER signal, for every room alike (owner ruling: no room
+  // types). The gate used to name the two flagship rooms as the ones with no
+  // owner/name to wait for — but "has no owner yet" is a state any room can
+  // be in, not a kind of room, and a room that never gets those keys used to
+  // stall the curtain for the full timeout.
+  //
+  // The convergence signal is `linkedSynced`, NOT `serverSynced`: the plain
+  // flag flips on the FIRST SyncStep2, which commonly arrives before the P2P
+  // host dial carrying an EMPTY replica (see YjsSync.resync). Acting on that
+  // would open the curtain on defaults AND let birth-door healing (beforeArrive)
+  // re-seed a door the unsynced host room actually has. `linkedSynced` only
+  // opens on a SyncStep2 received after the peer linked — i.e. real host state.
+  // Keys present ⇒ we know the room; post-link sync ⇒ we know there are no keys
+  // coming. The timeout covers a genuinely ownerless/never-linking room.
   const ready = () =>
-    authoredAmenity
-      ? sync.serverSynced
-      : roomMap.has("owner") && roomMap.has("name");
+    sync.linkedSynced || (roomMap.has("owner") && roomMap.has("name"));
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -1879,22 +1864,18 @@ function awaitInitialRoomState(
     const finish = () => {
       if (done) return;
       done = true;
-      if (!authoredAmenity) {
-        try {
-          roomMap.unobserve(observer);
-        } catch {
-          /* doc may be destroyed */
-        }
+      try {
+        roomMap.unobserve(observer);
+      } catch {
+        /* doc may be destroyed */
       }
       window.clearTimeout(timer);
       resolve();
     };
     const timer = window.setTimeout(finish, timeoutMs);
-    if (authoredAmenity) {
-      void sync.whenServerSynced.then(finish);
-    } else {
-      roomMap.observe(observer);
-    }
+    // Both signals, always — whichever lands first opens the curtain.
+    void sync.whenLinkedSynced.then(finish);
+    roomMap.observe(observer);
     // Guard the race between the initial ready() check and observe() attaching.
     if (ready()) finish();
   });
@@ -1943,6 +1924,11 @@ class StrandedOfflineError extends Error {}
 /** Per-caller choreography hooks for performRoomSwap. Both run while the
  *  transit curtain is fully opaque. */
 interface RoomSwapChoreography {
+  /** Runs after the room state has synced but BEFORE `arrive` stages the
+   *  avatar — the seam for any repair the arrival walk-in depends on (the
+   *  T1 transit re-seeds a lost birth door here so completeAdapterArrival
+   *  finds it). */
+  beforeArrive?: () => void;
   /** Arrival — the target room's session is live; stage the avatar (the T1
    *  transit walks in through the arrival door, the #52 ACCESS beam-in
    *  simply places the avatar at the default spawn). */
@@ -2033,7 +2019,10 @@ async function performRoomSwap(
     // showing the default name/owner (symptoms 1 & 5). Only foreign joins
     // actually wait — a minted/own room already has owner+name written, and a
     // same-node transit's replica is already populated, so both resolve at once.
-    await awaitInitialRoomState(SYNC_GATE_MS, target.roomId);
+    await awaitInitialRoomState(SYNC_GATE_MS);
+    // Any repair the arrival walk-in depends on (birth-door healing) runs
+    // BEFORE the avatar is staged, so completeAdapterArrival finds the door.
+    choreography.beforeArrive?.();
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);
@@ -2137,6 +2126,40 @@ async function transitTo(
   }
 
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
+    // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
+    // data loss, or the doorless claim that replaced the lobby-contamination
+    // path — arrives marked-authoritative-EMPTY, but the DEPARTURE pairing still
+    // knows exactly which door this connection enters through: farDoor was
+    // minted at provision, farWall/farLateral ride the record. Re-seed that
+    // one door BEFORE the arrival choreography resolves the walk-in, so both
+    // the walk-in and the way back work (it used to run after performRoomSwap
+    // returned, which was too late — completeAdapterArrival had already skipped
+    // the walk-in). Gated purely on DATA — a recorded farDoor (cardinal OR free
+    // `d:`) PLUS an authoritative-empty door doc (doorSetIsMarkedEmpty) — never
+    // on a room id: there are no room types (owner ruling, 2026-08-13).
+    //
+    // ⚠️ doorSetIsMarkedEmpty, NOT doorLayoutDocSize() === 0: a bare zero size
+    // also matches a legacy UNMARKED room (empty map, no marker), whose missing
+    // marker means "un-migrated; render the four defaults". Seeding THAT would
+    // convert the legacy fallback into an authoritative one-door set and reap
+    // the other three pairings — so we only repair a room that has explicitly
+    // stated "I have no doors" (marker present, no records).
+    beforeArrive: () => {
+      if (
+        depState?.farDoor &&
+        depState.farWall &&
+        doorSetIsMarkedEmpty()
+      ) {
+        seedDoorLayoutSingle(
+          depState.farWall,
+          depState.farLateral ?? 0,
+          depState.farDoor,
+        );
+        console.log(
+          `🩹 Healed doorless arrival: re-seeded ${depState.farDoor} on ${depState.farWall}.`,
+        );
+      }
+    },
     // 🔗 depRoomId lets the ARRIVAL room's own back-pointing record pick the
     // door (owner's octagon fix) — farDoor/opposite are fallbacks only.
     arrive: () =>
@@ -2172,13 +2195,12 @@ async function transitTo(
       seed: depAddress,
     };
     // 🌌 Resolve the arrival room's theme here too (the arrival doc is bound +
-    // synced by now). Passing NO theme would fall back to legacyThemeFromRoomId,
-    // which returns 'interior' for a provisioned deck/casino module (its id is
-    // never an authored constant) — clobbering the correct backdrop the room
-    // observer already painted and desyncing appliedTheme so it can't self-heal.
+    // synced by now) — passing NO theme would repaint it as a plain interior,
+    // clobbering the backdrop the room observer already applied and desyncing
+    // appliedTheme so it could not self-heal.
     const arrivalTheme =
       (yjsSync?.doc.getMap("roomInfo").get("theme") as RoomTheme | undefined) ??
-      legacyThemeFromRoomId(arrivalRoomId);
+      "interior";
     // 🛰️🚪 …and its retired door arrangement, for the same compat reason.
     const arrivalLayoutRaw = yjsSync?.doc.getMap("roomInfo").get("doorLayout");
     const arrivalLayout: LegacyLayoutKind | undefined = isLegacyDoorLayoutKind(
@@ -2186,12 +2208,7 @@ async function transitTo(
     )
       ? arrivalLayoutRaw
       : undefined;
-    world.applyRoomVisuals(
-      arrivalRoomId,
-      arrivalDoorId,
-      arrivalTheme,
-      arrivalLayout,
-    );
+    world.applyRoomVisuals(arrivalDoorId, arrivalTheme, arrivalLayout);
   }
 
   // Vestibule-findings fix (root cause 1) + #62 P4: LAZY MIRROR for EVERY
