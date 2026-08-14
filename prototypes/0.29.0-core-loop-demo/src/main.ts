@@ -93,6 +93,7 @@ import {
   doorLayoutDocSize,
   readAllDoorLayout,
   doorSetIsAuthoritative,
+  doorSetIsMarkedEmpty,
   seedDoorLayoutEmpty,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
@@ -1505,6 +1506,11 @@ async function joinRoomAtEpoch(
     return isLegacyDoorLayoutKind(v) ? v : undefined;
   };
   let appliedTheme: RoomTheme = resolveTheme();
+  // 🚪 Track the applied door-layout KIND too: a fresh join paints before the
+  //  host's roomInfo['doorLayout'] stamp syncs in, so a later layout-only
+  //  update (theme still 'interior') would otherwise be ignored — leaving
+  //  compatKind at 'legacy' and posing old records with the wrong arrangement.
+  let appliedLayout: LegacyLayoutKind | undefined = resolveDoorLayout();
 
   // 🏝️ Outdoor casino pool room: seed furniture on first entry (the normal
   // claimRoomDefaults path doesn't run for transit joins, so this is the
@@ -1562,9 +1568,11 @@ async function joinRoomAtEpoch(
     // host's roomInfo['theme'] lands — repaint to outdoor-deck). Guarded so
     // ordinary roomInfo edits (name, owner, access) don't churn the visuals.
     const t = resolveTheme();
-    if (t !== appliedTheme) {
+    const layout = resolveDoorLayout();
+    if (t !== appliedTheme || layout !== appliedLayout) {
       appliedTheme = t;
-      world?.applyRoomVisuals(undefined, t, resolveDoorLayout());
+      appliedLayout = layout;
+      world?.applyRoomVisuals(undefined, t, layout);
     }
   });
 
@@ -2111,21 +2119,27 @@ async function transitTo(
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
     // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
     // data loss, or the doorless claim that replaced the lobby-contamination
-    // path — arrives with ZERO door records, but the DEPARTURE pairing still
+    // path — arrives marked-authoritative-EMPTY, but the DEPARTURE pairing still
     // knows exactly which door this connection enters through: farDoor was
     // minted at provision, farWall/farLateral ride the record. Re-seed that
     // one door BEFORE the arrival choreography resolves the walk-in, so both
     // the walk-in and the way back work (it used to run after performRoomSwap
     // returned, which was too late — completeAdapterArrival had already skipped
-    // the walk-in). Gated purely on DATA (a recorded farDoor — cardinal OR
-    // free `d:` — plus a genuinely doorless doc; the marker doesn't count
-    // toward doorLayoutDocSize), never on a room id: there are no room types
-    // (owner ruling, 2026-08-13).
+    // the walk-in). Gated purely on DATA — a recorded farDoor (cardinal OR free
+    // `d:`) PLUS an authoritative-empty door doc (doorSetIsMarkedEmpty) — never
+    // on a room id: there are no room types (owner ruling, 2026-08-13).
+    //
+    // ⚠️ doorSetIsMarkedEmpty, NOT doorLayoutDocSize() === 0: a bare zero size
+    // also matches a legacy UNMARKED room (empty map, no marker), whose missing
+    // marker means "un-migrated; render the four defaults". Seeding THAT would
+    // convert the legacy fallback into an authoritative one-door set and reap
+    // the other three pairings — so we only repair a room that has explicitly
+    // stated "I have no doors" (marker present, no records).
     beforeArrive: () => {
       if (
         depState?.farDoor &&
         depState.farWall &&
-        doorLayoutDocSize() === 0
+        doorSetIsMarkedEmpty()
       ) {
         seedDoorLayoutSingle(
           depState.farWall,

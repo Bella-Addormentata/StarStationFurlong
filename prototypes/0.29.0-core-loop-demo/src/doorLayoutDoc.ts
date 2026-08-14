@@ -446,6 +446,22 @@ export function doorSetIsAuthoritative(): boolean {
 }
 
 /**
+ * True ONLY for an authoritative-EMPTY room: the marker is present and there
+ * are no door records. This is the one case birth-door healing may repair —
+ * the room has stated "I have no doors", and a connection's farDoor record is
+ * the evidence that one was lost. A legacy UNMARKED empty room returns false
+ * here: its missing marker means "un-migrated; render the four defaults", and
+ * seeding it would convert that legacy fallback into an authoritative one-door
+ * set (reaping the other three). Never heal the unmarked case.
+ */
+export function doorSetIsMarkedEmpty(): boolean {
+  if (!docAlive()) return false;
+  if (doorLayoutDocSize() > 0) return false;
+  const m = doorLayoutMap!.get(META_KEY);
+  return typeof m === 'object' && m !== null && (m as { v?: unknown }).v === 1;
+}
+
+/**
  * 🛰️ Claim a room as having NO doors at all — a fresh standalone station,
  * which is connected to nothing and so should present nothing to walk through
  * until its owner places one. Idempotent, and deliberately refuses to run over

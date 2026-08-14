@@ -71,6 +71,13 @@ function b64ToU8(b64: string): Uint8Array {
   return bytes;
 }
 
+/** Constant-length byte equality (both are 32-byte pubkeys in practice). */
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export class YjsSync {
   readonly doc: Y.Doc;
   /**
@@ -88,13 +95,17 @@ export class YjsSync {
   #serverSynced = false;
   #active = false;
 
-  /** 🛰️ Resolves once the doc has applied a SyncStep2 received AFTER the peer
-   *  link was reported up (markPeerLinked). The plain `whenServerSynced` fires
-   *  on the FIRST SyncStep2, which commonly lands before the P2P host dial and
-   *  carries an empty replica — callers that must not act on that (the arrival
-   *  curtain, birth-door healing) await THIS instead. Never rejects; if the
-   *  peer never links it simply never resolves (callers bound it with a
-   *  timeout, so "no link" degrades to the fallback, which is safe). */
+  /** 🛰️ Resolves once the doc has applied a SyncStep2 from the LINKED HOST —
+   *  correlated by signature, not just timing. The plain `whenServerSynced`
+   *  fires on the FIRST SyncStep2, which commonly lands before the P2P host
+   *  dial and carries an empty replica. Worse, the post-link `resync()` is
+   *  ALSO answered by the local node from its own (still possibly empty)
+   *  replica. The node's frame is UNSIGNED (it holds no identity key); the
+   *  host browser SIGNS its frames. So this gate opens only on a post-link
+   *  SyncStep2 that carries a valid non-self signature — proof the bytes came
+   *  from the host's live replica, not the node's. Never rejects; if no signed
+   *  host response arrives (ownerless room / solo station) the caller's timeout
+   *  is the fallback, which is safe. */
   readonly whenLinkedSynced: Promise<void>;
   #resolveLinkedSynced!: () => void;
   #linkedSynced = false;
@@ -113,9 +124,10 @@ export class YjsSync {
   }
 
   /** Record that the P2P bridge to the room host has linked (called from the
-   *  bridge `connected` handler, alongside `resync()`). If a SyncStep2 already
-   *  landed it was the empty pre-link one, so the linked-sync gate only opens
-   *  on the NEXT SyncStep2 — the one `resync()` pulls from the now-live host. */
+   *  bridge `connected` handler, alongside `resync()`). From this point we watch
+   *  for the host's OWN SyncStep2 — a SIGNED one — to open the readiness gate.
+   *  The local node answers every SyncStep1 from its own (possibly empty)
+   *  replica with an UNSIGNED frame, so an unsigned SyncStep2 is never enough. */
   markPeerLinked(): void {
     this.#peerLinked = true;
   }
@@ -187,7 +199,10 @@ export class YjsSync {
     if (wireEnvelope.room && wireEnvelope.room !== this.opts.roomId) return;
     if (!this.#verifyEnvelope(wireEnvelope)) return; // Slice 2: drop signed-but-invalid
     try {
-      this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
+      this.#processInboundYsync(
+        b64ToU8(wireEnvelope.payload),
+        this.#envelopeAuthor(wireEnvelope),
+      );
     } catch (e) {
       console.warn('YjsSync failed ingesting bridged envelope:', e);
     }
@@ -395,7 +410,10 @@ export class YjsSync {
           const wireEnvelope = JSON.parse(new TextDecoder().decode(payloadBytes));
 
           if (wireEnvelope.kind === 'ysync' && this.#verifyEnvelope(wireEnvelope)) {
-            this.#processInboundYsync(b64ToU8(wireEnvelope.payload));
+            this.#processInboundYsync(
+              b64ToU8(wireEnvelope.payload),
+              this.#envelopeAuthor(wireEnvelope),
+            );
           }
         }
       }
@@ -406,7 +424,18 @@ export class YjsSync {
     }
   }
 
-  #processInboundYsync(payload: Uint8Array) {
+  /** Decode an envelope's author pubkey bytes, or null when absent/dummy —
+   *  the local node holds no identity key, so ITS SyncStep2 always decodes to
+   *  null here; the host browser's frames carry its real (signed) pubkey. */
+  #envelopeAuthor(env: { author?: string }): Uint8Array | null {
+    if (typeof env.author !== 'string') return null;
+    let bytes: Uint8Array;
+    try { bytes = b64ToU8(env.author); } catch { return null; }
+    if (bytes.length !== 32 || bytes.every((b) => b === 0)) return null;
+    return bytes;
+  }
+
+  #processInboundYsync(payload: Uint8Array, author: Uint8Array | null = null) {
     let cursor = 0;
 
     const readVarUint = (): number => {
@@ -446,10 +475,17 @@ export class YjsSync {
         this.#serverSynced = true;
         this.#resolveServerSynced();
       }
-      // 🛰️ A SyncStep2 that arrives only AFTER the peer linked carries the
-      // host's real state (the pre-link one was an empty replica). Open the
-      // linked-sync gate on that one — never on the empty pre-link handshake.
-      if (subtype === 1 && this.#peerLinked && !this.#linkedSynced) {
+      // 🛰️ The readiness gate opens only on a SyncStep2 from the LINKED HOST —
+      // correlated by a real signature, not timing. The local node also answers
+      // the post-link resync() from its own (possibly still-empty) replica, and
+      // its frame is UNSIGNED (author null). The host browser SIGNS its frames,
+      // so requiring a non-null, non-self author here proves this SyncStep2 came
+      // from the host's live replica — the state we may act on. An unsigned or
+      // self-authored frame never opens the gate.
+      const fromHost =
+        author !== null &&
+        !bytesEq(author, this.opts.authorPub?.() ?? new Uint8Array(32));
+      if (subtype === 1 && this.#peerLinked && fromHost && !this.#linkedSynced) {
         this.#linkedSynced = true;
         this.#resolveLinkedSynced();
       }
