@@ -378,12 +378,15 @@ export class World {
   private outdoorFloorTex: THREE.Texture | null = null;
   /** Lazy-created casino carpet texture (created on first casino entry). */
   private casinoFloorTex: THREE.Texture | null = null;
-  /** True while the active room is the outdoor casino pool room. */
+  /** 🌌 Legacy mirror of isOutdoorDeck — kept in sync with the room's THEME so
+   *  the platform-floor visibility read in the render loop (world.ts:3427)
+   *  still hides the floor for an outdoor-deck room on a non-octagon hull.
+   *  Was once the id-keyed "outdoor casino pool room" flag; now theme-driven. */
   private isOutdoorRoom = false;
   /** 🌌 True while the active room's THEME is 'outdoor-deck' (space seen through
-   *  the glass ceiling + warm bright light). Independent of isOutdoorRoom —
-   *  ANY module can be a deck via its roomInfo theme. Drives the space backdrop
-   *  visibility toggle in applyRoomVisuals. */
+   *  the glass ceiling + warm bright light). Drives the space backdrop
+   *  visibility toggle in applyRoomVisuals; isOutdoorRoom mirrors it for the
+   *  legacy floor-visibility read. */
   private isOutdoorDeck = false;
   /** 🪐 Overhead ocean-planet for the outdoor-deck backdrop — the "beach" world
    *  the station orbits, seen up through the skylights. Built once, spun slowly,
@@ -2231,6 +2234,10 @@ export class World {
     const deck = resolvedTheme === "outdoor-deck";
     const casinoTheme = resolvedTheme === "casino";
     this.isOutdoorDeck = deck;
+    // Keep the legacy floor-visibility flag in lockstep with the theme: the
+    // render loop still reads isOutdoorRoom (world.ts:3427) to hide the
+    // platform floor under an outdoor deck on non-octagon hulls.
+    this.isOutdoorRoom = deck;
     // 🚪 The room's RETIRED door-layout kind — compat only. A door's physical
     // slot now comes from its own layout record (wall + lateral), which is what
     // lets a wall carry zero or many doors; this line only tells the doc layer

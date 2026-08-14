@@ -1894,6 +1894,11 @@ class StrandedOfflineError extends Error {}
 /** Per-caller choreography hooks for performRoomSwap. Both run while the
  *  transit curtain is fully opaque. */
 interface RoomSwapChoreography {
+  /** Runs after the room state has synced but BEFORE `arrive` stages the
+   *  avatar — the seam for any repair the arrival walk-in depends on (the
+   *  T1 transit re-seeds a lost birth door here so completeAdapterArrival
+   *  finds it). */
+  beforeArrive?: () => void;
   /** Arrival — the target room's session is live; stage the avatar (the T1
    *  transit walks in through the arrival door, the #52 ACCESS beam-in
    *  simply places the avatar at the default spawn). */
@@ -1985,6 +1990,9 @@ async function performRoomSwap(
     // actually wait — a minted/own room already has owner+name written, and a
     // same-node transit's replica is already populated, so both resolve at once.
     await awaitInitialRoomState(SYNC_GATE_MS);
+    // Any repair the arrival walk-in depends on (birth-door healing) runs
+    // BEFORE the avatar is staged, so completeAdapterArrival finds the door.
+    choreography.beforeArrive?.();
     // Stage the avatar behind the opaque curtain.
     choreography.arrive();
     await transitFadeTo(false);
@@ -2088,6 +2096,33 @@ async function transitTo(
   }
 
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
+    // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
+    // data loss, or the doorless claim that replaced the lobby-contamination
+    // path — arrives with ZERO door records, but the DEPARTURE pairing still
+    // knows exactly which door this connection enters through: farDoor was
+    // minted at provision, farWall/farLateral ride the record. Re-seed that
+    // one door BEFORE the arrival choreography resolves the walk-in, so both
+    // the walk-in and the way back work (it used to run after performRoomSwap
+    // returned, which was too late — completeAdapterArrival had already skipped
+    // the walk-in). Gated purely on DATA (a `d:` far door + a genuinely
+    // doorless doc — the marker doesn't count toward doorLayoutDocSize), never
+    // on a room id: there are no room types (owner ruling, 2026-08-13).
+    beforeArrive: () => {
+      if (
+        depState?.farDoor?.startsWith("d:") &&
+        depState.farWall &&
+        doorLayoutDocSize() === 0
+      ) {
+        seedDoorLayoutSingle(
+          depState.farWall,
+          depState.farLateral ?? 0,
+          depState.farDoor,
+        );
+        console.log(
+          `🩹 Healed doorless arrival: re-seeded ${depState.farDoor} on ${depState.farWall}.`,
+        );
+      }
+    },
     // 🔗 depRoomId lets the ARRIVAL room's own back-pointing record pick the
     // door (owner's octagon fix) — farDoor/opposite are fallbacks only.
     arrive: () =>
@@ -2102,30 +2137,6 @@ async function transitTo(
   if (result instanceof Error) {
     showHint("Dock seal failed.");
     return;
-  }
-
-  // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
-  // data loss, or the doorless claim that replaced the lobby-contamination
-  // path — arrives with ZERO door records, but the DEPARTURE pairing still
-  // knows exactly which door this connection enters through: farDoor was
-  // minted at provision, farWall/farLateral ride the record. Re-seed that
-  // one door before resolving the arrival so the walk-in and the way back
-  // both work. Gated purely on DATA (a `d:` far door + a genuinely doorless
-  // doc — the marker doesn't count toward doorLayoutDocSize), never on a
-  // room id: there are no room types (owner ruling, 2026-08-13).
-  if (
-    depState?.farDoor?.startsWith("d:") &&
-    depState.farWall &&
-    doorLayoutDocSize() === 0
-  ) {
-    seedDoorLayoutSingle(
-      depState.farWall,
-      depState.farLateral ?? 0,
-      depState.farDoor,
-    );
-    console.log(
-      `🩹 Healed doorless arrival: re-seeded ${depState.farDoor} on ${depState.farWall}.`,
-    );
   }
 
   // 🚪 A doorless arrival room has no door to come in through. The mirror
