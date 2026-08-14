@@ -95,6 +95,7 @@ import {
   doorSetIsAuthoritative,
   doorSetIsMarkedEmpty,
   seedDoorLayoutEmpty,
+  seedDoorLayoutDefaults,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -1415,16 +1416,24 @@ async function joinRoomAtEpoch(
       // module provisioned from a template therefore never published its door
       // set at all, and stayed in the "unseeded" state that made the next door
       // edit resurrect a full set of cardinals.
-      // 🚪 A room whose door doc is EMPTY gets NO doors — one rule for every
-      // room (owner ruling 2026-08-13: modules are universal, so nothing may
-      // key off what KIND of room this is). The old branch guessed from
-      // identity — session-minted rooms got one centred door per wall,
-      // everything else got four cardinals in the retired paired
-      // arrangement — which is how a reloaded module rebuilt itself as a
-      // lobby. Doorless is the honest floor: a connection re-seeds its own
-      // door on arrival (the healing in transitTo), and the owner places the
-      // rest. A room that already has doors is untouched.
-      if (ownsRoom && doorLayoutDocSize() === 0) seedDoorLayoutEmpty();
+      // 🚪 An empty door doc means ONE of two things, and getting it wrong is
+      // destructive (PR #108 review): marking it AUTHORITATIVE-empty makes
+      // reconcileDoorLayout's non-unseeded path reap every existing pairing —
+      // so an owner RELOADING a legacy room would erase all its connections.
+      //
+      // • PROVABLY FRESH room (minted this session — it has a provision record
+      //   or a claimed berth): born with no doors of its own, so mark it empty.
+      //   A connection re-seeds its own door on arrival (the healing in
+      //   transitTo), and the owner places the rest.
+      // • LEGACY room (no minted record — it predates the doorLayout store):
+      //   its empty map means "un-migrated; render the four defaults", NOT
+      //   "no doors". MIGRATE it: write the visible default records so the set
+      //   becomes authoritative WITHOUT reaping the pairings those doors carry.
+      const mintedHere = mintedRoomTemplates.get(boot.roomId);
+      if (ownsRoom && doorLayoutDocSize() === 0) {
+        if (mintedHere) seedDoorLayoutEmpty();
+        else seedDoorLayoutDefaults(); // legacy: keep the visible four, marked authoritative
+      }
       // 🏗️ A module minted FROM A TEMPLATE is born with that template's
       // furniture — seed it and skip the lobby default + migration + the
       // outdoor-casino auto-pairing below (all lobby-specific).

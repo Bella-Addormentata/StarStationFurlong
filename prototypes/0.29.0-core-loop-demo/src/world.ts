@@ -250,11 +250,7 @@ export class World {
   private robots = new Map<string, PoolWaiter>();
   /** Route the live robots were built with — a change rebuilds them all. */
   private robotsPatrol: Array<[number, number]> | null = null;
-  /** 🌌 The active room's THEME, stashed by applyRoomVisuals so reconcileFurniture
-   *  can recompute the robot patrol when a pool is added/removed without a
-   *  re-entry (the patrol falls back to the theme when there's no pool). */
-  private currentTheme: RoomTheme = "interior";
-  /** 🎰🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
+  /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
   private croupierNarrated = new Map<string, string>();
@@ -2237,7 +2233,6 @@ export class World {
     const resolvedTheme: RoomTheme = theme ?? "interior";
     const deck = resolvedTheme === "outdoor-deck";
     const casinoTheme = resolvedTheme === "casino";
-    this.currentTheme = resolvedTheme;
     this.isOutdoorDeck = deck;
     // Keep the legacy floor-visibility flag in lockstep with the theme: the
     // render loop still reads isOutdoorRoom (world.ts:3427) to hide the
@@ -4729,20 +4724,25 @@ export class World {
     this.reconcileRobots(this.computeRobotPatrol());
   }
 
-  /** 🤖 The robot patrol route from the room's CURRENT contents + theme. A pool
-   *  in the room runs the pool route (pool PRESENCE, like refreshOutdoorFloor);
-   *  otherwise the theme supplies the fallback (casino floor, else lobby). This
-   *  is recomputed on every reconcile — adding/removing a pool re-routes the
-   *  robots without a re-entry (no room types: the route follows the furniture). */
+  /** 🤖 The robot patrol route from the room's CURRENT CONTENTS alone — never
+   *  the theme (no room types: a mechanic may not key off the visual setting).
+   *  A pool in the room runs the pool route (pool PRESENCE, like
+   *  refreshOutdoorFloor); a casino GAME TABLE (roulette/craps) runs the casino
+   *  aisle route; anything else keeps the lobby promenade. Recomputed on every
+   *  reconcile — dropping a pool or a table into a room re-routes its robots
+   *  live, with no re-entry and no theme stamp required. */
   private computeRobotPatrol(): Array<[number, number]> {
     const hasPool = FURNITURE.some(
       (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
     );
-    return hasPool
-      ? POOL_PATROL
-      : this.currentTheme === "casino"
-        ? CASINO_PATROL
-        : LOBBY_PATROL;
+    if (hasPool) return POOL_PATROL;
+    // 🎰 A room is a casino because it HOLDS casino tables — the content-driven
+    // rule the whole PR asserts. Theme is visual only, so it must not pick the
+    // route; the placed roulette/craps table does.
+    const hasCasinoTable = FURNITURE.some(
+      (i) => i.kind === "roulette-table" || i.kind === "craps-table",
+    );
+    return hasCasinoTable ? CASINO_PATROL : LOBBY_PATROL;
   }
 
   private reconcileRobots(waiterPatrol: Array<[number, number]> | null): void {
