@@ -88,10 +88,36 @@ export class YjsSync {
   #serverSynced = false;
   #active = false;
 
+  /** 🛰️ Resolves once the doc has applied a SyncStep2 received AFTER the peer
+   *  link was reported up (markPeerLinked). The plain `whenServerSynced` fires
+   *  on the FIRST SyncStep2, which commonly lands before the P2P host dial and
+   *  carries an empty replica — callers that must not act on that (the arrival
+   *  curtain, birth-door healing) await THIS instead. Never rejects; if the
+   *  peer never links it simply never resolves (callers bound it with a
+   *  timeout, so "no link" degrades to the fallback, which is safe). */
+  readonly whenLinkedSynced: Promise<void>;
+  #resolveLinkedSynced!: () => void;
+  #linkedSynced = false;
+  #peerLinked = false;
+
   /** True once the node's initial SyncStep2 has applied (the promise above,
    *  as a synchronous probe — Tier A's backfill logic reads it). */
   get serverSynced(): boolean {
     return this.#serverSynced;
+  }
+
+  /** True once a post-link SyncStep2 has applied — the synchronous probe form
+   *  of `whenLinkedSynced`. */
+  get linkedSynced(): boolean {
+    return this.#linkedSynced;
+  }
+
+  /** Record that the P2P bridge to the room host has linked (called from the
+   *  bridge `connected` handler, alongside `resync()`). If a SyncStep2 already
+   *  landed it was the empty pre-link one, so the linked-sync gate only opens
+   *  on the NEXT SyncStep2 — the one `resync()` pulls from the now-live host. */
+  markPeerLinked(): void {
+    this.#peerLinked = true;
   }
   #writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #seq = 1;
@@ -100,6 +126,9 @@ export class YjsSync {
     this.doc = new Y.Doc();
     this.whenServerSynced = new Promise<void>((resolve) => {
       this.#resolveServerSynced = resolve;
+    });
+    this.whenLinkedSynced = new Promise<void>((resolve) => {
+      this.#resolveLinkedSynced = resolve;
     });
   }
 
@@ -416,6 +445,13 @@ export class YjsSync {
       if (subtype === 1 && !this.#serverSynced) {
         this.#serverSynced = true;
         this.#resolveServerSynced();
+      }
+      // 🛰️ A SyncStep2 that arrives only AFTER the peer linked carries the
+      // host's real state (the pre-link one was an empty replica). Open the
+      // linked-sync gate on that one — never on the empty pre-link handshake.
+      if (subtype === 1 && this.#peerLinked && !this.#linkedSynced) {
+        this.#linkedSynced = true;
+        this.#resolveLinkedSynced();
       }
       console.log(`✅ YjsSync Handshake Complete for Y.Doc room replica!`);
     }

@@ -1077,6 +1077,11 @@ async function joinRoomAtEpoch(
             // dial finished and was relayed to an empty neighbor set, so the host
             // never sent its (static) room state. Re-issue SyncStep1 now that the
             // host is a live neighbor to pull the roster / room name / furniture.
+            // Mark the link first so the SyncStep2 this resync pulls is the one
+            // that opens the post-link readiness gate (whenLinkedSynced) — the
+            // arrival curtain + birth-door healing wait on THAT, not the empty
+            // pre-link handshake.
+            yjsSync?.markPeerLinked();
             yjsSync?.resync();
           } else if (status.status === "failed") {
             setNetworkRow(
@@ -1807,7 +1812,7 @@ const SYNC_GATE_MS = 8_000;
 /**
  * Resolve once the freshly-joined room's shared state has converged, or after
  * `timeoutMs` as a fallback (issue #60 P1.3). Ready on EITHER the host's
- * roomInfo `owner`+`name` arriving OR the node's SyncStep2 landing — one rule
+ * roomInfo `owner`+`name` arriving OR a POST-LINK SyncStep2 landing — one rule
  * for every room, since "this room has no owner recorded" is a state, not a
  * kind of room (owner ruling: no room types).
  * Captures the CURRENT session's doc; if a newer session/leave destroys it
@@ -1821,10 +1826,18 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
   // types). The gate used to name the two flagship rooms as the ones with no
   // owner/name to wait for — but "has no owner yet" is a state any room can
   // be in, not a kind of room, and a room that never gets those keys used to
-  // stall the curtain for the full timeout. Keys present ⇒ we know the room;
-  // server synced ⇒ we know there are no keys coming.
+  // stall the curtain for the full timeout.
+  //
+  // The convergence signal is `linkedSynced`, NOT `serverSynced`: the plain
+  // flag flips on the FIRST SyncStep2, which commonly arrives before the P2P
+  // host dial carrying an EMPTY replica (see YjsSync.resync). Acting on that
+  // would open the curtain on defaults AND let birth-door healing (beforeArrive)
+  // re-seed a door the unsynced host room actually has. `linkedSynced` only
+  // opens on a SyncStep2 received after the peer linked — i.e. real host state.
+  // Keys present ⇒ we know the room; post-link sync ⇒ we know there are no keys
+  // coming. The timeout covers a genuinely ownerless/never-linking room.
   const ready = () =>
-    sync.serverSynced || (roomMap.has("owner") && roomMap.has("name"));
+    sync.linkedSynced || (roomMap.has("owner") && roomMap.has("name"));
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -1844,7 +1857,7 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
     };
     const timer = window.setTimeout(finish, timeoutMs);
     // Both signals, always — whichever lands first opens the curtain.
-    void sync.whenServerSynced.then(finish);
+    void sync.whenLinkedSynced.then(finish);
     roomMap.observe(observer);
     // Guard the race between the initial ready() check and observe() attaching.
     if (ready()) finish();
@@ -2104,12 +2117,13 @@ async function transitTo(
     // one door BEFORE the arrival choreography resolves the walk-in, so both
     // the walk-in and the way back work (it used to run after performRoomSwap
     // returned, which was too late — completeAdapterArrival had already skipped
-    // the walk-in). Gated purely on DATA (a `d:` far door + a genuinely
-    // doorless doc — the marker doesn't count toward doorLayoutDocSize), never
-    // on a room id: there are no room types (owner ruling, 2026-08-13).
+    // the walk-in). Gated purely on DATA (a recorded farDoor — cardinal OR
+    // free `d:` — plus a genuinely doorless doc; the marker doesn't count
+    // toward doorLayoutDocSize), never on a room id: there are no room types
+    // (owner ruling, 2026-08-13).
     beforeArrive: () => {
       if (
-        depState?.farDoor?.startsWith("d:") &&
+        depState?.farDoor &&
         depState.farWall &&
         doorLayoutDocSize() === 0
       ) {

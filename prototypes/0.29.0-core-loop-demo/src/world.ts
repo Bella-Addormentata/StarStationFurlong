@@ -250,6 +250,10 @@ export class World {
   private robots = new Map<string, PoolWaiter>();
   /** Route the live robots were built with — a change rebuilds them all. */
   private robotsPatrol: Array<[number, number]> | null = null;
+  /** 🌌 The active room's THEME, stashed by applyRoomVisuals so reconcileFurniture
+   *  can recompute the robot patrol when a pool is added/removed without a
+   *  re-entry (the patrol falls back to the theme when there's no pool). */
+  private currentTheme: RoomTheme = "interior";
   /** 🎰🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -2233,6 +2237,7 @@ export class World {
     const resolvedTheme: RoomTheme = theme ?? "interior";
     const deck = resolvedTheme === "outdoor-deck";
     const casinoTheme = resolvedTheme === "casino";
+    this.currentTheme = resolvedTheme;
     this.isOutdoorDeck = deck;
     // Keep the legacy floor-visibility flag in lockstep with the theme: the
     // render loop still reads isOutdoorRoom (world.ts:3427) to hide the
@@ -2268,17 +2273,9 @@ export class World {
     // Keyed on pool PRESENCE (like refreshOutdoorFloor), not the roomId — a
     // pool template dropped into a minted module runs the pool route too, while
     // a poolless sky deck (theme outdoor-deck, no pool) stays on the lobby route.
-    const hasPoolForPatrol = FURNITURE.some(
-      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
-    );
-    const waiterPatrol = hasPoolForPatrol
-      ? POOL_PATROL
-      : casinoTheme
-        ? CASINO_PATROL
-        : LOBBY_PATROL;
     // 🤖 #77C: reconcile the robot SET (one per placed charging-dock, else a
     // single ambient theme robot) against the current furniture.
-    this.reconcileRobots(waiterPatrol);
+    this.reconcileRobots(this.computeRobotPatrol());
 
     reposeDoorTargets(); // 🚪 #18: one currency — poses from the records
     this.dockingSystem?.repositionDoorGroups();
@@ -2787,8 +2784,10 @@ export class World {
     rebuildDevices();
     this.rebuildSkylightMeshList(); // 🪟 skylight panels follow the roof cutaway
     // 🤖 #77C: a placed/removed/moved charging-dock spawns/disposes/repositions
-    // its robot (uses the route the room was last set up with).
-    this.reconcileRobots(this.robotsPatrol);
+    // its robot. The patrol ROUTE is recomputed from the CURRENT furniture too,
+    // so adding/removing a pool re-routes the robots without a re-entry (a pool
+    // dropped into a casino switches it to the pool route, and back on removal).
+    this.reconcileRobots(this.computeRobotPatrol());
     // Replan per changed item (review fix): onObstaclesChanged only cancels an
     // in-flight APPROACH/FINE/TURN toward the item when given that item's id —
     // a no-arg call left a joiner walking to (and sitting/focusing onto) where
@@ -4727,7 +4726,23 @@ export class World {
    *  reconcile no-ops on a piece that's already been added locally, so a placed
    *  charging-dock would otherwise not spawn its robot. Idempotent + cheap. */
   public refreshRobots(): void {
-    this.reconcileRobots(this.robotsPatrol);
+    this.reconcileRobots(this.computeRobotPatrol());
+  }
+
+  /** 🤖 The robot patrol route from the room's CURRENT contents + theme. A pool
+   *  in the room runs the pool route (pool PRESENCE, like refreshOutdoorFloor);
+   *  otherwise the theme supplies the fallback (casino floor, else lobby). This
+   *  is recomputed on every reconcile — adding/removing a pool re-routes the
+   *  robots without a re-entry (no room types: the route follows the furniture). */
+  private computeRobotPatrol(): Array<[number, number]> {
+    const hasPool = FURNITURE.some(
+      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+    );
+    return hasPool
+      ? POOL_PATROL
+      : this.currentTheme === "casino"
+        ? CASINO_PATROL
+        : LOBBY_PATROL;
   }
 
   private reconcileRobots(waiterPatrol: Array<[number, number]> | null): void {
