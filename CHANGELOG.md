@@ -12,6 +12,19 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO (gated on spike B-7), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.34.5 — 2026-08-14
+
+### 🛰️ Vestibules from space + universal modules — no more room types
+
+Two fixes from your reports, plus a hardening pass that grew out of the review (#108).
+
+- **🔭 Your own room's vestibules no longer vanish from the space view.** The atlas deliberately skips the tubes touching the room you're standing in (they're drawn by the room view) — but their opacity came from the proximity fade, which rests at 0. From space you're never near a door, so exactly *your* room's vestibules drew invisible, and the missing set changed as you moved. At atlas zoom the fade now targets full opacity; the room view is unchanged.
+- **🧩 Modules are universal — there are no room types.** Any module becomes a casino, a pool, or both by what you place in it. The bookkeeping that used to key on two hard-coded room ids is gone: claiming a room no longer auto-pairs phantom pool/casino links, an empty door doc means *no doors* (everywhere), floor texture and decor follow the room's *theme* (a per-room setting), and templates are the one-click way to furnish a module into something.
+- **🩹 A wiped module heals its own door.** If a module's door records are lost, walking in from its partner room re-seeds exactly the door the connection enters through — the walk-in and the way back both work, and no phantom edges appear.
+- **🛰️ Cross-station arrivals are trustworthy now.** The transit curtain waits for a *verified* signed frame from the room's host (not the local node's possibly-empty first reply), so you're never staged in a room still showing default state — and a forged or premature signal can't open it early.
+- **Honest limits.** The two originally-authored rooms are now plain rooms whose docs happen to hold casino/pool furniture; one click of their template restores and stamps them. Already-contaminated docs keep phantom pairings until re-paired (the fix stops *new* contamination).
+- **Release line:** version bumped to 0.34.5, all nine locations. **Node binaries UNCHANGED** — frontend-only (TypeScript); no Rust node code changed since v0.33.30.
+
 ## v0.34.4 — 2026-08-12
 
 ### 🛑📐 Placement you can actually read — your room shows its true shape
