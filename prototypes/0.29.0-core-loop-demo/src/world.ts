@@ -114,6 +114,7 @@ import {
   createRouletteUI,
   createCrapsUI,
   createSlotMachineUI,
+  operateActiveSlotMachine,
   clearPendingSlotPlays,
   createRobotDockUI,
   createCloneVatUI,
@@ -130,6 +131,9 @@ import type {
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
+  SlotMachineVisualHandle,
+  SlotMachineCabinetControl,
+  DeviceUI,
   DeviceTarget,
 } from "./devices";
 import { subscribeGames, readGame } from "./games/gamesDoc";
@@ -348,6 +352,9 @@ export class World {
   private trunkLids: Map<string, TrunkLidHandle> = new Map();
   /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
   private cloneVats: Map<string, CloneVatHandle> = new Map();
+  private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
+  private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
+  public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
   /** 🧬 True once the queued spawn has seen the exterior boot view (zoom ≥ 3)
@@ -439,6 +446,9 @@ export class World {
 
     // 💦 Pool water entry → splash burst at the surface (big = dive landing).
     this.player.onWaterEntry = (x, y, z, big) => this.spawnSplash(x, y, z, big);
+    this.player.onSeatSettled = (seat) => {
+      if (seat.firstPerson) this.onFirstPersonSeat?.(seat.faceAngle);
+    };
 
     // Furniture layout sync (issue #60 E4): reconcile the local room to the
     // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
@@ -1480,6 +1490,12 @@ export class World {
         }
         if (obj.userData.cloneVat) {
           this.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
+        }
+        if (obj.userData.slotMachineVisual) {
+          this.slotMachineVisuals.set(
+            item.id,
+            obj.userData.slotMachineVisual as SlotMachineVisualHandle,
+          );
         }
         if (reveal) {
           const mat = obj.material as THREE.Material & {
@@ -2854,6 +2870,7 @@ export class World {
     // handle — update() tweens against disposed meshes and the games-map
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
+    this.slotMachineVisuals.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3539,6 +3556,10 @@ export class World {
 
     // 🧬 Advance clone-vat drain / door-spin cycles (same idiom)
     for (const vat of this.cloneVats.values()) vat.update(deltaTime);
+
+    // 🎰 Keep physical cabinet reels synchronized for nearby spectators.
+    for (const slot of this.slotMachineVisuals.values()) slot.update(deltaTime);
+    this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     const activePlayer = this.isPlayerActive() ? this.player : null;
@@ -4960,6 +4981,68 @@ export class World {
    * build the kind-appropriate focused UI, and hand both to the
    * DeviceFocusController, which wires its hooks into navigateToDevice.
    */
+  public handleSlotMachineControl(
+    deviceId: string,
+    control: SlotMachineCabinetControl | "service",
+    value?: number,
+  ): boolean {
+    const device = findDevice(deviceId);
+    if (!device || device.kind !== "slotMachine" || !this.isPlayerActive()) return false;
+    const visual = this.slotMachineVisuals.get(deviceId);
+    const deps = {
+      itemId: deviceId,
+      isHouse: () => canEditRoom().ok,
+      onDenominationChange: (amount: number) => visual?.setDenomination(amount),
+      onMessage: (message: string) => visual?.showMessage(message),
+    };
+    if (control === "service") {
+      const permission = canEditRoom();
+      if (!permission.ok) {
+        visual?.showMessage("OWNER ONLY");
+        showHint(permission.reason);
+        return true;
+      }
+      const serviceUI = createSlotMachineUI(deps, true);
+      if (deviceFocus.getActiveDeviceId() === deviceId
+        && deviceFocus.replaceFocusedUI(serviceUI)) return true;
+      deviceFocus.beginFocus(this.player, device, serviceUI);
+      return true;
+    }
+    const hasCabinetSession = deviceFocus.getActiveDeviceId() === deviceId
+      || this.seatedSlotSession?.itemId === deviceId;
+    if (!hasCabinetSession) {
+      this.requestDeviceFocus(deviceId);
+      return true;
+    }
+    const operated = operateActiveSlotMachine(deviceId, control, value);
+    if (operated && control === "pull") visual?.pullLever();
+    return operated;
+  }
+
+  private updateSeatedSlotSession(): void {
+    const seatId = this.player.getSeatedSeatId();
+    const separator = seatId?.lastIndexOf(":") ?? -1;
+    const itemId = separator >= 0 ? seatId!.slice(0, separator) : null;
+    const seatedOnSlot = itemId !== null
+      && FURNITURE.find((item) => item.id === itemId)?.kind === "slot-machine";
+    if (!seatedOnSlot || deviceFocus.isActive()) {
+      this.seatedSlotSession?.ui.unmount();
+      this.seatedSlotSession = null;
+      return;
+    }
+    if (this.seatedSlotSession?.itemId === itemId) return;
+    this.seatedSlotSession?.ui.unmount();
+    const visual = this.slotMachineVisuals.get(itemId);
+    const ui = createSlotMachineUI({
+      itemId,
+      isHouse: () => canEditRoom().ok,
+      onDenominationChange: (amount) => visual?.setDenomination(amount),
+      onMessage: (message) => visual?.showMessage(message),
+    });
+    ui.mount(document.body);
+    this.seatedSlotSession = { itemId, ui };
+  }
+
   public requestDeviceFocus(deviceId: string): void {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
@@ -5075,12 +5158,15 @@ export class World {
     }
 
     if (device.kind === "slotMachine") {
+      const visual = this.slotMachineVisuals.get(deviceId);
       deviceFocus.beginFocus(
         this.player,
         device,
         createSlotMachineUI({
           itemId: deviceId,
           isHouse: () => canEditRoom().ok,
+          onDenominationChange: (amount) => visual?.setDenomination(amount),
+          onMessage: (message) => visual?.showMessage(message),
         }),
       );
       return;

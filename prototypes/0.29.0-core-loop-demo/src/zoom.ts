@@ -389,6 +389,16 @@ export class MultiScaleZoomView {
     return this.currentLevel;
   }
 
+  /** Enter level-1 first person from the normal room view, facing the seat. */
+  public requestFirstPerson(faceAngle?: number): void {
+    if (this.currentLevel !== 2 || isDeviceFocusActive()) return;
+    if (faceAngle !== undefined) {
+      yaw = faceAngle;
+      pitch = 0;
+    }
+    this.zoomIn();
+  }
+
   /**
    * #49 pointer-lock click model: swallow the click event paired with the
    * mousedown that freed the cursor (its coordinates are frozen at the lock

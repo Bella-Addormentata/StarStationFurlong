@@ -62,7 +62,9 @@ const settling = new Set<string>();
 const accepting = new Set<string>();
 const acceptedRounds = new Map<string, AcceptedSlotRound>();
 const manualOperators = new Map<string, ManualSlotOperator>();
+const requestPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
 const REVEAL_TIMEOUT_MS = 30_000;
+const REQUEST_POLL_MS = 250;
 const MANUAL_LEASE_MS = 8_000;
 const MANUAL_LEASE_SETTLE_MS = 2_000;
 const MANUAL_LEASE_RENEW_MS = 3_000;
@@ -222,6 +224,11 @@ export function tickSlotMachine(machineId: string, operatorId?: string): void {
     return;
   }
 
+  const now = Date.now();
+  const docEpoch = casinoDocEpoch();
+  const lastPoll = requestPolls.get(machineId);
+  if (lastPoll?.docEpoch === docEpoch && now - lastPoll.checkedAt < REQUEST_POLL_MS) return;
+  requestPolls.set(machineId, { docEpoch, checkedAt: now });
   const request = readSlotPlayRequests(machineId)[0];
   if (!request) return;
   accepting.add(machineId);
@@ -443,6 +450,7 @@ export function closeSlotMachine(
   canManage = canRunCroupier(),
 ): void {
   manualOperators.delete(machineId);
+  requestPolls.delete(machineId);
   const lease = readSlotOperatorLease(machineId);
   if (lease?.sessionId === manualSessionId) clearSlotOperatorLease(machineId);
   if (!canManage) return;

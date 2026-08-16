@@ -6422,6 +6422,7 @@ function setupZoomView() {
   // Mount Multiscale Keyboard Zoom manager
   multiScaleZoom = new MultiScaleZoomView();
   multiScaleZoom.mount(document.body);
+  world.onFirstPersonSeat = (faceAngle) => multiScaleZoom?.requestFirstPerson(faceAngle);
   (window as any).multiScaleZoom = multiScaleZoom;
 }
 
@@ -6765,6 +6766,30 @@ function setupClickToEnter() {
   setTimeout(bootExterior, 400); // let startMorph flip isMorphing first
 }
 
+function findSlotMachineControl(scene: THREE.Scene): {
+  deviceId: string;
+  control: "denomination" | "pull" | "service";
+  value?: number;
+} | null {
+  const controls: THREE.Object3D[] = [];
+  scene.traverse((child) => {
+    if (child.userData?.slotControl && child.userData.slotMachineId) {
+      controls.push(child);
+    }
+  });
+  const hit = raycaster.intersectObjects(controls, false)[0];
+  if (!hit) return null;
+  const control = hit.object.userData.slotControl;
+  if (control !== "denomination" && control !== "pull" && control !== "service") return null;
+  return {
+    deviceId: hit.object.userData.slotMachineId as string,
+    control,
+    ...(typeof hit.object.userData.slotValue === "number"
+      ? { value: hit.object.userData.slotValue as number }
+      : {}),
+  };
+}
+
 function onCanvasClick(event: MouseEvent): void {
   if (!hasEntered || !rendererApi) return;
 
@@ -6780,10 +6805,21 @@ function onCanvasClick(event: MouseEvent): void {
     return;
   }
 
-  // ── While the device-focus camera is live, any click reaching the canvas
-  //    releases the focus (#33 D0.3 — device-UI panels stop propagation, so
-  //    UI clicks never land here). Raycasting is skipped entirely: the view
-  //    is the focus perspective camera, not the isometric one.
+  // ── While the device-focus camera is live, cabinet controls keep the view;
+  //    every other canvas click retains #33 D0.3's release behavior.
+  const focusRenderer = window.gameRenderer;
+  if (isDeviceFocusActive() && focusRenderer) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, deviceFocus.getCamera() ?? focusRenderer.camera);
+    const slotControl = findSlotMachineControl(focusRenderer.scene);
+    if (slotControl
+      && world.handleSlotMachineControl(
+        slotControl.deviceId,
+        slotControl.control,
+        slotControl.value,
+      )) return;
+  }
   if (isDeviceFocusActive()) {
     deviceFocus.release();
     return;
@@ -6807,6 +6843,14 @@ function onCanvasClick(event: MouseEvent): void {
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
   raycaster.setFromCamera(mouse, camera);
+
+  const slotControl = findSlotMachineControl(scene);
+  if (slotControl
+    && world.handleSlotMachineControl(
+      slotControl.deviceId,
+      slotControl.control,
+      slotControl.value,
+    )) return;
 
   // ── Intercept Golden Keypad Clicks for our Docking System
   if (world.dockingSystem) {
@@ -6941,6 +6985,19 @@ function onCanvasClick(event: MouseEvent): void {
     });
 
     const deviceHits = raycaster.intersectObjects(deviceMeshes, false);
+    if (
+      deviceHits.length > 0 &&
+      deviceHits[0].object.userData.skipDeviceHit
+    ) {
+      // The built-in slot chair deliberately is not a device target, but the
+      // floor point behind it is perspective-shifted well outside its seat box.
+      // Route through the chair mesh itself so the normal seat picker receives
+      // the authored chair coordinates instead of walking across the room.
+      const chairPoint = new THREE.Vector3();
+      deviceHits[0].object.getWorldPosition(chairPoint);
+      world.navigateTo(chairPoint.x, chairPoint.z);
+      return;
+    }
     if (
       deviceHits.length > 0 &&
       !deviceHits[0].object.userData.skipDeviceHit

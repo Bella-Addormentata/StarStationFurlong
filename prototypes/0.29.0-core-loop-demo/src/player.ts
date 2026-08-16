@@ -214,6 +214,8 @@ export class Player {
   public onWaterEntry:
     | ((x: number, y: number, z: number, big: boolean) => void)
     | null = null;
+  /** Fired once after a sit-down slide reaches its authored seat. */
+  public onSeatSettled: ((seat: Seat) => void) | null = null;
   // ── 🏊 Free-swim mode ─────────────────────────────────────────────────────
   /** True while freely swimming inside the pool basin (not seat-bound). */
   private swimMode = false;
@@ -1534,6 +1536,7 @@ export class Player {
 
     if (this.sitAnim >= 1) {
       this.sitPhase = "SEATED";
+      this.onSeatSettled?.(seat);
       // 🌉 Plopped over the rim into the hot tub — a small splash at the tub
       // waterline sells the landing.
       if (this.sitSlideFrom) {

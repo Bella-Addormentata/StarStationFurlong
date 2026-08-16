@@ -34,13 +34,14 @@ import type {
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
+  SlotMachineVisualHandle,
 } from "./devices";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
-import { DEFAULT_PAYTABLE, computeRTP } from "./games/slots";
-import type { SlotPayEntry } from "./games/slots";
-import { readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
+import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
+import type { SlotPayEntry, SlotSymbol } from "./games/slots";
+import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
@@ -158,6 +159,8 @@ export interface SeatTemplate {
   lie?: boolean;
   /** 🏊 true ⇒ the occupant renders the 'swim' pose (pool water seats). */
   swim?: boolean;
+  /** Enter regular first-person once the sit-down slide completes. */
+  firstPerson?: boolean;
   /**
    * 🏊‍♂️ true ⇒ this seat is a high-dive launch pad: clicking a swim seat of
    * the SAME item while seated here triggers a parabolic dive instead of the
@@ -2646,6 +2649,7 @@ const slotMachineSeats: SeatTemplate[] = [
     sit: { x: 0, z: -0.62 },
     faceAngle: 0,
     sitY: seatOn(0.475),
+    firstPerson: true,
   },
 ];
 
@@ -3324,8 +3328,8 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "slotMachine",
       front: { x: 0, z: -1.5 },
       faceAngle: 0,
-      eye: { x: 0, y: 1.45, z: -0.95 },
-      anchor: { x: 0, y: 1.25, z: -0.05 },
+      eye: { x: 0, y: 1.50, z: -1.45 },
+      anchor: { x: 0, y: 1.35, z: 0.45 },
     },
   },
 };
@@ -5543,16 +5547,38 @@ function buildCloneVat(ctx: BuildCtx) {
 // lever. A coin tray at the bottom catches winning chips. The canvas face
 // texture paints the current paytable so odds are always visible to the player.
 //
-// Local frame (rot 0): the cabinet FACE (player side) is at z ≈ −0.1, the
-// seat is centred at z ≈ −0.62, and the machine back is at z ≈ +0.45.
+// Local frame (rot 0): the cabinet FACE (player side) is at z ≈ +0.4, the
+// seat is centred at z ≈ −0.62, and the machine back is at z ≈ +0.95.
 // The pull lever is on the right side (+x).
-function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
+function buildSlotMachine({
+  itemId,
+  m,
+  place: addPlace,
+  addLight: addPointLight,
+  attach,
+}: BuildCtx) {
   const BODY    = 0x2a3444; // gunmetal (wall-computer family)
   const CHROME  = 0x8a93a0; // steel trim
   const GOLD    = 0xd4a84b; // accent gold
   const GLASS   = 0xb8d4f8; // pay-window glass tint
   const FELT    = 0x2e7d46; // seat pad green
   const LIGHT   = 0xfff0c8; // warm top light
+
+  // The cabinet occupies the rear 1×1 square of the 1×2 footprint. Its back
+  // lands at z ≈ +0.94 (the footprint edge is +1.0), while the chair remains
+  // in the front square with enough clear knee space between them.
+  const cabinet = new THREE.Group();
+  cabinet.position.z = 0.5;
+  attach(cabinet);
+  const place: BuildCtx["place"] = (...args) => {
+    const mesh = addPlace(...args);
+    cabinet.add(mesh);
+    return mesh;
+  };
+  const addLight: BuildCtx["addLight"] = (light, ...args) => {
+    addPointLight(light, ...args);
+    cabinet.add(light);
+  };
 
   // ── Cabinet body ──────────────────────────────────────────────────────────
   // Main box (z: −0.10 → +0.44, y: 0.38 → 1.90, x: −0.30 → +0.30)
@@ -5572,8 +5598,16 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   // ── Top dome / marquee ────────────────────────────────────────────────────
   place(new THREE.BoxGeometry(0.62, 0.14, 0.56), m(BODY,   0.55, 0.45), 0, 1.92, 0.17);
   place(new THREE.BoxGeometry(0.58, 0.04, 0.52), m(GOLD,   0.4,  0.5 ), 0, 1.86, 0.17);
-  // Neon-strip indicator at the very top (emissive gold)
-  place(new THREE.BoxGeometry(0.52, 0.06, 0.04), m(GOLD, 0.3, 0.5, GOLD, 0.8), 0, 1.96, -0.08);
+  // Neon-strip indicator at the very top doubles as the owner's service key.
+  const serviceLight = place(
+    new THREE.BoxGeometry(0.48, 0.065, 0.04),
+    m(GOLD, 0.25, 0.5, GOLD, 1.2),
+    0,
+    1.965,
+    -0.14,
+  );
+  serviceLight.userData.slotControl = "service";
+  serviceLight.userData.slotMachineId = itemId;
   // Top-mount warm point light (dims ambient lighting on the player)
   addLight(new THREE.PointLight(LIGHT, 0, 2.2), 0, 2.1, -0.12, 0.35);
 
@@ -5589,31 +5623,251 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   {
     const glassMat = m(GLASS, 0.05, 0.0);
     glassMat.transparent = true;
-    glassMat.userData.baseOpacity = 0.55;
+    glassMat.userData.baseOpacity = 0.22;
     place(new THREE.BoxGeometry(0.46, 0.30, 0.008), glassMat, 0, 1.30, -0.188);
   }
-  // Three reel drums behind the glass (decorative — grey cylinders with deco
-  // colour band representing the active face)
-  const reelColors = [0xc43c3c, 0x2e7d46, 0x23252e] as const; // red/green/black
+  // Three physical reel drums with the complete seven-symbol strip wrapped
+  // around each circumference. The drum rotation itself moves the symbols.
+  const reelDrums: THREE.Mesh[] = [];
+  const symbolFaces: Record<SlotSymbol, { face: string; color: string }> = {
+    cherry: { face: "🍒", color: "#B91C1C" },
+    lemon: { face: "🍋", color: "#CA8A04" },
+    orange: { face: "🍊", color: "#EA580C" },
+    plum: { face: "PLUM", color: "#7E22CE" },
+    bell: { face: "🔔", color: "#B7791F" },
+    bar: { face: "BAR", color: "#111827" },
+    seven: { face: "7", color: "#DC2626" },
+  };
+  const stripCell = 256;
+  const stripCanvas = document.createElement("canvas");
+  stripCanvas.width = stripCell * SLOT_SYMBOLS.length;
+  stripCanvas.height = stripCell;
+  const stripContext = stripCanvas.getContext("2d")!;
+  stripContext.fillStyle = "#F5F0E4";
+  stripContext.fillRect(0, 0, stripCanvas.width, stripCanvas.height);
+  for (let cell = 0; cell < SLOT_SYMBOLS.length; cell++) {
+    // CylinderGeometry's front is UV u=.5. The baked Z rotation makes larger
+    // reel positions sample decreasing u, so cell 3 is stop zero and the
+    // remaining symbols proceed in reverse UV order around the drum.
+    const symbol = SLOT_SYMBOLS[(3 - cell + SLOT_SYMBOLS.length) % SLOT_SYMBOLS.length];
+    const presentation = symbolFaces[symbol];
+    const centerX = cell * stripCell + stripCell / 2;
+    stripContext.save();
+    stripContext.translate(centerX, stripCell / 2);
+    stripContext.rotate(-Math.PI / 2);
+    stripContext.fillStyle = presentation.color;
+    stripContext.font = symbol === "plum" || symbol === "bar"
+      ? "bold 76px sans-serif"
+      : "116px 'Segoe UI Emoji', sans-serif";
+    stripContext.textAlign = "center";
+    stripContext.textBaseline = "middle";
+    stripContext.fillText(presentation.face, 0, 2);
+    stripContext.restore();
+    stripContext.strokeStyle = "rgba(80,70,55,.18)";
+    stripContext.lineWidth = 4;
+    stripContext.strokeRect(cell * stripCell + 2, 2, stripCell - 4, stripCell - 4);
+  }
+  const stripTexture = new THREE.CanvasTexture(stripCanvas);
+  stripTexture.minFilter = THREE.LinearMipmapLinearFilter;
+  stripTexture.magFilter = THREE.LinearFilter;
+  stripTexture.generateMipmaps = true;
+  stripTexture.anisotropy =
+    window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+  stripTexture.colorSpace = THREE.SRGBColorSpace;
+  const stripMaterial = m(0xffffff, 0.52, 0.08);
+  stripMaterial.map = stripTexture;
+  stripMaterial.userData.baseOpacity = 1;
   for (let i = 0; i < 3; i++) {
     const rx = (i - 1) * 0.14;
-    // Drum body
-    place(new THREE.CylinderGeometry(0.055, 0.055, 0.26, 14),
-      m(0xf5f2e8, 0.6, 0.1), rx, 1.30, -0.115);
-    // Active-face colour band on the front of the drum
-    place(new THREE.BoxGeometry(0.10, 0.10, 0.02),
-      m(reelColors[i], 0.5, 0.2), rx, 1.30, -0.174);
+    const drumGeometry = new THREE.CylinderGeometry(0.095, 0.095, 0.10, 56);
+    drumGeometry.rotateZ(Math.PI / 2);
+    reelDrums.push(place(
+      drumGeometry,
+      stripMaterial,
+      rx,
+      1.30,
+      -0.09,
+    ));
   }
+
+  const displayCanvas = document.createElement("canvas");
+  displayCanvas.width = 512;
+  displayCanvas.height = 128;
+  const displayContext = displayCanvas.getContext("2d")!;
+  const displayTexture = new THREE.CanvasTexture(displayCanvas);
+  displayTexture.minFilter = THREE.LinearMipmapLinearFilter;
+  displayTexture.magFilter = THREE.LinearFilter;
+  displayTexture.generateMipmaps = true;
+  displayTexture.anisotropy =
+    window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+  displayTexture.colorSpace = THREE.SRGBColorSpace;
+  const displayMaterial = new THREE.MeshBasicMaterial({
+    map: displayTexture,
+    transparent: true,
+    opacity: 0,
+  });
+  displayMaterial.userData.baseOpacity = 0.96;
+  place(
+    new THREE.PlaneGeometry(0.38, 0.055),
+    displayMaterial,
+    0,
+    1.60,
+    -0.118,
+    Math.PI,
+  );
+
+  const reelSpeeds = [14, 17, 20] as const;
+  const reelLandingSeconds = [0.62, 0.84, 1.06] as const;
+  let spinningRequest: string | null = null;
+  let spinElapsed = 0;
+  let landingRequest: string | null = null;
+  let landingElapsed = 0;
+  let reelPositions: [number, number, number] = [0, 2, 4];
+  let landingStarts: [number, number, number] = [0, 0, 0];
+  let landingTargets: [number, number, number] = [0, 0, 0];
+  let denomination = 5;
+  let displayText = "";
+  let displayedRequest: string | null = null;
+  const leverRestAngle = -0.35;
+  const leverPulledAngle = -1.35;
+  let leverPivot: THREE.Group | null = null;
+  let leverPullElapsed = -1;
+  const positiveModulo = (value: number, divisor: number): number =>
+    ((value % divisor) + divisor) % divisor;
+  const paintPhysicalReels = (): void => {
+    for (let reelIndex = 0; reelIndex < 3; reelIndex++) {
+      const position = reelPositions[reelIndex];
+      reelDrums[reelIndex].rotation.x =
+        -(position / SLOT_SYMBOLS.length) * Math.PI * 2;
+    }
+  };
+  const paintDisplay = (text: string): void => {
+    if (text === displayText) return;
+    displayText = text;
+    displayContext.fillStyle = "#04140B";
+    displayContext.fillRect(0, 0, 512, 128);
+    displayContext.strokeStyle = "#00C060";
+    displayContext.lineWidth = 6;
+    displayContext.strokeRect(4, 4, 504, 120);
+    displayContext.fillStyle = "#73FFAA";
+    displayContext.font = "bold 58px monospace";
+    displayContext.textAlign = "center";
+    displayContext.textBaseline = "middle";
+    displayContext.fillText(text.slice(0, 14), 256, 66);
+    displayTexture.needsUpdate = true;
+  };
+  const handle: SlotMachineVisualHandle = {
+    setDenomination(amount: number): void {
+      denomination = amount;
+      paintDisplay(`BET ${amount}`);
+    },
+    showMessage(message: string): void {
+      paintDisplay(message.toUpperCase());
+    },
+    pullLever(): void {
+      leverPullElapsed = 0;
+    },
+    update(deltaTime: number): void {
+      const state = readSlotMachineState(itemId);
+      const elapsed = Math.max(0, deltaTime);
+      if (leverPivot) {
+        if (leverPullElapsed >= 0) {
+          leverPullElapsed += elapsed;
+          const progress = Math.min(1, leverPullElapsed / 0.7);
+          const down = progress < 0.45
+            ? progress / 0.45
+            : 1 - (progress - 0.45) / 0.55;
+          const eased = Math.max(0, Math.min(1, down));
+          const smooth = eased * eased * (3 - 2 * eased);
+          leverPivot.rotation.x =
+            leverRestAngle + (leverPulledAngle - leverRestAngle) * smooth;
+          if (progress >= 1) {
+            leverPullElapsed = -1;
+            leverPivot.rotation.x = leverRestAngle;
+          }
+        } else {
+          leverPivot.rotation.x = leverRestAngle;
+        }
+      }
+      if (state?.phase === "spinning") {
+        if (spinningRequest !== state.requestId) {
+          spinningRequest = state.requestId;
+          spinElapsed = Math.max(0, (Date.now() - state.acceptedAt) / 1000);
+          landingRequest = null;
+          landingElapsed = 0;
+          const roundOffset = state.round * 3;
+          reelPositions = [roundOffset, roundOffset + 2, roundOffset + 4];
+          paintDisplay("SPIN");
+        }
+        spinElapsed += elapsed;
+        const speedScale = 0.25 + 0.75 * Math.min(1, spinElapsed / 0.28);
+        reelPositions = reelPositions.map((position, reelIndex) =>
+          position + reelSpeeds[reelIndex] * speedScale * elapsed,
+        ) as [number, number, number];
+      } else {
+        if (state?.phase === "settled"
+          && state.requestId === spinningRequest
+          && state.result
+          && state.requestId !== landingRequest) {
+          landingRequest = state.requestId;
+          landingElapsed = 0;
+          landingStarts = [...reelPositions];
+          landingTargets = reelPositions.map((position, reelIndex) => {
+            const finalIndex = SLOT_SYMBOLS.indexOf(state.result![reelIndex]);
+            const minimumTravel =
+              reelSpeeds[reelIndex] * reelLandingSeconds[reelIndex] * 0.72;
+            let target = Math.ceil(position + minimumTravel);
+            target += positiveModulo(finalIndex - target, SLOT_SYMBOLS.length);
+            return target;
+          }) as [number, number, number];
+        }
+        if (state?.phase === "settled"
+          && state.requestId
+          && state.requestId !== displayedRequest) {
+          displayedRequest = state.requestId;
+          paintDisplay(state.failure
+            ? "VOID"
+            : state.credited
+              ? `WIN ${state.credited}`
+              : "NO WIN");
+        }
+        spinningRequest = null;
+        const landing = state?.phase === "settled"
+          && state.requestId === landingRequest
+          && state.result !== null
+          && landingElapsed < reelLandingSeconds[2];
+        if (landing) {
+          landingElapsed += elapsed;
+          reelPositions = reelPositions.map((_position, reelIndex) => {
+            const progress = Math.min(1, landingElapsed / reelLandingSeconds[reelIndex]);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            return landingStarts[reelIndex]
+              + (landingTargets[reelIndex] - landingStarts[reelIndex]) * eased;
+          }) as [number, number, number];
+        } else if (state?.result) {
+          reelPositions = state.result.map((symbol) => SLOT_SYMBOLS.indexOf(symbol)) as
+            [number, number, number];
+        }
+      }
+      paintPhysicalReels();
+    },
+  };
+  const visualCarrier = reelDrums[0];
+  visualCarrier.userData.slotMachineVisual = handle;
+  paintPhysicalReels();
+  paintDisplay(`BET ${denomination}`);
 
   // ── Paytable panel below the window ──────────────────────────────────────
   {
     const pcv = document.createElement('canvas');
-    pcv.width = 128; pcv.height = 80;
+    pcv.width = 512; pcv.height = 320;
     const pc2 = pcv.getContext('2d')!;
     const ptex = new THREE.CanvasTexture(pcv);
-    ptex.minFilter = THREE.NearestFilter;
-    ptex.magFilter = THREE.NearestFilter;
-    ptex.generateMipmaps = false;
+    ptex.minFilter = THREE.LinearMipmapLinearFilter;
+    ptex.magFilter = THREE.LinearFilter;
+    ptex.generateMipmaps = true;
+    ptex.anisotropy =
+      window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
     ptex.colorSpace = THREE.SRGBColorSpace;
     const pmat = new THREE.MeshBasicMaterial({
       map: ptex, transparent: true, opacity: 0,
@@ -5625,17 +5879,22 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
     const panel = place(pgeo, pmat, 0, 1.05, -0.112, Math.PI);
     const drawPaytable = (paytable: readonly SlotPayEntry[]): void => {
       pc2.fillStyle = '#14181E';
-      pc2.fillRect(0, 0, 128, 80);
+      pc2.fillRect(0, 0, 512, 320);
       pc2.strokeStyle = '#3A424C';
-      pc2.strokeRect(1, 1, 126, 78);
+      pc2.lineWidth = 4;
+      pc2.strokeRect(4, 4, 504, 312);
       pc2.fillStyle = '#D4A84B';
-      pc2.font = 'bold 8px monospace';
+      pc2.font = 'bold 32px monospace';
       pc2.textAlign = 'center';
-      pc2.fillText(`PAYTABLE · RTP ${computeRTP(paytable).toFixed(2)}%`, 64, 12);
+      pc2.fillText(`PAYTABLE · RTP ${computeRTP(paytable).toFixed(2)}%`, 256, 48);
       pc2.fillStyle = '#E8ECF2';
-      pc2.font = '7px monospace';
+      pc2.font = '28px monospace';
       paytable.slice(0, 5).forEach((entry, ri) => {
-        pc2.fillText(`${entry.label.slice(0, 14)} → ${entry.multiplier}×`, 64, 25 + ri * 11);
+        pc2.fillText(
+          `${entry.label.slice(0, 14)} → ${entry.multiplier}×`,
+          256,
+          100 + ri * 44,
+        );
       });
       ptex.needsUpdate = true;
     };
@@ -5654,19 +5913,63 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
 
   // ── Denomination / credit display above window ─────────────────────────────
   place(new THREE.BoxGeometry(0.46, 0.09, 0.03), m(0x14181e, 0.85, 0.1), 0, 1.60, -0.10);
-  // Green LED bar (emissive)
-  place(new THREE.BoxGeometry(0.38, 0.04, 0.015), m(0x00c060, 0.3, 0.2, 0x00c060, 0.9),
-    0, 1.60, -0.115);
 
   // ── Denomination push buttons (4 × chip colors) ──────────────────────────
   const denomCols = [0xe8e2d2, 0xc43c3c, 0x2e7d46, 0x23252e] as const; // 1/5/25/100
+  const denominations = [1, 5, 25, 100] as const;
   for (let bi = 0; bi < 4; bi++) {
     const bx = -0.18 + bi * 0.12;
     // Button housing
-    place(new THREE.BoxGeometry(0.09, 0.06, 0.04), m(0x3d4a5e, 0.55, 0.4), bx, 0.85, -0.105);
+    const housing = place(
+      new THREE.BoxGeometry(0.09, 0.06, 0.04),
+      m(0x3d4a5e, 0.55, 0.4),
+      bx,
+      0.85,
+      -0.105,
+    );
     // Button face (chip colour)
-    place(new THREE.CylinderGeometry(0.025, 0.025, 0.015, 10),
+    const face = place(new THREE.CylinderGeometry(0.025, 0.025, 0.015, 10),
       m(denomCols[bi], 0.5, 0.25), bx, 0.885, -0.112);
+    for (const button of [housing, face]) {
+      button.userData.slotControl = "denomination";
+      button.userData.slotValue = denominations[bi];
+      button.userData.slotMachineId = itemId;
+    }
+    const labelCanvas = document.createElement("canvas");
+    labelCanvas.width = 128;
+    labelCanvas.height = 64;
+    const labelContext = labelCanvas.getContext("2d")!;
+    labelContext.fillStyle = "#101820";
+    labelContext.fillRect(0, 0, 128, 64);
+    labelContext.fillStyle = "#F5F0E4";
+    labelContext.font = "bold 38px monospace";
+    labelContext.textAlign = "center";
+    labelContext.textBaseline = "middle";
+    labelContext.fillText(String(denominations[bi]), 64, 34);
+    const labelTexture = new THREE.CanvasTexture(labelCanvas);
+    labelTexture.minFilter = THREE.LinearMipmapLinearFilter;
+    labelTexture.magFilter = THREE.LinearFilter;
+    labelTexture.generateMipmaps = true;
+    labelTexture.anisotropy =
+      window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+    labelTexture.colorSpace = THREE.SRGBColorSpace;
+    const labelMaterial = new THREE.MeshBasicMaterial({
+      map: labelTexture,
+      transparent: true,
+      opacity: 0,
+    });
+    labelMaterial.userData.baseOpacity = 1;
+    const label = place(
+      new THREE.PlaneGeometry(0.07, 0.035),
+      labelMaterial,
+      bx,
+      0.85,
+      -0.132,
+      Math.PI,
+    );
+    label.userData.slotControl = "denomination";
+    label.userData.slotValue = denominations[bi];
+    label.userData.slotMachineId = itemId;
   }
 
   // ── Coin tray (winning chips come out here) ───────────────────────────────
@@ -5675,23 +5978,53 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   place(new THREE.BoxGeometry(0.40, 0.03, 0.10), m(0x14181e, 0.85, 0.1), 0, 0.64, -0.135);
 
   // ── Pull lever (right side, +x) ───────────────────────────────────────────
-  // Ball grip at the top
-  place(new THREE.SphereGeometry(0.045, 10, 8), m(GOLD, 0.35, 0.5), 0.36, 1.62, 0.07);
-  // Lever shaft (slightly angled — resting position)
+  // A horizontal axle projects perpendicular to the cabinet's right side.
+  // Shaft and grip share one centerline at its outer end; the whole axle group
+  // rotates around X for the pull animation.
+  const leverMeshes: THREE.Mesh[] = [];
+  leverPivot = new THREE.Group();
+  leverPivot.position.set(0.37, 1.06, 0.07);
+  leverPivot.rotation.x = leverRestAngle;
+  cabinet.add(leverPivot);
+  const axleGeometry = new THREE.CylinderGeometry(0.05, 0.05, 0.16, 16);
+  axleGeometry.rotateZ(Math.PI / 2);
+  const axle = place(axleGeometry, m(CHROME, 0.35, 0.72), 0, 0, 0);
+  leverPivot.add(axle);
+  leverMeshes.push(axle);
+  const axleCapGeometry = new THREE.CylinderGeometry(0.035, 0.035, 0.018, 16);
+  axleCapGeometry.rotateZ(Math.PI / 2);
+  const axleCap = place(axleCapGeometry, m(GOLD, 0.3, 0.58), 0.089, 0, 0);
+  leverPivot.add(axleCap);
+  leverMeshes.push(axleCap);
+  const armX = 0.08;
+  const grip = place(
+    new THREE.SphereGeometry(0.045, 10, 8),
+    m(GOLD, 0.35, 0.5),
+    armX,
+    0.60,
+    0,
+  );
+  leverPivot.add(grip);
+  leverMeshes.push(grip);
+  // Shaft top and ball center share x/z exactly; a slight overlap makes the
+  // connection continuous instead of leaving a visible gap.
   {
     const shaft = place(new THREE.CylinderGeometry(0.018, 0.020, 0.58, 10),
-      m(CHROME, 0.4, 0.6), 0.36, 1.34, 0.07);
-    shaft.rotation.z = 0.12; // slight lean
+      m(CHROME, 0.4, 0.6), armX, 0.29, 0);
+    leverPivot.add(shaft);
+    leverMeshes.push(shaft);
   }
-  // Pivot housing on the cabinet side
-  place(new THREE.BoxGeometry(0.06, 0.06, 0.06), m(BODY, 0.55, 0.4), 0.325, 1.06, 0.07);
+  for (const lever of leverMeshes) {
+    lever.userData.slotControl = "pull";
+    lever.userData.slotMachineId = itemId;
+  }
 
   // ── Built-in chair ────────────────────────────────────────────────────────
   // These meshes opt out of the group's generic device hit tagging: chair
   // clicks must fall through to the seat click box, not open the machine UI.
   const chairMeshes: THREE.Mesh[] = [];
   // Seat pad (at y ≈ 0.44, with clear knee room before the cabinet)
-  chairMeshes.push(place(
+  chairMeshes.push(addPlace(
     new THREE.BoxGeometry(0.46, 0.07, 0.38),
     m(FELT, 0.85, 0.04),
     0,
@@ -5699,7 +6032,7 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
     -0.62,
   ));
   // Seat base / pedestal
-  chairMeshes.push(place(
+  chairMeshes.push(addPlace(
     new THREE.BoxGeometry(0.16, 0.44, 0.16),
     m(CHROME, 0.4, 0.6),
     0,
@@ -5707,7 +6040,7 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
     -0.62,
   ));
   // Pedestal foot
-  chairMeshes.push(place(
+  chairMeshes.push(addPlace(
     new THREE.BoxGeometry(0.34, 0.04, 0.34),
     m(CHROME, 0.4, 0.5),
     0,
@@ -5715,7 +6048,7 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
     -0.62,
   ));
   // Low back rest
-  chairMeshes.push(place(
+  chairMeshes.push(addPlace(
     new THREE.BoxGeometry(0.44, 0.22, 0.06),
     m(FELT, 0.85, 0.04),
     0,
@@ -7222,6 +7555,7 @@ export function buildSeatList(
         lie: t.lie ?? false,
         swim: t.swim ?? false,
         dive: t.dive ?? false,
+        firstPerson: t.firstPerson ?? false,
       });
     });
   }
