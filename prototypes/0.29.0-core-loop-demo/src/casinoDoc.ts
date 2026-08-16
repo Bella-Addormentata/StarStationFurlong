@@ -606,6 +606,7 @@ export function settleSlotWager(
     || !Number.isSafeInteger(payout) || payout < 0) return false;
   const map = ensureMap();
   const escrowKey = `slot-escrow:${machineId}`;
+  if (!map.has(escrowKey)) return false;
   const escrow = safeCount(map, escrowKey);
   if (payout > escrow) return false;
   const fundingKey = slotFundingBalanceKey(machineId, config);
@@ -636,6 +637,7 @@ export function refundSlotWager(
   if (!isSlotFundingConfig(config) || !Number.isSafeInteger(bet) || bet <= 0) return false;
   const map = ensureMap();
   const escrowKey = `slot-escrow:${machineId}`;
+  if (!map.has(escrowKey)) return false;
   const escrow = safeCount(map, escrowKey);
   const fundingKey = slotFundingBalanceKey(machineId, config);
   const playerKey = `bal:${playerId}`;

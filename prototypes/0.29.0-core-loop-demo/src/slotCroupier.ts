@@ -137,6 +137,8 @@ async function settle(
     state.paytable ?? DEFAULT_PAYTABLE,
   );
   const houseCommit = await commitSlotSeed(houseSeed);
+  const current = readSlotMachineState(machineId);
+  if (current?.phase !== 'spinning' || current.requestId !== state.requestId) return;
   const paid = state.funding
     ? settleSlotWager(machineId, state.player!, state.funding, resolution.credited)
     : false;

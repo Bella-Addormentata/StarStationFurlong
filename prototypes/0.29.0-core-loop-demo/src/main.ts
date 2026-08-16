@@ -6932,13 +6932,19 @@ function onCanvasClick(event: MouseEvent): void {
   if (!multiScaleZoom || multiScaleZoom.getLevel() <= 2) {
     const deviceMeshes: THREE.Object3D[] = [];
     scene.traverse((child) => {
-      if (child.userData && child.userData.isDevice) {
+      if (
+        child.userData &&
+        (child.userData.isDevice || child.userData.skipDeviceHit)
+      ) {
         deviceMeshes.push(child);
       }
     });
 
     const deviceHits = raycaster.intersectObjects(deviceMeshes, false);
-    if (deviceHits.length > 0) {
+    if (
+      deviceHits.length > 0 &&
+      !deviceHits[0].object.userData.skipDeviceHit
+    ) {
       const deviceId = deviceHits[0].object.userData.deviceId as string;
       if (deviceId) {
         if (!multiScaleZoom || multiScaleZoom.getLevel() === 2) {
