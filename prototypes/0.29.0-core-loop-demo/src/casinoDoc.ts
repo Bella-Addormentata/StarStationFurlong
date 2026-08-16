@@ -66,6 +66,7 @@ export interface CrapsTableBets {
 
 let boundDoc: Y.Doc | null = null;
 let casinoMap: Y.Map<unknown> | null = null;
+let bindingEpoch = 0;
 const listeners = new Set<() => void>();
 const keyListeners = new Map<string, Set<() => void>>();
 
@@ -98,10 +99,15 @@ function docAlive(): boolean {
 }
 
 export function bindCasinoDoc(doc: Y.Doc): void {
+  bindingEpoch += 1;
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
   casinoMap.observe((event) => notify(event.keysChanged));
   notify(); // repaint subscribers from the fresh doc
+}
+
+export function casinoDocEpoch(): number {
+  return bindingEpoch;
 }
 
 /** Bound map, lazily falling back to a page-local doc (offline practice). */
@@ -481,6 +487,39 @@ export function writeSlotFundingConfig(
   });
 }
 
+export interface SlotOperatorLease {
+  playerId: string;
+  sessionId: string;
+  expiresAt: number;
+}
+
+function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
+  if (typeof value !== 'object' || value === null) return false;
+  const lease = value as Partial<SlotOperatorLease>;
+  return typeof lease.playerId === 'string' && lease.playerId.length > 0
+    && lease.playerId.length <= 128
+    && typeof lease.sessionId === 'string' && lease.sessionId.length > 0
+    && lease.sessionId.length <= 128
+    && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt);
+}
+
+export function readSlotOperatorLease(machineId: string): SlotOperatorLease | null {
+  const value = ensureMap().get(`slot-operator:${machineId}`);
+  return isSlotOperatorLease(value) ? value : null;
+}
+
+export function writeSlotOperatorLease(
+  machineId: string,
+  lease: SlotOperatorLease,
+): void {
+  if (!isSlotOperatorLease(lease)) return;
+  ensureMap().set(`slot-operator:${machineId}`, lease);
+}
+
+export function clearSlotOperatorLease(machineId: string): void {
+  ensureMap().delete(`slot-operator:${machineId}`);
+}
+
 function slotFundingBalanceKey(
   machineId: string,
   config: SlotFundingConfig,
@@ -684,6 +723,7 @@ export function clearSlotMachineKeys(machineId: string): void {
     map.delete(`slot:${machineId}`);
     map.delete(`slot-odds:${machineId}`);
     map.delete(`slot-funding:${machineId}`);
+    map.delete(`slot-operator:${machineId}`);
     map.delete(`slot-bankroll:machine:${machineId}`);
     map.delete(`slot-escrow:${machineId}`);
     for (const key of [...map.keys()]) {

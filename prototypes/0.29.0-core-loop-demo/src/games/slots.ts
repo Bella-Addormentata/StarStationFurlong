@@ -207,7 +207,8 @@ export type SlotFailure =
   | 'insufficient-player-funds'
   | 'insufficient-bankroll'
   | 'reveal-timeout'
-  | 'invalid-reveal';
+  | 'invalid-reveal'
+  | 'invalid-house-commit';
 
 /** The per-machine shared state (casino doc key `slot:<machineId>`).
  *  Whole-value LWW; only the machine owner (or their croupier bot) writes it. */
@@ -220,7 +221,7 @@ export interface SlotMachineState {
   player: string | null;
   /** Bet amount for this round in chips (null on idle). */
   bet: number | null;
-  /** The accepted player request and the house entropy revealed in response. */
+  /** Accepted request id; house seed stays null until the settled transcript reveals it. */
   requestId: string | null;
   houseSeed: string | null;
   /** Owner-clock timestamp when the croupier accepted the request. */
@@ -263,6 +264,8 @@ export interface SlotPlayRequest {
 export interface SlotReveal {
   requestId: string;
   seed: string;
+  /** House commitment observed before the player disclosed their seed. */
+  houseCommit: string;
 }
 
 export function isSlotPlayRequest(v: unknown): v is SlotPlayRequest {
@@ -281,7 +284,8 @@ export function isSlotReveal(v: unknown): v is SlotReveal {
   const r = v as Partial<SlotReveal>;
   return typeof r.requestId === 'string' && r.requestId.length > 0
     && r.requestId.length <= REQUEST_ID_MAX_LENGTH
-    && typeof r.seed === 'string' && HEX_32.test(r.seed);
+    && typeof r.seed === 'string' && HEX_32.test(r.seed)
+    && typeof r.houseCommit === 'string' && HEX_32.test(r.houseCommit);
 }
 
 function isSlotSymbol(v: unknown): v is SlotSymbol {
@@ -303,6 +307,7 @@ const SLOT_FAILURES: readonly SlotFailure[] = [
   'insufficient-bankroll',
   'reveal-timeout',
   'invalid-reveal',
+  'invalid-house-commit',
 ];
 
 /** Shape guard — state crosses the room-doc trust boundary (peer writes). */

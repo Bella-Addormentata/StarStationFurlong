@@ -64,6 +64,7 @@ import {
   readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
   readCrapsBackendPref, writeCrapsBackendPref,
   readCrapsFairnessPref, writeCrapsFairnessPref,
+  casinoDocEpoch,
   readSlotMachineState, readSlotOddsConfig, writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
@@ -92,7 +93,11 @@ import {
 import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
-import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
+import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
+import {
+  isManualSlotMachineRunning,
+  setManualSlotMachineRunning,
+} from './slotCroupier';
 // 🎲🤖 #69 G3: the auto-stickman's shared settle/open helpers (manual ROLL /
 // NEXT ROLL delegate to the same implementation).
 import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
@@ -2598,13 +2603,64 @@ export interface SlotMachineUIDeps {
   isHouse: () => boolean;
 }
 
+interface PendingSlotPlay {
+  docEpoch: number;
+  machineId: string;
+  playerId: string;
+  requestId: string;
+  seed: string;
+  revealSent: boolean;
+}
+
+const pendingSlotPlays = new Map<string, PendingSlotPlay>();
+
+function pendingSlotKey(machineId: string, playerId: string): string {
+  return `${machineId}\0${playerId}`;
+}
+
+export function clearPendingSlotPlays(machineId: string): void {
+  for (const [key, pending] of pendingSlotPlays) {
+    if (pending.machineId === machineId) pendingSlotPlays.delete(key);
+  }
+}
+
+function revealPendingSlot(pending: PendingSlotPlay): void {
+  const key = pendingSlotKey(pending.machineId, pending.playerId);
+  if (pending.docEpoch !== casinoDocEpoch()) {
+    pendingSlotPlays.delete(key);
+    return;
+  }
+  const state = readSlotMachineState(pending.machineId);
+  if (state?.phase === 'settled' && state.requestId === pending.requestId) {
+    pendingSlotPlays.delete(key);
+    return;
+  }
+  const houseCommit = state?.fairness?.commits?.[1];
+  if (pending.revealSent
+    || state?.phase !== 'spinning'
+    || state.player !== pending.playerId
+    || state.requestId !== pending.requestId
+    || !houseCommit) return;
+
+  writeSlotReveal(pending.machineId, pending.playerId, {
+    requestId: pending.requestId,
+    seed: pending.seed,
+    houseCommit,
+  });
+  pending.revealSent = true;
+}
+
+subscribeCasino(() => {
+  for (const pending of pendingSlotPlays.values()) {
+    revealPendingSlot(pending);
+  }
+});
+
 export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   let denom = 5;
   let flash = '';
-  let pending: { requestId: string; seed: string } | null = null;
-  let revealSent = false;
   let spinningRequest: string | null = null;
   let spinElapsed = 0;
   let lastReelPaint = -1;
@@ -2632,7 +2688,8 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
 
   const pullLever = async (): Promise<void> => {
     const current = readSlotMachineState(deps.itemId);
-    if (current?.phase === 'spinning' || pending) return;
+    const key = pendingSlotKey(deps.itemId, myId);
+    if (current?.phase === 'spinning' || pendingSlotPlays.has(key)) return;
     if (readChips(myId) < denom) {
       flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
       render();
@@ -2640,14 +2697,28 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     }
     const seed = randomSlotSeed();
     const requestId = `${Date.now().toString(36)}-${crypto.randomUUID()}`;
-    pending = { requestId, seed };
-    revealSent = false;
-    writeSlotPlayRequest(deps.itemId, {
+    const pending: PendingSlotPlay = {
+      docEpoch: casinoDocEpoch(),
+      machineId: deps.itemId,
+      playerId: myId,
       requestId,
-      player: myId,
-      bet: denom,
-      playerCommit: await commitSlotSeed(seed),
-    });
+      seed,
+      revealSent: false,
+    };
+    pendingSlotPlays.set(key, pending);
+    try {
+      const playerCommit = await commitSlotSeed(seed);
+      if (pendingSlotPlays.get(key) !== pending) return;
+      writeSlotPlayRequest(deps.itemId, {
+        requestId,
+        player: myId,
+        bet: denom,
+        playerCommit,
+      });
+    } catch (error) {
+      pendingSlotPlays.delete(key);
+      throw error;
+    }
     render();
   };
 
@@ -2656,19 +2727,8 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     if (failure === 'insufficient-bankroll') return 'WAGER DECLINED — BANKROLL CANNOT COVER THE JACKPOT';
     if (failure === 'reveal-timeout') return 'SPIN CANCELLED — PLAYER REVEAL TIMED OUT';
     if (failure === 'invalid-reveal') return 'SPIN CANCELLED — FAIRNESS REVEAL FAILED';
+    if (failure === 'invalid-house-commit') return 'SPIN REFUNDED — HOUSE COMMITMENT CHANGED';
     return '';
-  };
-
-  const revealIfAccepted = (): void => {
-    const state = readSlotMachineState(deps.itemId);
-    if (!pending || revealSent || state?.phase !== 'spinning'
-      || state.player !== myId || state.requestId !== pending.requestId
-      || !state.houseSeed) return;
-    revealSent = true;
-    writeSlotReveal(deps.itemId, myId, {
-      requestId: pending.requestId,
-      seed: pending.seed,
-    });
   };
 
   const paintReels = (state: ReturnType<typeof readSlotMachineState>): void => {
@@ -2770,6 +2830,11 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
 
   const moveFunding = (direction: 'deposit' | 'withdraw'): void => {
     if (!deps.isHouse()) return;
+    if (readSlotMachineState(deps.itemId)?.phase === 'spinning') {
+      flash = 'BANKROLL TRANSFERS ARE LOCKED DURING A SPIN';
+      render();
+      return;
+    }
     const ok = direction === 'deposit'
       ? depositSlotFunding(deps.itemId, myId, 100)
       : withdrawSlotFunding(deps.itemId, myId, 100);
@@ -2784,10 +2849,13 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
   const render = (): void => {
     if (!panel) return;
     const state = readSlotMachineState(deps.itemId);
-    revealIfAccepted();
+    const key = pendingSlotKey(deps.itemId, myId);
+    const pendingReveal = pendingSlotPlays.get(key);
+    if (pendingReveal) revealPendingSlot(pendingReveal);
+    let pending = pendingSlotPlays.get(key) ?? null;
     if (pending && state?.phase === 'settled' && state.requestId === pending.requestId) {
+      pendingSlotPlays.delete(key);
       pending = null;
-      revealSent = false;
     }
     const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
     const fingerprint = JSON.stringify(paytable);
@@ -2830,6 +2898,18 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     const owner = panel.querySelector<HTMLElement>('#sl-owner');
     if (owner) owner.style.display = house ? 'flex' : 'none';
     if (house) {
+      const manual = panel.querySelector<HTMLButtonElement>('#sl-manual-croupier');
+      if (manual) {
+        manual.style.display = canRunCroupier() ? 'none' : '';
+        const operator = readSlotFundingConfig(deps.itemId)?.ownerId === myId;
+        const running = isManualSlotMachineRunning(deps.itemId, myId);
+        manual.disabled = !operator || (running && state?.phase === 'spinning');
+        manual.textContent = !operator
+          ? 'MANUAL CROUPIER · BANKROLL OWNER ONLY'
+          : running
+            ? 'STOP MANUAL CROUPIER'
+            : 'RUN MANUAL CROUPIER';
+      }
       const funding = fundingConfig();
       const modeLabel: Record<SlotFundingConfig['mode'], string> = {
         owner: 'OWNER WALLET',
@@ -2888,6 +2968,7 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
         <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:9px;color:#E8ECF2;"></div>
         <div id="sl-owner" style="display:none;flex-direction:column;gap:7px;padding-top:9px;border-top:1px solid rgba(212,168,75,.2);">
           <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
+          <button id="sl-manual-croupier" style="padding:7px;background:rgba(0,192,96,.08);border:1px solid #00A060;color:#8FFFC0;font:800 9px inherit;cursor:pointer;">RUN MANUAL CROUPIER</button>
           <button id="sl-funding-mode" style="padding:7px;background:rgba(212,168,75,.08);border:1px solid #D4A84B;color:#F0C060;font:800 9px inherit;cursor:pointer;"></button>
           <div id="sl-funding-balance" style="font-size:9px;color:#E8ECF2;"></div>
           <div style="display:flex;gap:6px;">
@@ -2916,6 +2997,15 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
       });
       panel.querySelector<HTMLButtonElement>('#sl-funding-mode')!
         .addEventListener('click', cycleFunding);
+      panel.querySelector<HTMLButtonElement>('#sl-manual-croupier')!
+        .addEventListener('click', () => {
+          if (!deps.isHouse() || canRunCroupier()) return;
+          const running = isManualSlotMachineRunning(deps.itemId, myId);
+          if (!setManualSlotMachineRunning(deps.itemId, myId, !running)) {
+            flash = 'CROUPIER CONTROL IS BUSY OR AN ACTIVE WAGER MUST FINISH';
+          }
+          render();
+        });
       panel.querySelector<HTMLButtonElement>('#sl-fund-deposit')!
         .addEventListener('click', () => moveFunding('deposit'));
       panel.querySelector<HTMLButtonElement>('#sl-fund-withdraw')!

@@ -114,11 +114,16 @@ import {
   createRouletteUI,
   createCrapsUI,
   createSlotMachineUI,
+  clearPendingSlotPlays,
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
-import { closeSlotMachine, tickSlotMachine } from "./slotCroupier";
+import {
+  closeSlotMachine,
+  tickManualSlotMachine,
+  tickSlotMachine,
+} from "./slotCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import type {
   WallScreenHandle,
@@ -2860,7 +2865,8 @@ export class World {
     } else if (removedKind === "craps-table") {
       closeCrapsTable(itemId);
     } else if (removedKind === "slot-machine") {
-      closeSlotMachine(itemId);
+      clearPendingSlotPlays(itemId);
+      closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -4839,7 +4845,8 @@ export class World {
     // FIRST so the operator's own fresh beat marks the table live this frame.
     // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
-    if ((tables.length || slotMachines.length) && canRunCroupier()) {
+    const autoCroupier = canRunCroupier();
+    if ((tables.length || slotMachines.length) && autoCroupier) {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
@@ -4849,6 +4856,11 @@ export class World {
         else tickAutoCroupier(t.id);
       }
       for (const machine of slotMachines) tickSlotMachine(machine.id);
+    } else {
+      const authorized = canEditRoom().ok;
+      for (const machine of slotMachines) {
+        tickManualSlotMachine(machine.id, authorized);
+      }
     }
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's
