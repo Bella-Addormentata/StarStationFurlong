@@ -520,6 +520,63 @@ export function clearSlotOperatorLease(machineId: string): void {
   ensureMap().delete(`slot-operator:${machineId}`);
 }
 
+export interface SlotSharedBankrollLease {
+  machineId: string;
+  token: string;
+  expiresAt: number;
+}
+
+const SHARED_BANKROLL_LEASE_KEY = 'slot-bankroll:shared-lease';
+const SHARED_BANKROLL_LEASE_MS = 45_000;
+const SHARED_BANKROLL_LEASE_SETTLE_MS = 2_000;
+
+function isSlotSharedBankrollLease(value: unknown): value is SlotSharedBankrollLease {
+  if (typeof value !== 'object' || value === null) return false;
+  const lease = value as Partial<SlotSharedBankrollLease>;
+  return typeof lease.machineId === 'string' && lease.machineId.length > 0
+    && lease.machineId.length <= 128
+    && typeof lease.token === 'string' && lease.token.length > 0
+    && lease.token.length <= 384
+    && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt);
+}
+
+export function readSlotSharedBankrollLease(): SlotSharedBankrollLease | null {
+  const value = ensureMap().get(SHARED_BANKROLL_LEASE_KEY);
+  return isSlotSharedBankrollLease(value) ? value : null;
+}
+
+export function ownsSlotSharedBankrollLease(machineId: string, token: string): boolean {
+  const lease = readSlotSharedBankrollLease();
+  return lease?.machineId === machineId
+    && lease.token === token
+    && lease.expiresAt > Date.now();
+}
+
+/**
+ * Claim the one room-wide shared-bankroll lease, then wait for concurrent Yjs
+ * writes to converge. Only the deterministic winning value may reserve funds.
+ */
+export async function acquireSlotSharedBankrollLease(
+  machineId: string,
+  token: string,
+): Promise<boolean> {
+  const current = readSlotSharedBankrollLease();
+  if (current && current.expiresAt > Date.now() && current.token !== token) return false;
+  ensureMap().set(SHARED_BANKROLL_LEASE_KEY, {
+    machineId,
+    token,
+    expiresAt: Date.now() + SHARED_BANKROLL_LEASE_MS,
+  } satisfies SlotSharedBankrollLease);
+  await new Promise<void>((resolve) => setTimeout(resolve, SHARED_BANKROLL_LEASE_SETTLE_MS));
+  return ownsSlotSharedBankrollLease(machineId, token);
+}
+
+export function releaseSlotSharedBankrollLease(machineId: string, token: string): void {
+  if (ownsSlotSharedBankrollLease(machineId, token)) {
+    ensureMap().delete(SHARED_BANKROLL_LEASE_KEY);
+  }
+}
+
 function slotFundingBalanceKey(
   machineId: string,
   config: SlotFundingConfig,
@@ -551,6 +608,8 @@ export function depositSlotFunding(
   const config = readSlotFundingConfig(machineId);
   if (!config || config.ownerId !== ownerId || config.mode === 'owner'
     || !Number.isSafeInteger(amount) || amount <= 0) return false;
+  const sharedLease = config.mode === 'shared' ? readSlotSharedBankrollLease() : null;
+  if (sharedLease && sharedLease.expiresAt > Date.now()) return false;
   const map = ensureMap();
   const ownerKey = `bal:${ownerId}`;
   const fundingKey = slotFundingBalanceKey(machineId, config);
@@ -573,6 +632,8 @@ export function withdrawSlotFunding(
   const config = readSlotFundingConfig(machineId);
   if (!config || config.ownerId !== ownerId || config.mode === 'owner'
     || !Number.isSafeInteger(amount) || amount <= 0) return false;
+  const sharedLease = config.mode === 'shared' ? readSlotSharedBankrollLease() : null;
+  if (sharedLease && sharedLease.expiresAt > Date.now()) return false;
   const map = ensureMap();
   const ownerKey = `bal:${ownerId}`;
   const fundingKey = slotFundingBalanceKey(machineId, config);
@@ -593,8 +654,8 @@ export type SlotReserveResult =
 
 /**
  * Debit the stake, add it to the selected bankroll, and lock the round's
- * maximum payout in a per-machine escrow. Escrow prevents two machines sharing
- * one bankroll from both promising the same chips.
+ * maximum payout in a per-machine escrow. Shared bankrolls additionally require
+ * the room-wide lease so reservations and settlements cannot lose CRDT updates.
  */
 export function reserveSlotWager(
   machineId: string,
@@ -602,10 +663,14 @@ export function reserveSlotWager(
   bet: number,
   config: SlotFundingConfig,
   maximumPayout: number,
+  sharedLeaseToken?: string,
 ): SlotReserveResult {
   if (!isSlotFundingConfig(config)
     || !Number.isSafeInteger(bet) || bet <= 0
-    || !Number.isSafeInteger(maximumPayout) || maximumPayout < 0) {
+    || !Number.isSafeInteger(maximumPayout) || maximumPayout < 0
+    || (config.mode === 'shared'
+      && (!sharedLeaseToken
+        || !ownsSlotSharedBankrollLease(machineId, sharedLeaseToken)))) {
     return 'insufficient-bankroll';
   }
   const map = ensureMap();
@@ -640,9 +705,13 @@ export function settleSlotWager(
   playerId: string,
   config: SlotFundingConfig,
   payout: number,
+  sharedLeaseToken?: string,
 ): boolean {
   if (!isSlotFundingConfig(config)
-    || !Number.isSafeInteger(payout) || payout < 0) return false;
+    || !Number.isSafeInteger(payout) || payout < 0
+    || (config.mode === 'shared'
+      && (!sharedLeaseToken
+        || !ownsSlotSharedBankrollLease(machineId, sharedLeaseToken)))) return false;
   const map = ensureMap();
   const escrowKey = `slot-escrow:${machineId}`;
   if (!map.has(escrowKey)) return false;
@@ -672,8 +741,12 @@ export function refundSlotWager(
   playerId: string,
   bet: number,
   config: SlotFundingConfig,
+  sharedLeaseToken?: string,
 ): boolean {
-  if (!isSlotFundingConfig(config) || !Number.isSafeInteger(bet) || bet <= 0) return false;
+  if (!isSlotFundingConfig(config) || !Number.isSafeInteger(bet) || bet <= 0
+    || (config.mode === 'shared'
+      && (!sharedLeaseToken
+        || !ownsSlotSharedBankrollLease(machineId, sharedLeaseToken)))) return false;
   const map = ensureMap();
   const escrowKey = `slot-escrow:${machineId}`;
   if (!map.has(escrowKey)) return false;
@@ -726,6 +799,8 @@ export function clearSlotMachineKeys(machineId: string): void {
     map.delete(`slot-operator:${machineId}`);
     map.delete(`slot-bankroll:machine:${machineId}`);
     map.delete(`slot-escrow:${machineId}`);
+    const sharedLease = readSlotSharedBankrollLease();
+    if (sharedLease?.machineId === machineId) map.delete(SHARED_BANKROLL_LEASE_KEY);
     for (const key of [...map.keys()]) {
       if (key.startsWith(requestPrefix) || key.startsWith(revealPrefix)) map.delete(key);
     }
@@ -749,5 +824,7 @@ if (typeof window !== 'undefined') {
     readSlotOddsConfig, writeSlotOddsConfig, clearSlotMachineKeys,
     readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
     depositSlotFunding, withdrawSlotFunding,
+    readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
+    releaseSlotSharedBankrollLease,
   };
 }

@@ -1,4 +1,5 @@
 import {
+  acquireSlotSharedBankrollLease,
   casinoDocEpoch,
   clearSlotMachineKeys,
   clearSlotOperatorLease,
@@ -11,6 +12,8 @@ import {
   readSlotOperatorLease,
   readSlotPlayRequests,
   readSlotReveal,
+  readSlotSharedBankrollLease,
+  releaseSlotSharedBankrollLease,
   refundSlotWager,
   reserveSlotWager,
   settleSlotWager,
@@ -48,6 +51,7 @@ interface AcceptedSlotRound {
   acceptedAt: number;
   bet: number;
   funding: SlotFundingConfig;
+  sharedLeaseToken: string | null;
   paytable: SlotPayEntry[];
 }
 
@@ -75,6 +79,28 @@ function currentAcceptedRound(machineId: string): AcceptedSlotRound | undefined 
   if (accepted?.docEpoch === casinoDocEpoch()) return accepted;
   if (accepted) acceptedRounds.delete(machineId);
   return undefined;
+}
+
+function releaseAcceptedFundingLease(
+  machineId: string,
+  accepted: AcceptedSlotRound | undefined,
+): void {
+  if (accepted?.sharedLeaseToken) {
+    releaseSlotSharedBankrollLease(machineId, accepted.sharedLeaseToken);
+  }
+}
+
+function sharedFundingLeaseToken(
+  machineId: string,
+  funding: SlotFundingConfig | undefined,
+  accepted?: AcceptedSlotRound,
+): string | undefined {
+  if (funding?.mode !== 'shared') return undefined;
+  if (accepted?.sharedLeaseToken) return accepted.sharedLeaseToken;
+  const lease = readSlotSharedBankrollLease();
+  return lease?.machineId === machineId && lease.expiresAt > Date.now()
+    ? lease.token
+    : undefined;
 }
 
 function ownsManualLease(machineId: string, playerId: string): boolean {
@@ -201,7 +227,13 @@ export function tickSlotMachine(machineId: string, operatorId?: string): void {
     if (!reveal || reveal.requestId !== state.requestId) {
       if (Date.now() - accepted.acceptedAt >= REVEAL_TIMEOUT_MS) {
         clearSlotReveal(machineId, player);
-        settleSlotWager(machineId, player, accepted.funding, 0);
+        settleSlotWager(
+          machineId,
+          player,
+          accepted.funding,
+          0,
+          accepted.sharedLeaseToken ?? undefined,
+        );
         writeSlotMachineState(machineId, {
           ...state,
           bet: accepted.bet,
@@ -212,6 +244,7 @@ export function tickSlotMachine(machineId: string, operatorId?: string): void {
           settledAt: Date.now(),
           failure: 'reveal-timeout',
         });
+        releaseAcceptedFundingLease(machineId, accepted);
         acceptedRounds.delete(machineId);
       }
       return;
@@ -246,8 +279,15 @@ function cancelForHouseCommit(
   const player = accepted?.player ?? state?.player;
   const bet = accepted?.bet ?? state?.bet;
   const funding = accepted?.funding ?? state?.funding;
+  const sharedLeaseToken = sharedFundingLeaseToken(machineId, funding, accepted);
   if (player && bet && funding) {
-    refundSlotWager(machineId, player, bet, funding);
+    refundSlotWager(
+      machineId,
+      player,
+      bet,
+      funding,
+      sharedLeaseToken,
+    );
   }
   writeSlotMachineState(machineId, {
     ...(state ?? initialSlotMachineState()),
@@ -265,6 +305,7 @@ function cancelForHouseCommit(
     settledAt: Date.now(),
     failure: 'invalid-house-commit',
   });
+  if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
   acceptedRounds.delete(machineId);
 }
 
@@ -274,7 +315,13 @@ function forfeitInvalidReveal(
   accepted: AcceptedSlotRound,
 ): void {
   clearSlotReveal(machineId, accepted.player);
-  settleSlotWager(machineId, accepted.player, accepted.funding, 0);
+  settleSlotWager(
+    machineId,
+    accepted.player,
+    accepted.funding,
+    0,
+    accepted.sharedLeaseToken ?? undefined,
+  );
   writeSlotMachineState(machineId, {
     ...state,
     player: accepted.player,
@@ -286,6 +333,7 @@ function forfeitInvalidReveal(
     settledAt: Date.now(),
     failure: 'invalid-reveal',
   });
+  releaseAcceptedFundingLease(machineId, accepted);
   acceptedRounds.delete(machineId);
 }
 
@@ -306,12 +354,31 @@ async function accept(
     || current?.phase === 'spinning'
     || (operatorId && (!ownsManualLease(machineId, operatorId)
       || readSlotFundingConfig(machineId)?.ownerId !== operatorId))) return;
-  clearSlotPlayRequest(machineId, request.player);
   const round = (current?.round ?? state?.round ?? 0) + 1;
   const ownerId = getPlayerId();
   const funding: SlotFundingConfig =
     readSlotFundingConfig(machineId) ?? { mode: 'owner', ownerId };
   if (!readSlotFundingConfig(machineId)) writeSlotFundingConfig(machineId, funding);
+  const sharedLeaseToken = funding.mode === 'shared'
+    ? `${manualSessionId}:${machineId}:${request.requestId}`
+    : null;
+  if (sharedLeaseToken
+    && !await acquireSlotSharedBankrollLease(machineId, sharedLeaseToken)) return;
+  const leaseQueued = readSlotPlayRequests(machineId)
+    .find((candidate) => candidate.player === request.player);
+  const leaseCurrent = readSlotMachineState(machineId);
+  const leaseFunding = readSlotFundingConfig(machineId);
+  if (docEpoch !== casinoDocEpoch()
+    || leaseQueued?.requestId !== request.requestId
+    || leaseCurrent?.phase === 'spinning'
+    || leaseFunding?.mode !== funding.mode
+    || leaseFunding.ownerId !== funding.ownerId
+    || (operatorId && (!ownsManualLease(machineId, operatorId)
+      || leaseFunding.ownerId !== operatorId))) {
+    if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
+    return;
+  }
+  clearSlotPlayRequest(machineId, request.player);
   const paytable = (readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE)
     .map((entry) => ({ ...entry, symbols: [...entry.symbols] as typeof entry.symbols }));
   const reserve = reserveSlotWager(
@@ -320,6 +387,7 @@ async function accept(
     request.bet,
     funding,
     Math.max(request.bet, maxSlotPayout(request.bet, paytable)),
+    sharedLeaseToken ?? undefined,
   );
   if (reserve !== 'ok') {
     writeSlotMachineState(machineId, {
@@ -335,6 +403,7 @@ async function accept(
       paytable,
       failure: reserve,
     });
+    if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
   }
   const acceptedAt = Date.now();
@@ -349,6 +418,7 @@ async function accept(
     acceptedAt,
     bet: request.bet,
     funding,
+    sharedLeaseToken,
     paytable,
   };
   acceptedRounds.set(machineId, accepted);
@@ -418,9 +488,16 @@ async function settle(
     accepted.player,
     accepted.funding,
     resolution.credited,
+    accepted.sharedLeaseToken ?? undefined,
   );
   if (!paid) {
-    settleSlotWager(machineId, accepted.player, accepted.funding, 0);
+    settleSlotWager(
+      machineId,
+      accepted.player,
+      accepted.funding,
+      0,
+      accepted.sharedLeaseToken ?? undefined,
+    );
   }
   writeSlotMachineState(machineId, {
     ...state,
@@ -442,6 +519,7 @@ async function settle(
     },
   });
   clearSlotReveal(machineId, accepted.player);
+  releaseAcceptedFundingLease(machineId, accepted);
   acceptedRounds.delete(machineId);
 }
 
@@ -463,11 +541,23 @@ export function closeSlotMachine(
       accepted.player,
       accepted.bet,
       accepted.funding,
+      accepted.sharedLeaseToken ?? undefined,
     );
   } else if (state?.phase === 'spinning' && state.player && state.bet && state.funding) {
-    refunded = refundSlotWager(machineId, state.player, state.bet, state.funding);
+    const sharedLeaseToken = sharedFundingLeaseToken(machineId, state.funding);
+    refunded = refundSlotWager(
+      machineId,
+      state.player,
+      state.bet,
+      state.funding,
+      sharedLeaseToken,
+    );
+    if (refunded && sharedLeaseToken) {
+      releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
+    }
   }
   if (!refunded) return;
+  releaseAcceptedFundingLease(machineId, accepted);
   acceptedRounds.delete(machineId);
   drainSlotMachineFunding(machineId);
   clearSlotMachineKeys(machineId);
