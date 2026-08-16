@@ -14,7 +14,7 @@
  *
  * ODDS & PAYTABLE
  * Vegas-typical 3-reel machines return roughly 85–98% RTP depending on
- * denomination (higher-coin machines pay more). Our default achieves 83.31%
+ * denomination (higher-coin machines pay more). Our default achieves 91.99%
  * over the strip distribution below. The room owner can override the odds
  * via `SlotOddsConfig` stored in the casino doc; `resolveSlot` accepts a
  * custom paytable, letting the owner increase or decrease the house edge and
@@ -73,7 +73,7 @@ export type SymbolIndex = 0 | 1 | 2 | 3 | 4 | 5 | 6;
  *   seven   1 stop   (5%)
  *
  * All three reels share the same strip; a real machine would stagger them, but
- * this distribution yields 83.31% RTP with the default paytable.
+ * this distribution yields 91.99% RTP with the default paytable.
  */
 export const REEL_STRIP: readonly SymbolIndex[] = [
   0, 0, 1, 2, 0, 3, 1, 2, 0, 4, 1, 2, 0, 3, 1, 0, 5, 2, 1, 4, 6, 3,
@@ -82,6 +82,7 @@ export const REEL_STRIP_SIZE = REEL_STRIP.length; // 22
 export const MAX_SLOT_STAKE = 100;
 export const MAX_SLOT_MULTIPLIER = 1_000_000;
 export const MAX_SLOT_PAYOUT = MAX_SLOT_STAKE * MAX_SLOT_MULTIPLIER;
+export const SLOT_SPIN_MS = 1_600;
 
 /** Resolve an unbiased reel stop (0–21) to its symbol. */
 export function seedToSymbol(stop: number): SlotSymbol {
@@ -120,7 +121,7 @@ export interface SlotPayEntry {
  * Default paytable — classic Vegas-style 3-reel single-line odds.
  * Displayed on the machine face and editable by the room owner.
  *
- * RTP with the default strip: 83.31%.
+ * RTP with the default strip: 91.99%.
  */
 export const DEFAULT_PAYTABLE: readonly SlotPayEntry[] = [
   // JACKPOT
@@ -128,15 +129,15 @@ export const DEFAULT_PAYTABLE: readonly SlotPayEntry[] = [
   // Triple bar
   { symbols: ['bar', 'bar', 'bar'], multiplier: 50, label: 'TRIPLE BAR' },
   // Triple bell
-  { symbols: ['bell', 'bell', 'bell'], multiplier: 20, label: 'TRIPLE BELL' },
+  { symbols: ['bell', 'bell', 'bell'], multiplier: 30, label: 'TRIPLE BELL' },
   // Triple plum
-  { symbols: ['plum', 'plum', 'plum'], multiplier: 14, label: 'TRIPLE PLUM' },
+  { symbols: ['plum', 'plum', 'plum'], multiplier: 18, label: 'TRIPLE PLUM' },
   // Triple orange
-  { symbols: ['orange', 'orange', 'orange'], multiplier: 10, label: 'TRIPLE ORANGE' },
+  { symbols: ['orange', 'orange', 'orange'], multiplier: 12, label: 'TRIPLE ORANGE' },
   // Triple lemon
-  { symbols: ['lemon', 'lemon', 'lemon'], multiplier: 8, label: 'TRIPLE LEMON' },
+  { symbols: ['lemon', 'lemon', 'lemon'], multiplier: 9, label: 'TRIPLE LEMON' },
   // Any bar / seven mix
-  { symbols: ['bar', null, null], multiplier: 5, label: 'BAR' },
+  { symbols: ['bar', null, null], multiplier: 6, label: 'BAR' },
   // Triple cherry
   { symbols: ['cherry', 'cherry', 'cherry'], multiplier: 4, label: 'TRIPLE CHERRY' },
   // Any two cherries on left+middle
@@ -177,7 +178,36 @@ export function isSlotOddsConfig(v: unknown): v is SlotOddsConfig {
     && c.paytable.every(isSlotPayEntry);
 }
 
+// ── Owner-selected funding source ─────────────────────────────────────────────
+
+export type SlotFundingMode = 'owner' | 'machine' | 'shared';
+
+/**
+ * The bankroll selected by the room owner. `owner` uses that player's chip
+ * balance, `machine` uses a balance dedicated to this furniture item, and
+ * `shared` uses the room-wide slot-machine pool.
+ */
+export interface SlotFundingConfig {
+  mode: SlotFundingMode;
+  ownerId: string;
+}
+
+export function isSlotFundingConfig(v: unknown): v is SlotFundingConfig {
+  if (typeof v !== 'object' || v === null) return false;
+  const c = v as Partial<SlotFundingConfig>;
+  return (c.mode === 'owner' || c.mode === 'machine' || c.mode === 'shared')
+    && typeof c.ownerId === 'string'
+    && c.ownerId.length > 0
+    && c.ownerId.length <= 128;
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
+
+export type SlotFailure =
+  | 'insufficient-player-funds'
+  | 'insufficient-bankroll'
+  | 'reveal-timeout'
+  | 'invalid-reveal';
 
 /** The per-machine shared state (casino doc key `slot:<machineId>`).
  *  Whole-value LWW; only the machine owner (or their croupier bot) writes it. */
@@ -203,6 +233,11 @@ export interface SlotMachineState {
   credited: number | null;
   /** Owner-clock ms timestamp of the settle write. */
   settledAt: number;
+  /** Round snapshots: later owner edits cannot change an accepted wager. */
+  funding?: SlotFundingConfig;
+  paytable?: SlotPayEntry[];
+  /** Why an accepted request did not produce a normal result. */
+  failure?: SlotFailure;
   /** 🎰🔒 Verifiable entropy transcript (absent for 'rng'). */
   fairness?: FairnessTranscript;
 }
@@ -263,6 +298,13 @@ function isSeedTriple(v: unknown): v is [number, number, number] {
       && (s as number) < REEL_STRIP_SIZE);
 }
 
+const SLOT_FAILURES: readonly SlotFailure[] = [
+  'insufficient-player-funds',
+  'insufficient-bankroll',
+  'reveal-timeout',
+  'invalid-reveal',
+];
+
 /** Shape guard — state crosses the room-doc trust boundary (peer writes). */
 export function isSlotMachineState(v: unknown): v is SlotMachineState {
   if (typeof v !== 'object' || v === null) return false;
@@ -282,6 +324,9 @@ export function isSlotMachineState(v: unknown): v is SlotMachineState {
     && (s.credited === null || (Number.isSafeInteger(s.credited)
       && (s.credited as number) >= 0 && (s.credited as number) <= MAX_SLOT_PAYOUT))
     && typeof s.settledAt === 'number' && Number.isFinite(s.settledAt as number)
+    && (s.funding === undefined || isSlotFundingConfig(s.funding))
+    && (s.paytable === undefined || isSlotOddsConfig({ paytable: s.paytable }))
+    && (s.failure === undefined || SLOT_FAILURES.includes(s.failure))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness));
 }
 
@@ -340,6 +385,26 @@ export function resolveSlot(
 
   }
   return { credited: 0, entry: null, multiplier: 0, outcome: 'NO WIN' };
+}
+
+/** Maximum chips a stake can return under this table (bankroll reservation). */
+export function maxSlotPayout(
+  stake: number,
+  paytable: readonly SlotPayEntry[] = DEFAULT_PAYTABLE,
+): number {
+  if (!Number.isSafeInteger(stake) || stake <= 0 || stake > MAX_SLOT_STAKE) {
+    throw new RangeError(`Slot stake must be a safe integer from 1 to ${MAX_SLOT_STAKE}`);
+  }
+  let maxMultiplier = 0;
+  for (const entry of paytable) {
+    if (!Number.isSafeInteger(entry.multiplier)
+      || entry.multiplier < 0
+      || entry.multiplier > MAX_SLOT_MULTIPLIER) {
+      throw new RangeError(`Slot multiplier must be a safe integer from 0 to ${MAX_SLOT_MULTIPLIER}`);
+    }
+    maxMultiplier = Math.max(maxMultiplier, entry.multiplier);
+  }
+  return stake * maxMultiplier;
 }
 
 async function sha256Bytes(message: string): Promise<Uint8Array> {
@@ -427,7 +492,7 @@ export type { FairnessMode, FairnessTranscript };
 // Debug handle (the __ssfGames/__ssfCasino/__ssfChips precedent).
 if (typeof window !== 'undefined') {
   (window as unknown as { __ssfSlots: unknown }).__ssfSlots = {
-    spinReels, resolveSlot, computeRTP, randomReelStops, commitSlotSeed,
+    spinReels, resolveSlot, maxSlotPayout, computeRTP, randomReelStops, commitSlotSeed,
     deriveReelStops, verifySlotFairness, DEFAULT_PAYTABLE, REEL_STRIP,
   };
 }

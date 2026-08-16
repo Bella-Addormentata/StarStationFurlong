@@ -43,9 +43,11 @@ import { isCrapsBet, isCrapsTableState } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
 import {
   isSlotMachineState, isSlotOddsConfig, isSlotPlayRequest, isSlotReveal,
+  isSlotFundingConfig,
 } from './games/slots';
 import type {
   SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
+  SlotFundingConfig,
 } from './games/slots';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
@@ -65,8 +67,9 @@ export interface CrapsTableBets {
 let boundDoc: Y.Doc | null = null;
 let casinoMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+const keyListeners = new Map<string, Set<() => void>>();
 
-function notify(): void {
+function notify(changedKeys?: ReadonlySet<string>): void {
   // Copy + isolate (the furnitureDoc/gamesDoc guard): a listener may
   // unsubscribe mid-notify, and one throwing render must not kill the rest
   // or Yjs's transaction cleanup.
@@ -75,6 +78,16 @@ function notify(): void {
       listener();
     } catch (err) {
       console.error('[casino] listener threw during doc notify:', err);
+    }
+  }
+  for (const [key, keyed] of keyListeners) {
+    if (changedKeys && !changedKeys.has(key)) continue;
+    for (const listener of [...keyed]) {
+      try {
+        listener();
+      } catch (err) {
+        console.error(`[casino] listener for '${key}' threw during doc notify:`, err);
+      }
     }
   }
 }
@@ -87,7 +100,7 @@ function docAlive(): boolean {
 export function bindCasinoDoc(doc: Y.Doc): void {
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
-  casinoMap.observe(() => notify());
+  casinoMap.observe((event) => notify(event.keysChanged));
   notify(); // repaint subscribers from the fresh doc
 }
 
@@ -100,6 +113,20 @@ function ensureMap(): Y.Map<unknown> {
 export function subscribeCasino(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** Subscribe to one casino-map key instead of repainting on every casino write. */
+export function subscribeCasinoKey(key: string, listener: () => void): () => void {
+  let keyed = keyListeners.get(key);
+  if (!keyed) {
+    keyed = new Set();
+    keyListeners.set(key, keyed);
+  }
+  keyed.add(listener);
+  return () => {
+    keyed!.delete(listener);
+    if (keyed!.size === 0) keyListeners.delete(key);
+  };
 }
 
 /** Non-negative integer read (doc values cross the peer trust boundary). */
@@ -437,6 +464,215 @@ export function writeSlotOddsConfig(machineId: string, config: SlotOddsConfig): 
   });
 }
 
+export function readSlotFundingConfig(machineId: string): SlotFundingConfig | null {
+  const value = ensureMap().get(`slot-funding:${machineId}`);
+  return isSlotFundingConfig(value) ? value : null;
+}
+
+/** Room owner only — selects which chip bankroll backs this machine. */
+export function writeSlotFundingConfig(
+  machineId: string,
+  config: SlotFundingConfig,
+): void {
+  if (!isSlotFundingConfig(config)) return;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`slot-funding:${machineId}`, config);
+  });
+}
+
+function slotFundingBalanceKey(
+  machineId: string,
+  config: SlotFundingConfig,
+): string {
+  if (config.mode === 'owner') return `bal:${config.ownerId}`;
+  if (config.mode === 'machine') return `slot-bankroll:machine:${machineId}`;
+  return 'slot-bankroll:shared';
+}
+
+function safeCount(map: Y.Map<unknown>, key: string): number {
+  const value = map.get(key);
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : 0;
+}
+
+export function readSlotFundingBalance(
+  machineId: string,
+  config: SlotFundingConfig,
+): number {
+  if (!isSlotFundingConfig(config)) return 0;
+  return safeCount(ensureMap(), slotFundingBalanceKey(machineId, config));
+}
+
+/** Move the owner's chips into a dedicated/shared bankroll. */
+export function depositSlotFunding(
+  machineId: string,
+  ownerId: string,
+  amount: number,
+): boolean {
+  const config = readSlotFundingConfig(machineId);
+  if (!config || config.ownerId !== ownerId || config.mode === 'owner'
+    || !Number.isSafeInteger(amount) || amount <= 0) return false;
+  const map = ensureMap();
+  const ownerKey = `bal:${ownerId}`;
+  const fundingKey = slotFundingBalanceKey(machineId, config);
+  const ownerBalance = safeCount(map, ownerKey);
+  const fundingBalance = safeCount(map, fundingKey);
+  if (ownerBalance < amount || !Number.isSafeInteger(fundingBalance + amount)) return false;
+  boundDoc!.transact(() => {
+    map.set(ownerKey, ownerBalance - amount);
+    map.set(fundingKey, fundingBalance + amount);
+  });
+  return true;
+}
+
+/** Return chips from a dedicated/shared bankroll to its owner. */
+export function withdrawSlotFunding(
+  machineId: string,
+  ownerId: string,
+  amount: number,
+): boolean {
+  const config = readSlotFundingConfig(machineId);
+  if (!config || config.ownerId !== ownerId || config.mode === 'owner'
+    || !Number.isSafeInteger(amount) || amount <= 0) return false;
+  const map = ensureMap();
+  const ownerKey = `bal:${ownerId}`;
+  const fundingKey = slotFundingBalanceKey(machineId, config);
+  const ownerBalance = safeCount(map, ownerKey);
+  const fundingBalance = safeCount(map, fundingKey);
+  if (fundingBalance < amount || !Number.isSafeInteger(ownerBalance + amount)) return false;
+  boundDoc!.transact(() => {
+    map.set(fundingKey, fundingBalance - amount);
+    map.set(ownerKey, ownerBalance + amount);
+  });
+  return true;
+}
+
+export type SlotReserveResult =
+  | 'ok'
+  | 'insufficient-player-funds'
+  | 'insufficient-bankroll';
+
+/**
+ * Debit the stake, add it to the selected bankroll, and lock the round's
+ * maximum payout in a per-machine escrow. Escrow prevents two machines sharing
+ * one bankroll from both promising the same chips.
+ */
+export function reserveSlotWager(
+  machineId: string,
+  playerId: string,
+  bet: number,
+  config: SlotFundingConfig,
+  maximumPayout: number,
+): SlotReserveResult {
+  if (!isSlotFundingConfig(config)
+    || !Number.isSafeInteger(bet) || bet <= 0
+    || !Number.isSafeInteger(maximumPayout) || maximumPayout < 0) {
+    return 'insufficient-bankroll';
+  }
+  const map = ensureMap();
+  const playerKey = `bal:${playerId}`;
+  const fundingKey = slotFundingBalanceKey(machineId, config);
+  const escrowKey = `slot-escrow:${machineId}`;
+  const playerBalance = safeCount(map, playerKey);
+  if (playerBalance < bet) return 'insufficient-player-funds';
+  if (safeCount(map, escrowKey) > 0) return 'insufficient-bankroll';
+
+  const sameAccount = playerKey === fundingKey;
+  const fundingBalance = safeCount(map, fundingKey);
+  const afterStake = sameAccount ? fundingBalance : fundingBalance + bet;
+  if (!Number.isSafeInteger(afterStake) || afterStake < maximumPayout) {
+    return 'insufficient-bankroll';
+  }
+
+  boundDoc!.transact(() => {
+    if (!sameAccount) map.set(playerKey, playerBalance - bet);
+    map.set(fundingKey, afterStake - maximumPayout);
+    map.set(escrowKey, maximumPayout);
+  });
+  return 'ok';
+}
+
+/**
+ * Pay a settled result from escrow and return the unused reserve to the
+ * selected bankroll. Returns false if peer-written state exceeds the reserve.
+ */
+export function settleSlotWager(
+  machineId: string,
+  playerId: string,
+  config: SlotFundingConfig,
+  payout: number,
+): boolean {
+  if (!isSlotFundingConfig(config)
+    || !Number.isSafeInteger(payout) || payout < 0) return false;
+  const map = ensureMap();
+  const escrowKey = `slot-escrow:${machineId}`;
+  const escrow = safeCount(map, escrowKey);
+  if (payout > escrow) return false;
+  const fundingKey = slotFundingBalanceKey(machineId, config);
+  const playerKey = `bal:${playerId}`;
+  const fundingBalance = safeCount(map, fundingKey);
+  const playerBalance = safeCount(map, playerKey);
+  const returned = escrow - payout;
+  const sameAccount = fundingKey === playerKey;
+  const nextFunding = fundingBalance + returned + (sameAccount ? payout : 0);
+  const nextPlayer = playerBalance + payout;
+  if (!Number.isSafeInteger(nextFunding)
+    || (!sameAccount && !Number.isSafeInteger(nextPlayer))) return false;
+  boundDoc!.transact(() => {
+    map.delete(escrowKey);
+    map.set(fundingKey, nextFunding);
+    if (!sameAccount && payout > 0) map.set(playerKey, nextPlayer);
+  });
+  return true;
+}
+
+/** Cancel an accepted round and return both its reserve and stake. */
+export function refundSlotWager(
+  machineId: string,
+  playerId: string,
+  bet: number,
+  config: SlotFundingConfig,
+): boolean {
+  if (!isSlotFundingConfig(config) || !Number.isSafeInteger(bet) || bet <= 0) return false;
+  const map = ensureMap();
+  const escrowKey = `slot-escrow:${machineId}`;
+  const escrow = safeCount(map, escrowKey);
+  const fundingKey = slotFundingBalanceKey(machineId, config);
+  const playerKey = `bal:${playerId}`;
+  const fundingBalance = safeCount(map, fundingKey);
+  const playerBalance = safeCount(map, playerKey);
+  const sameAccount = fundingKey === playerKey;
+  if (!sameAccount && fundingBalance + escrow < bet) return false;
+  const nextFunding = sameAccount
+    ? fundingBalance + escrow
+    : fundingBalance + escrow - bet;
+  const nextPlayer = sameAccount ? nextFunding : playerBalance + bet;
+  if (!Number.isSafeInteger(nextFunding) || !Number.isSafeInteger(nextPlayer)) return false;
+  boundDoc!.transact(() => {
+    map.delete(escrowKey);
+    map.set(fundingKey, nextFunding);
+    if (!sameAccount) map.set(playerKey, nextPlayer);
+  });
+  return true;
+}
+
+/** Return a removed machine's private bankroll to the configured owner. */
+export function drainSlotMachineFunding(machineId: string): void {
+  const config = readSlotFundingConfig(machineId);
+  if (!config) return;
+  const map = ensureMap();
+  const fundingKey = `slot-bankroll:machine:${machineId}`;
+  const amount = safeCount(map, fundingKey);
+  if (amount <= 0) return;
+  const ownerKey = `bal:${config.ownerId}`;
+  const ownerBalance = safeCount(map, ownerKey);
+  if (!Number.isSafeInteger(ownerBalance + amount)) return;
+  boundDoc!.transact(() => {
+    map.delete(fundingKey);
+    map.set(ownerKey, ownerBalance + amount);
+  });
+}
+
 /** Remove all casino-map keys for a slot machine (teardown on item removal). */
 export function clearSlotMachineKeys(machineId: string): void {
   const map = ensureMap();
@@ -445,6 +681,9 @@ export function clearSlotMachineKeys(machineId: string): void {
   boundDoc!.transact(() => {
     map.delete(`slot:${machineId}`);
     map.delete(`slot-odds:${machineId}`);
+    map.delete(`slot-funding:${machineId}`);
+    map.delete(`slot-bankroll:machine:${machineId}`);
+    map.delete(`slot-escrow:${machineId}`);
     for (const key of [...map.keys()]) {
       if (key.startsWith(requestPrefix) || key.startsWith(revealPrefix)) map.delete(key);
     }
@@ -466,5 +705,7 @@ if (typeof window !== 'undefined') {
     readSlotMachineState, writeSlotMachineState,
     readSlotPlayRequests, writeSlotPlayRequest, readSlotReveal, writeSlotReveal,
     readSlotOddsConfig, writeSlotOddsConfig, clearSlotMachineKeys,
+    readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
+    depositSlotFunding, withdrawSlotFunding,
   };
 }

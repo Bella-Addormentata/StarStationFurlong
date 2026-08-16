@@ -40,7 +40,7 @@ import type {
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
 import { DEFAULT_PAYTABLE, computeRTP } from "./games/slots";
 import type { SlotPayEntry } from "./games/slots";
-import { readSlotOddsConfig, subscribeCasino } from "./casinoDoc";
+import { readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
@@ -2633,17 +2633,17 @@ const bunkBedSeats: SeatTemplate[] = [
 ];
 
 // ── 🎰 Slot machine seat + builder (issue #109) ──────────────────────────────
-// The slot machine is a 1×1 footprint with ONE built-in chair seat. The player
+// The slot machine is a 1×2 footprint with ONE built-in chair seat. The player
 // sits in the chair (facing the machine at faceAngle = 0) and can then focus
 // the device to pull the lever. The front approach is from the -z side (the
-// machine faces +z so the front of the machine faces the player approaching
-// from -z). Click box covers the full 1×1 tile minus a 0.1 m clearance strip
-// behind (machine body occupies ~z[0.1, 0.5]).
+// cabinet face points toward -z, while the seated player faces +z toward it).
+// The extra metre separates the chair from the cabinet and leaves room for the
+// stand/turn/slide choreography inside one honest collision footprint.
 const slotMachineSeats: SeatTemplate[] = [
   {
-    clickBox: { x0: -0.4, z0: -0.5, x1: 0.4, z1: 0.1 },
-    front: { x: 0, z: -1.0 },
-    sit: { x: 0, z: -0.22 },
+    clickBox: { x0: -0.4, z0: -0.9, x1: 0.4, z1: -0.3 },
+    front: { x: 0, z: -1.5 },
+    sit: { x: 0, z: -0.62 },
     faceAngle: 0,
     sitY: seatOn(0.475),
   },
@@ -3308,8 +3308,8 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 1.05, z: 0.2 },
     },
   },
-  // 🎰 Slot machine (issue #109) — 1×1 footprint with a built-in chair.
-  // The seat faces -z (the player approaches from the front, z = -1). The
+  // 🎰 Slot machine (issue #109) — 1×2 footprint with a built-in chair.
+  // The seat faces +z toward the cabinet; approach is beyond the -z edge. The
   // device focus zooms the camera to the machine face; the player can also
   // look around in first-person from the chair. The builder + seat template
   // are function-declared below (FURNITURE_DEFS evaluates them at load time,
@@ -3317,15 +3317,15 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "slot-machine": {
     kind: "slot-machine",
     build: buildSlotMachine,
-    footprint: { w: 1, d: 1 },
+    footprint: { w: 1, d: 2 },
     functions: ["slotMachine"],
     seats: slotMachineSeats,
     device: {
       kind: "slotMachine",
-      front: { x: 0, z: -1.0 },
+      front: { x: 0, z: -1.5 },
       faceAngle: 0,
-      eye: { x: 0, y: 1.55, z: -0.55 },
-      anchor: { x: 0, y: 1.15, z: 0.1 },
+      eye: { x: 0, y: 1.45, z: -0.95 },
+      anchor: { x: 0, y: 1.25, z: -0.05 },
     },
   },
 };
@@ -5544,7 +5544,7 @@ function buildCloneVat(ctx: BuildCtx) {
 // texture paints the current paytable so odds are always visible to the player.
 //
 // Local frame (rot 0): the cabinet FACE (player side) is at z ≈ −0.1, the
-// seat is centred at z ≈ −0.22, and the machine back is at z ≈ +0.45.
+// seat is centred at z ≈ −0.62, and the machine back is at z ≈ +0.45.
 // The pull lever is on the right side (+x).
 function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   const BODY    = 0x2a3444; // gunmetal (wall-computer family)
@@ -5578,14 +5578,19 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   addLight(new THREE.PointLight(LIGHT, 0, 2.2), 0, 2.1, -0.12, 0.35);
 
   // ── Pay window (glazed opening showing three reel drums) ──────────────────
-  // Recess frame
-  place(new THREE.BoxGeometry(0.50, 0.36, 0.03), m(CHROME, 0.4, 0.6), 0, 1.30, -0.10);
+  // Four trim rails leave the reel window genuinely open (a solid box here
+  // depth-occludes the glass and drums).
+  const windowTrim = m(CHROME, 0.4, 0.6);
+  place(new THREE.BoxGeometry(0.50, 0.035, 0.025), windowTrim, 0, 1.465, -0.19);
+  place(new THREE.BoxGeometry(0.50, 0.035, 0.025), windowTrim, 0, 1.135, -0.19);
+  place(new THREE.BoxGeometry(0.035, 0.30, 0.025), windowTrim, -0.2325, 1.30, -0.19);
+  place(new THREE.BoxGeometry(0.035, 0.30, 0.025), windowTrim, 0.2325, 1.30, -0.19);
   // Glass panel (semi-transparent tint — baseOpacity so morph keeps it translucent)
   {
     const glassMat = m(GLASS, 0.05, 0.0);
     glassMat.transparent = true;
     glassMat.userData.baseOpacity = 0.55;
-    place(new THREE.BoxGeometry(0.46, 0.30, 0.015), glassMat, 0, 1.30, -0.092);
+    place(new THREE.BoxGeometry(0.46, 0.30, 0.008), glassMat, 0, 1.30, -0.188);
   }
   // Three reel drums behind the glass (decorative — grey cylinders with deco
   // colour band representing the active face)
@@ -5594,10 +5599,10 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
     const rx = (i - 1) * 0.14;
     // Drum body
     place(new THREE.CylinderGeometry(0.055, 0.055, 0.26, 14),
-      m(0xf5f2e8, 0.6, 0.1), rx, 1.30, 0.04);
+      m(0xf5f2e8, 0.6, 0.1), rx, 1.30, -0.115);
     // Active-face colour band on the front of the drum
     place(new THREE.BoxGeometry(0.10, 0.10, 0.02),
-      m(reelColors[i], 0.5, 0.2), rx, 1.30, -0.065);
+      m(reelColors[i], 0.5, 0.2), rx, 1.30, -0.174);
   }
 
   // ── Paytable panel below the window ──────────────────────────────────────
@@ -5613,8 +5618,11 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
     const pmat = new THREE.MeshBasicMaterial({
       map: ptex, transparent: true, opacity: 0,
     });
+    pmat.userData.baseOpacity = 0.96;
     const pgeo = new THREE.PlaneGeometry(0.44, 0.20);
-    const panel = place(pgeo, pmat, 0, 1.05, -0.088);
+    // PlaneGeometry faces +z; rotate it toward the player on the -z side and
+    // keep it just proud of the opaque cabinet face.
+    const panel = place(pgeo, pmat, 0, 1.05, -0.112, Math.PI);
     const drawPaytable = (paytable: readonly SlotPayEntry[]): void => {
       pc2.fillStyle = '#14181E';
       pc2.fillRect(0, 0, 128, 80);
@@ -5631,10 +5639,15 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
       });
       ptex.needsUpdate = true;
     };
+    let lastPaytable = "";
     const repaint = (): void => {
-      drawPaytable(readSlotOddsConfig(itemId)?.paytable ?? DEFAULT_PAYTABLE);
+      const paytable = readSlotOddsConfig(itemId)?.paytable ?? DEFAULT_PAYTABLE;
+      const fingerprint = JSON.stringify(paytable);
+      if (fingerprint === lastPaytable) return;
+      lastPaytable = fingerprint;
+      drawPaytable(paytable);
     };
-    const unsubscribe = subscribeCasino(repaint);
+    const unsubscribe = subscribeCasinoKey(`slot-odds:${itemId}`, repaint);
     panel.userData.disposeSlotPaytable = unsubscribe;
     repaint();
   }
@@ -5674,14 +5687,42 @@ function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   place(new THREE.BoxGeometry(0.06, 0.06, 0.06), m(BODY, 0.55, 0.4), 0.325, 1.06, 0.07);
 
   // ── Built-in chair ────────────────────────────────────────────────────────
-  // Seat pad (at y ≈ 0.44, slightly in front of the machine at z ≈ −0.22)
-  place(new THREE.BoxGeometry(0.46, 0.07, 0.38), m(FELT, 0.85, 0.04), 0, 0.44, -0.22);
+  // These meshes opt out of the group's generic device hit tagging: chair
+  // clicks must fall through to the seat click box, not open the machine UI.
+  const chairMeshes: THREE.Mesh[] = [];
+  // Seat pad (at y ≈ 0.44, with clear knee room before the cabinet)
+  chairMeshes.push(place(
+    new THREE.BoxGeometry(0.46, 0.07, 0.38),
+    m(FELT, 0.85, 0.04),
+    0,
+    0.44,
+    -0.62,
+  ));
   // Seat base / pedestal
-  place(new THREE.BoxGeometry(0.16, 0.44, 0.16), m(CHROME, 0.4, 0.6), 0, 0.22, -0.22);
+  chairMeshes.push(place(
+    new THREE.BoxGeometry(0.16, 0.44, 0.16),
+    m(CHROME, 0.4, 0.6),
+    0,
+    0.22,
+    -0.62,
+  ));
   // Pedestal foot
-  place(new THREE.BoxGeometry(0.34, 0.04, 0.34), m(CHROME, 0.4, 0.5), 0, 0.02, -0.22);
+  chairMeshes.push(place(
+    new THREE.BoxGeometry(0.34, 0.04, 0.34),
+    m(CHROME, 0.4, 0.5),
+    0,
+    0.02,
+    -0.62,
+  ));
   // Low back rest
-  place(new THREE.BoxGeometry(0.44, 0.22, 0.06), m(FELT, 0.85, 0.04), 0, 0.65, -0.41);
+  chairMeshes.push(place(
+    new THREE.BoxGeometry(0.44, 0.22, 0.06),
+    m(FELT, 0.85, 0.04),
+    0,
+    0.65,
+    -0.84,
+  ));
+  for (const mesh of chairMeshes) mesh.userData.skipDeviceHit = true;
 }
 
 
@@ -7380,7 +7421,7 @@ export function buildItemGroup(item: FurnitureItem): THREE.Group {
   // click anywhere on the prop into world.requestDeviceFocus(item.id).
   if (def.device) {
     group.traverse((obj) => {
-      if ((obj as THREE.Mesh).isMesh) {
+      if ((obj as THREE.Mesh).isMesh && !obj.userData.skipDeviceHit) {
         obj.userData.isDevice = true;
         obj.userData.deviceId = item.id;
       }

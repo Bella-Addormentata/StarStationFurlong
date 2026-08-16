@@ -5066,7 +5066,10 @@ export class World {
       deviceFocus.beginFocus(
         this.player,
         device,
-        createSlotMachineUI({ itemId: deviceId }),
+        createSlotMachineUI({
+          itemId: deviceId,
+          isHouse: () => canEditRoom().ok,
+        }),
       );
       return;
     }

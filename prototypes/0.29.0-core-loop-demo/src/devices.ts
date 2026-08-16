@@ -65,6 +65,8 @@ import {
   readCrapsBackendPref, writeCrapsBackendPref,
   readCrapsFairnessPref, writeCrapsFairnessPref,
   readSlotMachineState, readSlotOddsConfig, writeSlotPlayRequest, writeSlotReveal,
+  readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
+  depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
 } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -84,8 +86,10 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { canPlaceBet } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
-  DEFAULT_PAYTABLE, commitSlotSeed, computeRTP, randomSlotSeed,
+  DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_SPIN_MS, SLOT_SYMBOLS,
+  commitSlotSeed, computeRTP, isSlotOddsConfig, randomSlotSeed,
 } from './games/slots';
+import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -2591,6 +2595,7 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
 
 export interface SlotMachineUIDeps {
   itemId: string;
+  isHouse: () => boolean;
 }
 
 export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
@@ -2600,7 +2605,30 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
   let flash = '';
   let pending: { requestId: string; seed: string } | null = null;
   let revealSent = false;
+  let spinningRequest: string | null = null;
+  let spinElapsed = 0;
+  let lastReelPaint = -1;
+  let paytableFingerprint = '';
+  let paytableRtp = 0;
+  let renderedPaytable = '';
+  let renderedPaytableForHouse = false;
   const myId = getPlayerId();
+
+  const fundingConfig = (): SlotFundingConfig => {
+    const stored = readSlotFundingConfig(deps.itemId);
+    if (stored) return stored;
+    const roomOwner = readRoomOwner();
+    return {
+      mode: 'owner',
+      ownerId: deps.isHouse() ? myId : roomOwner && roomOwner !== 'Local-Clone' ? roomOwner : myId,
+    };
+  };
+
+  const clonePaytable = (paytable: readonly SlotPayEntry[]): SlotPayEntry[] =>
+    paytable.map((entry) => ({
+      ...entry,
+      symbols: [...entry.symbols] as SlotPayEntry['symbols'],
+    }));
 
   const pullLever = async (): Promise<void> => {
     const current = readSlotMachineState(deps.itemId);
@@ -2623,6 +2651,14 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     render();
   };
 
+  const failureText = (failure: NonNullable<ReturnType<typeof readSlotMachineState>>['failure']): string => {
+    if (failure === 'insufficient-player-funds') return 'WAGER DECLINED — NOT ENOUGH CHIPS';
+    if (failure === 'insufficient-bankroll') return 'WAGER DECLINED — BANKROLL CANNOT COVER THE JACKPOT';
+    if (failure === 'reveal-timeout') return 'SPIN CANCELLED — PLAYER REVEAL TIMED OUT';
+    if (failure === 'invalid-reveal') return 'SPIN CANCELLED — FAIRNESS REVEAL FAILED';
+    return '';
+  };
+
   const revealIfAccepted = (): void => {
     const state = readSlotMachineState(deps.itemId);
     if (!pending || revealSent || state?.phase !== 'spinning'
@@ -2635,6 +2671,116 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     });
   };
 
+  const paintReels = (state: ReturnType<typeof readSlotMachineState>): void => {
+    if (!panel) return;
+    const reels = panel.querySelector<HTMLElement>('#sl-reels');
+    if (!reels) return;
+    if (state?.phase === 'spinning') {
+      const frame = Math.floor(spinElapsed * 16);
+      if (frame === lastReelPaint) return;
+      lastReelPaint = frame;
+      reels.textContent = [0, 1, 2]
+        .map((offset) => SLOT_SYMBOLS[(frame + offset * 3) % SLOT_SYMBOLS.length].toUpperCase())
+        .join('  ·  ');
+      return;
+    }
+    lastReelPaint = -1;
+    reels.textContent = state?.result
+      ? state.result.map((symbol) => symbol.toUpperCase()).join('  ·  ')
+      : '—  ·  —  ·  —';
+  };
+
+  const renderPaytable = (paytable: readonly SlotPayEntry[], house: boolean): void => {
+    if (!panel) return;
+    const rows = panel.querySelector<HTMLElement>('#sl-paytable');
+    if (!rows) return;
+    const fingerprint = JSON.stringify(paytable);
+    if (fingerprint === renderedPaytable && house === renderedPaytableForHouse) return;
+    renderedPaytable = fingerprint;
+    renderedPaytableForHouse = house;
+    rows.replaceChildren(...paytable.slice(0, 10).map((entry, index) => {
+      const row = document.createElement('div');
+      row.style.cssText =
+        'display:flex;align-items:center;justify-content:space-between;gap:4px;min-height:20px;';
+      const label = document.createElement('span');
+      label.textContent = entry.label;
+      row.appendChild(label);
+      if (house) {
+        const controls = document.createElement('span');
+        controls.style.cssText = 'display:flex;align-items:center;gap:4px;';
+        const minus = document.createElement('button');
+        minus.type = 'button';
+        minus.dataset.slotPayIndex = String(index);
+        minus.dataset.slotPayDelta = '-1';
+        minus.textContent = '−';
+        const value = document.createElement('b');
+        value.textContent = `${entry.multiplier}×`;
+        const plus = document.createElement('button');
+        plus.type = 'button';
+        plus.dataset.slotPayIndex = String(index);
+        plus.dataset.slotPayDelta = '1';
+        plus.textContent = '+';
+        for (const button of [minus, plus]) {
+          button.style.cssText =
+            `width:20px;height:20px;padding:0;background:rgba(212,168,75,.08);border:1px solid ${GT_DIM};color:${GT_GOLD};cursor:pointer;`;
+        }
+        controls.append(minus, value, plus);
+        row.appendChild(controls);
+      } else {
+        const value = document.createElement('b');
+        value.textContent = `${entry.multiplier}×`;
+        row.appendChild(value);
+      }
+      return row;
+    }));
+  };
+
+  const adjustPaytable = (index: number, delta: number): void => {
+    if (!deps.isHouse() || !Number.isInteger(index) || !Number.isInteger(delta)) return;
+    if (readSlotMachineState(deps.itemId)?.phase === 'spinning') {
+      flash = 'ODDS ARE LOCKED DURING A SPIN';
+      render();
+      return;
+    }
+    const next = clonePaytable(readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE);
+    const entry = next[index];
+    if (!entry) return;
+    entry.multiplier = Math.max(0, Math.min(MAX_SLOT_MULTIPLIER, entry.multiplier + delta));
+    const config = { paytable: next };
+    if (!isSlotOddsConfig(config)) {
+      flash = 'INVALID PAYTABLE';
+      render();
+      return;
+    }
+    writeSlotOddsConfig(deps.itemId, config);
+  };
+
+  const cycleFunding = (): void => {
+    if (!deps.isHouse()) return;
+    if (readSlotMachineState(deps.itemId)?.phase === 'spinning') {
+      flash = 'FUNDING IS LOCKED DURING A SPIN';
+      render();
+      return;
+    }
+    const order: SlotFundingConfig['mode'][] = ['owner', 'machine', 'shared'];
+    const current = fundingConfig();
+    const mode = order[(order.indexOf(current.mode) + 1) % order.length];
+    writeSlotFundingConfig(deps.itemId, { mode, ownerId: myId });
+  };
+
+  const moveFunding = (direction: 'deposit' | 'withdraw'): void => {
+    if (!deps.isHouse()) return;
+    const ok = direction === 'deposit'
+      ? depositSlotFunding(deps.itemId, myId, 100)
+      : withdrawSlotFunding(deps.itemId, myId, 100);
+    if (!ok) {
+      flash = direction === 'deposit'
+        ? 'DEPOSIT NEEDS 100 OWNER CHIPS'
+        : 'WITHDRAW NEEDS 100 BANKROLL CHIPS';
+      render();
+    }
+  };
+
   const render = (): void => {
     if (!panel) return;
     const state = readSlotMachineState(deps.itemId);
@@ -2644,14 +2790,26 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
       revealSent = false;
     }
     const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
-    const result = state?.result ?? null;
-    const symbolName = (symbol: string): string => symbol.toUpperCase();
-
-    panel.querySelector<HTMLElement>('#sl-reels')!.textContent =
-      result ? result.map(symbolName).join('  ·  ') : '—  ·  —  ·  —';
+    const fingerprint = JSON.stringify(paytable);
+    if (fingerprint !== paytableFingerprint) {
+      paytableFingerprint = fingerprint;
+      paytableRtp = computeRTP(paytable);
+    }
+    if (state?.phase === 'spinning') {
+      if (spinningRequest !== state.requestId) {
+        spinningRequest = state.requestId;
+        spinElapsed = Math.max(0, (Date.now() - state.acceptedAt) / 1000);
+        lastReelPaint = -1;
+      }
+    } else {
+      spinningRequest = null;
+    }
+    paintReels(state);
+    const failure = failureText(state?.failure);
     panel.querySelector<HTMLElement>('#sl-status')!.textContent = flash
+      || failure
       || (state?.phase === 'spinning'
-        ? 'REELS SPINNING…'
+        ? `REELS SPINNING… ${(Math.max(0, SLOT_SPIN_MS / 1000 - spinElapsed)).toFixed(1)}s`
         : pending && state?.requestId !== pending.requestId
           ? 'WAITING FOR THE CROUPIER…'
           : state?.phase === 'settled'
@@ -2659,13 +2817,9 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
           : 'CHOOSE A CHIP AND PULL THE LEVER');
     panel.querySelector<HTMLElement>('#sl-chips')!.textContent = `YOUR CHIPS: ${readChips(myId)}`;
     panel.querySelector<HTMLElement>('#sl-rtp')!.textContent =
-      `THEORETICAL RTP ${computeRTP(paytable).toFixed(2)}%`;
-    const rows = panel.querySelector<HTMLElement>('#sl-paytable')!;
-    rows.replaceChildren(...paytable.slice(0, 10).map((entry) => {
-      const row = document.createElement('div');
-      row.textContent = `${entry.label} — ${entry.multiplier}×`;
-      return row;
-    }));
+      `THEORETICAL RTP ${paytableRtp.toFixed(2)}%`;
+    const house = deps.isHouse();
+    renderPaytable(paytable, house);
     panel.querySelectorAll<HTMLButtonElement>('[data-slot-denom]').forEach((button) => {
       const selected = Number(button.dataset.slotDenom) === denom;
       button.style.borderColor = selected ? '#F0C060' : 'rgba(212,168,75,0.35)';
@@ -2673,11 +2827,44 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     });
     const lever = panel.querySelector<HTMLButtonElement>('#sl-pull')!;
     lever.disabled = state?.phase === 'spinning' || pending !== null;
+    const owner = panel.querySelector<HTMLElement>('#sl-owner');
+    if (owner) owner.style.display = house ? 'flex' : 'none';
+    if (house) {
+      const funding = fundingConfig();
+      const modeLabel: Record<SlotFundingConfig['mode'], string> = {
+        owner: 'OWNER WALLET',
+        machine: 'THIS MACHINE',
+        shared: 'SHARED MACHINES',
+      };
+      const mode = panel.querySelector<HTMLButtonElement>('#sl-funding-mode');
+      if (mode) mode.textContent = `SOURCE · ${modeLabel[funding.mode]}`;
+      const balance = panel.querySelector<HTMLElement>('#sl-funding-balance');
+      if (balance) {
+        balance.textContent =
+          `AVAILABLE BANKROLL: ${readSlotFundingBalance(deps.itemId, funding)} CHIPS`;
+      }
+      const transfer = funding.mode !== 'owner';
+      const deposit = panel.querySelector<HTMLButtonElement>('#sl-fund-deposit');
+      const withdraw = panel.querySelector<HTMLButtonElement>('#sl-fund-withdraw');
+      if (deposit) deposit.style.display = transfer ? '' : 'none';
+      if (withdraw) withdraw.style.display = transfer ? '' : 'none';
+    }
     flash = '';
+  };
+
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.code !== 'Space' || event.repeat || !panel) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA') return;
+    event.preventDefault();
+    pullLever().catch((err) => console.error('[slots] request failed:', err));
   };
 
   return {
     mount(host: HTMLElement): void {
+      if (deps.isHouse() && !readSlotFundingConfig(deps.itemId)) {
+        writeSlotFundingConfig(deps.itemId, { mode: 'owner', ownerId: myId });
+      }
       panel = document.createElement('div');
       panel.id = 'device-slot-machine-pane';
       panel.style.cssText = `
@@ -2698,7 +2885,19 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
         ).join('')}</div>
         <button id="sl-pull" style="padding:11px;background:rgba(212,168,75,0.16);border:1px solid #D4A84B;border-radius:6px;color:#F0C060;font:800 11px inherit;letter-spacing:2px;cursor:pointer;">PULL LEVER</button>
         <div id="sl-rtp" style="font-size:9px;color:${GT_DIM};"></div>
-        <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;color:#E8ECF2;"></div>
+        <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:9px;color:#E8ECF2;"></div>
+        <div id="sl-owner" style="display:none;flex-direction:column;gap:7px;padding-top:9px;border-top:1px solid rgba(212,168,75,.2);">
+          <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
+          <button id="sl-funding-mode" style="padding:7px;background:rgba(212,168,75,.08);border:1px solid #D4A84B;color:#F0C060;font:800 9px inherit;cursor:pointer;"></button>
+          <div id="sl-funding-balance" style="font-size:9px;color:#E8ECF2;"></div>
+          <div style="display:flex;gap:6px;">
+            <button id="sl-fund-deposit" style="flex:1;padding:6px;background:rgba(0,230,118,.08);border:1px solid #00A060;color:#8FFFC0;font:800 9px inherit;cursor:pointer;">DEPOSIT 100</button>
+            <button id="sl-fund-withdraw" style="flex:1;padding:6px;background:rgba(255,179,0,.08);border:1px solid #B07800;color:#FFD782;font:800 9px inherit;cursor:pointer;">WITHDRAW 100</button>
+          </div>
+          <button id="sl-reset-odds" style="padding:6px;background:transparent;border:1px solid ${GT_DIM};color:${GT_GOLD};font:800 9px inherit;cursor:pointer;">RESTORE DEFAULT ODDS</button>
+          <div style="font-size:8px;color:${GT_DIM};">−/+ edits persist for this machine. Maximum liability is reserved before every spin.</div>
+        </div>
+        <div style="font-size:8px;color:${GT_DIM};text-align:center;">SPACE BAR ALSO PULLS</div>
       `;
       panel.addEventListener('click', (event) => event.stopPropagation());
       panel.querySelectorAll<HTMLButtonElement>('[data-slot-denom]').forEach((button) => {
@@ -2710,17 +2909,45 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
       panel.querySelector<HTMLButtonElement>('#sl-pull')!.addEventListener('click', () => {
         pullLever().catch((err) => console.error('[slots] request failed:', err));
       });
+      panel.querySelector<HTMLElement>('#sl-paytable')!.addEventListener('click', (event) => {
+        const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-slot-pay-index]');
+        if (!button) return;
+        adjustPaytable(Number(button.dataset.slotPayIndex), Number(button.dataset.slotPayDelta));
+      });
+      panel.querySelector<HTMLButtonElement>('#sl-funding-mode')!
+        .addEventListener('click', cycleFunding);
+      panel.querySelector<HTMLButtonElement>('#sl-fund-deposit')!
+        .addEventListener('click', () => moveFunding('deposit'));
+      panel.querySelector<HTMLButtonElement>('#sl-fund-withdraw')!
+        .addEventListener('click', () => moveFunding('withdraw'));
+      panel.querySelector<HTMLButtonElement>('#sl-reset-odds')!
+        .addEventListener('click', () => {
+          if (!deps.isHouse() || readSlotMachineState(deps.itemId)?.phase === 'spinning') return;
+          writeSlotOddsConfig(deps.itemId, { paytable: clonePaytable(DEFAULT_PAYTABLE) });
+        });
       host.appendChild(panel);
       unsubscribe = subscribeCasino(render);
+      window.addEventListener('keydown', onKeyDown);
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      window.removeEventListener('keydown', onKeyDown);
       panel?.remove();
       panel = null;
     },
-    update(): void {},
+    update(dt: number): void {
+      const state = readSlotMachineState(deps.itemId);
+      if (state?.phase !== 'spinning') return;
+      spinElapsed += Math.max(0, dt);
+      paintReels(state);
+      const status = panel?.querySelector<HTMLElement>('#sl-status');
+      if (status) {
+        status.textContent =
+          `REELS SPINNING… ${(Math.max(0, SLOT_SPIN_MS / 1000 - spinElapsed)).toFixed(1)}s`;
+      }
+    },
   };
 }
 
