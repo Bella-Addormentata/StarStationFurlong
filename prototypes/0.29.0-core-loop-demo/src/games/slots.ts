@@ -79,6 +79,9 @@ export const REEL_STRIP: readonly SymbolIndex[] = [
   0, 0, 1, 2, 0, 3, 1, 2, 0, 4, 1, 2, 0, 3, 1, 0, 5, 2, 1, 4, 6, 3,
 ] as const;
 export const REEL_STRIP_SIZE = REEL_STRIP.length; // 22
+export const MAX_SLOT_STAKE = 100;
+export const MAX_SLOT_MULTIPLIER = 1_000_000;
+export const MAX_SLOT_PAYOUT = MAX_SLOT_STAKE * MAX_SLOT_MULTIPLIER;
 
 /** Resolve an unbiased reel stop (0–21) to its symbol. */
 export function seedToSymbol(stop: number): SlotSymbol {
@@ -159,7 +162,9 @@ function isSlotPayEntry(v: unknown): v is SlotPayEntry {
   const e = v as Partial<SlotPayEntry>;
   if (!Array.isArray(e.symbols) || e.symbols.length !== 3) return false;
   if (!e.symbols.every((s) => s === null || SYMBOL_VALUES.includes(s as string))) return false;
-  if (!Number.isInteger(e.multiplier) || (e.multiplier as number) < 0) return false;
+  if (!Number.isSafeInteger(e.multiplier)
+    || (e.multiplier as number) < 0
+    || (e.multiplier as number) > MAX_SLOT_MULTIPLIER) return false;
   if (typeof e.label !== 'string' || (e.label as string).length > 32) return false;
   return true;
 }
@@ -185,6 +190,11 @@ export interface SlotMachineState {
   player: string | null;
   /** Bet amount for this round in chips (null on idle). */
   bet: number | null;
+  /** The accepted player request and the house entropy revealed in response. */
+  requestId: string | null;
+  houseSeed: string | null;
+  /** Owner-clock timestamp when the croupier accepted the request. */
+  acceptedAt: number;
   /** The three settled reel seeds (each 0–N); null while idle/spinning. */
   seeds: [number, number, number] | null;
   /** Resolved symbols for the settled spin; null until settled. */
@@ -200,8 +210,43 @@ export interface SlotMachineState {
 export function initialSlotMachineState(): SlotMachineState {
   return {
     kind: 'slot', phase: 'idle', round: 1,
-    player: null, bet: null, seeds: null, result: null, credited: null, settledAt: 0,
+    player: null, bet: null, requestId: null, houseSeed: null, acceptedAt: 0,
+    seeds: null, result: null, credited: null, settledAt: 0,
   };
+}
+
+const HEX_32 = /^[0-9a-f]{64}$/;
+const REQUEST_ID_MAX_LENGTH = 128;
+
+export interface SlotPlayRequest {
+  requestId: string;
+  player: string;
+  bet: number;
+  playerCommit: string;
+}
+
+export interface SlotReveal {
+  requestId: string;
+  seed: string;
+}
+
+export function isSlotPlayRequest(v: unknown): v is SlotPlayRequest {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<SlotPlayRequest>;
+  return typeof r.requestId === 'string' && r.requestId.length > 0
+    && r.requestId.length <= REQUEST_ID_MAX_LENGTH
+    && typeof r.player === 'string' && r.player.length > 0 && r.player.length <= 128
+    && Number.isSafeInteger(r.bet) && (r.bet as number) > 0
+    && (r.bet as number) <= MAX_SLOT_STAKE
+    && typeof r.playerCommit === 'string' && HEX_32.test(r.playerCommit);
+}
+
+export function isSlotReveal(v: unknown): v is SlotReveal {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<SlotReveal>;
+  return typeof r.requestId === 'string' && r.requestId.length > 0
+    && r.requestId.length <= REQUEST_ID_MAX_LENGTH
+    && typeof r.seed === 'string' && HEX_32.test(r.seed);
 }
 
 function isSlotSymbol(v: unknown): v is SlotSymbol {
@@ -226,10 +271,16 @@ export function isSlotMachineState(v: unknown): v is SlotMachineState {
     && (s.phase === 'idle' || s.phase === 'spinning' || s.phase === 'settled')
     && Number.isInteger(s.round) && (s.round as number) >= 1
     && (s.player === null || typeof s.player === 'string')
-    && (s.bet === null || (Number.isInteger(s.bet) && (s.bet as number) > 0))
+    && (s.bet === null || (Number.isSafeInteger(s.bet) && (s.bet as number) > 0
+      && (s.bet as number) <= MAX_SLOT_STAKE))
+    && (s.requestId === null || (typeof s.requestId === 'string'
+      && s.requestId.length > 0 && s.requestId.length <= REQUEST_ID_MAX_LENGTH))
+    && (s.houseSeed === null || (typeof s.houseSeed === 'string' && HEX_32.test(s.houseSeed)))
+    && typeof s.acceptedAt === 'number' && Number.isFinite(s.acceptedAt)
     && (s.seeds === null || isSeedTriple(s.seeds))
     && (s.result === null || isSymbolTriple(s.result))
-    && (s.credited === null || (Number.isInteger(s.credited) && (s.credited as number) >= 0))
+    && (s.credited === null || (Number.isSafeInteger(s.credited)
+      && (s.credited as number) >= 0 && (s.credited as number) <= MAX_SLOT_PAYOUT))
     && typeof s.settledAt === 'number' && Number.isFinite(s.settledAt as number)
     && (s.fairness === undefined || isFairnessTranscript(s.fairness));
 }
@@ -266,12 +317,18 @@ export function resolveSlot(
   stake: number,
   paytable: readonly SlotPayEntry[] = DEFAULT_PAYTABLE,
 ): SlotResolution {
+  if (!Number.isSafeInteger(stake) || stake <= 0 || stake > MAX_SLOT_STAKE) {
+    throw new RangeError(`Slot stake must be a safe integer from 1 to ${MAX_SLOT_STAKE}`);
+  }
   for (const entry of paytable) {
     const [s0, s1, s2] = entry.symbols;
     if ((s0 === null || s0 === symbols[0])
       && (s1 === null || s1 === symbols[1])
       && (s2 === null || s2 === symbols[2])) {
       const m = entry.multiplier;
+      if (!Number.isSafeInteger(m) || m < 0 || m > MAX_SLOT_MULTIPLIER) {
+        throw new RangeError(`Slot multiplier must be a safe integer from 0 to ${MAX_SLOT_MULTIPLIER}`);
+      }
       if (m === 0) break; // explicit loss entry
       return {
         credited: stake * m,
@@ -280,8 +337,64 @@ export function resolveSlot(
         outcome: entry.label,
       };
     }
+
   }
   return { credited: 0, entry: null, multiplier: 0, outcome: 'NO WIN' };
+}
+
+async function sha256Bytes(message: string): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(message));
+  return new Uint8Array(digest);
+}
+
+function toHex(bytes: Uint8Array): string {
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function randomSlotSeed(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return toHex(bytes);
+}
+
+export async function commitSlotSeed(seed: string): Promise<string> {
+  return toHex(await sha256Bytes(`ssf-slot-commit-v1|${seed}`));
+}
+
+/** Chia Gaming-style two-party commit/reveal, with unbiased 0–21 extraction. */
+export async function deriveReelStops(
+  playerSeed: string,
+  houseSeed: string,
+  machineId: string,
+  round: number,
+): Promise<[number, number, number]> {
+  const base = `ssf-slot-stops-v1|${playerSeed}|${houseSeed}|${machineId}|${round}`;
+  const stops: number[] = [];
+  let block = 0;
+  while (stops.length < 3) {
+    const bytes = await sha256Bytes(`${base}|${block++}`);
+    for (const byte of bytes) {
+      if (byte < 242) stops.push(byte % REEL_STRIP_SIZE);
+      if (stops.length === 3) break;
+    }
+  }
+  return stops as [number, number, number];
+}
+
+export async function verifySlotFairness(
+  transcript: FairnessTranscript,
+  machineId: string,
+  round: number,
+  stops: [number, number, number],
+): Promise<boolean> {
+  if (transcript.mode !== 'commit-reveal'
+    || transcript.commits?.length !== 2
+    || transcript.seeds?.length !== 2) return false;
+  const [playerSeed, houseSeed] = transcript.seeds;
+  if (await commitSlotSeed(playerSeed) !== transcript.commits[0]) return false;
+  if (await commitSlotSeed(houseSeed) !== transcript.commits[1]) return false;
+  const derived = await deriveReelStops(playerSeed, houseSeed, machineId, round);
+  return derived.every((stop, i) => stop === stops[i]);
 }
 
 /**
@@ -314,6 +427,7 @@ export type { FairnessMode, FairnessTranscript };
 // Debug handle (the __ssfGames/__ssfCasino/__ssfChips precedent).
 if (typeof window !== 'undefined') {
   (window as unknown as { __ssfSlots: unknown }).__ssfSlots = {
-    spinReels, resolveSlot, computeRTP, randomReelStops, DEFAULT_PAYTABLE, REEL_STRIP,
+    spinReels, resolveSlot, computeRTP, randomReelStops, commitSlotSeed,
+    deriveReelStops, verifySlotFairness, DEFAULT_PAYTABLE, REEL_STRIP,
   };
 }

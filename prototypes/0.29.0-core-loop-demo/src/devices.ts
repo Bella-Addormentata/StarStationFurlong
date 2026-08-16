@@ -64,7 +64,7 @@ import {
   readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
   readCrapsBackendPref, writeCrapsBackendPref,
   readCrapsFairnessPref, writeCrapsFairnessPref,
-  readSlotMachineState, writeSlotMachineState, readSlotOddsConfig,
+  readSlotMachineState, readSlotOddsConfig, writeSlotPlayRequest, writeSlotReveal,
 } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -84,8 +84,7 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { canPlaceBet } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
-  DEFAULT_PAYTABLE, computeRTP, initialSlotMachineState, randomReelStops,
-  resolveSlot, spinReels,
+  DEFAULT_PAYTABLE, commitSlotSeed, computeRTP, randomSlotSeed,
 } from './games/slots';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
@@ -2599,45 +2598,51 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
   let unsubscribe: (() => void) | null = null;
   let denom = 5;
   let flash = '';
+  let pending: { requestId: string; seed: string } | null = null;
+  let revealSent = false;
   const myId = getPlayerId();
 
-  const pullLever = (): void => {
+  const pullLever = async (): Promise<void> => {
     const current = readSlotMachineState(deps.itemId);
-    if (current?.phase === 'spinning') return;
-    if (!spendChips(myId, denom)) {
+    if (current?.phase === 'spinning' || pending) return;
+    if (readChips(myId) < denom) {
       flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
       render();
       return;
     }
-
-    const round = (current?.round ?? 0) + 1;
-    const spinning = {
-      ...initialSlotMachineState(),
-      phase: 'spinning' as const,
-      round,
+    const seed = randomSlotSeed();
+    const requestId = `${Date.now().toString(36)}-${crypto.randomUUID()}`;
+    pending = { requestId, seed };
+    revealSent = false;
+    writeSlotPlayRequest(deps.itemId, {
+      requestId,
       player: myId,
       bet: denom,
-    };
-    writeSlotMachineState(deps.itemId, spinning);
+      playerCommit: await commitSlotSeed(seed),
+    });
+    render();
+  };
 
-    const seeds = randomReelStops();
-    const result = spinReels(seeds);
-    const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
-    const resolution = resolveSlot(result, denom, paytable);
-    if (resolution.credited > 0) creditChips(myId, resolution.credited);
-    writeSlotMachineState(deps.itemId, {
-      ...spinning,
-      phase: 'settled',
-      seeds,
-      result,
-      credited: resolution.credited,
-      settledAt: Date.now(),
+  const revealIfAccepted = (): void => {
+    const state = readSlotMachineState(deps.itemId);
+    if (!pending || revealSent || state?.phase !== 'spinning'
+      || state.player !== myId || state.requestId !== pending.requestId
+      || !state.houseSeed) return;
+    revealSent = true;
+    writeSlotReveal(deps.itemId, myId, {
+      requestId: pending.requestId,
+      seed: pending.seed,
     });
   };
 
   const render = (): void => {
     if (!panel) return;
     const state = readSlotMachineState(deps.itemId);
+    revealIfAccepted();
+    if (pending && state?.phase === 'settled' && state.requestId === pending.requestId) {
+      pending = null;
+      revealSent = false;
+    }
     const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
     const result = state?.result ?? null;
     const symbolName = (symbol: string): string => symbol.toUpperCase();
@@ -2647,7 +2652,9 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
     panel.querySelector<HTMLElement>('#sl-status')!.textContent = flash
       || (state?.phase === 'spinning'
         ? 'REELS SPINNING…'
-        : state?.phase === 'settled'
+        : pending && state?.requestId !== pending.requestId
+          ? 'WAITING FOR THE CROUPIER…'
+          : state?.phase === 'settled'
           ? `${state.credited ? `PAYS ${state.credited} CHIPS` : 'NO WIN'} · ROUND ${state.round}`
           : 'CHOOSE A CHIP AND PULL THE LEVER');
     panel.querySelector<HTMLElement>('#sl-chips')!.textContent = `YOUR CHIPS: ${readChips(myId)}`;
@@ -2665,7 +2672,7 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
       button.style.color = selected ? '#F0C060' : GT_GOLD;
     });
     const lever = panel.querySelector<HTMLButtonElement>('#sl-pull')!;
-    lever.disabled = state?.phase === 'spinning';
+    lever.disabled = state?.phase === 'spinning' || pending !== null;
     flash = '';
   };
 
@@ -2700,7 +2707,9 @@ export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
           render();
         });
       });
-      panel.querySelector<HTMLButtonElement>('#sl-pull')!.addEventListener('click', pullLever);
+      panel.querySelector<HTMLButtonElement>('#sl-pull')!.addEventListener('click', () => {
+        pullLever().catch((err) => console.error('[slots] request failed:', err));
+      });
       host.appendChild(panel);
       unsubscribe = subscribeCasino(render);
       render();

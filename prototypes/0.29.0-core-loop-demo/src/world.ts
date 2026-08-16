@@ -118,7 +118,7 @@ import {
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
-import { clearSlotMachineKeys } from "./casinoDoc";
+import { closeSlotMachine, tickSlotMachine } from "./slotCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import type {
   WallScreenHandle,
@@ -2860,7 +2860,7 @@ export class World {
     } else if (removedKind === "craps-table") {
       closeCrapsTable(itemId);
     } else if (removedKind === "slot-machine") {
-      clearSlotMachineKeys(itemId);
+      closeSlotMachine(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -4832,13 +4832,14 @@ export class World {
     // roulette wheel-head and the craps stickman. Drive each by its kind.
     const rouletteTables = FURNITURE.filter((i) => i.kind === "roulette-table");
     const crapsTables = FURNITURE.filter((i) => i.kind === "craps-table");
+    const slotMachines = FURNITURE.filter((i) => i.kind === "slot-machine");
     const tables = [...rouletteTables, ...crapsTables];
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
     // FIRST so the operator's own fresh beat marks the table live this frame.
     // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
-    if (tables.length && canRunCroupier()) {
+    if ((tables.length || slotMachines.length) && canRunCroupier()) {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
@@ -4847,6 +4848,7 @@ export class World {
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
       }
+      for (const machine of slotMachines) tickSlotMachine(machine.id);
     }
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's

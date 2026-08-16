@@ -41,8 +41,12 @@ import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { isCrapsBet, isCrapsTableState } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
-import { isSlotMachineState, isSlotOddsConfig } from './games/slots';
-import type { SlotMachineState, SlotOddsConfig } from './games/slots';
+import {
+  isSlotMachineState, isSlotOddsConfig, isSlotPlayRequest, isSlotReveal,
+} from './games/slots';
+import type {
+  SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
+} from './games/slots';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -388,6 +392,38 @@ export function writeSlotMachineState(machineId: string, state: SlotMachineState
   });
 }
 
+export function readSlotPlayRequests(machineId: string): SlotPlayRequest[] {
+  const prefix = `slot-request:${machineId}:`;
+  const requests: SlotPlayRequest[] = [];
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix) || !isSlotPlayRequest(value)) continue;
+    if (value.player !== key.slice(prefix.length)) continue;
+    requests.push(value);
+  }
+  return requests.sort((a, b) => a.requestId.localeCompare(b.requestId));
+}
+
+export function writeSlotPlayRequest(machineId: string, request: SlotPlayRequest): void {
+  ensureMap().set(`slot-request:${machineId}:${request.player}`, request);
+}
+
+export function clearSlotPlayRequest(machineId: string, playerId: string): void {
+  ensureMap().delete(`slot-request:${machineId}:${playerId}`);
+}
+
+export function readSlotReveal(machineId: string, playerId: string): SlotReveal | null {
+  const value = ensureMap().get(`slot-reveal:${machineId}:${playerId}`);
+  return isSlotReveal(value) ? value : null;
+}
+
+export function writeSlotReveal(machineId: string, playerId: string, reveal: SlotReveal): void {
+  ensureMap().set(`slot-reveal:${machineId}:${playerId}`, reveal);
+}
+
+export function clearSlotReveal(machineId: string, playerId: string): void {
+  ensureMap().delete(`slot-reveal:${machineId}:${playerId}`);
+}
+
 export function readSlotOddsConfig(machineId: string): SlotOddsConfig | null {
   const value = ensureMap().get(`slot-odds:${machineId}`);
   return isSlotOddsConfig(value) ? value : null;
@@ -404,9 +440,14 @@ export function writeSlotOddsConfig(machineId: string, config: SlotOddsConfig): 
 /** Remove all casino-map keys for a slot machine (teardown on item removal). */
 export function clearSlotMachineKeys(machineId: string): void {
   const map = ensureMap();
+  const requestPrefix = `slot-request:${machineId}:`;
+  const revealPrefix = `slot-reveal:${machineId}:`;
   boundDoc!.transact(() => {
     map.delete(`slot:${machineId}`);
     map.delete(`slot-odds:${machineId}`);
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(requestPrefix) || key.startsWith(revealPrefix)) map.delete(key);
+    }
   });
 }
 
@@ -423,6 +464,7 @@ if (typeof window !== 'undefined') {
     readCrapsBackendPref, writeCrapsBackendPref,
     readCrapsFairnessPref, writeCrapsFairnessPref,
     readSlotMachineState, writeSlotMachineState,
+    readSlotPlayRequests, writeSlotPlayRequest, readSlotReveal, writeSlotReveal,
     readSlotOddsConfig, writeSlotOddsConfig, clearSlotMachineKeys,
   };
 }
