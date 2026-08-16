@@ -411,14 +411,18 @@ export function clearSlotMachineKeys(machineId: string): void {
 }
 
 // Permanent debug handle (the __ssfGames precedent) — console verification of
-// balances, table state and settle math without UI plumbing.
-(window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
-  readChips, buyInChips, cashOutChips, spendChips, creditChips,
-  readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
-  readCroupierBeat, writeCroupierBeat,
-  readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
-  readCrapsBackendPref, writeCrapsBackendPref,
-  readCrapsFairnessPref, writeCrapsFairnessPref,
-  readSlotMachineState, writeSlotMachineState,
-  readSlotOddsConfig, writeSlotOddsConfig,
-};
+// balances, table state and settle math without UI plumbing. Guard for Node
+// tooling / tests: importing this module must stay pure, with browser-only
+// debug handles attached only when a DOM exists.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
+    readChips, buyInChips, cashOutChips, spendChips, creditChips,
+    readCageLedger, readTableState, writeTableState, readMyBets, writeMyBets, readAllBets,
+    readCroupierBeat, writeCroupierBeat,
+    readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
+    readCrapsBackendPref, writeCrapsBackendPref,
+    readCrapsFairnessPref, writeCrapsFairnessPref,
+    readSlotMachineState, writeSlotMachineState,
+    readSlotOddsConfig, writeSlotOddsConfig, clearSlotMachineKeys,
+  };
+}
