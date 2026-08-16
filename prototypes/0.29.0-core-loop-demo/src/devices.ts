@@ -101,7 +101,7 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus

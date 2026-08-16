@@ -41,6 +41,8 @@ import { isRouletteBet, isRouletteTableState } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { isCrapsBet, isCrapsTableState } from './games/craps';
 import type { CrapsBet, CrapsTableState, FairnessMode } from './games/craps';
+import { isSlotMachineState, isSlotOddsConfig } from './games/slots';
+import type { SlotMachineState, SlotOddsConfig } from './games/slots';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -365,6 +367,49 @@ export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): voi
   });
 }
 
+// ── 🎰 Slot machine state + odds (#109) ──────────────────────────────────────
+// Each slot machine has an independent state (`slot:<machineId>`) and an
+// optional owner-override paytable (`slot-odds:<machineId>`). Both are
+// whole-value LWW keys on the casino map — the same discipline as roulette /
+// craps. The machine owner (or their croupier bot) writes the state; any player
+// reads it. An absent odds config falls back to DEFAULT_PAYTABLE (see
+// games/slots.ts) so un-configured machines work immediately on placement.
+
+export function readSlotMachineState(machineId: string): SlotMachineState | null {
+  const value = ensureMap().get(`slot:${machineId}`);
+  return isSlotMachineState(value) ? value : null;
+}
+
+/** Machine owner / croupier bot only. */
+export function writeSlotMachineState(machineId: string, state: SlotMachineState): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`slot:${machineId}`, state);
+  });
+}
+
+export function readSlotOddsConfig(machineId: string): SlotOddsConfig | null {
+  const value = ensureMap().get(`slot-odds:${machineId}`);
+  return isSlotOddsConfig(value) ? value : null;
+}
+
+/** Room owner only — sets the paytable shown on the machine face. */
+export function writeSlotOddsConfig(machineId: string, config: SlotOddsConfig): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`slot-odds:${machineId}`, config);
+  });
+}
+
+/** Remove all casino-map keys for a slot machine (teardown on item removal). */
+export function clearSlotMachineKeys(machineId: string): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.delete(`slot:${machineId}`);
+    map.delete(`slot-odds:${machineId}`);
+  });
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing.
 (window as unknown as { __ssfCasino: unknown }).__ssfCasino = {
@@ -374,4 +419,6 @@ export function writeCrapsFairnessPref(tableId: string, mode: FairnessMode): voi
   readCrapsTableState, writeCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
   readCrapsBackendPref, writeCrapsBackendPref,
   readCrapsFairnessPref, writeCrapsFairnessPref,
+  readSlotMachineState, writeSlotMachineState,
+  readSlotOddsConfig, writeSlotOddsConfig,
 };

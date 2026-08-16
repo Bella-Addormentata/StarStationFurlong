@@ -100,7 +100,8 @@ export type FurnitureKind =
   | "classic-pool"
   | "classic-hot-tub"
   | "bunk-bed"
-  | "clone-vat";
+  | "clone-vat"
+  | "slot-machine";
 
 export interface FurnitureItem {
   id: string;
@@ -2627,7 +2628,23 @@ const bunkBedSeats: SeatTemplate[] = [
   },
 ];
 
-// ── 🏊 Pool seats — Habbo Hotel-style jump-in (lazy-pool) ───────────────────
+// ── 🎰 Slot machine seat + builder (issue #109) ──────────────────────────────
+// The slot machine is a 1×1 footprint with ONE built-in chair seat. The player
+// sits in the chair (facing the machine at faceAngle = 0) and can then focus
+// the device to pull the lever. The front approach is from the -z side (the
+// machine faces +z so the front of the machine faces the player approaching
+// from -z). Click box covers the full 1×1 tile minus a 0.1 m clearance strip
+// behind (machine body occupies ~z[0.1, 0.5]).
+const slotMachineSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -0.4, z0: -0.5, x1: 0.4, z1: 0.1 },
+    front: { x: 0, z: -1.0 },
+    sit: { x: 0, z: -0.22 },
+    faceAngle: 0,
+  },
+];
+
+
 // Eight seats cover the full pool interior in a compass-rose layout.
 // sitY: POOL_SWIM_Y (-0.52) drops the avatar below the deck edge so only the
 // head bobs above the water plane (POOL_WATER_Y = -0.35) — Habbo Lido style.
@@ -3284,6 +3301,26 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.5, z: -0.9 },
       anchor: { x: 0, y: 1.05, z: 0.2 },
+    },
+  },
+  // 🎰 Slot machine (issue #109) — 1×1 footprint with a built-in chair.
+  // The seat faces -z (the player approaches from the front, z = -1). The
+  // device focus zooms the camera to the machine face; the player can also
+  // look around in first-person from the chair. The builder + seat template
+  // are function-declared below (FURNITURE_DEFS evaluates them at load time,
+  // but function declarations hoist — same pattern as bunk-bed / clone-vat).
+  "slot-machine": {
+    kind: "slot-machine",
+    build: buildSlotMachine,
+    footprint: { w: 1, d: 1 },
+    functions: ["slotMachine"],
+    seats: slotMachineSeats,
+    device: {
+      kind: "slotMachine",
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.55, z: -0.55 },
+      anchor: { x: 0, y: 1.15, z: 0.1 },
     },
   },
 };
@@ -5494,7 +5531,148 @@ function buildCloneVat(ctx: BuildCtx) {
   carrier.userData.cloneVat = handle;
 }
 
-// ── Item list — today's EXACT lobby layout ────────────────────────────────────
+// ── 🎰 Slot machine (issue #109) — upright cabinet + built-in chair ──────────
+// Classic electro-mechanical styling: a tall gunmetal cabinet on four stubby
+// legs, padded seat bolted to the front, a large glazed pay window showing the
+// three reel symbols, denomination display at the top, and a side-mounted pull
+// lever. A coin tray at the bottom catches winning chips. The canvas face
+// texture paints the current paytable so odds are always visible to the player.
+//
+// Local frame (rot 0): the cabinet FACE (player side) is at z ≈ −0.1, the
+// seat is centred at z ≈ −0.22, and the machine back is at z ≈ +0.45.
+// The pull lever is on the right side (+x).
+function buildSlotMachine({ m, place, addLight }: BuildCtx) {
+  const BODY    = 0x2a3444; // gunmetal (wall-computer family)
+  const CHROME  = 0x8a93a0; // steel trim
+  const GOLD    = 0xd4a84b; // accent gold
+  const GLASS   = 0xb8d4f8; // pay-window glass tint
+  const FELT    = 0x2e7d46; // seat pad green
+  const LIGHT   = 0xfff0c8; // warm top light
+
+  // ── Cabinet body ──────────────────────────────────────────────────────────
+  // Main box (z: −0.10 → +0.44, y: 0.38 → 1.90, x: −0.30 → +0.30)
+  place(new THREE.BoxGeometry(0.60, 1.52, 0.54), m(BODY,   0.55, 0.45), 0, 1.14, 0.17);
+  // Chrome side-trim strips
+  for (const sx of [-0.30, 0.30]) {
+    place(new THREE.BoxGeometry(0.025, 1.50, 0.56), m(CHROME, 0.4, 0.6), sx, 1.14, 0.17);
+  }
+  // Base plinth + four legs
+  place(new THREE.BoxGeometry(0.64, 0.08, 0.58), m(BODY, 0.55, 0.4), 0, 0.39, 0.17);
+  for (const [lx, lz] of [[-0.24, -0.06], [0.24, -0.06], [-0.24, 0.40], [0.24, 0.40]] as const) {
+    place(new THREE.BoxGeometry(0.08, 0.38, 0.08), m(CHROME, 0.4, 0.6), lx, 0.19, lz);
+    // Rubber foot
+    place(new THREE.BoxGeometry(0.10, 0.03, 0.10), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
+  }
+
+  // ── Top dome / marquee ────────────────────────────────────────────────────
+  place(new THREE.BoxGeometry(0.62, 0.14, 0.56), m(BODY,   0.55, 0.45), 0, 1.92, 0.17);
+  place(new THREE.BoxGeometry(0.58, 0.04, 0.52), m(GOLD,   0.4,  0.5 ), 0, 1.86, 0.17);
+  // Neon-strip indicator at the very top (emissive gold)
+  place(new THREE.BoxGeometry(0.52, 0.06, 0.04), m(GOLD, 0.3, 0.5, GOLD, 0.8), 0, 1.96, -0.08);
+  // Top-mount warm point light (dims ambient lighting on the player)
+  addLight(new THREE.PointLight(LIGHT, 0, 2.2), 0, 2.1, -0.12, 0.35);
+
+  // ── Pay window (glazed opening showing three reel drums) ──────────────────
+  // Recess frame
+  place(new THREE.BoxGeometry(0.50, 0.36, 0.03), m(CHROME, 0.4, 0.6), 0, 1.30, -0.10);
+  // Glass panel (semi-transparent tint — baseOpacity so morph keeps it translucent)
+  {
+    const glassMat = m(GLASS, 0.05, 0.0);
+    glassMat.transparent = true;
+    glassMat.userData.baseOpacity = 0.55;
+    place(new THREE.BoxGeometry(0.46, 0.30, 0.015), glassMat, 0, 1.30, -0.092);
+  }
+  // Three reel drums behind the glass (decorative — grey cylinders with deco
+  // colour band representing the active face)
+  const reelColors = [0xc43c3c, 0x2e7d46, 0x23252e] as const; // red/green/black
+  for (let i = 0; i < 3; i++) {
+    const rx = (i - 1) * 0.14;
+    // Drum body
+    place(new THREE.CylinderGeometry(0.055, 0.055, 0.26, 14),
+      m(0xf5f2e8, 0.6, 0.1), rx, 1.30, 0.04);
+    // Active-face colour band on the front of the drum
+    place(new THREE.BoxGeometry(0.10, 0.10, 0.02),
+      m(reelColors[i], 0.5, 0.2), rx, 1.30, -0.065);
+  }
+
+  // ── Paytable panel below the window ──────────────────────────────────────
+  {
+    const pcv = document.createElement('canvas');
+    pcv.width = 128; pcv.height = 80;
+    const pc2 = pcv.getContext('2d')!;
+    pc2.fillStyle = '#14181E';
+    pc2.fillRect(0, 0, 128, 80);
+    pc2.strokeStyle = '#3A424C';
+    pc2.strokeRect(1, 1, 126, 78);
+    pc2.fillStyle = '#D4A84B';
+    pc2.font = 'bold 8px monospace';
+    pc2.textAlign = 'center';
+    pc2.fillText('PAYTABLE', 64, 12);
+    // Abbreviated odds rows
+    const rows = ['7-7-7 → 100×', 'BAR-BAR-BAR → 50×', '🔔🔔🔔 → 20×', '🍒🍒🍒 → 4×', '🍒 → 1×'];
+    pc2.fillStyle = '#E8ECF2';
+    pc2.font = '7px monospace';
+    for (let ri = 0; ri < rows.length; ri++) {
+      pc2.fillText(rows[ri], 64, 25 + ri * 11);
+    }
+    const ptex = new THREE.CanvasTexture(pcv);
+    ptex.minFilter = THREE.NearestFilter;
+    ptex.magFilter = THREE.NearestFilter;
+    ptex.generateMipmaps = false;
+    ptex.colorSpace = THREE.SRGBColorSpace;
+    const pmat = new THREE.MeshBasicMaterial({
+      map: ptex, transparent: true, opacity: 0,
+    });
+    const pgeo = new THREE.PlaneGeometry(0.44, 0.20);
+    place(pgeo, pmat, 0, 1.05, -0.088);
+  }
+
+  // ── Denomination / credit display above window ─────────────────────────────
+  place(new THREE.BoxGeometry(0.46, 0.09, 0.03), m(0x14181e, 0.85, 0.1), 0, 1.60, -0.10);
+  // Green LED bar (emissive)
+  place(new THREE.BoxGeometry(0.38, 0.04, 0.015), m(0x00c060, 0.3, 0.2, 0x00c060, 0.9),
+    0, 1.60, -0.115);
+
+  // ── Denomination push buttons (4 × chip colors) ──────────────────────────
+  const denomCols = [0xe8e2d2, 0xc43c3c, 0x2e7d46, 0x23252e] as const; // 1/5/25/100
+  for (let bi = 0; bi < 4; bi++) {
+    const bx = -0.18 + bi * 0.12;
+    // Button housing
+    place(new THREE.BoxGeometry(0.09, 0.06, 0.04), m(0x3d4a5e, 0.55, 0.4), bx, 0.85, -0.105);
+    // Button face (chip colour)
+    place(new THREE.CylinderGeometry(0.025, 0.025, 0.015, 10),
+      m(denomCols[bi], 0.5, 0.25), bx, 0.885, -0.112);
+  }
+
+  // ── Coin tray (winning chips come out here) ───────────────────────────────
+  place(new THREE.BoxGeometry(0.44, 0.06, 0.12), m(CHROME, 0.4, 0.5), 0, 0.64, -0.13);
+  // Tray interior (slightly recessed dark)
+  place(new THREE.BoxGeometry(0.40, 0.03, 0.10), m(0x14181e, 0.85, 0.1), 0, 0.64, -0.135);
+
+  // ── Pull lever (right side, +x) ───────────────────────────────────────────
+  // Ball grip at the top
+  place(new THREE.SphereGeometry(0.045, 10, 8), m(GOLD, 0.35, 0.5), 0.36, 1.62, 0.07);
+  // Lever shaft (slightly angled — resting position)
+  {
+    const shaft = place(new THREE.CylinderGeometry(0.018, 0.020, 0.58, 10),
+      m(CHROME, 0.4, 0.6), 0.36, 1.34, 0.07);
+    shaft.rotation.z = 0.12; // slight lean
+  }
+  // Pivot housing on the cabinet side
+  place(new THREE.BoxGeometry(0.06, 0.06, 0.06), m(BODY, 0.55, 0.4), 0.325, 1.06, 0.07);
+
+  // ── Built-in chair ────────────────────────────────────────────────────────
+  // Seat pad (at y ≈ 0.44, slightly in front of the machine at z ≈ −0.22)
+  place(new THREE.BoxGeometry(0.46, 0.07, 0.38), m(FELT, 0.85, 0.04), 0, 0.44, -0.22);
+  // Seat base / pedestal
+  place(new THREE.BoxGeometry(0.16, 0.44, 0.16), m(CHROME, 0.4, 0.6), 0, 0.22, -0.22);
+  // Pedestal foot
+  place(new THREE.BoxGeometry(0.34, 0.04, 0.34), m(CHROME, 0.4, 0.5), 0, 0.02, -0.22);
+  // Low back rest
+  place(new THREE.BoxGeometry(0.44, 0.22, 0.06), m(FELT, 0.85, 0.04), 0, 0.65, -0.05);
+}
+
+
 // Obstacle-bearing items appear first, in the same order as the original
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
 // therefore sliding behaviour in multi-box corners) is unchanged.
