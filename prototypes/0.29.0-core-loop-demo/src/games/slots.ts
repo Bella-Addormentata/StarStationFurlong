@@ -206,6 +206,7 @@ export function isSlotFundingConfig(v: unknown): v is SlotFundingConfig {
 export type SlotFailure =
   | 'insufficient-player-funds'
   | 'insufficient-bankroll'
+  | 'odds-changed'
   | 'reveal-timeout'
   | 'invalid-reveal'
   | 'invalid-house-commit';
@@ -237,6 +238,8 @@ export interface SlotMachineState {
   /** Round snapshots: later owner edits cannot change an accepted wager. */
   funding?: SlotFundingConfig;
   paytable?: SlotPayEntry[];
+  /** Shared-bankroll lease token held for this accepted round. */
+  sharedLeaseToken: string | null;
   /** Why an accepted request did not produce a normal result. */
   failure?: SlotFailure;
   /** 🎰🔒 Verifiable entropy transcript (absent for 'rng'). */
@@ -247,7 +250,7 @@ export function initialSlotMachineState(): SlotMachineState {
   return {
     kind: 'slot', phase: 'idle', round: 1,
     player: null, bet: null, requestId: null, houseSeed: null, acceptedAt: 0,
-    seeds: null, result: null, credited: null, settledAt: 0,
+    seeds: null, result: null, credited: null, settledAt: 0, sharedLeaseToken: null,
   };
 }
 
@@ -259,6 +262,8 @@ export interface SlotPlayRequest {
   player: string;
   bet: number;
   playerCommit: string;
+  /** SHA-256 of the canonical paytable displayed when the player pulled. */
+  paytableHash: string;
 }
 
 export interface SlotReveal {
@@ -276,7 +281,8 @@ export function isSlotPlayRequest(v: unknown): v is SlotPlayRequest {
     && typeof r.player === 'string' && r.player.length > 0 && r.player.length <= 128
     && Number.isSafeInteger(r.bet) && (r.bet as number) > 0
     && (r.bet as number) <= MAX_SLOT_STAKE
-    && typeof r.playerCommit === 'string' && HEX_32.test(r.playerCommit);
+    && typeof r.playerCommit === 'string' && HEX_32.test(r.playerCommit)
+    && typeof r.paytableHash === 'string' && HEX_32.test(r.paytableHash);
 }
 
 export function isSlotReveal(v: unknown): v is SlotReveal {
@@ -305,6 +311,7 @@ function isSeedTriple(v: unknown): v is [number, number, number] {
 const SLOT_FAILURES: readonly SlotFailure[] = [
   'insufficient-player-funds',
   'insufficient-bankroll',
+  'odds-changed',
   'reveal-timeout',
   'invalid-reveal',
   'invalid-house-commit',
@@ -331,6 +338,8 @@ export function isSlotMachineState(v: unknown): v is SlotMachineState {
     && typeof s.settledAt === 'number' && Number.isFinite(s.settledAt as number)
     && (s.funding === undefined || isSlotFundingConfig(s.funding))
     && (s.paytable === undefined || isSlotOddsConfig({ paytable: s.paytable }))
+    && (s.sharedLeaseToken === null || (typeof s.sharedLeaseToken === 'string'
+      && s.sharedLeaseToken.length > 0 && s.sharedLeaseToken.length <= 384))
     && (s.failure === undefined || SLOT_FAILURES.includes(s.failure))
     && (s.fairness === undefined || isFairnessTranscript(s.fairness));
 }
@@ -431,6 +440,18 @@ export async function commitSlotSeed(seed: string): Promise<string> {
   return toHex(await sha256Bytes(`ssf-slot-commit-v1|${seed}`));
 }
 
+/** Stable hash of the exact ordered paytable a player accepted. */
+export async function hashSlotPaytable(
+  paytable: readonly SlotPayEntry[],
+): Promise<string> {
+  const canonical = JSON.stringify(paytable.map((entry) => [
+    entry.symbols,
+    entry.multiplier,
+    entry.label,
+  ]));
+  return toHex(await sha256Bytes(`ssf-slot-paytable-v1|${canonical}`));
+}
+
 /** Chia Gaming-style two-party commit/reveal, with unbiased 0–21 extraction. */
 export async function deriveReelStops(
   playerSeed: string,
@@ -498,6 +519,6 @@ export type { FairnessMode, FairnessTranscript };
 if (typeof window !== 'undefined') {
   (window as unknown as { __ssfSlots: unknown }).__ssfSlots = {
     spinReels, resolveSlot, maxSlotPayout, computeRTP, randomReelStops, commitSlotSeed,
-    deriveReelStops, verifySlotFairness, DEFAULT_PAYTABLE, REEL_STRIP,
+    hashSlotPaytable, deriveReelStops, verifySlotFairness, DEFAULT_PAYTABLE, REEL_STRIP,
   };
 }

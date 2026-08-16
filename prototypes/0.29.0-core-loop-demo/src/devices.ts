@@ -88,7 +88,7 @@ import { canPlaceBet } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_SPIN_MS, SLOT_SYMBOLS,
-  commitSlotSeed, computeRTP, isSlotOddsConfig, randomSlotSeed,
+  commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
 } from './games/slots';
 import type { SlotFundingConfig, SlotPayEntry, SlotSymbol } from './games/slots';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
@@ -2770,13 +2770,18 @@ export function createSlotMachineUI(
     };
     pendingSlotPlays.set(key, pending);
     try {
-      const playerCommit = await commitSlotSeed(seed);
+      const displayedPaytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
+      const [playerCommit, paytableHash] = await Promise.all([
+        commitSlotSeed(seed),
+        hashSlotPaytable(displayedPaytable),
+      ]);
       if (pendingSlotPlays.get(key) !== pending) return;
       writeSlotPlayRequest(deps.itemId, {
         requestId,
         player: myId,
         bet: denom,
         playerCommit,
+        paytableHash,
       });
       deps.onMessage?.('WAIT');
     } catch (error) {
@@ -2804,6 +2809,7 @@ export function createSlotMachineUI(
   const failureText = (failure: NonNullable<ReturnType<typeof readSlotMachineState>>['failure']): string => {
     if (failure === 'insufficient-player-funds') return 'WAGER DECLINED — NOT ENOUGH CHIPS';
     if (failure === 'insufficient-bankroll') return 'WAGER DECLINED — BANKROLL CANNOT COVER THE JACKPOT';
+    if (failure === 'odds-changed') return 'WAGER DECLINED — ODDS CHANGED, PULL AGAIN';
     if (failure === 'reveal-timeout') return 'SPIN CANCELLED — PLAYER REVEAL TIMED OUT';
     if (failure === 'invalid-reveal') return 'SPIN CANCELLED — FAIRNESS REVEAL FAILED';
     if (failure === 'invalid-house-commit') return 'SPIN REFUNDED — HOUSE COMMITMENT CHANGED';
