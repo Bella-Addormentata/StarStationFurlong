@@ -2,20 +2,19 @@
  * 🎰 Slot Machine — the pure engine (issue #109).
  *
  * A classic three-reel, single-payline slot machine. This module is PURE —
- * no doc access, no DOM, no randomness of its own (the caller passes three
- * integer seeds in) — so payout math is console-testable and a Chia
+ * no doc access and no DOM — so payout math is console-testable and a Chia
  * commit-reveal / block-beacon fairness upgrade slots in around it
  * untouched, exactly like games/craps.ts.
  *
  * SYMBOL STRIP
- * Each reel carries REEL_STRIP_SIZE virtual stops. The symbols are sampled by
- * `seeds[i] % REEL_STRIP_SIZE`, mapping to a symbol index via `REEL_STRIP`.
+ * Each reel carries REEL_STRIP_SIZE virtual stops. Random stops are sampled
+ * without modulo bias, then mapped to a symbol index via `REEL_STRIP`.
  * The strip distribution controls the house edge directly — rarer symbols
  * appear on fewer stops.
  *
  * ODDS & PAYTABLE
  * Vegas-typical 3-reel machines return roughly 85–98% RTP depending on
- * denomination (higher-coin machines pay more). Our default achieves ≈92%
+ * denomination (higher-coin machines pay more). Our default achieves 83.31%
  * over the strip distribution below. The room owner can override the odds
  * via `SlotOddsConfig` stored in the casino doc; `resolveSlot` accepts a
  * custom paytable, letting the owner increase or decrease the house edge and
@@ -74,16 +73,31 @@ export type SymbolIndex = 0 | 1 | 2 | 3 | 4 | 5 | 6;
  *   seven   1 stop   (5%)
  *
  * All three reels share the same strip; a real machine would stagger them, but
- * this distribution already yields ~92% RTP with the default paytable.
+ * this distribution yields 83.31% RTP with the default paytable.
  */
 export const REEL_STRIP: readonly SymbolIndex[] = [
   0, 0, 1, 2, 0, 3, 1, 2, 0, 4, 1, 2, 0, 3, 1, 0, 5, 2, 1, 4, 6, 3,
 ] as const;
 export const REEL_STRIP_SIZE = REEL_STRIP.length; // 22
 
-/** Resolve a seed (0–N) to its symbol. */
-export function seedToSymbol(seed: number): SlotSymbol {
-  return SLOT_SYMBOLS[REEL_STRIP[((seed % REEL_STRIP_SIZE) + REEL_STRIP_SIZE) % REEL_STRIP_SIZE]];
+/** Resolve an unbiased reel stop (0–21) to its symbol. */
+export function seedToSymbol(stop: number): SlotSymbol {
+  if (!Number.isInteger(stop) || stop < 0 || stop >= REEL_STRIP_SIZE) {
+    throw new RangeError(`Slot reel stop must be an integer from 0 to ${REEL_STRIP_SIZE - 1}`);
+  }
+  return SLOT_SYMBOLS[REEL_STRIP[stop]];
+}
+
+/** Draw three unbiased reel stops from browser/Node Web Crypto. */
+export function randomReelStops(): [number, number, number] {
+  const stops: number[] = [];
+  const words = new Uint32Array(1);
+  const limit = 2 ** 32 - ((2 ** 32) % REEL_STRIP_SIZE);
+  while (stops.length < 3) {
+    crypto.getRandomValues(words);
+    if (words[0] < limit) stops.push(words[0] % REEL_STRIP_SIZE);
+  }
+  return stops as [number, number, number];
 }
 
 // ── Paytable ──────────────────────────────────────────────────────────────────
@@ -103,7 +117,7 @@ export interface SlotPayEntry {
  * Default paytable — classic Vegas-style 3-reel single-line odds.
  * Displayed on the machine face and editable by the room owner.
  *
- * Approximate RTP with the default strip: ~92%.
+ * RTP with the default strip: 83.31%.
  */
 export const DEFAULT_PAYTABLE: readonly SlotPayEntry[] = [
   // JACKPOT
@@ -200,7 +214,8 @@ function isSymbolTriple(v: unknown): v is [SlotSymbol, SlotSymbol, SlotSymbol] {
 
 function isSeedTriple(v: unknown): v is [number, number, number] {
   return Array.isArray(v) && v.length === 3
-    && v.every((s) => Number.isInteger(s) && (s as number) >= 0);
+    && v.every((s) => Number.isInteger(s) && (s as number) >= 0
+      && (s as number) < REEL_STRIP_SIZE);
 }
 
 /** Shape guard — state crosses the room-doc trust boundary (peer writes). */
@@ -222,8 +237,7 @@ export function isSlotMachineState(v: unknown): v is SlotMachineState {
 // ── Pure spin logic ───────────────────────────────────────────────────────────
 
 /**
- * Derive three symbols from three integer seeds. Seeds are typically produced
- * by a fairness module (diceFairness.ts) — the same entropy pipeline as craps.
+ * Derive three symbols from three unbiased 0–21 reel stops.
  */
 export function spinReels(
   seeds: [number, number, number],
@@ -298,6 +312,8 @@ export function computeRTP(paytable: readonly SlotPayEntry[] = DEFAULT_PAYTABLE)
 export type { FairnessMode, FairnessTranscript };
 
 // Debug handle (the __ssfGames/__ssfCasino/__ssfChips precedent).
-(window as unknown as { __ssfSlots: unknown }).__ssfSlots = {
-  spinReels, resolveSlot, computeRTP, DEFAULT_PAYTABLE, REEL_STRIP,
-};
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfSlots: unknown }).__ssfSlots = {
+    spinReels, resolveSlot, computeRTP, randomReelStops, DEFAULT_PAYTABLE, REEL_STRIP,
+  };
+}

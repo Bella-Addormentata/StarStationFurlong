@@ -64,6 +64,7 @@ import {
   readCrapsTableState, readMyCrapsBets, writeMyCrapsBets, readAllCrapsBets,
   readCrapsBackendPref, writeCrapsBackendPref,
   readCrapsFairnessPref, writeCrapsFairnessPref,
+  readSlotMachineState, writeSlotMachineState, readSlotOddsConfig,
 } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -82,6 +83,10 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 // 🎲 #69 G3: the craps engine (pure payout math) + its table state.
 import { canPlaceBet } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
+import {
+  DEFAULT_PAYTABLE, computeRTP, initialSlotMachineState, randomReelStops,
+  resolveSlot, spinReels,
+} from './games/slots';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -2578,6 +2583,135 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
         drawWheelForNow();
       }
     },
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 🎰 Slot machine (#109)
+// ══════════════════════════════════════════════════════════════════════════════
+
+export interface SlotMachineUIDeps {
+  itemId: string;
+}
+
+export function createSlotMachineUI(deps: SlotMachineUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let denom = 5;
+  let flash = '';
+  const myId = getPlayerId();
+
+  const pullLever = (): void => {
+    const current = readSlotMachineState(deps.itemId);
+    if (current?.phase === 'spinning') return;
+    if (!spendChips(myId, denom)) {
+      flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
+      render();
+      return;
+    }
+
+    const round = (current?.round ?? 0) + 1;
+    const spinning = {
+      ...initialSlotMachineState(),
+      phase: 'spinning' as const,
+      round,
+      player: myId,
+      bet: denom,
+    };
+    writeSlotMachineState(deps.itemId, spinning);
+
+    const seeds = randomReelStops();
+    const result = spinReels(seeds);
+    const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
+    const resolution = resolveSlot(result, denom, paytable);
+    if (resolution.credited > 0) creditChips(myId, resolution.credited);
+    writeSlotMachineState(deps.itemId, {
+      ...spinning,
+      phase: 'settled',
+      seeds,
+      result,
+      credited: resolution.credited,
+      settledAt: Date.now(),
+    });
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const state = readSlotMachineState(deps.itemId);
+    const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
+    const result = state?.result ?? null;
+    const symbolName = (symbol: string): string => symbol.toUpperCase();
+
+    panel.querySelector<HTMLElement>('#sl-reels')!.textContent =
+      result ? result.map(symbolName).join('  ·  ') : '—  ·  —  ·  —';
+    panel.querySelector<HTMLElement>('#sl-status')!.textContent = flash
+      || (state?.phase === 'spinning'
+        ? 'REELS SPINNING…'
+        : state?.phase === 'settled'
+          ? `${state.credited ? `PAYS ${state.credited} CHIPS` : 'NO WIN'} · ROUND ${state.round}`
+          : 'CHOOSE A CHIP AND PULL THE LEVER');
+    panel.querySelector<HTMLElement>('#sl-chips')!.textContent = `YOUR CHIPS: ${readChips(myId)}`;
+    panel.querySelector<HTMLElement>('#sl-rtp')!.textContent =
+      `THEORETICAL RTP ${computeRTP(paytable).toFixed(2)}%`;
+    const rows = panel.querySelector<HTMLElement>('#sl-paytable')!;
+    rows.replaceChildren(...paytable.slice(0, 10).map((entry) => {
+      const row = document.createElement('div');
+      row.textContent = `${entry.label} — ${entry.multiplier}×`;
+      return row;
+    }));
+    panel.querySelectorAll<HTMLButtonElement>('[data-slot-denom]').forEach((button) => {
+      const selected = Number(button.dataset.slotDenom) === denom;
+      button.style.borderColor = selected ? '#F0C060' : 'rgba(212,168,75,0.35)';
+      button.style.color = selected ? '#F0C060' : GT_GOLD;
+    });
+    const lever = panel.querySelector<HTMLButtonElement>('#sl-pull')!;
+    lever.disabled = state?.phase === 'spinning';
+    flash = '';
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-slot-machine-pane';
+      panel.style.cssText = `
+        position:absolute; top:48%; left:50%; transform:translate(-50%,-50%);
+        width:390px; max-height:90vh; overflow-y:auto; box-sizing:border-box;
+        padding:18px; display:flex; flex-direction:column; gap:12px;
+        background:rgba(4,8,22,0.95); border:1px solid rgba(212,168,75,0.35);
+        border-radius:12px; color:${GT_GOLD}; font-family:'SF Mono','Consolas',monospace;
+        pointer-events:auto; box-shadow:0 12px 64px rgba(0,0,0,0.9);
+      `;
+      panel.innerHTML = `
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🎰 THREE-REEL SLOT</div>
+        <div id="sl-reels" style="padding:18px 8px;text-align:center;font-size:18px;font-weight:800;background:#14181e;border:2px solid #8a93a0;color:#f5efdf;"></div>
+        <div id="sl-status" style="min-height:14px;text-align:center;font-size:10px;font-weight:800;color:${GT_GOLD_BRIGHT};"></div>
+        <div id="sl-chips" style="font-size:10px;"></div>
+        <div style="display:flex;gap:8px;">${[1, 5, 25, 100].map((n) =>
+          `<button data-slot-denom="${n}" style="flex:1;padding:7px;background:rgba(212,168,75,0.08);border:2px solid rgba(212,168,75,0.35);border-radius:12px;color:${GT_GOLD};font:inherit;cursor:pointer;">${n}</button>`
+        ).join('')}</div>
+        <button id="sl-pull" style="padding:11px;background:rgba(212,168,75,0.16);border:1px solid #D4A84B;border-radius:6px;color:#F0C060;font:800 11px inherit;letter-spacing:2px;cursor:pointer;">PULL LEVER</button>
+        <div id="sl-rtp" style="font-size:9px;color:${GT_DIM};"></div>
+        <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:9px;color:#E8ECF2;"></div>
+      `;
+      panel.addEventListener('click', (event) => event.stopPropagation());
+      panel.querySelectorAll<HTMLButtonElement>('[data-slot-denom]').forEach((button) => {
+        button.addEventListener('click', () => {
+          denom = Number(button.dataset.slotDenom);
+          render();
+        });
+      });
+      panel.querySelector<HTMLButtonElement>('#sl-pull')!.addEventListener('click', pullLever);
+      host.appendChild(panel);
+      unsubscribe = subscribeCasino(render);
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+    },
+    update(): void {},
   };
 }
 

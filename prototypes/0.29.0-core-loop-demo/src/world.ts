@@ -113,10 +113,12 @@ import {
   createCashierUI,
   createRouletteUI,
   createCrapsUI,
+  createSlotMachineUI,
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
+import { clearSlotMachineKeys } from "./casinoDoc";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import type {
   WallScreenHandle,
@@ -2857,6 +2859,8 @@ export class World {
       closeTable(itemId);
     } else if (removedKind === "craps-table") {
       closeCrapsTable(itemId);
+    } else if (removedKind === "slot-machine") {
+      clearSlotMachineKeys(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -2868,6 +2872,8 @@ export class World {
     const groupLights = new Set<THREE.PointLight>();
     const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
     group.traverse((obj) => {
+      const disposeSlotPaytable = obj.userData.disposeSlotPaytable;
+      if (typeof disposeSlotPaytable === "function") disposeSlotPaytable();
       if (obj instanceof THREE.PointLight) {
         groupLights.add(obj);
         obj.dispose();
@@ -5051,6 +5057,15 @@ export class World {
       const target =
         device.kind === "cashier" ? device : this.standTarget(device);
       deviceFocus.beginFocus(this.player, target, ui);
+      return;
+    }
+
+    if (device.kind === "slotMachine") {
+      deviceFocus.beginFocus(
+        this.player,
+        device,
+        createSlotMachineUI({ itemId: deviceId }),
+      );
       return;
     }
 

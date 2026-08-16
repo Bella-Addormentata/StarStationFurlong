@@ -38,6 +38,9 @@ import type {
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
+import { DEFAULT_PAYTABLE, computeRTP } from "./games/slots";
+import type { SlotPayEntry } from "./games/slots";
+import { readSlotOddsConfig, subscribeCasino } from "./casinoDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
@@ -192,6 +195,7 @@ export interface StandSlot {
 
 /** Build-time helpers bound to the item's group (all coordinates local). */
 export interface BuildCtx {
+  itemId: string;
   m: (
     color: number,
     rough?: number,
@@ -2641,6 +2645,7 @@ const slotMachineSeats: SeatTemplate[] = [
     front: { x: 0, z: -1.0 },
     sit: { x: 0, z: -0.22 },
     faceAngle: 0,
+    sitY: seatOn(0.475),
   },
 ];
 
@@ -5541,7 +5546,7 @@ function buildCloneVat(ctx: BuildCtx) {
 // Local frame (rot 0): the cabinet FACE (player side) is at z ≈ −0.1, the
 // seat is centred at z ≈ −0.22, and the machine back is at z ≈ +0.45.
 // The pull lever is on the right side (+x).
-function buildSlotMachine({ m, place, addLight }: BuildCtx) {
+function buildSlotMachine({ itemId, m, place, addLight }: BuildCtx) {
   const BODY    = 0x2a3444; // gunmetal (wall-computer family)
   const CHROME  = 0x8a93a0; // steel trim
   const GOLD    = 0xd4a84b; // accent gold
@@ -5600,21 +5605,6 @@ function buildSlotMachine({ m, place, addLight }: BuildCtx) {
     const pcv = document.createElement('canvas');
     pcv.width = 128; pcv.height = 80;
     const pc2 = pcv.getContext('2d')!;
-    pc2.fillStyle = '#14181E';
-    pc2.fillRect(0, 0, 128, 80);
-    pc2.strokeStyle = '#3A424C';
-    pc2.strokeRect(1, 1, 126, 78);
-    pc2.fillStyle = '#D4A84B';
-    pc2.font = 'bold 8px monospace';
-    pc2.textAlign = 'center';
-    pc2.fillText('PAYTABLE', 64, 12);
-    // Abbreviated odds rows
-    const rows = ['7-7-7 → 100×', 'BAR-BAR-BAR → 50×', '🔔🔔🔔 → 20×', '🍒🍒🍒 → 4×', '🍒 → 1×'];
-    pc2.fillStyle = '#E8ECF2';
-    pc2.font = '7px monospace';
-    for (let ri = 0; ri < rows.length; ri++) {
-      pc2.fillText(rows[ri], 64, 25 + ri * 11);
-    }
     const ptex = new THREE.CanvasTexture(pcv);
     ptex.minFilter = THREE.NearestFilter;
     ptex.magFilter = THREE.NearestFilter;
@@ -5624,7 +5614,29 @@ function buildSlotMachine({ m, place, addLight }: BuildCtx) {
       map: ptex, transparent: true, opacity: 0,
     });
     const pgeo = new THREE.PlaneGeometry(0.44, 0.20);
-    place(pgeo, pmat, 0, 1.05, -0.088);
+    const panel = place(pgeo, pmat, 0, 1.05, -0.088);
+    const drawPaytable = (paytable: readonly SlotPayEntry[]): void => {
+      pc2.fillStyle = '#14181E';
+      pc2.fillRect(0, 0, 128, 80);
+      pc2.strokeStyle = '#3A424C';
+      pc2.strokeRect(1, 1, 126, 78);
+      pc2.fillStyle = '#D4A84B';
+      pc2.font = 'bold 8px monospace';
+      pc2.textAlign = 'center';
+      pc2.fillText(`PAYTABLE · RTP ${computeRTP(paytable).toFixed(2)}%`, 64, 12);
+      pc2.fillStyle = '#E8ECF2';
+      pc2.font = '7px monospace';
+      paytable.slice(0, 5).forEach((entry, ri) => {
+        pc2.fillText(`${entry.label.slice(0, 14)} → ${entry.multiplier}×`, 64, 25 + ri * 11);
+      });
+      ptex.needsUpdate = true;
+    };
+    const repaint = (): void => {
+      drawPaytable(readSlotOddsConfig(itemId)?.paytable ?? DEFAULT_PAYTABLE);
+    };
+    const unsubscribe = subscribeCasino(repaint);
+    panel.userData.disposeSlotPaytable = unsubscribe;
+    repaint();
   }
 
   // ── Denomination / credit display above window ─────────────────────────────
@@ -5669,7 +5681,7 @@ function buildSlotMachine({ m, place, addLight }: BuildCtx) {
   // Pedestal foot
   place(new THREE.BoxGeometry(0.34, 0.04, 0.34), m(CHROME, 0.4, 0.5), 0, 0.02, -0.22);
   // Low back rest
-  place(new THREE.BoxGeometry(0.44, 0.22, 0.06), m(FELT, 0.85, 0.04), 0, 0.65, -0.05);
+  place(new THREE.BoxGeometry(0.44, 0.22, 0.06), m(FELT, 0.85, 0.04), 0, 0.65, -0.41);
 }
 
 
@@ -7302,6 +7314,7 @@ export function furnitureVisualYaw(item: FurnitureItem): number {
 export function buildItemGroup(item: FurnitureItem): THREE.Group {
   const group = new THREE.Group();
   const ctx: BuildCtx = {
+    itemId: item.id,
     m: (color, rough = 0.72, metal = 0.06, em = 0x000000, emI = 0) =>
       new THREE.MeshStandardMaterial({
         color,
