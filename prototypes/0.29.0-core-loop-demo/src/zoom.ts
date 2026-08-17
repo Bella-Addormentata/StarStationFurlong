@@ -391,12 +391,12 @@ export class MultiScaleZoomView {
 
   /** Enter level-1 first person from the normal room view, facing the seat. */
   public requestFirstPerson(faceAngle?: number): void {
-    if (this.currentLevel !== 2 || isDeviceFocusActive()) return;
+    if ((this.currentLevel !== 1 && this.currentLevel !== 2) || isDeviceFocusActive()) return;
     if (faceAngle !== undefined) {
       yaw = faceAngle;
       pitch = 0;
     }
-    this.zoomIn();
+    if (this.currentLevel === 2) this.zoomIn();
   }
 
   /**

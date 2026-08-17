@@ -83,6 +83,8 @@ export const MAX_SLOT_STAKE = 100;
 export const MAX_SLOT_MULTIPLIER = 1_000_000;
 export const MAX_SLOT_PAYOUT = MAX_SLOT_STAKE * MAX_SLOT_MULTIPLIER;
 export const SLOT_SPIN_MS = 1_600;
+export const SLOT_REQUEST_TTL_MS = 60_000;
+export const SLOT_REQUEST_FUTURE_SKEW_MS = 5_000;
 
 /** Resolve an unbiased reel stop (0–21) to its symbol. */
 export function seedToSymbol(stop: number): SlotSymbol {
@@ -207,8 +209,8 @@ export type SlotFailure =
   | 'insufficient-player-funds'
   | 'insufficient-bankroll'
   | 'odds-changed'
+  | 'request-expired'
   | 'reveal-timeout'
-  | 'invalid-reveal'
   | 'invalid-house-commit';
 
 /** The per-machine shared state (casino doc key `slot:<machineId>`).
@@ -261,6 +263,7 @@ export interface SlotPlayRequest {
   requestId: string;
   player: string;
   bet: number;
+  requestedAt: number;
   playerCommit: string;
   /** SHA-256 of the canonical paytable displayed when the player pulled. */
   paytableHash: string;
@@ -281,6 +284,7 @@ export function isSlotPlayRequest(v: unknown): v is SlotPlayRequest {
     && typeof r.player === 'string' && r.player.length > 0 && r.player.length <= 128
     && Number.isSafeInteger(r.bet) && (r.bet as number) > 0
     && (r.bet as number) <= MAX_SLOT_STAKE
+    && Number.isSafeInteger(r.requestedAt) && (r.requestedAt as number) > 0
     && typeof r.playerCommit === 'string' && HEX_32.test(r.playerCommit)
     && typeof r.paytableHash === 'string' && HEX_32.test(r.paytableHash);
 }
@@ -312,8 +316,8 @@ const SLOT_FAILURES: readonly SlotFailure[] = [
   'insufficient-player-funds',
   'insufficient-bankroll',
   'odds-changed',
+  'request-expired',
   'reveal-timeout',
-  'invalid-reveal',
   'invalid-house-commit',
 ];
 

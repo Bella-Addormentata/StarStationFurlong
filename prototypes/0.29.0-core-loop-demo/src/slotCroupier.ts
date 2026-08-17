@@ -31,6 +31,8 @@ import {
   maxSlotPayout,
   randomSlotSeed,
   resolveSlot,
+  SLOT_REQUEST_FUTURE_SKEW_MS,
+  SLOT_REQUEST_TTL_MS,
   SLOT_SPIN_MS,
   spinReels,
 } from './games/slots';
@@ -39,6 +41,7 @@ import type {
   SlotMachineState,
   SlotPayEntry,
 } from './games/slots';
+import { readRoomOwner } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 
 interface AcceptedSlotRound {
@@ -250,11 +253,10 @@ export function tickSlotMachine(machineId: string, operatorId?: string): void {
         cancelForHouseCommit(machineId, state));
       return;
     }
-    const reveal = readSlotReveal(machineId, player);
+    let reveal = readSlotReveal(machineId, player);
     if (reveal?.requestId === state.requestId && reveal.houseCommit !== houseCommit) {
-      runTerminal(machineId, 'invalid reveal', () =>
-        forfeitInvalidReveal(machineId, state, accepted));
-      return;
+      clearSlotReveal(machineId, player);
+      reveal = null;
     }
     if (!reveal || reveal.requestId !== state.requestId) {
       if (Date.now() - accepted.acceptedAt >= REVEAL_TIMEOUT_MS) {
@@ -276,6 +278,22 @@ export function tickSlotMachine(machineId: string, operatorId?: string): void {
   requestPolls.set(machineId, { docEpoch, checkedAt: now });
   const request = readSlotPlayRequests(machineId)[0];
   if (!request) return;
+  if (request.requestedAt > now + SLOT_REQUEST_FUTURE_SKEW_MS
+    || now - request.requestedAt > SLOT_REQUEST_TTL_MS) {
+    clearSlotPlayRequest(machineId, request.player);
+    writeSlotMachineState(machineId, {
+      ...initialSlotMachineState(),
+      phase: 'settled',
+      round: (state?.round ?? 0) + 1,
+      player: request.player,
+      bet: request.bet,
+      requestId: request.requestId,
+      credited: 0,
+      settledAt: now,
+      failure: 'request-expired',
+    });
+    return;
+  }
   accepting.add(machineId);
   accept(machineId, state, request, operatorId)
     .catch((err) => console.error('[slots] accept failed:', err))
@@ -289,7 +307,13 @@ async function settleRevealTimeout(
 ): Promise<void> {
   const token = accepted.sharedLeaseToken ?? undefined;
   if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
-  if (!settleSlotWager(machineId, accepted.player, accepted.funding, 0, token)) return;
+  if (!refundSlotWager(
+    machineId,
+    accepted.player,
+    accepted.bet,
+    accepted.funding,
+    token,
+  )) return;
   clearSlotReveal(machineId, accepted.player);
   writeSlotMachineState(machineId, {
     ...state,
@@ -356,37 +380,6 @@ async function cancelForHouseCommit(
   acceptedRounds.delete(machineId);
 }
 
-async function forfeitInvalidReveal(
-  machineId: string,
-  state: SlotMachineState,
-  accepted: AcceptedSlotRound,
-): Promise<void> {
-  const token = accepted.sharedLeaseToken ?? undefined;
-  if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
-  if (!settleSlotWager(
-    machineId,
-    accepted.player,
-    accepted.funding,
-    0,
-    token,
-  )) return;
-  clearSlotReveal(machineId, accepted.player);
-  writeSlotMachineState(machineId, {
-    ...state,
-    player: accepted.player,
-    bet: accepted.bet,
-    funding: accepted.funding,
-    paytable: accepted.paytable,
-    phase: 'settled',
-    credited: 0,
-    settledAt: Date.now(),
-    failure: 'invalid-reveal',
-    sharedLeaseToken: null,
-  });
-  releaseAcceptedFundingLease(machineId, accepted);
-  acceptedRounds.delete(machineId);
-}
-
 async function accept(
   machineId: string,
   state: SlotMachineState | null,
@@ -404,7 +397,10 @@ async function accept(
     || current?.phase === 'spinning'
     || (operatorId && (!ownsManualLease(machineId, operatorId)
       || readSlotFundingConfig(machineId)?.ownerId !== operatorId))) return;
-  const ownerId = getPlayerId();
+  const roomOwner = readRoomOwner();
+  const ownerId = roomOwner && roomOwner !== 'Local-Clone'
+    ? roomOwner
+    : getPlayerId();
   const funding: SlotFundingConfig =
     readSlotFundingConfig(machineId) ?? { mode: 'owner', ownerId };
   if (!readSlotFundingConfig(machineId)) writeSlotFundingConfig(machineId, funding);
@@ -545,7 +541,7 @@ async function settle(
     return;
   }
   if (actualPlayerCommit !== accepted.playerCommit) {
-    await forfeitInvalidReveal(machineId, state, accepted);
+    clearSlotReveal(machineId, accepted.player);
     return;
   }
   const seeds = await deriveReelStops(

@@ -40,7 +40,7 @@ import type {
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
-import type { SlotPayEntry, SlotSymbol } from "./games/slots";
+import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
 // (floorPlanDoc imports neither this module nor anything that leads back to
@@ -5756,6 +5756,17 @@ function buildSlotMachine({
     displayContext.fillText(text.slice(0, 14), 256, 66);
     displayTexture.needsUpdate = true;
   };
+  const failureDisplay = (failure: SlotFailure): string => {
+    const labels: Record<SlotFailure, string> = {
+      "insufficient-player-funds": "NO CHIPS",
+      "insufficient-bankroll": "HOUSE SHORT",
+      "odds-changed": "ODDS CHANGED",
+      "request-expired": "REQUEST OLD",
+      "reveal-timeout": "REFUNDED",
+      "invalid-house-commit": "REFUNDED",
+    };
+    return labels[failure];
+  };
   const handle: SlotMachineVisualHandle = {
     setDenomination(amount: number): void {
       denomination = amount;
@@ -5826,7 +5837,7 @@ function buildSlotMachine({
           && state.requestId !== displayedRequest) {
           displayedRequest = state.requestId;
           paintDisplay(state.failure
-            ? "VOID"
+            ? failureDisplay(state.failure)
             : state.credited
               ? `WIN ${state.credited}`
               : "NO WIN");

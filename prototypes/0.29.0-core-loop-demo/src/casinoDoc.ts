@@ -464,6 +464,7 @@ export function readSlotOddsConfig(machineId: string): SlotOddsConfig | null {
 
 /** Room owner only — sets the paytable shown on the machine face. */
 export function writeSlotOddsConfig(machineId: string, config: SlotOddsConfig): void {
+  if (!isSlotOddsConfig(config)) return;
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`slot-odds:${machineId}`, config);

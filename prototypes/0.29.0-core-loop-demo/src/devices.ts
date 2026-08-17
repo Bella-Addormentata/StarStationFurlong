@@ -65,7 +65,9 @@ import {
   readCrapsBackendPref, writeCrapsBackendPref,
   readCrapsFairnessPref, writeCrapsFairnessPref,
   casinoDocEpoch,
-  readSlotMachineState, readSlotOddsConfig, writeSlotPlayRequest, writeSlotReveal,
+  clearSlotPlayRequest,
+  readSlotMachineState, readSlotOddsConfig, readSlotReveal,
+  writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
 } from './casinoDoc';
@@ -87,10 +89,10 @@ import type { RouletteBet, RouletteTableState } from './games/roulette';
 import { canPlaceBet } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
-  DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_SPIN_MS, SLOT_SYMBOLS,
+  DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
 } from './games/slots';
-import type { SlotFundingConfig, SlotPayEntry, SlotSymbol } from './games/slots';
+import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -2649,7 +2651,7 @@ interface PendingSlotPlay {
   playerId: string;
   requestId: string;
   seed: string;
-  revealSent: boolean;
+  expiryTimer: number;
 }
 
 const pendingSlotPlays = new Map<string, PendingSlotPlay>();
@@ -2660,34 +2662,53 @@ function pendingSlotKey(machineId: string, playerId: string): string {
 
 export function clearPendingSlotPlays(machineId: string): void {
   for (const [key, pending] of pendingSlotPlays) {
-    if (pending.machineId === machineId) pendingSlotPlays.delete(key);
+    if (pending.machineId === machineId) deletePendingSlotPlay(key);
   }
+}
+
+function deletePendingSlotPlay(key: string): void {
+  const pending = pendingSlotPlays.get(key);
+  if (pending?.expiryTimer) window.clearTimeout(pending.expiryTimer);
+  pendingSlotPlays.delete(key);
+}
+
+function cancelUnacceptedSlotPlay(key: string, pending: PendingSlotPlay): void {
+  if (pendingSlotPlays.get(key) !== pending) return;
+  const state = readSlotMachineState(pending.machineId);
+  if (state?.phase === 'spinning' && state.requestId === pending.requestId) return;
+  clearSlotPlayRequest(pending.machineId, pending.playerId);
+  deletePendingSlotPlay(key);
 }
 
 function revealPendingSlot(pending: PendingSlotPlay): void {
   const key = pendingSlotKey(pending.machineId, pending.playerId);
   if (pending.docEpoch !== casinoDocEpoch()) {
-    pendingSlotPlays.delete(key);
+    deletePendingSlotPlay(key);
     return;
   }
   const state = readSlotMachineState(pending.machineId);
   if (state?.phase === 'settled' && state.requestId === pending.requestId) {
-    pendingSlotPlays.delete(key);
+    deletePendingSlotPlay(key);
     return;
   }
   const houseCommit = state?.fairness?.commits?.[1];
-  if (pending.revealSent
-    || state?.phase !== 'spinning'
+  if (state?.phase !== 'spinning'
     || state.player !== pending.playerId
     || state.requestId !== pending.requestId
     || !houseCommit) return;
+
+  const published = readSlotReveal(pending.machineId, pending.playerId);
+  if (published?.requestId === pending.requestId
+    && published.seed === pending.seed
+    && published.houseCommit === houseCommit) {
+    return;
+  }
 
   writeSlotReveal(pending.machineId, pending.playerId, {
     requestId: pending.requestId,
     seed: pending.seed,
     houseCommit,
   });
-  pending.revealSent = true;
 }
 
 subscribeCasino(() => {
@@ -2700,29 +2721,10 @@ export function createSlotMachineUI(
   deps: SlotMachineUIDeps,
   serviceMode = false,
 ): DeviceUI {
-  const reelCellPx = 64;
-  const reelSpeeds = [14, 17, 20] as const;
-  const reelLandingSeconds = [0.62, 0.84, 1.06] as const;
-  const symbolFaces: Record<SlotSymbol, { face: string; color: string }> = {
-    cherry: { face: '🍒', color: '#B91C1C' },
-    lemon: { face: '🍋', color: '#CA8A04' },
-    orange: { face: '🍊', color: '#EA580C' },
-    plum: { face: 'PLUM', color: '#7E22CE' },
-    bell: { face: '🔔', color: '#B7791F' },
-    bar: { face: 'BAR', color: '#111827' },
-    seven: { face: '7', color: '#DC2626' },
-  };
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   let denom = 5;
   let flash = '';
-  let spinningRequest: string | null = null;
-  let spinElapsed = 0;
-  let landingRequest: string | null = null;
-  let landingElapsed = 0;
-  let reelPositions: [number, number, number] = [0, 2, 4];
-  let landingStarts: [number, number, number] = [0, 0, 0];
-  let landingTargets: [number, number, number] = [0, 0, 0];
   let paytableFingerprint = '';
   let paytableRtp = 0;
   let renderedPaytable = '';
@@ -2759,16 +2761,21 @@ export function createSlotMachineUI(
       return;
     }
     const seed = randomSlotSeed();
-    const requestId = `${Date.now().toString(36)}-${crypto.randomUUID()}`;
+    const requestedAt = Date.now();
+    const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
     const pending: PendingSlotPlay = {
       docEpoch: casinoDocEpoch(),
       machineId: deps.itemId,
       playerId: myId,
       requestId,
       seed,
-      revealSent: false,
+      expiryTimer: 0,
     };
     pendingSlotPlays.set(key, pending);
+    pending.expiryTimer = window.setTimeout(
+      () => cancelUnacceptedSlotPlay(key, pending),
+      SLOT_REQUEST_TTL_MS,
+    );
     try {
       const displayedPaytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
       const [playerCommit, paytableHash] = await Promise.all([
@@ -2780,12 +2787,13 @@ export function createSlotMachineUI(
         requestId,
         player: myId,
         bet: denom,
+        requestedAt,
         playerCommit,
         paytableHash,
       });
       deps.onMessage?.('WAIT');
     } catch (error) {
-      pendingSlotPlays.delete(key);
+      deletePendingSlotPlay(key);
       deps.onMessage?.('ERROR');
       throw error;
     }
@@ -2804,73 +2812,6 @@ export function createSlotMachineUI(
     pull(): void {
       pullLever().catch((err) => console.error('[slots] request failed:', err));
     },
-  };
-
-  const failureText = (failure: NonNullable<ReturnType<typeof readSlotMachineState>>['failure']): string => {
-    if (failure === 'insufficient-player-funds') return 'WAGER DECLINED — NOT ENOUGH CHIPS';
-    if (failure === 'insufficient-bankroll') return 'WAGER DECLINED — BANKROLL CANNOT COVER THE JACKPOT';
-    if (failure === 'odds-changed') return 'WAGER DECLINED — ODDS CHANGED, PULL AGAIN';
-    if (failure === 'reveal-timeout') return 'SPIN CANCELLED — PLAYER REVEAL TIMED OUT';
-    if (failure === 'invalid-reveal') return 'SPIN CANCELLED — FAIRNESS REVEAL FAILED';
-    if (failure === 'invalid-house-commit') return 'SPIN REFUNDED — HOUSE COMMITMENT CHANGED';
-    return '';
-  };
-
-  const positiveModulo = (value: number, divisor: number): number =>
-    ((value % divisor) + divisor) % divisor;
-
-  const reelsAreLanding = (
-    state: ReturnType<typeof readSlotMachineState>,
-  ): boolean => state?.phase === 'settled'
-    && state.requestId === landingRequest
-    && state.result !== null
-    && landingElapsed < reelLandingSeconds[2];
-
-  const beginReelLanding = (
-    state: NonNullable<ReturnType<typeof readSlotMachineState>>,
-  ): void => {
-    if (!state.requestId || !state.result) return;
-    landingRequest = state.requestId;
-    landingElapsed = 0;
-    landingStarts = [...reelPositions];
-    landingTargets = reelPositions.map((position, reelIndex) => {
-      const finalIndex = SLOT_SYMBOLS.indexOf(state.result![reelIndex]);
-      const minimumTravel = reelSpeeds[reelIndex] * reelLandingSeconds[reelIndex] * 0.72;
-      let target = Math.ceil(position + minimumTravel);
-      target += positiveModulo(finalIndex - target, SLOT_SYMBOLS.length);
-      return target;
-    }) as [number, number, number];
-  };
-
-  const paintReels = (state: ReturnType<typeof readSlotMachineState>): void => {
-    if (!panel) return;
-    const landing = reelsAreLanding(state);
-    if (state?.phase !== 'spinning' && !landing && state?.result) {
-      reelPositions = state.result.map((symbol) => SLOT_SYMBOLS.indexOf(symbol)) as
-        [number, number, number];
-    }
-    for (let reelIndex = 0; reelIndex < 3; reelIndex++) {
-      const strip = panel.querySelector<HTMLElement>(`[data-slot-reel="${reelIndex}"]`);
-      if (!strip) continue;
-      const position = reelPositions[reelIndex];
-      const baseIndex = Math.floor(position);
-      const phase = position - baseIndex;
-      const cells = strip.querySelectorAll<HTMLElement>('[data-slot-reel-cell]');
-      cells.forEach((cell, cellIndex) => {
-        const symbol = SLOT_SYMBOLS[
-          positiveModulo(baseIndex + cellIndex - 1, SLOT_SYMBOLS.length)
-        ];
-        const presentation = symbolFaces[symbol];
-        cell.textContent = presentation.face;
-        cell.title = symbol.toUpperCase();
-        cell.style.color = presentation.color;
-        cell.style.fontSize = symbol === 'plum' || symbol === 'bar' ? '20px' : '30px';
-      });
-      const moving = state?.phase === 'spinning'
-        || (landing && landingElapsed < reelLandingSeconds[reelIndex]);
-      strip.style.transform = `translate3d(0, ${-reelCellPx * (1 + phase)}px, 0)`;
-      strip.style.filter = moving ? 'blur(0.65px)' : 'none';
-    }
   };
 
   const renderPaytable = (paytable: readonly SlotPayEntry[], house: boolean): void => {
@@ -2972,66 +2913,17 @@ export function createSlotMachineUI(
   const render = (): void => {
     if (!panel) return;
     const state = readSlotMachineState(deps.itemId);
-    const key = pendingSlotKey(deps.itemId, myId);
-    const pendingReveal = pendingSlotPlays.get(key);
-    if (pendingReveal) revealPendingSlot(pendingReveal);
-    let pending = pendingSlotPlays.get(key) ?? null;
-    if (pending && state?.phase === 'settled' && state.requestId === pending.requestId) {
-      pendingSlotPlays.delete(key);
-      pending = null;
-    }
     const paytable = readSlotOddsConfig(deps.itemId)?.paytable ?? DEFAULT_PAYTABLE;
     const fingerprint = JSON.stringify(paytable);
     if (fingerprint !== paytableFingerprint) {
       paytableFingerprint = fingerprint;
       paytableRtp = computeRTP(paytable);
     }
-    if (state?.phase === 'spinning') {
-      if (spinningRequest !== state.requestId) {
-        spinningRequest = state.requestId;
-        spinElapsed = Math.max(0, (Date.now() - state.acceptedAt) / 1000);
-        landingRequest = null;
-        landingElapsed = 0;
-        const roundOffset = state.round * 3;
-        reelPositions = [roundOffset, roundOffset + 2, roundOffset + 4];
-      }
-    } else {
-      if (state?.phase === 'settled'
-        && state.requestId === spinningRequest
-        && state.result
-        && state.requestId !== landingRequest) {
-        beginReelLanding(state);
-      }
-      spinningRequest = null;
-    }
-    paintReels(state);
-    const failure = failureText(state?.failure);
-    const landing = reelsAreLanding(state);
-    panel.querySelector<HTMLElement>('#sl-status')!.textContent = flash
-      || failure
-      || (state?.phase === 'spinning'
-        ? spinElapsed < SLOT_SPIN_MS / 1000
-          ? `REELS SPINNING… ${(SLOT_SPIN_MS / 1000 - spinElapsed).toFixed(1)}s`
-          : 'VERIFYING RESULT…'
-        : landing
-          ? 'REELS SETTLING…'
-        : pending && state?.requestId !== pending.requestId
-          ? 'WAITING FOR THE CROUPIER…'
-          : state?.phase === 'settled'
-          ? `${state.credited ? `PAYS ${state.credited} CHIPS` : 'NO WIN'} · ROUND ${state.round}`
-          : 'CHOOSE A CHIP AND PULL THE LEVER');
-    panel.querySelector<HTMLElement>('#sl-chips')!.textContent = `YOUR CHIPS: ${readChips(myId)}`;
     panel.querySelector<HTMLElement>('#sl-rtp')!.textContent =
       `THEORETICAL RTP ${paytableRtp.toFixed(2)}%`;
+    panel.querySelector<HTMLElement>('#sl-service-status')!.textContent = flash;
     const house = deps.isHouse();
     renderPaytable(paytable, house);
-    panel.querySelectorAll<HTMLButtonElement>('[data-slot-denom]').forEach((button) => {
-      const selected = Number(button.dataset.slotDenom) === denom;
-      button.style.borderColor = selected ? '#F0C060' : 'rgba(212,168,75,0.35)';
-      button.style.color = selected ? '#F0C060' : GT_GOLD;
-    });
-    const lever = panel.querySelector<HTMLButtonElement>('#sl-pull')!;
-    lever.disabled = state?.phase === 'spinning' || pending !== null || landing;
     const owner = panel.querySelector<HTMLElement>('#sl-owner');
     if (owner) owner.style.display = house ? 'flex' : 'none';
     if (house) {
@@ -3070,10 +2962,23 @@ export function createSlotMachineUI(
   };
 
   const onKeyDown = (event: KeyboardEvent): void => {
-    if (serviceMode || event.code !== 'Space' || event.repeat) return;
+    if (serviceMode || event.repeat) return;
     const target = event.target;
     if (target instanceof Element
       && target.closest('button, input, textarea, select, a, [contenteditable="true"]')) return;
+    const denominationByKey: Record<string, number> = {
+      Digit1: 1, Numpad1: 1,
+      Digit2: 5, Numpad2: 5,
+      Digit3: 25, Numpad3: 25,
+      Digit4: 100, Numpad4: 100,
+    };
+    const amount = denominationByKey[event.code];
+    if (amount !== undefined) {
+      event.preventDefault();
+      selectDenomination(amount);
+      return;
+    }
+    if (event.code !== 'Space') return;
     event.preventDefault();
     pullLever().catch((err) => console.error('[slots] request failed:', err));
   };
@@ -3101,21 +3006,7 @@ export function createSlotMachineUI(
       `;
       panel.innerHTML = `
         <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🎰 SLOT MACHINE SERVICE</div>
-        <div id="sl-reels" style="height:72px;padding:5px 8px;display:none;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;background:#14181e;border:4px solid #8a93a0;box-sizing:border-box;box-shadow:inset 0 8px 14px rgba(0,0,0,.55),inset 0 -8px 14px rgba(0,0,0,.55);">
-          ${[0, 1, 2].map((reelIndex) => `
-            <div style="height:${reelCellPx}px;overflow:hidden;background:#F5F0E4;border:1px solid #B8AA91;box-sizing:border-box;box-shadow:inset 0 9px 10px rgba(0,0,0,.18),inset 0 -9px 10px rgba(0,0,0,.18);">
-              <div data-slot-reel="${reelIndex}" style="will-change:transform,filter;">
-                ${[0, 1, 2].map(() => `<div data-slot-reel-cell style="height:${reelCellPx}px;display:flex;align-items:center;justify-content:center;box-sizing:border-box;font-weight:900;line-height:1;letter-spacing:0;text-shadow:0 1px 0 #fff;"></div>`).join('')}
-              </div>
-            </div>
-          `).join('')}
-        </div>
-        <div id="sl-status" style="display:none;min-height:14px;text-align:center;font-size:10px;font-weight:800;color:${GT_GOLD_BRIGHT};"></div>
-        <div id="sl-chips" style="display:none;font-size:10px;"></div>
-        <div style="display:none;gap:8px;">${[1, 5, 25, 100].map((n) =>
-          `<button data-slot-denom="${n}" style="flex:1;padding:7px;background:rgba(212,168,75,0.08);border:2px solid rgba(212,168,75,0.35);border-radius:12px;color:${GT_GOLD};font:inherit;cursor:pointer;">${n}</button>`
-        ).join('')}</div>
-        <button id="sl-pull" style="display:none;padding:11px;background:rgba(212,168,75,0.16);border:1px solid #D4A84B;border-radius:6px;color:#F0C060;font:800 11px inherit;letter-spacing:2px;cursor:pointer;">PULL LEVER</button>
+        <div id="sl-service-status" style="min-height:14px;text-align:center;font-size:9px;font-weight:800;color:${GT_GOLD_BRIGHT};"></div>
         <div id="sl-rtp" style="font-size:9px;color:${GT_DIM};"></div>
         <div id="sl-paytable" style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:9px;color:#E8ECF2;"></div>
         <div id="sl-owner" style="display:none;flex-direction:column;gap:7px;padding-top:9px;border-top:1px solid rgba(212,168,75,.2);">
@@ -3133,14 +3024,6 @@ export function createSlotMachineUI(
         <div style="font-size:8px;color:${GT_DIM};text-align:center;">CLICK OUTSIDE THIS PANEL TO RETURN TO THE CABINET</div>
       `;
       panel.addEventListener('click', (event) => event.stopPropagation());
-      panel.querySelectorAll<HTMLButtonElement>('[data-slot-denom]').forEach((button) => {
-        button.addEventListener('click', () => {
-          selectDenomination(Number(button.dataset.slotDenom));
-        });
-      });
-      panel.querySelector<HTMLButtonElement>('#sl-pull')!.addEventListener('click', () => {
-        pullLever().catch((err) => console.error('[slots] request failed:', err));
-      });
       panel.querySelector<HTMLElement>('#sl-paytable')!.addEventListener('click', (event) => {
         const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-slot-pay-index]');
         if (!button) return;
@@ -3172,6 +3055,9 @@ export function createSlotMachineUI(
     },
     unmount(): void {
       if (activeSlotMachineSessions.get(deps.itemId) === cabinetSession) {
+        const key = pendingSlotKey(deps.itemId, myId);
+        const pending = pendingSlotPlays.get(key);
+        if (pending) cancelUnacceptedSlotPlay(key, pending);
         activeSlotMachineSessions.delete(deps.itemId);
       }
       unsubscribe?.();
@@ -3180,37 +3066,7 @@ export function createSlotMachineUI(
       panel?.remove();
       panel = null;
     },
-    update(dt: number): void {
-      if (!serviceMode) return;
-      const state = readSlotMachineState(deps.itemId);
-      const elapsed = Math.max(0, dt);
-      if (state?.phase === 'spinning') {
-        spinElapsed += elapsed;
-        const speedScale = 0.25 + 0.75 * Math.min(1, spinElapsed / 0.28);
-        reelPositions = reelPositions.map((position, reelIndex) =>
-          position + reelSpeeds[reelIndex] * speedScale * elapsed,
-        ) as [number, number, number];
-        paintReels(state);
-        const status = panel?.querySelector<HTMLElement>('#sl-status');
-        if (status) {
-          status.textContent = spinElapsed < SLOT_SPIN_MS / 1000
-            ? `REELS SPINNING… ${(SLOT_SPIN_MS / 1000 - spinElapsed).toFixed(1)}s`
-            : 'VERIFYING RESULT…';
-        }
-        return;
-      }
-      if (state?.phase === 'settled' && reelsAreLanding(state)) {
-        landingElapsed += elapsed;
-        reelPositions = reelPositions.map((_position, reelIndex) => {
-          const progress = Math.min(1, landingElapsed / reelLandingSeconds[reelIndex]);
-          const eased = 1 - Math.pow(1 - progress, 3);
-          return landingStarts[reelIndex]
-            + (landingTargets[reelIndex] - landingStarts[reelIndex]) * eased;
-        }) as [number, number, number];
-        paintReels(state);
-        if (!reelsAreLanding(state)) render();
-      }
-    },
+    update(_dt: number): void {},
   };
 }
 
