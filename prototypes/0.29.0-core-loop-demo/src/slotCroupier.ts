@@ -1,5 +1,4 @@
 import {
-  acquireSlotSharedBankrollLease,
   casinoDocEpoch,
   clearSlotMachineKeys,
   clearSlotOperatorLease,
@@ -30,7 +29,6 @@ import {
   maxSlotPayout,
   randomSlotSeed,
   resolveSlot,
-  SLOT_REQUEST_FUTURE_SKEW_MS,
   SLOT_REQUEST_TTL_MS,
   SLOT_SPIN_MS,
   spinReels,
@@ -70,6 +68,11 @@ const acceptedRounds = new Map<string, AcceptedSlotRound>();
 const manualOperators = new Map<string, SlotOperatorSession>();
 const autoOperators = new Map<string, SlotOperatorSession>();
 const requestPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
+const requestFirstSeen = new Map<string, {
+  docEpoch: number;
+  requestId: string;
+  seenAt: number;
+}>();
 const REVEAL_TIMEOUT_MS = 30_000;
 const REQUEST_POLL_MS = 250;
 const OPERATOR_LEASE_MS = 8_000;
@@ -113,9 +116,11 @@ async function ensureTerminalFundingLease(
   funding: SlotFundingConfig,
   token: string | undefined,
 ): Promise<boolean> {
-  if (funding.mode !== 'shared') return true;
-  return token !== undefined
-    && await acquireSlotSharedBankrollLease(machineId, token);
+  void machineId;
+  void token;
+  // Shared wagering is disabled. Never mutate a legacy shared escrow under
+  // the old LWW lease; recovery requires an authoritative migration path.
+  return funding.mode !== 'shared';
 }
 
 function runTerminal(
@@ -348,10 +353,18 @@ function tickSlotMachine(machineId: string, operatorId?: string): void {
   if (lastPoll?.docEpoch === docEpoch && now - lastPoll.checkedAt < REQUEST_POLL_MS) return;
   requestPolls.set(machineId, { docEpoch, checkedAt: now });
   const request = readSlotPlayRequests(machineId)[0];
-  if (!request) return;
-  if (request.requestedAt > now + SLOT_REQUEST_FUTURE_SKEW_MS
-    || now - request.requestedAt > SLOT_REQUEST_TTL_MS) {
+  if (!request) {
+    requestFirstSeen.delete(machineId);
+    return;
+  }
+  let firstSeen = requestFirstSeen.get(machineId);
+  if (firstSeen?.docEpoch !== docEpoch || firstSeen.requestId !== request.requestId) {
+    firstSeen = { docEpoch, requestId: request.requestId, seenAt: now };
+    requestFirstSeen.set(machineId, firstSeen);
+  }
+  if (now - firstSeen.seenAt > SLOT_REQUEST_TTL_MS) {
     clearSlotPlayRequest(machineId, request.player);
+    requestFirstSeen.delete(machineId);
     writeSlotMachineState(machineId, {
       ...initialSlotMachineState(),
       phase: 'settled',
@@ -470,11 +483,23 @@ async function accept(
       || readSlotFundingConfig(machineId)?.ownerId !== operatorId))) return;
   const funding = readSlotFundingConfig(machineId);
   if (!funding) return;
-  const sharedLeaseToken = funding.mode === 'shared'
-    ? `${operatorSessionId}:${machineId}:${request.requestId}`
-    : null;
-  if (sharedLeaseToken
-    && !await acquireSlotSharedBankrollLease(machineId, sharedLeaseToken)) return;
+  if (funding.mode === 'shared') {
+    clearSlotPlayRequest(machineId, request.player);
+    requestFirstSeen.delete(machineId);
+    writeSlotMachineState(machineId, {
+      ...initialSlotMachineState(),
+      phase: 'settled',
+      round: (current?.round ?? state?.round ?? 0) + 1,
+      player: request.player,
+      bet: request.bet,
+      requestId: request.requestId,
+      credited: 0,
+      settledAt: Date.now(),
+      funding,
+      failure: 'shared-funding-unavailable',
+    });
+    return;
+  }
   const leaseQueued = readSlotPlayRequests(machineId)
     .find((candidate) => candidate.player === request.player);
   const leaseCurrent = readSlotMachineState(machineId);
@@ -486,7 +511,6 @@ async function accept(
     || leaseFunding.ownerId !== funding.ownerId
     || (operatorId && (!ownsOperatorLease(machineId, operatorId)
       || leaseFunding.ownerId !== operatorId))) {
-    if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
   }
   const paytable = (readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE)
@@ -505,13 +529,13 @@ async function accept(
     || postHashFunding.ownerId !== funding.ownerId
     || (operatorId && (!ownsOperatorLease(machineId, operatorId)
       || postHashFunding.ownerId !== operatorId))) {
-    if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
   }
   const round = (postHashState?.round ?? state?.round ?? 0) + 1;
   if (paytableHash !== request.paytableHash
     || latestPaytableHash !== paytableHash) {
     clearSlotPlayRequest(machineId, request.player);
+    requestFirstSeen.delete(machineId);
     writeSlotMachineState(machineId, {
       ...initialSlotMachineState(),
       phase: 'settled',
@@ -526,17 +550,16 @@ async function accept(
       failure: 'odds-changed',
       sharedLeaseToken: null,
     });
-    if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
   }
   clearSlotPlayRequest(machineId, request.player);
+  requestFirstSeen.delete(machineId);
   const reserve = reserveSlotWager(
     machineId,
     request.player,
     request.bet,
     funding,
     Math.max(request.bet, maxSlotPayout(request.bet, paytable)),
-    sharedLeaseToken ?? undefined,
   );
   if (reserve !== 'ok') {
     writeSlotMachineState(machineId, {
@@ -553,7 +576,6 @@ async function accept(
       failure: reserve,
       sharedLeaseToken: null,
     });
-    if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
   }
   const acceptedAt = Date.now();
@@ -568,7 +590,7 @@ async function accept(
     acceptedAt,
     bet: request.bet,
     funding,
-    sharedLeaseToken,
+    sharedLeaseToken: null,
     paytable,
   };
   acceptedRounds.set(machineId, accepted);
@@ -583,7 +605,7 @@ async function accept(
     acceptedAt,
     funding,
     paytable,
-    sharedLeaseToken,
+    sharedLeaseToken: null,
     fairness: { mode: 'commit-reveal', commits: [request.playerCommit, houseCommit] },
   });
 }
@@ -691,6 +713,7 @@ export function closeSlotMachine(
   manualOperators.delete(machineId);
   autoOperators.delete(machineId);
   requestPolls.delete(machineId);
+  requestFirstSeen.delete(machineId);
   const lease = readSlotOperatorLease(machineId);
   if (lease?.sessionId === operatorSessionId) clearSlotOperatorLease(machineId);
   if (!canManage) return;

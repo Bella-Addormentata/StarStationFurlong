@@ -554,8 +554,9 @@ export function ownsSlotSharedBankrollLease(machineId: string, token: string): b
 }
 
 /**
- * Claim the one room-wide shared-bankroll lease, then wait for concurrent Yjs
- * writes to converge. Only the deterministic winning value may reserve funds.
+ * Legacy shared-bankroll lease record retained only to inspect/clear persisted
+ * pre-gate rounds. It is NOT a distributed mutex and never authorizes money
+ * mutation; shared reserve/settle/refund paths are disabled below.
  */
 export async function acquireSlotSharedBankrollLease(
   machineId: string,
@@ -609,8 +610,9 @@ export function depositSlotFunding(
   const config = readSlotFundingConfig(machineId);
   if (!config || config.ownerId !== ownerId || config.mode === 'owner'
     || !Number.isSafeInteger(amount) || amount <= 0) return false;
-  const sharedLease = config.mode === 'shared' ? readSlotSharedBankrollLease() : null;
-  if (sharedLease && sharedLease.expiresAt > Date.now()) return false;
+  // A Y.Map lease cannot serialize money during a partition. Keep legacy
+  // shared balances withdrawable, but do not allow new shared funding.
+  if (config.mode === 'shared') return false;
   const map = ensureMap();
   const ownerKey = `bal:${ownerId}`;
   const fundingKey = slotFundingBalanceKey(machineId, config);
@@ -651,7 +653,8 @@ export function withdrawSlotFunding(
 export type SlotReserveResult =
   | 'ok'
   | 'insufficient-player-funds'
-  | 'insufficient-bankroll';
+  | 'insufficient-bankroll'
+  | 'shared-funding-unavailable';
 
 /**
  * Debit the stake, add it to the selected bankroll, and lock the round's
@@ -664,14 +667,11 @@ export function reserveSlotWager(
   bet: number,
   config: SlotFundingConfig,
   maximumPayout: number,
-  sharedLeaseToken?: string,
 ): SlotReserveResult {
+  if (config.mode === 'shared') return 'shared-funding-unavailable';
   if (!isSlotFundingConfig(config)
     || !Number.isSafeInteger(bet) || bet <= 0
-    || !Number.isSafeInteger(maximumPayout) || maximumPayout < 0
-    || (config.mode === 'shared'
-      && (!sharedLeaseToken
-        || !ownsSlotSharedBankrollLease(machineId, sharedLeaseToken)))) {
+    || !Number.isSafeInteger(maximumPayout) || maximumPayout < 0) {
     return 'insufficient-bankroll';
   }
   const map = ensureMap();
@@ -699,20 +699,20 @@ export function reserveSlotWager(
 
 /**
  * Pay a settled result from escrow and return the unused reserve to the
- * selected bankroll. Returns false if peer-written state exceeds the reserve.
+ * selected bankroll. Returns false for shared funding or if peer-written state
+ * exceeds the reserve.
  */
 export function settleSlotWager(
   machineId: string,
   playerId: string,
   config: SlotFundingConfig,
   payout: number,
-  sharedLeaseToken?: string,
+  _sharedLeaseToken?: string,
 ): boolean {
+  if (config.mode === 'shared') return false;
   if (!isSlotFundingConfig(config)
     || !Number.isSafeInteger(payout) || payout < 0
-    || (config.mode === 'shared'
-      && (!sharedLeaseToken
-        || !ownsSlotSharedBankrollLease(machineId, sharedLeaseToken)))) return false;
+  ) return false;
   const map = ensureMap();
   const escrowKey = `slot-escrow:${machineId}`;
   if (!map.has(escrowKey)) return false;
@@ -736,18 +736,17 @@ export function settleSlotWager(
   return true;
 }
 
-/** Cancel an accepted round and return both its reserve and stake. */
+/** Cancel a non-shared round and return both its reserve and stake. */
 export function refundSlotWager(
   machineId: string,
   playerId: string,
   bet: number,
   config: SlotFundingConfig,
-  sharedLeaseToken?: string,
+  _sharedLeaseToken?: string,
 ): boolean {
+  if (config.mode === 'shared') return false;
   if (!isSlotFundingConfig(config) || !Number.isSafeInteger(bet) || bet <= 0
-    || (config.mode === 'shared'
-      && (!sharedLeaseToken
-        || !ownsSlotSharedBankrollLease(machineId, sharedLeaseToken)))) return false;
+  ) return false;
   const map = ensureMap();
   const escrowKey = `slot-escrow:${machineId}`;
   if (!map.has(escrowKey)) return false;

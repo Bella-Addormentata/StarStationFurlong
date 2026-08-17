@@ -356,6 +356,7 @@ export class World {
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
+  public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
   /** 🧬 True once the queued spawn has seen the exterior boot view (zoom ≥ 3)
@@ -5007,7 +5008,15 @@ export class World {
       const serviceUI = createSlotMachineUI(deps, true);
       if (deviceFocus.getActiveDeviceId() === deviceId
         && deviceFocus.replaceFocusedUI(serviceUI)) return true;
-      deviceFocus.beginFocus(this.player, device, serviceUI);
+      const beginServiceFocus = () =>
+        deviceFocus.beginFocus(this.player, device, serviceUI);
+      if (this.seatedSlotSession?.itemId === deviceId && this.onRequestRoomView) {
+        this.seatedSlotSession.ui.unmount();
+        this.seatedSlotSession = null;
+        this.onRequestRoomView(beginServiceFocus);
+      } else {
+        beginServiceFocus();
+      }
       return true;
     }
     const hasCabinetSession = deviceFocus.getActiveDeviceId() === deviceId
@@ -5043,6 +5052,7 @@ export class World {
     });
     ui.mount(document.body);
     this.seatedSlotSession = { itemId, ui };
+    this.onFirstPersonSeat?.(this.player.getSeatedFacing());
   }
 
   public requestDeviceFocus(deviceId: string): void {

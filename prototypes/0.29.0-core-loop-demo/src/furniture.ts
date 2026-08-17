@@ -5760,6 +5760,7 @@ function buildSlotMachine({
     const labels: Record<SlotFailure, string> = {
       "insufficient-player-funds": "NO CHIPS",
       "insufficient-bankroll": "HOUSE SHORT",
+      "shared-funding-unavailable": "SHARED OFF",
       "odds-changed": "ODDS CHANGED",
       "request-expired": "REQUEST OLD",
       "reveal-timeout": "REFUNDED",

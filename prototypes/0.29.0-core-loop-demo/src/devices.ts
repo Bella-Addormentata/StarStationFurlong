@@ -2754,6 +2754,18 @@ export function createSlotMachineUI(
       deps.onMessage?.('BUSY');
       return;
     }
+    if (readSlotFundingConfig(deps.itemId)?.mode === 'shared') {
+      flash = 'SHARED BANKROLL NEEDS AN AUTHORITATIVE SETTLEMENT SERVICE';
+      deps.onMessage?.('SHARED OFF');
+      render();
+      return;
+    }
+    if (!readSlotFundingConfig(deps.itemId)) {
+      flash = 'HOUSE SETUP REQUIRED';
+      deps.onMessage?.('HOUSE SETUP');
+      render();
+      return;
+    }
     if (readChips(myId) < denom) {
       flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
       deps.onMessage?.('NO CHIPS');
@@ -2886,7 +2898,7 @@ export function createSlotMachineUI(
       render();
       return;
     }
-    const order: SlotFundingConfig['mode'][] = ['owner', 'machine', 'shared'];
+    const order: SlotFundingConfig['mode'][] = ['owner', 'machine'];
     const current = fundingConfig();
     const mode = order[(order.indexOf(current.mode) + 1) % order.length];
     writeSlotFundingConfig(deps.itemId, { mode, ownerId: myId });
@@ -2952,7 +2964,7 @@ export function createSlotMachineUI(
         balance.textContent =
           `AVAILABLE BANKROLL: ${readSlotFundingBalance(deps.itemId, funding)} CHIPS`;
       }
-      const transfer = funding.mode !== 'owner';
+      const transfer = funding.mode === 'machine';
       const deposit = panel.querySelector<HTMLButtonElement>('#sl-fund-deposit');
       const withdraw = panel.querySelector<HTMLButtonElement>('#sl-fund-withdraw');
       if (deposit) deposit.style.display = transfer ? '' : 'none';

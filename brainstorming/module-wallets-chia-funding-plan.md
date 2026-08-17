@@ -43,6 +43,12 @@ The slot machine's shared-bankroll lease only serializes
 `slot-bankroll:shared`; it does **not** make global player or owner balances
 conflict-free.
 
+**Current safety gate:** new shared-bankroll deposits and wagers are disabled.
+A fixed-delay LWW lease cannot be a distributed mutex during a partition. The
+legacy shared balance remains readable/withdrawable only for recovery; shared
+play must stay off until an authoritative settlement service or a merge-safe,
+idempotent ledger is implemented.
+
 Before chips map to real wallet value, replace `bal:` with a derived ledger
 (immutable/per-writer debit and credit entries with idempotent settlement IDs)
 or introduce one wallet-wide serialization authority shared by every casino

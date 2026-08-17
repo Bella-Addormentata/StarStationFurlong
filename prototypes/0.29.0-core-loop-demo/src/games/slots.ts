@@ -84,7 +84,6 @@ export const MAX_SLOT_MULTIPLIER = 1_000_000;
 export const MAX_SLOT_PAYOUT = MAX_SLOT_STAKE * MAX_SLOT_MULTIPLIER;
 export const SLOT_SPIN_MS = 1_600;
 export const SLOT_REQUEST_TTL_MS = 60_000;
-export const SLOT_REQUEST_FUTURE_SKEW_MS = 5_000;
 
 /** Resolve an unbiased reel stop (0–21) to its symbol. */
 export function seedToSymbol(stop: number): SlotSymbol {
@@ -138,7 +137,7 @@ export const DEFAULT_PAYTABLE: readonly SlotPayEntry[] = [
   { symbols: ['orange', 'orange', 'orange'], multiplier: 12, label: 'TRIPLE ORANGE' },
   // Triple lemon
   { symbols: ['lemon', 'lemon', 'lemon'], multiplier: 9, label: 'TRIPLE LEMON' },
-  // Any bar / seven mix
+  // BAR on the left reel (middle/right may be any symbol)
   { symbols: ['bar', null, null], multiplier: 6, label: 'BAR' },
   // Triple cherry
   { symbols: ['cherry', 'cherry', 'cherry'], multiplier: 4, label: 'TRIPLE CHERRY' },
@@ -208,6 +207,7 @@ export function isSlotFundingConfig(v: unknown): v is SlotFundingConfig {
 export type SlotFailure =
   | 'insufficient-player-funds'
   | 'insufficient-bankroll'
+  | 'shared-funding-unavailable'
   | 'odds-changed'
   | 'request-expired'
   | 'reveal-timeout'
@@ -315,6 +315,7 @@ function isSeedTriple(v: unknown): v is [number, number, number] {
 const SLOT_FAILURES: readonly SlotFailure[] = [
   'insufficient-player-funds',
   'insufficient-bankroll',
+  'shared-funding-unavailable',
   'odds-changed',
   'request-expired',
   'reveal-timeout',
