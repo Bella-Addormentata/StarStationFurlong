@@ -43,6 +43,8 @@ export interface Seat {
   swim: boolean;
   /** 🏊‍♂️ true ⇒ high-dive launch pad (click pool water → parabolic dive). */
   dive: boolean;
+  /** Enter regular first-person after the avatar finishes sitting. */
+  firstPerson: boolean;
 }
 
 export const SEATS: Seat[] = [];

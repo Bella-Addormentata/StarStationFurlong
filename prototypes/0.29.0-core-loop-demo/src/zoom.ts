@@ -166,6 +166,7 @@ const FP_UNLOCK_CLICK_TTL_MS = 300;
 const DEVZOOM = new URLSearchParams(window.location.search).get('devzoom') === '1';
 
 export class MultiScaleZoomView {
+  private roomViewCallbacks: Array<() => void> = [];
   private overlay: HTMLDivElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
@@ -387,6 +388,27 @@ export class MultiScaleZoomView {
 
   public getLevel(): number {
     return this.currentLevel;
+  }
+
+  /** Enter level-1 first person from the normal room view, facing the seat. */
+  public requestFirstPerson(faceAngle?: number): void {
+    if ((this.currentLevel !== 1 && this.currentLevel !== 2) || isDeviceFocusActive()) return;
+    if (faceAngle !== undefined) {
+      yaw = faceAngle;
+      pitch = 0;
+    }
+    if (this.currentLevel === 2) this.zoomIn();
+  }
+
+  /** Return from level 1 to the orthographic room view, then run `onReady`. */
+  public requestRoomView(onReady: () => void): void {
+    if (this.currentLevel === 2) {
+      onReady();
+      return;
+    }
+    if (this.currentLevel !== 1 || isDeviceFocusActive()) return;
+    this.roomViewCallbacks.push(onReady);
+    if (!isBlinking && !pendingZoomOutAction) this.zoomOut();
   }
 
   /**
@@ -845,6 +867,8 @@ export class MultiScaleZoomView {
         pendingZoomOutAction = false;
         this.currentLevel++;
         this.updateViewContext();
+        const callbacks = this.roomViewCallbacks.splice(0);
+        for (const callback of callbacks) callback();
       }
       this.renderBlinkOverlay();
     }

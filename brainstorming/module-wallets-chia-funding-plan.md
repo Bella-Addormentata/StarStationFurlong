@@ -33,6 +33,28 @@ Derive the spend key as a **burner from the room seed** (§7 rule 3), fund it wi
 
 **Documented as future, not v1:** the per-module **singleton** (canonical-lineage "module has a wallet/identity" answer, unified with the Station Seals v2 Anchored-Seal coin) and the **covenant autospend** layered on it (the only shape that makes a room-funded, member-pokeable wallet safe). Both are gated and optional — see Parts 3–4.
 
+### 1.2 Prototype casino balance concurrency debt
+
+The `0.29.0` casino prototype still stores chip balances as plain integer
+`bal:<playerId>` values in a Y.Map. Those are LWW registers, not counters: a
+slot payout can race a cashier buy-in or roulette/craps settlement on another
+client and one read-modify-write update can disappear after CRDT convergence.
+The slot machine's shared-bankroll lease only serializes
+`slot-bankroll:shared`; it does **not** make global player or owner balances
+conflict-free.
+
+**Current safety gate:** new shared-bankroll deposits and wagers are disabled.
+A fixed-delay LWW lease cannot be a distributed mutex during a partition. The
+legacy shared balance remains readable/withdrawable only for recovery; shared
+play must stay off until an authoritative settlement service or a merge-safe,
+idempotent ledger is implemented.
+
+Before chips map to real wallet value, replace `bal:` with a derived ledger
+(immutable/per-writer debit and credit entries with idempotent settlement IDs)
+or introduce one wallet-wide serialization authority shared by every casino
+game and cashier operation. Do not extend per-game locks and mistake them for
+an account-level money invariant.
+
 ---
 
 ## 2. Chia cost mechanics — the verified floor

@@ -145,9 +145,23 @@ class DeviceFocusController {
     return this.active?.device.id ?? null;
   }
 
+  /** Perspective camera currently rendering the focused device, when active. */
+  public getCamera(): THREE.PerspectiveCamera | null {
+    return this.isActive() ? this.focusCam : null;
+  }
+
   /** Current controller state (debug/verification handle). */
   public getState(): FocusState {
     return this.state;
+  }
+
+  /** Replace the UI while keeping the current focused camera/device in place. */
+  public replaceFocusedUI(ui: DeviceUI): boolean {
+    if (this.state !== 'FOCUSED' || !this.active || !this.host) return false;
+    this.active.ui.unmount();
+    this.active = { device: this.active.device, ui };
+    ui.mount(this.host);
+    return true;
   }
 
   /**

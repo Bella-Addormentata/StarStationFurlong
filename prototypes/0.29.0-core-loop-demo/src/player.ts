@@ -214,6 +214,8 @@ export class Player {
   public onWaterEntry:
     | ((x: number, y: number, z: number, big: boolean) => void)
     | null = null;
+  /** Fired once after a sit-down slide reaches its authored seat. */
+  public onSeatSettled: ((seat: Seat) => void) | null = null;
   // ── 🏊 Free-swim mode ─────────────────────────────────────────────────────
   /** True while freely swimming inside the pool basin (not seat-bound). */
   private swimMode = false;
@@ -613,9 +615,9 @@ export class Player {
    * Request a device focus (#33 D0): A*-walk to the device's front point,
    * fine-step onto it, turn TOWARD the device, and fire hooks.onArrived()
    * exactly once (the DeviceFocusController takes the camera from there).
-   * While seated the player stands up first; mid door walk-through the
-   * request defers until the RETURN leg completes; while engaged on another
-   * device the controller is asked to release first.
+   * A device built into the seat currently occupied can focus in place; other
+   * devices make the player stand first. Mid door walk-through the request
+   * defers until RETURN; an engaged device is released before re-routing.
    */
   navigateToDevice(device: DeviceTarget, hooks: DeviceFocusHooks): void {
     // Mid adapter transit: fully scripted, room being swapped — swallow.
@@ -630,6 +632,29 @@ export class Player {
       this.deviceTarget.id === device.id
     )
       return;
+    // A built-in device can be operated from its matching seat. Keep both
+    // state machines live: device focus owns input/camera while the seat keeps
+    // the local and networked avatar in its seated pose.
+    if (this.sitPhase === "SEATED" && this.sitTarget) {
+      const separator = this.sitTarget.id.lastIndexOf(":");
+      const seatItemId =
+        separator >= 0 ? this.sitTarget.id.slice(0, separator) : "";
+      if (seatItemId === device.id) {
+        this._abortDoorApproach();
+        this._cancelDeviceApproach();
+        this._clearPath();
+        this.pendingDevice = null;
+        this.pendingSeat = null;
+        this.pendingDest = null;
+        this.pendingDoor = null;
+        this.deviceTarget = device;
+        this.deviceHooks = hooks;
+        this.devicePhase = "ENGAGED";
+        this.navMode = "MANUAL";
+        hooks.onArrived();
+        return;
+      }
+    }
     // 🏊 Free swim: climb out at the edge nearest the device, then walk over.
     if (this.swimMode) {
       this.pendingDevice = { device, hooks };
@@ -1511,6 +1536,7 @@ export class Player {
 
     if (this.sitAnim >= 1) {
       this.sitPhase = "SEATED";
+      this.onSeatSettled?.(seat);
       // 🌉 Plopped over the rim into the hot tub — a small splash at the tub
       // waterline sells the landing.
       if (this.sitSlideFrom) {
@@ -2565,7 +2591,8 @@ export class Player {
 
       // ── Idle at the device until the controller releases us ───────────────
       case "ENGAGED": {
-        this.character.setState("idle", device.faceAngle);
+        if (this.sitPhase === "SEATED") this._updateSeated();
+        else this.character.setState("idle", device.faceAngle);
         return;
       }
     }
