@@ -17,7 +17,6 @@ import {
   refundSlotWager,
   reserveSlotWager,
   settleSlotWager,
-  writeSlotFundingConfig,
   writeSlotMachineState,
   writeSlotOperatorLease,
 } from './casinoDoc';
@@ -41,7 +40,6 @@ import type {
   SlotMachineState,
   SlotPayEntry,
 } from './games/slots';
-import { readRoomOwner } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 
 interface AcceptedSlotRound {
@@ -59,7 +57,7 @@ interface AcceptedSlotRound {
   paytable: SlotPayEntry[];
 }
 
-interface ManualSlotOperator {
+interface SlotOperatorSession {
   docEpoch: number;
   playerId: string;
   readyAt: number;
@@ -69,14 +67,15 @@ interface ManualSlotOperator {
 const settling = new Set<string>();
 const accepting = new Set<string>();
 const acceptedRounds = new Map<string, AcceptedSlotRound>();
-const manualOperators = new Map<string, ManualSlotOperator>();
+const manualOperators = new Map<string, SlotOperatorSession>();
+const autoOperators = new Map<string, SlotOperatorSession>();
 const requestPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
 const REVEAL_TIMEOUT_MS = 30_000;
 const REQUEST_POLL_MS = 250;
-const MANUAL_LEASE_MS = 8_000;
-const MANUAL_LEASE_SETTLE_MS = 2_000;
-const MANUAL_LEASE_RENEW_MS = 3_000;
-const manualSessionId = randomSlotSeed();
+const OPERATOR_LEASE_MS = 8_000;
+const OPERATOR_LEASE_SETTLE_MS = 2_000;
+const OPERATOR_LEASE_RENEW_MS = 3_000;
+const operatorSessionId = randomSlotSeed();
 
 function currentAcceptedRound(machineId: string): AcceptedSlotRound | undefined {
   const accepted = acceptedRounds.get(machineId);
@@ -131,11 +130,80 @@ function runTerminal(
     .finally(() => settling.delete(machineId));
 }
 
-function ownsManualLease(machineId: string, playerId: string): boolean {
+function ownsOperatorLease(machineId: string, playerId: string): boolean {
   const lease = readSlotOperatorLease(machineId);
   return lease?.playerId === playerId
-    && lease.sessionId === manualSessionId
+    && lease.sessionId === operatorSessionId
     && lease.expiresAt > Date.now();
+}
+
+export function stopAutoSlotMachine(machineId: string): void {
+  if (!autoOperators.has(machineId)) return;
+  autoOperators.delete(machineId);
+  const state = readSlotMachineState(machineId);
+  const lease = readSlotOperatorLease(machineId);
+  if (lease?.sessionId === operatorSessionId
+    && state?.phase !== 'spinning'
+    && !currentAcceptedRound(machineId)) {
+    clearSlotOperatorLease(machineId);
+  }
+}
+
+/**
+ * Auto operation is deed-holder gated by World and independently session-
+ * leased here. Two tabs with the same identity converge on one Yjs lease;
+ * only its winning browser may reserve or settle this machine.
+ */
+export function tickAutoSlotMachine(machineId: string): void {
+  if (!canRunCroupier()) {
+    stopAutoSlotMachine(machineId);
+    return;
+  }
+  const playerId = getPlayerId();
+  const now = Date.now();
+  const configuredFunding = readSlotFundingConfig(machineId);
+  if (configuredFunding?.ownerId !== playerId) {
+    stopAutoSlotMachine(machineId);
+    return;
+  }
+
+  let operator = autoOperators.get(machineId);
+  const lease = readSlotOperatorLease(machineId);
+  if (!operator
+    || operator.docEpoch !== casinoDocEpoch()
+    || operator.playerId !== playerId) {
+    if (lease && lease.expiresAt > now && lease.sessionId !== operatorSessionId) return;
+    writeSlotOperatorLease(machineId, {
+      playerId,
+      sessionId: operatorSessionId,
+      expiresAt: now + OPERATOR_LEASE_MS,
+    });
+    operator = {
+      docEpoch: casinoDocEpoch(),
+      playerId,
+      readyAt: now + OPERATOR_LEASE_SETTLE_MS,
+      renewedAt: now,
+    };
+    autoOperators.set(machineId, operator);
+    return;
+  }
+
+  if (lease?.playerId !== playerId
+    || lease.sessionId !== operatorSessionId
+    || lease.expiresAt <= now) {
+    autoOperators.delete(machineId);
+    return;
+  }
+  if (now - operator.renewedAt >= OPERATOR_LEASE_RENEW_MS) {
+    writeSlotOperatorLease(machineId, {
+      playerId,
+      sessionId: operatorSessionId,
+      expiresAt: now + OPERATOR_LEASE_MS,
+    });
+    operator.renewedAt = now;
+  }
+  if (now < operator.readyAt) return;
+  tickSlotMachine(machineId, playerId);
 }
 
 export function setManualSlotMachineRunning(
@@ -151,22 +219,22 @@ export function setManualSlotMachineRunning(
       manualOperators.delete(machineId);
     }
     const lease = readSlotOperatorLease(machineId);
-    if (lease?.sessionId === manualSessionId) clearSlotOperatorLease(machineId);
+    if (lease?.sessionId === operatorSessionId) clearSlotOperatorLease(machineId);
     return true;
   }
   if (readSlotFundingConfig(machineId)?.ownerId !== playerId) return false;
   const now = Date.now();
   const lease = readSlotOperatorLease(machineId);
-  if (lease && lease.expiresAt > now && lease.sessionId !== manualSessionId) return false;
+  if (lease && lease.expiresAt > now && lease.sessionId !== operatorSessionId) return false;
   writeSlotOperatorLease(machineId, {
     playerId,
-    sessionId: manualSessionId,
-    expiresAt: now + MANUAL_LEASE_MS,
+    sessionId: operatorSessionId,
+    expiresAt: now + OPERATOR_LEASE_MS,
   });
   manualOperators.set(machineId, {
     docEpoch: casinoDocEpoch(),
     playerId,
-    readyAt: now + MANUAL_LEASE_SETTLE_MS,
+    readyAt: now + OPERATOR_LEASE_SETTLE_MS,
     renewedAt: now,
   });
   return true;
@@ -176,7 +244,7 @@ export function isManualSlotMachineRunning(machineId: string, playerId: string):
   const operator = manualOperators.get(machineId);
   return operator?.docEpoch === casinoDocEpoch()
     && operator.playerId === playerId
-    && ownsManualLease(machineId, playerId)
+    && ownsOperatorLease(machineId, playerId)
     && readSlotFundingConfig(machineId)?.ownerId === playerId;
 }
 
@@ -189,7 +257,7 @@ export function tickManualSlotMachine(machineId: string, authorized: boolean): v
   if (!authorized
     || operator.docEpoch !== casinoDocEpoch()
     || lease?.playerId !== operator.playerId
-    || lease.sessionId !== manualSessionId
+    || lease.sessionId !== operatorSessionId
     || lease.expiresAt <= now) {
     if (currentAcceptedRound(machineId) || state?.phase === 'spinning') {
       runTerminal(machineId, 'operator-loss refund', () =>
@@ -210,11 +278,11 @@ export function tickManualSlotMachine(machineId: string, authorized: boolean): v
     manualOperators.delete(machineId);
     return;
   }
-  if (now - operator.renewedAt >= MANUAL_LEASE_RENEW_MS) {
+  if (now - operator.renewedAt >= OPERATOR_LEASE_RENEW_MS) {
     writeSlotOperatorLease(machineId, {
       playerId,
-      sessionId: manualSessionId,
-      expiresAt: now + MANUAL_LEASE_MS,
+      sessionId: operatorSessionId,
+      expiresAt: now + OPERATOR_LEASE_MS,
     });
     operator.renewedAt = now;
   }
@@ -222,7 +290,7 @@ export function tickManualSlotMachine(machineId: string, authorized: boolean): v
   tickSlotMachine(machineId, playerId);
 }
 
-export function tickSlotMachine(machineId: string, operatorId?: string): void {
+function tickSlotMachine(machineId: string, operatorId?: string): void {
   if (settling.has(machineId) || accepting.has(machineId)) return;
   const state = readSlotMachineState(machineId);
   const activeAccepted = currentAcceptedRound(machineId);
@@ -235,10 +303,13 @@ export function tickSlotMachine(machineId: string, operatorId?: string): void {
     return;
   }
   if (operatorId) {
-    const funding = state?.phase === 'spinning'
-      ? state.funding
-      : readSlotFundingConfig(machineId);
-    if (funding?.ownerId !== operatorId) return;
+    const configuredFunding = readSlotFundingConfig(machineId);
+    if (configuredFunding?.ownerId !== operatorId) return;
+    if (state?.phase === 'spinning' && state.funding?.ownerId !== operatorId) {
+      runTerminal(machineId, 'funding-owner transfer refund', () =>
+        cancelForHouseCommit(machineId, state));
+      return;
+    }
   }
   if (state?.phase === 'spinning') {
     const player = state.player;
@@ -395,17 +466,12 @@ async function accept(
   const current = readSlotMachineState(machineId);
   if (queued?.requestId !== request.requestId
     || current?.phase === 'spinning'
-    || (operatorId && (!ownsManualLease(machineId, operatorId)
+    || (operatorId && (!ownsOperatorLease(machineId, operatorId)
       || readSlotFundingConfig(machineId)?.ownerId !== operatorId))) return;
-  const roomOwner = readRoomOwner();
-  const ownerId = roomOwner && roomOwner !== 'Local-Clone'
-    ? roomOwner
-    : getPlayerId();
-  const funding: SlotFundingConfig =
-    readSlotFundingConfig(machineId) ?? { mode: 'owner', ownerId };
-  if (!readSlotFundingConfig(machineId)) writeSlotFundingConfig(machineId, funding);
+  const funding = readSlotFundingConfig(machineId);
+  if (!funding) return;
   const sharedLeaseToken = funding.mode === 'shared'
-    ? `${manualSessionId}:${machineId}:${request.requestId}`
+    ? `${operatorSessionId}:${machineId}:${request.requestId}`
     : null;
   if (sharedLeaseToken
     && !await acquireSlotSharedBankrollLease(machineId, sharedLeaseToken)) return;
@@ -418,7 +484,7 @@ async function accept(
     || leaseCurrent?.phase === 'spinning'
     || leaseFunding?.mode !== funding.mode
     || leaseFunding.ownerId !== funding.ownerId
-    || (operatorId && (!ownsManualLease(machineId, operatorId)
+    || (operatorId && (!ownsOperatorLease(machineId, operatorId)
       || leaseFunding.ownerId !== operatorId))) {
     if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
@@ -437,7 +503,7 @@ async function accept(
     || postHashState?.phase === 'spinning'
     || postHashFunding?.mode !== funding.mode
     || postHashFunding.ownerId !== funding.ownerId
-    || (operatorId && (!ownsManualLease(machineId, operatorId)
+    || (operatorId && (!ownsOperatorLease(machineId, operatorId)
       || postHashFunding.ownerId !== operatorId))) {
     if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
     return;
@@ -623,9 +689,10 @@ export function closeSlotMachine(
   canManage = canRunCroupier(),
 ): void {
   manualOperators.delete(machineId);
+  autoOperators.delete(machineId);
   requestPolls.delete(machineId);
   const lease = readSlotOperatorLease(machineId);
-  if (lease?.sessionId === manualSessionId) clearSlotOperatorLease(machineId);
+  if (lease?.sessionId === operatorSessionId) clearSlotOperatorLease(machineId);
   if (!canManage) return;
   runTerminal(machineId, 'close', () => closeSlotMachineManaged(machineId));
 }

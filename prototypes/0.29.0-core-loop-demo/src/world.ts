@@ -122,8 +122,9 @@ import {
 } from "./devices";
 import {
   closeSlotMachine,
+  stopAutoSlotMachine,
+  tickAutoSlotMachine,
   tickManualSlotMachine,
-  tickSlotMachine,
 } from "./slotCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import type {
@@ -4876,10 +4877,11 @@ export class World {
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
       }
-      for (const machine of slotMachines) tickSlotMachine(machine.id);
+      for (const machine of slotMachines) tickAutoSlotMachine(machine.id);
     } else {
       const authorized = canEditRoom().ok;
       for (const machine of slotMachines) {
+        stopAutoSlotMachine(machine.id);
         tickManualSlotMachine(machine.id, authorized);
       }
     }
