@@ -10,8 +10,13 @@ import contracts from '../test-vectors/treasury/treasury-contracts.json';
 import {
   type CanonicalValue,
   type CompanyTreasuryPolicy,
+  type DeviceAllowance,
   type GovernanceKindRule,
   type MerkleStep,
+  compareMojoStrings,
+  isCompanyTreasuryPolicy,
+  isDeviceAllowance,
+  isShareClassPolicy,
   type ProposalRegistration,
   type TreasuryProposalKind,
   type UnsignedTreasuryProposal,
@@ -244,6 +249,175 @@ describe('guards', () => {
     expect(isGovernanceKindRule({ ...contracts.governanceRule.rule, vetoBps: 10001 })).toBe(false);
     expect(isGovernanceKindRule({ ...contracts.governanceRule.rule, passRule: 'plurality' })).toBe(false);
     expect(isGovernanceKindRule({ ...contracts.governanceRule.rule, votingBlocks: -1 })).toBe(false);
+  });
+});
+
+describe('contract guards', () => {
+  const policy = contracts.policy.value as CompanyTreasuryPolicy;
+  const clonePolicy = (): Record<string, unknown> & { board: { threshold: number; signerPuzzleHashes: string[] }; shareClasses: Record<string, unknown>[]; governanceRules: Record<string, unknown> } =>
+    JSON.parse(JSON.stringify(policy));
+
+  it('isCompanyTreasuryPolicy accepts the golden-vector policy', () => {
+    expect(isCompanyTreasuryPolicy(policy)).toBe(true);
+    expect(isCompanyTreasuryPolicy(JSON.parse(JSON.stringify(policy)))).toBe(true);
+  });
+
+  it('isCompanyTreasuryPolicy rejects structural violations', () => {
+    expect(isCompanyTreasuryPolicy(null)).toBe(false);
+    expect(isCompanyTreasuryPolicy([])).toBe(false);
+    let p = clonePolicy();
+    p.board.threshold = p.board.signerPuzzleHashes.length + 1;
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.board.threshold = 0;
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.board.signerPuzzleHashes.push(p.board.signerPuzzleHashes[0]);
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.board.signerPuzzleHashes = [];
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.companyId = 'not-hex';
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    delete p.governanceRules.pay;
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.governanceRules.bribe = p.governanceRules.pay;
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    (p.governanceRules.pay as Record<string, unknown>).vetoBps = 10001;
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.shareClasses[0].votesPerWholeShare = -1;
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.shareClasses.push({ ...p.shareClasses[0] });
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.shareClasses = [];
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.maxFeeMojos = '01';
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.emergencyPolicyHash = 'xyz';
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.shareClasses[0].assetId = 'zzz-not-a-cat-id';
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+    p = clonePolicy();
+    p.shareClasses.push({ ...p.shareClasses[0], id: 'preferred' }); // same assetId
+    expect(isCompanyTreasuryPolicy(p)).toBe(false);
+  });
+
+  it('isCompanyTreasuryPolicy rejects a JSON-parsed own __proto__ governance kind', () => {
+    const raw = JSON.stringify(policy);
+    const rule = JSON.stringify(contracts.governanceRule.rule);
+    // As an unknown 10th kind alongside the nine real ones...
+    const extra = JSON.parse(raw.replace('"governanceRules":{', `"governanceRules":{"__proto__":${rule},`));
+    expect(isCompanyTreasuryPolicy(extra)).toBe(false);
+    // ...and as a replacement for a required kind.
+    const replaced = JSON.parse(raw.replace('"pay":', '"__proto__":'));
+    expect(isCompanyTreasuryPolicy(replaced)).toBe(false);
+  });
+
+  const validAllowance: DeviceAllowance = {
+    v: 1,
+    allowanceId: 'a'.repeat(64),
+    networkGenesisChallenge: 'b'.repeat(64),
+    companyId: 'c'.repeat(64),
+    policyVersion: 1,
+    subject: {
+      kind: 'device',
+      id: 'slot-machine-7',
+      authorityHead: { headId: 'head-1', version: 1, scheme: 'ed25519', publicKey: 'd'.repeat(64) },
+    },
+    operations: ['casino-reserve', 'casino-settle', 'casino-refund'],
+    assetId: 'xch',
+    maxPerOperation: '1000000',
+    maxPerPeriod: '5000000',
+    maxFeeMojos: '50000',
+    periodBlocks: 4608,
+    startsAtHeight: 100,
+    expiresAfterHeight: 500000,
+    stateCoinLauncherId: 'e'.repeat(64),
+    nonce: 'f'.repeat(64),
+    policyProof: 'proof',
+  };
+
+  it('isDeviceAllowance accepts a valid allowance and its JSON round-trip', () => {
+    expect(isDeviceAllowance(validAllowance)).toBe(true);
+    expect(isDeviceAllowance(JSON.parse(JSON.stringify(validAllowance)))).toBe(true);
+  });
+
+  it('isDeviceAllowance rejects malformed capability records', () => {
+    const cloneAllowance = (): Record<string, unknown> => JSON.parse(JSON.stringify(validAllowance));
+    let a = cloneAllowance();
+    a.operations = [];
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.operations = ['casino-reserve', 'mint-money'];
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.operations = ['casino-reserve', 'casino-reserve'];
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.maxPerOperation = '9000000'; // exceeds maxPerPeriod
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.maxPerPeriod = '18446744073709551616'; // > u64::MAX
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    (a.subject as Record<string, unknown>).kind = 'furniture';
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    ((a.subject as Record<string, unknown>).authorityHead as Record<string, unknown>).scheme = 'rsa';
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    ((a.subject as Record<string, unknown>).authorityHead as Record<string, unknown>).version = 0;
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.periodBlocks = 0;
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.expiresAfterHeight = 100; // == startsAtHeight
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.destinationPuzzleHashes = [];
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.destinationPuzzleHashes = ['not-hex'];
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.destinationPuzzleHashes = ['9'.repeat(64), '9'.repeat(64)];
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.assetId = 'BTC';
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.roomId = '';
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.policyProof = '';
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    ((a.subject as Record<string, unknown>).authorityHead as Record<string, unknown>).headId = '';
+    expect(isDeviceAllowance(a)).toBe(false);
+    a = cloneAllowance();
+    a.startsAtHeight = -1;
+    expect(isDeviceAllowance(a)).toBe(false);
+  });
+
+  it('isShareClassPolicy and compareMojoStrings behave at the edges', () => {
+    expect(isShareClassPolicy(policy.shareClasses[0])).toBe(true);
+    expect(isShareClassPolicy({ ...policy.shareClasses[0], votesPerWholeShare: 1.5 })).toBe(false);
+    expect(isShareClassPolicy({ ...policy.shareClasses[0], assetId: 'not-a-cat-id' })).toBe(false);
+    expect(compareMojoStrings('99', '100')).toBeLessThan(0);
+    expect(compareMojoStrings('100', '99')).toBeGreaterThan(0);
+    expect(compareMojoStrings('100', '100')).toBe(0);
+    expect(compareMojoStrings('18446744073709551615', '18446744073709551615')).toBe(0);
   });
 });
 

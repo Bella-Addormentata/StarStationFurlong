@@ -46,6 +46,15 @@ export function isMojoString(value: unknown): value is MojoString {
     && (value.length < 20 || value <= '18446744073709551615');
 }
 
+/**
+ * Numeric order for MojoStrings without a BigInt parse: canonical decimal has
+ * no leading zeros, so shorter is smaller and equal lengths compare lexically.
+ */
+export function compareMojoStrings(a: MojoString, b: MojoString): number {
+  if (a.length !== b.length) return a.length - b.length;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function isPolicyVersion(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1;
 }
@@ -63,16 +72,19 @@ export function isBlockHeight(value: unknown): value is number {
 // Governance rule contracts (plan §7.3)
 // ---------------------------------------------------------------------------
 
-export type TreasuryProposalKind =
-  | 'pay'
-  | 'budget'
-  | 'appoint-manager'
-  | 'revoke-manager'
-  | 'bind-room'
-  | 'change-policy'
-  | 'rotate-board'
-  | 'add-share-class'
-  | 'dissolve';
+export const PROPOSAL_KINDS = [
+  'pay',
+  'budget',
+  'appoint-manager',
+  'revoke-manager',
+  'bind-room',
+  'change-policy',
+  'rotate-board',
+  'add-share-class',
+  'dissolve',
+] as const;
+
+export type TreasuryProposalKind = (typeof PROPOSAL_KINDS)[number];
 
 export type GovernancePassRule =
   | 'majority-cast'
@@ -295,16 +307,19 @@ export interface VoteInclusionProof {
 // Allowances and execution (plan §9.1, + maxFeeMojos)
 // ---------------------------------------------------------------------------
 
-export type TreasuryOperation =
-  | 'casino-reserve'
-  | 'casino-settle'
-  | 'casino-refund'
-  | 'robot-charge'
-  | 'robot-parts'
-  | 'room-rent'
-  | 'room-repair'
-  | 'room-service'
-  | 'manager-payment';
+export const TREASURY_OPERATIONS = [
+  'casino-reserve',
+  'casino-settle',
+  'casino-refund',
+  'robot-charge',
+  'robot-parts',
+  'room-rent',
+  'room-repair',
+  'room-service',
+  'manager-payment',
+] as const;
+
+export type TreasuryOperation = (typeof TREASURY_OPERATIONS)[number];
 
 export interface AllowanceAuthorityHead {
   headId: string;
@@ -421,6 +436,132 @@ export interface RoomTreasuryBinding {
   expiresAfterHeight?: number;
   policyReceiptId: Hex32;
   sig: string;
+}
+
+// ---------------------------------------------------------------------------
+// Contract guards (plan §17.2)
+// ---------------------------------------------------------------------------
+// Deserialization-boundary validators for the authority-bearing records that
+// arrive from replaceable caches and gossip: callers MUST guard untrusted data
+// with these before trusting, committing, or acting on it. The hash helpers
+// further down stay validation-free on purpose — the Rust codec hashes untyped
+// JSON until PR D introduces typed structs, so gating only one runtime's hash
+// functions would reopen the acceptance-divergence class this module closes.
+// Enforcement belongs where data enters (treasuryDoc.ts caches, node RPC).
+//
+// Optional fields travel OMITTED, never null: the guards reject explicit null
+// (only the hash canonicalizers map absent to null, internally). PR D's typed
+// Rust structs must serialize Option::None by skipping the field
+// (skip_serializing_if), or Rust would emit records these guards reject.
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function allDistinct(values: readonly string[]): boolean {
+  return new Set(values).size === values.length;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+export function isShareClassPolicy(value: unknown): value is ShareClassPolicy {
+  if (!isPlainObject(value)) return false;
+  // assetId is a CAT asset id — 32 bytes, same lexical rules as every Hex32.
+  return isNonEmptyString(value.id)
+    && isHex32(value.assetId)
+    && Number.isSafeInteger(value.votesPerWholeShare)
+    && (value.votesPerWholeShare as number) >= 0
+    && typeof value.grantsRoomAccess === 'boolean'
+    && typeof value.transferable === 'boolean'
+    && (value.convertsToClassId === undefined || isNonEmptyString(value.convertsToClassId))
+    && (value.sunsetHeight === undefined || isBlockHeight(value.sunsetHeight));
+}
+
+export function isCompanyTreasuryPolicy(value: unknown): value is CompanyTreasuryPolicy {
+  if (!isPlainObject(value)) return false;
+  if (value.v !== 1) return false;
+  if (!isHex32(value.networkGenesisChallenge)) return false;
+  if (!isHex32(value.companyId)) return false;
+  if (!isHex32(value.treasuryLauncherId)) return false;
+  if (!isPolicyVersion(value.policyVersion)) return false;
+  const board = value.board;
+  if (!isPlainObject(board)) return false;
+  const signers = board.signerPuzzleHashes;
+  if (!Array.isArray(signers) || signers.length === 0) return false;
+  if (!signers.every(isHex32) || !allDistinct(signers)) return false;
+  if (!Number.isSafeInteger(board.threshold)) return false;
+  const threshold = board.threshold as number;
+  if (threshold < 1 || threshold > signers.length) return false;
+  const classes = value.shareClasses;
+  if (!Array.isArray(classes) || classes.length === 0) return false;
+  if (!classes.every(isShareClassPolicy)) return false;
+  if (!allDistinct(classes.map((c) => c.id))) return false;
+  // Two classes sharing one CAT would double-count the same coins' votes.
+  if (!allDistinct(classes.map((c) => c.assetId))) return false;
+  const rules = value.governanceRules;
+  if (!isPlainObject(rules)) return false;
+  // Complete record: every proposal kind ruled, no unknown kinds smuggled in.
+  if (Object.keys(rules).length !== PROPOSAL_KINDS.length) return false;
+  for (const kind of PROPOSAL_KINDS) {
+    if (!Object.prototype.hasOwnProperty.call(rules, kind)) return false;
+    if (!isGovernanceKindRule(rules[kind])) return false;
+  }
+  const modules = value.approvalModuleHashes;
+  if (!Array.isArray(modules) || !modules.every(isHex32) || !allDistinct(modules)) return false;
+  if (!isMojoString(value.maxFeeMojos)) return false;
+  if (value.emergencyPolicyHash !== undefined && !isHex32(value.emergencyPolicyHash)) return false;
+  return true;
+}
+
+export function isDeviceAllowance(value: unknown): value is DeviceAllowance {
+  if (!isPlainObject(value)) return false;
+  if (value.v !== 1) return false;
+  if (!isHex32(value.allowanceId)) return false;
+  if (!isHex32(value.networkGenesisChallenge)) return false;
+  if (!isHex32(value.companyId)) return false;
+  if (!isPolicyVersion(value.policyVersion)) return false;
+  const subject = value.subject;
+  if (!isPlainObject(subject)) return false;
+  if (subject.kind !== 'room' && subject.kind !== 'device'
+    && subject.kind !== 'robot' && subject.kind !== 'manager') return false;
+  if (!isNonEmptyString(subject.id)) return false;
+  const head = subject.authorityHead;
+  if (!isPlainObject(head)) return false;
+  if (!isNonEmptyString(head.headId)) return false;
+  if (!Number.isSafeInteger(head.version) || (head.version as number) < 1) return false;
+  if (head.scheme !== 'ed25519' && head.scheme !== 'bls12381') return false;
+  if (!isNonEmptyString(head.publicKey)) return false;
+  if (value.roomId !== undefined && !isNonEmptyString(value.roomId)) return false;
+  const ops = value.operations;
+  if (!Array.isArray(ops) || ops.length === 0) return false;
+  if (!ops.every((op) => (TREASURY_OPERATIONS as readonly string[]).includes(op as string))) {
+    return false;
+  }
+  if (!allDistinct(ops as string[])) return false;
+  if (value.assetId !== 'xch' && !isHex32(value.assetId)) return false;
+  if (!isMojoString(value.maxPerOperation)) return false;
+  if (!isMojoString(value.maxPerPeriod)) return false;
+  if (!isMojoString(value.maxFeeMojos)) return false;
+  if (compareMojoStrings(value.maxPerOperation as MojoString, value.maxPerPeriod as MojoString) > 0) {
+    return false;
+  }
+  if (!Number.isSafeInteger(value.periodBlocks) || (value.periodBlocks as number) < 1) return false;
+  const dests = value.destinationPuzzleHashes;
+  if (dests !== undefined) {
+    if (!Array.isArray(dests) || dests.length === 0) return false;
+    if (!dests.every(isHex32) || !allDistinct(dests)) return false;
+  }
+  if (!isBlockHeight(value.startsAtHeight)) return false;
+  if (!isBlockHeight(value.expiresAfterHeight)) return false;
+  if ((value.expiresAfterHeight as number) <= (value.startsAtHeight as number)) return false;
+  if (!isHex32(value.stateCoinLauncherId)) return false;
+  if (!isHex32(value.nonce)) return false;
+  if (!isNonEmptyString(value.policyProof)) return false;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
