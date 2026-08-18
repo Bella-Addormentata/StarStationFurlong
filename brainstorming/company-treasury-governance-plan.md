@@ -4,7 +4,7 @@
 
 **Status:** architecture proposal; documentation only. No runtime money path should depend on this document until the testnet gates in section 17 pass.
 
-> **Amendment (sovereign/serverless):** the "authoritative Rust treasury service" architecture in §4 and §13 is **superseded** by [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) — Chialisp puzzles are the only money authority, the service's roles decompose into a treasury profile of every player's own `ssf-p2p-node`, proposal acceptance and vote checkpoints become on-chain events, and chain access moves to the Chia peer protocol. The invariants, contracts, puzzles, threat model, gates, migration, and mainnet ceremony below are unchanged. Original text is preserved below per repo convention.
+> **Amendment (sovereign/serverless):** the "authoritative Rust treasury service" architecture in §4 and §13 is **superseded** by [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) — Chialisp puzzles are the only money authority, the service's roles decompose into a treasury profile of every player's own `ssf-p2p-node`, and proposal acceptance and vote checkpoints become on-chain events. Chain access is **proposed** to move to the Chia peer protocol — pending maintainer ratification (amendment §6/§14), since that reverses §13.1's settled posture. The invariants, puzzles, threats (§17.1), migration, and mainnet ceremony below are unchanged. The contracts, tests, and gates are **amended, not unchanged**: §7.1's `TreasuryProposalAcceptance`/`serviceSig` are deleted in favor of derived `ProposalWindows`, §7.2's `VoteInclusionProof` changed shape and its vote body's field set is pinned by shared vectors, `maxFeeMojos` is added to `CompanyTreasuryPolicy` (§12) and `DeviceAllowance` (§9.1) and enters the policy hash, the §12 CBOR profile gains a no-byte-strings rule, §17.3–§17.4's service-shaped test and gate actors get per-node substitutions, and §18's sequence gains gating spikes S-0/S-1/S-3 — see the amendment's §10–§13 for the full deltas. Original text is preserved below per repo convention.
 
 **Code root:** unless a path starts with `brainstorming/`, every `src/...` path in this document is relative to `prototypes/0.29.0-core-loop-demo/`.
 
@@ -432,6 +432,8 @@ export interface VoteInclusionProof {
 }
 ```
 
+> **Amended:** the shipped `VoteInclusionProof` is `{ v: 1; voteId: Hex32; checkpointId: Hex32; steps: MerkleStep[] }` with `MerkleStep { side: "left" | "right"; hash: Hex32 }` — see [src/treasuryTypes.ts](../prototypes/0.29.0-core-loop-demo/src/treasuryTypes.ts) and [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §10. The sketch above predates the checkpoint contract's final shape.
+
 Tally rules:
 
 - weight comes from verified CAT balances at `snapshotHeight`;
@@ -554,6 +556,8 @@ Production puzzles must use audited libraries, exact condition semantics, safe i
 ## 9. Allowances for rooms, robots, and casino devices
 
 ### 9.1 Allowance data contract
+
+> **Amended:** the shipped contract adds `maxFeeMojos: MojoString` to `DeviceAllowance` — the chain-checkable fee bound of [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §8/§10. The block below predates that field; [src/treasuryTypes.ts](../prototypes/0.29.0-core-loop-demo/src/treasuryTypes.ts) is authoritative.
 
 ```ts
 export type TreasuryOperation =
@@ -769,6 +773,8 @@ V1 displays one `COMMON` class. The UI may read multiple class definitions, but 
 
 ## 12. Canonical TypeScript contracts
 
+> **Amended & implemented:** this section shipped as [src/treasuryTypes.ts](../prototypes/0.29.0-core-loop-demo/src/treasuryTypes.ts) with a Rust twin ([ssf-p2p-node/src/treasury_codec.rs](../prototypes/0.29.0-core-loop-demo/ssf-p2p-node/src/treasury_codec.rs)) and shared golden vectors — see [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §10. Deltas from the sketches below: `CompanyTreasuryPolicy` gains `maxFeeMojos: MojoString`, which `policyHashOf` includes; the shipped `policyHashOf` also applies `sortedSet()` to `signerPuzzleHashes`/`shareClasses`/`approvalModuleHashes` and null-normalizes optional share-class fields, which the example code below skips — so the example computes a **different** policy hash than the shipped code; the CBOR profile adds one clarification (no byte strings — binary travels as lowercase hex text); and `voteIdOf`'s field order is pinned by vectors. The shipped code is authoritative over these sketches.
+
 The first code PR should introduce a dependency-light module, for example `src/treasuryTypes.ts`, containing types, canonical encoders, hashes, and guards only.
 
 ```ts
@@ -856,7 +862,7 @@ PR B must include shared TypeScript/Rust test vectors: canonical bytes, SHA-256 
 
 ## 13. Browser/Rust service boundary
 
-> **Superseded:** this section's remote service and its §13.1 operator-run/cross-check full nodes are replaced by the treasury node profile and Chia peer-protocol chain access in [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §2/§3/§6. The `TreasuryService` interface below survives as the browser's contract with **its own local node**; the verification duties listed for "the Rust implementation" become duties of every player's node; §13.1's reorg/receipt rules carry over verbatim, executed per-node.
+> **Superseded:** this section's remote service is replaced by the treasury node profile in [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §2/§3. Replacing §13.1's operator-run/cross-check full nodes with Chia peer-protocol chain access (amendment §6) is **proposed, pending maintainer ratification** — see the §20 note. The `TreasuryService` interface below survives in role as the browser's contract with **its own local node**, with amended signatures: `ProposalWindows` replaces `TreasuryProposalAcceptance`, and inclusion proofs use the shipped `{voteId, checkpointId, steps}` shape. The verification duties listed for "the Rust implementation" become duties of every player's node; §13.1's reorg/receipt rules carry over in substance, executed per-node (the idempotency ledger becomes the chain itself — amendment §3).
 
 Define an interface before selecting transport:
 
@@ -1185,6 +1191,8 @@ Robot routines remain Yjs configuration. A future paid action references an allo
 ---
 
 ## 20. Open decisions
+
+> **Amended:** the amendment ([sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §14) answers decision **9** (fees: treasury/allowance spends self-pay within `maxFeeMojos`, committed in policy and in each allowance; publishers pay their own dust) and decision **12** (data availability: office-doc replication plus checkpoint-publisher retention; un-checkpointed votes don't count), and constrains half of decision 1 (custody coordination must tolerate offline signers). Those were genuinely open here, so the amendment's answers ride this PR's normal review. By contrast, the chain-access posture and the B-7 audit re-scoping (amendment §6/§11/§14) **reverse previously settled positions** and are pending explicit maintainer ratification, not decided. The remaining items stand as written.
 
 These require explicit decisions before PR B or PR D:
 
