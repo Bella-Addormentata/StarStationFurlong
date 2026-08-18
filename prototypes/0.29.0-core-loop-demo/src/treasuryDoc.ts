@@ -21,8 +21,16 @@
 //   registration:<proposalId>               -> ProposalRegistration
 //   windows:<proposalId>                    -> ProposalWindows (derived — recompute to trust)
 //   checkpoint:<proposalId>:<checkpointId>  -> TreasuryCheckpoint
-//   session:<proposalId>:<sessionId>        -> SigningSession (zero authority)
+//   session:<proposalId>:<sessionId>        -> SigningSession shell (zero authority)
+//   sessionsig:<sessionId>:<signerPuzzleHash> -> one collected signature
 //   payload:<payloadHash>                   -> proposal payload bytes, lowercase hex
+//
+// NETWORK PINNING (plan §17.5): the binding carries the room's configured
+// networkGenesisChallenge, and every genesis-bearing record must match it —
+// a correctly signed record from another network is invalid here, so
+// testnet records can never replay into a mainnet cache or vice versa.
+// (Registrations and windows carry no genesis field; they anchor to a
+// genesis-bound proposal by id and to chain observations the node verifies.)
 //
 // The vote slot is keyed by voterGamePub (plan §14's voterPub) — the identity
 // gameSig AUTHENTICATES, so nobody can squat another voter's slot: a record
@@ -31,10 +39,17 @@
 // voteId") is enforced per slot on write; dedup across game keys down to the
 // weight-bearing voterPuzzleHash happens at TALLY time — puzzle-hash binding
 // (chiaAddressProof) is chain-checked there, not here — via the exported
-// pickCanonicalVote. A Yjs same-key concurrent write resolves by CRDT rule,
-// so a cross-partition merge can transiently surface the losing vote —
-// harmless, because the checkpoint-union tally (sovereign §5) recounts from
-// the signed payloads.
+// pickCanonicalVote.
+//
+// VOTE RETENTION: this map holds ONE record per voter slot — the canonical
+// latest, per §14's pinned layout. A Yjs same-key concurrent write resolves
+// by CRDT rule, so a cross-partition merge can surface the §7.2 loser and
+// hide the winner's payload FROM THIS MAP. That is a display gap, not a
+// money gap: the tally counts only votes in confirmed checkpoints, whose
+// publishers MUST retain the payloads they root (sovereign §5), and a vote's
+// author always holds their own vote — any holder republishing (putVote)
+// repairs the slot, because the no-downgrade rule always yields to the
+// canonical vote.
 
 import * as Y from 'yjs';
 import {
@@ -67,6 +82,7 @@ import {
   proposalIdOf,
   proposalSignatureBytes,
   roomBindingSignatureBytes,
+  signingSessionIdOf,
   voteIdOf,
   voteSignatureBytes,
 } from './treasuryTypes';
@@ -110,8 +126,14 @@ function isChainSyncStatus(value: unknown): value is ChainSyncStatus {
 let boundDoc: Y.Doc | null = null;
 let treasuryMap: Y.Map<unknown> | null = null;
 let verifySig: TreasurySigVerifier | null = null;
+let expectedGenesis: Hex32 | null = null;
 let unobservePrevious: (() => void) | null = null;
 const listeners = new Set<() => void>();
+
+/** Plan §17.5: a record for any other network is invalid here, full stop. */
+function onNet(genesis: unknown): boolean {
+  return expectedGenesis !== null && genesis === expectedGenesis;
+}
 
 function notify(): void {
   // Copy first: a listener may unsubscribe mid-notify, and one throwing
@@ -126,10 +148,21 @@ function notify(): void {
 }
 
 /** Bind to the room's office doc at the join seam. Rebinding replaces state. */
-export function bindTreasuryDoc(doc: Y.Doc, opts: { verifySig: TreasurySigVerifier }): void {
+export function bindTreasuryDoc(
+  doc: Y.Doc,
+  opts: { verifySig: TreasurySigVerifier; networkGenesisChallenge: Hex32 },
+): void {
   unobservePrevious?.();
   boundDoc = doc;
   verifySig = opts.verifySig;
+  if (isHex32(opts.networkGenesisChallenge)) {
+    expectedGenesis = opts.networkGenesisChallenge;
+  } else {
+    // Fail closed, but loudly: with no valid pin every genesis-bearing put
+    // and read refuses, which is a local wiring bug, not peer hostility.
+    expectedGenesis = null;
+    console.warn('bindTreasuryDoc: invalid networkGenesisChallenge — treasury cache disabled');
+  }
   const nextMap = doc.getMap('treasury');
   treasuryMap = nextMap;
   const observer = (): void => notify();
@@ -188,6 +221,7 @@ function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
 
 function validProposal(value: unknown): value is TreasuryProposal {
   if (!isTreasuryProposal(value)) return false;
+  if (!onNet(value.networkGenesisChallenge)) return false;
   // try/catch: the canonical encoder throws on strings the profile rejects
   // (e.g. lone surrogates), and map values cross the peer trust boundary —
   // an unencodable record is invalid, not an exception.
@@ -239,6 +273,7 @@ export function listProposals(): TreasuryProposal[] {
 
 function validVote(value: unknown): value is TreasuryVote {
   if (!isTreasuryVote(value)) return false;
+  if (!onNet(value.networkGenesisChallenge)) return false;
   try {
     if (voteIdOf(value) !== value.voteId) return false;
     return verify(
@@ -311,6 +346,7 @@ export function listVotes(proposalId: string): TreasuryVote[] {
 
 export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
   if (!isCompanyTreasuryPolicy(policy)) return false;
+  if (!onNet(policy.networkGenesisChallenge)) return false;
   // Encodability probe: a policy the canonical encoder rejects would put
   // fine but read back null forever — refuse it here instead.
   try {
@@ -318,14 +354,10 @@ export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
   } catch {
     return false;
   }
-  const m = map();
-  if (!m) return false;
-  // §14: canonical authority rules, not LWW — never replace a valid cache
-  // with an older policy version. (Chain lineage is the real authority.)
-  const existing = m.get('policy');
-  if (isCompanyTreasuryPolicy(existing) && existing.policyVersion > policy.policyVersion) {
-    return false;
-  }
+  // Deliberately plain-replace (invariant 5: caches must stay replaceable).
+  // Version selection against the chain's policy lineage is the node's job —
+  // a local version-monotonicity rule over UNAUTHENTICATED entries would let
+  // a planted max-version record brick the cache.
   return put('policy', policy);
 }
 
@@ -335,6 +367,7 @@ export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: 
   if (!m) return null;
   const value = m.get('policy');
   if (!isCompanyTreasuryPolicy(value)) return null;
+  if (!onNet(value.networkGenesisChallenge)) return null;
   try {
     return { policy: value, policyHash: policyHashOf(value) };
   } catch {
@@ -344,6 +377,7 @@ export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: 
 
 export function putAllowanceCache(allowance: DeviceAllowance): boolean {
   if (!isDeviceAllowance(allowance)) return false;
+  if (!onNet(allowance.networkGenesisChallenge)) return false;
   return put(`allowance:${allowance.allowanceId}`, allowance);
 }
 
@@ -351,7 +385,8 @@ export function readAllowanceCache(allowanceId: string): DeviceAllowance | null 
   const m = map();
   if (!m) return null;
   const value = m.get(`allowance:${allowanceId}`);
-  return isDeviceAllowance(value) && value.allowanceId === allowanceId ? value : null;
+  if (!isDeviceAllowance(value) || value.allowanceId !== allowanceId) return null;
+  return onNet(value.networkGenesisChallenge) ? value : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +427,7 @@ export function readWindowsCache(proposalId: string): ProposalWindows | null {
 
 function validCheckpoint(value: unknown): value is TreasuryCheckpoint {
   if (!isTreasuryCheckpoint(value)) return false;
+  if (!onNet(value.networkGenesisChallenge)) return false;
   const { checkpointId, checkpointCoinId, confirmedHeight, ...body } = value;
   void checkpointCoinId;
   void confirmedHeight;
@@ -423,50 +459,86 @@ export function listCheckpoints(proposalId: string): TreasuryCheckpoint[] {
 }
 
 // ---------------------------------------------------------------------------
-// Signing sessions (zero authority; signature sets merge, never shrink)
+// Signing sessions (zero authority; CRDT-native signature union)
 // ---------------------------------------------------------------------------
+// A session's id is DERIVED — signingSessionIdOf hashes the immutable shell —
+// so "same id, different shell" is structurally impossible: an id mismatch is
+// junk to overwrite, and nothing can brick a slot. Signatures live under one
+// key PER SIGNER (`sessionsig:<sessionId>:<signerPuzzleHash>`), so Yjs sync
+// itself performs the set union across partitions — two replicas collecting
+// different signers merge losslessly with no application merge step. Sigs are
+// unverifiable at this layer (BLS lands with PR F), so a same-signer conflict
+// resolves by plain CRDT last-write — a planted garbage value cannot win
+// permanently, because any holder of the real signature re-puts it and the
+// aggregation layer verifies before use.
 
-function sameSessionShell(a: SigningSession, b: SigningSession): boolean {
-  return a.sessionId === b.sessionId
-    && a.networkGenesisChallenge === b.networkGenesisChallenge
-    && a.companyId === b.companyId
-    && a.policyVersion === b.policyVersion
-    && a.proposalId === b.proposalId
-    && a.bundleHash === b.bundleHash
-    && a.requiredThreshold === b.requiredThreshold
-    && a.expiresAfterHeight === b.expiresAfterHeight;
+function sessionShellOf(session: SigningSession): SigningSession {
+  return { ...session, collectedSigs: [] };
+}
+
+function validSessionShell(value: unknown, proposalId: string, sessionId: string): value is SigningSession {
+  if (!isSigningSession(value)) return false;
+  if (value.proposalId !== proposalId || value.sessionId !== sessionId) return false;
+  if (!onNet(value.networkGenesisChallenge)) return false;
+  try {
+    return signingSessionIdOf(value) === value.sessionId;
+  } catch {
+    return false;
+  }
 }
 
 export function putSigningSession(session: SigningSession): boolean {
   if (!isSigningSession(session)) return false;
+  if (!onNet(session.networkGenesisChallenge)) return false;
+  try {
+    if (signingSessionIdOf(session) !== session.sessionId) return false;
+  } catch {
+    return false;
+  }
   const m = map();
   if (!m) return false;
-  const key = `session:${session.proposalId}:${session.sessionId}`;
-  const existing = m.get(key);
-  // Only a record that claims THIS slot is an occupant — a valid-shaped
-  // session misfiled under the key by a hostile peer must not brick the
-  // slot; it is junk to overwrite.
-  if (isSigningSession(existing)
-    && existing.sessionId === session.sessionId
-    && existing.proposalId === session.proposalId) {
-    // A conflicting shell under the same id is bogus — a session is pinned to
-    // one bundleHash; collect-and-expire, never mutate (sovereign §7).
-    if (!sameSessionShell(existing, session)) return false;
-    // Union the signature sets (BLS collection is non-interactive; the record
-    // carries zero authority, so merging is always safe). Per signer, the
-    // lexicographically smaller sig string wins — a total, commutative rule,
-    // so peers merging in any order converge and a garbage sig planted first
-    // cannot permanently shadow the real one.
-    const merged = new Map(existing.collectedSigs.map((s) => [s.signerPuzzleHash, s]));
-    for (const s of session.collectedSigs) {
-      const held = merged.get(s.signerPuzzleHash);
-      if (!held || s.sig < held.sig) merged.set(s.signerPuzzleHash, s);
+  const shellKey = `session:${session.proposalId}:${session.sessionId}`;
+  const existing = m.get(shellKey);
+  boundDoc!.transact(() => {
+    // The shell is content-addressed, so a clean valid occupant is
+    // byte-equivalent and needs no write; anything else (junk, or a valid
+    // shell bloated with embedded sigs a peer parked there) is scrubbed.
+    const occupantClean = validSessionShell(existing, session.proposalId, session.sessionId)
+      && (existing as SigningSession).collectedSigs.length === 0;
+    if (!occupantClean) {
+      m.set(shellKey, sessionShellOf(session));
     }
-    const collectedSigs = [...merged.values()]
-      .sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
-    return put(key, { ...existing, collectedSigs });
+    for (const s of session.collectedSigs) {
+      const sigKey = `sessionsig:${session.sessionId}:${s.signerPuzzleHash}`;
+      // Overwrite unless the held entry is EXACTLY the canonical shape — a
+      // planted entry with the right sig string but a mismatched signer
+      // field would otherwise skip the write yet be dropped on read,
+      // permanently shadowing the signature.
+      const held = m.get(sigKey) as Record<string, unknown> | undefined;
+      if (!held || held.sig !== s.sig || held.signerPuzzleHash !== s.signerPuzzleHash) {
+        m.set(sigKey, { signerPuzzleHash: s.signerPuzzleHash, sig: s.sig });
+      }
+    }
+  });
+  return true;
+}
+
+function collectSessionSigs(
+  m: Y.Map<unknown>,
+  sessionId: string,
+): { signerPuzzleHash: Hex32; sig: string }[] {
+  const out: { signerPuzzleHash: Hex32; sig: string }[] = [];
+  const prefix = `sessionsig:${sessionId}:`;
+  for (const [key, value] of m.entries()) {
+    if (!key.startsWith(prefix)) continue;
+    if (typeof value !== 'object' || value === null) continue;
+    const entry = value as Record<string, unknown>;
+    if (!isHex32(entry.signerPuzzleHash)) continue;
+    if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
+    if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
+    out.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
   }
-  return put(key, session);
+  return out.sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
 }
 
 export function listSigningSessions(proposalId: string): SigningSession[] {
@@ -476,10 +548,10 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
   const prefix = `session:${proposalId}:`;
   for (const [key, value] of m.entries()) {
     if (!key.startsWith(prefix)) continue;
-    if (isSigningSession(value)
-      && key === `session:${value.proposalId}:${value.sessionId}`) {
-      out.push(value);
-    }
+    const sessionId = key.slice(prefix.length);
+    if (!validSessionShell(value, proposalId, sessionId)) continue;
+    const assembled = { ...value, collectedSigs: collectSessionSigs(m, sessionId) };
+    if (isSigningSession(assembled)) out.push(assembled);
   }
   return out;
 }
@@ -490,6 +562,7 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
 
 function validBinding(value: unknown): value is RoomTreasuryBinding {
   if (!isRoomTreasuryBinding(value)) return false;
+  if (!onNet(value.networkGenesisChallenge)) return false;
   const { sig, ...unsigned } = value;
   try {
     return verify(value.boundByPub, roomBindingSignatureBytes(unsigned), sig);
@@ -510,11 +583,16 @@ export function readRoomBinding(roomId: string): RoomTreasuryBinding | null {
   return validBinding(value) && value.roomId === roomId ? value : null;
 }
 
-// §13.1: a receipt's body is immutable but its confirmation status is a
-// replaceable attestation (confirmed -> reorged), so same-id re-puts are the
-// intended update path — no keep-first rule here, unlike proposals.
+// §13.1's immutable-body rule is enforced where receipts are VERIFIABLE —
+// against the chain facts they anchor to (spendBundleId, confirmation), the
+// node's job from PR D on. At this layer receipts are unauthenticated cache
+// entries, so the slot is deliberately plain-replace (invariant 5): a local
+// occupancy rule over unverifiable entries would let a planted same-id
+// forgery brick honest re-puts forever — the same trap the policy slot
+// avoids — while protecting readers from nothing.
 export function putReceiptCache(receipt: TreasuryReceipt): boolean {
   if (!isTreasuryReceipt(receipt)) return false;
+  if (!onNet(receipt.networkGenesisChallenge)) return false;
   return put(`receipt:${receipt.receiptId}`, receipt);
 }
 
@@ -522,7 +600,8 @@ export function readReceiptCache(receiptId: string): TreasuryReceipt | null {
   const m = map();
   if (!m) return null;
   const value = m.get(`receipt:${receiptId}`);
-  return isTreasuryReceipt(value) && value.receiptId === receiptId ? value : null;
+  if (!isTreasuryReceipt(value) || value.receiptId !== receiptId) return null;
+  return onNet(value.networkGenesisChallenge) ? value : null;
 }
 
 // ---------------------------------------------------------------------------

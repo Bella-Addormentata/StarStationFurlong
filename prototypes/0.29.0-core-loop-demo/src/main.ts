@@ -45,6 +45,10 @@ import {
   hasStoredIdentity,
 } from "./keypair";
 import { bindTreasuryDoc } from "./treasuryDoc";
+// Dev placeholder network pin for the treasury cache layer — deliberately
+// matches NO real chain genesis, so every foreign record is rejected until
+// real network configuration arrives with PR C (plan §17.5).
+const TREASURY_DEV_GENESIS = "0".repeat(64);
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
@@ -1211,8 +1215,14 @@ async function joinRoomAtEpoch(
   // writes can never split across docs.
   bindOffers(sync.doc);
   // 🏦 Treasury caches: signed display records over this room's doc (plan §14).
-  // Verify-on-read only — nothing here is authoritative (invariant 5).
-  bindTreasuryDoc(sync.doc, { verifySig: verifyIdentity });
+  // Verify-on-read only — nothing here is authoritative (invariant 5). The
+  // genesis pin (§17.5) rejects records from any other network; the value is
+  // a DEV PLACEHOLDER that matches no real chain — replace with the release
+  // network configuration when PR C wires real treasury flows.
+  bindTreasuryDoc(sync.doc, {
+    verifySig: verifyIdentity,
+    networkGenesisChallenge: TREASURY_DEV_GENESIS,
+  });
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
   (window as any).__ssfDoc = sync.doc;

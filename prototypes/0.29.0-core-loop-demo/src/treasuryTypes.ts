@@ -1032,6 +1032,31 @@ export function roomBindingSignatureBytes(
   });
 }
 
+/**
+ * A signing session's id IS the canonical hash of its immutable shell, so a
+ * "same session id, different shell" conflict is structurally impossible and
+ * cache layers can merge signature sets under an id without trusting anyone.
+ * Browser-side contract only for now (like roomBindingSignatureBytes); the
+ * PR F aggregation layer inherits it when sessions cross to the node.
+ */
+export function signingSessionIdOf(
+  shell: Omit<SigningSession, 'sessionId' | 'collectedSigs'>,
+): Hex32 {
+  return canonicalHashHex({
+    domain: 'ssf-signing-session:v1',
+    session: {
+      v: shell.v,
+      networkGenesisChallenge: shell.networkGenesisChallenge,
+      companyId: shell.companyId,
+      policyVersion: shell.policyVersion,
+      proposalId: shell.proposalId,
+      bundleHash: shell.bundleHash,
+      requiredThreshold: shell.requiredThreshold,
+      expiresAfterHeight: shell.expiresAfterHeight,
+    },
+  });
+}
+
 export function checkpointIdOf(
   checkpoint: Omit<TreasuryCheckpoint, 'checkpointId' | 'checkpointCoinId' | 'confirmedHeight'>,
 ): Hex32 {

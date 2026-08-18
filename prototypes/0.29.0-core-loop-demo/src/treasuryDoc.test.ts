@@ -21,6 +21,7 @@ import {
   proposalIdOf,
   proposalSignatureBytes,
   roomBindingSignatureBytes,
+  signingSessionIdOf,
   voteIdOf,
   voteSignatureBytes,
 } from './treasuryTypes';
@@ -117,7 +118,7 @@ let doc: Y.Doc;
 
 beforeEach(() => {
   doc = new Y.Doc();
-  bindTreasuryDoc(doc, { verifySig: verifier });
+  bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: GENESIS });
 });
 
 describe('proposals', () => {
@@ -247,7 +248,7 @@ describe('votes', () => {
     expect(surfacedA).toEqual(surfacedB);
     const canonical = pickCanonicalVote(va, vb);
     expect(canonical).toEqual(va.voteId < vb.voteId ? va : vb);
-    bindTreasuryDoc(doc, { verifySig: verifier });
+    bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: GENESIS });
     putVote(canonical);
     expect(readVote(proposalId, slotPub)).toEqual(canonical);
   });
@@ -257,7 +258,7 @@ describe('votes', () => {
     expect(putVote(v)).toBe(true);
     const other = new Y.Doc();
     Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
-    bindTreasuryDoc(other, { verifySig: verifier });
+    bindTreasuryDoc(other, { verifySig: verifier, networkGenesisChallenge: GENESIS });
     expect(readVote(proposalId, slotPub)).toEqual(v);
   });
 });
@@ -272,19 +273,24 @@ describe('policy, allowance, registration, windows, checkpoints', () => {
     expect(putPolicyCache({ ...policy, companyId: 'nope' } as CompanyTreasuryPolicy)).toBe(false);
   });
 
-  it('never replaces a policy cache with an older version, and refuses unencodable policies', () => {
+  it('stays replaceable — a planted max-version policy cannot brick the cache', () => {
     const policy = contracts.policy.value as CompanyTreasuryPolicy;
-    const v2 = { ...policy, policyVersion: 2 };
-    expect(putPolicyCache(v2)).toBe(true);
-    expect(putPolicyCache(policy)).toBe(false); // v1 cannot displace v2
-    expect(readPolicyCache()?.policy.policyVersion).toBe(2);
+    // Hostile raw write with an absurd version: guard-valid, but it must not
+    // block honest puts (invariant 5: caches are replaceable from chain
+    // state; version selection is the node's job, not this layer's).
+    const hostile = { ...policy, policyVersion: Number.MAX_SAFE_INTEGER };
+    doc.getMap('treasury').set('policy', hostile);
+    expect(putPolicyCache(policy)).toBe(true);
+    expect(readPolicyCache()?.policy.policyVersion).toBe(policy.policyVersion);
+  });
+
+  it('refuses unencodable policies at put and maps them to null on read', () => {
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
     // A lone surrogate passes the shape guard but not the encoder — put must
     // refuse it rather than caching a permanently unreadable entry.
-    const hostile = JSON.parse(JSON.stringify(v2)) as CompanyTreasuryPolicy;
+    const hostile = JSON.parse(JSON.stringify(policy)) as CompanyTreasuryPolicy;
     hostile.shareClasses[0].id = '\uD800';
-    hostile.policyVersion = 3;
     expect(putPolicyCache(hostile)).toBe(false);
-    // And if a peer raw-writes one, the read maps the encoder throw to null.
     doc.getMap('treasury').set('policy', hostile);
     expect(readPolicyCache()).toBeNull();
   });
@@ -339,6 +345,13 @@ describe('policy, allowance, registration, windows, checkpoints', () => {
     } as never;
     expect(putReceiptCache(confirmed)).toBe(true);
     expect(readReceiptCache('e'.repeat(64))).toEqual(confirmed);
+    // The slot is plain-replace (invariant 5): a planted same-id record can
+    // never brick honest re-puts — §13.1 body immutability is enforced where
+    // receipts are chain-verifiable, not by cache occupancy.
+    const planted = { ...(receipt as Record<string, unknown>), amount: '9999999' } as never;
+    doc.getMap('treasury').set(`receipt:${'e'.repeat(64)}`, planted);
+    expect(putReceiptCache(confirmed)).toBe(true);
+    expect(readReceiptCache('e'.repeat(64))).toEqual(confirmed);
   });
 
   it('replicates payloads content-addressed by their hash', () => {
@@ -376,62 +389,137 @@ describe('policy, allowance, registration, windows, checkpoints', () => {
 });
 
 describe('signing sessions', () => {
-  const base: SigningSession = {
-    v: 1,
-    sessionId: 'a1'.repeat(32),
+  const shell = {
+    v: 1 as const,
     networkGenesisChallenge: GENESIS,
     companyId: 'b'.repeat(64),
     policyVersion: 1,
     proposalId: 'c'.repeat(64),
     bundleHash: 'd'.repeat(64),
     requiredThreshold: 2,
-    collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-1' }],
     expiresAfterHeight: 100,
   };
+  const sessionId = signingSessionIdOf(shell);
+  const base: SigningSession = {
+    ...shell,
+    sessionId,
+    collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
+  };
 
-  it('merges signature sets and refuses conflicting shells', () => {
+  it('derives session ids from the shell and refuses undeciphered ids', () => {
+    expect(putSigningSession({ ...base, sessionId: 'a1'.repeat(32) })).toBe(false);
+    expect(putSigningSession(base)).toBe(true);
+    // A different bundleHash IS a different session (different derived id) —
+    // same-id shell conflicts are structurally impossible now.
+    const otherShell = { ...shell, bundleHash: '9'.repeat(64) };
+    const other: SigningSession = {
+      ...otherShell,
+      sessionId: signingSessionIdOf(otherShell),
+      collectedSigs: [],
+    };
+    expect(putSigningSession(other)).toBe(true);
+    expect(listSigningSessions(shell.proposalId)).toHaveLength(2);
+  });
+
+  it('unions signature sets across sequential puts, sorted by signer', () => {
     // Existing signer 'f' sorts AFTER the peer's 'e', so the sorted output
     // genuinely pins the sort (insertion order alone would be f-then-e).
-    const existing: SigningSession = {
+    expect(putSigningSession({
       ...base,
       collectedSigs: [{ signerPuzzleHash: 'f'.repeat(64), sig: 'sig-f' }],
-    };
-    expect(putSigningSession(existing)).toBe(true);
-    const fromPeer: SigningSession = {
-      ...base,
-      collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
-    };
-    expect(putSigningSession(fromPeer)).toBe(true);
-    const merged = listSigningSessions(base.proposalId);
+    })).toBe(true);
+    expect(putSigningSession(base)).toBe(true); // adds signer 'e'
+    const merged = listSigningSessions(shell.proposalId);
     expect(merged).toHaveLength(1);
     expect(merged[0].collectedSigs).toEqual([
       { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
       { signerPuzzleHash: 'f'.repeat(64), sig: 'sig-f' },
     ]);
-    // Conflicting shell refused — and the stored record keeps its sigs.
-    expect(putSigningSession({ ...base, bundleHash: '9'.repeat(64) })).toBe(false);
-    expect(listSigningSessions(base.proposalId)[0].collectedSigs).toHaveLength(2);
   });
 
-  it('per-signer conflicts resolve to the smaller sig regardless of order', () => {
-    const sigX = { signerPuzzleHash: 'e'.repeat(64), sig: 'aaa' };
-    const sigY = { signerPuzzleHash: 'e'.repeat(64), sig: 'bbb' };
-    expect(putSigningSession({ ...base, collectedSigs: [sigY] })).toBe(true);
-    expect(putSigningSession({ ...base, collectedSigs: [sigX] })).toBe(true);
-    expect(listSigningSessions(base.proposalId)[0].collectedSigs).toEqual([sigX]);
-    // Reversed arrival order converges identically (commutative merge).
-    bindTreasuryDoc(new Y.Doc(), { verifySig: verifier });
-    expect(putSigningSession({ ...base, collectedSigs: [sigX] })).toBe(true);
-    expect(putSigningSession({ ...base, collectedSigs: [sigY] })).toBe(true);
-    expect(listSigningSessions(base.proposalId)[0].collectedSigs).toEqual([sigX]);
+  it('CRDT sync itself unions signatures collected on partitioned replicas', () => {
+    expect(putSigningSession(base)).toBe(true); // replica A holds signer 'e'
+    const docB = new Y.Doc();
+    bindTreasuryDoc(docB, { verifySig: verifier, networkGenesisChallenge: GENESIS });
+    expect(putSigningSession({
+      ...base,
+      collectedSigs: [{ signerPuzzleHash: 'f'.repeat(64), sig: 'sig-f' }],
+    })).toBe(true); // replica B holds signer 'f'
+    // Heal the partition both ways — no application merge step runs.
+    const updA = Y.encodeStateAsUpdate(doc);
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(docB));
+    Y.applyUpdate(docB, updA);
+    for (const replica of [doc, docB]) {
+      bindTreasuryDoc(replica, { verifySig: verifier, networkGenesisChallenge: GENESIS });
+      expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([
+        { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
+        { signerPuzzleHash: 'f'.repeat(64), sig: 'sig-f' },
+      ]);
+    }
+  });
+
+  it('planted garbage cannot permanently shadow a signature; honest re-put restores', () => {
+    doc.getMap('treasury').set(`sessionsig:${sessionId}:${'e'.repeat(64)}`, {
+      signerPuzzleHash: 'e'.repeat(64),
+      sig: '!',
+    });
+    expect(putSigningSession(base)).toBe(true); // shell + honest re-put of 'e'
+    expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([
+      { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
+    ]);
+    // The subtler plant: the HONEST sig string under a mismatched signer
+    // field — dropped on read, so a naive value-only skip-check would let it
+    // shadow the signature forever. The re-put must overwrite it.
+    doc.getMap('treasury').set(`sessionsig:${sessionId}:${'e'.repeat(64)}`, {
+      signerPuzzleHash: '9'.repeat(64),
+      sig: 'sig-e',
+    });
+    expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([]);
+    expect(putSigningSession(base)).toBe(true);
+    expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([
+      { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
+    ]);
+  });
+
+  it('a shell bloated with embedded sigs is scrubbed by an honest put', () => {
+    doc.getMap('treasury').set(`session:${shell.proposalId}:${sessionId}`, {
+      ...shell,
+      sessionId,
+      collectedSigs: [{ signerPuzzleHash: 'f'.repeat(64), sig: 'x'.repeat(1000) }],
+    });
+    expect(putSigningSession(base)).toBe(true);
+    const stored = doc.getMap('treasury').get(`session:${shell.proposalId}:${sessionId}`);
+    expect((stored as SigningSession).collectedSigs).toEqual([]); // bloat scrubbed
   });
 
   it('a misfiled valid session cannot brick the slot', () => {
-    const squatter: SigningSession = { ...base, sessionId: 'b2'.repeat(32) };
-    doc.getMap('treasury').set(`session:${base.proposalId}:${base.sessionId}`, squatter);
-    expect(listSigningSessions(base.proposalId)).toEqual([]); // key mismatch skipped
+    const otherShell = { ...shell, bundleHash: '9'.repeat(64) };
+    const squatter: SigningSession = {
+      ...otherShell,
+      sessionId: signingSessionIdOf(otherShell),
+      collectedSigs: [],
+    };
+    doc.getMap('treasury').set(`session:${shell.proposalId}:${sessionId}`, squatter);
+    expect(listSigningSessions(shell.proposalId)).toEqual([]); // slot-claim mismatch
     expect(putSigningSession(base)).toBe(true); // overwrites the squatter
-    expect(listSigningSessions(base.proposalId)).toEqual([base]);
+    expect(listSigningSessions(shell.proposalId)).toEqual([base]);
+  });
+});
+
+describe('network pinning', () => {
+  it('rejects correctly signed records from another network', () => {
+    const foreign = makeProposal({ networkGenesisChallenge: 'b'.repeat(64) });
+    expect(putProposal(foreign)).toBe(false); // valid signature, wrong net
+    doc.getMap('treasury').set(`proposal:${foreign.proposalId}`, foreign);
+    expect(readProposal(foreign.proposalId)).toBeNull();
+    expect(listProposals()).toEqual([]);
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
+    // The vector policy's genesis is 'a'*64 == GENESIS, so it puts fine —
+    // rebind to another net and the same policy is refused and unreadable.
+    expect(putPolicyCache(policy)).toBe(true);
+    bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: 'f'.repeat(64) });
+    expect(putPolicyCache(policy)).toBe(false);
+    expect(readPolicyCache()).toBeNull();
   });
 });
 

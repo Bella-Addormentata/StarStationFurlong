@@ -28,6 +28,7 @@ import {
   isUnsignedTreasuryVote,
   payloadHashOf,
   roomBindingSignatureBytes,
+  signingSessionIdOf,
   voteSignatureBytes,
   type ProposalRegistration,
   type TreasuryProposalKind,
@@ -563,6 +564,27 @@ describe('contract guards', () => {
     expect(hex(roomBindingSignatureBytes({ ...base, networkGenesisChallenge: 'b'.repeat(64) }))).not.toBe(bytes);
     expect(hex(roomBindingSignatureBytes({ ...base, expiresAfterHeight: 9 }))).not.toBe(bytes);
     expect(hex(roomBindingSignatureBytes(base))).toBe(bytes); // deterministic
+  });
+
+  it('signingSessionIdOf is deterministic and sensitive to every shell field', () => {
+    const shell = {
+      v: 1 as const,
+      networkGenesisChallenge: 'a'.repeat(64),
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'c'.repeat(64),
+      bundleHash: 'd'.repeat(64),
+      requiredThreshold: 2,
+      expiresAfterHeight: 100,
+    };
+    const id = signingSessionIdOf(shell);
+    expect(isHex32(id)).toBe(true);
+    expect(signingSessionIdOf(shell)).toBe(id);
+    expect(signingSessionIdOf({ ...shell, bundleHash: '9'.repeat(64) })).not.toBe(id);
+    expect(signingSessionIdOf({ ...shell, requiredThreshold: 3 })).not.toBe(id);
+    expect(signingSessionIdOf({ ...shell, expiresAfterHeight: 101 })).not.toBe(id);
+    expect(signingSessionIdOf({ ...shell, proposalId: '9'.repeat(64) })).not.toBe(id);
+    expect(signingSessionIdOf({ ...shell, networkGenesisChallenge: '9'.repeat(64) })).not.toBe(id);
   });
 
   it('isShareClassPolicy and compareMojoStrings behave at the edges', () => {
