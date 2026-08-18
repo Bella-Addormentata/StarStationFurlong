@@ -350,6 +350,14 @@ export interface TreasuryExecutionRequestBody {
   authorityVersion: number;
   operation: TreasuryOperation;
   payloadHash: Hex32;
+  /**
+   * The exact allowance state coin this request authorizes consuming. Binding
+   * the signed body to one state-coin generation makes replay structurally
+   * impossible once the state advances — the named coin no longer exists — with
+   * no used-id ledger to maintain. The allowance puzzle MUST assert that the
+   * spend consumes this coin (serverless plan §3).
+   */
+  stateCoinId: Hex32;
   expiresAfterHeight: number;
 }
 
@@ -429,6 +437,12 @@ export type CanonicalValue =
 
 const utf8 = new TextEncoder();
 
+// TextEncoder silently folds an unpaired UTF-16 surrogate to U+FFFD, which
+// would make distinct JS strings hash identically — and Rust strings cannot
+// represent lone surrogates at all, so such inputs must be rejected, not
+// normalized, to keep cross-runtime acceptance parity.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 function encodeHead(major: number, arg: number, out: number[]): void {
   const base = major << 5;
   if (arg < 24) {
@@ -478,6 +492,9 @@ function encodeInto(value: CanonicalValue, out: number[]): void {
       return;
     }
     case 'string': {
+      if (LONE_SURROGATE.test(value)) {
+        throw new Error('canonicalEncode: string contains an unpaired surrogate');
+      }
       const bytes = utf8.encode(value);
       encodeHead(3, bytes.length, out);
       for (const b of bytes) out.push(b);
@@ -488,6 +505,13 @@ function encodeInto(value: CanonicalValue, out: number[]): void {
         encodeHead(4, value.length, out);
         for (const item of value) encodeInto(item, out);
         return;
+      }
+      // Class instances encode only their enumerable own fields (e.g. a Date
+      // becomes the same bytes as {}), which has no Rust/JSON equivalent —
+      // only plain objects are part of the canonical profile.
+      const proto = Object.getPrototypeOf(value);
+      if (proto !== Object.prototype && proto !== null) {
+        throw new Error('canonicalEncode: only plain objects are encodable');
       }
       const entries: { key: Uint8Array; val: Uint8Array }[] = [];
       for (const [k, v] of Object.entries(value)) {
@@ -715,7 +739,13 @@ export function voteRootOf(voteIds: Hex32[]): Hex32 {
  * tree is tall. Throws if targetId is not among the (distinct) vote ids.
  */
 export function voteInclusionStepsOf(voteIds: Hex32[], targetId: Hex32): MerkleStep[] {
+  if (!isHex32(targetId)) {
+    throw new Error('voteInclusionStepsOf: targetId must be Hex32');
+  }
   const unique = [...new Set(voteIds)].sort();
+  for (const id of unique) {
+    if (!isHex32(id)) throw new Error('voteInclusionStepsOf: vote ids must be Hex32');
+  }
   let index = unique.indexOf(targetId);
   if (index < 0) {
     throw new Error('voteInclusionStepsOf: targetId is not in voteIds');
@@ -746,14 +776,25 @@ export function voteInclusionStepsOf(voteIds: Hex32[], targetId: Hex32): MerkleS
   return steps;
 }
 
+/**
+ * A promoted-odd-node tree over distinct 32-byte ids can never be deeper than
+ * 64 levels; anything longer is garbage, and proofs arrive over gossip, so the
+ * bound is checked before the per-step hashing work (plan §12 guard rules).
+ */
+const MAX_PROOF_STEPS = 64;
+
 export function verifyVoteInclusion(
   voteId: Hex32,
   steps: MerkleStep[],
   voteRoot: Hex32,
 ): boolean {
   if (!isHex32(voteId) || !isHex32(voteRoot)) return false;
+  if (!Array.isArray(steps) || steps.length > MAX_PROOF_STEPS) return false;
   let acc = merkleLeaf(voteId);
   for (const step of steps) {
+    // Proofs arrive as gossip-decoded JSON: stay total (false, never throw).
+    if (typeof step !== 'object' || step === null) return false;
+    if (step.side !== 'left' && step.side !== 'right') return false;
     if (!isHex32(step.hash)) return false;
     const sibling = hexToBytes(step.hash);
     acc = step.side === 'left' ? merkleNode(sibling, acc) : merkleNode(acc, sibling);

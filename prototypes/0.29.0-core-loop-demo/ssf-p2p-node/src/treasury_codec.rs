@@ -298,7 +298,17 @@ pub fn checkpoint_id_of(body: &Value) -> Result<String> {
 // leaf = sha256(0x00 || vote_id_bytes); node = sha256(0x01 || left || right);
 // distinct leaves sorted bytewise; an odd node is PROMOTED, never duplicated.
 
+/// Mirrors TypeScript isHex32: exactly 64 LOWERCASE hex characters. Uppercase
+/// would decode to the same bytes but survive string-level dedup/sort as a
+/// distinct leaf, breaking the distinct-leaves-sorted-bytewise invariant.
+fn is_hex32(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn merkle_leaf(vote_id: &str) -> Result<[u8; 32]> {
+    if !is_hex32(vote_id) {
+        bail!("vote_root_of: vote ids must be Hex32");
+    }
     let bytes = hex::decode(vote_id)?;
     let mut hasher = Sha256::new();
     hasher.update([0x00]);
@@ -345,27 +355,61 @@ pub fn vote_root_of(vote_ids: &[String]) -> Result<String> {
 // Pure function of the on-chain registration and the policy-committed rule —
 // no serviceSig, nothing to trust. Every node derives identical deadlines.
 
+const MAX_SAFE: i64 = 9_007_199_254_740_991;
+
+/// Mirrors TypeScript isGovernanceKindRule field-for-field: bps fields are
+/// integers in 0..=10000, passRule is one of the three enum strings, block
+/// counts are integers in 0..=MAX_SAFE — so both runtimes reject the same
+/// malformed rules, not just derive the same windows from accepted ones.
+fn is_governance_kind_rule(rule: &Value) -> bool {
+    let bps = |key: &str| -> bool {
+        rule.get(key)
+            .and_then(Value::as_i64)
+            .is_some_and(|n| (0..=10_000).contains(&n))
+    };
+    let blocks = |key: &str| -> bool {
+        rule.get(key)
+            .and_then(Value::as_i64)
+            .is_some_and(|n| (0..=MAX_SAFE).contains(&n))
+    };
+    let pass_rule = matches!(
+        rule.get("passRule").and_then(Value::as_str),
+        Some("majority-cast" | "supermajority-cast" | "supermajority-total-supply")
+    );
+    bps("proposalThresholdBps")
+        && pass_rule
+        && bps("yesThresholdBps")
+        && bps("quorumBps")
+        && bps("vetoBps")
+        && blocks("votingBlocks")
+        && blocks("vetoBlocks")
+        && blocks("implementationDelayBlocks")
+        && blocks("executionWindowBlocks")
+}
+
 pub fn derive_proposal_windows(registration: &Value, rule: &Value) -> Result<Value> {
     let accepted = field(registration, "acceptedHeight")?
         .as_i64()
         .ok_or_else(|| anyhow!("acceptedHeight must be an integer"))?;
-    if accepted < 0 {
-        bail!("acceptedHeight must be >= 0");
+    if !(0..=MAX_SAFE).contains(&accepted) {
+        bail!("acceptedHeight is not a block height");
+    }
+    if !is_governance_kind_rule(rule) {
+        bail!("derive_proposal_windows: malformed GovernanceKindRule");
     }
     let blocks = |key: &str| -> Result<i64> {
-        let n = field(rule, key)?
+        field(rule, key)?
             .as_i64()
-            .ok_or_else(|| anyhow!("{key} must be an integer"))?;
-        if n < 0 {
-            bail!("{key} must be >= 0");
-        }
-        Ok(n)
+            .ok_or_else(|| anyhow!("{key} must be an integer"))
     };
-    let voting_ends = accepted + blocks("votingBlocks")?;
-    let veto_ends = voting_ends + blocks("vetoBlocks")?;
-    let executable_from = veto_ends + blocks("implementationDelayBlocks")?;
-    let expires_after = executable_from + blocks("executionWindowBlocks")?;
-    const MAX_SAFE: i64 = 9_007_199_254_740_991;
+    let add = |a: i64, b: i64| -> Result<i64> {
+        a.checked_add(b)
+            .ok_or_else(|| anyhow!("derive_proposal_windows: window heights overflow"))
+    };
+    let voting_ends = add(accepted, blocks("votingBlocks")?)?;
+    let veto_ends = add(voting_ends, blocks("vetoBlocks")?)?;
+    let executable_from = add(veto_ends, blocks("implementationDelayBlocks")?)?;
+    let expires_after = add(executable_from, blocks("executionWindowBlocks")?)?;
     if expires_after > MAX_SAFE {
         bail!("derive_proposal_windows: window heights overflow");
     }
@@ -499,6 +543,40 @@ mod treasury_codec_tests {
             "root must be order-independent"
         );
         assert!(vote_root_of(&[]).is_err());
+    }
+
+    #[test]
+    fn vote_tree_rejects_malformed_ids() {
+        // Mirrors TypeScript voteRootOf: exactly 64 lowercase hex — decodable
+        // hex of other shapes must not produce a root.
+        assert!(vote_root_of(&["00".to_string()]).is_err());
+        assert!(vote_root_of(&["A".repeat(64)]).is_err());
+        assert!(vote_root_of(&[format!("A{}", "a".repeat(63))]).is_err());
+    }
+
+    #[test]
+    fn window_derivation_rejects_malformed_input() {
+        let v = load(CONTRACT_VECTORS);
+        let reg = &v["windows"]["registration"];
+        let rule = &v["windows"]["rule"];
+        // acceptedHeight beyond the shared JS safe range is not a block height.
+        let mut big = reg.clone();
+        big["acceptedHeight"] = serde_json::json!(i64::MAX);
+        assert!(derive_proposal_windows(&big, rule).is_err());
+        // Heights that sum past MAX_SAFE overflow (mirrors the TS guard test).
+        let mut near = reg.clone();
+        near["acceptedHeight"] = serde_json::json!(MAX_SAFE - 10);
+        assert!(derive_proposal_windows(&near, rule).is_err());
+        // Rules TypeScript rejects must be rejected here too.
+        let mut bad_bps = rule.clone();
+        bad_bps["vetoBps"] = serde_json::json!(10_001);
+        assert!(derive_proposal_windows(reg, &bad_bps).is_err());
+        let mut bad_pass = rule.clone();
+        bad_pass["passRule"] = serde_json::json!(42);
+        assert!(derive_proposal_windows(reg, &bad_pass).is_err());
+        let mut neg = rule.clone();
+        neg["votingBlocks"] = serde_json::json!(-1);
+        assert!(derive_proposal_windows(reg, &neg).is_err());
     }
 
     #[test]

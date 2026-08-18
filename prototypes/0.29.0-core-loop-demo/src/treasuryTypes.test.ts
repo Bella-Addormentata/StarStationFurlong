@@ -11,6 +11,7 @@ import {
   type CanonicalValue,
   type CompanyTreasuryPolicy,
   type GovernanceKindRule,
+  type MerkleStep,
   type ProposalRegistration,
   type TreasuryProposalKind,
   type UnsignedTreasuryProposal,
@@ -60,6 +61,20 @@ describe('canonical CBOR golden vectors', () => {
     expect(() => canonicalEncode(Number.NaN)).toThrow();
     expect(() => canonicalEncode(Number.MAX_SAFE_INTEGER + 1)).toThrow();
     expect(() => canonicalEncode({ a: undefined } as unknown as CanonicalValue)).toThrow();
+  });
+
+  it('rejects unpaired surrogates but accepts well-formed non-ASCII', () => {
+    expect(() => canonicalEncode('\uD800')).toThrow();
+    expect(() => canonicalEncode('a\uDC00b')).toThrow();
+    expect(() => canonicalEncode({ key: '\uDBFF' } as CanonicalValue)).toThrow();
+    expect(() => canonicalEncode({ ['\uD800']: 1 } as CanonicalValue)).toThrow();
+    expect(() => canonicalEncode('🚀')).not.toThrow();
+  });
+
+  it('rejects non-plain objects that would encode as their enumerable fields', () => {
+    expect(() => canonicalEncode(new Date() as unknown as CanonicalValue)).toThrow();
+    expect(() => canonicalEncode(new Map() as unknown as CanonicalValue)).toThrow();
+    expect(() => canonicalEncode(Object.create(null) as CanonicalValue)).not.toThrow();
   });
 });
 
@@ -149,6 +164,25 @@ describe('vote inclusion proofs', () => {
   it('refuses an empty checkpoint and unknown targets', () => {
     expect(() => voteRootOf([])).toThrow();
     expect(() => voteInclusionStepsOf(ids, 'f'.repeat(64))).toThrow();
+  });
+
+  it('rejects malformed ids, oversized proofs, and unknown step sides', () => {
+    expect(() => voteInclusionStepsOf(['aa'], 'aa')).toThrow();
+    expect(() => voteInclusionStepsOf([...ids, 'A'.repeat(64)], ids[0])).toThrow();
+    // The smallest sorted leaf's proof is all 'right' steps, so an unknown
+    // side that silently defaulted to 'right' would still verify — it must not.
+    const sorted = [...ids].sort();
+    const proof = voteInclusionStepsOf(ids, sorted[0]);
+    const mangled = proof.map((s) => ({ ...s, side: 'up' as MerkleStep['side'] }));
+    expect(verifyVoteInclusion(sorted[0], mangled, root)).toBe(false);
+    const oversized = Array.from({ length: 65 }, () => ({
+      side: 'left' as const,
+      hash: '0'.repeat(64),
+    }));
+    expect(verifyVoteInclusion(sorted[0], oversized, root)).toBe(false);
+    // Gossip-decoded JSON can hold anything — the verifier must stay total.
+    expect(verifyVoteInclusion(sorted[0], [null] as unknown as MerkleStep[], root)).toBe(false);
+    expect(verifyVoteInclusion(sorted[0], 'nope' as unknown as MerkleStep[], root)).toBe(false);
   });
 });
 
