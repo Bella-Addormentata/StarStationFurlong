@@ -16,7 +16,19 @@ import {
   compareMojoStrings,
   isCompanyTreasuryPolicy,
   isDeviceAllowance,
+  isProposalRegistration,
+  isProposalWindows,
+  isRoomTreasuryBinding,
   isShareClassPolicy,
+  isSigningSession,
+  isTreasuryCheckpoint,
+  isTreasuryProposal,
+  isTreasuryReceipt,
+  isTreasuryVote,
+  isUnsignedTreasuryVote,
+  payloadHashOf,
+  roomBindingSignatureBytes,
+  voteSignatureBytes,
   type ProposalRegistration,
   type TreasuryProposalKind,
   type UnsignedTreasuryProposal,
@@ -104,6 +116,20 @@ describe('contract golden vectors (TS<->Rust parity fixtures)', () => {
     expect(
       hex(proposalSignatureBytes(unsigned.networkGenesisChallenge, contracts.proposal.proposalId)),
     ).toBe(contracts.proposal.signatureBytesHex);
+  });
+
+  it('reproduces the vote signature bytes', () => {
+    const unsigned = contracts.vote.unsigned as UnsignedTreasuryVote;
+    expect(hex(voteSignatureBytes(unsigned.networkGenesisChallenge, contracts.vote.voteId))).toBe(
+      contracts.vote.signatureBytesHex,
+    );
+  });
+
+  it('reproduces the payload content address and rejects non-byte hex', () => {
+    expect(payloadHashOf(contracts.payload.payloadHex)).toBe(contracts.payload.payloadHash);
+    expect(() => payloadHashOf('')).toThrow();
+    expect(() => payloadHashOf('abc')).toThrow(); // odd length
+    expect(() => payloadHashOf('AB')).toThrow(); // uppercase
   });
 
   it('reproduces the vote id, vote root, and checkpoint id', () => {
@@ -408,6 +434,135 @@ describe('contract guards', () => {
     a = cloneAllowance();
     a.startsAtHeight = -1;
     expect(isDeviceAllowance(a)).toBe(false);
+  });
+
+  it('record guards accept vector-shaped records and reject mutations', () => {
+    const unsignedVote = contracts.vote.unsigned;
+    expect(isUnsignedTreasuryVote(unsignedVote)).toBe(true);
+    const vote = { ...unsignedVote, voteId: contracts.vote.voteId, gameSig: 'sig' };
+    expect(isTreasuryVote(vote)).toBe(true);
+    expect(isTreasuryVote({ ...vote, sequence: -1 })).toBe(false);
+    expect(isTreasuryVote({ ...vote, choice: 'maybe' })).toBe(false);
+    expect(isTreasuryVote({ ...vote, gameSig: '' })).toBe(false);
+
+    const proposal = {
+      ...contracts.proposal.unsigned,
+      proposalId: contracts.proposal.proposalId,
+      proposerSig: 'sig',
+    };
+    expect(isTreasuryProposal(proposal)).toBe(true);
+    expect(isTreasuryProposal({ ...proposal, kind: 'coup' })).toBe(false);
+    expect(isTreasuryProposal({ ...proposal, proposalId: 'short' })).toBe(false);
+
+    const checkpoint = {
+      ...contracts.checkpoint.body,
+      checkpointId: contracts.checkpoint.checkpointId,
+    };
+    expect(isTreasuryCheckpoint(checkpoint)).toBe(true);
+    expect(isTreasuryCheckpoint({ ...checkpoint, voteCount: 0 })).toBe(false);
+    expect(isTreasuryCheckpoint({ ...checkpoint, confirmedHeight: -1 })).toBe(false);
+
+    expect(isProposalRegistration(contracts.windows.registration)).toBe(true);
+    expect(isProposalRegistration({ ...contracts.windows.registration, acceptedHeight: 1.5 })).toBe(false);
+    expect(isProposalWindows(contracts.windows.derived)).toBe(true);
+    expect(isProposalWindows({ ...contracts.windows.derived, votingEndsHeight: 0 })).toBe(false); // non-monotonic
+    expect(isProposalWindows({ ...contracts.windows.derived, snapshotHeight: 1 })).toBe(false); // v1 pin broken
+    expect(isProposalWindows({ ...contracts.windows.derived, snapshotBlockHash: '9'.repeat(64) }))
+      .toBe(false); // block-hash half of the v1 pin
+
+    const session = {
+      v: 1,
+      sessionId: 'a'.repeat(64),
+      networkGenesisChallenge: 'a'.repeat(64),
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'c'.repeat(64),
+      bundleHash: 'd'.repeat(64),
+      requiredThreshold: 2,
+      collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 's1' }],
+      expiresAfterHeight: 10,
+    };
+    expect(isSigningSession(session)).toBe(true);
+    expect(isSigningSession({ ...session, requiredThreshold: 0 })).toBe(false);
+    expect(isSigningSession({
+      ...session,
+      collectedSigs: [...session.collectedSigs, ...session.collectedSigs], // duplicate signer
+    })).toBe(false);
+
+    const receipt = {
+      v: 1,
+      receiptId: 'a'.repeat(64),
+      networkGenesisChallenge: 'a'.repeat(64),
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      operation: 'casino-settle',
+      authorization: { kind: 'allowance', allowanceId: 'c'.repeat(64) },
+      requestId: 'd'.repeat(64),
+      spendBundleId: 'e'.repeat(64),
+      assetId: 'xch',
+      amount: '1000',
+      destinations: ['f'.repeat(64)],
+    };
+    expect(isTreasuryReceipt(receipt)).toBe(true);
+    expect(isTreasuryReceipt({ ...receipt, operation: 'mint' })).toBe(false);
+    expect(isTreasuryReceipt({ ...receipt, authorization: { kind: 'divine-right' } })).toBe(false);
+    expect(isTreasuryReceipt({ ...receipt, destinations: [] })).toBe(false);
+    // Confirmation is both-or-neither.
+    expect(isTreasuryReceipt({ ...receipt, confirmedHeight: 5 })).toBe(false);
+    expect(isTreasuryReceipt({ ...receipt, confirmedBlockHash: '9'.repeat(64) })).toBe(false);
+    expect(isTreasuryReceipt({
+      ...receipt, confirmedHeight: 5, confirmedBlockHash: '9'.repeat(64),
+    })).toBe(true);
+  });
+
+  it('isRoomTreasuryBinding enforces its shape and expiry invariant', () => {
+    const binding = {
+      v: 1,
+      networkGenesisChallenge: 'a'.repeat(64),
+      roomId: 'room-1',
+      companyId: 'b'.repeat(64),
+      treasuryLauncherId: 'c'.repeat(64),
+      policyVersion: 1,
+      profileId: 'p1',
+      boundByPub: 'pub',
+      boundAtHeight: 10,
+      policyReceiptId: 'd'.repeat(64),
+      sig: 'sig',
+    };
+    expect(isRoomTreasuryBinding(binding)).toBe(true);
+    expect(isRoomTreasuryBinding({ ...binding, expiresAfterHeight: 20 })).toBe(true);
+    expect(isRoomTreasuryBinding({ ...binding, expiresAfterHeight: 10 })).toBe(false); // not after
+    expect(isRoomTreasuryBinding({ ...binding, expiresAfterHeight: null })).toBe(false); // omitted, never null
+    expect(isRoomTreasuryBinding({ ...binding, roomId: '' })).toBe(false);
+    expect(isRoomTreasuryBinding({ ...binding, sig: '' })).toBe(false);
+  });
+
+  it('roomBindingSignatureBytes commits every field including absent options', () => {
+    const base = {
+      v: 1 as const,
+      networkGenesisChallenge: 'a'.repeat(64),
+      roomId: 'room-1',
+      companyId: 'b'.repeat(64),
+      treasuryLauncherId: 'c'.repeat(64),
+      policyVersion: 1,
+      profileId: 'p1',
+      boundByPub: 'pub',
+      boundAtHeight: 5,
+      policyReceiptId: 'd'.repeat(64),
+    };
+    const bytes = hex(roomBindingSignatureBytes(base));
+    // Every field perturbs the signed bytes — a dropped field would collide.
+    expect(hex(roomBindingSignatureBytes({ ...base, roomId: 'room-2' }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, companyId: 'e'.repeat(64) }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, treasuryLauncherId: 'f'.repeat(64) }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, policyVersion: 2 }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, profileId: 'p2' }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, boundByPub: 'other' }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, boundAtHeight: 6 }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, policyReceiptId: 'e'.repeat(64) }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, networkGenesisChallenge: 'b'.repeat(64) }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes({ ...base, expiresAfterHeight: 9 }))).not.toBe(bytes);
+    expect(hex(roomBindingSignatureBytes(base))).toBe(bytes); // deterministic
   });
 
   it('isShareClassPolicy and compareMojoStrings behave at the edges', () => {

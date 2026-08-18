@@ -38,11 +38,13 @@ import {
   getIdentityFingerprint,
   signNameCert,
   verifyNameCert,
+  verifyIdentity,
   exportRecoveryKey,
   importRecoveryKey,
   ysyncSigner,
   hasStoredIdentity,
 } from "./keypair";
+import { bindTreasuryDoc } from "./treasuryDoc";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
@@ -1208,6 +1210,9 @@ async function joinRoomAtEpoch(
   // ride the same doc — bound here so redeem/revoke and the venture-map
   // writes can never split across docs.
   bindOffers(sync.doc);
+  // 🏦 Treasury caches: signed display records over this room's doc (plan §14).
+  // Verify-on-read only — nothing here is authoritative (invariant 5).
+  bindTreasuryDoc(sync.doc, { verifySig: verifyIdentity });
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
   (window as any).__ssfDoc = sync.doc;

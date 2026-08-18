@@ -564,6 +564,167 @@ export function isDeviceAllowance(value: unknown): value is DeviceAllowance {
   return true;
 }
 
+export function isUnsignedTreasuryProposal(value: unknown): value is UnsignedTreasuryProposal {
+  if (!isPlainObject(value)) return false;
+  return value.v === 1
+    && isHex32(value.networkGenesisChallenge)
+    && isHex32(value.companyId)
+    && isPolicyVersion(value.policyVersion)
+    && (PROPOSAL_KINDS as readonly string[]).includes(value.kind as string)
+    && isHex32(value.payloadHash)
+    && isNonEmptyString(value.proposerPub);
+}
+
+export function isTreasuryProposal(value: unknown): value is TreasuryProposal {
+  if (!isUnsignedTreasuryProposal(value)) return false;
+  const p = value as unknown as Record<string, unknown>;
+  return isHex32(p.proposalId) && isNonEmptyString(p.proposerSig);
+}
+
+export function isUnsignedTreasuryVote(value: unknown): value is UnsignedTreasuryVote {
+  if (!isPlainObject(value)) return false;
+  return value.v === 1
+    && isHex32(value.networkGenesisChallenge)
+    && isHex32(value.proposalId)
+    && isHex32(value.voterPuzzleHash)
+    && isNonEmptyString(value.voterGamePub)
+    && (value.choice === 'yes' || value.choice === 'no'
+      || value.choice === 'abstain' || value.choice === 'veto')
+    && Number.isSafeInteger(value.sequence)
+    && (value.sequence as number) >= 0
+    && isNonEmptyString(value.chiaAddressProof);
+}
+
+export function isTreasuryVote(value: unknown): value is TreasuryVote {
+  if (!isUnsignedTreasuryVote(value)) return false;
+  const v = value as unknown as Record<string, unknown>;
+  return isHex32(v.voteId) && isNonEmptyString(v.gameSig);
+}
+
+export function isTreasuryCheckpoint(value: unknown): value is TreasuryCheckpoint {
+  if (!isPlainObject(value)) return false;
+  return value.v === 1
+    && isHex32(value.checkpointId)
+    && isHex32(value.networkGenesisChallenge)
+    && isHex32(value.companyId)
+    && isHex32(value.proposalId)
+    && isHex32(value.voteRoot)
+    && Number.isSafeInteger(value.voteCount)
+    // voteRootOf refuses an empty checkpoint, so a valid count is >= 1.
+    && (value.voteCount as number) >= 1
+    && isNonEmptyString(value.publisherPub)
+    && (value.checkpointCoinId === undefined || isHex32(value.checkpointCoinId))
+    && (value.confirmedHeight === undefined || isBlockHeight(value.confirmedHeight));
+}
+
+export function isSigningSession(value: unknown): value is SigningSession {
+  if (!isPlainObject(value)) return false;
+  if (value.v !== 1) return false;
+  if (!isHex32(value.sessionId) || !isHex32(value.networkGenesisChallenge)
+    || !isHex32(value.companyId) || !isHex32(value.proposalId)
+    || !isHex32(value.bundleHash)) return false;
+  if (!isPolicyVersion(value.policyVersion)) return false;
+  if (!Number.isSafeInteger(value.requiredThreshold)
+    || (value.requiredThreshold as number) < 1) return false;
+  const sigs = value.collectedSigs;
+  if (!Array.isArray(sigs)) return false;
+  for (const s of sigs) {
+    if (!isPlainObject(s) || !isHex32(s.signerPuzzleHash) || !isNonEmptyString(s.sig)) {
+      return false;
+    }
+  }
+  if (!allDistinct(sigs.map((s) => (s as { signerPuzzleHash: string }).signerPuzzleHash))) {
+    return false;
+  }
+  return isBlockHeight(value.expiresAfterHeight);
+}
+
+export function isProposalRegistration(value: unknown): value is ProposalRegistration {
+  if (!isPlainObject(value)) return false;
+  return value.v === 1
+    && isHex32(value.proposalId)
+    && isPolicyVersion(value.policyVersion)
+    && (PROPOSAL_KINDS as readonly string[]).includes(value.kind as string)
+    && isHex32(value.registrationCoinId)
+    && isBlockHeight(value.acceptedHeight)
+    && isHex32(value.acceptedBlockHash);
+}
+
+export function isProposalWindows(value: unknown): value is ProposalWindows {
+  if (!isPlainObject(value)) return false;
+  if (value.v !== 1) return false;
+  if (!isHex32(value.proposalId) || !isHex32(value.governanceRuleHash)
+    || !isHex32(value.registrationCoinId) || !isHex32(value.acceptedBlockHash)
+    || !isHex32(value.snapshotBlockHash)) return false;
+  if (!isPolicyVersion(value.policyVersion)) return false;
+  const heights = [
+    value.acceptedHeight, value.snapshotHeight, value.votingEndsHeight,
+    value.vetoEndsHeight, value.executableFromHeight, value.expiresAfterHeight,
+  ];
+  if (!heights.every(isBlockHeight)) return false;
+  const [accepted, snapshot, voting, veto, executable, expires] = heights as number[];
+  // v1 rule: the snapshot (height AND block hash) is pinned at the
+  // registration, and windows only ever extend forward. (deriveProposalWindows
+  // is the real authority — recompute to trust; this guard just refuses
+  // obviously broken caches.)
+  return snapshot === accepted
+    && value.snapshotBlockHash === value.acceptedBlockHash
+    && accepted <= voting && voting <= veto && veto <= executable && executable <= expires;
+}
+
+export function isRoomTreasuryBinding(value: unknown): value is RoomTreasuryBinding {
+  if (!isPlainObject(value)) return false;
+  return value.v === 1
+    && isHex32(value.networkGenesisChallenge)
+    && isNonEmptyString(value.roomId)
+    && isHex32(value.companyId)
+    && isHex32(value.treasuryLauncherId)
+    && isPolicyVersion(value.policyVersion)
+    && isNonEmptyString(value.profileId)
+    && isNonEmptyString(value.boundByPub)
+    && isBlockHeight(value.boundAtHeight)
+    && (value.expiresAfterHeight === undefined
+      || (isBlockHeight(value.expiresAfterHeight)
+        && (value.expiresAfterHeight as number) > (value.boundAtHeight as number)))
+    && isHex32(value.policyReceiptId)
+    && isNonEmptyString(value.sig);
+}
+
+export function isTreasuryReceipt(value: unknown): value is TreasuryReceipt {
+  if (!isPlainObject(value)) return false;
+  if (value.v !== 1) return false;
+  if (!isHex32(value.receiptId) || !isHex32(value.networkGenesisChallenge)
+    || !isHex32(value.companyId) || !isHex32(value.requestId)
+    || !isHex32(value.spendBundleId)) return false;
+  if (!isPolicyVersion(value.policyVersion)) return false;
+  if (!(TREASURY_OPERATIONS as readonly string[]).includes(value.operation as string)) {
+    return false;
+  }
+  const auth = value.authorization;
+  if (!isPlainObject(auth)) return false;
+  if (auth.kind === 'proposal') {
+    if (!isHex32(auth.proposalId)) return false;
+  } else if (auth.kind === 'allowance') {
+    if (!isHex32(auth.allowanceId)) return false;
+  } else {
+    return false;
+  }
+  if (value.assetId !== 'xch' && !isHex32(value.assetId)) return false;
+  if (!isMojoString(value.amount)) return false;
+  // Destinations are the spend's actual outputs, so repeats are legal —
+  // unlike DeviceAllowance.destinationPuzzleHashes, which is an allowlist
+  // with set semantics and therefore requires distinctness.
+  const dests = value.destinations;
+  if (!Array.isArray(dests) || dests.length === 0 || !dests.every(isHex32)) return false;
+  // Confirmation stamps height and block hash together — both or neither.
+  if ((value.confirmedHeight === undefined) !== (value.confirmedBlockHash === undefined)) {
+    return false;
+  }
+  if (value.confirmedHeight !== undefined && !isBlockHeight(value.confirmedHeight)) return false;
+  if (value.confirmedBlockHash !== undefined && !isHex32(value.confirmedBlockHash)) return false;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // SSF deterministic CBOR (profile in the header comment)
 // ---------------------------------------------------------------------------
@@ -690,6 +851,20 @@ export function canonicalHashHex(value: CanonicalValue): Hex32 {
 }
 
 /**
+ * Content address of a proposal payload: sha256 over the raw payload bytes,
+ * which travel as non-empty lowercase hex text (profile rule: no byte
+ * strings). Pure content addressing — no domain tag, so the same bytes hash
+ * identically everywhere the payload is stored or committed (plan §7.1:
+ * "payload bytes are retained separately but addressed by payloadHash").
+ */
+export function payloadHashOf(payloadHex: string): Hex32 {
+  if (!/^(?:[0-9a-f]{2})+$/.test(payloadHex)) {
+    throw new Error('payloadHashOf: payload must be non-empty lowercase hex bytes');
+  }
+  return bytesToHex(sha256(hexToBytes(payloadHex)));
+}
+
+/**
  * Profile rule: arrays with SET semantics are sorted by their canonical
  * encoded bytes before hashing. Hash helpers apply this to signer sets,
  * module registries, share-class lists, and similar unordered fields.
@@ -810,6 +985,49 @@ export function voteIdOf(vote: UnsignedTreasuryVote): Hex32 {
       choice: vote.choice,
       sequence: vote.sequence,
       chiaAddressProof: vote.chiaAddressProof,
+    },
+  });
+}
+
+/**
+ * The bytes the voter's game key signs (plan §7.2: "vote ids and signatures
+ * cover a canonical unsigned vote body and the network genesis challenge" —
+ * the body is committed via voteId, exactly as proposalSignatureBytes commits
+ * the proposal body via proposalId).
+ */
+export function voteSignatureBytes(
+  networkGenesisChallenge: Hex32,
+  voteId: Hex32,
+): Uint8Array {
+  return canonicalEncode({
+    domain: 'ssf-treasury-vote-signature:v1',
+    networkGenesisChallenge,
+    voteId,
+  });
+}
+
+/**
+ * The bytes boundByPub signs over a room's treasury binding (plan §10.1).
+ * Browser-side contract only — the Rust codec carries no binding functions,
+ * so this has no twin to stay in parity with.
+ */
+export function roomBindingSignatureBytes(
+  binding: Omit<RoomTreasuryBinding, 'sig'>,
+): Uint8Array {
+  return canonicalEncode({
+    domain: 'ssf-room-treasury-binding-signature:v1',
+    binding: {
+      v: binding.v,
+      networkGenesisChallenge: binding.networkGenesisChallenge,
+      roomId: binding.roomId,
+      companyId: binding.companyId,
+      treasuryLauncherId: binding.treasuryLauncherId,
+      policyVersion: binding.policyVersion,
+      profileId: binding.profileId,
+      boundByPub: binding.boundByPub,
+      boundAtHeight: binding.boundAtHeight,
+      expiresAfterHeight: binding.expiresAfterHeight ?? null,
+      policyReceiptId: binding.policyReceiptId,
     },
   });
 }
