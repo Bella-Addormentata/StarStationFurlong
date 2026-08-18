@@ -4,10 +4,13 @@
 
 **Status:** architecture proposal; documentation only. No runtime money path should depend on this document until the testnet gates in section 17 pass.
 
+> **Amendment (sovereign/serverless):** the "authoritative Rust treasury service" architecture in §4 and §13 is **superseded** by [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) — Chialisp puzzles are the only money authority, the service's roles decompose into a treasury profile of every player's own `ssf-p2p-node`, proposal acceptance and vote checkpoints become on-chain events, and chain access moves to the Chia peer protocol. The invariants, contracts, puzzles, threat model, gates, migration, and mainnet ceremony below are unchanged. Original text is preserved below per repo convention.
+
 **Code root:** unless a path starts with `brainstorming/`, every `src/...` path in this document is relative to `prototypes/0.29.0-core-loop-demo/`.
 
 **Companions:**
 
+- [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) — the serverless amendment (supersedes §4/§13)
 - [chia-ventures-shared-ownership.md](chia-ventures-shared-ownership.md)
 - [chia-authority-architecture.md](chia-authority-architecture.md)
 - [module-wallets-chia-funding-plan.md](module-wallets-chia-funding-plan.md)
@@ -157,6 +160,8 @@ flowchart LR
 ```
 
 The authoritative treasury service in this diagram is aspirational PR D+ infrastructure. It does not exist on `main`. Until it is implemented and passes the testnet gates, treasury screens are read-only/mock views and no on-chain company spending is enabled.
+
+> **Superseded:** there will be no authoritative treasury service. See [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §0–§3 for the decomposition of this diagram's `Service` box into puzzles, the per-player treasury node profile, and on-chain events.
 
 ### 4.1 Trust placement
 
@@ -396,6 +401,8 @@ const proposerSig = signPersonalKey(canonicalEncode({
 ```
 
 The authoritative service accepts only the current policy version and the latest sufficiently confirmed canonical snapshot. It derives every `*Height` from `acceptedHeight` and the proposal kind's committed governance rule; clients and puzzles recompute those values rather than trusting supplied numbers. The acceptance record is included in an on-chain governance checkpoint before voting opens. Wall-clock dates are display estimates only and never authorize a vote or execution.
+
+> **Superseded:** `TreasuryProposalAcceptance`/`serviceSig` are replaced by an on-chain registration event and the derived, unsigned `ProposalWindows` record — every node computes identical deadlines from chain data with nobody to trust. See [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §4 and the shipped contracts in `src/treasuryTypes.ts`.
 
 ### 7.2 Voting
 
@@ -849,6 +856,8 @@ PR B must include shared TypeScript/Rust test vectors: canonical bytes, SHA-256 
 
 ## 13. Browser/Rust service boundary
 
+> **Superseded:** this section's remote service and its §13.1 operator-run/cross-check full nodes are replaced by the treasury node profile and Chia peer-protocol chain access in [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §2/§3/§6. The `TreasuryService` interface below survives as the browser's contract with **its own local node**; the verification duties listed for "the Rust implementation" become duties of every player's node; §13.1's reorg/receipt rules carry over verbatim, executed per-node.
+
 Define an interface before selecting transport:
 
 ```ts
@@ -1086,6 +1095,8 @@ Testnet singleton launcher ids, CAT asset ids, NFT deeds, treasury and allowance
 - no live company binding queries until PR D and PR F exist.
 
 ### PR D - Rust testnet treasury service
+
+> **Superseded:** PR D builds a `treasury` module inside `ssf-p2p-node` (a profile of every player's node), not a service; the custody spike moved to spike S-2 and gained serverless coordination criteria; new spikes S-0 (peer-protocol chain lane), S-1 (registration/checkpoint coins), and S-3 (peer-disagreement/reorg drill) gate PR D/E. See [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §11 for the revised sequence.
 
 - custody-primitive spike chooses and documents MedievalVault/on-chain `m-of-n`, threshold signing, or approval-coin semantics before implementation begins;
 - company singleton and policy lineage;
