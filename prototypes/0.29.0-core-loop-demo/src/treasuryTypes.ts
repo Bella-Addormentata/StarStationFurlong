@@ -592,7 +592,10 @@ function kindRuleCanonical(r: GovernanceKindRule): CanonicalValue {
 
 /** Covers every authority-bearing policy field (plan §12 + maxFeeMojos). */
 export function policyHashOf(policy: CompanyTreasuryPolicy): Hex32 {
-  const governanceRules: { [k: string]: CanonicalValue } = {};
+  // Null prototype: JSON.parse can produce an own "__proto__" rule kind, and
+  // on a {} accumulator that assignment would hit the legacy prototype setter
+  // — silently dropping the key that Rust hashes as an ordinary map entry.
+  const governanceRules: { [k: string]: CanonicalValue } = Object.create(null);
   for (const [kind, rule] of Object.entries(policy.governanceRules)) {
     governanceRules[kind] = kindRuleCanonical(rule);
   }

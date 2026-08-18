@@ -142,6 +142,23 @@ describe('hash sensitivity', () => {
       proposalIdOf(unsigned),
     );
   });
+
+  it('treats an own __proto__ governance kind as an ordinary map key', () => {
+    const raw = JSON.stringify(contracts.policy.value);
+    expect(policyHashOf(JSON.parse(raw))).toBe(contracts.policy.policyHash);
+    // JSON.parse creates "__proto__" as an own data property; it must flow
+    // into the hash like any other kind (as Rust's map does), not vanish into
+    // the accumulator's prototype.
+    const tampered = JSON.parse(
+      raw.replace(
+        '"governanceRules":{',
+        `"governanceRules":{"__proto__":${JSON.stringify(contracts.governanceRule.rule)},`,
+      ),
+    ) as CompanyTreasuryPolicy;
+    expect(Object.keys(tampered.governanceRules)).toContain('__proto__');
+    expect(() => policyHashOf(tampered)).not.toThrow();
+    expect(policyHashOf(tampered)).not.toBe(contracts.policy.policyHash);
+  });
 });
 
 describe('vote inclusion proofs', () => {
