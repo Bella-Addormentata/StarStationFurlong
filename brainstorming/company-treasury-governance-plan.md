@@ -43,7 +43,7 @@ The first implementation PR after this document should add data contracts, valid
 - no shared company seed or exported company private key;
 - no browser-side treasury signing key;
 - no Yjs integer balance treated as authoritative;
-- no CRDT lease presented as a distributed money lock;
+- no CRDT lease presented as authoritative money serialization;
 - no automatic treasury spending based only on room ownership;
 - no direct shareholder ability to spend treasury funds;
 - no dual-class super-voting enabled by default;
@@ -296,6 +296,8 @@ Outstanding proposal rule at rotation:
 - proposals still inside their voting window are voided and must be resubmitted against the new policy version;
 - proposals with a final tally may be re-authorized only by a deterministic carry-forward rule in the rotation payload;
 - absent that explicit carry-forward, they are void;
+- carry-forward preserves the exact proposal id, payload bytes, old-policy tally proof, and acceptance checkpoint; the rotator may only bind that immutable result to the new policy version;
+- a proposal that conflicts with the new policy is void and cannot be rewritten or resurrected under its old id;
 - every execution proves the prior policy hash, proposal snapshot, and current policy version, so rotation and proposal execution cannot race under different rule sets.
 
 ### 6.3 Share sale versus key rotation
@@ -331,7 +333,7 @@ Emergency recovery is a `rotate-board` proposal variant with `recoveryMode: true
 
 ### 7.1 Proposal lifecycle
 
-A proposal is an immutable signed record with a pinned share snapshot:
+A proposal is an immutable signed record. A separate acceptance record pins its share snapshot and policy-derived block windows so a proposer cannot choose a historical snapshot or shorten voting, veto, or implementation delays:
 
 ```ts
 export type TreasuryProposalKind =
@@ -345,25 +347,55 @@ export type TreasuryProposalKind =
   | "add-share-class"
   | "dissolve";
 
-export interface TreasuryProposal {
+export interface UnsignedTreasuryProposal {
   v: 1;
-  proposalId: string;
+  networkGenesisChallenge: string;
   companyId: string;
   policyVersion: number;
   kind: TreasuryProposalKind;
   payloadHash: string;
   proposerPub: string;
-  snapshotHeight: number;
-  createdAt: number;
-  votingEndsAt: number;
-  vetoEndsAt: number;
-  executableAt: number;
-  expiresAt: number;
+}
+
+export interface TreasuryProposal extends UnsignedTreasuryProposal {
+  proposalId: string;
   proposerSig: string;
+}
+
+export interface TreasuryProposalAcceptance {
+  v: 1;
+  proposalId: string;
+  policyVersion: number;
+  governanceRuleHash: string;
+  snapshotHeight: number;
+  snapshotBlockHash: string;
+  acceptedHeight: number;
+  acceptedBlockHash: string;
+  votingEndsHeight: number;
+  vetoEndsHeight: number;
+  executableFromHeight: number;
+  expiresAfterHeight: number;
+  acceptanceCheckpointId: string;
+  serviceSig: string;
 }
 ```
 
-Proposal ids are hashes over canonical proposal bytes. Payload bytes are retained separately but addressed by `payloadHash`.
+Payload bytes are retained separately but addressed by `payloadHash`. The identifier and signature targets are non-recursive and domain-separated:
+
+```ts
+const proposalId = sha256(canonicalEncode({
+  domain: "ssf-treasury-proposal:v1",
+  proposal: unsignedProposal,
+}));
+
+const proposerSig = signPersonalKey(canonicalEncode({
+  domain: "ssf-treasury-proposal-signature:v1",
+  networkGenesisChallenge: unsignedProposal.networkGenesisChallenge,
+  proposalId,
+}));
+```
+
+The authoritative service accepts only the current policy version and the latest sufficiently confirmed canonical snapshot. It derives every `*Height` from `acceptedHeight` and the proposal kind's committed governance rule; clients and puzzles recompute those values rather than trusting supplied numbers. The acceptance record is included in an on-chain governance checkpoint before voting opens. Wall-clock dates are display estimates only and never authorize a vote or execution.
 
 ### 7.2 Voting
 
@@ -372,13 +404,24 @@ Votes are signed personal messages:
 ```ts
 export interface TreasuryVote {
   v: 1;
+  networkGenesisChallenge: string;
   proposalId: string;
   voterPuzzleHash: string;
   voterGamePub: string;
   choice: "yes" | "no" | "abstain" | "veto";
-  castAt: number;
+  sequence: number;
   chiaAddressProof: string;
+  voteId: string;
   gameSig: string;
+}
+
+export interface VoteInclusionProof {
+  v: 1;
+  voteId: string;
+  checkpointRoot: string;
+  checkpointHeight: number;
+  checkpointBlockHash: string;
+  merkleProof: string;
 }
 ```
 
@@ -387,17 +430,46 @@ Tally rules:
 - weight comes from verified CAT balances at `snapshotHeight`;
 - each class applies its policy weight;
 - spent-after-snapshot coins still count; confirmed-after-snapshot coins do not;
-- duplicate votes use one deterministic latest signed vote before `votingEndsAt`;
+- a vote counts only with a valid inclusion proof rooted in a checkpoint confirmed no later than `votingEndsHeight`;
+- duplicate votes use the valid vote with the greatest per-voter `sequence`; equal-sequence conflicts choose the lexicographically smallest `voteId`;
 - votes are public and independently recountable;
-- delegation is a separate signed record pinned before snapshot.
+- vote ids and signatures cover a canonical unsigned vote body and the network genesis challenge;
+- delegation is disabled in v1; a later design must specify cycles, transitivity, revocation, direct-vote precedence, inclusion, and snapshot timing before enabling it.
 
 ### 7.3 Proposal classes and thresholds
 
-Suggested defaults for playtesting, not final constants:
+Policy commits one complete rule for every proposal kind:
+
+```ts
+export type GovernancePassRule =
+  | "majority-cast"
+  | "supermajority-cast"
+  | "supermajority-total-supply";
+
+export interface GovernanceKindRule {
+  proposalThresholdBps: number;
+  passRule: GovernancePassRule;
+  yesThresholdBps: number;
+  quorumBps: number;
+  vetoBps: number;
+  votingBlocks: number;
+  vetoBlocks: number;
+  implementationDelayBlocks: number;
+  executionWindowBlocks: number;
+}
+
+export type ProposalKindRules = Record<
+  TreasuryProposalKind,
+  GovernanceKindRule
+>;
+```
+
+Suggested defaults for playtesting, not final constants. Target durations shown for people are converted to conservative block counts in policy; block height is authoritative:
 
 | Proposal | Proposal threshold | Pass rule | Veto | Delay |
 | --- | ---: | ---: | ---: | ---: |
 | Routine payment within approved budget | manager capability | none | none | none |
+| One-time payment outside approved budget | 1% | >50% cast | 20% total | 24 h target |
 | New recurring budget | 1% | >50% cast | 20% total | 24 h |
 | Appoint/revoke manager | 2% | >50% cast | 20% total | 24 h |
 | Bind company treasury to room | 2% | >50% cast | 20% total | 24 h |
@@ -480,6 +552,7 @@ Production puzzles must use audited libraries, exact condition semantics, safe i
 export type TreasuryOperation =
   | "casino-reserve"
   | "casino-settle"
+  | "casino-refund"
   | "robot-charge"
   | "robot-parts"
   | "room-rent"
@@ -490,27 +563,59 @@ export type TreasuryOperation =
 export interface DeviceAllowance {
   v: 1;
   allowanceId: string;
+  networkGenesisChallenge: string;
   companyId: string;
   policyVersion: number;
   subject: {
     kind: "room" | "device" | "robot" | "manager";
     id: string;
+    authorityHead: {
+      headId: string;
+      version: number;
+      scheme: "ed25519" | "bls12381";
+      publicKey: string;
+    };
   };
   roomId?: string;
   operations: TreasuryOperation[];
   assetId: "xch" | string;
   maxPerOperation: string; // decimal mojo string
   maxPerPeriod: string;
-  periodSeconds: number;
+  periodBlocks: number;
   destinationPuzzleHashes?: string[];
-  startsAt: number;
-  expiresAt: number;
+  startsAtHeight: number;
+  expiresAfterHeight: number;
+  stateCoinLauncherId: string;
   nonce: string;
   policyProof: string;
 }
+
+export interface TreasuryExecutionRequestBody {
+  v: 1;
+  requestId: string;
+  networkGenesisChallenge: string;
+  allowanceId: string;
+  policyVersion: number;
+  authorityHeadId: string;
+  authorityVersion: number;
+  operation: TreasuryOperation;
+  payloadHash: string;
+  expiresAfterHeight: number;
+}
+
+export interface TreasuryExecutionRequest
+  extends TreasuryExecutionRequestBody {
+  subjectSig: string;
+}
 ```
 
-Amounts crossing JSON boundaries are decimal strings and become checked `u64`/`bigint` values only inside validated code.
+Amounts crossing JSON boundaries are decimal strings and become checked `u64`/`bigint` values only inside validated code. The canonical subject key includes both `kind` and `id`, preventing cross-kind collisions.
+
+An allowance cache is public and conveys no authority by itself. Every execution request signs the canonical request body and replay id with the current key in `authorityHead`; the service verifies its scheme, head id, version, and public key against policy. A puzzle hash may identify a destination or Chia authority, but it is not itself a signing key. Devices without protected keys act through an explicitly named manager/operator authority rather than an unauthenticated furniture id.
+
+Period caps are atomic on-chain invariants, not service database counters. Each allowance has a state coin lineage committing to its current period index, spent amount, and sequence. An authorized spend consumes that state coin and recreates its unique child with updated consumption in the same spend bundle; Chialisp rejects an amount over the remaining cap. Period rollover derives from confirmed block height. Concurrent services therefore contend for the same current state coin, and only one valid child can advance. The Rust service indexes this lineage but cannot override it.
+
+Every allowance binds `policyVersion`. Rotation invalidates all earlier-version allowances immediately; replacement allowances receive new ids and authority versions rather than reusing prior capabilities.
 
 ### 9.2 Casino allowances
 
@@ -568,14 +673,15 @@ Binding a room does not grant edit rights by itself. Room/deed authority and tre
 ```ts
 export interface RoomTreasuryBinding {
   v: 1;
+  networkGenesisChallenge: string;
   roomId: string;
   companyId: string;
   treasuryLauncherId: string;
   policyVersion: number;
   profileId: string;
   boundByPub: string;
-  boundAt: number;
-  expiresAt?: number;
+  boundAtHeight: number;
+  expiresAfterHeight?: number;
   policyReceiptId: string;
   sig: string;
 }
@@ -664,6 +770,7 @@ export type Hex32 = string;
 
 export interface CompanyTreasuryPolicy {
   v: 1;
+  networkGenesisChallenge: Hex32;
   companyId: Hex32;
   treasuryLauncherId: Hex32;
   policyVersion: number;
@@ -672,12 +779,7 @@ export interface CompanyTreasuryPolicy {
     signerPuzzleHashes: Hex32[];
   };
   shareClasses: ShareClassPolicy[];
-  governance: {
-    proposalThresholdBps: number;
-    quorumBps: number;
-    vetoBps: number;
-    implementationDelaySeconds: number;
-  };
+  governanceRules: ProposalKindRules;
   approvalModuleHashes: Hex32[];
   emergencyPolicyHash?: Hex32;
 }
@@ -685,14 +787,17 @@ export interface CompanyTreasuryPolicy {
 export interface TreasuryReceipt {
   v: 1;
   receiptId: Hex32;
+  networkGenesisChallenge: Hex32;
   companyId: Hex32;
   policyVersion: number;
   operation: TreasuryOperation;
-  proposalId?: Hex32;
-  allowanceId?: Hex32;
+  authorization:
+    | { kind: "proposal"; proposalId: Hex32 }
+    | { kind: "allowance"; allowanceId: Hex32 };
   requestId: Hex32;
   spendBundleId: Hex32;
   confirmedHeight?: number;
+  confirmedBlockHash?: Hex32;
   assetId: "xch" | Hex32;
   amount: MojoString;
   destinations: Hex32[];
@@ -704,8 +809,10 @@ Guard rules:
 ```ts
 export function isMojoString(value: unknown): value is MojoString {
   return typeof value === "string"
+    && value.length >= 1
+    && value.length <= 20
     && /^(0|[1-9][0-9]*)$/.test(value)
-    && BigInt(value) <= 18_446_744_073_709_551_615n;
+    && (value.length < 20 || value <= "18446744073709551615");
 }
 
 export function isPolicyVersion(value: unknown): value is number {
@@ -713,17 +820,23 @@ export function isPolicyVersion(value: unknown): value is number {
 }
 ```
 
-Canonical hashes must use explicit field order and domain tags:
+`canonicalEncode` uses the Star Station Furlong deterministic-CBOR profile: RFC 8949 deterministic encoding, definite lengths only, no floats or tags, UTF-8 strings, and the shortest integer encoding. Arrays with set semantics are sorted by their canonical encoded bytes before hashing. TypeScript and Rust implementations must reject values outside this profile.
+
+Canonical hashes must include every authority-bearing field, use explicit field order and domain tags, and bind the Chia network genesis challenge:
 
 ```ts
 const bytes = canonicalEncode({
   domain: "ssf-company-treasury-policy:v1",
+  v: policy.v,
+  networkGenesisChallenge: policy.networkGenesisChallenge,
   companyId: policy.companyId,
+  treasuryLauncherId: policy.treasuryLauncherId,
   policyVersion: policy.policyVersion,
   board: policy.board,
   shareClasses: policy.shareClasses,
-  governance: policy.governance,
+  governanceRules: policy.governanceRules,
   approvalModuleHashes: policy.approvalModuleHashes,
+  emergencyPolicyHash: policy.emergencyPolicyHash ?? null,
 });
 const policyHash = sha256(bytes);
 ```
@@ -742,8 +855,10 @@ Define an interface before selecting transport:
 export interface TreasuryService {
   getCompanySnapshot(companyId: string): Promise<CompanyTreasurySnapshot>;
   getProposal(proposalId: string): Promise<TreasuryProposal>;
-  submitProposal(proposal: TreasuryProposal): Promise<void>;
-  submitVote(vote: TreasuryVote): Promise<void>;
+  submitProposal(
+    proposal: TreasuryProposal,
+  ): Promise<TreasuryProposalAcceptance>;
+  submitVote(vote: TreasuryVote): Promise<VoteInclusionProof>;
   requestExecution(request: TreasuryExecutionRequest): Promise<TreasuryReceipt>;
   verifyAllowance(allowance: DeviceAllowance): Promise<AllowanceStatus>;
 }
@@ -761,6 +876,14 @@ The Rust implementation should:
 - track confirmation/reorg status;
 - return proof-bearing receipts;
 - deduplicate `requestId` across retries.
+
+### 13.1 Full-node trust boundary
+
+The v1 service uses a synced, self-run Chia full node in the same operator trust domain for candidate chain and mempool data. Browser-supplied RPC endpoints and public coinset responses are untrusted. Before accepting a governance snapshot, policy transition, or confirmed receipt, the service must cross-check the finalized height, header hash, and relevant coin records with at least one independently administered full node. Disagreement, inadequate confirmation depth, rollback, or an unavailable cross-check stops acceptance and spending.
+
+Where available, the service verifies header, singleton, CAT, and coin lineage proofs locally. If the selected Chia RPC cannot provide a proof for a required claim, the implementation must document the trusted-node assumption and may not label that claim trustless. A production/mainnet gate must explicitly approve each residual assumption. The service verifies the exact spend-bundle hash it constructed before submission and reconciles that hash against mempool and confirmed-chain observations.
+
+Receipt confirmation is a replaceable signed status attestation over an immutable receipt. A reorg that removes `confirmedBlockHash` changes the status to `reorged`/pending and clients stop treating it as final. The same `requestId` may be retried only after the former spend is proven absent and the original authorization remains valid; all attempts remain linked in the idempotency ledger.
 
 Potential Rust integration points:
 
@@ -805,7 +928,7 @@ All `src/...` paths in this table are under `prototypes/0.29.0-core-loop-demo/`.
 | Ventures/cap table | `src/ventures.ts` (`VentureRecord`, `transferShares`, `ventureLedger`) | Add company/treasury ids, class-aware metadata, treasury summary cache; keep cap-table writes separate from money |
 | Phone Ventures app | `src/main.ts` (`renderVenturesApp`) | Add Treasury/Proposals/Roles/Receipts views and signed action flows |
 | Phone Bank app | no complete company bank on main | Add personal/company account selector and handoff into Treasury views; never expose seeds |
-| Room ownership | `games/gamesDoc.ts` (`readRoomOwner`) and `main.ts` owner gates | Verify room binding against deed/company authority; do not conflate treasury access with edit access |
+| Room ownership | `src/games/gamesDoc.ts` (`readRoomOwner`) and `src/main.ts` owner gates | Verify room binding against deed/company authority; do not conflate treasury access with edit access |
 | Room control computer | `src/devices.ts` (`createRoomTerminalUI`) | Add Funding section, profiles, proof state, and proposal links |
 | Edit permissions | `src/editMode.ts`, `main.ts` | No automatic expansion from treasury binding; roles remain explicit |
 | Deeds | `src/deeds.ts`, `src/offers.ts` | Company singleton custody and room binding reference stable company id |
@@ -862,6 +985,8 @@ Dissolution is a high-threshold proposal that:
 - revokes manager/device allowances;
 - unbinds rooms;
 - resolves outstanding proposals;
+- freezes new company offers when the dissolution acceptance checkpoint is confirmed;
+- cancels outstanding company-authored offers by spending or replacing their source coins before distribution; deleting an offer file or Yjs record is not cancellation;
 - settles or cancels authorized liabilities;
 - transfers deeds according to approved terms;
 - sweeps treasury assets through an explicit distribution policy;
@@ -918,14 +1043,21 @@ Before any real-value/mainnet path:
 
 1. mint and follow company singleton lineage;
 2. rotate 1-of-1 to 2-of-3 without changing launcher id;
-3. transfer an NFT1 deed to `P2Singleton(companyId)` and back by approved proposal;
+3. acquire an NFT1 deed into `P2Singleton(companyId)`, then dispose of it through a separate approved proposal;
 4. mint fixed-supply CAT shares and verify snapshot balances with lineage checks;
-5. execute allowed and denied allowance spends;
+5. execute allowed and denied allowance spends, including concurrent requests at a period boundary;
 6. prove old policy/capabilities fail after rotation;
-7. test duplicate execution and mempool contention;
+7. test duplicate execution, vote inclusion ordering, policy-derived deadlines, and mempool contention;
 8. test reorg recovery and receipt reconciliation;
 9. test key loss/emergency rotation;
-10. independently review Chialisp and Rust spend construction.
+10. prove node disagreement or an unavailable cross-check stops governance acceptance and spending;
+11. independently review Chialisp and Rust spend construction.
+
+### 17.5 Network separation and mainnet promotion
+
+Testnet is a complete deployment environment, not a namespace that later becomes mainnet. Every policy, proposal, vote, allowance, request, receipt, offer, cache, and signature domain binds the configured Chia genesis challenge. The service reads the connected node's network identity at startup and refuses to run if it differs from release configuration. Network selection is operator/release configuration and is never controlled by an in-game browser setting.
+
+Testnet singleton launcher ids, CAT asset ids, NFT deeds, treasury and allowance coins, offers, and receipts do not migrate. Mainnet promotion creates fresh assets and lineages with production signer keys through a recorded deployment ceremony. Before promotion: all testnet gates pass; custody and guardian policies are final; independent Chialisp and Rust security reviews are complete; transferable-share and distribution flows pass legal review; recovery and pause drills succeed; monitoring is active; and initial spending caps are deliberately low. Mainnet starts with canary deposits and spends before broader funding is enabled.
 
 ---
 
@@ -955,6 +1087,7 @@ Before any real-value/mainnet path:
 
 ### PR D - Rust testnet treasury service
 
+- custody-primitive spike chooses and documents MedievalVault/on-chain `m-of-n`, threshold signing, or approval-coin semantics before implementation begins;
 - company singleton and policy lineage;
 - share snapshot verifier;
 - board rotation;
@@ -965,7 +1098,8 @@ Before any real-value/mainnet path:
 ### PR E - allowance engine plus one vertical slice
 
 - approval/capability contract;
-- period accounting in authoritative service;
+- stateful on-chain allowance coin lineage with atomic period accounting;
+- authoritative service indexes current allowance state but cannot replace puzzle enforcement;
 - integrate one robot operation or one casino table on testnet;
 - partition, duplicate, revocation, and reorg tests.
 

@@ -142,7 +142,9 @@ graph LR
 ```
 
 * [ ] **In-Game Economy:** Introduce trade systems, pricing pressure, Spacefuel constraints, player-run or deployable ATMs, and visible market demand.
-* [ ] **Player Company System:** Allow players to found and register companies — transportation, mining, retail, logistics — and hire other players as employees or contractors.
+* [ ] **Player Company System:** Allow players to found and register companies — transportation, mining, retail, logistics — and hire other players as employees or contractors. Keep shareholder voting, board custody, manager roles, room authority, and device operation as separate capabilities.
+* [ ] **Company Treasury & Governance — Testnet:** Implement the [company treasury architecture](brainstorming/company-treasury-governance-plan.md) on Chia testnet: stable singleton identity, rotatable threshold board, per-proposal governance policy, signed votes and receipts, room funding bindings, and authenticated operation-specific allowances. Keep Yjs display-only and stop spending whenever authoritative chain state is unavailable.
+* [ ] **Company Treasury & Governance — Mainnet Gate:** After testnet security, recovery, concurrency, reorg, legal, and operational reviews pass, deploy fresh mainnet singleton/CAT/NFT/treasury state with production keys and low initial caps. Network selection is operator/release configuration, never an in-game browser toggle; testnet assets and ids do not migrate.
 * [ ] **Transportation Companies:** Support airline-style operators running scheduled flights between stations, solo owner-operator truckers, and everything in between; let passengers buy tickets or hitch rides.
 * [ ] **Mining and Retail Companies:** Extend the company framework to resource extraction and player-run storefronts and marketplaces at stations.
 * [ ] **Community Bulletin Boards:** Place physical bulletin boards in station rooms and outposts; any nearby player can walk up, read, and post freeform entries (job offers, item requests, announcements, trade notices). Board data is stored locally and is only visible to players physically present at the board.

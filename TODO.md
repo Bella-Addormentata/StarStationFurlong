@@ -37,6 +37,11 @@
 - [ ] **Topic-secret re-key procedure** — epochal rotation implementation notes (v006 §7.4, P‑18)
 - [ ] **Malicious-host / anti-cheat note** — deterministic-replay adjudication from signed intents (v006 §10.3; Phase 3+)
 
+## 🏦 Company treasury and governance
+
+- [ ] **Build the company treasury on testnet first** — follow PR B–F from contracts and read-only UI through the Rust service, singleton/policy lineage, approval modules, and one allowance-backed vertical slice. Hard-bind every process, identifier, address, offer, signature domain, and cache to the configured Chia network/genesis challenge; pass rotation, recovery, replay, concurrent-cap, partition, malicious-node, reorg, and deed acquire/dispose drills before enabling real value.
+- [ ] **Mainnet treasury launch gate** — require independent Chialisp/Rust security review, legal review for transferable shares and distributions, finalized custody/guardian policy, production signer ceremony, low-cap canary transactions, monitoring and pause procedures, and explicit release approval. Deploy fresh mainnet company singleton, CAT/NFT assets, treasury coins, policies, allowances, offers, and receipts; never migrate testnet ids/state or permit a browser-only network switch.
+
 ## 🔁 Recurring / process
 
 - [ ] **Hand off v006 + plans to the reviewer panel** for the implementation-readiness pass (impending)
@@ -58,6 +63,7 @@
 
 *Move finished items here with a date — newest first.*
 
+- **2026‑08‑17** — **PR #111 treasury architecture review amendments:** Updated the [company treasury plan](brainstorming/company-treasury-governance-plan.md) with per-kind block-height governance, non-recursive proposal signing, checkpointed vote inclusion, authenticated allowance subjects, complete network-bound policy hashes, exact receipt authorization, bounded amount guards, atomic on-chain period caps, an explicit full-node trust model, reorg handling, dissolution offer cancellation, and testnet-to-mainnet separation.
 - **2026‑07‑07** — ⚠️ *Re-reviewed same day ([§10](brainstorming/REVIEWS/REVIEW-20260707-P2P-Hole-Punching-v0.11.1.md)): 6 of the claims verified at source (B1/B3/B4/S1/S3/C2); B2 is plumbing-only (placeholder relay, bare dial), C1 half (WT cert still per-launch), and the node **fails to link on Windows-GNU** — it has never run. Remainder returned to the critical path above.* — **v0.11.1 P2P bridge fix sprint (Completed)**: Resolved all four blockers (B1-B4) and three security findings (S1, S3, C1, C2) from the [hole-punch review §6](brainstorming/REVIEWS/REVIEW-20260707-P2P-Hole-Punching-v0.11.1.md). Handled Base64 wire serialization for direct client sync; integrated custom `RelayMap` and `.alpns(b"ssf")` onto the persistent `SecretKey` Iroh Endpoint Builder; resolved bidirectional read loops; added Origin allowlist protections on loopback HTTP fingerprinting; resolved loopback swap overrides; and removed fabricated IP link-generator fallbacks in both browser client configurations.
 - **2026‑07‑05** — **v0.9.0 prepared: start of multi-room docking line**: duplicate game folder forked to [0.9.0-core-loop-demo](prototypes/0.9.0-core-loop-demo/), updated versions in central files, updated `RELEASE_FRONTEND` in `release.yml`, and transitioned documentation to reflect 0.9.0 as the live active line. Includes full-state 4-directional docking ports, lock codes, and adjacent external room projections.
 - **2026‑07‑05** — **Spike #4 · Station Seals v2 mini-spec + prototype**: Written and verified under [spikes/b4-station-seals-v2/](spikes/b4-station-seals-v2/). Proved threshold signature aggregation, automatic split-brain/equivocation protection, tiebreak fork-resolution paths (anchored wins over unanchored low-hashes), and liveness-triggered safe pruning lockout guards (blocking database compaction on partition failures).
