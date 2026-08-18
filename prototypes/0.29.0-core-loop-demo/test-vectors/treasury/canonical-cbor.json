@@ -1,0 +1,225 @@
+[
+  {
+    "name": "zero",
+    "value": 0,
+    "hex": "00",
+    "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  {
+    "name": "int-23",
+    "value": 23,
+    "hex": "17",
+    "sha256": "8f11b05da785e43e713d03774c6bd3405d99cd3024af334ffd68db663aa37034"
+  },
+  {
+    "name": "int-24",
+    "value": 24,
+    "hex": "1818",
+    "sha256": "7c6348f7ea8a4e831aafe688a2557d7a3ab0be8549cdb190a029956ade971b15"
+  },
+  {
+    "name": "int-255",
+    "value": 255,
+    "hex": "18ff",
+    "sha256": "fcaae93768b1722dcefc0a06729388acfe35a4d08cbdfc996309a15fad7e62af"
+  },
+  {
+    "name": "int-256",
+    "value": 256,
+    "hex": "190100",
+    "sha256": "70aa0275e34b1dd6f23f2e97a23ffaffa642ad71a935484e5e878d33c89f1e21"
+  },
+  {
+    "name": "int-65535",
+    "value": 65535,
+    "hex": "19ffff",
+    "sha256": "459fbd327a935784702aca36217445923f8794e11be0b8a2e9f9b3ea9b800e91"
+  },
+  {
+    "name": "int-65536",
+    "value": 65536,
+    "hex": "1a00010000",
+    "sha256": "2928012187f03446d1e9ec37dae5cc9586656c20bd6e28ff4953181b933cb3f0"
+  },
+  {
+    "name": "int-1000000",
+    "value": 1000000,
+    "hex": "1a000f4240",
+    "sha256": "cbbec14103147af122feaff2419ad885d372d04bfd9d0af1714dd20dff24b6e3"
+  },
+  {
+    "name": "int-u32-max",
+    "value": 4294967295,
+    "hex": "1affffffff",
+    "sha256": "74925985507bbda0c27009d32686859a69ac1e7d2870986694ee73ece429bd68"
+  },
+  {
+    "name": "int-u32-max-plus-1",
+    "value": 4294967296,
+    "hex": "1b0000000100000000",
+    "sha256": "ff0a4ebee87c783ebeb2197fb436cfee11c1172a7363c7c133e085878c7d58ff"
+  },
+  {
+    "name": "int-max-safe",
+    "value": 9007199254740991,
+    "hex": "1b001fffffffffffff",
+    "sha256": "14f502e8a30340288b9da98ed55d9f230c8a92ee86336198df6d1b4e278f3d1e"
+  },
+  {
+    "name": "int-neg-1",
+    "value": -1,
+    "hex": "20",
+    "sha256": "36a9e7f1c95b82ffb99743e0c5c4ce95d83c9a430aac59f84ef3cbfab6145068"
+  },
+  {
+    "name": "int-neg-24",
+    "value": -24,
+    "hex": "37",
+    "sha256": "7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451"
+  },
+  {
+    "name": "int-neg-25",
+    "value": -25,
+    "hex": "3818",
+    "sha256": "dd7baa54409c052850ed2e03e586086bfed37a275ae4aee888711cd7c46bc91f"
+  },
+  {
+    "name": "int-neg-1000",
+    "value": -1000,
+    "hex": "3903e7",
+    "sha256": "e12267a8ecaa88c6f81071b963362422fff3245dee5510801dbf23768c9c4d4c"
+  },
+  {
+    "name": "false",
+    "value": false,
+    "hex": "f4",
+    "sha256": "2017ff3461395672aa0aa4f64894fd2f95a4b120e2690e8951656d79adc2eed2"
+  },
+  {
+    "name": "true",
+    "value": true,
+    "hex": "f5",
+    "sha256": "27abdeddfe8503496adeb623466caa47da5f63abd2bc6fa19f6cfcb73ecfed70"
+  },
+  {
+    "name": "null",
+    "value": null,
+    "hex": "f6",
+    "sha256": "b0b2988b6bbe724bacda5e9e524736de0bc7dae41c46b4213c50e1d35d4e5f13"
+  },
+  {
+    "name": "text-empty",
+    "value": "",
+    "hex": "60",
+    "sha256": "8d33f520a3c4cef80d2453aef81b612bfe1cb44c8b2025630ad38662763f13d3"
+  },
+  {
+    "name": "text-a",
+    "value": "a",
+    "hex": "6161",
+    "sha256": "961b6dd3ede3cb8ecbaacbd68de040cd78eb2ed5889130cceb4c49268ea4d506"
+  },
+  {
+    "name": "text-IETF",
+    "value": "IETF",
+    "hex": "6449455446",
+    "sha256": "b8c85d4ab7b2d652f7d4e43624401c3288cbde02a46b0240ae5f17ffa5bdc573"
+  },
+  {
+    "name": "text-u-umlaut",
+    "value": "ü",
+    "hex": "62c3bc",
+    "sha256": "579077f8dd4d539fa306635d1bb46a134bfe3e7ec064be8a0381cde26894d78a"
+  },
+  {
+    "name": "array-empty",
+    "value": [],
+    "hex": "80",
+    "sha256": "76be8b528d0075f7aae98d6fa57a6d3c83ae480a8469e668d7b0af968995ac71"
+  },
+  {
+    "name": "array-123",
+    "value": [
+      1,
+      2,
+      3
+    ],
+    "hex": "83010203",
+    "sha256": "4abc31137ce738d9aceb8a1d1d51f15cad42c2b08dcb7ed179f737a194b355e7"
+  },
+  {
+    "name": "map-empty",
+    "value": {},
+    "hex": "a0",
+    "sha256": "c19a797fa1fd590cd2e5b42d1cf5f246e29b91684e2f87404b81dc345c7a56a0"
+  },
+  {
+    "name": "map-a1-b23",
+    "value": {
+      "a": 1,
+      "b": [
+        2,
+        3
+      ]
+    },
+    "hex": "a26161016162820203",
+    "sha256": "b44774f185e1268bc3bfc660f02b1153546030565dd1b71c517a7390dbb24e02"
+  },
+  {
+    "name": "map-key-order",
+    "value": {
+      "b": 1,
+      "a": 2
+    },
+    "hex": "a2616102616201",
+    "sha256": "b9b2201386523b17e7dacdbf0f469ffebd37a32b4cbb8761d486ba70c2f75ad4"
+  },
+  {
+    "name": "map-key-order-length",
+    "value": {
+      "aa": 1,
+      "b": 2
+    },
+    "hex": "a261620262616101",
+    "sha256": "9ba01bc6133f5b08a6b955cc1372f5556170bc093939214953d0f05eb1e7630f"
+  },
+  {
+    "name": "neg-zero-is-zero",
+    "value": 0,
+    "hex": "00",
+    "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+  },
+  {
+    "name": "nested",
+    "value": {
+      "k": {
+        "a": [
+          null,
+          true,
+          "x"
+        ]
+      }
+    },
+    "hex": "a1616ba1616183f6f56178",
+    "sha256": "b6bd1394398f09775699de9735d2da308f3776aab5bbfa893f2647ffc600e2c9"
+  },
+  {
+    "name": "text-emoji",
+    "value": "🚀",
+    "hex": "64f09f9a80",
+    "sha256": "706c481cda31881a106d3ca33aeafabb4b3a01af6dee6e12cb0d43bc42b6a518"
+  },
+  {
+    "name": "array-mixed",
+    "value": [
+      0,
+      "a",
+      {
+        "b": []
+      },
+      null
+    ],
+    "hex": "84006161a1616280f6",
+    "sha256": "f549a432e79037b030c1fe223ab8e52c7364b78d02eaf21cceee87e497cae898"
+  }
+]

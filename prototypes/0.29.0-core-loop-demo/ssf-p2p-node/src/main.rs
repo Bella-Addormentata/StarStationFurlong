@@ -24,6 +24,11 @@ mod chia_publish;
 mod chia_resolve;
 #[cfg(feature = "chia-lane")]
 mod chia_craps_fair;
+// Treasury PR B: canonical contracts codec, golden-vector-matched against the
+// browser's src/treasuryTypes.ts. Chain IO for it arrives with PR D's treasury
+// module; gated with the chia lane so CI compiles and tests it.
+#[cfg(feature = "chia-lane")]
+mod treasury_codec;
 
 mod b64 {
     use base64::prelude::*;

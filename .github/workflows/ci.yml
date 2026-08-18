@@ -1,15 +1,18 @@
 name: "✅ PR Checks"
 
 # PR-time compile gate — the checks we previously only ran by hand (or that the
-# release workflow only ran at tag time). Three lanes:
+# release workflow only ran at tag time). Four lanes:
 #   1. Frontend `tsc --noEmit` — the repo's long-standing "tsc clean" bar.
-#   2. `cargo check` on the sovereign node with DEFAULT features — what a local
+#   2. Frontend `npm test` (vitest) — treasury contract unit tests + the shared
+#      TS<->Rust golden vectors under test-vectors/treasury/.
+#   3. `cargo check` on the sovereign node with DEFAULT features — what a local
 #      `cargo check` compiles.
-#   3. `cargo check`/`cargo test` with `--features chia-lane` — the feature-gated
-#      chia modules (chia_publish / chia_resolve / chia_craps_fair) are INVISIBLE
-#      to a default check, so a PR could break them without anyone noticing until
-#      the tag-time release build (#87's near-miss: a review fix to the gated
-#      module shipped without ever having been compiled).
+#   4. `cargo check`/`cargo test` with `--features chia-lane` — the feature-gated
+#      chia modules (chia_publish / chia_resolve / chia_craps_fair /
+#      treasury_codec) are INVISIBLE to a default check, so a PR could break them
+#      without anyone noticing until the tag-time release build (#87's near-miss:
+#      a review fix to the gated module shipped without ever having been
+#      compiled).
 
 on:
   pull_request:
@@ -40,6 +43,13 @@ jobs:
 
       - name: 🔎 tsc --noEmit
         run: npx tsc --noEmit
+        working-directory: ${{ env.RELEASE_FRONTEND }}
+
+      # Treasury PR B golden vectors: the same fixtures are asserted by
+      # `cargo test --features chia-lane` (treasury_codec.rs), so a drift in
+      # either runtime's canonical encoding fails one lane or the other.
+      - name: 🧪 npm test (vitest)
+        run: npm test
         working-directory: ${{ env.RELEASE_FRONTEND }}
 
   node-check:
