@@ -26,13 +26,17 @@ import { initialState, legalMoves, applyMove, chooseBotMove, isCheckersState } f
 import type { CheckersState } from './checkers';
 import { isChessState } from './chess';
 import type { ChessState } from './chess';
+import { isAirHockeyState } from './airHockey';
+import type { AirHockeyState } from './airHockey';
 
-/** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`;
+/** A table hosts ONE game at a time. Chess states carry `kind: 'chess'` and
+ *  air hockey `kind: 'airhockey'` (#115 — its own furniture, same map);
  *  legacy checkers states are kind-less (isCheckersState identifies them) —
  *  the additive discriminator keeps every pre-chess doc entry working. */
 export type TableGame =
   | { kind: 'checkers'; state: CheckersState }
-  | { kind: 'chess'; state: ChessState };
+  | { kind: 'chess'; state: ChessState }
+  | { kind: 'airhockey'; state: AirHockeyState };
 
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
@@ -96,13 +100,20 @@ export function readGame(tableId: string): CheckersState | null {
  *  Chess carries `kind: 'chess'`; kind-less entries are legacy checkers. */
 export function readTable(tableId: string): TableGame | null {
   const value = ensureMap().get(tableId);
+  if (isAirHockeyState(value)) return { kind: 'airhockey', state: value };
   if (isChessState(value)) return { kind: 'chess', state: value };
   if (isCheckersState(value)) return { kind: 'checkers', state: value };
   return null;
 }
 
+/** Air-hockey read for one table (#115) — null for other/absent games. */
+export function readAirHockey(tableId: string): AirHockeyState | null {
+  const value = ensureMap().get(tableId);
+  return isAirHockeyState(value) ? value : null;
+}
+
 /** Transacted whole-value write of one table's state (LWW per table key). */
-export function writeGame(tableId: string, state: CheckersState | ChessState): void {
+export function writeGame(tableId: string, state: CheckersState | ChessState | AirHockeyState): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(tableId, state);
@@ -138,8 +149,12 @@ export function readPlayerDisplayName(playerId: string): string {
 
 // Permanent debug handle (kept deliberately — runtime verification of doc
 // state + engine legality from the console; the __players / __deviceFocus
-// precedent). See PR #45 evidence.
-(window as unknown as { __ssfGames: unknown }).__ssfGames = {
-  readGame, writeGame, subscribeGames,
-  checkers: { initialState, legalMoves, applyMove, chooseBotMove },
-};
+// precedent). See PR #45 evidence. Guarded like casinoDoc's handle: vitest
+// runs in a bare Node environment, so importing this module must stay pure
+// with the browser-only handle attached only when a DOM exists.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfGames: unknown }).__ssfGames = {
+    readGame, writeGame, subscribeGames,
+    checkers: { initialState, legalMoves, applyMove, chooseBotMove },
+  };
+}

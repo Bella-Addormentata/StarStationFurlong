@@ -62,7 +62,10 @@ import {
 import { roomHalfExtents, roomPlaceBounds } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
-import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
+import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle, AirHockeyVisualHandle } from './devices';
+// 🏒 #115: a DEV-spawned air-hockey table must register with the session layer
+// (the doc-echo reconcile no-ops on this local add, so World never sees it).
+import { registerAirHockeyVisual } from './airHockeySession';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -98,6 +101,7 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
  *  (world.reconcileRobots), so label it so it's findable. */
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
+  'air-hockey-table': '🏒 AIR HOCKEY TABLE',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
   'rose-bouquet': '🌹 ROSE BOUQUET',
   'purple-bouquet': '💜 PURPLE BOUQUET',
@@ -340,6 +344,14 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       }
       if (obj.userData.cloneVat) {
         w.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
+      }
+      if (obj.userData.airHockey) {
+        // 🏒 #115 — mirrors World.registerFurnitureGroup's branch.
+        registerAirHockeyVisual(
+          item.id,
+          obj.userData.airHockey as AirHockeyVisualHandle,
+          { x: item.pos.x, z: item.pos.z, rot: item.rot },
+        );
       }
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
