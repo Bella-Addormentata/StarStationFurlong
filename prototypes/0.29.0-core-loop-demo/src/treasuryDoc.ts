@@ -523,34 +523,42 @@ export function putSigningSession(session: SigningSession): boolean {
   return true;
 }
 
-function collectSessionSigs(
-  m: Y.Map<unknown>,
-  sessionId: string,
-): { signerPuzzleHash: Hex32; sig: string }[] {
-  const out: { signerPuzzleHash: Hex32; sig: string }[] = [];
-  const prefix = `sessionsig:${sessionId}:`;
-  for (const [key, value] of m.entries()) {
-    if (!key.startsWith(prefix)) continue;
-    if (typeof value !== 'object' || value === null) continue;
-    const entry = value as Record<string, unknown>;
-    if (!isHex32(entry.signerPuzzleHash)) continue;
-    if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
-    if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
-    out.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
-  }
-  return out.sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
-}
-
+// One pass over the whole map builds a signature index keyed by session, so
+// listing stays O(map size) no matter how many shells a peer plants —
+// per-shell rescans would be O(sessions × map size), a cheap read-freeze.
 export function listSigningSessions(proposalId: string): SigningSession[] {
   const m = map();
   if (!m) return [];
-  const out: SigningSession[] = [];
-  const prefix = `session:${proposalId}:`;
+  const shellPrefix = `session:${proposalId}:`;
+  const shells: { sessionId: string; shell: SigningSession }[] = [];
+  const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
   for (const [key, value] of m.entries()) {
-    if (!key.startsWith(prefix)) continue;
-    const sessionId = key.slice(prefix.length);
-    if (!validSessionShell(value, proposalId, sessionId)) continue;
-    const assembled = { ...value, collectedSigs: collectSessionSigs(m, sessionId) };
+    if (key.startsWith(shellPrefix)) {
+      const sessionId = key.slice(shellPrefix.length);
+      if (validSessionShell(value, proposalId, sessionId)) {
+        shells.push({ sessionId, shell: value });
+      }
+    } else if (key.startsWith('sessionsig:')) {
+      if (typeof value !== 'object' || value === null) continue;
+      const entry = value as Record<string, unknown>;
+      if (!isHex32(entry.signerPuzzleHash)) continue;
+      // Session ids are fixed-width Hex32, so the key decomposes exactly.
+      const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
+      if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
+      if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
+      let bucket = sigsBySession.get(sessionId);
+      if (!bucket) {
+        bucket = [];
+        sigsBySession.set(sessionId, bucket);
+      }
+      bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
+    }
+  }
+  const out: SigningSession[] = [];
+  for (const { sessionId, shell } of shells) {
+    const collectedSigs = (sigsBySession.get(sessionId) ?? [])
+      .sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
+    const assembled = { ...shell, collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
   }
   return out;
