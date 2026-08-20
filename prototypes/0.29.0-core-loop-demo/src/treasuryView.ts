@@ -271,6 +271,14 @@ export function windowsView(
       : null;
   const cached =
     cachedRaw && cachedWindowsMatch(cachedRaw, proposal) ? cachedRaw : null;
+  // A record that was held but rejected is not the same as no record, and
+  // saying "none is held" would quietly turn a conflicting peer write into
+  // an absence.
+  const registrationConflicts = registrationRaw !== null && registration === null;
+  const cachedConflicts = cachedRaw !== null && cached === null;
+  const missingRegistrationNote = registrationConflicts
+    ? 'an acceptance record is held here but it describes a different proposal'
+    : 'no acceptance record is held here';
   if (registration && rule) {
     try {
       return {
@@ -288,7 +296,9 @@ export function windowsView(
       return {
         windows: null,
         source: 'none',
-        trust: trustTag('absent'),
+        // Both inputs WERE held — they are just unusable. NO DATA would put
+        // "nothing cached yet" in the tooltip beside a note saying otherwise.
+        trust: trustTag('unverified'),
         note: 'The acceptance record and policy held here do not produce sensible clocks.',
       };
     }
@@ -300,16 +310,20 @@ export function windowsView(
       trust: trustTag('unverified'),
       note: registration
         ? 'Copied from another player: the company policy is missing here, so these clocks could not be worked out independently.'
-        : 'Copied from another player: no acceptance record is held here, so these clocks could not be worked out independently.',
+        : `Copied from another player: ${missingRegistrationNote}, so these clocks could not be worked out independently.`,
     };
   }
   return {
     windows: null,
     source: 'none',
-    trust: trustTag('absent'),
+    // A conflicting record IS data, however wrong — only a genuinely empty
+    // slot earns NO DATA.
+    trust: trustTag(registrationConflicts || cachedConflicts ? 'unverified' : 'absent'),
     note: registration
       ? 'The company policy is missing here, so this proposal’s clocks cannot be worked out.'
-      : 'No acceptance record for this proposal is held in this room yet.',
+      : registrationConflicts
+        ? 'The acceptance record held here describes a different proposal, so this one’s clocks cannot be worked out.'
+        : 'No acceptance record for this proposal is held in this room yet.',
   };
 }
 

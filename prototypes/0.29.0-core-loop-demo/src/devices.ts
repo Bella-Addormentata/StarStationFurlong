@@ -704,7 +704,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
           <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:#F0C060;">PERSONAL</div>
           <div id="device-terminal-funding-detail" style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:3px; line-height:1.5;"></div>
-          <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:6px;">
+          <!-- Disabled controls leave the tab order, so the reason they are
+               disabled cannot live only in their title attributes. -->
+          <div id="device-terminal-command-note" style="font-size:8.5px; color:#4A5560; margin-top:6px;">These actions are not available yet — they arrive with the treasury and node lanes. This terminal never spends.</div>
+          <div role="group" aria-label="Funding commands, all currently unavailable" aria-describedby="device-terminal-command-note" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">
             <button type="button" disabled title="Arrives with the treasury lane — the terminal cannot spend."
               style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
             <button type="button" disabled title="Arrives with the treasury lane."

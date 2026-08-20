@@ -2852,7 +2852,10 @@ function renderTreasuryApp(): void {
         : tag.level === "self-checked"
           ? "#f0c060"
           : "rgba(212,168,75,0.45)";
-    return `<span title="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
+    // Focusable and labelled: the qualification behind a badge (a signature
+    // shows authorship, not authority) is the whole point of showing it, and
+    // a title tooltip on an inert span never reaches a keyboard user.
+    return `<span role="note" tabindex="0" aria-label="${esc(`${tag.label}. ${tag.detail}`)}" title="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
   };
   const row = (label: string, value: string) =>
     `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">

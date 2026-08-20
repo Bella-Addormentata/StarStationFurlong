@@ -315,6 +315,30 @@ describe('records must claim the proposal they are filed under', () => {
     expect(windowsView(proposal, registration, rule, null).source).toBe('recomputed');
   });
 
+  it('says a conflicting record is conflicting, not missing', () => {
+    // Rejecting a mismatched record must not be reported as "none is held":
+    // that would turn a hostile peer write into a reassuring absence, and
+    // NO DATA in the badge would say the same thing again.
+    const wrongKind = { ...registration, kind: 'dissolve' } as ProposalRegistration;
+    const v = windowsView(proposal, wrongKind, null, null);
+    expect(v.note).toMatch(/different proposal/i);
+    expect(v.note).not.toMatch(/no acceptance record/i);
+    expect(v.trust.level).toBe('unverified');
+    // A genuinely empty slot still reads as absent.
+    const empty = windowsView(proposal, null, null, null);
+    expect(empty.note).toMatch(/no acceptance record/i);
+    expect(empty.trust.level).toBe('absent');
+  });
+
+  it('marks unusable-but-present inputs unverified rather than absent', () => {
+    const bad = { ...registration, acceptedHeight: Number.MAX_SAFE_INTEGER } as ProposalRegistration;
+    const v = windowsView(proposal, bad, rule, null);
+    expect(v.windows).toBeNull();
+    // Both inputs were held; NO DATA would contradict the note.
+    expect(v.trust.level).toBe('unverified');
+    expect(v.note).toMatch(/do not produce sensible clocks/i);
+  });
+
   it('ignores cached windows filed under the wrong proposal or version', () => {
     const foreign = { ...windows, proposalId: '9'.repeat(64) } as ProposalWindows;
     expect(windowsView(proposal, null, null, foreign).source).toBe('none');
