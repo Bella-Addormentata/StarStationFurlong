@@ -371,8 +371,19 @@ describe('scoping and staleness', () => {
     );
     expect(scoped.shown).toEqual([mine]);
     expect(scoped.otherCompanies).toBe(2);
-    // With no company known, nothing is hidden behind the player's back.
-    expect(scopeProposals([mine], null).otherCompanies).toBe(0);
+    expect(scoped.scopeUnknown).toBe(false);
+  });
+
+  it('withholds the list entirely when no company can be identified', () => {
+    // Rows carry no company, so an unscoped list would present several
+    // companies' proposals as one board's business. Report the count instead.
+    const unscoped = scopeProposals(
+      [mk('a'.repeat(64), '1'.repeat(64)), mk('b'.repeat(64), '2'.repeat(64))],
+      null,
+    );
+    expect(unscoped.shown).toEqual([]);
+    expect(unscoped.scopeUnknown).toBe(true);
+    expect(unscoped.otherCompanies).toBe(2);
   });
 
   it('leaves an ended approval round out instead of showing it as progress', () => {
@@ -437,7 +448,11 @@ describe('balances, sync, and the local verdict', () => {
     expect(s.localState).toBe('unavailable');
     expect(s.peerClaim).toBe('verified');
     expect(s.peerHeight).toBe(5_000_000);
+    // The peer claim is a shape-only cache like every other panel's data, so
+    // it carries the same explicit badge rather than prose alone.
+    expect(s.trust.level).toBe('unverified');
     expect(syncView(null).peerClaim).toBeNull();
+    expect(syncView(null).trust.level).toBe('absent');
   });
 
   it('labels where a display height came from', () => {
@@ -488,6 +503,30 @@ describe('policy, shares, and room funding', () => {
     expect(unbound.trust.level).toBe('absent');
     expect(unbound.readOnlyNote).toMatch(/does not check the chain/i);
     expect(unbound.unavailable.length).toBeGreaterThan(0);
+  });
+
+  it('labels the lapsed verdict apart from the record’s own signature', () => {
+    const base: RoomTreasuryBinding = {
+      v: 1,
+      networkGenesisChallenge: 'a'.repeat(64),
+      roomId: 'room-1',
+      companyId: 'b'.repeat(64),
+      treasuryLauncherId: 'c'.repeat(64),
+      policyVersion: 2,
+      profileId: 'p1',
+      boundByPub: 'pub',
+      boundAtHeight: 100,
+      expiresAfterHeight: 200,
+      policyReceiptId: 'd'.repeat(64),
+      sig: 'sig',
+    };
+    // The signature covers the record and the end height it names — not the
+    // claim that the end has passed, which comes from an unchecked height.
+    const lapsed = roomFundingView(base, 250);
+    expect(lapsed.lapsed).toBe(true);
+    expect(lapsed.lapsedNote).toMatch(/not covered by the signature/i);
+    expect(roomFundingView(base, 150).lapsedNote).toBeNull();
+    expect(roomFundingView(null).lapsedNote).toBeNull();
   });
 
   it('flags a binding whose own end height has passed', () => {

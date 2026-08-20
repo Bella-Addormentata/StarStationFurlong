@@ -469,6 +469,8 @@ export interface SyncView {
   /** A peer's claim, shown as hearsay and never used as a gate. */
   peerClaim: string | null;
   peerHeight: number | null;
+  /** The peer claim is a shape-only cache like any other panel's data. */
+  trust: TrustTag;
 }
 
 /**
@@ -483,6 +485,7 @@ export function syncView(peer: ChainSyncStatus | null): SyncView {
     localNote: 'This device is not verifying the chain yet, so nothing here is final and no spending is possible from the phone.',
     peerClaim: peer ? peer.state : null,
     peerHeight: peer && typeof peer.verifiedHeight === 'number' ? peer.verifiedHeight : null,
+    trust: trustTag(peer ? 'unverified' : 'absent'),
   };
 }
 
@@ -550,6 +553,12 @@ export interface RoomFundingView {
   bound: boolean;
   /** True when a binding exists but its own expiry height has passed. */
   lapsed: boolean;
+  /**
+   * Set whenever `lapsed` is true: the signature does not cover the judgement
+   * that the end height has passed, so that verdict is labelled separately
+   * from the record's own trust tag.
+   */
+  lapsedNote: string | null;
   companyId: string | null;
   treasuryId: string | null;
   profileId: string | null;
@@ -593,6 +602,7 @@ export function roomFundingView(
     return {
       bound: false,
       lapsed: false,
+      lapsedNote: null,
       companyId: null,
       treasuryId: null,
       profileId: null,
@@ -610,6 +620,7 @@ export function roomFundingView(
     return {
       bound: false,
       lapsed: false,
+      lapsedNote: null,
       companyId: null,
       treasuryId: null,
       profileId: null,
@@ -628,9 +639,17 @@ export function roomFundingView(
   const expires = binding.expiresAfterHeight ?? null;
   const lapsed =
     expires !== null && currentHeight !== null && currentHeight >= expires;
+  // The signature covers the record and the end height it names — NOT the
+  // claim that the end has passed. That verdict comes from a height this
+  // device did not check, so it is labelled apart from the record's own
+  // trust rather than riding on it.
+  const lapsedNote = lapsed
+    ? 'Whether that end height has passed is judged against a height another player reported, which is not covered by the signature and has not been checked here.'
+    : null;
   return {
     bound: true,
     lapsed,
+    lapsedNote,
     companyId: binding.companyId,
     treasuryId: binding.treasuryLauncherId,
     profileId: binding.profileId,
@@ -832,6 +851,12 @@ export interface ScopedProposals {
   shown: TreasuryProposal[];
   /** How many belong to some other company and were left out. */
   otherCompanies: number;
+  /**
+   * True when no company could be identified at all, so nothing is listed:
+   * the rows carry no company of their own, and a mixed list would be
+   * indistinguishable.
+   */
+  scopeUnknown: boolean;
 }
 
 /**
@@ -844,9 +869,18 @@ export function scopeProposals(
   proposals: TreasuryProposal[],
   companyId: string | null,
 ): ScopedProposals {
-  if (companyId === null) return { shown: proposals, otherCompanies: 0 };
+  if (companyId === null) {
+    // Withhold rather than mix: this is a one-company screen and the rows
+    // show no company, so an unscoped list would present several companies'
+    // proposals as one board's business. The count is still reported.
+    return { shown: [], otherCompanies: proposals.length, scopeUnknown: true };
+  }
   const shown = proposals.filter((p) => p.companyId === companyId);
-  return { shown, otherCompanies: proposals.length - shown.length };
+  return {
+    shown,
+    otherCompanies: proposals.length - shown.length,
+    scopeUnknown: false,
+  };
 }
 
 /** Largest allowance bound first — uses the no-parse mojo comparator. */

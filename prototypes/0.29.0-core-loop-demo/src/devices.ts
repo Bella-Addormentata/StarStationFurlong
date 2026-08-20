@@ -512,7 +512,22 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
               funding.readOnlyNote,
               `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
             ];
+      if (funding.lapsedNote) lines.splice(3, 0, funding.lapsedNote.toUpperCase());
       fundDetailEl.textContent = lines.join('  ');
+
+      // §10.2's link to the phone Treasury app. A <button> so it answers the
+      // keyboard; the phone router only delegates inside the phone shell and
+      // this terminal is mounted elsewhere, so it goes through the same
+      // window seam other cross-module callers use.
+      const openBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-open-treasury');
+      if (openBtn && !openBtn.dataset.wired) {
+        openBtn.dataset.wired = '1';
+        openBtn.addEventListener('click', () => {
+          const open = (window as unknown as { __ssfOpenTreasury?: () => void })
+            .__ssfOpenTreasury;
+          if (open) open();
+        });
+      }
     }
 
     // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
@@ -699,7 +714,8 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
             <button type="button" disabled title="Asks this player's own node for chain state — that lane has not shipped."
               style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">REFRESH PROOF</button>
           </div>
-          <div style="font-size:8.5px; color:#33404E; margin-top:5px;">Open 🏦 TREASURY on your phone for the company's board and proposals.</div>
+          <button type="button" id="device-terminal-open-treasury"
+            style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>
         </div>
         <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only</div>
       `;

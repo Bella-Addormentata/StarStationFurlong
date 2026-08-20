@@ -3094,14 +3094,21 @@ function renderTreasuryApp(): void {
         : dim("No proposals in this room's records yet.")
     }
     ${
-      scoped.otherCompanies > 0
+      scoped.scopeUnknown && scoped.otherCompanies > 0
         ? dim(
-            `${scoped.otherCompanies} more proposal${scoped.otherCompanies === 1 ? "" : "s"} in this room belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
+            `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? " is" : "s are"} held in this room, but without company details there is no way to tell whose ${scoped.otherCompanies === 1 ? "it is" : "they are"}, so ${scoped.otherCompanies === 1 ? "it is" : "they are"} not listed.`,
           )
-        : ""
+        : scoped.otherCompanies > 0
+          ? dim(
+              `${scoped.otherCompanies} more proposal${scoped.otherCompanies === 1 ? "" : "s"} in this room belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
+            )
+          : ""
     }
 
-    ${header("CHAIN VIEW")}
+    <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+      <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">CHAIN VIEW</span>
+      ${badge(sync.trust)}
+    </div>
     ${row("This device", "not verifying")}
     ${
       sync.peerClaim
@@ -4772,6 +4779,15 @@ function setupSpacePhoneOverlay() {
     if (!id || !(id in phoneViewMeta)) return false;
     showPhoneView(id);
     return true;
+  };
+  // 🏦 Cross-surface entry point, same posture as __ssfRoomId: the room
+  // terminal's FUNDING panel is mounted outside the phone shell, so it cannot
+  // use the delegated router. It opens the phone straight to TREASURY.
+  (
+    window as unknown as { __ssfOpenTreasury?: () => void }
+  ).__ssfOpenTreasury = () => {
+    container?.classList.add("active");
+    showPhoneView("treasury");
   };
   phoneShell.addEventListener("click", (e) => routeFrom(e.target));
   phoneShell.addEventListener("keydown", (e) => {
