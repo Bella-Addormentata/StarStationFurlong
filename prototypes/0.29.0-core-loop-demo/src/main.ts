@@ -2874,6 +2874,16 @@ function renderTreasuryApp(): void {
   const sync = syncView(peerSync);
   const { height, source: heightSource } = displayHeight(peerSync);
   const policyCache = bound ? readPolicyCache() : null;
+  // Which company this screen may present, shared by BOTH branches: an open
+  // detail must obey the same scope as the list, or a binding or policy
+  // changing under it would leave a proposal on screen that the list has
+  // since withheld.
+  const roomId = activeBootstrap?.roomId ?? "";
+  const readable = net.configured && Boolean(roomId);
+  const scope = companyScope(
+    readable ? readRoomBinding(roomId) : null,
+    policyCache?.policy ?? null,
+  );
 
   // The local verdict, always first: this device is not verifying the chain,
   // so the whole app is read-only and says so (amendment §6/§15.3).
@@ -2901,6 +2911,18 @@ function renderTreasuryApp(): void {
     const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
     if (!proposal) {
       view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim("This proposal is no longer in the room's records.")}`;
+      return;
+    }
+    // The list would withhold this proposal now — a binding or policy landing
+    // while the detail was open can change whose company this screen shows.
+    if (scope.companyId !== null && proposal.companyId !== scope.companyId) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        "This proposal belongs to a different company than the one this room now shows, so it is no longer listed here.",
+      )}`;
+      return;
+    }
+    if (scope.mismatch) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(esc(scope.warning ?? ""))}`;
       return;
     }
     const registration = readRegistration(proposal.proposalId);
@@ -3004,23 +3026,14 @@ function renderTreasuryApp(): void {
   }
 
   // ── List screen ────────────────────────────────────────────────────────
-  const roomId = activeBootstrap?.roomId ?? "";
-  // Reads are only meaningful when a network is pinned; a disabled read is
-  // not evidence that no record exists.
-  const readable = net.configured && Boolean(roomId);
+  // roomId, readable and scope come from above, so this branch and the detail
+  // branch always agree about whose company is on screen.
   const binding = roomFundingView(
     readable ? readRoomBinding(roomId) : null,
     height,
     readable,
   );
   const balances = balanceView();
-  // The binding is signed; the policy cache is replaceable. If they name
-  // different companies, show neither rather than mixing one company's
-  // funding line with another's board.
-  const scope = companyScope(
-    readable && roomId ? readRoomBinding(roomId) : null,
-    policyCache?.policy ?? null,
-  );
   const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
   const scoped = scopeProposals(listProposals(), scope.companyId);
   const rows = proposalRows(

@@ -36,6 +36,9 @@ export interface TreasuryNetwork {
  */
 export const NO_NETWORK_PIN = 'no-network-configured';
 
+/** The last malformed value warned about, so the warning is not repeated. */
+let lastWarnedValue: string | null = null;
+
 function envValue(key: string): string {
   // Vite's import.meta.env in the browser; process.env under node tooling and
   // tests. Both are read because the key is dynamic, so Vite's static
@@ -74,7 +77,11 @@ export function treasuryNetwork(): TreasuryNetwork {
       configured: true,
     };
   }
-  if (raw.length > 0) {
+  // Warn once per distinct bad value: this is called from the room
+  // terminal's refresh loop, so warning every time would turn one bad
+  // deployment setting into a console flood.
+  if (raw.length > 0 && raw !== lastWarnedValue) {
+    lastWarnedValue = raw;
     console.warn('treasuryNetwork: VITE_SSF_TREASURY_GENESIS is not 64 lowercase hex — treasury records will not be shown');
   }
   return {
