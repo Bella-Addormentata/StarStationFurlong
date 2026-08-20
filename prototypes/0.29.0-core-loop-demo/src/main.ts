@@ -66,6 +66,7 @@ import {
   balanceView,
   boardThresholdFor,
   boardView,
+  checkpointsFor,
   displayHeight,
   formatHeight,
   governanceRuleFor,
@@ -2920,7 +2921,9 @@ function renderTreasuryApp(): void {
     );
     const votes = voteTallyView(
       listVotes(proposal.proposalId),
-      listCheckpoints(proposal.proposalId),
+      // Vote records are keyed by proposal id alone, so one filed under
+      // another company must not be counted among this proposal's.
+      checkpointsFor(listCheckpoints(proposal.proposalId), proposal),
     );
     // Rounds and thresholds only count when they belong to THIS proposal's
     // company and policy revision — both are peer-writable.
@@ -3053,6 +3056,7 @@ function renderTreasuryApp(): void {
         : ""
     }
     ${dim(esc(binding.detail))}
+    ${binding.lapsedNote ? dim(esc(binding.lapsedNote)) : ""}
     ${dim(esc(binding.readOnlyNote))}
     ${dim(`Not shown yet: ${esc(binding.unavailable.join("; "))}.`)}
 

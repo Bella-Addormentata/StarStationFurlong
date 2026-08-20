@@ -30,6 +30,7 @@ import {
   formatHeight,
   formatShares,
   boardThresholdFor,
+  checkpointsFor,
   companyScope,
   formatXch,
   governanceRuleFor,
@@ -268,6 +269,19 @@ describe('matching records to the proposal they claim', () => {
     expect(boardThresholdFor(proposal, null)).toBeNull();
   });
 
+  it('drops vote records filed under another company', () => {
+    // Records are keyed by proposal id alone, so a self-consistent one from
+    // another company would otherwise be counted among this proposal's.
+    const cp = (companyId: string): TreasuryCheckpoint => ({
+      ...(contracts.checkpoint.body as object),
+      checkpointId: contracts.checkpoint.checkpointId,
+      companyId,
+      proposalId: proposal.proposalId,
+    } as TreasuryCheckpoint);
+    const mine = cp(proposal.companyId);
+    expect(checkpointsFor([mine, cp('9'.repeat(64))], proposal)).toEqual([mine]);
+  });
+
   it('drops approval rounds belonging to another company or revision', () => {
     const round = (over: Partial<SigningSession>): SigningSession => ({
       v: 1,
@@ -441,6 +455,10 @@ describe('scoping and staleness', () => {
     expect(at500.collected).toBe(1);
     expect(at500.sessions).toBe(1);
     expect(at500.note).toMatch(/past its end height/i);
+    // The height doing that filtering is itself a peer's claim — one could
+    // hide live rounds or revive ended ones, so the basis must be named.
+    expect(at500.note).toMatch(/another player reported/i);
+    expect(approvalsView([live], 3, 500).note).toMatch(/another player reported/i);
     // With no height, nothing can be judged stale — say so rather than guess.
     const noHeight = approvalsView([dead, live], 3, null);
     expect(noHeight.collected).toBe(5);

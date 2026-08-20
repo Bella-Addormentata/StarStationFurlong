@@ -429,14 +429,18 @@ export function approvalsView(
     if (!best || s.collectedSigs.length > best.collectedSigs.length) best = s;
   }
   const required = policyThreshold ?? best?.requiredThreshold ?? null;
+  // Which rounds count as open is decided against a height nobody here
+  // checked, and a peer reporting a very high or low one could hide live
+  // rounds or revive ended ones — so the basis is named, exactly as it is for
+  // proposal clocks and funding expiry.
   const staleness =
     currentHeight === null
       ? sessions.length > 0
         ? ' Whether these rounds are still open cannot be judged without a chain height.'
         : ''
       : expired > 0
-        ? ` ${expired} round${expired === 1 ? '' : 's'} already past its end height ${expired === 1 ? 'is' : 'are'} left out.`
-        : '';
+        ? ` ${expired} round${expired === 1 ? '' : 's'} already past its end height ${expired === 1 ? 'is' : 'are'} left out, judged against a height another player reported and not checked here.`
+        : ' Which rounds count as still open is judged against a height another player reported, not checked here.';
   return {
     sessions: live.length,
     collected: best ? best.collectedSigs.length : 0,
@@ -771,6 +775,22 @@ export function sessionsFor(
       s.companyId === proposal.companyId &&
       s.policyVersion === proposal.policyVersion &&
       s.proposalId === proposal.proposalId,
+  );
+}
+
+/**
+ * The vote-confirmation records that actually belong to a proposal. Like
+ * approval rounds, these are keyed by proposal id alone, so a peer can file a
+ * self-consistent record carrying that id under a different company and have
+ * it counted among this proposal's.
+ */
+export function checkpointsFor(
+  checkpoints: TreasuryCheckpoint[],
+  proposal: TreasuryProposal,
+): TreasuryCheckpoint[] {
+  return checkpoints.filter(
+    (c) =>
+      c.companyId === proposal.companyId && c.proposalId === proposal.proposalId,
   );
 }
 
