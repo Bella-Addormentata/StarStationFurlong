@@ -35,6 +35,8 @@ import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
+import { readRoomBinding, treasuryDocBound } from './treasuryDoc';
+import { formatHeight, roomFundingView, shortId } from './treasuryView';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -445,6 +447,31 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         : 'NO ADJACENT MODULE DATA';
     }
 
+    // 🏦 FUNDING (plan §10.2): whether this room's costs come from the owner
+    // personally or from a company, read from the room's signed binding cache.
+    // Read-only by design in this PR — the terminal never spends, never asks
+    // for a treasury key, and funding a room grants nobody edit rights (§9.4).
+    const fundEl = panel.querySelector<HTMLElement>('#device-terminal-funding-source');
+    const fundDetailEl = panel.querySelector<HTMLElement>('#device-terminal-funding-detail');
+    if (fundEl && fundDetailEl) {
+      const roomId =
+        (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+      const funding = roomFundingView(
+        roomId && treasuryDocBound() ? readRoomBinding(roomId) : null,
+      );
+      fundEl.textContent = funding.headline.toUpperCase();
+      fundEl.style.color = funding.bound ? '#00E676' : '#F0C060';
+      const lines = funding.bound
+        ? [
+            `COMPANY ${shortId(funding.companyId ?? '')} · POLICY v${funding.policyVersion}`,
+            `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · EXPIRES ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+            'NOT VERIFIED HERE — this terminal does not read the chain.',
+            funding.detail,
+          ]
+        : [funding.detail];
+      fundDetailEl.textContent = lines.join('  ');
+    }
+
     // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
     // change (e.g. set via console for the non-owner test path) shows up live.
     const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
@@ -615,6 +642,22 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <div style="height:12px; border:1px solid rgba(212,168,75,0.22); border-radius:3px; background:repeating-linear-gradient(45deg, rgba(74,85,96,0.25) 0 6px, transparent 6px 12px);"></div>
         </div>
         <div id="device-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
+        <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+          <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
+          <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:#F0C060;">PERSONAL</div>
+          <div id="device-terminal-funding-detail" style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:3px; line-height:1.5;"></div>
+          <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:6px;">
+            <button type="button" disabled title="Arrives with the treasury lane — the terminal cannot spend."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">SELECT PROFILE</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">UNBIND</button>
+            <button type="button" disabled title="Asks this player's own node for chain state — that lane has not shipped."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">REFRESH PROOF</button>
+          </div>
+          <div style="font-size:8.5px; color:#33404E; margin-top:5px;">Open 🏦 TREASURY on your phone for the company's board and proposals.</div>
+        </div>
         <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only</div>
       `;
       // Input capture (plan §D0.3): clicks inside the device UI never reach

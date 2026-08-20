@@ -44,11 +44,41 @@ import {
   ysyncSigner,
   hasStoredIdentity,
 } from "./keypair";
-import { bindTreasuryDoc } from "./treasuryDoc";
-// Dev placeholder network pin for the treasury cache layer — deliberately
-// matches NO real chain genesis, so every foreign record is rejected until
-// real network configuration arrives with PR C (plan §17.5).
-const TREASURY_DEV_GENESIS = "0".repeat(64);
+import {
+  bindTreasuryDoc,
+  listCheckpoints,
+  listProposals,
+  listSigningSessions,
+  listVotes,
+  readChainSyncStatus,
+  readPolicyCache,
+  readProposal,
+  readProposalPayload,
+  readRegistration,
+  readRoomBinding,
+  readWindowsCache,
+  subscribeTreasury,
+  treasuryDocBound,
+} from "./treasuryDoc";
+import { treasuryNetwork } from "./treasuryNetwork";
+import {
+  approvalsView,
+  balanceView,
+  boardView,
+  displayHeight,
+  formatHeight,
+  phaseLabel,
+  proposalKindLabel,
+  proposalPhase,
+  proposalRows,
+  roomFundingView,
+  shareClassViews,
+  shortId,
+  syncView,
+  trustTag,
+  voteTallyView,
+  windowsView,
+} from "./treasuryView";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
@@ -1221,7 +1251,7 @@ async function joinRoomAtEpoch(
   // network configuration when PR C wires real treasury flows.
   bindTreasuryDoc(sync.doc, {
     verifySig: verifyIdentity,
-    networkGenesisChallenge: TREASURY_DEV_GENESIS,
+    networkGenesisChallenge: treasuryNetwork().genesisChallenge,
   });
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
@@ -1298,6 +1328,10 @@ async function joinRoomAtEpoch(
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
+    // 🏦 PR C: a treasury record landing (proposal, vote, policy cache) repaints
+    // an open TREASURY view. Registered once — the listener set is module-level
+    // in treasuryDoc, so it survives every rebind.
+    subscribeTreasury(() => renderTreasuryApp());
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
@@ -2753,6 +2787,247 @@ function renderBankApp(): void {
   `;
 }
 
+// ── 🏦 TREASURY view (PR C) ──────────────────────────────────────────────────
+// Read-only company treasury, reached from VENTURES. Everything here is a
+// DISPLAY of the room's signed caches (treasuryDoc) — the phone holds no
+// treasury key, decides no balance, and declares nothing executable (plan
+// §4.1). Each panel carries a badge saying how much checking actually
+// happened, because the cache validates record classes differently: signed,
+// self-checked (content matches its own fingerprint), or unverified shape.
+// Display logic lives in treasuryView.ts so it stays unit-tested.
+
+/** Which proposal detail is open ('' = the list). */
+let treasuryDetailId = "";
+
+function renderTreasuryApp(): void {
+  const view = document.getElementById("phone-app-treasury");
+  if (!view) return;
+  // Same black-inheritance fix as the BANK/VENTURES apps.
+  view.style.color = "#e8d5a3";
+  if (!view.dataset.wired) {
+    view.dataset.wired = "1";
+    view.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-treasury-action]",
+      );
+      if (!el) return;
+      const action = el.dataset.treasuryAction;
+      if (action === "open") treasuryDetailId = el.dataset.proposalId ?? "";
+      if (action === "back") treasuryDetailId = "";
+      renderTreasuryApp();
+    });
+  }
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const header = (t: string) =>
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+  const dim = (t: string) =>
+    `<div style="font-size:9px; color:rgba(212,168,75,0.45); margin-top:4px; line-height:1.6;">${t}</div>`;
+  const badge = (tag: { level: string; label: string; detail: string }) => {
+    const color =
+      tag.level === "signed"
+        ? "#7ddb8f"
+        : tag.level === "self-checked"
+          ? "#f0c060"
+          : "rgba(212,168,75,0.45)";
+    return `<span title="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
+  };
+  const row = (label: string, value: string) =>
+    `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+      <span style="color:rgba(212,168,75,0.7);">${label}</span>
+      <span style="flex-shrink:0; color:#f0c060; text-align:right;">${value}</span>
+    </div>`;
+
+  const bound = treasuryDocBound();
+  const net = treasuryNetwork();
+  const sync = syncView(bound ? readChainSyncStatus() : null);
+  const { height, source: heightSource } = displayHeight(
+    bound ? readChainSyncStatus() : null,
+  );
+  const policyCache = bound ? readPolicyCache() : null;
+
+  // The local verdict, always first: this device is not verifying the chain,
+  // so the whole app is read-only and says so (amendment §6/§15.3).
+  const verdictBanner = `
+    <div style="border:1px solid rgba(212,168,75,0.25); border-left:3px solid #f0c060; border-radius:6px; padding:8px 10px; background:rgba(212,168,75,0.05);">
+      <div style="font-size:10px; font-weight:800; color:#f0c060;">READ-ONLY · NOT VERIFIED HERE</div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.6); margin-top:3px; line-height:1.6;">${esc(sync.localNote)}</div>
+      ${
+        net.configured
+          ? ""
+          : `<div style="font-size:9px; color:rgba(212,168,75,0.45); margin-top:4px;">No company network is configured for this build, so nothing shown here is tied to a real chain.</div>`
+      }
+    </div>`;
+
+  if (!bound) {
+    view.innerHTML = `${verdictBanner}
+      ${header("COMPANY TREASURY")}
+      ${dim("Not connected to a room yet — treasury records ride the room you are standing in.")}`;
+    return;
+  }
+
+  // ── Proposal detail ────────────────────────────────────────────────────
+  if (treasuryDetailId) {
+    const proposal = readProposal(treasuryDetailId);
+    const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
+    if (!proposal) {
+      view.innerHTML = `${back}${header("PROPOSAL")}${dim("This proposal is no longer in the room's records.")}`;
+      return;
+    }
+    const registration = readRegistration(proposal.proposalId);
+    const rule = policyCache?.policy.governanceRules[proposal.kind] ?? null;
+    const w = windowsView(registration, rule, readWindowsCache(proposal.proposalId));
+    const votes = voteTallyView(
+      listVotes(proposal.proposalId),
+      listCheckpoints(proposal.proposalId),
+    );
+    const approvals = approvalsView(listSigningSessions(proposal.proposalId));
+    const phase = w.windows ? proposalPhase(w.windows, height) : "unknown-height";
+    const payload = readProposalPayload(proposal.payloadHash);
+
+    view.innerHTML = `${back}
+      <div style="display:flex; align-items:center; gap:6px; margin-top:8px;">
+        <span style="font-size:13px; font-weight:800; color:#f0c060;">${esc(proposalKindLabel(proposal.kind))}</span>
+        ${badge(trustTag("signed"))}
+      </div>
+      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px; word-break:break-all;">${esc(proposal.proposalId)}</div>
+      ${dim("The proposal itself is signed by its proposer, and that signature was checked on this device.")}
+
+      ${header("CLOCKS")}
+      <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+        <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(phaseLabel(phase))}</span>
+        ${badge(w.trust)}
+      </div>
+      ${
+        w.windows
+          ? row("Accepted at", formatHeight(w.windows.acceptedHeight)) +
+            row("Voting ends", formatHeight(w.windows.votingEndsHeight)) +
+            row("Veto ends", formatHeight(w.windows.vetoEndsHeight)) +
+            row("Board may act", formatHeight(w.windows.executableFromHeight)) +
+            row("Expires", formatHeight(w.windows.expiresAfterHeight))
+          : ""
+      }
+      ${dim(esc(w.note))}
+      ${dim(
+        heightSource === "peer-reported"
+          ? `Position on the clocks uses a height another player reported (${formatHeight(height ?? 0)}) — not checked here.`
+          : "No chain height available on this device, so the phone will not say which window is open.",
+      )}
+
+      ${header("VOTES HELD IN THIS ROOM")}
+      ${row("Held here", `${votes.held}`)}
+      ${row("Yes · No", `${votes.yes} · ${votes.no}`)}
+      ${row("Abstain · Veto", `${votes.abstain} · ${votes.veto}`)}
+      ${row("Confirmed vote records", `${votes.confirmedRecords}${votes.pendingRecords ? ` (+${votes.pendingRecords} pending)` : ""}`)}
+      ${dim(esc(votes.note))}
+
+      ${header("BOARD APPROVALS")}
+      ${row("Collected", `${approvals.collected} of ${approvals.required || "—"}`)}
+      ${dim(esc(approvals.note))}
+
+      ${header("WHAT IT PAYS FOR")}
+      ${
+        payload
+          ? `<div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; word-break:break-all;">${esc(payload.slice(0, 240))}${payload.length > 240 ? "…" : ""}</div>
+             ${dim("Contents match the fingerprint the proposal commits to.")}`
+          : dim("The details behind this proposal are not held in this room yet.")
+      }`;
+    return;
+  }
+
+  // ── List screen ────────────────────────────────────────────────────────
+  const roomId = activeBootstrap?.roomId ?? "";
+  const binding = roomFundingView(roomId ? readRoomBinding(roomId) : null);
+  const balances = balanceView();
+  const rows = proposalRows(
+    listProposals(),
+    (id) => {
+      const p = readProposal(id);
+      const reg = readRegistration(id);
+      const rule = p ? (policyCache?.policy.governanceRules[p.kind] ?? null) : null;
+      return windowsView(reg, rule, readWindowsCache(id)).windows;
+    },
+    height,
+    heightSource,
+  );
+
+  view.innerHTML = `${verdictBanner}
+
+    ${header("THIS ROOM")}
+    <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+      <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(binding.headline)}</span>
+      ${badge(binding.trust)}
+    </div>
+    ${
+      binding.bound
+        ? row("Company", esc(shortId(binding.companyId ?? ""))) +
+          row("Policy version", `${binding.policyVersion}`) +
+          row("Bound at", formatHeight(binding.boundAtHeight ?? 0))
+        : ""
+    }
+    ${dim(esc(binding.detail))}
+
+    ${header("BALANCES")}
+    <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.6); margin-top:5px;">${esc(balances.headline)}</div>
+    ${dim(esc(balances.detail))}
+
+    ${header("COMPANY")}
+    ${
+      policyCache
+        ? (() => {
+            const b = boardView(policyCache.policy);
+            const classes = shareClassViews(policyCache.policy);
+            return `<div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
+                ${badge(b.trust)}
+              </div>
+              ${row("Policy version", `${b.policyVersion}`)}
+              ${row("Fee ceiling per spend", esc(b.maxFee))}
+              ${row("Policy fingerprint", esc(shortId(policyCache.policyHash)))}
+              ${classes
+                .map((c) =>
+                  row(
+                    `Share class · ${esc(c.id)}`,
+                    `${c.votesPerWholeShare} vote${c.votesPerWholeShare === 1 ? "" : "s"} per share${c.grantsRoomAccess ? " · room access" : ""}`,
+                  ),
+                )
+                .join("")}
+              ${dim(esc(b.note))}`;
+          })()
+        : dim("No company policy cached in this room yet.")
+    }
+
+    ${header(`PROPOSALS${rows.length ? ` · ${rows.length}` : ""}`)}
+    ${
+      rows.length
+        ? rows
+            .map(
+              (r) => `<div data-treasury-action="open" data-proposal-id="${esc(r.proposalId)}" role="button" tabindex="0"
+                style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
+                <span style="min-width:0;">
+                  <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
+                  <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)}</span>
+                </span>
+                <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">${esc(r.phaseLabel)}</span>
+              </div>`,
+            )
+            .join("")
+        : dim("No proposals in this room's records yet.")
+    }
+
+    ${header("CHAIN VIEW")}
+    ${row("This device", "not verifying")}
+    ${
+      sync.peerClaim
+        ? row(
+            "Another player reports",
+            `${esc(sync.peerClaim)}${sync.peerHeight !== null ? ` · ${formatHeight(sync.peerHeight)}` : ""}`,
+          )
+        : row("Another player reports", "nothing")
+    }
+    ${dim("Reports from other players are shown as claims only — your own node's view is what will decide, once that lane ships.")}`;
+}
+
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
 // Screen 1: YOUR STAKES (every entity you hold shares in) + REAL ESTATE (every
 // module you personally own — the deeds ledger). Screen 2a: venture detail —
@@ -3991,6 +4266,12 @@ function renderVenturesApp(): void {
     ${redeemBlock}
     ${foundBlock}
     ${addBlock}
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">COMPANY</div>
+    <div data-phone-app="treasury" role="button" tabindex="0" aria-label="Open the company Treasury"
+      style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:8px 10px; border:1px solid rgba(212,168,75,0.25); border-radius:6px; cursor:pointer;">
+      <span style="font-size:10px; font-weight:700; color:#f0c060;">🏦 TREASURY</span>
+      <span style="font-size:9px; color:rgba(212,168,75,0.5);">board · proposals · funding ›</span>
+    </div>
   `;
 }
 const CHARTER_TOTAL_SHARES_LABEL = 100;
@@ -4210,6 +4491,7 @@ function setupSpacePhoneOverlay() {
     | "bank"
     | "access"
     | "ventures"
+    | "treasury"
     | "settings"
     | "setnet"
     | "setstats";
@@ -4247,6 +4529,11 @@ function setupSpacePhoneOverlay() {
       title: "🚀 VENTURES",
       subtitle: "Charters · Shares · Real Estate",
     },
+    treasury: {
+      elId: "phone-app-treasury",
+      title: "🏦 TREASURY",
+      subtitle: "Company · Proposals · Receipts",
+    },
     settings: {
       elId: "phone-app-settings",
       title: "⚙️ SETTINGS",
@@ -4267,6 +4554,8 @@ function setupSpacePhoneOverlay() {
   const phoneViewParent: Partial<Record<PhoneViewId, PhoneViewId>> = {
     setnet: "settings",
     setstats: "settings",
+    // 🏦 The treasury opens from VENTURES (plan §11), so BACK returns there.
+    treasury: "ventures",
   };
 
   // 📦 De-overlay (owner request): the Network Details, stats and room-info
@@ -4377,21 +4666,28 @@ function setupSpacePhoneOverlay() {
       renderVenturesApp();
     }
     if (id === "bank") renderBankApp();
+    if (id === "treasury") {
+      treasuryDetailId = "";
+      renderTreasuryApp();
+    }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
   };
 
-  // App tiles on the home screen route into their views
-  document
-    .querySelectorAll<HTMLButtonElement>(".phone-app-tile")
-    .forEach((tile) => {
-      tile.addEventListener("click", () => {
-        const target = tile.dataset.phoneApp as PhoneViewId | undefined;
-        if (target && target in phoneViewMeta) {
-          showPhoneView(target);
-        }
-      });
-    });
+  // App tiles on the home screen route into their views. Delegated from the
+  // phone shell rather than bound per tile, so links rendered INSIDE an app
+  // (VENTURES → 🏦 TREASURY) survive that app's innerHTML repaints.
+  (document.getElementById("phone-screen") ?? document).addEventListener(
+    "click",
+    (e) => {
+      const el = (e.target as HTMLElement | null)?.closest<HTMLElement>(
+        "[data-phone-app]",
+      );
+      if (!el) return;
+      const target = el.dataset.phoneApp as PhoneViewId | undefined;
+      if (target && target in phoneViewMeta) showPhoneView(target);
+    },
+  );
 
   if (backBtn) {
     backBtn.addEventListener("click", () => {
