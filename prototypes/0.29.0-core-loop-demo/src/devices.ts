@@ -36,6 +36,7 @@ import {
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
 import { readChainSyncStatus, readRoomBinding, treasuryDocBound } from './treasuryDoc';
+import { treasuryNetwork } from './treasuryNetwork';
 import { displayHeight, formatHeight, roomFundingView, shortId } from './treasuryView';
 import {
   getItemDef, loadTrunkState,
@@ -456,7 +457,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     if (fundEl && fundDetailEl) {
       const roomId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
-      const connected = Boolean(roomId) && treasuryDocBound();
+      // treasuryDocBound() only says a room document is attached: with no
+      // network pinned, every treasury read is disabled and returns null,
+      // which is NOT the same as there being no funding record. Gate on the
+      // network too so a disabled read is never reported as an absence.
+      const connected =
+        Boolean(roomId) && treasuryDocBound() && treasuryNetwork().configured;
       // Without a height an ended binding cannot be spotted, so a lapsed
       // record would read as current funding. Only a peer-reported height
       // exists today — it is enough to mark a record lapsed (a conservative
@@ -467,6 +473,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       const funding = roomFundingView(
         connected ? readRoomBinding(roomId) : null,
         height,
+        connected,
       );
       // No record is NOT the same fact as "funded personally", and an
       // unreachable room document is a third state again — say which one.

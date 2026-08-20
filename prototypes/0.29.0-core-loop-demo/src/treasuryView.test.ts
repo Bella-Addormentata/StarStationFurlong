@@ -39,6 +39,7 @@ import {
   proposalPhase,
   proposalRows,
   roomFundingView,
+  scopeProposals,
   shareClassViews,
   shortId,
   sortByAmountDesc,
@@ -112,8 +113,18 @@ describe('proposal phase', () => {
 });
 
 describe('window derivation (recompute to trust)', () => {
+  // The proposal these records are filed under: same id, kind and version as
+  // the golden-vector registration, so identity checks pass.
+  const subject = {
+    ...(contracts.proposal.unsigned as object),
+    proposalId: registration.proposalId,
+    policyVersion: registration.policyVersion,
+    kind: registration.kind,
+    proposerSig: 'sig',
+  } as TreasuryProposal;
+
   it('recomputes rather than trusting the cached copy', () => {
-    const v = windowsView(registration, rule, null);
+    const v = windowsView(subject, registration, rule, null);
     expect(v.source).toBe('recomputed');
     expect(v.windows).toEqual(deriveProposalWindows(registration, rule));
     // Recomputation does not outrank its inputs: both the acceptance record
@@ -124,31 +135,31 @@ describe('window derivation (recompute to trust)', () => {
   });
 
   it('says which input is missing rather than blaming the acceptance record', () => {
-    const noPolicy = windowsView(registration, null, null);
+    const noPolicy = windowsView(subject, registration, null, null);
     expect(noPolicy.note).toMatch(/policy/i);
     expect(noPolicy.note).not.toMatch(/not been accepted|no acceptance record/i);
-    const noRegistration = windowsView(null, rule, null);
+    const noRegistration = windowsView(subject, null, rule, null);
     expect(noRegistration.note).toMatch(/acceptance record/i);
   });
 
   it('ignores a tampered cache when it can recompute', () => {
     const tampered = { ...windows, expiresAfterHeight: windows.expiresAfterHeight + 999 };
-    const v = windowsView(registration, rule, tampered);
+    const v = windowsView(subject, registration, rule, tampered);
     expect(v.windows?.expiresAfterHeight).toBe(windows.expiresAfterHeight);
   });
 
   it('falls back to the cached copy, marked unverified, when it cannot recompute', () => {
-    const v = windowsView(null, null, windows);
+    const v = windowsView(subject, null, null, windows);
     expect(v.source).toBe('cached');
     expect(v.trust.level).toBe('unverified');
   });
 
   it('reports absence rather than throwing on malformed inputs', () => {
     const bad = { ...registration, acceptedHeight: -1 } as ProposalRegistration;
-    const v = windowsView(bad, rule, null);
+    const v = windowsView(subject, bad, rule, null);
     expect(v.source).toBe('none');
     expect(v.windows).toBeNull();
-    expect(windowsView(null, null, null).trust.level).toBe('absent');
+    expect(windowsView(subject, null, null, null).trust.level).toBe('absent');
   });
 });
 
@@ -218,7 +229,7 @@ describe('votes and approvals', () => {
     expect(a.trust.level).toBe('unverified');
   });
 
-  it('prefers the policy threshold over the round’s peer-authored copy', () => {
+  it('prefers the policy threshold over the round”™s peer-authored copy', () => {
     const withPolicy = approvalsView([session(1, 99)], 2);
     expect(withPolicy.required).toBe(2);
     expect(withPolicy.requiredFromPolicy).toBe(true);
@@ -277,6 +288,84 @@ describe('matching records to the proposal they claim', () => {
       proposal,
     );
     expect(kept).toEqual([mine]);
+  });
+});
+
+describe('records must claim the proposal they are filed under', () => {
+  const proposal = {
+    ...(contracts.proposal.unsigned as object),
+    proposalId: contracts.windows.registration.proposalId,
+    proposerSig: 'sig',
+  } as TreasuryProposal;
+
+  it('ignores a registration whose kind or version disagrees', () => {
+    // The cache keys registrations by proposal id alone, so a peer can file
+    // one describing a different rulebook. Splicing it with this proposal's
+    // rule would produce clocks it never answered to.
+    const wrongKind = { ...registration, kind: 'dissolve' } as ProposalRegistration;
+    expect(windowsView(proposal, wrongKind, rule, null).source).toBe('none');
+    const wrongVersion = { ...registration, policyVersion: 99 } as ProposalRegistration;
+    expect(windowsView(proposal, wrongVersion, rule, null).source).toBe('none');
+    // The matching one still works.
+    expect(windowsView(proposal, registration, rule, null).source).toBe('recomputed');
+  });
+
+  it('ignores cached windows filed under the wrong proposal or version', () => {
+    const foreign = { ...windows, proposalId: '9'.repeat(64) } as ProposalWindows;
+    expect(windowsView(proposal, null, null, foreign).source).toBe('none');
+    const wrongVersion = { ...windows, policyVersion: 99 } as ProposalWindows;
+    expect(windowsView(proposal, null, null, wrongVersion).source).toBe('none');
+    expect(windowsView(proposal, null, null, windows).source).toBe('cached');
+  });
+});
+
+describe('scoping and staleness', () => {
+  const mk = (companyId: string, id: string): TreasuryProposal => ({
+    ...(contracts.proposal.unsigned as object),
+    companyId,
+    proposalId: id,
+    proposerSig: 'sig',
+  } as TreasuryProposal);
+
+  it('lists only the shown company”™s proposals and counts the rest', () => {
+    const mine = mk('a'.repeat(64), '1'.repeat(64));
+    const scoped = scopeProposals(
+      [mine, mk('b'.repeat(64), '2'.repeat(64)), mk('b'.repeat(64), '3'.repeat(64))],
+      'a'.repeat(64),
+    );
+    expect(scoped.shown).toEqual([mine]);
+    expect(scoped.otherCompanies).toBe(2);
+    // With no company known, nothing is hidden behind the player's back.
+    expect(scopeProposals([mine], null).otherCompanies).toBe(0);
+  });
+
+  it('leaves an ended approval round out instead of showing it as progress', () => {
+    const round = (collected: number, expires: number): SigningSession => ({
+      v: 1,
+      sessionId: 'a'.repeat(64),
+      networkGenesisChallenge: 'a'.repeat(64),
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'c'.repeat(64),
+      bundleHash: 'd'.repeat(64),
+      requiredThreshold: 3,
+      collectedSigs: Array.from({ length: collected }, (_, i) => ({
+        signerPuzzleHash: `${i}`.repeat(64),
+        sig: 's',
+      })),
+      expiresAfterHeight: expires,
+    });
+    // A dead round with MORE signatures must not hide the live one.
+    const dead = round(5, 100);
+    const live = round(1, 900);
+    const at500 = approvalsView([dead, live], 3, 500);
+    expect(at500.collected).toBe(1);
+    expect(at500.sessions).toBe(1);
+    expect(at500.note).toMatch(/past its end height/i);
+    // With no height, nothing can be judged stale — say so rather than guess.
+    const noHeight = approvalsView([dead, live], 3, null);
+    expect(noHeight.collected).toBe(5);
+    expect(noHeight.note).toMatch(/cannot be judged/i);
   });
 });
 
@@ -342,6 +431,17 @@ describe('policy, shares, and room funding', () => {
     expect(Object.keys(classes[0])).toEqual([
       'id', 'votesPerWholeShare', 'grantsRoomAccess', 'transferable',
     ]);
+  });
+
+  it('distinguishes "cannot read" from "no record exists"', () => {
+    // A read that cannot run is not evidence of absence — the terminal used
+    // to report an unconfigured build as "no company funding record".
+    const disabled = roomFundingView(null, null, false);
+    expect(disabled.headline).toMatch(/unavailable/i);
+    expect(disabled.detail).toMatch(/not set up to read/i);
+    expect(disabled.headline).not.toMatch(/no company funding record/i);
+    const readableButEmpty = roomFundingView(null, null, true);
+    expect(readableButEmpty.headline).toMatch(/no company funding record/i);
   });
 
   it('reports a missing binding as missing, not as personal funding', () => {
@@ -412,12 +512,20 @@ describe('proposal rows', () => {
   } as TreasuryProposal);
 
   it('sorts newest-accepted first and stays stable for unaccepted ones', () => {
+    const view = (w: ProposalWindows | null): ReturnType<typeof windowsView> =>
+      w
+        ? { windows: w, source: 'cached', trust: trustTag('unverified'), note: '' }
+        : { windows: null, source: 'none', trust: trustTag('absent'), note: '' };
     const rows = proposalRows(
       [proposal('c'.repeat(64), 'pay'), proposal('a'.repeat(64), 'dissolve'), proposal('b'.repeat(64), 'budget')],
-      (p) => (p.proposalId.startsWith('c') ? { ...windows, acceptedHeight: 10 } : p.proposalId.startsWith('b') ? { ...windows, acceptedHeight: 20 } : null),
+      (p) => view(p.proposalId.startsWith('c') ? { ...windows, acceptedHeight: 10 } : p.proposalId.startsWith('b') ? { ...windows, acceptedHeight: 20 } : null),
       null,
       'none',
     );
+    // Each row keeps the trust of the clocks its phase came from, so the list
+    // can badge a peer-copied cache differently from a matched record.
+    expect(rows[0].clockTrust.level).toBe('unverified');
+    expect(rows[2].clockTrust.level).toBe('absent');
     expect(rows.map((r) => r.proposalId[0])).toEqual(['b', 'c', 'a']);
     expect(rows[0].kindLabel).toBe('Budget');
     // With clocks but no height: position unknown. Without clocks at all:
@@ -452,6 +560,13 @@ describe('player vocabulary rule', () => {
     // The plans' language rule: players see venture/company/shares/Registry;
     // singleton, CAT, vault and checkpoint coin must never reach game UI.
     const banned = /\b(singleton|vault|checkpoint coin|mojo)\b|\bCAT\b/i;
+    const subject = {
+      ...(contracts.proposal.unsigned as object),
+      proposalId: registration.proposalId,
+      policyVersion: registration.policyVersion,
+      kind: registration.kind,
+      proposerSig: 'sig',
+    } as TreasuryProposal;
     const strings: string[] = [
       ...Object.values(trustTag('signed')),
       ...Object.values(trustTag('unverified')),
@@ -469,9 +584,9 @@ describe('player vocabulary rule', () => {
       payloadView(true).headline,
       payloadView(true).detail,
       payloadView(false).detail,
-      windowsView(registration, rule, null).note,
-      windowsView(null, null, null).note,
-      windowsView(null, null, windows).note,
+      windowsView(subject, registration, rule, null).note,
+      windowsView(subject, null, null, null).note,
+      windowsView(subject, null, null, windows).note,
       ...Object.values(PHASE_STRINGS),
       ...['pay', 'budget', 'appoint-manager', 'revoke-manager', 'bind-room',
         'change-policy', 'rotate-board', 'add-share-class', 'dissolve',
@@ -500,11 +615,25 @@ describe('player vocabulary rule', () => {
     expect(start).toBeGreaterThan(-1);
     push('main.ts renderTreasuryApp', main.slice(start, end > 0 ? end : undefined));
     // devices.ts: the FUNDING panel markup and its refresh block.
+    // devices.ts holds the FUNDING code in TWO separate places — the refresh
+    // block that fills the panel, and the markup that declares it (including
+    // the disabled command labels). Both must be scanned, and the ids appear
+    // in both, so take the FIRST and LAST occurrence rather than one marker
+    // that resolves twice into the same region.
     const devices = readFileSync(join(root, 'devices.ts'), 'utf8');
-    for (const marker of ['device-terminal-funding-source', 'FUNDING (plan']) {
-      const i = devices.indexOf(marker);
-      expect(i, `marker missing: ${marker}`).toBeGreaterThan(-1);
-      push(`devices.ts @ ${marker}`, devices.slice(i - 400, i + 2500));
+    const marker = 'device-terminal-funding-source';
+    const first = devices.indexOf(marker);
+    const last = devices.lastIndexOf(marker);
+    expect(first).toBeGreaterThan(-1);
+    expect(last, 'FUNDING markup and refresh block should be distinct regions')
+      .toBeGreaterThan(first);
+    push('devices.ts refresh block', devices.slice(first - 600, first + 2500));
+    push('devices.ts FUNDING markup', devices.slice(last - 600, last + 2500));
+    // The markup slice must actually contain the player-visible command
+    // labels, or this test is guarding nothing.
+    const markup = treasuryBlocks[treasuryBlocks.length - 1].text;
+    for (const label of ['REQUEST COMPANY FUNDING', 'SELECT PROFILE', 'UNBIND', 'REFRESH PROOF']) {
+      expect(markup, `markup slice missing ${label}`).toContain(label);
     }
     const html = readFileSync(join(root, '..', 'index.html'), 'utf8');
     const t = html.indexOf('phone-app-treasury');
@@ -532,3 +661,4 @@ const PHASE_STRINGS = {
   executable: phaseLabel('executable'),
   expired: phaseLabel('expired'),
 };
+

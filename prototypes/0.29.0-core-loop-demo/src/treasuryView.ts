@@ -232,11 +232,42 @@ export interface WindowsView {
  * derives from is an unverified cache entry until the node confirms the
  * registration on chain, which is why the trust tag never says "signed".
  */
+/**
+ * Records that claim to belong to a proposal but describe a different one.
+ * The cache keys registrations and cached windows by proposal id alone, so a
+ * peer can file one whose kind or policy revision disagrees with the proposal
+ * it sits under; splicing that with the proposal's own rule would produce
+ * clocks for a rulebook the proposal never answered to.
+ */
+function registrationMatches(
+  registration: ProposalRegistration,
+  proposal: TreasuryProposal,
+): boolean {
+  return registration.proposalId === proposal.proposalId
+    && registration.policyVersion === proposal.policyVersion
+    && registration.kind === proposal.kind;
+}
+
+function cachedWindowsMatch(
+  cached: ProposalWindows,
+  proposal: TreasuryProposal,
+): boolean {
+  return cached.proposalId === proposal.proposalId
+    && cached.policyVersion === proposal.policyVersion;
+}
+
 export function windowsView(
-  registration: ProposalRegistration | null,
+  proposal: TreasuryProposal,
+  registrationRaw: ProposalRegistration | null,
   rule: GovernanceKindRule | null,
-  cached: ProposalWindows | null,
+  cachedRaw: ProposalWindows | null,
 ): WindowsView {
+  const registration =
+    registrationRaw && registrationMatches(registrationRaw, proposal)
+      ? registrationRaw
+      : null;
+  const cached =
+    cachedRaw && cachedWindowsMatch(cachedRaw, proposal) ? cachedRaw : null;
   if (registration && rule) {
     try {
       return {
@@ -363,21 +394,39 @@ export interface ApprovalsView {
 export function approvalsView(
   sessions: SigningSession[],
   policyThreshold: number | null,
+  currentHeight: number | null = null,
 ): ApprovalsView {
+  // Rounds stay in the cache after they end, so picking purely by signature
+  // count would let a dead round with more signatures hide a live one and
+  // read as current progress.
+  const live =
+    currentHeight === null
+      ? sessions
+      : sessions.filter((s) => currentHeight < s.expiresAfterHeight);
+  const expired = sessions.length - live.length;
   let best: SigningSession | null = null;
-  for (const s of sessions) {
+  for (const s of live) {
     if (!best || s.collectedSigs.length > best.collectedSigs.length) best = s;
   }
   const required = policyThreshold ?? best?.requiredThreshold ?? null;
+  const staleness =
+    currentHeight === null
+      ? sessions.length > 0
+        ? ' Whether these rounds are still open cannot be judged without a chain height.'
+        : ''
+      : expired > 0
+        ? ` ${expired} round${expired === 1 ? '' : 's'} already past its end height ${expired === 1 ? 'is' : 'are'} left out.`
+        : '';
   return {
-    sessions: sessions.length,
+    sessions: live.length,
     collected: best ? best.collectedSigs.length : 0,
     required,
     requiredFromPolicy: policyThreshold !== null,
     trust: trustTag('unverified'),
-    note: sessions.length === 0
-      ? 'No approval round open in this room.'
-      : 'Approvals are not checked in the phone — the chain enforces the board’s threshold when a spend is made.',
+    note:
+      (live.length === 0
+        ? 'No approval round open in this room.'
+        : 'Approvals are not checked in the phone — the chain enforces the board’s threshold when a spend is made.') + staleness,
   };
 }
 
@@ -522,12 +571,35 @@ export interface RoomFundingView {
 export function roomFundingView(
   binding: RoomTreasuryBinding | null,
   currentHeight: number | null = null,
+  /**
+   * False when treasury reads are switched off (no network configured, or no
+   * room document). A read that cannot run is NOT evidence that no record
+   * exists, so it must not be reported as one.
+   */
+  readable = true,
 ): RoomFundingView {
   const readOnlyNote = 'Read-only: this device does not check the chain, so none of this is confirmed.';
   const unavailable = [
     'Covered systems and remaining budgets',
     'Any pending request to bind or unbind',
   ];
+  if (!readable) {
+    return {
+      bound: false,
+      lapsed: false,
+      companyId: null,
+      treasuryId: null,
+      profileId: null,
+      policyVersion: null,
+      boundAtHeight: null,
+      expiresAfterHeight: null,
+      trust: trustTag('absent'),
+      headline: 'Funding records unavailable',
+      detail: 'This device is not set up to read company records, so it cannot say how this room is funded either way.',
+      readOnlyNote,
+      unavailable,
+    };
+  }
   if (!binding) {
     return {
       bound: false,
@@ -579,6 +651,12 @@ export interface ProposalRowView {
   phase: ProposalPhase;
   phaseLabel: string;
   heightSource: HeightSource;
+  /**
+   * How much the clocks behind this row's phase can be trusted. Carried per
+   * row so the list can badge it: a phase label derived from a peer-copied
+   * cache should not look like one worked out from a matching record.
+   */
+  clockTrust: TrustTag;
 }
 
 /**
@@ -587,13 +665,17 @@ export interface ProposalRowView {
  */
 export function proposalRows(
   proposals: TreasuryProposal[],
-  /** Receives the whole proposal so callers need not re-read (and re-verify) it. */
-  windowsFor: (proposal: TreasuryProposal) => ProposalWindows | null,
+  /**
+   * Receives the whole proposal so callers need not re-read (and re-verify)
+   * it, and returns the full view so each row keeps its clocks' trust tag.
+   */
+  windowsFor: (proposal: TreasuryProposal) => WindowsView,
   currentHeight: number | null,
   heightSource: HeightSource,
 ): ProposalRowView[] {
   const rows = proposals.map((p) => {
-    const w = windowsFor(p);
+    const view = windowsFor(p);
+    const w = view.windows;
     const phase: ProposalPhase = w ? proposalPhase(w, currentHeight) : 'no-clocks';
     return {
       proposalId: p.proposalId,
@@ -603,6 +685,7 @@ export function proposalRows(
       phase,
       phaseLabel: phaseLabel(phase),
       heightSource,
+      clockTrust: view.trust,
       _accepted: w ? w.acceptedHeight : -1,
     };
   });
@@ -699,6 +782,28 @@ export function payloadView(present: boolean): PayloadView {
         headline: 'Details not held here',
         detail: 'This room does not have the details behind this proposal, so what it would do cannot be shown.',
       };
+}
+
+export interface ScopedProposals {
+  /** Proposals governed by the company whose policy this screen shows. */
+  shown: TreasuryProposal[];
+  /** How many belong to some other company and were left out. */
+  otherCompanies: number;
+}
+
+/**
+ * The room map can hold proposals from any number of companies, but the
+ * screen shows ONE company's board and policy above the list. Rows carry no
+ * company of their own, so an unrelated proposal would read as governed by
+ * that board. Scope to the shown company and report what was left out.
+ */
+export function scopeProposals(
+  proposals: TreasuryProposal[],
+  companyId: string | null,
+): ScopedProposals {
+  if (companyId === null) return { shown: proposals, otherCompanies: 0 };
+  const shown = proposals.filter((p) => p.companyId === companyId);
+  return { shown, otherCompanies: proposals.length - shown.length };
 }
 
 /** Largest allowance bound first — uses the no-parse mojo comparator. */

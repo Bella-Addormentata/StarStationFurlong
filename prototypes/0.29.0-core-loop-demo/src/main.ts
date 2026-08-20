@@ -75,6 +75,7 @@ import {
   proposalPhase,
   proposalRows,
   roomFundingView,
+  scopeProposals,
   sessionsFor,
   shareClassViews,
   shortId,
@@ -2897,7 +2898,12 @@ function renderTreasuryApp(): void {
     const registration = readRegistration(proposal.proposalId);
     // Only a policy for the SAME company and version governs this proposal.
     const rule = governanceRuleFor(proposal, policyCache?.policy ?? null);
-    const w = windowsView(registration, rule, readWindowsCache(proposal.proposalId));
+    const w = windowsView(
+      proposal,
+      registration,
+      rule,
+      readWindowsCache(proposal.proposalId),
+    );
     const votes = voteTallyView(
       listVotes(proposal.proposalId),
       listCheckpoints(proposal.proposalId),
@@ -2907,6 +2913,7 @@ function renderTreasuryApp(): void {
     const approvals = approvalsView(
       sessionsFor(listSigningSessions(proposal.proposalId), proposal),
       boardThresholdFor(proposal, policyCache?.policy ?? null),
+      height,
     );
     const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
     const payload = payloadView(readProposalPayload(proposal.payloadHash) !== null);
@@ -2974,16 +2981,26 @@ function renderTreasuryApp(): void {
 
   // ── List screen ────────────────────────────────────────────────────────
   const roomId = activeBootstrap?.roomId ?? "";
-  const binding = roomFundingView(roomId ? readRoomBinding(roomId) : null, height);
+  // Reads are only meaningful when a network is pinned; a disabled read is
+  // not evidence that no record exists.
+  const readable = net.configured && Boolean(roomId);
+  const binding = roomFundingView(
+    readable ? readRoomBinding(roomId) : null,
+    height,
+    readable,
+  );
   const balances = balanceView();
+  // One company's board sits above this list, so scope the rows to it.
+  const scoped = scopeProposals(listProposals(), policyCache?.policy.companyId ?? null);
   const rows = proposalRows(
-    listProposals(),
+    scoped.shown,
     (p) =>
       windowsView(
+        p,
         readRegistration(p.proposalId),
         governanceRuleFor(p, policyCache?.policy ?? null),
         readWindowsCache(p.proposalId),
-      ).windows,
+      ),
     height,
     heightSource,
   );
@@ -3052,7 +3069,9 @@ function renderTreasuryApp(): void {
                   <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
                   <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)}</span>
                 </span>
-                <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">${esc(r.phaseLabel)}</span>
+                <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">
+                  ${esc(r.phaseLabel)}<br />${badge(r.clockTrust)}
+                </span>
               </div>`,
             )
             .join("") +
@@ -3062,6 +3081,13 @@ function renderTreasuryApp(): void {
               : "This device has no chain height, so these are listed without saying which window each is in.",
           )
         : dim("No proposals in this room's records yet.")
+    }
+    ${
+      scoped.otherCompanies > 0
+        ? dim(
+            `${scoped.otherCompanies} more proposal${scoped.otherCompanies === 1 ? "" : "s"} in this room belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
+          )
+        : ""
     }
 
     ${header("CHAIN VIEW")}
