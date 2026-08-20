@@ -166,7 +166,10 @@ export type ProposalPhase =
   | 'expired';
 
 const PHASE_LABELS: Record<ProposalPhase, string> = {
-  'no-clocks': 'Not accepted yet',
+  // Neutral on purpose: clocks are also missing when the acceptance record IS
+  // held but the matching policy is not, so "not accepted yet" would state a
+  // chain fact this device has no basis for.
+  'no-clocks': 'Clocks unavailable',
   'unknown-height': 'Clocks known · position unknown',
   voting: 'Voting open',
   veto: 'Veto window',
@@ -519,7 +522,10 @@ export function boardView(policy: CompanyTreasuryPolicy): BoardView {
     policyVersion: policy.policyVersion,
     maxFee: formatXch(policy.maxFeeMojos),
     trust: trustTag('unverified'),
-    note: 'Compare this policy fingerprint against the chain before trusting it.',
+    // The fingerprint is shown in full: a shortened one cannot establish that
+    // two hashes are equal, and this line asks the player to check exactly
+    // that.
+    note: 'Compare every character of this fingerprint against the chain before trusting it.',
   };
 }
 
@@ -612,7 +618,9 @@ export function roomFundingView(
       expiresAfterHeight: null,
       trust: trustTag('absent'),
       headline: 'No company funding record',
-      detail: 'Nothing here says a company funds this room. Costs fall to the owner unless a record turns up.',
+      // Says only what is known. Inferring that costs therefore fall to the
+      // owner would be the same absence-as-fact mistake in slower words.
+      detail: 'This room holds no record of a company funding it. That is not the same as knowing there is none.',
       readOnlyNote,
       unavailable,
     };
@@ -782,6 +790,41 @@ export function payloadView(present: boolean): PayloadView {
         headline: 'Details not held here',
         detail: 'This room does not have the details behind this proposal, so what it would do cannot be shown.',
       };
+}
+
+export interface CompanyScope {
+  /** The company whose board and proposals the screen may show, or null. */
+  companyId: string | null;
+  /** True when a signed binding and the cached policy name different companies. */
+  mismatch: boolean;
+  warning: string | null;
+}
+
+/**
+ * Which company this screen is entitled to present.
+ *
+ * The room binding is signed; the policy cache is freely replaceable. If a
+ * peer writes a policy for another company, the screen would otherwise show
+ * the binding's company as the funding source while rendering the OTHER
+ * company's board and proposals under one "COMPANY" heading, with nothing
+ * saying they disagree. When they disagree, show neither and say so.
+ */
+export function companyScope(
+  binding: RoomTreasuryBinding | null,
+  policy: CompanyTreasuryPolicy | null,
+): CompanyScope {
+  if (binding && policy && binding.companyId !== policy.companyId) {
+    return {
+      companyId: null,
+      mismatch: true,
+      warning: 'The company funding this room and the company details held here do not match, so neither is shown.',
+    };
+  }
+  return {
+    companyId: policy?.companyId ?? binding?.companyId ?? null,
+    mismatch: false,
+    warning: null,
+  };
 }
 
 export interface ScopedProposals {

@@ -74,6 +74,7 @@ import {
   proposalKindLabel,
   proposalPhase,
   proposalRows,
+  companyScope,
   roomFundingView,
   scopeProposals,
   sessionsFor,
@@ -2990,8 +2991,15 @@ function renderTreasuryApp(): void {
     readable,
   );
   const balances = balanceView();
-  // One company's board sits above this list, so scope the rows to it.
-  const scoped = scopeProposals(listProposals(), policyCache?.policy.companyId ?? null);
+  // The binding is signed; the policy cache is replaceable. If they name
+  // different companies, show neither rather than mixing one company's
+  // funding line with another's board.
+  const scope = companyScope(
+    readable && roomId ? readRoomBinding(roomId) : null,
+    policyCache?.policy ?? null,
+  );
+  const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
+  const scoped = scopeProposals(listProposals(), scope.companyId);
   const rows = proposalRows(
     scoped.shown,
     (p) =>
@@ -3034,17 +3042,20 @@ function renderTreasuryApp(): void {
 
     ${header("COMPANY")}
     ${
-      policyCache
+      scope.warning
+        ? dim(esc(scope.warning))
+        : showPolicy
         ? (() => {
-            const b = boardView(policyCache.policy);
-            const classes = shareClassViews(policyCache.policy);
+            const b = boardView(showPolicy.policy);
+            const classes = shareClassViews(showPolicy.policy);
             return `<div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
                 <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
                 ${badge(b.trust)}
               </div>
               ${row("Policy version", `${b.policyVersion}`)}
               ${row("Fee ceiling per spend", esc(b.maxFee))}
-              ${row("Policy fingerprint", esc(shortId(policyCache.policyHash)))}
+              <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:5px;">Policy fingerprint</div>
+              <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against the chain">${esc(showPolicy.policyHash)}</div>
               ${classes
                 .map((c) =>
                   row(

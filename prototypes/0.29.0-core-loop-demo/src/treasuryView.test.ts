@@ -30,6 +30,7 @@ import {
   formatHeight,
   formatShares,
   boardThresholdFor,
+  companyScope,
   formatXch,
   governanceRuleFor,
   payloadView,
@@ -229,7 +230,7 @@ describe('votes and approvals', () => {
     expect(a.trust.level).toBe('unverified');
   });
 
-  it('prefers the policy threshold over the round”™s peer-authored copy', () => {
+  it("prefers the policy threshold over the round's peer-authored copy", () => {
     const withPolicy = approvalsView([session(1, 99)], 2);
     expect(withPolicy.required).toBe(2);
     expect(withPolicy.requiredFromPolicy).toBe(true);
@@ -319,6 +320,41 @@ describe('records must claim the proposal they are filed under', () => {
   });
 });
 
+describe('company scope', () => {
+  const binding = (companyId: string): RoomTreasuryBinding => ({
+    v: 1,
+    networkGenesisChallenge: 'a'.repeat(64),
+    roomId: 'room-1',
+    companyId,
+    treasuryLauncherId: 'c'.repeat(64),
+    policyVersion: 1,
+    profileId: 'p1',
+    boundByPub: 'pub',
+    boundAtHeight: 1,
+    policyReceiptId: 'd'.repeat(64),
+    sig: 'sig',
+  });
+
+  it('shows neither company when the signed binding and the cache disagree', () => {
+    // The binding is signed; the policy cache is replaceable. A peer writing
+    // a policy for another company must not get its board rendered beside
+    // this room's real funding line.
+    const s = companyScope(binding('a'.repeat(64)), { ...policy, companyId: 'b'.repeat(64) });
+    expect(s.mismatch).toBe(true);
+    expect(s.companyId).toBeNull();
+    expect(s.warning).toMatch(/do not match/i);
+  });
+
+  it('uses the agreed company, or whichever one is known', () => {
+    const agreed = companyScope(binding(policy.companyId), policy);
+    expect(agreed.mismatch).toBe(false);
+    expect(agreed.companyId).toBe(policy.companyId);
+    expect(companyScope(null, policy).companyId).toBe(policy.companyId);
+    expect(companyScope(binding('e'.repeat(64)), null).companyId).toBe('e'.repeat(64));
+    expect(companyScope(null, null).companyId).toBeNull();
+  });
+});
+
 describe('scoping and staleness', () => {
   const mk = (companyId: string, id: string): TreasuryProposal => ({
     ...(contracts.proposal.unsigned as object),
@@ -327,7 +363,7 @@ describe('scoping and staleness', () => {
     proposerSig: 'sig',
   } as TreasuryProposal);
 
-  it('lists only the shown company”™s proposals and counts the rest', () => {
+  it("lists only the shown company's proposals and counts the rest", () => {
     const mine = mk('a'.repeat(64), '1'.repeat(64));
     const scoped = scopeProposals(
       [mine, mk('b'.repeat(64), '2'.repeat(64)), mk('b'.repeat(64), '3'.repeat(64))],
