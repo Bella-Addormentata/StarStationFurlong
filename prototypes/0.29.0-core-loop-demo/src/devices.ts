@@ -463,10 +463,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       // network too so a disabled read is never reported as an absence.
       const connected =
         Boolean(roomId) && treasuryDocBound() && treasuryNetwork().configured;
-      // Without a height an ended binding cannot be spotted, so a lapsed
-      // record would read as current funding. Only a peer-reported height
-      // exists today — it is enough to mark a record lapsed (a conservative
-      // direction) and is labelled as unchecked below.
+      // Only a peer-reported height exists today. It is enough to flag a
+      // record whose end height looks passed (the conservative direction),
+      // but it can never establish that one is still live — the colour below
+      // treats every case that leans on it as unsettled.
       const height = connected
         ? displayHeight(readChainSyncStatus()).height
         : null;
@@ -482,13 +482,18 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       fundEl.textContent = connected
         ? `${funding.headline.toUpperCase()} · ${funding.trust.label}`
         : 'FUNDING RECORDS UNAVAILABLE · NO DATA';
+      // Green claims "funded, currently". Only a signed record naming no end
+      // height supports that here. If the record does name one, deciding
+      // whether it has passed needs a chain height this device does not have,
+      // so both readings of a peer-reported height get the neutral blue —
+      // green there would dress an unchecked guess up as a settled fact.
       fundEl.style.color = !connected
         ? '#4A5560'
-        : funding.lapsed
+        : !funding.bound || funding.expiryStatus === 'passed'
           ? '#F0C060'
-          : funding.bound
+          : funding.expiryStatus === 'none'
             ? '#00E676'
-            : '#F0C060';
+            : '#3E92B8';
       const lines = !connected
         ? [
             'This terminal cannot reach the room’s records, so it cannot say how the room is funded.',
@@ -500,9 +505,16 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
               `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
               `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
               funding.trust.detail,
-              height === null
-                ? 'NO HEIGHT AVAILABLE, SO AN ENDED RECORD CANNOT BE SPOTTED.'
-                : `AGAINST A HEIGHT ANOTHER PLAYER REPORTED (${formatHeight(height)}), NOT CHECKED HERE.`,
+              // Only shown when the record names an end height at all. The
+              // note carries the verdict; the height it was judged against is
+              // named here so the player can see what the guess rests on.
+              ...(funding.expiryNote
+                ? [
+                    height === null
+                      ? funding.expiryNote.toUpperCase()
+                      : `${funding.expiryNote.toUpperCase()} REPORTED HEIGHT ${formatHeight(height)}.`,
+                  ]
+                : []),
               funding.readOnlyNote,
               funding.detail,
               `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
@@ -512,7 +524,6 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
               funding.readOnlyNote,
               `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
             ];
-      if (funding.lapsedNote) lines.splice(3, 0, funding.lapsedNote.toUpperCase());
       fundDetailEl.textContent = lines.join('  ');
 
       // §10.2's link to the phone Treasury app. A <button> so it answers the

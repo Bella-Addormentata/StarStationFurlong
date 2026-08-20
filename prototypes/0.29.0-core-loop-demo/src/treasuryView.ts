@@ -316,9 +316,12 @@ export function windowsView(
   return {
     windows: null,
     source: 'none',
-    // A conflicting record IS data, however wrong — only a genuinely empty
-    // slot earns NO DATA.
-    trust: trustTag(registrationConflicts || cachedConflicts ? 'unverified' : 'absent'),
+    // Anything HELD is data, however unusable — a matching registration we
+    // could not pair with a policy included. Only a genuinely empty slot
+    // earns NO DATA, whose badge says nothing is cached.
+    trust: trustTag(
+      registration || registrationConflicts || cachedConflicts ? 'unverified' : 'absent',
+    ),
     note: registration
       ? 'The company policy is missing here, so this proposal’s clocks cannot be worked out.'
       : registrationConflicts
@@ -594,14 +597,19 @@ export function shareClassViews(policy: CompanyTreasuryPolicy): ShareClassView[]
 
 export interface RoomFundingView {
   bound: boolean;
-  /** True when a binding exists but its own expiry height has passed. */
-  lapsed: boolean;
   /**
-   * Set whenever `lapsed` is true: the signature does not cover the judgement
-   * that the end height has passed, so that verdict is labelled separately
-   * from the record's own trust tag.
+   * Whether the record's own end height has been reached. 'unknown' — no
+   * height was available to judge by — is deliberately a state of its own and
+   * not folded into 'not-passed': a boolean lived here once and collapsed the
+   * two, which rendered an ended record as current funding.
    */
-  lapsedNote: string | null;
+  expiryStatus: 'none' | 'unknown' | 'passed' | 'not-passed';
+  /**
+   * Set whenever the record names an end height. The signature covers that
+   * height but never the claim about where the chain has got to, so every
+   * reading of it is qualified apart from the record's own trust tag.
+   */
+  expiryNote: string | null;
   companyId: string | null;
   treasuryId: string | null;
   profileId: string | null;
@@ -644,8 +652,8 @@ export function roomFundingView(
   if (!readable) {
     return {
       bound: false,
-      lapsed: false,
-      lapsedNote: null,
+      expiryStatus: 'none',
+      expiryNote: null,
       companyId: null,
       treasuryId: null,
       profileId: null,
@@ -668,8 +676,8 @@ export function roomFundingView(
   if (!binding) {
     return {
       bound: false,
-      lapsed: false,
-      lapsedNote: null,
+      expiryStatus: 'none',
+      expiryNote: null,
       companyId: null,
       treasuryId: null,
       profileId: null,
@@ -686,19 +694,32 @@ export function roomFundingView(
     };
   }
   const expires = binding.expiresAfterHeight ?? null;
-  const lapsed =
-    expires !== null && currentHeight !== null && currentHeight >= expires;
-  // The signature covers the record and the end height it names — NOT the
-  // claim that the end has passed. That verdict comes from a height this
-  // device did not check, so it is labelled apart from the record's own
-  // trust rather than riding on it.
-  const lapsedNote = lapsed
-    ? 'Whether that end height has passed is judged against a height another player reported, which is not covered by the signature and has not been checked here.'
-    : null;
+  // Three outcomes, not two. "Still live" and "no trustworthy height to
+  // decide with" are different statements, and collapsing them into a false
+  // `lapsed` made an ended record render as current funding — including when
+  // a peer supplies a stale low height. The signature covers the record and
+  // the end height it names, never the claim about where the chain has got
+  // to, so BOTH the passed and not-passed readings are qualified.
+  const expiryStatus: 'none' | 'unknown' | 'passed' | 'not-passed' =
+    expires === null
+      ? 'none'
+      : currentHeight === null
+        ? 'unknown'
+        : currentHeight >= expires
+          ? 'passed'
+          : 'not-passed';
+  const expiryNote =
+    expiryStatus === 'unknown'
+      ? 'This record names an end height, but with no chain height available this device cannot say whether it has passed.'
+      : expiryStatus === 'passed'
+        ? 'The end height appears to have passed, judged against a height another player reported — not covered by the signature and not checked here.'
+        : expiryStatus === 'not-passed'
+          ? 'It appears not to have ended yet, judged against a height another player reported — not covered by the signature and not checked here.'
+          : null;
   return {
     bound: true,
-    lapsed,
-    lapsedNote,
+    expiryStatus,
+    expiryNote,
     companyId: binding.companyId,
     treasuryId: binding.treasuryLauncherId,
     profileId: binding.profileId,
@@ -706,10 +727,20 @@ export function roomFundingView(
     boundAtHeight: binding.boundAtHeight,
     expiresAfterHeight: expires,
     trust: trustTag('signed'),
-    headline: lapsed ? 'Company funding · lapsed' : 'Company funding',
-    detail: lapsed
-      ? 'This record’s own end height has passed, so it no longer claims to fund the room. Funding a room grants nobody edit rights here — those stay separate.'
-      : 'Funding this room does not grant anyone edit rights here — those stay separate.',
+    // Only 'none' — the signed record naming no end height at all — earns the
+    // plain "Company funding" reading. Every other case rests on a height
+    // nobody here checked, so the headline says "record" and leaves the
+    // current state to the note rather than implying live funding.
+    headline:
+      expiryStatus === 'none'
+        ? 'Company funding'
+        : expiryStatus === 'passed'
+          ? 'Company funding record · may have ended'
+          : 'Company funding record',
+    detail:
+      expiryStatus === 'passed'
+        ? 'This record’s own end height appears to have passed, so it may no longer fund the room. Funding a room grants nobody edit rights here — those stay separate.'
+        : 'Funding this room does not grant anyone edit rights here — those stay separate.',
     readOnlyNote,
     unavailable,
   };

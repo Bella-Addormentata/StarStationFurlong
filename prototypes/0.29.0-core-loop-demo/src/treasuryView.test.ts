@@ -567,51 +567,58 @@ describe('policy, shares, and room funding', () => {
     expect(unbound.unavailable.length).toBeGreaterThan(0);
   });
 
-  it('labels the lapsed verdict apart from the record’s own signature', () => {
-    const base: RoomTreasuryBinding = {
-      v: 1,
-      networkGenesisChallenge: 'a'.repeat(64),
-      roomId: 'room-1',
-      companyId: 'b'.repeat(64),
-      treasuryLauncherId: 'c'.repeat(64),
-      policyVersion: 2,
-      profileId: 'p1',
-      boundByPub: 'pub',
-      boundAtHeight: 100,
-      expiresAfterHeight: 200,
-      policyReceiptId: 'd'.repeat(64),
-      sig: 'sig',
-    };
-    // The signature covers the record and the end height it names — not the
-    // claim that the end has passed, which comes from an unchecked height.
-    const lapsed = roomFundingView(base, 250);
-    expect(lapsed.lapsed).toBe(true);
-    expect(lapsed.lapsedNote).toMatch(/not covered by the signature/i);
-    expect(roomFundingView(base, 150).lapsedNote).toBeNull();
-    expect(roomFundingView(null).lapsedNote).toBeNull();
+  const expiring = (expiresAfterHeight: number | undefined): RoomTreasuryBinding => ({
+    v: 1,
+    networkGenesisChallenge: 'a'.repeat(64),
+    roomId: 'room-1',
+    companyId: 'b'.repeat(64),
+    treasuryLauncherId: 'c'.repeat(64),
+    policyVersion: 2,
+    profileId: 'casino-floor',
+    boundByPub: 'pub',
+    boundAtHeight: 100,
+    ...(expiresAfterHeight === undefined ? {} : { expiresAfterHeight }),
+    policyReceiptId: 'd'.repeat(64),
+    sig: 'sig',
   });
 
-  it('flags a binding whose own end height has passed', () => {
-    const base: RoomTreasuryBinding = {
-      v: 1,
-      networkGenesisChallenge: 'a'.repeat(64),
-      roomId: 'room-1',
-      companyId: 'b'.repeat(64),
-      treasuryLauncherId: 'c'.repeat(64),
-      policyVersion: 2,
-      profileId: 'casino-floor',
-      boundByPub: 'pub',
-      boundAtHeight: 100,
-      expiresAfterHeight: 200,
-      policyReceiptId: 'd'.repeat(64),
-      sig: 'sig',
-    };
-    expect(roomFundingView(base, 150).lapsed).toBe(false);
-    const lapsed = roomFundingView(base, 200);
-    expect(lapsed.lapsed).toBe(true);
-    expect(lapsed.headline).toMatch(/lapsed/i);
-    // With no height there is nothing to compare against — do not guess.
-    expect(roomFundingView(base, null).lapsed).toBe(false);
+  it('keeps "no height to judge by" distinct from "has not ended"', () => {
+    // The regression this guards: a boolean `lapsed` made both of these
+    // false, so a record that had ended rendered as current funding.
+    const base = expiring(200);
+    expect(roomFundingView(base, 250).expiryStatus).toBe('passed');
+    expect(roomFundingView(base, 150).expiryStatus).toBe('not-passed');
+    expect(roomFundingView(base, null).expiryStatus).toBe('unknown');
+    // A record naming no end height is a fourth case again, and the only one
+    // where the signature alone settles the question.
+    expect(roomFundingView(expiring(undefined), 150).expiryStatus).toBe('none');
+    // Boundary: the end height itself counts as reached.
+    expect(roomFundingView(base, 200).expiryStatus).toBe('passed');
+  });
+
+  it('labels every expiry verdict apart from the record’s own signature', () => {
+    const base = expiring(200);
+    // The signature covers the record and the end height it names — never the
+    // claim about where the chain has got to, so BOTH readings are qualified.
+    expect(roomFundingView(base, 250).expiryNote).toMatch(/not covered by the signature/i);
+    expect(roomFundingView(base, 150).expiryNote).toMatch(/not covered by the signature/i);
+    expect(roomFundingView(base, null).expiryNote).toMatch(/cannot say whether it has passed/i);
+    // Nothing to qualify when no end height is named, or no record is held.
+    expect(roomFundingView(expiring(undefined), 150).expiryNote).toBeNull();
+    expect(roomFundingView(null).expiryNote).toBeNull();
+  });
+
+  it('only calls it plain "Company funding" when no end height is named', () => {
+    // Anything resting on a peer-reported height says "record" instead, so the
+    // headline never implies funding is live on the strength of an unchecked
+    // number.
+    expect(roomFundingView(expiring(undefined), 150).headline).toBe('Company funding');
+    expect(roomFundingView(expiring(200), 250).headline).toMatch(/may have ended/i);
+    for (const height of [150, null]) {
+      const headline = roomFundingView(expiring(200), height).headline;
+      expect(headline).toBe('Company funding record');
+      expect(headline).not.toMatch(/may have ended/i);
+    }
   });
 
   it('separates company funding from edit rights, and exposes the profile', () => {
@@ -746,11 +753,20 @@ describe('player vocabulary rule', () => {
     push('treasuryView.ts', readFileSync(join(root, 'treasuryView.ts'), 'utf8'));
     push('treasuryNetwork.ts', readFileSync(join(root, 'treasuryNetwork.ts'), 'utf8'));
     // main.ts: just the treasury render function.
+    // paintTreasuryApp, NOT renderTreasuryApp: the latter is only the
+    // focus-preserving wrapper, so slicing from it would scan none of the
+    // player-visible markup this guard exists to cover.
     const main = readFileSync(join(root, 'main.ts'), 'utf8');
-    const start = main.indexOf('function renderTreasuryApp');
+    const start = main.indexOf('function paintTreasuryApp');
     const end = main.indexOf('\nfunction ', start + 1);
-    expect(start).toBeGreaterThan(-1);
-    push('main.ts renderTreasuryApp', main.slice(start, end > 0 ? end : undefined));
+    expect(start, 'paintTreasuryApp not found — did the render split change?')
+      .toBeGreaterThan(-1);
+    const slice = main.slice(start, end > 0 ? end : undefined);
+    // Prove the slice really holds rendered strings, so a future rename
+    // cannot quietly reduce this to scanning nothing.
+    expect(slice).toContain('BALANCES');
+    expect(slice).toContain('PROPOSALS');
+    push('main.ts paintTreasuryApp', slice);
     // devices.ts: the FUNDING panel markup and its refresh block.
     // devices.ts holds the FUNDING code in TWO separate places — the refresh
     // block that fills the panel, and the markup that declares it (including

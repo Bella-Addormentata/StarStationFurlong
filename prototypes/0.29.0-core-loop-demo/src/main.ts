@@ -3199,7 +3199,7 @@ function paintTreasuryApp(view: HTMLElement): void {
         : ""
     }
     ${dim(esc(binding.detail))}
-    ${binding.lapsedNote ? dim(esc(binding.lapsedNote)) : ""}
+    ${binding.expiryNote ? dim(esc(binding.expiryNote)) : ""}
     ${dim(esc(binding.readOnlyNote))}
     ${dim(`Not shown yet: ${esc(binding.unavailable.join("; "))}.`)}
 
