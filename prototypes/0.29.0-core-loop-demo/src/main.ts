@@ -1342,7 +1342,7 @@ async function joinRoomAtEpoch(
     // 🏦 PR C: a treasury record landing (proposal, vote, policy cache) repaints
     // an open TREASURY view. Registered once — the listener set is module-level
     // in treasuryDoc, so it survives every rebind.
-    subscribeTreasury(() => renderTreasuryApp());
+    subscribeTreasury(() => queueTreasuryRepaint());
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
@@ -2810,9 +2810,59 @@ function renderBankApp(): void {
 /** Which proposal detail is open ('' = the list). */
 let treasuryDetailId = "";
 
+/**
+ * Repaint, preserving keyboard focus across the innerHTML replacement.
+ *
+ * Every repaint — including one triggered by a record arriving from a peer —
+ * destroys the focused element. Tab is the phone's toggle rather than a tab
+ * stop, so a keyboard player left on `body` is stranded with no way back into
+ * the view. Focus is restored to the same control where it still exists, and
+ * to the first one otherwise.
+ */
 function renderTreasuryApp(): void {
   const view = document.getElementById("phone-app-treasury");
   if (!view) return;
+  const active = document.activeElement as HTMLElement | null;
+  const hadFocus = Boolean(active && view.contains(active));
+  const key = hadFocus
+    ? active?.dataset.proposalId
+      ? `[data-proposal-id="${CSS.escape(active.dataset.proposalId)}"]`
+      : active?.dataset.treasuryAction
+        ? `[data-treasury-action="${active.dataset.treasuryAction}"]`
+        : active?.dataset.phoneApp
+          ? `[data-phone-app="${active.dataset.phoneApp}"]`
+          : null
+    : null;
+  paintTreasuryApp(view);
+  if (!hadFocus) return;
+  const target =
+    (key ? view.querySelector<HTMLElement>(key) : null) ??
+    view.querySelector<HTMLElement>("[data-treasury-action], [data-phone-app]") ??
+    view;
+  target.focus({ preventScroll: true });
+}
+
+/**
+ * Coalesces repaints. The bounded scans cap the work of ONE render, but a
+ * peer chooses how often records land, and each Y.Map transaction notifies
+ * synchronously — so a stream of small writes could still saturate the main
+ * thread with back-to-back scans. Bursts collapse into a single trailing
+ * render on the next frame.
+ */
+let treasuryRepaintQueued = false;
+function queueTreasuryRepaint(): void {
+  if (treasuryRepaintQueued) return;
+  treasuryRepaintQueued = true;
+  // A timer rather than requestAnimationFrame: rAF does not fire at all
+  // while the tab is hidden, which would leave a queued repaint pending
+  // indefinitely instead of merely deferred.
+  setTimeout(() => {
+    treasuryRepaintQueued = false;
+    renderTreasuryApp();
+  }, 32);
+}
+
+function paintTreasuryApp(view: HTMLElement): void {
   // Every treasury record that lands fires this. Re-verifying the whole cache
   // for a view nobody is looking at is wasted signature work, and the app
   // repaints on open anyway.
@@ -2829,14 +2879,8 @@ function renderTreasuryApp(): void {
       const action = el.dataset.treasuryAction;
       if (action === "open") treasuryDetailId = el.dataset.proposalId ?? "";
       if (action === "back") treasuryDetailId = "";
+      // renderTreasuryApp preserves focus across the repaint for us.
       renderTreasuryApp();
-      // The repaint replaced the element that had focus. Without moving it
-      // into the new screen, focus falls to the body and — since Tab is the
-      // phone's toggle, not a tab stop — a keyboard player is stranded.
-      const first = view.querySelector<HTMLElement>(
-        "[data-treasury-action], [data-phone-app]",
-      );
-      (first ?? view).focus({ preventScroll: true });
       return true;
     };
     view.addEventListener("click", (e) => activate(e.target));
@@ -3078,6 +3122,13 @@ function renderTreasuryApp(): void {
           : ""
       }
       ${dim(esc(approvals.note))}
+      ${
+        sessionScan.truncated
+          ? dim(
+              "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
+            )
+          : ""
+      }
 
       <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">WHAT IT WOULD DO</span>
@@ -3215,9 +3266,13 @@ function renderTreasuryApp(): void {
         : scoped.otherCompanies > 0
           ? "" // records exist; the line below explains why none are listed
           : dim(
-              readable
-                ? "No proposals in this room's records yet."
-                : "Proposals cannot be read on this device, so none can be listed — that is not the same as there being none.",
+              !readable
+                ? "Proposals cannot be read on this device, so none can be listed — that is not the same as there being none."
+                : truncated
+                  ? // The scan stopped before the end of the map, so "none"
+                    // is a claim this screen cannot make.
+                    "No proposals were found in the part of this room's records that was read, and the rest was not looked at."
+                  : "No proposals in this room's records yet.",
             )
     }
     ${
