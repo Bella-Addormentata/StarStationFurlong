@@ -47,6 +47,11 @@ import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./
 // it, and DoorWall is type-only — no cycle either way.)
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import type { DoorWall } from "./doorLayoutDoc";
+// 🛑📐🏊 #80: pool basin geometry needs the room's octagon cross-section so the
+// basin bottom sits on the REAL basement floor and the water/hole never crosses
+// the 45° chamfer. Both symbols are pure (hullSection.ts has no side effects).
+import { computeOctagonProfile } from "./hullSection";
+import type { NarrowAxis, OctagonProfile } from "./hullSection";
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box {
@@ -2540,6 +2545,194 @@ export const POOL_WATER_WEST = 5.15; // WX — west waterline (near the room bou
 export const POOL_WATER_EAST = 3.4; // HX — east tile wall
 export const POOL_WATER_HALFZ = 2.9; // HZ
 
+/**
+ * 🛑📐🏊 #80: pool basin bounds in the item's LOCAL frame, CLIPPED to the
+ * octagon basement volume so nothing pushes into the 45° chamfer edges.
+ *
+ * The octagon cross-section on the ROOM's narrow axis shrinks with depth:
+ *   • y = 0 (walkable floor)         → half-width = narrowHalf
+ *   • y = WATER_Y  (−0.35)           → half-width = narrowHalf + WATER_Y (a
+ *                                       thin chamfer slice already eats in)
+ *   • y = −basementDepth (real floor) → half-width = basementHalf
+ * A pool sits in its ITEM local frame, and its `rot` swaps that frame relative
+ * to the room: rot 0/2 keep local-X ↔ world-X, rot 1/3 swap. So the pool's
+ * LOCAL narrow axis is derived from the room's narrowAxis AND the pool's rot.
+ *
+ * Pure — read by the world.ts floor-hole cutter (poolHoleRect / …Outline /
+ * …Cells) AND by the per-item builder (buildLazyPool / buildClassicPool) so a
+ * clipped water outline can never disagree with the clipped basin bottom (one
+ * "block depths near the chamfer" definition, applied in one place).
+ */
+export interface PoolBasementBounds {
+  /** The room's octagon profile — surfaced for callers that need more than the
+   *  narrow-axis clamp (rare; most sites only touch the four numbers below). */
+  profile: OctagonProfile;
+  /** Which of the POOL's LOCAL axes carries the room's narrow axis (rot-aware). */
+  narrowInLocal: "x" | "z";
+  /** Max local half-width on the narrow axis AT the water surface (y=WATER_Y).
+   *  Everything the water/hole can reach at surface level must lie within ±this. */
+  halfAtWater: number;
+  /** Max local half-width on the narrow axis AT the basement floor.
+   *  Basin bottom + long-axis basin walls must lie within ±this. */
+  halfAtFloor: number;
+  /** World y of the real basement floor (negative). Basin bottom sits here. */
+  basementY: number;
+}
+export function poolBasementBoundsFor(
+  rot: Rot,
+  waterY: number = POOL_WATER_Y,
+): PoolBasementBounds {
+  const { halfX, halfZ } = roomHalfExtents();
+  const profile = computeOctagonProfile({ halfX, halfZ });
+  // Even rot (0, 2) keeps the pool's local axes aligned with world axes; odd
+  // rot (1, 3) is a 90° swap — see rotXZ in this file. So the room's narrow
+  // axis lands on the pool's OPPOSITE local axis for odd rots.
+  const swap = rot % 2 === 1;
+  const narrowInLocal: "x" | "z" = swap
+    ? (profile.narrowAxis === "x" ? "z" : "x")
+    : profile.narrowAxis;
+  return {
+    profile,
+    narrowInLocal,
+    // narrowHalf + y with y ≤ 0 gives the chamfer's inner half-width at y.
+    // Clamped ≥ 0 for the pathological deep-water / small-room case.
+    halfAtWater: Math.max(0, profile.narrowHalf + waterY),
+    halfAtFloor: profile.basementHalf,
+    basementY: -profile.basementDepth,
+  };
+}
+
+/** 🏊 The item-local water rectangle a pool basin descends from. Passed as one
+ *  bag so the two pool builders share it verbatim (their authored constants are
+ *  identical — WX/HX/HZ + EDGE_BOT). */
+export interface PoolBasinFootprint {
+  /** Local x of the WEST waterline (negative — west of the pool origin). */
+  waterXWest: number;
+  /** Local x of the EAST waterline (positive). */
+  waterXEast: number;
+  /** Local half-extent on Z (the water spans ±waterZHalf). */
+  waterZHalf: number;
+  /** y of the EXISTING shallow basin lining bottom (=EDGE_BOT). The new deep
+   *  basin walls start here and descend to the basement floor, so the older
+   *  tiled lining tiles above them read continuously into the deeper wall. */
+  edgeTopY: number;
+}
+
+/**
+ * 🛑📐🏊🕳️ #80: draw the deep part of a pool basin — bottom + long-axis walls
+ * — into the octagon BASEMENT VOLUME. The basement chamfer already provides a
+ * naturally sloped wall on the NARROW axis (from the walkable floor edge down
+ * to the basement floor), so we DON'T add narrow-axis walls here: they'd only
+ * duplicate/clash with the chamfer and paint over its natural pool-slope look.
+ *
+ * • Bottom plate — a thin BoxGeometry hovering just above y=basementY (a hair
+ *   above to avoid Z-fighting with the basement floor mesh). Clipped on the
+ *   narrow axis to ±halfAtFloor (fits inside the basement floor's extent).
+ * • Long-axis walls — thin BoxGeometry slabs at the water's ±longHalf edges,
+ *   spanning from y=edgeTopY (top of the existing shallow lining) down to
+ *   y=basementY. They close off the extruded basement "trench" that would
+ *   otherwise show past the water footprint along the long axis.
+ *
+ * All coordinates are in the pool ITEM's LOCAL frame — its group is rotated by
+ * `furnitureVisualYaw` before rendering. `bounds.narrowInLocal` tells us which
+ * of the pool's own X/Z is the room's narrow axis (rot-aware, see the helper);
+ * even/odd rot is the only knob that flips it.
+ *
+ * Colour matches the existing pool bottom (0x0e3244 — the deep-water teal) so
+ * the visual reads as one continuous basin, not "old shallow bottom + new deep
+ * bottom" plates.
+ */
+function placeOctagonPoolBasin(
+  place: BuildCtx["place"],
+  m: BuildCtx["m"],
+  fp: PoolBasinFootprint,
+  bounds: PoolBasementBounds,
+): void {
+  const { basementY, halfAtFloor } = bounds;
+  const BASIN_COLOR = 0x0e3244; // deep-water teal (same as legacy rect bottom)
+  const PLATE_LIFT = 0.02;      // sits ABOVE the basement floor to avoid Z-fight
+  const PLATE_THICK = 0.08;     // matches the retired rect bottom's thickness
+  const WALL_THICK = 0.06;      // matches the shallow tiled basin lining thickness
+
+  // Clipped water half-extents in the pool's LOCAL frame. The narrow axis is
+  // capped by halfAtFloor (basement floor's extent on that axis); the long
+  // axis is uncapped (basement extends the full long-axis length of the room,
+  // so the water's long-axis half-extent always fits — POOL_WATER_HALFZ<longHalf
+  // for every real room size in the atlas).
+  const waterXWestPos = -fp.waterXWest; // positive west half-width (fp.waterXWest is negative)
+  const waterXEast = fp.waterXEast;
+  const waterZHalf = fp.waterZHalf;
+
+  let xNegHalf: number, xPosHalf: number, zNegHalf: number, zPosHalf: number;
+  if (bounds.narrowInLocal === "x") {
+    // Narrow = local X — clip west + east reaches on X.
+    xNegHalf = Math.min(waterXWestPos, halfAtFloor);
+    xPosHalf = Math.min(waterXEast, halfAtFloor);
+    zNegHalf = waterZHalf;
+    zPosHalf = waterZHalf;
+  } else {
+    // Narrow = local Z — clip both Z half-extents.
+    xNegHalf = waterXWestPos;
+    xPosHalf = waterXEast;
+    zNegHalf = Math.min(waterZHalf, halfAtFloor);
+    zPosHalf = Math.min(waterZHalf, halfAtFloor);
+  }
+
+  const width = xNegHalf + xPosHalf; // total narrow/long-axis size
+  const depth = zNegHalf + zPosHalf;
+  const cx = (xPosHalf - xNegHalf) / 2; // asymmetric water ⇒ off-centre plate
+  const cz = (zPosHalf - zNegHalf) / 2;
+
+  // Bail out cleanly if the clip degenerates (a room too small to host the
+  // pool at all — nothing to draw, but never NaN/negative extents).
+  if (!(width > 0) || !(depth > 0)) return;
+
+  // ── Deep pool BOTTOM — the drawn-in basin floor. On the narrow axis this is
+  //    ≤ basement floor extent; on the long axis it's the water footprint.
+  place(
+    new THREE.BoxGeometry(width, PLATE_THICK, depth),
+    m(BASIN_COLOR, 0.98, 0.02),
+    cx,
+    basementY + PLATE_LIFT,
+    cz,
+  );
+
+  // ── Long-axis basin walls — close off the basement trench past the water.
+  //    A thin slab at each water long-axis edge, spanning the SAME narrow-axis
+  //    width as the bottom plate (so it stays inside the basement volume all
+  //    the way up). Height fills the gap between edgeTopY and basementY.
+  const wallHeight = fp.edgeTopY - basementY;
+  const wallCenterY = (fp.edgeTopY + basementY) / 2;
+  if (wallHeight > 0) {
+    const longIsZ = bounds.narrowInLocal === "x";
+    // Wall geometry: on the narrow axis its BoxGeometry width matches the
+    // plate's; on the long axis a thin slab.
+    for (const sign of [-1, 1] as const) {
+      if (longIsZ) {
+        // Wall at Z = ±waterZHalf.
+        place(
+          new THREE.BoxGeometry(width, wallHeight, WALL_THICK),
+          m(BASIN_COLOR, 0.98, 0.02),
+          cx,
+          wallCenterY,
+          sign * waterZHalf,
+        );
+      } else {
+        // Wall at X = ±waterXHalf (asymmetric authored — mirror the same edges
+        // the water rect uses so an odd-rot pose stays symmetric with itself).
+        const edgeX = sign < 0 ? -waterXWestPos : waterXEast;
+        place(
+          new THREE.BoxGeometry(WALL_THICK, wallHeight, depth),
+          m(BASIN_COLOR, 0.98, 0.02),
+          edgeX,
+          wallCenterY,
+          cz,
+        );
+      }
+    }
+  }
+}
+
 // ── 🌉 Hot-tub footbridge geometry — single source of truth shared by the
 // lazy-pool builder (visual planks), the hot-tub seat approach path (the fox
 // WALKS the arch instead of gliding through it) and the remote-replica y
@@ -3969,19 +4162,29 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
   // the SAME curve — the water and the hole always agree.
   const makeLazyRiver = lazyRiverShape;
 
-  // 🕳️ #80: solid rect pool BOTTOM across the full water footprint. With the
-  // octagon floor hole cut, looking down the hole you see a real basin bottom
-  // sinking into the basement instead of the void; without the octagon flag the
-  // legacy hidden-floor pool is unchanged (skip it). Sits just under the
-  // organic lazy-river tint, which the rect can't reach in the corners.
+  // 🛑📐🏊🕳️ #80: sink the pool basin into the REAL basement volume. The
+  // basement is a live octagon geometry (hullSection.ts): a flat floor at
+  // y=basementY spanning ±basementHalf on the narrow axis + ±longHalf on the
+  // long axis, bracketed by 45° chamfers on the narrow axis. The basin's
+  // visible bottom sits ON the basement floor (tile plate a hair above), and
+  // long-axis walls close off the "trench" you'd otherwise see continuing past
+  // the water footprint. On the narrow axis the CHAMFER itself is the basin's
+  // slope (a natural shallow-to-deep gradient), so we don't add extra walls
+  // there — one wall to duplicate a chamfer would only clash with the hull.
+  // Without ?octagon=1 (legacy) the whole floor is hidden by refreshOutdoorFloor
+  // instead of holed, so no basin is needed.
   if (OCTAGON_HULL) {
-    place(
-      new THREE.BoxGeometry(WX + HX, 0.08, HZ * 2),
-      m(0x0e3244, 0.98, 0.02),
-      (HX - WX) / 2,
-      EDGE_BOT - 0.02,
-      0,
-    );
+    const bounds = poolBasementBoundsFor(0); // pool is authored at rot 0 here
+    // Deep bottom + long-axis walls — helper stays in this file so both pool
+    // builders (lazy + classic) share ONE basin discipline.
+    placeOctagonPoolBasin(place, m, {
+      // The item local frame carries the authored water rect; the helper
+      // clips it against the octagon bounds.
+      waterXWest: -POOL_WATER_WEST,
+      waterXEast: POOL_WATER_EAST,
+      waterZHalf: POOL_WATER_HALFZ,
+      edgeTopY: EDGE_BOT, // the existing basin lining wall's bottom edge
+    }, bounds);
   }
 
   // 🏖️ #80: sand BEACH filling the strip between the organic water and the deck
@@ -6932,20 +7135,20 @@ function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
     treeB.scale.set(1.0, 0.68, 0.48);
   }
 
-  // 🕳️ #80: solid rect pool BOTTOM across the full water footprint — mirrors
-  // the lazy pool. With the octagon floor hole cut, looking down the hole shows
-  // a real basin bottom sinking into the basement instead of the void; without
-  // the octagon flag the legacy hidden-floor pool is unchanged. The classic
-  // water is a full rect, so this rect bottom backs it completely (no organic
-  // corners to leak — no extra tint fill needed beyond the existing plane).
+  // 🛑📐🏊🕳️ #80: same octagon-basement basin as the lazy pool — bottom sits
+  // ON the real basement floor (y=basementY) and long-axis walls close off the
+  // basement's extruded "trench" past the water footprint. The narrow-axis
+  // sides use the hull's own 45° chamfer as a naturally sloped basin wall; a
+  // duplicate wall here would only Z-fight it. The rect water outline of the
+  // classic pool clips cleanly against the basement (no organic corners).
   if (OCTAGON_HULL) {
-    place(
-      new THREE.BoxGeometry(WX + HX, 0.08, HZ * 2),
-      m(0x0e3244, 0.98, 0.02),
-      (HX - WX) / 2,
-      EDGE_BOT - 0.02,
-      0,
-    );
+    const bounds = poolBasementBoundsFor(0); // pool is authored at rot 0 here
+    placeOctagonPoolBasin(place, m, {
+      waterXWest: -POOL_WATER_WEST,
+      waterXEast: POOL_WATER_EAST,
+      waterZHalf: POOL_WATER_HALFZ,
+      edgeTopY: EDGE_BOT,
+    }, bounds);
   }
 
   // ── Basin floor + depth-graded water.
@@ -7215,7 +7418,11 @@ export function poolHoleCells(items: FurnitureItem[]): Set<string> {
   const cells = new Set<string>();
   const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
   if (!pool) return cells;
-  const rect = poolHoleRect(items)!; // world bbox of the water footprint
+  // rect is CLAMPED to the octagon chamfer at the water surface (see
+  // poolHoleRect); a room too small to host the water at all collapses the
+  // rect to null — no cells to cut, matching "no water, no hole".
+  const rect = poolHoleRect(items);
+  if (!rect) return cells;
 
   if (pool.kind === "classic-pool") {
     // Rectangular water ⇒ rectangular hole: cut cells whose CENTRE lies inside
@@ -7282,12 +7489,46 @@ export function mergeCellsToRects(cells: Set<string>): Box[] {
 }
 
 /**
- * 🕳️ #80: the pool water OUTLINE as world-XZ points — the EXACT floor-hole
+ * 🛑📐🏊 #80: clip a WORLD-space point to the octagon chamfer at the water
+ * surface — on the ROOM's narrow axis only (the long axis extrudes at full
+ * width, so it never clips). Pulls the point's narrow-axis component into
+ * ±halfAtWater; leaves the long axis untouched. Idempotent + monotonic, so
+ * applying it to every vertex of a polygon is a safe (if approximate) half-
+ * plane clip: the resulting polygon is guaranteed inside the chamfer at the
+ * water level, with no NaNs or normal flips.
+ *
+ * Why point-clamp instead of a full Sutherland–Hodgman polygon clip: the
+ * default rooms are all sized so the authored water never actually reaches
+ * the chamfer at surface level (halfAtWater = 5.65 for a 6×6 half-room, water
+ * WX = 5.15). The clamp is a defensive floor for small rooms (owner ruling
+ * ROOM_TILE_MIN=1 ⇒ halfX=3 ⇒ halfAtWater=2.65), and a monotonic clamp on the
+ * narrow axis keeps the outline's winding intact for those degenerate cases.
+ */
+function clampToChamferAtWater(
+  p: { x: number; z: number },
+  narrowAxis: NarrowAxis,
+  halfAtWater: number,
+): { x: number; z: number } {
+  if (narrowAxis === "x") {
+    return { x: clampNumber(p.x, -halfAtWater, halfAtWater), z: p.z };
+  }
+  return { x: p.x, z: clampNumber(p.z, -halfAtWater, halfAtWater) };
+}
+function clampNumber(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+/**
+ * 🕳️🛑📐 #80: the pool water OUTLINE as world-XZ points — the EXACT floor-hole
  * shape, so no solid floor peeks over the water (the blocky 1 m cell holes
  * couldn't match the organic curve). Lazy pool → the lazy-river OUTER curve;
- * classic pool → the water rect. Transformed by the pool's pose. The floor hole
- * is purely visual (the pool OBSTACLE is a separate rect — buildObstacleList),
- * so an organic hole is safe for pathfinding. Null when there's no pool.
+ * classic pool → the water rect. Transformed by the pool's pose. Then CLAMPED
+ * to the octagon chamfer at the water surface on the ROOM's narrow axis (see
+ * poolBasementBoundsFor) so the hole never crosses the 45° chamfer edge — a
+ * safety belt for small rooms where the authored water would otherwise reach
+ * past the room's own chamfer. Floor hole is purely visual (the pool OBSTACLE
+ * is a separate rect — buildObstacleList), so an organic hole is safe for
+ * pathfinding. Null when there's no pool.
  */
 export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: number }> | null {
   const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
@@ -7311,17 +7552,25 @@ export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: n
       .map((p) => ({ x: p.x, z: -p.y }));
   }
   // Local → world by the pool's pose (cardinal rot + offset).
+  const bounds = poolBasementBoundsFor(pool.rot);
+  const narrowAxis = bounds.profile.narrowAxis; // ROOM narrow axis — clip is in world
+  const halfAtWater = bounds.halfAtWater;
   return local.map((p) => {
     const r = rotXZ(p.x, p.z, pool.rot);
-    return { x: pool.pos.x + r.x, z: pool.pos.z + r.z };
+    const w = { x: pool.pos.x + r.x, z: pool.pos.z + r.z };
+    return clampToChamferAtWater(w, narrowAxis, halfAtWater);
   });
 }
 
 /**
- * 🕳️ #80: the world XZ rectangle bounding a pool's water footprint (west
+ * 🕳️🛑📐 #80: the world XZ rectangle bounding a pool's water footprint (west
  * waterline → east tile wall × ±halfZ). Used for the water-cell scan bounds and
  * the rect basin bottom. Rotates/offsets with the item (cardinal rots only,
- * like getPoolBasin). Null when there's no pool.
+ * like getPoolBasin), then CLIPPED to ±halfAtWater on the ROOM's narrow axis
+ * so the rect never extends past the octagon chamfer — the poolHoleCells scan
+ * inherits the clip (cells outside the chamfer are simply never enumerated).
+ * Null when there's no pool, and null (not an empty rect) when the clip
+ * degenerates a room below any possible pool size.
  */
 export function poolHoleRect(
   items: FurnitureItem[],
@@ -7330,12 +7579,30 @@ export function poolHoleRect(
     if (item.kind !== "lazy-pool" && item.kind !== "classic-pool") continue;
     const a = rotXZ(-POOL_WATER_WEST, -POOL_WATER_HALFZ, item.rot);
     const b = rotXZ(POOL_WATER_EAST, POOL_WATER_HALFZ, item.rot);
-    return {
+    const raw = {
       x0: item.pos.x + Math.min(a.x, b.x),
       z0: item.pos.z + Math.min(a.z, b.z),
       x1: item.pos.x + Math.max(a.x, b.x),
       z1: item.pos.z + Math.max(a.z, b.z),
     };
+    // Clip on the ROOM's narrow axis to ±halfAtWater. Long axis is untouched:
+    // the octagon extrudes at full room length on the long axis, so the water
+    // rect always fits there (POOL_WATER_HALFZ ≤ longHalf in every real room).
+    const bounds = poolBasementBoundsFor(item.rot);
+    const halfAtWater = bounds.halfAtWater;
+    let { x0, z0, x1, z1 } = raw;
+    if (bounds.profile.narrowAxis === "x") {
+      x0 = Math.max(x0, -halfAtWater);
+      x1 = Math.min(x1, halfAtWater);
+    } else {
+      z0 = Math.max(z0, -halfAtWater);
+      z1 = Math.min(z1, halfAtWater);
+    }
+    // A degenerate clip (room too small to fit the pool at all) collapses the
+    // rect. Return null then, matching the "no water to cut" contract callers
+    // already handle (they treat null as no-pool for the hole cutter).
+    if (!(x1 > x0) || !(z1 > z0)) return null;
+    return { x0, z0, x1, z1 };
   }
   return null;
 }
