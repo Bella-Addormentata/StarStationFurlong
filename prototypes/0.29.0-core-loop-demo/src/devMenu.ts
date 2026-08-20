@@ -62,7 +62,10 @@ import {
 import { roomHalfExtents, roomPlaceBounds } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
-import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
+import type {
+  WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle,
+  SlotMachineVisualHandle,
+} from './devices';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -123,6 +126,7 @@ interface WorldInternals {
   trunkLids: Map<string, TrunkLidHandle>;
   gameTableTops: Map<string, GameTableTopHandle>;
   cloneVats: Map<string, CloneVatHandle>;
+  slotMachineVisuals: Map<string, SlotMachineVisualHandle>;
 }
 
 let getWorld: GetWorld = () => null;
@@ -340,6 +344,12 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       }
       if (obj.userData.cloneVat) {
         w.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
+      }
+      if (obj.userData.slotMachineVisual) {
+        w.slotMachineVisuals.set(
+          item.id,
+          obj.userData.slotMachineVisual as SlotMachineVisualHandle,
+        );
       }
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
