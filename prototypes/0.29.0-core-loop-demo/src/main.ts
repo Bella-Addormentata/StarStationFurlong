@@ -2846,7 +2846,15 @@ function renderTreasuryApp(): void {
     `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
   const dim = (t: string) =>
     `<div style="font-size:9px; color:rgba(212,168,75,0.45); margin-top:4px; line-height:1.6;">${t}</div>`;
-  const badge = (tag: { level: string; label: string; detail: string }) => {
+  // `focusable: false` for badges rendered INSIDE an activating control: a
+  // focusable note nested in a role="button" would swallow a tab stop and
+  // then bubble Enter/Space into the row's action, and descendants of a
+  // button are not reliably exposed with their own semantics. Those callers
+  // fold the detail into the row's own accessible label instead.
+  const badge = (
+    tag: { level: string; label: string; detail: string },
+    focusable = true,
+  ) => {
     const color =
       tag.level === "signed"
         ? "#7ddb8f"
@@ -2856,7 +2864,10 @@ function renderTreasuryApp(): void {
     // Focusable and labelled: the qualification behind a badge (a signature
     // shows authorship, not authority) is the whole point of showing it, and
     // a title tooltip on an inert span never reaches a keyboard user.
-    return `<span role="note" tabindex="0" aria-label="${esc(`${tag.label}. ${tag.detail}`)}" title="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
+    const a11y = focusable
+      ? ` role="note" tabindex="0" aria-label="${esc(`${tag.label}. ${tag.detail}`)}"`
+      : ` aria-hidden="true"`;
+    return `<span${a11y} title="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
   };
   const row = (label: string, value: string) =>
     `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
@@ -2915,14 +2926,22 @@ function renderTreasuryApp(): void {
     }
     // The list would withhold this proposal now — a binding or policy landing
     // while the detail was open can change whose company this screen shows.
-    if (scope.companyId !== null && proposal.companyId !== scope.companyId) {
+    // Mirror the list exactly: it withholds every row when no company can be
+    // identified, so an open detail must not survive that state either.
+    if (scope.mismatch) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(esc(scope.warning ?? ""))}`;
+      return;
+    }
+    if (scope.companyId === null) {
       view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
-        "This proposal belongs to a different company than the one this room now shows, so it is no longer listed here.",
+        "Without company details there is no way to tell whose proposal this is, so it is no longer listed here.",
       )}`;
       return;
     }
-    if (scope.mismatch) {
-      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(esc(scope.warning ?? ""))}`;
+    if (proposal.companyId !== scope.companyId) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        "This proposal belongs to a different company than the one this room now shows, so it is no longer listed here.",
+      )}`;
       return;
     }
     const registration = readRegistration(proposal.proposalId);
@@ -3112,13 +3131,14 @@ function renderTreasuryApp(): void {
         ? rows
             .map(
               (r) => `<div data-treasury-action="open" data-proposal-id="${esc(r.proposalId)}" role="button" tabindex="0"
+                aria-label="${esc(`${r.kindLabel}, policy version ${r.policyVersion}. ${r.phaseLabel}. ${r.clockTrust.label}: ${r.clockTrust.detail}`)}"
                 style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
                 <span style="min-width:0;">
                   <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
                   <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)} · policy v${r.policyVersion}</span>
                 </span>
                 <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">
-                  ${esc(r.phaseLabel)}<br />${badge(r.clockTrust)}
+                  ${esc(r.phaseLabel)}<br />${badge(r.clockTrust, false)}
                 </span>
               </div>`,
             )
