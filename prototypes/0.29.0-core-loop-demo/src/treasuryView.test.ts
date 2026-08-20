@@ -335,14 +335,18 @@ describe('company scope', () => {
     sig: 'sig',
   });
 
-  it('shows neither company when the signed binding and the cache disagree', () => {
+  it('withholds the cached company when it disagrees with the signed binding', () => {
     // The binding is signed; the policy cache is replaceable. A peer writing
     // a policy for another company must not get its board rendered beside
     // this room's real funding line.
     const s = companyScope(binding('a'.repeat(64)), { ...policy, companyId: 'b'.repeat(64) });
     expect(s.mismatch).toBe(true);
     expect(s.companyId).toBeNull();
-    expect(s.warning).toMatch(/do not match/i);
+    expect(s.warning).toMatch(/different company/i);
+    // The signed funding record stays on screen, so the warning must say what
+    // is actually withheld rather than claiming nothing is shown.
+    expect(s.warning).toMatch(/proposal list/i);
+    expect(s.warning).not.toMatch(/neither is shown/i);
   });
 
   it('uses the agreed company, or whichever one is known', () => {

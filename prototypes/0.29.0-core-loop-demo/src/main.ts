@@ -2862,10 +2862,13 @@ function renderTreasuryApp(): void {
 
   const bound = treasuryDocBound();
   const net = treasuryNetwork();
-  const sync = syncView(bound ? readChainSyncStatus() : null);
-  const { height, source: heightSource } = displayHeight(
-    bound ? readChainSyncStatus() : null,
-  );
+  // The sync entry carries no genesis, so treasuryDoc cannot pin it — an
+  // unconfigured build would otherwise render a peer's claim and take a
+  // height from it, walking straight around the fail-closed boundary. Read
+  // it once, gated, and feed both models from that value.
+  const peerSync = bound && net.configured ? readChainSyncStatus() : null;
+  const sync = syncView(peerSync);
+  const { height, source: heightSource } = displayHeight(peerSync);
   const policyCache = bound ? readPolicyCache() : null;
 
   // The local verdict, always first: this device is not verifying the chain,
@@ -2963,10 +2966,12 @@ function renderTreasuryApp(): void {
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">BOARD APPROVALS</span>
         ${badge(approvals.trust)}
       </div>
-      ${row("Gathered in one round", `${approvals.collected} of ${approvals.required ?? "—"}`)}
       ${
-        approvals.required !== null && !approvals.requiredFromPolicy
-          ? dim("The number needed comes from the round itself, not the company policy.")
+        approvals.sessions > 0
+          ? row("Gathered in one round", `${approvals.collected} of ${approvals.required ?? "—"}`) +
+            (approvals.required !== null && !approvals.requiredFromPolicy
+              ? dim("The number needed comes from the round itself, not the company policy.")
+              : "")
           : ""
       }
       ${dim(esc(approvals.note))}
@@ -3091,7 +3096,9 @@ function renderTreasuryApp(): void {
               ? `Where each one sits on its clocks is worked out from a height another player reported (${formatHeight(height ?? 0)}) — this device has not checked it.`
               : "This device has no chain height, so these are listed without saying which window each is in.",
           )
-        : dim("No proposals in this room's records yet.")
+        : scoped.otherCompanies > 0
+          ? "" // records exist; the line below explains why none are listed
+          : dim("No proposals in this room's records yet.")
     }
     ${
       scoped.scopeUnknown && scoped.otherCompanies > 0

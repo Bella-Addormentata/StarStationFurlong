@@ -609,7 +609,13 @@ export function roomFundingView(
       policyVersion: null,
       boundAtHeight: null,
       expiresAfterHeight: null,
-      trust: trustTag('absent'),
+      // Same badge level, but the default "nothing cached yet" wording would
+      // put the very absence claim back in the tooltip that the headline is
+      // careful to avoid.
+      trust: {
+        ...trustTag('absent'),
+        detail: 'No lookup was possible, so nothing is known either way.',
+      },
       headline: 'Funding records unavailable',
       detail: 'This device is not set up to read company records, so it cannot say how this room is funded either way.',
       readOnlyNote,
@@ -836,7 +842,10 @@ export function companyScope(
     return {
       companyId: null,
       mismatch: true,
-      warning: 'The company funding this room and the company details held here do not match, so neither is shown.',
+      // Precise about what is actually withheld: the signed funding record
+      // above stays on screen with its own company, and it is the cached
+      // company details and proposal list that are held back.
+      warning: 'The company details held in this room name a different company than the funding record above, so they and the proposal list are not shown.',
     };
   }
   return {
