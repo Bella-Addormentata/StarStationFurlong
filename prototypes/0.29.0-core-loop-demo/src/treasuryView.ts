@@ -360,7 +360,10 @@ export function voteTallyView(
     ...tally,
     records: checkpoints.length,
     trust: trustTag('unverified'),
-    note: 'Votes held in this room, one per voter — not a count, and not weighted by shares.',
+    // "one per key", not "one per voter": the slot is keyed by the signing
+    // key, and one person can hold several, so voter-level wording would
+    // imply a deduplication that does not happen here.
+    note: 'Votes held in this room, one per signing key — not a count, and not weighted by shares.',
     caveat: 'A vote only counts once it is inside a vote record confirmed on chain, which this device cannot check. Some votes may also be held by players who are not here.',
   };
 }

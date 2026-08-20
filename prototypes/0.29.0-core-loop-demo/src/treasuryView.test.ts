@@ -188,6 +188,10 @@ describe('votes and approvals', () => {
     expect(t.veto).toBe(1);
     expect(t.records).toBe(1);
     expect(t.trust.level).toBe('unverified');
+    // Slots are keyed by signing key and one person can hold several, so
+    // "one per voter" would imply a deduplication that never happens.
+    expect(t.note).toMatch(/one per signing key/i);
+    expect(t.note).not.toMatch(/one per voter/i);
   });
 
   it('never lets a peer-written confirmation flag soften the caveat', () => {

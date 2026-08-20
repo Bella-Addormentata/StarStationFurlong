@@ -2896,12 +2896,19 @@ function renderTreasuryApp(): void {
     const proposal = readProposal(treasuryDetailId);
     const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
     if (!proposal) {
-      view.innerHTML = `${back}${header("PROPOSAL")}${dim("This proposal is no longer in the room's records.")}`;
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim("This proposal is no longer in the room's records.")}`;
       return;
     }
     const registration = readRegistration(proposal.proposalId);
     // Only a policy for the SAME company and version governs this proposal.
     const rule = governanceRuleFor(proposal, policyCache?.policy ?? null);
+    // A same-company policy at a DIFFERENT revision is why clocks and the
+    // board threshold may be missing — say so instead of leaving the player
+    // to wonder.
+    const otherRevision =
+      policyCache && policyCache.policy.companyId === proposal.companyId
+        ? policyCache.policy.policyVersion
+        : null;
     const w = windowsView(
       proposal,
       registration,
@@ -2922,11 +2929,16 @@ function renderTreasuryApp(): void {
     const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
     const payload = payloadView(readProposalPayload(proposal.payloadHash) !== null);
 
-    view.innerHTML = `${back}
+    view.innerHTML = `${verdictBanner}${back}
       <div style="display:flex; align-items:center; gap:6px; margin-top:8px;">
         <span style="font-size:13px; font-weight:800; color:#f0c060;">${esc(proposalKindLabel(proposal.kind))}</span>
         ${badge(trustTag("signed"))}
       </div>
+      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">Made under policy version ${proposal.policyVersion}${
+        otherRevision !== null && otherRevision !== proposal.policyVersion
+          ? ` · the company details held here are version ${otherRevision}, so that board and its clocks do not apply to this proposal`
+          : ""
+      }</div>
       <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px; word-break:break-all;">${esc(proposal.proposalId)}</div>
       ${dim("The proposal itself is signed by its proposer, and that signature was checked on this device.")}
 
@@ -3083,7 +3095,7 @@ function renderTreasuryApp(): void {
                 style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
                 <span style="min-width:0;">
                   <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
-                  <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)}</span>
+                  <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)} · policy v${r.policyVersion}</span>
                 </span>
                 <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">
                   ${esc(r.phaseLabel)}<br />${badge(r.clockTrust)}
