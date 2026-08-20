@@ -256,13 +256,31 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
   return validProposal(value) && value.proposalId === proposalId ? value : null;
 }
 
-export function listProposals(): TreasuryProposal[] {
+/**
+ * Every valid proposal held here, optionally capped.
+ *
+ * Validation is a signature check per entry and nothing ever removes a
+ * proposal, so an ordinary long history — or a peer publishing many valid
+ * self-signed proposals — makes an uncapped scan expensive enough to stall a
+ * repaint. Callers that render should pass `max`: the scan then stops once it
+ * has that many, which also bounds the verification work.
+ *
+ * Note the trade-off a cap brings: entries are visited in map order, so a
+ * truncated result is an arbitrary subset rather than the "first" by any
+ * meaningful measure. Callers must say so rather than implying completeness.
+ */
+export function listProposals(max?: number): TreasuryProposal[] {
   const m = map();
   if (!m) return [];
   const out: TreasuryProposal[] = [];
   for (const [key, value] of m.entries()) {
     if (!key.startsWith('proposal:')) continue;
-    if (validProposal(value) && key === `proposal:${value.proposalId}`) out.push(value);
+    if (validProposal(value) && key === `proposal:${value.proposalId}`) {
+      // Checked BEFORE pushing so `max` is exact: a max of 0 returns nothing
+      // rather than one, and no entry is verified beyond the cap.
+      if (max !== undefined && out.length >= max) break;
+      out.push(value);
+    }
   }
   return out;
 }

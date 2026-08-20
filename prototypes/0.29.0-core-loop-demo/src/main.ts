@@ -2830,6 +2830,13 @@ function renderTreasuryApp(): void {
       if (action === "open") treasuryDetailId = el.dataset.proposalId ?? "";
       if (action === "back") treasuryDetailId = "";
       renderTreasuryApp();
+      // The repaint replaced the element that had focus. Without moving it
+      // into the new screen, focus falls to the body and — since Tab is the
+      // phone's toggle, not a tab stop — a keyboard player is stranded.
+      const first = view.querySelector<HTMLElement>(
+        "[data-treasury-action], [data-phone-app]",
+      );
+      (first ?? view).focus({ preventScroll: true });
       return true;
     };
     view.addEventListener("click", (e) => activate(e.target));
@@ -3073,7 +3080,14 @@ function renderTreasuryApp(): void {
   );
   const balances = balanceView();
   const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
-  const scoped = scopeProposals(listProposals(), scope.companyId);
+  // Bounded read: verifying every proposal in an unbounded, never-pruned map
+  // would let ordinary history — or a peer publishing many valid self-signed
+  // proposals — stall each repaint. One page at a time, and the page is
+  // honest about being one.
+  const PROPOSAL_PAGE = 50;
+  const page = listProposals(PROPOSAL_PAGE + 1);
+  const truncated = page.length > PROPOSAL_PAGE;
+  const scoped = scopeProposals(page.slice(0, PROPOSAL_PAGE), scope.companyId);
   const rows = proposalRows(
     scoped.shown,
     (p) =>
@@ -3194,6 +3208,13 @@ function renderTreasuryApp(): void {
               `${scoped.otherCompanies} more proposal${scoped.otherCompanies === 1 ? "" : "s"} in this room belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
             )
           : ""
+    }
+    ${
+      truncated
+        ? dim(
+            `Only the first ${PROPOSAL_PAGE} records this room holds were read, so this is a partial list and not in any particular order.`,
+          )
+        : ""
     }
 
     <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">

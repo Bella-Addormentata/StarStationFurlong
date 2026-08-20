@@ -122,6 +122,20 @@ beforeEach(() => {
 });
 
 describe('proposals', () => {
+  it('caps the scan when asked, so an unbounded map cannot stall a repaint', () => {
+    // Each entry costs a signature check and nothing ever prunes them, so a
+    // renderer must be able to stop early.
+    const made = [0, 1, 2, 3].map((i) =>
+      makeProposal({ payloadHash: `${i}`.repeat(64) }),
+    );
+    for (const p of made) expect(putProposal(p)).toBe(true);
+    expect(listProposals()).toHaveLength(4); // no cap given
+    expect(listProposals(2)).toHaveLength(2);
+    expect(listProposals(0)).toHaveLength(0); // the cap is exact
+    // A cap larger than the set still returns everything.
+    expect(listProposals(99)).toHaveLength(4);
+  });
+
   it('round-trips a signed proposal and lists it', () => {
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);
