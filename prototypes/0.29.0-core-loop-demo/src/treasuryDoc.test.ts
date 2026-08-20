@@ -148,6 +148,22 @@ describe('proposals', () => {
     expect(withJunk.items.length).toBeLessThanOrEqual(1);
   });
 
+  it('charges budget for UNRELATED keys too, so a flood cannot be free', () => {
+    // The bound must survive a hostile map. Keys of any other prefix are
+    // skipped by the filter, so if they cost nothing a peer could make every
+    // repaint walk the whole map however small the budget is.
+    const m = doc.getMap('treasury');
+    for (let i = 0; i < 40; i++) m.set(`junk:${i}`, { anything: i });
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    const tight = scanProposals(5);
+    expect(tight.truncated).toBe(true);
+    // Generous enough to get past the junk finds the real record.
+    const roomy = scanProposals(500);
+    expect(roomy.truncated).toBe(false);
+    expect(roomy.items.map((x) => x.proposalId)).toContain(p.proposalId);
+  });
+
   it('round-trips a signed proposal and lists it', () => {
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);

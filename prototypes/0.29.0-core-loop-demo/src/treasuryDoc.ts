@@ -261,17 +261,23 @@ export function listProposals(): TreasuryProposal[] {
 }
 
 /**
- * A scan that is bounded by SLOTS VISITED, not by results kept.
+ * A scan bounded by ENTRIES TRAVERSED — every key the iteration touches,
+ * whatever its prefix.
  *
- * Bounding results is not enough to protect a repaint: validation is a
- * signature check, and a peer can fill the map with entries that fail it, so
- * a result-capped scan still verifies every one of them before it fills up.
- * Counting slots — every key with the right prefix, valid or not — is what
- * actually caps the work.
+ * Two weaker bounds were tried first and neither held. Capping RESULTS still
+ * signature-checks every invalid entry a peer planted before the cap fills.
+ * Capping only MATCHING entries still walks the whole map, because anyone can
+ * add `junk:*` keys that are skipped for free — and this map is peer-writable
+ * and never pruned, so an attacker sets the cost of every repaint.
  *
- * `truncated` says the scan stopped early, so callers can report a partial
- * view honestly. Entries are visited in map order, so a truncated result is
- * an arbitrary subset, never "the first N" by any meaningful measure.
+ * Counting every entry is the only bound that survives a hostile map. The
+ * cost is real and is reported rather than hidden: under a flood, genuine
+ * records may sit past the budget, so `truncated` means "this view is partial
+ * and its contents are an arbitrary subset", never "the first N".
+ *
+ * The lasting fix is a per-class index so each record type can be reached
+ * without walking shared space; that belongs with the op-log durability work
+ * the plans already schedule.
  */
 export interface BoundedScan<T> {
   items: T[];
@@ -280,7 +286,7 @@ export interface BoundedScan<T> {
 
 function scanPrefixed<T>(
   prefix: string,
-  maxSlots: number,
+  maxEntries: number,
   take: (key: string, value: unknown) => T | null,
 ): BoundedScan<T> {
   const m = map();
@@ -288,24 +294,26 @@ function scanPrefixed<T>(
   const items: T[] = [];
   let visited = 0;
   for (const [key, value] of m.entries()) {
-    if (!key.startsWith(prefix)) continue;
-    if (visited >= maxSlots) return { items, truncated: true };
+    // Counted BEFORE the prefix test: a skipped key is still a key this
+    // repaint had to look at.
+    if (visited >= maxEntries) return { items, truncated: true };
     visited += 1;
+    if (!key.startsWith(prefix)) continue;
     const kept = take(key, value);
     if (kept !== null) items.push(kept);
   }
   return { items, truncated: false };
 }
 
-export function scanProposals(maxSlots: number): BoundedScan<TreasuryProposal> {
-  return scanPrefixed('proposal:', maxSlots, (key, value) =>
+export function scanProposals(maxEntries: number): BoundedScan<TreasuryProposal> {
+  return scanPrefixed('proposal:', maxEntries, (key, value) =>
     validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
   );
 }
 
-export function scanVotes(proposalId: string, maxSlots: number): BoundedScan<TreasuryVote> {
+export function scanVotes(proposalId: string, maxEntries: number): BoundedScan<TreasuryVote> {
   const prefix = `vote:${proposalId}:`;
-  return scanPrefixed(prefix, maxSlots, (key, value) =>
+  return scanPrefixed(prefix, maxEntries, (key, value) =>
     validVote(value) && key === `vote:${value.proposalId}:${value.voterGamePub}`
       ? value
       : null,
@@ -314,10 +322,10 @@ export function scanVotes(proposalId: string, maxSlots: number): BoundedScan<Tre
 
 export function scanCheckpoints(
   proposalId: string,
-  maxSlots: number,
+  maxEntries: number,
 ): BoundedScan<TreasuryCheckpoint> {
   const prefix = `checkpoint:${proposalId}:`;
-  return scanPrefixed(prefix, maxSlots, (key, value) =>
+  return scanPrefixed(prefix, maxEntries, (key, value) =>
     validCheckpoint(value) &&
     key === `checkpoint:${value.proposalId}:${value.checkpointId}`
       ? value
@@ -596,7 +604,7 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
  */
 export function scanSigningSessions(
   proposalId: string,
-  maxSlots: number,
+  maxEntries: number,
 ): BoundedScan<SigningSession> {
   const m = map();
   if (!m) return { items: [], truncated: false };
@@ -606,13 +614,14 @@ export function scanSigningSessions(
   const shells: { sessionId: string; shell: SigningSession }[] = [];
   const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
   for (const [key, value] of m.entries()) {
-    const relevant = key.startsWith(shellPrefix) || key.startsWith('sessionsig:');
-    if (!relevant) continue;
-    if (visited >= maxSlots) {
+    // Same rule as scanPrefixed: every entry counts, including the ones this
+    // scan does not want, or a peer's unrelated keys would be free.
+    if (visited >= maxEntries) {
       truncated = true;
       break;
     }
     visited += 1;
+    if (!key.startsWith(shellPrefix) && !key.startsWith('sessionsig:')) continue;
     if (key.startsWith(shellPrefix)) {
       const sessionId = key.slice(shellPrefix.length);
       if (validSessionShell(value, proposalId, sessionId)) {
