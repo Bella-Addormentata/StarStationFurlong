@@ -36,6 +36,7 @@ import {
 } from './casinoDoc';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
+import { isWheelTiming, type WheelTiming } from './robotScript';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet table never spins nothing). */
@@ -116,12 +117,38 @@ export function openBetting(tableId: string, round: number): void {
 }
 
 /**
+ * Resolve the three phase durations THIS tick will use. When the caller passes
+ * a valid `timing` (owner-programmed on the robot dock), those seconds win;
+ * anything malformed falls back to the module defaults so a hostile peer's junk
+ * cannot strand the wheel spinning or fire-hose the doc. Kept engine-local so
+ * every writer of `phaseDeadline` reads from the same knob.
+ */
+function resolveTimings(timing?: WheelTiming): {
+  betMs: number;
+  closingMs: number;
+  showMs: number;
+} {
+  if (timing && isWheelTiming(timing)) {
+    return {
+      betMs: Math.round(timing.betSecs * 1000),
+      closingMs: Math.round(timing.closingSecs * 1000),
+      showMs: Math.round(timing.showSecs * 1000),
+    };
+  }
+  return { betMs: BET_WINDOW_MS, closingMs: CLOSING_MS, showMs: SHOW_MS };
+}
+
+/**
  * One operator tick for one table. Idempotent per frame — only writes on a real
  * transition. The window ARMS on the first bet (so an empty table stays quiet),
  * then betting → closing → settled → next round on the deadlines. Call ONLY when
  * canRunCroupier() (the caller gates), else two clients race the settle.
+ *
+ * `timing` (optional) is the owner-programmed roulette pacing from the robot's
+ * dock config. When absent (or malformed) the defaults above apply.
  */
-export function tickAutoCroupier(tableId: string): void {
+export function tickAutoCroupier(tableId: string, timing?: WheelTiming): void {
+  const { betMs, closingMs, showMs } = resolveTimings(timing);
   const now = Date.now();
   const s = readTableState(tableId);
   if (!s) {
@@ -132,17 +159,17 @@ export function tickAutoCroupier(tableId: string): void {
     if (s.phaseDeadline == null) {
       // Arm the clock the moment the first chip is on the felt.
       if (Object.keys(readAllBets(tableId, s.round)).length > 0) {
-        writeTableState(tableId, { ...s, phaseDeadline: now + BET_WINDOW_MS });
+        writeTableState(tableId, { ...s, phaseDeadline: now + betMs });
       }
     } else if (now >= s.phaseDeadline) {
       writeTableState(tableId, {
         ...s,
         phase: 'closing',
-        phaseDeadline: now + CLOSING_MS,
+        phaseDeadline: now + closingMs,
       });
     }
   } else if (s.phase === 'closing') {
-    if (now >= (s.phaseDeadline ?? now)) rollAndSettle(tableId, s.round, SHOW_MS);
+    if (now >= (s.phaseDeadline ?? now)) rollAndSettle(tableId, s.round, showMs);
   } else if (s.phase === 'settled') {
     if (s.phaseDeadline != null && now >= s.phaseDeadline) {
       openBetting(tableId, s.round + 1);
