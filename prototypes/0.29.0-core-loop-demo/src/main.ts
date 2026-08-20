@@ -60,10 +60,11 @@ import {
   subscribeTreasury,
   treasuryDocBound,
 } from "./treasuryDoc";
-import { treasuryNetwork } from "./treasuryNetwork";
+import { NO_NETWORK_PIN, treasuryNetwork } from "./treasuryNetwork";
 import {
   approvalsView,
   balanceView,
+  boardThresholdFor,
   boardView,
   displayHeight,
   formatHeight,
@@ -74,6 +75,7 @@ import {
   proposalPhase,
   proposalRows,
   roomFundingView,
+  sessionsFor,
   shareClassViews,
   shortId,
   syncView,
@@ -1253,7 +1255,11 @@ async function joinRoomAtEpoch(
   // network configuration when PR C wires real treasury flows.
   bindTreasuryDoc(sync.doc, {
     verifySig: verifyIdentity,
-    networkGenesisChallenge: treasuryNetwork().genesisChallenge,
+    // An unconfigured build pins to a value treasuryDoc must refuse, which
+    // closes the cache: no record can match, so none is displayed. Passing a
+    // plausible-looking hex placeholder here would instead make it the live
+    // network, and any peer could publish records under it.
+    networkGenesisChallenge: treasuryNetwork().genesisChallenge ?? NO_NETWORK_PIN,
   });
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
@@ -2896,11 +2902,11 @@ function renderTreasuryApp(): void {
       listVotes(proposal.proposalId),
       listCheckpoints(proposal.proposalId),
     );
+    // Rounds and thresholds only count when they belong to THIS proposal's
+    // company and policy revision — both are peer-writable.
     const approvals = approvalsView(
-      listSigningSessions(proposal.proposalId),
-      policyCache?.policy.companyId === proposal.companyId
-        ? policyCache.policy.board.threshold
-        : null,
+      sessionsFor(listSigningSessions(proposal.proposalId), proposal),
+      boardThresholdFor(proposal, policyCache?.policy ?? null),
     );
     const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
     const payload = payloadView(readProposalPayload(proposal.payloadHash) !== null);
@@ -2957,7 +2963,10 @@ function renderTreasuryApp(): void {
       }
       ${dim(esc(approvals.note))}
 
-      ${header("WHAT IT WOULD DO")}
+      <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">WHAT IT WOULD DO</span>
+        ${badge(payload.trust)}
+      </div>
       <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.7); margin-top:5px;">${esc(payload.headline)}</div>
       ${dim(esc(payload.detail))}`;
     return;

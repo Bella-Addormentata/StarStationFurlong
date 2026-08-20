@@ -35,8 +35,8 @@ import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
-import { readRoomBinding, treasuryDocBound } from './treasuryDoc';
-import { formatHeight, roomFundingView, shortId } from './treasuryView';
+import { readChainSyncStatus, readRoomBinding, treasuryDocBound } from './treasuryDoc';
+import { displayHeight, formatHeight, roomFundingView, shortId } from './treasuryView';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -457,14 +457,24 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       const roomId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
       const connected = Boolean(roomId) && treasuryDocBound();
+      // Without a height an ended binding cannot be spotted, so a lapsed
+      // record would read as current funding. Only a peer-reported height
+      // exists today — it is enough to mark a record lapsed (a conservative
+      // direction) and is labelled as unchecked below.
+      const height = connected
+        ? displayHeight(readChainSyncStatus()).height
+        : null;
       const funding = roomFundingView(
         connected ? readRoomBinding(roomId) : null,
+        height,
       );
       // No record is NOT the same fact as "funded personally", and an
       // unreachable room document is a third state again — say which one.
+      // The trust status rides the headline: the read-only chain caveat says
+      // nothing about whether this record's signature was checked.
       fundEl.textContent = connected
-        ? funding.headline.toUpperCase()
-        : 'FUNDING RECORDS UNAVAILABLE';
+        ? `${funding.headline.toUpperCase()} · ${funding.trust.label}`
+        : 'FUNDING RECORDS UNAVAILABLE · NO DATA';
       fundEl.style.color = !connected
         ? '#4A5560'
         : funding.lapsed
@@ -482,6 +492,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
               `COMPANY ${shortId(funding.companyId ?? '')} · TREASURY ${shortId(funding.treasuryId ?? '')}`,
               `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
               `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+              funding.trust.detail,
+              height === null
+                ? 'NO HEIGHT AVAILABLE, SO AN ENDED RECORD CANNOT BE SPOTTED.'
+                : `AGAINST A HEIGHT ANOTHER PLAYER REPORTED (${formatHeight(height)}), NOT CHECKED HERE.`,
               funding.readOnlyNote,
               funding.detail,
               `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,

@@ -7,26 +7,52 @@
 //
 // The real genesis values are the node's network constants and arrive with the
 // node treasury lane (PR D) — they are deliberately NOT hardcoded here, because
-// a wrong constant would silently pin a build to a network nobody runs. Until a
-// build is configured, the default is a placeholder that matches no real chain:
-// an unconfigured build displays nothing rather than something wrong.
-
-/** Matches no real chain — an unconfigured build shows no treasury records. */
-const DEV_PLACEHOLDER_GENESIS = '0'.repeat(64);
+// a wrong constant would silently pin a build to a network nobody runs.
+//
+// An unconfigured build has NO pin at all, not a placeholder one. An earlier
+// version used 64 zeros, which looks unusable but is perfectly valid Hex32:
+// treasuryDoc accepted it as the active network, so any peer could publish
+// records carrying that same all-zero genesis and an unconfigured build would
+// render them. Returning null instead lets the caller hand treasuryDoc a value
+// it must reject, which closes the cache entirely — nothing matches, so
+// nothing shows.
 
 export interface TreasuryNetwork {
-  /** The genesis challenge treasuryDoc pins its cache to. */
-  genesisChallenge: string;
+  /**
+   * The genesis challenge treasuryDoc pins its cache to, or null when this
+   * build has no network configured. Callers must NOT substitute a plausible
+   * hex value for null: pass something treasuryDoc will refuse.
+   */
+  genesisChallenge: string | null;
   /** Player-facing network name for the UI's verification line. */
   label: string;
   /** False when this build has no real network configured. */
   configured: boolean;
 }
 
+/**
+ * What to pin with when unconfigured: deliberately not 64 hex characters, so
+ * treasuryDoc's own guard refuses it and disables every treasury read.
+ */
+export const NO_NETWORK_PIN = 'no-network-configured';
+
 function envValue(key: string): string {
+  // Vite's import.meta.env in the browser; process.env under node tooling and
+  // tests. Both are read because the key is dynamic, so Vite's static
+  // replacement of import.meta.env.FOO does not apply.
   try {
-    const env = (import.meta as { env?: Record<string, string | undefined> }).env;
-    return (env?.[key] ?? '').trim();
+    const meta = (import.meta as { env?: Record<string, string | undefined> }).env;
+    const fromMeta = meta?.[key];
+    if (typeof fromMeta === 'string' && fromMeta.trim().length > 0) {
+      return fromMeta.trim();
+    }
+  } catch {
+    /* import.meta.env is absent in some runtimes */
+  }
+  try {
+    const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } })
+      .process;
+    return (proc?.env?.[key] ?? '').trim();
   } catch {
     return '';
   }
@@ -49,10 +75,10 @@ export function treasuryNetwork(): TreasuryNetwork {
     };
   }
   if (raw.length > 0) {
-    console.warn('treasuryNetwork: VITE_SSF_TREASURY_GENESIS is not 64 lowercase hex — using the unconfigured placeholder');
+    console.warn('treasuryNetwork: VITE_SSF_TREASURY_GENESIS is not 64 lowercase hex — treasury records will not be shown');
   }
   return {
-    genesisChallenge: DEV_PLACEHOLDER_GENESIS,
+    genesisChallenge: null,
     label: 'not configured',
     configured: false,
   };

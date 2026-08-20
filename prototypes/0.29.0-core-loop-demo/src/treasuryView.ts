@@ -198,6 +198,11 @@ export function proposalPhase(
   currentHeight: number | null,
 ): ProposalPhase {
   if (currentHeight === null) return 'unknown-height';
+  // A height BEFORE the acceptance block means the two peer-written inputs
+  // disagree: the chain cannot be at a point where this proposal both exists
+  // and has not been accepted. Claiming "Voting open" there would invent a
+  // phase out of an inconsistency, so report the position as unknown.
+  if (currentHeight < windows.acceptedHeight) return 'unknown-height';
   if (currentHeight >= windows.expiresAfterHeight) return 'expired';
   if (currentHeight >= windows.executableFromHeight) return 'executable';
   if (currentHeight >= windows.vetoEndsHeight) return 'timelock';
@@ -618,6 +623,40 @@ export function proposalRows(
  * describe a different rulebook than the one the proposal answers to, while
  * looking authoritative.
  */
+/**
+ * The approval rounds that actually belong to a proposal. Rounds are
+ * peer-writable and only keyed by proposal id in the cache, so one opened
+ * under a different company or a different policy revision would otherwise be
+ * rendered as this proposal's progress.
+ */
+export function sessionsFor(
+  sessions: SigningSession[],
+  proposal: TreasuryProposal,
+): SigningSession[] {
+  return sessions.filter(
+    (s) =>
+      s.companyId === proposal.companyId &&
+      s.policyVersion === proposal.policyVersion &&
+      s.proposalId === proposal.proposalId,
+  );
+}
+
+/**
+ * The board threshold to hold a proposal's approvals against, or null. Same
+ * rule as the governance rule: a policy for another company — or another
+ * revision of this one — describes a different board than the proposal
+ * answers to.
+ */
+export function boardThresholdFor(
+  proposal: TreasuryProposal,
+  policy: CompanyTreasuryPolicy | null,
+): number | null {
+  if (!policy) return null;
+  if (policy.companyId !== proposal.companyId) return null;
+  if (policy.policyVersion !== proposal.policyVersion) return null;
+  return policy.board.threshold;
+}
+
 export function governanceRuleFor(
   proposal: TreasuryProposal,
   policy: CompanyTreasuryPolicy | null,
@@ -631,6 +670,11 @@ export function governanceRuleFor(
 export interface PayloadView {
   /** Whether the room holds the bytes this proposal commits to. */
   present: boolean;
+  /**
+   * The one genuinely self-checked panel: the cache only returns payload
+   * bytes whose hash it recomputed against the key they sit under.
+   */
+  trust: TrustTag;
   headline: string;
   detail: string;
 }
@@ -645,11 +689,13 @@ export function payloadView(present: boolean): PayloadView {
   return present
     ? {
         present: true,
+        trust: trustTag('self-checked'),
         headline: 'Details held in this room',
         detail: 'The full details behind this proposal are stored here and match the fingerprint it commits to. They are not readable in the phone yet.',
       }
     : {
         present: false,
+        trust: trustTag('absent'),
         headline: 'Details not held here',
         detail: 'This room does not have the details behind this proposal, so what it would do cannot be shown.',
       };

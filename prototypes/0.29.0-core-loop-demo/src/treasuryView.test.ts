@@ -29,10 +29,12 @@ import {
   formatAmount,
   formatHeight,
   formatShares,
+  boardThresholdFor,
   formatXch,
   governanceRuleFor,
   payloadView,
   phaseLabel,
+  sessionsFor,
   proposalKindLabel,
   proposalPhase,
   proposalRows,
@@ -87,6 +89,14 @@ describe('proposal phase', () => {
   it('refuses to claim a phase without a height', () => {
     expect(proposalPhase(windows, null)).toBe('unknown-height');
     expect(phaseLabel('unknown-height')).toContain('unknown');
+  });
+
+  it('refuses to claim a phase when the height precedes acceptance', () => {
+    // Both inputs are peer-written; a height before the acceptance block means
+    // they disagree. Falling through to "Voting open" would invent a phase out
+    // of an inconsistency.
+    expect(proposalPhase(windows, windows.acceptedHeight - 1)).toBe('unknown-height');
+    expect(proposalPhase(windows, 0)).toBe('unknown-height');
   });
 
   it('places the proposal on each clock at the boundaries', () => {
@@ -219,15 +229,54 @@ describe('votes and approvals', () => {
   });
 });
 
-describe('governance rule matching', () => {
+describe('matching records to the proposal they claim', () => {
   const proposal = contracts.proposal.unsigned as TreasuryProposal;
+  const matching = {
+    ...policy,
+    companyId: proposal.companyId,
+    policyVersion: proposal.policyVersion,
+  };
 
   it('only uses a policy for the same company and version', () => {
-    const matching = { ...policy, companyId: proposal.companyId, policyVersion: proposal.policyVersion };
     expect(governanceRuleFor(proposal, matching)).toEqual(matching.governanceRules[proposal.kind]);
     expect(governanceRuleFor(proposal, { ...matching, companyId: '9'.repeat(64) })).toBeNull();
     expect(governanceRuleFor(proposal, { ...matching, policyVersion: proposal.policyVersion + 1 })).toBeNull();
     expect(governanceRuleFor(proposal, null)).toBeNull();
+  });
+
+  it('takes the board threshold only from a matching policy revision', () => {
+    expect(boardThresholdFor(proposal, matching)).toBe(matching.board.threshold);
+    // Another revision of the same company describes a different board.
+    expect(boardThresholdFor(proposal, { ...matching, policyVersion: 99 })).toBeNull();
+    expect(boardThresholdFor(proposal, { ...matching, companyId: '9'.repeat(64) })).toBeNull();
+    expect(boardThresholdFor(proposal, null)).toBeNull();
+  });
+
+  it('drops approval rounds belonging to another company or revision', () => {
+    const round = (over: Partial<SigningSession>): SigningSession => ({
+      v: 1,
+      sessionId: 'a'.repeat(64),
+      networkGenesisChallenge: 'a'.repeat(64),
+      companyId: proposal.companyId,
+      policyVersion: proposal.policyVersion,
+      proposalId: proposal.proposalId,
+      bundleHash: 'd'.repeat(64),
+      requiredThreshold: 2,
+      collectedSigs: [],
+      expiresAfterHeight: 100,
+      ...over,
+    });
+    const mine = round({});
+    const kept = sessionsFor(
+      [
+        mine,
+        round({ companyId: '9'.repeat(64) }),
+        round({ policyVersion: proposal.policyVersion + 1 }),
+        round({ proposalId: '9'.repeat(64) }),
+      ],
+      proposal,
+    );
+    expect(kept).toEqual([mine]);
   });
 });
 
@@ -236,8 +285,12 @@ describe('payload view', () => {
     const held = payloadView(true);
     expect(held.present).toBe(true);
     expect(held.headline).toMatch(/held in this room/i);
+    // The cache only returns payload bytes whose hash it recomputed, so this
+    // is the one genuinely self-checked panel — and it must say so.
+    expect(held.trust.level).toBe('self-checked');
     const missing = payloadView(false);
     expect(missing.present).toBe(false);
+    expect(missing.trust.level).toBe('absent');
     expect(missing.detail).toMatch(/cannot be shown/i);
     for (const s of [held.headline, held.detail, missing.headline, missing.detail]) {
       expect(s).not.toMatch(/[0-9a-f]{16,}/); // never raw hex at the player
