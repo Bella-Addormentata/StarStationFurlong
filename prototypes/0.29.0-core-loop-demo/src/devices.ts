@@ -456,19 +456,41 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     if (fundEl && fundDetailEl) {
       const roomId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+      const connected = Boolean(roomId) && treasuryDocBound();
       const funding = roomFundingView(
-        roomId && treasuryDocBound() ? readRoomBinding(roomId) : null,
+        connected ? readRoomBinding(roomId) : null,
       );
-      fundEl.textContent = funding.headline.toUpperCase();
-      fundEl.style.color = funding.bound ? '#00E676' : '#F0C060';
-      const lines = funding.bound
+      // No record is NOT the same fact as "funded personally", and an
+      // unreachable room document is a third state again — say which one.
+      fundEl.textContent = connected
+        ? funding.headline.toUpperCase()
+        : 'FUNDING RECORDS UNAVAILABLE';
+      fundEl.style.color = !connected
+        ? '#4A5560'
+        : funding.lapsed
+          ? '#F0C060'
+          : funding.bound
+            ? '#00E676'
+            : '#F0C060';
+      const lines = !connected
         ? [
-            `COMPANY ${shortId(funding.companyId ?? '')} · POLICY v${funding.policyVersion}`,
-            `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · EXPIRES ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
-            'NOT VERIFIED HERE — this terminal does not read the chain.',
-            funding.detail,
+            'This terminal cannot reach the room’s records, so it cannot say how the room is funded.',
+            funding.readOnlyNote,
           ]
-        : [funding.detail];
+        : funding.bound
+          ? [
+              `COMPANY ${shortId(funding.companyId ?? '')} · TREASURY ${shortId(funding.treasuryId ?? '')}`,
+              `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
+              `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+              funding.readOnlyNote,
+              funding.detail,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ]
+          : [
+              funding.detail,
+              funding.readOnlyNote,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ];
       fundDetailEl.textContent = lines.join('  ');
     }
 

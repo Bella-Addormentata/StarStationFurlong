@@ -59,7 +59,9 @@ export interface TrustTag {
 const TRUST: Record<TrustLevel, Omit<TrustTag, 'level'>> = {
   signed: {
     label: 'SIGNED',
-    detail: 'Signature checked on this device.',
+    // Deliberately modest: a signature proves WHO wrote the record, never
+    // that they were entitled to. Authority is a chain question.
+    detail: 'Signed by its author, and that signature was checked here — which shows who wrote it, not that they were allowed to.',
   },
   'self-checked': {
     label: 'SELF-CHECKED',
@@ -155,6 +157,7 @@ export function proposalKindLabel(kind: TreasuryProposalKind): string {
 
 /** The §15 status vocabulary, minus the states only the chain can report. */
 export type ProposalPhase =
+  | 'no-clocks'
   | 'unknown-height'
   | 'voting'
   | 'veto'
@@ -163,11 +166,14 @@ export type ProposalPhase =
   | 'expired';
 
 const PHASE_LABELS: Record<ProposalPhase, string> = {
+  'no-clocks': 'Not accepted yet',
   'unknown-height': 'Clocks known · position unknown',
   voting: 'Voting open',
   veto: 'Veto window',
   timelock: 'Waiting out the delay',
-  executable: 'Ready for the board',
+  // Never "executable": §4.1 forbids the browser declaring a proposal
+  // executable, and the chain enforces the window regardless of this label.
+  executable: 'Inside the board’s window',
   expired: 'Expired',
 };
 
@@ -231,15 +237,20 @@ export function windowsView(
       return {
         windows: deriveProposalWindows(registration, rule),
         source: 'recomputed',
-        trust: trustTag('self-checked'),
-        note: 'Recomputed here from the accepted height and the company policy.',
+        // NOT 'self-checked': recomputing is better than trusting a peer's
+        // copy, but both inputs — the acceptance record and the policy — are
+        // shape-only caches anyone in the room can write. Claiming a higher
+        // trust level here would rank the fully peer-controlled path above
+        // the cached one it replaced.
+        trust: trustTag('unverified'),
+        note: 'Worked out here from the acceptance record and the company policy — neither of which this device has checked against the chain.',
       };
     } catch {
       return {
         windows: null,
         source: 'none',
         trust: trustTag('absent'),
-        note: 'The cached acceptance record and policy do not produce valid clocks.',
+        note: 'The acceptance record and policy held here do not produce sensible clocks.',
       };
     }
   }
@@ -249,15 +260,17 @@ export function windowsView(
       source: 'cached',
       trust: trustTag('unverified'),
       note: registration
-        ? 'Company policy is not cached, so these clocks could not be recomputed.'
-        : 'No acceptance record cached, so these clocks could not be recomputed.',
+        ? 'Copied from another player: the company policy is missing here, so these clocks could not be worked out independently.'
+        : 'Copied from another player: no acceptance record is held here, so these clocks could not be worked out independently.',
     };
   }
   return {
     windows: null,
     source: 'none',
     trust: trustTag('absent'),
-    note: 'This proposal has not been accepted on chain yet.',
+    note: registration
+      ? 'The company policy is missing here, so this proposal’s clocks cannot be worked out.'
+      : 'No acceptance record for this proposal is held in this room yet.',
   };
 }
 
@@ -272,23 +285,30 @@ export interface VoteTallyView {
   no: number;
   abstain: number;
   veto: number;
-  /** Confirmed vote-confirmation records covering this proposal. */
-  confirmedRecords: number;
-  /** Records published but not yet confirmed on chain. */
-  pendingRecords: number;
-  /**
-   * True when no confirmed record exists — under the amendment's rule a vote
-   * in no confirmed record does not count, however many are held locally.
-   */
-  noneCount: boolean;
+  /** Vote-confirmation records held here, confirmed or not. */
+  records: number;
+  trust: TrustTag;
   note: string;
+  /** Why these counts are not a result. Rendered alongside, never omitted. */
+  caveat: string;
 }
 
 /**
- * Summarises what this room's cache holds. Deliberately NOT a tally: counting
- * requires chain-verified share balances at the snapshot height and the union
- * across confirmed vote-confirmation records, neither of which the browser can
- * see. The count is described as "held here", never as a result.
+ * Summarises what this room's cache holds. Deliberately NOT a tally, and the
+ * caveat is unconditional rather than data-driven, because every input a
+ * softer message could key off is attacker-controlled:
+ *
+ *  - a record's confirmation fields (confirmedHeight / the coin id) are
+ *    excluded from its own fingerprint and it carries no signature, so a peer
+ *    can mint "confirmed" freely. Reporting a confirmed COUNT would let that
+ *    peer both fabricate reassurance and switch off the warning about it.
+ *  - votes are per-keypair, so counts are inflatable, and weight comes from
+ *    share balances at the snapshot height, which the browser cannot read.
+ *  - the cache holds one record per voter slot, so a merge across a partition
+ *    can surface the losing vote and hide the winner.
+ *
+ * So: counts are labelled as what is HELD HERE, and the caveat always says
+ * the real count happens elsewhere.
  */
 export function voteTallyView(
   votes: TreasuryVote[],
@@ -296,20 +316,13 @@ export function voteTallyView(
 ): VoteTallyView {
   const tally = { yes: 0, no: 0, abstain: 0, veto: 0 };
   for (const v of votes) tally[v.choice] += 1;
-  const confirmedRecords = checkpoints.filter(
-    (c) => typeof c.confirmedHeight === 'number',
-  ).length;
-  const pendingRecords = checkpoints.length - confirmedRecords;
-  const noneCount = confirmedRecords === 0;
   return {
     held: votes.length,
     ...tally,
-    confirmedRecords,
-    pendingRecords,
-    noneCount,
-    note: noneCount
-      ? 'No confirmed vote record yet — votes only count once one is confirmed on chain.'
-      : 'Final counting happens against confirmed records and share balances on chain.',
+    records: checkpoints.length,
+    trust: trustTag('unverified'),
+    note: 'Votes held in this room, one per voter — not a count, and not weighted by shares.',
+    caveat: 'A vote only counts once it is inside a vote record confirmed on chain, which this device cannot check. Some votes may also be held by players who are not here.',
   };
 }
 
@@ -319,31 +332,47 @@ export function voteTallyView(
 
 export interface ApprovalsView {
   sessions: number;
-  /** Highest collected count across sessions — unverified by construction. */
+  /** Signatures gathered in the furthest-along single round. */
   collected: number;
-  required: number;
+  /**
+   * How many that round needs. Taken from the company policy when it is
+   * known, because the round's own copy is written by whoever opened it.
+   */
+  required: number | null;
+  requiredFromPolicy: boolean;
+  trust: TrustTag;
   note: string;
 }
 
 /**
- * Board approval progress. The collected count is unverified: board signatures
- * cannot be checked in the browser until the custody primitive lands (PR F),
- * so a peer could inflate it. The note says so rather than implying progress.
+ * Board approval progress for ONE round — never a figure assembled from two.
+ * Collected and required used to be independent maxima across all rounds,
+ * which could pair a count from one round with a threshold from another and
+ * report a total that no round had reached.
+ *
+ * Both numbers stay unverified: board signatures cannot be checked in the
+ * browser until the custody primitive lands, so a peer can add arbitrary
+ * strings to a round, and a round's own threshold is peer-authored — which is
+ * why the policy's threshold is preferred when it is available.
  */
-export function approvalsView(sessions: SigningSession[]): ApprovalsView {
-  let collected = 0;
-  let required = 0;
+export function approvalsView(
+  sessions: SigningSession[],
+  policyThreshold: number | null,
+): ApprovalsView {
+  let best: SigningSession | null = null;
   for (const s of sessions) {
-    if (s.collectedSigs.length > collected) collected = s.collectedSigs.length;
-    if (s.requiredThreshold > required) required = s.requiredThreshold;
+    if (!best || s.collectedSigs.length > best.collectedSigs.length) best = s;
   }
+  const required = policyThreshold ?? best?.requiredThreshold ?? null;
   return {
     sessions: sessions.length,
-    collected,
+    collected: best ? best.collectedSigs.length : 0,
     required,
+    requiredFromPolicy: policyThreshold !== null,
+    trust: trustTag('unverified'),
     note: sessions.length === 0
-      ? 'No approval round open.'
-      : 'Approval counts are not verified in the phone — the chain enforces the threshold.',
+      ? 'No approval round open in this room.'
+      : 'Approvals are not checked in the phone — the chain enforces the board’s threshold when a spend is made.',
   };
 }
 
@@ -459,43 +488,77 @@ export function shareClassViews(policy: CompanyTreasuryPolicy): ShareClassView[]
 
 export interface RoomFundingView {
   bound: boolean;
+  /** True when a binding exists but its own expiry height has passed. */
+  lapsed: boolean;
   companyId: string | null;
+  treasuryId: string | null;
+  profileId: string | null;
   policyVersion: number | null;
   boundAtHeight: number | null;
   expiresAfterHeight: number | null;
   trust: TrustTag;
   headline: string;
   detail: string;
+  /** Always rendered: this device does not check the chain (§10.2). */
+  readOnlyNote: string;
+  /** §10.2 rows nothing can supply yet, named instead of quietly dropped. */
+  unavailable: string[];
 }
 
 /**
  * The room terminal's FUNDING panel and the phone's room line share this.
- * A binding is signed by whoever bound it, which the cache verifies — but
- * §10.1's rule stands: appearing in the room document does not make it
- * authoritative, and funding never implies edit rights (§9.4).
+ *
+ * Absence is reported as absence: with no binding cached, this device knows
+ * nothing about how the room is funded, which is not the same as knowing the
+ * room is funded personally. §10.1's rule also stands — appearing in the room
+ * document does not make a binding authoritative — and funding never implies
+ * edit rights (§9.4).
  */
-export function roomFundingView(binding: RoomTreasuryBinding | null): RoomFundingView {
+export function roomFundingView(
+  binding: RoomTreasuryBinding | null,
+  currentHeight: number | null = null,
+): RoomFundingView {
+  const readOnlyNote = 'Read-only: this device does not check the chain, so none of this is confirmed.';
+  const unavailable = [
+    'Covered systems and remaining budgets',
+    'Any pending request to bind or unbind',
+  ];
   if (!binding) {
     return {
       bound: false,
+      lapsed: false,
       companyId: null,
+      treasuryId: null,
+      profileId: null,
       policyVersion: null,
       boundAtHeight: null,
       expiresAfterHeight: null,
       trust: trustTag('absent'),
-      headline: 'Personal funding',
-      detail: 'This room is not funded by a company. Its costs come from the owner personally.',
+      headline: 'No company funding record',
+      detail: 'Nothing here says a company funds this room. Costs fall to the owner unless a record turns up.',
+      readOnlyNote,
+      unavailable,
     };
   }
+  const expires = binding.expiresAfterHeight ?? null;
+  const lapsed =
+    expires !== null && currentHeight !== null && currentHeight >= expires;
   return {
     bound: true,
+    lapsed,
     companyId: binding.companyId,
+    treasuryId: binding.treasuryLauncherId,
+    profileId: binding.profileId,
     policyVersion: binding.policyVersion,
     boundAtHeight: binding.boundAtHeight,
-    expiresAfterHeight: binding.expiresAfterHeight ?? null,
+    expiresAfterHeight: expires,
     trust: trustTag('signed'),
-    headline: 'Company funding',
-    detail: 'Funding this room does not grant anyone edit rights here — those stay separate.',
+    headline: lapsed ? 'Company funding · lapsed' : 'Company funding',
+    detail: lapsed
+      ? 'This record’s own end height has passed, so it no longer claims to fund the room. Funding a room grants nobody edit rights here — those stay separate.'
+      : 'Funding this room does not grant anyone edit rights here — those stay separate.',
+    readOnlyNote,
+    unavailable,
   };
 }
 
@@ -519,13 +582,14 @@ export interface ProposalRowView {
  */
 export function proposalRows(
   proposals: TreasuryProposal[],
-  windowsFor: (proposalId: string) => ProposalWindows | null,
+  /** Receives the whole proposal so callers need not re-read (and re-verify) it. */
+  windowsFor: (proposal: TreasuryProposal) => ProposalWindows | null,
   currentHeight: number | null,
   heightSource: HeightSource,
 ): ProposalRowView[] {
   const rows = proposals.map((p) => {
-    const w = windowsFor(p.proposalId);
-    const phase = w ? proposalPhase(w, currentHeight) : 'unknown-height';
+    const w = windowsFor(p);
+    const phase: ProposalPhase = w ? proposalPhase(w, currentHeight) : 'no-clocks';
     return {
       proposalId: p.proposalId,
       shortId: shortId(p.proposalId),
@@ -545,6 +609,50 @@ export function proposalRows(
     void _accepted;
     return row;
   });
+}
+
+/**
+ * The governance rule that actually governs a proposal, or null. The rule is
+ * only used when the cached policy is the SAME company and the SAME policy
+ * version the proposal was made under — otherwise the clocks it produces
+ * describe a different rulebook than the one the proposal answers to, while
+ * looking authoritative.
+ */
+export function governanceRuleFor(
+  proposal: TreasuryProposal,
+  policy: CompanyTreasuryPolicy | null,
+): GovernanceKindRule | null {
+  if (!policy) return null;
+  if (policy.companyId !== proposal.companyId) return null;
+  if (policy.policyVersion !== proposal.policyVersion) return null;
+  return policy.governanceRules[proposal.kind] ?? null;
+}
+
+export interface PayloadView {
+  /** Whether the room holds the bytes this proposal commits to. */
+  present: boolean;
+  headline: string;
+  detail: string;
+}
+
+/**
+ * What a proposal would do. The payload is an opaque canonical blob with no
+ * schema and no decoder yet, so the honest report is that the room either
+ * holds the referenced details or does not — dumping raw hex at a player
+ * teaches them nothing and reads as chain jargon the phone is meant to avoid.
+ */
+export function payloadView(present: boolean): PayloadView {
+  return present
+    ? {
+        present: true,
+        headline: 'Details held in this room',
+        detail: 'The full details behind this proposal are stored here and match the fingerprint it commits to. They are not readable in the phone yet.',
+      }
+    : {
+        present: false,
+        headline: 'Details not held here',
+        detail: 'This room does not have the details behind this proposal, so what it would do cannot be shown.',
+      };
 }
 
 /** Largest allowance bound first — uses the no-parse mojo comparator. */

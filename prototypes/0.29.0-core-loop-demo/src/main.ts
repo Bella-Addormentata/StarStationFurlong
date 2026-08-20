@@ -67,6 +67,8 @@ import {
   boardView,
   displayHeight,
   formatHeight,
+  governanceRuleFor,
+  payloadView,
   phaseLabel,
   proposalKindLabel,
   proposalPhase,
@@ -2802,19 +2804,31 @@ let treasuryDetailId = "";
 function renderTreasuryApp(): void {
   const view = document.getElementById("phone-app-treasury");
   if (!view) return;
+  // Every treasury record that lands fires this. Re-verifying the whole cache
+  // for a view nobody is looking at is wasted signature work, and the app
+  // repaints on open anyway.
+  if (!view.classList.contains("active") && view.dataset.wired) return;
   // Same black-inheritance fix as the BANK/VENTURES apps.
   view.style.color = "#e8d5a3";
   if (!view.dataset.wired) {
     view.dataset.wired = "1";
-    view.addEventListener("click", (e) => {
-      const el = (e.target as HTMLElement).closest<HTMLElement>(
+    const activate = (target: EventTarget | null) => {
+      const el = (target as HTMLElement | null)?.closest<HTMLElement>(
         "[data-treasury-action]",
       );
-      if (!el) return;
+      if (!el) return false;
       const action = el.dataset.treasuryAction;
       if (action === "open") treasuryDetailId = el.dataset.proposalId ?? "";
       if (action === "back") treasuryDetailId = "";
       renderTreasuryApp();
+      return true;
+    };
+    view.addEventListener("click", (e) => activate(e.target));
+    // The rows advertise role="button"/tabindex="0", so they must answer the
+    // keyboard too — otherwise the affordance is decorative.
+    view.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      if (activate(e.target)) e.preventDefault();
     });
   }
   const esc = (s: string) =>
@@ -2875,15 +2889,21 @@ function renderTreasuryApp(): void {
       return;
     }
     const registration = readRegistration(proposal.proposalId);
-    const rule = policyCache?.policy.governanceRules[proposal.kind] ?? null;
+    // Only a policy for the SAME company and version governs this proposal.
+    const rule = governanceRuleFor(proposal, policyCache?.policy ?? null);
     const w = windowsView(registration, rule, readWindowsCache(proposal.proposalId));
     const votes = voteTallyView(
       listVotes(proposal.proposalId),
       listCheckpoints(proposal.proposalId),
     );
-    const approvals = approvalsView(listSigningSessions(proposal.proposalId));
-    const phase = w.windows ? proposalPhase(w.windows, height) : "unknown-height";
-    const payload = readProposalPayload(proposal.payloadHash);
+    const approvals = approvalsView(
+      listSigningSessions(proposal.proposalId),
+      policyCache?.policy.companyId === proposal.companyId
+        ? policyCache.policy.board.threshold
+        : null,
+    );
+    const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
+    const payload = payloadView(readProposalPayload(proposal.payloadHash) !== null);
 
     view.innerHTML = `${back}
       <div style="display:flex; align-items:center; gap:6px; margin-top:8px;">
@@ -2914,39 +2934,47 @@ function renderTreasuryApp(): void {
           : "No chain height available on this device, so the phone will not say which window is open.",
       )}
 
-      ${header("VOTES HELD IN THIS ROOM")}
+      <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">VOTES HELD IN THIS ROOM</span>
+        ${badge(votes.trust)}
+      </div>
       ${row("Held here", `${votes.held}`)}
       ${row("Yes · No", `${votes.yes} · ${votes.no}`)}
       ${row("Abstain · Veto", `${votes.abstain} · ${votes.veto}`)}
-      ${row("Confirmed vote records", `${votes.confirmedRecords}${votes.pendingRecords ? ` (+${votes.pendingRecords} pending)` : ""}`)}
+      ${row("Vote records held", `${votes.records}`)}
       ${dim(esc(votes.note))}
+      ${dim(esc(votes.caveat))}
 
-      ${header("BOARD APPROVALS")}
-      ${row("Collected", `${approvals.collected} of ${approvals.required || "—"}`)}
+      <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">BOARD APPROVALS</span>
+        ${badge(approvals.trust)}
+      </div>
+      ${row("Gathered in one round", `${approvals.collected} of ${approvals.required ?? "—"}`)}
+      ${
+        approvals.required !== null && !approvals.requiredFromPolicy
+          ? dim("The number needed comes from the round itself, not the company policy.")
+          : ""
+      }
       ${dim(esc(approvals.note))}
 
-      ${header("WHAT IT PAYS FOR")}
-      ${
-        payload
-          ? `<div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px; word-break:break-all;">${esc(payload.slice(0, 240))}${payload.length > 240 ? "…" : ""}</div>
-             ${dim("Contents match the fingerprint the proposal commits to.")}`
-          : dim("The details behind this proposal are not held in this room yet.")
-      }`;
+      ${header("WHAT IT WOULD DO")}
+      <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.7); margin-top:5px;">${esc(payload.headline)}</div>
+      ${dim(esc(payload.detail))}`;
     return;
   }
 
   // ── List screen ────────────────────────────────────────────────────────
   const roomId = activeBootstrap?.roomId ?? "";
-  const binding = roomFundingView(roomId ? readRoomBinding(roomId) : null);
+  const binding = roomFundingView(roomId ? readRoomBinding(roomId) : null, height);
   const balances = balanceView();
   const rows = proposalRows(
     listProposals(),
-    (id) => {
-      const p = readProposal(id);
-      const reg = readRegistration(id);
-      const rule = p ? (policyCache?.policy.governanceRules[p.kind] ?? null) : null;
-      return windowsView(reg, rule, readWindowsCache(id)).windows;
-    },
+    (p) =>
+      windowsView(
+        readRegistration(p.proposalId),
+        governanceRuleFor(p, policyCache?.policy ?? null),
+        readWindowsCache(p.proposalId),
+      ).windows,
     height,
     heightSource,
   );
@@ -2961,11 +2989,18 @@ function renderTreasuryApp(): void {
     ${
       binding.bound
         ? row("Company", esc(shortId(binding.companyId ?? ""))) +
+          row("Treasury", esc(shortId(binding.treasuryId ?? ""))) +
+          row("Funding profile", esc(binding.profileId ?? "—")) +
           row("Policy version", `${binding.policyVersion}`) +
-          row("Bound at", formatHeight(binding.boundAtHeight ?? 0))
+          row("Bound at", formatHeight(binding.boundAtHeight ?? 0)) +
+          (binding.expiresAfterHeight !== null
+            ? row("Ends at", formatHeight(binding.expiresAfterHeight))
+            : "")
         : ""
     }
     ${dim(esc(binding.detail))}
+    ${dim(esc(binding.readOnlyNote))}
+    ${dim(`Not shown yet: ${esc(binding.unavailable.join("; "))}.`)}
 
     ${header("BALANCES")}
     <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.6); margin-top:5px;">${esc(balances.headline)}</div>
@@ -3011,7 +3046,12 @@ function renderTreasuryApp(): void {
                 <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">${esc(r.phaseLabel)}</span>
               </div>`,
             )
-            .join("")
+            .join("") +
+          dim(
+            heightSource === "peer-reported"
+              ? `Where each one sits on its clocks is worked out from a height another player reported (${formatHeight(height ?? 0)}) — this device has not checked it.`
+              : "This device has no chain height, so these are listed without saying which window each is in.",
+          )
         : dim("No proposals in this room's records yet.")
     }
 
@@ -4532,7 +4572,7 @@ function setupSpacePhoneOverlay() {
     treasury: {
       elId: "phone-app-treasury",
       title: "🏦 TREASURY",
-      subtitle: "Company · Proposals · Receipts",
+      subtitle: "Company · Board · Proposals",
     },
     settings: {
       elId: "phone-app-settings",
@@ -4677,17 +4717,22 @@ function setupSpacePhoneOverlay() {
   // App tiles on the home screen route into their views. Delegated from the
   // phone shell rather than bound per tile, so links rendered INSIDE an app
   // (VENTURES → 🏦 TREASURY) survive that app's innerHTML repaints.
-  (document.getElementById("phone-screen") ?? document).addEventListener(
-    "click",
-    (e) => {
-      const el = (e.target as HTMLElement | null)?.closest<HTMLElement>(
-        "[data-phone-app]",
-      );
-      if (!el) return;
-      const target = el.dataset.phoneApp as PhoneViewId | undefined;
-      if (target && target in phoneViewMeta) showPhoneView(target);
-    },
-  );
+  const phoneShell = document.getElementById("phone-screen") ?? document;
+  const routeFrom = (target: EventTarget | null): boolean => {
+    const el = (target as HTMLElement | null)?.closest<HTMLElement>(
+      "[data-phone-app]",
+    );
+    const id = el?.dataset.phoneApp as PhoneViewId | undefined;
+    if (!id || !(id in phoneViewMeta)) return false;
+    showPhoneView(id);
+    return true;
+  };
+  phoneShell.addEventListener("click", (e) => routeFrom(e.target));
+  phoneShell.addEventListener("keydown", (e) => {
+    const ev = e as KeyboardEvent;
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    if (routeFrom(ev.target)) ev.preventDefault();
+  });
 
   if (backBtn) {
     backBtn.addEventListener("click", () => {

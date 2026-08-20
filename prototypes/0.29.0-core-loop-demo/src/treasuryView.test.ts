@@ -3,6 +3,9 @@
 // recompute-to-trust window derivation, "held" vote counts that never present
 // themselves as a tally, and the plan's player-vocabulary ban.
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { ChainSyncStatus } from './treasuryDoc';
 import type {
@@ -27,6 +30,8 @@ import {
   formatHeight,
   formatShares,
   formatXch,
+  governanceRuleFor,
+  payloadView,
   phaseLabel,
   proposalKindLabel,
   proposalPhase,
@@ -101,7 +106,19 @@ describe('window derivation (recompute to trust)', () => {
     const v = windowsView(registration, rule, null);
     expect(v.source).toBe('recomputed');
     expect(v.windows).toEqual(deriveProposalWindows(registration, rule));
-    expect(v.trust.level).toBe('self-checked');
+    // Recomputation does not outrank its inputs: both the acceptance record
+    // and the policy are shape-only caches, so claiming a higher trust level
+    // would rank the peer-controlled path above the copy it replaced.
+    expect(v.trust.level).toBe('unverified');
+    expect(v.note).toMatch(/has (not )?checked against the chain|neither/i);
+  });
+
+  it('says which input is missing rather than blaming the acceptance record', () => {
+    const noPolicy = windowsView(registration, null, null);
+    expect(noPolicy.note).toMatch(/policy/i);
+    expect(noPolicy.note).not.toMatch(/not been accepted|no acceptance record/i);
+    const noRegistration = windowsView(null, rule, null);
+    expect(noRegistration.note).toMatch(/acceptance record/i);
   });
 
   it('ignores a tampered cache when it can recompute', () => {
@@ -147,38 +164,84 @@ describe('votes and approvals', () => {
     expect(t.held).toBe(3);
     expect(t.yes).toBe(2);
     expect(t.veto).toBe(1);
-    expect(t.confirmedRecords).toBe(1);
-    expect(t.noneCount).toBe(false);
-    expect(t.note).toMatch(/chain/i);
+    expect(t.records).toBe(1);
+    expect(t.trust.level).toBe('unverified');
   });
 
-  it('flags that nothing counts without a confirmed record', () => {
-    const t = voteTallyView([vote('yes', '1'.repeat(64))], [checkpoint(false)]);
-    expect(t.held).toBe(1);
-    expect(t.confirmedRecords).toBe(0);
-    expect(t.pendingRecords).toBe(1);
-    expect(t.noneCount).toBe(true);
-    expect(t.note).toMatch(/only count/i);
+  it('never lets a peer-written confirmation flag soften the caveat', () => {
+    // confirmedHeight sits OUTSIDE a vote record's fingerprint and the record
+    // carries no signature, so any peer can mint "confirmed". The caveat must
+    // therefore be unconditional — identical whatever the records claim.
+    const withClaim = voteTallyView([vote('yes', '1'.repeat(64))], [checkpoint(true)]);
+    const without = voteTallyView([vote('yes', '1'.repeat(64))], [checkpoint(false)]);
+    const none = voteTallyView([], []);
+    expect(withClaim.caveat).toBe(without.caveat);
+    expect(none.caveat).toBe(withClaim.caveat);
+    expect(withClaim.caveat).toMatch(/only counts once/i);
+    // And no field reports a "confirmed" count that a peer could fabricate.
+    expect(Object.keys(withClaim)).not.toContain('confirmedRecords');
+    expect(JSON.stringify(withClaim)).not.toMatch(/confirmedHeight/);
   });
 
-  it('marks board approval counts as unverified', () => {
-    const session: SigningSession = {
-      v: 1,
-      sessionId: 'a'.repeat(64),
-      networkGenesisChallenge: 'a'.repeat(64),
-      companyId: 'b'.repeat(64),
-      policyVersion: 1,
-      proposalId: 'c'.repeat(64),
-      bundleHash: 'd'.repeat(64),
-      requiredThreshold: 3,
-      collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 's' }],
-      expiresAfterHeight: 100,
-    };
-    const a = approvalsView([session]);
-    expect(a.collected).toBe(1);
+  const session = (collected: number, threshold: number): SigningSession => ({
+    v: 1,
+    sessionId: 'a'.repeat(64),
+    networkGenesisChallenge: 'a'.repeat(64),
+    companyId: 'b'.repeat(64),
+    policyVersion: 1,
+    proposalId: 'c'.repeat(64),
+    bundleHash: 'd'.repeat(64),
+    requiredThreshold: threshold,
+    collectedSigs: Array.from({ length: collected }, (_, i) => ({
+      signerPuzzleHash: `${i}`.repeat(64),
+      sig: 's',
+    })),
+    expiresAfterHeight: 100,
+  });
+
+  it('reports one round, never a figure spliced from two', () => {
+    // Round A has more signatures; round B claims a bigger threshold. The old
+    // per-field maxima would report "2 of 9" — a state no round is in.
+    const a = approvalsView([session(2, 3), session(0, 9)], null);
+    expect(a.collected).toBe(2);
     expect(a.required).toBe(3);
-    expect(a.note).toMatch(/not verified/i);
-    expect(approvalsView([]).note).toMatch(/No approval round/i);
+    expect(a.trust.level).toBe('unverified');
+  });
+
+  it('prefers the policy threshold over the round’s peer-authored copy', () => {
+    const withPolicy = approvalsView([session(1, 99)], 2);
+    expect(withPolicy.required).toBe(2);
+    expect(withPolicy.requiredFromPolicy).toBe(true);
+    const withoutPolicy = approvalsView([session(1, 99)], null);
+    expect(withoutPolicy.required).toBe(99);
+    expect(withoutPolicy.requiredFromPolicy).toBe(false);
+    expect(approvalsView([], null).note).toMatch(/No approval round/i);
+  });
+});
+
+describe('governance rule matching', () => {
+  const proposal = contracts.proposal.unsigned as TreasuryProposal;
+
+  it('only uses a policy for the same company and version', () => {
+    const matching = { ...policy, companyId: proposal.companyId, policyVersion: proposal.policyVersion };
+    expect(governanceRuleFor(proposal, matching)).toEqual(matching.governanceRules[proposal.kind]);
+    expect(governanceRuleFor(proposal, { ...matching, companyId: '9'.repeat(64) })).toBeNull();
+    expect(governanceRuleFor(proposal, { ...matching, policyVersion: proposal.policyVersion + 1 })).toBeNull();
+    expect(governanceRuleFor(proposal, null)).toBeNull();
+  });
+});
+
+describe('payload view', () => {
+  it('describes whether the details are held, without dumping raw data', () => {
+    const held = payloadView(true);
+    expect(held.present).toBe(true);
+    expect(held.headline).toMatch(/held in this room/i);
+    const missing = payloadView(false);
+    expect(missing.present).toBe(false);
+    expect(missing.detail).toMatch(/cannot be shown/i);
+    for (const s of [held.headline, held.detail, missing.headline, missing.detail]) {
+      expect(s).not.toMatch(/[0-9a-f]{16,}/); // never raw hex at the player
+    }
   });
 });
 
@@ -228,10 +291,40 @@ describe('policy, shares, and room funding', () => {
     ]);
   });
 
-  it('separates company funding from edit rights, and handles the unbound room', () => {
+  it('reports a missing binding as missing, not as personal funding', () => {
     const unbound = roomFundingView(null);
     expect(unbound.bound).toBe(false);
-    expect(unbound.headline).toMatch(/personal/i);
+    // Knowing nothing is not the same as knowing the room is self-funded.
+    expect(unbound.headline).toMatch(/no company funding record/i);
+    expect(unbound.trust.level).toBe('absent');
+    expect(unbound.readOnlyNote).toMatch(/does not check the chain/i);
+    expect(unbound.unavailable.length).toBeGreaterThan(0);
+  });
+
+  it('flags a binding whose own end height has passed', () => {
+    const base: RoomTreasuryBinding = {
+      v: 1,
+      networkGenesisChallenge: 'a'.repeat(64),
+      roomId: 'room-1',
+      companyId: 'b'.repeat(64),
+      treasuryLauncherId: 'c'.repeat(64),
+      policyVersion: 2,
+      profileId: 'casino-floor',
+      boundByPub: 'pub',
+      boundAtHeight: 100,
+      expiresAfterHeight: 200,
+      policyReceiptId: 'd'.repeat(64),
+      sig: 'sig',
+    };
+    expect(roomFundingView(base, 150).lapsed).toBe(false);
+    const lapsed = roomFundingView(base, 200);
+    expect(lapsed.lapsed).toBe(true);
+    expect(lapsed.headline).toMatch(/lapsed/i);
+    // With no height there is nothing to compare against — do not guess.
+    expect(roomFundingView(base, null).lapsed).toBe(false);
+  });
+
+  it('separates company funding from edit rights, and exposes the profile', () => {
     const binding: RoomTreasuryBinding = {
       v: 1,
       networkGenesisChallenge: 'a'.repeat(64),
@@ -250,6 +343,10 @@ describe('policy, shares, and room funding', () => {
     expect(bound.policyVersion).toBe(2);
     expect(bound.trust.level).toBe('signed');
     expect(bound.detail).toMatch(/edit rights/i);
+    expect(bound.profileId).toBe('p1');
+    expect(bound.treasuryId).toBe('c'.repeat(64));
+    // A signature says who wrote it — never that they were entitled to.
+    expect(bound.trust.detail).toMatch(/not that they were allowed to/i);
   });
 });
 
@@ -264,13 +361,23 @@ describe('proposal rows', () => {
   it('sorts newest-accepted first and stays stable for unaccepted ones', () => {
     const rows = proposalRows(
       [proposal('c'.repeat(64), 'pay'), proposal('a'.repeat(64), 'dissolve'), proposal('b'.repeat(64), 'budget')],
-      (id) => (id.startsWith('c') ? { ...windows, acceptedHeight: 10 } : id.startsWith('b') ? { ...windows, acceptedHeight: 20 } : null),
+      (p) => (p.proposalId.startsWith('c') ? { ...windows, acceptedHeight: 10 } : p.proposalId.startsWith('b') ? { ...windows, acceptedHeight: 20 } : null),
       null,
       'none',
     );
     expect(rows.map((r) => r.proposalId[0])).toEqual(['b', 'c', 'a']);
     expect(rows[0].kindLabel).toBe('Budget');
-    expect(rows.every((r) => r.phase === 'unknown-height')).toBe(true);
+    // With clocks but no height: position unknown. Without clocks at all:
+    // a different state entirely, not the same label.
+    expect(rows[0].phase).toBe('unknown-height');
+    expect(rows[2].phase).toBe('no-clocks');
+    expect(phaseLabel('no-clocks')).not.toBe(phaseLabel('unknown-height'));
+    // Every row carries where its height came from, so the list can say so.
+    expect(rows.every((r) => r.heightSource === 'none')).toBe(true);
+  });
+
+  it('never labels a proposal executable — the chain decides that', () => {
+    expect(phaseLabel('executable')).not.toMatch(/executable|ready for the board/i);
   });
 
   it('labels every proposal kind in player language', () => {
@@ -304,8 +411,11 @@ describe('player vocabulary rule', () => {
       roomFundingView(null).headline,
       roomFundingView(null).detail,
       voteTallyView([], []).note,
-      voteTallyView([], [{ ...(contracts.checkpoint.body as object), checkpointId: 'x', confirmedHeight: 1 } as TreasuryCheckpoint]).note,
-      approvalsView([]).note,
+      voteTallyView([], []).caveat,
+      approvalsView([], null).note,
+      payloadView(true).headline,
+      payloadView(true).detail,
+      payloadView(false).detail,
       windowsView(registration, rule, null).note,
       windowsView(null, null, null).note,
       windowsView(null, null, windows).note,
@@ -319,9 +429,49 @@ describe('player vocabulary rule', () => {
       expect(s, `banned vocabulary in: ${s}`).not.toMatch(banned);
     }
   });
+
+  it('keeps banned jargon out of the treasury UI source itself', () => {
+    // The view module is only half the surface: the strings a player actually
+    // reads are literals in the render function, the terminal panel and the
+    // markup. Scan those directly, scoped to the treasury code.
+    const banned = /\b(singleton|vault|checkpoint coin)\b|\bCAT\b/i;
+    const root = dirname(fileURLToPath(import.meta.url));
+    const treasuryBlocks: { where: string; text: string }[] = [];
+    const push = (where: string, text: string) => treasuryBlocks.push({ where, text });
+    push('treasuryView.ts', readFileSync(join(root, 'treasuryView.ts'), 'utf8'));
+    push('treasuryNetwork.ts', readFileSync(join(root, 'treasuryNetwork.ts'), 'utf8'));
+    // main.ts: just the treasury render function.
+    const main = readFileSync(join(root, 'main.ts'), 'utf8');
+    const start = main.indexOf('function renderTreasuryApp');
+    const end = main.indexOf('\nfunction ', start + 1);
+    expect(start).toBeGreaterThan(-1);
+    push('main.ts renderTreasuryApp', main.slice(start, end > 0 ? end : undefined));
+    // devices.ts: the FUNDING panel markup and its refresh block.
+    const devices = readFileSync(join(root, 'devices.ts'), 'utf8');
+    for (const marker of ['device-terminal-funding-source', 'FUNDING (plan']) {
+      const i = devices.indexOf(marker);
+      expect(i, `marker missing: ${marker}`).toBeGreaterThan(-1);
+      push(`devices.ts @ ${marker}`, devices.slice(i - 400, i + 2500));
+    }
+    const html = readFileSync(join(root, '..', 'index.html'), 'utf8');
+    const t = html.indexOf('phone-app-treasury');
+    push('index.html treasury view', html.slice(Math.max(0, t - 600), t + 200));
+
+    for (const block of treasuryBlocks) {
+      // Only player-visible text matters, so ignore lines that are pure code
+      // comments (which legitimately cite the plans' internal vocabulary).
+      const visible = block.text
+        .split('\n')
+        .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+        .join('\n');
+      const hit = visible.match(banned);
+      expect(hit, `banned vocabulary in ${block.where}: ${hit?.[0]}`).toBeNull();
+    }
+  });
 });
 
 const PHASE_STRINGS = {
+  noClocks: phaseLabel('no-clocks'),
   unknownHeight: phaseLabel('unknown-height'),
   voting: phaseLabel('voting'),
   veto: phaseLabel('veto'),
