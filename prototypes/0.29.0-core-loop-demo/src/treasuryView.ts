@@ -490,6 +490,8 @@ export interface SyncView {
   /** A peer's claim, shown as hearsay and never used as a gate. */
   peerClaim: string | null;
   peerHeight: number | null;
+  /** False when no lookup ran, so "no claim" is not evidence of absence. */
+  readable: boolean;
   /** The peer claim is a shape-only cache like any other panel's data. */
   trust: TrustTag;
 }
@@ -500,12 +502,32 @@ export interface SyncView {
  * than a status. With no local chain view the local verdict is 'unavailable':
  * the UI is read-only and says why.
  */
-export function syncView(peer: ChainSyncStatus | null): SyncView {
+export function syncView(
+  peer: ChainSyncStatus | null,
+  /** False when no lookup was attempted (no network pinned, or no room). */
+  readable = true,
+): SyncView {
+  if (!readable) {
+    return {
+      localState: 'unavailable',
+      localNote: 'This device is not verifying the chain yet, so nothing here is final and no spending is possible from the phone.',
+      peerClaim: null,
+      peerHeight: null,
+      readable: false,
+      // Not "nothing cached": nothing was looked up, which is a different
+      // statement — the same distinction the funding panel makes.
+      trust: {
+        ...trustTag('absent'),
+        detail: 'No lookup was possible, so nothing is known either way.',
+      },
+    };
+  }
   return {
     localState: 'unavailable',
     localNote: 'This device is not verifying the chain yet, so nothing here is final and no spending is possible from the phone.',
     peerClaim: peer ? peer.state : null,
     peerHeight: peer && typeof peer.verifiedHeight === 'number' ? peer.verifiedHeight : null,
+    readable: true,
     trust: trustTag(peer ? 'unverified' : 'absent'),
   };
 }

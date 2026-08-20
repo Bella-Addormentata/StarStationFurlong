@@ -256,33 +256,73 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
   return validProposal(value) && value.proposalId === proposalId ? value : null;
 }
 
+export function listProposals(): TreasuryProposal[] {
+  return scanProposals(Number.POSITIVE_INFINITY).items;
+}
+
 /**
- * Every valid proposal held here, optionally capped.
+ * A scan that is bounded by SLOTS VISITED, not by results kept.
  *
- * Validation is a signature check per entry and nothing ever removes a
- * proposal, so an ordinary long history — or a peer publishing many valid
- * self-signed proposals — makes an uncapped scan expensive enough to stall a
- * repaint. Callers that render should pass `max`: the scan then stops once it
- * has that many, which also bounds the verification work.
+ * Bounding results is not enough to protect a repaint: validation is a
+ * signature check, and a peer can fill the map with entries that fail it, so
+ * a result-capped scan still verifies every one of them before it fills up.
+ * Counting slots — every key with the right prefix, valid or not — is what
+ * actually caps the work.
  *
- * Note the trade-off a cap brings: entries are visited in map order, so a
- * truncated result is an arbitrary subset rather than the "first" by any
- * meaningful measure. Callers must say so rather than implying completeness.
+ * `truncated` says the scan stopped early, so callers can report a partial
+ * view honestly. Entries are visited in map order, so a truncated result is
+ * an arbitrary subset, never "the first N" by any meaningful measure.
  */
-export function listProposals(max?: number): TreasuryProposal[] {
+export interface BoundedScan<T> {
+  items: T[];
+  truncated: boolean;
+}
+
+function scanPrefixed<T>(
+  prefix: string,
+  maxSlots: number,
+  take: (key: string, value: unknown) => T | null,
+): BoundedScan<T> {
   const m = map();
-  if (!m) return [];
-  const out: TreasuryProposal[] = [];
+  if (!m) return { items: [], truncated: false };
+  const items: T[] = [];
+  let visited = 0;
   for (const [key, value] of m.entries()) {
-    if (!key.startsWith('proposal:')) continue;
-    if (validProposal(value) && key === `proposal:${value.proposalId}`) {
-      // Checked BEFORE pushing so `max` is exact: a max of 0 returns nothing
-      // rather than one, and no entry is verified beyond the cap.
-      if (max !== undefined && out.length >= max) break;
-      out.push(value);
-    }
+    if (!key.startsWith(prefix)) continue;
+    if (visited >= maxSlots) return { items, truncated: true };
+    visited += 1;
+    const kept = take(key, value);
+    if (kept !== null) items.push(kept);
   }
-  return out;
+  return { items, truncated: false };
+}
+
+export function scanProposals(maxSlots: number): BoundedScan<TreasuryProposal> {
+  return scanPrefixed('proposal:', maxSlots, (key, value) =>
+    validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
+  );
+}
+
+export function scanVotes(proposalId: string, maxSlots: number): BoundedScan<TreasuryVote> {
+  const prefix = `vote:${proposalId}:`;
+  return scanPrefixed(prefix, maxSlots, (key, value) =>
+    validVote(value) && key === `vote:${value.proposalId}:${value.voterGamePub}`
+      ? value
+      : null,
+  );
+}
+
+export function scanCheckpoints(
+  proposalId: string,
+  maxSlots: number,
+): BoundedScan<TreasuryCheckpoint> {
+  const prefix = `checkpoint:${proposalId}:`;
+  return scanPrefixed(prefix, maxSlots, (key, value) =>
+    validCheckpoint(value) &&
+    key === `checkpoint:${value.proposalId}:${value.checkpointId}`
+      ? value
+      : null,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -545,18 +585,40 @@ export function putSigningSession(session: SigningSession): boolean {
 // listing stays O(map size) no matter how many shells a peer plants —
 // per-shell rescans would be O(sessions × map size), a cheap read-freeze.
 export function listSigningSessions(proposalId: string): SigningSession[] {
+  return scanSigningSessions(proposalId, Number.POSITIVE_INFINITY).items;
+}
+
+/**
+ * Bounded twin of listSigningSessions. The index pass touches every
+ * `sessionsig:` key in the map — including other proposals' — so peer-written
+ * signature spam would otherwise grow the work done on every repaint while a
+ * detail is open. Counts every slot it looks at, shells and signatures alike.
+ */
+export function scanSigningSessions(
+  proposalId: string,
+  maxSlots: number,
+): BoundedScan<SigningSession> {
   const m = map();
-  if (!m) return [];
+  if (!m) return { items: [], truncated: false };
   const shellPrefix = `session:${proposalId}:`;
+  let visited = 0;
+  let truncated = false;
   const shells: { sessionId: string; shell: SigningSession }[] = [];
   const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
   for (const [key, value] of m.entries()) {
+    const relevant = key.startsWith(shellPrefix) || key.startsWith('sessionsig:');
+    if (!relevant) continue;
+    if (visited >= maxSlots) {
+      truncated = true;
+      break;
+    }
+    visited += 1;
     if (key.startsWith(shellPrefix)) {
       const sessionId = key.slice(shellPrefix.length);
       if (validSessionShell(value, proposalId, sessionId)) {
         shells.push({ sessionId, shell: value });
       }
-    } else if (key.startsWith('sessionsig:')) {
+    } else {
       if (typeof value !== 'object' || value === null) continue;
       const entry = value as Record<string, unknown>;
       if (!isHex32(entry.signerPuzzleHash)) continue;
@@ -579,7 +641,7 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
     const assembled = { ...shell, collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
   }
-  return out;
+  return { items: out, truncated };
 }
 
 // ---------------------------------------------------------------------------

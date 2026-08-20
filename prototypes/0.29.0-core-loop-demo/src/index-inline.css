@@ -1105,6 +1105,37 @@
          ACCESS/CONTACTS. Their sections carry their own vertical margins, so no
          flex `gap` here (would double the spacing). Scroll itself is inherited
          from .phone-app-view.active. */
+      /* 🏦 Trust badges explain themselves on HOVER AND FOCUS. A native
+         title tooltip never opens from the keyboard, and an aria-label only
+         reaches assistive technology — a sighted keyboard player would see
+         the label with none of the qualification that gives it meaning. */
+      .ssf-trust-badge {
+        position: relative;
+      }
+      .ssf-trust-badge:hover::after,
+      .ssf-trust-badge:focus::after,
+      .ssf-trust-badge:focus-visible::after {
+        content: attr(data-detail);
+        position: absolute;
+        left: 0;
+        top: calc(100% + 4px);
+        z-index: 20;
+        width: max-content;
+        max-width: 220px;
+        padding: 5px 7px;
+        border: 1px solid rgba(212, 168, 75, 0.35);
+        border-radius: 5px;
+        background: #10151c;
+        color: #e8d5a3;
+        font-size: 8.5px;
+        font-weight: 500;
+        letter-spacing: 0;
+        line-height: 1.5;
+        white-space: normal;
+        text-align: left;
+        pointer-events: none;
+      }
+
       #phone-app-ventures.active,
       #phone-app-bank.active,
       #phone-app-treasury.active,

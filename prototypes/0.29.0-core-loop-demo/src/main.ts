@@ -46,10 +46,6 @@ import {
 } from "./keypair";
 import {
   bindTreasuryDoc,
-  listCheckpoints,
-  listProposals,
-  listSigningSessions,
-  listVotes,
   readChainSyncStatus,
   readPolicyCache,
   readProposal,
@@ -57,6 +53,10 @@ import {
   readRegistration,
   readRoomBinding,
   readWindowsCache,
+  scanCheckpoints,
+  scanProposals,
+  scanSigningSessions,
+  scanVotes,
   subscribeTreasury,
   treasuryDocBound,
 } from "./treasuryDoc";
@@ -2890,10 +2890,12 @@ function renderTreasuryApp(): void {
     // Focusable and labelled: the qualification behind a badge (a signature
     // shows authorship, not authority) is the whole point of showing it, and
     // a title tooltip on an inert span never reaches a keyboard user.
+    // The detail rides in data-detail, which .ssf-trust-badge reveals on
+    // hover AND focus — a title tooltip never opens from the keyboard.
     const a11y = focusable
       ? ` role="note" tabindex="0" aria-label="${esc(`${tag.label}. ${tag.detail}`)}"`
       : ` aria-hidden="true"`;
-    return `<span${a11y} title="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
+    return `<span class="ssf-trust-badge"${a11y} data-detail="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
   };
   const row = (label: string, value: string) =>
     `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
@@ -2907,8 +2909,9 @@ function renderTreasuryApp(): void {
   // unconfigured build would otherwise render a peer's claim and take a
   // height from it, walking straight around the fail-closed boundary. Read
   // it once, gated, and feed both models from that value.
-  const peerSync = bound && net.configured ? readChainSyncStatus() : null;
-  const sync = syncView(peerSync);
+  const syncReadable = bound && net.configured;
+  const peerSync = syncReadable ? readChainSyncStatus() : null;
+  const sync = syncView(peerSync, syncReadable);
   const { height, source: heightSource } = displayHeight(peerSync);
   const policyCache = bound ? readPolicyCache() : null;
   // Which company this screen may present, shared by BOTH branches: an open
@@ -2986,16 +2989,24 @@ function renderTreasuryApp(): void {
       rule,
       readWindowsCache(proposal.proposalId),
     );
+    // Bounded reads: votes, vote records and approval rounds all sit in
+    // peer-writable slots that nothing prunes, and this screen repaints on
+    // every treasury event, so unbounded scans would let spam stall the UI.
+    const DETAIL_SCAN = 200;
+    const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN);
+    const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN);
+    const sessionScan = scanSigningSessions(proposal.proposalId, DETAIL_SCAN);
+    const detailPartial = voteScan.truncated || cpScan.truncated || sessionScan.truncated;
     const votes = voteTallyView(
-      listVotes(proposal.proposalId),
+      voteScan.items,
       // Vote records are keyed by proposal id alone, so one filed under
       // another company must not be counted among this proposal's.
-      checkpointsFor(listCheckpoints(proposal.proposalId), proposal),
+      checkpointsFor(cpScan.items, proposal),
     );
     // Rounds and thresholds only count when they belong to THIS proposal's
     // company and policy revision — both are peer-writable.
     const approvals = approvalsView(
-      sessionsFor(listSigningSessions(proposal.proposalId), proposal),
+      sessionsFor(sessionScan.items, proposal),
       boardThresholdFor(proposal, policyCache?.policy ?? null),
       height,
     );
@@ -3046,6 +3057,13 @@ function renderTreasuryApp(): void {
       ${row("Vote records held", `${votes.records}`)}
       ${dim(esc(votes.note))}
       ${dim(esc(votes.caveat))}
+      ${
+        detailPartial
+          ? dim(
+              "This room holds more records than were read for this screen, so these figures cover only part of what is here.",
+            )
+          : ""
+      }
 
       <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">BOARD APPROVALS</span>
@@ -3085,9 +3103,9 @@ function renderTreasuryApp(): void {
   // proposals — stall each repaint. One page at a time, and the page is
   // honest about being one.
   const PROPOSAL_PAGE = 50;
-  const page = listProposals(PROPOSAL_PAGE + 1);
-  const truncated = page.length > PROPOSAL_PAGE;
-  const scoped = scopeProposals(page.slice(0, PROPOSAL_PAGE), scope.companyId);
+  const page = scanProposals(PROPOSAL_PAGE);
+  const truncated = page.truncated;
+  const scoped = scopeProposals(page.items, scope.companyId);
   const rows = proposalRows(
     scoped.shown,
     (p) =>
@@ -3223,12 +3241,14 @@ function renderTreasuryApp(): void {
     </div>
     ${row("This device", "not verifying")}
     ${
-      sync.peerClaim
-        ? row(
-            "Another player reports",
-            `${esc(sync.peerClaim)}${sync.peerHeight !== null ? ` · ${formatHeight(sync.peerHeight)}` : ""}`,
-          )
-        : row("Another player reports", "nothing")
+      !sync.readable
+        ? row("Another player reports", "not read")
+        : sync.peerClaim
+          ? row(
+              "Another player reports",
+              `${esc(sync.peerClaim)}${sync.peerHeight !== null ? ` · ${formatHeight(sync.peerHeight)}` : ""}`,
+            )
+          : row("Another player reports", "nothing")
     }
     ${dim("Reports from other players are shown as claims only — your own node's view is what will decide, once that lane ships.")}`;
 }

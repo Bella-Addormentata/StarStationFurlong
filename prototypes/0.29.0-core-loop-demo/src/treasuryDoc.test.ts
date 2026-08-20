@@ -52,6 +52,7 @@ import {
   readReceiptCache,
   readRegistration,
   readRoomBinding,
+  scanProposals,
   readVote,
   readWindowsCache,
   subscribeTreasury,
@@ -129,11 +130,22 @@ describe('proposals', () => {
       makeProposal({ payloadHash: `${i}`.repeat(64) }),
     );
     for (const p of made) expect(putProposal(p)).toBe(true);
-    expect(listProposals()).toHaveLength(4); // no cap given
-    expect(listProposals(2)).toHaveLength(2);
-    expect(listProposals(0)).toHaveLength(0); // the cap is exact
-    // A cap larger than the set still returns everything.
-    expect(listProposals(99)).toHaveLength(4);
+    expect(listProposals()).toHaveLength(4); // unbounded convenience wrapper
+    // The bound counts SLOTS VISITED, not results kept: capping results
+    // alone would still verify every junk entry a peer planted before the
+    // cap filled up, which is the work that stalls a repaint.
+    const two = scanProposals(2);
+    expect(two.items).toHaveLength(2);
+    expect(two.truncated).toBe(true);
+    expect(scanProposals(0).items).toHaveLength(0);
+    const all = scanProposals(99);
+    expect(all.items).toHaveLength(4);
+    expect(all.truncated).toBe(false);
+    // Junk in the prefix consumes budget rather than being scanned for free.
+    doc.getMap('treasury').set(`proposal:${'7'.repeat(64)}`, { junk: true });
+    const withJunk = scanProposals(1);
+    expect(withJunk.truncated).toBe(true);
+    expect(withJunk.items.length).toBeLessThanOrEqual(1);
   });
 
   it('round-trips a signed proposal and lists it', () => {
