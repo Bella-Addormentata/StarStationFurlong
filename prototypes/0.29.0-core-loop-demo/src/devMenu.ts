@@ -52,6 +52,8 @@ import { findFreeExteriorSpot } from './hull';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
+// #45 board mirror: spawned game tables paint the doc's current game at once.
+import { readGame } from './games/gamesDoc';
 import { ROOM_TEMPLATES, applyRoomTemplate, exportCurrentRoomAsTemplate } from './roomTemplates';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
@@ -336,7 +338,12 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
         w.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
       }
       if (obj.userData.gameTableTop) {
-        w.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
+        const top = obj.userData.gameTableTop as GameTableTopHandle;
+        w.gameTableTops.set(item.id, top);
+        // Mirror World.registerFurnitureGroup (#45): paint the CURRENT doc
+        // state so a spawned table shows any game already stored under this
+        // id — the world's games listener only fires on the NEXT map change.
+        top.setBoard(readGame(item.id)?.board ?? null);
       }
       if (obj.userData.cloneVat) {
         w.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);

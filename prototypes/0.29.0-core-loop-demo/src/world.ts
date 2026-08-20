@@ -371,6 +371,10 @@ export class World {
   private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
+  /** Unsubscribe for the #45 board-mirror games listener — held so a
+   *  createPlatform re-run (morph restart) swaps the listener instead of
+   *  stacking a duplicate. */
+  private unsubscribeGameBoards: (() => void) | null = null;
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -1442,15 +1446,20 @@ export class World {
     // from the doc-synced `games` map, so spectators see the live game
     // without focusing (the wall-screen hybrid idiom, §D0.4). The
     // subscription survives room rebinds — gamesDoc re-notifies on bind.
-    if (this.gameTableTops.size > 0) {
-      const repaintBoards = () => {
-        for (const [id, top] of this.gameTableTops) {
-          top.setBoard(readGame(id)?.board ?? null);
-        }
-      };
-      subscribeGames(repaintBoards);
-      repaintBoards();
-    }
+    // Subscribed UNCONDITIONALLY (not size-gated): the closure iterates the
+    // LIVE map, so a table added at runtime (DEV spawn, E4 reconcile) into a
+    // room built with zero game tables still repaints — a size>0 gate here
+    // left such rooms without any mirror until reload. Over an empty map the
+    // callback is a free no-op. A createPlatform re-run (morph restart) drops
+    // the previous listener first, so rebuilds never stack duplicates.
+    this.unsubscribeGameBoards?.();
+    const repaintBoards = () => {
+      for (const [id, top] of this.gameTableTops) {
+        top.setBoard(readGame(id)?.board ?? null);
+      }
+    };
+    this.unsubscribeGameBoards = subscribeGames(repaintBoards);
+    repaintBoards();
   }
 
   /**
@@ -1485,10 +1494,12 @@ export class World {
           this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
         }
         if (obj.userData.gameTableTop) {
-          this.gameTableTops.set(
-            item.id,
-            obj.userData.gameTableTop as GameTableTopHandle,
-          );
+          const top = obj.userData.gameTableTop as GameTableTopHandle;
+          this.gameTableTops.set(item.id, top);
+          // Paint the CURRENT doc state now: a runtime-added table (E4
+          // reconcile on a joiner) must show a game already in progress —
+          // the games listener only fires on the NEXT map change.
+          top.setBoard(readGame(item.id)?.board ?? null);
         }
         if (obj.userData.cloneVat) {
           this.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
