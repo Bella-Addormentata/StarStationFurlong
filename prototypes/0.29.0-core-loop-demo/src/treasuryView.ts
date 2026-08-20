@@ -875,14 +875,23 @@ export function companyScope(
   binding: RoomTreasuryBinding | null,
   policy: CompanyTreasuryPolicy | null,
 ): CompanyScope {
-  if (binding && policy && binding.companyId !== policy.companyId) {
+  // Company AND treasury: both records name a treasury too, so a policy for
+  // the right company but a different treasury would otherwise have that
+  // treasury's board, fee ceiling and fingerprint rendered as if the signed
+  // funding record agreed with them.
+  if (
+    binding &&
+    policy &&
+    (binding.companyId !== policy.companyId ||
+      binding.treasuryLauncherId !== policy.treasuryLauncherId)
+  ) {
     return {
       companyId: null,
       mismatch: true,
       // Precise about what is actually withheld: the signed funding record
       // above stays on screen with its own company, and it is the cached
       // company details and proposal list that are held back.
-      warning: 'The company details held in this room name a different company than the funding record above, so they and the proposal list are not shown.',
+      warning: 'The company details held in this room do not match the funding record above, so they and the proposal list are not shown.',
     };
   }
   return {

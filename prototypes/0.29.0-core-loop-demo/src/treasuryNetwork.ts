@@ -39,18 +39,32 @@ export const NO_NETWORK_PIN = 'no-network-configured';
 /** The last malformed value warned about, so the warning is not repeated. */
 let lastWarnedValue: string | null = null;
 
-function envValue(key: string): string {
-  // Vite's import.meta.env in the browser; process.env under node tooling and
-  // tests. Both are read because the key is dynamic, so Vite's static
-  // replacement of import.meta.env.FOO does not apply.
+/**
+ * Reads one configuration value.
+ *
+ * The import.meta.env accesses below are written out LITERALLY on purpose.
+ * Vite substitutes `import.meta.env.VITE_FOO` at build time by matching that
+ * exact text; a computed lookup like `env[key]` is not substituted and
+ * survives into the bundle as a property read on an object the browser does
+ * not have. An earlier version did exactly that, so a production build with
+ * the genesis configured would still have reported itself unconfigured and
+ * closed every treasury read — the one failure this seam exists to prevent.
+ *
+ * process.env is kept only as a fallback for node tooling and tests, where
+ * Vite's substitution never runs.
+ */
+function envValue(key: 'VITE_SSF_TREASURY_GENESIS' | 'VITE_SSF_TREASURY_NETWORK'): string {
+  let fromMeta: string | undefined;
   try {
-    const meta = (import.meta as { env?: Record<string, string | undefined> }).env;
-    const fromMeta = meta?.[key];
-    if (typeof fromMeta === 'string' && fromMeta.trim().length > 0) {
-      return fromMeta.trim();
-    }
+    fromMeta =
+      key === 'VITE_SSF_TREASURY_GENESIS'
+        ? import.meta.env.VITE_SSF_TREASURY_GENESIS
+        : import.meta.env.VITE_SSF_TREASURY_NETWORK;
   } catch {
-    /* import.meta.env is absent in some runtimes */
+    /* import.meta.env is absent outside Vite */
+  }
+  if (typeof fromMeta === 'string' && fromMeta.trim().length > 0) {
+    return fromMeta.trim();
   }
   try {
     const proc = (globalThis as { process?: { env?: Record<string, string | undefined> } })

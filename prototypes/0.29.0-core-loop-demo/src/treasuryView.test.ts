@@ -384,11 +384,23 @@ describe('company scope', () => {
     const s = companyScope(binding('a'.repeat(64)), { ...policy, companyId: 'b'.repeat(64) });
     expect(s.mismatch).toBe(true);
     expect(s.companyId).toBeNull();
-    expect(s.warning).toMatch(/different company/i);
+    expect(s.warning).toMatch(/do not match/i);
     // The signed funding record stays on screen, so the warning must say what
     // is actually withheld rather than claiming nothing is shown.
     expect(s.warning).toMatch(/proposal list/i);
     expect(s.warning).not.toMatch(/neither is shown/i);
+  });
+
+  it('treats a different treasury as a mismatch even when the company agrees', () => {
+    // Both records name a treasury; a policy for the right company but the
+    // wrong treasury would otherwise have its board and fee ceiling rendered
+    // as if the signed funding record agreed.
+    const s = companyScope(binding(policy.companyId), {
+      ...policy,
+      treasuryLauncherId: '9'.repeat(64),
+    });
+    expect(s.mismatch).toBe(true);
+    expect(s.companyId).toBeNull();
   });
 
   it('uses the agreed company, or whichever one is known', () => {

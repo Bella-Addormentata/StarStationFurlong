@@ -3087,7 +3087,12 @@ function renderTreasuryApp(): void {
     heightSource,
   );
 
+  // An in-view return: the phone header's own Back button sits outside this
+  // view, so the arrow-key traversal cannot reach it and a keyboard-only
+  // player would have no way back to VENTURES (Escape jumps to Home).
   view.innerHTML = `${verdictBanner}
+    <div data-phone-app="ventures" role="button" tabindex="0" aria-label="Back to Ventures"
+      style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer; margin-top:8px;">← VENTURES</div>
 
     ${header("THIS ROOM")}
     <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
