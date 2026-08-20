@@ -2824,14 +2824,21 @@ function renderTreasuryApp(): void {
   if (!view) return;
   const active = document.activeElement as HTMLElement | null;
   const hadFocus = Boolean(active && view.contains(active));
+  // Trust badges are focus stops too — the qualification behind a badge is
+  // the whole reason it is readable from the keyboard, so a player parked on
+  // one while a peer's record lands must not be thrown to the top of the
+  // screen. Their slot name is checked first because it is the most specific
+  // identity an element here can carry.
   const key = hadFocus
-    ? active?.dataset.proposalId
-      ? `[data-proposal-id="${CSS.escape(active.dataset.proposalId)}"]`
-      : active?.dataset.treasuryAction
-        ? `[data-treasury-action="${active.dataset.treasuryAction}"]`
-        : active?.dataset.phoneApp
-          ? `[data-phone-app="${active.dataset.phoneApp}"]`
-          : null
+    ? active?.dataset.treasuryBadge
+      ? `[data-treasury-badge="${CSS.escape(active.dataset.treasuryBadge)}"]`
+      : active?.dataset.proposalId
+        ? `[data-proposal-id="${CSS.escape(active.dataset.proposalId)}"]`
+        : active?.dataset.treasuryAction
+          ? `[data-treasury-action="${active.dataset.treasuryAction}"]`
+          : active?.dataset.phoneApp
+            ? `[data-phone-app="${active.dataset.phoneApp}"]`
+            : null
     : null;
   paintTreasuryApp(view);
   if (!hadFocus) return;
@@ -2916,15 +2923,23 @@ function paintTreasuryApp(view: HTMLElement): void {
     `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
   const dim = (t: string) =>
     `<div style="font-size:9px; color:rgba(212,168,75,0.45); margin-top:4px; line-height:1.6;">${t}</div>`;
-  // `focusable: false` for badges rendered INSIDE an activating control: a
-  // focusable note nested in a role="button" would swallow a tab stop and
-  // then bubble Enter/Space into the row's action, and descendants of a
-  // button are not reliably exposed with their own semantics. Those callers
-  // fold the detail into the row's own accessible label instead.
+  // `id` names the badge's slot on the screen ("board", "sync", …) so focus
+  // can be restored to THIS badge across a repaint. It is the first argument
+  // and has no default because a focusable control without a stable identity
+  // silently loses keyboard focus on every peer update — passing `null` is
+  // how a caller says "not focusable", and there is no way to ask for a
+  // focusable badge without naming it.
+  //
+  // `null` is for badges rendered INSIDE an activating control: a focusable
+  // note nested in a role="button" would swallow a tab stop and then bubble
+  // Enter/Space into the row's action, and descendants of a button are not
+  // reliably exposed with their own semantics. Those callers fold the detail
+  // into the row's own accessible label instead.
   const badge = (
+    id: string | null,
     tag: { level: string; label: string; detail: string },
-    focusable = true,
   ) => {
+    const focusable = id !== null;
     const color =
       tag.level === "signed"
         ? "#7ddb8f"
@@ -2937,7 +2952,7 @@ function paintTreasuryApp(view: HTMLElement): void {
     // The detail rides in data-detail, which .ssf-trust-badge reveals on
     // hover AND focus — a title tooltip never opens from the keyboard.
     const a11y = focusable
-      ? ` role="note" tabindex="0" aria-label="${esc(`${tag.label}. ${tag.detail}`)}"`
+      ? ` role="note" tabindex="0" data-treasury-badge="${esc(id!)}" aria-label="${esc(`${tag.label}. ${tag.detail}`)}"`
       : ` aria-hidden="true"`;
     return `<span class="ssf-trust-badge"${a11y} data-detail="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
   };
@@ -2949,15 +2964,19 @@ function paintTreasuryApp(view: HTMLElement): void {
 
   const bound = treasuryDocBound();
   const net = treasuryNetwork();
-  // The sync entry carries no genesis, so treasuryDoc cannot pin it — an
-  // unconfigured build would otherwise render a peer's claim and take a
-  // height from it, walking straight around the fail-closed boundary. Read
-  // it once, gated, and feed both models from that value.
-  const syncReadable = bound && net.configured;
-  const peerSync = syncReadable ? readChainSyncStatus() : null;
-  const sync = syncView(peerSync, syncReadable);
+  // One gate for every cache read on this screen. A room document alone is
+  // not enough: with no network pinned nothing read from it can be tied to a
+  // chain, so an unconfigured build would otherwise render a peer's claim —
+  // and, for the sync entry, take a height from it — walking straight around
+  // the fail-closed boundary. treasuryDoc now refuses these reads on its own
+  // side too; keeping the gate here as well leaves the boundary visible at
+  // the call site instead of only in the reader.
+  const cacheReadable = bound && net.configured;
+  // Read once and feed both models from that value.
+  const peerSync = cacheReadable ? readChainSyncStatus() : null;
+  const sync = syncView(peerSync, cacheReadable);
   const { height, source: heightSource } = displayHeight(peerSync);
-  const policyCache = bound ? readPolicyCache() : null;
+  const policyCache = cacheReadable ? readPolicyCache() : null;
   // Which company this screen may present, shared by BOTH branches: an open
   // detail must obey the same scope as the list, or a binding or policy
   // changing under it would leave a proposal on screen that the list has
@@ -3060,7 +3079,7 @@ function paintTreasuryApp(view: HTMLElement): void {
     view.innerHTML = `${verdictBanner}${back}
       <div style="display:flex; align-items:center; gap:6px; margin-top:8px;">
         <span style="font-size:13px; font-weight:800; color:#f0c060;">${esc(proposalKindLabel(proposal.kind))}</span>
-        ${badge(trustTag("signed"))}
+        ${badge("proposal", trustTag("signed"))}
       </div>
       <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">Made under policy version ${proposal.policyVersion}${
         otherRevision !== null && otherRevision !== proposal.policyVersion
@@ -3073,7 +3092,7 @@ function paintTreasuryApp(view: HTMLElement): void {
       ${header("CLOCKS")}
       <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
         <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(phaseLabel(phase))}</span>
-        ${badge(w.trust)}
+        ${badge("clocks", w.trust)}
       </div>
       ${
         w.windows
@@ -3093,7 +3112,7 @@ function paintTreasuryApp(view: HTMLElement): void {
 
       <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">VOTES HELD IN THIS ROOM</span>
-        ${badge(votes.trust)}
+        ${badge("votes", votes.trust)}
       </div>
       ${row("Held here", `${votes.held}`)}
       ${row("Yes · No", `${votes.yes} · ${votes.no}`)}
@@ -3111,7 +3130,7 @@ function paintTreasuryApp(view: HTMLElement): void {
 
       <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">BOARD APPROVALS</span>
-        ${badge(approvals.trust)}
+        ${badge("approvals", approvals.trust)}
       </div>
       ${
         approvals.sessions > 0
@@ -3132,7 +3151,7 @@ function paintTreasuryApp(view: HTMLElement): void {
 
       <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">WHAT IT WOULD DO</span>
-        ${badge(payload.trust)}
+        ${badge("payload", payload.trust)}
       </div>
       <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.7); margin-top:5px;">${esc(payload.headline)}</div>
       ${dim(esc(payload.detail))}`;
@@ -3184,7 +3203,7 @@ function paintTreasuryApp(view: HTMLElement): void {
     ${header("THIS ROOM")}
     <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
       <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(binding.headline)}</span>
-      ${badge(binding.trust)}
+      ${badge("funding", binding.trust)}
     </div>
     ${
       binding.bound
@@ -3217,7 +3236,7 @@ function paintTreasuryApp(view: HTMLElement): void {
             const classes = shareClassViews(showPolicy.policy);
             return `<div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
                 <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
-                ${badge(b.trust)}
+                ${badge("board", b.trust)}
               </div>
               ${row("Policy version", `${b.policyVersion}`)}
               ${row("Fee ceiling per spend", esc(b.maxFee))}
@@ -3253,7 +3272,7 @@ function paintTreasuryApp(view: HTMLElement): void {
                   <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)} · policy v${r.policyVersion}</span>
                 </span>
                 <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">
-                  ${esc(r.phaseLabel)}<br />${badge(r.clockTrust, false)}
+                  ${esc(r.phaseLabel)}<br />${badge(null, r.clockTrust)}
                 </span>
               </div>`,
             )
@@ -3296,7 +3315,7 @@ function paintTreasuryApp(view: HTMLElement): void {
 
     <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
       <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">CHAIN VIEW</span>
-      ${badge(sync.trust)}
+      ${badge("sync", sync.trust)}
     </div>
     ${row("This device", "not verifying")}
     ${

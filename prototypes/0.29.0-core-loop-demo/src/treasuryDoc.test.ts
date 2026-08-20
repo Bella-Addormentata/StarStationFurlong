@@ -559,9 +559,87 @@ describe('network pinning', () => {
     // The vector policy's genesis is 'a'*64 == GENESIS, so it puts fine —
     // rebind to another net and the same policy is refused and unreadable.
     expect(putPolicyCache(policy)).toBe(true);
+    // Read BEFORE rebinding, so the rebind has a warm cache to invalidate:
+    // a verdict cached under the old pin must not survive into the new one.
+    expect(readPolicyCache()?.policy).toEqual(policy);
     bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: 'f'.repeat(64) });
     expect(putPolicyCache(policy)).toBe(false);
     expect(readPolicyCache()).toBeNull();
+  });
+
+  it('fails closed before touching the map when no network is pinned', () => {
+    const proposal = makeProposal();
+    expect(putProposal(proposal)).toBe(true);
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
+    expect(putPolicyCache(policy)).toBe(true);
+    expect(putChainSyncStatus({ v: 1, state: 'verified', verifiedHeight: 9 })).toBe(true);
+    // An invalid pin disables the cache (a local wiring bug, not hostility).
+    bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: 'not-hex' as never });
+    // A room document is still attached — that is a different question from
+    // whether anything may be read out of it, and callers report them apart.
+    expect(treasuryDocBound()).toBe(true);
+    expect(readProposal(proposal.proposalId)).toBeNull();
+    expect(scanProposals(100)).toEqual({ items: [], truncated: false });
+    expect(readPolicyCache()).toBeNull();
+    // The sync entry carries no genesis of its own, so this is the only place
+    // it can fail closed inside the cache layer.
+    expect(readChainSyncStatus()).toBeNull();
+  });
+});
+
+describe('verification caching', () => {
+  // Each read re-derives an id or hash and verifies a signature. Repeating
+  // that for records that have not changed made one repaint over a second
+  // long with 800 planted proposals, so verdicts are memoized on the stored
+  // object's identity. These pin the invariants that makes safe.
+  it('re-checks a record a peer replaces, rather than trusting the old verdict', () => {
+    const good = makeProposal();
+    expect(putProposal(good)).toBe(true);
+    expect(readProposal(good.proposalId)).toEqual(good);
+    // Same key, different object: a forgery with the signature stripped.
+    doc.getMap('treasury').set(`proposal:${good.proposalId}`, {
+      ...good,
+      proposerSig: sign(seedB, proposalSignatureBytes(GENESIS, good.proposalId)),
+    });
+    expect(readProposal(good.proposalId)).toBeNull();
+    // And back again — a cached rejection must not stick to the honest record.
+    doc.getMap('treasury').set(`proposal:${good.proposalId}`, { ...good });
+    expect(readProposal(good.proposalId)).toEqual(good);
+  });
+
+  it('keeps the slot-claim checks outside the cache', () => {
+    // A session shell is judged partly on the caller's arguments. Caching that
+    // against the object would let a lookup under the wrong proposal id poison
+    // the verdict for the right one.
+    const shell = {
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'e'.repeat(64),
+      bundleHash: '7'.repeat(64),
+      requiredThreshold: 2,
+      expiresAfterHeight: 500,
+    };
+    const session: SigningSession = {
+      ...shell,
+      sessionId: signingSessionIdOf(shell),
+      collectedSigs: [],
+    };
+    expect(putSigningSession(session)).toBe(true);
+    // Wrong proposal id first: must miss, and must not be remembered as "bad".
+    expect(listSigningSessions('f'.repeat(64))).toEqual([]);
+    expect(listSigningSessions(session.proposalId)).toEqual([session]);
+  });
+
+  it('returns a stable policy result without recomputing it', () => {
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
+    expect(putPolicyCache(policy)).toBe(true);
+    const first = readPolicyCache();
+    const second = readPolicyCache();
+    expect(first).not.toBeNull();
+    expect(second).toBe(first); // same object: served from the memo
+    expect(first?.policyHash).toBe(contracts.policy.policyHash);
   });
 });
 

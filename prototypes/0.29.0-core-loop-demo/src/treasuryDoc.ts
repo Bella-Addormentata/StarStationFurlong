@@ -163,6 +163,11 @@ export function bindTreasuryDoc(
     expectedGenesis = null;
     console.warn('bindTreasuryDoc: invalid networkGenesisChallenge — treasury cache disabled');
   }
+  // The pin and the verifier are inputs to every cached verdict, and both may
+  // have just changed — start again rather than trust answers computed under
+  // the previous binding.
+  verdicts = new WeakMap();
+  policyResults = new WeakMap();
   const nextMap = doc.getMap('treasury');
   treasuryMap = nextMap;
   const observer = (): void => notify();
@@ -188,6 +193,24 @@ function map(): Y.Map<unknown> | null {
   return docAlive() && treasuryMap ? treasuryMap : null;
 }
 
+/**
+ * The map, but only once a network is pinned — every READ goes through here.
+ *
+ * With `expectedGenesis` null nothing can be on-net, so every read's answer is
+ * already null. Returning it now matters for more than tidiness: each reader
+ * validated the peer-written value in full BEFORE reaching its `onNet` check,
+ * so an unconfigured build still paid structural validation over whatever a
+ * peer chose to write — on every repaint, for a result fixed in advance.
+ *
+ * Writes keep using `map()`: their input is local, and each `put*` already
+ * refuses off-net records up front. `map()` also stays pin-agnostic because
+ * `treasuryDocBound()` answers "is a room document attached", which callers
+ * report to the player quite differently from "no network is configured".
+ */
+function readMap(): Y.Map<unknown> | null {
+  return expectedGenesis === null ? null : map();
+}
+
 export function treasuryDocBound(): boolean {
   return map() !== null;
 }
@@ -206,6 +229,38 @@ function put(key: string, value: unknown): boolean {
   return true;
 }
 
+/**
+ * Validation verdicts, keyed by the identity of the stored object.
+ *
+ * The entry budget bounds how many records a repaint LOOKS at; it says nothing
+ * about what each one costs. Every check below recomputes a canonical id or
+ * hash and verifies an ed25519 signature — measured at roughly 1.4 ms per
+ * proposal, so a peer who plants 800 valid self-signed proposals freezes the
+ * main thread for over a second on EVERY repaint. Coalescing repaints does not
+ * help: it bounds how often a render runs, never how long one takes.
+ *
+ * Y.Map hands back the same object reference for an entry that has not
+ * changed, so keying on that reference turns a repeat scan into pointer
+ * lookups while a genuinely new or replaced record still pays full price once.
+ * A WeakMap so evicted records do not pin memory.
+ *
+ * This cannot mask a change: these records are immutable by construction (id
+ * and signature cover the body), and a replaced value is a different object.
+ * It is reset on rebind because `expectedGenesis` and `verifySig` are inputs
+ * to the verdict and both change there.
+ */
+let verdicts = new WeakMap<object, boolean>();
+
+/** Memoizes a validator over a peer-written value. Non-objects skip the memo. */
+function cachedVerdict(value: unknown, compute: () => boolean): boolean {
+  if (typeof value !== 'object' || value === null) return compute();
+  const hit = verdicts.get(value);
+  if (hit !== undefined) return hit;
+  const verdict = compute();
+  verdicts.set(value, verdict);
+  return verdict;
+}
+
 function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
   if (!verifySig) return false;
   try {
@@ -220,6 +275,10 @@ function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
 // ---------------------------------------------------------------------------
 
 function validProposal(value: unknown): value is TreasuryProposal {
+  return cachedVerdict(value, () => validProposalUncached(value));
+}
+
+function validProposalUncached(value: unknown): value is TreasuryProposal {
   if (!isTreasuryProposal(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   // try/catch: the canonical encoder throws on strings the profile rejects
@@ -250,7 +309,7 @@ export function putProposal(proposal: TreasuryProposal): boolean {
 }
 
 export function readProposal(proposalId: string): TreasuryProposal | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`proposal:${proposalId}`);
   return validProposal(value) && value.proposalId === proposalId ? value : null;
@@ -289,7 +348,7 @@ function scanPrefixed<T>(
   maxEntries: number,
   take: (key: string, value: unknown) => T | null,
 ): BoundedScan<T> {
-  const m = map();
+  const m = readMap();
   if (!m) return { items: [], truncated: false };
   const items: T[] = [];
   let visited = 0;
@@ -338,6 +397,10 @@ export function scanCheckpoints(
 // ---------------------------------------------------------------------------
 
 function validVote(value: unknown): value is TreasuryVote {
+  return cachedVerdict(value, () => validVoteUncached(value));
+}
+
+function validVoteUncached(value: unknown): value is TreasuryVote {
   if (!isTreasuryVote(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   try {
@@ -382,7 +445,7 @@ export function putVote(vote: TreasuryVote): boolean {
 }
 
 export function readVote(proposalId: string, voterGamePub: string): TreasuryVote | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`vote:${proposalId}:${voterGamePub}`);
   if (!validVote(value)) return null;
@@ -392,7 +455,7 @@ export function readVote(proposalId: string, voterGamePub: string): TreasuryVote
 }
 
 export function listVotes(proposalId: string): TreasuryVote[] {
-  const m = map();
+  const m = readMap();
   if (!m) return [];
   const out: TreasuryVote[] = [];
   const prefix = `vote:${proposalId}:`;
@@ -427,11 +490,44 @@ export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
   return put('policy', policy);
 }
 
-/** The returned hash is recomputed here — compare it against the on-chain commitment. */
+/**
+ * The returned hash is recomputed here — compare it against the on-chain
+ * commitment.
+ *
+ * Memoized on the stored object for the same reason the validators are, and
+ * more sharply: a policy carries unbounded signer, share-class and module
+ * arrays, and validating plus hashing one holding 20,000 share classes was
+ * measured at 627 ms — paid on every repaint, for a value that had not
+ * changed. Keyed on identity, so a policy a peer actually replaces is a new
+ * object and is checked afresh.
+ *
+ * RESIDUAL RISK, not fixed here: the FIRST read of an oversized policy still
+ * costs that 627 ms, and a peer who rewrites the key repeatedly pays it again
+ * each time. Bounding it properly means a size limit in the record schema
+ * itself, which is a protocol change the Rust side has to match — it belongs
+ * with the per-class index work noted above `scanPrefixed`, not in a
+ * read-only UI change.
+ */
+let policyResults = new WeakMap<
+  object,
+  { result: { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null }
+>();
+
 export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get('policy');
+  if (typeof value !== 'object' || value === null) return null;
+  const hit = policyResults.get(value);
+  if (hit) return hit.result;
+  const result = readPolicyUncached(value);
+  policyResults.set(value, { result });
+  return result;
+}
+
+function readPolicyUncached(
+  value: unknown,
+): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
   if (!isCompanyTreasuryPolicy(value)) return null;
   if (!onNet(value.networkGenesisChallenge)) return null;
   try {
@@ -448,7 +544,7 @@ export function putAllowanceCache(allowance: DeviceAllowance): boolean {
 }
 
 export function readAllowanceCache(allowanceId: string): DeviceAllowance | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`allowance:${allowanceId}`);
   if (!isDeviceAllowance(value) || value.allowanceId !== allowanceId) return null;
@@ -465,7 +561,7 @@ export function putRegistration(registration: ProposalRegistration): boolean {
 }
 
 export function readRegistration(proposalId: string): ProposalRegistration | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`registration:${proposalId}`);
   return isProposalRegistration(value) && value.proposalId === proposalId ? value : null;
@@ -481,7 +577,7 @@ export function putWindowsCache(windows: ProposalWindows): boolean {
  * deriveProposalWindows(readRegistration(id), rule) — sovereign §4.
  */
 export function readWindowsCache(proposalId: string): ProposalWindows | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`windows:${proposalId}`);
   return isProposalWindows(value) && value.proposalId === proposalId ? value : null;
@@ -492,6 +588,10 @@ export function readWindowsCache(proposalId: string): ProposalWindows | null {
 // ---------------------------------------------------------------------------
 
 function validCheckpoint(value: unknown): value is TreasuryCheckpoint {
+  return cachedVerdict(value, () => validCheckpointUncached(value));
+}
+
+function validCheckpointUncached(value: unknown): value is TreasuryCheckpoint {
   if (!isTreasuryCheckpoint(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   const { checkpointId, checkpointCoinId, confirmedHeight, ...body } = value;
@@ -510,7 +610,7 @@ export function putCheckpoint(checkpoint: TreasuryCheckpoint): boolean {
 }
 
 export function listCheckpoints(proposalId: string): TreasuryCheckpoint[] {
-  const m = map();
+  const m = readMap();
   if (!m) return [];
   const out: TreasuryCheckpoint[] = [];
   const prefix = `checkpoint:${proposalId}:`;
@@ -544,7 +644,16 @@ function sessionShellOf(session: SigningSession): SigningSession {
 
 function validSessionShell(value: unknown, proposalId: string, sessionId: string): value is SigningSession {
   if (!isSigningSession(value)) return false;
+  // The two key checks stay OUTSIDE the memo. They compare the record against
+  // the caller's arguments rather than judging the record itself, so caching
+  // their result against the object would let a mismatched lookup poison the
+  // verdict for the matching one.
   if (value.proposalId !== proposalId || value.sessionId !== sessionId) return false;
+  return cachedVerdict(value, () => selfConsistentSession(value));
+}
+
+/** The arg-independent half: on-net, and the shell hashes to its own id. */
+function selfConsistentSession(value: SigningSession): boolean {
   if (!onNet(value.networkGenesisChallenge)) return false;
   try {
     return signingSessionIdOf(value) === value.sessionId;
@@ -606,7 +715,7 @@ export function scanSigningSessions(
   proposalId: string,
   maxEntries: number,
 ): BoundedScan<SigningSession> {
-  const m = map();
+  const m = readMap();
   if (!m) return { items: [], truncated: false };
   const shellPrefix = `session:${proposalId}:`;
   let visited = 0;
@@ -658,6 +767,10 @@ export function scanSigningSessions(
 // ---------------------------------------------------------------------------
 
 function validBinding(value: unknown): value is RoomTreasuryBinding {
+  return cachedVerdict(value, () => validBindingUncached(value));
+}
+
+function validBindingUncached(value: unknown): value is RoomTreasuryBinding {
   if (!isRoomTreasuryBinding(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   const { sig, ...unsigned } = value;
@@ -674,7 +787,7 @@ export function putRoomBinding(binding: RoomTreasuryBinding): boolean {
 }
 
 export function readRoomBinding(roomId: string): RoomTreasuryBinding | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`binding:${roomId}`);
   return validBinding(value) && value.roomId === roomId ? value : null;
@@ -694,7 +807,7 @@ export function putReceiptCache(receipt: TreasuryReceipt): boolean {
 }
 
 export function readReceiptCache(receiptId: string): TreasuryReceipt | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`receipt:${receiptId}`);
   if (!isTreasuryReceipt(value) || value.receiptId !== receiptId) return null;
@@ -724,7 +837,7 @@ export function putProposalPayload(payloadHex: string): boolean {
 }
 
 export function readProposalPayload(payloadHash: string): string | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   if (!isHex32(payloadHash)) return null;
   const value = m.get(`payload:${payloadHash}`);
@@ -746,7 +859,7 @@ export function putChainSyncStatus(status: ChainSyncStatus): boolean {
 }
 
 export function readChainSyncStatus(): ChainSyncStatus | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get('sync');
   return isChainSyncStatus(value) ? value : null;

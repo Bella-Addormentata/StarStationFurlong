@@ -731,7 +731,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <button type="button" id="device-terminal-open-treasury"
             style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>
         </div>
-        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only</div>
+        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only · ↑↓ MOVE · ENTER SELECT · ESC STEP BACK</div>
       `;
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.
@@ -753,6 +753,38 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           editRoom.requestHull();
         });
       }
+      // Keyboard traversal for the panel's controls.
+      //
+      // Tab cannot do it: main.ts binds Tab globally as the phone's open/close
+      // toggle and preventDefaults EVERY press, so the browser never cycles
+      // focus. Without this the panel's buttons — EDIT ROOM, EDIT HULL and the
+      // treasury link — are reachable by pointer only. Escape is left alone;
+      // it belongs to the device-focus controller that steps the player back
+      // out of the terminal.
+      //
+      // Enter and Space need no handling: these are real <button> elements and
+      // answer both natively once they can be focused. Disabled controls are
+      // skipped, which is also why the reason they are disabled is written in
+      // the note beside them rather than in their title attributes.
+      // Bound once here rather than read from the module-level `panel`, which
+      // unmount() sets to null — a late keydown would otherwise throw.
+      const mounted = panel;
+      const focusStops = (): HTMLElement[] =>
+        [...mounted.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]')]
+          .filter((el) => el.offsetParent !== null);
+      mounted.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        const stops = focusStops();
+        if (stops.length === 0) return;
+        e.preventDefault();
+        const here = stops.indexOf(document.activeElement as HTMLElement);
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+      });
+      // Somewhere to start from: arrow traversal is useless if nothing in the
+      // panel holds focus when it opens. preventScroll because the panel is
+      // positioned over the canvas and must not drag the page under it.
+      focusStops()[0]?.focus({ preventScroll: true });
       deps.onEngagedChange?.(true);
       refresh();
     },
