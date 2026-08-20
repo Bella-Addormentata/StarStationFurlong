@@ -602,6 +602,10 @@ export interface RoomFundingView {
    * height was available to judge by — is deliberately a state of its own and
    * not folded into 'not-passed': a boolean lived here once and collapsed the
    * two, which rendered an ended record as current funding.
+   *
+   * 'none' means only that no end height is in play, so it is also what the
+   * two recordless branches report — read it together with `bound`, never as
+   * a claim that funding is open-ended.
    */
   expiryStatus: 'none' | 'unknown' | 'passed' | 'not-passed';
   /**
