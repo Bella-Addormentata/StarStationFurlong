@@ -2834,10 +2834,29 @@ function renderTreasuryApp(): void {
     };
     view.addEventListener("click", (e) => activate(e.target));
     // The rows advertise role="button"/tabindex="0", so they must answer the
-    // keyboard too — otherwise the affordance is decorative.
+    // keyboard too — otherwise the affordance is decorative. Tab cannot do
+    // the traversal: the app reserves it globally as the phone's open/close
+    // toggle (it preventDefaults every press), so this view carries its own
+    // arrow-key movement between controls, and opening it lands focus here.
     view.addEventListener("keydown", (e) => {
-      if (e.key !== "Enter" && e.key !== " ") return;
-      if (activate(e.target)) e.preventDefault();
+      if (e.key === "Enter" || e.key === " ") {
+        if (activate(e.target)) e.preventDefault();
+        return;
+      }
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const stops = [
+        ...view.querySelectorAll<HTMLElement>("[data-treasury-action], [data-phone-app], [tabindex='0']"),
+      ].filter((el) => el.offsetParent !== null);
+      if (stops.length === 0) return;
+      e.preventDefault();
+      const here = stops.indexOf(
+        (e.target as HTMLElement).closest<HTMLElement>(
+          "[data-treasury-action], [data-phone-app], [tabindex='0']",
+        ) as HTMLElement,
+      );
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      const next = here < 0 ? 0 : (here + step + stops.length) % stops.length;
+      stops[next].focus();
     });
   }
   const esc = (s: string) =>
@@ -3122,7 +3141,11 @@ function renderTreasuryApp(): void {
                 .join("")}
               ${dim(esc(b.note))}`;
           })()
-        : dim("No company policy cached in this room yet.")
+        : dim(
+            readable
+              ? "No company policy cached in this room yet."
+              : "Company details cannot be read on this device, so nothing is known about the company either way.",
+          )
     }
 
     ${header(`PROPOSALS${rows.length ? ` · ${rows.length}` : ""}`)}
@@ -3150,7 +3173,11 @@ function renderTreasuryApp(): void {
           )
         : scoped.otherCompanies > 0
           ? "" // records exist; the line below explains why none are listed
-          : dim("No proposals in this room's records yet.")
+          : dim(
+              readable
+                ? "No proposals in this room's records yet."
+                : "Proposals cannot be read on this device, so none can be listed — that is not the same as there being none.",
+            )
     }
     ${
       scoped.scopeUnknown && scoped.otherCompanies > 0
@@ -4821,6 +4848,13 @@ function setupSpacePhoneOverlay() {
     if (id === "treasury") {
       treasuryDetailId = "";
       renderTreasuryApp();
+      // Land focus in the view so its arrow-key traversal is reachable
+      // without a pointer (Tab is the app's phone toggle, not a tab stop).
+      const tv = document.getElementById("phone-app-treasury");
+      if (tv) {
+        tv.setAttribute("tabindex", "-1");
+        tv.focus({ preventScroll: true });
+      }
     }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures

@@ -65,7 +65,9 @@ function envValue(key: string): string {
  * Release/operator configuration, per the plan's network-separation rule:
  * `VITE_SSF_TREASURY_GENESIS` (64 lowercase hex) plus an optional
  * `VITE_SSF_TREASURY_NETWORK` label. A malformed value is refused rather than
- * guessed at — the build stays on the placeholder and says so.
+ * guessed at — the build stays unconfigured, which closes the cache, and says
+ * so. There is no placeholder pin: see the note above on why a plausible one
+ * would be worse than none.
  */
 export function treasuryNetwork(): TreasuryNetwork {
   const raw = envValue('VITE_SSF_TREASURY_GENESIS').toLowerCase();
