@@ -731,16 +731,17 @@ export function roomFundingView(
     boundAtHeight: binding.boundAtHeight,
     expiresAfterHeight: expires,
     trust: trustTag('signed'),
-    // Only 'none' — the signed record naming no end height at all — earns the
-    // plain "Company funding" reading. Every other case rests on a height
-    // nobody here checked, so the headline says "record" and leaves the
-    // current state to the note rather than implying live funding.
+    // Always "record", never "Company funding" on its own — including when no
+    // end height is named. A signature shows who wrote the statement; it does
+    // not show they were entitled to write it, that the chain ever confirmed
+    // it, or that it has not since been unbound. An open-ended record is
+    // therefore no more evidence of live funding than an expiring one, and a
+    // headline saying otherwise would be exactly the invented certainty the
+    // rest of this module refuses.
     headline:
-      expiryStatus === 'none'
-        ? 'Company funding'
-        : expiryStatus === 'passed'
-          ? 'Company funding record · may have ended'
-          : 'Company funding record',
+      expiryStatus === 'passed'
+        ? 'Company funding record · may have ended'
+        : 'Company funding record',
     detail:
       expiryStatus === 'passed'
         ? 'This record’s own end height appears to have passed, so it may no longer fund the room. Funding a room grants nobody edit rights here — those stay separate.'

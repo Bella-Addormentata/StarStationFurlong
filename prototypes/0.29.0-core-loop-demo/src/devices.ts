@@ -482,18 +482,19 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       fundEl.textContent = connected
         ? `${funding.headline.toUpperCase()} · ${funding.trust.label}`
         : 'FUNDING RECORDS UNAVAILABLE · NO DATA';
-      // Green claims "funded, currently". Only a signed record naming no end
-      // height supports that here. If the record does name one, deciding
-      // whether it has passed needs a chain height this device does not have,
-      // so both readings of a peer-reported height get the neutral blue —
-      // green there would dress an unchecked guess up as a settled fact.
+      // No green anywhere on this panel. Green reads as "funded, currently",
+      // and nothing available here establishes that: a valid signature shows
+      // who wrote the record, not that they were entitled to, that the chain
+      // confirmed it, or that it has not since been unbound. So a held record
+      // is neutral blue whatever its end height says, amber marks the two
+      // cases needing attention (no record, or one that looks ended), and grey
+      // means the lookup could not run. Green returns with a local chain
+      // verdict, not before.
       fundEl.style.color = !connected
         ? '#4A5560'
         : !funding.bound || funding.expiryStatus === 'passed'
           ? '#F0C060'
-          : funding.expiryStatus === 'none'
-            ? '#00E676'
-            : '#3E92B8';
+          : '#3E92B8';
       const lines = !connected
         ? [
             'This terminal cannot reach the room’s records, so it cannot say how the room is funded.',

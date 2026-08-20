@@ -134,16 +134,16 @@ describe('proposals', () => {
     // The bound counts SLOTS VISITED, not results kept: capping results
     // alone would still verify every junk entry a peer planted before the
     // cap filled up, which is the work that stalls a repaint.
-    const two = scanProposals(2);
+    const two = scanProposals(2, 99);
     expect(two.items).toHaveLength(2);
     expect(two.truncated).toBe(true);
-    expect(scanProposals(0).items).toHaveLength(0);
-    const all = scanProposals(99);
+    expect(scanProposals(0, 99).items).toHaveLength(0);
+    const all = scanProposals(99, 99);
     expect(all.items).toHaveLength(4);
     expect(all.truncated).toBe(false);
     // Junk in the prefix consumes budget rather than being scanned for free.
     doc.getMap('treasury').set(`proposal:${'7'.repeat(64)}`, { junk: true });
-    const withJunk = scanProposals(1);
+    const withJunk = scanProposals(1, 99);
     expect(withJunk.truncated).toBe(true);
     expect(withJunk.items.length).toBeLessThanOrEqual(1);
   });
@@ -156,12 +156,42 @@ describe('proposals', () => {
     for (let i = 0; i < 40; i++) m.set(`junk:${i}`, { anything: i });
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);
-    const tight = scanProposals(5);
+    const tight = scanProposals(5, 99);
     expect(tight.truncated).toBe(true);
     // Generous enough to get past the junk finds the real record.
-    const roomy = scanProposals(500);
+    const roomy = scanProposals(500, 99);
     expect(roomy.truncated).toBe(false);
     expect(roomy.items.map((x) => x.proposalId)).toContain(p.proposalId);
+  });
+
+  it('caps VERIFICATIONS separately, since traversal is not what costs', () => {
+    // A traversal budget bounds how far a scan walks; it never bounded how
+    // much signature work the walk does. 800 verifiable records was measured
+    // at over a second of blocked main thread with a traversal budget alone.
+    const made = [0, 1, 2, 3, 4, 5].map((i) =>
+      makeProposal({ payloadHash: `${i}`.repeat(64) }),
+    );
+    for (const p of made) expect(putProposal(p)).toBe(true);
+    // Traversal budget generous, check budget tight: the scan stops on checks.
+    const capped = scanProposals(999, 2);
+    expect(capped.items).toHaveLength(2);
+    expect(capped.truncated).toBe(true);
+    // Zero checks verifies nothing at all, and says the view is partial.
+    const none = scanProposals(999, 0);
+    expect(none.items).toHaveLength(0);
+    expect(none.truncated).toBe(true);
+    // Invalid entries spend check budget too — rejecting one costs a
+    // verification, so letting them go free would leave the bound useless.
+    doc.getMap('treasury').set(`proposal:${'7'.repeat(64)}`, {
+      ...made[0],
+      proposalId: '7'.repeat(64),
+    });
+    const withForgery = scanProposals(999, 6);
+    expect(withForgery.items.length).toBeLessThanOrEqual(6);
+    // Both budgets clear: everything valid comes back, nothing is flagged.
+    const full = scanProposals(999, 999);
+    expect(full.items).toHaveLength(6);
+    expect(full.truncated).toBe(false);
   });
 
   it('round-trips a signed proposal and lists it', () => {
@@ -579,7 +609,7 @@ describe('network pinning', () => {
     // whether anything may be read out of it, and callers report them apart.
     expect(treasuryDocBound()).toBe(true);
     expect(readProposal(proposal.proposalId)).toBeNull();
-    expect(scanProposals(100)).toEqual({ items: [], truncated: false });
+    expect(scanProposals(100, 100)).toEqual({ items: [], truncated: false });
     expect(readPolicyCache()).toBeNull();
     // The sync entry carries no genesis of its own, so this is the only place
     // it can fail closed inside the cache layer.
@@ -640,6 +670,28 @@ describe('verification caching', () => {
     expect(first).not.toBeNull();
     expect(second).toBe(first); // same object: served from the memo
     expect(first?.policyHash).toBe(contracts.policy.policyHash);
+  });
+
+  it('refuses a policy too large to validate, at both put and read', () => {
+    // The memo cannot save this one: every peer REWRITE is a new object and
+    // so a fresh miss, and validating plus hashing 20,000 share classes was
+    // measured at 627 ms — on the repaint path, repeatable at will. Counting
+    // lengths first costs nothing and turns it into an immediate refusal.
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
+    const oversized = {
+      ...policy,
+      shareClasses: Array.from({ length: 300 }, (_unused, i) => ({
+        ...policy.shareClasses[0],
+        id: `class-${i}`,
+      })),
+    } as CompanyTreasuryPolicy;
+    expect(putPolicyCache(oversized)).toBe(false);
+    // A hostile peer writes past put() anyway, so the read must refuse too.
+    doc.getMap('treasury').set('policy', oversized);
+    expect(readPolicyCache()).toBeNull();
+    // The cap is far above anything real: the golden vector is well inside it.
+    expect(putPolicyCache(policy)).toBe(true);
+    expect(readPolicyCache()?.policy).toEqual(policy);
   });
 });
 

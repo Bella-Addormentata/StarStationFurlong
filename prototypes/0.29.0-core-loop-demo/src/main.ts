@@ -2811,6 +2811,27 @@ function renderBankApp(): void {
 let treasuryDetailId = "";
 
 /**
+ * How many records one repaint may VERIFY, as opposed to walk past.
+ *
+ * Verifying a record costs about 1.4 ms — a canonical id or hash recomputed
+ * and an ed25519 signature checked. The traversal budget below bounds how far
+ * a scan walks, which a cheap skipped key needs, but it never bounded this: a
+ * page of 800 verifiable records is over a second of blocked main thread. Nor
+ * does treasuryDoc's identity memo rescue it, because a peer who keeps writing
+ * NEW records writes new object identities, and every one of those is a miss.
+ *
+ * 24 keeps the verification cost of a repaint near 35 ms even under a flood,
+ * and 24 rows is already more than a phone screen shows at once. What falls
+ * outside the budget is not hidden: `truncated` drives an on-screen line
+ * saying the view is partial and its contents are an arbitrary subset.
+ *
+ * The real fix is validating off the render path with cancellation, alongside
+ * the per-class index treasuryDoc's scanPrefixed comment describes.
+ */
+const LIST_CHECKS = 24;
+const DETAIL_CHECKS = 24;
+
+/**
  * Repaint, preserving keyboard focus across the innerHTML replacement.
  *
  * Every repaint — including one triggered by a record arriving from a peer —
@@ -3055,10 +3076,11 @@ function paintTreasuryApp(view: HTMLElement): void {
     // Bounded reads: votes, vote records and approval rounds all sit in
     // peer-writable slots that nothing prunes, and this screen repaints on
     // every treasury event, so unbounded scans would let spam stall the UI.
+    // Two budgets, because the entries do not cost the same — see scanPrefixed.
     const DETAIL_SCAN = 800;
-    const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN);
-    const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN);
-    const sessionScan = scanSigningSessions(proposal.proposalId, DETAIL_SCAN);
+    const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
+    const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
+    const sessionScan = scanSigningSessions(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
     const detailPartial = voteScan.truncated || cpScan.truncated || sessionScan.truncated;
     const votes = voteTallyView(
       voteScan.items,
@@ -3172,12 +3194,14 @@ function paintTreasuryApp(view: HTMLElement): void {
   // would let ordinary history — or a peer publishing many valid self-signed
   // proposals — stall each repaint. One page at a time, and the page is
   // honest about being one.
-  // Budget in ENTRIES TRAVERSED, not records kept: the map is peer-writable
-  // and unpruned, so unrelated keys must cost budget too or they are free.
-  // Generous enough for a real room's records, bounded enough that a flood
-  // cannot make each repaint walk the whole map.
+  //
+  // Two budgets. LIST_SCAN counts ENTRIES TRAVERSED, not records kept, because
+  // the map is peer-writable and unpruned so unrelated keys must cost budget
+  // or they are free. LIST_CHECKS counts the entries actually VERIFIED, which
+  // is the expensive half and the one that decides how long a repaint blocks
+  // for; it also caps how many rows this screen can be made to render.
   const LIST_SCAN = 800;
-  const page = scanProposals(LIST_SCAN);
+  const page = scanProposals(LIST_SCAN, LIST_CHECKS);
   const truncated = page.truncated;
   const scoped = scopeProposals(page.items, scope.companyId);
   const rows = proposalRows(

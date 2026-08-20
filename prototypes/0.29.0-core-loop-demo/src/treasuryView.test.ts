@@ -608,17 +608,23 @@ describe('policy, shares, and room funding', () => {
     expect(roomFundingView(null).expiryNote).toBeNull();
   });
 
-  it('only calls it plain "Company funding" when no end height is named', () => {
-    // Anything resting on a peer-reported height says "record" instead, so the
-    // headline never implies funding is live on the strength of an unchecked
-    // number.
-    expect(roomFundingView(expiring(undefined), 150).headline).toBe('Company funding');
-    expect(roomFundingView(expiring(200), 250).headline).toMatch(/may have ended/i);
-    for (const height of [150, null]) {
-      const headline = roomFundingView(expiring(200), height).headline;
+  it('never claims live funding — every held record is headlined as a record', () => {
+    // Not even a record naming NO end height earns "Company funding" on its
+    // own. Its signature shows who wrote the statement, not that they were
+    // entitled to, that the chain confirmed it, or that it has not since been
+    // unbound — so open-ended is no more evidence of live funding than
+    // expiring, and only the passed case adds anything to the headline.
+    for (const [expires, height] of [
+      [undefined, 150],
+      [undefined, null],
+      [200, 150],
+      [200, null],
+    ] as const) {
+      const headline = roomFundingView(expiring(expires), height).headline;
       expect(headline).toBe('Company funding record');
       expect(headline).not.toMatch(/may have ended/i);
     }
+    expect(roomFundingView(expiring(200), 250).headline).toMatch(/may have ended/i);
   });
 
   it('separates company funding from edit rights, and exposes the profile', () => {

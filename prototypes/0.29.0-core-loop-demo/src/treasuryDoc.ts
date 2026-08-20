@@ -316,27 +316,34 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
 }
 
 export function listProposals(): TreasuryProposal[] {
-  return scanProposals(Number.POSITIVE_INFINITY).items;
+  return scanProposals(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY).items;
 }
 
 /**
- * A scan bounded by ENTRIES TRAVERSED — every key the iteration touches,
- * whatever its prefix.
+ * A scan bounded on TWO axes, because the map's entries do not all cost the
+ * same and a single budget can only bound one of them.
  *
- * Two weaker bounds were tried first and neither held. Capping RESULTS still
- * signature-checks every invalid entry a peer planted before the cap fills.
- * Capping only MATCHING entries still walks the whole map, because anyone can
- * add `junk:*` keys that are skipped for free — and this map is peer-writable
- * and never pruned, so an attacker sets the cost of every repaint.
+ *  `maxEntries` — every key the iteration touches, whatever its prefix.
+ *      Skipping a wrong-prefix key is cheap but not free, and anyone can add
+ *      unlimited `junk:*` keys to a peer-writable, never-pruned map. Without
+ *      this bound an attacker sets how far every repaint walks.
  *
- * Counting every entry is the only bound that survives a hostile map. The
- * cost is real and is reported rather than hidden: under a flood, genuine
- * records may sit past the budget, so `truncated` means "this view is partial
- * and its contents are an arbitrary subset", never "the first N".
+ *  `maxChecks` — entries that match the prefix and are therefore handed to
+ *      `take`, which re-derives a canonical id or hash and verifies an
+ *      ed25519 signature: roughly 1.4 ms EACH. Traversal budget alone never
+ *      bounded this. 800 matching entries is over a second of blocked main
+ *      thread, and the identity memo does not save a repaint that is seeing
+ *      those records for the first time — a peer who keeps writing NEW
+ *      records is writing new object identities, so every one is a miss.
+ *      This is the budget that keeps a repaint's cost bounded.
+ *
+ * Neither bound hides what it drops. Hitting either sets `truncated`, which
+ * means "this view is partial and its contents are an arbitrary subset",
+ * never "the first N".
  *
  * The lasting fix is a per-class index so each record type can be reached
- * without walking shared space; that belongs with the op-log durability work
- * the plans already schedule.
+ * without walking shared space, plus validation moved off the render path;
+ * that belongs with the op-log durability work the plans already schedule.
  */
 export interface BoundedScan<T> {
   items: T[];
@@ -346,33 +353,46 @@ export interface BoundedScan<T> {
 function scanPrefixed<T>(
   prefix: string,
   maxEntries: number,
+  maxChecks: number,
   take: (key: string, value: unknown) => T | null,
 ): BoundedScan<T> {
   const m = readMap();
   if (!m) return { items: [], truncated: false };
   const items: T[] = [];
   let visited = 0;
+  let checked = 0;
   for (const [key, value] of m.entries()) {
     // Counted BEFORE the prefix test: a skipped key is still a key this
     // repaint had to look at.
     if (visited >= maxEntries) return { items, truncated: true };
     visited += 1;
     if (!key.startsWith(prefix)) continue;
+    // Counted BEFORE `take` runs, for the same reason: the check is the
+    // expensive part, so the budget has to be spent before it, not after.
+    if (checked >= maxChecks) return { items, truncated: true };
+    checked += 1;
     const kept = take(key, value);
     if (kept !== null) items.push(kept);
   }
   return { items, truncated: false };
 }
 
-export function scanProposals(maxEntries: number): BoundedScan<TreasuryProposal> {
-  return scanPrefixed('proposal:', maxEntries, (key, value) =>
+export function scanProposals(
+  maxEntries: number,
+  maxChecks: number,
+): BoundedScan<TreasuryProposal> {
+  return scanPrefixed('proposal:', maxEntries, maxChecks, (key, value) =>
     validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
   );
 }
 
-export function scanVotes(proposalId: string, maxEntries: number): BoundedScan<TreasuryVote> {
+export function scanVotes(
+  proposalId: string,
+  maxEntries: number,
+  maxChecks: number,
+): BoundedScan<TreasuryVote> {
   const prefix = `vote:${proposalId}:`;
-  return scanPrefixed(prefix, maxEntries, (key, value) =>
+  return scanPrefixed(prefix, maxEntries, maxChecks, (key, value) =>
     validVote(value) && key === `vote:${value.proposalId}:${value.voterGamePub}`
       ? value
       : null,
@@ -382,9 +402,10 @@ export function scanVotes(proposalId: string, maxEntries: number): BoundedScan<T
 export function scanCheckpoints(
   proposalId: string,
   maxEntries: number,
+  maxChecks: number,
 ): BoundedScan<TreasuryCheckpoint> {
   const prefix = `checkpoint:${proposalId}:`;
-  return scanPrefixed(prefix, maxEntries, (key, value) =>
+  return scanPrefixed(prefix, maxEntries, maxChecks, (key, value) =>
     validCheckpoint(value) &&
     key === `checkpoint:${value.proposalId}:${value.checkpointId}`
       ? value
@@ -476,6 +497,10 @@ export function listVotes(proposalId: string): TreasuryVote[] {
 export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
   if (!isCompanyTreasuryPolicy(policy)) return false;
   if (!onNet(policy.networkGenesisChallenge)) return false;
+  // Same cap the read applies. Refusing here too keeps put and read agreeing:
+  // a policy that put fine but read back null forever is the exact foot-gun
+  // the encodability probe below exists to avoid.
+  if (!withinDisplayCaps(policy)) return false;
   // Encodability probe: a policy the canonical encoder rejects would put
   // fine but read back null forever — refuse it here instead.
   try {
@@ -501,12 +526,9 @@ export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
  * changed. Keyed on identity, so a policy a peer actually replaces is a new
  * object and is checked afresh.
  *
- * RESIDUAL RISK, not fixed here: the FIRST read of an oversized policy still
- * costs that 627 ms, and a peer who rewrites the key repeatedly pays it again
- * each time. Bounding it properly means a size limit in the record schema
- * itself, which is a protocol change the Rust side has to match — it belongs
- * with the per-class index work noted above `scanPrefixed`, not in a
- * read-only UI change.
+ * The memo alone did not close the hole: every peer REWRITE is a new object,
+ * so a peer rewriting the key in a loop pays that 627 ms afresh each repaint
+ * and never hits the cache. `withinDisplayCaps` below is what bounds it.
  */
 let policyResults = new WeakMap<
   object,
@@ -525,9 +547,40 @@ export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: 
   return result;
 }
 
+/**
+ * The largest collections this cache will validate, hash, or hand to the UI.
+ *
+ * Not a protocol rule — the record schema has no size limit, and adding one
+ * is a change the Rust side must match. This is the browser refusing to do
+ * unbounded work on a peer's say-so: a policy carries three unbounded arrays,
+ * and validating plus hashing one holding 20,000 share classes measured
+ * 627 ms on the repaint path. Counting lengths first costs nothing and turns
+ * that into an immediate refusal.
+ *
+ * Set far above anything a real company would use — the golden-vector policy
+ * has 3 signers, 1 share class and 2 modules — so this rejects only records
+ * that are already implausible. A policy over the cap is treated exactly like
+ * any other invalid cache entry: read as null, and the UI reports the policy
+ * as unavailable rather than rendering half of it.
+ */
+const DISPLAY_CAP = 256;
+
+function withinDisplayCaps(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const p = value as Record<string, unknown>;
+  const board = p.board as Record<string, unknown> | undefined;
+  const under = (v: unknown): boolean => !Array.isArray(v) || v.length <= DISPLAY_CAP;
+  return under(board?.signerPuzzleHashes)
+    && under(p.shareClasses)
+    && under(p.approvalModuleHashes);
+}
+
 function readPolicyUncached(
   value: unknown,
 ): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
+  // Cheap length checks BEFORE the full structural walk, which is the whole
+  // point — running them afterwards would already have paid the cost.
+  if (!withinDisplayCaps(value)) return null;
   if (!isCompanyTreasuryPolicy(value)) return null;
   if (!onNet(value.networkGenesisChallenge)) return null;
   try {
@@ -702,23 +755,28 @@ export function putSigningSession(session: SigningSession): boolean {
 // listing stays O(map size) no matter how many shells a peer plants —
 // per-shell rescans would be O(sessions × map size), a cheap read-freeze.
 export function listSigningSessions(proposalId: string): SigningSession[] {
-  return scanSigningSessions(proposalId, Number.POSITIVE_INFINITY).items;
+  return scanSigningSessions(proposalId, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY).items;
 }
 
 /**
- * Bounded twin of listSigningSessions. The index pass touches every
- * `sessionsig:` key in the map — including other proposals' — so peer-written
- * signature spam would otherwise grow the work done on every repaint while a
- * detail is open. Counts every slot it looks at, shells and signatures alike.
+ * Bounded twin of listSigningSessions, on the same two axes as scanPrefixed.
+ * The index pass touches every `sessionsig:` key in the map — including other
+ * proposals' — so peer-written signature spam would otherwise grow the work
+ * done on every repaint while a detail is open. `maxEntries` counts every slot
+ * it looks at, shells and signatures alike; `maxChecks` counts only the shells
+ * handed to validSessionShell, which is where a hash gets recomputed. Signature
+ * slots cost a few string comparisons and are covered by `maxEntries` alone.
  */
 export function scanSigningSessions(
   proposalId: string,
   maxEntries: number,
+  maxChecks: number,
 ): BoundedScan<SigningSession> {
   const m = readMap();
   if (!m) return { items: [], truncated: false };
   const shellPrefix = `session:${proposalId}:`;
   let visited = 0;
+  let checked = 0;
   let truncated = false;
   const shells: { sessionId: string; shell: SigningSession }[] = [];
   const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
@@ -732,6 +790,11 @@ export function scanSigningSessions(
     visited += 1;
     if (!key.startsWith(shellPrefix) && !key.startsWith('sessionsig:')) continue;
     if (key.startsWith(shellPrefix)) {
+      if (checked >= maxChecks) {
+        truncated = true;
+        break;
+      }
+      checked += 1;
       const sessionId = key.slice(shellPrefix.length);
       if (validSessionShell(value, proposalId, sessionId)) {
         shells.push({ sessionId, shell: value });
