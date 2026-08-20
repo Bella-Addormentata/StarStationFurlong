@@ -43,7 +43,20 @@ import {
   importRecoveryKey,
   ysyncSigner,
   hasStoredIdentity,
+  getCloneVatPreference,
+  setCloneVatPreference,
 } from "./keypair";
+// 🛰️ #79 P3: the shared default station — a fresh install boots into THIS
+// room (its clone-vat welcome) instead of minting its own per-install home.
+// sharedStationBootstrap() returns null when station.ts is unconfigured, at
+// which point every caller collapses to today's per-install `home-*` behaviour.
+// isSharedStationRoom() is the runtime test the join/persist paths use to know
+// they are looking at the shared station (never claim owner, never persist a
+// station-scoped `ssf-last-room`).
+import {
+  isSharedStationRoom,
+  sharedStationBootstrap,
+} from "./station";
 import { bindTreasuryDoc } from "./treasuryDoc";
 // Dev placeholder network pin for the treasury cache layer — deliberately
 // matches NO real chain genesis, so every foreign record is rejected until
@@ -742,6 +755,38 @@ async function bootstrapNetworking() {
         localStorage.removeItem("ssf-last-room");
       }
     }
+    // 🧬 #79 P2/P4: on the first-run / post-restore boot (no override, no
+    // resume) look up the CURRENT IDENTITY's clone-vat preference and use it
+    // as the boot target. Falls back to the shared station (fetchDefault) when
+    // no preference is set — that IS the default clone-vat for every new
+    // identity. LOCAL-only lookup: a fresh install with a restored key has no
+    // record here → shared-station fallback lands them in the welcome vat.
+    if (!pendingBootstrapOverride) {
+      try {
+        const identityPref = getCloneVatPreference(getIdentityPub());
+        if (identityPref && !isSharedStationRoom(identityPref.roomId)) {
+          const fp = await awaitLocalNodeFingerprint();
+          if (fp) {
+            pendingBootstrapOverride = {
+              v: 2,
+              roomId: identityPref.roomId,
+              roomKeyB64: identityPref.roomKeyB64,
+              wtUrl: `https://127.0.0.1:${fp.port}`,
+              certHashesB64: [fp.base64],
+              memberHints: (() => {
+                const h = getLocalNodeHint(fp);
+                return h ? [h] : undefined;
+              })(),
+              irohNodeId: fp.iroh_node_id,
+              irohRelayUrls: fp.iroh_relay_urls,
+              irohDirectAddrs: fp.iroh_direct_addrs,
+            };
+          }
+        }
+      } catch {
+        /* preference is best-effort — fall through to the shared station */
+      }
+    }
     const override = pendingBootstrapOverride;
     let boot = override ?? (await fetchDefaultBootstrap());
     // Stale-cert self-dial guard (node-restart bug): an override captured
@@ -791,7 +836,16 @@ async function bootstrapNetworking() {
     // comment in joinRoomAtEpoch for the initial-sync race this prevents.
     // pendingBootstrapOverride intentionally persists after use, so a
     // Retry-node following a seed import stays classified as a join.
-    await joinRoom(boot, /* claimRoomDefaults */ !override);
+    //
+    // 🛰️ #79 P3: the SHARED STATION is authored by its always-on host — a
+    // fresh install joining it must NEVER claim defaults (racing the host's
+    // real name/owner over the SyncStep2). Force-JOIN semantics regardless
+    // of whether the boot came from the default path or an override.
+    const isSharedStationJoin = isSharedStationRoom(boot.roomId);
+    await joinRoom(
+      boot,
+      /* claimRoomDefaults */ !override && !isSharedStationJoin,
+    );
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -938,14 +992,47 @@ async function joinRoomAtEpoch(
   // room reconnects from the LIVE local node (its loopback cert drifts across
   // restarts), so persist ONLY non-home rooms; entering home clears the resume
   // target. Stored as a base64 RoomBootstrap — the same shape a pass carries.
+  //
+  // 🛰️ #79 P3: also skip the SHARED STATION here — it is a rebuild-from-
+  // defaults room like `home-*`, and persisting its overriding wtUrl would
+  // fight the fetchDefaultBootstrap live-fingerprint path on the next boot.
   try {
-    if (boot.roomId === getDefaultRoomId()) {
+    if (
+      boot.roomId === getDefaultRoomId() ||
+      isSharedStationRoom(boot.roomId)
+    ) {
       localStorage.removeItem("ssf-last-room");
     } else {
       localStorage.setItem("ssf-last-room", btoa(JSON.stringify(boot)));
     }
   } catch {
     /* privacy mode — resume is best-effort */
+  }
+
+  // 🧬 #79 P2/P4: record THIS room as the current identity's clone-vat
+  // preference so a returning boot (on this install, and eventually elsewhere)
+  // knows where to land. Local-only, whole-value write; the reader is shape-
+  // guarded (see keypair.ts). Two rooms are DELIBERATELY skipped:
+  //   • the shared STATION default — fetchDefaultBootstrap picks it up on its
+  //     own, so a null preference IS "boot into the shared vat".
+  //   • the per-install HOME (`home-*` from getDefaultRoomId) — its id and
+  //     roomKey are install-scoped local state; recording it as an identity
+  //     preference would send a restore-elsewhere boot into a private room
+  //     the current install can't reproduce.
+  try {
+    if (
+      isSharedStationRoom(boot.roomId) ||
+      boot.roomId === getDefaultRoomId()
+    ) {
+      setCloneVatPreference(getIdentityPub(), null);
+    } else if (boot.roomKeyB64) {
+      setCloneVatPreference(getIdentityPub(), {
+        roomId: boot.roomId,
+        roomKeyB64: boot.roomKeyB64,
+      });
+    }
+  } catch {
+    /* preference is best-effort */
   }
 
   // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
@@ -4860,20 +4947,48 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   if (!fingerprint) {
     return null;
   }
-  const roomId = activeBootstrap?.roomId ?? getDefaultRoomId();
+  // 🛰️ #79 P3: prefer the SHARED default station id + key when configured, so
+  // every fresh install lands in the same clone-vat welcome instead of minting
+  // its own per-install `home-*` room. Skipped when an activeBootstrap is
+  // already established (a live session — never re-derives its own roomId) and
+  // when station.ts hasn't been filled in yet (hasSharedStation → false).
+  //
+  // The wtUrl / certHash come from the LOCAL node's fingerprint: we always
+  // dial our own loopback listener (the node bridges to the mesh from there).
+  // Baked-in station seed hints ride along too, merged with the local hint
+  // so a hint-less install can still self-seed while a seeded one can dial
+  // the always-on host.
+  const shared = !activeBootstrap ? sharedStationBootstrap() : null;
+  const roomId = activeBootstrap?.roomId ?? shared?.roomId ?? getDefaultRoomId();
   const roomKeyB64 =
-    activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
+    activeBootstrap?.roomKeyB64 ??
+    shared?.roomKeyB64 ??
+    getOrCreateRoomKeyB64(roomId);
   const localHint = getLocalNodeHint(fingerprint);
+  // Merge baked-in station hints (if any) with the local hint. The local hint
+  // must be first so a loopback dial still targets our OWN node's fingerprint.
+  const stationHints: RoomMemberHint[] = shared
+    ? shared.memberHints.map((h) => ({
+        irohNodeId: h.nodeId,
+        irohRelayUrls: h.relayUrls,
+        irohDirectAddrs: h.directAddrs,
+      }))
+    : [];
+  const mergedHints = mergeMemberHints(
+    localHint ? [localHint] : [],
+    stationHints,
+  );
+  const primaryHint = localHint ?? mergedHints[0];
   return {
     v: 2,
     roomId,
     roomKeyB64,
     wtUrl: `https://127.0.0.1:${fingerprint.port}`,
     certHashesB64: [fingerprint.base64],
-    memberHints: localHint ? [localHint] : undefined,
-    irohNodeId: localHint?.irohNodeId,
-    irohRelayUrls: localHint?.irohRelayUrls,
-    irohDirectAddrs: localHint?.irohDirectAddrs,
+    memberHints: mergedHints.length ? mergedHints : undefined,
+    irohNodeId: primaryHint?.irohNodeId,
+    irohRelayUrls: primaryHint?.irohRelayUrls,
+    irohDirectAddrs: primaryHint?.irohDirectAddrs,
   };
 }
 
@@ -6717,6 +6832,17 @@ function setupClickToEnter() {
             return;
           }
           ta.value = ""; // scrub the private key from the DOM immediately
+          // 🧬 #79 P2: the restored identity is (probably) NEW to this install,
+          // so the install-scoped `ssf-last-room` (which belonged to whoever
+          // was here before) is now the WRONG resume target. Drop it — the
+          // next boot's fetchDefaultBootstrap will pick this identity's
+          // clone-vat preference (if a mesh lookup ever finds one) or fall
+          // through to the shared station default, which is what we want.
+          try {
+            localStorage.removeItem("ssf-last-room");
+          } catch {
+            /* privacy mode — best-effort */
+          }
           note.textContent = `Identity ${getIdentityFingerprint()} restored — loading your station…`;
           doRestore.disabled = true;
           setTimeout(() => window.location.reload(), 700);
