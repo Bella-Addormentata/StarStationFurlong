@@ -29,18 +29,31 @@
  *
  * ─── SH3 state machine (plan §5.1, §7 SH3) ───────────────────────────────────
  *
- *          ┌──────────┐   depart(dest)     ┌───────────┐
- *          │  docked  │ ──────────────────▶│ undocking │
- *          └────▲─────┘                    └─────┬─────┘
- *               │                                │  (transient berths detached,
- *               │                                │   fuel debited)
- *               │                                ▼
- *          ┌────┴──────┐   arrive(location) ┌─────────────┐
- *          │ redocking │◀───────────────────┤  in-flight  │
- *          └────▲──────┘   (etaAt passed)   └──────┬──────┘
- *               │                                  │
- *               │           (redock accepted)      │
- *               └──────────────────────────────────┘
+ * Legal transitions (isLegalFlightTransition — the writer-side gate):
+ *
+ *     from        →   to          notes
+ *   ─────────────────────────────────────────────────────────────────────────
+ *     docked      ═▶  in-flight   FAST-path DEPART (SH3-shipped)
+ *     docked       ▶  undocking   SLOW-path DEPART (reserved for later slice)
+ *     undocking    ▶  in-flight   slow-path continue (reserved)
+ *     undocking    ▶  docked      slow-path abort    (reserved)
+ *     in-flight    ▶  redocking   commander tick, once now ≥ etaAt
+ *     redocking    ▶  docked      COMPLETE REDOCK (helm button)
+ *     redocking    ▶  in-flight   reserved bounce-back
+ *     <any>        ▶  <same>      idempotent self-republish (commander race)
+ *
+ * Two legal DEPART paths — the state machine (isLegalFlightTransition) accepts
+ * BOTH so a caller may pick per-slice:
+ *   - FAST path (SH3, shipped): `docked ═══▶ in-flight` in a single write.
+ *     The transient-berth detach, fuel debit, and record publish happen in one
+ *     commander step (see devices.ts createHelmUI's DEPART handler). No visible
+ *     `undocking` beat — the SH3 first flight keeps the choreography terse.
+ *   - SLOW path (reserved): `docked → undocking → in-flight`, with `undocking`
+ *     as a brief hand-off beat. Kept in the machine (and its abort edge back
+ *     to `docked`) so a future preflight-animation / cast-off cinematic slice
+ *     can restore it without changing the state room. No writer produces
+ *     `undocking` in the shipped code today; the shape guard, sanitizer, and
+ *     legal-transition table all handle it for that future slice.
  *
  * `undocking` and `redocking` are BRIEF hand-off states — the transient-berth
  * lane (#67 D2, shipped) does the physical detach/attach. They exist so:
@@ -283,16 +296,45 @@ export function writeFuelLevel(level: number, capacity: number): void {
   });
 }
 
-/** Publish the flight record. Owner-gated at the caller. Validates the state
- *  machine invariants BEFORE writing — an invalid record here would still be
- *  filtered out by readFlightRecord's guard, but a rejected write is louder
- *  than a silently-reverted one. */
+/** Publish the flight record. Owner-gated at the caller. Validates TWO
+ *  invariants BEFORE writing (defense in depth; readFlightRecord's guard would
+ *  filter a bad record too, but a rejected write is louder than a
+ *  silently-reverted one):
+ *
+ *    1. SHAPE — sanitize + isFlightRecord: kills malformed / stale-field /
+ *       etaAt<=departedAt records at the wire.
+ *    2. LEGAL-TRANSITION — isLegalFlightTransition against the CURRENT record:
+ *       an existing well-formed record only advances along an edge the state
+ *       machine allows. On a fresh doc (no prior record) any status is a legal
+ *       SEED — matching the "an unopened room doc IS today's module" ruling in
+ *       the header. A prior record that itself fails the shape guard is treated
+ *       as absent, so the writer can HEAL from a corrupt map entry rather than
+ *       stranding the ship.
+ *
+ *  Rejections are non-throwing (console.warn + no-op) so a bad caller cannot
+ *  wedge a doc.transact half-write on the map. */
 export function writeFlightRecord(rec: FlightRecord): void {
   if (!docAlive()) return;
   const clean = sanitizeFlightRecord(rec);
   if (!isFlightRecord(clean)) {
     console.warn('[ship] refused to write malformed flight record', rec);
     return;
+  }
+  // Transition-legality gate — read the current record OUTSIDE the transact
+  // (no lock; honest-client posture, SH5 signed enforcement is a later slice).
+  // A hostile / bogus current record fails isFlightRecord and is treated as
+  // "no prior record", so the writer can seed a fresh legal state on top of
+  // corruption instead of being permanently blocked.
+  const raw = shipMap!.get('flight');
+  if (isFlightRecord(raw)) {
+    const current = sanitizeFlightRecord(raw);
+    if (!isLegalFlightTransition(current.status, clean.status)) {
+      console.warn(
+        `[ship] refused illegal flight transition ${current.status} -> ${clean.status}`,
+        rec,
+      );
+      return;
+    }
   }
   boundDoc!.transact(() => {
     shipMap!.set('flight', clean);
@@ -307,8 +349,19 @@ export function writeFlightRecord(rec: FlightRecord): void {
 export function isLegalFlightTransition(from: FlightStatus, to: FlightStatus): boolean {
   if (from === to) return true; // idempotent republish
   switch (from) {
-    case 'docked':    return to === 'undocking';
-    case 'undocking': return to === 'in-flight' || to === 'docked'; // depart or abort
+    case 'docked':
+      // Two DEPART paths (see header): the SH3 FAST path lands directly at
+      // 'in-flight' without a visible undocking hand-off, the reserved SLOW
+      // path pauses at 'undocking' for a future preflight-animation slice.
+      // Both are downstream of canDepart at the caller (owner, fuel, chain).
+      return to === 'undocking' || to === 'in-flight';
+    case 'undocking':
+      // Reserved slow-path successors: continue to 'in-flight' or abort back
+      // to 'docked'. No writer produces 'undocking' in the shipped SH3 code
+      // (the DEPART flow fast-paths past it), but the transition legality
+      // stays populated so a later slice can restore the hand-off beat
+      // without changing the state room.
+      return to === 'in-flight' || to === 'docked';
     case 'in-flight': return to === 'redocking';
     case 'redocking': return to === 'docked' || to === 'in-flight'; // arrive or bounced
   }

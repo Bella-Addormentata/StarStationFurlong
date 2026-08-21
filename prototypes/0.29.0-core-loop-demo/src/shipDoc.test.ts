@@ -317,10 +317,13 @@ describe('shipDoc flight record', () => {
     expect(isFlightRecord({ status: 'undocking', locationId: HOME.id, destinationId: L4.id })).toBe(true);
   });
 
-  it('legal transition table matches the SH3 diagram', () => {
-    // docked → undocking (only)
+  it('legal transition table matches the SH3 diagram (fast + slow DEPART paths)', () => {
+    // docked → undocking (slow-path DEPART, reserved for a future preflight
+    // slice) OR in-flight (SH3 FAST-path DEPART, shipped) — both legalized so
+    // the writer may pick per-slice. See shipDoc.ts header + state-machine
+    // switch comments for the rationale.
     expect(isLegalFlightTransition('docked', 'undocking')).toBe(true);
-    expect(isLegalFlightTransition('docked', 'in-flight')).toBe(false);
+    expect(isLegalFlightTransition('docked', 'in-flight')).toBe(true);
     expect(isLegalFlightTransition('docked', 'redocking')).toBe(false);
     // undocking → in-flight or docked (abort)
     expect(isLegalFlightTransition('undocking', 'in-flight')).toBe(true);
@@ -338,6 +341,133 @@ describe('shipDoc flight record', () => {
     for (const s of ['docked', 'undocking', 'in-flight', 'redocking'] as const) {
       expect(isLegalFlightTransition(s, s)).toBe(true);
     }
+  });
+
+  it('writeFlightRecord refuses ILLEGAL transitions against the current record', () => {
+    // Regression for the audit MINOR: previously, writeFlightRecord did NOT
+    // check transition legality. It now reads the current record and refuses
+    // any advance the state machine rejects.
+    const doc = freshDoc();
+    // Seed the doc with an in-flight record (any seed is legal on a fresh doc).
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    // Silence the expected warn so the test output stays clean.
+    const originalWarn = console.warn;
+    let warned = 0;
+    console.warn = () => { warned++; };
+    // in-flight → docked is not a legal edge; the write must be rejected AND
+    // the doc must still hold the in-flight record.
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    console.warn = originalWarn;
+    expect(warned).toBeGreaterThan(0);
+    expect(readFlightRecord()).toEqual({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    doc.destroy();
+  });
+
+  it('writeFlightRecord accepts the SH3 fast-path DEPART (docked → in-flight)', () => {
+    // The SH3 DEPART flow (devices.ts createHelmUI) writes 'in-flight' directly
+    // from a 'docked' record — the state machine legalizes this fast path.
+    const doc = freshDoc();
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    expect(readFlightRecord().status).toBe('in-flight');
+    doc.destroy();
+  });
+
+  it('writeFlightRecord accepts the reserved slow-path (docked → undocking → in-flight)', () => {
+    // Belt-and-braces for the reserved slow path: 'undocking' has no live
+    // producer in the shipped SH3 code, but the state machine legalizes both
+    // its successor state and its abort back to 'docked'. A future preflight-
+    // animation slice can walk this path without touching the state room.
+    const doc = freshDoc();
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    writeFlightRecord({
+      status: 'undocking',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+    });
+    expect(readFlightRecord().status).toBe('undocking');
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    expect(readFlightRecord().status).toBe('in-flight');
+    doc.destroy();
+  });
+
+  it('writeFlightRecord accepts REDOCK completion (redocking → docked)', () => {
+    // Regression for the shipped REDOCK button: seed redocking, advance to
+    // docked, confirm it lands. Also proves the redocking-side auto-advance
+    // sequence (in-flight → redocking → docked) works end-to-end under the
+    // new writer-side gate.
+    const doc = freshDoc();
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    writeFlightRecord({ status: 'redocking', locationId: HIGH_ORBIT.id });
+    writeFlightRecord({ status: 'docked', locationId: HIGH_ORBIT.id });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: HIGH_ORBIT.id });
+    doc.destroy();
+  });
+
+  it('writeFlightRecord treats a hostile current record as absent (heal, not stall)', () => {
+    // If a peer wrote junk to the map, the transition check would have no
+    // legal `from` state — the ship must be able to HEAL back to a well-formed
+    // state, not be permanently stalled. Verify by seeding junk, then writing
+    // a legal seed on top.
+    const doc = freshDoc();
+    hostileSetFlight(doc, { status: 'landed', locationId: HOME.id }); // shape-invalid
+    // Silence the shape guard on read (readFlightRecord defaults to home);
+    // the write path must accept a fresh seed even though the raw entry is
+    // present-but-invalid.
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    expect(readFlightRecord().status).toBe('in-flight');
+    doc.destroy();
+  });
+
+  it('writeFlightRecord accepts idempotent self-republish under contention', () => {
+    // The autoAdvance tick in devices.ts (in-flight → redocking) can fire on
+    // two commander helms simultaneously. The second writer sees the first's
+    // 'redocking' already published and its own 'redocking → redocking' write
+    // must land as a no-op republish, NOT be rejected.
+    const doc = freshDoc();
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    writeFlightRecord({ status: 'redocking', locationId: HIGH_ORBIT.id });
+    // Second commander races; second write is a self-republish.
+    writeFlightRecord({ status: 'redocking', locationId: HIGH_ORBIT.id });
+    expect(readFlightRecord()).toEqual({ status: 'redocking', locationId: HIGH_ORBIT.id });
+    doc.destroy();
   });
 });
 

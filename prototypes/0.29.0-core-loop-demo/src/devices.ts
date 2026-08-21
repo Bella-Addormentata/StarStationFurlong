@@ -1656,8 +1656,11 @@ function helmIsCommander(): boolean {
  *  refreshes the DOM, and drives the arrival transition when etaAt passes
  *  under the open panel (a client that never opened the helm still sees the
  *  transition — the state advance is a broadcast owner-write, and everyone's
- *  helm reads the same record). Idempotent under contention (whichever owner
- *  writes first, the second write's isLegalFlightTransition catches). */
+ *  helm reads the same record). Idempotent under contention: whichever owner
+ *  writes first, the second's writeFlightRecord reads the just-published
+ *  'redocking' current record and its 'redocking → redocking' self-transition
+ *  lands as a no-op republish (writeFlightRecord's isLegalFlightTransition
+ *  gate treats self-transitions as legal). */
 const HELM_TICK_MS = 250;
 
 /** Enumerate the room's PERMANENT chained doors — a paired berth that is
@@ -1710,12 +1713,18 @@ export function isShipReady(): boolean {
  * picker + DEPART button funneled through canDepart so the refusal reason is
  * SHOWN, and a live countdown + REDOCK button while a flight is under way.
  *
- * The state machine (docked → undocking → in-flight → redocking → docked) is
- * ENFORCED by isLegalFlightTransition at every writeFlightRecord edge — the UI
- * never advances the state directly. Arrival is READ-side (plan §2, item 3):
- * once now ≥ etaAt, every viewer draws "APPROACHING …" regardless of the
- * status field, and the owner's helm auto-advances the record to redocking on
- * the next tick.
+ * The flight state machine (docked → in-flight → redocking → docked on the
+ * SH3 fast path; the slow-path `undocking` beat is legalized but not produced
+ * by any writer in the shipped code — see shipDoc.ts's header diagram) is
+ * ENFORCED at write time: every writeFlightRecord call is gated by BOTH a
+ * shape guard AND isLegalFlightTransition against the current record (see
+ * shipDoc.ts:writeFlightRecord). The UI produces the desired NEXT record
+ * (docked → in-flight for DEPART, in-flight → redocking for auto-advance,
+ * redocking → docked for REDOCK); illegal edges are refused at the writer.
+ *
+ * Arrival is READ-side (plan §2, item 3): once now ≥ etaAt, every viewer
+ * draws "APPROACHING …" regardless of the status field, and the owner's helm
+ * auto-advances the record to redocking on the next tick.
  */
 export function createHelmUI(): DeviceUI {
   let panel: HTMLDivElement | null = null;
@@ -1940,9 +1949,12 @@ export function createHelmUI(): DeviceUI {
         // 2) Debit the fuel cost. clampFuelToCapacity keeps the write honest
         //    even if a peer wrote a higher-than-capacity value moments ago.
         writeFuelLevel(nowFuel - dest.fuelCost, tanks * TANK_CAPACITY);
-        // 3) Publish the flight record — sanitize + guard on the write side.
-        //    Skip `undocking` (a brief hand-off, no cross-doc coordination
-        //    needed) and go straight to in-flight for the SH3 first flight.
+        // 3) Publish the flight record — sanitize, shape-guard, AND
+        //    isLegalFlightTransition all fire on the write side (shipDoc.ts).
+        //    SH3 takes the FAST path (docked → in-flight; skip the reserved
+        //    `undocking` hand-off beat — no cross-doc coordination needed for
+        //    the first flight); the state machine legalizes both paths so a
+        //    future preflight-animation slice can restore `undocking` here.
         const start = Date.now();
         writeFlightRecord({
           status: 'in-flight',
@@ -1962,16 +1974,21 @@ export function createHelmUI(): DeviceUI {
         if (!helmIsCommander()) return;
         const rec = readFlightRecord();
         if (rec.status !== 'redocking') return;
-        if (!isLegalFlightTransition('redocking', 'docked')) return; // paranoid
+        // Redundant belt-and-braces: writeFlightRecord ALSO enforces the
+        // legal-transition table (see shipDoc.ts), so this early-out only
+        // saves the transact wrapper when a peer has just advanced past us.
+        if (!isLegalFlightTransition('redocking', 'docked')) return;
         writeFlightRecord({ status: 'docked', locationId: rec.locationId });
       });
     }
   };
 
   /** Owner-driven auto-transitions. Runs on every commander's helm; the
-   *  isLegalFlightTransition gate + the writer-clock etaAt make the race
-   *  benign (whichever commander writes first wins; the second observes
-   *  the new state on the next tick and skips). */
+   *  writeFlightRecord-side isLegalFlightTransition gate + the writer-clock
+   *  etaAt make the race benign — whichever commander writes 'redocking'
+   *  first wins, the second's write reads the fresh 'redocking' state and
+   *  the transition 'redocking → redocking' is legalized as an idempotent
+   *  self-transition (a no-op republish, not a duplicate advance). */
   const autoAdvance = (): void => {
     if (!panel) return;
     if (!helmIsCommander()) return;

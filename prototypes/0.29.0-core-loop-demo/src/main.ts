@@ -1186,11 +1186,15 @@ async function joinRoomAtEpoch(
 
   // 🚀 #30 SH2 + SH3: the ship's own doc (fuel level + flight state machine)
   // rides the room doc too. Rebinds per join RIGHT AFTER furniture — a helm
-  // that reads fuel truth must see the fresh doc BEFORE its subscribe fires,
-  // and the exterior-view flight branch must see docked/in-flight from the
-  // right doc. Fuel-tank capacity is DERIVED from furniture, so the two docs
-  // are consumed together in the helm UI; binding in this order guarantees
-  // both observers are installed before the first reconcile.
+  // that reads fuel truth must see the fresh doc BEFORE its subscribe fires
+  // (the helm's REFUEL/DEPART/REDOCK writers all read the CURRENT record
+  // through writeFlightRecord's transition gate, so a subscribe firing against
+  // the stale doc would refuse legal advances). Fuel-tank capacity is DERIVED
+  // from furniture, so the two docs are consumed together in the helm UI;
+  // binding shipDoc right after furniture guarantees both observers are
+  // installed before the first reconcile. (A future exterior-view flight
+  // branch will read this same doc — plan §7 SH4 — but no exterior code
+  // consumes shipDoc in the shipped SH3 slice.)
   bindShipDoc(sync.doc);
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
