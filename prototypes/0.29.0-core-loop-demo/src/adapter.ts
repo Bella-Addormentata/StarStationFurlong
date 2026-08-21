@@ -19,7 +19,11 @@
  */
 
 import * as THREE from "three";
-import { physicalDoorPose, poseFromWall } from "./doorLayout";
+import {
+  physicalDoorPose,
+  poseFromWall,
+  type DoorRecordsMap,
+} from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 
 /**
@@ -837,8 +841,16 @@ export function projectionPoseForDoor(
   segments?: ConnectorSegment[],
   farWall?: DoorWall | null,
   farLateral = 0,
+  // 🧭 #102 S0-prime: the NEAR room's records, so the pose the projection
+  // hangs off is the door's own room's — not whatever the doorLayout module
+  // global happens to be pointing at when this runs. The atlas hop and the
+  // return-leg mirror are exactly the two callers that reason about a room
+  // other than the currently-pushed one; they now pass their own layout in.
+  // Omitting keeps the pushed global as a floor for the single-room callers
+  // that never leave their own room.
+  nearLayout?: DoorRecordsMap,
 ): { x: number; z: number; rotY: number } {
-  const p = physicalDoorPose(doorId);
+  const p = physicalDoorPose(doorId, nearLayout);
   return projectionPoseFromWall(
     p.wall,
     p.tangent === "x" ? p.x : p.z,
@@ -899,10 +911,19 @@ export function projectionPoseFromWall(
     x: xr + Math.sin(heading) * ROOM_HALF,
     z: zr + Math.cos(heading) * ROOM_HALF,
   };
-  // Far room rotation: its far door faces BACK along the arrival heading.
+  // 🧭 #102 T1: far-room rotation. When the far wall is KNOWN, orient the
+  // module so its far door faces BACK along the arrival heading — the R2
+  // continuity that lets a viewer walk out of one wall and INTO another
+  // without a silent spin. When the far wall is UNKNOWN, the owner's ruling
+  // is ZERO rotation, not the chain heading: rotating the projected module by
+  // an arbitrary heading is a GUESS about how the far room is oriented, and
+  // the whole issue was that guesses on the seam publish as silent turns.
+  // The straight-gangway branch above already returns 0 on unknown far; the
+  // chain branch used to fall through to `heading`, which meant the two
+  // branches disagreed on the same "we do not know" state. They agree now.
   const rotY = farWall
     ? heading + Math.PI - poseFromWall(farWall, 0, 0).outwardYaw
-    : heading;
+    : 0;
   return farWall
     ? { ...shiftByFarLateral(centre, rotY, farWall, farLateral), rotY }
     : { ...centre, rotY };

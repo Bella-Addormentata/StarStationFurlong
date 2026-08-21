@@ -20,8 +20,9 @@
 import * as THREE from 'three';
 import { setExteriorActive } from './exteriorView';
 import { isDeviceFocusActive } from './deviceFocus';
-import { rotateIsoOffset } from './cameraRig';
+import { rotateIsoOffset, getCameraYaw } from './cameraRig';
 import { STAND_EYE_OFFSET } from './player';
+import { shouldPinSeatFaceOverride } from './zoomSeatPolicy';
 
 // Base (yaw-0) isometric offsets for the ortho levels — the camera rig
 // (cameraRig.ts) swings these around Y by the current 45°-detent azimuth,
@@ -125,6 +126,24 @@ export const ZOOM_LEVELS: ZoomScaleDef[] = [
 let yaw = 0;   // Left-Right rotation (radians)
 let pitch = 0; // Up-Down rotation (radians)
 let initializedMouseLookOffset = false;
+// 🧭 #102 T5: one-shot flag — requestFirstPerson set yaw from a SEAT face
+// override this frame, so zoomIn's rig-inherit seed must not clobber it.
+// Cleared inside zoomIn once consumed, so the next 2→1 (which was NOT from a
+// seat: a device-close, a plain '+' hotkey, a phone dismiss) inherits the
+// rig's yaw as designed.
+//
+// 🧭 T5 REMEDIATION (audit round 1): only ARM the flag when zoomIn will
+// actually consume it (currentLevel === 2). A sit-down that fires while
+// already at level 1 (world.ts:472-473 onSeatSettled → onFirstPersonSeat)
+// wrote yaw directly and set the flag with no zoomIn to clear it, so the
+// flag persisted across the eventual stand-up, zoom-out to 2, and rotated
+// transit — silently defeating the very next 2→1 rig-inherit seed and
+// re-opening the R2 continuity gap this flag exists to close. The pure
+// arming predicate and its regression test live in ./zoomSeatPolicy — kept
+// out of this file so a Node-side test can import the predicate without
+// pulling in three.js and window.
+let seatFaceOverride = false;
+
 let perspectiveCamera: THREE.PerspectiveCamera | null = null;
 let orthographicCamera: THREE.OrthographicCamera | null = null;
 
@@ -390,12 +409,31 @@ export class MultiScaleZoomView {
     return this.currentLevel;
   }
 
-  /** Enter level-1 first person from the normal room view, facing the seat. */
+  /** Enter level-1 first person from the normal room view, facing the seat.
+   *  🧭 #102 T5: `faceAngle` is the SEAT's world-facing when the entry came
+   *  from sitting down. When absent (a device-close, a phone dismiss) the
+   *  entry inherits the camera rig's current yaw — see zoomIn's yaw seed for
+   *  why this is what preserves R2 continuity across a rotated transit.
+   *
+   *  🧭 T5 REMEDIATION (audit round 1): the seatFaceOverride flag is armed
+   *  ONLY when a 2→1 zoomIn is about to run — its sole consumer. Arming it
+   *  at currentLevel === 1 (a seat entered from inside first person, via
+   *  world.ts:472-473 onSeatSettled → onFirstPersonSeat) would leave a stale
+   *  flag across the eventual stand-up, zoom-out to 2, and rotated transit,
+   *  silently skipping the next dive's rig-inherit seed. See
+   *  shouldPinSeatFaceOverride() and its regression test. */
   public requestFirstPerson(faceAngle?: number): void {
     if ((this.currentLevel !== 1 && this.currentLevel !== 2) || isDeviceFocusActive()) return;
     if (faceAngle !== undefined) {
       yaw = faceAngle;
       pitch = 0;
+      // Pin the seat's face angle through zoomIn's rig-inherit seed —
+      // ONLY when zoomIn will actually run this frame (level 2 caller).
+      // At level 1, the yaw write above is the whole update; arming the
+      // flag here would strand it (see audit-round-1 note above).
+      if (shouldPinSeatFaceOverride(this.currentLevel, faceAngle)) {
+        seatFaceOverride = true;
+      }
     }
     if (this.currentLevel === 2) this.zoomIn();
   }
@@ -474,12 +512,27 @@ export class MultiScaleZoomView {
     if (isDeviceFocusActive()) return;
     if (this.currentLevel > 1) {
       if (this.currentLevel === 2) {
+        // 🧭 #102 T5: seed the first-person yaw from the CAMERA RIG on the
+        // 2→1 handoff — the rig's `targetYaw + stationBias` is the pose the
+        // player just saw in the room view. Without this, the module-level
+        // `yaw` retains its pre-transit value; a dive-and-return after a
+        // rotated transit would un-rotate the bias silently (R2 violation)
+        // and the on-screen "forward" would jump. Skipped when a SEAT face
+        // override was published by requestFirstPerson this frame — a seat's
+        // world facing is the authority for its own dive-in. The flag is a
+        // one-shot: cleared on consume, so the next 2→1 (device-close, plain
+        // '+' key, phone dismiss) inherits the rig's yaw as designed.
+        if (!seatFaceOverride) {
+          yaw = getCameraYaw();
+          pitch = 0;
+        }
+        seatFaceOverride = false;
         // Trigger smooth trajectory transition to Level 1 (First Person) from current camera position
         const { camera } = window.gameRenderer;
         if (camera) {
           isTransitioningFirstPerson = true;
           transitionProgress = 0.0;
-          
+
           // Orthographic cameras don't have standard positions that match perspective coordinates due to parallel lines,
           // but we can generate an identical apparent starting point of the elevated three-quarter room view: (22, 26, 22)
           // swung to the camera rig's current 45°-detent azimuth (cameraRig.ts).

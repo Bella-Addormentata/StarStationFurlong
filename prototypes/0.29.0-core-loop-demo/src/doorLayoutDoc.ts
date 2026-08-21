@@ -472,6 +472,29 @@ export function seedDoorLayoutEmpty(): void {
   markDoorSetAuthoritative();
 }
 
+/**
+ * 🧭 #102 R2 (audit round 1): the arrival-layout selection extracted from
+ * `world.completeAdapterArrival`, so the doc-read gating is unit-testable
+ * end-to-end from a bound doc. The rule the arrival hook uses:
+ *
+ *   - stored records present   ⇒ use them (the room's authored door set).
+ *   - stored empty + marked    ⇒ still use them (authoritative-empty; the
+ *                                arrival room legitimately has no doors, and
+ *                                the walk-in bail in completeAdapterArrival
+ *                                covers the empty case).
+ *   - stored empty + unmarked  ⇒ fall back to the four cardinal defaults
+ *                                (an un-migrated room's implicit door set).
+ *
+ * Extracted (not inlined) so a future re-wiring of the arrival hook can be
+ * caught by orientedTransit.test.ts even when the primitives still pass —
+ * the whole point of round 1's H2b harness.
+ */
+export function selectArrivalDoorLayout(): Map<string, DoorLayoutRecord> {
+  const stored = readAllDoorLayout();
+  if (stored.size > 0 || doorSetIsAuthoritative()) return stored;
+  return defaultDoorLayoutRecords();
+}
+
 /** Cheap membership test — no snapshot, no allocation. Some callers ask this
  *  per door per FRAME (the first-person auto-door pass reaches it through
  *  canPass → readDoorPolicy), so they must not build a whole Map to find out. */
