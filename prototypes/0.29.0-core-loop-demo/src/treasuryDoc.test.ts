@@ -121,6 +121,23 @@ function makeVote(
   return { ...unsigned, voteId, gameSig: sign(seed, voteSignatureBytes(GENESIS, voteId)) };
 }
 
+/** Walks every page by cursor, the way the screens do, and returns all ids. */
+function walkPages<T>(
+  scan: (after: string | null) => { items: T[]; nextCursor: string | null },
+  id: (item: T) => string,
+): string[] {
+  const seen: string[] = [];
+  let after: string | null = null;
+  // Bounded so a cursor that fails to advance fails the test rather than hangs.
+  for (let guard = 0; guard < 200; guard += 1) {
+    const page = scan(after);
+    seen.push(...page.items.map(id));
+    if (page.nextCursor === null) return seen;
+    after = page.nextCursor;
+  }
+  throw new Error('cursor never reached the end — it is not advancing');
+}
+
 let doc: Y.Doc;
 
 beforeEach(() => {
@@ -189,10 +206,10 @@ describe('proposals', () => {
     expect(all.matched).toBe(13); // 12 planted + 1 honest, all pageable
     expect(all.truncated).toBe(true); // a page was shown, not everything
     // Walking the pages reaches the honest record wherever it sorted.
-    const seen: string[] = [];
-    for (let offset = 0; offset < all.matched; offset += 4) {
-      seen.push(...scanProposals(50_000, 4, offset).items.map((x) => x.proposalId));
-    }
+    const seen = walkPages(
+      (after) => scanProposals(50_000, 4, after),
+      (x) => x.proposalId,
+    );
     expect(seen).toContain(p.proposalId);
     // The one horizon still exists, and says so when it is hit.
     const starved = scanProposals(3, 99);
@@ -241,25 +258,64 @@ describe('proposals', () => {
     for (let i = 0; i < 8; i += 1) {
       m.set(`proposal:0${i.toString().padStart(63, '0')}`, { junk: i });
     }
-    const first = scanProposals(500, 4, 0);
+    const first = scanProposals(500, 4, null);
     expect(first.items).toEqual([]); // buried
     expect(first.truncated).toBe(true);
     expect(first.matched).toBe(9);
-    expect(first.offset).toBe(0);
+    expect(first.cursor).toBeNull();
     // ...but reachable. Walk the pages until the honest record turns up.
-    const seen: string[] = [];
-    for (let offset = 0; offset < first.matched; offset += 4) {
-      seen.push(...scanProposals(500, 4, offset).items.map((p) => p.proposalId));
-    }
+    const seen = walkPages((after) => scanProposals(500, 4, after), (p) => p.proposalId);
     expect(seen).toContain(real.proposalId);
-    // The offset is clamped to what matched, so an over-run page is empty
-    // rather than throwing, and reports where it actually landed.
-    const past = scanProposals(500, 4, 999);
+    // A cursor past every key is empty rather than throwing, and ends paging.
+    const past = scanProposals(500, 4, 'proposal:~');
     expect(past.items).toEqual([]);
-    expect(past.offset).toBe(9);
-    // A page is deterministic: same offset, same records, across repaints.
-    expect(scanProposals(500, 4, 4).items.map((p) => p.proposalId))
-      .toEqual(scanProposals(500, 4, 4).items.map((p) => p.proposalId));
+    expect(past.nextCursor).toBeNull();
+    // A page is deterministic: same cursor, same records, across repaints.
+    expect(scanProposals(500, 4, first.nextCursor).items.map((p) => p.proposalId))
+      .toEqual(scanProposals(500, 4, first.nextCursor).items.map((p) => p.proposalId));
+  });
+
+  it('cannot be walked backwards by a peer inserting keys behind the cursor', () => {
+    // The attack an INDEX-based page loses to: after every "next", insert a
+    // page of keys before the reader's position. The genuine record shifts
+    // forward by exactly as much as the reader advanced, so paging never
+    // arrives — the guarantee paging exists to provide, defeated by the writer.
+    //
+    // A cursor is a KEY. "Everything after this key" cannot be pushed forward
+    // by adding more keys before it, so forward paging always makes progress.
+    const m = doc.getMap('treasury');
+    const real = makeProposal({ payloadHash: 'e'.repeat(64) });
+    expect(putProposal(real)).toBe(true);
+    let planted = 1000;
+    const prependOnePage = () => {
+      // Each batch sorts BEFORE every key planted so far — the reviewer's
+      // attack exactly: keys inserted behind the reader's position, which an
+      // index-based page treats as "everything shifted forward by four".
+      for (let i = 0; i < 4; i += 1) {
+        planted -= 1;
+        m.set(`proposal:0${planted.toString().padStart(63, '0')}`, { junk: planted });
+      }
+    };
+    prependOnePage();
+    const seen: string[] = [];
+    const cursors: (string | null)[] = [null];
+    let after: string | null = null;
+    for (let step = 0; step < 12; step += 1) {
+      const page = scanProposals(50_000, 4, after);
+      seen.push(...page.items.map((p) => p.proposalId));
+      if (page.nextCursor === null) break;
+      after = page.nextCursor;
+      cursors.push(after);
+      prependOnePage(); // the peer writes again between every repaint
+    }
+    // Reached, despite a page of keys landing behind the reader every step.
+    expect(seen).toContain(real.proposalId);
+    // And the cursor only ever moved FORWARD — an index would have been walked
+    // backwards by four each time, which is how the same attack defeats it.
+    const advanced = cursors.filter((c): c is string => c !== null);
+    for (let i = 1; i < advanced.length; i += 1) {
+      expect(advanced[i] > advanced[i - 1]).toBe(true);
+    }
   });
 
   it('round-trips a signed proposal and lists it', () => {
@@ -683,7 +739,9 @@ describe('network pinning', () => {
       refusedTooLarge: 0,
       rejected: 0,
       matched: 0,
-      offset: 0,
+      cursor: null,
+      startIndex: 0,
+      nextCursor: null,
     });
     expect(readPolicyCache()).toBeNull();
     // The sync entry carries no genesis of its own, so this is the only place
@@ -805,22 +863,22 @@ describe('verification caching', () => {
     for (let i = 0; i < 6; i += 1) {
       m.set(`vote:${p.proposalId}:0${i.toString().padStart(63, '0')}`, { junk: i });
     }
-    const seen: string[] = [];
-    const first = scanVotes(p.proposalId, 50_000, 3, 0);
-    for (let offset = 0; offset < first.matched; offset += 3) {
-      seen.push(...scanVotes(p.proposalId, 50_000, 3, offset).items.map((v) => v.voteId));
-    }
+    const seen = walkPages(
+      (after) => scanVotes(p.proposalId, 50_000, 3, after),
+      (v) => v.voteId,
+    );
     expect(seen).toContain(real.voteId);
-    // A NON-ZERO offset is itself a partial view: the last page omits every
-    // earlier one, so clearing the flag there would let a page-sized subset
+    // A page reached BY CURSOR is a partial view in its own right: it omits
+    // every earlier page, so clearing the flag would let a page-sized subset
     // read as the whole cache.
-    const lastPage = scanVotes(p.proposalId, 50_000, 3, 6);
-    expect(lastPage.offset).toBe(6);
+    const firstPage = scanVotes(p.proposalId, 50_000, 3, null);
+    const lastPage = scanVotes(p.proposalId, 50_000, 3, firstPage.nextCursor);
+    expect(lastPage.cursor).toBe(firstPage.nextCursor);
     expect(lastPage.truncated).toBe(true);
-    // Page zero covering everything is the only complete answer.
-    expect(scanVotes(p.proposalId, 50_000, 50_000, 0).truncated).toBe(false);
-    // Checkpoints take an offset on the same terms.
-    expect(scanCheckpoints(p.proposalId, 50_000, 3, 0).offset).toBe(0);
+    // One page covering everything is the only complete answer.
+    expect(scanVotes(p.proposalId, 50_000, 50_000, null).truncated).toBe(false);
+    // Checkpoints take a cursor on the same terms.
+    expect(scanCheckpoints(p.proposalId, 50_000, 3, null).cursor).toBeNull();
   });
 
   it('counts rejected records, so a page of forgeries is not "none held"', () => {
@@ -879,7 +937,7 @@ describe('verification caching', () => {
         sig: 'noise',
       });
     }
-    const scan = scanSigningSessions(session.proposalId, 50, 10, 0);
+    const scan = scanSigningSessions(session.proposalId, 50, 10, null);
     expect(scan.items).toHaveLength(1);
     expect(scan.items[0].collectedSigs).toEqual(session.collectedSigs);
   });
@@ -911,19 +969,18 @@ describe('verification caching', () => {
       const id = signingSessionIdOf(decoy);
       m.set(`session:${proposalId}:${id}`, { ...decoy, sessionId: id, collectedSigs: [] });
     }
-    const first = scanSigningSessions(proposalId, 50_000, 3, 0);
+    const first = scanSigningSessions(proposalId, 50_000, 3, null);
     expect(first.matched).toBe(9);
     expect(first.truncated).toBe(true);
-    const seen: string[] = [];
-    for (let offset = 0; offset < first.matched; offset += 3) {
-      seen.push(...scanSigningSessions(proposalId, 50_000, 3, offset).items.map((s) => s.sessionId));
-    }
+    const seen = walkPages(
+      (after) => scanSigningSessions(proposalId, 50_000, 3, after),
+      (s) => s.sessionId,
+    );
     expect(seen).toContain(realId);
-    // Over-running the end reports where it landed rather than throwing, so
-    // the screen can snap back to the last page that holds something.
-    const past = scanSigningSessions(proposalId, 50_000, 3, 999);
+    // A cursor past every shell key ends paging rather than throwing.
+    const past = scanSigningSessions(proposalId, 50_000, 3, `session:${proposalId}:~`);
     expect(past.items).toEqual([]);
-    expect(past.offset).toBe(9);
+    expect(past.nextCursor).toBeNull();
   });
 
   it('caps one round’s signatures and says the set is partial', () => {
@@ -951,7 +1008,7 @@ describe('verification caching', () => {
       const signer = i.toString(16).padStart(64, '0');
       m.set(`sessionsig:${sessionId}:${signer}`, { signerPuzzleHash: signer, sig: `s${i}` });
     }
-    const scan = scanSigningSessions(shell.proposalId, 50_000, 10, 0);
+    const scan = scanSigningSessions(shell.proposalId, 50_000, 10, null);
     expect(scan.items).toHaveLength(1);
     expect(scan.items[0].collectedSigs.length).toBeLessThanOrEqual(256);
     // Flagged BY SESSION, so a caveat lands on the round it belongs to
@@ -965,7 +1022,7 @@ describe('verification caching', () => {
       sessionId,
       collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
     })).toBe(true);
-    expect(scanSigningSessions(shell.proposalId, 50_000, 10, 0).partialSessionIds).toEqual([]);
+    expect(scanSigningSessions(shell.proposalId, 50_000, 10, null).partialSessionIds).toEqual([]);
   });
 
   it('survives a value nested deeper than the call stack', () => {
@@ -1017,22 +1074,25 @@ describe('verification caching', () => {
       const id = signingSessionIdOf(decoy);
       m.set(`session:${decoy.proposalId}:${id}`, { ...decoy, sessionId: id, collectedSigs: [] });
     }
-    const found: string[] = [];
-    let offset = 0;
-    let matched = Number.POSITIVE_INFINITY;
-    while (offset < matched) {
-      const pageScan = scanSigningSessions(realSession.proposalId, 500, 3, offset);
-      matched = pageScan.matched;
-      found.push(...pageScan.items.map((s) => s.sessionId));
-      offset += 3;
-    }
+    const found = walkPages(
+      (after) => scanSigningSessions(realSession.proposalId, 500, 3, after),
+      (s) => s.sessionId,
+    );
     expect(found).toContain(realSession.sessionId);
     // And its signatures travel with it, whichever page it landed on.
-    for (let o = 0; o < matched; o += 3) {
-      const hit = scanSigningSessions(realSession.proposalId, 500, 3, o).items
-        .find((s) => s.sessionId === realSession.sessionId);
-      if (hit) expect(hit.collectedSigs).toEqual(realSession.collectedSigs);
+    let after: string | null = null;
+    let checked = false;
+    for (let guard = 0; guard < 20; guard += 1) {
+      const pageScan = scanSigningSessions(realSession.proposalId, 500, 3, after);
+      const hit = pageScan.items.find((s) => s.sessionId === realSession.sessionId);
+      if (hit) {
+        expect(hit.collectedSigs).toEqual(realSession.collectedSigs);
+        checked = true;
+      }
+      if (pageScan.nextCursor === null) break;
+      after = pageScan.nextCursor;
     }
+    expect(checked, 'the real round never appeared on any page').toBe(true);
   });
 
   it('survives a peer storing binary in a treasury slot', () => {

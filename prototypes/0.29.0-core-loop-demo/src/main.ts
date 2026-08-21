@@ -2820,7 +2820,33 @@ let treasuryDetailId = "";
  * a check too — could hide every real proposal permanently. Paging is what
  * makes the bound survivable rather than exploitable.
  */
-let treasuryListOffset = 0;
+let treasuryListCursors: (string | null)[] = [null];
+
+/**
+ * The `nextCursor` each paged scan handed back on the last repaint.
+ *
+ * The click handler runs BEFORE the repaint that would recompute them, so it
+ * needs the value from the render it is reacting to — which is exactly the
+ * page the player was looking at when they pressed the control.
+ */
+let lastListNext: string | null = null;
+let lastVoteNext: string | null = null;
+let lastApprovalNext: string | null = null;
+
+/**
+ * "3–10 of 42" for one scan's page — descriptive only.
+ *
+ * startIndex is a position in a list a peer can prepend to, so it is fine for
+ * wording and useless for navigation; the cursor does the navigating.
+ */
+function pageRange(
+  scan: { matched: number; startIndex: number; items: unknown[] },
+  size: number,
+): string {
+  if (scan.matched === 0) return "none held";
+  const shown = Math.min(size, scan.matched - scan.startIndex);
+  return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${scan.matched}`;
+}
 
 /**
  * Where the open proposal's approval rounds are paged to.
@@ -2832,7 +2858,7 @@ let treasuryListOffset = 0;
  * was permanently invisible. Reset whenever a different proposal is opened,
  * or a page number from one proposal would carry over to another.
  */
-let treasuryApprovalOffset = 0;
+let treasuryApprovalCursors: (string | null)[] = [null];
 
 /**
  * Where the open proposal's vote and vote-record scans are paged to.
@@ -2845,7 +2871,7 @@ let treasuryApprovalOffset = 0;
  * into a single tally and advancing them apart would make the figures answer
  * different questions.
  */
-let treasuryVoteOffset = 0;
+let treasuryVoteCursors: (string | null)[] = [null];
 
 /**
  * How many records one repaint may VERIFY, as opposed to walk past.
@@ -2999,24 +3025,27 @@ function wireTreasuryView(view: HTMLElement): void {
       if (action === "open") {
         treasuryDetailId = el.dataset.proposalId ?? "";
         // Page numbers are per proposal.
-        treasuryApprovalOffset = 0;
-        treasuryVoteOffset = 0;
+        treasuryApprovalCursors = [null];
+        treasuryVoteCursors = [null];
       }
       if (action === "back") treasuryDetailId = "";
-      if (action === "rounds-next") treasuryApprovalOffset += DETAIL_PAGE;
-      if (action === "rounds-prev") {
-        treasuryApprovalOffset = Math.max(0, treasuryApprovalOffset - DETAIL_PAGE);
-      }
-      if (action === "votes-next") treasuryVoteOffset += DETAIL_PAGE;
-      if (action === "votes-prev") {
-        treasuryVoteOffset = Math.max(0, treasuryVoteOffset - DETAIL_PAGE);
-      }
-      // Paging is clamped by the scan itself against what actually matched,
-      // so a page that empties out between repaints cannot strand anyone.
-      if (action === "page-next") treasuryListOffset += LIST_CHECKS;
-      if (action === "page-prev") {
-        treasuryListOffset = Math.max(0, treasuryListOffset - LIST_CHECKS);
-      }
+      // Forward pushes the cursor the scan just handed back; back pops to the
+      // one before. A stack rather than arithmetic because a cursor is a KEY,
+      // not a position — which is the point: a position can be pushed forward
+      // indefinitely by a peer prepending records between repaints, and a
+      // "next" that never arrives is not paging.
+      const pageForward = (stack: (string | null)[], next: string | null) => {
+        if (next !== null) stack.push(next);
+      };
+      const pageBack = (stack: (string | null)[]) => {
+        if (stack.length > 1) stack.pop();
+      };
+      if (action === "rounds-next") pageForward(treasuryApprovalCursors, lastApprovalNext);
+      if (action === "rounds-prev") pageBack(treasuryApprovalCursors);
+      if (action === "votes-next") pageForward(treasuryVoteCursors, lastVoteNext);
+      if (action === "votes-prev") pageBack(treasuryVoteCursors);
+      if (action === "page-next") pageForward(treasuryListCursors, lastListNext);
+      if (action === "page-prev") pageBack(treasuryListCursors);
       // renderTreasuryApp preserves focus across the repaint for us.
       renderTreasuryApp();
       return true;
@@ -3252,58 +3281,28 @@ function paintTreasuryBody(view: HTMLElement): void {
     // Paged, like the proposal list and the approval rounds. These keys are
     // peer-writable too, so without a way through, decoys sorted ahead of the
     // genuine records hid them for good.
-    let voteScan = scanVotes(
-      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
+    // Each scan carries its OWN cursor. They were sharing one, which made the
+    // two ranges answer different questions while being reported as one — and
+    // a cursor is a key from a particular key space, so sharing it across two
+    // prefixes was meaningless as well as wrong.
+    const voteCursor = treasuryVoteCursors[treasuryVoteCursors.length - 1];
+    const voteScan = scanVotes(
+      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, voteCursor,
     );
-    let cpScan = scanCheckpoints(
-      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
+    const cpScan = scanCheckpoints(
+      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, voteCursor,
     );
-    // One offset drives both, so it is clamped against whichever set is
-    // longer — otherwise paging would stop at the shorter one and strand the
-    // rest of the other.
-    const voteMatched = Math.max(voteScan.matched, cpScan.matched);
-    if (treasuryVoteOffset >= voteMatched && voteMatched > 0) {
-      treasuryVoteOffset = Math.max(
-        0,
-        (Math.ceil(voteMatched / DETAIL_PAGE) - 1) * DETAIL_PAGE,
-      );
-      voteScan = scanVotes(
-        proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
-      );
-      cpScan = scanCheckpoints(
-        proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
-      );
-    }
+    lastVoteNext = voteScan.nextCursor ?? cpScan.nextCursor;
     // Paged, for the same reason the proposal list is: shells are unsigned and
     // peer-writable, so decoys sorted ahead of the genuine round would
     // otherwise put it permanently out of reach.
-    let sessionScan = scanSigningSessions(
+    const sessionScan = scanSigningSessions(
       proposal.proposalId,
       DETAIL_SCAN,
       DETAIL_PAGE,
-      treasuryApprovalOffset,
+      treasuryApprovalCursors[treasuryApprovalCursors.length - 1],
     );
-    // Same stranding guard as the list: a page that empties out between
-    // repaints lands on the last page that still holds something.
-    if (
-      sessionScan.items.length === 0 &&
-      sessionScan.matched > 0 &&
-      sessionScan.offset >= sessionScan.matched
-    ) {
-      treasuryApprovalOffset = Math.max(
-        0,
-        (Math.ceil(sessionScan.matched / DETAIL_PAGE) - 1) * DETAIL_PAGE,
-      );
-      sessionScan = scanSigningSessions(
-        proposal.proposalId,
-        DETAIL_SCAN,
-        DETAIL_PAGE,
-        treasuryApprovalOffset,
-      );
-    }
-    if (sessionScan.offset !== treasuryApprovalOffset) {
-      treasuryApprovalOffset = sessionScan.offset;
-    }
+    lastApprovalNext = sessionScan.nextCursor;
     // Only the two scans that FEED the vote panel. Including the approval scan
     // made a proposal with many approval rounds tell the VOTES panel its own
     // figures were partial when they were complete — and approval truncation
@@ -3400,19 +3399,23 @@ function paintTreasuryBody(view: HTMLElement): void {
         // Reachability for the tally too. Without it the partial warning above
         // told the player their figures were incomplete and gave them no way
         // to see the rest — the same hole the list and the rounds had.
-        voteMatched > DETAIL_PAGE
+        // TWO ranges, reported separately. These are different key spaces
+        // scanned to different depths, so one range against the larger of the
+        // two described neither: 8 votes plus 8 vote records rendered 16
+        // inputs while claiming "records 1–8 of 8".
+        voteScan.matched > DETAIL_PAGE || cpScan.matched > DETAIL_PAGE
           ? `${dim(
-              `These figures cover records ${treasuryVoteOffset + 1}–${treasuryVoteOffset + Math.min(DETAIL_PAGE, voteMatched - treasuryVoteOffset)} of the ${voteMatched} held under this proposal's vote keys. Only this page was read.`,
+              `Votes: ${pageRange(voteScan, DETAIL_PAGE)}. Vote records: ${pageRange(cpScan, DETAIL_PAGE)}. Only these pages were read.`,
             )}
             <div style="display:flex; gap:6px; margin-top:6px;">
               ${
-                treasuryVoteOffset > 0
+                treasuryVoteCursors.length > 1
                   ? `<div data-treasury-action="votes-prev" role="button" tabindex="0" aria-label="Previous page of vote records"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
                   : ""
               }
               ${
-                treasuryVoteOffset + DETAIL_PAGE < voteMatched
+                lastVoteNext !== null
                   ? `<div data-treasury-action="votes-next" role="button" tabindex="0" aria-label="Next page of vote records"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                   : ""
@@ -3463,17 +3466,17 @@ function paintTreasuryBody(view: HTMLElement): void {
         // could be hidden for good — the same hole the proposal list had.
         sessionScan.matched > DETAIL_PAGE
           ? `${dim(
-              `Showing rounds ${sessionScan.offset + 1}–${sessionScan.offset + Math.min(DETAIL_PAGE, sessionScan.matched - sessionScan.offset)} of ${sessionScan.matched} held under this proposal's approval keys. Only this page was read.`,
+              `Showing rounds ${pageRange(sessionScan, DETAIL_PAGE)} held under this proposal's approval keys. Only this page was read.`,
             )}
             <div style="display:flex; gap:6px; margin-top:6px;">
               ${
-                sessionScan.offset > 0
+                treasuryApprovalCursors.length > 1
                   ? `<div data-treasury-action="rounds-prev" role="button" tabindex="0" aria-label="Previous page of approval rounds"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
                   : ""
               }
               ${
-                sessionScan.offset + DETAIL_PAGE < sessionScan.matched
+                lastApprovalNext !== null
                   ? `<div data-treasury-action="rounds-next" role="button" tabindex="0" aria-label="Next page of approval rounds"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                   : ""
@@ -3544,24 +3547,24 @@ function paintTreasuryBody(view: HTMLElement): void {
   // LIST_SCAN is a runaway stop on the walk, deliberately far above any real
   // room: a page-sized value there is a horizon, and paging cannot cross one.
   const LIST_SCAN = 50_000;
-  // Paged, not merely capped. A cap alone let a peer bury every real proposal
-  // behind two dozen pieces of junk with no way to look past them — see
-  // scanPrefixed. The offset is clamped to what actually matched, so records
-  // arriving or leaving cannot strand the player on an empty page.
-  let page = scanProposals(LIST_SCAN, LIST_CHECKS, treasuryListOffset);
-  // Clamping alone still stranded the player. If page two was open and the
-  // record count then dropped below one page, the offset clamped to `matched`
-  // — a valid index, but one past the last record — so the screen showed no
-  // rows AND hid the paging controls, because there was no longer more than
-  // one page. Land on the last page that actually holds something.
-  if (page.items.length === 0 && page.matched > 0 && page.offset >= page.matched) {
-    treasuryListOffset = Math.max(
-      0,
-      (Math.ceil(page.matched / LIST_CHECKS) - 1) * LIST_CHECKS,
+  // Paged by CURSOR, not merely capped and not by index. A cap alone let a
+  // peer bury every real proposal behind two dozen pieces of junk with no way
+  // to look past them; an index-based page then let the same peer prepend a
+  // page of keys after every "next", pushing the genuine record forward as
+  // fast as the reader advanced — see scanPrefixed.
+  let page = scanProposals(
+    LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
+  );
+  // A cursor cannot outrun the list, but records LEAVING can still empty the
+  // page under it. Walk the stack back to the last page that holds something
+  // rather than leaving the screen blank with its controls hidden.
+  while (page.items.length === 0 && page.matched > 0 && treasuryListCursors.length > 1) {
+    treasuryListCursors.pop();
+    page = scanProposals(
+      LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
     );
-    page = scanProposals(LIST_SCAN, LIST_CHECKS, treasuryListOffset);
   }
-  if (page.offset !== treasuryListOffset) treasuryListOffset = page.offset;
+  lastListNext = page.nextCursor;
   const truncated = page.truncated;
   const scoped = scopeProposals(page.items, scope.companyId);
   const rows = proposalRows(
@@ -3772,7 +3775,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       // junk flood enough to hide every real proposal.
       page.matched > LIST_CHECKS
         ? `${dim(
-            `Showing records ${page.offset + 1}–${page.offset + Math.min(LIST_CHECKS, page.matched - page.offset)} of ${page.matched} held under this room's proposal keys. Only this page was read.`,
+            `Showing records ${pageRange(page, LIST_CHECKS)} held under this room's proposal keys. Only this page was read.`,
           )}
           <div style="display:flex; gap:6px; margin-top:6px;">
             ${
@@ -3782,13 +3785,13 @@ function paintTreasuryBody(view: HTMLElement): void {
               // chronology this ordering does not have. Rows WITHIN a page are
               // sorted by acceptance height; across pages there is no time
               // order at all.
-              page.offset > 0
+              treasuryListCursors.length > 1
                 ? `<div data-treasury-action="page-prev" role="button" tabindex="0" aria-label="Previous page of proposals"
                      style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
                 : ""
             }
             ${
-              page.offset + LIST_CHECKS < page.matched
+              lastListNext !== null
                 ? `<div data-treasury-action="page-next" role="button" tabindex="0" aria-label="Next page of proposals"
                      style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                 : ""

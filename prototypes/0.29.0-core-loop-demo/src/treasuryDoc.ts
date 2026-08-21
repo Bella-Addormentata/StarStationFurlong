@@ -604,8 +604,33 @@ export interface BoundedScan<T> {
   rejected: number;
   /** Matching keys found within the traversal budget, before verification. */
   matched: number;
-  /** Where this page started in that list. */
-  offset: number;
+  /**
+   * The cursor this page started AFTER — the caller's own input, echoed back.
+   *
+   * A cursor rather than an index because an index is not stable against a
+   * hostile writer: the key list is rebuilt every repaint, so a peer inserting
+   * one page of keys BEFORE the offset after each "next" shifts the genuine
+   * record forward by exactly as much as the reader advances, and it is never
+   * reached. Paging existed to make records reachable, and an index-based one
+   * could be walked backwards indefinitely by the writer.
+   *
+   * Keys sort lexicographically and are content-derived, so "everything after
+   * this key" cannot be pushed forward by inserting more keys before it.
+   * Forward paging therefore always makes progress.
+   *
+   * PROGRESS, not arrival — the honest limit. A writer who cannot walk the
+   * reader backwards can still insert keys BETWEEN the cursor and a target,
+   * and by grinding ids into that range as fast as the reader pages, keep the
+   * target ahead of it. What the cursor buys is that ground already covered
+   * stays covered, which an index does not. Closing the remaining gap needs
+   * ordering the reader controls — the per-class index scanPrefixed's comment
+   * describes — not a better page pointer.
+   */
+  cursor: string | null;
+  /** Position of this page's first key, for wording only — never for paging. */
+  startIndex: number;
+  /** Pass as the next `after` to advance; null when this page is the last. */
+  nextCursor: string | null;
 }
 
 /**
@@ -632,12 +657,14 @@ function scanPrefixed<T>(
   take: (key: string, value: unknown) => T | null,
   /** Optional: lets a caller count entries refused on size alone. */
   verdictOf?: (value: unknown) => RecordVerdict,
-  offset = 0,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
 ): BoundedScan<T> {
   const m = readMap();
   if (!m) {
     return {
-      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0, offset: 0,
+      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0,
+      cursor: after, startIndex: 0, nextCursor: null,
     };
   }
   // Pass one: which keys match, within ONE budget on keys examined.
@@ -669,15 +696,22 @@ function scanPrefixed<T>(
     if (key.startsWith(prefix)) keys.push(key);
   }
   keys.sort();
-  const start = Math.max(0, Math.min(offset, keys.length));
-  const page = keys.slice(start, start + Math.max(0, maxChecks));
+  // Page forward from the CURSOR, not from an index. An index is rebuilt
+  // against a list a peer can prepend to, so inserting a page of keys before
+  // it after each "next" pushes the genuine record forward exactly as fast as
+  // the reader advances — paging that never arrives. "Everything after this
+  // key" cannot be moved that way.
+  const start = after === null ? 0 : keys.findIndex((k) => k > after);
+  const from = start < 0 ? keys.length : start;
+  const page = keys.slice(from, from + Math.max(0, maxChecks));
+  const hasMore = from + page.length < keys.length;
   // Anything the page does not cover is still there to be paged to, and the
   // caller is told so rather than being left to assume it saw everything.
-  // start > 0 counts too: the LAST page omits every earlier one, so
+  // A non-zero start counts too: the LAST page omits every earlier one, so
   // clearing the flag there would let a page-sized subset be read as the
   // whole cache — the same partial-answer-as-total mistake the removed
   // wrappers made.
-  if (start > 0 || start + page.length < keys.length) truncated = true;
+  if (from > 0 || hasMore) truncated = true;
   // Pass two: verify only this page. THIS is the expensive half.
   const items: T[] = [];
   let refusedTooLarge = 0;
@@ -693,15 +727,22 @@ function scanPrefixed<T>(
     else if (verdict !== 'too-large') rejected += 1;
   }
   return {
-    items, truncated, refusedTooLarge, rejected, matched: keys.length, offset: start,
+    items,
+    truncated,
+    refusedTooLarge,
+    rejected,
+    matched: keys.length,
+    cursor: after,
+    startIndex: from,
+    nextCursor: hasMore && page.length > 0 ? page[page.length - 1] : null,
   };
 }
 
 export function scanProposals(
   maxEntries: number,
   maxChecks: number,
-  /** Where to start in the sorted matching keys — see scanPrefixed. */
-  offset = 0,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
 ): BoundedScan<TreasuryProposal> {
   return scanPrefixed(
     'proposal:',
@@ -710,7 +751,7 @@ export function scanProposals(
     (key, value) =>
       validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
     proposalVerdict,
-    offset,
+    after,
   );
 }
 
@@ -718,8 +759,8 @@ export function scanVotes(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
-  /** Where to start in the sorted matching keys — see scanPrefixed. */
-  offset = 0,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
 ): BoundedScan<TreasuryVote> {
   const prefix = `vote:${proposalId}:`;
   return scanPrefixed(
@@ -731,7 +772,7 @@ export function scanVotes(
         ? value
         : null,
     voteVerdict,
-    offset,
+    after,
   );
 }
 
@@ -739,8 +780,8 @@ export function scanCheckpoints(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
-  /** Where to start in the sorted matching keys — see scanPrefixed. */
-  offset = 0,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
 ): BoundedScan<TreasuryCheckpoint> {
   const prefix = `checkpoint:${proposalId}:`;
   return scanPrefixed(
@@ -753,7 +794,7 @@ export function scanCheckpoints(
         ? value
         : null,
     checkpointVerdict,
-    offset,
+    after,
   );
 }
 
@@ -1216,13 +1257,14 @@ export function scanSigningSessions(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
-  offset = 0,
+  /** Page starts at the first shell key strictly greater than this. */
+  after: string | null = null,
 ): SigningSessionScan {
   const m = readMap();
   if (!m) {
     return {
       items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0,
-      offset: 0, partialSessionIds: [],
+      cursor: after, startIndex: 0, nextCursor: null, partialSessionIds: [],
     };
   }
   const shellPrefix = `session:${proposalId}:`;
@@ -1246,10 +1288,15 @@ export function scanSigningSessions(
     if (key.startsWith(shellPrefix)) shellKeys.push(key);
   }
   shellKeys.sort();
-  const start = Math.max(0, Math.min(offset, shellKeys.length));
-  const page = shellKeys.slice(start, start + Math.max(0, maxChecks));
-  // Same rule as scanPrefixed: a non-zero offset is itself a partial view.
-  if (start > 0 || start + page.length < shellKeys.length) truncated = true;
+  // Cursor, not index — same reason as scanPrefixed: shells are unsigned and
+  // peer-writable, so an index-based page can be pushed forward forever by a
+  // writer prepending keys between repaints.
+  const startAt = after === null ? 0 : shellKeys.findIndex((k) => k > after);
+  const from = startAt < 0 ? shellKeys.length : startAt;
+  const page = shellKeys.slice(from, from + Math.max(0, maxChecks));
+  const hasMore = from + page.length < shellKeys.length;
+  // Same rule as scanPrefixed: a non-zero start is itself a partial view.
+  if (from > 0 || hasMore) truncated = true;
 
   // Pass two: signatures for THIS PAGE's sessions, chosen after the page is.
   // Filtering during examination means a flood of signatures for other
@@ -1327,7 +1374,9 @@ export function scanSigningSessions(
     refusedTooLarge,
     rejected,
     matched: shellKeys.length,
-    offset: start,
+    cursor: after,
+    startIndex: from,
+    nextCursor: hasMore && page.length > 0 ? page[page.length - 1] : null,
     partialSessionIds: [...partialSessions],
   };
 }
