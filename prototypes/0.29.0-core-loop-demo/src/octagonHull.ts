@@ -101,15 +101,60 @@ export type HullWindows = Partial<Record<HullSurface, WindowOpening[]>>;
 export type HullWallpapers = Partial<Record<HullSurface, WallpaperPresetId>>;
 
 /**
+ * 🚪 #92: the FOUR vertical hull faces a door can punch through — the two SIDE
+ * WALLS (extruded strips at ±narrowHalf on the narrow axis) plus the two END
+ * CAPS (at ±longHalf on the long axis, currently the plain wall-band quads).
+ *
+ * Note the deliberate mismatch with `HullSurface`: an end cap is not a
+ * cross-section-edge strip, so it isn't one of the 8 window-carrying surfaces
+ * — but it IS one of the 4 walls a room's occupant walks into and cuts a door
+ * through. Same-name overlap with 'wall-neg'/'wall-pos' keeps the two side-wall
+ * cases interchangeable with the strip surface (see `resolveDoorCut`).
+ */
+export type DoorSurface = 'wall-neg' | 'wall-pos' | 'cap-neg' | 'cap-pos';
+
+/**
+ * 🚪 #92: a RECTANGULAR door opening cut from one of the 4 vertical hull faces,
+ * in that face's local frame:
+ *  - `along` = position of the door CENTRE along the wall's tangent axis
+ *    (extrude coord on the two side walls; narrow-axis coord `a` on the end
+ *    caps). Equals the door layout record's `lateral` on every wall.
+ *  - `w` = opening width along the wall (`DOOR_OPENING_WIDTH`, 2.0 m).
+ *  - `h` = opening height — the notch spans `across ∈ [0, h]`, sitting flush on
+ *    the floor so you walk through no hull geometry (contrast a `WindowOpening`,
+ *    which is an INTERIOR rounded-rect hole and CANNOT touch the strip edges
+ *    without breaking triangulation).
+ *
+ * The door NEVER carries a corner radius — the frame's own posts + header cover
+ * the opening edges, so any radius would just leave visible hull inside the
+ * frame. Merged into the outline as a bottom-edge notch (see
+ * `notchedRectOutline`), not stashed in `Shape.holes`.
+ */
+export interface DoorOpening {
+  along: number;
+  w: number;
+  h: number;
+}
+
+/** 🚪 #92: door cuts per vertical hull face (any of the 4 walls). Unlike
+ *  `HullWindows`, this map's keys are `DoorSurface` (side walls + end caps),
+ *  because a door on an END CAP still needs to punch its opening. */
+export type HullDoorCuts = Partial<Record<DoorSurface, DoorOpening[]>>;
+
+/**
  * Build the octagon hull for the given room half-extents (+ optional tuning).
- * `windows` cuts rounded-rect openings in the two side walls (look outside).
+ * `windows` cuts rounded-rect openings in the barrel strips (look outside).
  * `wallpapers` paints a covering texture onto individual strips (#80 S6).
- * `world.ts` calls this behind the flag and adds `.group` to platformGroup.
+ * `doors` cuts floor-flush rectangular NOTCHES per door on any of the 4
+ * vertical walls (2 side-wall strips + 2 end-cap wall bands) so a doorway
+ * actually opens through the hull — #92. `world.ts` calls this behind the flag
+ * and adds `.group` to platformGroup.
  */
 export function buildOctagonHull(
   opts: HullSectionOpts,
   windows: HullWindows = {},
   wallpapers: HullWallpapers = {},
+  doors: HullDoorCuts = {},
 ): OctagonHull {
   const profile = computeOctagonProfile(opts);
   const {
@@ -164,7 +209,16 @@ export function buildOctagonHull(
     // Clamp openings to fit the strip ONCE (drops any too big to fit), so the
     // hole and its glass share identical, in-bounds coordinates.
     const openings = clampedOpenings(windows[surface], strip, longHalf);
-    const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
+    // 🚪 #92: door NOTCHES on the two vertical SIDE-WALL strips (extruded
+    // walls at ±narrowHalf). Every other strip — roof eaves, ridge, basement
+    // chamfers / floor — carries no door: only the vertical walls do, by
+    // definition (a door stands upright on the floor). Same-name key overlap
+    // makes 'wall-neg'/'wall-pos' index this map interchangeably.
+    const isSideWall = surface === 'wall-neg' || surface === 'wall-pos';
+    const doorCuts = isSideWall
+      ? clampedDoorCuts(doors[surface], -longHalf, longHalf, strip.edgeLen)
+      : [];
+    const geo = stripGeometry(narrowAxis, strip, longHalf, openings, doorCuts);
     geometries.push(geo);
 
     // 🪟 translucent glass filling each opening (barely-there blue — the view
@@ -210,7 +264,8 @@ export function buildOctagonHull(
   //    basement gable so each obeys the same cutaway rule as the strips. ──────
   for (const sign of [-1, 1] as const) {
     const b = sign * longHalf;
-    const normal = verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg');
+    const capSurface: DoorSurface = sign > 0 ? 'cap-pos' : 'cap-neg';
+    const normal = verticalFaceNormal(narrowAxis, capSurface);
     const capQuad = (
       pa: { a: number; y: number },
       pb: { a: number; y: number },
@@ -226,18 +281,24 @@ export function buildOctagonHull(
       geometries.push(geo);
       return geo;
     };
-    // wall band (vertical [0, wallHeight])
+    // wall band (vertical [0, wallHeight]) — with any door notches on THIS cap.
+    // 🚪 #92: an end cap is one of the room's 4 walls a door can sit on, so its
+    // wall band cannot be a plain quad any more. Its (a, y) rectangle stays the
+    // same when there are no cuts; when there are, the outline notches down to
+    // the floor at each door so the opening reaches world y=0 with no sliver.
     {
       const mat = mkMat(HULL_COLOR.wall);
-      const mesh = new THREE.Mesh(
-        capQuad(
-          { a: -narrowHalf, y: 0 },
-          { a: -narrowHalf, y: wallHeight },
-          { a: narrowHalf, y: wallHeight },
-          { a: narrowHalf, y: 0 },
-        ),
-        mat,
-      );
+      const capDoorCuts = clampedDoorCuts(doors[capSurface], -narrowHalf, narrowHalf, wallHeight);
+      const geo = capDoorCuts.length === 0
+        ? capQuad(
+            { a: -narrowHalf, y: 0 },
+            { a: -narrowHalf, y: wallHeight },
+            { a: narrowHalf, y: wallHeight },
+            { a: narrowHalf, y: 0 },
+          )
+        : capWallBandGeometry(narrowAxis, b, -narrowHalf, narrowHalf, wallHeight, capDoorCuts);
+      if (capDoorCuts.length !== 0) geometries.push(geo);
+      const mesh = new THREE.Mesh(geo, mat);
       mesh.name = 'octagon-cap-wall';
       group.add(mesh);
       wallFaces.push({ mesh, material: mat, normal });
@@ -356,9 +417,10 @@ export function buildOctagonShell(
   opts: HullSectionOpts,
   style: OctagonShellStyle = {},
   windows: HullWindows = {},
+  doors: HullDoorCuts = {},
 ): OctagonShell {
   const profile = computeOctagonProfile(opts);
-  const { narrowAxis, longHalf, outline, edges } = profile;
+  const { narrowAxis, longHalf, outline, edges, narrowHalf, wallHeight } = profile;
   const hull = style.hull ?? 0x3a4556;
   const roofC = style.roof ?? 0x2f3a4c;
   const baseC = style.basement ?? 0x27303d;
@@ -390,7 +452,14 @@ export function buildOctagonShell(
     const surface = SURFACE_BY_EDGE[edgeIndex];
     const strip = surfaceEdge(profile, surface);
     const openings = clampedOpenings(windows[surface], strip, longHalf);
-    const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
+    // 🚪 #92: side-wall door notches on the exterior shell — mirrors the
+    // interior barrel so a docking tube / berthed ship at that door lines up
+    // with an actual hole, not a solid hull with a floating tube in front.
+    const isSideWall = surface === 'wall-neg' || surface === 'wall-pos';
+    const doorCuts = isSideWall
+      ? clampedDoorCuts(doors[surface], -longHalf, longHalf, strip.edgeLen)
+      : [];
+    const geo = stripGeometry(narrowAxis, strip, longHalf, openings, doorCuts);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(faceColor(edge.kind)));
     mesh.name = `octagon-shell-${edge.kind}`;
@@ -407,8 +476,17 @@ export function buildOctagonShell(
       group.add(gMesh);
     }
   });
+  // 🚪 #92: END-CAP wall bands, split off the octagon fan so the door notches
+  // land only on the vertical [0, wallHeight] band and the roof/basement gables
+  // stay intact. Signature parity with the interior barrel: same clamp, same
+  // notched outline; only the material differs (single hull tint here). When a
+  // cap carries no door cuts, `capGeometryWithDoors` falls through to the
+  // legacy `capGeometry` fan, so the shell without doors is byte-identical.
   for (const sign of [-1, 1] as const) {
-    const geo = capGeometry(profile, sign * longHalf);
+    const b = sign * longHalf;
+    const capSurface: DoorSurface = sign > 0 ? 'cap-pos' : 'cap-neg';
+    const capDoorCuts = clampedDoorCuts(doors[capSurface], -narrowHalf, narrowHalf, wallHeight);
+    const geo = capGeometryWithDoors(profile, b, capDoorCuts);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(hull));
     mesh.name = 'octagon-shell-cap';
@@ -565,22 +643,29 @@ function clampedOpenings(
 
 /**
  * 🪟 A hull STRIP face, spanning the extrude axis [−longHalf, longHalf] × across
- * [0, edgeLen]. No openings ⇒ a plain quad (the same 4 world corners as the
- * legacy per-edge quad); with openings ⇒ a ShapeGeometry (strip rect minus
- * rounded-rect window holes), triangulated in strip-local (u=along, v=across)
- * then each vertex mapped to world via remapStripToWorld — no orientation math
- * to get wrong. Works for every surface: vertical walls, 45° eaves/chamfers,
- * and the horizontal ridge / basement floor alike. `openings` are already
- * clamped-to-fit (clampedOpenings) by the caller.
+ * [0, edgeLen]. No openings AND no door cuts ⇒ a plain quad (the same 4 world
+ * corners as the legacy per-edge quad); otherwise ⇒ a ShapeGeometry:
+ *  - `openings` (windows) are rounded-rect INTERIOR holes.
+ *  - `doorCuts` (#92) are floor-flush notches punched into the BOTTOM outline
+ *    itself, so the opening reaches the floor with no hull sliver (a window
+ *    hole cannot: `across=0` would touch the outline and break triangulation).
+ *
+ * Triangulated in strip-local (u=along, v=across), then each vertex mapped to
+ * world via `remapStripToWorld` — no orientation math to get wrong. Works for
+ * every surface (walls / eaves / ridge / basement), though door cuts are only
+ * ever pushed to the two vertical side-wall strips by the caller. `openings`
+ * are already clamped-to-fit (`clampedOpenings`) and `doorCuts` clamped by
+ * `clampedDoorCuts`.
  */
 function stripGeometry(
   narrowAxis: NarrowAxis,
   strip: StripEdge,
   longHalf: number,
   openings: WindowOpening[],
+  doorCuts: DoorOpening[] = [],
 ): THREE.BufferGeometry {
   const { p0, dir, edgeLen } = strip;
-  if (openings.length === 0) {
+  if (openings.length === 0 && doorCuts.length === 0) {
     // Strip-local UVs in METRES (u = along, v = across) so a wallpaper texture
     // tiles at a fixed per-metre scale — matching the ShapeGeometry path below,
     // whose UVs are the shape's own (along, across) coords.
@@ -597,16 +682,65 @@ function stripGeometry(
       ],
     );
   }
-  const shape = new THREE.Shape();
-  shape.moveTo(-longHalf, 0);
-  shape.lineTo(longHalf, 0);
-  shape.lineTo(longHalf, edgeLen);
-  shape.lineTo(-longHalf, edgeLen);
-  shape.closePath();
+  const shape = buildNotchedShape(-longHalf, longHalf, edgeLen, doorCuts);
   for (const o of openings) {
     shape.holes.push(roundedRectPath(o.along, o.across, o.w, o.h, o.r));
   }
   return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, p0, dir);
+}
+
+/**
+ * 🚪 #92: build the (u, v) `THREE.Shape` for a notched rectangle — the pure
+ * outline from `notchedRectOutline` traced as a Shape path. Kept separate from
+ * that helper so the outline stays THREE-free + vitest-testable (it's a plain
+ * array of `{along, across}` points) while the Shape construction is one
+ * `moveTo` + N `lineTo`s + `closePath` here.
+ */
+function buildNotchedShape(
+  alongMin: number,
+  alongMax: number,
+  edgeMax: number,
+  doorCuts: readonly DoorOpening[],
+): THREE.Shape {
+  const outline = notchedRectOutline(alongMin, alongMax, edgeMax, doorCuts);
+  const shape = new THREE.Shape();
+  shape.moveTo(outline[0].along, outline[0].across);
+  for (let i = 1; i < outline.length; i++) shape.lineTo(outline[i].along, outline[i].across);
+  shape.closePath();
+  return shape;
+}
+
+/**
+ * 🚪 #92: build the END-CAP WALL BAND ShapeGeometry (the vertical
+ * a ∈ [alongMin, alongMax], y ∈ [0, edgeMax] rectangle at extrude coord `b`,
+ * with door notches on the bottom edge). Mirrors `stripGeometry`'s ShapeGeometry
+ * path but remaps (u=a, v=y) → world via `sectionToWorld(narrowAxis, u, v, b)`
+ * — different remap because a cap's `u` is the cross-section a-axis, not the
+ * extrude axis. `doorCuts` are already clamped by `clampedDoorCuts`.
+ */
+function capWallBandGeometry(
+  narrowAxis: NarrowAxis,
+  b: number,
+  alongMin: number,
+  alongMax: number,
+  edgeMax: number,
+  doorCuts: DoorOpening[],
+): THREE.BufferGeometry {
+  const shape = buildNotchedShape(alongMin, alongMax, edgeMax, doorCuts);
+  const geo = new THREE.ShapeGeometry(shape);
+  const pos = geo.attributes.position;
+  const world = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const u = pos.getX(i); // a-axis coord
+    const v = pos.getY(i); // y coord
+    const w = sectionToWorld(narrowAxis, u, v, b);
+    world[i * 3] = w.x;
+    world[i * 3 + 1] = w.y;
+    world[i * 3 + 2] = w.z;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(world, 3));
+  geo.computeVertexNormals();
+  return geo;
 }
 
 /** A double-sided quad (two triangles a-b-c / a-c-d) from four world corners.
@@ -664,4 +798,230 @@ function capGeometry(profile: OctagonProfile, b: number): THREE.BufferGeometry {
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
   geo.computeVertexNormals();
   return geo;
+}
+
+/**
+ * 🚪 #92: the exterior-shell end cap with any door notches punched into its
+ * WALL BAND. When there are no cuts, this is byte-identical to the plain
+ * `capGeometry` (one fan-triangulated mesh over the full octagon outline) so a
+ * cap without doors gets no new triangles. With cuts, the octagon is split
+ * into three pieces — wall band (with notches), roof gable, basement gable —
+ * merged into one BufferGeometry so the caller still handles ONE mesh + ONE
+ * material per cap. The gables use their own tiny fan; the wall band goes
+ * through the same `buildNotchedShape` + earcut path the interior barrel uses.
+ */
+function capGeometryWithDoors(
+  profile: OctagonProfile,
+  b: number,
+  doorCuts: DoorOpening[],
+): THREE.BufferGeometry {
+  if (doorCuts.length === 0) return capGeometry(profile, b);
+  const { narrowAxis, narrowHalf, wallHeight, ridgeHalf, ridgeY, basementHalf, basementDepth } = profile;
+
+  const positions: number[] = [];
+  const push = (a: number, y: number) => {
+    const w = sectionToWorld(narrowAxis, a, y, b);
+    positions.push(w.x, w.y, w.z);
+  };
+  // triangle-fan a convex polygon (its own 3 CCW vertex points; called with
+  // 3 or 4 vertices — the gables are triangles / trapezoids).
+  const pushFan = (pts: Array<{ a: number; y: number }>): void => {
+    for (let i = 1; i < pts.length - 1; i++) {
+      push(pts[0].a, pts[0].y);
+      push(pts[i].a, pts[i].y);
+      push(pts[i + 1].a, pts[i + 1].y);
+    }
+  };
+
+  // 1) Wall band with door notches — triangulate via ShapeGeometry, then copy
+  //    its (a=u, y=v) → world positions into our merged buffer.
+  const band = capWallBandGeometry(narrowAxis, b, -narrowHalf, narrowHalf, wallHeight, doorCuts);
+  const bandPos = band.attributes.position;
+  for (let i = 0; i < bandPos.count * 3; i++) positions.push((bandPos.array as ArrayLike<number>)[i]);
+  band.dispose();
+
+  // 2) Roof gable (trapezoid, CCW in (a, y)).
+  pushFan([
+    { a: -narrowHalf, y: wallHeight },
+    { a: -ridgeHalf, y: ridgeY },
+    { a: ridgeHalf, y: ridgeY },
+    { a: narrowHalf, y: wallHeight },
+  ]);
+  // 3) Basement gable (trapezoid, CCW in (a, y)).
+  pushFan([
+    { a: -narrowHalf, y: 0 },
+    { a: narrowHalf, y: 0 },
+    { a: basementHalf, y: -basementDepth },
+    { a: -basementHalf, y: -basementDepth },
+  ]);
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// ── 🚪 #92: DOOR CUT geometry — pure helpers ────────────────────────────────
+//
+// The strip-local `across` parametrisation is the fiddly part called out on
+// #92 (get it wrong and the outline self-intersects, breaking earcut). It
+// lives here as a plain data function `notchedRectOutline` — takes numbers,
+// returns numbers, no THREE dependency — so the vitest suite in
+// `octagonHull.test.ts` can pin it down without a renderer.
+
+/** Inset keeping a door cut off the strip ends (the same discipline as
+ *  WINDOW_INSET — the outline must be a simple polygon or earcut fails).
+ *  Exported so the vitest suite can assert the clamp policy in numbers rather
+ *  than depending on a private literal. */
+export const DOOR_HULL_INSET = 0.05;
+
+/** Small epsilon for coordinate deduplication when building the outline
+ *  (values closer than this collapse — see notchedRectOutline). */
+const OUTLINE_EPS = 1e-6;
+
+/**
+ * 🚪 #92: THE outline for a rectangle [alongMin, alongMax] × [0, edgeMax] with
+ * a set of door NOTCHES poking upward from the bottom edge — each notch
+ * `[along − w/2, along + w/2] × [0, h]`. CCW winding, matches the plain
+ * quad's when `doors` is empty (bottom-left → bottom-right → top-right →
+ * top-left). Pure, no THREE dependency.
+ *
+ * The routine sorts doors along-ascending and MERGES touching / overlapping
+ * intervals so the outline stays a simple polygon (the editor prevents
+ * overlap via `MIN_DOOR_GAP` = 4.0 m, but a room resize could bring doors
+ * closer, and merging is the geometrically-correct thing to do either way).
+ * A door that fully clears the wall bounds is dropped; a door that pokes past
+ * one end is clipped to the wall. A door whose merged notch reaches an end of
+ * the wall replaces that corner rather than emitting a zero-length edge (the
+ * kind of degenerate that turns triangulation into a garbled mesh).
+ */
+export function notchedRectOutline(
+  alongMin: number,
+  alongMax: number,
+  edgeMax: number,
+  doors: readonly DoorOpening[],
+): Array<{ along: number; across: number }> {
+  const empty: Array<{ along: number; across: number }> = [
+    { along: alongMin, across: 0 },
+    { along: alongMax, across: 0 },
+    { along: alongMax, across: edgeMax },
+    { along: alongMin, across: edgeMax },
+  ];
+  if (doors.length === 0) return empty;
+
+  // Sort + clip + merge door intervals along the bottom edge.
+  const kept = doors
+    .filter(d => d.w > 0 && d.h > 0 && d.h <= edgeMax)
+    .map(d => ({
+      a: Math.max(alongMin, d.along - d.w / 2),
+      b: Math.min(alongMax, d.along + d.w / 2),
+      h: Math.min(d.h, edgeMax),
+    }))
+    .filter(iv => iv.b - iv.a > OUTLINE_EPS)
+    .sort((p, q) => p.a - q.a);
+  const merged: Array<{ a: number; b: number; h: number }> = [];
+  for (const iv of kept) {
+    const last = merged.length > 0 ? merged[merged.length - 1] : null;
+    if (last && iv.a <= last.b + OUTLINE_EPS) {
+      last.b = Math.max(last.b, iv.b);
+      last.h = Math.max(last.h, iv.h);
+    } else {
+      merged.push({ ...iv });
+    }
+  }
+  if (merged.length === 0) return empty;
+
+  // Trace the outline CCW. Push `(along, across)` points, deduplicating BOTH
+  // adjacent-in-sequence identical points (via `pushPoint`) AND the cyclic
+  // wraparound at the end. A notch whose left interval `iv.a` sits AT
+  // `alongMin` REPLACES the bottom-left corner (skip the initial `(alongMin, 0)`
+  // AND the notch's own `(iv.a, 0)` — else earcut sees a zero-length edge and
+  // an outline with a redundant vertex, which is safe for earcut in most cases
+  // but throws off point-count assertions and can flip winding on adversarial
+  // corner cases). Same discipline on the right (`iv.b === alongMax`).
+  const out: Array<{ along: number; across: number }> = [];
+  const pushPoint = (along: number, across: number) => {
+    const last = out.length > 0 ? out[out.length - 1] : null;
+    if (
+      last &&
+      Math.abs(last.along - along) < OUTLINE_EPS &&
+      Math.abs(last.across - across) < OUTLINE_EPS
+    ) return;
+    out.push({ along, across });
+  };
+  const firstTouchesLeft = Math.abs(merged[0].a - alongMin) < OUTLINE_EPS;
+  const lastTouchesRight = Math.abs(merged[merged.length - 1].b - alongMax) < OUTLINE_EPS;
+
+  if (!firstTouchesLeft) pushPoint(alongMin, 0);
+  for (let i = 0; i < merged.length; i++) {
+    const iv = merged[i];
+    const skipLeftBottom = i === 0 && firstTouchesLeft;
+    const skipRightBottom = i === merged.length - 1 && lastTouchesRight;
+    if (!skipLeftBottom) pushPoint(iv.a, 0);
+    pushPoint(iv.a, iv.h);
+    pushPoint(iv.b, iv.h);
+    if (!skipRightBottom) pushPoint(iv.b, 0);
+  }
+  if (!lastTouchesRight) pushPoint(alongMax, 0);
+  pushPoint(alongMax, edgeMax);
+  pushPoint(alongMin, edgeMax);
+  // Cyclic dedup: if the trace closed onto its starting vertex (a
+  // corner-touching notch on the left produces a top-left `(alongMin, edgeMax)`
+  // that also opened the trace), drop the trailing copy so earcut sees a
+  // simple polygon with no zero-length closing edge.
+  if (out.length > 1) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (
+      Math.abs(first.along - last.along) < OUTLINE_EPS &&
+      Math.abs(first.across - last.across) < OUTLINE_EPS
+    ) {
+      out.pop();
+    }
+  }
+  return out;
+}
+
+/**
+ * 🚪 #92: clamp one door cut to fit within a wall face's bounds — same shape
+ * of contract as `clampOpening` but for door NOTCHES: the cut must survive
+ * the inset on both `along` ends (`along ± w/2` stays inside
+ * `[alongMin+inset, alongMax−inset]`) and must not overflow the wall's
+ * `across` range (`h ≤ edgeMax−inset`). A cut that cannot fit returns null
+ * (dropped, exactly like an oversized window). The floor edge itself is NOT
+ * inset — the whole point is to sit flush on the floor.
+ */
+function clampDoorCut(
+  alongMin: number,
+  alongMax: number,
+  edgeMax: number,
+  o: DoorOpening,
+): DoorOpening | null {
+  if (o.w <= 0 || o.h <= 0) return null;
+  const alongSpan = alongMax - alongMin;
+  if (o.w > alongSpan - 2 * DOOR_HULL_INSET) return null;
+  if (o.h > edgeMax - DOOR_HULL_INSET) return null;
+  const lo = alongMin + o.w / 2 + DOOR_HULL_INSET;
+  const hi = alongMax - o.w / 2 - DOOR_HULL_INSET;
+  const along = Math.max(lo, Math.min(hi, o.along));
+  return { along, w: o.w, h: o.h };
+}
+
+/** 🚪 #92: map + clamp one wall's raw door cuts to the ones that actually fit.
+ *  Exported so `hullDoorCuts.test.ts` can pin the drop-oversized + clamp-along
+ *  policy without spinning up a THREE scene. */
+export function clampedDoorCuts(
+  raw: DoorOpening[] | undefined,
+  alongMin: number,
+  alongMax: number,
+  edgeMax: number,
+): DoorOpening[] {
+  const out: DoorOpening[] = [];
+  if (raw) {
+    for (const o of raw) {
+      const c = clampDoorCut(alongMin, alongMax, edgeMax, o);
+      if (c) out.push(c);
+    }
+  }
+  return out;
 }

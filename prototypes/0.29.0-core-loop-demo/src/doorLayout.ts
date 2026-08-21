@@ -59,6 +59,11 @@ const HALF_PI = Math.PI / 2;
 // assumed 2/1).
 /** Opening width — exactly 2 grid cells; centre on an integer grid line. */
 export const DOOR_OPENING_WIDTH = 2.0;
+/** 🚪 #92: opening HEIGHT — the door leaf's clear vertical span, measured from
+ *  the floor up. The door frame in `docking.ts` (`OPEN_H` there) and the hull
+ *  cut in `doorCuts.ts` / `octagonHull.ts` both derive from this ONE constant
+ *  so a resize can never split a floating frame from a floor-flush hole. */
+export const DOOR_OPENING_HEIGHT = 3.0;
 /** Side-post width, one each side of the opening. */
 export const DOOR_POST_WIDTH = 0.3;
 /** Full frame width (opening + both posts) = 2.6. */

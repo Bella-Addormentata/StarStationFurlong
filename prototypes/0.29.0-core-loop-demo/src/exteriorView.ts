@@ -45,6 +45,7 @@ import {
 import type { VestibuleDoorId } from "./adapter";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
+import { collectDoorCuts } from "./doorCuts";
 import { roomHalfExtents } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
@@ -176,7 +177,19 @@ function buildGroup(): THREE.Group {
     // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
     // exterior barrel (neighbour shells below stay windowless — other modules'
     // windows aren't loaded here, by design).
-    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings()).group);
+    // 🚪 #92: cuts + windows on the CURRENT room's shell so a berthed ship
+    // / docking tube / arrival ghost lines up with an ACTUAL hole in the hull
+    // (not a solid barrel with something floating at the door slot). Neighbour
+    // shells stay plain — other rooms' door records aren't loaded here, and a
+    // ghost hole with no live door on it would misread.
+    g.add(
+      buildOctagonShell(
+        { halfX, halfZ },
+        {},
+        collectWindowOpenings(),
+        collectDoorCuts(),
+      ).group,
+    );
   } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
