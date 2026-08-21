@@ -398,13 +398,33 @@ function deepFreeze<T>(value: T): T {
     if (typeof node !== 'object' || node === null) continue;
     if (seen.has(node)) continue;
     seen.add(node);
-    // Typed arrays are left alone. Object.freeze THROWS on an ArrayBuffer view
-    // with elements, and Yjs will happily store a Uint8Array a peer put in a
-    // slot — so freezing before the shape guard turned one binary value into
-    // an exception that aborted the whole treasury render. No treasury record
-    // contains binary, so skipping costs nothing: the value still meets its
+    // ONLY plain objects and arrays are frozen — an allowlist, because this
+    // runs before the shape guard and a peer chooses what is in the slot.
+    //
+    // Two ways that bit, both of them render-killing. A Uint8Array: freezing
+    // an ArrayBuffer view with elements THROWS. And a nested Yjs shared type,
+    // which is every bit as legal a map value: the walk would follow its `doc`
+    // reference into live Yjs internals and freeze them, so the NEXT
+    // transaction throws when Yjs writes its own fields — a peer bricking the
+    // room's document by writing one Y.Map into a treasury key.
+    //
+    // Valid treasury records are arrays and plain objects and nothing else, so
+    // an allowlist costs them nothing: anything skipped here still meets its
     // type guard next and is rejected the ordinary way.
-    if (ArrayBuffer.isView(node)) continue;
+    //
+    // DEFENCE IN DEPTH, measured: through the public readers the Yjs case is
+    // currently unreachable, because smallEnough runs first and a shared
+    // type's graph exceeds RECORD_BUDGET, so the slot is refused as
+    // 'too-large' before this walk ever sees it — verified by planting a Y.Map
+    // in a treasury key with and without this allowlist and getting the same
+    // refusal both times. Freezing one directly does brick the document
+    // (`TypeError: Cannot assign to read only property '_transaction'`), and
+    // the ordering that saves us has already been moved once in this PR's
+    // history, so the guard belongs here rather than in the caller.
+    const proto = Object.getPrototypeOf(node);
+    if (proto !== Object.prototype && proto !== Array.prototype && proto !== null) {
+      continue;
+    }
     // Harmless if it was already frozen; what matters is that its children are
     // still queued below.
     Object.freeze(node);

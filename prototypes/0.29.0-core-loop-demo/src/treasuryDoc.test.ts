@@ -1025,6 +1025,33 @@ describe('verification caching', () => {
     expect(scanSigningSessions(shell.proposalId, 50_000, 10, null).partialSessionIds).toEqual([]);
   });
 
+  it('leaves the document usable when a peer plants a Yjs type in a slot', () => {
+    // A Y.Map is as legal a map value as anything else, and deep-freezing one
+    // walks its `doc` reference into live Yjs internals — after which the next
+    // transaction throws `Cannot assign to read only property '_transaction'`
+    // and the room's document is bricked.
+    //
+    // This test pins the END-TO-END property and does NOT discriminate the
+    // allowlist that guards it: measured, the size budget already refuses a
+    // shared type as 'too-large' before the freeze runs, so this passes with
+    // or without that guard. Said plainly rather than left to imply otherwise
+    // — the allowlist is defence in depth against the ordering changing, and
+    // what is asserted here is that the document survives.
+    const m = doc.getMap('treasury');
+    const planted = new Y.Map<unknown>();
+    m.set(`proposal:${'2'.repeat(64)}`, planted);
+    planted.set('bait', 'value');
+    expect(() => readProposal('2'.repeat(64))).not.toThrow();
+    expect(readProposal('2'.repeat(64))).toBeNull(); // rejected by shape
+    // The document still works afterwards — the point of the whole test.
+    expect(() => doc.transact(() => { m.set('probe', { v: 1 }); })).not.toThrow();
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    expect(readProposal(p.proposalId)).toEqual(p);
+    // And the peer's own nested type was left alone rather than frozen.
+    expect(Object.isFrozen(planted)).toBe(false);
+  });
+
   it('survives a value nested deeper than the call stack', () => {
     // A NODE budget does not bound call-stack DEPTH. 64,000 nested arrays cost
     // about one budget unit each — well inside the cap — while a recursive

@@ -2831,6 +2831,7 @@ let treasuryListCursors: (string | null)[] = [null];
  */
 let lastListNext: string | null = null;
 let lastVoteNext: string | null = null;
+let lastCheckpointNext: string | null = null;
 let lastApprovalNext: string | null = null;
 
 /**
@@ -2872,6 +2873,9 @@ let treasuryApprovalCursors: (string | null)[] = [null];
  * different questions.
  */
 let treasuryVoteCursors: (string | null)[] = [null];
+
+/** Checkpoints have their OWN key space, so they need their own cursor. */
+let treasuryCheckpointCursors: (string | null)[] = [null];
 
 /**
  * How many records one repaint may VERIFY, as opposed to walk past.
@@ -3027,6 +3031,7 @@ function wireTreasuryView(view: HTMLElement): void {
         // Page numbers are per proposal.
         treasuryApprovalCursors = [null];
         treasuryVoteCursors = [null];
+        treasuryCheckpointCursors = [null];
       }
       if (action === "back") treasuryDetailId = "";
       // Forward pushes the cursor the scan just handed back; back pops to the
@@ -3042,8 +3047,15 @@ function wireTreasuryView(view: HTMLElement): void {
       };
       if (action === "rounds-next") pageForward(treasuryApprovalCursors, lastApprovalNext);
       if (action === "rounds-prev") pageBack(treasuryApprovalCursors);
-      if (action === "votes-next") pageForward(treasuryVoteCursors, lastVoteNext);
-      if (action === "votes-prev") pageBack(treasuryVoteCursors);
+      // One control, two key spaces: each stack advances along its own.
+      if (action === "votes-next") {
+        pageForward(treasuryVoteCursors, lastVoteNext);
+        pageForward(treasuryCheckpointCursors, lastCheckpointNext);
+      }
+      if (action === "votes-prev") {
+        pageBack(treasuryVoteCursors);
+        pageBack(treasuryCheckpointCursors);
+      }
       if (action === "page-next") pageForward(treasuryListCursors, lastListNext);
       if (action === "page-prev") pageBack(treasuryListCursors);
       // renderTreasuryApp preserves focus across the repaint for us.
@@ -3281,18 +3293,26 @@ function paintTreasuryBody(view: HTMLElement): void {
     // Paged, like the proposal list and the approval rounds. These keys are
     // peer-writable too, so without a way through, decoys sorted ahead of the
     // genuine records hid them for good.
-    // Each scan carries its OWN cursor. They were sharing one, which made the
-    // two ranges answer different questions while being reported as one — and
-    // a cursor is a key from a particular key space, so sharing it across two
-    // prefixes was meaningless as well as wrong.
-    const voteCursor = treasuryVoteCursors[treasuryVoteCursors.length - 1];
+    // Each scan carries its OWN cursor, and they are NOT interchangeable. A
+    // cursor is a key from one key space: every `checkpoint:` key sorts before
+    // any `vote:` cursor, so handing the vote cursor to the checkpoint scan
+    // sent it straight to its end, and the reverse would have restarted the
+    // vote scan and re-counted votes already shown. One control still advances
+    // both, but each advances along its own keys.
     const voteScan = scanVotes(
-      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, voteCursor,
+      proposal.proposalId,
+      DETAIL_SCAN,
+      DETAIL_PAGE,
+      treasuryVoteCursors[treasuryVoteCursors.length - 1],
     );
     const cpScan = scanCheckpoints(
-      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, voteCursor,
+      proposal.proposalId,
+      DETAIL_SCAN,
+      DETAIL_PAGE,
+      treasuryCheckpointCursors[treasuryCheckpointCursors.length - 1],
     );
-    lastVoteNext = voteScan.nextCursor ?? cpScan.nextCursor;
+    lastVoteNext = voteScan.nextCursor;
+    lastCheckpointNext = cpScan.nextCursor;
     // Paged, for the same reason the proposal list is: shells are unsigned and
     // peer-writable, so decoys sorted ahead of the genuine round would
     // otherwise put it permanently out of reach.
@@ -3409,13 +3429,13 @@ function paintTreasuryBody(view: HTMLElement): void {
             )}
             <div style="display:flex; gap:6px; margin-top:6px;">
               ${
-                treasuryVoteCursors.length > 1
+                treasuryVoteCursors.length > 1 || treasuryCheckpointCursors.length > 1
                   ? `<div data-treasury-action="votes-prev" role="button" tabindex="0" aria-label="Previous page of vote records"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
                   : ""
               }
               ${
-                lastVoteNext !== null
+                lastVoteNext !== null || lastCheckpointNext !== null
                   ? `<div data-treasury-action="votes-next" role="button" tabindex="0" aria-label="Next page of vote records"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                   : ""
@@ -3555,10 +3575,15 @@ function paintTreasuryBody(view: HTMLElement): void {
   let page = scanProposals(
     LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
   );
-  // A cursor cannot outrun the list, but records LEAVING can still empty the
-  // page under it. Walk the stack back to the last page that holds something
-  // rather than leaving the screen blank with its controls hidden.
-  while (page.items.length === 0 && page.matched > 0 && treasuryListCursors.length > 1) {
+  // A cursor cannot outrun the list, but records LEAVING can still put it past
+  // the end. Rewind on THAT — the cursor being past every matching key — and
+  // not on an empty page: `items` holds only ACCEPTED records, so a page whose
+  // entries were all rejected or refused is legitimately empty while its keys
+  // are still there. Rewinding on that let a peer plant one full invalid page
+  // in front of an honest proposal: "next" reached the bad page, this loop
+  // bounced straight back, and the honest page after it was unreachable —
+  // the censorship hole rebuilt inside the guard meant to prevent stranding.
+  while (page.startIndex >= page.matched && page.matched > 0 && treasuryListCursors.length > 1) {
     treasuryListCursors.pop();
     page = scanProposals(
       LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
