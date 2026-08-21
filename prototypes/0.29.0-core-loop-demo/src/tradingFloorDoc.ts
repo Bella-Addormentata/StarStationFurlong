@@ -288,6 +288,17 @@ export function verifyFloorOffer(o: FloorOffer | null | undefined): boolean {
   } catch { return false; }
 }
 
+/**
+ * Shape-and-signature gate for a taker acceptance. The temporal window check
+ * `acceptedAt ∈ [offer.createdAt, offer.expiresAt)` is intentionally NOT here —
+ * `verifyFloorAccept` has no visibility into the target offer's timeline, and
+ * hostile takers can shove any signed acceptedAt into their own key slot. The
+ * window is enforced at every point of use via `isAcceptInWindow(accept,
+ * offer)` (reconcile + `hasCanonicalAcceptBefore`) so ledger settlement and
+ * the open-offer list agree. Without that guard a hostile taker's backdated
+ * accept becomes canonical (earliest wins in `pickCanonicalAccept`) and the
+ * corrective path robs the legit winner — audit #68 round-2 finding 2.
+ */
 export function verifyFloorAccept(a: FloorAccept | null | undefined): boolean {
   if (!a || a.v !== 1) return false;
   if (typeof a.offerId !== 'string' || !OFFER_ID_RE.test(a.offerId)) return false;
@@ -314,9 +325,19 @@ export function verifyFloorCancel(c: FloorCancel | null | undefined): boolean {
   } catch { return false; }
 }
 
-/** Shape gate for a tape entry (write-once byproduct of reconciliation).
- *  A tape without a matching offer+canonical-accept is discarded on read —
- *  this rejects fabricated tape planted by a hostile peer. */
+/**
+ * Shape gate for a tape entry (write-once byproduct of reconciliation). The
+ * tape is UNSIGNED (no field on `FloorTape` binds a writer's Ed25519 key), so
+ * this gate alone cannot say who wrote a given tape — it only rejects malformed
+ * bytes. The AUTHENTICITY check — "does this tape agree with the signed accept
+ * set for the same offer?" — is `isExistingTapeAuthentic(tape, offer,
+ * validAccepts)`, applied at the point of use inside `reconcileTradingFloor`
+ * before the corrective-transfer path trusts `tape.takerPub` as evidence of a
+ * prior settlement. Without that guard a hostile peer plants a tape naming an
+ * uninvolved third party as `takerPub` and reconcile robs them of shares —
+ * audit #68 round-2 finding 1. Adding a signed-writer field to `FloorTape` is
+ * a stronger fix and is tracked in TODO.md for a follow-up refactor.
+ */
 export function verifyFloorTape(t: FloorTape | null | undefined): boolean {
   if (!t || t.v !== 1) return false;
   if (!isOfferKind(t.kind)) return false;
@@ -513,7 +534,7 @@ export function listOpenOffers(): FloorOffer[] {
     // `isCancelInWindow`. A valid cancel with no canonical accept before it
     // kills the offer for display; a valid cancel that a canonical accept
     // beat is not fatal (the tape lane in reconcile will still settle).
-    if (cancel && isCancelInWindow(cancel, o) && !hasCanonicalAcceptBefore(o.offerId, cancel.cancelledAt)) continue;
+    if (cancel && isCancelInWindow(cancel, o) && !hasCanonicalAcceptBefore(o, cancel.cancelledAt)) continue;
     out.push(o);
   }
   return out
@@ -575,10 +596,17 @@ function compareAccept(a: FloorAccept, b: FloorAccept): number {
   return a.takerPub < b.takerPub ? -1 : a.takerPub > b.takerPub ? 1 : 0;
 }
 
-/** Fast path used by listOpenOffers to decide whether a cancel is too late:
- *  does the canonical accept exist AND fall before `t`? */
-function hasCanonicalAcceptBefore(offerId: string, t: number): boolean {
-  const winner = pickCanonicalAccept(listAcceptsFor(offerId));
+/**
+ * Fast path used by listOpenOffers to decide whether a cancel is too late:
+ * does the canonical accept exist AND fall before `t`? Accepts outside the
+ * offer's temporal window (`isAcceptInWindow`) are filtered FIRST — a
+ * backdated accept could otherwise become the canonical winner and mask a
+ * legitimate cancel (audit #68 round-2 finding 2 mirror). Takes the offer
+ * (not just its id) so the window check has both bounds available.
+ */
+function hasCanonicalAcceptBefore(offer: FloorOffer, t: number): boolean {
+  const validAccepts = listAcceptsFor(offer.offerId).filter((a) => isAcceptInWindow(a, offer));
+  const winner = pickCanonicalAccept(validAccepts);
   return winner !== null && winner.acceptedAt < t;
 }
 
@@ -596,6 +624,72 @@ function hasCanonicalAcceptBefore(offerId: string, t: number): boolean {
  */
 function isCancelInWindow(cancel: FloorCancel, offer: FloorOffer): boolean {
   return cancel.cancelledAt >= offer.createdAt;
+}
+
+/**
+ * Symmetric temporal window for an accept — mirrors `isCancelInWindow` and
+ * closes audit #68 round-2 finding 2 ("retroactive share theft via backdated
+ * FloorAccept"). `pickCanonicalAccept` picks the EARLIEST acceptedAt, so an
+ * attacker who signs an accept with `acceptedAt=0` becomes canonical for any
+ * offer — and the reconcile corrective path then routes the settled shares
+ * from the legitimate winner (Bob) to the attacker (Eve). The upper bound
+ * `< offer.expiresAt` matches reconcile's own `o.expiresAt <= winner
+ * .acceptedAt` gate: an accept scheduled past the offer's expiry cannot have
+ * bound the maker.
+ *
+ * The check is applied at every point where an accept feeds a decision
+ * (`reconcileTradingFloor`, `hasCanonicalAcceptBefore`,
+ * `isExistingTapeAuthentic`) — `verifyFloorAccept` cannot enforce it because
+ * the shape gate has no visibility into the target offer's timeline.
+ */
+function isAcceptInWindow(accept: FloorAccept, offer: FloorOffer): boolean {
+  return accept.acceptedAt >= offer.createdAt && accept.acceptedAt < offer.expiresAt;
+}
+
+/**
+ * Is an existing tape entry *authentic* — i.e. does it agree with the signed
+ * accept set for the same offer? The tape itself carries no signature (see
+ * `verifyFloorTape`), so a hostile peer can plant a byte-valid tape naming
+ * ANY `takerPub` and reconcile — before this guard — would treat that pub as
+ * the "wrong recipient" and move shares off their balance (audit #68 round-2
+ * finding 1: "share theft via unsigned hostile FloorTape planting"). The
+ * check verifies:
+ *
+ *   (a) Every payload field bound at settlement (ventureId, kind, shares,
+ *       priceMojo, makerPub) matches the OFFER. A forged tape with wrong
+ *       payload dies here.
+ *
+ *   (b) `t.takerPub` names a real, in-window signed FloorAccept for this
+ *       offer (via `validAccepts`, already filtered by `isAcceptInWindow`).
+ *       Uninvolved third parties named by the attacker are rejected.
+ *
+ *   (c) `t.settledAt === matchingAccept.acceptedAt` — the tape's settlement
+ *       time is exactly what a peer would have written for THAT taker. A
+ *       forged timestamp dies here.
+ *
+ * A tape that fails this check is treated as absent by reconcile: the
+ * corrective transfer refuses to run and the offer lands in `refusedOfferIds`.
+ * Bob's legitimate settlement being blocked by a fabricated tape is a
+ * documented DoS-limit on the PR — the attacker cannot move shares off any
+ * account (no theft), only prevent that specific offer from settling until
+ * the fabricated tape is cleared. Adding a signed-writer field to FloorTape
+ * (writerPub + sig, verify writer holds shares) is a stronger fix tracked in
+ * TODO.md for a follow-up refactor.
+ */
+function isExistingTapeAuthentic(
+  t: FloorTape,
+  offer: FloorOffer,
+  validAccepts: FloorAccept[],
+): boolean {
+  if (t.ventureId !== offer.ventureId) return false;
+  if (t.kind !== offer.kind) return false;
+  if (t.shares !== offer.shares) return false;
+  if (t.priceMojo !== offer.priceMojo) return false;
+  if (t.makerPub !== offer.makerPub) return false;
+  const ref = validAccepts.find((a) => a.takerPub === t.takerPub);
+  if (!ref) return false;
+  if (t.settledAt !== ref.acceptedAt) return false;
+  return true;
 }
 
 /** The result of a reconciliation pass — for the UI to surface. */
@@ -654,8 +748,17 @@ export function reconcileTradingFloor(): ReconcileResult {
     offers.push(o);
   }
   for (const o of offers) {
-    const accepts = listAcceptsFor(o.offerId);
-    const winner = pickCanonicalAccept(accepts);
+    // Filter accepts through `isAcceptInWindow` BEFORE picking the canonical
+    // winner. A hostile taker can shove any signed acceptedAt into their own
+    // slot; pickCanonicalAccept picks the EARLIEST acceptedAt, so an accept
+    // with `acceptedAt=0` would always win and the corrective path below
+    // would then move shares from the legitimate winner onto the attacker
+    // (audit #68 round-2 finding 2: "retroactive share theft via backdated
+    // FloorAccept"). The upper bound (< o.expiresAt) matches the "expired
+    // before canonical accept" gate below.
+    const rawAccepts = listAcceptsFor(o.offerId);
+    const validAccepts = rawAccepts.filter((a) => isAcceptInWindow(a, o));
+    const winner = pickCanonicalAccept(validAccepts);
     if (!winner) continue;
     // Cancel-before-canonical-accept invalidates the trade. A BACKDATED cancel
     // (cancelledAt < offer.createdAt) is ignored — `isCancelInWindow` refuses
@@ -663,7 +766,10 @@ export function reconcileTradingFloor(): ReconcileResult {
     // small `cancelledAt` and nullify every legitimate accept (audit finding 1).
     const cancel = readCancelFor(o.offerId);
     if (cancel && isCancelInWindow(cancel, o) && cancel.cancelledAt <= winner.acceptedAt) continue;
-    // Expired-before-canonical-accept invalidates the trade.
+    // Expired-before-canonical-accept invalidates the trade. Defense-in-depth
+    // — `isAcceptInWindow` above already excludes accepts with
+    // `acceptedAt >= o.expiresAt`, but this guard keeps reconcile correct if
+    // that filter is ever loosened.
     if (o.expiresAt <= winner.acceptedAt) continue;
     // v1 gift rule: only priceMojo === 0 settles today (the Registry lane
     // is V3). Non-zero priced offers remain visible so the chart can plot
@@ -692,6 +798,21 @@ export function reconcileTradingFloor(): ReconcileResult {
     };
 
     const existing = readTapeFor(o.offerId);
+
+    // AUTHENTICITY GATE (audit #68 round-2 finding 1): the tape carries no
+    // signature, so an existing entry could be a fabrication planted by a
+    // hostile peer naming any pub as `takerPub`. Before the corrective path
+    // trusts `existing.takerPub` as the "wrong recipient" to move shares FROM,
+    // the tape must be cross-checked against the signed accept set for this
+    // offer. A fabricated tape refuses the offer entirely (documented DoS
+    // limit on PR — no shares move, no theft).
+    if (existing && !isExistingTapeAuthentic(existing, o, validAccepts)) {
+      console.warn('[tradingFloor] refusing offer', o.offerId,
+        '- existing tape fails authenticity check (fabricated or stale)');
+      refused.push(o.offerId);
+      continue;
+    }
+
     if (existing && existing.takerPub === winner.takerPub && existing.settledAt === winner.acceptedAt) {
       // Canonical already settled — idempotent skip. Every peer computes
       // this same tape entry from the same merged state, so a match here
@@ -759,7 +880,9 @@ export function reconcileTradingFloor(): ReconcileResult {
       moveFrom = rightTaker;
       moveTo = wrongTaker;
       // The wrong-taker's display name lives on their accept record.
-      const wrongAccept = accepts.find((a) => a.takerPub === wrongTaker);
+      // `isExistingTapeAuthentic` above already verified `wrongTaker` names
+      // an in-window signed accept, so this lookup is guaranteed to hit.
+      const wrongAccept = validAccepts.find((a) => a.takerPub === wrongTaker);
       moveToName = wrongAccept?.takerName
         ?? v.holderNames?.[wrongTaker]
         ?? 'Unknown-Clone';
