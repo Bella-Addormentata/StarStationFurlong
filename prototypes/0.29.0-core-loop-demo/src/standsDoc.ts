@@ -18,9 +18,27 @@
  * client — the player claiming it (heartbeat renewal is the same player), or
  * the REAPER on any client (deletion only, never a fresh write). The heartbeat
  * pattern makes the write cadence explicit: the holder rewrites the same
- * shape every STAND_CLAIM_HEARTBEAT_MS to keep the TTL alive. A dropped tab
- * stops writing → any peer's reap sweep removes the stale claim after
- * STAND_CLAIM_TTL_MS → the slot re-opens.
+ * shape every STAND_CLAIM_HEARTBEAT_MS to keep the TTL alive.
+ *
+ * RECOVERY OF A DROPPED PEER'S SLOT (audit-honest, finding #3). Two paths open
+ * a stale slot back up:
+ *   1. The WALK-UP PATH (primary): pickStandForWalkup's canPlayerClaim
+ *      stale-clause treats any claim past STAND_CLAIM_TTL_MS as claimable,
+ *      independent of the online-players provider. A new walker lands on the
+ *      slot and their claimStand overwrites the stale entry via LWW. This is
+ *      the mechanism that actually reclaims a departed peer's slot today.
+ *   2. The REAP SWEEP (safety net): findExpiredClaims removes a stale claim
+ *      only when its holder is ALSO not in the online-players set. In this
+ *      build the players Y.Map is append-only (main.ts has no players.delete
+ *      call site — leaveRoom destroys only the local doc, so every other
+ *      replica still sees the departed peer in `players`). That makes the
+ *      reap safe (it never deletes a currently-online peer's slot) but
+ *      largely a no-op for a real disconnect — the reap effectively fires
+ *      only for peers whose entry never made it to another replica, or for
+ *      claims from a local offline session (getPlayerId is added locally as
+ *      belt-and-braces so a solo player never reaps their own slot). A
+ *      future graceful-leave path that calls players.delete would make the
+ *      reap sweep meaningful; until then, path (1) is the load-bearing one.
  *
  * TRUST BOUNDARY. Reads go through isStandClaim, so a hostile peer's junk
  * write reads as "no claim" and the walk-up logic simply picks that slot.

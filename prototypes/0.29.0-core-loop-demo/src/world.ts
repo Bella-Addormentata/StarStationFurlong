@@ -36,7 +36,9 @@ import {
 import {
   STAND_CLAIM_HEARTBEAT_MS,
   STAND_CLAIM_REAP_MS,
+  canPlayerClaim,
   findExpiredClaims,
+  isClaimActive,
   pickStandForWalkup,
   shouldReleaseSlot,
 } from "./standClaims";
@@ -4811,14 +4813,45 @@ export class World {
    * suspends stops writing and their claim ages out (findExpiredClaims). Real
    * time is captured from Date.now() rather than the render clock so a stalled
    * frame loop can't extend the TTL past its real window.
+   *
+   * OWNERSHIP-RULE GUARD (audit fix, finding #1). If the local tab is throttled
+   * or frozen past the TTL — Chrome background-tab freeze, phone lock, network
+   * drop — another peer's walk-up sees our claim as stale (canPlayerClaim
+   * stale-clause) and legitimately takes the slot. When THIS tab resumes,
+   * blindly writing a fresh claim would let LWW displace the new holder (the
+   * heartbeat's `at` is Date.now(), always greater than the recent claim), and
+   * that is exactly the "one live player displacing another" bug this whole
+   * slice defends against (see standClaims.ts's OWNERSHIP RULE header). The
+   * pure engine already publishes `canPlayerClaim` for precisely this guard:
+   * read the current slot, and if we can no longer claim it (someone else is
+   * live on it) drop the tracked stand and skip the write. The next walk-up
+   * will pick a fresh open slot; the peer's legitimate claim stays intact.
    */
   private tickStandHeartbeat(): void {
     const tracked = this.trackedStand;
     if (!tracked) return;
     const now = Date.now();
     if (now - tracked.lastHeartbeat < STAND_CLAIM_HEARTBEAT_MS) return;
+    // Ownership guard — consult the doc BEFORE overwriting. A stale local tab
+    // whose slot was legitimately reassigned to a peer must yield, never
+    // clobber the peer's claim via a plain LWW write.
+    let current;
     try {
-      claimStand(tracked.slotId, getPlayerId(), now);
+      current = readStandClaim(tracked.slotId);
+    } catch (err) {
+      console.error("[stands] readStandClaim threw during heartbeat:", err);
+      current = null;
+    }
+    const me = getPlayerId();
+    if (!canPlayerClaim(current, me, now)) {
+      // A different live peer is on our slot — the resume walked into a
+      // hand-off we missed. Forget the slot locally so the wrapped
+      // onRelease's ownership guard cannot false-positive later either.
+      this.trackedStand = null;
+      return;
+    }
+    try {
+      claimStand(tracked.slotId, me, now);
       tracked.lastHeartbeat = now;
     } catch (err) {
       console.error("[stands] heartbeat threw:", err);
@@ -4923,9 +4956,18 @@ export class World {
     // Preserve tier order (mine first, then civilian, then reserved-if-owner);
     // within a tier, sort by walk distance so the nearest open slot wins.
     // Stable sort keeps the tier grouping intact.
+    //
+    // AUDIT ALIGNMENT (finding #2). The pure engine's pickStandForWalkup gates
+    // the mine-active tier on isClaimActive: a stale-mine claim (leftover after
+    // a forced reload without a release) falls to openCivilian, NOT
+    // mine-active. Without matching that gate here, this local re-sort would
+    // re-promote the stale-mine slot to tier 0 and prefer it over a nearer
+    // open civilian slot — a subtle disagreement between the two layers. The
+    // aligned check keeps both layers on the same tier assignment.
+    const tierNow = Date.now();
     const tierOf = (s: StandSlot): number => {
       const claim = readStandClaim(s.id);
-      if (claim && claim.playerId === playerId) return 0;
+      if (claim && claim.playerId === playerId && isClaimActive(claim, tierNow)) return 0;
       return s.role ? 2 : 1;
     };
     free.sort((a, b) => {

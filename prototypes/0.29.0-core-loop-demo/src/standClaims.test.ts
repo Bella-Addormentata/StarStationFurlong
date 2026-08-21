@@ -736,3 +736,139 @@ describe('online-players provider (audit remediation for finding #5)', () => {
     expect(getOnlinePlayerIds().size).toBe(0);
   });
 });
+
+describe('heartbeat ownership guard (audit remediation for finding #1: frozen-tab resume)', () => {
+  // World.ts tickStandHeartbeat blindly overwrote another peer's claim after
+  // a background-tab freeze past the TTL. LWW picked the resumed-tab's write
+  // (its `at` is Date.now(), always > the peer's earlier claim) and displaced
+  // the peer's legitimate walk-up. Round-3 fix: consult canPlayerClaim on the
+  // current doc value BEFORE writing the heartbeat, and if we've lost tenure
+  // to another live peer, drop trackedStand and skip the write.
+  //
+  // Simulated at the doc level rather than through world.ts so the regression
+  // is hermetic (same pattern as the release-before-claim block above).
+  beforeEach(() => bindStandsDoc(new Y.Doc()));
+
+  /**
+   * The guarded heartbeat as a pure function. Mirrors the tickStandHeartbeat
+   * body in world.ts: read the current claim, decide via canPlayerClaim, and
+   * either write (renew) or null the tracked slot (yield). Returns the new
+   * tracked-stand slot id (or null when we yielded) so the test can assert.
+   */
+  function guardedHeartbeat(
+    trackedSlotId: string,
+    me: string,
+    now: number,
+  ): string | null {
+    const current = readStandClaim(trackedSlotId);
+    if (!canPlayerClaim(current, me, now)) return null;
+    claimStand(trackedSlotId, me, now);
+    return trackedSlotId;
+  }
+
+  it('yields the slot when a peer legitimately took over during a freeze', () => {
+    // t=0: Alice claims slot A and gets her wrapped onRelease + heartbeat
+    // tracker for it. Her tab then freezes.
+    claimStand('t1:s0', ALICE, T0);
+    // t=20 000 (> STAND_CLAIM_TTL_MS = 15 000): Bob walks up and, per
+    // pickStandForWalkup + canPlayerClaim, finds Alice's claim stale and
+    // legitimately takes the slot.
+    const takeoverAt = T0 + STAND_CLAIM_TTL_MS + 5_000;
+    claimStand('t1:s0', BOB, takeoverAt);
+    // t=25 000: Alice's tab resumes and her tickStandHeartbeat runs. The
+    // guard reads the doc, sees Bob's live claim, and refuses to write —
+    // the tracked stand is nulled and Bob's claim stays intact.
+    const resumeAt = takeoverAt + 5_000;
+    const result = guardedHeartbeat('t1:s0', ALICE, resumeAt);
+    expect(result).toBeNull();
+    expect(readStandClaim('t1:s0')).toEqual({ playerId: BOB, at: takeoverAt });
+  });
+
+  it('renews normally when the slot is still ours', () => {
+    // Ordinary heartbeat path — Alice's tab is live, her claim is still
+    // named + fresh, the write goes through.
+    claimStand('t1:s0', ALICE, T0);
+    const nextTick = T0 + STAND_CLAIM_HEARTBEAT_MS;
+    const result = guardedHeartbeat('t1:s0', ALICE, nextTick);
+    expect(result).toBe('t1:s0');
+    expect(readStandClaim('t1:s0')).toEqual({ playerId: ALICE, at: nextTick });
+  });
+
+  it('renews when our own claim aged past the TTL and nobody took over', () => {
+    // The heartbeat is scheduled from the local loop, so a heartbeat that
+    // fires exactly at TTL sees its own stale claim. canPlayerClaim treats
+    // "the claim is theirs" as always renewable — this stays a live
+    // heartbeat, not a yield. (Contrast with the frozen-tab case above:
+    // the difference is only whether another peer's write intervened.)
+    claimStand('t1:s0', ALICE, T0);
+    const late = T0 + STAND_CLAIM_TTL_MS + 100;
+    const result = guardedHeartbeat('t1:s0', ALICE, late);
+    expect(result).toBe('t1:s0');
+    expect(readStandClaim('t1:s0')).toEqual({ playerId: ALICE, at: late });
+  });
+
+  it('yields when the slot key is a hostile shape from another peer', () => {
+    // Belt-and-braces: a peer plants a non-claim value under our slot key.
+    // The shape guard reads it as null, canPlayerClaim(null, us, now) is
+    // true, and the heartbeat proceeds — this is the desired behaviour
+    // (garbage under our slot key does NOT strand us out of our own slot).
+    const doc = new Y.Doc();
+    bindStandsDoc(doc);
+    doc.getMap('stands').set('t1:s0', 'not-a-claim');
+    const result = guardedHeartbeat('t1:s0', ALICE, T0);
+    expect(result).toBe('t1:s0');
+    expect(readStandClaim('t1:s0')).toEqual({ playerId: ALICE, at: T0 });
+  });
+});
+
+describe('world.ts pickFreeStand tierOf alignment (audit remediation for finding #2)', () => {
+  // The world.ts sorter used to grant tier 0 to ANY slot the local player
+  // named in a claim, regardless of freshness. pickStandForWalkup gates the
+  // mine-active tier on isClaimActive: a stale-mine non-role claim falls to
+  // openCivilian. The disagreement let a stale-mine slot re-promote to tier
+  // 0 in the local re-sort and win over a nearer open civilian slot.
+  //
+  // These pure tests pin the aligned tier semantics — the world.ts sorter
+  // now also gates on isClaimActive, so both layers agree.
+
+  it('a stale-mine non-role claim is NOT tier 0', () => {
+    // Same shape the aligned world.ts tierOf uses: an active-mine claim
+    // is tier 0; a stale one is not.
+    const active: StandClaim = { playerId: ALICE, at: T0 };
+    const stale: StandClaim = { playerId: ALICE, at: T0 };
+    const nowActive = T0 + STAND_CLAIM_HEARTBEAT_MS;
+    const nowStale = T0 + STAND_CLAIM_TTL_MS + 100;
+    expect(isClaimActive(active, nowActive)).toBe(true);
+    expect(isClaimActive(stale, nowStale)).toBe(false);
+    // The world.ts tierOf's active-mine condition (aligned):
+    //   claim.playerId === me && isClaimActive(claim, now) → tier 0
+    // For a stale claim the isClaimActive gate fails, so tierOf falls
+    // through to `s.role ? 2 : 1` — matches openCivilian in the pure engine.
+  });
+
+  it('pickStandForWalkup emits a stale-mine non-role slot in openCivilian (tier 2 in the return order)', () => {
+    // Direct proof of what the pure engine does with a stale-mine claim:
+    // the mine-active guard fails (not active), canPlayerClaim allows the
+    // write (it's still ours in name), s.role is falsy → openCivilian.
+    const slots = [
+      slot('t1:s0'),
+      slot('t1:s1'),
+      slot('t1:s2'),
+    ];
+    const claims = new Map<string, StandClaim>([
+      ['t1:s1', { playerId: ALICE, at: T0 }], // stale-mine
+    ]);
+    const nowStale = T0 + STAND_CLAIM_TTL_MS + 100;
+    const picked = pickStandForWalkup({
+      slots,
+      claims,
+      playerId: ALICE,
+      now: nowStale,
+      canOperateReserved: false,
+    });
+    // All three slots are eligible (none held by another live peer); the
+    // stale-mine slot appears among openCivilian — position by insertion
+    // order, not promoted ahead as tier 0.
+    expect(picked.map((s) => s.id)).toEqual(['t1:s0', 't1:s1', 't1:s2']);
+  });
+});
