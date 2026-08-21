@@ -76,6 +76,7 @@ import {
   proposalPhase,
   proposalRows,
   companyScope,
+  type FundingReadAccess,
   roomFundingView,
   scopeProposals,
   sessionsFor,
@@ -1253,9 +1254,7 @@ async function joinRoomAtEpoch(
   bindOffers(sync.doc);
   // 🏦 Treasury caches: signed display records over this room's doc (plan §14).
   // Verify-on-read only — nothing here is authoritative (invariant 5). The
-  // genesis pin (§17.5) rejects records from any other network; the value is
-  // a DEV PLACEHOLDER that matches no real chain — replace with the release
-  // network configuration when PR C wires real treasury flows.
+  // genesis pin (§17.5) rejects records from any other network.
   bindTreasuryDoc(sync.doc, {
     verifySig: verifyIdentity,
     // An unconfigured build pins to a value treasuryDoc must refuse, which
@@ -2890,13 +2889,43 @@ function queueTreasuryRepaint(): void {
   }, 32);
 }
 
+/**
+ * Is the treasury view actually on screen?
+ *
+ * Two conditions, because the view's own class is not enough. Tab closes the
+ * phone by toggling `#spacephone-container.active` and never calls
+ * showPhoneView, so `#phone-app-treasury` keeps its `active` class while the
+ * container is merely slid offscreen — it is never display:none, so the
+ * subtree stays laid out. Checking only the view meant a player who opened
+ * TREASURY, pressed Tab and walked away still paid a full rebuild, relayout
+ * and a page of signature checks for every key any peer wrote, at up to 31 Hz,
+ * with no treasury screen anywhere in sight.
+ */
+function treasuryViewOnScreen(view: HTMLElement): boolean {
+  const phone = document.getElementById("spacephone-container");
+  return Boolean(phone?.classList.contains("active"))
+    && view.classList.contains("active");
+}
+
 function paintTreasuryApp(view: HTMLElement): void {
   // Every treasury record that lands fires this. Re-verifying the whole cache
   // for a view nobody is looking at is wasted signature work, and the app
-  // repaints on open anyway.
-  if (!view.classList.contains("active") && view.dataset.wired) return;
+  // repaints on open anyway — showPhoneView("treasury") always renders.
+  //
+  // Unconditional: this used to also require `view.dataset.wired`, which is
+  // set INSIDE this function, so on a fresh load the latch was unset and the
+  // first record any peer synced painted the hidden view in full — the one
+  // pass where no memo is warm. The listeners it was protecting are wired
+  // below, off the painted path, so nothing needs the paint to have run.
+  if (!treasuryViewOnScreen(view)) return;
   // Same black-inheritance fix as the BANK/VENTURES apps.
   view.style.color = "#e8d5a3";
+  wireTreasuryView(view);
+  paintTreasuryBody(view);
+}
+
+/** One-time listener wiring, kept out of the paint so the guard can precede it. */
+function wireTreasuryView(view: HTMLElement): void {
   if (!view.dataset.wired) {
     view.dataset.wired = "1";
     const activate = (target: EventTarget | null) => {
@@ -2938,6 +2967,9 @@ function paintTreasuryApp(view: HTMLElement): void {
       stops[next].focus();
     });
   }
+}
+
+function paintTreasuryBody(view: HTMLElement): void {
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
   const header = (t: string) =>
@@ -3015,7 +3047,15 @@ function paintTreasuryApp(view: HTMLElement): void {
   // changing under it would leave a proposal on screen that the list has
   // since withheld.
   const roomId = activeBootstrap?.roomId ?? "";
-  const readable = net.configured && Boolean(roomId);
+  // Which obstacle, not just whether there is one — an unconfigured build and
+  // a missing room document are different facts and the player gets told
+  // which. The terminal panel derives the same three states.
+  const access: FundingReadAccess = !net.configured
+    ? "no-network"
+    : !roomId
+      ? "no-room"
+      : "readable";
+  const readable = access === "readable";
   const scope = companyScope(
     readable ? readRoomBinding(roomId) : null,
     policyCache?.policy ?? null,
@@ -3198,7 +3238,7 @@ function paintTreasuryApp(view: HTMLElement): void {
   const binding = roomFundingView(
     readable ? readRoomBinding(roomId) : null,
     height,
-    readable,
+    access,
   );
   const balances = balanceView();
   const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
@@ -3278,7 +3318,7 @@ function paintTreasuryApp(view: HTMLElement): void {
               ${row("Fee ceiling per spend", esc(b.maxFee))}
               <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:5px;">Policy fingerprint</div>
               <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against the chain">${esc(showPolicy.policyHash)}</div>
-              ${classes
+              ${classes.items
                 .map((c) =>
                   row(
                     `Share class · ${esc(c.id)}`,
@@ -3286,6 +3326,13 @@ function paintTreasuryApp(view: HTMLElement): void {
                   ),
                 )
                 .join("")}
+              ${
+                classes.truncated
+                  ? dim(
+                      `${classes.hidden} more share class${classes.hidden === 1 ? "" : "es"} in this policy are not shown here. How many a policy declares is chosen by whoever wrote it.`,
+                    )
+                  : ""
+              }
               ${dim(esc(b.note))}`;
           })()
         : dim(

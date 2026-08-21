@@ -1117,7 +1117,16 @@
       .ssf-trust-badge:focus-visible::after {
         content: attr(data-detail);
         position: absolute;
-        left: 0;
+        /* Anchored to the badge's RIGHT edge, growing leftward. Every badge is
+           the trailing item of its header row, so it sits near the right of a
+           ~312px content box; anchoring left pushed 35-75% of the text past
+           the phone bezel, where `pointer-events: none` meant a mouse could
+           not chase it and .phone-app-view.active's overflow-y:auto turned the
+           overspill into a horizontal scrollbar. The qualification behind a
+           badge is the whole reason the tooltip exists, so it has to be
+           readable in full. */
+        right: 0;
+        left: auto;
         top: calc(100% + 4px);
         z-index: 20;
         width: max-content;

@@ -560,22 +560,69 @@ describe('policy, shares, and room funding', () => {
 
   it('reads share classes without offering creation', () => {
     const classes = shareClassViews(policy);
-    expect(classes).toHaveLength(1);
-    expect(classes[0].id).toBe('common');
-    expect(Object.keys(classes[0])).toEqual([
+    expect(classes.items).toHaveLength(1);
+    expect(classes.truncated).toBe(false);
+    expect(classes.hidden).toBe(0);
+    expect(classes.items[0].id).toBe('common');
+    expect(Object.keys(classes.items[0])).toEqual([
       'id', 'votesPerWholeShare', 'grantsRoomAccess', 'transferable',
     ]);
+  });
+
+  it('caps how many share classes it will hand over, and says how many it dropped', () => {
+    // The policy key is peer-writable and shape-only, and nothing in the
+    // record schema limits how many classes it declares — so an unbounded
+    // list here became an unbounded row count in the phone's COMPANY panel,
+    // rebuilt on every repaint a peer chose to trigger. The proposal list
+    // beside it has capped and disclosed its page all along; same contract.
+    const many = {
+      ...policy,
+      shareClasses: Array.from({ length: 40 }, (_unused, i) => ({
+        ...policy.shareClasses[0],
+        id: `class-${i}`,
+        assetId: `${i}`.padStart(64, '0'),
+      })),
+    } as CompanyTreasuryPolicy;
+    const capped = shareClassViews(many, 5);
+    expect(capped.items).toHaveLength(5);
+    expect(capped.truncated).toBe(true);
+    // The count is what the on-screen line reports, so it has to be right.
+    expect(capped.hidden).toBe(35);
+    // A cap at or above the real length drops nothing and claims nothing.
+    const whole = shareClassViews(many, 40);
+    expect(whole.items).toHaveLength(40);
+    expect(whole.truncated).toBe(false);
+    expect(whole.hidden).toBe(0);
+    // Degenerate budgets stay honest rather than throwing or over-reporting.
+    const zero = shareClassViews(many, 0);
+    expect(zero.items).toHaveLength(0);
+    expect(zero.truncated).toBe(true);
+    expect(zero.hidden).toBe(40);
   });
 
   it('distinguishes "cannot read" from "no record exists"', () => {
     // A read that cannot run is not evidence of absence — the terminal used
     // to report an unconfigured build as "no company funding record".
-    const disabled = roomFundingView(null, null, false);
-    expect(disabled.headline).toMatch(/unavailable/i);
-    expect(disabled.detail).toMatch(/not set up to read/i);
-    expect(disabled.headline).not.toMatch(/no company funding record/i);
-    const readableButEmpty = roomFundingView(null, null, true);
+    for (const access of ['no-network', 'no-room'] as const) {
+      const disabled = roomFundingView(null, null, access);
+      expect(disabled.headline).toMatch(/unavailable/i);
+      expect(disabled.headline).not.toMatch(/no company funding record/i);
+    }
+    const readableButEmpty = roomFundingView(null, null, 'readable');
     expect(readableButEmpty.headline).toMatch(/no company funding record/i);
+  });
+
+  it('names WHICH obstacle stopped the read, since they are different facts', () => {
+    // Rolled into one boolean, an unconfigured build got blamed on a failing
+    // room connection — wrong, and unactionable: nothing about the room is
+    // broken. That was every build today, since no genesis is configured.
+    const noNetwork = roomFundingView(null, null, 'no-network');
+    expect(noNetwork.detail).toMatch(/no company network is set up/i);
+    // Must not pin it on the room, which is working fine.
+    expect(noNetwork.detail).not.toMatch(/not attached to a room/i);
+    const noRoom = roomFundingView(null, null, 'no-room');
+    expect(noRoom.detail).toMatch(/not attached to a room/i);
+    expect(noRoom.detail).not.toMatch(/network/i);
   });
 
   it('reports a missing binding as missing, not as personal funding', () => {
@@ -779,14 +826,15 @@ describe('player vocabulary rule', () => {
     const push = (where: string, text: string) => treasuryBlocks.push({ where, text });
     push('treasuryView.ts', readFileSync(join(root, 'treasuryView.ts'), 'utf8'));
     push('treasuryNetwork.ts', readFileSync(join(root, 'treasuryNetwork.ts'), 'utf8'));
-    // main.ts: just the treasury render function.
-    // paintTreasuryApp, NOT renderTreasuryApp: the latter is only the
-    // focus-preserving wrapper, so slicing from it would scan none of the
-    // player-visible markup this guard exists to cover.
+    // main.ts: just the function that builds the markup. Not
+    // renderTreasuryApp (the focus-preserving wrapper) and not
+    // paintTreasuryApp (now the guard plus two calls) — either would scan
+    // none of the player-visible strings this guard exists to cover. The
+    // assertions below are what make that mistake loud instead of silent.
     const main = readFileSync(join(root, 'main.ts'), 'utf8');
-    const start = main.indexOf('function paintTreasuryApp');
+    const start = main.indexOf('function paintTreasuryBody');
     const end = main.indexOf('\nfunction ', start + 1);
-    expect(start, 'paintTreasuryApp not found — did the render split change?')
+    expect(start, 'paintTreasuryBody not found — did the render split change?')
       .toBeGreaterThan(-1);
     const slice = main.slice(start, end > 0 ? end : undefined);
     // Prove the slice really holds rendered strings, so a future rename
@@ -807,7 +855,18 @@ describe('player vocabulary rule', () => {
     expect(first).toBeGreaterThan(-1);
     expect(last, 'FUNDING markup and refresh block should be distinct regions')
       .toBeGreaterThan(first);
-    push('devices.ts refresh block', devices.slice(first - 600, first + 2500));
+    // The refresh block runs to where its assembled lines are written out.
+    // A fixed character window stopped short of that and silently missed
+    // every literal in the `lines` array — all of it player-visible
+    // textContent. Slice to the write itself, and self-check it, so the same
+    // shortfall cannot happen quietly again.
+    const refreshEnd = devices.indexOf('fundDetailEl.textContent', first);
+    expect(refreshEnd, 'refresh block end marker not found').toBeGreaterThan(first);
+    const refresh = devices.slice(first - 600, refreshEnd + 200);
+    for (const literal of ['NOT SHOWN YET', 'BOUND AT', 'PROFILE ']) {
+      expect(refresh, `refresh slice missing ${literal}`).toContain(literal);
+    }
+    push('devices.ts refresh block', refresh);
     push('devices.ts FUNDING markup', devices.slice(last - 600, last + 2500));
     // The markup slice must actually contain the player-visible command
     // labels, or this test is guarding nothing.

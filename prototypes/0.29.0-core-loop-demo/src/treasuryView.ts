@@ -594,15 +594,56 @@ export interface ShareClassView {
   transferable: boolean;
 }
 
-/** §11.4: classes are readable, creation stays out of the UI. */
-export function shareClassViews(policy: CompanyTreasuryPolicy): ShareClassView[] {
-  return policy.shareClasses.map((c) => ({
-    id: c.id,
-    votesPerWholeShare: c.votesPerWholeShare,
-    grantsRoomAccess: c.grantsRoomAccess,
-    transferable: c.transferable,
-  }));
+export interface ShareClassListView {
+  items: ShareClassView[];
+  /** True when the policy declares more classes than were returned. */
+  truncated: boolean;
+  /** How many were left out — named on screen, never silently dropped. */
+  hidden: number;
 }
+
+/**
+ * §11.4: classes are readable, creation stays out of the UI.
+ *
+ * Bounded, and honest about it. The policy key is peer-writable, shape-only
+ * and plain-replace, and nothing in the record schema limits how many classes
+ * it declares — so an unbounded map here became an unbounded row count in the
+ * phone's COMPANY panel, rebuilt into innerHTML on every repaint a peer chose
+ * to trigger, pushing BALANCES and PROPOSALS off the screen. The record-size
+ * budget in treasuryDoc refuses the extreme cases but still admits a few
+ * hundred classes, which is a few hundred rows.
+ *
+ * The proposal list beside this one has capped and disclosed its page since
+ * PR C; this is the same contract, in the same unit-tested layer, so the cap
+ * cannot be forgotten by a caller building markup.
+ */
+export function shareClassViews(
+  policy: CompanyTreasuryPolicy,
+  max = 24,
+): ShareClassListView {
+  const all = policy.shareClasses;
+  const shown = max >= 0 ? all.slice(0, max) : [];
+  return {
+    items: shown.map((c) => ({
+      id: c.id,
+      votesPerWholeShare: c.votesPerWholeShare,
+      grantsRoomAccess: c.grantsRoomAccess,
+      transferable: c.transferable,
+    })),
+    truncated: shown.length < all.length,
+    hidden: all.length - shown.length,
+  };
+}
+
+/**
+ * Whether this device can read funding records at all, and if not, why.
+ *
+ *  'readable'    a network is pinned and a room document is attached.
+ *  'no-network'  no company network is configured for this build — a local
+ *                setup fact, nothing to do with the room or the connection.
+ *  'no-room'     no room document to read from.
+ */
+export type FundingReadAccess = 'readable' | 'no-network' | 'no-room';
 
 export interface RoomFundingView {
   bound: boolean;
@@ -651,18 +692,20 @@ export function roomFundingView(
   binding: RoomTreasuryBinding | null,
   currentHeight: number | null = null,
   /**
-   * False when treasury reads are switched off (no network configured, or no
-   * room document). A read that cannot run is NOT evidence that no record
-   * exists, so it must not be reported as one.
+   * Why a read could or could not run. A read that cannot run is NOT evidence
+   * that no record exists — and WHICH obstacle stopped it is a fact of its own
+   * that the player is entitled to. Rolled into one boolean, an unconfigured
+   * build got blamed on a failing room connection, which is both wrong and
+   * unactionable: nothing about the room is broken.
    */
-  readable = true,
+  access: FundingReadAccess = 'readable',
 ): RoomFundingView {
   const readOnlyNote = 'Read-only: this device does not check the chain, so none of this is confirmed.';
   const unavailable = [
     'Covered systems and remaining budgets',
     'Any pending request to bind or unbind',
   ];
-  if (!readable) {
+  if (access !== 'readable') {
     return {
       bound: false,
       expiryStatus: 'none',
@@ -681,7 +724,10 @@ export function roomFundingView(
         detail: 'No lookup was possible, so nothing is known either way.',
       },
       headline: 'Funding records unavailable',
-      detail: 'This device is not set up to read company records, so it cannot say how this room is funded either way.',
+      detail:
+        access === 'no-network'
+          ? 'No company network is set up for this build, so this device cannot read company records at all. Nothing here is a fault in this room.'
+          : 'This device is not attached to a room’s records, so it cannot say how this room is funded either way.',
       readOnlyNote,
       unavailable,
     };

@@ -37,7 +37,13 @@ import {
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
 import { readChainSyncStatus, readRoomBinding, treasuryDocBound } from './treasuryDoc';
 import { treasuryNetwork } from './treasuryNetwork';
-import { displayHeight, formatHeight, roomFundingView, shortId } from './treasuryView';
+import {
+  type FundingReadAccess,
+  displayHeight,
+  formatHeight,
+  roomFundingView,
+  shortId,
+} from './treasuryView';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -461,8 +467,18 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       // network pinned, every treasury read is disabled and returns null,
       // which is NOT the same as there being no funding record. Gate on the
       // network too so a disabled read is never reported as an absence.
-      const connected =
-        Boolean(roomId) && treasuryDocBound() && treasuryNetwork().configured;
+      // Three obstacles, not one. Collapsing them into a single boolean made
+      // this panel blame the room connection for an unconfigured build —
+      // which is every build with no VITE_SSF_TREASURY_GENESIS set, so a
+      // player in a perfectly healthy room read "cannot reach the room's
+      // records" while their own phone correctly said no network is
+      // configured. Two surfaces in one PR, contradicting each other.
+      const access: FundingReadAccess = !treasuryNetwork().configured
+        ? 'no-network'
+        : !roomId || !treasuryDocBound()
+          ? 'no-room'
+          : 'readable';
+      const connected = access === 'readable';
       // Only a peer-reported height exists today. It is enough to flag a
       // record whose end height looks passed (the conservative direction),
       // but it can never establish that one is still live — the colour below
@@ -473,7 +489,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       const funding = roomFundingView(
         connected ? readRoomBinding(roomId) : null,
         height,
-        connected,
+        access,
       );
       // No record is NOT the same fact as "funded personally", and an
       // unreachable room document is a third state again — say which one.
@@ -497,7 +513,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           : '#3E92B8';
       const lines = !connected
         ? [
-            'This terminal cannot reach the room’s records, so it cannot say how the room is funded.',
+            // The model already worked out which obstacle this is and said so
+            // in the player's words. Substituting a hard-coded sentence here
+            // threw that away and named the wrong cause.
+            funding.detail,
             funding.readOnlyNote,
           ]
         : funding.bound
