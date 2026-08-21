@@ -35,7 +35,7 @@ import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
-import { readChainSyncStatus, readRoomBinding, treasuryDocBound } from './treasuryDoc';
+import { readChainSyncStatus, readRoomBindingResult, treasuryDocBound } from './treasuryDoc';
 import { treasuryNetwork } from './treasuryNetwork';
 import {
   type FundingReadAccess,
@@ -490,10 +490,13 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       const height = connected
         ? displayHeight(readChainSyncStatus()).height
         : null;
+      // Result form, so a record refused on size reads as a refusal rather
+      // than as an absence — the panel's whole job is keeping those apart.
+      const bindingResult = connected ? readRoomBindingResult(roomId) : null;
       const funding = roomFundingView(
-        connected ? readRoomBinding(roomId) : null,
+        bindingResult?.status === 'ok' ? bindingResult.binding : null,
         height,
-        access,
+        bindingResult?.status === 'too-large' ? 'too-large' : access,
       );
       // No record is NOT the same fact as "funded personally", and an
       // unreachable room document is a third state again — say which one.

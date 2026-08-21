@@ -53,6 +53,7 @@ import {
   readReceiptCache,
   readRegistration,
   readRoomBinding,
+  readRoomBindingResult,
   scanProposals,
   scanVotes,
   readVote,
@@ -611,7 +612,11 @@ describe('network pinning', () => {
     // whether anything may be read out of it, and callers report them apart.
     expect(treasuryDocBound()).toBe(true);
     expect(readProposal(proposal.proposalId)).toBeNull();
-    expect(scanProposals(100, 100)).toEqual({ items: [], truncated: false });
+    expect(scanProposals(100, 100)).toEqual({
+      items: [],
+      truncated: false,
+      refusedTooLarge: 0,
+    });
     expect(readPolicyCache()).toBeNull();
     // The sync entry carries no genesis of its own, so this is the only place
     // it can fail closed inside the cache layer.
@@ -717,6 +722,49 @@ describe('verification caching', () => {
       (held as unknown as { proposerSig: string }).proposerSig = 'tampered';
     }).toThrow();
     expect(readProposal(p.proposalId)?.proposerSig).toBe(p.proposerSig);
+  });
+
+  it('survives a peer storing binary in a treasury slot', () => {
+    // Object.freeze THROWS on an ArrayBuffer view with elements, and Yjs will
+    // store a Uint8Array a peer puts in a slot. Because the freeze runs before
+    // any shape guard, one binary value used to abort the whole read — and
+    // with it the treasury render — instead of being rejected.
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    const m = doc.getMap('treasury');
+    m.set(`proposal:${'8'.repeat(64)}`, new Uint8Array([1, 2, 3]));
+    m.set(`binding:room-bin`, new Uint8Array([4, 5, 6]));
+    expect(() => readProposal('8'.repeat(64))).not.toThrow();
+    expect(readProposal('8'.repeat(64))).toBeNull();
+    expect(() => readRoomBinding('room-bin')).not.toThrow();
+    expect(readRoomBinding('room-bin')).toBeNull();
+    // The scan walks past it and still returns the honest record beside it.
+    expect(() => scanProposals(99, 99)).not.toThrow();
+    expect(scanProposals(99, 99).items).toEqual([p]);
+    // An EMPTY typed array does not throw on freeze, so cover both shapes.
+    m.set(`proposal:${'9'.repeat(64)}`, new Uint8Array());
+    expect(() => listProposals()).not.toThrow();
+  });
+
+  it('reports a record refused on size as refused, not as absent', () => {
+    // The size cap is this device's decision, so a protocol-valid record that
+    // trips it is still a record the room is holding. Collapsing it into the
+    // same null as a missing record had the UI say NO DATA about it.
+    const huge = 'x'.repeat(200_000);
+    const p = makeProposal();
+    const m = doc.getMap('treasury');
+    m.set(`binding:room-big`, { roomId: 'room-big', filler: huge });
+    expect(readRoomBindingResult('room-big').status).toBe('too-large');
+    // Absent, unreadable and too-large stay three different answers.
+    expect(readRoomBindingResult('room-missing').status).toBe('absent');
+    m.set('binding:room-junk', { roomId: 'room-junk', nonsense: true });
+    expect(readRoomBindingResult('room-junk').status).toBe('unreadable');
+    // Scans count refusals rather than silently dropping them.
+    expect(putProposal(p)).toBe(true);
+    m.set(`proposal:${'a5'.repeat(32)}`, { proposalId: 'a5'.repeat(32), filler: huge });
+    const scan = scanProposals(99, 99);
+    expect(scan.refusedTooLarge).toBe(1);
+    expect(scan.items).toEqual([p]); // the honest one still lists
   });
 
   it('refuses a record too large to be worth checking, in constant time', () => {

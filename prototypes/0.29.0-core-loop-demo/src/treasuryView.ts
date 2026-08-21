@@ -663,8 +663,11 @@ export function shareClassViews(
  *  'no-network'  no company network is configured for this build — a local
  *                setup fact, nothing to do with the room or the connection.
  *  'no-room'     no room document to read from.
+ *  'too-large'   a binding IS held, and this device refused to read it on
+ *                size alone. A local decision, so it is reported as a refusal
+ *                rather than as no record.
  */
-export type FundingReadAccess = 'readable' | 'no-network' | 'no-room';
+export type FundingReadAccess = 'readable' | 'no-network' | 'no-room' | 'too-large';
 
 export interface RoomFundingView {
   bound: boolean;
@@ -744,11 +747,16 @@ export function roomFundingView(
         ...trustTag('absent'),
         detail: 'No lookup was possible, so nothing is known either way.',
       },
-      headline: 'Funding records unavailable',
+      headline:
+        access === 'too-large'
+          ? 'Funding record too large to read'
+          : 'Funding records unavailable',
       detail:
         access === 'no-network'
           ? 'No company network is set up for this build, so this device cannot read company records at all. Nothing here is a fault in this room.'
-          : 'This device is not attached to a room’s records, so it cannot say how this room is funded either way.',
+          : access === 'too-large'
+            ? 'This room is holding a company funding record, but it is too large for this device to read. That is this device’s limit, not a fault in the record — and it is not the same as there being no record.'
+            : 'This device is not attached to a room’s records, so it cannot say how this room is funded either way.',
       readOnlyNote,
       unavailable,
     };

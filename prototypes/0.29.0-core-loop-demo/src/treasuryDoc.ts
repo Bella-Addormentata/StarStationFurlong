@@ -251,7 +251,24 @@ function put(key: string, value: unknown): boolean {
  */
 type VerdictClass = 'proposal' | 'vote' | 'checkpoint' | 'binding' | 'session';
 
-function freshVerdictCaches(): Record<VerdictClass, WeakMap<object, boolean>> {
+/**
+ * Why a record is or is not usable — three answers, not two.
+ *
+ *  'ok'         valid, and checked here.
+ *  'invalid'    held, but fails its shape, pin, id or signature.
+ *  'too-large'  held, quite possibly valid on the wire, and refused only
+ *               because reading it would cost this device more than it is
+ *               willing to spend.
+ *
+ * The last one is a LOCAL decision, so collapsing it into 'invalid' — or into
+ * the `null` a reader returns for both — would have the UI report a record the
+ * room is holding as one that does not exist. That is the absence-as-fact
+ * mistake this module refuses everywhere else, and readPolicyCacheResult
+ * already refuses it for the policy slot.
+ */
+export type RecordVerdict = 'ok' | 'invalid' | 'too-large';
+
+function freshVerdictCaches(): Record<VerdictClass, WeakMap<object, RecordVerdict>> {
   return {
     proposal: new WeakMap(),
     vote: new WeakMap(),
@@ -334,6 +351,13 @@ function smallEnough(value: unknown, budget = RECORD_BUDGET): boolean {
  */
 function deepFreeze<T>(value: T): T {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  // Typed arrays are left alone. Object.freeze THROWS on an ArrayBuffer view
+  // with elements, and Yjs will happily store a Uint8Array a peer put in a
+  // slot — so freezing before the shape guard turned one binary value into an
+  // exception that aborted the whole treasury render. No treasury record
+  // contains binary, so skipping here costs nothing: the value still meets its
+  // type guard next and is rejected the ordinary way.
+  if (ArrayBuffer.isView(value)) return value;
   Object.freeze(value);
   for (const key of Object.getOwnPropertyNames(value)) {
     deepFreeze((value as Record<string, unknown>)[key]);
@@ -356,8 +380,8 @@ function cachedVerdict(
   cls: VerdictClass,
   value: unknown,
   compute: () => boolean,
-): boolean {
-  if (typeof value !== 'object' || value === null) return compute();
+): RecordVerdict {
+  if (typeof value !== 'object' || value === null) return compute() ? 'ok' : 'invalid';
   const verdicts = verdictCaches[cls];
   const hit = verdicts.get(value);
   if (hit !== undefined) return hit;
@@ -366,12 +390,14 @@ function cachedVerdict(
   // check exists to avoid. A record too large to be plausible is refused
   // without the encoder, the hash or the freeze ever touching it — and the
   // refusal is cached, so re-reading cannot re-charge it.
-  let verdict = false;
-  if (smallEnough(value)) {
+  let verdict: RecordVerdict;
+  if (!smallEnough(value)) {
+    verdict = 'too-large';
+  } else {
     // Frozen BEFORE the verdict is computed and stored, so there is no window
     // in which a cached verdict describes bytes that can still change.
     deepFreeze(value);
-    verdict = compute();
+    verdict = compute() ? 'ok' : 'invalid';
   }
   verdicts.set(value, verdict);
   return verdict;
@@ -391,6 +417,11 @@ function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
 // ---------------------------------------------------------------------------
 
 function validProposal(value: unknown): value is TreasuryProposal {
+  return proposalVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function proposalVerdict(value: unknown): RecordVerdict {
   return cachedVerdict('proposal', value, () => validProposalUncached(value));
 }
 
@@ -464,6 +495,13 @@ export function listProposals(): TreasuryProposal[] {
 export interface BoundedScan<T> {
   items: T[];
   truncated: boolean;
+  /**
+   * How many entries this device declined to read on size alone. Counted
+   * apart from invalid ones: those may well be valid records, refused by a
+   * local budget, so folding them into the same silence would let the list
+   * report "no proposals" about proposals the room is holding.
+   */
+  refusedTooLarge: number;
 }
 
 function scanPrefixed<T>(
@@ -471,34 +509,44 @@ function scanPrefixed<T>(
   maxEntries: number,
   maxChecks: number,
   take: (key: string, value: unknown) => T | null,
+  /** Optional: lets a caller count entries refused on size alone. */
+  verdictOf?: (value: unknown) => RecordVerdict,
 ): BoundedScan<T> {
   const m = readMap();
-  if (!m) return { items: [], truncated: false };
+  if (!m) return { items: [], truncated: false, refusedTooLarge: 0 };
   const items: T[] = [];
   let visited = 0;
   let checked = 0;
+  let refusedTooLarge = 0;
   for (const [key, value] of m.entries()) {
     // Counted BEFORE the prefix test: a skipped key is still a key this
     // repaint had to look at.
-    if (visited >= maxEntries) return { items, truncated: true };
+    if (visited >= maxEntries) return { items, truncated: true, refusedTooLarge };
     visited += 1;
     if (!key.startsWith(prefix)) continue;
     // Counted BEFORE `take` runs, for the same reason: the check is the
     // expensive part, so the budget has to be spent before it, not after.
-    if (checked >= maxChecks) return { items, truncated: true };
+    if (checked >= maxChecks) return { items, truncated: true, refusedTooLarge };
     checked += 1;
+    // Asked first, so the verdict is cached and `take` costs nothing extra.
+    if (verdictOf?.(value) === 'too-large') refusedTooLarge += 1;
     const kept = take(key, value);
     if (kept !== null) items.push(kept);
   }
-  return { items, truncated: false };
+  return { items, truncated: false, refusedTooLarge };
 }
 
 export function scanProposals(
   maxEntries: number,
   maxChecks: number,
 ): BoundedScan<TreasuryProposal> {
-  return scanPrefixed('proposal:', maxEntries, maxChecks, (key, value) =>
-    validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
+  return scanPrefixed(
+    'proposal:',
+    maxEntries,
+    maxChecks,
+    (key, value) =>
+      validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
+    proposalVerdict,
   );
 }
 
@@ -534,7 +582,7 @@ export function scanCheckpoints(
 // ---------------------------------------------------------------------------
 
 function validVote(value: unknown): value is TreasuryVote {
-  return cachedVerdict('vote', value, () => validVoteUncached(value));
+  return cachedVerdict('vote', value, () => validVoteUncached(value)) === 'ok';
 }
 
 function validVoteUncached(value: unknown): value is TreasuryVote {
@@ -766,7 +814,7 @@ export function readWindowsCache(proposalId: string): ProposalWindows | null {
 // ---------------------------------------------------------------------------
 
 function validCheckpoint(value: unknown): value is TreasuryCheckpoint {
-  return cachedVerdict('checkpoint', value, () => validCheckpointUncached(value));
+  return cachedVerdict('checkpoint', value, () => validCheckpointUncached(value)) === 'ok';
 }
 
 function validCheckpointUncached(value: unknown): value is TreasuryCheckpoint {
@@ -827,7 +875,7 @@ function validSessionShell(value: unknown, proposalId: string, sessionId: string
   // distinctness check, so leaving it outside meant a peer-written shell with
   // a huge signature array was walked in full on every repaint — before the
   // size budget could refuse it, and without the memo ever saving a repeat.
-  if (!cachedVerdict('session', value, () => isSigningSession(value) && selfConsistentSession(value))) {
+  if (cachedVerdict('session', value, () => isSigningSession(value) && selfConsistentSession(value)) !== 'ok') {
     return false;
   }
   // Only the caller-dependent slot checks stay outside. They compare the
@@ -907,11 +955,12 @@ export function scanSigningSessions(
   maxChecks: number,
 ): BoundedScan<SigningSession> {
   const m = readMap();
-  if (!m) return { items: [], truncated: false };
+  if (!m) return { items: [], truncated: false, refusedTooLarge: 0 };
   const shellPrefix = `session:${proposalId}:`;
   let visited = 0;
   let checked = 0;
   let truncated = false;
+  let refusedTooLarge = 0;
   const shells: { sessionId: string; shell: SigningSession }[] = [];
   const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
   for (const [key, value] of m.entries()) {
@@ -956,7 +1005,7 @@ export function scanSigningSessions(
     const assembled = { ...shell, collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
   }
-  return { items: out, truncated };
+  return { items: out, truncated, refusedTooLarge };
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +1013,11 @@ export function scanSigningSessions(
 // ---------------------------------------------------------------------------
 
 function validBinding(value: unknown): value is RoomTreasuryBinding {
+  return bindingVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function bindingVerdict(value: unknown): RecordVerdict {
   return cachedVerdict('binding', value, () => validBindingUncached(value));
 }
 
@@ -983,11 +1037,34 @@ export function putRoomBinding(binding: RoomTreasuryBinding): boolean {
   return put(`binding:${binding.roomId}`, binding);
 }
 
-export function readRoomBinding(roomId: string): RoomTreasuryBinding | null {
+/**
+ * The room's funding binding, or WHY there is none to show — the same four
+ * states readPolicyCacheResult reports, and for the same reason: 'too-large'
+ * is this device's own refusal, so answering it with the silence used for a
+ * missing record would deny a record the room is holding.
+ */
+export type RoomBindingResult =
+  | { status: 'ok'; binding: RoomTreasuryBinding }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+export function readRoomBindingResult(roomId: string): RoomBindingResult {
   const m = readMap();
-  if (!m) return null;
+  if (!m) return { status: 'absent' };
   const value = m.get(`binding:${roomId}`);
-  return validBinding(value) && value.roomId === roomId ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  const verdict = bindingVerdict(value);
+  if (verdict === 'too-large') return { status: 'too-large' };
+  // The slot-claim check stays out of the verdict: it compares the record
+  // against the caller's room id rather than judging the record itself.
+  if (verdict !== 'ok' || (value as RoomTreasuryBinding).roomId !== roomId) {
+    return { status: 'unreadable' };
+  }
+  return { status: 'ok', binding: value as RoomTreasuryBinding };
+}
+
+export function readRoomBinding(roomId: string): RoomTreasuryBinding | null {
+  const result = readRoomBindingResult(roomId);
+  return result.status === 'ok' ? result.binding : null;
 }
 
 // §13.1's immutable-body rule is enforced where receipts are VERIFIABLE —

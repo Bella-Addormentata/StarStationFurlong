@@ -52,6 +52,7 @@ import {
   readProposalPayload,
   readRegistration,
   readRoomBinding,
+  readRoomBindingResult,
   readWindowsCache,
   scanCheckpoints,
   scanProposals,
@@ -3139,7 +3140,11 @@ function paintTreasuryBody(view: HTMLElement): void {
     const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
     const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
     const sessionScan = scanSigningSessions(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
-    const detailPartial = voteScan.truncated || cpScan.truncated || sessionScan.truncated;
+    // Only the two scans that FEED the vote panel. Including the approval scan
+    // made a proposal with many approval rounds tell the VOTES panel its own
+    // figures were partial when they were complete — and approval truncation
+    // already has its own warning where it belongs.
+    const votesPartial = voteScan.truncated || cpScan.truncated;
     const votes = voteTallyView(
       voteScan.items,
       // Vote records are keyed by proposal id alone, so one filed under
@@ -3201,9 +3206,16 @@ function paintTreasuryBody(view: HTMLElement): void {
       ${dim(esc(votes.note))}
       ${dim(esc(votes.caveat))}
       ${
-        detailPartial
+        votesPartial
           ? dim(
-              "This room holds more records than were read for this screen, so these figures cover only part of what is here.",
+              "This room holds more vote records than were read for this screen, so these figures cover only part of what is here.",
+            )
+          : ""
+      }
+      ${
+        voteScan.refusedTooLarge + cpScan.refusedTooLarge > 0
+          ? dim(
+              `${voteScan.refusedTooLarge + cpScan.refusedTooLarge} record${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted here. That is this device's limit, not a fault in the records.`,
             )
           : ""
       }
@@ -3241,10 +3253,13 @@ function paintTreasuryBody(view: HTMLElement): void {
   // ── List screen ────────────────────────────────────────────────────────
   // roomId, readable and scope come from above, so this branch and the detail
   // branch always agree about whose company is on screen.
+  // The result form, so a binding this device refused on size is reported as
+  // a refusal rather than joining the silence used for a missing record.
+  const bindingResult = readable ? readRoomBindingResult(roomId) : null;
   const binding = roomFundingView(
-    readable ? readRoomBinding(roomId) : null,
+    bindingResult?.status === "ok" ? bindingResult.binding : null,
     height,
-    access,
+    bindingResult?.status === "too-large" ? "too-large" : access,
   );
   const balances = balanceView();
   const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
@@ -3397,8 +3412,19 @@ function paintTreasuryBody(view: HTMLElement): void {
                   ? // The scan stopped before the end of the map, so "none"
                     // is a claim this screen cannot make.
                     "No proposals were found in the part of this room's records that was read, and the rest was not looked at."
-                  : "No proposals in this room's records yet.",
+                  : page.refusedTooLarge > 0
+                    ? // Records ARE here — this device just would not read
+                      // them. Saying "none" would deny what the room holds.
+                      `No proposals could be listed. ${page.refusedTooLarge} record${page.refusedTooLarge === 1 ? " in" : "s in"} this room ${page.refusedTooLarge === 1 ? "was" : "were"} too large for this device to read.`
+                    : "No proposals in this room's records yet.",
             )
+    }
+    ${
+      rows.length > 0 && page.refusedTooLarge > 0
+        ? dim(
+            `${page.refusedTooLarge} more record${page.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${page.refusedTooLarge === 1 ? "it is" : "they are"} not listed. That is this device's limit, not a fault in the records.`,
+          )
+        : ""
     }
     ${
       scoped.scopeUnknown && scoped.otherCompanies > 0
