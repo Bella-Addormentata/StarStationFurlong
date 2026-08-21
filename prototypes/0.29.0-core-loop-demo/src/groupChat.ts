@@ -18,13 +18,36 @@
  * accidental double-create by two members merges (LWW on the record) rather
  * than forking into two parallel histories.
  *
- * Bounded size:
- *   - `GROUP_CHAT_CAP` (200) — max messages per thread; matches the room
- *     chat cap in main.ts §sharedChat. Enforced on send by trimming the
- *     OLDEST group-messages so the room doc stays bounded regardless of how
- *     many threads live in it.
+ * Bounded size (each lane trims IN-PLACE on its own membership so unrelated
+ * lane activity cannot evict the other lane's history):
+ *   - `GROUP_CHAT_CAP` (200) — max messages per thread. Enforced on send by
+ *     `excessGroupIndices` — scans the array for THAT groupId and returns the
+ *     oldest overflow indices; caller deletes DESC in a single Yjs transact.
+ *   - Room lane: parallel per-lane cap (`main.ts::ROOM_CHAT_CAP` = 200,
+ *     also matched to 200 by design). Enforced on send by `excessRoomIndices`
+ *     — same pattern, filtered on non-group entries. The pre-fix trim was
+ *     `sharedChat.length - 200` over the WHOLE array, which counted group
+ *     messages toward the room budget and deleted from index 0 (typically an
+ *     older group message), so a room-message burst silently ate a group's
+ *     history before its own per-group cap fired.
  *   - `MAX_GROUP_CHATS` (64) — hard cap on the thread map so a hostile peer
  *     can't grow the doc without bound by writing thread records.
+ *
+ * Hostile-peer discipline (verify EVERY read of a shared map value; a room
+ * peer can write junk into any shared map / array key):
+ *   - Value shape: `isGroupChatThread` — kind + version, canonical member
+ *     list, id-must-match-members-hash, creator-must-be-a-member.
+ *   - Map entry: `isValidThreadEntry(key, value)` — chains the value guard
+ *     AND requires the map KEY to equal `value.id`. Own writes always use
+ *     `groupsMap.set(thread.id, thread)` so the invariant holds locally,
+ *     but a hostile peer's mismatched-key write (`key='junk'`,
+ *     `value.id='g-xyz'`) would produce a chip whose activation sets
+ *     `activeChatThread='g-xyz'` — and every downstream `groupsMap.get('g-xyz')`
+ *     misses (the actual key is 'junk'), so the send-path guard's
+ *     `isGroupChatThread(groupsMap.get(threadTarget))` returns false and the
+ *     message silently falls back to the ROOM lane. `isValidThreadEntry`
+ *     drops the chip so no send is misrouted; both `listMyGroupChats` and
+ *     `excessThreadIds` use this same entry guard for consistency.
  *
  * Privacy: v1 is private-by-UI, not private-by-crypto. Every room member
  * replicates the shared chat array, so anyone with the room doc can filter to
@@ -146,6 +169,26 @@ export function isGroupChatThread(x: unknown): x is GroupChatThread {
   return true;
 }
 
+/** True iff the map entry `(key, value)` is a well-formed thread record whose
+ *  map KEY equals `value.id`. Own writes go through `groupsMap.set(thread.id,
+ *  thread)` so the invariant always holds locally — but a hostile peer can
+ *  freely write both fields, e.g. `key='junk'` with `value.id='g-xyz'`. That
+ *  value alone would pass `isGroupChatThread`, so `listMyGroupChats` would
+ *  surface it as a chip whose `dataset.thread = 'g-xyz'`. Every downstream
+ *  send-path lookup then reads `groupsMap.get('g-xyz')` — which misses (the
+ *  actual map key is 'junk') — and silently falls back to the ROOM lane. The
+ *  user thinks they are sending into a group, but their message goes to room
+ *  broadcast. Failing the guard here means the chip never appears, so no send
+ *  can be misrouted. */
+export function isValidThreadEntry(
+  key: unknown,
+  value: unknown,
+): value is GroupChatThread {
+  if (typeof key !== 'string' || !key) return false;
+  if (!isGroupChatThread(value)) return false;
+  return value.id === key;
+}
+
 /** True iff `x` is a chat entry that is a well-formed group message (has a
  *  non-empty groupId and a string text). Deliberately does NOT verify the
  *  groupId names an existing thread — the caller decides the resolution
@@ -207,8 +250,48 @@ export function excessGroupIndices(
   return idxs.slice(0, excess); // OLDEST first — matches array position order
 }
 
+/** Indices (into the FULL chat array) of the OLDEST ROOM messages that must
+ *  be removed to bring the room-lane count down to `cap`. Mirror of
+ *  `excessGroupIndices` for the room broadcast lane — the room and group
+ *  lanes must trim INDEPENDENTLY (each keyed on its own inclusion rule),
+ *  otherwise a burst of room activity would push the room-only cap `excess`
+ *  positive on the WHOLE array and evict from index 0 — usually the oldest
+ *  group message, not the oldest room message.
+ *
+ *  Returned ASCENDING (same convention as `excessGroupIndices`), so the
+ *  caller deletes DESC inside a Yjs transact to keep intermediate indices
+ *  valid.
+ *
+ *  "ROOM" mirrors `filterMessagesForRoom`'s inclusion rule exactly: anything
+ *  that is not an object with a valid (string + non-empty) `groupId` is ROOM.
+ *  Legacy pre-slice entries and any defensive non-object entries fall here. */
+export function excessRoomIndices(
+  all: readonly unknown[],
+  cap: number,
+): number[] {
+  if (cap < 0) cap = 0;
+  const idxs: number[] = [];
+  for (let i = 0; i < all.length; i++) {
+    const m = all[i];
+    if (!m || typeof m !== 'object') {
+      // Non-object entries are ROOM by fallback (matches filterMessagesForRoom).
+      idxs.push(i);
+      continue;
+    }
+    const g = (m as { groupId?: unknown }).groupId;
+    if (!(typeof g === 'string' && g)) idxs.push(i);
+  }
+  const excess = idxs.length - cap;
+  if (excess <= 0) return [];
+  return idxs.slice(0, excess); // OLDEST first — matches array position order
+}
+
 /** Which threads is `myPub` a member of? Silently rejects any map entry that
- *  fails the guard — hostile peers can't inject themselves into the picker.
+ *  fails the entry guard (`isValidThreadEntry` — checks both the value shape
+ *  AND that its `id` equals the map key). Hostile peers can't inject
+ *  themselves into the picker, and they can't produce a chip whose id-labelled
+ *  activation would misroute sends to the ROOM lane (see isValidThreadEntry
+ *  for the misrouting scenario the key-vs-id check closes).
  *  Sorted by createdAt (stable oldest-first order for the UI). */
 export function listMyGroupChats(
   threads: Iterable<readonly [string, unknown]>,
@@ -216,8 +299,8 @@ export function listMyGroupChats(
 ): GroupChatThread[] {
   if (typeof myPub !== 'string' || !myPub) return [];
   const out: GroupChatThread[] = [];
-  for (const [, v] of threads) {
-    if (!isGroupChatThread(v)) continue;
+  for (const [k, v] of threads) {
+    if (!isValidThreadEntry(k, v)) continue;
     if (!v.members.includes(myPub)) continue;
     out.push(v);
   }
@@ -226,8 +309,13 @@ export function listMyGroupChats(
 
 /** Ids of the oldest VALID thread records to evict when the map exceeds
  *  `cap`. The caller applies the deletion via a Yjs transact. Malformed
- *  entries (rejected by the guard) are NOT returned — pruning them belongs to
- *  a separate housekeeping pass so we don't confuse "over cap" with "corrupt". */
+ *  entries (rejected by `isValidThreadEntry` — including mismatched key /
+ *  value.id records a hostile peer could write) are NOT returned — pruning
+ *  them belongs to a separate housekeeping pass so we don't confuse "over
+ *  cap" with "corrupt". Same-guard as the picker (`listMyGroupChats`) so a
+ *  record shown as a chip and a record counted toward the cap are the exact
+ *  same set: an attacker cannot skew the cap arithmetic with mismatched
+ *  entries to steer eviction of legitimate threads. */
 export function excessThreadIds(
   threads: Iterable<readonly [string, unknown]>,
   cap: number = MAX_GROUP_CHATS,
@@ -235,7 +323,7 @@ export function excessThreadIds(
   if (cap < 0) cap = 0;
   const valid: Array<{ id: string; createdAt: number }> = [];
   for (const [k, v] of threads) {
-    if (!isGroupChatThread(v)) continue;
+    if (!isValidThreadEntry(k, v)) continue;
     valid.push({ id: k, createdAt: v.createdAt });
   }
   const excess = valid.length - cap;

@@ -8,6 +8,7 @@ import {
   buildGroupChatThread,
   deriveGroupChatId,
   excessGroupIndices,
+  excessRoomIndices,
   excessThreadIds,
   filterMessagesForGroup,
   filterMessagesForRoom,
@@ -15,6 +16,7 @@ import {
   GROUP_TITLE_MAX,
   isGroupChatMessage,
   isGroupChatThread,
+  isValidThreadEntry,
   listMyGroupChats,
   MAX_GROUP_CHATS,
   MIN_GROUP_MEMBERS,
@@ -421,5 +423,156 @@ describe('groupChat · buildGroupChatThread', () => {
       members: ['pub-B'], createdBy: 'pub-A', createdAt: NaN,
     });
     expect(Number.isFinite(t2.createdAt)).toBe(true);
+  });
+});
+
+// ── Audit fix (issue #20 remediation): map-entry key/value.id consistency ────
+
+describe('groupChat · isValidThreadEntry', () => {
+  const goodMembers = normalizeMembers(['pub-A', 'pub-B']);
+  const goodId = deriveGroupChatId(goodMembers);
+  const good: GroupChatThread = {
+    v: 1, kind: 'group-chat', id: goodId, title: 'ok',
+    members: goodMembers, createdAt: 1, createdBy: 'pub-A',
+  };
+
+  it('accepts a matched (key, value) pair', () => {
+    expect(isValidThreadEntry(goodId, good)).toBe(true);
+  });
+
+  it('rejects an entry whose map key does not equal value.id', () => {
+    // A hostile peer's write: `key='junk'`, `value.id='g-xyz'`. The value
+    // alone passes isGroupChatThread, but the mismatch would silently
+    // reroute sends through activeChatThread='g-xyz' → groupsMap.get('g-xyz')
+    // → undefined → ROOM lane. This entry-level guard blocks it.
+    expect(isValidThreadEntry('junk', good)).toBe(false);
+  });
+
+  it('rejects non-string / empty map keys', () => {
+    expect(isValidThreadEntry('', good)).toBe(false);
+    expect(isValidThreadEntry(42 as unknown as string, good)).toBe(false);
+    expect(isValidThreadEntry(null as unknown as string, good)).toBe(false);
+    expect(isValidThreadEntry(undefined as unknown as string, good)).toBe(false);
+  });
+
+  it('rejects when the value fails isGroupChatThread (chained guard)', () => {
+    expect(isValidThreadEntry(goodId, { not: 'a thread' })).toBe(false);
+    expect(isValidThreadEntry(goodId, null)).toBe(false);
+    // A wrong-members entry that also happens to name a valid-looking id
+    // is rejected because isGroupChatThread's members↔id derivation fails.
+    expect(isValidThreadEntry(goodId, { ...good, members: normalizeMembers(['pub-Z', 'pub-Y']) })).toBe(false);
+  });
+});
+
+describe('groupChat · listMyGroupChats rejects mismatched-key entries (audit fix)', () => {
+  it('omits a hostile entry whose key !== value.id — the chip would misroute sends', () => {
+    const members = normalizeMembers(['pub-A', 'pub-B']);
+    const good: GroupChatThread = {
+      v: 1, kind: 'group-chat', id: deriveGroupChatId(members),
+      title: 'Valid', members, createdAt: 1000, createdBy: 'pub-A',
+    };
+    // Hostile write pattern: map key ≠ value.id. The value alone is well-formed
+    // and would pass isGroupChatThread, so the pre-fix listMyGroupChats returned
+    // it and the chip fell into activeChatThread='g-xyz' → sends misrouted to
+    // ROOM (see isValidThreadEntry docstring for the misrouting scenario).
+    const entries: Array<readonly [string, unknown]> = [
+      [good.id, good],
+      ['junk-key', good], // key mismatch — value.id says good.id
+    ];
+    const out = listMyGroupChats(entries, 'pub-A');
+    expect(out).toHaveLength(1);
+    expect(out[0]).toBe(good);
+  });
+});
+
+describe('groupChat · excessThreadIds rejects mismatched-key entries (audit fix)', () => {
+  it('does not count a mismatched-key entry toward the valid-cap arithmetic', () => {
+    const mk = (members: string[], ts: number): GroupChatThread => {
+      const n = normalizeMembers(members);
+      return {
+        v: 1, kind: 'group-chat', id: deriveGroupChatId(n),
+        title: `t${ts}`, members: n, createdAt: ts, createdBy: n[0],
+      };
+    };
+    const a = mk(['pub-A', 'pub-B'], 1000);
+    const b = mk(['pub-A', 'pub-C'], 2000);
+    // Hostile mismatched-key entry: uses `a`'s value under a bad key. The
+    // pre-fix code counted this as valid and would evict `a` at cap=2 (three
+    // "valid" entries → drop oldest). Post-fix: only `a` and `b` count, so
+    // cap=2 returns [] and cap=1 evicts only `a`.
+    const entries: Array<readonly [string, unknown]> = [
+      [a.id, a],
+      [b.id, b],
+      ['junk-key', a],
+    ];
+    expect(excessThreadIds(entries, 2)).toEqual([]);
+    expect(excessThreadIds(entries, 1)).toEqual([a.id]);
+  });
+});
+
+// ── Audit fix (issue #20 remediation): room-lane trim is lane-independent ────
+
+describe('groupChat · excessRoomIndices', () => {
+  it('returns [] when the room lane is at/under cap', () => {
+    const chat = [
+      { text: 'r1' },
+      { text: 'r2', groupId: '' },       // empty groupId → ROOM
+      { text: 'g1', groupId: 'g-1' },
+    ];
+    expect(excessRoomIndices(chat, 2)).toEqual([]);
+    expect(excessRoomIndices(chat, 5)).toEqual([]);
+  });
+
+  it('returns the oldest N ROOM indices when the room lane overflows', () => {
+    const chat = [
+      { text: 'r0' },                        // 0 ROOM
+      { text: 'r1' },                        // 1 ROOM
+      { text: 'g0', groupId: 'g-1' },       // 2 group — never counted here
+      { text: 'r2' },                        // 3 ROOM
+      { text: 'r3' },                        // 4 ROOM
+    ];
+    // 4 room messages at [0, 1, 3, 4], cap=2 → drop the two oldest → [0, 1].
+    expect(excessRoomIndices(chat, 2)).toEqual([0, 1]);
+  });
+
+  it('does NOT count group-tagged messages toward the room cap (defect regression)', () => {
+    // Simulates the audit-cited scenario: a group has 30 messages, then a
+    // peer sends 200 room broadcasts. The pre-fix trim was `length - 200`
+    // over the WHOLE array (30 + 200 = 230 → excess 30 → delete indices 0..29),
+    // which deletes the group's entire history before its own per-group cap
+    // ever fires. The lane-independent room trim leaves group messages alone.
+    const chat: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 30; i++) chat.push({ text: `g-${i}`, groupId: 'g-1' });
+    for (let i = 0; i < 200; i++) chat.push({ text: `r-${i}` });
+    // Room-lane count = 200 (exactly at cap) → no room trim.
+    expect(excessRoomIndices(chat, 200)).toEqual([]);
+    // Push one more room message → room-lane count = 201 → drop oldest room
+    // message (index 30, the first r-N — indices 0..29 are the group messages
+    // and MUST NOT be evicted by this lane's trim).
+    chat.push({ text: 'r-200' });
+    expect(excessRoomIndices(chat, 200)).toEqual([30]);
+  });
+
+  it('treats non-object + missing/empty/wrong-type groupId as ROOM (matches filterMessagesForRoom)', () => {
+    const chat: unknown[] = [
+      null,                                // 0 ROOM (non-object)
+      'stringy',                            // 1 ROOM (non-object)
+      { text: 'r0' },                      // 2 ROOM
+      { text: 'r1', groupId: '' },         // 3 ROOM (empty)
+      { text: 'r2', groupId: null },       // 4 ROOM (null → not string)
+      { text: 'r3', groupId: 42 },         // 5 ROOM (wrong type)
+      { text: 'g0', groupId: 'g-1' },      // 6 group
+    ];
+    // 6 room-lane entries at [0..5]; cap=3 → drop the 3 oldest ROOM → [0, 1, 2].
+    expect(excessRoomIndices(chat, 3)).toEqual([0, 1, 2]);
+  });
+
+  it('treats a negative cap as zero (drop every ROOM entry)', () => {
+    const chat = [
+      { text: 'r' },
+      { text: 'g', groupId: 'g-1' },
+      { text: 'r2' },
+    ];
+    expect(excessRoomIndices(chat, -1)).toEqual([0, 2]);
   });
 });

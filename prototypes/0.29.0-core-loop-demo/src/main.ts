@@ -260,6 +260,7 @@ import {
   GROUP_TITLE_MAX,
   buildGroupChatThread,
   excessGroupIndices,
+  excessRoomIndices,
   excessThreadIds,
   isGroupChatThread,
   listMyGroupChats,
@@ -376,6 +377,14 @@ let roomCacheHandle: RoomCacheHandle | null = null;
 // deriveGroupChatId returns). Reset to null on every join so a rejoin never
 // leaks the DEPARTURE room's active thread into the NEW room.
 let activeChatThread: string | null = null;
+/** Room-lane cap: at most this many ROOM broadcast messages in the doc at
+ *  once. Kept parallel to `GROUP_CHAT_CAP` (200) — the CHANGELOG documents
+ *  the two caps as matching, and `excessRoomIndices` uses this on the room
+ *  lane exactly the way `excessGroupIndices` uses `GROUP_CHAT_CAP` on a
+ *  group lane. Historically the trim was `sharedChat.length - 200` (mixing
+ *  the two lanes on one budget); see the send-path comment for why that was
+ *  wrong and how the audit fix separated them. */
+const ROOM_CHAT_CAP = 200;
 /** The current join's chat rebuild closure (assigned inside the join binder).
  *  Module-scope indirection so subscribers set up at boot (block list, group
  *  threads) can trigger a repaint without holding a reference to the closure. */
@@ -4968,18 +4977,26 @@ function setupSpacePhoneOverlay() {
           // cached snapshot, and every sync — stays bounded. Concurrent trims
           // delete overlapping ranges idempotently (CRDT-safe).
           //
-          // Room lane keeps its 200-cap on the array as a whole; groups get a
-          // parallel per-group cap that scans the array for their tag and
-          // deletes only the oldest overflow indices (see excessGroupIndices
-          // for the invariant: indices are ASCENDING, so we delete DESC to
-          // keep intermediate indices valid inside this transact).
+          // Each lane gets a parallel cap that scans the array for its OWN
+          // messages and deletes only that lane's oldest overflow indices
+          // (see excess{Room,Group}Indices for the invariant: indices are
+          // ASCENDING, so we delete DESC to keep intermediate indices valid
+          // inside this transact).
+          //
+          // NOTE (issue #20 audit fix): the pre-fix room path did `excess =
+          // sharedChat.length - 200; sharedChat.delete(0, excess)`. That
+          // counted GROUP messages toward the 200-cap and deleted from index
+          // 0 — index 0 was typically the oldest GROUP message, not a room
+          // one — so a burst of 200+ room messages silently ate a group's
+          // history before its own 200 per-group cap ever fired. Both lanes
+          // now trim in-place on their own membership.
+          const raw = sharedChat.toArray() as unknown[];
           if (isGroupSend && threadTarget) {
-            const raw = sharedChat.toArray() as unknown[];
             const idxs = excessGroupIndices(raw, threadTarget, GROUP_CHAT_CAP);
             for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
           } else {
-            const excess = sharedChat.length - 200;
-            if (excess > 0) sharedChat.delete(0, excess);
+            const idxs = excessRoomIndices(raw, ROOM_CHAT_CAP);
+            for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
           }
         });
       } else {
