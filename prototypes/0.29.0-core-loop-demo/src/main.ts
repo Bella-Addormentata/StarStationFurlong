@@ -2862,11 +2862,35 @@ let treasuryVoteOffset = 0;
  * outside the budget is not hidden: `truncated` drives an on-screen line
  * saying the view is partial and its contents are an arbitrary subset.
  *
+ * The budget is PER REPAINT, not per scan. The list screen runs one scan, so
+ * LIST_CHECKS is both; the detail screen runs three and splits DETAIL_CHECKS
+ * between them — see DETAIL_PAGE below.
+ *
  * The real fix is validating off the render path with cancellation, alongside
  * the per-class index treasuryDoc's scanPrefixed comment describes.
  */
 const LIST_CHECKS = 24;
+
+/**
+ * The detail screen's budget for the whole repaint, and the per-scan share
+ * that adds up to it.
+ *
+ * DETAIL_CHECKS was handed to each of the three scans — votes, vote records
+ * and approval rounds — so it bounded one scan while the repaint did up to
+ * THREE times the documented work, and the comment above claiming it bounds a
+ * repaint was simply wrong. A peer replacing records under all three prefixes
+ * defeats the memo in each of them at once, so the aggregate is exactly the
+ * number that matters.
+ *
+ * Split rather than shared dynamically: a scan's page size has to be FIXED or
+ * an offset stops meaning the same thing twice, and resumable paging is what
+ * keeps a bound from becoming a way to hide records. Three fixed pages of 8
+ * come to the same 24, and DETAIL_PAGE is what every page calculation on that
+ * screen uses.
+ */
 const DETAIL_CHECKS = 24;
+const DETAIL_SCANS = 3;
+const DETAIL_PAGE = DETAIL_CHECKS / DETAIL_SCANS;
 
 /**
  * Repaint, preserving keyboard focus across the innerHTML replacement.
@@ -2979,13 +3003,13 @@ function wireTreasuryView(view: HTMLElement): void {
         treasuryVoteOffset = 0;
       }
       if (action === "back") treasuryDetailId = "";
-      if (action === "rounds-next") treasuryApprovalOffset += DETAIL_CHECKS;
+      if (action === "rounds-next") treasuryApprovalOffset += DETAIL_PAGE;
       if (action === "rounds-prev") {
-        treasuryApprovalOffset = Math.max(0, treasuryApprovalOffset - DETAIL_CHECKS);
+        treasuryApprovalOffset = Math.max(0, treasuryApprovalOffset - DETAIL_PAGE);
       }
-      if (action === "votes-next") treasuryVoteOffset += DETAIL_CHECKS;
+      if (action === "votes-next") treasuryVoteOffset += DETAIL_PAGE;
       if (action === "votes-prev") {
-        treasuryVoteOffset = Math.max(0, treasuryVoteOffset - DETAIL_CHECKS);
+        treasuryVoteOffset = Math.max(0, treasuryVoteOffset - DETAIL_PAGE);
       }
       // Paging is clamped by the scan itself against what actually matched,
       // so a page that empties out between repaints cannot strand anyone.
@@ -3221,16 +3245,18 @@ function paintTreasuryBody(view: HTMLElement): void {
     // Two budgets, because the entries do not cost the same — see scanPrefixed.
     // The walk guard is generous on purpose: it is a runaway stop, and any
     // value small enough to be a page becomes a horizon a peer can hide
-    // records behind. What bounds a repaint is DETAIL_CHECKS.
+    // records behind. What bounds a repaint is DETAIL_CHECKS, of which each of
+    // the three scans below takes DETAIL_PAGE — they run on every repaint, so
+    // the aggregate is the figure that matters, not any one scan's share.
     const DETAIL_SCAN = 50_000;
     // Paged, like the proposal list and the approval rounds. These keys are
     // peer-writable too, so without a way through, decoys sorted ahead of the
     // genuine records hid them for good.
     let voteScan = scanVotes(
-      proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
     );
     let cpScan = scanCheckpoints(
-      proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+      proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
     );
     // One offset drives both, so it is clamped against whichever set is
     // longer — otherwise paging would stop at the shorter one and strand the
@@ -3239,13 +3265,13 @@ function paintTreasuryBody(view: HTMLElement): void {
     if (treasuryVoteOffset >= voteMatched && voteMatched > 0) {
       treasuryVoteOffset = Math.max(
         0,
-        (Math.ceil(voteMatched / DETAIL_CHECKS) - 1) * DETAIL_CHECKS,
+        (Math.ceil(voteMatched / DETAIL_PAGE) - 1) * DETAIL_PAGE,
       );
       voteScan = scanVotes(
-        proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+        proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
       );
       cpScan = scanCheckpoints(
-        proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+        proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteOffset,
       );
     }
     // Paged, for the same reason the proposal list is: shells are unsigned and
@@ -3254,7 +3280,7 @@ function paintTreasuryBody(view: HTMLElement): void {
     let sessionScan = scanSigningSessions(
       proposal.proposalId,
       DETAIL_SCAN,
-      DETAIL_CHECKS,
+      DETAIL_PAGE,
       treasuryApprovalOffset,
     );
     // Same stranding guard as the list: a page that empties out between
@@ -3266,12 +3292,12 @@ function paintTreasuryBody(view: HTMLElement): void {
     ) {
       treasuryApprovalOffset = Math.max(
         0,
-        (Math.ceil(sessionScan.matched / DETAIL_CHECKS) - 1) * DETAIL_CHECKS,
+        (Math.ceil(sessionScan.matched / DETAIL_PAGE) - 1) * DETAIL_PAGE,
       );
       sessionScan = scanSigningSessions(
         proposal.proposalId,
         DETAIL_SCAN,
-        DETAIL_CHECKS,
+        DETAIL_PAGE,
         treasuryApprovalOffset,
       );
     }
@@ -3301,7 +3327,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       !sessionScan.truncated &&
         sessionScan.rejected === 0 &&
         sessionScan.refusedTooLarge === 0 &&
-        sessionScan.matched <= DETAIL_CHECKS,
+        sessionScan.matched <= DETAIL_PAGE,
     );
     // Only the round whose count is on screen. A scan-wide flag put an
     // "at least" on a complete round whenever some OTHER round — expired,
@@ -3374,9 +3400,9 @@ function paintTreasuryBody(view: HTMLElement): void {
         // Reachability for the tally too. Without it the partial warning above
         // told the player their figures were incomplete and gave them no way
         // to see the rest — the same hole the list and the rounds had.
-        voteMatched > DETAIL_CHECKS
+        voteMatched > DETAIL_PAGE
           ? `${dim(
-              `These figures cover records ${treasuryVoteOffset + 1}–${treasuryVoteOffset + Math.min(DETAIL_CHECKS, voteMatched - treasuryVoteOffset)} of the ${voteMatched} held under this proposal's vote keys. Only this page was read.`,
+              `These figures cover records ${treasuryVoteOffset + 1}–${treasuryVoteOffset + Math.min(DETAIL_PAGE, voteMatched - treasuryVoteOffset)} of the ${voteMatched} held under this proposal's vote keys. Only this page was read.`,
             )}
             <div style="display:flex; gap:6px; margin-top:6px;">
               ${
@@ -3386,7 +3412,7 @@ function paintTreasuryBody(view: HTMLElement): void {
                   : ""
               }
               ${
-                treasuryVoteOffset + DETAIL_CHECKS < voteMatched
+                treasuryVoteOffset + DETAIL_PAGE < voteMatched
                   ? `<div data-treasury-action="votes-next" role="button" tabindex="0" aria-label="Next page of vote records"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                   : ""
@@ -3435,9 +3461,9 @@ function paintTreasuryBody(view: HTMLElement): void {
         // Reachability, not just disclosure. Rounds are peer-writable, so
         // without a way to page past planted ones the genuine round's progress
         // could be hidden for good — the same hole the proposal list had.
-        sessionScan.matched > DETAIL_CHECKS
+        sessionScan.matched > DETAIL_PAGE
           ? `${dim(
-              `Showing rounds ${sessionScan.offset + 1}–${sessionScan.offset + Math.min(DETAIL_CHECKS, sessionScan.matched - sessionScan.offset)} of ${sessionScan.matched} held under this proposal's approval keys. Only this page was read.`,
+              `Showing rounds ${sessionScan.offset + 1}–${sessionScan.offset + Math.min(DETAIL_PAGE, sessionScan.matched - sessionScan.offset)} of ${sessionScan.matched} held under this proposal's approval keys. Only this page was read.`,
             )}
             <div style="display:flex; gap:6px; margin-top:6px;">
               ${
@@ -3447,7 +3473,7 @@ function paintTreasuryBody(view: HTMLElement): void {
                   : ""
               }
               ${
-                sessionScan.offset + DETAIL_CHECKS < sessionScan.matched
+                sessionScan.offset + DETAIL_PAGE < sessionScan.matched
                   ? `<div data-treasury-action="rounds-next" role="button" tabindex="0" aria-label="Next page of approval rounds"
                        style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                   : ""

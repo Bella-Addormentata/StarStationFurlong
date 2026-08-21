@@ -971,6 +971,56 @@ describe('player vocabulary rule', () => {
     expect(contrast('#ffffff', '#000000')).toBeCloseTo(21, 1);
   });
 
+  it('keeps the detail screen’s verification budget an AGGREGATE, not per scan', () => {
+    // The detail screen runs three scans on every repaint — votes, vote
+    // records and approval rounds — and handing each the full budget made one
+    // repaint do three times the documented work while the comment above the
+    // constant claimed otherwise. A peer replacing records under all three
+    // prefixes defeats the memo in each at once, so the aggregate is the only
+    // figure that means anything.
+    //
+    // Read from source because these live in a 7k-line entry point that has no
+    // export seam; the arithmetic is the invariant worth pinning, not the
+    // numbers themselves.
+    const root = dirname(fileURLToPath(import.meta.url));
+    const main = readFileSync(join(root, 'main.ts'), 'utf8');
+    const num = (name: string): number => {
+      const hit = main.match(new RegExp(`^const ${name} = (\\d+);`, 'm'));
+      expect(hit, `${name} not found — did the constant move or get renamed?`)
+        .not.toBeNull();
+      return Number(hit![1]);
+    };
+    const checks = num('DETAIL_CHECKS');
+    const scans = num('DETAIL_SCANS');
+    expect(checks).toBeGreaterThan(0);
+    // DETAIL_PAGE is derived, so assert the derivation rather than a literal.
+    expect(main).toMatch(/^const DETAIL_PAGE = DETAIL_CHECKS \/ DETAIL_SCANS;$/m);
+    expect(checks / scans).toBeGreaterThanOrEqual(1);
+    // The three scans really do take the per-scan share, not the whole budget.
+    // Checked against EACH CALL'S OWN arguments: a fixed-width window after the
+    // call name ran into the next call, so a neighbour's DETAIL_PAGE satisfied
+    // the assertion and the check passed with the defect reintroduced.
+    const detail = main.slice(main.indexOf('const DETAIL_SCAN ='));
+    for (const scan of ['scanVotes(', 'scanCheckpoints(', 'scanSigningSessions(']) {
+      let from = 0;
+      let calls = 0;
+      for (;;) {
+        const at = detail.indexOf(scan, from);
+        if (at < 0) break;
+        // These calls contain no nested parentheses, so the first one closes.
+        const args = detail.slice(at, detail.indexOf(')', at));
+        expect(args, `${scan} should take the per-scan share`).toContain('DETAIL_PAGE');
+        expect(args, `${scan} must not take the whole repaint budget`)
+          .not.toContain('DETAIL_CHECKS');
+        calls += 1;
+        from = at + scan.length;
+      }
+      expect(calls, `${scan} not found on the detail screen`).toBeGreaterThan(0);
+    }
+    // And the number of scans the constant divides by is the number there are.
+    expect(scans).toBe(3);
+  });
+
   it('keeps banned jargon out of the treasury UI source itself', () => {
     // The view module is only half the surface: the strings a player actually
     // reads are literals in the render function, the terminal panel and the
