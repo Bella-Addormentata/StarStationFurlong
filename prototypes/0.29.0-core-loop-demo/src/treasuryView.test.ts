@@ -40,6 +40,8 @@ import {
   proposalKindLabel,
   proposalPhase,
   proposalRows,
+  TREASURY_LABEL,
+  TREASURY_MUTED,
   roomFundingView,
   scopeProposals,
   shareClassViews,
@@ -814,6 +816,42 @@ describe('player vocabulary rule', () => {
       expect(typeof s).toBe('string');
       expect(s, `banned vocabulary in: ${s}`).not.toMatch(banned);
     }
+  });
+
+  it('keeps every caveat colour above the contrast a player can actually read', () => {
+    // These started as alpha gold over a dark surface, which composites to
+    // about 2.6:1 — dimmest on exactly the states most worth reading. Worse,
+    // the value was duplicated, so fixing the badge left the phone's `dim()`
+    // and the terminal's notes behind. Measured here rather than asserted in
+    // a comment, so the palette cannot drift back.
+    const srgb = (c: number): number => {
+      const s = c / 255;
+      return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+    };
+    const luminance = (hex: string): number => {
+      const n = parseInt(hex.replace('#', ''), 16);
+      return 0.2126 * srgb((n >> 16) & 255)
+        + 0.7152 * srgb((n >> 8) & 255)
+        + 0.0722 * (srgb(n & 255));
+    };
+    const contrast = (a: string, b: string): number => {
+      const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+    // Both dark surfaces the treasury draws on.
+    const PHONE_SCREEN = '#04060f';
+    const TERMINAL_PANEL = '#040816';
+    for (const surface of [PHONE_SCREEN, TERMINAL_PANEL]) {
+      // 4.5:1 is the WCAG AA floor for normal text, and none of this text is
+      // large enough to qualify for the relaxed threshold.
+      expect(contrast(TREASURY_MUTED, surface)).toBeGreaterThanOrEqual(4.5);
+      expect(contrast(TREASURY_LABEL, surface)).toBeGreaterThanOrEqual(4.5);
+    }
+    // Labels stay brighter than caveats, so the hierarchy the dimming was
+    // for survives — it just no longer costs legibility.
+    expect(luminance(TREASURY_LABEL)).toBeGreaterThan(luminance(TREASURY_MUTED));
+    // Sanity-check the measure itself against a known pair.
+    expect(contrast('#ffffff', '#000000')).toBeCloseTo(21, 1);
   });
 
   it('keeps banned jargon out of the treasury UI source itself', () => {

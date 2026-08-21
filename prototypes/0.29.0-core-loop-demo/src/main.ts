@@ -77,6 +77,8 @@ import {
   proposalRows,
   companyScope,
   type FundingReadAccess,
+  TREASURY_LABEL,
+  TREASURY_MUTED,
   roomFundingView,
   scopeProposals,
   sessionsFor,
@@ -2973,9 +2975,9 @@ function paintTreasuryBody(view: HTMLElement): void {
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
   const header = (t: string) =>
-    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL}; margin-top:12px;">${t}</div>`;
   const dim = (t: string) =>
-    `<div style="font-size:9px; color:rgba(212,168,75,0.45); margin-top:4px; line-height:1.6;">${t}</div>`;
+    `<div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:4px; line-height:1.6;">${t}</div>`;
   // `id` names the badge's slot on the screen ("board", "sync", …) so focus
   // can be restored to THIS badge across a repaint. It is the first argument
   // and has no default because a focusable control without a stable identity
@@ -3004,7 +3006,7 @@ function paintTreasuryBody(view: HTMLElement): void {
         ? "#7ddb8f"
         : tag.level === "self-checked"
           ? "#f0c060"
-          : "#998356";
+          : TREASURY_MUTED;
     // Focusable and labelled: the qualification behind a badge (a signature
     // shows authorship, not authority) is the whole point of showing it, and
     // a title tooltip on an inert span never reaches a keyboard user.
@@ -3017,7 +3019,7 @@ function paintTreasuryBody(view: HTMLElement): void {
   };
   const row = (label: string, value: string) =>
     `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
-      <span style="color:rgba(212,168,75,0.7);">${label}</span>
+      <span style="color:${TREASURY_LABEL};">${label}</span>
       <span style="flex-shrink:0; color:#f0c060; text-align:right;">${value}</span>
     </div>`;
 
@@ -3066,11 +3068,11 @@ function paintTreasuryBody(view: HTMLElement): void {
   const verdictBanner = `
     <div style="border:1px solid rgba(212,168,75,0.25); border-left:3px solid #f0c060; border-radius:6px; padding:8px 10px; background:rgba(212,168,75,0.05);">
       <div style="font-size:10px; font-weight:800; color:#f0c060;">READ-ONLY · NOT VERIFIED HERE</div>
-      <div style="font-size:9px; color:rgba(212,168,75,0.6); margin-top:3px; line-height:1.6;">${esc(sync.localNote)}</div>
+      <div style="font-size:9px; color:${TREASURY_LABEL}; margin-top:3px; line-height:1.6;">${esc(sync.localNote)}</div>
       ${
         net.configured
           ? ""
-          : `<div style="font-size:9px; color:rgba(212,168,75,0.45); margin-top:4px;">No company network is configured for this build, so nothing shown here is tied to a real chain.</div>`
+          : `<div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:4px;">No company network is configured for this build, so nothing shown here is tied to a real chain.</div>`
       }
     </div>`;
 
@@ -3151,11 +3153,11 @@ function paintTreasuryBody(view: HTMLElement): void {
     const payload = payloadView(readProposalPayload(proposal.payloadHash) !== null);
 
     view.innerHTML = `${verdictBanner}${back}
-      <div style="display:flex; align-items:center; gap:6px; margin-top:8px;">
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:8px;">
         <span style="font-size:13px; font-weight:800; color:#f0c060;">${esc(proposalKindLabel(proposal.kind))}</span>
         ${badge("proposal", trustTag("signed"))}
       </div>
-      <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">Made under policy version ${proposal.policyVersion}${
+      <div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:2px;">Made under policy version ${proposal.policyVersion}${
         otherRevision !== null && otherRevision !== proposal.policyVersion
           ? ` · the company details held here are version ${otherRevision}, so that board and its clocks do not apply to this proposal`
           : ""
@@ -3164,7 +3166,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       ${dim("The proposal itself is signed by its proposer, and that signature was checked on this device.")}
 
       ${header("CLOCKS")}
-      <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
         <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(phaseLabel(phase))}</span>
         ${badge("clocks", w.trust)}
       </div>
@@ -3184,8 +3186,8 @@ function paintTreasuryBody(view: HTMLElement): void {
           : "No chain height available on this device, so the phone will not say which window is open.",
       )}
 
-      <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
-        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">VOTES HELD IN THIS ROOM</span>
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">VOTES HELD IN THIS ROOM</span>
         ${badge("votes", votes.trust)}
       </div>
       ${row("Held here", `${votes.held}`)}
@@ -3202,8 +3204,8 @@ function paintTreasuryBody(view: HTMLElement): void {
           : ""
       }
 
-      <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
-        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">BOARD APPROVALS</span>
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">BOARD APPROVALS</span>
         ${badge("approvals", approvals.trust)}
       </div>
       ${
@@ -3223,11 +3225,11 @@ function paintTreasuryBody(view: HTMLElement): void {
           : ""
       }
 
-      <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
-        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">WHAT IT WOULD DO</span>
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">WHAT IT WOULD DO</span>
         ${badge("payload", payload.trust)}
       </div>
-      <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.7); margin-top:5px;">${esc(payload.headline)}</div>
+      <div style="font-size:11px; font-weight:800; color:${TREASURY_LABEL}; margin-top:5px;">${esc(payload.headline)}</div>
       ${dim(esc(payload.detail))}`;
     return;
   }
@@ -3277,7 +3279,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer; margin-top:8px;">← VENTURES</div>
 
     ${header("THIS ROOM")}
-    <div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+    <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
       <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(binding.headline)}</span>
       ${badge("funding", binding.trust)}
     </div>
@@ -3299,7 +3301,7 @@ function paintTreasuryBody(view: HTMLElement): void {
     ${dim(`Not shown yet: ${esc(binding.unavailable.join("; "))}.`)}
 
     ${header("BALANCES")}
-    <div style="font-size:11px; font-weight:800; color:rgba(212,168,75,0.6); margin-top:5px;">${esc(balances.headline)}</div>
+    <div style="font-size:11px; font-weight:800; color:${TREASURY_LABEL}; margin-top:5px;">${esc(balances.headline)}</div>
     ${dim(esc(balances.detail))}
 
     ${header("COMPANY")}
@@ -3310,13 +3312,13 @@ function paintTreasuryBody(view: HTMLElement): void {
         ? (() => {
             const b = boardView(showPolicy.policy);
             const classes = shareClassViews(showPolicy.policy);
-            return `<div style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+            return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
                 <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
                 ${badge("board", b.trust)}
               </div>
               ${row("Policy version", `${b.policyVersion}`)}
               ${row("Fee ceiling per spend", esc(b.maxFee))}
-              <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:5px;">Policy fingerprint</div>
+              <div style="font-size:10px; color:${TREASURY_LABEL}; margin-top:5px;">Policy fingerprint</div>
               <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against the chain">${esc(showPolicy.policyHash)}</div>
               ${classes.items
                 .map((c) =>
@@ -3360,9 +3362,9 @@ function paintTreasuryBody(view: HTMLElement): void {
                 style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
                 <span style="min-width:0;">
                   <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
-                  <span style="display:block; font-size:8.5px; color:rgba(212,168,75,0.4);">${esc(r.shortId)} · policy v${r.policyVersion}</span>
+                  <span style="display:block; font-size:8.5px; color:${TREASURY_MUTED};">${esc(r.shortId)} · policy v${r.policyVersion}</span>
                 </span>
-                <span style="flex-shrink:0; font-size:9px; color:rgba(212,168,75,0.6); text-align:right;">
+                <span style="flex-shrink:0; font-size:9px; color:${TREASURY_LABEL}; text-align:right;">
                   ${esc(r.phaseLabel)}<br />${badge(null, r.clockTrust)}
                 </span>
               </div>`,
@@ -3404,8 +3406,8 @@ function paintTreasuryBody(view: HTMLElement): void {
         : ""
     }
 
-    <div style="display:flex; align-items:center; gap:6px; margin-top:12px;">
-      <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6);">CHAIN VIEW</span>
+    <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+      <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">CHAIN VIEW</span>
       ${badge("sync", sync.trust)}
     </div>
     ${row("This device", "not verifying")}

@@ -671,6 +671,15 @@ describe('verification caching', () => {
     expect(first).not.toBeNull();
     expect(second).toBe(first); // same object: served from the memo
     expect(first?.policyHash).toBe(contracts.policy.policyHash);
+    // The WRAPPER is frozen, not just the policy inside it. This exact object
+    // goes to every caller, so a write to policyHash would leave later reads
+    // returning a hash beside a policy it no longer describes.
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(Object.isFrozen(first?.policy)).toBe(true);
+    expect(() => {
+      (first as unknown as { policyHash: string }).policyHash = 'x'.repeat(64);
+    }).toThrow();
+    expect(readPolicyCache()?.policyHash).toBe(contracts.policy.policyHash);
   });
 
   it('freezes what it validates, so a cached verdict cannot outlive the bytes', () => {

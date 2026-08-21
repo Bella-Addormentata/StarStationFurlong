@@ -647,7 +647,12 @@ export function readPolicyCacheResult(): PolicyCacheResult {
   if (typeof value !== 'object' || value === null) return { status: 'unreadable' };
   const hit = policyResults.get(value);
   if (hit) return hit.result;
-  const result = readPolicyUncached(value);
+  // The WRAPPER is frozen too, not just the policy inside it. This exact
+  // object is handed to every caller from here on, so a consumer that wrote
+  // to `status` or `policyHash` would have later reads return altered derived
+  // data — the hash beside a policy it no longer describes — without anything
+  // recomputing. Freezing the nested value alone left that open.
+  const result = deepFreeze(readPolicyUncached(value));
   policyResults.set(value, { result });
   return result;
 }

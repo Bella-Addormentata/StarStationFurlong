@@ -1109,28 +1109,30 @@
          title tooltip never opens from the keyboard, and an aria-label only
          reaches assistive technology — a sighted keyboard player would see
          the label with none of the qualification that gives it meaning. */
-      .ssf-trust-badge {
+      /* The tooltip is positioned against the badge's ROW, not the badge.
+         Anchored to the badge it could not fit either way: measured in the
+         312px phone screen, badges land between x=68 and x=243 depending on
+         how long their label is, so a 220px note anchored left ran off the
+         right bezel and anchored right ran off the left. Both directions
+         clipped 35-75% of the qualification — and `pointer-events: none`
+         meant a mouse could not chase it, while the view's overflow-y:auto
+         turned the overspill into a horizontal scrollbar. Against the row it
+         gets the full content width and always fits, whatever the label. */
+      .ssf-badge-row {
         position: relative;
       }
-      .ssf-trust-badge:hover::after,
-      .ssf-trust-badge:focus::after,
-      .ssf-trust-badge:focus-visible::after {
+      /* Scoped to badges inside such a row: the one badge rendered elsewhere
+         is aria-hidden inside a button and folds its detail into that row's
+         own label, so it should not open a note of its own. */
+      .ssf-badge-row .ssf-trust-badge:hover::after,
+      .ssf-badge-row .ssf-trust-badge:focus::after,
+      .ssf-badge-row .ssf-trust-badge:focus-visible::after {
         content: attr(data-detail);
         position: absolute;
-        /* Anchored to the badge's RIGHT edge, growing leftward. Every badge is
-           the trailing item of its header row, so it sits near the right of a
-           ~312px content box; anchoring left pushed 35-75% of the text past
-           the phone bezel, where `pointer-events: none` meant a mouse could
-           not chase it and .phone-app-view.active's overflow-y:auto turned the
-           overspill into a horizontal scrollbar. The qualification behind a
-           badge is the whole reason the tooltip exists, so it has to be
-           readable in full. */
+        left: 0;
         right: 0;
-        left: auto;
         top: calc(100% + 4px);
         z-index: 20;
-        width: max-content;
-        max-width: 220px;
         padding: 5px 7px;
         border: 1px solid rgba(212, 168, 75, 0.35);
         border-radius: 5px;

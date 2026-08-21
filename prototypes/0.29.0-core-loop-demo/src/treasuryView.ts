@@ -82,6 +82,27 @@ export function trustTag(level: TrustLevel): TrustTag {
 }
 
 // ---------------------------------------------------------------------------
+// Text colours for treasury surfaces
+// ---------------------------------------------------------------------------
+//
+// Named here rather than written inline because the alpha gold these replace
+// was duplicated across the badge helper, the phone's `dim()` and two room
+// terminal elements — so fixing the badge left the far more common paths at
+// the same unreadable value. A caveat nobody can read is not a caveat.
+//
+// Both are opaque. Alpha over a dark surface is what produced the problem:
+// 45% gold composites to about 2.6:1 and 50% to 2.9:1, well under the 4.5:1
+// that these 8.5-9px strings need. Contrast below is measured against BOTH
+// dark surfaces the treasury draws on — the phone screen (#04060F) and the
+// room terminal panel (#040816).
+
+/** Caveats, notes and qualifications. 5.5:1 phone / 5.4:1 terminal. */
+export const TREASURY_MUTED = '#998356';
+
+/** Section headers and row labels. 8.0:1 phone / 7.9:1 terminal. */
+export const TREASURY_LABEL = '#b29a67';
+
+// ---------------------------------------------------------------------------
 // Amount formatting (there is no currency helper anywhere else in src/)
 // ---------------------------------------------------------------------------
 
