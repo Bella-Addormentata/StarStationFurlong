@@ -1304,7 +1304,12 @@ async function joinRoomAtEpoch(
     // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
     // the door slide), refresh an open keypad's POSITION row, and re-dress
     // the exterior (a slid door carries its adapter collar).
+    // 🧱 #66 S3: reconcileRoomDims short-circuits on a same-dims callback via
+    // its own lastAppliedDims cache, so a door-slide notify pays only that
+    // cheap comparison. A dims write drives the full shell rebuild + walkable
+    // rebake + player clamp so a shrink can't strand the avatar.
     subscribeFloorPlan(() => {
+      world?.reconcileRoomDims();
       world?.reconcileDoorPlacements();
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();

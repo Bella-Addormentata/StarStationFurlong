@@ -49,7 +49,7 @@ import {
 import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
 // 🛰️ Hull space (exterior anchors + stacking) — moved out of furniture.ts.
 import { findFreeExteriorSpot } from './hull';
-import { validatePlacement, roomEdit } from './editMode';
+import { validatePlacement, roomEdit, canEditRoom } from './editMode';
 import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
 import { ROOM_TEMPLATES, applyRoomTemplate, exportCurrentRoomAsTemplate } from './roomTemplates';
@@ -59,7 +59,12 @@ import { OBSTACLES, rebuildObstacles } from './obstacles';
 import {
   computeReachable, rebakeWalkableGrid, GRID_SIZE, worldToCol, worldToRow,
 } from './pathfinding';
-import { roomHalfExtents, roomPlaceBounds } from './floorPlanDoc';
+import {
+  roomHalfExtents, roomPlaceBounds,
+  readRoomDims, writeRoomDims,
+  ROOM_TILE_MIN, ROOM_TILE_MAX,
+  subscribeFloorPlan,
+} from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
@@ -755,6 +760,7 @@ function buildPanel(): HTMLDivElement {
       ${sectionHtml('CLONE', 'respawn at the vat (🧬)', [cloneRow])}
       ${sectionHtml('MODULES', null, [moduleRow, stationRow])}
       ${sectionHtml('PARTS', 'station construction (#62)', ['<div id="dev-parts-rows"></div>'])}
+      ${sectionHtml('STRUCTURE', 'room tile dims — 6 m per tile (#66)', ['<div id="dev-structure-rows"></div>'])}
       ${sectionHtml('VESTIBULE', null, [vestibuleRow])}
       ${sectionHtml('NAVIGATION', 'lost? beam straight home', [`
         <div style="${ROW_STYLE}">
@@ -854,6 +860,19 @@ function buildPanel(): HTMLDivElement {
       case 'add-flex': addParts('flex', 4); refreshPartsRows(); break;
       case 'add-ext': addParts('ext', 2); refreshPartsRows(); break;
       case 'add-adapter': addParts('adapter', 1); refreshPartsRows(); break;
+      // 🧱 #66 S3: grant a single HULL TILE — the dev-phase currency for the
+      // STRUCTURE section's + COLS / + ROWS growth. Consumption gate (spending
+      // a HULL TILE on grow) is a follow-up ticket; today the STRUCTURE UX
+      // writes the new dims directly and this row is here so the count is
+      // visible / testable and the ledger shape is already right.
+      case 'add-hull': addParts('hull', 1); refreshPartsRows(); break;
+      // 🧱 #66 S3 STRUCTURE actions — writeRoomDims fires subscribeFloorPlan,
+      // which drives world.reconcileRoomDims() (shell rebuild + walkable rebake
+      // + player clamp) AND our own subscribeFloorPlan below (row refresh).
+      case 'inc-cols': applyDimDelta( 1, 0); break;
+      case 'dec-cols': applyDimDelta(-1, 0); break;
+      case 'inc-rows': applyDimDelta( 0,  1); break;
+      case 'dec-rows': applyDimDelta( 0, -1); break;
       case 'arm-preset': {
         const p = btn.dataset.preset as PresetId;
         setArmedPreset(armedPreset() === p ? null : p); // toggle
@@ -949,6 +968,10 @@ function refreshPartsRows(): void {
       <button type="button" data-dev-action="add-adapter" style="${BTN_STYLE}">+1</button>
     </div>
     <div style="${ROW_STYLE}">
+      <span>🧱 HULL TILE <span style="color:rgba(255,179,0,0.5);">× ${partsCount('hull')}</span> <span style="color:rgba(255,179,0,0.4);">· grows the room by one square tile (#66)</span></span>
+      <button type="button" data-dev-action="add-hull" style="${BTN_STYLE}">+1</button>
+    </div>
+    <div style="${ROW_STYLE}">
       <span>⭕ RING LINK <span style="color:rgba(255,179,0,0.4);">· flex+22.5 / ext×4 / flex+22.5</span></span>
       <button type="button" data-dev-action="arm-preset" data-preset="ring" style="${BTN_STYLE}${preset === 'ring' ? 'background:rgba(0,230,118,0.18); color:#00e676; border-color:rgba(0,230,118,0.5);' : ''}">${preset === 'ring' ? 'ARMED' : 'ARM'}</button>
     </div>
@@ -969,11 +992,103 @@ function refreshPartsRows(): void {
   `;
 }
 
+/**
+ * 🧱 #66 S3: rebuild the STRUCTURE section rows (current cols/rows readout +
+ * owner-gated grow/shrink buttons). Reads live from floorPlanDoc so a peer
+ * that just resized the room shows up as fresh dims here on the next tick.
+ *
+ * Gating: `canEditRoom()` is the same predicate the wall-computer EDIT ROOM
+ * button consults. A non-owner sees the current dims read-only, no controls —
+ * the STRUCTURE UX writes to the shared plan and only the room's owner may.
+ *
+ * Envelope: buttons for a direction go DISABLED (opacity + not-allowed cursor,
+ * not hidden) when the axis is already at ROOM_TILE_MIN / ROOM_TILE_MAX, so
+ * the shape of the panel is stable even at the limits.
+ */
+function refreshStructureRows(): void {
+  const host = panel?.querySelector<HTMLElement>('#dev-structure-rows');
+  if (!host) return;
+  const { cols, rows } = readRoomDims();
+  const perm = canEditRoom();
+  const dimM = `${cols * 6} × ${rows * 6} m`;
+  const range = `${ROOM_TILE_MIN}–${ROOM_TILE_MAX}`;
+  const rowHtml = (label: string, action: string, at: number, dir: -1 | 1): string => {
+    const disabled = dir < 0 ? at <= ROOM_TILE_MIN : at >= ROOM_TILE_MAX;
+    const style = disabled
+      ? `${BTN_STYLE} opacity:0.35; cursor:not-allowed;`
+      : BTN_STYLE;
+    return `
+      <div style="${ROW_STYLE}">
+        <span>${label}</span>
+        <button type="button" data-dev-action="${action}"${disabled ? ' disabled' : ''} style="${style}">${dir > 0 ? '+' : '−'}</button>
+      </div>
+    `;
+  };
+  const readout = `
+    <div style="${ROW_STYLE}">
+      <span>📐 ROOM SIZE <span style="color:rgba(255,179,0,0.5);">${cols} × ${rows} tiles</span> <span style="color:rgba(255,179,0,0.4);">· ${dimM} · range ${range}</span></span>
+    </div>
+  `;
+  if (!perm.ok) {
+    // Non-owner: readout only, plus a note. Never render disabled writer
+    // buttons — writing writeRoomDims() from a non-owner would still land
+    // locally (LWW) and race the true owner's write; the correct UX is that
+    // the controls don't exist for you at all.
+    host.innerHTML = `
+      ${readout}
+      <div style="${ROW_STYLE}">
+        <span style="color:rgba(255,179,0,0.4);">${perm.reason || 'owner-only'} · you can view but not resize this room</span>
+      </div>
+    `;
+    return;
+  }
+  host.innerHTML = `
+    ${readout}
+    ${rowHtml(`↔ COLS <span style="color:rgba(255,179,0,0.5);">× ${cols}</span>`, 'inc-cols', cols, 1)}
+    ${rowHtml(`↔ COLS <span style="color:rgba(255,179,0,0.5);">× ${cols}</span>`, 'dec-cols', cols, -1)}
+    ${rowHtml(`↕ ROWS <span style="color:rgba(255,179,0,0.5);">× ${rows}</span>`, 'inc-rows', rows, 1)}
+    ${rowHtml(`↕ ROWS <span style="color:rgba(255,179,0,0.5);">× ${rows}</span>`, 'dec-rows', rows, -1)}
+  `;
+}
+
+/**
+ * 🧱 #66 S3: single point of truth for STRUCTURE dim writes.
+ *  – reads the current cols/rows once so a rapid double-click doesn't stack
+ *    against a stale snapshot
+ *  – hard-clamps to [ROOM_TILE_MIN, ROOM_TILE_MAX] so a race with a disabled
+ *    button never escapes the envelope (defense in depth — writeRoomDims's
+ *    own sanitizer would also drop an out-of-range write on the floor, but
+ *    we prefer to succeed at the limit rather than silently no-op)
+ *  – hint-toasts the outcome (grown / shrunk / at-limit) so the owner has
+ *    immediate feedback even when the scene shell rebuild lags a frame
+ *  – no side-effects when the delta is a no-op (already at limit)
+ */
+function applyDimDelta(deltaCols: number, deltaRows: number): void {
+  const perm = canEditRoom();
+  if (!perm.ok) { showHint(`DEV: 🧱 ${perm.reason || 'owner-only'} — cannot resize.`); return; }
+  const cur = readRoomDims();
+  const nextCols = Math.max(ROOM_TILE_MIN, Math.min(ROOM_TILE_MAX, cur.cols + deltaCols));
+  const nextRows = Math.max(ROOM_TILE_MIN, Math.min(ROOM_TILE_MAX, cur.rows + deltaRows));
+  if (nextCols === cur.cols && nextRows === cur.rows) {
+    showHint(`DEV: 🧱 already at the envelope limit (${ROOM_TILE_MIN}–${ROOM_TILE_MAX}).`);
+    return;
+  }
+  writeRoomDims(nextCols, nextRows);
+  // Row refresh comes for free via subscribeFloorPlan, but a synchronous
+  // refresh here means the readout updates in the same frame as the click —
+  // the subscription-driven pass still runs (idempotent) and reconciles any
+  // remote-write that landed between our read and write.
+  refreshStructureRows();
+  const grew = (nextCols - cur.cols) + (nextRows - cur.rows) > 0;
+  showHint(`DEV: 🧱 room ${grew ? 'grown' : 'shrunk'} to ${nextCols} × ${nextRows} tiles (${nextCols * 6} × ${nextRows * 6} m).`);
+}
+
 /** Rows whose state depends on the live environment (module handle, preview). */
 function refreshDynamicRows(): void {
   if (!panel) return;
   refreshInventoryRows();
   refreshPartsRows();
+  refreshStructureRows();
   const moduleBtn = panel.querySelector<HTMLButtonElement>('#dev-module-btn');
   const moduleNote = panel.querySelector<HTMLElement>('#dev-module-note');
   if (moduleBtn && moduleNote) {
@@ -1022,6 +1137,12 @@ export function initDevMenu(getWorldRef: GetWorld): void {
   // #62 P4: keep the PARTS rows live while the panel is open (the ledger grows
   // when provisioning from the docking pane; counts change as chips consume).
   subscribeStationParts(() => { if (isOpen()) refreshPartsRows(); });
+
+  // 🧱 #66 S3: keep the STRUCTURE readout live too — a remote peer's writeRoomDims
+  // fires this subscription, so an open panel shows the fresh cols/rows without
+  // requiring the local viewer to reopen it. The row refresh is safe from any
+  // floorPlan mutation (door slide, tile edit): readRoomDims only reads dims.
+  subscribeFloorPlan(() => { if (isOpen()) refreshStructureRows(); });
 
   // North-door unlock survives reloads — re-assert the live flag at init.
   if (northDoorUnlocked()) {

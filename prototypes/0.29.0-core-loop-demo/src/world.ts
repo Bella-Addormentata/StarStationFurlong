@@ -428,6 +428,11 @@ export class World {
   private doorLabelSigns = new Map<string, THREE.Group>();
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
+  /** 🧱 #66 S3: cached half-extents last consumed by reconcileRoomDims — every
+   *  floorPlan mutation fires our subscription (door slide, tile edit, dims
+   *  write), so this guard skips the expensive shell-rebuild when only the
+   *  non-dims parts changed. Reset in createPlatform (initial + morph). */
+  private lastAppliedDims: { halfX: number; halfZ: number } | null = null;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -585,6 +590,12 @@ export class World {
     // + shell derive from these. Default 2×2 room ⇒ {6,6} ⇒ 12×12, reproducing
     // every legacy literal below bit-for-bit.
     const { halfX, halfZ } = roomHalfExtents();
+    // 🧱 #66 S3: seed the reconcile-dims guard with what THIS platform is being
+    // built at, so a floorPlan mutation that doesn't touch dims (door slide,
+    // tile edit) skips reconcileRoomDims's full shell teardown. Reset here to
+    // cover morph restart (startMorph re-runs createPlatform, so the guard
+    // must not carry a stale value across the teardown).
+    this.lastAppliedDims = { halfX, halfZ };
     const platformW = 2 * halfX,
       platformD = 2 * halfZ;
 
@@ -1611,6 +1622,170 @@ export class World {
     // — the drag's stashed origin is stale now, so the editor drops it and the
     // doc-derived pose stands, mirroring the doorLayout mid-drag abort.
     roomEdit.onDoorPlacementsChanged();
+  }
+
+  /**
+   * 🧱 #66 S3: reconcile every scene structure whose geometry depends on the
+   * room's tile dims to the CURRENT floorPlan.dims. Called from main.ts's
+   * subscribeFloorPlan handler on every floorPlan mutation — cheap idempotency
+   * guard skips the shell teardown when only non-dims fields changed (door
+   * slide, tile edit).
+   *
+   * Discipline follows addOctagonHull + reconcileFurniture: dispose (geometry
+   * + material) every mesh that carried the OLD wall coords, then rebuild via
+   * the SAME helpers createPlatform uses (addSideWalls, addCapsuleOuterStructure,
+   * addOctagonHull, refreshFpNeighbourShells). Furniture, atmosphere, docking
+   * ports, and the ambient/deck planets don't depend on dims and stay put.
+   *
+   * The rebake pipeline (obstacles → walkable grid → seats → stands → devices →
+   * player replan) mirrors reconcileFurniture's final stretch. Without it a
+   * shrunken room would leave the player standing outside the fresh walkable
+   * box with no path off — the beamTo clamp below is the safety net for that.
+   *
+   * A live edit session's raycast index is rebuilt the same way reconcileFurniture
+   * does it (forceExit + enter): the walls and click plane it snapshots on
+   * `enter()` are stale the instant this method rebuilds them.
+   */
+  public reconcileRoomDims(): void {
+    const { halfX, halfZ } = roomHalfExtents();
+    // Idempotency guard: subscribeFloorPlan fires on every plan mutation, but
+    // dims can only change via writeRoomDims. Same-dims callbacks (door slide,
+    // structure-tile edit) are the common case and must be free.
+    if (this.lastAppliedDims &&
+        this.lastAppliedDims.halfX === halfX &&
+        this.lastAppliedDims.halfZ === halfZ) return;
+    // Nothing built yet ⇒ createPlatform will pick up the current dims when it
+    // runs (it reads roomHalfExtents fresh + seeds lastAppliedDims itself).
+    if (!this.platformFloor) return;
+    this.lastAppliedDims = { halfX, halfZ };
+
+    // 1. Floor: swap geometry (holes preserved — makeFloorGeometry rebuilds
+    // from the current floorHoles + floorHoleOutlines list).
+    {
+      const old = this.platformFloor.geometry;
+      this.platformFloor.geometry = this.makeFloorGeometry();
+      old.dispose();
+    }
+
+    // 2. Click plane: same geometry swap. Its rotation.x=-π/2 was baked into
+    // the initial geometry (clickGeo.rotateX), so rebuild at the current dims
+    // with the SAME rotation bake — rotation on the mesh itself stays 0.
+    if (this.clickPlane) {
+      const old = this.clickPlane.geometry;
+      const newGeo = new THREE.PlaneGeometry(2 * halfX, 2 * halfZ);
+      newGeo.rotateX(-Math.PI / 2);
+      this.clickPlane.geometry = newGeo;
+      old.dispose();
+    }
+
+    // 3. Grid helper: dispose + rebuild (GridHelper is square-only, sized to
+    // the larger axis at 1 m divisions — mirrors createPlatform).
+    if (this.platformGrid) {
+      this.platformGroup.remove(this.platformGrid);
+      this.disposeObject3D(this.platformGrid);
+      const gridSpan = Math.max(2 * halfX, 2 * halfZ);
+      this.platformGrid = new THREE.GridHelper(
+        gridSpan,
+        gridSpan,
+        0x1e88e5,
+        0x0a1e3a,
+      );
+      this.platformGrid.position.y = 0.01;
+      this.platformGrid.visible = false;
+      this.platformGroup.add(this.platformGrid);
+    }
+
+    // 4. Legacy flat-box side walls + north wall + their coping strips — only
+    // relevant under `?octagon=0`. Under the octagon hull the shells fully
+    // replace them (addOctagonHull below).
+    if (!OCTAGON_HULL) {
+      for (const w of this.sideWalls) {
+        this.platformGroup.remove(w);
+        this.disposeObject3D(w);
+      }
+      this.sideWalls.length = 0;
+      if (this.northWall) {
+        this.platformGroup.remove(this.northWall);
+        this.disposeObject3D(this.northWall);
+        this.northWall = null;
+      }
+      // Coping strips are the ONLY things addSideWalls pushes to
+      // platformElements (verified by grep). Everything else that lives in
+      // platformElements would be a future addition; guard the coping-only
+      // teardown by clearing the array we're about to refill.
+      for (const el of this.platformElements) {
+        this.platformGroup.remove(el);
+        this.disposeObject3D(el);
+      }
+      this.platformElements.length = 0;
+      this.addSideWalls();
+      // Fresh walls come in visible; hull-edit / wallpaper-cover flags may
+      // want them hidden — the same public method createPlatform ends with.
+      this.updateSideWallCoverage();
+    }
+
+    // 5. Exterior capsule (used by the iso view — always rebuilt, not hull-gated).
+    // Prior instances MUST be disposed or the rebuild would leave a second
+    // set of solid walls at the new dims stacked on the old.
+    if (this.capsuleRoof) {
+      this.platformGroup.remove(this.capsuleRoof);
+      this.disposeObject3D(this.capsuleRoof);
+      this.capsuleRoof = null;
+    }
+    for (const w of this.capsuleOuterWalls) {
+      this.platformGroup.remove(w);
+      this.disposeObject3D(w);
+    }
+    this.capsuleOuterWalls.length = 0;
+    this.addCapsuleOuterStructure();
+
+    // 6. Octagon hull barrel — already idempotent (disposes its prior instance
+    // internally and rebuilds window click-boxes).
+    if (OCTAGON_HULL) this.addOctagonHull();
+
+    // 7. Station-through-the-window neighbour shells — already idempotent;
+    // rebuild so pose-around-the-current-room stays correct as OUR dims change.
+    this.refreshFpNeighbourShells();
+
+    // 8. Doors: wall coords derive from room dims (doorWallCoord), so every
+    // physical pose must re-run against the fresh dims.
+    this.reconcileDoorPlacements();
+
+    // 9. Rebake the walkable-grid pipeline (mirrors reconcileFurniture's tail).
+    // The grid is pre-sized at boot to the ROOM_TILE_MAX envelope, so a resize
+    // never re-allocates — only which cells are inside the CURRENT walkable
+    // box + free of obstacles is refreshed. Seats/stands/devices then rebake
+    // world-space poses off the fresh grid; the player's in-flight plan is
+    // invalidated with no arg (no specific item moved — the WALLS moved).
+    rebuildObstacles();
+    rebakeWalkableGrid();
+    rebuildSeats();
+    rebuildStands();
+    rebuildDevices();
+    this.rebuildSkylightMeshList();
+    this.player.onObstaclesChanged();
+
+    // 10. Player clamp: a shrunk room may leave the avatar outside the fresh
+    // walkable box. beamTo is the safe reset — it cancels any mid-walk / sit /
+    // adapter / device state before repositioning, so we never strand them
+    // in a broken half-transition. Grown rooms leave the position untouched.
+    {
+      const { boundX, boundZ } = roomWalkBounds();
+      const px = this.player.mesh.position.x;
+      const pz = this.player.mesh.position.z;
+      if (Math.abs(px) > boundX || Math.abs(pz) > boundZ) {
+        const cx = Math.max(-boundX, Math.min(boundX, px));
+        const cz = Math.max(-boundZ, Math.min(boundZ, pz));
+        this.player.beamTo(cx, cz);
+      }
+    }
+
+    // 11. Live edit session — the fresh walls/floor invalidate its snapshotted
+    // raycast index; same idiom reconcileFurniture uses (forceExit + enter).
+    if (roomEdit.isEditModeActive()) {
+      roomEdit.forceExit();
+      roomEdit.enter(this);
+    }
   }
 
   /**
