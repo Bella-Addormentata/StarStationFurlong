@@ -757,6 +757,40 @@ describe('proposal rows', () => {
     expect(rows.every((r) => r.heightSource === 'none')).toBe(true);
   });
 
+  it('carries where each row’s clocks came from, not just how trusted they are', () => {
+    // Both paths badge UNVERIFIED — correctly, since both rest on
+    // peer-written inputs — so the trust tag alone cannot tell a window
+    // copied wholesale from another player from one worked out here. Without
+    // the source the list rendered them identically.
+    const subject = {
+      ...(contracts.proposal.unsigned as object),
+      proposalId: registration.proposalId,
+      policyVersion: registration.policyVersion,
+      kind: registration.kind,
+      proposerSig: 'sig',
+    } as TreasuryProposal;
+    const rowFor = (view: (p: TreasuryProposal) => ReturnType<typeof windowsView>) =>
+      proposalRows([subject], view, 5_000_000, 'peer-reported')[0];
+
+    const recomputed = rowFor((p) => windowsView(p, registration, rule, null));
+    expect(recomputed.clockSource).toBe('recomputed');
+    expect(recomputed.clockSourceLabel).toMatch(/worked out here/i);
+
+    const copied = rowFor((p) => windowsView(p, null, null, windows));
+    expect(copied.clockSource).toBe('cached');
+    expect(copied.clockSourceLabel).toMatch(/copied/i);
+
+    // Same badge, different provenance — which is exactly the case that was
+    // indistinguishable before, so assert both halves together.
+    expect(copied.clockTrust.level).toBe(recomputed.clockTrust.level);
+    expect(copied.clockSourceLabel).not.toBe(recomputed.clockSourceLabel);
+
+    // No clocks at all names no source rather than inventing one.
+    const none = rowFor((p) => windowsView(p, null, null, null));
+    expect(none.clockSource).toBe('none');
+    expect(none.clockSourceLabel).toBeNull();
+  });
+
   it('never labels a proposal executable — the chain decides that', () => {
     expect(phaseLabel('executable')).not.toMatch(/executable|ready for the board/i);
   });

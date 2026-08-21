@@ -2949,6 +2949,10 @@ function wireTreasuryView(view: HTMLElement): void {
     // toggle (it preventDefaults every press), so this view carries its own
     // arrow-key movement between controls, and opening it lands focus here.
     view.addEventListener("keydown", (e) => {
+      // Nothing here acts on a phone that is put away. The phone only slides
+      // offscreen, so a control left focused inside it still receives keys —
+      // and moving focus between rows nobody can see is worse than useless.
+      if (!treasuryViewOnScreen(view)) return;
       if (e.key === "Enter" || e.key === " ") {
         if (activate(e.target)) e.preventDefault();
         return;
@@ -3358,7 +3362,7 @@ function paintTreasuryBody(view: HTMLElement): void {
         ? rows
             .map(
               (r) => `<div data-treasury-action="open" data-proposal-id="${esc(r.proposalId)}" role="button" tabindex="0"
-                aria-label="${esc(`${r.kindLabel}, policy version ${r.policyVersion}. ${r.phaseLabel}. ${r.clockTrust.label}: ${r.clockTrust.detail}`)}"
+                aria-label="${esc(`${r.kindLabel}, policy version ${r.policyVersion}. ${r.phaseLabel}.${r.clockSourceLabel ? ` Clocks ${r.clockSourceLabel.toLowerCase()}.` : ""} ${r.clockTrust.label}: ${r.clockTrust.detail}`)}"
                 style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
                 <span style="min-width:0;">
                   <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
@@ -3366,6 +3370,15 @@ function paintTreasuryBody(view: HTMLElement): void {
                 </span>
                 <span style="flex-shrink:0; font-size:9px; color:${TREASURY_LABEL}; text-align:right;">
                   ${esc(r.phaseLabel)}<br />${badge(null, r.clockTrust)}
+                  ${
+                    // Both clock paths badge as UNVERIFIED — correctly, since
+                    // both rest on peer-written inputs. Without the source
+                    // beside it, a window copied wholesale from another player
+                    // read exactly like one worked out here.
+                    r.clockSourceLabel
+                      ? `<br /><span style="font-size:8px; color:${TREASURY_MUTED};">${esc(r.clockSourceLabel)}</span>`
+                      : ""
+                  }
                 </span>
               </div>`,
             )
@@ -5090,12 +5103,34 @@ function setupSpacePhoneOverlay() {
     showPhoneView(id);
     return true;
   };
+  /**
+   * The control outside the phone that opened it, if any.
+   *
+   * The phone is only slid offscreen, never display:none, so focus left inside
+   * it stays live and keeps answering arrow keys against rows nobody can see.
+   * A keyboard player who reached TREASURY from the room terminal would then
+   * have no way back to the terminal.
+   */
+  let phoneOpener: HTMLElement | null = null;
+  const releasePhoneOpener = (): void => {
+    const opener = phoneOpener;
+    phoneOpener = null;
+    // Only if it is still in the document and still focusable: the terminal
+    // panel is torn down on unmount, and focusing a detached node silently
+    // sends focus to <body> instead.
+    if (opener?.isConnected) opener.focus({ preventScroll: true });
+  };
   // 🏦 Cross-surface entry point, same posture as __ssfRoomId: the room
   // terminal's FUNDING panel is mounted outside the phone shell, so it cannot
   // use the delegated router. It opens the phone straight to TREASURY.
   (
     window as unknown as { __ssfOpenTreasury?: () => void }
   ).__ssfOpenTreasury = () => {
+    // Remember who sent us here, so closing the phone can hand focus back.
+    // Only for openers OUTSIDE the phone: a control within it is about to be
+    // hidden anyway, and would be a worse place to land than the game.
+    const opener = document.activeElement as HTMLElement | null;
+    phoneOpener = opener && !phoneShell.contains(opener) ? opener : null;
     // Quick chat first. It leaves the phone in `peek`, and `.peek` is declared
     // after `.active` at equal specificity, so adding `active` alone left the
     // phone at bottom:-386px — mostly offscreen — and this link appeared to do
@@ -5245,6 +5280,12 @@ function setupSpacePhoneOverlay() {
           logToPhoneSystem("Entering SpacePhone net...");
         } else {
           chatInput?.blur();
+          // Hand focus back to whatever opened the phone from outside it. The
+          // phone is only moved offscreen, never display:none, so a control
+          // left focused inside it keeps answering the arrow keys against
+          // hidden rows — a keyboard player who opened TREASURY from the room
+          // terminal could not get back to the terminal at all.
+          releasePhoneOpener();
         }
       }
     }

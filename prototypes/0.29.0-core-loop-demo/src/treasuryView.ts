@@ -845,7 +845,24 @@ export interface ProposalRowView {
    * cache should not look like one worked out from a matching record.
    */
   clockTrust: TrustTag;
+  /**
+   * WHERE those clocks came from. The trust tag alone cannot say: both the
+   * recomputed and the copied path are 'unverified' — correctly, since both
+   * rest on peer-written inputs — so without this the list rendered a window
+   * copied wholesale from another player identically to one worked out here
+   * from a matching acceptance record. Same trust, materially different
+   * provenance, and only the detail screen was saying so.
+   */
+  clockSource: WindowsView['source'];
+  /** Short provenance word for the row, or null when there are no clocks. */
+  clockSourceLabel: string | null;
 }
+
+const CLOCK_SOURCE_LABELS: Record<WindowsView['source'], string | null> = {
+  recomputed: 'WORKED OUT HERE',
+  cached: 'COPIED FROM A PLAYER',
+  none: null,
+};
 
 /**
  * Sorts by acceptance height where known (newest first), then by id so the
@@ -874,6 +891,8 @@ export function proposalRows(
       phaseLabel: phaseLabel(phase),
       heightSource,
       clockTrust: view.trust,
+      clockSource: view.source,
+      clockSourceLabel: CLOCK_SOURCE_LABELS[view.source],
       _accepted: w ? w.acceptedHeight : -1,
     };
   });

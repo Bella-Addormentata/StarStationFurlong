@@ -805,12 +805,17 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         const step = e.key === 'ArrowDown' ? 1 : -1;
         stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
       });
+      deps.onEngagedChange?.(true);
+      // refresh() BEFORE choosing where focus lands. It applies the EDIT ROOM
+      // permission gate, so picking first would land a non-owner on EDIT ROOM
+      // and then disable the very button holding focus — dropping focus out of
+      // the panel and leaving the enabled treasury link unreachable by the
+      // arrow traversal.
+      refresh();
       // Somewhere to start from: arrow traversal is useless if nothing in the
       // panel holds focus when it opens. preventScroll because the panel is
       // positioned over the canvas and must not drag the page under it.
       focusStops()[0]?.focus({ preventScroll: true });
-      deps.onEngagedChange?.(true);
-      refresh();
     },
 
     unmount(): void {
