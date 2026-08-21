@@ -342,6 +342,35 @@ export function physicalPortPose(
 }
 
 /**
+ * 🧭 #102 R2 (audit round 1): the transit's station-bias delta, extracted
+ * from `world.completeAdapterArrival` so the composite hArr − hDep math is
+ * unit-testable end-to-end. Pure: the answer depends ONLY on the departure
+ * wall, the arrival door's id, and the arrival room's records — never the
+ * pushed doorLayout global. That is the whole reason `arrivalLayout` is a
+ * required parameter here, mirroring `physicalDoorPose(id, layout?)`.
+ *
+ *   h_dep = outwardYaw(departure wall)         — heading OUT of the near wall
+ *   h_arr = outwardYaw(arrival wall) + π       — heading INTO the far room
+ *   Δ     = h_arr − h_dep                       — camera rotation to publish
+ *
+ * A traveler heading `h_dep` into the vestibule ends up heading `h_arr` on
+ * the other side; adding Δ to the camera yaw keeps the on-screen "forward"
+ * continuous across the transit (owner's R2). Extracted (not inlined) so a
+ * future re-wiring of the arrival hook can be caught by
+ * orientedTransit.test.ts even when the primitives still pass.
+ */
+export function computeArrivalStationBias(
+  departureWall: DoorWall,
+  arrivalDoorId: string,
+  arrivalLayout: DoorRecordsMap,
+): number {
+  const hDep = poseFromWall(departureWall, 0, 0).outwardYaw;
+  const hArr =
+    physicalDoorPose(arrivalDoorId, arrivalLayout).outwardYaw + Math.PI;
+  return hArr - hDep;
+}
+
+/**
  * 🚪↔🛰️ #28 S3: the DOOR → PORT map — which structural docking port a door
  * serves. Today doors ARE the 4 cardinal ports, so this is identity. Slice 5
  * makes it geometric: a free door resolves to the port it ALIGNS to (same wall,

@@ -9,6 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import {
   physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
+  computeArrivalStationBias,
   type PhysicalDoorId,
   type DoorRecordsMap,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
@@ -92,6 +93,7 @@ import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import {
   subscribeDoorLayout, readAllDoorLayout, sanitizeDoorLabel,
   setLegacyRoomDoorLayout, defaultDoorLayoutRecords, doorSetIsAuthoritative,
+  selectArrivalDoorLayout,
   doorDisplayName,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
@@ -165,6 +167,7 @@ import {
 import { computeOctagonProfile } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
 import { getCameraYaw, addStationBias, resetStationBias } from "./cameraRig";
+import { computeVestibuleFadeTarget } from "./vestibuleFade";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -4380,44 +4383,35 @@ export class World {
         // and FADE_OUT_AT thresholds bracket a MATERIAL band (radius <
         // FADE_HOLD) that stays solid — a small isometric jitter around a
         // 45° detent no longer restarts a fade. Inside FADE_IN_AT ⇒ 1.0;
-        // outside FADE_OUT_AT ⇒ base; between them, linear ramp on distance,
-        // biased so the material band is FLAT rather than a peaked curve.
+        // outside FADE_OUT_AT ⇒ base; between them, linear ramp on distance.
+        //
+        // 🧭 T2 REMEDIATION (audit round 1): each ramp now spans ONLY its
+        // half of the hysteresis band (FADE_HOLD → FADE_OUT_AT on fade-out;
+        // FADE_IN_AT → FADE_HOLD on fade-in), so the target value is
+        // continuous with the flat region at the FADE_HOLD boundary. Pre-fix
+        // the ramp used the full range and produced a target jump of ~0.6 at
+        // dist = FADE_HOLD, which the per-frame chase-lerp hid on slow walks
+        // but not on fast ones. Math extracted to `computeVestibuleFadeTarget`
+        // so vestibuleFade.test.ts can assert the boundary continuity.
         const dist = Math.hypot(
           playerPos.x - door.front.x,
           playerPos.z - door.front.z,
         );
         const current = (vestibule.userData.opacity as number) ?? 0;
-        // Detect which side of the hold band the ramp should aim for. The
-        // hysteresis is: once opacity is above the hold value, don't start
+        // Hysteresis bit: once opacity is above the hold value, don't start
         // fading out until the avatar reaches FADE_OUT_AT; once opacity is
         // below the hold value, don't start fading in until FADE_IN_AT.
-        const isMaterialising = current > 0.5; // already solid → hold longer
-        if (dist <= World.VESTIBULE_FADE_IN_AT) {
-          target = 1.0;
-        } else if (dist >= World.VESTIBULE_FADE_OUT_AT) {
-          target = World.VESTIBULE_BASE_OPACITY;
-        } else if (isMaterialising && dist <= World.VESTIBULE_FADE_HOLD) {
-          // Inside the hysteresis band while ALREADY solid — stay solid
-          // (no fade-out from a jitter around the detent).
-          target = 1.0;
-        } else if (!isMaterialising && dist >= World.VESTIBULE_FADE_HOLD) {
-          // Inside the hysteresis band while ALREADY faded — stay faded
-          // (no fade-in from a jitter that didn't cross the near edge).
-          target = World.VESTIBULE_BASE_OPACITY;
-        } else {
-          // Actively ramping across the hold band. Linear on distance from
-          // the appropriate edge for continuity with the flat regions.
-          const range =
-            World.VESTIBULE_FADE_OUT_AT - World.VESTIBULE_FADE_IN_AT;
-          const t = THREE.MathUtils.clamp(
-            1 - (dist - World.VESTIBULE_FADE_IN_AT) / range,
-            0,
-            1,
-          );
-          target =
-            World.VESTIBULE_BASE_OPACITY +
-            t * (1 - World.VESTIBULE_BASE_OPACITY);
-        }
+        const isMaterialising = current > 0.5;
+        target = computeVestibuleFadeTarget(
+          dist,
+          isMaterialising,
+          {
+            fadeInAt: World.VESTIBULE_FADE_IN_AT,
+            fadeHold: World.VESTIBULE_FADE_HOLD,
+            fadeOutAt: World.VESTIBULE_FADE_OUT_AT,
+          },
+          World.VESTIBULE_BASE_OPACITY,
+        );
       }
 
       const current = (vestibule.userData.opacity as number) ?? 0;
@@ -4600,11 +4594,12 @@ export class World {
     // rule reconcileDoorLayout uses when a room is unseeded but not
     // authoritative-empty. An authoritative-empty (doorless) room legitimately
     // yields an empty snapshot; the walk-in bail below handles that.
-    const arrivalStored = readAllDoorLayout();
-    const arrivalLayout: DoorRecordsMap =
-      arrivalStored.size > 0 || doorSetIsAuthoritative()
-        ? arrivalStored
-        : defaultDoorLayoutRecords();
+    //
+    // 🧭 R2 (audit round 1): extracted to `selectArrivalDoorLayout` in
+    // doorLayoutDoc.ts so orientedTransit.test.ts can drive the SAME logic
+    // through a bound doc — a future re-wiring that keeps the primitives
+    // correct but breaks their composition here now trips the H2b test.
+    const arrivalLayout: DoorRecordsMap = selectArrivalDoorLayout();
     // 🔗 The arrival room's own back-pointing record picks the door (see
     // resolveArrivalDoor); the record's farDoor and the opposite-cardinal
     // guess are fallbacks only.
@@ -4638,11 +4633,15 @@ export class World {
     // path the H2 harness exercises. A wrong records source here rotates the
     // camera by the delta between the DEPARTURE room's and ARRIVAL room's
     // reading of the SAME id, which is always the wrong answer.
+    //
+    // 🧭 R2 (audit round 1): the h_arr − h_dep math is extracted to
+    // `computeArrivalStationBias(depWall, arrival.id, arrivalLayout)` in
+    // doorLayout.ts, so orientedTransit.test.ts can assert the composed
+    // primitives yield the R2 delta this hook is supposed to publish.
     if (departureWall) {
-      const hDep = poseFromWall(departureWall, 0, 0).outwardYaw;
-      const hArr =
-        physicalDoorPose(arrival.id, arrivalLayout).outwardYaw + Math.PI;
-      addStationBias(hArr - hDep);
+      addStationBias(
+        computeArrivalStationBias(departureWall, arrival.id, arrivalLayout),
+      );
     }
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
     // arrivals — the traveler walks in, gets the hint, and is walked right
