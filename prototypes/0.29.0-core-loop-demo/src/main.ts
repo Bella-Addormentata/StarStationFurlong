@@ -1807,7 +1807,27 @@ async function joinRoomAtEpoch(
     }
   };
   // Publish for module-scope subscribers (block list, group threads observer).
+  // Both closures MUST be republished symmetrically here: leaveRoom nulls both
+  // (defensive, so a click during the room-null gap becomes a silent no-op),
+  // so a join that only republishes one leaves the sibling permanently null
+  // after the first hop. `rebuildChatLog` closes over the per-join `sharedChat`
+  // handle so we necessarily re-create it here; `refreshChatThreadBar` is a
+  // module-scope function that reads the CURRENT yjsSync.doc.getMap fresh on
+  // each call, so republishing the same reference every join is safe. The
+  // hoisted function declaration at the bottom of the file guarantees the
+  // reference resolves regardless of source order.
+  //
+  // 👥 Issue #20 audit r4 regression fix: pre-fix, this file only assigned
+  // `latestRefreshChatThreadBar` once inside setupChatThreadBar (a one-shot
+  // reached via setupSpacePhoneOverlay at boot). leaveRoom nulled it, joins
+  // after the first never restored it, and every chip-bar refresh path routed
+  // through refreshChatThreadBarIfBound (sharedGroups.observe, the joinRoom
+  // initial paint, the CHAT-app open handler) became a silent no-op — so
+  // remote group creations stopped repainting chips, and rejoining a room
+  // showed stale chips from the departure room. Republishing here restores
+  // the invariant that both closures are non-null between join and leave.
   latestRebuildChatLog = rebuildChatLog;
+  latestRefreshChatThreadBar = refreshChatThreadBar;
   sharedChat.observe((event) => {
     // 💬 Overhead bubbles from the event's INSERT delta only — robust against
     // the in-transact 200-cap trim (length deltas lie there) and precise about
@@ -1964,6 +1984,13 @@ async function leaveRoom(): Promise<void> {
   // ("[chat] rebuild threw:") on every mutation. Clearing them here means
   // the ?.() call is a silent no-op until the next join re-publishes the
   // fresh closures over the fresh sharedChat / groupsMap handles.
+  //
+  // Symmetry contract (audit r4): the join binder MUST republish BOTH
+  // pointers. Historically only `latestRebuildChatLog` was republished per
+  // join because it closes over the per-join `sharedChat`; the sibling
+  // `latestRefreshChatThreadBar` was assigned once inside setupChatThreadBar
+  // (a one-shot) and stayed null after the first leaveRoom. See the
+  // republish site next to `latestRebuildChatLog = rebuildChatLog;`.
   latestRebuildChatLog = null;
   latestRefreshChatThreadBar = null;
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
@@ -6178,7 +6205,12 @@ function setupChatThreadBar(): void {
     }
   });
 
-  // Publish the refresh closure so per-join observers can trigger paints.
+  // Publish the refresh closure for the case where the FIRST setupChatThreadBar
+  // call (via setupSpacePhoneOverlay in bootstrapNetworking) races AHEAD of the
+  // first joinRoomAtEpoch — the per-join republish (in joinRoomAtEpoch) covers
+  // every subsequent join, but a pre-join click that opens the chat overlay
+  // and lands here first must still leave the bar wired up. Same reference the
+  // join path uses, so a subsequent join re-assigning is a no-op.
   latestRefreshChatThreadBar = refreshChatThreadBar;
   refreshChatThreadBar();
 }
