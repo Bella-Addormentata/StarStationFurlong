@@ -1203,6 +1203,40 @@ describe('pager visibility', () => {
     }
   });
 
+  it('leaves no treasury screen without a way out by keyboard', () => {
+    // The phone header's Back button is OUTSIDE this view, the global Tab
+    // handler stops browser traversal, the arrow handler only searches
+    // inside the view, and Escape goes to Home rather than to the parent
+    // app. So a branch that paints the whole screen without a focusable
+    // return traps a keyboard-only player. The "not connected" branch did:
+    // it is the one screen with nothing else on it, so it offered no stop at
+    // all and the arrow handler found zero elements to move between.
+    //
+    // Checked at every assignment rather than at the one that was wrong,
+    // because the control existed and was reasoned about — it was simply
+    // absent from one branch, and nothing said the branches had to agree.
+    // Bounded to THIS function. An unbounded slice ran on into the Ventures
+    // app's own painters and failed on their markup — the same mistake as
+    // reading a fixed-width window, which this file has now made twice.
+    const from = main.indexOf('function paintTreasuryBody(');
+    expect(from, 'paintTreasuryBody not found — did it move or get renamed?')
+      .toBeGreaterThan(-1);
+    const end = main.indexOf('\nfunction ', from + 1);
+    expect(end, 'no function follows paintTreasuryBody — bound check is unsound')
+      .toBeGreaterThan(from);
+    const body = main.slice(from, end);
+    const assignments = [...body.matchAll(/view\.innerHTML = `/g)];
+    expect(assignments.length).toBeGreaterThan(4);
+    for (const at of assignments) {
+      const head = body.slice(at.index!, at.index! + 120);
+      // Either the in-view Ventures return, or ALL PROPOSALS, which reaches
+      // the list screen that carries one. Both must come FIRST, so the first
+      // arrow press lands on a way out.
+      expect(head, `a treasury screen paints with no keyboard route out: ${head.slice(0, 80)}`)
+        .toMatch(/\$\{verdictBanner\}\$\{back/);
+    }
+  });
+
   it('shows which network the records are pinned to', () => {
     // `label` was documented as player-facing and settable through
     // VITE_SSF_TREASURY_NETWORK, and nothing read it: the option changed

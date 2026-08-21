@@ -3273,8 +3273,20 @@ function paintTreasuryBody(view: HTMLElement): void {
       }
     </div>`;
 
+  // An in-view return, needed on EVERY branch that can be the whole screen.
+  // The phone header's own Back button sits outside this view, arrow-key
+  // traversal only searches inside it, and Escape goes to Home rather than to
+  // the parent app — so a branch without this leaves a keyboard-only player
+  // with no way back to VENTURES. The "not connected" branch had exactly that
+  // hole: it is the one screen with nothing else on it, so it offered no
+  // focusable element at all. Declared once here rather than pasted per
+  // branch, since the copy that was missing is how it went wrong.
+  const backToVentures = `
+    <div data-phone-app="ventures" role="button" tabindex="0" aria-label="Back to Ventures"
+      style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer; margin-top:8px;">← VENTURES</div>`;
+
   if (!bound) {
-    view.innerHTML = `${verdictBanner}
+    view.innerHTML = `${verdictBanner}${backToVentures}
       ${header("COMPANY TREASURY")}
       ${dim("Not connected to a room yet — treasury records ride the room you are standing in.")}`;
     return;
@@ -3708,12 +3720,7 @@ function paintTreasuryBody(view: HTMLElement): void {
     heightSource,
   );
 
-  // An in-view return: the phone header's own Back button sits outside this
-  // view, so the arrow-key traversal cannot reach it and a keyboard-only
-  // player would have no way back to VENTURES (Escape jumps to Home).
-  view.innerHTML = `${verdictBanner}
-    <div data-phone-app="ventures" role="button" tabindex="0" aria-label="Back to Ventures"
-      style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer; margin-top:8px;">← VENTURES</div>
+  view.innerHTML = `${verdictBanner}${backToVentures}
 
     ${header("THIS ROOM")}
     <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
