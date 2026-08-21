@@ -181,6 +181,19 @@ describe('votes and approvals', () => {
     ...(confirmed ? { confirmedHeight: 5_000_100 } : {}),
   } as TreasuryCheckpoint);
 
+  it('will not say no round is open when it only saw part of the records', () => {
+    // The warnings under this note say a round may be unread or on another
+    // page. An unconditional "No approval round open in this room" beside
+    // them made the panel contradict itself — and the confident half was the
+    // wrong half.
+    const partial = approvalsView([], null, 5_000_000, false);
+    expect(partial.note).not.toMatch(/no approval round open in this room/i);
+    expect(partial.note).toMatch(/not the same as there being none/i);
+    // With a complete view the plain statement is fine, and is what it says.
+    const whole = approvalsView([], null, 5_000_000, true);
+    expect(whole.note).toMatch(/no approval round open in this room/i);
+  });
+
   it('counts held votes by choice without presenting a tally', () => {
     const t = voteTallyView(
       [vote('yes', '1'.repeat(64)), vote('yes', '2'.repeat(64)), vote('veto', '3'.repeat(64))],

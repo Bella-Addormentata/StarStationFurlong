@@ -1103,6 +1103,33 @@ describe('verification caching', () => {
     expect(scan.items).toEqual([p]); // the honest one still lists
   });
 
+  it('freezes NESTED data even when the caller froze only the top level', () => {
+    // Object.isFrozen is shallow, so using it as the walk's early-out skipped
+    // the children of anything already frozen. A caller can hand in exactly
+    // that — Object.freeze(policy) leaves policy.board and policy.shareClasses
+    // mutable — and the hash would then be cached over a value whose insides
+    // could still change, which is the stale fingerprint the freeze prevents.
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
+    const shallow = Object.freeze({
+      ...policy,
+      board: { ...policy.board, signerPuzzleHashes: [...policy.board.signerPuzzleHashes] },
+      shareClasses: policy.shareClasses.map((c) => ({ ...c })),
+    }) as CompanyTreasuryPolicy;
+    expect(Object.isFrozen(shallow)).toBe(true);
+    expect(Object.isFrozen(shallow.board)).toBe(false); // the hole
+    expect(putPolicyCache(shallow)).toBe(true);
+    const first = readPolicyCache();
+    expect(first?.policyHash).toBe(contracts.policy.policyHash);
+    // Everything under it is frozen too, so the hash cannot go stale.
+    expect(Object.isFrozen(shallow.board)).toBe(true);
+    expect(Object.isFrozen(shallow.shareClasses)).toBe(true);
+    expect(Object.isFrozen(shallow.shareClasses[0])).toBe(true);
+    expect(() => {
+      (shallow.board as { threshold: number }).threshold = 99;
+    }).toThrow();
+    expect(readPolicyCache()?.policy.board.threshold).toBe(policy.board.threshold);
+  });
+
   it('refuses a record too large to be worth checking, in constant time', () => {
     // Capping array counts was not enough: every string field here is checked
     // with isNonEmptyString and has no length limit, so ONE record with a huge

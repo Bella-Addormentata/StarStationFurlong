@@ -469,6 +469,17 @@ export function approvalsView(
   sessions: SigningSession[],
   policyThreshold: number | null,
   currentHeight: number | null = null,
+  /**
+   * False when the rounds handed in are only part of what the room holds —
+   * the scan was cut short, a page was shown, or entries were rejected or
+   * refused on size.
+   *
+   * Without it the zero case asserted "No approval round open in this room"
+   * while the warnings printed directly beneath it said a round might be
+   * unread or on another page. The panel contradicted itself, and the
+   * confident half was the wrong half.
+   */
+  complete = true,
 ): ApprovalsView {
   // Rounds stay in the cache after they end, so picking purely by signature
   // count would let a dead round with more signatures hide a live one and
@@ -506,7 +517,9 @@ export function approvalsView(
     trust: trustTag('unverified'),
     note:
       (live.length === 0
-        ? 'No approval round open in this room.'
+        ? complete
+          ? 'No approval round open in this room.'
+          : 'No approval round is open among the records read for this screen — that is not the same as there being none.'
         : 'Approvals are not checked in the phone — the chain enforces the board’s threshold when a spend is made.') + staleness,
   };
 }

@@ -3253,6 +3253,13 @@ function paintTreasuryBody(view: HTMLElement): void {
       sessionsFor(sessionScan.items, proposal),
       boardThresholdFor(proposal, policyCache?.policy ?? null),
       height,
+      // Whether these rounds are ALL of them. Anything cut short, paged over,
+      // rejected or refused means the panel must not assert that no round is
+      // open — the warnings under it already say one might be.
+      !sessionScan.truncated &&
+        sessionScan.rejected === 0 &&
+        sessionScan.refusedTooLarge === 0 &&
+        sessionScan.matched <= DETAIL_CHECKS,
     );
     // Only the round whose count is on screen. A scan-wide flag put an
     // "at least" on a complete round whenever some OTHER round — expired,

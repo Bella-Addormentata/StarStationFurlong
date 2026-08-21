@@ -384,10 +384,20 @@ function deepFreeze<T>(value: T): T {
   // Iterative for the same reason withinBudget is: a value can pass the node
   // budget and still be nested deep enough to overflow the call stack, and a
   // throw here aborts the render.
+  // Cycles are tracked SEPARATELY from frozenness. Object.isFrozen is a
+  // shallow check, so using it as the early-out skipped the children of any
+  // object that was already frozen at the top level — and a caller can hand in
+  // exactly that: Object.freeze(policy) leaves policy.board and
+  // policy.shareClasses mutable. The hash would then be computed and cached
+  // over a value whose insides could still change, which is the stale
+  // fingerprint this freeze exists to prevent.
+  const seen = new Set<object>();
   const pending: unknown[] = [value];
   while (pending.length > 0) {
     const node = pending.pop();
-    if (typeof node !== 'object' || node === null || Object.isFrozen(node)) continue;
+    if (typeof node !== 'object' || node === null) continue;
+    if (seen.has(node)) continue;
+    seen.add(node);
     // Typed arrays are left alone. Object.freeze THROWS on an ArrayBuffer view
     // with elements, and Yjs will happily store a Uint8Array a peer put in a
     // slot — so freezing before the shape guard turned one binary value into
@@ -395,8 +405,8 @@ function deepFreeze<T>(value: T): T {
     // contains binary, so skipping costs nothing: the value still meets its
     // type guard next and is rejected the ordinary way.
     if (ArrayBuffer.isView(node)) continue;
-    // Frozen BEFORE its children are queued, so the isFrozen check above also
-    // terminates a cyclic value.
+    // Harmless if it was already frozen; what matters is that its children are
+    // still queued below.
     Object.freeze(node);
     for (const key of Object.getOwnPropertyNames(node)) {
       pending.push((node as Record<string, unknown>)[key]);
