@@ -585,10 +585,30 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
  */
 /**
  * A runaway guard on key EXAMINATION, deliberately far above any plausible
- * room. It is not a page bound: examining a key is a prefix test, so this
+ * room. It is not a PAGE bound — examining a key is a prefix test, so this
  * costs a fraction of a millisecond even at the cap, whereas the old
  * page-sized traversal cap let 800 unrelated keys hide every real record
  * behind a horizon paging could not cross.
+ *
+ * But it IS a horizon once a map exceeds it, and saying otherwise would be
+ * the overclaim this file exists to avoid. Every page is rebuilt by walking
+ * the map from the start, so a peer who puts more than this many entries
+ * ahead of an honest key in raw iteration order keeps it out of the collected
+ * set on every repaint, and no amount of NEXT reaches it. That case is
+ * disclosed rather than hidden — see `discoveryCutShort`, which is reported
+ * apart from ordinary paging truncation precisely so the screen can say that
+ * records may exist here that paging cannot reach.
+ *
+ * It is not fixable at this layer, which is worth writing down because the
+ * obvious repair is unsound. Resuming a later walk part-way needs a stable
+ * position in `m.keys()`, and that order is a peer-writable insertion order:
+ * remembering "carry on from the 50,000th entry" is the same index-versus-
+ * cursor mistake that cursors were introduced to fix, one level further down
+ * — a writer inserting ahead of the resume point pushes content past it
+ * exactly as fast as the reader advances. Nor can the resume point be a KEY,
+ * since a writer can delete it and strand the walk. The fix is the per-record
+ * class index the plan schedules with the op-log work: an ordering the reader
+ * controls, rather than a better way to walk one it does not.
  */
 const MAX_KEYS_EXAMINED = 50_000;
 
@@ -653,6 +673,19 @@ export interface BoundedScan<T> {
   rejected: number;
   /** Matching keys found within the traversal budget, before verification. */
   matched: number;
+  /**
+   * The traversal guard stopped the walk before the map ran out.
+   *
+   * Reported apart from `truncated` because they mean different things to a
+   * reader. `truncated` says "this is one page of several" — the rest is a
+   * NEXT away. This one says the walk that BUILDS those pages was cut short,
+   * so records may be held here that no amount of paging reaches. Folding it
+   * into `truncated` would present an unreachable record as merely a later
+   * page, which is the more dangerous of the two claims to get wrong.
+   *
+   * See MAX_KEYS_EXAMINED for why this cannot be repaired at this layer.
+   */
+  discoveryCutShort: boolean;
   /**
    * Keys that carried the right prefix but were too long to be any record this
    * schema can name, and so were never collected. See MAX_KEY_LENGTH.
@@ -722,7 +755,7 @@ function scanPrefixed<T>(
   const m = readMap();
   if (!m) {
     return {
-      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
+      items: [], truncated: false, discoveryCutShort: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
       cursor: after, startIndex: 0, nextCursor: null,
     };
   }
@@ -745,12 +778,14 @@ function scanPrefixed<T>(
   const keys: string[] = [];
   let examined = 0;
   let truncated = false;
+  let discoveryCutShort = false;
   let malformedKeys = 0;
   const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
   for (const key of m.keys()) {
     examined += 1;
     if (examined > ceiling) {
       truncated = true;
+      discoveryCutShort = true;
       break;
     }
     if (!key.startsWith(prefix)) continue;
@@ -797,6 +832,7 @@ function scanPrefixed<T>(
   return {
     items,
     truncated,
+    discoveryCutShort,
     refusedTooLarge,
     rejected,
     malformedKeys,
@@ -1332,7 +1368,7 @@ export function scanSigningSessions(
   const m = readMap();
   if (!m) {
     return {
-      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
+      items: [], truncated: false, discoveryCutShort: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
       cursor: after, startIndex: 0, nextCursor: null, partialSessionIds: [],
     };
   }
@@ -1348,11 +1384,13 @@ export function scanSigningSessions(
   // contradicted the guarantee that a paged shell carries its approvals.
   const shellKeys: string[] = [];
   let malformedKeys = 0;
+  let discoveryCutShort = false;
   const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
   for (const key of m.keys()) {
     examined += 1;
     if (examined > ceiling) {
       truncated = true;
+      discoveryCutShort = true;
       break;
     }
     if (!key.startsWith(shellPrefix)) continue;
@@ -1396,6 +1434,7 @@ export function scanSigningSessions(
       // signatures it holds, so all of them are flagged rather than none.
       for (const id of wanted) partialSessions.add(id);
       truncated = true;
+      discoveryCutShort = true;
       break;
     }
     if (!key.startsWith('sessionsig:')) continue;
@@ -1412,12 +1451,22 @@ export function scanSigningSessions(
       partialSessions.add(sessionId);
       continue;
     }
+    // A signature entry this device cannot read is not a signature that was
+    // never gathered. Dropping these silently let a round render an exact
+    // "2 of 3" while entries filed under that round's own signature keys had
+    // been thrown away — the same absence-from-a-failed-read the rest of this
+    // file refuses, one level down. Flagging the SESSION (rather than
+    // counting map-wide) keeps the caveat on the round it belongs to, so an
+    // unrelated round's junk cannot put an "at least" on a complete one.
+    const dropped = () => {
+      partialSessions.add(sessionId);
+    };
     const value = m.get(key);
-    if (typeof value !== 'object' || value === null) continue;
+    if (typeof value !== 'object' || value === null) { dropped(); continue; }
     const entry = value as Record<string, unknown>;
-    if (!isHex32(entry.signerPuzzleHash)) continue;
-    if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
-    if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
+    if (!isHex32(entry.signerPuzzleHash)) { dropped(); continue; }
+    if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) { dropped(); continue; }
+    if (typeof entry.sig !== 'string' || entry.sig.length === 0) { dropped(); continue; }
     let bucket = sigsBySession.get(sessionId);
     if (!bucket) {
       bucket = [];
@@ -1448,6 +1497,7 @@ export function scanSigningSessions(
   return {
     items: out,
     truncated,
+    discoveryCutShort,
     refusedTooLarge,
     rejected,
     malformedKeys,

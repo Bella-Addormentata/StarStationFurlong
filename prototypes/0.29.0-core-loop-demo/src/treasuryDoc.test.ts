@@ -216,6 +216,30 @@ describe('proposals', () => {
     expect(starved.truncated).toBe(true);
   });
 
+  it('says when the SEARCH was cut short, not just the page', () => {
+    // Two different claims. "There is another page" is an invitation to press
+    // NEXT; "the walk that builds the pages stopped early" says pressing NEXT
+    // may never get there, because every page is rebuilt from the same
+    // truncated walk. Folding the second into the first would present an
+    // unreachable record as merely a later one — the more dangerous of the
+    // two to get wrong, so they are reported separately.
+    const m = doc.getMap('treasury');
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    for (let i = 0; i < 40; i++) m.set(`junk:${i}`, { i });
+
+    // Ordinary paging: more pages exist, but the walk saw the whole map.
+    const paged = scanProposals(50_000, 1);
+    expect(paged.truncated).toBe(false); // one record, one page
+    expect(paged.discoveryCutShort).toBe(false);
+
+    // The walk itself stops early. Everything past it is unreachable by
+    // paging, and the flag is what lets the screen say so.
+    const cut = scanProposals(5, 99);
+    expect(cut.discoveryCutShort).toBe(true);
+    expect(cut.truncated).toBe(true);
+  });
+
   it('refuses keys too long to name a record, before they reach the sort', () => {
     // The traversal guard bounds how MANY keys are collected; nothing bounded
     // their LENGTH, and comparing two keys costs their shared prefix. So a
@@ -776,6 +800,7 @@ describe('network pinning', () => {
     expect(scanProposals(100, 100)).toEqual({
       items: [],
       truncated: false,
+      discoveryCutShort: false,
       refusedTooLarge: 0,
       rejected: 0,
       malformedKeys: 0,
@@ -1064,6 +1089,60 @@ describe('verification caching', () => {
       collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
     })).toBe(true);
     expect(scanSigningSessions(shell.proposalId, 50_000, 10, null).partialSessionIds).toEqual([]);
+  });
+
+  it('qualifies a round whose signature entries could not be read', () => {
+    // A signature entry this device throws out is not a signature that was
+    // never gathered. Skipping them silently let a round render an exact
+    // "2 of 3" while entries under that round's OWN signature keys had been
+    // dropped as unreadable — absence claimed from a failed read, which is
+    // the one thing this whole layer refuses to do.
+    const doc2 = new Y.Doc();
+    bindTreasuryDoc(doc2, { verifySig: verifier, networkGenesisChallenge: GENESIS });
+    const shell = {
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'c'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'c3'.repeat(32),
+      bundleHash: '7'.repeat(64),
+      requiredThreshold: 2,
+      expiresAfterHeight: 900,
+    };
+    const sessionId = signingSessionIdOf(shell);
+    const m = doc2.getMap('treasury');
+    m.set(`session:${shell.proposalId}:${sessionId}`, {
+      ...shell, sessionId, collectedSigs: [],
+    });
+    const good = 'a'.repeat(64);
+    m.set(`sessionsig:${sessionId}:${good}`, { signerPuzzleHash: good, sig: 'sig-a' });
+    // Clean round first: one readable signature, nothing to qualify.
+    expect(scanSigningSessions(shell.proposalId, 50_000, 10, null).partialSessionIds)
+      .toEqual([]);
+
+    // Now a junk entry filed under this round's signature keys. Each of the
+    // four ways an entry can fail must qualify the round, not vanish.
+    const bad = 'b'.repeat(64);
+    for (const planted of [
+      'not-an-object',
+      { signerPuzzleHash: 'too-short', sig: 'x' },
+      { signerPuzzleHash: 'c'.repeat(64), sig: 'x' }, // key claims a different signer
+      { signerPuzzleHash: bad, sig: '' },
+    ]) {
+      const fresh = new Y.Doc();
+      bindTreasuryDoc(fresh, { verifySig: verifier, networkGenesisChallenge: GENESIS });
+      const fm = fresh.getMap('treasury');
+      fm.set(`session:${shell.proposalId}:${sessionId}`, {
+        ...shell, sessionId, collectedSigs: [],
+      });
+      fm.set(`sessionsig:${sessionId}:${good}`, { signerPuzzleHash: good, sig: 'sig-a' });
+      fm.set(`sessionsig:${sessionId}:${bad}`, planted);
+      const scan = scanSigningSessions(shell.proposalId, 50_000, 10, null);
+      expect(scan.partialSessionIds, `${JSON.stringify(planted)} vanished silently`)
+        .toContain(sessionId);
+      // The readable one still counts — qualifying is not discarding.
+      expect(scan.items[0].collectedSigs.map((s) => s.signerPuzzleHash)).toContain(good);
+    }
   });
 
   it('leaves the document usable when a peer plants a Yjs type in a slot', () => {

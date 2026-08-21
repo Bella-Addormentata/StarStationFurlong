@@ -3527,6 +3527,13 @@ function paintTreasuryBody(view: HTMLElement): void {
             )
           : ""
       }
+      ${
+        voteScan.discoveryCutShort || cpScan.discoveryCutShort
+          ? dim(
+              "This room holds more entries than this device will search in one go, so there may be votes here that paging cannot reach.",
+            )
+          : ""
+      }
 
       <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">BOARD APPROVALS</span>
@@ -3598,6 +3605,13 @@ function paintTreasuryBody(view: HTMLElement): void {
         sessionScan.malformedKeys > 0
           ? dim(
               `${sessionScan.malformedKeys} entr${sessionScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any approval round, so ${sessionScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.discoveryCutShort
+          ? dim(
+              "This room holds more entries than this device will search in one go, so there may be approval rounds here that paging cannot reach.",
             )
           : ""
       }
@@ -3902,6 +3916,18 @@ function paintTreasuryBody(view: HTMLElement): void {
       page.malformedKeys > 0
         ? dim(
             `${page.malformedKeys} entr${page.malformedKeys === 1 ? "y is" : "ies are"} filed in this room under a name too long to belong to any proposal, so ${page.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+          )
+        : ""
+    }
+    ${
+      // A different claim from "there is another page", and the stronger one:
+      // the search that BUILDS the pages stopped early, so paging cannot be
+      // relied on to reach what it missed. Said plainly rather than folded
+      // into the ordinary partial-list note, which would present a record
+      // nothing can reach as merely one that is further along.
+      page.discoveryCutShort
+        ? dim(
+            "This room holds more entries than this device will search in one go, so there may be proposals here that paging cannot reach.",
           )
         : ""
     }
