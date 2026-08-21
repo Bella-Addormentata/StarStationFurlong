@@ -10,6 +10,7 @@ import {
   excessGroupIndices,
   excessRoomIndices,
   excessThreadIds,
+  excessTotalIndices,
   filterMessagesForGroup,
   filterMessagesForRoom,
   GROUP_CHAT_CAP,
@@ -20,6 +21,7 @@ import {
   listMyGroupChats,
   MAX_GROUP_CHATS,
   MIN_GROUP_MEMBERS,
+  TOTAL_CHAT_CAP,
   normalizeMembers,
   type GroupChatMessage,
   type GroupChatThread,
@@ -574,5 +576,110 @@ describe('groupChat · excessRoomIndices', () => {
       { text: 'r2' },
     ];
     expect(excessRoomIndices(chat, -1)).toEqual([0, 2]);
+  });
+});
+
+// ── Audit fix (issue #20 remediation r3): global cap safety net ─────────────
+//
+// The per-lane trims (excessRoomIndices, excessGroupIndices) only touch lanes
+// THIS client recognizes: the room broadcast lane and, on send, the exact
+// groupId the send was for. A hostile peer that writes messages tagged with
+// distinct fresh groupIds ('junk-1', 'junk-2', …) escapes BOTH — no active
+// groupId ever matches, and the room-lane guard excludes anything with a
+// non-empty string groupId. Without a global bound sharedChat.length grows
+// without limit. TOTAL_CHAT_CAP is a safety net well above the sum of per-
+// lane caps so honest use never trips it; excessTotalIndices trims oldest-
+// first regardless of lane.
+
+describe('groupChat · excessTotalIndices', () => {
+  it('returns [] when totalLength <= cap', () => {
+    expect(excessTotalIndices(0, 100)).toEqual([]);
+    expect(excessTotalIndices(50, 100)).toEqual([]);
+    expect(excessTotalIndices(100, 100)).toEqual([]);
+  });
+
+  it('returns the oldest N indices when over cap', () => {
+    // 5 entries, cap 3 → drop indices [0, 1] (oldest two).
+    expect(excessTotalIndices(5, 3)).toEqual([0, 1]);
+    // 10 entries, cap 7 → drop [0, 1, 2].
+    expect(excessTotalIndices(10, 7)).toEqual([0, 1, 2]);
+  });
+
+  it('defaults to TOTAL_CHAT_CAP when cap omitted', () => {
+    // Exactly at cap → no eviction.
+    expect(excessTotalIndices(TOTAL_CHAT_CAP)).toEqual([]);
+    // One over cap → drop the single oldest.
+    expect(excessTotalIndices(TOTAL_CHAT_CAP + 1)).toEqual([0]);
+    // 3 over cap → drop 3 oldest.
+    const idxs = excessTotalIndices(TOTAL_CHAT_CAP + 3);
+    expect(idxs).toEqual([0, 1, 2]);
+  });
+
+  it('treats a negative cap as zero (drop every entry)', () => {
+    expect(excessTotalIndices(4, -5)).toEqual([0, 1, 2, 3]);
+  });
+
+  it('defends against non-finite length inputs (returns [])', () => {
+    // A defensive branch: NaN / Infinity would blow up an Array(size) below;
+    // silently returning [] is safer than throwing inside a Yjs transact.
+    expect(excessTotalIndices(NaN)).toEqual([]);
+    expect(excessTotalIndices(Infinity)).toEqual([]);
+    expect(excessTotalIndices(-Infinity)).toEqual([]);
+  });
+
+  it('TOTAL_CHAT_CAP is well above ROOM_CHAT_CAP + GROUP_CHAT_CAP so honest use never trips it', () => {
+    // The constant is a safety net; honest mixed use (room lane + a few
+    // active groups) MUST fit within it. This is a design invariant, not
+    // a defensive check — verify it here so a future edit that lowers
+    // the total below the sum of per-lane budgets is caught by tests.
+    expect(TOTAL_CHAT_CAP).toBeGreaterThan(GROUP_CHAT_CAP * 2);
+    // Room cap (200 per main.ts) + a handful of active groups (>=5) at 200
+    // each must fit — the intent is ~10 groups of headroom.
+    expect(TOTAL_CHAT_CAP).toBeGreaterThanOrEqual(200 + GROUP_CHAT_CAP * 5);
+  });
+});
+
+describe('groupChat · TOTAL_CHAT_CAP defends against unrecognized-groupId injection', () => {
+  it('per-lane trims skip hostile fresh-groupId entries; global cap catches them (regression)', () => {
+    // Simulate the audit-cited attack: a hostile peer writes N messages,
+    // each with a distinct fresh groupId that is NOT in the local groupsMap
+    // and NOT the local viewer's active thread. Every honest peer must see
+    // sharedChat bounded regardless.
+    const chat: unknown[] = [];
+    // A little bit of legitimate history at the front.
+    chat.push({ text: 'r-old-1' });
+    chat.push({ text: 'g-old-1', groupId: 'g-my-real' });
+    // Now the hostile burst — each with a unique groupId.
+    const HOSTILE_COUNT = 5000;
+    for (let i = 0; i < HOSTILE_COUNT; i++) {
+      chat.push({ text: `junk-${i}`, groupId: `junk-${i}` });
+    }
+    // Per-lane trims, viewed by a client whose active thread is 'g-my-real':
+    // - excessRoomIndices excludes everything with a non-empty string groupId
+    //   → returns only entries with no/empty groupId → just [] (the 'r-old-1'
+    //   count is 1, well under any cap).
+    // - excessGroupIndices('g-my-real', GROUP_CHAT_CAP) → the count for
+    //   'g-my-real' is 1, well under 200 → returns [].
+    // So without the global cap the hostile entries stay forever.
+    expect(excessRoomIndices(chat, 200)).toEqual([]);
+    expect(excessGroupIndices(chat, 'g-my-real', 200)).toEqual([]);
+    // The global cap catches it. `chat.length` = 5002; cap 2000 → drop
+    // 3002 oldest entries. Room + real-group history at indices 0/1 are
+    // ALSO trimmed — that is the cost of the safety net firing, and only
+    // fires under a hostile scenario or truly heroic honest activity.
+    const idxs = excessTotalIndices(chat.length, TOTAL_CHAT_CAP);
+    expect(idxs).toHaveLength(chat.length - TOTAL_CHAT_CAP);
+    expect(idxs[0]).toBe(0);
+    expect(idxs[idxs.length - 1]).toBe(chat.length - TOTAL_CHAT_CAP - 1);
+  });
+
+  it('honest mixed use never trips the global cap (per-lane trims fire first)', () => {
+    // A room + one active group, both filled to their per-lane caps. Length
+    // = 200 + 200 = 400, well below TOTAL_CHAT_CAP (2000) → global helper
+    // returns [].
+    const chat: unknown[] = [];
+    for (let i = 0; i < 200; i++) chat.push({ text: `r-${i}` });
+    for (let i = 0; i < 200; i++) chat.push({ text: `g-${i}`, groupId: 'g-real' });
+    expect(excessTotalIndices(chat.length, TOTAL_CHAT_CAP)).toEqual([]);
   });
 });

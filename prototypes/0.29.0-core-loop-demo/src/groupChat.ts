@@ -19,7 +19,8 @@
  * than forking into two parallel histories.
  *
  * Bounded size (each lane trims IN-PLACE on its own membership so unrelated
- * lane activity cannot evict the other lane's history):
+ * lane activity cannot evict the other lane's history, THEN a global cap
+ * runs as a safety net for anything the per-lane trims cannot see):
  *   - `GROUP_CHAT_CAP` (200) — max messages per thread. Enforced on send by
  *     `excessGroupIndices` — scans the array for THAT groupId and returns the
  *     oldest overflow indices; caller deletes DESC in a single Yjs transact.
@@ -30,6 +31,15 @@
  *     messages toward the room budget and deleted from index 0 (typically an
  *     older group message), so a room-message burst silently ate a group's
  *     history before its own per-group cap fired.
+ *   - `TOTAL_CHAT_CAP` (2000) — GLOBAL safety net. The per-lane trims only
+ *     touch lanes THIS client recognizes (its own active groupId or the room
+ *     lane). A hostile peer that writes N messages each tagged with a distinct
+ *     fresh groupId ('junk-1', 'junk-2', …) escapes BOTH per-lane trims: no
+ *     current active groupId matches, and the room-lane guard excludes non-
+ *     empty string groupIds. The global cap catches that class of attack,
+ *     evicting oldest entries regardless of lane, with a generous headroom
+ *     (~10 active groups' worth) over the sum of per-lane caps so honest use
+ *     never trips it. Enforced on send via `excessTotalIndices`.
  *   - `MAX_GROUP_CHATS` (64) — hard cap on the thread map so a hostile peer
  *     can't grow the doc without bound by writing thread records.
  *
@@ -73,8 +83,40 @@ export const MAX_GROUP_CHATS = 64;
  *  notepad, not a chat — DMs cover the two-person case (directMessages.ts). */
 export const MIN_GROUP_MEMBERS = 2;
 
-/** Title bound — matches the roster PLAYER_NAME_MAX_LENGTH scale (main.ts). */
+/** Title bound. Deliberately LARGER than identity's PLAYER_NAME_MAX_LENGTH
+ *  (24) — group titles read naturally longer than personal names ("Design
+ *  Team Q3", "Engineering Standup Wednesday") — but still bounded so a
+ *  hostile peer can't blow up the doc / UI with a multi-KB "title". Kept
+ *  in-lockstep with the isGroupChatThread guard and the buildGroupChatThread
+ *  factory: any title above this cap is rejected on read AND on write. */
 export const GROUP_TITLE_MAX = 60;
+
+/** Hard cap on the shared chat array as a WHOLE — a safety net over and
+ *  above the per-lane caps. Rationale: the per-lane trims (excessRoomIndices,
+ *  excessGroupIndices) only touch lanes THIS client recognizes — the room
+ *  lane and the exact groupId the local send was for. A hostile peer that
+ *  writes N messages each tagged with a distinct fresh groupId ('junk-1',
+ *  'junk-2', …) escapes both: none of the current viewer's active groupIds
+ *  ever match, and the room-lane guard excludes anything with a non-empty
+ *  string groupId. Without a global bound the array grows without limit and
+ *  every honest peer replicates the bloat to disk + memory.
+ *
+ *  The pre-audit trim `sharedChat.length - 200; delete(0, excess)` was WRONG
+ *  for a different reason (it mixed the two lanes on one budget and evicted
+ *  legitimate group history when the room lane burst) but it did enforce
+ *  SOME global bound. Removing it fixed the mixing but opened the unbounded-
+ *  growth attack. Reinstating a global cap ALONGSIDE the per-lane trims is
+ *  the belt-and-braces fix the audit calls out.
+ *
+ *  Cap sized to cover legitimate mixed use — ROOM_CHAT_CAP + a handful of
+ *  active groups at GROUP_CHAT_CAP each — while still catching sustained
+ *  bloat well before it hurts. 2000 = 200 room + ~9 fully-primed groups
+ *  worth of headroom, which is well past any realistic room's live activity
+ *  window. Once exceeded, the trim evicts oldest entries regardless of lane:
+ *  under a hostile-injection scenario the oldest entries ARE the injected
+ *  junk (or, in a sustained attack, honest history that has already exceeded
+ *  its lane cap and been trimmed there). */
+export const TOTAL_CHAT_CAP = 2000;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -284,6 +326,31 @@ export function excessRoomIndices(
   const excess = idxs.length - cap;
   if (excess <= 0) return [];
   return idxs.slice(0, excess); // OLDEST first — matches array position order
+}
+
+/** Indices (into the FULL chat array) of the OLDEST entries that must be
+ *  removed to bring the whole-array size down to `cap`. Runs AFTER the per-
+ *  lane trims as a safety net: any entry the per-lane trims failed to catch
+ *  (unrecognized-groupId injections from a hostile peer) still gets bounded
+ *  here. Trims oldest-first regardless of lane — under a hostile-injection
+ *  scenario the oldest entries ARE the injected junk; under a legitimate
+ *  scenario the per-lane trims already fired first, so this helper returns
+ *  [] until real activity crosses the (deliberately generous) global bound.
+ *
+ *  Returned ASCENDING (same convention as the per-lane helpers), so the
+ *  caller deletes DESC inside a Yjs transact to keep intermediate indices
+ *  valid. Deliberately does NOT peek at message shapes — the whole point of
+ *  a global bound is that it doesn't trust the lane taxonomy at all. */
+export function excessTotalIndices(
+  totalLength: number,
+  cap: number = TOTAL_CHAT_CAP,
+): number[] {
+  if (cap < 0) cap = 0;
+  if (!Number.isFinite(totalLength) || totalLength <= cap) return [];
+  const excess = totalLength - cap;
+  const out: number[] = new Array(excess);
+  for (let i = 0; i < excess; i++) out[i] = i; // oldest first
+  return out;
 }
 
 /** Which threads is `myPub` a member of? Silently rejects any map entry that

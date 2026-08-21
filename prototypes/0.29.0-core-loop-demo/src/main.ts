@@ -258,10 +258,12 @@ import {
   MAX_GROUP_CHATS,
   MIN_GROUP_MEMBERS,
   GROUP_TITLE_MAX,
+  TOTAL_CHAT_CAP,
   buildGroupChatThread,
   excessGroupIndices,
   excessRoomIndices,
   excessThreadIds,
+  excessTotalIndices,
   isValidThreadEntry,
   listMyGroupChats,
   type GroupChatThread,
@@ -1951,6 +1953,19 @@ async function leaveRoom(): Promise<void> {
   setActivePassRoom(null);
   // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
   clearChatBubbles();
+  // 👥 CHAT closure indirection: null out the join-scoped rebuild/refresh
+  // closures so the boot-time subscribers (subscribeBlockList, sharedGroups
+  // observer) that trigger repaints via these pointers stop invoking them
+  // against a doc that leaveRoom is about to destroy. rebuildChatLogIfBound
+  // and refreshChatThreadBarIfBound swallow the resulting exceptions via
+  // try/catch (correct — the doc IS destroyed, no need to crash), but
+  // between leaveRoom() and the next joinRoomAtEpoch() any block/unblock
+  // click still walked into the closure and produced console-error noise
+  // ("[chat] rebuild threw:") on every mutation. Clearing them here means
+  // the ?.() call is a silent no-op until the next join re-publishes the
+  // fresh closures over the fresh sharedChat / groupsMap handles.
+  latestRebuildChatLog = null;
+  latestRefreshChatThreadBar = null;
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
@@ -5005,21 +5020,43 @@ function setupSpacePhoneOverlay() {
           // ASCENDING, so we delete DESC to keep intermediate indices valid
           // inside this transact).
           //
-          // NOTE (issue #20 audit fix): the pre-fix room path did `excess =
-          // sharedChat.length - 200; sharedChat.delete(0, excess)`. That
-          // counted GROUP messages toward the 200-cap and deleted from index
-          // 0 — index 0 was typically the oldest GROUP message, not a room
-          // one — so a burst of 200+ room messages silently ate a group's
+          // NOTE (issue #20 audit fix round 1): the pre-fix room path did
+          // `excess = sharedChat.length - 200; sharedChat.delete(0, excess)`.
+          // That counted GROUP messages toward the 200-cap and deleted from
+          // index 0 — index 0 was typically the oldest GROUP message, not a
+          // room one — so a burst of 200+ room messages silently ate a group's
           // history before its own 200 per-group cap ever fired. Both lanes
           // now trim in-place on their own membership.
-          const raw = sharedChat.toArray() as unknown[];
+          //
+          // NOTE (issue #20 audit fix round 3): removing the pre-fix bound
+          // also removed the crude-but-effective global bound. Per-lane trims
+          // only touch lanes THIS client recognizes — the room lane and the
+          // exact groupId this send was for. A hostile peer that writes
+          // messages tagged with distinct fresh groupIds ('junk-1', 'junk-2',
+          // …) escapes BOTH trims (no active groupId matches, and the room-
+          // lane guard excludes any non-empty string groupId). We now run a
+          // GLOBAL cap (`excessTotalIndices` over `TOTAL_CHAT_CAP`) AFTER the
+          // per-lane trim as a safety net. Global cap sized well above the
+          // sum of per-lane caps so honest use never trips it (see the
+          // TOTAL_CHAT_CAP definition in groupChat.ts). Under a hostile-
+          // injection scenario the oldest entries ARE the injected junk;
+          // under honest use the per-lane trim already fired first, so the
+          // global helper returns [] and this is a no-op.
           if (isGroupSend && threadTarget) {
+            const raw = sharedChat.toArray() as unknown[];
             const idxs = excessGroupIndices(raw, threadTarget, GROUP_CHAT_CAP);
             for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
           } else {
+            const raw = sharedChat.toArray() as unknown[];
             const idxs = excessRoomIndices(raw, ROOM_CHAT_CAP);
             for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
           }
+          // Global safety-net cap: length-only helper (does not need to peek
+          // at message shapes — the whole point is that it doesn't trust the
+          // lane taxonomy). Read the fresh length after the per-lane trim so
+          // this trims only what the per-lane pass could not.
+          const totalIdxs = excessTotalIndices(sharedChat.length, TOTAL_CHAT_CAP);
+          for (let i = totalIdxs.length - 1; i >= 0; i--) sharedChat.delete(totalIdxs[i], 1);
         });
       } else {
         // Fallback offline simulator if no node serves connection
