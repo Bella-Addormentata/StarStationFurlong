@@ -198,3 +198,40 @@ export async function closeDm(peerPub: string): Promise<void> {
 export async function closeAllDms(): Promise<void> {
   await Promise.all([...sessions.keys()].map((p) => closeDm(p)));
 }
+
+// ── 🚫 Block-list filter (issue #20 audit remediation) ───────────────────────
+//
+// The BLOCK confirm() dialog promises: "Their chat and DM messages will stop
+// appearing on your screen…" — but pre-remediation renderDmMessages() ignored
+// the block set entirely. This pure helper is the anti-regression seam: it
+// drops any DM whose `author` (base64url identity pub, the ONLY field a DM
+// carries — no legacy authorId) is on the block set, preserves order, and
+// returns both the survivors and the hidden-count for an honest UI note.
+//
+// Kept HERE (next to the DirectMessage type) so the DM lane's block discipline
+// stays local: a future DM-shape change touches one module and one test file.
+// Room-chat filtering stays in blockList.isAuthoredByBlocked because that lane
+// carries the canonical `authorPub` / legacy `authorId` pair — different shape,
+// different filter, same block set.
+
+/** Split a DM history into (visible, hidden) by the block set. Pure — safe to
+ *  test. The `author` field is a base64url identity pub (see verifyMessage —
+ *  only the two DM members are accepted as authors), so a simple set-lookup is
+ *  the correct filter with no legacy-id fallback. */
+export function filterOutBlockedDms<T extends { author?: unknown }>(
+  msgs: readonly T[],
+  blockedPubs: ReadonlySet<string>,
+): { visible: T[]; hidden: number } {
+  if (blockedPubs.size === 0) return { visible: msgs.slice(), hidden: 0 };
+  const visible: T[] = [];
+  let hidden = 0;
+  for (const m of msgs) {
+    const a = m?.author;
+    if (typeof a === 'string' && a && blockedPubs.has(a)) {
+      hidden++;
+      continue;
+    }
+    visible.push(m);
+  }
+  return { visible, hidden };
+}

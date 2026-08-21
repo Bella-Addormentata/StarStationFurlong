@@ -262,7 +262,7 @@ import {
   excessGroupIndices,
   excessRoomIndices,
   excessThreadIds,
-  isGroupChatThread,
+  isValidThreadEntry,
   listMyGroupChats,
   type GroupChatThread,
 } from "./groupChat";
@@ -312,6 +312,7 @@ import {
   closeAllDms,
   dmRoomIdFor,
   dmRoomKeyFor,
+  filterOutBlockedDms,
   type DmSession,
   type DirectMessage,
 } from "./directMessages";
@@ -1343,12 +1344,22 @@ async function joinRoomAtEpoch(
     // 🚫 Local block list (issue #20). Loaded before subscribeContacts wires up
     // renderPhonePlayersList so the very first roster paint already filters
     // blocked identities. subscribeBlockList repaints the roster, the chat log,
-    // and the (potentially open) contacts app whenever the local list changes.
+    // the (potentially open) contacts app, and the (potentially open) DM
+    // overlay whenever the local list changes — a block/unblock click gets a
+    // synchronous whole-app refresh so no lane silently keeps rendering
+    // blocked content until the next natural rebuild.
     initBlockList();
     subscribeBlockList(() => {
       renderPhonePlayersList();
       rebuildChatLogIfBound();
       if (isContactsAppOpen()) refreshContactsApp();
+      // 🚫 DM overlay lives in a separate DOM subtree (dm-overlay); the chat
+      // rebuild above doesn't touch it. If a DM is currently open with a peer
+      // we just blocked (or just unblocked), re-render so their history is
+      // hidden (or restored) in step with the click.
+      if (dmActiveSession && !document.getElementById("dm-overlay")?.hasAttribute("hidden")) {
+        renderDmMessages();
+      }
     });
     initDirectMessages({
       resolve: resolveBridgeBootstrap,
@@ -1853,8 +1864,16 @@ async function joinRoomAtEpoch(
     // silently falls back to the room lane so the input never targets a
     // vanished thread. Same rebuild for the chat log (its per-thread filter
     // narrows correctly whether or not the record exists).
+    //
+    // 👥 Issue #20 audit remediation: use isValidThreadEntry (key + value.id
+    // must match), not just isGroupChatThread. A hostile peer's mismatched-
+    // key write would pass isGroupChatThread on the value alone, and the
+    // pre-fix check here would keep activeChatThread set even though
+    // listMyGroupChats (which chains isValidThreadEntry) drops the chip from
+    // the picker. Keeping the two in lock-step means the router state and
+    // the chip visibility can never disagree.
     if (activeChatThread) {
-      const stillHere = isGroupChatThread(sharedGroups.get(activeChatThread));
+      const stillHere = isValidThreadEntry(activeChatThread, sharedGroups.get(activeChatThread));
       if (!stillHere) activeChatThread = null;
     }
     refreshChatThreadBarIfBound();
@@ -4934,9 +4953,12 @@ function setupSpacePhoneOverlay() {
         // the sharedGroups observer's fallback (a slow tab, a race between
         // send-click and delete-observer), drop back to ROOM rather than
         // stamp an orphan groupId onto a message no one can filter to.
+        // Uses the entry-level guard (key === value.id) so a hostile peer's
+        // mismatched-key write cannot misroute a group send to the ROOM lane
+        // — same discipline as listMyGroupChats and the sharedGroups observer.
         const threadTarget = activeChatThread;
         const isGroupSend = threadTarget !== null
-          && isGroupChatThread(groupsMap.get(threadTarget));
+          && isValidThreadEntry(threadTarget, groupsMap.get(threadTarget));
         // Transact safe transactional delta block append (Task 3.3 / 4.1)
         yjsSync.doc.transact(() => {
           sharedChat.push([
@@ -5947,7 +5969,7 @@ function isContactsAppOpen(): boolean {
 function contactRowHtml(
   name: string,
   pub: string,
-  opts: { friend: boolean },
+  opts: { friend: boolean; blocked?: boolean },
 ): string {
   const fp = contactFingerprint(pub);
   const safeName = escapeHtml(name);
@@ -5955,7 +5977,14 @@ function contactRowHtml(
   const friendBtn = opts.friend
     ? `<button type="button" data-contact-act="unfriend" data-contact-pub="${safePub}" title="Remove from friends">★</button>`
     : `<button type="button" data-contact-act="friend" data-contact-pub="${safePub}" title="Add to friends">☆</button>`;
-  const dmBtn = opts.friend
+  // 🚫 Issue #20 audit remediation: hide the DM button for a blocked friend.
+  // The DM lane is now block-filtered (renderDmMessages), so opening the pane
+  // would show at most our own outbound messages plus a "hidden by BLOCK"
+  // note — offering the button is misleading UX (and the BLOCK confirm()'s
+  // "DM messages will stop appearing on your screen" promise reads more
+  // honestly if the entry point itself disappears). Unblocking restores the
+  // button on the next repaint (subscribeBlockList → refreshContactsApp).
+  const dmBtn = opts.friend && !opts.blocked
     ? `<button type="button" data-contact-act="dm" data-contact-pub="${safePub}" title="Direct message">💬</button>`
     : "";
   // 🚫 Block button (issue #20) — red ✕ with a confirm() prompt handled by
@@ -5994,20 +6023,23 @@ function refreshContactsApp(): void {
   const friends = listFriends();
   const all = listContacts();
   const blockedPubs = listBlocked();
+  // 🚫 Snapshot the block set for the row renderer so the DM button hides
+  // uniformly across the friends + all-contacts lists in a single repaint.
+  const blockedNow = blockedSet();
   const friendsList = document.getElementById("contacts-friends-list");
   const allList = document.getElementById("contacts-all-list");
   const blockedList = document.getElementById("contacts-blocked-list");
   if (friendsList) {
     friendsList.innerHTML = friends.length
       ? friends
-          .map((c) => contactRowHtml(c.name, c.pub, { friend: true }))
+          .map((c) => contactRowHtml(c.name, c.pub, { friend: true, blocked: blockedNow.has(c.pub) }))
           .join("")
       : '<div class="phone-access-note">No friends yet — add a contact, then tap ☆ to make them a friend.</div>';
   }
   if (allList) {
     allList.innerHTML = all.length
       ? all
-          .map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend }))
+          .map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend, blocked: blockedNow.has(c.pub) }))
           .join("")
       : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
   }
@@ -6200,7 +6232,11 @@ function updateChatInputPlaceholder(): void {
   const sync = yjsSync;
   if (!sync) return;
   const t = sync.doc.getMap("groupChats").get(activeChatThread);
-  if (!isGroupChatThread(t)) {
+  // Use isValidThreadEntry (chained guard, key === value.id) for the same
+  // reason as the send path: a mismatched-key entry must not label the
+  // placeholder as if the thread were addressable when the SEND lookup
+  // (groupsMap.get(activeChatThread)) would in fact miss.
+  if (!isValidThreadEntry(activeChatThread, t)) {
     input.placeholder = "Broadcast to room...";
     return;
   }
@@ -6410,13 +6446,27 @@ function renderDmMessages(): void {
   const list = document.getElementById("dm-messages");
   if (!list || !dmActiveSession) return;
   const me = getIdentityPub();
-  const msgs: DirectMessage[] = readMessages(dmActiveSession);
+  const all: DirectMessage[] = readMessages(dmActiveSession);
+  // 🚫 Issue #20 audit remediation: honor the BLOCK confirm() promise that
+  // "chat and DM messages will stop appearing on your screen". A DM has
+  // exactly two possible authors (see verifyMessage), so blocking the peer
+  // silences every remote message in the thread; our own outbound messages
+  // still render (we don't block ourselves). Client-side only — matches the
+  // room-chat filter's posture (documented on the BLOCKED-section note).
+  const { visible: msgs, hidden: hiddenBlocked } = filterOutBlockedDms(all, blockedSet());
   if (!msgs.length) {
-    list.innerHTML =
-      '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
+    // Distinguish "genuinely empty" from "everything hidden by BLOCK" so the
+    // user isn't puzzled by a blank pane after blocking their DM peer.
+    if (hiddenBlocked > 0) {
+      list.innerHTML =
+        `<div id="dm-empty">🚫 ${hiddenBlocked} message${hiddenBlocked === 1 ? "" : "s"} hidden from a blocked contact. Unblock them in the CONTACTS app to see this thread again.</div>`;
+    } else {
+      list.innerHTML =
+        '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
+    }
     return;
   }
-  list.innerHTML = msgs
+  let html = msgs
     .map((m) => {
       const mine = m.author === me;
       const time = new Date(m.ts).toLocaleTimeString([], {
@@ -6426,6 +6476,12 @@ function renderDmMessages(): void {
       return `<div class="dm-msg ${mine ? "dm-mine" : "dm-theirs"}">${escapeHtml(m.text)}<span class="dm-msg-meta">${escapeHtml(mine ? "you" : m.authorName)} · ${time}</span></div>`;
     })
     .join("");
+  if (hiddenBlocked > 0) {
+    // Honest note — mirrors the chat log's "🚫 N messages hidden from blocked
+    // contacts." system line so the user knows the pane isn't the full history.
+    html += `<div class="dm-msg dm-system">🚫 ${hiddenBlocked} message${hiddenBlocked === 1 ? "" : "s"} hidden from a blocked contact.</div>`;
+  }
+  list.innerHTML = html;
   list.scrollTop = list.scrollHeight;
 }
 
