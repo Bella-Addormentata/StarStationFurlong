@@ -3605,28 +3605,38 @@ function paintTreasuryBody(view: HTMLElement): void {
           )}
           <div style="display:flex; gap:6px; margin-top:6px;">
             ${
+              // Neutral labels. Pages are ordered by record key, which is a
+              // content hash — so the previous page is not the earlier one in
+              // any sense a player would mean, and "EARLIER" implied a
+              // chronology this ordering does not have. Rows WITHIN a page are
+              // sorted by acceptance height; across pages there is no time
+              // order at all.
               page.offset > 0
                 ? `<div data-treasury-action="page-prev" role="button" tabindex="0" aria-label="Previous page of proposals"
-                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ EARLIER</div>`
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
                 : ""
             }
             ${
               page.offset + LIST_CHECKS < page.matched
                 ? `<div data-treasury-action="page-next" role="button" tabindex="0" aria-label="Next page of proposals"
-                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">MORE ›</div>`
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
                 : ""
             }
           </div>`
         : ""
     }
     ${
+      // Page-local, and said so. `scoped` is built from this page's items, so
+      // "held in this room" made a partial count sound like the room's total —
+      // and on a multi-page list it under-reports, which is the same shape of
+      // false certainty as the counts above.
       scoped.scopeUnknown && scoped.otherCompanies > 0
         ? dim(
-            `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? " is" : "s are"} held in this room, but without company details there is no way to tell whose ${scoped.otherCompanies === 1 ? "it is" : "they are"}, so ${scoped.otherCompanies === 1 ? "it is" : "they are"} not listed.`,
+            `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? "" : "s"} on this page ${scoped.otherCompanies === 1 ? "is" : "are"} held without company details, so there is no way to tell whose ${scoped.otherCompanies === 1 ? "it is" : "they are"} and ${scoped.otherCompanies === 1 ? "it is" : "they are"} not listed.`,
           )
         : scoped.otherCompanies > 0
           ? dim(
-              `${scoped.otherCompanies} more proposal${scoped.otherCompanies === 1 ? "" : "s"} in this room belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
+              `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? "" : "s"} on this page belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
             )
           : ""
     }
