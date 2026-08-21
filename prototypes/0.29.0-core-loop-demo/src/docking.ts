@@ -16,6 +16,7 @@ import {
   physicalDoorPose, portForDoor, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
   DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
+  isCardinalDoorId,
 } from "./doorLayout";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
@@ -90,12 +91,14 @@ function moveToward(current: number, target: number, maxStep: number): number {
   return current + Math.sign(d) * maxStep;
 }
 
-/** True for the 4 structural cardinal door ids (the docking berths). Free/genId
- *  doors are NOT cardinal — the cardinal-only pose helpers (physicalDoorPose /
- *  projectionPoseForDoor) must never be called with a free id. */
-function isCardinalDoorId(id: string): id is DoorId {
-  return id === "north" || id === "south" || id === "east" || id === "west";
-}
+// #101 follow-up: the cardinal predicate now lives once in doorLayout.ts and is
+// re-exported to every caller (the private copies this file and editMode.ts each
+// used to carry are what let a free `d:` id reach cardinal-only helpers in the
+// first place — #91's fix note). physicalDoorPose no longer throws on an
+// unknown id (fallbackPose degrades loudly instead), so the predicate is a
+// design-intent marker — "does this id name a structural docking berth?" —
+// rather than a crash guard. Kept as a type-narrowing `id is PhysicalDoorId` so
+// downstream code still gets compiler-checked cardinal narrowing.
 
 export interface DockingState {
   doorId: string;
@@ -796,8 +799,9 @@ export class DoorDockingPortSystem {
       // 3+4. PORT HARDWARE — keypad + status LED. Every door (including free
       // `d:` doors) gets a panel mounted on the FRONT FACE of the door post so
       // the control is an integral part of the door and requires no separate
-      // wall mount. Cardinal doors open the full docking pane; free doors open
-      // a simplified settings panel (lock state + PIN + passage policy).
+      // wall mount. Every door — cardinal or free — opens the full docking
+      // pane now (#101 follow-up: the earlier "free doors get a simplified
+      // panel" split retired with 94df5c6's "any door can pair" unification).
       {
         const keypadGeo = new THREE.BoxGeometry(0.3, 0.4, 0.12);
         const keypadMat = new THREE.MeshStandardMaterial({
@@ -1003,9 +1007,12 @@ export class DoorDockingPortSystem {
         <!-- 🪧 DOOR SIGN — the owner's ruling: instead of the app deciding what
              a door leads to from its cardinal ID (the pool sign was welded to
              the door called "south", the casino sign to "east"), the room
-             author types it. Works on EVERY door, cardinal or free d: —
-             deliberately outside the isCardinal show/hide block below, because
-             a user-placed door is exactly the one nobody can otherwise label.
+             author types it. Works on EVERY door, cardinal or free d: — a
+             user-placed door is exactly the one nobody can otherwise label.
+             (#101 follow-up: the mention of an "isCardinal show/hide block"
+             below is historical — 94df5c6 unified the pane so every door
+             already shows every control; the row's own inclusive scope is
+             now the reason it lives here, not a distinction from siblings.)
              maxlength mirrors DOOR_LABEL_MAX; sanitizeDoorLabel is still the
              authority at the write boundary (paste bypasses maxlength). -->
         <div id="docking-label-row">
@@ -1122,6 +1129,17 @@ export class DoorDockingPortSystem {
     const rejectBtn = document.getElementById("docking-reject-btn");
     const box = document.getElementById("docking-control-pane");
 
+    // #101 follow-up: one typed reader for the pane's "active door" stash,
+    // used by EVERY callback in this closure (formerly a mix of inline
+    // `(pane as any).activeDoorId` reads and a same-named helper declared
+    // partway down — moving it to the top means the earlier handlers no
+    // longer bypass the compiler with a per-callsite `any` cast). The
+    // one writer in handlePanelRaycast uses the same typed intersection.
+    const activeDoor = (): string | null => {
+      const pane = document.getElementById("docking-control-pane");
+      return pane ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ?? null) : null;
+    };
+
     if (closeBtn) closeBtn.addEventListener("click", () => this.dismissPanel());
 
     // Handle clicks inside the modal to prevent passing them to 3D world floor clicks
@@ -1130,8 +1148,7 @@ export class DoorDockingPortSystem {
     // Toggle Port Lock State
     if (lockBtn) {
       lockBtn.addEventListener("click", () => {
-        const pane = document.getElementById("docking-control-pane");
-        const activeDoorId = pane ? (pane as any).activeDoorId : null;
+        const activeDoorId = activeDoor();
         if (!activeDoorId) return;
         // #67 D1: lock/unlock follows the PASSAGE policy (this control was
         // accidentally ungated before the policy work surfaced it).
@@ -1223,8 +1240,7 @@ export class DoorDockingPortSystem {
     // Initiate pairings
     if (requestBtn) {
       requestBtn.addEventListener("click", () => {
-        const pane = document.getElementById("docking-control-pane");
-        const activeDoorId = pane ? (pane as any).activeDoorId : null;
+        const activeDoorId = activeDoor();
         if (!activeDoorId) return;
         const state = this.doorState.get(activeDoorId);
         const addrInput = document.getElementById(
@@ -1265,9 +1281,13 @@ export class DoorDockingPortSystem {
 
           // 🛰️ #28 S6a: BLOCK a pairing whose module would dock ON TOP of an
           // existing station module (the WARN's hard-stop half). Only when a
-          // chain projects the module, and only for a cardinal berth (the pose
-          // helper is cardinal-only); the connect target within the match radius
-          // is excluded by moduleOverlapAt. Keys off ports/atlas, never doors.
+          // chain projects the module. (#101 follow-up: previously "cardinal
+          // berths only" because `physicalDoorPose` used to throw on a free
+          // `d:` id; today it degrades to a warned fallback pose, so a free
+          // door reaches this block safely — the projection is a best-effort
+          // hypothesis for overlap testing, not a wire commit.) The connect
+          // target within the match radius is excluded by moduleOverlapAt.
+          // Keys off ports/atlas, never doors.
           if (state.segments && state.segments.length > 0) {
             const currentId =
               (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
@@ -1318,8 +1338,7 @@ export class DoorDockingPortSystem {
     // Accept / Reject inbound pairings
     if (acceptBtn) {
       acceptBtn.addEventListener("click", () => {
-        const pane = document.getElementById("docking-control-pane");
-        const activeDoorId = pane ? (pane as any).activeDoorId : null;
+        const activeDoorId = activeDoor();
         if (!activeDoorId) return;
         // #67 D1: approving a docking follows construction rights.
         if (!this.canConstruct(activeDoorId)) {
@@ -1336,8 +1355,7 @@ export class DoorDockingPortSystem {
 
     if (rejectBtn) {
       rejectBtn.addEventListener("click", () => {
-        const pane = document.getElementById("docking-control-pane");
-        const activeDoorId = pane ? (pane as any).activeDoorId : null;
+        const activeDoorId = activeDoor();
         if (!activeDoorId) return;
         this.completePairing(activeDoorId, false);
         this.removeProvisionGhost(); // hypothesis dies with the pane
@@ -1353,8 +1371,7 @@ export class DoorDockingPortSystem {
       "docking-label-input",
     ) as HTMLInputElement | null;
     labelInput?.addEventListener("change", () => {
-      const pane = document.getElementById("docking-control-pane");
-      const doorId = pane ? ((pane as any).activeDoorId as string | null) : null;
+      const doorId = activeDoor();
       if (!doorId || !this.canConstruct(doorId)) return;
       const label = sanitizeDoorLabel(labelInput.value);
       labelInput.value = label ?? ""; // show what was actually stored
@@ -1431,10 +1448,8 @@ export class DoorDockingPortSystem {
       ?.addEventListener("click", () => shift(1));
 
     // ── #62 P4: CONNECTION ASSEMBLY wiring ──────────────────────────────────
-    const activeDoor = (): string | null => {
-      const pane = document.getElementById("docking-control-pane");
-      return pane ? ((pane as any).activeDoorId ?? null) : null;
-    };
+    // #101 follow-up: `activeDoor` is now declared once at the top of this
+    // function — the earlier duplicate here would shadow it if kept.
 
     document
       .getElementById("docking-add-flex")
@@ -1901,11 +1916,17 @@ export class DoorDockingPortSystem {
   }
 
   /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
-   *  a grant landing while a guest stares at the keypad unlocks it live). */
+   *  a grant landing while a guest stares at the keypad unlocks it live).
+   *
+   *  #101 follow-up: `activeDoorId` typed off the pane element (was `as any`).
+   *  The write path in handlePanelRaycast still stringly-writes the field on
+   *  the DOM node; reading it through a typed intersection is the tightest
+   *  narrow we can produce without an interface for the whole pane. */
   public refreshPolicyUI(): void {
     const pane = document.getElementById("docking-control-pane");
     if (!pane || pane.style.display === "none") return;
-    const doorId = (pane as any).activeDoorId as string | null;
+    const doorId =
+      (pane as unknown as { activeDoorId?: string }).activeDoorId ?? null;
     if (!doorId) return;
     this.renderPolicySection(doorId);
     if (isCardinalDoorId(doorId)) this.renderAssemblyStrip(doorId);
@@ -2023,7 +2044,10 @@ export class DoorDockingPortSystem {
    *  (adversarial review of the placement-context change, 2026-08-12). */
   public dismissPanel(): void {
     const pane = document.getElementById("docking-control-pane");
-    const activeDoorId = pane ? ((pane as any).activeDoorId ?? null) : null;
+    // #101 follow-up: typed read (was `as any`) — see refreshPolicyUI note.
+    const activeDoorId = pane
+      ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ?? null)
+      : null;
     // Ghost-residue fix: closing without using the prefilled chain refunds it.
     if (activeDoorId) this.discardUntouchedPrefill(activeDoorId);
     this.removeProvisionGhost(); // the placement hypothesis dies with the pane
@@ -2071,8 +2095,11 @@ export class DoorDockingPortSystem {
     for (const el of [assemblyEl, addrSection, provisionTemplate, provisionBtn, requestBtn])
       if (el) el.style.display = "";
 
-    // Expose active door context inside the modal scope
-    (pane as any).activeDoorId = doorId;
+    // Expose active door context inside the modal scope. #101 follow-up:
+    // typed intersection (was `as any`) matches the reader in refreshPolicyUI
+    // and dismissPanel and the `activeDoor` closure in setupPanelListeners —
+    // one shared shape across every touch of this DOM stash.
+    (pane as unknown as { activeDoorId?: string }).activeDoorId = doorId;
     pane.style.display = "flex";
     // 🧭 A fresh pane starts from a fresh placement default: the memoized
     // choice would otherwise replay a default computed for ANOTHER room
@@ -2380,9 +2407,14 @@ export class DoorDockingPortSystem {
     sel.style.display = entries.length > 0 ? "block" : "none";
   }
 
-  /** Refund + drop an untouched prefill chain (see untouchedPrefills docs). */
+  /** Refund + drop an untouched prefill chain (see untouchedPrefills docs).
+   *
+   * #101 follow-up: `doorId: string` (was cardinal-only). `untouchedPrefills`
+   * itself is `Set<string>` (line 207) — a free `d:` id gets added on pane
+   * open, so it must be delete-able here on pane close. The cardinal-only
+   * signature was untrue the moment the "any door can pair" design landed. */
   private discardUntouchedPrefill(
-    doorId: "north" | "south" | "east" | "west",
+    doorId: string,
   ): void {
     if (!this.untouchedPrefills.delete(doorId)) return;
     const state = this.doorState.get(doorId);
@@ -2428,9 +2460,14 @@ export class DoorDockingPortSystem {
 
   /**
    * Execute inbound request triggers
+   *
+   * #101 follow-up: `doorId: string` (was cardinal-only). The pairing wire /
+   * doors doc keys pairings by ANY door id under the "any door can pair"
+   * design; a lied-about cardinal-only signature here would eventually be
+   * called with a free `d:` id from an untyped seam and silently type-mismatch.
    */
   public receiveInboundPairingRequest(
-    doorId: "north" | "south" | "east" | "west",
+    doorId: string,
     targetAddr: string,
   ) {
     const state = this.doorState.get(doorId);
@@ -2444,8 +2481,11 @@ export class DoorDockingPortSystem {
     }
   }
 
+  // #101 follow-up: `doorId: string` (was cardinal-only). Reached only via
+  // receiveInboundPairingRequest whose own type has widened; keeping this cardinal
+  // would put the widened caller through an unnecessary narrowing dance.
   private animateBlinkingIndicator(
-    doorId: "north" | "south" | "east" | "west",
+    doorId: string,
   ) {
     let toggle = false;
     const interval = setInterval(() => {
@@ -2464,8 +2504,17 @@ export class DoorDockingPortSystem {
     }, 450);
   }
 
+  // #101 follow-up: `doorId` is `string`, not a cardinal union — the "any door
+  // can pair" design (94df5c6) makes free `d:` ids first-class callers here.
+  // The INITIATE / ACCEPT panel handlers reach this via the pane's
+  // `activeDoorId` stash (originally read through `(pane as any)`, so the
+  // compiler could never enforce a cardinal-only signature at those call
+  // sites — the `any` bypassed the check; the reads are typed now, but the
+  // runtime shape does accept any string, and the widened signature makes
+  // the type honest about what the "any door pairs" feature deliberately
+  // allows.
   public completePairing(
-    doorId: "north" | "south" | "east" | "west",
+    doorId: string,
     accept: boolean,
   ) {
     const state = this.doorState.get(doorId);
@@ -2951,9 +3000,14 @@ export class DoorDockingPortSystem {
   /** 🛰️ Exterior view: edit one chain segment in place (the click-a-joint
    *  BEND editor). Same rights gate + publish path as the keypad chips — the
    *  record rewrites and every client's geometry diff rebuilds the chain.
-   *  Returns false when refused (no rights / no such segment). */
+   *  Returns false when refused (no rights / no such segment).
+   *
+   *  #101 follow-up: `doorId: string` (was cardinal-only). The exterior view
+   *  itself declares the callback as `(doorId: string, ...)` (exteriorView.ts:86),
+   *  and free-door chains are first-class under the "any door can pair" design;
+   *  the widened signature stops that from being a silent one-way `any` cast. */
   public editChainSegment(
-    doorId: "north" | "south" | "east" | "west",
+    doorId: string,
     index: number,
     patch: {
       bendDeg?: number;
