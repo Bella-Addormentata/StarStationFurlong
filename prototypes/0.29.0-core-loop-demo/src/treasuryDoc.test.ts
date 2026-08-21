@@ -48,6 +48,7 @@ import {
   readPolicyCache,
   readPolicyCacheResult,
   readProposal,
+  readProposalResult,
   readProposalPayload,
   readProposalPayloadResult,
   readReceiptCache,
@@ -214,6 +215,52 @@ describe('proposals', () => {
     // The one horizon still exists, and says so when it is hit.
     const starved = scanProposals(3, 99);
     expect(starved.truncated).toBe(true);
+  });
+
+  it('tells "no such proposal" apart from "held but not readable"', () => {
+    // This reader decides which of four things the open proposal screen says,
+    // and only ONE of them is allowed to claim the record was removed. The
+    // wording was already tested; the mapping from map contents to state was
+    // not, so the contract behind the wording could drift without anything
+    // failing. Each case here is a different lie if it comes out wrong.
+    const m = doc.getMap('treasury');
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+
+    // Valid: the only state that yields a record at all.
+    const ok = readProposalResult(p.proposalId);
+    expect(ok.status).toBe('ok');
+    expect(ok.status === 'ok' && ok.proposal).toEqual(p);
+
+    // Genuinely empty slot — the ONLY case that may say "no longer here".
+    expect(readProposalResult('f'.repeat(64)).status).toBe('absent');
+
+    // Held but malformed. Saying "removed" here would deny a record the room
+    // is holding, which is the claim this whole layer refuses to make.
+    m.set(`proposal:${'a'.repeat(64)}`, { not: 'a proposal' });
+    expect(readProposalResult('a'.repeat(64)).status).toBe('unreadable');
+
+    // MISFILED: a real, correctly signed proposal parked under someone
+    // else's id. The record is fine; it does not belong to this slot, and
+    // reporting the slot as empty would hide that a record is sitting in it.
+    m.set(`proposal:${'b'.repeat(64)}`, p);
+    expect(readProposalResult('b'.repeat(64)).status).toBe('unreadable');
+
+    // Forged signature: held, checked, failed. Still held.
+    m.set(`proposal:${'c'.repeat(64)}`, {
+      ...p, proposalId: 'c'.repeat(64), proposerSig: 'f'.repeat(128),
+    });
+    expect(readProposalResult('c'.repeat(64)).status).toBe('unreadable');
+
+    // Oversized: refused by THIS DEVICE on size alone, which is a local
+    // decision and must never read as either absence or invalidity.
+    m.set(`proposal:${'d'.repeat(64)}`, { ...p, filler: 'x'.repeat(200_000) });
+    expect(readProposalResult('d'.repeat(64)).status).toBe('too-large');
+
+    // The plain wrapper flattens all four to null, which is exactly why the
+    // screen needs the result form — pinned so the two cannot be confused.
+    expect(readProposal('d'.repeat(64))).toBeNull();
+    expect(readProposal('f'.repeat(64))).toBeNull();
   });
 
   it('says when the SEARCH was cut short, not just the page', () => {
