@@ -81,7 +81,7 @@ import {
   reapOrphanPairings,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, readRoomDims } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
@@ -5076,6 +5076,16 @@ export class World {
           // walls drop so the OUTSIDE is visible and clickable.
           requestHull: () =>
             deviceFocus.releaseThen(() => roomEdit.enter(this, "hull")),
+        },
+        // 🗺️ #33 M-station: the STATION OVERVIEW pane. Getters (never a
+        // captured snapshot) so an atlas gossip landing mid-focus shows up on
+        // the pane's next refresh tick. Passes atlasLayout in the CURRENT
+        // room's frame — the same call the exterior composes hulls from.
+        station: {
+          getRoomId: () => World.activeRoomId(),
+          getRoomName: () => readLiveRoomStatus().roomName,
+          getRoomDims: () => readRoomDims(),
+          getAtlasPoses: () => atlasLayout(World.activeRoomId(), 8),
         },
       });
       deviceFocus.beginFocus(this.player, device, ui);
