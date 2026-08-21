@@ -1180,13 +1180,16 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
  */
 export interface SigningSessionScan extends BoundedScan<SigningSession> {
   /**
-   * True when a session's signature set was cut short by a local cap, so the
-   * `collectedSigs` on a returned round may be fewer than the room holds.
-   * Reported apart from `truncated`, which is about ROUNDS being cut, so the
-   * screen can qualify the gathered-of-required count instead of showing a
-   * partial figure as though it were complete.
+   * The sessions whose signature set was cut short by a local cap, so their
+   * `collectedSigs` may be fewer than the room holds.
+   *
+   * Per session, not a scan-wide flag: only ONE round's count is rendered, so
+   * a flag covering the whole scan let an expired or foreign round hitting
+   * the cap put an "at least" on a selected round that was complete.
+   * Reported apart from `truncated`, which is about ROUNDS being cut rather
+   * than signatures.
    */
-  signaturesPartial: boolean;
+  partialSessionIds: string[];
 }
 
 export function scanSigningSessions(
@@ -1199,7 +1202,7 @@ export function scanSigningSessions(
   if (!m) {
     return {
       items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0,
-      offset: 0, signaturesPartial: false,
+      offset: 0, partialSessionIds: [],
     };
   }
   const shellPrefix = `session:${proposalId}:`;
@@ -1240,13 +1243,13 @@ export function scanSigningSessions(
   // signatures held later in the map, which is the very guarantee this split
   // was made to provide.
   let sigExamined = 0;
-  let signaturesPartial = false;
+  const partialSessions = new Set<string>();
   for (const key of m.keys()) {
     sigExamined += 1;
     if (sigExamined > ceiling) {
-      // Cut short mid-collection: a session on this page may be missing
-      // signatures it actually holds, which the caller has to be able to say.
-      signaturesPartial = true;
+      // Cut short mid-collection: every session still wanted may be missing
+      // signatures it holds, so all of them are flagged rather than none.
+      for (const id of wanted) partialSessions.add(id);
       truncated = true;
       break;
     }
@@ -1261,7 +1264,7 @@ export function scanSigningSessions(
     // screen's cost budget.
     const already = sigsBySession.get(sessionId);
     if (already && already.length >= MAX_SIGS_PER_SESSION) {
-      signaturesPartial = true;
+      partialSessions.add(sessionId);
       continue;
     }
     const value = m.get(key);
@@ -1304,7 +1307,7 @@ export function scanSigningSessions(
     rejected,
     matched: shellKeys.length,
     offset: start,
-    signaturesPartial,
+    partialSessionIds: [...partialSessions],
   };
 }
 

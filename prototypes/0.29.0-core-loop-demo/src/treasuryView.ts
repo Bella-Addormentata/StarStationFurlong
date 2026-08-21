@@ -439,6 +439,12 @@ export interface ApprovalsView {
   /** Signatures gathered in the furthest-along single round. */
   collected: number;
   /**
+   * Which round `collected` describes, so a caller can qualify THAT round.
+   * Without it, a caveat about any round the scan touched — an expired or
+   * foreign one — landed on the count for a round that was complete.
+   */
+  selectedSessionId: string | null;
+  /**
    * How many that round needs. Taken from the company policy when it is
    * known, because the round's own copy is written by whoever opened it.
    */
@@ -492,6 +498,9 @@ export function approvalsView(
   return {
     sessions: live.length,
     collected: best ? best.collectedSigs.length : 0,
+    // Which round the count above describes, so a caller can qualify THAT
+    // round rather than every round the scan happened to touch.
+    selectedSessionId: best ? best.sessionId : null,
     required,
     requiredFromPolicy: policyThreshold !== null,
     trust: trustTag('unverified'),

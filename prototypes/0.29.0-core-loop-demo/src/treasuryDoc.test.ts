@@ -879,7 +879,9 @@ describe('verification caching', () => {
     const scan = scanSigningSessions(shell.proposalId, 50_000, 10, 0);
     expect(scan.items).toHaveLength(1);
     expect(scan.items[0].collectedSigs.length).toBeLessThanOrEqual(256);
-    expect(scan.signaturesPartial).toBe(true);
+    // Flagged BY SESSION, so a caveat lands on the round it belongs to
+    // rather than on whichever round the screen happens to be showing.
+    expect(scan.partialSessionIds).toContain(sessionId);
     // An ordinary round is not flagged.
     const doc2 = new Y.Doc();
     bindTreasuryDoc(doc2, { verifySig: verifier, networkGenesisChallenge: GENESIS });
@@ -888,7 +890,7 @@ describe('verification caching', () => {
       sessionId,
       collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
     })).toBe(true);
-    expect(scanSigningSessions(shell.proposalId, 50_000, 10, 0).signaturesPartial).toBe(false);
+    expect(scanSigningSessions(shell.proposalId, 50_000, 10, 0).partialSessionIds).toEqual([]);
   });
 
   it('survives a value nested deeper than the call stack', () => {

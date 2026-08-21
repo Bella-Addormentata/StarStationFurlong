@@ -3206,6 +3206,12 @@ function paintTreasuryBody(view: HTMLElement): void {
       boardThresholdFor(proposal, policyCache?.policy ?? null),
       height,
     );
+    // Only the round whose count is on screen. A scan-wide flag put an
+    // "at least" on a complete round whenever some OTHER round — expired,
+    // or belonging to another company — happened to hit the signature cap.
+    const selectedRoundPartial =
+      approvals.selectedSessionId !== null &&
+      sessionScan.partialSessionIds.includes(approvals.selectedSessionId);
     const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
     const payload = payloadView(readProposalPayloadResult(proposal.payloadHash).status);
 
@@ -3289,11 +3295,11 @@ function paintTreasuryBody(view: HTMLElement): void {
               // Never a bare figure when the set behind it was cut short: a
               // partial count read as a complete one is the same invented
               // certainty as reporting a held record as absent.
-              sessionScan.signaturesPartial
+              selectedRoundPartial
                 ? `at least ${approvals.collected} of ${approvals.required ?? "—"}`
                 : `${approvals.collected} of ${approvals.required ?? "—"}`,
             ) +
-            (sessionScan.signaturesPartial
+            (selectedRoundPartial
               ? dim(
                   "More approvals for this round are held here than this device would read, so the figure above is a floor, not a total.",
                 )
@@ -3560,22 +3566,31 @@ function paintTreasuryBody(view: HTMLElement): void {
                   ? // The scan stopped before the end of the map, so "none"
                     // is a claim this screen cannot make.
                     "No proposals were found in the part of this room's records that was read, and the rest was not looked at."
-                  : page.refusedTooLarge > 0
-                    ? // Records ARE here — this device just would not read
-                      // them. Saying "none" would deny what the room holds.
-                      `No proposals could be listed. ${page.refusedTooLarge} record${page.refusedTooLarge === 1 ? " in" : "s in"} this room ${page.refusedTooLarge === 1 ? "was" : "were"} too large for this device to read.`
-                    : page.matched > 0
-                      ? // Keys matched and every one failed its checks. Not
-                        // truncated, nothing refused on size — the case a
-                        // panel reading only those two flags called "none".
-                        `No proposals could be listed. ${page.matched} record${page.matched === 1 ? " is" : "s are"} held under this room's proposal keys, but ${page.matched === 1 ? "it" : "none of them"} could be made sense of here.`
-                      : "No proposals in this room's records yet.",
+                  : // PAGE-LOCAL counts, not `matched`. matched is every key
+                    // across every page, so a final page of rejects used to
+                    // claim that records shown perfectly well on earlier pages
+                    // were unreadable.
+                    page.rejected + page.refusedTooLarge > 0
+                    ? `No proposals could be listed on this page. ${page.rejected + page.refusedTooLarge} record${page.rejected + page.refusedTooLarge === 1 ? " here is" : "s here are"} held but could not be read.`
+                    : "No proposals in this room's records yet.",
             )
     }
     ${
-      rows.length > 0 && page.refusedTooLarge > 0
+      // Both counts, rendered independently and whether or not any row
+      // survived. Gating them on `rows.length > 0` hid them exactly when a
+      // page was all failures, and gating on the company filter hid them
+      // whenever the surviving rows belonged to another company — the two
+      // cases where the player most needs to know something was dropped.
+      page.refusedTooLarge > 0
         ? dim(
-            `${page.refusedTooLarge} more record${page.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${page.refusedTooLarge === 1 ? "it is" : "they are"} not listed. That is this device's limit, not a fault in the records.`,
+            `${page.refusedTooLarge} record${page.refusedTooLarge === 1 ? " on this page was" : "s on this page were"} too large for this device to read, so ${page.refusedTooLarge === 1 ? "it is" : "they are"} not listed. That is this device's limit, not a fault in the records.`,
+          )
+        : ""
+    }
+    ${
+      page.rejected > 0
+        ? dim(
+            `${page.rejected} record${page.rejected === 1 ? " on this page is" : "s on this page are"} held but could not be made sense of — wrong shape, wrong network, or a signature that did not check out — so ${page.rejected === 1 ? "it is" : "they are"} not listed.`,
           )
         : ""
     }
