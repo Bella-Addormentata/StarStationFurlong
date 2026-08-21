@@ -82,6 +82,7 @@ import {
   roomFundingView,
   scopeProposals,
   advanceCursorPair,
+  missingProposalNote,
   retreatCursorPair,
   sessionsFor,
   shareClassViews,
@@ -3231,9 +3232,19 @@ function paintTreasuryBody(view: HTMLElement): void {
   // Which obstacle, not just whether there is one — an unconfigured build and
   // a missing room document are different facts and the player gets told
   // which. The terminal panel derives the same three states.
+  // `bound` belongs in here, not only in the early return further down.
+  // leaveRoom() destroys the treasury document but deliberately KEEPS
+  // activeBootstrap as last-room memory, so a roomId outlives the document it
+  // named — and this gate, reading roomId alone, called that readable. The
+  // early return below happens to stop anything being painted from it today,
+  // which makes this latent rather than live; it is still a gate that depends
+  // on a guard 30 lines away to stay honest, and the room terminal has
+  // included the document in its own version of this check all along. Two
+  // surfaces disagreeing about what "readable" means is how this screen
+  // produced a contradiction once already.
   const access: FundingReadAccess = !net.configured
     ? "no-network"
-    : !roomId
+    : !roomId || !bound
       ? "no-room"
       : "readable";
   const readable = access === "readable";
@@ -3271,22 +3282,26 @@ function paintTreasuryBody(view: HTMLElement): void {
 
   // ── Proposal detail ────────────────────────────────────────────────────
   if (treasuryDetailId) {
-    const proposalResult = readProposalResult(treasuryDetailId);
-    const proposal = proposalResult.status === "ok" ? proposalResult.proposal : null;
+    // Gated like every other read on this screen. This was the one that was
+    // not, and it is the one that makes a positive claim about the room from
+    // what it gets back: the reader answers "the map could not be read" and
+    // "no such proposal" with the same `absent`, so an ungated call turned a
+    // disabled read into "this proposal was removed".
+    const proposalResult = cacheReadable ? readProposalResult(treasuryDetailId) : null;
     const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
-    if (!proposal) {
+    if (proposalResult === null || proposalResult.status !== "ok") {
       // A peer can replace the open slot with something malformed or
       // oversized. The record is still there — saying it is "no longer in the
       // room's records" would be the absence claim every other panel refuses.
+      // A null result is the read that never ran, which claims less still.
       view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
-        proposalResult.status === "too-large"
-          ? "This proposal is still held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
-          : proposalResult.status === "unreadable"
-            ? "This proposal is still held in this room, but this device cannot make sense of it — wrong shape, wrong network, or a signature that did not check out."
-            : "This proposal is no longer in the room's records.",
+        missingProposalNote(
+          proposalResult === null ? "unavailable" : proposalResult.status,
+        ),
       )}`;
       return;
     }
+    const proposal = proposalResult.proposal;
     // The list would withhold this proposal now — a binding or policy landing
     // while the detail was open can change whose company this screen shows.
     // Mirror the list exactly: it withholds every row when no company can be

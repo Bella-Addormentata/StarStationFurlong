@@ -29,6 +29,7 @@ import {
   displayHeight,
   formatAmount,
   formatHeight,
+  missingProposalNote,
   retreatCursorPair,
   formatShares,
   boardThresholdFor,
@@ -1176,6 +1177,39 @@ describe('pager visibility', () => {
     expect(fn).toContain('history.length > 1');
   });
 
+  it('gates the phone and the terminal on the same three obstacles', () => {
+    // leaveRoom() destroys the treasury document and KEEPS activeBootstrap as
+    // last-room memory, so a roomId outlives the document it named. A gate
+    // reading roomId alone calls that readable. The terminal has always
+    // included the document in its own check; the phone did not, and two
+    // surfaces disagreeing about what "readable" means is how this screen
+    // contradicted itself once before.
+    const devices = readFileSync(join(root, 'devices.ts'), 'utf8');
+    for (const [where, src] of [['main.ts', main], ['devices.ts', devices]] as const) {
+      const at = src.indexOf('const access: FundingReadAccess');
+      expect(at, `${where} has no FundingReadAccess gate to check`).toBeGreaterThan(-1);
+      // The whole conditional: from the declaration to the semicolon that
+      // ends it. A fixed-width window is what let an earlier test in this
+      // file pass by reading a neighbour's code instead of its own.
+      const gate = src.slice(at, src.indexOf(';', at));
+      // Either spelling: the phone holds the answer in `bound`, the terminal
+      // calls treasuryDocBound() inline.
+      expect(gate, `${where} decides readability without the room document`)
+        .toMatch(/bound/i);
+      // And all three obstacles stay distinct — collapsing them is what made
+      // the terminal blame the room connection for an unconfigured build.
+      expect(gate, `${where} lost the no-network branch`).toContain('no-network');
+      expect(gate, `${where} lost the no-room branch`).toContain('no-room');
+    }
+  });
+
+  it('gates the open proposal read like every other read on the screen', () => {
+    // This was the one ungated call, and the one whose result becomes a
+    // positive claim about the room.
+    expect(main).toContain('cacheReadable ? readProposalResult(treasuryDetailId) : null');
+    expect(main).not.toMatch(/^\s*const proposalResult = readProposalResult\(/m);
+  });
+
   it('gates every treasury pager on it, so none can shrink out of reach', () => {
     // The defect: `matched > PAGE` alone. A peer deleting earlier keys drops
     // `matched` to one page's worth while the reader sits past that page, and
@@ -1191,6 +1225,39 @@ describe('pager visibility', () => {
     expect(main).toContain('pagerNeeded(cpScan, DETAIL_PAGE, treasuryCheckpointCursors)');
     expect(main).toContain('pagerNeeded(sessionScan, DETAIL_PAGE, treasuryApprovalCursors)');
     expect(main).toContain('pagerNeeded(page, LIST_CHECKS, treasuryListCursors)');
+  });
+});
+
+describe('the open proposal that is not there', () => {
+  it('never reports a removal it did not observe', () => {
+    // The cache reader answers a lookup it COULD NOT PERFORM with the same
+    // `absent` it uses for an empty slot — both are "no map". So the screen
+    // needs a state the reader cannot supply, or a disabled read renders as
+    // "your proposal was removed": a claim about the room, from a question
+    // this device never asked.
+    const unavailable = missingProposalNote('unavailable');
+    expect(unavailable).not.toMatch(/no longer|removed|deleted/i);
+    expect(unavailable).toMatch(/not known|cannot read/i);
+    // And it must not go the other way either — silence about the obstacle
+    // would leave the player reading an empty screen with no account of why.
+    expect(unavailable.length).toBeGreaterThan(0);
+  });
+
+  it('keeps held-but-unreadable distinct from gone', () => {
+    // A peer can drop something malformed or oversized into the open slot.
+    // The record is still in the room; only this device's reading failed.
+    for (const held of ['too-large', 'unreadable'] as const) {
+      expect(missingProposalNote(held)).toMatch(/still held in this room/);
+      expect(missingProposalNote(held)).not.toMatch(/no longer/);
+    }
+    // Genuine absence is the ONLY state allowed to say the record is gone.
+    expect(missingProposalNote('absent')).toMatch(/no longer/);
+  });
+
+  it('gives each state its own wording', () => {
+    const notes = (['absent', 'unreadable', 'too-large', 'unavailable'] as const)
+      .map(missingProposalNote);
+    expect(new Set(notes).size).toBe(4);
   });
 });
 

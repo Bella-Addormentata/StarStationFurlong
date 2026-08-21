@@ -763,6 +763,40 @@ export type FundingReadAccess =
   | 'too-large'
   | 'unreadable';
 
+/**
+ * What the open proposal screen says when it has no proposal to show.
+ *
+ * 'unavailable' is the state that was missing, and its absence was the bug:
+ * the cache reader answers a lookup it could not perform with `absent`,
+ * exactly as it answers a slot that is genuinely empty, because both come
+ * back as "no map". So a screen reading that value alone told the player
+ * their proposal had been REMOVED whenever the read was merely disabled — a
+ * positive claim about the room, made from a question this device never got
+ * to ask. Every other panel on this screen already draws that line; the open
+ * proposal was the one read that did not.
+ */
+export type ProposalDetailAbsence =
+  | 'absent'
+  | 'unreadable'
+  | 'too-large'
+  | 'unavailable';
+
+export function missingProposalNote(status: ProposalDetailAbsence): string {
+  switch (status) {
+    case 'too-large':
+      return 'This proposal is still held in this room, but it is too large for this device to read. That is this device’s limit, not a fault in the record.';
+    case 'unreadable':
+      return 'This proposal is still held in this room, but this device cannot make sense of it — wrong shape, wrong network, or a signature that did not check out.';
+    case 'unavailable':
+      // Deliberately says nothing about the proposal itself. The obstacle is
+      // named in the banner above; what belongs here is the admission that
+      // this device has no basis for any claim either way.
+      return 'This device cannot read this room’s records, so whether this proposal is still here is not known.';
+    case 'absent':
+      return 'This proposal is no longer in the room’s records.';
+  }
+}
+
 export interface RoomFundingView {
   bound: boolean;
   /**
