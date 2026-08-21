@@ -73,6 +73,12 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
+// 🚀 #30 SH3: the INITIATE handler refuses to start a new berthing while the
+// ship is not-docked (undocking / in-flight / redocking). A berth mid-hop
+// would leave the station side pointing at a moving target — the plan's
+// "the module IS the room; passengers travel with it" invariant relies on
+// the ship being at rest before a station lane latches on.
+import { readFlightRecord } from "./shipDoc";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -1226,6 +1232,21 @@ export class DoorDockingPortSystem {
         const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
+
+        // 🚀 #30 SH3: refuse a new berthing while THIS module is not docked.
+        // The doors doc key here is the LOCAL room — if we're in-flight/
+        // undocking/redocking, latching onto us would leave the station side
+        // pointing at a target that is moving out from under it. Fail LOUD
+        // (the same alert idiom the rest of this handler uses) so the player
+        // sees the refusal instead of a silent no-op.
+        const localFlight = readFlightRecord();
+        if (localFlight.status !== "docked") {
+          alert(
+            `This module is ${localFlight.status.toUpperCase()} — new berths are refused until the flight completes and the ship redocks.`,
+          );
+          return;
+        }
+
         const state = this.doorState.get(activeDoorId);
         const addrInput = document.getElementById(
           "docking-addr-input",
