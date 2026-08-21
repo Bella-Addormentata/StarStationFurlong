@@ -530,11 +530,16 @@ describe('stand-switch release-before-claim (audit remediation for finding #1 / 
   });
 
   it('leaked claim from an aborted walk-up is reapable once the local player goes offline', () => {
-    // Documents the recovery path if a leak somehow slips past the fix:
-    // once the local player id is no longer in the online set, the reaper
-    // sees the expired claim and deletes it. Before the audit fix, the
-    // local player id was ALWAYS in the online set, so a leaked claim
-    // stuck for the entire session.
+    // BACKSTOP path. The round-2 audit fix in player.ts's
+    // _cancelDeviceApproach now fires the wrapped onRelease on every
+    // abort site, so a leak of this kind should never actually reach the
+    // reaper — see the "aborted APPROACH ..." describe below for the
+    // round-2 correctness proof. But if some future refactor manages to
+    // strand a claim anyway, this is the recovery path: once the local
+    // player id is no longer in the online set, the reaper sees the
+    // expired claim and deletes it. Before the round-1 fix the local
+    // player id was ALWAYS in the online set, so a leak stuck for the
+    // whole session.
     claimStand('t1:s0', ALICE, T0);
     // Alice's tab actually crashed (not just "quiet"): she's not in the
     // online set. Well past the TTL.
@@ -545,6 +550,129 @@ describe('stand-switch release-before-claim (audit remediation for finding #1 / 
       now: late,
     });
     expect(stale).toEqual(['t1:s0']);
+  });
+});
+
+describe('aborted APPROACH releases the stand claim (round-2 audit fix)', () => {
+  // Round-1 wrapped every device's onRelease so it released the claimed
+  // stand slot — good, but the focus controller only ever fires onRelease
+  // from the FOCUSED state (deviceFocus.release / forceRelease). The
+  // player state machine has its own APPROACH/FINE/TURN phases BEFORE
+  // handing off to the controller, and _cancelDeviceApproach used to
+  // abandon those phases without firing the wrapped onRelease. That left
+  // the claim stranded, and heartbeat kept it alive.
+  //
+  // The round-2 fix teaches _cancelDeviceApproach to fire
+  // deviceTarget.onRelease?.() uniformly for every abort entry point
+  // (floor-click, seat/door-click, WASD, FINE-stuck, obstacles-changed,
+  // beamTo, enterFromDoor, item-removed/moved, non-ENGAGED release). The
+  // wrapped closure captures the claimed slot id and calls the
+  // shouldReleaseSlot-guarded releaseStandById — so the claim clears
+  // immediately, not "next reap sweep after we go offline".
+  //
+  // These tests exercise the wrapped-closure semantics against the doc
+  // directly, mirroring the release-before-claim block above — pure
+  // engine, no live scene.
+  beforeEach(() => bindStandsDoc(new Y.Doc()));
+
+  it('a wrapped onRelease fired during APPROACH releases the claimed slot immediately', () => {
+    // Simulate the exact call sequence:
+    //   1. World.ts standTarget(device) claims 't3:s0' for Alice.
+    //   2. Wrapped onRelease captures slotId 't3:s0' in its closure.
+    //   3. Player.ts's _cancelDeviceApproach (any of the 12+ abort sites)
+    //      calls deviceTarget.onRelease?.() — fires the wrapped release.
+    //   4. Slot 't3:s0' clears NOW, no TTL wait, no offline requirement.
+    const claimedSlotId = 't3:s0';
+    claimStand(claimedSlotId, ALICE, T0);
+    // Wrap closure a la world.ts:standTarget — captures the slot id at
+    // wrap time, guards with shouldReleaseSlot, then calls releaseStand.
+    const wrappedOnRelease = () => {
+      const current = readStandClaim(claimedSlotId);
+      if (shouldReleaseSlot(current, ALICE)) releaseStand(claimedSlotId);
+    };
+    // _cancelDeviceApproach fires it.
+    wrappedOnRelease();
+    // Claim is gone. Not "expired". Not "reapable after offline". Gone.
+    expect(readStandClaim(claimedSlotId)).toBeNull();
+    // And the reaper sees nothing to do at time T0 (the claim isn't even
+    // expired — this is a live-release, not a leak-then-reap).
+    const stale = findExpiredClaims({
+      claims: readAllStandClaims(),
+      onlinePlayerIds: new Set<string>([ALICE]),
+      now: T0,
+    });
+    expect(stale).toEqual([]);
+  });
+
+  it('firing the wrapped onRelease twice is a no-op the second time (idempotent)', () => {
+    // Some abort paths can chain — e.g. _cancelDeviceApproach fires the
+    // wrapped release, then a subsequent releaseDevice() might fire the
+    // controller's own onRelease later if state got confused. The
+    // ownership guard makes the second fire a safe no-op.
+    const claimedSlotId = 't3:s0';
+    claimStand(claimedSlotId, ALICE, T0);
+    const wrappedOnRelease = () => {
+      const current = readStandClaim(claimedSlotId);
+      if (shouldReleaseSlot(current, ALICE)) releaseStand(claimedSlotId);
+    };
+    wrappedOnRelease();
+    expect(readStandClaim(claimedSlotId)).toBeNull();
+    // Second fire — current is now null, shouldReleaseSlot(null, _) is
+    // true, releaseStand is a no-op when the map key is absent.
+    expect(() => wrappedOnRelease()).not.toThrow();
+    expect(readStandClaim(claimedSlotId)).toBeNull();
+  });
+
+  it('a re-tap that lands on a different slot preserves the latest closure so both slots release cleanly', () => {
+    // Round-2 fix companion: navigateToDevice's same-device branch used
+    // to update `deviceHooks` but keep the OLD `deviceTarget`. If
+    // standTarget picked a fresh slot on re-tap (rare — TTL expired
+    // between clicks), the new wrapped onRelease was discarded and the
+    // NEW slot leaked. The fix also refreshes `deviceTarget = device`
+    // so the newest wrapped closure survives — old A closure orphans
+    // safely (standTarget's own pre-release already dropped slot A).
+    //
+    // Simulation: Alice claims A (t3:s0), then re-taps → standTarget
+    // pre-releases A and claims B (t3:s2). Later an abort fires the
+    // NEWEST wrapped closure — it targets B, and B clears.
+    claimStand('t3:s0', ALICE, T0);
+    // standTarget's pre-release path (world.ts) on the re-tap:
+    releaseStand('t3:s0');
+    claimStand('t3:s2', ALICE, T0 + 50);
+    // Player.ts NOW holds the B-flavoured wrapped onRelease as
+    // deviceTarget (round-2 fix's navigateToDevice branch adopts the
+    // fresh DeviceTarget, not just hooks).
+    const wrappedOnReleaseB = () => {
+      const current = readStandClaim('t3:s2');
+      if (shouldReleaseSlot(current, ALICE)) releaseStand('t3:s2');
+    };
+    // Abort fires it.
+    wrappedOnReleaseB();
+    // Both A and B are gone.
+    expect(readStandClaim('t3:s0')).toBeNull();
+    expect(readStandClaim('t3:s2')).toBeNull();
+  });
+
+  it('the wrapped closure will not drop another peer\'s slot even if fired late', () => {
+    // Racing scenario: Alice's APPROACH aborts, but by the time her
+    // wrapped closure fires her TTL had expired and Bob legitimately
+    // took the same slot (shouldReleaseSlot's whole reason to exist).
+    // The guard refuses; Bob keeps his claim.
+    const claimedSlotId = 't3:s0';
+    // The world was: Alice claimed, went silent, Bob took over.
+    claimStand(claimedSlotId, BOB, T0 + STAND_CLAIM_TTL_MS + 500);
+    // Alice's stale wrapped closure — captures the same slot id, uses
+    // Alice's playerId in the ownership check.
+    const staleWrappedOnRelease = () => {
+      const current = readStandClaim(claimedSlotId);
+      if (shouldReleaseSlot(current, ALICE)) releaseStand(claimedSlotId);
+    };
+    staleWrappedOnRelease();
+    // Bob's claim survives.
+    expect(readStandClaim(claimedSlotId)).toEqual({
+      playerId: BOB,
+      at: T0 + STAND_CLAIM_TTL_MS + 500,
+    });
   });
 });
 

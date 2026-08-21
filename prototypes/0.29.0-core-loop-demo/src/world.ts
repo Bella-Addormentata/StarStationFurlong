@@ -5263,17 +5263,24 @@ export class World {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
 
-    // 🎰 #76 (audit fix): if the previous focus target was a TABLE that we
-    // claimed a stand slot on, and the new target is a DIFFERENT device (a
-    // non-table like the cashier, or a different table), release the prior
-    // claim NOW — before the player-side cancellation path runs. The player
-    // aborts an unfinished device APPROACH via `_cancelDeviceApproach`
-    // (player.ts), which clears deviceTarget/hooks WITHOUT firing the
-    // wrapped `onRelease`; without this pre-cleanup the claim would leak
-    // into the doc and the heartbeat would keep refreshing it forever.
-    // Same table (re-tap): keep the current claim; standTarget below will
-    // either re-claim the same slot (heartbeat) or release-and-swap to a
-    // different slot on that table.
+    // 🎰 #76 (audit fix — round 2 clarification): if the previous focus
+    // target was a TABLE we claimed a stand slot on, and the new target is a
+    // DIFFERENT device (non-table cashier, different table), release the
+    // prior claim NOW — a defensive early-release so the doc is clean the
+    // instant the user's intent is registered, without waiting for the
+    // player-side cancellation cascade to run and fire the wrapped
+    // onRelease. Same table (re-tap): keep the current claim; standTarget
+    // below will either re-claim the same slot (heartbeat) or release-and-
+    // swap to a different slot on that table.
+    //
+    // COVERAGE. The AUTHORITATIVE stand-release path — the one that catches
+    // every _cancelDeviceApproach entry point (floor-click, seat-click,
+    // door-click, WASD, FINE-stuck watchdog, obstacles-changed, etc.) — is
+    // the wrapped `deviceTarget.onRelease` now fired from player.ts's
+    // `_cancelDeviceApproach` itself. This pre-release fires on a strict
+    // subset of those paths (retarget only) and is idempotent with that
+    // player-side fire (ownership guard + null-slot no-op), so keeping it
+    // adds a small latency win without a double-drop hazard.
     if (this.trackedStand && this.trackedStand.itemId !== deviceId) {
       this.releaseStandById(this.trackedStand.slotId);
     }
