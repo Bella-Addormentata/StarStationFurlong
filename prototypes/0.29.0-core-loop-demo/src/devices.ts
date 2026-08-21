@@ -86,7 +86,7 @@ import {
 } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 // 🎲 #69 G3: the craps engine (pure payout math) + its table state.
-import { canPlaceBet } from './games/craps';
+import { canPlaceBet, crapsMaxOdds, POINT_NUMBERS } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
@@ -3096,7 +3096,12 @@ export interface CrapsUIDeps {
 /** Seconds the dice tumble after a settle lands. */
 const CR_ROLL_SECS = 1.6;
 const CR_BOARD_W = 360;
-const CR_BOARD_H = 186;
+// Taller than the original 186 to accommodate the come line and the odds strip
+// (both point-phase bets that only make sense once a point is on). Regions that
+// are inactive for the current point state render dimmed instead of vanishing —
+// this way the felt's geometry is stable so a player's muscle memory is not
+// disrupted round to round, and the DIM is a diegetic "this bet is closed" cue.
+const CR_BOARD_H = 232;
 const CR_GREEN = '#1B6B3A';
 const CR_RED = '#7A1E1E';
 
@@ -3104,25 +3109,44 @@ interface CrapsRegion {
   x: number; y: number; w: number; h: number;
   label: string;
   fill: string | null;
-  bet: { type: CrapsBet['type']; pick?: number };
+  /** Placement descriptor. `pickFromPoint` = pass/dontpass odds regions whose
+   *  `pick` is the CURRENT pass line's point (filled at click time, not baked
+   *  into the region). This way one felt region works whether the point is 4,
+   *  5, 6, 8, 9, or 10 — matching how a real dealer places the chips. */
+  bet: { type: CrapsBet['type']; pick?: number; pickFromPoint?: boolean };
 }
 
-/** Single source for drawing AND hit-testing the craps felt (CSS px). */
+/** Single source for drawing AND hit-testing the craps felt (CSS px).
+ *  Regions are drawn in top-down layout order; a region's `bet` decides the bet
+ *  placed on click AND the "which stacks live here" key for the mine/others
+ *  chip readback. Odds regions carry `pickFromPoint` because their point is not
+ *  chosen by the player — it IS the pass line's current point. */
 function crapsBoardRegions(): CrapsRegion[] {
   const r: CrapsRegion[] = [];
-  r.push({ x: 6, y: 6, w: 232, h: 34, label: 'PASS LINE · 1:1', fill: null, bet: { type: 'pass' } });
-  r.push({ x: 242, y: 6, w: 112, h: 34, label: "DON'T PASS", fill: CR_RED, bet: { type: 'dontpass' } });
-  r.push({ x: 6, y: 44, w: 348, h: 44, label: 'FIELD · 2 3 4 9 10 11 12 · 2 & 12 DOUBLE', fill: null, bet: { type: 'field' } });
+  // Row 1 — the flat line bets (allowed on come-out only).
+  r.push({ x: 6, y: 6, w: 232, h: 30, label: 'PASS LINE · 1:1', fill: null, bet: { type: 'pass' } });
+  r.push({ x: 242, y: 6, w: 112, h: 30, label: "DON'T PASS", fill: CR_RED, bet: { type: 'dontpass' } });
+  // Row 2 — the come strip (a "personal pass line" you take DURING a point).
+  r.push({ x: 6, y: 40, w: 232, h: 28, label: 'COME · 1:1', fill: null, bet: { type: 'come' } });
+  r.push({ x: 242, y: 40, w: 112, h: 28, label: "DON'T COME", fill: CR_RED, bet: { type: 'dontcome' } });
+  // Row 3 — the odds strip (true-odds backing of the pass line's point;
+  // dealer places these chips physically behind the flat pass line bet).
+  r.push({ x: 6, y: 72, w: 232, h: 28, label: 'PASS ODDS · TRUE ODDS', fill: null, bet: { type: 'passodds', pickFromPoint: true } });
+  r.push({ x: 242, y: 72, w: 112, h: 28, label: "DON'T PASS ODDS · LAY", fill: CR_RED, bet: { type: 'dontpassodds', pickFromPoint: true } });
+  // Row 4 — the field.
+  r.push({ x: 6, y: 104, w: 348, h: 34, label: 'FIELD · 2 3 4 9 10 11 12 · 2 & 12 DOUBLE', fill: null, bet: { type: 'field' } });
+  // Row 5 — place bets.
   [4, 5, 6, 8, 9, 10].forEach((n, i) => {
     r.push({
-      x: 6 + i * 58, y: 92, w: 54, h: 46,
+      x: 6 + i * 58, y: 142, w: 54, h: 44,
       label: String(n),
       fill: CR_GREEN,
       bet: { type: 'place', pick: n },
     });
   });
-  r.push({ x: 6, y: 144, w: 170, h: 34, label: 'ANY 7 · 4:1', fill: null, bet: { type: 'anyseven' } });
-  r.push({ x: 184, y: 144, w: 170, h: 34, label: 'ANY CRAPS · 7:1', fill: null, bet: { type: 'anycraps' } });
+  // Row 6 — one-roll props.
+  r.push({ x: 6, y: 192, w: 170, h: 34, label: 'ANY 7 · 4:1', fill: null, bet: { type: 'anyseven' } });
+  r.push({ x: 184, y: 192, w: 170, h: 34, label: 'ANY CRAPS · 7:1', fill: null, bet: { type: 'anycraps' } });
   return r;
 }
 
@@ -3221,19 +3245,70 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
 
   // ── Bet placement (stakes move at placement time — see module doc) ─────────
 
-  const placeBet = (bet: { type: CrapsBet['type']; pick?: number }): void => {
+  /** Total stake already placed on a given bet type (optionally filtered by
+   *  pick) — used to enforce the 3x/4x/5x odds cap on the pass side. */
+  const stakeOn = (type: CrapsBet['type'], pick?: number): number => {
+    let sum = 0;
+    for (const b of myBets()) {
+      if (b.type === type && (pick === undefined || b.pick === pick)) sum += b.amount;
+    }
+    return sum;
+  };
+
+  const placeBet = (bet: { type: CrapsBet['type']; pick?: number; pickFromPoint?: boolean }): void => {
     if (!bettingOpen() || animT !== null) return;
-    if (!canPlaceBet(bet.type, point())) {
-      flash = 'THE LINE IS CLOSED — A POINT IS ON';
+    const pt = point();
+    if (!canPlaceBet(bet.type, pt)) {
+      // Say the truth precisely: for pass/dontpass the line is closed during a
+      // point; for come/dontcome/odds the come-out is closed until the point sets.
+      flash = pt === null
+        ? 'THIS BET NEEDS A POINT — WAIT FOR THE PASS LINE TO SET ONE'
+        : 'THE LINE IS CLOSED — A POINT IS ON';
       render();
       return;
+    }
+    // pickFromPoint = odds regions inherit the pass line's point at click time.
+    // A stray click during come-out is already rejected above (canPlaceBet).
+    let pick = bet.pick;
+    if (bet.pickFromPoint) {
+      if (pt === null || !POINT_NUMBERS.has(pt)) return; // belt+braces
+      pick = pt;
+    }
+    // Odds cap: refuse an odds chip that would push the total past 3x/4x/5x of
+    // the flat pass/dontpass stake. Real casino behaviour — the dealer stops you.
+    if (bet.type === 'passodds' && pick != null) {
+      const flat = stakeOn('pass');
+      if (flat <= 0) {
+        flash = 'BACK A PASS LINE BET FIRST — ODDS RIDE THE FLAT';
+        render();
+        return;
+      }
+      if (stakeOn('passodds', pick) + denom > crapsMaxOdds(flat, pick)) {
+        flash = 'AT THE MAX ODDS FOR THIS POINT — 3x·4x·5x HOUSE CAP';
+        render();
+        return;
+      }
+    } else if (bet.type === 'dontpassodds' && pick != null) {
+      const flat = stakeOn('dontpass');
+      if (flat <= 0) {
+        flash = "BACK A DON'T PASS BET FIRST — LAY RIDES THE FLAT";
+        render();
+        return;
+      }
+      if (stakeOn('dontpassodds', pick) + denom > crapsMaxOdds(flat, pick)) {
+        flash = 'AT THE MAX LAY ODDS FOR THIS POINT — 3x·4x·5x HOUSE CAP';
+        render();
+        return;
+      }
     }
     if (!spendChips(myId, denom)) {
       flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
       render();
       return;
     }
-    const full: CrapsBet = { ...bet, amount: denom };
+    const full: CrapsBet = pick != null
+      ? { type: bet.type, pick, amount: denom }
+      : { type: bet.type, amount: denom };
     writeMyCrapsBets(deps.itemId, myId, [...myBets(), full]);
     addedThisWindow.push(full);
   };
@@ -3346,8 +3421,14 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     // spectator): the matching place box + the field when it hit.
     const settled = state()?.phase === 'settled' && animT === null;
     const rolled = settled ? state()!.result : null;
+    const pt = point();
     const fieldSet = new Set([2, 3, 4, 9, 10, 11, 12]);
     for (const rg of regions) {
+      // A region is DIM when placing this bet type is not allowed right now
+      // (e.g. pass/dontpass with a point on; come/odds with no point). Dim ≠
+      // hidden — the felt geometry stays stable so muscle memory works.
+      const active = canPlaceBet(rg.bet.type, pt);
+      ctx.globalAlpha = active ? 1 : 0.42;
       ctx.fillStyle = rg.fill ?? '#1B6B3A';
       ctx.fillRect(rg.x, rg.y, rg.w, rg.h);
       const flare = rolled != null && (
@@ -3376,16 +3457,26 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
         ctx.fillStyle = 'rgba(240,224,180,0.7)';
         ctx.fillText(
           rg.bet.pick === 6 || rg.bet.pick === 8 ? '7:6' : rg.bet.pick === 5 || rg.bet.pick === 9 ? '7:5' : '9:5',
-          rg.x + rg.w / 2, rg.y + 32,
+          rg.x + rg.w / 2, rg.y + 30,
         );
       }
-      const theirs = otherChips.get(keyOf(rg.bet));
-      if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
-      const placed = mineChips.get(keyOf(rg.bet));
-      if (placed) {
-        const cols = Math.ceil(placed.length / 8);
-        drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
+      // Chip readback — the felt is the source of truth, so read what actually
+      // lives at this bet key. Odds regions carry a wildcard `pick` because
+      // their pick was determined by point at click time; sum across whatever
+      // odds bets the player actually has on this type.
+      const keys: string[] = rg.bet.pickFromPoint
+        ? [...POINT_NUMBERS].map((p) => `${rg.bet.type}:${p}`)
+        : [keyOf(rg.bet)];
+      for (const k of keys) {
+        const theirs = otherChips.get(k);
+        if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
+        const placed = mineChips.get(k);
+        if (placed) {
+          const cols = Math.ceil(placed.length / 8);
+          drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
+        }
       }
+      ctx.globalAlpha = 1;
     }
   };
 
@@ -3540,10 +3631,12 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
         🔒 provably fair · ${(s.fairness.mode as string).toUpperCase()}${s.fairness.simulated ? ' (dev-simulated)' : ''} · verifying…
       </div>` : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
-        BANK CRAPS · pass/don't-pass 1:1 (come-out only) · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6
-        · any 7 4:1 · any craps 7:1 · place bets ride until a 7, the pass line rides its point
-        · house-banked, the stickman's throw settles the roll · fair-dice upgrade coming
-        · chips are physical at the table — count them; the CASHIER's screen shows the number
+        BANK CRAPS · pass/don't-pass 1:1 (come-out only) · come/don't-come 1:1 (point ON — a "personal pass line")
+        · pass ODDS true odds (4/10 2:1, 5/9 3:2, 6/8 6:5) · don't pass LAY reciprocal
+        · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6 · any 7 4:1 · any craps 7:1
+        · place bets ride until a 7, the pass line rides its point, come bets travel to their come point
+        · house 3x/4x/5x odds cap (4/10 · 5/9 · 6/8) · house-banked, the stickman's throw settles the roll
+        · fair-dice upgrade coming · chips are physical at the table — count them; the CASHIER's screen shows the number
       </div>
     `;
     panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
