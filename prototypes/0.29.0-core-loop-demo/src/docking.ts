@@ -13,7 +13,7 @@ import * as THREE from "three";
 import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
 import {
-  physicalDoorPose, portForDoor, poseFromWall,
+  physicalDoorPose, physicalDoorPoseOrNull, portForDoor, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
   DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
 } from "./doorLayout";
@@ -45,7 +45,12 @@ import {
 // way when a chain would run through mounted equipment.
 import { setChainBoxProvider, exteriorItemBoxes } from "./hull";
 import { buildOctagonShell } from "./octagonHull";
-import type { Box } from "./furniture";
+import type { Box, FurnitureItem } from "./furniture";
+// 🦾 #62: FURNITURE list read at the INITIATE seam so the arm gate can query
+// "any station-mounted arm reaches this door?" — the SAME array editMode
+// mutates when the player places an arm, so a fresh arm counts immediately.
+import { FURNITURE } from "./furniture";
+import { armCoversDoor, armReachPose, ROBOT_ARM_KIND } from "./robotArmGate";
 import {
   armedPreset,
   presetSegments,
@@ -1286,6 +1291,38 @@ export class DoorDockingPortSystem {
                 `Can't dock here — the module would overlap ${clash.name}. Re-route the connector chain to a clear berth.`,
               );
               return;
+            }
+          }
+
+          // #62: 🦾 ROBOT ARM construction gate — a NEW pairing requires a
+          // station-mounted arm reaching the door. Compatibility rule (OWNER
+          // ruling in the issue thread — "gate applies to NEW pairings only")
+          // is enforced HERE by three explicit skip lanes:
+          //   1. state.pairedSuccessfully — an already-paired door keeps
+          //      working: any re-INITIATE inherits the historical decision.
+          //   2. state.transient — the #67 D2 adapter GUEST BERTH lane (set
+          //      up above at line ~1245 for non-rights players): no permanent
+          //      structure is being built, so no arm is required.
+          //   3. auto-accept dev bypass — when the walkthrough would auto-
+          //      accept this pairing (own-minted module under the dev
+          //      toggle), the arm gate stands down too. This is the SAME
+          //      autoAcceptCheckCallback the immediate-completion branch
+          //      below reads, so both lanes agree on "this is testing".
+          const willAutoAccept =
+            this.autoAcceptCheckCallback?.(state.connectedRoomAddress) ?? false;
+          if (!state.pairedSuccessfully && !state.transient && !willAutoAccept) {
+            const armDoorPose = physicalDoorPoseOrNull(activeDoorId);
+            if (armDoorPose) {
+              const armCheck = armCoversDoor(armDoorPose, FURNITURE);
+              if (!armCheck.ok) {
+                alert(`🦾 CANNOT DOCK — ${armCheck.reason}`);
+                // Un-set the pairing intent completely so the next INITIATE
+                // re-runs every check from a clean state (no lingering
+                // pairingPending, no LED sync). The address stayed in the
+                // input so the user can place an arm and retry.
+                state.pairingPending = false;
+                return;
+              }
             }
           }
 
@@ -2710,6 +2747,97 @@ export class DoorDockingPortSystem {
         this.slideAnims.delete(doorId);
         if (anim.onComplete) anim.onComplete();
       }
+    }
+  }
+
+  /**
+   * 🦾 #62 — per-frame animation for the ROBOT ARM construction gate.
+   *
+   * While ANY door is `pairingPending` (has an open INITIATE request but no
+   * `pairedSuccessfully` yet), the arm covering that door articulates: shoulder
+   * yaws along-wall toward the door, elbow un-folds from its parked pose. When
+   * every pairing has resolved (accepted or rejected), the arms ease back to
+   * idle.
+   *
+   * Pattern mirrors the door-leaf slide loop above (update-loop-driven,
+   * completion-signalled) and the world.holoSpinners tag-and-traverse pattern:
+   * builder attached `userData.robotArmShoulder`/`robotArmElbow` tags; this
+   * method resolves each arm's group via a caller-supplied lookup, traverses
+   * the group to find the tagged sub-Groups, and drives their rotation.
+   *
+   * The per-arm animation state (t ∈ [0,1]) is kept in `armAnimState` and
+   * eased toward the target with a linear approach at ARM_ANIM_SPEED units per
+   * second — a full extend or retract lands in ~1 s (visible but never
+   * blocking; the pairing completes when the far side accepts, not when the
+   * arm finishes reaching).
+   */
+  private armAnimState = new Map<string, number>(); // itemId → t ∈ [0,1]
+  private readonly ARM_ANIM_SPEED = 1.5; // 0→1 in ~0.67 s (crisp, low-poly reach)
+
+  public updateRobotArms(
+    deltaTime: number,
+    resolveGroup: (itemId: string) => THREE.Group | null,
+  ): void {
+    // Every arm on the current station — kept short by the fact that arms are
+    // rare (station-scale infrastructure, not room clutter). O(arms * doors)
+    // in the worst case; today's stations top out at a handful of each.
+    const arms = FURNITURE.filter((i): i is FurnitureItem => i.kind === ROBOT_ARM_KIND);
+    if (arms.length === 0) {
+      if (this.armAnimState.size > 0) this.armAnimState.clear();
+      return;
+    }
+
+    // Which arm (if any) is currently reaching for a pending pairing?
+    // For each pending-and-not-yet-completed door, ask the pure predicate;
+    // the winning arm gets target=1, everyone else eases back to 0.
+    const reachTargets = new Map<string, PhysicalDoorPose>();
+    for (const [doorId, state] of this.doorState.entries()) {
+      if (!state.pairingPending || state.pairedSuccessfully || state.transient) continue;
+      const pose = physicalDoorPoseOrNull(doorId);
+      if (!pose) continue;
+      const check = armCoversDoor(pose, arms);
+      if (check.ok) reachTargets.set(check.arm.id, pose);
+    }
+
+    for (const arm of arms) {
+      const target = reachTargets.has(arm.id) ? 1 : 0;
+      const current = this.armAnimState.get(arm.id) ?? 0;
+      // Approach the target at a constant speed (per-frame delta clamped).
+      const step = this.ARM_ANIM_SPEED * deltaTime;
+      const next = Math.abs(target - current) <= step
+        ? target
+        : current + Math.sign(target - current) * step;
+      this.armAnimState.set(arm.id, next);
+
+      // Apply to the arm's shoulder/elbow sub-Groups (idle when at rest — no
+      // wasted three.js writes on the many rest-frame arms).
+      if (next === 0 && current === 0) continue;
+      const group = resolveGroup(arm.id);
+      if (!group) continue;
+      // Prefer the live reach target; when retracting (no active pairing to
+      // reach for), synthesize a reference pose at the arm's own along-wall
+      // position so armReachPose returns shoulderYaw=0 and the arm eases
+      // straight up rather than swinging sideways on the way home.
+      const referencePose: Pick<PhysicalDoorPose, 'wall' | 'x' | 'z'> =
+        reachTargets.get(arm.id) ?? {
+          wall: (['y+', 'x+', 'y-', 'x-'] as const)[arm.rot],
+          x: arm.pos.x,
+          z: arm.pos.z,
+        };
+      const targetPose = armReachPose(referencePose, arm, next);
+
+      // Walk the group's children ONCE to find the shoulder + elbow tags.
+      let shoulder: THREE.Object3D | null = null;
+      let elbow: THREE.Object3D | null = null;
+      group.traverse((obj) => {
+        if (obj.userData?.robotArmShoulder) shoulder = obj;
+        if (obj.userData?.robotArmElbow) elbow = obj;
+      });
+      if (shoulder) (shoulder as THREE.Object3D).rotation.y = targetPose.shoulderYaw;
+      // three.js rotation about X flips the sign of the "fold up" direction —
+      // idle elbowPitch π/2 maps to rotation.x = -π/2 (forearm along local +Y),
+      // reach 0.35 maps to rotation.x = -0.35 (forearm mostly along local +Z).
+      if (elbow) (elbow as THREE.Object3D).rotation.x = -targetPose.elbowPitch;
     }
   }
 

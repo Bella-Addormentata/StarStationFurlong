@@ -104,6 +104,10 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'lavender-bouquet': '🪻 LAVENDER BOUQUET',
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
+  // 🦾 #62 · issue-owner design ruling: the ROBOT ARM is a piece the dev
+  // must place before a NEW pairing can dock at a door. Label it so it's
+  // easy to find in the FURNITURE gallery next to the other station parts.
+  'robot-arm': '🦾 ROBOT ARM',
 };
 
 type GetWorld = () => World | null;
@@ -854,6 +858,11 @@ function buildPanel(): HTMLDivElement {
       case 'add-flex': addParts('flex', 4); refreshPartsRows(); break;
       case 'add-ext': addParts('ext', 2); refreshPartsRows(); break;
       case 'add-adapter': addParts('adapter', 1); refreshPartsRows(); break;
+      // 🦾 #62: grant a ROBOT ARM. One per click — arms are station-scale
+      // infrastructure, not fuse-box consumables. The player still has to
+      // PLACE it in edit mode; this action just adds to the buildable
+      // inventory (same lane as flex/ext/adapter).
+      case 'add-arm': addParts('arm', 1); refreshPartsRows(); break;
       case 'arm-preset': {
         const p = btn.dataset.preset as PresetId;
         setArmedPreset(armedPreset() === p ? null : p); // toggle
@@ -947,6 +956,10 @@ function refreshPartsRows(): void {
     <div style="${ROW_STYLE}">
       <span>🔌 DOCK ADAPTER <span style="color:rgba(255,179,0,0.5);">× ${partsCount('adapter')}</span></span>
       <button type="button" data-dev-action="add-adapter" style="${BTN_STYLE}">+1</button>
+    </div>
+    <div style="${ROW_STYLE}">
+      <span>🦾 ROBOT ARM <span style="color:rgba(255,179,0,0.5);">× ${partsCount('arm')}</span></span>
+      <button type="button" data-dev-action="add-arm" style="${BTN_STYLE}">+1</button>
     </div>
     <div style="${ROW_STYLE}">
       <span>⭕ RING LINK <span style="color:rgba(255,179,0,0.4);">· flex+22.5 / ext×4 / flex+22.5</span></span>
