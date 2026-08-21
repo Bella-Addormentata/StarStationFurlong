@@ -44,11 +44,54 @@ import {
   ysyncSigner,
   hasStoredIdentity,
 } from "./keypair";
-import { bindTreasuryDoc } from "./treasuryDoc";
-// Dev placeholder network pin for the treasury cache layer — deliberately
-// matches NO real chain genesis, so every foreign record is rejected until
-// real network configuration arrives with PR C (plan §17.5).
-const TREASURY_DEV_GENESIS = "0".repeat(64);
+import {
+  bindTreasuryDoc,
+  readChainSyncStatusResult,
+  readPolicyCacheResult,
+  readProposalResult,
+  readProposalPayloadResult,
+  readRegistrationResult,
+  readRoomBindingResult,
+  readWindowsCacheResult,
+  scanCheckpoints,
+  scanProposals,
+  scanSigningSessions,
+  scanVotes,
+  subscribeTreasury,
+  treasuryDocBound,
+} from "./treasuryDoc";
+import { NO_NETWORK_PIN, treasuryNetwork } from "./treasuryNetwork";
+import {
+  approvalsView,
+  balanceView,
+  boardThresholdFor,
+  boardView,
+  checkpointsFor,
+  displayHeight,
+  formatHeight,
+  governanceRuleFor,
+  payloadView,
+  phaseLabel,
+  proposalKindLabel,
+  proposalPhase,
+  proposalRows,
+  companyScope,
+  type FundingReadAccess,
+  TREASURY_LABEL,
+  TREASURY_MUTED,
+  roomFundingView,
+  scopeProposals,
+  advanceCursorPair,
+  missingProposalNote,
+  retreatCursorPair,
+  sessionsFor,
+  shareClassViews,
+  shortId,
+  syncView,
+  trustTag,
+  voteTallyView,
+  windowsView,
+} from "./treasuryView";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
@@ -1216,12 +1259,14 @@ async function joinRoomAtEpoch(
   bindOffers(sync.doc);
   // 🏦 Treasury caches: signed display records over this room's doc (plan §14).
   // Verify-on-read only — nothing here is authoritative (invariant 5). The
-  // genesis pin (§17.5) rejects records from any other network; the value is
-  // a DEV PLACEHOLDER that matches no real chain — replace with the release
-  // network configuration when PR C wires real treasury flows.
+  // genesis pin (§17.5) rejects records from any other network.
   bindTreasuryDoc(sync.doc, {
     verifySig: verifyIdentity,
-    networkGenesisChallenge: TREASURY_DEV_GENESIS,
+    // An unconfigured build pins to a value treasuryDoc must refuse, which
+    // closes the cache: no record can match, so none is displayed. Passing a
+    // plausible-looking hex placeholder here would instead make it the live
+    // network, and any peer could publish records under it.
+    networkGenesisChallenge: treasuryNetwork().genesisChallenge ?? NO_NETWORK_PIN,
   });
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
@@ -1298,6 +1343,10 @@ async function joinRoomAtEpoch(
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
+    // 🏦 PR C: a treasury record landing (proposal, vote, policy cache) repaints
+    // an open TREASURY view. Registered once — the listener set is module-level
+    // in treasuryDoc, so it survives every rebind.
+    subscribeTreasury(() => queueTreasuryRepaint());
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
@@ -2753,6 +2802,1230 @@ function renderBankApp(): void {
   `;
 }
 
+// ── 🏦 TREASURY view (PR C) ──────────────────────────────────────────────────
+// Read-only company treasury, reached from VENTURES. Everything here is a
+// DISPLAY of the room's signed caches (treasuryDoc) — the phone holds no
+// treasury key, decides no balance, and declares nothing executable (plan
+// §4.1). Each panel carries a badge saying how much checking actually
+// happened, because the cache validates record classes differently: signed,
+// self-checked (content matches its own fingerprint), or unverified shape.
+// Display logic lives in treasuryView.ts so it stays unit-tested.
+
+/** Which proposal detail is open ('' = the list). */
+let treasuryDetailId = "";
+
+/**
+ * Where the proposal list is paged to.
+ *
+ * A per-repaint check budget bounds cost but, on its own, made the list
+ * censorable: the scan restarted at the beginning every time, so the first
+ * two dozen prefix-matching entries — junk included, since rejecting one costs
+ * a check too — could hide every real proposal permanently. Paging is what
+ * makes the bound survivable rather than exploitable.
+ */
+let treasuryListCursors: (string | null)[] = [null];
+
+/**
+ * The `nextCursor` each paged scan handed back on the last repaint.
+ *
+ * The click handler runs BEFORE the repaint that would recompute them, so it
+ * needs the value from the render it is reacting to — which is exactly the
+ * page the player was looking at when they pressed the control.
+ */
+let lastListNext: string | null = null;
+let lastVoteNext: string | null = null;
+let lastCheckpointNext: string | null = null;
+let lastApprovalNext: string | null = null;
+
+/**
+ * How many share classes one page of the COMPANY panel shows, and where that
+ * page starts. An offset rather than a cursor stack — see shareClassViews for
+ * why this one list is different from the map scans.
+ */
+const CLASS_PAGE = 24;
+let treasuryClassOffset = 0;
+
+/**
+ * "3–10 of 42" for one scan's page — descriptive only.
+ *
+ * startIndex is a position in a list a peer can prepend to, so it is fine for
+ * wording and useless for navigation; the cursor does the navigating.
+ */
+function pageRange(
+  scan: { matched: number; startIndex: number; items: unknown[] },
+  size: number,
+): string {
+  if (scan.matched === 0) return "none held";
+  const shown = Math.min(size, scan.matched - scan.startIndex);
+  return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${scan.matched}`;
+}
+
+/**
+ * Whether this panel must show its pager.
+ *
+ * NOT "is there more than one page of records", which is what it used to ask.
+ * `matched` is recounted from the map on every repaint, so a peer who deletes
+ * enough earlier keys drops it to one page's worth WHILE THE READER IS PAST
+ * THAT PAGE — the block disappears, taking PREVIOUS with it, and everything
+ * behind the cursor is stranded. Deleting records to remove the control that
+ * reaches records is the same censorship shape as planting them, arrived at
+ * from the other side.
+ *
+ * So the question is whether this view is anywhere other than the whole list:
+ * a cursor with history behind it, a page that starts partway in, or a page
+ * with more after it. Any of those and the controls stay.
+ */
+function pagerNeeded(
+  scan: { matched: number; startIndex: number; nextCursor: string | null },
+  size: number,
+  history: readonly (string | null)[],
+): boolean {
+  return (
+    scan.matched > size ||
+    scan.startIndex > 0 ||
+    scan.nextCursor !== null ||
+    history.length > 1
+  );
+}
+
+/**
+ * Where the open proposal's approval rounds are paged to.
+ *
+ * Same reason as the list, and the same attack: session shells are UNSIGNED
+ * and peer-writable, so two dozen self-consistent decoys sorted ahead of the
+ * genuine round consume the check budget before sessionsFor can filter them
+ * out — and with no way to reach the next page, that round's real progress
+ * was permanently invisible. Reset whenever a different proposal is opened,
+ * or a page number from one proposal would carry over to another.
+ */
+let treasuryApprovalCursors: (string | null)[] = [null];
+
+/**
+ * Where the open proposal's vote and vote-record scans are paged to.
+ *
+ * The fifth and last place this was missing. Vote and checkpoint keys are
+ * peer-writable too, so a page of decoys sorted ahead of the genuine records
+ * hid them with no way through — the panel warned it was partial and offered
+ * nothing to do about it, exactly as the proposal list and the approval rounds
+ * did before they were paged. One offset for both, because they are counted
+ * into a single tally and advancing them apart would make the figures answer
+ * different questions.
+ */
+let treasuryVoteCursors: (string | null)[] = [null];
+
+/** Checkpoints have their OWN key space, so they need their own cursor. */
+let treasuryCheckpointCursors: (string | null)[] = [null];
+
+/**
+ * How many records one repaint may VERIFY, as opposed to walk past.
+ *
+ * Verifying a record costs about 1.4 ms — a canonical id or hash recomputed
+ * and an ed25519 signature checked. The traversal budget below bounds how far
+ * a scan walks, which a cheap skipped key needs, but it never bounded this: a
+ * page of 800 verifiable records is over a second of blocked main thread. Nor
+ * does treasuryDoc's identity memo rescue it, because a peer who keeps writing
+ * NEW records writes new object identities, and every one of those is a miss.
+ *
+ * 24 keeps the verification cost of a repaint near 35 ms even under a flood,
+ * and 24 rows is already more than a phone screen shows at once. What falls
+ * outside the budget is not hidden: `truncated` drives an on-screen line
+ * saying the view is partial and its contents are an arbitrary subset.
+ *
+ * The budget is PER REPAINT, not per scan. The list screen runs one scan, so
+ * LIST_CHECKS is both; the detail screen runs three and splits DETAIL_CHECKS
+ * between them — see DETAIL_PAGE below.
+ *
+ * The real fix is validating off the render path with cancellation, alongside
+ * the per-class index treasuryDoc's scanPrefixed comment describes.
+ */
+const LIST_CHECKS = 24;
+
+/**
+ * The detail screen's budget for the whole repaint, and the per-scan share
+ * that adds up to it.
+ *
+ * DETAIL_CHECKS was handed to each of the three scans — votes, vote records
+ * and approval rounds — so it bounded one scan while the repaint did up to
+ * THREE times the documented work, and the comment above claiming it bounds a
+ * repaint was simply wrong. A peer replacing records under all three prefixes
+ * defeats the memo in each of them at once, so the aggregate is exactly the
+ * number that matters.
+ *
+ * Split rather than shared dynamically: a scan's page size has to be FIXED or
+ * an offset stops meaning the same thing twice, and resumable paging is what
+ * keeps a bound from becoming a way to hide records. Three fixed pages of 8
+ * come to the same 24, and DETAIL_PAGE is what every page calculation on that
+ * screen uses.
+ */
+const DETAIL_CHECKS = 24;
+const DETAIL_SCANS = 3;
+const DETAIL_PAGE = DETAIL_CHECKS / DETAIL_SCANS;
+
+/**
+ * Repaint, preserving keyboard focus across the innerHTML replacement.
+ *
+ * Every repaint — including one triggered by a record arriving from a peer —
+ * destroys the focused element. Tab is the phone's toggle rather than a tab
+ * stop, so a keyboard player left on `body` is stranded with no way back into
+ * the view. Focus is restored to the same control where it still exists, and
+ * to the first one otherwise.
+ */
+function renderTreasuryApp(): void {
+  const view = document.getElementById("phone-app-treasury");
+  if (!view) return;
+  const active = document.activeElement as HTMLElement | null;
+  const hadFocus = Boolean(active && view.contains(active));
+  // Trust badges are focus stops too — the qualification behind a badge is
+  // the whole reason it is readable from the keyboard, so a player parked on
+  // one while a peer's record lands must not be thrown to the top of the
+  // screen. Their slot name is checked first because it is the most specific
+  // identity an element here can carry.
+  const key = hadFocus
+    ? active?.dataset.treasuryBadge
+      ? `[data-treasury-badge="${CSS.escape(active.dataset.treasuryBadge)}"]`
+      : active?.dataset.proposalId
+        ? `[data-proposal-id="${CSS.escape(active.dataset.proposalId)}"]`
+        : active?.dataset.treasuryAction
+          ? `[data-treasury-action="${active.dataset.treasuryAction}"]`
+          : active?.dataset.phoneApp
+            ? `[data-phone-app="${active.dataset.phoneApp}"]`
+            : null
+    : null;
+  paintTreasuryApp(view);
+  if (!hadFocus) return;
+  const target =
+    (key ? view.querySelector<HTMLElement>(key) : null) ??
+    view.querySelector<HTMLElement>("[data-treasury-action], [data-phone-app]") ??
+    view;
+  target.focus({ preventScroll: true });
+}
+
+/**
+ * Coalesces repaints. The bounded scans cap the work of ONE render, but a
+ * peer chooses how often records land, and each Y.Map transaction notifies
+ * synchronously — so a stream of small writes could still saturate the main
+ * thread with back-to-back scans. Bursts collapse into a single trailing
+ * render on the next frame.
+ */
+let treasuryRepaintQueued = false;
+function queueTreasuryRepaint(): void {
+  if (treasuryRepaintQueued) return;
+  treasuryRepaintQueued = true;
+  // A timer rather than requestAnimationFrame: rAF does not fire at all
+  // while the tab is hidden, which would leave a queued repaint pending
+  // indefinitely instead of merely deferred.
+  setTimeout(() => {
+    treasuryRepaintQueued = false;
+    renderTreasuryApp();
+  }, 32);
+}
+
+/**
+ * Is the treasury view actually on screen?
+ *
+ * Two conditions, because the view's own class is not enough. Tab closes the
+ * phone by toggling `#spacephone-container.active` and never calls
+ * showPhoneView, so `#phone-app-treasury` keeps its `active` class while the
+ * container is merely slid offscreen — it is never display:none, so the
+ * subtree stays laid out. Checking only the view meant a player who opened
+ * TREASURY, pressed Tab and walked away still paid a full rebuild, relayout
+ * and a page of signature checks for every key any peer wrote, at up to 31 Hz,
+ * with no treasury screen anywhere in sight.
+ */
+function treasuryViewOnScreen(view: HTMLElement): boolean {
+  const phone = document.getElementById("spacephone-container");
+  return Boolean(phone?.classList.contains("active"))
+    && view.classList.contains("active");
+}
+
+function paintTreasuryApp(view: HTMLElement): void {
+  // Every treasury record that lands fires this. Re-verifying the whole cache
+  // for a view nobody is looking at is wasted signature work, and the app
+  // repaints on open anyway — showPhoneView("treasury") always renders.
+  //
+  // Unconditional: this used to also require `view.dataset.wired`, which is
+  // set INSIDE this function, so on a fresh load the latch was unset and the
+  // first record any peer synced painted the hidden view in full — the one
+  // pass where no memo is warm. The listeners it was protecting are wired
+  // below, off the painted path, so nothing needs the paint to have run.
+  if (!treasuryViewOnScreen(view)) return;
+  // Same black-inheritance fix as the BANK/VENTURES apps.
+  view.style.color = "#e8d5a3";
+  wireTreasuryView(view);
+  paintTreasuryBody(view);
+}
+
+/** One-time listener wiring, kept out of the paint so the guard can precede it. */
+function wireTreasuryView(view: HTMLElement): void {
+  if (!view.dataset.wired) {
+    view.dataset.wired = "1";
+    const activate = (target: EventTarget | null) => {
+      const el = (target as HTMLElement | null)?.closest<HTMLElement>(
+        "[data-treasury-action]",
+      );
+      if (!el) return false;
+      const action = el.dataset.treasuryAction;
+      if (action === "open") {
+        treasuryDetailId = el.dataset.proposalId ?? "";
+        // Page numbers are per proposal.
+        treasuryApprovalCursors = [null];
+        treasuryVoteCursors = [null];
+        treasuryCheckpointCursors = [null];
+      }
+      if (action === "back") treasuryDetailId = "";
+      // Forward pushes the cursor the scan just handed back; back pops to the
+      // one before. A stack rather than arithmetic because a cursor is a KEY,
+      // not a position — which is the point: a position can be pushed forward
+      // indefinitely by a peer prepending records between repaints, and a
+      // "next" that never arrives is not paging.
+      const pageForward = (stack: (string | null)[], next: string | null) => {
+        if (next !== null) stack.push(next);
+      };
+      const pageBack = (stack: (string | null)[]) => {
+        if (stack.length > 1) stack.pop();
+      };
+      if (action === "rounds-next") pageForward(treasuryApprovalCursors, lastApprovalNext);
+      if (action === "rounds-prev") pageBack(treasuryApprovalCursors);
+      // One control, two key spaces: paged as a pair so the two histories
+      // stay the same height. See advanceCursorPair for why.
+      if (action === "votes-next" || action === "votes-prev") {
+        const pair = { a: treasuryVoteCursors, b: treasuryCheckpointCursors };
+        const moved =
+          action === "votes-next"
+            ? advanceCursorPair(pair, lastVoteNext, lastCheckpointNext)
+            : retreatCursorPair(pair);
+        treasuryVoteCursors = [...moved.a];
+        treasuryCheckpointCursors = [...moved.b];
+      }
+      if (action === "page-next") pageForward(treasuryListCursors, lastListNext);
+      if (action === "page-prev") pageBack(treasuryListCursors);
+      // Share classes page by offset, not cursor — one array inside one
+      // record, shown in the order the policy declares it. The paint clamps
+      // this against the policy's real length before using it, so an offset
+      // left past the end after a shrink cannot strand the reader.
+      if (action === "classes-next") treasuryClassOffset += CLASS_PAGE;
+      if (action === "classes-prev") {
+        treasuryClassOffset = Math.max(0, treasuryClassOffset - CLASS_PAGE);
+      }
+      // renderTreasuryApp preserves focus across the repaint for us.
+      renderTreasuryApp();
+      return true;
+    };
+    view.addEventListener("click", (e) => activate(e.target));
+    // The rows advertise role="button"/tabindex="0", so they must answer the
+    // keyboard too — otherwise the affordance is decorative. Tab cannot do
+    // the traversal: the app reserves it globally as the phone's open/close
+    // toggle (it preventDefaults every press), so this view carries its own
+    // arrow-key movement between controls, and opening it lands focus here.
+    view.addEventListener("keydown", (e) => {
+      // Nothing here acts on a phone that is put away. The phone only slides
+      // offscreen, so a control left focused inside it still receives keys —
+      // and moving focus between rows nobody can see is worse than useless.
+      if (!treasuryViewOnScreen(view)) return;
+      if (e.key === "Enter" || e.key === " ") {
+        if (activate(e.target)) e.preventDefault();
+        return;
+      }
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const stops = [
+        ...view.querySelectorAll<HTMLElement>("[data-treasury-action], [data-phone-app], [tabindex='0']"),
+      ].filter((el) => el.offsetParent !== null);
+      if (stops.length === 0) return;
+      e.preventDefault();
+      const here = stops.indexOf(
+        (e.target as HTMLElement).closest<HTMLElement>(
+          "[data-treasury-action], [data-phone-app], [tabindex='0']",
+        ) as HTMLElement,
+      );
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      const next = here < 0 ? 0 : (here + step + stops.length) % stops.length;
+      stops[next].focus();
+    });
+  }
+}
+
+function paintTreasuryBody(view: HTMLElement): void {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const header = (t: string) =>
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL}; margin-top:12px;">${t}</div>`;
+  const dim = (t: string) =>
+    `<div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:4px; line-height:1.6;">${t}</div>`;
+  // `id` names the badge's slot on the screen ("board", "sync", …) so focus
+  // can be restored to THIS badge across a repaint. It is the first argument
+  // and has no default because a focusable control without a stable identity
+  // silently loses keyboard focus on every peer update — passing `null` is
+  // how a caller says "not focusable", and there is no way to ask for a
+  // focusable badge without naming it.
+  //
+  // `null` is for badges rendered INSIDE an activating control: a focusable
+  // note nested in a role="button" would swallow a tab stop and then bubble
+  // Enter/Space into the row's action, and descendants of a button are not
+  // reliably exposed with their own semantics. Those callers fold the detail
+  // into the row's own accessible label instead.
+  const badge = (
+    id: string | null,
+    tag: { level: string; label: string; detail: string },
+  ) => {
+    const focusable = id !== null;
+    // UNVERIFIED and NO DATA were a 45%-alpha gold, which composites over the
+    // phone's near-black screen to about 2.6:1 — under the 4.5:1 this 8px text
+    // needs, and dimmest on exactly the two states a player most needs to
+    // read. Opaque, and measured against #04060F: 5.5:1. Still visibly quieter
+    // than the ~12:1 SIGNED and SELF-CHECKED badges, so the hierarchy the
+    // dimming was for survives without costing legibility.
+    const color =
+      tag.level === "signed"
+        ? "#7ddb8f"
+        : tag.level === "self-checked"
+          ? "#f0c060"
+          : TREASURY_MUTED;
+    // Focusable and labelled: the qualification behind a badge (a signature
+    // shows authorship, not authority) is the whole point of showing it, and
+    // a title tooltip on an inert span never reaches a keyboard user.
+    // The detail rides in data-detail, which .ssf-trust-badge reveals on
+    // hover AND focus — a title tooltip never opens from the keyboard.
+    const a11y = focusable
+      ? ` role="note" tabindex="0" data-treasury-badge="${esc(id!)}" aria-label="${esc(`${tag.label}. ${tag.detail}`)}"`
+      : ` aria-hidden="true"`;
+    return `<span class="ssf-trust-badge"${a11y} data-detail="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
+  };
+  const row = (label: string, value: string) =>
+    `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+      <span style="color:${TREASURY_LABEL};">${label}</span>
+      <span style="flex-shrink:0; color:#f0c060; text-align:right;">${value}</span>
+    </div>`;
+
+  const bound = treasuryDocBound();
+  const net = treasuryNetwork();
+  // One gate for every cache read on this screen. A room document alone is
+  // not enough: with no network pinned nothing read from it can be tied to a
+  // chain, so an unconfigured build would otherwise render a peer's claim —
+  // and, for the sync entry, take a height from it — walking straight around
+  // the fail-closed boundary. treasuryDoc now refuses these reads on its own
+  // side too; keeping the gate here as well leaves the boundary visible at
+  // the call site instead of only in the reader.
+  const cacheReadable = bound && net.configured;
+  // Read once and feed both models from that value.
+  const syncResult = cacheReadable ? readChainSyncStatusResult() : null;
+  const peerSync = syncResult?.status === "ok" ? syncResult.sync : null;
+  // An entry a player wrote but this device cannot read is not the same as
+  // nobody having written one — the badge has to be able to say which.
+  const sync = syncView(
+    peerSync,
+    cacheReadable,
+    syncResult?.status === "unreadable",
+  );
+  const { height, source: heightSource } = displayHeight(peerSync);
+  // The result form, not the plain read: "held but this device declined to
+  // read it" and "held but unreadable" are held records, and reporting either
+  // as absence would tell a player there is no policy while one sits in the
+  // room they are standing in.
+  const policyResult = cacheReadable ? readPolicyCacheResult() : null;
+  const policyStatus = policyResult?.status ?? "absent";
+  const policyCache = policyResult?.status === "ok" ? policyResult : null;
+  // Which company this screen may present, shared by BOTH branches: an open
+  // detail must obey the same scope as the list, or a binding or policy
+  // changing under it would leave a proposal on screen that the list has
+  // since withheld.
+  const roomId = activeBootstrap?.roomId ?? "";
+  // Which obstacle, not just whether there is one — an unconfigured build and
+  // a missing room document are different facts and the player gets told
+  // which. The terminal panel derives the same three states.
+  // `bound` belongs in here, not only in the early return further down.
+  // leaveRoom() destroys the treasury document but deliberately KEEPS
+  // activeBootstrap as last-room memory, so a roomId outlives the document it
+  // named — and this gate, reading roomId alone, called that readable. The
+  // early return below happens to stop anything being painted from it today,
+  // which makes this latent rather than live; it is still a gate that depends
+  // on a guard 30 lines away to stay honest, and the room terminal has
+  // included the document in its own version of this check all along. Two
+  // surfaces disagreeing about what "readable" means is how this screen
+  // produced a contradiction once already.
+  const access: FundingReadAccess = !net.configured
+    ? "no-network"
+    : !roomId || !bound
+      ? "no-room"
+      : "readable";
+  const readable = access === "readable";
+  // Read ONCE, in result form, and share it with the funding panel below: the
+  // scope decision and the funding headline must not disagree about whether a
+  // binding is here. The plain reader's null hid "held but unusable", which
+  // let a peer neutralise the signed binding and have their own policy name
+  // the company for the whole screen.
+  const bindingResult = readable ? readRoomBindingResult(roomId) : null;
+  const scope = companyScope(
+    bindingResult?.status === "ok" ? bindingResult.binding : null,
+    policyCache?.policy ?? null,
+    bindingResult?.status === "unreadable" || bindingResult?.status === "too-large",
+  );
+
+  // The local verdict, always first: this device is not verifying the chain,
+  // so the whole app is read-only and says so (amendment §6/§15.3).
+  const verdictBanner = `
+    <div style="border:1px solid rgba(212,168,75,0.25); border-left:3px solid #f0c060; border-radius:6px; padding:8px 10px; background:rgba(212,168,75,0.05);">
+      <div style="font-size:10px; font-weight:800; color:#f0c060;">READ-ONLY · NOT VERIFIED HERE</div>
+      <div style="font-size:9px; color:${TREASURY_LABEL}; margin-top:3px; line-height:1.6;">${esc(sync.localNote)}</div>
+      ${
+        net.configured
+          ? ""
+          : `<div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:4px;">No company network is configured for this build, so nothing shown here is tied to a real chain.</div>`
+      }
+    </div>`;
+
+  // An in-view return, needed on EVERY branch that can be the whole screen.
+  // The phone header's own Back button sits outside this view, arrow-key
+  // traversal only searches inside it, and Escape goes to Home rather than to
+  // the parent app — so a branch without this leaves a keyboard-only player
+  // with no way back to VENTURES. The "not connected" branch had exactly that
+  // hole: it is the one screen with nothing else on it, so it offered no
+  // focusable element at all. Declared once here rather than pasted per
+  // branch, since the copy that was missing is how it went wrong.
+  const backToVentures = `
+    <div data-phone-app="ventures" role="button" tabindex="0" aria-label="Back to Ventures"
+      style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer; margin-top:8px;">← VENTURES</div>`;
+
+  if (!bound) {
+    view.innerHTML = `${verdictBanner}${backToVentures}
+      ${header("COMPANY TREASURY")}
+      ${dim("Not connected to a room yet — treasury records ride the room you are standing in.")}`;
+    return;
+  }
+
+  // ── Proposal detail ────────────────────────────────────────────────────
+  if (treasuryDetailId) {
+    // Gated like every other read on this screen. This was the one that was
+    // not, and it is the one that makes a positive claim about the room from
+    // what it gets back: the reader answers "the map could not be read" and
+    // "no such proposal" with the same `absent`, so an ungated call turned a
+    // disabled read into "this proposal was removed".
+    const proposalResult = cacheReadable ? readProposalResult(treasuryDetailId) : null;
+    const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
+    if (proposalResult === null || proposalResult.status !== "ok") {
+      // A peer can replace the open slot with something malformed or
+      // oversized. The record is still there — saying it is "no longer in the
+      // room's records" would be the absence claim every other panel refuses.
+      // A null result is the read that never ran, which claims less still.
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        missingProposalNote(
+          proposalResult === null ? "unavailable" : proposalResult.status,
+        ),
+      )}`;
+      return;
+    }
+    const proposal = proposalResult.proposal;
+    // The list would withhold this proposal now — a binding or policy landing
+    // while the detail was open can change whose company this screen shows.
+    // Mirror the list exactly: it withholds every row when no company can be
+    // identified, so an open detail must not survive that state either.
+    if (scope.mismatch) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(esc(scope.warning ?? ""))}`;
+      return;
+    }
+    if (scope.companyId === null) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        "Without company details there is no way to tell whose proposal this is, so it is no longer listed here.",
+      )}`;
+      return;
+    }
+    if (proposal.companyId !== scope.companyId) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        "This proposal belongs to a different company than the one this room now shows, so it is no longer listed here.",
+      )}`;
+      return;
+    }
+    const registrationResult = readRegistrationResult(proposal.proposalId);
+    // Only a policy for the SAME company and version governs this proposal.
+    const rule = governanceRuleFor(proposal, policyCache?.policy ?? null);
+    // A same-company policy at a DIFFERENT revision is why clocks and the
+    // board threshold may be missing — say so instead of leaving the player
+    // to wonder.
+    const otherRevision =
+      policyCache && policyCache.policy.companyId === proposal.companyId
+        ? policyCache.policy.policyVersion
+        : null;
+    const windowsResult = readWindowsCacheResult(proposal.proposalId);
+    const w = windowsView(
+      proposal,
+      registrationResult.status === "ok" ? registrationResult.registration : null,
+      rule,
+      windowsResult.status === "ok" ? windowsResult.windows : null,
+      // A record the room holds but the reader could not return is a conflict,
+      // not an absence — windowsView cannot tell without being told.
+      registrationResult.status === "unreadable",
+      windowsResult.status === "unreadable",
+    );
+    // Bounded reads: votes, vote records and approval rounds all sit in
+    // peer-writable slots that nothing prunes, and this screen repaints on
+    // every treasury event, so unbounded scans would let spam stall the UI.
+    // Two budgets, because the entries do not cost the same — see scanPrefixed.
+    // The walk guard is generous on purpose: it is a runaway stop, and any
+    // value small enough to be a page becomes a horizon a peer can hide
+    // records behind. What bounds a repaint is DETAIL_CHECKS, of which each of
+    // the three scans below takes DETAIL_PAGE — they run on every repaint, so
+    // the aggregate is the figure that matters, not any one scan's share.
+    const DETAIL_SCAN = 50_000;
+    // Paged, like the proposal list and the approval rounds. These keys are
+    // peer-writable too, so without a way through, decoys sorted ahead of the
+    // genuine records hid them for good.
+    // Each scan carries its OWN cursor, and they are NOT interchangeable. A
+    // cursor is a key from one key space: every `checkpoint:` key sorts before
+    // any `vote:` cursor, so handing the vote cursor to the checkpoint scan
+    // sent it straight to its end, and the reverse would have restarted the
+    // vote scan and re-counted votes already shown. One control still advances
+    // both, but each advances along its own keys.
+    const voteScan = scanVotes(
+      proposal.proposalId,
+      DETAIL_SCAN,
+      DETAIL_PAGE,
+      treasuryVoteCursors[treasuryVoteCursors.length - 1],
+    );
+    const cpScan = scanCheckpoints(
+      proposal.proposalId,
+      DETAIL_SCAN,
+      DETAIL_PAGE,
+      treasuryCheckpointCursors[treasuryCheckpointCursors.length - 1],
+    );
+    lastVoteNext = voteScan.nextCursor;
+    lastCheckpointNext = cpScan.nextCursor;
+    // Paged, for the same reason the proposal list is: shells are unsigned and
+    // peer-writable, so decoys sorted ahead of the genuine round would
+    // otherwise put it permanently out of reach.
+    const sessionScan = scanSigningSessions(
+      proposal.proposalId,
+      DETAIL_SCAN,
+      DETAIL_PAGE,
+      treasuryApprovalCursors[treasuryApprovalCursors.length - 1],
+    );
+    lastApprovalNext = sessionScan.nextCursor;
+    // Only the two scans that FEED the vote panel. Including the approval scan
+    // made a proposal with many approval rounds tell the VOTES panel its own
+    // figures were partial when they were complete — and approval truncation
+    // already has its own warning where it belongs.
+    const votesPartial = voteScan.truncated || cpScan.truncated;
+    const votes = voteTallyView(
+      voteScan.items,
+      // Vote records are keyed by proposal id alone, so one filed under
+      // another company must not be counted among this proposal's.
+      checkpointsFor(cpScan.items, proposal),
+    );
+    // Rounds and thresholds only count when they belong to THIS proposal's
+    // company and policy revision — both are peer-writable.
+    const approvals = approvalsView(
+      sessionsFor(sessionScan.items, proposal),
+      boardThresholdFor(proposal, policyCache?.policy ?? null),
+      height,
+      // Whether these rounds are ALL of them. Anything cut short, paged over,
+      // rejected or refused means the panel must not assert that no round is
+      // open — the warnings under it already say one might be.
+      !sessionScan.truncated &&
+        sessionScan.rejected === 0 &&
+        sessionScan.refusedTooLarge === 0 &&
+        sessionScan.matched <= DETAIL_PAGE,
+    );
+    // Only the round whose count is on screen. A scan-wide flag put an
+    // "at least" on a complete round whenever some OTHER round — expired,
+    // or belonging to another company — happened to hit the signature cap.
+    const selectedRoundPartial =
+      approvals.selectedSessionId !== null &&
+      sessionScan.partialSessionIds.includes(approvals.selectedSessionId);
+    const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
+    const payload = payloadView(readProposalPayloadResult(proposal.payloadHash).status);
+
+    view.innerHTML = `${verdictBanner}${back}
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:8px;">
+        <span style="font-size:13px; font-weight:800; color:#f0c060;">${esc(proposalKindLabel(proposal.kind))}</span>
+        ${badge("proposal", trustTag("signed"))}
+      </div>
+      <div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:2px;">Made under policy version ${proposal.policyVersion}${
+        otherRevision !== null && otherRevision !== proposal.policyVersion
+          ? ` · the company details held here are version ${otherRevision}, so that board and its clocks do not apply to this proposal`
+          : ""
+      }</div>
+      <div style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:2px; word-break:break-all;">${esc(proposal.proposalId)}</div>
+      ${dim("The proposal itself is signed by its proposer, and that signature was checked on this device.")}
+
+      ${header("CLOCKS")}
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+        <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(phaseLabel(phase))}</span>
+        ${badge("clocks", w.trust)}
+      </div>
+      ${
+        w.windows
+          ? row("Accepted at", formatHeight(w.windows.acceptedHeight)) +
+            row("Voting ends", formatHeight(w.windows.votingEndsHeight)) +
+            row("Veto ends", formatHeight(w.windows.vetoEndsHeight)) +
+            row("Board may act", formatHeight(w.windows.executableFromHeight)) +
+            row("Expires", formatHeight(w.windows.expiresAfterHeight))
+          : ""
+      }
+      ${dim(esc(w.note))}
+      ${dim(
+        heightSource === "peer-reported"
+          ? `Position on the clocks uses a height another player reported (${formatHeight(height ?? 0)}) — not checked here.`
+          : "No chain height available on this device, so the phone will not say which window is open.",
+      )}
+
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">VOTES HELD IN THIS ROOM</span>
+        ${badge("votes", votes.trust)}
+      </div>
+      ${row("Held here", `${votes.held}`)}
+      ${row("Yes · No", `${votes.yes} · ${votes.no}`)}
+      ${row("Abstain · Veto", `${votes.abstain} · ${votes.veto}`)}
+      ${row("Vote records held", `${votes.records}`)}
+      ${dim(esc(votes.note))}
+      ${dim(esc(votes.caveat))}
+      ${
+        votesPartial
+          ? dim(
+              "This room holds more vote records than were read for this screen, so these figures cover only part of what is here.",
+            )
+          : ""
+      }
+      ${
+        voteScan.refusedTooLarge + cpScan.refusedTooLarge > 0
+          ? dim(
+              `${voteScan.refusedTooLarge + cpScan.refusedTooLarge} record${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted here. That is this device's limit, not a fault in the records.`,
+            )
+          : ""
+      }
+      ${
+        // Reachability for the tally too. Without it the partial warning above
+        // told the player their figures were incomplete and gave them no way
+        // to see the rest — the same hole the list and the rounds had.
+        // TWO ranges, reported separately. These are different key spaces
+        // scanned to different depths, so one range against the larger of the
+        // two described neither: 8 votes plus 8 vote records rendered 16
+        // inputs while claiming "records 1–8 of 8".
+        pagerNeeded(voteScan, DETAIL_PAGE, treasuryVoteCursors) ||
+        pagerNeeded(cpScan, DETAIL_PAGE, treasuryCheckpointCursors)
+          ? `${dim(
+              `Votes: ${pageRange(voteScan, DETAIL_PAGE)}. Vote records: ${pageRange(cpScan, DETAIL_PAGE)}. Only these pages were read.`,
+            )}
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              ${
+                treasuryVoteCursors.length > 1 || treasuryCheckpointCursors.length > 1
+                  ? `<div data-treasury-action="votes-prev" role="button" tabindex="0" aria-label="Previous page of vote records"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                  : ""
+              }
+              ${
+                lastVoteNext !== null || lastCheckpointNext !== null
+                  ? `<div data-treasury-action="votes-next" role="button" tabindex="0" aria-label="Next page of vote records"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                  : ""
+              }
+            </div>`
+          : ""
+      }
+      ${
+        // A rejected record is still a record the room holds. Without this,
+        // a slot full of forgeries rendered as a flat "0 held" — absence
+        // presented as fact, about entries this screen had just thrown out.
+        voteScan.rejected + cpScan.rejected > 0
+          ? dim(
+              `${voteScan.rejected + cpScan.rejected} record${voteScan.rejected + cpScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of — wrong shape, wrong network, or a signature that did not check out — so ${voteScan.rejected + cpScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        // Whole-map, like the list's own line. Both vote key spaces folded
+        // into one figure because the player is being told the room holds
+        // junk under this proposal, not which prefix carried it.
+        voteScan.malformedKeys + cpScan.malformedKeys > 0
+          ? dim(
+              `${voteScan.malformedKeys + cpScan.malformedKeys} entr${voteScan.malformedKeys + cpScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any vote, so ${voteScan.malformedKeys + cpScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+            )
+          : ""
+      }
+      ${
+        voteScan.discoveryCutShort || cpScan.discoveryCutShort
+          ? dim(
+              "This room holds more entries than this device will search in one go, so there may be votes here that paging cannot reach.",
+            )
+          : ""
+      }
+
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">BOARD APPROVALS</span>
+        ${badge("approvals", approvals.trust)}
+      </div>
+      ${
+        approvals.sessions > 0
+          ? row(
+              "Gathered in one round",
+              // Never a bare figure when the set behind it was cut short: a
+              // partial count read as a complete one is the same invented
+              // certainty as reporting a held record as absent.
+              selectedRoundPartial
+                ? `at least ${approvals.collected} of ${approvals.required ?? "—"}`
+                : `${approvals.collected} of ${approvals.required ?? "—"}`,
+            ) +
+            (selectedRoundPartial
+              ? dim(
+                  "More approvals for this round are held here than this device would read, so the figure above is a floor, not a total.",
+                )
+              : "") +
+            (approvals.required !== null && !approvals.requiredFromPolicy
+              ? dim("The number needed comes from the round itself, not the company policy.")
+              : "")
+          : ""
+      }
+      ${dim(esc(approvals.note))}
+      ${
+        // Reachability, not just disclosure. Rounds are peer-writable, so
+        // without a way to page past planted ones the genuine round's progress
+        // could be hidden for good — the same hole the proposal list had.
+        pagerNeeded(sessionScan, DETAIL_PAGE, treasuryApprovalCursors)
+          ? `${dim(
+              `Showing rounds ${pageRange(sessionScan, DETAIL_PAGE)} held under this proposal's approval keys. Only this page was read.`,
+            )}
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              ${
+                treasuryApprovalCursors.length > 1
+                  ? `<div data-treasury-action="rounds-prev" role="button" tabindex="0" aria-label="Previous page of approval rounds"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                  : ""
+              }
+              ${
+                lastApprovalNext !== null
+                  ? `<div data-treasury-action="rounds-next" role="button" tabindex="0" aria-label="Next page of approval rounds"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                  : ""
+              }
+            </div>`
+          : ""
+      }
+      ${
+        sessionScan.refusedTooLarge > 0
+          ? dim(
+              `${sessionScan.refusedTooLarge} approval round${sessionScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${sessionScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted above. That is this device's limit, not a fault in the records.`,
+            )
+          : ""
+      }
+      ${
+        // Same rule as the votes panel: rounds this device rejected are still
+        // rounds the room holds, and "no approval round open" would deny them.
+        sessionScan.rejected > 0
+          ? dim(
+              `${sessionScan.rejected} approval round${sessionScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of, so ${sessionScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.malformedKeys > 0
+          ? dim(
+              `${sessionScan.malformedKeys} entr${sessionScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any approval round, so ${sessionScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.discoveryCutShort
+          ? dim(
+              "This room holds more entries than this device will search in one go, so there may be approval rounds here that paging cannot reach.",
+            )
+          : ""
+      }
+      ${
+        sessionScan.truncated
+          ? dim(
+              "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
+            )
+          : ""
+      }
+
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">WHAT IT WOULD DO</span>
+        ${badge("payload", payload.trust)}
+      </div>
+      <div style="font-size:11px; font-weight:800; color:${TREASURY_LABEL}; margin-top:5px;">${esc(payload.headline)}</div>
+      ${dim(esc(payload.detail))}`;
+    return;
+  }
+
+  // ── List screen ────────────────────────────────────────────────────────
+  // roomId, readable and scope come from above, so this branch and the detail
+  // branch always agree about whose company is on screen.
+  // bindingResult comes from above — one read, so the funding headline and the
+  // company scope can never disagree about whether a binding is here.
+  const binding = roomFundingView(
+    bindingResult?.status === "ok" ? bindingResult.binding : null,
+    height,
+    // Every held-but-unusable state travels, not just the size refusal: a
+    // binding this room HAS but this device will not or cannot read is never
+    // reported as there being none.
+    bindingResult && bindingResult.status !== "ok" && bindingResult.status !== "absent"
+      ? bindingResult.status
+      : access,
+  );
+  const balances = balanceView();
+  const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
+  // Bounded read: verifying every proposal in an unbounded, never-pruned map
+  // would let ordinary history — or a peer publishing many valid self-signed
+  // proposals — stall each repaint. One page at a time, and the page is
+  // honest about being one.
+  //
+  // Two budgets. LIST_SCAN counts ENTRIES TRAVERSED, not records kept, because
+  // the map is peer-writable and unpruned so unrelated keys must cost budget
+  // or they are free. LIST_CHECKS counts the entries actually VERIFIED, which
+  // is the expensive half and the one that decides how long a repaint blocks
+  // for; it also caps how many rows this screen can be made to render.
+  // LIST_SCAN is a runaway stop on the walk, deliberately far above any real
+  // room: a page-sized value there is a horizon, and paging cannot cross one.
+  const LIST_SCAN = 50_000;
+  // Paged by CURSOR, not merely capped and not by index. A cap alone let a
+  // peer bury every real proposal behind two dozen pieces of junk with no way
+  // to look past them; an index-based page then let the same peer prepend a
+  // page of keys after every "next", pushing the genuine record forward as
+  // fast as the reader advanced — see scanPrefixed.
+  let page = scanProposals(
+    LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
+  );
+  // A cursor cannot outrun the list, but records LEAVING can still put it past
+  // the end. Rewind on THAT — the cursor being past every matching key — and
+  // not on an empty page: `items` holds only ACCEPTED records, so a page whose
+  // entries were all rejected or refused is legitimately empty while its keys
+  // are still there. Rewinding on that let a peer plant one full invalid page
+  // in front of an honest proposal: "next" reached the bad page, this loop
+  // bounced straight back, and the honest page after it was unreachable —
+  // the censorship hole rebuilt inside the guard meant to prevent stranding.
+  while (page.startIndex >= page.matched && page.matched > 0 && treasuryListCursors.length > 1) {
+    treasuryListCursors.pop();
+    page = scanProposals(
+      LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
+    );
+  }
+  lastListNext = page.nextCursor;
+  const truncated = page.truncated;
+  const scoped = scopeProposals(page.items, scope.companyId);
+  const rows = proposalRows(
+    scoped.shown,
+    (p) => {
+      // Both slots report held-but-unreadable, exactly as the detail screen
+      // does — otherwise the same proposal reads NO DATA in the list and
+      // "a record is held" when opened.
+      const reg = readRegistrationResult(p.proposalId);
+      const win = readWindowsCacheResult(p.proposalId);
+      return windowsView(
+        p,
+        reg.status === "ok" ? reg.registration : null,
+        governanceRuleFor(p, policyCache?.policy ?? null),
+        win.status === "ok" ? win.windows : null,
+        reg.status === "unreadable",
+        win.status === "unreadable",
+      );
+    },
+    height,
+    heightSource,
+  );
+
+  view.innerHTML = `${verdictBanner}${backToVentures}
+
+    ${header("THIS ROOM")}
+    <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+      <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(binding.headline)}</span>
+      ${badge("funding", binding.trust)}
+    </div>
+    ${
+      binding.bound
+        ? row("Company", esc(shortId(binding.companyId ?? ""))) +
+          row("Treasury", esc(shortId(binding.treasuryId ?? ""))) +
+          row("Funding profile", esc(binding.profileId ?? "—")) +
+          row("Policy version", `${binding.policyVersion}`) +
+          row("Bound at", formatHeight(binding.boundAtHeight ?? 0)) +
+          (binding.expiresAfterHeight !== null
+            ? row("Ends at", formatHeight(binding.expiresAfterHeight))
+            : "")
+        : ""
+    }
+    ${dim(esc(binding.detail))}
+    ${binding.expiryNote ? dim(esc(binding.expiryNote)) : ""}
+    ${dim(esc(binding.readOnlyNote))}
+    ${dim(`Not shown yet: ${esc(binding.unavailable.join("; "))}.`)}
+
+    ${header("BALANCES")}
+    <div style="font-size:11px; font-weight:800; color:${TREASURY_LABEL}; margin-top:5px;">${esc(balances.headline)}</div>
+    ${dim(esc(balances.detail))}
+
+    ${header("COMPANY")}
+    ${
+      scope.warning
+        ? dim(esc(scope.warning))
+        : showPolicy
+        ? (() => {
+            const b = boardView(showPolicy.policy);
+            const classes = shareClassViews(
+              showPolicy.policy, CLASS_PAGE, treasuryClassOffset,
+            );
+            // The clamped value, so a policy that shrank under the offset
+            // leaves the reader on a real page rather than one press from
+            // nowhere. Read back rather than recomputed: the view already
+            // did the clamping and this must not disagree with it.
+            treasuryClassOffset = classes.startIndex;
+            return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
+                ${badge("board", b.trust)}
+              </div>
+              ${row("Policy version", `${b.policyVersion}`)}
+              ${row("Fee ceiling per spend", esc(b.maxFee))}
+              <div style="font-size:10px; color:${TREASURY_LABEL}; margin-top:5px;">Policy fingerprint</div>
+              <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against the chain">${esc(showPolicy.policyHash)}</div>
+              ${classes.items
+                .map((c) =>
+                  row(
+                    `Share class · ${esc(c.id)}`,
+                    `${c.votesPerWholeShare} vote${c.votesPerWholeShare === 1 ? "" : "s"} per share${c.grantsRoomAccess ? " · room access" : ""}`,
+                  ),
+                )
+                .join("")}
+              ${
+                classes.truncated
+                  ? `${dim(
+                      `Showing share classes ${classes.startIndex + 1}–${classes.startIndex + classes.items.length} of ${classes.total}. How many a policy declares is chosen by whoever wrote it.`,
+                    )}
+                    <div style="display:flex; gap:6px; margin-top:6px;">
+                      ${
+                        classes.startIndex > 0
+                          ? `<div data-treasury-action="classes-prev" role="button" tabindex="0" aria-label="Previous page of share classes"
+                               style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                          : ""
+                      }
+                      ${
+                        classes.hasMore
+                          ? `<div data-treasury-action="classes-next" role="button" tabindex="0" aria-label="Next page of share classes"
+                               style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                          : ""
+                      }
+                    </div>`
+                  : ""
+              }
+              ${dim(esc(b.note))}`;
+          })()
+        : // A badge here too. Every other cache-backed panel carries one, and
+          // this branch is where the panel is LEAST certain — an absent policy
+          // and one the device refused should not both be silent about how
+          // much checking happened.
+          (() => {
+            const held = policyStatus === "too-large" || policyStatus === "unreadable";
+            const tag = !readable
+              ? { ...trustTag("absent"), detail: "No lookup was possible, so nothing is known either way." }
+              : held
+                ? {
+                    ...trustTag("unverified"),
+                    label: "UNREAD",
+                    detail:
+                      policyStatus === "too-large"
+                        ? "A policy is held here, but this device would not read it: it is larger than this device is willing to process."
+                        : "A policy is held here, but this device could not make sense of it.",
+                  }
+                : trustTag("absent");
+            return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                <span style="font-size:11px; font-weight:800; color:#f0c060;">${
+                  !readable
+                    ? "Company details unavailable"
+                    : held
+                      ? "Company policy cannot be read"
+                      : "No company policy"
+                }</span>
+                ${badge("policy", tag)}
+              </div>
+              ${dim(
+                !readable
+                  ? "Company details cannot be read on this device, so nothing is known about the company either way."
+                  // A record this device declined to read is NOT an absent
+                  // record. The size cap is a local display decision, so a
+                  // policy that is perfectly valid on the wire can trip it —
+                  // and answering that with "none cached" would deny a policy
+                  // the room is holding.
+                  : policyStatus === "too-large"
+                    ? "A company policy is held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
+                    : policyStatus === "unreadable"
+                      ? "A company policy is held in this room, but this device cannot make sense of it — wrong shape, wrong network, or damaged."
+                      : "No company policy cached in this room yet.",
+              )}`;
+          })()
+    }
+
+    ${header(`PROPOSALS${rows.length ? ` · ${rows.length}` : ""}`)}
+    ${
+      rows.length
+        ? rows
+            .map(
+              (r) => `<div data-treasury-action="open" data-proposal-id="${esc(r.proposalId)}" role="button" tabindex="0"
+                aria-label="${esc(`${r.kindLabel}, policy version ${r.policyVersion}. ${r.phaseLabel}.${r.clockSourceLabel ? ` Clocks ${r.clockSourceLabel.toLowerCase()}.` : ""} ${r.clockTrust.label}: ${r.clockTrust.detail}`)}"
+                style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
+                <span style="min-width:0;">
+                  <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
+                  <span style="display:block; font-size:8.5px; color:${TREASURY_MUTED};">${esc(r.shortId)} · policy v${r.policyVersion}</span>
+                </span>
+                <span style="flex-shrink:0; font-size:9px; color:${TREASURY_LABEL}; text-align:right;">
+                  ${esc(r.phaseLabel)}<br />${badge(null, r.clockTrust)}
+                  ${
+                    // Both clock paths badge as UNVERIFIED — correctly, since
+                    // both rest on peer-written inputs. Without the source
+                    // beside it, a window copied wholesale from another player
+                    // read exactly like one worked out here.
+                    r.clockSourceLabel
+                      ? `<br /><span style="font-size:8px; color:${TREASURY_MUTED};">${esc(r.clockSourceLabel)}</span>`
+                      : ""
+                  }
+                </span>
+              </div>`,
+            )
+            .join("") +
+          dim(
+            heightSource === "peer-reported"
+              ? `Where each one sits on its clocks is worked out from a height another player reported (${formatHeight(height ?? 0)}) — this device has not checked it.`
+              : "This device has no chain height, so these are listed without saying which window each is in.",
+          )
+        : scoped.otherCompanies > 0
+          ? "" // records exist; the line below explains why none are listed
+          : dim(
+              !readable
+                ? "Proposals cannot be read on this device, so none can be listed — that is not the same as there being none."
+                : truncated
+                  ? // The scan stopped before the end of the map, so "none"
+                    // is a claim this screen cannot make.
+                    "No proposals were found in the part of this room's records that was read, and the rest was not looked at."
+                  : // PAGE-LOCAL counts, not `matched`. matched is every key
+                    // across every page, so a final page of rejects used to
+                    // claim that records shown perfectly well on earlier pages
+                    // were unreadable.
+                    page.rejected + page.refusedTooLarge > 0
+                    ? `No proposals could be listed on this page. ${page.rejected + page.refusedTooLarge} record${page.rejected + page.refusedTooLarge === 1 ? " here is" : "s here are"} held but could not be read.`
+                    : "No proposals in this room's records yet.",
+            )
+    }
+    ${
+      // Both counts, rendered independently and whether or not any row
+      // survived. Gating them on `rows.length > 0` hid them exactly when a
+      // page was all failures, and gating on the company filter hid them
+      // whenever the surviving rows belonged to another company — the two
+      // cases where the player most needs to know something was dropped.
+      page.refusedTooLarge > 0
+        ? dim(
+            `${page.refusedTooLarge} record${page.refusedTooLarge === 1 ? " on this page was" : "s on this page were"} too large for this device to read, so ${page.refusedTooLarge === 1 ? "it is" : "they are"} not listed. That is this device's limit, not a fault in the records.`,
+          )
+        : ""
+    }
+    ${
+      page.rejected > 0
+        ? dim(
+            `${page.rejected} record${page.rejected === 1 ? " on this page is" : "s on this page are"} held but could not be made sense of — wrong shape, wrong network, or a signature that did not check out — so ${page.rejected === 1 ? "it is" : "they are"} not listed.`,
+          )
+        : ""
+    }
+    ${
+      // Worded "in this room", not "on this page": unlike the two counts
+      // above, this one is found while walking the WHOLE map, and a map-wide
+      // figure under a page-local heading would be its own small dishonesty.
+      page.malformedKeys > 0
+        ? dim(
+            `${page.malformedKeys} entr${page.malformedKeys === 1 ? "y is" : "ies are"} filed in this room under a name too long to belong to any proposal, so ${page.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+          )
+        : ""
+    }
+    ${
+      // A different claim from "there is another page", and the stronger one:
+      // the search that BUILDS the pages stopped early, so paging cannot be
+      // relied on to reach what it missed. Said plainly rather than folded
+      // into the ordinary partial-list note, which would present a record
+      // nothing can reach as merely one that is further along.
+      page.discoveryCutShort
+        ? dim(
+            "This room holds more entries than this device will search in one go, so there may be proposals here that paging cannot reach.",
+          )
+        : ""
+    }
+    ${
+      // A way to actually reach what the page does not show. Without this the
+      // partial-list warning told the player their view was incomplete and
+      // offered them nothing to do about it — which is what made a small
+      // junk flood enough to hide every real proposal.
+      pagerNeeded(page, LIST_CHECKS, treasuryListCursors)
+        ? `${dim(
+            `Showing records ${pageRange(page, LIST_CHECKS)} held under this room's proposal keys. Only this page was read.`,
+          )}
+          <div style="display:flex; gap:6px; margin-top:6px;">
+            ${
+              // Neutral labels. Pages are ordered by record key, which is a
+              // content hash — so the previous page is not the earlier one in
+              // any sense a player would mean, and "EARLIER" implied a
+              // chronology this ordering does not have. Rows WITHIN a page are
+              // sorted by acceptance height; across pages there is no time
+              // order at all.
+              treasuryListCursors.length > 1
+                ? `<div data-treasury-action="page-prev" role="button" tabindex="0" aria-label="Previous page of proposals"
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                : ""
+            }
+            ${
+              lastListNext !== null
+                ? `<div data-treasury-action="page-next" role="button" tabindex="0" aria-label="Next page of proposals"
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                : ""
+            }
+          </div>`
+        : ""
+    }
+    ${
+      // Page-local, and said so. `scoped` is built from this page's items, so
+      // "held in this room" made a partial count sound like the room's total —
+      // and on a multi-page list it under-reports, which is the same shape of
+      // false certainty as the counts above.
+      scoped.scopeUnknown && scoped.otherCompanies > 0
+        ? dim(
+            `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? "" : "s"} on this page ${scoped.otherCompanies === 1 ? "is" : "are"} held without company details, so there is no way to tell whose ${scoped.otherCompanies === 1 ? "it is" : "they are"} and ${scoped.otherCompanies === 1 ? "it is" : "they are"} not listed.`,
+          )
+        : scoped.otherCompanies > 0
+          ? dim(
+              `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? "" : "s"} on this page belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
+            )
+          : ""
+    }
+    ${
+      truncated
+        ? dim(
+            "This room holds more records than were read for this screen, so the list is partial and in no particular order.",
+          )
+        : ""
+    }
+
+    <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+      <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">CHAIN VIEW</span>
+      ${badge("sync", sync.trust)}
+    </div>
+    ${
+      // WHICH network these records are pinned to, named on the one panel
+      // that is about chain trust. `label` was documented as player-facing
+      // and configured through VITE_SSF_TREASURY_NETWORK, but nothing read
+      // it — so the option changed nothing a player could see, and a build
+      // pinned to a test network looked exactly like one pinned to the real
+      // one. For a screen about money that is the distinction most worth
+      // showing. The unconfigured case keeps its fuller explanation in the
+      // banner above and is not repeated here.
+      net.configured ? row("Records pinned to", esc(net.label)) : ""
+    }
+    ${row("This device", "not verifying")}
+    ${
+      !sync.readable
+        ? row("Another player reports", "not read")
+        : sync.peerClaim
+          ? row(
+              "Another player reports",
+              `${esc(sync.peerClaim)}${sync.peerHeight !== null ? ` · ${formatHeight(sync.peerHeight)}` : ""}`,
+            )
+          // "nothing" only when the slot is genuinely empty. A held-but-
+          // unreadable claim gets its own wording, or this row would flatly
+          // contradict the UNREAD badge the panel just rendered.
+          : syncResult?.status === "unreadable"
+            ? row("Another player reports", "something unreadable")
+            : row("Another player reports", "nothing")
+    }
+    ${dim("Reports from other players are shown as claims only — your own node's view is what will decide, once that lane ships.")}`;
+}
+
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
 // Screen 1: YOUR STAKES (every entity you hold shares in) + REAL ESTATE (every
 // module you personally own — the deeds ledger). Screen 2a: venture detail —
@@ -3991,6 +5264,12 @@ function renderVenturesApp(): void {
     ${redeemBlock}
     ${foundBlock}
     ${addBlock}
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">COMPANY</div>
+    <div data-phone-app="treasury" role="button" tabindex="0" aria-label="Open the company Treasury"
+      style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:8px 10px; border:1px solid rgba(212,168,75,0.25); border-radius:6px; cursor:pointer;">
+      <span style="font-size:10px; font-weight:700; color:#f0c060;">🏦 TREASURY</span>
+      <span style="font-size:9px; color:${TREASURY_MUTED};">board · proposals · funding ›</span>
+    </div>
   `;
 }
 const CHARTER_TOTAL_SHARES_LABEL = 100;
@@ -4210,6 +5489,7 @@ function setupSpacePhoneOverlay() {
     | "bank"
     | "access"
     | "ventures"
+    | "treasury"
     | "settings"
     | "setnet"
     | "setstats";
@@ -4247,6 +5527,11 @@ function setupSpacePhoneOverlay() {
       title: "🚀 VENTURES",
       subtitle: "Charters · Shares · Real Estate",
     },
+    treasury: {
+      elId: "phone-app-treasury",
+      title: "🏦 TREASURY",
+      subtitle: "Company · Board · Proposals",
+    },
     settings: {
       elId: "phone-app-settings",
       title: "⚙️ SETTINGS",
@@ -4267,6 +5552,8 @@ function setupSpacePhoneOverlay() {
   const phoneViewParent: Partial<Record<PhoneViewId, PhoneViewId>> = {
     setnet: "settings",
     setstats: "settings",
+    // 🏦 The treasury opens from VENTURES (plan §11), so BACK returns there.
+    treasury: "ventures",
   };
 
   // 📦 De-overlay (owner request): the Network Details, stats and room-info
@@ -4377,21 +5664,77 @@ function setupSpacePhoneOverlay() {
       renderVenturesApp();
     }
     if (id === "bank") renderBankApp();
+    if (id === "treasury") {
+      treasuryDetailId = "";
+      renderTreasuryApp();
+      // Land focus in the view so its arrow-key traversal is reachable
+      // without a pointer (Tab is the app's phone toggle, not a tab stop).
+      const tv = document.getElementById("phone-app-treasury");
+      if (tv) {
+        tv.setAttribute("tabindex", "-1");
+        tv.focus({ preventScroll: true });
+      }
+    }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
   };
 
-  // App tiles on the home screen route into their views
-  document
-    .querySelectorAll<HTMLButtonElement>(".phone-app-tile")
-    .forEach((tile) => {
-      tile.addEventListener("click", () => {
-        const target = tile.dataset.phoneApp as PhoneViewId | undefined;
-        if (target && target in phoneViewMeta) {
-          showPhoneView(target);
-        }
-      });
-    });
+  // App tiles on the home screen route into their views. Delegated from the
+  // phone shell rather than bound per tile, so links rendered INSIDE an app
+  // (VENTURES → 🏦 TREASURY) survive that app's innerHTML repaints.
+  const phoneShell = document.getElementById("phone-screen") ?? document;
+  const routeFrom = (target: EventTarget | null): boolean => {
+    const el = (target as HTMLElement | null)?.closest<HTMLElement>(
+      "[data-phone-app]",
+    );
+    const id = el?.dataset.phoneApp as PhoneViewId | undefined;
+    if (!id || !(id in phoneViewMeta)) return false;
+    showPhoneView(id);
+    return true;
+  };
+  /**
+   * The control outside the phone that opened it, if any.
+   *
+   * The phone is only slid offscreen, never display:none, so focus left inside
+   * it stays live and keeps answering arrow keys against rows nobody can see.
+   * A keyboard player who reached TREASURY from the room terminal would then
+   * have no way back to the terminal.
+   */
+  let phoneOpener: HTMLElement | null = null;
+  const releasePhoneOpener = (): void => {
+    const opener = phoneOpener;
+    phoneOpener = null;
+    // Only if it is still in the document and still focusable: the terminal
+    // panel is torn down on unmount, and focusing a detached node silently
+    // sends focus to <body> instead.
+    if (opener?.isConnected) opener.focus({ preventScroll: true });
+  };
+  // 🏦 Cross-surface entry point, same posture as __ssfRoomId: the room
+  // terminal's FUNDING panel is mounted outside the phone shell, so it cannot
+  // use the delegated router. It opens the phone straight to TREASURY.
+  (
+    window as unknown as { __ssfOpenTreasury?: () => void }
+  ).__ssfOpenTreasury = () => {
+    // Remember who sent us here, so closing the phone can hand focus back.
+    // Only for openers OUTSIDE the phone: a control within it is about to be
+    // hidden anyway, and would be a worse place to land than the game.
+    const opener = document.activeElement as HTMLElement | null;
+    phoneOpener = opener && !phoneShell.contains(opener) ? opener : null;
+    // Quick chat first. It leaves the phone in `peek`, and `.peek` is declared
+    // after `.active` at equal specificity, so adding `active` alone left the
+    // phone at bottom:-386px — mostly offscreen — and this link appeared to do
+    // nothing. Closing it also returns the chat form to its home slot, which
+    // is what the Tab handler does on the same transition.
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView("treasury");
+  };
+  phoneShell.addEventListener("click", (e) => routeFrom(e.target));
+  phoneShell.addEventListener("keydown", (e) => {
+    const ev = e as KeyboardEvent;
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    if (routeFrom(ev.target)) ev.preventDefault();
+  });
 
   if (backBtn) {
     backBtn.addEventListener("click", () => {
@@ -4526,6 +5869,12 @@ function setupSpacePhoneOverlay() {
           logToPhoneSystem("Entering SpacePhone net...");
         } else {
           chatInput?.blur();
+          // Hand focus back to whatever opened the phone from outside it. The
+          // phone is only moved offscreen, never display:none, so a control
+          // left focused inside it keeps answering the arrow keys against
+          // hidden rows — a keyboard player who opened TREASURY from the room
+          // terminal could not get back to the terminal at all.
+          releasePhoneOpener();
         }
       }
     }
