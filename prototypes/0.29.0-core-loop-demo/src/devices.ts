@@ -67,6 +67,7 @@ import type { SolitaireMove, SolitaireState } from './games/solitaire';
 import {
   initialPokerState, beginPoker, applyPokerAction, callAmount, legalActions,
   minBet, minRaiseTo, nextHand, chooseBotAction, readVisiblePokerState,
+  pokerForfeit as pokerForfeitState,
 } from './games/poker';
 import type { PokerSeat, PokerState } from './games/poker';
 import {
@@ -1572,28 +1573,20 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     // In poker, "forfeit" means concede the current hand (fold if you can);
     // if the hand isn't yours to act, this is a no-op (the button already
     // handles that case via the FOLD action). This exists so a player who
-    // rage-quits during a bot game can end the match cleanly.
+    // rage-quits during a bot game can end the match cleanly. The transition
+    // itself is a pure function in `games/poker.ts` (`pokerForfeitState`):
+    //   · awards the live pot to the opponent (fold-equivalent) — the
+    //     previous inline implementation forgot this step and left SB+BB
+    //     chips stranded in the terminal state (audit finding #3),
+    //   · transfers residual stack to the opponent,
+    //   · sets match-over/complete and records `lastShowdown`.
+    // Idempotent on non-playing states so a doc race between two writers
+    // still converges cleanly via LWW.
     const t = readTable(deps.itemId);
     if (!t || t.kind !== 'poker' || t.state.status !== 'playing') return;
     const seat = myPokerSeat(t.state);
     if (!seat) return;
-    // Zero-out this player's stack — engine's `dealHand`/`endHand` sees the
-    // 0-stack and flips to match-over cleanly.
-    const other = seat === 'button' ? 'bigBlind' : 'button';
-    const players = {
-      button: { ...t.state.players.button },
-      bigBlind: { ...t.state.players.bigBlind },
-    };
-    // Award all my remaining stack to opponent and zero mine.
-    players[other].stack += players[seat].stack;
-    players[seat].stack = 0;
-    writeGame(deps.itemId, {
-      ...t.state,
-      players,
-      status: 'match-over',
-      toAct: null,
-      street: 'complete',
-    });
+    writeGame(deps.itemId, pokerForfeitState(t.state, seat));
   };
 
   const doPokerAction = (kind: 'fold' | 'check' | 'call' | 'bet' | 'raise'): void => {

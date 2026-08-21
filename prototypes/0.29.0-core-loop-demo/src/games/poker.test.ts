@@ -7,8 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { cardOf } from './cards';
 import {
   applyPokerAction, beginPoker, callAmount, chooseBotAction, compareHands,
-  evaluate5, evaluate7, evaluateBest, initialPokerState, isPokerState,
-  legalActions, nextHand, readVisiblePokerState,
+  dealHand, evaluate5, evaluate7, evaluateBest, initialPokerState,
+  isPokerState, legalActions, nextHand, pokerForfeit,
+  readVisiblePokerState,
 } from './poker';
 import type { PokerState } from './poker';
 
@@ -506,5 +507,302 @@ describe('poker: determinism', () => {
     expect(a.players.button.holeCards).toEqual(b.players.button.holeCards);
     expect(a.players.bigBlind.holeCards).toEqual(b.players.bigBlind.holeCards);
     expect(a.deck).toEqual(b.deck);
+  });
+});
+
+// ── Round-2 audit regressions (MAJOR / MAJOR / MINOR) ───────────────────────
+
+describe('poker: chooseBotAction never emits an action applyPokerAction will reject', () => {
+  // Round-2 audit finding #1 (MAJOR). Before this fix the bot unconditionally
+  // returned `kind: 'bet'` when `canCheck` was true — but the canonical case
+  // for `canCheck` in the BB seat preflop is "the button already limped, so my
+  // streetBet (=BB=10) matches the standing bet (=10)". The 'bet' handler
+  // rejects when currentBet !== 0 ("must raise instead"), the bot pump then
+  // re-fires the same rejected action every 0.9s, and the whole hand freezes
+  // in the doc with no UI signal (only RESET recovers). Triggered by any pair
+  // 66+ or AKs (holeStrength ≥ 0.65) preflop after a button-call, which
+  // happens within a handful of hands. The bot must instead emit an action
+  // the state machine actually accepts.
+  it('BB with a strong pair does not emit rejected bet after a button-limp preflop', () => {
+    // Deterministic in-progress preflop state: BB posted 10, button called
+    // to match (streetBet 10 each, currentBet 10, callAmount(BB) = 0, so the
+    // bot's canCheck path fires). Give BB a pocket queen (strength ≥ 0.65).
+    const s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'preflop',
+      players: {
+        button: {
+          id: 'A', stack: 990, streetBet: 10, handBet: 10,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: false,
+        },
+        bigBlind: {
+          id: null, stack: 990, streetBet: 10, handBet: 10,
+          holeCards: [c(2, 12), c(3, 12)], folded: false, allIn: false, // QQ
+        },
+      },
+      community: [],
+      toAct: 'bigBlind',
+      currentBet: 10,
+      minRaise: 10,
+      pot: 20,
+      deck: [c(0, 2), c(0, 3), c(0, 4), c(0, 5), c(0, 6), c(0, 7), c(0, 8), c(0, 9)],
+      actions: [{ seat: 'button', kind: 'call', amount: 5, street: 'preflop' }],
+      bot: true,
+    };
+    expect(isPokerState(s)).toBe(true);
+    const action = chooseBotAction(s, 'bigBlind');
+    expect(action).not.toBeNull();
+    // A raise is the correct action here. Critically: the action must NOT be
+    // rejected by applyPokerAction (which is how the pre-fix deadlock
+    // presented — same input in and same input out, forever).
+    expect(action?.kind).not.toBe('bet'); // 'bet' would be rejected here
+    const next = applyPokerAction(s, action!);
+    expect(next).not.toBe(s); // action was accepted → state advanced
+  });
+
+  it('takes the free check when the opponent is already all-in', () => {
+    // Extension of the fix (see chooseBotAction opponentCanRespond gate): an
+    // opponent who is all-in or folded can't call a raise, so a raise into
+    // them just piles chips into an uncontested pot. The bot should check.
+    const s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'flop',
+      players: {
+        button: {
+          id: 'A', stack: 0, streetBet: 0, handBet: 30,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: true, // all-in
+        },
+        bigBlind: {
+          id: null, stack: 970, streetBet: 0, handBet: 30,
+          holeCards: [c(2, 12), c(3, 12)], folded: false, allIn: false, // QQ
+        },
+      },
+      community: [c(0, 14), c(1, 5), c(3, 2)],
+      toAct: 'bigBlind',
+      currentBet: 0,
+      minRaise: 10,
+      pot: 60,
+      deck: [c(0, 6), c(0, 7)],
+      actions: [],
+      bot: true,
+    };
+    expect(isPokerState(s)).toBe(true);
+    const action = chooseBotAction(s, 'bigBlind');
+    // Free-check: the bot must not pump chips into an uncontestable pot.
+    expect(action?.kind).toBe('check');
+  });
+});
+
+describe('poker: dealHand handles all-in-from-blinds without deadlocking', () => {
+  // Round-2 audit finding #2 (MAJOR). Before this fix, `dealHand` capped SB/BB
+  // at each poster's stack and marked them `allIn = true` when the stack hit
+  // zero — then unconditionally set `toAct: 'button'`. If button.stack ≤ SB,
+  // button is all-in from posting but toAct=button; applyPokerAction's
+  // `if (p.allIn) return state` guard silently rejects every action they
+  // attempt, and the opposite seat never gets a turn — hand freezes, RESET
+  // only. Reachable via natural chip-bleed over a long match. legalActions
+  // still returned ['fold','check'/'call'] so the UI showed enabled buttons
+  // that no-op'd.
+  it('button.stack <= smallBlind: button goes all-in, toAct passes to bigBlind', () => {
+    const s0: PokerState = {
+      ...beginPoker(initialPokerState(1), {
+        button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+      }),
+    };
+    // Force the drained scenario at a fresh hand seam. `handsPlayed = 0`
+    // keeps the SB seat = button (no rotation).
+    const drained: PokerState = {
+      ...s0,
+      players: {
+        button: { ...s0.players.button, stack: 3, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        bigBlind: { ...s0.players.bigBlind, stack: 1000, streetBet: 0, handBet: 0, folded: false, allIn: false },
+      },
+      status: 'hand-over',
+      handsPlayed: 0,
+    };
+    const dealt = dealHand(drained);
+    // Post-fix expectations:
+    expect(dealt.status).toBe('playing');
+    expect(dealt.players.button.allIn).toBe(true);    // all-in from SB
+    expect(dealt.players.button.stack).toBe(0);
+    expect(dealt.players.bigBlind.allIn).toBe(false); // still has stack
+    // toAct is bigBlind (they hold the fold-or-continue decision).
+    expect(dealt.toAct).toBe('bigBlind');
+    // currentBet is max(sb, bb) = 10 (BB is still the standing bet).
+    expect(dealt.currentBet).toBe(10);
+  });
+
+  it('deadlocked-case: bigBlind can now advance the hand end-to-end', () => {
+    // Drive the fix through to terminal state — the pre-fix hang manifested
+    // here (every action from any seat rejected).
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const drained: PokerState = {
+      ...s0,
+      players: {
+        button: { ...s0.players.button, stack: 3, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        bigBlind: { ...s0.players.bigBlind, stack: 1000, streetBet: 0, handBet: 0, folded: false, allIn: false },
+      },
+      status: 'hand-over',
+      handsPlayed: 0,
+    };
+    let dealt = dealHand(drained);
+    // A single check from BB must close the street (opponent-can-act gate)
+    // and cascade through the community deal to terminal state.
+    dealt = applyPokerAction(dealt, { seat: 'bigBlind', kind: 'check' });
+    expect(['hand-over', 'match-over']).toContain(dealt.status);
+    expect(dealt.street).toBe('complete');
+    expect(dealt.community.length).toBe(5); // ran all community cards
+    expect(dealt.lastShowdown).not.toBeNull();
+  });
+
+  it('bigBlind.stack <= bigBlind: BB all-in from BB, button can still act', () => {
+    // Symmetric edge: BB is drained, button has stack. `toAct` stays on
+    // button (default heads-up rule); the opponent-can-act gate closes the
+    // street after button's check so the hand runs out.
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const drained: PokerState = {
+      ...s0,
+      players: {
+        button: { ...s0.players.button, stack: 1000, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        bigBlind: { ...s0.players.bigBlind, stack: 5, streetBet: 0, handBet: 0, folded: false, allIn: false },
+      },
+      status: 'hand-over',
+      handsPlayed: 0,
+    };
+    let dealt = dealHand(drained);
+    expect(dealt.players.bigBlind.allIn).toBe(true);
+    expect(dealt.players.bigBlind.stack).toBe(0);
+    expect(dealt.toAct).toBe('button');
+    // callAmount(button) = 0 (both posted 5), so a check is legal.
+    dealt = applyPokerAction(dealt, { seat: 'button', kind: 'check' });
+    expect(['hand-over', 'match-over']).toContain(dealt.status);
+    expect(dealt.street).toBe('complete');
+    expect(dealt.community.length).toBe(5);
+  });
+
+  it('both all-in from blinds: hand runs directly to showdown', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const drained: PokerState = {
+      ...s0,
+      players: {
+        button: { ...s0.players.button, stack: 3, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        bigBlind: { ...s0.players.bigBlind, stack: 5, streetBet: 0, handBet: 0, folded: false, allIn: false },
+      },
+      status: 'hand-over',
+      handsPlayed: 0,
+    };
+    const dealt = dealHand(drained);
+    expect(dealt.players.button.allIn).toBe(true);
+    expect(dealt.players.bigBlind.allIn).toBe(true);
+    expect(['hand-over', 'match-over']).toContain(dealt.status);
+    expect(dealt.street).toBe('complete');
+    expect(dealt.community.length).toBe(5);
+    // Chips conserved: 3 + 5 = 8 total across both stacks post-showdown.
+    expect(dealt.players.button.stack + dealt.players.bigBlind.stack).toBe(8);
+  });
+
+  it('shape guard still accepts every dealt corner-case state', () => {
+    // Round-2 audit callout: dealt state must still validate — otherwise a
+    // peer receiving it via LWW would reject the read.
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    for (const [buttonStack, bigBlindStack] of [
+      [3, 1000], [1000, 5], [3, 5], [8, 1000], [1000, 8],
+    ] as const) {
+      const drained: PokerState = {
+        ...s0,
+        players: {
+          button: { ...s0.players.button, stack: buttonStack, streetBet: 0, handBet: 0, folded: false, allIn: false },
+          bigBlind: { ...s0.players.bigBlind, stack: bigBlindStack, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        },
+        status: 'hand-over',
+        handsPlayed: 0,
+      };
+      const dealt = dealHand(drained);
+      expect(isPokerState(dealt)).toBe(true);
+    }
+  });
+});
+
+describe('poker: pokerForfeit awards the pot as well as the residual stack', () => {
+  // Round-2 audit finding #3 (MINOR). The old inline forfeit in devices.ts
+  // moved the forfeiter's remaining stack to the opponent and set
+  // match-over, but never awarded `state.pot`. A mid-hand rage-quit therefore
+  // left the SB+BB (≥ 15 chips) orphaned in the terminal state — the recap
+  // announced the winner "takes the stack" while the pot chips sat
+  // unaccounted for. Correct escape hatch: award the pot first (as if the
+  // forfeiter folded), then transfer the residual stack.
+  it('mid-hand forfeit: opponent receives BOTH the pot and the residual stack', () => {
+    // Fresh deal — button posts SB=5, BB posts 10, pot=15.
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const buttonStackBefore = s0.players.button.stack; // 995 after SB
+    const bigBlindStackBefore = s0.players.bigBlind.stack; // 990 after BB
+    const potBefore = s0.pot; // 15
+    expect(potBefore).toBeGreaterThanOrEqual(15);
+    const forfeited = pokerForfeit(s0, 'button');
+    expect(forfeited.status).toBe('match-over');
+    expect(forfeited.street).toBe('complete');
+    expect(forfeited.toAct).toBeNull();
+    // Chip conservation across the transition — every chip on the table
+    // must live either in the winner's stack or (transiently) in state.pot.
+    expect(forfeited.pot).toBe(0);
+    // Opponent receives: their prior stack + the pot + the forfeiter's stack.
+    expect(forfeited.players.bigBlind.stack).toBe(
+      bigBlindStackBefore + potBefore + buttonStackBefore,
+    );
+    expect(forfeited.players.button.stack).toBe(0);
+    // Recap reports the opponent as the winner of the abandoned pot.
+    expect(forfeited.lastShowdown?.winner).toBe('bigBlind');
+    expect(forfeited.lastShowdown?.pot).toBe(potBefore);
+    // Terminal state still passes the shape guard.
+    expect(isPokerState(forfeited)).toBe(true);
+  });
+
+  it('chip conservation over a forfeit round-trip', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 250, bot: false,
+    });
+    const totalBefore = s0.players.button.stack + s0.players.bigBlind.stack + s0.pot;
+    const forfeited = pokerForfeit(s0, 'button');
+    const totalAfter = forfeited.players.button.stack + forfeited.players.bigBlind.stack + forfeited.pot;
+    expect(totalAfter).toBe(totalBefore); // no chips stranded, no chips minted
+  });
+
+  it('forfeit by the bigBlind seat mirrors the button case', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 400, bot: false,
+    });
+    const buttonBefore = s0.players.button.stack;
+    const bigBlindBefore = s0.players.bigBlind.stack;
+    const potBefore = s0.pot;
+    const forfeited = pokerForfeit(s0, 'bigBlind');
+    expect(forfeited.lastShowdown?.winner).toBe('button');
+    expect(forfeited.players.button.stack).toBe(
+      buttonBefore + potBefore + bigBlindBefore,
+    );
+    expect(forfeited.players.bigBlind.stack).toBe(0);
+    expect(forfeited.pot).toBe(0);
+  });
+
+  it('idempotent on non-playing state (LWW-safe against double writers)', () => {
+    // Two peers each fire forfeit — the loser under LWW writes the same
+    // terminal state, so double-crediting stacks would corrupt chip totals.
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 500, bot: false,
+    });
+    const once = pokerForfeit(s0, 'button');
+    const twice = pokerForfeit(once, 'button'); // status !== 'playing' now
+    expect(twice).toBe(once); // untouched — no double credit
   });
 });

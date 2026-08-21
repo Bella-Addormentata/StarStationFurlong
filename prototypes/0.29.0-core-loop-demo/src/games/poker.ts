@@ -237,19 +237,57 @@ export function dealHand(state: PokerState): PokerState {
   bigBlind.handBet = bb;
   if (bigBlind.stack === 0) bigBlind.allIn = true;
 
-  return {
+  // Post-blind current-bet normalization.
+  //   The canonical case sets `currentBet = bb` (BB posted the higher blind).
+  //   But when the BB seat's stack is smaller than the small blind (natural
+  //   chip-bleed across many hands), `bb = min(BB, stack) < sb`, so the
+  //   SB-poster's streetBet exceeds the standing bet — using bare `bb` here
+  //   would leave callAmount computations underwater. Use the max of both
+  //   posted amounts to keep `currentBet` = highest street bet, which is
+  //   how every downstream rule (callAmount, legalActions, minRaiseTo)
+  //   interprets it.
+  const initialCurrentBet = Math.max(sb, bb);
+
+  // toAct selection when a poster went all-in from the blinds.
+  //   Default heads-up rule: BUTTON acts first preflop.
+  //   Corner cases (audit finding #2 — natural chip-bleed produces stacks
+  //   ≤ blinds; before this fix the engine set `toAct: 'button'`
+  //   unconditionally, then applyPokerAction's `if (p.allIn) return state`
+  //   guard rejected every action the all-in poster attempted, and no seat
+  //   could ever move the doc — RESET was the only recovery):
+  //     · button all-in from SB + BB has chips → toAct = 'bigBlind' (they
+  //       still hold the fold-or-continue decision; a check on their turn
+  //       cascades through the streets via advanceAfterAction's
+  //       opponent-can-act check).
+  //     · BB all-in from BB + button has chips → toAct = 'button' (they
+  //       still hold the fold-or-continue decision).
+  //     · Both all-in from blinds → toAct = null and run the streets to
+  //       showdown immediately (same recursion openNextStreet uses for the
+  //       both-in-during-play path).
+  const buttonAllInFromPost = button.allIn;
+  const bigBlindAllInFromPost = bigBlind.allIn;
+  let toAct: PokerSeat | null;
+  if (buttonAllInFromPost && bigBlindAllInFromPost) toAct = null;
+  else if (buttonAllInFromPost) toAct = 'bigBlind';
+  else toAct = 'button'; // default (also correct when only BB is all-in)
+
+  const dealt: PokerState = {
     ...state,
     players: { button, bigBlind },
     status: 'playing',
     street: 'preflop',
     community: [],
-    toAct: 'button', // heads-up special: BUTTON acts first preflop
-    currentBet: bb,
+    toAct,
+    currentBet: initialCurrentBet,
     minRaise: state.bigBlind,
     pot: sb + bb,
     deck: afterDeal,
     actions: [],
   };
+
+  // Both posted all-in → no action possible; run community out to showdown.
+  if (buttonAllInFromPost && bigBlindAllInFromPost) return openNextStreet(dealt);
+  return dealt;
 }
 
 // ── Legal action helpers ─────────────────────────────────────────────────────
@@ -431,12 +469,29 @@ function advanceAfterAction(
     && matched
     && streetActions.filter((a) => a.seat === 'bigBlind').every((a) => a.kind === 'check');
 
+  // Opponent-can-act gate (audit finding #2 hardening).
+  //   If the opponent (the seat opposite the actor) can no longer legally
+  //   act — because they're already all-in (posted blinds fully or shoved
+  //   earlier) or folded — then passing them the action would just re-hit
+  //   applyPokerAction's `if (p.allIn || p.folded) return state` guard and
+  //   the doc would freeze at this state (no seat can move it, RESET only).
+  //   In that case we close the street unconditionally: openNextStreet
+  //   deals the next community and, when the all-in survivor still has no
+  //   opponent capable of a call/raise, recurses through to showdown so
+  //   the pot resolves cleanly. Refunds of an over-committed bet are not
+  //   modelled here (heads-up no-side-pot demo scope; see the same
+  //   simplification called out in the interface comment on `pot`).
+  const opponent = state.players[otherSeat(actor)];
+  const opponentCanAct = !opponent.allIn && !opponent.folded;
+
   // Continue-in-street condition (pass to other seat):
   //  - amounts not matched (opponent still needs to call/raise/fold),
   //  - or bothActed=false (someone hasn't spoken yet — e.g. button raise preflop
   //    means big blind hasn't acted yet since the raise),
   //  - or preflop limp waiting for BB option.
-  const streetOpen = !matched || !bothActed || (preflopLimp && !hasBigBlindOption(state));
+  //  AND opponent must still be able to act (else close the street).
+  const streetOpen = opponentCanAct
+    && (!matched || !bothActed || (preflopLimp && !hasBigBlindOption(state)));
 
   if (streetOpen) {
     return { ...state, toAct: otherSeat(actor) };
@@ -470,8 +525,19 @@ function openNextStreet(state: PokerState): PokerState {
   // Deal community cards for the newly opened street.
   const [community, deck] = dealCommunity(state.deck, state.community, nextStreet);
 
-  // If both players are all-in, run remaining streets and go to showdown.
-  const bothAllIn = players.button.allIn && players.bigBlind.allIn;
+  // Auto-run condition: if either player is all-in, no voluntary action can
+  // change the outcome any more (the all-in seat can't call further, and the
+  // other seat has no one to bet into — heads-up has no side pots by design;
+  // see the interface comment on `pot`). Recurse through remaining streets
+  // to showdown so the pot resolves in one write. Previously this recursed
+  // only when BOTH were all-in — the audit's finding #2 hardening extends it
+  // to the one-all-in case so the doc doesn't sit on a "playing" state where
+  // the non-all-in seat's only sensible action is a series of checks.
+  //
+  // A folded player short-circuits earlier via `awardUncontested`, so
+  // openNextStreet is never entered with a folded seat — the check on
+  // `allIn` alone is sufficient here.
+  const oneOrBothAllIn = players.button.allIn || players.bigBlind.allIn;
 
   const nextState: PokerState = {
     ...state,
@@ -481,9 +547,9 @@ function openNextStreet(state: PokerState): PokerState {
     deck,
     currentBet: 0,
     minRaise: state.bigBlind,
-    toAct: bothAllIn ? null : 'bigBlind', // heads-up: BB acts first postflop
+    toAct: oneOrBothAllIn ? null : 'bigBlind', // heads-up: BB acts first postflop
   };
-  if (bothAllIn) return openNextStreet(nextState); // recurse to showdown
+  if (oneOrBothAllIn) return openNextStreet(nextState); // recurse to showdown
   return nextState;
 }
 
@@ -576,6 +642,52 @@ function endHand(state: PokerState): PokerState {
 export function nextHand(state: PokerState, seed: number): PokerState {
   if (state.status !== 'hand-over') return state;
   return dealHand({ ...state, seed: seed | 0 || (state.seed + 1) | 0 });
+}
+
+/**
+ * Rage-quit escape hatch — the seated player at `forfeiter` concedes the
+ * whole match to their opponent. Standard-poker semantics for a mid-hand
+ * concession:
+ *   1. Any live pot is awarded to the opponent (as if the forfeiter folded
+ *      first). Without this step the pot's chips would sit orphaned in the
+ *      terminal state — the old `pokerForfeit` in devices.ts only transferred
+ *      the residual STACK to the opponent and left `state.pot` untouched, so
+ *      SB+BB (≥15) at forfeit time silently disappeared from the accounting
+ *      (audit finding #3).
+ *   2. The forfeiter's residual stack transfers to the opponent (they cannot
+ *      cash it out — they've quit the match).
+ *   3. `status = 'match-over'`, `street = 'complete'`, `toAct = null`, and
+ *      `lastShowdown` records the concession as a fold-off (so the recap
+ *      shows the opponent taking the pot).
+ * Idempotent when `status !== 'playing'`: returns the input untouched (so
+ * two concurrent doc writers converge on the same terminal state via LWW
+ * instead of double-crediting stacks).
+ */
+export function pokerForfeit(state: PokerState, forfeiter: PokerSeat): PokerState {
+  if (state.status !== 'playing') return state;
+  const winner = otherSeat(forfeiter);
+  const players = clonePlayers(state.players);
+  const conceded = state.pot;
+  const residual = players[forfeiter].stack;
+  // Award the pot first (fold-equivalent), then transfer the residual stack.
+  players[winner].stack += conceded;
+  players[winner].stack += residual;
+  players[forfeiter].stack = 0;
+  const lastShowdown: PokerShowdown = {
+    buttonHand: null,
+    bigBlindHand: null,
+    winner,
+    pot: conceded,
+  };
+  return {
+    ...state,
+    players,
+    pot: 0,
+    status: 'match-over',
+    street: 'complete',
+    toAct: null,
+    lastShowdown,
+  };
 }
 
 export function otherSeat(s: PokerSeat): PokerSeat {
@@ -807,14 +919,39 @@ export function chooseBotAction(state: PokerState, seat: PokerSeat): PokerAction
   const strength = holeStrength(p.holeCards, state.community);
   const toCall = callAmount(state, seat);
   const canCheck = toCall === 0;
+  const opponent = state.players[otherSeat(seat)];
+  const opponentCanRespond = !opponent.allIn && !opponent.folded;
 
   // Fold gate: weak hand and non-trivial bet.
   const potOdds = state.pot === 0 ? 0 : toCall / (state.pot + toCall);
   if (!canCheck && strength < 0.35 && potOdds > 0.25) return { seat, kind: 'fold' };
   if (canCheck && strength < 0.65) return { seat, kind: 'check' };
+  // Opponent already all-in (posted-blind edge or shove earlier) or folded
+  // has no way to call a bet or raise — any additional chips just get stuck
+  // in the pot with no meaningful contest. Take the free-showdown check so
+  // the bot doesn't leak equity into an uncontestable pot.
+  if (canCheck && !opponentCanRespond) return { seat, kind: 'check' };
   if (canCheck) {
-    const amount = Math.min(p.stack, minBet(state));
-    return { seat, kind: 'bet', amount };
+    // Two distinct sub-cases share `canCheck` (toCall === 0):
+    //   (a) `currentBet === 0`  → street is unopened, legal action is 'bet'.
+    //   (b) `currentBet !== 0`  → someone matched the standing bet on this
+    //       street (canonical case: preflop BB after a button-limp — the BB
+    //       posted 10, button called for 10, BB's streetBet === currentBet
+    //       === 10, so callAmount is 0 and canCheck is true — but the engine
+    //       requires 'raise', not 'bet', because currentBet !== 0). If we
+    //       return kind:'bet' here `applyPokerAction` silently rejects the
+    //       action and the doc never advances; the bot pump keeps re-firing
+    //       the same rejected action and the whole hand deadlocks with no
+    //       UI signal (regressed in the initial ship). Route through raise
+    //       whenever currentBet !== 0; if a min-raise is not legally
+    //       available (short-stack edge), fall back to check.
+    if (state.currentBet === 0) {
+      const amount = Math.min(p.stack, minBet(state));
+      return { seat, kind: 'bet', amount };
+    }
+    const target = minRaiseTo(state, seat);
+    if (target > state.currentBet) return { seat, kind: 'raise', amount: target };
+    return { seat, kind: 'check' };
   }
   if (strength >= 0.75) {
     // Raise if legal and enough chips.
