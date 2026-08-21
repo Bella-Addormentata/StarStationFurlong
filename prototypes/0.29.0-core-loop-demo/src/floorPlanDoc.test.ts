@@ -47,6 +47,7 @@ import {
   ROOM_TILE_MAX,
   WALL_CLEARANCE,
 } from './floorPlanDoc';
+import { bindFurnitureDoc, writeFurnitureItem } from './furnitureDoc';
 import type { DoorId } from './doors';
 
 /** All four door ids — the test surface for placement / delta / wall coord. */
@@ -58,6 +59,11 @@ let plan: Y.Map<unknown>;
 beforeEach(() => {
   doc = new Y.Doc();
   bindFloorPlan(doc);
+  // 🧱 #66 S3 (audit remediation): writeRoomDims consults the furniture doc to
+  // refuse a shrink that would strand items. Bind the SAME Y.Doc so the check
+  // sees an empty map by default (existing tests behave unchanged), and the
+  // dedicated stranded-furniture tests can populate it deliberately.
+  bindFurnitureDoc(doc);
   plan = doc.getMap('floorPlan');
 });
 
@@ -251,6 +257,146 @@ describe('subscribeFloorPlan: writeRoomDims fires the shared subscription', () =
 });
 
 // ── 3. Dims-driven door geometry (S1 currency, S3 room-frame invariants) ─────
+
+// ── 4. audit-remediation guards (writeRoomDims result contract + shrink safety
+// + advisory downgrade) ─────────────────────────────────────────────────────
+
+describe('writeRoomDims: result contract (audit remediation)', () => {
+  it('returns { ok: true } on a successful write', () => {
+    const result = writeRoomDims(3, 3);
+    expect(result).toEqual({ ok: true });
+    expect(readRoomDims()).toEqual({ cols: 3, rows: 3 });
+  });
+
+  it('returns { ok: false, reason: "invalid-dims" } for a non-integer axis', () => {
+    const result = writeRoomDims(2.5, 2);
+    expect(result).toEqual({ ok: false, reason: 'invalid-dims' });
+    expect(plan.get('dims')).toBeUndefined();
+  });
+
+  it('returns { ok: false, reason: "invalid-dims" } for out-of-envelope input', () => {
+    const belowMin = writeRoomDims(ROOM_TILE_MIN - 1, 2);
+    expect(belowMin).toEqual({ ok: false, reason: 'invalid-dims' });
+    const aboveMax = writeRoomDims(ROOM_TILE_MAX + 1, 2);
+    expect(aboveMax).toEqual({ ok: false, reason: 'invalid-dims' });
+    const nan = writeRoomDims(NaN, 2);
+    expect(nan).toEqual({ ok: false, reason: 'invalid-dims' });
+  });
+});
+
+describe('writeRoomDims: shrink-would-strand-furniture guard (audit Fix 3)', () => {
+  it('refuses a shrink that would leave a placed item past the new wall', () => {
+    // Author a room at 4×4 (halfX=halfZ=12) with a lamp near the edge of the
+    // WALK box (±11, safely inside the ±11 placement bound). A shrink to 2×2
+    // brings the placement bound down to ±5 — the lamp at (10, 0) now sits
+    // 5 m past the new wall.
+    writeRoomDims(4, 4);
+    writeFurnitureItem({
+      id: 'test-stranded-lamp',
+      kind: 'lamp-table',
+      pos: { x: 10, z: 0 },
+      rot: 0,
+      movable: true,
+    });
+    const result = writeRoomDims(2, 2);
+    expect(result).toEqual({ ok: false, reason: 'stranded-furniture' });
+    // The refusal is a genuine gate — dims + advisory unchanged.
+    expect(readRoomDims()).toEqual({ cols: 4, rows: 4 });
+    expect(plan.get('meta')).toEqual({ v: 2 });
+    expect(doc.getMap('roomInfo').get('minClient')).toBe('0.32.36');
+  });
+
+  it('allows a shrink when every item is still inside the new placement box', () => {
+    writeRoomDims(4, 4);
+    writeFurnitureItem({
+      id: 'test-safe-lamp',
+      kind: 'lamp-table',
+      pos: { x: 2, z: 2 }, // well inside a 2×2 room's ±5 placement bound
+      rot: 0,
+      movable: true,
+    });
+    const result = writeRoomDims(2, 2);
+    expect(result).toEqual({ ok: true });
+    expect(readRoomDims()).toEqual({ cols: 2, rows: 2 });
+  });
+
+  it('growth NEVER checks the strand condition (the new box strictly contains the old)', () => {
+    // Put an item on the current 2×2 room's placement edge (x=5, z=0), then
+    // grow to 3×3. The check would still pass, but this asserts the semantic:
+    // growth must succeed regardless of item layout.
+    writeFurnitureItem({
+      id: 'test-grow-lamp',
+      kind: 'lamp-table',
+      pos: { x: 5, z: 0 },
+      rot: 0,
+      movable: true,
+    });
+    const result = writeRoomDims(3, 3);
+    expect(result).toEqual({ ok: true });
+    expect(readRoomDims()).toEqual({ cols: 3, rows: 3 });
+  });
+
+  it('same-size write is not a shrink and never gates on furniture', () => {
+    writeRoomDims(3, 3);
+    writeFurnitureItem({
+      id: 'test-edge-lamp',
+      kind: 'lamp-table',
+      pos: { x: 7.5, z: 0 }, // inside 3×3 (bound ±8)
+      rot: 0,
+      movable: true,
+    });
+    const result = writeRoomDims(3, 3);
+    expect(result).toEqual({ ok: true });
+  });
+});
+
+describe('writeRoomDims: advisory downgrade on shrink-to-default (audit Fix 4)', () => {
+  it('shrink from advisory dims BACK to 2×2 clears meta.v=2 and 0.32.36 minClient', () => {
+    // Author a 3×3 room — this stamps meta.v=2 + minClient='0.32.36'.
+    writeRoomDims(3, 3);
+    expect(plan.get('meta')).toEqual({ v: 2 });
+    expect(doc.getMap('roomInfo').get('minClient')).toBe('0.32.36');
+    // Shrink back to the default 2×2. No furniture, so the shrink is allowed.
+    const result = writeRoomDims(2, 2);
+    expect(result).toEqual({ ok: true });
+    // Advisory is downgraded: the room is legacy-shaped again, so an older
+    // client that gates on minClient shouldn't be refused entry.
+    expect(plan.get('meta')).toEqual({ v: 1 });
+    expect(doc.getMap('roomInfo').get('minClient')).toBe('0.32.1');
+  });
+
+  it('shrink-to-default does NOT fabricate an advisory when the doc has none (Case-C invariant)', () => {
+    // A fresh doc that never grew has NO meta and NO minClient. Writing the
+    // default dims must NOT stamp an advisory to downgrade — the room stays
+    // as-is and would still boot on the oldest clients.
+    writeRoomDims(2, 2);
+    // meta may exist (previous test showed dims-write is a separate concern)
+    // but must not be v=2, and minClient must not be pinned to a version.
+    const meta = plan.get('meta') as { v?: number } | undefined;
+    expect(meta?.v).not.toBe(2);
+    expect(doc.getMap('roomInfo').get('minClient')).toBeUndefined();
+  });
+
+  it('downgrade is DEFENSIVE — leaves a foreign advisory alone', () => {
+    // A theoretical future advisory stamped by a newer release (meta.v=3, a
+    // different minClient string) must be left intact: this release did not
+    // raise it, so this release must not lower it. The write still lands.
+    plan.set('meta', { v: 3 });
+    doc.getMap('roomInfo').set('minClient', '0.99.0');
+    const result = writeRoomDims(2, 2);
+    expect(result).toEqual({ ok: true });
+    expect(plan.get('meta')).toEqual({ v: 3 });
+    expect(doc.getMap('roomInfo').get('minClient')).toBe('0.99.0');
+  });
+
+  it('a non-default write keeps meta.v=2 + minClient="0.32.36" (Case B seed remains)', () => {
+    // 4×2 (rectangular) is non-default; the advisory must be stamped.
+    const result = writeRoomDims(4, 2);
+    expect(result).toEqual({ ok: true });
+    expect(plan.get('meta')).toEqual({ v: 2 });
+    expect(doc.getMap('roomInfo').get('minClient')).toBe('0.32.36');
+  });
+});
 
 describe('door placement tracks dims changes (walls in the LOCAL frame stay axis-aligned)', () => {
   it('growing to 3×3 moves each door onto its FRESH wall (default lateral)', () => {

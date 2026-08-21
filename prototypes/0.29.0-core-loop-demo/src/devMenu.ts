@@ -1073,7 +1073,26 @@ function applyDimDelta(deltaCols: number, deltaRows: number): void {
     showHint(`DEV: 🧱 already at the envelope limit (${ROOM_TILE_MIN}–${ROOM_TILE_MAX}).`);
     return;
   }
-  writeRoomDims(nextCols, nextRows);
+  // 🧱 #66 S3 (audit remediation): writeRoomDims now returns a discriminated
+  // result — a shrink that would strand furniture past the new wall is
+  // refused. Surface each refusal with its own reason so the owner knows what
+  // to fix instead of clicking a silently-dead button. Success falls through
+  // to the existing grown / shrunk toast.
+  const result = writeRoomDims(nextCols, nextRows);
+  if (!result.ok) {
+    if (result.reason === 'stranded-furniture') {
+      showHint(`DEV: 🧱 cannot shrink — furniture would sit past the new wall. Move stranded items inside ${nextCols * 6} × ${nextRows * 6} m first.`);
+    } else if (result.reason === 'invalid-dims') {
+      // The disabled buttons at the envelope limits should prevent this, but
+      // a rapid double-click ordering could still land here; keep the message
+      // concrete so a real bug is visible rather than swallowed.
+      showHint(`DEV: 🧱 invalid dims ${nextCols} × ${nextRows} — must be integers in ${ROOM_TILE_MIN}–${ROOM_TILE_MAX}.`);
+    } else {
+      // 'not-bound' — the floor plan doc isn't wired yet; effectively boot-only.
+      showHint(`DEV: 🧱 resize unavailable (room not bound yet).`);
+    }
+    return;
+  }
   // Row refresh comes for free via subscribeFloorPlan, but a synchronous
   // refresh here means the readout updates in the same frame as the click —
   // the subscription-driven pass still runs (idempotent) and reconciles any

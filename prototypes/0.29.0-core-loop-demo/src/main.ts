@@ -1308,9 +1308,16 @@ async function joinRoomAtEpoch(
     // its own lastAppliedDims cache, so a door-slide notify pays only that
     // cheap comparison. A dims write drives the full shell rebuild + walkable
     // rebake + player clamp so a shrink can't strand the avatar.
+    // 🧱 #66 S3 (audit Fix 6): reconcileRoomDims returns TRUE when it did the
+    // full rebuild (which already fires reconcileDoorPlacements internally,
+    // step 8), FALSE when it short-circuited on unchanged dims or on a
+    // not-yet-built world. Only call reconcileDoorPlacements ourselves in the
+    // short-circuit case so a genuine dims write doesn't reconcile doors
+    // twice per callback.
     subscribeFloorPlan(() => {
-      world?.reconcileRoomDims();
-      world?.reconcileDoorPlacements();
+      if (world && !world.reconcileRoomDims()) {
+        world.reconcileDoorPlacements();
+      }
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
     });

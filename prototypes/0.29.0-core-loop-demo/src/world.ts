@@ -1615,6 +1615,13 @@ export class World {
     setDoorRecords(stored.size ? stored : defaultDoorLayoutRecords());
     reposeDoorTargets();
     this.dockingSystem?.repositionDoorGroups();
+    // 🧱 #66 S3 (audit Fix 2): a slid or wall-repositioned door left its
+    // paired vestibule / connector chain floating at the OLD anchor —
+    // dockingSystem.repositionDoorGroups only re-poses the door hardware
+    // (frame / leaves / keypad), not the paired-connection tubes that live on
+    // this world. Re-pose them here so the connector always leaves the door
+    // face flush.
+    this.repositionPairedVestibules();
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
@@ -1622,6 +1629,30 @@ export class World {
     // — the drag's stashed origin is stale now, so the editor drops it and the
     // doc-derived pose stands, mirroring the doorLayout mid-drag abort.
     roomEdit.onDoorPlacementsChanged();
+  }
+
+  /**
+   * 🧱 #66 S3 (audit Fix 2): re-pose every LIVE paired vestibule / connector
+   * chain to the CURRENT door face. buildVestibule / buildConnectorChain both
+   * capture `physicalDoorPose(id)` at group-creation time and set the group's
+   * translation + rotation from it (adapter.ts:212–216, adapter.ts:996–1000);
+   * a door that has since slid along a wall — or the wall itself moving under
+   * a room resize — leaves the group frozen at the OLD anchor and the tube
+   * appears to drift out of the door frame.
+   *
+   * Connector chains fold OUTWARD from the door face (each segment is
+   * relative), so translating + rotating the whole group at the new door pose
+   * preserves the chain's shape end-to-end — no rebuild needed. A missing
+   * door record (mid-remove) is safely ignored by physicalDoorPose.
+   */
+  private repositionPairedVestibules(): void {
+    for (const [id, group] of this.pairedVestibules) {
+      // physicalDoorPose reads the fresh doorRecords set + falls back to the
+      // canonical un-slid pose for unknown ids, so it never throws.
+      const p = physicalDoorPose(id as DoorId);
+      group.position.set(p.x, 0, p.z);
+      group.rotation.y = p.outwardYaw;
+    }
   }
 
   /**
@@ -1646,17 +1677,24 @@ export class World {
    * does it (forceExit + enter): the walls and click plane it snapshots on
    * `enter()` are stale the instant this method rebuilds them.
    */
-  public reconcileRoomDims(): void {
+  public reconcileRoomDims(): boolean {
     const { halfX, halfZ } = roomHalfExtents();
     // Idempotency guard: subscribeFloorPlan fires on every plan mutation, but
     // dims can only change via writeRoomDims. Same-dims callbacks (door slide,
-    // structure-tile edit) are the common case and must be free.
+    // structure-tile edit) are the common case and must be free. The `false`
+    // returned here tells the subscribeFloorPlan handler to still run the
+    // door-reconcile it would have skipped otherwise (Fix 6 in the audit —
+    // avoids the double-reconcile on genuine dims changes while keeping door
+    // slides working).
     if (this.lastAppliedDims &&
         this.lastAppliedDims.halfX === halfX &&
-        this.lastAppliedDims.halfZ === halfZ) return;
+        this.lastAppliedDims.halfZ === halfZ) return false;
     // Nothing built yet ⇒ createPlatform will pick up the current dims when it
     // runs (it reads roomHalfExtents fresh + seeds lastAppliedDims itself).
-    if (!this.platformFloor) return;
+    // Returned `false` so the caller still fires the door reconcile — the
+    // subscribeFloorPlan handler is often the FIRST call the world sees, and
+    // a same-frame door change on a not-yet-built room must not be swallowed.
+    if (!this.platformFloor) return false;
     this.lastAppliedDims = { halfX, halfZ };
 
     // 1. Floor: swap geometry (holes preserved — makeFloorGeometry rebuilds
@@ -1666,6 +1704,15 @@ export class World {
       this.platformFloor.geometry = this.makeFloorGeometry();
       old.dispose();
     }
+
+    // 1b. Floor TEXTURE repeat: every floor texture (wood, casino carpet,
+    // outdoor stone) bakes its `repeat` at creation from the DEFAULT 12 m room
+    // — a resize left the tiles stretched (grew) or compressed (shrunk).
+    // Rescale linearly so plank / tile size stays constant in world space,
+    // matching the wood texture's original formula. `needsUpdate` is a
+    // material-level flag, not a texture one: the map bind hasn't changed, so
+    // the material is fine; refreshing repeat on the Texture is enough.
+    this.refreshFloorTextureRepeats(halfX, halfZ);
 
     // 2. Click plane: same geometry swap. Its rotation.x=-π/2 was baked into
     // the initial geometry (clickGeo.rotateX), so rebuild at the current dims
@@ -1765,6 +1812,14 @@ export class World {
     this.rebuildSkylightMeshList();
     this.player.onObstaclesChanged();
 
+    // 9b. Robots follow the same content-rebake reconcileFurniture ends with:
+    // the patrol route bakes from the CURRENT walkable grid, so a resized room
+    // that clipped a former patrol node would strand a robot mid-loop
+    // otherwise (audit Fix 5 — parity with reconcileFurniture and the room
+    // template + morph paths that already call reconcileRobots after their
+    // grid rebakes).
+    this.reconcileRobots(this.computeRobotPatrol());
+
     // 10. Player clamp: a shrunk room may leave the avatar outside the fresh
     // walkable box. beamTo is the safe reset — it cancels any mid-walk / sit /
     // adapter / device state before repositioning, so we never strand them
@@ -1785,6 +1840,40 @@ export class World {
     if (roomEdit.isEditModeActive()) {
       roomEdit.forceExit();
       roomEdit.enter(this);
+    }
+
+    return true;
+  }
+
+  /**
+   * 🧱 #66 S3 (audit Fix 1): rescale every cached floor texture's `repeat` so
+   * a plank / tile stays constant world-space size across a room resize. Wood
+   * was always dims-aware (formula in makeWoodTexture); casino + outdoor
+   * baked their repeats for the DEFAULT 12 m room, so a grown room had them
+   * stretched and a shrunken room had them compressed. The scale factors here
+   * MATCH the creation-time densities (wood 3.5, casino 2.5, outdoor 3.5 —
+   * the values the code shipped with for the 12 m default), so at default
+   * dims the repeat is unchanged (bit-identical legacy behaviour).
+   *
+   * `refreshFloorTextureRepeats` is ALSO called at texture-creation time from
+   * `applyRoomVisuals` (casino / outdoor themes lazy-build their texture on
+   * first entry) so a room that resized BEFORE the theme was ever visited
+   * gets the right repeat when the texture is finally built.
+   */
+  private refreshFloorTextureRepeats(halfX: number, halfZ: number): void {
+    const platformW = 2 * halfX;
+    const platformD = 2 * halfZ;
+    // Wood: matches the closure formula in makeWoodTexture.
+    if (this.woodTex) {
+      this.woodTex.repeat.set((3.5 * platformW) / 12, (3.5 * platformD) / 12);
+    }
+    // Casino carpet: the original hardcoded 2.5 was the 12 m value.
+    if (this.casinoFloorTex) {
+      this.casinoFloorTex.repeat.set((2.5 * platformW) / 12, (2.5 * platformD) / 12);
+    }
+    // Outdoor stone: the original hardcoded 3.5 was the 12 m value.
+    if (this.outdoorFloorTex) {
+      this.outdoorFloorTex.repeat.set((3.5 * platformW) / 12, (3.5 * platformD) / 12);
     }
   }
 
@@ -2595,15 +2684,25 @@ export class World {
     if (this.floorMat) {
       if (deck) {
         // Swap to a stone-tile texture (created once, cached).
-        if (!this.outdoorFloorTex)
+        if (!this.outdoorFloorTex) {
           this.outdoorFloorTex = this.makeOutdoorFloorTex();
+          // 🧱 #66 S3 (audit Fix 1): the lazy-build path was blind to
+          // room dims. Refresh so an already-resized room gets tiles at
+          // the CURRENT scale on first theme entry.
+          const { halfX, halfZ } = roomHalfExtents();
+          this.refreshFloorTextureRepeats(halfX, halfZ);
+        }
         this.floorMat.map = this.outdoorFloorTex;
         this.floorMat.color.setHex(0xffffff); // no tint — texture has its own palette
         this.floorMat.roughness = 0.92;
         this.floorMat.metalness = 0.0;
       } else if (casinoTheme) {
-        if (!this.casinoFloorTex)
+        if (!this.casinoFloorTex) {
           this.casinoFloorTex = this.makeCasinoFloorTex();
+          // 🧱 #66 S3 (audit Fix 1): same lazy-build repeat refresh.
+          const { halfX, halfZ } = roomHalfExtents();
+          this.refreshFloorTextureRepeats(halfX, halfZ);
+        }
         this.floorMat.map = this.casinoFloorTex;
         this.floorMat.color.setHex(0xffffff);
         this.floorMat.roughness = 0.48;
