@@ -833,11 +833,32 @@ function capGeometryWithDoors(
     }
   };
 
-  // 1) Wall band with door notches — triangulate via ShapeGeometry, then copy
-  //    its (a=u, y=v) → world positions into our merged buffer.
+  // 1) Wall band with door notches — triangulate via ShapeGeometry, then EXPAND
+  //    its indexed triangles into raw per-triangle vertices for the merged
+  //    non-indexed buffer. ShapeGeometry is INDEXED (extras/ShapeUtils earcut
+  //    reuses each unique outline vertex across the triangles that touch it —
+  //    see three/src/geometries/ShapeGeometry.js line 55 `this.setIndex`), so
+  //    naively copying `position` alone drops N−2 of the N triangles and
+  //    reassembles the remainder from mixed-vertex triples spanning the
+  //    band/gable boundary — the visible "garbled mesh" the audit called out.
+  //    Expanding per-triangle via `band.index` is the only correct merge into
+  //    this non-indexed buffer (the interior barrel path keeps its ShapeGeometry
+  //    as its own mesh, so its index survives untouched).
   const band = capWallBandGeometry(narrowAxis, b, -narrowHalf, narrowHalf, wallHeight, doorCuts);
   const bandPos = band.attributes.position;
-  for (let i = 0; i < bandPos.count * 3; i++) positions.push((bandPos.array as ArrayLike<number>)[i]);
+  const bandIdx = band.index;
+  if (bandIdx) {
+    for (let i = 0; i < bandIdx.count; i++) {
+      const v = bandIdx.getX(i);
+      positions.push(bandPos.getX(v), bandPos.getY(v), bandPos.getZ(v));
+    }
+  } else {
+    // Defensive: an un-indexed ShapeGeometry would still triangulate the
+    // outline in-order 0-1-2, 0-2-3, … so falling back to the raw positions
+    // would misread. If THREE ever drops the index we prefer to fail visibly.
+    console.warn('[octagonHull] capWallBandGeometry returned an un-indexed geometry — cap doors will render incorrectly.');
+    for (let i = 0; i < bandPos.count * 3; i++) positions.push((bandPos.array as ArrayLike<number>)[i]);
+  }
   band.dispose();
 
   // 2) Roof gable (trapezoid, CCW in (a, y)).

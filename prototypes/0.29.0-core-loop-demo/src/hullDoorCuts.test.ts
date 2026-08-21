@@ -17,9 +17,12 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import * as THREE from 'three';
 import {
   notchedRectOutline,
   clampedDoorCuts,
+  buildOctagonHull,
+  buildOctagonShell,
   DOOR_HULL_INSET,
   type DoorOpening,
 } from './octagonHull';
@@ -305,5 +308,134 @@ describe('room resize', () => {
   it('a shrink past the door height also drops it (h > edgeMax − inset)', () => {
     const dropped = clampedDoorCuts([{ along: 0, w: 2, h: 3 }], -10, 10, 2);
     expect(dropped).toEqual([]);
+  });
+});
+
+// ── Full-mesh regression: cap-door on the SHELL is a well-formed triangle set ──
+//
+// The pure primitives above pin the outline; these tests instantiate the actual
+// `buildOctagonHull` / `buildOctagonShell` and interrogate the resulting
+// BufferGeometry so a merge-time defect (e.g. dropping a ShapeGeometry index
+// during a non-indexed merge) can't hide behind green outline tests. A single
+// broken assertion here would have caught the pre-fix regression on
+// `capGeometryWithDoors` immediately.
+//
+// The shell path is the interesting one: it MERGES the notched wall-band
+// ShapeGeometry (indexed) with two gable fans (raw triangles) into ONE
+// non-indexed BufferGeometry. That merge must expand the ShapeGeometry via its
+// index — otherwise (band vertex count) + (12 gable-fan floats-per-triangle) is
+// almost never divisible by 3, and the mesh renders garbled.
+
+/** Utility: collect every mesh in a group with a given .name into an array. */
+function collectMeshesByName(group: THREE.Object3D, name: string): THREE.Mesh[] {
+  const out: THREE.Mesh[] = [];
+  group.traverse(obj => {
+    if ((obj as THREE.Mesh).isMesh && obj.name === name) out.push(obj as THREE.Mesh);
+  });
+  return out;
+}
+
+/** Utility: total triangle count from a geometry — index count / 3 when indexed,
+ *  else position count / 3. Returns 0 for an empty geometry. */
+function triangleCount(geo: THREE.BufferGeometry): number {
+  if (geo.index) return geo.index.count / 3;
+  const pos = geo.attributes.position as THREE.BufferAttribute | undefined;
+  return pos ? pos.count / 3 : 0;
+}
+
+describe('buildOctagonShell with cap doors — merged cap geometry is valid', () => {
+  it('cap-neg with one centre door yields a non-indexed cap whose position count is divisible by 3', () => {
+    // A default 12×12 room (halfX=halfZ=6): ties on the narrow axis, defaults
+    // to 'x' — 'cap-neg' is then a wall at y=-halfZ. One centred door on it.
+    const shell = buildOctagonShell(
+      { halfX: 6, halfZ: 6 },
+      {},
+      {},
+      { 'cap-neg': [{ along: 0, w: 2, h: 3 }] },
+    );
+    try {
+      const caps = collectMeshesByName(shell.group, 'octagon-shell-cap');
+      expect(caps).toHaveLength(2); // one per end (cap-neg, cap-pos)
+      for (const cap of caps) {
+        const geo = cap.geometry as THREE.BufferGeometry;
+        const posCount = (geo.attributes.position as THREE.BufferAttribute).count;
+        // The merged shell cap is deliberately NON-indexed (positions expanded
+        // per-triangle), so posCount must be a whole multiple of 3.
+        expect(geo.index).toBeNull();
+        expect(posCount % 3).toBe(0);
+        // Sanity: at least the base gable fans (roof trapezoid = 2 tris,
+        // basement trapezoid = 2 tris) contribute 12 vertices, so any cap is
+        // ≥ 12. The notched cap adds N wall-band triangles on top.
+        expect(posCount).toBeGreaterThanOrEqual(12);
+      }
+    } finally {
+      shell.dispose();
+    }
+  });
+
+  it('cap without a door falls through to the byte-identical legacy fan (no notch overhead)', () => {
+    // No door on either cap ⇒ capGeometryWithDoors returns capGeometry(), which
+    // fan-triangulates the 8-vertex octagon outline into (8 − 2) = 6 tris,
+    // i.e. 18 raw vertices, independent of the door map.
+    const shell = buildOctagonShell({ halfX: 6, halfZ: 6 }, {}, {}, {});
+    try {
+      const caps = collectMeshesByName(shell.group, 'octagon-shell-cap');
+      for (const cap of caps) {
+        const posCount = (cap.geometry.attributes.position as THREE.BufferAttribute).count;
+        expect(posCount).toBe(18);
+      }
+    } finally {
+      shell.dispose();
+    }
+  });
+
+  it('side-wall door on the shell is a valid strip geometry (never a broken sliver)', () => {
+    // 'wall-neg' side-wall door on a 12x12 default room. stripGeometry keeps
+    // its own indexed ShapeGeometry (its own mesh, no merge), so the wall
+    // strip must remain indexed with index.count % 3 === 0 and enough tris.
+    const shell = buildOctagonShell(
+      { halfX: 6, halfZ: 6 },
+      {},
+      {},
+      { 'wall-neg': [{ along: 0, w: 2, h: 3 }] },
+    );
+    try {
+      // The wall strip mesh's name is "octagon-shell-wall".
+      const walls = collectMeshesByName(shell.group, 'octagon-shell-wall');
+      expect(walls.length).toBeGreaterThan(0);
+      // At least one has a real cut on it — triangle count > the 2 a plain
+      // quad emits (a notched outline needs ≥ 6 tris).
+      const notchedTriCount = Math.max(...walls.map(w => triangleCount(w.geometry as THREE.BufferGeometry)));
+      expect(notchedTriCount).toBeGreaterThanOrEqual(6);
+    } finally {
+      shell.dispose();
+    }
+  });
+});
+
+describe('buildOctagonHull with cap doors — interior barrel cap-wall mesh keeps its index', () => {
+  it('interior cap-wall mesh is INDEXED (its own ShapeGeometry, not merged)', () => {
+    // Interior path keeps capWallBandGeometry as its own mesh with its own
+    // material, so its index survives — this was correct pre-fix and must stay
+    // correct post-fix. Guards against a copy-paste of the shell-side merge
+    // logic accidentally flattening the interior mesh too.
+    const hull = buildOctagonHull(
+      { halfX: 6, halfZ: 6 },
+      {},
+      {},
+      { 'cap-neg': [{ along: 0, w: 2, h: 3 }] },
+    );
+    try {
+      const capWalls = collectMeshesByName(hull.group, 'octagon-cap-wall');
+      expect(capWalls.length).toBeGreaterThan(0);
+      // At least the notched cap-wall carries an index (>= 6 tris = 18 idx).
+      const notched = capWalls.find(m => (m.geometry as THREE.BufferGeometry).index !== null);
+      expect(notched).toBeDefined();
+      const idx = notched!.geometry.index!;
+      expect(idx.count % 3).toBe(0);
+      expect(idx.count).toBeGreaterThanOrEqual(18);
+    } finally {
+      hull.dispose();
+    }
   });
 });
