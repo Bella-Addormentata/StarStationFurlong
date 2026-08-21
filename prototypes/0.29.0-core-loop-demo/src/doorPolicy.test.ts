@@ -417,6 +417,87 @@ describe('D3 · signed door grants', () => {
     expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
   });
 
+  it('STRONG cross-door replay (v.doorId UNMODIFIED) also refuses via hasDoorGrant', () => {
+    // Regression for audit MAJOR #67: a hostile peer lifts an owner-signed
+    // grant UNMODIFIED to a foreign map key — v.doorId still reads the
+    // ORIGINAL door. Before the fix, hasDoorGrant re-built verify bytes from
+    // v.doorId (matching the original sig) and returned true, granting the
+    // guest construction rights on a door whose owner never approved them —
+    // and readDoorGrants['south'] returned an empty list because its filter
+    // ran on v.doorId=='north' first, hiding the lifted record entirely.
+    // After the fix, verify bytes are built from the map key's doorId
+    // (authoritative) and the map-key discipline guard drops any record
+    // whose carried doorId does not match its slot.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const signedForNorth = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+
+    // Copy UNMODIFIED: v.doorId is left as 'north' at map key 'south|<pub>'.
+    doc.getMap('doorGrants').set(`${DOOR_SOUTH}|${guestPub}`, signedForNorth);
+
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+    });
+    // The construction gate in docking.ts:canConstruct reads through this
+    // function — a true here would grant rights on the wrong door.
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(false);
+    // The original slot still verifies.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    // readDoorGrants must not surface the lifted copy either — even though
+    // v.doorId claims 'north', its map key is 'south' and the discipline
+    // guard drops the mismatched slot. So the 'north' list still has one
+    // legitimate entry (the original) and NOT a duplicate (audit NOTE #67).
+    expect(readDoorGrants(DOOR_NORTH).map((x) => x.pub)).toEqual([guestPub]);
+    expect(readDoorGrants(DOOR_NORTH)).toHaveLength(1);
+    expect(readDoorGrants(DOOR_SOUTH)).toHaveLength(0);
+  });
+
+  it('STRONG cross-pub replay (lift a signed grant to a different pub slot) refuses', () => {
+    // Companion to the cross-door case: the same lift attack in the pub
+    // dimension. A hostile peer copies Sam's owner-signed grant UNMODIFIED
+    // from `north|<samPub>` to `north|<bobPub>`. The v.pub still reads Sam.
+    // Before the fix, hasDoorGrant('north', bobPub) fetched the record at
+    // Bob's slot, ran only isGrantShape and isValidSignedGrant, and returned
+    // true — granting Bob rights on Sam's approval. After the fix, the
+    // map-key discipline guard (v.pub !== keyPub) drops the mismatched slot.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const signedForSam = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${otherPub}`, signedForSam);
+
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+    });
+    expect(hasDoorGrant(DOOR_NORTH, otherPub)).toBe(false);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    // The list must not include the lifted (mismatched-slot) copy either.
+    expect(readDoorGrants(DOOR_NORTH).map((x) => x.pub)).toEqual([guestPub]);
+  });
+
+  it('legacy unsigned grant lifted to a foreign key is refused (map-key discipline)', () => {
+    // The MAJOR fix also hardens the legacy fallback: a hostile peer that
+    // planted a legacy record for Sam on door north cannot lift it to door
+    // south's slot and expect the shape-only fallback to honor it.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Legacy-Sam', grantedAt: 1,
+    });
+    // Copy UNMODIFIED to the south slot.
+    const rec = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+    doc.getMap('doorGrants').set(`${DOOR_SOUTH}|${guestPub}`, rec);
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+    });
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(false);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
   it('cross-room replay of a signed grant refuses', () => {
     bindAsOwner(doc, ROOM_A);
     writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
@@ -497,6 +578,54 @@ describe('D3 · signed door requests (self-signed)', () => {
       roomOwnerPub: () => ownerPub,
     });
     expect(hasDoorRequest(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
+  it('STRONG cross-door replay of a signed request (v.doorId UNMODIFIED) refuses', () => {
+    // Twin of the grant-side regression. A hostile peer lifts a valid
+    // self-signed request UNMODIFIED to a foreign door slot. Before the fix
+    // hasDoorRequest re-built verify bytes from v.doorId (matching the sig)
+    // and returned true, causing the owner's UI to see a plea on a door the
+    // requester never asked about. After the fix, verify bytes are built
+    // from the map-key doorId and the mismatch guard drops the slot.
+    ownerPubReader = () => ownerPub;
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPubReader(),
+      localPub: () => guestPub,
+      signSelf: signerFor(seedGuest),
+    });
+    writeDoorRequest(DOOR_NORTH, guestPub, 'Sam');
+    const req = doc.getMap('doorRequests').get(`${DOOR_NORTH}|${guestPub}`);
+    // Copy UNMODIFIED to south's slot.
+    doc.getMap('doorRequests').set(`${DOOR_SOUTH}|${guestPub}`, req);
+    expect(hasDoorRequest(DOOR_SOUTH, guestPub)).toBe(false);
+    expect(hasDoorRequest(DOOR_NORTH, guestPub)).toBe(true);
+    // readDoorRequests must not surface the lifted copy on south either.
+    expect(readDoorRequests(DOOR_SOUTH)).toEqual([]);
+    expect(readDoorRequests(DOOR_NORTH).map((x) => x.doorId)).toEqual([DOOR_NORTH]);
+  });
+
+  it('STRONG cross-pub replay of a signed request refuses', () => {
+    // A hostile peer copies Sam's signed request UNMODIFIED to Bob's slot
+    // (`north|<bobPub>`). Before the fix hasDoorRequest returned true for
+    // Bob's slot, letting the owner see a fake plea from Bob (with Sam's
+    // signature). After the fix the map-key discipline guard drops it.
+    ownerPubReader = () => ownerPub;
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPubReader(),
+      localPub: () => guestPub,
+      signSelf: signerFor(seedGuest),
+    });
+    writeDoorRequest(DOOR_NORTH, guestPub, 'Sam');
+    const req = doc.getMap('doorRequests').get(`${DOOR_NORTH}|${guestPub}`);
+    doc.getMap('doorRequests').set(`${DOOR_NORTH}|${otherPub}`, req);
+    expect(hasDoorRequest(DOOR_NORTH, otherPub)).toBe(false);
+    expect(hasDoorRequest(DOOR_NORTH, guestPub)).toBe(true);
+    // The list surfaces only the legitimate original request.
+    expect(readDoorRequests(DOOR_NORTH).map((x) => x.requesterPub)).toEqual([guestPub]);
   });
 
   it('a guest binding cannot sign a request naming ANOTHER user\'s pub', () => {
@@ -620,6 +749,27 @@ describe('D1/D1b · pure logic (legacy binding, no signatures)', () => {
     doc.getMap('doorGrants').set('bogus', { doorId: DOOR_NORTH, pub: guestPub }); // no name/grantedAt
     expect(readDoorGrants(DOOR_NORTH)).toEqual([]);
     expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it('map-key discipline: unparseable map keys are dropped by readDoor*', () => {
+    // Bogus keys with no `|` separator (or empty parts) cannot map back to a
+    // `(doorId, pub)` pair — the reader must skip them so a hostile write
+    // to a garbage key never surfaces as a real grant/request.
+    doc.getMap('doorGrants').set('no-separator-here', {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Sam', grantedAt: 1,
+    });
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Sam', grantedAt: 1,
+    });
+    doc.getMap('doorGrants').set(`|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Sam', grantedAt: 1,
+    });
+    expect(readDoorGrants(DOOR_NORTH)).toEqual([]);
+
+    doc.getMap('doorRequests').set('no-separator-here', {
+      doorId: DOOR_NORTH, requesterPub: guestPub, requesterName: 'Sam', at: 1,
+    });
+    expect(readDoorRequests(DOOR_NORTH)).toEqual([]);
   });
 
   it('per-door construction default is OWNER (matches DEFAULT_DOOR_POLICY invariant)', () => {

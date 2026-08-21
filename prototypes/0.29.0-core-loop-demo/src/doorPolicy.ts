@@ -60,10 +60,23 @@
  * WHAT THE OWNER KEY IS: the local player's `getIdentityPub()` when the room
  * doc names them owner (`roomInfo.owner === getPlayerId()` AND the players map
  * carries their `keyB64`). Only that local session can sign; other peers read
- * `players.get(ownerId).keyB64` from the room doc as the verifying key. Until
- * the room's players map has synced, there is no key to check against and
- * signed reads refuse (see `readDoorPolicy`) — an unreached room shows door
- * defaults rather than junk, which is the safer failure mode.
+ * `players.get(ownerId).keyB64` from the room doc as the verifying key. When
+ * the room's players map has NOT synced (`ownerPubExpected === null`), signed
+ * reads still ACCEPT a record whose carried `ownerPub` verifies its own
+ * signature — the verifier keeps forgeries out, and this fail-open posture
+ * avoids flickering every un-synced viewer's UI to defaults during T0. Once
+ * the expected owner pub IS known, signed records must claim it (a stale
+ * owner's signature is stale, not authoritative). See the doc-comment on
+ * `isValidSignedPolicy` for the exact rule.
+ *
+ * MAP-KEY DISCIPLINE (grants/requests): every grant/request lives at
+ * `${doorId}|${pub}`. The map key is authoritative; a record's carried
+ * `doorId`/`pub` MUST equal the key's parts. Reads verify signatures against
+ * the KEY's doorId (not the record's), and refuse any record whose carried
+ * doorId/pub does not match the slot it was written into. This defeats
+ * cross-door / cross-pub lift attacks where a hostile peer copies a valid
+ * signed grant UNMODIFIED to a foreign key — the signature bytes are re-built
+ * over the key's doorId and no longer match the original sig.
  */
 
 import * as Y from 'yjs';
@@ -409,6 +422,21 @@ function reqKey(doorId: string, pub: string): string {
   return `${doorId}|${pub}`;
 }
 
+/**
+ * Reverse of `reqKey`: split a `${doorId}|${pub}` key back into its parts.
+ * Base64url pubs never contain `|` and every doorId in use today (cardinal
+ * berths + free-door `d:`-ids) is `|`-free, so a first-`|` split is unambiguous.
+ * Returns null on any shape that could not have been produced by `reqKey`
+ * (missing separator, empty doorId, empty pub) — callers treat that as a
+ * silently-dropped hostile write.
+ */
+function parseReqKey(key: string): { doorId: string; pub: string } | null {
+  if (typeof key !== 'string') return null;
+  const i = key.indexOf('|');
+  if (i <= 0 || i >= key.length - 1) return null;
+  return { doorId: key.slice(0, i), pub: key.slice(i + 1) };
+}
+
 function isRequestShape(v: unknown): v is DoorRightsRequest {
   const r = v as Partial<DoorRightsRequest> | null;
   return !!r && typeof r.doorId === 'string' && typeof r.requesterPub === 'string'
@@ -420,15 +448,24 @@ function isRequestShape(v: unknown): v is DoorRightsRequest {
  * LEGACY (no sig). Mirrors the policy fallback rule so unsigned records keep
  * working during the transition, while a hostile peer cannot mint requests
  * naming another user's pub.
+ *
+ * `expectedDoorId` is the AUTHORITATIVE door id (the map-key's parsed doorId,
+ * or the caller's argument in `hasDoorRequest`). Signature bytes are re-built
+ * over `expectedDoorId`, so a request lifted UNMODIFIED to a foreign key
+ * fails to verify (audit MAJOR #67): the original sig covered the original
+ * door's bytes, not this slot's bytes.
  */
-function isValidSignedRequest(v: DoorRightsRequest): boolean {
+function isValidSignedRequest(v: DoorRightsRequest, expectedDoorId: string): boolean {
   const hasSig = typeof v.requesterSig === 'string' && v.requesterSig.length > 0;
   if (!hasSig) return true;
   if (!verifier) return true;
   try {
     return verifier(
       v.requesterPub,
-      doorRequestSignatureBytes(boundRoomId, v.doorId, v),
+      // Use expectedDoorId (map-key authoritative), NOT v.doorId — a lifted
+      // record whose v.doorId still reads 'north' at map-key `south|<pub>`
+      // must not verify against the original sig.
+      doorRequestSignatureBytes(boundRoomId, expectedDoorId, v),
       v.requesterSig as string,
     );
   } catch {
@@ -463,14 +500,25 @@ export function removeDoorRequest(doorId: string, pub: string): void {
   boundDoc!.transact(() => { requestsMap!.delete(reqKey(doorId, pub)); });
 }
 
-/** All pending requests, optionally for one door (sanitized, newest first). */
+/** All pending requests, optionally for one door (sanitized, newest first).
+ *  Iterates over ENTRIES so the map key is the source of truth for both the
+ *  doorId filter and the signature bytes — a record's carried doorId/pub
+ *  MUST match its map key or it is dropped (map-key discipline, see header). */
 export function readDoorRequests(doorId?: string): DoorRightsRequest[] {
   if (!docAlive()) return [];
   const out: DoorRightsRequest[] = [];
-  for (const v of requestsMap!.values()) {
+  for (const [key, v] of requestsMap!.entries()) {
+    const parsed = parseReqKey(key);
+    if (!parsed) continue;
+    const { doorId: keyDoorId, pub: keyPub } = parsed;
+    if (doorId && keyDoorId !== doorId) continue;
     if (!isRequestShape(v)) continue;
-    if (doorId && v.doorId !== doorId) continue;
-    if (!isValidSignedRequest(v)) continue;
+    // Map-key discipline: refuse any record whose carried doorId/pub does not
+    // match the slot it lives at — defeats cross-door/cross-pub lift attacks
+    // even for LEGACY unsigned records (which would otherwise bypass the sig
+    // check entirely). See audit NOTE #67 (readDoorGrants duplicates).
+    if (v.doorId !== keyDoorId || v.requesterPub !== keyPub) continue;
+    if (!isValidSignedRequest(v, keyDoorId)) continue;
     out.push(v);
   }
   return out.sort((a, b) => b.at - a.at);
@@ -480,7 +528,10 @@ export function hasDoorRequest(doorId: string, pub: string): boolean {
   if (!docAlive()) return false;
   const v = requestsMap!.get(reqKey(doorId, pub));
   if (!isRequestShape(v)) return false;
-  return isValidSignedRequest(v);
+  // Map-key discipline: a lifted record whose carried doorId/pub does not
+  // match this slot is refused BEFORE verify runs (audit MAJOR #67).
+  if (v.doorId !== doorId || v.requesterPub !== pub) return false;
+  return isValidSignedRequest(v, doorId);
 }
 
 // ── Grants ───────────────────────────────────────────────────────────────────
@@ -497,8 +548,14 @@ function isGrantShape(v: unknown): v is DoorRightsGrant {
  * owner pub is null (unreached room), signed grants are accepted on the
  * carried pub alone so a visitor's grant list is not blanked while sync
  * catches up.
+ *
+ * `expectedDoorId` is the AUTHORITATIVE door id (map-key parsed doorId, or
+ * the caller's argument in `hasDoorGrant`). Signature bytes are re-built over
+ * `expectedDoorId`, so a grant lifted UNMODIFIED to a foreign key fails to
+ * verify — the original owner sig covered the ORIGINAL door's bytes, not
+ * this slot's. Fixes audit MAJOR #67 (cross-door replay via has/read).
  */
-function isValidSignedGrant(v: DoorRightsGrant, ownerPubExpected: string | null): boolean {
+function isValidSignedGrant(v: DoorRightsGrant, expectedDoorId: string, ownerPubExpected: string | null): boolean {
   const hasPub = typeof v.ownerPub === 'string' && v.ownerPub.length > 0;
   const hasSig = typeof v.ownerSig === 'string' && v.ownerSig.length > 0;
   if (!hasPub && !hasSig) return true;
@@ -508,7 +565,9 @@ function isValidSignedGrant(v: DoorRightsGrant, ownerPubExpected: string | null)
   try {
     return verifier(
       v.ownerPub as string,
-      doorGrantSignatureBytes(boundRoomId, v.doorId, v),
+      // Use expectedDoorId (map-key authoritative), NOT v.doorId — see the
+      // isValidSignedRequest twin for the rationale.
+      doorGrantSignatureBytes(boundRoomId, expectedDoorId, v),
       v.ownerSig as string,
     );
   } catch {
@@ -547,14 +606,24 @@ export function removeDoorGrant(doorId: string, pub: string): void {
   boundDoc!.transact(() => { grantsMap!.delete(reqKey(doorId, pub)); });
 }
 
+/** All grants, optionally for one door (sanitized, newest first).
+ *  Iterates over ENTRIES so the map key is the source of truth for both the
+ *  doorId filter and the signature bytes — a record's carried doorId/pub
+ *  MUST match its map key or it is dropped (map-key discipline, see header).
+ *  Fixes audit NOTE #67 (duplicates on multi-key copies) as a side-effect. */
 export function readDoorGrants(doorId?: string): DoorRightsGrant[] {
   if (!docAlive()) return [];
   const out: DoorRightsGrant[] = [];
   const ownerPubExpected = ownerPubReader?.() ?? null;
-  for (const v of grantsMap!.values()) {
+  for (const [key, v] of grantsMap!.entries()) {
+    const parsed = parseReqKey(key);
+    if (!parsed) continue;
+    const { doorId: keyDoorId, pub: keyPub } = parsed;
+    if (doorId && keyDoorId !== doorId) continue;
     if (!isGrantShape(v)) continue;
-    if (doorId && v.doorId !== doorId) continue;
-    if (!isValidSignedGrant(v, ownerPubExpected)) continue;
+    // Map-key discipline: refuse mismatched slot even for legacy records.
+    if (v.doorId !== keyDoorId || v.pub !== keyPub) continue;
+    if (!isValidSignedGrant(v, keyDoorId, ownerPubExpected)) continue;
     out.push(v);
   }
   return out.sort((a, b) => b.grantedAt - a.grantedAt);
@@ -564,6 +633,9 @@ export function hasDoorGrant(doorId: string, pub: string): boolean {
   if (!docAlive()) return false;
   const v = grantsMap!.get(reqKey(doorId, pub));
   if (!isGrantShape(v)) return false;
+  // Map-key discipline: a lifted record whose carried doorId/pub does not
+  // match this slot is refused BEFORE verify runs (audit MAJOR #67).
+  if (v.doorId !== doorId || v.pub !== pub) return false;
   const ownerPubExpected = ownerPubReader?.() ?? null;
-  return isValidSignedGrant(v, ownerPubExpected);
+  return isValidSignedGrant(v, doorId, ownerPubExpected);
 }
