@@ -41,9 +41,36 @@ import {
   verifyIdentity,
   exportRecoveryKey,
   importRecoveryKey,
+  previewRecoveryKey,
   ysyncSigner,
   hasStoredIdentity,
+  getCloneVatPreference,
+  setCloneVatPreference,
 } from "./keypair";
+// 🛰️ #79 P3: the shared default station — a fresh install boots into THIS
+// room (its clone-vat welcome) instead of minting its own per-install home.
+// sharedStationBootstrap() returns null when station.ts is unconfigured, at
+// which point every caller collapses to today's per-install `home-*` behaviour.
+// isSharedStationRoom() is the runtime test the join/persist paths use to know
+// they are looking at the shared station (never claim owner, never persist a
+// station-scoped `ssf-last-room`).
+import {
+  isSharedStationRoom,
+  sharedStationBootstrap,
+} from "./station";
+// 🎬 #79 P5: pure state machine for the boot title (paste → confirm → applied)
+// and the "boot target priority" contract fetchDefaultBootstrap / bootstrap-
+// Networking implement — bootFlow.ts is the tested spec for those seams.
+import {
+  cancelConfirm,
+  chooseNewPlayer,
+  confirmRestore,
+  isTerminal,
+  openPaste,
+  readyToFade,
+  submitPaste,
+  type BootTitleStage,
+} from "./bootFlow";
 import { bindTreasuryDoc } from "./treasuryDoc";
 // Dev placeholder network pin for the treasury cache layer — deliberately
 // matches NO real chain genesis, so every foreign record is rejected until
@@ -742,6 +769,38 @@ async function bootstrapNetworking() {
         localStorage.removeItem("ssf-last-room");
       }
     }
+    // 🧬 #79 P2/P4: on the first-run / post-restore boot (no override, no
+    // resume) look up the CURRENT IDENTITY's clone-vat preference and use it
+    // as the boot target. Falls back to the shared station (fetchDefault) when
+    // no preference is set — that IS the default clone-vat for every new
+    // identity. LOCAL-only lookup: a fresh install with a restored key has no
+    // record here → shared-station fallback lands them in the welcome vat.
+    if (!pendingBootstrapOverride) {
+      try {
+        const identityPref = getCloneVatPreference(getIdentityPub());
+        if (identityPref && !isSharedStationRoom(identityPref.roomId)) {
+          const fp = await awaitLocalNodeFingerprint();
+          if (fp) {
+            pendingBootstrapOverride = {
+              v: 2,
+              roomId: identityPref.roomId,
+              roomKeyB64: identityPref.roomKeyB64,
+              wtUrl: `https://127.0.0.1:${fp.port}`,
+              certHashesB64: [fp.base64],
+              memberHints: (() => {
+                const h = getLocalNodeHint(fp);
+                return h ? [h] : undefined;
+              })(),
+              irohNodeId: fp.iroh_node_id,
+              irohRelayUrls: fp.iroh_relay_urls,
+              irohDirectAddrs: fp.iroh_direct_addrs,
+            };
+          }
+        }
+      } catch {
+        /* preference is best-effort — fall through to the shared station */
+      }
+    }
     const override = pendingBootstrapOverride;
     let boot = override ?? (await fetchDefaultBootstrap());
     // Stale-cert self-dial guard (node-restart bug): an override captured
@@ -791,7 +850,16 @@ async function bootstrapNetworking() {
     // comment in joinRoomAtEpoch for the initial-sync race this prevents.
     // pendingBootstrapOverride intentionally persists after use, so a
     // Retry-node following a seed import stays classified as a join.
-    await joinRoom(boot, /* claimRoomDefaults */ !override);
+    //
+    // 🛰️ #79 P3: the SHARED STATION is authored by its always-on host — a
+    // fresh install joining it must NEVER claim defaults (racing the host's
+    // real name/owner over the SyncStep2). Force-JOIN semantics regardless
+    // of whether the boot came from the default path or an override.
+    const isSharedStationJoin = isSharedStationRoom(boot.roomId);
+    await joinRoom(
+      boot,
+      /* claimRoomDefaults */ !override && !isSharedStationJoin,
+    );
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -938,14 +1006,47 @@ async function joinRoomAtEpoch(
   // room reconnects from the LIVE local node (its loopback cert drifts across
   // restarts), so persist ONLY non-home rooms; entering home clears the resume
   // target. Stored as a base64 RoomBootstrap — the same shape a pass carries.
+  //
+  // 🛰️ #79 P3: also skip the SHARED STATION here — it is a rebuild-from-
+  // defaults room like `home-*`, and persisting its overriding wtUrl would
+  // fight the fetchDefaultBootstrap live-fingerprint path on the next boot.
   try {
-    if (boot.roomId === getDefaultRoomId()) {
+    if (
+      boot.roomId === getDefaultRoomId() ||
+      isSharedStationRoom(boot.roomId)
+    ) {
       localStorage.removeItem("ssf-last-room");
     } else {
       localStorage.setItem("ssf-last-room", btoa(JSON.stringify(boot)));
     }
   } catch {
     /* privacy mode — resume is best-effort */
+  }
+
+  // 🧬 #79 P2/P4: record THIS room as the current identity's clone-vat
+  // preference so a returning boot (on this install, and eventually elsewhere)
+  // knows where to land. Local-only, whole-value write; the reader is shape-
+  // guarded (see keypair.ts). Two rooms are DELIBERATELY skipped:
+  //   • the shared STATION default — fetchDefaultBootstrap picks it up on its
+  //     own, so a null preference IS "boot into the shared vat".
+  //   • the per-install HOME (`home-*` from getDefaultRoomId) — its id and
+  //     roomKey are install-scoped local state; recording it as an identity
+  //     preference would send a restore-elsewhere boot into a private room
+  //     the current install can't reproduce.
+  try {
+    if (
+      isSharedStationRoom(boot.roomId) ||
+      boot.roomId === getDefaultRoomId()
+    ) {
+      setCloneVatPreference(getIdentityPub(), null);
+    } else if (boot.roomKeyB64) {
+      setCloneVatPreference(getIdentityPub(), {
+        roomId: boot.roomId,
+        roomKeyB64: boot.roomKeyB64,
+      });
+    }
+  } catch {
+    /* preference is best-effort */
   }
 
   // Seeding readout: our own node serves on 0.0.0.0 whenever it runs —
@@ -4860,20 +4961,48 @@ async function fetchDefaultBootstrap(): Promise<RoomBootstrap | null> {
   if (!fingerprint) {
     return null;
   }
-  const roomId = activeBootstrap?.roomId ?? getDefaultRoomId();
+  // 🛰️ #79 P3: prefer the SHARED default station id + key when configured, so
+  // every fresh install lands in the same clone-vat welcome instead of minting
+  // its own per-install `home-*` room. Skipped when an activeBootstrap is
+  // already established (a live session — never re-derives its own roomId) and
+  // when station.ts hasn't been filled in yet (hasSharedStation → false).
+  //
+  // The wtUrl / certHash come from the LOCAL node's fingerprint: we always
+  // dial our own loopback listener (the node bridges to the mesh from there).
+  // Baked-in station seed hints ride along too, merged with the local hint
+  // so a hint-less install can still self-seed while a seeded one can dial
+  // the always-on host.
+  const shared = !activeBootstrap ? sharedStationBootstrap() : null;
+  const roomId = activeBootstrap?.roomId ?? shared?.roomId ?? getDefaultRoomId();
   const roomKeyB64 =
-    activeBootstrap?.roomKeyB64 ?? getOrCreateRoomKeyB64(roomId);
+    activeBootstrap?.roomKeyB64 ??
+    shared?.roomKeyB64 ??
+    getOrCreateRoomKeyB64(roomId);
   const localHint = getLocalNodeHint(fingerprint);
+  // Merge baked-in station hints (if any) with the local hint. The local hint
+  // must be first so a loopback dial still targets our OWN node's fingerprint.
+  const stationHints: RoomMemberHint[] = shared
+    ? shared.memberHints.map((h) => ({
+        irohNodeId: h.nodeId,
+        irohRelayUrls: h.relayUrls,
+        irohDirectAddrs: h.directAddrs,
+      }))
+    : [];
+  const mergedHints = mergeMemberHints(
+    localHint ? [localHint] : [],
+    stationHints,
+  );
+  const primaryHint = localHint ?? mergedHints[0];
   return {
     v: 2,
     roomId,
     roomKeyB64,
     wtUrl: `https://127.0.0.1:${fingerprint.port}`,
     certHashesB64: [fingerprint.base64],
-    memberHints: localHint ? [localHint] : undefined,
-    irohNodeId: localHint?.irohNodeId,
-    irohRelayUrls: localHint?.irohRelayUrls,
-    irohDirectAddrs: localHint?.irohDirectAddrs,
+    memberHints: mergedHints.length ? mergedHints : undefined,
+    irohNodeId: primaryHint?.irohNodeId,
+    irohRelayUrls: primaryHint?.irohRelayUrls,
+    irohDirectAddrs: primaryHint?.irohDirectAddrs,
   };
 }
 
@@ -6615,14 +6744,32 @@ function setupClickToEnter() {
   let exteriorReady = false;
   let faded = false;
 
-  // 🆕 #79 P1: a genuine first run (no stored identity seed) holds the title on
-  // a New Player / Load-from-Backup choice before the station reveals; a
-  // returning install auto-reveals its station as before (proceedChosen = true).
+  // 🆕 #79 P1/P5: a genuine first run (no stored identity seed) holds the
+  // title on a New Player / Load-from-Backup choice before the station
+  // reveals; a returning install auto-reveals its station as before
+  // (proceedChosen = true). The title screen's stage transitions run through
+  // the pure state machine in bootFlow.ts so the paste → confirm → applied
+  // sequence is testable + a stray click after applied cannot re-open the
+  // choice.
   const firstRun = !hasStoredIdentity();
   let proceedChosen = !firstRun;
+  // Boot-title state — 'idle' shows NEW PLAYER / LOAD FROM BACKUP, 'paste'
+  // shows the recovery-key textarea, 'confirm' shows the identity preview +
+  // CONFIRM/CANCEL, 'applied' schedules the reload, 'proceed' fades to the
+  // atlas. Returning installs never leave the implicit 'proceed'.
+  let titleStage: BootTitleStage = { kind: 'idle' };
 
   const maybeFade = () => {
-    if (faded || !dwellDone || !exteriorReady || !proceedChosen) return;
+    if (
+      !readyToFade({
+        dwellDone,
+        exteriorReady,
+        proceedChosen,
+        alreadyFaded: faded,
+      })
+    ) {
+      return;
+    }
     faded = true;
     // 🎬 Pre-entry ends with the curtain: HUD elements gated on it (the
     // SpacePhone tip) become eligible again — the exterior-active gate keeps
@@ -6641,15 +6788,19 @@ function setupClickToEnter() {
     window.addEventListener("click", onCanvasClick);
   };
 
-  // 🆕 #79 P1: on a first run, replace the "Click to Enter" hint with the
+  // 🆕 #79 P1/P5: on a first run, replace the "Click to Enter" hint with the
   // New Player / Load-from-Backup choice. New Player reveals the station now;
-  // Load-from-Backup's restore is wired in the next slice (no key handling
-  // here). A returning install skips this and auto-reveals as before.
+  // Load-from-Backup opens a paste box, PREVIEW derives a fingerprint from
+  // the pasted key WITHOUT applying it, then a distinct CONFIRM / CANCEL
+  // step (owner spec: "text box to paste key, then confirmation then load
+  // atlas of that players clone vat preference") gates the actual import.
+  // A returning install skips this and auto-reveals as before.
   if (firstRun) {
     const content = document.getElementById("welcome-content");
     const hint = content?.querySelector<HTMLElement>(".hint") ?? null;
     if (hint) hint.style.display = "none";
     if (content) {
+      // ── Style tokens shared by all title-screen controls (one place to tune).
       const primary =
         "padding:12px 30px; font:700 15px/1 inherit; letter-spacing:1.5px; color:#1a1206; " +
         "background:linear-gradient(180deg,#ffd879,#f0b429); border:2px solid #ffe9a8; " +
@@ -6661,17 +6812,11 @@ function setupClickToEnter() {
       const wrap = document.createElement("div");
       wrap.style.cssText =
         "display:flex; flex-direction:column; gap:12px; margin-top:24px; align-items:center;";
+      // ── Buttons + inputs (visibility gated on titleStage via renderStage).
       const btnNew = document.createElement("button");
       btnNew.type = "button";
       btnNew.textContent = "🚀  NEW PLAYER";
       btnNew.style.cssText = primary;
-      btnNew.addEventListener("click", (e) => {
-        e.stopPropagation();
-        wrap.remove();
-        dwellDone = true; // proceed at once — don't wait out the intro dwell
-        proceedChosen = true;
-        maybeFade();
-      });
       const btnLoad = document.createElement("button");
       btnLoad.type = "button";
       btnLoad.textContent = "🔑  LOAD FROM BACKUP";
@@ -6679,56 +6824,153 @@ function setupClickToEnter() {
       const note = document.createElement("div");
       note.style.cssText =
         "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.75); min-height:15px; max-width:300px; text-align:center;";
-      // 🔑 #79 P2: Load-from-Backup reveals a paste box wired to the EXISTING
-      // recovery-key restore (keypair.importRecoveryKey — the same seam the
-      // SpacePhone's "Restore identity" uses). The recovery key is the private
-      // identity: it is stored ONLY via importRecoveryKey (localStorage, exactly
-      // like a returning install), never logged, and cleared from the field the
-      // instant it's applied. A valid key reboots into that identity's station.
-      let restoreOpen = false;
+      // Paste stage: textarea + PREVIEW button.
+      const pasteBox = document.createElement("div");
+      pasteBox.style.cssText =
+        "display:none; flex-direction:column; gap:8px; align-items:center; width:300px;";
+      const ta = document.createElement("textarea");
+      ta.rows = 2;
+      ta.placeholder = "Paste your recovery key…";
+      ta.autocomplete = "off";
+      ta.spellcheck = false;
+      ta.style.cssText =
+        "width:100%; box-sizing:border-box; resize:none; font:400 11px/1.4 monospace; " +
+        "padding:8px; border-radius:8px; border:1px solid rgba(240,180,41,0.4); " +
+        "background:rgba(10,7,3,0.75); color:#f0e0b0;";
+      ta.addEventListener("click", (ev) => ev.stopPropagation());
+      const btnPreview = document.createElement("button");
+      btnPreview.type = "button";
+      btnPreview.textContent = "▶  PREVIEW IDENTITY";
+      btnPreview.style.cssText = primary;
+      pasteBox.append(ta, btnPreview);
+      // Confirm stage: fingerprint preview + CONFIRM / CANCEL. The CONFIRM
+      // path is the ONLY caller of importRecoveryKey — the pure state machine
+      // in bootFlow.ts guarantees it can't fire from paste/idle/applied.
+      const confirmBox = document.createElement("div");
+      confirmBox.style.cssText =
+        "display:none; flex-direction:column; gap:10px; align-items:center; " +
+        "width:300px; padding:14px; border-radius:10px; " +
+        "background:rgba(20,14,6,0.55); border:1px solid rgba(240,180,41,0.4);";
+      const fpLine = document.createElement("div");
+      fpLine.style.cssText =
+        "font:700 14px/1.3 monospace; color:#ffe9a8; letter-spacing:1.5px; text-align:center;";
+      const confirmQ = document.createElement("div");
+      confirmQ.style.cssText =
+        "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.85); text-align:center;";
+      confirmQ.textContent =
+        "Restore this identity? Your current install identity will be replaced by it.";
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText =
+        "display:flex; flex-direction:row; gap:10px; align-items:center;";
+      const btnConfirm = document.createElement("button");
+      btnConfirm.type = "button";
+      btnConfirm.textContent = "✓  CONFIRM RESTORE";
+      btnConfirm.style.cssText = primary;
+      const btnCancel = document.createElement("button");
+      btnCancel.type = "button";
+      btnCancel.textContent = "✕  CANCEL";
+      btnCancel.style.cssText = secondary;
+      btnRow.append(btnConfirm, btnCancel);
+      confirmBox.append(fpLine, confirmQ, btnRow);
+      wrap.append(btnNew, btnLoad, pasteBox, confirmBox, note);
+      content.appendChild(wrap);
+
+      // ── Render the current stage: which controls are visible + status text.
+      const renderStage = (): void => {
+        // Reset visibility (title-only DOM state — cheap to recompute).
+        btnNew.style.display = "none";
+        btnLoad.style.display = "none";
+        pasteBox.style.display = "none";
+        confirmBox.style.display = "none";
+        switch (titleStage.kind) {
+          case "idle":
+            btnNew.style.display = "";
+            btnLoad.style.display = "";
+            note.textContent = "";
+            break;
+          case "paste":
+            pasteBox.style.display = "flex";
+            note.textContent =
+              titleStage.error ??
+              "Paste the recovery key you saved from Settings → Backup / restore identity.";
+            ta.focus();
+            break;
+          case "confirm":
+            confirmBox.style.display = "flex";
+            fpLine.textContent = `🔑 ${titleStage.fingerprint}`;
+            note.textContent =
+              "Confirm to restore — your current install identity is replaced.";
+            break;
+          case "applied":
+            note.textContent =
+              `Identity ${getIdentityFingerprint()} restored — loading your station…`;
+            break;
+          case "proceed":
+            // wrap.remove() runs in the button handler; nothing to render.
+            break;
+        }
+      };
+
+      // ── Handlers: every transition runs through the pure state machine so
+      //    the state stays a single source of truth.
+      btnNew.addEventListener("click", (e) => {
+        e.stopPropagation();
+        titleStage = chooseNewPlayer(titleStage);
+        if (titleStage.kind === "proceed") {
+          wrap.remove();
+          dwellDone = true; // proceed at once — don't wait out the intro dwell
+          proceedChosen = true;
+          maybeFade();
+        }
+      });
       btnLoad.addEventListener("click", (e) => {
         e.stopPropagation();
-        if (restoreOpen) return;
-        restoreOpen = true;
-        btnLoad.style.display = "none";
-        const box = document.createElement("div");
-        box.style.cssText =
-          "display:flex; flex-direction:column; gap:8px; align-items:center; width:300px;";
-        const ta = document.createElement("textarea");
-        ta.rows = 2;
-        ta.placeholder = "Paste your recovery key…";
-        ta.autocomplete = "off";
-        ta.spellcheck = false;
-        ta.style.cssText =
-          "width:100%; box-sizing:border-box; resize:none; font:400 11px/1.4 monospace; " +
-          "padding:8px; border-radius:8px; border:1px solid rgba(240,180,41,0.4); " +
-          "background:rgba(10,7,3,0.75); color:#f0e0b0;";
-        ta.addEventListener("click", (ev) => ev.stopPropagation());
-        const doRestore = document.createElement("button");
-        doRestore.type = "button";
-        doRestore.textContent = "↩  RESTORE MY IDENTITY";
-        doRestore.style.cssText = primary;
-        doRestore.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          const pub = importRecoveryKey(ta.value);
-          if (!pub) {
-            note.textContent =
-              "That isn't a valid recovery key — check it and paste again.";
-            return;
-          }
-          ta.value = ""; // scrub the private key from the DOM immediately
-          note.textContent = `Identity ${getIdentityFingerprint()} restored — loading your station…`;
-          doRestore.disabled = true;
-          setTimeout(() => window.location.reload(), 700);
-        });
-        box.append(ta, doRestore);
-        wrap.insertBefore(box, note);
-        note.textContent =
-          "Paste the recovery key you saved from Settings → Backup / restore identity.";
-        ta.focus();
+        titleStage = openPaste(titleStage);
+        renderStage();
       });
-      wrap.append(btnNew, btnLoad, note);
-      content.appendChild(wrap);
+      btnPreview.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // The paste value is READ here, VALIDATED via the pure preview, and
+        // NEVER mutated on failure — the current identity is safe until the
+        // user actually confirms.
+        titleStage = submitPaste(titleStage, ta.value, previewRecoveryKey);
+        renderStage();
+      });
+      btnCancel.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // Cancel returns to paste with a cleared error. Scrub the textarea
+        // so the private key never lingers on-screen after a back-out.
+        ta.value = "";
+        titleStage = cancelConfirm(titleStage);
+        renderStage();
+      });
+      btnConfirm.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // ONLY caller of importRecoveryKey. The pure machine guarantees this
+        // can't fire from any stage other than 'confirm'.
+        titleStage = confirmRestore(titleStage, () => {
+          const pub = importRecoveryKey(ta.value);
+          if (!pub) return false;
+          ta.value = ""; // scrub the private key from the DOM immediately
+          // 🧬 #79 P2: the restored identity is (probably) NEW to this
+          // install, so the install-scoped `ssf-last-room` (which belonged
+          // to whoever was here before) is now the WRONG resume target. Drop
+          // it — the next boot's fetchDefaultBootstrap will pick this
+          // identity's clone-vat preference (if a mesh lookup ever finds
+          // one) or fall through to the shared station default.
+          try {
+            localStorage.removeItem("ssf-last-room");
+          } catch {
+            /* privacy mode — best-effort */
+          }
+          return true;
+        });
+        renderStage();
+        if (isTerminal(titleStage) && titleStage.kind === "applied") {
+          setTimeout(() => window.location.reload(), 700);
+        }
+      });
+      renderStage();
     }
   }
 
