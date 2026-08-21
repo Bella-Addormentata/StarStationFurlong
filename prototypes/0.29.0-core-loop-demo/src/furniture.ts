@@ -204,6 +204,15 @@ export interface StandSlot {
 /** Build-time helpers bound to the item's group (all coordinates local). */
 export interface BuildCtx {
   itemId: string;
+  /** The FurnitureItem's cardinal rotation (0/1/2/3) — surfaced so builders
+   *  whose geometry depends on the room-axis mapping (e.g. the pool basin,
+   *  which sinks into the octagon basement and must know which of the pool's
+   *  local axes carries the room's narrow axis) can look it up without a
+   *  round-trip through the item registry. Even rot keeps the item's local
+   *  frame aligned with the room's; odd rot swaps X↔Z. Renderers that don't
+   *  care about the room axis mapping (most of them — the item group is
+   *  rotated externally by furnitureVisualYaw) simply ignore this. */
+  itemRot: Rot;
   m: (
     color: number,
     rough?: number,
@@ -2618,6 +2627,153 @@ export interface PoolBasinFootprint {
   edgeTopY: number;
 }
 
+/** 🛑📐🏊🕳️ #80: geometric constants of the octagon-basement pool basin —
+ *  exported so tests can assert the exact plate/wall dimensions the renderer
+ *  emits (there is no way to introspect a placed THREE.BoxGeometry from a
+ *  pure-math test). Kept in one place so a future tweak here (e.g. thinner
+ *  plate) can never desync between the helper and its consumers. */
+export const POOL_BASIN_PLATE_LIFT = 0.02; // plate CENTRE offset above y=basementY
+export const POOL_BASIN_PLATE_THICK = 0.08; // plate box thickness (matches retired rect bottom)
+export const POOL_BASIN_WALL_THICK = 0.06; // wall box thickness (matches shallow lining slabs)
+
+/** 🛑📐🏊🕳️ #80: one plate/wall slab in the pool ITEM's LOCAL frame. All
+ *  dimensions are the BoxGeometry inputs the renderer passes verbatim; all
+ *  centre coords are the mesh position the renderer sets. Pure — no THREE. */
+export interface PoolBasinSlab {
+  /** BoxGeometry size on the pool's local X. */
+  width: number;
+  /** BoxGeometry size on Y (height). */
+  height: number;
+  /** BoxGeometry size on the pool's local Z. */
+  depth: number;
+  /** Mesh centre coords in the pool item's LOCAL frame. */
+  cx: number;
+  cy: number;
+  cz: number;
+}
+
+/** 🛑📐🏊🕳️ #80: full pool-basin geometry the renderer draws — one bottom
+ *  plate (nullable when the clip degenerates a room-too-small case) plus zero
+ *  or two long-axis walls. Consumed by `placeOctagonPoolBasin` and its tests. */
+export interface PoolBasinGeometry {
+  plate: PoolBasinSlab | null;
+  walls: PoolBasinSlab[];
+}
+
+/**
+ * 🛑📐🏊🕳️ #80: pure basin geometry generator — resolves the exact plate +
+ * long-axis wall dimensions for a pool sitting in the octagon basement volume.
+ * `placeOctagonPoolBasin` is a thin wrapper around this helper so the geometry
+ * can be unit-tested without a THREE.js runtime.
+ *
+ * ── Discipline ───────────────────────────────────────────────────────────────
+ * • The bottom PLATE is CLIPPED on the narrow axis to ±halfAtFloor: the plate
+ *   is the visible basin floor and must lie inside the flat basement floor's
+ *   extent (below that plane is hull material, not walkable space).
+ * • The long-axis WALLS at the water rect's ±long ends span the FULL water
+ *   footprint on the narrow axis — deliberately UNCLIPPED. In the wing
+ *   regions (|narrow| ∈ [halfAtFloor, halfAtWater]) the water surface still
+ *   exists (the chamfer at y=WATER_Y is at ±halfAtWater, wider than
+ *   halfAtFloor), so a wall clipped to halfAtFloor would leave the water
+ *   "leaking" past z=±waterZHalf into the extruded wedge cavity between the
+ *   chamfer and the walkable floor (the visible defect the initial slice
+ *   missed — remediated 2026‑08‑21). In the wing the wall's lower portion
+ *   sits below the chamfer surface, embedded in opaque hull material, and is
+ *   never visible from any interior vantage.
+ *
+ * Colour is chosen by the caller; this helper is orientation-aware but paints
+ * nothing.
+ */
+export function computePoolBasinGeometry(
+  fp: PoolBasinFootprint,
+  bounds: PoolBasementBounds,
+): PoolBasinGeometry {
+  const { basementY, halfAtFloor } = bounds;
+
+  // Water half-extents in the pool's LOCAL frame — always POSITIVE half-widths
+  // (fp.waterXWest is authored negative; POSITIVE'ify it here so downstream
+  // math uses distances, not signed coords).
+  const waterXWestPos = -fp.waterXWest;
+  const waterXEast = fp.waterXEast;
+  const waterZHalf = fp.waterZHalf;
+
+  // ── Plate half-extents: clipped to the basement floor's extent on the
+  //    narrow axis. The plate is the visible basin bottom slab.
+  let plateXNegHalf: number, plateXPosHalf: number, plateZNegHalf: number, plateZPosHalf: number;
+  if (bounds.narrowInLocal === "x") {
+    plateXNegHalf = Math.min(waterXWestPos, halfAtFloor);
+    plateXPosHalf = Math.min(waterXEast, halfAtFloor);
+    plateZNegHalf = waterZHalf;
+    plateZPosHalf = waterZHalf;
+  } else {
+    plateXNegHalf = waterXWestPos;
+    plateXPosHalf = waterXEast;
+    plateZNegHalf = Math.min(waterZHalf, halfAtFloor);
+    plateZPosHalf = Math.min(waterZHalf, halfAtFloor);
+  }
+
+  const plateWidth = plateXNegHalf + plateXPosHalf;
+  const plateDepth = plateZNegHalf + plateZPosHalf;
+
+  // Bail out cleanly if the plate clip degenerates. A room too small to host
+  // any basin at all ⇒ nothing to draw. The renderer treats plate:null +
+  // walls:[] as "skip this basin entirely" (see placeOctagonPoolBasin).
+  if (!(plateWidth > 0) || !(plateDepth > 0)) {
+    return { plate: null, walls: [] };
+  }
+
+  const plate: PoolBasinSlab = {
+    width: plateWidth,
+    height: POOL_BASIN_PLATE_THICK,
+    depth: plateDepth,
+    cx: (plateXPosHalf - plateXNegHalf) / 2, // asymmetric water ⇒ off-centre plate
+    cy: basementY + POOL_BASIN_PLATE_LIFT,
+    cz: (plateZPosHalf - plateZNegHalf) / 2,
+  };
+
+  // ── Long-axis walls: at the water rect's ±long ends, spanning the FULL
+  //    water extent on the narrow axis (NOT clipped to halfAtFloor — see the
+  //    header discipline note).
+  const wallHeight = fp.edgeTopY - basementY;
+  if (!(wallHeight > 0)) return { plate, walls: [] };
+  const wallCenterY = (fp.edgeTopY + basementY) / 2;
+  const walls: PoolBasinSlab[] = [];
+  const longIsZ = bounds.narrowInLocal === "x";
+  // Wall span on the NARROW axis = full water width (unclipped): closes the
+  // water off at its z (or x for narrow=z pools) boundary all the way to the
+  // authored waterline, so no leak survives in the wing regions.
+  const wallSpanWidth = waterXWestPos + waterXEast;
+  const wallSpanDepth = waterZHalf + waterZHalf;
+  const wallSpanCX = (waterXEast - waterXWestPos) / 2;
+  const wallSpanCZ = 0;
+  for (const sign of [-1, 1] as const) {
+    if (longIsZ) {
+      // Wall at Z = ±waterZHalf. Spans full water X extent.
+      walls.push({
+        width: wallSpanWidth,
+        height: wallHeight,
+        depth: POOL_BASIN_WALL_THICK,
+        cx: wallSpanCX,
+        cy: wallCenterY,
+        cz: sign * waterZHalf,
+      });
+    } else {
+      // Wall at X = ±waterX{West,East} (asymmetric authored — mirror the same
+      // edges the water rect uses so an odd-rot pose stays self-symmetric).
+      const edgeX = sign < 0 ? -waterXWestPos : waterXEast;
+      walls.push({
+        width: POOL_BASIN_WALL_THICK,
+        height: wallHeight,
+        depth: wallSpanDepth,
+        cx: edgeX,
+        cy: wallCenterY,
+        cz: wallSpanCZ,
+      });
+    }
+  }
+  return { plate, walls };
+}
+
 /**
  * 🛑📐🏊🕳️ #80: draw the deep part of a pool basin — bottom + long-axis walls
  * — into the octagon BASEMENT VOLUME. The basement chamfer already provides a
@@ -2625,13 +2781,18 @@ export interface PoolBasinFootprint {
  * to the basement floor), so we DON'T add narrow-axis walls here: they'd only
  * duplicate/clash with the chamfer and paint over its natural pool-slope look.
  *
- * • Bottom plate — a thin BoxGeometry hovering just above y=basementY (a hair
- *   above to avoid Z-fighting with the basement floor mesh). Clipped on the
- *   narrow axis to ±halfAtFloor (fits inside the basement floor's extent).
+ * • Bottom plate — a thin BoxGeometry STRADDLING y=basementY: its centre sits
+ *   at basementY+POOL_BASIN_PLATE_LIFT (0.02 above the basement-floor mesh
+ *   plane) so the TOP face (0.06 above the plane) is what a viewer sees from
+ *   inside the pool without Z-fighting the floor mesh; the BOTTOM face (0.02
+ *   below the plane) is hidden by the opaque basement floor mesh above it.
+ *   Clipped on the narrow axis to ±halfAtFloor (fits inside the basement
+ *   floor's extent — beyond that is hull material, not walkable space).
  * • Long-axis walls — thin BoxGeometry slabs at the water's ±longHalf edges,
  *   spanning from y=edgeTopY (top of the existing shallow lining) down to
- *   y=basementY. They close off the extruded basement "trench" that would
- *   otherwise show past the water footprint along the long axis.
+ *   y=basementY, across the FULL water footprint on the narrow axis (so the
+ *   water is closed off in the wing regions too — see computePoolBasinGeometry
+ *   for why the wall span is unclipped).
  *
  * All coordinates are in the pool ITEM's LOCAL frame — its group is rotated by
  * `furnitureVisualYaw` before rendering. `bounds.narrowInLocal` tells us which
@@ -2648,88 +2809,22 @@ function placeOctagonPoolBasin(
   fp: PoolBasinFootprint,
   bounds: PoolBasementBounds,
 ): void {
-  const { basementY, halfAtFloor } = bounds;
   const BASIN_COLOR = 0x0e3244; // deep-water teal (same as legacy rect bottom)
-  const PLATE_LIFT = 0.02;      // sits ABOVE the basement floor to avoid Z-fight
-  const PLATE_THICK = 0.08;     // matches the retired rect bottom's thickness
-  const WALL_THICK = 0.06;      // matches the shallow tiled basin lining thickness
+  const geometry = computePoolBasinGeometry(fp, bounds);
+  if (geometry.plate === null) return; // degenerate clip — nothing to draw
 
-  // Clipped water half-extents in the pool's LOCAL frame. The narrow axis is
-  // capped by halfAtFloor (basement floor's extent on that axis); the long
-  // axis is uncapped (basement extends the full long-axis length of the room,
-  // so the water's long-axis half-extent always fits — POOL_WATER_HALFZ<longHalf
-  // for every real room size in the atlas).
-  const waterXWestPos = -fp.waterXWest; // positive west half-width (fp.waterXWest is negative)
-  const waterXEast = fp.waterXEast;
-  const waterZHalf = fp.waterZHalf;
-
-  let xNegHalf: number, xPosHalf: number, zNegHalf: number, zPosHalf: number;
-  if (bounds.narrowInLocal === "x") {
-    // Narrow = local X — clip west + east reaches on X.
-    xNegHalf = Math.min(waterXWestPos, halfAtFloor);
-    xPosHalf = Math.min(waterXEast, halfAtFloor);
-    zNegHalf = waterZHalf;
-    zPosHalf = waterZHalf;
-  } else {
-    // Narrow = local Z — clip both Z half-extents.
-    xNegHalf = waterXWestPos;
-    xPosHalf = waterXEast;
-    zNegHalf = Math.min(waterZHalf, halfAtFloor);
-    zPosHalf = Math.min(waterZHalf, halfAtFloor);
-  }
-
-  const width = xNegHalf + xPosHalf; // total narrow/long-axis size
-  const depth = zNegHalf + zPosHalf;
-  const cx = (xPosHalf - xNegHalf) / 2; // asymmetric water ⇒ off-centre plate
-  const cz = (zPosHalf - zNegHalf) / 2;
-
-  // Bail out cleanly if the clip degenerates (a room too small to host the
-  // pool at all — nothing to draw, but never NaN/negative extents).
-  if (!(width > 0) || !(depth > 0)) return;
-
-  // ── Deep pool BOTTOM — the drawn-in basin floor. On the narrow axis this is
-  //    ≤ basement floor extent; on the long axis it's the water footprint.
+  const { plate } = geometry;
   place(
-    new THREE.BoxGeometry(width, PLATE_THICK, depth),
+    new THREE.BoxGeometry(plate.width, plate.height, plate.depth),
     m(BASIN_COLOR, 0.98, 0.02),
-    cx,
-    basementY + PLATE_LIFT,
-    cz,
+    plate.cx, plate.cy, plate.cz,
   );
-
-  // ── Long-axis basin walls — close off the basement trench past the water.
-  //    A thin slab at each water long-axis edge, spanning the SAME narrow-axis
-  //    width as the bottom plate (so it stays inside the basement volume all
-  //    the way up). Height fills the gap between edgeTopY and basementY.
-  const wallHeight = fp.edgeTopY - basementY;
-  const wallCenterY = (fp.edgeTopY + basementY) / 2;
-  if (wallHeight > 0) {
-    const longIsZ = bounds.narrowInLocal === "x";
-    // Wall geometry: on the narrow axis its BoxGeometry width matches the
-    // plate's; on the long axis a thin slab.
-    for (const sign of [-1, 1] as const) {
-      if (longIsZ) {
-        // Wall at Z = ±waterZHalf.
-        place(
-          new THREE.BoxGeometry(width, wallHeight, WALL_THICK),
-          m(BASIN_COLOR, 0.98, 0.02),
-          cx,
-          wallCenterY,
-          sign * waterZHalf,
-        );
-      } else {
-        // Wall at X = ±waterXHalf (asymmetric authored — mirror the same edges
-        // the water rect uses so an odd-rot pose stays symmetric with itself).
-        const edgeX = sign < 0 ? -waterXWestPos : waterXEast;
-        place(
-          new THREE.BoxGeometry(WALL_THICK, wallHeight, depth),
-          m(BASIN_COLOR, 0.98, 0.02),
-          edgeX,
-          wallCenterY,
-          cz,
-        );
-      }
-    }
+  for (const wall of geometry.walls) {
+    place(
+      new THREE.BoxGeometry(wall.width, wall.height, wall.depth),
+      m(BASIN_COLOR, 0.98, 0.02),
+      wall.cx, wall.cy, wall.cz,
+    );
   }
 }
 
@@ -3903,7 +3998,7 @@ function radialWaterMat(stops: string[]): THREE.MeshBasicMaterial {
   });
 }
 
-function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
+function buildLazyPool({ m, flat, place, addLight, itemRot }: BuildCtx) {
   // Tropical island resort wrapped around the original functional basin.
   // Water bounds, surface height, dive coordinates and interaction tags stay
   // stable; this builder only changes the room's visual language.
@@ -4174,7 +4269,13 @@ function buildLazyPool({ m, flat, place, addLight }: BuildCtx) {
   // Without ?octagon=1 (legacy) the whole floor is hidden by refreshOutdoorFloor
   // instead of holed, so no basin is needed.
   if (OCTAGON_HULL) {
-    const bounds = poolBasementBoundsFor(0); // pool is authored at rot 0 here
+    // 🛑📐🏊🕳️ #80: bounds derived from the ITEM's rot — even/odd rot swaps
+    // the pool's local narrow axis (see poolBasementBoundsFor). The two pool
+    // templates ship rot:0 movable:false today, but keying on itemRot removes
+    // the "always rot 0" latent assumption so a future rotated-pool template
+    // (or an in-app rotate-in-place) stays coherent with the basement bounds
+    // — same discipline poolHoleRect/…Outline already use.
+    const bounds = poolBasementBoundsFor(itemRot);
     // Deep bottom + long-axis walls — helper stays in this file so both pool
     // builders (lazy + classic) share ONE basin discipline.
     placeOctagonPoolBasin(place, m, {
@@ -7084,7 +7185,7 @@ export const CASINO_RETIRED_FURNITURE_IDS = [
 // island / bridge). Registered as the "classic-pool" / "classic-hot-tub"
 // kinds; the pool-2 room template places them.
 // ═══════════════════════════════════════════════════════════════════════════
-function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
+function buildClassicPool({ m, flat, place, addLight, itemRot }: BuildCtx) {
   const TILE = 0xf3f9fb; // white pool tile (plain faces)
   const WATER_MID = 0x46aebd; // submerged basin walls (visible through water)
   const CHROME = 0xd8e2e8; // ladder metal
@@ -7142,7 +7243,10 @@ function buildClassicPool({ m, flat, place, addLight }: BuildCtx) {
   // duplicate wall here would only Z-fight it. The rect water outline of the
   // classic pool clips cleanly against the basement (no organic corners).
   if (OCTAGON_HULL) {
-    const bounds = poolBasementBoundsFor(0); // pool is authored at rot 0 here
+    // 🛑📐🏊🕳️ #80: rot-aware bounds — matches poolHoleRect/…Outline so a
+    // rotated pool keeps water hole + basin coherent (see buildLazyPool's
+    // matching note for the full rationale).
+    const bounds = poolBasementBoundsFor(itemRot);
     placeOctagonPoolBasin(place, m, {
       waterXWest: -POOL_WATER_WEST,
       waterXEast: POOL_WATER_EAST,
@@ -7969,6 +8073,7 @@ export function buildItemGroup(item: FurnitureItem): THREE.Group {
   const group = new THREE.Group();
   const ctx: BuildCtx = {
     itemId: item.id,
+    itemRot: item.rot,
     m: (color, rough = 0.72, metal = 0.06, em = 0x000000, emI = 0) =>
       new THREE.MeshStandardMaterial({
         color,

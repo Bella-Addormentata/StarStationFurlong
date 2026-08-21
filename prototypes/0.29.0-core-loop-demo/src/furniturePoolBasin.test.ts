@@ -15,16 +15,32 @@ import * as Y from 'yjs';
 import { bindFloorPlan, writeRoomDims, DEFAULT_DIMS } from './floorPlanDoc';
 import { computeOctagonProfile } from './hullSection';
 import {
+  POOL_BASIN_PLATE_LIFT,
+  POOL_BASIN_PLATE_THICK,
+  POOL_BASIN_WALL_THICK,
   POOL_WATER_EAST,
   POOL_WATER_HALFZ,
   POOL_WATER_WEST,
   POOL_WATER_Y,
+  computePoolBasinGeometry,
   poolBasementBoundsFor,
   poolHoleOutline,
   poolHoleRect,
   type FurnitureItem,
+  type PoolBasinFootprint,
   type Rot,
 } from './furniture';
+
+// ── Shared basin footprint fixture — same authored water rect both pool
+//    builders pass into placeOctagonPoolBasin (see buildLazyPool /
+//    buildClassicPool). Kept here so a future authored-water tweak is picked
+//    up by both the renderer and these tests in lock-step.
+const BASIN_FP: PoolBasinFootprint = {
+  waterXWest: -POOL_WATER_WEST,
+  waterXEast: POOL_WATER_EAST,
+  waterZHalf: POOL_WATER_HALFZ,
+  edgeTopY: -0.95, // EDGE_BOT (top of the retired shallow basin lining)
+};
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 //
@@ -252,5 +268,185 @@ describe('poolHoleOutline', () => {
     const zs = outline.map((p) => p.z);
     expect(Math.min(...zs)).toBeCloseTo(-POOL_WATER_HALFZ, 6);
     expect(Math.max(...zs)).toBeCloseTo(POOL_WATER_HALFZ, 6);
+  });
+});
+
+// ── computePoolBasinGeometry: rendered basin dimensions (regression suite for
+//    the placeOctagonPoolBasin drawer — pure so we can assert exact slab sizes
+//    and positions without a THREE.js runtime). Guards the audit findings:
+//     • plate STRADDLES y=basementY (bottom face 0.02 BELOW the plane, top face
+//       0.06 above) — asserts the geometry the comment now honestly describes.
+//     • long-axis WALLS span the FULL water extent on the narrow axis (NOT
+//       clipped to halfAtFloor), closing off the water at z=±waterZHalf even
+//       in the wing regions |narrow| ∈ [halfAtFloor, halfAtWater] — the leak
+//       remediated 2026‑08‑21.
+//     • degenerate clip ⇒ plate:null, walls:[] (no NaNs, no negative widths).
+//     • rot-aware axis mapping: even rot keeps pool-local aligned with the
+//       room's narrow axis; odd rot swaps the wall placement axis.
+describe('computePoolBasinGeometry', () => {
+  beforeEach(() => bindFreshRoom());
+
+  it('default room + rot 0 plate STRADDLES the basement floor', () => {
+    // PLATE_LIFT = 0.02 (centre offset above basementY), PLATE_THICK = 0.08
+    // ⇒ plate y-extent [basementY − 0.02, basementY + 0.06]. This asserts
+    // finding 3's honest geometry rewrite — the plate is deliberately a hair
+    // above the basement floor plane so the TOP face is what a viewer inside
+    // the pool sees, without Z-fighting the opaque basement floor mesh.
+    const bounds = poolBasementBoundsFor(0);
+    const { plate } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(plate).not.toBeNull();
+    expect(plate!.height).toBeCloseTo(POOL_BASIN_PLATE_THICK, 6);
+    expect(plate!.cy).toBeCloseTo(bounds.basementY + POOL_BASIN_PLATE_LIFT, 6);
+    // Explicit face positions — top just above the plane, bottom just below.
+    const topFaceY = plate!.cy + plate!.height / 2;
+    const bottomFaceY = plate!.cy - plate!.height / 2;
+    expect(topFaceY).toBeCloseTo(bounds.basementY + 0.06, 6);
+    expect(bottomFaceY).toBeCloseTo(bounds.basementY - 0.02, 6);
+  });
+
+  it('default room + rot 0 plate CLIPPED on narrow axis to ±halfAtFloor', () => {
+    // narrowInLocal='x' ⇒ x extents clipped to halfAtFloor (basementHalf);
+    // z extents stay at the authored waterZHalf. Water is asymmetric on X
+    // (west 5.15 vs east 3.4), but both exceed halfAtFloor ≈ 2.485 for the
+    // default 6×6 room, so both sides clip and the plate becomes symmetric
+    // about x=0 with width = 2·halfAtFloor.
+    const bounds = poolBasementBoundsFor(0);
+    const { plate } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(plate).not.toBeNull();
+    expect(plate!.width).toBeCloseTo(2 * bounds.halfAtFloor, 6);
+    expect(plate!.depth).toBeCloseTo(2 * POOL_WATER_HALFZ, 6);
+    expect(plate!.cx).toBeCloseTo(0, 6); // both sides clipped ⇒ symmetric
+    expect(plate!.cz).toBeCloseTo(0, 6);
+  });
+
+  it('default room + rot 0 long-axis WALLS span FULL water extent (not clipped)', () => {
+    // THE finding-1 regression. Before the fix, wall width = plateWidth
+    // (clipped to halfAtFloor), which left the wing regions |x| ∈
+    // [halfAtFloor, waterX*] open past z=±waterZHalf. The wall must now be
+    // FULL water width (waterXWestPos + waterXEast) so the water is closed
+    // off at its long-axis boundary EVERYWHERE it exists.
+    const bounds = poolBasementBoundsFor(0);
+    const { walls } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(walls).toHaveLength(2);
+    const fullWaterWidth = POOL_WATER_WEST + POOL_WATER_EAST; // 5.15 + 3.4 = 8.55
+    for (const wall of walls) {
+      expect(wall.width).toBeCloseTo(fullWaterWidth, 6);
+      // Wall centre-X shifts to the water rect's own centre (asymmetric).
+      expect(wall.cx).toBeCloseTo((POOL_WATER_EAST - POOL_WATER_WEST) / 2, 6);
+      // Wall thickness is the fixed slab depth (long axis = Z).
+      expect(wall.depth).toBeCloseTo(POOL_BASIN_WALL_THICK, 6);
+    }
+    // Anti-regression: FULL width must EXCEED the plate's clipped width for
+    // the default room — otherwise the fix would be indistinguishable from
+    // the old (broken) code.
+    expect(fullWaterWidth).toBeGreaterThan(2 * bounds.halfAtFloor);
+  });
+
+  it('default room + rot 0 walls sit at z=±waterZHalf', () => {
+    const { walls } = computePoolBasinGeometry(BASIN_FP, poolBasementBoundsFor(0));
+    const zs = walls.map((w) => w.cz).sort((a, b) => a - b);
+    expect(zs[0]).toBeCloseTo(-POOL_WATER_HALFZ, 6);
+    expect(zs[1]).toBeCloseTo(POOL_WATER_HALFZ, 6);
+  });
+
+  it('default room + rot 0 wall height spans edgeTopY to basementY', () => {
+    const bounds = poolBasementBoundsFor(0);
+    const { walls } = computePoolBasinGeometry(BASIN_FP, bounds);
+    const expectedHeight = BASIN_FP.edgeTopY - bounds.basementY;
+    const expectedCenterY = (BASIN_FP.edgeTopY + bounds.basementY) / 2;
+    for (const wall of walls) {
+      expect(wall.height).toBeCloseTo(expectedHeight, 6);
+      expect(wall.cy).toBeCloseTo(expectedCenterY, 6);
+    }
+  });
+
+  it('rot 1 (odd) swaps wall placement to the pool-local X axis', () => {
+    // Room narrowAxis='x' (square) + pool rot 1 ⇒ narrowInLocal='z'. The
+    // pool's LONG axis becomes X, so walls sit at x=±waterX{West,East} (asymm)
+    // and span the full water Z extent as their depth.
+    const bounds = poolBasementBoundsFor(1);
+    expect(bounds.narrowInLocal).toBe('z');
+    const { walls } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(walls).toHaveLength(2);
+    // Wall thickness now on X, span on Z.
+    for (const wall of walls) {
+      expect(wall.width).toBeCloseTo(POOL_BASIN_WALL_THICK, 6);
+      expect(wall.depth).toBeCloseTo(2 * POOL_WATER_HALFZ, 6);
+      expect(wall.cz).toBeCloseTo(0, 6);
+    }
+    const xs = walls.map((w) => w.cx).sort((a, b) => a - b);
+    expect(xs[0]).toBeCloseTo(-POOL_WATER_WEST, 6);
+    expect(xs[1]).toBeCloseTo(POOL_WATER_EAST, 6);
+  });
+
+  it('rot 1 (odd) plate clipped on Z (the pool-local narrow axis)', () => {
+    // narrowInLocal='z' ⇒ plate's Z half-extent capped by halfAtFloor; X keeps
+    // the authored asymmetric water extent (5.15 + 3.4).
+    const bounds = poolBasementBoundsFor(1);
+    const { plate } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(plate).not.toBeNull();
+    // halfAtFloor ≈ 2.485 < POOL_WATER_HALFZ (2.9), so Z clips symmetric.
+    expect(plate!.depth).toBeCloseTo(2 * bounds.halfAtFloor, 6);
+    // X un-clipped ⇒ full authored asymmetric width.
+    expect(plate!.width).toBeCloseTo(POOL_WATER_WEST + POOL_WATER_EAST, 6);
+    expect(plate!.cx).toBeCloseTo((POOL_WATER_EAST - POOL_WATER_WEST) / 2, 6);
+    expect(plate!.cz).toBeCloseTo(0, 6);
+  });
+
+  it('non-square room (halfZ<halfX ⇒ narrow=z) wraps to walls-on-X', () => {
+    // 18×12 room ⇒ halfX=9, halfZ=6, narrowAxis='z'. Pool rot 0 keeps
+    // pool-local aligned with the room's narrow axis, so narrowInLocal='z'.
+    // Walls sit at x=±waterX{West,East}, spanning the full Z extent.
+    bindFreshRoom(3, 2);
+    const bounds = poolBasementBoundsFor(0);
+    expect(bounds.narrowInLocal).toBe('z');
+    const { walls } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(walls).toHaveLength(2);
+    const xs = walls.map((w) => w.cx).sort((a, b) => a - b);
+    expect(xs[0]).toBeCloseTo(-POOL_WATER_WEST, 6);
+    expect(xs[1]).toBeCloseTo(POOL_WATER_EAST, 6);
+    // With rot 1 in the same room, wall axis flips back to Z.
+    const { walls: walls1 } = computePoolBasinGeometry(BASIN_FP, poolBasementBoundsFor(1));
+    const zs = walls1.map((w) => w.cz).sort((a, b) => a - b);
+    expect(zs[0]).toBeCloseTo(-POOL_WATER_HALFZ, 6);
+    expect(zs[1]).toBeCloseTo(POOL_WATER_HALFZ, 6);
+  });
+
+  it('degenerate clip returns plate:null, walls:[]', () => {
+    // A pathological footprint where the plate has zero width — the renderer
+    // must skip drawing without emitting NaN geometry (the guard the shipped
+    // placeOctagonPoolBasin used as its width>0 && depth>0 short-circuit).
+    const zeroFP: PoolBasinFootprint = {
+      waterXWest: 0,
+      waterXEast: 0,
+      waterZHalf: POOL_WATER_HALFZ,
+      edgeTopY: -0.95,
+    };
+    const bounds = poolBasementBoundsFor(0);
+    const geom = computePoolBasinGeometry(zeroFP, bounds);
+    expect(geom.plate).toBeNull();
+    expect(geom.walls).toEqual([]);
+  });
+
+  it('non-positive wall height ⇒ walls:[] (plate still present)', () => {
+    // If edgeTopY ≤ basementY the wall would be zero-height or negative — the
+    // helper must return no walls but keep the plate (which does not depend
+    // on edgeTopY). Guards against a caller passing a bad edgeTopY.
+    const bounds = poolBasementBoundsFor(0);
+    const flatFP: PoolBasinFootprint = { ...BASIN_FP, edgeTopY: bounds.basementY };
+    const geom = computePoolBasinGeometry(flatFP, bounds);
+    expect(geom.plate).not.toBeNull();
+    expect(geom.walls).toEqual([]);
+  });
+
+  it('anti-regression: wall span does NOT equal plate width on the default room', () => {
+    // Direct sentinel for finding 1: if a future refactor accidentally
+    // re-clips the wall span back to halfAtFloor, this asserts fails loudly.
+    const bounds = poolBasementBoundsFor(0);
+    const { plate, walls } = computePoolBasinGeometry(BASIN_FP, bounds);
+    expect(plate).not.toBeNull();
+    for (const wall of walls) {
+      expect(wall.width).toBeGreaterThan(plate!.width);
+    }
   });
 });
