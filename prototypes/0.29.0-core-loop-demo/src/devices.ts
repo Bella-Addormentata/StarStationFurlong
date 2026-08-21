@@ -591,6 +591,18 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           : perm.reason;
       }
       if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
+      // A permission change can disable the button that currently HAS focus.
+      // The browser then moves focus out of the panel, so the arrow-key
+      // listener bound to it never fires again and the enabled treasury link
+      // becomes unreachable — the traversal defeating itself. Catch that here,
+      // where the disabling happens, and land on a stop that still works.
+      const active = document.activeElement as HTMLElement | null;
+      if (active instanceof HTMLButtonElement && active.disabled && panel?.contains(active)) {
+        const stops = [
+          ...panel.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]'),
+        ].filter((el) => el.offsetParent !== null);
+        stops[0]?.focus({ preventScroll: true });
+      }
     }
 
     drawWireframe();

@@ -851,6 +851,46 @@ describe('verification caching', () => {
     expect(scan.items[0].collectedSigs).toEqual(session.collectedSigs);
   });
 
+  it('caps one round’s signatures and says the set is partial', () => {
+    // Signature entries are peer-writable and unverified here, so one wanted
+    // session could absorb the whole scan ceiling — and every repaint would
+    // then store, sort and re-validate that array. Capped per session, and
+    // reported, because a partial count shown as a complete one is the same
+    // invented certainty as reporting a held record as absent.
+    const shell = {
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'b2'.repeat(32),
+      bundleHash: '6'.repeat(64),
+      requiredThreshold: 2,
+      expiresAfterHeight: 900,
+    };
+    const sessionId = signingSessionIdOf(shell);
+    const m = doc.getMap('treasury');
+    m.set(`session:${shell.proposalId}:${sessionId}`, {
+      ...shell, sessionId, collectedSigs: [],
+    });
+    for (let i = 0; i < 400; i += 1) {
+      const signer = i.toString(16).padStart(64, '0');
+      m.set(`sessionsig:${sessionId}:${signer}`, { signerPuzzleHash: signer, sig: `s${i}` });
+    }
+    const scan = scanSigningSessions(shell.proposalId, 50_000, 10, 0);
+    expect(scan.items).toHaveLength(1);
+    expect(scan.items[0].collectedSigs.length).toBeLessThanOrEqual(256);
+    expect(scan.signaturesPartial).toBe(true);
+    // An ordinary round is not flagged.
+    const doc2 = new Y.Doc();
+    bindTreasuryDoc(doc2, { verifySig: verifier, networkGenesisChallenge: GENESIS });
+    expect(putSigningSession({
+      ...shell,
+      sessionId,
+      collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
+    })).toBe(true);
+    expect(scanSigningSessions(shell.proposalId, 50_000, 10, 0).signaturesPartial).toBe(false);
+  });
+
   it('survives a value nested deeper than the call stack', () => {
     // A NODE budget does not bound call-stack DEPTH. 64,000 nested arrays cost
     // about one budget unit each — well inside the cap — while a recursive

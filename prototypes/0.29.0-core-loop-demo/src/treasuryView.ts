@@ -860,7 +860,12 @@ export function roomFundingView(
           : 'not-passed';
   const expiryNote =
     expiryStatus === 'unknown'
-      ? 'This record names an end height, but with no chain height available this device cannot say whether it has passed.'
+      ? // Two ways to be unknown, and the terminal prints the reported height
+        // next to this line — so "no chain height available" beside an actual
+        // number was a flat contradiction on screen.
+        currentHeight === null
+        ? 'This record names an end height, but with no chain height available this device cannot say whether it has passed.'
+        : 'This record names an end height, but the height another player reported is earlier than the block this record says it started at — the two disagree, so this device cannot say whether it has passed.'
       : expiryStatus === 'passed'
         ? 'The end height appears to have passed, judged against a height another player reported — not covered by the signature and not checked here.'
         : expiryStatus === 'not-passed'
@@ -1125,7 +1130,26 @@ export interface CompanyScope {
 export function companyScope(
   binding: RoomTreasuryBinding | null,
   policy: CompanyTreasuryPolicy | null,
+  /**
+   * True when a binding IS held but could not be used — malformed, off-network,
+   * or refused on size.
+   *
+   * Without this the plain reader's null was indistinguishable from "no
+   * binding at all", and the fallback below then let the freely-writable
+   * policy name the company on its own. That hands a peer a way to neutralise
+   * the SIGNED anchor and have their own company's board, fingerprint and
+   * proposal list rendered as this room's: write junk over the binding slot,
+   * then write whatever policy you like.
+   */
+  bindingHeldButUnusable = false,
 ): CompanyScope {
+  if (bindingHeldButUnusable) {
+    return {
+      companyId: null,
+      mismatch: true,
+      warning: 'A company funding record is held in this room but cannot be read, so the company details and proposal list are not shown — there is no signed record here to check them against.',
+    };
+  }
   // Company AND treasury: both records name a treasury too, so a policy for
   // the right company but a different treasury would otherwise have that
   // treasury's board, fee ceiling and fingerprint rendered as if the signed

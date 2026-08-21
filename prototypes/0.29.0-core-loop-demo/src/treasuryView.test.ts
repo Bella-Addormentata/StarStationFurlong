@@ -746,6 +746,24 @@ describe('policy, shares, and room funding', () => {
     expect(roomFundingView(expiring(200), 250).headline).toMatch(/may have ended/i);
   });
 
+  it('withholds company details when the signed binding is held but unusable', () => {
+    // The binding is the SIGNED anchor; the policy is freely writable by any
+    // peer. Treating an unusable binding as no binding let the policy name
+    // the company on its own — so writing junk over the binding slot and then
+    // a policy of your choosing put YOUR company's board, fingerprint and
+    // proposals on someone else's room screen.
+    const otherPolicy = { ...policy, companyId: 'd'.repeat(64) } as CompanyTreasuryPolicy;
+    const held = companyScope(null, otherPolicy, true);
+    expect(held.companyId).toBeNull();
+    expect(held.mismatch).toBe(true);
+    expect(held.warning).toMatch(/cannot be read/i);
+    // With no binding held at all, the policy may still stand alone — that is
+    // an ordinary room that has not been bound yet, not a neutralised anchor.
+    const unbound = companyScope(null, otherPolicy, false);
+    expect(unbound.companyId).toBe('d'.repeat(64));
+    expect(unbound.mismatch).toBe(false);
+  });
+
   it('separates company funding from edit rights, and exposes the profile', () => {
     const binding: RoomTreasuryBinding = {
       v: 1,

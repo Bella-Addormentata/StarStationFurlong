@@ -559,6 +559,16 @@ export function listProposals(): TreasuryProposal[] {
  */
 const MAX_KEYS_EXAMINED = 50_000;
 
+/**
+ * The most signatures one approval round may contribute to a screen.
+ *
+ * A real board is a handful of signers. This is not a protocol rule — it is
+ * the same refusal to do unbounded work on a peer's say-so that RECORD_BUDGET
+ * is, applied where an unverified, peer-writable collection feeds a sort and
+ * a re-validation on every repaint.
+ */
+const MAX_SIGS_PER_SESSION = 256;
+
 export interface BoundedScan<T> {
   items: T[];
   truncated: boolean;
@@ -1168,16 +1178,28 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
  * page fell, so a shell on this page always gets the approvals it actually
  * holds. Signature entries cost a few string comparisons, not a hash.
  */
+export interface SigningSessionScan extends BoundedScan<SigningSession> {
+  /**
+   * True when a session's signature set was cut short by a local cap, so the
+   * `collectedSigs` on a returned round may be fewer than the room holds.
+   * Reported apart from `truncated`, which is about ROUNDS being cut, so the
+   * screen can qualify the gathered-of-required count instead of showing a
+   * partial figure as though it were complete.
+   */
+  signaturesPartial: boolean;
+}
+
 export function scanSigningSessions(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
   offset = 0,
-): BoundedScan<SigningSession> {
+): SigningSessionScan {
   const m = readMap();
   if (!m) {
     return {
-      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0, offset: 0,
+      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0,
+      offset: 0, signaturesPartial: false,
     };
   }
   const shellPrefix = `session:${proposalId}:`;
@@ -1218,9 +1240,13 @@ export function scanSigningSessions(
   // signatures held later in the map, which is the very guarantee this split
   // was made to provide.
   let sigExamined = 0;
+  let signaturesPartial = false;
   for (const key of m.keys()) {
     sigExamined += 1;
     if (sigExamined > ceiling) {
+      // Cut short mid-collection: a session on this page may be missing
+      // signatures it actually holds, which the caller has to be able to say.
+      signaturesPartial = true;
       truncated = true;
       break;
     }
@@ -1228,6 +1254,16 @@ export function scanSigningSessions(
     // Session ids are fixed-width Hex32, so the key decomposes exactly.
     const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
     if (!wanted.has(sessionId)) continue;
+    // Per session, not just per scan. Signature entries are peer-writable and
+    // unverified at this layer, so one wanted session could otherwise absorb
+    // the whole ceiling — and every repaint would then store, sort and
+    // re-validate an arbitrarily long array, straight past the detail
+    // screen's cost budget.
+    const already = sigsBySession.get(sessionId);
+    if (already && already.length >= MAX_SIGS_PER_SESSION) {
+      signaturesPartial = true;
+      continue;
+    }
     const value = m.get(key);
     if (typeof value !== 'object' || value === null) continue;
     const entry = value as Record<string, unknown>;
@@ -1268,6 +1304,7 @@ export function scanSigningSessions(
     rejected,
     matched: shellKeys.length,
     offset: start,
+    signaturesPartial,
   };
 }
 

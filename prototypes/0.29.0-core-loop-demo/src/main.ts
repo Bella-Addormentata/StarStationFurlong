@@ -51,7 +51,6 @@ import {
   readProposalResult,
   readProposalPayloadResult,
   readRegistrationResult,
-  readRoomBinding,
   readRoomBindingResult,
   readWindowsCacheResult,
   scanCheckpoints,
@@ -3087,9 +3086,16 @@ function paintTreasuryBody(view: HTMLElement): void {
       ? "no-room"
       : "readable";
   const readable = access === "readable";
+  // Read ONCE, in result form, and share it with the funding panel below: the
+  // scope decision and the funding headline must not disagree about whether a
+  // binding is here. The plain reader's null hid "held but unusable", which
+  // let a peer neutralise the signed binding and have their own policy name
+  // the company for the whole screen.
+  const bindingResult = readable ? readRoomBindingResult(roomId) : null;
   const scope = companyScope(
-    readable ? readRoomBinding(roomId) : null,
+    bindingResult?.status === "ok" ? bindingResult.binding : null,
     policyCache?.policy ?? null,
+    bindingResult?.status === "unreadable" || bindingResult?.status === "too-large",
   );
 
   // The local verdict, always first: this device is not verifying the chain,
@@ -3278,7 +3284,20 @@ function paintTreasuryBody(view: HTMLElement): void {
       </div>
       ${
         approvals.sessions > 0
-          ? row("Gathered in one round", `${approvals.collected} of ${approvals.required ?? "—"}`) +
+          ? row(
+              "Gathered in one round",
+              // Never a bare figure when the set behind it was cut short: a
+              // partial count read as a complete one is the same invented
+              // certainty as reporting a held record as absent.
+              sessionScan.signaturesPartial
+                ? `at least ${approvals.collected} of ${approvals.required ?? "—"}`
+                : `${approvals.collected} of ${approvals.required ?? "—"}`,
+            ) +
+            (sessionScan.signaturesPartial
+              ? dim(
+                  "More approvals for this round are held here than this device would read, so the figure above is a floor, not a total.",
+                )
+              : "") +
             (approvals.required !== null && !approvals.requiredFromPolicy
               ? dim("The number needed comes from the round itself, not the company policy.")
               : "")
@@ -3321,9 +3340,8 @@ function paintTreasuryBody(view: HTMLElement): void {
   // ── List screen ────────────────────────────────────────────────────────
   // roomId, readable and scope come from above, so this branch and the detail
   // branch always agree about whose company is on screen.
-  // The result form, so a binding this device refused on size is reported as
-  // a refusal rather than joining the silence used for a missing record.
-  const bindingResult = readable ? readRoomBindingResult(roomId) : null;
+  // bindingResult comes from above — one read, so the funding headline and the
+  // company scope can never disagree about whether a binding is here.
   const binding = roomFundingView(
     bindingResult?.status === "ok" ? bindingResult.binding : null,
     height,
@@ -3353,7 +3371,19 @@ function paintTreasuryBody(view: HTMLElement): void {
   // behind two dozen pieces of junk with no way to look past them — see
   // scanPrefixed. The offset is clamped to what actually matched, so records
   // arriving or leaving cannot strand the player on an empty page.
-  const page = scanProposals(LIST_SCAN, LIST_CHECKS, treasuryListOffset);
+  let page = scanProposals(LIST_SCAN, LIST_CHECKS, treasuryListOffset);
+  // Clamping alone still stranded the player. If page two was open and the
+  // record count then dropped below one page, the offset clamped to `matched`
+  // — a valid index, but one past the last record — so the screen showed no
+  // rows AND hid the paging controls, because there was no longer more than
+  // one page. Land on the last page that actually holds something.
+  if (page.items.length === 0 && page.matched > 0 && page.offset >= page.matched) {
+    treasuryListOffset = Math.max(
+      0,
+      (Math.ceil(page.matched / LIST_CHECKS) - 1) * LIST_CHECKS,
+    );
+    page = scanProposals(LIST_SCAN, LIST_CHECKS, treasuryListOffset);
+  }
   if (page.offset !== treasuryListOffset) treasuryListOffset = page.offset;
   const truncated = page.truncated;
   const scoped = scopeProposals(page.items, scope.companyId);
