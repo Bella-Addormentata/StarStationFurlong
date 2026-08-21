@@ -1131,7 +1131,20 @@ async function joinRoomAtEpoch(
   // 🎰 #76: bind the shared stand-occupancy map — one CRDT claim per stand
   // slot at multiplayer tables, so two simultaneous walk-ups can't collide on
   // the same standing position. Rebinds per join like games/casino (T0 seam).
-  bindStandsDoc(sync.doc);
+  //
+  // Register the online-players provider so the reap sweep can consult the
+  // room doc's `players` map WITHOUT reaching through the `__ssfDoc` debug
+  // handle. A live-but-quiet peer (present in `players`, past their claim
+  // TTL) keeps their slot; a crashed peer (dropped from `players`) has
+  // theirs reaped. Iterating the map every reap is cheap — a few dozen
+  // entries at most — and keeps the plumbing local to standsDoc.
+  bindStandsDoc(sync.doc, {
+    getOnlinePlayerIds: () => {
+      const ids = new Set<string>();
+      playersMap.forEach((_v, id) => ids.add(id));
+      return ids;
+    },
+  });
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);

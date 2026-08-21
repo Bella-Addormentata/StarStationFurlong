@@ -27,10 +27,18 @@
  * Same shape-guard discipline as gamesDoc.ts / treasuryDoc.ts.
  *
  * REBIND PER JOIN (T0 seam): leaveRoom destroys the Y.Doc; main.ts's
- * joinRoomAtEpoch calls bindStandsDoc(sync.doc) beside the other bindings.
- * OFFLINE FALLBACK mirrors gamesDoc — a page-local doc lazily binds so the
- * feature works solo; a later real join rebinds and the practice claims
- * vanish with the local doc (documented v1 semantics).
+ * joinRoomAtEpoch calls bindStandsDoc(sync.doc, { getOnlinePlayerIds }) beside
+ * the other bindings. OFFLINE FALLBACK mirrors gamesDoc — a page-local doc
+ * lazily binds so the feature works solo; a later real join rebinds and the
+ * practice claims vanish with the local doc (documented v1 semantics).
+ *
+ * ONLINE-PLAYER PROVIDER. The reap sweep needs to know which claim holders
+ * are currently online (a live-but-quiet peer keeps their slot). Rather than
+ * reach through a window back-channel like `__ssfDoc`, main.ts REGISTERS a
+ * provider at bind time that reads the current room doc's `players` map;
+ * the reap code calls `getOnlinePlayerIds()` and gets the same answer.
+ * Tests can bind a fresh doc without a provider and the fallback returns
+ * an empty set (every claim is reapable — the pure engine's expected input).
  */
 
 import * as Y from 'yjs';
@@ -39,21 +47,24 @@ import type { StandClaim } from './standClaims';
 
 let boundDoc: Y.Doc | null = null;
 let standsMap: Y.Map<unknown> | null = null;
-const listeners = new Set<() => void>();
 
 /**
- * Fan out map changes to every subscriber. Copy + isolate (the games/casino
- * guard): a listener may unsubscribe mid-notify, and one throwing render must
- * not kill the rest or Yjs's transaction cleanup.
+ * Optional provider for the currently-online player id set — supplied by
+ * main.ts at bind time so the reap sweep can consult the room doc's
+ * `players` map without a window back-channel (former `__ssfDoc` coupling).
+ * Null in tests / offline fallback → reap treats every expired claim as
+ * reapable, which is what the pure engine tests want.
  */
-function notify(): void {
-  for (const listener of [...listeners]) {
-    try {
-      listener();
-    } catch (err) {
-      console.error('[stands] listener threw during doc notify:', err);
-    }
-  }
+let onlinePlayerIdsProvider: (() => Set<string>) | null = null;
+
+/** Options bag for bindStandsDoc — additive so existing tests keep working. */
+export interface StandsDocOptions {
+  /**
+   * Snapshot of currently-online player ids (the room doc's `players` map,
+   * usually). Called each reap sweep — copy-free callers may reuse a
+   * scratch Set as long as it's fresh per call. Omit in unit tests.
+   */
+  getOnlinePlayerIds?: () => Set<string>;
 }
 
 function docAlive(): boolean {
@@ -66,12 +77,19 @@ function docAlive(): boolean {
  * joinRoomAtEpoch in the no-awaits zone; also self-called with a local doc
  * as the offline fallback. Observers on the PREVIOUS doc died with it
  * (doc.destroy() in leaveRoom) — nothing to detach here.
+ *
+ * Registering a fresh `getOnlinePlayerIds` provider REPLACES the previous
+ * one; passing no options KEEPS the last provider (a rebind for the same
+ * room can skip re-plumbing). To CLEAR the provider (dev / test teardown),
+ * pass `{ getOnlinePlayerIds: undefined }` explicitly and it will fall
+ * back to the empty-set behaviour.
  */
-export function bindStandsDoc(doc: Y.Doc): void {
+export function bindStandsDoc(doc: Y.Doc, opts?: StandsDocOptions): void {
   boundDoc = doc;
   standsMap = doc.getMap('stands');
-  standsMap.observe(() => notify());
-  notify(); // repaint subscribers from the fresh doc
+  if (opts !== undefined && 'getOnlinePlayerIds' in opts) {
+    onlinePlayerIdsProvider = opts.getOnlinePlayerIds ?? null;
+  }
 }
 
 /** Bound map, lazily falling back to a page-local doc (offline practice). */
@@ -81,14 +99,20 @@ function ensureMap(): Y.Map<unknown> {
 }
 
 /**
- * Subscribe to stands-map changes (any slot, any rebind). Returns the
- * unsubscribe. Subscribers re-read via readStandClaim / readAllStandClaims —
- * events carry no payload on purpose, since a rebind swaps the whole map
- * identity.
+ * Snapshot of currently-online player ids for the reap sweep. Returns an
+ * empty set when no provider is registered — safe for tests (nobody
+ * "online", so every stale claim reaps), and the world reap adds the
+ * local player id itself as a belt-and-braces so a solo player never
+ * reaps their own slot even during offline fallback.
  */
-export function subscribeStands(listener: () => void): () => void {
-  listeners.add(listener);
-  return () => listeners.delete(listener);
+export function getOnlinePlayerIds(): Set<string> {
+  if (!onlinePlayerIdsProvider) return new Set<string>();
+  try {
+    return onlinePlayerIdsProvider();
+  } catch (err) {
+    console.error('[stands] online-players provider threw:', err);
+    return new Set<string>();
+  }
 }
 
 /** One slot's claim, or null (empty / malformed peer write). */

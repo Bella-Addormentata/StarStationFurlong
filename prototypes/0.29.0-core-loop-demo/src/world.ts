@@ -27,6 +27,7 @@ import { STANDS, rebuildStands, standsForItem } from "./stands";
 // tier picker + expiry rules; world.ts wires them into walk-up + heartbeat.
 import {
   claimStand,
+  getOnlinePlayerIds,
   readAllStandClaims,
   readStandClaim,
   reapExpiredClaims,
@@ -37,6 +38,7 @@ import {
   STAND_CLAIM_REAP_MS,
   findExpiredClaims,
   pickStandForWalkup,
+  shouldReleaseSlot,
 } from "./standClaims";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
 import {
@@ -4720,10 +4722,30 @@ export class World {
    * device focus ends. Proximity to remote avatars still adds a backup filter
    * so a peer that never wrote a claim (legacy client / lost write) doesn't
    * get walked through.
+   *
+   * SLOT-ID CLOSURE (audit fix). The wrapped onRelease closes over the slot
+   * id we picked HERE, not `this.trackedStand.slotId` at call time. Two
+   * back-to-back approaches (switching tables) previously overwrote
+   * trackedStand between the first table's claim and the release that came
+   * later, causing the release to drop the WRONG slot. Capturing per-wrap
+   * fixes that regardless of what races between construction and release.
+   *
+   * RELEASE-BEFORE-CLAIM (audit fix). If we already track a claim on this
+   * same table's DIFFERENT slot (rare: pickFreeStand landed on another slot
+   * after our first pick's TTL expired between clicks) we release the prior
+   * claim first — a stale write that outlives our tenure would otherwise
+   * strand a slot from other peers' view.
    */
   private standTarget(device: DeviceTarget): DeviceTarget {
     const stand = this.pickFreeStand(device.id);
     if (!stand) return device;
+    // If we already have a tracked claim on a DIFFERENT slot (same table's
+    // other position, or a leftover from an aborted approach), release it
+    // first so the doc reflects only the slot we're actually walking to.
+    const prior = this.trackedStand;
+    if (prior && prior.slotId !== stand.id) {
+      this.releaseStandById(prior.slotId);
+    }
     // Claim + track the slot so update() can heartbeat it and the release
     // hook can free it. Wrapping the caller's existing onRelease keeps trunk-
     // style choreography intact if this ever gets composed on a device that
@@ -4735,13 +4757,16 @@ export class World {
       itemId: device.id,
       lastHeartbeat: now,
     };
+    // Capture per-wrap so a subsequent standTarget() that overwrites
+    // trackedStand can't redirect THIS closure's release to a different slot.
+    const claimedSlotId = stand.id;
     const priorRelease = device.onRelease;
     return {
       ...device,
       front: stand.front,
       faceAngle: stand.faceAngle,
       onRelease: () => {
-        this.releaseTrackedStand();
+        this.releaseStandById(claimedSlotId);
         if (priorRelease) {
           try { priorRelease(); } catch (err) { console.error(err); }
         }
@@ -4749,15 +4774,36 @@ export class World {
     };
   }
 
-  /** Release the currently-tracked stand (if any). Idempotent — safe to call
-   *  from every release path, including a leaveRoom teardown. */
-  private releaseTrackedStand(): void {
-    const tracked = this.trackedStand;
-    if (!tracked) return;
-    this.trackedStand = null;
-    try { releaseStand(tracked.slotId); }
+  /**
+   * Release ONE specific slot from the doc, clearing trackedStand only if it
+   * still matches. The wrapped onRelease closure (and the requestDeviceFocus
+   * pre-cleanup for a table→different-device swap) both call this so the
+   * released slot is always the one the caller CLAIMED, never whatever
+   * `trackedStand` currently points to.
+   *
+   * Ownership guard (shouldReleaseSlot): if the current doc value for this
+   * key names another player (a legit TTL race where we lost tenure and a
+   * peer legitimately took the slot), we DO NOT delete their claim — an
+   * over-eager release would violate the ownership rule the whole claim
+   * system defends against. `shouldReleaseSlot` returns true when the slot
+   * is empty (our expected common case) OR when we're still the named owner.
+   */
+  private releaseStandById(slotId: string): void {
+    if (this.trackedStand?.slotId === slotId) {
+      this.trackedStand = null;
+    }
+    let current;
+    try {
+      current = readStandClaim(slotId);
+    } catch (err) {
+      console.error("[stands] readStandClaim threw during release:", err);
+      current = null;
+    }
+    if (!shouldReleaseSlot(current, getPlayerId())) return;
+    try { releaseStand(slotId); }
     catch (err) { console.error("[stands] release threw:", err); }
   }
+
 
   /**
    * Refresh the local player's stand claim at the heartbeat cadence. A live
@@ -4784,18 +4830,20 @@ export class World {
    * longer online (per the room doc's `players` map). Delete-only + LWW-safe:
    * a fresh heartbeat that races the reap just re-writes the same key, and Yjs
    * picks whichever landed last.
+   *
+   * The online set is sourced through `getOnlinePlayerIds()` from standsDoc,
+   * which main.ts wires to the room doc's `players` map at bind time — a
+   * proper injected accessor rather than reaching through the `__ssfDoc`
+   * debug window handle. We add the local player id as belt-and-braces so
+   * a solo session (or offline fallback) never reaps its own slot even
+   * before the local presence entry has been written.
    */
   private tickStandReap(deltaTime: number): void {
     this.standReapAccumMs += deltaTime * 1000;
     if (this.standReapAccumMs < STAND_CLAIM_REAP_MS) return;
     this.standReapAccumMs = 0;
-    // Currently-online player ids — the local player plus everyone with an
-    // entry in the room doc's `players` map. The `players` map is the
-    // canonical presence source: peers upsert on join, entries stick after
-    // leave (fine — they'll age out via the TTL if they never come back).
-    const online = new Set<string>([getPlayerId()]);
-    const doc = (window as unknown as { __ssfDoc?: import("yjs").Doc }).__ssfDoc;
-    doc?.getMap("players").forEach((_v, k) => online.add(k));
+    const online = getOnlinePlayerIds();
+    online.add(getPlayerId());
     const stale = findExpiredClaims({
       claims: readAllStandClaims(),
       onlinePlayerIds: online,
@@ -5214,6 +5262,21 @@ export class World {
   public requestDeviceFocus(deviceId: string): void {
     const device = findDevice(deviceId);
     if (!device || !this.isPlayerActive()) return;
+
+    // 🎰 #76 (audit fix): if the previous focus target was a TABLE that we
+    // claimed a stand slot on, and the new target is a DIFFERENT device (a
+    // non-table like the cashier, or a different table), release the prior
+    // claim NOW — before the player-side cancellation path runs. The player
+    // aborts an unfinished device APPROACH via `_cancelDeviceApproach`
+    // (player.ts), which clears deviceTarget/hooks WITHOUT firing the
+    // wrapped `onRelease`; without this pre-cleanup the claim would leak
+    // into the doc and the heartbeat would keep refreshing it forever.
+    // Same table (re-tap): keep the current claim; standTarget below will
+    // either re-claim the same slot (heartbeat) or release-and-swap to a
+    // different slot on that table.
+    if (this.trackedStand && this.trackedStand.itemId !== deviceId) {
+      this.releaseStandById(this.trackedStand.slotId);
+    }
 
     if (device.kind === "roomTerminal") {
       const screen = this.wallScreens.get(deviceId) ?? null;

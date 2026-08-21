@@ -7,7 +7,7 @@
 //   • CRDT convergence across two docs (LWW picks one winner on both replicas)
 //   • release + reap batch semantics
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   STAND_CLAIM_TTL_MS,
@@ -17,11 +17,13 @@ import {
   isClaimActive,
   isStandClaim,
   pickStandForWalkup,
+  shouldReleaseSlot,
   type StandClaim,
 } from './standClaims';
 import {
   bindStandsDoc,
   claimStand,
+  getOnlinePlayerIds,
   readAllStandClaims,
   readStandClaim,
   reapExpiredClaims,
@@ -231,7 +233,7 @@ describe('pickStandForWalkup (tier order)', () => {
     expect(picked.map((s) => s.id)).toEqual(['t1:s0']);
   });
 
-  it('keeps an owner on a reserved slot they already hold (re-focus)', () => {
+  it('keeps an owner on a reserved slot they already hold in TIER 1 (re-focus resume, audit fix)', () => {
     const claims = new Map<string, StandClaim>([
       ['t1:s0', { playerId: OWNER, at: T0 }],
     ]);
@@ -242,10 +244,34 @@ describe('pickStandForWalkup (tier order)', () => {
       now: T0,
       canOperateReserved: true,
     });
-    // The reserved slot the owner already holds appears LAST (reserved tier),
-    // but it's still there — otherwise the caller would leave the wheel-head.
-    expect(picked.map((s) => s.id)).toContain('t1:s0');
-    expect(picked[picked.length - 1].id).toBe('t1:s0');
+    // Audit remediation: an owner's OWN active claim on a reserved slot is a
+    // "resume" and belongs in mine-active (tier 1), NOT the reserved-fallback
+    // tier — otherwise an owner walking back to the wheel-head would prefer
+    // any open civilian slot in front of it. The issue directive is that
+    // owners/operators stand IN the reserved spot, so re-focus honours that.
+    expect(picked[0].id).toBe('t1:s0');
+    // Every other civilian slot is still on offer (in case the wheel-head
+    // is somehow unavailable at walk time), just after mine-active.
+    expect(picked.slice(1).map((s) => s.id).sort())
+      .toEqual(['t1:s1', 't1:s2', 't1:s3']);
+  });
+
+  it('drops a former operator\'s own reserved-slot claim once they lose spin rights', () => {
+    // Audit fix side effect: mine-active for a reserved slot is gated by
+    // canOperateReserved. A former owner still hearing about their old claim
+    // in the doc should NOT walk back onto the wheel-head — the claim will
+    // age out via TTL, and meanwhile the caller lands on an open civilian.
+    const claims = new Map<string, StandClaim>([
+      ['t1:s0', { playerId: OWNER, at: T0 }],
+    ]);
+    const picked = pickStandForWalkup({
+      slots,
+      claims,
+      playerId: OWNER,
+      now: T0,
+      canOperateReserved: false,
+    });
+    expect(picked.map((s) => s.id)).toEqual(['t1:s1', 't1:s2', 't1:s3']);
   });
 });
 
@@ -323,11 +349,11 @@ describe('standsDoc round-trip and shape guard', () => {
   it('release is a no-op on a missing key (no observer spam)', () => {
     let notifies = 0;
     const unsub = (() => {
-      // Fresh doc to bind a listener that counts fan-outs.
+      // Fresh doc to bind a listener that counts fan-outs. Attach directly
+      // to the Y.Map's observe hook — the subscribeStands fan-out was
+      // removed as dead code (audit fix), and no consumer subscribes today.
       const doc = new Y.Doc();
       bindStandsDoc(doc);
-      // subscribeStands is imported for wiring but we don't need it here —
-      // the observe hook is enough. Attach one directly to see writes.
       doc.getMap('stands').observe(() => (notifies += 1));
       return () => doc.destroy();
     })();
@@ -426,5 +452,159 @@ describe('CRDT convergence: two peers grab the same slot', () => {
       canOperateReserved: false,
     });
     expect(picked.map((s) => s.id)).toEqual(['t1:s1']);
+  });
+});
+
+// ── Audit fixes: pure regressions for the release-guard + provider paths ───
+
+describe('shouldReleaseSlot (release-ownership guard)', () => {
+  // World.ts's releaseStandById calls this before deleting a slot key so a
+  // hypothetical TTL race where another peer legitimately took our slot
+  // cannot cause our stale release closure to drop THEIR claim.
+  it('allows a release when the slot is empty', () => {
+    expect(shouldReleaseSlot(null, ALICE)).toBe(true);
+  });
+
+  it('allows a release when the current claim names us', () => {
+    expect(shouldReleaseSlot({ playerId: ALICE, at: T0 }, ALICE)).toBe(true);
+  });
+
+  it('refuses to drop another live player\'s claim', () => {
+    expect(shouldReleaseSlot({ playerId: BOB, at: T0 }, ALICE)).toBe(false);
+  });
+
+  it('refuses even a stale foreign claim — the reaper handles cleanup, not us', () => {
+    // Ownership is name-based, not time-based, on this path. Only the
+    // reaper (findExpiredClaims + reapExpiredClaims) should touch a
+    // stale foreign claim; an over-eager per-slot release would race the
+    // legitimate owner's fresh heartbeat.
+    expect(shouldReleaseSlot({ playerId: BOB, at: 0 }, ALICE)).toBe(false);
+  });
+});
+
+describe('stand-switch release-before-claim (audit remediation for finding #1 / #2)', () => {
+  // Simulates world.ts's standTarget + wrapped onRelease sequence:
+  //   1. Claim slot A (walk to table A starts, trackedStand = { slotId:A }).
+  //   2. User clicks table B → standTarget releases A (per fix), claims B.
+  //   3. Later A_wrapped.onRelease fires via the deferred release path.
+  // The wrapped closure captures the ORIGINAL slot id (A) at wrap time, so
+  // the release in step 3 must target A (already gone), never B. And the
+  // ownership guard (shouldReleaseSlot) must protect against dropping B.
+  //
+  // Testing the wrapped-closure semantics with the doc directly rather than
+  // driving through world.ts (which needs a live scene) — the standsDoc
+  // half is the load-bearing correctness proof; world.ts's wire-up is the
+  // trivial adapter around it.
+  beforeEach(() => bindStandsDoc(new Y.Doc()));
+
+  it('releasing slot A after re-claiming slot B leaves B intact', () => {
+    // Step 1: claim A, capture its id in a "wrap" closure.
+    claimStand('t1:s0', ALICE, T0);
+    const wrapA = { slotIdAtWrap: 't1:s0' };
+    // Step 2: switch tables → release A, claim B (in trackedStand terms,
+    // trackedStand is now s2 not s0). The fix in standTarget also does
+    // this pre-release; simulate directly here.
+    releaseStand(wrapA.slotIdAtWrap);
+    claimStand('t2:s0', ALICE, T0 + 100);
+    // Step 3: A's stale wrap onRelease fires — it must target A (captured),
+    // not "whatever we track now". World.ts's releaseStandById reads the
+    // current claim, sees it's empty (already released), so the
+    // shouldReleaseSlot guard allows a no-op releaseStand call.
+    const current = readStandClaim(wrapA.slotIdAtWrap);
+    expect(shouldReleaseSlot(current, ALICE)).toBe(true);
+    if (shouldReleaseSlot(current, ALICE)) releaseStand(wrapA.slotIdAtWrap);
+    // B survives intact.
+    expect(readStandClaim('t2:s0')).toEqual({ playerId: ALICE, at: T0 + 100 });
+  });
+
+  it('the ownership guard prevents an errant release from dropping another peer\'s slot', () => {
+    // Contrived race: Alice's TTL expired and Bob legitimately took her old
+    // slot. Alice's stale wrap onRelease should NOT delete Bob's claim.
+    claimStand('t1:s0', BOB, T0);
+    const wrapA = { slotIdAtWrap: 't1:s0' };
+    const current = readStandClaim(wrapA.slotIdAtWrap);
+    expect(shouldReleaseSlot(current, ALICE)).toBe(false);
+    // The guard refuses — world.ts's releaseStandById early-returns without
+    // calling releaseStand. Bob's claim stays.
+    expect(readStandClaim('t1:s0')).toEqual({ playerId: BOB, at: T0 });
+  });
+
+  it('leaked claim from an aborted walk-up is reapable once the local player goes offline', () => {
+    // Documents the recovery path if a leak somehow slips past the fix:
+    // once the local player id is no longer in the online set, the reaper
+    // sees the expired claim and deletes it. Before the audit fix, the
+    // local player id was ALWAYS in the online set, so a leaked claim
+    // stuck for the entire session.
+    claimStand('t1:s0', ALICE, T0);
+    // Alice's tab actually crashed (not just "quiet"): she's not in the
+    // online set. Well past the TTL.
+    const late = T0 + STAND_CLAIM_TTL_MS + 100;
+    const stale = findExpiredClaims({
+      claims: readAllStandClaims(),
+      onlinePlayerIds: new Set<string>(), // Alice not online → reapable
+      now: late,
+    });
+    expect(stale).toEqual(['t1:s0']);
+  });
+});
+
+describe('online-players provider (audit remediation for finding #5)', () => {
+  // Formerly world.ts reached into `window.__ssfDoc` to enumerate the
+  // room's `players` map. The audit called that a coupling smell in a
+  // hot path; the fix is a proper accessor registered at bind time.
+  beforeEach(() => bindStandsDoc(new Y.Doc()));
+
+  it('returns an empty set when no provider is registered (tests / offline)', () => {
+    // Fresh binding via beforeEach cleared any prior test's provider only
+    // if that test passed `{ getOnlinePlayerIds: undefined }` explicitly.
+    // Belt-and-braces: clear it here for hermeticity.
+    bindStandsDoc(new Y.Doc(), { getOnlinePlayerIds: undefined });
+    expect(getOnlinePlayerIds().size).toBe(0);
+  });
+
+  it('surfaces whatever set the provider returns', () => {
+    bindStandsDoc(new Y.Doc(), {
+      getOnlinePlayerIds: () => new Set([ALICE, BOB]),
+    });
+    const ids = getOnlinePlayerIds();
+    expect(ids.has(ALICE)).toBe(true);
+    expect(ids.has(BOB)).toBe(true);
+  });
+
+  it('swallows a throwing provider and returns an empty set (fail-safe)', () => {
+    // The reap sweep runs every 3 s of world update; a provider that
+    // throws once (e.g. Y.Map racing a leaveRoom teardown) must not crash
+    // the world loop. World.ts adds getPlayerId() locally after the
+    // provider call, so a solo user still keeps their own slot even
+    // during a transient provider failure.
+    //
+    // Suppress the expected [stands] error log so the test output stays
+    // clean — the log itself is the diagnostic, and we assert on the
+    // return value here.
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    bindStandsDoc(new Y.Doc(), {
+      getOnlinePlayerIds: () => {
+        throw new Error('boom');
+      },
+    });
+    expect(getOnlinePlayerIds().size).toBe(0);
+    expect(errSpy).toHaveBeenCalledOnce();
+    errSpy.mockRestore();
+  });
+
+  it('a rebind without opts keeps the previous provider (partial rebind pattern)', () => {
+    bindStandsDoc(new Y.Doc(), {
+      getOnlinePlayerIds: () => new Set([ALICE]),
+    });
+    bindStandsDoc(new Y.Doc()); // rebind for a new room, opts intentionally omitted
+    expect(getOnlinePlayerIds().has(ALICE)).toBe(true);
+  });
+
+  it('a rebind with { getOnlinePlayerIds: undefined } CLEARS the provider', () => {
+    bindStandsDoc(new Y.Doc(), {
+      getOnlinePlayerIds: () => new Set([ALICE]),
+    });
+    bindStandsDoc(new Y.Doc(), { getOnlinePlayerIds: undefined });
+    expect(getOnlinePlayerIds().size).toBe(0);
   });
 });

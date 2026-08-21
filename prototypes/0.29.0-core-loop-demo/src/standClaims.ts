@@ -123,15 +123,25 @@ export function canPlayerClaim(
  * Ordered candidates for a walk-up, given a claim snapshot + a player.
  *
  * TIER RULE:
- *   1. OPEN non-reserved slots that this player already claims (heartbeat
- *      resume — if I focused and briefly walked away my slot is still mine).
+ *   1. OPEN slots that this player ALREADY CLAIMS (heartbeat resume — if I
+ *      focused and briefly walked away my slot is still mine). Includes
+ *      MY reserved-slot claim when I'm authorised (canOperateReserved), so
+ *      an owner walking back to their wheel-head post lands on the SAME
+ *      spot they left — issue #76: "someone that has spin privileges, to
+ *      stand in a reserved spot".
  *   2. OPEN non-reserved slots claimable by this player (empty or stale).
- *   3. If the player is owner-equivalent, OPEN reserved slots (last-resort
- *      fallback so the owner isn't stranded).
+ *   3. If the player is owner-equivalent AND has no prior claim, OPEN
+ *      reserved slots (last-resort fallback so the owner isn't stranded).
  *
  * Within each tier the caller supplies the sort key (nearest by walk distance
  * in world.ts); this module just returns the tier order so tests can pin the
  * policy without importing pathfinding.
+ *
+ * Rationale for putting mine-reserved in tier 1: the owner's OWN active
+ * claim on the wheel-head is a "resume" signal, and world.ts's stable tier
+ * sort (`tierOf` at pickFreeStand) already grants tier 0 to any slot the
+ * local player claims — aligning pickStandForWalkup's tier assignment
+ * removes a subtle disagreement between the two layers.
  */
 export function pickStandForWalkup(args: {
   slots: readonly StandSlot[];
@@ -148,13 +158,13 @@ export function pickStandForWalkup(args: {
     const claim = claims.get(s.id) ?? null;
     // "Mine, still active" wins the first tier so re-focus resumes cleanly.
     if (claim && claim.playerId === playerId && isClaimActive(claim, now)) {
-      if (!s.role) mineActive.push(s);
-      // A held reserved slot (owner already at the wheel-head) falls into
-      // the reserved tier so a re-focus still lands on it, but only if the
-      // player is still authorised (canOperateReserved). If not, we quietly
-      // skip — the claim will expire, and the caller falls back to the
-      // device's own front.
-      else if (canOperateReserved) openReserved.push(s);
+      // A held reserved slot (owner already at the wheel-head) belongs in
+      // the same "mine" tier so a re-focus still lands on it — but only if
+      // the player is still authorised (canOperateReserved). If not, we
+      // quietly skip: the claim will expire, and the caller falls back to
+      // the device's own front. A civilian slot (no `role`) is always mine
+      // to resume.
+      if (!s.role || canOperateReserved) mineActive.push(s);
       continue;
     }
     if (!canPlayerClaim(claim, playerId, now)) continue;
@@ -164,10 +174,29 @@ export function pickStandForWalkup(args: {
       openCivilian.push(s);
     }
   }
-  // Reserved tier appended LAST so operators still prefer a civilian spot
-  // when the wheel-head robot is around (the reserved slot's job is to keep
-  // the robot's post clear, not to be the operator's default walk-up).
+  // Reserved tier appended LAST for a FRESH walk-up so operators still
+  // prefer an open civilian spot when the wheel-head robot is around (the
+  // reserved slot's job is to keep the robot's post clear). A RESUME onto
+  // a reserved slot the operator already holds bypasses this by landing
+  // in mineActive (tier 1) above.
   return [...mineActive, ...openCivilian, ...openReserved];
+}
+
+/**
+ * Should the caller be allowed to DELETE a claim key it thinks it owns?
+ * True when the current claim in the doc is empty, or when it names the
+ * caller as playerId. Guard against a hypothetical race where our TTL
+ * expired between claim-and-release and another peer legitimately took
+ * the slot — we must not drop THEIR claim.
+ *
+ * Pure helper used by world.ts's releaseStandById; centralised here so the
+ * ownership rule is testable without a live doc.
+ */
+export function shouldReleaseSlot(
+  current: StandClaim | null,
+  playerId: string,
+): boolean {
+  return current === null || current.playerId === playerId;
 }
 
 /**
