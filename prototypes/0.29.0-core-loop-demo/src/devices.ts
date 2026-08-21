@@ -113,10 +113,21 @@ import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
+// Trading floor (#68 V4): the wall-mounted terminal at a venture's OFFICE
+// shows offers on the board + a price chart drawn from the settlement tape.
+// Bind is at the T0 seam (main.ts) alongside bindVentures / bindOffers.
+import {
+  listOpenOffers, listTape, priceHistory,
+  makeFloorOffer, postFloorOffer, acceptFloorOffer, cancelFloorOffer,
+  reconcileTradingFloor, subscribeTradingFloor,
+  type FloorOffer, type FloorOfferKind,
+} from './tradingFloorDoc';
+import { ventureRecord, isOfficeHere, myVentureShares } from './ventures';
+import { getIdentityPub } from './keypair';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'tradingScreen';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -653,6 +664,330 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       if (refreshTimer >= 0.25) { // 4 Hz is plenty for status + wireframe
         refreshTimer = 0;
         refresh();
+      }
+    },
+  };
+}
+
+// ── #68 V4 trading screen focused UI — offers board + price chart, diegetic ──
+
+/**
+ * Callback hooks the trading-screen UI uses to talk to its host. myName is
+ * copied into signed records (offer maker/taker name); it must resolve to a
+ * stable display name at each call so a rename between mount and click is
+ * captured. onDone lets the UI ask the focus controller to step back after
+ * a settled trade (currently unused; the taker often stays on-screen to
+ * watch the tape re-render).
+ */
+export interface TradingScreenDeps {
+  myName: () => string;
+  requestRelease?: () => void;
+  /** Dim the in-world screen to "TERMINAL IN USE" while the panel is up. */
+  onEngagedChange?: (engaged: boolean) => void;
+}
+
+/**
+ * The trading-screen's focused DOM UI (#68 V4). Renders three sections:
+ *   • THE BOARD — every open SELL/BUY offer for the venture whose OFFICE
+ *     you stand in; per-row ACCEPT (or CANCEL if yours). Refuses to open
+ *     off-office (a link-viewer sees the board + chart, but the buttons
+ *     stay disabled — settlement is office-authoritative).
+ *   • YOUR SLIP — a small form to sign a new SELL or BUY offer.
+ *   • PRICE CHART — a sparkline of the settlement tape (priceMojo × shares),
+ *     drawn from priceHistory(ventureId); when no trades yet, the pane
+ *     shows "NO TRADES YET" so the user knows they're seeing truth, not
+ *     a failure.
+ *
+ * PLAIN-LANGUAGE RULE (#68 hard requirement): every string here says OFFER,
+ * SHARES, VENTURE, REGISTRY. No chain jargon.
+ *
+ * Refresh cadence: 4 Hz timer + a live subscribe to the trading floor doc
+ * so a peer's write appears within one frame after the merge. Because
+ * reconcile is idempotent, calling it on every refresh is safe (and cheap:
+ * a no-op unless an accept just landed).
+ */
+export function createTradingScreenUI(deps: TradingScreenDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let chart: HTMLCanvasElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let refreshTimer = 0;
+
+  // Convert priceMojo to a display string. v1 gift offers are "GIFT"; priced
+  // offers show as an integer + " M/share". Deliberately NOT calling this
+  // XCH — plain-language rule (Chia jargon on the screen breaks the surface).
+  const priceText = (priceMojo: number): string =>
+    priceMojo === 0 ? 'GIFT' : `${priceMojo.toLocaleString()} M/share`;
+
+  const drawChart = (): void => {
+    if (!chart) return;
+    const ctx = chart.getContext('2d');
+    if (!ctx) return;
+    const W = chart.width;
+    const H = chart.height;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#0A1018';
+    ctx.fillRect(0, 0, W, H);
+    const v = ventureRecord();
+    if (!v) {
+      ctx.fillStyle = '#4A5560';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('NO VENTURE HERE', W / 2, H / 2);
+      return;
+    }
+    const rows = priceHistory(v.id);
+    // Baseline grid (subtle).
+    ctx.strokeStyle = 'rgba(62, 146, 184, 0.15)';
+    ctx.lineWidth = 1;
+    for (let g = 1; g < 4; g++) {
+      const y = (g / 4) * H;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    if (rows.length === 0) {
+      ctx.fillStyle = '#4A5560';
+      ctx.font = '12px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('NO TRADES YET', W / 2, H / 2);
+      ctx.font = '9px monospace';
+      ctx.fillStyle = '#33404E';
+      ctx.fillText('Signed offers only — accepted offers land on the tape here.', W / 2, H / 2 + 20);
+      return;
+    }
+    // Determine price range. Gifts (priceMojo=0) go at the axis bottom;
+    // the chart is meaningful only when priced offers exist (V3 rail).
+    const maxPrice = rows.reduce((mx, r) => Math.max(mx, r.priceMojo), 1);
+    const t0 = rows[0].t;
+    const tN = rows[rows.length - 1].t;
+    const span = Math.max(1, tN - t0);
+    // Points
+    ctx.strokeStyle = '#00E5FF';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    rows.forEach((r, i) => {
+      const x = span > 0 ? ((r.t - t0) / span) * (W - 20) + 10 : W / 2;
+      const y = H - 10 - (r.priceMojo / maxPrice) * (H - 20);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // Trade dots (SELL green, BUY amber)
+    for (const r of rows) {
+      const x = span > 0 ? ((r.t - t0) / span) * (W - 20) + 10 : W / 2;
+      const y = H - 10 - (r.priceMojo / maxPrice) * (H - 20);
+      ctx.fillStyle = r.kind === 'SELL' ? '#00E676' : '#D4A84B';
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    // Axis label
+    ctx.fillStyle = 'rgba(62, 146, 184, 0.55)';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`PRICE CHART — ${rows.length} trade${rows.length === 1 ? '' : 's'}`, 10, 6);
+  };
+
+  const rowHtml = (o: FloorOffer, myPub: string): string => {
+    const mine = o.makerPub === myPub;
+    const btnLabel = mine ? 'CANCEL' : 'ACCEPT';
+    const btnClass = mine ? 'tf-btn-cancel' : 'tf-btn-accept';
+    const kindColor = o.kind === 'SELL' ? '#FF9E80' : '#B9F6CA'; // sell=red-ish, buy=green-ish
+    return `
+      <div class="tf-row" data-offer-id="${o.offerId}"
+        style="display:grid; grid-template-columns: 56px 60px 1fr auto; gap:8px; align-items:center; padding:6px 8px; border:1px solid rgba(212,168,75,0.15); border-radius:4px; background:rgba(4,8,22,0.6); margin-bottom:4px; font-size:11px;">
+        <span style="color:${kindColor}; font-weight:800; letter-spacing:1px;">${o.kind}</span>
+        <span style="color:#F0C060;">${o.shares} sh</span>
+        <span style="color:#8FA3B8;">${escapeText(o.makerName)} · <span style="color:#3E92B8;">${priceText(o.priceMojo)}</span></span>
+        <button data-action="${mine ? 'cancel' : 'accept'}" class="${btnClass}"
+          style="padding:4px 10px; background:${mine ? 'rgba(255,23,68,0.15)' : 'rgba(0,230,118,0.15)'};
+          border:1px solid ${mine ? 'rgba(255,23,68,0.45)' : 'rgba(0,230,118,0.45)'};
+          border-radius:4px; color:${mine ? '#FF8A80' : '#B9F6CA'};
+          font-family:inherit; font-size:10px; font-weight:800; letter-spacing:1px; cursor:pointer;">${btnLabel}</button>
+      </div>`;
+  };
+
+  // HTML-escape for the maker name display (peer-supplied string — never trust).
+  const escapeText = (s: string): string =>
+    s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
+
+  const refresh = (): void => {
+    if (!panel) return;
+    const myPub = getIdentityPub();
+    const v = ventureRecord();
+    const officeHere = isOfficeHere();
+    const heading = panel.querySelector<HTMLElement>('#tf-heading');
+    if (heading) {
+      heading.textContent = v ? `TRADING FLOOR — ${v.name.toUpperCase()}` : 'TRADING FLOOR';
+    }
+    const status = panel.querySelector<HTMLElement>('#tf-status');
+    if (status) {
+      status.textContent = v && officeHere
+        ? `YOU HOLD ${myVentureShares(myPub)} / ${v.totalShares} SHARES`
+        : v ? 'PROPERTY LINK — SETTLEMENT LIVES AT THE OFFICE' : 'NO VENTURE HERE';
+      status.style.color = v && officeHere ? '#D4A84B' : '#8FA3B8';
+    }
+    const board = panel.querySelector<HTMLElement>('#tf-board');
+    if (board) {
+      const offers = v ? listOpenOffers().filter((o) => o.ventureId === v.id) : [];
+      if (offers.length === 0) {
+        board.innerHTML = `<div style="color:#4A5560; font-size:11px; text-align:center; padding:16px;">
+          NO OPEN OFFERS<br><span style="color:#33404E; font-size:9px;">Sign a slip below to post the first one.</span>
+        </div>`;
+      } else {
+        board.innerHTML = offers.map((o) => rowHtml(o, myPub)).join('');
+      }
+    }
+    // Slip form: gate the submit button on office + venture + valid shares.
+    const submit = panel.querySelector<HTMLButtonElement>('#tf-submit');
+    if (submit) {
+      const ok = !!v && officeHere;
+      submit.disabled = !ok;
+      submit.style.opacity = ok ? '1' : '0.35';
+      submit.style.cursor = ok ? 'pointer' : 'not-allowed';
+      submit.title = ok ? 'Sign and post the offer to the floor'
+        : (!v ? 'No venture here.' : 'Only the venture office can accept new offers.');
+    }
+    // Tape rows below the chart — "last 8 trades".
+    const tape = panel.querySelector<HTMLElement>('#tf-tape');
+    if (tape) {
+      const rows = v
+        ? listTape().filter((t) => t.ventureId === v.id).slice(-8).reverse()
+        : [];
+      if (rows.length === 0) {
+        tape.innerHTML = '<div style="color:#4A5560; font-size:10px; text-align:center; padding:8px;">tape empty</div>';
+      } else {
+        tape.innerHTML = rows.map((r) => `
+          <div style="display:grid; grid-template-columns: 48px 46px 1fr auto; gap:6px; padding:2px 6px; font-size:10px; color:#8FA3B8;">
+            <span style="color:${r.kind === 'SELL' ? '#00E676' : '#D4A84B'}; font-weight:800;">${r.kind}</span>
+            <span>${r.shares} sh</span>
+            <span>at ${priceText(r.priceMojo)}</span>
+            <span style="color:#4A5560;">${new Date(r.settledAt).toLocaleTimeString().slice(0, 5)}</span>
+          </div>`).join('');
+      }
+    }
+    drawChart();
+  };
+
+  const attachRowHandlers = (): void => {
+    if (!panel) return;
+    panel.querySelectorAll<HTMLButtonElement>('.tf-btn-accept, .tf-btn-cancel').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const row = (e.currentTarget as HTMLElement).closest<HTMLElement>('.tf-row');
+        const offerId = row?.dataset.offerId;
+        if (!offerId) return;
+        const action = (e.currentTarget as HTMLElement).dataset.action;
+        if (action === 'accept') {
+          acceptFloorOffer(offerId, deps.myName());
+          reconcileTradingFloor();
+        } else if (action === 'cancel') {
+          cancelFloorOffer(offerId);
+        }
+        refresh();
+      };
+    });
+  };
+
+  const refreshAndBind = (): void => {
+    refresh();
+    attachRowHandlers();
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-trading-pane';
+      // Docking/room-terminal palette (gold on dark), sized to fit the board.
+      panel.style.cssText = `
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 500px;
+        max-height: 92vh;
+        overflow-y: auto;
+        background: rgba(4, 8, 22, 0.95);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box;
+        pointer-events: auto;
+      `;
+      panel.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+          <span id="tf-heading" style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">TRADING FLOOR</span>
+          <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+        </div>
+        <div id="tf-status" style="font-size:11px; color:#8FA3B8; letter-spacing:0.5px;">—</div>
+        <div>
+          <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:4px;">THE BOARD</div>
+          <div id="tf-board" style="max-height:180px; overflow-y:auto; padding:2px;"></div>
+        </div>
+        <div style="border-top:1px solid rgba(212,168,75,0.15); padding-top:10px;">
+          <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:6px;">YOUR SLIP</div>
+          <div style="display:grid; grid-template-columns: 78px 78px 1fr auto; gap:6px; align-items:center;">
+            <select id="tf-kind" style="background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.28); color:#F0C060; font-family:inherit; font-size:11px; padding:5px;">
+              <option value="SELL">SELL</option>
+              <option value="BUY">BUY</option>
+            </select>
+            <input id="tf-shares" type="number" min="1" max="100" value="1" style="background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.28); color:#F0C060; font-family:inherit; font-size:11px; padding:5px; text-align:right;" />
+            <input id="tf-price" type="number" min="0" step="1" value="0" placeholder="price (mojo/share)" title="0 = GIFT (v1 gift-only rail). Priced offers post but settle with the Registry."
+              style="background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.28); color:#F0C060; font-family:inherit; font-size:11px; padding:5px; text-align:right;" />
+            <button id="tf-submit" style="padding:5px 14px; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.45); border-radius:4px; color:#F0C060; font-family:inherit; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer;">POST</button>
+          </div>
+          <div id="tf-slip-note" style="font-size:9px; color:#4A5560; margin-top:4px;">Priced offers post but only GIFT offers (price 0) settle in v1 — the Registry lane arrives with V3.</div>
+        </div>
+        <div style="border-top:1px solid rgba(212,168,75,0.15); padding-top:10px;">
+          <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:6px;">PRICE CHART</div>
+          <canvas id="tf-chart" width="460" height="140" style="width:100%; height:140px; border:1px solid rgba(62,146,184,0.35); border-radius:4px; background:#0A1018;"></canvas>
+          <div id="tf-tape" style="margin-top:6px;"></div>
+        </div>
+        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF TRADING FLOOR v1 · every trade is a signed OFFER</div>
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      chart = panel.querySelector<HTMLCanvasElement>('#tf-chart');
+      // Wire the POST button (the shares/price inputs are read at click time).
+      const submit = panel.querySelector<HTMLButtonElement>('#tf-submit');
+      const kindEl = panel.querySelector<HTMLSelectElement>('#tf-kind');
+      const sharesEl = panel.querySelector<HTMLInputElement>('#tf-shares');
+      const priceEl = panel.querySelector<HTMLInputElement>('#tf-price');
+      submit?.addEventListener('click', () => {
+        const kind = (kindEl?.value === 'BUY' ? 'BUY' : 'SELL') as FloorOfferKind;
+        const shares = Math.max(1, Math.floor(Number(sharesEl?.value ?? '0')));
+        const priceMojo = Math.max(0, Math.floor(Number(priceEl?.value ?? '0')));
+        const offer = makeFloorOffer(kind, deps.myName(), shares, { priceMojo });
+        if (offer && postFloorOffer(offer)) {
+          refreshAndBind();
+        }
+      });
+      unsubscribe = subscribeTradingFloor(() => refreshAndBind());
+      deps.onEngagedChange?.(true);
+      refreshAndBind();
+    },
+
+    unmount(): void {
+      deps.onEngagedChange?.(false);
+      unsubscribe?.();
+      unsubscribe = null;
+      panel?.remove();
+      panel = null;
+      chart = null;
+    },
+
+    update(dt: number): void {
+      refreshTimer += dt;
+      if (refreshTimer >= 0.25) {
+        refreshTimer = 0;
+        refresh();
+        // Re-attach row handlers whenever the board rerenders — button
+        // elements can be replaced by refresh() so onclick must be re-bound.
+        attachRowHandlers();
       }
     },
   };

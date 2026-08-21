@@ -44,7 +44,7 @@ import { speakRobotLine } from "./robotVoice";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
-import { getDefaultRoomId } from "./identity";
+import { getDefaultRoomId, getPlayerName } from "./identity";
 import {
   FURNITURE,
   FURNITURE_DEFS,
@@ -119,6 +119,7 @@ import {
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
+  createTradingScreenUI,
 } from "./devices";
 import {
   closeSlotMachine,
@@ -5190,6 +5191,20 @@ export class World {
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "tradingScreen") {
+      // 🏛️ #68 V4: the in-world trading floor — offer book + price chart on a
+      // wall screen. Same engaged-dim seam as the room terminal so the physical
+      // prop reads as IN USE while the focused pane is up.
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const ui = createTradingScreenUI({
+        myName: () => getPlayerName(),
+        requestRelease: () => deviceFocus.release(),
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
