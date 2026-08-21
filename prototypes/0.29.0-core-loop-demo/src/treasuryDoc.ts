@@ -539,6 +539,16 @@ export interface BoundedScan<T> {
    * report "no proposals" about proposals the room is holding.
    */
   refusedTooLarge: number;
+  /**
+   * Entries on this page that were checked and failed — wrong shape, wrong
+   * network, bad signature, or filed under a key they do not claim.
+   *
+   * Reported for the same reason as refusedTooLarge, and it was the gap left
+   * after that one: a page whose every entry is invalid is not truncated and
+   * refuses nothing on size, so a panel reading only those two said "none
+   * held" while the room held records it had just rejected.
+   */
+  rejected: number;
   /** Matching keys found within the traversal budget, before verification. */
   matched: number;
   /** Where this page started in that list. */
@@ -573,7 +583,9 @@ function scanPrefixed<T>(
 ): BoundedScan<T> {
   const m = readMap();
   if (!m) {
-    return { items: [], truncated: false, refusedTooLarge: 0, matched: 0, offset: 0 };
+    return {
+      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0, offset: 0,
+    };
   }
   // Pass one: which keys match. Examining a key is a prefix test on a string
   // this loop already holds — nanoseconds, and nothing is allocated for a key
@@ -613,13 +625,20 @@ function scanPrefixed<T>(
   // Pass two: verify only this page. THIS is the expensive half.
   const items: T[] = [];
   let refusedTooLarge = 0;
+  let rejected = 0;
   for (const key of page) {
     const value = m.get(key);
-    if (verdictOf?.(value) === 'too-large') refusedTooLarge += 1;
+    const verdict = verdictOf?.(value);
+    if (verdict === 'too-large') refusedTooLarge += 1;
     const kept = take(key, value);
     if (kept !== null) items.push(kept);
+    // Held, checked, and not usable — counted so a panel can say so rather
+    // than reporting a page of rejects as an empty room.
+    else if (verdict !== 'too-large') rejected += 1;
   }
-  return { items, truncated, refusedTooLarge, matched: keys.length, offset: start };
+  return {
+    items, truncated, refusedTooLarge, rejected, matched: keys.length, offset: start,
+  };
 }
 
 export function scanProposals(
@@ -1128,47 +1147,67 @@ export function scanSigningSessions(
 ): BoundedScan<SigningSession> {
   const m = readMap();
   if (!m) {
-    return { items: [], truncated: false, refusedTooLarge: 0, matched: 0, offset: 0 };
+    return {
+      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0, offset: 0,
+    };
   }
   const shellPrefix = `session:${proposalId}:`;
   let examined = 0;
   let truncated = false;
   let refusedTooLarge = 0;
+  let rejected = 0;
+  // Pass one: shell keys only. Signature keys are NOT collected here. Sharing
+  // one budget with them was the same censorship shape the shells had: 800
+  // unrelated `sessionsig:` entries filled it and broke the whole scan, so
+  // later signatures — and later SHELLS — were never reached, which flatly
+  // contradicted the guarantee that a paged shell carries its approvals.
   const shellKeys: string[] = [];
-  const sigKeys: string[] = [];
   for (const key of m.keys()) {
     examined += 1;
     if (examined > MAX_KEYS_EXAMINED) {
       truncated = true;
       break;
     }
-    if (key.startsWith(shellPrefix)) {
-      if (shellKeys.length >= maxEntries) {
-        truncated = true;
-        break;
-      }
-      shellKeys.push(key);
-    } else if (key.startsWith('sessionsig:')) {
-      if (sigKeys.length >= maxEntries) {
-        truncated = true;
-        break;
-      }
-      sigKeys.push(key);
+    if (!key.startsWith(shellPrefix)) continue;
+    if (shellKeys.length >= maxEntries) {
+      truncated = true;
+      break;
     }
+    shellKeys.push(key);
   }
   shellKeys.sort();
   const start = Math.max(0, Math.min(offset, shellKeys.length));
   const page = shellKeys.slice(start, start + Math.max(0, maxChecks));
   if (start + page.length < shellKeys.length) truncated = true;
 
+  // Pass two: signatures for THIS PAGE's sessions, chosen after the page is.
+  // Filtering during examination means a flood of signatures for other
+  // sessions costs a Set lookup each and cannot crowd out the ones that
+  // belong here — the collection budget applies only to signatures this page
+  // can actually use, which real signers bound.
+  const wanted = new Set(page.map((key) => key.slice(shellPrefix.length)));
   const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
-  for (const key of sigKeys) {
+  let collectedSigCount = 0;
+  let signaturesTruncated = false;
+  for (const key of m.keys()) {
+    examined += 1;
+    if (examined > MAX_KEYS_EXAMINED) {
+      truncated = true;
+      break;
+    }
+    if (!key.startsWith('sessionsig:')) continue;
+    // Session ids are fixed-width Hex32, so the key decomposes exactly.
+    const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
+    if (!wanted.has(sessionId)) continue;
+    if (collectedSigCount >= maxEntries) {
+      signaturesTruncated = true;
+      truncated = true;
+      break;
+    }
     const value = m.get(key);
     if (typeof value !== 'object' || value === null) continue;
     const entry = value as Record<string, unknown>;
     if (!isHex32(entry.signerPuzzleHash)) continue;
-    // Session ids are fixed-width Hex32, so the key decomposes exactly.
-    const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
     if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
     if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
     let bucket = sigsBySession.get(sessionId);
@@ -1177,7 +1216,9 @@ export function scanSigningSessions(
       sigsBySession.set(sessionId, bucket);
     }
     bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
+    collectedSigCount += 1;
   }
+  void signaturesTruncated; // folded into `truncated`, which the UI renders
 
   const out: SigningSession[] = [];
   for (const key of page) {
@@ -1185,18 +1226,24 @@ export function scanSigningSessions(
     // Counted, not just skipped: a shell refused on size is a record this
     // room holds, so leaving it out silently would report "no open round"
     // about a round that exists.
-    if (sessionShellVerdict(value) === 'too-large') refusedTooLarge += 1;
+    const verdict = sessionShellVerdict(value);
+    if (verdict === 'too-large') refusedTooLarge += 1;
     const sessionId = key.slice(shellPrefix.length);
-    if (!validSessionShell(value, proposalId, sessionId)) continue;
+    if (!validSessionShell(value, proposalId, sessionId)) {
+      if (verdict !== 'too-large') rejected += 1;
+      continue;
+    }
     const collectedSigs = (sigsBySession.get(sessionId) ?? [])
       .sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
     const assembled = { ...(value as SigningSession), collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
+    else rejected += 1;
   }
   return {
     items: out,
     truncated,
     refusedTooLarge,
+    rejected,
     matched: shellKeys.length,
     offset: start,
   };

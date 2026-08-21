@@ -3248,6 +3248,16 @@ function paintTreasuryBody(view: HTMLElement): void {
             )
           : ""
       }
+      ${
+        // A rejected record is still a record the room holds. Without this,
+        // a slot full of forgeries rendered as a flat "0 held" — absence
+        // presented as fact, about entries this screen had just thrown out.
+        voteScan.rejected + cpScan.rejected > 0
+          ? dim(
+              `${voteScan.rejected + cpScan.rejected} record${voteScan.rejected + cpScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of — wrong shape, wrong network, or a signature that did not check out — so ${voteScan.rejected + cpScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
 
       <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
         <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">BOARD APPROVALS</span>
@@ -3263,11 +3273,25 @@ function paintTreasuryBody(view: HTMLElement): void {
       }
       ${dim(esc(approvals.note))}
       ${
-        sessionScan.truncated || sessionScan.refusedTooLarge > 0
+        sessionScan.refusedTooLarge > 0
           ? dim(
-              sessionScan.refusedTooLarge > 0
-                ? `${sessionScan.refusedTooLarge} approval round${sessionScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${sessionScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted above. That is this device's limit, not a fault in the records.`
-                : "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
+              `${sessionScan.refusedTooLarge} approval round${sessionScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${sessionScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted above. That is this device's limit, not a fault in the records.`,
+            )
+          : ""
+      }
+      ${
+        // Same rule as the votes panel: rounds this device rejected are still
+        // rounds the room holds, and "no approval round open" would deny them.
+        sessionScan.rejected > 0
+          ? dim(
+              `${sessionScan.rejected} approval round${sessionScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of, so ${sessionScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.truncated
+          ? dim(
+              "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
             )
           : ""
       }
@@ -3405,19 +3429,49 @@ function paintTreasuryBody(view: HTMLElement): void {
               }
               ${dim(esc(b.note))}`;
           })()
-        : dim(
-            !readable
-              ? "Company details cannot be read on this device, so nothing is known about the company either way."
-              // A record this device declined to read is NOT an absent record.
-              // The size cap is a local display decision, so a policy that is
-              // perfectly valid on the wire can trip it — and answering that
-              // with "none cached" would deny a policy the room is holding.
-              : policyStatus === "too-large"
-                ? "A company policy is held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
-                : policyStatus === "unreadable"
-                  ? "A company policy is held in this room, but this device cannot make sense of it — wrong shape, wrong network, or damaged."
-                  : "No company policy cached in this room yet.",
-          )
+        : // A badge here too. Every other cache-backed panel carries one, and
+          // this branch is where the panel is LEAST certain — an absent policy
+          // and one the device refused should not both be silent about how
+          // much checking happened.
+          (() => {
+            const held = policyStatus === "too-large" || policyStatus === "unreadable";
+            const tag = !readable
+              ? { ...trustTag("absent"), detail: "No lookup was possible, so nothing is known either way." }
+              : held
+                ? {
+                    ...trustTag("unverified"),
+                    label: "UNREAD",
+                    detail:
+                      policyStatus === "too-large"
+                        ? "A policy is held here, but this device would not read it: it is larger than this device is willing to process."
+                        : "A policy is held here, but this device could not make sense of it.",
+                  }
+                : trustTag("absent");
+            return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                <span style="font-size:11px; font-weight:800; color:#f0c060;">${
+                  !readable
+                    ? "Company details unavailable"
+                    : held
+                      ? "Company policy cannot be read"
+                      : "No company policy"
+                }</span>
+                ${badge("policy", tag)}
+              </div>
+              ${dim(
+                !readable
+                  ? "Company details cannot be read on this device, so nothing is known about the company either way."
+                  // A record this device declined to read is NOT an absent
+                  // record. The size cap is a local display decision, so a
+                  // policy that is perfectly valid on the wire can trip it —
+                  // and answering that with "none cached" would deny a policy
+                  // the room is holding.
+                  : policyStatus === "too-large"
+                    ? "A company policy is held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
+                    : policyStatus === "unreadable"
+                      ? "A company policy is held in this room, but this device cannot make sense of it — wrong shape, wrong network, or damaged."
+                      : "No company policy cached in this room yet.",
+              )}`;
+          })()
     }
 
     ${header(`PROPOSALS${rows.length ? ` · ${rows.length}` : ""}`)}
@@ -3465,7 +3519,12 @@ function paintTreasuryBody(view: HTMLElement): void {
                     ? // Records ARE here — this device just would not read
                       // them. Saying "none" would deny what the room holds.
                       `No proposals could be listed. ${page.refusedTooLarge} record${page.refusedTooLarge === 1 ? " in" : "s in"} this room ${page.refusedTooLarge === 1 ? "was" : "were"} too large for this device to read.`
-                    : "No proposals in this room's records yet.",
+                    : page.matched > 0
+                      ? // Keys matched and every one failed its checks. Not
+                        // truncated, nothing refused on size — the case a
+                        // panel reading only those two flags called "none".
+                        `No proposals could be listed. ${page.matched} record${page.matched === 1 ? " is" : "s are"} held under this room's proposal keys, but ${page.matched === 1 ? "it" : "none of them"} could be made sense of here.`
+                      : "No proposals in this room's records yet.",
             )
     }
     ${

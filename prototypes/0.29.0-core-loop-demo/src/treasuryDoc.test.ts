@@ -668,6 +668,7 @@ describe('network pinning', () => {
       items: [],
       truncated: false,
       refusedTooLarge: 0,
+      rejected: 0,
       matched: 0,
       offset: 0,
     });
@@ -776,6 +777,67 @@ describe('verification caching', () => {
       (held as unknown as { proposerSig: string }).proposerSig = 'tampered';
     }).toThrow();
     expect(readProposal(p.proposalId)?.proposerSig).toBe(p.proposerSig);
+  });
+
+  it('counts rejected records, so a page of forgeries is not "none held"', () => {
+    // A page whose every entry fails its checks is not truncated and refuses
+    // nothing on size, so a panel reading only those two flags reported an
+    // empty room while the room held records it had just thrown out.
+    const m = doc.getMap('treasury');
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    for (let i = 0; i < 3; i += 1) {
+      m.set(`proposal:${i.toString().padStart(64, 'c')}`, { ...p, proposerSig: 'forged' });
+    }
+    const scan = scanProposals(99, 99);
+    expect(scan.items).toEqual([p]);
+    expect(scan.rejected).toBe(3);
+    expect(scan.truncated).toBe(false);
+    expect(scan.refusedTooLarge).toBe(0);
+    // matched sees every key, so "records are held" is distinguishable from
+    // "the map is empty" even when nothing survives verification.
+    expect(scan.matched).toBe(4);
+    // A size refusal is NOT also counted as a rejection — they are different
+    // facts and the UI words them differently.
+    m.set(`proposal:${'d'.repeat(64)}`, { ...p, filler: 'x'.repeat(200_000) });
+    const withBig = scanProposals(99, 99);
+    expect(withBig.refusedTooLarge).toBe(1);
+    expect(withBig.rejected).toBe(3);
+  });
+
+  it('gives a paged shell its approvals despite a flood of other sessions', () => {
+    // The signature pass used to share one budget with unrelated sessionsig
+    // keys and break the WHOLE scan on hitting it, so 800 planted signatures
+    // starved the real round of its own — the exact opposite of the guarantee
+    // the paging change claimed. Signatures are now chosen after the page is.
+    const shell = {
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'a1'.repeat(32),
+      bundleHash: '5'.repeat(64),
+      requiredThreshold: 2,
+      expiresAfterHeight: 800,
+    };
+    const session: SigningSession = {
+      ...shell,
+      sessionId: signingSessionIdOf(shell),
+      collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
+    };
+    expect(putSigningSession(session)).toBe(true);
+    // Signatures for sessions that are not on this page, planted first.
+    const m = doc.getMap('treasury');
+    for (let i = 0; i < 300; i += 1) {
+      const other = i.toString().padStart(64, '7');
+      m.set(`sessionsig:${other}:${i.toString().padStart(64, '8')}`, {
+        signerPuzzleHash: i.toString().padStart(64, '8'),
+        sig: 'noise',
+      });
+    }
+    const scan = scanSigningSessions(session.proposalId, 50, 10, 0);
+    expect(scan.items).toHaveLength(1);
+    expect(scan.items[0].collectedSigs).toEqual(session.collectedSigs);
   });
 
   it('survives a value nested deeper than the call stack', () => {
