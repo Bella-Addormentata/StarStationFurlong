@@ -294,30 +294,49 @@ let verdictCaches = freshVerdictCaches();
  * is what makes the refusal cheap enough to sit on the repaint path. Iterated
  * lazily (for…in, for…of) rather than through Object.entries, which would
  * materialise an array as long as the object a peer chose to send.
+ *
+ * ITERATIVE, not recursive. A node budget does not bound call-stack depth: a
+ * peer can nest arrays 64,000 deep, which spends well under the budget and
+ * still overflows the stack — throwing, and taking the treasury render with
+ * it, exactly as the typed-array freeze did. An explicit queue has no depth
+ * limit to hit, and a cyclic value simply spends budget until it is refused.
  */
-function withinBudget(value: unknown, budget: { left: number }): boolean {
-  if (budget.left <= 0) return false;
-  budget.left -= 1;
-  if (typeof value === 'string') {
-    budget.left -= value.length;
-    return budget.left >= 0;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      if (!withinBudget(item, budget)) return false;
-    }
+function withinBudget(root: unknown, budget: number): boolean {
+  let left = budget;
+  const pending: unknown[] = [];
+  // A node is CHARGED WHEN QUEUED, not when popped. That keeps the queue
+  // itself from outgrowing the budget — an enormous collection is refused
+  // part-way through being walked rather than after it has all been listed.
+  const queue = (v: unknown): boolean => {
+    if (left <= 0) return false;
+    left -= 1;
+    pending.push(v);
     return true;
-  }
-  if (typeof value === 'object' && value !== null) {
-    for (const key in value) {
-      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
-      budget.left -= key.length + 1;
-      if (budget.left < 0) return false;
-      if (!withinBudget((value as Record<string, unknown>)[key], budget)) return false;
+  };
+  if (!queue(root)) return false;
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === 'string') {
+      left -= value.length;
+      if (left < 0) return false;
+      continue;
     }
-    return true;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (!queue(item)) return false;
+      }
+      continue;
+    }
+    if (typeof value === 'object' && value !== null) {
+      for (const key in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        left -= key.length;
+        if (left < 0) return false;
+        if (!queue((value as Record<string, unknown>)[key])) return false;
+      }
+    }
   }
-  return budget.left >= 0;
+  return true;
 }
 
 /**
@@ -329,7 +348,7 @@ const RECORD_BUDGET = 64_000;
 
 /** Convenience wrapper: one budget per call, so callers cannot share state. */
 function smallEnough(value: unknown, budget = RECORD_BUDGET): boolean {
-  return withinBudget(value, { left: budget });
+  return withinBudget(value, budget);
 }
 
 /**
@@ -350,17 +369,26 @@ function smallEnough(value: unknown, budget = RECORD_BUDGET): boolean {
  * on a cyclic value.
  */
 function deepFreeze<T>(value: T): T {
-  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
-  // Typed arrays are left alone. Object.freeze THROWS on an ArrayBuffer view
-  // with elements, and Yjs will happily store a Uint8Array a peer put in a
-  // slot — so freezing before the shape guard turned one binary value into an
-  // exception that aborted the whole treasury render. No treasury record
-  // contains binary, so skipping here costs nothing: the value still meets its
-  // type guard next and is rejected the ordinary way.
-  if (ArrayBuffer.isView(value)) return value;
-  Object.freeze(value);
-  for (const key of Object.getOwnPropertyNames(value)) {
-    deepFreeze((value as Record<string, unknown>)[key]);
+  // Iterative for the same reason withinBudget is: a value can pass the node
+  // budget and still be nested deep enough to overflow the call stack, and a
+  // throw here aborts the render.
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (typeof node !== 'object' || node === null || Object.isFrozen(node)) continue;
+    // Typed arrays are left alone. Object.freeze THROWS on an ArrayBuffer view
+    // with elements, and Yjs will happily store a Uint8Array a peer put in a
+    // slot — so freezing before the shape guard turned one binary value into
+    // an exception that aborted the whole treasury render. No treasury record
+    // contains binary, so skipping costs nothing: the value still meets its
+    // type guard next and is rejected the ordinary way.
+    if (ArrayBuffer.isView(node)) continue;
+    // Frozen BEFORE its children are queued, so the isFrozen check above also
+    // terminates a cyclic value.
+    Object.freeze(node);
+    for (const key of Object.getOwnPropertyNames(node)) {
+      pending.push((node as Record<string, unknown>)[key]);
+    }
   }
   return value;
 }
@@ -492,6 +520,15 @@ export function listProposals(): TreasuryProposal[] {
  * without walking shared space, plus validation moved off the render path;
  * that belongs with the op-log durability work the plans already schedule.
  */
+/**
+ * A runaway guard on key EXAMINATION, deliberately far above any plausible
+ * room. It is not a page bound: examining a key is a prefix test, so this
+ * costs a fraction of a millisecond even at the cap, whereas the old
+ * page-sized traversal cap let 800 unrelated keys hide every real record
+ * behind a horizon paging could not cross.
+ */
+const MAX_KEYS_EXAMINED = 50_000;
+
 export interface BoundedScan<T> {
   items: T[];
   truncated: boolean;
@@ -538,20 +575,34 @@ function scanPrefixed<T>(
   if (!m) {
     return { items: [], truncated: false, refusedTooLarge: 0, matched: 0, offset: 0 };
   }
-  // Pass one: which keys match, bounded by the traversal budget. Iterating
-  // keys rather than entries, since no value is needed to decide this.
+  // Pass one: which keys match. Examining a key is a prefix test on a string
+  // this loop already holds — nanoseconds, and nothing is allocated for a key
+  // that does not match. Bounding THAT tightly bought almost no time and cost
+  // reachability: with the cap at 800, a peer needed only 800 unrelated keys
+  // to push every real proposal past the horizon, where no amount of paging
+  // could reach it, because paging only ever moved within what this pass had
+  // already collected.
+  //
+  // So the budget now bounds what is COLLECTED — which is what actually costs
+  // memory and feeds the expensive pass below — and examination gets a
+  // runaway guard set far above any plausible room instead of a page-sized
+  // cap. The bound that governs how long a repaint blocks for is still
+  // `maxChecks`, which is where the signature work lives.
   const keys: string[] = [];
-  let visited = 0;
+  let examined = 0;
   let truncated = false;
   for (const key of m.keys()) {
-    // Counted BEFORE the prefix test: a skipped key is still a key this
-    // repaint had to look at.
-    if (visited >= maxEntries) {
+    examined += 1;
+    if (examined > MAX_KEYS_EXAMINED) {
       truncated = true;
       break;
     }
-    visited += 1;
-    if (key.startsWith(prefix)) keys.push(key);
+    if (!key.startsWith(prefix)) continue;
+    if (keys.length >= maxEntries) {
+      truncated = true;
+      break;
+    }
+    keys.push(key);
   }
   keys.sort();
   const start = Math.max(0, Math.min(offset, keys.length));
@@ -1052,79 +1103,103 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
 }
 
 /**
- * Bounded twin of listSigningSessions, on the same two axes as scanPrefixed.
- * The index pass touches every `sessionsig:` key in the map — including other
- * proposals' — so peer-written signature spam would otherwise grow the work
- * done on every repaint while a detail is open. `maxEntries` counts every slot
- * it looks at, shells and signatures alike; `maxChecks` counts only the shells
- * handed to validSessionShell, which is where a hash gets recomputed. Signature
- * slots cost a few string comparisons and are covered by `maxEntries` alone.
+ * Bounded twin of listSigningSessions, paged like scanPrefixed and for the
+ * same reason.
+ *
+ * Shells are UNSIGNED and peer-writable, so stopping at the check limit was a
+ * censorship tool of its own: a peer could plant enough self-consistent shells
+ * to push the genuine round past the cut — and, because the old single pass
+ * broke out of the whole loop, could arrange for the break to land before that
+ * round's SIGNATURE entries too, so even a shell that did survive came back
+ * with its approvals missing.
+ *
+ * Three passes, so no axis can hide another. Keys are collected first (a
+ * prefix test, guarded by MAX_KEYS_EXAMINED); shell keys are sorted and a page
+ * of them verified — that is where a hash is recomputed; and the signature
+ * index is built from every `sessionsig:` key regardless of where the shell
+ * page fell, so a shell on this page always gets the approvals it actually
+ * holds. Signature entries cost a few string comparisons, not a hash.
  */
 export function scanSigningSessions(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
+  offset = 0,
 ): BoundedScan<SigningSession> {
   const m = readMap();
   if (!m) {
     return { items: [], truncated: false, refusedTooLarge: 0, matched: 0, offset: 0 };
   }
   const shellPrefix = `session:${proposalId}:`;
-  let visited = 0;
-  let checked = 0;
+  let examined = 0;
   let truncated = false;
   let refusedTooLarge = 0;
-  const shells: { sessionId: string; shell: SigningSession }[] = [];
-  const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
-  for (const [key, value] of m.entries()) {
-    // Same rule as scanPrefixed: every entry counts, including the ones this
-    // scan does not want, or a peer's unrelated keys would be free.
-    if (visited >= maxEntries) {
+  const shellKeys: string[] = [];
+  const sigKeys: string[] = [];
+  for (const key of m.keys()) {
+    examined += 1;
+    if (examined > MAX_KEYS_EXAMINED) {
       truncated = true;
       break;
     }
-    visited += 1;
-    if (!key.startsWith(shellPrefix) && !key.startsWith('sessionsig:')) continue;
     if (key.startsWith(shellPrefix)) {
-      if (checked >= maxChecks) {
+      if (shellKeys.length >= maxEntries) {
         truncated = true;
         break;
       }
-      checked += 1;
-      // Counted, not just skipped: a shell refused on size is a record this
-      // room holds, so leaving it out silently would report "no open round"
-      // about a round that exists.
-      if (sessionShellVerdict(value) === 'too-large') refusedTooLarge += 1;
-      const sessionId = key.slice(shellPrefix.length);
-      if (validSessionShell(value, proposalId, sessionId)) {
-        shells.push({ sessionId, shell: value });
+      shellKeys.push(key);
+    } else if (key.startsWith('sessionsig:')) {
+      if (sigKeys.length >= maxEntries) {
+        truncated = true;
+        break;
       }
-    } else {
-      if (typeof value !== 'object' || value === null) continue;
-      const entry = value as Record<string, unknown>;
-      if (!isHex32(entry.signerPuzzleHash)) continue;
-      // Session ids are fixed-width Hex32, so the key decomposes exactly.
-      const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
-      if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
-      if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
-      let bucket = sigsBySession.get(sessionId);
-      if (!bucket) {
-        bucket = [];
-        sigsBySession.set(sessionId, bucket);
-      }
-      bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
+      sigKeys.push(key);
     }
   }
+  shellKeys.sort();
+  const start = Math.max(0, Math.min(offset, shellKeys.length));
+  const page = shellKeys.slice(start, start + Math.max(0, maxChecks));
+  if (start + page.length < shellKeys.length) truncated = true;
+
+  const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
+  for (const key of sigKeys) {
+    const value = m.get(key);
+    if (typeof value !== 'object' || value === null) continue;
+    const entry = value as Record<string, unknown>;
+    if (!isHex32(entry.signerPuzzleHash)) continue;
+    // Session ids are fixed-width Hex32, so the key decomposes exactly.
+    const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
+    if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
+    if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
+    let bucket = sigsBySession.get(sessionId);
+    if (!bucket) {
+      bucket = [];
+      sigsBySession.set(sessionId, bucket);
+    }
+    bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
+  }
+
   const out: SigningSession[] = [];
-  for (const { sessionId, shell } of shells) {
+  for (const key of page) {
+    const value = m.get(key);
+    // Counted, not just skipped: a shell refused on size is a record this
+    // room holds, so leaving it out silently would report "no open round"
+    // about a round that exists.
+    if (sessionShellVerdict(value) === 'too-large') refusedTooLarge += 1;
+    const sessionId = key.slice(shellPrefix.length);
+    if (!validSessionShell(value, proposalId, sessionId)) continue;
     const collectedSigs = (sigsBySession.get(sessionId) ?? [])
       .sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
-    const assembled = { ...shell, collectedSigs };
+    const assembled = { ...(value as SigningSession), collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
   }
-  // Sessions are not paged: a proposal has few approval rounds, and the
-  // detail screen shows them all. matched is the shells this scan looked at.
-  return { items: out, truncated, refusedTooLarge, matched: shells.length, offset: 0 };
+  return {
+    items: out,
+    truncated,
+    refusedTooLarge,
+    matched: shellKeys.length,
+    offset: start,
+  };
 }
 
 // ---------------------------------------------------------------------------

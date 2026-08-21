@@ -58,6 +58,7 @@ import {
   readRoomBinding,
   readRoomBindingResult,
   scanProposals,
+  scanSigningSessions,
   scanVotes,
   readVote,
   readWindowsCache,
@@ -137,9 +138,10 @@ describe('proposals', () => {
     );
     for (const p of made) expect(putProposal(p)).toBe(true);
     expect(listProposals()).toHaveLength(4); // unbounded convenience wrapper
-    // The bound counts SLOTS VISITED, not results kept: capping results
-    // alone would still verify every junk entry a peer planted before the
-    // cap filled up, which is the work that stalls a repaint.
+    // The collection bound counts MATCHING keys, not records kept: capping
+    // results alone would still verify every junk entry a peer planted under
+    // this prefix before the cap filled up, and that is the work that stalls
+    // a repaint.
     const two = scanProposals(2, 99);
     expect(two.items).toHaveLength(2);
     expect(two.truncated).toBe(true);
@@ -147,27 +149,41 @@ describe('proposals', () => {
     const all = scanProposals(99, 99);
     expect(all.items).toHaveLength(4);
     expect(all.truncated).toBe(false);
-    // Junk in the prefix consumes budget rather than being scanned for free.
+    // Junk under this prefix consumes budget rather than being had for free.
     doc.getMap('treasury').set(`proposal:${'7'.repeat(64)}`, { junk: true });
     const withJunk = scanProposals(1, 99);
     expect(withJunk.truncated).toBe(true);
     expect(withJunk.items.length).toBeLessThanOrEqual(1);
   });
 
-  it('charges budget for UNRELATED keys too, so a flood cannot be free', () => {
-    // The bound must survive a hostile map. Keys of any other prefix are
-    // skipped by the filter, so if they cost nothing a peer could make every
-    // repaint walk the whole map however small the budget is.
+  it('does not let unrelated keys hide matching ones', () => {
+    // This reverses an earlier rule deliberately. Unrelated keys used to
+    // charge against the same page-sized budget, on the reasoning that a
+    // skipped key is not free — but that made a flood of them a censorship
+    // tool: 800 `junk:` keys pushed every real proposal past a horizon paging
+    // could not cross, because paging only moved within what the walk had
+    // already collected.
+    //
+    // Examining a key is a prefix test on a string the loop already holds, so
+    // it is bounded by a runaway guard far above any real room rather than by
+    // a page. The bound that decides how long a repaint blocks for is the
+    // CHECK budget, which is where the signature work is.
     const m = doc.getMap('treasury');
-    for (let i = 0; i < 40; i++) m.set(`junk:${i}`, { anything: i });
+    for (let i = 0; i < 400; i++) m.set(`junk:${i}`, { anything: i });
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);
+    // A page-sized collection budget no longer hides the record behind junk.
     const tight = scanProposals(5, 99);
-    expect(tight.truncated).toBe(true);
-    // Generous enough to get past the junk finds the real record.
-    const roomy = scanProposals(500, 99);
-    expect(roomy.truncated).toBe(false);
-    expect(roomy.items.map((x) => x.proposalId)).toContain(p.proposalId);
+    expect(tight.items.map((x) => x.proposalId)).toContain(p.proposalId);
+    expect(tight.truncated).toBe(false);
+    // The collection budget still bounds MATCHING keys, which is what costs
+    // memory and feeds the expensive pass.
+    for (let i = 0; i < 12; i++) {
+      m.set(`proposal:${i.toString().padStart(64, 'b')}`, { junk: i });
+    }
+    const capped = scanProposals(4, 99);
+    expect(capped.truncated).toBe(true);
+    expect(capped.matched).toBe(4);
   });
 
   it('caps VERIFICATIONS separately, since traversal is not what costs', () => {
@@ -760,6 +776,73 @@ describe('verification caching', () => {
       (held as unknown as { proposerSig: string }).proposerSig = 'tampered';
     }).toThrow();
     expect(readProposal(p.proposalId)?.proposerSig).toBe(p.proposerSig);
+  });
+
+  it('survives a value nested deeper than the call stack', () => {
+    // A NODE budget does not bound call-stack DEPTH. 64,000 nested arrays cost
+    // about one budget unit each — well inside the cap — while a recursive
+    // walk overflows long before the budget runs out, throwing and taking the
+    // render with it, exactly as the typed-array freeze did.
+    let deep: unknown = 'leaf';
+    for (let i = 0; i < 60_000; i += 1) deep = [deep];
+    const m = doc.getMap('treasury');
+    m.set(`proposal:${'3'.repeat(64)}`, deep);
+    expect(() => readProposal('3'.repeat(64))).not.toThrow();
+    expect(readProposal('3'.repeat(64))).toBeNull();
+    expect(() => scanProposals(99, 99)).not.toThrow();
+    // A cycle terminates too, rather than walking forever.
+    const loop: Record<string, unknown> = {};
+    loop.self = loop;
+    m.set(`binding:room-cycle`, loop);
+    expect(() => readRoomBinding('room-cycle')).not.toThrow();
+    expect(readRoomBinding('room-cycle')).toBeNull();
+  });
+
+  it('lets a player page past a flood of planted approval shells', () => {
+    // Session shells are UNSIGNED and peer-writable, so a check limit with no
+    // paging let a peer bury the genuine round — and, when the old single pass
+    // broke out of the whole loop, could put the break before that round's
+    // signature entries so even a surviving shell came back without them.
+    const shellOf = (bundle: string) => ({
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'f0'.repeat(32),
+      bundleHash: bundle,
+      requiredThreshold: 2,
+      expiresAfterHeight: 700,
+    });
+    const real = shellOf('9'.repeat(64));
+    const realSession: SigningSession = {
+      ...real,
+      sessionId: signingSessionIdOf(real),
+      collectedSigs: [{ signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' }],
+    };
+    expect(putSigningSession(realSession)).toBe(true);
+    // Plant self-consistent decoys until the real round is past a small page.
+    const m = doc.getMap('treasury');
+    for (let i = 0; i < 10; i += 1) {
+      const decoy = shellOf(i.toString().padStart(64, '0'));
+      const id = signingSessionIdOf(decoy);
+      m.set(`session:${decoy.proposalId}:${id}`, { ...decoy, sessionId: id, collectedSigs: [] });
+    }
+    const found: string[] = [];
+    let offset = 0;
+    let matched = Number.POSITIVE_INFINITY;
+    while (offset < matched) {
+      const pageScan = scanSigningSessions(realSession.proposalId, 500, 3, offset);
+      matched = pageScan.matched;
+      found.push(...pageScan.items.map((s) => s.sessionId));
+      offset += 3;
+    }
+    expect(found).toContain(realSession.sessionId);
+    // And its signatures travel with it, whichever page it landed on.
+    for (let o = 0; o < matched; o += 3) {
+      const hit = scanSigningSessions(realSession.proposalId, 500, 3, o).items
+        .find((s) => s.sessionId === realSession.sessionId);
+      if (hit) expect(hit.collectedSigs).toEqual(realSession.collectedSigs);
+    }
   });
 
   it('survives a peer storing binary in a treasury slot', () => {
