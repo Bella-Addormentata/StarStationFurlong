@@ -8,7 +8,7 @@ import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
 import {
-  physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
+  physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
   type PhysicalDoorId,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
@@ -1642,14 +1642,31 @@ export class World {
    *
    * Connector chains fold OUTWARD from the door face (each segment is
    * relative), so translating + rotating the whole group at the new door pose
-   * preserves the chain's shape end-to-end — no rebuild needed. A missing
-   * door record (mid-remove) is safely ignored by physicalDoorPose.
+   * preserves the chain's shape end-to-end — no rebuild needed.
+   *
+   * A missing door record (mid-remove) must be SKIPPED, not posed to any wall.
+   * pairedVestibules is keyed by free `d:xxx` ids as well as the four cardinal
+   * ones, so we cannot narrow to PhysicalDoorId here. reconcileDoorLayout parks
+   * a vanished id in `orphanVestibules` and calls `drainOrphanVestibules`
+   * BEFORE us, but that drain intentionally SKIPS an orphan whose vestibule is
+   * still being walked through (`activeDoorId === id`) or is lit for a transit
+   * (`transitVestibuleDoorId === id`) — the id stays in `pairedVestibules`
+   * until a later frame can dispose it safely. During that window this method
+   * runs; `physicalDoorPose` on a free-door id with no live record would fall
+   * back to the north-wall centre (a warning + a mis-pose that teleports the
+   * gangway around the avatar mid-walk-through). `physicalDoorPoseOrNull` is
+   * the honest read that lets us leave the group at its LAST known pose until
+   * the drain finally disposes it — which is what the deferred-drain contract
+   * already promised.
    */
   private repositionPairedVestibules(): void {
     for (const [id, group] of this.pairedVestibules) {
-      // physicalDoorPose reads the fresh doorRecords set + falls back to the
-      // canonical un-slid pose for unknown ids, so it never throws.
-      const p = physicalDoorPose(id as DoorId);
+      // Iterating a Map<string, THREE.Group>: cardinal ids AND free `d:xxx`
+      // ids reach here, so `physicalDoorPoseOrNull(id: string)` is the right
+      // signature (no cast, no PhysicalDoorId narrowing). A null result means
+      // the door has no live record — see the doc block above for why.
+      const p = physicalDoorPoseOrNull(id);
+      if (!p) continue;
       group.position.set(p.x, 0, p.z);
       group.rotation.y = p.outwardYaw;
     }
