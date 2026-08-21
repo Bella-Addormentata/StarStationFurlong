@@ -1235,6 +1235,46 @@ export function scopeProposals(
   };
 }
 
+/**
+ * Two key spaces behind one pair of buttons.
+ *
+ * The detail screen pages votes and vote records together, but they are
+ * separate prefixes with separate lengths: one can run out while the other
+ * still has pages. Advancing only the stack that moved leaves the two stacks
+ * at different heights, and since PREVIOUS pops both, they stop describing the
+ * same navigation steps — with two vote pages and four checkpoint pages, the
+ * third NEXT advances only checkpoints, and one PREVIOUS then drops votes two
+ * steps to page 1 while checkpoints go back one.
+ *
+ * So every step appends to BOTH, an exhausted scan repeating its current
+ * cursor. Equal heights are the invariant; a repeated cursor is what "this
+ * side had nowhere further to go" looks like in the history.
+ */
+export interface CursorPair {
+  readonly a: readonly (string | null)[];
+  readonly b: readonly (string | null)[];
+}
+
+export function advanceCursorPair(
+  pair: CursorPair,
+  aNext: string | null,
+  bNext: string | null,
+): CursorPair {
+  // Neither side has a further page, so this is not a step and nothing is
+  // recorded. Pushing here would grow the history on a button that changed
+  // nothing, and the matching PREVIOUS would then appear to do nothing.
+  if (aNext === null && bNext === null) return pair;
+  return {
+    a: [...pair.a, aNext ?? pair.a[pair.a.length - 1]],
+    b: [...pair.b, bNext ?? pair.b[pair.b.length - 1]],
+  };
+}
+
+export function retreatCursorPair(pair: CursorPair): CursorPair {
+  if (pair.a.length <= 1 && pair.b.length <= 1) return pair;
+  return { a: pair.a.slice(0, -1), b: pair.b.slice(0, -1) };
+}
+
 /** Largest allowance bound first — uses the no-parse mojo comparator. */
 export function sortByAmountDesc<T>(items: T[], amountOf: (item: T) => MojoString): T[] {
   return [...items].sort((a, b) => compareMojoStrings(amountOf(b), amountOf(a)));

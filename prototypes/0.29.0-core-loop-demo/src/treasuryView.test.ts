@@ -22,12 +22,14 @@ import type {
 import { deriveProposalWindows } from './treasuryTypes';
 import contracts from '../test-vectors/treasury/treasury-contracts.json';
 import {
+  advanceCursorPair,
   approvalsView,
   balanceView,
   boardView,
   displayHeight,
   formatAmount,
   formatHeight,
+  retreatCursorPair,
   formatShares,
   boardThresholdFor,
   checkpointsFor,
@@ -1093,6 +1095,66 @@ describe('player vocabulary rule', () => {
       const hit = visible.match(banned);
       expect(hit, `banned vocabulary in ${block.where}: ${hit?.[0]}`).toBeNull();
     }
+  });
+});
+
+describe('paired cursor history', () => {
+  // Walk the pair the way the buttons do, so a test failure names the page the
+  // player would be looking at rather than an array.
+  const walk = (
+    steps: ReadonlyArray<'next' | 'prev'>,
+    aPages: number,
+    bPages: number,
+  ): { a: string | null; b: string | null } => {
+    let pair = { a: [null as string | null], b: [null as string | null] };
+    // A scan reports a next cursor only while pages remain. Cursor VALUES are
+    // keys, so name them after the page they open: 'a2' opens vote page 2.
+    const nextOf = (side: 'a' | 'b', pages: number) => {
+      const depth = pair[side].length; // 1 => showing page 1
+      return depth < pages ? `${side}${depth + 1}` : null;
+    };
+    for (const step of steps) {
+      pair =
+        step === 'next'
+          ? (advanceCursorPair(pair, nextOf('a', aPages), nextOf('b', bPages)) as typeof pair)
+          : (retreatCursorPair(pair) as typeof pair);
+    }
+    return { a: pair.a[pair.a.length - 1], b: pair.b[pair.b.length - 1] };
+  };
+
+  it('rewinds both key spaces by one step when one has run out', () => {
+    // The reported case: 2 vote pages, 4 checkpoint pages. The third NEXT can
+    // only advance checkpoints, and the PREVIOUS after it must restore the
+    // view the second NEXT produced — vote page 2 with checkpoint page 3.
+    expect(walk(['next', 'next', 'next'], 2, 4)).toEqual({ a: 'a2', b: 'b4' });
+    expect(walk(['next', 'next', 'next', 'prev'], 2, 4)).toEqual({ a: 'a2', b: 'b3' });
+    // Not page 1: the old code popped a stack that never grew on that step.
+    expect(walk(['next', 'next', 'next', 'prev'], 2, 4).a).not.toBeNull();
+  });
+
+  it('returns to the first page after undoing every step', () => {
+    const steps = ['next', 'next', 'next', 'next', 'prev', 'prev', 'prev', 'prev'] as const;
+    expect(walk(steps, 2, 4)).toEqual({ a: null, b: null });
+  });
+
+  it('keeps the two histories the same height', () => {
+    let pair = { a: [null as string | null], b: [null as string | null] };
+    for (const [aNext, bNext] of [['a2', 'b2'], [null, 'b3'], ['a3', null], [null, null]] as const) {
+      pair = advanceCursorPair(pair, aNext, bNext) as typeof pair;
+      expect(pair.a.length).toBe(pair.b.length);
+    }
+  });
+
+  it('records nothing when neither side has a further page', () => {
+    const pair = { a: ['a2'], b: ['b2'] };
+    // A step that changes nothing must not be undoable, or PREVIOUS would
+    // spend a press going back to the page already shown.
+    expect(advanceCursorPair(pair, null, null)).toBe(pair);
+  });
+
+  it('holds at the first page rather than underflowing', () => {
+    const first = { a: [null], b: [null] };
+    expect(retreatCursorPair(first)).toBe(first);
   });
 });
 

@@ -81,6 +81,8 @@ import {
   TREASURY_MUTED,
   roomFundingView,
   scopeProposals,
+  advanceCursorPair,
+  retreatCursorPair,
   sessionsFor,
   shareClassViews,
   shortId,
@@ -3047,14 +3049,16 @@ function wireTreasuryView(view: HTMLElement): void {
       };
       if (action === "rounds-next") pageForward(treasuryApprovalCursors, lastApprovalNext);
       if (action === "rounds-prev") pageBack(treasuryApprovalCursors);
-      // One control, two key spaces: each stack advances along its own.
-      if (action === "votes-next") {
-        pageForward(treasuryVoteCursors, lastVoteNext);
-        pageForward(treasuryCheckpointCursors, lastCheckpointNext);
-      }
-      if (action === "votes-prev") {
-        pageBack(treasuryVoteCursors);
-        pageBack(treasuryCheckpointCursors);
+      // One control, two key spaces: paged as a pair so the two histories
+      // stay the same height. See advanceCursorPair for why.
+      if (action === "votes-next" || action === "votes-prev") {
+        const pair = { a: treasuryVoteCursors, b: treasuryCheckpointCursors };
+        const moved =
+          action === "votes-next"
+            ? advanceCursorPair(pair, lastVoteNext, lastCheckpointNext)
+            : retreatCursorPair(pair);
+        treasuryVoteCursors = [...moved.a];
+        treasuryCheckpointCursors = [...moved.b];
       }
       if (action === "page-next") pageForward(treasuryListCursors, lastListNext);
       if (action === "page-prev") pageBack(treasuryListCursors);
