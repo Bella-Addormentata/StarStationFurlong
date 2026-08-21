@@ -236,6 +236,35 @@ import {
   reconstructCard,
   type ContactCard,
 } from "./contacts";
+// 🚫 Client-side block list (issue #20 — contacts BLOCK). Local mute only; a
+// signed on-doc block op is a later TrustAndSafety slice. Every filter path
+// funnels through the pure helpers in ./blockList so vitest can verify the
+// logic without spinning up a DOM.
+import {
+  initBlockList,
+  listBlocked,
+  blockedSet,
+  setBlocked,
+  subscribeBlockList,
+  isAuthoredByBlocked,
+  partitionRosterByBlocked,
+} from "./blockList";
+// 👥💬 Group chats (issue #20 — group chat threads). Threads live in a room-
+// doc Yjs `groupChats` map; their MESSAGES ride the same shared `chat` array
+// as the room broadcast (tagged with `groupId`). The Chat app's thread picker
+// is the UI-side filter. Private-by-UI, not by-crypto (documented in-app).
+import {
+  GROUP_CHAT_CAP,
+  MAX_GROUP_CHATS,
+  MIN_GROUP_MEMBERS,
+  GROUP_TITLE_MAX,
+  buildGroupChatThread,
+  excessGroupIndices,
+  excessThreadIds,
+  isGroupChatThread,
+  listMyGroupChats,
+  type GroupChatThread,
+} from "./groupChat";
 import {
   makeIntroductions,
   ingestIntroduction,
@@ -341,6 +370,41 @@ const networkProvider = new NetworkProvider();
 let yjsSync: YjsSync | null = null;
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
 let roomCacheHandle: RoomCacheHandle | null = null;
+
+// 💬 Chat thread router (issue #20 — group chats). `null` means the ROOM
+// broadcast lane; any string is an active group thread id (the same id space
+// deriveGroupChatId returns). Reset to null on every join so a rejoin never
+// leaks the DEPARTURE room's active thread into the NEW room.
+let activeChatThread: string | null = null;
+/** The current join's chat rebuild closure (assigned inside the join binder).
+ *  Module-scope indirection so subscribers set up at boot (block list, group
+ *  threads) can trigger a repaint without holding a reference to the closure. */
+let latestRebuildChatLog: (() => void) | null = null;
+/** Trigger a chat log rebuild if the join binder has installed one. Safe pre-
+ *  join / post-leave: silently does nothing when nothing is bound. */
+function rebuildChatLogIfBound(): void {
+  try { latestRebuildChatLog?.(); } catch (e) { console.error("[chat] rebuild threw:", e); }
+}
+/** The current join's group-chat panel refresh closure — same rationale as
+ *  above. Repopulates the chat thread bar when the shared groupChats map
+ *  observes a delta or when the block list toggles. */
+let latestRefreshChatThreadBar: (() => void) | null = null;
+function refreshChatThreadBarIfBound(): void {
+  try { latestRefreshChatThreadBar?.(); } catch (e) { console.error("[chat] chip refresh threw:", e); }
+}
+/** Resolve a legacy `authorId` (players map key) → identity pub. Only the
+ *  ACTIVE room's players map is consulted — a legacy chat message from a room
+ *  we've since left cannot be resolved (correct: we don't know that mapping).
+ *  Used by the block filter to match blocks against pre-slice messages that
+ *  carry `authorId` only. */
+function getPubForAuthorId(authorId: string): string | undefined {
+  const sync = yjsSync;
+  if (!sync) return undefined;
+  const entry = sync.doc.getMap("players").get(authorId);
+  if (!entry || typeof entry !== "object") return undefined;
+  const key = (entry as { keyB64?: unknown }).keyB64;
+  return typeof key === "string" && key ? key : undefined;
+}
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
 // the epoch after EACH await and unwinds if superseded — otherwise a rapid
@@ -1267,6 +1331,16 @@ async function joinRoomAtEpoch(
       myHints: () =>
         localFingerprint ? getLocalNodeHint(localFingerprint) : null,
     });
+    // 🚫 Local block list (issue #20). Loaded before subscribeContacts wires up
+    // renderPhonePlayersList so the very first roster paint already filters
+    // blocked identities. subscribeBlockList repaints the roster, the chat log,
+    // and the (potentially open) contacts app whenever the local list changes.
+    initBlockList();
+    subscribeBlockList(() => {
+      renderPhonePlayersList();
+      rebuildChatLogIfBound();
+      if (isContactsAppOpen()) refreshContactsApp();
+    });
     initDirectMessages({
       resolve: resolveBridgeBootstrap,
       myName: () => getPlayerName(),
@@ -1652,8 +1726,31 @@ async function joinRoomAtEpoch(
     if (container) {
       // Safe clear except original system greet is fine
       container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
+      // 🚫 Snapshot the block set ONCE per rebuild. Chat rebuilds fire on
+      // every insert delta, so any per-item cost multiplies with room chat
+      // traffic — the ReadonlySet handle stays valid inside this pass. 👥
+      // Also snapshot the thread router: null = ROOM broadcast; string = the
+      // active group thread. Every item is scored against both.
+      const blockedNow = blockedSet();
+      const thread = activeChatThread;
       const items: any[] = sharedChat.toArray();
+      let hiddenBlocked = 0;
       items.forEach((item) => {
+        // 👥 Thread routing FIRST — an item in a different thread is not this
+        // view's concern at all (group messages have a non-empty string groupId,
+        // room broadcasts have none or an empty one).
+        const gid = typeof item?.groupId === "string" && item.groupId ? item.groupId : null;
+        if (thread === null) {
+          if (gid !== null) return; // room view: skip anything tagged for a group
+        } else {
+          if (gid !== thread) return; // group view: skip other groups AND room
+        }
+        // 🚫 Block filter — canonical authorPub wins, legacy authorId resolved
+        // via the current players map (see getPubForAuthorId).
+        if (isAuthoredByBlocked(item, blockedNow, getPubForAuthorId)) {
+          hiddenBlocked++;
+          return;
+        }
         // S2: classify by stable authorId. Pre-S2 messages carry no authorId
         // and EVERY pre-S2 sender wrote the literal authorName 'Local-Clone',
         // so the fallback renders all legacy messages as 'me' — exactly the
@@ -1676,9 +1773,19 @@ async function joinRoomAtEpoch(
         bubble.appendChild(textNode);
         container.appendChild(bubble);
       });
+      // Honesty note: tell the reader when messages were hidden. Client-side
+      // only — the sender doesn't know we filtered them (documented in-app).
+      if (hiddenBlocked > 0) {
+        const note = document.createElement("div");
+        note.className = "chat-bubble system";
+        note.textContent = `🚫 ${hiddenBlocked} message${hiddenBlocked === 1 ? "" : "s"} hidden from blocked contacts.`;
+        container.appendChild(note);
+      }
       container.scrollTop = container.scrollHeight;
     }
   };
+  // Publish for module-scope subscribers (block list, group threads observer).
+  latestRebuildChatLog = rebuildChatLog;
   sharedChat.observe((event) => {
     // 💬 Overhead bubbles from the event's INSERT delta only — robust against
     // the in-transact 200-cap trim (length deltas lie there) and precise about
@@ -1686,17 +1793,25 @@ async function joinRoomAtEpoch(
     // burst (one big insert delta) never floods bubbles for old messages.
     if (sync.serverSynced) {
       try {
+        const blockedNow = blockedSet();
         for (const op of event.changes.delta) {
           const inserted = (op as { insert?: unknown[] }).insert;
           if (!Array.isArray(inserted)) continue;
           for (const item of inserted) {
             const msg = item as {
               authorId?: string;
+              authorPub?: string;
               text?: string;
               atX?: number;
               atZ?: number;
+              groupId?: unknown;
             };
             if (typeof msg?.text !== "string") continue;
+            // 👥 Group messages don't spawn WORLD bubbles — they're a private-
+            // by-UI thread; only the ROOM broadcast lane pops overhead bubbles.
+            if (typeof msg.groupId === "string" && msg.groupId) continue;
+            // 🚫 Blocked authors get no bubble (matches the chat-log filter).
+            if (isAuthoredByBlocked(msg, blockedNow, getPubForAuthorId)) continue;
             const isSelf =
               typeof msg.authorId === "string" &&
               msg.authorId === getPlayerId();
@@ -1716,6 +1831,27 @@ async function joinRoomAtEpoch(
   // already holds in index.html). Accepted: this also wipes any PRE-join
   // logToPhoneSystem() lines — rebind semantics; the log mirrors the doc.
   rebuildChatLog();
+
+  // 👥 Group chats (issue #20): shared thread records keyed by their derived
+  // id. The messages themselves ride sharedChat above (tagged with `groupId`).
+  // T0 semantics identical to sharedChat — a rejoin resets the active thread
+  // so the CHAT app never leaks the departure room's group into the new room.
+  const sharedGroups = sync.doc.getMap("groupChats");
+  activeChatThread = null;
+  sharedGroups.observe(() => {
+    // A group being created (locally or remotely) repopulates the thread bar
+    // and, if the currently-active group just aged out beyond MAX_GROUP_CHATS,
+    // silently falls back to the room lane so the input never targets a
+    // vanished thread. Same rebuild for the chat log (its per-thread filter
+    // narrows correctly whether or not the record exists).
+    if (activeChatThread) {
+      const stillHere = isGroupChatThread(sharedGroups.get(activeChatThread));
+      if (!stillHere) activeChatThread = null;
+    }
+    refreshChatThreadBarIfBound();
+    rebuildChatLog();
+  });
+  refreshChatThreadBarIfBound(); // initial paint if the chat picker is set up
 
   // 4. Set up incoming real-time client movement tick handler.
   // 0.23.0 wire (issue #22): the node prefixes every delivered tick with the
@@ -2521,17 +2657,25 @@ function renderPhonePlayersList(): void {
   }
 
   const players = sync.doc.getMap("players");
-  const rows: Array<{ id: string; entry: Partial<PlayerEntry> }> = [];
+  const rows: Array<{ id: string; entry: Partial<PlayerEntry>; pub?: string }> = [];
   players.forEach((value, key) => {
     if (value && typeof value === "object") {
-      rows.push({ id: key, entry: value as Partial<PlayerEntry> });
+      const entry = value as Partial<PlayerEntry>;
+      // Denormalize the pub onto the row so partitionRosterByBlocked scores it
+      // (a legacy keyless entry has no pub — those pass through as visible).
+      const pub = typeof entry.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : undefined;
+      rows.push({ id: key, entry, pub });
     }
   });
   rows.sort((a, b) => (a.entry.joinedAt ?? 0) - (b.entry.joinedAt ?? 0));
 
-  countEl.textContent = String(rows.length);
+  // 🚫 Block filter for the roster (issue #20): blocked players are HIDDEN
+  // from CLONES SEEN and counted separately (never in the visible tally). A
+  // small footer note surfaces the count so blocks feel visible to the user.
+  const { visible, blocked } = partitionRosterByBlocked(rows, blockedSet());
+  countEl.textContent = String(visible.length);
   const myId = getPlayerId();
-  for (const { id, entry } of rows) {
+  for (const { id, entry } of visible) {
     const li = document.createElement("li");
     li.className = "phone-players-row";
     const nameSpan = document.createElement("span");
@@ -2600,6 +2744,15 @@ function renderPhonePlayersList(): void {
       }
     }
     listEl.appendChild(li);
+  }
+  // 🚫 Footer: how many roster rows the local block set removed. Rendered as
+  // a phone-players-empty variant (no border, muted) so it never feels like a
+  // player row itself. Silent when nothing was blocked.
+  if (blocked.length > 0) {
+    const note = document.createElement("li");
+    note.className = "phone-players-empty";
+    note.textContent = `🚫 ${blocked.length} hidden by your block list.`;
+    listEl.appendChild(note);
   }
 }
 
@@ -4356,6 +4509,11 @@ function setupSpacePhoneOverlay() {
     // Chat input focus lives in the chat-view-open path (was: on phone open)
     if (id === "chat") {
       chatInput?.focus();
+      // 💬 Thread picker + input placeholder — refresh on every open so a
+      // group created while the chat app was closed shows up on entry, and
+      // the placeholder reflects the currently-active thread.
+      refreshChatThreadBarIfBound();
+      updateChatInputPlaceholder();
       // Hidden views report scrollHeight 0 — restore tail-scroll on re-entry
       const messages = document.getElementById("chat-messages-container");
       if (messages) messages.scrollTop = messages.scrollHeight;
@@ -4715,6 +4873,10 @@ function setupSpacePhoneOverlay() {
 
   // 👥 Contacts app wiring (keyed identity §8) — share/import cards, friends.
   setupContactsApp();
+  // 💬 Chat app wiring (issue #20 group chats) — thread picker + new-group
+  // flow. Setup is idempotent; the per-join binder repaints the chip list
+  // via refreshChatThreadBarIfBound() from the groupChats map observer.
+  setupChatThreadBar();
 
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
@@ -4758,6 +4920,14 @@ function setupSpacePhoneOverlay() {
 
       if (yjsSync) {
         const sharedChat = yjsSync.doc.getArray("chat");
+        const groupsMap = yjsSync.doc.getMap("groupChats");
+        // 👥 Group-scope guard: if a stale thread pointer somehow slips past
+        // the sharedGroups observer's fallback (a slow tab, a race between
+        // send-click and delete-observer), drop back to ROOM rather than
+        // stamp an orphan groupId onto a message no one can filter to.
+        const threadTarget = activeChatThread;
+        const isGroupSend = threadTarget !== null
+          && isGroupChatThread(groupsMap.get(threadTarget));
         // Transact safe transactional delta block append (Task 3.3 / 4.1)
         yjsSync.doc.transact(() => {
           sharedChat.push([
@@ -4765,14 +4935,26 @@ function setupSpacePhoneOverlay() {
               // S2: authorId is the stable identity (isMe check); authorName is
               // denormalized for display + legacy readers.
               authorId: getPlayerId(),
+              // Keyed-identity denormalization (issue #20): the canonical pub
+              // rides EVERY new chat message, so the block filter and other
+              // consumers never need to re-resolve authorId → keyB64 via the
+              // players map. Legacy readers ignore unknown fields.
+              authorPub: getIdentityPub(),
               authorName: getPlayerName(),
               text: val,
               atTick: localSeq,
               scope: "global",
+              // 👥 Thread tag — present ONLY on group sends so the room-lane
+              // filter (see rebuildChatLog / bubble observer) treats absent /
+              // empty groupId as ROOM and skips it here without change.
+              ...(isGroupSend ? { groupId: threadTarget } : {}),
               // 💬 Bubble anchor (additive; legacy readers ignore): the sender's
               // position at send time — remote clients pop the bubble over the
               // avatar nearest this spot (no lane↔player mapping exists yet).
+              // Group sends omit the anchor so a group message never spawns a
+              // world bubble (defense-in-depth alongside the observer skip).
               ...((): { atX?: number; atZ?: number } => {
+                if (isGroupSend) return {};
                 try {
                   const p = world?.getPlayer()?.getPosition();
                   return p ? { atX: p.x, atZ: p.z } : {};
@@ -4785,8 +4967,20 @@ function setupSpacePhoneOverlay() {
           // 💾 Tier A (plan §3.3): cap chat IN THE DOC so the room doc — and its
           // cached snapshot, and every sync — stays bounded. Concurrent trims
           // delete overlapping ranges idempotently (CRDT-safe).
-          const excess = sharedChat.length - 200;
-          if (excess > 0) sharedChat.delete(0, excess);
+          //
+          // Room lane keeps its 200-cap on the array as a whole; groups get a
+          // parallel per-group cap that scans the array for their tag and
+          // deletes only the oldest overflow indices (see excessGroupIndices
+          // for the invariant: indices are ASCENDING, so we delete DESC to
+          // keep intermediate indices valid inside this transact).
+          if (isGroupSend && threadTarget) {
+            const raw = sharedChat.toArray() as unknown[];
+            const idxs = excessGroupIndices(raw, threadTarget, GROUP_CHAT_CAP);
+            for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
+          } else {
+            const excess = sharedChat.length - 200;
+            if (excess > 0) sharedChat.delete(0, excess);
+          }
         });
       } else {
         // Fallback offline simulator if no node serves connection
@@ -5662,7 +5856,7 @@ function setupContactsApp(): void {
       setContactsFeedback("Identity restored. Your key fingerprint updated.");
     });
 
-  // Delegated list actions (friend toggle, DM, remove) for both lists.
+  // Delegated list actions (friend toggle, DM, remove, block, unblock).
   const onListClick = (e: Event) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
       "button[data-contact-act]",
@@ -5686,6 +5880,24 @@ function setupContactsApp(): void {
       case "dm":
         openDirectMessage(pub);
         break;
+      case "block": {
+        // 🚫 Issue #20 UX rule: destructive confirmation. Only proceed on an
+        // explicit YES from the native confirm() dialog — a stray tap on a
+        // touchscreen won't silence a contact by accident.
+        const c = getContact(pub);
+        const label = c?.name ? `${c.name} (🔑 ${contactFingerprint(pub)})` : `🔑 ${contactFingerprint(pub)}`;
+        const ok = window.confirm(
+          `Block ${label}?\n\nTheir chat and DM messages will stop appearing on your screen and their row will be hidden from CLONES SEEN. This is LOCAL to your device — the other side will not know they were blocked, and their bytes still arrive over the network (a server-enforced block is a later slice).`,
+        );
+        if (!ok) return;
+        setBlocked(pub, true);
+        setContactsFeedback(`Blocked ${label}. Unblock in the BLOCKED section below.`);
+        break;
+      }
+      case "unblock":
+        setBlocked(pub, false);
+        setContactsFeedback("Unblocked. Their messages and roster row will reappear.");
+        break;
     }
   };
   document
@@ -5693,6 +5905,11 @@ function setupContactsApp(): void {
     ?.addEventListener("click", onListClick);
   document
     .getElementById("contacts-all-list")
+    ?.addEventListener("click", onListClick);
+  // The BLOCKED section is rendered dynamically into #contacts-blocked-list;
+  // reuse the same delegated handler so its UNBLOCK buttons work.
+  document
+    .getElementById("contacts-blocked-list")
     ?.addEventListener("click", onListClick);
 
   // Keep the app live while it (or anything) mutates the contacts store or the
@@ -5724,10 +5941,30 @@ function contactRowHtml(
   const dmBtn = opts.friend
     ? `<button type="button" data-contact-act="dm" data-contact-pub="${safePub}" title="Direct message">💬</button>`
     : "";
+  // 🚫 Block button (issue #20) — red ✕ with a confirm() prompt handled by
+  // the delegated click handler. Distinct from the neutral REMOVE ✕: this one
+  // silences the identity across the app; REMOVE just forgets the card.
+  const blockBtn = `<button type="button" class="contact-block-btn" data-contact-act="block" data-contact-pub="${safePub}" title="Block this contact (hides their messages and roster row)">✕ BLOCK</button>`;
   return `<div class="contact-row" role="listitem">
     <span class="contact-name" title="${safePub}">${safeName}</span>
     <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
-    <span class="contact-actions">${dmBtn}${friendBtn}<button type="button" data-contact-act="remove" data-contact-pub="${safePub}" title="Remove contact">✕</button></span>
+    <span class="contact-actions">${dmBtn}${friendBtn}${blockBtn}<button type="button" data-contact-act="remove" data-contact-pub="${safePub}" title="Remove contact">✕</button></span>
+  </div>`;
+}
+
+/** Row shown in the BLOCKED CONTACTS section — the pub is the durable id and
+ *  may not be in your contacts anymore (a peer you never added but blocked
+ *  from the roster). We resolve a friendly name if we can, else render the
+ *  fingerprint alone. */
+function blockedRowHtml(pub: string): string {
+  const safePub = escapeHtml(pub);
+  const fp = contactFingerprint(pub);
+  const c = getContact(pub);
+  const display = c?.name ? escapeHtml(c.name) : `Unknown (🔑 ${fp})`;
+  return `<div class="contact-row" role="listitem">
+    <span class="contact-name" title="${safePub}">${display}</span>
+    <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
+    <span class="contact-actions"><button type="button" data-contact-act="unblock" data-contact-pub="${safePub}" title="Unblock — allow their messages and roster row again">↺ UNBLOCK</button></span>
   </div>`;
 }
 
@@ -5739,8 +5976,10 @@ function refreshContactsApp(): void {
 
   const friends = listFriends();
   const all = listContacts();
+  const blockedPubs = listBlocked();
   const friendsList = document.getElementById("contacts-friends-list");
   const allList = document.getElementById("contacts-all-list");
+  const blockedList = document.getElementById("contacts-blocked-list");
   if (friendsList) {
     friendsList.innerHTML = friends.length
       ? friends
@@ -5754,6 +5993,16 @@ function refreshContactsApp(): void {
           .map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend }))
           .join("")
       : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
+  }
+  // 🚫 BLOCKED section — one row per pub on the local block list. Includes
+  // an honesty note: this is local mute only; the sender is not notified,
+  // their bytes still arrive over the mesh, and a signed on-doc block op is
+  // a later TrustAndSafety slice. See brainstorming/phone-apps-breakdown.md §3.2.
+  if (blockedList) {
+    blockedList.innerHTML = blockedPubs.length
+      ? blockedPubs.map((pub) => blockedRowHtml(pub)).join("")
+        + '<div class="phone-access-note">Local mute only. Your device hides their messages and roster row; other clients are unaffected, and the blocked party is not notified.</div>'
+      : '<div class="phone-access-note">Nobody on your block list. Tap ✕ BLOCK on any contact to silence them locally.</div>';
   }
   const meshNote = document.getElementById("contacts-mesh-note");
   if (meshNote) {
@@ -5777,6 +6026,288 @@ function escapeHtml(s: string): string {
             ? "&quot;"
             : "&#39;",
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 💬 Chat app · thread picker + new-group flow (issue #20 · group chats)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The Chat app now supports THREADS above its existing broadcast log. A chip
+// bar switches the log between:
+//   - 🌐 ROOM  → messages in the room broadcast lane (no groupId)
+//   - 👥 <G>   → messages tagged with a specific groupId (a group thread)
+// A trailing + NEW GROUP chip opens a picker for choosing 1+ friends to seed
+// a fresh thread. The thread record is written to the room doc's `groupChats`
+// map; every member's client filters the shared chat to that groupId.
+//
+// Router state (`activeChatThread`) lives at module scope so subscribers set
+// up at boot (block list, groupChats observer) can trigger repaints via the
+// `latestRefreshChatThreadBar` closure indirection.
+
+let chatThreadBarInited = false;
+
+/** One-time setup for the Chat app's thread picker and new-group panel.
+ *  Delegated click handling lets us re-render the chip list freely without
+ *  re-binding listeners. */
+function setupChatThreadBar(): void {
+  if (chatThreadBarInited) return;
+  chatThreadBarInited = true;
+
+  const bar = document.getElementById("chat-thread-bar");
+  const panel = document.getElementById("chat-new-group-panel");
+  if (!bar || !panel) return;
+
+  // Delegated chip clicks: swap active thread OR open the new-group panel.
+  bar.addEventListener("click", (e) => {
+    const chip = (e.target as HTMLElement).closest<HTMLButtonElement>(
+      "button.chat-thread-chip",
+    );
+    if (!chip) return;
+    const target = chip.dataset.thread;
+    if (target === "__new__") {
+      openNewGroupPanel();
+      return;
+    }
+    // "__room__" is the sentinel for the ROOM broadcast lane.
+    activeChatThread = target === "__room__" || !target ? null : target;
+    refreshChatThreadBar();
+    updateChatInputPlaceholder();
+    rebuildChatLogIfBound();
+    // Refocus the input so the picker feels like a quick tab-switch, not a
+    // modal — same discipline as the phone view router (chatInput?.focus()).
+    (document.getElementById("chat-input") as HTMLInputElement | null)?.focus();
+  });
+
+  // The new-group panel's Cancel/Create buttons are also delegated so the
+  // panel can be re-rendered from state without re-binding listeners.
+  panel.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button");
+    if (!btn) return;
+    if (btn.classList.contains("chat-new-group-cancel")) {
+      closeNewGroupPanel();
+      return;
+    }
+    if (btn.classList.contains("chat-new-group-create")) {
+      void submitNewGroup(panel);
+    }
+  });
+
+  // Publish the refresh closure so per-join observers can trigger paints.
+  latestRefreshChatThreadBar = refreshChatThreadBar;
+  refreshChatThreadBar();
+}
+
+/** Rebuild the chip bar from the shared groupChats map + activeChatThread.
+ *  Silent no-op if the Chat app DOM isn't mounted (defense-in-depth: this
+ *  fires from Yjs observers that may still be attached during teardown). */
+function refreshChatThreadBar(): void {
+  const bar = document.getElementById("chat-thread-bar");
+  if (!bar) return;
+  bar.textContent = "";
+  const myPub = getIdentityPub();
+
+  // ROOM chip — always present, active when activeChatThread is null.
+  const roomChip = document.createElement("button");
+  roomChip.type = "button";
+  roomChip.className = "chat-thread-chip" + (activeChatThread === null ? " active" : "");
+  roomChip.dataset.thread = "__room__";
+  roomChip.textContent = "🌐 ROOM";
+  roomChip.title = "Room broadcast — everyone in this room sees these messages.";
+  bar.appendChild(roomChip);
+
+  // Group chips — one per thread that includes MY identity pub. Silently
+  // omits threads that fail the guard (hostile-peer entries can't inject).
+  const sync = yjsSync;
+  if (sync) {
+    const groupsMap = sync.doc.getMap("groupChats");
+    const mine = listMyGroupChats(groupsMap.entries(), myPub);
+    for (const t of mine) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chat-thread-chip" + (activeChatThread === t.id ? " active" : "");
+      chip.dataset.thread = t.id;
+      chip.textContent = "👥 " + (t.title || groupChatFallbackLabel(t, myPub));
+      chip.title = groupChatChipTitle(t, myPub);
+      bar.appendChild(chip);
+    }
+  }
+
+  // + NEW GROUP chip — opens the picker. Hidden entirely offline (no doc =
+  // no place to write a thread record; the CTA would be misleading).
+  if (sync) {
+    const newChip = document.createElement("button");
+    newChip.type = "button";
+    newChip.className = "chat-thread-chip chat-thread-new";
+    newChip.dataset.thread = "__new__";
+    newChip.id = "chat-new-group-btn";
+    newChip.textContent = "+ NEW GROUP";
+    newChip.title = "Start a new group chat with one or more friends.";
+    bar.appendChild(newChip);
+  }
+}
+
+/** Compose a fallback chip label when a thread has no explicit title. Lists
+ *  the OTHER members' short names (or fingerprints), truncated for the chip. */
+function groupChatFallbackLabel(t: GroupChatThread, myPub: string): string {
+  const others = t.members.filter((m) => m !== myPub);
+  if (others.length === 0) return "Just me";
+  const parts = others.map((pub) => {
+    const c = getContact(pub);
+    return c?.name ? c.name : contactFingerprint(pub);
+  });
+  // Cap the visible portion — chat chips are horizontally scrollable but a
+  // 40-char label is a screenful all on its own.
+  const label = parts.join(", ");
+  return label.length > 24 ? label.slice(0, 22) + "…" : label;
+}
+
+/** Long-form tooltip: member roster + honest privacy footnote. */
+function groupChatChipTitle(t: GroupChatThread, myPub: string): string {
+  const members = t.members.map((pub) => {
+    const c = getContact(pub);
+    const label = c?.name || `Unknown-${contactFingerprint(pub)}`;
+    return pub === myPub ? `${label} (you)` : label;
+  }).join(", ");
+  return `Group chat · ${t.members.length} members: ${members}\nPrivate-by-UI: every room member replicates the messages; only members see them in the picker.`;
+}
+
+/** Update the chat input's placeholder text based on the active thread — a
+ *  small but crucial cue so the user knows which lane a SEND will target. */
+function updateChatInputPlaceholder(): void {
+  const input = document.getElementById("chat-input") as HTMLInputElement | null;
+  if (!input) return;
+  if (activeChatThread === null) {
+    input.placeholder = "Broadcast to room...";
+    return;
+  }
+  const sync = yjsSync;
+  if (!sync) return;
+  const t = sync.doc.getMap("groupChats").get(activeChatThread);
+  if (!isGroupChatThread(t)) {
+    input.placeholder = "Broadcast to room...";
+    return;
+  }
+  const label = t.title || groupChatFallbackLabel(t, getIdentityPub());
+  input.placeholder = `Message ${label}...`;
+}
+
+/** Open the new-group panel — populates the friends checklist fresh each time.
+ *  If there are no friends yet, shows a hint rather than an empty form. */
+function openNewGroupPanel(): void {
+  const panel = document.getElementById("chat-new-group-panel");
+  if (!panel) return;
+  const myPub = getIdentityPub();
+  // Only FRIENDS (contacts.friend === true) can be group members — a raw
+  // contact is a verified id, but the friend gate is the intent signal that
+  // you actually want to co-thread with them.
+  const friends = listFriends();
+  const parts: string[] = [];
+  parts.push('<div class="chat-new-group-header">NEW GROUP CHAT</div>');
+  parts.push('<input type="text" id="chat-new-group-title" maxlength="' + GROUP_TITLE_MAX + '" placeholder="Group title (optional)" autocomplete="off">');
+  if (friends.length === 0) {
+    parts.push('<div class="chat-new-group-note">You have no friends yet. Add someone in the CONTACTS app, then tap ☆ to promote them to a friend.</div>');
+  } else {
+    parts.push('<div class="chat-new-group-friends">');
+    for (const f of friends) {
+      if (f.pub === myPub) continue; // self is added automatically
+      const safePub = escapeHtml(f.pub);
+      const safeName = escapeHtml(f.name);
+      parts.push(
+        '<label><input type="checkbox" value="' + safePub + '"><span>' + safeName + ' · 🔑 ' + contactFingerprint(f.pub) + '</span></label>',
+      );
+    }
+    parts.push('</div>');
+    parts.push('<div class="chat-new-group-note">Pick ' + (MIN_GROUP_MEMBERS - 1) + '+ friends. Local & private-by-UI: every room member replicates the messages, filtering happens in the app. A signed on-doc scoping is a later slice.</div>');
+  }
+  parts.push('<div class="chat-new-group-actions">');
+  parts.push('<button type="button" class="chat-new-group-cancel">CANCEL</button>');
+  parts.push('<button type="button" class="chat-new-group-create" disabled>CREATE</button>');
+  parts.push('</div>');
+  panel.innerHTML = parts.join("");
+  panel.hidden = false;
+
+  // Enable CREATE only when at least one friend is checked. Live listener on
+  // the (freshly-rendered) checkbox group.
+  const createBtn = panel.querySelector<HTMLButtonElement>("button.chat-new-group-create");
+  const friendsBox = panel.querySelector(".chat-new-group-friends");
+  const refreshCreate = () => {
+    if (!createBtn) return;
+    const checked = panel.querySelectorAll<HTMLInputElement>(".chat-new-group-friends input[type=checkbox]:checked").length;
+    createBtn.disabled = checked < (MIN_GROUP_MEMBERS - 1);
+  };
+  friendsBox?.addEventListener("change", refreshCreate);
+  refreshCreate();
+}
+
+function closeNewGroupPanel(): void {
+  const panel = document.getElementById("chat-new-group-panel");
+  if (panel) {
+    panel.hidden = true;
+    panel.textContent = "";
+  }
+}
+
+/** Read the panel's checked friends + title, build a canonical thread record,
+ *  write it into the room doc's groupChats map, and switch to the new thread.
+ *  Enforces MAX_GROUP_CHATS by evicting the oldest thread records (client-
+ *  local — every viewer trims the same overflow because the sort is stable). */
+async function submitNewGroup(panel: HTMLElement): Promise<void> {
+  const sync = yjsSync;
+  if (!sync) {
+    setChatFeedback("Offline — a group chat needs a connected room.");
+    return;
+  }
+  const titleInput = panel.querySelector<HTMLInputElement>("#chat-new-group-title");
+  const title = titleInput?.value.trim() ?? "";
+  const checked = Array.from(
+    panel.querySelectorAll<HTMLInputElement>(".chat-new-group-friends input[type=checkbox]:checked"),
+  ).map((cb) => cb.value);
+  if (checked.length < MIN_GROUP_MEMBERS - 1) {
+    setChatFeedback(`Pick at least ${MIN_GROUP_MEMBERS - 1} friend${MIN_GROUP_MEMBERS - 1 === 1 ? "" : "s"}.`);
+    return;
+  }
+  let thread: GroupChatThread;
+  try {
+    thread = buildGroupChatThread({
+      members: checked,
+      title,
+      createdBy: getIdentityPub(),
+    });
+  } catch (e) {
+    setChatFeedback(`Could not create group: ${(e as Error).message}`);
+    return;
+  }
+  const groupsMap = sync.doc.getMap("groupChats");
+  sync.doc.transact(() => {
+    // Whole-value LWW: idempotent when two members create the same set at
+    // once (deriveGroupChatId is deterministic on the sorted member list),
+    // so the later writer's record overwrites with identical shape.
+    groupsMap.set(thread.id, thread);
+    // 🚫 Bounded map: evict the OLDEST thread records if we exceed the hard
+    // cap. Deleted threads keep their message history in sharedChat (the
+    // messages don't age with the record); this only removes the picker
+    // entry — a fair tradeoff for a bounded room doc.
+    const evict = excessThreadIds(groupsMap.entries(), MAX_GROUP_CHATS);
+    for (const id of evict) if (id !== thread.id) groupsMap.delete(id);
+  });
+  activeChatThread = thread.id;
+  closeNewGroupPanel();
+  refreshChatThreadBar();
+  updateChatInputPlaceholder();
+  rebuildChatLogIfBound();
+  (document.getElementById("chat-input") as HTMLInputElement | null)?.focus();
+}
+
+/** Small inline feedback line — reuses the room log so the message surfaces
+ *  without a separate DOM element (fresh install has no dedicated slot). */
+function setChatFeedback(msg: string): void {
+  const container = document.getElementById("chat-messages-container");
+  if (!container) return;
+  const line = document.createElement("div");
+  line.className = "chat-bubble system";
+  line.textContent = msg;
+  container.appendChild(line);
+  container.scrollTop = container.scrollHeight;
 }
 
 /** 🕸️ Mesh harvest (§7 M1): fold every contact/friend into the peer store.
