@@ -2823,6 +2823,18 @@ let treasuryDetailId = "";
 let treasuryListOffset = 0;
 
 /**
+ * Where the open proposal's approval rounds are paged to.
+ *
+ * Same reason as the list, and the same attack: session shells are UNSIGNED
+ * and peer-writable, so two dozen self-consistent decoys sorted ahead of the
+ * genuine round consume the check budget before sessionsFor can filter them
+ * out — and with no way to reach the next page, that round's real progress
+ * was permanently invisible. Reset whenever a different proposal is opened,
+ * or a page number from one proposal would carry over to another.
+ */
+let treasuryApprovalOffset = 0;
+
+/**
  * How many records one repaint may VERIFY, as opposed to walk past.
  *
  * Verifying a record costs about 1.4 ms — a canonical id or hash recomputed
@@ -2947,8 +2959,15 @@ function wireTreasuryView(view: HTMLElement): void {
       );
       if (!el) return false;
       const action = el.dataset.treasuryAction;
-      if (action === "open") treasuryDetailId = el.dataset.proposalId ?? "";
+      if (action === "open") {
+        treasuryDetailId = el.dataset.proposalId ?? "";
+        treasuryApprovalOffset = 0; // a page number is per proposal
+      }
       if (action === "back") treasuryDetailId = "";
+      if (action === "rounds-next") treasuryApprovalOffset += DETAIL_CHECKS;
+      if (action === "rounds-prev") {
+        treasuryApprovalOffset = Math.max(0, treasuryApprovalOffset - DETAIL_CHECKS);
+      }
       // Paging is clamped by the scan itself against what actually matched,
       // so a page that empties out between repaints cannot strand anyone.
       if (action === "page-next") treasuryListOffset += LIST_CHECKS;
@@ -3187,7 +3206,36 @@ function paintTreasuryBody(view: HTMLElement): void {
     const DETAIL_SCAN = 50_000;
     const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
     const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
-    const sessionScan = scanSigningSessions(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
+    // Paged, for the same reason the proposal list is: shells are unsigned and
+    // peer-writable, so decoys sorted ahead of the genuine round would
+    // otherwise put it permanently out of reach.
+    let sessionScan = scanSigningSessions(
+      proposal.proposalId,
+      DETAIL_SCAN,
+      DETAIL_CHECKS,
+      treasuryApprovalOffset,
+    );
+    // Same stranding guard as the list: a page that empties out between
+    // repaints lands on the last page that still holds something.
+    if (
+      sessionScan.items.length === 0 &&
+      sessionScan.matched > 0 &&
+      sessionScan.offset >= sessionScan.matched
+    ) {
+      treasuryApprovalOffset = Math.max(
+        0,
+        (Math.ceil(sessionScan.matched / DETAIL_CHECKS) - 1) * DETAIL_CHECKS,
+      );
+      sessionScan = scanSigningSessions(
+        proposal.proposalId,
+        DETAIL_SCAN,
+        DETAIL_CHECKS,
+        treasuryApprovalOffset,
+      );
+    }
+    if (sessionScan.offset !== treasuryApprovalOffset) {
+      treasuryApprovalOffset = sessionScan.offset;
+    }
     // Only the two scans that FEED the vote panel. Including the approval scan
     // made a proposal with many approval rounds tell the VOTES panel its own
     // figures were partial when they were complete — and approval truncation
@@ -3310,6 +3358,30 @@ function paintTreasuryBody(view: HTMLElement): void {
           : ""
       }
       ${dim(esc(approvals.note))}
+      ${
+        // Reachability, not just disclosure. Rounds are peer-writable, so
+        // without a way to page past planted ones the genuine round's progress
+        // could be hidden for good — the same hole the proposal list had.
+        sessionScan.matched > DETAIL_CHECKS
+          ? `${dim(
+              `Showing rounds ${sessionScan.offset + 1}–${sessionScan.offset + Math.min(DETAIL_CHECKS, sessionScan.matched - sessionScan.offset)} of ${sessionScan.matched} held under this proposal's approval keys. Only this page was read.`,
+            )}
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              ${
+                sessionScan.offset > 0
+                  ? `<div data-treasury-action="rounds-prev" role="button" tabindex="0" aria-label="Previous page of approval rounds"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                  : ""
+              }
+              ${
+                sessionScan.offset + DETAIL_CHECKS < sessionScan.matched
+                  ? `<div data-treasury-action="rounds-next" role="button" tabindex="0" aria-label="Next page of approval rounds"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                  : ""
+              }
+            </div>`
+          : ""
+      }
       ${
         sessionScan.refusedTooLarge > 0
           ? dim(

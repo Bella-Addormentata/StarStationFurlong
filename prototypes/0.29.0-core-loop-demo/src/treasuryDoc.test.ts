@@ -851,6 +851,48 @@ describe('verification caching', () => {
     expect(scan.items[0].collectedSigs).toEqual(session.collectedSigs);
   });
 
+  it('lets the detail screen page past decoy rounds to the genuine one', () => {
+    // The UI read page 0 only, and shells are UNSIGNED and peer-writable, so
+    // a page's worth of self-consistent decoys sorted ahead of the real round
+    // consumed the check budget before sessionsFor could filter them — and
+    // with no next page, that round's progress was invisible for good. Same
+    // hole the proposal list had; this pins the offset the screen now uses.
+    const shellOf = (proposalId: string, bundle: string) => ({
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId,
+      bundleHash: bundle,
+      requiredThreshold: 2,
+      expiresAfterHeight: 900,
+    });
+    const proposalId = 'c3'.repeat(32);
+    const real = shellOf(proposalId, 'f'.repeat(64));
+    const realId = signingSessionIdOf(real);
+    const m = doc.getMap('treasury');
+    m.set(`session:${proposalId}:${realId}`, { ...real, sessionId: realId, collectedSigs: [] });
+    // Decoys for the SAME proposal, so sessionsFor cannot drop them either.
+    for (let i = 0; i < 8; i += 1) {
+      const decoy = shellOf(proposalId, i.toString().padStart(64, '0'));
+      const id = signingSessionIdOf(decoy);
+      m.set(`session:${proposalId}:${id}`, { ...decoy, sessionId: id, collectedSigs: [] });
+    }
+    const first = scanSigningSessions(proposalId, 50_000, 3, 0);
+    expect(first.matched).toBe(9);
+    expect(first.truncated).toBe(true);
+    const seen: string[] = [];
+    for (let offset = 0; offset < first.matched; offset += 3) {
+      seen.push(...scanSigningSessions(proposalId, 50_000, 3, offset).items.map((s) => s.sessionId));
+    }
+    expect(seen).toContain(realId);
+    // Over-running the end reports where it landed rather than throwing, so
+    // the screen can snap back to the last page that holds something.
+    const past = scanSigningSessions(proposalId, 50_000, 3, 999);
+    expect(past.items).toEqual([]);
+    expect(past.offset).toBe(9);
+  });
+
   it('caps one round’s signatures and says the set is partial', () => {
     // Signature entries are peer-writable and unverified here, so one wanted
     // session could absorb the whole scan ceiling — and every repaint would

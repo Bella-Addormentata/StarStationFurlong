@@ -578,6 +578,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     const editNote = panel.querySelector<HTMLElement>('#device-terminal-edit-room-note');
     if (editBtn && deps.editRoom) {
       const perm = deps.editRoom.permission();
+      // Captured BEFORE anything is disabled. Browsers blur a focused button
+      // the moment it becomes disabled, so reading document.activeElement
+      // afterwards always found focus already outside the panel and the
+      // recovery below never ran at all.
+      const focusedBefore = document.activeElement as HTMLElement | null;
+      const hadFocusInPanel = Boolean(panel && focusedBefore && panel.contains(focusedBefore));
       for (const btn of [editBtn, hullBtn]) {
         if (!btn) continue;
         btn.disabled = !perm.ok;
@@ -596,8 +602,15 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       // listener bound to it never fires again and the enabled treasury link
       // becomes unreachable — the traversal defeating itself. Catch that here,
       // where the disabling happens, and land on a stop that still works.
-      const active = document.activeElement as HTMLElement | null;
-      if (active instanceof HTMLButtonElement && active.disabled && panel?.contains(active)) {
+      //
+      // Tested against the SAVED reference and the state now: focus was ours,
+      // the element that held it is disabled, and focus has since left.
+      const lostFocus =
+        hadFocusInPanel &&
+        focusedBefore instanceof HTMLButtonElement &&
+        focusedBefore.disabled &&
+        !panel?.contains(document.activeElement);
+      if (lostFocus && panel) {
         const stops = [
           ...panel.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]'),
         ].filter((el) => el.offsetParent !== null);
