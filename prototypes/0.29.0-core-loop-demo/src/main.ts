@@ -3989,6 +3989,17 @@ function paintTreasuryBody(view: HTMLElement): void {
       <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">CHAIN VIEW</span>
       ${badge("sync", sync.trust)}
     </div>
+    ${
+      // WHICH network these records are pinned to, named on the one panel
+      // that is about chain trust. `label` was documented as player-facing
+      // and configured through VITE_SSF_TREASURY_NETWORK, but nothing read
+      // it — so the option changed nothing a player could see, and a build
+      // pinned to a test network looked exactly like one pinned to the real
+      // one. For a screen about money that is the distinction most worth
+      // showing. The unconfigured case keeps its fuller explanation in the
+      // banner above and is not repeated here.
+      net.configured ? row("Records pinned to", esc(net.label)) : ""
+    }
     ${row("This device", "not verifying")}
     ${
       !sync.readable

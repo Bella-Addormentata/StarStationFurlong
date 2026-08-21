@@ -1203,6 +1203,20 @@ describe('pager visibility', () => {
     }
   });
 
+  it('shows which network the records are pinned to', () => {
+    // `label` was documented as player-facing and settable through
+    // VITE_SSF_TREASURY_NETWORK, and nothing read it: the option changed
+    // nothing on screen, so a build pinned to a test network looked exactly
+    // like one pinned to the real one. On a screen about money that is the
+    // distinction most worth showing, and a configuration contract with no
+    // reader is a promise the build does not keep.
+    expect(main).toMatch(/net\.configured \? row\("Records pinned to", esc\(net\.label\)\)/);
+    // On the panel about chain trust, not somewhere incidental.
+    const chain = main.indexOf('CHAIN VIEW');
+    expect(chain).toBeGreaterThan(-1);
+    expect(main.indexOf('net.label')).toBeGreaterThan(chain);
+  });
+
   it('gates the open proposal read like every other read on the screen', () => {
     // This was the one ungated call, and the one whose result becomes a
     // positive claim about the room.
