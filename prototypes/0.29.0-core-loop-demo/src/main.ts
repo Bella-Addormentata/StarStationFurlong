@@ -2835,6 +2835,19 @@ let treasuryListOffset = 0;
 let treasuryApprovalOffset = 0;
 
 /**
+ * Where the open proposal's vote and vote-record scans are paged to.
+ *
+ * The fifth and last place this was missing. Vote and checkpoint keys are
+ * peer-writable too, so a page of decoys sorted ahead of the genuine records
+ * hid them with no way through — the panel warned it was partial and offered
+ * nothing to do about it, exactly as the proposal list and the approval rounds
+ * did before they were paged. One offset for both, because they are counted
+ * into a single tally and advancing them apart would make the figures answer
+ * different questions.
+ */
+let treasuryVoteOffset = 0;
+
+/**
  * How many records one repaint may VERIFY, as opposed to walk past.
  *
  * Verifying a record costs about 1.4 ms — a canonical id or hash recomputed
@@ -2961,12 +2974,18 @@ function wireTreasuryView(view: HTMLElement): void {
       const action = el.dataset.treasuryAction;
       if (action === "open") {
         treasuryDetailId = el.dataset.proposalId ?? "";
-        treasuryApprovalOffset = 0; // a page number is per proposal
+        // Page numbers are per proposal.
+        treasuryApprovalOffset = 0;
+        treasuryVoteOffset = 0;
       }
       if (action === "back") treasuryDetailId = "";
       if (action === "rounds-next") treasuryApprovalOffset += DETAIL_CHECKS;
       if (action === "rounds-prev") {
         treasuryApprovalOffset = Math.max(0, treasuryApprovalOffset - DETAIL_CHECKS);
+      }
+      if (action === "votes-next") treasuryVoteOffset += DETAIL_CHECKS;
+      if (action === "votes-prev") {
+        treasuryVoteOffset = Math.max(0, treasuryVoteOffset - DETAIL_CHECKS);
       }
       // Paging is clamped by the scan itself against what actually matched,
       // so a page that empties out between repaints cannot strand anyone.
@@ -3204,8 +3223,31 @@ function paintTreasuryBody(view: HTMLElement): void {
     // value small enough to be a page becomes a horizon a peer can hide
     // records behind. What bounds a repaint is DETAIL_CHECKS.
     const DETAIL_SCAN = 50_000;
-    const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
-    const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
+    // Paged, like the proposal list and the approval rounds. These keys are
+    // peer-writable too, so without a way through, decoys sorted ahead of the
+    // genuine records hid them for good.
+    let voteScan = scanVotes(
+      proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+    );
+    let cpScan = scanCheckpoints(
+      proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+    );
+    // One offset drives both, so it is clamped against whichever set is
+    // longer — otherwise paging would stop at the shorter one and strand the
+    // rest of the other.
+    const voteMatched = Math.max(voteScan.matched, cpScan.matched);
+    if (treasuryVoteOffset >= voteMatched && voteMatched > 0) {
+      treasuryVoteOffset = Math.max(
+        0,
+        (Math.ceil(voteMatched / DETAIL_CHECKS) - 1) * DETAIL_CHECKS,
+      );
+      voteScan = scanVotes(
+        proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+      );
+      cpScan = scanCheckpoints(
+        proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS, treasuryVoteOffset,
+      );
+    }
     // Paged, for the same reason the proposal list is: shells are unsigned and
     // peer-writable, so decoys sorted ahead of the genuine round would
     // otherwise put it permanently out of reach.
@@ -3326,6 +3368,30 @@ function paintTreasuryBody(view: HTMLElement): void {
           ? dim(
               `${voteScan.refusedTooLarge + cpScan.refusedTooLarge} record${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted here. That is this device's limit, not a fault in the records.`,
             )
+          : ""
+      }
+      ${
+        // Reachability for the tally too. Without it the partial warning above
+        // told the player their figures were incomplete and gave them no way
+        // to see the rest — the same hole the list and the rounds had.
+        voteMatched > DETAIL_CHECKS
+          ? `${dim(
+              `These figures cover records ${treasuryVoteOffset + 1}–${treasuryVoteOffset + Math.min(DETAIL_CHECKS, voteMatched - treasuryVoteOffset)} of the ${voteMatched} held under this proposal's vote keys. Only this page was read.`,
+            )}
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              ${
+                treasuryVoteOffset > 0
+                  ? `<div data-treasury-action="votes-prev" role="button" tabindex="0" aria-label="Previous page of vote records"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                  : ""
+              }
+              ${
+                treasuryVoteOffset + DETAIL_CHECKS < voteMatched
+                  ? `<div data-treasury-action="votes-next" role="button" tabindex="0" aria-label="Next page of vote records"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                  : ""
+              }
+            </div>`
           : ""
       }
       ${

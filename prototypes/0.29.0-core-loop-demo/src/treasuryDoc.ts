@@ -673,7 +673,11 @@ function scanPrefixed<T>(
   const page = keys.slice(start, start + Math.max(0, maxChecks));
   // Anything the page does not cover is still there to be paged to, and the
   // caller is told so rather than being left to assume it saw everything.
-  if (start + page.length < keys.length) truncated = true;
+  // start > 0 counts too: the LAST page omits every earlier one, so
+  // clearing the flag there would let a page-sized subset be read as the
+  // whole cache — the same partial-answer-as-total mistake the removed
+  // wrappers made.
+  if (start > 0 || start + page.length < keys.length) truncated = true;
   // Pass two: verify only this page. THIS is the expensive half.
   const items: T[] = [];
   let refusedTooLarge = 0;
@@ -714,6 +718,8 @@ export function scanVotes(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
+  /** Where to start in the sorted matching keys — see scanPrefixed. */
+  offset = 0,
 ): BoundedScan<TreasuryVote> {
   const prefix = `vote:${proposalId}:`;
   return scanPrefixed(
@@ -725,6 +731,7 @@ export function scanVotes(
         ? value
         : null,
     voteVerdict,
+    offset,
   );
 }
 
@@ -732,6 +739,8 @@ export function scanCheckpoints(
   proposalId: string,
   maxEntries: number,
   maxChecks: number,
+  /** Where to start in the sorted matching keys — see scanPrefixed. */
+  offset = 0,
 ): BoundedScan<TreasuryCheckpoint> {
   const prefix = `checkpoint:${proposalId}:`;
   return scanPrefixed(
@@ -744,6 +753,7 @@ export function scanCheckpoints(
         ? value
         : null,
     checkpointVerdict,
+    offset,
   );
 }
 
@@ -1238,7 +1248,8 @@ export function scanSigningSessions(
   shellKeys.sort();
   const start = Math.max(0, Math.min(offset, shellKeys.length));
   const page = shellKeys.slice(start, start + Math.max(0, maxChecks));
-  if (start + page.length < shellKeys.length) truncated = true;
+  // Same rule as scanPrefixed: a non-zero offset is itself a partial view.
+  if (start > 0 || start + page.length < shellKeys.length) truncated = true;
 
   // Pass two: signatures for THIS PAGE's sessions, chosen after the page is.
   // Filtering during examination means a flood of signatures for other

@@ -55,6 +55,7 @@ import {
   readRegistrationResult,
   readRoomBinding,
   readRoomBindingResult,
+  scanCheckpoints,
   scanProposals,
   scanSigningSessions,
   scanVotes,
@@ -789,6 +790,37 @@ describe('verification caching', () => {
       (held as unknown as { proposerSig: string }).proposerSig = 'tampered';
     }).toThrow();
     expect(readProposal(p.proposalId)?.proposerSig).toBe(p.proposerSig);
+  });
+
+  it('pages votes and checkpoints too, and never calls a page complete', () => {
+    // The last two scans without a paging path. Vote and checkpoint keys are
+    // peer-writable, so decoys sorted ahead of the genuine records hid them
+    // with no way through — the panel warned it was partial and offered
+    // nothing to do about it.
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    const real = makeVote(seedA, 'a'.repeat(64), 1, p.proposalId);
+    expect(putVote(real)).toBe(true);
+    const m = doc.getMap('treasury');
+    for (let i = 0; i < 6; i += 1) {
+      m.set(`vote:${p.proposalId}:0${i.toString().padStart(63, '0')}`, { junk: i });
+    }
+    const seen: string[] = [];
+    const first = scanVotes(p.proposalId, 50_000, 3, 0);
+    for (let offset = 0; offset < first.matched; offset += 3) {
+      seen.push(...scanVotes(p.proposalId, 50_000, 3, offset).items.map((v) => v.voteId));
+    }
+    expect(seen).toContain(real.voteId);
+    // A NON-ZERO offset is itself a partial view: the last page omits every
+    // earlier one, so clearing the flag there would let a page-sized subset
+    // read as the whole cache.
+    const lastPage = scanVotes(p.proposalId, 50_000, 3, 6);
+    expect(lastPage.offset).toBe(6);
+    expect(lastPage.truncated).toBe(true);
+    // Page zero covering everything is the only complete answer.
+    expect(scanVotes(p.proposalId, 50_000, 50_000, 0).truncated).toBe(false);
+    // Checkpoints take an offset on the same terms.
+    expect(scanCheckpoints(p.proposalId, 50_000, 3, 0).offset).toBe(0);
   });
 
   it('counts rejected records, so a page of forgeries is not "none held"', () => {
