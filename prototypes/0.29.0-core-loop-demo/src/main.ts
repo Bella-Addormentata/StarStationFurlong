@@ -41,6 +41,7 @@ import {
   verifyIdentity,
   exportRecoveryKey,
   importRecoveryKey,
+  previewRecoveryKey,
   ysyncSigner,
   hasStoredIdentity,
   getCloneVatPreference,
@@ -57,6 +58,19 @@ import {
   isSharedStationRoom,
   sharedStationBootstrap,
 } from "./station";
+// 🎬 #79 P5: pure state machine for the boot title (paste → confirm → applied)
+// and the "boot target priority" contract fetchDefaultBootstrap / bootstrap-
+// Networking implement — bootFlow.ts is the tested spec for those seams.
+import {
+  cancelConfirm,
+  chooseNewPlayer,
+  confirmRestore,
+  isTerminal,
+  openPaste,
+  readyToFade,
+  submitPaste,
+  type BootTitleStage,
+} from "./bootFlow";
 import { bindTreasuryDoc } from "./treasuryDoc";
 // Dev placeholder network pin for the treasury cache layer — deliberately
 // matches NO real chain genesis, so every foreign record is rejected until
@@ -6730,14 +6744,32 @@ function setupClickToEnter() {
   let exteriorReady = false;
   let faded = false;
 
-  // 🆕 #79 P1: a genuine first run (no stored identity seed) holds the title on
-  // a New Player / Load-from-Backup choice before the station reveals; a
-  // returning install auto-reveals its station as before (proceedChosen = true).
+  // 🆕 #79 P1/P5: a genuine first run (no stored identity seed) holds the
+  // title on a New Player / Load-from-Backup choice before the station
+  // reveals; a returning install auto-reveals its station as before
+  // (proceedChosen = true). The title screen's stage transitions run through
+  // the pure state machine in bootFlow.ts so the paste → confirm → applied
+  // sequence is testable + a stray click after applied cannot re-open the
+  // choice.
   const firstRun = !hasStoredIdentity();
   let proceedChosen = !firstRun;
+  // Boot-title state — 'idle' shows NEW PLAYER / LOAD FROM BACKUP, 'paste'
+  // shows the recovery-key textarea, 'confirm' shows the identity preview +
+  // CONFIRM/CANCEL, 'applied' schedules the reload, 'proceed' fades to the
+  // atlas. Returning installs never leave the implicit 'proceed'.
+  let titleStage: BootTitleStage = { kind: 'idle' };
 
   const maybeFade = () => {
-    if (faded || !dwellDone || !exteriorReady || !proceedChosen) return;
+    if (
+      !readyToFade({
+        dwellDone,
+        exteriorReady,
+        proceedChosen,
+        alreadyFaded: faded,
+      })
+    ) {
+      return;
+    }
     faded = true;
     // 🎬 Pre-entry ends with the curtain: HUD elements gated on it (the
     // SpacePhone tip) become eligible again — the exterior-active gate keeps
@@ -6756,15 +6788,19 @@ function setupClickToEnter() {
     window.addEventListener("click", onCanvasClick);
   };
 
-  // 🆕 #79 P1: on a first run, replace the "Click to Enter" hint with the
+  // 🆕 #79 P1/P5: on a first run, replace the "Click to Enter" hint with the
   // New Player / Load-from-Backup choice. New Player reveals the station now;
-  // Load-from-Backup's restore is wired in the next slice (no key handling
-  // here). A returning install skips this and auto-reveals as before.
+  // Load-from-Backup opens a paste box, PREVIEW derives a fingerprint from
+  // the pasted key WITHOUT applying it, then a distinct CONFIRM / CANCEL
+  // step (owner spec: "text box to paste key, then confirmation then load
+  // atlas of that players clone vat preference") gates the actual import.
+  // A returning install skips this and auto-reveals as before.
   if (firstRun) {
     const content = document.getElementById("welcome-content");
     const hint = content?.querySelector<HTMLElement>(".hint") ?? null;
     if (hint) hint.style.display = "none";
     if (content) {
+      // ── Style tokens shared by all title-screen controls (one place to tune).
       const primary =
         "padding:12px 30px; font:700 15px/1 inherit; letter-spacing:1.5px; color:#1a1206; " +
         "background:linear-gradient(180deg,#ffd879,#f0b429); border:2px solid #ffe9a8; " +
@@ -6776,17 +6812,11 @@ function setupClickToEnter() {
       const wrap = document.createElement("div");
       wrap.style.cssText =
         "display:flex; flex-direction:column; gap:12px; margin-top:24px; align-items:center;";
+      // ── Buttons + inputs (visibility gated on titleStage via renderStage).
       const btnNew = document.createElement("button");
       btnNew.type = "button";
       btnNew.textContent = "🚀  NEW PLAYER";
       btnNew.style.cssText = primary;
-      btnNew.addEventListener("click", (e) => {
-        e.stopPropagation();
-        wrap.remove();
-        dwellDone = true; // proceed at once — don't wait out the intro dwell
-        proceedChosen = true;
-        maybeFade();
-      });
       const btnLoad = document.createElement("button");
       btnLoad.type = "button";
       btnLoad.textContent = "🔑  LOAD FROM BACKUP";
@@ -6794,67 +6824,153 @@ function setupClickToEnter() {
       const note = document.createElement("div");
       note.style.cssText =
         "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.75); min-height:15px; max-width:300px; text-align:center;";
-      // 🔑 #79 P2: Load-from-Backup reveals a paste box wired to the EXISTING
-      // recovery-key restore (keypair.importRecoveryKey — the same seam the
-      // SpacePhone's "Restore identity" uses). The recovery key is the private
-      // identity: it is stored ONLY via importRecoveryKey (localStorage, exactly
-      // like a returning install), never logged, and cleared from the field the
-      // instant it's applied. A valid key reboots into that identity's station.
-      let restoreOpen = false;
+      // Paste stage: textarea + PREVIEW button.
+      const pasteBox = document.createElement("div");
+      pasteBox.style.cssText =
+        "display:none; flex-direction:column; gap:8px; align-items:center; width:300px;";
+      const ta = document.createElement("textarea");
+      ta.rows = 2;
+      ta.placeholder = "Paste your recovery key…";
+      ta.autocomplete = "off";
+      ta.spellcheck = false;
+      ta.style.cssText =
+        "width:100%; box-sizing:border-box; resize:none; font:400 11px/1.4 monospace; " +
+        "padding:8px; border-radius:8px; border:1px solid rgba(240,180,41,0.4); " +
+        "background:rgba(10,7,3,0.75); color:#f0e0b0;";
+      ta.addEventListener("click", (ev) => ev.stopPropagation());
+      const btnPreview = document.createElement("button");
+      btnPreview.type = "button";
+      btnPreview.textContent = "▶  PREVIEW IDENTITY";
+      btnPreview.style.cssText = primary;
+      pasteBox.append(ta, btnPreview);
+      // Confirm stage: fingerprint preview + CONFIRM / CANCEL. The CONFIRM
+      // path is the ONLY caller of importRecoveryKey — the pure state machine
+      // in bootFlow.ts guarantees it can't fire from paste/idle/applied.
+      const confirmBox = document.createElement("div");
+      confirmBox.style.cssText =
+        "display:none; flex-direction:column; gap:10px; align-items:center; " +
+        "width:300px; padding:14px; border-radius:10px; " +
+        "background:rgba(20,14,6,0.55); border:1px solid rgba(240,180,41,0.4);";
+      const fpLine = document.createElement("div");
+      fpLine.style.cssText =
+        "font:700 14px/1.3 monospace; color:#ffe9a8; letter-spacing:1.5px; text-align:center;";
+      const confirmQ = document.createElement("div");
+      confirmQ.style.cssText =
+        "font:400 11px/1.4 inherit; color:rgba(212,168,75,0.85); text-align:center;";
+      confirmQ.textContent =
+        "Restore this identity? Your current install identity will be replaced by it.";
+      const btnRow = document.createElement("div");
+      btnRow.style.cssText =
+        "display:flex; flex-direction:row; gap:10px; align-items:center;";
+      const btnConfirm = document.createElement("button");
+      btnConfirm.type = "button";
+      btnConfirm.textContent = "✓  CONFIRM RESTORE";
+      btnConfirm.style.cssText = primary;
+      const btnCancel = document.createElement("button");
+      btnCancel.type = "button";
+      btnCancel.textContent = "✕  CANCEL";
+      btnCancel.style.cssText = secondary;
+      btnRow.append(btnConfirm, btnCancel);
+      confirmBox.append(fpLine, confirmQ, btnRow);
+      wrap.append(btnNew, btnLoad, pasteBox, confirmBox, note);
+      content.appendChild(wrap);
+
+      // ── Render the current stage: which controls are visible + status text.
+      const renderStage = (): void => {
+        // Reset visibility (title-only DOM state — cheap to recompute).
+        btnNew.style.display = "none";
+        btnLoad.style.display = "none";
+        pasteBox.style.display = "none";
+        confirmBox.style.display = "none";
+        switch (titleStage.kind) {
+          case "idle":
+            btnNew.style.display = "";
+            btnLoad.style.display = "";
+            note.textContent = "";
+            break;
+          case "paste":
+            pasteBox.style.display = "flex";
+            note.textContent =
+              titleStage.error ??
+              "Paste the recovery key you saved from Settings → Backup / restore identity.";
+            ta.focus();
+            break;
+          case "confirm":
+            confirmBox.style.display = "flex";
+            fpLine.textContent = `🔑 ${titleStage.fingerprint}`;
+            note.textContent =
+              "Confirm to restore — your current install identity is replaced.";
+            break;
+          case "applied":
+            note.textContent =
+              `Identity ${getIdentityFingerprint()} restored — loading your station…`;
+            break;
+          case "proceed":
+            // wrap.remove() runs in the button handler; nothing to render.
+            break;
+        }
+      };
+
+      // ── Handlers: every transition runs through the pure state machine so
+      //    the state stays a single source of truth.
+      btnNew.addEventListener("click", (e) => {
+        e.stopPropagation();
+        titleStage = chooseNewPlayer(titleStage);
+        if (titleStage.kind === "proceed") {
+          wrap.remove();
+          dwellDone = true; // proceed at once — don't wait out the intro dwell
+          proceedChosen = true;
+          maybeFade();
+        }
+      });
       btnLoad.addEventListener("click", (e) => {
         e.stopPropagation();
-        if (restoreOpen) return;
-        restoreOpen = true;
-        btnLoad.style.display = "none";
-        const box = document.createElement("div");
-        box.style.cssText =
-          "display:flex; flex-direction:column; gap:8px; align-items:center; width:300px;";
-        const ta = document.createElement("textarea");
-        ta.rows = 2;
-        ta.placeholder = "Paste your recovery key…";
-        ta.autocomplete = "off";
-        ta.spellcheck = false;
-        ta.style.cssText =
-          "width:100%; box-sizing:border-box; resize:none; font:400 11px/1.4 monospace; " +
-          "padding:8px; border-radius:8px; border:1px solid rgba(240,180,41,0.4); " +
-          "background:rgba(10,7,3,0.75); color:#f0e0b0;";
-        ta.addEventListener("click", (ev) => ev.stopPropagation());
-        const doRestore = document.createElement("button");
-        doRestore.type = "button";
-        doRestore.textContent = "↩  RESTORE MY IDENTITY";
-        doRestore.style.cssText = primary;
-        doRestore.addEventListener("click", (ev) => {
-          ev.stopPropagation();
+        titleStage = openPaste(titleStage);
+        renderStage();
+      });
+      btnPreview.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // The paste value is READ here, VALIDATED via the pure preview, and
+        // NEVER mutated on failure — the current identity is safe until the
+        // user actually confirms.
+        titleStage = submitPaste(titleStage, ta.value, previewRecoveryKey);
+        renderStage();
+      });
+      btnCancel.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // Cancel returns to paste with a cleared error. Scrub the textarea
+        // so the private key never lingers on-screen after a back-out.
+        ta.value = "";
+        titleStage = cancelConfirm(titleStage);
+        renderStage();
+      });
+      btnConfirm.addEventListener("click", (e) => {
+        e.stopPropagation();
+        // ONLY caller of importRecoveryKey. The pure machine guarantees this
+        // can't fire from any stage other than 'confirm'.
+        titleStage = confirmRestore(titleStage, () => {
           const pub = importRecoveryKey(ta.value);
-          if (!pub) {
-            note.textContent =
-              "That isn't a valid recovery key — check it and paste again.";
-            return;
-          }
+          if (!pub) return false;
           ta.value = ""; // scrub the private key from the DOM immediately
-          // 🧬 #79 P2: the restored identity is (probably) NEW to this install,
-          // so the install-scoped `ssf-last-room` (which belonged to whoever
-          // was here before) is now the WRONG resume target. Drop it — the
-          // next boot's fetchDefaultBootstrap will pick this identity's
-          // clone-vat preference (if a mesh lookup ever finds one) or fall
-          // through to the shared station default, which is what we want.
+          // 🧬 #79 P2: the restored identity is (probably) NEW to this
+          // install, so the install-scoped `ssf-last-room` (which belonged
+          // to whoever was here before) is now the WRONG resume target. Drop
+          // it — the next boot's fetchDefaultBootstrap will pick this
+          // identity's clone-vat preference (if a mesh lookup ever finds
+          // one) or fall through to the shared station default.
           try {
             localStorage.removeItem("ssf-last-room");
           } catch {
             /* privacy mode — best-effort */
           }
-          note.textContent = `Identity ${getIdentityFingerprint()} restored — loading your station…`;
-          doRestore.disabled = true;
-          setTimeout(() => window.location.reload(), 700);
+          return true;
         });
-        box.append(ta, doRestore);
-        wrap.insertBefore(box, note);
-        note.textContent =
-          "Paste the recovery key you saved from Settings → Backup / restore identity.";
-        ta.focus();
+        renderStage();
+        if (isTerminal(titleStage) && titleStage.kind === "applied") {
+          setTimeout(() => window.location.reload(), 700);
+        }
       });
-      wrap.append(btnNew, btnLoad, note);
-      content.appendChild(wrap);
+      renderStage();
     }
   }
 

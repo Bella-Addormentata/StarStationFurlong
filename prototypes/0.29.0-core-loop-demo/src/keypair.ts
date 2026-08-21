@@ -154,6 +154,41 @@ export function importRecoveryKey(recovery: string): string | null {
 }
 
 /**
+ * 🆕 #79 P5: PREVIEW a recovery credential WITHOUT taking effect.
+ *
+ * The boot-title Load-from-Backup flow needs to show the user "this is the
+ * identity you're about to restore" as a distinct CONFIRM step before the
+ * seed replaces the live identity (owner spec: "text box → confirmation →
+ * load atlas"). importRecoveryKey applies immediately and cannot be
+ * previewed; this pure helper derives the pubkey + fingerprint from the
+ * candidate seed WITHOUT touching cachedSeed / cachedPub / localStorage.
+ *
+ * Returns { pub, fingerprint } on a valid 32-byte seed, or null on any
+ * decode/length failure. Same input-validation contract as importRecoveryKey
+ * (trim tolerance, base64url decode, exact length gate) so a preview that
+ * succeeds is guaranteed to import successfully on confirm.
+ *
+ * PRIVACY: the caller still holds the raw recovery key in whatever field it
+ * lives in (the paste textarea in main.ts); this helper never persists it
+ * and never logs it. Every intermediate `Uint8Array`/`pub` here is a normal
+ * garbage-collectible value — no state hangs onto them after return.
+ */
+export function previewRecoveryKey(
+  recovery: string,
+): { pub: string; fingerprint: string } | null {
+  let seed: Uint8Array;
+  try { seed = b64urlDecode(recovery.trim()); } catch { return null; }
+  if (seed.length !== 32) return null;
+  // Derive without touching module state (mirrors getPubBytes' math but writes
+  // nothing back). A local pub buffer stays a normal GC-able value.
+  const pubBytes = ed.getPublicKey(seed);
+  return {
+    pub: b64urlEncode(pubBytes),
+    fingerprint: ed.etc.bytesToHex(pubBytes).slice(0, 8),
+  };
+}
+
+/**
  * 🧬 Per-identity CLONE-VAT SPAWN PREFERENCE (#79 P2/P4).
  *
  * The room a given identity wants to boot back into — their "clone-vat

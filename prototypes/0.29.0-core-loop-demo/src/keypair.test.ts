@@ -34,9 +34,11 @@ class MemoryStorage implements Storage {
 const {
   exportRecoveryKey,
   getCloneVatPreference,
+  getIdentityFingerprint,
   getIdentityPub,
   hasStoredIdentity,
   importRecoveryKey,
+  previewRecoveryKey,
   setCloneVatPreference,
 } = await import('./keypair');
 
@@ -103,6 +105,91 @@ describe('keypair.importRecoveryKey — restore-from-backup input validation', (
     expect(importRecoveryKey('garbage')).toBeNull();
     const after = getIdentityPub();
     expect(after).toBe(before);
+  });
+});
+
+// ─── previewRecoveryKey (#79 P5) ────────────────────────────────────────────
+
+describe('keypair.previewRecoveryKey — non-mutating validate + fingerprint', () => {
+  it('returns the pub + fingerprint that a subsequent import would produce', () => {
+    // Prove the preview is byte-identical to the applied import: mint a
+    // seed, export it, preview, then import — the pub matches on both.
+    const currentPub = getIdentityPub();
+    void currentPub; // suppress unused warning; kept for clarity in tests
+    const recovery = exportRecoveryKey();
+    // A parallel fresh install (no cached seed) previews it and gets the
+    // same pub we'd import — proves the pure derivation matches.
+    (globalThis as any).localStorage = new MemoryStorage();
+    const previewed = previewRecoveryKey(recovery);
+    expect(previewed).not.toBeNull();
+    const applied = importRecoveryKey(recovery);
+    expect(previewed!.pub).toBe(applied);
+    // The fingerprint is the first 8 hex of the pubkey bytes — same math
+    // as getIdentityFingerprint on the applied identity.
+    expect(previewed!.fingerprint).toBe(getIdentityFingerprint());
+  });
+
+  it('does NOT mutate the cached identity — a preview leaves getIdentityPub unchanged', () => {
+    // The CORE invariant of the confirm step: the paste can be previewed
+    // without replacing the running identity.
+    //
+    // keypair.ts holds cachedSeed / cachedPub at MODULE level, so a
+    // localStorage reset in beforeEach doesn't clear them. We hand
+    // previewRecoveryKey a HARD-CODED valid 32-byte seed (base64url of 32
+    // 0x01 bytes) that is guaranteed distinct from any randomly minted
+    // identity — proving both that the preview produces a NEW pub AND that
+    // the module's own cached identity is byte-for-byte unchanged after.
+    const beforePub = getIdentityPub();
+    // Build the recovery-key string for a "1 * 32" seed WITHOUT touching
+    // the module — matches keypair.ts's own b64url encoding (base64 →
+    // -_ transform → strip = padding).
+    const seedBytes = new Uint8Array(32).fill(0x01);
+    let bin = '';
+    for (const b of seedBytes) bin += String.fromCharCode(b);
+    const recovery = btoa(bin)
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const previewed = previewRecoveryKey(recovery);
+    expect(previewed).not.toBeNull();
+    // Original identity UNCHANGED — the preview only DERIVED, never wrote.
+    expect(getIdentityPub()).toBe(beforePub);
+    // And the preview produced a DIFFERENT pubkey (so the check above is
+    // meaningful — a preview that silently returned the current pub would
+    // be a bug the test would MISS otherwise).
+    expect(previewed!.pub).not.toBe(beforePub);
+  });
+
+  it('trims whitespace so a copy-paste with newlines still previews', () => {
+    const recovery = exportRecoveryKey();
+    (globalThis as any).localStorage = new MemoryStorage();
+    expect(previewRecoveryKey(`  ${recovery}\n`)).not.toBeNull();
+  });
+
+  it('rejects a non-base64url string (same validation contract as import)', () => {
+    expect(previewRecoveryKey('this is not a key')).toBeNull();
+  });
+
+  it('rejects a valid-base64 blob of the WRONG length', () => {
+    const wrong = new Uint8Array(31);
+    let bin = '';
+    for (const b of wrong) bin += String.fromCharCode(b);
+    const b64 = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    expect(previewRecoveryKey(b64)).toBeNull();
+  });
+
+  it('rejects the empty string', () => {
+    expect(previewRecoveryKey('')).toBeNull();
+  });
+
+  it('a preview that succeeds guarantees the follow-up import also succeeds', () => {
+    // Contract for the boot-title flow: the confirm step trusts that the
+    // preview → apply pair share input-validation. Prove it end-to-end.
+    const recovery = exportRecoveryKey();
+    (globalThis as any).localStorage = new MemoryStorage();
+    const previewed = previewRecoveryKey(recovery);
+    expect(previewed).not.toBeNull();
+    const applied = importRecoveryKey(recovery);
+    expect(applied).not.toBeNull();
+    expect(applied).toBe(previewed!.pub);
   });
 });
 
