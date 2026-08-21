@@ -37,6 +37,7 @@ import {
   getIdentityPub,
   getIdentityFingerprint,
   signNameCert,
+  signIdentity,
   verifyNameCert,
   verifyIdentity,
   exportRecoveryKey,
@@ -1173,8 +1174,37 @@ async function joinRoomAtEpoch(
   // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
   bindDoorsDoc(sync.doc);
 
-  // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
-  bindDoorPolicy(sync.doc);
+  // #67 D1/D1b/D3: per-door policy + rights requests/grants ride the same doc.
+  // D3 signing: writes made by the LOCAL room owner carry an Ed25519 signature
+  // over domain-tagged canonical bytes (roomId + doorId inside the payload —
+  // no cross-room, no cross-door replay); readers verify against the room
+  // owner's identity pub read live from `players.get(roomInfo.owner).keyB64`.
+  // A record lacking BOTH sig fields is treated as LEGACY and honored — every
+  // pre-D3 room keeps working without migration. See doorPolicy.ts's header
+  // for the full trust boundary (what signing does and does not prove).
+  bindDoorPolicy(sync.doc, {
+    roomId: boot.roomId,
+    verifySig: verifyIdentity,
+    // Live-read the room owner's identity pub through the doc: roomInfo.owner
+    // holds a player id, players.get(id).keyB64 holds their Ed25519 pub. Both
+    // arrive async via sync; nulling while un-synced keeps the read side from
+    // rejecting honest signed records under a stale/missing expected pub.
+    roomOwnerPub: () => {
+      const ownerId = sync.doc.getMap("roomInfo").get("owner");
+      if (typeof ownerId !== "string" || !ownerId) return null;
+      const entry = sync.doc.getMap("players").get(ownerId) as
+        | { keyB64?: string }
+        | undefined;
+      return typeof entry?.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : null;
+    },
+    localPub: () => getIdentityPub(),
+    signOwner: (bytes) => {
+      try { return signIdentity(bytes); } catch { return null; }
+    },
+    signSelf: (bytes) => {
+      try { return signIdentity(bytes); } catch { return null; }
+    },
+  });
 
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
   bindExteriorDoc(sync.doc);
