@@ -34,6 +34,22 @@
  *   `reconcileTradingFloor()`. Every peer computes the same target and
  *   writes it; the LWW race becomes a race between IDENTICAL writes.
  *
+ *   POST-MERGE CORRECTIVE RECONCILE (audit #68 remediation, round 1): the UI
+ *   button-handler used to call `reconcileTradingFloor()` SYNCHRONOUSLY after
+ *   the local `acceptFloorOffer` — before any peer merge — so each peer
+ *   could locally "settle" a non-canonical winner (their own accept was the
+ *   only one visible). To keep the deterministic-winner promise honest, the
+ *   engine now (a) exposes `scheduleReconcileTradingFloor()` — a merge-
+ *   quiescence debouncer that the app wires to `subscribeTradingFloor` so
+ *   reconcile fires post-merge — and (b) DROPS the "existing tape ⇒ skip"
+ *   shortcut inside reconcile: if the merged accept set names a different
+ *   canonical winner than the current tape entry, reconcile computes a
+ *   CORRECTIVE transfer (moves the shares from the wrong recipient to the
+ *   canonical one) and rewrites the tape. The corrective transfer only
+ *   works when the wrong recipient still holds the shares; if they've
+ *   spent them on, reconcile leaves the stale tape and returns the offer
+ *   in `refusedOfferIds` — an honest limit documented on the PR.
+ *
  * FORWARD-COMPAT WITH V3 (Registry anchor): every record is shaped so a
  * future Chia offer file can carry the same fields — offerId, ventureId,
  * kind (SELL/BUY), shares, priceMojo, makerPub, expiresAt, nonce. When V3
@@ -147,6 +163,10 @@ const FLOOR_LIST_CAP = 500;
 let boundDoc: Y.Doc | null = null;
 let floorMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+/** Handle for the debounced post-merge reconcile — see
+ *  `scheduleReconcileTradingFloor` below. Kept at module scope so
+ *  `bindTradingFloor` can clear a pending timer from a prior binding. */
+let reconcileTimer: ReturnType<typeof setTimeout> | null = null;
 
 function notify(): void {
   // Copy first — a listener that unsubscribes mid-emit must not skip its peers.
@@ -160,6 +180,13 @@ function notify(): void {
  *  isOfficeHere(); the board still renders on a link so shareholders can
  *  see what's on the market anywhere they visit. */
 export function bindTradingFloor(doc: Y.Doc): void {
+  // Clear any pending scheduled reconcile from a prior binding — it would
+  // fire against the new doc otherwise (harmless since reconcile is safe,
+  // but reasoning is cleaner if bindings start with an empty scheduler).
+  if (reconcileTimer !== null) {
+    clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+  }
   boundDoc = doc;
   floorMap = doc.getMap('tradingFloor');
   floorMap.observe(() => notify());
@@ -482,7 +509,11 @@ export function listOpenOffers(): FloorOffer[] {
     // filter out here so the board only shows what a click can act on.
     if (readTapeFor(o.offerId)) continue;
     const cancel = readCancelFor(o.offerId);
-    if (cancel && !hasCanonicalAcceptBefore(o.offerId, cancel.cancelledAt)) continue;
+    // A backdated cancel (cancelledAt < offer.createdAt) is ignored — see
+    // `isCancelInWindow`. A valid cancel with no canonical accept before it
+    // kills the offer for display; a valid cancel that a canonical accept
+    // beat is not fatal (the tape lane in reconcile will still settle).
+    if (cancel && isCancelInWindow(cancel, o) && !hasCanonicalAcceptBefore(o.offerId, cancel.cancelledAt)) continue;
     out.push(o);
   }
   return out
@@ -551,6 +582,22 @@ function hasCanonicalAcceptBefore(offerId: string, t: number): boolean {
   return winner !== null && winner.acceptedAt < t;
 }
 
+/**
+ * A cancel is honored only when its `cancelledAt` is not older than the
+ * offer's own `createdAt`. Without this floor a maker could pick any small
+ * integer for `cancelledAt` and use `cancel.cancelledAt <= winner.acceptedAt`
+ * to nullify every accept ever posted against the offer (audit #68 finding
+ * 1: "backdated cancel bypass"). The signature verifies (the maker owns the
+ * key) and `Number.isFinite` passes, so the shape-gate in `verifyFloorCancel`
+ * cannot enforce this — it does not know which offer the cancel is for. The
+ * check is applied at the point of use (reconcile + hasCanonicalAcceptBefore)
+ * so both the ledger settlement and the open-offer list agree on whether a
+ * cancel is valid.
+ */
+function isCancelInWindow(cancel: FloorCancel, offer: FloorOffer): boolean {
+  return cancel.cancelledAt >= offer.createdAt;
+}
+
 /** The result of a reconciliation pass — for the UI to surface. */
 export interface ReconcileResult {
   settledOfferIds: string[];  // newly written tape entries
@@ -567,11 +614,23 @@ export interface ReconcileResult {
  * Safe to call from any code path that touches the floor:
  *   - After `acceptFloorOffer` (settle immediately if we're the fastest).
  *   - After `bindTradingFloor` (catch up any merged accepts from peers).
- *   - After any observed change to the floor map (the subscribe hook does this).
+ *   - After any observed change to the floor map — bound at the app layer
+ *     via `subscribeTradingFloor(() => scheduleReconcileTradingFloor())`
+ *     (see `main.ts`) so post-merge reconciles fire on every peer.
  *
  * Runs OUTSIDE any transact so the cap-table write from `transferShares`
  * keeps its normal semantics; the identical-write property makes overlapping
  * peers safe.
+ *
+ * POST-MERGE CORRECTIVE PATH (audit #68 finding 2 remediation): if a tape
+ * entry already exists for an offer AND it names a different winner than the
+ * merged canonical accept set, this pass moves the shares from the wrong
+ * recipient to the canonical one and rewrites the tape. This fires when two
+ * peers each locally settled before their accepts had merged (each peer saw
+ * only its own accept and picked a non-canonical winner). The correction
+ * only works while the wrong recipient still holds those shares; if they've
+ * been spent onward, the offer lands in `refusedOfferIds` and the stale tape
+ * survives — an honest limit called out on the PR.
  *
  * SETTLEMENT V1 CAVEAT: priceMojo === 0 (gift) settles; non-zero refuses
  * with `refusedOfferIds` (the Registry lane arrives with V3). Non-zero
@@ -595,31 +654,31 @@ export function reconcileTradingFloor(): ReconcileResult {
     offers.push(o);
   }
   for (const o of offers) {
-    // Already settled? Idempotent skip.
-    if (readTapeFor(o.offerId)) continue;
     const accepts = listAcceptsFor(o.offerId);
     const winner = pickCanonicalAccept(accepts);
     if (!winner) continue;
-    // Cancel-before-canonical-accept invalidates the trade.
+    // Cancel-before-canonical-accept invalidates the trade. A BACKDATED cancel
+    // (cancelledAt < offer.createdAt) is ignored — `isCancelInWindow` refuses
+    // it. Without this guard a maker could sign a cancel with an arbitrarily
+    // small `cancelledAt` and nullify every legitimate accept (audit finding 1).
     const cancel = readCancelFor(o.offerId);
-    if (cancel && cancel.cancelledAt <= winner.acceptedAt) continue;
+    if (cancel && isCancelInWindow(cancel, o) && cancel.cancelledAt <= winner.acceptedAt) continue;
     // Expired-before-canonical-accept invalidates the trade.
     if (o.expiresAt <= winner.acceptedAt) continue;
     // v1 gift rule: only priceMojo === 0 settles today (the Registry lane
     // is V3). Non-zero priced offers remain visible so the chart can plot
     // the ask price, but the cap table does not move.
     if (o.priceMojo !== 0) { refused.push(o.offerId); continue; }
-    // Ownership authority: SELL requires the maker to still hold ≥ shares;
-    // BUY requires the WINNING taker to still hold ≥ shares. Fail → refuse.
+    // Cap-table settlement lives at the OFFICE — property-link viewers hold
+    // a snapshot and would fork the truth by writing here. This check is per-
+    // offer so a non-office peer skips silently on every entry (cheap).
     const v = ventureRecord();
     if (!v || v.id !== o.ventureId) { refused.push(o.offerId); continue; }
-    if (!isOfficeHere()) continue; // property-link viewers see the tape via office writes; do not settle here
-    const seller = o.kind === 'SELL' ? o.makerPub : winner.takerPub;
-    const buyer  = o.kind === 'SELL' ? winner.takerPub : o.makerPub;
-    const buyerName = o.kind === 'SELL' ? winner.takerName : o.makerName;
-    const held = v.shares[seller] ?? 0;
-    if (held < o.shares) { refused.push(o.offerId); continue; }
-    // Deterministic tape entry FIRST — every peer writes bytes-identical.
+    if (!isOfficeHere()) continue;
+
+    // The deterministic tape entry every peer writes for this canonical
+    // winner. `settledAt` is derived from `winner.acceptedAt`, which is
+    // fixed by the accept record itself, so bytes-identical across peers.
     const tape: FloorTape = {
       v: 1,
       offerId: o.offerId,
@@ -631,23 +690,137 @@ export function reconcileTradingFloor(): ReconcileResult {
       takerPub: winner.takerPub,
       settledAt: winner.acceptedAt,
     };
-    // transferShares is atomic + idempotent-safe: identical-writes from
-    // parallel peers land as one, and the second peer's identical tape
-    // write is a no-op. If the cap table moved BETWEEN our read and the
-    // transact, transferShares refuses and we come back next tick.
+
+    const existing = readTapeFor(o.offerId);
+    if (existing && existing.takerPub === winner.takerPub && existing.settledAt === winner.acceptedAt) {
+      // Canonical already settled — idempotent skip. Every peer computes
+      // this same tape entry from the same merged state, so a match here
+      // means the canonical write already landed.
+      continue;
+    }
+
+    if (!existing) {
+      // FIRST-TIME SETTLEMENT — the normal happy path. Move the shares in
+      // the same transact as the tape write so a merge across both maps
+      // preserves the pairing (Y.js resolves concurrent transacts per key,
+      // with clientId as the tiebreaker; because we pair the two writes in
+      // ONE transact, the tiebreaker keeps them consistent).
+      const seller = o.kind === 'SELL' ? o.makerPub : winner.takerPub;
+      const buyer  = o.kind === 'SELL' ? winner.takerPub : o.makerPub;
+      const buyerName = o.kind === 'SELL' ? winner.takerName : o.makerName;
+      const held = v.shares[seller] ?? 0;
+      if (held < o.shares) { refused.push(o.offerId); continue; }
+      boundDoc!.transact(() => {
+        const moved = transferShares(seller, buyer, buyerName, o.shares);
+        if (moved) {
+          m.set(`${K_TAPE}${o.offerId}`, tape);
+          // GC one long-dead offer per settlement to keep the map trim —
+          // never delete the just-settled entries (they're the price history).
+          gcOne(m, now);
+        }
+      });
+      if (readTapeFor(o.offerId)) settled.push(o.offerId);
+      else refused.push(o.offerId);
+      continue;
+    }
+
+    // CORRECTIVE PATH — the tape says one winner, the merged accept set names
+    // another. Two peers each locally settled from a partial view (audit #68
+    // finding 2 UI-flow). Move the shares from the wrong recipient back to
+    // the canonical one and rewrite the tape. Every peer that reaches this
+    // branch computes the same correction from the same merged state, so the
+    // corrective writes are bytes-identical across peers → LWW converges.
+    //
+    // For SELL: wrong settled (seller → wrongTaker). Correct is (seller →
+    //   rightTaker). Net correction: (wrongTaker → rightTaker) — the seller
+    //   already lost the shares once; we just re-route them.
+    //
+    // For BUY:  wrong settled (wrongTaker → maker). Correct is (rightTaker →
+    //   maker). Net correction: (rightTaker → wrongTaker) — the maker
+    //   already received the shares once; we just re-route the "outflow".
+    const wrongTaker = existing.takerPub;
+    const rightTaker = winner.takerPub;
+    if (wrongTaker === rightTaker) {
+      // takerPub matched above; only settledAt drifted (which would be
+      // impossible given accepts are per-taker-single-writer). Rewrite the
+      // tape to the canonical settledAt and move on.
+      boundDoc!.transact(() => { m.set(`${K_TAPE}${o.offerId}`, tape); });
+      settled.push(o.offerId);
+      continue;
+    }
+    let moveFrom: string;
+    let moveTo: string;
+    let moveToName: string;
+    if (o.kind === 'SELL') {
+      moveFrom = wrongTaker;
+      moveTo = rightTaker;
+      moveToName = winner.takerName;
+    } else {
+      moveFrom = rightTaker;
+      moveTo = wrongTaker;
+      // The wrong-taker's display name lives on their accept record.
+      const wrongAccept = accepts.find((a) => a.takerPub === wrongTaker);
+      moveToName = wrongAccept?.takerName
+        ?? v.holderNames?.[wrongTaker]
+        ?? 'Unknown-Clone';
+    }
+    const heldFrom = v.shares[moveFrom] ?? 0;
+    if (heldFrom < o.shares) {
+      // Correction is not possible — the wrong recipient has already spent
+      // the shares. This is an honest limit: the stale tape survives, the
+      // canonical winner does not receive the shares. Called out on the PR.
+      console.warn('[tradingFloor] cannot correct settlement for offer',
+        o.offerId, '- wrong recipient no longer holds', o.shares, 'shares');
+      refused.push(o.offerId);
+      continue;
+    }
     boundDoc!.transact(() => {
-      const moved = transferShares(seller, buyer, buyerName, o.shares);
+      const moved = transferShares(moveFrom, moveTo, moveToName, o.shares);
       if (moved) {
         m.set(`${K_TAPE}${o.offerId}`, tape);
-        // GC one long-dead offer per settlement to keep the map trim —
-        // never delete the just-settled entries (they're the price history).
-        gcOne(m, now);
       }
     });
-    if (readTapeFor(o.offerId)) settled.push(o.offerId);
+    const t = readTapeFor(o.offerId);
+    if (t && t.takerPub === rightTaker && t.settledAt === winner.acceptedAt) settled.push(o.offerId);
     else refused.push(o.offerId);
   }
   return { settledOfferIds: settled, refusedOfferIds: refused };
+}
+
+// ── Post-merge scheduling (merge-quiescence debounce) ────────────────────────
+
+/**
+ * Debounce wrapper around `reconcileTradingFloor()`. Wired to the trading-
+ * floor observer so a burst of merged accepts collapses to ONE reconcile
+ * after the doc has been quiet for `delayMs`. The debounce lets peer accepts
+ * arrive before the office peer commits a settlement — combined with the
+ * corrective path inside reconcile, this restores the module's deterministic-
+ * winner promise even when the UI path fires an initial settle before merge
+ * (audit #68 finding 2 remediation).
+ *
+ * The default 400 ms window is long enough for typical LAN sync and short
+ * enough that the wall-screen tape appears within one refresh tick of the
+ * user seeing their ACCEPT click. Test suites should call the synchronous
+ * `reconcileTradingFloor()` directly and never depend on this timer.
+ */
+export const RECONCILE_QUIESCENCE_MS = 400;
+
+export function scheduleReconcileTradingFloor(delayMs: number = RECONCILE_QUIESCENCE_MS): void {
+  if (reconcileTimer !== null) clearTimeout(reconcileTimer);
+  reconcileTimer = setTimeout(() => {
+    reconcileTimer = null;
+    try { reconcileTradingFloor(); }
+    catch (e) { console.error('[tradingFloor] scheduled reconcile threw:', e); }
+  }, Math.max(0, delayMs));
+}
+
+/** Test-only: cancel any pending scheduled reconcile so a suite can move on
+ *  without an orphan timer. Safe to call when nothing is scheduled. */
+export function cancelScheduledReconcile(): void {
+  if (reconcileTimer !== null) {
+    clearTimeout(reconcileTimer);
+    reconcileTimer = null;
+  }
 }
 
 /** GC one long-dead offer (with no tape and past grace) per call. Cheap +

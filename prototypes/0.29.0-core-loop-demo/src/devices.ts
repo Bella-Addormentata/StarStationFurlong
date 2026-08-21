@@ -119,7 +119,7 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 import {
   listOpenOffers, listTape, priceHistory,
   makeFloorOffer, postFloorOffer, acceptFloorOffer, cancelFloorOffer,
-  reconcileTradingFloor, subscribeTradingFloor,
+  scheduleReconcileTradingFloor, subscribeTradingFloor,
   type FloorOffer, type FloorOfferKind,
 } from './tradingFloorDoc';
 import { ventureRecord, isOfficeHere, myVentureShares } from './ventures';
@@ -878,9 +878,16 @@ export function createTradingScreenUI(deps: TradingScreenDeps): DeviceUI {
         const action = (e.currentTarget as HTMLElement).dataset.action;
         if (action === 'accept') {
           acceptFloorOffer(offerId, deps.myName());
-          reconcileTradingFloor();
+          // Do NOT reconcile synchronously here — a synchronous reconcile
+          // runs BEFORE any peer's accept has merged, so this peer would
+          // locally settle a non-canonical winner (audit #68 finding 2).
+          // The subscribe observer schedules a merge-quiescence reconcile
+          // that fires post-merge; the corrective path inside reconcile
+          // then keeps every peer converging on the canonical winner.
+          scheduleReconcileTradingFloor();
         } else if (action === 'cancel') {
           cancelFloorOffer(offerId);
+          scheduleReconcileTradingFloor();
         }
         refresh();
       };
@@ -966,7 +973,16 @@ export function createTradingScreenUI(deps: TradingScreenDeps): DeviceUI {
           refreshAndBind();
         }
       });
-      unsubscribe = subscribeTradingFloor(() => refreshAndBind());
+      // Any observed change to the trading floor (local write OR remote merge)
+      // schedules a merge-quiescence reconcile (see #68 audit finding 2). The
+      // debounce collapses a burst of merged accepts into one reconcile after
+      // the doc has been quiet for ~400 ms — long enough for peer accepts to
+      // arrive before this peer commits a settlement, short enough that the
+      // tape appears within a tick of the user's ACCEPT click.
+      unsubscribe = subscribeTradingFloor(() => {
+        scheduleReconcileTradingFloor();
+        refreshAndBind();
+      });
       deps.onEngagedChange?.(true);
       refreshAndBind();
     },
