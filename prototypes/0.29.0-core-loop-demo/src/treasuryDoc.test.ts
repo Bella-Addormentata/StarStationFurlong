@@ -28,8 +28,6 @@ import {
 import {
   bindTreasuryDoc,
   listCheckpoints,
-  listProposals,
-  listSigningSessions,
   listVotes,
   pickCanonicalVote,
   putAllowanceCache,
@@ -137,7 +135,10 @@ describe('proposals', () => {
       makeProposal({ payloadHash: `${i}`.repeat(64) }),
     );
     for (const p of made) expect(putProposal(p)).toBe(true);
-    expect(listProposals()).toHaveLength(4); // unbounded convenience wrapper
+    // Explicit budgets at every call site. A wrapper that passed Infinity
+    // read as exhaustive but was still clamped by the scan's own guard, so it
+    // could drop records silently — a partial answer wearing a total's name.
+    expect(scanProposals(50_000, 50_000).items).toHaveLength(4);
     // The collection bound counts MATCHING keys, not records kept: capping
     // results alone would still verify every junk entry a peer planted under
     // this prefix before the cap filled up, and that is the work that stalls
@@ -264,7 +265,7 @@ describe('proposals', () => {
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);
     expect(readProposal(p.proposalId)).toEqual(p);
-    expect(listProposals()).toEqual([p]);
+    expect(scanProposals(50_000, 50_000).items).toEqual([p]);
   });
 
   it('rejects a tampered signature and a mismatched id', () => {
@@ -280,7 +281,7 @@ describe('proposals', () => {
     m.set(`proposal:${p.proposalId}`, { junk: true });
     m.set('proposal:misfiled', p); // valid record under the wrong key
     expect(readProposal(p.proposalId)).toBeNull();
-    expect(listProposals()).toEqual([]);
+    expect(scanProposals(50_000, 50_000).items).toEqual([]);
   });
 
   it('stays total when a peer plants encoder-hostile strings', () => {
@@ -290,7 +291,7 @@ describe('proposals', () => {
     // the canonical encoder throw — the read must treat it as invalid.
     m.set(`proposal:${p.proposalId}`, { ...p, proposerPub: '\uD800' });
     expect(readProposal(p.proposalId)).toBeNull();
-    expect(listProposals()).toEqual([]);
+    expect(scanProposals(50_000, 50_000).items).toEqual([]);
   });
 
   it('a valid decoy misfiled under another id cannot block the honest put', () => {
@@ -556,7 +557,7 @@ describe('signing sessions', () => {
       collectedSigs: [],
     };
     expect(putSigningSession(other)).toBe(true);
-    expect(listSigningSessions(shell.proposalId)).toHaveLength(2);
+    expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items).toHaveLength(2);
   });
 
   it('unions signature sets across sequential puts, sorted by signer', () => {
@@ -567,7 +568,7 @@ describe('signing sessions', () => {
       collectedSigs: [{ signerPuzzleHash: 'f'.repeat(64), sig: 'sig-f' }],
     })).toBe(true);
     expect(putSigningSession(base)).toBe(true); // adds signer 'e'
-    const merged = listSigningSessions(shell.proposalId);
+    const merged = scanSigningSessions(shell.proposalId, 50_000, 50_000).items;
     expect(merged).toHaveLength(1);
     expect(merged[0].collectedSigs).toEqual([
       { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
@@ -589,7 +590,7 @@ describe('signing sessions', () => {
     Y.applyUpdate(docB, updA);
     for (const replica of [doc, docB]) {
       bindTreasuryDoc(replica, { verifySig: verifier, networkGenesisChallenge: GENESIS });
-      expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([
+      expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items[0].collectedSigs).toEqual([
         { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
         { signerPuzzleHash: 'f'.repeat(64), sig: 'sig-f' },
       ]);
@@ -602,7 +603,7 @@ describe('signing sessions', () => {
       sig: '!',
     });
     expect(putSigningSession(base)).toBe(true); // shell + honest re-put of 'e'
-    expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([
+    expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items[0].collectedSigs).toEqual([
       { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
     ]);
     // The subtler plant: the HONEST sig string under a mismatched signer
@@ -612,9 +613,9 @@ describe('signing sessions', () => {
       signerPuzzleHash: '9'.repeat(64),
       sig: 'sig-e',
     });
-    expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([]);
+    expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items[0].collectedSigs).toEqual([]);
     expect(putSigningSession(base)).toBe(true);
-    expect(listSigningSessions(shell.proposalId)[0].collectedSigs).toEqual([
+    expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items[0].collectedSigs).toEqual([
       { signerPuzzleHash: 'e'.repeat(64), sig: 'sig-e' },
     ]);
   });
@@ -638,9 +639,9 @@ describe('signing sessions', () => {
       collectedSigs: [],
     };
     doc.getMap('treasury').set(`session:${shell.proposalId}:${sessionId}`, squatter);
-    expect(listSigningSessions(shell.proposalId)).toEqual([]); // slot-claim mismatch
+    expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items).toEqual([]); // slot-claim mismatch
     expect(putSigningSession(base)).toBe(true); // overwrites the squatter
-    expect(listSigningSessions(shell.proposalId)).toEqual([base]);
+    expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items).toEqual([base]);
   });
 });
 
@@ -650,7 +651,7 @@ describe('network pinning', () => {
     expect(putProposal(foreign)).toBe(false); // valid signature, wrong net
     doc.getMap('treasury').set(`proposal:${foreign.proposalId}`, foreign);
     expect(readProposal(foreign.proposalId)).toBeNull();
-    expect(listProposals()).toEqual([]);
+    expect(scanProposals(50_000, 50_000).items).toEqual([]);
     const policy = contracts.policy.value as CompanyTreasuryPolicy;
     // The vector policy's genesis is 'a'*64 == GENESIS, so it puts fine —
     // rebind to another net and the same policy is refused and unreadable.
@@ -750,8 +751,8 @@ describe('verification caching', () => {
     };
     expect(putSigningSession(session)).toBe(true);
     // Wrong proposal id first: must miss, and must not be remembered as "bad".
-    expect(listSigningSessions('f'.repeat(64))).toEqual([]);
-    expect(listSigningSessions(session.proposalId)).toEqual([session]);
+    expect(scanSigningSessions('f'.repeat(64), 50_000, 50_000).items).toEqual([]);
+    expect(scanSigningSessions(session.proposalId, 50_000, 50_000).items).toEqual([session]);
   });
 
   it('returns a stable policy result without recomputing it', () => {
@@ -1021,7 +1022,7 @@ describe('verification caching', () => {
     expect(scanProposals(99, 99).items).toEqual([p]);
     // An EMPTY typed array does not throw on freeze, so cover both shapes.
     m.set(`proposal:${'9'.repeat(64)}`, new Uint8Array());
-    expect(() => listProposals()).not.toThrow();
+    expect(() => scanProposals(50_000, 50_000).items).not.toThrow();
   });
 
   it('keeps held-but-unusable apart from absent in every reader', () => {
@@ -1156,14 +1157,21 @@ describe('verification caching', () => {
     const policy = contracts.policy.value as CompanyTreasuryPolicy;
     const oversized = {
       ...policy,
-      shareClasses: Array.from({ length: 300 }, (_unused, i) => ({
+      // Every asset id DISTINCT. Reusing one made isCompanyTreasuryPolicy
+      // reject the fixture for duplicate assets, so the test passed whether or
+      // not the size guard existed — it proved nothing about RECORD_BUDGET.
+      shareClasses: Array.from({ length: 900 }, (_unused, i) => ({
         ...policy.shareClasses[0],
         id: `class-${i}`,
+        assetId: i.toString(16).padStart(64, '0'),
       })),
     } as CompanyTreasuryPolicy;
     expect(putPolicyCache(oversized)).toBe(false);
-    // A hostile peer writes past put() anyway, so the read must refuse too.
+    // A hostile peer writes past put() anyway, so the read must refuse too —
+    // and refuse it AS a size refusal, which is what the UI words differently
+    // from an unreadable record.
     doc.getMap('treasury').set('policy', oversized);
+    expect(readPolicyCacheResult().status).toBe('too-large');
     expect(readPolicyCache()).toBeNull();
     // The cap is far above anything real: the golden vector is well inside it.
     expect(putPolicyCache(policy)).toBe(true);

@@ -530,9 +530,12 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
   return result.status === 'ok' ? result.proposal : null;
 }
 
-export function listProposals(): TreasuryProposal[] {
-  return scanProposals(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY).items;
-}
+// There is deliberately no listProposals() wrapper. Passing
+// Number.POSITIVE_INFINITY read as exhaustive, but the scan still clamps
+// traversal to MAX_KEYS_EXAMINED — so on a large map it dropped records AND
+// discarded `truncated`: a partial answer wearing a total's name, which is the
+// absence-as-fact mistake in API form. Callers name their own budgets and get
+// the flags back alongside the items.
 
 /**
  * A scan bounded on TWO axes, because the map's entries do not all cost the
@@ -1163,12 +1166,9 @@ export function putSigningSession(session: SigningSession): boolean {
   return true;
 }
 
-// One pass over the whole map builds a signature index keyed by session, so
-// listing stays O(map size) no matter how many shells a peer plants —
-// per-shell rescans would be O(sessions × map size), a cheap read-freeze.
-export function listSigningSessions(proposalId: string): SigningSession[] {
-  return scanSigningSessions(proposalId, Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY).items;
-}
+// No listSigningSessions() wrapper either, and for the same reason: it hid
+// `truncated` and `partialSessionIds`, so missing rounds or a clipped
+// signature set came back looking complete.
 
 /**
  * Bounded twin of listSigningSessions, paged like scanPrefixed and for the
