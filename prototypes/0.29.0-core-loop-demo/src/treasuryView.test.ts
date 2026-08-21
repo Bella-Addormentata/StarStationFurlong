@@ -546,7 +546,12 @@ describe('balances, sync, and the local verdict', () => {
   });
 
   it('keeps the local verdict unavailable even when a peer claims verified', () => {
-    const peer: ChainSyncStatus = { v: 1, state: 'verified', verifiedHeight: 5_000_000 };
+    const peer: ChainSyncStatus = {
+      v: 1,
+      networkGenesisChallenge: 'a'.repeat(64),
+      state: 'verified',
+      verifiedHeight: 5_000_000,
+    };
     const s = syncView(peer);
     expect(s.localState).toBe('unavailable');
     expect(s.peerClaim).toBe('verified');
@@ -560,12 +565,21 @@ describe('balances, sync, and the local verdict', () => {
 
   it('labels where a display height came from', () => {
     expect(displayHeight(null)).toEqual({ height: null, source: 'none' });
-    expect(displayHeight({ v: 1, state: 'degraded', verifiedHeight: 42 })).toEqual({
+    expect(displayHeight({
+      v: 1,
+      networkGenesisChallenge: 'a'.repeat(64),
+      state: 'degraded',
+      verifiedHeight: 42,
+    })).toEqual({
       height: 42,
       source: 'peer-reported',
     });
     // A status with no height cannot supply one.
-    expect(displayHeight({ v: 1, state: 'unavailable' }).height).toBeNull();
+    expect(displayHeight({
+      v: 1,
+      networkGenesisChallenge: 'a'.repeat(64),
+      state: 'unavailable',
+    }).height).toBeNull();
   });
 });
 
@@ -682,6 +696,23 @@ describe('policy, shares, and room funding', () => {
     expect(roomFundingView(expiring(undefined), 150).expiryStatus).toBe('none');
     // Boundary: the end height itself counts as reached.
     expect(roomFundingView(base, 200).expiryStatus).toBe('passed');
+  });
+
+  it('treats a height that contradicts the record as no answer at all', () => {
+    // A peer-reported height BELOW the binding's own boundAtHeight says the
+    // chain has not reached the block the record claims to have started at.
+    // Two peer-written numbers disagreeing is not evidence the funding is
+    // current, so it is 'unknown' — the same treatment proposalPhase gives a
+    // height that precedes acceptance.
+    const base = expiring(200); // boundAtHeight is 100
+    expect(roomFundingView(base, 50).expiryStatus).toBe('unknown');
+    expect(roomFundingView(base, 99).expiryStatus).toBe('unknown');
+    // At the bound height and above, the two agree and the question is
+    // answerable again.
+    expect(roomFundingView(base, 100).expiryStatus).toBe('not-passed');
+    expect(roomFundingView(base, 250).expiryStatus).toBe('passed');
+    // The note says it cannot tell, rather than asserting either way.
+    expect(roomFundingView(base, 50).expiryNote).toMatch(/cannot say whether/i);
   });
 
   it('labels every expiry verdict apart from the record’s own signature', () => {

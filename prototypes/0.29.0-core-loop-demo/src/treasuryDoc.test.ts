@@ -156,34 +156,45 @@ describe('proposals', () => {
     expect(withJunk.items.length).toBeLessThanOrEqual(1);
   });
 
-  it('does not let unrelated keys hide matching ones', () => {
-    // This reverses an earlier rule deliberately. Unrelated keys used to
-    // charge against the same page-sized budget, on the reasoning that a
-    // skipped key is not free — but that made a flood of them a censorship
-    // tool: 800 `junk:` keys pushed every real proposal past a horizon paging
-    // could not cross, because paging only moved within what the walk had
-    // already collected.
+  it('has exactly ONE horizon, and it is a runaway guard not a page', () => {
+    // Second correction to the same rule, so the reasoning is recorded here
+    // rather than rediscovered a third time.
     //
-    // Examining a key is a prefix test on a string the loop already holds, so
-    // it is bounded by a runaway guard far above any real room rather than by
-    // a page. The bound that decides how long a repaint blocks for is the
-    // CHECK budget, which is where the signature work is.
+    // Any cap that stops this scan early is a horizon, and every horizon is a
+    // censorship tool: whatever sits past it cannot be paged to, because
+    // paging only moves within what the scan collected. Capping keys EXAMINED
+    // let unrelated keys hide everything. Moving the cap to keys COLLECTED
+    // just moved the horizon — planted `proposal:` keys ahead of an honest one
+    // in iteration order hid it exactly as well.
+    //
+    // So there is one budget, on keys examined, set far above any real room.
+    // The bound that decides how long a repaint BLOCKS for is the check
+    // budget, which is where the signature work is.
     const m = doc.getMap('treasury');
     for (let i = 0; i < 400; i++) m.set(`junk:${i}`, { anything: i });
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);
-    // A page-sized collection budget no longer hides the record behind junk.
-    const tight = scanProposals(5, 99);
-    expect(tight.items.map((x) => x.proposalId)).toContain(p.proposalId);
-    expect(tight.truncated).toBe(false);
-    // The collection budget still bounds MATCHING keys, which is what costs
-    // memory and feeds the expensive pass.
+    // A generous guard — what the UI passes — finds the record behind junk.
+    const roomy = scanProposals(50_000, 99);
+    expect(roomy.items.map((x) => x.proposalId)).toContain(p.proposalId);
+    expect(roomy.truncated).toBe(false);
+    // Matching keys are NOT separately capped, so every one of them is
+    // reachable by paging rather than sitting past a second horizon.
     for (let i = 0; i < 12; i++) {
       m.set(`proposal:${i.toString().padStart(64, 'b')}`, { junk: i });
     }
-    const capped = scanProposals(4, 99);
-    expect(capped.truncated).toBe(true);
-    expect(capped.matched).toBe(4);
+    const all = scanProposals(50_000, 4);
+    expect(all.matched).toBe(13); // 12 planted + 1 honest, all pageable
+    expect(all.truncated).toBe(true); // a page was shown, not everything
+    // Walking the pages reaches the honest record wherever it sorted.
+    const seen: string[] = [];
+    for (let offset = 0; offset < all.matched; offset += 4) {
+      seen.push(...scanProposals(50_000, 4, offset).items.map((x) => x.proposalId));
+    }
+    expect(seen).toContain(p.proposalId);
+    // The one horizon still exists, and says so when it is hit.
+    const starved = scanProposals(3, 99);
+    expect(starved.truncated).toBe(true);
   });
 
   it('caps VERIFICATIONS separately, since traversal is not what costs', () => {
@@ -1098,21 +1109,55 @@ describe('bindings, receipts, sync status, and lifecycle', () => {
     let notified = 0;
     const unsubscribe = subscribeTreasury(() => { notified += 1; });
     expect(putChainSyncStatus({ v: 1, state: 'verified', verifiedHeight: 123 })).toBe(true);
-    expect(readChainSyncStatus()).toEqual({ v: 1, state: 'verified', verifiedHeight: 123 });
+    // The genesis is stamped by the writer from the active pin, so callers
+    // cannot forget the field the read side needs to reject another chain.
+    expect(readChainSyncStatus()).toEqual({
+      v: 1,
+      networkGenesisChallenge: GENESIS,
+      state: 'verified',
+      verifiedHeight: 123,
+    });
     expect(putChainSyncStatus({ v: 1, state: 'bogus' } as never)).toBe(false);
     expect(putChainSyncStatus({ v: 1, state: 'verified', verifiedHeight: -1 } as never)).toBe(false);
     expect(notified).toBeGreaterThan(0);
     unsubscribe();
   });
 
+  it('refuses a chain-view claim about another network', () => {
+    // This entry is the ONLY cache value used as a clock — its height drives
+    // every proposal's phase and the funding record's has-it-ended text. It
+    // was also the one record the pin could not reject, because it carried no
+    // genesis, so a peer on another chain could supply the height this room
+    // reasons with.
+    const m = doc.getMap('treasury');
+    m.set('sync', {
+      v: 1,
+      networkGenesisChallenge: 'f'.repeat(64),
+      state: 'verified',
+      verifiedHeight: 9_999_999,
+    });
+    // Held, and not about this chain: reported as unreadable, never as a
+    // height to reason with, and never as "nobody has said anything".
+    expect(readChainSyncStatusResult().status).toBe('unreadable');
+    expect(readChainSyncStatus()).toBeNull();
+  });
+
   it('notifies subscribers on remote updates too', () => {
     const remote = new Y.Doc();
-    remote.getMap('treasury').set('sync', { v: 1, state: 'degraded' });
+    remote.getMap('treasury').set('sync', {
+      v: 1,
+      networkGenesisChallenge: GENESIS,
+      state: 'degraded',
+    });
     let notified = 0;
     const unsubscribe = subscribeTreasury(() => { notified += 1; });
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(remote));
     expect(notified).toBeGreaterThan(0);
-    expect(readChainSyncStatus()).toEqual({ v: 1, state: 'degraded' });
+    expect(readChainSyncStatus()).toEqual({
+      v: 1,
+      networkGenesisChallenge: GENESIS,
+      state: 'degraded',
+    });
     unsubscribe();
   });
 

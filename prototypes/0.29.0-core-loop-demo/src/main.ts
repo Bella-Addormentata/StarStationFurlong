@@ -48,7 +48,7 @@ import {
   bindTreasuryDoc,
   readChainSyncStatusResult,
   readPolicyCacheResult,
-  readProposal,
+  readProposalResult,
   readProposalPayloadResult,
   readRegistrationResult,
   readRoomBinding,
@@ -3114,10 +3114,20 @@ function paintTreasuryBody(view: HTMLElement): void {
 
   // ── Proposal detail ────────────────────────────────────────────────────
   if (treasuryDetailId) {
-    const proposal = readProposal(treasuryDetailId);
+    const proposalResult = readProposalResult(treasuryDetailId);
+    const proposal = proposalResult.status === "ok" ? proposalResult.proposal : null;
     const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
     if (!proposal) {
-      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim("This proposal is no longer in the room's records.")}`;
+      // A peer can replace the open slot with something malformed or
+      // oversized. The record is still there — saying it is "no longer in the
+      // room's records" would be the absence claim every other panel refuses.
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        proposalResult.status === "too-large"
+          ? "This proposal is still held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
+          : proposalResult.status === "unreadable"
+            ? "This proposal is still held in this room, but this device cannot make sense of it — wrong shape, wrong network, or a signature that did not check out."
+            : "This proposal is no longer in the room's records.",
+      )}`;
       return;
     }
     // The list would withhold this proposal now — a binding or policy landing
@@ -3165,7 +3175,10 @@ function paintTreasuryBody(view: HTMLElement): void {
     // peer-writable slots that nothing prunes, and this screen repaints on
     // every treasury event, so unbounded scans would let spam stall the UI.
     // Two budgets, because the entries do not cost the same — see scanPrefixed.
-    const DETAIL_SCAN = 800;
+    // The walk guard is generous on purpose: it is a runaway stop, and any
+    // value small enough to be a page becomes a horizon a peer can hide
+    // records behind. What bounds a repaint is DETAIL_CHECKS.
+    const DETAIL_SCAN = 50_000;
     const voteScan = scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
     const cpScan = scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
     const sessionScan = scanSigningSessions(proposal.proposalId, DETAIL_SCAN, DETAIL_CHECKS);
@@ -3333,7 +3346,9 @@ function paintTreasuryBody(view: HTMLElement): void {
   // or they are free. LIST_CHECKS counts the entries actually VERIFIED, which
   // is the expensive half and the one that decides how long a repaint blocks
   // for; it also caps how many rows this screen can be made to render.
-  const LIST_SCAN = 800;
+  // LIST_SCAN is a runaway stop on the walk, deliberately far above any real
+  // room: a page-sized value there is a horizon, and paging cannot cross one.
+  const LIST_SCAN = 50_000;
   // Paged, not merely capped. A cap alone let a peer bury every real proposal
   // behind two dozen pieces of junk with no way to look past them — see
   // scanPrefixed. The offset is clamped to what actually matched, so records

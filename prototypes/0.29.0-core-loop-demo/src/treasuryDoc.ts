@@ -109,6 +109,17 @@ export type TreasurySigVerifier = (pub: string, bytes: Uint8Array, sig: string) 
  */
 export interface ChainSyncStatus {
   v: 1;
+  /**
+   * Which network this claim is about (plan §17.5).
+   *
+   * Added because this entry is the ONLY cache value used as a clock: its
+   * height drives every proposal's phase and the funding record's
+   * has-it-ended text. Without a genesis it was the one record the pin could
+   * not reject, so a peer on another Chia network could supply the height
+   * this room reasons with — a testnet height placing mainnet proposals on
+   * their clocks. Stamped by putChainSyncStatus, checked on read.
+   */
+  networkGenesisChallenge: Hex32;
   state: 'verified' | 'degraded' | 'unavailable';
   verifiedHeight?: number;
   verifiedBlockHash?: Hex32;
@@ -118,6 +129,7 @@ function isChainSyncStatus(value: unknown): value is ChainSyncStatus {
   if (typeof value !== 'object' || value === null) return false;
   const s = value as Record<string, unknown>;
   return s.v === 1
+    && isHex32(s.networkGenesisChallenge)
     && (s.state === 'verified' || s.state === 'degraded' || s.state === 'unavailable')
     && (s.verifiedHeight === undefined || isBlockHeight(s.verifiedHeight))
     && (s.verifiedBlockHash === undefined || isHex32(s.verifiedBlockHash));
@@ -483,11 +495,29 @@ export function putProposal(proposal: TreasuryProposal): boolean {
   return put(`proposal:${proposal.proposalId}`, proposal);
 }
 
-export function readProposal(proposalId: string): TreasuryProposal | null {
+/** A proposal, or why there is none — the same four states as its siblings. */
+export type ProposalResult =
+  | { status: 'ok'; proposal: TreasuryProposal }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+export function readProposalResult(proposalId: string): ProposalResult {
   const m = readMap();
-  if (!m) return null;
+  if (!m) return { status: 'absent' };
   const value = m.get(`proposal:${proposalId}`);
-  return validProposal(value) && value.proposalId === proposalId ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  const verdict = proposalVerdict(value);
+  if (verdict === 'too-large') return { status: 'too-large' };
+  // The slot-claim check stays out of the verdict: it compares the record
+  // against the caller's id rather than judging the record itself.
+  if (verdict !== 'ok' || (value as TreasuryProposal).proposalId !== proposalId) {
+    return { status: 'unreadable' };
+  }
+  return { status: 'ok', proposal: value as TreasuryProposal };
+}
+
+export function readProposal(proposalId: string): TreasuryProposal | null {
+  const result = readProposalResult(proposalId);
+  return result.status === 'ok' ? result.proposal : null;
 }
 
 export function listProposals(): TreasuryProposal[] {
@@ -587,34 +617,33 @@ function scanPrefixed<T>(
       items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0, offset: 0,
     };
   }
-  // Pass one: which keys match. Examining a key is a prefix test on a string
-  // this loop already holds — nanoseconds, and nothing is allocated for a key
-  // that does not match. Bounding THAT tightly bought almost no time and cost
-  // reachability: with the cap at 800, a peer needed only 800 unrelated keys
-  // to push every real proposal past the horizon, where no amount of paging
-  // could reach it, because paging only ever moved within what this pass had
-  // already collected.
+  // Pass one: which keys match, within ONE budget on keys examined.
   //
-  // So the budget now bounds what is COLLECTED — which is what actually costs
-  // memory and feeds the expensive pass below — and examination gets a
-  // runaway guard set far above any plausible room instead of a page-sized
-  // cap. The bound that governs how long a repaint blocks for is still
-  // `maxChecks`, which is where the signature work lives.
+  // This has now been wrong twice in the same way, so it is worth being
+  // explicit. Any cap that stops the scan early is a horizon, and every
+  // horizon is a censorship tool: whatever sits past it cannot be paged to,
+  // because paging only moves within what this pass collected. Capping keys
+  // EXAMINED let 800 unrelated keys hide everything; moving the cap to keys
+  // COLLECTED just moved the horizon, since 800 planted `proposal:` keys
+  // ahead of an honest one in iteration order hid it exactly as well.
+  //
+  // So there is one budget, it is a runaway guard rather than a page, and it
+  // is set far above any plausible room. Examining a key is a prefix test on
+  // a string this loop already holds, and a matching key costs one array
+  // slot — both cheap enough that a generous ceiling is affordable. The bound
+  // that governs how long a repaint BLOCKS for is `maxChecks`, which is where
+  // the signature work lives; this one only stops an unbounded walk.
   const keys: string[] = [];
   let examined = 0;
   let truncated = false;
+  const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
   for (const key of m.keys()) {
     examined += 1;
-    if (examined > MAX_KEYS_EXAMINED) {
+    if (examined > ceiling) {
       truncated = true;
       break;
     }
-    if (!key.startsWith(prefix)) continue;
-    if (keys.length >= maxEntries) {
-      truncated = true;
-      break;
-    }
-    keys.push(key);
+    if (key.startsWith(prefix)) keys.push(key);
   }
   keys.sort();
   const start = Math.max(0, Math.min(offset, keys.length));
@@ -1162,18 +1191,14 @@ export function scanSigningSessions(
   // later signatures — and later SHELLS — were never reached, which flatly
   // contradicted the guarantee that a paged shell carries its approvals.
   const shellKeys: string[] = [];
+  const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
   for (const key of m.keys()) {
     examined += 1;
-    if (examined > MAX_KEYS_EXAMINED) {
+    if (examined > ceiling) {
       truncated = true;
       break;
     }
-    if (!key.startsWith(shellPrefix)) continue;
-    if (shellKeys.length >= maxEntries) {
-      truncated = true;
-      break;
-    }
-    shellKeys.push(key);
+    if (key.startsWith(shellPrefix)) shellKeys.push(key);
   }
   shellKeys.sort();
   const start = Math.max(0, Math.min(offset, shellKeys.length));
@@ -1187,11 +1212,15 @@ export function scanSigningSessions(
   // can actually use, which real signers bound.
   const wanted = new Set(page.map((key) => key.slice(shellPrefix.length)));
   const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
-  let collectedSigCount = 0;
-  let signaturesTruncated = false;
+  // Its OWN counter. Sharing the shell pass's meant a large map spent most of
+  // the allowance before this pass began — on a 30,000-key map only 20,000
+  // keys remained — so a selected round could still come back missing
+  // signatures held later in the map, which is the very guarantee this split
+  // was made to provide.
+  let sigExamined = 0;
   for (const key of m.keys()) {
-    examined += 1;
-    if (examined > MAX_KEYS_EXAMINED) {
+    sigExamined += 1;
+    if (sigExamined > ceiling) {
       truncated = true;
       break;
     }
@@ -1199,11 +1228,6 @@ export function scanSigningSessions(
     // Session ids are fixed-width Hex32, so the key decomposes exactly.
     const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
     if (!wanted.has(sessionId)) continue;
-    if (collectedSigCount >= maxEntries) {
-      signaturesTruncated = true;
-      truncated = true;
-      break;
-    }
     const value = m.get(key);
     if (typeof value !== 'object' || value === null) continue;
     const entry = value as Record<string, unknown>;
@@ -1216,9 +1240,7 @@ export function scanSigningSessions(
       sigsBySession.set(sessionId, bucket);
     }
     bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
-    collectedSigCount += 1;
   }
-  void signaturesTruncated; // folded into `truncated`, which the UI renders
 
   const out: SigningSession[] = [];
   for (const key of page) {
@@ -1384,9 +1406,24 @@ export function readProposalPayload(payloadHash: string): string | null {
 // Chain-sync display status
 // ---------------------------------------------------------------------------
 
-export function putChainSyncStatus(status: ChainSyncStatus): boolean {
-  if (!isChainSyncStatus(status)) return false;
-  return put('sync', status);
+/**
+ * Publishes this node's chain view for the room to display.
+ *
+ * The genesis is STAMPED here from the active pin rather than taken from the
+ * caller, so a claim can only ever be about the network this device is
+ * actually on — and so callers cannot forget the field that makes the read
+ * side able to reject someone else's chain.
+ */
+export function putChainSyncStatus(
+  status: Omit<ChainSyncStatus, 'networkGenesisChallenge'>,
+): boolean {
+  if (expectedGenesis === null) return false;
+  const stamped: ChainSyncStatus = {
+    ...status,
+    networkGenesisChallenge: expectedGenesis,
+  };
+  if (!isChainSyncStatus(stamped)) return false;
+  return put('sync', stamped);
 }
 
 /** A peer's chain-view claim, or why there is none. */
@@ -1400,10 +1437,12 @@ export function readChainSyncStatusResult(): ChainSyncResult {
   const value = m.get('sync');
   if (value === undefined) return { status: 'absent' };
   // Held but malformed is not "nobody has said anything" — somebody wrote
-  // here, and what they wrote could not be read.
-  return isChainSyncStatus(value)
-    ? { status: 'ok', sync: value }
-    : { status: 'unreadable' };
+  // here, and what they wrote could not be read. A claim about ANOTHER
+  // network reads the same way: something is here, and it is not about this
+  // chain, so it cannot be this room's clock.
+  if (!isChainSyncStatus(value)) return { status: 'unreadable' };
+  if (!onNet(value.networkGenesisChallenge)) return { status: 'unreadable' };
+  return { status: 'ok', sync: value };
 }
 
 export function readChainSyncStatus(): ChainSyncStatus | null {

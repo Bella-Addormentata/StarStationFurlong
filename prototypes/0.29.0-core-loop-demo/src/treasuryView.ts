@@ -843,10 +843,17 @@ export function roomFundingView(
   // a peer supplies a stale low height. The signature covers the record and
   // the end height it names, never the claim about where the chain has got
   // to, so BOTH the passed and not-passed readings are qualified.
+  // A height BELOW the record's own boundAtHeight contradicts the record: the
+  // binding says it started at a block the reported height has not reached.
+  // Two peer-written numbers disagreeing is not evidence the funding is
+  // current, so it is 'unknown' — the same treatment proposalPhase gives a
+  // height that precedes acceptance.
+  const heightIsConsistent =
+    currentHeight !== null && currentHeight >= binding.boundAtHeight;
   const expiryStatus: 'none' | 'unknown' | 'passed' | 'not-passed' =
     expires === null
       ? 'none'
-      : currentHeight === null
+      : currentHeight === null || !heightIsConsistent
         ? 'unknown'
         : currentHeight >= expires
           ? 'passed'
