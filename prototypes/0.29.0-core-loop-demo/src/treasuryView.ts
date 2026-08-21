@@ -675,6 +675,12 @@ export interface ShareClassListView {
   truncated: boolean;
   /** How many were left out — named on screen, never silently dropped. */
   hidden: number;
+  /** Every class the policy declares, so the page can say what it is part of. */
+  total: number;
+  /** Where this page starts, after clamping — for wording and for paging. */
+  startIndex: number;
+  /** Pass `startIndex + items.length` to advance; false when this is the last. */
+  hasMore: boolean;
 }
 
 /**
@@ -691,13 +697,36 @@ export interface ShareClassListView {
  * The proposal list beside this one has capped and disclosed its page since
  * PR C; this is the same contract, in the same unit-tested layer, so the cap
  * cannot be forgotten by a caller building markup.
+ *
+ * PAGED, not merely capped. Disclosing "35 more" while offering no way to see
+ * them left the classes past the cap unreachable for good, and the policy key
+ * is peer-writable — so declaring two dozen filler classes ahead of the real
+ * ones hid them exactly the way a flood of planted proposals once hid the
+ * genuine record. A cap that cannot be paged past is a censorship tool
+ * wherever the underlying list is attacker-ordered, which is the lesson the
+ * scans in treasuryDoc had to learn three times.
+ *
+ * Paging here is by OFFSET, unlike those scans, and the difference is worth
+ * stating rather than glossing. A cursor is what defeats a writer who inserts
+ * keys ahead of the reader between repaints; these classes are not a key space
+ * but one array inside a single record, and they are shown in the order the
+ * policy declares, which sorting away would misrepresent. A peer rewriting the
+ * whole policy between presses can still shuffle this page — but they cannot
+ * do it invisibly, because the policy version and fingerprint are on screen
+ * directly above, and the total below moves with it.
  */
 export function shareClassViews(
   policy: CompanyTreasuryPolicy,
   max = 24,
+  offset = 0,
 ): ShareClassListView {
   const all = policy.shareClasses;
-  const shown = max >= 0 ? all.slice(0, max) : [];
+  const size = Math.max(0, max);
+  // Clamp rather than trust: the offset survives repaints, so a policy that
+  // shrinks under it would otherwise strand the reader on an empty page with
+  // a NEXT that does nothing and a total that says there is plenty to see.
+  const start = Math.max(0, Math.min(Math.floor(offset) || 0, Math.max(0, all.length - 1)));
+  const shown = all.slice(start, start + size);
   return {
     items: shown.map((c) => ({
       id: c.id,
@@ -707,6 +736,9 @@ export function shareClassViews(
     })),
     truncated: shown.length < all.length,
     hidden: all.length - shown.length,
+    total: all.length,
+    startIndex: all.length === 0 ? 0 : start,
+    hasMore: start + shown.length < all.length,
   };
 }
 

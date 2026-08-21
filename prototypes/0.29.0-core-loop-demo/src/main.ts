@@ -2837,6 +2837,14 @@ let lastCheckpointNext: string | null = null;
 let lastApprovalNext: string | null = null;
 
 /**
+ * How many share classes one page of the COMPANY panel shows, and where that
+ * page starts. An offset rather than a cursor stack — see shareClassViews for
+ * why this one list is different from the map scans.
+ */
+const CLASS_PAGE = 24;
+let treasuryClassOffset = 0;
+
+/**
  * "3–10 of 42" for one scan's page — descriptive only.
  *
  * startIndex is a position in a list a peer can prepend to, so it is fine for
@@ -2849,6 +2857,34 @@ function pageRange(
   if (scan.matched === 0) return "none held";
   const shown = Math.min(size, scan.matched - scan.startIndex);
   return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${scan.matched}`;
+}
+
+/**
+ * Whether this panel must show its pager.
+ *
+ * NOT "is there more than one page of records", which is what it used to ask.
+ * `matched` is recounted from the map on every repaint, so a peer who deletes
+ * enough earlier keys drops it to one page's worth WHILE THE READER IS PAST
+ * THAT PAGE — the block disappears, taking PREVIOUS with it, and everything
+ * behind the cursor is stranded. Deleting records to remove the control that
+ * reaches records is the same censorship shape as planting them, arrived at
+ * from the other side.
+ *
+ * So the question is whether this view is anywhere other than the whole list:
+ * a cursor with history behind it, a page that starts partway in, or a page
+ * with more after it. Any of those and the controls stay.
+ */
+function pagerNeeded(
+  scan: { matched: number; startIndex: number; nextCursor: string | null },
+  size: number,
+  history: readonly (string | null)[],
+): boolean {
+  return (
+    scan.matched > size ||
+    scan.startIndex > 0 ||
+    scan.nextCursor !== null ||
+    history.length > 1
+  );
 }
 
 /**
@@ -3062,6 +3098,14 @@ function wireTreasuryView(view: HTMLElement): void {
       }
       if (action === "page-next") pageForward(treasuryListCursors, lastListNext);
       if (action === "page-prev") pageBack(treasuryListCursors);
+      // Share classes page by offset, not cursor — one array inside one
+      // record, shown in the order the policy declares it. The paint clamps
+      // this against the policy's real length before using it, so an offset
+      // left past the end after a shrink cannot strand the reader.
+      if (action === "classes-next") treasuryClassOffset += CLASS_PAGE;
+      if (action === "classes-prev") {
+        treasuryClassOffset = Math.max(0, treasuryClassOffset - CLASS_PAGE);
+      }
       // renderTreasuryApp preserves focus across the repaint for us.
       renderTreasuryApp();
       return true;
@@ -3427,7 +3471,8 @@ function paintTreasuryBody(view: HTMLElement): void {
         // scanned to different depths, so one range against the larger of the
         // two described neither: 8 votes plus 8 vote records rendered 16
         // inputs while claiming "records 1–8 of 8".
-        voteScan.matched > DETAIL_PAGE || cpScan.matched > DETAIL_PAGE
+        pagerNeeded(voteScan, DETAIL_PAGE, treasuryVoteCursors) ||
+        pagerNeeded(cpScan, DETAIL_PAGE, treasuryCheckpointCursors)
           ? `${dim(
               `Votes: ${pageRange(voteScan, DETAIL_PAGE)}. Vote records: ${pageRange(cpScan, DETAIL_PAGE)}. Only these pages were read.`,
             )}
@@ -3454,6 +3499,16 @@ function paintTreasuryBody(view: HTMLElement): void {
         voteScan.rejected + cpScan.rejected > 0
           ? dim(
               `${voteScan.rejected + cpScan.rejected} record${voteScan.rejected + cpScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of — wrong shape, wrong network, or a signature that did not check out — so ${voteScan.rejected + cpScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        // Whole-map, like the list's own line. Both vote key spaces folded
+        // into one figure because the player is being told the room holds
+        // junk under this proposal, not which prefix carried it.
+        voteScan.malformedKeys + cpScan.malformedKeys > 0
+          ? dim(
+              `${voteScan.malformedKeys + cpScan.malformedKeys} entr${voteScan.malformedKeys + cpScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any vote, so ${voteScan.malformedKeys + cpScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
             )
           : ""
       }
@@ -3488,7 +3543,7 @@ function paintTreasuryBody(view: HTMLElement): void {
         // Reachability, not just disclosure. Rounds are peer-writable, so
         // without a way to page past planted ones the genuine round's progress
         // could be hidden for good — the same hole the proposal list had.
-        sessionScan.matched > DETAIL_PAGE
+        pagerNeeded(sessionScan, DETAIL_PAGE, treasuryApprovalCursors)
           ? `${dim(
               `Showing rounds ${pageRange(sessionScan, DETAIL_PAGE)} held under this proposal's approval keys. Only this page was read.`,
             )}
@@ -3521,6 +3576,13 @@ function paintTreasuryBody(view: HTMLElement): void {
         sessionScan.rejected > 0
           ? dim(
               `${sessionScan.rejected} approval round${sessionScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of, so ${sessionScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.malformedKeys > 0
+          ? dim(
+              `${sessionScan.malformedKeys} entr${sessionScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any approval round, so ${sessionScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
             )
           : ""
       }
@@ -3657,7 +3719,14 @@ function paintTreasuryBody(view: HTMLElement): void {
         : showPolicy
         ? (() => {
             const b = boardView(showPolicy.policy);
-            const classes = shareClassViews(showPolicy.policy);
+            const classes = shareClassViews(
+              showPolicy.policy, CLASS_PAGE, treasuryClassOffset,
+            );
+            // The clamped value, so a policy that shrank under the offset
+            // leaves the reader on a real page rather than one press from
+            // nowhere. Read back rather than recomputed: the view already
+            // did the clamping and this must not disagree with it.
+            treasuryClassOffset = classes.startIndex;
             return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
                 <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
                 ${badge("board", b.trust)}
@@ -3676,9 +3745,23 @@ function paintTreasuryBody(view: HTMLElement): void {
                 .join("")}
               ${
                 classes.truncated
-                  ? dim(
-                      `${classes.hidden} more share class${classes.hidden === 1 ? "" : "es"} in this policy are not shown here. How many a policy declares is chosen by whoever wrote it.`,
-                    )
+                  ? `${dim(
+                      `Showing share classes ${classes.startIndex + 1}–${classes.startIndex + classes.items.length} of ${classes.total}. How many a policy declares is chosen by whoever wrote it.`,
+                    )}
+                    <div style="display:flex; gap:6px; margin-top:6px;">
+                      ${
+                        classes.startIndex > 0
+                          ? `<div data-treasury-action="classes-prev" role="button" tabindex="0" aria-label="Previous page of share classes"
+                               style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                          : ""
+                      }
+                      ${
+                        classes.hasMore
+                          ? `<div data-treasury-action="classes-next" role="button" tabindex="0" aria-label="Next page of share classes"
+                               style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                          : ""
+                      }
+                    </div>`
                   : ""
               }
               ${dim(esc(b.note))}`;
@@ -3798,11 +3881,21 @@ function paintTreasuryBody(view: HTMLElement): void {
         : ""
     }
     ${
+      // Worded "in this room", not "on this page": unlike the two counts
+      // above, this one is found while walking the WHOLE map, and a map-wide
+      // figure under a page-local heading would be its own small dishonesty.
+      page.malformedKeys > 0
+        ? dim(
+            `${page.malformedKeys} entr${page.malformedKeys === 1 ? "y is" : "ies are"} filed in this room under a name too long to belong to any proposal, so ${page.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+          )
+        : ""
+    }
+    ${
       // A way to actually reach what the page does not show. Without this the
       // partial-list warning told the player their view was incomplete and
       // offered them nothing to do about it — which is what made a small
       // junk flood enough to hide every real proposal.
-      page.matched > LIST_CHECKS
+      pagerNeeded(page, LIST_CHECKS, treasuryListCursors)
         ? `${dim(
             `Showing records ${pageRange(page, LIST_CHECKS)} held under this room's proposal keys. Only this page was read.`,
           )}

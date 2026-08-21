@@ -216,6 +216,46 @@ describe('proposals', () => {
     expect(starved.truncated).toBe(true);
   });
 
+  it('refuses keys too long to name a record, before they reach the sort', () => {
+    // The traversal guard bounds how MANY keys are collected; nothing bounded
+    // their LENGTH, and comparing two keys costs their shared prefix. So a
+    // peer could make the sort — not the verification, which is what maxChecks
+    // governs — walk megabytes per comparison.
+    const m = doc.getMap('treasury');
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    const long = 'proposal:' + 'a'.repeat(4000);
+    for (let i = 0; i < 30; i++) m.set(`${long}${i}`, { junk: i });
+
+    const scan = scanProposals(50_000, 8);
+    expect(scan.malformedKeys).toBe(30);
+    // Refused, not merely unshown: they never enter the key list, so they
+    // cannot spend a page or shift the honest record's position.
+    expect(scan.matched).toBe(1);
+    expect(scan.items.map((x) => x.proposalId)).toEqual([p.proposalId]);
+    // And this must NOT behave like the horizons that came before it: the
+    // honest record stays reachable, and no partial-view flag is raised for
+    // a refusal that hid nothing readable.
+    expect(scan.truncated).toBe(false);
+  });
+
+  it('keeps every key a real record could be filed under', () => {
+    // The counterpart to the test above, and the one that would catch a bound
+    // set too tight. A vote's key carries a voter's public key, which is the
+    // longest variable part any key here has — if the ceiling ever drops below
+    // a real one, votes would silently stop being counted.
+    const m = doc.getMap('treasury');
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    const v = makeVote(seedA, '6'.repeat(64), 1, p.proposalId);
+    expect(putVote(v)).toBe(true);
+    const key = `vote:${v.proposalId}:${v.voterGamePub}`;
+    expect(m.get(key)).toBeTruthy();
+    const scan = scanVotes(p.proposalId, 50_000, 8);
+    expect(scan.malformedKeys).toBe(0);
+    expect(scan.items.map((x) => x.voteId)).toEqual([v.voteId]);
+  });
+
   it('caps VERIFICATIONS separately, since traversal is not what costs', () => {
     // A traversal budget bounds how far a scan walks; it never bounded how
     // much signature work the walk does. 800 verifiable records was measured
@@ -738,6 +778,7 @@ describe('network pinning', () => {
       truncated: false,
       refusedTooLarge: 0,
       rejected: 0,
+      malformedKeys: 0,
       matched: 0,
       cursor: null,
       startIndex: 0,

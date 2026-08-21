@@ -593,6 +593,35 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
 const MAX_KEYS_EXAMINED = 50_000;
 
 /**
+ * The longest key this schema can name a record with, plus generous slack.
+ *
+ * The traversal guard bounds how many keys are collected; nothing bounded
+ * their LENGTH, and Y.Map keys are peer-controlled. Collecting is cheap, but
+ * the sort that follows is not: comparing two keys costs their shared prefix,
+ * so keys built as one long common prefix plus a short distinct tail make
+ * every one of the sort's comparisons walk that prefix. Measured at the
+ * traversal ceiling: 50,000 such keys sort in 288 ms against 15 ms for the
+ * same count at schema size, and it grows linearly with the prefix — a 40,000
+ * character one is about three seconds. Per scan, and the detail screen runs
+ * three. The verification budget never saw any of it, because none of this is
+ * verification.
+ *
+ * Every key here is `<class>:<Hex32>` or `<class>:<Hex32>:<id>` — the longest
+ * fixed form is `sessionsig:` + 64 + 1 + 64 = 140, and the one variable part
+ * (a vote's `voterGamePub`) is an ed25519 public key. 256 clears all of them
+ * with room to spare.
+ *
+ * This is NOT another horizon, and the difference is the whole point after
+ * three goes at it. A horizon stops the walk somewhere a peer chooses, so
+ * honest records behind it become unreachable. This refuses a SHAPE no honest
+ * record can have: nothing this app writes exceeds 166 characters, so a key
+ * past the bound names no record that could be read even if it were collected.
+ * Ordering is untouched and every legitimate key stays pageable — and the
+ * count is reported, so a peer cannot make the refusal look like absence.
+ */
+const MAX_KEY_LENGTH = 256;
+
+/**
  * The most signatures one approval round may contribute to a screen.
  *
  * A real board is a handful of signers. This is not a protocol rule — it is
@@ -624,6 +653,16 @@ export interface BoundedScan<T> {
   rejected: number;
   /** Matching keys found within the traversal budget, before verification. */
   matched: number;
+  /**
+   * Keys that carried the right prefix but were too long to be any record this
+   * schema can name, and so were never collected. See MAX_KEY_LENGTH.
+   *
+   * Counted rather than folded into `rejected`, which is deliberately
+   * PAGE-LOCAL — this one is whole-map, and reporting it under a page-local
+   * heading would be a count about the map dressed up as a count about the
+   * page. It is the same distinction refusedTooLarge draws for values.
+   */
+  malformedKeys: number;
   /**
    * The cursor this page started AFTER — the caller's own input, echoed back.
    *
@@ -683,7 +722,7 @@ function scanPrefixed<T>(
   const m = readMap();
   if (!m) {
     return {
-      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0,
+      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
       cursor: after, startIndex: 0, nextCursor: null,
     };
   }
@@ -706,6 +745,7 @@ function scanPrefixed<T>(
   const keys: string[] = [];
   let examined = 0;
   let truncated = false;
+  let malformedKeys = 0;
   const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
   for (const key of m.keys()) {
     examined += 1;
@@ -713,7 +753,15 @@ function scanPrefixed<T>(
       truncated = true;
       break;
     }
-    if (key.startsWith(prefix)) keys.push(key);
+    if (!key.startsWith(prefix)) continue;
+    // Length before collection, because the cost being bounded is the SORT
+    // below, and a key only reaches it by being collected. The prefix test
+    // above is already bounded by the prefix.
+    if (key.length > MAX_KEY_LENGTH) {
+      malformedKeys += 1;
+      continue;
+    }
+    keys.push(key);
   }
   keys.sort();
   // Page forward from the CURSOR, not from an index. An index is rebuilt
@@ -751,6 +799,7 @@ function scanPrefixed<T>(
     truncated,
     refusedTooLarge,
     rejected,
+    malformedKeys,
     matched: keys.length,
     cursor: after,
     startIndex: from,
@@ -1283,7 +1332,7 @@ export function scanSigningSessions(
   const m = readMap();
   if (!m) {
     return {
-      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, matched: 0,
+      items: [], truncated: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
       cursor: after, startIndex: 0, nextCursor: null, partialSessionIds: [],
     };
   }
@@ -1298,6 +1347,7 @@ export function scanSigningSessions(
   // later signatures — and later SHELLS — were never reached, which flatly
   // contradicted the guarantee that a paged shell carries its approvals.
   const shellKeys: string[] = [];
+  let malformedKeys = 0;
   const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
   for (const key of m.keys()) {
     examined += 1;
@@ -1305,7 +1355,14 @@ export function scanSigningSessions(
       truncated = true;
       break;
     }
-    if (key.startsWith(shellPrefix)) shellKeys.push(key);
+    if (!key.startsWith(shellPrefix)) continue;
+    // Same reason as scanPrefixed: what follows sorts these, and sorting
+    // peer-supplied keys costs their shared prefix.
+    if (key.length > MAX_KEY_LENGTH) {
+      malformedKeys += 1;
+      continue;
+    }
+    shellKeys.push(key);
   }
   shellKeys.sort();
   // Cursor, not index — same reason as scanPrefixed: shells are unsigned and
@@ -1393,6 +1450,7 @@ export function scanSigningSessions(
     truncated,
     refusedTooLarge,
     rejected,
+    malformedKeys,
     matched: shellKeys.length,
     cursor: after,
     startIndex: from,

@@ -1158,6 +1158,107 @@ describe('paired cursor history', () => {
   });
 });
 
+describe('pager visibility', () => {
+  // Read from source: the predicate lives in the 7k-line entry point with no
+  // export seam, and what matters is that it is no longer "more than one page
+  // of records exist", which is a fact about the MAP and not about where the
+  // reader is standing in it.
+  const root = dirname(fileURLToPath(import.meta.url));
+  const main = readFileSync(join(root, 'main.ts'), 'utf8');
+
+  it('asks where the reader is, not how many records remain', () => {
+    const fn = main.slice(
+      main.indexOf('function pagerNeeded('),
+      main.indexOf('function paintTreasuryApp('),
+    );
+    expect(fn).toContain('scan.startIndex > 0');
+    expect(fn).toContain('scan.nextCursor !== null');
+    expect(fn).toContain('history.length > 1');
+  });
+
+  it('gates every treasury pager on it, so none can shrink out of reach', () => {
+    // The defect: `matched > PAGE` alone. A peer deleting earlier keys drops
+    // `matched` to one page's worth while the reader sits past that page, and
+    // the whole block — PREVIOUS included — disappears, stranding everything
+    // behind the cursor. Three panels had it; all three must be converted, or
+    // the one left behind is still strandable.
+    for (const scan of ['voteScan', 'cpScan', 'sessionScan', 'page']) {
+      const bad = new RegExp(`${scan}\\.matched > (DETAIL_PAGE|LIST_CHECKS)\\s*(\\?|\\|\\||$)`, 'm');
+      expect(main, `${scan} still gates its pager on record count alone`)
+        .not.toMatch(bad);
+    }
+    expect(main).toContain('pagerNeeded(voteScan, DETAIL_PAGE, treasuryVoteCursors)');
+    expect(main).toContain('pagerNeeded(cpScan, DETAIL_PAGE, treasuryCheckpointCursors)');
+    expect(main).toContain('pagerNeeded(sessionScan, DETAIL_PAGE, treasuryApprovalCursors)');
+    expect(main).toContain('pagerNeeded(page, LIST_CHECKS, treasuryListCursors)');
+  });
+});
+
+describe('share class paging', () => {
+  const many = (n: number) =>
+    ({
+      ...policy,
+      shareClasses: Array.from({ length: n }, (_unused, i) => ({
+        ...policy.shareClasses[0],
+        id: `class-${i}`,
+        assetId: `${i}`.padStart(64, '0'),
+      })),
+    }) as CompanyTreasuryPolicy;
+
+  it('reaches the classes past the first page', () => {
+    // Truncating with only a "35 more" note left those 35 unreachable for
+    // good, and the policy key is peer-writable — so filler classes declared
+    // ahead of the real ones hid them the way planted proposals once did.
+    const all = many(40);
+    const first = shareClassViews(all, 24, 0);
+    expect(first.items).toHaveLength(24);
+    expect(first.startIndex).toBe(0);
+    expect(first.hasMore).toBe(true);
+    expect(first.total).toBe(40);
+
+    const second = shareClassViews(all, 24, 24);
+    expect(second.items.map((c) => c.id)).toEqual(
+      Array.from({ length: 16 }, (_u, i) => `class-${24 + i}`),
+    );
+    expect(second.hasMore).toBe(false);
+    expect(second.startIndex).toBe(24);
+  });
+
+  it('walks every class in the policy across pages', () => {
+    const all = many(97);
+    const seen: string[] = [];
+    let offset = 0;
+    for (let guard = 0; guard < 20; guard++) {
+      const page = shareClassViews(all, 24, offset);
+      seen.push(...page.items.map((c) => c.id));
+      if (!page.hasMore) break;
+      offset = page.startIndex + page.items.length;
+    }
+    expect(seen).toHaveLength(97);
+    expect(new Set(seen).size).toBe(97);
+  });
+
+  it('clamps an offset the policy has shrunk beneath', () => {
+    // The offset outlives the repaint, so a policy that loses classes under
+    // it must not leave the reader on a page that does not exist — with a
+    // total insisting there is plenty to see and no control that moves.
+    const page = shareClassViews(many(5), 24, 400);
+    expect(page.startIndex).toBe(4);
+    expect(page.items).toHaveLength(1);
+    expect(page.hasMore).toBe(false);
+    expect(page.total).toBe(5);
+  });
+
+  it('says nothing is held rather than dividing an empty policy into pages', () => {
+    const none = { ...policy, shareClasses: [] } as CompanyTreasuryPolicy;
+    const page = shareClassViews(none, 24, 0);
+    expect(page.items).toHaveLength(0);
+    expect(page.startIndex).toBe(0);
+    expect(page.hasMore).toBe(false);
+    expect(page.truncated).toBe(false);
+  });
+});
+
 const PHASE_STRINGS = {
   noClocks: phaseLabel('no-clocks'),
   unknownHeight: phaseLabel('unknown-height'),
