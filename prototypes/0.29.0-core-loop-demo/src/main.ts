@@ -53,6 +53,8 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMod
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+// 🎰 #76: CRDT-backed stand occupancy for multi-player tables.
+import { bindStandsDoc } from "./standsDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -1125,6 +1127,11 @@ async function joinRoomAtEpoch(
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
   bindCasinoDoc(sync.doc);
+
+  // 🎰 #76: bind the shared stand-occupancy map — one CRDT claim per stand
+  // slot at multiplayer tables, so two simultaneous walk-ups can't collide on
+  // the same standing position. Rebinds per join like games/casino (T0 seam).
+  bindStandsDoc(sync.doc);
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);

@@ -22,6 +22,22 @@ import {
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
+// 🎰 #76: CRDT-backed stand occupancy. The Y.Map claim binds at the T0 seam
+// in main.ts (bindStandsDoc). The pure engine (standClaims) supplies the
+// tier picker + expiry rules; world.ts wires them into walk-up + heartbeat.
+import {
+  claimStand,
+  readAllStandClaims,
+  readStandClaim,
+  reapExpiredClaims,
+  releaseStand,
+} from "./standsDoc";
+import {
+  STAND_CLAIM_HEARTBEAT_MS,
+  STAND_CLAIM_REAP_MS,
+  findExpiredClaims,
+  pickStandForWalkup,
+} from "./standClaims";
 import { readTableState, readCrapsTableState } from "./casinoDoc";
 import {
   beatCroupier,
@@ -44,7 +60,7 @@ import { speakRobotLine } from "./robotVoice";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
-import { getDefaultRoomId } from "./identity";
+import { getDefaultRoomId, getPlayerId } from "./identity";
 import {
   FURNITURE,
   FURNITURE_DEFS,
@@ -351,6 +367,19 @@ export class World {
   private holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }> = [];
   /** Animated trunk lids, keyed by item id (TR2 — driven every frame). */
   private trunkLids: Map<string, TrunkLidHandle> = new Map();
+  /**
+   * 🎰 #76: the stand slot this player currently occupies (CRDT-authoritative),
+   * plus the last time we heartbeated its claim. Null while no table focus is
+   * active. Written by standTarget on approach, refreshed by update() at
+   * STAND_CLAIM_HEARTBEAT_MS, cleared by the release hook.
+   */
+  private trackedStand: {
+    slotId: string;
+    itemId: string;
+    lastHeartbeat: number;
+  } | null = null;
+  /** ms accumulator for the reap sweep (STAND_CLAIM_REAP_MS cadence). */
+  private standReapAccumMs = 0;
   /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
   private cloneVats: Map<string, CloneVatHandle> = new Map();
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
@@ -3588,6 +3617,13 @@ export class World {
     // owner can see where the stand slots land as they move a table (#76).
     this.updateStandMarkers();
 
+    // 🎰 #76: keep MY stand claim alive while I'm on it (heartbeat every
+    // ~5 s of real time), and periodically reap OTHER players' expired
+    // claims from crashed peers. Two writes on separate cadences — one bump,
+    // one delete — both idempotent under Yjs LWW.
+    this.tickStandHeartbeat();
+    this.tickStandReap(deltaTime);
+
     // 1 Hz idle status on wall-computer screens (M1 — the permanent home of
     // PR #36's dev-hook wiring; same live values, same cadence).
     if (this.wallScreens.size > 0) {
@@ -4676,27 +4712,125 @@ export class World {
    * avatar walks up to an OPEN position (auto-bumping past taken ones) facing
    * the table, then the game/betting UI opens — instead of everyone stacking on
    * the single fixed device front. The reserved wheel-head is never auto-picked
-   * (it's the owner's croupier robot's spot); falls back to the device's own
-   * front when every open slot is occupied. Occupancy is inferred from remote
-   * avatar positions (Phase 1 — a synced claim map lands in a later slice).
+   * unless the walker is owner-equivalent (canEditRoom().ok — the same gate
+   * that runs the croupier); falls back to the device's own front when every
+   * open slot is occupied. Occupancy is CRDT-authoritative (Y.Map `stands`,
+   * see standsDoc): the claim tracked here is written on approach, refreshed
+   * by the heartbeat in update(), and released by the onRelease hook when
+   * device focus ends. Proximity to remote avatars still adds a backup filter
+   * so a peer that never wrote a claim (legacy client / lost write) doesn't
+   * get walked through.
    */
   private standTarget(device: DeviceTarget): DeviceTarget {
     const stand = this.pickFreeStand(device.id);
-    return stand
-      ? { ...device, front: stand.front, faceAngle: stand.faceAngle }
-      : device;
+    if (!stand) return device;
+    // Claim + track the slot so update() can heartbeat it and the release
+    // hook can free it. Wrapping the caller's existing onRelease keeps trunk-
+    // style choreography intact if this ever gets composed on a device that
+    // already had a hook (none today, but the pattern is uniform).
+    const now = Date.now();
+    claimStand(stand.id, getPlayerId(), now);
+    this.trackedStand = {
+      slotId: stand.id,
+      itemId: device.id,
+      lastHeartbeat: now,
+    };
+    const priorRelease = device.onRelease;
+    return {
+      ...device,
+      front: stand.front,
+      faceAngle: stand.faceAngle,
+      onRelease: () => {
+        this.releaseTrackedStand();
+        if (priorRelease) {
+          try { priorRelease(); } catch (err) { console.error(err); }
+        }
+      },
+    };
   }
 
-  /** Nearest open, REACHABLE (non-wheel-head) stand slot for the item, or null.
-   *  "Taken" = a remote avatar within 0.7 m of the slot front. A slot must also
-   *  be A*-reachable from the player — otherwise picking it would strand the
-   *  avatar short of the table (worse than the legacy single front), so an
-   *  unreachable slot is skipped and the caller falls back to the device front. */
+  /** Release the currently-tracked stand (if any). Idempotent — safe to call
+   *  from every release path, including a leaveRoom teardown. */
+  private releaseTrackedStand(): void {
+    const tracked = this.trackedStand;
+    if (!tracked) return;
+    this.trackedStand = null;
+    try { releaseStand(tracked.slotId); }
+    catch (err) { console.error("[stands] release threw:", err); }
+  }
+
+  /**
+   * Refresh the local player's stand claim at the heartbeat cadence. A live
+   * holder keeps the slot even during a doc quiescence; a peer whose tab
+   * suspends stops writing and their claim ages out (findExpiredClaims). Real
+   * time is captured from Date.now() rather than the render clock so a stalled
+   * frame loop can't extend the TTL past its real window.
+   */
+  private tickStandHeartbeat(): void {
+    const tracked = this.trackedStand;
+    if (!tracked) return;
+    const now = Date.now();
+    if (now - tracked.lastHeartbeat < STAND_CLAIM_HEARTBEAT_MS) return;
+    try {
+      claimStand(tracked.slotId, getPlayerId(), now);
+      tracked.lastHeartbeat = now;
+    } catch (err) {
+      console.error("[stands] heartbeat threw:", err);
+    }
+  }
+
+  /**
+   * Periodically sweep the claim map for expired records whose holders are no
+   * longer online (per the room doc's `players` map). Delete-only + LWW-safe:
+   * a fresh heartbeat that races the reap just re-writes the same key, and Yjs
+   * picks whichever landed last.
+   */
+  private tickStandReap(deltaTime: number): void {
+    this.standReapAccumMs += deltaTime * 1000;
+    if (this.standReapAccumMs < STAND_CLAIM_REAP_MS) return;
+    this.standReapAccumMs = 0;
+    // Currently-online player ids — the local player plus everyone with an
+    // entry in the room doc's `players` map. The `players` map is the
+    // canonical presence source: peers upsert on join, entries stick after
+    // leave (fine — they'll age out via the TTL if they never come back).
+    const online = new Set<string>([getPlayerId()]);
+    const doc = (window as unknown as { __ssfDoc?: import("yjs").Doc }).__ssfDoc;
+    doc?.getMap("players").forEach((_v, k) => online.add(k));
+    const stale = findExpiredClaims({
+      claims: readAllStandClaims(),
+      onlinePlayerIds: online,
+      now: Date.now(),
+    });
+    if (stale.length === 0) return;
+    try { reapExpiredClaims(stale); }
+    catch (err) { console.error("[stands] reap threw:", err); }
+  }
+
+  /**
+   * Ordered stand candidates for THIS player's walk-up: reads the doc's
+   * claim map, applies the pure-tier rule (own-active → open civilian →
+   * reserved-if-owner), then filters + sorts locally for reachability and
+   * proximity. Returns the first surviving slot, or null (caller falls back
+   * to the device's own front).
+   *
+   * The proximity filter (remote avatar within 0.7 m) stays as a defence
+   * against a legacy peer that never posted a claim — a stand seen taken on
+   * screen is still treated as taken here, even without a matching claim.
+   */
   private pickFreeStand(itemId: string): StandSlot | null {
-    // Skip any reserved operator slot (roulette wheelHead / craps stickman) —
-    // that's the owner's croupier robot's spot, never auto-picked for a walk-up.
-    const slots = standsForItem(itemId).filter((s) => !s.role);
+    const slots = standsForItem(itemId);
     if (slots.length === 0) return null;
+    const playerId = getPlayerId();
+    const candidates = pickStandForWalkup({
+      slots,
+      claims: readAllStandClaims(),
+      playerId,
+      now: Date.now(),
+      // Owner-equivalent gate — same rule that unlocks the croupier UIs (#69
+      // G1/G2). A non-owner never lands on the wheel-head from a walk-up.
+      canOperateReserved: canEditRoom().ok,
+    });
+    if (candidates.length === 0) return null;
     const others = this.getRemoteAvatarSnapshots();
     const me = this.player.getPosition();
     let mr = worldToRow(me.z);
@@ -4721,17 +4855,39 @@ export class World {
     const reachable = (s: StandSlot) =>
       Math.hypot(s.front.x - me.x, s.front.z - me.z) < 0.6 ||
       findPath(mr, mc, worldToRow(s.front.z), worldToCol(s.front.x)).length > 0;
-    const free = slots.filter(
+    // Proximity filter: any slot with a stranger physically on top of it is
+    // out, regardless of the claim map. Two exceptions: my own tracked stand
+    // (I'm the one on top of it) and the mineActive tier (the claim map
+    // already says it's mine, so my own avatar being there is fine).
+    const claimByThisPlayer = (slotId: string): boolean => {
+      const claim = readStandClaim(slotId);
+      return claim != null && claim.playerId === playerId;
+    };
+    const free = candidates.filter(
       (s) =>
-        !others.some((a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7) &&
+        (claimByThisPlayer(s.id) ||
+          !others.some(
+            (a) => Math.hypot(a.x - s.front.x, a.z - s.front.z) < 0.7,
+          )) &&
         reachable(s),
     );
     if (free.length === 0) return null;
-    free.sort(
-      (a, b) =>
+    // Preserve tier order (mine first, then civilian, then reserved-if-owner);
+    // within a tier, sort by walk distance so the nearest open slot wins.
+    // Stable sort keeps the tier grouping intact.
+    const tierOf = (s: StandSlot): number => {
+      const claim = readStandClaim(s.id);
+      if (claim && claim.playerId === playerId) return 0;
+      return s.role ? 2 : 1;
+    };
+    free.sort((a, b) => {
+      const dt = tierOf(a) - tierOf(b);
+      if (dt !== 0) return dt;
+      return (
         Math.hypot(a.front.x - me.x, a.front.z - me.z) -
-        Math.hypot(b.front.x - me.x, b.front.z - me.z),
-    );
+        Math.hypot(b.front.x - me.x, b.front.z - me.z)
+      );
+    });
     return free[0];
   }
 
