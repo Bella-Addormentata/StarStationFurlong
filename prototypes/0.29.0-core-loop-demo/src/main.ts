@@ -47,7 +47,7 @@ import {
 import {
   bindTreasuryDoc,
   readChainSyncStatus,
-  readPolicyCache,
+  readPolicyCacheResult,
   readProposal,
   readProposalPayload,
   readRegistration,
@@ -2961,12 +2961,18 @@ function paintTreasuryApp(view: HTMLElement): void {
     tag: { level: string; label: string; detail: string },
   ) => {
     const focusable = id !== null;
+    // UNVERIFIED and NO DATA were a 45%-alpha gold, which composites over the
+    // phone's near-black screen to about 2.6:1 — under the 4.5:1 this 8px text
+    // needs, and dimmest on exactly the two states a player most needs to
+    // read. Opaque, and measured against #04060F: 5.5:1. Still visibly quieter
+    // than the ~12:1 SIGNED and SELF-CHECKED badges, so the hierarchy the
+    // dimming was for survives without costing legibility.
     const color =
       tag.level === "signed"
         ? "#7ddb8f"
         : tag.level === "self-checked"
           ? "#f0c060"
-          : "rgba(212,168,75,0.45)";
+          : "#998356";
     // Focusable and labelled: the qualification behind a badge (a signature
     // shows authorship, not authority) is the whole point of showing it, and
     // a title tooltip on an inert span never reaches a keyboard user.
@@ -2997,7 +3003,13 @@ function paintTreasuryApp(view: HTMLElement): void {
   const peerSync = cacheReadable ? readChainSyncStatus() : null;
   const sync = syncView(peerSync, cacheReadable);
   const { height, source: heightSource } = displayHeight(peerSync);
-  const policyCache = cacheReadable ? readPolicyCache() : null;
+  // The result form, not the plain read: "held but this device declined to
+  // read it" and "held but unreadable" are held records, and reporting either
+  // as absence would tell a player there is no policy while one sits in the
+  // room they are standing in.
+  const policyResult = cacheReadable ? readPolicyCacheResult() : null;
+  const policyStatus = policyResult?.status ?? "absent";
+  const policyCache = policyResult?.status === "ok" ? policyResult : null;
   // Which company this screen may present, shared by BOTH branches: an open
   // detail must obey the same scope as the list, or a binding or policy
   // changing under it would leave a proposal on screen that the list has
@@ -3277,9 +3289,17 @@ function paintTreasuryApp(view: HTMLElement): void {
               ${dim(esc(b.note))}`;
           })()
         : dim(
-            readable
-              ? "No company policy cached in this room yet."
-              : "Company details cannot be read on this device, so nothing is known about the company either way.",
+            !readable
+              ? "Company details cannot be read on this device, so nothing is known about the company either way."
+              // A record this device declined to read is NOT an absent record.
+              // The size cap is a local display decision, so a policy that is
+              // perfectly valid on the wire can trip it — and answering that
+              // with "none cached" would deny a policy the room is holding.
+              : policyStatus === "too-large"
+                ? "A company policy is held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
+                : policyStatus === "unreadable"
+                  ? "A company policy is held in this room, but this device cannot make sense of it — wrong shape, wrong network, or damaged."
+                  : "No company policy cached in this room yet.",
           )
     }
 

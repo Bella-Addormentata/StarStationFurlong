@@ -47,6 +47,7 @@ import {
   readAllowanceCache,
   readChainSyncStatus,
   readPolicyCache,
+  readPolicyCacheResult,
   readProposal,
   readProposalPayload,
   readReceiptCache,
@@ -672,6 +673,41 @@ describe('verification caching', () => {
     expect(first?.policyHash).toBe(contracts.policy.policyHash);
   });
 
+  it('freezes what it validates, so a cached verdict cannot outlive the bytes', () => {
+    // The memo keys on object identity, which only means anything if identity
+    // implies the bytes are unchanged. Without the freeze, mutating a record
+    // in place after it validated kept the cache hit and had the altered
+    // contents reported as signed.
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    const held = readProposal(p.proposalId);
+    expect(held).not.toBeNull();
+    expect(Object.isFrozen(held)).toBe(true);
+    // Strict mode (ES modules) throws rather than failing silently.
+    expect(() => {
+      (held as unknown as { proposerSig: string }).proposerSig = 'tampered';
+    }).toThrow();
+    expect(readProposal(p.proposalId)?.proposerSig).toBe(p.proposerSig);
+  });
+
+  it('refuses a record too large to be worth checking, in constant time', () => {
+    // Capping array counts was not enough: every string field here is checked
+    // with isNonEmptyString and has no length limit, so ONE record with a huge
+    // string still dragged the encoder and hash across it before rejection.
+    const huge = 'x'.repeat(200_000);
+    const p = makeProposal();
+    doc.getMap('treasury').set(`proposal:${p.proposalId}`, { ...p, proposerPub: huge });
+    const t0 = performance.now();
+    expect(readProposal(p.proposalId)).toBeNull();
+    // The point is the early-out: the refusal costs the budget, not the
+    // record's own size. Generous bound so the assertion is about the
+    // algorithm rather than the machine it runs on.
+    expect(performance.now() - t0).toBeLessThan(100);
+    // An honest record of ordinary size is unaffected.
+    expect(putProposal(p)).toBe(true);
+    expect(readProposal(p.proposalId)).toEqual(p);
+  });
+
   it('refuses a policy too large to validate, at both put and read', () => {
     // The memo cannot save this one: every peer REWRITE is a new object and
     // so a fresh miss, and validating plus hashing 20,000 share classes was
@@ -692,6 +728,28 @@ describe('verification caching', () => {
     // The cap is far above anything real: the golden vector is well inside it.
     expect(putPolicyCache(policy)).toBe(true);
     expect(readPolicyCache()?.policy).toEqual(policy);
+  });
+
+  it('never reports a held-but-refused policy as an absent one', () => {
+    // The size cap is a local display decision, not a protocol rule, so a
+    // policy that is perfectly valid on the wire can trip it. Answering that
+    // with the same silence as a missing record would have the UI say "no
+    // company policy" about a policy the room is holding right now.
+    const policy = contracts.policy.value as CompanyTreasuryPolicy;
+    expect(readPolicyCacheResult().status).toBe('absent');
+    doc.getMap('treasury').set('policy', {
+      ...policy,
+      shareClasses: [{ ...policy.shareClasses[0], id: 'y'.repeat(200_000) }],
+    });
+    expect(readPolicyCacheResult().status).toBe('too-large');
+    doc.getMap('treasury').set('policy', { nonsense: true });
+    expect(readPolicyCacheResult().status).toBe('unreadable');
+    expect(putPolicyCache(policy)).toBe(true);
+    expect(readPolicyCacheResult().status).toBe('ok');
+    // All three non-ok states still read as "nothing usable" for callers that
+    // only want the policy, so the convenience form keeps its contract.
+    doc.getMap('treasury').set('policy', { nonsense: true });
+    expect(readPolicyCache()).toBeNull();
   });
 });
 

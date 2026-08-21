@@ -322,11 +322,20 @@ export function windowsView(
     trust: trustTag(
       registration || registrationConflicts || cachedConflicts ? 'unverified' : 'absent',
     ),
-    note: registration
-      ? 'The company policy is missing here, so this proposal’s clocks cannot be worked out.'
-      : registrationConflicts
-        ? 'The acceptance record held here describes a different proposal, so this one’s clocks cannot be worked out.'
-        : 'No acceptance record for this proposal is held in this room yet.',
+    // A rejected cached clock record is data too, and it is what raised the
+    // badge above NO DATA — so it belongs in the note. Left out, the last
+    // branch below would say "no acceptance record is held" while a record
+    // sits in the room, which is the absence-as-fact mistake again, and the
+    // badge and the sentence beside it would disagree.
+    note:
+      (registration
+        ? 'The company policy is missing here, so this proposal’s clocks cannot be worked out.'
+        : registrationConflicts
+          ? 'The acceptance record held here describes a different proposal, so this one’s clocks cannot be worked out.'
+          : 'No acceptance record for this proposal is held in this room yet.')
+      + (cachedConflicts
+        ? ' A copied set of clocks is held here as well, but it belongs to a different proposal or policy version.'
+        : ''),
   };
 }
 

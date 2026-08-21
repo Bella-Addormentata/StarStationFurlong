@@ -251,12 +251,101 @@ function put(key: string, value: unknown): boolean {
  */
 let verdicts = new WeakMap<object, boolean>();
 
+/**
+ * Is `value` small enough to be worth validating? Answered in CONSTANT time.
+ *
+ * Counting array lengths was not enough: every string field in these records
+ * is checked with isNonEmptyString and has no length limit, so one share class
+ * carrying a megabyte `id` — or one proposal with a huge `proposerPub` — still
+ * dragged the canonical encoder and the hash function across it before it
+ * could be rejected. A budget bounds counts and text together.
+ *
+ * The early-out is the whole point: the walk stops the moment the budget runs
+ * out, so an oversized record costs the budget rather than its own size. That
+ * is what makes the refusal cheap enough to sit on the repaint path. Iterated
+ * lazily (for…in, for…of) rather than through Object.entries, which would
+ * materialise an array as long as the object a peer chose to send.
+ */
+function withinBudget(value: unknown, budget: { left: number }): boolean {
+  if (budget.left <= 0) return false;
+  budget.left -= 1;
+  if (typeof value === 'string') {
+    budget.left -= value.length;
+    return budget.left >= 0;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (!withinBudget(item, budget)) return false;
+    }
+    return true;
+  }
+  if (typeof value === 'object' && value !== null) {
+    for (const key in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      budget.left -= key.length + 1;
+      if (budget.left < 0) return false;
+      if (!withinBudget((value as Record<string, unknown>)[key], budget)) return false;
+    }
+    return true;
+  }
+  return budget.left >= 0;
+}
+
+/**
+ * Roughly the character count a record may occupy before this cache refuses to
+ * look at it. Generous: the golden-vector policy is a few hundred characters
+ * and the largest record class here is nowhere near this.
+ */
+const RECORD_BUDGET = 64_000;
+
+/** Convenience wrapper: one budget per call, so callers cannot share state. */
+function smallEnough(value: unknown, budget = RECORD_BUDGET): boolean {
+  return withinBudget(value, { left: budget });
+}
+
+/**
+ * Freezes a record, and everything under it, before its verdict is cached.
+ *
+ * The memo keys on object identity, which is only sound if identity implies
+ * the bytes have not changed — and these are plain mutable objects that the
+ * read APIs hand out by reference. Without this, code that mutated a record
+ * in place after it validated (putProposal validates the very object it then
+ * stores, and its caller still holds the reference) would keep the cache hit
+ * and have altered contents reported as signed. Freezing makes the assumption
+ * true rather than merely assumed, and it protects callers from doing it by
+ * accident: these records are immutable by construction, since their id and
+ * signature cover the body.
+ *
+ * Shallow freezing would not do — a policy's board, share classes and rules
+ * are nested. The isFrozen early-out both prunes repeat work and terminates
+ * on a cyclic value.
+ */
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const key of Object.getOwnPropertyNames(value)) {
+    deepFreeze((value as Record<string, unknown>)[key]);
+  }
+  return value;
+}
+
 /** Memoizes a validator over a peer-written value. Non-objects skip the memo. */
 function cachedVerdict(value: unknown, compute: () => boolean): boolean {
   if (typeof value !== 'object' || value === null) return compute();
   const hit = verdicts.get(value);
   if (hit !== undefined) return hit;
-  const verdict = compute();
+  // Size first, and before the freeze: deepFreeze walks the whole value, so
+  // running it on an unbounded record would pay exactly the cost the size
+  // check exists to avoid. A record too large to be plausible is refused
+  // without the encoder, the hash or the freeze ever touching it — and the
+  // refusal is cached, so re-reading cannot re-charge it.
+  let verdict = false;
+  if (smallEnough(value)) {
+    // Frozen BEFORE the verdict is computed and stored, so there is no window
+    // in which a cached verdict describes bytes that can still change.
+    deepFreeze(value);
+    verdict = compute();
+  }
   verdicts.set(value, verdict);
   return verdict;
 }
@@ -497,10 +586,10 @@ export function listVotes(proposalId: string): TreasuryVote[] {
 export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
   if (!isCompanyTreasuryPolicy(policy)) return false;
   if (!onNet(policy.networkGenesisChallenge)) return false;
-  // Same cap the read applies. Refusing here too keeps put and read agreeing:
-  // a policy that put fine but read back null forever is the exact foot-gun
-  // the encodability probe below exists to avoid.
-  if (!withinDisplayCaps(policy)) return false;
+  // Same budget the read applies. Refusing here too keeps put and read
+  // agreeing: a policy that puts fine but reads back null forever is the exact
+  // foot-gun the encodability probe below exists to avoid.
+  if (!smallEnough(policy)) return false;
   // Encodability probe: a policy the canonical encoder rejects would put
   // fine but read back null forever — refuse it here instead.
   try {
@@ -516,6 +605,22 @@ export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
 }
 
 /**
+ * Why the policy cache has nothing usable — four different facts, kept apart.
+ *
+ *  'ok'          a policy is held and was checked here.
+ *  'absent'      no policy entry, or no readable cache at all.
+ *  'unreadable'  an entry is held but fails its shape, pin or encoding.
+ *  'too-large'   an entry is held and may well be valid on the wire; this
+ *                device simply refuses to spend the work to read it.
+ *
+ * The last two are held records. Reporting them as absence would tell a player
+ * "no company policy" about a policy sitting in the room they are standing in.
+ */
+export type PolicyCacheResult =
+  | { status: 'ok'; policy: CompanyTreasuryPolicy; policyHash: Hex32 }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+/**
  * The returned hash is recomputed here — compare it against the on-chain
  * commitment.
  *
@@ -528,18 +633,18 @@ export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
  *
  * The memo alone did not close the hole: every peer REWRITE is a new object,
  * so a peer rewriting the key in a loop pays that 627 ms afresh each repaint
- * and never hits the cache. `withinDisplayCaps` below is what bounds it.
+ * and never hits the cache. The size budget in readPolicyUncached is what
+ * bounds it.
  */
-let policyResults = new WeakMap<
-  object,
-  { result: { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null }
->();
+let policyResults = new WeakMap<object, { result: PolicyCacheResult }>();
 
-export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
+/** Full result, including WHY there is nothing to show. */
+export function readPolicyCacheResult(): PolicyCacheResult {
   const m = readMap();
-  if (!m) return null;
+  if (!m) return { status: 'absent' };
   const value = m.get('policy');
-  if (typeof value !== 'object' || value === null) return null;
+  if (value === undefined) return { status: 'absent' };
+  if (typeof value !== 'object' || value === null) return { status: 'unreadable' };
   const hit = policyResults.get(value);
   if (hit) return hit.result;
   const result = readPolicyUncached(value);
@@ -547,46 +652,34 @@ export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: 
   return result;
 }
 
-/**
- * The largest collections this cache will validate, hash, or hand to the UI.
- *
- * Not a protocol rule — the record schema has no size limit, and adding one
- * is a change the Rust side must match. This is the browser refusing to do
- * unbounded work on a peer's say-so: a policy carries three unbounded arrays,
- * and validating plus hashing one holding 20,000 share classes measured
- * 627 ms on the repaint path. Counting lengths first costs nothing and turns
- * that into an immediate refusal.
- *
- * Set far above anything a real company would use — the golden-vector policy
- * has 3 signers, 1 share class and 2 modules — so this rejects only records
- * that are already implausible. A policy over the cap is treated exactly like
- * any other invalid cache entry: read as null, and the UI reports the policy
- * as unavailable rather than rendering half of it.
- */
-const DISPLAY_CAP = 256;
-
-function withinDisplayCaps(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false;
-  const p = value as Record<string, unknown>;
-  const board = p.board as Record<string, unknown> | undefined;
-  const under = (v: unknown): boolean => !Array.isArray(v) || v.length <= DISPLAY_CAP;
-  return under(board?.signerPuzzleHashes)
-    && under(p.shareClasses)
-    && under(p.approvalModuleHashes);
+/** The usable policy, or null. Callers needing the reason use the result form. */
+export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
+  const result = readPolicyCacheResult();
+  // The memoized result object itself, never a copy. Copying would hand back
+  // a different object on every call and quietly undo the stable identity the
+  // memo exists to give; the extra `status` field costs a caller nothing.
+  return result.status === 'ok' ? result : null;
 }
 
-function readPolicyUncached(
-  value: unknown,
-): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
-  // Cheap length checks BEFORE the full structural walk, which is the whole
-  // point — running them afterwards would already have paid the cost.
-  if (!withinDisplayCaps(value)) return null;
-  if (!isCompanyTreasuryPolicy(value)) return null;
-  if (!onNet(value.networkGenesisChallenge)) return null;
+function readPolicyUncached(value: unknown): PolicyCacheResult {
+  // Size first, and before the freeze — same order and same reason as
+  // cachedVerdict. Running the structural walk or the hash first would pay
+  // exactly the cost this check exists to avoid.
+  //
+  // "Too large" is reported as its OWN state, not folded into unreadable.
+  // This cap is a local display decision rather than a protocol rule, so a
+  // record that is perfectly valid on the wire can fail it — and answering
+  // that with the same silence as a missing record would have the UI say "no
+  // company policy" about a policy this room is holding right now. That is
+  // the absence-as-fact mistake the rest of the module refuses to make.
+  if (!smallEnough(value)) return { status: 'too-large' };
+  deepFreeze(value);
+  if (!isCompanyTreasuryPolicy(value)) return { status: 'unreadable' };
+  if (!onNet(value.networkGenesisChallenge)) return { status: 'unreadable' };
   try {
-    return { policy: value, policyHash: policyHashOf(value) };
+    return { status: 'ok', policy: value, policyHash: policyHashOf(value) };
   } catch {
-    return null; // unencodable strings — treat as an invalid cache entry
+    return { status: 'unreadable' }; // unencodable strings
   }
 }
 

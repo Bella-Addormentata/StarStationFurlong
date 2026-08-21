@@ -344,6 +344,27 @@ describe('records must claim the proposal they are filed under', () => {
     expect(empty.trust.level).toBe('absent');
   });
 
+  it('names a rejected CACHED clock record too, not just a rejected acceptance', () => {
+    // A mismatched cached record is what lifts the badge off NO DATA, so
+    // leaving it out of the note had the badge and the sentence beside it
+    // disagree — and the "nothing is held" wording denied a record sitting in
+    // the room. Every branch that can carry one has to mention it.
+    const wrongCache = {
+      ...windows,
+      proposalId: 'f'.repeat(64),
+    } as ProposalWindows;
+    const alone = windowsView(proposal, null, null, wrongCache);
+    expect(alone.trust.level).toBe('unverified');
+    expect(alone.note).toMatch(/different proposal or policy version/i);
+    // Still true when a usable acceptance record is held but no policy is.
+    const withRegistration = windowsView(proposal, registration, null, wrongCache);
+    expect(withRegistration.note).toMatch(/company policy is missing/i);
+    expect(withRegistration.note).toMatch(/different proposal or policy version/i);
+    // And nothing is invented when no cached record was rejected.
+    expect(windowsView(proposal, registration, null, null).note)
+      .not.toMatch(/different proposal or policy version/i);
+  });
+
   it('marks unusable-but-present inputs unverified rather than absent', () => {
     const bad = { ...registration, acceptedHeight: Number.MAX_SAFE_INTEGER } as ProposalRegistration;
     const v = windowsView(proposal, bad, rule, null);
