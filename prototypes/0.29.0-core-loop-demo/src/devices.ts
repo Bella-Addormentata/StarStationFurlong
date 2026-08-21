@@ -496,7 +496,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       const funding = roomFundingView(
         bindingResult?.status === 'ok' ? bindingResult.binding : null,
         height,
-        bindingResult?.status === 'too-large' ? 'too-large' : access,
+        // Every held-but-unusable state travels — see main.ts.
+        bindingResult && bindingResult.status !== 'ok' && bindingResult.status !== 'absent'
+          ? bindingResult.status
+          : access,
       );
       // No record is NOT the same fact as "funded personally", and an
       // unreachable room document is a third state again — say which one.
@@ -740,20 +743,20 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         <div id="device-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
         <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
           <div style="font-size:10px; color:${TREASURY_MUTED}; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
-          <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:#F0C060;">PERSONAL</div>
+          <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:${TREASURY_MUTED};">READING FUNDING RECORDS…</div>
           <div id="device-terminal-funding-detail" style="font-size:9px; color:${TREASURY_MUTED}; margin-top:3px; line-height:1.5;"></div>
           <!-- Disabled controls leave the tab order, so the reason they are
                disabled cannot live only in their title attributes. -->
           <div id="device-terminal-command-note" style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:6px;">These actions are not available yet — they arrive with the treasury and node lanes. This terminal never spends.</div>
           <div role="group" aria-label="Funding commands, all currently unavailable" aria-describedby="device-terminal-command-note" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">
             <button type="button" disabled title="Arrives with the treasury lane — the terminal cannot spend."
-              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
             <button type="button" disabled title="Arrives with the treasury lane."
-              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">SELECT PROFILE</button>
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">SELECT PROFILE</button>
             <button type="button" disabled title="Arrives with the treasury lane."
-              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">UNBIND</button>
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">UNBIND</button>
             <button type="button" disabled title="Asks this player's own node for chain state — that lane has not shipped."
-              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:#4A5560; cursor:not-allowed;">REFRESH PROOF</button>
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REFRESH PROOF</button>
           </div>
           <button type="button" id="device-terminal-open-treasury"
             style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>

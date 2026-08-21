@@ -556,10 +556,15 @@ export function scanVotes(
   maxChecks: number,
 ): BoundedScan<TreasuryVote> {
   const prefix = `vote:${proposalId}:`;
-  return scanPrefixed(prefix, maxEntries, maxChecks, (key, value) =>
-    validVote(value) && key === `vote:${value.proposalId}:${value.voterGamePub}`
-      ? value
-      : null,
+  return scanPrefixed(
+    prefix,
+    maxEntries,
+    maxChecks,
+    (key, value) =>
+      validVote(value) && key === `vote:${value.proposalId}:${value.voterGamePub}`
+        ? value
+        : null,
+    voteVerdict,
   );
 }
 
@@ -569,11 +574,16 @@ export function scanCheckpoints(
   maxChecks: number,
 ): BoundedScan<TreasuryCheckpoint> {
   const prefix = `checkpoint:${proposalId}:`;
-  return scanPrefixed(prefix, maxEntries, maxChecks, (key, value) =>
-    validCheckpoint(value) &&
-    key === `checkpoint:${value.proposalId}:${value.checkpointId}`
-      ? value
-      : null,
+  return scanPrefixed(
+    prefix,
+    maxEntries,
+    maxChecks,
+    (key, value) =>
+      validCheckpoint(value) &&
+      key === `checkpoint:${value.proposalId}:${value.checkpointId}`
+        ? value
+        : null,
+    checkpointVerdict,
   );
 }
 
@@ -582,7 +592,12 @@ export function scanCheckpoints(
 // ---------------------------------------------------------------------------
 
 function validVote(value: unknown): value is TreasuryVote {
-  return cachedVerdict('vote', value, () => validVoteUncached(value)) === 'ok';
+  return voteVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function voteVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict('vote', value, () => validVoteUncached(value));
 }
 
 function validVoteUncached(value: unknown): value is TreasuryVote {
@@ -659,12 +674,17 @@ export function listVotes(proposalId: string): TreasuryVote[] {
 // ---------------------------------------------------------------------------
 
 export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
+  // Size FIRST, exactly as the read path does it. Behind the structural
+  // guard this bounded nothing: isCompanyTreasuryPolicy walks and
+  // deduplicates every signer, class and module before returning, so the put
+  // path still paid an arbitrary cost to reject an arbitrary policy.
+  //
+  // Refusing the same sizes the read refuses also keeps the two agreeing: a
+  // policy that puts fine but reads back null forever is the exact foot-gun
+  // the encodability probe below exists to avoid.
+  if (!smallEnough(policy)) return false;
   if (!isCompanyTreasuryPolicy(policy)) return false;
   if (!onNet(policy.networkGenesisChallenge)) return false;
-  // Same budget the read applies. Refusing here too keeps put and read
-  // agreeing: a policy that puts fine but reads back null forever is the exact
-  // foot-gun the encodability probe below exists to avoid.
-  if (!smallEnough(policy)) return false;
   // Encodability probe: a policy the canonical encoder rejects would put
   // fine but read back null forever — refuse it here instead.
   try {
@@ -786,11 +806,31 @@ export function putRegistration(registration: ProposalRegistration): boolean {
   return put(`registration:${registration.proposalId}`, registration);
 }
 
-export function readRegistration(proposalId: string): ProposalRegistration | null {
+/**
+ * An acceptance record, or why there is none.
+ *
+ * windowsView goes to some trouble to report a MISMATCHED record as a
+ * conflict rather than as absence — but a record that fails its shape guard,
+ * or that sits under a key it does not claim, never reached it: this reader
+ * flattened both to null and the screen said "no acceptance record is held".
+ */
+export type RegistrationResult =
+  | { status: 'ok'; registration: ProposalRegistration }
+  | { status: 'absent' | 'unreadable' };
+
+export function readRegistrationResult(proposalId: string): RegistrationResult {
   const m = readMap();
-  if (!m) return null;
+  if (!m) return { status: 'absent' };
   const value = m.get(`registration:${proposalId}`);
-  return isProposalRegistration(value) && value.proposalId === proposalId ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  return isProposalRegistration(value) && value.proposalId === proposalId
+    ? { status: 'ok', registration: value }
+    : { status: 'unreadable' };
+}
+
+export function readRegistration(proposalId: string): ProposalRegistration | null {
+  const result = readRegistrationResult(proposalId);
+  return result.status === 'ok' ? result.registration : null;
 }
 
 export function putWindowsCache(windows: ProposalWindows): boolean {
@@ -814,7 +854,12 @@ export function readWindowsCache(proposalId: string): ProposalWindows | null {
 // ---------------------------------------------------------------------------
 
 function validCheckpoint(value: unknown): value is TreasuryCheckpoint {
-  return cachedVerdict('checkpoint', value, () => validCheckpointUncached(value)) === 'ok';
+  return checkpointVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function checkpointVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict('checkpoint', value, () => validCheckpointUncached(value));
 }
 
 function validCheckpointUncached(value: unknown): value is TreasuryCheckpoint {
@@ -875,15 +920,22 @@ function validSessionShell(value: unknown, proposalId: string, sessionId: string
   // distinctness check, so leaving it outside meant a peer-written shell with
   // a huge signature array was walked in full on every repaint — before the
   // size budget could refuse it, and without the memo ever saving a repeat.
-  if (cachedVerdict('session', value, () => isSigningSession(value) && selfConsistentSession(value)) !== 'ok') {
-    return false;
-  }
+  if (sessionShellVerdict(value) !== 'ok') return false;
   // Only the caller-dependent slot checks stay outside. They compare the
   // record against the caller's arguments rather than judging the record, so
   // caching their result against the object would let a mismatched lookup
   // poison the verdict for the matching one.
   const session = value as SigningSession;
   return session.proposalId === proposalId && session.sessionId === sessionId;
+}
+
+/** The full answer for a shell, including a local size refusal. */
+function sessionShellVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict(
+    'session',
+    value,
+    () => isSigningSession(value) && selfConsistentSession(value),
+  );
 }
 
 /** The arg-independent half: on-net, and the shell hashes to its own id. */
@@ -898,6 +950,12 @@ function selfConsistentSession(value: unknown): boolean {
 }
 
 export function putSigningSession(session: SigningSession): boolean {
+  // Size FIRST, like every other put. isSigningSession walks collectedSigs and
+  // allocates for its distinctness check, so behind it this bounded nothing —
+  // and the READ side does bound the shell, so without this a session could
+  // write fine and then read back 'too-large' forever, which is the put/read
+  // disagreement putPolicyCache warns about.
+  if (!smallEnough(session)) return false;
   if (!isSigningSession(session)) return false;
   if (!onNet(session.networkGenesisChallenge)) return false;
   try {
@@ -978,6 +1036,10 @@ export function scanSigningSessions(
         break;
       }
       checked += 1;
+      // Counted, not just skipped: a shell refused on size is a record this
+      // room holds, so leaving it out silently would report "no open round"
+      // about a round that exists.
+      if (sessionShellVerdict(value) === 'too-large') refusedTooLarge += 1;
       const sessionId = key.slice(shellPrefix.length);
       if (validSessionShell(value, proposalId, sessionId)) {
         shells.push({ sessionId, shell: value });
@@ -1110,17 +1172,33 @@ export function putProposalPayload(payloadHex: string): boolean {
   return put(`payload:${hash}`, payloadHex);
 }
 
-export function readProposalPayload(payloadHash: string): string | null {
+/** Payload bytes, or why there are none — same four states as the others. */
+export type PayloadResult =
+  | { status: 'ok'; hex: string }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+export function readProposalPayloadResult(payloadHash: string): PayloadResult {
   const m = readMap();
-  if (!m) return null;
-  if (!isHex32(payloadHash)) return null;
+  if (!m) return { status: 'absent' };
+  if (!isHex32(payloadHash)) return { status: 'absent' };
   const value = m.get(`payload:${payloadHash}`);
-  if (typeof value !== 'string' || value.length > PAYLOAD_MAX_HEX) return null;
+  if (value === undefined) return { status: 'absent' };
+  if (typeof value !== 'string') return { status: 'unreadable' };
+  // Over the cap is this device's own refusal — the payload may be perfectly
+  // good — so it is reported apart from a payload nobody here holds.
+  if (value.length > PAYLOAD_MAX_HEX) return { status: 'too-large' };
   try {
-    return payloadHashOf(value) === payloadHash ? value : null;
+    return payloadHashOf(value) === payloadHash
+      ? { status: 'ok', hex: value }
+      : { status: 'unreadable' };
   } catch {
-    return null;
+    return { status: 'unreadable' };
   }
+}
+
+export function readProposalPayload(payloadHash: string): string | null {
+  const result = readProposalPayloadResult(payloadHash);
+  return result.status === 'ok' ? result.hex : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,9 +1210,24 @@ export function putChainSyncStatus(status: ChainSyncStatus): boolean {
   return put('sync', status);
 }
 
-export function readChainSyncStatus(): ChainSyncStatus | null {
+/** A peer's chain-view claim, or why there is none. */
+export type ChainSyncResult =
+  | { status: 'ok'; sync: ChainSyncStatus }
+  | { status: 'absent' | 'unreadable' };
+
+export function readChainSyncStatusResult(): ChainSyncResult {
   const m = readMap();
-  if (!m) return null;
+  if (!m) return { status: 'absent' };
   const value = m.get('sync');
-  return isChainSyncStatus(value) ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  // Held but malformed is not "nobody has said anything" — somebody wrote
+  // here, and what they wrote could not be read.
+  return isChainSyncStatus(value)
+    ? { status: 'ok', sync: value }
+    : { status: 'unreadable' };
+}
+
+export function readChainSyncStatus(): ChainSyncStatus | null {
+  const result = readChainSyncStatusResult();
+  return result.status === 'ok' ? result.sync : null;
 }

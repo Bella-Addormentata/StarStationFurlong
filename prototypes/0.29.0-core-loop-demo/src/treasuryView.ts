@@ -251,12 +251,6 @@ export interface WindowsView {
 }
 
 /**
- * Recomputes a proposal's clocks rather than trusting the cached copy. Even a
- * clean recomputation only proves internal consistency: the registration it
- * derives from is an unverified cache entry until the node confirms the
- * registration on chain, which is why the trust tag never says "signed".
- */
-/**
  * Records that claim to belong to a proposal but describe a different one.
  * The cache keys registrations and cached windows by proposal id alone, so a
  * peer can file one whose kind or policy revision disagrees with the proposal
@@ -280,11 +274,25 @@ function cachedWindowsMatch(
     && cached.policyVersion === proposal.policyVersion;
 }
 
+/**
+ * Recomputes a proposal's clocks rather than trusting the cached copy. Even a
+ * clean recomputation only proves internal consistency: the registration it
+ * derives from is an unverified cache entry until the node confirms the
+ * registration on chain, which is why the trust tag never says "signed".
+ */
 export function windowsView(
   proposal: TreasuryProposal,
   registrationRaw: ProposalRegistration | null,
   rule: GovernanceKindRule | null,
   cachedRaw: ProposalWindows | null,
+  /**
+   * True when the room HOLDS an acceptance record that the reader could not
+   * return — wrong shape, or filed under a key it does not claim. The reader
+   * used to flatten that to null alongside a genuinely empty slot, so this
+   * function's careful conflict reporting never saw it and the screen said
+   * "no acceptance record is held" about a record sitting in the room.
+   */
+  registrationUnreadable = false,
 ): WindowsView {
   const registration =
     registrationRaw && registrationMatches(registrationRaw, proposal)
@@ -295,11 +303,14 @@ export function windowsView(
   // A record that was held but rejected is not the same as no record, and
   // saying "none is held" would quietly turn a conflicting peer write into
   // an absence.
-  const registrationConflicts = registrationRaw !== null && registration === null;
+  const registrationConflicts =
+    (registrationRaw !== null && registration === null) || registrationUnreadable;
   const cachedConflicts = cachedRaw !== null && cached === null;
-  const missingRegistrationNote = registrationConflicts
-    ? 'an acceptance record is held here but it describes a different proposal'
-    : 'no acceptance record is held here';
+  const missingRegistrationNote = registrationUnreadable && registrationRaw === null
+    ? 'an acceptance record is held here but this device cannot make sense of it'
+    : registrationConflicts
+      ? 'an acceptance record is held here but it describes a different proposal'
+      : 'no acceptance record is held here';
   if (registration && rule) {
     try {
       return {
@@ -351,9 +362,11 @@ export function windowsView(
     note:
       (registration
         ? 'The company policy is missing here, so this proposal’s clocks cannot be worked out.'
-        : registrationConflicts
-          ? 'The acceptance record held here describes a different proposal, so this one’s clocks cannot be worked out.'
-          : 'No acceptance record for this proposal is held in this room yet.')
+        : registrationUnreadable && registrationRaw === null
+          ? 'An acceptance record is held here, but this device cannot make sense of it, so this proposal’s clocks cannot be worked out.'
+          : registrationConflicts
+            ? 'The acceptance record held here describes a different proposal, so this one’s clocks cannot be worked out.'
+            : 'No acceptance record for this proposal is held in this room yet.')
       + (cachedConflicts
         ? ' A copied set of clocks is held here as well, but it belongs to a different proposal or policy version.'
         : ''),
@@ -539,6 +552,12 @@ export function syncView(
   peer: ChainSyncStatus | null,
   /** False when no lookup was attempted (no network pinned, or no room). */
   readable = true,
+  /**
+   * True when an entry IS held under the sync key but could not be read.
+   * Without it, "a player wrote something unreadable here" and "nobody has
+   * written anything" both came out as NO DATA.
+   */
+  held = false,
 ): SyncView {
   if (!readable) {
     return {
@@ -561,7 +580,18 @@ export function syncView(
     peerClaim: peer ? peer.state : null,
     peerHeight: peer && typeof peer.verifiedHeight === 'number' ? peer.verifiedHeight : null,
     readable: true,
-    trust: trustTag(peer ? 'unverified' : 'absent'),
+    // A held-but-unreadable entry is somebody having written here, which is
+    // not "nobody has said anything". Same distinction the funding and policy
+    // panels make; the sync slot had it collapsed.
+    trust: peer
+      ? trustTag('unverified')
+      : held
+        ? {
+            ...trustTag('unverified'),
+            label: 'UNREAD',
+            detail: 'A player wrote a chain-view claim here, but this device could not make sense of it.',
+          }
+        : trustTag('absent'),
   };
 }
 
@@ -666,8 +696,16 @@ export function shareClassViews(
  *  'too-large'   a binding IS held, and this device refused to read it on
  *                size alone. A local decision, so it is reported as a refusal
  *                rather than as no record.
+ *  'unreadable'  a binding IS held and cannot be made sense of — wrong shape,
+ *                wrong network, or a broken signature. Still a held record,
+ *                so still not the same as there being none.
  */
-export type FundingReadAccess = 'readable' | 'no-network' | 'no-room' | 'too-large';
+export type FundingReadAccess =
+  | 'readable'
+  | 'no-network'
+  | 'no-room'
+  | 'too-large'
+  | 'unreadable';
 
 export interface RoomFundingView {
   bound: boolean;
@@ -740,23 +778,38 @@ export function roomFundingView(
       policyVersion: null,
       boundAtHeight: null,
       expiresAfterHeight: null,
-      // Same badge level, but the default "nothing cached yet" wording would
-      // put the very absence claim back in the tooltip that the headline is
-      // careful to avoid.
-      trust: {
-        ...trustTag('absent'),
-        detail: 'No lookup was possible, so nothing is known either way.',
-      },
+      // The badge has to agree with the headline beside it. Two of these
+      // states mean a record IS held — this device just would not or could
+      // not read it — so NO DATA / "nothing cached yet" would flatly
+      // contradict a headline that says a record is here.
+      trust:
+        access === 'too-large' || access === 'unreadable'
+          ? {
+              ...trustTag('unverified'),
+              label: 'UNREAD',
+              detail:
+                access === 'too-large'
+                  ? 'A record is held here, but this device would not read it: it is larger than this device is willing to process.'
+                  : 'A record is held here, but this device could not make sense of it.',
+            }
+          : {
+              ...trustTag('absent'),
+              detail: 'No lookup was possible, so nothing is known either way.',
+            },
       headline:
         access === 'too-large'
           ? 'Funding record too large to read'
-          : 'Funding records unavailable',
+          : access === 'unreadable'
+            ? 'Funding record cannot be read'
+            : 'Funding records unavailable',
       detail:
         access === 'no-network'
           ? 'No company network is set up for this build, so this device cannot read company records at all. Nothing here is a fault in this room.'
           : access === 'too-large'
             ? 'This room is holding a company funding record, but it is too large for this device to read. That is this device’s limit, not a fault in the record — and it is not the same as there being no record.'
-            : 'This device is not attached to a room’s records, so it cannot say how this room is funded either way.',
+            : access === 'unreadable'
+              ? 'This room is holding a company funding record, but this device cannot make sense of it — wrong shape, wrong network, or a broken signature. Something is here; what it says is unknown.'
+              : 'This device is not attached to a room’s records, so it cannot say how this room is funded either way.',
       readOnlyNote,
       unavailable,
     };
@@ -915,13 +968,6 @@ export function proposalRows(
 }
 
 /**
- * The governance rule that actually governs a proposal, or null. The rule is
- * only used when the cached policy is the SAME company and the SAME policy
- * version the proposal was made under — otherwise the clocks it produces
- * describe a different rulebook than the one the proposal answers to, while
- * looking authoritative.
- */
-/**
  * The approval rounds that actually belong to a proposal. Rounds are
  * peer-writable and only keyed by proposal id in the cache, so one opened
  * under a different company or a different policy revision would otherwise be
@@ -971,6 +1017,13 @@ export function boardThresholdFor(
   return policy.board.threshold;
 }
 
+/**
+ * The governance rule that actually governs a proposal, or null. The rule is
+ * only used when the cached policy is the SAME company and the SAME policy
+ * version the proposal was made under — otherwise the clocks it produces
+ * describe a different rulebook than the one the proposal answers to, while
+ * looking authoritative.
+ */
 export function governanceRuleFor(
   proposal: TreasuryProposal,
   policy: CompanyTreasuryPolicy | null,
@@ -999,20 +1052,48 @@ export interface PayloadView {
  * holds the referenced details or does not — dumping raw hex at a player
  * teaches them nothing and reads as chain jargon the phone is meant to avoid.
  */
-export function payloadView(present: boolean): PayloadView {
-  return present
-    ? {
-        present: true,
-        trust: trustTag('self-checked'),
-        headline: 'Details held in this room',
-        detail: 'The full details behind this proposal are stored here and match the fingerprint it commits to. They are not readable in the phone yet.',
-      }
-    : {
-        present: false,
-        trust: trustTag('absent'),
-        headline: 'Details not held here',
-        detail: 'This room does not have the details behind this proposal, so what it would do cannot be shown.',
-      };
+export function payloadView(
+  /**
+   * Four states, not a boolean. 'too-large' and 'unreadable' both mean the
+   * room HOLDS the details — this device just would not or could not read
+   * them — so reporting either as "not held here" would deny what is there.
+   */
+  status: 'ok' | 'absent' | 'unreadable' | 'too-large',
+): PayloadView {
+  if (status === 'ok') {
+    return {
+      present: true,
+      trust: trustTag('self-checked'),
+      headline: 'Details held in this room',
+      detail: 'The full details behind this proposal are stored here and match the fingerprint it commits to. They are not readable in the phone yet.',
+    };
+  }
+  if (status === 'absent') {
+    return {
+      present: false,
+      trust: trustTag('absent'),
+      headline: 'Details not held here',
+      detail: 'This room does not have the details behind this proposal, so what it would do cannot be shown.',
+    };
+  }
+  return {
+    present: false,
+    // Held, so not NO DATA — the badge has to agree with the headline.
+    trust: {
+      ...trustTag('unverified'),
+      label: 'UNREAD',
+      detail:
+        status === 'too-large'
+          ? 'The details are held here, but this device would not read them: they are larger than it is willing to process.'
+          : 'The details are held here, but they do not match the fingerprint this proposal commits to.',
+    },
+    headline:
+      status === 'too-large' ? 'Details too large to read' : 'Details do not match',
+    detail:
+      status === 'too-large'
+        ? 'This room is holding the details behind this proposal, but they are larger than this device will read. That is this device’s limit, not a fault in the record.'
+        : 'This room is holding something under this proposal’s details, but it does not match the fingerprint the proposal commits to — so it is not shown.',
+  };
 }
 
 export interface CompanyScope {

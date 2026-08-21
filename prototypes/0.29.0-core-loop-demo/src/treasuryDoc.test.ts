@@ -46,12 +46,15 @@ import {
   putWindowsCache,
   readAllowanceCache,
   readChainSyncStatus,
+  readChainSyncStatusResult,
   readPolicyCache,
   readPolicyCacheResult,
   readProposal,
   readProposalPayload,
+  readProposalPayloadResult,
   readReceiptCache,
   readRegistration,
+  readRegistrationResult,
   readRoomBinding,
   readRoomBindingResult,
   scanProposals,
@@ -744,6 +747,64 @@ describe('verification caching', () => {
     // An EMPTY typed array does not throw on freeze, so cover both shapes.
     m.set(`proposal:${'9'.repeat(64)}`, new Uint8Array());
     expect(() => listProposals()).not.toThrow();
+  });
+
+  it('keeps held-but-unusable apart from absent in every reader', () => {
+    // One rule, applied everywhere rather than in the slot that happened to
+    // be reviewed: a record the room HOLDS is never reported as one that does
+    // not exist, whatever made it unusable.
+    const m = doc.getMap('treasury');
+    const id = 'c'.repeat(64);
+    // Registrations: a record filed under a key it does not claim.
+    expect(readRegistrationResult(id).status).toBe('absent');
+    m.set(`registration:${id}`, { nonsense: true });
+    expect(readRegistrationResult(id).status).toBe('unreadable');
+    // Payloads: absent, mismatched fingerprint, and over the local cap.
+    const hash = '4'.repeat(64);
+    expect(readProposalPayloadResult(hash).status).toBe('absent');
+    m.set(`payload:${hash}`, 'ab'.repeat(8));
+    expect(readProposalPayloadResult(hash).status).toBe('unreadable');
+    m.set(`payload:${hash}`, 'a'.repeat(600 * 1024));
+    expect(readProposalPayloadResult(hash).status).toBe('too-large');
+    // Sync: somebody wrote here, and it could not be read.
+    expect(readChainSyncStatusResult().status).toBe('absent');
+    m.set('sync', { v: 1, state: 'bogus' });
+    expect(readChainSyncStatusResult().status).toBe('unreadable');
+    expect(putChainSyncStatus({ v: 1, state: 'verified', verifiedHeight: 7 })).toBe(true);
+    expect(readChainSyncStatusResult().status).toBe('ok');
+    // The plain readers keep their old contract for callers that only want
+    // the value, so nothing had to change at the call sites that do.
+    expect(readRegistration(id)).toBeNull();
+    expect(readProposalPayload(hash)).toBeNull();
+  });
+
+  it('bounds the signing-session put like every other put', () => {
+    // isSigningSession walks collectedSigs and allocates for its distinctness
+    // check, so behind it a size guard bounds nothing — and the READ side does
+    // bound the shell, so an unbounded put could write a session that then
+    // read back as too-large forever.
+    const shell = {
+      v: 1 as const,
+      networkGenesisChallenge: GENESIS,
+      companyId: 'b'.repeat(64),
+      policyVersion: 1,
+      proposalId: 'd'.repeat(64),
+      bundleHash: '7'.repeat(64),
+      requiredThreshold: 2,
+      expiresAfterHeight: 900,
+    };
+    const huge: SigningSession = {
+      ...shell,
+      sessionId: signingSessionIdOf(shell),
+      collectedSigs: Array.from({ length: 400 }, (_unused, i) => ({
+        signerPuzzleHash: i.toString(16).padStart(64, '0'),
+        sig: 'z'.repeat(400),
+      })),
+    };
+    expect(putSigningSession(huge)).toBe(false);
+    // An ordinary session is unaffected.
+    const ok: SigningSession = { ...shell, sessionId: signingSessionIdOf(shell), collectedSigs: [] };
+    expect(putSigningSession(ok)).toBe(true);
   });
 
   it('reports a record refused on size as refused, not as absent', () => {

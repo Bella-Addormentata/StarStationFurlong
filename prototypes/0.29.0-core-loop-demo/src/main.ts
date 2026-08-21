@@ -46,11 +46,11 @@ import {
 } from "./keypair";
 import {
   bindTreasuryDoc,
-  readChainSyncStatus,
+  readChainSyncStatusResult,
   readPolicyCacheResult,
   readProposal,
-  readProposalPayload,
-  readRegistration,
+  readProposalPayloadResult,
+  readRegistrationResult,
   readRoomBinding,
   readRoomBindingResult,
   readWindowsCache,
@@ -3039,8 +3039,15 @@ function paintTreasuryBody(view: HTMLElement): void {
   // the call site instead of only in the reader.
   const cacheReadable = bound && net.configured;
   // Read once and feed both models from that value.
-  const peerSync = cacheReadable ? readChainSyncStatus() : null;
-  const sync = syncView(peerSync, cacheReadable);
+  const syncResult = cacheReadable ? readChainSyncStatusResult() : null;
+  const peerSync = syncResult?.status === "ok" ? syncResult.sync : null;
+  // An entry a player wrote but this device cannot read is not the same as
+  // nobody having written one — the badge has to be able to say which.
+  const sync = syncView(
+    peerSync,
+    cacheReadable,
+    syncResult?.status === "unreadable",
+  );
   const { height, source: heightSource } = displayHeight(peerSync);
   // The result form, not the plain read: "held but this device declined to
   // read it" and "held but unreadable" are held records, and reporting either
@@ -3116,7 +3123,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       )}`;
       return;
     }
-    const registration = readRegistration(proposal.proposalId);
+    const registrationResult = readRegistrationResult(proposal.proposalId);
     // Only a policy for the SAME company and version governs this proposal.
     const rule = governanceRuleFor(proposal, policyCache?.policy ?? null);
     // A same-company policy at a DIFFERENT revision is why clocks and the
@@ -3128,9 +3135,12 @@ function paintTreasuryBody(view: HTMLElement): void {
         : null;
     const w = windowsView(
       proposal,
-      registration,
+      registrationResult.status === "ok" ? registrationResult.registration : null,
       rule,
       readWindowsCache(proposal.proposalId),
+      // A record the room holds but the reader could not return is a conflict,
+      // not an absence — windowsView cannot tell without being told.
+      registrationResult.status === "unreadable",
     );
     // Bounded reads: votes, vote records and approval rounds all sit in
     // peer-writable slots that nothing prunes, and this screen repaints on
@@ -3159,7 +3169,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       height,
     );
     const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
-    const payload = payloadView(readProposalPayload(proposal.payloadHash) !== null);
+    const payload = payloadView(readProposalPayloadResult(proposal.payloadHash).status);
 
     view.innerHTML = `${verdictBanner}${back}
       <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:8px;">
@@ -3234,9 +3244,11 @@ function paintTreasuryBody(view: HTMLElement): void {
       }
       ${dim(esc(approvals.note))}
       ${
-        sessionScan.truncated
+        sessionScan.truncated || sessionScan.refusedTooLarge > 0
           ? dim(
-              "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
+              sessionScan.refusedTooLarge > 0
+                ? `${sessionScan.refusedTooLarge} approval round${sessionScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${sessionScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted above. That is this device's limit, not a fault in the records.`
+                : "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
             )
           : ""
       }
@@ -3259,7 +3271,12 @@ function paintTreasuryBody(view: HTMLElement): void {
   const binding = roomFundingView(
     bindingResult?.status === "ok" ? bindingResult.binding : null,
     height,
-    bindingResult?.status === "too-large" ? "too-large" : access,
+    // Every held-but-unusable state travels, not just the size refusal: a
+    // binding this room HAS but this device will not or cannot read is never
+    // reported as there being none.
+    bindingResult && bindingResult.status !== "ok" && bindingResult.status !== "absent"
+      ? bindingResult.status
+      : access,
   );
   const balances = balanceView();
   const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
@@ -3282,7 +3299,10 @@ function paintTreasuryBody(view: HTMLElement): void {
     (p) =>
       windowsView(
         p,
-        readRegistration(p.proposalId),
+        (() => {
+          const r = readRegistrationResult(p.proposalId);
+          return r.status === "ok" ? r.registration : null;
+        })(),
         governanceRuleFor(p, policyCache?.policy ?? null),
         readWindowsCache(p.proposalId),
       ),

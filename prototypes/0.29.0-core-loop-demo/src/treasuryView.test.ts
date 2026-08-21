@@ -503,19 +503,37 @@ describe('scoping and staleness', () => {
 
 describe('payload view', () => {
   it('describes whether the details are held, without dumping raw data', () => {
-    const held = payloadView(true);
+    const held = payloadView('ok');
     expect(held.present).toBe(true);
     expect(held.headline).toMatch(/held in this room/i);
     // The cache only returns payload bytes whose hash it recomputed, so this
     // is the one genuinely self-checked panel — and it must say so.
     expect(held.trust.level).toBe('self-checked');
-    const missing = payloadView(false);
+    const missing = payloadView('absent');
     expect(missing.present).toBe(false);
     expect(missing.trust.level).toBe('absent');
     expect(missing.detail).toMatch(/cannot be shown/i);
     for (const s of [held.headline, held.detail, missing.headline, missing.detail]) {
       expect(s).not.toMatch(/[0-9a-f]{16,}/); // never raw hex at the player
     }
+  });
+
+  it('does not report details the room HOLDS as details it lacks', () => {
+    // A payload over the local size cap, or one that fails its fingerprint,
+    // is still something the room is holding. Both used to arrive as the same
+    // null as an empty slot and render "Details not held here" with NO DATA.
+    for (const status of ['too-large', 'unreadable'] as const) {
+      const v = payloadView(status);
+      expect(v.present).toBe(false);
+      expect(v.headline).not.toMatch(/not held here/i);
+      expect(v.detail).toMatch(/holding/i);
+      // Held means the badge cannot say "nothing cached for this yet".
+      expect(v.trust.level).not.toBe('absent');
+      expect(v.trust.detail).not.toMatch(/nothing cached/i);
+      expect(v.headline).not.toMatch(/[0-9a-f]{16,}/);
+    }
+    // And the size refusal names itself as this device's limit.
+    expect(payloadView('too-large').detail).toMatch(/this device’s limit/i);
   });
 });
 
@@ -835,12 +853,15 @@ describe('player vocabulary rule', () => {
       voteTallyView([], []).note,
       voteTallyView([], []).caveat,
       approvalsView([], null).note,
-      payloadView(true).headline,
-      payloadView(true).detail,
-      payloadView(false).detail,
+      ...(['ok', 'absent', 'unreadable', 'too-large'] as const).flatMap((s) => [
+        payloadView(s).headline,
+        payloadView(s).detail,
+        payloadView(s).trust.detail,
+      ]),
       windowsView(subject, registration, rule, null).note,
       windowsView(subject, null, null, null).note,
       windowsView(subject, null, null, windows).note,
+      windowsView(subject, null, null, null, true).note,
       ...Object.values(PHASE_STRINGS),
       ...['pay', 'budget', 'appoint-manager', 'revoke-manager', 'bind-room',
         'change-policy', 'rotate-board', 'add-share-class', 'dissolve',
