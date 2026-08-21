@@ -455,8 +455,11 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         : 'NO ADJACENT MODULE DATA';
     }
 
-    // 🏦 FUNDING (plan §10.2): whether this room's costs come from the owner
-    // personally or from a company, read from the room's signed binding cache.
+    // 🏦 FUNDING (plan §10.2): what the room's signed binding cache says
+    // about a company funding this room — or, just as often, that it says
+    // nothing. It never concludes the costs are therefore personal: no record
+    // is not evidence of no company, and this panel's whole job is to keep
+    // those apart.
     // Read-only by design in this PR — the terminal never spends, never asks
     // for a treasury key, and funding a room grants nobody edit rights (§9.4).
     const fundEl = panel.querySelector<HTMLElement>('#device-terminal-funding-source');
@@ -508,7 +511,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       // means the lookup could not run. Green returns with a local chain
       // verdict, not before.
       fundEl.style.color = !connected
-        ? '#4A5560'
+        ? TREASURY_MUTED
         : !funding.bound || funding.expiryStatus === 'passed'
           ? '#F0C060'
           : '#3E92B8';
@@ -733,7 +736,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         </div>
         <div id="device-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
         <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-          <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
+          <div style="font-size:10px; color:${TREASURY_MUTED}; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
           <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:#F0C060;">PERSONAL</div>
           <div id="device-terminal-funding-detail" style="font-size:9px; color:${TREASURY_MUTED}; margin-top:3px; line-height:1.5;"></div>
           <!-- Disabled controls leave the tab order, so the reason they are
@@ -752,7 +755,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <button type="button" id="device-terminal-open-treasury"
             style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>
         </div>
-        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only · ↑↓ MOVE · ENTER SELECT · ESC STEP BACK</div>
+        <div style="font-size:9px; color:${TREASURY_MUTED}; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only · ↑↓ MOVE · ENTER SELECT · ESC STEP BACK</div>
       `;
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.

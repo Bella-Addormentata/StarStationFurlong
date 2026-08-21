@@ -3162,7 +3162,7 @@ function paintTreasuryBody(view: HTMLElement): void {
           ? ` · the company details held here are version ${otherRevision}, so that board and its clocks do not apply to this proposal`
           : ""
       }</div>
-      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px; word-break:break-all;">${esc(proposal.proposalId)}</div>
+      <div style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:2px; word-break:break-all;">${esc(proposal.proposalId)}</div>
       ${dim("The proposal itself is signed by its proposer, and that signature was checked on this device.")}
 
       ${header("CLOCKS")}
@@ -4666,7 +4666,7 @@ function renderVenturesApp(): void {
     <div data-phone-app="treasury" role="button" tabindex="0" aria-label="Open the company Treasury"
       style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:8px 10px; border:1px solid rgba(212,168,75,0.25); border-radius:6px; cursor:pointer;">
       <span style="font-size:10px; font-weight:700; color:#f0c060;">🏦 TREASURY</span>
-      <span style="font-size:9px; color:rgba(212,168,75,0.5);">board · proposals · funding ›</span>
+      <span style="font-size:9px; color:${TREASURY_MUTED};">board · proposals · funding ›</span>
     </div>
   `;
 }
@@ -5096,6 +5096,12 @@ function setupSpacePhoneOverlay() {
   (
     window as unknown as { __ssfOpenTreasury?: () => void }
   ).__ssfOpenTreasury = () => {
+    // Quick chat first. It leaves the phone in `peek`, and `.peek` is declared
+    // after `.active` at equal specificity, so adding `active` alone left the
+    // phone at bottom:-386px — mostly offscreen — and this link appeared to do
+    // nothing. Closing it also returns the chat form to its home slot, which
+    // is what the Tab handler does on the same transition.
+    closeMiniChat();
     container?.classList.add("active");
     showPhoneView("treasury");
   };

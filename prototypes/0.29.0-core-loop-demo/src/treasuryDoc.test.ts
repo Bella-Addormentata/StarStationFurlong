@@ -54,6 +54,7 @@ import {
   readRegistration,
   readRoomBinding,
   scanProposals,
+  scanVotes,
   readVote,
   readWindowsCache,
   subscribeTreasury,
@@ -636,6 +637,25 @@ describe('verification caching', () => {
     // And back again — a cached rejection must not stick to the honest record.
     doc.getMap('treasury').set(`proposal:${good.proposalId}`, { ...good });
     expect(readProposal(good.proposalId)).toEqual(good);
+  });
+
+  it('does not let one record class inherit another class’s verdict', () => {
+    // A single shared memo storing bare booleans answered "has this object
+    // been validated?" rather than "is this object a valid X?". The type
+    // guards accept extra fields, so the same object filed under two slots
+    // could take the first class's cached `true` and be handed back as the
+    // second, its own shape and signature never checked.
+    const p = makeProposal();
+    expect(putProposal(p)).toBe(true);
+    expect(readProposal(p.proposalId)).toEqual(p); // caches the proposal verdict
+    // The very same object reference, filed in a vote slot by a hostile peer.
+    const asVote = readProposal(p.proposalId) as unknown as TreasuryVote;
+    doc.getMap('treasury').set(`vote:${p.proposalId}:${pub(seedA)}`, asVote);
+    expect(readVote(p.proposalId, pub(seedA))).toBeNull();
+    expect(listVotes(p.proposalId)).toEqual([]);
+    expect(scanVotes(p.proposalId, 99, 99).items).toEqual([]);
+    // And the proposal still reads as a proposal — scoping did not break it.
+    expect(readProposal(p.proposalId)).toEqual(p);
   });
 
   it('keeps the slot-claim checks outside the cache', () => {

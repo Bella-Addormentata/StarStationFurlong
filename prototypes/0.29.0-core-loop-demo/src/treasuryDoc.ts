@@ -166,7 +166,7 @@ export function bindTreasuryDoc(
   // The pin and the verifier are inputs to every cached verdict, and both may
   // have just changed — start again rather than trust answers computed under
   // the previous binding.
-  verdicts = new WeakMap();
+  verdictCaches = freshVerdictCaches();
   policyResults = new WeakMap();
   const nextMap = doc.getMap('treasury');
   treasuryMap = nextMap;
@@ -249,7 +249,19 @@ function put(key: string, value: unknown): boolean {
  * It is reset on rebind because `expectedGenesis` and `verifySig` are inputs
  * to the verdict and both change there.
  */
-let verdicts = new WeakMap<object, boolean>();
+type VerdictClass = 'proposal' | 'vote' | 'checkpoint' | 'binding' | 'session';
+
+function freshVerdictCaches(): Record<VerdictClass, WeakMap<object, boolean>> {
+  return {
+    proposal: new WeakMap(),
+    vote: new WeakMap(),
+    checkpoint: new WeakMap(),
+    binding: new WeakMap(),
+    session: new WeakMap(),
+  };
+}
+
+let verdictCaches = freshVerdictCaches();
 
 /**
  * Is `value` small enough to be worth validating? Answered in CONSTANT time.
@@ -329,9 +341,24 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** Memoizes a validator over a peer-written value. Non-objects skip the memo. */
-function cachedVerdict(value: unknown, compute: () => boolean): boolean {
+/**
+ * Memoizes a validator over a peer-written value. Non-objects skip the memo.
+ *
+ * Keyed by RECORD CLASS as well as identity. A single shared map storing bare
+ * booleans answered the wrong question: "has this object been validated?"
+ * rather than "is this object a valid X?". The type guards accept extra
+ * fields, so one object filed under two slots — a proposal that is also
+ * written to a `vote:` key — would take the proposal's cached `true` and be
+ * handed back as a vote, its own shape and signature never checked. Per-class
+ * maps make a hit mean what the caller asked.
+ */
+function cachedVerdict(
+  cls: VerdictClass,
+  value: unknown,
+  compute: () => boolean,
+): boolean {
   if (typeof value !== 'object' || value === null) return compute();
+  const verdicts = verdictCaches[cls];
   const hit = verdicts.get(value);
   if (hit !== undefined) return hit;
   // Size first, and before the freeze: deepFreeze walks the whole value, so
@@ -364,7 +391,7 @@ function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
 // ---------------------------------------------------------------------------
 
 function validProposal(value: unknown): value is TreasuryProposal {
-  return cachedVerdict(value, () => validProposalUncached(value));
+  return cachedVerdict('proposal', value, () => validProposalUncached(value));
 }
 
 function validProposalUncached(value: unknown): value is TreasuryProposal {
@@ -507,7 +534,7 @@ export function scanCheckpoints(
 // ---------------------------------------------------------------------------
 
 function validVote(value: unknown): value is TreasuryVote {
-  return cachedVerdict(value, () => validVoteUncached(value));
+  return cachedVerdict('vote', value, () => validVoteUncached(value));
 }
 
 function validVoteUncached(value: unknown): value is TreasuryVote {
@@ -739,7 +766,7 @@ export function readWindowsCache(proposalId: string): ProposalWindows | null {
 // ---------------------------------------------------------------------------
 
 function validCheckpoint(value: unknown): value is TreasuryCheckpoint {
-  return cachedVerdict(value, () => validCheckpointUncached(value));
+  return cachedVerdict('checkpoint', value, () => validCheckpointUncached(value));
 }
 
 function validCheckpointUncached(value: unknown): value is TreasuryCheckpoint {
@@ -794,20 +821,29 @@ function sessionShellOf(session: SigningSession): SigningSession {
 }
 
 function validSessionShell(value: unknown, proposalId: string, sessionId: string): value is SigningSession {
-  if (!isSigningSession(value)) return false;
-  // The two key checks stay OUTSIDE the memo. They compare the record against
-  // the caller's arguments rather than judging the record itself, so caching
-  // their result against the object would let a mismatched lookup poison the
-  // verdict for the matching one.
-  if (value.proposalId !== proposalId || value.sessionId !== sessionId) return false;
-  return cachedVerdict(value, () => selfConsistentSession(value));
+  if (typeof value !== 'object' || value === null) return false;
+  // EVERYTHING that judges the record itself goes inside the memo, the shape
+  // guard included. isSigningSession walks collectedSigs and allocates for its
+  // distinctness check, so leaving it outside meant a peer-written shell with
+  // a huge signature array was walked in full on every repaint — before the
+  // size budget could refuse it, and without the memo ever saving a repeat.
+  if (!cachedVerdict('session', value, () => isSigningSession(value) && selfConsistentSession(value))) {
+    return false;
+  }
+  // Only the caller-dependent slot checks stay outside. They compare the
+  // record against the caller's arguments rather than judging the record, so
+  // caching their result against the object would let a mismatched lookup
+  // poison the verdict for the matching one.
+  const session = value as SigningSession;
+  return session.proposalId === proposalId && session.sessionId === sessionId;
 }
 
 /** The arg-independent half: on-net, and the shell hashes to its own id. */
-function selfConsistentSession(value: SigningSession): boolean {
-  if (!onNet(value.networkGenesisChallenge)) return false;
+function selfConsistentSession(value: unknown): boolean {
+  const session = value as SigningSession;
+  if (!onNet(session.networkGenesisChallenge)) return false;
   try {
-    return signingSessionIdOf(value) === value.sessionId;
+    return signingSessionIdOf(session) === session.sessionId;
   } catch {
     return false;
   }
@@ -928,7 +964,7 @@ export function scanSigningSessions(
 // ---------------------------------------------------------------------------
 
 function validBinding(value: unknown): value is RoomTreasuryBinding {
-  return cachedVerdict(value, () => validBindingUncached(value));
+  return cachedVerdict('binding', value, () => validBindingUncached(value));
 }
 
 function validBindingUncached(value: unknown): value is RoomTreasuryBinding {
