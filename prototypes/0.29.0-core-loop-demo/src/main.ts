@@ -53,7 +53,7 @@ import {
   readRegistrationResult,
   readRoomBinding,
   readRoomBindingResult,
-  readWindowsCache,
+  readWindowsCacheResult,
   scanCheckpoints,
   scanProposals,
   scanSigningSessions,
@@ -2813,6 +2813,17 @@ function renderBankApp(): void {
 let treasuryDetailId = "";
 
 /**
+ * Where the proposal list is paged to.
+ *
+ * A per-repaint check budget bounds cost but, on its own, made the list
+ * censorable: the scan restarted at the beginning every time, so the first
+ * two dozen prefix-matching entries — junk included, since rejecting one costs
+ * a check too — could hide every real proposal permanently. Paging is what
+ * makes the bound survivable rather than exploitable.
+ */
+let treasuryListOffset = 0;
+
+/**
  * How many records one repaint may VERIFY, as opposed to walk past.
  *
  * Verifying a record costs about 1.4 ms — a canonical id or hash recomputed
@@ -2939,6 +2950,12 @@ function wireTreasuryView(view: HTMLElement): void {
       const action = el.dataset.treasuryAction;
       if (action === "open") treasuryDetailId = el.dataset.proposalId ?? "";
       if (action === "back") treasuryDetailId = "";
+      // Paging is clamped by the scan itself against what actually matched,
+      // so a page that empties out between repaints cannot strand anyone.
+      if (action === "page-next") treasuryListOffset += LIST_CHECKS;
+      if (action === "page-prev") {
+        treasuryListOffset = Math.max(0, treasuryListOffset - LIST_CHECKS);
+      }
       // renderTreasuryApp preserves focus across the repaint for us.
       renderTreasuryApp();
       return true;
@@ -3133,14 +3150,16 @@ function paintTreasuryBody(view: HTMLElement): void {
       policyCache && policyCache.policy.companyId === proposal.companyId
         ? policyCache.policy.policyVersion
         : null;
+    const windowsResult = readWindowsCacheResult(proposal.proposalId);
     const w = windowsView(
       proposal,
       registrationResult.status === "ok" ? registrationResult.registration : null,
       rule,
-      readWindowsCache(proposal.proposalId),
+      windowsResult.status === "ok" ? windowsResult.windows : null,
       // A record the room holds but the reader could not return is a conflict,
       // not an absence — windowsView cannot tell without being told.
       registrationResult.status === "unreadable",
+      windowsResult.status === "unreadable",
     );
     // Bounded reads: votes, vote records and approval rounds all sit in
     // peer-writable slots that nothing prunes, and this screen repaints on
@@ -3291,21 +3310,31 @@ function paintTreasuryBody(view: HTMLElement): void {
   // is the expensive half and the one that decides how long a repaint blocks
   // for; it also caps how many rows this screen can be made to render.
   const LIST_SCAN = 800;
-  const page = scanProposals(LIST_SCAN, LIST_CHECKS);
+  // Paged, not merely capped. A cap alone let a peer bury every real proposal
+  // behind two dozen pieces of junk with no way to look past them — see
+  // scanPrefixed. The offset is clamped to what actually matched, so records
+  // arriving or leaving cannot strand the player on an empty page.
+  const page = scanProposals(LIST_SCAN, LIST_CHECKS, treasuryListOffset);
+  if (page.offset !== treasuryListOffset) treasuryListOffset = page.offset;
   const truncated = page.truncated;
   const scoped = scopeProposals(page.items, scope.companyId);
   const rows = proposalRows(
     scoped.shown,
-    (p) =>
-      windowsView(
+    (p) => {
+      // Both slots report held-but-unreadable, exactly as the detail screen
+      // does — otherwise the same proposal reads NO DATA in the list and
+      // "a record is held" when opened.
+      const reg = readRegistrationResult(p.proposalId);
+      const win = readWindowsCacheResult(p.proposalId);
+      return windowsView(
         p,
-        (() => {
-          const r = readRegistrationResult(p.proposalId);
-          return r.status === "ok" ? r.registration : null;
-        })(),
+        reg.status === "ok" ? reg.registration : null,
         governanceRuleFor(p, policyCache?.policy ?? null),
-        readWindowsCache(p.proposalId),
-      ),
+        win.status === "ok" ? win.windows : null,
+        reg.status === "unreadable",
+        win.status === "unreadable",
+      );
+    },
     height,
     heightSource,
   );
@@ -3447,6 +3476,31 @@ function paintTreasuryBody(view: HTMLElement): void {
         : ""
     }
     ${
+      // A way to actually reach what the page does not show. Without this the
+      // partial-list warning told the player their view was incomplete and
+      // offered them nothing to do about it — which is what made a small
+      // junk flood enough to hide every real proposal.
+      page.matched > LIST_CHECKS
+        ? `${dim(
+            `Showing records ${page.offset + 1}–${page.offset + Math.min(LIST_CHECKS, page.matched - page.offset)} of ${page.matched} held under this room's proposal keys. Only this page was read.`,
+          )}
+          <div style="display:flex; gap:6px; margin-top:6px;">
+            ${
+              page.offset > 0
+                ? `<div data-treasury-action="page-prev" role="button" tabindex="0" aria-label="Previous page of proposals"
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ EARLIER</div>`
+                : ""
+            }
+            ${
+              page.offset + LIST_CHECKS < page.matched
+                ? `<div data-treasury-action="page-next" role="button" tabindex="0" aria-label="Next page of proposals"
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">MORE ›</div>`
+                : ""
+            }
+          </div>`
+        : ""
+    }
+    ${
       scoped.scopeUnknown && scoped.otherCompanies > 0
         ? dim(
             `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? " is" : "s are"} held in this room, but without company details there is no way to tell whose ${scoped.otherCompanies === 1 ? "it is" : "they are"}, so ${scoped.otherCompanies === 1 ? "it is" : "they are"} not listed.`,
@@ -3478,7 +3532,12 @@ function paintTreasuryBody(view: HTMLElement): void {
               "Another player reports",
               `${esc(sync.peerClaim)}${sync.peerHeight !== null ? ` · ${formatHeight(sync.peerHeight)}` : ""}`,
             )
-          : row("Another player reports", "nothing")
+          // "nothing" only when the slot is genuinely empty. A held-but-
+          // unreadable claim gets its own wording, or this row would flatly
+          // contradict the UNREAD badge the panel just rendered.
+          : syncResult?.status === "unreadable"
+            ? row("Another player reports", "something unreadable")
+            : row("Another player reports", "nothing")
     }
     ${dim("Reports from other players are shown as claims only — your own node's view is what will decide, once that lane ships.")}`;
 }

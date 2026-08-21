@@ -502,8 +502,29 @@ export interface BoundedScan<T> {
    * report "no proposals" about proposals the room is holding.
    */
   refusedTooLarge: number;
+  /** Matching keys found within the traversal budget, before verification. */
+  matched: number;
+  /** Where this page started in that list. */
+  offset: number;
 }
 
+/**
+ * One page of a bounded scan.
+ *
+ * A check budget on its own made the list CENSORABLE. The scan always
+ * restarted from the beginning, so once the first `maxChecks` prefix-matching
+ * entries used the budget up, everything after them was permanently
+ * unreachable — and since malformed entries spend budget too, a peer could
+ * bury every real proposal behind two dozen pieces of junk. The partial-list
+ * warning said the view was incomplete but gave nobody any way to see the
+ * rest.
+ *
+ * So the walk is split. Collecting the matching KEYS is cheap — a prefix test
+ * per entry, bounded by `maxEntries` — and only the page's worth of values is
+ * verified. Keys are sorted so the page is the same across repaints and an
+ * offset means the same thing twice; a peer can grind ids to sort early, but
+ * paging past them still works, which is what censorship needs to fail.
+ */
 function scanPrefixed<T>(
   prefix: string,
   maxEntries: number,
@@ -511,34 +532,50 @@ function scanPrefixed<T>(
   take: (key: string, value: unknown) => T | null,
   /** Optional: lets a caller count entries refused on size alone. */
   verdictOf?: (value: unknown) => RecordVerdict,
+  offset = 0,
 ): BoundedScan<T> {
   const m = readMap();
-  if (!m) return { items: [], truncated: false, refusedTooLarge: 0 };
-  const items: T[] = [];
+  if (!m) {
+    return { items: [], truncated: false, refusedTooLarge: 0, matched: 0, offset: 0 };
+  }
+  // Pass one: which keys match, bounded by the traversal budget. Iterating
+  // keys rather than entries, since no value is needed to decide this.
+  const keys: string[] = [];
   let visited = 0;
-  let checked = 0;
-  let refusedTooLarge = 0;
-  for (const [key, value] of m.entries()) {
+  let truncated = false;
+  for (const key of m.keys()) {
     // Counted BEFORE the prefix test: a skipped key is still a key this
     // repaint had to look at.
-    if (visited >= maxEntries) return { items, truncated: true, refusedTooLarge };
+    if (visited >= maxEntries) {
+      truncated = true;
+      break;
+    }
     visited += 1;
-    if (!key.startsWith(prefix)) continue;
-    // Counted BEFORE `take` runs, for the same reason: the check is the
-    // expensive part, so the budget has to be spent before it, not after.
-    if (checked >= maxChecks) return { items, truncated: true, refusedTooLarge };
-    checked += 1;
-    // Asked first, so the verdict is cached and `take` costs nothing extra.
+    if (key.startsWith(prefix)) keys.push(key);
+  }
+  keys.sort();
+  const start = Math.max(0, Math.min(offset, keys.length));
+  const page = keys.slice(start, start + Math.max(0, maxChecks));
+  // Anything the page does not cover is still there to be paged to, and the
+  // caller is told so rather than being left to assume it saw everything.
+  if (start + page.length < keys.length) truncated = true;
+  // Pass two: verify only this page. THIS is the expensive half.
+  const items: T[] = [];
+  let refusedTooLarge = 0;
+  for (const key of page) {
+    const value = m.get(key);
     if (verdictOf?.(value) === 'too-large') refusedTooLarge += 1;
     const kept = take(key, value);
     if (kept !== null) items.push(kept);
   }
-  return { items, truncated: false, refusedTooLarge };
+  return { items, truncated, refusedTooLarge, matched: keys.length, offset: start };
 }
 
 export function scanProposals(
   maxEntries: number,
   maxChecks: number,
+  /** Where to start in the sorted matching keys — see scanPrefixed. */
+  offset = 0,
 ): BoundedScan<TreasuryProposal> {
   return scanPrefixed(
     'proposal:',
@@ -547,6 +584,7 @@ export function scanProposals(
     (key, value) =>
       validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
     proposalVerdict,
+    offset,
   );
 }
 
@@ -842,6 +880,21 @@ export function putWindowsCache(windows: ProposalWindows): boolean {
  * A cached derivation, returned for display. To TRUST windows, recompute them:
  * deriveProposalWindows(readRegistration(id), rule) — sovereign §4.
  */
+/** Cached clocks, or why there are none. Same four states as its siblings. */
+export type WindowsCacheResult =
+  | { status: 'ok'; windows: ProposalWindows }
+  | { status: 'absent' | 'unreadable' };
+
+export function readWindowsCacheResult(proposalId: string): WindowsCacheResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
+  const value = m.get(`windows:${proposalId}`);
+  if (value === undefined) return { status: 'absent' };
+  return isProposalWindows(value) && value.proposalId === proposalId
+    ? { status: 'ok', windows: value }
+    : { status: 'unreadable' };
+}
+
 export function readWindowsCache(proposalId: string): ProposalWindows | null {
   const m = readMap();
   if (!m) return null;
@@ -1013,7 +1066,9 @@ export function scanSigningSessions(
   maxChecks: number,
 ): BoundedScan<SigningSession> {
   const m = readMap();
-  if (!m) return { items: [], truncated: false, refusedTooLarge: 0 };
+  if (!m) {
+    return { items: [], truncated: false, refusedTooLarge: 0, matched: 0, offset: 0 };
+  }
   const shellPrefix = `session:${proposalId}:`;
   let visited = 0;
   let checked = 0;
@@ -1067,7 +1122,9 @@ export function scanSigningSessions(
     const assembled = { ...shell, collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
   }
-  return { items: out, truncated, refusedTooLarge };
+  // Sessions are not paged: a proposal has few approval rounds, and the
+  // detail screen shows them all. matched is the shells this scan looked at.
+  return { items: out, truncated, refusedTooLarge, matched: shells.length, offset: 0 };
 }
 
 // ---------------------------------------------------------------------------

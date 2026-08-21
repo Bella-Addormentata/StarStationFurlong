@@ -293,6 +293,8 @@ export function windowsView(
    * "no acceptance record is held" about a record sitting in the room.
    */
   registrationUnreadable = false,
+  /** As above, for the cached-clocks slot. */
+  cachedUnreadable = false,
 ): WindowsView {
   const registration =
     registrationRaw && registrationMatches(registrationRaw, proposal)
@@ -305,7 +307,7 @@ export function windowsView(
   // an absence.
   const registrationConflicts =
     (registrationRaw !== null && registration === null) || registrationUnreadable;
-  const cachedConflicts = cachedRaw !== null && cached === null;
+  const cachedConflicts = (cachedRaw !== null && cached === null) || cachedUnreadable;
   const missingRegistrationNote = registrationUnreadable && registrationRaw === null
     ? 'an acceptance record is held here but this device cannot make sense of it'
     : registrationConflicts

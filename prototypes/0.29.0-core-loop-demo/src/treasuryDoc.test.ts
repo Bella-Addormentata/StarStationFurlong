@@ -200,6 +200,39 @@ describe('proposals', () => {
     expect(full.truncated).toBe(false);
   });
 
+  it('lets a player page past a flood instead of being censored by it', () => {
+    // A check budget alone made the list censorable: the scan restarted at the
+    // beginning every time, so the first maxChecks prefix-matching entries —
+    // junk included, since rejecting one spends a check too — hid everything
+    // after them permanently. Paging is what makes the bound survivable.
+    const m = doc.getMap('treasury');
+    const real = makeProposal({ payloadHash: 'e'.repeat(64) });
+    expect(putProposal(real)).toBe(true);
+    // Junk that sorts BEFORE the honest record, so page one is all junk.
+    for (let i = 0; i < 8; i += 1) {
+      m.set(`proposal:0${i.toString().padStart(63, '0')}`, { junk: i });
+    }
+    const first = scanProposals(500, 4, 0);
+    expect(first.items).toEqual([]); // buried
+    expect(first.truncated).toBe(true);
+    expect(first.matched).toBe(9);
+    expect(first.offset).toBe(0);
+    // ...but reachable. Walk the pages until the honest record turns up.
+    const seen: string[] = [];
+    for (let offset = 0; offset < first.matched; offset += 4) {
+      seen.push(...scanProposals(500, 4, offset).items.map((p) => p.proposalId));
+    }
+    expect(seen).toContain(real.proposalId);
+    // The offset is clamped to what matched, so an over-run page is empty
+    // rather than throwing, and reports where it actually landed.
+    const past = scanProposals(500, 4, 999);
+    expect(past.items).toEqual([]);
+    expect(past.offset).toBe(9);
+    // A page is deterministic: same offset, same records, across repaints.
+    expect(scanProposals(500, 4, 4).items.map((p) => p.proposalId))
+      .toEqual(scanProposals(500, 4, 4).items.map((p) => p.proposalId));
+  });
+
   it('round-trips a signed proposal and lists it', () => {
     const p = makeProposal();
     expect(putProposal(p)).toBe(true);
@@ -619,6 +652,8 @@ describe('network pinning', () => {
       items: [],
       truncated: false,
       refusedTooLarge: 0,
+      matched: 0,
+      offset: 0,
     });
     expect(readPolicyCache()).toBeNull();
     // The sync entry carries no genesis of its own, so this is the only place
