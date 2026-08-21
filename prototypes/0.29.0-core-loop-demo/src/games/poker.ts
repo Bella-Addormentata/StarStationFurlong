@@ -604,10 +604,35 @@ export function evaluate7(cards: Card[]): PokerHand {
   if (cards.length !== 7) {
     throw new RangeError(`evaluate7 requires 7 cards, got ${cards.length}`);
   }
-  // Try every C(7,5) = 21 combination and take the best.
+  return bestOfN(cards);
+}
+
+/**
+ * Best 5-card hand from any 5..7 real cards — the correct primitive for
+ * postflop hand strength when the community isn't full yet (holeStrength on
+ * the flop/turn). Never pad the input: duplicating a card lets evaluate5 see
+ * impossible sets (three copies of one card → false trips/full-house/quads)
+ * and inflates the score above its true value. See padCards removal (bot
+ * heuristic used to feed evaluate7 with duplicates of community[0], flipping
+ * high-card holdings into ranged-trip category on flop boards containing any
+ * high card — that regression is asserted in poker.test.ts).
+ */
+export function evaluateBest(cards: Card[]): PokerHand {
+  if (cards.length < 5 || cards.length > 7) {
+    throw new RangeError(`evaluateBest requires 5..7 cards, got ${cards.length}`);
+  }
+  return bestOfN(cards);
+}
+
+/**
+ * Shared C(n,5) best-hand enumerator (n ∈ 5..7). Uses the standard next-
+ * lexicographic-combination increment: at n=5 the loop runs once, at n=6 six
+ * times, at n=7 twenty-one times.
+ */
+function bestOfN(cards: Card[]): PokerHand {
+  const n = cards.length;
   let best: PokerHand | null = null;
   const idx = [0, 1, 2, 3, 4];
-  const n = 7;
   while (true) {
     const combo = [cards[idx[0]], cards[idx[1]], cards[idx[2]], cards[idx[3]], cards[idx[4]]];
     const h = evaluate5(combo);
@@ -803,6 +828,15 @@ export function chooseBotAction(state: PokerState, seat: PokerSeat): PokerAction
 /**
  * Rough 0..1 hand strength for the bot. Preflop: high-pair > high-suited-connector
  * > everything else. Postflop: check made-hand category and pair-vs-community.
+ *
+ * Postflop evaluates the best 5-card hand from EXACTLY the real cards on the
+ * table — hole (2) + community (3..5) — via `evaluateBest`. A previous version
+ * padded the input with duplicates of `community[0]` to reach 7 cards for
+ * `evaluate7`; that made every high card on the flop look like trips because
+ * the 21 C(7,5) combos included 3-of-the-same-card samples that evaluate5 has
+ * no dedup for. Fixed here: no padding, real cards only, so `holeStrength`
+ * actually computes what its docstring claims (made-hand category vs the
+ * shared community).
  */
 function holeStrength(hole: [Card, Card], community: Card[]): number {
   if (community.length === 0) {
@@ -817,22 +851,10 @@ function holeStrength(hole: [Card, Card], community: Card[]): number {
     if (gap === 0 && lo >= 8) score += 0.1;
     return Math.min(1, score);
   }
-  const hand = community.length >= 3
-    ? evaluate7([...hole, ...community, ...padCards(community, 5)].slice(0, 7))
-    : null;
-  if (!hand) return 0.4;
+  if (community.length < 3) return 0.4; // shouldn't happen — postflop only
+  const hand = evaluateBest([...hole, ...community]);
   // Category-based normalisation: 0.4 (highcard) .. 1 (straight-flush).
   return 0.4 + (hand.categoryRank / 8) * 0.6;
-}
-
-function padCards(cards: Card[], target: number): Card[] {
-  if (cards.length >= target) return [];
-  // Pad with duplicates from the input — evaluator only cares about combos
-  // and we clip back to 7 above; padding never reaches evaluate5 as a valid
-  // 5-card sample because we clip via slice(0,7).
-  const pad: Card[] = [];
-  while (cards.length + pad.length < target) pad.push(cards[0]);
-  return pad;
 }
 
 // ── Read-side helper — hide opponent hole cards for the UI ───────────────────
@@ -841,6 +863,14 @@ function padCards(cards: Card[], target: number): Card[] {
  * Return a state copy safe to render for `viewerId`. If the viewer is not a
  * seated player, both hands are hidden until showdown. If they are seated,
  * their own hand stays visible; opponent hidden until showdown.
+ *
+ * A folded player's hand is MUCKED — after a fold-driven `awardUncontested`,
+ * `street` reaches 'complete' but the folder's hole cards must stay hidden
+ * from spectators (standard poker: the loser of a fold-off doesn't show).
+ * The folder themselves still sees their own cards (they can review). The
+ * winner's cards remain visible at showdown/complete; in real poker they may
+ * muck too, but for the demo felt this keeps the recap informative (any peer
+ * inspecting the raw doc could read it anyway — see white-cards caveat).
  *
  * NOTE: the raw doc still contains all cards; a determined peer can inspect
  * `readGame(tableId)` directly. See white-cards caveat at file top.
@@ -852,11 +882,57 @@ export function readVisiblePokerState(state: PokerState, viewerId: string | null
   if (!showdownVisible) {
     if (viewerId !== button.id) button.holeCards = null;
     if (viewerId !== bigBlind.id) bigBlind.holeCards = null;
+  } else {
+    // Post-hand: the folder's cards stay mucked to spectators (and to the
+    // opponent — they never earned the right to see). The folder themselves
+    // still sees their own cards for review.
+    if (button.folded && viewerId !== button.id) button.holeCards = null;
+    if (bigBlind.folded && viewerId !== bigBlind.id) bigBlind.holeCards = null;
   }
   return { ...state, players: { button, bigBlind } };
 }
 
 // ── Shape guard (peers write the doc; malformed reads render as no game) ─────
+
+/**
+ * Runtime guard for a PokerHand summary (rank + tiebreaks + 5-card best hand).
+ * Used by `isPokerShowdown` below — a hostile peer can plant any object shape
+ * into the doc, so the read path validates every declared field before the UI
+ * dereferences it (see devices.ts poker panel render loop).
+ */
+function isPokerHand(value: unknown): value is PokerHand {
+  if (typeof value !== 'object' || value === null) return false;
+  const h = value as Partial<PokerHand>;
+  const catsOk = ['high-card', 'pair', 'two-pair', 'three-of-a-kind',
+    'straight', 'flush', 'full-house', 'four-of-a-kind', 'straight-flush']
+    .includes(h.category as string);
+  const rankOk = Number.isInteger(h.categoryRank)
+    && (h.categoryRank as number) >= 0 && (h.categoryRank as number) <= 8;
+  const tbOk = Array.isArray(h.tiebreak)
+    && h.tiebreak.every((x) => typeof x === 'number' && Number.isFinite(x));
+  const best5Ok = Array.isArray(h.best5) && h.best5.length === 5
+    && h.best5.every(isCard);
+  return catsOk && rankOk && tbOk && best5Ok;
+}
+
+/**
+ * Runtime guard for the PokerShowdown record embedded in `lastShowdown`.
+ * CRITICAL: without this, a hostile peer writing `{ ...validState, status:
+ * 'hand-over', lastShowdown: { winner: 'not-a-seat', pot: 0 } }` would pass
+ * isPokerState, and devices.ts:pokerStatusText would deref
+ * `s.players['not-a-seat'].id` on the render path — TypeError swallowed by the
+ * gamesDoc notify try/catch, poker panel silently blanks. `winner` MUST match
+ * the render-side seat lookup exactly, and every declared field is checked.
+ */
+function isPokerShowdown(value: unknown): value is PokerShowdown {
+  if (typeof value !== 'object' || value === null) return false;
+  const s = value as Partial<PokerShowdown>;
+  const winnerOk = s.winner === 'button' || s.winner === 'bigBlind' || s.winner === 'split';
+  const btnHandOk = s.buttonHand === null || isPokerHand(s.buttonHand);
+  const bbHandOk = s.bigBlindHand === null || isPokerHand(s.bigBlindHand);
+  const potOk = Number.isInteger(s.pot) && (s.pot as number) >= 0;
+  return winnerOk && btnHandOk && bbHandOk && potOk;
+}
 
 export function isPokerState(value: unknown): value is PokerState {
   if (typeof value !== 'object' || value === null) return false;
@@ -889,6 +965,10 @@ export function isPokerState(value: unknown): value is PokerState {
       && Number.isInteger(x.amount) && (x.amount as number) >= 0
       && ['preflop', 'flop', 'turn', 'river', 'showdown', 'complete'].includes(x.street as string);
   };
+  // lastShowdown: PokerShowdown | null is a REQUIRED field on the interface
+  // (see line 105) — validated here so downstream renderers (pokerStatusText,
+  // pokerSeatLabel) can trust s.lastShowdown.winner as a valid seat token.
+  const showdownOk = s.lastShowdown === null || isPokerShowdown(s.lastShowdown);
   return playersOk
     && statusOk
     && streetOk
@@ -903,5 +983,6 @@ export function isPokerState(value: unknown): value is PokerState {
     && Number.isInteger(s.bigBlind) && (s.bigBlind as number) > 0
     && Number.isInteger(s.seed)
     && Number.isInteger(s.handsPlayed) && (s.handsPlayed as number) >= 0
+    && showdownOk
     && typeof s.bot === 'boolean';
 }

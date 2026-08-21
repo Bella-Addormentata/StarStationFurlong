@@ -6,9 +6,9 @@
 import { describe, expect, it } from 'vitest';
 import { cardOf } from './cards';
 import {
-  applyPokerAction, beginPoker, callAmount, compareHands,
-  evaluate5, evaluate7, initialPokerState, isPokerState, legalActions,
-  nextHand, readVisiblePokerState,
+  applyPokerAction, beginPoker, callAmount, chooseBotAction, compareHands,
+  evaluate5, evaluate7, evaluateBest, initialPokerState, isPokerState,
+  legalActions, nextHand, readVisiblePokerState,
 } from './poker';
 import type { PokerState } from './poker';
 
@@ -297,6 +297,205 @@ describe('poker: shape guard', () => {
       },
     };
     expect(isPokerState(bad)).toBe(false);
+  });
+
+  // Regression for the doc-boundary MAJOR: previously isPokerState never
+  // validated s.lastShowdown, so a hostile peer writing an object with an
+  // invalid winner ('not-a-seat') would slip through, and the devices.ts
+  // render path would deref `s.players['not-a-seat'].id` → TypeError.
+  it('accepts a state with lastShowdown null (initial state)', () => {
+    const s = initialPokerState(1);
+    expect(s.lastShowdown).toBeNull();
+    expect(isPokerState(s)).toBe(true);
+  });
+
+  it('accepts a state with a valid lastShowdown after fold', () => {
+    let s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    s = applyPokerAction(s, { seat: 'button', kind: 'fold' });
+    expect(s.status).toBe('hand-over');
+    expect(s.lastShowdown).not.toBeNull();
+    expect(isPokerState(s)).toBe(true);
+  });
+
+  it('rejects lastShowdown with an invalid winner seat', () => {
+    const s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    const bad = {
+      ...s,
+      status: 'hand-over',
+      lastShowdown: { winner: 'not-a-seat', pot: 0, buttonHand: null, bigBlindHand: null },
+    };
+    expect(isPokerState(bad)).toBe(false);
+  });
+
+  it('rejects lastShowdown that is not an object', () => {
+    const s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    // A stray primitive (or the field omitted entirely, since it's required).
+    expect(isPokerState({ ...s, lastShowdown: 42 })).toBe(false);
+    expect(isPokerState({ ...s, lastShowdown: 'hand-over' })).toBe(false);
+    // Undefined = the field was omitted → not the declared shape.
+    const omitted = { ...s } as Record<string, unknown>;
+    delete omitted.lastShowdown;
+    expect(isPokerState(omitted)).toBe(false);
+  });
+
+  it('rejects lastShowdown with a non-integer pot', () => {
+    const s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    const bad = {
+      ...s,
+      status: 'hand-over',
+      lastShowdown: { winner: 'button', pot: 'DELETE', buttonHand: null, bigBlindHand: null },
+    };
+    expect(isPokerState(bad)).toBe(false);
+  });
+
+  it('rejects lastShowdown with a malformed buttonHand', () => {
+    const s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    const bad = {
+      ...s,
+      status: 'hand-over',
+      lastShowdown: {
+        winner: 'button', pot: 0,
+        buttonHand: { category: 'not-a-category', categoryRank: 99, tiebreak: 'nope', best5: [] },
+        bigBlindHand: null,
+      },
+    };
+    expect(isPokerState(bad)).toBe(false);
+  });
+});
+
+describe('poker: evaluateBest handles 5..7 cards without padding', () => {
+  // Regression for the padCards MINOR: holeStrength used to pad the community
+  // with duplicates of community[0] to reach 7 cards, so evaluate7's C(7,5)
+  // combos included samples with 3 copies of the same card — evaluate5 has no
+  // dedup, so it reported false trips/full-house on any high-card board.
+  // evaluateBest evaluates from the REAL card set (no padding) instead.
+  it('is equivalent to evaluate5 on exactly 5 cards', () => {
+    const cards = [c(0, 10), c(0, 11), c(0, 12), c(0, 13), c(0, 14)];
+    const a = evaluateBest(cards);
+    const b = evaluate5(cards);
+    expect(a.category).toBe(b.category);
+    expect(a.categoryRank).toBe(b.categoryRank);
+    expect(a.tiebreak).toEqual(b.tiebreak);
+  });
+
+  it('is equivalent to evaluate7 on exactly 7 cards', () => {
+    const cards = [c(0, 14), c(0, 13), c(0, 12), c(0, 11), c(0, 10), c(1, 2), c(2, 3)];
+    const a = evaluateBest(cards);
+    const b = evaluate7(cards);
+    expect(a.category).toBe(b.category);
+    expect(a.categoryRank).toBe(b.categoryRank);
+    expect(a.tiebreak).toEqual(b.tiebreak);
+  });
+
+  it('picks the best straight from 6 cards (turn = 2 hole + 4 community)', () => {
+    // Hole: 9♠ 8♠, Board: 7♥ 6♦ 5♣ 2♠ → straight to 9.
+    const h = evaluateBest([c(3, 9), c(3, 8), c(2, 7), c(1, 6), c(0, 5), c(3, 2)]);
+    expect(h.category).toBe('straight');
+    expect(h.tiebreak[0]).toBe(9);
+  });
+
+  it('does NOT report trips from a single high community card (flop, 5 cards)', () => {
+    // The audit's failure scenario: community=[A♣,5♦,2♠], hole=[K♥,7♦].
+    // Real best-5-of-5 is high-card ace-king. Padding used to lift this to
+    // trips because 3 copies of A♣ appeared in some C(7,5) combo. Not any more.
+    const community = [c(0, 14), c(1, 5), c(3, 2)]; // A♣ 5♦ 2♠
+    const hole = [c(2, 13), c(1, 7)];               // K♥ 7♦
+    const h = evaluateBest([...hole, ...community]);
+    expect(h.category).toBe('high-card');
+    expect(h.categoryRank).toBe(0);
+  });
+
+  it('rejects too-few or too-many cards', () => {
+    expect(() => evaluateBest([c(0, 2), c(0, 3), c(0, 4), c(0, 5)])).toThrow();
+    expect(() => evaluateBest([
+      c(0, 2), c(0, 3), c(0, 4), c(0, 5), c(0, 6), c(0, 7), c(0, 8), c(0, 9),
+    ])).toThrow();
+  });
+
+  it('bot no longer over-raises high-card-with-community-ace boards', () => {
+    // Direct end-to-end check of the padCards regression at the bot level.
+    // Set up a hand-in-progress where the bot (bigBlind) faces a check-through
+    // to the flop with a weak high-card hand and a community ace: previously
+    // the bot inflated this to trips-category strength and raised. Now it
+    // sees plain high-card and takes the cheap check.
+    let s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'flop',
+      players: {
+        button: {
+          id: 'A', stack: 990, streetBet: 0, handBet: 10,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: false,
+        },
+        bigBlind: {
+          id: null, stack: 990, streetBet: 0, handBet: 10,
+          holeCards: [c(2, 13), c(1, 7)], folded: false, allIn: false, // K♥ 7♦
+        },
+      },
+      community: [c(0, 14), c(1, 5), c(3, 2)], // A♣ 5♦ 2♠
+      toAct: 'bigBlind',
+      currentBet: 0,
+      minRaise: 10,
+      pot: 20,
+      deck: [c(2, 8), c(3, 9)],
+      actions: [],
+      bot: true,
+    };
+    // Sanity: fresh state passes the shape guard.
+    expect(isPokerState(s)).toBe(true);
+    const action = chooseBotAction(s, 'bigBlind');
+    // Weak hand on a checked flop — should check, never bet/raise.
+    expect(action?.kind === 'check' || action?.kind === 'fold').toBe(true);
+  });
+});
+
+describe('poker: fold does not expose the folder\'s cards', () => {
+  // Regression for the NOTE finding — after awardUncontested, street='complete'
+  // used to reveal BOTH holeCards via readVisiblePokerState. Standard poker
+  // mucks the folder's hand.
+  it('spectators do not see the folder\'s hole cards after a fold', () => {
+    let s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    s = applyPokerAction(s, { seat: 'button', kind: 'fold' });
+    const spec = readVisiblePokerState(s, 'someoneElse');
+    expect(spec.players.button.folded).toBe(true);
+    expect(spec.players.button.holeCards).toBeNull(); // mucked
+    // Winner's cards remain visible (see doc comment — the raw doc already
+    // holds them, and the demo felt keeps the recap informative).
+    expect(spec.players.bigBlind.holeCards).not.toBeNull();
+  });
+
+  it('the folder still sees their own hole cards after folding', () => {
+    let s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000,
+    });
+    s = applyPokerAction(s, { seat: 'button', kind: 'fold' });
+    // The player who folded is still 'B' — their view keeps their own cards.
+    const own = readVisiblePokerState(s, 'B');
+    expect(own.players.button.holeCards).not.toBeNull();
+  });
+
+  it('a non-fold showdown still reveals both hands (regression guard for the fix)', () => {
+    // Both go all-in, run to showdown, no fold. Both hands must remain visible.
+    let s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 30,
+    });
+    s = applyPokerAction(s, { seat: 'button', kind: 'raise', amount: 30 });
+    s = applyPokerAction(s, { seat: 'bigBlind', kind: 'call' });
+    const spec = readVisiblePokerState(s, 'someoneElse');
+    expect(spec.players.button.holeCards).not.toBeNull();
+    expect(spec.players.bigBlind.holeCards).not.toBeNull();
   });
 });
 
