@@ -199,6 +199,18 @@ export function wallAndLateralFromPoint(
 }
 
 /**
+ * 🧭 #102 S0-prime: the pose helpers' door-records currency, exported so a
+ * caller with the RIGHT layout in hand (e.g. arrival-side yaw math, tests) can
+ * pass it explicitly rather than depending on whatever the module-global
+ * happened to hold at that moment. Kept as `ReadonlyMap` at the boundary so a
+ * caller can never mutate a snapshot another caller is still reading from.
+ */
+export type DoorRecordsMap = ReadonlyMap<
+  string,
+  { wall: DoorWall; lateral: number }
+>;
+
+/**
  * 🚪 The room's live door records, pushed here by world.reconcileDoorLayout —
  * which already receives exactly this map (stored records, or the room's
  * defaults when unseeded) on bind and on every door change, so there is no new
@@ -209,13 +221,16 @@ export function wallAndLateralFromPoint(
  * door: `physicalDoorPose` switched on it to pick one of two four-slot tables,
  * which can express neither an empty wall nor a wall with three doors on it.
  * A record per door expresses both, and one code path serves every door.
+ *
+ * 🧭 #102 S0-prime: still the FALLBACK, not the truth. Callers on the seam
+ * between rooms (arrival-side yaw, exterior/atlas projection of a far room's
+ * door) MUST pass their own layout — reading this global at those points was
+ * the "silent 180" the issue named, because it holds whichever room reconciled
+ * last, not the room the caller is currently reasoning about.
  */
-let doorRecords: ReadonlyMap<string, { wall: DoorWall; lateral: number }> =
-  new Map();
+let doorRecords: DoorRecordsMap = new Map();
 
-export function setDoorRecords(
-  records: ReadonlyMap<string, { wall: DoorWall; lateral: number }>,
-): void {
+export function setDoorRecords(records: DoorRecordsMap): void {
   doorRecords = records;
 }
 
@@ -228,9 +243,20 @@ export function setDoorRecords(
  * entered. The fallback poses a cardinal centred on its own wall, which is
  * exactly what the retired global's "legacy" default produced there, so boot
  * geometry is unchanged.
+ *
+ * 🧭 #102 S0-prime: `layout` is the caller-supplied door records the door
+ * belongs to. When supplied it WINS over the pushed global — that is the
+ * whole reason the parameter exists (the arrival-side yaw math and the
+ * far-room projection both reason about a room the pushed global is NOT
+ * currently pointing at). Omitting it keeps the legacy "read whichever room
+ * is currently pushed" behavior for the many local-scenery callers that only
+ * ever ask about the room they are already in.
  */
-export function physicalDoorPose(id: string): PhysicalDoorPose {
-  return physicalDoorPoseOrNull(id) ?? fallbackPose(id);
+export function physicalDoorPose(
+  id: string,
+  layout?: DoorRecordsMap,
+): PhysicalDoorPose {
+  return physicalDoorPoseOrNull(id, layout) ?? fallbackPose(id);
 }
 
 /**
@@ -242,14 +268,28 @@ export function physicalDoorPose(id: string): PhysicalDoorPose {
  * wrong answer there refuses a legitimate dock or draws a module in the wrong
  * place. Callers that only need *some* pose to render local scenery can keep
  * using physicalDoorPose.
+ *
+ * 🧭 #102 S0-prime: same `layout` semantics as `physicalDoorPose` — an
+ * explicit map wins over the pushed global, so a caller reasoning about a
+ * room other than the currently-bound one gets an honest answer about THAT
+ * room instead of the currently-bound room's answer under the same id.
  */
-export function physicalDoorPoseOrNull(id: string): PhysicalDoorPose | null {
+export function physicalDoorPoseOrNull(
+  id: string,
+  layout?: DoorRecordsMap,
+): PhysicalDoorPose | null {
   // 🚪 #18: no delta parameter — the record's lateral IS the live position
   // (the read boundary folds any legacy slide residue in). Deleting the
   // parameter is deliberate over defaulting it: the double-slide bug is one
   // "helpful" caller away, and a parameter that no longer exists cannot be
   // passed twice.
-  const rec = doorRecords.get(id);
+  // 🧭 #102 S0-prime: an EXPLICIT layout is authoritative — a caller that
+  // knows which room the id belongs to (arrival-side math, projection of a
+  // far room) MUST be answered from THAT map, never the currently-pushed
+  // global. Falling through to `doorRecords` when nothing is passed keeps
+  // every same-room caller unchanged.
+  const source = layout ?? doorRecords;
+  const rec = source.get(id);
   if (rec) return poseFromWall(rec.wall, rec.lateral, rec.lateral);
   // No record. A LEGACY id is still self-describing — the four old ids were
   // born on the wall of the same name (LEGACY_ID_WALL), which is what the boot
@@ -288,9 +328,17 @@ function fallbackPose(id: string): PhysicalDoorPose {
 /** 🛰️ #28 S1: the structural PORT pose. Ports are, for now, exactly the 4
  *  cardinal berths, so this aliases `physicalDoorPose`. Later slices split the
  *  pairing/mesh (which keys off ports) from the free-door layer; keeping this
- *  name lets those call sites read against "port" while the wire stays cardinal. */
-export function physicalPortPose(id: PortId): PhysicalDoorPose {
-  return physicalDoorPose(id);
+ *  name lets those call sites read against "port" while the wire stays cardinal.
+ *
+ *  🧭 #102 S0-prime: same `layout` seam as `physicalDoorPose` — a caller that
+ *  is asking about a port on a room OTHER than the currently-pushed one (the
+ *  atlas hop, the return-leg mirror) passes THAT room's records and gets the
+ *  answer for it, never a silently-cross-room one. */
+export function physicalPortPose(
+  id: PortId,
+  layout?: DoorRecordsMap,
+): PhysicalDoorPose {
+  return physicalDoorPose(id, layout);
 }
 
 /**

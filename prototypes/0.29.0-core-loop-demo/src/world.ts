@@ -10,6 +10,7 @@ import { readDoorPolicy } from "./doorPolicy";
 import {
   physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
   type PhysicalDoorId,
+  type DoorRecordsMap,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import { Player } from "./player";
@@ -333,8 +334,28 @@ export class World {
    *  walls (owner request: remove them from view); the tube still fades in
    *  on approach and goes solid during a transit. */
   private static readonly VESTIBULE_BASE_OPACITY = 0;
-  /** Proximity fade range (m from the door's front stand-point). */
-  private static readonly VESTIBULE_FADE_RANGE = 4.0;
+  /**
+   * 🧭 #102 T2: three-threshold fade with hysteresis, tuned so the exact
+   * 45° camera detents fall CLEANLY inside one band and never straddle two.
+   * The pre-#102 code used a single linear ramp from 0..VESTIBULE_FADE_RANGE
+   * that flickered whenever the avatar hovered on the ramp — an isometric
+   * step of ±0.7 m across the fade edge cycled opacity every frame. Three
+   * thresholds fix that:
+   *   - FADE_IN_AT   (near): fade IN starts here; inside is fully material
+   *   - FADE_OUT_AT  (far):  fade OUT starts here; outside is fully faded
+   *   - FADE_HOLD    (mid):  the "material" band where a small jitter around
+   *                          a detent stays SOLID rather than starting a
+   *                          fade-out — the hysteresis gap
+   * FADE_IN_AT < FADE_HOLD < FADE_OUT_AT, so once you cross into "material"
+   * you have to drift out by at least (FADE_OUT_AT − FADE_HOLD) before the
+   * fade-out begins. Chosen to snap around the room's isometric detents:
+   *   inner 1.5 m → clears the door plate + one avatar step
+   *   hold  3.0 m → half-room, wide enough that shoulder-turns do not fade
+   *   outer 4.0 m → the retired FADE_RANGE, kept as the "gone" edge
+   */
+  private static readonly VESTIBULE_FADE_IN_AT = 1.5;
+  private static readonly VESTIBULE_FADE_HOLD = 3.0;
+  private static readonly VESTIBULE_FADE_OUT_AT = 4.0;
   // Lobby furniture (fades in to full opacity)
   private furnitureMeshes: THREE.Mesh[] = [];
   private furnitureLights: Array<{
@@ -4355,17 +4376,48 @@ export class World {
       ) {
         target = 1.0; // transit / walk-through in progress — fully material
       } else {
+        // 🧭 #102 T2: three-threshold fade with hysteresis. The FADE_IN_AT
+        // and FADE_OUT_AT thresholds bracket a MATERIAL band (radius <
+        // FADE_HOLD) that stays solid — a small isometric jitter around a
+        // 45° detent no longer restarts a fade. Inside FADE_IN_AT ⇒ 1.0;
+        // outside FADE_OUT_AT ⇒ base; between them, linear ramp on distance,
+        // biased so the material band is FLAT rather than a peaked curve.
         const dist = Math.hypot(
           playerPos.x - door.front.x,
           playerPos.z - door.front.z,
         );
-        const t = THREE.MathUtils.clamp(
-          1 - dist / World.VESTIBULE_FADE_RANGE,
-          0,
-          1,
-        );
-        target =
-          World.VESTIBULE_BASE_OPACITY + t * (1 - World.VESTIBULE_BASE_OPACITY);
+        const current = (vestibule.userData.opacity as number) ?? 0;
+        // Detect which side of the hold band the ramp should aim for. The
+        // hysteresis is: once opacity is above the hold value, don't start
+        // fading out until the avatar reaches FADE_OUT_AT; once opacity is
+        // below the hold value, don't start fading in until FADE_IN_AT.
+        const isMaterialising = current > 0.5; // already solid → hold longer
+        if (dist <= World.VESTIBULE_FADE_IN_AT) {
+          target = 1.0;
+        } else if (dist >= World.VESTIBULE_FADE_OUT_AT) {
+          target = World.VESTIBULE_BASE_OPACITY;
+        } else if (isMaterialising && dist <= World.VESTIBULE_FADE_HOLD) {
+          // Inside the hysteresis band while ALREADY solid — stay solid
+          // (no fade-out from a jitter around the detent).
+          target = 1.0;
+        } else if (!isMaterialising && dist >= World.VESTIBULE_FADE_HOLD) {
+          // Inside the hysteresis band while ALREADY faded — stay faded
+          // (no fade-in from a jitter that didn't cross the near edge).
+          target = World.VESTIBULE_BASE_OPACITY;
+        } else {
+          // Actively ramping across the hold band. Linear on distance from
+          // the appropriate edge for continuity with the flat regions.
+          const range =
+            World.VESTIBULE_FADE_OUT_AT - World.VESTIBULE_FADE_IN_AT;
+          const t = THREE.MathUtils.clamp(
+            1 - (dist - World.VESTIBULE_FADE_IN_AT) / range,
+            0,
+            1,
+          );
+          target =
+            World.VESTIBULE_BASE_OPACITY +
+            t * (1 - World.VESTIBULE_BASE_OPACITY);
+        }
       }
 
       const current = (vestibule.userData.opacity as number) ?? 0;
@@ -4389,9 +4441,18 @@ export class World {
    * whose wall the active layout decides (pairs layouts hang logical south on
    * the north wall); a free door carries its wall in its record. Anything
    * unknown reads as its own id — the pre-#91 assumption, kept as a floor.
+   *
+   * 🧭 #102 S0-prime: `layout` is the door records to reason from — the
+   * arrival-side callers pass the arrival room's snapshot so the answer is
+   * about the ARRIVAL room, not whichever room the pose global happens to
+   * hold. Omitting keeps the pushed global as a floor for local callers.
    */
-  private wallOfDoor(id: string): DoorWall {
-    if (isCardinalDoorId(id)) return physicalDoorPose(id).wall;
+  private wallOfDoor(id: string, layout?: DoorRecordsMap): DoorWall {
+    if (isCardinalDoorId(id)) return physicalDoorPose(id, layout).wall;
+    // A free door's wall lives in the record itself — read it out of the
+    // passed layout first, then the currently-pushed doc as a floor.
+    const rec = layout?.get(id);
+    if (rec) return rec.wall;
     return readAllDoorLayout().get(id)?.wall ?? "y-";
   }
 
@@ -4408,8 +4469,13 @@ export class World {
     // id exists in no other room. Falls back to the old inference when the
     // caller has nothing better (e.g. a stale session-restore route).
     departureWall?: DoorWall,
+    // 🧭 #102 S0-prime: the ARRIVAL room's door records — passed explicitly
+    // so the wall math answers about the arrival room, not the currently-
+    // pushed doc. `wallOfDoor` reads through this rather than the module
+    // global; the global is still the floor for the pre-plumbing callers.
+    arrivalLayout?: DoorRecordsMap,
   ): DoorTarget | null {
-    const depWall = departureWall ?? this.wallOfDoor(departureDoorId);
+    const depWall = departureWall ?? this.wallOfDoor(departureDoorId, arrivalLayout);
     // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
     // records — the door whose pairing points BACK at the room we came from.
     // This survives every other keypad/vestibule change on either side: a
@@ -4433,7 +4499,7 @@ export class World {
         // loop came out the same door.
         const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
         const facing = backs.find(
-          (b) => this.wallOfDoor(b.id) === oppositeWall(depWall),
+          (b) => this.wallOfDoor(b.id, arrivalLayout) === oppositeWall(depWall),
         );
         return named ?? facing ?? backs[0];
       }
@@ -4460,7 +4526,7 @@ export class World {
     // choice does not depend on DOORS insertion order.
     const want = oppositeWall(depWall);
     const onWall = DOORS.filter(
-      (d) => d.enabled && this.wallOfDoor(d.id) === want,
+      (d) => d.enabled && this.wallOfDoor(d.id, arrivalLayout) === want,
     );
     const facing = onWall.find((d) => isCardinalDoorId(d.id)) ?? onWall[0];
     if (facing) return facing;
@@ -4521,6 +4587,24 @@ export class World {
     this.fpArrivalCooldownUntil = performance.now() + 1500;
     this.fpTransitArmed = false;
     this.fpAutoOpened.clear(); // departure-room door refs died with the swap
+    // 🧭 #102 S0-prime: capture the ARRIVAL room's door records NOW, at the
+    // one call site that provably reasons about them (this is the arrival
+    // choreography, invoked after performRoomSwap's awaitInitialRoomState
+    // gate — the arrival doc is bound + reconciled here). Passing the snapshot
+    // by hand into resolveArrivalDoor + physicalDoorPose closes the ordering
+    // hazard the issue named: the previous code read whichever room the pushed
+    // global happened to hold, and applyRoomVisuals's setDoorRecords runs
+    // AFTER this method returns, so an un-migrated arrival could be reasoned
+    // about with the DEPARTURE room's records. Falls back to the room's
+    // default cardinal set when the arrival doc has no records at all — same
+    // rule reconcileDoorLayout uses when a room is unseeded but not
+    // authoritative-empty. An authoritative-empty (doorless) room legitimately
+    // yields an empty snapshot; the walk-in bail below handles that.
+    const arrivalStored = readAllDoorLayout();
+    const arrivalLayout: DoorRecordsMap =
+      arrivalStored.size > 0 || doorSetIsAuthoritative()
+        ? arrivalStored
+        : defaultDoorLayoutRecords();
     // 🔗 The arrival room's own back-pointing record picks the door (see
     // resolveArrivalDoor); the record's farDoor and the opposite-cardinal
     // guess are fallbacks only.
@@ -4529,6 +4613,7 @@ export class World {
       farDoor,
       fromRoomId,
       departureWall,
+      arrivalLayout,
     );
     if (!arrival) {
       // Doorless arrival room: nothing to walk in through. Unreachable while
@@ -4548,9 +4633,15 @@ export class World {
     //   camera delta       Δ     = h_arr − h_dep   (= −rotY of the far module)
     // Unknown departure wall ⇒ NO rotation — an honest zero, never a guess
     // (owner decision: a guessed heading is a silent R2 violation).
+    // 🧭 #102 S0-prime: the arrival pose comes from the arrival LAYOUT
+    // captured above, not the pushed global — this is the exact silent-180
+    // path the H2 harness exercises. A wrong records source here rotates the
+    // camera by the delta between the DEPARTURE room's and ARRIVAL room's
+    // reading of the SAME id, which is always the wrong answer.
     if (departureWall) {
       const hDep = poseFromWall(departureWall, 0, 0).outwardYaw;
-      const hArr = physicalDoorPose(arrival.id).outwardYaw + Math.PI;
+      const hArr =
+        physicalDoorPose(arrival.id, arrivalLayout).outwardYaw + Math.PI;
       addStationBias(hArr - hDep);
     }
     // 🚪↦ ONE-WAY turnstile (owner request): an OUT-only door refuses guest
