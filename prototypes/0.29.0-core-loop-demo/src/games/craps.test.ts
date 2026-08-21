@@ -297,6 +297,58 @@ describe('true odds (passodds / comeodds)', () => {
     // 7 → loses (like passodds).
     expect(resolveCrapsBet(b, 3, 4, 6).credited).toBe(0);
   });
+
+  // Regression: passodds/comeodds are OFF on the pass-line come-out (standard
+  // casino rule the block comment names). The felt's canPlaceBet gate blocks
+  // placement while pointBefore is null, but a hostile peer can bypass it and
+  // write a shape-valid odds bet directly into `bets:<id>:<pid>` — so the
+  // ENGINE must also refuse to settle it on come-out. Every roll must stay,
+  // regardless of whether the sum matches the backed point or is a 7.
+  it('passodds during come-out stays regardless of roll (peer-write guard)', () => {
+    for (const pick of [4, 5, 6, 8, 9, 10]) {
+      const b = bet('passodds', 10, pick);
+      // Sum that would ordinarily WIN (matches the backed point) → stay.
+      const d1 = Math.min(pick - 1, 6);
+      const d2 = pick - d1;
+      expect(resolveCrapsBet(b, d1, d2, null)).toEqual(
+        { credited: 0, keep: true, outcome: 'stay' },
+      );
+      // Sum that would ordinarily LOSE (7-out) → stay.
+      expect(resolveCrapsBet(b, 3, 4, null)).toEqual(
+        { credited: 0, keep: true, outcome: 'stay' },
+      );
+      // A neutral sum also stays.
+      expect(resolveCrapsBet(b, 5, 6, null)).toEqual(
+        { credited: 0, keep: true, outcome: 'stay' },
+      );
+    }
+  });
+
+  it('comeodds during come-out stays regardless of roll (peer-write guard)', () => {
+    for (const pick of [4, 5, 6, 8, 9, 10]) {
+      const b = bet('comeodds', 10, pick);
+      // Match on backed point → stay (not the usual 22-on-6 payout).
+      const d1 = Math.min(pick - 1, 6);
+      const d2 = pick - d1;
+      expect(resolveCrapsBet(b, d1, d2, null).keep).toBe(true);
+      expect(resolveCrapsBet(b, d1, d2, null).credited).toBe(0);
+      // 7 during come-out → stay (not the usual lose).
+      expect(resolveCrapsBet(b, 3, 4, null).keep).toBe(true);
+      expect(resolveCrapsBet(b, 3, 4, null).credited).toBe(0);
+    }
+  });
+
+  // resolveCrapsRound-level regression: a hostile peer's passodds injected
+  // during come-out must not siphon a true-odds payout out of the aggregate.
+  it('resolveCrapsRound rejects come-out passodds settlement (peer-write guard)', () => {
+    // Roll 8 on the come-out (would ordinarily be worth 22 at 6:5 true odds).
+    const r = resolveCrapsRound(
+      { hostile: [bet('passodds', 100, 8)] },
+      4, 4, null,
+    );
+    expect(r.payouts).toEqual({});                                 // no siphon
+    expect(r.remaining.hostile).toEqual([bet('passodds', 100, 8)]); // just stays
+  });
 });
 
 // ── LAY ODDS (dontpass / dontcome) ──────────────────────────────────────────
@@ -348,6 +400,49 @@ describe('lay odds (dontpassodds / dontcomeodds)', () => {
     expect(resolveCrapsBet(b, 2, 3, 6).credited).toBe(0);
     // Roll 6 (the pass point) → dontcomeodds ignores it
     expect(resolveCrapsBet(b, 3, 3, 6).keep).toBe(true);
+  });
+
+  // Mirror of the pass/comeodds come-out guard — the ENGINE must not honour a
+  // peer-injected dontpassodds/dontcomeodds during a pass-line come-out. Every
+  // roll must stay, regardless of whether the sum is a 7 (would ordinarily win
+  // lay odds) or matches the backed point (would ordinarily lose).
+  it('dontpassodds during come-out stays regardless of roll (peer-write guard)', () => {
+    for (const pick of [4, 5, 6, 8, 9, 10]) {
+      const b = bet('dontpassodds', 12, pick);
+      // 7 would normally WIN lay odds → stay instead.
+      expect(resolveCrapsBet(b, 3, 4, null)).toEqual(
+        { credited: 0, keep: true, outcome: 'stay' },
+      );
+      // Match on the backed point would normally LOSE → stay instead.
+      const d1 = Math.min(pick - 1, 6);
+      const d2 = pick - d1;
+      expect(resolveCrapsBet(b, d1, d2, null)).toEqual(
+        { credited: 0, keep: true, outcome: 'stay' },
+      );
+    }
+  });
+
+  it('dontcomeodds during come-out stays regardless of roll (peer-write guard)', () => {
+    for (const pick of [4, 5, 6, 8, 9, 10]) {
+      const b = bet('dontcomeodds', 12, pick);
+      expect(resolveCrapsBet(b, 3, 4, null).keep).toBe(true);
+      expect(resolveCrapsBet(b, 3, 4, null).credited).toBe(0);
+      const d1 = Math.min(pick - 1, 6);
+      const d2 = pick - d1;
+      expect(resolveCrapsBet(b, d1, d2, null).keep).toBe(true);
+      expect(resolveCrapsBet(b, d1, d2, null).credited).toBe(0);
+    }
+  });
+
+  it('resolveCrapsRound rejects come-out dontpassodds settlement (peer-write guard)', () => {
+    // Roll 7 on the come-out (would ordinarily be worth 12 + floor(12*5/6) = 22
+    // at 5:6 lay odds against a backed point of 6). Must stay, not pay.
+    const r = resolveCrapsRound(
+      { hostile: [bet('dontpassodds', 12, 6)] },
+      3, 4, null,
+    );
+    expect(r.payouts).toEqual({});                                     // no siphon
+    expect(r.remaining.hostile).toEqual([bet('dontpassodds', 12, 6)]); // just stays
   });
 });
 

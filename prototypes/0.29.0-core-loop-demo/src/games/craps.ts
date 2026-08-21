@@ -386,13 +386,19 @@ export function resolveCrapsBet(
     // ── PASS / COME ODDS (true odds — no house edge on this money) ───────────
     // Odds are backing an already-established point. They only decide when that
     // point is made or a 7-out fires. Between, they stay (working). Standard
-    // rule: pass-line odds are OFF on come-out — so a passodds bet whose point
-    // is `bet.pick` should not exist during a come-out phase, but if it does
-    // (peer wrote it, come-out surprise resolution, etc.) we simply stay.
+    // rule: pass-line odds are OFF on come-out (and standard casino behaviour
+    // has come odds OFF on the pass-line come-out too, matching the pass-odds
+    // rule) — so an odds bet whose point is `bet.pick` should not exist during
+    // a come-out phase. The felt's canPlaceBet gate blocks placement, but a
+    // hostile peer can bypass the UI and write `bets:<id>:<pid>` directly with
+    // a shape-valid `{type:'passodds', pick:N, amount:X}` (isCrapsBet has no
+    // table-phase view). The GUARD below enforces the rule at settle: on a
+    // come-out (pointBefore == null) the bet simply stays instead of paying.
     case 'passodds':
     case 'comeodds': {
       const backed = bet.pick;
       if (backed == null) return lost;
+      if (pointBefore === null) return stay;               // odds OFF on come-out
       if (sum === backed) {
         const [num, den] = TRUE_ODDS[backed] ?? [1, 1];
         // Stake returned + true-odds winnings, no house edge.
@@ -404,10 +410,14 @@ export function resolveCrapsBet(
     // ── DON'T PASS / DON'T COME LAY ODDS ─────────────────────────────────────
     // You're laying against the point: 7 wins, the point loses. Payout is the
     // reciprocal true odds so the money weight matches the probability.
+    // Mirror of the pass/come-odds guard above: don't-pass/don't-come odds are
+    // OFF on the pass-line come-out too (a peer-injected dontpassodds during
+    // come-out must not win at 7 — it simply stays until a point sets).
     case 'dontpassodds':
     case 'dontcomeodds': {
       const backed = bet.pick;
       if (backed == null) return lost;
+      if (pointBefore === null) return stay;               // lay odds OFF on come-out
       if (sum === 7) {
         const [num, den] = LAY_ODDS[backed] ?? [1, 1];
         return won(a + Math.floor((a * num) / den));
