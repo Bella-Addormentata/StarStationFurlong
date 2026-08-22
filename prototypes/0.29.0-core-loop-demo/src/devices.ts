@@ -86,7 +86,7 @@ import {
 } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 // 🎲 #69 G3: the craps engine (pure payout math) + its table state.
-import { canPlaceBet, crapsMaxOdds, POINT_NUMBERS } from './games/craps';
+import { canPlaceBet, crapsMaxLayOdds, crapsMaxOdds, POINT_NUMBERS } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
@@ -3275,7 +3275,13 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
       pick = pt;
     }
     // Odds cap: refuse an odds chip that would push the total past 3x/4x/5x of
-    // the flat pass/dontpass stake. Real casino behaviour — the dealer stops you.
+    // the flat pass/dontpass stake. Real casino behaviour — the dealer stops
+    // you. NB: on the DON'T side the cap limits the WIN, not the amount at
+    // risk, so a player may lay MORE than they back — the correct cap comes
+    // from `crapsMaxLayOdds` (6F uniform under the modern schedule; see the
+    // engine helper for the derivation). Using `crapsMaxOdds` on both sides
+    // (the earlier code) capped the LAID amount at 3F/4F/5F instead of the
+    // 6F the house advertises — that was the audit fix, round 2.
     if (bet.type === 'passodds' && pick != null) {
       const flat = stakeOn('pass');
       if (flat <= 0) {
@@ -3295,7 +3301,7 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
         render();
         return;
       }
-      if (stakeOn('dontpassodds', pick) + denom > crapsMaxOdds(flat, pick)) {
+      if (stakeOn('dontpassodds', pick) + denom > crapsMaxLayOdds(flat, pick)) {
         flash = 'AT THE MAX LAY ODDS FOR THIS POINT — 3x·4x·5x HOUSE CAP';
         render();
         return;

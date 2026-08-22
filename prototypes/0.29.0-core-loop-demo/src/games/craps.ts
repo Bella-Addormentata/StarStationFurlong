@@ -287,12 +287,11 @@ const PLACE_ODDS: Record<number, [number, number]> = {
 /** TRUE ODDS payout NUMERATOR:DENOMINATOR by point (no house edge — the whole
  *  reason odds bets exist). Applied to passodds and comeodds when the point is
  *  MADE (the come/pass line wins first, then the odds pays true odds on top).
- *    4 or 10 → 2:1  (three 7s roll for every winning point; unfair 3:1 would
- *                    be exact — casino gives 2:1 with no cut here because the
- *                    house is compensating with the pass line's already-taxed
- *                    edge on other numbers)
- *    5 or 9  → 3:2
- *    6 or 8  → 6:5 */
+ *  These are the MATHEMATICALLY FAIR payoffs (dice-combination count of the 7
+ *  vs the point):
+ *    4 or 10 → 2:1  (six ways to roll 7 vs three ways to roll 4/10 → 6/3 = 2)
+ *    5 or 9  → 3:2  (six ways to roll 7 vs four ways to roll 5/9  → 6/4 = 3/2)
+ *    6 or 8  → 6:5  (six ways to roll 7 vs five ways to roll 6/8  → 6/5) */
 const TRUE_ODDS: Record<number, [number, number]> = {
   4: [2, 1], 5: [3, 2], 6: [6, 5], 8: [6, 5], 9: [3, 2], 10: [2, 1],
 };
@@ -383,22 +382,23 @@ export function resolveCrapsBet(
       if (sum === 7) return won(a * 2);                    // 7 before the come point
       if (sum === bet.point) return lost;
       return stay;
-    // ── PASS / COME ODDS (true odds — no house edge on this money) ───────────
-    // Odds are backing an already-established point. They only decide when that
-    // point is made or a 7-out fires. Between, they stay (working). Standard
-    // rule: pass-line odds are OFF on come-out (and standard casino behaviour
-    // has come odds OFF on the pass-line come-out too, matching the pass-odds
-    // rule) — so an odds bet whose point is `bet.pick` should not exist during
-    // a come-out phase. The felt's canPlaceBet gate blocks placement, but a
-    // hostile peer can bypass the UI and write `bets:<id>:<pid>` directly with
-    // a shape-valid `{type:'passodds', pick:N, amount:X}` (isCrapsBet has no
-    // table-phase view). The GUARD below enforces the rule at settle: on a
-    // come-out (pointBefore == null) the bet simply stays instead of paying.
-    case 'passodds':
-    case 'comeodds': {
+    // ── PASS-LINE ODDS (true odds — no house edge on this money) ────────────
+    // Pass-line odds back the CURRENT PASS-LINE POINT. `bet.pick` must equal
+    // `pointBefore`: canPlaceBet blocks a UI placement while pointBefore is
+    // null OR when the picked number doesn't match, but a hostile peer can
+    // bypass the felt and write `bets:<id>:<pid>` directly with a shape-valid
+    // `{type:'passodds', pick:8, amount:X}` while the table's point is 6. If
+    // we let that settle at true odds, the peer siphons pass-odds payouts on
+    // the WRONG NUMBER (audit remediation, round 2). We FAIL CLOSED: any
+    // passodds whose pick doesn't match pointBefore loses immediately (this
+    // also handles the come-out case naturally — pointBefore is null then, so
+    // no numeric pick can match, and the bet loses). The player's stake is
+    // already spent when the bet was placed, so `lost` simply keeps those
+    // chips on the house side rather than paying out fraudulent odds.
+    case 'passodds': {
       const backed = bet.pick;
       if (backed == null) return lost;
-      if (pointBefore === null) return stay;               // odds OFF on come-out
+      if (backed !== pointBefore) return lost;             // pick MUST bind to pass-line point
       if (sum === backed) {
         const [num, den] = TRUE_ODDS[backed] ?? [1, 1];
         // Stake returned + true-odds winnings, no house edge.
@@ -407,17 +407,49 @@ export function resolveCrapsBet(
       if (sum === 7) return lost;
       return stay;
     }
-    // ── DON'T PASS / DON'T COME LAY ODDS ─────────────────────────────────────
-    // You're laying against the point: 7 wins, the point loses. Payout is the
-    // reciprocal true odds so the money weight matches the probability.
-    // Mirror of the pass/come-odds guard above: don't-pass/don't-come odds are
-    // OFF on the pass-line come-out too (a peer-injected dontpassodds during
-    // come-out must not win at 7 — it simply stays until a point sets).
-    case 'dontpassodds':
+    // ── COME ODDS (true odds) ────────────────────────────────────────────────
+    // Come odds back a COME POINT — which is INDEPENDENT of the pass-line's
+    // point. A player's come bet that traveled to 8 backs 8 with `comeodds`
+    // even after the pass line makes its own point and reverts to come-out.
+    // So comeodds resolves against `bet.pick` regardless of pass-line phase
+    // (per the standard rule that come bets and their odds are always on).
+    case 'comeodds': {
+      const backed = bet.pick;
+      if (backed == null) return lost;
+      if (sum === backed) {
+        const [num, den] = TRUE_ODDS[backed] ?? [1, 1];
+        return won(a + Math.floor((a * num) / den));
+      }
+      if (sum === 7) return lost;
+      return stay;
+    }
+    // ── DON'T PASS LAY ODDS ──────────────────────────────────────────────────
+    // Mirror of passodds: LAY against the CURRENT PASS-LINE POINT. `bet.pick`
+    // must equal `pointBefore`; a peer-injected dontpassodds with mismatched
+    // pick is a siphon attempt (would win on 7 without ever risking against
+    // the actual pass-line point) and fails closed (audit remediation, round
+    // 2). Come-out (pointBefore null) also falls under the mismatch — no lay
+    // odds can back a point that doesn't yet exist.
+    case 'dontpassodds': {
+      const backed = bet.pick;
+      if (backed == null) return lost;
+      if (backed !== pointBefore) return lost;             // pick MUST bind to pass-line point
+      if (sum === 7) {
+        const [num, den] = LAY_ODDS[backed] ?? [1, 1];
+        return won(a + Math.floor((a * num) / den));
+      }
+      if (sum === backed) return lost;
+      return stay;
+    }
+    // ── DON'T COME LAY ODDS ──────────────────────────────────────────────────
+    // Mirror of comeodds: lay against the bet's OWN come point, independent of
+    // the pass-line phase (the traveled dontcome flat bet keeps working on the
+    // pass-line come-out and so must its lay odds — per the standard "don't
+    // come odds are always on" rule; audit remediation, round 2). The bet is
+    // free to back any of its come-point numbers via `bet.pick`.
     case 'dontcomeodds': {
       const backed = bet.pick;
       if (backed == null) return lost;
-      if (pointBefore === null) return stay;               // lay odds OFF on come-out
       if (sum === 7) {
         const [num, den] = LAY_ODDS[backed] ?? [1, 1];
         return won(a + Math.floor((a * num) / den));
@@ -573,14 +605,37 @@ export function crapsBetLabel(bet: CrapsBet): string {
 
 /** MAXIMUM ODDS the house lets a player back a flat pass/come bet with. The
  *  classic "3x/4x/5x" schedule (the standard modern casino cap): 3x on 4/10,
- *  4x on 5/9, 5x on 6/8. Payout stays true odds; the CAP limits stake weight.
- *  Exported for the UI to gate odds-chip placement and for tests to pin. */
+ *  4x on 5/9, 5x on 6/8. Payout stays true odds; the CAP limits stake weight
+ *  and thus the WINNING amount. Exported for the UI to gate odds-chip placement
+ *  and for tests to pin. Zero or negative flat stakes floor at 0. */
 export function crapsMaxOdds(flatStake: number, point: number): number {
   const mult = point === 4 || point === 10 ? 3
              : point === 5 || point === 9 ? 4
              : point === 6 || point === 8 ? 5
              : 0;
   return Math.max(0, flatStake) * mult;
+}
+
+/** MAXIMUM LAY (dontpass/dontcome odds) the house lets a player put out. On the
+ *  don't side the 3x/4x/5x schedule limits the POSSIBLE WIN, not the amount at
+ *  risk — so the player may LAY MORE than they would BACK. Concretely, for a
+ *  flat stake F:
+ *    4/10 → win cap 3F, lay pays 1:2, so laid = 3F · 2 = 6F  (wins 3F)
+ *    5/9  → win cap 4F, lay pays 2:3, so laid = 4F · 3/2 = 6F (wins 4F)
+ *    6/8  → win cap 5F, lay pays 5:6, so laid = 5F · 6/5 = 6F (wins 5F)
+ *  All points collapse to a uniform 6F lay cap under the modern schedule; the
+ *  computation stays general so a bespoke schedule still lays the right amount.
+ *  The felt uses this to allow the correct don't-side chip weight instead of
+ *  the pass-side cap that undercuts the advertised maximum (audit remediation,
+ *  round 2). Returns 0 for a non-point input or a zero/negative flat stake. */
+export function crapsMaxLayOdds(flatStake: number, point: number): number {
+  const winCap = crapsMaxOdds(flatStake, point);          // e.g., 3F for 4/10
+  if (winCap <= 0) return 0;
+  const [num, den] = LAY_ODDS[point] ?? [0, 0];
+  if (num <= 0) return 0;                                  // non-point input
+  // WIN = laid * num/den; solve for laid at the win cap. Floor because the
+  // house always rounds a max-lay DOWN to what pays a clean integer win.
+  return Math.floor((winCap * den) / num);
 }
 
 /** Plain-language call for a settled roll (the stickman's shout). */
