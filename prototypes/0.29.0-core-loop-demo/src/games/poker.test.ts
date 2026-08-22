@@ -448,7 +448,11 @@ describe('poker: evaluateBest handles 5..7 cards without padding', () => {
       currentBet: 0,
       minRaise: 10,
       pot: 20,
-      deck: [c(2, 8), c(3, 9)],
+      // Enough remaining deck to safely open the turn (burn+card=2) and the
+      // river (burn+card=2) — the new isPokerState per-street guard requires
+      // deck.length >= 4 on flop so a hostile peer can't plant a short-deck
+      // state that would drive dealCommunity to shift undefined.
+      deck: [c(2, 8), c(3, 9), c(2, 10), c(3, 11)],
       actions: [],
       bot: true,
     };
@@ -584,7 +588,9 @@ describe('poker: chooseBotAction never emits an action applyPokerAction will rej
       currentBet: 0,
       minRaise: 10,
       pot: 60,
-      deck: [c(0, 6), c(0, 7)],
+      // Same per-street guard requirement as the flop test above: deck must
+      // hold enough cards to open the remaining streets.
+      deck: [c(0, 6), c(0, 7), c(0, 8), c(0, 9)],
       actions: [],
       bot: true,
     };
@@ -623,15 +629,20 @@ describe('poker: dealHand handles all-in-from-blinds without deadlocking', () =>
       handsPlayed: 0,
     };
     const dealt = dealHand(drained);
-    // Post-fix expectations:
+    // Post-fix expectations (also asserting round-3 unmatched-blind refund).
     expect(dealt.status).toBe('playing');
     expect(dealt.players.button.allIn).toBe(true);    // all-in from SB
     expect(dealt.players.button.stack).toBe(0);
     expect(dealt.players.bigBlind.allIn).toBe(false); // still has stack
     // toAct is bigBlind (they hold the fold-or-continue decision).
     expect(dealt.toAct).toBe('bigBlind');
-    // currentBet is max(sb, bb) = 10 (BB is still the standing bet).
-    expect(dealt.currentBet).toBe(10);
+    // currentBet is min(sb-post, bb-post) = 3 (matched cap after refund of
+    // the 7 chips BB posted that button couldn't match). Pre-round-3 this
+    // was 10 with pot=13 — a 3-chip winner could walk with 13 chips they
+    // never contested against. See dealHand refund block.
+    expect(dealt.currentBet).toBe(3);
+    expect(dealt.pot).toBe(6);
+    expect(dealt.players.bigBlind.stack).toBe(997); // 1000 - 3 posted
   });
 
   it('deadlocked-case: bigBlind can now advance the hand end-to-end', () => {
@@ -686,7 +697,13 @@ describe('poker: dealHand handles all-in-from-blinds without deadlocking', () =>
     expect(dealt.community.length).toBe(5);
   });
 
-  it('both all-in from blinds: hand runs directly to showdown', () => {
+  it('both all-in from blinds (with refund): matched at 3, BB retains 2 residual, closes on a check', () => {
+    // Round-3 unmatched-blind refund changes the shape here: BB posts 5
+    // (all-in), refund is 5-3=2 → BB.stack=2, streetBet=3, allIn=false.
+    // The matched pot is 3+3=6, and BB now holds a fold-or-continue decision
+    // (opponent all-in, but BB technically has 2 chips left that they can
+    // walk away with by folding). A single check from BB closes preflop
+    // (opponent-can-act gate) and cascades to showdown.
     const s0 = beginPoker(initialPokerState(1), {
       button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
     });
@@ -699,13 +716,22 @@ describe('poker: dealHand handles all-in-from-blinds without deadlocking', () =>
       status: 'hand-over',
       handsPlayed: 0,
     };
-    const dealt = dealHand(drained);
+    let dealt = dealHand(drained);
     expect(dealt.players.button.allIn).toBe(true);
-    expect(dealt.players.bigBlind.allIn).toBe(true);
+    expect(dealt.players.button.stack).toBe(0);
+    expect(dealt.players.bigBlind.allIn).toBe(false); // refunded 2 → 2 residual
+    expect(dealt.players.bigBlind.stack).toBe(2);
+    expect(dealt.currentBet).toBe(3);
+    expect(dealt.pot).toBe(6);
+    expect(dealt.toAct).toBe('bigBlind');
+    expect(dealt.status).toBe('playing');
+    // Close preflop with BB's check → showdown.
+    dealt = applyPokerAction(dealt, { seat: 'bigBlind', kind: 'check' });
     expect(['hand-over', 'match-over']).toContain(dealt.status);
     expect(dealt.street).toBe('complete');
     expect(dealt.community.length).toBe(5);
-    // Chips conserved: 3 + 5 = 8 total across both stacks post-showdown.
+    // Chips conserved: 3 + 5 = 8 total across both stacks post-showdown
+    // (BB's 2 residual chips plus the 6-chip pot both accounted for).
     expect(dealt.players.button.stack + dealt.players.bigBlind.stack).toBe(8);
   });
 
@@ -806,3 +832,363 @@ describe('poker: pokerForfeit awards the pot as well as the residual stack', () 
     expect(twice).toBe(once); // untouched — no double credit
   });
 });
+
+// ── Round-3 audit regressions (BLOCKER / MAJOR / MAJOR / MAJOR / MAJOR) ─────
+
+describe('poker: dealHand refunds unmatched blinds when one poster is short-stack', () => {
+  // Round-3 audit finding (poker.ts:283). Heads-up removes SIDE pots, not
+  // UNMATCHED-BET refunds. When one seat can't cover the full blind, the
+  // over-committed portion of the other seat's post must be returned to
+  // their stack — otherwise the short-stack seat can win chips they were
+  // never risked to win. Pre-fix: stacks 3/1000 with 5/10 blinds produced
+  // pot=13, and if the 3-chip player took it they'd walk with 13 (winning
+  // 7 chips of BB money that BB never had a chance to fold on).
+  it('SB-short: opponent (BB) refund of the uncalled amount', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    // Force the drained scenario: button has only 3 chips vs BB's 1000.
+    const drained: PokerState = {
+      ...s0,
+      players: {
+        button: { ...s0.players.button, stack: 3, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        bigBlind: { ...s0.players.bigBlind, stack: 1000, streetBet: 0, handBet: 0, folded: false, allIn: false },
+      },
+      status: 'hand-over',
+      handsPlayed: 0,
+    };
+    const dealt = dealHand(drained);
+    // Matched-pot cap = min(3, 10) = 3. Button all-in for 3, BB posts 3
+    // (7-chip refund). Total pot contest = 6 chips.
+    expect(dealt.players.button.streetBet).toBe(3);
+    expect(dealt.players.bigBlind.streetBet).toBe(3);
+    expect(dealt.players.button.handBet).toBe(3);
+    expect(dealt.players.bigBlind.handBet).toBe(3);
+    expect(dealt.pot).toBe(6);
+    expect(dealt.players.button.allIn).toBe(true);
+    expect(dealt.players.button.stack).toBe(0);
+    // BB stack: started 1000, posted the matched 3 (7 refunded from the
+    // 10 attempted post) → 1000 - 3 = 997.
+    expect(dealt.players.bigBlind.stack).toBe(997);
+    // Chip conservation: refunded chips remain accounted for in stack+pot.
+    const preTotal = drained.players.button.stack + drained.players.bigBlind.stack;
+    const postTotal = dealt.players.button.stack + dealt.players.bigBlind.stack + dealt.pot;
+    expect(postTotal).toBe(preTotal);
+  });
+
+  it('BB-short: opponent (button/SB) refund of the uncalled amount', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    // Symmetric edge: BB has only 4 chips; SB=5, BB=10 blinds. Matched cap =
+    // min(5, 4) = 4. Button posts 5 attempted → refund 1 → posts 4.
+    const drained: PokerState = {
+      ...s0,
+      players: {
+        button: { ...s0.players.button, stack: 1000, streetBet: 0, handBet: 0, folded: false, allIn: false },
+        bigBlind: { ...s0.players.bigBlind, stack: 4, streetBet: 0, handBet: 0, folded: false, allIn: false },
+      },
+      status: 'hand-over',
+      handsPlayed: 0,
+    };
+    const dealt = dealHand(drained);
+    expect(dealt.players.button.streetBet).toBe(4);
+    expect(dealt.players.bigBlind.streetBet).toBe(4);
+    expect(dealt.pot).toBe(8);
+    expect(dealt.players.button.stack).toBe(996);
+    expect(dealt.players.bigBlind.stack).toBe(0);
+    expect(dealt.players.bigBlind.allIn).toBe(true);
+    const preTotal = drained.players.button.stack + drained.players.bigBlind.stack;
+    const postTotal = dealt.players.button.stack + dealt.players.bigBlind.stack + dealt.pot;
+    expect(postTotal).toBe(preTotal);
+  });
+
+  it('both posters cover both blinds → no refund, canonical pot', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    // Baseline case (both cover their blinds fully). Canonical pot = SB+BB.
+    expect(s0.pot).toBe(15);
+    expect(s0.players.button.streetBet).toBe(5);
+    expect(s0.players.bigBlind.streetBet).toBe(10);
+  });
+});
+
+describe('poker: raise below currentBet is rejected (not accepted as an all-in raise)', () => {
+  // Round-3 audit finding (poker.ts:405). Pre-fix, `amount === maxTarget`
+  // (all-in) bypassed the minimum-raise check even when amount < currentBet,
+  // so a short-stack "raise" to 70 when currentBet=100 was accepted AND
+  // currentBet was lowered to 70 (corrupting the state machine — the
+  // opponent's callAmount went negative, legalActions fell out of sync).
+  // Such a short stack's only legal aggression is CALL (all-in for what
+  // they have); the engine must reject the "raise" and let them call.
+  it('raise to amount below currentBet is rejected', () => {
+    // Construct a mid-flop state: button opened with a big bet, BB has a
+    // short stack. BB attempts to "raise" to less than the standing bet.
+    const s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'flop',
+      players: {
+        button: {
+          id: 'A', stack: 900, streetBet: 100, handBet: 100,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: false,
+        },
+        bigBlind: {
+          id: 'W', stack: 50, streetBet: 20, handBet: 20,
+          holeCards: [c(2, 13), c(1, 7)], folded: false, allIn: false,
+        },
+      },
+      community: [c(0, 14), c(1, 5), c(3, 2)],
+      toAct: 'bigBlind',
+      currentBet: 100,
+      minRaise: 100,
+      pot: 220,
+      deck: [c(2, 8), c(3, 9), c(2, 10), c(3, 11)],
+      actions: [{ seat: 'button', kind: 'bet', amount: 100, street: 'flop' }],
+      bot: false,
+    };
+    expect(isPokerState(s)).toBe(true);
+    // BB's maxTarget = 50 + 20 = 70; currentBet = 100. A "raise" to 70 is
+    // BELOW currentBet, must be rejected (their only legal aggression is
+    // CALL — they'll be all-in for 50 more chips).
+    const next = applyPokerAction(s, { seat: 'bigBlind', kind: 'raise', amount: 70 });
+    expect(next).toBe(s); // unchanged — action refused
+    // currentBet NOT corrupted:
+    expect(next.currentBet).toBe(100);
+    // A CALL is still legal (goes all-in for the 50 they have).
+    const called = applyPokerAction(s, { seat: 'bigBlind', kind: 'call' });
+    expect(called).not.toBe(s);
+    expect(called.players.bigBlind.allIn).toBe(true);
+    expect(called.players.bigBlind.stack).toBe(0);
+  });
+
+  it('raise into an already-all-in opponent is rejected', () => {
+    // The old raise branch had no opponent-can-act check; a bet/raise into a
+    // shoved opponent just piled chips into an uncontestable pot without
+    // changing the outcome. Reject it — a raise requires someone to raise AT.
+    const s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'flop',
+      players: {
+        button: {
+          id: 'A', stack: 0, streetBet: 100, handBet: 100,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: true,
+        },
+        bigBlind: {
+          id: 'W', stack: 900, streetBet: 100, handBet: 100,
+          holeCards: [c(2, 13), c(1, 7)], folded: false, allIn: false,
+        },
+      },
+      community: [c(0, 14), c(1, 5), c(3, 2)],
+      toAct: 'bigBlind',
+      currentBet: 100,
+      minRaise: 100,
+      pot: 200,
+      deck: [c(2, 8), c(3, 9), c(2, 10), c(3, 11)],
+      actions: [{ seat: 'button', kind: 'call', amount: 0, street: 'flop' }],
+      bot: false,
+    };
+    expect(isPokerState(s)).toBe(true);
+    // Even a legal-looking raise-to-300 is refused (opponent is all-in).
+    const next = applyPokerAction(s, { seat: 'bigBlind', kind: 'raise', amount: 300 });
+    expect(next).toBe(s);
+  });
+});
+
+describe('poker: legalActions hides aggression when the opponent can\'t respond or player can\'t exceed', () => {
+  // Round-3 audit finding (poker.ts:336). legalActions unconditionally
+  // advertised 'bet'/'raise' whenever !p.allIn — the UI then let the human
+  // pick a raise target that the state machine would refuse (or worse,
+  // pick one that corrupted the pot into an uncontestable ghost pool).
+  it('opponent all-in: no raise offered', () => {
+    const s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'flop',
+      players: {
+        button: {
+          id: 'A', stack: 0, streetBet: 100, handBet: 100,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: true,
+        },
+        bigBlind: {
+          id: 'W', stack: 900, streetBet: 100, handBet: 100,
+          holeCards: [c(2, 13), c(1, 7)], folded: false, allIn: false,
+        },
+      },
+      community: [c(0, 14), c(1, 5), c(3, 2)],
+      toAct: 'bigBlind',
+      currentBet: 100,
+      minRaise: 100,
+      pot: 200,
+      deck: [c(2, 8), c(3, 9), c(2, 10), c(3, 11)],
+      actions: [{ seat: 'button', kind: 'call', amount: 0, street: 'flop' }],
+      bot: false,
+    };
+    expect(isPokerState(s)).toBe(true);
+    const acts = legalActions(s, 'bigBlind');
+    expect(acts).not.toContain('raise');
+    expect(acts).not.toContain('bet');
+    // check/fold still there (the matched amount means BB can check through).
+    expect(acts).toContain('check');
+    expect(acts).toContain('fold');
+  });
+
+  it('player cannot exceed currentBet with maxBet: no raise offered', () => {
+    // BB's max possible street-bet is exactly currentBet — a "raise" would
+    // not actually raise. Only CALL (all-in) is legally aggressive here.
+    const s: PokerState = {
+      ...initialPokerState(1),
+      status: 'playing',
+      street: 'flop',
+      players: {
+        button: {
+          id: 'A', stack: 900, streetBet: 100, handBet: 100,
+          holeCards: [c(0, 3), c(1, 4)], folded: false, allIn: false,
+        },
+        bigBlind: {
+          // maxBet = stack + streetBet = 80 + 20 = 100. Cannot exceed 100.
+          id: 'W', stack: 80, streetBet: 20, handBet: 20,
+          holeCards: [c(2, 13), c(1, 7)], folded: false, allIn: false,
+        },
+      },
+      community: [c(0, 14), c(1, 5), c(3, 2)],
+      toAct: 'bigBlind',
+      currentBet: 100,
+      minRaise: 100,
+      pot: 220,
+      deck: [c(2, 8), c(3, 9), c(2, 10), c(3, 11)],
+      actions: [{ seat: 'button', kind: 'bet', amount: 100, street: 'flop' }],
+      bot: false,
+    };
+    expect(isPokerState(s)).toBe(true);
+    const acts = legalActions(s, 'bigBlind');
+    expect(acts).not.toContain('raise');
+    expect(acts).toContain('call'); // all-in call is the only aggression
+    expect(acts).toContain('fold');
+  });
+
+  it('normal preflop: raise IS offered when both conditions hold', () => {
+    // Regression guard for the fix — the base case (both seats have chips
+    // and the opponent can respond) still offers raise.
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    expect(legalActions(s0, 'button')).toContain('raise');
+  });
+});
+
+describe('poker: isPokerState rejects short-deck / stale-community active states', () => {
+  // Round-3 audit finding (poker.ts:1117). The trust-boundary guard used to
+  // accept any deck-array length, so a hostile peer could plant a state with
+  // status='playing', an empty deck, and the next transition would call
+  // dealCommunity → deck.shift()! → undefined appended to community, then
+  // handed to evaluate7 which would throw or produce garbage. Guard the
+  // engine's own invariants at the boundary.
+  it('rejects a preflop playing state with a short deck', () => {
+    const good = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    expect(isPokerState(good)).toBe(true);
+    // Truncate the deck below the preflop cascade requirement (≥ 8).
+    const bad = { ...good, deck: good.deck.slice(0, 5) };
+    expect(isPokerState(bad)).toBe(false);
+  });
+
+  it('rejects a flop playing state with a short deck', () => {
+    const good = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    // Fabricate a flop state with mismatched deck.
+    const bad: PokerState = {
+      ...good,
+      street: 'flop',
+      community: [c(0, 2), c(0, 3), c(0, 4)],
+      deck: [c(0, 5)], // < 4 = insufficient for turn+river
+    };
+    expect(isPokerState(bad)).toBe(false);
+  });
+
+  it('rejects a flop playing state with wrong community length', () => {
+    const good = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const bad: PokerState = {
+      ...good,
+      street: 'flop',
+      // community should have EXACTLY 3 cards on the flop.
+      community: [c(0, 2), c(0, 3)],
+      deck: good.deck.slice(0, 40),
+    };
+    expect(isPokerState(bad)).toBe(false);
+  });
+
+  it('rejects a playing state with null hole cards', () => {
+    const good = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const bad = {
+      ...good,
+      players: {
+        ...good.players,
+        button: { ...good.players.button, holeCards: null },
+      },
+    };
+    expect(isPokerState(bad)).toBe(false);
+  });
+
+  it('accepts terminal states (hand-over/match-over) regardless of deck length', () => {
+    // The guard only enforces per-street invariants on ACTIVE states — a
+    // terminal state has no upcoming dealCommunity call, so its deck is
+    // unconstrained (this preserves the fold/showdown terminal states).
+    let s = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    s = applyPokerAction(s, { seat: 'button', kind: 'fold' });
+    expect(s.status).toBe('hand-over');
+    // Even if we manually drain the deck, the terminal state remains valid.
+    expect(isPokerState({ ...s, deck: [] })).toBe(true);
+  });
+
+  it('rejects a playing state at street=showdown (engine invariant)', () => {
+    // showdown/complete always come with status='hand-over' or 'match-over'
+    // (the transitions call endHand). A playing + showdown state is
+    // inconsistent — no legitimate write produces it.
+    const good = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const bad: PokerState = { ...good, street: 'showdown', community: [c(0,2), c(0,3), c(0,4), c(0,5), c(0,6)] };
+    expect(isPokerState(bad)).toBe(false);
+  });
+});
+
+describe('poker: pokerForfeit marks the forfeiter folded so their hole cards are mucked', () => {
+  // Round-3 audit finding (poker.ts:675). Before the fix, pokerForfeit set
+  // street='complete' but never marked folded=true. readVisiblePokerState's
+  // showdown-visible branch (street==='showdown' || 'complete') then REVEALED
+  // both hole-card hands to spectators — a forfeit is documented as
+  // fold-equivalent and standard poker mucks the folder's hand.
+  it('spectator sees the forfeiter\'s cards mucked (not revealed)', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const forfeited = pokerForfeit(s0, 'button');
+    expect(forfeited.players.button.folded).toBe(true);
+    const spec = readVisiblePokerState(forfeited, 'someoneElse');
+    expect(spec.players.button.holeCards).toBeNull(); // mucked
+    // Winner's cards still visible in the recap (see the same convention as
+    // the fold-mucking test — a determined peer can read raw doc anyway).
+    expect(spec.players.bigBlind.holeCards).not.toBeNull();
+  });
+
+  it('the forfeiter still sees their own cards after forfeit', () => {
+    const s0 = beginPoker(initialPokerState(1), {
+      button: 'B', bigBlind: 'W', startingStack: 1000, bot: false,
+    });
+    const forfeited = pokerForfeit(s0, 'button');
+    const own = readVisiblePokerState(forfeited, 'B'); // 'B' was button
+    expect(own.players.button.holeCards).not.toBeNull();
+  });
+});
+

@@ -7,17 +7,24 @@
  * so no adversary means the "cards are technically public" concern from
  * games-plan.md does not apply here).
  *
- * RULES (standard Klondike, DRAW-ONE — the most forgiving default; a
- * DRAW-THREE toggle is out of scope for v1):
+ * RULES (standard Klondike, DRAW-ONE or DRAW-THREE — both modes are shipped;
+ * default is DRAW-THREE, matching the classic Windows / physical deal, with
+ * a DRAW-ONE toggle for the more forgiving practice mode):
  *  - 7 TABLEAU piles: pile i (0-based) is dealt i+1 cards, only the TOP card
  *    face-up. Piles descend by rank in ALTERNATING COLOURS. Only a KING
  *    (rank 13) may occupy an empty tableau pile.
  *  - 4 FOUNDATIONS (one per suit): ascend by rank in the SAME suit, starting
  *    with the ACE (2 of ♣ on Ace of ♣, etc.). WIN when all 52 cards sit on
  *    foundations.
- *  - STOCK / WASTE: draw one card face-up from stock to waste per DRAW. When
- *    stock is empty, RECYCLE the waste back to stock (order preserved so the
- *    same draw sequence repeats — deterministic).
+ *  - STOCK / WASTE:
+ *      · DRAW-ONE: one card per DRAW moves from stock (top) to waste (top).
+ *      · DRAW-THREE: up to three cards per DRAW move stock→waste in order,
+ *        so `waste[waste.length - 1]` remains the freshly-drawn top and only
+ *        that card is playable (standard rule — the 3-card fan is display only).
+ *    When stock is empty and waste is non-empty, a `draw` RECYCLES the
+ *    waste back to stock preserving the original draw order (see recycle
+ *    convention comment in `applySolitaireMove`) — deterministic and
+ *    unlimited (v1).
  *  - MOVES:
  *      • waste → tableau: waste top onto legal tableau pile.
  *      • waste → foundation: waste top onto legal foundation.
@@ -26,10 +33,23 @@
  *        The run must already be a valid descending-alternating-colour run.
  *      • tableau → foundation: move ONLY the top card (single-card rule).
  *      • foundation → tableau: allowed (rare — for unblocking); one card only.
- *      • draw: stock → waste (single card). Recycle waste ⇢ stock when stock
- *        is empty and waste is non-empty (single call).
+ *      • draw: stock → waste (1 or 3 cards per `drawMode`). Recycle waste ⇢
+ *        stock when stock is empty and waste is non-empty (single call).
+ *      • undo: pop the previous state off the undo history (see below).
  *  - Flipping a newly-exposed tableau top card face-up happens AUTOMATICALLY
  *    after any move that empties the top face-up cluster of a source pile.
+ *
+ * UNDO HISTORY (bounded, per-move)
+ *   Every non-`undo` transition PUSHES a snapshot of the pre-move state onto
+ *   `undoHistory` before applying the move. `undo` pops the most recent
+ *   snapshot back to become the new current state (dropping its own history
+ *   ancestor from that snapshot's tail — the popped state itself sits on top
+ *   of the history that produced it). The stack is capped (see
+ *   MAX_UNDO_HISTORY) so a marathon session cannot grow the room doc without
+ *   bound; the oldest snapshot is dropped when the cap is hit. Snapshots are
+ *   deep clones of the RENDERABLE fields (tableau/stock/waste/foundations/…)
+ *   with `undoHistory: []` (we don't recursively store the history-of-history
+ *   — that would multiply doc size by the max depth).
  *
  * DOC / RACE DISCIPLINE
  *   Only the CLAIMED seat holder may write; a whole-value LWW write settles
@@ -45,6 +65,14 @@ import { isCard, isDeck, isRed, rankOf, shuffledDeck, suitOf } from './cards';
 
 export type SolitairePileKind = 'tableau' | 'stock' | 'waste' | 'foundation';
 export type SolitaireStatus = 'waiting' | 'playing' | 'won';
+
+/** Draw-per-tap mode. 1 = draw-one (forgiving), 3 = draw-three (classic). */
+export type SolitaireDrawMode = 1 | 3;
+
+/** Hard cap on the undo history size so the room doc stays bounded even in a
+ *  marathon session. 128 moves is plenty for practical play — most games
+ *  don't exceed ~150 total moves, and undoing further than a handful is rare. */
+export const MAX_UNDO_HISTORY = 128;
 
 /** A tableau card with its face state (face-up ⇔ visible/playable top). */
 export interface SolitaireTableauCard {
@@ -72,12 +100,23 @@ export interface SolitaireState {
   moves: number;
   /** Rebound draws — for a future "Redeals allowed" cap; v1 leaves this open. */
   redeals: number;
+  /** Cards moved per DRAW (1 or 3). Fixed for the lifetime of the deal. */
+  drawMode: SolitaireDrawMode;
+  /** Bounded stack of pre-move snapshots (see MAX_UNDO_HISTORY). Each entry
+   *  has `undoHistory: []` (no recursive nesting). Oldest at index 0. */
+  undoHistory: SolitaireSnapshot[];
 }
+
+/** Snapshot of a SolitaireState without the recursive undoHistory field. */
+export type SolitaireSnapshot = Omit<SolitaireState, 'undoHistory'> & {
+  undoHistory: [];
+};
 
 // ── Move descriptor (union — the applyMove tag is `type`) ────────────────────
 
 export type SolitaireMove =
-  /** Draw one card from stock → waste. Recycles the waste when stock empty. */
+  /** Draw one or three cards from stock → waste (per drawMode). Recycles
+   *  the waste when stock empty. */
   | { type: 'draw' }
   /** Move top of waste → tableau pile `to`. */
   | { type: 'waste-to-tableau'; to: number }
@@ -88,12 +127,19 @@ export type SolitaireMove =
   /** Move top of tableau pile `from` → foundation for its suit. */
   | { type: 'tableau-to-foundation'; from: number }
   /** Move top of foundation for suit `suit` → tableau pile `to`. */
-  | { type: 'foundation-to-tableau'; suit: number; to: number };
+  | { type: 'foundation-to-tableau'; suit: number; to: number }
+  /** Pop the previous state off the undo history and make it current. */
+  | { type: 'undo' };
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-/** Fresh waiting-to-start table; no cards dealt (deal() flips 'playing'). */
-export function initialSolitaireState(seed: number): SolitaireState {
+/** Fresh waiting-to-start table; no cards dealt (deal() flips 'playing').
+ *  `drawMode` defaults to 3 (classic Klondike) — the caller can toggle it
+ *  via `setSolitaireDrawMode` before dealing. */
+export function initialSolitaireState(
+  seed: number,
+  drawMode: SolitaireDrawMode = 3,
+): SolitaireState {
   return {
     kind: 'solitaire',
     player: null,
@@ -105,12 +151,26 @@ export function initialSolitaireState(seed: number): SolitaireState {
     seed: seed | 0 || 1,
     moves: 0,
     redeals: 0,
+    drawMode,
+    undoHistory: [],
   };
+}
+
+/** Return a copy of `state` with `drawMode` set. Legal only in 'waiting'
+ *  (before the deal) — changing it mid-hand would silently invalidate
+ *  the undo history's mode invariant. */
+export function setSolitaireDrawMode(
+  state: SolitaireState,
+  drawMode: SolitaireDrawMode,
+): SolitaireState {
+  if (state.status !== 'waiting') return state;
+  return { ...state, drawMode };
 }
 
 /**
  * Deal a fresh Klondike game onto `state` — pile i gets i+1 cards, top card
  * face-up, remainder becomes the stock (28 dealt to tableau; 24 in stock).
+ * Clears any prior undo history (a fresh hand starts fresh).
  */
 export function dealSolitaire(state: SolitaireState): SolitaireState {
   const deck = shuffledDeck(state.seed);
@@ -131,6 +191,7 @@ export function dealSolitaire(state: SolitaireState): SolitaireState {
     foundations: [[], [], [], []],
     moves: 0,
     redeals: 0,
+    undoHistory: [],
   };
 }
 
@@ -184,6 +245,11 @@ export function legalSolitaireMoves(state: SolitaireState): SolitaireMove[] {
   // draw / recycle — always legal if there's anything to draw or recycle.
   if (state.stock.length > 0 || state.waste.length > 0) {
     moves.push({ type: 'draw' });
+  }
+
+  // undo — legal whenever a snapshot exists to restore.
+  if (state.undoHistory.length > 0) {
+    moves.push({ type: 'undo' });
   }
 
   // waste → foundation
@@ -278,23 +344,62 @@ export function legalSolitaireMoves(state: SolitaireState): SolitaireMove[] {
  * original state unchanged if the move is illegal. Never mutates inputs.
  * Bumps `moves`; auto-flips a newly exposed tableau top; sets status='won'
  * when every foundation carries all 13 cards.
+ *
+ * Snapshots the pre-move state onto `undoHistory` for every kind other than
+ * `undo` itself; `undo` never records a snapshot (undoing an undo would
+ * duplicate the stack) — instead it POPS the top snapshot. This is the
+ * standard classic-solitaire undo semantics.
  */
 export function applySolitaireMove(state: SolitaireState, move: SolitaireMove): SolitaireState {
+  if (move.type === 'undo') {
+    // Undo is legal whenever there's a snapshot to restore, regardless of
+    // status (a `won` state can be undone if the player wants to try a
+    // different closing sequence — the win transition sets status via the
+    // `finish` helper which is inside the pre-move snapshot's applyMove
+    // frame, so popping restores the pre-win state).
+    if (state.undoHistory.length === 0) return state;
+    const history = state.undoHistory.slice();
+    const restored = history.pop()!;
+    return {
+      ...restored,
+      // Rehydrate: the snapshot stored an empty history sentinel; restore
+      // the truncated history stack as the current one.
+      undoHistory: history,
+    };
+  }
   if (state.status !== 'playing') return state;
+  // Snapshot the pre-move state (drop the recursive undoHistory field per
+  // MAX_UNDO_HISTORY doctrine) BEFORE we build the successor. Snapshots
+  // include the current move counter so undoing restores it exactly.
+  const snapshot = takeSnapshot(state);
   switch (move.type) {
     case 'draw': {
       if (state.stock.length > 0) {
-        // Standard draw-one: move the TOP card of stock to the TOP of waste.
+        // Draw one OR three cards per `drawMode`. Each drawn card is pushed
+        // to waste in order (so waste[waste.length - 1] is the freshly-drawn
+        // top and remains the sole playable card; the 3-card fan is a UI
+        // convention, not a legality rule).
         const stock = state.stock.slice();
-        const drawn = stock.shift()!;
-        const waste = [...state.waste, drawn];
-        return commit({ ...state, stock, waste });
+        const waste = state.waste.slice();
+        const n = Math.min(state.drawMode, stock.length);
+        for (let i = 0; i < n; i++) waste.push(stock.shift()!);
+        return commit(pushUndo(state, snapshot), { stock, waste });
       }
       if (state.waste.length > 0) {
-        // Recycle waste back to stock (reverse so the first-drawn returns to
-        // the top — deterministic draw sequence, unlimited redeals per v1).
-        const stock = state.waste.slice().reverse();
-        return commit({ ...state, stock, waste: [], redeals: state.redeals + 1 });
+        // Recycle waste back to stock. WASTE APPEND CONVENTION: cards were
+        // pushed to waste in draw order so `waste[0]` is the FIRST card ever
+        // drawn and `waste[waste.length - 1]` is the LAST (currently top).
+        // STOCK CONVENTION: `stock[0]` is the NEXT card to be drawn.
+        // Therefore preserving the deterministic draw sequence requires
+        // stock = waste (SAME ORDER, no reverse) so the first `draw` after
+        // recycle produces the same card that was drawn first at cycle 1.
+        // (Regression from Copilot review: pre-fix used `.reverse()`, which
+        // put the most-recently-drawn card on top of the stock and immediately
+        // re-drew it — breaking determinism and the classic recycle rule.)
+        const stock = state.waste.slice();
+        return commit(pushUndo(state, snapshot), {
+          stock, waste: [], redeals: state.redeals + 1,
+        });
       }
       return state;
     }
@@ -305,8 +410,7 @@ export function applySolitaireMove(state: SolitaireState, move: SolitaireMove): 
       if (!canPlaceOnFoundation(state.foundations[suit], top)) return state;
       const foundations = cloneFoundations(state.foundations);
       foundations[suit] = [...foundations[suit], top];
-      return finish(commit({
-        ...state,
+      return finish(commit(pushUndo(state, snapshot), {
         waste: state.waste.slice(0, -1),
         foundations,
       }));
@@ -317,8 +421,7 @@ export function applySolitaireMove(state: SolitaireState, move: SolitaireMove): 
       if (!canPlaceCardOnTableau(state.tableau[move.to], top)) return state;
       const tableau = cloneTableau(state.tableau);
       tableau[move.to] = [...tableau[move.to], { card: top, faceUp: true }];
-      return commit({
-        ...state,
+      return commit(pushUndo(state, snapshot), {
         waste: state.waste.slice(0, -1),
         tableau,
       });
@@ -347,7 +450,7 @@ export function applySolitaireMove(state: SolitaireState, move: SolitaireMove): 
       const tableau = cloneTableau(state.tableau);
       tableau[move.from] = newSrc;
       tableau[move.to] = newDst;
-      return commit({ ...state, tableau });
+      return commit(pushUndo(state, snapshot), { tableau });
     }
     case 'tableau-to-foundation': {
       const pile = state.tableau[move.from];
@@ -364,7 +467,7 @@ export function applySolitaireMove(state: SolitaireState, move: SolitaireMove): 
       tableau[move.from] = newPile;
       const foundations = cloneFoundations(state.foundations);
       foundations[suit] = [...foundations[suit], top.card];
-      return finish(commit({ ...state, tableau, foundations }));
+      return finish(commit(pushUndo(state, snapshot), { tableau, foundations }));
     }
     case 'foundation-to-tableau': {
       const found = state.foundations[move.suit];
@@ -375,7 +478,7 @@ export function applySolitaireMove(state: SolitaireState, move: SolitaireMove): 
       foundations[move.suit] = found.slice(0, -1);
       const tableau = cloneTableau(state.tableau);
       tableau[move.to] = [...tableau[move.to], { card: top, faceUp: true }];
-      return commit({ ...state, tableau, foundations });
+      return commit(pushUndo(state, snapshot), { tableau, foundations });
     }
     default: {
       // exhaustive-check ceremony — a new SolitaireMove kind fails to compile.
@@ -393,16 +496,46 @@ function canPlaceCardOnTableau(pile: SolitaireTableauCard[], card: Card): boolea
 }
 
 function cloneTableau(t: SolitaireTableauCard[][]): SolitaireTableauCard[][] {
-  return t.map((pile) => pile.slice());
+  return t.map((pile) => pile.slice().map((c) => ({ ...c })));
 }
 
 function cloneFoundations(f: SolitaireState['foundations']): SolitaireState['foundations'] {
   return [f[0].slice(), f[1].slice(), f[2].slice(), f[3].slice()];
 }
 
-/** Bump move counter — every successful applyMove passes through here. */
-function commit(state: SolitaireState): SolitaireState {
-  return { ...state, moves: state.moves + 1 };
+/** Deep(ish) snapshot of state with a sentinel empty undoHistory. Used both
+ *  when pushing pre-move history and when comparing snapshots for tests. */
+function takeSnapshot(state: SolitaireState): SolitaireSnapshot {
+  return {
+    kind: 'solitaire',
+    player: state.player,
+    status: state.status,
+    tableau: cloneTableau(state.tableau),
+    stock: state.stock.slice(),
+    waste: state.waste.slice(),
+    foundations: cloneFoundations(state.foundations),
+    seed: state.seed,
+    moves: state.moves,
+    redeals: state.redeals,
+    drawMode: state.drawMode,
+    // The snapshot itself carries no history — we never nest histories.
+    undoHistory: [],
+  };
+}
+
+/** Push `snapshot` onto `state.undoHistory` (dropping the oldest when full).
+ *  Returns a shallow-copy state so the caller can chain `commit`. */
+function pushUndo(state: SolitaireState, snapshot: SolitaireSnapshot): SolitaireState {
+  const history = state.undoHistory.slice();
+  history.push(snapshot);
+  if (history.length > MAX_UNDO_HISTORY) history.shift();
+  return { ...state, undoHistory: history };
+}
+
+/** Bump move counter and merge the successor patch. Every successful applyMove
+ *  passes through here (undo excluded — undo restores an earlier `moves`). */
+function commit(state: SolitaireState, patch: Partial<SolitaireState>): SolitaireState {
+  return { ...state, ...patch, moves: state.moves + 1 };
 }
 
 /** Set status='won' when every foundation carries 13 cards. */
@@ -426,6 +559,35 @@ export function isSolitaireState(value: unknown): value is SolitaireState {
     && s.tableau.every((p) => Array.isArray(p) && p.every(tableauCardOk));
   const foundationsOk = Array.isArray(s.foundations) && s.foundations.length === 4
     && s.foundations.every(isDeck);
+  const drawModeOk = s.drawMode === 1 || s.drawMode === 3;
+  // Undo history entries must be well-shaped snapshots. We do NOT recurse into
+  // history-of-history — those are always the empty [] sentinel by construction.
+  const historyEntryOk = (h: unknown): boolean => {
+    if (typeof h !== 'object' || h === null) return false;
+    const q = h as Partial<SolitaireSnapshot>;
+    if (q.kind !== 'solitaire') return false;
+    const tPilesOk = Array.isArray(q.tableau) && q.tableau.length === 7
+      && q.tableau.every((p) => Array.isArray(p) && p.every(tableauCardOk));
+    const tFoundationsOk = Array.isArray(q.foundations) && q.foundations.length === 4
+      && q.foundations.every(isDeck);
+    const tDrawModeOk = q.drawMode === 1 || q.drawMode === 3;
+    // Nested undoHistory sentinel: must be an empty array.
+    const nestedHistoryOk = Array.isArray(q.undoHistory) && q.undoHistory.length === 0;
+    return (q.player === null || typeof q.player === 'string')
+      && ['waiting', 'playing', 'won'].includes(q.status as string)
+      && tPilesOk
+      && isDeck(q.stock)
+      && isDeck(q.waste)
+      && tFoundationsOk
+      && Number.isInteger(q.seed)
+      && Number.isInteger(q.moves) && (q.moves as number) >= 0
+      && Number.isInteger(q.redeals) && (q.redeals as number) >= 0
+      && tDrawModeOk
+      && nestedHistoryOk;
+  };
+  const undoOk = Array.isArray(s.undoHistory)
+    && s.undoHistory.length <= MAX_UNDO_HISTORY
+    && s.undoHistory.every(historyEntryOk);
   return (s.player === null || typeof s.player === 'string')
     && ['waiting', 'playing', 'won'].includes(s.status as string)
     && pilesOk
@@ -434,5 +596,7 @@ export function isSolitaireState(value: unknown): value is SolitaireState {
     && foundationsOk
     && Number.isInteger(s.seed)
     && Number.isInteger(s.moves) && (s.moves as number) >= 0
-    && Number.isInteger(s.redeals) && (s.redeals as number) >= 0;
+    && Number.isInteger(s.redeals) && (s.redeals as number) >= 0
+    && drawModeOk
+    && undoOk;
 }

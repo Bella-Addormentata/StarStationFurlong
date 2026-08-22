@@ -62,8 +62,9 @@ import {
 import type { WarSeat, WarState } from './games/war';
 import {
   initialSolitaireState, dealSolitaire, applySolitaireMove, legalSolitaireMoves,
+  setSolitaireDrawMode,
 } from './games/solitaire';
-import type { SolitaireMove, SolitaireState } from './games/solitaire';
+import type { SolitaireMove, SolitaireState, SolitaireDrawMode } from './games/solitaire';
 import {
   initialPokerState, beginPoker, applyPokerAction, callAmount, legalActions,
   minBet, minRaiseTo, nextHand, chooseBotAction, readVisiblePokerState,
@@ -1501,6 +1502,27 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     writeGame(deps.itemId, next);
   };
 
+  // Draw-mode setter: only valid while the felt is in 'waiting' status
+  // (before the first deal). setSolitaireDrawMode returns the same state
+  // reference when the change is illegal, so the guard below skips the
+  // pointless doc write. Enables the round-3 turn-3 draw mode alongside the
+  // classic draw-1 (games-plan.md marks Klondike as single-player, so the
+  // player is free to pick their variant per-session).
+  const doSetSolitaireDrawMode = (drawMode: SolitaireDrawMode): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'solitaire') return;
+    const next = setSolitaireDrawMode(t.state, drawMode);
+    if (next === t.state) return;
+    writeGame(deps.itemId, next);
+  };
+
+  // Undo helper: applies a bounded-history 'undo' move (see solitaire.ts
+  // MAX_UNDO_HISTORY). Silent no-op when history is empty — the UI gates
+  // the button on undoHistory.length > 0 so this rarely fires spuriously.
+  const doSolitaireUndo = (): void => {
+    doSolitaireMove({ type: 'undo' });
+  };
+
   // ── POKER helpers (2-player NL Hold'em) ─────────────────────────────────────
 
   const myPokerSeat = (s: PokerState): PokerSeat | null =>
@@ -1513,8 +1535,16 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   };
 
   const pokerSeatLabel = (s: PokerState, seat: PokerSeat): string => {
-    if (seat === 'bigBlind' && s.bot) return 'BOT';
+    // The BOT identity travels with a `null` id (see poker.ts:172 comment
+    // "a seat with a null id is a BOT"). Pre-round-3 this label hard-coded
+    // `bigBlind` as the bot seat — correct only for hand #1, since dealHand
+    // rotates the button/BB assignment on hand ≥ 2 (poker.ts:201). After
+    // rotation the human's seat still showed their name, but the bot's seat
+    // (now BUTTON) was displayed as OPEN — the pump kept firing because
+    // dealHand only rotates the assignment, not the underlying id, but the
+    // UI became a lie.
     const id = s.players[seat].id;
+    if (id === null && s.bot) return 'BOT';
     if (!id) return 'OPEN';
     const name = readPlayerDisplayName(id).toUpperCase();
     return id === myId ? `${name} (YOU)` : name;
@@ -2176,7 +2206,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">♠ CARD FELT — PICK A GAME</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
             ${btn('gt-pick-war', '⚔ WAR (2P)', false, 'Two-player war — top-card duels')}
-            ${btn('gt-pick-solitaire', '★ SOLITAIRE', false, 'Single-player Klondike (draw one)')}
+            ${btn('gt-pick-solitaire', '★ SOLITAIRE', false, 'Single-player Klondike (draw three, draw-one toggle available)')}
             ${btn('gt-pick-poker', '♠ POKER (2P)', false, 'Heads-up NL Texas Hold\'em')}
           </div>
           <div style="font-size:9px; color:rgba(212,168,75,0.5); line-height:1.5;">
@@ -2184,6 +2214,13 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             determined spectator inspecting the doc could read hole cards.
             Full hidden-hand play (commit-reveal) arrives with the wallet-
             integrated slice — see brainstorming/games-plan.md.
+            <br /><br />
+            <strong style="color:rgba(230,120,120,0.85);">Adversarial fairness:</strong>
+            each client shuffles independently using a deterministic seed
+            written into the doc — so a peer who observes the SEED before
+            posting can pre-compute the whole hand order. Trusted-node play
+            only in v1; competitive/wagered play blocks on the same
+            commit-reveal work as hidden-hand poker (see games-plan.md).
           </div>
         </div>`;
     } else if (table.kind === 'war') {
@@ -2218,6 +2255,28 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       const s = table.state;
       const claimable = s.status === 'waiting' && (s.player === null || s.player === myId);
       const legal = mySolitairePlayer(s) ? legalSolitaireMoves(s).length : 0;
+      const isMine = mySolitairePlayer(s);
+      // Draw-mode toggle is only actionable pre-deal (waiting status). After
+      // dealing, the mode is locked (setSolitaireDrawMode rejects changes
+      // while playing so a mid-hand switch can't corrupt the stock/waste
+      // draw count). Show it as a static label when playing.
+      const drawModeToggle = s.status === 'waiting'
+        ? `
+        <div style="display:flex; gap:6px; align-items:center;">
+          <span style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">DRAW:</span>
+          ${btn('gt-sol-draw-1', 'DRAW ONE',
+            s.drawMode === 1,
+            'Klondike draw-one variant (turn one card at a time)')}
+          ${btn('gt-sol-draw-3', 'DRAW THREE',
+            s.drawMode === 3,
+            'Klondike draw-three variant (turn three cards at a time; classic default)')}
+        </div>`
+        : `<div style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">DRAW ${s.drawMode === 1 ? 'ONE' : 'THREE'} · locked for this deal</div>`;
+      // Undo button: only offered mid-play, only when there IS a snapshot
+      // to restore. The engine caps undoHistory at MAX_UNDO_HISTORY (128)
+      // and each snapshot elides its own history to keep the doc shape
+      // bounded across long sessions.
+      const canUndo = isMine && s.status === 'playing' && s.undoHistory.length > 0;
       cardFace = `
         <div id="gt-card-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
           s.status === 'playing' ? GT_GOLD_BRIGHT : s.status === 'waiting' ? GT_DIM : '#00E676'
@@ -2227,6 +2286,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             ? (s.player === myId ? `${readPlayerDisplayName(s.player).toUpperCase()} (YOU)` : readPlayerDisplayName(s.player).toUpperCase())
             : 'OPEN'}`, '#F0C060', claimable, 'Claim the seat and deal')}
         </div>
+        ${drawModeToggle}
         ${cardCanvasHtml(mySolitairePlayer(s) && s.status === 'playing')}
         <div style="display:flex; gap:8px; justify-content:space-between; align-items:center;">
           <div style="font-size:9px; color:rgba(212,168,75,0.5);">${
@@ -2234,8 +2294,13 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
               ? `${legal} legal moves · click a card, then click a destination`
               : ''
           }</div>
-          ${btn('gt-reset', 'RESET', !canClearTable(),
-            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset')}
+          <div style="display:flex; gap:8px;">
+            ${isMine && s.status === 'playing' ? btn('gt-sol-undo', `↶ UNDO (${s.undoHistory.length})`,
+              !canUndo,
+              canUndo ? `Restore the previous state (${s.undoHistory.length} snapshot${s.undoHistory.length === 1 ? '' : 's'} available)` : 'No moves to undo yet') : ''}
+            ${btn('gt-reset', 'RESET', !canClearTable(),
+              canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset')}
+          </div>
         </div>`;
     } else if (table.kind === 'poker') {
       const p = table.state;
@@ -2243,7 +2308,13 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         && (p.players.button.id === null || p.players.button.id === myId);
       const bothClaimed = p.players.button.id !== null && p.players.bigBlind.id !== null;
       const showBegin = p.status === 'waiting' && bothClaimed;
-      const showForfeit = (p.status === 'playing' || p.status === 'hand-over') && myPokerSeat(p) !== null;
+      // Forfeit is only sensible mid-hand — post-round-3 fix. Between hands
+      // (status === 'hand-over') the winner is decided, the seat's stack is
+      // stable, and pressing "FORFEIT" would gift chips it had every right
+      // to keep or reject on 'nextHand'. The Copilot review flagged this as
+      // a stack-integrity bug: a rage-forfeit at hand-over hopped a decision
+      // point (start next hand vs. leave) and directly transferred chips.
+      const showForfeit = p.status === 'playing' && myPokerSeat(p) !== null;
       const showNextHand = p.status === 'hand-over' && (myPokerSeat(p) !== null || p.bot);
       const seat = myPokerSeat(p);
       const inTurn = seat !== null && myPokerTurn(p);
@@ -2359,6 +2430,9 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#gt-war-forfeit')?.addEventListener('click', () => warForfeit());
     // Solitaire controls.
     panel.querySelector<HTMLButtonElement>('#gt-sol-sit')?.addEventListener('click', () => claimSolitaireSeat());
+    panel.querySelector<HTMLButtonElement>('#gt-sol-draw-1')?.addEventListener('click', () => doSetSolitaireDrawMode(1));
+    panel.querySelector<HTMLButtonElement>('#gt-sol-draw-3')?.addEventListener('click', () => doSetSolitaireDrawMode(3));
+    panel.querySelector<HTMLButtonElement>('#gt-sol-undo')?.addEventListener('click', () => doSolitaireUndo());
     // Poker controls.
     panel.querySelector<HTMLButtonElement>('#gt-poker-sit-button')?.addEventListener('click', () => claimPokerSeat('button'));
     panel.querySelector<HTMLButtonElement>('#gt-poker-sit-bb')?.addEventListener('click', () => claimPokerSeat('bigBlind'));
@@ -2492,15 +2566,23 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           }
         } else warBotTimer = 0;
       } else if (t?.kind === 'poker') {
-        // Poker bot: the BUTTON claimant's client acts on the BIG BLIND's
-        // behalf when it's the bot's turn. Trivial strategy (see chooseBotAction).
+        // Poker bot: the human claimant's client acts on the bot's behalf
+        // when it's the bot's turn. The bot is identified by a `null` id
+        // (mirrors checkers/chess conventions — see pokerSeatLabel).
+        // Pre-round-3 this hard-coded `'bigBlind'` as the bot seat AND
+        // required the human to be at BUTTON, so it stopped firing once
+        // dealHand rotated the seats on hand ≥ 2 — no client pumped, the
+        // bot froze mid-match, RESET was the only recovery.
         const s = t.state;
-        if (s.bot && s.status === 'playing' && s.toAct === 'bigBlind'
-            && s.players.button.id === myId) {
+        const botSeat: PokerSeat | null =
+          s.players.button.id === null && s.players.bigBlind.id === myId ? 'button'
+          : s.players.bigBlind.id === null && s.players.button.id === myId ? 'bigBlind'
+          : null;
+        if (s.bot && s.status === 'playing' && botSeat !== null && s.toAct === botSeat) {
           pokerBotTimer += dt;
           if (pokerBotTimer >= 0.9) {
             pokerBotTimer = 0;
-            const action = chooseBotAction(s, 'bigBlind');
+            const action = chooseBotAction(s, botSeat);
             if (action) {
               const next = applyPokerAction(s, action);
               if (next !== s) writeGame(deps.itemId, next);

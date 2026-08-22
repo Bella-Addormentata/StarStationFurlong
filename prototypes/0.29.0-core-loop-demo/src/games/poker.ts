@@ -225,7 +225,9 @@ export function dealHand(state: PokerState): PokerState {
   };
   const afterDeal = deck.slice(4);
 
-  // Post blinds (BTN posts SB, BB posts BB in heads-up).
+  // Post blinds (BTN posts SB, BB posts BB in heads-up). Both are capped to
+  // the respective poster's stack — a short-stack player unable to cover the
+  // full blind posts what they have and goes all-in from the post.
   const sb = Math.min(state.smallBlind, button.stack);
   const bb = Math.min(state.bigBlind, bigBlind.stack);
   button.stack -= sb;
@@ -237,6 +239,53 @@ export function dealHand(state: PokerState): PokerState {
   bigBlind.handBet = bb;
   if (bigBlind.stack === 0) bigBlind.allIn = true;
 
+  // Unmatched-blind refund (Copilot review — poker.ts:283).
+  //   In heads-up, if the SHORTER-POST player is all-in from posting for less
+  //   than the other posted, only the matched portion belongs in the
+  //   contestable pot. Example: stacks 3/1000 with 5/10 blinds → SB posts 3
+  //   (all-in), BB posts 10 (7 uncalled). Without a refund, the 3-chip
+  //   player winning collects 13 chips they could never have won — the
+  //   excess 7 must return to the big blind's stack. Heads-up removes SIDE
+  //   pots, not unmatched-bet refunds; the two are distinct rules.
+  //
+  //   The refund is GATED on the shorter-post player being all-in. In the
+  //   canonical 5/10 pre-flop scenario both players have chips, and BB's
+  //   10-chip post is NOT uncalled — the button will still decide fold/
+  //   call/raise. Applying the refund unconditionally would drop pot to 10
+  //   and let the button check preflop (both matched at 5), destroying the
+  //   defining rule that BTN must call BB to see the flop.
+  //
+  //   Refunding a BB-post can leave BB with chips again but the OPPONENT
+  //   (button) is still all-in — BB retains the fold-or-continue decision;
+  //   a check on their turn cascades through the streets via
+  //   advanceAfterAction's opponent-can-act check. Same shape when BB is
+  //   the drained seat (pathological SB>BB post scenario, e.g. BB stack < SB
+  //   blind).
+  // Note: we sample allIn from the JUST-POSTED player state (not from a saved
+  // snapshot) so the refund conditions see the true "did the post drain
+  // them?" answer. The re-read after refund (below) captures whether they
+  // still count as all-in post-refund, which the toAct logic depends on.
+  if (button.allIn && bb > sb) {
+    // Button all-in for SB's short post; BB's excess over that is uncalled.
+    const refund = bb - sb;
+    bigBlind.stack += refund;
+    bigBlind.streetBet = sb;
+    bigBlind.handBet = sb;
+    // A refund can un-all-in BB (only when BB was also drained by the post).
+    if (bigBlind.stack > 0) bigBlind.allIn = false;
+  }
+  if (bigBlind.allIn && sb > bb) {
+    // BB all-in for BB's short post; SB's excess is uncalled.
+    const refund = sb - bb;
+    button.stack += refund;
+    button.streetBet = bb;
+    button.handBet = bb;
+    if (button.stack > 0) button.allIn = false;
+  }
+  // Effective posted amounts after refund (used downstream).
+  const sbEff = button.streetBet;
+  const bbEff = bigBlind.streetBet;
+
   // Post-blind current-bet normalization.
   //   The canonical case sets `currentBet = bb` (BB posted the higher blind).
   //   But when the BB seat's stack is smaller than the small blind (natural
@@ -245,8 +294,9 @@ export function dealHand(state: PokerState): PokerState {
   //   would leave callAmount computations underwater. Use the max of both
   //   posted amounts to keep `currentBet` = highest street bet, which is
   //   how every downstream rule (callAmount, legalActions, minRaiseTo)
-  //   interprets it.
-  const initialCurrentBet = Math.max(sb, bb);
+  //   interprets it. (Post-refund, both effective posts are equal to the
+  //   matched-pot cap, so this reduces to that cap.)
+  const initialCurrentBet = Math.max(sbEff, bbEff);
 
   // toAct selection when a poster went all-in from the blinds.
   //   Default heads-up rule: BUTTON acts first preflop.
@@ -264,6 +314,8 @@ export function dealHand(state: PokerState): PokerState {
   //     · Both all-in from blinds → toAct = null and run the streets to
   //       showdown immediately (same recursion openNextStreet uses for the
   //       both-in-during-play path).
+  // Re-read allIn from the post-refund players — the refund can have cleared
+  // the flag when returning chips to a poster whose blind was uncalled.
   const buttonAllInFromPost = button.allIn;
   const bigBlindAllInFromPost = bigBlind.allIn;
   let toAct: PokerSeat | null;
@@ -280,7 +332,9 @@ export function dealHand(state: PokerState): PokerState {
     toAct,
     currentBet: initialCurrentBet,
     minRaise: state.bigBlind,
-    pot: sb + bb,
+    // Pot uses the EFFECTIVE posts (post-refund) so a short-stack all-in
+    // from the SB doesn't leave the opponent's uncalled chips locked in.
+    pot: sbEff + bbEff,
     deck: afterDeal,
     actions: [],
   };
@@ -323,6 +377,7 @@ export function legalActions(state: PokerState, seat: PokerSeat): PokerActionKin
   if (!canAct(state, seat)) return [];
   const acts: PokerActionKind[] = [];
   const p = state.players[seat];
+  const opponent = state.players[otherSeat(seat)];
   const toCall = callAmount(state, seat);
   acts.push('fold');
   if (toCall === 0) {
@@ -330,7 +385,20 @@ export function legalActions(state: PokerState, seat: PokerSeat): PokerActionKin
   } else {
     acts.push('call');
   }
-  if (!p.allIn) {
+  // Aggression (bet / raise) requires ALL of:
+  //   · the actor still has chips (!p.allIn);
+  //   · the opponent still has chips and hasn't folded (else there is nobody
+  //     to be aggressed at — a raise into a wall just donates chips to an
+  //     uncontestable pot without changing the outcome);
+  //   · the actor's MAXIMUM street bet actually EXCEEDS the standing bet
+  //     (a shorter stack cannot legally raise even if they haven't shoved
+  //     yet — their only aggressive action is CALL-all-in, and that's
+  //     what the 'call' branch above already offers).
+  // (Copilot review — poker.ts:336.)
+  const opponentCanRespond = !opponent.allIn && !opponent.folded;
+  const maxBet = p.stack + p.streetBet;
+  const canIncrease = maxBet > state.currentBet;
+  if (!p.allIn && opponentCanRespond && canIncrease) {
     if (state.currentBet === 0) acts.push('bet');
     else acts.push('raise');
   }
@@ -403,6 +471,22 @@ export function applyPokerAction(state: PokerState, action: PokerActionInput): P
       if (!Number.isFinite(amount) || amount <= p.streetBet) return state;
       const maxTarget = p.stack + p.streetBet;
       if (amount > maxTarget) return state;
+      // A raise must, by definition, strictly EXCEED the standing currentBet.
+      // The old branch admitted `amount === maxTarget` (all-in) even when
+      // amount < currentBet, silently *lowering* currentBet — corrupting the
+      // state machine (the opponent's callAmount went negative and legalActions
+      // fell out of sync). If the seat's all-in maxTarget doesn't exceed
+      // currentBet, their only legal action is CALL (all-in for whatever they
+      // have); route them there instead of accepting a "raise" that isn't one.
+      // (Copilot review — poker.ts:405.)
+      if (amount <= state.currentBet) return state;
+      // A raise also requires the opponent to have chips left — you cannot
+      // "raise" into a seat that's already all-in (no chips to call), and
+      // you cannot raise into a folded seat. The engine still admits the
+      // action as a `call` (see the call branch) but a `raise` here is
+      // ill-formed.
+      const opponentPlayer = state.players[other];
+      if (opponentPlayer.allIn || opponentPlayer.folded) return state;
       const legalTarget = state.currentBet + state.minRaise;
       const isAllIn = amount === maxTarget;
       if (amount < legalTarget && !isAllIn) return state;
@@ -669,6 +753,14 @@ export function pokerForfeit(state: PokerState, forfeiter: PokerSeat): PokerStat
   const players = clonePlayers(state.players);
   const conceded = state.pot;
   const residual = players[forfeiter].stack;
+  // Mark the forfeiter as FOLDED so readVisiblePokerState mucks their hole
+  // cards to spectators (and to the winner) — a forfeit is documented as
+  // fold-equivalent, and the standard-poker rule mucks the folder's hand.
+  // Without this flag, the terminal state's `street === 'complete'` triggers
+  // the showdown-visible branch and readVisiblePokerState would REVEAL the
+  // forfeiter's hole cards, contradicting the intent (and leaking the
+  // conceder's cards to the whole table). (Copilot review — poker.ts:675.)
+  players[forfeiter].folded = true;
   // Award the pot first (fold-equivalent), then transfer the residual stack.
   players[winner].stack += conceded;
   players[winner].stack += residual;
@@ -1106,7 +1198,7 @@ export function isPokerState(value: unknown): value is PokerState {
   // (see line 105) — validated here so downstream renderers (pokerStatusText,
   // pokerSeatLabel) can trust s.lastShowdown.winner as a valid seat token.
   const showdownOk = s.lastShowdown === null || isPokerShowdown(s.lastShowdown);
-  return playersOk
+  const structuralOk = playersOk
     && statusOk
     && streetOk
     && toActOk
@@ -1122,4 +1214,58 @@ export function isPokerState(value: unknown): value is PokerState {
     && Number.isInteger(s.handsPlayed) && (s.handsPlayed as number) >= 0
     && showdownOk
     && typeof s.bot === 'boolean';
+  if (!structuralOk) return false;
+
+  // Per-street deck/community/hole-card sanity when the hand is ACTIVE
+  // (status='playing'). Without this, a hostile peer could plant a state
+  // with `status='playing'`, `street='preflop'`, an empty deck, and no
+  // hole cards; when the local player acted (or when both went all-in from
+  // posted blinds), `openNextStreet → dealCommunity` would call
+  // `deck.shift()!` on an empty array and append `undefined` to community,
+  // which then flows into `evaluate7`/`evaluate5` and downstream renderers
+  // as a non-card. Guard the invariants dealHand actually establishes.
+  //
+  // Community length per street (from dealCommunity above):
+  //   preflop: 0    flop: 3    turn: 4    river/showdown/complete: 5 (or ≤5 on early-fold complete)
+  // Deck-remaining requirement per active street (running to showdown):
+  //   preflop: ≥ 8  (flop burn+3, turn burn+1, river burn+1)
+  //   flop:    ≥ 4  (turn burn+1, river burn+1)
+  //   turn:    ≥ 2  (river burn+1)
+  //   river:   ≥ 0
+  // Hole cards: every non-folded active seat must hold two cards. A folded
+  // seat's holeCards is written to null after awardUncontested runs — and
+  // awardUncontested moves status off 'playing', so during 'playing' both
+  // seats' holeCards must be populated.
+  if (s.status === 'playing') {
+    const communityLen = (s.community as Card[]).length;
+    const deckLen = (s.deck as Card[]).length;
+    const players = s.players as PokerState['players'];
+    const btnHoleOk = players.button.holeCards !== null;
+    const bbHoleOk = players.bigBlind.holeCards !== null;
+    if (!btnHoleOk || !bbHoleOk) return false;
+    switch (s.street) {
+      case 'preflop':
+        if (communityLen !== 0) return false;
+        if (deckLen < 8) return false;
+        break;
+      case 'flop':
+        if (communityLen !== 3) return false;
+        if (deckLen < 4) return false;
+        break;
+      case 'turn':
+        if (communityLen !== 4) return false;
+        if (deckLen < 2) return false;
+        break;
+      case 'river':
+        if (communityLen !== 5) return false;
+        break;
+      case 'showdown':
+      case 'complete':
+        // showdown/complete under status='playing' is an inconsistent
+        // engine state (both transitions call endHand which moves off
+        // 'playing'). Reject it — no legitimate write ever produces it.
+        return false;
+    }
+  }
+  return true;
 }
