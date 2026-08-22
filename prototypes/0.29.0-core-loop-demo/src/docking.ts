@@ -59,6 +59,11 @@ import {
   refundPart,
   consumeForSegments,
   refundForSegments,
+  // 🦾 #62: PROVISION-seam arm-gate skip lane matches the INITIATE-seam
+  // auto-accept lane in intent — the dev walkthrough toggle bypasses live
+  // construction infrastructure so the "own minted modules" flow works
+  // without placing arms first (see docs on the PROVISION handler).
+  autoAcceptEnabled,
 } from "./stationParts";
 import {
   readDoorPolicy,
@@ -1168,6 +1173,52 @@ export class DoorDockingPortSystem {
           alert("Module provisioning is not available (no local node wiring).");
           return;
         }
+        // 🛰️🚪 Hoisted from the try body so the arm gate below can read the
+        // active door before the button state changes. Same source the
+        // INITIATE handler further down reads.
+        const pane = document.getElementById("docking-control-pane");
+        const parentDoorId = pane
+          ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ??
+            undefined)
+          : undefined;
+
+        // #62: 🦾 ROBOT ARM construction gate — the PROVISION seam mints a
+        // NEW module at this door, which is exactly the "new pairing being
+        // constructed" the OWNER ruling gates. Mirrors the INITIATE seam
+        // below so both entry points to a fresh pairing refuse identically
+        // (docs in robotArmGate.ts header). Three explicit skip lanes:
+        //   1. state.pairedSuccessfully — the door is already docked to a
+        //      permanent module; a re-PROVISION would only be an accident
+        //      (the placement editor is even hidden in this case, see
+        //      the mayProvision flag in the panel-open path).
+        //   2. state.transient — the #67 D2 adapter GUEST BERTH lane never
+        //      mints a fresh module (transient berths carry no chain and
+        //      no persistent structure).
+        //   3. autoAcceptEnabled() dev walkthrough — the walkthrough
+        //      toggle bypasses the physical infrastructure so the end-to-end
+        //      "mint + auto-accept" flow works without placing arms first.
+        //      (The INITIATE seam reads the same intent via its per-address
+        //      callback, but the callback would be false-y here anyway —
+        //      the address is empty pre-mint — so we read the toggle
+        //      directly for the same effect.)
+        if (parentDoorId) {
+          const state = this.doorState.get(parentDoorId);
+          const skipGate =
+            (state?.pairedSuccessfully ?? false) ||
+            (state?.transient ?? false) ||
+            autoAcceptEnabled();
+          if (!skipGate) {
+            const armDoorPose = physicalDoorPoseOrNull(parentDoorId);
+            if (armDoorPose) {
+              const armCheck = armCoversDoor(armDoorPose, FURNITURE);
+              if (!armCheck.ok) {
+                alert(`🦾 CANNOT PROVISION — ${armCheck.reason}`);
+                return;
+              }
+            }
+          }
+        }
+
         const originalLabel = provisionBtn.textContent;
         const templateSelect = document.getElementById(
           "docking-provision-template",
@@ -1180,11 +1231,7 @@ export class DoorDockingPortSystem {
           // from. That is what lets the new room be born with exactly one
           // door — the one leading back here — instead of inheriting a full
           // set of cardinals. Same source the INITIATE handler below reads.
-          const pane = document.getElementById("docking-control-pane");
-          const parentDoorId = pane
-            ? ((pane as unknown as { activeDoorId?: string }).activeDoorId ??
-              undefined)
-            : undefined;
+          // (`pane`/`parentDoorId` were hoisted above for the arm gate.)
           const choice = parentDoorId ? this.choiceFor(parentDoorId) : undefined;
           // 🧭 Mint the birth door's ID here, where the pairing that will name
           // it lives — an opaque d: uuid, not the wall label (which the axis
@@ -2772,6 +2819,22 @@ export class DoorDockingPortSystem {
    * arm finishes reaching).
    */
   private armAnimState = new Map<string, number>(); // itemId → t ∈ [0,1]
+  /**
+   * 🦾 #62 — per-arm cache of the LAST LIVE door pose the arm was reaching
+   * for. Populated whenever the arm covers a currently-pending door; consumed
+   * during retraction (no active reach target) so `armReachPose` receives the
+   * ORIGINAL door delta and its shoulderYaw eases with `t` rather than
+   * collapsing to zero. Cleared once `t` returns to 0 so a fresh reach starts
+   * from an empty cache. Without this, retraction synthesizes a fallback pose
+   * at the arm's own along-wall centre → delta = 0 → atan2(0, REACH_FORWARD)
+   * = 0 → shoulderYaw snaps to 0 on the first retraction frame while only
+   * the elbow eases, and the arm visibly jerks sideways-to-parked. (Copilot
+   * PR-131 inline at docking.ts:2825.)
+   */
+  private lastReachTarget = new Map<
+    string,
+    Pick<PhysicalDoorPose, 'wall' | 'x' | 'z'>
+  >();
   private readonly ARM_ANIM_SPEED = 1.5; // 0→1 in ~0.67 s (crisp, low-poly reach)
 
   public updateRobotArms(
@@ -2784,6 +2847,9 @@ export class DoorDockingPortSystem {
     const arms = FURNITURE.filter((i): i is FurnitureItem => i.kind === ROBOT_ARM_KIND);
     if (arms.length === 0) {
       if (this.armAnimState.size > 0) this.armAnimState.clear();
+      // 🦾 No arms → no cached poses to preserve either (a rebuild starts
+      // from an empty cache — matches the state after every arm reached 0).
+      if (this.lastReachTarget.size > 0) this.lastReachTarget.clear();
       return;
     }
 
@@ -2800,7 +2866,8 @@ export class DoorDockingPortSystem {
     }
 
     for (const arm of arms) {
-      const target = reachTargets.has(arm.id) ? 1 : 0;
+      const activeReach = reachTargets.get(arm.id);
+      const target = activeReach ? 1 : 0;
       const current = this.armAnimState.get(arm.id) ?? 0;
       // Approach the target at a constant speed (per-frame delta clamped).
       const step = this.ARM_ANIM_SPEED * deltaTime;
@@ -2809,17 +2876,36 @@ export class DoorDockingPortSystem {
         : current + Math.sign(target - current) * step;
       this.armAnimState.set(arm.id, next);
 
+      // 🦾 Cache the LIVE reach pose whenever the arm is actively reaching so
+      // the retraction path (below) can keep using it. Cache is cleared once
+      // the arm has fully retracted (next === 0) so a fresh reach starts
+      // from an empty cache — matches the intent of "shoulderYaw eases as t
+      // does". (Fix: previously the retraction fell back to the arm's own
+      // along-wall position → delta = 0 → shoulderYaw snapped to 0.)
+      if (activeReach) this.lastReachTarget.set(arm.id, activeReach);
+
       // Apply to the arm's shoulder/elbow sub-Groups (idle when at rest — no
       // wasted three.js writes on the many rest-frame arms).
-      if (next === 0 && current === 0) continue;
+      if (next === 0 && current === 0) {
+        // Fully at rest — nothing to write. Cache also drops when next
+        // reaches zero (below), so this branch is the steady-idle case.
+        continue;
+      }
       const group = resolveGroup(arm.id);
       if (!group) continue;
-      // Prefer the live reach target; when retracting (no active pairing to
-      // reach for), synthesize a reference pose at the arm's own along-wall
-      // position so armReachPose returns shoulderYaw=0 and the arm eases
-      // straight up rather than swinging sideways on the way home.
+      // Prefer the LIVE reach target when actively reaching; during retraction
+      // (no `activeReach`), fall back to the CACHED last-live pose so
+      // armReachPose sees the same signed along-wall delta the reach used and
+      // shoulderYaw eases with `t` back to 0 alongside elbowPitch. Only when
+      // no cache exists (a stray retract that never had a reach, e.g. arm was
+      // freshly placed onto an already-completed pending state that then
+      // resolved) do we synthesize a self-referencing fallback pose — the
+      // shoulder there is already at 0 so the fallback's zero-delta is
+      // harmless. NOTE: `wall` uses the same rot→wall mapping the pure gate
+      // module carries (WALL_FOR_ROT) — hull.ROT_WALL parity is guarded in
+      // robotArmGate.test.ts.
       const referencePose: Pick<PhysicalDoorPose, 'wall' | 'x' | 'z'> =
-        reachTargets.get(arm.id) ?? {
+        activeReach ?? this.lastReachTarget.get(arm.id) ?? {
           wall: (['y+', 'x+', 'y-', 'x-'] as const)[arm.rot],
           x: arm.pos.x,
           z: arm.pos.z,
@@ -2838,6 +2924,12 @@ export class DoorDockingPortSystem {
       // idle elbowPitch π/2 maps to rotation.x = -π/2 (forearm along local +Y),
       // reach 0.35 maps to rotation.x = -0.35 (forearm mostly along local +Z).
       if (elbow) (elbow as THREE.Object3D).rotation.x = -targetPose.elbowPitch;
+
+      // 🦾 Retraction landed: drop the cached last-reach so the next reach
+      // starts fresh. Kept until AFTER the rotation write so the last frame
+      // of retraction still uses the cached delta (shoulderYaw eases to 0
+      // via t → 0 with the delta held constant).
+      if (next === 0) this.lastReachTarget.delete(arm.id);
     }
   }
 

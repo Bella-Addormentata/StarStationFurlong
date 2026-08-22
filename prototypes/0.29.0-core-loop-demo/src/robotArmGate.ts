@@ -4,8 +4,13 @@
  * The first DIEGETIC construction gate for a new pairing: before a fresh
  * module may be docked at a door, a station-mounted robot arm must already be
  * present on that door's wall, within arm's reach of the door centre. Without
- * one, the INITIATE / PROVISION seams refuse the pairing with a clear
- * player-facing message.
+ * one, the INITIATE seam (docking a paired module) AND the PROVISION seam
+ * (minting a fresh module at this door) both refuse with the same
+ * player-facing message. Both seams share the same skip lanes
+ * (paired / transient / auto-accept walkthrough) so the compatibility rule
+ * — "gate applies to NEW pairings only" — reads identically at either
+ * entry point; the pairing ACCEPT seam is unchanged (a joiner accepts on
+ * trust of the initiator's local gate).
  *
  * This module is deliberately PURE — no Yjs, no three.js, no DOM, no
  * subscriptions. It exposes ONE predicate the caller (docking.ts) evaluates at

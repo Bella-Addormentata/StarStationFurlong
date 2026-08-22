@@ -76,6 +76,12 @@ import {
   partsCount, addParts, armedPreset, setArmedPreset, moduleLedger,
   autoAcceptEnabled, setAutoAccept, northDoorUnlocked, setNorthDoorUnlocked,
   subscribeStationParts, type PresetId,
+  // 🦾 #62: fresh ROBOT ARM spawns from the FURNITURE gallery must consume
+  // one from the granted arm count so the +1 grant in the PARTS section is
+  // a real entitlement, not a decoration (PR-131 review: Copilot inline at
+  // devMenu.ts:865). Room-inventory RE-PLACE stays exempt — a piece put in
+  // inventory was already granted once.
+  consumePart,
 } from './stationParts';
 import { showHint } from './hud';
 import type { World } from './world';
@@ -395,6 +401,23 @@ function spawnFurniture(kind: FurnitureKind): void {
     showHint('DEV: enter the room first.');
     return;
   }
+  // 🦾 #62: FRESH ROBOT ARM placements consume from the granted arm count
+  // (the "+1 ROBOT ARM" grant in the PARTS section). The grant IS the
+  // entitlement — without wiring the two together the +1 button was
+  // decorative, the count never decremented, and arms could be spawned
+  // ad infinitum from the FURNITURE gallery with zero grants. Refuse
+  // upfront when the count is zero so the failure is legible ("grant one
+  // first") rather than showing a placement failure at some random spot.
+  //
+  // NOTE — placement gallery path only. The room-inventory re-place lane
+  // (placeFromInventory) STAYS EXEMPT: that piece was already consumed
+  // from the grant once, was then stashed via edit-mode ✕ REMOVE, and
+  // re-placing it does not re-grant. This mirrors the reviewer's
+  // guidance (Copilot PR-131 inline at devMenu.ts:865).
+  if (kind === 'robot-arm' && partsCount('arm') <= 0) {
+    showHint('DEV: 🦾 no ROBOT ARM in inventory — grant one from PARTS first.');
+    return;
+  }
   const item: FurnitureItem = {
     id: uniqueSpawnId(kind),
     kind,
@@ -410,12 +433,27 @@ function spawnFurniture(kind: FurnitureKind): void {
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
       : findSpawnSpot(world, item);
   if (!spot) {
+    // ORDER: no spot → no consume. Reviewer guidance: "consume one arm only
+    // after a valid spot is found" (a full room must not deplete the grant).
     showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (room is full).`);
     return;
   }
   item.pos = { x: spot.x, z: spot.z };
   if (spot.rot !== undefined) item.rot = spot.rot;
   if (spot.mountParent !== undefined) item.mountParent = spot.mountParent;
+  // 🦾 #62: consume the arm ONLY once a spot is secured. Between the
+  // upfront pre-check (count > 0) and here there is no async gap, but the
+  // consume is defensive — if it somehow returns false (localStorage
+  // eviction, a concurrent grant drain from another tab), refuse rather
+  // than silently spawning a "free" arm. subscribeStationParts is
+  // fire-and-forget from consumePart so the panel row (if open) refreshes
+  // automatically; no explicit refreshPartsRows() call needed here.
+  if (kind === 'robot-arm') {
+    if (!consumePart('arm')) {
+      showHint('DEV: 🦾 ROBOT ARM inventory drained during spawn — try again.');
+      return;
+    }
+  }
   commitSpawn(world, item);
   showHint(`DEV: spawned ${item.id} at (${item.pos.x}, ${item.pos.z}) — synced to the room (E4).`);
 }

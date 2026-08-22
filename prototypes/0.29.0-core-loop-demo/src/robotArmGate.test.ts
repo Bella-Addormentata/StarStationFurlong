@@ -263,4 +263,65 @@ describe('robotArmGate.armReachPose', () => {
     expect(over.elbowPitch).toBeCloseTo(full.elbowPitch, 6);
     expect(over.shoulderYaw).toBeCloseTo(full.shoulderYaw, 6);
   });
+
+  // ── Retract-fallback regression (PR-131 Copilot inline at docking.ts:2825) ──
+  //
+  // The bug: docking.ts.updateRobotArms fell back to a synthetic door pose at
+  // the arm's OWN along-wall centre when no active pairing existed. That fed
+  // armReachPose a zero along-wall delta, so shoulderYaw collapsed to 0
+  // regardless of `progress` (t) — the shoulder snapped to parked on the
+  // first retraction frame while only the elbow eased. The fix caches the
+  // LAST live door pose per arm and uses it during retraction so shoulderYaw
+  // eases to 0 as `t → 0` instead of jumping.
+  //
+  // These tests pin the pure-math facts the bug rests on, so a future
+  // regression in either the pure function or the caller's cache wiring
+  // surfaces here.
+
+  it('retract-fallback bug: arm-own-position pose yields shoulderYaw=0 at every progress', () => {
+    // The pre-fix docking fallback synthesized referencePose = { wall, x: arm.x, z: arm.z }.
+    // With arm.pos === door.pos on the same wall, delta = 0 → atan2(0, 2) = 0
+    // → shoulderYaw = 0 * t = 0 for every t. This is the visible snap.
+    const arm = mkArm({ id: 'a', pos: { x: 3, z: 6 }, rot: 0 });
+    const selfPose = mkDoor('y+', arm.pos.x, arm.pos.z); // fallback shape
+    for (const t of [0, 0.25, 0.5, 0.75, 1]) {
+      const pose = armReachPose(selfPose, arm, t);
+      expect(pose.shoulderYaw, `t=${t}`).toBe(0);
+    }
+  });
+
+  it('retract-fallback fix: cached LIVE door pose keeps shoulderYaw scaling with progress', () => {
+    // The fix path: docking caches the live door pose while reaching, and
+    // re-uses it while retracting. armReachPose then sees the real delta and
+    // shoulderYaw scales with t on the way home just as it did on the way out.
+    const arm = mkArm({ id: 'a', pos: { x: 0, z: 6 }, rot: 0 });
+    const livePose = mkDoor('y+', 4, 6); // 4 m to the along-wall right of the arm
+    const full = armReachPose(livePose, arm, 1);
+    const half = armReachPose(livePose, arm, 0.5);
+    const quarter = armReachPose(livePose, arm, 0.25);
+    // shoulderYaw grows monotonically with t — proves the cache preserves
+    // the useful signal the fallback destroyed.
+    expect(quarter.shoulderYaw).toBeGreaterThan(0);
+    expect(half.shoulderYaw).toBeGreaterThan(quarter.shoulderYaw);
+    expect(full.shoulderYaw).toBeGreaterThan(half.shoulderYaw);
+    // At the exact same t (0.5), the CACHED live pose yields a nonzero yaw
+    // while the fallback (arm's own position) yields zero. That difference
+    // is the entire user-visible cost of the retract-snap bug.
+    const selfPose = mkDoor('y+', arm.pos.x, arm.pos.z);
+    expect(armReachPose(selfPose, arm, 0.5).shoulderYaw).toBe(0);
+    expect(half.shoulderYaw).not.toBe(0);
+  });
+
+  it('retract-fallback fix: shoulderYaw eases smoothly with t under a cached pose', () => {
+    // Approximate the retract loop: t decays from 1 → 0 in ARM_ANIM_SPEED
+    // steps. Under a cached live pose, every step's shoulderYaw is a strict
+    // fraction of the previous one (linear in t) — no discontinuity.
+    const arm = mkArm({ id: 'a', pos: { x: 0, z: 6 }, rot: 0 });
+    const livePose = mkDoor('y+', 4, 6);
+    const samples = [1, 0.8, 0.6, 0.4, 0.2, 0].map((t) => armReachPose(livePose, arm, t));
+    for (let i = 1; i < samples.length; i++) {
+      expect(samples[i].shoulderYaw, `sample ${i}`).toBeLessThanOrEqual(samples[i - 1].shoulderYaw);
+    }
+    expect(samples[samples.length - 1].shoulderYaw).toBe(0); // fully retracted
+  });
 });
