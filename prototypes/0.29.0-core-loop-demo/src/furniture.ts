@@ -6181,10 +6181,18 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   }
 
   // ── Three drop holes across the top face ───────────────────────────────────
+  // Two per-hole arrays: the RIM mesh (gold torus, receives the highlight
+  // emissive) and the DISC mesh (dark opening; carries click userData). The
+  // handle needs them tracked separately — an earlier revision stored only
+  // the disc and walked `disc.parent?.children[0]` to reach the rim, but
+  // `children[0]` is the cabinet's base plinth (the first mesh added by
+  // `place`), so setSelectedHole/triggerDropFx were painting the plinth
+  // instead of any hole rim (audit finding #3).
   const holeXs = [-0.20, 0.00, 0.20];
-  const holeMeshes: THREE.Mesh[] = [];
+  const holeRimMeshes: THREE.Mesh[] = [];
+  const holeDiscMeshes: THREE.Mesh[] = [];
   for (let i = 0; i < 3; i++) {
-    // Hole rim
+    // Hole rim (gold torus)
     const rim = place(
       new THREE.TorusGeometry(0.045, 0.010, 8, 20),
       m(GOLD, 0.35, 0.6),
@@ -6205,7 +6213,8 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       mesh.userData.coinPusherHole = i;
       mesh.userData.coinPusherMachineId = itemId;
     }
-    holeMeshes.push(disc);
+    holeRimMeshes.push(rim);
+    holeDiscMeshes.push(disc);
   }
 
   // ── Interior stepped platforms (upper is BEHIND lower, one step down) ──────
@@ -6329,9 +6338,11 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       void dt;
     },
     setSelectedHole(hole: 0 | 1 | 2): void {
-      // Emphasise the selected hole rim in gold.
+      // Emphasise the selected hole rim in gold and cool the other two —
+      // paints ONLY the rim meshes so the plinth / disc / other cabinet
+      // parts never accidentally light up (audit finding #3 fix).
       for (let i = 0; i < 3; i++) {
-        const rim = holeMeshes[i].parent?.children[0] as THREE.Mesh | undefined;
+        const rim = holeRimMeshes[i];
         if (!rim || !(rim.material as THREE.MeshStandardMaterial).emissive) continue;
         const isSel = i === hole;
         const std = rim.material as THREE.MeshStandardMaterial;
@@ -6346,10 +6357,12 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     },
     triggerDropFx(hole: 0 | 1 | 2): void {
       // A short warm pulse of light at the selected hole — enough to catch
-      // the eye. Non-latching; the update loop cools the emissive in one
-      // frame (setSelectedHole re-applies after).
-      const rim = holeMeshes[hole];
-      if (!rim.material || !(rim.material as THREE.MeshStandardMaterial).emissive) return;
+      // the eye. Non-latching; setSelectedHole re-applies the calmer
+      // emissive on the next selection change. Targets the RIM mesh (a
+      // prior revision indexed into `holeMeshes` which held the DARK disc,
+      // leaving the disc glowing gold indefinitely — audit finding #3).
+      const rim = holeRimMeshes[hole];
+      if (!rim || !rim.material || !(rim.material as THREE.MeshStandardMaterial).emissive) return;
       const std = rim.material as THREE.MeshStandardMaterial;
       std.emissive = new THREE.Color(GOLD);
       std.emissiveIntensity = 0.9;

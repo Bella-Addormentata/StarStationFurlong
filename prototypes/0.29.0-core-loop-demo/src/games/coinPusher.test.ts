@@ -807,3 +807,172 @@ describe('chipsInMachine', () => {
     expect(chipsInMachine(s)).toBe(5);
   });
 });
+
+// ── Audit-remediation regression tests ────────────────────────────────────────
+//
+// The following two suites nail down the specific bugs called out in the
+// remediation-pass audit. Both were passing latent through the original
+// suites because the exact conditions never arose in the vitest scenarios —
+// the fixes plus these tests together close both leaks.
+
+describe('processInsert — audit #1: no double-credit of between-insert fallouts', () => {
+  // AUDIT FINDING #1 (coinPusher.ts, prior processInsert step 6):
+  //   Step 1's advanceSim() already credited its own fallouts to
+  //   `pendingCredit[player]` AND `totalPaid` on the state it returned.
+  //   The `paid` accumulator was seeded with those same chip IDs, and
+  //   step 6 unconditionally re-applied `paid.length` to BOTH counters —
+  //   incrementing `pendingCredit[player]` a SECOND time (fabricating chips)
+  //   AND inflating `totalPaid` beyond the number of chips actually paid.
+  //   The conservation identity totalInserted === chipsInMachine + totalPaid
+  //   + totalEmptied fails as -N (where N = step-1 fallout count), which
+  //   is what `assertConserved` catches below.
+  //
+  // Setup — how the scenario forces N > 0 in step 1:
+  //   • Upper: single pile at x=0.66, `MAX_STACK_HEIGHT` chips. Because
+  //     0.66 > PLAT_UP_FRONT (0.60), the very first stepMachine substep's
+  //     settlePiles() evicts the pile — 4 upper chips head down to the
+  //     lower platform.
+  //   • Lower: nine contiguous piles at x=0.67, 0.73, …, 1.15, each with
+  //     MAX_STACK_HEIGHT chips. The evicted upper pile lands within CHIP_R
+  //     of the leftmost lower pile, so insertOnPlatform() MERGES (not just
+  //     stacks). The merge triggers the CONTACT IMPULSE: with 4 landing
+  //     chips, shove = 4*CHIP_R*0.5 = 0.06 = PILE_STEP, propagating through
+  //     the entire contiguous chain (no gap > PILE_STEP breaks it). Every
+  //     pile shifts one step forward — including the front pile 1.15 → 1.21.
+  //     The final settle pass evicts 1.21 (past PLAT_LOW_FRONT = 1.20)
+  //     → 4 chips paid in step 1.
+  //
+  // Post-conditions (fixed code): totalPaid == 4, pendingCredit[player] == 4,
+  // conservation holds. Buggy code: totalPaid == 8, pendingCredit[player] == 8,
+  // conservation broken by -4 (unbalanced).
+
+  it('credits between-insert fallouts exactly once (not twice)', () => {
+    const s0 = buildState(
+      // Upper pile past PLAT_UP_FRONT — evicts on first stepMachine substep.
+      (next) => [pileN(0.66, MAX_STACK_HEIGHT, next)],
+      // Full contiguous lower chain — contact impulse propagates end to end.
+      (next) => {
+        const piles: Pile[] = [];
+        for (let i = 0; i < 9; i++) piles.push(pileN(0.67 + i * PILE_STEP, MAX_STACK_HEIGHT, next));
+        return piles;
+      },
+    );
+    // Sanity: 4 (upper) + 9*4 (lower) = 40 chips in fixture.
+    expect(chipsInMachine(s0)).toBe(MAX_STACK_HEIGHT + 9 * MAX_STACK_HEIGHT);
+
+    // 100 ms > PHYSICS_SUBSTEP_MS is plenty to run the eviction + cascade.
+    // (Longer times don't change the outcome — after the first substep
+    // upper is empty and lower is stable, so no further step-1 payouts
+    // occur — but 100 ms keeps the scenario minimal and readable.)
+    const r = processInsert(s0, PLAYER1, 1, 0.5, 1, 42, 100);
+
+    // Conservation is the audit's primary invariant. The buggy code inflates
+    // totalPaid by the between-insert fallout count (4) but does NOT remove
+    // any additional chips from the machine, so totalInserted !==
+    // chipsInMachine + totalPaid + totalEmptied under the bug.
+    assertConserved(r.state, 'step-1 cascade — no double credit');
+
+    // Direct proof that step 1 actually produced fallouts (setup validity):
+    // if this ever regressed to 0, the test would silently pass on buggy
+    // code even though the conservation assertion would too — because no
+    // step-1 chips would exist to be double-credited. We expect ≥ 4 from
+    // the step-1 cascade (the front pile at 1.15, shoved to 1.21, evicted).
+    expect(r.state.totalPaid).toBeGreaterThanOrEqual(4);
+
+    // The reported paidChipIds return value must equal the delta on totalPaid.
+    // Under the bug, paidChipIds correctly aggregates each fallout once, but
+    // totalPaid gets inflated by 4 (step-1 double-credit), so this identity
+    // ALSO breaks — a second, independent check on the bug.
+    expect(r.paidChipIds.length).toBe(r.state.totalPaid - s0.totalPaid);
+  });
+
+  it('paidChipIds report has NO duplicate chip ids across the return', () => {
+    // A duplicate id in `paidChipIds` would be the audit's smoking gun:
+    // a UI/log would render the same chip twice, and a wiring layer could
+    // mint a real casino chip on the strength of it. Under the bug the
+    // step-1 IDs appear once in advanceSim's return AND again threaded into
+    // `paid`, then handed back to the caller — a phantom chip in the log.
+    const s0 = buildState(
+      (next) => [pileN(0.66, MAX_STACK_HEIGHT, next)],
+      (next) => {
+        const piles: Pile[] = [];
+        for (let i = 0; i < 9; i++) piles.push(pileN(0.67 + i * PILE_STEP, MAX_STACK_HEIGHT, next));
+        return piles;
+      },
+    );
+    const r = processInsert(s0, PLAYER1, 1, 0.4, 1, 137, 100);
+    const seen = new Set<number>();
+    for (const id of r.paidChipIds) {
+      expect(seen.has(id), `duplicate chip id ${id} in paidChipIds`).toBe(false);
+      seen.add(id);
+    }
+    // The count returned MUST equal the delta the state records.
+    expect(r.paidChipIds.length).toBe(r.state.totalPaid - s0.totalPaid);
+  });
+
+  it('long-idle operator gap: a single insert crediting massive elapsed time still balances', () => {
+    // Simulates the exact scenario the audit called out: an operator that
+    // has been offline for many pusher periods, then a player inserts. The
+    // between-insert advance runs many substeps; without the fix, the
+    // step-1 fallouts get credited a SECOND time in step 6.
+    const s0 = buildState(
+      (next) => [pileN(0.66, MAX_STACK_HEIGHT, next)],
+      (next) => {
+        const piles: Pile[] = [];
+        for (let i = 0; i < 9; i++) piles.push(pileN(0.67 + i * PILE_STEP, MAX_STACK_HEIGHT, next));
+        return piles;
+      },
+      { pusherAtMs: 0 },
+    );
+    const nowMs = PUSHER_PERIOD_MS * 20; // twenty full sweeps offline
+    const r = processInsert(s0, PLAYER1, 2, 0.5, 1, 424242, nowMs);
+
+    // Conservation invariant is the primary check — the bug breaks it.
+    assertConserved(r.state, 'long-idle-then-insert');
+
+    // Same identity as above.
+    expect(r.paidChipIds.length).toBe(r.state.totalPaid - s0.totalPaid);
+  });
+});
+
+describe('advanceSim — audit #2: idle physics attribution semantics', () => {
+  // AUDIT FINDING #2 (devices.ts tickCoinPusherOperator):
+  //   The operator's idle physics call used `payoutTo=null` (documented in
+  //   the engine header as "dev inspection only"), so any chip that
+  //   tipped between inserts left `chipsInMachine` and landed in
+  //   `totalPaid` with no player credited. Owner-empty only credits piles
+  //   still on the platforms, so those chips vanished.
+  //
+  // The engine already exposed this hazard clearly (see the passing
+  // 'leaves pendingCredit empty when payoutTo is null' test above); the
+  // fix lives in the OPERATOR, which now passes `state.ownerId` so idle
+  // payouts accrue to the machine owner. That routing is exercised
+  // directly here so a future refactor cannot silently break it.
+
+  it('when payoutTo is state.ownerId, idle-tipped chips accrue to the owner', () => {
+    const s = buildState(
+      (next) => [pileN(PLAT_UP_FRONT + 0.005, 3, next)],
+      (next) => {
+        const piles: Pile[] = [];
+        const start = PLAT_LOW_BACK + CHIP_R;
+        for (let i = 0; i < 10; i++) piles.push(pileN(start + i * PILE_STEP, 1, next));
+        return piles;
+      },
+    );
+    // The operator's actual call shape: pass the owner id as payoutTo so
+    // the owner earns what the machine sheds while idle.
+    const r = advanceSim(s, 500, s.ownerId);
+    expect(r.paidChipIds.length).toBeGreaterThan(0);
+    // Every paid chip lands in the OWNER's pendingCredit, nowhere else.
+    const ownerCredit = r.state.pendingCredit[s.ownerId] ?? 0;
+    expect(ownerCredit).toBe(r.paidChipIds.length);
+    const otherCredit = Object.entries(r.state.pendingCredit)
+      .filter(([k]) => k !== s.ownerId)
+      .reduce((a, [, v]) => a + v, 0);
+    expect(otherCredit).toBe(0);
+    // Conservation: chips left the platforms, they went into pendingCredit,
+    // totalPaid tracks the same number.
+    assertConserved(r.state, 'idle physics -> owner');
+    expect(r.state.totalPaid - s.totalPaid).toBe(r.paidChipIds.length);
+  });
+});

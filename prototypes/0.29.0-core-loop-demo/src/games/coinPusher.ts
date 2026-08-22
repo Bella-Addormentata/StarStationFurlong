@@ -621,8 +621,13 @@ export function stepMachine(
  * Advance the machine by `elapsedMs` in fixed PHYSICS_SUBSTEP_MS substeps.
  * Payout attribution: the pending-credit is credited to `payoutTo` (usually
  * the current insert's player). Callers may pass `null` to leave payouts
- * uncredited (rare — dev-tool inspection only; the wiring layer always
- * attributes payouts to the triggering inserter).
+ * UNATTRIBUTED — `totalPaid` is still bumped for conservation, but the
+ * chips are NOT written to any `pendingCredit[]` entry and therefore
+ * NEVER reach a real player balance. The wiring layer MUST NOT pass
+ * `null` during idle physics ticks (audit finding #2): use `state.ownerId`
+ * for ambient sweep — the machine owner earns what tips off between
+ * inserts. `null` is reserved for dev-tool inspection where the caller
+ * wants to see the pile settle without a ledger entry.
  */
 export function advanceSim(
   state: CoinPusherState,
@@ -693,12 +698,18 @@ export function processInsert(
   }
 
   // 1. Advance to now (pusher may have swept while no one was inserting).
+  //    advanceSim() already credits any resulting payouts to the passed
+  //    `playerId` — both `state.pendingCredit[playerId]` and `state.totalPaid`
+  //    are updated on the returned state. Keep `betweenPaid` SEPARATE from
+  //    `instantPaid` (below) so step 6 re-applies ONLY the step-3 fallouts,
+  //    never the step-1 ones (audit finding #1: prior code double-credited
+  //    step-1 fallouts, silently minting chips into `pendingCredit`).
   let cur = state;
-  const paid: number[] = [];
+  const betweenPaid: number[] = [];
   if (nowMs !== null && nowMs > state.pusherAtMs) {
     const between = advanceSim(cur, nowMs - state.pusherAtMs, playerId);
     cur = between.state;
-    paid.push(...between.paidChipIds);
+    betweenPaid.push(...between.paidChipIds);
   }
 
   // 2. Compute the chip's landing x from the peg field (deterministic).
@@ -709,14 +720,17 @@ export function processInsert(
 
   // 3. Any INSTANT fall-off from the drop itself lands on the lower and
   //    may cascade off (rare — needs a full front row). Route the same way
-  //    stepMachine does.
+  //    stepMachine does. These chips are NOT tracked by any state field
+  //    yet (the drop wrote only to the local `upper`/`lower` copies), so
+  //    step 6 owns the accounting for them.
   let upper = inserted.piles;
   let lower = copyPiles(cur.lower);
+  const instantPaid: number[] = [];
   for (const fallenPile of inserted.fallen) {
     const lowerLandX = clamp(fallenPile.x, PLAT_LOW_BACK + CHIP_R, PLAT_LOW_FRONT - CHIP_R);
     const landing = insertOnPlatform(lower, lowerLandX, fallenPile.chipIds, PLAT_LOW_FRONT);
     lower = landing.piles;
-    for (const p of landing.fallen) paid.push(...p.chipIds);
+    for (const p of landing.fallen) instantPaid.push(...p.chipIds);
   }
 
   // 4. Bank the insert in the state — the ante is inserted CHIPS-wise
@@ -733,27 +747,33 @@ export function processInsert(
   // 5. Simulate SETTLE_MS of pusher motion so the freshly-inserted chip
   //    can be pushed. This is what makes an insert feel like an action:
   //    the chip lands, the pusher advances, chips cascade off the edges.
+  //    advanceSim() attributes any settle-time payouts to `playerId` on
+  //    the returned state (both `pendingCredit` and `totalPaid`).
   const settled = advanceSim(cur, SETTLE_MS, playerId);
   cur = settled.state;
   const settlePaid = settled.paidChipIds;
 
-  // 6. Credit chips that fell during step 3 (the instant cascade) to the
-  //    same player — they belong to this insert cycle.
-  if (paid.length > 0) {
+  // 6. Credit chips that fell during STEP 3 ONLY (the instant cascade off
+  //    the freshly-inserted chip). Step 1 and step 5 already bumped both
+  //    `pendingCredit[playerId]` and `totalPaid` inside advanceSim; only
+  //    step 3 wrote directly into `upper`/`lower` without touching either
+  //    counter, so exactly `instantPaid.length` chips need a manual credit
+  //    to keep the conservation invariant balanced.
+  if (instantPaid.length > 0) {
     cur = {
       ...cur,
       pendingCredit: {
         ...cur.pendingCredit,
-        [playerId]: (cur.pendingCredit[playerId] ?? 0) + paid.length,
+        [playerId]: (cur.pendingCredit[playerId] ?? 0) + instantPaid.length,
       },
-      totalPaid: cur.totalPaid + paid.length,
+      totalPaid: cur.totalPaid + instantPaid.length,
       tick: cur.tick + 1,
     };
   }
 
   return {
     state: cur,
-    paidChipIds: [...paid, ...settlePaid],
+    paidChipIds: [...betweenPaid, ...instantPaid, ...settlePaid],
     landedX,
     chipId,
   };

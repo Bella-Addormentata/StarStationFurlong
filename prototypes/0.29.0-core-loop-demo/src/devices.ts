@@ -3808,11 +3808,21 @@ function tickCoinPusherOperator(machineId: string): void {
   }
   // 2) Free-running physics — pusher keeps sweeping between inserts so any
   //    chip already near the tray edge eventually tips (the "attract-mode"
-  //    behaviour real coin pushers show while idle).
+  //    behaviour real coin pushers show while idle). Payouts that tip off
+  //    the lower front while NO ONE is actively inserting have no
+  //    "triggering inserter" to credit, so we route them to the MACHINE
+  //    OWNER as house winnings — physically, the arcade owner earns what
+  //    the machine sheds on its own. Passing `state.ownerId` (rather than
+  //    `null`) also satisfies the engine header's contract that "the wiring
+  //    layer always attributes payouts to a real player id"; audit finding
+  //    #2 flagged a prior `null` that let idle-tipped chips leave
+  //    `chipsInMachine` and land in `totalPaid` with no player credited,
+  //    silently destroying money once past the owner-empty path (which
+  //    only credits back the piles still on the platforms).
   const dt = Math.max(0, Math.min(now - op.lastTickAt, 2000));
   op.lastTickAt = now;
   if (dt > 0) {
-    const advanced = advanceSim(state, dt, null);
+    const advanced = advanceSim(state, dt, state.ownerId);
     if (advanced.paidChipIds.length > 0
       || advanced.state.tick !== state.tick) {
       state = advanced.state;
