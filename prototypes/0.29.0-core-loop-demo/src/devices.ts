@@ -3994,7 +3994,22 @@ function tickCoinPusherOperator(machineId: string): void {
   //    `chipsInMachine` and land in `totalPaid` with no player credited,
   //    silently destroying money once past the owner-empty path (which
   //    only credits back the piles still on the platforms).
-  const dt = Math.max(0, Math.min(now - op.lastTickAt, 2000));
+  //
+  //    dt derivation (audit r5 MINOR fix): free-running physics catches
+  //    the state's `pusherAtMs` up to the current wall clock rather than
+  //    tracking a separate `lastTickAt` cursor. The old cursor double-
+  //    counted after any drain-time insert — processInsert re-anchors
+  //    pusherAtMs to `now`, but the cursor was still `lastTick's now`,
+  //    so `now - lastTickAt` would add another `dt` of physics on top,
+  //    pushing pusherAtMs into the future and freezing the render's
+  //    interpolation. Using `now - state.pusherAtMs` self-corrects:
+  //    when a drain just re-anchored to `now`, dt is 0 and the tick
+  //    is a no-op; when the state is idle, dt catches up the missed
+  //    wall-clock ms; the 2000-ms cap survives (protects against a
+  //    stale state read after a peer offline gap). `lastTickAt` is
+  //    retained on the operator record for debug/diagnostics but no
+  //    longer feeds physics.
+  const dt = Math.max(0, Math.min(now - state.pusherAtMs, 2000));
   op.lastTickAt = now;
   if (dt > 0) {
     const advanced = advanceSim(state, dt, state.ownerId);

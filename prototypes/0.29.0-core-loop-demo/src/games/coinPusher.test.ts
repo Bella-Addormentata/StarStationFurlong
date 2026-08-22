@@ -45,6 +45,7 @@ import {
   PUSHER_MIN_X,
   PUSHER_PERIOD_MS,
   pusherFaceX,
+  SETTLE_MS,
   settlePiles,
   simulatePeg,
   stepMachine,
@@ -974,5 +975,169 @@ describe('advanceSim — audit #2: idle physics attribution semantics', () => {
     // totalPaid tracks the same number.
     assertConserved(r.state, 'idle physics -> owner');
     expect(r.state.totalPaid - s.totalPaid).toBe(r.paidChipIds.length);
+  });
+});
+
+describe('processInsert — audit r5: pusherAtMs is re-anchored so the render interpolates', () => {
+  // AUDIT r5 MINOR (coinPusher.ts processInsert step 5 + currentPusherPhase):
+  //   Step 5 always ran `advanceSim(cur, SETTLE_MS, playerId)`, whose
+  //   substeps accumulate `dtMs` into `pusherAtMs`. On return, pusherAtMs
+  //   sat at `caller-nowMs + SETTLE_MS`. Step 1 then SKIPPED the between-
+  //   advance on the next insert (because that nowMs' <= pusherAtMs), so
+  //   the SETTLE_MS offset never got consumed — every insert stacked ANOTHER
+  //   SETTLE_MS on top, drifting pusherAtMs many periods into the future.
+  //
+  //   The renderer (currentPusherPhase(state, Date.now()) → coinPusherPhaseNow
+  //   in devices.ts → pusher.position.z in furniture.ts) does
+  //     dt = Math.max(0, nowMs - state.pusherAtMs)
+  //   and returns bare state.pusherPhase whenever dt clamps to 0. With
+  //   pusherAtMs many seconds ahead of wall clock, the pusher visual
+  //   froze between operator 4Hz republishes instead of interpolating
+  //   at the render frame rate — the whole point of currentPusherPhase.
+  //
+  //   The fix re-anchors pusherAtMs to `nowMs` after the SETTLE_MS advance
+  //   in processInsert. pusherPhase is left at its post-settle value so
+  //   physics continuity is preserved; only the wall-clock timestamp is
+  //   corrected. Conservation, determinism, and tick monotonicity all hold.
+
+  it('after a burst of inserts at rising nowMs, pusherAtMs equals the last nowMs (no drift)', () => {
+    // The finding cited: after 10 processInsert calls with rising nowMs
+    // 100..1000, pusherAtMs was 24400 ms ahead of the wall clock (each
+    // insert added SETTLE_MS). Under the fix, pusherAtMs must never
+    // exceed the caller's `nowMs` on return.
+    let s = initialCoinPusherState(OWNER, 0);
+    let lastNow = 0;
+    for (let i = 0; i < 10; i++) {
+      lastNow = 100 * (i + 1);
+      s = processInsert(s, PLAYER1, 1, 0.5, 1, i + 1, lastNow).state;
+      // Anchor invariant: the returned pusherAtMs must sit AT nowMs. It
+      // may not exceed it (would freeze render) and may not fall behind
+      // by more than a rounding tick (would leak physics work to callers).
+      expect(s.pusherAtMs).toBe(lastNow);
+    }
+    // Bare-phase equality check the finding measured directly: at wall time
+    // == last insert's nowMs, currentPusherPhase returns state.pusherPhase
+    // (dt=0). One PUSHER_PERIOD_MS later it must have advanced by exactly
+    // one full cycle back to the same phase — proving interpolation works.
+    expect(currentPusherPhase(s, lastNow)).toBe(s.pusherPhase);
+    const oneLater = currentPusherPhase(s, lastNow + PUSHER_PERIOD_MS);
+    expect(oneLater).toBeCloseTo(s.pusherPhase, 9);
+  });
+
+  it('currentPusherPhase interpolates forward for wall-clock times AFTER the anchor', () => {
+    // The renderer runs at ~60 Hz. Between operator republishes it uses
+    // currentPusherPhase(state, Date.now()) to advance the pusher. This
+    // test walks a wall clock forward from the anchor across a full
+    // sweep period and confirms the phase advances monotonically off
+    // the bare state.pusherPhase.
+    let s = initialCoinPusherState(OWNER, 0);
+    const nowAtInsert = 5000;
+    s = processInsert(s, PLAYER1, 1, 0.5, 1, 99, nowAtInsert).state;
+    expect(s.pusherAtMs).toBe(nowAtInsert);
+
+    const basePhase = currentPusherPhase(s, nowAtInsert);
+    expect(basePhase).toBe(s.pusherPhase);
+
+    // Walk wall clock forward in 40 ms frames (one physics substep) up to
+    // one full period. The phase must move OFF basePhase (never stuck).
+    let sawDistinctPhase = false;
+    let prevAdvance = 0;
+    for (let ahead = 40; ahead <= PUSHER_PERIOD_MS - 40; ahead += 40) {
+      const p = currentPusherPhase(s, nowAtInsert + ahead);
+      // Compute the same "distance from basePhase" formula the render sees.
+      const advance = (ahead / PUSHER_PERIOD_MS);
+      const expected = (basePhase + advance) % 1;
+      expect(p).toBeCloseTo(expected, 9);
+      if (p !== basePhase) sawDistinctPhase = true;
+      // Monotonic advance within the same cycle (mod 1 with no wrap).
+      if (ahead < PUSHER_PERIOD_MS && basePhase + advance < 1) {
+        expect(advance).toBeGreaterThanOrEqual(prevAdvance - 1e-12);
+        prevAdvance = advance;
+      }
+    }
+    expect(sawDistinctPhase).toBe(true);
+  });
+
+  it('phase continuity across the settle: the state phase and the anchored render phase agree', () => {
+    // Physics continuity: the pusherPhase AFTER step 5 is the fast-forwarded
+    // phase; re-anchoring pusherAtMs must NOT touch pusherPhase, so
+    // currentPusherPhase(state, nowMs) === state.pusherPhase.
+    // If the fix ever regressed to also rewriting pusherPhase to some
+    // "pre-settle" value the visual would jump backwards on every insert.
+    const s0 = initialCoinPusherState(OWNER, 0);
+    // Prime the state with some phase so 0.0 is not a coincidence.
+    const primed = stepMachine(s0, PUSHER_PERIOD_MS * 0.37).state;
+    const nowAtInsert = 12345;
+    const r = processInsert(primed, PLAYER1, 2, 0.4, 1, 777, nowAtInsert);
+    // Anchor invariant.
+    expect(r.state.pusherAtMs).toBe(nowAtInsert);
+    // Continuity invariant: bare-phase read matches the state field.
+    expect(currentPusherPhase(r.state, nowAtInsert)).toBe(r.state.pusherPhase);
+    // The post-settle phase corresponds to a positive number of SETTLE_MS
+    // advances — it can't be equal to the pre-settle phase (would prove
+    // step 5 didn't actually run). SETTLE_MS = PUSHER_PERIOD_MS + one
+    // substep so phase advances by ~1.0167 cycles net.
+    expect(r.state.pusherPhase).not.toBe(primed.pusherPhase);
+  });
+
+  it('re-anchor preserves the conservation invariant (unchanged money counters)', () => {
+    // The re-anchor touches ONLY pusherAtMs — not upper/lower piles, not
+    // pendingCredit, not totalInserted/totalPaid/totalEmptied. This test
+    // pins that: run a long burst and check conservation holds AND
+    // pusherAtMs stays at each caller nowMs.
+    let s = initialCoinPusherState(OWNER, 0);
+    let now = 0;
+    for (let i = 0; i < 50; i++) {
+      const hole = ((i % 3) as PusherHole);
+      now += 60; // wall clock advances between inserts
+      s = processInsert(s, PLAYER1, hole, (i * 0.11) % 1, 1, 4000 + i, now).state;
+      expect(s.pusherAtMs).toBe(now);
+      assertConserved(s, `re-anchor-insert-${i}`);
+    }
+    expect(s.totalInserted).toBe(50);
+  });
+
+  it('nowMs === null (test/dev inspection escape hatch) leaves pusherAtMs alone', () => {
+    // The engine's contract: nowMs === null skips step 1's between-advance
+    // AND the step-5b re-anchor. Existing callers (dev tools, tests) that
+    // opt out of wall-clock semantics must still get the legacy behaviour.
+    const s0 = initialCoinPusherState(OWNER, 500);
+    const r = processInsert(s0, PLAYER1, 1, 0.5, 1, 42, null);
+    // Legacy: pusherAtMs = pre-existing pusherAtMs + SETTLE_MS.
+    expect(r.state.pusherAtMs).toBe(500 + SETTLE_MS);
+  });
+
+  it('long-idle then insert: pusherAtMs snaps to the caller nowMs (no future drift)', () => {
+    // The audit finding's key example: peer inserts after a very long
+    // idle gap. Under the bug, pusherAtMs would be ~24s ahead of wall
+    // clock after the first insert (SETTLE_MS + the between-advance).
+    // Under the fix, it must sit AT nowMs.
+    const s0 = initialCoinPusherState(OWNER, 0);
+    const nowMs = PUSHER_PERIOD_MS * 20; // 48s
+    const r = processInsert(s0, PLAYER1, 2, 0.5, 1, 424242, nowMs);
+    expect(r.state.pusherAtMs).toBe(nowMs);
+    // Render at wall-clock nowMs must equal the stored phase.
+    expect(currentPusherPhase(r.state, nowMs)).toBe(r.state.pusherPhase);
+    // Render at nowMs + 250 ms (one operator tick later) must have moved.
+    const laterPhase = currentPusherPhase(r.state, nowMs + 250);
+    expect(laterPhase).not.toBe(r.state.pusherPhase);
+    assertConserved(r.state, 'long-idle-anchor');
+  });
+
+  it('multiple inserts in the same operator tick (same nowMs) all end at pusherAtMs === nowMs', () => {
+    // A burst drain: the operator captures `now` once and calls processInsert
+    // with the same nowMs across every queued request. Every insert must
+    // finish with pusherAtMs === nowMs so the free-running dt (now -
+    // state.pusherAtMs) is zero and no double-simulation happens.
+    let s = initialCoinPusherState(OWNER, 0);
+    const now = 1000;
+    for (let i = 0; i < 5; i++) {
+      s = processInsert(s, PLAYER1, ((i % 3) as PusherHole), 0.5, 1, 300 + i, now).state;
+      expect(s.pusherAtMs).toBe(now);
+    }
+    // At wall-clock `now`, phase = bare pusherPhase. One period later, the
+    // interpolated phase must match state.pusherPhase again (full cycle).
+    expect(currentPusherPhase(s, now)).toBe(s.pusherPhase);
+    expect(currentPusherPhase(s, now + PUSHER_PERIOD_MS)).toBeCloseTo(s.pusherPhase, 9);
   });
 });

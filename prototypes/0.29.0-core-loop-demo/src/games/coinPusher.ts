@@ -200,9 +200,19 @@ export interface CoinPusherState {
   nextChipId: number;
   /** Pusher animation phase [0, 1) at `pusherAtMs`. */
   pusherPhase: number;
-  /** Wall-clock ms when `pusherPhase` was last recorded. Used by the wiring
-   *  layer to pick up where the last operator left off; the pure engine only
-   *  uses it as a monotonic timestamp for `advanceSim`. */
+  /** Wall-clock ms at which the current `pusherPhase` should be rendered —
+   *  the anchor point for `currentPusherPhase(state, Date.now())`'s per-frame
+   *  interpolation. The renderer at furniture.ts computes
+   *  `dt = max(0, Date.now() - pusherAtMs)` and advances the phase by
+   *  `dt / PUSHER_PERIOD_MS`, so pusherAtMs MUST stay <= wall clock or the
+   *  visual freezes (audit r5 fix: pusherAtMs is re-anchored to the caller's
+   *  `nowMs` after processInsert's SETTLE_MS advance, and the operator's
+   *  free-running physics catches up from `state.pusherAtMs` rather than a
+   *  private lastTickAt cursor — see the tickCoinPusherOperator comment).
+   *  Substep-level accumulation inside a single advanceSim() run is fine —
+   *  what matters is that when control returns to the caller, pusherAtMs
+   *  reflects the wall-clock time the CALLER associates with the new phase.
+   *  The pure engine never reads Date.now(); the wiring layer stamps this. */
   pusherAtMs: number;
   /** Monotonic write counter — every mutating helper bumps it. Peer readers
    *  can use it to detect stale updates; whole-value LWW resolves ties. */
@@ -674,7 +684,12 @@ export function advanceSim(
  * holds; the money side is the wiring layer's job.
  *
  * `nowMs` may be `null` to skip the between-insert pusher advance (rarely
- * useful — dev inspection or tests only).
+ * useful — dev inspection or tests only). When non-null it is ALSO used
+ * to re-anchor the returned state's `pusherAtMs` after the SETTLE_MS
+ * physics advance (audit r5 fix): pusherAtMs sits at `nowMs`, NOT at
+ * `nowMs + SETTLE_MS`. This keeps the per-frame render interpolation in
+ * currentPusherPhase() live — see the pusherAtMs field doc for the full
+ * rationale.
  */
 export function processInsert(
   state: CoinPusherState,
@@ -752,6 +767,34 @@ export function processInsert(
   const settled = advanceSim(cur, SETTLE_MS, playerId);
   cur = settled.state;
   const settlePaid = settled.paidChipIds;
+
+  // 5b. RE-ANCHOR `pusherAtMs` to the caller's `nowMs` (audit r5 MINOR fix).
+  //
+  //    advanceSim's substeps accumulate `dtMs` into pusherAtMs so, on return,
+  //    pusherAtMs sits at `pre-settle + SETTLE_MS` — i.e., 2440 ms AHEAD of
+  //    the wall clock the caller supplied. If left as-is, the RENDERER
+  //    (furniture.ts's coin-pusher visual, driven by currentPusherPhase(state,
+  //    Date.now())) sees `dt = Date.now() - pusherAtMs < 0`, clamps it to 0,
+  //    and returns bare state.pusherPhase — the visual freezes until wall
+  //    clock catches up SETTLE_MS later. Under a burst of inserts pusherAtMs
+  //    stacks N·SETTLE_MS ahead and the pusher only redraws on the operator's
+  //    4Hz publish, defeating the whole point of per-frame interpolation.
+  //
+  //    The fix pins pusherAtMs BACK to nowMs while KEEPING pusherPhase at
+  //    its post-settle value. The physics has been fast-forwarded — the new
+  //    phase is the correct phase — and re-anchoring the timestamp lets the
+  //    renderer resume smooth per-frame interpolation from that phase.
+  //
+  //    Conservation: the money-side counters (totalInserted, totalPaid,
+  //    pendingCredit, totalEmptied) live on the returned state and are
+  //    UNTOUCHED by this re-anchor. Determinism: pusherPhase is unchanged,
+  //    so any subsequent physics step from the same (state, dt) is identical.
+  //    `nowMs === null` is the tests / dev-inspection escape hatch that opts
+  //    out of the between-advance in step 1; the re-anchor is skipped for
+  //    parity so those callers still see the legacy SETTLE_MS advance.
+  if (nowMs !== null) {
+    cur = { ...cur, pusherAtMs: nowMs };
+  }
 
   // 6. Credit chips that fell during STEP 3 ONLY (the instant cascade off
   //    the freshly-inserted chip). Step 1 and step 5 already bumped both
