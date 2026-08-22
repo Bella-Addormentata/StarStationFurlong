@@ -713,10 +713,17 @@ export function createTradingScreenUI(deps: TradingScreenDeps): DeviceUI {
   let refreshTimer = 0;
 
   // Convert priceMojo to a display string. v1 gift offers are "GIFT"; priced
-  // offers show as an integer + " M/share". Deliberately NOT calling this
-  // XCH — plain-language rule (Chia jargon on the screen breaks the surface).
+  // offers show as an integer + " credits/share". Deliberately NOT calling
+  // this "M/share", "mojo", "XCH", or any other Chia jargon — the plain-
+  // language rule bans that vocabulary on the player surface (per PR #128
+  // reviewer note 2026-08-21: same species as the banned singleton / CAT /
+  // vault vocabulary even though "mojo" is not on the explicit list).
+  // "credits" is SSF's existing demo-ledger unit (phone-apps-breakdown §3.1)
+  // — the internal `priceMojo` field NAME is unchanged because it will map
+  // to Chia mojo one-to-one when the V3 Registry rail lands, but the string
+  // shown on screen never carries that word today.
   const priceText = (priceMojo: number): string =>
-    priceMojo === 0 ? 'GIFT' : `${priceMojo.toLocaleString()} M/share`;
+    priceMojo === 0 ? 'GIFT' : `${priceMojo.toLocaleString()} credits/share`;
 
   const drawChart = (): void => {
     if (!chart) return;
@@ -943,7 +950,7 @@ export function createTradingScreenUI(deps: TradingScreenDeps): DeviceUI {
               <option value="BUY">BUY</option>
             </select>
             <input id="tf-shares" type="number" min="1" max="100" value="1" style="background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.28); color:#F0C060; font-family:inherit; font-size:11px; padding:5px; text-align:right;" />
-            <input id="tf-price" type="number" min="0" step="1" value="0" placeholder="price (mojo/share)" title="0 = GIFT (v1 gift-only rail). Priced offers post but settle with the Registry."
+            <input id="tf-price" type="number" min="0" step="1" value="0" placeholder="price (credits/share)" title="0 = GIFT (v1 gift-only rail). Priced offers post but settle with the Registry."
               style="background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.28); color:#F0C060; font-family:inherit; font-size:11px; padding:5px; text-align:right;" />
             <button id="tf-submit" style="padding:5px 14px; background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.45); border-radius:4px; color:#F0C060; font-family:inherit; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer;">POST</button>
           </div>
