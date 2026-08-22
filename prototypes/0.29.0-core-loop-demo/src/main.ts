@@ -49,6 +49,22 @@ import { bindTreasuryDoc } from "./treasuryDoc";
 // matches NO real chain genesis, so every foreign record is rejected until
 // real network configuration arrives with PR C (plan §17.5).
 const TREASURY_DEV_GENESIS = "0".repeat(64);
+// 🚀 #30 SH2 + SH3: the ship's own doc (fuel truth + flight state machine).
+// Rebinds at the T0 seam alongside furniture / doors / games — see the
+// bindShipDoc call below for the rebind rationale. flightArrived + findDest
+// power the commander-side auto-advance (in-flight → redocking) that runs
+// once/sec so a flight completes even if no one has the helm panel open.
+import {
+  bindShipDoc,
+  findDestination,
+  flightArrived,
+  readFlightRecord,
+  writeFlightRecord,
+} from "./shipDoc";
+// 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
+// gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
+// funnels the current-room owner predicate into the device UI.
+import { setHelmOwnerCheck } from "./devices";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
@@ -1168,6 +1184,19 @@ async function joinRoomAtEpoch(
   // like players/games/roomInfo (T0 seam).
   bindFurnitureDoc(sync.doc);
 
+  // 🚀 #30 SH2 + SH3: the ship's own doc (fuel level + flight state machine)
+  // rides the room doc too. Rebinds per join RIGHT AFTER furniture — a helm
+  // that reads fuel truth must see the fresh doc BEFORE its subscribe fires
+  // (the helm's REFUEL/DEPART/REDOCK writers all read the CURRENT record
+  // through writeFlightRecord's transition gate, so a subscribe firing against
+  // the stale doc would refuse legal advances). Fuel-tank capacity is DERIVED
+  // from furniture, so the two docs are consumed together in the helm UI;
+  // binding shipDoc right after furniture guarantees both observers are
+  // installed before the first reconcile. (A future exterior-view flight
+  // branch will read this same doc — plan §7 SH4 — but no exterior code
+  // consumes shipDoc in the shipped SH3 slice.)
+  bindShipDoc(sync.doc);
+
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
   // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
@@ -1352,6 +1381,37 @@ async function joinRoomAtEpoch(
         "";
       return isLocalPlayerRoomOwner(ownerVal);
     });
+    // 🚀 #30 SH2/SH3: the helm's writes are owner-gated at the UI. Same seam
+    // as the exterior owner check — dev-phase honest-client posture (signed
+    // enforcement lives in a later slice, plan §7 SH5).
+    setHelmOwnerCheck(() => {
+      const ownerVal =
+        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+        "";
+      return isLocalPlayerRoomOwner(ownerVal);
+    });
+    // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
+    // ticks the countdown while open, but a flight must complete even if no
+    // one has the panel up — otherwise a `in-flight` record with a past
+    // `etaAt` would strand the ship (canDepart refuses because status !==
+    // 'docked'). Idempotent under contention: whichever commander writes
+    // first wins; the second's next tick reads `redocking` and skips. Non-
+    // commanders don't advance (owner-writes posture). Runs at 1 Hz — an
+    // arrival-latency ceiling of ~1 second is imperceptible next to the
+    // 60–90 s minimum travel time.
+    window.setInterval(() => {
+      const ownerVal =
+        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
+        "";
+      if (!isLocalPlayerRoomOwner(ownerVal)) return;
+      const rec = readFlightRecord();
+      if (rec.status !== "in-flight") return;
+      if (!flightArrived(rec, Date.now())) return;
+      const dest = rec.destinationId
+        ? findDestination(rec.destinationId)
+        : findDestination(rec.locationId);
+      writeFlightRecord({ status: "redocking", locationId: dest.id });
+    }, 1_000);
   }
   setActivePassRoom(boot.roomId);
 
