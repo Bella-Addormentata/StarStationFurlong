@@ -108,7 +108,15 @@ import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
   ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
 } from './robotDoc';
-import type { RobotRoutine, RobotStep } from './robotDoc';
+import type { RobotConfig, RobotRoutine, RobotStep } from './robotDoc';
+// 🎰⏱️ #77C: owner-editable roulette pacing bounds (used by the croupier UI).
+import {
+  BET_SECS_MAX, BET_SECS_MIN,
+  CLOSING_SECS_MAX, CLOSING_SECS_MIN,
+  SHOW_SECS_MAX, SHOW_SECS_MIN,
+  isWheelTiming,
+  type WheelTiming,
+} from './robotScript';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
@@ -1926,10 +1934,38 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
 
+  /** Write a partial patch, preserving every field the console isn't editing.
+   *  Every UI event routes through here so a toggle in one section doesn't
+   *  silently drop the setting a different section wrote (routine change would
+   *  otherwise clobber a scripted wheelTiming). Uses `in` (not `??`) so an
+   *  explicit `false`/`0`/`""` in the patch WINS over the stored value — the
+   *  STOP/START toggle needs `parked: false` to actually unpark. */
+  const writePatch = (patch: Partial<RobotConfig>): void => {
+    const c = readRobotConfig(deps.itemId);
+    const routine: RobotRoutine =
+      'routine' in patch && patch.routine ? patch.routine : c?.routine ?? 'serve';
+    const script = 'script' in patch ? patch.script : c?.script;
+    const parked = 'parked' in patch ? patch.parked : c?.parked;
+    const wheelTiming = 'wheelTiming' in patch ? patch.wheelTiming : c?.wheelTiming;
+    writeRobotConfig(deps.itemId, {
+      routine,
+      ...(script && script.length ? { script } : {}),
+      ...(parked ? { parked: true } : {}),
+      ...(wheelTiming ? { wheelTiming } : {}),
+    });
+  };
   const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
-    writeRobotConfig(deps.itemId, { routine, script });
+    writePatch({ routine, script });
   };
   const curScript = (): RobotStep[] => readRobotConfig(deps.itemId)?.script ?? [];
+  /** The current wheelTiming, or the module defaults expressed in seconds so
+   *  the inputs always show something meaningful (owner hasn't tuned yet). */
+  const curTiming = (): WheelTiming => {
+    const t = readRobotConfig(deps.itemId)?.wheelTiming;
+    return isWheelTiming(t)
+      ? t
+      : { betSecs: 18, closingSecs: 3, showSecs: 9 };
+  };
 
   const render = (): void => {
     if (!panel) return;
@@ -1993,6 +2029,30 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
       cursor:pointer;
     "><span>${voiceOn ? '🔊 VOICE ON' : '🔇 VOICE OFF'}</span><span style="font-size:9px; color:rgba(212,168,75,0.5);">this device</span></button>`;
+    // 🎰⏱️ #77C: wheelTiming editor — only visible under the 'croupier'
+    // routine (where these seconds actually govern the wheel's rhythm). Three
+    // number inputs, each bounded by the module constants so a hostile paste
+    // is rejected before it commits.
+    const timing = curTiming();
+    const timingInp = (field: keyof WheelTiming, min: number, max: number): string =>
+      `<input data-timing="${field}" type="number" min="${min}" max="${max}" step="1" value="${timing[field]}" ${owner ? '' : 'disabled'} style="
+        width:54px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
+        border-radius:4px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:3px 5px;">`;
+    const timingRow = (label: string, field: keyof WheelTiming, min: number, max: number, hint: string): string =>
+      `<div style="display:flex; align-items:center; gap:8px; font-size:10px; color:${CH_GOLD};">
+        <span style="width:96px;">${label}</span>
+        ${timingInp(field, min, max)} <span style="font-size:9px; color:${CH_DIM};">s · ${hint}</span>
+      </div>`;
+    const timingEditor =
+      current === 'croupier'
+        ? `
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">WHEEL PACING</div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        ${timingRow('Betting window', 'betSecs', BET_SECS_MIN, BET_SECS_MAX, `${BET_SECS_MIN}–${BET_SECS_MAX}`)}
+        ${timingRow('Closing beat', 'closingSecs', CLOSING_SECS_MIN, CLOSING_SECS_MAX, `${CLOSING_SECS_MIN}–${CLOSING_SECS_MAX}`)}
+        ${timingRow('Result show', 'showSecs', SHOW_SECS_MIN, SHOW_SECS_MAX, `${SHOW_SECS_MIN}–${SHOW_SECS_MAX}`)}
+      </div>`
+        : '';
     const editor =
       current === 'custom'
         ? `
@@ -2005,7 +2065,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
             ? `<div style="display:flex; gap:6px;">${addBtn('goto', '+ Go to')}${addBtn('say', '+ Say')}${addBtn('wait', '+ Wait')}</div>`
             : `<span style="font-size:9px; color:#4A5560;">Max ${MAX_SCRIPT_STEPS} steps.</span>`
           : ''}`
-        : '';
+        : timingEditor;
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🤖 ROBOT PROGRAM</span>
@@ -2036,24 +2096,30 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       render();
     });
     if (!owner) return;
-    // 🤖 STOP/START: toggle parked, preserving routine + script.
+    // 🤖 STOP/START: toggle parked. writePatch preserves routine, script AND
+    // any owner-authored wheelTiming so the park toggle never clobbers them.
+    // Pass the boolean directly — writePatch honours `false` (unpark) via the
+    // `in` check, so a toggle-off cleanly drops the field on write.
     panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
       const c = readRobotConfig(deps.itemId);
-      writeRobotConfig(deps.itemId, {
-        routine: c?.routine ?? 'serve',
-        ...(c?.script?.length ? { script: c.script } : {}),
-        parked: !(c?.parked === true),
-      });
+      writePatch({ parked: !(c?.parked === true) });
     });
     panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
       b.addEventListener('click', () => {
-        // Keep any authored script AND the parked state when switching routines.
-        const c = readRobotConfig(deps.itemId);
-        writeRobotConfig(deps.itemId, {
-          routine: b.dataset.routine as RobotRoutine,
-          ...(script.length ? { script } : {}),
-          ...(c?.parked ? { parked: true } : {}),
-        });
+        writePatch({ routine: b.dataset.routine as RobotRoutine });
+      });
+    });
+    // 🎰⏱️ #77C: three number inputs bound to the wheelTiming fields (only
+    // rendered when the routine is 'croupier'). Each change validates through
+    // isWheelTiming before it commits — a nonsense value stays local, so the
+    // synced doc always holds a safely-bounded triple.
+    panel.querySelectorAll<HTMLInputElement>('[data-timing]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const field = el.dataset.timing as keyof WheelTiming;
+        const cur = curTiming();
+        const next: WheelTiming = { ...cur, [field]: Number(el.value) };
+        if (isWheelTiming(next)) writePatch({ wheelTiming: next });
+        else render(); // reset the input back to the accepted value
       });
     });
     panel.querySelectorAll<HTMLButtonElement>('[data-add]').forEach((b) => {

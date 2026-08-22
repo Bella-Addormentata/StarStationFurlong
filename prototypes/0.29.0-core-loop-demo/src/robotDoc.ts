@@ -14,18 +14,21 @@
  */
 
 import * as Y from 'yjs';
+import {
+  MAX_SCRIPT_STEPS,
+  isRobotStep,
+  isWheelTiming,
+  type RobotStep,
+  type WheelTiming,
+} from './robotScript';
+
+// 🤖📜 The RobotStep type and its shape-guard live in robotScript.ts — that's
+// the engine-pure module the render layer + tests share. Re-exported here so
+// existing importers of `./robotDoc` keep working without churn.
+export { MAX_SCRIPT_STEPS, isRobotStep, isWheelTiming };
+export type { RobotStep, WheelTiming };
 
 export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom';
-
-/** 🤖 #77C s4: one bounded step of an owner-authored routine (a chip list, NOT
- *  a DSL). The robot loops the list: walk to a spot, say a line, or pause. */
-export type RobotStep =
-  | { kind: 'goto'; x: number; z: number }
-  | { kind: 'say'; text: string }
-  | { kind: 'wait'; secs: number };
-
-/** Hard cap on a custom script (keeps the synced record small + the loop cheap). */
-export const MAX_SCRIPT_STEPS = 16;
 
 export interface RobotConfig {
   routine: RobotRoutine;
@@ -35,6 +38,10 @@ export interface RobotConfig {
    *  stands on it, OFF, overriding the routine. START (parked false/absent)
    *  resumes the routine. Independent of `routine` so it survives a routine edit. */
   parked?: boolean;
+  /** 🎰⏱️ #77C: owner-programmable roulette pacing. When set on ANY dock's
+   *  config, croupier duty uses these timings in place of its defaults (validated
+   *  to safe bounds so a hostile peer can't strand the wheel spinning). */
+  wheelTiming?: WheelTiming;
 }
 
 export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom'];
@@ -86,16 +93,6 @@ export function subscribeRobot(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-/** Step guard — the script crosses the room-doc trust boundary (peer writes). */
-export function isRobotStep(value: unknown): value is RobotStep {
-  if (typeof value !== 'object' || value === null) return false;
-  const s = value as { kind?: unknown; x?: unknown; z?: unknown; text?: unknown; secs?: unknown };
-  if (s.kind === 'goto') return Number.isFinite(s.x) && Number.isFinite(s.z);
-  if (s.kind === 'say') return typeof s.text === 'string';
-  if (s.kind === 'wait') return Number.isFinite(s.secs) && (s.secs as number) >= 0;
-  return false;
-}
-
 function isRobotConfig(value: unknown): value is RobotConfig {
   if (typeof value !== 'object' || value === null) return false;
   const c = value as Partial<RobotConfig>;
@@ -110,6 +107,7 @@ function isRobotConfig(value: unknown): value is RobotConfig {
     if (!c.script.every(isRobotStep)) return false;
   }
   if (c.parked !== undefined && typeof c.parked !== 'boolean') return false;
+  if (c.wheelTiming !== undefined && !isWheelTiming(c.wheelTiming)) return false;
   return true;
 }
 

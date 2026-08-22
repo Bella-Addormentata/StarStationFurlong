@@ -4873,10 +4873,17 @@ export class World {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
+      // 🎰⏱️ #77C: pick the owner-programmed roulette pacing (if any). Docks
+      // are sorted by id so multiple configured docks pick the SAME timing on
+      // every client — no wall-clock drift between operator and viewers.
+      const dockIds = [...this.robots.keys()].sort();
+      const wheelTiming = dockIds
+        .map((k) => readRobotConfig(k)?.wheelTiming)
+        .find((t) => t != null);
       for (const t of tables) {
         if (beatNow) beatCroupier(t.id);
         if (t.kind === "craps-table") tickAutoStickman(t.id);
-        else tickAutoCroupier(t.id);
+        else tickAutoCroupier(t.id, wheelTiming);
       }
       for (const machine of slotMachines) tickAutoSlotMachine(machine.id);
     } else {

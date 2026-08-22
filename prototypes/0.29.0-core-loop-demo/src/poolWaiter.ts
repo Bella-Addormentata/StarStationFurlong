@@ -18,6 +18,10 @@ import * as THREE from "three";
 import type { Player } from "./player";
 import { CELL_SIZE, findPath, worldToCol, worldToRow } from "./pathfinding";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
+import {
+  ARRIVE_DIST as SCRIPT_ARRIVE_DIST,
+  RobotScriptScheduler,
+} from "./robotScript";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -187,12 +191,11 @@ export class PoolWaiter {
   /** 🤖 STOP/START: when true the bot parks on its dock (off), overriding the
    *  routine + croupier duty. Set from the dock console via the world. */
   private parked = false;
-  /** 🤖 #77C s4: the custom step list (routine 'custom') + loop cursor/timer, and
-   *  the world-provided handler that renders a 'say' bubble over the bot. */
-  private script: RobotStep[] = [];
-  private scriptIndex = 0;
-  private scriptTimer = 0;
-  private saidThisStep = false;
+  /** 🤖📜 #77C s4: the engine-pure state machine driving a custom routine. This
+   *  scheduler owns cursor+timers+edge-flags and validates every step; poolWaiter
+   *  just asks each frame "what should the chassis DO now?" and renders that.
+   *  Kept here (not created per-tick) so timers survive across frames. */
+  private scriptScheduler = new RobotScriptScheduler();
   private sayHandler: ((text: string, x: number, z: number) => void) | null = null;
   /** 🗨️ #77 small talk: greet once when a fox newly enters range, then hold off. */
   private smalltalkCooldown = 0;
@@ -541,14 +544,12 @@ export class PoolWaiter {
     this.parked = parked;
   }
 
-  /** 🤖 #77C s4: set the custom step list. Resets the loop only when the script
-   *  actually changed, so a re-apply mid-loop doesn't restart it. */
+  /** 🤖 #77C s4: set the custom step list. The scheduler dedups an identical
+   *  payload so a re-apply mid-loop doesn't restart it, and drops any malformed
+   *  step (a hostile peer sneaking through the doc guard) — safe to pass through. */
   public setScript(steps: RobotStep[]): void {
-    if (JSON.stringify(steps) === JSON.stringify(this.script)) return;
-    this.script = steps;
-    this.scriptIndex = 0;
-    this.scriptTimer = 0;
-    this.saidThisStep = false;
+    this.scriptScheduler.setSteps(steps);
+    // Clear the walker's cached path so the next `goto` step recomputes cleanly.
     this.path = [];
     this.pathGoalKey = "";
   }
@@ -558,38 +559,38 @@ export class PoolWaiter {
     this.sayHandler = fn;
   }
 
-  /** 🤖 #77C s4: advance the custom step loop (walk / say / wait). */
+  /** 🤖📜 #77C s4: advance the custom step loop by asking the engine-pure
+   *  scheduler what the chassis should do this frame, then rendering it. The
+   *  scheduler judges arrival/timeouts/hold-durations; poolWaiter only handles
+   *  I/O (walker legs, tray, sayHandler bubble). Chassis position is fed in so
+   *  the scheduler's arrival check stays in step with the walker's own. */
   private updateScript(dt: number): void {
-    if (this.script.length === 0) {
+    const pos = this.group.position;
+    const action = this.scriptScheduler.advance(dt, {
+      x: pos.x,
+      z: pos.z,
+    });
+    if (action.kind === "none") {
       this.idlePose();
       return;
     }
-    const step = this.script[this.scriptIndex % this.script.length];
-    const advance = (): void => {
-      this.scriptIndex = (this.scriptIndex + 1) % this.script.length;
-      this.scriptTimer = 0;
-      this.saidThisStep = false;
-      this.path = [];
-      this.pathGoalKey = "";
-    };
-    if (step.kind === "goto") {
-      if (this.walkTo(dt, step.x, step.z, 0.15)) advance();
-    } else if (step.kind === "say") {
-      if (!this.saidThisStep) {
-        this.saidThisStep = true;
-        const p = this.group.position;
-        this.sayHandler?.(step.text, p.x, p.z);
-      }
-      // Hold the pose briefly so the line is readable before the next step.
-      this.idlePose();
-      this.scriptTimer += dt;
-      if (this.scriptTimer >= 2.5) advance();
-    } else {
-      // wait
-      this.idlePose();
-      this.scriptTimer += dt;
-      if (this.scriptTimer >= step.secs) advance();
+    if (action.kind === "goto") {
+      // walkTo uses the same ARRIVE_DIST as the scheduler so both agree on
+      // "arrived". Return value is ignored — the scheduler owns advancement.
+      this.walkTo(dt, action.x, action.z, SCRIPT_ARRIVE_DIST);
+      return;
     }
+    if (action.kind === "say") {
+      // Edge-trigger: emit exactly once per SAY step (the scheduler flips the
+      // flag on the first tick, so a stale bubble won't re-fire).
+      if (action.started) {
+        this.sayHandler?.(action.text, pos.x, pos.z);
+      }
+      this.idlePose();
+      return;
+    }
+    // wait
+    this.idlePose();
   }
 
   /** Stand still (a dockless off-duty robot) — legs settled, a slow idle bob. */
