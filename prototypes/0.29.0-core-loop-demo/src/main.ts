@@ -133,6 +133,16 @@ import {
   removeVentureLink,
   isOfficeHere,
 } from "./ventures";
+// 🏛️ #68 V4: trading-floor doc — signed OFFER records + tape + price history.
+// Bound on every room join alongside `bindVentures`/`bindOffers`: the offers,
+// accepts, cancels, and settlement tape all ride the SAME room-doc so a
+// venture's board + cap-table writes can never split across docs (the seam
+// that makes reconcileTradingFloor's deterministic settle safe).
+import {
+  bindTradingFloor,
+  subscribeTradingFloor,
+  scheduleReconcileTradingFloor,
+} from "./tradingFloorDoc";
 import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
 import {
   refreshExteriorView,
@@ -1214,6 +1224,18 @@ async function joinRoomAtEpoch(
   // ride the same doc — bound here so redeem/revoke and the venture-map
   // writes can never split across docs.
   bindOffers(sync.doc);
+  // 🏛️ #68 V4: the trading floor's offer book + settlement tape ride the SAME
+  // room-doc as the venture record — bound at the same T0 seam so a peer that
+  // sees an accept has already seen the cap-table it settles into.
+  //
+  // AUDIT #68 REMEDIATION (round 1, finding 2): every observed change to the
+  // floor map schedules a merge-quiescence reconcile — so the office peer
+  // reconciles even when the trading-screen UI is not open (the settlement
+  // lane can't wait on a shareholder walking up to the wall). Combined with
+  // the corrective path inside `reconcileTradingFloor`, every peer converges
+  // on the canonical winner even if an earlier settle preceded the merge.
+  bindTradingFloor(sync.doc);
+  subscribeTradingFloor(() => { scheduleReconcileTradingFloor(); });
   // 🏦 Treasury caches: signed display records over this room's doc (plan §14).
   // Verify-on-read only — nothing here is authoritative (invariant 5). The
   // genesis pin (§17.5) rejects records from any other network; the value is

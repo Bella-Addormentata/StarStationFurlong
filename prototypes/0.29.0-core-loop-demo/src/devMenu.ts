@@ -104,6 +104,8 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'lavender-bouquet': '🪻 LAVENDER BOUQUET',
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
+  // 🏛️ #68 V4 — the venture's in-world trading floor (offers + tape + chart).
+  'trading-screen': '🏛️ TRADING FLOOR',
 };
 
 type GetWorld = () => World | null;
