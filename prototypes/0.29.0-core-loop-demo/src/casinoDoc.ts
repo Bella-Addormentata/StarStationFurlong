@@ -49,6 +49,13 @@ import type {
   SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
   SlotFundingConfig,
 } from './games/slots';
+// 🏒 #115: air-hockey pay-to-play fees ride the same chip ledger. The
+// gamesDoc import is a READ-ONLY seam (fee configs must name the CURRENT
+// room owner — see readAirHockeyFeeConfig); no transactional coupling, and
+// no cycle (gamesDoc imports only the pure game engines).
+import { isAirHockeyFeeConfig, isAirHockeyPaidRecord } from './games/airHockey';
+import type { AirHockeyFeeConfig, AirHockeyPaidRecord } from './games/airHockey';
+import { readRoomOwner } from './games/gamesDoc';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -807,6 +814,262 @@ export function clearSlotMachineKeys(machineId: string): void {
   });
 }
 
+// ── 🏒 Air-hockey fees (#115) ────────────────────────────────────────────────
+//
+// Key layout (same LWW rules as everything above):
+//   ah-fee:<tableId>             → AirHockeyFeeConfig   owner-written config
+//   ah-paid:<tableId>:<playerId> → AirHockeyPaidRecord  the payer's escrow
+//
+// Money moves through PER-PLAYER ESCROW RECORDS so every key keeps exactly
+// one writer per lifecycle phase (the slot-escrow precedent, per player):
+//
+//   pay      PAYER    one transact: bal:<self> −= fee, record set 'held'
+//   refund   PAYER    one transact: record deleted,   bal:<self> += amount
+//   finalize PAYER    one transact: record 'held' → 'final' (start observed)
+//   sweep    OWNER    one transact: records 'final' addressed to me deleted,
+//                     bal:<self> += Σ amounts
+//
+// The payer only ever writes their OWN balance and their OWN record; the
+// owner only credits their OWN balance and deletes records already handed
+// over ('final'). Concurrent pays, refunds, or sweeps therefore touch
+// disjoint keys — per-key LWW can neither mint nor destroy chips, which the
+// previous direct player→owner transfer could under concurrent read-modify-
+// writes of bal:<owner>. A refund needs no owner-balance check any more
+// (the escrowed chips never reached the owner), so a pre-start un-ready
+// always gets its money back.
+//
+// Orphan self-healing: airHockeySession runs airHockeyEscrowAction (pure,
+// games/airHockey.ts) over MY records on a slow timer — a crash, reset,
+// kick, or table removal strands a 'held' record and the payer refunds it
+// on return; 'final' records wait for their owner's sweep. Ties break to
+// the player: a held record whose match cannot be proven to have run
+// refunds rather than finalizes.
+//
+// Known bound (documented, not exploitable for gain): an un-ready refund
+// racing the opponent's match-start write across a sync gap can leave the
+// started state carrying paid[side] > 0 with no record — the player got
+// their fee back yet the match plays. Bounded at one fee ≤ AH_MAX_FEE,
+// requires a genuine sub-sync race, and biases to the PLAYER like every
+// other tie here. The prior design turned this same race into unbounded
+// chip minting; an auto-recharge variant was rejected because a crash-
+// rejoin after the owner's sweep could not distinguish "settled and swept"
+// from "refund raced the start" and would double-charge an innocent player.
+//
+// Same-player, multi-client caveat: "one writer per key" means one CLIENT —
+// a player running two concurrent tabs is two writers of their own keys and
+// inherits the map-wide lost-update semantics every chips lane already has
+// (spendChips's read-modify-write of bal:<self> included). Honest same-base
+// races still converge safely: two tabs refunding the same record both
+// compute base + amount, so LWW lands on ONE credit.
+//
+// Trust boundary (the same one every chips key already has): map writes are
+// unauthenticated, so a hostile peer can forge whole records — a fake 'held'
+// record makes its named payer's own upkeep credit that payer, a fake
+// 'final' makes its named owner's sweep credit that owner. Neither hands
+// the FORGER anything a direct write of bal:<target> would not, and
+// AH_MAX_FEE caps each record, not the aggregate across forged keys, so
+// this lane adds no new power — only a new shape — inside the boundary.
+// Authenticated authorship (the roadmapped signing work) is the real fix
+// here, exactly as it is for the balances themselves.
+
+/** Escrow record key — payer-scoped, like `bets:<tableId>:<playerId>`. */
+function airHockeyPaidKey(tableId: string, playerId: string): string {
+  return `ah-paid:${tableId}:${playerId}`;
+}
+
+/**
+ * The table's fee config, validated TWICE: shape (peer trust boundary) and
+ * recipient — config.ownerId must be the CURRENT room owner, read through
+ * gamesDoc from the same room doc. A stale or hostile config naming anyone
+ * else reads as "no fee" instead of routing chips to the wrong pocket;
+ * offline (no room, no owner) every config is rejected, matching the UI
+ * rule that an ownerless room has no fee knob.
+ */
+export function readAirHockeyFeeConfig(tableId: string): AirHockeyFeeConfig | null {
+  const value = ensureMap().get(`ah-fee:${tableId}`);
+  if (!isAirHockeyFeeConfig(value)) return null;
+  const owner = readRoomOwner();
+  return owner !== null && value.ownerId === owner ? value : null;
+}
+
+/** Room owner only — callers gate via isHouse (the slot-odds precedent);
+ *  the recipient check makes a mis-stamped config unwritable, not just
+ *  unreadable. */
+export function writeAirHockeyFeeConfig(tableId: string, config: AirHockeyFeeConfig): void {
+  if (!isAirHockeyFeeConfig(config) || config.ownerId !== readRoomOwner()) return;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`ah-fee:${tableId}`, config);
+  });
+}
+
+/** My escrow record on one table, shape-guarded (peer trust boundary). */
+export function readAirHockeyPaidRecord(
+  tableId: string,
+  playerId: string,
+): AirHockeyPaidRecord | null {
+  const value = ensureMap().get(airHockeyPaidKey(tableId, playerId));
+  return isAirHockeyPaidRecord(value) ? value : null;
+}
+
+/** Every escrow record in the room — the session reconciler/sweep scan.
+ *  Guarded parse; the key's own segments name the table and payer (records
+ *  outlive their table's game state after a removal, so the key is the only
+ *  index). Keys with ':' inside the table id cannot collide: player ids are
+ *  the LAST segment and contain no ':' (identity.ts format). */
+export function scanAirHockeyPaidRecords(): Array<{
+  tableId: string;
+  playerId: string;
+  record: AirHockeyPaidRecord;
+}> {
+  const map = ensureMap();
+  const out: Array<{ tableId: string; playerId: string; record: AirHockeyPaidRecord }> = [];
+  for (const [key, value] of map.entries()) {
+    if (!key.startsWith('ah-paid:')) continue;
+    if (!isAirHockeyPaidRecord(value)) continue;
+    const rest = key.slice('ah-paid:'.length);
+    const cut = rest.lastIndexOf(':');
+    if (cut <= 0 || cut >= rest.length - 1) continue;
+    out.push({ tableId: rest.slice(0, cut), playerId: rest.slice(cut + 1), record: value });
+  }
+  return out;
+}
+
+/**
+ * Escrow my ready-up fee: one transaction debits MY balance and creates MY
+ * 'held' record — the owner's balance is untouched until they sweep the
+ * finalized record. Returns the chips escrowed — 0 when nothing is owed
+ * (fee off / zero / the owner playing their own table), or null when the
+ * pay is refused (see below).
+ *
+ * IDEMPOTENT on retry: an existing 'held' record (a crash between pay and
+ * the ready write) is reused at ITS amount — no double debit; the reuse
+ * runs BEFORE the config gates, so chips already escrowed remain the
+ * truth even if the owner has since disabled or re-priced the fee.
+ *
+ * #116 review fix (Copilot inline): a 'final' record from a previously
+ * completed but not-yet-swept match is NO LONGER reused as fresh payment.
+ * The previous unconditional reuse let the same player RESET and play
+ * repeatedly without another debit whenever the owner was offline, and
+ * an old amount/recipient captured pre-config-change would silently
+ * bypass the current fee config. We cannot simply overwrite the 'final'
+ * record with a new 'held' one either — that would destroy chips owed to
+ * the owner (only their sweep may delete a 'final'). So the pay refuses
+ * (returns null) until the previous fee is settled by its rightful owner.
+ * Callers distinguish this refusal from "insufficient balance" by peeking
+ * readAirHockeyPaidRecord: `{ state: 'final' }` means prior-fee-pending;
+ * anything else means the balance was short.
+ */
+export function payAirHockeyFee(tableId: string, playerId: string): number | null {
+  const existing = readAirHockeyPaidRecord(tableId, playerId);
+  if (existing) {
+    // Only 'held' is a legitimate crash-retry reuse. A 'final' means the
+    // previous match's fee is owed to the owner and hasn't been swept —
+    // fabricating a new payment on top of it would either destroy owner
+    // chips (if we overwrote) or double-play for free (the original bug).
+    if (existing.state === 'held') return existing.amount;
+    return null;
+  }
+  const config = readAirHockeyFeeConfig(tableId);
+  if (!config || !config.enabled || config.feeAmount <= 0) return 0;
+  if (config.ownerId === playerId) return 0;
+  const map = ensureMap();
+  const playerKey = `bal:${playerId}`;
+  const playerBalance = safeCount(map, playerKey);
+  const fee = config.feeAmount;
+  if (playerBalance < fee) return null;
+  const record: AirHockeyPaidRecord = { amount: fee, ownerId: config.ownerId, state: 'held' };
+  boundDoc!.transact(() => {
+    map.set(playerKey, playerBalance - fee);
+    map.set(airHockeyPaidKey(tableId, playerId), record);
+  });
+  return fee;
+}
+
+/**
+ * Return MY pre-start escrow: one transaction deletes MY 'held' record and
+ * credits MY balance its amount — no owner key involved, so a refund can
+ * never be "not covered" and record-existence makes double refunds
+ * structurally impossible. Returns the chips returned (0 = nothing held).
+ * 'final' records are never refunded — fees are final once the match
+ * starts; those wait for the owner's sweep.
+ */
+export function refundAirHockeyFee(tableId: string, playerId: string): number {
+  const record = readAirHockeyPaidRecord(tableId, playerId);
+  if (!record || record.state !== 'held') return 0;
+  const map = ensureMap();
+  const playerKey = `bal:${playerId}`;
+  const playerBalance = safeCount(map, playerKey);
+  // Guard-only branch: an honest balance can't approach 2^53. Keep the
+  // record so a later retry can still make the player whole.
+  if (!Number.isSafeInteger(playerBalance + record.amount)) return 0;
+  boundDoc!.transact(() => {
+    map.delete(airHockeyPaidKey(tableId, playerId));
+    map.set(playerKey, playerBalance + record.amount);
+  });
+  return record.amount;
+}
+
+/**
+ * Promote MY 'held' record to 'final' — called when the payer OBSERVES the
+ * match start (startedAt stamped while they are seated). One-way: from here
+ * only the recorded owner's sweep moves the money. True when a promotion
+ * happened (false = no record / already final).
+ */
+export function finalizeAirHockeyFee(tableId: string, playerId: string): boolean {
+  const record = readAirHockeyPaidRecord(tableId, playerId);
+  if (!record || record.state !== 'held') return false;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(airHockeyPaidKey(tableId, playerId), { ...record, state: 'final' });
+  });
+  return true;
+}
+
+/**
+ * Collect every 'final' record addressed to ME, across all tables, in one
+ * transaction: my balance += Σ amounts, records deleted. Self-limiting —
+ * records name their recipient, so a non-owner sweeping moves nothing —
+ * which lets the session call it on a timer without an isHouse gate.
+ * Returns the chips collected.
+ */
+export function sweepAirHockeyFees(ownerId: string): number {
+  const map = ensureMap();
+  const keys: string[] = [];
+  let total = 0;
+  const base = safeCount(map, `bal:${ownerId}`);
+  for (const { tableId, playerId, record } of scanAirHockeyPaidRecords()) {
+    if (record.state !== 'final' || record.ownerId !== ownerId) continue;
+    // Per-record overflow guard: skip (and keep) any record that would push
+    // the balance past a safe integer — unreachable honestly, cheap anyway.
+    if (!Number.isSafeInteger(base + total + record.amount)) continue;
+    total += record.amount;
+    keys.push(airHockeyPaidKey(tableId, playerId));
+  }
+  if (total <= 0) return 0;
+  boundDoc!.transact(() => {
+    for (const key of keys) map.delete(key);
+    map.set(`bal:${ownerId}`, base + total);
+  });
+  return total;
+}
+
+/**
+ * Remove the fee CONFIG for a removed table. Escrow records are deliberately
+ * left in place: each has exactly one rightful writer (payer for 'held',
+ * recorded owner for 'final'), and the session reconciler/sweep resolves
+ * them the moment that party is next online — a removal must not touch
+ * other players' money (the multi-writer hazard this lane exists to avoid).
+ * Runs on EVERY observing client (removeFurnitureVisuals), so it must stay
+ * an idempotent delete.
+ */
+export function clearAirHockeyKeys(tableId: string): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.delete(`ah-fee:${tableId}`);
+  });
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing. Guard for Node
 // tooling / tests: importing this module must stay pure, with browser-only
@@ -826,5 +1089,9 @@ if (typeof window !== 'undefined') {
     depositSlotFunding, withdrawSlotFunding,
     readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
     releaseSlotSharedBankrollLease,
+    readAirHockeyFeeConfig, writeAirHockeyFeeConfig,
+    readAirHockeyPaidRecord, scanAirHockeyPaidRecords,
+    payAirHockeyFee, refundAirHockeyFee, finalizeAirHockeyFee,
+    sweepAirHockeyFees, clearAirHockeyKeys,
   };
 }
