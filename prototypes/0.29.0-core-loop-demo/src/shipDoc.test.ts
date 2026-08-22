@@ -30,6 +30,7 @@ import {
   flightProgress,
   isFlightRecord,
   isLegalFlightTransition,
+  pairingAllowedByFlight,
   readFlightRecord,
   readFuelLevel,
   shipDocBound,
@@ -538,6 +539,91 @@ describe('shipDoc canDepart', () => {
     // A round-trip DEPART TO HOME lets a stuck ship "arrive" without fuel —
     // useful for the abort UX. Empty tank is fine because cost is 0.
     expect(canDepart({ ...base, currentFuel: 0, destinationId: HOME.id })).toEqual({ ok: true });
+  });
+});
+
+// ── 4b. pairingAllowedByFlight — the shared pairing-completion gate ─────────
+//
+// PR #134 audit MAJOR regression: the outbound INITIATE handler in docking.ts
+// gated on flight state, but the ACCEPT handler (and the auto-accept branch of
+// INITIATE, and any future pairing-completion caller) called
+// completePairing(accept=true) WITHOUT checking, so a request that went
+// PENDING while the module was docked could still complete after a DEPART.
+//
+// The remediation moved the gate onto a pure predicate and into the shared
+// completePairing seam. These tests pin the predicate down so any regression
+// to the seam surfaces as a red test, and any future flight-status addition
+// forces a decision here rather than sneaking through as "docked or else".
+
+describe('shipDoc pairingAllowedByFlight', () => {
+  it('allows pairing completion while docked (the only accept status)', () => {
+    expect(pairingAllowedByFlight({ status: 'docked', locationId: HOME.id })).toEqual({ ok: true });
+  });
+
+  it('refuses pairing completion in every non-docked status (undocking/in-flight/redocking)', () => {
+    // Undocking (slow-path DEPART hand-off, reserved for a later slice) still
+    // refuses: it means a DEPART is imminent and latching a new berth on now
+    // would be visible on the wire for zero benefit.
+    expect(pairingAllowedByFlight({
+      status: 'undocking', locationId: HOME.id, destinationId: HIGH_ORBIT.id,
+    })).toEqual({ ok: false, reason: 'flight', status: 'undocking' });
+    // In-flight is the load-bearing case the MAJOR flagged: an already-pending
+    // ACCEPT click after DEPART would latch a station door onto a target that
+    // has moved out from under it.
+    expect(pairingAllowedByFlight({
+      status: 'in-flight', locationId: HOME.id, destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    })).toEqual({ ok: false, reason: 'flight', status: 'in-flight' });
+    // Redocking is a brief arrival hand-off; the transient-berth contract
+    // (#67 D2, shipped) covers the physical re-attach, so a fresh accept
+    // through completePairing is refused here too.
+    expect(pairingAllowedByFlight({
+      status: 'redocking', locationId: HIGH_ORBIT.id,
+    })).toEqual({ ok: false, reason: 'flight', status: 'redocking' });
+  });
+
+  it('carries the exact refusing status back to the caller (drives the alert copy)', () => {
+    // The docking.ts alert reads `${refusal.status.toUpperCase()}` — a peer
+    // debugging the modal expects to see "IN-FLIGHT" verbatim, not a generic
+    // "not docked". Pin the exact wire.
+    const refused = pairingAllowedByFlight({
+      status: 'in-flight', locationId: HOME.id, destinationId: L4.id,
+      departedAt: 1_000, etaAt: 90_000,
+    });
+    expect(refused.ok).toBe(false);
+    if (refused.ok) throw new Error('should refuse');
+    expect(refused.status).toBe('in-flight');
+    expect(refused.reason).toBe('flight');
+  });
+
+  it('reads the live doc through readFlightRecord (end-to-end wire test)', () => {
+    // The completePairing gate calls `pairingAllowedByFlight(readFlightRecord())`.
+    // Exercise that composition on real Yjs state so a future refactor that
+    // breaks either half breaks this test.
+    const doc = freshDoc();
+    // A fresh (empty) doc reads as docked → accepts.
+    expect(pairingAllowedByFlight(readFlightRecord())).toEqual({ ok: true });
+    // Seed docked (explicit) → still accepts.
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    expect(pairingAllowedByFlight(readFlightRecord())).toEqual({ ok: true });
+    // DEPART → refuses.
+    writeFlightRecord({
+      status: 'in-flight',
+      locationId: HOME.id,
+      destinationId: HIGH_ORBIT.id,
+      departedAt: 1_000, etaAt: 61_000,
+    });
+    const inflight = pairingAllowedByFlight(readFlightRecord());
+    expect(inflight.ok).toBe(false);
+    if (inflight.ok) throw new Error('should refuse');
+    expect(inflight.status).toBe('in-flight');
+    // A hostile / shape-invalid record falls back to the docked default on
+    // read → the gate accepts. This matches the "unopened room doc IS today's
+    // module" ruling: a corrupt map entry must not permanently lock every
+    // future accept out.
+    hostileSetFlight(doc, { status: 'orbiting', locationId: 'nowhere' });
+    expect(pairingAllowedByFlight(readFlightRecord())).toEqual({ ok: true });
+    doc.destroy();
   });
 });
 

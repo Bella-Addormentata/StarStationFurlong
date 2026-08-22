@@ -1692,7 +1692,23 @@ function enumerateTransientBerths(): string[] {
 
 /** Derived flight capability — plan §1.4: at least one fuel tank, engine, and
  *  helm mounted. Ship-ness is DERIVED from furniture (never stored); this is
- *  the read side of that ruling. */
+ *  the read side of that ruling.
+ *
+ *  PR #134 audit MINOR (dorkmo speed note, verified in-source 2026‑08‑21):
+ *  confirmed this walk is NOT per-frame. Callers of countFunction are the
+ *  render() closure in createHelmUI (below) and isShipReady (below); render()
+ *  is invoked ONLY from (a) the helm's doc observers (furniture / ship /
+ *  doors — event-driven, not per-frame), (b) discrete user gestures (picker
+ *  change, refuel arm, depart / redock click), (c) the mount()-side initial
+ *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY while
+ *  `readFlightRecord().status === 'in-flight'`. World.update / animate() /
+ *  requestAnimationFrame never call render() (grep-verified). No cache added:
+ *  the walk is FURNITURE.filter over a bounded compile-time array — 3 tag
+ *  lookups per render — and caching by furniture-map-change would add a
+ *  subscribeFurniture layer whose only savings are already covered by the
+ *  observer-driven render cadence. Documented rather than optimized so a
+ *  future move (e.g. adding countFunction to a per-frame status readout)
+ *  requires a deliberate cache decision, not a silent regression. */
 function countFunction(fnTag: string): number {
   return FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes(fnTag)).length;
 }

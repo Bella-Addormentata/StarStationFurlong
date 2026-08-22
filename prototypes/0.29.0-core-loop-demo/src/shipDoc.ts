@@ -431,3 +431,41 @@ export function flightArrived(rec: FlightRecord, now: number): boolean {
   if (rec.status !== 'in-flight') return false;
   return rec.etaAt !== undefined && now >= rec.etaAt;
 }
+
+// ── Pairing / berth gate against flight state (pure — testable without a doc) ─
+//
+// PR #134 audit MAJOR: the DEPART-time flight gate on the outbound INITIATE
+// path (docking.ts's REQUEST BERTHING handler) is not enough. A remote peer
+// could send a pairing REQUEST while the module was still docked, and a helm
+// commander could DEPART before the local user hit ACCEPT — the ACCEPT click
+// would then complete the pairing on an already-in-flight module, latching a
+// station door onto a target that has literally moved out from under it.
+//
+// The fix is a SHARED PREDICATE (this function) applied at the pairing-
+// completion seam (`completePairing`'s accept branch), NOT just at the INITIATE
+// UX gate. Every accept — outbound INITIATE, inbound ACCEPT, and any future
+// pairing-completion caller — funnels through the same check.
+//
+// The predicate answers only the flight-state question; the caller is still
+// responsible for owner-gating, construction rights, and the transient-berth
+// contract. It is DELIBERATELY narrow so it can be reused unchanged as the
+// slow-path `undocking` beat and any bounce-back / cast-off cinematic land in
+// later slices without a state-room change.
+
+/** Reasons a berthing / pairing completion is refused by the flight state.
+ *  `reason: 'flight'` carries the offending status so the caller's alert can
+ *  say "IN-FLIGHT" rather than "not docked" — the SH3 REDOCKING and future
+ *  slow-path UNDOCKING beats deserve their own copy at the boundary. */
+export type PairingRefusal =
+  | { ok: true }
+  | { ok: false; reason: 'flight'; status: FlightStatus };
+
+/** True iff a new pairing may complete against the local module given its
+ *  current flight record. A `docked` module always accepts; every other
+ *  status refuses, so `undocking` / `in-flight` / `redocking` are all
+ *  covered — a redocking ship's transient re-berthing is a shipped #67 D2
+ *  flow, NOT a fresh accept/publish through completePairing. */
+export function pairingAllowedByFlight(rec: FlightRecord): PairingRefusal {
+  if (rec.status === 'docked') return { ok: true };
+  return { ok: false, reason: 'flight', status: rec.status };
+}
