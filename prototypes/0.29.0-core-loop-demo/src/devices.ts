@@ -113,6 +113,20 @@ import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
+// 🗺️ #33 M-station: pure helpers for the wall computer's STATION overview
+// (types + math live in wallComputerMap.ts so vitest can exercise them
+// without a browser). AtlasPose is the atlasLayout output shape; readAtlas
+// is only used here to size the pane's small-station gate.
+import {
+  fitPointsToCanvas,
+  isSmallStation,
+  projectModuleFootprintCorners,
+  projectPoint,
+  stationPlacements,
+} from './wallComputerMap';
+import type { StationModulePlacement } from './wallComputerMap';
+import type { AtlasPose } from './stationAtlas';
+import type { RoomDims } from './floorPlanDoc';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -363,6 +377,25 @@ export interface RoomTerminalDeps {
      *  the OUTSIDE of the module (tanks, engines, stacks) is editable. */
     requestHull: () => void;
   };
+  /**
+   * 🗺️ #33 M-station: STATION OVERVIEW (small stations only) — the second
+   * wireframe pane below the room canvas. World provides live-per-refresh
+   * getters for the current room's id, display name, dims, and the atlas
+   * layout in the current room's frame. The pane keeps itself honest by
+   * asking each refresh; no cached snapshots means an atlas gossip landing
+   * mid-focus shows up next tick. Omit to hide the pane entirely (kept for
+   * unit tests / minimal builds — every production wiring passes it).
+   */
+  station?: {
+    /** Stable bootstrap room id (matches World.activeRoomId). */
+    getRoomId: () => string;
+    /** Display name (the same string the header's ROOM name uses). */
+    getRoomName: () => string;
+    /** Current room dims from the local floorPlan doc (null while binding). */
+    getRoomDims: () => RoomDims | null;
+    /** Atlas poses in the current room's frame — atlasLayout(currentRoomId). */
+    getAtlasPoses: () => AtlasPose[];
+  };
 }
 
 /**
@@ -408,10 +441,16 @@ function livePortView(): Array<{
 export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let canvas: HTMLCanvasElement | null = null;
+  // 🗺️ #33 M-station: the second (bottom) canvas paints the atlas-wide
+  //     wireframe overview. Present only when station deps are wired AND the
+  //     known-module count is inside the SMALL_STATION_MAX cap.
+  let stationCanvas: HTMLCanvasElement | null = null;
   let refreshTimer = 0;
 
   const CANVAS_CSS = 290;   // CSS px (square)
   const CANVAS_RES = 580;   // backing-store px (2x for crisp lines)
+  const STATION_CSS = 290;  // same width as the room wireframe (aligned column)
+  const STATION_RES = 580;
 
   const refresh = () => {
     if (!panel) return;
@@ -468,6 +507,163 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     }
 
     drawWireframe();
+    drawStationOverview();
+  };
+
+  // ── 🗺️ Station-overview pane (#33 M-station) ─────────────────────────────
+  // The pure math is in wallComputerMap.ts (with vitest coverage). This
+  // function is the small DOM/canvas adapter: it asks the deps for the LIVE
+  // atlas + current dims, composes placements, fits them, and draws each as
+  // an oriented outline. Larger stations get a note pointing to the map
+  // table (Stage C of brainstorming/device-maps-plan.md). No station deps ⇒
+  // the pane hides entirely — the wall computer degrades to the M1 view.
+  const drawStationOverview = () => {
+    if (!panel || !stationCanvas || !deps.station) return;
+    const ctx = stationCanvas.getContext('2d');
+    if (!ctx) return;
+    const S = STATION_RES;
+    const PAD = 34;
+    const labelEl = panel.querySelector<HTMLElement>('#device-terminal-station-label');
+    const emptyEl = panel.querySelector<HTMLElement>('#device-terminal-station-empty');
+
+    ctx.clearRect(0, 0, S, S);
+    ctx.fillStyle = '#0A1018';
+    ctx.fillRect(0, 0, S, S);
+
+    const roomId = deps.station.getRoomId();
+    const roomName = deps.station.getRoomName();
+    const dims = deps.station.getRoomDims();
+    const poses = deps.station.getAtlasPoses();
+    // Total-known counts the CURRENT room + every DISTINCT atlas neighbour
+    // (a duplicate of the current id in the atlas is dropped by stationPlacements).
+    const neighbourCount = poses.filter(
+      (p) => p && p.roomId && p.roomId !== roomId,
+    ).length;
+    const moduleCount = 1 + neighbourCount;
+
+    if (emptyEl) {
+      // Two "no data yet" states, said honestly (no fake dots on the canvas):
+      //   – atlas has ONLY the current room ⇒ NO OTHER MODULES YET
+      //   – station is too big for this pane ⇒ USE MAP TABLE
+      if (!isSmallStation(moduleCount)) {
+        emptyEl.textContent = `LARGER STATION (${moduleCount} MODULES) — USE MAP TABLE`;
+        emptyEl.style.display = 'block';
+      } else if (neighbourCount === 0) {
+        emptyEl.textContent = 'NO OTHER MODULES YET · JOIN ANOTHER ROOM TO POPULATE THIS MAP';
+        emptyEl.style.display = 'block';
+      } else {
+        emptyEl.style.display = 'none';
+      }
+    }
+
+    // The oversize / empty cases still paint a background so the pane never
+    // flashes to transparent (the DOM slot stays fixed height).
+    if (!isSmallStation(moduleCount)) {
+      // ⚠️ Deliberate: the LARGER STATION note replaces the canvas contents.
+      //    Painting a fake overview here would violate the "honest data only"
+      //    rule the wall computer ships under.
+      if (labelEl) labelEl.textContent = 'STATION OVERVIEW — DEFERRED';
+      return;
+    }
+
+    const placements = stationPlacements(roomId, roomName, dims, poses);
+    // Every corner point across every placement — the equal-aspect fit sees
+    // the whole footprint set, not just the centres, so a fat module near the
+    // edge still lands inside the padded canvas (verified by test).
+    const allCorners: Array<{ x: number; z: number }> = [];
+    for (const p of placements) {
+      for (const c of projectModuleFootprintCorners(p)) allCorners.push(c);
+    }
+    // Fit-driven scale: we always seed the CURRENT room's four corners into
+    // allCorners (moduleHalfExtents guarantees a non-zero box even without
+    // dims — MODULE_HALF_FALLBACK ≈ 5.9 m), so the input has range on both
+    // axes and the fit already gives a legibly-sized single-module view
+    // without a lower clamp. Clamping to a minimum scale would prevent a
+    // legitimately spread-out small station (up to a 12-module chain, over
+    // 200 m corner-to-corner) from fitting inside the padded canvas — the
+    // very case the pane exists to render. maxScale still guards the tightly
+    // packed extreme (a single module can't blow up past ~40 px/m).
+    const viewport = fitPointsToCanvas(allCorners, S, PAD, { maxScale: 40 });
+
+    // Faint 5 m grid over the whole panel, aligned to world origin so the
+    // current room's centre lines up cleanly. Only draw when scale is high
+    // enough to keep lines readable.
+    if (viewport.scale >= 2) {
+      ctx.strokeStyle = 'rgba(62, 146, 184, 0.10)';
+      ctx.lineWidth = 1;
+      const step = 5; // metres
+      // Find the world x/z range visible in the padded canvas.
+      const worldLeft = (PAD - viewport.offsetX) / viewport.scale;
+      const worldRight = (S - PAD - viewport.offsetX) / viewport.scale;
+      const worldTop = (PAD - viewport.offsetZ) / viewport.scale;
+      const worldBot = (S - PAD - viewport.offsetZ) / viewport.scale;
+      const gx0 = Math.ceil(worldLeft / step) * step;
+      const gx1 = Math.floor(worldRight / step) * step;
+      const gz0 = Math.ceil(worldTop / step) * step;
+      const gz1 = Math.floor(worldBot / step) * step;
+      for (let gx = gx0; gx <= gx1; gx += step) {
+        const px = viewport.offsetX + gx * viewport.scale;
+        ctx.beginPath(); ctx.moveTo(px, PAD); ctx.lineTo(px, S - PAD); ctx.stroke();
+      }
+      for (let gz = gz0; gz <= gz1; gz += step) {
+        const pz = viewport.offsetZ + gz * viewport.scale;
+        ctx.beginPath(); ctx.moveTo(PAD, pz); ctx.lineTo(S - PAD, pz); ctx.stroke();
+      }
+    }
+
+    // Paint neighbours first, current room LAST so the gold accent sits on
+    // top wherever it overlaps another module's edge in a tight ring.
+    const drawOne = (p: StationModulePlacement) => {
+      const corners = projectModuleFootprintCorners(p).map((c) => projectPoint(c, viewport));
+      ctx.beginPath();
+      ctx.moveTo(corners[0].x, corners[0].z);
+      for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].z);
+      ctx.closePath();
+      // Dashed outline for "we don't know its true size" (fallback dims): the
+      // pane is honest that the shape shown is guessed.
+      if (p.dimsUnknown && !p.isCurrent) ctx.setLineDash([6, 4]);
+      else ctx.setLineDash([]);
+      if (p.isCurrent) {
+        ctx.strokeStyle = '#F0C060';
+        ctx.fillStyle = 'rgba(212, 168, 75, 0.10)';
+        ctx.lineWidth = 3;
+      } else {
+        ctx.strokeStyle = '#3E92B8';
+        ctx.fillStyle = 'rgba(62, 146, 184, 0.06)';
+        ctx.lineWidth = 2;
+      }
+      ctx.fill();
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Centre dot
+      const centre = projectPoint({ x: p.x, z: p.z }, viewport);
+      ctx.fillStyle = p.isCurrent ? '#F0C060' : '#7FD4FF';
+      ctx.beginPath();
+      ctx.arc(centre.x, centre.z, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Label: MODULE NAME on top, HOPS badge underneath (or YOU for current).
+      const label = (p.name || 'Module').toUpperCase();
+      const badge = p.isCurrent ? 'YOU' : `+${p.hops}`;
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = p.isCurrent ? '#F0C060' : '#9FC8DE';
+      ctx.fillText(label.slice(0, 14), centre.x, centre.z + 8);
+      ctx.font = 'bold 12px monospace';
+      ctx.fillStyle = p.isCurrent ? 'rgba(240, 192, 96, 0.75)' : 'rgba(159, 200, 222, 0.7)';
+      ctx.fillText(badge, centre.x, centre.z + 26);
+    };
+    for (const p of placements) if (!p.isCurrent) drawOne(p);
+    for (const p of placements) if (p.isCurrent) drawOne(p);
+
+    if (labelEl) {
+      const suffix = moduleCount === 1
+        ? 'THIS MODULE ONLY'
+        : `${moduleCount} MODULES · HOP MAX ${Math.max(...placements.map((p) => p.hops))}`;
+      labelEl.textContent = `STATION OVERVIEW — ${suffix}`;
+    }
   };
 
   const drawWireframe = () => {
@@ -578,6 +774,13 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         </div>
         <canvas id="device-terminal-map" width="${CANVAS_RES}" height="${CANVAS_RES}"
           style="width:${CANVAS_CSS}px; height:${CANVAS_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+        ${deps.station ? `
+        <div style="display:flex; flex-direction:column; gap:4px; margin-top:2px;">
+          <div id="device-terminal-station-label" style="font-size:10px; color:#4A5560; letter-spacing:1px; text-align:center;">STATION OVERVIEW</div>
+          <canvas id="device-terminal-station" width="${STATION_RES}" height="${STATION_RES}"
+            style="width:${STATION_CSS}px; height:${STATION_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+          <div id="device-terminal-station-empty" style="display:none; font-size:9px; color:#4A5560; letter-spacing:0.5px; text-align:center;"></div>
+        </div>` : ''}
         ${deps.editRoom ? `
         <div style="display:flex; flex-direction:column; gap:3px;">
           <div style="display:flex; gap:8px;">
@@ -622,6 +825,9 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
       canvas = panel.querySelector<HTMLCanvasElement>('#device-terminal-map');
+      // 🗺️ #33 M-station: only queried when station deps are wired (the panel
+      //     otherwise omits the canvas from the HTML above).
+      stationCanvas = panel.querySelector<HTMLCanvasElement>('#device-terminal-station');
       // EDIT ROOM (#33 M2): release the focus first, THEN enter edit mode —
       // the wired request() is deviceFocus.releaseThen(→ roomEdit.enter).
       const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
@@ -646,6 +852,7 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       panel?.remove();
       panel = null;
       canvas = null;
+      stationCanvas = null;
     },
 
     update(dt: number): void {
