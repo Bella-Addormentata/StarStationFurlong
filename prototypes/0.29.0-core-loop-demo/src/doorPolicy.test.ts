@@ -1038,6 +1038,241 @@ describe('D3.2 · revoked-grant replay defence', () => {
     expect(hasDoorGrant(DOOR_NORTH, otherPub)).toBe(false);
   });
 
+  // ── PR #129 audit regressions ─────────────────────────────────────────────
+  //
+  // The three tests below LOCK the exact defects the reviewer reproduced on
+  // the branch head, so they cannot silently reappear. Each names the audit
+  // severity so a future reader can trace the fix back to the finding.
+
+  it("BLOCKER-1 REGRESSION — an UNSIGNED tombstone cannot revoke a signed grant", () => {
+    // Reviewer's exact repro: signed binding, owner grants Sam, a hostile
+    // peer plants an unsigned tombstone at the slot with a huge seq. Pre-fix
+    // `isValidSignedTombstone`'s `!hasPub && !hasSig ⇒ return true` short-
+    // circuited BEFORE the `!verifier` check, so the reader treated the
+    // hostile shape as authoritative revocation AND bumped its watermark to
+    // seq 999 — forcing any subsequent owner regrant into seq >= 1000.
+    // Post-fix: unsigned tombstones are refused in signed binding.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    const g1 = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(g1.seq).toBe(0);
+
+    // Hostile writes a UNSIGNED tombstone with a huge seq.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      tombstone: true,
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      revokedAt: Date.now(),
+      seq: 999,
+    });
+    // Reader must NOT accept the unsigned tombstone. The signed grant was
+    // clobbered by CRDT-LWW so the slot no longer verifies as a grant either
+    // (fail-safe: the door falls back to defaults, matching the module
+    // header's DOCUMENTED RESIDUALS for "hostile overwrite ⇒ absent slot").
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+
+    // Owner regrants. Post-fix: seq is 1 (watermark stayed at 0). Pre-fix:
+    // seq would be >= 1000 because the watermark had been poisoned.
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const g2 = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(g2.seq).toBe(1);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
+  it("BLOCKER-1 REGRESSION — legacy binding still accepts unsigned tombstone shape", () => {
+    // Same defence must NOT brick legacy rooms. In legacy binding the
+    // signature layer is absent by definition; a hostile with map-write
+    // access could equally have called the bare-delete path and produced
+    // the same effect. The invariant we hold is only meaningful when the
+    // signed layer is present. See the doc-comment on isValidSignedTombstone.
+    bindLegacy(doc);
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Sam', grantedAt: 1,
+    });
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    // Unsigned tombstone shape lands and revokes (legacy shape-only reads).
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      tombstone: true, doorId: DOOR_NORTH, pub: guestPub, revokedAt: 2, seq: 1,
+    });
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it("BLOCKER-2 REGRESSION — writeDoorGrant THROWS when owner signer returns null", () => {
+    // Pre-fix: a signer that returned null caused writeDoorGrant to plant an
+    // UNSIGNED record with a numeric seq. Our own MAJOR-fix read rule now
+    // refuses that shape (legacy-with-seq is malformed), so the write would
+    // silently land bytes no reader accepts. Post-fix: writeDoorGrant throws
+    // in signed binding so the caller (docking.ts / owner UI) can surface
+    // the failure instead of leaving the slot in a poisoned state.
+    ownerPubReader = () => ownerPub;
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPubReader(),
+      localPub: () => ownerPub,
+      signOwner: () => null,          // broken signer
+      signSelf: signerFor(seedOwner),
+    });
+    expect(() => writeDoorGrant(DOOR_NORTH, guestPub, 'Sam')).toThrow(/refusing to persist/);
+    // Slot MUST NOT hold the poisoned record — nothing was written.
+    expect(doc.getMap('doorGrants').has(`${DOOR_NORTH}|${guestPub}`)).toBe(false);
+  });
+
+  it("BLOCKER-2 REGRESSION — writeDoorGrant THROWS when owner signer itself throws", () => {
+    // Companion to the null-return case: an ed25519 library that raises on
+    // some malformed byte input must produce the same fail-loud behavior.
+    ownerPubReader = () => ownerPub;
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPubReader(),
+      localPub: () => ownerPub,
+      signOwner: () => { throw new Error('signer blew up'); },
+      signSelf: signerFor(seedOwner),
+    });
+    expect(() => writeDoorGrant(DOOR_NORTH, guestPub, 'Sam')).toThrow(/refusing to persist/);
+    expect(doc.getMap('doorGrants').has(`${DOOR_NORTH}|${guestPub}`)).toBe(false);
+  });
+
+  it("BLOCKER-2 REGRESSION — removeDoorGrant THROWS when owner signer returns null", () => {
+    // Twin defect on the revoke side: pre-fix a signer failure returned
+    // silently while the OLD grant was still at the slot, so the owner UI
+    // reported "revoked" but every reader still verified the grant. Post-fix:
+    // removeDoorGrant throws instead of leaving that split-brain state.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const g1 = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect((g1 as unknown as { tombstone?: boolean }).tombstone).toBeUndefined();
+
+    // Rebind with a broken signer (still owner-local).
+    ownerPubReader = () => ownerPub;
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPubReader(),
+      localPub: () => ownerPub,
+      signOwner: () => null,
+      signSelf: signerFor(seedOwner),
+    });
+    expect(() => removeDoorGrant(DOOR_NORTH, guestPub)).toThrow(/refusing to leave the grant standing/);
+    // The old grant is untouched — no bare-delete, no unsigned tombstone.
+    const rec = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect((rec as unknown as { tombstone?: boolean }).tombstone).toBeUndefined();
+    expect(rec.ownerSig).toBe(g1.ownerSig);
+  });
+
+  it("BLOCKER-2 REGRESSION — writeDoorGrant THROWS when seq overflows MAX_SAFE_INTEGER", () => {
+    // MAX_SAFE_INTEGER + 1 is representable as a double but NOT a safe
+    // integer, and treasuryTypes.canonicalEncode throws on unsafe integers
+    // (matching the Rust codec's SafeInt profile). Pre-fix, the try/catch
+    // around the signer call swallowed the canonicalEncode throw and wrote
+    // an unsigned record. Post-fix, the throw propagates.
+    //
+    // We inject the near-overflow condition by planting a SIGNED grant that
+    // legitimately has seq = MAX_SAFE_INTEGER at the slot — nextGrantSeqFor
+    // then computes seq = MSI + 1 and doorGrantSignatureBytes throws inside
+    // writeDoorGrant. This is the exact chain the audit exhibited (via a
+    // hostile MAX_SAFE_INTEGER tombstone in the pre-fix world; here we
+    // simulate the same end-state under our post-fix invariants using an
+    // owner-signed grant so it verifies).
+    bindAsOwner(doc, ROOM_A);
+    // Owner signs a grant at seq = MAX_SAFE_INTEGER directly. This uses the
+    // real signer over the seq-carrying byte shape.
+    const grantedAt = 1;
+    const signedGrant: DoorRightsGrant = {
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      name: 'Sam',
+      grantedAt,
+      seq: Number.MAX_SAFE_INTEGER,
+      ownerPub,
+      ownerSig: sign(seedOwner, doorGrantSignatureBytes(ROOM_A, DOOR_NORTH, {
+        pub: guestPub, name: 'Sam', grantedAt, seq: Number.MAX_SAFE_INTEGER,
+      })),
+    };
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, signedGrant);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    // Next regrant would ask for seq MSI + 1 → canonicalEncode throws → the
+    // fix propagates the throw instead of silently persisting garbage.
+    expect(() => writeDoorGrant(DOOR_NORTH, guestPub, 'Sam2')).toThrow(/refusing to persist/);
+    // The pre-existing signed grant is still at the slot; no poisoned write.
+    const rec = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(rec.ownerSig).toBe(signedGrant.ownerSig);
+    expect(rec.seq).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it("MAJOR REGRESSION — a LEGACY grant with a seq field is REFUSED (watermark stays clean)", () => {
+    // Reviewer finding: unsigned records were only accepted as "legacy" when
+    // they had NO seq field, but the code path read `typeof v.seq === 'number'`
+    // and inflated the watermark to that value at face value. Post-fix the
+    // legacy-with-seq shape is rejected by `isValidSignedGrant`, so the
+    // watermark stays at 0 and the owner regrant seq is 1.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const g1 = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(g1.seq).toBe(0);
+
+    // Hostile writes an UNSIGNED grant with a large seq — legacy fields only.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      name: 'Rogue',
+      grantedAt: Date.now(),
+      seq: 1_000_000,
+    });
+    // Reader refuses the hostile record; slot reads as absent.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    expect(readDoorGrants(DOOR_NORTH)).toEqual([]);
+
+    // Owner regrants; watermark was NOT poisoned (still at 0), so seq is 1.
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam2');
+    const g2 = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(g2.seq).toBe(1);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
+  it("MAJOR REGRESSION — a truly LEGACY grant (no sig, no seq) still reads (pre-D3 fleet)", () => {
+    // Fail-safe posture: the MIGRATION path in the module header commits to
+    // still accepting pre-D3 records (no sig fields, no seq field), treated
+    // as seq = -1 for the greatest-sequence-wins rule. The MAJOR fix only
+    // adds "no sig AND seq present ⇒ refuse"; the untouched shape MUST
+    // continue to read.
+    bindAsOwner(doc, ROOM_A);
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Legacy-Sam', grantedAt: 1,
+    });
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    expect(readDoorGrants(DOOR_NORTH)).toHaveLength(1);
+  });
+
+  it("MAJOR REGRESSION — a tombstone at MAX_SAFE_INTEGER+1 is refused up front", () => {
+    // Companion safety guard on tombstones: pre-fix isTombstoneShape used
+    // Number.isInteger, which accepts MAX_SAFE_INTEGER+1 (a double that is
+    // representable but not a SAFE integer). Then canonicalEncode throws
+    // inside verify, verify returns false anyway — but a hostile could also
+    // set seq to MSI+1 and the shape guard would let it inflate observations
+    // later in the pipeline. Post-fix isSafeInteger rejects up front.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      tombstone: true,
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      revokedAt: 1,
+      seq: Number.MAX_SAFE_INTEGER + 1,   // NOT a safe integer
+      ownerPub,
+      ownerSig: '00'.repeat(64),          // never reached — shape guard trips first
+    });
+    // Slot reads as absent; no observation is recorded, watermark stays clean.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    // A subsequent legitimate regrant proves the watermark was not poisoned.
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const g = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    // seq must be small (1 — the original signed grant was at 0), not near MSI.
+    expect(g.seq).toBe(1);
+  });
+
   it("DOCUMENTED RESIDUAL — fresh peer that never saw the tombstone accepts replay", () => {
     // HONEST test: `seq` NARROWS the replay window, it does not close it.
     // A fresh peer whose watermark is empty (browser restart, first join

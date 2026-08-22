@@ -88,6 +88,22 @@
  *      reader has ever verified a `(seq S, tombstone)` at a slot, no
  *      subsequently-observed grant with seq <= S is accepted, even if a
  *      hostile peer overwrote the CRDT slot with the earlier grant bytes.
+ *    - A hostile peer REVOKING a signed grant via an UNSIGNED TOMBSTONE. In
+ *      signed binding, tombstones with no owner sig (and no owner pub) are
+ *      refused by `isValidSignedTombstone`; they cannot bump reader
+ *      watermarks and they cannot defeat the signed grant they overwrote.
+ *      Legacy binding still accepts unsigned tombstones as a shape (there
+ *      is no signature layer to protect there anyway).
+ *    - A hostile peer PLANTING AN UNSIGNED GRANT WITH A HUGE `seq` to inflate
+ *      reader watermarks and force subsequent owner regrants to burn seq
+ *      budget (or push past MAX_SAFE_INTEGER and break signing). Legacy
+ *      grants MUST have no seq field; a "legacy but with seq" record is
+ *      malformed and refused up front by `isValidSignedGrant`.
+ *    - A silent unsigned WRITE when the injected signer throws (byte-encoding
+ *      failure or signer error). `writeDoorGrant` and `removeDoorGrant`
+ *      throw in signed binding rather than degrade to an unsigned record
+ *      that our own reader would refuse, so the caller can surface the
+ *      failure to the owner instead of the write vanishing silently.
  *   NOT PREVENTED (still gated by later slices, DOCUMENTED RESIDUALS):
  *    - A hostile peer OVERWRITING a valid signed record with garbage (Yjs map
  *      LWW rule). Verify-on-read drops the garbage and treats the slot as
@@ -723,8 +739,13 @@ function isTombstoneShape(v: unknown): v is DoorGrantTombstone {
   if (t.tombstone !== true) return false;
   return typeof t.doorId === 'string' && typeof t.pub === 'string' && !!t.pub
     && typeof t.revokedAt === 'number'
-    // Tombstones REQUIRE a non-negative integer seq — no legacy shape exists.
-    && typeof t.seq === 'number' && Number.isInteger(t.seq) && t.seq >= 0;
+    // Tombstones REQUIRE a non-negative SAFE integer seq — no legacy shape
+    // exists. We use isSafeInteger (not isInteger) so a hostile value at
+    // MAX_SAFE_INTEGER+1 (representable as a double but not a safe integer)
+    // is refused up-front; canonicalEncode rejects unsafe integers when we
+    // rebuild verify bytes, so accepting them here would only produce a
+    // deferred failure at signature verification.
+    && typeof t.seq === 'number' && Number.isSafeInteger(t.seq) && t.seq >= 0;
 }
 
 /**
@@ -749,14 +770,29 @@ function isTombstoneShape(v: unknown): v is DoorGrantTombstone {
 function isValidSignedGrant(v: DoorRightsGrant, expectedDoorId: string, ownerPubExpected: string | null): boolean {
   const hasPub = typeof v.ownerPub === 'string' && v.ownerPub.length > 0;
   const hasSig = typeof v.ownerSig === 'string' && v.ownerSig.length > 0;
-  if (!hasPub && !hasSig) return true;
+  if (!hasPub && !hasSig) {
+    // LEGACY grant: MUST have NO seq field. The module header MIGRATION
+    // contract defines legacy as "no sig, no seq"; a record with no sig but
+    // WITH a seq is malformed/hostile — no pre-D3 client could have written
+    // one, and a hostile peer with map-write access must not be able to
+    // inflate reader watermarks via such a record (which would have made
+    // subsequent legitimate owner regrants need artificially-high seq to
+    // outrank the injected value, or in the MAX_SAFE_INTEGER variant push
+    // the seq past the safe-integer boundary and break signing entirely).
+    // Fixes PR #129 MAJOR (legacy `seq` read at face value contradicting the
+    // module header's `seq = -1` promise). Truly legacy records (no sig, no
+    // seq) still fall through to the accept path below.
+    if (v.seq !== undefined) return false;
+    return true;
+  }
   if (hasPub !== hasSig) return false;
   if (!verifier) return true;
   if (ownerPubExpected !== null && v.ownerPub !== ownerPubExpected) return false;
-  // If seq is present, it MUST be a non-negative integer. A non-numeric seq
-  // would silently degrade to the legacy byte shape below, opening a
-  // downgrade attack; refuse it up front.
-  if (v.seq !== undefined && (typeof v.seq !== 'number' || !Number.isInteger(v.seq) || v.seq < 0)) {
+  // If seq is present, it MUST be a non-negative SAFE integer. Non-numeric
+  // or unsafe-integer seq would silently degrade to a byte shape our
+  // canonical encoder rejects (isSafeInteger throws), opening a downgrade
+  // attack; refuse it up front so no verify pass runs on unsafe bytes.
+  if (v.seq !== undefined && (typeof v.seq !== 'number' || !Number.isSafeInteger(v.seq) || v.seq < 0)) {
     return false;
   }
   try {
@@ -775,17 +811,35 @@ function isValidSignedGrant(v: DoorRightsGrant, expectedDoorId: string, ownerPub
 
 /**
  * D3.2: validate a revocation tombstone. Owner-signed only — there is no
- * legacy tombstone shape (tombstones are new in D3.2). A partial record
- * (one sig field present, the other absent) is refused; a signed record
- * whose signature verifies against `doorGrantTombstoneSignatureBytes` is
- * accepted. When no verifier is wired (legacy binding), the tombstone is
- * accepted on shape alone — matches the legacy-binding posture used by
- * every other record kind.
+ * legacy tombstone shape (tombstones are NEW in D3.2, and legacy binding's
+ * removeDoorGrant uses bare `Map.delete` rather than writing a tombstone,
+ * so no legitimate producer ever writes an unsigned tombstone).
+ *
+ * SIGNED BINDING (verifier wired): unsigned/partial tombstones are REFUSED.
+ * Accepting them would let any peer with map-write access revoke any grant
+ * without owner authority — the exact D3.2 invariant this module holds. This
+ * is the fix for PR #129 BLOCKER-1: pre-fix the `!hasPub && !hasSig` early
+ * return short-circuited BEFORE the `!verifier` check, so a hostile could
+ * plant `{tombstone:true, doorId, pub, revokedAt, seq:999}` at any slot and
+ * every reader treated it as authoritative revocation.
+ *
+ * LEGACY BINDING (no verifier): the `!hasPub && !hasSig` fallback stays
+ * available for the record shape, matching the fail-safe posture of every
+ * other record kind in this module — a hostile unsigned tombstone written
+ * into a legacy-bound room is still worth accepting-as-shape because the
+ * hostile could equally have called the bare-delete path with the same
+ * effect; the signature layer we're missing is what would have distinguished
+ * the two, and legacy binding by definition doesn't have that layer.
  */
 function isValidSignedTombstone(v: DoorGrantTombstone, expectedDoorId: string, ownerPubExpected: string | null): boolean {
   const hasPub = typeof v.ownerPub === 'string' && v.ownerPub.length > 0;
   const hasSig = typeof v.ownerSig === 'string' && v.ownerSig.length > 0;
-  if (!hasPub && !hasSig) return true;             // legacy-binding posture
+  if (!hasPub && !hasSig) {
+    // Gate on `!verifier` — legacy binding accepts the shape as before, but
+    // signed binding REFUSES so a hostile unsigned tombstone cannot revoke
+    // an owner-signed grant. See doc-comment above for the full rationale.
+    return !verifier;
+  }
   if (hasPub !== hasSig) return false;             // partial — refuse
   if (!verifier) return true;                       // no verifier wired
   if (ownerPubExpected !== null && v.ownerPub !== ownerPubExpected) return false;
@@ -855,39 +909,83 @@ function nextGrantSeqFor(doorId: string, pub: string, ownerPubExpected: string |
 
 /** Owner ACCEPT: standing, revocable grant; clears the matching request.
  *  D3.2: computes a monotonic seq inside the signature bytes so the grant
- *  outranks any prior grant OR tombstone the reader has ever verified. */
+ *  outranks any prior grant OR tombstone the reader has ever verified.
+ *
+ *  THROWS in signed binding when owner-signing was required and failed
+ *  (byte-encoding failure — e.g. seq overflow past MAX_SAFE_INTEGER — or the
+ *  injected signer failing/returning null). Fix for PR #129 BLOCKER-2:
+ *  pre-fix a signer failure produced a silent unsigned+seq record that our
+ *  read rule now treats as malformed (see `isValidSignedGrant` MAJOR fix),
+ *  and the owner had no in-module signal that the write had failed. The
+ *  caller (docking.ts / owner UI) is expected to surface the error. */
 export function writeDoorGrant(doorId: string, pub: string, name: string): void {
   if (!docAlive() || !pub) return;
-  const ownerPubExpected = ownerPubReader?.() ?? null;
-  const canSign = !!ownerSigner && !!localPubReader && !!ownerPubReader;
-  const seq = canSign ? nextGrantSeqFor(doorId, pub, ownerPubExpected) : undefined;
   const grantedAt = Date.now();
+  // "Can sign" requires the full seam: verifier + owner-signer + both live
+  // readers. A verifier-less binding is legacy and takes the pre-D3 shape;
+  // a signer-less binding was designed to fall through to legacy shape too
+  // (a rare corner case — see the D3 doc-header ARCHITECTURE note).
+  const canSign = !!verifier && !!ownerSigner && !!localPubReader && !!ownerPubReader;
+
+  if (!canSign) {
+    // LEGACY binding — pre-D3 posture. No seq, no signature; a signed peer
+    // that reads this record accepts it as fail-safe fallback.
+    const body: DoorRightsGrant = { doorId, pub, name: name || 'Unknown-Clone', grantedAt };
+    boundDoc!.transact(() => {
+      grantsMap!.set(reqKey(doorId, pub), body);
+      requestsMap!.delete(reqKey(doorId, pub));
+    });
+    return;
+  }
+
+  // Signed binding — owner-only. A non-owner reaching writeDoorGrant is a
+  // caller bug (docking.ts already gates on ownership at the UI layer);
+  // silently drop the write rather than plant an unsigned-with-seq record
+  // our read rule would refuse anyway (see MAJOR fix on isValidSignedGrant).
+  const localPub = localPubReader!();
+  const ownerPub = ownerPubReader!();
+  if (!localPub || !ownerPub || localPub !== ownerPub) return;
+
+  const seq = nextGrantSeqFor(doorId, pub, ownerPub);
   const body: DoorRightsGrant = {
     doorId,
     pub,
     name: name || 'Unknown-Clone',
     grantedAt,
-    ...(seq !== undefined ? { seq } : {}),
+    seq,
   };
-  if (canSign) {
-    const localPub = localPubReader!();
-    const ownerPub = ownerPubReader!();
-    if (localPub && ownerPub && localPub === ownerPub) {
-      let sig: string | null = null;
-      try { sig = ownerSigner!(doorGrantSignatureBytes(boundRoomId, doorId, body)); } catch { sig = null; }
-      if (sig) { body.ownerPub = ownerPub; body.ownerSig = sig; }
-    }
+  // Build signature bytes first — canonicalEncode throws on unsafe integers
+  // (e.g. seq that has climbed past MAX_SAFE_INTEGER, whether legitimately
+  // over billions of grant cycles or via a lingering attack on an earlier
+  // module version). Let the throw propagate so the owner UI can surface
+  // the failure instead of persisting an unsigned garbage record.
+  let bytes: Uint8Array;
+  try { bytes = doorGrantSignatureBytes(boundRoomId, doorId, body); }
+  catch (e) {
+    throw new Error(
+      `writeDoorGrant: could not build signature bytes for ${doorId}|${pub} (${String(e)}) — refusing to persist an unsigned record`,
+    );
   }
+  let sig: string | null = null;
+  let signerErr: unknown = null;
+  try { sig = ownerSigner!(bytes); } catch (e) { signerErr = e; }
+  if (!sig) {
+    throw new Error(
+      `writeDoorGrant: owner signer failed for ${doorId}|${pub} (${
+        signerErr ? String(signerErr) : 'signer returned null'
+      }) — refusing to persist an unsigned record`,
+    );
+  }
+  body.ownerPub = ownerPub;
+  body.ownerSig = sig;
+
   boundDoc!.transact(() => {
     grantsMap!.set(reqKey(doorId, pub), body);
     requestsMap!.delete(reqKey(doorId, pub));
   });
   // Bump watermark for the writer's OWN subsequent reads — the seq we just
-  // wrote is now the highest we've observed for this slot. Legacy writes
-  // (seq === undefined) do not bump the watermark; they read at seq -1.
-  if (typeof seq === 'number') {
-    bumpWatermark(doorId, pub, { seq, isTombstone: false });
-  }
+  // wrote is now the highest we've observed for this slot.
+  bumpWatermark(doorId, pub, { seq, isTombstone: false });
 }
 
 /**
@@ -912,6 +1010,12 @@ export function writeDoorGrant(doorId: string, pub: string, name: string): void 
  * from a non-owner session would let any peer revoke grants; better to
  * refuse the write cleanly than to plant a legacy-shape tombstone whose only
  * defence is the same signed-CRDT-op gap (C6) we already document.
+ *
+ * THROWS in signed binding when signing was required and failed. Fix for
+ * PR #129 BLOCKER-2 (revoke-side twin of writeDoorGrant): pre-fix a signer
+ * failure returned silently with the OLD grant still at the slot, so the
+ * owner UI reported "revoked" while readers still verified the grant. The
+ * caller (docking.ts / owner UI) is expected to surface the error.
  */
 export function removeDoorGrant(doorId: string, pub: string): void {
   if (!docAlive()) return;
@@ -929,8 +1033,7 @@ export function removeDoorGrant(doorId: string, pub: string): void {
     // in docking.ts; a caller that reaches here is either buggy or hostile.
     return;
   }
-  const ownerPubExpected = ownerPubReader!();
-  const seq = nextGrantSeqFor(doorId, pub, ownerPubExpected);
+  const seq = nextGrantSeqFor(doorId, pub, ownerPub);
   const revokedAt = Date.now();
   const tomb: DoorGrantTombstone = {
     tombstone: true,
@@ -939,15 +1042,32 @@ export function removeDoorGrant(doorId: string, pub: string): void {
     revokedAt,
     seq,
   };
+  // Build signature bytes first — canonicalEncode throws on unsafe integers
+  // (seq that has climbed past MAX_SAFE_INTEGER). Let the throw propagate so
+  // the caller surfaces it instead of degrading to a silent no-op that would
+  // leave the honest grant standing while the owner UI showed "revoked".
+  let bytes: Uint8Array;
+  try { bytes = doorGrantTombstoneSignatureBytes(boundRoomId, doorId, tomb); }
+  catch (e) {
+    throw new Error(
+      `removeDoorGrant: could not build tombstone bytes for ${doorId}|${pub} (${String(e)}) — refusing to leave the grant standing without a signed tombstone`,
+    );
+  }
   let sig: string | null = null;
-  try { sig = ownerSigner!(doorGrantTombstoneSignatureBytes(boundRoomId, doorId, tomb)); } catch { sig = null; }
+  let signerErr: unknown = null;
+  try { sig = ownerSigner!(bytes); } catch (e) { signerErr = e; }
   if (!sig) {
     // Signer failed. Do NOT fall back to a bare delete — that would leave
     // the slot empty and a replayed grant could be re-set to restore rights.
     // Do NOT write an unsigned tombstone either — verify-on-read would drop
-    // it and the reader would treat the slot as absent. Refuse the revoke
-    // and let the caller surface a UI error.
-    return;
+    // it and the reader would treat the slot as absent. THROW so the caller
+    // can surface a real error to the owner, rather than the pre-fix silent
+    // return that produced a "revoked in UI, still valid on the wire" split.
+    throw new Error(
+      `removeDoorGrant: owner signer failed for ${doorId}|${pub} (${
+        signerErr ? String(signerErr) : 'signer returned null'
+      }) — refusing to leave the grant standing without a signed tombstone`,
+    );
   }
   tomb.ownerPub = ownerPub;
   tomb.ownerSig = sig;

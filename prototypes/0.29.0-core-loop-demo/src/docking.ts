@@ -1701,11 +1701,31 @@ export class DoorDockingPortSystem {
             this.undockArmed.set(doorId, stu.connectedRoomAddress);
           }
         } else if (action === "accept-req" && pub) {
-          writeDoorGrant(doorId, pub, el.dataset.name ?? "Unknown-Clone");
+          // #67 D3.2 (PR #129 audit): writeDoorGrant now THROWS in signed
+          // binding when signing was required and failed (byte-encoding
+          // overflow past MAX_SAFE_INTEGER, or the injected signer erroring/
+          // returning null). Pre-fix that failure produced a silent unsigned
+          // record; post-fix we surface it here so the operation fails visibly
+          // rather than leaving the map in a poisoned state.
+          try {
+            writeDoorGrant(doorId, pub, el.dataset.name ?? "Unknown-Clone");
+          } catch (err) {
+            console.error("[docking] accept-req failed:", err);
+          }
         } else if (action === "deny-req" && pub) {
           removeDoorRequest(doorId, pub);
         } else if (action === "revoke-grant" && pub) {
-          removeDoorGrant(doorId, pub);
+          // #67 D3.2 (PR #129 audit): removeDoorGrant now THROWS in signed
+          // binding when signing was required and failed. Pre-fix the failure
+          // returned silently with the OLD grant still at the slot (owner UI
+          // said "revoked" but every reader still verified the grant); post-
+          // fix we surface it and leave the grant intact until a successful
+          // re-attempt lands a signed tombstone.
+          try {
+            removeDoorGrant(doorId, pub);
+          } catch (err) {
+            console.error("[docking] revoke-grant failed:", err);
+          }
         }
         this.renderPolicySection(doorId);
         if (isCardinalDoorId(doorId)) this.renderAssemblyStrip(doorId); // a grant/mode change may unlock the strip
