@@ -23,11 +23,13 @@ import { sha512 } from '@noble/hashes/sha512';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
 import {
   DEFAULT_DOOR_POLICY,
+  type DoorGrantTombstone,
   type DoorPolicyRecord,
   type DoorRightsGrant,
   type DoorRightsRequest,
   bindDoorPolicy,
   doorGrantSignatureBytes,
+  doorGrantTombstoneSignatureBytes,
   doorPolicySignatureBytes,
   doorRequestSignatureBytes,
   hasDoorGrant,
@@ -645,6 +647,500 @@ describe('D3 · signed door requests (self-signed)', () => {
     writeDoorRequest(DOOR_NORTH, otherPub, 'Fake-Bob'); // writing FOR Bob
     const stored = doc.getMap('doorRequests').get(`${DOOR_NORTH}|${otherPub}`) as DoorRightsRequest;
     expect(stored.requesterSig).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// D3.2: REVOKE-REPLAY DEFENCE (monotonic seq + owner-signed tombstones)
+// ============================================================================
+//
+// dorkmo's PR #129 review (2026-08-21T22:37Z) proved that D3's bare
+// `grantsMap.delete()` was fail-DANGEROUS: a hostile peer that captured the
+// pre-revocation grant bytes could re-set the map key with the owner's still-
+// valid signature and hasDoorGrant would return true, restoring privileges the
+// owner actively withdrew.
+//
+// The fix (following sovereign-treasury-serverless-plan.md §5's greatest-
+// sequence-wins pattern):
+//   1. Grants and tombstones carry a monotonic `seq` inside the SIGNED
+//      envelope.
+//   2. Revocation writes an OWNER-SIGNED TOMBSTONE record to the SAME
+//      `${doorId}|${pub}` slot as the grant it withdraws.
+//   3. Read rule: greatest verified (seq, tombstone-tie-break) wins per slot.
+//   4. Each reader keeps an IN-MEMORY watermark of the highest verified
+//      observation, so a subsequently-replayed lower-seq grant is refused
+//      even after a hostile peer overwrote the CRDT slot.
+//
+// The tests below cover the reviewer's exact repro (now PASSING), the four
+// invariants the fix must uphold, and the DOCUMENTED RESIDUAL — a fresh peer
+// that never observed the tombstone still accepts a replayed grant, because
+// `seq` narrows the replay window but does not close it (that requires signed
+// CRDT ops / durability C6, or the chain-anchored log — out of scope for D3).
+
+describe('D3.2 · revoked-grant replay defence', () => {
+  it("dorkmo's reproduction — replay of a revoked grant is now REFUSED", () => {
+    // Verbatim reproduction from the PR #129 finding (2026-08-21T22:37Z).
+    // Before the fix this expect(...toBe(false)) was toBe(true) — the
+    // captured pre-revocation bytes verified against the still-valid owner
+    // signature and hasDoorGrant restored the withdrawn right.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    // A hostile peer captures the wire bytes of the signed grant.
+    const captured = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+
+    // Owner revokes.
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+
+    // Hostile peer replays the captured bytes into the same slot.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, captured);
+
+    // Post-fix: the reader's watermark from the tombstone observation defeats
+    // the replayed lower-seq grant.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it('a revocation writes an owner-signed TOMBSTONE (never a bare delete)', () => {
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    removeDoorGrant(DOOR_NORTH, guestPub);
+
+    // The slot must still exist, holding a signed tombstone record — a bare
+    // delete was the pre-fix vulnerable shape (dorkmo's repro).
+    const rec = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorGrantTombstone;
+    expect(rec).toBeDefined();
+    expect(rec.tombstone).toBe(true);
+    expect(rec.doorId).toBe(DOOR_NORTH);
+    expect(rec.pub).toBe(guestPub);
+    expect(typeof rec.seq).toBe('number');
+    expect(rec.seq).toBeGreaterThanOrEqual(0);
+    expect(rec.ownerPub).toBe(ownerPub);
+    expect(typeof rec.ownerSig).toBe('string');
+  });
+
+  it("tombstone at seq S defeats a REPLAYED grant at seq S (reviewer's core repro)", () => {
+    // A hostile peer with a pristine reader state (no watermark yet) still
+    // refuses the replayed grant because the tombstone at the slot outranks
+    // it on the tombstone-tie-break rule, and observeGrantSlot picks the
+    // tombstone up before the grant is even considered.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const capturedGrant = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    const tomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorGrantTombstone;
+
+    // Fresh peer session — different room binding wipes the watermark.
+    const peerDoc = doc;
+    bindDoorPolicy(peerDoc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+      localPub: () => otherPub,
+    });
+    // First read sees the tombstone (currently at the slot).
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+
+    // Hostile peer overwrites the tombstone with the captured grant.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, capturedGrant);
+
+    // The watermark set from the tombstone observation now defeats the
+    // replayed grant, whose seq is <= the tombstone's seq (in fact equal-
+    // minus-one — writeDoorGrant used seq 0, removeDoorGrant used seq 1).
+    expect(tomb.seq).toBeGreaterThan(capturedGrant.seq ?? -1);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it('a HIGHER-SEQ regrant after a tombstone restores rights', () => {
+    // The owner may re-grant the same peer's access after a revocation. The
+    // regrant must carry a higher seq than the tombstone (writeDoorGrant's
+    // nextGrantSeqFor computes it from watermark+observed-seq+1), so it
+    // outranks the tombstone.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    const tomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorGrantTombstone;
+
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    const grant2 = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(grant2.seq).toBeGreaterThan(tomb.seq);
+
+    // And the readDoorGrants list now surfaces the regrant (tombstones never
+    // appear in the grant list).
+    const grants = readDoorGrants(DOOR_NORTH);
+    expect(grants).toHaveLength(1);
+    expect(grants[0].pub).toBe(guestPub);
+  });
+
+  it("a tombstone does NOT bleed across doors (cross-door non-interference)", () => {
+    // Revoke on north — south must remain untouched. A previous bug shape
+    // where tombstones keyed by pub alone would collide here.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    writeDoorGrant(DOOR_SOUTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(true);
+
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(true);
+    // Lifting the north tombstone to the south slot must not defeat the south
+    // grant either — the tombstone signature is over north's bytes.
+    const northTomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+    doc.getMap('doorGrants').set(`${DOOR_SOUTH}|${guestPub}`, northTomb);
+    // Rebind to purge any watermark from prior south reads.
+    bindDoorPolicy(new Y.Doc(), { roomId: ROOM_A });
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+      localPub: () => guestPub,
+    });
+    // The lifted tombstone fails cross-door verify. The slot's authoritative
+    // record is invalid, so hasDoorGrant returns false — no lingering south
+    // grant survives the hostile overwrite (fail-safe, not fail-dangerous).
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(false);
+  });
+
+  it("a tombstone does NOT bleed across rooms (cross-room non-interference)", () => {
+    // Sign a tombstone in room A, lift it into room B under the same slot.
+    // The tombstone's signature bytes carry roomId, so verify refuses in
+    // room B — no way for a hostile peer to blank another room's grants.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    const liftedTomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+
+    // Room B: fresh doc, bind as owner (same owner key across rooms — that
+    // is the harder case; a hostile peer that captured the room-A tombstone
+    // knows the owner pub matches the room-B owner pub).
+    const docB = new Y.Doc();
+    bindAsOwner(docB, ROOM_B);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    const bGrant = docB.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(typeof bGrant.seq).toBe('number');
+
+    // Hostile peer overwrites room B's slot with room A's tombstone.
+    docB.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, liftedTomb);
+    // Room-B owner session re-observes. The lifted A tombstone's signature
+    // covers ROOM_A bytes and fails verify against ROOM_B — the slot reads
+    // as absent (verify-on-read dropped it and the B grant it overwrote was
+    // clobbered by CRDT-LWW). Documents the residual: a hostile peer that
+    // can WRITE the doc can always overwrite a slot with garbage; verify-
+    // on-read then treats the slot as absent. The A tombstone did NOT
+    // propagate its authority into room B.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+
+    // A fresh regrant in room B works normally — the lifted A tombstone did
+    // not contaminate B's watermark (verify failed, so observeGrantSlot
+    // returned null and bumpWatermark never fired for the A tombstone's
+    // higher seq). The regrant's seq is one above whatever the reader last
+    // verified for this slot, which is the ORIGINAL bGrant.seq (the only
+    // record that ever verified in room B).
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const regrantB = docB.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect(typeof regrantB.seq).toBe('number');
+    // Regrant seq must be strictly greater than the original B grant seq
+    // (monotonic within room B), AND must not be inflated by the lifted A
+    // tombstone's seq (i.e. the A tombstone did not bleed watermark values
+    // into room B). The A tombstone in this test was written after only one
+    // A grant, so its seq is 1; the regrant should be bGrant.seq + 1 (i.e.
+    // 1 for a first-grant/first-regrant scenario), not e.g. 2 or higher.
+    expect(regrantB.seq).toBe((bGrant.seq ?? 0) + 1);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
+  it("a legacy unsigned grant is OUTRANKED by a subsequent signed tombstone", () => {
+    // MIGRATION path (see doorPolicy.ts module header): legacy records read
+    // as seq = -1, so any signed tombstone (seq >= 0) defeats them. This
+    // keeps pre-D3.2 grants revocable once an owner upgrades.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Legacy-Sam', grantedAt: 1,
+    });
+    bindAsOwner(doc, ROOM_A);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    const rec = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorGrantTombstone;
+    expect(rec.tombstone).toBe(true);
+    expect(rec.seq).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a signed grant OUTRANKS a hostile downgrade-to-legacy attempt", () => {
+    // The MIGRATION rule says legacy (seqless) records are seq = -1 and any
+    // seq-carrying record outranks them. So a hostile peer that strips
+    // ownerPub/ownerSig/seq to plant a legacy-shape grant AFTER an owner's
+    // signed grant lands at the slot cannot succeed — the reader's watermark
+    // is at the signed grant's seq (>= 0), and the legacy fallback is seq -1.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const signedGrant = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    // Force a read so the watermark bumps to seq 0.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+
+    // Hostile downgrade: overwrite with a legacy-shape record that claims
+    // 'Rogue' access — the shape check passes, but the watermark refuses it.
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Rogue', grantedAt: 999,
+    });
+    // Read still refuses (legacy seq -1 does not outrank the watermarked
+    // signed grant at seq 0).
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    expect(readDoorGrants(DOOR_NORTH)).toEqual([]);
+    // Sanity: the record we planted is not a valid seq-carrying record.
+    expect(signedGrant.seq).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a hostile FAKE-SEQ (higher number, own key) forgery is refused", () => {
+    // Forgery resistance: a hostile peer cannot mint a fake regrant with an
+    // inflated seq because they cannot sign as the owner. Verify-on-read
+    // rejects the sig and the slot reads as absent.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+    const tomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorGrantTombstone;
+
+    // Attempt to overrule the tombstone with a "higher seq" grant signed by
+    // NOT-the-owner.
+    const fakeSeq = tomb.seq + 10;
+    const forged: DoorRightsGrant = {
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      name: 'Rogue',
+      grantedAt: Date.now(),
+      seq: fakeSeq,
+      ownerPub: otherPub,
+      ownerSig: sign(seedOther, doorGrantSignatureBytes(ROOM_A, DOOR_NORTH, {
+        pub: guestPub, name: 'Rogue', grantedAt: 0, seq: fakeSeq,
+      })),
+    };
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, forged);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it("hasDoorGrant refuses a grant whose carried seq is negative or non-integer", () => {
+    // isValidSignedGrant explicitly refuses non-integer / negative seq BEFORE
+    // running verify — the guard trips first, so the ownerSig on these
+    // planted records is never inspected. The canonical encoder can't even
+    // build bytes for a non-integer seq (safe-integer invariant), so a
+    // hostile peer who tried to sign one would fail at the encoder anyway.
+    bindAsOwner(doc, ROOM_A);
+    // NEGATIVE seq: signed with a real owner sig; the seq guard rejects
+    // before verify runs.
+    const negative: DoorRightsGrant = {
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      name: 'Sam',
+      grantedAt: 1,
+      seq: -5,
+      ownerPub: ownerPub,
+      ownerSig: sign(seedOwner, doorGrantSignatureBytes(ROOM_A, DOOR_NORTH, {
+        pub: guestPub, name: 'Sam', grantedAt: 1, seq: -5,
+      })),
+    };
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, negative);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+
+    // NON-INTEGER seq: signature would be un-encodable, so a hostile peer
+    // could only ever plant garbage bytes here. The seq guard still rejects.
+    const noninteger: DoorRightsGrant = {
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      name: 'Sam',
+      grantedAt: 1,
+      seq: 1.5,
+      ownerPub: ownerPub,
+      ownerSig: '00'.repeat(64),   // never reached — seq guard trips first
+    };
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, noninteger);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it("a tombstone with an INVALID signature is dropped (verify-on-read)", () => {
+    // A hostile peer plants a tombstone with a garbage signature — verify
+    // fails, so the slot reads as absent (no grant surfaces, but also no
+    // watermark bump so a subsequent LEGITIMATE grant works normally).
+    bindAsOwner(doc, ROOM_A);
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      tombstone: true,
+      doorId: DOOR_NORTH,
+      pub: guestPub,
+      revokedAt: 1,
+      seq: 5,
+      ownerPub: ownerPub,
+      ownerSig: '00'.repeat(64),   // will not verify
+    });
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+
+    // A subsequent legitimate grant lands and works (no stale watermark).
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
+  it("cross-door tombstone lift refuses (tombstone sig covers doorId)", () => {
+    // Sign a tombstone on north, lift UNMODIFIED to south. Its signature
+    // covers north's bytes, so verify fails on south — a hostile peer cannot
+    // borrow a north tombstone to blank a south grant.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    const northTomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+
+    // Fresh south grant.
+    writeDoorGrant(DOOR_SOUTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(true);
+    const southGrant = doc.getMap('doorGrants').get(`${DOOR_SOUTH}|${guestPub}`);
+
+    // Lift north's tombstone into south's slot.
+    doc.getMap('doorGrants').set(`${DOOR_SOUTH}|${guestPub}`, northTomb);
+    // Rebind to purge watermark for the south slot.
+    bindDoorPolicy(new Y.Doc(), { roomId: ROOM_A });
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+      localPub: () => guestPub,
+    });
+    // The lifted tombstone fails verify (doorId scope). Slot reads as absent
+    // (verify dropped it, and the grant that was here has been overwritten).
+    // Sanity: this documents the CRDT-overwrite residual — the honest south
+    // grant is gone, but the north tombstone did NOT authoritatively kill
+    // the south right; a regrant works.
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(false);
+    // Restore the honest south grant — regrant works, no phantom watermark.
+    doc.getMap('doorGrants').set(`${DOOR_SOUTH}|${guestPub}`, southGrant);
+    expect(hasDoorGrant(DOOR_SOUTH, guestPub)).toBe(true);
+  });
+
+  it("cross-pub tombstone lift refuses (tombstone sig covers pub)", () => {
+    // Companion to cross-door: a tombstone for Sam does not blank Bob's slot.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    writeDoorGrant(DOOR_NORTH, otherPub, 'Bob');
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    const samTomb = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${otherPub}`, samTomb);
+    bindDoorPolicy(new Y.Doc(), { roomId: ROOM_A });
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+      localPub: () => guestPub,
+    });
+    // The lifted tombstone fails verify (map-key discipline: sam's pub does
+    // not match the bob slot's key).
+    expect(hasDoorGrant(DOOR_NORTH, otherPub)).toBe(false);
+  });
+
+  it("DOCUMENTED RESIDUAL — fresh peer that never saw the tombstone accepts replay", () => {
+    // HONEST test: `seq` NARROWS the replay window, it does not close it.
+    // A fresh peer whose watermark is empty (browser restart, first join
+    // after a hostile tombstone-delete) has no prior observation to defeat
+    // the replayed grant. This test documents the residual truthfully so
+    // future readers can see the boundary of the fix.
+    //
+    // Setup: owner grants, hostile captures, owner revokes. Then a hostile
+    // peer DELETES the tombstone (they have map-write access — the whole
+    // reason C6 signed CRDT ops are still open) and REPLACES it with the
+    // replayed grant. A brand-new peer session (fresh watermark) then reads.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    const capturedGrant = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`);
+    removeDoorGrant(DOOR_NORTH, guestPub);
+
+    // Hostile peer deletes the tombstone and plants the replayed grant.
+    doc.getMap('doorGrants').delete(`${DOOR_NORTH}|${guestPub}`);
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, capturedGrant);
+
+    // Brand-new peer session — different doc means watermark is wiped, but
+    // even rebinding to the SAME doc with a fresh internal state models the
+    // "browser restart" case. bindDoorPolicy clears watermarks on new doc.
+    const freshDoc = new Y.Doc();
+    bindDoorPolicy(freshDoc, { roomId: ROOM_A });   // wipes the map
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+      localPub: () => otherPub,
+    });
+    // Fresh peer has no watermark; the replayed grant verifies against the
+    // owner's key and hasDoorGrant returns TRUE.
+    //
+    // This is the tombstone-deletion attack surface that C6 (signed CRDT
+    // ops) or an anchored tombstone log (chia-authority-architecture)
+    // closes. Documented in the doorPolicy.ts module header under
+    // DOCUMENTED RESIDUALS.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+  });
+
+  it("removeDoorGrant from a non-owner session in signed mode is a no-op", () => {
+    // The signer/verifier are wired but the local session is not the owner.
+    // A well-behaved caller (docking.ts gates on ownership already) never
+    // reaches here; a hostile/buggy caller must not be able to plant an
+    // unsigned tombstone that gets dropped by verify-on-read but STILL
+    // clobbers the grant via CRDT-LWW. We refuse the write cleanly.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorGrant(DOOR_NORTH, guestPub, 'Sam');
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+
+    // Rebind as a non-owner guest with the full signer seam.
+    bindDoorPolicy(doc, {
+      roomId: ROOM_A,
+      verifySig: verifier,
+      roomOwnerPub: () => ownerPub,
+      localPub: () => guestPub,            // NOT the owner
+      signOwner: signerFor(seedGuest),
+      signSelf: signerFor(seedGuest),
+    });
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    // The grant is still intact — the non-owner call was refused.
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    // The slot still holds the original grant, not a tombstone.
+    const rec = doc.getMap('doorGrants').get(`${DOOR_NORTH}|${guestPub}`) as DoorRightsGrant;
+    expect((rec as unknown as { tombstone?: boolean }).tombstone).not.toBe(true);
+  });
+
+  it("legacy-binding removeDoorGrant preserves pre-D3 bare-delete behavior", () => {
+    // The MIGRATION posture: a room bound WITHOUT the signing seam still
+    // uses the old bare-delete semantics — there is no signed layer to
+    // defeat and the pre-D3 fleet already writes/reads unsigned records.
+    bindLegacy(doc);
+    doc.getMap('doorGrants').set(`${DOOR_NORTH}|${guestPub}`, {
+      doorId: DOOR_NORTH, pub: guestPub, name: 'Sam', grantedAt: 1,
+    });
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(true);
+    removeDoorGrant(DOOR_NORTH, guestPub);
+    // Slot deleted, not replaced with a tombstone (no owner-signer wired).
+    expect(doc.getMap('doorGrants').has(`${DOOR_NORTH}|${guestPub}`)).toBe(false);
+    expect(hasDoorGrant(DOOR_NORTH, guestPub)).toBe(false);
+  });
+
+  it("signed tombstone verify-bytes helper exposes a stable canonical shape", () => {
+    // Sanity that the helper canonicalizes deterministically — two calls
+    // with the same inputs produce byte-identical output.
+    const a = doorGrantTombstoneSignatureBytes(ROOM_A, DOOR_NORTH, {
+      pub: guestPub, revokedAt: 42, seq: 3,
+    });
+    const b = doorGrantTombstoneSignatureBytes(ROOM_A, DOOR_NORTH, {
+      pub: guestPub, revokedAt: 42, seq: 3,
+    });
+    expect(bytesToHex(a)).toBe(bytesToHex(b));
+    // A different doorId produces different bytes.
+    const c = doorGrantTombstoneSignatureBytes(ROOM_A, DOOR_SOUTH, {
+      pub: guestPub, revokedAt: 42, seq: 3,
+    });
+    expect(bytesToHex(a)).not.toBe(bytesToHex(c));
+    // A different seq produces different bytes.
+    const d = doorGrantTombstoneSignatureBytes(ROOM_A, DOOR_NORTH, {
+      pub: guestPub, revokedAt: 42, seq: 4,
+    });
+    expect(bytesToHex(a)).not.toBe(bytesToHex(d));
   });
 });
 
