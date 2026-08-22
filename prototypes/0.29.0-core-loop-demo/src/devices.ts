@@ -55,6 +55,26 @@ import {
 } from './games/chess';
 import type { ChessState, ChessColor } from './games/chess';
 import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+// ♠♥♦♣ #45 P3 card felt — three games share the flippable table's card face.
+import {
+  initialWarState, beginWar, playWarRound,
+} from './games/war';
+import type { WarSeat, WarState } from './games/war';
+import {
+  initialSolitaireState, dealSolitaire, applySolitaireMove, legalSolitaireMoves,
+  setSolitaireDrawMode,
+} from './games/solitaire';
+import type { SolitaireMove, SolitaireState, SolitaireDrawMode } from './games/solitaire';
+import {
+  initialPokerState, beginPoker, applyPokerAction, callAmount, legalActions,
+  minBet, minRaiseTo, nextHand, chooseBotAction, readVisiblePokerState,
+  pokerForfeit as pokerForfeitState,
+} from './games/poker';
+import type { PokerSeat, PokerState } from './games/poker';
+import {
+  isRed, randomSeed, rankOf, suitOf, RANK_GLYPH, SUIT_GLYPH,
+} from './games/cards';
+import type { Card } from './games/cards';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
@@ -1224,16 +1244,39 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     writeGame(deps.itemId, { ...t.state, status: seat === 'white' ? 'black-won' : 'white-won' });
   };
 
-  /** RESET gate for EITHER game kind (mirror of canReset's reasoning). */
+  /** RESET gate for EITHER board-game kind (mirror of canReset's reasoning). */
   const canClearTable = (): boolean => {
     const t = readTable(deps.itemId);
     if (!t) return false;
     if (t.kind === 'checkers') return canReset(t.state);
-    const s = t.state;
-    if (s.status !== 'waiting' && s.status !== 'playing') return true;
-    if (s.bot) return true;
-    if (s.status === 'waiting') return true; // nobody committed yet
-    return myChessSeat(s) !== null || readRoomOwner() === myId;
+    if (t.kind === 'chess') {
+      const s = t.state;
+      if (s.status !== 'waiting' && s.status !== 'playing') return true;
+      if (s.bot) return true;
+      if (s.status === 'waiting') return true;
+      return myChessSeat(s) !== null || readRoomOwner() === myId;
+    }
+    if (t.kind === 'war') {
+      const s = t.state;
+      if (s.status === 'left-won' || s.status === 'right-won') return true;
+      if (s.bot) return true;
+      if (s.status === 'waiting') return true;
+      return myWarSeat(s) !== null || readRoomOwner() === myId;
+    }
+    if (t.kind === 'solitaire') {
+      const s = t.state;
+      if (s.status === 'won') return true;
+      if (s.player === null) return true;
+      return s.player === myId || readRoomOwner() === myId;
+    }
+    if (t.kind === 'poker') {
+      const s = t.state;
+      if (s.status === 'match-over') return true;
+      if (s.bot) return true;
+      if (s.status === 'waiting') return true;
+      return myPokerSeat(s) !== null || readRoomOwner() === myId;
+    }
+    return false;
   };
 
   /** Clear the table back to the GAME PICKER (both kinds — lets players
@@ -1339,6 +1382,662 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     drawChessBoard(s);
   };
 
+  // ── ♠♥♦♣ Card felt (#45 P3) — WAR, SOLITAIRE, TWO-PLAYER POKER ────────────
+  // The flippable table's card face carries three games sharing one Y-map key
+  // (only one kind lives on the table at a time; RESET returns to the picker).
+  // Card canvases are separate from the board canvas — each game draws its
+  // own layout onto the same DOM slot when the felt is up.
+
+  let cardCanvas: HTMLCanvasElement | null = null;
+  // Local UI state (never written to the doc):
+  let warBotTimer = 0;
+  let pokerBotTimer = 0;
+  /** Solitaire click-to-move source: { kind: 'waste' } | { kind: 'foundation'; suit } |
+   *  { kind: 'tableau'; pile; index } — null when nothing selected. */
+  let solitaireSource: SolitaireClickSource | null = null;
+  /** Poker bet-size input value (text) — parsed to int on Bet/Raise. */
+  let pokerBetInput = '';
+
+  // ── WAR helpers ─────────────────────────────────────────────────────────────
+
+  const myWarSeat = (s: WarState): WarSeat | null =>
+    s.players.left === myId ? 'left' : s.players.right === myId ? 'right' : null;
+
+  const warSeatLabel = (s: WarState, seat: WarSeat): string => {
+    if (seat === 'right' && s.bot) return 'BOT';
+    const id = s.players[seat];
+    if (!id) return 'OPEN';
+    const name = readPlayerDisplayName(id).toUpperCase();
+    return id === myId ? `${name} (YOU)` : name;
+  };
+
+  const warStatusText = (s: WarState): string => {
+    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT DOWN AT LEFT OR RIGHT';
+    if (s.status === 'left-won') return `▲ LEFT WINS — ${warSeatLabel(s, 'left')}`;
+    if (s.status === 'right-won') return `▲ RIGHT WINS — ${warSeatLabel(s, 'right')}`;
+    const lc = s.leftDeck.length; const rc = s.rightDeck.length;
+    const war = s.lastRound && s.lastRound.warDepth > 0 ? ` · WAR×${s.lastRound.warDepth}` : '';
+    return `L:${lc} · R:${rc}${war}`;
+  };
+
+  const claimWarSeat = (seat: WarSeat): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'war') return;
+    const s = t.state;
+    if (s.status !== 'waiting') return;
+    if (s.players[seat] !== null) return;
+    const other = seat === 'left' ? 'right' : 'left';
+    if (s.players[other] === myId) return; // one seat per player
+    if (s.bot && seat === 'right') return; // bot holds right
+    const players = { ...s.players, [seat]: myId };
+    const bothSeated = players.left && players.right;
+    writeGame(deps.itemId, bothSeated
+      ? beginWar({ ...s, players })
+      : { ...s, players });
+  };
+
+  const startWarBot = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'war') return;
+    const s = t.state;
+    if (s.status !== 'waiting' || s.players.right !== null) return;
+    if (s.players.left !== null && s.players.left !== myId) return;
+    writeGame(deps.itemId, beginWar({
+      ...s,
+      players: { ...s.players, left: myId },
+      bot: true,
+    }));
+  };
+
+  const warForfeit = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'war' || t.state.status !== 'playing') return;
+    const seat = myWarSeat(t.state);
+    if (!seat) return;
+    writeGame(deps.itemId, {
+      ...t.state,
+      status: seat === 'left' ? 'right-won' : 'left-won',
+    });
+  };
+
+  const warPlayRound = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'war' || t.state.status !== 'playing') return;
+    // Either seat may click PLAY (deterministic engine — race collapses to
+    // one identical successor state under LWW). Spectators can't play.
+    if (myWarSeat(t.state) === null && !t.state.bot) return;
+    writeGame(deps.itemId, playWarRound(t.state));
+  };
+
+  // ── SOLITAIRE helpers (single-player) ───────────────────────────────────────
+
+  type SolitaireClickSource =
+    | { kind: 'waste' }
+    | { kind: 'foundation'; suit: number }
+    | { kind: 'tableau'; pile: number; index: number };
+
+  const mySolitairePlayer = (s: SolitaireState): boolean => s.player === myId;
+
+  const solitaireStatusText = (s: SolitaireState): string => {
+    if (s.status === 'waiting') return 'WAITING — CLAIM THE SEAT AND DEAL';
+    if (s.status === 'won') return '★ SOLVED — CLICK RESET FOR A FRESH DEAL';
+    return `MOVES: ${s.moves} · REDEALS: ${s.redeals}`;
+  };
+
+  const claimSolitaireSeat = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'solitaire') return;
+    const s = t.state;
+    if (s.status !== 'waiting') return;
+    if (s.player !== null && s.player !== myId) return;
+    writeGame(deps.itemId, dealSolitaire({ ...s, player: myId }));
+  };
+
+  const doSolitaireMove = (move: SolitaireMove): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'solitaire') return;
+    if (!mySolitairePlayer(t.state)) return;
+    const next = applySolitaireMove(t.state, move);
+    if (next === t.state) return; // illegal — no doc write
+    writeGame(deps.itemId, next);
+  };
+
+  // Draw-mode setter: only valid while the felt is in 'waiting' status
+  // (before the first deal). setSolitaireDrawMode returns the same state
+  // reference when the change is illegal, so the guard below skips the
+  // pointless doc write. Enables the round-3 turn-3 draw mode alongside the
+  // classic draw-1 (games-plan.md marks Klondike as single-player, so the
+  // player is free to pick their variant per-session).
+  const doSetSolitaireDrawMode = (drawMode: SolitaireDrawMode): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'solitaire') return;
+    const next = setSolitaireDrawMode(t.state, drawMode);
+    if (next === t.state) return;
+    writeGame(deps.itemId, next);
+  };
+
+  // Undo helper: applies a bounded-history 'undo' move (see solitaire.ts
+  // MAX_UNDO_HISTORY). Silent no-op when history is empty — the UI gates
+  // the button on undoHistory.length > 0 so this rarely fires spuriously.
+  const doSolitaireUndo = (): void => {
+    doSolitaireMove({ type: 'undo' });
+  };
+
+  // ── POKER helpers (2-player NL Hold'em) ─────────────────────────────────────
+
+  const myPokerSeat = (s: PokerState): PokerSeat | null =>
+    s.players.button.id === myId ? 'button'
+      : s.players.bigBlind.id === myId ? 'bigBlind' : null;
+
+  const myPokerTurn = (s: PokerState): boolean => {
+    const seat = myPokerSeat(s);
+    return s.status === 'playing' && seat !== null && s.toAct === seat;
+  };
+
+  const pokerSeatLabel = (s: PokerState, seat: PokerSeat): string => {
+    // The BOT identity travels with a `null` id (see poker.ts:172 comment
+    // "a seat with a null id is a BOT"). Pre-round-3 this label hard-coded
+    // `bigBlind` as the bot seat — correct only for hand #1, since dealHand
+    // rotates the button/BB assignment on hand ≥ 2 (poker.ts:201). After
+    // rotation the human's seat still showed their name, but the bot's seat
+    // (now BUTTON) was displayed as OPEN — the pump kept firing because
+    // dealHand only rotates the assignment, not the underlying id, but the
+    // UI became a lie.
+    const id = s.players[seat].id;
+    if (id === null && s.bot) return 'BOT';
+    if (!id) return 'OPEN';
+    const name = readPlayerDisplayName(id).toUpperCase();
+    return id === myId ? `${name} (YOU)` : name;
+  };
+
+  const pokerStatusText = (s: PokerState): string => {
+    if (s.status === 'waiting') return 'WAITING FOR PLAYERS — SIT AT BUTTON OR BIG BLIND';
+    if (s.status === 'match-over') return `▲ MATCH OVER — ${
+      s.players.button.stack > 0 ? pokerSeatLabel(s, 'button') : pokerSeatLabel(s, 'bigBlind')
+    } TAKES THE STACK`;
+    if (s.status === 'hand-over') {
+      const w = s.lastShowdown?.winner;
+      if (w === 'split') return `HAND OVER — SPLIT POT (${s.lastShowdown?.pot ?? 0})`;
+      if (w) return `HAND OVER — ${pokerSeatLabel(s, w).toUpperCase()} WINS (${s.lastShowdown?.pot ?? 0})`;
+      return 'HAND OVER';
+    }
+    const streetLabel = s.street.toUpperCase();
+    const toAct = s.toAct ? ` · ${s.toAct === 'button' ? 'BUTTON' : 'BB'} TO ACT` : '';
+    const yours = myPokerTurn(s) ? ' — YOUR TURN' : '';
+    return `${streetLabel} · POT ${s.pot}${toAct}${yours}`;
+  };
+
+  const claimPokerSeat = (seat: PokerSeat): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker') return;
+    const s = t.state;
+    if (s.status !== 'waiting') return;
+    if (s.players[seat].id !== null) return;
+    const other = seat === 'button' ? 'bigBlind' : 'button';
+    if (s.players[other].id === myId) return; // one seat per player
+    if (s.bot && seat === 'bigBlind') return;
+    // Claim only — the game starts when BOTH seats are claimed via BEGIN.
+    const players = {
+      button: { ...s.players.button },
+      bigBlind: { ...s.players.bigBlind },
+    };
+    players[seat] = { ...players[seat], id: myId };
+    writeGame(deps.itemId, { ...s, players });
+  };
+
+  const beginPokerMatch = (bot: boolean): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker') return;
+    const s = t.state;
+    if (s.status !== 'waiting') return;
+    const buttonId = s.players.button.id ?? (bot ? myId : null);
+    const bigBlindId = bot ? null : s.players.bigBlind.id;
+    if (!bot && (!buttonId || !bigBlindId)) return;
+    if (bot && buttonId !== myId) return; // solo start: I sit at button
+    writeGame(deps.itemId, beginPoker(s, {
+      button: buttonId, bigBlind: bigBlindId, bot, startingStack: 1000,
+    }));
+  };
+
+  const pokerForfeit = (): void => {
+    // In poker, "forfeit" means concede the current hand (fold if you can);
+    // if the hand isn't yours to act, this is a no-op (the button already
+    // handles that case via the FOLD action). This exists so a player who
+    // rage-quits during a bot game can end the match cleanly. The transition
+    // itself is a pure function in `games/poker.ts` (`pokerForfeitState`):
+    //   · awards the live pot to the opponent (fold-equivalent) — the
+    //     previous inline implementation forgot this step and left SB+BB
+    //     chips stranded in the terminal state (audit finding #3),
+    //   · transfers residual stack to the opponent,
+    //   · sets match-over/complete and records `lastShowdown`.
+    // Idempotent on non-playing states so a doc race between two writers
+    // still converges cleanly via LWW.
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker' || t.state.status !== 'playing') return;
+    const seat = myPokerSeat(t.state);
+    if (!seat) return;
+    writeGame(deps.itemId, pokerForfeitState(t.state, seat));
+  };
+
+  const doPokerAction = (kind: 'fold' | 'check' | 'call' | 'bet' | 'raise'): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker') return;
+    const seat = myPokerSeat(t.state);
+    if (!seat || !myPokerTurn(t.state)) return;
+    if (kind === 'fold' || kind === 'check' || kind === 'call') {
+      const next = applyPokerAction(t.state, { seat, kind });
+      if (next !== t.state) writeGame(deps.itemId, next);
+      return;
+    }
+    const amount = Number.parseInt(pokerBetInput, 10);
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    const next = applyPokerAction(t.state, { seat, kind, amount });
+    if (next === t.state) return;
+    pokerBetInput = '';
+    writeGame(deps.itemId, next);
+  };
+
+  const advancePokerHand = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker') return;
+    if (t.state.status !== 'hand-over') return;
+    if (myPokerSeat(t.state) === null && !t.state.bot) return;
+    // Rotate seed per hand for a fresh shuffle (deterministic per-peer).
+    writeGame(deps.itemId, nextHand(t.state, (t.state.seed + 1) | 0 || randomSeed()));
+  };
+
+  // ── Card drawing primitives (shared across the three card games) ────────────
+
+  const CARD_W = 44; // canvas px
+  const CARD_H = 62;
+  const CARD_GAP = 6;
+
+  /** Paint a card face (or facedown back) at (x, y). Backing store units. */
+  const paintCard = (
+    ctx: CanvasRenderingContext2D, x: number, y: number, card: Card | null, faceUp: boolean,
+  ): void => {
+    ctx.save();
+    ctx.fillStyle = '#F5EEDF';
+    ctx.strokeStyle = '#1B1B22';
+    ctx.lineWidth = 1.5;
+    // Rounded rect body.
+    const r = 6;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + CARD_W - r, y);
+    ctx.quadraticCurveTo(x + CARD_W, y, x + CARD_W, y + r);
+    ctx.lineTo(x + CARD_W, y + CARD_H - r);
+    ctx.quadraticCurveTo(x + CARD_W, y + CARD_H, x + CARD_W - r, y + CARD_H);
+    ctx.lineTo(x + r, y + CARD_H);
+    ctx.quadraticCurveTo(x, y + CARD_H, x, y + CARD_H - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+    if (faceUp && card !== null) {
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = isRed(card) ? '#C6162E' : '#151519';
+      ctx.font = 'bold 14px "SF Mono", monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(RANK_GLYPH[rankOf(card)], x + 5, y + 4);
+      ctx.font = '14px serif';
+      ctx.fillText(SUIT_GLYPH[suitOf(card)], x + 5, y + 22);
+      // Mirror in bottom-right for classic look.
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'bottom';
+      ctx.font = 'bold 14px "SF Mono", monospace';
+      ctx.fillText(RANK_GLYPH[rankOf(card)], x + CARD_W - 5, y + CARD_H - 22);
+      ctx.font = '14px serif';
+      ctx.fillText(SUIT_GLYPH[suitOf(card)], x + CARD_W - 5, y + CARD_H - 4);
+    } else {
+      // Facedown: dark bordered rectangle with a subtle pattern.
+      ctx.fillStyle = '#3E5A72';
+      ctx.fill();
+      ctx.strokeStyle = '#0A1622';
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(212, 168, 75, 0.4)';
+      ctx.strokeRect(x + 4, y + 4, CARD_W - 8, CARD_H - 8);
+    }
+    ctx.restore();
+  };
+
+  /** Small empty-slot outline (for foundation targets, empty tableau piles). */
+  const paintSlot = (ctx: CanvasRenderingContext2D, x: number, y: number, label = ''): void => {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(212, 168, 75, 0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(x, y, CARD_W, CARD_H);
+    if (label) {
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(212, 168, 75, 0.5)';
+      ctx.font = '10px "SF Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, x + CARD_W / 2, y + CARD_H / 2);
+    }
+    ctx.restore();
+  };
+
+  const drawWarBoard = (s: WarState): void => {
+    if (!cardCanvas) return;
+    const ctx = cardCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.clearRect(0, 0, cardCanvas.width, cardCanvas.height);
+    // Backdrop.
+    ctx.fillStyle = '#0C2216';
+    ctx.fillRect(0, 0, cardCanvas.width, cardCanvas.height);
+    ctx.fillStyle = GT_GOLD;
+    ctx.font = 'bold 12px "SF Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('LEFT', cardCanvas.width / 4, 16);
+    ctx.fillText('RIGHT', (cardCanvas.width * 3) / 4, 16);
+    // Draw the two decks (facedown stacks) with count.
+    const deckY = 30;
+    const leftX = cardCanvas.width / 4 - CARD_W / 2;
+    const rightX = (cardCanvas.width * 3) / 4 - CARD_W / 2;
+    if (s.leftDeck.length > 0) paintCard(ctx, leftX, deckY, null, false);
+    else paintSlot(ctx, leftX, deckY, 'EMPTY');
+    if (s.rightDeck.length > 0) paintCard(ctx, rightX, deckY, null, false);
+    else paintSlot(ctx, rightX, deckY, 'EMPTY');
+    ctx.fillStyle = GT_GOLD;
+    ctx.font = '11px "SF Mono", monospace';
+    ctx.fillText(`${s.leftDeck.length}`, cardCanvas.width / 4, deckY + CARD_H + 12);
+    ctx.fillText(`${s.rightDeck.length}`, (cardCanvas.width * 3) / 4, deckY + CARD_H + 12);
+    // Draw last-round reveal beneath.
+    const revealY = deckY + CARD_H + 26;
+    if (s.lastRound) {
+      const rr = s.lastRound;
+      // Face-down burn to the left of each up card (compact indicator).
+      const drawSide = (cards: Card[], burn: Card[], baseX: number): void => {
+        let offset = 0;
+        for (const b of burn) {
+          void b;
+          paintCard(ctx, baseX - CARD_W + offset, revealY, null, false);
+          offset += 8;
+        }
+        // The up-card(s) — most recent last, offset to the right of burn.
+        let ux = baseX + offset - CARD_W;
+        for (const up of cards) {
+          paintCard(ctx, ux, revealY, up, true);
+          ux += CARD_W + 4;
+        }
+      };
+      drawSide(rr.leftUp, rr.leftDown, cardCanvas.width / 4);
+      drawSide(rr.rightUp, rr.rightDown, (cardCanvas.width * 3) / 4);
+      if (rr.winner) {
+        ctx.fillStyle = GT_GOLD_BRIGHT;
+        ctx.font = 'bold 12px "SF Mono", monospace';
+        ctx.fillText(rr.winner === 'left' ? '◀ LEFT WINS' : 'RIGHT WINS ▶',
+          cardCanvas.width / 2, revealY + CARD_H + 14);
+      }
+    } else if (s.status === 'playing') {
+      ctx.fillStyle = 'rgba(212, 168, 75, 0.6)';
+      ctx.font = '11px "SF Mono", monospace';
+      ctx.fillText('CLICK PLAY ROUND TO REVEAL', cardCanvas.width / 2, revealY + CARD_H / 2);
+    }
+  };
+
+  const drawSolitaireBoard = (s: SolitaireState): void => {
+    if (!cardCanvas) return;
+    const ctx = cardCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.clearRect(0, 0, cardCanvas.width, cardCanvas.height);
+    ctx.fillStyle = '#0C2216';
+    ctx.fillRect(0, 0, cardCanvas.width, cardCanvas.height);
+    // Layout: top row = stock, waste, foundations x4. Bottom = 7 tableau piles.
+    const topY = 10;
+    const stockX = 10;
+    const wasteX = stockX + CARD_W + CARD_GAP;
+    // Stock.
+    if (s.stock.length > 0) paintCard(ctx, stockX, topY, null, false);
+    else paintSlot(ctx, stockX, topY, s.waste.length > 0 ? '↺' : '—');
+    ctx.fillStyle = GT_GOLD;
+    ctx.font = '10px "SF Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${s.stock.length}`, stockX + CARD_W / 2, topY + CARD_H + 10);
+    // Waste — show top card only (draw-one rule).
+    if (s.waste.length > 0) paintCard(ctx, wasteX, topY, s.waste[s.waste.length - 1], true);
+    else paintSlot(ctx, wasteX, topY, 'W');
+    // Foundations (right side).
+    const foundStartX = cardCanvas.width - 4 * (CARD_W + CARD_GAP) - 4;
+    for (let suit = 0; suit < 4; suit++) {
+      const fx = foundStartX + suit * (CARD_W + CARD_GAP);
+      const found = s.foundations[suit];
+      if (found.length > 0) paintCard(ctx, fx, topY, found[found.length - 1], true);
+      else paintSlot(ctx, fx, topY, SUIT_GLYPH[suit]);
+    }
+    // Tableau row: 7 piles.
+    const tabY = topY + CARD_H + 22;
+    const totalW = 7 * CARD_W + 6 * CARD_GAP;
+    const tabStartX = Math.max(10, (cardCanvas.width - totalW) / 2);
+    const rowStep = 18; // vertical staggering per card
+    for (let p = 0; p < 7; p++) {
+      const px = tabStartX + p * (CARD_W + CARD_GAP);
+      const pile = s.tableau[p];
+      if (pile.length === 0) {
+        paintSlot(ctx, px, tabY, '');
+        continue;
+      }
+      for (let i = 0; i < pile.length; i++) {
+        paintCard(ctx, px, tabY + i * rowStep, pile[i].card, pile[i].faceUp);
+      }
+    }
+    // Selection highlight.
+    if (solitaireSource) {
+      ctx.strokeStyle = GT_GOLD_BRIGHT;
+      ctx.lineWidth = 2.5;
+      if (solitaireSource.kind === 'waste' && s.waste.length > 0) {
+        ctx.strokeRect(wasteX - 2, topY - 2, CARD_W + 4, CARD_H + 4);
+      } else if (solitaireSource.kind === 'foundation') {
+        const fx = foundStartX + solitaireSource.suit * (CARD_W + CARD_GAP);
+        ctx.strokeRect(fx - 2, topY - 2, CARD_W + 4, CARD_H + 4);
+      } else if (solitaireSource.kind === 'tableau') {
+        const px = tabStartX + solitaireSource.pile * (CARD_W + CARD_GAP);
+        const py = tabY + solitaireSource.index * rowStep;
+        const pile = s.tableau[solitaireSource.pile];
+        const runLen = pile.length - solitaireSource.index;
+        const height = CARD_H + (runLen - 1) * rowStep;
+        ctx.strokeRect(px - 2, py - 2, CARD_W + 4, height + 4);
+      }
+    }
+  };
+
+  const onSolitaireCanvasClick = (e: MouseEvent): void => {
+    if (!cardCanvas) return;
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'solitaire' || !mySolitairePlayer(t.state)) return;
+    const s = t.state;
+    if (s.status !== 'playing') return;
+    const rect = cardCanvas.getBoundingClientRect();
+    const scaleX = cardCanvas.width / rect.width;
+    const scaleY = cardCanvas.height / rect.height;
+    const x = (e.clientX - rect.left) * scaleX;
+    const y = (e.clientY - rect.top) * scaleY;
+
+    const topY = 10;
+    const stockX = 10;
+    const wasteX = stockX + CARD_W + CARD_GAP;
+    const foundStartX = cardCanvas.width - 4 * (CARD_W + CARD_GAP) - 4;
+    const tabY = topY + CARD_H + 22;
+    const totalW = 7 * CARD_W + 6 * CARD_GAP;
+    const tabStartX = Math.max(10, (cardCanvas.width - totalW) / 2);
+    const rowStep = 18;
+
+    // Hit test — identify what was clicked.
+    const inRect = (rx: number, ry: number, rw: number, rh: number): boolean =>
+      x >= rx && x <= rx + rw && y >= ry && y <= ry + rh;
+
+    // Stock click → draw.
+    if (inRect(stockX, topY, CARD_W, CARD_H)) {
+      solitaireSource = null;
+      doSolitaireMove({ type: 'draw' });
+      return;
+    }
+    // Waste click.
+    if (inRect(wasteX, topY, CARD_W, CARD_H) && s.waste.length > 0) {
+      if (solitaireSource?.kind === 'waste') { solitaireSource = null; return; }
+      solitaireSource = { kind: 'waste' };
+      return;
+    }
+    // Foundation clicks.
+    for (let suit = 0; suit < 4; suit++) {
+      const fx = foundStartX + suit * (CARD_W + CARD_GAP);
+      if (inRect(fx, topY, CARD_W, CARD_H)) {
+        if (solitaireSource?.kind === 'waste') {
+          doSolitaireMove({ type: 'waste-to-foundation' });
+          solitaireSource = null;
+          return;
+        }
+        if (solitaireSource?.kind === 'tableau') {
+          doSolitaireMove({ type: 'tableau-to-foundation', from: solitaireSource.pile });
+          solitaireSource = null;
+          return;
+        }
+        // Select this foundation as source.
+        if (s.foundations[suit].length > 0) {
+          solitaireSource = { kind: 'foundation', suit };
+        } else {
+          solitaireSource = null;
+        }
+        return;
+      }
+    }
+    // Tableau piles.
+    for (let p = 0; p < 7; p++) {
+      const px = tabStartX + p * (CARD_W + CARD_GAP);
+      const pile = s.tableau[p];
+      // The empty slot still gets a hit box.
+      if (pile.length === 0) {
+        if (inRect(px, tabY, CARD_W, CARD_H)) {
+          if (solitaireSource?.kind === 'waste') {
+            doSolitaireMove({ type: 'waste-to-tableau', to: p });
+            solitaireSource = null;
+            return;
+          }
+          if (solitaireSource?.kind === 'foundation') {
+            doSolitaireMove({ type: 'foundation-to-tableau', suit: solitaireSource.suit, to: p });
+            solitaireSource = null;
+            return;
+          }
+          if (solitaireSource?.kind === 'tableau') {
+            doSolitaireMove({
+              type: 'tableau-to-tableau',
+              from: solitaireSource.pile,
+              fromIndex: solitaireSource.index,
+              to: p,
+            });
+            solitaireSource = null;
+            return;
+          }
+          return;
+        }
+        continue;
+      }
+      // Walk the pile from bottom to top (last card on top wins hit priority).
+      for (let i = pile.length - 1; i >= 0; i--) {
+        const cy = tabY + i * rowStep;
+        // Only the TOP card gets the full height; interior cards get rowStep vis area.
+        const isTop = i === pile.length - 1;
+        const hitH = isTop ? CARD_H : rowStep;
+        if (inRect(px, cy, CARD_W, hitH)) {
+          // Only face-up cards may become a source.
+          if (!pile[i].faceUp) return;
+          // If source is set and we clicked a valid destination (the top of another pile),
+          // this branch is handled above by "destination pile" — here `p` is the target.
+          if (solitaireSource?.kind === 'waste' && isTop) {
+            doSolitaireMove({ type: 'waste-to-tableau', to: p });
+            solitaireSource = null;
+            return;
+          }
+          if (solitaireSource?.kind === 'foundation' && isTop) {
+            doSolitaireMove({ type: 'foundation-to-tableau', suit: solitaireSource.suit, to: p });
+            solitaireSource = null;
+            return;
+          }
+          if (solitaireSource?.kind === 'tableau' && solitaireSource.pile !== p && isTop) {
+            doSolitaireMove({
+              type: 'tableau-to-tableau',
+              from: solitaireSource.pile,
+              fromIndex: solitaireSource.index,
+              to: p,
+            });
+            solitaireSource = null;
+            return;
+          }
+          // Otherwise (re)select this face-up run head.
+          solitaireSource = { kind: 'tableau', pile: p, index: i };
+          return;
+        }
+      }
+    }
+    // Missed everything — clear selection.
+    solitaireSource = null;
+  };
+
+  const drawPokerBoard = (s: PokerState): void => {
+    if (!cardCanvas) return;
+    const ctx = cardCanvas.getContext('2d');
+    if (!ctx) return;
+    ctx.imageSmoothingEnabled = true;
+    ctx.clearRect(0, 0, cardCanvas.width, cardCanvas.height);
+    ctx.fillStyle = '#0C2216';
+    ctx.fillRect(0, 0, cardCanvas.width, cardCanvas.height);
+    // Community row (centre).
+    const communityY = 66;
+    const totalCW = 5 * CARD_W + 4 * CARD_GAP;
+    const communityX0 = (cardCanvas.width - totalCW) / 2;
+    for (let i = 0; i < 5; i++) {
+      const cx = communityX0 + i * (CARD_W + CARD_GAP);
+      if (i < s.community.length) paintCard(ctx, cx, communityY, s.community[i], true);
+      else paintSlot(ctx, cx, communityY, '');
+    }
+    // Pot indicator.
+    ctx.fillStyle = GT_GOLD_BRIGHT;
+    ctx.font = 'bold 12px "SF Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`POT ${s.pot}`, cardCanvas.width / 2, communityY - 6);
+    // Player rows: BB at top, BUTTON at bottom.
+    const viewer = readVisiblePokerState(s, myId);
+    const paintPlayer = (
+      p: typeof viewer.players.button, label: string, y: number, seatIsToAct: boolean,
+    ): void => {
+      const x0 = 10;
+      // Hole cards.
+      if (p.holeCards) {
+        paintCard(ctx, x0, y, p.holeCards[0], true);
+        paintCard(ctx, x0 + CARD_W + CARD_GAP, y, p.holeCards[1], true);
+      } else {
+        paintCard(ctx, x0, y, null, false);
+        paintCard(ctx, x0 + CARD_W + CARD_GAP, y, null, false);
+      }
+      // Label + stack.
+      ctx.textAlign = 'left';
+      ctx.fillStyle = seatIsToAct ? GT_GOLD_BRIGHT : GT_GOLD;
+      ctx.font = 'bold 12px "SF Mono", monospace';
+      ctx.fillText(label, x0 + 2 * CARD_W + CARD_GAP + 12, y + 16);
+      ctx.fillStyle = GT_GOLD;
+      ctx.font = '11px "SF Mono", monospace';
+      ctx.fillText(`STACK ${p.stack}`, x0 + 2 * CARD_W + CARD_GAP + 12, y + 32);
+      ctx.fillText(`BET ${p.streetBet}`, x0 + 2 * CARD_W + CARD_GAP + 12, y + 48);
+      if (p.folded) {
+        ctx.fillStyle = '#FF8A80';
+        ctx.fillText('FOLDED', x0 + 2 * CARD_W + CARD_GAP + 12, y - 4);
+      } else if (p.allIn) {
+        ctx.fillStyle = '#F0C060';
+        ctx.fillText('ALL-IN', x0 + 2 * CARD_W + CARD_GAP + 12, y - 4);
+      }
+    };
+    // BB on top, button on bottom (heads-up visual convention: dealer at bottom).
+    paintPlayer(viewer.players.bigBlind, `BIG BLIND — ${pokerSeatLabel(s, 'bigBlind')}`,
+      10, s.toAct === 'bigBlind');
+    paintPlayer(viewer.players.button, `BUTTON (SB) — ${pokerSeatLabel(s, 'button')}`,
+      communityY + CARD_H + 12, s.toAct === 'button');
+  };
+
   // ── Panel rendering (trunk-UI idiom: re-render + re-attach on change) ──────
 
   const render = (): void => {
@@ -1414,6 +2113,20 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     };
 
     // ── The board face: game picker / checkers / chess ──
+    // "Flip to play X" mismatched-face hint used when the current table game
+    // lives on the opposite surface.
+    const flipHint = (game: string): string => `
+      <div style="display:flex; flex-direction:column; gap:10px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:16px 12px; background:rgba(10,24,14,0.5);">
+        <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">${game.toUpperCase()} IS ON THE OTHER FACE</div>
+        <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
+          Flip the table to keep playing, or RESET to clear it and pick a new game on this face.
+        </div>
+        <div style="display:flex; gap:8px;">
+          ${btn('gt-reset', 'RESET', !canClearTable(),
+            canClearTable() ? 'Clear the table back to the picker' : 'Participants or the room owner reset a live game')}
+        </div>
+      </div>`;
+
     let boardFace: string;
     if (table === null) {
       boardFace = `
@@ -1423,7 +2136,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             ${btn('gt-pick-chess', '♟ CHESS', false, 'Full rules — castling, en passant, checkmate')}
             ${btn('gt-pick-checkers', '⛀ CHECKERS', false, 'American rules, forced captures')}
           </div>
-          <div style="font-size:9px; color:rgba(212,168,75,0.5);">Anyone at the table picks; the first two to SIT play. RESET brings this menu back.</div>
+          <div style="font-size:9px; color:rgba(212,168,75,0.5);">Anyone at the table picks; the first two to SIT play. RESET brings this menu back. Flip for the card felt.</div>
         </div>`;
     } else if (table.kind === 'chess') {
       const cs = table.state;
@@ -1445,7 +2158,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           ${btn('gt-reset', 'RESET', !canClearTable(),
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
         </div>`;
-    } else {
+    } else if (table.kind === 'checkers') {
       const state = table.state;
       const showBot = state.status === 'waiting' && state.players.black === null
         && (state.players.red === null || state.players.red === myId);
@@ -1465,6 +2178,196 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           ${btn('gt-reset', 'RESET', !canClearTable(),
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
         </div>`;
+    } else {
+      // A card-felt game (war/solitaire/poker) is on the OPPOSITE face.
+      const label = table.kind === 'war' ? 'WAR'
+        : table.kind === 'solitaire' ? 'SOLITAIRE'
+        : 'POKER';
+      boardFace = flipHint(label);
+    }
+
+    // ── The card face: picker / war / solitaire / poker ──
+    const cardCanvasHtml = (interactive: boolean): string => `
+      <canvas id="gt-card-canvas" width="400" height="240"
+        style="width:400px; height:240px; align-self:center; border:1px solid rgba(212,168,75,0.35); border-radius:6px; cursor:${interactive ? 'pointer' : 'default'};"></canvas>`;
+    const cardSeatCell = (
+      idSuffix: string, name: string, dot: string, claimable: boolean, hint: string,
+    ): string => `
+      <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:7px 10px;">
+        <span style="width:10px; height:10px; border-radius:50%; background:${dot}; flex:none;"></span>
+        <span style="flex:1; font-size:10px; letter-spacing:1px; color:${GT_GOLD};">${name}</span>
+        ${claimable ? btn(idSuffix, 'SIT', false, hint) : ''}
+      </div>`;
+
+    let cardFace: string;
+    if (table === null) {
+      cardFace = `
+        <div style="display:flex; flex-direction:column; gap:10px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:16px 12px;">
+          <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">♠ CARD FELT — PICK A GAME</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            ${btn('gt-pick-war', '⚔ WAR (2P)', false, 'Two-player war — top-card duels')}
+            ${btn('gt-pick-solitaire', '★ SOLITAIRE', false, 'Single-player Klondike (draw three, draw-one toggle available)')}
+            ${btn('gt-pick-poker', '♠ POKER (2P)', false, 'Heads-up NL Texas Hold\'em')}
+          </div>
+          <div style="font-size:9px; color:rgba(212,168,75,0.5); line-height:1.5;">
+            v1 caveat: the card felt syncs cards through the ROOM DOC, so a
+            determined spectator inspecting the doc could read hole cards.
+            Full hidden-hand play (commit-reveal) arrives with the wallet-
+            integrated slice — see brainstorming/games-plan.md.
+            <br /><br />
+            <strong style="color:rgba(230,120,120,0.85);">Adversarial fairness:</strong>
+            each client shuffles independently using a deterministic seed
+            written into the doc — so a peer who observes the SEED before
+            posting can pre-compute the whole hand order. Trusted-node play
+            only in v1; competitive/wagered play blocks on the same
+            commit-reveal work as hidden-hand poker (see games-plan.md).
+          </div>
+        </div>`;
+    } else if (table.kind === 'war') {
+      const w = table.state;
+      const showBot = w.status === 'waiting' && w.players.right === null
+        && (w.players.left === null || w.players.left === myId);
+      const showForfeit = w.status === 'playing' && myWarSeat(w) !== null;
+      const canPlay = w.status === 'playing' && (myWarSeat(w) !== null || w.bot);
+      cardFace = `
+        <div id="gt-card-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
+          w.status === 'playing' ? GT_GOLD_BRIGHT : w.status === 'waiting' ? GT_DIM : '#00E676'
+        };">${warStatusText(w)}</div>
+        <div style="display:flex; gap:8px;">
+          ${cardSeatCell('gt-war-sit-left', `LEFT — ${warSeatLabel(w, 'left')}`,
+            '#F0C060',
+            w.status === 'waiting' && w.players.left === null && w.players.right !== myId,
+            'Claim LEFT')}
+          ${cardSeatCell('gt-war-sit-right', `RIGHT — ${warSeatLabel(w, 'right')}`,
+            '#9AA3B2',
+            w.status === 'waiting' && w.players.right === null && !w.bot && w.players.left !== myId,
+            'Claim RIGHT')}
+        </div>
+        ${showBot ? `<div>${btn('gt-war-bot', '⚙ VS BOT — PLAY ALONE', false, 'Single-player war against a trivial AI')}</div>` : ''}
+        ${cardCanvasHtml(false)}
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          ${canPlay ? btn('gt-war-play', '▶ PLAY ROUND', false, 'Reveal both top cards and resolve') : ''}
+          ${showForfeit ? btn('gt-war-forfeit', 'FORFEIT', false, 'Concede the match') : ''}
+          ${btn('gt-reset', 'RESET', !canClearTable(),
+            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset')}
+        </div>`;
+    } else if (table.kind === 'solitaire') {
+      const s = table.state;
+      const claimable = s.status === 'waiting' && (s.player === null || s.player === myId);
+      const legal = mySolitairePlayer(s) ? legalSolitaireMoves(s).length : 0;
+      const isMine = mySolitairePlayer(s);
+      // Draw-mode toggle is only actionable pre-deal (waiting status). After
+      // dealing, the mode is locked (setSolitaireDrawMode rejects changes
+      // while playing so a mid-hand switch can't corrupt the stock/waste
+      // draw count). Show it as a static label when playing.
+      const drawModeToggle = s.status === 'waiting'
+        ? `
+        <div style="display:flex; gap:6px; align-items:center;">
+          <span style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">DRAW:</span>
+          ${btn('gt-sol-draw-1', 'DRAW ONE',
+            s.drawMode === 1,
+            'Klondike draw-one variant (turn one card at a time)')}
+          ${btn('gt-sol-draw-3', 'DRAW THREE',
+            s.drawMode === 3,
+            'Klondike draw-three variant (turn three cards at a time; classic default)')}
+        </div>`
+        : `<div style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">DRAW ${s.drawMode === 1 ? 'ONE' : 'THREE'} · locked for this deal</div>`;
+      // Undo button: only offered mid-play, only when there IS a snapshot
+      // to restore. The engine caps undoHistory at MAX_UNDO_HISTORY (128)
+      // and each snapshot elides its own history to keep the doc shape
+      // bounded across long sessions.
+      const canUndo = isMine && s.status === 'playing' && s.undoHistory.length > 0;
+      cardFace = `
+        <div id="gt-card-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
+          s.status === 'playing' ? GT_GOLD_BRIGHT : s.status === 'waiting' ? GT_DIM : '#00E676'
+        };">${solitaireStatusText(s)}</div>
+        <div style="display:flex; gap:8px;">
+          ${cardSeatCell('gt-sol-sit', `PLAYER — ${s.player
+            ? (s.player === myId ? `${readPlayerDisplayName(s.player).toUpperCase()} (YOU)` : readPlayerDisplayName(s.player).toUpperCase())
+            : 'OPEN'}`, '#F0C060', claimable, 'Claim the seat and deal')}
+        </div>
+        ${drawModeToggle}
+        ${cardCanvasHtml(mySolitairePlayer(s) && s.status === 'playing')}
+        <div style="display:flex; gap:8px; justify-content:space-between; align-items:center;">
+          <div style="font-size:9px; color:rgba(212,168,75,0.5);">${
+            mySolitairePlayer(s) && s.status === 'playing'
+              ? `${legal} legal moves · click a card, then click a destination`
+              : ''
+          }</div>
+          <div style="display:flex; gap:8px;">
+            ${isMine && s.status === 'playing' ? btn('gt-sol-undo', `↶ UNDO (${s.undoHistory.length})`,
+              !canUndo,
+              canUndo ? `Restore the previous state (${s.undoHistory.length} snapshot${s.undoHistory.length === 1 ? '' : 's'} available)` : 'No moves to undo yet') : ''}
+            ${btn('gt-reset', 'RESET', !canClearTable(),
+              canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset')}
+          </div>
+        </div>`;
+    } else if (table.kind === 'poker') {
+      const p = table.state;
+      const showBot = p.status === 'waiting' && p.players.bigBlind.id === null
+        && (p.players.button.id === null || p.players.button.id === myId);
+      const bothClaimed = p.players.button.id !== null && p.players.bigBlind.id !== null;
+      const showBegin = p.status === 'waiting' && bothClaimed;
+      // Forfeit is only sensible mid-hand — post-round-3 fix. Between hands
+      // (status === 'hand-over') the winner is decided, the seat's stack is
+      // stable, and pressing "FORFEIT" would gift chips it had every right
+      // to keep or reject on 'nextHand'. The Copilot review flagged this as
+      // a stack-integrity bug: a rage-forfeit at hand-over hopped a decision
+      // point (start next hand vs. leave) and directly transferred chips.
+      const showForfeit = p.status === 'playing' && myPokerSeat(p) !== null;
+      const showNextHand = p.status === 'hand-over' && (myPokerSeat(p) !== null || p.bot);
+      const seat = myPokerSeat(p);
+      const inTurn = seat !== null && myPokerTurn(p);
+      const legal = inTurn ? legalActions(p, seat!) : [];
+      const toCall = seat !== null ? callAmount(p, seat) : 0;
+      const minB = minBet(p);
+      const minR = seat !== null ? minRaiseTo(p, seat) : 0;
+      cardFace = `
+        <div id="gt-card-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
+          p.status === 'playing' ? GT_GOLD_BRIGHT : p.status === 'waiting' ? GT_DIM : '#00E676'
+        };">${pokerStatusText(p)}</div>
+        <div style="font-size:9px; color:rgba(230,120,120,0.75); background:rgba(90,20,20,0.25); padding:6px 8px; border-radius:4px; line-height:1.4;">
+          ⚠ HOLE CARDS ARE TECHNICALLY PUBLIC in this v1 — the doc that syncs
+          the hand is visible to any peer inspecting it. Commit-reveal / chia-
+          gaming integration is a later slice.
+        </div>
+        <div style="display:flex; gap:8px;">
+          ${cardSeatCell('gt-poker-sit-button', `BUTTON — ${pokerSeatLabel(p, 'button')}`,
+            '#F0C060',
+            p.status === 'waiting' && p.players.button.id === null && p.players.bigBlind.id !== myId,
+            'Claim BUTTON (small blind)')}
+          ${cardSeatCell('gt-poker-sit-bb', `BIG BLIND — ${pokerSeatLabel(p, 'bigBlind')}`,
+            '#9AA3B2',
+            p.status === 'waiting' && p.players.bigBlind.id === null && !p.bot && p.players.button.id !== myId,
+            'Claim BIG BLIND')}
+        </div>
+        ${showBot ? `<div>${btn('gt-poker-bot', '⚙ VS BOT — PLAY ALONE', false, 'Heads-up against a trivial AI')}</div>` : ''}
+        ${showBegin ? `<div>${btn('gt-poker-begin', '▶ BEGIN MATCH', false, 'Deal hand #1 with 1000-chip starting stacks')}</div>` : ''}
+        ${cardCanvasHtml(false)}
+        ${inTurn ? `
+          <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+            ${legal.includes('fold') ? btn('gt-poker-fold', 'FOLD', false, 'Concede this hand') : ''}
+            ${legal.includes('check') ? btn('gt-poker-check', 'CHECK', false, 'Pass (no bet to call)') : ''}
+            ${legal.includes('call') ? btn('gt-poker-call', `CALL ${toCall}`, false, `Match the current bet (${toCall})`) : ''}
+            ${legal.includes('bet') || legal.includes('raise') ? `
+              <input id="gt-poker-amt" type="number" min="${legal.includes('bet') ? minB : minR}"
+                value="${pokerBetInput || (legal.includes('bet') ? String(minB) : String(minR))}"
+                style="width:70px; padding:5px 8px; background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.35); border-radius:4px; color:${GT_GOLD_BRIGHT}; font-family:inherit; font-size:11px;"
+                placeholder="chips" />
+              ${legal.includes('bet') ? btn('gt-poker-bet', `BET (min ${minB})`, false, 'Open the betting on this street') : ''}
+              ${legal.includes('raise') ? btn('gt-poker-raise', `RAISE TO (min ${minR})`, false, 'Increase the current bet') : ''}
+            ` : ''}
+          </div>` : ''}
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          ${showNextHand ? btn('gt-poker-next', '▶ NEXT HAND', false, 'Rotate button and deal') : ''}
+          ${showForfeit ? btn('gt-poker-forfeit', 'FORFEIT', false, 'Concede the match') : ''}
+          ${btn('gt-reset', 'RESET', !canClearTable(),
+            canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset')}
+        </div>`;
+    } else {
+      // A board-face game (checkers/chess) is on the OPPOSITE face.
+      const label = 'BOARD GAME';
+      cardFace = flipHint(label);
     }
 
     panel.innerHTML = `
@@ -1478,16 +2381,9 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         ${btn('gt-flip', '⟲ FLIP TABLE', !deps.top || flipping,
           deps.top ? 'Flip to the other playing surface' : 'This table top is not animatable')}
       </div>
-      ${cardsUp ? `
-      <div style="display:flex; flex-direction:column; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:14px 12px; background:rgba(10,24,14,0.5);">
-        <div style="font-size:11px; font-weight:800; color:${GT_GOLD_BRIGHT}; letter-spacing:1.5px;">♠ CARD FELT</div>
-        <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
-          NO DECK DEALT — war, two-player poker and solitaire arrive with the
-          games roadmap (brainstorming/games-plan.md). Flip back for the board games.
-        </div>
-      </div>` : boardFace}
+      ${cardsUp ? cardFace : boardFace}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
-        SSF GAME TABLE · chess (full rules, auto-queen) + checkers (American rules) · state synced via room doc · flip is per-player (only you see the other face)
+        SSF GAME TABLE · board face: chess + checkers · card face: war, solitaire, heads-up poker · state synced via room doc · flip is per-player (only you see the other face)
       </div>
     `;
 
@@ -1495,15 +2391,26 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       if (!deps.top || deps.top.isFlipping()) return;
       selected = null;
       chessSelected = null;
+      solitaireSource = null;
       deps.top.flip(() => render()); // completion swaps the panel face
       render();                      // immediate: show FLIPPING…
     });
-    // Picker.
+    // Board-face picker.
     panel.querySelector<HTMLButtonElement>('#gt-pick-chess')?.addEventListener('click', () => {
       if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialChessState());
     });
     panel.querySelector<HTMLButtonElement>('#gt-pick-checkers')?.addEventListener('click', () => {
       if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialState());
+    });
+    // Card-face picker.
+    panel.querySelector<HTMLButtonElement>('#gt-pick-war')?.addEventListener('click', () => {
+      if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialWarState(randomSeed()));
+    });
+    panel.querySelector<HTMLButtonElement>('#gt-pick-solitaire')?.addEventListener('click', () => {
+      if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialSolitaireState(randomSeed()));
+    });
+    panel.querySelector<HTMLButtonElement>('#gt-pick-poker')?.addEventListener('click', () => {
+      if (readTable(deps.itemId) === null) writeGame(deps.itemId, initialPokerState(randomSeed()));
     });
     // Checkers controls.
     panel.querySelector<HTMLButtonElement>('#gt-sit-red')?.addEventListener('click', () => claimSeat('red'));
@@ -1515,15 +2422,55 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#gt-chess-sit-black')?.addEventListener('click', () => claimChessSeat('black'));
     panel.querySelector<HTMLButtonElement>('#gt-chess-bot')?.addEventListener('click', () => startChessBotGame());
     panel.querySelector<HTMLButtonElement>('#gt-chess-forfeit')?.addEventListener('click', () => chessForfeit());
-    // Shared RESET → back to the picker (both kinds).
+    // War controls.
+    panel.querySelector<HTMLButtonElement>('#gt-war-sit-left')?.addEventListener('click', () => claimWarSeat('left'));
+    panel.querySelector<HTMLButtonElement>('#gt-war-sit-right')?.addEventListener('click', () => claimWarSeat('right'));
+    panel.querySelector<HTMLButtonElement>('#gt-war-bot')?.addEventListener('click', () => startWarBot());
+    panel.querySelector<HTMLButtonElement>('#gt-war-play')?.addEventListener('click', () => warPlayRound());
+    panel.querySelector<HTMLButtonElement>('#gt-war-forfeit')?.addEventListener('click', () => warForfeit());
+    // Solitaire controls.
+    panel.querySelector<HTMLButtonElement>('#gt-sol-sit')?.addEventListener('click', () => claimSolitaireSeat());
+    panel.querySelector<HTMLButtonElement>('#gt-sol-draw-1')?.addEventListener('click', () => doSetSolitaireDrawMode(1));
+    panel.querySelector<HTMLButtonElement>('#gt-sol-draw-3')?.addEventListener('click', () => doSetSolitaireDrawMode(3));
+    panel.querySelector<HTMLButtonElement>('#gt-sol-undo')?.addEventListener('click', () => doSolitaireUndo());
+    // Poker controls.
+    panel.querySelector<HTMLButtonElement>('#gt-poker-sit-button')?.addEventListener('click', () => claimPokerSeat('button'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-sit-bb')?.addEventListener('click', () => claimPokerSeat('bigBlind'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-bot')?.addEventListener('click', () => beginPokerMatch(true));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-begin')?.addEventListener('click', () => beginPokerMatch(false));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-fold')?.addEventListener('click', () => doPokerAction('fold'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-check')?.addEventListener('click', () => doPokerAction('check'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-call')?.addEventListener('click', () => doPokerAction('call'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-bet')?.addEventListener('click', () => doPokerAction('bet'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-raise')?.addEventListener('click', () => doPokerAction('raise'));
+    panel.querySelector<HTMLButtonElement>('#gt-poker-next')?.addEventListener('click', () => advancePokerHand());
+    panel.querySelector<HTMLButtonElement>('#gt-poker-forfeit')?.addEventListener('click', () => pokerForfeit());
+    const amtInput = panel.querySelector<HTMLInputElement>('#gt-poker-amt');
+    if (amtInput) {
+      // Store the bet-input value so re-renders don't wipe the user's typing.
+      amtInput.addEventListener('input', () => { pokerBetInput = amtInput.value; });
+      // A re-render right after typing sets the value from `pokerBetInput`;
+      // preserve caret position by not re-focusing here.
+    }
+    // Shared RESET → back to the picker (all kinds).
     panel.querySelector<HTMLButtonElement>('#gt-reset')?.addEventListener('click', () => clearToPicker());
+    // Board-face canvas (checkers / chess).
     boardCanvas = panel.querySelector<HTMLCanvasElement>('#gt-board');
     if (table?.kind === 'chess') {
       boardCanvas?.addEventListener('click', onChessBoardClick);
       drawChessBoard(table.state);
-    } else {
+    } else if (table?.kind === 'checkers' || table === null) {
       boardCanvas?.addEventListener('click', onBoardClick);
       drawBoard(table?.state ?? null);
+    }
+    // Card-face canvas (war / solitaire / poker).
+    cardCanvas = panel.querySelector<HTMLCanvasElement>('#gt-card-canvas');
+    if (cardCanvas) {
+      if (table?.kind === 'war') drawWarBoard(table.state);
+      else if (table?.kind === 'solitaire') {
+        cardCanvas.addEventListener('click', onSolitaireCanvasClick);
+        drawSolitaireBoard(table.state);
+      } else if (table?.kind === 'poker') drawPokerBoard(table.state);
     }
   };
 
@@ -1560,6 +2507,10 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       host.appendChild(panel);
       selected = null;
       botTimer = 0;
+      warBotTimer = 0;
+      pokerBotTimer = 0;
+      solitaireSource = null;
+      pokerBetInput = '';
       // Observer-driven repaint: doc changes (peer moves, claims, resets,
       // rebinds after a rejoin) re-render the whole panel from the doc.
       unsubscribe = subscribeGames(() => render());
@@ -1572,6 +2523,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       panel?.remove();
       panel = null;
       boardCanvas = null;
+      cardCanvas = null;
     },
 
     update(dt: number): void {
@@ -1599,9 +2551,49 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             if (move) writeGame(deps.itemId, applyChessMove(s, move));
           }
         } else chessBotTimer = 0;
+      } else if (t?.kind === 'war') {
+        // War bot: the LEFT claimant's client auto-plays rounds against the
+        // trivial "always play" bot at RIGHT. The bot's advantage is nil —
+        // this is just so the human doesn't have to click PLAY every round
+        // during a solo demo. Human vs human runs on manual PLAY clicks.
+        const s = t.state;
+        if (s.bot && s.status === 'playing' && s.players.left === myId
+            && s.leftDeck.length > 0 && s.rightDeck.length > 0) {
+          warBotTimer += dt;
+          if (warBotTimer >= 0.5) {
+            warBotTimer = 0;
+            writeGame(deps.itemId, playWarRound(s));
+          }
+        } else warBotTimer = 0;
+      } else if (t?.kind === 'poker') {
+        // Poker bot: the human claimant's client acts on the bot's behalf
+        // when it's the bot's turn. The bot is identified by a `null` id
+        // (mirrors checkers/chess conventions — see pokerSeatLabel).
+        // Pre-round-3 this hard-coded `'bigBlind'` as the bot seat AND
+        // required the human to be at BUTTON, so it stopped firing once
+        // dealHand rotated the seats on hand ≥ 2 — no client pumped, the
+        // bot froze mid-match, RESET was the only recovery.
+        const s = t.state;
+        const botSeat: PokerSeat | null =
+          s.players.button.id === null && s.players.bigBlind.id === myId ? 'button'
+          : s.players.bigBlind.id === null && s.players.button.id === myId ? 'bigBlind'
+          : null;
+        if (s.bot && s.status === 'playing' && botSeat !== null && s.toAct === botSeat) {
+          pokerBotTimer += dt;
+          if (pokerBotTimer >= 0.9) {
+            pokerBotTimer = 0;
+            const action = chooseBotAction(s, botSeat);
+            if (action) {
+              const next = applyPokerAction(s, action);
+              if (next !== s) writeGame(deps.itemId, next);
+            }
+          }
+        } else pokerBotTimer = 0;
       } else {
         botTimer = 0;
         chessBotTimer = 0;
+        warBotTimer = 0;
+        pokerBotTimer = 0;
       }
     },
   };
