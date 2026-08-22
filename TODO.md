@@ -31,6 +31,7 @@
 - [ ] Sprint 4 — chat UI (`ChatProvider`, session-capped demo), onboarding sequence, **host-sequenced** capsule claiming, polish/audio
 - [ ] [Issue #8](https://github.com/Bella-Addormentata/StarStationFurlong/issues/8) — character model demo
 - [ ] [Issue #12](https://github.com/Bella-Addormentata/StarStationFurlong/issues/12) — QR phone chat: capability skeleton early (challenge-bound QR, zxing-wasm decode), full UI later
+- [ ] **Unified T1 floor-occupancy claim (cross-PR #77 / #97 / #126)** — resolution when the fitness-coach routine (#97) and the CRDT stand claims (#126) both land. #97 lazily treats "open floor nearest room centre" as a class stage; #126 keeps CRDT-backed stand claims for table slots; two independent notions of "this floor is taken" that can double-book (a coach can hold a stage that a player's `pickStandForWalkup` believes is free). Land a single T1 **occupancy claim record**: one CRDT map keyed by floor cell / footprint id, whole-value LWW writes, single-writer-per-key (the claim's owner extends it, everyone else backs off), and a bounded TTL so an abandoned coach class doesn't wedge a stage forever. Route both the coach's stage acquisition and `pickStandForWalkup`'s slot pick through it. Scope note: PR #125's `robotScript.ts` scheduler is off-chain by construction and needs none of this today — the item exists so whichever merge order lands both routines cannot leave the double-book unresolved. Recorded per reviewer's PR #125 cross-PR note (2026‑08‑21).
 
 ## 📐 Design artifacts owed
 
