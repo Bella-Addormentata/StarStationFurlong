@@ -958,12 +958,34 @@ export function readCoinPusherEscrow(
  * record, write the escrow record — ALL in one transact(). Returns false when
  * the player is short of chips OR already has an outstanding request (one at
  * a time per player per machine; the operator settles before a new insert).
+ *
+ * ESCROW TIMESTAMP DISCIPLINE (audit r4 MINOR): `escrowedAt` is stamped from
+ * the submitter's OWN local wall clock (defaulting to Date.now()), NEVER from
+ * the client-provided `request.requestedAt` field. The distinction matters
+ * because `request.requestedAt` is peer-writable (an attacker who bypasses
+ * this helper and writes `pusher-req:<mid>:<pid>` directly can pick any value
+ * they want) — and even for the honest local caller, the wrapping helper is
+ * a value they COULD tamper with. Anchoring `escrowedAt` on a value this
+ * function chooses at write time closes both failure modes:
+ *   • `requestedAt = Number.MAX_SAFE_INTEGER` → prior code would stamp
+ *     `escrowedAt = MAX_SAFE_INTEGER`, permanently past every finite TTL
+ *     check → the submitter's own escrow would be un-refundable until the
+ *     server clock wrapped, effectively a self-DoS lockup of their chips.
+ *   • `requestedAt = 0` → prior code would stamp `escrowedAt = 0`, then any
+ *     nowMs >= PUSHER_REQUEST_TTL_MS refunds instantly → the submitter can
+ *     race the operator's own settle, hoping to double-recover their stake.
+ * The nowMs parameter defaults to Date.now() so callers do not have to plumb
+ * it; tests pass an explicit value for deterministic control.
  */
 export function submitCoinPusherInsert(
   machineId: string,
   request: PusherInsertRequest,
+  nowMs: number = Date.now(),
 ): boolean {
   if (!isPusherInsertRequest(request)) return false;
+  // The nowMs guard: reject non-finite / NaN clocks so downstream TTL math
+  // (nowRefund - escrow.escrowedAt) can never produce NaN.
+  if (typeof nowMs !== 'number' || !Number.isFinite(nowMs)) return false;
   const map = ensureMap();
   const balKey = `bal:${request.player}`;
   const reqKey = `pusher-req:${machineId}:${request.player}`;
@@ -975,7 +997,11 @@ export function submitCoinPusherInsert(
     requestId: request.requestId,
     player: request.player,
     ante: request.ante,
-    escrowedAt: request.requestedAt,
+    // SERVER-side timestamp: this function's own view of the clock at write
+    // time, INSIDE the transact that also debits bal and writes the request.
+    // Never `request.requestedAt` — see doc comment above for the two forgery
+    // scenarios that produces.
+    escrowedAt: nowMs,
   };
   boundDoc!.transact(() => {
     map.set(balKey, bal - request.ante);
@@ -987,10 +1013,9 @@ export function submitCoinPusherInsert(
 
 /**
  * Operator (owner) side: clear one request AND its escrow after processing.
- * Called from the SAME transact() as writeCoinPusherState, so the money side
- * (the escrow disappears — the chip is now part of chipsInMachine and rides
- * the state's totalInserted) is atomic with the physics side (the new pile
- * has the freshly-inserted chip).
+ * Standalone teardown used by test helpers and legacy call sites; the LIVE
+ * operator loop should use `publishAndClearCoinPusherInsert` below to keep
+ * the state publish and the request-clear inside ONE transact (audit r4).
  */
 export function clearCoinPusherInsert(
   machineId: string,
@@ -1002,6 +1027,40 @@ export function clearCoinPusherInsert(
     map.delete(`pusher-req:${machineId}:${playerId}`);
     map.delete(`pusher-esc:${machineId}:${playerId}:${requestId}`);
   });
+}
+
+/**
+ * Operator's atomic settle (audit r4 NOTE): publish `pusher:<mid>` AND delete
+ * both the request record and its escrow in ONE `transact()`. Prior code split
+ * these into two consecutive transacts — an unlikely but real interleaving
+ * failure between them (an exception thrown by delete, a crash, a concurrent
+ * map re-bind mid-tick) would leave the machine state carrying a chip the
+ * request record still claims, so the next drain would MINT a second copy of
+ * that chip into `pendingCredit`. Wrapping both sides in one transact makes
+ * the failure impossible in principle (Yjs commits the whole transact or
+ * none of it) and also makes remote peers see both effects in the same
+ * update-batch — no visible mid-state where the chip appears twice.
+ *
+ * Returns false when the state shape guard rejects `nextState` (never mutates
+ * the map in that case); true on a successful commit. Shape-check the state
+ * BEFORE opening the transact so a bad state cannot leak into the doc.
+ */
+export function publishAndClearCoinPusherInsert(
+  machineId: string,
+  nextState: CoinPusherState,
+  playerId: string,
+  requestId: string,
+): boolean {
+  if (!isCoinPusherState(nextState)) return false;
+  if (typeof playerId !== 'string' || playerId.length === 0 || playerId.length > 128) return false;
+  if (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 128) return false;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`pusher:${machineId}`, nextState);
+    map.delete(`pusher-req:${machineId}:${playerId}`);
+    map.delete(`pusher-esc:${machineId}:${playerId}:${requestId}`);
+  });
+  return true;
 }
 
 /**

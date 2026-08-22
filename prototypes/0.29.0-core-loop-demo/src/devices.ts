@@ -74,6 +74,7 @@ import {
   readCoinPusherState, writeCoinPusherState,
   readCoinPusherRequests, readCoinPusherRequest, readCoinPusherEscrow,
   submitCoinPusherInsert, clearCoinPusherInsert,
+  publishAndClearCoinPusherInsert,
   refundExpiredCoinPusherRequest, operatorRefundCoinPusherRequest,
   claimCoinPusherPayout, commitCoinPusherEmpty,
   subscribeCasinoKey, casinoPrefixWriteGeneration,
@@ -3779,12 +3780,41 @@ function seedFromRequestId(requestId: string): number {
  * owner as its `ownerId` — the operator loop then starts without the panel
  * ever having to open. The panel's mount() also calls this for the manual
  * "someone just walked up and clicked" flow.
+ *
+ * SELF-HEAL (audit r4 NOTE): the `pusher:<mid>` map slot is peer-writable,
+ * so a hostile peer could stamp a well-shaped state whose `ownerId` is not
+ * the true room owner — then `startCoinPusherOperator` would bail on the
+ * ownerId gate forever, permanently locking the cabinet from operation.
+ * When the local caller HAS room edit permission (`isHouse === true`) but
+ * observes a foreign `ownerId`, we take ownership by re-writing state with
+ * our own id while preserving chips-in-machine, piles, pendingCredit and
+ * counters. This same path recovers a room whose previous owner is offline
+ * (a new owner steps up and continues the machine).
+ *
+ * Ownership transfer preserves EVERY chip that was already inside the
+ * machine — the money conservation invariant is intact across the heal.
  */
 export function ensureCoinPusherInitialized(machineId: string, isHouse: boolean): boolean {
   if (!isHouse) return false;
-  if (readCoinPusherState(machineId)) return false;
-  writeCoinPusherState(machineId, initialCoinPusherState(getPlayerId(), Date.now()));
-  return true;
+  const myId = getPlayerId();
+  const existing = readCoinPusherState(machineId);
+  if (!existing) {
+    writeCoinPusherState(machineId, initialCoinPusherState(myId, Date.now()));
+    return true;
+  }
+  if (existing.ownerId !== myId) {
+    // Take over as operator. Preserves piles + pendingCredit + counters.
+    // Bumping `tick` here keeps monotonicity for any peer that was already
+    // watching `pusher:<mid>` — the transferred state is a NEW state event
+    // even though the visible chips did not move.
+    writeCoinPusherState(machineId, {
+      ...existing,
+      ownerId: myId,
+      tick: (existing.tick >>> 0) + 1,
+    });
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -3864,6 +3894,13 @@ export function isCoinPusherOperatorRunning(machineId: string): boolean {
  * TICK MONOTONICITY (audit finding #7): each publish is guarded so state.tick
  * strictly increases; a rare same-ms tick or dt<=0 no-op never leaves peers
  * observing a stale tick number.
+ *
+ * ATOMIC SETTLE (audit r4 NOTE): the per-insert settle uses
+ * `publishAndClearCoinPusherInsert` which wraps the state publish AND the
+ * request-clear in ONE Yjs transact. Splitting them into two consecutive
+ * transacts leaves a narrow interleaving window where the freshly-inserted
+ * chip is live in machine state but the request record survives, so a
+ * subsequent drain would re-process the request and mint a second chip.
  */
 function tickCoinPusherOperator(machineId: string): void {
   const op = coinPusherOperators.get(machineId);
@@ -3912,8 +3949,24 @@ function tickCoinPusherOperator(machineId: string): void {
           state, req.player, req.hole, req.timing, req.ante, seed, now,
         );
         state = result.state;
-        publishCoinPusherState(machineId, state, op);
-        clearCoinPusherInsert(machineId, req.player, req.requestId);
+        // Tick monotonicity: skip when the engine returned a same-tick state
+        // (e.g. a zero-cost no-op) — otherwise the atomic settle still runs
+        // to clear the request record from the queue.
+        const tick = state.tick >>> 0;
+        if (tick > op.lastTick) {
+          op.lastTick = tick;
+          // Atomic settle (audit r4 NOTE): publish new state AND delete both
+          // request + escrow records in ONE transact. Prior code split these
+          // into two consecutive transacts; a failure between them would
+          // leave the request record live while its chip was already in
+          // machine state, so the next drain would mint the chip again.
+          publishAndClearCoinPusherInsert(machineId, state, req.player, req.requestId);
+        } else {
+          // State did not advance a tick; still clear the request so the
+          // drain can move on. clearCoinPusherInsert wraps its delete in
+          // its own transact — no state-write race to worry about.
+          clearCoinPusherInsert(machineId, req.player, req.requestId);
+        }
       } catch (err) {
         console.warn('[coin-pusher] processInsert threw; refunding escrow and dropping request', err);
         // Refund the escrow to the player so we do not destroy their stake,
@@ -3994,6 +4047,10 @@ export function requestCoinPusherInsert(
   }
   const requestedAt = Date.now();
   const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
+  // Pass the same wall-clock reading as nowMs so escrowedAt is stamped from
+  // this peer's own clock (server-side stamp — see submitCoinPusherInsert's
+  // audit r4 header). requestedAt is a hint the operator can log; escrowedAt
+  // is the authoritative gate for the refund TTL.
   const ok = submitCoinPusherInsert(machineId, {
     requestId,
     player: myId,
@@ -4001,7 +4058,7 @@ export function requestCoinPusherInsert(
     timing,
     ante,
     requestedAt,
-  });
+  }, requestedAt);
   return ok ? { ok: true, requestId } : { ok: false, reason: 'insert refused (concurrent)' };
 }
 

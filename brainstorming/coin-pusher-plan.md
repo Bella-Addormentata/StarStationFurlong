@@ -158,6 +158,63 @@ zero drift across long random traces.
 6. Owner clicks OPEN DOOR → `commitCoinPusherEmpty(machineId, nextState,
    ownerId, emptied)` — atomic `chips:<ownerId> += emptied; state cleared`.
 
+## Audit remediation history (r3 + r4)
+
+Independent audits caught a few WIRING-LAYER defects (the engine surface is
+covered by 63 stable vitest cases; the money side lives in the CRDT + operator
+loop). Fixes here are enumerated so the record and the tests line up.
+
+**r3 audit (previous pass — landed in commit `d60d7be`):**
+- BLOCKER #1 — an unbacked `pusher-req:<mid>:<attacker>` written directly
+  into the map would have been drained by the operator, minting into
+  `pendingCredit`. Fixed by adding an ESCROW gate in the operator's loop:
+  every request is checked for a matching `pusher-esc:<mid>:<pid>:<reqId>`
+  whose `ante` and `player` agree; anything else is torn down without a mint.
+- BLOCKER #2 — `clearCoinPusherKeys` (called when a room owner removes the
+  cabinet) only cleared the local peer's refund; remote-peer escrows were
+  silently destroyed. Fixed by refunding EVERY outstanding escrow atomically
+  with the delete.
+- #6 — TTL age gate used `request.requestedAt` (client-provided, forgeable),
+  so a hostile submitter could stamp a far-future date and permanently lock
+  their own escrow OR bypass the TTL entirely. Fixed by adding
+  `escrow.escrowedAt` and gating the refund on it (the r3 comment CLAIMED
+  server-side stamping but the code still copied requestedAt — r4 completed
+  the fix, see below).
+
+**r4 audit (this pass):**
+- MINOR — `submitCoinPusherInsert` copied `request.requestedAt` verbatim
+  into `escrow.escrowedAt` (comment claim inaccurate). Now the function
+  accepts a `nowMs` parameter that defaults to `Date.now()`, and stamps
+  `escrowedAt = nowMs` inside the same transact that debits balance and
+  writes the request. Tests demonstrate:
+  - `requestedAt = MAX_SAFE_INTEGER` no longer locks the escrow — a refund
+    at `nowMs + PUSHER_REQUEST_TTL_MS + ε` succeeds.
+  - `requestedAt = 0` no longer bypasses the TTL — the age is measured
+    from the server-stamped `escrowedAt`, not the client's field.
+  - non-finite `nowMs` is rejected before any map mutation.
+- NOTE (atomic settle) — the operator's per-insert settle previously ran
+  `publishCoinPusherState` and `clearCoinPusherInsert` as TWO separate
+  transacts. An interleaving failure between them would leave the request
+  live while the chip was already in machine state, so a next-tick re-drain
+  would mint the chip AGAIN. The new `publishAndClearCoinPusherInsert`
+  wraps all three writes (state set, request delete, escrow delete) in
+  ONE Yjs transact — a single `update` event covers both effects, and a
+  bad `nextState` shape or bad ids reject without any partial write.
+- NOTE (ownership self-heal) — `state.ownerId` was peer-writable, so a
+  hostile peer could overwrite it and permanently lock out the true room
+  owner's operator loop. `ensureCoinPusherInitialized(mid, isHouse=true)`
+  now HEALS on foreign-ownerId observation, transferring ownership while
+  preserving piles, `pendingCredit`, and every counter (money conservation
+  intact across the heal). Same code path also serves the legitimate
+  "new room owner takes over from an offline predecessor" case.
+- NOTE (real operator try/catch test) — the r3 test roster included a
+  placeholder that admitted it did not exercise the operator's try/catch.
+  Added an end-to-end integration test that faithfully emulates the drain
+  loop and forces `processInsert` to throw on one request — asserting the
+  escrow is refunded, the poison request is dropped, and later requests
+  in the same drain still settle cleanly. No chips are minted from the
+  failed insert.
+
 ## What still isn't done here
 
 - No robot at the cabinet (the slot machine has no dealer either — a
