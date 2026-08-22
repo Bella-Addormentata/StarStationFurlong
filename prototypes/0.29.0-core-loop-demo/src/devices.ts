@@ -72,10 +72,11 @@ import {
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
   // 🪙 Coin pusher (#135) — insert/queue/escrow/state/payout wiring.
   readCoinPusherState, writeCoinPusherState,
-  readCoinPusherRequests, readCoinPusherRequest,
+  readCoinPusherRequests, readCoinPusherRequest, readCoinPusherEscrow,
   submitCoinPusherInsert, clearCoinPusherInsert,
-  refundExpiredCoinPusherRequest, claimCoinPusherPayout, commitCoinPusherEmpty,
-  subscribeCasinoKey,
+  refundExpiredCoinPusherRequest, operatorRefundCoinPusherRequest,
+  claimCoinPusherPayout, commitCoinPusherEmpty,
+  subscribeCasinoKey, casinoPrefixWriteGeneration,
 } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -106,7 +107,7 @@ import {
   initialCoinPusherState, chipsInMachine, currentPusherPhase,
   computeConservation, HOLE_COUNT, PUSHER_MAX_ANTE,
 } from './games/coinPusher';
-import type { PusherHole } from './games/coinPusher';
+import type { CoinPusherState, PusherHole } from './games/coinPusher';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -3721,14 +3722,53 @@ export interface CoinPusherUIDeps {
   onTriggerDropFx?(hole: PusherHole): void;
 }
 
-/** Timer identifier for the in-progress pusher operator loop; one per cabinet. */
+/** Timer identifier for the in-progress pusher operator loop; one per cabinet.
+ *
+ *  `lastQueueGen` tracks casinoDoc's prefix-scoped write-generation counter
+ *  for `pusher-req:<mid>:`. The queue-drain scan is O(N-map-keys), so we
+ *  skip it entirely when NO write has touched a matching key since we last
+ *  looked (audit finding #5). This is a strictly cheaper substitute for the
+ *  slotCroupier.ts docEpoch gate — the casinoDoc counter bumps on writes
+ *  (not just rebinds), so a busy room with many machines only scans the map
+ *  when a request actually lands.
+ *  `lastTick` is the machine's own monotonic tick counter at the last publish;
+ *  we clamp the outgoing state.tick so a wall-clock hiccup or a same-ms tick
+ *  never publishes a NON-monotonic tick number (audit finding #7). */
 interface CoinPusherOperator {
   running: boolean;
   intervalId: number;
   lastTickAt: number;
+  lastQueueGen: number;
+  lastTick: number;
 }
 
 const coinPusherOperators = new Map<string, CoinPusherOperator>();
+
+/**
+ * Derive the physics seed from the request's UUID-bearing `requestId` string
+ * (`${ts.toString(36)}-${crypto.randomUUID()}` — see requestCoinPusherInsert).
+ * A wall-clock second is NEVER used as an ingredient (audit finding #3): a
+ * hostile operator could otherwise delay the tick until a favourable clock
+ * second to pre-compute an unfavourable trajectory for a specific hole+timing.
+ * Two honest requests within the same second stay distinct because the UUID
+ * differs. The hash is deliberately FNV-1a — non-cryptographic, but the seed
+ * is not a secret; determinism + wide distribution is what the peg field
+ * demands. This function is pure — no wall-clock, no Math.random.
+ */
+function seedFromRequestId(requestId: string): number {
+  // FNV-1a 32-bit over every UTF-16 code unit of the requestId. Even a short
+  // requestId (24+ chars for the timestamp + hyphen + 36 char UUID) mixes
+  // ~48 code units into the accumulator, well above the state entropy the
+  // peg field consumes (5 rows × 1 bit = 5 bits).
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < requestId.length; i++) {
+    h ^= requestId.charCodeAt(i) & 0xff;
+    h = Math.imul(h, 16777619) >>> 0;
+    h ^= (requestId.charCodeAt(i) >>> 8) & 0xff;
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
 
 /**
  * Idempotent init: writes an `initialCoinPusherState` for `machineId` if none
@@ -3762,8 +3802,15 @@ export function startCoinPusherOperator(machineId: string): void {
   const op: CoinPusherOperator = {
     running: true,
     lastTickAt: Date.now(),
+    // Seed the queue-gen cache at -1 so the FIRST tick unconditionally scans
+    // (any submit that landed BEFORE we started is picked up).
+    lastQueueGen: -1,
+    lastTick: state0.tick >>> 0,
     intervalId: window.setInterval(() => tickCoinPusherOperator(machineId), 250),
   };
+  // Register the prefix so the write-generation counter tracks it from now on
+  // (creates the counter at 0 if this is the first observer).
+  casinoPrefixWriteGeneration(`pusher-req:${machineId}:`);
   coinPusherOperators.set(machineId, op);
 }
 
@@ -3781,9 +3828,42 @@ export function isCoinPusherOperatorRunning(machineId: string): boolean {
 }
 
 /**
- * One operator step: process queued inserts, then advance free-running
- * physics by the elapsed wall-clock delta. Every publish uses the atomic
- * money-and-state helpers in casinoDoc so conservation holds across peers.
+ * One operator step: process queued inserts (each gated on a matching escrow,
+ * with per-request try/catch so one bad record cannot deadlock the queue),
+ * then advance free-running physics by the elapsed wall-clock delta. Every
+ * publish uses the atomic money-and-state helpers in casinoDoc so conservation
+ * holds across peers.
+ *
+ * REQUEST-ESCROW BINDING (audit finding #1): the queue drain scans requests
+ * from the shared casino map — a hostile peer can write a `pusher-req:<mid>:
+ * <attacker>` record DIRECTLY, without ever going through submitCoinPusherInsert.
+ * Such a request has no matching `pusher-esc:<mid>:<attacker>:<reqId>` escrow
+ * (and no `bal:<attacker>` debit either). Before calling processInsert (which
+ * increments totalInserted, credits pendingCredit, and gets to claim real
+ * chips), we MUST verify a matching escrow exists. Without this gate anyone
+ * with write access to the casino map can silently MINT chips into their own
+ * pendingCredit and then claim real balance.
+ *
+ * POISON-REQUEST ISOLATION (audit finding #4): processInsert throws on some
+ * hostile shapes (e.g. RangeError for out-of-range ante). If a throw
+ * propagates out of the tick callback the browser's setInterval swallows it
+ * and reschedules — because readCoinPusherRequests sorts by requestId, any
+ * poisoned earlier request blocks EVERY later request behind it in perpetuity.
+ * Wrap each request in try/catch: on throw we refund the escrow (if any) and
+ * drop the record so the drain can continue.
+ *
+ * SEED DERIVATION (audit finding #3): seed derives from `req.requestId` (which
+ * embeds a UUID), NEVER from the wall clock — a hostile operator otherwise
+ * chooses the seed by delaying the tick to a favourable second.
+ *
+ * EPOCH-GATED POLL (audit finding #5): we skip the queue scan on ticks where
+ * the casinoDoc epoch has not advanced since the last drain (the same idle-
+ * poll gate slotCroupier.ts uses). The physics substep still runs so
+ * free-running sweep animation stays live.
+ *
+ * TICK MONOTONICITY (audit finding #7): each publish is guarded so state.tick
+ * strictly increases; a rare same-ms tick or dt<=0 no-op never leaves peers
+ * observing a stale tick number.
  */
 function tickCoinPusherOperator(machineId: string): void {
   const op = coinPusherOperators.get(machineId);
@@ -3795,17 +3875,59 @@ function tickCoinPusherOperator(machineId: string): void {
     return;
   }
   const now = Date.now();
-  // 1) Drain insert queue oldest-first (stable order under concurrent submits).
-  const requests = readCoinPusherRequests(machineId);
-  for (const req of requests) {
-    // The engine's processInsert stamps totalInserted + spawns the chip;
-    // clearCoinPusherInsert atomically removes the request record + escrow.
-    const seed = (Math.floor(now / 1000) ^ (req.requestedAt >>> 0)) >>> 0;
-    const result = processInsert(state, req.player, req.hole, req.timing, req.ante, seed, now);
-    state = result.state;
-    writeCoinPusherState(machineId, state);
-    clearCoinPusherInsert(machineId, req.player, req.requestId);
+
+  // 1) Drain insert queue — but ONLY when the pusher-req:<mid>: prefix has
+  //    been written since our last scan. The map iteration is O(all keys) so
+  //    this saves work on the common idle path (no one submitting).
+  const queueGen = casinoPrefixWriteGeneration(`pusher-req:${machineId}:`);
+  if (queueGen !== op.lastQueueGen) {
+    op.lastQueueGen = queueGen;
+    const requests = readCoinPusherRequests(machineId);
+    for (const req of requests) {
+      // ── Mint guard: verify the ESCROW record. Skip the request otherwise
+      //    (do NOT clearCoinPusherInsert — if the escrow is momentarily
+      //    absent due to concurrent submits we retry next tick; a genuinely
+      //    unbacked request either has no matching pusher-esc key AT ALL
+      //    or the escrow's ante/player disagrees, and operatorRefund below
+      //    tears it down when the try/catch fires).
+      const esc = readCoinPusherEscrow(machineId, req.player, req.requestId);
+      if (!esc || esc.player !== req.player || esc.ante !== req.ante) {
+        // Unbacked request: someone bypassed submitCoinPusherInsert. Refund
+        // any matching escrow (none exists, so this is a pure teardown) and
+        // clear the poison request so it does not permanently block the
+        // queue behind it.
+        try {
+          operatorRefundCoinPusherRequest(machineId, req.player, req.requestId);
+        } catch (err) {
+          console.warn('[coin-pusher] operator refund threw on unbacked request', err);
+        }
+        continue;
+      }
+
+      // ── Poison-shape guard: try/catch around the pure engine so one bad
+      //    ante / hole / timing cannot halt the queue drain.
+      try {
+        const seed = seedFromRequestId(req.requestId);
+        const result = processInsert(
+          state, req.player, req.hole, req.timing, req.ante, seed, now,
+        );
+        state = result.state;
+        publishCoinPusherState(machineId, state, op);
+        clearCoinPusherInsert(machineId, req.player, req.requestId);
+      } catch (err) {
+        console.warn('[coin-pusher] processInsert threw; refunding escrow and dropping request', err);
+        // Refund the escrow to the player so we do not destroy their stake,
+        // then delete the request record so the drain can continue on the
+        // next tick.
+        try {
+          operatorRefundCoinPusherRequest(machineId, req.player, req.requestId);
+        } catch (refundErr) {
+          console.warn('[coin-pusher] refund also threw; leaving records for reconcile', refundErr);
+        }
+      }
+    }
   }
+
   // 2) Free-running physics — pusher keeps sweeping between inserts so any
   //    chip already near the tray edge eventually tips (the "attract-mode"
   //    behaviour real coin pushers show while idle). Payouts that tip off
@@ -3826,9 +3948,24 @@ function tickCoinPusherOperator(machineId: string): void {
     if (advanced.paidChipIds.length > 0
       || advanced.state.tick !== state.tick) {
       state = advanced.state;
-      writeCoinPusherState(machineId, state);
+      publishCoinPusherState(machineId, state, op);
     }
   }
+}
+
+/** Publish a new machine state, but only when `state.tick` STRICTLY exceeds
+ *  the last-published tick — protects peers from a same-ms tick or a monotonic-
+ *  clock hiccup that would otherwise let two writes race with the same tick
+ *  number, breaking naive tick-based dedupers (audit finding #7). */
+function publishCoinPusherState(
+  machineId: string,
+  state: CoinPusherState,
+  op: CoinPusherOperator,
+): void {
+  const tick = state.tick >>> 0;
+  if (tick <= op.lastTick) return;
+  op.lastTick = tick;
+  writeCoinPusherState(machineId, state);
 }
 
 /** Return currentPusherPhase(state) so external UI can preview the sweep. */
@@ -4189,9 +4326,13 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   };
 }
 
-/** Called from world.ts teardown paths for a removed coin pusher — refunds any
- *  outstanding escrows to their owners and shuts the local operator loop. The
- *  casinoDoc key-clear happens in world.ts alongside furniture removal. */
+/** Called from world.ts teardown paths for a removed coin pusher — shuts the
+ *  local operator loop. The atomic delete-and-refund for EVERY outstanding
+ *  escrow now happens inside casinoDoc.clearCoinPusherKeys (audit finding #2);
+ *  we keep the local-peer refund as a redundant safety net for the (rare)
+ *  path where a caller invokes only this helper without clearCoinPusherKeys —
+ *  refundExpiredCoinPusherRequest is a no-op when the escrow has already
+ *  been cleared, so this stays idempotent. */
 export function clearPendingCoinPusherPlays(machineId: string): void {
   stopCoinPusherOperator(machineId);
   const reqs = readCoinPusherRequests(machineId);

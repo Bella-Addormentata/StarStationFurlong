@@ -73,10 +73,65 @@ export interface CrapsTableBets {
 let boundDoc: Y.Doc | null = null;
 let casinoMap: Y.Map<unknown> | null = null;
 let bindingEpoch = 0;
+/** Bumped on EVERY casino-map write (including remote peer writes) and on
+ *  every bind. Cheap polling gates (the coin-pusher operator tick, any code
+ *  that wants "did anything change since I last looked?") compare against
+ *  their last-observed value — skipping full-map scans on the common idle
+ *  path where nothing moved. Distinct from `bindingEpoch`, which only tracks
+ *  rebinds (a re-join). Wraps at 2^32 via `>>> 0` for stable equality tests. */
+let writeGeneration = 0;
 const listeners = new Set<() => void>();
 const keyListeners = new Map<string, Set<() => void>>();
+/** Prefix-matched change-generation counters. Callers observing "did any
+ *  key starting with X change?" register the prefix once via
+ *  `casinoPrefixWriteGeneration(prefix)` and compare against their last
+ *  value. This is the O(N) fallback when a per-key subscription is not
+ *  possible because the exact key set is unknown at subscribe time (e.g.
+ *  the coin-pusher operator does not know which `pusher-req:<mid>:*` keys
+ *  will exist). Counters are lazily created on first read. */
+const prefixWriteGenerations = new Map<string, number>();
+
+function bumpPrefixGenerations(changedKeys?: ReadonlySet<string>): void {
+  if (!changedKeys || prefixWriteGenerations.size === 0) {
+    // Full bump on unknown / rebind — every registered prefix should re-scan.
+    for (const key of prefixWriteGenerations.keys()) {
+      prefixWriteGenerations.set(key, (prefixWriteGenerations.get(key) ?? 0) + 1);
+    }
+    return;
+  }
+  for (const prefix of prefixWriteGenerations.keys()) {
+    // Cheap: if ANY changed key starts with this prefix, bump. Prefixes are
+    // typically 1–3 per process (one per active operator).
+    for (const changed of changedKeys) {
+      if (changed.startsWith(prefix)) {
+        prefixWriteGenerations.set(prefix, (prefixWriteGenerations.get(prefix) ?? 0) + 1);
+        break;
+      }
+    }
+  }
+}
+
+/** Current write-generation counter — bumped on every casino write. Cheap
+ *  poll gate (see `writeGeneration` doc). */
+export function casinoWriteGeneration(): number {
+  return writeGeneration >>> 0;
+}
+
+/** Current change-generation for keys starting with `prefix`. Lazily
+ *  registered on first read. Useful when a caller needs to poll "did any
+ *  `pusher-req:<mid>:*` change" without a per-key subscription. */
+export function casinoPrefixWriteGeneration(prefix: string): number {
+  const g = prefixWriteGenerations.get(prefix);
+  if (g === undefined) {
+    prefixWriteGenerations.set(prefix, 0);
+    return 0;
+  }
+  return g >>> 0;
+}
 
 function notify(changedKeys?: ReadonlySet<string>): void {
+  writeGeneration = (writeGeneration + 1) >>> 0;
+  bumpPrefixGenerations(changedKeys);
   // Copy + isolate (the furnitureDoc/gamesDoc guard): a listener may
   // unsubscribe mid-notify, and one throwing render must not kill the rest
   // or Yjs's transaction cleanup.
@@ -955,6 +1010,13 @@ export function clearCoinPusherInsert(
  * PUSHER_REQUEST_TTL_MS. Only the request's OWNER may call this, and only
  * when the escrow + request records both match. Returns the refunded chip
  * count so the caller can surface it to the user.
+ *
+ * TTL is gated on `escrow.escrowedAt` (SERVER-side timestamp stamped by
+ * submitCoinPusherInsert inside the same transact that wrote the escrow),
+ * NEVER on `request.requestedAt` (which is a client-provided value a hostile
+ * peer can stamp in the far future to permanently lock the escrow — audit
+ * finding #6). Both records must still match player + requestId; if either
+ * is missing, we treat it as already reconciled and return 0.
  */
 export function refundExpiredCoinPusherRequest(
   machineId: string,
@@ -965,9 +1027,10 @@ export function refundExpiredCoinPusherRequest(
   const map = ensureMap();
   const req = readCoinPusherRequest(machineId, playerId);
   if (!req) return 0;
-  if (nowMs - req.requestedAt < PUSHER_REQUEST_TTL_MS) return 0;
   const esc = readCoinPusherEscrow(machineId, playerId, req.requestId);
   if (!esc || esc.ante !== req.ante) return 0;
+  // Age from ESCROW time (server-side), not requestedAt (client-side, forgeable).
+  if (nowMs - esc.escrowedAt < PUSHER_REQUEST_TTL_MS) return 0;
   const balKey = `bal:${playerId}`;
   const bal = safeCount(map, balKey);
   if (!Number.isSafeInteger(bal + req.ante)) return 0;
@@ -977,6 +1040,55 @@ export function refundExpiredCoinPusherRequest(
     map.set(balKey, bal + req.ante);
   });
   return req.ante;
+}
+
+/**
+ * Operator-initiated refund: same money-side effect as
+ * refundExpiredCoinPusherRequest but WITHOUT the TTL age gate. Reserved for
+ * the machine owner (operator) when they detect a request they cannot
+ * process — e.g. a poison record that threw inside the engine, or a request
+ * whose escrow is missing / mismatched. Callers MUST verify their operator
+ * authority before invoking; this helper is a wiring-layer trust primitive.
+ *
+ * Refunds only when a matching escrow exists (mint/burn safety); if the
+ * escrow is absent or mismatched we treat the record as unbacked and simply
+ * clear it without minting chips. Returns the chip count actually refunded
+ * (0 when no escrow existed or the balance would overflow).
+ */
+export function operatorRefundCoinPusherRequest(
+  machineId: string,
+  playerId: string,
+  requestId: string,
+): number {
+  if (typeof playerId !== 'string' || playerId.length === 0 || playerId.length > 128) return 0;
+  if (typeof requestId !== 'string' || requestId.length === 0 || requestId.length > 128) return 0;
+  const map = ensureMap();
+  const req = readCoinPusherRequest(machineId, playerId);
+  const esc = readCoinPusherEscrow(machineId, playerId, requestId);
+  // If the caller passed a request id that no longer matches the outstanding
+  // request record, we STILL delete the escrow (if any) and the stale request.
+  // But we only refund when the escrow's ante is a safe positive integer.
+  if (!esc) {
+    // No escrow to unlock — safely drop both keys (idempotent teardown).
+    boundDoc!.transact(() => {
+      if (req && req.requestId === requestId) {
+        map.delete(`pusher-req:${machineId}:${playerId}`);
+      }
+      map.delete(`pusher-esc:${machineId}:${playerId}:${requestId}`);
+    });
+    return 0;
+  }
+  const balKey = `bal:${playerId}`;
+  const bal = safeCount(map, balKey);
+  if (!Number.isSafeInteger(bal + esc.ante)) return 0;
+  boundDoc!.transact(() => {
+    if (req && req.requestId === requestId) {
+      map.delete(`pusher-req:${machineId}:${playerId}`);
+    }
+    map.delete(`pusher-esc:${machineId}:${playerId}:${requestId}`);
+    map.set(balKey, bal + esc.ante);
+  });
+  return esc.ante;
 }
 
 /**
@@ -1032,15 +1144,68 @@ export function commitCoinPusherEmpty(
   return true;
 }
 
-/** Remove every casino-map key that belongs to a coin pusher (teardown on
- *  item removal). Refunding outstanding escrows to the affected peers is the
- *  CALLER's job — call refundExpiredCoinPusherRequest per outstanding request
- *  before this so no chip is silently minted or burned. */
+/**
+ * Remove every casino-map key that belongs to a coin pusher AND refund every
+ * outstanding escrow to its owning peer's `bal:<pid>` — all in ONE transact()
+ * so the delete-and-refund pair is atomic (a remote peer observes the update
+ * only after every affected balance has been re-credited).
+ *
+ * Prior behaviour (audit finding #2) deferred refunds to the CALLER — but
+ * `world.ts`'s furniture-removal path only calls the LOCAL peer's refund
+ * helper. When peer A removes a cabinet while peer B has an outstanding
+ * escrow, Yjs delivers A's key-deletion update to B in a single applyUpdate
+ * transaction; B's observer then sees an already-empty casino map, so B's
+ * own reconciler finds nothing to refund. B's chips are silently destroyed.
+ *
+ * The fix: on ANY peer, when this function runs (locally as A does the
+ * removal, or downstream as B replays A's update via a peer-side teardown),
+ * iterate every outstanding escrow record and re-credit `bal:<player>` in
+ * the same transact() as the delete. Because Y.Map balance writes are
+ * whole-value LWW keyed by peer id, both A and B compute the same final
+ * balance — B's replayed writes are idempotent with A's. No chip is minted
+ * (we credit exactly what escrow.ante records) and no chip is burned (every
+ * unprocessed escrow is refunded before its key vanishes).
+ */
 export function clearCoinPusherKeys(machineId: string): void {
   const map = ensureMap();
   const reqPrefix = `pusher-req:${machineId}:`;
   const escPrefix = `pusher-esc:${machineId}:`;
+
+  // Collect escrows to refund BEFORE mutating; each entry is (balKey, plusN).
+  // We de-duplicate per-player because two-plus escrows for the same player
+  // would each want to bump `bal:<pid>`; last-writer-wins per key inside the
+  // transact means the second write would overwrite the first without adding.
+  // Aggregate the refund per player and issue one balance write per player.
+  const refundByPlayer = new Map<string, number>();
+  for (const [key, value] of map.entries()) {
+    if (!key.startsWith(escPrefix)) continue;
+    if (!isPusherEscrow(value)) continue;
+    // Cross-key sanity: `pusher-esc:<mid>:<pid>:<reqId>`. The player field
+    // in the value MUST match the <pid> segment in the key or we discard —
+    // guards against a hostile peer stapling another player's id to their
+    // own escrow value.
+    const tail = key.slice(escPrefix.length);
+    const colon = tail.indexOf(':');
+    if (colon <= 0) continue;
+    const pid = tail.slice(0, colon);
+    if (value.player !== pid) continue;
+    // Safe integer accumulation: PILE_MAX_CHIPS-scale escrows never overflow,
+    // but be defensive against a hostile peer that wrote MAX_SAFE_INTEGER.
+    const prev = refundByPlayer.get(pid) ?? 0;
+    const next = prev + (value.ante as number);
+    if (!Number.isSafeInteger(next)) continue;
+    refundByPlayer.set(pid, next);
+  }
+
   boundDoc!.transact(() => {
+    // 1) Credit each peer for the total of their outstanding escrows.
+    for (const [pid, refund] of refundByPlayer) {
+      const balKey = `bal:${pid}`;
+      const bal = safeCount(map, balKey);
+      if (!Number.isSafeInteger(bal + refund)) continue;
+      map.set(balKey, bal + refund);
+    }
+    // 2) Delete every pusher-scoped key (state + requests + escrows).
     map.delete(`pusher:${machineId}`);
     for (const key of [...map.keys()]) {
       if (key.startsWith(reqPrefix) || key.startsWith(escPrefix)) map.delete(key);
@@ -1070,7 +1235,8 @@ if (typeof window !== 'undefined') {
     readCoinPusherState, writeCoinPusherState,
     readCoinPusherRequests, readCoinPusherRequest, readCoinPusherEscrow,
     submitCoinPusherInsert, clearCoinPusherInsert,
-    refundExpiredCoinPusherRequest, claimCoinPusherPayout,
+    refundExpiredCoinPusherRequest, operatorRefundCoinPusherRequest,
+    claimCoinPusherPayout,
     commitCoinPusherEmpty, clearCoinPusherKeys,
   };
 }
