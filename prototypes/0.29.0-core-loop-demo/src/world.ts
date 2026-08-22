@@ -85,6 +85,12 @@ import { roomHalfExtents, roomWalkBounds, readRoomDims } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
+// 🗺️ #33 M-station: the small-station cap governs the wall-computer overview.
+// The traversal must reach at least SMALL_STATION_MAX neighbours so we can
+// tell a 12-module chain from a 13-module one — otherwise a chain longer than
+// the traversal limit would silently classify as small and paint an
+// incomplete overview. See wallComputerMap.ts and PR #133 review.
+import { SMALL_STATION_MAX } from "./wallComputerMap";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -5081,11 +5087,20 @@ export class World {
         // captured snapshot) so an atlas gossip landing mid-focus shows up on
         // the pane's next refresh tick. Passes atlasLayout in the CURRENT
         // room's frame — the same call the exterior composes hulls from.
+        //
+        // 🛰️ maxHops = SMALL_STATION_MAX (12). The atlas walker terminates
+        // when the frontier exceeds `from.hops >= maxHops`, so passing 12
+        // discovers up to 12 neighbours — enough to fill a small station
+        // (current + 11 = 12) AND find the 13th module that flips the pane
+        // into "USE MAP TABLE". Anything below the cap silently truncates a
+        // chain (e.g. the previous 8 dropped the last 3 modules of a 12-module
+        // chain, painting a partial map while advertising the whole overview).
         station: {
           getRoomId: () => World.activeRoomId(),
           getRoomName: () => readLiveRoomStatus().roomName,
           getRoomDims: () => readRoomDims(),
-          getAtlasPoses: () => atlasLayout(World.activeRoomId(), 8),
+          getAtlasPoses: () =>
+            atlasLayout(World.activeRoomId(), SMALL_STATION_MAX),
         },
       });
       deviceFocus.beginFocus(this.player, device, ui);

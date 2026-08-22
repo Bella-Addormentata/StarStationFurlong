@@ -101,17 +101,33 @@ player to the M4 device.
 
 - Renders the whole set via a `fitPointsToCanvas` viewport transform so a
   crooked or off-centre layout still lands centred with equal aspect ratio.
-- Draws each module as an oriented outline (uses the atlas pose's `rotY`) with
-  a small dot at the module centre, its display name below, and hop count
-  from the current room next to it.
+- Draws each module as an oriented outline (uses the atlas pose's `rotY`, in
+  the same rotation convention as `atlasLayout` and Three.js `rotation.y` so
+  the pane and the exterior view agree on which end is which) with a small
+  dot at the module centre, its display name below, and hop count from the
+  current room next to it.
 - Colours the CURRENT module with the same gold as the EDIT ROOM button so
   "you are here" reads at a glance; neighbours get the same cool cyan every
   wireframe surface uses.
-- Uses `readAllDoorLayout` + `physicalDoorPose` to mark this module's own
-  doors on both wireframes (already the case for the room-only pane).
+- **Doors stay on the room wireframe only.** The room-only pane above already
+  paints this module's doors from `readAllDoorLayout` + `physicalDoorPose`;
+  the station overview deliberately shows footprint + centre + name + hop
+  badge only — door markers on the inset would read as noise at station scale
+  and there is no gossiped door geometry for neighbours worth drawing until
+  the map table's STATION page (Stage C) picks up connector chains too.
+- **Honest dims envelope.** The pane treats a neighbour's `dims` as unknown
+  unless it passes the same integer range the room contract enforces (1..5
+  tiles each axis, per `floorPlanDoc.ROOM_TILE_MIN/MAX`), so hostile or older
+  localStorage entries fall back to the dashed uniform outline rather than
+  collapsing or blowing out the fit.
 - **No new network traffic.** Uses the already-populated atlas — the same
   data the exterior renders and the docking-pane keypad's KNOWN MODULES list
   already reads.
+- **Traversal depth pinned to `SMALL_STATION_MAX`.** The BFS runs at least as
+  far as the small-station cap so a straight 12-module chain reads as small
+  and the first over-cap module can still trigger `USE MAP TABLE` — a
+  shallower cap silently truncated the last modules of long chains and
+  advertised a partial map as the whole overview.
 
 The station overview is derived by **pure helpers** in `wallComputerMap.ts`
 (the module the tests target):
@@ -122,27 +138,41 @@ export interface StationModulePlacement {
   name: string;
   x: number;         // world-space centre of the module
   z: number;
-  rotY: number;      // module orientation
+  rotY: number;      // module orientation (atlasLayout / Three.js convention)
   halfX: number;     // module footprint half-extent along its local X
   halfZ: number;     // …and along its local Z
   isCurrent: boolean;
   hops: number;      // 0 for the current room
+  dimsUnknown: boolean; // true when the module was rendered at the fallback size
 }
 
-// Compose the current room + atlas poses into one placement list.
+// Compose the current room + atlas poses into one placement list. The
+// currentName is inserted between the id and the dims so the pane can label
+// the "you are here" cell with the room's display name (the room-status
+// read that owns that name lives in the DOM adapter, not this pure helper).
+// currentDims may be null / undefined — the placement then reads with
+// dimsUnknown = true and the fallback outline is drawn.
 export function stationPlacements(
   currentRoomId: string,
-  currentDims: RoomDims | null,
+  currentName: string,
+  currentDims: RoomDims | null | undefined,
   poses: AtlasPose[],
 ): StationModulePlacement[];
 
 // Rotate + translate a module's oriented rectangle into world-space corners.
+// Uses the atlas / Three.js `rotation.y` convention:
+//   x' = x·cos + z·sin
+//   z' = -x·sin + z·cos
+// so the projected footprint agrees with the exterior view for the same pose.
 export function projectModuleFootprintCorners(
   placement: PlacementPose,
 ): Array<{ x: number; z: number }>;
 
 // Fit a set of world-space points into a square canvas with padding, keeping
 // the aspect ratio (equal x/z scale) and bounding the scale within [min,max].
+// Both bounds are optional; the wall computer passes only `maxScale`, letting
+// the fit decide the lower end so an ~200 m 12-module chain still lands
+// inside the padded canvas.
 export interface Viewport { scale: number; offsetX: number; offsetZ: number; }
 export function fitPointsToCanvas(
   points: Array<{ x: number; z: number }>,
@@ -153,6 +183,13 @@ export function fitPointsToCanvas(
 
 export const SMALL_STATION_MAX = 12;
 export function isSmallStation(count: number): boolean;
+// Whether a RoomDims value passes the room contract envelope (integer axes
+// in ROOM_TILE_MIN..ROOM_TILE_MAX = 1..5). Every unvalidated read of dims
+// (atlas gossip, localStorage) must go through this before being drawn.
+export function areDimsRoomValid(dims: RoomDims | null | undefined): boolean;
+export function moduleHalfExtents(
+  dims: RoomDims | null | undefined,
+): { halfX: number; halfZ: number; usedFallback: boolean };
 ```
 
 The DOM UI walks the placements, calls `projectModuleFootprintCorners` for

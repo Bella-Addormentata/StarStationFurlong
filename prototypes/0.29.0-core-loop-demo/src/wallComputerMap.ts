@@ -24,7 +24,10 @@
  */
 
 import type { AtlasPose } from './stationAtlas';
-import { DEFAULT_DIMS, TILE_SIZE, type RoomDims } from './floorPlanDoc';
+import {
+  DEFAULT_DIMS, ROOM_TILE_MAX, ROOM_TILE_MIN, TILE_SIZE,
+  type RoomDims,
+} from './floorPlanDoc';
 
 // ── 🎯 Small-station threshold ────────────────────────────────────────────────
 
@@ -50,15 +53,40 @@ export function isSmallStation(moduleCount: number): boolean {
  *  helpers must not import from the atlas file's internals just to reuse it. */
 export const MODULE_HALF_FALLBACK = 5.9;
 
+/** The room contract in floorPlanDoc allows only integer tile counts in
+ *  [ROOM_TILE_MIN, ROOM_TILE_MAX] (1..5). Anything else — non-integer, out of
+ *  range, non-numeric, or hostile localStorage — collapses or blows out the
+ *  footprint, so this pane treats it as "we don't know this module's size" and
+ *  falls back to the uniform MODULE_HALF_FALLBACK box. readAtlas() is
+ *  UNVALIDATED (localStorage can hold anything an older / hostile client
+ *  wrote), and this is the last line of defence before the value drives the
+ *  canvas fit. */
+export function areDimsRoomValid(dims: RoomDims | null | undefined): boolean {
+  if (!dims) return false;
+  const inRange = (n: unknown): boolean =>
+    typeof n === 'number' && Number.isInteger(n)
+    && n >= ROOM_TILE_MIN && n <= ROOM_TILE_MAX;
+  return inRange(dims.cols) && inRange(dims.rows);
+}
+
 /** A module's half-extents (metres) from its tile dims: halfX = cols · 3,
- *  halfZ = rows · 3 (TILE_SIZE / 2). Missing / hostile dims fall back to
- *  MODULE_HALF_FALLBACK on BOTH axes — the same discipline readRoomDims uses
- *  for the room-local plan. */
-export function moduleHalfExtents(dims: RoomDims | null | undefined): { halfX: number; halfZ: number } {
-  if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) {
-    return { halfX: MODULE_HALF_FALLBACK, halfZ: MODULE_HALF_FALLBACK };
+ *  halfZ = rows · 3 (TILE_SIZE / 2). Missing / hostile / out-of-envelope dims
+ *  fall back to MODULE_HALF_FALLBACK on BOTH axes — the same envelope
+ *  readRoomDims enforces for the local plan. `usedFallback` is returned so
+ *  callers (stationPlacements) can mark placements dimsUnknown when the
+ *  gossiped value failed the envelope: the outline reads as a guess (dashed)
+ *  rather than lying that a squashed shape is the true room. */
+export function moduleHalfExtents(
+  dims: RoomDims | null | undefined,
+): { halfX: number; halfZ: number; usedFallback: boolean } {
+  if (!areDimsRoomValid(dims)) {
+    return { halfX: MODULE_HALF_FALLBACK, halfZ: MODULE_HALF_FALLBACK, usedFallback: true };
   }
-  return { halfX: dims.cols * TILE_SIZE / 2, halfZ: dims.rows * TILE_SIZE / 2 };
+  return {
+    halfX: dims!.cols * TILE_SIZE / 2,
+    halfZ: dims!.rows * TILE_SIZE / 2,
+    usedFallback: false,
+  };
 }
 
 /** A single module's placement on the wall-computer's station canvas: its
@@ -113,7 +141,12 @@ export function stationPlacements(
     halfZ: currentSize.halfZ,
     isCurrent: true,
     hops: 0,
-    dimsUnknown: !currentDims,
+    // 🛑📐 dimsUnknown tracks whether the shape drawn is a GUESS (fallback
+    //     box). The single source of truth is moduleHalfExtents's usedFallback
+    //     — an out-of-envelope value (e.g. {cols: 0, rows: 2} or non-integer)
+    //     took the fallback path and must read as guessed, even though the
+    //     `currentDims` object was truthy.
+    dimsUnknown: currentSize.usedFallback,
   });
   for (const pose of poses) {
     if (!pose || !pose.roomId || pose.roomId === currentRoomId) continue;
@@ -128,7 +161,9 @@ export function stationPlacements(
       halfZ: size.halfZ,
       isCurrent: false,
       hops: Number.isFinite(pose.hops) && pose.hops > 0 ? pose.hops : 1,
-      dimsUnknown: !pose.dims,
+      // Same discipline as above: usedFallback covers both missing dims and
+      // dims that failed the room envelope.
+      dimsUnknown: size.usedFallback,
     });
   }
   return out;
@@ -147,11 +182,19 @@ export interface PlacementPose {
 }
 
 /**
- * The four world-space corners of one module's oriented footprint, in the
- * order [-halfX,-halfZ], [+halfX,-halfZ], [+halfX,+halfZ], [-halfX,+halfZ]
- * (walking clockwise in canvas coordinates once z runs top-down). This is
- * the same rotation math squaresOverlap uses in stationAtlas.ts, kept local
- * so the pure helpers stay self-contained.
+ * The four world-space corners of one module's oriented footprint. The local
+ * corner order is [-halfX,-halfZ], [+halfX,-halfZ], [+halfX,+halfZ],
+ * [-halfX,+halfZ] before rotation.
+ *
+ * 🧭 The rotY convention MUST match the atlas / exterior transform:
+ * atlasLayout composes hops as `wx = x·cos + z·sin`, `wz = -x·sin + z·cos`
+ * (identical to Three.js `rotation.y` on `mod.rotation.y = pose.rotY` — see
+ * exteriorView.ts). Any other sign choice MIRRORS every non-square module's
+ * orientation on the overview relative to the 3D scene the pane is trying to
+ * echo, so the overview would disagree with what the room camera shows.
+ * (An earlier version used the opposite matrix, which agreed only with itself
+ * — the square-only tests concealed the mirror; a directional rectangular
+ * case now pins the sign.)
  */
 export function projectModuleFootprintCorners(
   placement: PlacementPose,
@@ -166,12 +209,11 @@ export function projectModuleFootprintCorners(
     [-placement.halfX,  placement.halfZ],
   ];
   for (const [sx, sz] of corners) {
-    // Rotate the local corner into world coordinates about the placement's
-    // centre. cos/sin/rotY are the standard 2D rotation about y, consistent
-    // with adapter.ts's projection math.
+    // Same rotation matrix as atlasLayout / Three.js rotation.y so the
+    // overview footprint agrees with the exterior view for the same pose.
     out.push({
-      x: placement.x + sx * cos - sz * sin,
-      z: placement.z + sx * sin + sz * cos,
+      x: placement.x + sx * cos + sz * sin,
+      z: placement.z - sx * sin + sz * cos,
     });
   }
   return out;

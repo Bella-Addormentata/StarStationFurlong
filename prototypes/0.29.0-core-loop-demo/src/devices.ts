@@ -574,10 +574,16 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     for (const p of placements) {
       for (const c of projectModuleFootprintCorners(p)) allCorners.push(c);
     }
-    // Give a single-module station a comfortable metres-per-pixel: the fit
-    // otherwise clamps to minScale (0.5), which draws the current room as
-    // ~6 px on a side (unreadable). This bound keeps the fit sane at any size.
-    const viewport = fitPointsToCanvas(allCorners, S, PAD, { minScale: 3, maxScale: 40 });
+    // Fit-driven scale: we always seed the CURRENT room's four corners into
+    // allCorners (moduleHalfExtents guarantees a non-zero box even without
+    // dims — MODULE_HALF_FALLBACK ≈ 5.9 m), so the input has range on both
+    // axes and the fit already gives a legibly-sized single-module view
+    // without a lower clamp. Clamping to a minimum scale would prevent a
+    // legitimately spread-out small station (up to a 12-module chain, over
+    // 200 m corner-to-corner) from fitting inside the padded canvas — the
+    // very case the pane exists to render. maxScale still guards the tightly
+    // packed extreme (a single module can't blow up past ~40 px/m).
+    const viewport = fitPointsToCanvas(allCorners, S, PAD, { maxScale: 40 });
 
     // Faint 5 m grid over the whole panel, aligned to world origin so the
     // current room's centre lines up cleanly. Only draw when scale is high
