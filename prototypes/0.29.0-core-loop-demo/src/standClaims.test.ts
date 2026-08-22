@@ -12,6 +12,7 @@ import * as Y from 'yjs';
 import {
   STAND_CLAIM_TTL_MS,
   STAND_CLAIM_HEARTBEAT_MS,
+  STAND_CLAIM_MAX_SKEW_MS,
   canPlayerClaim,
   findExpiredClaims,
   isClaimActive,
@@ -99,6 +100,25 @@ describe('isClaimActive (TTL window)', () => {
   it('tolerates a future claim (clock skew — never strand a slot)', () => {
     const c: StandClaim = { playerId: ALICE, at: T0 + 5_000 };
     expect(isClaimActive(c, T0)).toBe(true);
+  });
+
+  it('refuses a claim dated FAR in the future, so a slot cannot be locked', () => {
+    const grief: StandClaim = { playerId: BOB, at: T0 + 1e12 };
+    expect(isClaimActive(grief, T0)).toBe(false);
+    // ... and the reclaim paths agree, which is the property that matters.
+    expect(canPlayerClaim(grief, ALICE, T0)).toBe(true);
+    expect(findExpiredClaims({
+      claims: new Map([['slot-1', grief]]),
+      onlinePlayerIds: new Set<string>(),
+      now: T0,
+    })).toEqual(['slot-1']);
+  });
+
+  it('keeps the boundary generous enough for real skew', () => {
+    const edge: StandClaim = { playerId: ALICE, at: T0 + STAND_CLAIM_MAX_SKEW_MS };
+    expect(isClaimActive(edge, T0)).toBe(true);
+    const past: StandClaim = { playerId: ALICE, at: T0 + STAND_CLAIM_MAX_SKEW_MS + 1 };
+    expect(isClaimActive(past, T0)).toBe(false);
   });
 });
 

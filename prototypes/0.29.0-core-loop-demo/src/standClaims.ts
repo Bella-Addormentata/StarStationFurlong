@@ -93,12 +93,32 @@ export function isStandClaim(value: unknown): value is StandClaim {
 }
 
 /**
- * True while `claim` is inside its TTL window relative to `now`. A future
- * timestamp counts as active (a peer's clock could be a few seconds ahead;
- * refusing a future claim would let one skewed peer strand a slot).
+ * How far ahead of us a claim's clock may be and still count as live.
+ *
+ * A peer's clock genuinely can run a few seconds fast, and refusing every
+ * future timestamp would let one skewed peer strand a slot it legitimately
+ * holds. But the tolerance has to be BOUNDED, because `at` is peer-written
+ * and unsigned: an unbounded future acceptance means `at = Date.now() + 1e12`
+ * is always active, and a permanently-active claim closes BOTH reclaim paths
+ * at once — canPlayerClaim refuses every other player, and findExpiredClaims
+ * skips it — so the slot is dead for the life of the doc.
+ *
+ * One TTL of slack covers real skew (the heartbeat is a third of that) while
+ * making a far-future claim read as what it is: not live.
+ */
+export const STAND_CLAIM_MAX_SKEW_MS = STAND_CLAIM_TTL_MS;
+
+/**
+ * True while `claim` is inside its TTL window relative to `now`. A modestly
+ * future timestamp still counts as active (a peer's clock could be a few
+ * seconds ahead; refusing a future claim would let one skewed peer strand a
+ * slot) — but only up to STAND_CLAIM_MAX_SKEW_MS, so a claim dated far in the
+ * future cannot hold a slot forever.
  */
 export function isClaimActive(claim: StandClaim, now: number): boolean {
-  return now - claim.at < STAND_CLAIM_TTL_MS;
+  const age = now - claim.at;
+  if (age < -STAND_CLAIM_MAX_SKEW_MS) return false;
+  return age < STAND_CLAIM_TTL_MS;
 }
 
 /**
