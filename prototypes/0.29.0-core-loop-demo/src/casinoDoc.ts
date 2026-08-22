@@ -939,17 +939,37 @@ export function scanAirHockeyPaidRecords(): Array<{
  * Escrow my ready-up fee: one transaction debits MY balance and creates MY
  * 'held' record — the owner's balance is untouched until they sweep the
  * finalized record. Returns the chips escrowed — 0 when nothing is owed
- * (fee off / zero / the owner playing their own table), or null when my
- * balance cannot cover it (ready refused). IDEMPOTENT: an existing record
- * (a crash between pay and the ready write, retried) is reused at ITS
- * amount — no double debit; a leftover 'final' from a reverted start counts
- * for the restarted match rather than charging twice. The reuse check runs
- * BEFORE the config gates: chips already escrowed are the truth even if the
- * owner has since disabled or re-priced the fee.
+ * (fee off / zero / the owner playing their own table), or null when the
+ * pay is refused (see below).
+ *
+ * IDEMPOTENT on retry: an existing 'held' record (a crash between pay and
+ * the ready write) is reused at ITS amount — no double debit; the reuse
+ * runs BEFORE the config gates, so chips already escrowed remain the
+ * truth even if the owner has since disabled or re-priced the fee.
+ *
+ * #116 review fix (Copilot inline): a 'final' record from a previously
+ * completed but not-yet-swept match is NO LONGER reused as fresh payment.
+ * The previous unconditional reuse let the same player RESET and play
+ * repeatedly without another debit whenever the owner was offline, and
+ * an old amount/recipient captured pre-config-change would silently
+ * bypass the current fee config. We cannot simply overwrite the 'final'
+ * record with a new 'held' one either — that would destroy chips owed to
+ * the owner (only their sweep may delete a 'final'). So the pay refuses
+ * (returns null) until the previous fee is settled by its rightful owner.
+ * Callers distinguish this refusal from "insufficient balance" by peeking
+ * readAirHockeyPaidRecord: `{ state: 'final' }` means prior-fee-pending;
+ * anything else means the balance was short.
  */
 export function payAirHockeyFee(tableId: string, playerId: string): number | null {
   const existing = readAirHockeyPaidRecord(tableId, playerId);
-  if (existing) return existing.amount;
+  if (existing) {
+    // Only 'held' is a legitimate crash-retry reuse. A 'final' means the
+    // previous match's fee is owed to the owner and hasn't been swept —
+    // fabricating a new payment on top of it would either destroy owner
+    // chips (if we overwrote) or double-play for free (the original bug).
+    if (existing.state === 'held') return existing.amount;
+    return null;
+  }
   const config = readAirHockeyFeeConfig(tableId);
   if (!config || !config.enabled || config.feeAmount <= 0) return 0;
   if (config.ownerId === playerId) return 0;

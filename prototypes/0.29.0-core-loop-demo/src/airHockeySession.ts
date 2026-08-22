@@ -55,11 +55,15 @@ import {
   writeGame,
 } from './games/gamesDoc';
 import {
-  finalizeAirHockeyFee, payAirHockeyFee, readAirHockeyFeeConfig, readChips,
-  refundAirHockeyFee, scanAirHockeyPaidRecords, subscribeCasino,
-  sweepAirHockeyFees, writeAirHockeyFeeConfig,
+  finalizeAirHockeyFee, payAirHockeyFee, readAirHockeyFeeConfig,
+  readAirHockeyPaidRecord, readChips, refundAirHockeyFee,
+  scanAirHockeyPaidRecords, subscribeCasino, sweepAirHockeyFees,
+  writeAirHockeyFeeConfig,
 } from './casinoDoc';
 import { chipDotsHtml } from './chipDisplay';
+// #116 review fix: HTML escaper for peer-authored strings that reach
+// innerHTML (the seat-row display-name interpolation, previously an XSS).
+import { escapeHtml } from './htmlEscape';
 import { getPlayerId } from './identity';
 import {
   packTick, tickKind, TICK_KIND_AH_MALLET, TICK_KIND_AH_PUCK,
@@ -793,12 +797,25 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
    *  creates MY 'held' record (casinoDoc — idempotent on a crash retry); if
    *  the ready write is beaten by a state change the escrow comes straight
    *  back (a self-credit that cannot fail — no owner balance involved). */
+  /** #116 review fix: distinguish "prev fee not swept" from "insufficient
+   *  balance" — payAirHockeyFee now returns null for BOTH, and only a peek
+   *  at my record reveals which. A 'final' record means the previous match
+   *  ran, its fee is owed to the owner, and the owner hasn't swept yet
+   *  (typically because they're offline). */
+  const payFailureNotice = (): string => {
+    const existing = readAirHockeyPaidRecord(deps.itemId, myId);
+    if (existing && existing.state === 'final') {
+      return 'PREVIOUS FEE PENDING SWEEP — WAIT FOR ROOM OWNER';
+    }
+    return `NOT ENOUGH CHIPS — ENTRY FEE IS ${myFee()}`;
+  };
+
   const doReady = (): void => {
     const s = state();
     if (!s || s.status !== 'waiting' || s.players[side] !== myId || s.ready[side]) return;
     const paid = payAirHockeyFee(deps.itemId, myId);
     if (paid === null) {
-      showNotice(`NOT ENOUGH CHIPS — ENTRY FEE IS ${myFee()}`);
+      showNotice(payFailureNotice());
       return;
     }
     const ns = setReady(state() ?? s, side, myId, paid);
@@ -811,7 +828,18 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     const after = state();
     if (after) {
       const started = startIfReady(after, Date.now());
-      if (started) writeGame(deps.itemId, started);
+      if (started) {
+        writeGame(deps.itemId, started);
+        // #116 review fix: finalize MY escrow immediately once the match-start
+        // write has landed. The frame loop's startedAt-transition hook is now
+        // only a crash backstop — if it were the sole path, a fast unready /
+        // unmount before the next frame could clear startedAt again and the
+        // reconciler would refund a fee whose match provably ran (violating
+        // "fees final once the match starts"). No-op when nothing is held
+        // (owner/free/already-final). The other side's finalize runs on its
+        // own client when that client observes startedAt.
+        if (paid > 0) finalizeAirHockeyFee(deps.itemId, myId);
+      }
     }
   };
 
@@ -835,7 +863,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     if (s.players[otherSide(side)] !== null) return;
     const paid = payAirHockeyFee(deps.itemId, myId);
     if (paid === null) {
-      showNotice(`NOT ENOUGH CHIPS — ENTRY FEE IS ${myFee()}`);
+      showNotice(payFailureNotice());
       return;
     }
     const ns = startPractice(state() ?? s, side, myId, paid, Date.now());
@@ -845,6 +873,13 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       return;
     }
     writeGame(deps.itemId, ns);
+    // #116 review fix: startPractice always yields startedAt > 0, so this
+    // fee is IMMEDIATELY final. Finalize inline rather than waiting for the
+    // next frame — otherwise a fast END PRACTICE (which writes the initial
+    // state before the frame observes the transition) would let the
+    // reconciler refund a fee whose match provably ran. No-op when nothing
+    // is held (owner/free).
+    if (paid > 0) finalizeAirHockeyFee(deps.itemId, myId);
   };
 
   const doForfeit = (): void => {
@@ -963,8 +998,11 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const seatRow = (s: AirHockeyState | null, sd: AirHockeySide): string => {
     const pid = s?.players[sd] ?? null;
+    // #116 review fix: display name is peer-writable and this string is
+    // interpolated into card.innerHTML — escape before it reaches the DOM.
+    // (The rest of the label is fixed strings under our control.)
     const label = pid
-      ? `${readPlayerDisplayName(pid).toUpperCase()}${pid === myId ? ' (YOU)' : ''}${s?.ready[sd] ? ' · READY' : ''}`
+      ? `${escapeHtml(readPlayerDisplayName(pid).toUpperCase())}${pid === myId ? ' (YOU)' : ''}${s?.ready[sd] ? ' · READY' : ''}`
       : 'OPEN';
     return `
       <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:6px 10px;">
@@ -1153,7 +1191,21 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
         cursor: crosshair;
       `;
       captureLayer.addEventListener('click', onCaptureClick);
-      captureLayer.addEventListener('mousedown', (e) => e.stopPropagation());
+      // #116 review fix: the capture layer IS the pointer-lock target, so a
+      // locked mousedown fires HERE and — because it bubbles to document —
+      // gets swallowed by zoom.ts's "click-while-locked exits pointer lock"
+      // handler unless we stopPropagation. But we ALSO need onMouseDown to
+      // run so engaged.down flips to true (mallet press). Forward the event
+      // to the same handler BEFORE stopping propagation; mouseup mirrors it
+      // so a fast release inside the layer never leaves the mallet planted.
+      captureLayer.addEventListener('mousedown', (e) => {
+        onMouseDown(e);
+        e.stopPropagation();
+      });
+      captureLayer.addEventListener('mouseup', (e) => {
+        onMouseUp(e);
+        e.stopPropagation();
+      });
       panel.appendChild(captureLayer);
 
       topBar = document.createElement('div');

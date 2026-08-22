@@ -231,6 +231,79 @@ describe('payAirHockeyFee', () => {
     expect(payAirHockeyFee(TABLE, P1)).toBe(50);
     expect(readChips(P1)).toBe(150); // still the one original debit
   });
+
+  // #116 review fix — Copilot inline on casinoDoc.ts:952 —————————————————————
+  // A 'final' record from a previous completed match must NOT be reused as
+  // fresh payment for a new match: doing so let the same player RESET and
+  // play repeatedly for free whenever the owner was offline (never got to
+  // sweep), and it silently locked in an old amount/recipient captured
+  // before any fee-config change. The fix refuses the new pay (returns null)
+  // until the previous fee is settled by its rightful owner; overwriting a
+  // 'final' record with a new 'held' one is NOT an option — it would destroy
+  // chips owed to the owner (only the owner's sweep may delete a 'final').
+  describe('#116 fix — refuses to reuse a final record as new payment', () => {
+    it('returns null (no debit, record intact) when a final record exists', () => {
+      makeRoom();
+      writeAirHockeyFeeConfig(TABLE, feeConfig(50));
+      buyInChips(P1, 200);
+      expect(payAirHockeyFee(TABLE, P1)).toBe(50);
+      finalizeAirHockeyFee(TABLE, P1);
+      expect(readAirHockeyPaidRecord(TABLE, P1)?.state).toBe('final');
+      // Attempt a fresh pay (e.g. after RESET + re-ready): must refuse.
+      expect(payAirHockeyFee(TABLE, P1)).toBeNull();
+      // Balance untouched — no second debit; record still the ORIGINAL final,
+      // not overwritten (the owner's money is preserved for their sweep).
+      expect(readChips(P1)).toBe(150);
+      expect(readAirHockeyPaidRecord(TABLE, P1))
+        .toEqual({ amount: 50, ownerId: OWNER, state: 'final' });
+      expectConserved();
+    });
+
+    it('does NOT bypass an updated fee config either — original amount stays', () => {
+      // Fee went up between matches: with the old bug the pending 'final'
+      // (at the OLD amount) would silently be treated as the new payment,
+      // undercharging by 150. Now the pay refuses; nothing moves.
+      makeRoom();
+      writeAirHockeyFeeConfig(TABLE, feeConfig(50));
+      buyInChips(P1, 500);
+      expect(payAirHockeyFee(TABLE, P1)).toBe(50);
+      finalizeAirHockeyFee(TABLE, P1);
+      writeAirHockeyFeeConfig(TABLE, feeConfig(200));
+      expect(payAirHockeyFee(TABLE, P1)).toBeNull();
+      expect(readChips(P1)).toBe(450); // still just the one 50-chip debit
+      expect(readAirHockeyPaidRecord(TABLE, P1)?.amount).toBe(50);
+    });
+
+    it('unblocks after the owner sweeps the previous final', () => {
+      // The block is deliberately transient: once the previous fee reaches
+      // its rightful owner the record is gone and a fresh pay proceeds.
+      makeRoom();
+      writeAirHockeyFeeConfig(TABLE, feeConfig(50));
+      buyInChips(P1, 200);
+      expect(payAirHockeyFee(TABLE, P1)).toBe(50);
+      finalizeAirHockeyFee(TABLE, P1);
+      expect(payAirHockeyFee(TABLE, P1)).toBeNull(); // blocked
+      expect(sweepAirHockeyFees(OWNER)).toBe(50);    // owner returns, sweeps
+      expect(readAirHockeyPaidRecord(TABLE, P1)).toBeNull();
+      // Now the next pay is a fresh debit at the CURRENT config.
+      expect(payAirHockeyFee(TABLE, P1)).toBe(50);
+      expect(readChips(P1)).toBe(100); // 200 - 50 - 50 = 100
+      expectConserved();
+    });
+
+    it('idempotent crash-retry on held is unaffected (regression guard)', () => {
+      // The fix must narrow reuse to 'held' only, WITHOUT breaking the
+      // original crash-retry idempotency — that path lives in a different
+      // arm and remains a same-match no-op that returns the escrowed amount.
+      makeRoom();
+      writeAirHockeyFeeConfig(TABLE, feeConfig(50));
+      buyInChips(P1, 200);
+      expect(payAirHockeyFee(TABLE, P1)).toBe(50);
+      expect(readAirHockeyPaidRecord(TABLE, P1)?.state).toBe('held');
+      expect(payAirHockeyFee(TABLE, P1)).toBe(50); // crash-retry still works
+      expect(readChips(P1)).toBe(150);            // still ONE debit
+    });
+  });
 });
 
 // ── Refund: held-only self-credit ────────────────────────────────────────────
