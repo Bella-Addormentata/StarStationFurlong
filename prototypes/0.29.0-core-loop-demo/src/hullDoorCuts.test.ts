@@ -26,7 +26,9 @@ import {
   DOOR_HULL_INSET,
   type DoorOpening,
 } from './octagonHull';
-import { doorSurfaceForWall } from './doorCuts';
+import { doorSurfaceForWall, bucketDoorCutsFromRecords } from './doorCuts';
+import { DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT } from './doorLayout';
+import type { DoorWall } from './doorLayoutDoc';
 
 // ── notchedRectOutline ─────────────────────────────────────────────────────
 
@@ -266,6 +268,175 @@ describe('doorSurfaceForWall', () => {
       expect(doorSurfaceForWall('x+', axis)).toMatch(/-pos$/);
       expect(doorSurfaceForWall('y+', axis)).toMatch(/-pos$/);
     }
+  });
+});
+
+// ── bucketDoorCutsFromRecords: peer-writable records → clamped cuts ────────
+//
+// Regression cover for the PR #122 review §"clamp at the boundary":
+// `readAllDoorLayout` is a peer-boundary read — `isDoorLayoutRecord` proves
+// the fields are the right SHAPE and finite, but not that the numbers name a
+// location that fits the current room. A hostile or malformed record (or a
+// legitimate one that survived a room resize past it) must not feed a cut
+// that runs off the end of a strip or end cap into the hull builder. The
+// collector clamps at the boundary; the mesh builders' own `clampedDoorCuts`
+// still runs, so this clamp is defence-in-depth — testing the collector's
+// clamp specifically ensures a downstream refactor that removes one clamp
+// cannot silently drop the other.
+
+describe('bucketDoorCutsFromRecords — clamps peer-writable records at the collection boundary', () => {
+  // Default 12×12 room (halfX=halfZ=6): narrowAxisFor picks 'x' by tie-break,
+  // so wall 'x-' → 'wall-neg' (side wall, along ∈ [-longHalf=−6, longHalf=6])
+  // and wall 'y-' → 'cap-neg' (end cap, along ∈ [−narrowHalf=−6, narrowHalf=6]).
+  // Hull default wallHeight=4 (DEFAULT_WALL_HEIGHT), so DOOR_OPENING_HEIGHT=3
+  // survives the vertical clamp on every case here.
+
+  it('a hostile lateral far outside the side wall is clamped to the inset limit — not passed through', () => {
+    // A malicious peer writes lateral=999 on wall 'x-'. Without a boundary
+    // clamp, the mesh builder would receive along=999; with it, the collector
+    // shifts it to the inset limit (longHalf − w/2 − DOOR_HULL_INSET).
+    const cuts = bucketDoorCutsFromRecords(
+      [{ wall: 'x-' as DoorWall, lateral: 999 }],
+      6, 6,
+    );
+    expect(cuts['wall-neg']).toHaveLength(1);
+    expect(cuts['wall-neg']![0].along).toBeCloseTo(6 - DOOR_OPENING_WIDTH / 2 - DOOR_HULL_INSET);
+    expect(cuts['wall-neg']![0].w).toBe(DOOR_OPENING_WIDTH);
+    expect(cuts['wall-neg']![0].h).toBe(DOOR_OPENING_HEIGHT);
+    // Nothing landed on the other three faces.
+    expect(cuts['wall-pos']).toBeUndefined();
+    expect(cuts['cap-neg']).toBeUndefined();
+    expect(cuts['cap-pos']).toBeUndefined();
+  });
+
+  it('a hostile lateral on the −∞ end of the side wall is clamped up to the inset limit', () => {
+    const cuts = bucketDoorCutsFromRecords(
+      [{ wall: 'x+' as DoorWall, lateral: -1e12 }],
+      6, 6,
+    );
+    expect(cuts['wall-pos']).toHaveLength(1);
+    expect(cuts['wall-pos']![0].along).toBeCloseTo(-(6 - DOOR_OPENING_WIDTH / 2 - DOOR_HULL_INSET));
+  });
+
+  it('a hostile lateral far outside an end cap is clamped to its narrow-axis inset limit', () => {
+    // On a rectangular 6×12 room (halfX=3, halfZ=6): narrowAxis='x',
+    // narrowHalf=3, longHalf=6. Walls 'y±' become the caps with along ∈ [−3, 3].
+    // A record at lateral=999 on wall 'y-' should clamp to (3 − 1 − 0.05).
+    const cuts = bucketDoorCutsFromRecords(
+      [{ wall: 'y-' as DoorWall, lateral: 999 }],
+      3, 6,
+    );
+    expect(cuts['cap-neg']).toHaveLength(1);
+    expect(cuts['cap-neg']![0].along).toBeCloseTo(3 - DOOR_OPENING_WIDTH / 2 - DOOR_HULL_INSET);
+  });
+
+  it('drops a door on a side wall whose extrude span is too short for DOOR_OPENING_WIDTH', () => {
+    // Shrink the room so 2*longHalf − 2*DOOR_HULL_INSET < DOOR_OPENING_WIDTH.
+    // halfX=halfZ=1 → longHalf=1 → alongSpan=2 → 2 − 0.1 = 1.9 < 2.0 → drop.
+    // (A room this small never renders in the app, but a hostile floor-plan
+    // write can produce it and the collector must refuse to emit a broken
+    // cut regardless. #130 makes floor-plan placements authoritative, which
+    // is where this failure mode enters the runtime.)
+    const cuts = bucketDoorCutsFromRecords(
+      [{ wall: 'x-' as DoorWall, lateral: 0 }],
+      1, 1,
+    );
+    expect(cuts['wall-neg']).toBeUndefined();
+  });
+
+  it('drops a door on an end cap whose narrow-axis span is too short for DOOR_OPENING_WIDTH', () => {
+    // halfX=1 (narrow), halfZ=6 (long) → narrowHalf=1, cap span=2, drop.
+    const cuts = bucketDoorCutsFromRecords(
+      [{ wall: 'y-' as DoorWall, lateral: 0 }],
+      1, 6,
+    );
+    expect(cuts['cap-neg']).toBeUndefined();
+  });
+
+  it('a mix of hostile + honest records: each is clamped or dropped independently, honest ones untouched', () => {
+    const cuts = bucketDoorCutsFromRecords(
+      [
+        { wall: 'x-' as DoorWall, lateral: 999 },   // clamp right
+        { wall: 'x-' as DoorWall, lateral: -999 },  // clamp left
+        { wall: 'x-' as DoorWall, lateral: 0 },     // in-bounds — untouched
+        { wall: 'x+' as DoorWall, lateral: 2 },     // in-bounds — untouched (different surface)
+      ],
+      6, 6,
+    );
+    expect(cuts['wall-neg']).toHaveLength(3);
+    // Order is preserved for the survivors (clampedDoorCuts guarantee).
+    expect(cuts['wall-neg']![0].along).toBeCloseTo(6 - 1 - DOOR_HULL_INSET);
+    expect(cuts['wall-neg']![1].along).toBeCloseTo(-(6 - 1 - DOOR_HULL_INSET));
+    expect(cuts['wall-neg']![2].along).toBe(0);
+    expect(cuts['wall-pos']).toHaveLength(1);
+    expect(cuts['wall-pos']![0].along).toBe(2);
+  });
+
+  it('a room too small for ANY door on a face returns an empty bucket for that face — no half-cut mesh downstream', () => {
+    // Two hostile records on the same undersized side wall — both dropped,
+    // and the surface key never appears in the output map (the mesh builder's
+    // `doors[surface]` read gets `undefined` and it falls straight through to
+    // the plain-quad path). This is the crucial post-condition: no partial /
+    // broken cut list can reach the mesh builder from a rogue record.
+    const cuts = bucketDoorCutsFromRecords(
+      [
+        { wall: 'x-' as DoorWall, lateral: 0 },
+        { wall: 'x-' as DoorWall, lateral: 999 },
+      ],
+      1, 1,
+    );
+    expect(cuts['wall-neg']).toBeUndefined();
+    expect(Object.keys(cuts)).toHaveLength(0);
+  });
+
+  it('an empty record iterable is an empty map — no coincidental default cuts', () => {
+    // The unseeded-room FALLBACK to defaultDoorLayoutRecords lives in
+    // collectDoorCuts (the doc-reading wrapper); the pure helper here trusts
+    // its caller's records. Passing zero records must produce zero cuts —
+    // no keys at all — so a downstream `for (const s of Object.keys(cuts))`
+    // observes no surfaces to punch.
+    const cuts = bucketDoorCutsFromRecords([], 6, 6);
+    expect(Object.keys(cuts)).toHaveLength(0);
+  });
+
+  it('the four cardinal defaults on a normal room round-trip untouched — no false-positive clamps', () => {
+    // Regression against an over-eager clamp: the four cardinal defaults
+    // (LEGACY_ID_WALL entries at lateral=0) all fit trivially inside a 12×12
+    // room, so the collector must emit their (along=0) values unchanged.
+    const cuts = bucketDoorCutsFromRecords(
+      [
+        { wall: 'y-' as DoorWall, lateral: 0 },
+        { wall: 'y+' as DoorWall, lateral: 0 },
+        { wall: 'x-' as DoorWall, lateral: 0 },
+        { wall: 'x+' as DoorWall, lateral: 0 },
+      ],
+      6, 6,
+    );
+    // narrowAxis='x' by tie-break: x± are strips, y± are caps.
+    expect(cuts['wall-neg']).toEqual([{ along: 0, w: DOOR_OPENING_WIDTH, h: DOOR_OPENING_HEIGHT }]);
+    expect(cuts['wall-pos']).toEqual([{ along: 0, w: DOOR_OPENING_WIDTH, h: DOOR_OPENING_HEIGHT }]);
+    expect(cuts['cap-neg']).toEqual([{ along: 0, w: DOOR_OPENING_WIDTH, h: DOOR_OPENING_HEIGHT }]);
+    expect(cuts['cap-pos']).toEqual([{ along: 0, w: DOOR_OPENING_WIDTH, h: DOOR_OPENING_HEIGHT }]);
+  });
+
+  it('narrowAxis flip (halfZ<halfX) routes strip/cap to the OTHER axis — the clamp follows', () => {
+    // halfX=6, halfZ=3 → narrowAxis='z', so y± walls become STRIPS with
+    // along ∈ [−longHalf=−6, 6], and x± walls become CAPS with
+    // along ∈ [−narrowHalf=−3, 3]. A hostile lateral=999 on wall 'x-'
+    // (now a cap) clamps to 3 − 1 − 0.05.
+    const cuts = bucketDoorCutsFromRecords(
+      [{ wall: 'x-' as DoorWall, lateral: 999 }],
+      6, 3,
+    );
+    expect(cuts['cap-neg']).toHaveLength(1);
+    expect(cuts['cap-neg']![0].along).toBeCloseTo(3 - 1 - DOOR_HULL_INSET);
+    // And a hostile lateral=999 on wall 'y-' (now a strip) clamps to 6 − 1 − 0.05.
+    const cuts2 = bucketDoorCutsFromRecords(
+      [{ wall: 'y-' as DoorWall, lateral: 999 }],
+      6, 3,
+    );
+    expect(cuts2['wall-neg']).toHaveLength(1);
+    expect(cuts2['wall-neg']![0].along).toBeCloseTo(6 - 1 - DOOR_HULL_INSET);
   });
 });
 
