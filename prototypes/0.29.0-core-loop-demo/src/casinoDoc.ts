@@ -49,6 +49,12 @@ import type {
   SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
   SlotFundingConfig,
 } from './games/slots';
+import {
+  isCoinPusherState, isPusherInsertRequest, isPusherEscrow,
+} from './games/coinPusher';
+import type {
+  CoinPusherState, PusherInsertRequest, PusherEscrow,
+} from './games/coinPusher';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -807,6 +813,241 @@ export function clearSlotMachineKeys(machineId: string): void {
   });
 }
 
+// ── 🪙 Coin pusher (#135) ────────────────────────────────────────────────────
+// A coin pusher is a self-contained arcade machine. Each machine has one
+// authoritative record (`pusher:<machineId>`) + a per-player insert-request
+// queue (`pusher-req:<mid>:<pid>`) + a per-request escrow (`pusher-esc:<mid>:
+// <pid>:<reqId>`). The MACHINE OWNER's client is the sole operator (the
+// slot-machine croupier precedent): it drains the queue, runs the physics
+// engine, and publishes the new state — the same whole-value LWW discipline as
+// roulette / craps / slots. Every read shape-guards via games/coinPusher's
+// isCoinPusherState etc. so a hostile peer that writes junk into the shared
+// map cannot corrupt other clients (they simply see no machine).
+//
+// AUTHORITY MODEL (aligns with games/coinPusher.ts header):
+//   • Insert:    player writes `pusher-req:<mid>:<pid>` + escrows chips to
+//                `pusher-esc:<mid>:<pid>:<reqId>`; owner processes, commits
+//                new state, credits payout, clears request + escrow.
+//   • Empty:     owner-only path; the engine's emptyMachine() refuses non-owner
+//                writes, and the wiring layer additionally credits ownerId
+//                atomically with the state publish.
+//   • Refund:    the owner is offline / never processed a request → any peer
+//                whose escrow TTL is past can call refundExpiredPusherEscrow()
+//                to recover their stake. The chip returns to the peer only if
+//                the request record is still their own and the escrow record
+//                still their own — mint/burn safety, not race safety.
+//
+// CONSERVATION (money side): totalInserted = chipsInMachine + totalPaid +
+// totalEmptied. This module enforces the money-side atomicity: an insert both
+// debits `bal:<pid>` AND writes the escrow record in ONE transact(); a payout-
+// claim both zeros pendingCredit AND credits `bal:<pid>` in ONE transact().
+
+/** Request-record TTL beyond which a would-be player may reclaim their escrow.
+ *  Generous — the operator only needs a few seconds under normal load; if the
+ *  owner has gone offline this lets the money come home without a UI. */
+const PUSHER_REQUEST_TTL_MS = 90_000;
+
+export function readCoinPusherState(machineId: string): CoinPusherState | null {
+  const value = ensureMap().get(`pusher:${machineId}`);
+  return isCoinPusherState(value) ? value : null;
+}
+
+/** Machine owner (operator) writes state. Callers gate on the room permission. */
+export function writeCoinPusherState(machineId: string, state: CoinPusherState): void {
+  if (!isCoinPusherState(state)) return;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`pusher:${machineId}`, state);
+  });
+}
+
+/** Every insert request for this machine, sorted by requestId (stable order
+ *  under concurrent submits — the operator drains them oldest-first). Shape-
+ *  and cross-key-guarded: a request under `pusher-req:<mid>:<pid>` whose
+ *  `player` field disagrees with the `<pid>` in the key is discarded (a
+ *  hostile peer cannot bind another player's id to their own escrow). */
+export function readCoinPusherRequests(machineId: string): PusherInsertRequest[] {
+  const prefix = `pusher-req:${machineId}:`;
+  const out: PusherInsertRequest[] = [];
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix) || !isPusherInsertRequest(value)) continue;
+    if (value.player !== key.slice(prefix.length)) continue;
+    out.push(value);
+  }
+  return out.sort((a, b) => a.requestId.localeCompare(b.requestId));
+}
+
+/** Read one player's current request record (returns null when absent). */
+export function readCoinPusherRequest(
+  machineId: string,
+  playerId: string,
+): PusherInsertRequest | null {
+  const value = ensureMap().get(`pusher-req:${machineId}:${playerId}`);
+  if (!isPusherInsertRequest(value)) return null;
+  return value.player === playerId ? value : null;
+}
+
+/** Read one escrow record. */
+export function readCoinPusherEscrow(
+  machineId: string,
+  playerId: string,
+  requestId: string,
+): PusherEscrow | null {
+  const value = ensureMap().get(`pusher-esc:${machineId}:${playerId}:${requestId}`);
+  if (!isPusherEscrow(value)) return null;
+  return value.player === playerId && value.requestId === requestId ? value : null;
+}
+
+/**
+ * Player-side insert: debit `bal:<playerId>` by `ante`, write the request
+ * record, write the escrow record — ALL in one transact(). Returns false when
+ * the player is short of chips OR already has an outstanding request (one at
+ * a time per player per machine; the operator settles before a new insert).
+ */
+export function submitCoinPusherInsert(
+  machineId: string,
+  request: PusherInsertRequest,
+): boolean {
+  if (!isPusherInsertRequest(request)) return false;
+  const map = ensureMap();
+  const balKey = `bal:${request.player}`;
+  const reqKey = `pusher-req:${machineId}:${request.player}`;
+  const escKey = `pusher-esc:${machineId}:${request.player}:${request.requestId}`;
+  const bal = safeCount(map, balKey);
+  if (bal < request.ante) return false;
+  if (map.has(reqKey)) return false;
+  const escrow: PusherEscrow = {
+    requestId: request.requestId,
+    player: request.player,
+    ante: request.ante,
+    escrowedAt: request.requestedAt,
+  };
+  boundDoc!.transact(() => {
+    map.set(balKey, bal - request.ante);
+    map.set(reqKey, request);
+    map.set(escKey, escrow);
+  });
+  return true;
+}
+
+/**
+ * Operator (owner) side: clear one request AND its escrow after processing.
+ * Called from the SAME transact() as writeCoinPusherState, so the money side
+ * (the escrow disappears — the chip is now part of chipsInMachine and rides
+ * the state's totalInserted) is atomic with the physics side (the new pile
+ * has the freshly-inserted chip).
+ */
+export function clearCoinPusherInsert(
+  machineId: string,
+  playerId: string,
+  requestId: string,
+): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.delete(`pusher-req:${machineId}:${playerId}`);
+    map.delete(`pusher-esc:${machineId}:${playerId}:${requestId}`);
+  });
+}
+
+/**
+ * Refund a stale insert whose operator never processed it. The player-side
+ * safety valve — if the owner has gone offline the money comes home after
+ * PUSHER_REQUEST_TTL_MS. Only the request's OWNER may call this, and only
+ * when the escrow + request records both match. Returns the refunded chip
+ * count so the caller can surface it to the user.
+ */
+export function refundExpiredCoinPusherRequest(
+  machineId: string,
+  playerId: string,
+  nowMs: number,
+): number {
+  if (typeof nowMs !== 'number' || !Number.isFinite(nowMs)) return 0;
+  const map = ensureMap();
+  const req = readCoinPusherRequest(machineId, playerId);
+  if (!req) return 0;
+  if (nowMs - req.requestedAt < PUSHER_REQUEST_TTL_MS) return 0;
+  const esc = readCoinPusherEscrow(machineId, playerId, req.requestId);
+  if (!esc || esc.ante !== req.ante) return 0;
+  const balKey = `bal:${playerId}`;
+  const bal = safeCount(map, balKey);
+  if (!Number.isSafeInteger(bal + req.ante)) return 0;
+  boundDoc!.transact(() => {
+    map.delete(`pusher-req:${machineId}:${playerId}`);
+    map.delete(`pusher-esc:${machineId}:${playerId}:${req.requestId}`);
+    map.set(balKey, bal + req.ante);
+  });
+  return req.ante;
+}
+
+/**
+ * Payout claim: transfer one player's pendingCredit out of the machine state
+ * into their `bal:<pid>` in a single transact(). The state is passed in from
+ * the caller (usually the operator's local reducer) and re-published here so
+ * the reduction and the credit are atomic — a peer that observes the state
+ * after this call sees both sides consistently.
+ */
+export function claimCoinPusherPayout(
+  machineId: string,
+  nextState: CoinPusherState,
+  playerId: string,
+  amount: number,
+): boolean {
+  if (!isCoinPusherState(nextState)) return false;
+  if (typeof playerId !== 'string' || playerId.length === 0 || playerId.length > 128) return false;
+  if (!Number.isSafeInteger(amount) || amount <= 0) return false;
+  const map = ensureMap();
+  const balKey = `bal:${playerId}`;
+  const bal = safeCount(map, balKey);
+  if (!Number.isSafeInteger(bal + amount)) return false;
+  boundDoc!.transact(() => {
+    map.set(`pusher:${machineId}`, nextState);
+    map.set(balKey, bal + amount);
+  });
+  return true;
+}
+
+/**
+ * Owner-empty settlement: publish the emptied state AND credit the owner in
+ * one transact(). Callers must invoke the pure engine's emptyMachine() first
+ * to compute `nextState` + `emptied`; this helper simply enforces atomicity.
+ */
+export function commitCoinPusherEmpty(
+  machineId: string,
+  nextState: CoinPusherState,
+  ownerId: string,
+  emptied: number,
+): boolean {
+  if (!isCoinPusherState(nextState)) return false;
+  if (typeof ownerId !== 'string' || ownerId.length === 0 || ownerId.length > 128) return false;
+  if (nextState.ownerId !== ownerId) return false;
+  if (!Number.isSafeInteger(emptied) || emptied < 0) return false;
+  const map = ensureMap();
+  const balKey = `bal:${ownerId}`;
+  const bal = safeCount(map, balKey);
+  if (!Number.isSafeInteger(bal + emptied)) return false;
+  boundDoc!.transact(() => {
+    map.set(`pusher:${machineId}`, nextState);
+    if (emptied > 0) map.set(balKey, bal + emptied);
+  });
+  return true;
+}
+
+/** Remove every casino-map key that belongs to a coin pusher (teardown on
+ *  item removal). Refunding outstanding escrows to the affected peers is the
+ *  CALLER's job — call refundExpiredCoinPusherRequest per outstanding request
+ *  before this so no chip is silently minted or burned. */
+export function clearCoinPusherKeys(machineId: string): void {
+  const map = ensureMap();
+  const reqPrefix = `pusher-req:${machineId}:`;
+  const escPrefix = `pusher-esc:${machineId}:`;
+  boundDoc!.transact(() => {
+    map.delete(`pusher:${machineId}`);
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(reqPrefix) || key.startsWith(escPrefix)) map.delete(key);
+    }
+  });
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing. Guard for Node
 // tooling / tests: importing this module must stay pure, with browser-only
@@ -826,5 +1067,10 @@ if (typeof window !== 'undefined') {
     depositSlotFunding, withdrawSlotFunding,
     readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
     releaseSlotSharedBankrollLease,
+    readCoinPusherState, writeCoinPusherState,
+    readCoinPusherRequests, readCoinPusherRequest, readCoinPusherEscrow,
+    submitCoinPusherInsert, clearCoinPusherInsert,
+    refundExpiredCoinPusherRequest, claimCoinPusherPayout,
+    commitCoinPusherEmpty, clearCoinPusherKeys,
   };
 }

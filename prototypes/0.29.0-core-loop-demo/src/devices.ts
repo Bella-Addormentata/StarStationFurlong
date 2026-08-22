@@ -70,6 +70,12 @@ import {
   writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
+  // 🪙 Coin pusher (#135) — insert/queue/escrow/state/payout wiring.
+  readCoinPusherState, writeCoinPusherState,
+  readCoinPusherRequests, readCoinPusherRequest,
+  submitCoinPusherInsert, clearCoinPusherInsert,
+  refundExpiredCoinPusherRequest, claimCoinPusherPayout, commitCoinPusherEmpty,
+  subscribeCasinoKey,
 } from './casinoDoc';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -93,6 +99,14 @@ import {
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
 } from './games/slots';
 import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
+// 🪙 Coin pusher engine (#135) — pure physics, no doc / DOM access. The wiring
+// layer feeds it dt + insert requests and publishes the reduced state.
+import {
+  emptyMachine, processInsert, advanceSim, claimPendingCredit,
+  initialCoinPusherState, chipsInMachine, currentPusherPhase,
+  computeConservation, HOLE_COUNT, PUSHER_MAX_ANTE,
+} from './games/coinPusher';
+import type { PusherHole } from './games/coinPusher';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -116,7 +130,7 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher';
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -257,6 +271,26 @@ export interface SlotMachineVisualHandle {
   showMessage(message: string): void;
   /** Animate the physical axle/arm through one pull-and-return cycle. */
   pullLever(): void;
+}
+
+/**
+ * 🪙 In-world coin-pusher cabinet visuals. The pusher bar swings on a cosine
+ * profile that matches the pure engine's `pusherFaceX(phase)`, and the piles
+ * of chips on both platforms rebuild from the shared `pusher:<mid>` state each
+ * frame so every peer watches the same layout. World.update calls update(dt)
+ * every frame (the SlotMachineVisualHandle precedent — no detached rAF loop).
+ */
+export interface CoinPusherVisualHandle {
+  /** Advance the pusher animation phase and repaint pile visuals from the
+   *  shared doc state. Called every frame from World.update. */
+  update(deltaTime: number): void;
+  /** Flash the local hole-select highlight ring so the player sees which of
+   *  the three drop holes their next insert will use. */
+  setSelectedHole(hole: 0 | 1 | 2): void;
+  /** Show a short device-panel message on the marquee (BUSY / EMPTY / etc.). */
+  showMessage(message: string): void;
+  /** Drop-animation kickoff: puff of light at the chosen hole. */
+  triggerDropFx(hole: 0 | 1 | 2): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
@@ -3671,3 +3705,497 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     },
   };
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 🪙 Coin pusher (#135)
+// ══════════════════════════════════════════════════════════════════════════════
+
+export interface CoinPusherUIDeps {
+  /** Furniture item id — keys the state + queue + escrow records in the casino map. */
+  itemId: string;
+  /** Room-owner predicate — gates the OPEN DOOR affordance (owner-only empty). */
+  isHouse: () => boolean;
+  /** Optional visual hooks so the in-world cabinet mirrors DOM UI feedback. */
+  onSelectedHoleChange?(hole: PusherHole): void;
+  onMessage?(message: string): void;
+  onTriggerDropFx?(hole: PusherHole): void;
+}
+
+/** Timer identifier for the in-progress pusher operator loop; one per cabinet. */
+interface CoinPusherOperator {
+  running: boolean;
+  intervalId: number;
+  lastTickAt: number;
+}
+
+const coinPusherOperators = new Map<string, CoinPusherOperator>();
+
+/**
+ * Idempotent init: writes an `initialCoinPusherState` for `machineId` if none
+ * exists yet. Returns true on the write, false on a no-op or if the caller
+ * isn't authorised (`isHouse`).
+ *
+ * Kept exported so world.ts can seed a freshly-spawned cabinet with the room
+ * owner as its `ownerId` — the operator loop then starts without the panel
+ * ever having to open. The panel's mount() also calls this for the manual
+ * "someone just walked up and clicked" flow.
+ */
+export function ensureCoinPusherInitialized(machineId: string, isHouse: boolean): boolean {
+  if (!isHouse) return false;
+  if (readCoinPusherState(machineId)) return false;
+  writeCoinPusherState(machineId, initialCoinPusherState(getPlayerId(), Date.now()));
+  return true;
+}
+
+/**
+ * The MACHINE OWNER's client is the sole operator (the slot-machine croupier
+ * precedent). It drains the request queue, calls the pure engine's
+ * processInsert(), and publishes the reduced state. Runs at 4 Hz — insert
+ * requests are rare (player action) and free-running physics only advances
+ * the pusher; every write bumps `tick` so peers dedupe naturally.
+ */
+export function startCoinPusherOperator(machineId: string): void {
+  if (coinPusherOperators.has(machineId)) return;
+  const myId = getPlayerId();
+  const state0 = readCoinPusherState(machineId);
+  if (!state0 || state0.ownerId !== myId) return;
+  const op: CoinPusherOperator = {
+    running: true,
+    lastTickAt: Date.now(),
+    intervalId: window.setInterval(() => tickCoinPusherOperator(machineId), 250),
+  };
+  coinPusherOperators.set(machineId, op);
+}
+
+export function stopCoinPusherOperator(machineId: string): void {
+  const op = coinPusherOperators.get(machineId);
+  if (!op) return;
+  op.running = false;
+  window.clearInterval(op.intervalId);
+  coinPusherOperators.delete(machineId);
+}
+
+/** True when *this* client is running the operator loop for `machineId`. */
+export function isCoinPusherOperatorRunning(machineId: string): boolean {
+  return coinPusherOperators.has(machineId);
+}
+
+/**
+ * One operator step: process queued inserts, then advance free-running
+ * physics by the elapsed wall-clock delta. Every publish uses the atomic
+ * money-and-state helpers in casinoDoc so conservation holds across peers.
+ */
+function tickCoinPusherOperator(machineId: string): void {
+  const op = coinPusherOperators.get(machineId);
+  if (!op || !op.running) return;
+  const myId = getPlayerId();
+  let state = readCoinPusherState(machineId);
+  if (!state || state.ownerId !== myId) {
+    stopCoinPusherOperator(machineId);
+    return;
+  }
+  const now = Date.now();
+  // 1) Drain insert queue oldest-first (stable order under concurrent submits).
+  const requests = readCoinPusherRequests(machineId);
+  for (const req of requests) {
+    // The engine's processInsert stamps totalInserted + spawns the chip;
+    // clearCoinPusherInsert atomically removes the request record + escrow.
+    const seed = (Math.floor(now / 1000) ^ (req.requestedAt >>> 0)) >>> 0;
+    const result = processInsert(state, req.player, req.hole, req.timing, req.ante, seed, now);
+    state = result.state;
+    writeCoinPusherState(machineId, state);
+    clearCoinPusherInsert(machineId, req.player, req.requestId);
+  }
+  // 2) Free-running physics — pusher keeps sweeping between inserts so any
+  //    chip already near the tray edge eventually tips (the "attract-mode"
+  //    behaviour real coin pushers show while idle).
+  const dt = Math.max(0, Math.min(now - op.lastTickAt, 2000));
+  op.lastTickAt = now;
+  if (dt > 0) {
+    const advanced = advanceSim(state, dt, null);
+    if (advanced.paidChipIds.length > 0
+      || advanced.state.tick !== state.tick) {
+      state = advanced.state;
+      writeCoinPusherState(machineId, state);
+    }
+  }
+}
+
+/** Return currentPusherPhase(state) so external UI can preview the sweep. */
+export function coinPusherPhaseNow(state: Parameters<typeof currentPusherPhase>[0]): number {
+  return currentPusherPhase(state, Date.now());
+}
+
+/**
+ * Player-side insert helper. Debits the player's chip balance and writes the
+ * insert-request record via casinoDoc.submitCoinPusherInsert (one transact()).
+ * Returns false when the player is short of chips or already has an
+ * outstanding request on this machine.
+ */
+export function requestCoinPusherInsert(
+  machineId: string,
+  hole: PusherHole,
+  timing: number,
+  ante: number,
+): { ok: boolean; reason?: string; requestId?: string } {
+  const myId = getPlayerId();
+  if (readCoinPusherRequest(machineId, myId)) {
+    return { ok: false, reason: 'a previous insert is still pending' };
+  }
+  if (readChips(myId) < ante) {
+    return { ok: false, reason: 'not enough chips — visit the cashier' };
+  }
+  const requestedAt = Date.now();
+  const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
+  const ok = submitCoinPusherInsert(machineId, {
+    requestId,
+    player: myId,
+    hole,
+    timing,
+    ante,
+    requestedAt,
+  });
+  return ok ? { ok: true, requestId } : { ok: false, reason: 'insert refused (concurrent)' };
+}
+
+/**
+ * Player-side payout claim helper. If the shared state has any pendingCredit
+ * for the local player, transfer it to their chip balance in one transact().
+ */
+export function claimCoinPusherWinnings(machineId: string): number {
+  const state = readCoinPusherState(machineId);
+  if (!state) return 0;
+  const myId = getPlayerId();
+  const claim = claimPendingCredit(state, myId);
+  if (claim.amount <= 0) return 0;
+  const ok = claimCoinPusherPayout(machineId, claim.state, myId, claim.amount);
+  return ok ? claim.amount : 0;
+}
+
+/**
+ * Owner-side empty helper: runs the engine's emptyMachine() (owner-gated) and
+ * publishes state+chip-credit atomically via casinoDoc.commitCoinPusherEmpty.
+ * Returns the number of chips actually credited; 0 means non-owner / empty
+ * machine / balance overflow (documented safety guards).
+ */
+export function openCoinPusherDoor(machineId: string): number {
+  const state = readCoinPusherState(machineId);
+  if (!state) return 0;
+  const myId = getPlayerId();
+  const result = emptyMachine(state, myId);
+  if (!result.ok || result.emptied === 0) return 0;
+  const ok = commitCoinPusherEmpty(machineId, result.state, myId, result.emptied);
+  return ok ? result.emptied : 0;
+}
+
+/**
+ * Player-side reconciler for stale inserts (owner offline). Refunds the
+ * escrow to the player's `bal:<pid>` when the request has aged past its
+ * TTL and both records still match. Returns the refunded chip count.
+ */
+export function reclaimStaleCoinPusherEscrow(machineId: string): number {
+  const myId = getPlayerId();
+  return refundExpiredCoinPusherRequest(machineId, myId, Date.now());
+}
+
+/**
+ * The player's DOM UI for a coin pusher. Three big drop-hole buttons + a
+ * sliding timing bar + an INSERT ante action + a chip-in-machine counter + an
+ * owner-only OPEN DOOR affordance. The panel subscribes to `pusher:<mid>` so
+ * every operator write repaints without polling.
+ */
+export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let selectedHole: PusherHole = 1;
+  let selectedTiming = 0.5; // 0.5 = perfect centre; edges are the missed-timing extremes
+  let ante = 1;
+  let flash = '';
+  let claimTimer = 0;
+  const myId = getPlayerId();
+
+  const currentState = () => readCoinPusherState(deps.itemId);
+
+  const setSelectedHole = (hole: PusherHole): void => {
+    selectedHole = hole;
+    deps.onSelectedHoleChange?.(hole);
+    render();
+  };
+
+  const setTiming = (value: number): void => {
+    if (!Number.isFinite(value)) return;
+    selectedTiming = Math.max(0, Math.min(1, value));
+    render();
+  };
+
+  const setAnte = (value: number): void => {
+    if (!Number.isSafeInteger(value) || value <= 0) return;
+    ante = Math.min(PUSHER_MAX_ANTE, value);
+    render();
+  };
+
+  const insertOne = (): void => {
+    const result = requestCoinPusherInsert(deps.itemId, selectedHole, selectedTiming, ante);
+    if (!result.ok) {
+      flash = (result.reason ?? 'insert refused').toUpperCase();
+      deps.onMessage?.(flash);
+      render();
+      return;
+    }
+    flash = 'DROP!';
+    deps.onMessage?.('DROP');
+    deps.onTriggerDropFx?.(selectedHole);
+    render();
+  };
+
+  const emptyBox = (): void => {
+    if (!deps.isHouse()) {
+      flash = 'OWNER ONLY';
+      render();
+      return;
+    }
+    const emptied = openCoinPusherDoor(deps.itemId);
+    if (emptied === 0) {
+      flash = 'MACHINE IS EMPTY';
+    } else {
+      flash = `EMPTIED ${emptied} CHIPS`;
+    }
+    render();
+  };
+
+  const refundStale = (): void => {
+    const refunded = reclaimStaleCoinPusherEscrow(deps.itemId);
+    if (refunded > 0) {
+      flash = `REFUNDED ${refunded} CHIPS`;
+      render();
+    }
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const state = currentState();
+    const inMachine = state ? chipsInMachine(state) : 0;
+    const pendingMine = state?.pendingCredit[myId] ?? 0;
+    const conservation = state ? computeConservation(state) : null;
+    panel.querySelector<HTMLElement>('#cp-in-machine')!.textContent =
+      String(inMachine);
+    panel.querySelector<HTMLElement>('#cp-mine-pending')!.textContent =
+      String(pendingMine);
+    panel.querySelector<HTMLElement>('#cp-my-chips')!.textContent =
+      String(readChips(myId));
+    const status = panel.querySelector<HTMLElement>('#cp-status')!;
+    status.textContent = flash || (state?.ownerId
+      ? `MACHINE ${state.ownerId === myId ? '(YOURS)' : 'OWNED BY ' + state.ownerId.slice(0, 8)}`
+      : 'NOT INITIALISED');
+    // Highlight the selected hole button and disable non-integer choices.
+    for (let i = 0; i < HOLE_COUNT; i++) {
+      const btn = panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`);
+      if (!btn) continue;
+      btn.style.borderColor = i === selectedHole ? '#D4A84B' : '#3A424C';
+      btn.style.background = i === selectedHole
+        ? 'rgba(212,168,75,0.18)' : 'rgba(212,168,75,0.05)';
+    }
+    // Reflect timing on the slider.
+    const timingSlider = panel.querySelector<HTMLInputElement>('#cp-timing');
+    if (timingSlider) timingSlider.value = String(Math.round(selectedTiming * 100));
+    const timingLabel = panel.querySelector<HTMLElement>('#cp-timing-label');
+    if (timingLabel) {
+      timingLabel.textContent = `TIMING: ${(selectedTiming * 100).toFixed(0)}%`;
+    }
+    // Ante value.
+    const anteInput = panel.querySelector<HTMLInputElement>('#cp-ante');
+    if (anteInput) anteInput.value = String(ante);
+    // Insert button enabled only when player is present and chip supply allows.
+    const insertBtn = panel.querySelector<HTMLButtonElement>('#cp-insert');
+    if (insertBtn) {
+      const canInsert = state !== null
+        && readChips(myId) >= ante
+        && !readCoinPusherRequest(deps.itemId, myId);
+      insertBtn.disabled = !canInsert;
+      insertBtn.textContent = canInsert
+        ? `INSERT ${ante} CHIP${ante === 1 ? '' : 'S'} · HOLE ${selectedHole + 1}`
+        : (state === null ? 'MACHINE OFFLINE'
+          : readChips(myId) < ante ? 'NEED MORE CHIPS'
+            : 'INSERT PENDING…');
+    }
+    // Claim button appears when local player has pending credit.
+    const claimBtn = panel.querySelector<HTMLButtonElement>('#cp-claim');
+    if (claimBtn) {
+      claimBtn.disabled = pendingMine <= 0;
+      claimBtn.textContent = pendingMine > 0
+        ? `CLAIM ${pendingMine} CHIP${pendingMine === 1 ? '' : 'S'}`
+        : 'NO WINNINGS YET';
+    }
+    // OPEN DOOR only for the room owner + machine-owner match.
+    const doorRow = panel.querySelector<HTMLElement>('#cp-owner-row');
+    if (doorRow) {
+      doorRow.style.display = deps.isHouse() ? 'flex' : 'none';
+    }
+    const conservationLine = panel.querySelector<HTMLElement>('#cp-conservation');
+    if (conservationLine && conservation) {
+      conservationLine.textContent = conservation.balanced
+        ? `CONSERVED · IN ${conservation.chipsInMachine} · PAID ${conservation.totalPaid} · EMPTIED ${conservation.totalEmptied}`
+        : `!! CONSERVATION BROKEN — CONTACT OPERATOR !!`;
+      conservationLine.style.color = conservation.balanced ? GT_DIM : '#FF6060';
+    }
+    // Operator toggle (owner only, when this client is not automatically running it).
+    const opBtn = panel.querySelector<HTMLButtonElement>('#cp-operator-toggle');
+    if (opBtn) {
+      const isOwner = deps.isHouse();
+      opBtn.style.display = isOwner ? '' : 'none';
+      opBtn.textContent = isCoinPusherOperatorRunning(deps.itemId)
+        ? 'STOP OPERATOR LOOP'
+        : 'RUN OPERATOR LOOP';
+    }
+  };
+
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.code === 'ArrowLeft') { setSelectedHole(Math.max(0, selectedHole - 1) as PusherHole); event.preventDefault(); return; }
+    if (event.code === 'ArrowRight') { setSelectedHole(Math.min(HOLE_COUNT - 1, selectedHole + 1) as PusherHole); event.preventDefault(); return; }
+    if (event.code === 'Space') { insertOne(); event.preventDefault(); return; }
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      // A machine placement without state must be initialised by the owner
+      // exactly once — a spawn-time convenience so the first click is playable.
+      if (deps.isHouse() && !currentState()) {
+        writeCoinPusherState(deps.itemId, initialCoinPusherState(myId, Date.now()));
+      }
+      // The room owner also boots the operator loop for their machines so
+      // inserts drain automatically (the analogue of the slot-machine
+      // manual-croupier button; started here rather than by a click so it
+      // never depends on a UI open).
+      if (deps.isHouse() && !isCoinPusherOperatorRunning(deps.itemId)) {
+        startCoinPusherOperator(deps.itemId);
+      }
+      panel = document.createElement('div');
+      panel.id = 'device-coin-pusher-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 420px; max-height: 92vh; overflow-y: auto; box-sizing: border-box;
+        padding: 18px; display: flex; flex-direction: column; gap: 10px;
+        background: rgba(4, 8, 22, 0.95); border: 1px solid rgba(212, 168, 75, 0.35);
+        border-radius: 12px; color: ${GT_GOLD};
+        font-family: 'SF Mono','Consolas',monospace; pointer-events: auto;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+      `;
+      panel.innerHTML = `
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🪙 COIN PUSHER</div>
+        <div id="cp-status" style="min-height:14px;text-align:center;font-size:9px;color:${GT_GOLD_BRIGHT};font-weight:800;"></div>
+        <div style="display:flex;justify-content:space-between;font-size:9px;color:#E8ECF2;">
+          <span>YOUR CHIPS: <b id="cp-my-chips">0</b></span>
+          <span>IN MACHINE: <b id="cp-in-machine">0</b></span>
+          <span>PENDING YOURS: <b id="cp-mine-pending">0</b></span>
+        </div>
+        <div id="cp-conservation" style="font-size:8px;color:${GT_DIM};text-align:center;"></div>
+        <div style="display:flex;gap:6px;padding-top:6px;">
+          ${[0, 1, 2].map((i) => `
+            <button id="cp-hole-${i}" style="flex:1;padding:12px 6px;background:rgba(212,168,75,0.05);border:2px solid #3A424C;color:${GT_GOLD};font:800 10px inherit;cursor:pointer;">
+              HOLE ${i + 1}
+            </button>
+          `).join('')}
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px;padding-top:4px;">
+          <label id="cp-timing-label" style="font-size:9px;color:#E8ECF2;">TIMING: 50%</label>
+          <input id="cp-timing" type="range" min="0" max="100" value="50" style="width:100%;accent-color:#D4A84B;">
+          <div style="font-size:8px;color:${GT_DIM};text-align:center;">50% = centre; slide to lean drop LEFT or RIGHT of the hole.</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;padding-top:4px;">
+          <label style="font-size:9px;color:#E8ECF2;">ANTE</label>
+          <input id="cp-ante" type="number" min="1" max="${PUSHER_MAX_ANTE}" value="1" style="width:60px;background:#0A0E1F;border:1px solid #3A424C;color:${GT_GOLD};padding:4px;font:800 10px inherit;">
+          <span style="font-size:8px;color:${GT_DIM};">CHIPS PER INSERT (1 IS CLASSIC).</span>
+        </div>
+        <button id="cp-insert" style="padding:12px;background:rgba(0,192,96,0.12);border:1px solid #00A060;color:#8FFFC0;font:800 11px inherit;cursor:pointer;letter-spacing:1px;">INSERT</button>
+        <button id="cp-claim" style="padding:8px;background:rgba(212,168,75,0.10);border:1px solid #D4A84B;color:${GT_GOLD_BRIGHT};font:800 10px inherit;cursor:pointer;">NO WINNINGS YET</button>
+        <div id="cp-owner-row" style="display:none;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid rgba(212,168,75,.20);">
+          <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
+          <button id="cp-empty" style="padding:8px;background:rgba(230,80,60,0.10);border:1px solid #A03020;color:#FF9070;font:800 10px inherit;cursor:pointer;">OPEN DOOR &amp; EMPTY MACHINE</button>
+          <button id="cp-operator-toggle" style="padding:8px;background:rgba(212,168,75,0.08);border:1px solid #D4A84B;color:${GT_GOLD};font:800 9px inherit;cursor:pointer;">RUN OPERATOR LOOP</button>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button id="cp-refund" style="flex:1;padding:6px;background:transparent;border:1px solid ${GT_DIM};color:${GT_GOLD};font:800 8px inherit;cursor:pointer;">RECLAIM STALE ESCROW</button>
+        </div>
+        <div style="font-size:8px;color:${GT_DIM};text-align:center;">← / → SELECT HOLE · SPACE INSERT · CHIPS STAY IN MACHINE UNTIL OWNER OPENS THE DOOR OR THEY FALL OFF THE TRAY.</div>
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      for (let i = 0; i < HOLE_COUNT; i++) {
+        panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`)!
+          .addEventListener('click', () => setSelectedHole(i as PusherHole));
+      }
+      panel.querySelector<HTMLInputElement>('#cp-timing')!
+        .addEventListener('input', (e) => setTiming(Number((e.target as HTMLInputElement).value) / 100));
+      panel.querySelector<HTMLInputElement>('#cp-ante')!
+        .addEventListener('change', (e) => setAnte(Number((e.target as HTMLInputElement).value)));
+      panel.querySelector<HTMLButtonElement>('#cp-insert')!
+        .addEventListener('click', insertOne);
+      panel.querySelector<HTMLButtonElement>('#cp-claim')!
+        .addEventListener('click', () => {
+          const claimed = claimCoinPusherWinnings(deps.itemId);
+          if (claimed > 0) {
+            flash = `CLAIMED ${claimed} CHIPS`;
+            render();
+          }
+        });
+      panel.querySelector<HTMLButtonElement>('#cp-empty')!
+        .addEventListener('click', emptyBox);
+      panel.querySelector<HTMLButtonElement>('#cp-refund')!
+        .addEventListener('click', refundStale);
+      panel.querySelector<HTMLButtonElement>('#cp-operator-toggle')!
+        .addEventListener('click', () => {
+          if (!deps.isHouse()) return;
+          if (isCoinPusherOperatorRunning(deps.itemId)) {
+            stopCoinPusherOperator(deps.itemId);
+          } else {
+            startCoinPusherOperator(deps.itemId);
+          }
+          render();
+        });
+      window.addEventListener('keydown', onKeyDown);
+      host.appendChild(panel);
+      unsubscribe = subscribeCasinoKey(`pusher:${deps.itemId}`, render);
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      window.removeEventListener('keydown', onKeyDown);
+      panel?.remove();
+      panel = null;
+    },
+    update(dt: number): void {
+      // Auto-claim heartbeat: if the player wanders away between clicks the
+      // pendingCredit can still be reconciled at ~1 Hz. Cheap; keeps chips
+      // moving so a paranoid player never sees stale winnings sit visible.
+      claimTimer += Math.max(0, dt);
+      if (claimTimer > 1) {
+        claimTimer = 0;
+        const s = currentState();
+        if (s && (s.pendingCredit[myId] ?? 0) > 0) {
+          claimCoinPusherWinnings(deps.itemId);
+        }
+      }
+    },
+  };
+}
+
+/** Called from world.ts teardown paths for a removed coin pusher — refunds any
+ *  outstanding escrows to their owners and shuts the local operator loop. The
+ *  casinoDoc key-clear happens in world.ts alongside furniture removal. */
+export function clearPendingCoinPusherPlays(machineId: string): void {
+  stopCoinPusherOperator(machineId);
+  const reqs = readCoinPusherRequests(machineId);
+  const now = Date.now();
+  for (const req of reqs) {
+    // Every peer refunds itself; a lost update simply retries next call.
+    if (req.player === getPlayerId()) {
+      refundExpiredCoinPusherRequest(machineId, req.player, now + 86_400_000);
+    }
+  }
+}
+
+/** Convenience for the pusher-face-x demo utilities. */
+export function coinPusherOperatorCount(): number {
+  return coinPusherOperators.size;
+}
+
