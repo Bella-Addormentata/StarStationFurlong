@@ -161,6 +161,7 @@ import {
   collectWindowOpenings,
   WINDOW_BOX_THICKNESS,
 } from "./windowLayout";
+import { collectDoorCuts } from "./doorCuts";
 import { computeOctagonProfile } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
 import { getCameraYaw, addStationBias, resetStationBias } from "./cameraRig";
@@ -1036,6 +1037,10 @@ export class World {
       { halfX, halfZ },
       collectWindowOpenings(),
       this.collectWallpaper(),
+      // 🚪 #92: cut a rectangular notch at every live door — 4th arg mirrors
+      // the shape of `collectWindowOpenings`, so the hull, its wallpaper, its
+      // window holes and its DOOR holes all rebuild off the same input snapshot.
+      collectDoorCuts(),
     );
     this.platformGroup.add(this.octagonHull.group);
     // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
@@ -1606,6 +1611,11 @@ export class World {
     this.dockingSystem?.repositionDoorGroups();
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
+    // 🚪 #92: rebuild the octagon hull so its cut notches follow the door
+    // moves this method just made — mirrors reconcileWindowLayout for windows
+    // (a door slide is a hole move; without this the hole floats behind the
+    // door). Gated on the flag + a live hull like every other rebuild caller.
+    if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
     // drag when the placement changed remotely (slider / another client's drag)
     // — the drag's stashed origin is stale now, so the editor drops it and the

@@ -14,7 +14,7 @@ import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
 import {
   physicalDoorPose, portForDoor, poseFromWall,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
   DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
 } from "./doorLayout";
 import type { PhysicalDoorPose } from "./doorLayout";
@@ -611,7 +611,11 @@ export class DoorDockingPortSystem {
       // again (they did: the old 2.4/1.4 openings matched no whole number of
       // cells while the validators assumed 2/1).
       const openingWidth = DOOR_OPENING_WIDTH;
-      const OPEN_H = 3.0; // opening height (local y -2 .. 1)
+      // 🚪 #92: opening height shared with the HULL CUT via DOOR_OPENING_HEIGHT
+      // (doorLayout.ts). Kept as a local alias so the rest of this builder reads
+      // exactly as before, but one edit up there now moves the frame AND the
+      // hole in lock-step (local y range is [FLOOR_Y, FLOOR_Y + OPEN_H]).
+      const OPEN_H = DOOR_OPENING_HEIGHT;
       const POST_W = DOOR_POST_WIDTH; // side post width
       const FRAME_D = 0.5; // frame depth
       const FLOOR_Y = -2; // local floor level
