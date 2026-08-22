@@ -3530,6 +3530,13 @@ export class World {
         fadeEnabled,
         this.player.getActiveDoorId(),
       );
+      // 🦾 #62: articulate every ROBOT ARM every frame — shoulder yaws +
+      // elbow un-folds toward the door of any live pairing an arm covers,
+      // eases back to the parked pose when the pairing resolves. Pass a
+      // group resolver so docking.ts stays free of world imports.
+      this.dockingSystem.updateRobotArms(deltaTime, (id) =>
+        this.furnitureGroups.get(id) ?? null,
+      );
     }
 
     // 🛑📐 #80 S1: drive the octagon hull's camera-facing wall transparency —
