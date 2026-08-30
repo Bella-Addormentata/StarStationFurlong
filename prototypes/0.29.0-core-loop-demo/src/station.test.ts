@@ -13,9 +13,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  STATION_ATLAS_SEED,
   STATION_ROOM_ID,
   STATION_ROOM_KEY_B64,
   STATION_SEED_HINTS,
+  firstBootAtlasSeed,
   hasSharedStation,
   hasSharedStationSeed,
   isSharedStationRoom,
@@ -103,6 +105,106 @@ describe('station.ts — sharedStationBootstrap descriptor', () => {
       if (returnedAddrs && bakedAddrs) {
         expect(returnedAddrs).not.toBe(bakedAddrs);
       }
+    }
+  });
+});
+
+describe('station.ts — first-boot atlas seed (#79 P6)', () => {
+  it('names the shared station room as the hub entry', () => {
+    // The seed must include the station itself, otherwise a first-run boot
+    // in the station has no entry to BFS from and the exterior renders nothing.
+    const hub = STATION_ATLAS_SEED.find((e) => e.roomId === STATION_ROOM_ID);
+    expect(hub).toBeDefined();
+    expect(hub!.doors.length).toBeGreaterThan(0);
+  });
+
+  it('every door names an entry that exists in the seed (spoke topology closes)', () => {
+    // A door pointing at a room the seed does not describe would render as a
+    // dead-end stub in the exterior — the whole reason to bake the seed is to
+    // show a complete visible shell BEFORE any gossip.
+    const ids = new Set(STATION_ATLAS_SEED.map((e) => e.roomId));
+    for (const entry of STATION_ATLAS_SEED) {
+      for (const door of entry.doors) {
+        expect(ids.has(door.targetRoomId)).toBe(true);
+      }
+    }
+  });
+
+  it('every door uses a valid cardinal wall (x+/x-/y+/y-)', () => {
+    // The exterior renderer poses neighbours off the wall vocabulary — a
+    // legacy compass label would silently drop back to the fallback pose.
+    const walls = new Set(['x+', 'x-', 'y+', 'y-']);
+    for (const entry of STATION_ATLAS_SEED) {
+      for (const door of entry.doors) {
+        expect(walls.has(door.wall)).toBe(true);
+        if (door.farWall !== undefined) {
+          expect(walls.has(door.farWall)).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('NO door carries a targetSeed — credentials do not ride in the baked seed', () => {
+    // Security invariant: the baked seed is GEOMETRY and NAMES only. A
+    // credential in here would ship to every install and, worse, be pushed
+    // into the shared doc if the sentinel guard ever regressed.
+    for (const entry of STATION_ATLAS_SEED) {
+      for (const door of entry.doors) {
+        // targetSeed is not even part of the seed-door shape — assert the
+        // runtime shape has no such key so a future refactor cannot slip
+        // one in unnoticed.
+        expect(Object.prototype.hasOwnProperty.call(door, 'targetSeed')).toBe(false);
+      }
+    }
+  });
+
+  it('firstBootAtlasSeed() returns a DEFENSIVE COPY — mutating it does not corrupt the constant', () => {
+    // Same discipline as sharedStationBootstrap. This one matters MORE because
+    // main.ts will pass the returned array into a store-mutating merge — a
+    // shallow copy would let a merge-time patch leak back into the constant
+    // and change what the NEXT boot sees.
+    const seedA = firstBootAtlasSeed();
+    const bakedLen = STATION_ATLAS_SEED.length;
+    const bakedHub = STATION_ATLAS_SEED.find((e) => e.roomId === STATION_ROOM_ID)!;
+    const bakedHubDoorsLen = bakedHub.doors.length;
+
+    // Mutate every layer we care about.
+    seedA.push({ roomId: 'MUTANT', name: 'nope', doors: [] });
+    const hubCopy = seedA.find((e) => e.roomId === STATION_ROOM_ID)!;
+    hubCopy.name = 'CORRUPTED';
+    hubCopy.doors.push({ doorId: 'nope', targetRoomId: 'MUTANT', wall: 'y-', lateral: 999 });
+    if (hubCopy.doors[0]) hubCopy.doors[0].lateral = 1234;
+
+    // The constants are unchanged.
+    expect(STATION_ATLAS_SEED.length).toBe(bakedLen);
+    expect(STATION_ATLAS_SEED.find((e) => e.roomId === 'MUTANT')).toBeUndefined();
+    expect(bakedHub.name).not.toBe('CORRUPTED');
+    expect(bakedHub.doors.length).toBe(bakedHubDoorsLen);
+    if (bakedHub.doors[0]) expect(bakedHub.doors[0].lateral).not.toBe(1234);
+
+    // A fresh accessor yields the pristine values.
+    const seedB = firstBootAtlasSeed();
+    expect(seedB.length).toBe(bakedLen);
+    expect(seedB.find((e) => e.roomId === 'MUTANT')).toBeUndefined();
+    expect(seedB.find((e) => e.roomId === STATION_ROOM_ID)!.name).toBe(bakedHub.name);
+  });
+
+  it('firstBootAtlasSeed() preserves every door field the merger consumes', () => {
+    // A defensive-copy bug that dropped, say, farWall would silently break
+    // the pose composition. Assert the exact field shape survives a copy.
+    const bakedHub = STATION_ATLAS_SEED.find((e) => e.roomId === STATION_ROOM_ID)!;
+    const copiedHub = firstBootAtlasSeed().find((e) => e.roomId === STATION_ROOM_ID)!;
+    expect(copiedHub.doors.length).toBe(bakedHub.doors.length);
+    for (let i = 0; i < bakedHub.doors.length; i++) {
+      const a = bakedHub.doors[i];
+      const b = copiedHub.doors[i];
+      expect(b.doorId).toBe(a.doorId);
+      expect(b.targetRoomId).toBe(a.targetRoomId);
+      expect(b.wall).toBe(a.wall);
+      expect(b.lateral).toBe(a.lateral);
+      expect(b.farDoor).toBe(a.farDoor);
+      expect(b.farWall).toBe(a.farWall);
+      expect(b.farLateral).toBe(a.farLateral);
     }
   });
 });

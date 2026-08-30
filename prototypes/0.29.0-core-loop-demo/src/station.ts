@@ -1,11 +1,21 @@
 /**
- * 🛰️ The shared default station (#79 P3).
+ * 🛰️ The shared default station (#79 P3 + P6).
  *
  * Instead of every fresh install minting its own random `home-*` room
  * (identity.ts getDefaultRoomId), a FIRST-RUN install boots into ONE common
  * station: a small welcome room (a clone-vat + one door) that everyone shares.
  * Returning installs keep their own home / last location (#79 P4) — this only
  * changes where a brand-new install lands.
+ *
+ * P6 (#79) also bakes a FIRST-BOOT ATLAS SNAPSHOT here: on a very first boot
+ * the local station-atlas cache is empty and the exterior view can only render
+ * the ONE module we happen to have joined ("empty/single-module view" the
+ * owner ask calls out). The snapshot below carries the shared station's known
+ * cardinal-door layout, so the exterior renders the WHOLE station immediately;
+ * once real peers gossip or the current room's own harvest fires, the live
+ * data replaces our baked stubs (bootFlow.mergeFirstBootAtlas is
+ * non-destructive, and stationAtlas.pushAtlasToDoc skips entries carrying the
+ * `lastSeen === 0` first-boot sentinel so we never publish placeholder data).
  *
  * DURABLE vs SEED — the split that lets us change ownership without re-baking:
  *   • ROOM_ID + ROOM_KEY_B64 are the station's PERMANENT identity + encryption
@@ -125,4 +135,137 @@ export function sharedStationBootstrap(): {
       directAddrs: h.directAddrs ? [...h.directAddrs] : undefined,
     })),
   };
+}
+
+// ── 🗺️ FIRST-BOOT ATLAS SEED (#79 P6) ───────────────────────────────────────
+//
+// See the file header: on the very first boot the station-atlas store is
+// empty, and the exterior view has nothing to render but the ONE module we
+// happen to have joined. That produces the "empty / single-module view" the
+// owner ask calls out. To fix it we bake a KNOWN shell of the station in as
+// a first-boot seed the atlas can merge on top of an empty local store; once
+// real gossip arrives, the live entries overwrite our sentinel stubs (see
+// stationAtlas.mergeFirstBootAtlas + the pushAtlasToDoc `lastSeen === 0`
+// guard that keeps the sentinel data OUT of the shared doc).
+//
+// GEOMETRY + NAMES ONLY — no `targetSeed` credentials ride in the baked seed.
+// Doors record which cardinal wall they sit on so the exterior renderer can
+// pose neighbour modules, but the pass to DIAL a neighbour has to come from
+// real gossip (or from actually walking there through the shared station).
+
+/** A door on a first-boot seed entry — geometry + names only, no seeds. Wall
+ *  is a cardinal so the exterior can pose the far module without probing an
+ *  atlas we don't yet have. */
+export interface StationAtlasSeedDoor {
+  /** Door id in the near room (e.g. 'north' | 'south' | 'east' | 'west'). */
+  doorId: string;
+  /** Far room's stable id — matches another seed entry's roomId. */
+  targetRoomId: string;
+  /** The near door's wall in door-layout axis vocabulary (y-/y+/x+/x-). */
+  wall: 'x+' | 'x-' | 'y+' | 'y-';
+  /** Signed distance along the wall from centre (0 = centre of the wall). */
+  lateral: number;
+  /** Optional matching door on the far room. Baked when we know the ring
+   *  faces its opposite door (e.g. north↔south) so the pose composes. */
+  farDoor?: string;
+  farWall?: 'x+' | 'x-' | 'y+' | 'y-';
+  farLateral?: number;
+}
+
+/** A first-boot seed atlas entry — the same shape the atlas store uses,
+ *  minus the timestamp (bakeed entries stamp `lastSeen: 0` as their sentinel;
+ *  see stationAtlas.mergeFirstBootAtlas). */
+export interface StationAtlasSeedEntry {
+  roomId: string;
+  name: string;
+  dims?: { cols: number; rows: number };
+  doors: StationAtlasSeedDoor[];
+}
+
+/**
+ * The baked first-boot atlas for the shared station.
+ *
+ * Layout: a hub-and-four-arms shell — the shared station room in the middle,
+ * four cardinal-doored neighbour modules stubbed around it. Names are
+ * placeholders that any real gossip will overwrite; door wall+lateral drives
+ * the exterior renderer's neighbour placement (see stationAtlas.atlasLayout,
+ * which BFS'es from the current room and composes each hop's pose).
+ *
+ * Why FOUR arms: exteriorView renders whatever atlasLayout returns, and
+ * atlasLayout returns every module reachable from the current room. A four-
+ * neighbour shell gives the "full station" visual the owner asks for on the
+ * very first boot without pretending we know the whole octagon (which the
+ * shared doc's own gossip fills in once a real peer joins).
+ *
+ * ⚠️ No `targetSeed` fields — a baked seed is GEOMETRY, not a credential. To
+ * ACTUALLY walk through one of these stubbed doors, real gossip has to
+ * supply the pass first.
+ */
+export const STATION_ATLAS_SEED: StationAtlasSeedEntry[] = [
+  {
+    roomId: STATION_ROOM_ID,
+    name: 'Furlong Station',
+    doors: [
+      // Cardinal doors at the wall centres — the exterior renders each
+      // neighbour flush against the named wall.
+      { doorId: 'north', targetRoomId: 'furlong-atrium',      wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0 },
+      { doorId: 'south', targetRoomId: 'furlong-market',      wall: 'y+', lateral: 0, farDoor: 'north', farWall: 'y-', farLateral: 0 },
+      { doorId: 'east',  targetRoomId: 'furlong-observatory', wall: 'x+', lateral: 0, farDoor: 'west',  farWall: 'x-', farLateral: 0 },
+      { doorId: 'west',  targetRoomId: 'furlong-lounge',      wall: 'x-', lateral: 0, farDoor: 'east',  farWall: 'x+', farLateral: 0 },
+    ],
+  },
+  // Neighbour stubs — a single door back to the station so a client that
+  // somehow visits one first still sees the hub. No cross-arm doors: the
+  // baked shell is deliberately a spoke topology, and real gossip supplies
+  // whatever cross-connections the live station actually holds.
+  {
+    roomId: 'furlong-atrium',
+    name: 'Atrium',
+    doors: [
+      { doorId: 'south', targetRoomId: STATION_ROOM_ID, wall: 'y+', lateral: 0, farDoor: 'north', farWall: 'y-', farLateral: 0 },
+    ],
+  },
+  {
+    roomId: 'furlong-market',
+    name: 'Market',
+    doors: [
+      { doorId: 'north', targetRoomId: STATION_ROOM_ID, wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0 },
+    ],
+  },
+  {
+    roomId: 'furlong-observatory',
+    name: 'Observatory',
+    doors: [
+      { doorId: 'west',  targetRoomId: STATION_ROOM_ID, wall: 'x-', lateral: 0, farDoor: 'east',  farWall: 'x+', farLateral: 0 },
+    ],
+  },
+  {
+    roomId: 'furlong-lounge',
+    name: 'Lounge',
+    doors: [
+      { doorId: 'east',  targetRoomId: STATION_ROOM_ID, wall: 'x+', lateral: 0, farDoor: 'west',  farWall: 'x-', farLateral: 0 },
+    ],
+  },
+];
+
+/**
+ * Defensive-copy accessor for the first-boot seed. Same discipline as
+ * `sharedStationBootstrap`: the caller MUST NOT be able to mutate the baked
+ * constant. Every entry, every door, every array is a fresh instance.
+ */
+export function firstBootAtlasSeed(): StationAtlasSeedEntry[] {
+  return STATION_ATLAS_SEED.map((e) => ({
+    roomId: e.roomId,
+    name: e.name,
+    dims: e.dims ? { cols: e.dims.cols, rows: e.dims.rows } : undefined,
+    doors: e.doors.map((d) => ({
+      doorId: d.doorId,
+      targetRoomId: d.targetRoomId,
+      wall: d.wall,
+      lateral: d.lateral,
+      farDoor: d.farDoor,
+      farWall: d.farWall,
+      farLateral: d.farLateral,
+    })),
+  }));
 }

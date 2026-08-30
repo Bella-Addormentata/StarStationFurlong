@@ -20,6 +20,7 @@ import {
   chooseNewPlayer,
   confirmRestore,
   decideBootTarget,
+  decideInitialStage,
   isTerminal,
   openPaste,
   readyToFade,
@@ -283,6 +284,70 @@ describe('bootFlow — boot-title state machine (NEW PLAYER / LOAD FROM BACKUP)'
     expect(isTerminal({ kind: 'confirm', fingerprint: 'aa' })).toBe(false);
     expect(isTerminal({ kind: 'applied' })).toBe(true);
     expect(isTerminal({ kind: 'proceed' })).toBe(true);
+  });
+});
+
+// ─── decideInitialStage — first-run vs returning-install boot order ─────────
+
+describe('bootFlow.decideInitialStage — first-run vs returning boot order (#79 P6)', () => {
+  it('returns idle on a first-run install (no stored identity)', () => {
+    // The title screen MUST show NEW PLAYER + LOAD FROM BACKUP before any
+    // atlas view — the owner's boot-order rule. `idle` is the non-terminal
+    // stage so the curtain does not fade before a choice is made.
+    const stage = decideInitialStage(false);
+    expect(stage).toEqual({ kind: 'idle' });
+    expect(isTerminal(stage)).toBe(false);
+  });
+
+  it('returns proceed on a returning install (identity on disk)', () => {
+    // Existing users boot straight to their last location — the title screen
+    // still flashes for the dwell, but the fade is armed the moment exterior
+    // is ready (readyToFade sees proceedChosen=true immediately).
+    const stage = decideInitialStage(true);
+    expect(stage).toEqual({ kind: 'proceed' });
+    expect(isTerminal(stage)).toBe(true);
+  });
+
+  it('is a pure function of the single bool (no side effects, no hidden state)', () => {
+    // Same input → same output, indefinitely. The guarantee that lets main.ts
+    // call this once at wire-up time without worrying about racing anything.
+    for (let i = 0; i < 4; i++) {
+      expect(decideInitialStage(false)).toEqual({ kind: 'idle' });
+      expect(decideInitialStage(true)).toEqual({ kind: 'proceed' });
+    }
+  });
+
+  it('threads into readyToFade — a returning install fades once the room is ready', () => {
+    // Composed with readyToFade: proceedChosen is derived from the initial
+    // stage kind, so a returning install arms the curtain gate immediately.
+    const stage = decideInitialStage(true);
+    const proceedChosen = stage.kind === 'proceed';
+    expect(
+      readyToFade({
+        dwellDone: true,
+        exteriorReady: true,
+        proceedChosen,
+        alreadyFaded: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('threads into readyToFade — a first-run install BLOCKS the curtain until a choice', () => {
+    // Symmetry: `idle` never sets proceedChosen, so the gate stays closed —
+    // the atlas is not shown until NEW PLAYER (or CONFIRM after restore)
+    // promotes the stage to a terminal one.
+    const stage = decideInitialStage(false);
+    // Same derivation main.ts uses (stage.kind === 'proceed') — for idle it's
+    // false, so the composite gate refuses to fire.
+    const proceedChosen: boolean = stage.kind === 'proceed';
+    expect(
+      readyToFade({
+        dwellDone: true,
+        exteriorReady: true,
+        proceedChosen,
+        alreadyFaded: false,
+      }),
+    ).toBe(false);
   });
 });
 

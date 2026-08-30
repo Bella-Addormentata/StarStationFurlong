@@ -55,6 +55,7 @@ import {
 // they are looking at the shared station (never claim owner, never persist a
 // station-scoped `ssf-last-room`).
 import {
+  firstBootAtlasSeed,
   isSharedStationRoom,
   sharedStationBootstrap,
 } from "./station";
@@ -65,6 +66,7 @@ import {
   cancelConfirm,
   chooseNewPlayer,
   confirmRestore,
+  decideInitialStage,
   isTerminal,
   openPaste,
   readyToFade,
@@ -171,6 +173,7 @@ import {
   tickExterior,
 } from "./exteriorView";
 import {
+  applyFirstBootAtlas,
   harvestIntoAtlas,
   readAtlas,
   bindStationAtlasDoc,
@@ -6739,25 +6742,36 @@ async function init() {
  * outruns the exterior.
  */
 function setupClickToEnter() {
+  // 🗺️ #79 P6 FIRST-BOOT ATLAS: fold the baked shared-station shell into the
+  // local atlas store BEFORE any bind/render touches it, so the very first
+  // exterior view already sees the whole station (not the single joined
+  // module). Merge is non-destructive (rule 1) — a returning install's real
+  // visited entries are preserved verbatim, and repeat boots are a no-op.
+  // Baked entries carry lastSeen: 0, which pushAtlasToDoc's sentinel guard
+  // refuses to publish, so no fabricated geometry ever reaches the shared
+  // atlas of the station. Safe to call before or after networking comes up.
+  applyFirstBootAtlas(firstBootAtlasSeed());
+
   const MIN_DWELL_MS = 2800; // long enough to read the title + let sync start
   let dwellDone = false;
   let exteriorReady = false;
   let faded = false;
 
-  // 🆕 #79 P1/P5: a genuine first run (no stored identity seed) holds the
+  // 🆕 #79 P1/P5/P6: a genuine first run (no stored identity seed) holds the
   // title on a New Player / Load-from-Backup choice before the station
-  // reveals; a returning install auto-reveals its station as before
-  // (proceedChosen = true). The title screen's stage transitions run through
-  // the pure state machine in bootFlow.ts so the paste → confirm → applied
-  // sequence is testable + a stray click after applied cannot re-open the
-  // choice.
+  // reveals; a returning install auto-reveals its station as before. The
+  // pure controller `decideInitialStage` in bootFlow.ts owns the choice
+  // between `idle` (choice pending) and `proceed` (returning install), so
+  // the boot-order rule ("show NEW PLAYER + LOAD FROM BACKUP before the
+  // atlas on first run, fade straight to last location on a returning
+  // install") is a tested pure function, not a hand-computed bool here.
   const firstRun = !hasStoredIdentity();
-  let proceedChosen = !firstRun;
-  // Boot-title state — 'idle' shows NEW PLAYER / LOAD FROM BACKUP, 'paste'
-  // shows the recovery-key textarea, 'confirm' shows the identity preview +
-  // CONFIRM/CANCEL, 'applied' schedules the reload, 'proceed' fades to the
-  // atlas. Returning installs never leave the implicit 'proceed'.
-  let titleStage: BootTitleStage = { kind: 'idle' };
+  // The pure state machine picks the initial stage. `proceedChosen` is
+  // DERIVED from the stage kind so the boot flow's single source of truth
+  // is bootFlow.decideInitialStage / .chooseNewPlayer / .confirmRestore —
+  // the composite readyToFade gate reads the derived bool.
+  let titleStage: BootTitleStage = decideInitialStage(hasStoredIdentity());
+  let proceedChosen = titleStage.kind === 'proceed';
 
   const maybeFade = () => {
     if (

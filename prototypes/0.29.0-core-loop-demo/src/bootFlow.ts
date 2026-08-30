@@ -192,6 +192,29 @@ export function isTerminal(stage: BootTitleStage): boolean {
 }
 
 /**
+ * Pick the initial boot-title stage for THIS install (#79 P6 boot-order rule):
+ *
+ *   • FIRST-RUN install (no stored identity) → `idle` — the title screen SHOWS
+ *     the NEW PLAYER / LOAD FROM BACKUP choice before any atlas view, as the
+ *     owner asks: "the boot screen should offer NEW PLAYER and LOAD FROM
+ *     BACKUP before the atlas view". A choice must be made before the curtain
+ *     fades.
+ *   • RETURNING install (a stored identity is on disk) → `proceed` — the title
+ *     screen appears once, then fades STRAIGHT to the last-location atlas: no
+ *     clone-vat step, no restore prompt. The owner spec: "existing users boot
+ *     straight to their last location". `proceed` is terminal, so the composite
+ *     `readyToFade` gate arms as soon as the dwell + exterior are ready.
+ *
+ * The pure controller receives a bool (`hasStoredIdentity`) rather than
+ * calling into localStorage itself — main.ts resolves the impure question
+ * and passes the answer in. Keeps this file free of DOM/storage side effects
+ * and the transition trivially unit-testable.
+ */
+export function decideInitialStage(hasStoredIdentity: boolean): BootTitleStage {
+  return hasStoredIdentity ? { kind: 'proceed' } : { kind: 'idle' };
+}
+
+/**
  * NEW PLAYER — from any pre-terminal stage, jump straight to `proceed`. The
  * spec allows this at any point before Restore has been CONFIRMED: a user who
  * pasted their key by mistake can back out via NEW PLAYER (the paste box is
