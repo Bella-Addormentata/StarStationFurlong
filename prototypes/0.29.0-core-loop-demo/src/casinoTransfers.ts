@@ -350,12 +350,26 @@ export function compareTransfersForReplay(a: ChipTransfer, b: ChipTransfer): num
  *   guard so a hostile-but-signed chain cannot drive a running balance past
  *   Number.MAX_SAFE_INTEGER and corrupt the arithmetic).
  *
- * This mirrors the physical settlement writeChipTransfer already performs (it
- * debits/credits the real `bal:<pid>` keys, checking the LIVE balance — not
- * lifetime issuance — at write time). Aligning the read-side replay to that
- * closes a divergence in the shipped slice: a player could physically spend
- * chips they RECEIVED (the write succeeds, `Σ bal:*` conserved) yet see that
- * onward transfer REFUSED and hidden from the audit view on every peer.
+ * The DEBIT/CREDIT of each transfer mirrors the physical settlement
+ * writeChipTransfer already performs (it moves the real `bal:<pid>` keys,
+ * checking the LIVE balance — not lifetime issuance — at write time). Aligning
+ * the read-side replay to that closes a divergence in the shipped slice: a
+ * player could physically spend chips they RECEIVED (the write succeeds,
+ * `Σ bal:*` conserved) yet see that onward transfer REFUSED and hidden from
+ * the audit view on every peer.
+ *
+ * Honest limit — the SEED is cage issuance (`bought − cashed`), NOT the live
+ * `bal:<pid>`. Gambling winnings credit `bal:` WITHOUT bumping `bought:`
+ * (casinoDoc.creditChips is the payout path), so a net-up player's spendable
+ * balance is HIGHER than their seed here. Such a winnings-backed send still
+ * SETTLES physically — and the BANK CHIPS count reads `bal:` directly, so the
+ * money on screen stays correct — but this replay refuses it, so that one send
+ * is hidden from the TRANSFERS log until the sender's seed catches up. This is
+ * a mint-SAFE under-approximation (the replay can only HIDE a genuine send,
+ * never INVENT one) and is PRE-EXISTING — the earlier conservative rule hid it
+ * too, and more. Fully closing it needs a stable croupier-authored winnings
+ * counter (a monotonic `won:` seed input, distinct from bet refunds); that is
+ * a separate money-model slice tracked in TODO, not this read-side fix.
  *
  * No-mint proof: callers MUST sig-verify every record BEFORE partitioning
  * (see main.ts bankReadValidTransfers — verifyChipTransfer filters first), so
@@ -399,9 +413,18 @@ export function partitionValidTransfers(
   const valid: ChipTransfer[] = [];
   const refused: ChipTransfer[] = [];
   for (const t of sorted) {
-    // fromPlayerId !== toPlayerId is guaranteed by isChipTransfer (self-
-    // transfers are rejected on read), so touching both never aliases one
-    // running balance — the debit and credit target distinct entries.
+    // Self-transfer defense-in-depth. isChipTransfer already rejects
+    // fromPlayerId === toPlayerId on read, so no shipping caller reaches here
+    // with one — but this function is EXPORTED, and a future direct caller that
+    // skipped that filter would MINT: touching one pid as both sender and
+    // recipient aliases a single running balance, and the credit `set` below
+    // would overwrite the debit `set`, netting +amount from nothing. Refuse it
+    // here unconditionally so no-mint holds on THIS function's own terms, not
+    // only its callers'.
+    if (t.fromPlayerId === t.toPlayerId) {
+      refused.push(t);
+      continue;
+    }
     const from = touch(t.fromPlayerId);
     const nextTo = touch(t.toPlayerId) + t.amount;
     // Over-drain (amount beyond the sender's CURRENT balance) or an out-of-

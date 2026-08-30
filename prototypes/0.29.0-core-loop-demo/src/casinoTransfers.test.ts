@@ -30,6 +30,7 @@ import {
   transferSignBytes,
   verifyChipTransfer,
   TRANSFER_NONCE_MAX,
+  type ChipTransfer,
   type SenderIssuance,
   type VerifyIdentityFn,
 } from './casinoTransfers';
@@ -264,7 +265,7 @@ describe('chip transfers · partitionValidTransfers', () => {
   };
   const issuanceOf = (pid: string): SenderIssuance => issuanceMap[pid] ?? { bought: 0, cashed: 0 };
 
-  it('accepts transfers within the sender budget', () => {
+  it('accepts sends within the sender running balance', () => {
     const t1 = buildChipTransfer(baseInput({ amount: 100, nonce: 'n1', ts: 1000 }));
     const t2 = buildChipTransfer(baseInput({ amount: 200, nonce: 'n2', ts: 2000 }));
     const t3 = buildChipTransfer(baseInput({ amount: 200, nonce: 'n3', ts: 3000 }));
@@ -273,9 +274,9 @@ describe('chip transfers · partitionValidTransfers', () => {
     expect(refused).toHaveLength(0);
   });
 
-  it('refuses transfers over the sender budget', () => {
+  it('refuses a send over the sender running balance', () => {
     const t1 = buildChipTransfer(baseInput({ amount: 300, nonce: 'n1', ts: 1000 }));
-    // t2 would push cumulative outgoing to 600 > 500 issued → REFUSED
+    // t2's 300 exceeds ALICE's running balance (200 left after t1's 300) → REFUSED
     const t2 = buildChipTransfer(baseInput({ amount: 300, nonce: 'n2', ts: 2000 }));
     const { valid, refused } = partitionValidTransfers([t1, t2], issuanceOf);
     expect(valid.map((v) => v.id)).toEqual([t1.id]);
@@ -306,7 +307,7 @@ describe('chip transfers · partitionValidTransfers', () => {
     expect(refused).toHaveLength(1);
   });
 
-  it('tracks per-sender budgets independently', () => {
+  it('tracks per-player running balances independently', () => {
     // Alice can send 500; Carol can send only 100.
     const alicePays = buildChipTransfer(baseInput({ amount: 400, nonce: 'n1', ts: 1000 }));
     const carolPays = buildChipTransfer(baseInput({
@@ -317,6 +318,29 @@ describe('chip transfers · partitionValidTransfers', () => {
     const { valid, refused } = partitionValidTransfers([alicePays, carolPays], issuanceOf);
     expect(valid.map((v) => v.id)).toEqual([alicePays.id]);
     expect(refused.map((v) => v.id)).toEqual([carolPays.id]);
+  });
+
+  it('refuses a self-transfer passed directly (mint defense for non-read callers)', () => {
+    // partitionValidTransfers is EXPORTED. The read path strips self-transfers
+    // via isChipTransfer, but a future DIRECT caller might not — aliasing one
+    // pid as both sender and recipient would MINT if the debit/credit ran (the
+    // credit `set` overwrites the debit `set`, netting +amount). The function
+    // must refuse it on its OWN terms. buildChipTransfer throws on from===to,
+    // so hand-craft the row a naive caller could still hand straight in.
+    const legit = buildChipTransfer(baseInput({ amount: 100, nonce: 'n1', ts: 1000 }));
+    const self: ChipTransfer = {
+      ...legit, toPub: ALICE, toPlayerId: ALICE_PID,
+      amount: 400, nonce: 'self', ts: 2000, id: 'self-row',
+    };
+    // A follow-up that consumes ALICE's ENTIRE post-legit balance (500−100=400)
+    // and is EXACT-fit, so the over-drain guard alone can't be what refuses the
+    // self row (400 ≯ 400) — only the self-guard can. If the self row had
+    // minted into ALICE's balance, this exact-fit 400 would leave her over-
+    // drawn on some peer; refusing the self row is the only mint-safe outcome.
+    const after = buildChipTransfer(baseInput({ amount: 400, nonce: 'after', ts: 3000 }));
+    const { valid, refused } = partitionValidTransfers([legit, self, after], issuanceOf);
+    expect(valid.map((v) => v.id)).toEqual([legit.id, after.id]);
+    expect(refused.map((v) => v.id)).toEqual(['self-row']);
   });
 });
 
