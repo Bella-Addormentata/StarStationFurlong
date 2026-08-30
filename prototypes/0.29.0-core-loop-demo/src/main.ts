@@ -39,6 +39,7 @@ import {
   signNameCert,
   verifyNameCert,
   verifyIdentity,
+  signIdentity,
   exportRecoveryKey,
   importRecoveryKey,
   ysyncSigner,
@@ -52,9 +53,33 @@ const TREASURY_DEV_GENESIS = "0".repeat(64);
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
-import { bindCasinoDoc, readChips } from "./casinoDoc";
+import {
+  bindCasinoDoc,
+  readChips,
+  readBought,
+  readCashed,
+  writeChipTransfer,
+  readAllChipTransfers,
+  subscribeCasino,
+} from "./casinoDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
+// 💸 In-world chip transfers (issue #20 BANK send/receive slice). Every
+// transfer runs through the pure engine: build → shape/sig guards →
+// deterministic over-drain rule → block-list filter. The engine takes the
+// signature and verify functions as parameters so it stays crypto-free; the
+// app wires signIdentity / verifyIdentity here at the seam.
+import {
+  buildChipTransfer,
+  filterIncoming,
+  filterOutgoing,
+  partitionIncomingByBlocked,
+  partitionValidTransfers,
+  compareTransfersForReplay,
+  verifyChipTransfer,
+  type ChipTransfer,
+  type SenderIssuance,
+} from "./casinoTransfers";
 import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
@@ -1005,6 +1030,12 @@ async function joinRoomAtEpoch(
   }
   if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
   activeBootstrap = connectBoot;
+  // 💸 #20 send/receive: a room switch invalidates every field in the SEND
+  // panel — the recipient list is scoped to the OLD room's players, the chip
+  // balance is a per-room count, and the audit log we're about to render is
+  // the NEW room's. Clear the send state so a stale armed confirmation from
+  // the previous room can't fire against a coincidentally-matching pid here.
+  bankResetSendState();
   await syncAccessPass();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
@@ -1362,6 +1393,14 @@ async function joinRoomAtEpoch(
       if (dmActiveSession && !document.getElementById("dm-overlay")?.hasAttribute("hidden")) {
         renderDmMessages();
       }
+      // 💸 #20 send/receive: a mid-flight SEND with a just-blocked recipient
+      // must not survive as an armed confirmation — the two-step trust anchor
+      // depends on the recipient still being a legitimate roster row. Clear
+      // send state entirely (the panel re-opens fine on the next click) and
+      // repaint the BANK so the TRANSFERS log honours the new visibility
+      // partition without waiting for a doc event.
+      bankResetSendState();
+      renderBankApp();
     });
     initDirectMessages({
       resolve: resolveBridgeBootstrap,
@@ -1394,6 +1433,13 @@ async function joinRoomAtEpoch(
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
+    // 💸 #20 send/receive: a chip transfer landing in the room casino doc
+    // (either OURS just written, or a peer's arriving) must repaint the BANK
+    // so the audit log grows and any dependent balance line moves. Runs on
+    // ANY casino-doc change — cage balances, cashed marks, and the new xfer:*
+    // rows all live in the same map, so this repaint keeps every derived
+    // section (CHIPS count, TRANSFERS log, over-drain refusals) honest.
+    subscribeCasino(() => renderBankApp());
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
@@ -2892,6 +2938,41 @@ function harvestStationAtlas(): void {
 // Registry status. Balances in Chia arrive when the node serves a wallet
 // endpoint (the chia-lane build keeps its account node-side today) — the
 // panel says so honestly instead of faking a number.
+//
+// 💸 SEND / RECEIVE (issue #20 slice): the BANK grows a SEND CHIPS button and
+// a TRANSFERS block. Transfers move chips inside THIS ROOM'S casino between
+// two identities in the roster — physical settlement is atomic in one Yjs
+// transact (see casinoDoc.writeChipTransfer), the audit log runs through the
+// pure engine (see casinoTransfers.ts). Blocked identities cannot be picked
+// as a recipient, and incoming from a blocked identity is HIDDEN from the
+// audit UI but the physical credit is preserved (conservation). Every
+// success/refusal shows a plain-language note so the user always knows what
+// the click did.
+
+/** SEND panel state — module-scoped so the panel keeps its half-filled form
+ *  across the natural repaints subscribeCasino triggers. Reset when the user
+ *  cancels, sends, opens BANK fresh, or leaves the room (bankResetSendState). */
+let bankSendOpen = false;
+let bankSendPickedPid = "";
+/** Text-input value (not the parsed number) so the field stays exactly what
+ *  the user typed across repaints — "1.5" stays "1.5" and gets refused at
+ *  send time with an explicit note, rather than being silently reformatted. */
+let bankSendAmountText = "";
+/** Two-step guard mirroring the deed-handover pattern: the first click on
+ *  SEND arms the confirmation; a second click on the SAME (recipient, amount)
+ *  actually writes. Any change to picker/amount re-arms so the user can never
+ *  send by mis-tapping through a stale confirmation. */
+let bankSendConfirmArmed = false;
+/** Human-language feedback line displayed under the SEND panel. */
+let bankSendNote = "";
+
+function bankResetSendState(): void {
+  bankSendOpen = false;
+  bankSendPickedPid = "";
+  bankSendAmountText = "";
+  bankSendConfirmArmed = false;
+  bankSendNote = "";
+}
 
 function renderBankApp(): void {
   const view = document.getElementById("phone-app-bank");
@@ -2903,6 +2984,67 @@ function renderBankApp(): void {
   const myPub = getIdentityPub();
   const header = (t: string) =>
     `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+
+  // ── SEND CHIPS wiring (event delegation, wired once) ─────────────────────
+  // Same discipline as renderVenturesApp — a single click handler on the view
+  // dispatches on data-bank-action; input changes drop the confirmation so a
+  // stale arm cannot slip through. Fields survive repaints because subscribers
+  // never blow away the state variables, only re-render from them.
+  if (!view.dataset.wired) {
+    view.dataset.wired = "1";
+    view.addEventListener("change", (e) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      if (el.id === "bank-send-to") {
+        const sel = el as HTMLSelectElement;
+        bankSendPickedPid = sel.value;
+        bankSendConfirmArmed = false; // recipient change ⇒ re-arm
+        bankSendNote = "";
+        renderBankApp();
+      }
+    });
+    view.addEventListener("input", (e) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      if (el.id === "bank-send-amount") {
+        const inp = el as HTMLInputElement;
+        bankSendAmountText = inp.value;
+        bankSendConfirmArmed = false;
+        bankSendNote = "";
+        // Do NOT re-render on every keystroke — the input keeps focus and
+        // caret placement (a repaint would rebuild the DOM and eat both).
+        // We refresh the CONFIRM button label only if the amount changes
+        // WAY beyond the balance — for now, just update the note area.
+        const noteEl = document.getElementById("bank-send-note");
+        if (noteEl) noteEl.textContent = "";
+      }
+    });
+    view.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-bank-action]",
+      );
+      if (!el) return;
+      const action = el.dataset.bankAction;
+      if (action === "send-open") {
+        bankSendOpen = true;
+        bankSendConfirmArmed = false;
+        bankSendNote = "";
+      } else if (action === "send-cancel") {
+        bankResetSendState();
+      } else if (action === "send-submit") {
+        // Two-step: first click arms the confirmation, second executes.
+        const result = executeBankSend();
+        if (result === "armed") {
+          // fall through — repaint shows CONFIRM label
+        } else if (result === "sent") {
+          bankResetSendState();
+        }
+        // On refusal, bankSendNote carries the explanation; state persists
+        // so the user can correct the amount / recipient and try again.
+      }
+      renderBankApp();
+    });
+  }
 
   const current = ventureRecord();
   const ledger = ventureLedger();
@@ -2944,13 +3086,11 @@ function renderBankApp(): void {
       // 🎰 #69: chips are PER-CASINO records — and PHYSICAL (owner rule):
       // the BANK shows the chips themselves, never a total. Count them, or
       // walk to the room's CASHIER for the number.
+      // 💸 #20 send/receive: the SEND CHIPS button + panel + TRANSFERS log
+      // live inside this section so they follow the same "here in the room"
+      // fiction (the chip is a physical thing you hand across the felt).
       const chips = readChips(getPlayerId());
-      return chips > 0
-        ? `${header("CHIPS")}
-        <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
-        <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
-        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>`
-        : "";
+      return renderBankChipsSection(chips);
     })()}
     ${header("PROPERTY")}
     ${
@@ -2974,6 +3114,328 @@ function renderBankApp(): void {
       lands. Shares today are room records — same rules, no coins at risk.
     </div>
   `;
+}
+
+// ── 💸 SEND / RECEIVE — the BANK's in-world chip-transfer surface ────────────
+//
+// One HTML builder + one action executor. The HTML fragment is composed inside
+// renderBankApp's template literal; the executor mutates module state and
+// writes to the doc. Both keep the honest-limits stance from
+// brainstorming/phone-apps-breakdown.md §5: refusal explains itself, success
+// says exactly what moved and to whom.
+
+/** Room-scoped roster row usable as a SEND CHIPS recipient. */
+interface BankRosterRow {
+  playerId: string;
+  name: string;
+  pub: string;
+}
+
+/**
+ * Everyone in the current room's players map WITH a keyed identity, minus
+ * ourselves and minus anyone on the local block list. Legacy players without
+ * a `keyB64` are hidden from the picker (a signed transfer needs a pub for
+ * both parties). This is the deterministic honest recipient set.
+ */
+function bankSendRoster(): BankRosterRow[] {
+  const sync = yjsSync;
+  if (!sync) return [];
+  const players = sync.doc.getMap("players");
+  const myId = getPlayerId();
+  const myPub = getIdentityPub();
+  const blocked = blockedSet();
+  const rows: BankRosterRow[] = [];
+  players.forEach((value, key) => {
+    if (!value || typeof value !== "object") return;
+    if (key === myId) return; // never the sender themselves
+    const entry = value as Partial<PlayerEntry>;
+    const pub = typeof entry.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : "";
+    if (!pub) return; // keyless legacy entry — no place to route the sig
+    if (pub === myPub) return; // another install of same identity — not payable to self
+    if (blocked.has(pub)) return; // BLOCKED: cannot be a recipient (task req 6)
+    const name = typeof entry.name === "string" && entry.name ? entry.name : "Unknown-Clone";
+    rows.push({ playerId: key, name, pub });
+  });
+  // Deterministic ordering by name so the picker is stable across observers.
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+  return rows;
+}
+
+/**
+ * Every VALID transfer currently in the room's casino doc, in deterministic
+ * display order (oldest first — chronological). Shape guard + signature
+ * verify + over-drain refusal all applied. Callers project this through the
+ * incoming / outgoing / blocked filters.
+ */
+function bankReadValidTransfers(): ChipTransfer[] {
+  // Read every well-formed record (readAllChipTransfers already applied the
+  // shape + entry-key guards).
+  const all = readAllChipTransfers();
+  // Verify the sender's signature — reject anything a hostile peer wrote
+  // without holding the fromPub's identity key. Wrapping verifyIdentity here
+  // matches the pure engine's injected VerifyIdentityFn shape.
+  const signed = all.filter((t) => verifyChipTransfer(t, verifyIdentity));
+  // Over-drain refusal: fold in per-sender issuance from the cage keys.
+  const issuanceOf = (pid: string): SenderIssuance => ({
+    bought: readBought(pid),
+    cashed: readCashed(pid),
+  });
+  const { valid } = partitionValidTransfers(signed, issuanceOf);
+  return [...valid].sort(compareTransfersForReplay);
+}
+
+/**
+ * The HTML fragment for the CHIPS + SEND CHIPS + TRANSFERS blocks. Returns
+ * the empty string only when the player has no chips AND there is no send
+ * panel open AND no transfers to show — the block chooses honesty over
+ * always-visible clutter.
+ */
+function renderBankChipsSection(chips: number): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const header = (t: string) =>
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+  const roomId = activeBootstrap?.roomId ?? "";
+  const myPub = getIdentityPub();
+  const transfers = bankReadValidTransfers();
+  const myIncomingAll = filterIncoming(transfers, myPub);
+  const { visible: incomingVisible, hidden: incomingHidden } =
+    partitionIncomingByBlocked(myIncomingAll, blockedSet());
+  const outgoing = filterOutgoing(transfers, myPub);
+
+  // Suppress the whole section only when there is truly nothing to say.
+  if (chips === 0 && !bankSendOpen && incomingVisible.length === 0
+    && outgoing.length === 0 && incomingHidden === 0) {
+    return "";
+  }
+
+  const btnStyle =
+    "display:inline-block; padding:4px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.15); border:1px solid rgba(212,168,75,0.35); color:#f0c060; margin-top:6px;";
+  const dangerBtnStyle =
+    "display:inline-block; padding:4px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer; background:rgba(240,192,96,0.28); border:1px solid rgba(240,192,96,0.6); color:#1a1208; margin-top:6px;";
+  const cancelStyle =
+    "display:inline-block; padding:4px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.05); border:1px solid rgba(212,168,75,0.2); color:rgba(212,168,75,0.7); margin-top:6px; margin-left:6px;";
+  const inputStyle =
+    "flex:1; min-width:0; font-size:10px; padding:5px 7px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;";
+  const selectStyle =
+    "flex:1; min-width:0; font-size:10px; padding:5px 7px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;";
+
+  let chipsBlock = "";
+  if (chips > 0) {
+    chipsBlock = `
+      <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
+      <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
+      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>`;
+  } else if (bankSendOpen || outgoing.length > 0 || incomingVisible.length > 0 || incomingHidden > 0) {
+    // No chips right now, but a transfer or send panel is up — show a
+    // stat line so the section isn't a mystery.
+    chipsBlock = `
+      <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
+      <div style="margin-top:4px; font-size:10px; color:rgba(212,168,75,0.5);">No chips on hand right now.</div>`;
+  }
+
+  // SEND CHIPS button (only when we hold chips, and the panel isn't already
+  // open, and we're actually in a room with other keyed players).
+  const roster = bankSendRoster();
+  let sendControls = "";
+  if (!bankSendOpen && chips > 0 && roster.length > 0 && roomId) {
+    sendControls = `
+      <button type="button" data-bank-action="send-open" style="${btnStyle}">SEND CHIPS</button>`;
+  } else if (!bankSendOpen && chips > 0 && roster.length === 0) {
+    // Chips but no one to send to — honest tell instead of a dead button.
+    sendControls = `
+      <div style="font-size:9px; color:rgba(212,168,75,0.4); margin-top:6px;">
+        No one else here to send chips to.
+      </div>`;
+  }
+
+  // SEND panel — a two-step form. Amount is a text input (validated at
+  // send time) so refused values keep exactly what the user typed.
+  let sendPanel = "";
+  if (bankSendOpen) {
+    // If our picked recipient dropped out of the roster (they left / got
+    // blocked mid-repaint), clear the pick and re-arm.
+    const picked = roster.find((r) => r.playerId === bankSendPickedPid) ?? null;
+    if (!picked && bankSendPickedPid) {
+      bankSendPickedPid = "";
+      bankSendConfirmArmed = false;
+    }
+    const options = ['<option value="">— choose a recipient —</option>']
+      .concat(roster.map((r) => `<option value="${esc(r.playerId)}"${r.playerId === bankSendPickedPid ? " selected" : ""}>${esc(r.name)}</option>`))
+      .join("");
+    const parsed = Math.floor(Number(bankSendAmountText));
+    const validAmount = Number.isSafeInteger(parsed) && parsed > 0 && parsed <= chips;
+    const canSubmit = !!picked && validAmount;
+    const submitLabel = bankSendConfirmArmed && canSubmit
+      ? `CONFIRM SEND ${parsed} to ${esc(picked!.name)}`
+      : "SEND";
+    const submitStyle = bankSendConfirmArmed && canSubmit ? dangerBtnStyle : btnStyle;
+    const helpText = roster.length === 0
+      ? "No one else here to send chips to."
+      : "Pick who — pick how many — tap SEND, then CONFIRM SEND.";
+    sendPanel = `
+      <div style="margin-top:8px; padding:8px 10px; border:1px solid rgba(212,168,75,0.25); border-radius:8px; background:rgba(0,0,0,0.15);">
+        <div style="font-size:10px; font-weight:800; color:#f0c060;">SEND CHIPS · this room</div>
+        <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">${esc(helpText)}</div>
+        <div style="display:flex; gap:6px; align-items:center; margin-top:8px;">
+          <label for="bank-send-to" style="font-size:10px; color:rgba(212,168,75,0.7); min-width:32px;">To</label>
+          <select id="bank-send-to" style="${selectStyle}">${options}</select>
+        </div>
+        <div style="display:flex; gap:6px; align-items:center; margin-top:6px;">
+          <label for="bank-send-amount" style="font-size:10px; color:rgba(212,168,75,0.7); min-width:32px;">Chips</label>
+          <input id="bank-send-amount" type="number" min="1" step="1" max="${chips}" placeholder="how many"
+                 value="${esc(bankSendAmountText)}" style="${inputStyle}" />
+          <span style="font-size:9px; color:rgba(212,168,75,0.5);">of ${chips}</span>
+        </div>
+        <div style="margin-top:6px;">
+          <button type="button" data-bank-action="send-submit" style="${submitStyle}"${canSubmit ? "" : " disabled"}>${esc(submitLabel)}</button>
+          <button type="button" data-bank-action="send-cancel" style="${cancelStyle}">Cancel</button>
+        </div>
+        <div id="bank-send-note" style="margin-top:6px; font-size:9px; color:rgba(212,168,75,0.7); min-height:12px;">${esc(bankSendNote)}</div>
+      </div>`;
+  }
+
+  // Audit-log block: incoming (visible + hidden count) and outgoing.
+  const fmtTs = (ts: number) => {
+    if (!Number.isFinite(ts)) return "";
+    // Deterministic HH:MM — no locale surprises.
+    const d = new Date(ts);
+    const h = String(d.getHours()).padStart(2, "0");
+    const m = String(d.getMinutes()).padStart(2, "0");
+    return `${h}:${m}`;
+  };
+  const nameForPub = (pub: string, fallback: string): string => {
+    // The players map is keyed by pid — walk it to find whoever posted this
+    // pub, so the audit line reads "Alice" not "abc123…". Unknown → fallback.
+    const sync = yjsSync;
+    if (!sync) return fallback;
+    const players = sync.doc.getMap("players");
+    let hit = fallback;
+    players.forEach((value) => {
+      if (!value || typeof value !== "object" || hit !== fallback) return;
+      const e = value as Partial<PlayerEntry>;
+      if (e.keyB64 === pub && typeof e.name === "string" && e.name) hit = e.name;
+    });
+    return hit;
+  };
+  const AUDIT_CAP = 20;
+  const recent = <T,>(a: T[]): T[] => (a.length > AUDIT_CAP ? a.slice(a.length - AUDIT_CAP) : a);
+
+  let transferBlock = "";
+  if (incomingVisible.length > 0 || outgoing.length > 0 || incomingHidden > 0) {
+    const incRows = recent(incomingVisible).map((t) => `
+      <div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px; font-size:10px;">
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">↩︎ from ${esc(nameForPub(t.fromPub, "Unknown-Clone"))}</span>
+        <span style="flex-shrink:0; color:#7ec96b;">+${t.amount}</span>
+        <span style="flex-shrink:0; color:rgba(212,168,75,0.35); font-size:9px;">${fmtTs(t.ts)}</span>
+      </div>`).join("");
+    const outRows = recent(outgoing).map((t) => `
+      <div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px; font-size:10px;">
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">↪ to ${esc(nameForPub(t.toPub, "Unknown-Clone"))}</span>
+        <span style="flex-shrink:0; color:#f0c060;">-${t.amount}</span>
+        <span style="flex-shrink:0; color:rgba(212,168,75,0.35); font-size:9px;">${fmtTs(t.ts)}</span>
+      </div>`).join("");
+    const blockedNote = incomingHidden > 0
+      ? `<div style="font-size:9px; color:rgba(212,168,75,0.4); margin-top:6px;">${incomingHidden} incoming hidden from blocked identities (chips still credited).</div>`
+      : "";
+    transferBlock = `
+      ${header("TRANSFERS")}
+      ${incomingVisible.length > 0 ? `<div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px;">Received</div>${incRows}` : ""}
+      ${outgoing.length > 0 ? `<div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:6px;">Sent</div>${outRows}` : ""}
+      ${blockedNote}`;
+  }
+
+  return `${header("CHIPS")}${chipsBlock}${sendControls}${sendPanel}${transferBlock}`;
+}
+
+/**
+ * Execute a SEND click. Two-step:
+ *   - if the (recipient, amount) pair is valid and the confirmation is NOT
+ *     yet armed → arm it (bankSendConfirmArmed = true) and return "armed";
+ *     the repaint shows a distinct CONFIRM SEND label so the user reads what
+ *     they're about to do.
+ *   - if the pair is valid and confirmation IS armed → build the signed
+ *     transfer, write it to the doc, return "sent".
+ *   - invalid input → set bankSendNote to a plain-language reason and return
+ *     "refused"; the panel keeps the user's inputs so they can fix them.
+ */
+function executeBankSend(): "armed" | "sent" | "refused" {
+  const roomId = activeBootstrap?.roomId ?? "";
+  if (!roomId) {
+    bankSendNote = "Not in a room — cannot send chips here.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  const roster = bankSendRoster();
+  const picked = roster.find((r) => r.playerId === bankSendPickedPid) ?? null;
+  if (!picked) {
+    bankSendNote = "Pick a recipient from the list.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  const amount = Math.floor(Number(bankSendAmountText));
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    bankSendNote = "Enter a whole number of chips greater than zero.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  const myId = getPlayerId();
+  const myBal = readChips(myId);
+  if (amount > myBal) {
+    bankSendNote = `Not enough chips — you have ${myBal}, tried to send ${amount}.`;
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  // Two-step confirm: first click ARMS, second click sends.
+  if (!bankSendConfirmArmed) {
+    bankSendConfirmArmed = true;
+    bankSendNote = `Tap CONFIRM SEND to move ${amount} chips to ${picked.name}.`;
+    return "armed";
+  }
+  // Build the signed transfer at the app seam — nonce is 64 bits of local
+  // entropy, ts is the local clock (deterministic ordering key only, never
+  // authority). The engine's signer takes the canonical bytes and returns
+  // the base64url sig; signIdentity is the identity-key wire from keypair.ts.
+  let nonceHex = "";
+  try {
+    const nonceBytes = crypto.getRandomValues(new Uint8Array(8));
+    nonceHex = Array.from(nonceBytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    // Fallback: a millisecond stamp + Math.random. Not cryptographic but
+    // still collision-safe enough for id uniqueness (the id also bakes in
+    // fromPub / toPub / amount / ts).
+    nonceHex = `${Date.now().toString(16)}-${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+  }
+  const ts = Date.now();
+  let transfer: ChipTransfer;
+  try {
+    transfer = buildChipTransfer({
+      roomId,
+      fromPub: getIdentityPub(),
+      toPub: picked.pub,
+      fromPlayerId: myId,
+      toPlayerId: picked.playerId,
+      amount,
+      nonce: nonceHex,
+      ts,
+      sign: (bytes: Uint8Array) => signIdentity(bytes),
+    });
+  } catch (err) {
+    bankSendNote = `Could not build the transfer: ${(err as Error).message}`;
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  // Write to the doc — refuses on residual over-drain (a concurrent spend
+  // burned the balance between the arm and the send), on collision (dedup
+  // of an already-written transfer), or on the flood cap.
+  const ok = writeChipTransfer(transfer);
+  if (!ok) {
+    bankSendNote = "Send refused — either your chips just moved, or the room is full of transfers. Try again.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  bankSendNote = `Sent ${amount} chips to ${picked.name}.`;
+  return "sent";
 }
 
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────

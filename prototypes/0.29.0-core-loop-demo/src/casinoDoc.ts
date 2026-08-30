@@ -49,6 +49,10 @@ import type {
   SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
   SlotFundingConfig,
 } from './games/slots';
+import {
+  isValidChipTransferEntry, MAX_CHIP_TRANSFERS,
+} from './casinoTransfers';
+import type { ChipTransfer } from './casinoTransfers';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -154,6 +158,20 @@ export function readChips(playerId: string): number {
   return readCount(`bal:${playerId}`);
 }
 
+/** Lifetime chips issued to a player by the cage (buy-ins). Public getter for
+ *  the transfer-audit-log's over-drain rule — the deterministic replay needs
+ *  `bought − cashed` per sender to score whether a claimed transfer fits
+ *  their honest budget. */
+export function readBought(playerId: string): number {
+  return readCount(`bought:${playerId}`);
+}
+
+/** Lifetime chips a player has returned to the cage (cash-outs). Same
+ *  audit-log seam as `readBought`. */
+export function readCashed(playerId: string): number {
+  return readCount(`cashed:${playerId}`);
+}
+
 /** Cashier BUY-IN: the cage issues chips to the player (own-key writes). */
 export function buyInChips(playerId: string, amount: number): void {
   if (!Number.isInteger(amount) || amount <= 0) return;
@@ -219,6 +237,109 @@ export function readCageLedger(): CageLedger {
     }
   }
   return { issued, cashed, outstanding, houseNet: issued - cashed - outstanding, balances };
+}
+
+// ── 💸 In-world chip transfers (BANK send/receive, issue #20 slice) ──────────
+//
+// Transfers ride the same casino Y.Map as `xfer:<transferId>` records — one per
+// signed movement. Discipline follows the module header's rule set:
+//
+//   • Single-writer-per-key: the id is a hash of every non-signature field
+//     (see casinoTransfers.deriveChipTransferId), so a distinct transfer ALWAYS
+//     lands on a distinct key. Only the SENDER writes this key in normal play.
+//   • Whole-value LWW: `map.set(t.id, t)` writes the record atomically.
+//   • Physical settlement in ONE transact: the SENDER debits `bal:<from_pid>`
+//     and credits `bal:<to_pid>` inside the same transact as the xfer record.
+//     Conservation holds INSTANTLY (Σ bal:* unchanged); `readCageLedger`'s
+//     `outstanding = Σ bal:*` therefore stays consistent with `issued − cashed`
+//     across every transfer.
+//   • Over-drain refused at write time: `writeChipTransfer` refuses when the
+//     sender's own `bal:<from_pid>` is short (returns false; the UI surfaces
+//     that as an honest "not enough chips" tell). The reader-side over-drain
+//     rule lives in the pure engine (partitionValidTransfers) — that closes
+//     the hostile-mint window on the audit-log display.
+//   • bal:<to_pid> is a shared-writer window with the recipient's own
+//     buy-in / cash-out / bet writes. Same discipline as the croupier-payout
+//     window documented in the module header (disjoint in practice, at worst
+//     one lost update visible in the cage ledger). A signed on-doc transfer
+//     op is the enforceable path for the G4 Registry-chips phase.
+
+/**
+ * Write a signed chip transfer AND move the physical chips in one atomic
+ * transact. Returns true on success, false when:
+ *   - the sender's current `bal:<from_pid>` is < transfer.amount (over-drain
+ *     refusal — do not proceed even client-side)
+ *   - the xfer key already exists (double-send guard — id is deterministic
+ *     so an honest resend collides, and we do not overwrite the audit log)
+ *   - the recipient's next balance would not be a safe integer (bounds
+ *     defence — the ledger stays inside Number.MAX_SAFE_INTEGER)
+ *   - the transfer map is at MAX_CHIP_TRANSFERS (flood defence — a hostile
+ *     peer can still write directly, but honest sends respect the bound)
+ *
+ * The caller (main.ts BANK) MUST also refuse to send to a BLOCKED recipient
+ * BEFORE calling this function; the block-list decision belongs at the UI
+ * seam (blockedSet is local, per-viewer) not in this shared engine.
+ */
+export function writeChipTransfer(transfer: ChipTransfer): boolean {
+  // Own writes always shape-check locally — the entry guard on read is defence
+  // against hostile peers, not a substitute for local hygiene. The engine's
+  // entry guard asserts KEY === value.id (that's its hijack-defence contract),
+  // so we call it with the id-only key here (the module wraps each row on the
+  // wire with an `xfer:` prefix so the casino Y.Map keeps its namespacing;
+  // the wrap is bijective — see readAllChipTransfers for the unwrap).
+  if (!isValidChipTransferEntry(transfer.id, transfer)) return false;
+  const map = ensureMap();
+  const fromKey = `bal:${transfer.fromPlayerId}`;
+  const toKey = `bal:${transfer.toPlayerId}`;
+  const xferKey = `xfer:${transfer.id}`;
+  // Bounds + collision + over-drain + flood — every check BEFORE the transact
+  // so a rejected send never leaves a half-write.
+  if (map.has(xferKey)) return false;
+  const fromBal = readCount(fromKey);
+  if (fromBal < transfer.amount) return false;
+  const toBal = readCount(toKey);
+  const nextTo = toBal + transfer.amount;
+  if (!Number.isSafeInteger(nextTo)) return false;
+  // Count current xfer:* rows (cheap: one pass over the map keys — the room
+  // doc is small in this phase). The bound stops a runaway UI from spamming
+  // the doc; a hostile peer can still write, and the read side re-verifies.
+  let currentCount = 0;
+  for (const key of map.keys()) {
+    if (key.startsWith('xfer:')) currentCount += 1;
+    if (currentCount >= MAX_CHIP_TRANSFERS) return false;
+  }
+  boundDoc!.transact(() => {
+    map.set(fromKey, fromBal - transfer.amount);
+    map.set(toKey, nextTo);
+    map.set(xferKey, transfer);
+  });
+  return true;
+}
+
+/**
+ * Every well-formed chip transfer currently in the doc. Shape guard + entry
+ * guard applied per row; malformed / hijack-key rows silently dropped so a
+ * hostile peer cannot crash BANK repaint. Signature verification is a
+ * SEPARATE step (casinoTransfers.verifyChipTransfer) so callers can defer
+ * the expensive check behind their own filters (e.g. incoming-for-me only).
+ * Order is NOT guaranteed — the caller sorts (see compareTransfersForReplay
+ * in the pure engine).
+ */
+export function readAllChipTransfers(): ChipTransfer[] {
+  const out: ChipTransfer[] = [];
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith('xfer:')) continue;
+    // Strip the doc-layout `xfer:` prefix before handing to the engine's
+    // entry guard — the guard asserts KEY === value.id (its hijack-defence
+    // contract lives in the pure engine's key-namespace, not the doc's).
+    // A hostile peer that plants `xfer:t-aaa` with `value.id='t-bbb'` fails
+    // here just as it would fail if the peer wrote to `t-aaa` directly.
+    const idOnly = key.slice('xfer:'.length);
+    if (!isValidChipTransferEntry(idOnly, value)) continue;
+    out.push(value);
+    if (out.length >= MAX_CHIP_TRANSFERS) break;
+  }
+  return out;
 }
 
 // ── Roulette table state + bets ──────────────────────────────────────────────
@@ -826,5 +947,6 @@ if (typeof window !== 'undefined') {
     depositSlotFunding, withdrawSlotFunding,
     readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
     releaseSlotSharedBankrollLease,
+    writeChipTransfer, readAllChipTransfers,
   };
 }
