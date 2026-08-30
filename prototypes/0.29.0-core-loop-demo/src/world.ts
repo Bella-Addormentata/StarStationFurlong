@@ -72,7 +72,7 @@ import {
   rowToWorld,
   findPath,
 } from "./pathfinding";
-import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
+import { subscribeFurniture, readAllFurniture, readRawFurnitureValues } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
@@ -156,12 +156,16 @@ import {
   subscribeWallpaperLayout,
 } from "./wallpaperLayoutDoc";
 import {
+  deriveLegacyWallpapers,
+  mergeWithExplicit,
+} from "./wallpaperDerivation";
+import {
   surfaceCenterWorld,
   surfaceBasis,
   collectWindowOpenings,
   WINDOW_BOX_THICKNESS,
 } from "./windowLayout";
-import { computeOctagonProfile } from "./hullSection";
+import { computeOctagonProfile, narrowAxisFor } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
 import { getCameraYaw, addStationBias, resetStationBias } from "./cameraRig";
 
@@ -283,6 +287,14 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
   private octagonHull: OctagonHull | null = null;
+  /** 🖼️🩹 #80 S6 walls-migration: fingerprint of the DERIVED (legacy → wallpaper)
+   *  covering set from the last furniture-doc notification. Used to gate a hull
+   *  rebuild on furniture change — an every-move hull rebuild would thrash, but
+   *  the derivation must trigger one when a legacy brick-wall / window-wall
+   *  segment is added / removed / moved off the edge. Compared as a stable
+   *  string; "" ⇒ no coverings derived (the common case, and the sentinel that
+   *  makes a fresh-doc replay after leaveRoom re-notify correctly). */
+  private lastDerivedWallpaperKey = "";
   /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
    *  + their connector tubes, posed around the current room; shown ONLY in first
    *  person (update() gate) so looking OUT a window shows the real station. */
@@ -456,7 +468,16 @@ export class World {
     // shared `furniture` map whenever it changes. Subscribed ONCE here (not per
     // morph) — furnitureDoc re-notifies on every room (re)bind, and reconcile
     // is a no-op until the platform exists (empty map / no groups yet).
-    subscribeFurniture(() => this.reconcileFurniture(readAllFurniture()));
+    //
+    // 🖼️🩹 #80 S6 walls-migration: raw furniture values also feed the
+    // legacy-wallpaper derivation (collectWallpaper), so a change to a
+    // brick-wall / window-wall record must ALSO nudge the hull. We only rebuild
+    // when the DERIVED set actually changes (fingerprint compare) — otherwise
+    // ordinary furniture moves would thrash the hull unnecessarily.
+    subscribeFurniture(() => {
+      this.reconcileFurniture(readAllFurniture());
+      this.maybeReconcileDerivedWallpaper();
+    });
 
     // Door-pairing sync (issue #64): reconcile docked-module pairings from the
     // shared `doors` map whenever it changes. Subscribed ONCE here — doorsDoc
@@ -1040,14 +1061,35 @@ export class World {
     this.platformGroup.add(this.octagonHull.group);
     // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
     this.rebuildWindowClickBoxes();
+    // 🖼️🩹 #80 S6 walls-migration: this build already used the current derived
+    // set, so refresh the fingerprint. Skipping this would cause the next
+    // furniture-doc notification to see a stale mismatch and rebuild again
+    // for no visual change (double-rebuild on morph/rebind).
+    this.lastDerivedWallpaperKey = this.derivedWallpaperKey();
   }
 
   /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
-   *  hull to paint (readAllWallpaper Map → the record buildOctagonHull wants). */
+   *  hull to paint (readAllWallpaper Map → the record buildOctagonHull wants).
+   *
+   *  Read-repair for retired freestanding walls (df26789): a legacy room-doc
+   *  that still holds `brick-wall` / `window-wall` furniture records — which
+   *  `isFurnitureRecord` now silently drops — has its side walls derived from
+   *  those raw records via `deriveLegacyWallpapers`, so the design survives
+   *  the migration WITHOUT any doc rewrite. The owner's explicit wallpaper
+   *  writes always win via `mergeWithExplicit` — the derivation is only ever
+   *  a fallback for surfaces the owner has NOT deliberately re-skinned. */
   private collectWallpaper(): HullWallpapers {
-    const out: HullWallpapers = {};
-    for (const [surface, preset] of readAllWallpaper()) out[surface] = preset;
-    return out;
+    const explicit: HullWallpapers = {};
+    for (const [surface, preset] of readAllWallpaper()) explicit[surface] = preset;
+    const { halfX, halfZ } = roomHalfExtents();
+    const narrowAxis = narrowAxisFor(halfX, halfZ);
+    const narrowHalf = Math.min(halfX, halfZ);
+    const derived = deriveLegacyWallpapers(
+      readRawFurnitureValues(),
+      narrowHalf,
+      narrowAxis,
+    );
+    return mergeWithExplicit(derived, explicit);
   }
 
   /**
@@ -1342,10 +1384,53 @@ export class World {
    * 🖼️ #80 S6: rebuild the octagon hull when the shared wall-covering set
    * changes (paint / clear) — mirrors reconcileWindowLayout. The rebuild
    * re-reads collectWallpaper so each strip's material follows the doc.
+   * Also refreshes the derivation fingerprint so the furniture-side gate
+   * (maybeReconcileDerivedWallpaper) does not double-rebuild for the same
+   * effective wallpaper set right after this pass.
    */
   private reconcileWallpaper(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
     this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes
+    this.lastDerivedWallpaperKey = this.derivedWallpaperKey();
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+  }
+
+  /**
+   * 🖼️🩹 #80 S6 walls-migration: stable string fingerprint of the CURRENT
+   * derived (legacy → wallpaper) covering set — sorted by surface so the
+   * result is order-independent (Y.Map iteration is stable but we do not
+   * want to rely on that here). Empty ⇒ no legacy wall records currently
+   * affect any surface.
+   */
+  private derivedWallpaperKey(): string {
+    if (!OCTAGON_HULL) return "";
+    const { halfX, halfZ } = roomHalfExtents();
+    const narrowAxis = narrowAxisFor(halfX, halfZ);
+    const narrowHalf = Math.min(halfX, halfZ);
+    const derived = deriveLegacyWallpapers(
+      readRawFurnitureValues(),
+      narrowHalf,
+      narrowAxis,
+    );
+    return Object.keys(derived)
+      .sort()
+      .map((surface) => `${surface}=${derived[surface as HullSurface]}`)
+      .join("|");
+  }
+
+  /**
+   * 🖼️🩹 #80 S6 walls-migration: trigger a hull rebuild when — and only when —
+   * a furniture-doc change flipped the DERIVED wallpaper set. Called from the
+   * shared subscribeFurniture callback after reconcileFurniture, so ordinary
+   * furniture moves cost nothing extra and legacy wall records regain visual
+   * parity the instant they cross the edge threshold or appear / disappear.
+   */
+  private maybeReconcileDerivedWallpaper(): void {
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    const next = this.derivedWallpaperKey();
+    if (next === this.lastDerivedWallpaperKey) return;
+    this.lastDerivedWallpaperKey = next;
+    this.addOctagonHull(); // rebuild with the refreshed covering set
     if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
   }
 
