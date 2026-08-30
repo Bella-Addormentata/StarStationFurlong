@@ -8,7 +8,7 @@ import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
 import {
-  physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
+  physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
   type PhysicalDoorId,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
@@ -428,6 +428,11 @@ export class World {
   private doorLabelSigns = new Map<string, THREE.Group>();
   /** Casino-only marquee and colored ceiling lights (lazy-built). */
   private casinoDecor: THREE.Group | null = null;
+  /** 🧱 #66 S3: cached half-extents last consumed by reconcileRoomDims — every
+   *  floorPlan mutation fires our subscription (door slide, tile edit, dims
+   *  write), so this guard skips the expensive shell-rebuild when only the
+   *  non-dims parts changed. Reset in createPlatform (initial + morph). */
+  private lastAppliedDims: { halfX: number; halfZ: number } | null = null;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -585,6 +590,12 @@ export class World {
     // + shell derive from these. Default 2×2 room ⇒ {6,6} ⇒ 12×12, reproducing
     // every legacy literal below bit-for-bit.
     const { halfX, halfZ } = roomHalfExtents();
+    // 🧱 #66 S3: seed the reconcile-dims guard with what THIS platform is being
+    // built at, so a floorPlan mutation that doesn't touch dims (door slide,
+    // tile edit) skips reconcileRoomDims's full shell teardown. Reset here to
+    // cover morph restart (startMorph re-runs createPlatform, so the guard
+    // must not carry a stale value across the teardown).
+    this.lastAppliedDims = { halfX, halfZ };
     const platformW = 2 * halfX,
       platformD = 2 * halfZ;
 
@@ -1604,6 +1615,13 @@ export class World {
     setDoorRecords(stored.size ? stored : defaultDoorLayoutRecords());
     reposeDoorTargets();
     this.dockingSystem?.repositionDoorGroups();
+    // 🧱 #66 S3 (audit Fix 2): a slid or wall-repositioned door left its
+    // paired vestibule / connector chain floating at the OLD anchor —
+    // dockingSystem.repositionDoorGroups only re-poses the door hardware
+    // (frame / leaves / keypad), not the paired-connection tubes that live on
+    // this world. Re-pose them here so the connector always leaves the door
+    // face flush.
+    this.repositionPairedVestibules();
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
@@ -1611,6 +1629,269 @@ export class World {
     // — the drag's stashed origin is stale now, so the editor drops it and the
     // doc-derived pose stands, mirroring the doorLayout mid-drag abort.
     roomEdit.onDoorPlacementsChanged();
+  }
+
+  /**
+   * 🧱 #66 S3 (audit Fix 2): re-pose every LIVE paired vestibule / connector
+   * chain to the CURRENT door face. buildVestibule / buildConnectorChain both
+   * capture `physicalDoorPose(id)` at group-creation time and set the group's
+   * translation + rotation from it (adapter.ts:212–216, adapter.ts:996–1000);
+   * a door that has since slid along a wall — or the wall itself moving under
+   * a room resize — leaves the group frozen at the OLD anchor and the tube
+   * appears to drift out of the door frame.
+   *
+   * Connector chains fold OUTWARD from the door face (each segment is
+   * relative), so translating + rotating the whole group at the new door pose
+   * preserves the chain's shape end-to-end — no rebuild needed.
+   *
+   * A missing door record (mid-remove) must be SKIPPED, not posed to any wall.
+   * pairedVestibules is keyed by free `d:xxx` ids as well as the four cardinal
+   * ones, so we cannot narrow to PhysicalDoorId here. reconcileDoorLayout parks
+   * a vanished id in `orphanVestibules` and calls `drainOrphanVestibules`
+   * BEFORE us, but that drain intentionally SKIPS an orphan whose vestibule is
+   * still being walked through (`activeDoorId === id`) or is lit for a transit
+   * (`transitVestibuleDoorId === id`) — the id stays in `pairedVestibules`
+   * until a later frame can dispose it safely. During that window this method
+   * runs; `physicalDoorPose` on a free-door id with no live record would fall
+   * back to the north-wall centre (a warning + a mis-pose that teleports the
+   * gangway around the avatar mid-walk-through). `physicalDoorPoseOrNull` is
+   * the honest read that lets us leave the group at its LAST known pose until
+   * the drain finally disposes it — which is what the deferred-drain contract
+   * already promised.
+   */
+  private repositionPairedVestibules(): void {
+    for (const [id, group] of this.pairedVestibules) {
+      // Iterating a Map<string, THREE.Group>: cardinal ids AND free `d:xxx`
+      // ids reach here, so `physicalDoorPoseOrNull(id: string)` is the right
+      // signature (no cast, no PhysicalDoorId narrowing). A null result means
+      // the door has no live record — see the doc block above for why.
+      const p = physicalDoorPoseOrNull(id);
+      if (!p) continue;
+      group.position.set(p.x, 0, p.z);
+      group.rotation.y = p.outwardYaw;
+    }
+  }
+
+  /**
+   * 🧱 #66 S3: reconcile every scene structure whose geometry depends on the
+   * room's tile dims to the CURRENT floorPlan.dims. Called from main.ts's
+   * subscribeFloorPlan handler on every floorPlan mutation — cheap idempotency
+   * guard skips the shell teardown when only non-dims fields changed (door
+   * slide, tile edit).
+   *
+   * Discipline follows addOctagonHull + reconcileFurniture: dispose (geometry
+   * + material) every mesh that carried the OLD wall coords, then rebuild via
+   * the SAME helpers createPlatform uses (addSideWalls, addCapsuleOuterStructure,
+   * addOctagonHull, refreshFpNeighbourShells). Furniture, atmosphere, docking
+   * ports, and the ambient/deck planets don't depend on dims and stay put.
+   *
+   * The rebake pipeline (obstacles → walkable grid → seats → stands → devices →
+   * player replan) mirrors reconcileFurniture's final stretch. Without it a
+   * shrunken room would leave the player standing outside the fresh walkable
+   * box with no path off — the beamTo clamp below is the safety net for that.
+   *
+   * A live edit session's raycast index is rebuilt the same way reconcileFurniture
+   * does it (forceExit + enter): the walls and click plane it snapshots on
+   * `enter()` are stale the instant this method rebuilds them.
+   */
+  public reconcileRoomDims(): boolean {
+    const { halfX, halfZ } = roomHalfExtents();
+    // Idempotency guard: subscribeFloorPlan fires on every plan mutation, but
+    // dims can only change via writeRoomDims. Same-dims callbacks (door slide,
+    // structure-tile edit) are the common case and must be free. The `false`
+    // returned here tells the subscribeFloorPlan handler to still run the
+    // door-reconcile it would have skipped otherwise (Fix 6 in the audit —
+    // avoids the double-reconcile on genuine dims changes while keeping door
+    // slides working).
+    if (this.lastAppliedDims &&
+        this.lastAppliedDims.halfX === halfX &&
+        this.lastAppliedDims.halfZ === halfZ) return false;
+    // Nothing built yet ⇒ createPlatform will pick up the current dims when it
+    // runs (it reads roomHalfExtents fresh + seeds lastAppliedDims itself).
+    // Returned `false` so the caller still fires the door reconcile — the
+    // subscribeFloorPlan handler is often the FIRST call the world sees, and
+    // a same-frame door change on a not-yet-built room must not be swallowed.
+    if (!this.platformFloor) return false;
+    this.lastAppliedDims = { halfX, halfZ };
+
+    // 1. Floor: swap geometry (holes preserved — makeFloorGeometry rebuilds
+    // from the current floorHoles + floorHoleOutlines list).
+    {
+      const old = this.platformFloor.geometry;
+      this.platformFloor.geometry = this.makeFloorGeometry();
+      old.dispose();
+    }
+
+    // 1b. Floor TEXTURE repeat: every floor texture (wood, casino carpet,
+    // outdoor stone) bakes its `repeat` at creation from the DEFAULT 12 m room
+    // — a resize left the tiles stretched (grew) or compressed (shrunk).
+    // Rescale linearly so plank / tile size stays constant in world space,
+    // matching the wood texture's original formula. `needsUpdate` is a
+    // material-level flag, not a texture one: the map bind hasn't changed, so
+    // the material is fine; refreshing repeat on the Texture is enough.
+    this.refreshFloorTextureRepeats(halfX, halfZ);
+
+    // 2. Click plane: same geometry swap. Its rotation.x=-π/2 was baked into
+    // the initial geometry (clickGeo.rotateX), so rebuild at the current dims
+    // with the SAME rotation bake — rotation on the mesh itself stays 0.
+    if (this.clickPlane) {
+      const old = this.clickPlane.geometry;
+      const newGeo = new THREE.PlaneGeometry(2 * halfX, 2 * halfZ);
+      newGeo.rotateX(-Math.PI / 2);
+      this.clickPlane.geometry = newGeo;
+      old.dispose();
+    }
+
+    // 3. Grid helper: dispose + rebuild (GridHelper is square-only, sized to
+    // the larger axis at 1 m divisions — mirrors createPlatform).
+    if (this.platformGrid) {
+      this.platformGroup.remove(this.platformGrid);
+      this.disposeObject3D(this.platformGrid);
+      const gridSpan = Math.max(2 * halfX, 2 * halfZ);
+      this.platformGrid = new THREE.GridHelper(
+        gridSpan,
+        gridSpan,
+        0x1e88e5,
+        0x0a1e3a,
+      );
+      this.platformGrid.position.y = 0.01;
+      this.platformGrid.visible = false;
+      this.platformGroup.add(this.platformGrid);
+    }
+
+    // 4. Legacy flat-box side walls + north wall + their coping strips — only
+    // relevant under `?octagon=0`. Under the octagon hull the shells fully
+    // replace them (addOctagonHull below).
+    if (!OCTAGON_HULL) {
+      for (const w of this.sideWalls) {
+        this.platformGroup.remove(w);
+        this.disposeObject3D(w);
+      }
+      this.sideWalls.length = 0;
+      if (this.northWall) {
+        this.platformGroup.remove(this.northWall);
+        this.disposeObject3D(this.northWall);
+        this.northWall = null;
+      }
+      // Coping strips are the ONLY things addSideWalls pushes to
+      // platformElements (verified by grep). Everything else that lives in
+      // platformElements would be a future addition; guard the coping-only
+      // teardown by clearing the array we're about to refill.
+      for (const el of this.platformElements) {
+        this.platformGroup.remove(el);
+        this.disposeObject3D(el);
+      }
+      this.platformElements.length = 0;
+      this.addSideWalls();
+      // Fresh walls come in visible; hull-edit / wallpaper-cover flags may
+      // want them hidden — the same public method createPlatform ends with.
+      this.updateSideWallCoverage();
+    }
+
+    // 5. Exterior capsule (used by the iso view — always rebuilt, not hull-gated).
+    // Prior instances MUST be disposed or the rebuild would leave a second
+    // set of solid walls at the new dims stacked on the old.
+    if (this.capsuleRoof) {
+      this.platformGroup.remove(this.capsuleRoof);
+      this.disposeObject3D(this.capsuleRoof);
+      this.capsuleRoof = null;
+    }
+    for (const w of this.capsuleOuterWalls) {
+      this.platformGroup.remove(w);
+      this.disposeObject3D(w);
+    }
+    this.capsuleOuterWalls.length = 0;
+    this.addCapsuleOuterStructure();
+
+    // 6. Octagon hull barrel — already idempotent (disposes its prior instance
+    // internally and rebuilds window click-boxes).
+    if (OCTAGON_HULL) this.addOctagonHull();
+
+    // 7. Station-through-the-window neighbour shells — already idempotent;
+    // rebuild so pose-around-the-current-room stays correct as OUR dims change.
+    this.refreshFpNeighbourShells();
+
+    // 8. Doors: wall coords derive from room dims (doorWallCoord), so every
+    // physical pose must re-run against the fresh dims.
+    this.reconcileDoorPlacements();
+
+    // 9. Rebake the walkable-grid pipeline (mirrors reconcileFurniture's tail).
+    // The grid is pre-sized at boot to the ROOM_TILE_MAX envelope, so a resize
+    // never re-allocates — only which cells are inside the CURRENT walkable
+    // box + free of obstacles is refreshed. Seats/stands/devices then rebake
+    // world-space poses off the fresh grid; the player's in-flight plan is
+    // invalidated with no arg (no specific item moved — the WALLS moved).
+    rebuildObstacles();
+    rebakeWalkableGrid();
+    rebuildSeats();
+    rebuildStands();
+    rebuildDevices();
+    this.rebuildSkylightMeshList();
+    this.player.onObstaclesChanged();
+
+    // 9b. Robots follow the same content-rebake reconcileFurniture ends with:
+    // the patrol route bakes from the CURRENT walkable grid, so a resized room
+    // that clipped a former patrol node would strand a robot mid-loop
+    // otherwise (audit Fix 5 — parity with reconcileFurniture and the room
+    // template + morph paths that already call reconcileRobots after their
+    // grid rebakes).
+    this.reconcileRobots(this.computeRobotPatrol());
+
+    // 10. Player clamp: a shrunk room may leave the avatar outside the fresh
+    // walkable box. beamTo is the safe reset — it cancels any mid-walk / sit /
+    // adapter / device state before repositioning, so we never strand them
+    // in a broken half-transition. Grown rooms leave the position untouched.
+    {
+      const { boundX, boundZ } = roomWalkBounds();
+      const px = this.player.mesh.position.x;
+      const pz = this.player.mesh.position.z;
+      if (Math.abs(px) > boundX || Math.abs(pz) > boundZ) {
+        const cx = Math.max(-boundX, Math.min(boundX, px));
+        const cz = Math.max(-boundZ, Math.min(boundZ, pz));
+        this.player.beamTo(cx, cz);
+      }
+    }
+
+    // 11. Live edit session — the fresh walls/floor invalidate its snapshotted
+    // raycast index; same idiom reconcileFurniture uses (forceExit + enter).
+    if (roomEdit.isEditModeActive()) {
+      roomEdit.forceExit();
+      roomEdit.enter(this);
+    }
+
+    return true;
+  }
+
+  /**
+   * 🧱 #66 S3 (audit Fix 1): rescale every cached floor texture's `repeat` so
+   * a plank / tile stays constant world-space size across a room resize. Wood
+   * was always dims-aware (formula in makeWoodTexture); casino + outdoor
+   * baked their repeats for the DEFAULT 12 m room, so a grown room had them
+   * stretched and a shrunken room had them compressed. The scale factors here
+   * MATCH the creation-time densities (wood 3.5, casino 2.5, outdoor 3.5 —
+   * the values the code shipped with for the 12 m default), so at default
+   * dims the repeat is unchanged (bit-identical legacy behaviour).
+   *
+   * `refreshFloorTextureRepeats` is ALSO called at texture-creation time from
+   * `applyRoomVisuals` (casino / outdoor themes lazy-build their texture on
+   * first entry) so a room that resized BEFORE the theme was ever visited
+   * gets the right repeat when the texture is finally built.
+   */
+  private refreshFloorTextureRepeats(halfX: number, halfZ: number): void {
+    const platformW = 2 * halfX;
+    const platformD = 2 * halfZ;
+    // Wood: matches the closure formula in makeWoodTexture.
+    if (this.woodTex) {
+      this.woodTex.repeat.set((3.5 * platformW) / 12, (3.5 * platformD) / 12);
+    }
+    // Casino carpet: the original hardcoded 2.5 was the 12 m value.
+    if (this.casinoFloorTex) {
+      this.casinoFloorTex.repeat.set((2.5 * platformW) / 12, (2.5 * platformD) / 12);
+    }
+    // Outdoor stone: the original hardcoded 3.5 was the 12 m value.
+    if (this.outdoorFloorTex) {
+      this.outdoorFloorTex.repeat.set((3.5 * platformW) / 12, (3.5 * platformD) / 12);
+    }
   }
 
   /**
@@ -2420,15 +2701,25 @@ export class World {
     if (this.floorMat) {
       if (deck) {
         // Swap to a stone-tile texture (created once, cached).
-        if (!this.outdoorFloorTex)
+        if (!this.outdoorFloorTex) {
           this.outdoorFloorTex = this.makeOutdoorFloorTex();
+          // 🧱 #66 S3 (audit Fix 1): the lazy-build path was blind to
+          // room dims. Refresh so an already-resized room gets tiles at
+          // the CURRENT scale on first theme entry.
+          const { halfX, halfZ } = roomHalfExtents();
+          this.refreshFloorTextureRepeats(halfX, halfZ);
+        }
         this.floorMat.map = this.outdoorFloorTex;
         this.floorMat.color.setHex(0xffffff); // no tint — texture has its own palette
         this.floorMat.roughness = 0.92;
         this.floorMat.metalness = 0.0;
       } else if (casinoTheme) {
-        if (!this.casinoFloorTex)
+        if (!this.casinoFloorTex) {
           this.casinoFloorTex = this.makeCasinoFloorTex();
+          // 🧱 #66 S3 (audit Fix 1): same lazy-build repeat refresh.
+          const { halfX, halfZ } = roomHalfExtents();
+          this.refreshFloorTextureRepeats(halfX, halfZ);
+        }
         this.floorMat.map = this.casinoFloorTex;
         this.floorMat.color.setHex(0xffffff);
         this.floorMat.roughness = 0.48;
