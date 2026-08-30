@@ -90,7 +90,13 @@ import {
   writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
+  // 🃏🎰 #45 wager slice — poker/war chip-escrow operations.
+  stampCardWagerConfig, readCardWagerConfig, payCardWager,
+  readCardWagerEscrow, activateCardWager,
+  settleCardWager, refundCardWager, clearCardWagerKeys,
 } from './casinoDoc';
+// 🃏🎰 #45 wager slice — buy-in bounds for UI clamps.
+import { MAX_CARD_WAGER_BUY_IN, MIN_CARD_WAGER_BUY_IN } from './games/cardWager';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
 import { crapsBackend } from './crapsBackend';
@@ -1283,8 +1289,28 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
    *  switch games; the whole-value LWW caveat from reset() applies). */
   const clearToPicker = (): void => {
     if (!canClearTable()) return;
+    // 🃏🎰 #45 wager slice — a RESET while a wager is active leaves chips
+    // stranded in escrow. Refund every held record we can before clearing
+    // the table, and (owner-only) wipe the wager config keys. This mirrors
+    // the air-hockey escrow-safety discipline on table removal (PR #116).
+    const t = readTable(deps.itemId);
+    const wagerCfg = readCardWagerConfig(deps.itemId);
+    if (wagerCfg && t?.kind === 'poker') {
+      // Refund every seat's held record — self-refund works pre-BEGIN;
+      // owner-refund works at any stage. refundCardWager is idempotent
+      // (missing record returns false without any side effect).
+      const seats = [t.state.players.button.id, t.state.players.bigBlind.id];
+      for (const pid of seats) {
+        if (pid) refundCardWager(myId, deps.itemId, pid);
+      }
+      // Owner: also wipe the config so the reset is complete. Non-owner
+      // reset leaves the config in place — the owner returns to their
+      // stranded wager later. (Owner can also cancel from the wager panel.)
+      if (myId === wagerCfg.ownerId) clearCardWagerKeys(myId, deps.itemId);
+    }
     selected = null;
     chessSelected = null;
+    pokerLastSettledAt = null;
     clearTable(deps.itemId);
   };
 
@@ -1397,6 +1423,15 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   let solitaireSource: SolitaireClickSource | null = null;
   /** Poker bet-size input value (text) — parsed to int on Bet/Raise. */
   let pokerBetInput = '';
+  /** 🃏🎰 #45 wager slice — WAGER MODE buy-in draft (owner-only, pre-stamp).
+   *  Empty string until the owner types a buy-in; committed to a config
+   *  on the "🎰 ENABLE WAGER" button; then the config becomes the source
+   *  of truth and this draft is only used pre-commit. */
+  let pokerWagerDraft = '';
+  /** Guard: once we've observed match-over and settled once, don't settle
+   *  again on subsequent re-renders (the config delete is the primary guard
+   *  but the flag prevents even calling the refused-second-settle path). */
+  let pokerLastSettledAt: string | null = null;
 
   // ── WAR helpers ─────────────────────────────────────────────────────────────
 
@@ -1594,9 +1629,114 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     const bigBlindId = bot ? null : s.players.bigBlind.id;
     if (!bot && (!buttonId || !bigBlindId)) return;
     if (bot && buttonId !== myId) return; // solo start: I sit at button
+    // 🃏🎰 #45 WAGER MODE: if this table has an active wager config, both
+    // seats must have paid their buy-in, the wager owner (only) starts the
+    // match by ACTIVATING the wager (stamps startedAt → locks self-refund)
+    // and the buy-in becomes the STARTING STACK. Free-play (no config) is
+    // bit-identical to today's path (startingStack: 1000).
+    const wager = readCardWagerConfig(deps.itemId);
+    let startingStack = 1000;
+    if (wager) {
+      // Wager mode disallows the trivial bot (there's no counter-party
+      // paying in on the other seat). Owner must clear the wager first
+      // if they want to play against the bot.
+      if (bot) return;
+      // Both seats must have paid.
+      if (buttonId === null || bigBlindId === null) return;
+      if (!readCardWagerEscrow(deps.itemId, buttonId)) return;
+      if (!readCardWagerEscrow(deps.itemId, bigBlindId)) return;
+      // Only the wager owner can start the match (single-writer for
+      // startedAt stamp; matches settleCardWager's owner-only rule).
+      if (myId !== wager.ownerId) return;
+      if (!activateCardWager(myId, deps.itemId, Date.now())) return;
+      startingStack = wager.buyIn;
+    }
     writeGame(deps.itemId, beginPoker(s, {
-      button: buttonId, bigBlind: bigBlindId, bot, startingStack: 1000,
+      button: buttonId, bigBlind: bigBlindId, bot, startingStack,
     }));
+  };
+
+  /**
+   * 🃏🎰 #45 wager slice — owner stamps a WAGER config for the poker
+   * table. Refuses on non-integer or out-of-range buy-in; refuses when
+   * a wager is already stamped by a different owner (single-writer for
+   * the config key). Idempotent for the same owner (repeat calls are
+   * fine; the stampCardWagerConfig helper accepts a same-owner update).
+   */
+  const enablePokerWager = (): void => {
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker' || t.state.status !== 'waiting') return;
+    const buyIn = Number.parseInt(pokerWagerDraft, 10);
+    if (!Number.isInteger(buyIn) || buyIn < MIN_CARD_WAGER_BUY_IN
+      || buyIn > MAX_CARD_WAGER_BUY_IN) return;
+    stampCardWagerConfig(myId, deps.itemId, 'poker', buyIn, Date.now());
+    pokerWagerDraft = '';
+  };
+
+  /**
+   * 🃏🎰 #45 wager slice — I pay MY buy-in into escrow. Own-key write —
+   * casinoDoc refuses when actor !== payer. Idempotent under crash-retry.
+   */
+  const payPokerWager = (): void => {
+    payCardWager(myId, deps.itemId, myId, Date.now());
+  };
+
+  /**
+   * 🃏🎰 #45 wager slice — cancel/refund path. Before BEGIN, any payer
+   * can self-refund. The owner can refund BOTH players (abandonment) and
+   * then clear the wager keys. Called from the "CANCEL WAGER" button.
+   */
+  const cancelPokerWager = (): void => {
+    const wager = readCardWagerConfig(deps.itemId);
+    if (!wager) return;
+    const t = readTable(deps.itemId);
+    if (!t || t.kind !== 'poker') return;
+    const s = t.state;
+    // Refund every held record we can (payer or owner).
+    for (const pid of [s.players.button.id, s.players.bigBlind.id]) {
+      if (!pid) continue;
+      if (readCardWagerEscrow(deps.itemId, pid)) {
+        refundCardWager(myId, deps.itemId, pid);
+      }
+    }
+    // Owner-only: wipe the config so the felt is back to free-play mode.
+    if (myId === wager.ownerId) clearCardWagerKeys(myId, deps.itemId);
+  };
+
+  /**
+   * 🃏🎰 #45 wager slice — owner auto-settles when the poker match ends.
+   * Determined by looking at final stacks: the seat that ends the match
+   * with stack > 0 is the winner (poker's endHand + pokerForfeit both
+   * transfer all chips to the survivor). Deterministic on public state
+   * so every peer would agree — owner is the SINGLE writer that turns
+   * that agreement into a pot payout.
+   *
+   * Called from the poker-panel render pass. Uses `pokerLastSettledAt`
+   * as a re-entrancy guard so a re-render after settle doesn't re-attempt
+   * (the primary guard is the config-deleted state; this belt-and-braces
+   * cuts wasted work).
+   */
+  const maybeSettleWager = (s: PokerState): void => {
+    if (s.status !== 'match-over') return;
+    const wager = readCardWagerConfig(deps.itemId);
+    if (!wager) { pokerLastSettledAt = null; return; }
+    if (wager.startedAt === null) return;
+    if (myId !== wager.ownerId) return;
+    // Determine winner from final stacks — the seat with the whole pot.
+    const buttonId = s.players.button.id;
+    const bigBlindId = s.players.bigBlind.id;
+    if (!buttonId || !bigBlindId) return;
+    const buttonStack = s.players.button.stack;
+    const bigBlindStack = s.players.bigBlind.stack;
+    let winnerId: string | 'split';
+    if (buttonStack > 0 && bigBlindStack === 0) winnerId = buttonId;
+    else if (bigBlindStack > 0 && buttonStack === 0) winnerId = bigBlindId;
+    else if (buttonStack > 0 && bigBlindStack > 0) winnerId = 'split';
+    else return; // both zero — impossible in a normal terminal state
+    const sig = `${deps.itemId}:${wager.ownerId}:${winnerId}`;
+    if (pokerLastSettledAt === sig) return;
+    pokerLastSettledAt = sig;
+    settleCardWager(myId, deps.itemId, winnerId);
   };
 
   const pokerForfeit = (): void => {
@@ -2304,10 +2444,27 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
         </div>`;
     } else if (table.kind === 'poker') {
       const p = table.state;
+      // 🃏🎰 #45 wager slice — active WAGER config for this table (null =
+      // free-play mode, bit-identical to today's behavior). The presence
+      // of a config turns on wager UI (buy-in badge, PAY button, POT).
+      const wagerCfg = readCardWagerConfig(deps.itemId);
+      const myEscrow = wagerCfg ? readCardWagerEscrow(deps.itemId, myId) : null;
+      const buttonEscrow = wagerCfg && p.players.button.id
+        ? readCardWagerEscrow(deps.itemId, p.players.button.id) : null;
+      const bbEscrow = wagerCfg && p.players.bigBlind.id
+        ? readCardWagerEscrow(deps.itemId, p.players.bigBlind.id) : null;
+      const bothPaid = !!buttonEscrow && !!bbEscrow;
+      const isWagerOwner = wagerCfg?.ownerId === myId;
+      // Auto-settle on match-over — owner does one write. Idempotent
+      // (config gone after settle → future renders no-op).
+      maybeSettleWager(p);
       const showBot = p.status === 'waiting' && p.players.bigBlind.id === null
-        && (p.players.button.id === null || p.players.button.id === myId);
+        && (p.players.button.id === null || p.players.button.id === myId)
+        && !wagerCfg; // wager mode disables the trivial bot (no counter-party)
       const bothClaimed = p.players.button.id !== null && p.players.bigBlind.id !== null;
-      const showBegin = p.status === 'waiting' && bothClaimed;
+      // Wager mode requires BOTH players to have paid before BEGIN unlocks.
+      const beginUnlocked = wagerCfg ? (bothClaimed && bothPaid && isWagerOwner) : bothClaimed;
+      const showBegin = p.status === 'waiting' && beginUnlocked;
       // Forfeit is only sensible mid-hand — post-round-3 fix. Between hands
       // (status === 'hand-over') the winner is decided, the seat's stack is
       // stable, and pressing "FORFEIT" would gift chips it had every right
@@ -2322,6 +2479,48 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       const toCall = seat !== null ? callAmount(p, seat) : 0;
       const minB = minBet(p);
       const minR = seat !== null ? minRaiseTo(p, seat) : 0;
+      // 🃏🎰 #45 wager panel HTML — only rendered while the table is in
+      // waiting phase (owner sets up wager) or before settle. The plain-
+      // language rule bans token/channel jargon: WAGER / BUY-IN / POT.
+      const canEnableWager = p.status === 'waiting' && !wagerCfg;
+      const potChips = wagerCfg ? (wagerCfg.buyIn * 2) : 0;
+      const wagerPanel = wagerCfg ? `
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:${GT_GOLD_BRIGHT}; background:rgba(70,40,10,0.35); padding:8px 10px; border:1px solid rgba(212,168,75,0.35); border-radius:4px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span>🎰 WAGER MODE — BUY-IN ${wagerCfg.buyIn} chips</span>
+            <span style="color:${GT_GOLD};">POT ${potChips}</span>
+          </div>
+          <div style="margin-top:6px; display:flex; gap:6px; align-items:center; font-size:9px; color:${GT_DIM};">
+            <span>BUTTON: ${buttonEscrow ? '<span style="color:#00E676;">PAID</span>' : 'PENDING'}</span>
+            <span>·</span>
+            <span>BIG BLIND: ${bbEscrow ? '<span style="color:#00E676;">PAID</span>' : 'PENDING'}</span>
+            ${wagerCfg.startedAt !== null ? '<span>· <span style="color:#F0C060;">MATCH LIVE</span></span>' : ''}
+          </div>
+          <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap;">
+            ${p.status === 'waiting' && !myEscrow && (p.players.button.id === myId || p.players.bigBlind.id === myId)
+              ? btn('gt-poker-wager-pay', `PAY BUY-IN (${wagerCfg.buyIn})`, readChips(myId) < wagerCfg.buyIn,
+                readChips(myId) < wagerCfg.buyIn ? `Need ${wagerCfg.buyIn} chips (you have ${readChips(myId)})` : 'Escrow your buy-in')
+              : ''}
+            ${p.status === 'waiting' && wagerCfg.startedAt === null
+              ? btn('gt-poker-wager-cancel', 'CANCEL WAGER',
+                !(isWagerOwner || (myEscrow !== null)),
+                isWagerOwner ? 'Refund all payers and clear the wager' : (myEscrow ? 'Refund your own buy-in' : 'Only the owner or a payer can cancel'))
+              : ''}
+          </div>
+        </div>` : (canEnableWager ? `
+        <div style="font-size:10px; letter-spacing:1px; color:${GT_DIM}; background:rgba(4,8,22,0.5); padding:6px 8px; border:1px dashed rgba(212,168,75,0.25); border-radius:4px;">
+          <div style="display:flex; gap:6px; align-items:center;">
+            <span style="color:${GT_GOLD};">🎰 WAGER MODE (optional)</span>
+            <input id="gt-poker-wager-buyin" type="number" min="${MIN_CARD_WAGER_BUY_IN}" max="${MAX_CARD_WAGER_BUY_IN}"
+              value="${pokerWagerDraft}" placeholder="buy-in"
+              style="width:80px; padding:4px 6px; background:rgba(4,8,22,0.8); border:1px solid rgba(212,168,75,0.35); border-radius:3px; color:${GT_GOLD_BRIGHT}; font-family:inherit; font-size:10px;" />
+            ${btn('gt-poker-wager-enable', 'ENABLE WAGER', false,
+              'Escrow chips for a winner-takes-pot match')}
+          </div>
+          <div style="margin-top:4px; font-size:8px; color:rgba(212,168,75,0.5);">
+            Leave OFF for today's free-play (no chip transfer). Wager mode is heads-up only (no bot).
+          </div>
+        </div>` : '');
       cardFace = `
         <div id="gt-card-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:${
           p.status === 'playing' ? GT_GOLD_BRIGHT : p.status === 'waiting' ? GT_DIM : '#00E676'
@@ -2331,6 +2530,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           the hand is visible to any peer inspecting it. Commit-reveal / chia-
           gaming integration is a later slice.
         </div>
+        ${wagerPanel}
         <div style="display:flex; gap:8px;">
           ${cardSeatCell('gt-poker-sit-button', `BUTTON — ${pokerSeatLabel(p, 'button')}`,
             '#F0C060',
@@ -2342,7 +2542,10 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
             'Claim BIG BLIND')}
         </div>
         ${showBot ? `<div>${btn('gt-poker-bot', '⚙ VS BOT — PLAY ALONE', false, 'Heads-up against a trivial AI')}</div>` : ''}
-        ${showBegin ? `<div>${btn('gt-poker-begin', '▶ BEGIN MATCH', false, 'Deal hand #1 with 1000-chip starting stacks')}</div>` : ''}
+        ${showBegin ? `<div>${btn('gt-poker-begin', '▶ BEGIN MATCH', false,
+          wagerCfg
+            ? `Deal hand #1 with ${wagerCfg.buyIn}-chip stacks (wager active)`
+            : 'Deal hand #1 with 1000-chip starting stacks')}</div>` : ''}
         ${cardCanvasHtml(false)}
         ${inTurn ? `
           <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
@@ -2445,6 +2648,14 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#gt-poker-raise')?.addEventListener('click', () => doPokerAction('raise'));
     panel.querySelector<HTMLButtonElement>('#gt-poker-next')?.addEventListener('click', () => advancePokerHand());
     panel.querySelector<HTMLButtonElement>('#gt-poker-forfeit')?.addEventListener('click', () => pokerForfeit());
+    // 🃏🎰 #45 wager controls (draft input + enable/pay/cancel buttons).
+    const wagerBuyInInput = panel.querySelector<HTMLInputElement>('#gt-poker-wager-buyin');
+    if (wagerBuyInInput) {
+      wagerBuyInInput.addEventListener('input', () => { pokerWagerDraft = wagerBuyInInput.value; });
+    }
+    panel.querySelector<HTMLButtonElement>('#gt-poker-wager-enable')?.addEventListener('click', () => enablePokerWager());
+    panel.querySelector<HTMLButtonElement>('#gt-poker-wager-pay')?.addEventListener('click', () => payPokerWager());
+    panel.querySelector<HTMLButtonElement>('#gt-poker-wager-cancel')?.addEventListener('click', () => cancelPokerWager());
     const amtInput = panel.querySelector<HTMLInputElement>('#gt-poker-amt');
     if (amtInput) {
       // Store the bet-input value so re-renders don't wipe the user's typing.
@@ -2513,7 +2724,12 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       pokerBetInput = '';
       // Observer-driven repaint: doc changes (peer moves, claims, resets,
       // rebinds after a rejoin) re-render the whole panel from the doc.
-      unsubscribe = subscribeGames(() => render());
+      // 🃏🎰 #45 wager slice — wager config + escrow records live in the
+      // CASINO map, so a wager-mode poker table also needs a casino-map
+      // subscription (PAY by peer, or owner refund, re-paints the panel).
+      const unsubGames = subscribeGames(() => render());
+      const unsubCasino = subscribeCasino(() => render());
+      unsubscribe = () => { unsubGames(); unsubCasino(); };
       render();
     },
 

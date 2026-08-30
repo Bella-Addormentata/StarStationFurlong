@@ -49,6 +49,23 @@ import type {
   SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
   SlotFundingConfig,
 } from './games/slots';
+// 🃏🎰 #45 wager slice — chip-escrowed table stakes on the card felt.
+// Types + shape guards + key layout + chia-gaming compatibility contract
+// live in `games/cardWager.ts`; the escrow-side transacted operations
+// (pay / refund / settle / owner-abandonment sweep) live below in this
+// module so they share the same bound doc + trust model as the rest of
+// the cage. Owner-single-writer for the config and settle; per-player
+// single-writer for each escrow record (mirrors the air-hockey fee
+// discipline reviewed clean on PR #116).
+import {
+  cardWagerConfigKey, cardWagerEscrowKey,
+  CARD_WAGER_ESCROW_PREFIX,
+  MAX_CARD_WAGER_BUY_IN, MIN_CARD_WAGER_BUY_IN,
+  isCardWagerConfig, isCardWagerRecord,
+} from './games/cardWager';
+import type {
+  CardWagerConfig, CardWagerKind, CardWagerRecord,
+} from './games/cardWager';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -807,6 +824,363 @@ export function clearSlotMachineKeys(machineId: string): void {
   });
 }
 
+// ── 🃏🎰 #45 CARD WAGER: chip-escrowed table stakes ─────────────────────────
+// Keys (owner writes cfg; each payer writes only their own escrow record):
+//   cw-cfg:<tableId>             → CardWagerConfig  (owner-written)
+//   cw-escrow:<tableId>:<pid>    → CardWagerRecord  (payer-written)
+//
+// TRUST BOUNDARY
+//   Peers write the casino Y.Map unauthenticated. Every read below runs
+//   the isCardWagerConfig / isCardWagerRecord guard from cardWager.ts
+//   before any settle / refund / conservation path consumes the value.
+//   A malformed peer record reads as absent (fails SAFE — never as a
+//   partial value that would drain, double-credit, or divert the pot).
+//
+// SETTLE AUTHORITY
+//   Only the CONFIG OWNER may call settleCardWager / activateCardWager
+//   / owner-abandonment refund. That mirrors the air-hockey fee owner
+//   (PR #116 reviewed clean) — the settle is a single transact by a
+//   single writer, so no concurrent-writer race can inflate the payout.
+//   Non-participants (any actor other than owner or the record's payer)
+//   are refused shape-first by the actor check on every entry point.
+//
+// CONSERVATION INVARIANT (locked by tests in cardWager.test.ts):
+//   escrowed_total == paid_out + refunded + still_held
+//   Every pay / refund / settle path writes matching deltas in one
+//   transact, so a mid-settle throw is all-or-nothing at the Y.Doc
+//   level (Yjs transact semantics).
+
+/** Read the wager config for a table. Returns null when absent or
+ *  when a hostile peer planted a malformed value under the key. */
+export function readCardWagerConfig(tableId: string): CardWagerConfig | null {
+  const v = ensureMap().get(cardWagerConfigKey(tableId));
+  return isCardWagerConfig(v) ? v : null;
+}
+
+/**
+ * Stamp a NEW wager config for a table. Writes the `cw-cfg:<tableId>`
+ * key. Refuses to overwrite an existing config with a DIFFERENT ownerId
+ * (single-writer discipline for the config key).
+ *
+ * The write is atomic within one transact — nothing else is touched.
+ * Balances / escrow records are unaffected; this only records intent.
+ */
+export function stampCardWagerConfig(
+  actorId: string,
+  tableId: string,
+  kind: CardWagerKind,
+  buyIn: number,
+  nowMs: number,
+): boolean {
+  if (!Number.isInteger(buyIn) || buyIn < MIN_CARD_WAGER_BUY_IN
+    || buyIn > MAX_CARD_WAGER_BUY_IN) return false;
+  if (typeof actorId !== 'string' || actorId.length === 0) return false;
+  if (!Number.isFinite(nowMs) || nowMs < 0) return false;
+  const map = ensureMap();
+  const key = cardWagerConfigKey(tableId);
+  const existing = map.get(key);
+  if (existing !== undefined) {
+    if (!isCardWagerConfig(existing)) return false;
+    if (existing.ownerId !== actorId) return false;
+  }
+  const cfg: CardWagerConfig = {
+    kind, buyIn, ownerId: actorId, createdAt: nowMs, startedAt: null,
+  };
+  boundDoc!.transact(() => {
+    map.set(key, cfg);
+  });
+  return true;
+}
+
+/** Read one player's escrow record (shape-guarded). */
+export function readCardWagerEscrow(
+  tableId: string,
+  playerId: string,
+): CardWagerRecord | null {
+  const v = ensureMap().get(cardWagerEscrowKey(tableId, playerId));
+  return isCardWagerRecord(v) ? v : null;
+}
+
+/** Scan every well-formed escrow record for a table (in doc order). */
+export function scanCardWagerEscrow(tableId: string): CardWagerRecord[] {
+  const prefix = `${CARD_WAGER_ESCROW_PREFIX}${tableId}:`;
+  const out: CardWagerRecord[] = [];
+  for (const [key, value] of ensureMap().entries()) {
+    if (!key.startsWith(prefix)) continue;
+    if (!isCardWagerRecord(value)) continue;
+    out.push(value);
+  }
+  return out;
+}
+
+/**
+ * Player pays their BUY-IN into escrow. Debits the payer's balance by
+ * exactly `config.buyIn` and writes the `held` record under the payer's
+ * own key. All in one transact so a mid-write throw leaves the doc in a
+ * consistent state.
+ *
+ * Refuses when:
+ *   - No config, or a malformed one on the doc.
+ *   - `actorId !== playerId` (payer is the sole writer of their key).
+ *   - `state.startedAt !== null` (match already begun; pay window closed).
+ *   - Player already has a well-formed `held` record at the SAME amount —
+ *     returns TRUE without a rewrite (crash-retry idempotency).
+ *   - Player already has a well-formed `held` record at a DIFFERENT amount
+ *     (config drift; the caller should refund first). Returns false.
+ *   - Player balance short. Returns false.
+ *
+ * Returns true when the record is present after the call (either wrote
+ * new or matched an existing well-formed record).
+ */
+export function payCardWager(
+  actorId: string,
+  tableId: string,
+  playerId: string,
+  nowMs: number,
+): boolean {
+  if (actorId !== playerId) return false;
+  if (!Number.isFinite(nowMs) || nowMs < 0) return false;
+  const cfg = readCardWagerConfig(tableId);
+  if (!cfg) return false;
+  if (cfg.startedAt !== null) return false;
+  const buyIn = cfg.buyIn;
+  const map = ensureMap();
+  const key = cardWagerEscrowKey(tableId, playerId);
+  const existing = map.get(key);
+  if (existing !== undefined && isCardWagerRecord(existing)) {
+    // Crash-retry idempotency: same amount, same owner, still 'held' → no-op.
+    if (existing.amount === buyIn
+      && existing.ownerId === cfg.ownerId
+      && existing.state === 'held'
+      && existing.playerId === playerId) return true;
+    // Any other existing well-formed record blocks the pay path.
+    return false;
+  }
+  const balKey = `bal:${playerId}`;
+  const bal = readCount(balKey);
+  if (bal < buyIn) return false;
+  const record: CardWagerRecord = {
+    kind: cfg.kind, amount: buyIn, ownerId: cfg.ownerId,
+    playerId, paidAt: nowMs, state: 'held',
+  };
+  boundDoc!.transact(() => {
+    map.set(balKey, bal - buyIn);
+    map.set(key, record);
+  });
+  return true;
+}
+
+/**
+ * Owner stamps `startedAt` (the BEGIN transition) once BOTH players have
+ * paid in. Refuses when:
+ *   - `actorId !== config.ownerId`.
+ *   - No config, or already-started.
+ *   - Fewer than 2 well-formed `held` records for the table.
+ *   - Any recorded amount != config.buyIn (peer-tampered record;
+ *     caller should refund the offender first).
+ *
+ * After BEGIN, self-refund is locked — only owner-abandonment refund
+ * or settle can move the escrow chips. This is the point where the
+ * chia-gaming state channel would "open".
+ */
+export function activateCardWager(
+  actorId: string,
+  tableId: string,
+  nowMs: number,
+): boolean {
+  const cfg = readCardWagerConfig(tableId);
+  if (!cfg) return false;
+  if (actorId !== cfg.ownerId) return false;
+  if (cfg.startedAt !== null) return false;
+  if (!Number.isFinite(nowMs) || nowMs < 0) return false;
+  const records = scanCardWagerEscrow(tableId);
+  // Heads-up only: exactly 2 well-formed records at activation. A
+  // hostile third record blocks activate so the owner sweeps it first
+  // (via refundCardWager on the forged player id).
+  if (records.length !== 2) return false;
+  for (const r of records) {
+    if (r.amount !== cfg.buyIn) return false;
+    if (r.ownerId !== cfg.ownerId) return false;
+    if (r.state !== 'held') return false;
+  }
+  if (records[0].playerId === records[1].playerId) return false;
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(cardWagerConfigKey(tableId), { ...cfg, startedAt: nowMs });
+  });
+  return true;
+}
+
+/**
+ * Self-refund BEFORE BEGIN (state 'held', config.startedAt === null).
+ * Payer writes their own key → deletes the record, credits own balance
+ * += record.amount. Idempotent: missing record → false.
+ *
+ * When `actorId === config.ownerId` and `playerId !== actorId`, this is
+ * the OWNER-ABANDONMENT refund — the owner may return a stranded pay-in
+ * to a player who left the table before both sides completed. Owner can
+ * do this at any startedAt state; that mirrors the air-hockey owner
+ * sweep on removed tables (records must not be left orphaned).
+ *
+ * Refuses non-participants: neither the payer nor the owner can be
+ * spoofed by a bystander — every entry point checks `actorId`.
+ */
+export function refundCardWager(
+  actorId: string,
+  tableId: string,
+  playerId: string,
+): boolean {
+  const cfg = readCardWagerConfig(tableId);
+  if (!cfg) return false;
+  const isSelf = actorId === playerId;
+  const isOwner = actorId === cfg.ownerId;
+  if (!isSelf && !isOwner) return false;
+  // Self-refund is only legal BEFORE begin. Owner-abandonment is legal
+  // at any state (documented above).
+  if (isSelf && cfg.startedAt !== null) return false;
+  const map = ensureMap();
+  const key = cardWagerEscrowKey(tableId, playerId);
+  const existing = map.get(key);
+  if (existing === undefined) return false;
+  if (!isCardWagerRecord(existing)) {
+    // Malformed record — delete it (no credit; hostile write cannot mint
+    // chips into a real balance). Owner-only cleanup step.
+    if (!isOwner) return false;
+    boundDoc!.transact(() => { map.delete(key); });
+    return true;
+  }
+  // Well-formed record: return chips to the payer.
+  const balKey = `bal:${playerId}`;
+  const bal = readCount(balKey);
+  const refund = existing.amount;
+  boundDoc!.transact(() => {
+    map.set(balKey, bal + refund);
+    map.delete(key);
+  });
+  return true;
+}
+
+/**
+ * SETTLE — winner takes the pot. Owner reads both escrow records, credits
+ * the winner's balance by their sum (= 2 × buyIn for the standard match;
+ * for a split, each player gets their own buyIn back), and deletes both
+ * records + the config in ONE transact.
+ *
+ * `winnerId` must be one of the two payers' ids, or the literal string
+ * `'split'` for a tie (heads-up hold'em ties are rare but real — two
+ * pair on the board, etc.).
+ *
+ * Refuses when:
+ *   - `actorId !== config.ownerId`.
+ *   - No config, or match not begun (startedAt === null).
+ *   - The doc holds anything other than EXACTLY 2 well-formed 'held'
+ *     records (heads-up only; a hostile peer that planted a well-formed
+ *     third record cannot inflate the pot — see the drain-safety test
+ *     in cardWager.test.ts).
+ *   - Any recorded amount != config.buyIn.
+ *   - `winnerId` not 'split' and not present as a payer.
+ *
+ * Idempotent: after a successful settle both records + config are gone,
+ * so a second call reads no config and returns false (no double-credit).
+ *
+ * The single transact is the mid-settle-throw safeguard: Yjs applies
+ * the whole set of `map.set` / `map.delete` writes in one commit. All
+ * writes are pure data mutations that don't execute user code, so the
+ * transact body itself cannot throw mid-way. See `cardWager.test.ts`
+ * for the drain-safety test that asserts a REFUSED settle does not
+ * partially credit / partially delete.
+ */
+export function settleCardWager(
+  actorId: string,
+  tableId: string,
+  winnerId: string | 'split',
+): boolean {
+  const cfg = readCardWagerConfig(tableId);
+  if (!cfg) return false;
+  if (actorId !== cfg.ownerId) return false;
+  if (cfg.startedAt === null) return false;
+  const records = scanCardWagerEscrow(tableId);
+  // Heads-up only: exactly 2 well-formed records. A hostile peer that
+  // planted a well-formed THIRD record without paying chips in cannot
+  // inflate the pot the winner is credited from — refuse the whole
+  // settle so the owner can sweep the forged record first (refundCardWager
+  // with the forged player id deletes it; then settle sees 2 again).
+  if (records.length !== 2) return false;
+  for (const r of records) {
+    if (r.amount !== cfg.buyIn) return false;
+    if (r.ownerId !== cfg.ownerId) return false;
+    if (r.state !== 'held') return false;
+  }
+  const payerIds = records.map((r) => r.playerId);
+  // Payer ids must be distinct (two SEPARATE players); catches the
+  // hostile "same player twice under different keys" edge if a peer
+  // ever finds a way to spoof the key layout.
+  if (payerIds[0] === payerIds[1]) return false;
+  const pot = records.reduce((sum, r) => sum + r.amount, 0);
+  const map = ensureMap();
+  if (winnerId === 'split') {
+    const [balKey0, balKey1] = payerIds.map((pid) => `bal:${pid}`);
+    const bal0 = readCount(balKey0);
+    const bal1 = readCount(balKey1);
+    boundDoc!.transact(() => {
+      map.set(balKey0, bal0 + records[0].amount);
+      map.set(balKey1, bal1 + records[1].amount);
+      for (const pid of payerIds) {
+        map.delete(cardWagerEscrowKey(tableId, pid));
+      }
+      map.delete(cardWagerConfigKey(tableId));
+    });
+    return true;
+  }
+  // Winner-takes-pot path.
+  if (!payerIds.includes(winnerId)) return false;
+  const winnerBalKey = `bal:${winnerId}`;
+  const winnerBal = readCount(winnerBalKey);
+  boundDoc!.transact(() => {
+    map.set(winnerBalKey, winnerBal + pot);
+    for (const pid of payerIds) {
+      map.delete(cardWagerEscrowKey(tableId, pid));
+    }
+    map.delete(cardWagerConfigKey(tableId));
+  });
+  return true;
+}
+
+/**
+ * Wipe every wager key for a table (config + all escrow records). Owner-
+ * only teardown — a hostile peer cannot drain by calling this, because
+ * the actor check refuses non-owner. Callers should REFUND outstanding
+ * held records FIRST (via refundCardWager) so this is a defensive
+ * no-orphan sweep rather than a chip-loss path.
+ */
+export function clearCardWagerKeys(actorId: string, tableId: string): boolean {
+  const cfg = readCardWagerConfig(tableId);
+  // If there's no config, allow anyone to clear stale escrow records
+  // (an orphaned record with no owning config cannot be refunded by
+  // the payer either — this is the recovery valve).
+  if (!cfg) {
+    const map = ensureMap();
+    const escrowPrefix = `${CARD_WAGER_ESCROW_PREFIX}${tableId}:`;
+    boundDoc!.transact(() => {
+      map.delete(cardWagerConfigKey(tableId));
+      for (const key of [...map.keys()]) {
+        if (key.startsWith(escrowPrefix)) map.delete(key);
+      }
+    });
+    return true;
+  }
+  if (actorId !== cfg.ownerId) return false;
+  const map = ensureMap();
+  const escrowPrefix = `${CARD_WAGER_ESCROW_PREFIX}${tableId}:`;
+  boundDoc!.transact(() => {
+    map.delete(cardWagerConfigKey(tableId));
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(escrowPrefix)) map.delete(key);
+    }
+  });
+  return true;
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing. Guard for Node
 // tooling / tests: importing this module must stay pure, with browser-only
@@ -826,5 +1200,10 @@ if (typeof window !== 'undefined') {
     depositSlotFunding, withdrawSlotFunding,
     readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
     releaseSlotSharedBankrollLease,
+    // 🃏🎰 #45 wager slice — expose the escrow operations for devtools
+    // verification of pay / refund / settle math from the console.
+    readCardWagerConfig, stampCardWagerConfig, readCardWagerEscrow,
+    scanCardWagerEscrow, payCardWager, refundCardWager,
+    activateCardWager, settleCardWager, clearCardWagerKeys,
   };
 }
