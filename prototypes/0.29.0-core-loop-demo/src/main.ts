@@ -1172,7 +1172,41 @@ async function joinRoomAtEpoch(
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
   // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
-  bindDoorsDoc(sync.doc);
+  //
+  // #67 D3 pairing extension: pairings/tombstones now carry an Ed25519
+  // signature over domain-tagged canonical bytes (`ssf-door-pairing[-guest]:v1`
+  // and `ssf-door-tombstone[-guest]:v1`). Non-transient pairings + owner
+  // undocks sign as OWNER; transient berths + either-side detaches sign as
+  // GUEST (self-signed by the local player). Legacy records (no sig fields)
+  // remain accepted as fail-safe fallback so pre-D3 rooms keep working; the
+  // cross-room MIRROR write at the arrival path below (line ~2287) is a
+  // documented residual — a traveler cannot sign for a foreign room's owner,
+  // so mirror pairings ride the legacy shape until a future slice carries a
+  // departure-owner attestation. See doorsDoc.ts's TRUST BOUNDARY header.
+  bindDoorsDoc(sync.doc, {
+    roomId: boot.roomId,
+    verifySig: verifyIdentity,
+    // Live-read the room owner's identity pub through the doc — same live
+    // read used by bindDoorPolicy so signed door-side and pairing-side records
+    // share the same trust source. Nulling while un-synced keeps honest
+    // signed records surviving T0 (verifier accepts when the expected pub is
+    // not yet known, but still refuses forgeries against a wrong-pub).
+    roomOwnerPub: () => {
+      const ownerId = sync.doc.getMap("roomInfo").get("owner");
+      if (typeof ownerId !== "string" || !ownerId) return null;
+      const entry = sync.doc.getMap("players").get(ownerId) as
+        | { keyB64?: string }
+        | undefined;
+      return typeof entry?.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : null;
+    },
+    localPub: () => getIdentityPub(),
+    signOwner: (bytes) => {
+      try { return signIdentity(bytes); } catch { return null; }
+    },
+    signSelf: (bytes) => {
+      try { return signIdentity(bytes); } catch { return null; }
+    },
+  });
 
   // #67 D1/D1b/D3: per-door policy + rights requests/grants ride the same doc.
   // D3 signing: writes made by the LOCAL room owner carry an Ed25519 signature
@@ -2284,26 +2318,49 @@ async function transitTo(
     const retired =
       existing && !existing.paired && existing.retiredAddress === depAddress;
     if (!existing?.paired && !retired) {
-      writeDoorPairing(arrivalDoorId, depAddress, {
-        segments: depGeometry
-          ? mirrorSegments(depGeometry.segments)
-          : undefined,
-        farDoor: departureDoorId,
-        // 🧭 The mirror is the one writer that KNOWS the far wall exactly: the
-        // traveler just departed through that door and captured its wall
-        // before the swap tore the departure room down. This is how a pairing
-        // whose INITIATE could not know the far side (free door, unvisited
-        // room) becomes fully described after one walk-through.
-        farWall: depWall,
-        farLateral: depLateral,
-        farYawDeg: depGeometry?.farYawDeg,
-        // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
-        // detaching either side casts the whole connection off.
-        transient: depState?.transient,
-      });
-      console.log(
-        `🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`,
-      );
+      // #67 D3 pairing extension: this mirror-write case has three shapes:
+      //  1. Non-transient into a foreign room: traveler is not the arrival
+      //     room's owner, so writeDoorPairing lands the record UNSIGNED as
+      //     the DOCUMENTED RESIDUAL (see doorsDoc.ts TRUST BOUNDARY). A
+      //     subsequent signed write by the arrival room's owner supersedes.
+      //  2. Transient into the local player's own ship-room: signer wired,
+      //     transient=true → guest-signed by the local player. Coherent
+      //     berth authorship — the actor casting off can either be owner or
+      //     guest, and either produces a signed tombstone.
+      //  3. Transient with no local signer (never-signed-in guest): falls to
+      //     legacy shape. Also a residual — mirror-write with no signing
+      //     path.
+      // A signer failure inside case 2 THROWS; we catch it and log so the
+      // walk-through completes visually and the return direction just stays
+      // "no mirror this time" (the pairing can be re-attempted on the next
+      // detach + re-berth cycle).
+      try {
+        writeDoorPairing(arrivalDoorId, depAddress, {
+          segments: depGeometry
+            ? mirrorSegments(depGeometry.segments)
+            : undefined,
+          farDoor: departureDoorId,
+          // 🧭 The mirror is the one writer that KNOWS the far wall exactly: the
+          // traveler just departed through that door and captured its wall
+          // before the swap tore the departure room down. This is how a pairing
+          // whose INITIATE could not know the far side (free door, unvisited
+          // room) becomes fully described after one walk-through.
+          farWall: depWall,
+          farLateral: depLateral,
+          farYawDeg: depGeometry?.farYawDeg,
+          // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
+          // detaching either side casts the whole connection off.
+          transient: depState?.transient,
+        });
+        console.log(
+          `🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`,
+        );
+      } catch (err) {
+        console.error(
+          `🪞 Mirror pairing SIGN failed for ${arrivalDoorId} → departure room (${depRoomId}):`,
+          err,
+        );
+      }
     }
   } else if (depPaired) {
     console.warn(

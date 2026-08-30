@@ -5338,14 +5338,26 @@ export class World {
         if (st?.connectedRoomAddress) {
           // #62 P2: an assembled chain publishes its geometry with the pairing
           // (absent on plain pairings — the legacy record shape, v0.30.x-safe).
-          writeDoorPairing(doorId, st.connectedRoomAddress, {
-            segments: st.segments,
-            farDoor: st.farDoor,
-            farWall: st.farWall,
-            farLateral: st.farLateral,
-            farYawDeg: st.farYawDeg,
-            transient: st.transient, // #67 D2: guest berths carry the flag
-          });
+          //
+          // #67 D3 pairing extension: writeDoorPairing THROWS in signed
+          // binding when a signature was required and failed (canonical-
+          // encode overflow, or the injected signer erroring / returning
+          // null). Same lesson as PR #129's grant-side fixes — a silent
+          // unsigned pairing would be refused by our own reader on the
+          // rebound, so surface the failure and leave the pipeline able to
+          // retry on the next status transition.
+          try {
+            writeDoorPairing(doorId, st.connectedRoomAddress, {
+              segments: st.segments,
+              farDoor: st.farDoor,
+              farWall: st.farWall,
+              farLateral: st.farLateral,
+              farYawDeg: st.farYawDeg,
+              transient: st.transient, // #67 D2: guest berths carry the flag
+            });
+          } catch (err) {
+            console.error("[docking] writeDoorPairing (ACCEPTED) failed:", err);
+          }
         }
       } else if (status === "REJECTED") {
         deleteDoorPairing(doorId);

@@ -72,7 +72,7 @@ import {
 } from "./doorPolicy";
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
-import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
+import { detachTransientBerth, writeDoorTombstone } from "./doorsDoc";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -1606,10 +1606,21 @@ export class DoorDockingPortSystem {
           // Any player may ASK (that is the point) — their own client writes it.
           writeDoorRequest(doorId, getIdentityPub(), getPlayerName());
         } else if (action === "detach-berth") {
-          // #67 D2: EITHER side casts off a transient berth — no owner ceremony.
-          // The doc delete reconciles to every client (projection torn down,
-          // door re-locked) through the normal doors-doc path.
-          deleteDoorPairing(doorId);
+          // #67 D2 + D3: EITHER side casts off a transient berth — no owner
+          // ceremony. In SIGNED binding this writes a signed tombstone (owner
+          // if local == room owner, guest-signed by the local player
+          // otherwise); the seq inside the envelope defeats a hostile REPLAY
+          // of the paired bytes after detach (pre-D3 the bare delete let any
+          // peer that retained the paired record re-set the slot and restore
+          // the berth on every reader — the pairing analogue of PR #129's
+          // revoked-grant replay defence). In legacy binding it falls through
+          // to a bare delete. THROWS on signer failure — surface as UI error
+          // rather than leaving the map in a poisoned state.
+          try {
+            detachTransientBerth(doorId);
+          } catch (err) {
+            console.error("[docking] detach-berth failed:", err);
+          }
         } else if (!this.isRoomOwner()) {
           return; // every action below is owner-only (UI gate, dev-phase posture)
         } else if (action === "cycle-passage") {
@@ -1695,7 +1706,18 @@ export class DoorDockingPortSystem {
             // points here and would re-pair this door on the next walk-through
             // back, silently undoing the undock. It names the retired module so
             // it refuses only that one. See writeDoorTombstone.
-            writeDoorTombstone(doorId, stu.connectedRoomAddress);
+            //
+            // #67 D3.2 pattern (mirror of accept-req / revoke-grant above):
+            // writeDoorTombstone THROWS in signed binding when signing was
+            // required and failed. Pre-fix a silent unsigned tombstone would
+            // be refused by every signed reader, leaving the owner UI showing
+            // "undocked" while every peer still sees the module. Surface the
+            // failure and re-arm on the next click.
+            try {
+              writeDoorTombstone(doorId, stu.connectedRoomAddress);
+            } catch (err) {
+              console.error("[docking] undock-module failed:", err);
+            }
           } else {
             // arm FOR this pairing — a different armed address is stale
             this.undockArmed.set(doorId, stu.connectedRoomAddress);
