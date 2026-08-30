@@ -505,16 +505,27 @@ function segmentsForSig(segs: ConnectorSegment[] | undefined): CanonicalValue {
  *  console.error'd, silently dropping the pairing from the UI. It is the exact
  *  griefable owner-write DoS the round-4 segment fix closed, left open on this
  *  one lane (and a future honest hazard too — the continuous-space adapter
- *  solver can emit a fractional lateral with no attacker). |32 m|×1000 ⇒ |32000|,
- *  a safe integer everywhere; the sanitizer's own ±32 clamp is idempotent; a
- *  non-finite / non-number folds to null (= absent) so signer and verifier emit
- *  byte-identical envelopes for any stored value, hostile or clean. The `Mm`
+ *  solver can emit a fractional lateral with no attacker). This helper's accept
+ *  window is IDENTICAL to sanitizeDoorGeometry's — finite AND |v| ≤ 32 m — so the
+ *  signature attests EXACTLY the value the reader keeps: in range it quantizes to
+ *  a safe integer (|32 m|×1000 ⇒ |32000|); out of range OR non-finite it folds to
+ *  null (= absent), MATCHING the sanitizer's DROP (that gate drops the field, it
+ *  does NOT clamp). Mirroring the drop rather than clamping closes a boundary
+ *  asymmetry: were this helper to clamp |v|>32 back to ±32000, a hostile CRDT
+ *  tamper of a signed ±32 boundary offset to any larger value would quantize to
+ *  the same envelope bytes — signature still valid — yet the reader's sanitizer
+ *  would DROP the field and render the module centred instead of at the boundary.
+ *  Folding out-of-range to null makes any such tamper change the rebuilt bytes, so
+ *  verify refuses the record outright (fail-safe to unpaired) exactly as it does
+ *  for any in-range shift. Signer and verifier share this ONE helper, so they emit
+ *  byte-identical envelopes for every stored value, hostile or clean. The `Mm`
  *  suffix names the unit so a foreign reader (Rust twin, envelope inspector)
  *  cannot mistake fixed-point for the raw metre value — same as the segment
  *  arms. */
 function farLateralForSig(p: PairingSigInput): CanonicalValue {
-  return typeof p.farLateral === 'number' && Number.isFinite(p.farLateral)
-    ? Math.round(Math.max(-32, Math.min(32, p.farLateral)) * 1000)
+  const v = p.farLateral;
+  return typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 32
+    ? Math.round(v * 1000)
     : null;
 }
 

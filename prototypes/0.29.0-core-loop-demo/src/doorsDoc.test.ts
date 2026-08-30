@@ -880,4 +880,33 @@ describe('D3 · signed far-side lateral placement (round-5 regression)', () => {
       }),
     ).not.toThrow();
   });
+
+  it('signed farLateral at the ±32 boundary refuses an out-of-range tamper (attack: boundary-clamp-laundering)', () => {
+    // The sign helper's accept window is deliberately IDENTICAL to the reader's
+    // sanitizer (finite AND |v| ≤ 32). Were the helper to CLAMP |v|>32 back to
+    // ±32000 instead of folding to null, a signed boundary offset (exactly ±32 m)
+    // could be nudged to any larger out-of-range value: the verifier would
+    // re-quantize it to the SAME ±32000 envelope bytes — signature still valid —
+    // while the reader's sanitizer DROPPED the field, silently downgrading a
+    // max-offset module to "centred". Folding out-of-range to null closes it: the
+    // tamper's rebuilt bytes (null) no longer match the signed bytes (32000), so
+    // verify refuses the whole record, fail-safe to unpaired.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorPairing(DOOR_NORTH, ADDR_ONE, { farLateral: 32 });
+    const raw = rawEntry(doc, DOOR_NORTH) as DoorPairing;
+    // Precondition: the exact boundary value WAS signable — it quantized to the
+    // safe integer 32000 and the owner path produced a signature over it. (If it
+    // had NOT signed, there would be no envelope for the tamper to launder past.)
+    expect(raw.farLateral).toBe(32);
+    expect(typeof raw.ownerSig).toBe('string');
+
+    // Hostile nudge past the envelope edge — the clamp-laundering attack. The
+    // signed bytes committed farLateralMm:32000; the verifier now re-encodes 33
+    // as null (|33|>32), so the rebuilt bytes differ and the record is refused
+    // rather than surfacing sig-valid but sanitizer-dropped ("centred").
+    const tampered: DoorPairing = { ...raw, farLateral: 33 };
+    doc.getMap('doors').set(DOOR_NORTH, tampered);
+    bindAsPeer(doc, ROOM_A);
+    expect(readAllDoors().has(DOOR_NORTH)).toBe(false);
+  });
 });
