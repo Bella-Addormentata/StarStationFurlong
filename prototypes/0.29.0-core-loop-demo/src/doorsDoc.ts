@@ -132,6 +132,16 @@
  *   - A GUEST fabricating a PERMANENT pairing: guest-signed records MUST
  *     carry `transient: true` or verification refuses. A guest signature
  *     over a non-transient shape is treated as forgery.
+ *   - A hostile peer TAMPERING WITH connector geometry (segments — flex
+ *     `bendDeg`, ext `bays`, either `stretch`, and `skin`). The sig
+ *     envelope covers segments at fixed-point precision (deciDegrees for
+ *     flex bend, millimeters for stretch, exact integer for bays / skin).
+ *     Any change big enough to see — a bay swap, a bend past the 0.1°
+ *     quantization floor — invalidates the signature and the record fails
+ *     verify. Sub-quantization tweaks slip through but are visually
+ *     indistinguishable (0.1° at ~2.4 m gangway ≈ 4 mm arc, 1 mm on
+ *     stretch); this is the price of encoding fractional geometry through
+ *     the safe-integer canonical CBOR profile.
  *  NOT PREVENTED (DOCUMENTED RESIDUALS):
  *   - A hostile peer OVERWRITING a valid signed record with garbage (Yjs map
  *     LWW rule). Verify-on-read drops the garbage and treats the slot as
@@ -427,16 +437,52 @@ function orNull<T>(v: T | undefined): T | null {
 /** Serialize a ConnectorSegment as a plain JSON object canonicalEncode
  *  accepts — same field selection as `sanitizeDoorGeometry`, so the sig
  *  bytes cover only what the reader would render. Unknown kinds are dropped
- *  upstream by the sanitizer before they ever reach this encoder. */
+ *  upstream by the sanitizer before they ever reach this encoder.
+ *
+ *  #67 D3 audit follow-up (round-4 BLOCKER on RING preset): canonicalEncode
+ *  refuses non-safe-integer numbers (float 22.5, NaN, Infinity), so a raw
+ *  `{ bendDeg: 22.5 }` — the shipped RING preset — threw on the way in,
+ *  the throw was swallowed at the two production call sites (world.ts
+ *  ACCEPTED handshake and main.ts cross-room mirror), and every signed RING
+ *  pairing was silently poisoned. Fix: run the sanitize clamps in-line so
+ *  hostile non-finite floats fold to the same safe value the reader would
+ *  render, then quantize to a fixed-point integer (deciDeg for bend, mm for
+ *  stretch — both well inside safe-integer range across the whole clamp
+ *  window). Signer and verifier both encode through here, so byte-identical
+ *  output is guaranteed for any raw input, hostile or clean. */
 function segmentForSig(s: ConnectorSegment): { [k: string]: CanonicalValue } {
   if (s.kind === 'flex') {
-    return { kind: 'flex', bendDeg: s.bendDeg ?? 0, stretch: s.stretch ?? 0 };
+    const bendDeg = clampFlexBendFine(
+      typeof s.bendDeg === 'number' && Number.isFinite(s.bendDeg) ? s.bendDeg : 0,
+    );
+    const stretch = clampFlexStretch(
+      typeof s.stretch === 'number' && Number.isFinite(s.stretch) ? s.stretch : 0,
+    );
+    return {
+      kind: 'flex',
+      // Deci-degrees: ±60° clamp × 10 ⇒ ±600, a safe integer everywhere.
+      // Field-name suffix names the unit so a foreign reader (Rust twin, an
+      // envelope inspector) cannot confuse fixed-point for the raw value.
+      bendDeg10: Math.round(bendDeg * 10),
+      // Millimeters: flex stretch clamp ±0.45 m × 1000 ⇒ ±450, safe integer.
+      stretchMm: Math.round(stretch * 1000),
+    };
   }
+  const bays = clampExtBays(
+    typeof s.bays === 'number' && Number.isFinite(s.bays) ? s.bays : 2,
+  );
+  const stretch = clampExtStretch(
+    typeof s.stretch === 'number' && Number.isFinite(s.stretch) ? s.stretch : 0,
+  );
   return {
     kind: 'ext',
-    bays: s.bays ?? 2,
+    // clampExtBays already Math.rounds — integer within [2, 12], safe.
+    bays,
     skin: s.skin === 'solid' ? 'solid' : 'ribbed',
-    stretch: s.stretch ?? 0,
+    // Ext stretch clamp ±0.6 m × 1000 ⇒ ±600, safe integer. Same suffix
+    // discipline as the flex arm — deliberate divergence from the raw field
+    // name so a byte-encoding round-trip cannot silently reuse untyped data.
+    stretchMm: Math.round(stretch * 1000),
   };
 }
 

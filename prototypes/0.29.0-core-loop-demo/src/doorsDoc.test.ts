@@ -632,3 +632,150 @@ describe('D3 · map-key discipline', () => {
     })).toThrow();
   });
 });
+
+// ============================================================================
+// D3 · SIGNED SEGMENT GEOMETRY (round-4 audit BLOCKER regression)
+// ============================================================================
+//
+// Attack: prior segmentForSig forwarded raw fractional bendDeg / stretch to
+// canonicalEncode, which refuses non-safe-integer numbers. The RING preset
+// (`{kind:'flex',bendDeg:22.5,stretch:0}`, x2 with a solid ext bay bank) is
+// one of two shipped octagon presets used by every ring-connector chain, so
+// every signed RING pairing threw on the sig-bytes build. The write-side
+// error was swallowed by the two production call sites (world.ts ACCEPTED
+// handshake and main.ts cross-room mirror), leaving the door slot empty and
+// no UI feedback — the ship silently never docked as far as any peer could
+// tell.
+//
+// Fix: segmentForSig now runs the sanitize clamps and quantizes to a
+// fixed-point integer (deciDeg for flex bend, mm for stretch) so both the
+// signer and the verifier round through the same helper for byte-identical
+// output; hostile non-finite floats fold to the safe clamp default.
+
+describe('D3 · signed segment geometry (round-4 BLOCKER regression)', () => {
+  const RING_SEGMENTS = [
+    { kind: 'flex' as const, bendDeg: 22.5, stretch: 0 },
+    { kind: 'ext' as const, bays: 4, skin: 'solid' as const },
+    { kind: 'flex' as const, bendDeg: 22.5, stretch: 0 },
+  ];
+
+  it('writeDoorPairing round-trips the shipped RING preset (attack: fractional-bend-fails-encode)', () => {
+    bindAsOwner(doc, ROOM_A);
+    // Before the fix: canonicalEncode threw on `bendDeg: 22.5` and the
+    // outer catch converted the throw into `writeDoorPairing … refusing to
+    // persist an unsigned record`; every RING pairing silently disappeared.
+    expect(() =>
+      writeDoorPairing(DOOR_NORTH, ADDR_ONE, { segments: RING_SEGMENTS }),
+    ).not.toThrow();
+
+    // Peer reads the pairing and sees the RING geometry intact.
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    expect(p?.paired).toBe(true);
+    if (!p?.paired) throw new Error('unreachable');
+    expect(p.segments?.length).toBe(3);
+    expect(p.segments?.[0]).toMatchObject({ kind: 'flex', bendDeg: 22.5, stretch: 0 });
+    expect(p.segments?.[1]).toMatchObject({ kind: 'ext', bays: 4, skin: 'solid' });
+    expect(p.segments?.[2]).toMatchObject({ kind: 'flex', bendDeg: 22.5, stretch: 0 });
+  });
+
+  it('signed segments verify against the SPOKE preset (integer bend, boundary case)', () => {
+    // Second shipped preset — bendDeg 0 (integer), long ext bank. Confirms
+    // the fix does not regress the integer-only path.
+    bindAsOwner(doc, ROOM_A);
+    const spoke = [
+      { kind: 'flex' as const, bendDeg: 0, stretch: 0 },
+      { kind: 'ext' as const, bays: 11, skin: 'solid' as const },
+      { kind: 'flex' as const, bendDeg: 0, stretch: 0 },
+    ];
+    writeDoorPairing(DOOR_NORTH, ADDR_ONE, { segments: spoke });
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    expect(p?.paired).toBe(true);
+  });
+
+  it('signed segments cover meaningful tamper: swapping bendDeg 22.5→30 refuses (attack: chain-tamper)', () => {
+    // Segments live inside the sig envelope, so a hostile peer that flips
+    // one flex bend to a visibly different angle can no longer keep the
+    // owner's signature attached. 30° is 5 detent snaps away from 22.5°,
+    // WELL above the 0.1° quantization floor.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorPairing(DOOR_NORTH, ADDR_ONE, { segments: RING_SEGMENTS });
+    const raw = rawEntry(doc, DOOR_NORTH) as DoorPairing;
+
+    const tampered: DoorPairing = {
+      ...raw,
+      segments: [
+        { kind: 'flex', bendDeg: 30, stretch: 0 },
+        { kind: 'ext', bays: 4, skin: 'solid' },
+        { kind: 'flex', bendDeg: 22.5, stretch: 0 },
+      ],
+    };
+    doc.getMap('doors').set(DOOR_NORTH, tampered);
+    bindAsPeer(doc, ROOM_A);
+    expect(readAllDoors().has(DOOR_NORTH)).toBe(false);
+  });
+
+  it('signed segments cover ext bays tamper: 4→8 refuses (attack: chain-length-tamper)', () => {
+    // Same as above for the extension arm — swapping bays 4→8 doubles the
+    // chain length. Sig envelope covers bays, so the swap fails verify.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorPairing(DOOR_NORTH, ADDR_ONE, { segments: RING_SEGMENTS });
+    const raw = rawEntry(doc, DOOR_NORTH) as DoorPairing;
+
+    const tampered: DoorPairing = {
+      ...raw,
+      segments: [
+        { kind: 'flex', bendDeg: 22.5, stretch: 0 },
+        { kind: 'ext', bays: 8, skin: 'solid' },
+        { kind: 'flex', bendDeg: 22.5, stretch: 0 },
+      ],
+    };
+    doc.getMap('doors').set(DOOR_NORTH, tampered);
+    bindAsPeer(doc, ROOM_A);
+    expect(readAllDoors().has(DOOR_NORTH)).toBe(false);
+  });
+
+  it('signed segments tolerate hostile NaN / Infinity floats (attack: encoder-crash-DoS)', () => {
+    // The canonicalize step folds non-finite numbers to the sanitize
+    // default (0), so a hostile writer cannot crash the encoder by seeding
+    // its own record with `bendDeg: Infinity`. The written record's segments
+    // still ride on the wire (the raw shape is untouched); verify rebuilds
+    // bytes over the SAME canonicalized value the sanitizer would render.
+    bindAsOwner(doc, ROOM_A);
+    // Owner signs a pairing with a NaN segment — must not throw.
+    const wild = [
+      { kind: 'flex' as const, bendDeg: NaN, stretch: Infinity },
+    ];
+    expect(() => writeDoorPairing(DOOR_NORTH, ADDR_ONE, { segments: wild })).not.toThrow();
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    // Reader sanitizes wild floats to safe clamp defaults and the record
+    // still verifies (both sides encode the SAME clamped value).
+    expect(p?.paired).toBe(true);
+    if (!p?.paired) throw new Error('unreachable');
+    // Sanitizer output for wild bendDeg / stretch is 0 (see sanitizeDoorGeometry).
+    expect(p.segments?.[0]).toMatchObject({ kind: 'flex', bendDeg: 0, stretch: 0 });
+  });
+
+  it('signed guest transient with RING segments round-trips (adapter jetbridge path)', () => {
+    // docking-adapter berthing (transient path, guest-signed) also carries
+    // segments — the jetbridge solver's continuous-bend chain. Same
+    // signed-envelope regression as the owner-signed pairing.
+    bindAsGuest(doc, ROOM_A);
+    const jet = [
+      { kind: 'flex' as const, bendDeg: 40.1, stretch: 0.001 },
+      { kind: 'ext' as const, bays: 3, skin: 'ribbed' as const, stretch: -0.05 },
+      { kind: 'flex' as const, bendDeg: -12.7, stretch: 0.0 },
+    ];
+    expect(() =>
+      writeDoorPairing(DOOR_NORTH, ADDR_ONE, { segments: jet, transient: true }),
+    ).not.toThrow();
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    expect(p?.paired).toBe(true);
+    if (!p?.paired) throw new Error('unreachable');
+    expect(p.transient).toBe(true);
+    expect(p.segments?.length).toBe(3);
+  });
+});
