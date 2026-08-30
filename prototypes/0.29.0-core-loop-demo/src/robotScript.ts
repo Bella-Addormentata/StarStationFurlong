@@ -175,6 +175,58 @@ export function parseRobotScript(input: unknown): { steps: RobotStep[]; issues: 
   return { steps, issues };
 }
 
+// ── Validated per-step editing (console step editor) ─────────────────────────
+
+/** Editable-field whitelist per step kind — the console's per-step inputs may
+ *  patch exactly these. A field that doesn't belong to the step's kind is
+ *  refused outright (patching `x` onto a SAY step would smuggle an unchecked
+ *  extra key into the doc), and a DOCK step has no payload to edit at all. */
+const EDITABLE_STEP_FIELDS: Record<RobotStep['kind'], readonly string[]> = {
+  goto: ['x', 'z'],
+  say: ['text'],
+  wait: ['secs'],
+  dock: [],
+};
+
+/** patchScriptStep — pure, VALIDATED single-field edit of one script step.
+ *
+ *  The dock console's per-step inputs route every change through here BEFORE
+ *  the doc write — the same refuse-and-snap-back gate the wheel-pacing and
+ *  charge-envelope editors use: build the candidate step, run it through the
+ *  isRobotStep envelope, and return the new steps array only when the result
+ *  is valid. `null` means "refuse the edit, keep the stored script" (the
+ *  caller re-renders so the input snaps back to the accepted value). Without
+ *  this gate a single out-of-envelope keystroke (coord past ±MAX_COORD_ABS,
+ *  empty SAY text, WAIT past MAX_WAIT_SECS) would commit an invalid step and
+ *  isRobotConfig would then refuse the WHOLE config on every client — routine,
+ *  script, wheel pacing and charge envelope all silently reverting to
+ *  defaults over one typo.
+ *
+ *  Numeric fields parse from the raw input string; a blank string is refused
+ *  rather than coerced (`Number('') === 0` would silently rewrite a cleared
+ *  coordinate to 0 — a valid but unintended value). The input array is never
+ *  mutated; the returned array shares the untouched step objects.
+ */
+export function patchScriptStep(
+  steps: readonly RobotStep[],
+  index: number,
+  field: string,
+  rawValue: string,
+): RobotStep[] | null {
+  if (!Number.isInteger(index) || index < 0 || index >= steps.length) return null;
+  const step = steps[index];
+  if (!EDITABLE_STEP_FIELDS[step.kind].includes(field)) return null;
+  let candidate: RobotStep;
+  if (field === 'text') {
+    candidate = { ...step, text: rawValue } as RobotStep;
+  } else {
+    if (rawValue.trim() === '') return null;
+    candidate = { ...step, [field]: Number(rawValue) } as RobotStep;
+  }
+  if (!isRobotStep(candidate)) return null;
+  return steps.map((s, n) => (n === index ? candidate : s));
+}
+
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
 /** What the scheduler asks the render layer to do this frame. The scheduler

@@ -126,6 +126,11 @@ import {
   CLOSING_SECS_MAX, CLOSING_SECS_MIN,
   SHOW_SECS_MAX, SHOW_SECS_MIN,
   isWheelTiming,
+  // ✏️ Step-editor envelope: per-field bounds surfaced as native input hints,
+  // and the validated single-field patch helper the change handler routes
+  // through (refuse-and-snap-back, same as the pacing/charge editors).
+  MAX_COORD_ABS, MAX_SAY_LEN, MAX_WAIT_SECS,
+  patchScriptStep,
   type WheelTiming,
 } from './robotScript';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
@@ -2039,21 +2044,28 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         cursor:${owner ? 'pointer' : 'default'};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
-    const inp = (idx: number, field: string, val: string, w: string, type = 'text'): string =>
-      `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${owner ? '' : 'disabled'} style="
+    // ✏️ `extra` carries per-field native constraint attributes (min/max/
+    // maxlength) so the browser hints the same envelope patchScriptStep
+    // enforces — the authoritative gate stays the validator, not the DOM.
+    const inp = (idx: number, field: string, val: string, w: string, type = 'text', extra = ''): string =>
+      `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${extra} ${owner ? '' : 'disabled'} style="
         width:${w}; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
         border-radius:4px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:3px 5px;">`;
     const stepRow = (step: RobotStep, idx: number): string => {
       const del = owner
         ? `<button data-del="${idx}" title="Remove" style="margin-left:auto; background:none; border:none; color:#FF8A80; font-size:14px; cursor:pointer;">×</button>`
         : '';
+      // Native hints mirror the isRobotStep envelope: coords ±MAX_COORD_ABS
+      // (fractional allowed → step="any"), wait 0..MAX_WAIT_SECS, say text
+      // capped at MAX_SAY_LEN code units.
+      const coordAttrs = `min="-${MAX_COORD_ABS}" max="${MAX_COORD_ABS}" step="any"`;
       let body: string;
       if (step.kind === 'goto') {
-        body = `🚶 GO TO ${inp(idx, 'x', String(step.x), '46px', 'number')} , ${inp(idx, 'z', String(step.z), '46px', 'number')}`;
+        body = `🚶 GO TO ${inp(idx, 'x', String(step.x), '46px', 'number', coordAttrs)} , ${inp(idx, 'z', String(step.z), '46px', 'number', coordAttrs)}`;
       } else if (step.kind === 'say') {
-        body = `💬 SAY ${inp(idx, 'text', escAttr(step.text), '150px')}`;
+        body = `💬 SAY ${inp(idx, 'text', escAttr(step.text), '150px', 'text', `maxlength="${MAX_SAY_LEN}"`)}`;
       } else if (step.kind === 'wait') {
-        body = `⏱ WAIT ${inp(idx, 'secs', String(step.secs), '46px', 'number')} s`;
+        body = `⏱ WAIT ${inp(idx, 'secs', String(step.secs), '46px', 'number', `min="0" max="${MAX_WAIT_SECS}" step="any"`)} s`;
       } else {
         // 🔋 #77 charge slice: DOCK step carries no payload — the render binding
         // resolves the dock target. No editable fields; just a labelled row.
@@ -2242,16 +2254,18 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         writeScript('custom', curScript().filter((_, n) => n !== i));
       });
     });
+    // ✏️ Per-step edits validate through patchScriptStep BEFORE the doc write —
+    // the same refuse-and-snap-back gate the wheel-pacing ([data-timing]) and
+    // charge-envelope ([data-charge-param]) editors use. An out-of-envelope
+    // value (coord past ±MAX_COORD_ABS, empty SAY text, WAIT past
+    // MAX_WAIT_SECS) stays local and render() resets the input; the raw write
+    // it replaces would have made isRobotConfig refuse the WHOLE config on
+    // every client (routine, script, pacing and charge envelope all reverting).
     panel.querySelectorAll<HTMLInputElement>('[data-idx]').forEach((el) => {
       el.addEventListener('change', () => {
-        const i = Number(el.dataset.idx);
-        const f = el.dataset.f!;
-        const script2 = curScript().map((s, n) => {
-          if (n !== i) return s;
-          if (f === 'text') return { ...s, text: el.value };
-          return { ...s, [f]: Number(el.value) };
-        });
-        writeScript('custom', script2 as RobotStep[]);
+        const next = patchScriptStep(curScript(), Number(el.dataset.idx), el.dataset.f!, el.value);
+        if (next) writeScript('custom', next);
+        else render();
       });
     });
   };

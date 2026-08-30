@@ -26,6 +26,7 @@ import {
   isRobotStep,
   isWheelTiming,
   parseRobotScript,
+  patchScriptStep,
 } from './robotScript';
 import type { RobotStep } from './robotScript';
 
@@ -449,5 +450,94 @@ describe('RobotScriptScheduler — safety and determinism', () => {
     ]);
     s.skipStep();
     expect(s.cursor()).toBe(1);
+  });
+});
+
+// ── patchScriptStep — the console's validated per-step edit gate ─────────────
+//
+// Regression lane for the #77 audit MAJOR: the dock console's per-step inputs
+// used to write the rebuilt script raw, so one out-of-envelope keystroke
+// (x=35, empty SAY text, WAIT 61 s) committed an invalid step and
+// isRobotConfig then refused the WHOLE config on every client — routine,
+// script, wheel pacing and charge envelope all reverting to defaults. Every
+// edit now routes through patchScriptStep, which refuses instead of writing.
+describe('patchScriptStep', () => {
+  /** Fresh three-kind script for each case — index 0 goto, 1 say, 2 wait, 3 dock. */
+  const base = (): RobotStep[] => [
+    { kind: 'goto', x: 1, z: -2 },
+    { kind: 'say', text: 'Hello!' },
+    { kind: 'wait', secs: 2 },
+    { kind: 'dock' },
+  ];
+
+  it('applies an in-envelope goto coordinate edit', () => {
+    const steps = base();
+    const next = patchScriptStep(steps, 0, 'x', '7');
+    expect(next).not.toBeNull();
+    expect(next![0]).toEqual({ kind: 'goto', x: 7, z: -2 });
+  });
+  it('accepts fractional coordinates (the envelope is not integer-only)', () => {
+    const next = patchScriptStep(base(), 0, 'z', '2.5');
+    expect(next![0]).toEqual({ kind: 'goto', x: 1, z: 2.5 });
+  });
+  it('refuses a coordinate past ±MAX_COORD_ABS — the config-nuke typo', () => {
+    expect(patchScriptStep(base(), 0, 'x', String(MAX_COORD_ABS + 5))).toBeNull();
+    expect(patchScriptStep(base(), 0, 'z', String(-(MAX_COORD_ABS + 5)))).toBeNull();
+    // Boundary itself is legal (isBoundedNumber is inclusive).
+    expect(patchScriptStep(base(), 0, 'x', String(MAX_COORD_ABS))).not.toBeNull();
+  });
+  it('refuses non-numeric input on a numeric field', () => {
+    expect(patchScriptStep(base(), 0, 'x', 'abc')).toBeNull();
+    expect(patchScriptStep(base(), 2, 'secs', '1e999')).toBeNull(); // Infinity
+  });
+  it("refuses a blank numeric field instead of coercing it (Number('') === 0 trap)", () => {
+    // A cleared input would otherwise silently rewrite the coordinate to 0 —
+    // a VALID value the owner never typed. Blank means "refuse, snap back".
+    expect(patchScriptStep(base(), 0, 'x', '')).toBeNull();
+    expect(patchScriptStep(base(), 2, 'secs', '   ')).toBeNull();
+  });
+  it('applies an in-envelope SAY text edit', () => {
+    const next = patchScriptStep(base(), 1, 'text', 'Care for a drink?');
+    expect(next![1]).toEqual({ kind: 'say', text: 'Care for a drink?' });
+  });
+  it('refuses an empty SAY text — the single-keystroke config-nuke', () => {
+    // Clearing the text field then blurring fired the old raw write; the empty
+    // string fails isBoundedString and the whole config vanished everywhere.
+    expect(patchScriptStep(base(), 1, 'text', '')).toBeNull();
+  });
+  it('caps SAY text at MAX_SAY_LEN (inclusive)', () => {
+    expect(patchScriptStep(base(), 1, 'text', 'a'.repeat(MAX_SAY_LEN))).not.toBeNull();
+    expect(patchScriptStep(base(), 1, 'text', 'a'.repeat(MAX_SAY_LEN + 1))).toBeNull();
+  });
+  it('bounds WAIT seconds to [0, MAX_WAIT_SECS]', () => {
+    expect(patchScriptStep(base(), 2, 'secs', String(MAX_WAIT_SECS))).not.toBeNull();
+    expect(patchScriptStep(base(), 2, 'secs', String(MAX_WAIT_SECS + 1))).toBeNull();
+    expect(patchScriptStep(base(), 2, 'secs', '-1')).toBeNull();
+    expect(patchScriptStep(base(), 2, 'secs', '0')).not.toBeNull();
+  });
+  it('refuses a field that does not belong to the step kind (no smuggled keys)', () => {
+    // Patching `x` onto a SAY step would spread an unchecked extra key into
+    // the stored record; the per-kind whitelist refuses before building it.
+    expect(patchScriptStep(base(), 1, 'x', '3')).toBeNull();
+    expect(patchScriptStep(base(), 0, 'text', 'hi')).toBeNull();
+    expect(patchScriptStep(base(), 0, 'kind', 'say')).toBeNull();
+  });
+  it('refuses any edit on a DOCK step (payload-free by design)', () => {
+    expect(patchScriptStep(base(), 3, 'x', '1')).toBeNull();
+    expect(patchScriptStep(base(), 3, 'text', 'hi')).toBeNull();
+  });
+  it('refuses an out-of-range or non-integer index', () => {
+    expect(patchScriptStep(base(), -1, 'x', '1')).toBeNull();
+    expect(patchScriptStep(base(), 4, 'x', '1')).toBeNull();
+    expect(patchScriptStep(base(), 0.5, 'x', '1')).toBeNull();
+    expect(patchScriptStep([], 0, 'x', '1')).toBeNull();
+  });
+  it('never mutates the input; untouched steps are shared by reference', () => {
+    const steps = base();
+    const snapshot = JSON.parse(JSON.stringify(steps));
+    const next = patchScriptStep(steps, 0, 'x', '9');
+    expect(steps).toEqual(snapshot); // original untouched
+    expect(next![1]).toBe(steps[1]); // unpatched entries share identity
+    expect(next![0]).not.toBe(steps[0]); // patched entry is a fresh object
   });
 });
