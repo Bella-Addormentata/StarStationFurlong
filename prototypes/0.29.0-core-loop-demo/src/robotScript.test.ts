@@ -13,6 +13,7 @@ import {
   BET_SECS_MIN,
   CLOSING_SECS_MAX,
   CLOSING_SECS_MIN,
+  DOCK_STEP_NO_DOCK_SECS,
   GOTO_TIMEOUT_SECS,
   MAX_COORD_ABS,
   MAX_SAY_LEN,
@@ -81,6 +82,16 @@ describe('isRobotStep', () => {
   });
   it('accepts the exact coord boundary', () => {
     expect(isRobotStep({ kind: 'goto', x: MAX_COORD_ABS, z: -MAX_COORD_ABS })).toBe(true);
+  });
+  it('accepts a valid dock step (payload-free)', () => {
+    // 🔋 #77 charge slice: the 'dock' step carries no coords — the render
+    // binding resolves the target from ITS own dockTarget, not from the doc.
+    expect(isRobotStep({ kind: 'dock' })).toBe(true);
+  });
+  it('ignores extraneous fields on a dock step (still valid on kind alone)', () => {
+    // The guard only checks `kind`. Extra fields don't invalidate the step —
+    // but they are silently dropped by whole-value replace on the next write.
+    expect(isRobotStep({ kind: 'dock', x: 999, z: 'nope' })).toBe(true);
   });
 });
 
@@ -258,6 +269,94 @@ describe('RobotScriptScheduler — GOTO step arrival and timeout', () => {
     // ARRIVE_DIST * 2 away — safely outside without float ambiguity.
     s.advance(0.1, { x: 10 - ARRIVE_DIST * 2, z: 0 });
     expect(s.cursor()).toBe(0);
+  });
+});
+
+// 🔋 #77 charge slice: the 'dock' step composes with the rest of the loop —
+// walk home to the robot's dock, then let the next step (say/wait) run. The
+// scheduler emits `gotoDock` and defers the target coord to the render binding.
+describe('RobotScriptScheduler — DOCK step (goto-dock capability)', () => {
+  it('emits gotoDock with the dock coords the binding hands in', () => {
+    const s = new RobotScriptScheduler([
+      { kind: 'dock' },
+      { kind: 'wait', secs: 1 },
+    ]);
+    const a = s.advance(0.1, { x: 0, z: 0 }, { x: 4.5, z: 4.5 }) as {
+      kind: 'gotoDock'; x: number; z: number; hasDock: boolean;
+    };
+    expect(a.kind).toBe('gotoDock');
+    expect(a.x).toBe(4.5);
+    expect(a.z).toBe(4.5);
+    expect(a.hasDock).toBe(true);
+    expect(s.cursor()).toBe(0);
+  });
+
+  it('advances the cursor when the robot arrives at the dock (ARRIVE_DIST)', () => {
+    const s = new RobotScriptScheduler([
+      { kind: 'dock' },
+      { kind: 'wait', secs: 1 },
+    ]);
+    // Standing on the dock — arrived.
+    s.advance(0.1, { x: 4.5, z: 4.5 }, { x: 4.5, z: 4.5 });
+    expect(s.cursor()).toBe(1);
+  });
+
+  it('does NOT advance while just outside ARRIVE_DIST from the dock', () => {
+    const s = new RobotScriptScheduler([
+      { kind: 'dock' },
+      { kind: 'wait', secs: 1 },
+    ]);
+    s.advance(0.1, { x: 4.5 + ARRIVE_DIST * 2, z: 4.5 }, { x: 4.5, z: 4.5 });
+    expect(s.cursor()).toBe(0);
+  });
+
+  it('advances a dock step that never arrives on GOTO_TIMEOUT_SECS', () => {
+    const s = new RobotScriptScheduler([
+      { kind: 'dock' },
+      { kind: 'wait', secs: MAX_WAIT_SECS },
+    ]);
+    const dock = { x: 10, z: 10 };
+    const dt = 1;
+    // Bot stationary far from dock — must exit via the same timeout as goto.
+    for (let t = 0; t < Math.ceil(GOTO_TIMEOUT_SECS); t++) {
+      s.advance(dt, { x: 0, z: 0 }, dock);
+    }
+    expect(s.cursor()).toBe(1);
+  });
+
+  it('reports hasDock=false and stalls only for DOCK_STEP_NO_DOCK_SECS when there is no dock', () => {
+    const s = new RobotScriptScheduler([
+      { kind: 'dock' },
+      { kind: 'wait', secs: MAX_WAIT_SECS },
+    ]);
+    // No dock context — the step must not freeze the loop for the full 20 s
+    // goto timeout; the 3-second short stall lets a dockless routine keep moving.
+    const a = s.advance(0.1, { x: 0, z: 0 }, null) as {
+      kind: 'gotoDock'; hasDock: boolean; x: number; z: number;
+    };
+    expect(a.kind).toBe('gotoDock');
+    expect(a.hasDock).toBe(false);
+    expect(s.cursor()).toBe(0);
+    // After DOCK_STEP_NO_DOCK_SECS elapses, the step advances.
+    s.advance(DOCK_STEP_NO_DOCK_SECS, { x: 0, z: 0 }, null);
+    expect(s.cursor()).toBe(1);
+  });
+
+  it('parses a dock step through the doc-boundary sanitiser', () => {
+    // Hostile-payload probe: a mix of valid/invalid + a plain 'dock' step —
+    // dock survives, garbage is dropped with a diagnostic.
+    const { steps, issues } = parseRobotScript([
+      { kind: 'dock' },
+      { kind: 'exec', code: 'alert(1)' },
+      { kind: 'say', text: 'ready' },
+      { kind: 'dock', payload: 'ignored' },
+    ]);
+    expect(steps.length).toBe(3);
+    expect(steps[0]).toEqual({ kind: 'dock' });
+    expect(steps[2]).toEqual({ kind: 'dock', payload: 'ignored' });
+    // Only the exec kind was rejected as malformed.
+    expect(issues.length).toBe(1);
+    expect(issues[0].index).toBe(1);
   });
 });
 

@@ -22,13 +22,19 @@
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /** One bounded step of an owner-authored routine (a chip list, NOT a DSL). The
- *  robot loops the list: walk to a spot, say a line, or pause. The step kinds
- *  are frozen — any new mechanism ships as a new kind, so the validator's
- *  refusal remains a whitelist and stays cheap. */
+ *  robot loops the list: walk to a spot, say a line, pause, or return to its
+ *  charging dock. The step kinds are frozen — any new mechanism ships as a
+ *  new kind, so the validator's refusal remains a whitelist and stays cheap. */
 export type RobotStep =
   | { kind: 'goto'; x: number; z: number }
   | { kind: 'say'; text: string }
-  | { kind: 'wait'; secs: number };
+  | { kind: 'wait'; secs: number }
+  // 🔋 #77 charge slice: a "walk home to the dock" primitive the script can
+  // compose (top-up between beats, park at the end of a tour). No coords: the
+  // scheduler emits a `gotoDock` action and the render binding walks to WHATEVER
+  // dock the robot is bound to — a hostile owner can't teleport the bot outside
+  // the bounded goto envelope by writing a synthetic goto to a dock's world pos.
+  | { kind: 'dock' };
 
 /** Hard cap on a custom script — keeps the synced record small, the render
  *  loop cheap, and a malicious peer's payload bounded. 16 chips is enough for a
@@ -115,6 +121,12 @@ export function isRobotStep(value: unknown): value is RobotStep {
   if (s.kind === 'wait') {
     return isBoundedNonNegative(s.secs, 0, MAX_WAIT_SECS);
   }
+  // 🔋 The 'dock' step carries NO PAYLOAD — the render binding resolves the
+  // target dock, not the doc. That is the whole reason it is its own kind
+  // instead of a goto: no coords cross the trust boundary here.
+  if (s.kind === 'dock') {
+    return true;
+  }
   return false;
 }
 
@@ -174,8 +186,20 @@ export type SchedulerAction =
   | { kind: 'say'; text: string; started: boolean }
   /** Hold pose; the caller can idle-animate. */
   | { kind: 'wait' }
+  /** 🔋 Walk to the ROBOT'S OWN CHARGING DOCK, if bound; the caller resolves
+   *  the target from its `dock` context (never from doc coords). `x`/`z`/`hasDock`
+   *  ride along for callers that already know where to walk — a caller that
+   *  had no dock passes null, and `hasDock=false` means "there is nowhere to
+   *  go; hold pose while the step's stall timer runs out". */
+  | { kind: 'gotoDock'; x: number; z: number; hasDock: boolean }
   /** No script → no request; the caller idles freely. */
   | { kind: 'none' };
+
+/** Grace beat before a 'dock' step gives up when the robot has no dock
+ *  bound. Kept SHORTER than GOTO_TIMEOUT_SECS so an unbound loop doesn't
+ *  freeze the schedule for a full 20 s at every dock step — 3 s is enough
+ *  for a viewer to see the intent without hanging the routine. */
+export const DOCK_STEP_NO_DOCK_SECS = 3;
 
 /** RobotScriptScheduler — the pure state machine driving one robot's custom
  *  routine. The render layer feeds it dt + the bot's current world position;
@@ -248,8 +272,18 @@ export class RobotScriptScheduler {
    *
    *  `pos` is optional so a caller without a chassis (a test) can also drive
    *  the scheduler with only `advance(dt)` for say/wait timing. In that case
-   *  goto steps only advance via GOTO_TIMEOUT_SECS. */
-  advance(dt: number, pos?: { x: number; z: number }): SchedulerAction {
+   *  goto steps only advance via GOTO_TIMEOUT_SECS.
+   *
+   *  `dock` is optional and only consulted for a `dock` STEP — the render
+   *  binding hands it in every frame from its own dockTarget (or null when
+   *  the robot has no dock). Passing it here keeps the doc's `dock` step
+   *  payload-free (no coords for a hostile peer to abuse) while still giving
+   *  the scheduler an arrival predicate that matches the walker's own. */
+  advance(
+    dt: number,
+    pos?: { x: number; z: number },
+    dock?: { x: number; z: number } | null,
+  ): SchedulerAction {
     if (this.steps.length === 0) return { kind: 'none' };
     // Clamp dt into a sane band. Negative dt is a caller bug — treat as zero.
     const stepDt = Math.max(0, Math.min(dt, RobotScriptScheduler.DT_CEILING));
@@ -274,6 +308,24 @@ export class RobotScriptScheduler {
       if (started) this.sayStarted = true;
       if (this.timer >= SAY_HOLD_SECS) this.advanceCursor();
       return { kind: 'say', text: step.text, started };
+    }
+
+    // 🔋 dock: walk to the robot's own dock (resolved by the caller). Same
+    // arrival predicate as a goto, only the target comes from the render
+    // context rather than the step payload.
+    if (step.kind === 'dock') {
+      const hasDock = dock != null;
+      if (!hasDock) {
+        // No dock to walk to — stall for a short beat, then advance so the
+        // loop doesn't freeze on a dock step in a dockless room.
+        if (this.timer >= DOCK_STEP_NO_DOCK_SECS) this.advanceCursor();
+        return { kind: 'gotoDock', x: 0, z: 0, hasDock: false };
+      }
+      const arrived =
+        pos != null && Math.hypot(pos.x - dock.x, pos.z - dock.z) <= ARRIVE_DIST;
+      const timedOut = this.timer >= GOTO_TIMEOUT_SECS;
+      if (arrived || timedOut) this.advanceCursor();
+      return { kind: 'gotoDock', x: dock.x, z: dock.z, hasDock: true };
     }
 
     // wait
