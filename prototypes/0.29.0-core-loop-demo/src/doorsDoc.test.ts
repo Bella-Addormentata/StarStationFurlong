@@ -779,3 +779,105 @@ describe('D3 · signed segment geometry (round-4 BLOCKER regression)', () => {
     expect(p.segments?.length).toBe(3);
   });
 });
+
+// ============================================================================
+// D3 · SIGNED FAR-SIDE LATERAL PLACEMENT (round-5 audit MAJOR regression)
+// ============================================================================
+//
+// Attack: farLateral was the LAST geometry number riding RAW into
+// canonicalEncode — the two pairing sig builders forwarded `orNull(p.farLateral)`
+// while the segment arms already quantized bendDeg / stretch to fixed-point.
+// canonicalEncode refuses non-safe-integer numbers, and a fractional farLateral
+// is reachable WITHOUT a signing key: sanitizeDoorGeometry admits any finite
+// |v| ≤ 32 m (fractional included), and isValidSignedPairing accepts a keyless
+// LEGACY record, so a hostile peer can plant `{ paired:true,
+// connectedRoomAddress, farLateral:1.5 }`. That value survives the sanitized
+// read, hydrates into docking state, and throws on the owner's NEXT
+// ACCEPTED-handshake re-sign — caught + console.error'd, silently dropping the
+// pairing from the UI. It is the exact griefable owner-write DoS the round-4
+// segment fix closed, left open on this one lane (and a future honest hazard
+// too — the continuous-space adapter solver can emit a fractional lateral with
+// no attacker at all).
+//
+// Fix: farLateralForSig quantizes to a fixed-point MILLIMETRE integer
+// (|32 m|×1000 ⇒ |32000|, safe) under the sanitizer's own ±32 clamp, folding a
+// non-finite value to null (= absent), so signer and verifier round through one
+// helper for byte-identical output over any raw value, hostile or clean.
+
+describe('D3 · signed far-side lateral placement (round-5 regression)', () => {
+  it('owner-signed pairing round-trips a FRACTIONAL farLateral (attack: fractional-lateral-fails-encode)', () => {
+    // Before the fix: canonicalEncode threw on `farLateral: 1.5` and the outer
+    // catch converted the throw into a refusal to persist, so the pairing
+    // silently vanished — the RING-preset failure class, on the lateral lane.
+    bindAsOwner(doc, ROOM_A);
+    expect(() =>
+      writeDoorPairing(DOOR_NORTH, ADDR_ONE, { farLateral: 1.5 }),
+    ).not.toThrow();
+
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    expect(p?.paired).toBe(true);
+    if (!p?.paired) throw new Error('unreachable');
+    // The stored record keeps the RAW metre value — quantization lives ONLY
+    // inside the sig bytes, so the reader still renders the true lateral offset.
+    expect(p.farLateral).toBe(1.5);
+  });
+
+  it('signed farLateral covers meaningful tamper: 1.5→2.5 refuses (attack: lateral-shift-tamper)', () => {
+    // farLateral now rides inside the sig envelope, so a hostile peer that
+    // shifts the far module a full metre sideways can no longer keep the
+    // owner's signature attached. 1 m = 1000 mm, WELL above the 1 mm floor.
+    bindAsOwner(doc, ROOM_A);
+    writeDoorPairing(DOOR_NORTH, ADDR_ONE, { farLateral: 1.5 });
+    const raw = rawEntry(doc, DOOR_NORTH) as DoorPairing;
+
+    const tampered: DoorPairing = { ...raw, farLateral: 2.5 };
+    doc.getMap('doors').set(DOOR_NORTH, tampered);
+    bindAsPeer(doc, ROOM_A);
+    expect(readAllDoors().has(DOOR_NORTH)).toBe(false);
+  });
+
+  it('signed farLateral tolerates a hostile NaN (attack: encoder-crash-DoS)', () => {
+    // A non-finite lateral folds to null (= absent) on BOTH the sign and verify
+    // sides, so a hostile writer cannot crash the encoder with `farLateral: NaN`
+    // the way a raw forward would. The record still verifies (null == null).
+    bindAsOwner(doc, ROOM_A);
+    expect(() =>
+      writeDoorPairing(DOOR_NORTH, ADDR_ONE, { farLateral: NaN }),
+    ).not.toThrow();
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    expect(p?.paired).toBe(true);
+    if (!p?.paired) throw new Error('unreachable');
+    // Sanitizer drops the non-finite lateral (|v| ≤ 32 test fails on NaN).
+    expect(p.farLateral).toBeUndefined();
+  });
+
+  it('a keyless LEGACY farLateral plant does not throw the owner re-sign (attack: re-sign DoS via legacy plant)', () => {
+    // The real DoS: a hostile peer needs NO key to plant a legacy (unsigned)
+    // pairing carrying a fractional farLateral. It is accepted (legacy posture)
+    // and its lateral survives the sanitized read, so the owner's next ACCEPTED
+    // handshake feeds that exact value into doorPairingSignatureBytes. Pre-fix
+    // that call threw and the pairing was silently lost; post-fix the encoder
+    // folds it to a safe fixed-point integer and the re-sign builds cleanly.
+    doc.getMap('doors').set(DOOR_NORTH, {
+      paired: true,
+      connectedRoomAddress: ADDR_ONE,
+      farLateral: 1.5,
+    });
+    bindAsPeer(doc, ROOM_A);
+    const p = readAllDoors().get(DOOR_NORTH);
+    expect(p?.paired).toBe(true);
+    if (!p?.paired) throw new Error('unreachable');
+    expect(p.farLateral).toBe(1.5); // legacy accepted; fractional lateral survives sanitize
+
+    // The ACCEPTED handshake re-signs over the hydrated value — the call that
+    // threw pre-fix. It must now build signature bytes without throwing.
+    expect(() =>
+      doorPairingSignatureBytes(ROOM_A, DOOR_NORTH, {
+        connectedRoomAddress: p.connectedRoomAddress,
+        farLateral: p.farLateral,
+      }),
+    ).not.toThrow();
+  });
+});

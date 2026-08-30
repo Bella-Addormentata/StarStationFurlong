@@ -133,14 +133,15 @@
  *     carry `transient: true` or verification refuses. A guest signature
  *     over a non-transient shape is treated as forgery.
  *   - A hostile peer TAMPERING WITH connector geometry (segments — flex
- *     `bendDeg`, ext `bays`, either `stretch`, and `skin`). The sig
- *     envelope covers segments at fixed-point precision (deciDegrees for
- *     flex bend, millimeters for stretch, exact integer for bays / skin).
- *     Any change big enough to see — a bay swap, a bend past the 0.1°
- *     quantization floor — invalidates the signature and the record fails
- *     verify. Sub-quantization tweaks slip through but are visually
- *     indistinguishable (0.1° at ~2.4 m gangway ≈ 4 mm arc, 1 mm on
- *     stretch); this is the price of encoding fractional geometry through
+ *     `bendDeg`, ext `bays`, either `stretch`, and `skin` — plus the far-side
+ *     lateral placement offset `farLateral`). The sig envelope covers them at
+ *     fixed-point precision (deciDegrees for flex bend, millimeters for stretch
+ *     AND for farLateral, exact integer for bays / skin). Any change big enough
+ *     to see — a bay swap, a bend past the 0.1° quantization floor, a lateral
+ *     shift past the 1 mm floor — invalidates the signature and the record
+ *     fails verify. Sub-quantization tweaks slip through but are visually
+ *     indistinguishable (0.1° at ~2.4 m gangway ≈ 4 mm arc, 1 mm on stretch and
+ *     on lateral); this is the price of encoding fractional geometry through
  *     the safe-integer canonical CBOR profile.
  *  NOT PREVENTED (DOCUMENTED RESIDUALS):
  *   - A hostile peer OVERWRITING a valid signed record with garbage (Yjs map
@@ -493,6 +494,30 @@ function segmentsForSig(segs: ConnectorSegment[] | undefined): CanonicalValue {
   return segs.map(segmentForSig);
 }
 
+/** farLateral (metres) quantized to a fixed-point MILLIMETRE integer for the
+ *  signature bytes — same discipline as segmentForSig's bendDeg10/stretchMm,
+ *  and for the same reason. canonicalEncode refuses non-safe-integer numbers,
+ *  yet sanitizeDoorGeometry admits ANY finite |farLateral| ≤ 32 m (fractional
+ *  included), and isValidSignedPairing accepts a keyless LEGACY record — so a
+ *  hostile peer needs no signing key to plant `{ paired:true, …, farLateral:1.5 }`.
+ *  That raw fractional value survives the sanitized read, hydrates into docking
+ *  state, and throws on the owner's NEXT ACCEPTED-handshake re-sign — caught and
+ *  console.error'd, silently dropping the pairing from the UI. It is the exact
+ *  griefable owner-write DoS the round-4 segment fix closed, left open on this
+ *  one lane (and a future honest hazard too — the continuous-space adapter
+ *  solver can emit a fractional lateral with no attacker). |32 m|×1000 ⇒ |32000|,
+ *  a safe integer everywhere; the sanitizer's own ±32 clamp is idempotent; a
+ *  non-finite / non-number folds to null (= absent) so signer and verifier emit
+ *  byte-identical envelopes for any stored value, hostile or clean. The `Mm`
+ *  suffix names the unit so a foreign reader (Rust twin, envelope inspector)
+ *  cannot mistake fixed-point for the raw metre value — same as the segment
+ *  arms. */
+function farLateralForSig(p: PairingSigInput): CanonicalValue {
+  return typeof p.farLateral === 'number' && Number.isFinite(p.farLateral)
+    ? Math.round(Math.max(-32, Math.min(32, p.farLateral)) * 1000)
+    : null;
+}
+
 /** Bytes the room owner signs for a non-transient DoorPairing record.
  *  transient is EXCLUDED from the payload here — the domain tag itself
  *  encodes "non-transient". A hostile peer that adds `transient:true` to a
@@ -512,7 +537,7 @@ export function doorPairingSignatureBytes(
       segments: segmentsForSig(p.segments),
       farDoor: orNull(p.farDoor),
       farWall: orNull(p.farWall),
-      farLateral: orNull(p.farLateral),
+      farLateralMm: farLateralForSig(p),
       farYawDeg: orNull(p.farYawDeg),
       seq: orNull(p.seq),
     },
@@ -539,7 +564,7 @@ export function doorPairingGuestSignatureBytes(
       segments: segmentsForSig(p.segments),
       farDoor: orNull(p.farDoor),
       farWall: orNull(p.farWall),
-      farLateral: orNull(p.farLateral),
+      farLateralMm: farLateralForSig(p),
       farYawDeg: orNull(p.farYawDeg),
       seq: orNull(p.seq),
     },
