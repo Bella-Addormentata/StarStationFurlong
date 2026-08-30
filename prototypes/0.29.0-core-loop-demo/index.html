@@ -248,8 +248,18 @@
           </div>
         </div>
 
-        <!-- 💬 Chat app view (existing chat DOM — ids preserved, do not rename) -->
+        <!-- 💬 Chat app view (existing chat DOM — ids preserved, do not rename)
+             Issue #20: adds a thread picker above the messages. 🌐 ROOM is the
+             room broadcast lane; each 👥 chip is a group chat this identity is
+             a member of. Group threads ride the SAME shared chat array,
+             tagged by groupId — the picker is the client-side filter. -->
         <div id="phone-app-chat" class="phone-app-view">
+          <!-- Thread picker + new-group button. Populated by main.ts on join
+               and whenever the shared groupChats map changes. -->
+          <div id="chat-thread-bar" role="tablist" aria-label="Chat thread"></div>
+          <!-- New-group panel (hidden until user taps + NEW GROUP). Contains a
+               friends checklist + optional title input + Create / Cancel. -->
+          <div id="chat-new-group-panel" hidden></div>
           <!-- Scrollable Messages Container -->
           <div id="chat-messages-container">
             <div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>
@@ -300,6 +310,13 @@
           <div class="phone-access-section">
             <div class="phone-access-header">CONTACTS</div>
             <div id="contacts-all-list" role="list" aria-label="All contacts"></div>
+          </div>
+          <!-- 🚫 Issue #20 · client-side block list. Rendered from localStorage.
+               Kept below the contact lists so a fresh install starts empty and
+               only surfaces the section content when the user actually blocks. -->
+          <div class="phone-access-section">
+            <div class="phone-access-header">🚫 BLOCKED</div>
+            <div id="contacts-blocked-list" role="list" aria-label="Blocked contacts"></div>
           </div>
           <div class="phone-access-section">
             <div class="phone-access-header">🕸️ MESH</div>

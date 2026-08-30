@@ -39,6 +39,7 @@ import {
   signNameCert,
   verifyNameCert,
   verifyIdentity,
+  signIdentity,
   exportRecoveryKey,
   importRecoveryKey,
   ysyncSigner,
@@ -52,9 +53,35 @@ const TREASURY_DEV_GENESIS = "0".repeat(64);
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
-import { bindCasinoDoc, readChips } from "./casinoDoc";
+import {
+  bindCasinoDoc,
+  readChips,
+  readBought,
+  readCashed,
+  writeChipTransfer,
+  readAllChipTransfers,
+  subscribeCasino,
+} from "./casinoDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
+// 💸 In-world chip transfers (issue #20 BANK send/receive slice). Every
+// transfer runs through the pure engine: build → shape/sig guards →
+// deterministic ledger-replay rule (received chips become spendable, so a
+// re-send of them is honoured; a phantom over-drain is refused) → block-list
+// filter. The engine takes the signature and verify functions as parameters so
+// it stays crypto-free; the app wires signIdentity / verifyIdentity here at the
+// seam.
+import {
+  buildChipTransfer,
+  filterIncoming,
+  filterOutgoing,
+  partitionIncomingByBlocked,
+  partitionValidTransfers,
+  compareTransfersForReplay,
+  verifyChipTransfer,
+  type ChipTransfer,
+  type SenderIssuance,
+} from "./casinoTransfers";
 import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
@@ -236,6 +263,38 @@ import {
   reconstructCard,
   type ContactCard,
 } from "./contacts";
+// 🚫 Client-side block list (issue #20 — contacts BLOCK). Local mute only; a
+// signed on-doc block op is a later TrustAndSafety slice. Every filter path
+// funnels through the pure helpers in ./blockList so vitest can verify the
+// logic without spinning up a DOM.
+import {
+  initBlockList,
+  listBlocked,
+  blockedSet,
+  setBlocked,
+  subscribeBlockList,
+  isAuthoredByBlocked,
+  partitionRosterByBlocked,
+} from "./blockList";
+// 👥💬 Group chats (issue #20 — group chat threads). Threads live in a room-
+// doc Yjs `groupChats` map; their MESSAGES ride the same shared `chat` array
+// as the room broadcast (tagged with `groupId`). The Chat app's thread picker
+// is the UI-side filter. Private-by-UI, not by-crypto (documented in-app).
+import {
+  GROUP_CHAT_CAP,
+  MAX_GROUP_CHATS,
+  MIN_GROUP_MEMBERS,
+  GROUP_TITLE_MAX,
+  TOTAL_CHAT_CAP,
+  buildGroupChatThread,
+  excessGroupIndices,
+  excessRoomIndices,
+  excessThreadIds,
+  excessTotalIndices,
+  isValidThreadEntry,
+  listMyGroupChats,
+  type GroupChatThread,
+} from "./groupChat";
 import {
   makeIntroductions,
   ingestIntroduction,
@@ -282,6 +341,7 @@ import {
   closeAllDms,
   dmRoomIdFor,
   dmRoomKeyFor,
+  filterOutBlockedDms,
   type DmSession,
   type DirectMessage,
 } from "./directMessages";
@@ -341,6 +401,49 @@ const networkProvider = new NetworkProvider();
 let yjsSync: YjsSync | null = null;
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
 let roomCacheHandle: RoomCacheHandle | null = null;
+
+// 💬 Chat thread router (issue #20 — group chats). `null` means the ROOM
+// broadcast lane; any string is an active group thread id (the same id space
+// deriveGroupChatId returns). Reset to null on every join so a rejoin never
+// leaks the DEPARTURE room's active thread into the NEW room.
+let activeChatThread: string | null = null;
+/** Room-lane cap: at most this many ROOM broadcast messages in the doc at
+ *  once. Kept parallel to `GROUP_CHAT_CAP` (200) — the CHANGELOG documents
+ *  the two caps as matching, and `excessRoomIndices` uses this on the room
+ *  lane exactly the way `excessGroupIndices` uses `GROUP_CHAT_CAP` on a
+ *  group lane. Historically the trim was `sharedChat.length - 200` (mixing
+ *  the two lanes on one budget); see the send-path comment for why that was
+ *  wrong and how the audit fix separated them. */
+const ROOM_CHAT_CAP = 200;
+/** The current join's chat rebuild closure (assigned inside the join binder).
+ *  Module-scope indirection so subscribers set up at boot (block list, group
+ *  threads) can trigger a repaint without holding a reference to the closure. */
+let latestRebuildChatLog: (() => void) | null = null;
+/** Trigger a chat log rebuild if the join binder has installed one. Safe pre-
+ *  join / post-leave: silently does nothing when nothing is bound. */
+function rebuildChatLogIfBound(): void {
+  try { latestRebuildChatLog?.(); } catch (e) { console.error("[chat] rebuild threw:", e); }
+}
+/** The current join's group-chat panel refresh closure — same rationale as
+ *  above. Repopulates the chat thread bar when the shared groupChats map
+ *  observes a delta or when the block list toggles. */
+let latestRefreshChatThreadBar: (() => void) | null = null;
+function refreshChatThreadBarIfBound(): void {
+  try { latestRefreshChatThreadBar?.(); } catch (e) { console.error("[chat] chip refresh threw:", e); }
+}
+/** Resolve a legacy `authorId` (players map key) → identity pub. Only the
+ *  ACTIVE room's players map is consulted — a legacy chat message from a room
+ *  we've since left cannot be resolved (correct: we don't know that mapping).
+ *  Used by the block filter to match blocks against pre-slice messages that
+ *  carry `authorId` only. */
+function getPubForAuthorId(authorId: string): string | undefined {
+  const sync = yjsSync;
+  if (!sync) return undefined;
+  const entry = sync.doc.getMap("players").get(authorId);
+  if (!entry || typeof entry !== "object") return undefined;
+  const key = (entry as { keyB64?: unknown }).keyB64;
+  return typeof key === "string" && key ? key : undefined;
+}
 // Session-epoch guard (issue #30 T0 review): every joinRoom() claims a fresh
 // epoch and every leaveRoom() invalidates the current one. joinRoom re-checks
 // the epoch after EACH await and unwinds if superseded — otherwise a rapid
@@ -929,6 +1032,12 @@ async function joinRoomAtEpoch(
   }
   if (epoch !== sessionEpoch) return; // superseded — the transport now belongs to the newer session
   activeBootstrap = connectBoot;
+  // 💸 #20 send/receive: a room switch invalidates every field in the SEND
+  // panel — the recipient list is scoped to the OLD room's players, the chip
+  // balance is a per-room count, and the audit log we're about to render is
+  // the NEW room's. Clear the send state so a stale armed confirmation from
+  // the previous room can't fire against a coincidentally-matching pid here.
+  bankResetSendState();
   await syncAccessPass();
   if (epoch !== sessionEpoch) return; // superseded — nothing of ours left to undo
 
@@ -1267,6 +1376,34 @@ async function joinRoomAtEpoch(
       myHints: () =>
         localFingerprint ? getLocalNodeHint(localFingerprint) : null,
     });
+    // 🚫 Local block list (issue #20). Loaded before subscribeContacts wires up
+    // renderPhonePlayersList so the very first roster paint already filters
+    // blocked identities. subscribeBlockList repaints the roster, the chat log,
+    // the (potentially open) contacts app, and the (potentially open) DM
+    // overlay whenever the local list changes — a block/unblock click gets a
+    // synchronous whole-app refresh so no lane silently keeps rendering
+    // blocked content until the next natural rebuild.
+    initBlockList();
+    subscribeBlockList(() => {
+      renderPhonePlayersList();
+      rebuildChatLogIfBound();
+      if (isContactsAppOpen()) refreshContactsApp();
+      // 🚫 DM overlay lives in a separate DOM subtree (dm-overlay); the chat
+      // rebuild above doesn't touch it. If a DM is currently open with a peer
+      // we just blocked (or just unblocked), re-render so their history is
+      // hidden (or restored) in step with the click.
+      if (dmActiveSession && !document.getElementById("dm-overlay")?.hasAttribute("hidden")) {
+        renderDmMessages();
+      }
+      // 💸 #20 send/receive: a mid-flight SEND with a just-blocked recipient
+      // must not survive as an armed confirmation — the two-step trust anchor
+      // depends on the recipient still being a legitimate roster row. Clear
+      // send state entirely (the panel re-opens fine on the next click) and
+      // repaint the BANK so the TRANSFERS log honours the new visibility
+      // partition without waiting for a doc event.
+      bankResetSendState();
+      renderBankApp();
+    });
     initDirectMessages({
       resolve: resolveBridgeBootstrap,
       myName: () => getPlayerName(),
@@ -1298,6 +1435,13 @@ async function joinRoomAtEpoch(
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
+    // 💸 #20 send/receive: a chip transfer landing in the room casino doc
+    // (either OURS just written, or a peer's arriving) must repaint the BANK
+    // so the audit log grows and any dependent balance line moves. Runs on
+    // ANY casino-doc change — cage balances, cashed marks, and the new xfer:*
+    // rows all live in the same map, so this repaint keeps every derived
+    // section (CHIPS count, TRANSFERS log, over-drain refusals) honest.
+    subscribeCasino(() => renderBankApp());
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
@@ -1652,8 +1796,31 @@ async function joinRoomAtEpoch(
     if (container) {
       // Safe clear except original system greet is fine
       container.innerHTML = `<div class="chat-bubble system">📲 SpacePhone connection ready. Welcome to Furlong System Net!</div>`;
+      // 🚫 Snapshot the block set ONCE per rebuild. Chat rebuilds fire on
+      // every insert delta, so any per-item cost multiplies with room chat
+      // traffic — the ReadonlySet handle stays valid inside this pass. 👥
+      // Also snapshot the thread router: null = ROOM broadcast; string = the
+      // active group thread. Every item is scored against both.
+      const blockedNow = blockedSet();
+      const thread = activeChatThread;
       const items: any[] = sharedChat.toArray();
+      let hiddenBlocked = 0;
       items.forEach((item) => {
+        // 👥 Thread routing FIRST — an item in a different thread is not this
+        // view's concern at all (group messages have a non-empty string groupId,
+        // room broadcasts have none or an empty one).
+        const gid = typeof item?.groupId === "string" && item.groupId ? item.groupId : null;
+        if (thread === null) {
+          if (gid !== null) return; // room view: skip anything tagged for a group
+        } else {
+          if (gid !== thread) return; // group view: skip other groups AND room
+        }
+        // 🚫 Block filter — canonical authorPub wins, legacy authorId resolved
+        // via the current players map (see getPubForAuthorId).
+        if (isAuthoredByBlocked(item, blockedNow, getPubForAuthorId)) {
+          hiddenBlocked++;
+          return;
+        }
         // S2: classify by stable authorId. Pre-S2 messages carry no authorId
         // and EVERY pre-S2 sender wrote the literal authorName 'Local-Clone',
         // so the fallback renders all legacy messages as 'me' — exactly the
@@ -1676,9 +1843,39 @@ async function joinRoomAtEpoch(
         bubble.appendChild(textNode);
         container.appendChild(bubble);
       });
+      // Honesty note: tell the reader when messages were hidden. Client-side
+      // only — the sender doesn't know we filtered them (documented in-app).
+      if (hiddenBlocked > 0) {
+        const note = document.createElement("div");
+        note.className = "chat-bubble system";
+        note.textContent = `🚫 ${hiddenBlocked} message${hiddenBlocked === 1 ? "" : "s"} hidden from blocked contacts.`;
+        container.appendChild(note);
+      }
       container.scrollTop = container.scrollHeight;
     }
   };
+  // Publish for module-scope subscribers (block list, group threads observer).
+  // Both closures MUST be republished symmetrically here: leaveRoom nulls both
+  // (defensive, so a click during the room-null gap becomes a silent no-op),
+  // so a join that only republishes one leaves the sibling permanently null
+  // after the first hop. `rebuildChatLog` closes over the per-join `sharedChat`
+  // handle so we necessarily re-create it here; `refreshChatThreadBar` is a
+  // module-scope function that reads the CURRENT yjsSync.doc.getMap fresh on
+  // each call, so republishing the same reference every join is safe. The
+  // hoisted function declaration at the bottom of the file guarantees the
+  // reference resolves regardless of source order.
+  //
+  // 👥 Issue #20 audit r4 regression fix: pre-fix, this file only assigned
+  // `latestRefreshChatThreadBar` once inside setupChatThreadBar (a one-shot
+  // reached via setupSpacePhoneOverlay at boot). leaveRoom nulled it, joins
+  // after the first never restored it, and every chip-bar refresh path routed
+  // through refreshChatThreadBarIfBound (sharedGroups.observe, the joinRoom
+  // initial paint, the CHAT-app open handler) became a silent no-op — so
+  // remote group creations stopped repainting chips, and rejoining a room
+  // showed stale chips from the departure room. Republishing here restores
+  // the invariant that both closures are non-null between join and leave.
+  latestRebuildChatLog = rebuildChatLog;
+  latestRefreshChatThreadBar = refreshChatThreadBar;
   sharedChat.observe((event) => {
     // 💬 Overhead bubbles from the event's INSERT delta only — robust against
     // the in-transact 200-cap trim (length deltas lie there) and precise about
@@ -1686,17 +1883,25 @@ async function joinRoomAtEpoch(
     // burst (one big insert delta) never floods bubbles for old messages.
     if (sync.serverSynced) {
       try {
+        const blockedNow = blockedSet();
         for (const op of event.changes.delta) {
           const inserted = (op as { insert?: unknown[] }).insert;
           if (!Array.isArray(inserted)) continue;
           for (const item of inserted) {
             const msg = item as {
               authorId?: string;
+              authorPub?: string;
               text?: string;
               atX?: number;
               atZ?: number;
+              groupId?: unknown;
             };
             if (typeof msg?.text !== "string") continue;
+            // 👥 Group messages don't spawn WORLD bubbles — they're a private-
+            // by-UI thread; only the ROOM broadcast lane pops overhead bubbles.
+            if (typeof msg.groupId === "string" && msg.groupId) continue;
+            // 🚫 Blocked authors get no bubble (matches the chat-log filter).
+            if (isAuthoredByBlocked(msg, blockedNow, getPubForAuthorId)) continue;
             const isSelf =
               typeof msg.authorId === "string" &&
               msg.authorId === getPlayerId();
@@ -1716,6 +1921,35 @@ async function joinRoomAtEpoch(
   // already holds in index.html). Accepted: this also wipes any PRE-join
   // logToPhoneSystem() lines — rebind semantics; the log mirrors the doc.
   rebuildChatLog();
+
+  // 👥 Group chats (issue #20): shared thread records keyed by their derived
+  // id. The messages themselves ride sharedChat above (tagged with `groupId`).
+  // T0 semantics identical to sharedChat — a rejoin resets the active thread
+  // so the CHAT app never leaks the departure room's group into the new room.
+  const sharedGroups = sync.doc.getMap("groupChats");
+  activeChatThread = null;
+  sharedGroups.observe(() => {
+    // A group being created (locally or remotely) repopulates the thread bar
+    // and, if the currently-active group just aged out beyond MAX_GROUP_CHATS,
+    // silently falls back to the room lane so the input never targets a
+    // vanished thread. Same rebuild for the chat log (its per-thread filter
+    // narrows correctly whether or not the record exists).
+    //
+    // 👥 Issue #20 audit remediation: use isValidThreadEntry (key + value.id
+    // must match), not just isGroupChatThread. A hostile peer's mismatched-
+    // key write would pass isGroupChatThread on the value alone, and the
+    // pre-fix check here would keep activeChatThread set even though
+    // listMyGroupChats (which chains isValidThreadEntry) drops the chip from
+    // the picker. Keeping the two in lock-step means the router state and
+    // the chip visibility can never disagree.
+    if (activeChatThread) {
+      const stillHere = isValidThreadEntry(activeChatThread, sharedGroups.get(activeChatThread));
+      if (!stillHere) activeChatThread = null;
+    }
+    refreshChatThreadBarIfBound();
+    rebuildChatLog();
+  });
+  refreshChatThreadBarIfBound(); // initial paint if the chat picker is set up
 
   // 4. Set up incoming real-time client movement tick handler.
   // 0.23.0 wire (issue #22): the node prefixes every delivered tick with the
@@ -1787,6 +2021,26 @@ async function leaveRoom(): Promise<void> {
   setActivePassRoom(null);
   // 💬 Bubbles anchor to THIS room's avatars — drop them with the room.
   clearChatBubbles();
+  // 👥 CHAT closure indirection: null out the join-scoped rebuild/refresh
+  // closures so the boot-time subscribers (subscribeBlockList, sharedGroups
+  // observer) that trigger repaints via these pointers stop invoking them
+  // against a doc that leaveRoom is about to destroy. rebuildChatLogIfBound
+  // and refreshChatThreadBarIfBound swallow the resulting exceptions via
+  // try/catch (correct — the doc IS destroyed, no need to crash), but
+  // between leaveRoom() and the next joinRoomAtEpoch() any block/unblock
+  // click still walked into the closure and produced console-error noise
+  // ("[chat] rebuild threw:") on every mutation. Clearing them here means
+  // the ?.() call is a silent no-op until the next join re-publishes the
+  // fresh closures over the fresh sharedChat / groupsMap handles.
+  //
+  // Symmetry contract (audit r4): the join binder MUST republish BOTH
+  // pointers. Historically only `latestRebuildChatLog` was republished per
+  // join because it closes over the per-join `sharedChat`; the sibling
+  // `latestRefreshChatThreadBar` was assigned once inside setupChatThreadBar
+  // (a one-shot) and stayed null after the first leaveRoom. See the
+  // republish site next to `latestRebuildChatLog = rebuildChatLog;`.
+  latestRebuildChatLog = null;
+  latestRefreshChatThreadBar = null;
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
@@ -2521,17 +2775,25 @@ function renderPhonePlayersList(): void {
   }
 
   const players = sync.doc.getMap("players");
-  const rows: Array<{ id: string; entry: Partial<PlayerEntry> }> = [];
+  const rows: Array<{ id: string; entry: Partial<PlayerEntry>; pub?: string }> = [];
   players.forEach((value, key) => {
     if (value && typeof value === "object") {
-      rows.push({ id: key, entry: value as Partial<PlayerEntry> });
+      const entry = value as Partial<PlayerEntry>;
+      // Denormalize the pub onto the row so partitionRosterByBlocked scores it
+      // (a legacy keyless entry has no pub — those pass through as visible).
+      const pub = typeof entry.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : undefined;
+      rows.push({ id: key, entry, pub });
     }
   });
   rows.sort((a, b) => (a.entry.joinedAt ?? 0) - (b.entry.joinedAt ?? 0));
 
-  countEl.textContent = String(rows.length);
+  // 🚫 Block filter for the roster (issue #20): blocked players are HIDDEN
+  // from CLONES SEEN and counted separately (never in the visible tally). A
+  // small footer note surfaces the count so blocks feel visible to the user.
+  const { visible, blocked } = partitionRosterByBlocked(rows, blockedSet());
+  countEl.textContent = String(visible.length);
   const myId = getPlayerId();
-  for (const { id, entry } of rows) {
+  for (const { id, entry } of visible) {
     const li = document.createElement("li");
     li.className = "phone-players-row";
     const nameSpan = document.createElement("span");
@@ -2601,6 +2863,15 @@ function renderPhonePlayersList(): void {
     }
     listEl.appendChild(li);
   }
+  // 🚫 Footer: how many roster rows the local block set removed. Rendered as
+  // a phone-players-empty variant (no border, muted) so it never feels like a
+  // player row itself. Silent when nothing was blocked.
+  if (blocked.length > 0) {
+    const note = document.createElement("li");
+    note.className = "phone-players-empty";
+    note.textContent = `🚫 ${blocked.length} hidden by your block list.`;
+    listEl.appendChild(note);
+  }
 }
 
 // ── 🗺️ Station atlas harvest (#62 P5 findings) ───────────────────────────────
@@ -2669,6 +2940,41 @@ function harvestStationAtlas(): void {
 // Registry status. Balances in Chia arrive when the node serves a wallet
 // endpoint (the chia-lane build keeps its account node-side today) — the
 // panel says so honestly instead of faking a number.
+//
+// 💸 SEND / RECEIVE (issue #20 slice): the BANK grows a SEND CHIPS button and
+// a TRANSFERS block. Transfers move chips inside THIS ROOM'S casino between
+// two identities in the roster — physical settlement is atomic in one Yjs
+// transact (see casinoDoc.writeChipTransfer), the audit log runs through the
+// pure engine (see casinoTransfers.ts). Blocked identities cannot be picked
+// as a recipient, and incoming from a blocked identity is HIDDEN from the
+// audit UI but the physical credit is preserved (conservation). Every
+// success/refusal shows a plain-language note so the user always knows what
+// the click did.
+
+/** SEND panel state — module-scoped so the panel keeps its half-filled form
+ *  across the natural repaints subscribeCasino triggers. Reset when the user
+ *  cancels, sends, opens BANK fresh, or leaves the room (bankResetSendState). */
+let bankSendOpen = false;
+let bankSendPickedPid = "";
+/** Text-input value (not the parsed number) so the field stays exactly what
+ *  the user typed across repaints — "1.5" stays "1.5" and gets refused at
+ *  send time with an explicit note, rather than being silently reformatted. */
+let bankSendAmountText = "";
+/** Two-step guard mirroring the deed-handover pattern: the first click on
+ *  SEND arms the confirmation; a second click on the SAME (recipient, amount)
+ *  actually writes. Any change to picker/amount re-arms so the user can never
+ *  send by mis-tapping through a stale confirmation. */
+let bankSendConfirmArmed = false;
+/** Human-language feedback line displayed under the SEND panel. */
+let bankSendNote = "";
+
+function bankResetSendState(): void {
+  bankSendOpen = false;
+  bankSendPickedPid = "";
+  bankSendAmountText = "";
+  bankSendConfirmArmed = false;
+  bankSendNote = "";
+}
 
 function renderBankApp(): void {
   const view = document.getElementById("phone-app-bank");
@@ -2680,6 +2986,67 @@ function renderBankApp(): void {
   const myPub = getIdentityPub();
   const header = (t: string) =>
     `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+
+  // ── SEND CHIPS wiring (event delegation, wired once) ─────────────────────
+  // Same discipline as renderVenturesApp — a single click handler on the view
+  // dispatches on data-bank-action; input changes drop the confirmation so a
+  // stale arm cannot slip through. Fields survive repaints because subscribers
+  // never blow away the state variables, only re-render from them.
+  if (!view.dataset.wired) {
+    view.dataset.wired = "1";
+    view.addEventListener("change", (e) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      if (el.id === "bank-send-to") {
+        const sel = el as HTMLSelectElement;
+        bankSendPickedPid = sel.value;
+        bankSendConfirmArmed = false; // recipient change ⇒ re-arm
+        bankSendNote = "";
+        renderBankApp();
+      }
+    });
+    view.addEventListener("input", (e) => {
+      const el = e.target as HTMLElement | null;
+      if (!el) return;
+      if (el.id === "bank-send-amount") {
+        const inp = el as HTMLInputElement;
+        bankSendAmountText = inp.value;
+        bankSendConfirmArmed = false;
+        bankSendNote = "";
+        // Do NOT re-render on every keystroke — the input keeps focus and
+        // caret placement (a repaint would rebuild the DOM and eat both).
+        // We refresh the CONFIRM button label only if the amount changes
+        // WAY beyond the balance — for now, just update the note area.
+        const noteEl = document.getElementById("bank-send-note");
+        if (noteEl) noteEl.textContent = "";
+      }
+    });
+    view.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-bank-action]",
+      );
+      if (!el) return;
+      const action = el.dataset.bankAction;
+      if (action === "send-open") {
+        bankSendOpen = true;
+        bankSendConfirmArmed = false;
+        bankSendNote = "";
+      } else if (action === "send-cancel") {
+        bankResetSendState();
+      } else if (action === "send-submit") {
+        // Two-step: first click arms the confirmation, second executes.
+        const result = executeBankSend();
+        if (result === "armed") {
+          // fall through — repaint shows CONFIRM label
+        } else if (result === "sent") {
+          bankResetSendState();
+        }
+        // On refusal, bankSendNote carries the explanation; state persists
+        // so the user can correct the amount / recipient and try again.
+      }
+      renderBankApp();
+    });
+  }
 
   const current = ventureRecord();
   const ledger = ventureLedger();
@@ -2721,13 +3088,11 @@ function renderBankApp(): void {
       // 🎰 #69: chips are PER-CASINO records — and PHYSICAL (owner rule):
       // the BANK shows the chips themselves, never a total. Count them, or
       // walk to the room's CASHIER for the number.
+      // 💸 #20 send/receive: the SEND CHIPS button + panel + TRANSFERS log
+      // live inside this section so they follow the same "here in the room"
+      // fiction (the chip is a physical thing you hand across the felt).
       const chips = readChips(getPlayerId());
-      return chips > 0
-        ? `${header("CHIPS")}
-        <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
-        <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
-        <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>`
-        : "";
+      return renderBankChipsSection(chips);
     })()}
     ${header("PROPERTY")}
     ${
@@ -2751,6 +3116,335 @@ function renderBankApp(): void {
       lands. Shares today are room records — same rules, no coins at risk.
     </div>
   `;
+}
+
+// ── 💸 SEND / RECEIVE — the BANK's in-world chip-transfer surface ────────────
+//
+// One HTML builder + one action executor. The HTML fragment is composed inside
+// renderBankApp's template literal; the executor mutates module state and
+// writes to the doc. Both keep the honest-limits stance from
+// brainstorming/phone-apps-breakdown.md §5: refusal explains itself, success
+// says exactly what moved and to whom.
+
+/** Room-scoped roster row usable as a SEND CHIPS recipient. */
+interface BankRosterRow {
+  playerId: string;
+  name: string;
+  pub: string;
+}
+
+/**
+ * Everyone in the current room's players map WITH a keyed identity, minus
+ * ourselves and minus anyone on the local block list. Legacy players without
+ * a `keyB64` are hidden from the picker (a signed transfer needs a pub for
+ * both parties). This is the deterministic honest recipient set.
+ */
+function bankSendRoster(): BankRosterRow[] {
+  const sync = yjsSync;
+  if (!sync) return [];
+  const players = sync.doc.getMap("players");
+  const myId = getPlayerId();
+  const myPub = getIdentityPub();
+  const blocked = blockedSet();
+  const rows: BankRosterRow[] = [];
+  players.forEach((value, key) => {
+    if (!value || typeof value !== "object") return;
+    if (key === myId) return; // never the sender themselves
+    const entry = value as Partial<PlayerEntry>;
+    const pub = typeof entry.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : "";
+    if (!pub) return; // keyless legacy entry — no place to route the sig
+    if (pub === myPub) return; // another install of same identity — not payable to self
+    if (blocked.has(pub)) return; // BLOCKED: cannot be a recipient (task req 6)
+    const name = typeof entry.name === "string" && entry.name ? entry.name : "Unknown-Clone";
+    rows.push({ playerId: key, name, pub });
+  });
+  // Deterministic ordering by name so the picker is stable across observers.
+  rows.sort((a, b) => a.name.localeCompare(b.name));
+  return rows;
+}
+
+/**
+ * Every VALID transfer currently in the room's casino doc, in deterministic
+ * display order (oldest first — chronological). Shape guard + signature
+ * verify + over-drain refusal all applied. Callers project this through the
+ * incoming / outgoing / blocked filters.
+ */
+function bankReadValidTransfers(): ChipTransfer[] {
+  // Read every well-formed record (readAllChipTransfers already applied the
+  // shape + entry-key guards).
+  const all = readAllChipTransfers();
+  // Verify the sender's signature — reject anything a hostile peer wrote
+  // without holding the fromPub's identity key. Wrapping verifyIdentity here
+  // matches the pure engine's injected VerifyIdentityFn shape.
+  const signed = all.filter((t) => verifyChipTransfer(t, verifyIdentity));
+  // Ledger-replay seed: per-PLAYER cage issuance (bought − cashed) looked up
+  // for every sender AND recipient. partitionValidTransfers first-touches each
+  // pid at this budget, then debits/credits as it replays — so received chips
+  // become spendable and an over-drain (amount past the running balance) is
+  // refused identically on every peer.
+  const issuanceOf = (pid: string): SenderIssuance => ({
+    bought: readBought(pid),
+    cashed: readCashed(pid),
+  });
+  const { valid } = partitionValidTransfers(signed, issuanceOf);
+  return [...valid].sort(compareTransfersForReplay);
+}
+
+/**
+ * The HTML fragment for the CHIPS + SEND CHIPS + TRANSFERS blocks. Returns
+ * the empty string only when the player has no chips AND there is no send
+ * panel open AND no transfers to show — the block chooses honesty over
+ * always-visible clutter.
+ */
+function renderBankChipsSection(chips: number): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const header = (t: string) =>
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.6); margin-top:12px;">${t}</div>`;
+  const roomId = activeBootstrap?.roomId ?? "";
+  const myPub = getIdentityPub();
+  const transfers = bankReadValidTransfers();
+  const myIncomingAll = filterIncoming(transfers, myPub);
+  const { visible: incomingVisible, hidden: incomingHidden } =
+    partitionIncomingByBlocked(myIncomingAll, blockedSet());
+  const outgoing = filterOutgoing(transfers, myPub);
+
+  // Suppress the whole section only when there is truly nothing to say.
+  if (chips === 0 && !bankSendOpen && incomingVisible.length === 0
+    && outgoing.length === 0 && incomingHidden === 0) {
+    return "";
+  }
+
+  const btnStyle =
+    "display:inline-block; padding:4px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.15); border:1px solid rgba(212,168,75,0.35); color:#f0c060; margin-top:6px;";
+  const dangerBtnStyle =
+    "display:inline-block; padding:4px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer; background:rgba(240,192,96,0.28); border:1px solid rgba(240,192,96,0.6); color:#1a1208; margin-top:6px;";
+  const cancelStyle =
+    "display:inline-block; padding:4px 10px; border-radius:6px; font-size:10px; font-weight:700; cursor:pointer; background:rgba(212,168,75,0.05); border:1px solid rgba(212,168,75,0.2); color:rgba(212,168,75,0.7); margin-top:6px; margin-left:6px;";
+  const inputStyle =
+    "flex:1; min-width:0; font-size:10px; padding:5px 7px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;";
+  const selectStyle =
+    "flex:1; min-width:0; font-size:10px; padding:5px 7px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.25); border-radius:5px; color:#f0c060;";
+
+  let chipsBlock = "";
+  if (chips > 0) {
+    chipsBlock = `
+      <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
+      <div style="margin-top:4px;">${chipDotsHtml(chips)}</div>
+      <div style="font-size:8.5px; color:rgba(212,168,75,0.35); margin-top:2px;">Count them — the CASHIER's screen shows the number and cashes out.</div>`;
+  } else if (bankSendOpen || outgoing.length > 0 || incomingVisible.length > 0 || incomingHidden > 0) {
+    // No chips right now, but a transfer or send panel is up — show a
+    // stat line so the section isn't a mystery.
+    chipsBlock = `
+      <div style="margin-top:5px; font-size:10px;">🎰 This room's casino</div>
+      <div style="margin-top:4px; font-size:10px; color:rgba(212,168,75,0.5);">No chips on hand right now.</div>`;
+  }
+
+  // SEND CHIPS button (only when we hold chips, and the panel isn't already
+  // open, and we're actually in a room with other keyed players).
+  const roster = bankSendRoster();
+  let sendControls = "";
+  if (!bankSendOpen && chips > 0 && roster.length > 0 && roomId) {
+    sendControls = `
+      <button type="button" data-bank-action="send-open" style="${btnStyle}">SEND CHIPS</button>`;
+  } else if (!bankSendOpen && chips > 0 && roster.length === 0) {
+    // Chips but no one to send to — honest tell instead of a dead button.
+    sendControls = `
+      <div style="font-size:9px; color:rgba(212,168,75,0.4); margin-top:6px;">
+        No one else here to send chips to.
+      </div>`;
+  }
+
+  // SEND panel — a two-step form. Amount is a text input (validated at
+  // send time) so refused values keep exactly what the user typed.
+  let sendPanel = "";
+  if (bankSendOpen) {
+    // If our picked recipient dropped out of the roster (they left / got
+    // blocked mid-repaint), clear the pick and re-arm.
+    const picked = roster.find((r) => r.playerId === bankSendPickedPid) ?? null;
+    if (!picked && bankSendPickedPid) {
+      bankSendPickedPid = "";
+      bankSendConfirmArmed = false;
+    }
+    const options = ['<option value="">— choose a recipient —</option>']
+      .concat(roster.map((r) => `<option value="${esc(r.playerId)}"${r.playerId === bankSendPickedPid ? " selected" : ""}>${esc(r.name)}</option>`))
+      .join("");
+    const parsed = Math.floor(Number(bankSendAmountText));
+    const validAmount = Number.isSafeInteger(parsed) && parsed > 0 && parsed <= chips;
+    const canSubmit = !!picked && validAmount;
+    const submitLabel = bankSendConfirmArmed && canSubmit
+      ? `CONFIRM SEND ${parsed} to ${esc(picked!.name)}`
+      : "SEND";
+    const submitStyle = bankSendConfirmArmed && canSubmit ? dangerBtnStyle : btnStyle;
+    const helpText = roster.length === 0
+      ? "No one else here to send chips to."
+      : "Pick who — pick how many — tap SEND, then CONFIRM SEND.";
+    sendPanel = `
+      <div style="margin-top:8px; padding:8px 10px; border:1px solid rgba(212,168,75,0.25); border-radius:8px; background:rgba(0,0,0,0.15);">
+        <div style="font-size:10px; font-weight:800; color:#f0c060;">SEND CHIPS · this room</div>
+        <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:2px;">${esc(helpText)}</div>
+        <div style="display:flex; gap:6px; align-items:center; margin-top:8px;">
+          <label for="bank-send-to" style="font-size:10px; color:rgba(212,168,75,0.7); min-width:32px;">To</label>
+          <select id="bank-send-to" style="${selectStyle}">${options}</select>
+        </div>
+        <div style="display:flex; gap:6px; align-items:center; margin-top:6px;">
+          <label for="bank-send-amount" style="font-size:10px; color:rgba(212,168,75,0.7); min-width:32px;">Chips</label>
+          <input id="bank-send-amount" type="number" min="1" step="1" max="${chips}" placeholder="how many"
+                 value="${esc(bankSendAmountText)}" style="${inputStyle}" />
+          <span style="font-size:9px; color:rgba(212,168,75,0.5);">of ${chips}</span>
+        </div>
+        <div style="margin-top:6px;">
+          <button type="button" data-bank-action="send-submit" style="${submitStyle}"${canSubmit ? "" : " disabled"}>${esc(submitLabel)}</button>
+          <button type="button" data-bank-action="send-cancel" style="${cancelStyle}">Cancel</button>
+        </div>
+        <div id="bank-send-note" style="margin-top:6px; font-size:9px; color:rgba(212,168,75,0.7); min-height:12px;">${esc(bankSendNote)}</div>
+      </div>`;
+  }
+
+  // Audit-log block: incoming (visible + hidden count) and outgoing.
+  const fmtTs = (ts: number) => {
+    if (!Number.isFinite(ts)) return "";
+    // Deterministic HH:MM — no locale surprises.
+    const d = new Date(ts);
+    const h = String(d.getHours()).padStart(2, "0");
+    const m = String(d.getMinutes()).padStart(2, "0");
+    return `${h}:${m}`;
+  };
+  const nameForPub = (pub: string, fallback: string): string => {
+    // The players map is keyed by pid — walk it to find whoever posted this
+    // pub, so the audit line reads "Alice" not "abc123…". Unknown → fallback.
+    const sync = yjsSync;
+    if (!sync) return fallback;
+    const players = sync.doc.getMap("players");
+    let hit = fallback;
+    players.forEach((value) => {
+      if (!value || typeof value !== "object" || hit !== fallback) return;
+      const e = value as Partial<PlayerEntry>;
+      if (e.keyB64 === pub && typeof e.name === "string" && e.name) hit = e.name;
+    });
+    return hit;
+  };
+  const AUDIT_CAP = 20;
+  const recent = <T,>(a: T[]): T[] => (a.length > AUDIT_CAP ? a.slice(a.length - AUDIT_CAP) : a);
+
+  let transferBlock = "";
+  if (incomingVisible.length > 0 || outgoing.length > 0 || incomingHidden > 0) {
+    const incRows = recent(incomingVisible).map((t) => `
+      <div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px; font-size:10px;">
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">↩︎ from ${esc(nameForPub(t.fromPub, "Unknown-Clone"))}</span>
+        <span style="flex-shrink:0; color:#7ec96b;">+${t.amount}</span>
+        <span style="flex-shrink:0; color:rgba(212,168,75,0.35); font-size:9px;">${fmtTs(t.ts)}</span>
+      </div>`).join("");
+    const outRows = recent(outgoing).map((t) => `
+      <div style="display:flex; justify-content:space-between; gap:8px; margin-top:4px; font-size:10px;">
+        <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">↪ to ${esc(nameForPub(t.toPub, "Unknown-Clone"))}</span>
+        <span style="flex-shrink:0; color:#f0c060;">-${t.amount}</span>
+        <span style="flex-shrink:0; color:rgba(212,168,75,0.35); font-size:9px;">${fmtTs(t.ts)}</span>
+      </div>`).join("");
+    const blockedNote = incomingHidden > 0
+      ? `<div style="font-size:9px; color:rgba(212,168,75,0.4); margin-top:6px;">${incomingHidden} incoming hidden from blocked identities (chips still credited).</div>`
+      : "";
+    transferBlock = `
+      ${header("TRANSFERS")}
+      ${incomingVisible.length > 0 ? `<div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:4px;">Received</div>${incRows}` : ""}
+      ${outgoing.length > 0 ? `<div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:6px;">Sent</div>${outRows}` : ""}
+      ${blockedNote}`;
+  }
+
+  return `${header("CHIPS")}${chipsBlock}${sendControls}${sendPanel}${transferBlock}`;
+}
+
+/**
+ * Execute a SEND click. Two-step:
+ *   - if the (recipient, amount) pair is valid and the confirmation is NOT
+ *     yet armed → arm it (bankSendConfirmArmed = true) and return "armed";
+ *     the repaint shows a distinct CONFIRM SEND label so the user reads what
+ *     they're about to do.
+ *   - if the pair is valid and confirmation IS armed → build the signed
+ *     transfer, write it to the doc, return "sent".
+ *   - invalid input → set bankSendNote to a plain-language reason and return
+ *     "refused"; the panel keeps the user's inputs so they can fix them.
+ */
+function executeBankSend(): "armed" | "sent" | "refused" {
+  const roomId = activeBootstrap?.roomId ?? "";
+  if (!roomId) {
+    bankSendNote = "Not in a room — cannot send chips here.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  const roster = bankSendRoster();
+  const picked = roster.find((r) => r.playerId === bankSendPickedPid) ?? null;
+  if (!picked) {
+    bankSendNote = "Pick a recipient from the list.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  const amount = Math.floor(Number(bankSendAmountText));
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    bankSendNote = "Enter a whole number of chips greater than zero.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  const myId = getPlayerId();
+  const myBal = readChips(myId);
+  if (amount > myBal) {
+    bankSendNote = `Not enough chips — you have ${myBal}, tried to send ${amount}.`;
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  // Two-step confirm: first click ARMS, second click sends.
+  if (!bankSendConfirmArmed) {
+    bankSendConfirmArmed = true;
+    bankSendNote = `Tap CONFIRM SEND to move ${amount} chips to ${picked.name}.`;
+    return "armed";
+  }
+  // Build the signed transfer at the app seam — nonce is 64 bits of local
+  // entropy, ts is the local clock (deterministic ordering key only, never
+  // authority). The engine's signer takes the canonical bytes and returns
+  // the base64url sig; signIdentity is the identity-key wire from keypair.ts.
+  let nonceHex = "";
+  try {
+    const nonceBytes = crypto.getRandomValues(new Uint8Array(8));
+    nonceHex = Array.from(nonceBytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  } catch {
+    // Fallback: a millisecond stamp + Math.random. Not cryptographic but
+    // still collision-safe enough for id uniqueness (the id also bakes in
+    // fromPub / toPub / amount / ts).
+    nonceHex = `${Date.now().toString(16)}-${Math.floor(Math.random() * 0xffffffff).toString(16)}`;
+  }
+  const ts = Date.now();
+  let transfer: ChipTransfer;
+  try {
+    transfer = buildChipTransfer({
+      roomId,
+      fromPub: getIdentityPub(),
+      toPub: picked.pub,
+      fromPlayerId: myId,
+      toPlayerId: picked.playerId,
+      amount,
+      nonce: nonceHex,
+      ts,
+      sign: (bytes: Uint8Array) => signIdentity(bytes),
+    });
+  } catch (err) {
+    bankSendNote = `Could not build the transfer: ${(err as Error).message}`;
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  // Write to the doc — refuses on residual over-drain (a concurrent spend
+  // burned the balance between the arm and the send), on collision (dedup of
+  // an already-written transfer), on a bad own-signature, or on the room's
+  // capacity / flood cap. verifyIdentity is the seam's Ed25519 check:
+  // writeChipTransfer proves our own row genuine and counts the cap over
+  // signature-verified rows only, so a keyless junk flood can never trip it.
+  const ok = writeChipTransfer(transfer, verifyIdentity);
+  if (!ok) {
+    bankSendNote = "Send refused — either your chips just moved, or you've hit the per-room send limit. Try again in a moment.";
+    bankSendConfirmArmed = false;
+    return "refused";
+  }
+  bankSendNote = `Sent ${amount} chips to ${picked.name}.`;
+  return "sent";
 }
 
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
@@ -4356,6 +5050,11 @@ function setupSpacePhoneOverlay() {
     // Chat input focus lives in the chat-view-open path (was: on phone open)
     if (id === "chat") {
       chatInput?.focus();
+      // 💬 Thread picker + input placeholder — refresh on every open so a
+      // group created while the chat app was closed shows up on entry, and
+      // the placeholder reflects the currently-active thread.
+      refreshChatThreadBarIfBound();
+      updateChatInputPlaceholder();
       // Hidden views report scrollHeight 0 — restore tail-scroll on re-entry
       const messages = document.getElementById("chat-messages-container");
       if (messages) messages.scrollTop = messages.scrollHeight;
@@ -4715,6 +5414,10 @@ function setupSpacePhoneOverlay() {
 
   // 👥 Contacts app wiring (keyed identity §8) — share/import cards, friends.
   setupContactsApp();
+  // 💬 Chat app wiring (issue #20 group chats) — thread picker + new-group
+  // flow. Setup is idempotent; the per-join binder repaints the chip list
+  // via refreshChatThreadBarIfBound() from the groupChats map observer.
+  setupChatThreadBar();
 
   // Inbound broadcast triggers
   if (chatForm && chatInput) {
@@ -4758,6 +5461,17 @@ function setupSpacePhoneOverlay() {
 
       if (yjsSync) {
         const sharedChat = yjsSync.doc.getArray("chat");
+        const groupsMap = yjsSync.doc.getMap("groupChats");
+        // 👥 Group-scope guard: if a stale thread pointer somehow slips past
+        // the sharedGroups observer's fallback (a slow tab, a race between
+        // send-click and delete-observer), drop back to ROOM rather than
+        // stamp an orphan groupId onto a message no one can filter to.
+        // Uses the entry-level guard (key === value.id) so a hostile peer's
+        // mismatched-key write cannot misroute a group send to the ROOM lane
+        // — same discipline as listMyGroupChats and the sharedGroups observer.
+        const threadTarget = activeChatThread;
+        const isGroupSend = threadTarget !== null
+          && isValidThreadEntry(threadTarget, groupsMap.get(threadTarget));
         // Transact safe transactional delta block append (Task 3.3 / 4.1)
         yjsSync.doc.transact(() => {
           sharedChat.push([
@@ -4765,14 +5479,26 @@ function setupSpacePhoneOverlay() {
               // S2: authorId is the stable identity (isMe check); authorName is
               // denormalized for display + legacy readers.
               authorId: getPlayerId(),
+              // Keyed-identity denormalization (issue #20): the canonical pub
+              // rides EVERY new chat message, so the block filter and other
+              // consumers never need to re-resolve authorId → keyB64 via the
+              // players map. Legacy readers ignore unknown fields.
+              authorPub: getIdentityPub(),
               authorName: getPlayerName(),
               text: val,
               atTick: localSeq,
               scope: "global",
+              // 👥 Thread tag — present ONLY on group sends so the room-lane
+              // filter (see rebuildChatLog / bubble observer) treats absent /
+              // empty groupId as ROOM and skips it here without change.
+              ...(isGroupSend ? { groupId: threadTarget } : {}),
               // 💬 Bubble anchor (additive; legacy readers ignore): the sender's
               // position at send time — remote clients pop the bubble over the
               // avatar nearest this spot (no lane↔player mapping exists yet).
+              // Group sends omit the anchor so a group message never spawns a
+              // world bubble (defense-in-depth alongside the observer skip).
               ...((): { atX?: number; atZ?: number } => {
+                if (isGroupSend) return {};
                 try {
                   const p = world?.getPlayer()?.getPosition();
                   return p ? { atX: p.x, atZ: p.z } : {};
@@ -4785,8 +5511,50 @@ function setupSpacePhoneOverlay() {
           // 💾 Tier A (plan §3.3): cap chat IN THE DOC so the room doc — and its
           // cached snapshot, and every sync — stays bounded. Concurrent trims
           // delete overlapping ranges idempotently (CRDT-safe).
-          const excess = sharedChat.length - 200;
-          if (excess > 0) sharedChat.delete(0, excess);
+          //
+          // Each lane gets a parallel cap that scans the array for its OWN
+          // messages and deletes only that lane's oldest overflow indices
+          // (see excess{Room,Group}Indices for the invariant: indices are
+          // ASCENDING, so we delete DESC to keep intermediate indices valid
+          // inside this transact).
+          //
+          // NOTE (issue #20 audit fix round 1): the pre-fix room path did
+          // `excess = sharedChat.length - 200; sharedChat.delete(0, excess)`.
+          // That counted GROUP messages toward the 200-cap and deleted from
+          // index 0 — index 0 was typically the oldest GROUP message, not a
+          // room one — so a burst of 200+ room messages silently ate a group's
+          // history before its own 200 per-group cap ever fired. Both lanes
+          // now trim in-place on their own membership.
+          //
+          // NOTE (issue #20 audit fix round 3): removing the pre-fix bound
+          // also removed the crude-but-effective global bound. Per-lane trims
+          // only touch lanes THIS client recognizes — the room lane and the
+          // exact groupId this send was for. A hostile peer that writes
+          // messages tagged with distinct fresh groupIds ('junk-1', 'junk-2',
+          // …) escapes BOTH trims (no active groupId matches, and the room-
+          // lane guard excludes any non-empty string groupId). We now run a
+          // GLOBAL cap (`excessTotalIndices` over `TOTAL_CHAT_CAP`) AFTER the
+          // per-lane trim as a safety net. Global cap sized well above the
+          // sum of per-lane caps so honest use never trips it (see the
+          // TOTAL_CHAT_CAP definition in groupChat.ts). Under a hostile-
+          // injection scenario the oldest entries ARE the injected junk;
+          // under honest use the per-lane trim already fired first, so the
+          // global helper returns [] and this is a no-op.
+          if (isGroupSend && threadTarget) {
+            const raw = sharedChat.toArray() as unknown[];
+            const idxs = excessGroupIndices(raw, threadTarget, GROUP_CHAT_CAP);
+            for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
+          } else {
+            const raw = sharedChat.toArray() as unknown[];
+            const idxs = excessRoomIndices(raw, ROOM_CHAT_CAP);
+            for (let i = idxs.length - 1; i >= 0; i--) sharedChat.delete(idxs[i], 1);
+          }
+          // Global safety-net cap: length-only helper (does not need to peek
+          // at message shapes — the whole point is that it doesn't trust the
+          // lane taxonomy). Read the fresh length after the per-lane trim so
+          // this trims only what the per-lane pass could not.
+          const totalIdxs = excessTotalIndices(sharedChat.length, TOTAL_CHAT_CAP);
+          for (let i = totalIdxs.length - 1; i >= 0; i--) sharedChat.delete(totalIdxs[i], 1);
         });
       } else {
         // Fallback offline simulator if no node serves connection
@@ -5662,7 +6430,7 @@ function setupContactsApp(): void {
       setContactsFeedback("Identity restored. Your key fingerprint updated.");
     });
 
-  // Delegated list actions (friend toggle, DM, remove) for both lists.
+  // Delegated list actions (friend toggle, DM, remove, block, unblock).
   const onListClick = (e: Event) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(
       "button[data-contact-act]",
@@ -5686,6 +6454,24 @@ function setupContactsApp(): void {
       case "dm":
         openDirectMessage(pub);
         break;
+      case "block": {
+        // 🚫 Issue #20 UX rule: destructive confirmation. Only proceed on an
+        // explicit YES from the native confirm() dialog — a stray tap on a
+        // touchscreen won't silence a contact by accident.
+        const c = getContact(pub);
+        const label = c?.name ? `${c.name} (🔑 ${contactFingerprint(pub)})` : `🔑 ${contactFingerprint(pub)}`;
+        const ok = window.confirm(
+          `Block ${label}?\n\nTheir chat and DM messages will stop appearing on your screen and their row will be hidden from CLONES SEEN. This is LOCAL to your device — the other side will not know they were blocked, and their bytes still arrive over the network (a server-enforced block is a later slice).`,
+        );
+        if (!ok) return;
+        setBlocked(pub, true);
+        setContactsFeedback(`Blocked ${label}. Unblock in the BLOCKED section below.`);
+        break;
+      }
+      case "unblock":
+        setBlocked(pub, false);
+        setContactsFeedback("Unblocked. Their messages and roster row will reappear.");
+        break;
     }
   };
   document
@@ -5693,6 +6479,11 @@ function setupContactsApp(): void {
     ?.addEventListener("click", onListClick);
   document
     .getElementById("contacts-all-list")
+    ?.addEventListener("click", onListClick);
+  // The BLOCKED section is rendered dynamically into #contacts-blocked-list;
+  // reuse the same delegated handler so its UNBLOCK buttons work.
+  document
+    .getElementById("contacts-blocked-list")
     ?.addEventListener("click", onListClick);
 
   // Keep the app live while it (or anything) mutates the contacts store or the
@@ -5713,7 +6504,7 @@ function isContactsAppOpen(): boolean {
 function contactRowHtml(
   name: string,
   pub: string,
-  opts: { friend: boolean },
+  opts: { friend: boolean; blocked?: boolean },
 ): string {
   const fp = contactFingerprint(pub);
   const safeName = escapeHtml(name);
@@ -5721,13 +6512,40 @@ function contactRowHtml(
   const friendBtn = opts.friend
     ? `<button type="button" data-contact-act="unfriend" data-contact-pub="${safePub}" title="Remove from friends">★</button>`
     : `<button type="button" data-contact-act="friend" data-contact-pub="${safePub}" title="Add to friends">☆</button>`;
-  const dmBtn = opts.friend
+  // 🚫 Issue #20 audit remediation: hide the DM button for a blocked friend.
+  // The DM lane is now block-filtered (renderDmMessages), so opening the pane
+  // would show at most our own outbound messages plus a "hidden by BLOCK"
+  // note — offering the button is misleading UX (and the BLOCK confirm()'s
+  // "DM messages will stop appearing on your screen" promise reads more
+  // honestly if the entry point itself disappears). Unblocking restores the
+  // button on the next repaint (subscribeBlockList → refreshContactsApp).
+  const dmBtn = opts.friend && !opts.blocked
     ? `<button type="button" data-contact-act="dm" data-contact-pub="${safePub}" title="Direct message">💬</button>`
     : "";
+  // 🚫 Block button (issue #20) — red ✕ with a confirm() prompt handled by
+  // the delegated click handler. Distinct from the neutral REMOVE ✕: this one
+  // silences the identity across the app; REMOVE just forgets the card.
+  const blockBtn = `<button type="button" class="contact-block-btn" data-contact-act="block" data-contact-pub="${safePub}" title="Block this contact (hides their messages and roster row)">✕ BLOCK</button>`;
   return `<div class="contact-row" role="listitem">
     <span class="contact-name" title="${safePub}">${safeName}</span>
     <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
-    <span class="contact-actions">${dmBtn}${friendBtn}<button type="button" data-contact-act="remove" data-contact-pub="${safePub}" title="Remove contact">✕</button></span>
+    <span class="contact-actions">${dmBtn}${friendBtn}${blockBtn}<button type="button" data-contact-act="remove" data-contact-pub="${safePub}" title="Remove contact">✕</button></span>
+  </div>`;
+}
+
+/** Row shown in the BLOCKED CONTACTS section — the pub is the durable id and
+ *  may not be in your contacts anymore (a peer you never added but blocked
+ *  from the roster). We resolve a friendly name if we can, else render the
+ *  fingerprint alone. */
+function blockedRowHtml(pub: string): string {
+  const safePub = escapeHtml(pub);
+  const fp = contactFingerprint(pub);
+  const c = getContact(pub);
+  const display = c?.name ? escapeHtml(c.name) : `Unknown (🔑 ${fp})`;
+  return `<div class="contact-row" role="listitem">
+    <span class="contact-name" title="${safePub}">${display}</span>
+    <span class="contact-fp" title="Identity fingerprint">🔑 ${fp}</span>
+    <span class="contact-actions"><button type="button" data-contact-act="unblock" data-contact-pub="${safePub}" title="Unblock — allow their messages and roster row again">↺ UNBLOCK</button></span>
   </div>`;
 }
 
@@ -5739,21 +6557,36 @@ function refreshContactsApp(): void {
 
   const friends = listFriends();
   const all = listContacts();
+  const blockedPubs = listBlocked();
+  // 🚫 Snapshot the block set for the row renderer so the DM button hides
+  // uniformly across the friends + all-contacts lists in a single repaint.
+  const blockedNow = blockedSet();
   const friendsList = document.getElementById("contacts-friends-list");
   const allList = document.getElementById("contacts-all-list");
+  const blockedList = document.getElementById("contacts-blocked-list");
   if (friendsList) {
     friendsList.innerHTML = friends.length
       ? friends
-          .map((c) => contactRowHtml(c.name, c.pub, { friend: true }))
+          .map((c) => contactRowHtml(c.name, c.pub, { friend: true, blocked: blockedNow.has(c.pub) }))
           .join("")
       : '<div class="phone-access-note">No friends yet — add a contact, then tap ☆ to make them a friend.</div>';
   }
   if (allList) {
     allList.innerHTML = all.length
       ? all
-          .map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend }))
+          .map((c) => contactRowHtml(c.name, c.pub, { friend: c.friend, blocked: blockedNow.has(c.pub) }))
           .join("")
       : '<div class="phone-access-note">No contacts yet — share your card and paste one back.</div>';
+  }
+  // 🚫 BLOCKED section — one row per pub on the local block list. Includes
+  // an honesty note: this is local mute only; the sender is not notified,
+  // their bytes still arrive over the mesh, and a signed on-doc block op is
+  // a later TrustAndSafety slice. See brainstorming/phone-apps-breakdown.md §3.2.
+  if (blockedList) {
+    blockedList.innerHTML = blockedPubs.length
+      ? blockedPubs.map((pub) => blockedRowHtml(pub)).join("")
+        + '<div class="phone-access-note">Local mute only. Your device hides their messages and roster row; other clients are unaffected, and the blocked party is not notified.</div>'
+      : '<div class="phone-access-note">Nobody on your block list. Tap ✕ BLOCK on any contact to silence them locally.</div>';
   }
   const meshNote = document.getElementById("contacts-mesh-note");
   if (meshNote) {
@@ -5777,6 +6610,297 @@ function escapeHtml(s: string): string {
             ? "&quot;"
             : "&#39;",
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 💬 Chat app · thread picker + new-group flow (issue #20 · group chats)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The Chat app now supports THREADS above its existing broadcast log. A chip
+// bar switches the log between:
+//   - 🌐 ROOM  → messages in the room broadcast lane (no groupId)
+//   - 👥 <G>   → messages tagged with a specific groupId (a group thread)
+// A trailing + NEW GROUP chip opens a picker for choosing 1+ friends to seed
+// a fresh thread. The thread record is written to the room doc's `groupChats`
+// map; every member's client filters the shared chat to that groupId.
+//
+// Router state (`activeChatThread`) lives at module scope so subscribers set
+// up at boot (block list, groupChats observer) can trigger repaints via the
+// `latestRefreshChatThreadBar` closure indirection.
+
+let chatThreadBarInited = false;
+
+/** One-time setup for the Chat app's thread picker and new-group panel.
+ *  Delegated click handling lets us re-render the chip list freely without
+ *  re-binding listeners. */
+function setupChatThreadBar(): void {
+  if (chatThreadBarInited) return;
+  chatThreadBarInited = true;
+
+  const bar = document.getElementById("chat-thread-bar");
+  const panel = document.getElementById("chat-new-group-panel");
+  if (!bar || !panel) return;
+
+  // Delegated chip clicks: swap active thread OR open the new-group panel.
+  bar.addEventListener("click", (e) => {
+    const chip = (e.target as HTMLElement).closest<HTMLButtonElement>(
+      "button.chat-thread-chip",
+    );
+    if (!chip) return;
+    const target = chip.dataset.thread;
+    if (target === "__new__") {
+      openNewGroupPanel();
+      return;
+    }
+    // "__room__" is the sentinel for the ROOM broadcast lane.
+    activeChatThread = target === "__room__" || !target ? null : target;
+    refreshChatThreadBar();
+    updateChatInputPlaceholder();
+    rebuildChatLogIfBound();
+    // Refocus the input so the picker feels like a quick tab-switch, not a
+    // modal — same discipline as the phone view router (chatInput?.focus()).
+    (document.getElementById("chat-input") as HTMLInputElement | null)?.focus();
+  });
+
+  // The new-group panel's Cancel/Create buttons are also delegated so the
+  // panel can be re-rendered from state without re-binding listeners.
+  panel.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("button");
+    if (!btn) return;
+    if (btn.classList.contains("chat-new-group-cancel")) {
+      closeNewGroupPanel();
+      return;
+    }
+    if (btn.classList.contains("chat-new-group-create")) {
+      void submitNewGroup(panel);
+    }
+  });
+
+  // Publish the refresh closure for the case where the FIRST setupChatThreadBar
+  // call (via setupSpacePhoneOverlay in bootstrapNetworking) races AHEAD of the
+  // first joinRoomAtEpoch — the per-join republish (in joinRoomAtEpoch) covers
+  // every subsequent join, but a pre-join click that opens the chat overlay
+  // and lands here first must still leave the bar wired up. Same reference the
+  // join path uses, so a subsequent join re-assigning is a no-op.
+  latestRefreshChatThreadBar = refreshChatThreadBar;
+  refreshChatThreadBar();
+}
+
+/** Rebuild the chip bar from the shared groupChats map + activeChatThread.
+ *  Silent no-op if the Chat app DOM isn't mounted (defense-in-depth: this
+ *  fires from Yjs observers that may still be attached during teardown). */
+function refreshChatThreadBar(): void {
+  const bar = document.getElementById("chat-thread-bar");
+  if (!bar) return;
+  bar.textContent = "";
+  const myPub = getIdentityPub();
+
+  // ROOM chip — always present, active when activeChatThread is null.
+  const roomChip = document.createElement("button");
+  roomChip.type = "button";
+  roomChip.className = "chat-thread-chip" + (activeChatThread === null ? " active" : "");
+  roomChip.dataset.thread = "__room__";
+  roomChip.textContent = "🌐 ROOM";
+  roomChip.title = "Room broadcast — everyone in this room sees these messages.";
+  bar.appendChild(roomChip);
+
+  // Group chips — one per thread that includes MY identity pub. Silently
+  // omits threads that fail the guard (hostile-peer entries can't inject).
+  const sync = yjsSync;
+  if (sync) {
+    const groupsMap = sync.doc.getMap("groupChats");
+    const mine = listMyGroupChats(groupsMap.entries(), myPub);
+    for (const t of mine) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chat-thread-chip" + (activeChatThread === t.id ? " active" : "");
+      chip.dataset.thread = t.id;
+      chip.textContent = "👥 " + (t.title || groupChatFallbackLabel(t, myPub));
+      chip.title = groupChatChipTitle(t, myPub);
+      bar.appendChild(chip);
+    }
+  }
+
+  // + NEW GROUP chip — opens the picker. Hidden entirely offline (no doc =
+  // no place to write a thread record; the CTA would be misleading).
+  if (sync) {
+    const newChip = document.createElement("button");
+    newChip.type = "button";
+    newChip.className = "chat-thread-chip chat-thread-new";
+    newChip.dataset.thread = "__new__";
+    newChip.id = "chat-new-group-btn";
+    newChip.textContent = "+ NEW GROUP";
+    newChip.title = "Start a new group chat with one or more friends.";
+    bar.appendChild(newChip);
+  }
+}
+
+/** Compose a fallback chip label when a thread has no explicit title. Lists
+ *  the OTHER members' short names (or fingerprints), truncated for the chip. */
+function groupChatFallbackLabel(t: GroupChatThread, myPub: string): string {
+  const others = t.members.filter((m) => m !== myPub);
+  if (others.length === 0) return "Just me";
+  const parts = others.map((pub) => {
+    const c = getContact(pub);
+    return c?.name ? c.name : contactFingerprint(pub);
+  });
+  // Cap the visible portion — chat chips are horizontally scrollable but a
+  // 40-char label is a screenful all on its own.
+  const label = parts.join(", ");
+  return label.length > 24 ? label.slice(0, 22) + "…" : label;
+}
+
+/** Long-form tooltip: member roster + honest privacy footnote. */
+function groupChatChipTitle(t: GroupChatThread, myPub: string): string {
+  const members = t.members.map((pub) => {
+    const c = getContact(pub);
+    const label = c?.name || `Unknown-${contactFingerprint(pub)}`;
+    return pub === myPub ? `${label} (you)` : label;
+  }).join(", ");
+  return `Group chat · ${t.members.length} members: ${members}\nPrivate-by-UI: every room member replicates the messages; only members see them in the picker.`;
+}
+
+/** Update the chat input's placeholder text based on the active thread — a
+ *  small but crucial cue so the user knows which lane a SEND will target. */
+function updateChatInputPlaceholder(): void {
+  const input = document.getElementById("chat-input") as HTMLInputElement | null;
+  if (!input) return;
+  if (activeChatThread === null) {
+    input.placeholder = "Broadcast to room...";
+    return;
+  }
+  const sync = yjsSync;
+  if (!sync) return;
+  const t = sync.doc.getMap("groupChats").get(activeChatThread);
+  // Use isValidThreadEntry (chained guard, key === value.id) for the same
+  // reason as the send path: a mismatched-key entry must not label the
+  // placeholder as if the thread were addressable when the SEND lookup
+  // (groupsMap.get(activeChatThread)) would in fact miss.
+  if (!isValidThreadEntry(activeChatThread, t)) {
+    input.placeholder = "Broadcast to room...";
+    return;
+  }
+  const label = t.title || groupChatFallbackLabel(t, getIdentityPub());
+  input.placeholder = `Message ${label}...`;
+}
+
+/** Open the new-group panel — populates the friends checklist fresh each time.
+ *  If there are no friends yet, shows a hint rather than an empty form. */
+function openNewGroupPanel(): void {
+  const panel = document.getElementById("chat-new-group-panel");
+  if (!panel) return;
+  const myPub = getIdentityPub();
+  // Only FRIENDS (contacts.friend === true) can be group members — a raw
+  // contact is a verified id, but the friend gate is the intent signal that
+  // you actually want to co-thread with them.
+  const friends = listFriends();
+  const parts: string[] = [];
+  parts.push('<div class="chat-new-group-header">NEW GROUP CHAT</div>');
+  parts.push('<input type="text" id="chat-new-group-title" maxlength="' + GROUP_TITLE_MAX + '" placeholder="Group title (optional)" autocomplete="off">');
+  if (friends.length === 0) {
+    parts.push('<div class="chat-new-group-note">You have no friends yet. Add someone in the CONTACTS app, then tap ☆ to promote them to a friend.</div>');
+  } else {
+    parts.push('<div class="chat-new-group-friends">');
+    for (const f of friends) {
+      if (f.pub === myPub) continue; // self is added automatically
+      const safePub = escapeHtml(f.pub);
+      const safeName = escapeHtml(f.name);
+      parts.push(
+        '<label><input type="checkbox" value="' + safePub + '"><span>' + safeName + ' · 🔑 ' + contactFingerprint(f.pub) + '</span></label>',
+      );
+    }
+    parts.push('</div>');
+    parts.push('<div class="chat-new-group-note">Pick ' + (MIN_GROUP_MEMBERS - 1) + '+ friends. Local & private-by-UI: every room member replicates the messages, filtering happens in the app. A signed on-doc scoping is a later slice.</div>');
+  }
+  parts.push('<div class="chat-new-group-actions">');
+  parts.push('<button type="button" class="chat-new-group-cancel">CANCEL</button>');
+  parts.push('<button type="button" class="chat-new-group-create" disabled>CREATE</button>');
+  parts.push('</div>');
+  panel.innerHTML = parts.join("");
+  panel.hidden = false;
+
+  // Enable CREATE only when at least one friend is checked. Live listener on
+  // the (freshly-rendered) checkbox group.
+  const createBtn = panel.querySelector<HTMLButtonElement>("button.chat-new-group-create");
+  const friendsBox = panel.querySelector(".chat-new-group-friends");
+  const refreshCreate = () => {
+    if (!createBtn) return;
+    const checked = panel.querySelectorAll<HTMLInputElement>(".chat-new-group-friends input[type=checkbox]:checked").length;
+    createBtn.disabled = checked < (MIN_GROUP_MEMBERS - 1);
+  };
+  friendsBox?.addEventListener("change", refreshCreate);
+  refreshCreate();
+}
+
+function closeNewGroupPanel(): void {
+  const panel = document.getElementById("chat-new-group-panel");
+  if (panel) {
+    panel.hidden = true;
+    panel.textContent = "";
+  }
+}
+
+/** Read the panel's checked friends + title, build a canonical thread record,
+ *  write it into the room doc's groupChats map, and switch to the new thread.
+ *  Enforces MAX_GROUP_CHATS by evicting the oldest thread records (client-
+ *  local — every viewer trims the same overflow because the sort is stable). */
+async function submitNewGroup(panel: HTMLElement): Promise<void> {
+  const sync = yjsSync;
+  if (!sync) {
+    setChatFeedback("Offline — a group chat needs a connected room.");
+    return;
+  }
+  const titleInput = panel.querySelector<HTMLInputElement>("#chat-new-group-title");
+  const title = titleInput?.value.trim() ?? "";
+  const checked = Array.from(
+    panel.querySelectorAll<HTMLInputElement>(".chat-new-group-friends input[type=checkbox]:checked"),
+  ).map((cb) => cb.value);
+  if (checked.length < MIN_GROUP_MEMBERS - 1) {
+    setChatFeedback(`Pick at least ${MIN_GROUP_MEMBERS - 1} friend${MIN_GROUP_MEMBERS - 1 === 1 ? "" : "s"}.`);
+    return;
+  }
+  let thread: GroupChatThread;
+  try {
+    thread = buildGroupChatThread({
+      members: checked,
+      title,
+      createdBy: getIdentityPub(),
+    });
+  } catch (e) {
+    setChatFeedback(`Could not create group: ${(e as Error).message}`);
+    return;
+  }
+  const groupsMap = sync.doc.getMap("groupChats");
+  sync.doc.transact(() => {
+    // Whole-value LWW: idempotent when two members create the same set at
+    // once (deriveGroupChatId is deterministic on the sorted member list),
+    // so the later writer's record overwrites with identical shape.
+    groupsMap.set(thread.id, thread);
+    // 🚫 Bounded map: evict the OLDEST thread records if we exceed the hard
+    // cap. Deleted threads keep their message history in sharedChat (the
+    // messages don't age with the record); this only removes the picker
+    // entry — a fair tradeoff for a bounded room doc.
+    const evict = excessThreadIds(groupsMap.entries(), MAX_GROUP_CHATS);
+    for (const id of evict) if (id !== thread.id) groupsMap.delete(id);
+  });
+  activeChatThread = thread.id;
+  closeNewGroupPanel();
+  refreshChatThreadBar();
+  updateChatInputPlaceholder();
+  rebuildChatLogIfBound();
+  (document.getElementById("chat-input") as HTMLInputElement | null)?.focus();
+}
+
+/** Small inline feedback line — reuses the room log so the message surfaces
+ *  without a separate DOM element (fresh install has no dedicated slot). */
+function setChatFeedback(msg: string): void {
+  const container = document.getElementById("chat-messages-container");
+  if (!container) return;
+  const line = document.createElement("div");
+  line.className = "chat-bubble system";
+  line.textContent = msg;
+  container.appendChild(line);
+  container.scrollTop = container.scrollHeight;
 }
 
 /** 🕸️ Mesh harvest (§7 M1): fold every contact/friend into the peer store.
@@ -5862,13 +6986,27 @@ function renderDmMessages(): void {
   const list = document.getElementById("dm-messages");
   if (!list || !dmActiveSession) return;
   const me = getIdentityPub();
-  const msgs: DirectMessage[] = readMessages(dmActiveSession);
+  const all: DirectMessage[] = readMessages(dmActiveSession);
+  // 🚫 Issue #20 audit remediation: honor the BLOCK confirm() promise that
+  // "chat and DM messages will stop appearing on your screen". A DM has
+  // exactly two possible authors (see verifyMessage), so blocking the peer
+  // silences every remote message in the thread; our own outbound messages
+  // still render (we don't block ourselves). Client-side only — matches the
+  // room-chat filter's posture (documented on the BLOCKED-section note).
+  const { visible: msgs, hidden: hiddenBlocked } = filterOutBlockedDms(all, blockedSet());
   if (!msgs.length) {
-    list.innerHTML =
-      '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
+    // Distinguish "genuinely empty" from "everything hidden by BLOCK" so the
+    // user isn't puzzled by a blank pane after blocking their DM peer.
+    if (hiddenBlocked > 0) {
+      list.innerHTML =
+        `<div id="dm-empty">🚫 ${hiddenBlocked} message${hiddenBlocked === 1 ? "" : "s"} hidden from a blocked contact. Unblock them in the CONTACTS app to see this thread again.</div>`;
+    } else {
+      list.innerHTML =
+        '<div id="dm-empty">No messages yet — say hello. Messages are signed (authenticated), not encrypted.</div>';
+    }
     return;
   }
-  list.innerHTML = msgs
+  let html = msgs
     .map((m) => {
       const mine = m.author === me;
       const time = new Date(m.ts).toLocaleTimeString([], {
@@ -5878,6 +7016,12 @@ function renderDmMessages(): void {
       return `<div class="dm-msg ${mine ? "dm-mine" : "dm-theirs"}">${escapeHtml(m.text)}<span class="dm-msg-meta">${escapeHtml(mine ? "you" : m.authorName)} · ${time}</span></div>`;
     })
     .join("");
+  if (hiddenBlocked > 0) {
+    // Honest note — mirrors the chat log's "🚫 N messages hidden from blocked
+    // contacts." system line so the user knows the pane isn't the full history.
+    html += `<div class="dm-msg dm-system">🚫 ${hiddenBlocked} message${hiddenBlocked === 1 ? "" : "s"} hidden from a blocked contact.</div>`;
+  }
+  list.innerHTML = html;
   list.scrollTop = list.scrollHeight;
 }
 
