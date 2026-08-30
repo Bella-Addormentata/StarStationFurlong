@@ -14,18 +14,23 @@
  */
 
 import * as Y from 'yjs';
+import {
+  MAX_SCRIPT_STEPS,
+  isRobotStep,
+  isWheelTiming,
+  type RobotStep,
+  type WheelTiming,
+} from './robotScript';
+import { isChargeParams, type ChargeParams } from './robotCharge';
+
+// 🤖📜 The RobotStep type and its shape-guard live in robotScript.ts — that's
+// the engine-pure module the render layer + tests share. Re-exported here so
+// existing importers of `./robotDoc` keep working without churn. Same for
+// the charge model's ChargeParams (robotCharge.ts).
+export { MAX_SCRIPT_STEPS, isRobotStep, isWheelTiming, isChargeParams };
+export type { RobotStep, WheelTiming, ChargeParams };
 
 export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom';
-
-/** 🤖 #77C s4: one bounded step of an owner-authored routine (a chip list, NOT
- *  a DSL). The robot loops the list: walk to a spot, say a line, or pause. */
-export type RobotStep =
-  | { kind: 'goto'; x: number; z: number }
-  | { kind: 'say'; text: string }
-  | { kind: 'wait'; secs: number };
-
-/** Hard cap on a custom script (keeps the synced record small + the loop cheap). */
-export const MAX_SCRIPT_STEPS = 16;
 
 export interface RobotConfig {
   routine: RobotRoutine;
@@ -35,6 +40,15 @@ export interface RobotConfig {
    *  stands on it, OFF, overriding the routine. START (parked false/absent)
    *  resumes the routine. Independent of `routine` so it survives a routine edit. */
   parked?: boolean;
+  /** 🎰⏱️ #77C: owner-programmable roulette pacing. When set on ANY dock's
+   *  config, croupier duty uses these timings in place of its defaults (validated
+   *  to safe bounds so a hostile peer can't strand the wheel spinning). */
+  wheelTiming?: WheelTiming;
+  /** 🔋 #77 charge slice: owner-tuneable charge model — discharge/charge seconds
+   *  + low threshold. Refused by isChargeParams outside its envelope so a hostile
+   *  peer can't push the battery to seconds or hours; the tracker falls back to
+   *  DEFAULT_CHARGE_PARAMS on refusal. */
+  chargeParams?: ChargeParams;
 }
 
 export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom'];
@@ -86,17 +100,13 @@ export function subscribeRobot(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-/** Step guard — the script crosses the room-doc trust boundary (peer writes). */
-export function isRobotStep(value: unknown): value is RobotStep {
-  if (typeof value !== 'object' || value === null) return false;
-  const s = value as { kind?: unknown; x?: unknown; z?: unknown; text?: unknown; secs?: unknown };
-  if (s.kind === 'goto') return Number.isFinite(s.x) && Number.isFinite(s.z);
-  if (s.kind === 'say') return typeof s.text === 'string';
-  if (s.kind === 'wait') return Number.isFinite(s.secs) && (s.secs as number) >= 0;
-  return false;
-}
-
-function isRobotConfig(value: unknown): value is RobotConfig {
+/** Trust-boundary guard: refuses any RobotConfig payload — top-level fields OR
+ *  their nested records — that fails the module's shape/bounds discipline. A
+ *  hostile peer's write is dropped on read, and DEFAULT_CHARGE_PARAMS take
+ *  over for chargeParams; only fully-valid configs cross into behaviour.
+ *  Exported for the test lane that exercises the guard against hostile
+ *  payloads without going through the Y.Doc round-trip. */
+export function isRobotConfig(value: unknown): value is RobotConfig {
   if (typeof value !== 'object' || value === null) return false;
   const c = value as Partial<RobotConfig>;
   if (
@@ -110,6 +120,11 @@ function isRobotConfig(value: unknown): value is RobotConfig {
     if (!c.script.every(isRobotStep)) return false;
   }
   if (c.parked !== undefined && typeof c.parked !== 'boolean') return false;
+  if (c.wheelTiming !== undefined && !isWheelTiming(c.wheelTiming)) return false;
+  // 🔋 chargeParams is optional (owner unmodified ⇒ defaults apply). When
+  // present it MUST pass the module envelope — a hostile peer's out-of-range
+  // rate would otherwise poison every reader's charge tracker.
+  if (c.chargeParams !== undefined && !isChargeParams(c.chargeParams)) return false;
   return true;
 }
 
@@ -135,9 +150,13 @@ export function clearRobotConfig(dockId: string): void {
   });
 }
 
-// Console verification handle (the __ssfCasino precedent).
-(window as unknown as { __ssfRobot: unknown }).__ssfRobot = {
-  readRobotConfig,
-  writeRobotConfig,
-  clearRobotConfig,
-};
+// Console verification handle (the __ssfCasino precedent). Guarded so this
+// module can be imported by a node-env test (vitest default) without crashing
+// on the missing `window` — the write is a browser-only debugging convenience.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfRobot: unknown }).__ssfRobot = {
+    readRobotConfig,
+    writeRobotConfig,
+    clearRobotConfig,
+  };
+}

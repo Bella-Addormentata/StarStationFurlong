@@ -42,6 +42,10 @@ import {
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
+// 🔋 #77 charge slice: deterministic multi-dock claim helper (nearest, stable
+// tie-break) — the same helper the tests exercise. Used inside reconcileRobots
+// so every client picks the same dock for each robot when multiple exist.
+import { pickDockForRobot, type DockCandidate, type ChargeReading } from "./robotCharge";
 import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
@@ -4816,16 +4820,27 @@ export class World {
         ),
       );
     }
-    // (Re)point each dock robot at ITS dock (a moved/rotated dock is reflected);
-    // the ambient robot has no dock and simply patrols.
+    // 🔋 #77 charge slice: deterministic dock claim across ALL clients. Every
+    // dock is a candidate; each robot's KEY is its assigned dock id. When the
+    // assignment resolves to a live candidate (the common case), pickDockForRobot
+    // returns THAT dock — a moved/rotated dock is reflected. If the assigned
+    // dock was just removed (rare — the reconcile above already disposes such
+    // robots before this loop), the helper's nearest+stable-tie-break fallback
+    // keeps the robot pointed at SOME dock so it doesn't strand.
+    const dockCandidates: DockCandidate[] = docks.map((d) => ({
+      id: d.id,
+      x: d.pos.x,
+      z: d.pos.z,
+    }));
     for (const [key, bot] of this.robots) {
-      const dock = docks.find((d) => d.id === key);
+      const bp = bot.getPosition();
+      const chosen = pickDockForRobot(bp.x, bp.z, dockCandidates, key);
       bot.setDock(
-        dock
+        chosen
           ? {
-              x: dock.pos.x,
-              z: dock.pos.z,
-              faceAngle: Math.atan2(-dock.pos.x, -dock.pos.z),
+              x: chosen.x,
+              z: chosen.z,
+              faceAngle: Math.atan2(-chosen.x, -chosen.z),
             }
           : null,
       );
@@ -4850,10 +4865,24 @@ export class World {
       bot.setRoutine(cfg?.routine ?? "serve");
       bot.setScript(cfg?.script ?? []);
       bot.setParked(cfg?.parked ?? false); // 🤖 STOP/START park override
+      // 🔋 #77 charge slice: hand the tracker the OWNER-TUNED rate params (or
+      // undefined, which falls back to DEFAULT_CHARGE_PARAMS inside the tracker).
+      // Runs on every doc change so an owner nudge takes effect without a room
+      // reload; percent is preserved across a retune.
+      bot.setChargeParams(cfg?.chargeParams);
       // 🤖 #77C s4: a custom-script 'say' step pops a bubble over the bot (one
       // per robot, replaced each line) — local, like the croupier's narration.
       bot.setSayHandler((text, x, z) => this.robotSay(`robotsay:${key}`, text, x, z));
     }
+  }
+
+  /** 🔋 #77 charge slice: owner-visible CHARGE reading for one dock's robot,
+   *  or null when there's no such robot (dock just added and the reconcile
+   *  hasn't run, or the room has no robots). The dock console polls this each
+   *  frame — bot::getChargeReading is cheap (an integer round + three booleans). */
+  public robotChargeReading(dockId: string): ChargeReading | null {
+    const bot = this.robots.get(dockId);
+    return bot ? bot.getChargeReading() : null;
   }
 
   private updateCroupier(): void {
@@ -4873,10 +4902,17 @@ export class World {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
+      // 🎰⏱️ #77C: pick the owner-programmed roulette pacing (if any). Docks
+      // are sorted by id so multiple configured docks pick the SAME timing on
+      // every client — no wall-clock drift between operator and viewers.
+      const dockIds = [...this.robots.keys()].sort();
+      const wheelTiming = dockIds
+        .map((k) => readRobotConfig(k)?.wheelTiming)
+        .find((t) => t != null);
       for (const t of tables) {
         if (beatNow) beatCroupier(t.id);
         if (t.kind === "craps-table") tickAutoStickman(t.id);
-        else tickAutoCroupier(t.id);
+        else tickAutoCroupier(t.id, wheelTiming);
       }
       for (const machine of slotMachines) tickAutoSlotMachine(machine.id);
     } else {
@@ -5187,9 +5223,13 @@ export class World {
     if (device.kind === "robotDock") {
       // 🤖 #77C s3: program the dock's robot. Owner-gated (only the room owner
       // may set the routine); anyone can open it to see the current program.
+      // 🔋 #77 charge slice: the console also DISPLAYS the live charge —
+      // getCharge polls the world's per-robot tracker (returning null when
+      // there's no robot for this dock yet, e.g. mid-reconcile).
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+        getCharge: () => this.robotChargeReading(deviceId),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

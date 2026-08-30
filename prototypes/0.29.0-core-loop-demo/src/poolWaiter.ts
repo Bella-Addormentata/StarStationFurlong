@@ -18,6 +18,19 @@ import * as THREE from "three";
 import type { Player } from "./player";
 import { CELL_SIZE, findPath, worldToCol, worldToRow } from "./pathfinding";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
+import {
+  ARRIVE_DIST as SCRIPT_ARRIVE_DIST,
+  RobotScriptScheduler,
+} from "./robotScript";
+// 🔋 #77 charge slice: engine-pure per-robot charge accumulator + the reading
+// shape the dock console reads. All timing is dt-driven so every client's
+// derivation agrees; a hostile ChargeParams is refused inside the tracker.
+import {
+  RobotChargeTracker,
+  nextLowChargeLatch,
+  type ChargeParams,
+  type ChargeReading,
+} from "./robotCharge";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -35,6 +48,15 @@ const GULP_TIME = 0.3; // drink shrinks away (drunk!)
 const SERVE_COOLDOWN = 6; // s before the next drink can be grabbed
 const DOCK_AFTER_SECS = 12; // 🔌 idle this long with no fox near → return to dock
 const DOCK_WAKE_RANGE = 4.5; // 🔌 a fox this close wakes the bot off the dock
+/** 🔋 #77 charge slice: how close to the dock counts as "on the pad" — the
+ *  tracker charges only inside this range so the "walking to the dock" leg
+ *  visibly drains, and a bot idling AT the dock visibly climbs. Matches the
+ *  walker's `updateDock` arrive tolerance (0.12 m). */
+const DOCK_CHARGE_RANGE = 0.15;
+/** 🔋 #77 charge slice: gap between low-battery small-talk lines while docked.
+ *  Prevents the "recharging" bubble from spamming every SMALLTALK edge — the
+ *  charging beat holds its own tempo. */
+const LOW_CHARGE_SPEAK_SECS = 12;
 const REFILL_TIME = 14; // s until an emptied tray slot is restocked
 const SMALLTALK_RANGE = 3.2; // 🗨️ #77: fox newly this close → one greeting line
 const SMALLTALK_COOLDOWN_SECS = 45; // per bot — greet, don't pester
@@ -187,12 +209,11 @@ export class PoolWaiter {
   /** 🤖 STOP/START: when true the bot parks on its dock (off), overriding the
    *  routine + croupier duty. Set from the dock console via the world. */
   private parked = false;
-  /** 🤖 #77C s4: the custom step list (routine 'custom') + loop cursor/timer, and
-   *  the world-provided handler that renders a 'say' bubble over the bot. */
-  private script: RobotStep[] = [];
-  private scriptIndex = 0;
-  private scriptTimer = 0;
-  private saidThisStep = false;
+  /** 🤖📜 #77C s4: the engine-pure state machine driving a custom routine. This
+   *  scheduler owns cursor+timers+edge-flags and validates every step; poolWaiter
+   *  just asks each frame "what should the chassis DO now?" and renders that.
+   *  Kept here (not created per-tick) so timers survive across frames. */
+  private scriptScheduler = new RobotScriptScheduler();
   private sayHandler: ((text: string, x: number, z: number) => void) | null = null;
   /** 🗨️ #77 small talk: greet once when a fox newly enters range, then hold off. */
   private smalltalkCooldown = 0;
@@ -202,6 +223,18 @@ export class PoolWaiter {
    *  clipping straight through), and the goal they were computed for. */
   private path: Array<{ x: number; z: number }> = [];
   private pathGoalKey = "";
+  /** 🔋 #77 charge slice: engine-pure charge accumulator (one per bot).
+   *  Advanced every frame with the current dt + a `docked` flag derived from
+   *  the bot's activity + distance to the dock pad. The dock console polls
+   *  `.reading()` for the owner-visible CHARGE % / state pill. */
+  private chargeTracker = new RobotChargeTracker();
+  /** 🔋 The last frame's "did we override this bot into DOCK because of low
+   *  charge?" latch. Fed through nextLowChargeLatch (robotCharge.ts) each
+   *  frame: arms on the low edge, HOLDS until the bot is docked at 100 % —
+   *  never releases at the threshold itself (that would ping-pong the bot). */
+  private lowChargeOverride = false;
+  /** 🔋 Cooldown between charging small-talk lines (LOW_CHARGE_SPEAK_SECS). */
+  private lowChargeSpeakCooldown = 0;
 
   constructor(
     scene: THREE.Scene,
@@ -413,12 +446,23 @@ export class PoolWaiter {
     if (this.cooldown > 0) this.cooldown = Math.max(0, this.cooldown - dt);
     if (this.smalltalkCooldown > 0)
       this.smalltalkCooldown = Math.max(0, this.smalltalkCooldown - dt);
+    if (this.lowChargeSpeakCooldown > 0)
+      this.lowChargeSpeakCooldown = Math.max(0, this.lowChargeSpeakCooldown - dt);
     this.refill();
 
     // One player↔bot distance per frame — shared by small talk and the
     // dock-wake check below (foxDistance is allocation-free).
     const foxDist = player ? this.foxDistance(player) : Infinity;
     this.maybeSmalltalk(foxDist);
+
+    // 🔋 #77 charge slice: advance the charge accumulator using THIS FRAME'S
+    // actual docked state (bot's feet on the pad, not just "walking toward"
+    // the dock). Runs every frame BEFORE we branch on activity so the reading
+    // stays synchronous with the dt even during a serve — a bot mid-serve is
+    // never docked, so its charge visibly drops during a long service. The
+    // tracker itself clamps dt to DT_CEILING for tab-freeze safety.
+    const dockedNow = this.isPhysicallyDocked();
+    this.chargeTracker.advance(dt, dockedNow);
 
     if (this.servePhase !== "NONE") {
       this.tray.visible = true; // 🍹 the tray only shows while serving drinks
@@ -437,9 +481,38 @@ export class PoolWaiter {
       return;
     }
 
+    // 🔋 #77 charge slice: LOW-CHARGE OVERRIDE. When the tracker reports the
+    // battery under the owner-configured threshold, force the bot home to its
+    // dock — the honest "returns to dock and says it's charging" beat. Overrides
+    // routine (serve/croupier/custom) but NOT parked (an owner park always
+    // wins). The hysteresis lives in the ENGINE-PURE nextLowChargeLatch
+    // (robotCharge.ts, tested): arm on the low edge, hold until docked AND
+    // back at 100 % — releasing at the low threshold instead would ping-pong
+    // the bot at the pad edge forever.
+    const chargeReading = this.chargeTracker.reading();
+    this.lowChargeOverride = nextLowChargeLatch(
+      this.lowChargeOverride,
+      this.dockTarget != null,
+      dockedNow,
+      chargeReading,
+    );
+    if (this.lowChargeOverride) {
+      this.tray.visible = false;
+      this.activity = "DOCK";
+      this.updateDock(dt);
+      // Say the "recharging" line once per LOW_CHARGE_SPEAK_SECS while docked,
+      // so a viewer standing by hears the bot own its state rather than
+      // getting a silent "why isn't it working" moment.
+      if (dockedNow && this.lowChargeSpeakCooldown <= 0) {
+        this.lowChargeSpeakCooldown = LOW_CHARGE_SPEAK_SECS;
+        this.sayRandom(SMALLTALK_CHARGING);
+      }
+      return;
+    }
+
     // 🎰🤖 #77 Phase B: croupier duty takes priority. With a wheel-head post set
-    // (the room has a roulette table), the bot walks to the head of the wheel and
-    // stands the table — no patrol, no dock, no serving.
+    // (the room has a roulette table), the bot leaves patrol/dock, walks to the
+    // head of the wheel, and stands the table — no patrol, no dock, no serving.
     if (this.croupierPost) {
       this.tray.visible = false; // a croupier carries no drink tray
       this.activity = "CROUPIER";
@@ -448,7 +521,7 @@ export class PoolWaiter {
     }
 
     // 🤖 #77C s4: a 'custom' robot runs its owner-authored step loop (walk / say /
-    // wait) — never serves or croupiers.
+    // wait / dock) — never serves or croupiers.
     if (this.routine === "custom") {
       this.tray.visible = false;
       this.updateScript(dt);
@@ -486,6 +559,17 @@ export class PoolWaiter {
       this.updatePatrol(dt);
       if (player) this.maybeBeginServe(player);
     }
+  }
+
+  /** 🔋 True IFF the bot is standing on its dock pad this frame (used both to
+   *  advance the tracker's docked/undocked accumulator and to gate the "still
+   *  charging" line). A bot merely WALKING TOWARD its dock is not yet docked —
+   *  the tracker discharges during the trip, then climbs once the bot arrives. */
+  private isPhysicallyDocked(): boolean {
+    if (!this.dockTarget) return false;
+    const p = this.group.position;
+    const d = Math.hypot(p.x - this.dockTarget.x, p.z - this.dockTarget.z);
+    return d <= DOCK_CHARGE_RANGE;
   }
 
   /** 🗨️ #77: greet a fox the moment it steps into range — edge-triggered on
@@ -541,14 +625,12 @@ export class PoolWaiter {
     this.parked = parked;
   }
 
-  /** 🤖 #77C s4: set the custom step list. Resets the loop only when the script
-   *  actually changed, so a re-apply mid-loop doesn't restart it. */
+  /** 🤖 #77C s4: set the custom step list. The scheduler dedups an identical
+   *  payload so a re-apply mid-loop doesn't restart it, and drops any malformed
+   *  step (a hostile peer sneaking through the doc guard) — safe to pass through. */
   public setScript(steps: RobotStep[]): void {
-    if (JSON.stringify(steps) === JSON.stringify(this.script)) return;
-    this.script = steps;
-    this.scriptIndex = 0;
-    this.scriptTimer = 0;
-    this.saidThisStep = false;
+    this.scriptScheduler.setSteps(steps);
+    // Clear the walker's cached path so the next `goto` step recomputes cleanly.
     this.path = [];
     this.pathGoalKey = "";
   }
@@ -558,38 +640,74 @@ export class PoolWaiter {
     this.sayHandler = fn;
   }
 
-  /** 🤖 #77C s4: advance the custom step loop (walk / say / wait). */
+  /** 🔋 #77 charge slice: hand the tracker fresh owner-tuned rate params (from
+   *  the room doc). A rejected value falls back to defaults inside the tracker
+   *  — a hostile peer can't strand the battery on undefined rates. Cheap to
+   *  call every doc change; percent is preserved across a retune. */
+  public setChargeParams(next: ChargeParams | undefined): void {
+    this.chargeTracker.setParams(next);
+  }
+
+  /** 🔋 #77 charge slice: owner-visible snapshot the dock console renders as
+   *  the CHARGE % pill + charging/discharging/full/low badge. Cheap enough to
+   *  poll every frame from the UI (integer round + three booleans). */
+  public getChargeReading(): ChargeReading {
+    return this.chargeTracker.reading();
+  }
+
+  /** 🤖📜 #77C s4: advance the custom step loop by asking the engine-pure
+   *  scheduler what the chassis should do this frame, then rendering it. The
+   *  scheduler judges arrival/timeouts/hold-durations; poolWaiter only handles
+   *  I/O (walker legs, tray, sayHandler bubble). Chassis position + this bot's
+   *  DOCK context are fed in so the scheduler's arrival check stays in step
+   *  with the walker's own for both `goto` and `dock` steps. */
   private updateScript(dt: number): void {
-    if (this.script.length === 0) {
+    const pos = this.group.position;
+    const action = this.scriptScheduler.advance(
+      dt,
+      { x: pos.x, z: pos.z },
+      // 🔋 The `dock` step composes as a goto to the RENDER-BOUND dock target
+      // (never doc-side coords). Passing null when there's no dock lets the
+      // scheduler stall for DOCK_STEP_NO_DOCK_SECS and move on — the loop
+      // never freezes on a dock step in a dockless room.
+      this.dockTarget ? { x: this.dockTarget.x, z: this.dockTarget.z } : null,
+    );
+    if (action.kind === "none") {
       this.idlePose();
       return;
     }
-    const step = this.script[this.scriptIndex % this.script.length];
-    const advance = (): void => {
-      this.scriptIndex = (this.scriptIndex + 1) % this.script.length;
-      this.scriptTimer = 0;
-      this.saidThisStep = false;
-      this.path = [];
-      this.pathGoalKey = "";
-    };
-    if (step.kind === "goto") {
-      if (this.walkTo(dt, step.x, step.z, 0.15)) advance();
-    } else if (step.kind === "say") {
-      if (!this.saidThisStep) {
-        this.saidThisStep = true;
-        const p = this.group.position;
-        this.sayHandler?.(step.text, p.x, p.z);
-      }
-      // Hold the pose briefly so the line is readable before the next step.
-      this.idlePose();
-      this.scriptTimer += dt;
-      if (this.scriptTimer >= 2.5) advance();
-    } else {
-      // wait
-      this.idlePose();
-      this.scriptTimer += dt;
-      if (this.scriptTimer >= step.secs) advance();
+    if (action.kind === "goto") {
+      // walkTo uses the same ARRIVE_DIST as the scheduler so both agree on
+      // "arrived". Return value is ignored — the scheduler owns advancement.
+      this.walkTo(dt, action.x, action.z, SCRIPT_ARRIVE_DIST);
+      return;
     }
+    if (action.kind === "gotoDock") {
+      // 🔋 A scripted DOCK step: walk to the bound dock and face it on arrival,
+      // matching the routine-idle "walk home" beat. When hasDock=false the
+      // scheduler is stalling on the no-dock grace beat — the bot just holds
+      // an idle pose for the rest of that stall, then the scheduler advances.
+      if (!action.hasDock) {
+        this.idlePose();
+        return;
+      }
+      if (this.walkTo(dt, action.x, action.z, SCRIPT_ARRIVE_DIST)) {
+        // Arrived at the pad — face the dock the way the routine-idle path does.
+        if (this.dockTarget) this.turnToward(this.dockTarget.faceAngle, dt);
+      }
+      return;
+    }
+    if (action.kind === "say") {
+      // Edge-trigger: emit exactly once per SAY step (the scheduler flips the
+      // flag on the first tick, so a stale bubble won't re-fire).
+      if (action.started) {
+        this.sayHandler?.(action.text, pos.x, pos.z);
+      }
+      this.idlePose();
+      return;
+    }
+    // wait
+    this.idlePose();
   }
 
   /** Stand still (a dockless off-duty robot) — legs settled, a slow idle bob. */

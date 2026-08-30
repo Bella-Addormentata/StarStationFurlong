@@ -107,8 +107,32 @@ import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
   ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
+  isChargeParams,
 } from './robotDoc';
-import type { RobotRoutine, RobotStep } from './robotDoc';
+import type { RobotConfig, RobotRoutine, RobotStep, ChargeParams } from './robotDoc';
+// 🔋 #77 charge slice: bounds hints for the ChargeParams editor + default
+// values for a dock the owner hasn't tuned yet (the console still shows the
+// derived reading and the editable envelope from the very first open).
+import {
+  CHARGE_SECS_MAX, CHARGE_SECS_MIN,
+  DEFAULT_CHARGE_PARAMS,
+  DISCHARGE_SECS_MAX, DISCHARGE_SECS_MIN,
+  LOW_PERCENT_MAX, LOW_PERCENT_MIN,
+  type ChargeReading,
+} from './robotCharge';
+// 🎰⏱️ #77C: owner-editable roulette pacing bounds (used by the croupier UI).
+import {
+  BET_SECS_MAX, BET_SECS_MIN,
+  CLOSING_SECS_MAX, CLOSING_SECS_MIN,
+  SHOW_SECS_MAX, SHOW_SECS_MIN,
+  isWheelTiming,
+  // ✏️ Step-editor envelope: per-field bounds surfaced as native input hints,
+  // and the validated single-field patch helper the change handler routes
+  // through (refuse-and-snap-back, same as the pacing/charge editors).
+  MAX_COORD_ABS, MAX_SAY_LEN, MAX_WAIT_SECS,
+  patchScriptStep,
+  type WheelTiming,
+} from './robotScript';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
@@ -1907,12 +1931,44 @@ export interface RobotDockUIDeps {
   itemId: string;
   /** Owner gate — only the room owner may program the robot. */
   canEdit: () => boolean;
+  /** 🔋 #77 charge slice: live CHARGE reading for THIS dock's robot. Returns
+   *  null when there's no robot for this dock yet (mid-reconcile / dockless
+   *  room). Polled every frame from the console's update() so the pill stays
+   *  in sync without a full re-render (which would blow away input focus). */
+  getCharge?: () => ChargeReading | null;
 }
 
 /** HTML-attribute escape for owner-authored 'say' text (rendered in the editor
  *  on every client's owner view — never trust the value even from a peer). */
 function escAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+/** 🔋 #77 charge slice: HTML for the owner-visible CHARGE pill — a percent
+ *  read-out plus a status badge (⚡ CHARGING / ✅ FULL / 🔻 LOW / 🔋 DRAINING).
+ *  Rendered on every frame from the poolWaiter's tracker.reading() so the
+ *  console stays in sync without a full re-render. Returns a placeholder line
+ *  when the world has no robot for this dock yet (mid-reconcile / dockless). */
+function renderChargePill(r: ChargeReading | null): string {
+  if (!r) {
+    return `<span style="font-size:11px; color:${CH_DIM};">No robot bound to this dock.</span>`;
+  }
+  // Colour + label pick — LOW wins over CHARGING (the "urgent" state), FULL
+  // over CHARGING (nothing to add), otherwise the docked/undocked derived flag.
+  let colour: string;
+  let label: string;
+  if (r.low) {
+    colour = '#FF8A50'; label = '🔻 LOW';
+  } else if (r.full) {
+    colour = '#2fe6a0'; label = '✅ FULL';
+  } else if (r.charging) {
+    colour = '#2fe6a0'; label = '⚡ CHARGING';
+  } else {
+    colour = CH_GOLD; label = '🔋 DRAINING';
+  }
+  return `
+    <span style="font-size:22px; font-weight:800; color:${colour}; letter-spacing:1px;">${r.percent}%</span>
+    <span style="font-size:11px; font-weight:800; color:${colour}; letter-spacing:0.5px;">${label}</span>`;
 }
 
 /**
@@ -1926,10 +1982,50 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
 
+  /** Write a partial patch, preserving every field the console isn't editing.
+   *  Every UI event routes through here so a toggle in one section doesn't
+   *  silently drop the setting a different section wrote (routine change would
+   *  otherwise clobber a scripted wheelTiming). Uses `in` (not `??`) so an
+   *  explicit `false`/`0`/`""` in the patch WINS over the stored value — the
+   *  STOP/START toggle needs `parked: false` to actually unpark. */
+  const writePatch = (patch: Partial<RobotConfig>): void => {
+    const c = readRobotConfig(deps.itemId);
+    const routine: RobotRoutine =
+      'routine' in patch && patch.routine ? patch.routine : c?.routine ?? 'serve';
+    const script = 'script' in patch ? patch.script : c?.script;
+    const parked = 'parked' in patch ? patch.parked : c?.parked;
+    const wheelTiming = 'wheelTiming' in patch ? patch.wheelTiming : c?.wheelTiming;
+    // 🔋 #77 charge slice: preserve chargeParams the way wheelTiming is —
+    // an unrelated edit never clobbers the owner-tuned battery envelope.
+    const chargeParams = 'chargeParams' in patch ? patch.chargeParams : c?.chargeParams;
+    writeRobotConfig(deps.itemId, {
+      routine,
+      ...(script && script.length ? { script } : {}),
+      ...(parked ? { parked: true } : {}),
+      ...(wheelTiming ? { wheelTiming } : {}),
+      ...(chargeParams ? { chargeParams } : {}),
+    });
+  };
   const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
-    writeRobotConfig(deps.itemId, { routine, script });
+    writePatch({ routine, script });
   };
   const curScript = (): RobotStep[] => readRobotConfig(deps.itemId)?.script ?? [];
+  /** The current wheelTiming, or the module defaults expressed in seconds so
+   *  the inputs always show something meaningful (owner hasn't tuned yet). */
+  const curTiming = (): WheelTiming => {
+    const t = readRobotConfig(deps.itemId)?.wheelTiming;
+    return isWheelTiming(t)
+      ? t
+      : { betSecs: 18, closingSecs: 3, showSecs: 9 };
+  };
+  /** 🔋 #77 charge slice: current ChargeParams, or the module defaults if the
+   *  owner hasn't tuned yet — the editor always shows something meaningful,
+   *  and a valid stored value passes isChargeParams even after a hostile write
+   *  attempt drops it. */
+  const curChargeParams = (): ChargeParams => {
+    const p = readRobotConfig(deps.itemId)?.chargeParams;
+    return isChargeParams(p) ? p : { ...DEFAULT_CHARGE_PARAMS };
+  };
 
   const render = (): void => {
     if (!panel) return;
@@ -1948,21 +2044,32 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         cursor:${owner ? 'pointer' : 'default'};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
-    const inp = (idx: number, field: string, val: string, w: string, type = 'text'): string =>
-      `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${owner ? '' : 'disabled'} style="
+    // ✏️ `extra` carries per-field native constraint attributes (min/max/
+    // maxlength) so the browser hints the same envelope patchScriptStep
+    // enforces — the authoritative gate stays the validator, not the DOM.
+    const inp = (idx: number, field: string, val: string, w: string, type = 'text', extra = ''): string =>
+      `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${extra} ${owner ? '' : 'disabled'} style="
         width:${w}; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
         border-radius:4px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:3px 5px;">`;
     const stepRow = (step: RobotStep, idx: number): string => {
       const del = owner
         ? `<button data-del="${idx}" title="Remove" style="margin-left:auto; background:none; border:none; color:#FF8A80; font-size:14px; cursor:pointer;">×</button>`
         : '';
+      // Native hints mirror the isRobotStep envelope: coords ±MAX_COORD_ABS
+      // (fractional allowed → step="any"), wait 0..MAX_WAIT_SECS, say text
+      // capped at MAX_SAY_LEN code units.
+      const coordAttrs = `min="-${MAX_COORD_ABS}" max="${MAX_COORD_ABS}" step="any"`;
       let body: string;
       if (step.kind === 'goto') {
-        body = `🚶 GO TO ${inp(idx, 'x', String(step.x), '46px', 'number')} , ${inp(idx, 'z', String(step.z), '46px', 'number')}`;
+        body = `🚶 GO TO ${inp(idx, 'x', String(step.x), '46px', 'number', coordAttrs)} , ${inp(idx, 'z', String(step.z), '46px', 'number', coordAttrs)}`;
       } else if (step.kind === 'say') {
-        body = `💬 SAY ${inp(idx, 'text', escAttr(step.text), '150px')}`;
+        body = `💬 SAY ${inp(idx, 'text', escAttr(step.text), '150px', 'text', `maxlength="${MAX_SAY_LEN}"`)}`;
+      } else if (step.kind === 'wait') {
+        body = `⏱ WAIT ${inp(idx, 'secs', String(step.secs), '46px', 'number', `min="0" max="${MAX_WAIT_SECS}" step="any"`)} s`;
       } else {
-        body = `⏱ WAIT ${inp(idx, 'secs', String(step.secs), '46px', 'number')} s`;
+        // 🔋 #77 charge slice: DOCK step carries no payload — the render binding
+        // resolves the dock target. No editable fields; just a labelled row.
+        body = `🔋 DOCK · walk to the charging dock`;
       }
       return `<div style="display:flex; align-items:center; gap:6px; font-size:10px; color:${CH_GOLD};">${body}${del}</div>`;
     };
@@ -1993,6 +2100,55 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
       cursor:pointer;
     "><span>${voiceOn ? '🔊 VOICE ON' : '🔇 VOICE OFF'}</span><span style="font-size:9px; color:rgba(212,168,75,0.5);">this device</span></button>`;
+    // 🎰⏱️ #77C: wheelTiming editor — only visible under the 'croupier'
+    // routine (where these seconds actually govern the wheel's rhythm). Three
+    // number inputs, each bounded by the module constants so a hostile paste
+    // is rejected before it commits.
+    const timing = curTiming();
+    const timingInp = (field: keyof WheelTiming, min: number, max: number): string =>
+      `<input data-timing="${field}" type="number" min="${min}" max="${max}" step="1" value="${timing[field]}" ${owner ? '' : 'disabled'} style="
+        width:54px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
+        border-radius:4px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:3px 5px;">`;
+    const timingRow = (label: string, field: keyof WheelTiming, min: number, max: number, hint: string): string =>
+      `<div style="display:flex; align-items:center; gap:8px; font-size:10px; color:${CH_GOLD};">
+        <span style="width:96px;">${label}</span>
+        ${timingInp(field, min, max)} <span style="font-size:9px; color:${CH_DIM};">s · ${hint}</span>
+      </div>`;
+    const timingEditor =
+      current === 'croupier'
+        ? `
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">WHEEL PACING</div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        ${timingRow('Betting window', 'betSecs', BET_SECS_MIN, BET_SECS_MAX, `${BET_SECS_MIN}–${BET_SECS_MAX}`)}
+        ${timingRow('Closing beat', 'closingSecs', CLOSING_SECS_MIN, CLOSING_SECS_MAX, `${CLOSING_SECS_MIN}–${CLOSING_SECS_MAX}`)}
+        ${timingRow('Result show', 'showSecs', SHOW_SECS_MIN, SHOW_SECS_MAX, `${SHOW_SECS_MIN}–${SHOW_SECS_MAX}`)}
+      </div>`
+        : '';
+    // 🔋 #77 charge slice: CHARGE ENVELOPE editor. Owner-tuneable rate params
+    // (discharge/charge seconds + low threshold), each bounded by the module
+    // constants — a value outside the envelope is refused before commit so a
+    // console typo (or a hostile paste) never poisons the tracker. Visible on
+    // every routine (charge applies whatever the bot is doing).
+    const chargeParams = curChargeParams();
+    const chargeParamInp = (field: keyof ChargeParams, min: number, max: number): string =>
+      `<input data-charge-param="${field}" type="number" min="${min}" max="${max}" step="1" value="${chargeParams[field]}" ${owner ? '' : 'disabled'} style="
+        width:54px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
+        border-radius:4px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:3px 5px;">`;
+    const chargeParamRow = (label: string, field: keyof ChargeParams, min: number, max: number, unit: string): string =>
+      `<div style="display:flex; align-items:center; gap:8px; font-size:10px; color:${CH_GOLD};">
+        <span style="width:96px;">${label}</span>
+        ${chargeParamInp(field, min, max)} <span style="font-size:9px; color:${CH_DIM};">${unit} · ${min}–${max}</span>
+      </div>`;
+    const chargeEditor = `
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">CHARGE</div>
+      <div id="ssf-charge-pill" style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 10px; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.28); border-radius:6px;">
+        ${renderChargePill(deps.getCharge?.() ?? null)}
+      </div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        ${chargeParamRow('Discharge', 'dischargeSecs', DISCHARGE_SECS_MIN, DISCHARGE_SECS_MAX, 's')}
+        ${chargeParamRow('Charge', 'chargeSecs', CHARGE_SECS_MIN, CHARGE_SECS_MAX, 's')}
+        ${chargeParamRow('Low at', 'lowPercent', LOW_PERCENT_MIN, LOW_PERCENT_MAX, '%')}
+      </div>`;
     const editor =
       current === 'custom'
         ? `
@@ -2002,10 +2158,10 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       </div>
       ${owner
           ? script.length < MAX_SCRIPT_STEPS
-            ? `<div style="display:flex; gap:6px;">${addBtn('goto', '+ Go to')}${addBtn('say', '+ Say')}${addBtn('wait', '+ Wait')}</div>`
+            ? `<div style="display:flex; gap:6px;">${addBtn('goto', '+ Go to')}${addBtn('say', '+ Say')}${addBtn('wait', '+ Wait')}${addBtn('dock', '+ Dock')}</div>`
             : `<span style="font-size:9px; color:#4A5560;">Max ${MAX_SCRIPT_STEPS} steps.</span>`
           : ''}`
-        : '';
+        : timingEditor;
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🤖 ROBOT PROGRAM</span>
@@ -2018,6 +2174,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       </div>
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
       ${voiceBtn}
+      ${chargeEditor}
       ${editor}
       <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
         ${owner
@@ -2036,35 +2193,58 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       render();
     });
     if (!owner) return;
-    // 🤖 STOP/START: toggle parked, preserving routine + script.
+    // 🤖 STOP/START: toggle parked. writePatch preserves routine, script AND
+    // any owner-authored wheelTiming so the park toggle never clobbers them.
+    // Pass the boolean directly — writePatch honours `false` (unpark) via the
+    // `in` check, so a toggle-off cleanly drops the field on write.
     panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
       const c = readRobotConfig(deps.itemId);
-      writeRobotConfig(deps.itemId, {
-        routine: c?.routine ?? 'serve',
-        ...(c?.script?.length ? { script: c.script } : {}),
-        parked: !(c?.parked === true),
-      });
+      writePatch({ parked: !(c?.parked === true) });
     });
     panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
       b.addEventListener('click', () => {
-        // Keep any authored script AND the parked state when switching routines.
-        const c = readRobotConfig(deps.itemId);
-        writeRobotConfig(deps.itemId, {
-          routine: b.dataset.routine as RobotRoutine,
-          ...(script.length ? { script } : {}),
-          ...(c?.parked ? { parked: true } : {}),
-        });
+        writePatch({ routine: b.dataset.routine as RobotRoutine });
+      });
+    });
+    // 🎰⏱️ #77C: three number inputs bound to the wheelTiming fields (only
+    // rendered when the routine is 'croupier'). Each change validates through
+    // isWheelTiming before it commits — a nonsense value stays local, so the
+    // synced doc always holds a safely-bounded triple.
+    panel.querySelectorAll<HTMLInputElement>('[data-timing]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const field = el.dataset.timing as keyof WheelTiming;
+        const cur = curTiming();
+        const next: WheelTiming = { ...cur, [field]: Number(el.value) };
+        if (isWheelTiming(next)) writePatch({ wheelTiming: next });
+        else render(); // reset the input back to the accepted value
+      });
+    });
+    // 🔋 #77 charge slice: three number inputs bound to the chargeParams fields.
+    // isChargeParams validates the WHOLE triple (envelope bounds), matching the
+    // wheelTiming discipline — a nonsense value stays local and the render call
+    // resets the input back to the accepted stored value.
+    panel.querySelectorAll<HTMLInputElement>('[data-charge-param]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const field = el.dataset.chargeParam as keyof ChargeParams;
+        const cur = curChargeParams();
+        const next: ChargeParams = { ...cur, [field]: Number(el.value) };
+        if (isChargeParams(next)) writePatch({ chargeParams: next });
+        else render();
       });
     });
     panel.querySelectorAll<HTMLButtonElement>('[data-add]').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.add;
+        // 🔋 #77 charge slice: 'dock' composes with the rest of the loop —
+        // walk home to the robot's own dock, then run the next step.
         const step: RobotStep =
           kind === 'goto'
             ? { kind: 'goto', x: 0, z: 0 }
             : kind === 'say'
               ? { kind: 'say', text: 'Hello!' }
-              : { kind: 'wait', secs: 2 };
+              : kind === 'dock'
+                ? { kind: 'dock' }
+                : { kind: 'wait', secs: 2 };
         writeScript('custom', [...curScript(), step].slice(0, MAX_SCRIPT_STEPS));
       });
     });
@@ -2074,16 +2254,18 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         writeScript('custom', curScript().filter((_, n) => n !== i));
       });
     });
+    // ✏️ Per-step edits validate through patchScriptStep BEFORE the doc write —
+    // the same refuse-and-snap-back gate the wheel-pacing ([data-timing]) and
+    // charge-envelope ([data-charge-param]) editors use. An out-of-envelope
+    // value (coord past ±MAX_COORD_ABS, empty SAY text, WAIT past
+    // MAX_WAIT_SECS) stays local and render() resets the input; the raw write
+    // it replaces would have made isRobotConfig refuse the WHOLE config on
+    // every client (routine, script, pacing and charge envelope all reverting).
     panel.querySelectorAll<HTMLInputElement>('[data-idx]').forEach((el) => {
       el.addEventListener('change', () => {
-        const i = Number(el.dataset.idx);
-        const f = el.dataset.f!;
-        const script2 = curScript().map((s, n) => {
-          if (n !== i) return s;
-          if (f === 'text') return { ...s, text: el.value };
-          return { ...s, [f]: Number(el.value) };
-        });
-        writeScript('custom', script2 as RobotStep[]);
+        const next = patchScriptStep(curScript(), Number(el.dataset.idx), el.dataset.f!, el.value);
+        if (next) writeScript('custom', next);
+        else render();
       });
     });
   };
@@ -2113,7 +2295,14 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       panel = null;
     },
     update(): void {
-      /* observer-driven; nothing per-frame */
+      // 🔋 #77 charge slice: refresh the CHARGE pill each frame from the
+      // world's per-robot tracker. Rewrites only the pill's innerHTML — no
+      // full render, so input focus / cursor position survive. Cheap: reading
+      // is an integer round + three booleans.
+      if (!panel || !deps.getCharge) return;
+      const pill = panel.querySelector<HTMLElement>('#ssf-charge-pill');
+      if (!pill) return;
+      pill.innerHTML = renderChargePill(deps.getCharge());
     },
   };
 }
