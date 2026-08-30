@@ -50,9 +50,10 @@ import type {
   SlotFundingConfig,
 } from './games/slots';
 import {
-  isValidChipTransferEntry, MAX_CHIP_TRANSFERS,
+  isValidChipTransferEntry, verifyChipTransfer,
+  MAX_CHIP_TRANSFERS,
 } from './casinoTransfers';
-import type { ChipTransfer } from './casinoTransfers';
+import type { ChipTransfer, VerifyIdentityFn } from './casinoTransfers';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -159,9 +160,9 @@ export function readChips(playerId: string): number {
 }
 
 /** Lifetime chips issued to a player by the cage (buy-ins). Public getter for
- *  the transfer-audit-log's over-drain rule — the deterministic replay needs
- *  `bought − cashed` per sender to score whether a claimed transfer fits
- *  their honest budget. */
+ *  the transfer-audit-log's ledger replay — `bought − cashed` per player is the
+ *  FIRST-TOUCH seed of that player's running spendable balance, which the
+ *  replay then debits as they send and credits as they receive. */
 export function readBought(playerId: string): number {
   return readCount(`bought:${playerId}`);
 }
@@ -266,21 +267,48 @@ export function readCageLedger(): CageLedger {
 
 /**
  * Write a signed chip transfer AND move the physical chips in one atomic
- * transact. Returns true on success, false when:
+ * transact. `verify` is the injected Ed25519 check (the app wires
+ * keypair.verifyIdentity; tests pass a stub) — kept as a parameter so this
+ * module imports no @noble. Returns true on success, false when:
+ *   - the record fails its shape / entry guard, or its signature does not
+ *     verify under `fromPub` (local hygiene — never write a row we could not
+ *     ourselves prove genuine; the read seam re-verifies every row anyway)
  *   - the sender's current `bal:<from_pid>` is < transfer.amount (over-drain
  *     refusal — do not proceed even client-side)
  *   - the xfer key already exists (double-send guard — id is deterministic
  *     so an honest resend collides, and we do not overwrite the audit log)
  *   - the recipient's next balance would not be a safe integer (bounds
  *     defence — the ledger stays inside Number.MAX_SAFE_INTEGER)
- *   - the transfer map is at MAX_CHIP_TRANSFERS (flood defence — a hostile
- *     peer can still write directly, but honest sends respect the bound)
+ *   - the room's audit log already holds MAX_CHIP_TRANSFERS signature-verified
+ *     rows (capacity / flood cap — see below)
+ *
+ * Flood defence counts only rows a hostile peer cannot mint: entry-valid AND
+ * signature-verified (forging one needs a real identity key). The earlier count
+ * included UNVERIFIED rows, so 512 junk `xfer:` rows planted directly on the
+ * Yjs map (which needs no key) refused every honest send in the room forever;
+ * counting only verified rows closes that denial-of-service. The cap is GLOBAL
+ * — the same MAX_CHIP_TRANSFERS the read seam materializes — on purpose: honest
+ * rows are held at the very number readAllChipTransfers returns, so the ledger
+ * replay never sees a truncated history (a per-sender cap would let N senders
+ * push the honest total past the read window and silently drop real transfers
+ * from the running-balance computation — a correctness bug, not a capacity one).
+ * Signature verification is the costly step, and a hostile peer CAN plant
+ * unlimited entry-valid junk rows (ids are derivable by anyone), so the verify
+ * ATTEMPTS are bounded at MAX_CHIP_TRANSFERS and we FAIL OPEN (allow the send)
+ * if that budget is exhausted before MAX_CHIP_TRANSFERS verified rows are
+ * counted — refusing there would hand the flooder back the very denial-of-
+ * service this removes (junk rows do not verify, so they never raise the count
+ * that matters; they can only burn the attempt budget, which fails open). The
+ * cap is app-path send hygiene, not a money-safety invariant: Yjs has no write
+ * ACL, so a hostile peer bypasses this function entirely; the enforceable truth
+ * is the balance transact below plus the read-seam sig-verify + ledger replay
+ * (see casinoTransfers.partitionValidTransfers).
  *
  * The caller (main.ts BANK) MUST also refuse to send to a BLOCKED recipient
  * BEFORE calling this function; the block-list decision belongs at the UI
  * seam (blockedSet is local, per-viewer) not in this shared engine.
  */
-export function writeChipTransfer(transfer: ChipTransfer): boolean {
+export function writeChipTransfer(transfer: ChipTransfer, verify: VerifyIdentityFn): boolean {
   // Own writes always shape-check locally — the entry guard on read is defence
   // against hostile peers, not a substitute for local hygiene. The engine's
   // entry guard asserts KEY === value.id (that's its hijack-defence contract),
@@ -288,25 +316,44 @@ export function writeChipTransfer(transfer: ChipTransfer): boolean {
   // wire with an `xfer:` prefix so the casino Y.Map keeps its namespacing;
   // the wrap is bijective — see readAllChipTransfers for the unwrap).
   if (!isValidChipTransferEntry(transfer.id, transfer)) return false;
+  // Never plant a row whose signature we cannot ourselves verify under fromPub
+  // — the read seam drops such a row anyway, so writing it only pollutes the
+  // audit log. (Local hygiene, the write-side twin of the read-side verify.)
+  if (!verifyChipTransfer(transfer, verify)) return false;
   const map = ensureMap();
   const fromKey = `bal:${transfer.fromPlayerId}`;
   const toKey = `bal:${transfer.toPlayerId}`;
   const xferKey = `xfer:${transfer.id}`;
-  // Bounds + collision + over-drain + flood — every check BEFORE the transact
-  // so a rejected send never leaves a half-write.
+  // Bounds + collision + over-drain — every check BEFORE the transact so a
+  // rejected send never leaves a half-write.
   if (map.has(xferKey)) return false;
   const fromBal = readCount(fromKey);
   if (fromBal < transfer.amount) return false;
   const toBal = readCount(toKey);
   const nextTo = toBal + transfer.amount;
   if (!Number.isSafeInteger(nextTo)) return false;
-  // Count current xfer:* rows (cheap: one pass over the map keys — the room
-  // doc is small in this phase). The bound stops a runaway UI from spamming
-  // the doc; a hostile peer can still write, and the read side re-verifies.
-  let currentCount = 0;
-  for (const key of map.keys()) {
-    if (key.startsWith('xfer:')) currentCount += 1;
-    if (currentCount >= MAX_CHIP_TRANSFERS) return false;
+  // Global capacity / flood cap, counted ONLY over rows a hostile peer cannot
+  // mint: entry-valid AND signature-verified. A flood of junk or forged rows
+  // therefore never raises the count — unlike the old count over ALL `xfer:*`
+  // rows, which a hostile peer inflated to 512 with keyless direct writes to
+  // lock every honest send in the room. The cap is the SAME MAX_CHIP_TRANSFERS
+  // the read seam materializes, so honest rows never outgrow the replay's
+  // window (a per-sender cap would let the honest total exceed it and truncate
+  // real history — see the docstring). Verify ATTEMPTS are bounded at
+  // MAX_CHIP_TRANSFERS and we FAIL OPEN if that budget is exhausted before the
+  // cap is reached (refusing there would restore the DoS this removes; junk
+  // rows fail verify, so they only burn attempts, never the verified count).
+  let verified = 0;
+  let attempts = 0;
+  for (const [key, value] of map.entries()) {
+    if (!key.startsWith('xfer:')) continue;
+    const idOnly = key.slice('xfer:'.length);
+    if (!isValidChipTransferEntry(idOnly, value)) continue;
+    attempts += 1;
+    if (attempts > MAX_CHIP_TRANSFERS) break; // bounded work; fail open
+    if (!verifyChipTransfer(value, verify)) continue;
+    verified += 1;
+    if (verified >= MAX_CHIP_TRANSFERS) return false;
   }
   boundDoc!.transact(() => {
     map.set(fromKey, fromBal - transfer.amount);

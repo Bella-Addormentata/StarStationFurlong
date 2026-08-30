@@ -21,7 +21,7 @@
  *     record cannot crash BANK repaint.
  *   - **Entry guard**       `isValidChipTransferEntry(key, value)` — chains
  *     the value guard AND requires the map KEY to equal `value.id`. Own writes
- *     go through `writeChipTransfer(t)` which uses `map.set(t.id, t)` so the
+ *     go through `writeChipTransfer(t, verify)` which uses `map.set(t.id, t)` so the
  *     invariant always holds locally; the guard closes the same hijack window
  *     the group-chat lane closed (mismatched key ⇒ downstream lookups miss ⇒
  *     silent misroute).
@@ -29,14 +29,20 @@
  *     over the canonical bytes (domain-tagged `ssf-chip-xfer:v1`). Verify is
  *     INJECTED so this module stays pure (no @noble import in the engine —
  *     the test file supplies a stub, the app wires `verifyIdentity`).
- *   - **Deterministic over-drain rule** `partitionValidTransfers` — replays
- *     the sorted transfers ((ts asc, id asc)) and refuses any whose sender's
- *     LIFETIME OUTGOING would exceed their sender-side issuance (`bought −
- *     cashed`). Both sides derive the same partition, so a hostile write that
- *     tries to mint phantom chips (by claiming Alice sent more than she was
- *     ever issued) is dropped by every reader without coordination. The rule
- *     is CONSERVATIVE (does not credit received transfers back into a
- *     sender's outgoing budget) — it is the audit-log's floor of honesty.
+ *   - **Deterministic ledger-replay rule** `partitionValidTransfers` — replays
+ *     the sorted transfers ((ts asc, id asc)) maintaining a per-player running
+ *     SPENDABLE balance: each player's balance is seeded ON FIRST TOUCH at
+ *     their sender-side issuance (`max(0, bought − cashed)`), then every valid
+ *     transfer DEBITS the sender and CREDITS the recipient — so chips a player
+ *     RECEIVED become spendable onward, exactly as the physical `bal:<pid>`
+ *     ledger already permits at write time (writeChipTransfer checks the live
+ *     balance, not lifetime issuance). A transfer whose amount exceeds the
+ *     sender's running balance is REFUSED. Both sides derive the same
+ *     partition, and because callers sig-verify EVERY row before this replay
+ *     (a forged row can never enter), every credit corresponds to a
+ *     genuinely-signed debit — phantom-mint is impossible: total spendable
+ *     chips never exceed total honest cage issuance (Σ running balances =
+ *     Σ first-touch budgets, invariant at every step).
  *
  * The `writeChipTransfer` path (in casinoDoc.ts) mutates `bal:<from_pid>`
  * DOWN and `bal:<to_pid>` UP inside ONE Yjs transact so the physical chip
@@ -74,11 +80,31 @@ const ID_DOMAIN = 'ssf-chip-xfer-id:v1';
  *  be repurposed as a different transfer). */
 const SIG_DOMAIN = 'ssf-chip-xfer:v1';
 
-/** Hard cap on the transfer map on the doc so a hostile peer flooding
- *  records cannot balloon the room doc's disk / observer fan-out without
- *  bound. Sized to well over any realistic room's activity — a room with
- *  hundreds of transfers per hour still stays inside this budget. Bounded
- *  the same way MAX_GROUP_CHATS bounds the group-chat map. */
+/** Cap on the number of SIGNATURE-VERIFIED transfer rows a room's audit log
+ *  holds — the single bound shared by BOTH seams, and deliberately the same
+ *  number at each so the ledger replay stays exact:
+ *
+ *    • writeChipTransfer refuses a new send once this many VERIFIED rows
+ *      already exist. It counts only rows a hostile peer cannot mint —
+ *      entry-valid AND signature-verified (forging one needs a real identity
+ *      key) — so a keyless junk flood cannot trip the cap. The earlier count
+ *      included UNVERIFIED rows, so 512 junk `xfer:` rows planted straight onto
+ *      the Yjs map (which needs no key) locked every honest send in the room;
+ *      counting only verified rows closes that denial-of-service.
+ *
+ *    • readAllChipTransfers stops materializing rows past this (the replay /
+ *      render fan-out bound).
+ *
+ *  Capping HONEST rows at the very number the reader materializes is what keeps
+ *  partitionValidTransfers' running-balance replay exact: honest history can
+ *  never outgrow the read window, so a genuine transfer is never silently
+ *  dropped from the balance computation (a per-sender cap would let N senders
+ *  push the total past the window and truncate real history — a correctness
+ *  bug, not just a capacity one). It is a hygiene / capacity bound, NOT a
+ *  money-safety invariant: Yjs has no write ACL, so a hostile peer still writes
+ *  what it likes; the enforceable truth is the balance transact plus the
+ *  read-seam sig-verify + replay. Sized well over any realistic room (hundreds
+ *  of transfers per hour still fit), the way MAX_GROUP_CHATS bounds its map. */
 export const MAX_CHIP_TRANSFERS = 512;
 
 /** Cap on the sender-supplied nonce length. The nonce only needs to be
@@ -133,10 +159,12 @@ export interface ChipTransfer {
 }
 
 /**
- * Per-player issuance from the cage ledger — the read side of the
- * over-drain rule. `bought - cashed` is the sender's LIFETIME chip
- * throughput from the cage; a valid transfer cannot claim more than that.
- * Keyed by fromPlayerId (the players-map key the ledger uses).
+ * Per-player issuance from the cage ledger — the SEED for the ledger-replay
+ * rule. `max(0, bought − cashed)` is the player's FIRST-TOUCH spendable
+ * balance (their lifetime cage throughput); the replay then debits/credits
+ * that balance as transfers move chips, so a player's spendable total also
+ * grows with whatever they RECEIVE. Looked up by playerId (the players-map
+ * key the ledger uses) for every sender AND recipient in the replayed set.
  */
 export interface SenderIssuance {
   /** Total chips ever bought at the cage. */
@@ -311,54 +339,81 @@ export function compareTransfersForReplay(a: ChipTransfer, b: ChipTransfer): num
 
 /**
  * Partition the transfers into (valid, refused) by replaying them in
- * deterministic order and enforcing the over-drain rule:
+ * deterministic order as a FULL LEDGER — received chips are spendable:
  *
- *   For each sender pub, the CUMULATIVE outgoing amount up to and including
- *   the current transfer must not exceed their sender-side issuance
- *   (`bought − cashed` at the moment we compute). A transfer that would push
- *   the running total over the budget is REFUSED.
+ *   Each player has a running SPENDABLE balance, seeded ON FIRST TOUCH at
+ *   `max(0, bought − cashed)` (their sender-side cage issuance). Replaying in
+ *   (ts asc, id asc) order, every valid transfer DEBITS the sender's running
+ *   balance by `amount` and CREDITS the recipient's by the same. A transfer is
+ *   REFUSED when its `amount` exceeds the sender's CURRENT running balance, or
+ *   when crediting the recipient would leave the safe-integer range (a bounds
+ *   guard so a hostile-but-signed chain cannot drive a running balance past
+ *   Number.MAX_SAFE_INTEGER and corrupt the arithmetic).
  *
- * Deliberately CONSERVATIVE: the rule does NOT credit a sender's incoming
- * transfers into their outgoing budget. This means Alice can send at most
- * her lifetime cage issuance, ever, no matter how much she has received. The
- * trade-off is a smaller class of "hostile-mint" attacks the reader silently
- * accepts: a hostile peer that forges a valid-looking transfer FROM someone
- * cannot claim more than that someone's honest cage throughput. The stricter
- * "run a full ledger simulation" is a later slice — this rule ships the
- * safety property the task calls out (readers refuse over-draining so
- * hostile writes cannot mint) with no room for a rounding surprise.
+ * This mirrors the physical settlement writeChipTransfer already performs (it
+ * debits/credits the real `bal:<pid>` keys, checking the LIVE balance — not
+ * lifetime issuance — at write time). Aligning the read-side replay to that
+ * closes a divergence in the shipped slice: a player could physically spend
+ * chips they RECEIVED (the write succeeds, `Σ bal:*` conserved) yet see that
+ * onward transfer REFUSED and hidden from the audit view on every peer.
+ *
+ * No-mint proof: callers MUST sig-verify every record BEFORE partitioning
+ * (see main.ts bankReadValidTransfers — verifyChipTransfer filters first), so
+ * every row here is genuinely signed by its `fromPub`. A forged row never
+ * enters; an attacker cannot credit themselves without a signed debit from a
+ * real balance. `Σ running balances = Σ first-touch budgets` holds at every
+ * step (each transfer only MOVES `amount` between two running balances), so
+ * the total spendable is bounded by total honest cage issuance — received
+ * chips circulate but are never multiplied.
  *
  * Callers pass:
  *  - `transfers`  — every shape+sig-verified record they want to display
- *  - `issuanceOf` — `fromPlayerId → {bought, cashed}` for every sender pid
- *                   that appears in `transfers`; missing pids get 0/0 (so a
- *                   record from a sender the reader never saw issue chips is
- *                   refused — the correct fail-closed answer)
+ *  - `issuanceOf` — `playerId → {bought, cashed}` for every pid that appears
+ *                   as a SENDER or RECIPIENT in `transfers`; missing pids get
+ *                   0/0 (fail-closed: a sender the reader never saw issue
+ *                   chips first-touches at a zero budget, so their transfers
+ *                   are refused until they legitimately RECEIVE some)
  *
- * Missing entries default to a ZERO budget (the sender's transfers are ALL
- * refused). This is the deterministic fail-closed answer under an offline /
- * partial-doc read: if we cannot prove the sender had a budget, we do not
- * grant one on their say-so.
+ * Missing / partial-doc reads stay fail-closed: an unknown pid first-touches
+ * at a ZERO budget, so a sender whose cage `bought:` record has not yet synced
+ * is refused rather than trusted — the deterministic safe answer.
  */
 export function partitionValidTransfers(
   transfers: readonly ChipTransfer[],
-  issuanceOf: (fromPlayerId: string) => SenderIssuance,
+  issuanceOf: (playerId: string) => SenderIssuance,
 ): PartitionedTransfers {
   const sorted = [...transfers].sort(compareTransfersForReplay);
-  const sentSoFar = new Map<string, number>(); // fromPlayerId → cumulative outgoing
+  // playerId → running spendable chips. Seeded lazily on first touch so a pid
+  // that only ever RECEIVES still starts from its own cage issuance (0 for a
+  // pure recipient) — never from an implicit unbounded balance.
+  const balance = new Map<string, number>();
+  const touch = (pid: string): number => {
+    let b = balance.get(pid);
+    if (b === undefined) {
+      const iss = issuanceOf(pid);
+      b = Math.max(0, iss.bought - iss.cashed);
+      balance.set(pid, b);
+    }
+    return b;
+  };
   const valid: ChipTransfer[] = [];
   const refused: ChipTransfer[] = [];
   for (const t of sorted) {
-    const already = sentSoFar.get(t.fromPlayerId) ?? 0;
-    const budget = Math.max(0, issuanceOf(t.fromPlayerId).bought
-      - issuanceOf(t.fromPlayerId).cashed);
-    const next = already + t.amount;
-    if (next > budget) {
+    // fromPlayerId !== toPlayerId is guaranteed by isChipTransfer (self-
+    // transfers are rejected on read), so touching both never aliases one
+    // running balance — the debit and credit target distinct entries.
+    const from = touch(t.fromPlayerId);
+    const nextTo = touch(t.toPlayerId) + t.amount;
+    // Over-drain (amount beyond the sender's CURRENT balance) or an out-of-
+    // range credit (bounds guard) is refused — the running arithmetic stays
+    // exact and identical on every peer.
+    if (t.amount > from || !Number.isSafeInteger(nextTo)) {
       refused.push(t);
       continue;
     }
+    balance.set(t.fromPlayerId, from - t.amount);
+    balance.set(t.toPlayerId, nextTo);
     valid.push(t);
-    sentSoFar.set(t.fromPlayerId, next);
   }
   return { valid, refused };
 }

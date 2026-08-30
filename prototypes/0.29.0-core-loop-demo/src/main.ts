@@ -66,9 +66,11 @@ import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 // 💸 In-world chip transfers (issue #20 BANK send/receive slice). Every
 // transfer runs through the pure engine: build → shape/sig guards →
-// deterministic over-drain rule → block-list filter. The engine takes the
-// signature and verify functions as parameters so it stays crypto-free; the
-// app wires signIdentity / verifyIdentity here at the seam.
+// deterministic ledger-replay rule (received chips become spendable, so a
+// re-send of them is honoured; a phantom over-drain is refused) → block-list
+// filter. The engine takes the signature and verify functions as parameters so
+// it stays crypto-free; the app wires signIdentity / verifyIdentity here at the
+// seam.
 import {
   buildChipTransfer,
   filterIncoming,
@@ -3175,7 +3177,11 @@ function bankReadValidTransfers(): ChipTransfer[] {
   // without holding the fromPub's identity key. Wrapping verifyIdentity here
   // matches the pure engine's injected VerifyIdentityFn shape.
   const signed = all.filter((t) => verifyChipTransfer(t, verifyIdentity));
-  // Over-drain refusal: fold in per-sender issuance from the cage keys.
+  // Ledger-replay seed: per-PLAYER cage issuance (bought − cashed) looked up
+  // for every sender AND recipient. partitionValidTransfers first-touches each
+  // pid at this budget, then debits/credits as it replays — so received chips
+  // become spendable and an over-drain (amount past the running balance) is
+  // refused identically on every peer.
   const issuanceOf = (pid: string): SenderIssuance => ({
     bought: readBought(pid),
     cashed: readCashed(pid),
@@ -3426,11 +3432,14 @@ function executeBankSend(): "armed" | "sent" | "refused" {
     return "refused";
   }
   // Write to the doc — refuses on residual over-drain (a concurrent spend
-  // burned the balance between the arm and the send), on collision (dedup
-  // of an already-written transfer), or on the flood cap.
-  const ok = writeChipTransfer(transfer);
+  // burned the balance between the arm and the send), on collision (dedup of
+  // an already-written transfer), on a bad own-signature, or on the room's
+  // capacity / flood cap. verifyIdentity is the seam's Ed25519 check:
+  // writeChipTransfer proves our own row genuine and counts the cap over
+  // signature-verified rows only, so a keyless junk flood can never trip it.
+  const ok = writeChipTransfer(transfer, verifyIdentity);
   if (!ok) {
-    bankSendNote = "Send refused — either your chips just moved, or the room is full of transfers. Try again.";
+    bankSendNote = "Send refused — either your chips just moved, or you've hit the per-room send limit. Try again in a moment.";
     bankSendConfirmArmed = false;
     return "refused";
   }

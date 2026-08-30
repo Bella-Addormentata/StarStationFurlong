@@ -1,9 +1,11 @@
 // casinoTransfers.ts unit tests: id derivation is deterministic across peers,
 // the shape/entry guards refuse hostile writes, signature verification is
-// bound tightly to the record's canonical bytes, the deterministic over-drain
-// rule refuses phantom mints, the block-list filter hides incoming from
-// blocked BUT the visible count still reflects the physical credit, and the
-// factory returns records that round-trip through every guard.
+// bound tightly to the record's canonical bytes, the deterministic ledger-
+// replay rule makes received chips spendable while still refusing phantom
+// mints (over-drain, time-travel, out-of-range credit), the block-list filter
+// hides incoming from blocked BUT the visible count still reflects the
+// physical credit, and the factory returns records that round-trip through
+// every guard.
 //
 // Pure engine ⇒ no Yjs, no @noble import at test time. Signatures are stubbed
 // with a deterministic HMAC-ish concatenation so the test file has no crypto
@@ -477,11 +479,12 @@ describe('chip transfers · conservation of chips', () => {
     expect(sum).toBe(0);
   });
 
-  it('does not credit received transfers back into a sender budget (conservative rule)', () => {
+  it('credits received transfers into the recipient running balance (received chips are spendable)', () => {
     // Alice's budget = 500. Bob's budget = 0 (bought 0). Alice → Bob 500 is
-    // VALID. Bob → Carol 100 must be REFUSED — Bob's own budget is 0, even
-    // though he received 500 (this documents the conservative rule from the
-    // module header).
+    // VALID; Bob → Carol 100 is now ALSO VALID — Bob received 500, so his
+    // running spendable balance is 500 and a 100 re-send is honest. This is
+    // the ledger-replay rule: received chips move on, exactly as the physical
+    // writeChipTransfer already lets them (it debits/credits the live bal:*).
     const issuanceMap: Record<string, SenderIssuance> = {
       [ALICE_PID]: { bought: 500, cashed: 0 },
       [BOB_PID]: { bought: 0, cashed: 0 },
@@ -495,8 +498,74 @@ describe('chip transfers · conservation of chips', () => {
       amount: 100, nonce: 'y', ts: 2, sign: stubSignFor(BOB),
     }));
     const { valid, refused } = partitionValidTransfers([aliceToBob, bobToCarol], issuanceOf);
+    expect(valid.map((t) => t.id)).toEqual([aliceToBob.id, bobToCarol.id]);
+    expect(refused).toEqual([]);
+  });
+
+  it('still refuses an over-drain beyond the running balance, without corrupting it', () => {
+    // Alice → Bob 500 (Bob's running balance becomes 500). Bob → Carol 600 is
+    // REFUSED (only 500 spendable). A later Bob → Carol 400 is VALID — the
+    // refused row left the running balance untouched, so Bob still has 500.
+    const issuanceMap: Record<string, SenderIssuance> = {
+      [ALICE_PID]: { bought: 500, cashed: 0 },
+    };
+    const issuanceOf = (pid: string): SenderIssuance => issuanceMap[pid] ?? { bought: 0, cashed: 0 };
+    const aliceToBob = buildChipTransfer(baseInput({ amount: 500, nonce: 'x', ts: 1 }));
+    const bobOverDrain = buildChipTransfer(baseInput({
+      fromPub: BOB, fromPlayerId: BOB_PID,
+      toPub: CAROL, toPlayerId: CAROL_PID,
+      amount: 600, nonce: 'y', ts: 2, sign: stubSignFor(BOB),
+    }));
+    const bobWithin = buildChipTransfer(baseInput({
+      fromPub: BOB, fromPlayerId: BOB_PID,
+      toPub: CAROL, toPlayerId: CAROL_PID,
+      amount: 400, nonce: 'z', ts: 3, sign: stubSignFor(BOB),
+    }));
+    const { valid, refused } = partitionValidTransfers(
+      [aliceToBob, bobOverDrain, bobWithin], issuanceOf,
+    );
+    expect(valid.map((t) => t.id)).toEqual([aliceToBob.id, bobWithin.id]);
+    expect(refused.map((t) => t.id)).toEqual([bobOverDrain.id]);
+  });
+
+  it('replays in (ts, id) order so a spend cannot draw on chips received later (no time travel)', () => {
+    // Bob spends 100 at ts=1 — BEFORE Alice funds him at ts=2. Replay is by
+    // timestamp, not array order, so the ts=1 spend sees Bob's budget of 0 and
+    // is REFUSED; the ts=2 credit lands after. Received chips are spendable,
+    // but only once actually received — no retroactive mint.
+    const issuanceMap: Record<string, SenderIssuance> = {
+      [ALICE_PID]: { bought: 500, cashed: 0 },
+    };
+    const issuanceOf = (pid: string): SenderIssuance => issuanceMap[pid] ?? { bought: 0, cashed: 0 };
+    const aliceToBob = buildChipTransfer(baseInput({ amount: 500, nonce: 'x', ts: 2 }));
+    const bobEarlySpend = buildChipTransfer(baseInput({
+      fromPub: BOB, fromPlayerId: BOB_PID,
+      toPub: CAROL, toPlayerId: CAROL_PID,
+      amount: 100, nonce: 'y', ts: 1, sign: stubSignFor(BOB),
+    }));
+    // Pass in reverse-of-time order to prove the partition sorts, not trusts.
+    const { valid, refused } = partitionValidTransfers([aliceToBob, bobEarlySpend], issuanceOf);
     expect(valid.map((t) => t.id)).toEqual([aliceToBob.id]);
-    expect(refused.map((t) => t.id)).toEqual([bobToCarol.id]);
+    expect(refused.map((t) => t.id)).toEqual([bobEarlySpend.id]);
+  });
+
+  it('refuses a credit that would push the recipient balance past MAX_SAFE_INTEGER (bounds guard)', () => {
+    // Carol is (absurdly) seeded at the top of the safe-integer range. Any
+    // further credit would leave that range and corrupt the running
+    // arithmetic, so the transfer is REFUSED even though the sender can afford
+    // it — the bounds guard keeps every peer's replay exact and identical.
+    const issuanceMap: Record<string, SenderIssuance> = {
+      [ALICE_PID]: { bought: 500, cashed: 0 },
+      [CAROL_PID]: { bought: Number.MAX_SAFE_INTEGER, cashed: 0 },
+    };
+    const issuanceOf = (pid: string): SenderIssuance => issuanceMap[pid] ?? { bought: 0, cashed: 0 };
+    const aliceToCarol = buildChipTransfer(baseInput({
+      toPub: CAROL, toPlayerId: CAROL_PID,
+      amount: 100, nonce: 'x', ts: 1,
+    }));
+    const { valid, refused } = partitionValidTransfers([aliceToCarol], issuanceOf);
+    expect(valid).toEqual([]);
+    expect(refused.map((t) => t.id)).toEqual([aliceToCarol.id]);
   });
 });
 
