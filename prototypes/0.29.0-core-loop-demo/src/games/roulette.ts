@@ -13,6 +13,15 @@
  * returns 0 — the chips are already gone.
  */
 
+// 🔒 #69 G5 house commit-reveal: the croupier COMMITS to a secret seed BEFORE
+// bets close (publishing SHA-256(seed || tableId || round) on the round record)
+// and REVEALS the seed at settle. Every client re-derives the pocket from the
+// revealed seed and refuses to render the round FAIR unless commit and derivation
+// both check out. See games/fairness.ts — this file only carries the proof shape
+// on the table state and shape-guards it against peer forgery.
+import type { FairnessProof } from './fairness';
+import { isFairnessProof } from './fairness';
+
 /** Numbers that pay RED (standard wheel). Everything 1–36 not here is black. */
 export const RED_NUMBERS = new Set([
   1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36,
@@ -59,6 +68,16 @@ export interface RouletteTableState {
    *  countdown is display-only). Absent ⇒ a manual/idle table with no timer,
    *  so legacy and un-driven tables validate and behave exactly as before. */
   phaseDeadline?: number;
+  /** 🔒 #69 G5 house commit-reveal PROOF for THIS round. Populated with only a
+   *  COMMIT (SHA-256 of the seed || tableId || round) when the round opens; the
+   *  matching REVEAL (the seed hex) is stamped on at settle. A settled round
+   *  with commit+reveal is verifiable by every client via verifyRoulette. Absent
+   *  ⇒ a LEGACY round (opened before G5 rolled out on this table, or on a
+   *  legacy fallback path) — the UI labels it plainly instead of claiming
+   *  either FAIR or UNVERIFIED. Peer-planted junk in this field is refused by
+   *  the isRouletteTableState guard below (fail SAFE: the doc-write is dropped
+   *  and the next operator write re-establishes truth). */
+  fairness?: FairnessProof;
 }
 
 export function initialRouletteState(): RouletteTableState {
@@ -94,7 +113,12 @@ export function isRouletteTableState(value: unknown): value is RouletteTableStat
     && typeof s.resultAt === 'number'
     && (s.payouts === null || typeof s.payouts === 'object')
     && (s.phaseDeadline === undefined
-        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
+        || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)))
+    // 🔒 #69 G5: trust boundary — a hostile peer that plants a malformed
+    // fairness object here would freeze the verifier (bad hex, missing commit,
+    // etc.). Fail SAFE and drop the whole state so the operator's next write
+    // repairs. `undefined` remains fine — that's the legacy posture.
+    && (s.fairness === undefined || isFairnessProof(s.fairness));
 }
 
 /** Layout column of a number (0/1/2 = bottom/middle/top row of the classic

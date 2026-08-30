@@ -25,6 +25,21 @@
  *   - A standing bet with no decision credits 0 and keep=true.
  */
 
+// 🔒 #69 G5 house commit-reveal: the stickman COMMITS to a secret seed BEFORE
+// bets close (publishing SHA-256(seed || tableId || round) on the round record)
+// and REVEALS the seed at settle. Every client re-derives the two dice from
+// the revealed seed and refuses to render the roll FAIR unless commit and
+// derivation both check out. See games/fairness.ts — this file only carries
+// the proof shape on the table state and shape-guards it against peer forgery.
+// The G5 pre-commit sits ORTHOGONAL to the existing dev-phase FairnessTranscript
+// (rng / commit-reveal / multiparty / block-beacon) that lives on `.fairness`:
+// G5 is the ALWAYS-ON operator pre-commit, `.fairness` is the multi-mode
+// transcript. Both fields coexist on legacy fallback rolls; on the G5 happy
+// path the transcript is deliberately OMITTED (its dice would not match a
+// G5-derived pair and would misread as tampering).
+import type { FairnessProof } from './fairness';
+import { isFairnessProof } from './fairness';
+
 /** The six point numbers (a come-out roll of one of these sets the point). */
 export const POINT_NUMBERS = new Set([4, 5, 6, 8, 9, 10]);
 
@@ -93,6 +108,15 @@ export interface CrapsTableState {
   /** 🎲🔒 How this roll's dice were produced + its verifiable transcript (absent
    *  for 'rng'). Settled rolls only; lets any client re-derive and check the dice. */
   fairness?: FairnessTranscript;
+  /** 🔒 #69 G5 house commit-reveal PROOF for THIS roll. Populated with only a
+   *  COMMIT (SHA-256 of the seed || tableId || round) when the round opens; the
+   *  matching REVEAL (the seed hex) is stamped on at settle. A settled roll
+   *  with commit+reveal is verifiable by every client via verifyCraps. Absent
+   *  ⇒ a LEGACY round (opened before G5 rolled out on this table, or on a
+   *  legacy fallback path) — the UI labels it plainly instead of claiming
+   *  either FAIR or UNVERIFIED. Peer-planted junk here is refused by the
+   *  isCrapsTableState guard below (fail SAFE). */
+  houseFairness?: FairnessProof;
   /** 🤖 auto-stickman: absolute operator-clock ms at which THIS phase advances
    *  (the operator's Date.now() is the reference; everyone else's countdown is
    *  display-only). Absent ⇒ a manual/idle table with no timer. */
@@ -212,6 +236,11 @@ export function isCrapsTableState(value: unknown): value is CrapsTableState {
     ))
     && (s.sevenOut === undefined || typeof s.sevenOut === 'boolean')
     && (s.fairness === undefined || isFairnessTranscript(s.fairness))
+    // 🔒 #69 G5: trust boundary — a hostile peer that plants a malformed
+    // houseFairness object would freeze the verifier. Fail SAFE and drop the
+    // whole state so the operator's next write repairs. `undefined` remains
+    // fine — that's the legacy posture.
+    && (s.houseFairness === undefined || isFairnessProof(s.houseFairness))
     && (s.phaseDeadline === undefined
         || (typeof s.phaseDeadline === 'number' && Number.isFinite(s.phaseDeadline)));
 }

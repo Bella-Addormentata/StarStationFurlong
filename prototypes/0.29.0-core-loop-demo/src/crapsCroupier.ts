@@ -21,9 +21,15 @@
  * the settle, disjoint from the players' betting window (documented v1; the G4
  * Registry chips + a claim lane close it for real).
  *
- * NO SHARED CLOCK, FAIRNESS = dev-phase trust — same as croupier.ts: the
- * operator's Date.now() drives the deadlines and its client throws the dice; the
- * G5 commit-reveal upgrade slots in around resolveCrapsRound untouched.
+ * NO SHARED CLOCK. FAIRNESS (#69 G5 — DONE): the stickman publishes a SHA-256
+ * commitment to a secret seed at OPEN, before bets close, and reveals it at
+ * settle alongside the dice. Every client re-derives the dice from the seed
+ * and refuses to render the roll FAIR unless commit and derivation both check
+ * out — see games/fairness.ts and the `houseFairness` field on CrapsTableState.
+ * The multi-mode transcript (fairness.mode + commits/seeds) still coexists on
+ * settled state for the dev-phase modes it selects; the G5 proof is the
+ * ALWAYS-ON pre-commit that upgrades every dev-phase mode to
+ * "operator can't rewrite the outcome after seeing the felt".
  */
 
 import { canRunCroupier } from './croupier';
@@ -38,6 +44,8 @@ import type { CrapsTableState } from './games/craps';
 // 🎲🔗 #69 G5 seam: the roll+settle is pluggable — local (crypto RNG + room-doc
 // chips, default) or an optional Chia gaming backend. See crapsBackend.ts.
 import { selectCrapsBackend } from './crapsBackend';
+// 🔒 #69 G5 house commit-reveal: pre-commit-at-open + tear-down-cleanup.
+import { clearFairnessForTable, prepareRoundFairness } from './games/fairness';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet come-out table never throws to an empty felt). */
@@ -93,19 +101,63 @@ export function rollAndSettleCraps(
     .finally(() => settling.delete(tableId));
 }
 
-/** Open a fresh betting window carrying the point forward (idle — no timer until
- *  a bet, or a standing bet, arms it). */
-export function openCrapsBetting(tableId: string, round: number, point: number | null): void {
-  writeCrapsTableState(tableId, {
-    kind: 'craps',
-    phase: 'betting',
-    round,
-    point,
-    dice: null,
-    result: null,
-    resultAt: 0,
-    payouts: null,
-  });
+/** Rounds mid-open — the async G5 prepare+write pair takes a couple of ms and
+ *  the operator's tick fires openCrapsBetting every frame while the state is
+ *  still the previous phase. Skip re-entrant calls until the write lands. */
+const opening = new Set<string>();
+
+function openingKey(tableId: string, round: number): string {
+  return `${tableId}\0${round}`;
+}
+
+/** Open a fresh betting window carrying the point forward (idle — no timer
+ *  until a bet, or a standing bet, arms it), publishing the G5 house
+ *  commit-reveal COMMITMENT before any bet lands. Fire-and-forget: the sync
+ *  tick calls this on every frame, and the `opening` guard makes redundant
+ *  calls a no-op until the prepare+write pair completes. On a fairness error
+ *  the round still opens (LEGACY posture: never freeze the felt on a proof
+ *  edge case) — it just renders LEGACY. */
+export function openCrapsBetting(
+  tableId: string,
+  round: number,
+  point: number | null,
+): void {
+  const key = openingKey(tableId, round);
+  if (opening.has(key)) return;
+  opening.add(key);
+  void (async () => {
+    try {
+      const { proof } = await prepareRoundFairness('craps', tableId, round);
+      writeCrapsTableState(tableId, {
+        kind: 'craps',
+        phase: 'betting',
+        round,
+        point,
+        dice: null,
+        result: null,
+        resultAt: 0,
+        payouts: null,
+        houseFairness: proof,
+      });
+    } catch (err) {
+      // Fall through to a legacy open — better than freezing the felt on a
+      // fairness edge case. The resulting round will render LEGACY.
+      // eslint-disable-next-line no-console
+      console.warn('[craps] openCrapsBetting fairness failed:', err);
+      writeCrapsTableState(tableId, {
+        kind: 'craps',
+        phase: 'betting',
+        round,
+        point,
+        dice: null,
+        result: null,
+        resultAt: 0,
+        payouts: null,
+      });
+    } finally {
+      opening.delete(key);
+    }
+  })();
 }
 
 /** Any chips on the felt (fresh bets OR standing pass/place from prior rolls)? */
@@ -164,6 +216,9 @@ export function closeCrapsTable(tableId: string): void {
       if (staked > 0) creditChips(pid, staked);
     }
   }
+  // G5: drop any operator-held seeds for this table so a removed table leaves
+  // no secrets behind (same discipline as croupier.closeTable).
+  clearFairnessForTable(tableId);
   clearTableKeys(tableId);
 }
 

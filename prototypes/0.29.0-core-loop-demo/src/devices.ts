@@ -81,6 +81,15 @@ import {
   FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript,
 } from './games/diceFairness';
 import type { FairnessMode } from './games/craps';
+// 🔒 #69 G5 house commit-reveal — the pre-committed-seed proof that lives on
+// EVERY settled round (roulette + craps): every client re-derives the outcome
+// from the revealed seed and refuses to render it FAIR unless commit and
+// derivation both check out. See games/fairness.ts. This is orthogonal to
+// diceFairness above — the G5 proof is an ALWAYS-ON pre-commit that upgrades
+// every dev-phase dice-fairness mode to "operator can't rewrite after seeing
+// the felt"; the two badges show side by side.
+import { verifyCraps, verifyRoulette } from './games/fairness';
+import type { FairnessVerdict } from './games/fairness';
 import {
   WHEEL_ORDER, pocketColor,
 } from './games/roulette';
@@ -2209,6 +2218,11 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
   let animT: number | null = null;
   /** One-shot notice line (e.g. "not enough chips"), cleared on next render. */
   let flash = '';
+  /** 🔒 #69 G5: round → verdict cache. verifyRoulette is async (SHA-256 via
+   *  SubtleCrypto), so each re-render stamps the badge from the cache and only
+   *  hashes once per round. Keyed on round to survive the panel.innerHTML
+   *  rebuild render does; capped so old rounds never leak. */
+  const g5Verdicts = new Map<number, FairnessVerdict>();
   const myId = getPlayerId();
   const regions = rouletteBoardRegions();
 
@@ -2515,9 +2529,13 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
             : btn('rl-spin', '🎡 SPIN', spinning, 'Close betting and spin the wheel'))
           : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !spinning ? 'WAITING FOR THE CROUPIER TO OPEN THE NEXT ROUND' : 'THE HOUSE SPINS WHEN BETS ARE DOWN'}</span>`}
       </div>
+      ${p === 'settled' && !spinning ? (s?.fairness
+        ? `<div id="rl-fair-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔒 house pre-commit · checking the seal…</div>`
+        : `<div id="rl-fair-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔓 legacy round — no house pre-commit for this spin</div>`) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
         SINGLE-ZERO WHEEL · straight pays 35:1 · dozens &amp; columns 2:1 · red/black odd/even 1–18/19–36 1:1
-        · house-banked, the croupier's spin settles the round · fair-spin upgrade coming
+        · house-banked, the croupier's spin settles the round
+        · the croupier pre-commits a secret seed BEFORE bets close and reveals it at settle; every client re-derives the pocket and refuses to render the round FAIR unless commit and derivation both check out
         · chips are physical at the table — count them; the CASHIER's screen shows the number
       </div>
     `;
@@ -2531,6 +2549,59 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
     wheelCanvas = panel.querySelector<HTMLCanvasElement>('#rl-wheel');
     boardCanvas = panel.querySelector<HTMLCanvasElement>('#rl-board');
     boardCanvas?.addEventListener('click', onBoardClick);
+    // 🔒 #69 G5: verify the house pre-commit + derived pocket for the settled
+    // round, and stamp the badge in plain language. verifyRoulette is async
+    // (SubtleCrypto SHA-256), so we cache the verdict per round and re-query
+    // the LIVE badge inside the stamp (render() rebuilds panel.innerHTML —
+    // capturing the node before the await would stamp a detached element).
+    // A slow promise from round N is also gated by re-checking the current
+    // round before writing, so a late verdict never lands on round N+1.
+    if (p === 'settled' && !spinning && s?.fairness && s.result != null) {
+      const proof = s.fairness;
+      const resultAtIssue = s.result;
+      const forRound = s.round;
+      const stampG5 = (verdict: FairnessVerdict): void => {
+        if (!panel || round() !== forRound) return;
+        const badge = panel.querySelector<HTMLDivElement>('#rl-fair-badge');
+        if (!badge) return;
+        // Plain-language stamps — the audit calls for a labelled verdict, not a
+        // colour-coded checkbox. 'fair' means commit-hash matched AND the derived
+        // pocket matched the published one. 'unverified' covers every failure
+        // mode (seed doesn't hash to commit, derived pocket disagrees, malformed
+        // proof) — deliberately conservative so a hostile operator cannot get a
+        // green stamp by faking either half. 'legacy' surfaces a proof that
+        // never carried a reveal (committed at open but the settle path took
+        // the legacy fallback — the badge already said LEGACY before the
+        // async verify started, so we just leave the initial dim label).
+        if (verdict === 'fair') {
+          badge.textContent = '🔒 fair spin — house pre-commit verified & pocket derives from the revealed seed';
+          badge.style.color = '#7CF5B0';
+        } else if (verdict === 'unverified') {
+          badge.textContent = '⚠ UNVERIFIED — the revealed seed does not produce this pocket (or the commit does not match). Do not trust this round.';
+          badge.style.color = '#FF8A80';
+        } else {
+          badge.textContent = '🔓 legacy round — house committed a seed but no reveal was published';
+          badge.style.color = GT_DIM;
+        }
+      };
+      const cached = g5Verdicts.get(forRound);
+      if (cached !== undefined) {
+        stampG5(cached);
+      } else {
+        // verifyRoulette never throws — it degrades to 'unverified' on any
+        // crypto-layer failure. The .catch here is belt+braces so a rejected
+        // promise from a future refactor still stamps a conservative badge.
+        verifyRoulette(proof, deps.itemId, forRound, resultAtIssue).then((verdict) => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, verdict);
+          stampG5(verdict);
+        }).catch(() => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, 'unverified');
+          stampG5('unverified');
+        });
+      }
+    }
     flash = '';
     drawWheelForNow();
     drawBoard();
@@ -3219,6 +3290,11 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
   /** round → transcript verdict, so re-renders stamp the badge from cache
    *  instead of re-hashing the whole transcript every time (#87 review). */
   const verifiedVerdicts = new Map<number, boolean>();
+  /** 🔒 #69 G5: round → house-commit-reveal verdict cache — SEPARATE from
+   *  verifiedVerdicts above. This one is the pre-committed-seed proof (always
+   *  on when opened by a G5 croupier); the other is the multi-mode dice
+   *  fairness transcript. Both badges show side by side when present. */
+  const g5Verdicts = new Map<number, FairnessVerdict>();
   const myId = getPlayerId();
   const regions = crapsBoardRegions();
 
@@ -3636,13 +3712,17 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
       <div id="cr-fair-badge" style="font-size:9px; color:#7CF5B0; letter-spacing:1px;">
         🔒 provably fair · ${(s.fairness.mode as string).toUpperCase()}${s.fairness.simulated ? ' (dev-simulated)' : ''} · verifying…
       </div>` : ''}
+      ${p === 'settled' && !rolling ? (s?.houseFairness
+        ? `<div id="cr-g5-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔒 house pre-commit · checking the seal…</div>`
+        : `<div id="cr-g5-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔓 legacy round — no house pre-commit for this roll</div>`) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
         BANK CRAPS · pass/don't-pass 1:1 (come-out only) · come/don't-come 1:1 (point ON — a "personal pass line")
         · pass ODDS true odds (4/10 2:1, 5/9 3:2, 6/8 6:5) · don't pass LAY reciprocal
         · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6 · any 7 4:1 · any craps 7:1
         · place bets ride until a 7, the pass line rides its point, come bets travel to their come point
         · house 3x/4x/5x odds cap (4/10 · 5/9 · 6/8) · house-banked, the stickman's throw settles the roll
-        · fair-dice upgrade coming · chips are physical at the table — count them; the CASHIER's screen shows the number
+        · the stickman pre-commits a secret seed BEFORE bets close and reveals it at settle; every client re-derives the dice and refuses to render the roll FAIR unless commit and derivation both check out
+        · chips are physical at the table — count them; the CASHIER's screen shows the number
       </div>
     `;
     panel.querySelectorAll<HTMLButtonElement>('[data-denom]').forEach((b) => {
@@ -3686,6 +3766,46 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
           if (verifiedVerdicts.size > 32) verifiedVerdicts.clear(); // old rounds never re-render
           verifiedVerdicts.set(forRound, ok);
           stamp(ok);
+        });
+      }
+    }
+    // 🔒 #69 G5: verify the house pre-commit + derived dice for the settled
+    // roll. Separate cache from the multi-mode dice transcript above — this is
+    // the ALWAYS-ON pre-commit that stops the operator rewriting the roll
+    // AFTER seeing the felt. Same live-node re-query + round-guard shape as
+    // the roulette verifier (render() rebuilds panel.innerHTML on every doc
+    // tick; a slow promise from round N must never stamp N+1's badge).
+    if (p === 'settled' && !rolling && s?.houseFairness && s.dice) {
+      const proof = s.houseFairness;
+      const diceAtIssue: [number, number] = [s.dice[0], s.dice[1]];
+      const forRound = s.round;
+      const stampG5 = (verdict: FairnessVerdict): void => {
+        if (!panel || round() !== forRound) return;
+        const badge = panel.querySelector<HTMLDivElement>('#cr-g5-badge');
+        if (!badge) return;
+        if (verdict === 'fair') {
+          badge.textContent = '🔒 fair roll — house pre-commit verified & dice derive from the revealed seed';
+          badge.style.color = '#7CF5B0';
+        } else if (verdict === 'unverified') {
+          badge.textContent = '⚠ UNVERIFIED — the revealed seed does not produce these dice (or the commit does not match). Do not trust this roll.';
+          badge.style.color = '#FF8A80';
+        } else {
+          badge.textContent = '🔓 legacy roll — house committed a seed but no reveal was published';
+          badge.style.color = GT_DIM;
+        }
+      };
+      const cached = g5Verdicts.get(forRound);
+      if (cached !== undefined) {
+        stampG5(cached);
+      } else {
+        verifyCraps(proof, deps.itemId, forRound, diceAtIssue).then((verdict) => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, verdict);
+          stampG5(verdict);
+        }).catch(() => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, 'unverified');
+          stampG5('unverified');
         });
       }
     }
