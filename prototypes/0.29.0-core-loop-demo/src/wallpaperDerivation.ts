@@ -36,9 +36,11 @@ import type { WallpaperPresetId } from './wallpaper';
  * The retired freestanding wall furniture kinds this module knows how to map
  * to hull wallpaper. Both used brown brick as the base look (0x8a4a3a):
  *  - `brick-wall`  — solid brick slab, 4 m wide, replaced a side wall.
- *  - `window-wall` — brick-framed glazing on the same 4 m footprint; the glass
- *    hole is now covered by the octagon's own windowLayoutDoc + hole cutter,
- *    so only the brick FRAME needs to survive as a covering.
+ *  - `window-wall` — brick-framed glazing on the same 4 m footprint. Only the
+ *    brick FRAME survives as a covering: the GLAZING IS NOT DERIVED — this
+ *    module writes no window records, so an upgraded room shows solid brick
+ *    where the glass used to be until the owner re-adds panes with the
+ *    octagon's own window editor (windowLayoutDoc + hole cutter).
  *
  * `casino-gold-wall` is DELIBERATELY NOT in this set: it is a decorative
  * furniture item ATTACHED to the wall (mount:"exterior-wall") — the current
@@ -92,11 +94,14 @@ const PRESET_FOR_LEGACY_KIND: Readonly<Record<string, WallpaperPresetId>> = {
 
 /**
  * How close to the room edge a segment had to sit to count as "covering" that
- * wall. The retired `world.updateSideWallCoverage` (pre-df26789) treated a
- * segment at `|x| > 5` in a 6 m-half room as covering the side wall — a 1 m
- * threshold. We use `narrowHalf - EDGE_MARGIN` so the same rule stays
- * proportional if the room resizes; a segment deep in the middle of the room
- * (e.g. an owner staging pieces on the floor) is correctly ignored.
+ * wall. MODELED ON the retired `world.updateSideWallCoverage` (pre-df26789),
+ * which treated a segment at `|x| > 5` in a 6 m-half room as covering the
+ * side wall — a 1 m margin, STRICT comparison, always measured on X. This
+ * derivation deliberately WIDENS that band to 1.5 m INCLUSIVE
+ * (`narrowHalf - EDGE_MARGIN`, compared with >=): a legacy segment nudged
+ * slightly off flush still repairs, and the band stays proportional if the
+ * room resizes. A segment deep in the middle of the room (e.g. an owner
+ * staging pieces on the floor) is still correctly ignored.
  */
 export const EDGE_MARGIN = 1.5;
 
