@@ -196,17 +196,70 @@ The DOM UI walks the placements, calls `projectModuleFootprintCorners` for
 each, and paints an oriented outline onto the second `<canvas>`. All coordinate
 math lives in pure functions with tests; the UI code is a thin adapter.
 
-### Stage B — Desk computer
+### Stage B — Desk computer [SHIPPED]
 
-New `desk-computer` (2×1 obstacle, monitor + keyboard, `deskTerminal` device
-kind). Focused UI: everything the wall computer shows PLUS **room-management
-writes** (rename, invite mint / copy, peer list, room-role table). This is the
-"higher-resolution management" seat the issue names — the wall computer stays
-the walk-up glance; the desk is the sit-down-and-work version.
+Shipped as the follow-up to Stage A. New `desk-computer` furniture: 2×1 floor
+obstacle carrying a monitor + keyboard on a slab top, `deskTerminal` capability
+tag, `deskComputer` device kind. Placed by default at world `(2, -3.5)` rot 0
+between the map-table nook and the sofa cluster — the front-point at `(2, -2)`
+lands in the open aisle and the west edge is EDGE-FLUSH with the map-table
+(same wedge-trap-safe-by-construction rule the bunk bed uses).
 
-Anti-scope: no operator diagnostics move here. The HUD network panel keeps its
-diagnostics drawer — that is a developer tool that lives on the frame, not in
-the world; the ruling is about the game's fiction, not devtools.
+The focused DOM UI (`devices.ts createDeskComputerUI`) is a **two-column**
+gold-frame panel: the LEFT column mirrors the wall computer's read surface
+verbatim (room name / peer count / node & P2P dots; the top-down module
+wireframe; the small-station overview from Stage A; EDIT ROOM / EDIT HULL;
+`FUEL — NO SENSOR FITTED`; adjacent-module line), and the RIGHT column adds
+the **room-management writes** the issue calls for:
+
+- **Rename** — 24-char cap (same cap the network panel enforces via
+  `input.maxLength = 24`), owner-gated at write time, pure sanitiser
+  (`deskComputerManagement.sanitizeRoomName`) shared with the provider.
+- **Invite mint / copy** — button calls the same `mintBootstrapLink` helper
+  the network panel and Copy Invite already use; the returned link runs
+  through the pure `isValidInviteLink` guard (accepts `ssf://room?seed=…`
+  and `http(s)://…?seed=…`; rejects `javascript:` / `data:` / `file:` and
+  any URL lacking a non-empty `seed`) before it is echoed / copied.
+- **Access mode selector** — PUBLIC / PASS / KEYED radios, LWW-normalised
+  through `deskComputerManagement.normalizeAccessMode` (any unknown value
+  collapses to `pass`, matching `main.ts §5476 getRoomAccessMode`), and the
+  description text word-for-word matches the ACCESS app's `ACCESS_MODE_COPY`.
+- **Peer roster** — three-column table (PEER · ROLE · KEY) painted from a
+  pure `orderedRoster` helper: sorted by `joinedAt` ascending (matches the
+  phone's CLONES SEEN grain), OWNER pill on the row whose id matches
+  `roomInfo.owner`, `(you)` suffix on the local row, `🔑` badge on rows
+  that publish a name↔key self-cert. Malformed peer entries render as
+  `? MALFORMED` — honest partial-knowledge label rather than a silent drop.
+
+Discipline (same as Stage A):
+
+- **Pure math in `deskComputerManagement.ts`** with 30 vitest cases (name
+  sanitisation, access-mode normalisation, ACCESS_MODES ordering, roster
+  ordering including malformed / joinedAt-missing / owner-tie / stable-sort
+  cases, invite-link guard including `javascript:` / missing-seed rejection,
+  ownership-label decoration). No DOM / no globals / no `window` / no
+  `localStorage` — the module is exercised without a browser.
+- **DOM adapter is a thin painter.** `devices.ts createDeskComputerUI`
+  composes provider data with pure helpers and paints; every write echoes
+  the provider's `{ok} | {ok:false, reason}` verdict inline.
+- **Provider seam.** `deskComputerProvider.ts` exports a module-scoped
+  slot (`setRoomManagementProvider` / `getRoomManagementProvider`) — the
+  same setter-once idiom `editMode.setRoomEditPermission` uses. `main.ts`
+  registers the live implementation at init (reading owner / roomInfo /
+  players from `yjsSync.doc`, delegating mint to `mintBootstrapLink`);
+  `world.ts` consumes the provider when building the desk-computer's
+  deps. A missing provider (minimal test harness, early boot) ⇒ the
+  management column HIDES and the desk terminal degrades to the wall
+  computer's read view.
+- **No new network traffic.** The desk pane reads live doc state; writes
+  land through the same `yjsSync.doc.transact` seams the network panel
+  uses. The mint path reuses the existing fingerprint / WebTransport
+  bootstrap flow — same code path the ACCESS app relies on today.
+
+Anti-scope (as originally called): no operator diagnostics move here. The HUD
+network panel keeps its diagnostics drawer — that is a developer tool that
+lives on the frame, not in the world; the ruling is about the game's fiction,
+not devtools.
 
 ### Stage C — Map table: **STATION** page
 
@@ -257,7 +310,7 @@ saying no sensor is fitted.
 | Galaxy / universe      |               |                |                  |                      |      | **E** (holograph)   |
 | Edit room / hull       | ✓             | ✓             |                  |                      |      |                     |
 | Fuel / ship systems    |               |                |                  |                      | **F**|                     |
-| Manage room / peers    |               | **B**          |                  |                      |      |                     |
+| Manage room / peers    |               | ✓ (Stage B)     |                  |                      |      |                     |
 
 Bold cells name the stage that lands each surface. Every non-bold cell is
 either already shipped or a graceful redundancy (e.g. the desk computer will
