@@ -81,10 +81,16 @@ import {
   reapOrphanPairings,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, readRoomDims } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
+// 🗺️ #33 M-station: the small-station cap governs the wall-computer overview.
+// The traversal must reach at least SMALL_STATION_MAX neighbours so we can
+// tell a 12-module chain from a 13-module one — otherwise a chain longer than
+// the traversal limit would silently classify as small and paint an
+// incomplete overview. See wallComputerMap.ts and PR #133 review.
+import { SMALL_STATION_MAX } from "./wallComputerMap";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -106,6 +112,9 @@ import {
   findDevice,
   rebuildDevices,
   createRoomTerminalUI,
+  // 🖥️ #33 Stage B: sit-down desk terminal (management writes) — the wall
+  //     computer stays the walk-up glance; the desk adds owner-gated writes.
+  createDeskComputerUI,
   createMapTableUI,
   createStorageTrunkUI,
   createGameTableUI,
@@ -120,6 +129,11 @@ import {
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
+// 🖥️ #33 Stage B: live seam into main.ts's session state — the desk-computer
+// UI reaches through it for rename, invite-mint, access-mode, and roster
+// data. `getRoomManagementProvider()` returns `null` before main.ts registers
+// or in minimal test builds; the UI hides the management column in that case.
+import { getRoomManagementProvider } from "./deskComputerProvider";
 import {
   closeSlotMachine,
   stopAutoSlotMachine,
@@ -5077,6 +5091,25 @@ export class World {
           requestHull: () =>
             deviceFocus.releaseThen(() => roomEdit.enter(this, "hull")),
         },
+        // 🗺️ #33 M-station: the STATION OVERVIEW pane. Getters (never a
+        // captured snapshot) so an atlas gossip landing mid-focus shows up on
+        // the pane's next refresh tick. Passes atlasLayout in the CURRENT
+        // room's frame — the same call the exterior composes hulls from.
+        //
+        // 🛰️ maxHops = SMALL_STATION_MAX (12). The atlas walker terminates
+        // when the frontier exceeds `from.hops >= maxHops`, so passing 12
+        // discovers up to 12 neighbours — enough to fill a small station
+        // (current + 11 = 12) AND find the 13th module that flips the pane
+        // into "USE MAP TABLE". Anything below the cap silently truncates a
+        // chain (e.g. the previous 8 dropped the last 3 modules of a 12-module
+        // chain, painting a partial map while advertising the whole overview).
+        station: {
+          getRoomId: () => World.activeRoomId(),
+          getRoomName: () => readLiveRoomStatus().roomName,
+          getRoomDims: () => readRoomDims(),
+          getAtlasPoses: () =>
+            atlasLayout(World.activeRoomId(), SMALL_STATION_MAX),
+        },
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
@@ -5195,7 +5228,47 @@ export class World {
       return;
     }
 
-    // The desk computer UI arrives with M3.
+    if (device.kind === "deskComputer") {
+      // 🖥️ #33 Stage B: sit-down "room management" terminal. Read view is a
+      //     duplicate of the wall-computer surface (module wireframe + station
+      //     overview + fuel/adjacency line + EDIT ROOM/EDIT HULL affordances);
+      //     the extra RIGHT column carries owner-gated writes: rename, invite
+      //     mint / copy, access-mode selector, peer roster.
+      //
+      //     The management provider comes from main.ts via the seam in
+      //     deskComputerProvider.ts (RoomManagementProvider). A null return
+      //     from getRoomManagementProvider() means main.ts has not registered
+      //     yet (early boot, minimal test harness) — createDeskComputerUI
+      //     hides the management column gracefully in that case, so the
+      //     desk-computer stays operational as a read-only terminal.
+      const ui = createDeskComputerUI({
+        dockingSystem: this.dockingSystem,
+        getPlayerPos: () => this.player.getPosition(),
+        // EDIT ROOM / EDIT HULL — same wiring as the wall computer.
+        editRoom: {
+          permission: () => canEditRoom(),
+          request: () => deviceFocus.releaseThen(() => roomEdit.enter(this)),
+          requestHull: () =>
+            deviceFocus.releaseThen(() => roomEdit.enter(this, "hull")),
+        },
+        // Station-overview getters — same wiring as the wall computer.
+        station: {
+          getRoomId: () => World.activeRoomId(),
+          getRoomName: () => readLiveRoomStatus().roomName,
+          getRoomDims: () => readRoomDims(),
+          getAtlasPoses: () =>
+            atlasLayout(World.activeRoomId(), SMALL_STATION_MAX),
+        },
+        // Live seam into main.ts's session state (registered at init via
+        // setRoomManagementProvider). null ⇒ management pane hidden.
+        management: getRoomManagementProvider(),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // Unknown device kinds fall through with an honest note (no new device
+    // ships without a branch above — the roster is closed at compile time).
     showHint("This device is not operational yet.");
   }
 

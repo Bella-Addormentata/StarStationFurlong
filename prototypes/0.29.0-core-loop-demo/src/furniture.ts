@@ -80,6 +80,7 @@ export type FurnitureKind =
   | "birthday-balloons"
   | "birthday-balloons-wall"
   | "wall-computer"
+  | "desk-computer"
   | "map-table"
   | "storage-trunk"
   | "game-table"
@@ -1767,6 +1768,151 @@ const buildWallComputer = (ctx: BuildCtx) => {
   screen.userData.wallScreen = handle; // collected by World.addLobbyFurniture
 };
 
+// ── 🖥️ Desk computer (Stage B of #33 device-maps plan) ────────────────────────
+// A sit-down / lean-in "management" terminal: 2×1 floor obstacle, monitor +
+// keyboard on a slab top. Same visual family as the wall computer (gunmetal
+// housing + amber accent + cyan glass) — the fiction is that the wall unit is
+// the walk-up glance and the desk unit is the desk-work version of the same
+// terminal family.
+//
+// Geometry constraints (per plan §3 "Placement discipline"):
+//  - Footprint 2×1 with local +z as the front face → the seat is on +z.
+//  - Item local origin (0,0,0) sits at the CENTRE of the footprint, so the
+//    monitor is pushed to the back (local −z) side of the slab so nothing
+//    sticks out beyond the AABB.
+//  - Everything visible fits inside the footprint: even the desk-top slab
+//    (1.9 × 0.9) undercuts the 2.0 × 1.0 AABB so the collision box holds
+//    with a small painting inset.
+//  - The screen faces +z (toward the seat) at ~y=1.05, matching the device
+//    def's `anchor` — the deviceFocus camera lands on that face.
+const DC_TOP_Y = 0.72; // desk top surface height (same as helm-console)
+const DC_MON_Y = 1.05; // monitor centre height (matches device anchor.y)
+const DC_MON_Z = -0.28; // monitor pushed toward back of footprint (local −z)
+const DC_KEYS_Z = 0.28; // keyboard pulled toward front of footprint (local +z)
+
+const buildDeskComputer = (ctx: BuildCtx) => {
+  const { m, flat, place } = ctx;
+  // Same palette as the wall computer so the family reads at a glance:
+  const HOUSING = 0x2a3444; // gunmetal slate (wall-computer housing)
+  const BEZEL = 0x3d4a5e; // slate bezel
+  const ACCENT = 0xd4a84b; // amber keypad-gold
+  const WOOD = 0x3b2f24; // dark walnut desk top
+
+  // Desk-top slab (1.9 × 0.05 × 0.9, inset from the 2×1 footprint by 0.05 m
+  // to keep the collision AABB honest under floating-point drift).
+  place(
+    new THREE.BoxGeometry(1.9, 0.05, 0.9),
+    m(WOOD, 0.7, 0.3),
+    0,
+    DC_TOP_Y,
+    0,
+  );
+
+  // Four legs (0.06 × 0.72 × 0.06) at the desk corners.
+  for (const sx of [-0.85, 0.85]) {
+    for (const sz of [-0.4, 0.4]) {
+      place(
+        new THREE.BoxGeometry(0.06, DC_TOP_Y, 0.06),
+        m(0x2a2018, 0.7, 0.4),
+        sx,
+        DC_TOP_Y / 2,
+        sz,
+      );
+    }
+  }
+
+  // Monitor stand: thin vertical post from the desk top up to the housing.
+  place(
+    new THREE.CylinderGeometry(0.025, 0.03, 0.28, 10),
+    m(HOUSING, 0.6, 0.5),
+    0,
+    DC_TOP_Y + 0.14,
+    DC_MON_Z,
+  );
+  // Stand foot: small oval base on the desk top.
+  place(
+    new THREE.BoxGeometry(0.24, 0.02, 0.14),
+    m(HOUSING, 0.6, 0.5),
+    0,
+    DC_TOP_Y + 0.03,
+    DC_MON_Z,
+  );
+
+  // Monitor housing: 0.6 × 0.4 × 0.05 slab, facing +z (toward the seat).
+  place(
+    new THREE.BoxGeometry(0.6, 0.4, 0.05),
+    m(HOUSING, 0.6, 0.5),
+    0,
+    DC_MON_Y,
+    DC_MON_Z - 0.01,
+  );
+  // Front bezel: slightly darker slate lip so the screen reads as inset.
+  place(
+    new THREE.BoxGeometry(0.5, 0.32, 0.02),
+    m(BEZEL, 0.55, 0.45),
+    0,
+    DC_MON_Y,
+    DC_MON_Z + 0.02,
+  );
+  // Amber accent strip along the bottom of the housing (family cue).
+  place(
+    new THREE.BoxGeometry(0.6, 0.03, 0.02),
+    m(ACCENT, 0.4, 0.5),
+    0,
+    DC_MON_Y - 0.2 + 0.015,
+    DC_MON_Z + 0.02,
+  );
+  // Screen: unlit dark cyan plane, same idiom as the wall computer's boot
+  // frame. This is the item's "off" look — the focused DOM UI is the live
+  // face; the item screen is just a hint that the terminal exists.
+  const screen = place(
+    new THREE.PlaneGeometry(0.46, 0.28),
+    flat(0x0a2a3a),
+    0,
+    DC_MON_Y,
+    DC_MON_Z + 0.031,
+  );
+  // Faint cyan glow line at the top of the screen (same idiom as the wall
+  // computer's amber underline — asymmetric so the two read as siblings).
+  place(
+    new THREE.PlaneGeometry(0.42, 0.02),
+    flat(0x00e5ff),
+    0,
+    DC_MON_Y + 0.11,
+    DC_MON_Z + 0.032,
+  );
+  // Silence unused-var; the screen mesh is kept so a later
+  // "management-in-use" hint can hang off userData without a re-fit.
+  screen.userData.deskScreen = true;
+
+  // Keyboard: slim slate tray in front of the monitor stand.
+  place(
+    new THREE.BoxGeometry(0.4, 0.02, 0.14),
+    m(BEZEL, 0.55, 0.5),
+    0,
+    DC_TOP_Y + 0.035,
+    DC_KEYS_Z,
+  );
+  // Amber key row hint on the keyboard front (matches accent family).
+  place(
+    new THREE.BoxGeometry(0.36, 0.005, 0.03),
+    m(ACCENT, 0.4, 0.5),
+    0,
+    DC_TOP_Y + 0.046,
+    DC_KEYS_Z + 0.05,
+  );
+
+  // Small mouse puck to the right of the keyboard (visual cue that this is
+  // an interactive workstation, not just a display).
+  place(
+    new THREE.BoxGeometry(0.06, 0.015, 0.09),
+    m(BEZEL, 0.55, 0.5),
+    0.28,
+    DC_TOP_Y + 0.03,
+    DC_KEYS_Z,
+  );
+};
+
 // ── Map table / holograph table (M4 of #33) ──────────────────────────────────
 // Sturdy dark 2×2 table (4 chunky legs + top) with a holographic disc floating
 // above it: emissive cyan plane + a slow-spinning broken emissive ring (the
@@ -3111,6 +3257,30 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: Math.PI,
       eye: { x: 0, y: 1.45, z: 0.85 },
       anchor: { x: 0, y: 1.62, z: 0.06 },
+    },
+  },
+  // 🖥️ Desk computer (Stage B of #33 — brainstorming/device-maps-plan.md §2):
+  // a 2×1 floor obstacle carrying a monitor + keyboard, tagged `deskTerminal`.
+  // Same read-only pages the wall computer paints, PLUS room-management writes
+  // (rename, invite mint / copy, peer roster, access-mode selector). Front is
+  // on the +z side (`front: {x: 0, z: 1.5}`, faceAngle π — the same TOWARD-the-
+  // device convention wall-computer / map-table / clone-vat use): the walk-up
+  // stand is deliberately 1.5 m off the item edge so the derived cell survives
+  // PLAYER_R (0.38) inflation of the desk's OWN footprint (a 1.0 m front would
+  // fall inside the inflated south edge). Eye above/inside that stand, anchor
+  // at the monitor's screen centre (item back, y ≈ 1.05) — the "sit down and
+  // work" framing, mirroring the map-table's slightly-forward eye pose.
+  "desk-computer": {
+    kind: "desk-computer",
+    build: buildDeskComputer,
+    footprint: { w: 2, d: 1 },
+    functions: ["deskTerminal"],
+    device: {
+      kind: "deskComputer",
+      front: { x: 0, z: 1.5 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.45, z: 1.15 },
+      anchor: { x: 0, y: 1.05, z: -0.25 },
     },
   },
   // Holographic map table (M4 of #33): footprint 2×2 — a REAL obstacle (both
@@ -6402,6 +6572,29 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 0,
     movable: true,
   },
+  // 🖥️ Desk computer (Stage B of #33 — plan §2). Sit-down management terminal
+  // between the map nook and the seat cluster: AABB x[1, 3] z[-4, -3] with
+  // rot 0 so the monitor faces +z (into the lounge) and the seat is on the
+  // south side. The front-point at (2, -2) lands one cell south of the
+  // desk in the open aisle band z∈(-3, -2), clear of sofa-back (z south
+  // edge at z=-1 raw / -0.62 inflated at x∈[-1.88, 1.88]) — x=2 is outside
+  // sofa inflated x-range so the seat approach is a clean north-south walk
+  // from the aisle. West edge (x=1) is EDGE-FLUSH with the map-table's
+  // east edge (x=1), same wedge-trap-safe-by-construction rule the bunk
+  // bed uses on its west face. North edge (z=-4) sits 0.3 m south of the
+  // map-table's south edge (z=-4.3): the residual sliver x∈[1,3] z∈(-4.3,
+  // -4) is a DEAD-END pocket, not a route (fireplace to the north at
+  // z<-5), so the sliver-on-a-route ban doesn't apply. East neighbour is
+  // the bunk-bed at x[4.4, 5.4] — 1.4 m gap of open aisle in x, well over
+  // the 0.76 m player-diameter threshold. Parity: w=2 even → x integer
+  // (2 ✓), d=1 odd → z at n+0.5 (-3.5 ✓). Overlaps dev-asserted below.
+  {
+    id: "desk-computer",
+    kind: "desk-computer",
+    pos: { x: 2, z: -3.5 },
+    rot: 0,
+    movable: true,
+  },
 ];
 
 /**
@@ -6453,6 +6646,7 @@ if (import.meta.env.DEV) assertPlacementClear("map-table");
 if (import.meta.env.DEV) assertPlacementClear("game-table");
 if (import.meta.env.DEV) assertPlacementClear("bunk-bed");
 if (import.meta.env.DEV) assertPlacementClear("clone-vat");
+if (import.meta.env.DEV) assertPlacementClear("desk-computer");
 
 // ── Derivation helpers ────────────────────────────────────────────────────────
 

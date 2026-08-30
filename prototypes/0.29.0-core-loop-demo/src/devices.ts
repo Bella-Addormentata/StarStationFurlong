@@ -113,6 +113,32 @@ import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
+// 🗺️ #33 M-station: pure helpers for the wall computer's STATION overview
+// (types + math live in wallComputerMap.ts so vitest can exercise them
+// without a browser). AtlasPose is the atlasLayout output shape; readAtlas
+// is only used here to size the pane's small-station gate.
+import {
+  fitPointsToCanvas,
+  isSmallStation,
+  projectModuleFootprintCorners,
+  projectPoint,
+  stationPlacements,
+} from './wallComputerMap';
+import type { StationModulePlacement } from './wallComputerMap';
+import type { AtlasPose } from './stationAtlas';
+import type { RoomDims } from './floorPlanDoc';
+// 🖥️ #33 Stage B: desk-computer management pane — pure helpers (rename /
+//     access-mode / roster / invite validation) shared with vitest, plus the
+//     provider seam the DOM adapter reaches through into main.ts's live state.
+import {
+  ACCESS_MODES, sanitizeRoomName, ROOM_NAME_MAX_LENGTH,
+  normalizeAccessMode, describeAccessMode,
+  orderedRoster, isValidInviteLink, ownershipLabel,
+} from './deskComputerManagement';
+import type {
+  AccessMode as DeskAccessMode, RosterEntry,
+} from './deskComputerManagement';
+import type { RoomManagementProvider } from './deskComputerProvider';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -363,6 +389,25 @@ export interface RoomTerminalDeps {
      *  the OUTSIDE of the module (tanks, engines, stacks) is editable. */
     requestHull: () => void;
   };
+  /**
+   * 🗺️ #33 M-station: STATION OVERVIEW (small stations only) — the second
+   * wireframe pane below the room canvas. World provides live-per-refresh
+   * getters for the current room's id, display name, dims, and the atlas
+   * layout in the current room's frame. The pane keeps itself honest by
+   * asking each refresh; no cached snapshots means an atlas gossip landing
+   * mid-focus shows up next tick. Omit to hide the pane entirely (kept for
+   * unit tests / minimal builds — every production wiring passes it).
+   */
+  station?: {
+    /** Stable bootstrap room id (matches World.activeRoomId). */
+    getRoomId: () => string;
+    /** Display name (the same string the header's ROOM name uses). */
+    getRoomName: () => string;
+    /** Current room dims from the local floorPlan doc (null while binding). */
+    getRoomDims: () => RoomDims | null;
+    /** Atlas poses in the current room's frame — atlasLayout(currentRoomId). */
+    getAtlasPoses: () => AtlasPose[];
+  };
 }
 
 /**
@@ -408,10 +453,16 @@ function livePortView(): Array<{
 export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let canvas: HTMLCanvasElement | null = null;
+  // 🗺️ #33 M-station: the second (bottom) canvas paints the atlas-wide
+  //     wireframe overview. Present only when station deps are wired AND the
+  //     known-module count is inside the SMALL_STATION_MAX cap.
+  let stationCanvas: HTMLCanvasElement | null = null;
   let refreshTimer = 0;
 
   const CANVAS_CSS = 290;   // CSS px (square)
   const CANVAS_RES = 580;   // backing-store px (2x for crisp lines)
+  const STATION_CSS = 290;  // same width as the room wireframe (aligned column)
+  const STATION_RES = 580;
 
   const refresh = () => {
     if (!panel) return;
@@ -468,6 +519,163 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     }
 
     drawWireframe();
+    drawStationOverview();
+  };
+
+  // ── 🗺️ Station-overview pane (#33 M-station) ─────────────────────────────
+  // The pure math is in wallComputerMap.ts (with vitest coverage). This
+  // function is the small DOM/canvas adapter: it asks the deps for the LIVE
+  // atlas + current dims, composes placements, fits them, and draws each as
+  // an oriented outline. Larger stations get a note pointing to the map
+  // table (Stage C of brainstorming/device-maps-plan.md). No station deps ⇒
+  // the pane hides entirely — the wall computer degrades to the M1 view.
+  const drawStationOverview = () => {
+    if (!panel || !stationCanvas || !deps.station) return;
+    const ctx = stationCanvas.getContext('2d');
+    if (!ctx) return;
+    const S = STATION_RES;
+    const PAD = 34;
+    const labelEl = panel.querySelector<HTMLElement>('#device-terminal-station-label');
+    const emptyEl = panel.querySelector<HTMLElement>('#device-terminal-station-empty');
+
+    ctx.clearRect(0, 0, S, S);
+    ctx.fillStyle = '#0A1018';
+    ctx.fillRect(0, 0, S, S);
+
+    const roomId = deps.station.getRoomId();
+    const roomName = deps.station.getRoomName();
+    const dims = deps.station.getRoomDims();
+    const poses = deps.station.getAtlasPoses();
+    // Total-known counts the CURRENT room + every DISTINCT atlas neighbour
+    // (a duplicate of the current id in the atlas is dropped by stationPlacements).
+    const neighbourCount = poses.filter(
+      (p) => p && p.roomId && p.roomId !== roomId,
+    ).length;
+    const moduleCount = 1 + neighbourCount;
+
+    if (emptyEl) {
+      // Two "no data yet" states, said honestly (no fake dots on the canvas):
+      //   – atlas has ONLY the current room ⇒ NO OTHER MODULES YET
+      //   – station is too big for this pane ⇒ USE MAP TABLE
+      if (!isSmallStation(moduleCount)) {
+        emptyEl.textContent = `LARGER STATION (${moduleCount} MODULES) — USE MAP TABLE`;
+        emptyEl.style.display = 'block';
+      } else if (neighbourCount === 0) {
+        emptyEl.textContent = 'NO OTHER MODULES YET · JOIN ANOTHER ROOM TO POPULATE THIS MAP';
+        emptyEl.style.display = 'block';
+      } else {
+        emptyEl.style.display = 'none';
+      }
+    }
+
+    // The oversize / empty cases still paint a background so the pane never
+    // flashes to transparent (the DOM slot stays fixed height).
+    if (!isSmallStation(moduleCount)) {
+      // ⚠️ Deliberate: the LARGER STATION note replaces the canvas contents.
+      //    Painting a fake overview here would violate the "honest data only"
+      //    rule the wall computer ships under.
+      if (labelEl) labelEl.textContent = 'STATION OVERVIEW — DEFERRED';
+      return;
+    }
+
+    const placements = stationPlacements(roomId, roomName, dims, poses);
+    // Every corner point across every placement — the equal-aspect fit sees
+    // the whole footprint set, not just the centres, so a fat module near the
+    // edge still lands inside the padded canvas (verified by test).
+    const allCorners: Array<{ x: number; z: number }> = [];
+    for (const p of placements) {
+      for (const c of projectModuleFootprintCorners(p)) allCorners.push(c);
+    }
+    // Fit-driven scale: we always seed the CURRENT room's four corners into
+    // allCorners (moduleHalfExtents guarantees a non-zero box even without
+    // dims — MODULE_HALF_FALLBACK ≈ 5.9 m), so the input has range on both
+    // axes and the fit already gives a legibly-sized single-module view
+    // without a lower clamp. Clamping to a minimum scale would prevent a
+    // legitimately spread-out small station (up to a 12-module chain, over
+    // 200 m corner-to-corner) from fitting inside the padded canvas — the
+    // very case the pane exists to render. maxScale still guards the tightly
+    // packed extreme (a single module can't blow up past ~40 px/m).
+    const viewport = fitPointsToCanvas(allCorners, S, PAD, { maxScale: 40 });
+
+    // Faint 5 m grid over the whole panel, aligned to world origin so the
+    // current room's centre lines up cleanly. Only draw when scale is high
+    // enough to keep lines readable.
+    if (viewport.scale >= 2) {
+      ctx.strokeStyle = 'rgba(62, 146, 184, 0.10)';
+      ctx.lineWidth = 1;
+      const step = 5; // metres
+      // Find the world x/z range visible in the padded canvas.
+      const worldLeft = (PAD - viewport.offsetX) / viewport.scale;
+      const worldRight = (S - PAD - viewport.offsetX) / viewport.scale;
+      const worldTop = (PAD - viewport.offsetZ) / viewport.scale;
+      const worldBot = (S - PAD - viewport.offsetZ) / viewport.scale;
+      const gx0 = Math.ceil(worldLeft / step) * step;
+      const gx1 = Math.floor(worldRight / step) * step;
+      const gz0 = Math.ceil(worldTop / step) * step;
+      const gz1 = Math.floor(worldBot / step) * step;
+      for (let gx = gx0; gx <= gx1; gx += step) {
+        const px = viewport.offsetX + gx * viewport.scale;
+        ctx.beginPath(); ctx.moveTo(px, PAD); ctx.lineTo(px, S - PAD); ctx.stroke();
+      }
+      for (let gz = gz0; gz <= gz1; gz += step) {
+        const pz = viewport.offsetZ + gz * viewport.scale;
+        ctx.beginPath(); ctx.moveTo(PAD, pz); ctx.lineTo(S - PAD, pz); ctx.stroke();
+      }
+    }
+
+    // Paint neighbours first, current room LAST so the gold accent sits on
+    // top wherever it overlaps another module's edge in a tight ring.
+    const drawOne = (p: StationModulePlacement) => {
+      const corners = projectModuleFootprintCorners(p).map((c) => projectPoint(c, viewport));
+      ctx.beginPath();
+      ctx.moveTo(corners[0].x, corners[0].z);
+      for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].z);
+      ctx.closePath();
+      // Dashed outline for "we don't know its true size" (fallback dims): the
+      // pane is honest that the shape shown is guessed.
+      if (p.dimsUnknown && !p.isCurrent) ctx.setLineDash([6, 4]);
+      else ctx.setLineDash([]);
+      if (p.isCurrent) {
+        ctx.strokeStyle = '#F0C060';
+        ctx.fillStyle = 'rgba(212, 168, 75, 0.10)';
+        ctx.lineWidth = 3;
+      } else {
+        ctx.strokeStyle = '#3E92B8';
+        ctx.fillStyle = 'rgba(62, 146, 184, 0.06)';
+        ctx.lineWidth = 2;
+      }
+      ctx.fill();
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Centre dot
+      const centre = projectPoint({ x: p.x, z: p.z }, viewport);
+      ctx.fillStyle = p.isCurrent ? '#F0C060' : '#7FD4FF';
+      ctx.beginPath();
+      ctx.arc(centre.x, centre.z, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Label: MODULE NAME on top, HOPS badge underneath (or YOU for current).
+      const label = (p.name || 'Module').toUpperCase();
+      const badge = p.isCurrent ? 'YOU' : `+${p.hops}`;
+      ctx.font = 'bold 16px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = p.isCurrent ? '#F0C060' : '#9FC8DE';
+      ctx.fillText(label.slice(0, 14), centre.x, centre.z + 8);
+      ctx.font = 'bold 12px monospace';
+      ctx.fillStyle = p.isCurrent ? 'rgba(240, 192, 96, 0.75)' : 'rgba(159, 200, 222, 0.7)';
+      ctx.fillText(badge, centre.x, centre.z + 26);
+    };
+    for (const p of placements) if (!p.isCurrent) drawOne(p);
+    for (const p of placements) if (p.isCurrent) drawOne(p);
+
+    if (labelEl) {
+      const suffix = moduleCount === 1
+        ? 'THIS MODULE ONLY'
+        : `${moduleCount} MODULES · HOP MAX ${Math.max(...placements.map((p) => p.hops))}`;
+      labelEl.textContent = `STATION OVERVIEW — ${suffix}`;
+    }
   };
 
   const drawWireframe = () => {
@@ -578,6 +786,13 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         </div>
         <canvas id="device-terminal-map" width="${CANVAS_RES}" height="${CANVAS_RES}"
           style="width:${CANVAS_CSS}px; height:${CANVAS_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+        ${deps.station ? `
+        <div style="display:flex; flex-direction:column; gap:4px; margin-top:2px;">
+          <div id="device-terminal-station-label" style="font-size:10px; color:#4A5560; letter-spacing:1px; text-align:center;">STATION OVERVIEW</div>
+          <canvas id="device-terminal-station" width="${STATION_RES}" height="${STATION_RES}"
+            style="width:${STATION_CSS}px; height:${STATION_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+          <div id="device-terminal-station-empty" style="display:none; font-size:9px; color:#4A5560; letter-spacing:0.5px; text-align:center;"></div>
+        </div>` : ''}
         ${deps.editRoom ? `
         <div style="display:flex; flex-direction:column; gap:3px;">
           <div style="display:flex; gap:8px;">
@@ -622,6 +837,9 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
       canvas = panel.querySelector<HTMLCanvasElement>('#device-terminal-map');
+      // 🗺️ #33 M-station: only queried when station deps are wired (the panel
+      //     otherwise omits the canvas from the HTML above).
+      stationCanvas = panel.querySelector<HTMLCanvasElement>('#device-terminal-station');
       // EDIT ROOM (#33 M2): release the focus first, THEN enter edit mode —
       // the wired request() is deviceFocus.releaseThen(→ roomEdit.enter).
       const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
@@ -646,11 +864,771 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
       panel?.remove();
       panel = null;
       canvas = null;
+      stationCanvas = null;
     },
 
     update(dt: number): void {
       refreshTimer += dt;
       if (refreshTimer >= 0.25) { // 4 Hz is plenty for status + wireframe
+        refreshTimer = 0;
+        refresh();
+      }
+    },
+  };
+}
+
+// ── 🖥️ Stage B (#33): desk-computer focused UI — read view + management ──────
+// The desk computer is the SIT-DOWN version of the wall terminal. It paints
+// EVERYTHING the wall computer shows (room name / peers / node / p2p, module
+// wireframe, station overview) in a LEFT column, and adds a RIGHT column for
+// room-management writes: rename, invite mint / copy, access-mode selector,
+// peer roster with a room-role table.
+//
+// Discipline (brainstorming/device-maps-plan.md §3):
+//  – ALL projection math lives in wallComputerMap.ts (already shipped).
+//  – ALL management math (name sanitisation, access-mode normalisation, roster
+//    ordering, invite-link validation, ownership labelling) lives in
+//    deskComputerManagement.ts (pure, vitest-covered — see .test.ts).
+//  – THIS function is the DOM adapter: it composes provider data with pure
+//    helpers and paints. No math here; no globals; every write echoes the
+//    provider's verdict inline.
+//  – The read pane duplicates the wall-computer HTML so refactoring the wall
+//    computer never has to reason about this pane's writes. The wall computer
+//    stays the "walk-up glance" (M1 spec); the desk computer is the deeper
+//    read + management surface. Their shared surface is the pure math.
+//  – Provider missing (main.ts hasn't registered yet, or a minimal test
+//    harness) ⇒ the management pane HIDES rather than throws. The read view
+//    still paints from live doc/HUD state.
+//  – editRoom deps mirror the wall computer verbatim so the EDIT ROOM /
+//    EDIT HULL buttons live on both terminals (same owner-gate + same wiring).
+
+export interface DeskComputerDeps {
+  dockingSystem: DoorDockingPortSystem | null;
+  getPlayerPos: () => THREE.Vector3;
+  /** Lets World dim any future in-world screen while focused (parity with the
+   *  wall terminal). Currently optional; the builder does not stow a live
+   *  screen handle, so the World hook can be a no-op. */
+  onEngagedChange?: (engaged: boolean) => void;
+  /** EDIT ROOM / EDIT HULL — same shape and same wiring as the wall terminal. */
+  editRoom?: RoomTerminalDeps['editRoom'];
+  /** Station-overview deps — same shape and same wiring as the wall terminal. */
+  station?: RoomTerminalDeps['station'];
+  /**
+   * Room-management seam. `null` ⇒ the management column HIDES and the desk
+   * computer degrades to the wall-computer view (parity with #33 M1). Present
+   * ⇒ the pane paints rename / invite / access-mode / roster controls, each
+   * one owner-gated at write time by the provider itself.
+   */
+  management: RoomManagementProvider | null;
+}
+
+/**
+ * The desk computer's focused DOM UI (plan §2 Stage B). Two-column gold-frame
+ * panel: LEFT column mirrors the wall computer's read view, RIGHT column adds
+ * room-management writes. Every write re-checks the provider's owner gate; a
+ * refused write paints its reason inline. The pane is refreshed at 4 Hz — the
+ * same cadence as the wall computer.
+ */
+export function createDeskComputerUI(deps: DeskComputerDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let canvas: HTMLCanvasElement | null = null;
+  let stationCanvas: HTMLCanvasElement | null = null;
+  let refreshTimer = 0;
+  // Draft state: the rename input holds an unsaved edit until the user hits
+  // SAVE. Kept on the closure so refresh() does not clobber the field mid-
+  // typing. Reset when the user clicks SAVE (accepted) or presses ESC.
+  let renameDraft: string | null = null;
+  // Invite-mint state: the field shows the last mint outcome (link OR error);
+  // `mintPending` prevents a second click while the promise is in flight.
+  let lastInvite: { link?: string; error?: string } = {};
+  let mintPending = false;
+  // Copy-button "COPIED" flash. Cleared by the next refresh tick.
+  let copyFlashUntil = 0;
+  // Access-mode write echo. Cleared by the next successful write.
+  let accessNote = '';
+
+  const CANVAS_CSS = 260;
+  const CANVAS_RES = 520;
+  const STATION_CSS = 260;
+  const STATION_RES = 520;
+
+  // Same station-overview drawer the wall computer uses. Duplicated because
+  // its closures reference the LOCAL `stationCanvas` and `panel` — sharing
+  // the wall computer's function would require a rewrite that pulls both
+  // out; not worth the risk for Stage B (see the module comment).
+  const drawStationOverview = () => {
+    if (!panel || !stationCanvas || !deps.station) return;
+    const ctx = stationCanvas.getContext('2d');
+    if (!ctx) return;
+    const S = STATION_RES;
+    const PAD = 30;
+    const labelEl = panel.querySelector<HTMLElement>('#desk-terminal-station-label');
+    const emptyEl = panel.querySelector<HTMLElement>('#desk-terminal-station-empty');
+
+    ctx.clearRect(0, 0, S, S);
+    ctx.fillStyle = '#0A1018';
+    ctx.fillRect(0, 0, S, S);
+
+    const roomId = deps.station.getRoomId();
+    const roomName = deps.station.getRoomName();
+    const dims = deps.station.getRoomDims();
+    const poses = deps.station.getAtlasPoses();
+    const neighbourCount = poses.filter((p) => p && p.roomId && p.roomId !== roomId).length;
+    const moduleCount = 1 + neighbourCount;
+
+    if (emptyEl) {
+      if (!isSmallStation(moduleCount)) {
+        emptyEl.textContent = `LARGER STATION (${moduleCount} MODULES) — USE MAP TABLE`;
+        emptyEl.style.display = 'block';
+      } else if (neighbourCount === 0) {
+        emptyEl.textContent = 'NO OTHER MODULES YET · JOIN ANOTHER ROOM TO POPULATE THIS MAP';
+        emptyEl.style.display = 'block';
+      } else {
+        emptyEl.style.display = 'none';
+      }
+    }
+
+    if (!isSmallStation(moduleCount)) {
+      if (labelEl) labelEl.textContent = 'STATION OVERVIEW — DEFERRED';
+      return;
+    }
+
+    const placements = stationPlacements(roomId, roomName, dims, poses);
+    const allCorners: Array<{ x: number; z: number }> = [];
+    for (const p of placements) {
+      for (const c of projectModuleFootprintCorners(p)) allCorners.push(c);
+    }
+    const viewport = fitPointsToCanvas(allCorners, S, PAD, { maxScale: 40 });
+
+    if (viewport.scale >= 2) {
+      ctx.strokeStyle = 'rgba(62, 146, 184, 0.10)';
+      ctx.lineWidth = 1;
+      const step = 5;
+      const worldLeft = (PAD - viewport.offsetX) / viewport.scale;
+      const worldRight = (S - PAD - viewport.offsetX) / viewport.scale;
+      const worldTop = (PAD - viewport.offsetZ) / viewport.scale;
+      const worldBot = (S - PAD - viewport.offsetZ) / viewport.scale;
+      const gx0 = Math.ceil(worldLeft / step) * step;
+      const gx1 = Math.floor(worldRight / step) * step;
+      const gz0 = Math.ceil(worldTop / step) * step;
+      const gz1 = Math.floor(worldBot / step) * step;
+      for (let gx = gx0; gx <= gx1; gx += step) {
+        const px = viewport.offsetX + gx * viewport.scale;
+        ctx.beginPath(); ctx.moveTo(px, PAD); ctx.lineTo(px, S - PAD); ctx.stroke();
+      }
+      for (let gz = gz0; gz <= gz1; gz += step) {
+        const pz = viewport.offsetZ + gz * viewport.scale;
+        ctx.beginPath(); ctx.moveTo(PAD, pz); ctx.lineTo(S - PAD, pz); ctx.stroke();
+      }
+    }
+
+    const drawOne = (p: StationModulePlacement) => {
+      const corners = projectModuleFootprintCorners(p).map((c) => projectPoint(c, viewport));
+      ctx.beginPath();
+      ctx.moveTo(corners[0].x, corners[0].z);
+      for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].z);
+      ctx.closePath();
+      if (p.dimsUnknown && !p.isCurrent) ctx.setLineDash([6, 4]);
+      else ctx.setLineDash([]);
+      if (p.isCurrent) {
+        ctx.strokeStyle = '#F0C060';
+        ctx.fillStyle = 'rgba(212, 168, 75, 0.10)';
+        ctx.lineWidth = 3;
+      } else {
+        ctx.strokeStyle = '#3E92B8';
+        ctx.fillStyle = 'rgba(62, 146, 184, 0.06)';
+        ctx.lineWidth = 2;
+      }
+      ctx.fill();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const centre = projectPoint({ x: p.x, z: p.z }, viewport);
+      ctx.fillStyle = p.isCurrent ? '#F0C060' : '#7FD4FF';
+      ctx.beginPath();
+      ctx.arc(centre.x, centre.z, 4, 0, Math.PI * 2);
+      ctx.fill();
+      const label = (p.name || 'Module').toUpperCase();
+      const badge = p.isCurrent ? 'YOU' : `+${p.hops}`;
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = p.isCurrent ? '#F0C060' : '#9FC8DE';
+      ctx.fillText(label.slice(0, 14), centre.x, centre.z + 8);
+      ctx.font = 'bold 10px monospace';
+      ctx.fillStyle = p.isCurrent ? 'rgba(240, 192, 96, 0.75)' : 'rgba(159, 200, 222, 0.7)';
+      ctx.fillText(badge, centre.x, centre.z + 24);
+    };
+    for (const p of placements) if (!p.isCurrent) drawOne(p);
+    for (const p of placements) if (p.isCurrent) drawOne(p);
+
+    if (labelEl) {
+      const suffix = moduleCount === 1
+        ? 'THIS MODULE ONLY'
+        : `${moduleCount} MODULES · HOP MAX ${Math.max(...placements.map((p) => p.hops))}`;
+      labelEl.textContent = `STATION OVERVIEW — ${suffix}`;
+    }
+  };
+
+  // Same top-down module wireframe the wall computer paints.
+  const drawWireframe = () => {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const S = CANVAS_RES;
+    const PAD = 42;
+    const scale = (S - PAD * 2) / 12;
+    const px = (wx: number) => PAD + (wx + 6) * scale;
+    const pz = (wz: number) => PAD + (wz + 6) * scale;
+
+    ctx.clearRect(0, 0, S, S);
+    ctx.fillStyle = '#0A1018';
+    ctx.fillRect(0, 0, S, S);
+
+    ctx.strokeStyle = 'rgba(62, 146, 184, 0.12)';
+    ctx.lineWidth = 1;
+    for (let g = -6; g <= 6; g++) {
+      ctx.beginPath(); ctx.moveTo(px(g), pz(-6)); ctx.lineTo(px(g), pz(6)); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(px(-6), pz(g)); ctx.lineTo(px(6), pz(g)); ctx.stroke();
+    }
+    ctx.strokeStyle = '#3E92B8';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(px(-6), pz(-6), 12 * scale, 12 * scale);
+    ctx.lineWidth = 2;
+    for (const item of FURNITURE) {
+      const box = itemAabb(item);
+      if (!box) continue;
+      ctx.strokeStyle = 'rgba(212, 168, 75, 0.55)';
+      ctx.strokeRect(px(box.x0), pz(box.z0), (box.x1 - box.x0) * scale, (box.z1 - box.z0) * scale);
+    }
+    ctx.font = 'bold 20px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const port of livePortView()) {
+      const state = deps.dockingSystem?.getDockingState(port.id) ?? null;
+      ctx.fillStyle = doorStateColor(state);
+      const wpx = port.w * scale;
+      const thick = 10;
+      if (port.horizontal) {
+        ctx.fillRect(px(port.x) - wpx / 2, pz(port.z) - thick / 2, wpx, thick);
+        ctx.fillText(port.label, px(port.x), pz(port.z) + (port.z < 0 ? 22 : -22));
+      } else {
+        ctx.fillRect(px(port.x) - thick / 2, pz(port.z) - wpx / 2, thick, wpx);
+        ctx.fillText(port.label, px(port.x) + (port.x < 0 ? 22 : -22), pz(port.z));
+      }
+    }
+    const p = deps.getPlayerPos();
+    ctx.fillStyle = '#F0C060';
+    ctx.beginPath();
+    ctx.arc(px(p.x), pz(p.z), 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(62, 146, 184, 0.6)';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('MODULE — TOP-DOWN', PAD, S - 14);
+  };
+
+  // Small HTML escape for name cells — the roster names come from other
+  // peers over CRDT and must never render as HTML. `.split().join()` avoids
+  // String.prototype.replaceAll (ES2021) to keep the module compatible with
+  // the tsconfig lib target (see tsconfig.json — currently pre-ES2021).
+  const escapeHtml = (s: string): string =>
+    s
+      .split('&').join('&amp;')
+      .split('<').join('&lt;')
+      .split('>').join('&gt;')
+      .split('"').join('&quot;')
+      .split("'").join('&#39;');
+
+  // Roster row renderer. Painted into the management column when a provider
+  // is wired. Order is joinedAt-ascending (owner may be anywhere in that order);
+  // the "role" cell reads "OWNER" for the owner id and "PEER" for everyone
+  // else, plus a "(you)" suffix on the local row. Rows lacking a joinedAt or
+  // a name are surfaced as MALFORMED (matches the plan's "honest partial-
+  // knowledge labels" rule).
+  const renderRoster = (rows: RosterEntry[]): string => {
+    if (rows.length === 0) {
+      return `<div style="font-size:10px; color:#4A5560; padding:8px 0;">NO PEERS YET</div>`;
+    }
+    const cells = rows.map((row) => {
+      const rolePill = row.isOwner
+        ? `<span style="color:#F0C060; font-weight:bold; letter-spacing:1px;">OWNER</span>`
+        : `<span style="color:#7FD4FF;">PEER</span>`;
+      const nameCell = row.malformed
+        ? `<span style="color:#FF9E80;" title="Missing display name or joinedAt">? MALFORMED</span>`
+        : `<span style="color:#D4A84B;">${escapeHtml(row.name)}${row.isMe ? ' <span style="color:#4A5560;">(you)</span>' : ''}</span>`;
+      const keyBadge = row.hasKeyCert
+        ? `<span title="Publishes a signed keyed-access certificate" style="color:#00E676;">🔑</span>`
+        : `<span style="color:#33404E;">—</span>`;
+      return `<tr>
+        <td style="padding:3px 6px 3px 0; font-size:11px;">${nameCell}</td>
+        <td style="padding:3px 6px; font-size:10px;">${rolePill}</td>
+        <td style="padding:3px 0; font-size:11px; text-align:center;">${keyBadge}</td>
+      </tr>`;
+    }).join('');
+    return `<table style="width:100%; border-collapse:collapse; font-family:inherit;">
+      <thead>
+        <tr style="color:#4A5560; font-size:9px; letter-spacing:1px; text-align:left;">
+          <th style="padding:0 6px 4px 0;">PEER</th>
+          <th style="padding:0 6px 4px;">ROLE</th>
+          <th style="padding:0 0 4px; text-align:center;">KEY</th>
+        </tr>
+      </thead>
+      <tbody>${cells}</tbody>
+    </table>`;
+  };
+
+  const refresh = () => {
+    if (!panel) return;
+    // ── Left column (read view — parity with the wall computer) ────────────
+    const status = readLiveRoomStatus();
+    const nameEl = panel.querySelector<HTMLElement>('#desk-terminal-room-name');
+    if (nameEl) nameEl.textContent = status.roomName.toUpperCase();
+    const peersEl = panel.querySelector<HTMLElement>('#desk-terminal-peers');
+    if (peersEl) peersEl.textContent = String(status.peers);
+    const nodeEl = panel.querySelector<HTMLElement>('#desk-terminal-node');
+    if (nodeEl) {
+      nodeEl.textContent = status.nodeOnline ? '● ONLINE' : '● OFFLINE';
+      nodeEl.style.color = status.nodeOnline ? '#00E676' : '#FF1744';
+    }
+    const p2p = readP2PStatus();
+    const p2pEl = panel.querySelector<HTMLElement>('#desk-terminal-p2p');
+    if (p2pEl) {
+      p2pEl.textContent = p2p;
+      p2pEl.style.color = p2p.includes('CONNECTED') ? '#00E676' : '#FF1744';
+    }
+    const adjEl = panel.querySelector<HTMLElement>('#desk-terminal-adjacent');
+    if (adjEl) {
+      const paired = livePortView()
+        .filter((p) => deps.dockingSystem?.getDockingState(p.id)?.pairedSuccessfully)
+        .map((p) => doorDisplayName(p.id));
+      adjEl.textContent = paired.length
+        ? `${paired.join(', ')} PAIRED — NO ADJACENT MODULE DATA`
+        : 'NO ADJACENT MODULE DATA';
+    }
+    const editBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-edit-room');
+    const hullBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-edit-hull');
+    const editNote = panel.querySelector<HTMLElement>('#desk-terminal-edit-room-note');
+    if (editBtn && deps.editRoom) {
+      const perm = deps.editRoom.permission();
+      for (const btn of [editBtn, hullBtn]) {
+        if (!btn) continue;
+        btn.disabled = !perm.ok;
+        btn.style.opacity = perm.ok ? '1' : '0.35';
+        btn.style.cursor = perm.ok ? 'pointer' : 'not-allowed';
+      }
+      editBtn.title = perm.ok ? 'Rearrange this room’s furniture' : perm.reason;
+      if (hullBtn) {
+        hullBtn.title = perm.ok
+          ? 'Mount tanks and engines on the OUTSIDE of the module (stacks too)'
+          : perm.reason;
+      }
+      if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
+    }
+    drawWireframe();
+    drawStationOverview();
+
+    // ── Right column (management — provider-gated) ─────────────────────────
+    if (!deps.management) return; // no provider ⇒ management column absent
+    const mgmt = deps.management;
+    const isOwner = mgmt.isLocalOwner();
+    const roomName = mgmt.getRoomName();
+    const ownerId = mgmt.getOwnerId();
+    const ownerName = mgmt.resolveOwnerLabel(ownerId);
+    const myId = mgmt.getLocalPlayerId();
+    const rawRoster = mgmt.getRosterRaw();
+    const roster = orderedRoster(rawRoster, myId, ownerId);
+    const accessMode = normalizeAccessMode(mgmt.getAccessMode());
+
+    // Owner label — "You" cue when the local player owns.
+    const ownerEl = panel.querySelector<HTMLElement>('#desk-terminal-owner');
+    if (ownerEl) ownerEl.textContent = ownershipLabel(ownerName, isOwner);
+
+    // Room-name field: only owners can edit; non-owners see the value greyed.
+    const nameField = panel.querySelector<HTMLInputElement>('#desk-terminal-rename');
+    const saveBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-rename-save');
+    const renameNote = panel.querySelector<HTMLElement>('#desk-terminal-rename-note');
+    if (nameField) {
+      // Only overwrite the visible value when there is no unsaved draft
+      // (otherwise a mid-typing refresh would clobber the user's keystrokes).
+      if (renameDraft === null) nameField.value = roomName;
+      nameField.disabled = !isOwner;
+      nameField.style.opacity = isOwner ? '1' : '0.5';
+      nameField.style.cursor = isOwner ? 'text' : 'not-allowed';
+      nameField.title = isOwner ? '' : 'Only the room owner can rename this room.';
+    }
+    if (saveBtn) {
+      const draft = renameDraft ?? roomName;
+      const sanitized = sanitizeRoomName(draft);
+      const dirty = sanitized !== null && sanitized !== roomName;
+      const enabled = isOwner && dirty;
+      saveBtn.disabled = !enabled;
+      saveBtn.style.opacity = enabled ? '1' : '0.35';
+      saveBtn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+    }
+
+    // Access-mode radios: enabled only for owners.
+    for (const mode of ACCESS_MODES) {
+      const radio = panel.querySelector<HTMLInputElement>(`#desk-terminal-access-${mode}`);
+      if (!radio) continue;
+      radio.checked = (accessMode === mode);
+      radio.disabled = !isOwner;
+    }
+    const accessDesc = panel.querySelector<HTMLElement>('#desk-terminal-access-desc');
+    if (accessDesc) accessDesc.textContent = describeAccessMode(accessMode);
+    const accessNoteEl = panel.querySelector<HTMLElement>('#desk-terminal-access-note');
+    if (accessNoteEl) {
+      accessNoteEl.textContent = accessNote;
+      accessNoteEl.style.color = accessNote.startsWith('Refused') ? '#FF9E80' : '#7FD4FF';
+    }
+    if (renameNote) renameNote.textContent = isOwner ? '' : 'View only.';
+
+    // Invite field: mint button + last outcome (link OR error).
+    const inviteField = panel.querySelector<HTMLInputElement>('#desk-terminal-invite-link');
+    const mintBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-invite-mint');
+    const copyBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-invite-copy');
+    const inviteNote = panel.querySelector<HTMLElement>('#desk-terminal-invite-note');
+    if (inviteField) {
+      // Show the last mint's link (validated by the pure helper first) OR the
+      // last error, with a graceful empty state.
+      const displayed = lastInvite.link && isValidInviteLink(lastInvite.link)
+        ? lastInvite.link
+        : '';
+      inviteField.value = displayed;
+      inviteField.readOnly = true;
+    }
+    if (mintBtn) {
+      mintBtn.disabled = mintPending;
+      mintBtn.textContent = mintPending ? 'MINTING…' : 'MINT INVITE';
+      mintBtn.style.opacity = mintPending ? '0.55' : '1';
+      mintBtn.style.cursor = mintPending ? 'progress' : 'pointer';
+    }
+    if (copyBtn) {
+      const hasLink = !!(lastInvite.link && isValidInviteLink(lastInvite.link));
+      copyBtn.disabled = !hasLink;
+      copyBtn.style.opacity = hasLink ? '1' : '0.35';
+      copyBtn.style.cursor = hasLink ? 'pointer' : 'not-allowed';
+      const flashing = copyFlashUntil > performance.now();
+      copyBtn.textContent = flashing ? 'COPIED ✓' : 'COPY';
+    }
+    if (inviteNote) {
+      if (lastInvite.error) {
+        inviteNote.textContent = lastInvite.error;
+        inviteNote.style.color = '#FF9E80';
+      } else if (lastInvite.link) {
+        inviteNote.textContent = 'Share this link with the peer you want to invite.';
+        inviteNote.style.color = '#7FD4FF';
+      } else {
+        inviteNote.textContent = 'Bootstrap link — only mint when a specific peer needs to join.';
+        inviteNote.style.color = '#4A5560';
+      }
+    }
+
+    // Roster panel (owner sorted first via ownedRoster's isOwner flag; the
+    // sort itself is joinedAt-ascending — early joiners on top).
+    const rosterEl = panel.querySelector<HTMLElement>('#desk-terminal-roster');
+    if (rosterEl) rosterEl.innerHTML = renderRoster(roster);
+    const rosterCount = panel.querySelector<HTMLElement>('#desk-terminal-roster-count');
+    if (rosterCount) rosterCount.textContent = `${roster.length} peer${roster.length === 1 ? '' : 's'}`;
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-desk-computer-pane';
+      // Wider panel than the wall computer (two columns). Same palette /
+      // border / shadow so the two devices read as siblings.
+      panel.style.cssText = `
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: min(860px, 96vw);
+        max-height: 94vh;
+        overflow-y: auto;
+        background: rgba(4, 8, 22, 0.96);
+        border: 1px solid rgba(212, 168, 75, 0.32);
+        border-radius: 12px;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 20px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box;
+        pointer-events: auto;
+      `;
+      const mgmtColumn = deps.management ? `
+        <div style="flex: 1 1 340px; min-width: 300px; display:flex; flex-direction:column; gap:16px;">
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div style="font-size:10px; color:#4A5560; letter-spacing:1px;">OWNER</div>
+            <div id="desk-terminal-owner" style="font-size:13px; color:#F0C060; font-weight:bold;">—</div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div style="font-size:10px; color:#4A5560; letter-spacing:1px;">ROOM NAME</div>
+            <div style="display:flex; gap:6px;">
+              <input id="desk-terminal-rename" type="text" maxlength="${ROOM_NAME_MAX_LENGTH}"
+                style="flex:1; background: rgba(4,8,22,0.7); border:1px solid rgba(212,168,75,0.3); border-radius:4px; color:#F0C060; font-family:inherit; font-size:12px; padding:6px 8px;" />
+              <button id="desk-terminal-rename-save" style="
+                padding: 6px 12px;
+                background: rgba(212, 168, 75, 0.14);
+                border: 1px solid rgba(212, 168, 75, 0.4);
+                border-radius: 4px;
+                color: #F0C060;
+                font-family: inherit;
+                font-size: 11px;
+                font-weight: 800;
+                letter-spacing: 1px;
+              ">SAVE</button>
+            </div>
+            <div id="desk-terminal-rename-note" style="font-size:9px; color:#4A5560; letter-spacing:0.5px;"></div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div style="font-size:10px; color:#4A5560; letter-spacing:1px;">ACCESS MODE</div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+              ${ACCESS_MODES.map((mode) => `
+                <label style="display:flex; align-items:center; gap:4px; font-size:10px; color:#D4A84B; padding: 4px 8px; border:1px solid rgba(212,168,75,0.22); border-radius:4px; cursor:pointer;">
+                  <input id="desk-terminal-access-${mode}" name="desk-terminal-access" type="radio" value="${mode}" style="accent-color:#F0C060; cursor:inherit;" />
+                  ${mode.toUpperCase()}
+                </label>`).join('')}
+            </div>
+            <div id="desk-terminal-access-desc" style="font-size:10px; color:#7FD4FF;">—</div>
+            <div id="desk-terminal-access-note" style="font-size:9px; letter-spacing:0.5px;"></div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div style="font-size:10px; color:#4A5560; letter-spacing:1px;">INVITE LINK</div>
+            <div style="display:flex; gap:6px;">
+              <input id="desk-terminal-invite-link" type="text" readonly
+                placeholder="No invite minted yet"
+                style="flex:1; background: rgba(4,8,22,0.7); border:1px solid rgba(62,146,184,0.3); border-radius:4px; color:#7FD4FF; font-family:inherit; font-size:11px; padding:6px 8px;" />
+              <button id="desk-terminal-invite-copy" style="
+                padding: 6px 10px;
+                background: rgba(62, 146, 184, 0.10);
+                border: 1px solid rgba(62, 146, 184, 0.35);
+                border-radius: 4px;
+                color: #7FD4FF;
+                font-family: inherit;
+                font-size: 11px;
+                font-weight: 800;
+                letter-spacing: 1px;
+              ">COPY</button>
+            </div>
+            <button id="desk-terminal-invite-mint" style="
+              padding: 6px 10px;
+              background: rgba(212, 168, 75, 0.10);
+              border: 1px solid rgba(212, 168, 75, 0.4);
+              border-radius: 4px;
+              color: #F0C060;
+              font-family: inherit;
+              font-size: 11px;
+              font-weight: 800;
+              letter-spacing: 1px;
+              align-self: flex-start;
+            ">MINT INVITE</button>
+            <div id="desk-terminal-invite-note" style="font-size:9px; letter-spacing:0.5px; color:#4A5560;"></div>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:4px;">
+            <div style="display:flex; justify-content:space-between; align-items:baseline;">
+              <div style="font-size:10px; color:#4A5560; letter-spacing:1px;">PEERS</div>
+              <div id="desk-terminal-roster-count" style="font-size:9px; color:#4A5560;">0 peers</div>
+            </div>
+            <div id="desk-terminal-roster" style="border:1px solid rgba(212,168,75,0.18); border-radius:4px; padding:6px 8px; max-height: 220px; overflow-y:auto;"></div>
+          </div>
+        </div>` : '';
+      panel.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px; margin-bottom:14px;">
+          <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">▣ DESK COMPUTER — ROOM MANAGEMENT</span>
+          <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+        </div>
+        <div style="display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap;">
+          <div style="flex: 1 1 340px; min-width:300px; display:flex; flex-direction:column; gap:12px;">
+            <div id="desk-terminal-room-name" style="font-size:16px; font-weight:800; color:#D4A84B; letter-spacing:1.5px;">--</div>
+            <div style="display:flex; gap:14px; font-size:11px; flex-wrap:wrap;">
+              <span>PEERS: <span id="desk-terminal-peers" style="color:#00E5FF; font-weight:bold;">--</span></span>
+              <span>NODE: <span id="desk-terminal-node" style="font-weight:bold;">--</span></span>
+              <span>P2P: <span id="desk-terminal-p2p" style="font-weight:bold;">--</span></span>
+            </div>
+            <canvas id="desk-terminal-map" width="${CANVAS_RES}" height="${CANVAS_RES}"
+              style="width:${CANVAS_CSS}px; height:${CANVAS_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+            ${deps.station ? `
+            <div style="display:flex; flex-direction:column; gap:4px;">
+              <div id="desk-terminal-station-label" style="font-size:10px; color:#4A5560; letter-spacing:1px; text-align:center;">STATION OVERVIEW</div>
+              <canvas id="desk-terminal-station" width="${STATION_RES}" height="${STATION_RES}"
+                style="width:${STATION_CSS}px; height:${STATION_CSS}px; align-self:center; border:1px solid rgba(62,146,184,0.35); border-radius:6px;"></canvas>
+              <div id="desk-terminal-station-empty" style="display:none; font-size:9px; color:#4A5560; letter-spacing:0.5px; text-align:center;"></div>
+            </div>` : ''}
+            ${deps.editRoom ? `
+            <div style="display:flex; flex-direction:column; gap:3px;">
+              <div style="display:flex; gap:8px;">
+                <button id="desk-terminal-edit-room" style="
+                  flex: 1; padding: 8px 12px;
+                  background: rgba(212, 168, 75, 0.10);
+                  border: 1px solid rgba(212, 168, 75, 0.45);
+                  border-radius: 6px;
+                  color: #F0C060;
+                  font-family: inherit;
+                  font-size: 12px;
+                  font-weight: 800;
+                  letter-spacing: 1.5px;
+                  cursor: pointer;
+                ">EDIT ROOM ✎</button>
+                <button id="desk-terminal-edit-hull" style="
+                  flex: 1; padding: 8px 12px;
+                  background: rgba(62, 146, 184, 0.10);
+                  border: 1px solid rgba(62, 146, 184, 0.45);
+                  border-radius: 6px;
+                  color: #7FD4FF;
+                  font-family: inherit;
+                  font-size: 12px;
+                  font-weight: 800;
+                  letter-spacing: 1.5px;
+                  cursor: pointer;
+                ">EDIT HULL 🛰️</button>
+              </div>
+              <div id="desk-terminal-edit-room-note" style="font-size:9px; color:#4A5560; letter-spacing:0.5px;"></div>
+            </div>` : ''}
+            <div>
+              <div style="font-size:10px; color:#4A5560; letter-spacing:1px; margin-bottom:4px;">FUEL — NO SENSOR FITTED</div>
+              <div style="height:12px; border:1px solid rgba(212,168,75,0.22); border-radius:3px; background:repeating-linear-gradient(45deg, rgba(74,85,96,0.25) 0 6px, transparent 6px 12px);"></div>
+            </div>
+            <div id="desk-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
+          </div>
+          ${mgmtColumn}
+        </div>
+        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:14px;">SSF DESK COMPUTER v1 · honest data only · management writes owner-gated</div>
+      `;
+      // Input capture: clicks inside the device UI never reach the world.
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      // Keys inside inputs must NOT trigger the world's WASD/ESC handlers.
+      panel.addEventListener('keydown', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      canvas = panel.querySelector<HTMLCanvasElement>('#desk-terminal-map');
+      stationCanvas = panel.querySelector<HTMLCanvasElement>('#desk-terminal-station');
+
+      // EDIT ROOM / EDIT HULL wiring (verbatim from the wall terminal).
+      const editBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-edit-room');
+      const hullBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-edit-hull');
+      if (editBtn && deps.editRoom) {
+        const editRoom = deps.editRoom;
+        editBtn.addEventListener('click', () => {
+          if (!editRoom.permission().ok) return;
+          editRoom.request();
+        });
+        hullBtn?.addEventListener('click', () => {
+          if (!editRoom.permission().ok) return;
+          editRoom.requestHull();
+        });
+      }
+
+      // Management wiring — only when a provider is present.
+      if (deps.management) {
+        const mgmt = deps.management;
+        const nameField = panel.querySelector<HTMLInputElement>('#desk-terminal-rename');
+        const saveBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-rename-save');
+        const renameNote = panel.querySelector<HTMLElement>('#desk-terminal-rename-note');
+        if (nameField) {
+          nameField.addEventListener('input', () => {
+            renameDraft = nameField.value;
+          });
+        }
+        if (saveBtn) {
+          saveBtn.addEventListener('click', () => {
+            const raw = renameDraft ?? nameField?.value ?? '';
+            const clean = sanitizeRoomName(raw);
+            if (clean === null) {
+              if (renameNote) renameNote.textContent = 'Room name cannot be empty.';
+              return;
+            }
+            const verdict = mgmt.setRoomName(clean);
+            if (verdict.ok) {
+              renameDraft = null;
+              if (renameNote) renameNote.textContent = 'Saved.';
+            } else if (renameNote) {
+              renameNote.textContent = `Refused: ${verdict.reason}`;
+            }
+            refresh();
+          });
+        }
+
+        for (const mode of ACCESS_MODES) {
+          const radio = panel.querySelector<HTMLInputElement>(`#desk-terminal-access-${mode}`);
+          if (!radio) continue;
+          radio.addEventListener('change', () => {
+            if (!radio.checked) return;
+            const verdict = mgmt.setAccessMode(mode as DeskAccessMode);
+            if (verdict.ok) accessNote = `Access set to ${describeAccessMode(mode)}.`;
+            else accessNote = `Refused: ${verdict.reason}`;
+            refresh();
+          });
+        }
+
+        const mintBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-invite-mint');
+        const inviteField = panel.querySelector<HTMLInputElement>('#desk-terminal-invite-link');
+        const copyBtn = panel.querySelector<HTMLButtonElement>('#desk-terminal-invite-copy');
+        if (mintBtn) {
+          mintBtn.addEventListener('click', async () => {
+            if (mintPending) return;
+            mintPending = true;
+            refresh();
+            let result: { link?: string; error?: string };
+            try {
+              result = await mgmt.mintInvite();
+            } catch (err) {
+              result = { error: err instanceof Error ? err.message : String(err) };
+            }
+            mintPending = false;
+            // Pure-helper gate: refuse to display anything that isn't a real
+            // room-bootstrap link. This is defense-in-depth — the provider
+            // should have already refused an unsafe scheme.
+            if (result.link && !isValidInviteLink(result.link)) {
+              lastInvite = { error: 'Mint returned an unrecognised link scheme.' };
+            } else {
+              lastInvite = result;
+            }
+            refresh();
+          });
+        }
+        if (copyBtn && inviteField) {
+          copyBtn.addEventListener('click', () => {
+            const link = lastInvite.link;
+            if (!link || !isValidInviteLink(link)) return;
+            // navigator.clipboard is Permissions-guarded and can throw in test
+            // harnesses; fall back to a temporary selection + execCommand.
+            const done = () => {
+              copyFlashUntil = performance.now() + 1200;
+              refresh();
+            };
+            const nav: Navigator | undefined = typeof navigator !== 'undefined' ? navigator : undefined;
+            if (nav?.clipboard?.writeText) {
+              nav.clipboard.writeText(link).then(done).catch(() => {
+                inviteField.select();
+                try { document.execCommand('copy'); done(); } catch { /* ignore */ }
+              });
+            } else {
+              inviteField.select();
+              try { document.execCommand('copy'); done(); } catch { /* ignore */ }
+            }
+          });
+        }
+      }
+
+      deps.onEngagedChange?.(true);
+      refresh();
+    },
+
+    unmount(): void {
+      deps.onEngagedChange?.(false);
+      panel?.remove();
+      panel = null;
+      canvas = null;
+      stationCanvas = null;
+      renameDraft = null;
+      lastInvite = {};
+      mintPending = false;
+      copyFlashUntil = 0;
+      accessNote = '';
+    },
+
+    update(dt: number): void {
+      refreshTimer += dt;
+      if (refreshTimer >= 0.25) {
         refreshTimer = 0;
         refresh();
       }
