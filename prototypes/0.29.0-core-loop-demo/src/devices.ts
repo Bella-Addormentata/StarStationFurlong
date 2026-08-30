@@ -81,12 +81,21 @@ import {
   FAIRNESS_MODES, getCrapsFairnessMode, verifyTranscript,
 } from './games/diceFairness';
 import type { FairnessMode } from './games/craps';
+// 🔒 #69 G5 house commit-reveal — the pre-committed-seed proof that lives on
+// EVERY settled round (roulette + craps): every client re-derives the outcome
+// from the revealed seed and refuses to render it FAIR unless commit and
+// derivation both check out. See games/fairness.ts. This is orthogonal to
+// diceFairness above — the G5 proof is an ALWAYS-ON pre-commit that upgrades
+// every dev-phase dice-fairness mode to "operator can't rewrite after seeing
+// the felt"; the two badges show side by side.
+import { verifyCraps, verifyRoulette } from './games/fairness';
+import type { FairnessVerdict } from './games/fairness';
 import {
   WHEEL_ORDER, pocketColor,
 } from './games/roulette';
 import type { RouletteBet, RouletteTableState } from './games/roulette';
 // 🎲 #69 G3: the craps engine (pure payout math) + its table state.
-import { canPlaceBet } from './games/craps';
+import { canPlaceBet, crapsMaxLayOdds, crapsMaxOdds, POINT_NUMBERS } from './games/craps';
 import type { CrapsBet, CrapsTableState } from './games/craps';
 import {
   DEFAULT_PAYTABLE, MAX_SLOT_MULTIPLIER, SLOT_REQUEST_TTL_MS,
@@ -2209,6 +2218,11 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
   let animT: number | null = null;
   /** One-shot notice line (e.g. "not enough chips"), cleared on next render. */
   let flash = '';
+  /** 🔒 #69 G5: round → verdict cache. verifyRoulette is async (SHA-256 via
+   *  SubtleCrypto), so each re-render stamps the badge from the cache and only
+   *  hashes once per round. Keyed on round to survive the panel.innerHTML
+   *  rebuild render does; capped so old rounds never leak. */
+  const g5Verdicts = new Map<number, FairnessVerdict>();
   const myId = getPlayerId();
   const regions = rouletteBoardRegions();
 
@@ -2515,9 +2529,13 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
             : btn('rl-spin', '🎡 SPIN', spinning, 'Close betting and spin the wheel'))
           : `<span style="font-size:9.5px; color:${GT_DIM};">${p === 'settled' && !spinning ? 'WAITING FOR THE CROUPIER TO OPEN THE NEXT ROUND' : 'THE HOUSE SPINS WHEN BETS ARE DOWN'}</span>`}
       </div>
+      ${p === 'settled' && !spinning ? (s?.fairness
+        ? `<div id="rl-fair-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔒 house pre-commit · checking the seal…</div>`
+        : `<div id="rl-fair-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔓 legacy round — no house pre-commit for this spin</div>`) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
         SINGLE-ZERO WHEEL · straight pays 35:1 · dozens &amp; columns 2:1 · red/black odd/even 1–18/19–36 1:1
-        · house-banked, the croupier's spin settles the round · fair-spin upgrade coming
+        · house-banked, the croupier's spin settles the round
+        · the croupier pre-commits a secret seed BEFORE bets close and reveals it at settle; every client re-derives the pocket and refuses to render the round FAIR unless commit and derivation both check out
         · chips are physical at the table — count them; the CASHIER's screen shows the number
       </div>
     `;
@@ -2531,6 +2549,59 @@ export function createRouletteUI(deps: RouletteUIDeps): DeviceUI {
     wheelCanvas = panel.querySelector<HTMLCanvasElement>('#rl-wheel');
     boardCanvas = panel.querySelector<HTMLCanvasElement>('#rl-board');
     boardCanvas?.addEventListener('click', onBoardClick);
+    // 🔒 #69 G5: verify the house pre-commit + derived pocket for the settled
+    // round, and stamp the badge in plain language. verifyRoulette is async
+    // (SubtleCrypto SHA-256), so we cache the verdict per round and re-query
+    // the LIVE badge inside the stamp (render() rebuilds panel.innerHTML —
+    // capturing the node before the await would stamp a detached element).
+    // A slow promise from round N is also gated by re-checking the current
+    // round before writing, so a late verdict never lands on round N+1.
+    if (p === 'settled' && !spinning && s?.fairness && s.result != null) {
+      const proof = s.fairness;
+      const resultAtIssue = s.result;
+      const forRound = s.round;
+      const stampG5 = (verdict: FairnessVerdict): void => {
+        if (!panel || round() !== forRound) return;
+        const badge = panel.querySelector<HTMLDivElement>('#rl-fair-badge');
+        if (!badge) return;
+        // Plain-language stamps — the audit calls for a labelled verdict, not a
+        // colour-coded checkbox. 'fair' means commit-hash matched AND the derived
+        // pocket matched the published one. 'unverified' covers every failure
+        // mode (seed doesn't hash to commit, derived pocket disagrees, malformed
+        // proof) — deliberately conservative so a hostile operator cannot get a
+        // green stamp by faking either half. 'legacy' surfaces a proof that
+        // never carried a reveal (committed at open but the settle path took
+        // the legacy fallback — the badge already said LEGACY before the
+        // async verify started, so we just leave the initial dim label).
+        if (verdict === 'fair') {
+          badge.textContent = '🔒 fair spin — house pre-commit verified & pocket derives from the revealed seed';
+          badge.style.color = '#7CF5B0';
+        } else if (verdict === 'unverified') {
+          badge.textContent = '⚠ UNVERIFIED — the revealed seed does not produce this pocket (or the commit does not match). Do not trust this round.';
+          badge.style.color = '#FF8A80';
+        } else {
+          badge.textContent = '🔓 legacy round — house committed a seed but no reveal was published';
+          badge.style.color = GT_DIM;
+        }
+      };
+      const cached = g5Verdicts.get(forRound);
+      if (cached !== undefined) {
+        stampG5(cached);
+      } else {
+        // verifyRoulette never throws — it degrades to 'unverified' on any
+        // crypto-layer failure. The .catch here is belt+braces so a rejected
+        // promise from a future refactor still stamps a conservative badge.
+        verifyRoulette(proof, deps.itemId, forRound, resultAtIssue).then((verdict) => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, verdict);
+          stampG5(verdict);
+        }).catch(() => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, 'unverified');
+          stampG5('unverified');
+        });
+      }
+    }
     flash = '';
     drawWheelForNow();
     drawBoard();
@@ -3096,7 +3167,12 @@ export interface CrapsUIDeps {
 /** Seconds the dice tumble after a settle lands. */
 const CR_ROLL_SECS = 1.6;
 const CR_BOARD_W = 360;
-const CR_BOARD_H = 186;
+// Taller than the original 186 to accommodate the come line and the odds strip
+// (both point-phase bets that only make sense once a point is on). Regions that
+// are inactive for the current point state render dimmed instead of vanishing —
+// this way the felt's geometry is stable so a player's muscle memory is not
+// disrupted round to round, and the DIM is a diegetic "this bet is closed" cue.
+const CR_BOARD_H = 232;
 const CR_GREEN = '#1B6B3A';
 const CR_RED = '#7A1E1E';
 
@@ -3104,25 +3180,44 @@ interface CrapsRegion {
   x: number; y: number; w: number; h: number;
   label: string;
   fill: string | null;
-  bet: { type: CrapsBet['type']; pick?: number };
+  /** Placement descriptor. `pickFromPoint` = pass/dontpass odds regions whose
+   *  `pick` is the CURRENT pass line's point (filled at click time, not baked
+   *  into the region). This way one felt region works whether the point is 4,
+   *  5, 6, 8, 9, or 10 — matching how a real dealer places the chips. */
+  bet: { type: CrapsBet['type']; pick?: number; pickFromPoint?: boolean };
 }
 
-/** Single source for drawing AND hit-testing the craps felt (CSS px). */
+/** Single source for drawing AND hit-testing the craps felt (CSS px).
+ *  Regions are drawn in top-down layout order; a region's `bet` decides the bet
+ *  placed on click AND the "which stacks live here" key for the mine/others
+ *  chip readback. Odds regions carry `pickFromPoint` because their point is not
+ *  chosen by the player — it IS the pass line's current point. */
 function crapsBoardRegions(): CrapsRegion[] {
   const r: CrapsRegion[] = [];
-  r.push({ x: 6, y: 6, w: 232, h: 34, label: 'PASS LINE · 1:1', fill: null, bet: { type: 'pass' } });
-  r.push({ x: 242, y: 6, w: 112, h: 34, label: "DON'T PASS", fill: CR_RED, bet: { type: 'dontpass' } });
-  r.push({ x: 6, y: 44, w: 348, h: 44, label: 'FIELD · 2 3 4 9 10 11 12 · 2 & 12 DOUBLE', fill: null, bet: { type: 'field' } });
+  // Row 1 — the flat line bets (allowed on come-out only).
+  r.push({ x: 6, y: 6, w: 232, h: 30, label: 'PASS LINE · 1:1', fill: null, bet: { type: 'pass' } });
+  r.push({ x: 242, y: 6, w: 112, h: 30, label: "DON'T PASS", fill: CR_RED, bet: { type: 'dontpass' } });
+  // Row 2 — the come strip (a "personal pass line" you take DURING a point).
+  r.push({ x: 6, y: 40, w: 232, h: 28, label: 'COME · 1:1', fill: null, bet: { type: 'come' } });
+  r.push({ x: 242, y: 40, w: 112, h: 28, label: "DON'T COME", fill: CR_RED, bet: { type: 'dontcome' } });
+  // Row 3 — the odds strip (true-odds backing of the pass line's point;
+  // dealer places these chips physically behind the flat pass line bet).
+  r.push({ x: 6, y: 72, w: 232, h: 28, label: 'PASS ODDS · TRUE ODDS', fill: null, bet: { type: 'passodds', pickFromPoint: true } });
+  r.push({ x: 242, y: 72, w: 112, h: 28, label: "DON'T PASS ODDS · LAY", fill: CR_RED, bet: { type: 'dontpassodds', pickFromPoint: true } });
+  // Row 4 — the field.
+  r.push({ x: 6, y: 104, w: 348, h: 34, label: 'FIELD · 2 3 4 9 10 11 12 · 2 & 12 DOUBLE', fill: null, bet: { type: 'field' } });
+  // Row 5 — place bets.
   [4, 5, 6, 8, 9, 10].forEach((n, i) => {
     r.push({
-      x: 6 + i * 58, y: 92, w: 54, h: 46,
+      x: 6 + i * 58, y: 142, w: 54, h: 44,
       label: String(n),
       fill: CR_GREEN,
       bet: { type: 'place', pick: n },
     });
   });
-  r.push({ x: 6, y: 144, w: 170, h: 34, label: 'ANY 7 · 4:1', fill: null, bet: { type: 'anyseven' } });
-  r.push({ x: 184, y: 144, w: 170, h: 34, label: 'ANY CRAPS · 7:1', fill: null, bet: { type: 'anycraps' } });
+  // Row 6 — one-roll props.
+  r.push({ x: 6, y: 192, w: 170, h: 34, label: 'ANY 7 · 4:1', fill: null, bet: { type: 'anyseven' } });
+  r.push({ x: 184, y: 192, w: 170, h: 34, label: 'ANY CRAPS · 7:1', fill: null, bet: { type: 'anycraps' } });
   return r;
 }
 
@@ -3195,6 +3290,11 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
   /** round → transcript verdict, so re-renders stamp the badge from cache
    *  instead of re-hashing the whole transcript every time (#87 review). */
   const verifiedVerdicts = new Map<number, boolean>();
+  /** 🔒 #69 G5: round → house-commit-reveal verdict cache — SEPARATE from
+   *  verifiedVerdicts above. This one is the pre-committed-seed proof (always
+   *  on when opened by a G5 croupier); the other is the multi-mode dice
+   *  fairness transcript. Both badges show side by side when present. */
+  const g5Verdicts = new Map<number, FairnessVerdict>();
   const myId = getPlayerId();
   const regions = crapsBoardRegions();
 
@@ -3221,19 +3321,76 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
 
   // ── Bet placement (stakes move at placement time — see module doc) ─────────
 
-  const placeBet = (bet: { type: CrapsBet['type']; pick?: number }): void => {
+  /** Total stake already placed on a given bet type (optionally filtered by
+   *  pick) — used to enforce the 3x/4x/5x odds cap on the pass side. */
+  const stakeOn = (type: CrapsBet['type'], pick?: number): number => {
+    let sum = 0;
+    for (const b of myBets()) {
+      if (b.type === type && (pick === undefined || b.pick === pick)) sum += b.amount;
+    }
+    return sum;
+  };
+
+  const placeBet = (bet: { type: CrapsBet['type']; pick?: number; pickFromPoint?: boolean }): void => {
     if (!bettingOpen() || animT !== null) return;
-    if (!canPlaceBet(bet.type, point())) {
-      flash = 'THE LINE IS CLOSED — A POINT IS ON';
+    const pt = point();
+    if (!canPlaceBet(bet.type, pt)) {
+      // Say the truth precisely: for pass/dontpass the line is closed during a
+      // point; for come/dontcome/odds the come-out is closed until the point sets.
+      flash = pt === null
+        ? 'THIS BET NEEDS A POINT — WAIT FOR THE PASS LINE TO SET ONE'
+        : 'THE LINE IS CLOSED — A POINT IS ON';
       render();
       return;
+    }
+    // pickFromPoint = odds regions inherit the pass line's point at click time.
+    // A stray click during come-out is already rejected above (canPlaceBet).
+    let pick = bet.pick;
+    if (bet.pickFromPoint) {
+      if (pt === null || !POINT_NUMBERS.has(pt)) return; // belt+braces
+      pick = pt;
+    }
+    // Odds cap: refuse an odds chip that would push the total past 3x/4x/5x of
+    // the flat pass/dontpass stake. Real casino behaviour — the dealer stops
+    // you. NB: on the DON'T side the cap limits the WIN, not the amount at
+    // risk, so a player may lay MORE than they back — the correct cap comes
+    // from `crapsMaxLayOdds` (6F uniform under the modern schedule; see the
+    // engine helper for the derivation). Using `crapsMaxOdds` on both sides
+    // (the earlier code) capped the LAID amount at 3F/4F/5F instead of the
+    // 6F the house advertises — that was the audit fix, round 2.
+    if (bet.type === 'passodds' && pick != null) {
+      const flat = stakeOn('pass');
+      if (flat <= 0) {
+        flash = 'BACK A PASS LINE BET FIRST — ODDS RIDE THE FLAT';
+        render();
+        return;
+      }
+      if (stakeOn('passodds', pick) + denom > crapsMaxOdds(flat, pick)) {
+        flash = 'AT THE MAX ODDS FOR THIS POINT — 3x·4x·5x HOUSE CAP';
+        render();
+        return;
+      }
+    } else if (bet.type === 'dontpassodds' && pick != null) {
+      const flat = stakeOn('dontpass');
+      if (flat <= 0) {
+        flash = "BACK A DON'T PASS BET FIRST — LAY RIDES THE FLAT";
+        render();
+        return;
+      }
+      if (stakeOn('dontpassodds', pick) + denom > crapsMaxLayOdds(flat, pick)) {
+        flash = 'AT THE MAX LAY ODDS FOR THIS POINT — 3x·4x·5x HOUSE CAP';
+        render();
+        return;
+      }
     }
     if (!spendChips(myId, denom)) {
       flash = 'NOT ENOUGH CHIPS — VISIT THE CASHIER';
       render();
       return;
     }
-    const full: CrapsBet = { ...bet, amount: denom };
+    const full: CrapsBet = pick != null
+      ? { type: bet.type, pick, amount: denom }
+      : { type: bet.type, amount: denom };
     writeMyCrapsBets(deps.itemId, myId, [...myBets(), full]);
     addedThisWindow.push(full);
   };
@@ -3346,8 +3503,14 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     // spectator): the matching place box + the field when it hit.
     const settled = state()?.phase === 'settled' && animT === null;
     const rolled = settled ? state()!.result : null;
+    const pt = point();
     const fieldSet = new Set([2, 3, 4, 9, 10, 11, 12]);
     for (const rg of regions) {
+      // A region is DIM when placing this bet type is not allowed right now
+      // (e.g. pass/dontpass with a point on; come/odds with no point). Dim ≠
+      // hidden — the felt geometry stays stable so muscle memory works.
+      const active = canPlaceBet(rg.bet.type, pt);
+      ctx.globalAlpha = active ? 1 : 0.42;
       ctx.fillStyle = rg.fill ?? '#1B6B3A';
       ctx.fillRect(rg.x, rg.y, rg.w, rg.h);
       const flare = rolled != null && (
@@ -3376,16 +3539,26 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
         ctx.fillStyle = 'rgba(240,224,180,0.7)';
         ctx.fillText(
           rg.bet.pick === 6 || rg.bet.pick === 8 ? '7:6' : rg.bet.pick === 5 || rg.bet.pick === 9 ? '7:5' : '9:5',
-          rg.x + rg.w / 2, rg.y + 32,
+          rg.x + rg.w / 2, rg.y + 30,
         );
       }
-      const theirs = otherChips.get(keyOf(rg.bet));
-      if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
-      const placed = mineChips.get(keyOf(rg.bet));
-      if (placed) {
-        const cols = Math.ceil(placed.length / 8);
-        drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
+      // Chip readback — the felt is the source of truth, so read what actually
+      // lives at this bet key. Odds regions carry a wildcard `pick` because
+      // their pick was determined by point at click time; sum across whatever
+      // odds bets the player actually has on this type.
+      const keys: string[] = rg.bet.pickFromPoint
+        ? [...POINT_NUMBERS].map((p) => `${rg.bet.type}:${p}`)
+        : [keyOf(rg.bet)];
+      for (const k of keys) {
+        const theirs = otherChips.get(k);
+        if (theirs) drawFeltStack(ctx, theirs, rg.x + 2, rg.y + rg.h - 2, true);
+        const placed = mineChips.get(k);
+        if (placed) {
+          const cols = Math.ceil(placed.length / 8);
+          drawFeltStack(ctx, placed, rg.x + rg.w - 2 - cols * 17, rg.y + rg.h - 2, false);
+        }
       }
+      ctx.globalAlpha = 1;
     }
   };
 
@@ -3539,10 +3712,16 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
       <div id="cr-fair-badge" style="font-size:9px; color:#7CF5B0; letter-spacing:1px;">
         🔒 provably fair · ${(s.fairness.mode as string).toUpperCase()}${s.fairness.simulated ? ' (dev-simulated)' : ''} · verifying…
       </div>` : ''}
+      ${p === 'settled' && !rolling ? (s?.houseFairness
+        ? `<div id="cr-g5-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔒 house pre-commit · checking the seal…</div>`
+        : `<div id="cr-g5-badge" style="font-size:9px; color:${GT_DIM}; letter-spacing:1px;">🔓 legacy round — no house pre-commit for this roll</div>`) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; line-height:1.6;">
-        BANK CRAPS · pass/don't-pass 1:1 (come-out only) · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6
-        · any 7 4:1 · any craps 7:1 · place bets ride until a 7, the pass line rides its point
-        · house-banked, the stickman's throw settles the roll · fair-dice upgrade coming
+        BANK CRAPS · pass/don't-pass 1:1 (come-out only) · come/don't-come 1:1 (point ON — a "personal pass line")
+        · pass ODDS true odds (4/10 2:1, 5/9 3:2, 6/8 6:5) · don't pass LAY reciprocal
+        · field 1:1, 2 &amp; 12 pay 2:1 · place 4/10 9:5, 5/9 7:5, 6/8 7:6 · any 7 4:1 · any craps 7:1
+        · place bets ride until a 7, the pass line rides its point, come bets travel to their come point
+        · house 3x/4x/5x odds cap (4/10 · 5/9 · 6/8) · house-banked, the stickman's throw settles the roll
+        · the stickman pre-commits a secret seed BEFORE bets close and reveals it at settle; every client re-derives the dice and refuses to render the roll FAIR unless commit and derivation both check out
         · chips are physical at the table — count them; the CASHIER's screen shows the number
       </div>
     `;
@@ -3587,6 +3766,46 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
           if (verifiedVerdicts.size > 32) verifiedVerdicts.clear(); // old rounds never re-render
           verifiedVerdicts.set(forRound, ok);
           stamp(ok);
+        });
+      }
+    }
+    // 🔒 #69 G5: verify the house pre-commit + derived dice for the settled
+    // roll. Separate cache from the multi-mode dice transcript above — this is
+    // the ALWAYS-ON pre-commit that stops the operator rewriting the roll
+    // AFTER seeing the felt. Same live-node re-query + round-guard shape as
+    // the roulette verifier (render() rebuilds panel.innerHTML on every doc
+    // tick; a slow promise from round N must never stamp N+1's badge).
+    if (p === 'settled' && !rolling && s?.houseFairness && s.dice) {
+      const proof = s.houseFairness;
+      const diceAtIssue: [number, number] = [s.dice[0], s.dice[1]];
+      const forRound = s.round;
+      const stampG5 = (verdict: FairnessVerdict): void => {
+        if (!panel || round() !== forRound) return;
+        const badge = panel.querySelector<HTMLDivElement>('#cr-g5-badge');
+        if (!badge) return;
+        if (verdict === 'fair') {
+          badge.textContent = '🔒 fair roll — house pre-commit verified & dice derive from the revealed seed';
+          badge.style.color = '#7CF5B0';
+        } else if (verdict === 'unverified') {
+          badge.textContent = '⚠ UNVERIFIED — the revealed seed does not produce these dice (or the commit does not match). Do not trust this roll.';
+          badge.style.color = '#FF8A80';
+        } else {
+          badge.textContent = '🔓 legacy roll — house committed a seed but no reveal was published';
+          badge.style.color = GT_DIM;
+        }
+      };
+      const cached = g5Verdicts.get(forRound);
+      if (cached !== undefined) {
+        stampG5(cached);
+      } else {
+        verifyCraps(proof, deps.itemId, forRound, diceAtIssue).then((verdict) => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, verdict);
+          stampG5(verdict);
+        }).catch(() => {
+          if (g5Verdicts.size > 32) g5Verdicts.clear();
+          g5Verdicts.set(forRound, 'unverified');
+          stampG5('unverified');
         });
       }
     }
