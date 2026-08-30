@@ -1016,9 +1016,11 @@ export function activateCardWager(
   if (cfg.startedAt !== null) return false;
   if (!Number.isFinite(nowMs) || nowMs < 0) return false;
   const records = scanCardWagerEscrow(tableId);
-  // Heads-up only: exactly 2 well-formed records at activation. A
-  // hostile third record blocks activate so the owner sweeps it first
-  // (via refundCardWager on the forged player id).
+  // Heads-up only: exactly 2 well-formed records at activation. A hostile
+  // third record blocks activate; the owner clears it first — refundCardWager
+  // DELETES a record whose terms do not match the config WITHOUT crediting
+  // anything (only a conforming pay-in is ever returned), so the sweep cannot
+  // be turned into a chip mint.
   if (records.length !== 2) return false;
   for (const r of records) {
     if (r.amount !== cfg.buyIn) return false;
@@ -1043,13 +1045,17 @@ export function activateCardWager(
 /**
  * Self-refund BEFORE BEGIN (state 'held', config.startedAt === null).
  * Payer writes their own key → deletes the record, credits own balance
- * += record.amount. Idempotent: missing record → false.
+ * += config.buyIn (only a record whose terms MATCH the config is
+ * refundable — see the conformance gate below). Idempotent: missing
+ * record → false.
  *
  * When `actorId === config.ownerId` and `playerId !== actorId`, this is
  * the OWNER-ABANDONMENT refund — the owner may return a stranded pay-in
  * to a player who left the table before both sides completed. Owner can
  * do this at any startedAt state; that mirrors the air-hockey owner
- * sweep on removed tables (records must not be left orphaned).
+ * sweep on removed tables (records must not be left orphaned). The owner
+ * may ALSO clear a non-conforming stray (hostile plant / debris) — that
+ * path DELETES without any credit, so the sweep can never mint chips.
  *
  * Refuses non-participants: neither the payer nor the owner can be
  * spoofed by a bystander — every entry point checks `actorId`.
@@ -1071,19 +1077,47 @@ export function refundCardWager(
   const key = cardWagerEscrowKey(tableId, playerId);
   const existing = map.get(key);
   if (existing === undefined) return false;
-  if (!isCardWagerRecord(existing)) {
-    // Malformed record — delete it (no credit; hostile write cannot mint
-    // chips into a real balance). Owner-only cleanup step.
+  // A record is REFUNDABLE only when it CONFORMS to the table config — the
+  // very check activateCardWager and settleCardWager already run before they
+  // move escrow chips (amount === buyIn, ownerId, state 'held'), plus kind
+  // and key-binding for good measure. refundCardWager was the ONE escrow-
+  // consuming path that trusted the record's self-declared `amount`, so a
+  // hostile peer could raw-write a well-formed `held` record carrying
+  // amount = MAX_CARD_WAGER_BUY_IN under a player id they control and let an
+  // HONEST owner's cancel-sweep (or the documented stray-record recovery)
+  // CREDIT it — chips minted with no matching pay-in debit, breaking the
+  // module's escrowed = paid_out + refunded + still_held invariant. Gating
+  // on the owner-declared config strips the attacker's control of the figure
+  // and makes refund symmetric with pay/settle.
+  //
+  // RESIDUAL (unsigned-chip v1): a record planted at EXACTLY config.buyIn
+  // under an attacker-chosen id still returns one buy-in on an owner sweep.
+  // That is no more power than a raw `bal:` write already grants this phase
+  // (chips are unsigned doc state; the derived cage ledger's houseNet
+  // surfaces the anomaly), and the G4 signed-registry chips close it for
+  // real. The point of this gate is that refund no longer AMPLIFIES that
+  // baseline into an attacker-sized, honest-owner-laundered mint.
+  const conforms = isCardWagerRecord(existing)
+    && existing.amount === cfg.buyIn
+    && existing.ownerId === cfg.ownerId
+    && existing.kind === cfg.kind
+    && existing.state === 'held'
+    && existing.playerId === playerId;
+  if (!conforms) {
+    // Malformed, wrong-terms, or mis-bound debris. The OWNER may sweep it
+    // away — WITHOUT credit (a hostile write must never mint into a real
+    // balance). A non-owner self-caller cannot: it is not a legitimate
+    // self-refund of their own conforming pay-in.
     if (!isOwner) return false;
     boundDoc!.transact(() => { map.delete(key); });
     return true;
   }
-  // Well-formed record: return chips to the payer.
+  // Conforming record: return exactly the owner-declared buy-in, then drop
+  // the record — one transact so a mid-write throw cannot double-spend.
   const balKey = `bal:${playerId}`;
   const bal = readCount(balKey);
-  const refund = existing.amount;
   boundDoc!.transact(() => {
-    map.set(balKey, bal + refund);
+    map.set(balKey, bal + cfg.buyIn);
     map.delete(key);
   });
   return true;
@@ -1224,9 +1258,11 @@ export function settleCardWager(
   const records = scanCardWagerEscrow(tableId);
   // Heads-up only: exactly 2 well-formed records. A hostile peer that
   // planted a well-formed THIRD record without paying chips in cannot
-  // inflate the pot the winner is credited from — refuse the whole
-  // settle so the owner can sweep the forged record first (refundCardWager
-  // with the forged player id deletes it; then settle sees 2 again).
+  // inflate the pot the winner is credited from — refuse the whole settle
+  // so the owner clears the stray first. refundCardWager only returns a
+  // record whose terms match the config (never the record's self-declared
+  // amount) and DELETES a non-conforming plant without credit, so neither
+  // settle nor the sweep can be turned into a mint; then settle sees 2 again.
   if (records.length !== 2) return false;
   for (const r of records) {
     if (r.amount !== cfg.buyIn) return false;

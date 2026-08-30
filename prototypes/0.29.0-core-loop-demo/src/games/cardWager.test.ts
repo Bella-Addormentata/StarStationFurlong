@@ -584,6 +584,99 @@ describe('card wager escrow — hostile-peer refusals', () => {
     expect(readChips(P1)).toBe(75 + BUY_IN * 2);
   });
 
+  it('owner sweep of an INFLATED hostile plant credits NOTHING (no chip mint)', () => {
+    // #45 round-5 CRITICAL: refundCardWager used to credit the record's own
+    // self-declared `amount`. A hostile peer raw-writes a well-formed `held`
+    // record at amount = MAX_CARD_WAGER_BUY_IN (1,000,000) under an id they
+    // control — no matching pay-in debit ever happened — and an honest owner's
+    // cancel/stray-record sweep would MINT that million into the attacker's
+    // balance, shattering escrowed = paid_out + refunded + still_held. The
+    // refund now gates on config conformance: a non-conforming record is
+    // DELETED with zero credit. This locks that in.
+    buyInChips(P1, 100);
+    buyInChips(P2, 100);
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1);
+    payCardWager(P1, TABLE, P1, 2); // P1: 100 → 75, conforming held record @25
+    payCardWager(P2, TABLE, P2, 3); // P2: 100 → 75, conforming held record @25
+
+    // P3 never bought in (balance 0). Plant an inflated well-formed record.
+    const casinoMap = getBoundCasino();
+    const plant: CardWagerRecord = {
+      kind: 'poker', amount: MAX_CARD_WAGER_BUY_IN, ownerId: OWNER,
+      playerId: P3, paidAt: 5, state: 'held',
+    };
+    casinoMap.set(cardWagerEscrowKey(TABLE, P3), plant);
+    expect(readChips(P3)).toBe(0);
+
+    // Owner sweeps the stray (the documented recovery / cancelPokerWager loop):
+    // the record is removed…
+    expect(refundCardWager(OWNER, TABLE, P3)).toBe(true);
+    expect(readCardWagerEscrow(TABLE, P3)).toBeNull();
+    // …but NOTHING was credited — the million-chip mint is prevented.
+    expect(readChips(P3)).toBe(0);
+    // Real payers and their conforming escrow are untouched: the real chip
+    // supply is still exactly the 200 that was bought in (75 + 75 + 25 + 25).
+    expect(readChips(P1)).toBe(75);
+    expect(readChips(P2)).toBe(75);
+    expect(readCardWagerEscrow(TABLE, P1)).not.toBeNull();
+    expect(readCardWagerEscrow(TABLE, P2)).not.toBeNull();
+  });
+
+  it('owner sweep of a WRONG-OWNER plant (conforming amount) credits nothing', () => {
+    // Amount matches the config buy-in, but the record names a different
+    // casino owner — so it is NOT a pay-in against THIS table. Conformance
+    // check fails on ownerId; the owner sweep deletes it without credit.
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1);
+    const casinoMap = getBoundCasino();
+    const plant: CardWagerRecord = {
+      kind: 'poker', amount: BUY_IN, ownerId: 'evil_owner',
+      playerId: P3, paidAt: 5, state: 'held',
+    };
+    casinoMap.set(cardWagerEscrowKey(TABLE, P3), plant);
+
+    expect(refundCardWager(OWNER, TABLE, P3)).toBe(true);
+    expect(readChips(P3)).toBe(0);
+    expect(readCardWagerEscrow(TABLE, P3)).toBeNull();
+  });
+
+  it('owner sweep of a MIS-BOUND plant (field playerId ≠ key) credits nothing', () => {
+    // The record sits under P3's escrow key but its `playerId` field claims
+    // P1. Without the key-binding guard the owner sweep would credit bal:P3
+    // for a record no one paid under that key. Conformance fails on the
+    // playerId binding; the sweep deletes without credit.
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1);
+    const casinoMap = getBoundCasino();
+    const plant: CardWagerRecord = {
+      kind: 'poker', amount: BUY_IN, ownerId: OWNER,
+      playerId: P1, paidAt: 5, state: 'held', // field P1, but stored under P3's key
+    };
+    casinoMap.set(cardWagerEscrowKey(TABLE, P3), plant);
+
+    expect(refundCardWager(OWNER, TABLE, P3)).toBe(true);
+    expect(readChips(P3)).toBe(0);
+    expect(readChips(P1)).toBe(0);
+    expect(readCardWagerEscrow(TABLE, P3)).toBeNull();
+  });
+
+  it('a SELF-caller cannot sweep a non-conforming record (refused, no credit)', () => {
+    // Attacker P3 plants an inflated record under their OWN key and tries to
+    // self-refund it into their balance. A self-refund is only ever a return
+    // of the caller's own CONFORMING pay-in; a non-conforming record is
+    // refused outright (only the owner may sweep debris, and even then
+    // without credit) — the record is left in place, no chips minted.
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1); // startedAt null → self-refund window open
+    const casinoMap = getBoundCasino();
+    const plant: CardWagerRecord = {
+      kind: 'poker', amount: MAX_CARD_WAGER_BUY_IN, ownerId: OWNER,
+      playerId: P3, paidAt: 5, state: 'held',
+    };
+    casinoMap.set(cardWagerEscrowKey(TABLE, P3), plant);
+
+    expect(refundCardWager(P3, TABLE, P3)).toBe(false);
+    expect(readChips(P3)).toBe(0);
+    expect(readCardWagerEscrow(TABLE, P3)).not.toBeNull(); // self cannot delete it
+  });
+
   it('out-of-range buy-in is refused at config stamp time (per-kind floors)', () => {
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 0, 1)).toBe(false);
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', -5, 1)).toBe(false);
