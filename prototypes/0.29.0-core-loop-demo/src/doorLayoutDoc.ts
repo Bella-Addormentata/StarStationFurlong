@@ -29,7 +29,7 @@
 
 import * as Y from 'yjs';
 import { findDoor } from './doors';
-import { doorSlideDelta } from './floorPlanDoc';
+import { doorSlideDelta, doorLateralLimitForWall } from './floorPlanDoc';
 
 /**
  * 🧭 AXIS WALL LABELS (owner ruling 2026-08-09): the room's four sides named by
@@ -205,6 +205,15 @@ export function defaultDoorLayoutRecords(): Map<string, DoorLayoutRecord> {
     // 🚪 #18: an un-migrated room's slid doors keep their slide (same fold as
     // readAllDoorLayout — the synthesized defaults are that room's truth).
     rec.lateral += doorSlideDelta(id);
+    // 🚪 #66 S2 CLAMP-ON-SHRINK: mirror the read boundary's safety net for
+    // unseeded rooms too. The paired compat kinds ('casino-pairs' / 'pool-pairs')
+    // put cardinals at ±PAIR_OFFSET = ±3, which fits every default room and every
+    // grown room but strands a door on a 1-tile axis (halfX=3 ⇒ limit 1). A
+    // slid legacy id can also push over the limit for the same reason. Same
+    // clamp keeps every consumer honest for un-migrated rooms.
+    const wallLimit = doorLateralLimitForWall(rec.wall);
+    if (rec.lateral > wallLimit) rec.lateral = wallLimit;
+    else if (rec.lateral < -wallLimit) rec.lateral = -wallLimit;
     out.set(id, rec);
   }
   return out;
@@ -380,6 +389,24 @@ export function readAllDoorLayout(): Map<string, DoorLayoutRecord> {
       // top of. Every consumer now poses from the record alone; nothing else
       // may read the slide store, or the door doubles its own drag.
       if (id in LEGACY_ID_WALL) norm.lateral += doorSlideDelta(id);
+      // 🚪 #66 S2 CLAMP-ON-SHRINK: the stored lateral is bounded on WRITE by
+      // the wall's slide limit (validateDoorPlacement / doorLateralLimitForWall
+      // in the drag editor and the keypad), but that limit is dynamic — it
+      // shrinks with the room. A door placed at lateral 4 on a 5×5 wall (limit
+      // 4) becomes stranded past the wall corner the moment the owner shrinks
+      // the room to 1×1 (limit 1), because the RECORD is not rewritten by a
+      // resize (the reconcile re-poses from records, it does not edit them).
+      // Clamp inward here — the same read-side repair discipline as
+      // floorPlanDoc.readDoorPlacement — so every consumer (reposeDoorTargets,
+      // physicalDoorPose, door groups, paired vestibules) sees a legal position
+      // and the door snaps back inside the wall on the next observe notify. AT
+      // the read boundary because we cross the peer trust boundary here: a
+      // hostile or stale peer's over-limit lateral degrades to the wall edge
+      // rather than rendering a floating door. Writes back are still gated by
+      // the editor/keypad — this only repairs stale reads.
+      const wallLimit = doorLateralLimitForWall(norm.wall);
+      if (norm.lateral > wallLimit) norm.lateral = wallLimit;
+      else if (norm.lateral < -wallLimit) norm.lateral = -wallLimit;
       // 🪧 …and the label, for the same reason the size and lateral are done
       // here: the shape guard accepts any string so stored data is never
       // rejected, which means an over-long, padded or whitespace-only label
