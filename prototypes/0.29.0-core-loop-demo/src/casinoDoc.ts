@@ -1091,12 +1091,17 @@ export function refundCardWager(
   // and makes refund symmetric with pay/settle.
   //
   // RESIDUAL (unsigned-chip v1): a record planted at EXACTLY config.buyIn
-  // under an attacker-chosen id still returns one buy-in on an owner sweep.
-  // That is no more power than a raw `bal:` write already grants this phase
-  // (chips are unsigned doc state; the derived cage ledger's houseNet
-  // surfaces the anomaly), and the G4 signed-registry chips close it for
-  // real. The point of this gate is that refund no longer AMPLIFIES that
-  // baseline into an attacker-sized, honest-owner-laundered mint.
+  // still returns one buy-in on a conforming refund. The plant can sit under
+  // an attacker-chosen puppet id (an owner sweep credits the puppet) OR under
+  // an HONEST payer's own key — payCardWager's crash-retry idempotency returns
+  // true WITHOUT debiting when a conforming record already occupies the key,
+  // so that payer's own pre-BEGIN self-refund (or an owner sweep) hands them a
+  // buy-in they never paid. Either way it is exactly one buy-in, and no more
+  // power than the raw `bal:` write the same no-ACL peer can already make
+  // (chips are unsigned doc state; the derived cage ledger's houseNet surfaces
+  // the anomaly); the G4 signed-registry chips close it for real. The point of
+  // this gate is that refund no longer AMPLIFIES that baseline into an
+  // attacker-sized, honest-owner-laundered mint.
   const conforms = isCardWagerRecord(existing)
     && existing.amount === cfg.buyIn
     && existing.ownerId === cfg.ownerId
