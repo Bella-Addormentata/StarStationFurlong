@@ -21,16 +21,27 @@
 //      merge via encodeStateAsUpdate / applyUpdate, and both sides
 //      converge to identical map contents (LWW + per-key single-writer
 //      discipline holds).
+//   8. TWO-PLAYER CONFIRM GATE (#45 ack slice): settle pays out only
+//      when BOTH payers countersigned the SAME fresh result — spectator
+//      acks, pre-start acks, outsider winners, stale / mis-bound /
+//      kind-mismatched acks, and disputes all hold the pot in escrow.
+//   9. RE-STAMP GUARDS: identical re-stamp stays legal (crash retry);
+//      term changes freeze while chips are escrowed; every re-stamp is
+//      locked while a match is live.
+//  10. PER-KIND FLOORS: poker's buy-in floor is 20 (2 × the engine big
+//      blind) so escrowed chips always cover the seated stacks; war
+//      keeps the absolute floor.
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 
 import {
-  MIN_CARD_WAGER_BUY_IN, MAX_CARD_WAGER_BUY_IN,
-  cardWagerEscrowKey,
-  isCardWagerConfig, isCardWagerRecord,
+  MIN_CARD_WAGER_BUY_IN, MAX_CARD_WAGER_BUY_IN, POKER_MIN_WAGER_BUY_IN,
+  minCardWagerBuyIn, deriveHeadsUpWinner,
+  cardWagerEscrowKey, cardWagerAckKey,
+  isCardWagerConfig, isCardWagerRecord, isCardWagerAck,
   isCardWagerConservationBalanced, filterConformingHeld,
-  type CardWagerConfig, type CardWagerRecord,
+  type CardWagerConfig, type CardWagerRecord, type CardWagerAck,
 } from './cardWager';
 import {
   bindCasinoDoc, buyInChips, readChips,
@@ -38,6 +49,7 @@ import {
   payCardWager, readCardWagerEscrow, scanCardWagerEscrow,
   activateCardWager, refundCardWager, settleCardWager,
   clearCardWagerKeys,
+  readCardWagerAck, ackCardWagerResult, readAgreedCardWagerResult,
 } from '../casinoDoc';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -79,6 +91,24 @@ function totalChips(doc: Y.Doc, tableId: string): number {
     if (k.startsWith('bal:') && typeof v === 'number') bals += v;
   }
   return bals + sumHeld(tableId);
+}
+
+/** Both payers countersign `winner` — the standard unlock for a settle
+ *  behind the #45 two-player confirm gate. */
+function ackBoth(winner: string | 'split', atMs = 9_000): void {
+  expect(ackCardWagerResult(P1, TABLE, winner, atMs)).toBe(true);
+  expect(ackCardWagerResult(P2, TABLE, winner, atMs + 1)).toBe(true);
+}
+
+/** Stamp → both pay → BEGIN, the standard live-match fixture (startedAt
+ *  lands at 4 — several freshness tests key on that value). */
+function setupLiveMatch(): void {
+  buyInChips(P1, 100);
+  buyInChips(P2, 100);
+  expect(stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1)).toBe(true);
+  expect(payCardWager(P1, TABLE, P1, 2)).toBe(true);
+  expect(payCardWager(P2, TABLE, P2, 3)).toBe(true);
+  expect(activateCardWager(OWNER, TABLE, 4)).toBe(true);
 }
 
 // ── Shape guards ────────────────────────────────────────────────────────────
@@ -177,6 +207,50 @@ describe('isCardWagerRecord', () => {
   });
 });
 
+describe('isCardWagerAck', () => {
+  const good: CardWagerAck = {
+    kind: 'poker', playerId: P1, winnerId: P2,
+    matchStartedAt: 2_000, ackedAt: 3_000,
+  };
+
+  it('accepts a well-formed ack (payer winner or the split sentinel)', () => {
+    expect(isCardWagerAck(good)).toBe(true);
+    expect(isCardWagerAck({ ...good, winnerId: 'split' })).toBe(true);
+    expect(isCardWagerAck({ ...good, kind: 'war' })).toBe(true);
+    expect(isCardWagerAck({ ...good, matchStartedAt: 0 })).toBe(true);
+  });
+
+  it('rejects roots that are not plain objects', () => {
+    expect(isCardWagerAck(null)).toBe(false);
+    expect(isCardWagerAck(undefined)).toBe(false);
+    expect(isCardWagerAck('ack')).toBe(false);
+    expect(isCardWagerAck(7)).toBe(false);
+    expect(isCardWagerAck([])).toBe(false);
+  });
+
+  it('rejects unknown / missing kinds', () => {
+    expect(isCardWagerAck({ ...good, kind: 'blackjack' })).toBe(false);
+    expect(isCardWagerAck({ ...good, kind: undefined })).toBe(false);
+    expect(isCardWagerAck({ ...good, kind: '' })).toBe(false);
+  });
+
+  it('rejects empty / wrong-type ids', () => {
+    expect(isCardWagerAck({ ...good, playerId: '' })).toBe(false);
+    expect(isCardWagerAck({ ...good, playerId: 9 as unknown as string })).toBe(false);
+    expect(isCardWagerAck({ ...good, winnerId: '' })).toBe(false);
+    expect(isCardWagerAck({ ...good, winnerId: null as unknown as string })).toBe(false);
+  });
+
+  it('rejects bad timestamps', () => {
+    expect(isCardWagerAck({ ...good, matchStartedAt: -1 })).toBe(false);
+    expect(isCardWagerAck({ ...good, matchStartedAt: Number.NaN })).toBe(false);
+    expect(isCardWagerAck({ ...good, matchStartedAt: Number.POSITIVE_INFINITY })).toBe(false);
+    expect(isCardWagerAck({ ...good, matchStartedAt: 'now' as unknown as number })).toBe(false);
+    expect(isCardWagerAck({ ...good, ackedAt: -1 })).toBe(false);
+    expect(isCardWagerAck({ ...good, ackedAt: Number.NaN })).toBe(false);
+  });
+});
+
 // ── Conservation invariant helpers ──────────────────────────────────────────
 
 describe('isCardWagerConservationBalanced', () => {
@@ -230,6 +304,37 @@ describe('filterConformingHeld', () => {
   });
 });
 
+describe('deriveHeadsUpWinner', () => {
+  it('the seat holding all the chips wins', () => {
+    expect(deriveHeadsUpWinner({ id: P1, stack: 50 }, { id: P2, stack: 0 })).toBe(P1);
+    expect(deriveHeadsUpWinner({ id: P1, stack: 0 }, { id: P2, stack: 50 })).toBe(P2);
+  });
+
+  it('both seats still holding chips → split', () => {
+    expect(deriveHeadsUpWinner({ id: P1, stack: 25 }, { id: P2, stack: 25 })).toBe('split');
+    expect(deriveHeadsUpWinner({ id: P1, stack: 1 }, { id: P2, stack: 999 })).toBe('split');
+  });
+
+  it('missing seat id → null (not derivable)', () => {
+    expect(deriveHeadsUpWinner({ id: null, stack: 50 }, { id: P2, stack: 0 })).toBeNull();
+    expect(deriveHeadsUpWinner({ id: P1, stack: 50 }, { id: null, stack: 0 })).toBeNull();
+  });
+
+  it('both stacks zero → null (mangled terminal state, never a payout)', () => {
+    expect(deriveHeadsUpWinner({ id: P1, stack: 0 }, { id: P2, stack: 0 })).toBeNull();
+  });
+});
+
+describe('minCardWagerBuyIn', () => {
+  it('poker floor is 20 = 2 × the engine big blind; war keeps the absolute floor', () => {
+    // beginPoker clamps startingStack to at least 2×bigBlind (poker.ts) —
+    // a poker wager below 20 would seat stacks LARGER than the escrow.
+    expect(POKER_MIN_WAGER_BUY_IN).toBe(20);
+    expect(minCardWagerBuyIn('poker')).toBe(POKER_MIN_WAGER_BUY_IN);
+    expect(minCardWagerBuyIn('war')).toBe(MIN_CARD_WAGER_BUY_IN);
+  });
+});
+
 // ── End-to-end round trips on a live Y.Doc ──────────────────────────────────
 
 describe('card wager escrow — pay/settle round trip', () => {
@@ -256,14 +361,17 @@ describe('card wager escrow — pay/settle round trip', () => {
     expect(activateCardWager(OWNER, TABLE, 2_000)).toBe(true);
     expect(readCardWagerConfig(TABLE)?.startedAt).toBe(2_000);
 
-    // Owner settles: P1 wins the pot.
+    // Both payers confirm the result, then the owner settles: P1 wins.
+    ackBoth(P1);
     expect(settleCardWager(OWNER, TABLE, P1)).toBe(true);
     expect(readChips(P1)).toBe(75 + BUY_IN * 2);
     expect(readChips(P2)).toBe(75);
-    // Config and both escrow records are gone.
+    // Config, both escrow records, AND both acks are gone.
     expect(readCardWagerConfig(TABLE)).toBeNull();
     expect(readCardWagerEscrow(TABLE, P1)).toBeNull();
     expect(readCardWagerEscrow(TABLE, P2)).toBeNull();
+    expect(readCardWagerAck(TABLE, P1)).toBeNull();
+    expect(readCardWagerAck(TABLE, P2)).toBeNull();
     // Chip supply preserved: no minting, no burning.
     expect(readChips(P1) + readChips(P2)).toBe(startingSupply);
   });
@@ -275,6 +383,7 @@ describe('card wager escrow — pay/settle round trip', () => {
     payCardWager(P1, TABLE, P1, 1_001);
     payCardWager(P2, TABLE, P2, 1_002);
     activateCardWager(OWNER, TABLE, 2_000);
+    ackBoth('split');
     expect(settleCardWager(OWNER, TABLE, 'split')).toBe(true);
     expect(readChips(P1)).toBe(100);
     expect(readChips(P2)).toBe(100);
@@ -289,6 +398,7 @@ describe('card wager escrow — pay/settle round trip', () => {
     expect(payCardWager(P2, TABLE, P2, 2)).toBe(true);
     expect(scanCardWagerEscrow(TABLE).every((r) => r.kind === 'war')).toBe(true);
     activateCardWager(OWNER, TABLE, 3);
+    ackBoth(P2);
     settleCardWager(OWNER, TABLE, P2);
     expect(readChips(P2)).toBe(60 + 80);
   });
@@ -330,6 +440,7 @@ describe('card wager escrow — pay/settle round trip', () => {
     expect(readChips(P1)).toBe(75);
     payCardWager(P2, TABLE, P2, 3);
     activateCardWager(OWNER, TABLE, 4);
+    ackBoth(P1);
     expect(settleCardWager(OWNER, TABLE, P1)).toBe(true);
     // Second settle: config deleted → refuses. Cannot double-credit.
     expect(settleCardWager(OWNER, TABLE, P1)).toBe(false);
@@ -442,6 +553,9 @@ describe('card wager escrow — hostile-peer refusals', () => {
     payCardWager(P1, TABLE, P1, 2);
     payCardWager(P2, TABLE, P2, 3);
     activateCardWager(OWNER, TABLE, 4);
+    // Both real payers have already confirmed — the forged record must
+    // STILL block settle (the refusal is structural, not ack-driven).
+    ackBoth(P1);
 
     // Plant a THIRD well-formed record under a bystander id.
     const casinoMap = getBoundCasino();
@@ -470,13 +584,20 @@ describe('card wager escrow — hostile-peer refusals', () => {
     expect(readChips(P1)).toBe(75 + BUY_IN * 2);
   });
 
-  it('over-budget buy-in is refused at config stamp time', () => {
+  it('out-of-range buy-in is refused at config stamp time (per-kind floors)', () => {
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 0, 1)).toBe(false);
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', -5, 1)).toBe(false);
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 1.5, 1)).toBe(false);
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', MAX_CARD_WAGER_BUY_IN + 1, 1)).toBe(false);
-    // MIN and MAX inclusive are OK.
-    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', MIN_CARD_WAGER_BUY_IN, 1)).toBe(true);
+    // Poker's floor is 20 (2 × the engine big blind): a 19-chip buy-in
+    // would seat stacks LARGER than the escrowed pot (beginPoker clamps
+    // startingStack up to 2×bigBlind), so it is refused at the boundary.
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', POKER_MIN_WAGER_BUY_IN - 1, 1)).toBe(false);
+    // War has no blind structure — the absolute floor still applies.
+    expect(stampCardWagerConfig(OWNER, TABLE, 'war', MIN_CARD_WAGER_BUY_IN, 1)).toBe(true);
+    clearCardWagerKeys(OWNER, TABLE);
+    // Per-kind floor and the shared MAX are inclusive.
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', POKER_MIN_WAGER_BUY_IN, 1)).toBe(true);
     clearCardWagerKeys(OWNER, TABLE);
     expect(stampCardWagerConfig(OWNER, TABLE, 'poker', MAX_CARD_WAGER_BUY_IN, 2)).toBe(true);
   });
@@ -494,6 +615,9 @@ describe('card wager escrow — failed settle does not drain', () => {
     payCardWager(P1, TABLE, P1, 2);
     payCardWager(P2, TABLE, P2, 3);
     activateCardWager(OWNER, TABLE, 4);
+    // Both payers agree on P1 — isolates the WRONG-WINNER refusal from
+    // the missing-ack refusal.
+    ackBoth(P1);
 
     // Snapshot pre-state.
     const preP1 = readChips(P1);
@@ -501,13 +625,18 @@ describe('card wager escrow — failed settle does not drain', () => {
     const preHeld = sumHeld(TABLE);
     const preCfg = readCardWagerConfig(TABLE);
 
-    // winnerId not a payer → refused.
+    // winnerId not a payer → refused; winnerId a payer but NOT the
+    // agreed result → also refused (ack-gate mismatch).
     expect(settleCardWager(OWNER, TABLE, P3)).toBe(false);
-    // Nothing changed.
+    expect(settleCardWager(OWNER, TABLE, P2)).toBe(false);
+    expect(settleCardWager(OWNER, TABLE, 'split')).toBe(false);
+    // Nothing changed — acks included.
     expect(readChips(P1)).toBe(preP1);
     expect(readChips(P2)).toBe(preP2);
     expect(sumHeld(TABLE)).toBe(preHeld);
     expect(readCardWagerConfig(TABLE)).toEqual(preCfg);
+    expect(readCardWagerAck(TABLE, P1)).not.toBeNull();
+    expect(readCardWagerAck(TABLE, P2)).not.toBeNull();
   });
 
   it('settle refused before BEGIN does not touch escrow or balances', () => {
@@ -536,6 +665,8 @@ describe('card wager escrow — failed settle does not drain', () => {
     payCardWager(P2, TABLE, P2, 3);
     expect(totalChips(doc, TABLE)).toBe(supply);
     activateCardWager(OWNER, TABLE, 4);
+    expect(totalChips(doc, TABLE)).toBe(supply);
+    ackBoth(P1);
     expect(totalChips(doc, TABLE)).toBe(supply);
     settleCardWager(OWNER, TABLE, P1);
     expect(totalChips(doc, TABLE)).toBe(supply);
@@ -578,8 +709,10 @@ describe('card wager escrow — concurrent divergence', () => {
 
     // Both sides now see both escrow records and identical config.
     expect(scanCardWagerEscrow(TABLE).map((r) => r.playerId).sort()).toEqual([P1, P2]);
-    // Owner can now activate + settle on either side deterministically.
+    // Owner can now activate; both payers confirm; owner settles — all
+    // deterministic on the merged doc.
     expect(activateCardWager(OWNER, TABLE, 4)).toBe(true);
+    ackBoth(P1);
     expect(settleCardWager(OWNER, TABLE, P1)).toBe(true);
     expect(readChips(P1)).toBe(75 + BUY_IN * 2);
     expect(readChips(P2)).toBe(75);
@@ -589,6 +722,258 @@ describe('card wager escrow — concurrent divergence', () => {
     expect(readCardWagerConfig(TABLE)).toBeNull();
     expect(readCardWagerEscrow(TABLE, P1)).toBeNull();
     expect(readCardWagerEscrow(TABLE, P2)).toBeNull();
+    expect(readCardWagerAck(TABLE, P1)).toBeNull();
+    expect(readCardWagerAck(TABLE, P2)).toBeNull();
+  });
+});
+
+// ── TWO-PLAYER CONFIRM GATE (#45 ack slice) ─────────────────────────────────
+
+describe('ackCardWagerResult — write-side refusals', () => {
+  beforeEach(() => { freshDoc(); });
+
+  it('spectator (no escrow record) cannot ack', () => {
+    setupLiveMatch();
+    expect(ackCardWagerResult(P3, TABLE, P1, 5)).toBe(false);
+    expect(readCardWagerAck(TABLE, P3)).toBeNull();
+  });
+
+  it('cannot ack before BEGIN (there is no result to confirm yet)', () => {
+    buyInChips(P1, 100);
+    buyInChips(P2, 100);
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1);
+    payCardWager(P1, TABLE, P1, 2);
+    payCardWager(P2, TABLE, P2, 3);
+    // startedAt still null.
+    expect(ackCardWagerResult(P1, TABLE, P1, 5)).toBe(false);
+    expect(readCardWagerAck(TABLE, P1)).toBeNull();
+  });
+
+  it('winner must be a current payer or the split sentinel', () => {
+    setupLiveMatch();
+    expect(ackCardWagerResult(P1, TABLE, P3, 5)).toBe(false);
+    expect(ackCardWagerResult(P1, TABLE, '', 5)).toBe(false);
+    expect(ackCardWagerResult(P1, TABLE, 'split', 5)).toBe(true);
+  });
+
+  it('empty actor / non-finite time refused', () => {
+    setupLiveMatch();
+    expect(ackCardWagerResult('', TABLE, P1, 5)).toBe(false);
+    expect(ackCardWagerResult(P1, TABLE, P1, Number.NaN)).toBe(false);
+    expect(ackCardWagerResult(P1, TABLE, P1, -1)).toBe(false);
+  });
+
+  it('records the config kind and the matchStartedAt freshness echo', () => {
+    setupLiveMatch(); // activates at nowMs = 4
+    expect(ackCardWagerResult(P1, TABLE, P1, 5)).toBe(true);
+    const ack = readCardWagerAck(TABLE, P1);
+    expect(ack).not.toBeNull();
+    expect(ack!.playerId).toBe(P1);
+    expect(ack!.kind).toBe('poker');
+    expect(ack!.matchStartedAt).toBe(4);
+    expect(ack!.ackedAt).toBe(5);
+  });
+
+  it('re-ack overwrites the own key (LWW — the dispute-resolution path)', () => {
+    setupLiveMatch();
+    expect(ackCardWagerResult(P1, TABLE, P1, 5)).toBe(true);
+    expect(ackCardWagerResult(P1, TABLE, P2, 6)).toBe(true);
+    const ack = readCardWagerAck(TABLE, P1);
+    expect(ack!.winnerId).toBe(P2);
+    expect(ack!.ackedAt).toBe(6);
+  });
+});
+
+describe('readAgreedCardWagerResult — the settle gate\'s source of truth', () => {
+  beforeEach(() => { freshDoc(); });
+
+  it('null with no config / before BEGIN', () => {
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+    buyInChips(P1, 100);
+    buyInChips(P2, 100);
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1);
+    payCardWager(P1, TABLE, P1, 2);
+    payCardWager(P2, TABLE, P2, 3);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+  });
+
+  it('null while either ack is missing; the winner id once both agree', () => {
+    setupLiveMatch();
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+    ackCardWagerResult(P1, TABLE, P1, 5);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+    ackCardWagerResult(P2, TABLE, P1, 6);
+    expect(readAgreedCardWagerResult(TABLE)).toBe(P1);
+  });
+
+  it("'split' agreement round-trips", () => {
+    setupLiveMatch();
+    ackBoth('split');
+    expect(readAgreedCardWagerResult(TABLE)).toBe('split');
+  });
+
+  it('null when the two acks disagree (DISPUTED), non-null again after a re-ack', () => {
+    setupLiveMatch();
+    ackCardWagerResult(P1, TABLE, P1, 5);
+    ackCardWagerResult(P2, TABLE, P2, 6);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+    // P2 concedes on a re-look: LWW re-ack resolves the dispute.
+    ackCardWagerResult(P2, TABLE, P1, 7);
+    expect(readAgreedCardWagerResult(TABLE)).toBe(P1);
+  });
+
+  it('null when an ack is STALE (matchStartedAt from a previous match)', () => {
+    setupLiveMatch(); // startedAt = 4
+    ackCardWagerResult(P1, TABLE, P1, 5);
+    // Hostile replay: a well-formed ack for P2 minted against an older match.
+    getBoundCasino().set(cardWagerAckKey(TABLE, P2), {
+      kind: 'poker', playerId: P2, winnerId: P1,
+      matchStartedAt: 999, ackedAt: 5,
+    } satisfies CardWagerAck);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+  });
+
+  it("null when an ack sits under the WRONG key (peer-planted vote)", () => {
+    setupLiveMatch();
+    ackCardWagerResult(P1, TABLE, P1, 5);
+    // A peer plants P1's ack payload under P2's key — the key/payload
+    // playerId binding refuses it, so P2's "vote" was never cast.
+    getBoundCasino().set(cardWagerAckKey(TABLE, P2), {
+      kind: 'poker', playerId: P1, winnerId: P1,
+      matchStartedAt: 4, ackedAt: 5,
+    } satisfies CardWagerAck);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+  });
+
+  it('null when an ack kind mismatches the config kind', () => {
+    setupLiveMatch();
+    ackCardWagerResult(P1, TABLE, P1, 5);
+    getBoundCasino().set(cardWagerAckKey(TABLE, P2), {
+      kind: 'war', playerId: P2, winnerId: P1,
+      matchStartedAt: 4, ackedAt: 5,
+    } satisfies CardWagerAck);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+  });
+
+  it('null when the escrow set is not a clean heads-up pair', () => {
+    setupLiveMatch();
+    ackBoth(P1);
+    expect(readAgreedCardWagerResult(TABLE)).toBe(P1);
+    // A forged third record voids "both payers agree".
+    getBoundCasino().set(cardWagerEscrowKey(TABLE, P3), {
+      kind: 'poker', amount: BUY_IN, ownerId: OWNER, playerId: P3,
+      paidAt: 5, state: 'held',
+    } satisfies CardWagerRecord);
+    expect(readAgreedCardWagerResult(TABLE)).toBeNull();
+  });
+});
+
+describe('card wager settle — two-player confirm gate', () => {
+  beforeEach(() => { freshDoc(); });
+
+  it('settle refused until BOTH payers have confirmed', () => {
+    setupLiveMatch();
+    expect(settleCardWager(OWNER, TABLE, P1)).toBe(false);
+    ackCardWagerResult(P1, TABLE, P1, 5);
+    expect(settleCardWager(OWNER, TABLE, P1)).toBe(false);
+    expect(sumHeld(TABLE)).toBe(BUY_IN * 2);
+    ackCardWagerResult(P2, TABLE, P1, 6);
+    expect(settleCardWager(OWNER, TABLE, P1)).toBe(true);
+    expect(readChips(P1)).toBe(75 + BUY_IN * 2);
+  });
+
+  it('the owner cannot pay out a result the payers did not agree on', () => {
+    setupLiveMatch();
+    ackBoth(P2);
+    // Payers agreed on P2 — the owner cannot steer the pot to P1.
+    expect(settleCardWager(OWNER, TABLE, P1)).toBe(false);
+    expect(settleCardWager(OWNER, TABLE, 'split')).toBe(false);
+    expect(settleCardWager(OWNER, TABLE, P2)).toBe(true);
+    expect(readChips(P2)).toBe(75 + BUY_IN * 2);
+  });
+
+  it('activate sweeps stale acks left over from a previous match', () => {
+    buyInChips(P1, 100);
+    buyInChips(P2, 100);
+    stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1);
+    payCardWager(P1, TABLE, P1, 2);
+    payCardWager(P2, TABLE, P2, 3);
+    // A well-formed ack from an earlier round is still sitting on the key.
+    getBoundCasino().set(cardWagerAckKey(TABLE, P1), {
+      kind: 'poker', playerId: P1, winnerId: P1,
+      matchStartedAt: 999, ackedAt: 1,
+    } satisfies CardWagerAck);
+    expect(readCardWagerAck(TABLE, P1)).not.toBeNull();
+    expect(activateCardWager(OWNER, TABLE, 4)).toBe(true);
+    // Swept at BEGIN — the freshness echo would refuse it anyway; the
+    // sweep keeps dead keys from accumulating.
+    expect(readCardWagerAck(TABLE, P1)).toBeNull();
+  });
+
+  it('clearCardWagerKeys sweeps acks on both the owner and recovery paths', () => {
+    // Owner path: live match, both confirmed, owner aborts instead.
+    setupLiveMatch();
+    ackBoth(P1);
+    expect(refundCardWager(OWNER, TABLE, P1)).toBe(true);
+    expect(refundCardWager(OWNER, TABLE, P2)).toBe(true);
+    expect(clearCardWagerKeys(OWNER, TABLE)).toBe(true);
+    expect(readCardWagerAck(TABLE, P1)).toBeNull();
+    expect(readCardWagerAck(TABLE, P2)).toBeNull();
+    // Recovery path: an orphaned ack with NO owning config — anyone clears.
+    getBoundCasino().set(cardWagerAckKey('table-orphan', P1), {
+      kind: 'poker', playerId: P1, winnerId: P1,
+      matchStartedAt: 1, ackedAt: 2,
+    } satisfies CardWagerAck);
+    expect(clearCardWagerKeys(P3, 'table-orphan')).toBe(true);
+    expect(readCardWagerAck('table-orphan', P1)).toBeNull();
+  });
+});
+
+// ── RE-STAMP GUARDS (#45 hardening) ─────────────────────────────────────────
+
+describe('stampCardWagerConfig — re-stamp guards', () => {
+  beforeEach(() => { freshDoc(); });
+
+  it('identical re-stamp stays legal while un-started (crash-retry path)', () => {
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1)).toBe(true);
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 2)).toBe(true);
+    expect(readCardWagerConfig(TABLE)?.createdAt).toBe(2);
+  });
+
+  it('changing terms is legal while nothing is escrowed', () => {
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 25, 1)).toBe(true);
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 30, 2)).toBe(true);
+    expect(readCardWagerConfig(TABLE)?.buyIn).toBe(30);
+    expect(stampCardWagerConfig(OWNER, TABLE, 'war', 40, 3)).toBe(true);
+    expect(readCardWagerConfig(TABLE)?.kind).toBe('war');
+  });
+
+  it('ESCROW-FREEZE: terms cannot drift under an existing pay-in', () => {
+    buyInChips(P1, 100);
+    stampCardWagerConfig(OWNER, TABLE, 'poker', 25, 1);
+    payCardWager(P1, TABLE, P1, 2);
+    // Both the amount and the kind are frozen…
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 30, 3)).toBe(false);
+    expect(stampCardWagerConfig(OWNER, TABLE, 'war', 25, 3)).toBe(false);
+    // …but an identical re-stamp (crash retry) still passes.
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 25, 4)).toBe(true);
+    expect(readCardWagerConfig(TABLE)?.buyIn).toBe(25);
+    expect(readCardWagerConfig(TABLE)?.kind).toBe('poker');
+  });
+
+  it('LIVE-MATCH LOCK: no re-stamp of any shape once the match began', () => {
+    setupLiveMatch();
+    // A successful re-stamp here would reset startedAt to null and REOPEN
+    // the self-refund window mid-match — refused, identical terms or not.
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 9)).toBe(false);
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', 30, 9)).toBe(false);
+    expect(readCardWagerConfig(TABLE)?.startedAt).toBe(4);
+  });
+
+  it('non-owner cannot re-stamp an existing config', () => {
+    expect(stampCardWagerConfig(OWNER, TABLE, 'poker', BUY_IN, 1)).toBe(true);
+    expect(stampCardWagerConfig(P1, TABLE, 'poker', BUY_IN, 2)).toBe(false);
+    expect(readCardWagerConfig(TABLE)?.ownerId).toBe(OWNER);
   });
 });
 

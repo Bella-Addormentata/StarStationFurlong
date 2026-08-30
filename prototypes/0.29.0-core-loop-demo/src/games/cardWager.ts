@@ -125,6 +125,22 @@ export const MIN_CARD_WAGER_BUY_IN = 1;
  *  attacks (a maliciously-large buyIn record trying to inflate the pot). */
 export const MAX_CARD_WAGER_BUY_IN = 1_000_000;
 
+/**
+ * Poker-specific floor. `beginPoker` seats each stack at the wager buy-in
+ * but clamps it UP to `2 × bigBlind` (= 20 with the engine's bigBlind: 10)
+ * so the first hand can post blinds. A wager below that floor would play
+ * with in-game stacks LARGER than the chips actually escrowed — the match
+ * would be fought over more than the pot pays. Refused at the config
+ * boundary instead of silently clamped.
+ */
+export const POKER_MIN_WAGER_BUY_IN = 20;
+
+/** The per-kind buy-in floor (poker carries the engine blind floor; war has
+ *  no blind structure, so the absolute floor applies). */
+export function minCardWagerBuyIn(kind: CardWagerKind): number {
+  return kind === 'poker' ? POKER_MIN_WAGER_BUY_IN : MIN_CARD_WAGER_BUY_IN;
+}
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 /**
@@ -179,6 +195,42 @@ export interface CardWagerRecord {
   state: CardWagerRecordState;
 }
 
+/**
+ * Per-player RESULT ACKNOWLEDGMENT. Written only by `playerId` (their own
+ * `cw-ack:<tableId>:<playerId>` key) after the match reaches its terminal
+ * state. Settle is gated on BOTH payers' acks agreeing — the owner alone
+ * can no longer pick the winner.
+ *
+ * WHY: the owner is the sole settle authority, and pre-ack the winner was
+ * derived from the poker doc the owner's client read. A hostile peer who
+ * forged a terminal PokerState (raw whole-value LWW write — the doc is
+ * unauthenticated until the chia-gaming referee lands) could steer an
+ * HONEST owner into paying the wrong seat. With the ack gate, the losing
+ * player's client independently derives the result from ITS view and
+ * refuses to confirm a forged outcome — the settle then simply never
+ * fires, and the owner's abandonment refund returns both buy-ins.
+ *
+ * WHAT THIS DOES NOT DEFEND (documented trust posture): a MALICIOUS owner
+ * colluding with one payer, or raw-writing balances, is out of scope for
+ * v1 — that is exactly the chia-gaming referee's job (see the contract
+ * table above). The ack gate closes the "deceived honest owner" hole only.
+ *
+ * `matchStartedAt` echoes `config.startedAt` — an ack from a PREVIOUS
+ * match on the same table (stale key, or a replayed value) fails the
+ * freshness check and cannot gate a later match's settle.
+ */
+export interface CardWagerAck {
+  kind: CardWagerKind;
+  /** The acking payer — this key's sole writer. */
+  playerId: string;
+  /** The payer this ack names as winner, or 'split' for a tie. */
+  winnerId: string | 'split';
+  /** Echo of `config.startedAt` for the match being acked (freshness). */
+  matchStartedAt: number;
+  /** ms wall-clock at ack time (payer stamp). */
+  ackedAt: number;
+}
+
 // ── Shape guards ─────────────────────────────────────────────────────────────
 
 function isPositiveInt(v: unknown, max: number = Number.MAX_SAFE_INTEGER): v is number {
@@ -226,10 +278,27 @@ export function isCardWagerRecord(value: unknown): value is CardWagerRecord {
   return true;
 }
 
+/** Guard for a `CardWagerAck` read out of the casino map. Hostile-peer
+ *  surface like the other two shapes — `winnerId` may be any non-empty
+ *  string ('split' is the tie sentinel; whether it names a REAL payer is
+ *  a read-side check in `readAgreedCardWagerResult`, which also binds
+ *  `playerId` to the key it was read from). */
+export function isCardWagerAck(value: unknown): value is CardWagerAck {
+  if (typeof value !== 'object' || value === null) return false;
+  const a = value as Partial<CardWagerAck>;
+  if (!CARD_WAGER_KINDS.includes(a.kind as CardWagerKind)) return false;
+  if (!isNonEmptyString(a.playerId)) return false;
+  if (!isNonEmptyString(a.winnerId)) return false;
+  if (!isFiniteNumber(a.matchStartedAt) || (a.matchStartedAt as number) < 0) return false;
+  if (!isFiniteNumber(a.ackedAt) || (a.ackedAt as number) < 0) return false;
+  return true;
+}
+
 // ── Key layout (import-friendly constants for casinoDoc.ts) ─────────────────
 
 export const CARD_WAGER_CONFIG_PREFIX = 'cw-cfg:';
 export const CARD_WAGER_ESCROW_PREFIX = 'cw-escrow:';
+export const CARD_WAGER_ACK_PREFIX = 'cw-ack:';
 
 /** Build the config key for one table (single writer: config owner). */
 export function cardWagerConfigKey(tableId: string): string {
@@ -239,6 +308,11 @@ export function cardWagerConfigKey(tableId: string): string {
 /** Build the per-player escrow key (single writer: the payer). */
 export function cardWagerEscrowKey(tableId: string, playerId: string): string {
   return `${CARD_WAGER_ESCROW_PREFIX}${tableId}:${playerId}`;
+}
+
+/** Build the per-player result-ack key (single writer: the acking payer). */
+export function cardWagerAckKey(tableId: string, playerId: string): string {
+  return `${CARD_WAGER_ACK_PREFIX}${tableId}:${playerId}`;
 }
 
 // ── Pure derivation helpers (no doc / DOM / clock) ──────────────────────────
@@ -282,4 +356,30 @@ export function filterConformingHeld(
   buyIn: number,
 ): CardWagerRecord[] {
   return records.filter((r) => r.state === 'held' && r.amount === buyIn);
+}
+
+/**
+ * Derive the heads-up match result from two terminal seat stacks — the
+ * SAME rule every client applies, so honest peers agree without any
+ * message exchange:
+ *
+ *   - one seat holds all the chips, the other zero  → that seat's id
+ *   - both seats still hold chips                   → 'split'
+ *   - a seat id missing, or both stacks zero        → null (not derivable;
+ *     a normal terminal PokerState never looks like this)
+ *
+ * Structural parameters (id + stack only) keep this module decoupled from
+ * the poker engine's types; devices.ts passes the two seats straight in.
+ * Used for the ACK default (each payer confirms what their OWN doc view
+ * derives) and by the owner's settle trigger.
+ */
+export function deriveHeadsUpWinner(
+  a: { id: string | null; stack: number },
+  b: { id: string | null; stack: number },
+): string | 'split' | null {
+  if (a.id === null || b.id === null) return null;
+  if (a.stack > 0 && b.stack === 0) return a.id;
+  if (b.stack > 0 && a.stack === 0) return b.id;
+  if (a.stack > 0 && b.stack > 0) return 'split';
+  return null;
 }

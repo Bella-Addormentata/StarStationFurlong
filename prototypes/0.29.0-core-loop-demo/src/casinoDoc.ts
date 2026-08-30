@@ -58,13 +58,13 @@ import type {
 // single-writer for each escrow record (mirrors the air-hockey fee
 // discipline reviewed clean on PR #116).
 import {
-  cardWagerConfigKey, cardWagerEscrowKey,
-  CARD_WAGER_ESCROW_PREFIX,
-  MAX_CARD_WAGER_BUY_IN, MIN_CARD_WAGER_BUY_IN,
-  isCardWagerConfig, isCardWagerRecord,
+  cardWagerConfigKey, cardWagerEscrowKey, cardWagerAckKey,
+  CARD_WAGER_ESCROW_PREFIX, CARD_WAGER_ACK_PREFIX,
+  MAX_CARD_WAGER_BUY_IN, minCardWagerBuyIn,
+  isCardWagerConfig, isCardWagerRecord, isCardWagerAck,
 } from './games/cardWager';
 import type {
-  CardWagerConfig, CardWagerKind, CardWagerRecord,
+  CardWagerAck, CardWagerConfig, CardWagerKind, CardWagerRecord,
 } from './games/cardWager';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
@@ -825,9 +825,11 @@ export function clearSlotMachineKeys(machineId: string): void {
 }
 
 // ── 🃏🎰 #45 CARD WAGER: chip-escrowed table stakes ─────────────────────────
-// Keys (owner writes cfg; each payer writes only their own escrow record):
+// Keys (owner writes cfg; each payer writes only their own escrow + ack):
 //   cw-cfg:<tableId>             → CardWagerConfig  (owner-written)
 //   cw-escrow:<tableId>:<pid>    → CardWagerRecord  (payer-written)
+//   cw-ack:<tableId>:<pid>       → CardWagerAck     (payer-written; settle
+//                                  is gated on both payers' acks agreeing)
 //
 // TRUST BOUNDARY
 //   Peers write the casino Y.Map unauthenticated. Every read below runs
@@ -862,6 +864,20 @@ export function readCardWagerConfig(tableId: string): CardWagerConfig | null {
  * key. Refuses to overwrite an existing config with a DIFFERENT ownerId
  * (single-writer discipline for the config key).
  *
+ * RE-STAMP RULES (the stamp always writes `startedAt: null`, so an
+ * unguarded overwrite is an escrow-integrity hazard, not a no-op):
+ *   - While a match is LIVE (`existing.startedAt !== null`) every
+ *     re-stamp is refused — resetting `startedAt` to null would reopen
+ *     the self-refund window mid-match, letting the losing seat pull
+ *     their buy-in back out from under the running game.
+ *   - While any well-formed escrow record exists, `buyIn` / `kind` are
+ *     FROZEN — a payer escrowed against the OLD terms, and re-pricing
+ *     under them would make activate/settle read their record as
+ *     non-conforming (amount ≠ buyIn), stranding their chips behind the
+ *     owner-refund path.
+ *   - An IDENTICAL re-stamp (same kind, same buyIn, pre-start) stays
+ *     legal for crash-retry idempotency; it only refreshes `createdAt`.
+ *
  * The write is atomic within one transact — nothing else is touched.
  * Balances / escrow records are unaffected; this only records intent.
  */
@@ -872,7 +888,7 @@ export function stampCardWagerConfig(
   buyIn: number,
   nowMs: number,
 ): boolean {
-  if (!Number.isInteger(buyIn) || buyIn < MIN_CARD_WAGER_BUY_IN
+  if (!Number.isInteger(buyIn) || buyIn < minCardWagerBuyIn(kind)
     || buyIn > MAX_CARD_WAGER_BUY_IN) return false;
   if (typeof actorId !== 'string' || actorId.length === 0) return false;
   if (!Number.isFinite(nowMs) || nowMs < 0) return false;
@@ -882,6 +898,12 @@ export function stampCardWagerConfig(
   if (existing !== undefined) {
     if (!isCardWagerConfig(existing)) return false;
     if (existing.ownerId !== actorId) return false;
+    // Live-match lock: chips are committed to the running match; only
+    // settle or the owner's cancel/refund path may release them.
+    if (existing.startedAt !== null) return false;
+    // Escrow-freeze: terms cannot drift under an existing pay-in.
+    if ((existing.buyIn !== buyIn || existing.kind !== kind)
+      && scanCardWagerEscrow(tableId).length > 0) return false;
   }
   const cfg: CardWagerConfig = {
     kind, buyIn, ownerId: actorId, createdAt: nowMs, startedAt: null,
@@ -1005,8 +1027,15 @@ export function activateCardWager(
   }
   if (records[0].playerId === records[1].playerId) return false;
   const map = ensureMap();
+  const ackPrefix = `${CARD_WAGER_ACK_PREFIX}${tableId}:`;
   boundDoc!.transact(() => {
     map.set(cardWagerConfigKey(tableId), { ...cfg, startedAt: nowMs });
+    // Sweep any result-acks left from a previous match on this table —
+    // the freshness echo (`matchStartedAt`) already refuses them at read
+    // time; deleting here keeps the doc from accumulating dead keys.
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(ackPrefix)) map.delete(key);
+    }
   });
   return true;
 }
@@ -1060,6 +1089,95 @@ export function refundCardWager(
   return true;
 }
 
+/** Read one player's result-ack (shape-guarded; binding of `playerId` to
+ *  the key it sits under is the caller's read-side check — see
+ *  `readAgreedCardWagerResult`). */
+export function readCardWagerAck(
+  tableId: string,
+  playerId: string,
+): CardWagerAck | null {
+  const v = ensureMap().get(cardWagerAckKey(tableId, playerId));
+  return isCardWagerAck(v) ? v : null;
+}
+
+/**
+ * A payer CONFIRMS the match result. Own-key write (`cw-ack:` + own id) —
+ * the two escrow holders are the only voters, and each may re-ack to
+ * change their answer any time before settle (whole-value LWW on their
+ * own key; that is the dispute-resolution path when views diverge).
+ *
+ * Refuses when:
+ *   - No config, or match not begun (`startedAt === null`) — there is no
+ *     result to confirm yet.
+ *   - The actor holds no well-formed escrow record (spectators and forged
+ *     third seats get no vote).
+ *   - `winnerId` is neither 'split' nor one of the CURRENT payers.
+ */
+export function ackCardWagerResult(
+  actorId: string,
+  tableId: string,
+  winnerId: string | 'split',
+  nowMs: number,
+): boolean {
+  if (typeof actorId !== 'string' || actorId.length === 0) return false;
+  if (typeof winnerId !== 'string' || winnerId.length === 0) return false;
+  if (!Number.isFinite(nowMs) || nowMs < 0) return false;
+  const cfg = readCardWagerConfig(tableId);
+  if (!cfg) return false;
+  if (cfg.startedAt === null) return false;
+  const records = scanCardWagerEscrow(tableId);
+  const payerIds = records.map((r) => r.playerId);
+  if (!payerIds.includes(actorId)) return false;
+  if (winnerId !== 'split' && !payerIds.includes(winnerId)) return false;
+  const ack: CardWagerAck = {
+    kind: cfg.kind, playerId: actorId, winnerId,
+    matchStartedAt: cfg.startedAt, ackedAt: nowMs,
+  };
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(cardWagerAckKey(tableId, actorId), ack);
+  });
+  return true;
+}
+
+/**
+ * The AGREED result for a table's live match, or null while agreement is
+ * absent (an ack missing, stale, mis-bound, or the two acks conflict).
+ * This is the settle gate's single source of truth; it re-derives from
+ * the doc on every call so a mid-flight refund / re-ack is always seen.
+ *
+ * Null (not an error) when:
+ *   - config absent or match not begun;
+ *   - the escrow set is not the exact heads-up pair settle requires
+ *     (anything else makes "both payers agree" meaningless);
+ *   - either payer's ack is missing / malformed;
+ *   - an ack's `playerId` doesn't match the key it was read from
+ *     (peer-planted ack under someone else's key);
+ *   - an ack's `matchStartedAt` ≠ `config.startedAt` (stale — from a
+ *     previous match on this table);
+ *   - the two acks name different winners (DISPUTED — the UI surfaces
+ *     it; re-acks or the owner's cancel/refund resolve it).
+ */
+export function readAgreedCardWagerResult(tableId: string): string | 'split' | null {
+  const cfg = readCardWagerConfig(tableId);
+  if (!cfg) return null;
+  if (cfg.startedAt === null) return null;
+  const records = scanCardWagerEscrow(tableId);
+  if (records.length !== 2) return null;
+  if (records[0].playerId === records[1].playerId) return null;
+  let agreed: string | 'split' | null = null;
+  for (const r of records) {
+    const ack = readCardWagerAck(tableId, r.playerId);
+    if (!ack) return null;
+    if (ack.playerId !== r.playerId) return null;
+    if (ack.kind !== cfg.kind) return null;
+    if (ack.matchStartedAt !== cfg.startedAt) return null;
+    if (agreed === null) agreed = ack.winnerId;
+    else if (agreed !== ack.winnerId) return null;
+  }
+  return agreed;
+}
+
 /**
  * SETTLE — winner takes the pot. Owner reads both escrow records, credits
  * the winner's balance by their sum (= 2 × buyIn for the standard match;
@@ -1079,9 +1197,13 @@ export function refundCardWager(
  *     in cardWager.test.ts).
  *   - Any recorded amount != config.buyIn.
  *   - `winnerId` not 'split' and not present as a payer.
+ *   - BOTH payers' result-acks are not present-fresh-and-agreeing on
+ *     exactly `winnerId` (`readAgreedCardWagerResult` — the two-player
+ *     confirmation gate; the owner cannot unilaterally pick a winner).
  *
- * Idempotent: after a successful settle both records + config are gone,
- * so a second call reads no config and returns false (no double-credit).
+ * Idempotent: after a successful settle both records + config + acks are
+ * gone, so a second call reads no config and returns false (no
+ * double-credit).
  *
  * The single transact is the mid-settle-throw safeguard: Yjs applies
  * the whole set of `map.set` / `map.delete` writes in one commit. All
@@ -1116,6 +1238,14 @@ export function settleCardWager(
   // hostile "same player twice under different keys" edge if a peer
   // ever finds a way to spoof the key layout.
   if (payerIds[0] === payerIds[1]) return false;
+  // ACK GATE — both payers must have confirmed THIS match's result, and
+  // the settle argument must match what they agreed on. The owner alone
+  // can no longer pick the winner: a forged terminal PokerState steering
+  // an honest owner dies here, because the cheated payer's client never
+  // confirms it. (A malicious OWNER remains out of scope — that is the
+  // chia-gaming referee's job; see cardWager.ts `CardWagerAck` docs.)
+  const agreed = readAgreedCardWagerResult(tableId);
+  if (agreed === null || agreed !== winnerId) return false;
   const pot = records.reduce((sum, r) => sum + r.amount, 0);
   const map = ensureMap();
   if (winnerId === 'split') {
@@ -1127,6 +1257,7 @@ export function settleCardWager(
       map.set(balKey1, bal1 + records[1].amount);
       for (const pid of payerIds) {
         map.delete(cardWagerEscrowKey(tableId, pid));
+        map.delete(cardWagerAckKey(tableId, pid));
       }
       map.delete(cardWagerConfigKey(tableId));
     });
@@ -1140,6 +1271,7 @@ export function settleCardWager(
     map.set(winnerBalKey, winnerBal + pot);
     for (const pid of payerIds) {
       map.delete(cardWagerEscrowKey(tableId, pid));
+      map.delete(cardWagerAckKey(tableId, pid));
     }
     map.delete(cardWagerConfigKey(tableId));
   });
@@ -1161,10 +1293,11 @@ export function clearCardWagerKeys(actorId: string, tableId: string): boolean {
   if (!cfg) {
     const map = ensureMap();
     const escrowPrefix = `${CARD_WAGER_ESCROW_PREFIX}${tableId}:`;
+    const ackPrefix = `${CARD_WAGER_ACK_PREFIX}${tableId}:`;
     boundDoc!.transact(() => {
       map.delete(cardWagerConfigKey(tableId));
       for (const key of [...map.keys()]) {
-        if (key.startsWith(escrowPrefix)) map.delete(key);
+        if (key.startsWith(escrowPrefix) || key.startsWith(ackPrefix)) map.delete(key);
       }
     });
     return true;
@@ -1172,10 +1305,11 @@ export function clearCardWagerKeys(actorId: string, tableId: string): boolean {
   if (actorId !== cfg.ownerId) return false;
   const map = ensureMap();
   const escrowPrefix = `${CARD_WAGER_ESCROW_PREFIX}${tableId}:`;
+  const ackPrefix = `${CARD_WAGER_ACK_PREFIX}${tableId}:`;
   boundDoc!.transact(() => {
     map.delete(cardWagerConfigKey(tableId));
     for (const key of [...map.keys()]) {
-      if (key.startsWith(escrowPrefix)) map.delete(key);
+      if (key.startsWith(escrowPrefix) || key.startsWith(ackPrefix)) map.delete(key);
     }
   });
   return true;
@@ -1205,5 +1339,6 @@ if (typeof window !== 'undefined') {
     readCardWagerConfig, stampCardWagerConfig, readCardWagerEscrow,
     scanCardWagerEscrow, payCardWager, refundCardWager,
     activateCardWager, settleCardWager, clearCardWagerKeys,
+    readCardWagerAck, ackCardWagerResult, readAgreedCardWagerResult,
   };
 }
