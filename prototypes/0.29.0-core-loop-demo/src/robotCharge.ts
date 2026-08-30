@@ -201,6 +201,32 @@ function clampPercent(p: number): number {
   return p;
 }
 
+// ── Low-charge override latch (hysteresis) ───────────────────────────────────
+
+/** Pure hysteresis step for the render layer's low-charge override latch.
+ *  Called once per frame with last frame's latch + this frame's dock context
+ *  and reading; the result is both the new latch value and "force DOCK now".
+ *
+ *  Semantics (the whole point is the asymmetry):
+ *    • ARM on the low edge — `reading.low` (raw percent under the owner's
+ *      threshold) while un-latched.
+ *    • HOLD while latched until the bot is DOCKED with a FULL battery
+ *      (rounded percent back at 100). Releasing at the low threshold instead
+ *      would ping-pong the bot at the pad edge: resume duty at 20.0x %, drain
+ *      under 20 % within a second, walk straight back — forever.
+ *    • A robot with NO dock never latches (nowhere to walk home to); losing
+ *      the dock mid-walk releases the latch the same way.
+ */
+export function nextLowChargeLatch(
+  prevLatched: boolean,
+  hasDock: boolean,
+  docked: boolean,
+  reading: ChargeReading,
+): boolean {
+  if (!hasDock) return false;
+  return prevLatched ? !docked || reading.percent < 100 : reading.low;
+}
+
 // ── Dock claim helper (multi-dock determinism) ───────────────────────────────
 
 /** Read-only view of a dock's placed position. */

@@ -4,7 +4,9 @@
  * These tests cover the ENGINE-PURE side (no THREE, no Y.js) of the robot
  * charge model: shape+bounds guards on hostile ChargeParams, deterministic
  * charge/discharge derivation from a dt sequence, low-charge trigger,
- * dt-clamp safety, and the multi-dock claim's nearest+stable-tie-break rule.
+ * dt-clamp safety, the low-charge override latch's hysteresis (arm on low
+ * edge, hold until docked-and-full), and the multi-dock claim's
+ * nearest+stable-tie-break rule.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -18,8 +20,10 @@ import {
   LOW_PERCENT_MIN,
   RobotChargeTracker,
   isChargeParams,
+  nextLowChargeLatch,
   pickDockForRobot,
   type ChargeParams,
+  type ChargeReading,
   type DockCandidate,
 } from './robotCharge';
 
@@ -191,6 +195,105 @@ describe('RobotChargeTracker — safety and edge cases', () => {
     // Split into 1 s ticks so DT_CEILING (5 s) doesn't clamp the total.
     for (let i = 0; i < 30; i++) t.advance(1, false);
     expect(t.percent()).toBeCloseTo(90, 5);
+  });
+});
+
+// ── nextLowChargeLatch — override hysteresis ─────────────────────────────────
+
+describe('nextLowChargeLatch', () => {
+  /** Literal ChargeReading for the pure state-table cases. The latch only
+   *  consumes `percent` (rounded display value) and `low` (raw-threshold
+   *  flag); `charging`/`full` are derived here the same way reading() does so
+   *  the fixture can't drift from the real shape. */
+  const reading = (percent: number, low: boolean, docked = false): ChargeReading => ({
+    percent,
+    charging: docked && percent < 100,
+    full: docked && percent >= 100,
+    low,
+  });
+
+  it('arms on the low edge while un-latched', () => {
+    expect(nextLowChargeLatch(false, true, false, reading(19, true))).toBe(true);
+  });
+
+  it('does not arm while the battery is not low', () => {
+    expect(nextLowChargeLatch(false, true, false, reading(55, false))).toBe(false);
+    expect(nextLowChargeLatch(false, true, true, reading(100, false, true))).toBe(false);
+  });
+
+  it('HOLDS while latched and undocked, even once percent is back above threshold', () => {
+    // The ping-pong regression: releasing here would let the bot resume duty
+    // at 20.0x %, drain under threshold within a second, and walk right back.
+    expect(nextLowChargeLatch(true, true, false, reading(25, false))).toBe(true);
+    expect(nextLowChargeLatch(true, true, false, reading(99, false))).toBe(true);
+  });
+
+  it('HOLDS while docked but not yet full', () => {
+    expect(nextLowChargeLatch(true, true, true, reading(21, false, true))).toBe(true);
+    expect(nextLowChargeLatch(true, true, true, reading(99, false, true))).toBe(true);
+  });
+
+  it('releases exactly at docked AND displayed 100 %', () => {
+    expect(nextLowChargeLatch(true, true, true, reading(100, false, true))).toBe(false);
+    // …and stays released the following frame.
+    expect(nextLowChargeLatch(false, true, true, reading(100, false, true))).toBe(false);
+  });
+
+  it('keys release off the DISPLAYED (rounded) percent so console and bot agree', () => {
+    // reading() rounds — raw 99.6 displays as 100 and flags full. The latch
+    // must release on that same value: holding until raw 100 would leave the
+    // bot parked while the console says "✅ FULL 100 %" (up to ~9 s at the
+    // slowest legal charge rate) — a dishonest UI state.
+    expect(nextLowChargeLatch(true, true, true, reading(100, false, true))).toBe(false);
+    // Displayed 99 (raw ≤ 99.49…) still holds.
+    expect(nextLowChargeLatch(true, true, true, reading(99, false, true))).toBe(true);
+  });
+
+  it('never latches without a dock, and releases if the dock disappears mid-hold', () => {
+    expect(nextLowChargeLatch(false, false, false, reading(5, true))).toBe(false);
+    expect(nextLowChargeLatch(true, false, false, reading(5, true))).toBe(false);
+  });
+
+  it('end-to-end with a real tracker: arm → hold through threshold re-cross → release at full', () => {
+    const params: ChargeParams = { dischargeSecs: 100, chargeSecs: 50, lowPercent: 20 };
+    const t = new RobotChargeTracker(params, 21);
+    let latched = false;
+
+    // Drain 2 s undocked (1 %/s) → 19 %, low → latch ARMS.
+    t.advance(1, false); t.advance(1, false);
+    latched = nextLowChargeLatch(latched, true, false, t.reading());
+    expect(t.percent()).toBeCloseTo(19, 5);
+    expect(latched).toBe(true);
+
+    // Walk-to-dock frames (still undocked, still draining) → latch holds.
+    t.advance(1, false);
+    latched = nextLowChargeLatch(latched, true, false, t.reading());
+    expect(latched).toBe(true);
+
+    // Docked: charge 2 %/s. After 2 s → 22 % — ABOVE threshold, but the latch
+    // must hold (this exact frame is where the pre-fix code released and the
+    // bot ping-ponged off the pad).
+    t.advance(1, true); t.advance(1, true);
+    latched = nextLowChargeLatch(latched, true, true, t.reading());
+    expect(t.percent()).toBeCloseTo(22, 5);
+    expect(t.reading().low).toBe(false);
+    expect(latched).toBe(true);
+
+    // Keep charging to full (39 more seconds ≥ 78 %) → releases at 100.
+    for (let i = 0; i < 45; i++) {
+      t.advance(1, true);
+      latched = nextLowChargeLatch(latched, true, true, t.reading());
+    }
+    expect(t.percent()).toBe(100);
+    expect(latched).toBe(false);
+  });
+
+  it('does not arm at exactly lowPercent (low is a strict raw-percent comparison)', () => {
+    const params: ChargeParams = { dischargeSecs: 100, chargeSecs: 50, lowPercent: 20 };
+    const t = new RobotChargeTracker(params, 25);
+    for (let i = 0; i < 5; i++) t.advance(1, false); // exactly 20 %
+    expect(t.percent()).toBeCloseTo(20, 5);
+    expect(nextLowChargeLatch(false, true, false, t.reading())).toBe(false);
   });
 });
 

@@ -27,6 +27,7 @@ import {
 // derivation agrees; a hostile ChargeParams is refused inside the tracker.
 import {
   RobotChargeTracker,
+  nextLowChargeLatch,
   type ChargeParams,
   type ChargeReading,
 } from "./robotCharge";
@@ -228,8 +229,9 @@ export class PoolWaiter {
    *  `.reading()` for the owner-visible CHARGE % / state pill. */
   private chargeTracker = new RobotChargeTracker();
   /** 🔋 The last frame's "did we override this bot into DOCK because of low
-   *  charge?" bit — remembered so the override releases smoothly the moment
-   *  the tracker climbs back above threshold (no flicker on the boundary). */
+   *  charge?" latch. Fed through nextLowChargeLatch (robotCharge.ts) each
+   *  frame: arms on the low edge, HOLDS until the bot is docked at 100 % —
+   *  never releases at the threshold itself (that would ping-pong the bot). */
   private lowChargeOverride = false;
   /** 🔋 Cooldown between charging small-talk lines (LOW_CHARGE_SPEAK_SECS). */
   private lowChargeSpeakCooldown = 0;
@@ -483,28 +485,29 @@ export class PoolWaiter {
     // battery under the owner-configured threshold, force the bot home to its
     // dock — the honest "returns to dock and says it's charging" beat. Overrides
     // routine (serve/croupier/custom) but NOT parked (an owner park always
-    // wins). Once at the dock the tracker climbs; the override releases when
-    // the reading is no longer low so the routine resumes without flicker.
+    // wins). The hysteresis lives in the ENGINE-PURE nextLowChargeLatch
+    // (robotCharge.ts, tested): arm on the low edge, hold until docked AND
+    // back at 100 % — releasing at the low threshold instead would ping-pong
+    // the bot at the pad edge forever.
     const chargeReading = this.chargeTracker.reading();
-    if (this.dockTarget && (this.lowChargeOverride ? !dockedNow || chargeReading.percent < 100 : chargeReading.low)) {
-      // Latch the override on the low edge; drop it only when we're docked and
-      // no longer low (a topped-off battery, back on duty).
-      this.lowChargeOverride = !(dockedNow && !chargeReading.low);
-      if (this.lowChargeOverride) {
-        this.tray.visible = false;
-        this.activity = "DOCK";
-        this.updateDock(dt);
-        // Say the "recharging" line once per LOW_CHARGE_SPEAK_SECS while docked,
-        // so a viewer standing by hears the bot own its state rather than
-        // getting a silent "why isn't it working" moment.
-        if (dockedNow && this.lowChargeSpeakCooldown <= 0) {
-          this.lowChargeSpeakCooldown = LOW_CHARGE_SPEAK_SECS;
-          this.sayRandom(SMALLTALK_CHARGING);
-        }
-        return;
+    this.lowChargeOverride = nextLowChargeLatch(
+      this.lowChargeOverride,
+      this.dockTarget != null,
+      dockedNow,
+      chargeReading,
+    );
+    if (this.lowChargeOverride) {
+      this.tray.visible = false;
+      this.activity = "DOCK";
+      this.updateDock(dt);
+      // Say the "recharging" line once per LOW_CHARGE_SPEAK_SECS while docked,
+      // so a viewer standing by hears the bot own its state rather than
+      // getting a silent "why isn't it working" moment.
+      if (dockedNow && this.lowChargeSpeakCooldown <= 0) {
+        this.lowChargeSpeakCooldown = LOW_CHARGE_SPEAK_SECS;
+        this.sayRandom(SMALLTALK_CHARGING);
       }
-    } else {
-      this.lowChargeOverride = false;
+      return;
     }
 
     // 🎰🤖 #77 Phase B: croupier duty takes priority. With a wheel-head post set
