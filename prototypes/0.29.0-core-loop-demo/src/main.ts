@@ -1377,6 +1377,15 @@ async function joinRoomAtEpoch(
   // roomInfo observer below — the owner value lands async with the sync.
   syncDeedsLedgerFromCurrentRoom();
 
+  // 🔑 #79 R1: sweep the pub-keyed holdings this doc ALREADY carries for us
+  // (a build-rights grant, a co-host seat). The doorPolicy / roomRoles
+  // subscribers below are armed once, in the first-join init block, so on a
+  // session's first join the bind-time notify() above ran before they
+  // existed — and a Tier A cache-restored doc (restoreRoomSnapshot, applied
+  // before start()) never re-observes what it already holds. Deeds and
+  // shares have their own T0 sync calls above.
+  noteIdentityHoldingsInCurrentRoom();
+
   // Staged room-list (issue #60): restore + background-warm the saved passes
   // once (the node is up here), and tell the manager which room is active so
   // its pass reads CURRENT and the room we LEFT re-warms in the list.
@@ -1412,9 +1421,13 @@ async function joinRoomAtEpoch(
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
       // 🔑 #79 R1: a build-rights grant naming OUR pub is identity-keyed
-      // value — the review's "first-grant moment". Grants are pub-keyed, so
-      // a lost device loses them; this also fires at bind, so a grant that
-      // pre-dates the nudge is noticed on the next join.
+      // value — the review's "first-grant moment" (grants are pub-keyed, so a
+      // lost device loses them). This is the LIVE seam — the grantsMap
+      // observer; on later joins bind's notify() reaches it too. It cannot be
+      // the only seam: on a session's first join bind's notify() ran before
+      // this subscriber existed, and a cache-restored doc never re-observes
+      // what it already holds — noteIdentityHoldingsInCurrentRoom() at the T0
+      // seam covers that.
       const me = getIdentityPub();
       if (readDoorGrants().some((g) => g.pub === me)) {
         noteIdentityValueAccrued("grant");
@@ -1425,8 +1438,10 @@ async function joinRoomAtEpoch(
     // volunteer watches).
     subscribeRoomRoles(() => {
       renderCoHostsSection();
-      // 🔑 #79 R1: a co-host seat is identity-keyed value (roomRoles keys
-      // by pub); bindRoomRoles notifies at bind, so an existing seat counts.
+      // 🔑 #79 R1: a co-host seat is identity-keyed value (roomRoles keys by
+      // pub). LIVE seam only — a seat already in the doc at join is stamped by
+      // noteIdentityHoldingsInCurrentRoom() at the T0 seam (see the grant seam
+      // above for why the subscriber alone would miss a session's first join).
       if (isCoHost(getIdentityPub())) noteIdentityValueAccrued("cohost");
     });
     // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
@@ -2951,21 +2966,37 @@ function syncVentureLedgerFromCurrentRoom(): void {
 
 // ── 🏠 REAL ESTATE (#68) — personal deeds, harvested by visitation ──────────
 
-/** Is the CURRENT room's `roomInfo.owner` value ME, personally? Deliberately
- *  the RAW owner — NOT the shareholder-extended `isLocalPlayerRoomOwner` gate:
- *  a deed belongs to the personal owner alone (venture co-owners get access,
- *  not the right to hand the module away). Legacy 'Local-Clone' rooms count
- *  as mine, matching `categorizeRoom`. */
-function currentRoomDeedIsMine(): boolean {
+/** How the CURRENT room's `roomInfo.owner` value resolves against ME,
+ *  personally. Deliberately the RAW owner — NOT the shareholder-extended
+ *  `isLocalPlayerRoomOwner` gate: a deed belongs to the personal owner alone
+ *  (venture co-owners get access, not the right to hand the module away).
+ *   - `keyed`  — the owner is our own player id (our players entry carries
+ *                our pub — `updateLocalPlayerEntry` — and a restored identity
+ *                on a NEW install resolves through that same entry; nothing
+ *                ever deletes one) or another install's entry carrying our pub.
+ *   - `legacy` — the pre-S2 literal 'Local-Clone'. Counts as mine for the
+ *                deeds ledger, matching `categorizeRoom`, but proves nothing
+ *                about WHO holds the deed: every visitor passes this leg.
+ *   - `none`   — someone else's, or the owner value has not synced yet. */
+type DeedClaim = "keyed" | "legacy" | "none";
+function currentRoomDeedClaim(): DeedClaim {
   const ownerVal = yjsSync?.doc.getMap("roomInfo").get("owner") as
     | string
     | undefined;
-  if (typeof ownerVal !== "string" || !ownerVal) return false;
-  if (ownerVal === getPlayerId() || ownerVal === "Local-Clone") return true;
+  if (typeof ownerVal !== "string" || !ownerVal) return "none";
+  if (ownerVal === getPlayerId()) return "keyed";
+  if (ownerVal === "Local-Clone") return "legacy";
   const entry = yjsSync?.doc.getMap("players").get(ownerVal) as
     | Partial<PlayerEntry>
     | undefined;
-  return typeof entry?.keyB64 === "string" && entry.keyB64 === getIdentityPub();
+  return typeof entry?.keyB64 === "string" && entry.keyB64 === getIdentityPub()
+    ? "keyed"
+    : "none";
+}
+
+/** Is the CURRENT room's deed mine — keyed OR legacy (`currentRoomDeedClaim`)? */
+function currentRoomDeedIsMine(): boolean {
+  return currentRoomDeedClaim() !== "none";
 }
 
 /** Visitation harvest (the atlas/venture-ledger pattern): the room we're IN
@@ -2980,7 +3011,8 @@ function syncDeedsLedgerFromCurrentRoom(): void {
     | undefined;
   // Owner not synced yet ⇒ decide NOTHING (never drop a deed on stale silence).
   if (typeof ownerVal !== "string" || !ownerVal) return;
-  if (!currentRoomDeedIsMine()) {
+  const claim = currentRoomDeedClaim();
+  if (claim === "none") {
     removeDeed(roomId);
     return;
   }
@@ -2988,10 +3020,12 @@ function syncDeedsLedgerFromCurrentRoom(): void {
     (yjsSync.doc.getMap("roomInfo").get("name") as string | undefined) ||
     "Module";
   const v = ventureRecord();
-  // 🔑 #79 R1: a deed in OUR name is identity-keyed value — the review's
-  // "first-deed moment" (ownership resolves to the pub behind the owner's
-  // players entry, so a lost device loses the deed).
-  noteIdentityValueAccrued("deed");
+  // 🔑 #79 R1: a deed that PROVABLY resolves to our pub is identity-keyed
+  // value — the review's "first-deed moment": a lost device loses it, and a
+  // restored identity gets it back through the owner's players entry. The
+  // legacy leg is excluded on purpose — every guest in a 'Local-Clone' room
+  // passes it, and "you now hold a deed" must never be said to a guest.
+  if (claim === "keyed") noteIdentityValueAccrued("deed");
   upsertDeed({
     roomId,
     name,
@@ -4535,17 +4569,6 @@ function setupSpacePhoneOverlay() {
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
   };
-  // 🔑 #79 R1: hand the recovery-nudge glue (module level, outside this
-  // closure) a way to raise the phone on a given app — the tip-click open
-  // path, minus its log line (the caller says why the phone opened).
-  openPhoneApp = (id) => {
-    removeTipIndicator();
-    closeMiniChat();
-    if (!container) return;
-    container.classList.add("active");
-    showPhoneView(id);
-  };
-
   // App tiles on the home screen route into their views
   document
     .querySelectorAll<HTMLButtonElement>(".phone-app-tile")
@@ -4603,6 +4626,19 @@ function setupSpacePhoneOverlay() {
         localStorage.setItem("ssf-spacephone-tipped", "true");
       } catch {}
     }
+  };
+
+  // 🔑 #79 R1: hand the recovery-nudge glue (module level, outside this
+  // closure) a way to raise the phone on a given app — the tip-click open
+  // path, minus its log line (the caller says why the phone opened). Sits
+  // AFTER removeTipIndicator so the arrow never references a `const` still
+  // in its temporal dead zone, whatever calls it and whenever.
+  openPhoneApp = (id) => {
+    removeTipIndicator();
+    closeMiniChat();
+    if (!container) return;
+    container.classList.add("active");
+    showPhoneView(id);
   };
 
   // Check if tip has been closed globally before
@@ -5749,7 +5785,9 @@ function refreshIdentityKeyRow(): void {
 // ── 🔑 Recovery-key backup nudge (#79 R1, PR #124 review 💡) ─────────────────
 // recoveryNudge.ts decides; this is the DOM / clock / storage glue around it.
 //   value seams  → noteIdentityValueAccrued  (deeds sync, door-grant change,
-//                  room-roles change, venture-ledger sync)
+//                  room-roles change, venture-ledger sync) and the T0 sweep
+//                  noteIdentityHoldingsInCurrentRoom (grants / co-host seats
+//                  already in the doc at join)
 //   key in hand  → noteRecoveryKeyShown      (Contacts reveal, Contacts
 //                  restore, title-screen restore)
 //   re-decide    → refreshRecoveryNudge      (join seam + every change above)
@@ -5762,9 +5800,11 @@ const RECOVERY_NUDGE_COPY: Record<IdentityValueKind | "", string> = {
   shares: "You now hold venture shares.",
   "": "Your identity now holds something.",
 };
+/** Shared tail. The HOLDING lives in the room's shared doc; what lives only on
+ *  this device is the identity it is keyed to — say that, not "it lives here". */
 const RECOVERY_NUDGE_TAIL =
-  "It lives only on this device — if the device is lost, so is it. " +
-  "Back up your recovery key.";
+  "It is tied to the identity on this device — lose the device without a " +
+  "backup and it is gone. Back up your recovery key.";
 
 /** The live identity's record, cached write-through: a storage that is
  *  absent (privacy mode) or refuses writes (quota) still yields ONE nudge per
@@ -5838,6 +5878,20 @@ function noteIdentityValueAccrued(kind: IdentityValueKind): void {
     );
   }
   refreshRecoveryNudge();
+}
+
+/** T0 sweep at every join: stamp the pub-keyed holdings the CURRENT room's doc
+ *  already carries for us. Grants and co-host seats otherwise reach the nudge
+ *  only through the doorPolicy / roomRoles subscribers, which are armed once
+ *  in the first-join init block — AFTER the bind-time notify() of a session's
+ *  first join — and a Tier A cache-restored doc never re-observes what it
+ *  already holds. Cheap and idempotent (first accrual only). */
+function noteIdentityHoldingsInCurrentRoom(): void {
+  const me = getIdentityPub();
+  if (readDoorGrants().some((g) => g.pub === me)) {
+    noteIdentityValueAccrued("grant");
+  }
+  if (isCoHost(me)) noteIdentityValueAccrued("cohost");
 }
 
 /** The recovery key was just revealed or pasted for the LIVE identity —
@@ -6840,9 +6894,7 @@ async function init() {
   // they keep the manual SPIN button. Offline (no sync) ⇒ we are the only client.
   setSoleCroupierPredicate(() => {
     if (!yjsSync) return true;
-    const owner = yjsSync.doc.getMap("roomInfo").get("owner");
-    if (owner === "Local-Clone") return false;
-    return currentRoomDeedIsMine();
+    return currentRoomDeedClaim() === "keyed"; // the legacy leg makes everyone owner
   });
 
   // ── Outfit v1 (TR3 rig half of #35): re-apply the locally saved outfit and
