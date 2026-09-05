@@ -9,10 +9,11 @@
  * WILL BE REMOVED once the demo phase ends. Removal = delete this file, the
  * `#dev-menu-btn` line in index.html and the initDevMenu() call in main.ts —
  * nothing else in the codebase knows this module exists. To keep that true,
- * runtime furniture spawning REPLICATES World.addLobbyFurniture's per-item
- * registration path here (reaching into World's private collections through
- * a typed cast — the deliberate trade: a temporary module bends, the
- * permanent World API stays clean).
+ * runtime furniture spawning REPLICATES World.registerFurnitureGroup's per-item
+ * registration path here (the drive-handle list itself is shared through
+ * registerFurnitureHandles in furnitureHandles.ts; World's private handle
+ * collections are reached through a typed cast — the deliberate trade: a
+ * temporary module bends, the permanent World API stays clean).
  *
  * Sections (scrollable):
  *  - ITEMS     : [+] per ITEM_DEFS entry → first free slot of the right tray

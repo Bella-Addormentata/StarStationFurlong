@@ -2848,8 +2848,10 @@ export class World {
 
   /**
    * Despawn ONE furniture item's visuals and deregister every per-item
-   * handle — the exact inverse of addLobbyFurniture's per-item registration
-   * (#53 remove-to-inventory). Scene-graph and World-collection side only:
+   * handle — the exact inverse of the per-item registration that both
+   * registerFurnitureGroup and devMenu's registerSpawnedGroup perform through
+   * registerFurnitureHandles (#53 remove-to-inventory). Scene-graph and
+   * World-collection side only:
    * the FURNITURE registry splice and the rebake pipeline (obstacles → grid
    * → seats → devices → replan) are the CALLER's responsibility, mirroring
    * how commitCarry/spawnFurniture own that pipeline around their mutation.
