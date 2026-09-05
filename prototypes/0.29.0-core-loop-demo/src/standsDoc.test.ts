@@ -265,6 +265,24 @@ describe('forgery and lift resistance (every case reads as "no claim")', () => {
     expect(readStandClaim('tbl-1:s0')).toBeNull();
   });
 
+  it('a lone-surrogate slot KEY or `pub` passes the shape guard, throws in the encoder, reads as invalid', () => {
+    const doc = new Y.Doc();
+    bindAs(seedBob, doc);
+    const map = doc.getMap('stands');
+    // Neither is screened by isStandClaim (non-empty strings, safe-integer
+    // `at`); canonicalEncode's unpaired-surrogate rule is what throws, INSIDE
+    // the binding's verify try/catch. This pins that the catch — not the
+    // shape guard — is what keeps the read path exception-free here.
+    map.set('\uD800', signedClaim(seedAlice, ROOM, 'tbl-1:s0', T0));
+    map.set('tbl-1:s1', { pub: '\uD800', at: T0, sig: 'ff' });
+    expect(() => readStandClaim('\uD800')).not.toThrow();
+    expect(readStandClaim('\uD800')).toBeNull();
+    expect(() => readStandClaim('tbl-1:s1')).not.toThrow();
+    expect(readStandClaim('tbl-1:s1')).toBeNull();
+    expect(() => readAllStandClaims()).not.toThrow();
+    expect(readAllStandClaims().size).toBe(0);
+  });
+
   it('SYBIL residual (documented, not prevented): any key may claim under its OWN name', () => {
     const doc = new Y.Doc();
     bindAs(seedAlice, doc);
