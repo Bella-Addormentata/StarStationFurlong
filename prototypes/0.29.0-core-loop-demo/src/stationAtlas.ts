@@ -35,6 +35,7 @@ import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
 import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
+import type { StationAtlasSeedEntry } from './station';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -520,6 +521,12 @@ export function pushAtlasToDoc(): void {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
       if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
+      // #79 P6 first-boot-atlas sentinel: baked seed entries carry
+      // lastSeen: 0 so we never publish PLACEHOLDER geometry into the shared
+      // doc — otherwise a first-boot install would pollute the station's
+      // ground-truth atlas with fabricated cardinal-arm rooms nobody has
+      // ever visited. Real gossip fills in from `visited` entries only.
+      if (!isOwn && entry.lastSeen === 0) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
       if (known && !isOwn
@@ -562,4 +569,88 @@ export function pushAtlasToDoc(): void {
       sharedMap!.set(entry.roomId, rec);
     }
   });
+}
+
+// ── 🗺️ FIRST-BOOT ATLAS SEED merge (#79 P6) ─────────────────────────────────
+//
+// A brand-new install has an empty local atlas store; the exterior view then
+// renders exactly ONE module (the room we joined) even though the shared
+// station has more. The seed baked in station.ts (STATION_ATLAS_SEED) is a
+// known cardinal-shell layout we merge on top of the empty store so the
+// exterior renders the full station immediately.
+//
+// TWO invariants keep this safe:
+//   1. NON-DESTRUCTIVE: never overwrite what we already know. A locally
+//      visited room's real geometry / seed / dims survive a seed merge, so
+//      re-boot on top of a populated store is a no-op for known entries.
+//   2. SENTINEL STAMP: every seed entry lands with `lastSeen: 0`. The
+//      pushAtlasToDoc guard above skips these when pushing to the shared
+//      doc — so we render locally without EVER teaching the station's live
+//      atlas about fabricated modules. Once we visit a seed room for real,
+//      harvestIntoAtlas overwrites the sentinel with Date.now() and normal
+//      gossip resumes.
+
+/**
+ * PURE merger: fold a first-boot seed into the CURRENT-BOOT local atlas snapshot,
+ * returning a NEW record. Never mutates its inputs. No localStorage, no clock.
+ *
+ *   • Existing entries WIN. If `local` already has an entry for a seed room —
+ *     however we got it (real visit, prior seed merge, cross-session gossip
+ *     residue) — we keep it verbatim. The seed only fills GAPS.
+ *   • Seed entries land with `lastSeen: 0` (sentinel) and a defensively-copied
+ *     doors record. Cardinal seed doors carry `wall` + `lateral` so
+ *     atlasLayout can pose the far module even before any live gossip.
+ *   • Doors carry NO `targetSeed` — the baked seed is geometry, not credentials.
+ *     The atlas doors' targetSeed field is set to `''` (matching the shape),
+ *     and `pushAtlasToDoc` will not publish these entries.
+ */
+export function mergeFirstBootAtlas(
+  local: Record<string, AtlasEntry>,
+  seed: StationAtlasSeedEntry[],
+): Record<string, AtlasEntry> {
+  // Shallow clone the outer map so we can add without mutating the caller's copy.
+  const out: Record<string, AtlasEntry> = { ...local };
+  for (const entry of seed) {
+    if (!entry || !entry.roomId) continue;
+    if (out[entry.roomId]) continue; // rule 1: never overwrite what we know
+    const doors: Record<string, AtlasDoor> = {};
+    for (const d of entry.doors) {
+      if (!d || !d.doorId || !d.targetRoomId) continue;
+      doors[d.doorId] = {
+        targetSeed: '',           // rule 2: no credentials in a baked seed
+        targetRoomId: d.targetRoomId,
+        wall: d.wall,
+        lateral: d.lateral,
+        farDoor: d.farDoor,
+        farWall: d.farWall,
+        farLateral: d.farLateral,
+      };
+    }
+    out[entry.roomId] = {
+      roomId: entry.roomId,
+      name: entry.name || 'Module',
+      dims: entry.dims ? { cols: entry.dims.cols, rows: entry.dims.rows } : undefined,
+      doors,
+      lastSeen: 0, // sentinel — pushAtlasToDoc refuses to publish this entry
+    };
+  }
+  return out;
+}
+
+/**
+ * Impure adapter: read the local atlas, merge the seed, write it back.
+ *
+ * Call this ONCE at boot — before bindStationAtlasDoc, so the first exterior
+ * render already sees a full cardinal shell. Localstorage-only side effects;
+ * degrades to a no-op in privacy mode (writeAtlas swallows the failure), which
+ * simply means first-run rendering falls back to the single-module view the
+ * seed was there to prevent — the app itself still boots.
+ */
+export function applyFirstBootAtlas(seed: StationAtlasSeedEntry[]): void {
+  const local = readAtlas();
+  const merged = mergeFirstBootAtlas(local, seed);
+  // Only touch the store if something actually changed (all seed rooms
+  // already existed locally → merge is a fixed point → nothing to write).
+  if (Object.keys(merged).length === Object.keys(local).length) return;
+  writeAtlas(merged);
 }

@@ -137,6 +137,11 @@ export function exportRecoveryKey(): string {
 /**
  * Restore the identity from an exported recovery credential. Returns the new
  * public key (base64url) on success, or null if the input isn't a 32-byte seed.
+ *
+ * The recovery key IS the private identity: it is stored ONLY here (via
+ * localStorage, exactly like a returning install's already-persisted seed).
+ * Callers must NEVER log it, transmit it, or write it anywhere else — treat
+ * it exactly as the pre-existing seed handling in this module.
  */
 export function importRecoveryKey(recovery: string): string | null {
   let seed: Uint8Array;
@@ -146,6 +151,138 @@ export function importRecoveryKey(recovery: string): string | null {
   cachedPub = null;
   try { localStorage.setItem(SEED_STORAGE_KEY, b64urlEncode(seed)); } catch { /* session-only */ }
   return getIdentityPub();
+}
+
+/**
+ * 🆕 #79 P5: PREVIEW a recovery credential WITHOUT taking effect.
+ *
+ * The boot-title Load-from-Backup flow needs to show the user "this is the
+ * identity you're about to restore" as a distinct CONFIRM step before the
+ * seed replaces the live identity (owner spec: "text box → confirmation →
+ * load atlas"). importRecoveryKey applies immediately and cannot be
+ * previewed; this pure helper derives the pubkey + fingerprint from the
+ * candidate seed WITHOUT touching cachedSeed / cachedPub / localStorage.
+ *
+ * Returns { pub, fingerprint } on a valid 32-byte seed, or null on any
+ * decode/length failure. Same input-validation contract as importRecoveryKey
+ * (trim tolerance, base64url decode, exact length gate) so a preview that
+ * succeeds is guaranteed to import successfully on confirm.
+ *
+ * PRIVACY: the caller still holds the raw recovery key in whatever field it
+ * lives in (the paste textarea in main.ts); this helper never persists it
+ * and never logs it. Every intermediate `Uint8Array`/`pub` here is a normal
+ * garbage-collectible value — no state hangs onto them after return.
+ */
+export function previewRecoveryKey(
+  recovery: string,
+): { pub: string; fingerprint: string } | null {
+  let seed: Uint8Array;
+  try { seed = b64urlDecode(recovery.trim()); } catch { return null; }
+  if (seed.length !== 32) return null;
+  // Derive without touching module state (mirrors getPubBytes' math but writes
+  // nothing back). A local pub buffer stays a normal GC-able value.
+  const pubBytes = ed.getPublicKey(seed);
+  return {
+    pub: b64urlEncode(pubBytes),
+    fingerprint: ed.etc.bytesToHex(pubBytes).slice(0, 8),
+  };
+}
+
+/**
+ * 🧬 Per-identity CLONE-VAT SPAWN PREFERENCE (#79 P2/P4).
+ *
+ * The room a given identity wants to boot back into — their "clone-vat
+ * preference" in owner-speak. Distinct from the install-scoped `ssf-last-room`
+ * (which is keyed to the local install, not the identity): a restore-from-
+ * backup on a fresh install lands with no ssf-last-room but IS the same
+ * identity, and we want them to arrive at their preference if we know it.
+ *
+ * Storage: localStorage keyed by identity public key. LOCAL-ONLY (never
+ * networked): if a mesh-published preference lands later (Phase 2 presence),
+ * that lookup is layered on top of this without changing the shape here.
+ *
+ * Shape: a minimal `{ roomId, roomKeyB64 }` — enough to key the boot fallback
+ * without embedding the identity's ephemeral wtUrl/certHash (loopback cert
+ * drift is the whole reason ssf-last-room is skipped for `home-*` rooms). The
+ * bootstrap networking rebuilds the WT half from the LIVE local node.
+ *
+ * KEY BOUNDARY: this stores a ROOM POINTER only — never the recovery/private
+ * key material. The record is a plain, replay-safe hint (any writer could
+ * plant it); the room doc's own owner/policy checks remain the authority.
+ */
+export interface CloneVatPreference {
+  roomId: string;
+  /** Base64url of 32 raw bytes — the room-doc encryption key. */
+  roomKeyB64: string;
+}
+
+/** Storage key namespace for per-identity spawn preferences. */
+const SPAWN_PREF_KEY_PREFIX = 'ssf-spawn:';
+
+/** Compose the localStorage key for a given identity pubkey. */
+function spawnPrefStorageKey(pubB64: string): string {
+  return `${SPAWN_PREF_KEY_PREFIX}${pubB64}`;
+}
+
+/**
+ * Shape-guarded read: rejects malformed / non-shaped stored data.
+ * A hostile writer of localStorage could plant anything; the reader must
+ * treat every stored value as untrusted data.
+ */
+function isCloneVatPreference(v: unknown): v is CloneVatPreference {
+  if (!v || typeof v !== 'object') return false;
+  const rec = v as Record<string, unknown>;
+  if (typeof rec.roomId !== 'string' || rec.roomId.length === 0) return false;
+  if (typeof rec.roomKeyB64 !== 'string' || rec.roomKeyB64.length === 0) return false;
+  return true;
+}
+
+/**
+ * Fetch the current identity's clone-vat preference from local storage.
+ * Returns null when unset, absent, or malformed — the caller should fall back
+ * to the shared station or the install's per-install home in that case.
+ *
+ * `pubB64` MUST be a base64url identity pubkey (from `getIdentityPub` or a
+ * restore return value); it is trusted to be a stable, safe map key.
+ */
+export function getCloneVatPreference(pubB64: string): CloneVatPreference | null {
+  if (typeof pubB64 !== 'string' || pubB64.length === 0) return null;
+  try {
+    const raw = localStorage.getItem(spawnPrefStorageKey(pubB64));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!isCloneVatPreference(parsed)) return null;
+    return { roomId: parsed.roomId, roomKeyB64: parsed.roomKeyB64 };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Persist the current identity's clone-vat preference. A whole-value WRITE
+ * (no partial merges) — mirrors the whole-value-LWW discipline the room docs
+ * use, so an unauthenticated reader is never surprised by a half-updated
+ * record. `pref === null` deletes the record.
+ */
+export function setCloneVatPreference(
+  pubB64: string,
+  pref: CloneVatPreference | null,
+): void {
+  if (typeof pubB64 !== 'string' || pubB64.length === 0) return;
+  const key = spawnPrefStorageKey(pubB64);
+  try {
+    if (pref === null) {
+      localStorage.removeItem(key);
+      return;
+    }
+    if (!isCloneVatPreference(pref)) return; // silently reject malformed input
+    localStorage.setItem(
+      key,
+      JSON.stringify({ roomId: pref.roomId, roomKeyB64: pref.roomKeyB64 }),
+    );
+  } catch {
+    /* privacy mode / quota — preference is best-effort */
+  }
 }
 
 /**
