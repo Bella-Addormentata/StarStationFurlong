@@ -274,6 +274,72 @@
       body.exterior-active #phone-tip-indicator {
         display: none;
       }
+      /* 🔑 Recovery-key backup nudge (#79 R1, PR #124 review). Armed by
+         hud.ts (`data-armed="1"`); the SAME body-class gating as the tip
+         above decides whether an armed banner is actually on screen — in the
+         room only, never behind the title curtain or over the space view.
+         The hide rules come AFTER the show rule at equal specificity, so
+         zooming out to space re-hides it. z-index sits UNDER the SpacePhone
+         (5000) so BACK UP NOW slides the phone over the banner. */
+      #hud-recovery-nudge {
+        display: none;
+        position: fixed;
+        top: 14px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 4500;
+        max-width: min(560px, 92vw);
+        box-sizing: border-box;
+        padding: 10px 14px;
+        flex-direction: column;
+        gap: 8px;
+        background: rgba(4, 8, 22, 0.95);
+        border: 1px solid rgba(212, 168, 75, 0.45);
+        border-radius: 8px;
+        color: #d4a84b;
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 12px;
+        letter-spacing: 0.4px;
+        line-height: 1.45;
+        pointer-events: auto;
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+      }
+      body.in-room #hud-recovery-nudge[data-armed="1"] {
+        display: flex;
+      }
+      body.pre-entry #hud-recovery-nudge[data-armed="1"],
+      body.exterior-active #hud-recovery-nudge[data-armed="1"] {
+        display: none;
+      }
+      #hud-recovery-nudge .nudge-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      #hud-recovery-nudge .nudge-btn {
+        cursor: pointer;
+        padding: 5px 10px;
+        border-radius: 5px;
+        border: 1px solid rgba(212, 168, 75, 0.45);
+        background: transparent;
+        color: #d4a84b;
+        font: inherit;
+        letter-spacing: 0.6px;
+      }
+      #hud-recovery-nudge .nudge-btn:hover,
+      #hud-recovery-nudge .nudge-btn:focus-visible {
+        background: rgba(212, 168, 75, 0.14);
+        outline: none;
+      }
+      #hud-recovery-nudge .nudge-btn.primary {
+        background: rgba(212, 168, 75, 0.9);
+        color: #0a0f1e;
+        font-weight: 700;
+      }
+      #hud-recovery-nudge .nudge-btn.primary:hover,
+      #hud-recovery-nudge .nudge-btn.primary:focus-visible {
+        background: #e5b95a;
+      }
       #phone-tip-indicator::after {
         content: '';
         position: absolute;
@@ -761,6 +827,11 @@
         margin-left: auto;
         flex: 0 0 auto;
         cursor: default;
+      }
+      /* 🔑 #79 R1: amber while the recovery key has never been shown or
+         pasted on this install (main.ts refreshIdentityKeyRow). */
+      #phone-identity-key.no-backup {
+        color: #ffb347;
       }
 
       #phone-player-name {

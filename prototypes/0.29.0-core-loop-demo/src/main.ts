@@ -5,7 +5,12 @@
 
 import * as THREE from "three";
 import "./style.css";
-import { updateDebugHUD, showHint } from "./hud";
+import {
+  updateDebugHUD,
+  showHint,
+  showRecoveryNudgeBanner,
+  hideRecoveryNudgeBanner,
+} from "./hud";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
@@ -116,6 +121,7 @@ import {
   bindDoorPolicy,
   subscribeDoorPolicy,
   readDoorPolicy,
+  readDoorGrants,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
@@ -163,6 +169,22 @@ import {
   isOfficeHere,
 } from "./ventures";
 import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
+// 🔑 #79 R1 (PR #124 review 💡): the recovery-key backup nudge — a pure
+// decision engine; the DOM / clock / storage glue lives with the Contacts app.
+import {
+  RECOVERY_NUDGE_STORAGE_KEY,
+  loadRecoveryNudgeRecord,
+  saveRecoveryNudgeRecord,
+  decideRecoveryNudge,
+  noteIdentityValue,
+  noteRecoveryKeyInHand,
+  snoozeRecoveryNudge,
+  dismissRecoveryNudge,
+  isRecoveryKeyInHand,
+  type IdentityValueKind,
+  type RecoveryNudgeRecord,
+  type RecoveryNudgeStore,
+} from "./recoveryNudge";
 import {
   refreshExteriorView,
   setExteriorOwnerCheck,
@@ -1389,11 +1411,24 @@ async function joinRoomAtEpoch(
     subscribeDoorPolicy(() => {
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
+      // 🔑 #79 R1: a build-rights grant naming OUR pub is identity-keyed
+      // value — the review's "first-grant moment". Grants are pub-keyed, so
+      // a lost device loses them; this also fires at bind, so a grant that
+      // pre-dates the nudge is noticed on the next join.
+      const me = getIdentityPub();
+      if (readDoorGrants().some((g) => g.pub === me)) {
+        noteIdentityValueAccrued("grant");
+      }
     });
     // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
     // appearing while the owner has the app open, an accept while the
     // volunteer watches).
-    subscribeRoomRoles(() => renderCoHostsSection());
+    subscribeRoomRoles(() => {
+      renderCoHostsSection();
+      // 🔑 #79 R1: a co-host seat is identity-keyed value (roomRoles keys
+      // by pub); bindRoomRoles notifies at bind, so an existing seat counts.
+      if (isCoHost(getIdentityPub())) noteIdentityValueAccrued("cohost");
+    });
     // 🚀 #68 V1: venture changes keep the personal ledger fresh + repaint an
     // open VENTURES app (a share transfer landing while both look at it).
     subscribeVentures(() => {
@@ -1717,6 +1752,10 @@ async function joinRoomAtEpoch(
   // observer above, which paints the roster + HUD).
   updateLocalPlayerEntry();
   updateRoomUI();
+  // 🔑 #79 R1: re-decide the backup nudge for THIS identity at every join —
+  // a snooze that lapsed since the last one shows again here; the value
+  // seams (deed / grant / co-host / shares) re-decide as holdings land.
+  refreshRecoveryNudge();
 
   // Backfill retry (v0.29.7): the host's QUIESCENT room state — name, owner,
   // furniture — all ride ONE signed SyncStep2 that transfers only when the host
@@ -2880,6 +2919,9 @@ function syncVentureLedgerFromCurrentRoom(): void {
   const myPub = getIdentityPub();
   const mine = v.shares[myPub] ?? 0;
   if (mine <= 0) return;
+  // 🔑 #79 R1: shares in OUR name are identity-keyed value (the cap table
+  // keys by pub). First call stamps; every later sync is a no-op.
+  noteIdentityValueAccrued("shares");
   const roomId = activeBootstrap.roomId;
   const isOffice = v.snapshotAt === undefined;
   const prior = ventureLedger().find((e) => e.id === v.id);
@@ -2946,6 +2988,10 @@ function syncDeedsLedgerFromCurrentRoom(): void {
     (yjsSync.doc.getMap("roomInfo").get("name") as string | undefined) ||
     "Module";
   const v = ventureRecord();
+  // 🔑 #79 R1: a deed in OUR name is identity-keyed value — the review's
+  // "first-deed moment" (ownership resolves to the pub behind the owner's
+  // players entry, so a lost device loses the deed).
+  noteIdentityValueAccrued("deed");
   upsertDeed({
     roomId,
     name,
@@ -4262,6 +4308,11 @@ function closeMiniChat(): void {
   (document.getElementById("chat-input") as HTMLInputElement | null)?.blur();
 }
 
+/** 🔑 #79 R1: raise the SpacePhone on an app from OUTSIDE the overlay
+ *  closure (the recovery nudge's BACK UP NOW). Assigned once by
+ *  setupSpacePhoneOverlay; null until then, so callers optional-chain it. */
+let openPhoneApp: ((id: "home" | "contacts") => void) | null = null;
+
 function setupSpacePhoneOverlay() {
   // bootstrapNetworking() re-runs via the Retry-node / Use-link buttons;
   // guard so the Tab toggle and form submit listeners bind exactly once
@@ -4484,6 +4535,16 @@ function setupSpacePhoneOverlay() {
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
   };
+  // 🔑 #79 R1: hand the recovery-nudge glue (module level, outside this
+  // closure) a way to raise the phone on a given app — the tip-click open
+  // path, minus its log line (the caller says why the phone opened).
+  openPhoneApp = (id) => {
+    removeTipIndicator();
+    closeMiniChat();
+    if (!container) return;
+    container.classList.add("active");
+    showPhoneView(id);
+  };
 
   // App tiles on the home screen route into their views
   document
@@ -4655,14 +4716,9 @@ function setupSpacePhoneOverlay() {
   // ignores keydowns targeted at non-chat inputs, same as the room-name editor).
   const playerNameEl = document.getElementById("phone-player-name");
   const playerNameEditBtn = document.getElementById("phone-player-name-edit");
-  const refreshIdentityRow = () => {
-    if (playerNameEl) playerNameEl.textContent = getPlayerName();
-    const keyEl = document.getElementById("phone-identity-key");
-    if (keyEl) {
-      keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
-      keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
-    }
-  };
+  // ONE writer for the row: refreshIdentityKeyRow (module level) also paints
+  // the 🔑 #79 R1 "NO BACKUP" cue, so both repaint paths say the same thing.
+  const refreshIdentityRow = () => refreshIdentityKeyRow();
   refreshIdentityRow();
   const beginPlayerNameEdit = () => {
     if (!playerNameEl || document.getElementById("phone-player-name-input"))
@@ -5674,10 +5730,156 @@ function refreshIdentityKeyRow(): void {
   if (nameEl) nameEl.textContent = getPlayerName();
   const keyEl = document.getElementById("phone-identity-key");
   if (keyEl) {
-    keyEl.textContent = `🔑 ${getIdentityFingerprint()}`;
-    keyEl.title = `Cryptographic identity (keyed-identity): ${getIdentityPub()}`;
+    // 🔑 #79 R1: a standing "NO BACKUP" cue until the recovery key has been
+    // shown or pasted on this install. A fact, not a nag — DON'T ASK AGAIN
+    // silences the banner, never this.
+    const inHand = recoveryKeyInHand();
+    keyEl.textContent = inHand
+      ? `🔑 ${getIdentityFingerprint()}`
+      : `🔑 ${getIdentityFingerprint()} · ⚠ NO BACKUP`;
+    keyEl.classList.toggle("no-backup", !inHand);
+    keyEl.title =
+      `Cryptographic identity (keyed-identity): ${getIdentityPub()}` +
+      (inHand
+        ? ""
+        : "\nNo backup yet — Contacts → Backup / restore identity → Reveal recovery key.");
   }
 }
+
+// ── 🔑 Recovery-key backup nudge (#79 R1, PR #124 review 💡) ─────────────────
+// recoveryNudge.ts decides; this is the DOM / clock / storage glue around it.
+//   value seams  → noteIdentityValueAccrued  (deeds sync, door-grant change,
+//                  room-roles change, venture-ledger sync)
+//   key in hand  → noteRecoveryKeyShown      (Contacts reveal, Contacts
+//                  restore, title-screen restore)
+//   re-decide    → refreshRecoveryNudge      (join seam + every change above)
+
+/** Banner / log copy per first-value kind ('' = a record whose kind was lost). */
+const RECOVERY_NUDGE_COPY: Record<IdentityValueKind | "", string> = {
+  deed: "You now hold a deed.",
+  grant: "You now hold build rights at a door.",
+  cohost: "You are now a co-host.",
+  shares: "You now hold venture shares.",
+  "": "Your identity now holds something.",
+};
+const RECOVERY_NUDGE_TAIL =
+  "It lives only on this device — if the device is lost, so is it. " +
+  "Back up your recovery key.";
+
+/** The live identity's record, cached write-through: a storage that is
+ *  absent (privacy mode) or refuses writes (quota) still yields ONE nudge per
+ *  session instead of a fresh "first value" on every sync. The `storage`
+ *  listener below drops the cache when another tab of this install writes. */
+let recoveryNudgeLive: RecoveryNudgeRecord | null = null;
+
+function recoveryNudgeStore(): RecoveryNudgeStore | null {
+  try {
+    return window.localStorage; // the mere access throws in some privacy modes
+  } catch {
+    return null;
+  }
+}
+
+function readRecoveryNudge(): RecoveryNudgeRecord {
+  const pub = getIdentityPub();
+  if (recoveryNudgeLive?.pub !== pub) {
+    recoveryNudgeLive = loadRecoveryNudgeRecord(recoveryNudgeStore(), pub);
+  }
+  return recoveryNudgeLive;
+}
+
+function writeRecoveryNudge(rec: RecoveryNudgeRecord): void {
+  recoveryNudgeLive = rec;
+  saveRecoveryNudgeRecord(recoveryNudgeStore(), rec); // best effort (cache note above)
+}
+
+/** Has this identity's recovery key ever been shown or pasted on this install? */
+function recoveryKeyInHand(): boolean {
+  return isRecoveryKeyInHand(readRecoveryNudge());
+}
+
+/** Re-decide the banner from the record. Idempotent; safe before any room. */
+function refreshRecoveryNudge(): void {
+  const verdict = decideRecoveryNudge(readRecoveryNudge(), Date.now());
+  if (!verdict.show) {
+    hideRecoveryNudgeBanner();
+    return;
+  }
+  showRecoveryNudgeBanner(
+    `${RECOVERY_NUDGE_COPY[verdict.kind]} ${RECOVERY_NUDGE_TAIL}`,
+    {
+      onBackUp: openRecoveryBackupPanel,
+      onLater: () => {
+        writeRecoveryNudge(snoozeRecoveryNudge(readRecoveryNudge(), Date.now()));
+        refreshRecoveryNudge();
+      },
+      onNever: () => {
+        writeRecoveryNudge(dismissRecoveryNudge(readRecoveryNudge(), Date.now()));
+        refreshRecoveryNudge();
+      },
+    },
+  );
+}
+
+/** A value seam fired for `kind`. First accrual only: persist the moment,
+ *  log it once (unless the key is already in hand — nothing to ask then),
+ *  and arm the banner. Every later call is a cheap no-op. */
+function noteIdentityValueAccrued(kind: IdentityValueKind): void {
+  const { record, first } = noteIdentityValue(
+    readRecoveryNudge(),
+    kind,
+    Date.now(),
+  );
+  if (!first) return;
+  writeRecoveryNudge(record);
+  if (!isRecoveryKeyInHand(record)) {
+    logToPhoneSystem(
+      `🔑 ${RECOVERY_NUDGE_COPY[kind]} ${RECOVERY_NUDGE_TAIL} (Contacts → Backup / restore identity)`,
+    );
+  }
+  refreshRecoveryNudge();
+}
+
+/** The recovery key was just revealed or pasted for the LIVE identity —
+ *  "in hand", not "verified" (recoveryNudge.ts header). */
+function noteRecoveryKeyShown(): void {
+  writeRecoveryNudge(noteRecoveryKeyInHand(readRecoveryNudge(), Date.now()));
+  refreshRecoveryNudge();
+  refreshIdentityKeyRow();
+}
+
+/** BACK UP NOW: raise the phone on Contacts with the backup panel open and
+ *  the reveal button focused. Never reveals the key itself — that stays one
+ *  deliberate click away, on the panel that says what the key is. */
+function openRecoveryBackupPanel(): void {
+  // An open phone during room editing swallows the edit-mode ESC exit (see
+  // the Tab handler) — ask for Esc first rather than strand the player.
+  if (roomEdit.isEditModeActive()) {
+    showHint("Leave edit mode (Esc) first, then BACK UP NOW.");
+    return;
+  }
+  openPhoneApp?.("contacts");
+  const panel = document.getElementById(
+    "contacts-recovery",
+  ) as HTMLDetailsElement | null;
+  if (panel) panel.open = true;
+  const reveal = document.getElementById("contacts-export-btn");
+  reveal?.scrollIntoView({ block: "center" });
+  reveal?.focus();
+  setContactsFeedback(
+    "Reveal your recovery key, then store it somewhere only you control.",
+  );
+}
+
+// Another tab of this install revealed / snoozed / dismissed (a `storage`
+// event fires only in OTHER documents): drop the cache so this tab agrees.
+// `key === null` is a localStorage.clear() — drop it then too.
+window.addEventListener("storage", (e) => {
+  if (e.key !== null && e.key !== RECOVERY_NUDGE_STORAGE_KEY) return;
+  recoveryNudgeLive = null;
+  refreshRecoveryNudge();
+  refreshIdentityKeyRow();
+});
 
 let contactsAppInited = false;
 
@@ -5761,6 +5963,9 @@ function setupContactsApp(): void {
       if (out) {
         out.value = (window as any).__ssfIdentity.exportRecoveryKey();
         out.select();
+        // 🔑 #79 R1: the key is now in the player's hands — the banner and
+        // the identity row's NO BACKUP cue stand down for this identity.
+        noteRecoveryKeyShown();
       }
       setContactsFeedback(
         "Recovery key revealed — store it somewhere only you control.",
@@ -5783,6 +5988,10 @@ function setupContactsApp(): void {
         return;
       }
       if (inp) inp.value = "";
+      // 🔑 #79 R1: a successful paste proves the key is in hand — for the
+      // RESTORED identity (markers are pub-scoped; the old identity's record
+      // is left behind with it).
+      noteRecoveryKeyShown();
       // The old identity's DM rooms are derived from the OLD pubkey pair and would
       // sign/verify-mismatch under the new key — tear them down (review LOW).
       closeDmOverlay();
@@ -6966,6 +7175,9 @@ function setupClickToEnter() {
           const pub = importRecoveryKey(ta.value);
           if (!pub) return false;
           ta.value = ""; // scrub the private key from the DOM immediately
+          // 🔑 #79 R1: the pasted key is in hand for the restored identity —
+          // synchronous, so the marker is persisted before the reload below.
+          noteRecoveryKeyShown();
           // 🧬 #79 P2: the restored identity is (probably) NEW to this
           // install, so the install-scoped `ssf-last-room` (which belonged
           // to whoever was here before) is now the WRONG resume target. Drop
