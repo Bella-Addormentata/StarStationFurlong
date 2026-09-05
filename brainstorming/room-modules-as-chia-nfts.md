@@ -1,0 +1,135 @@
+<!-- Produced 2026-09-05 in answer to issue #138 ("Room Modules as Chia NFTs?"). Every claim below is pinned to a design-doc line or a source line on main @ dc46460 (line numbers drift; the function/section names beside them do not). Sections marked PROPOSED are new thinking, not settled design. Companions: chia-authority-architecture.md (the load-bearing decision), transfer-offers-deeds-shares.md, chia-ventures-shared-ownership.md, module-wallets-chia-funding-plan.md. PLAYER-FACING language rule (#68) applies throughout: "deed", "hand over", "offer" are the game words; NFT / launcher id / CAT are implementation vocabulary and never reach the UI. -->
+
+# Room Modules as Chia NFTs — grounded answers to #138
+
+## 0. TL;DR
+
+| # | Question (#138) | Short answer | Where the repo stands |
+|---|---|---|---|
+| 1 | Make each room module its own NFT? | **Yes — and it is already the design's central decision:** one NFT1 singleton per module *is* its transferable deed ([chia-authority-architecture.md](chia-authority-architecture.md) §1, line 7). | Designed, not implemented. No chain code exists in the browser by design; the node's chia lane is where it lands. |
+| 2 | A better way to handle ownership? | **For the ownership FACT and its transfer, sale and dispute: yes. For live permissions (doors, grants, co-hosts, edit rights): no** — those stay off-chain on purpose (§4 of the same doc). | Today `roomInfo.owner` is a plain Yjs string, UI-gated on write, shape-checked on read. |
+| 3 | Pros and cons vs the existing system? | §3 below. Decisive pro: consensus between parties who don't trust each other, plus atomic sale. Decisive cons: wrong latency tier for anything live, key loss = stranded deed, external-wallet foot-gun. | — |
+| 4 | Swap it in without changing gameplay? | **Yes, additively.** The four-phase path (§5 of the architecture doc) keeps unanchored rooms behaving exactly as today and needs no grant-schema change. Conditions in §4 below. | Sequenced by ROADMAP.md:162 after the core economy; TODO.md:62 already carries the custody item. |
+| 5 | Ownership of items *within* the room? | **Not designed anywhere yet.** §5 proposes: furniture is an appurtenance of the deed (no per-item chain object); portable, fungible and rare items each sit at a different tier. | Items are per-install local storage; no record carries a per-item owner. |
+
+## 1. What ships today (code truth, main @ dc46460)
+
+**Module ownership is one Yjs string.**
+- Claiming: only the own-room default-bootstrap path claims, and only when no owner exists — `main.ts:1372-1378` (`claimRoomDefaults && !roomMap.has("owner")` → `roomMap.set("owner", getPlayerId())`). The comment above it (`:1360-1371`) records the seed-link race this gate closed and the residual own-room race that remains.
+- Owner authority: `isLocalPlayerRoomOwner` (`main.ts:2483-2489`) — owner is my player id, the legacy `'Local-Clone'` sentinel, or I hold any share of the owning venture (the #68 V1 "joint owners are owner-equivalent everywhere" rule).
+- Personal deed: `currentRoomDeedIsMine` (`main.ts:2813-2823`) — the RAW owner (venture co-owners get access, not the right to hand the module away); resolves the owner's key through `players[owner].keyB64`.
+- Hand-over: `executeDeedHandover` (`main.ts:2862-2873`) — one `rm.set("owner", toPlayerId)` inside a transaction, gated client-side by `currentRoomDeedIsMine()` and `!isOfficeHere()`, recipient must hold a keyed `players` entry in this doc. "All the room's standing records — passes, policies, co-hosts, a venture property link — ride along" (`:2859-2861`). Gift only; no signature; no chain.
+
+**There is no global ownership registry.** `deeds.ts:4-12`: `roomInfo.owner` lives inside each room's own doc, the client holds ONE doc at a time, so the REAL ESTATE list is harvested by visitation into `localStorage['ssf-deeds-ledger']` (`:31`); "The V3 Registry anchor (#68) replaces walk-to-learn with shared truth." The transfer-offers design says the same from the other side: `roomInfo.owner` "in the room doc is the authoritative record" ([transfer-offers-deeds-shares.md:38-43](transfer-offers-deeds-shares.md)) and "there is no cross-doc write path" (`:130-133`).
+
+**Authority records are shape-checked, not verified.** `doorPolicy.ts:22-24` and `roomRoles.ts:20-21` state the dev-phase posture verbatim: WRITE-side UI-gated (owner-only controls), READ-side shape-validated but not cryptographically verified — "signed records are #67 D3". PR #129 (open) is that D3 signing for door policy / grants / requests. Grants are keyed by identity pubkey, not player id (`doorPolicy.ts:14-16`, `:50`, `:57`) — the fact that lets the architecture doc promise no schema change when the root moves (line 93).
+
+**Envelope signing exists, and proves authorship only.** `keypair.ts` holds an exportable Ed25519 seed (`:11-14`); `network/signBytes.ts:19-31` binds `v ‖ roomId ‖ kind ‖ seq ‖ payload` under the `ssf-env:v1` tag; `YjsSync.#verifyEnvelope` (`network/YjsSync.ts:216-240`) drops a signed-but-invalid frame and lets an unsigned/legacy frame through as *never trusted as host*. This signs the **frame**, not the **authorization**: a validly signed frame may still carry any LWW write, including `roomInfo.owner`.
+
+**The money layer already models the target posture.** `treasuryDoc.ts:6-11` (merged as PR #114): "everything in this map is a REPLACEABLE CACHE. Money is authoritative on chain… every read re-validates at this boundary: guards first, then id recomputation, then signature verification." A deed cache would adopt exactly this ladder with the chain-anchored head as its root.
+
+**Items are not owned by anyone, anywhere.**
+- Furniture layout: one `furniture` Y.Map keyed by item id; owner-gated writes, shape-checked reads (`furnitureDoc.ts:10-12`); `FurnitureRecord` (`:28-38`) is `{kind, x, z, rot, movable, mountParent?}` — no placer, no owner, no signature.
+- Trunk contents: `localStorage['ssf-trunk:<roomId>:<itemId>']`, "LOCAL ONLY… labelled 'LOCAL STOWAGE — not yet synced'; the Yjs `trunks` map arrives with TR-sync"; cross-trunk transfer, world drops, stacking and per-slot CRDTs are explicitly deferred (`items.ts:12-18`; plan: [device-focus-and-storage-trunk-plan.md:97](device-focus-and-storage-trunk-plan.md)).
+- Removed-furniture inventory: per-room localStorage, "LOCAL ONLY" (`roomInventory.ts:14-15`).
+- Chips: room-doc records (`casinoDoc.ts:5-9`), with the G4 upgrade already described as anchoring "the same ledger on the Registry (issuer-mintable chip asset under the house's authority) without changing this module's read/write shape".
+
+**The browser has no chain code, by design.** Division of labour: "Rust node: BLS keys, minting, transfers, offer make/take, coinset resolution, head signing/verification… Browser: never touches BLS or the chain" (chia-authority-architecture.md:73-75). The maintainer's PR #121 review reads module identity the same way: "already the NFT1 launcher id, read from elsewhere and never written by this code."
+
+## 2. Q1 + Q2 — one NFT per module, and is that "better"?
+
+**Q1 is settled: yes.** chia-authority-architecture.md:7 — "Mint one NFT1 singleton per module/room as its transferable deed. Everything else stays off-chain, chained to that deed by signatures." Line 9 fixes the identities: launcher id = permanent module id; current p2 puzzle hash = owner key. §2 (lines 16-33) compares NFT1 against DID1, CHIP-0035 DataStore, a custom singleton and Offers, and rejects each alternative for stated reasons (DID: single-key, recovery effectively dead, doubles mint cost; DataStore: every grant a chain spend, public social graph — kept as the named fallback). [module-wallets-chia-funding-plan.md](module-wallets-chia-funding-plan.md) §3 model D and [STUDY-Architecture v006](AI%20BRAINSTORMING/STUDY-Architecture%20v006.md) §6.1 anchor the same singleton for module wallets and Station Seals — the deed coin is the one lineage everything else hangs from.
+
+**Q2 splits, and the split is the design.** The authority question "decomposes into two very different halves" (line 29):
+
+- *Ownership and transferability need consensus* — "two players who don't trust each other must agree who owns a module, and a sale must be atomic. NFT1 + Offers solves exactly this." Today's LWW string cannot: any peer in the room with a modified client can rewrite `roomInfo.owner`, and even D3-signed records only prove *who wrote*, not *who was entitled to* — without an anchored root, "entitled" reduces to "claimed first" (`main.ts:1372`).
+- *Co-host sets, grants, door policies need low latency, cheap revocation and privacy* — "three things a public chain with ~52 s blocks structurally can't give." §4 (lines 79-86) gives the four reasons — latency, one-spend-per-confirmation sequencing, social-graph privacy, revocation honesty — and closes with "Cost is *not* the argument… The chain is simply the wrong latency/privacy tier for live permissions."
+
+The maintainer's own tier rule (PR #121 review table) says the same: door pose / pane UI = **T0, never chain**; pairing eligibility = **T1, keep off-chain**; module identity = **T3, already anchored**. An NFT deed upgrades exactly the T3 fact and nothing below it. It also does **not** replace the Registry (#68): the deed answers *who owns this module*; the Registry answers *which modules exist and who owns them* without walking into each one (`deeds.ts:11-12`).
+
+**The bridge is mandatory, not optional.** CLVM has no Ed25519 (line 35, CHIP-0011), so the on-chain owner is a BLS key in the node and the Ed25519 game identity is bound to it by a signed **authority head** `{launcher_id, seq, owner_ed25519_pubkey, cohost_ed25519_pubkeys[], transferable, issued_at}` + BLS signature by the NFT's current p2 key (lines 52-57). Peers verify the head against the coin's current p2 hash (lines 59-62); highest `seq` wins, so co-host and even game-key rotation costs zero chain writes (line 64). Non-transferable modules are a head flag, not a custom transfer program (line 70).
+
+## 3. Q3 — pros and cons against the existing system
+
+| | Existing (LWW string + UI gate) | NFT1 deed + signed head |
+|---|---|---|
+| Who decides the owner | First claimant's write; last writer wins on conflict (`main.ts:1360-1371` documents a real race) | The chain — one unspent coin, one p2 hash (arch. doc :60-61) |
+| Hand-over | `rm.set("owner", …)` gift, in-room only, recipient must have visited (`main.ts:2862-2873`) | `Nft::transfer` gift (~1 min finality) or an Offer — atomic trade/sale, no coordinator, maker can be offline (:9, :68-69) |
+| Dispute between strangers | Unresolvable — both replicas are "right" | Resolvable by resolution walk; a malicious relay "can only *censor* authority data, never *forge* it" (:64) |
+| Cost per module | none | ~53M CLVM, 1 mojo locked, normally zero fee; busy-mempool worst case ~0.000265 XCH (:44, :101). Linear in module count — fine at hobby scale |
+| Live permissions | milliseconds, room-doc sync | **unchanged** — deliberately still room-doc (§4) |
+| Recovery | player id in localStorage; identity seed exportable (`keypair.ts:11-14`) | key loss = stranded deed; mitigated by seed backup (one backup covers all deeds) and later MIPs vault re-parenting (:102) |
+| Foot-guns | none new | a deed is a real NFT — sellable/meltable by accident from Sage; needs honest CHIP-0007 naming + an unexpected-owner-change warning (:103) |
+| Staleness | none (single doc) | cached head can mislead for its TTL after a transfer — bound TTL, re-resolve on authority-sensitive actions (:106) |
+| Ecosystem | none | deeds render in Sage / MintGarden; NFT-for-NFT trades are simulator-tested in the pinned SDK (:29, :105) |
+| Prerequisites | none | owner's device runs the node profile with a funded wallet (:41-47, :73); browser stays chain-free |
+
+Two cons the code adds to the doc's list:
+- **The one-doc-at-a-time model is unchanged.** A chain deed does not give a player a global list of their modules; the Registry (#68) does. Until then REAL ESTATE stays visitation-harvested even with anchored deeds.
+- **"Anchored" is invisible to the browser.** Everything the browser shows is served by its local node (:75). A peer without a node sees room-doc authority "just unverified (mirrors today's trust level)" (:97) — the same words apply after the swap.
+
+## 4. Q4 — can it be swapped in without changing gameplay?
+
+**Yes, and the design was written to make that true.** §5 of the architecture doc (lines 88-97):
+- Phase 1 — additive anchor: mint + `authority_root: <launcher_id>` in the room doc + head publication. "No existing structure changes; rooms without `authority_root` behave exactly as today."
+- Phase 2 — verified precedence: when the anchor is present, peers derive owner/co-hosts from the verified head; the raw owner map "becomes a cache of the head. Grant records need **no schema change** — they already chain from Ed25519 keys; only the root of the chain moves." (Confirmed at code level: `doorPolicy.ts:50`/`:57`, `roomRoles.ts:26-35` key by pubkey.)
+- Phase 3 — transfers: direct, then offers + market-board docs, simulator-tested before testnet11.
+- Phase 4 — optional DIDs / DataStore fallback.
+- "Each phase ships independently and degrades gracefully to the previous one."
+
+**Gameplay-visible delta for existing tenants: zero.** New, additive affordances only: an opt-in "claim deed" moment ("Deed minting is opt-in and lazy — casual module creation stays chain-free exactly as today", :41), and the unexpected-owner-change warning (:103). The player vocabulary does not change — deed, hand over, offer — per the #68 language rule; the transfer-offers design already models the offer artifact as a game object ([transfer-offers-deeds-shares.md](transfer-offers-deeds-shares.md) §1).
+
+**Conditions the docs attach (not optional):**
+1. The Rust node holds the BLS keys and does mint / transfer / resolve / head verification (:73-74); the browser consumes verified state (:75). A browser-only player can play but not claim or transfer a deed.
+2. Head verification lives in the node, never the browser (:59-64).
+3. Verified-head cache TTL bounded to minutes; re-resolve on authority-sensitive actions (:106).
+4. `transferable` is enforced as game policy through the head, not on-chain (:70).
+5. Network binding: the treasury layer already refuses records from another network's genesis (`treasuryDoc.ts` NETWORK PINNING block); deed heads must carry the same binding — testnet deeds must never look valid on mainnet (ROADMAP.md:147: "testnet assets and ids do not migrate").
+
+**Sequencing is already decided upstream of this issue.** ROADMAP.md:162 — "Integrate experimental Chia or decentralized persistence only after the core economy feels good without it"; TODO.md:62 — "Chia custody path for modules/deeds (Issue #1 lineage; chia-wallet-sdk vaults)". Nothing in this answer moves that gate; it only confirms the swap is additive when the gate opens.
+
+## 5. Q5 — ownership of items *within* the room (PROPOSED — no doc has decided this)
+
+No design doc mentions per-item ownership: chia-authority-architecture.md never says "item" or "furniture"; transfer-offers-deeds-shares.md scopes itself to deeds and shares; chia-ventures-shared-ownership.md models venture-held *deeds* via `P2Singleton(company_launcher_id)`. The code baseline (§1) is "nothing is owned; furniture is a room-doc layout the owner may edit; the trunk is a per-install list."
+
+### 5.1 "Items in a room" are four different things, at four tiers
+
+| Kind | Examples | Who cares about consensus | Tier (PR #121 rule) |
+|---|---|---|---|
+| **Fixtures** | placed furniture, wall screens, tables, vats — the `furniture` map | nobody beyond the deed holder and co-hosts; peers only need a valid layout | T1 — live edits, must feel instant |
+| **Portables** | trunk tools and outfits (`items.ts`) | the holder, and whoever they hand one to | T1/T2 — hand-over is interactive |
+| **Fungibles** | chips (`casinoDoc.ts`), future ore/parts | everyone who accepts them as value | T3 — already planned as a Registry-anchored asset (casinoDoc G4) |
+| **Artifacts** | a named blade, a signed painting — none exist yet | strangers, across rooms and stations | T3 — the only item class that earns a chain object |
+
+### 5.2 Recommendation per kind
+
+1. **Fixtures are an appurtenance of the deed — no per-item ownership object, on chain or off.** Whoever holds the deed (and owner-equivalents, `isLocalPlayerRoomOwner`) may write the layout; a hand-over moves the furniture with the room exactly as today (`main.ts:2859-2861` — standing records ride along). The only addition worth making is the one already promised for every other room record: when #67 D3 lands, `FurnitureRecord` writes carry `{authorPub, sig, seq}` under the room's authority root, verified on read like doorPolicy/treasury — so a peer's forged placement is *dropped*, not merely UI-discouraged. One schema addition, zero chain writes, consistent with §4's latency/privacy argument. Per-furniture NFTs are rejected for the same reasons DataStore was rejected as the primary primitive: minute-scale latency, one spend per confirmation per singleton, and a public record of every couch you move.
+2. **Portables get an off-chain signed-transfer ledger first, behind one predicate.** Mirror chia-ventures-shared-ownership.md §6 (lines 125-139): the chain layer hides behind `holds_whole_share`, shipped v1 as ledger replay and swapped later "invisible to players". For items: `holdsItem(pub, itemId) → bool` computed by replaying signed records `{itemId, from_pub, to_pub, seq}` — the current holder signs each transfer, the same bearer-artifact pattern the transfer-offers design reuses from contact cards. **Ordering constraint:** this cannot precede trunk sync — `items.ts:15-18` defers cross-trunk transfer and world drops until the Yjs `trunks` map (TR-sync) exists, and an ownership record over a local-only inventory would be theatre. Trunk sync first, ownership records second, chain never for ordinary tools and outfits.
+3. **Fungibles follow the plan that already exists.** Chips: casinoDoc G4 — an issuer-mintable chip asset under the house's authority on the Registry; the module's read/write shape does not change. A future ore/parts economy is the same shape (CAT2 under an issuing authority), not per-unit objects.
+4. **Artifacts, and only artifacts, may become NFT1 coins of their own** — transferable independently of any room, tradable by Offer, visible in external wallets. They inherit every con in §3 (key loss, foot-gun, staleness) and the CHIP-0011 constraint (BLS spend key, Ed25519 game key bound by a signed record). Gate: an item earns a coin only when strangers must agree who holds it across rooms and stations; otherwise it is a portable under (2).
+
+### 5.3 Non-goals (say them so nobody builds them)
+- No on-chain furniture; no per-placement spends.
+- No on-chain trunk sync; the `trunks` map is a room-doc CRDT like everything else at T1.
+- No item ownership before trunk sync — records without a shared inventory prove nothing.
+- No new player vocabulary: "hand over", "give", "offer" cover every tier; "mint"/"NFT"/"CAT" never appear in UI.
+
+## 6. Clarifications the docs should carry (small edits, no design change)
+
+1. chia-authority-architecture.md §3 "Ownership transfer" describes the on-chain future; today's hand-over is one LWW write (`executeDeedHandover`). A one-line "today:" pointer under §3 would stop readers over-estimating a live deed's authority.
+2. transfer-offers-deeds-shares.md:43 calls `roomInfo.owner` "the authoritative record". It is authoritative *within the doc* (there is nothing else), not verified — worth saying, since the whole point of #138 is that nothing enforces it.
+3. module-wallets-chia-funding-plan.md's invariant "changes no trust boundary" (`:20`, `:156`, `:350`) is about **presence-record publishing** — a funded spend proves someone paid to publish, never that the published addresses are reachable. It should not be cited for deeds: anchoring deeds *raises* the ownership trust level, which is the intended change.
+4. "Already anchored" (PR #121) means anchored in the node's chia lane. The browser never sees a launcher id (§1), so a reader looking for it in `src/` will find nothing and should not read that as a gap.
+
+## 7. Issue-sized slices this answer implies (for the maintainer to pick, in dependency order)
+
+| Slice | Tier / phase | Depends on | Notes |
+|---|---|---|---|
+| S1 — #67 D3 signed room records (door policy, co-hosts, then `furniture`) | T1, off-chain | keypair.ts (shipped); PR #129 in review | Verify-on-read like treasuryDoc; unsigned → dropped once the room opts in |
+| S2 — Authority-head Phase 1 in `ssf-p2p-node` (mint deed, write `authority_root`, publish head) | T3, Phase 1 | node profile + funded testnet11 wallet (already used by presence) | Opt-in, lazy; rooms without it unchanged |
+| S3 — Browser consumes the verified head as the owner-equivalence source | Phase 2 | S1, S2 | `isLocalPlayerRoomOwner` reads the head when present, the raw map when not |
+| S4 — Deed hand-over via node when anchored (gift now, offers later), LWW fallback when not | Phase 3 | S2 | The transfer-offers artifact becomes the offer text |
+| S5 — Registry (#68) for the global deed view | T3 | independent | Replaces visitation harvest; not a substitute for S2 |
+| S6 — Trunk sync (TR-sync `trunks` map), then signed item-transfer records | T1 | independent of chain | Precondition for any Q5 semantics; artifacts-as-NFT only after S2 exists |
+
+None of these change gameplay for a room that does not opt in — which is the answer to Q4 restated as work.
