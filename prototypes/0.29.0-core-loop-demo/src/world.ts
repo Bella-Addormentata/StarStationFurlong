@@ -23,11 +23,15 @@ import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
 // 🎰 #76: CRDT-backed stand occupancy. The Y.Map claim binds at the T0 seam
-// in main.ts (bindStandsDoc). The pure engine (standClaims) supplies the
-// tier picker + expiry rules; world.ts wires them into walk-up + heartbeat.
+// in main.ts (bindStandsDoc, which also injects the identity signer +
+// verifier: every claim is SIGNED, and the identity compared against below is
+// localStandPub() — the same pub the signer writes under, never a separate
+// lookup). The pure engine (standClaims) supplies the tier picker + expiry
+// rules; world.ts wires them into walk-up + heartbeat.
 import {
   claimStand,
-  getOnlinePlayerIds,
+  getOnlinePubs,
+  localStandPub,
   readAllStandClaims,
   readStandClaim,
   reapExpiredClaims,
@@ -64,7 +68,7 @@ import { speakRobotLine } from "./robotVoice";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
-import { getDefaultRoomId, getPlayerId } from "./identity";
+import { getDefaultRoomId } from "./identity";
 import {
   FURNITURE,
   FURNITURE_DEFS,
@@ -4752,13 +4756,21 @@ export class World {
     // hook can free it. Wrapping the caller's existing onRelease keeps trunk-
     // style choreography intact if this ever gets composed on a device that
     // already had a hook (none today, but the pattern is uniform).
+    //
+    // The claim is SIGNED by the local identity inside claimStand. A null
+    // return means this client cannot produce a verifiable claim right now
+    // (no identity wired — standsDoc warns once): walk to the slot anyway
+    // WITHOUT tracking it, the same posture as a legacy peer that never posts
+    // a claim, which the proximity filter in pickFreeStand already covers.
+    // Tracking an unwritten slot would only heartbeat nulls.
     const now = Date.now();
-    claimStand(stand.id, getPlayerId(), now);
-    this.trackedStand = {
-      slotId: stand.id,
-      itemId: device.id,
-      lastHeartbeat: now,
-    };
+    if (claimStand(stand.id, now)) {
+      this.trackedStand = {
+        slotId: stand.id,
+        itemId: device.id,
+        lastHeartbeat: now,
+      };
+    }
     // Capture per-wrap so a subsequent standTarget() that overwrites
     // trackedStand can't redirect THIS closure's release to a different slot.
     const claimedSlotId = stand.id;
@@ -4783,12 +4795,15 @@ export class World {
    * released slot is always the one the caller CLAIMED, never whatever
    * `trackedStand` currently points to.
    *
-   * Ownership guard (shouldReleaseSlot): if the current doc value for this
-   * key names another player (a legit TTL race where we lost tenure and a
-   * peer legitimately took the slot), we DO NOT delete their claim — an
-   * over-eager release would violate the ownership rule the whole claim
-   * system defends against. `shouldReleaseSlot` returns true when the slot
-   * is empty (our expected common case) OR when we're still the named owner.
+   * Ownership guard (shouldReleaseSlot): if the current VERIFIED doc value
+   * for this key names another identity (a legit TTL race where we lost
+   * tenure and a peer legitimately took the slot), we DO NOT delete their
+   * claim — an over-eager release would violate the ownership rule the whole
+   * claim system defends against. `shouldReleaseSlot` returns true when the
+   * slot is empty (our expected common case — an unverifiable record reads
+   * as empty too, and deleting garbage is fine) OR when we're still the
+   * named holder. With no identity bound, localStandPub() is null and "" can
+   * never name us, so only empty slots release — conservative by design.
    */
   private releaseStandById(slotId: string): void {
     if (this.trackedStand?.slotId === slotId) {
@@ -4801,7 +4816,7 @@ export class World {
       console.error("[stands] readStandClaim threw during release:", err);
       current = null;
     }
-    if (!shouldReleaseSlot(current, getPlayerId())) return;
+    if (!shouldReleaseSlot(current, localStandPub() ?? "")) return;
     try { releaseStand(slotId); }
     catch (err) { console.error("[stands] release threw:", err); }
   }
@@ -4842,7 +4857,7 @@ export class World {
       console.error("[stands] readStandClaim threw during heartbeat:", err);
       current = null;
     }
-    const me = getPlayerId();
+    const me = localStandPub() ?? "";
     if (!canPlayerClaim(current, me, now)) {
       // A different live peer is on our slot — the resume walked into a
       // hand-off we missed. Forget the slot locally so the wrapped
@@ -4851,8 +4866,15 @@ export class World {
       return;
     }
     try {
-      claimStand(tracked.slotId, me, now);
-      tracked.lastHeartbeat = now;
+      // A fresh signature every renewal (the bytes cover `at`). If we can no
+      // longer produce a verifiable claim, stop tracking: heartbeating a slot
+      // we cannot hold would only re-arm this branch every 5 s, and the
+      // stale entry (if any) ages out through the TTL like a crashed peer's.
+      if (claimStand(tracked.slotId, now)) {
+        tracked.lastHeartbeat = now;
+      } else {
+        this.trackedStand = null;
+      }
     } catch (err) {
       console.error("[stands] heartbeat threw:", err);
     }
@@ -4864,22 +4886,24 @@ export class World {
    * a fresh heartbeat that races the reap just re-writes the same key, and Yjs
    * picks whichever landed last.
    *
-   * The online set is sourced through `getOnlinePlayerIds()` from standsDoc,
-   * which main.ts wires to the room doc's `players` map at bind time — a
-   * proper injected accessor rather than reaching through the `__ssfDoc`
-   * debug window handle. We add the local player id as belt-and-braces so
-   * a solo session (or offline fallback) never reaps its own slot even
-   * before the local presence entry has been written.
+   * The online set is sourced through `getOnlinePubs()` from standsDoc, which
+   * main.ts wires to the room doc's `players` map at bind time — a proper
+   * injected accessor rather than reaching through the `__ssfDoc` debug
+   * window handle. It is a set of identity PUBS (each entry's keyB64),
+   * because that is what a signed claim carries. We add the local pub as
+   * belt-and-braces so a solo session (or offline fallback) never reaps its
+   * own slot even before the local presence entry has been written.
    */
   private tickStandReap(deltaTime: number): void {
     this.standReapAccumMs += deltaTime * 1000;
     if (this.standReapAccumMs < STAND_CLAIM_REAP_MS) return;
     this.standReapAccumMs = 0;
-    const online = getOnlinePlayerIds();
-    online.add(getPlayerId());
+    const online = getOnlinePubs();
+    const me = localStandPub();
+    if (me) online.add(me);
     const stale = findExpiredClaims({
       claims: readAllStandClaims(),
-      onlinePlayerIds: online,
+      onlinePubs: online,
       now: Date.now(),
     });
     if (stale.length === 0) return;
@@ -4895,18 +4919,28 @@ export class World {
    * to the device's own front).
    *
    * The proximity filter (remote avatar within 0.7 m) stays as a defence
-   * against a legacy peer that never posted a claim — a stand seen taken on
-   * screen is still treated as taken here, even without a matching claim.
+   * against a peer that never posted a claim — a legacy build, or a client
+   * whose claims we cannot verify — a stand seen taken on screen is still
+   * treated as taken here, even without a matching claim.
+   *
+   * ONE claim snapshot (readAllStandClaims) feeds the tier picker, the
+   * proximity exemption and the tier re-sort below: every record in it is
+   * already signature-verified, the three consumers see one consistent
+   * view, and nothing re-reads (or re-verifies) per slot inside the sort.
    */
   private pickFreeStand(itemId: string): StandSlot | null {
     const slots = standsForItem(itemId);
     if (slots.length === 0) return null;
-    const playerId = getPlayerId();
+    // "" when no identity is bound: never equal to a verified claim's pub,
+    // so nothing reads as mine and only empty/stale slots are candidates.
+    const pub = localStandPub() ?? "";
+    const now = Date.now();
+    const claims = readAllStandClaims();
     const candidates = pickStandForWalkup({
       slots,
-      claims: readAllStandClaims(),
-      playerId,
-      now: Date.now(),
+      claims,
+      pub,
+      now,
       // Owner-equivalent gate — same rule that unlocks the croupier UIs (#69
       // G1/G2). A non-owner never lands on the wheel-head from a walk-up.
       canOperateReserved: canEditRoom().ok,
@@ -4940,10 +4974,8 @@ export class World {
     // out, regardless of the claim map. Two exceptions: my own tracked stand
     // (I'm the one on top of it) and the mineActive tier (the claim map
     // already says it's mine, so my own avatar being there is fine).
-    const claimByThisPlayer = (slotId: string): boolean => {
-      const claim = readStandClaim(slotId);
-      return claim != null && claim.playerId === playerId;
-    };
+    const claimByThisPlayer = (slotId: string): boolean =>
+      claims.get(slotId)?.pub === pub;
     const free = candidates.filter(
       (s) =>
         (claimByThisPlayer(s.id) ||
@@ -4964,10 +4996,9 @@ export class World {
     // re-promote the stale-mine slot to tier 0 and prefer it over a nearer
     // open civilian slot — a subtle disagreement between the two layers. The
     // aligned check keeps both layers on the same tier assignment.
-    const tierNow = Date.now();
     const tierOf = (s: StandSlot): number => {
-      const claim = readStandClaim(s.id);
-      if (claim && claim.playerId === playerId && isClaimActive(claim, tierNow)) return 0;
+      const claim = claims.get(s.id);
+      if (claim && claim.pub === pub && isClaimActive(claim, now)) return 0;
       return s.role ? 2 : 1;
     };
     free.sort((a, b) => {
