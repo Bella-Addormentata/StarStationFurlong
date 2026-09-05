@@ -5528,8 +5528,10 @@ function buildCloneVat(ctx: BuildCtx) {
       applyPose();
     },
   };
-  // Stow on a tiny carrier mesh inside the plinth — collected by World and
-  // devMenu's registerSpawnedGroup exactly like userData.trunkLid.
+  // Stow on a tiny carrier mesh inside the plinth — collected by
+  // registerFurnitureHandles (furnitureHandles.ts, the one list both World
+  // and devMenu's registerSpawnedGroup file through) exactly like
+  // userData.trunkLid.
   const carrier = place(
     new THREE.BoxGeometry(0.01, 0.01, 0.01),
     m(BODY, 0.5, 0.5),

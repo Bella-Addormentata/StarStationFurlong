@@ -62,7 +62,8 @@ import {
 import { roomHalfExtents, roomPlaceBounds } from './floorPlanDoc';
 import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
-import type { WallScreenHandle, TrunkLidHandle, GameTableTopHandle, CloneVatHandle } from './devices';
+import { registerFurnitureHandles } from './furnitureHandles';
+import type { FurnitureHandleSinks } from './furnitureHandles';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -109,20 +110,21 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
 type GetWorld = () => World | null;
 
 /**
- * The private World collections addLobbyFurniture feeds per item — runtime
- * spawning must feed the SAME ones so zoom-hide, light fades, wall-screen
- * ticks, holo spins and trunk-lid drives all pick the new piece up.
- * (Deliberate private reach-through — see module header.)
+ * The private World collections registerFurnitureGroup feeds per item —
+ * runtime spawning must feed the SAME ones so zoom-hide and light fades pick
+ * the new piece up. (Deliberate private reach-through — see module header.)
+ * The drive-handle sinks (wall-screen ticks, holo spins, trunk lids, table
+ * tops, vats, slot visuals) are deliberately NOT mirrored field-by-field any
+ * more — that mirror drifted (#117). World's private furnitureHandleSinks()
+ * hands them out as one object and the shared list in furnitureHandles.ts
+ * files into it, so a new handle kind cannot land in one path only; the
+ * only name this cast must keep in sync for them is the method's.
  */
 interface WorldInternals {
   platformGroup: THREE.Group;
   furnitureMeshes: THREE.Mesh[];
   furnitureLights: Array<{ light: THREE.PointLight; targetIntensity: number }>;
-  wallScreens: Map<string, WallScreenHandle>;
-  holoSpinners: Array<{ mesh: THREE.Mesh; speed: number }>;
-  trunkLids: Map<string, TrunkLidHandle>;
-  gameTableTops: Map<string, GameTableTopHandle>;
-  cloneVats: Map<string, CloneVatHandle>;
+  furnitureHandleSinks(): FurnitureHandleSinks;
 }
 
 let getWorld: GetWorld = () => null;
@@ -313,34 +315,23 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
 }
 
 /**
- * Replicate World.addLobbyFurniture's per-item registration for a runtime
- * spawn, then snap the fade-in to "done": we are post-morph, so materials go
- * straight to their design opacity (userData.baseOpacity ?? 1) and point
- * lights to their fade target.
+ * Replicate World.registerFurnitureGroup's per-item registration for a
+ * runtime spawn, then snap the fade-in to "done": we are post-morph, so
+ * materials go straight to their design opacity (userData.baseOpacity ?? 1)
+ * and point lights to their fade target.
  */
 function registerSpawnedGroup(world: World, item: FurnitureItem): void {
   const w = world as unknown as WorldInternals;
   const group = buildItemGroup(item);
   w.platformGroup.add(group);
   world.furnitureGroups.set(item.id, group);
+  // 🗂️ Same handle list as World.registerFurnitureGroup (furnitureHandles.ts);
+  // taken fresh per spawn — see World.furnitureHandleSinks on caching.
+  const sinks = w.furnitureHandleSinks();
   group.traverse((obj) => {
     if (obj instanceof THREE.Mesh) {
       w.furnitureMeshes.push(obj);
-      if (obj.userData.wallScreen) {
-        w.wallScreens.set(item.id, obj.userData.wallScreen as WallScreenHandle);
-      }
-      if (typeof obj.userData.holoSpin === 'number') {
-        w.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin as number });
-      }
-      if (obj.userData.trunkLid) {
-        w.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
-      }
-      if (obj.userData.gameTableTop) {
-        w.gameTableTops.set(item.id, obj.userData.gameTableTop as GameTableTopHandle);
-      }
-      if (obj.userData.cloneVat) {
-        w.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
-      }
+      registerFurnitureHandles(sinks, item.id, obj);
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;
