@@ -1764,7 +1764,7 @@ const buildWallComputer = (ctx: BuildCtx) => {
   };
   // Boot frame so the prop is never a black rectangle before the first tick.
   drawStatus(lastStatus);
-  screen.userData.wallScreen = handle; // collected by World.addLobbyFurniture
+  screen.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 };
 
 // ── Map table / holograph table (M4 of #33) ──────────────────────────────────
@@ -1772,9 +1772,10 @@ const buildWallComputer = (ctx: BuildCtx) => {
 // above it: emissive cyan plane + a slow-spinning broken emissive ring (the
 // gap is what makes the spin readable). flat() = MeshBasicMaterial, the same
 // unlit-reads-as-emissive idiom as the fireplace fire layers and wall strips.
-// The ring mesh carries userData.holoSpin (rad/s); World.addLobbyFurniture
-// collects it and World.update() drives the rotation — same collect-and-drive
-// seam as the wall computer's userData.wallScreen handle.
+// The ring mesh carries userData.holoSpin (rad/s); registerFurnitureHandles
+// (furnitureHandles.ts) collects it on every registration path and
+// World.update() drives the rotation — same collect-and-drive seam as the
+// wall computer's userData.wallScreen handle.
 const MT_TOP_Y = 0.84; // table-top surface height
 const MT_HOLO_Y = 1.18; // holo disc plane height
 const HOLO_CYAN = 0x00e5ff;
@@ -1872,7 +1873,7 @@ const buildMapTable = (ctx: BuildCtx) => {
   const ringGeo = new THREE.TorusGeometry(0.55, 0.018, 8, 48, Math.PI * 1.55);
   ringGeo.rotateX(Math.PI / 2); // lie flat in the XZ plane
   const ring = place(ringGeo, ringMat, 0, MT_HOLO_Y + 0.05, 0);
-  ring.userData.holoSpin = 0.6; // rad/s — collected by World.addLobbyFurniture
+  ring.userData.holoSpin = 0.6; // rad/s — collected by registerFurnitureHandles (furnitureHandles.ts)
 
   // Faint cyan wash over the table surface
   addLight(new THREE.PointLight(HOLO_CYAN, 0, 3.5), 0, MT_HOLO_Y + 0.4, 0, 0.9);
@@ -2106,7 +2107,7 @@ const buildStorageTrunk = (ctx: BuildCtx) => {
       }
     },
   };
-  lidSlab.userData.trunkLid = handle; // collected by World.addLobbyFurniture
+  lidSlab.userData.trunkLid = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 };
 
 // ── Game table (#45 v1) — sturdy lounge table with a flippable two-face top ──
@@ -2385,7 +2386,7 @@ const buildGameTable = (ctx: BuildCtx) => {
       }
     },
   };
-  slab.userData.gameTableTop = handle; // collected by World.addLobbyFurniture
+  slab.userData.gameTableTop = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 };
 
 // ── Definitions ───────────────────────────────────────────────────────────────
@@ -5528,8 +5529,10 @@ function buildCloneVat(ctx: BuildCtx) {
       applyPose();
     },
   };
-  // Stow on a tiny carrier mesh inside the plinth — collected by World and
-  // devMenu's registerSpawnedGroup exactly like userData.trunkLid.
+  // Stow on a tiny carrier mesh inside the plinth — collected by
+  // registerFurnitureHandles (furnitureHandles.ts, the one list both World
+  // and devMenu's registerSpawnedGroup file through) exactly like
+  // userData.trunkLid.
   const carrier = place(
     new THREE.BoxGeometry(0.01, 0.01, 0.01),
     m(BODY, 0.5, 0.5),
@@ -5865,7 +5868,7 @@ function buildSlotMachine({
     },
   };
   const visualCarrier = reelDrums[0];
-  visualCarrier.userData.slotMachineVisual = handle;
+  visualCarrier.userData.slotMachineVisual = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
   paintPhysicalReels();
   paintDisplay(`BET ${denomination}`);
 

@@ -127,6 +127,8 @@ import {
   tickManualSlotMachine,
 } from "./slotCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
+import { registerFurnitureHandles } from "./furnitureHandles";
+import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
   TrunkLidHandle,
@@ -1464,41 +1466,18 @@ export class World {
    *    on a client already past the morph) which no fade-in will ever touch.
    * ⚠ Every per-item collection here MUST have its inverse delete in
    * removeFurnitureVisuals, or removal leaves a live driven handle (#45 F1).
+   * The drive-handle filing itself lives in furnitureHandles.ts — ONE list
+   * shared with devMenu's registerSpawnedGroup (#117 was the two-copy drift).
    */
   private registerFurnitureGroup(item: FurnitureItem, reveal: boolean): void {
     const group = buildItemGroup(item);
     this.platformGroup.add(group);
     this.furnitureGroups.set(item.id, group);
+    const sinks = this.furnitureHandleSinks();
     group.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
         this.furnitureMeshes.push(obj);
-        if (obj.userData.wallScreen) {
-          this.wallScreens.set(
-            item.id,
-            obj.userData.wallScreen as WallScreenHandle,
-          );
-        }
-        if (typeof obj.userData.holoSpin === "number") {
-          this.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin });
-        }
-        if (obj.userData.trunkLid) {
-          this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
-        }
-        if (obj.userData.gameTableTop) {
-          this.gameTableTops.set(
-            item.id,
-            obj.userData.gameTableTop as GameTableTopHandle,
-          );
-        }
-        if (obj.userData.cloneVat) {
-          this.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
-        }
-        if (obj.userData.slotMachineVisual) {
-          this.slotMachineVisuals.set(
-            item.id,
-            obj.userData.slotMachineVisual as SlotMachineVisualHandle,
-          );
-        }
+        registerFurnitureHandles(sinks, item.id, obj);
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1516,6 +1495,31 @@ export class World {
         if (reveal) obj.intensity = targetIntensity;
       }
     });
+  }
+
+  /**
+   * 🗂️ World's per-item drive collections as the sinks the shared handle
+   * list files into (furnitureHandles.ts). Private like the collections it
+   * exposes: devMenu's runtime spawn registers through the SAME list by
+   * reaching this method through its WorldInternals cast — one name to keep
+   * in sync instead of the six field names its old mirror copied (and let
+   * drift, #117) — and World's public API stays clean, per devMenu's header.
+   * Returns the live collections, not copies: filing into the result is
+   * filing into World. Take it fresh per registration and don't cache it —
+   * removeFurnitureVisuals replaces `holoSpinners` by filter, so a stale
+   * result would file spinners into a list nobody drives.
+   * The literal doubles as the compile-time exhaustiveness proof: a sink
+   * added to FurnitureHandleSinks without a World collection fails here.
+   */
+  private furnitureHandleSinks(): FurnitureHandleSinks {
+    return {
+      wallScreens: this.wallScreens,
+      holoSpinners: this.holoSpinners,
+      trunkLids: this.trunkLids,
+      gameTableTops: this.gameTableTops,
+      cloneVats: this.cloneVats,
+      slotMachineVisuals: this.slotMachineVisuals,
+    };
   }
 
   /**
@@ -2844,8 +2848,10 @@ export class World {
 
   /**
    * Despawn ONE furniture item's visuals and deregister every per-item
-   * handle — the exact inverse of addLobbyFurniture's per-item registration
-   * (#53 remove-to-inventory). Scene-graph and World-collection side only:
+   * handle — the exact inverse of the per-item registration that both
+   * registerFurnitureGroup and devMenu's registerSpawnedGroup perform through
+   * registerFurnitureHandles (#53 remove-to-inventory). Scene-graph and
+   * World-collection side only:
    * the FURNITURE registry splice and the rebake pipeline (obstacles → grid
    * → seats → devices → replan) are the CALLER's responsibility, mirroring
    * how commitCarry/spawnFurniture own that pipeline around their mutation.
