@@ -706,11 +706,23 @@ export class Player {
     // (a re-click bumps the controller's deviceSeq — keeping the old closure
     // would make onArrived fire with a stale token and strand the avatar
     // ENGAGED with no camera) and keep walking.
+    //
+    // ROUND-2 AUDIT FIX. Also adopt the caller's fresh DeviceTarget — a re-tap
+    // that picks a DIFFERENT stand slot (rare: our prior slot's TTL expired
+    // between clicks and a peer legitimately took it, so standTarget picked
+    // another slot on the same table) hands us a NEW wrapped onRelease that
+    // captures the NEW slot id. Keeping only the old closure would strand the
+    // NEW claim on a later cancellation (the abort would release the OLD slot,
+    // already gone, while the NEW slot sits held). The OLD closure orphans
+    // safely — standTarget's own pre-release already dropped the old slot when
+    // it picked a different one (or the same-slot case captures the same id
+    // in both closures and the orphan is a no-op).
     if (
       this.devicePhase !== "NONE" &&
       this.deviceTarget &&
       this.deviceTarget.id === device.id
     ) {
+      this.deviceTarget = device;
       this.deviceHooks = hooks;
       return;
     }
@@ -2519,6 +2531,21 @@ export class Player {
    * only — an ENGAGED device is released through the controller's ease via
    * releaseDevice()). Clearing the hooks here is what guards against stale
    * onArrived callbacks: TURN can only fire the hooks it still holds.
+   *
+   * WRAPPED onRelease (round-2 audit fix). Fire `deviceTarget.onRelease?.()`
+   * BEFORE nulling the target so every cancellation path — floor-click,
+   * seat-click, door-click, WASD, FINE-stuck watchdog, item removed/moved,
+   * enterFromDoor, beamTo, non-ENGAGED releaseDevice — uniformly runs the
+   * hook the DeviceTarget author registered. #76's standTarget wrapper is
+   * the load-bearing consumer (it releases the CRDT stand claim); the
+   * trunk's lid handle is the other consumer today (closeLid is a no-op on
+   * a lid that never opened, so the fire-and-forget call is safe). Every
+   * onRelease is required to be idempotent — the focus controller already
+   * calls onRelease from three release paths without guarding for double-
+   * fire, so this is contract, not a new obligation.
+   *
+   * A try/catch wraps the invocation so a throwing hook cannot leave the
+   * player state machine half-cancelled with a live deviceTarget hanging on.
    */
   private _cancelDeviceApproach(): void {
     if (
@@ -2526,10 +2553,19 @@ export class Player {
       this.devicePhase === "FINE" ||
       this.devicePhase === "TURN"
     ) {
+      const target = this.deviceTarget;
+      // Clear state FIRST so a hook that re-enters (unlikely, but a stand-
+      // claim release does write to the room doc, and observers might land
+      // in the same turn) cannot see a half-cancelled machine — same reason
+      // releaseStandById clears trackedStand before touching the map.
       this.devicePhase = "NONE";
       this.deviceTarget = null;
       this.deviceHooks = null;
       this._removeReticle();
+      if (target?.onRelease) {
+        try { target.onRelease(); }
+        catch (err) { console.error("[player] device onRelease threw during cancel:", err); }
+      }
     }
   }
 
