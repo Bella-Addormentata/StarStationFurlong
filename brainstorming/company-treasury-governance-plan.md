@@ -4,7 +4,7 @@
 
 **Status:** architecture proposal; documentation only. No runtime money path should depend on this document until the testnet gates in section 17 pass.
 
-> **Amendment (sovereign/serverless):** the "authoritative Rust treasury service" architecture in §4 and §13 is **superseded** by [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) — Chialisp puzzles are the only money authority, the service's roles decompose into a treasury profile of every player's own `ssf-p2p-node`, and proposal acceptance and vote checkpoints become on-chain events. Chain access is **proposed** to move to the Chia peer protocol — pending maintainer ratification (amendment §6/§14), since that reverses §13.1's settled posture. The invariants, puzzles, threats (§17.1), migration, and mainnet ceremony below are unchanged. The contracts, tests, and gates are **amended, not unchanged**: §7.1's `TreasuryProposalAcceptance`/`serviceSig` are deleted in favor of derived `ProposalWindows`, §7.2's `VoteInclusionProof` changed shape and its vote body's field set is pinned by shared vectors, `maxFeeMojos` is added to `CompanyTreasuryPolicy` (§12) and `DeviceAllowance` (§9.1) and enters the policy hash, `stateCoinId` binds each §9.1 execution request to the state coin it consumes, the §12 CBOR profile gains a no-byte-strings rule, §17.3–§17.4's service-shaped test and gate actors get per-node substitutions, and §18's sequence gains gating spikes S-0/S-1/S-3 — see the amendment's §10–§13 for the full deltas. Original text is preserved below per repo convention.
+> **Amendment (sovereign/serverless):** the "authoritative Rust treasury service" architecture in §4 and §13 is **superseded** by [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) — Chialisp puzzles are the only money authority, the service's roles decompose into a treasury profile of every player's own `ssf-p2p-node`, and proposal acceptance and vote checkpoints become on-chain events. Chain access is **proposed** to move to the Chia peer protocol — re-stated 2026-09-05 with binding conditions and still pending maintainer ratification (amendment §6/§14), since that reverses §13.1's settled posture. The invariants, puzzles, threats (§17.1), migration, and mainnet ceremony below are unchanged. The contracts, tests, and gates are **amended, not unchanged**: §7.1's `TreasuryProposalAcceptance`/`serviceSig` are deleted in favor of derived `ProposalWindows`, §7.2's `VoteInclusionProof` changed shape and its vote body's field set is pinned by shared vectors, `maxFeeMojos` is added to `CompanyTreasuryPolicy` (§12) and `DeviceAllowance` (§9.1) and enters the policy hash, `stateCoinId` binds each §9.1 execution request to the state coin it consumes, the §12 CBOR profile gains a no-byte-strings rule, §17.3–§17.4's service-shaped test and gate actors get per-node substitutions, and §18's sequence gains gating spikes S-0/S-1/S-3 — see the amendment's §10–§13 for the full deltas. Original text is preserved below per repo convention.
 
 **Code root:** unless a path starts with `brainstorming/`, every `src/...` path in this document is relative to `prototypes/0.29.0-core-loop-demo/`.
 
@@ -700,6 +700,13 @@ export interface RoomTreasuryBinding {
 
 The room doc stores a signed cache of this binding. Clients verify it against company policy and the room deed/authority head. It is not authoritative merely because it appears in Yjs.
 
+> **Amended 2026-09-05 (PR 119 follow-up).** "Verify against company policy and the room deed/authority head" is two predicates, checked in different places and never presented as one:
+>
+> - **P-room — who may bind this room.** `boundByPub` MUST equal the room owner's identity key: `players[roomInfo.owner].keyB64` today, read live on every read; the verified authority head's `owner_ed25519_pubkey` once room deeds land (issue #138, [chia-authority-architecture.md](chia-authority-architecture.md)) — same field, same comparison, no schema change, and the only code that changes is `gamesDoc.readRoomOwnerKey`. Owner only, and the RAW owner: venture shareholders do pass the shareholder-extended owner gate for room edits, docking and door policies (`main.ts` `isLocalPlayerRoomOwner`), but a deed is the personal owner's alone (`currentRoomDeedIsMine`), and a binding is a statement about the room's deed, not about its edit rights — so the deed holder's key signs it; widening to co-hosts or the company is PR F's call through the authority head and the policy, and a strict subset now cannot be invalidated by that later. The cache layer proves authorship only (`sig` verifies under the record's own key); the owner comparison is a READ rule in the view layer (`treasuryView.bindingSigner`), and the slot stays plain-replace and un-gated on write (invariant 5). Verdicts: **OWNER-SIGNED** anchors the company scope; **OWNER UNKNOWN** and **NO OWNER KEY** show the record as the claim it is and withhold the company details and proposal list — deliberately no fail-open, because once a room has synced the only peer action that produces an unknown owner is deleting or overwriting the owner's entry, and trusting any signer then turns censorship into forgery (an honest deed hand-over never leaves a room in that state, since it refuses a recipient with no key); **NOT OWNER-SIGNED** is refused as this room's funding, still reported as held, and renders no company details. The signer's fingerprint is always shown. What OWNER-SIGNED is worth today, in one sentence: the key the room document currently names as owner signed this, and naming the owner is two unauthenticated map writes (`roomInfo.owner`, `players[owner].keyB64`) — room-document trust, no more. The badge therefore says "as its records name them", and may say "confirmed against the room's deed" only for a key a verified head supplied.
+> - **P-company — does the company agree.** `policyReceiptId` MUST name a confirmed receipt of an accepted `bind-room` proposal for exactly this (companyId, treasuryLauncherId, policyVersion, roomId, profileId) on the pinned network, with that policy version current. Not checkable in the browser; PR D/F own it, and until then every surface prints **Company approval · not checked** beside the receipt id, so an owner's signature is never read as the company's consent.
+>
+> Recorded with the rule: a legacy (`Local-Clone`) room cannot show an owner-signed binding until it is claimed under a keyed owner — and claiming is itself one unauthenticated write today; a venture office room keeps its founder as `roomInfo.owner` (deed hand-over refuses office rooms), so PR F's writer must not treat the office founder's key as the company's consent, and ventures need a way to rotate the office owner key; **deletion is not revocation** — with no sequence, tombstone or reader watermark, any binding the owner ever signed can be re-put and reads OWNER-SIGNED again, which is safe only while no writer exists, so PR F's first writer is gated on a signed unbind tombstone carrying seq/height, highest-seq-wins on read, and a per-reader watermark; and when an authority head supplies the owner key, `authority_root` must be anchored outside the peer-writable room doc (bootstrap link, room seed, or a roomId derived from the launcher id) and readers must keep a per-peer highest-seen `seq` watermark, or a swapped root or rolled-back head re-anchors a stale binding. Open decision #10 is resolved by this rule: a binding persists until the owner KEY changes (which demotes it automatically) or a PR F unbind; `expiresAfterHeight` stays an optional self-imposed cap.
+
 ### 10.2 Room control computer UI
 
 Add a `FUNDING` section to `createRoomTerminalUI` in `devices.ts`:
@@ -724,6 +731,8 @@ The room computer does not display or request treasury private keys.
 
 PR C implements this section as read-only/mock UI. It must not query or install live company bindings until PR D supplies verified treasury snapshots and PR F supplies proposal-authorized room bindings.
 
+> **Superseded (2026-09-05, as shipped in PR 119):** PR C took the read-only branch of every "read-only/mock" slash and mocked nothing. The funding source is reported as record / no record / cannot read / not owner-signed rather than "personal / company" — a missing record is never inferred to mean personal funding (invariant 5); no snapshot or balance is mocked; `REFRESH PROOF` will ask the player's own node ([sovereign plan](sovereign-treasury-serverless-plan.md) §2), not a service. The four commands are present and disabled.
+
 ---
 
 ## 11. Furlong Phone: Ventures and Treasury
@@ -743,6 +752,8 @@ Extend `renderVenturesApp()` in `main.ts` with a Treasury tab.
 - chain sync and proof status.
 
 PR C's MVP is verified/mock balances plus a proposal list and offline/proof states. Interactive proposal, role, allowance, and execution controls arrive in PR F after the service and policy proofs exist.
+
+> **Superseded (2026-09-05, as shipped in PR 119):** PR C shows no balance — mocked or otherwise — until the node lane supplies a verified one, and the panel says why. Nothing named `TreasuryService` exists in the browser: the seam the sovereign plan §2 keeps "in role as the browser↔local-node contract" is the local HTTP API PR D defines, and PR C's result-form readers (`ok` / `absent` / `unreadable` / `too-large`) with a trust badge on every panel are the display contract it must feed.
 
 ### 11.2 Proposal flow
 
@@ -862,7 +873,7 @@ PR B must include shared TypeScript/Rust test vectors: canonical bytes, SHA-256 
 
 ## 13. Browser/Rust service boundary
 
-> **Superseded:** this section's remote service is replaced by the treasury node profile in [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §2/§3. Replacing §13.1's operator-run/cross-check full nodes with Chia peer-protocol chain access (amendment §6) is **proposed, pending maintainer ratification** — see the §20 note. The `TreasuryService` interface below survives in role as the browser's contract with **its own local node**, with amended signatures: `ProposalWindows` replaces `TreasuryProposalAcceptance`, and inclusion proofs use the shipped `{voteId, checkpointId, steps}` shape. The verification duties listed for "the Rust implementation" become duties of every player's node; §13.1's reorg/receipt rules carry over in substance, executed per-node (the idempotency ledger becomes the chain itself — amendment §3).
+> **Superseded:** this section's remote service is replaced by the treasury node profile in [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §2/§3. Replacing §13.1's operator-run/cross-check full nodes with Chia peer-protocol chain access (amendment §6) is **proposed with binding conditions (2026-09-05) and pending maintainer ratification** (amendment §14; see the §13.1 and §20 notes). The `TreasuryService` interface below survives in role as the browser's contract with **its own local node**, with amended signatures: `ProposalWindows` replaces `TreasuryProposalAcceptance`, and inclusion proofs use the shipped `{voteId, checkpointId, steps}` shape. The verification duties listed for "the Rust implementation" become duties of every player's node; §13.1's reorg/receipt rules carry over in substance, executed per-node (the idempotency ledger becomes the chain itself — amendment §3).
 
 Define an interface before selecting transport:
 
@@ -894,6 +905,8 @@ The Rust implementation should:
 
 ### 13.1 Full-node trust boundary
 
+> **Proposed superseded (2026-09-05, pending maintainer ratification in the sovereign plan §14):** the operator-run full node and independently administered cross-check node below would be withdrawn, with chain access moving to the Chia peer protocol from each player's own node under an N-peer cross-check and the binding conditions in [sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §6 and §14. The honesty rule in the second paragraph — name every residual trusted-node assumption, never label it trustless, approve each one at the mainnet gate — is unchanged and now applies per node.
+
 The v1 service uses a synced, self-run Chia full node in the same operator trust domain for candidate chain and mempool data. Browser-supplied RPC endpoints and public coinset responses are untrusted. Before accepting a governance snapshot, policy transition, or confirmed receipt, the service must cross-check the finalized height, header hash, and relevant coin records with at least one independently administered full node. Disagreement, inadequate confirmation depth, rollback, or an unavailable cross-check stops acceptance and spending.
 
 Where available, the service verifies header, singleton, CAT, and coin lineage proofs locally. If the selected Chia RPC cannot provide a proof for a required claim, the implementation must document the trusted-node assumption and may not label that claim trustless. A production/mainnet gate must explicitly approve each residual assumption. The service verifies the exact spend-bundle hash it constructed before submission and reconciles that hash against mempool and confirmed-chain observations.
@@ -913,13 +926,19 @@ Potential Rust integration points:
 A company office doc may cache signed records in a `treasury` Y.Map:
 
 ```text
-policy                         -> SignedPolicyCache
-proposal:<proposalId>          -> SignedProposal
-vote:<proposalId>:<voterPub>   -> SignedVote
-allowance:<allowanceId>        -> SignedAllowanceCache
-binding:<roomId>               -> SignedRoomTreasuryBinding
-receipt:<receiptId>            -> SignedReceiptCache
-sync                           -> ChainSyncStatus
+policy                                    -> CompanyTreasuryPolicy cache (shape-checked, plain-replace)
+proposal:<proposalId>                     -> TreasuryProposal (signed)
+vote:<proposalId>:<voterGamePub>          -> TreasuryVote (signed; slot keyed by the authenticating game key)
+allowance:<allowanceId>                   -> DeviceAllowance cache
+binding:<roomId>                          -> RoomTreasuryBinding (signed; §10.1 owner rule applied on read)
+receipt:<receiptId>                       -> TreasuryReceipt cache
+sync                                      -> ChainSyncStatus (display-only; carries the genesis; a per-peer claim)
+registration:<proposalId>                 -> ProposalRegistration
+windows:<proposalId>                      -> ProposalWindows (derived — recompute to trust)
+checkpoint:<proposalId>:<checkpointId>    -> TreasuryCheckpoint
+session:<proposalId>:<sessionId>          -> SigningSession shell (zero authority)
+sessionsig:<sessionId>:<signerPuzzleHash> -> one collected signature
+payload:<payloadHash>                     -> proposal payload bytes, lowercase hex
 ```
 
 Rules:
@@ -930,7 +949,9 @@ Rules:
 - caches are replaceable from chain/service state;
 - conflicting signed records resolve through canonical authority rules, not last-write-wins arrival;
 - receipts and proposal ids are idempotent;
-- prune only after retaining an auditable chain pointer.
+- prune only after retaining an auditable chain pointer;
+- `sync` is a per-node display claim, not a status (amended 2026-09-05 to match `treasuryDoc.ts`): offline / read-only / paused states come from the local node's own verdict, never from this key; it carries `networkGenesisChallenge` and is rejected off-network like every other record, because it is the only cache value used as a clock;
+- reachability through a bounded reader is allowed for the read-only screen only (as implemented in PR 119, 2026-09-05): a hostile peer can crowd honest records past `treasuryDoc.ts`'s traversal guard, the screen discloses it (`discoveryCutShort`), and that is permitted there because nothing on it acts on a record (§4.1) and the sovereign plan §5 makes a vote's countability independent of any display. This map is the vote transport and the data-availability store behind checkpoint roots, not a display cache, so the same bound in any other reader — a governance-lane screen, or a node building a checkpoint root from its replica — is a data-availability censorship tool and is not allowed; PR C.1's reader-maintained first-seen index removes the guard and gates PR F.
 
 ---
 
@@ -1020,6 +1041,9 @@ The dissolution proposal must contain the immutable distribution policy: asset/d
 - removed member replays old capability;
 - duplicate browser sessions submit the same execution;
 - partitioned room docs show conflicting policy caches;
+- a peer floods the treasury cache map so honest records sit past any traversal bound a reader imposes — a browser panel, or a node building a checkpoint root from its replica;
+- a peer writes a room funding binding under a fresh key, or rewrites who owns the room, so another company's board and proposals render as this room's;
+- a peer deletes the owner's players entry so the room's owner key becomes unknown, then relies on a reader that fails open;
 - device id is removed/reused;
 - stale share snapshot is used for voting/access;
 - chain reorg invalidates apparent execution;
@@ -1072,6 +1096,8 @@ Before any real-value/mainnet path:
 
 Testnet is a complete deployment environment, not a namespace that later becomes mainnet. Every policy, proposal, vote, allowance, request, receipt, offer, cache, and signature domain binds the configured Chia genesis challenge. The service reads the connected node's network identity at startup and refuses to run if it differs from release configuration. Network selection is operator/release configuration and is never controlled by an in-game browser setting.
 
+> **Amended 2026-09-05 (what PR C established at the seam).** Under the serverless design the browser carries its own build-time pin (`VITE_SSF_TREASURY_GENESIS`, `treasuryNetwork.ts`) beside the node's release configuration, and four rules the paragraph above did not state now apply: (1) an unconfigured browser build has **no** network — every treasury read is disabled and nothing renders; (2) no placeholder genesis is ever permitted, because every 64-hex value is a live network id (a 64-zero placeholder was valid `Hex32` and made itself the live network, publishable by any peer); (3) the browser's pin must equal the genesis its own node reports over loopback, or the treasury UI refuses exactly as the node refuses to run — PR D wires the comparison, the rule stands now; (4) the player-facing network name is a free-text label with no tie to the pin, so the pinned genesis itself is shown in full wherever the label is, until the name is derived from the genesis.
+
 Testnet singleton launcher ids, CAT asset ids, NFT deeds, treasury and allowance coins, offers, and receipts do not migrate. Mainnet promotion creates fresh assets and lineages with production signer keys through a recorded deployment ceremony. Before promotion: all testnet gates pass; custody and guardian policies are final; independent Chialisp and Rust security reviews are complete; transferable-share and distribution flows pass legal review; recovery and pause drills succeed; monitoring is active; and initial spending caps are deliberately low. Mainnet starts with canary deposits and spends before broader funding is enabled.
 
 ---
@@ -1095,10 +1121,10 @@ Testnet singleton launcher ids, CAT asset ids, NFT deeds, treasury and allowance
 
 - Treasury views in Ventures app;
 - room Funding section;
-- mocked/service snapshots;
+- ~~mocked/service snapshots~~ — **superseded (2026-09-05):** nothing is mocked; every panel reads the room's signed caches and carries a badge for how much checking happened, and balances report that no verified source exists yet (§14);
 - offline/proof/error states;
-- no spend commands enabled.
-- no live company binding queries until PR D and PR F exist.
+- no spend commands enabled;
+- no live company binding queries until PR D and PR F exist — the room-side owner check of §10.1 is a read rule over the cache and shipped in PR C; the company-side receipt check did not.
 
 ### PR D - Rust testnet treasury service
 
@@ -1145,6 +1171,7 @@ Testnet singleton launcher ids, CAT asset ids, NFT deeds, treasury and allowance
 | Casino/robot vertical slice | gameplay-system owner | treasury service owner, multi-client test owner |
 | Governance and custody UX | governance product owner | legal reviewer, security reviewer |
 | Testnet gates, partitions, replay, and reorgs | integration/QA owner | Rust, frontend, and Chialisp owners |
+| Treasury cache index (sovereign plan §11, PR C.1) | frontend/data-contract owner | security reviewer |
 
 Named people may change, but each PR must assign these roles before review begins.
 
@@ -1192,7 +1219,7 @@ Robot routines remain Yjs configuration. A future paid action references an allo
 
 ## 20. Open decisions
 
-> **Amended:** the amendment ([sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §14) answers decision **9** (fees: treasury/allowance spends self-pay within `maxFeeMojos`, committed in policy and in each allowance; publishers pay their own dust) and decision **12** (data availability: office-doc replication plus checkpoint-publisher retention; un-checkpointed votes don't count), and constrains half of decision 1 (custody coordination must tolerate offline signers). Those were genuinely open here, so the amendment's answers ride this PR's normal review. By contrast, the chain-access posture and the B-7 audit re-scoping (amendment §6/§11/§14) **reverse previously settled positions** and are pending explicit maintainer ratification, not decided. The remaining items stand as written.
+> **Amended:** the amendment ([sovereign-treasury-serverless-plan.md](sovereign-treasury-serverless-plan.md) §14) answers decision **9** (fees: treasury/allowance spends self-pay within `maxFeeMojos`, committed in policy and in each allowance; publishers pay their own dust) and decision **12** (data availability: office-doc replication plus checkpoint-publisher retention; un-checkpointed votes don't count), and constrains half of decision 1 (custody coordination must tolerate offline signers). Those were genuinely open here, so the amendment's answers ride this PR's normal review. By contrast, the chain-access posture and the B-7 audit re-scoping (amendment §6/§11/§14) **reverse previously settled positions**; they were re-stated on 2026-09-05 with binding conditions (sovereign plan §14, recorded by the PR 119 follow-up commit) and remain pending the maintainer's explicit ratification there. The remaining items stand as written, except #10, resolved by the §10.1 rule as implemented in PR 119.
 
 These require explicit decisions before PR B or PR D:
 
@@ -1205,7 +1232,7 @@ These require explicit decisions before PR B or PR D:
 7. Emergency guardian composition and delay.
 8. Which asset pays casino liabilities: XCH, company CAT, or a dedicated casino CAT.
 9. Who pays transaction fees for allowance execution.
-10. Whether room funding bindings expire or persist until revoked.
+10. Whether room funding bindings expire or persist until revoked. **Resolved by the §10.1 rule as implemented in PR 119 (2026-09-05):** a binding persists until the owner key changes, which demotes it automatically, or until a PR F unbind; `expiresAfterHeight` stays optional.
 11. Legal treatment of transferable shares and any revenue distribution.
 12. Data availability for proposal payloads and vote archives.
 

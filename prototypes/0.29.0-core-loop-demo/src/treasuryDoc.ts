@@ -10,7 +10,7 @@
 // guards first, then id recomputation, then signature verification. Malformed
 // or unverifiable entries are skipped, never thrown into money paths.
 //
-// Key layout (plan §14 pins the first seven; the rest follow its convention):
+// Key layout (plan §14 pins all thirteen — expanded 2026-09-05 to match this file):
 //   policy                                  -> CompanyTreasuryPolicy cache
 //   proposal:<proposalId>                   -> TreasuryProposal      (signed)
 //   vote:<proposalId>:<voterGamePub>        -> TreasuryVote          (signed)
@@ -32,7 +32,7 @@
 // (Registrations and windows carry no genesis field; they anchor to a
 // genesis-bound proposal by id and to chain observations the node verifies.)
 //
-// The vote slot is keyed by voterGamePub (plan §14's voterPub) — the identity
+// The vote slot is keyed by voterGamePub — the identity
 // gameSig AUTHENTICATES, so nobody can squat another voter's slot: a record
 // claiming a slot must carry that slot's pub and verify against it. The §7.2
 // dedup rule ("greatest per-voter sequence; equal sequence -> smallest
@@ -109,6 +109,17 @@ export type TreasurySigVerifier = (pub: string, bytes: Uint8Array, sig: string) 
  */
 export interface ChainSyncStatus {
   v: 1;
+  /**
+   * Which network this claim is about (plan §17.5).
+   *
+   * Added because this entry is the ONLY cache value used as a clock: its
+   * height drives every proposal's phase and the funding record's
+   * has-it-ended text. Without a genesis it was the one record the pin could
+   * not reject, so a peer on another Chia network could supply the height
+   * this room reasons with — a testnet height placing mainnet proposals on
+   * their clocks. Stamped by putChainSyncStatus, checked on read.
+   */
+  networkGenesisChallenge: Hex32;
   state: 'verified' | 'degraded' | 'unavailable';
   verifiedHeight?: number;
   verifiedBlockHash?: Hex32;
@@ -118,6 +129,7 @@ function isChainSyncStatus(value: unknown): value is ChainSyncStatus {
   if (typeof value !== 'object' || value === null) return false;
   const s = value as Record<string, unknown>;
   return s.v === 1
+    && isHex32(s.networkGenesisChallenge)
     && (s.state === 'verified' || s.state === 'degraded' || s.state === 'unavailable')
     && (s.verifiedHeight === undefined || isBlockHeight(s.verifiedHeight))
     && (s.verifiedBlockHash === undefined || isHex32(s.verifiedBlockHash));
@@ -163,6 +175,11 @@ export function bindTreasuryDoc(
     expectedGenesis = null;
     console.warn('bindTreasuryDoc: invalid networkGenesisChallenge — treasury cache disabled');
   }
+  // The pin and the verifier are inputs to every cached verdict, and both may
+  // have just changed — start again rather than trust answers computed under
+  // the previous binding.
+  verdictCaches = freshVerdictCaches();
+  policyResults = new WeakMap();
   const nextMap = doc.getMap('treasury');
   treasuryMap = nextMap;
   const observer = (): void => notify();
@@ -188,6 +205,24 @@ function map(): Y.Map<unknown> | null {
   return docAlive() && treasuryMap ? treasuryMap : null;
 }
 
+/**
+ * The map, but only once a network is pinned — every READ goes through here.
+ *
+ * With `expectedGenesis` null nothing can be on-net, so every read's answer is
+ * already null. Returning it now matters for more than tidiness: each reader
+ * validated the peer-written value in full BEFORE reaching its `onNet` check,
+ * so an unconfigured build still paid structural validation over whatever a
+ * peer chose to write — on every repaint, for a result fixed in advance.
+ *
+ * Writes keep using `map()`: their input is local, and each `put*` already
+ * refuses off-net records up front. `map()` also stays pin-agnostic because
+ * `treasuryDocBound()` answers "is a room document attached", which callers
+ * report to the player quite differently from "no network is configured".
+ */
+function readMap(): Y.Map<unknown> | null {
+  return expectedGenesis === null ? null : map();
+}
+
 export function treasuryDocBound(): boolean {
   return map() !== null;
 }
@@ -206,6 +241,238 @@ function put(key: string, value: unknown): boolean {
   return true;
 }
 
+/**
+ * Validation verdicts, keyed by the identity of the stored object.
+ *
+ * The entry budget bounds how many records a repaint LOOKS at; it says nothing
+ * about what each one costs. Every check below recomputes a canonical id or
+ * hash and verifies an ed25519 signature — measured at roughly 1.4 ms per
+ * proposal, so a peer who plants 800 valid self-signed proposals freezes the
+ * main thread for over a second on EVERY repaint. Coalescing repaints does not
+ * help: it bounds how often a render runs, never how long one takes.
+ *
+ * Y.Map hands back the same object reference for an entry that has not
+ * changed, so keying on that reference turns a repeat scan into pointer
+ * lookups while a genuinely new or replaced record still pays full price once.
+ * A WeakMap so evicted records do not pin memory.
+ *
+ * This cannot mask a change: these records are immutable by construction (id
+ * and signature cover the body), and a replaced value is a different object.
+ * It is reset on rebind because `expectedGenesis` and `verifySig` are inputs
+ * to the verdict and both change there.
+ */
+type VerdictClass = 'proposal' | 'vote' | 'checkpoint' | 'binding' | 'session';
+
+/**
+ * Why a record is or is not usable — three answers, not two.
+ *
+ *  'ok'         valid, and checked here.
+ *  'invalid'    held, but fails its shape, pin, id or signature.
+ *  'too-large'  held, quite possibly valid on the wire, and refused only
+ *               because reading it would cost this device more than it is
+ *               willing to spend.
+ *
+ * The last one is a LOCAL decision, so collapsing it into 'invalid' — or into
+ * the `null` a reader returns for both — would have the UI report a record the
+ * room is holding as one that does not exist. That is the absence-as-fact
+ * mistake this module refuses everywhere else, and readPolicyCacheResult
+ * already refuses it for the policy slot.
+ */
+export type RecordVerdict = 'ok' | 'invalid' | 'too-large';
+
+function freshVerdictCaches(): Record<VerdictClass, WeakMap<object, RecordVerdict>> {
+  return {
+    proposal: new WeakMap(),
+    vote: new WeakMap(),
+    checkpoint: new WeakMap(),
+    binding: new WeakMap(),
+    session: new WeakMap(),
+  };
+}
+
+let verdictCaches = freshVerdictCaches();
+
+/**
+ * Is `value` small enough to be worth validating? Answered in CONSTANT time.
+ *
+ * Counting array lengths was not enough: every string field in these records
+ * is checked with isNonEmptyString and has no length limit, so one share class
+ * carrying a megabyte `id` — or one proposal with a huge `proposerPub` — still
+ * dragged the canonical encoder and the hash function across it before it
+ * could be rejected. A budget bounds counts and text together.
+ *
+ * The early-out is the whole point: the walk stops the moment the budget runs
+ * out, so an oversized record costs the budget rather than its own size. That
+ * is what makes the refusal cheap enough to sit on the repaint path. Iterated
+ * lazily (for…in, for…of) rather than through Object.entries, which would
+ * materialise an array as long as the object a peer chose to send.
+ *
+ * ITERATIVE, not recursive. A node budget does not bound call-stack depth: a
+ * peer can nest arrays 64,000 deep, which spends well under the budget and
+ * still overflows the stack — throwing, and taking the treasury render with
+ * it, exactly as the typed-array freeze did. An explicit queue has no depth
+ * limit to hit, and a cyclic value simply spends budget until it is refused.
+ */
+function withinBudget(root: unknown, budget: number): boolean {
+  let left = budget;
+  const pending: unknown[] = [];
+  // A node is CHARGED WHEN QUEUED, not when popped. That keeps the queue
+  // itself from outgrowing the budget — an enormous collection is refused
+  // part-way through being walked rather than after it has all been listed.
+  const queue = (v: unknown): boolean => {
+    if (left <= 0) return false;
+    left -= 1;
+    pending.push(v);
+    return true;
+  };
+  if (!queue(root)) return false;
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === 'string') {
+      left -= value.length;
+      if (left < 0) return false;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (!queue(item)) return false;
+      }
+      continue;
+    }
+    if (typeof value === 'object' && value !== null) {
+      for (const key in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        left -= key.length;
+        if (left < 0) return false;
+        if (!queue((value as Record<string, unknown>)[key])) return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Roughly the character count a record may occupy before this cache refuses to
+ * look at it. Generous: the golden-vector policy is a few hundred characters
+ * and the largest record class here is nowhere near this.
+ */
+const RECORD_BUDGET = 64_000;
+
+/** Convenience wrapper: one budget per call, so callers cannot share state. */
+function smallEnough(value: unknown, budget = RECORD_BUDGET): boolean {
+  return withinBudget(value, budget);
+}
+
+/**
+ * Freezes a record, and everything under it, before its verdict is cached.
+ *
+ * The memo keys on object identity, which is only sound if identity implies
+ * the bytes have not changed — and these are plain mutable objects that the
+ * read APIs hand out by reference. Without this, code that mutated a record
+ * in place after it validated (putProposal validates the very object it then
+ * stores, and its caller still holds the reference) would keep the cache hit
+ * and have altered contents reported as signed. Freezing makes the assumption
+ * true rather than merely assumed, and it protects callers from doing it by
+ * accident: these records are immutable by construction, since their id and
+ * signature cover the body.
+ *
+ * Shallow freezing would not do — a policy's board, share classes and rules
+ * are nested. The isFrozen early-out both prunes repeat work and terminates
+ * on a cyclic value.
+ */
+function deepFreeze<T>(value: T): T {
+  // Iterative for the same reason withinBudget is: a value can pass the node
+  // budget and still be nested deep enough to overflow the call stack, and a
+  // throw here aborts the render.
+  // Cycles are tracked SEPARATELY from frozenness. Object.isFrozen is a
+  // shallow check, so using it as the early-out skipped the children of any
+  // object that was already frozen at the top level — and a caller can hand in
+  // exactly that: Object.freeze(policy) leaves policy.board and
+  // policy.shareClasses mutable. The hash would then be computed and cached
+  // over a value whose insides could still change, which is the stale
+  // fingerprint this freeze exists to prevent.
+  const seen = new Set<object>();
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (typeof node !== 'object' || node === null) continue;
+    if (seen.has(node)) continue;
+    seen.add(node);
+    // ONLY plain objects and arrays are frozen — an allowlist, because this
+    // runs before the shape guard and a peer chooses what is in the slot.
+    //
+    // Two ways that bit, both of them render-killing. A Uint8Array: freezing
+    // an ArrayBuffer view with elements THROWS. And a nested Yjs shared type,
+    // which is every bit as legal a map value: the walk would follow its `doc`
+    // reference into live Yjs internals and freeze them, so the NEXT
+    // transaction throws when Yjs writes its own fields — a peer bricking the
+    // room's document by writing one Y.Map into a treasury key.
+    //
+    // Valid treasury records are arrays and plain objects and nothing else, so
+    // an allowlist costs them nothing: anything skipped here still meets its
+    // type guard next and is rejected the ordinary way.
+    //
+    // DEFENCE IN DEPTH, measured: through the public readers the Yjs case is
+    // currently unreachable, because smallEnough runs first and a shared
+    // type's graph exceeds RECORD_BUDGET, so the slot is refused as
+    // 'too-large' before this walk ever sees it — verified by planting a Y.Map
+    // in a treasury key with and without this allowlist and getting the same
+    // refusal both times. Freezing one directly does brick the document
+    // (`TypeError: Cannot assign to read only property '_transaction'`), and
+    // the ordering that saves us has already been moved once in this PR's
+    // history, so the guard belongs here rather than in the caller.
+    const proto = Object.getPrototypeOf(node);
+    if (proto !== Object.prototype && proto !== Array.prototype && proto !== null) {
+      continue;
+    }
+    // Harmless if it was already frozen; what matters is that its children are
+    // still queued below.
+    Object.freeze(node);
+    for (const key of Object.getOwnPropertyNames(node)) {
+      pending.push((node as Record<string, unknown>)[key]);
+    }
+  }
+  return value;
+}
+
+/**
+ * Memoizes a validator over a peer-written value. Non-objects skip the memo.
+ *
+ * Keyed by RECORD CLASS as well as identity. A single shared map storing bare
+ * booleans answered the wrong question: "has this object been validated?"
+ * rather than "is this object a valid X?". The type guards accept extra
+ * fields, so one object filed under two slots — a proposal that is also
+ * written to a `vote:` key — would take the proposal's cached `true` and be
+ * handed back as a vote, its own shape and signature never checked. Per-class
+ * maps make a hit mean what the caller asked.
+ */
+function cachedVerdict(
+  cls: VerdictClass,
+  value: unknown,
+  compute: () => boolean,
+): RecordVerdict {
+  if (typeof value !== 'object' || value === null) return compute() ? 'ok' : 'invalid';
+  const verdicts = verdictCaches[cls];
+  const hit = verdicts.get(value);
+  if (hit !== undefined) return hit;
+  // Size first, and before the freeze: deepFreeze walks the whole value, so
+  // running it on an unbounded record would pay exactly the cost the size
+  // check exists to avoid. A record too large to be plausible is refused
+  // without the encoder, the hash or the freeze ever touching it — and the
+  // refusal is cached, so re-reading cannot re-charge it.
+  let verdict: RecordVerdict;
+  if (!smallEnough(value)) {
+    verdict = 'too-large';
+  } else {
+    // Frozen BEFORE the verdict is computed and stored, so there is no window
+    // in which a cached verdict describes bytes that can still change.
+    deepFreeze(value);
+    verdict = compute() ? 'ok' : 'invalid';
+  }
+  verdicts.set(value, verdict);
+  return verdict;
+}
+
 function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
   if (!verifySig) return false;
   try {
@@ -220,6 +487,15 @@ function verify(pub: string, bytes: Uint8Array, sig: string): boolean {
 // ---------------------------------------------------------------------------
 
 function validProposal(value: unknown): value is TreasuryProposal {
+  return proposalVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function proposalVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict('proposal', value, () => validProposalUncached(value));
+}
+
+function validProposalUncached(value: unknown): value is TreasuryProposal {
   if (!isTreasuryProposal(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   // try/catch: the canonical encoder throws on strings the profile rejects
@@ -249,22 +525,400 @@ export function putProposal(proposal: TreasuryProposal): boolean {
   return put(`proposal:${proposal.proposalId}`, proposal);
 }
 
-export function readProposal(proposalId: string): TreasuryProposal | null {
-  const m = map();
-  if (!m) return null;
+/** A proposal, or why there is none — the same four states as its siblings. */
+export type ProposalResult =
+  | { status: 'ok'; proposal: TreasuryProposal }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+export function readProposalResult(proposalId: string): ProposalResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
   const value = m.get(`proposal:${proposalId}`);
-  return validProposal(value) && value.proposalId === proposalId ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  const verdict = proposalVerdict(value);
+  if (verdict === 'too-large') return { status: 'too-large' };
+  // The slot-claim check stays out of the verdict: it compares the record
+  // against the caller's id rather than judging the record itself.
+  if (verdict !== 'ok' || (value as TreasuryProposal).proposalId !== proposalId) {
+    return { status: 'unreadable' };
+  }
+  return { status: 'ok', proposal: value as TreasuryProposal };
 }
 
-export function listProposals(): TreasuryProposal[] {
-  const m = map();
-  if (!m) return [];
-  const out: TreasuryProposal[] = [];
-  for (const [key, value] of m.entries()) {
-    if (!key.startsWith('proposal:')) continue;
-    if (validProposal(value) && key === `proposal:${value.proposalId}`) out.push(value);
+export function readProposal(proposalId: string): TreasuryProposal | null {
+  const result = readProposalResult(proposalId);
+  return result.status === 'ok' ? result.proposal : null;
+}
+
+// There is deliberately no listProposals() wrapper. Passing
+// Number.POSITIVE_INFINITY read as exhaustive, but the scan still clamps
+// traversal to MAX_KEYS_EXAMINED — so on a large map it dropped records AND
+// discarded `truncated`: a partial answer wearing a total's name, which is the
+// absence-as-fact mistake in API form. Callers name their own budgets and get
+// the flags back alongside the items.
+
+/**
+ * A scan bounded on TWO axes, because the map's entries do not all cost the
+ * same and a single budget can only bound one of them.
+ *
+ *  `maxEntries` — every key the iteration touches, whatever its prefix.
+ *      Skipping a wrong-prefix key is cheap but not free, and anyone can add
+ *      unlimited `junk:*` keys to a peer-writable, never-pruned map. Without
+ *      this bound an attacker sets how far every repaint walks.
+ *
+ *  `maxChecks` — entries that match the prefix and are therefore handed to
+ *      `take`, which re-derives a canonical id or hash and verifies an
+ *      ed25519 signature: roughly 1.4 ms EACH. Traversal budget alone never
+ *      bounded this. 800 matching entries is over a second of blocked main
+ *      thread, and the identity memo does not save a repaint that is seeing
+ *      those records for the first time — a peer who keeps writing NEW
+ *      records is writing new object identities, so every one is a miss.
+ *      This is the budget that keeps a repaint's cost bounded.
+ *
+ * Neither bound hides what it drops. Hitting either sets `truncated`, which
+ * means "this view is partial and its contents are an arbitrary subset",
+ * never "the first N".
+ *
+ * The lasting fix is a reader-side per-record-class index in the reader's
+ * own first-seen order, kept current from this map's observe events, so a
+ * page is looked up rather than rebuilt by walking. No plan scheduled it when
+ * this shipped (an earlier version of this comment pointed at the op-log,
+ * which is an authority ledger and pages nothing); it is PR C.1 in the
+ * sovereign plan §11, gating the governance lane, and the horizon below
+ * stands, disclosed, until it lands. Validation off the render path is a
+ * separate improvement and does not remove the horizon.
+ */
+/**
+ * A runaway guard on key EXAMINATION, deliberately far above any plausible
+ * room. It is not a PAGE bound — examining a key is a prefix test, so this
+ * costs a fraction of a millisecond even at the cap, whereas the old
+ * page-sized traversal cap let 800 unrelated keys hide every real record
+ * behind a horizon paging could not cross.
+ *
+ * But it IS a horizon once a map exceeds it, and saying otherwise would be
+ * the overclaim this file exists to avoid. Every page is rebuilt by walking
+ * the map from the start, so a peer who puts more than this many entries
+ * ahead of an honest key in raw iteration order keeps it out of the collected
+ * set on every repaint, and no amount of NEXT reaches it. That case is
+ * disclosed rather than hidden — see `discoveryCutShort`, which is reported
+ * apart from ordinary paging truncation precisely so the screen can say that
+ * records may exist here that paging cannot reach.
+ *
+ * It is not fixable at this layer, which is worth writing down because the
+ * obvious repair is unsound. Resuming a later walk part-way needs a stable
+ * position in `m.keys()`, and that order is a peer-writable insertion order:
+ * remembering "carry on from the 50,000th entry" is the same index-versus-
+ * cursor mistake that cursors were introduced to fix, one level further down
+ * — a writer inserting ahead of the resume point pushes content past it
+ * exactly as fast as the reader advances. Nor can the resume point be a KEY,
+ * since a writer can delete it and strand the walk. The fix is an ordering
+ * the reader controls — a first-seen index maintained from observe events,
+ * which sees every key once at integration and never re-walks, so a key once
+ * seen can never be pushed later — rather than a better way to walk an order
+ * it does not control. (A lexicographic index would remove the horizon but
+ * not the grind gap the cursor comment below describes.) That is sovereign
+ * plan §11 PR C.1. Until it lands this constant is a disclosed limit of the
+ * read-only screen, decided there for this screen only: nothing on it acts
+ * on a record, the loss is stated on screen, and under sovereign §5 no vote's
+ * countability depends on a display. The map itself is the vote transport
+ * and the data-availability store behind checkpoint roots, not a display
+ * cache — so the same bound in any other reader, a governance-lane screen or
+ * a node building a checkpoint root from its replica, is a censorship tool
+ * and is not covered by that decision. Note the walk order is steerable on a
+ * fresh joiner (Yjs integrates the highest client id first), so what a flood
+ * hides reproduces on every new device.
+ */
+const MAX_KEYS_EXAMINED = 50_000;
+
+/**
+ * The longest key this schema can name a record with, plus generous slack.
+ *
+ * The traversal guard bounds how many keys are collected; nothing bounded
+ * their LENGTH, and Y.Map keys are peer-controlled. Collecting is cheap, but
+ * the sort that follows is not: comparing two keys costs their shared prefix,
+ * so keys built as one long common prefix plus a short distinct tail make
+ * every one of the sort's comparisons walk that prefix. Measured at the
+ * traversal ceiling: 50,000 such keys sort in 288 ms against 15 ms for the
+ * same count at schema size, and it grows linearly with the prefix — a 40,000
+ * character one is about three seconds. Per scan, and the detail screen runs
+ * three. The verification budget never saw any of it, because none of this is
+ * verification.
+ *
+ * Every key here is `<class>:<Hex32>` or `<class>:<Hex32>:<id>` — the longest
+ * fixed form is `sessionsig:` + 64 + 1 + 64 = 140, and the one variable part
+ * (a vote's `voterGamePub`) is an ed25519 public key. 256 clears all of them
+ * with room to spare.
+ *
+ * This is NOT another horizon, and the difference is the whole point after
+ * three goes at it. A horizon stops the walk somewhere a peer chooses, so
+ * honest records behind it become unreachable. This refuses a SHAPE no honest
+ * record can have: nothing this app writes exceeds 166 characters, so a key
+ * past the bound names no record that could be read even if it were collected.
+ * Ordering is untouched and every legitimate key stays pageable — and the
+ * count is reported, so a peer cannot make the refusal look like absence.
+ */
+const MAX_KEY_LENGTH = 256;
+
+/**
+ * The most signatures one approval round may contribute to a screen.
+ *
+ * A real board is a handful of signers. This is not a protocol rule — it is
+ * the same refusal to do unbounded work on a peer's say-so that RECORD_BUDGET
+ * is, applied where an unverified, peer-writable collection feeds a sort and
+ * a re-validation on every repaint.
+ */
+const MAX_SIGS_PER_SESSION = 256;
+
+export interface BoundedScan<T> {
+  items: T[];
+  truncated: boolean;
+  /**
+   * How many entries this device declined to read on size alone. Counted
+   * apart from invalid ones: those may well be valid records, refused by a
+   * local budget, so folding them into the same silence would let the list
+   * report "no proposals" about proposals the room is holding.
+   */
+  refusedTooLarge: number;
+  /**
+   * Entries on this page that were checked and failed — wrong shape, wrong
+   * network, bad signature, or filed under a key they do not claim.
+   *
+   * Reported for the same reason as refusedTooLarge, and it was the gap left
+   * after that one: a page whose every entry is invalid is not truncated and
+   * refuses nothing on size, so a panel reading only those two said "none
+   * held" while the room held records it had just rejected.
+   */
+  rejected: number;
+  /** Matching keys found within the traversal budget, before verification. */
+  matched: number;
+  /**
+   * The traversal guard stopped the walk before the map ran out.
+   *
+   * Reported apart from `truncated` because they mean different things to a
+   * reader. `truncated` says "this is one page of several" — the rest is a
+   * NEXT away. This one says the walk that BUILDS those pages was cut short,
+   * so records may be held here that no amount of paging reaches. Folding it
+   * into `truncated` would present an unreachable record as merely a later
+   * page, which is the more dangerous of the two claims to get wrong.
+   *
+   * See MAX_KEYS_EXAMINED for why this cannot be repaired at this layer.
+   */
+  discoveryCutShort: boolean;
+  /**
+   * Keys that carried the right prefix but were too long to be any record this
+   * schema can name, and so were never collected. See MAX_KEY_LENGTH.
+   *
+   * Counted rather than folded into `rejected`, which is deliberately
+   * PAGE-LOCAL — this one is whole-map, and reporting it under a page-local
+   * heading would be a count about the map dressed up as a count about the
+   * page. It is the same distinction refusedTooLarge draws for values.
+   */
+  malformedKeys: number;
+  /**
+   * The cursor this page started AFTER — the caller's own input, echoed back.
+   *
+   * A cursor rather than an index because an index is not stable against a
+   * hostile writer: the key list is rebuilt every repaint, so a peer inserting
+   * one page of keys BEFORE the offset after each "next" shifts the genuine
+   * record forward by exactly as much as the reader advances, and it is never
+   * reached. Paging existed to make records reachable, and an index-based one
+   * could be walked backwards indefinitely by the writer.
+   *
+   * Keys sort lexicographically and are content-derived, so "everything after
+   * this key" cannot be pushed forward by inserting more keys before it.
+   * Forward paging therefore always makes progress.
+   *
+   * PROGRESS, not arrival — the honest limit. A writer who cannot walk the
+   * reader backwards can still insert keys BETWEEN the cursor and a target,
+   * and by grinding ids into that range as fast as the reader pages, keep the
+   * target ahead of it. What the cursor buys is that ground already covered
+   * stays covered, which an index does not. Closing the remaining gap needs
+   * ordering the reader controls — the per-class index scanPrefixed's comment
+   * describes — not a better page pointer.
+   */
+  cursor: string | null;
+  /** Position of this page's first key, for wording only — never for paging. */
+  startIndex: number;
+  /** Pass as the next `after` to advance; null when this page is the last. */
+  nextCursor: string | null;
+}
+
+/**
+ * One page of a bounded scan.
+ *
+ * A check budget on its own made the list CENSORABLE. The scan always
+ * restarted from the beginning, so once the first `maxChecks` prefix-matching
+ * entries used the budget up, everything after them was permanently
+ * unreachable — and since malformed entries spend budget too, a peer could
+ * bury every real proposal behind two dozen pieces of junk. The partial-list
+ * warning said the view was incomplete but gave nobody any way to see the
+ * rest.
+ *
+ * So the walk is split. Collecting the matching KEYS is cheap — a prefix test
+ * per entry, bounded by `maxEntries` — and only the page's worth of values is
+ * verified. Keys are sorted so the page is the same across repaints and an
+ * offset means the same thing twice; a peer can grind ids to sort early, but
+ * paging past them still works, which is what censorship needs to fail.
+ */
+function scanPrefixed<T>(
+  prefix: string,
+  maxEntries: number,
+  maxChecks: number,
+  take: (key: string, value: unknown) => T | null,
+  /** Optional: lets a caller count entries refused on size alone. */
+  verdictOf?: (value: unknown) => RecordVerdict,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
+): BoundedScan<T> {
+  const m = readMap();
+  if (!m) {
+    return {
+      items: [], truncated: false, discoveryCutShort: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
+      cursor: after, startIndex: 0, nextCursor: null,
+    };
   }
-  return out;
+  // Pass one: which keys match, within ONE budget on keys examined.
+  //
+  // This has now been wrong twice in the same way, so it is worth being
+  // explicit. Any cap that stops the scan early is a horizon, and every
+  // horizon is a censorship tool: whatever sits past it cannot be paged to,
+  // because paging only moves within what this pass collected. Capping keys
+  // EXAMINED let 800 unrelated keys hide everything; moving the cap to keys
+  // COLLECTED just moved the horizon, since 800 planted `proposal:` keys
+  // ahead of an honest one in iteration order hid it exactly as well.
+  //
+  // So there is one budget, it is a runaway guard rather than a page, and it
+  // is set far above any plausible room. Examining a key is a prefix test on
+  // a string this loop already holds, and a matching key costs one array
+  // slot — both cheap enough that a generous ceiling is affordable. The bound
+  // that governs how long a repaint BLOCKS for is `maxChecks`, which is where
+  // the signature work lives; this one only stops an unbounded walk.
+  const keys: string[] = [];
+  let examined = 0;
+  let truncated = false;
+  let discoveryCutShort = false;
+  let malformedKeys = 0;
+  const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
+  for (const key of m.keys()) {
+    examined += 1;
+    if (examined > ceiling) {
+      truncated = true;
+      discoveryCutShort = true;
+      break;
+    }
+    if (!key.startsWith(prefix)) continue;
+    // Length before collection, because the cost being bounded is the SORT
+    // below, and a key only reaches it by being collected. The prefix test
+    // above is already bounded by the prefix.
+    if (key.length > MAX_KEY_LENGTH) {
+      malformedKeys += 1;
+      continue;
+    }
+    keys.push(key);
+  }
+  keys.sort();
+  // Page forward from the CURSOR, not from an index. An index is rebuilt
+  // against a list a peer can prepend to, so inserting a page of keys before
+  // it after each "next" pushes the genuine record forward exactly as fast as
+  // the reader advances — paging that never arrives. "Everything after this
+  // key" cannot be moved that way.
+  const start = after === null ? 0 : keys.findIndex((k) => k > after);
+  const from = start < 0 ? keys.length : start;
+  const page = keys.slice(from, from + Math.max(0, maxChecks));
+  const hasMore = from + page.length < keys.length;
+  // Anything the page does not cover is still there to be paged to, and the
+  // caller is told so rather than being left to assume it saw everything.
+  // A non-zero start counts too: the LAST page omits every earlier one, so
+  // clearing the flag there would let a page-sized subset be read as the
+  // whole cache — the same partial-answer-as-total mistake the removed
+  // wrappers made.
+  if (from > 0 || hasMore) truncated = true;
+  // Pass two: verify only this page. THIS is the expensive half.
+  const items: T[] = [];
+  let refusedTooLarge = 0;
+  let rejected = 0;
+  for (const key of page) {
+    const value = m.get(key);
+    const verdict = verdictOf?.(value);
+    if (verdict === 'too-large') refusedTooLarge += 1;
+    const kept = take(key, value);
+    if (kept !== null) items.push(kept);
+    // Held, checked, and not usable — counted so a panel can say so rather
+    // than reporting a page of rejects as an empty room.
+    else if (verdict !== 'too-large') rejected += 1;
+  }
+  return {
+    items,
+    truncated,
+    discoveryCutShort,
+    refusedTooLarge,
+    rejected,
+    malformedKeys,
+    matched: keys.length,
+    cursor: after,
+    startIndex: from,
+    nextCursor: hasMore && page.length > 0 ? page[page.length - 1] : null,
+  };
+}
+
+export function scanProposals(
+  maxEntries: number,
+  maxChecks: number,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
+): BoundedScan<TreasuryProposal> {
+  return scanPrefixed(
+    'proposal:',
+    maxEntries,
+    maxChecks,
+    (key, value) =>
+      validProposal(value) && key === `proposal:${value.proposalId}` ? value : null,
+    proposalVerdict,
+    after,
+  );
+}
+
+export function scanVotes(
+  proposalId: string,
+  maxEntries: number,
+  maxChecks: number,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
+): BoundedScan<TreasuryVote> {
+  const prefix = `vote:${proposalId}:`;
+  return scanPrefixed(
+    prefix,
+    maxEntries,
+    maxChecks,
+    (key, value) =>
+      validVote(value) && key === `vote:${value.proposalId}:${value.voterGamePub}`
+        ? value
+        : null,
+    voteVerdict,
+    after,
+  );
+}
+
+export function scanCheckpoints(
+  proposalId: string,
+  maxEntries: number,
+  maxChecks: number,
+  /** Page starts at the first matching key strictly greater than this. */
+  after: string | null = null,
+): BoundedScan<TreasuryCheckpoint> {
+  const prefix = `checkpoint:${proposalId}:`;
+  return scanPrefixed(
+    prefix,
+    maxEntries,
+    maxChecks,
+    (key, value) =>
+      validCheckpoint(value) &&
+      key === `checkpoint:${value.proposalId}:${value.checkpointId}`
+        ? value
+        : null,
+    checkpointVerdict,
+    after,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +926,15 @@ export function listProposals(): TreasuryProposal[] {
 // ---------------------------------------------------------------------------
 
 function validVote(value: unknown): value is TreasuryVote {
+  return voteVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function voteVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict('vote', value, () => validVoteUncached(value));
+}
+
+function validVoteUncached(value: unknown): value is TreasuryVote {
   if (!isTreasuryVote(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   try {
@@ -316,7 +979,7 @@ export function putVote(vote: TreasuryVote): boolean {
 }
 
 export function readVote(proposalId: string, voterGamePub: string): TreasuryVote | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`vote:${proposalId}:${voterGamePub}`);
   if (!validVote(value)) return null;
@@ -326,7 +989,7 @@ export function readVote(proposalId: string, voterGamePub: string): TreasuryVote
 }
 
 export function listVotes(proposalId: string): TreasuryVote[] {
-  const m = map();
+  const m = readMap();
   if (!m) return [];
   const out: TreasuryVote[] = [];
   const prefix = `vote:${proposalId}:`;
@@ -345,6 +1008,15 @@ export function listVotes(proposalId: string): TreasuryVote[] {
 // ---------------------------------------------------------------------------
 
 export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
+  // Size FIRST, exactly as the read path does it. Behind the structural
+  // guard this bounded nothing: isCompanyTreasuryPolicy walks and
+  // deduplicates every signer, class and module before returning, so the put
+  // path still paid an arbitrary cost to reject an arbitrary policy.
+  //
+  // Refusing the same sizes the read refuses also keeps the two agreeing: a
+  // policy that puts fine but reads back null forever is the exact foot-gun
+  // the encodability probe below exists to avoid.
+  if (!smallEnough(policy)) return false;
   if (!isCompanyTreasuryPolicy(policy)) return false;
   if (!onNet(policy.networkGenesisChallenge)) return false;
   // Encodability probe: a policy the canonical encoder rejects would put
@@ -361,17 +1033,87 @@ export function putPolicyCache(policy: CompanyTreasuryPolicy): boolean {
   return put('policy', policy);
 }
 
-/** The returned hash is recomputed here — compare it against the on-chain commitment. */
-export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
-  const m = map();
-  if (!m) return null;
+/**
+ * Why the policy cache has nothing usable — four different facts, kept apart.
+ *
+ *  'ok'          a policy is held and was checked here.
+ *  'absent'      no policy entry, or no readable cache at all.
+ *  'unreadable'  an entry is held but fails its shape, pin or encoding.
+ *  'too-large'   an entry is held and may well be valid on the wire; this
+ *                device simply refuses to spend the work to read it.
+ *
+ * The last two are held records. Reporting them as absence would tell a player
+ * "no company policy" about a policy sitting in the room they are standing in.
+ */
+export type PolicyCacheResult =
+  | { status: 'ok'; policy: CompanyTreasuryPolicy; policyHash: Hex32 }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+/**
+ * The returned hash is recomputed here — compare it against the on-chain
+ * commitment.
+ *
+ * Memoized on the stored object for the same reason the validators are, and
+ * more sharply: a policy carries unbounded signer, share-class and module
+ * arrays, and validating plus hashing one holding 20,000 share classes was
+ * measured at 627 ms — paid on every repaint, for a value that had not
+ * changed. Keyed on identity, so a policy a peer actually replaces is a new
+ * object and is checked afresh.
+ *
+ * The memo alone did not close the hole: every peer REWRITE is a new object,
+ * so a peer rewriting the key in a loop pays that 627 ms afresh each repaint
+ * and never hits the cache. The size budget in readPolicyUncached is what
+ * bounds it.
+ */
+let policyResults = new WeakMap<object, { result: PolicyCacheResult }>();
+
+/** Full result, including WHY there is nothing to show. */
+export function readPolicyCacheResult(): PolicyCacheResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
   const value = m.get('policy');
-  if (!isCompanyTreasuryPolicy(value)) return null;
-  if (!onNet(value.networkGenesisChallenge)) return null;
+  if (value === undefined) return { status: 'absent' };
+  if (typeof value !== 'object' || value === null) return { status: 'unreadable' };
+  const hit = policyResults.get(value);
+  if (hit) return hit.result;
+  // The WRAPPER is frozen too, not just the policy inside it. This exact
+  // object is handed to every caller from here on, so a consumer that wrote
+  // to `status` or `policyHash` would have later reads return altered derived
+  // data — the hash beside a policy it no longer describes — without anything
+  // recomputing. Freezing the nested value alone left that open.
+  const result = deepFreeze(readPolicyUncached(value));
+  policyResults.set(value, { result });
+  return result;
+}
+
+/** The usable policy, or null. Callers needing the reason use the result form. */
+export function readPolicyCache(): { policy: CompanyTreasuryPolicy; policyHash: Hex32 } | null {
+  const result = readPolicyCacheResult();
+  // The memoized result object itself, never a copy. Copying would hand back
+  // a different object on every call and quietly undo the stable identity the
+  // memo exists to give; the extra `status` field costs a caller nothing.
+  return result.status === 'ok' ? result : null;
+}
+
+function readPolicyUncached(value: unknown): PolicyCacheResult {
+  // Size first, and before the freeze — same order and same reason as
+  // cachedVerdict. Running the structural walk or the hash first would pay
+  // exactly the cost this check exists to avoid.
+  //
+  // "Too large" is reported as its OWN state, not folded into unreadable.
+  // This cap is a local display decision rather than a protocol rule, so a
+  // record that is perfectly valid on the wire can fail it — and answering
+  // that with the same silence as a missing record would have the UI say "no
+  // company policy" about a policy this room is holding right now. That is
+  // the absence-as-fact mistake the rest of the module refuses to make.
+  if (!smallEnough(value)) return { status: 'too-large' };
+  deepFreeze(value);
+  if (!isCompanyTreasuryPolicy(value)) return { status: 'unreadable' };
+  if (!onNet(value.networkGenesisChallenge)) return { status: 'unreadable' };
   try {
-    return { policy: value, policyHash: policyHashOf(value) };
+    return { status: 'ok', policy: value, policyHash: policyHashOf(value) };
   } catch {
-    return null; // unencodable strings — treat as an invalid cache entry
+    return { status: 'unreadable' }; // unencodable strings
   }
 }
 
@@ -382,7 +1124,7 @@ export function putAllowanceCache(allowance: DeviceAllowance): boolean {
 }
 
 export function readAllowanceCache(allowanceId: string): DeviceAllowance | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`allowance:${allowanceId}`);
   if (!isDeviceAllowance(value) || value.allowanceId !== allowanceId) return null;
@@ -398,11 +1140,31 @@ export function putRegistration(registration: ProposalRegistration): boolean {
   return put(`registration:${registration.proposalId}`, registration);
 }
 
-export function readRegistration(proposalId: string): ProposalRegistration | null {
-  const m = map();
-  if (!m) return null;
+/**
+ * An acceptance record, or why there is none.
+ *
+ * windowsView goes to some trouble to report a MISMATCHED record as a
+ * conflict rather than as absence — but a record that fails its shape guard,
+ * or that sits under a key it does not claim, never reached it: this reader
+ * flattened both to null and the screen said "no acceptance record is held".
+ */
+export type RegistrationResult =
+  | { status: 'ok'; registration: ProposalRegistration }
+  | { status: 'absent' | 'unreadable' };
+
+export function readRegistrationResult(proposalId: string): RegistrationResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
   const value = m.get(`registration:${proposalId}`);
-  return isProposalRegistration(value) && value.proposalId === proposalId ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  return isProposalRegistration(value) && value.proposalId === proposalId
+    ? { status: 'ok', registration: value }
+    : { status: 'unreadable' };
+}
+
+export function readRegistration(proposalId: string): ProposalRegistration | null {
+  const result = readRegistrationResult(proposalId);
+  return result.status === 'ok' ? result.registration : null;
 }
 
 export function putWindowsCache(windows: ProposalWindows): boolean {
@@ -414,8 +1176,23 @@ export function putWindowsCache(windows: ProposalWindows): boolean {
  * A cached derivation, returned for display. To TRUST windows, recompute them:
  * deriveProposalWindows(readRegistration(id), rule) — sovereign §4.
  */
+/** Cached clocks, or why there are none. Same four states as its siblings. */
+export type WindowsCacheResult =
+  | { status: 'ok'; windows: ProposalWindows }
+  | { status: 'absent' | 'unreadable' };
+
+export function readWindowsCacheResult(proposalId: string): WindowsCacheResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
+  const value = m.get(`windows:${proposalId}`);
+  if (value === undefined) return { status: 'absent' };
+  return isProposalWindows(value) && value.proposalId === proposalId
+    ? { status: 'ok', windows: value }
+    : { status: 'unreadable' };
+}
+
 export function readWindowsCache(proposalId: string): ProposalWindows | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`windows:${proposalId}`);
   return isProposalWindows(value) && value.proposalId === proposalId ? value : null;
@@ -426,6 +1203,15 @@ export function readWindowsCache(proposalId: string): ProposalWindows | null {
 // ---------------------------------------------------------------------------
 
 function validCheckpoint(value: unknown): value is TreasuryCheckpoint {
+  return checkpointVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function checkpointVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict('checkpoint', value, () => validCheckpointUncached(value));
+}
+
+function validCheckpointUncached(value: unknown): value is TreasuryCheckpoint {
   if (!isTreasuryCheckpoint(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   const { checkpointId, checkpointCoinId, confirmedHeight, ...body } = value;
@@ -444,7 +1230,7 @@ export function putCheckpoint(checkpoint: TreasuryCheckpoint): boolean {
 }
 
 export function listCheckpoints(proposalId: string): TreasuryCheckpoint[] {
-  const m = map();
+  const m = readMap();
   if (!m) return [];
   const out: TreasuryCheckpoint[] = [];
   const prefix = `checkpoint:${proposalId}:`;
@@ -477,17 +1263,48 @@ function sessionShellOf(session: SigningSession): SigningSession {
 }
 
 function validSessionShell(value: unknown, proposalId: string, sessionId: string): value is SigningSession {
-  if (!isSigningSession(value)) return false;
-  if (value.proposalId !== proposalId || value.sessionId !== sessionId) return false;
-  if (!onNet(value.networkGenesisChallenge)) return false;
+  if (typeof value !== 'object' || value === null) return false;
+  // EVERYTHING that judges the record itself goes inside the memo, the shape
+  // guard included. isSigningSession walks collectedSigs and allocates for its
+  // distinctness check, so leaving it outside meant a peer-written shell with
+  // a huge signature array was walked in full on every repaint — before the
+  // size budget could refuse it, and without the memo ever saving a repeat.
+  if (sessionShellVerdict(value) !== 'ok') return false;
+  // Only the caller-dependent slot checks stay outside. They compare the
+  // record against the caller's arguments rather than judging the record, so
+  // caching their result against the object would let a mismatched lookup
+  // poison the verdict for the matching one.
+  const session = value as SigningSession;
+  return session.proposalId === proposalId && session.sessionId === sessionId;
+}
+
+/** The full answer for a shell, including a local size refusal. */
+function sessionShellVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict(
+    'session',
+    value,
+    () => isSigningSession(value) && selfConsistentSession(value),
+  );
+}
+
+/** The arg-independent half: on-net, and the shell hashes to its own id. */
+function selfConsistentSession(value: unknown): boolean {
+  const session = value as SigningSession;
+  if (!onNet(session.networkGenesisChallenge)) return false;
   try {
-    return signingSessionIdOf(value) === value.sessionId;
+    return signingSessionIdOf(session) === session.sessionId;
   } catch {
     return false;
   }
 }
 
 export function putSigningSession(session: SigningSession): boolean {
+  // Size FIRST, like every other put. isSigningSession walks collectedSigs and
+  // allocates for its distinctness check, so behind it this bounded nothing —
+  // and the READ side does bound the shell, so without this a session could
+  // write fine and then read back 'too-large' forever, which is the put/read
+  // disagreement putPolicyCache warns about.
+  if (!smallEnough(session)) return false;
   if (!isSigningSession(session)) return false;
   if (!onNet(session.networkGenesisChallenge)) return false;
   try {
@@ -523,45 +1340,191 @@ export function putSigningSession(session: SigningSession): boolean {
   return true;
 }
 
-// One pass over the whole map builds a signature index keyed by session, so
-// listing stays O(map size) no matter how many shells a peer plants —
-// per-shell rescans would be O(sessions × map size), a cheap read-freeze.
-export function listSigningSessions(proposalId: string): SigningSession[] {
-  const m = map();
-  if (!m) return [];
-  const shellPrefix = `session:${proposalId}:`;
-  const shells: { sessionId: string; shell: SigningSession }[] = [];
-  const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
-  for (const [key, value] of m.entries()) {
-    if (key.startsWith(shellPrefix)) {
-      const sessionId = key.slice(shellPrefix.length);
-      if (validSessionShell(value, proposalId, sessionId)) {
-        shells.push({ sessionId, shell: value });
-      }
-    } else if (key.startsWith('sessionsig:')) {
-      if (typeof value !== 'object' || value === null) continue;
-      const entry = value as Record<string, unknown>;
-      if (!isHex32(entry.signerPuzzleHash)) continue;
-      // Session ids are fixed-width Hex32, so the key decomposes exactly.
-      const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
-      if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) continue;
-      if (typeof entry.sig !== 'string' || entry.sig.length === 0) continue;
-      let bucket = sigsBySession.get(sessionId);
-      if (!bucket) {
-        bucket = [];
-        sigsBySession.set(sessionId, bucket);
-      }
-      bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
-    }
+// No listSigningSessions() wrapper either, and for the same reason: it hid
+// `truncated` and `partialSessionIds`, so missing rounds or a clipped
+// signature set came back looking complete.
+
+/**
+ * Bounded twin of listSigningSessions, paged like scanPrefixed and for the
+ * same reason.
+ *
+ * Shells are UNSIGNED and peer-writable, so stopping at the check limit was a
+ * censorship tool of its own: a peer could plant enough self-consistent shells
+ * to push the genuine round past the cut — and, because the old single pass
+ * broke out of the whole loop, could arrange for the break to land before that
+ * round's SIGNATURE entries too, so even a shell that did survive came back
+ * with its approvals missing.
+ *
+ * Three passes, so no axis can hide another. Keys are collected first (a
+ * prefix test, guarded by MAX_KEYS_EXAMINED); shell keys are sorted and a page
+ * of them verified — that is where a hash is recomputed; and the signature
+ * index is built from every `sessionsig:` key regardless of where the shell
+ * page fell, so a shell on this page always gets the approvals it actually
+ * holds. Signature entries cost a few string comparisons, not a hash.
+ */
+export interface SigningSessionScan extends BoundedScan<SigningSession> {
+  /**
+   * The sessions whose signature set was cut short by a local cap, so their
+   * `collectedSigs` may be fewer than the room holds.
+   *
+   * Per session, not a scan-wide flag: only ONE round's count is rendered, so
+   * a flag covering the whole scan let an expired or foreign round hitting
+   * the cap put an "at least" on a selected round that was complete.
+   * Reported apart from `truncated`, which is about ROUNDS being cut rather
+   * than signatures.
+   */
+  partialSessionIds: string[];
+}
+
+export function scanSigningSessions(
+  proposalId: string,
+  maxEntries: number,
+  maxChecks: number,
+  /** Page starts at the first shell key strictly greater than this. */
+  after: string | null = null,
+): SigningSessionScan {
+  const m = readMap();
+  if (!m) {
+    return {
+      items: [], truncated: false, discoveryCutShort: false, refusedTooLarge: 0, rejected: 0, malformedKeys: 0, matched: 0,
+      cursor: after, startIndex: 0, nextCursor: null, partialSessionIds: [],
+    };
   }
+  const shellPrefix = `session:${proposalId}:`;
+  let examined = 0;
+  let truncated = false;
+  let refusedTooLarge = 0;
+  let rejected = 0;
+  // Pass one: shell keys only. Signature keys are NOT collected here. Sharing
+  // one budget with them was the same censorship shape the shells had: 800
+  // unrelated `sessionsig:` entries filled it and broke the whole scan, so
+  // later signatures — and later SHELLS — were never reached, which flatly
+  // contradicted the guarantee that a paged shell carries its approvals.
+  const shellKeys: string[] = [];
+  let malformedKeys = 0;
+  let discoveryCutShort = false;
+  const ceiling = Math.min(maxEntries, MAX_KEYS_EXAMINED);
+  for (const key of m.keys()) {
+    examined += 1;
+    if (examined > ceiling) {
+      truncated = true;
+      discoveryCutShort = true;
+      break;
+    }
+    if (!key.startsWith(shellPrefix)) continue;
+    // Same reason as scanPrefixed: what follows sorts these, and sorting
+    // peer-supplied keys costs their shared prefix.
+    if (key.length > MAX_KEY_LENGTH) {
+      malformedKeys += 1;
+      continue;
+    }
+    shellKeys.push(key);
+  }
+  shellKeys.sort();
+  // Cursor, not index — same reason as scanPrefixed: shells are unsigned and
+  // peer-writable, so an index-based page can be pushed forward forever by a
+  // writer prepending keys between repaints.
+  const startAt = after === null ? 0 : shellKeys.findIndex((k) => k > after);
+  const from = startAt < 0 ? shellKeys.length : startAt;
+  const page = shellKeys.slice(from, from + Math.max(0, maxChecks));
+  const hasMore = from + page.length < shellKeys.length;
+  // Same rule as scanPrefixed: a non-zero start is itself a partial view.
+  if (from > 0 || hasMore) truncated = true;
+
+  // Pass two: signatures for THIS PAGE's sessions, chosen after the page is.
+  // Filtering during examination means a flood of signatures for other
+  // sessions costs a Set lookup each and cannot crowd out the ones that
+  // belong here — the collection budget applies only to signatures this page
+  // can actually use, which real signers bound.
+  const wanted = new Set(page.map((key) => key.slice(shellPrefix.length)));
+  const sigsBySession = new Map<string, { signerPuzzleHash: Hex32; sig: string }[]>();
+  // Its OWN counter. Sharing the shell pass's meant a large map spent most of
+  // the allowance before this pass began — on a 30,000-key map only 20,000
+  // keys remained — so a selected round could still come back missing
+  // signatures held later in the map, which is the very guarantee this split
+  // was made to provide.
+  let sigExamined = 0;
+  const partialSessions = new Set<string>();
+  for (const key of m.keys()) {
+    sigExamined += 1;
+    if (sigExamined > ceiling) {
+      // Cut short mid-collection: every session still wanted may be missing
+      // signatures it holds, so all of them are flagged rather than none.
+      for (const id of wanted) partialSessions.add(id);
+      truncated = true;
+      discoveryCutShort = true;
+      break;
+    }
+    if (!key.startsWith('sessionsig:')) continue;
+    // Session ids are fixed-width Hex32, so the key decomposes exactly.
+    const sessionId = key.slice('sessionsig:'.length, 'sessionsig:'.length + 64);
+    if (!wanted.has(sessionId)) continue;
+    // Per session, not just per scan. Signature entries are peer-writable and
+    // unverified at this layer, so one wanted session could otherwise absorb
+    // the whole ceiling — and every repaint would then store, sort and
+    // re-validate an arbitrarily long array, straight past the detail
+    // screen's cost budget.
+    const already = sigsBySession.get(sessionId);
+    if (already && already.length >= MAX_SIGS_PER_SESSION) {
+      partialSessions.add(sessionId);
+      continue;
+    }
+    // A signature entry this device cannot read is not a signature that was
+    // never gathered. Dropping these silently let a round render an exact
+    // "2 of 3" while entries filed under that round's own signature keys had
+    // been thrown away — the same absence-from-a-failed-read the rest of this
+    // file refuses, one level down. Flagging the SESSION (rather than
+    // counting map-wide) keeps the caveat on the round it belongs to, so an
+    // unrelated round's junk cannot put an "at least" on a complete one.
+    const dropped = () => {
+      partialSessions.add(sessionId);
+    };
+    const value = m.get(key);
+    if (typeof value !== 'object' || value === null) { dropped(); continue; }
+    const entry = value as Record<string, unknown>;
+    if (!isHex32(entry.signerPuzzleHash)) { dropped(); continue; }
+    if (key !== `sessionsig:${sessionId}:${entry.signerPuzzleHash}`) { dropped(); continue; }
+    if (typeof entry.sig !== 'string' || entry.sig.length === 0) { dropped(); continue; }
+    let bucket = sigsBySession.get(sessionId);
+    if (!bucket) {
+      bucket = [];
+      sigsBySession.set(sessionId, bucket);
+    }
+    bucket.push({ signerPuzzleHash: entry.signerPuzzleHash, sig: entry.sig });
+  }
+
   const out: SigningSession[] = [];
-  for (const { sessionId, shell } of shells) {
+  for (const key of page) {
+    const value = m.get(key);
+    // Counted, not just skipped: a shell refused on size is a record this
+    // room holds, so leaving it out silently would report "no open round"
+    // about a round that exists.
+    const verdict = sessionShellVerdict(value);
+    if (verdict === 'too-large') refusedTooLarge += 1;
+    const sessionId = key.slice(shellPrefix.length);
+    if (!validSessionShell(value, proposalId, sessionId)) {
+      if (verdict !== 'too-large') rejected += 1;
+      continue;
+    }
     const collectedSigs = (sigsBySession.get(sessionId) ?? [])
       .sort((a, b) => (a.signerPuzzleHash < b.signerPuzzleHash ? -1 : 1));
-    const assembled = { ...shell, collectedSigs };
+    const assembled = { ...(value as SigningSession), collectedSigs };
     if (isSigningSession(assembled)) out.push(assembled);
+    else rejected += 1;
   }
-  return out;
+  return {
+    items: out,
+    truncated,
+    discoveryCutShort,
+    refusedTooLarge,
+    rejected,
+    malformedKeys,
+    matched: shellKeys.length,
+    cursor: after,
+    startIndex: from,
+    nextCursor: hasMore && page.length > 0 ? page[page.length - 1] : null,
+    partialSessionIds: [...partialSessions],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +1532,15 @@ export function listSigningSessions(proposalId: string): SigningSession[] {
 // ---------------------------------------------------------------------------
 
 function validBinding(value: unknown): value is RoomTreasuryBinding {
+  return bindingVerdict(value) === 'ok';
+}
+
+/** The full answer, including a local size refusal. */
+function bindingVerdict(value: unknown): RecordVerdict {
+  return cachedVerdict('binding', value, () => validBindingUncached(value));
+}
+
+function validBindingUncached(value: unknown): value is RoomTreasuryBinding {
   if (!isRoomTreasuryBinding(value)) return false;
   if (!onNet(value.networkGenesisChallenge)) return false;
   const { sig, ...unsigned } = value;
@@ -579,17 +1551,65 @@ function validBinding(value: unknown): value is RoomTreasuryBinding {
   }
 }
 
+/**
+ * Writes a binding. Deliberately NOT owner-gated, and deliberately
+ * plain-replace (invariant 5): this layer cannot authenticate who the room's
+ * owner is, so an occupancy rule here would only let a planted record brick
+ * honest re-puts. What `validBinding` proves is authorship — `sig` verifies
+ * under the record's own `boundByPub` — and the read side says exactly that
+ * and no more. Whether that key is the ROOM OWNER's is decided where the
+ * owner key can be read live (treasuryView.bindingSigner against
+ * gamesDoc.readRoomOwnerKey), the same read-side split main.ts's owner gates
+ * use; and
+ * whether the COMPANY agreed is a chain fact for the node lane. See
+ * RoomTreasuryBinding for the writer rule PR F must follow.
+ *
+ * DELETION IS NOT REVOCATION. The slot has no sequence, no tombstone and no
+ * reader watermark, so any binding the owner ever signed can be re-put by
+ * anyone who kept a copy, and it reads OWNER-SIGNED again; with one slot,
+ * whichever write lands last wins. That is safe today only because PR C ships
+ * no writer, so no honest record exists to replay, and the only revocation
+ * available is the owner rotating their identity key. Hard preconditions for
+ * the first writer (PR F): a signed unbind tombstone carrying seq/height,
+ * highest-seq-wins on read, and a per-reader watermark — before any honest
+ * binding is written.
+ */
 export function putRoomBinding(binding: RoomTreasuryBinding): boolean {
   if (!validBinding(binding)) return false;
   return put(`binding:${binding.roomId}`, binding);
 }
 
-export function readRoomBinding(roomId: string): RoomTreasuryBinding | null {
-  const m = map();
-  if (!m) return null;
+/**
+ * The room's funding binding, or WHY there is none to show — the same four
+ * states readPolicyCacheResult reports, and for the same reason: 'too-large'
+ * is this device's own refusal, so answering it with the silence used for a
+ * missing record would deny a record the room is holding.
+ */
+export type RoomBindingResult =
+  | { status: 'ok'; binding: RoomTreasuryBinding }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+export function readRoomBindingResult(roomId: string): RoomBindingResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
   const value = m.get(`binding:${roomId}`);
-  return validBinding(value) && value.roomId === roomId ? value : null;
+  if (value === undefined) return { status: 'absent' };
+  const verdict = bindingVerdict(value);
+  if (verdict === 'too-large') return { status: 'too-large' };
+  // The slot-claim check stays out of the verdict: it compares the record
+  // against the caller's room id rather than judging the record itself.
+  if (verdict !== 'ok' || (value as RoomTreasuryBinding).roomId !== roomId) {
+    return { status: 'unreadable' };
+  }
+  return { status: 'ok', binding: value as RoomTreasuryBinding };
 }
+
+// There is deliberately no plain readRoomBinding() wrapper any more. A reader
+// that answers "held but unusable" with the same null it uses for an empty
+// slot is the trap the phone closed once already (a neutralised binding let
+// a peer's policy name the company for the whole screen); with the signer
+// verdict now layered on top, the next caller must start from the result form
+// and decide what each state means on screen.
 
 // §13.1's immutable-body rule is enforced where receipts are VERIFIABLE —
 // against the chain facts they anchor to (spendBundleId, confirmation), the
@@ -605,7 +1625,7 @@ export function putReceiptCache(receipt: TreasuryReceipt): boolean {
 }
 
 export function readReceiptCache(receiptId: string): TreasuryReceipt | null {
-  const m = map();
+  const m = readMap();
   if (!m) return null;
   const value = m.get(`receipt:${receiptId}`);
   if (!isTreasuryReceipt(value) || value.receiptId !== receiptId) return null;
@@ -634,31 +1654,79 @@ export function putProposalPayload(payloadHex: string): boolean {
   return put(`payload:${hash}`, payloadHex);
 }
 
-export function readProposalPayload(payloadHash: string): string | null {
-  const m = map();
-  if (!m) return null;
-  if (!isHex32(payloadHash)) return null;
+/** Payload bytes, or why there are none — same four states as the others. */
+export type PayloadResult =
+  | { status: 'ok'; hex: string }
+  | { status: 'absent' | 'unreadable' | 'too-large' };
+
+export function readProposalPayloadResult(payloadHash: string): PayloadResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
+  if (!isHex32(payloadHash)) return { status: 'absent' };
   const value = m.get(`payload:${payloadHash}`);
-  if (typeof value !== 'string' || value.length > PAYLOAD_MAX_HEX) return null;
+  if (value === undefined) return { status: 'absent' };
+  if (typeof value !== 'string') return { status: 'unreadable' };
+  // Over the cap is this device's own refusal — the payload may be perfectly
+  // good — so it is reported apart from a payload nobody here holds.
+  if (value.length > PAYLOAD_MAX_HEX) return { status: 'too-large' };
   try {
-    return payloadHashOf(value) === payloadHash ? value : null;
+    return payloadHashOf(value) === payloadHash
+      ? { status: 'ok', hex: value }
+      : { status: 'unreadable' };
   } catch {
-    return null;
+    return { status: 'unreadable' };
   }
+}
+
+export function readProposalPayload(payloadHash: string): string | null {
+  const result = readProposalPayloadResult(payloadHash);
+  return result.status === 'ok' ? result.hex : null;
 }
 
 // ---------------------------------------------------------------------------
 // Chain-sync display status
 // ---------------------------------------------------------------------------
 
-export function putChainSyncStatus(status: ChainSyncStatus): boolean {
-  if (!isChainSyncStatus(status)) return false;
-  return put('sync', status);
+/**
+ * Publishes this node's chain view for the room to display.
+ *
+ * The genesis is STAMPED here from the active pin rather than taken from the
+ * caller, so a claim can only ever be about the network this device is
+ * actually on — and so callers cannot forget the field that makes the read
+ * side able to reject someone else's chain.
+ */
+export function putChainSyncStatus(
+  status: Omit<ChainSyncStatus, 'networkGenesisChallenge'>,
+): boolean {
+  if (expectedGenesis === null) return false;
+  const stamped: ChainSyncStatus = {
+    ...status,
+    networkGenesisChallenge: expectedGenesis,
+  };
+  if (!isChainSyncStatus(stamped)) return false;
+  return put('sync', stamped);
+}
+
+/** A peer's chain-view claim, or why there is none. */
+export type ChainSyncResult =
+  | { status: 'ok'; sync: ChainSyncStatus }
+  | { status: 'absent' | 'unreadable' };
+
+export function readChainSyncStatusResult(): ChainSyncResult {
+  const m = readMap();
+  if (!m) return { status: 'absent' };
+  const value = m.get('sync');
+  if (value === undefined) return { status: 'absent' };
+  // Held but malformed is not "nobody has said anything" — somebody wrote
+  // here, and what they wrote could not be read. A claim about ANOTHER
+  // network reads the same way: something is here, and it is not about this
+  // chain, so it cannot be this room's clock.
+  if (!isChainSyncStatus(value)) return { status: 'unreadable' };
+  if (!onNet(value.networkGenesisChallenge)) return { status: 'unreadable' };
+  return { status: 'ok', sync: value };
 }
 
 export function readChainSyncStatus(): ChainSyncStatus | null {
-  const m = map();
-  if (!m) return null;
-  const value = m.get('sync');
-  return isChainSyncStatus(value) ? value : null;
+  const result = readChainSyncStatusResult();
+  return result.status === 'ok' ? result.sync : null;
 }

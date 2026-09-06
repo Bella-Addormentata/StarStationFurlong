@@ -423,6 +423,35 @@ export interface SigningSession {
   expiresAfterHeight: number;
 }
 
+/**
+ * A room's funding binding (plan §10.1). Two predicates make it this room's
+ * funding, and they are checked in different places:
+ *
+ *  - ROOM SIDE — "who may bind this room": `boundByPub` must be the room
+ *    owner's identity key. Checked on READ, in treasuryView, against the key
+ *    the room document names live (gamesDoc.readRoomOwnerKey); the cache
+ *    layer only verifies that `sig` is a valid signature under `boundByPub`,
+ *    i.e. authorship. The slot is plain-replace and NOT owner-gated on write
+ *    (invariant 5: enforcing occupancy over what the browser cannot
+ *    authenticate would let a planted record brick honest re-puts).
+ *  - COMPANY SIDE — "does the company agree": `policyReceiptId` must name a
+ *    confirmed receipt of an accepted `bind-room` proposal for exactly this
+ *    (companyId, treasuryLauncherId, policyVersion, roomId, profileId) on the
+ *    pinned network. Not checkable in the browser; the node lane (PR D/F)
+ *    owns it, and the UI states it as NOT CHECKED until then.
+ *
+ * WRITER RULE for the governance lane (PR F): sign with the RAW owner
+ * identity key — signIdentity under a deed-holder check — never under the
+ * shareholder-extended owner gate the room UI uses for edit rights, or an
+ * honest venture-owner's binding reads NOT OWNER-SIGNED. `boundByPub` must be
+ * the same base64url string getIdentityPub() writes into players.keyB64: the
+ * comparison is string equality, and the tests use hex on both sides, so a
+ * writer emitting the key in another encoding would not be caught by them.
+ *
+ * Issue #138 (NFT deeds / authority head): no change to this contract — the
+ * owner key the reader compares against moves from the players map to the
+ * verified head; see gamesDoc.readRoomOwnerKey and treasuryView.RoomOwnerKey.
+ */
 export interface RoomTreasuryBinding {
   v: 1;
   networkGenesisChallenge: Hex32;
@@ -431,6 +460,7 @@ export interface RoomTreasuryBinding {
   treasuryLauncherId: Hex32;
   policyVersion: number;
   profileId: string;
+  /** The signer's identity key (base64url, as players.keyB64 carries it). */
   boundByPub: string;
   boundAtHeight: number;
   expiresAfterHeight?: number;
