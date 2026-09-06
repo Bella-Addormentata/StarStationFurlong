@@ -64,7 +64,7 @@ import {
   B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
 } from './games/chess';
 import type { ChessState, ChessColor } from './games/chess';
-import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
@@ -500,6 +500,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         bindingResult && bindingResult.status !== 'ok' && bindingResult.status !== 'absent'
           ? bindingResult.status
           : access,
+        // Who the room's owner is, read live — the signer verdict rests on
+        // it, and this panel must agree with the phone about it. (Issue #138:
+        // readRoomOwnerKey is the seam an NFT-deed authority head replaces.)
+        readRoomOwnerKey(),
       );
       // No record is NOT the same fact as "funded personally", and an
       // unreachable room document is a third state again — say which one.
@@ -534,6 +538,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
               `COMPANY ${shortId(funding.companyId ?? '')} · TREASURY ${shortId(funding.treasuryId ?? '')}`,
               `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
               `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+              // The signer, always: a record whose author is never shown is
+              // one a peer can forge without anyone noticing whose key it is.
+              // "BOUND BY" only when the signer is the room owner.
+              `${funding.signer === 'owner' ? 'BOUND BY' : 'SIGNED BY'} ${(funding.signerLabel ?? '—').toUpperCase()}`,
+              // And the half of §10.1 this device cannot check, said so.
+              `COMPANY APPROVAL ${(funding.companyApproval ?? '—').toUpperCase()}`,
               funding.trust.detail,
               // Only shown when the record names an end height at all. The
               // note carries the verdict; the height it was judged against is
@@ -550,6 +560,10 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
               `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
             ]
           : [
+              // A held record under someone else's key is still named by its
+              // signer, so "not the room owner" is a fact on screen and not a
+              // silence.
+              ...(funding.signerLabel ? [`SIGNED BY ${funding.signerLabel.toUpperCase()}`] : []),
               funding.detail,
               funding.readOnlyNote,
               `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,

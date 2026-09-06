@@ -308,6 +308,14 @@ export function windowsView(
   const registrationConflicts =
     (registrationRaw !== null && registration === null) || registrationUnreadable;
   const cachedConflicts = (cachedRaw !== null && cached === null) || cachedUnreadable;
+  // Two ways for the cached-clocks slot to be unusable, and they are not the
+  // same claim. A record this device could not parse says nothing about which
+  // proposal it describes, so its note must not assert a mismatch — that
+  // would be a statement about bytes never read, in the one place this module
+  // otherwise keeps "cannot make sense of it" apart from "describes another".
+  // Only a record that WAS read and named a different proposal or revision
+  // earns the mismatch line.
+  const cachedMismatch = cachedRaw !== null && cached === null;
   const missingRegistrationNote = registrationUnreadable && registrationRaw === null
     ? 'an acceptance record is held here but this device cannot make sense of it'
     : registrationConflicts
@@ -369,9 +377,11 @@ export function windowsView(
           : registrationConflicts
             ? 'The acceptance record held here describes a different proposal, so this one’s clocks cannot be worked out.'
             : 'No acceptance record for this proposal is held in this room yet.')
-      + (cachedConflicts
+      + (cachedMismatch
         ? ' A copied set of clocks is held here as well, but it belongs to a different proposal or policy version.'
-        : ''),
+        : cachedUnreadable
+          ? ' A copied set of clocks is held here as well, but this device cannot make sense of it.'
+          : ''),
   };
 }
 
@@ -797,6 +807,112 @@ export function missingProposalNote(status: ProposalDetailAbsence): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Room ownership as this device can establish it — plan §10.1's room-side check
+// ---------------------------------------------------------------------------
+
+/**
+ * The room owner's identity key, as far as this device can currently tell.
+ *
+ *  'known'   the room document names an owner and that player's entry carries
+ *            an identity key. `pub` is the same base64url string that
+ *            getIdentityPub() writes into players.keyB64, so a binding's
+ *            boundByPub compares to it by plain string equality — a writer
+ *            that emits the key in any other encoding will never match.
+ *  'unknown' an owner is named but their entry (or its key) has not synced
+ *            yet, or no owner is named at all. Deliberately NOT a licence to
+ *            trust whatever key signed the record (no fail-open): once the
+ *            room has synced, the only peer action that produces this state
+ *            is deleting or overwriting the owner's players entry, and a rule
+ *            that accepted any signer then would turn that censorship into a
+ *            forgery. Withholding costs honest players nothing beyond the sync
+ *            window, because an honest deed transfer never leaves the room in
+ *            this state — the hand-over refuses to name a recipient who holds
+ *            no key.
+ *  'legacy'  the owner is the pre-keyed-identity 'Local-Clone' marker, so no
+ *            key can ever be the owner's. Such a room cannot show an
+ *            owner-signed funding record until it is claimed under a keyed
+ *            owner.
+ *
+ * ISSUE #138 (room modules as Chia NFT deeds) — WHERE IT PLUGS IN. This type
+ * is the seam. Today gamesDoc.readRoomOwnerKey() derives it from the
+ * peer-writable roomInfo.owner → players[owner].keyB64 chain, which is exactly
+ * as strong as the room's ownership model is today (main.ts's roomOwnerInfo
+ * and currentRoomDeedIsMine read the same chain; so does the unmerged #67
+ * door-policy PR). Under chia-authority-architecture.md the owner's
+ * node publishes a signed authority head — {launcher_id, seq,
+ * owner_ed25519_pubkey, cohost_ed25519_pubkeys[], ...} — anchored to the
+ * room's NFT1 deed, and its Phase 2 has peers derive the owner from the
+ * verified head while the raw owner map becomes a cache of it. When that
+ * lands, readRoomOwnerKey() returns the head's owner_ed25519_pubkey (emitted
+ * in, or normalised to, the same base64url form) and nothing in this module,
+ * in the binding contract, or in the signature bytes changes: same string
+ * equality against the same field, only the root of the chain moves. A key
+ * rotation in a new head demotes every earlier owner-signed binding to
+ * NOT OWNER-SIGNED, which is the intended answer to plan §20 open question
+ * #10: a binding stands until the owner KEY changes or the governance lane
+ * (PR F) supplies a proposal-authorised unbind; `expiresAfterHeight` stays an
+ * optional self-imposed cap.
+ */
+export type RoomOwnerKey =
+  | {
+      status: 'known';
+      pub: string;
+      /**
+       * WHERE the key came from, because the badge's last sentence depends on
+       * it and must never say more than the reader did.
+       *  'room-doc'        players[roomInfo.owner].keyB64 — two unauthenticated
+       *                    map writes name the owner. The only source today.
+       *  'head-verified'   an issue-#138 authority head this device's node
+       *                    verified against the chain-anchored deed. Only
+       *                    this source may ever say "confirmed against the
+       *                    room's deed".
+       *  'head-unverified' a head this device could read but not verify (no
+       *                    chain access) — chia-authority-architecture's
+       *                    Phase 2 fallback, which is room-doc trust again
+       *                    and must be worded as such.
+       */
+      source: 'room-doc' | 'head-verified' | 'head-unverified';
+    }
+  | { status: 'unknown' }
+  | { status: 'legacy' };
+
+/**
+ * How a held binding's signer relates to the room's owner key. Owner ONLY,
+ * and the RAW owner: venture shareholders do pass the shareholder-extended
+ * owner gate for room edits, docking and door policies (main.ts
+ * isLocalPlayerRoomOwner), but a deed is the personal owner's alone
+ * (currentRoomDeedIsMine), and a binding is a statement about the room's
+ * deed, not about its edit rights — so the deed holder's key is the one that
+ * signs it. Widening to co-hosts or the company is PR F's call, through the
+ * authority head and the policy; a strict subset now cannot be invalidated by
+ * that later.
+ */
+export type BindingSigner = 'owner' | 'owner-unknown' | 'no-owner-key' | 'not-owner';
+
+export function bindingSigner(
+  binding: RoomTreasuryBinding,
+  ownerKey: RoomOwnerKey,
+): BindingSigner {
+  if (ownerKey.status === 'legacy') return 'no-owner-key';
+  if (ownerKey.status === 'unknown') return 'owner-unknown';
+  return binding.boundByPub === ownerKey.pub ? 'owner' : 'not-owner';
+}
+
+/**
+ * The standing of the room's binding slot, for deciding what the screen may
+ * present. The three reader states, or — when a record was read — who signed
+ * it. A typed union rather than the boolean that preceded it, so the next
+ * state anyone adds is a compile error at every caller instead of a silent
+ * fall-through to "no binding at all".
+ */
+export type BindingStanding = 'absent' | 'unreadable' | 'too-large' | BindingSigner;
+
+/** A player-safe fingerprint of a signing key. The raw key is never shown. */
+export function keyFingerprint(pub: string): string {
+  return shortId(pub);
+}
+
 export interface RoomFundingView {
   bound: boolean;
   /**
@@ -822,6 +938,26 @@ export interface RoomFundingView {
   policyVersion: number | null;
   boundAtHeight: number | null;
   expiresAfterHeight: number | null;
+  /**
+   * Who signed the held record, relative to the room's owner key — null when
+   * no record was read. This is the room-side half of §10.1's check and the
+   * only thing the trust badge below is allowed to rest on.
+   */
+  signer: BindingSigner | null;
+  /**
+   * The signer's fingerprint and standing, for a "Bound by" / "Signed by"
+   * row. Never the raw key. A binding whose author the screen does not name
+   * is one a peer can forge without anyone noticing whose key it carries.
+   */
+  signerLabel: string | null;
+  /**
+   * The company-side half of §10.1, stated as NOT checked. An owner's
+   * signature shows the owner bound the room; whether the company agreed to
+   * fund it is a chain fact (the receipt this record names) that only the
+   * node lane can establish. Rendered whenever a record is shown, so the
+   * owner's signature is never read as the company's consent.
+   */
+  companyApproval: string | null;
   trust: TrustTag;
   headline: string;
   detail: string;
@@ -851,6 +987,12 @@ export function roomFundingView(
    * unactionable: nothing about the room is broken.
    */
   access: FundingReadAccess = 'readable',
+  /**
+   * The room owner's key as this device can establish it right now. The
+   * default is the honest one — not known — so a caller that forgets to pass
+   * it gets an OWNER UNKNOWN badge, never a SIGNED one.
+   */
+  ownerKey: RoomOwnerKey = { status: 'unknown' },
 ): RoomFundingView {
   const readOnlyNote = 'Read-only: this device does not check the chain, so none of this is confirmed.';
   const unavailable = [
@@ -868,6 +1010,9 @@ export function roomFundingView(
       policyVersion: null,
       boundAtHeight: null,
       expiresAfterHeight: null,
+      signer: null,
+      signerLabel: null,
+      companyApproval: null,
       // The badge has to agree with the headline beside it. Two of these
       // states mean a record IS held — this device just would not or could
       // not read it — so NO DATA / "nothing cached yet" would flatly
@@ -915,11 +1060,50 @@ export function roomFundingView(
       policyVersion: null,
       boundAtHeight: null,
       expiresAfterHeight: null,
+      signer: null,
+      signerLabel: null,
+      companyApproval: null,
       trust: trustTag('absent'),
       headline: 'No company funding record',
       // Says only what is known. Inferring that costs therefore fall to the
       // owner would be the same absence-as-fact mistake in slower words.
       detail: 'This room holds no record of a company funding it. That is not the same as knowing there is none.',
+      readOnlyNote,
+      unavailable,
+    };
+  }
+  // WHO signed it, before anything else is said about it. The cache layer
+  // verified the signature against the key the record itself carries, which
+  // establishes authorship and nothing more: any peer can mint a key, sign a
+  // binding naming any company, and write it over this room's slot. The
+  // record is this room's funding only when that key is the room owner's.
+  const signer = bindingSigner(binding, ownerKey);
+  const fingerprint = keyFingerprint(binding.boundByPub);
+  if (signer === 'not-owner') {
+    // Held, so never "no record" — but no company billboard either. The ids
+    // a planted record names are the attacker's choice, and rendering them
+    // under THIS ROOM would hand a forged binding exactly the display a real
+    // one gets, with only the badge to tell them apart.
+    return {
+      bound: false,
+      expiryStatus: 'none',
+      expiryNote: null,
+      companyId: null,
+      treasuryId: null,
+      profileId: null,
+      policyVersion: null,
+      boundAtHeight: null,
+      expiresAfterHeight: null,
+      signer,
+      signerLabel: `${fingerprint} · not the room owner`,
+      companyApproval: null,
+      trust: {
+        ...trustTag('unverified'),
+        label: 'NOT OWNER-SIGNED',
+        detail: 'A record is held here, signed by a key that is not this room’s owner’s, so it is not shown as this room’s funding.',
+      },
+      headline: 'Funding record not signed by the room owner',
+      detail: 'This room holds a company funding record, but its signature is not the room owner’s. Anyone can write such a record into any room, so it says nothing about how this room is funded, and its company details are not shown.',
       readOnlyNote,
       unavailable,
     };
@@ -969,14 +1153,52 @@ export function roomFundingView(
     policyVersion: binding.policyVersion,
     boundAtHeight: binding.boundAtHeight,
     expiresAfterHeight: expires,
-    trust: trustTag('signed'),
+    signer,
+    signerLabel:
+      signer === 'owner'
+        ? `${fingerprint} · room owner`
+        : signer === 'owner-unknown'
+          ? `${fingerprint} · owner not yet known here`
+          : `${fingerprint} · room has no keyed owner`,
+    companyApproval: `Not checked here · receipt ${shortId(binding.policyReceiptId)}`,
+    // SIGNED only when the signer is the owner. The other two are signatures
+    // that checked out under a key this device cannot yet tie to anyone, and
+    // a badge that said otherwise would be the fail-open the door policy
+    // accepts for a door and this record cannot afford — see RoomOwnerKey.
+    trust:
+      signer === 'owner'
+        ? {
+            ...trustTag('signed'),
+            label: 'OWNER-SIGNED',
+            // The last clause is chosen by the owner key's PROVENANCE. Naming
+            // the owner in the room document is itself an unauthenticated
+            // write, so until a verified deed head supplies the key this
+            // badge says "as its records name them" and nothing stronger —
+            // a peer without chain access under issue #138's Phase 2 falls
+            // back to exactly that trust level and must read the same words.
+            detail:
+              ownerKey.status === 'known' && ownerKey.source === 'head-verified'
+                ? 'Signed by this room’s owner, confirmed against the room’s deed by your own node, and that signature was checked here — which shows the owner bound the room, not that the company agreed to fund it.'
+                : 'Signed by this room’s owner as its records currently name them — a name anyone in the room can write, not yet checked against a deed — and that signature was checked here, which shows the owner bound the room, not that the company agreed to fund it.',
+          }
+        : signer === 'owner-unknown'
+          ? {
+              ...trustTag('unverified'),
+              label: 'OWNER UNKNOWN',
+              detail: 'Signed, and the signature was checked here — but this device has not learned this room’s owner key yet, so whether the owner wrote it is not known.',
+            }
+          : {
+              ...trustTag('unverified'),
+              label: 'NO OWNER KEY',
+              detail: 'Signed, and the signature was checked here — but this room has no keyed owner on record, so no signature can count as the owner’s.',
+            },
     // Always "record", never "Company funding" on its own — including when no
     // end height is named. A signature shows who wrote the statement; it does
-    // not show they were entitled to write it, that the chain ever confirmed
-    // it, or that it has not since been unbound. An open-ended record is
-    // therefore no more evidence of live funding than an expiring one, and a
-    // headline saying otherwise would be exactly the invented certainty the
-    // rest of this module refuses.
+    // not show the company agreed, that the chain ever confirmed it, or that
+    // it has not since been unbound. An open-ended record is therefore no
+    // more evidence of live funding than an expiring one, and a headline
+    // saying otherwise would be exactly the invented certainty the rest of
+    // this module refuses.
     headline:
       expiryStatus === 'passed'
         ? 'Company funding record · may have ended'
@@ -1070,21 +1292,47 @@ export function proposalRows(
 }
 
 /**
+ * Records that belong to a proposal, and how many held under its keys do not.
+ *
+ * The DROPPED count is part of the answer, not a detail. A silent filter let
+ * the approvals panel print "No approval round open in this room" about a
+ * room holding a round under this proposal's own approval keys: the doc layer
+ * accepted the shell (it checks the proposal id and the hash, never the
+ * company), the scan-level counts saw nothing wrong, the filter threw it away,
+ * and the absence read as fact. The proposal list has always reported what its
+ * company filter left out; these two per-proposal filters did not.
+ */
+export interface ScopedRecords<T> {
+  kept: T[];
+  /** Held under this proposal's keys, but for another company or revision. */
+  dropped: number;
+}
+
+/**
  * The approval rounds that actually belong to a proposal. Rounds are
  * peer-writable and only keyed by proposal id in the cache, so one opened
  * under a different company or a different policy revision would otherwise be
  * rendered as this proposal's progress.
  */
-export function sessionsFor(
+export function scopeSessions(
   sessions: SigningSession[],
   proposal: TreasuryProposal,
-): SigningSession[] {
-  return sessions.filter(
+): ScopedRecords<SigningSession> {
+  const kept = sessions.filter(
     (s) =>
       s.companyId === proposal.companyId &&
       s.policyVersion === proposal.policyVersion &&
       s.proposalId === proposal.proposalId,
   );
+  return { kept, dropped: sessions.length - kept.length };
+}
+
+/** The kept rounds alone — only for callers that report `dropped` elsewhere. */
+export function sessionsFor(
+  sessions: SigningSession[],
+  proposal: TreasuryProposal,
+): SigningSession[] {
+  return scopeSessions(sessions, proposal).kept;
 }
 
 /**
@@ -1093,14 +1341,38 @@ export function sessionsFor(
  * self-consistent record carrying that id under a different company and have
  * it counted among this proposal's.
  */
+export function scopeCheckpoints(
+  checkpoints: TreasuryCheckpoint[],
+  proposal: TreasuryProposal,
+): ScopedRecords<TreasuryCheckpoint> {
+  const kept = checkpoints.filter(
+    (c) =>
+      c.companyId === proposal.companyId && c.proposalId === proposal.proposalId,
+  );
+  return { kept, dropped: checkpoints.length - kept.length };
+}
+
+/** The kept records alone — only for callers that report `dropped` elsewhere. */
 export function checkpointsFor(
   checkpoints: TreasuryCheckpoint[],
   proposal: TreasuryProposal,
 ): TreasuryCheckpoint[] {
-  return checkpoints.filter(
-    (c) =>
-      c.companyId === proposal.companyId && c.proposalId === proposal.proposalId,
-  );
+  return scopeCheckpoints(checkpoints, proposal).kept;
+}
+
+/**
+ * The page-local line that says what a per-proposal filter left out, so the
+ * counts above it are never read as the room's whole holding under that
+ * proposal. Null when nothing was dropped.
+ */
+export function droppedRecordsNote(
+  dropped: number,
+  noun: 'approval round' | 'vote record',
+): string | null {
+  if (dropped <= 0) return null;
+  const plural = dropped === 1 ? '' : 's';
+  const verb = dropped === 1 ? 'belongs' : 'belong';
+  return `${dropped} ${noun}${plural} held under this proposal's keys ${verb} to a different company or policy revision and ${dropped === 1 ? 'is' : 'are'} not counted above.`;
 }
 
 /**
@@ -1204,63 +1476,96 @@ export interface CompanyScope {
   /** True when a signed binding and the cached policy name different companies. */
   mismatch: boolean;
   warning: string | null;
+  /**
+   * True only when the owner's binding named the company. False when the
+   * company came from the policy cache alone — an ordinary unbound room, and
+   * also the cheapest thing a hostile peer can arrange, since every HELD
+   * binding state withholds and only an empty slot lets the freely writable
+   * policy speak. The fallback is kept so an unbound room still shows its
+   * company, but the screen says what it rests on.
+   */
+  anchored: boolean;
+  /** The sentence to print under an unanchored company, or null. */
+  note: string | null;
 }
 
 /**
  * Which company this screen is entitled to present.
  *
- * The room binding is signed; the policy cache is freely replaceable. If a
- * peer writes a policy for another company, the screen would otherwise show
- * the binding's company as the funding source while rendering the OTHER
- * company's board and proposals under one "COMPANY" heading, with nothing
- * saying they disagree. When they disagree, show neither and say so.
+ * An OWNER-SIGNED room binding is the anchor; the policy cache is freely
+ * replaceable. If a peer writes a policy for another company, the screen
+ * would otherwise show the binding's company as the funding source while
+ * rendering the OTHER company's board and proposals under one "COMPANY"
+ * heading, with nothing saying they disagree. When they disagree, show
+ * neither and say so.
+ *
+ * Only the owner's binding anchors. A binding under any other key — or one
+ * whose signer cannot be tied to the owner yet — is displayed as the claim it
+ * is, and the company details and proposal list are withheld exactly as they
+ * are for an unreadable binding. "The room binding is signed" was once this
+ * function's whole premise, and the signature it meant was anyone's: a peer
+ * could forge the anchor outright as easily as neutralise it.
  */
 export function companyScope(
   binding: RoomTreasuryBinding | null,
   policy: CompanyTreasuryPolicy | null,
   /**
-   * True when a binding IS held but could not be used — malformed, off-network,
-   * or refused on size.
-   *
-   * Without this the plain reader's null was indistinguishable from "no
-   * binding at all", and the fallback below then let the freely-writable
-   * policy name the company on its own. That hands a peer a way to neutralise
-   * the SIGNED anchor and have their own company's board, fingerprint and
-   * proposal list rendered as this room's: write junk over the binding slot,
-   * then write whatever policy you like.
+   * The binding slot's standing. Anything other than 'owner' means the
+   * binding passed in — if any — must not anchor the scope. A boolean lived
+   * here once ("held but unusable"), which let every new held-state fall
+   * through to the "no binding at all" branch below, where the freely
+   * writable policy names the company on its own.
    */
-  bindingHeldButUnusable = false,
+  standing: BindingStanding = 'absent',
 ): CompanyScope {
-  if (bindingHeldButUnusable) {
-    return {
-      companyId: null,
-      mismatch: true,
-      warning: 'A company funding record is held in this room but cannot be read, so the company details and proposal list are not shown — there is no signed record here to check them against.',
-    };
+  const withheld = (warning: string): CompanyScope => ({
+    companyId: null,
+    mismatch: true,
+    warning,
+    anchored: false,
+    note: null,
+  });
+  if (standing === 'unreadable' || standing === 'too-large') {
+    return withheld('A company funding record is held in this room but cannot be read, so the company details and proposal list are not shown — there is no signed record here to check them against.');
   }
+  if (standing === 'not-owner') {
+    return withheld('A company funding record is held in this room but was not signed by the room’s owner, so the company details and proposal list are not shown.');
+  }
+  if (standing === 'owner-unknown') {
+    return withheld('A company funding record is held here, but this device does not yet know this room’s owner key, so it cannot tell whether the owner wrote it — the company details and proposal list are not shown until it can.');
+  }
+  if (standing === 'no-owner-key') {
+    return withheld('A company funding record is held here, but this room has no keyed owner on record, so there is no owner signature to check it against — the company details and proposal list are not shown.');
+  }
+  // From here the only binding that counts is the owner's; an absent slot
+  // carries none, and the policy may stand alone as an ordinary unbound room.
+  const anchor = standing === 'owner' ? binding : null;
   // Company AND treasury: both records name a treasury too, so a policy for
   // the right company but a different treasury would otherwise have that
   // treasury's board, fee ceiling and fingerprint rendered as if the signed
   // funding record agreed with them.
   if (
-    binding &&
+    anchor &&
     policy &&
-    (binding.companyId !== policy.companyId ||
-      binding.treasuryLauncherId !== policy.treasuryLauncherId)
+    (anchor.companyId !== policy.companyId ||
+      anchor.treasuryLauncherId !== policy.treasuryLauncherId)
   ) {
-    return {
-      companyId: null,
-      mismatch: true,
-      // Precise about what is actually withheld: the signed funding record
-      // above stays on screen with its own company, and it is the cached
-      // company details and proposal list that are held back.
-      warning: 'The company details held in this room do not match the funding record above, so they and the proposal list are not shown.',
-    };
+    // Precise about what is actually withheld: the signed funding record
+    // above stays on screen with its own company, and it is the cached
+    // company details and proposal list that are held back.
+    return withheld('The company details held in this room do not match the funding record above, so they and the proposal list are not shown.');
   }
+  const companyId = policy?.companyId ?? anchor?.companyId ?? null;
+  const anchored = anchor !== null;
   return {
-    companyId: policy?.companyId ?? binding?.companyId ?? null,
+    companyId,
     mismatch: false,
     warning: null,
+    anchored,
+    note:
+      companyId !== null && !anchored
+        ? 'Named by a company record anyone in the room can write; no funding record ties this company to this room.'
+        : null,
   };
 }
 
@@ -1339,6 +1644,83 @@ export function advanceCursorPair(
 export function retreatCursorPair(pair: CursorPair): CursorPair {
   if (pair.a.length <= 1 && pair.b.length <= 1) return pair;
   return { a: pair.a.slice(0, -1), b: pair.b.slice(0, -1) };
+}
+
+// ---------------------------------------------------------------------------
+// Paging predicates shared by the phone's panels
+// ---------------------------------------------------------------------------
+//
+// Moved here from main.ts so they are unit-tested against real scan shapes.
+// While they lived in the entry point they were pinned only by regexes over
+// its source text, which cannot catch a behavioural defect — and one went
+// through: a cursor left past every matching key rendered "Votes: 9–8 of 8".
+
+/** The subset of a BoundedScan these predicates read. */
+export interface ScanPosition {
+  matched: number;
+  startIndex: number;
+  nextCursor: string | null;
+}
+
+/**
+ * Whether a page's cursor sits past every matching key — records LEAVING
+ * after the reader advanced. This is the rewind condition, and it is
+ * deliberately not "the page is empty": `items` holds only ACCEPTED records,
+ * so a page whose entries were all rejected or refused is legitimately empty
+ * while its keys are still there. Rewinding on that let a peer plant one full
+ * invalid page in front of an honest record: NEXT reached the bad page, the
+ * rewind bounced straight back, and the honest page after it was unreachable
+ * — the censorship hole rebuilt inside the guard meant to prevent stranding.
+ */
+export function cursorPastEnd(scan: { matched: number; startIndex: number }): boolean {
+  return scan.matched > 0 && scan.startIndex >= scan.matched;
+}
+
+/**
+ * "3–10 of 42" for one scan's page — descriptive only. startIndex is a
+ * position in a list a peer can prepend to, so it is fine for wording and
+ * useless for navigation; the cursor does the navigating.
+ *
+ * A cursor past the end is worded as such rather than as an inverted range.
+ * Every caller rewinds on that condition before painting, but the wording
+ * must not depend on each of them remembering to.
+ */
+export function pageRange(
+  scan: { matched: number; startIndex: number },
+  size: number,
+): string {
+  if (scan.matched === 0) return 'none held';
+  if (cursorPastEnd(scan)) return `past the end of ${scan.matched}`;
+  const shown = Math.min(size, scan.matched - scan.startIndex);
+  return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${scan.matched}`;
+}
+
+/**
+ * Whether a panel must show its pager.
+ *
+ * NOT "is there more than one page of records", which is what it used to ask.
+ * `matched` is recounted from the map on every repaint, so a peer who deletes
+ * enough earlier keys drops it to one page's worth WHILE THE READER IS PAST
+ * THAT PAGE — the block disappears, taking PREVIOUS with it, and everything
+ * behind the cursor is stranded. Deleting records to remove the control that
+ * reaches records is the same censorship shape as planting them, arrived at
+ * from the other side.
+ *
+ * So the question is whether this view is anywhere other than the whole list:
+ * a cursor with history behind it, a page that starts partway in, or a page
+ * with more after it. Any of those and the controls stay.
+ */
+export function pagerNeeded(
+  scan: ScanPosition,
+  size: number,
+  history: readonly (string | null)[],
+): boolean {
+  return (
+    scan.matched > size ||
+    scan.startIndex > 0 ||
+    scan.nextCursor !== null ||
+    history.length > 1
+  );
 }
 
 /** Largest allowance bound first — uses the no-parse mojo comparator. */

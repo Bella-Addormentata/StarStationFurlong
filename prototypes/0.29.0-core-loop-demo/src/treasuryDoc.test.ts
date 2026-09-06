@@ -54,7 +54,6 @@ import {
   readReceiptCache,
   readRegistration,
   readRegistrationResult,
-  readRoomBinding,
   readRoomBindingResult,
   scanCheckpoints,
   scanProposals,
@@ -272,13 +271,25 @@ describe('proposals', () => {
     // two to get wrong, so they are reported separately.
     const m = doc.getMap('treasury');
     const p = makeProposal();
+    const q = makeProposal({ payloadHash: '5'.repeat(64) });
     expect(putProposal(p)).toBe(true);
+    expect(putProposal(q)).toBe(true);
     for (let i = 0; i < 40; i++) m.set(`junk:${i}`, { i });
 
-    // Ordinary paging: more pages exist, but the walk saw the whole map.
+    // Ordinary paging: more pages exist, but the walk saw the whole map. This
+    // is the DISCRIMINATING state — truncated without discoveryCutShort — and
+    // the one-record version of this test never built it (one record paged at
+    // size one is not truncated either), so computing one flag from the other
+    // passed the suite. Two records at page size one is the smallest case
+    // that tells them apart.
     const paged = scanProposals(50_000, 1);
-    expect(paged.truncated).toBe(false); // one record, one page
+    expect(paged.truncated).toBe(true); // two records, a page of one
+    expect(paged.nextCursor).not.toBeNull(); // and NEXT really does arrive
     expect(paged.discoveryCutShort).toBe(false);
+    // The whole map on one page: neither flag.
+    const whole = scanProposals(50_000, 99);
+    expect(whole.truncated).toBe(false);
+    expect(whole.discoveryCutShort).toBe(false);
 
     // The walk itself stops early. Everything past it is unreachable by
     // paging, and the flag is what lets the screen say so.
@@ -811,6 +822,43 @@ describe('signing sessions', () => {
     expect(putSigningSession(base)).toBe(true); // overwrites the squatter
     expect(scanSigningSessions(shell.proposalId, 50_000, 50_000).items).toEqual([base]);
   });
+
+  it('refuses over-long shell keys before the sort, like every other scan', () => {
+    // The key-length bound is written out by hand here, apart from
+    // scanPrefixed's copy, and only that copy had a test: deleting this one
+    // passed the whole suite. Same attack as the proposal list — 30 keys
+    // sharing a 4,000-character prefix make every sort comparison walk it.
+    expect(putSigningSession(base)).toBe(true);
+    const long = `session:${shell.proposalId}:` + 'a'.repeat(4000);
+    for (let i = 0; i < 30; i++) doc.getMap('treasury').set(`${long}${i}`, { junk: i });
+    const scan = scanSigningSessions(shell.proposalId, 50_000, 8);
+    expect(scan.malformedKeys).toBe(30);
+    expect(scan.matched).toBe(1); // never collected, so never sorted
+    expect(scan.items.map((s) => s.sessionId)).toEqual([sessionId]);
+    expect(scan.truncated).toBe(false);
+  });
+
+  it('says when its own walk was cut short, and marks every wanted round partial', () => {
+    // The horizon flag is the author's stated disclosure on the one open
+    // review thread, and this scan sets it by hand rather than through
+    // scanPrefixed — so nothing pinned it here, and deleting it passed. The
+    // signature pass breaking early also has to flag every round on the page
+    // as possibly missing signatures, or a clipped round renders an exact
+    // "2 of 3".
+    expect(putSigningSession(base)).toBe(true);
+    for (let i = 0; i < 40; i++) doc.getMap('treasury').set(`junk:${i}`, { i });
+    const cut = scanSigningSessions(shell.proposalId, 5, 99);
+    expect(cut.discoveryCutShort).toBe(true);
+    expect(cut.truncated).toBe(true);
+    expect(cut.partialSessionIds).toContain(sessionId);
+    // Under the guard the same room reads clean, so the flag is the walk's
+    // and not the room's.
+    const roomy = scanSigningSessions(shell.proposalId, 50_000, 99);
+    expect(roomy.discoveryCutShort).toBe(false);
+    expect(roomy.truncated).toBe(false);
+    expect(roomy.partialSessionIds).toEqual([]);
+    expect(roomy.items).toHaveLength(1);
+  });
 });
 
 describe('network pinning', () => {
@@ -925,6 +973,31 @@ describe('verification caching', () => {
     // Wrong proposal id first: must miss, and must not be remembered as "bad".
     expect(scanSigningSessions('f'.repeat(64), 50_000, 50_000).items).toEqual([]);
     expect(scanSigningSessions(session.proposalId, 50_000, 50_000).items).toEqual([session]);
+  });
+
+  it('serves a repeat read from the memo instead of re-verifying', () => {
+    // Everything the memo's SAFETY needs was pinned — class scoping, the
+    // freeze, re-checking a replaced record — and that a hit ever HAPPENS was
+    // not: replacing the store with a no-op passed every test, while every
+    // repaint-cost figure in the commit history rests on it. So count the
+    // verifier's calls, which is the cost the memo exists to avoid.
+    let calls = 0;
+    const counting = (p: string, b: Uint8Array, s: string): boolean => {
+      calls += 1;
+      return verifier(p, b, s);
+    };
+    bindTreasuryDoc(doc, { verifySig: counting, networkGenesisChallenge: GENESIS });
+    const made = [0, 1, 2, 3, 4, 5].map((i) => makeProposal({ payloadHash: `${i}`.repeat(64) }));
+    for (const p of made) expect(putProposal(p)).toBe(true);
+    expect(scanProposals(999, 999).items).toHaveLength(6);
+    const afterFirstRead = calls;
+    // A repeat read of unchanged records: zero verifications.
+    expect(scanProposals(999, 999).items).toHaveLength(6);
+    expect(calls).toBe(afterFirstRead);
+    // A replaced record is a new object, so exactly one more — not six.
+    doc.getMap('treasury').set(`proposal:${made[0].proposalId}`, { ...made[0] });
+    expect(scanProposals(999, 999).items).toHaveLength(6);
+    expect(calls).toBe(afterFirstRead + 1);
   });
 
   it('returns a stable policy result without recomputing it', () => {
@@ -1235,8 +1308,8 @@ describe('verification caching', () => {
     const loop: Record<string, unknown> = {};
     loop.self = loop;
     m.set(`binding:room-cycle`, loop);
-    expect(() => readRoomBinding('room-cycle')).not.toThrow();
-    expect(readRoomBinding('room-cycle')).toBeNull();
+    expect(() => readRoomBindingResult('room-cycle')).not.toThrow();
+    expect(readRoomBindingResult('room-cycle').status).not.toBe('ok');
   });
 
   it('lets a player page past a flood of planted approval shells', () => {
@@ -1301,8 +1374,8 @@ describe('verification caching', () => {
     m.set(`binding:room-bin`, new Uint8Array([4, 5, 6]));
     expect(() => readProposal('8'.repeat(64))).not.toThrow();
     expect(readProposal('8'.repeat(64))).toBeNull();
-    expect(() => readRoomBinding('room-bin')).not.toThrow();
-    expect(readRoomBinding('room-bin')).toBeNull();
+    expect(() => readRoomBindingResult('room-bin')).not.toThrow();
+    expect(readRoomBindingResult('room-bin').status).not.toBe('ok');
     // The scan walks past it and still returns the honest record beside it.
     expect(() => scanProposals(99, 99)).not.toThrow();
     expect(scanProposals(99, 99).items).toEqual([p]);
@@ -1506,8 +1579,45 @@ describe('bindings, receipts, sync status, and lifecycle', () => {
       sig: sign(seedA, roomBindingSignatureBytes(unsigned)),
     };
     expect(putRoomBinding(binding)).toBe(true);
-    expect(readRoomBinding('room-42')).toEqual(binding);
+    expect(readRoomBindingResult('room-42')).toEqual({ status: 'ok', binding });
     expect(putRoomBinding({ ...binding, boundAtHeight: 11 })).toBe(false); // sig no longer covers
+  });
+
+  it('proves authorship only — the owner rule is a READ rule in the view layer', () => {
+    // This layer cannot authenticate who the room's owner is, so it must not
+    // pretend to: a binding under ANY key that verifies its own signature is
+    // written (the slot is plain-replace, invariant 5) and read back 'ok'.
+    // Whether that key is the room owner's is decided by treasuryView against
+    // the owner key the room document names live. Pinned here so nobody
+    // "helpfully" adds an owner gate to the write side, where it would only
+    // let a planted record brick honest re-puts.
+    const unsigned: Omit<RoomTreasuryBinding, 'sig'> = {
+      v: 1,
+      networkGenesisChallenge: GENESIS,
+      roomId: 'room-43',
+      companyId: 'b'.repeat(64),
+      treasuryLauncherId: 'c'.repeat(64),
+      policyVersion: 1,
+      profileId: 'profile-1',
+      boundByPub: pub(seedB), // not any room's owner — a fresh key
+      boundAtHeight: 10,
+      policyReceiptId: 'd'.repeat(64),
+    };
+    const stranger: RoomTreasuryBinding = {
+      ...unsigned,
+      sig: sign(seedB, roomBindingSignatureBytes(unsigned)),
+    };
+    expect(putRoomBinding(stranger)).toBe(true);
+    expect(readRoomBindingResult('room-43')).toEqual({ status: 'ok', binding: stranger });
+    // A signature under a key the record does NOT carry is still refused:
+    // authorship is exactly what this layer checks.
+    const forged: RoomTreasuryBinding = {
+      ...unsigned,
+      sig: sign(seedA, roomBindingSignatureBytes(unsigned)),
+    };
+    expect(putRoomBinding(forged)).toBe(false);
+    doc.getMap('treasury').set('binding:room-44', { ...forged, roomId: 'room-44' });
+    expect(readRoomBindingResult('room-44').status).toBe('unreadable');
   });
 
   it('stores sync status, rejects malformed status, and notifies subscribers', () => {

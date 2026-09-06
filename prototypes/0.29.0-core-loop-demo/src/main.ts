@@ -64,12 +64,17 @@ import { NO_NETWORK_PIN, treasuryNetwork } from "./treasuryNetwork";
 import {
   approvalsView,
   balanceView,
+  bindingSigner,
+  type BindingStanding,
   boardThresholdFor,
   boardView,
-  checkpointsFor,
+  cursorPastEnd,
   displayHeight,
+  droppedRecordsNote,
   formatHeight,
   governanceRuleFor,
+  pageRange,
+  pagerNeeded,
   payloadView,
   phaseLabel,
   proposalKindLabel,
@@ -80,11 +85,12 @@ import {
   TREASURY_LABEL,
   TREASURY_MUTED,
   roomFundingView,
+  scopeCheckpoints,
   scopeProposals,
+  scopeSessions,
   advanceCursorPair,
   missingProposalNote,
   retreatCursorPair,
-  sessionsFor,
   shareClassViews,
   shortId,
   syncView,
@@ -94,7 +100,7 @@ import {
 } from "./treasuryView";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
-import { bindGamesDoc } from "./games/gamesDoc";
+import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -1268,6 +1274,10 @@ async function joinRoomAtEpoch(
     // network, and any peer could publish records under it.
     networkGenesisChallenge: treasuryNetwork().genesisChallenge ?? NO_NETWORK_PIN,
   });
+  // A new document means a new key space: every treasury cursor, offset and
+  // open-detail id was minted against the previous room's map and is junk
+  // here. See resetTreasuryNavigation for what applying them anyway did.
+  resetTreasuryNavigation();
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
   (window as any).__ssfDoc = sync.doc;
@@ -1636,6 +1646,12 @@ async function joinRoomAtEpoch(
 
   roomMap.observe((_event) => {
     updateRoomUI();
+    // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
+    // is, read live from this map and the players map — so an owner change
+    // must repaint it, or a demoted binding keeps its badge until some
+    // unrelated treasury write happens along. Coalesced, and a no-op while
+    // the view is off screen.
+    queueTreasuryRepaint();
     // 🌌 Re-paint the room's backdrop + lighting when its theme syncs in or an
     // owner flips it (a provisioned deck arrives 'interior' pre-sync, then the
     // host's roomInfo['theme'] lands — repaint to outdoor-deck). Guarded so
@@ -1656,6 +1672,9 @@ async function joinRoomAtEpoch(
     renderPhonePlayersList();
     updateRoomUI();
     harvestRoomPlayersIntoMesh(playersMap);
+    // 🏦 The owner's identity key lives in THIS map (players[owner].keyB64)
+    // and can land after roomInfo — the OWNER UNKNOWN → OWNER-SIGNED flip.
+    queueTreasuryRepaint();
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -2845,47 +2864,34 @@ let lastApprovalNext: string | null = null;
 const CLASS_PAGE = 24;
 let treasuryClassOffset = 0;
 
-/**
- * "3–10 of 42" for one scan's page — descriptive only.
- *
- * startIndex is a position in a list a peer can prepend to, so it is fine for
- * wording and useless for navigation; the cursor does the navigating.
- */
-function pageRange(
-  scan: { matched: number; startIndex: number; items: unknown[] },
-  size: number,
-): string {
-  if (scan.matched === 0) return "none held";
-  const shown = Math.min(size, scan.matched - scan.startIndex);
-  return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${scan.matched}`;
-}
+// pageRange, pagerNeeded and cursorPastEnd live in treasuryView.ts now, where
+// they are unit-tested against real scan shapes. Pinned here only by regexes
+// over this file's source, pageRange shipped an inverted "9–8 of 8" for a
+// cursor left past the end.
 
 /**
- * Whether this panel must show its pager.
+ * Every piece of treasury navigation state, back to the first page.
  *
- * NOT "is there more than one page of records", which is what it used to ask.
- * `matched` is recounted from the map on every repaint, so a peer who deletes
- * enough earlier keys drops it to one page's worth WHILE THE READER IS PAST
- * THAT PAGE — the block disappears, taking PREVIOUS with it, and everything
- * behind the cursor is stranded. Deleting records to remove the control that
- * reaches records is the same censorship shape as planting them, arrived at
- * from the other side.
- *
- * So the question is whether this view is anywhere other than the whole list:
- * a cursor with history behind it, a page that starts partway in, or a page
- * with more after it. Any of those and the controls stay.
+ * All of it is module-level and until now nothing at the join seam touched
+ * it, so it outlived the room it described: a cursor stack built from room
+ * A's proposal keys was applied to room B's map on the next paint — keys are
+ * content hashes, so roughly half of B's records were skipped and the first
+ * screen read "Showing records 5–9 of 9" with a PREVIOUS control — and an
+ * open detail id from room A was looked up in room B and reported as no
+ * longer in the room's records. A cursor is a key in ONE document's key
+ * space; it means nothing in another.
  */
-function pagerNeeded(
-  scan: { matched: number; startIndex: number; nextCursor: string | null },
-  size: number,
-  history: readonly (string | null)[],
-): boolean {
-  return (
-    scan.matched > size ||
-    scan.startIndex > 0 ||
-    scan.nextCursor !== null ||
-    history.length > 1
-  );
+function resetTreasuryNavigation(): void {
+  treasuryDetailId = "";
+  treasuryListCursors = [null];
+  treasuryApprovalCursors = [null];
+  treasuryVoteCursors = [null];
+  treasuryCheckpointCursors = [null];
+  treasuryClassOffset = 0;
+  lastListNext = null;
+  lastVoteNext = null;
+  lastCheckpointNext = null;
+  lastApprovalNext = null;
 }
 
 /**
@@ -3166,6 +3172,13 @@ function paintTreasuryBody(view: HTMLElement): void {
   const badge = (
     id: string | null,
     tag: { level: string; label: string; detail: string },
+    /**
+     * Overrides the level's colour. Used by the funding badge alone: the room
+     * terminal refuses green on that panel because green reads as "funded,
+     * currently", which nothing here establishes — and the phone painted the
+     * very same state green. Blue is the terminal's held-record colour.
+     */
+    colorOverride?: string,
   ) => {
     const focusable = id !== null;
     // UNVERIFIED and NO DATA were a 45%-alpha gold, which composites over the
@@ -3175,11 +3188,12 @@ function paintTreasuryBody(view: HTMLElement): void {
     // than the ~12:1 SIGNED and SELF-CHECKED badges, so the hierarchy the
     // dimming was for survives without costing legibility.
     const color =
-      tag.level === "signed"
+      colorOverride ??
+      (tag.level === "signed"
         ? "#7ddb8f"
         : tag.level === "self-checked"
           ? "#f0c060"
-          : TREASURY_MUTED;
+          : TREASURY_MUTED);
     // Focusable and labelled: the qualification behind a badge (a signature
     // shows authorship, not authority) is the whole point of showing it, and
     // a title tooltip on an inert span never reaches a keyboard user.
@@ -3254,10 +3268,25 @@ function paintTreasuryBody(view: HTMLElement): void {
   // let a peer neutralise the signed binding and have their own policy name
   // the company for the whole screen.
   const bindingResult = readable ? readRoomBindingResult(roomId) : null;
+  const heldBinding = bindingResult?.status === "ok" ? bindingResult.binding : null;
+  // WHO signed it, read live from the room document — the room-side half of
+  // plan §10.1. The cache layer proved authorship under the record's own key
+  // and nothing more: any peer can mint a key and write a binding naming any
+  // company over this slot. Only the room owner's signature makes it the
+  // room's binding, and only that binding may decide which company this
+  // screen presents. (Issue #138: readRoomOwnerKey is where an NFT-deed
+  // authority head would replace the players-map chain; nothing here moves.)
+  const ownerKey = readRoomOwnerKey();
+  const standing: BindingStanding =
+    bindingResult === null || bindingResult.status === "absent"
+      ? "absent"
+      : bindingResult.status !== "ok"
+        ? bindingResult.status
+        : bindingSigner(bindingResult.binding, ownerKey);
   const scope = companyScope(
-    bindingResult?.status === "ok" ? bindingResult.binding : null,
+    standing === "owner" ? heldBinding : null,
     policyCache?.policy ?? null,
-    bindingResult?.status === "unreadable" || bindingResult?.status === "too-large",
+    standing,
   );
 
   // The local verdict, always first: this device is not verifying the chain,
@@ -3374,54 +3403,73 @@ function paintTreasuryBody(view: HTMLElement): void {
     // sent it straight to its end, and the reverse would have restarted the
     // vote scan and re-counted votes already shown. One control still advances
     // both, but each advances along its own keys.
-    const voteScan = scanVotes(
-      proposal.proposalId,
-      DETAIL_SCAN,
-      DETAIL_PAGE,
-      treasuryVoteCursors[treasuryVoteCursors.length - 1],
-    );
-    const cpScan = scanCheckpoints(
-      proposal.proposalId,
-      DETAIL_SCAN,
-      DETAIL_PAGE,
-      treasuryCheckpointCursors[treasuryCheckpointCursors.length - 1],
-    );
+    const scanVotePair = () => ({
+      votes: scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteCursors[treasuryVoteCursors.length - 1]),
+      checkpoints: scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryCheckpointCursors[treasuryCheckpointCursors.length - 1]),
+    });
+    let { votes: voteScan, checkpoints: cpScan } = scanVotePair();
+    // Records LEAVING can put a cursor past every remaining key, exactly as
+    // they can on the list — and this screen had no rewind, so it printed
+    // "Votes: 9–8 of 8" and a tally of 0 for a room still holding a page of
+    // verified votes behind the cursor. Rewound as a PAIR, because the two
+    // histories must stay the same height (see advanceCursorPair): a side that
+    // is not past its end goes back one page with the other, which is what
+    // PREVIOUS would have done. Same condition as the list — past the end,
+    // never merely empty. An all-rejected page is empty with its keys still
+    // there, and rewinding on that is the censorship hole the list closed.
+    while (
+      (cursorPastEnd(voteScan) || cursorPastEnd(cpScan)) &&
+      (treasuryVoteCursors.length > 1 || treasuryCheckpointCursors.length > 1)
+    ) {
+      const moved = retreatCursorPair({ a: treasuryVoteCursors, b: treasuryCheckpointCursors });
+      treasuryVoteCursors = [...moved.a];
+      treasuryCheckpointCursors = [...moved.b];
+      ({ votes: voteScan, checkpoints: cpScan } = scanVotePair());
+    }
     lastVoteNext = voteScan.nextCursor;
     lastCheckpointNext = cpScan.nextCursor;
     // Paged, for the same reason the proposal list is: shells are unsigned and
     // peer-writable, so decoys sorted ahead of the genuine round would
     // otherwise put it permanently out of reach.
-    const sessionScan = scanSigningSessions(
-      proposal.proposalId,
-      DETAIL_SCAN,
-      DETAIL_PAGE,
-      treasuryApprovalCursors[treasuryApprovalCursors.length - 1],
-    );
+    const scanRounds = () =>
+      scanSigningSessions(proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryApprovalCursors[treasuryApprovalCursors.length - 1]);
+    let sessionScan = scanRounds();
+    // The same rewind, on this screen's own key space.
+    while (cursorPastEnd(sessionScan) && treasuryApprovalCursors.length > 1) {
+      treasuryApprovalCursors.pop();
+      sessionScan = scanRounds();
+    }
     lastApprovalNext = sessionScan.nextCursor;
     // Only the two scans that FEED the vote panel. Including the approval scan
     // made a proposal with many approval rounds tell the VOTES panel its own
     // figures were partial when they were complete — and approval truncation
     // already has its own warning where it belongs.
     const votesPartial = voteScan.truncated || cpScan.truncated;
-    const votes = voteTallyView(
-      voteScan.items,
-      // Vote records are keyed by proposal id alone, so one filed under
-      // another company must not be counted among this proposal's.
-      checkpointsFor(cpScan.items, proposal),
-    );
+    // Vote records are keyed by proposal id alone, so one filed under another
+    // company must not be counted among this proposal's — and what the filter
+    // drops is said on screen, not swallowed.
+    const scopedCheckpoints = scopeCheckpoints(cpScan.items, proposal);
+    const votes = voteTallyView(voteScan.items, scopedCheckpoints.kept);
+    const droppedVoteRecords = droppedRecordsNote(scopedCheckpoints.dropped, "vote record");
     // Rounds and thresholds only count when they belong to THIS proposal's
     // company and policy revision — both are peer-writable.
+    const scopedSessions = scopeSessions(sessionScan.items, proposal);
+    const droppedRounds = droppedRecordsNote(scopedSessions.dropped, "approval round");
     const approvals = approvalsView(
-      sessionsFor(sessionScan.items, proposal),
+      scopedSessions.kept,
       boardThresholdFor(proposal, policyCache?.policy ?? null),
       height,
       // Whether these rounds are ALL of them. Anything cut short, paged over,
-      // rejected or refused means the panel must not assert that no round is
-      // open — the warnings under it already say one might be.
+      // rejected, refused — or set aside as another company's — means the
+      // panel must not assert that no round is open. The filter was the gap:
+      // the scan-level counts saw a clean page while the one round the room
+      // held under this proposal's keys was discarded for its company id, and
+      // the panel said "No approval round open in this room" as fact.
       !sessionScan.truncated &&
         sessionScan.rejected === 0 &&
         sessionScan.refusedTooLarge === 0 &&
-        sessionScan.matched <= DETAIL_PAGE,
+        sessionScan.matched <= DETAIL_PAGE &&
+        scopedSessions.dropped === 0,
     );
     // Only the round whose count is on screen. A scan-wide flag put an
     // "at least" on a complete round whenever some OTHER round — expired,
@@ -3476,6 +3524,7 @@ function paintTreasuryBody(view: HTMLElement): void {
       ${row("Vote records held", `${votes.records}`)}
       ${dim(esc(votes.note))}
       ${dim(esc(votes.caveat))}
+      ${droppedVoteRecords ? dim(esc(droppedVoteRecords)) : ""}
       ${
         votesPartial
           ? dim(
@@ -3573,6 +3622,7 @@ function paintTreasuryBody(view: HTMLElement): void {
           : ""
       }
       ${dim(esc(approvals.note))}
+      ${droppedRounds ? dim(esc(droppedRounds)) : ""}
       ${
         // Reachability, not just disclosure. Rounds are peer-writable, so
         // without a way to page past planted ones the genuine round's progress
@@ -3650,7 +3700,7 @@ function paintTreasuryBody(view: HTMLElement): void {
   // bindingResult comes from above — one read, so the funding headline and the
   // company scope can never disagree about whether a binding is here.
   const binding = roomFundingView(
-    bindingResult?.status === "ok" ? bindingResult.binding : null,
+    heldBinding,
     height,
     // Every held-but-unusable state travels, not just the size refusal: a
     // binding this room HAS but this device will not or cannot read is never
@@ -3658,6 +3708,7 @@ function paintTreasuryBody(view: HTMLElement): void {
     bindingResult && bindingResult.status !== "ok" && bindingResult.status !== "absent"
       ? bindingResult.status
       : access,
+    ownerKey,
   );
   const balances = balanceView();
   const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
@@ -3690,7 +3741,10 @@ function paintTreasuryBody(view: HTMLElement): void {
   // in front of an honest proposal: "next" reached the bad page, this loop
   // bounced straight back, and the honest page after it was unreachable —
   // the censorship hole rebuilt inside the guard meant to prevent stranding.
-  while (page.startIndex >= page.matched && page.matched > 0 && treasuryListCursors.length > 1) {
+  // The condition is cursorPastEnd, shared with the detail screen and
+  // unit-tested there — not a hand-rolled copy, which is how the detail scans
+  // came to have no rewind at all.
+  while (cursorPastEnd(page) && treasuryListCursors.length > 1) {
     treasuryListCursors.pop();
     page = scanProposals(
       LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
@@ -3725,7 +3779,7 @@ function paintTreasuryBody(view: HTMLElement): void {
     ${header("THIS ROOM")}
     <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
       <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(binding.headline)}</span>
-      ${badge("funding", binding.trust)}
+      ${badge("funding", binding.trust, binding.trust.level === "signed" ? "#3E92B8" : undefined)}
     </div>
     ${
       binding.bound
@@ -3739,6 +3793,22 @@ function paintTreasuryBody(view: HTMLElement): void {
             : "")
         : ""
     }
+    ${
+      // The signer, ALWAYS named when a record is held. A binding whose
+      // author the screen never shows is one a peer can forge without anyone
+      // noticing whose key it carries. "Bound by" only when the signer IS the
+      // room owner; a record refused, or not yet tied to the owner, is merely
+      // "signed by" — the rows above may still show it as the claim it is,
+      // but this label must not upgrade it.
+      binding.signerLabel
+        ? row(binding.signer === "owner" ? "Bound by" : "Signed by", esc(binding.signerLabel))
+        : ""
+    }
+    ${
+      // The company-side half of §10.1, stated as not checked, so the owner's
+      // signature is never read as the company's consent.
+      binding.companyApproval ? row("Company approval", esc(binding.companyApproval)) : ""
+    }
     ${dim(esc(binding.detail))}
     ${binding.expiryNote ? dim(esc(binding.expiryNote)) : ""}
     ${dim(esc(binding.readOnlyNote))}
@@ -3749,6 +3819,14 @@ function paintTreasuryBody(view: HTMLElement): void {
     ${dim(esc(balances.detail))}
 
     ${header("COMPANY")}
+    ${
+      // What the company below rests on, when it is the policy cache alone.
+      // Every HELD binding state withholds this block; only an empty slot lets
+      // the freely writable policy name the company — which makes deleting
+      // the binding a hostile peer's cheapest move, so the fallback says what
+      // it is rather than looking like an anchored one.
+      scope.note ? dim(esc(scope.note)) : ""
+    }
     ${
       scope.warning
         ? dim(esc(scope.warning))
@@ -4006,6 +4084,19 @@ function paintTreasuryBody(view: HTMLElement): void {
       // showing. The unconfigured case keeps its fuller explanation in the
       // banner above and is not repeated here.
       net.configured ? row("Records pinned to", esc(net.label)) : ""
+    }
+    ${
+      // The pin ITSELF, not only its name. `label` is an operator's free-text
+      // string with no tie to the genesis the cache is pinned to, so two
+      // builds pinned to different networks under one label looked identical
+      // on screen, and a build with only the required genesis set read
+      // "Records pinned to configured network" — a row naming no network at
+      // all. Shown in full and selectable, like the policy fingerprint above,
+      // because a shortened hash cannot be compared against anything.
+      net.configured && net.genesisChallenge
+        ? `<div style="font-size:10px; color:${TREASURY_LABEL}; margin-top:5px;">Network genesis</div>
+           <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against your own node's network">${esc(net.genesisChallenge)}</div>`
+        : ""
     }
     ${row("This device", "not verifying")}
     ${

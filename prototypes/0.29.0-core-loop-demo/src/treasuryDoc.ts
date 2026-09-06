@@ -10,7 +10,7 @@
 // guards first, then id recomputation, then signature verification. Malformed
 // or unverifiable entries are skipped, never thrown into money paths.
 //
-// Key layout (plan §14 pins the first seven; the rest follow its convention):
+// Key layout (plan §14 pins all thirteen — expanded 2026-09-05 to match this file):
 //   policy                                  -> CompanyTreasuryPolicy cache
 //   proposal:<proposalId>                   -> TreasuryProposal      (signed)
 //   vote:<proposalId>:<voterGamePub>        -> TreasuryVote          (signed)
@@ -32,7 +32,7 @@
 // (Registrations and windows carry no genesis field; they anchor to a
 // genesis-bound proposal by id and to chain observations the node verifies.)
 //
-// The vote slot is keyed by voterGamePub (plan §14's voterPub) — the identity
+// The vote slot is keyed by voterGamePub — the identity
 // gameSig AUTHENTICATES, so nobody can squat another voter's slot: a record
 // claiming a slot must carry that slot's pub and verify against it. The §7.2
 // dedup rule ("greatest per-voter sequence; equal sequence -> smallest
@@ -579,9 +579,14 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
  * means "this view is partial and its contents are an arbitrary subset",
  * never "the first N".
  *
- * The lasting fix is a per-class index so each record type can be reached
- * without walking shared space, plus validation moved off the render path;
- * that belongs with the op-log durability work the plans already schedule.
+ * The lasting fix is a reader-side per-record-class index in the reader's
+ * own first-seen order, kept current from this map's observe events, so a
+ * page is looked up rather than rebuilt by walking. No plan scheduled it when
+ * this shipped (an earlier version of this comment pointed at the op-log,
+ * which is an authority ledger and pages nothing); it is PR C.1 in the
+ * sovereign plan §11, gating the governance lane, and the horizon below
+ * stands, disclosed, until it lands. Validation off the render path is a
+ * separate improvement and does not remove the horizon.
  */
 /**
  * A runaway guard on key EXAMINATION, deliberately far above any plausible
@@ -606,9 +611,22 @@ export function readProposal(proposalId: string): TreasuryProposal | null {
  * cursor mistake that cursors were introduced to fix, one level further down
  * — a writer inserting ahead of the resume point pushes content past it
  * exactly as fast as the reader advances. Nor can the resume point be a KEY,
- * since a writer can delete it and strand the walk. The fix is the per-record
- * class index the plan schedules with the op-log work: an ordering the reader
- * controls, rather than a better way to walk one it does not.
+ * since a writer can delete it and strand the walk. The fix is an ordering
+ * the reader controls — a first-seen index maintained from observe events,
+ * which sees every key once at integration and never re-walks, so a key once
+ * seen can never be pushed later — rather than a better way to walk an order
+ * it does not control. (A lexicographic index would remove the horizon but
+ * not the grind gap the cursor comment below describes.) That is sovereign
+ * plan §11 PR C.1. Until it lands this constant is a disclosed limit of the
+ * read-only screen, decided there for this screen only: nothing on it acts
+ * on a record, the loss is stated on screen, and under sovereign §5 no vote's
+ * countability depends on a display. The map itself is the vote transport
+ * and the data-availability store behind checkpoint roots, not a display
+ * cache — so the same bound in any other reader, a governance-lane screen or
+ * a node building a checkpoint root from its replica, is a censorship tool
+ * and is not covered by that decision. Note the walk order is steerable on a
+ * fresh joiner (Yjs integrates the highest client id first), so what a flood
+ * hides reproduces on every new device.
  */
 const MAX_KEYS_EXAMINED = 50_000;
 
@@ -1533,6 +1551,29 @@ function validBindingUncached(value: unknown): value is RoomTreasuryBinding {
   }
 }
 
+/**
+ * Writes a binding. Deliberately NOT owner-gated, and deliberately
+ * plain-replace (invariant 5): this layer cannot authenticate who the room's
+ * owner is, so an occupancy rule here would only let a planted record brick
+ * honest re-puts. What `validBinding` proves is authorship — `sig` verifies
+ * under the record's own `boundByPub` — and the read side says exactly that
+ * and no more. Whether that key is the ROOM OWNER's is decided where the
+ * owner key can be read live (treasuryView.bindingSigner against
+ * gamesDoc.readRoomOwnerKey), the same read-side split main.ts's owner gates
+ * use; and
+ * whether the COMPANY agreed is a chain fact for the node lane. See
+ * RoomTreasuryBinding for the writer rule PR F must follow.
+ *
+ * DELETION IS NOT REVOCATION. The slot has no sequence, no tombstone and no
+ * reader watermark, so any binding the owner ever signed can be re-put by
+ * anyone who kept a copy, and it reads OWNER-SIGNED again; with one slot,
+ * whichever write lands last wins. That is safe today only because PR C ships
+ * no writer, so no honest record exists to replay, and the only revocation
+ * available is the owner rotating their identity key. Hard preconditions for
+ * the first writer (PR F): a signed unbind tombstone carrying seq/height,
+ * highest-seq-wins on read, and a per-reader watermark — before any honest
+ * binding is written.
+ */
 export function putRoomBinding(binding: RoomTreasuryBinding): boolean {
   if (!validBinding(binding)) return false;
   return put(`binding:${binding.roomId}`, binding);
@@ -1563,10 +1604,12 @@ export function readRoomBindingResult(roomId: string): RoomBindingResult {
   return { status: 'ok', binding: value as RoomTreasuryBinding };
 }
 
-export function readRoomBinding(roomId: string): RoomTreasuryBinding | null {
-  const result = readRoomBindingResult(roomId);
-  return result.status === 'ok' ? result.binding : null;
-}
+// There is deliberately no plain readRoomBinding() wrapper any more. A reader
+// that answers "held but unusable" with the same null it uses for an empty
+// slot is the trap the phone closed once already (a neutralised binding let
+// a peer's policy name the company for the whole screen); with the signer
+// verdict now layered on top, the next caller must start from the result form
+// and decide what each state means on screen.
 
 // §13.1's immutable-body rule is enforced where receipts are VERIFIABLE —
 // against the chain facts they anchor to (spendBundleId, confirmation), the

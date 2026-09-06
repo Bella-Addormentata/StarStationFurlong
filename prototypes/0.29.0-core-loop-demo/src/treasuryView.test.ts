@@ -20,13 +20,17 @@ import type {
   TreasuryVote,
 } from './treasuryTypes';
 import { deriveProposalWindows } from './treasuryTypes';
+import * as Y from 'yjs';
+import { bindGamesDoc, readRoomOwnerKey } from './games/gamesDoc';
 import contracts from '../test-vectors/treasury/treasury-contracts.json';
 import {
   advanceCursorPair,
   approvalsView,
   balanceView,
+  bindingSigner,
   boardView,
   displayHeight,
+  keyFingerprint,
   formatAmount,
   formatHeight,
   missingProposalNote,
@@ -35,10 +39,16 @@ import {
   boardThresholdFor,
   checkpointsFor,
   companyScope,
+  cursorPastEnd,
+  droppedRecordsNote,
   formatXch,
   governanceRuleFor,
+  pageRange,
+  pagerNeeded,
   payloadView,
   phaseLabel,
+  scopeCheckpoints,
+  scopeSessions,
   sessionsFor,
   proposalKindLabel,
   proposalPhase,
@@ -298,6 +308,23 @@ describe('matching records to the proposal they claim', () => {
     } as TreasuryCheckpoint);
     const mine = cp(proposal.companyId);
     expect(checkpointsFor([mine, cp('9'.repeat(64))], proposal)).toEqual([mine]);
+    // And says how many it dropped: a silent filter turned a foreign record
+    // held under this proposal's keys into "Vote records held: 0" as fact.
+    const scoped = scopeCheckpoints([mine, cp('9'.repeat(64)), cp('8'.repeat(64))], proposal);
+    expect(scoped.kept).toEqual([mine]);
+    expect(scoped.dropped).toBe(2);
+    expect(scopeCheckpoints([mine], proposal).dropped).toBe(0);
+  });
+
+  it('words what was dropped as held-but-not-counted, and says nothing when nothing was', () => {
+    expect(droppedRecordsNote(0, 'approval round')).toBeNull();
+    const one = droppedRecordsNote(1, 'approval round');
+    expect(one).toMatch(/^1 approval round held under this proposal/);
+    expect(one).toMatch(/different company or policy revision/);
+    expect(one).toMatch(/not counted above/);
+    const many = droppedRecordsNote(3, 'vote record');
+    expect(many).toMatch(/^3 vote records held under this proposal/);
+    expect(many).toMatch(/are not counted above/);
   });
 
   it('drops approval rounds belonging to another company or revision', () => {
@@ -315,16 +342,27 @@ describe('matching records to the proposal they claim', () => {
       ...over,
     });
     const mine = round({});
-    const kept = sessionsFor(
-      [
-        mine,
-        round({ companyId: '9'.repeat(64) }),
-        round({ policyVersion: proposal.policyVersion + 1 }),
-        round({ proposalId: '9'.repeat(64) }),
-      ],
-      proposal,
-    );
-    expect(kept).toEqual([mine]);
+    const all = [
+      mine,
+      round({ companyId: '9'.repeat(64) }),
+      round({ policyVersion: proposal.policyVersion + 1 }),
+      round({ proposalId: '9'.repeat(64) }),
+    ];
+    expect(sessionsFor(all, proposal)).toEqual([mine]);
+    // The dropped count is what stops the approvals panel from asserting "No
+    // approval round open in this room" over a round it just set aside: the
+    // scan-level counts see a clean page, so only the filter can say.
+    const scoped = scopeSessions(all, proposal);
+    expect(scoped.kept).toEqual([mine]);
+    expect(scoped.dropped).toBe(3);
+    // A foreign round alone, with nothing else wrong on the page: the panel
+    // must be told the view is incomplete, and then must not claim absence.
+    const foreignOnly = scopeSessions([round({ companyId: '9'.repeat(64) })], proposal);
+    expect(foreignOnly.kept).toEqual([]);
+    expect(foreignOnly.dropped).toBe(1);
+    const note = approvalsView(foreignOnly.kept, null, 5_000_000, foreignOnly.dropped === 0).note;
+    expect(note).not.toMatch(/no approval round open in this room/i);
+    expect(note).toMatch(/not the same as there being none/i);
   });
 });
 
@@ -420,7 +458,7 @@ describe('company scope', () => {
     // The binding is signed; the policy cache is replaceable. A peer writing
     // a policy for another company must not get its board rendered beside
     // this room's real funding line.
-    const s = companyScope(binding('a'.repeat(64)), { ...policy, companyId: 'b'.repeat(64) });
+    const s = companyScope(binding('a'.repeat(64)), { ...policy, companyId: 'b'.repeat(64) }, 'owner');
     expect(s.mismatch).toBe(true);
     expect(s.companyId).toBeNull();
     expect(s.warning).toMatch(/do not match/i);
@@ -437,17 +475,17 @@ describe('company scope', () => {
     const s = companyScope(binding(policy.companyId), {
       ...policy,
       treasuryLauncherId: '9'.repeat(64),
-    });
+    }, 'owner');
     expect(s.mismatch).toBe(true);
     expect(s.companyId).toBeNull();
   });
 
   it('uses the agreed company, or whichever one is known', () => {
-    const agreed = companyScope(binding(policy.companyId), policy);
+    const agreed = companyScope(binding(policy.companyId), policy, 'owner');
     expect(agreed.mismatch).toBe(false);
     expect(agreed.companyId).toBe(policy.companyId);
     expect(companyScope(null, policy).companyId).toBe(policy.companyId);
-    expect(companyScope(binding('e'.repeat(64)), null).companyId).toBe('e'.repeat(64));
+    expect(companyScope(binding('e'.repeat(64)), null, 'owner').companyId).toBe('e'.repeat(64));
     expect(companyScope(null, null).companyId).toBeNull();
   });
 });
@@ -769,13 +807,15 @@ describe('policy, shares, and room funding', () => {
     // a policy of your choosing put YOUR company's board, fingerprint and
     // proposals on someone else's room screen.
     const otherPolicy = { ...policy, companyId: 'd'.repeat(64) } as CompanyTreasuryPolicy;
-    const held = companyScope(null, otherPolicy, true);
-    expect(held.companyId).toBeNull();
-    expect(held.mismatch).toBe(true);
-    expect(held.warning).toMatch(/cannot be read/i);
+    for (const standing of ['unreadable', 'too-large'] as const) {
+      const held = companyScope(null, otherPolicy, standing);
+      expect(held.companyId).toBeNull();
+      expect(held.mismatch).toBe(true);
+      expect(held.warning).toMatch(/cannot be read/i);
+    }
     // With no binding held at all, the policy may still stand alone — that is
     // an ordinary room that has not been bound yet, not a neutralised anchor.
-    const unbound = companyScope(null, otherPolicy, false);
+    const unbound = companyScope(null, otherPolicy, 'absent');
     expect(unbound.companyId).toBe('d'.repeat(64));
     expect(unbound.mismatch).toBe(false);
   });
@@ -794,15 +834,16 @@ describe('policy, shares, and room funding', () => {
       policyReceiptId: 'd'.repeat(64),
       sig: 'sig',
     };
-    const bound = roomFundingView(binding);
+    const bound = roomFundingView(binding, null, 'readable', { status: 'known', pub: 'pub', source: 'room-doc' });
     expect(bound.bound).toBe(true);
     expect(bound.policyVersion).toBe(2);
     expect(bound.trust.level).toBe('signed');
     expect(bound.detail).toMatch(/edit rights/i);
     expect(bound.profileId).toBe('p1');
     expect(bound.treasuryId).toBe('c'.repeat(64));
-    // A signature says who wrote it — never that they were entitled to.
-    expect(bound.trust.detail).toMatch(/not that they were allowed to/i);
+    // The owner's signature says the owner bound the room — never that the
+    // company agreed to fund it, which is the chain's to say.
+    expect(bound.trust.detail).toMatch(/not that the company agreed/i);
   });
 });
 
@@ -896,7 +937,9 @@ describe('player vocabulary rule', () => {
   it('never emits banned chain jargon in any display string', () => {
     // The plans' language rule: players see venture/company/shares/Registry;
     // singleton, CAT, vault and checkpoint coin must never reach game UI.
-    const banned = /\b(singleton|vault|checkpoint coin|mojo)\b|\bCAT\b/i;
+    // "trustless" too: the amendment (§15.5) reserves it for claims a node
+    // verified locally, and nothing on this screen is one.
+    const banned = /\b(singleton|vault|checkpoint coin|mojo|trustless)\b|\bCAT\b/i;
     const subject = {
       ...(contracts.proposal.unsigned as object),
       proposalId: registration.proposalId,
@@ -915,6 +958,20 @@ describe('player vocabulary rule', () => {
       boardView(policy).note,
       roomFundingView(null).headline,
       roomFundingView(null).detail,
+      // Every signer state's strings, and every scope warning.
+      ...[
+        { status: 'known', pub: 'k'.repeat(43), source: 'room-doc' } as const,
+        { status: 'known', pub: 'k'.repeat(43), source: 'head-verified' } as const,
+        { status: 'known', pub: 'k'.repeat(43), source: 'head-unverified' } as const,
+        { status: 'known', pub: 'z'.repeat(43), source: 'room-doc' } as const,
+        { status: 'unknown' } as const,
+        { status: 'legacy' } as const,
+      ].flatMap((owner) => {
+        const v = roomFundingView(VOCAB_BINDING, null, 'readable', owner);
+        return [v.headline, v.detail, v.trust.label, v.trust.detail, v.signerLabel ?? '', v.companyApproval ?? ''];
+      }),
+      ...(['absent', 'unreadable', 'too-large', 'owner', 'owner-unknown', 'no-owner-key', 'not-owner'] as const)
+        .flatMap((s) => [companyScope(null, policy, s).warning ?? '', companyScope(null, policy, s).note ?? '']),
       voteTallyView([], []).note,
       voteTallyView([], []).caveat,
       approvalsView([], null).note,
@@ -1028,12 +1085,27 @@ describe('player vocabulary rule', () => {
     // The view module is only half the surface: the strings a player actually
     // reads are literals in the render function, the terminal panel and the
     // markup. Scan those directly, scoped to the treasury code.
-    const banned = /\b(singleton|vault|checkpoint coin)\b|\bCAT\b/i;
+    const banned = /\b(singleton|vault|checkpoint coin|trustless)\b|\bCAT\b/i;
     const root = dirname(fileURLToPath(import.meta.url));
     const treasuryBlocks: { where: string; text: string }[] = [];
     const push = (where: string, text: string) => treasuryBlocks.push({ where, text });
     push('treasuryView.ts', readFileSync(join(root, 'treasuryView.ts'), 'utf8'));
     push('treasuryNetwork.ts', readFileSync(join(root, 'treasuryNetwork.ts'), 'utf8'));
+    // Two treasury strings a player reads BEFORE the treasury opens, and both
+    // sat outside every slice below: the VENTURES row that opens it, and the
+    // phone-app registry entry that titles it. A rename to "board · vault ›"
+    // would have shipped with this guard green.
+    const mainSrc = readFileSync(join(root, 'main.ts'), 'utf8');
+    const venturesRow = mainSrc.indexOf('data-phone-app="treasury"');
+    expect(venturesRow, 'VENTURES row that opens the treasury not found').toBeGreaterThan(-1);
+    const venturesSlice = mainSrc.slice(venturesRow - 300, venturesRow + 600);
+    expect(venturesSlice).toContain('🏦 TREASURY');
+    push('main.ts VENTURES row', venturesSlice);
+    const registry = mainSrc.indexOf('elId: "phone-app-treasury"');
+    expect(registry, 'phone-app registry entry for the treasury not found').toBeGreaterThan(-1);
+    const registrySlice = mainSrc.slice(registry - 100, registry + 300);
+    expect(registrySlice).toContain('🏦 TREASURY');
+    push('main.ts phone-app registry', registrySlice);
     // main.ts: just the function that builds the markup. Not
     // renderTreasuryApp (the focus-preserving wrapper) and not
     // paintTreasuryApp (now the guard plus two calls) — either would scan
@@ -1168,13 +1240,90 @@ describe('pager visibility', () => {
   const main = readFileSync(join(root, 'main.ts'), 'utf8');
 
   it('asks where the reader is, not how many records remain', () => {
-    const fn = main.slice(
-      main.indexOf('function pagerNeeded('),
-      main.indexOf('function paintTreasuryApp('),
-    );
-    expect(fn).toContain('scan.startIndex > 0');
-    expect(fn).toContain('scan.nextCursor !== null');
-    expect(fn).toContain('history.length > 1');
+    // A cursor with history, a page starting partway in, or a page with more
+    // after it: any of those and the controls stay, whatever `matched` says.
+    const whole = { matched: 5, startIndex: 0, nextCursor: null };
+    expect(pagerNeeded(whole, 8, [null])).toBe(false);
+    expect(pagerNeeded({ ...whole, matched: 9 }, 8, [null])).toBe(true);
+    expect(pagerNeeded({ ...whole, startIndex: 3 }, 8, [null])).toBe(true);
+    expect(pagerNeeded({ ...whole, nextCursor: 'k' }, 8, [null])).toBe(true);
+    // The deletion attack: a peer drops `matched` to one page's worth while
+    // the reader is past that page. Only the history says so, and it must be
+    // enough on its own — or PREVIOUS vanishes with the block.
+    expect(pagerNeeded({ matched: 4, startIndex: 4, nextCursor: null }, 8, [null, 'k'])).toBe(true);
+  });
+
+  it('rewinds on a cursor past the end, never on an empty page', () => {
+    // `items` holds only ACCEPTED records: a page of rejects is empty with its
+    // keys still there, and rewinding on that let a peer plant one invalid
+    // page ahead of an honest record and bounce NEXT straight back off it.
+    expect(cursorPastEnd({ matched: 9, startIndex: 4 })).toBe(false); // all-rejected page
+    expect(cursorPastEnd({ matched: 9, startIndex: 9 })).toBe(true); // past every key
+    expect(cursorPastEnd({ matched: 9, startIndex: 12 })).toBe(true);
+    expect(cursorPastEnd({ matched: 0, startIndex: 0 })).toBe(false); // empty map
+  });
+
+  it('never prints an inverted page range', () => {
+    // The state a rewind repairs, worded honestly in case a caller does not:
+    // 8 records, cursor past all of them, page of 8 used to read "9–8 of 8".
+    expect(pageRange({ matched: 8, startIndex: 8 }, 8)).toBe('past the end of 8');
+    expect(pageRange({ matched: 8, startIndex: 0 }, 8)).toBe('1–8 of 8');
+    expect(pageRange({ matched: 20, startIndex: 8 }, 8)).toBe('9–16 of 20');
+    expect(pageRange({ matched: 10, startIndex: 8 }, 8)).toBe('9–10 of 10');
+    expect(pageRange({ matched: 0, startIndex: 0 }, 8)).toBe('none held');
+  });
+
+  it('rewinds every paged scan on the phone, the detail screen included', () => {
+    // The list rewound on the right condition and the three detail scans did
+    // not rewind at all, so records leaving behind their cursor left the
+    // VOTES panel reading "Held here: 0" for a room still holding a page of
+    // verified votes. The predicate is unit-tested above; this pins that
+    // every scan goes through it, since the loops themselves live in main.ts.
+    const from = main.indexOf('function paintTreasuryBody(');
+    const body = main.slice(from, main.indexOf('\nfunction ', from + 1));
+    for (const scan of ['page', 'voteScan', 'cpScan', 'sessionScan']) {
+      expect(body, `${scan} is not rewound when its cursor is past the end`)
+        .toContain(`cursorPastEnd(${scan})`);
+    }
+    // And no hand-rolled copy of the condition survives beside the shared one.
+    expect(body).not.toMatch(/startIndex >= \w+\.matched/);
+    // The vote and checkpoint histories rewind as a PAIR — the equal-height
+    // invariant advanceCursorPair relies on — never by popping one side.
+    expect(body).toContain('retreatCursorPair({ a: treasuryVoteCursors, b: treasuryCheckpointCursors })');
+    expect(body).not.toMatch(/treasury(Vote|Checkpoint)Cursors\.pop\(\)/);
+  });
+
+  it('discloses a cut-short search on all three panels, apart from ordinary paging', () => {
+    // "There is another page" and "the walk that builds the pages stopped
+    // early" are different claims, and only the second means NEXT may never
+    // arrive. This is the author's stated mitigation on the one open review
+    // thread, and the rounds block has been rewritten several times — any of
+    // the three notes could have been dropped with nothing failing.
+    const from = main.indexOf('function paintTreasuryBody(');
+    const body = main.slice(from, main.indexOf('\nfunction ', from + 1));
+    for (const flag of [
+      'voteScan.discoveryCutShort || cpScan.discoveryCutShort',
+      'sessionScan.discoveryCutShort',
+      'page.discoveryCutShort',
+    ]) {
+      const at = body.indexOf(flag);
+      expect(at, `${flag} is not rendered`).toBeGreaterThan(-1);
+      expect(body.slice(at, at + 400), `${flag} is rendered without saying paging cannot reach`)
+        .toContain('paging cannot reach');
+    }
+  });
+
+  it('says on screen what the per-proposal filters left out', () => {
+    // The filters return the dropped count; the screen has to print it, and
+    // fold it into the approvals panel's `complete` argument, or the flat
+    // "No approval round open in this room" comes back for a round the room
+    // holds under this proposal's own keys.
+    expect(main).toContain('droppedRecordsNote(scopedCheckpoints.dropped, "vote record")');
+    expect(main).toContain('droppedRecordsNote(scopedSessions.dropped, "approval round")');
+    // Computed AND rendered — a note nobody paints is not a disclosure.
+    expect(main).toContain('${droppedVoteRecords ? dim(esc(droppedVoteRecords)) : ""}');
+    expect(main).toContain('${droppedRounds ? dim(esc(droppedRounds)) : ""}');
+    expect(main).toContain('scopedSessions.dropped === 0');
   });
 
   it('gates the phone and the terminal on the same three obstacles', () => {
@@ -1371,6 +1520,315 @@ describe('share class paging', () => {
     expect(page.startIndex).toBe(0);
     expect(page.hasMore).toBe(false);
     expect(page.truncated).toBe(false);
+  });
+});
+
+/** A held binding under a realistic-length key, for the signer tests. */
+const VOCAB_BINDING: RoomTreasuryBinding = {
+  v: 1,
+  networkGenesisChallenge: 'a'.repeat(64),
+  roomId: 'room-1',
+  companyId: 'b'.repeat(64),
+  treasuryLauncherId: 'c'.repeat(64),
+  policyVersion: 1,
+  profileId: 'p1',
+  boundByPub: 'k'.repeat(43),
+  boundAtHeight: 100,
+  policyReceiptId: 'd'.repeat(64),
+  sig: 'sig',
+};
+
+describe('who signed the funding record (plan §10.1, room side)', () => {
+  // The cache layer verifies a binding's signature against the key the record
+  // ITSELF carries, which proves authorship and nothing more: any peer can
+  // mint a key, sign a binding naming any company, and overwrite this room's
+  // slot. The screen used to badge that SIGNED and let it decide which
+  // company's board and proposals were "this room's". Only the room owner's
+  // signature makes it the room's binding.
+  const owner = { status: 'known', pub: 'k'.repeat(43), source: 'room-doc' } as const;
+  const stranger = { status: 'known', pub: 'z'.repeat(43), source: 'room-doc' } as const;
+  const unknown = { status: 'unknown' } as const;
+  const legacy = { status: 'legacy' } as const;
+
+  it('classifies the signer against the owner key, owner only', () => {
+    expect(bindingSigner(VOCAB_BINDING, owner)).toBe('owner');
+    expect(bindingSigner(VOCAB_BINDING, stranger)).toBe('not-owner');
+    expect(bindingSigner(VOCAB_BINDING, unknown)).toBe('owner-unknown');
+    expect(bindingSigner(VOCAB_BINDING, legacy)).toBe('no-owner-key');
+  });
+
+  it('badges only the owner’s signature as signed, and says what the signature shows', () => {
+    const v = roomFundingView(VOCAB_BINDING, null, 'readable', owner);
+    expect(v.bound).toBe(true);
+    expect(v.signer).toBe('owner');
+    expect(v.trust.level).toBe('signed');
+    expect(v.trust.label).toBe('OWNER-SIGNED');
+    expect(v.trust.detail).toMatch(/not that the company agreed/i);
+    // Provenance: a room-doc owner is "as its records name them", never
+    // "confirmed against the deed" — that clause is reserved for a key an
+    // issue-#138 head supplied AND this device's node verified.
+    expect(v.trust.detail).toMatch(/as its records currently name them/i);
+    expect(v.trust.detail).not.toMatch(/confirmed against/i);
+    const headVerified = roomFundingView(VOCAB_BINDING, null, 'readable', { ...owner, source: 'head-verified' });
+    expect(headVerified.trust.detail).toMatch(/confirmed against the room’s deed/i);
+    const headUnverified = roomFundingView(VOCAB_BINDING, null, 'readable', { ...owner, source: 'head-unverified' });
+    expect(headUnverified.trust.detail).not.toMatch(/confirmed against/i);
+    expect(v.signerLabel).toMatch(/room owner/i);
+    expect(v.companyId).toBe('b'.repeat(64));
+    // The company-side predicate is stated as unchecked, with the receipt it
+    // would rest on, so an owner signature is never read as company consent.
+    expect(v.companyApproval).toMatch(/not checked here/i);
+    expect(v.companyApproval).toContain(shortId('d'.repeat(64)));
+  });
+
+  it('refuses a stranger’s signature as this room’s funding, without denying the record', () => {
+    const v = roomFundingView(VOCAB_BINDING, null, 'readable', stranger);
+    expect(v.bound).toBe(false);
+    expect(v.signer).toBe('not-owner');
+    expect(v.trust.level).toBe('unverified');
+    expect(v.trust.label).toBe('NOT OWNER-SIGNED');
+    expect(v.headline).toMatch(/not signed by the room owner/i);
+    // Held, so the headline is about a record — never "no company funding".
+    expect(v.headline).not.toMatch(/no company funding record/i);
+    // But no company billboard: the ids a planted record names are the
+    // attacker's choice.
+    expect(v.companyId).toBeNull();
+    expect(v.treasuryId).toBeNull();
+    expect(v.profileId).toBeNull();
+    // The signer is still named, so the refusal is a fact on screen.
+    expect(v.signerLabel).toMatch(/not the room owner/i);
+    expect(v.signerLabel).toContain(keyFingerprint('k'.repeat(43)));
+    expect(v.companyApproval).toBeNull();
+  });
+
+  it('never fails open when the owner is unknown or the room has no keyed owner', () => {
+    // Once synced, the only peer action that produces "owner unknown" is
+    // deleting or overwriting the owner's players entry — so a rule that
+    // trusted any signer then would turn censorship into forgery.
+    const u = roomFundingView(VOCAB_BINDING, null, 'readable', unknown);
+    expect(u.signer).toBe('owner-unknown');
+    expect(u.trust.level).toBe('unverified');
+    expect(u.trust.label).toBe('OWNER UNKNOWN');
+    expect(u.trust.detail).toMatch(/not learned this room’s owner key yet/i);
+    expect(u.bound).toBe(true); // shown as the claim it is
+    expect(u.signerLabel).toMatch(/owner not yet known/i);
+    const l = roomFundingView(VOCAB_BINDING, null, 'readable', legacy);
+    expect(l.signer).toBe('no-owner-key');
+    expect(l.trust.level).toBe('unverified');
+    expect(l.trust.label).toBe('NO OWNER KEY');
+    expect(l.signerLabel).toMatch(/no keyed owner/i);
+    // And a caller that forgets the owner key gets the honest default, never
+    // a SIGNED badge.
+    expect(roomFundingView(VOCAB_BINDING).trust.level).toBe('unverified');
+    expect(roomFundingView(VOCAB_BINDING).signer).toBe('owner-unknown');
+  });
+
+  it('never prints a raw signing key — fingerprints only', () => {
+    const raw = 'k'.repeat(43);
+    for (const ownerKey of [owner, stranger, unknown, legacy]) {
+      const v = roomFundingView(VOCAB_BINDING, null, 'readable', ownerKey);
+      for (const s of [v.headline, v.detail, v.trust.detail, v.signerLabel ?? '', v.companyApproval ?? '']) {
+        expect(s).not.toContain(raw);
+      }
+      expect(v.signerLabel).toContain(keyFingerprint(raw));
+    }
+    expect(keyFingerprint(raw).length).toBeLessThan(raw.length);
+  });
+
+  it('anchors the company scope on the owner’s binding alone', () => {
+    // The owner's binding decides which company the screen shows.
+    const anchored = companyScope(VOCAB_BINDING, null, 'owner');
+    expect(anchored.companyId).toBe('b'.repeat(64));
+    expect(anchored.mismatch).toBe(false);
+    // Every other standing withholds the company details and proposal list,
+    // each saying why in its own words — a binding under any other key, or
+    // one whose signer cannot be tied to the owner yet, anchors nothing.
+    const warnings = new Set<string>();
+    for (const standing of ['not-owner', 'owner-unknown', 'no-owner-key'] as const) {
+      const s = companyScope(VOCAB_BINDING, policy, standing);
+      expect(s.companyId, standing).toBeNull();
+      expect(s.mismatch, standing).toBe(true);
+      expect(s.warning, standing).toMatch(/not shown/i);
+      warnings.add(s.warning ?? '');
+    }
+    expect(warnings.size).toBe(3);
+    expect(companyScope(VOCAB_BINDING, policy, 'not-owner').warning).toMatch(/not signed by the room’s owner/i);
+    expect(companyScope(VOCAB_BINDING, policy, 'owner-unknown').warning).toMatch(/does not yet know this room’s owner key/i);
+    expect(companyScope(VOCAB_BINDING, policy, 'no-owner-key').warning).toMatch(/no keyed owner/i);
+    // The binding passed alongside a non-owner standing is ignored, not
+    // trusted by accident: with no policy either, nothing is known.
+    expect(companyScope(VOCAB_BINDING, null, 'not-owner').companyId).toBeNull();
+    // Anchored means the owner's binding named the company. The policy-alone
+    // fallback still names one (an unbound room is allowed to show its
+    // company) but says on screen what that rests on — every held state
+    // withholds, so an empty slot is a hostile peer's cheapest arrangement.
+    expect(anchored.anchored).toBe(true);
+    expect(anchored.note).toBeNull();
+    const fallback = companyScope(null, policy, 'absent');
+    expect(fallback.companyId).toBe(policy.companyId);
+    expect(fallback.anchored).toBe(false);
+    expect(fallback.note).toMatch(/anyone in the room can write/i);
+    expect(fallback.note).toMatch(/no funding record ties this company/i);
+    expect(companyScope(null, null, 'absent').note).toBeNull();
+    // And the phone prints it.
+    const root = dirname(fileURLToPath(import.meta.url));
+    const main = readFileSync(join(root, 'main.ts'), 'utf8');
+    expect(main).toContain('scope.note ? dim(esc(scope.note)) : ""');
+  });
+
+  it('reads the owner key live from the room document, three ways', () => {
+    // gamesDoc.readRoomOwnerKey is the seam: roomInfo.owner → players[owner].keyB64
+    // today, the NFT-deed authority head under issue #138 tomorrow.
+    const doc = new Y.Doc();
+    bindGamesDoc(doc);
+    expect(readRoomOwnerKey()).toEqual({ status: 'unknown' }); // nothing named
+    doc.getMap('roomInfo').set('owner', 'player-1');
+    expect(readRoomOwnerKey()).toEqual({ status: 'unknown' }); // entry not synced yet
+    doc.getMap('players').set('player-1', { name: 'Ann' });
+    expect(readRoomOwnerKey()).toEqual({ status: 'unknown' }); // entry without a key
+    doc.getMap('players').set('player-1', { name: 'Ann', keyB64: 'k'.repeat(43) });
+    // Provenance travels with the key: the room document is the only source
+    // today, and it must say so rather than pass for a verified deed head.
+    expect(readRoomOwnerKey()).toEqual({ status: 'known', pub: 'k'.repeat(43), source: 'room-doc' });
+    // A rotated key takes effect on the next read, with no rebind.
+    doc.getMap('players').set('player-1', { name: 'Ann', keyB64: 'z'.repeat(43) });
+    expect(readRoomOwnerKey()).toEqual({ status: 'known', pub: 'z'.repeat(43), source: 'room-doc' });
+    // The pre-keyed-identity marker can never have a key.
+    doc.getMap('roomInfo').set('owner', 'Local-Clone');
+    expect(readRoomOwnerKey()).toEqual({ status: 'legacy' });
+  });
+
+  it('wires the live owner key into both surfaces and repaints when it changes', () => {
+    // Source-pinned because the wiring lives in main.ts and devices.ts. Both
+    // surfaces must derive the signer from the SAME live reader, or the phone
+    // and the terminal disagree about whose binding this is.
+    const root = dirname(fileURLToPath(import.meta.url));
+    const main = readFileSync(join(root, 'main.ts'), 'utf8');
+    const devices = readFileSync(join(root, 'devices.ts'), 'utf8');
+    const from = main.indexOf('function paintTreasuryBody(');
+    const body = main.slice(from, main.indexOf('\nfunction ', from + 1));
+    expect(body).toContain('const ownerKey = readRoomOwnerKey();');
+    expect(body).toContain('bindingSigner(bindingResult.binding, ownerKey)');
+    // Only the owner's binding reaches companyScope as an anchor.
+    expect(body).toContain('standing === "owner" ? heldBinding : null');
+    // The phone's funding view RECEIVES the live key. The parameter has an
+    // honest default (owner unknown), so a dropped argument compiles and
+    // leaves the suite green while the phone and the terminal disagree.
+    const callAt = body.indexOf('const binding = roomFundingView(');
+    expect(callAt).toBeGreaterThan(-1);
+    const fundingCall = body.slice(callAt, body.indexOf(');', callAt));
+    expect(fundingCall, 'phone funding view is not handed the live owner key').toContain('ownerKey');
+    // The signer and the unchecked company half are rendered, not just
+    // computed — and "Bound by" is reserved for the owner's own signature.
+    expect(body).toContain('row(binding.signer === "owner" ? "Bound by" : "Signed by", esc(binding.signerLabel))');
+    expect(body).toContain('row("Company approval", esc(binding.companyApproval))');
+    // The terminal passes the same reader.
+    // Bounded to the FUNDING refresh block — from its read to its write — so a
+    // neighbour's code cannot satisfy the assertion by accident.
+    const readAt = devices.indexOf('const bindingResult = connected ? readRoomBindingResult(roomId)');
+    const writeAt = devices.indexOf('fundDetailEl.textContent', readAt);
+    expect(readAt).toBeGreaterThan(-1);
+    expect(writeAt).toBeGreaterThan(readAt);
+    const terminal = devices.slice(readAt, writeAt);
+    expect(terminal).toContain('readRoomOwnerKey(),');
+    expect(terminal).toContain("${funding.signer === 'owner' ? 'BOUND BY' : 'SIGNED BY'} ${(funding.signerLabel");
+    expect(terminal).toContain('COMPANY APPROVAL ${(funding.companyApproval');
+    expect(terminal).toContain('SIGNED BY ${funding.signerLabel');
+    // And an owner change repaints: both maps the verdict reads from. Bounded
+    // to each observer's closing brace, not a character window, so moving the
+    // call within the observer cannot fail with a message claiming it is gone.
+    for (const observer of ['roomMap.observe((_event) => {', 'playersMap.observe((_event) => {']) {
+      const at = main.indexOf(observer);
+      expect(at, `${observer} not found`).toBeGreaterThan(-1);
+      const end = main.indexOf('\n  });', at);
+      expect(end, `${observer} has no closing brace`).toBeGreaterThan(at);
+      expect(main.slice(at, end), `${observer} does not repaint the treasury`)
+        .toContain('queueTreasuryRepaint();');
+    }
+  });
+
+  it('resets every piece of treasury navigation state at the room-join seam', () => {
+    // The one behavioural edit in this change with no unit seam: a cursor is
+    // a key in one document's key space and meant nothing in the next room.
+    // Pinned here so the call cannot drift away from the bind, and so a reset
+    // that forgets one of the ten variables is caught by name.
+    const root = dirname(fileURLToPath(import.meta.url));
+    const main = readFileSync(join(root, 'main.ts'), 'utf8');
+    const bindAt = main.indexOf('bindTreasuryDoc(sync.doc, {');
+    expect(bindAt, 'the join-seam bindTreasuryDoc call not found').toBeGreaterThan(-1);
+    expect(main.slice(bindAt, bindAt + 1200)).toContain('resetTreasuryNavigation();');
+    const fnAt = main.indexOf('function resetTreasuryNavigation(');
+    expect(fnAt).toBeGreaterThan(-1);
+    const fn = main.slice(fnAt, main.indexOf('\n}', fnAt));
+    for (const v of [
+      'treasuryDetailId', 'treasuryListCursors', 'treasuryApprovalCursors', 'treasuryVoteCursors',
+      'treasuryCheckpointCursors', 'treasuryClassOffset',
+      'lastListNext', 'lastVoteNext', 'lastCheckpointNext', 'lastApprovalNext',
+    ]) {
+      expect(fn, `${v} is not reset at the join seam`).toContain(`${v} =`);
+    }
+  });
+});
+
+describe('held-but-unreadable states added late', () => {
+  // The UNREAD badges and "a record is held" headlines arrived in the last
+  // review rounds and none of these branches had an assertion: a refactor
+  // that dropped the too-large/unreadable guard would have left the badge
+  // saying NO DATA beside a headline saying a record is here, with the suite
+  // green. These are exactly the branches where badge and headline must agree.
+  it('badges a funding record this device would not or could not read as UNREAD, not NO DATA', () => {
+    for (const access of ['too-large', 'unreadable'] as const) {
+      const v = roomFundingView(null, null, access);
+      expect(v.bound).toBe(false);
+      expect(v.trust.label).toBe('UNREAD');
+      expect(v.trust.level).toBe('unverified');
+      expect(v.headline).toMatch(/funding record/i);
+      expect(v.headline).not.toMatch(/no company funding record|unavailable/i);
+      expect(v.detail).toMatch(/not the same as there being no record|something is here/i);
+    }
+    // And the two recordless obstacles stay NO DATA with the no-lookup detail.
+    for (const access of ['no-network', 'no-room'] as const) {
+      const v = roomFundingView(null, null, access);
+      expect(v.trust.level).toBe('absent');
+      expect(v.trust.detail).toMatch(/no lookup was possible/i);
+    }
+  });
+
+  it('badges a held-but-unreadable chain-view claim as UNREAD', () => {
+    const held = syncView(null, true, true);
+    expect(held.trust.label).toBe('UNREAD');
+    expect(held.trust.level).toBe('unverified');
+    expect(held.peerClaim).toBeNull();
+    // Nothing written at all is the only state that earns NO DATA.
+    expect(syncView(null, true, false).trust.level).toBe('absent');
+    // A claim that read fine is unverified, like every other panel's data.
+    const peer = { v: 1, networkGenesisChallenge: 'a'.repeat(64), state: 'degraded' } as ChainSyncStatus;
+    expect(syncView(peer, true).trust.level).toBe('unverified');
+    expect(syncView(peer, true).peerClaim).toBe('degraded');
+  });
+
+  it('does not describe an unreadable cached clock record as a mismatch', () => {
+    // 'unreadable' from the reader covers a malformed value as well as a
+    // misfiled one, so the note must not assert which proposal the bytes
+    // describe — that is a claim about something this device never read.
+    const subject = {
+      ...(contracts.proposal.unsigned as object),
+      proposalId: registration.proposalId,
+      policyVersion: registration.policyVersion,
+      kind: registration.kind,
+      proposerSig: 'sig',
+    } as TreasuryProposal;
+    const unreadable = windowsView(subject, null, null, null, false, true);
+    expect(unreadable.trust.level).toBe('unverified');
+    expect(unreadable.note).toMatch(/copied set of clocks is held here/i);
+    expect(unreadable.note).toMatch(/cannot make sense of it/i);
+    expect(unreadable.note).not.toMatch(/different proposal or policy version/i);
+    // A record that WAS read and names another proposal keeps the mismatch
+    // wording — the two are different facts and stay worded apart.
+    const other = { ...windows, proposalId: '9'.repeat(64) } as ProposalWindows;
+    const mismatch = windowsView(subject, null, null, other);
+    expect(mismatch.note).toMatch(/different proposal or policy version/i);
+    expect(mismatch.note).not.toMatch(/cannot make sense of it/i);
   });
 });
 
