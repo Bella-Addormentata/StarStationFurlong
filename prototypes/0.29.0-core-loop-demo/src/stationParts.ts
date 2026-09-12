@@ -13,13 +13,17 @@
 
 import type { ConnectorSegment } from './adapter';
 
-const PARTS_KEY = 'ssf-station-parts';       // { flex: n, ext: n, adapter: n }
+const PARTS_KEY = 'ssf-station-parts';       // { flex: n, ext: n, adapter: n, arm: n }
 const LEDGER_KEY = 'ssf-module-ledger';      // [{ roomId, seed, mintedAt }]
 const PRESET_KEY = 'ssf-armed-preset';       // 'ring' | 'spoke' | ''
 const AUTO_ACCEPT_KEY = 'ssf-auto-accept';   // '1' when on
 const NORTH_DOOR_KEY = 'ssf-north-door';     // '1' when unlocked
 
-export type PartKind = 'flex' | 'ext' | 'adapter';
+// PartKind — 🦾 'arm' added under #62 (robot arm construction gate). It lives
+// alongside flex/ext/adapter in the SAME PARTS_KEY object; existing installs
+// that predate 'arm' read {..., arm: 0} from loadParts()'s missing-field
+// default, so no migration is needed (ISO/IEC 5055 — safe on-disk evolution).
+export type PartKind = 'flex' | 'ext' | 'adapter' | 'arm';
 export type PresetId = 'ring' | 'spoke';
 
 export interface LedgerEntry {
@@ -41,7 +45,9 @@ export function subscribeStationParts(listener: () => void): () => void {
 
 // ── Parts counts ─────────────────────────────────────────────────────────────
 
-function loadParts(): { flex: number; ext: number; adapter: number } {
+type PartsBag = { flex: number; ext: number; adapter: number; arm: number };
+
+function loadParts(): PartsBag {
   try {
     const raw = localStorage.getItem(PARTS_KEY);
     if (raw) {
@@ -50,13 +56,16 @@ function loadParts(): { flex: number; ext: number; adapter: number } {
         flex: Number.isFinite(p?.flex) ? Math.max(0, Math.floor(p.flex)) : 0,
         ext: Number.isFinite(p?.ext) ? Math.max(0, Math.floor(p.ext)) : 0,
         adapter: Number.isFinite(p?.adapter) ? Math.max(0, Math.floor(p.adapter)) : 0,
+        // 🦾 arm: default 0 for installs that predate the field so no migration
+        // step is needed — an existing player just has zero arms in inventory.
+        arm: Number.isFinite(p?.arm) ? Math.max(0, Math.floor(p.arm)) : 0,
       };
     }
   } catch { /* privacy mode / corrupt — start empty */ }
-  return { flex: 0, ext: 0, adapter: 0 };
+  return { flex: 0, ext: 0, adapter: 0, arm: 0 };
 }
 
-function saveParts(p: { flex: number; ext: number; adapter: number }): void {
+function saveParts(p: PartsBag): void {
   try { localStorage.setItem(PARTS_KEY, JSON.stringify(p)); } catch { /* session-only */ }
   notify();
 }

@@ -105,7 +105,11 @@ export type FurnitureKind =
   | "classic-hot-tub"
   | "bunk-bed"
   | "clone-vat"
-  | "slot-machine";
+  | "slot-machine"
+  // 🦾 Station-mounted construction arm (#62 · issue owner's design ruling).
+  // Placed on the EXTERIOR of a hull wall; must sit within reach of a door
+  // before that door may INITIATE a NEW pairing (see robotArmGate.ts).
+  | "robot-arm";
 
 export interface FurnitureItem {
   id: string;
@@ -3194,6 +3198,21 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     mount: "exterior-wall",
     attach: { accepts: ["wall", "tankFace"] },
   },
+  // 🦾 ROBOT ARM — the diegetic construction-gate device (#62, owner ruling).
+  // Mirrors engine-block's exterior-wall pattern (plate flush to hull, business
+  // end in +z outward) so all the existing exterior placement / edit-mode
+  // carry / stacking rules apply unchanged. Its 'arm' function tag lets the
+  // gate query the FURNITURE list by kind AND makes the piece discoverable for
+  // later capability-driven UI. It DOES NOT accept a tank face (the arm needs
+  // a rigid hull mount for reach precision) — 'wall' only.
+  "robot-arm": {
+    kind: "robot-arm",
+    build: buildRobotArm,
+    footprint: { w: 2, d: 1 },
+    functions: ["arm"],
+    mount: "exterior-wall",
+    attach: { accepts: ["wall"] },
+  },
   // 🖼️ #80 S6: the old freestanding brick-wall / window-wall SEGMENTS retired —
   // the octagon hull is the wall now, re-skinnable via the wallpaper editor
   // (their brick look lives on as the `brick` wallpaper preset). See wallpaper.ts.
@@ -3529,6 +3548,139 @@ function buildEngineBlock(ctx: BuildCtx) {
 
   // Faint warm wash over the bell mouths (idle engines, not firing)
   addLight(new THREE.PointLight(0xffd9a0, 0, 4), 0, 1.1, 0.9, 0.9);
+}
+
+/**
+ * 🦾 buildRobotArm — the station-mounted construction arm (#62).
+ *
+ * Anatomy (all coordinates LOCAL, exterior-wall mount → +z points AWAY from
+ * the room; hull.WALL_ROT rotates the group so this axis lines up with the
+ * outward normal of whatever wall the arm sits on):
+ *
+ *   plate  (0, 0.8, -0.44)                — steel plate flush against hull
+ *     ↑
+ *   yoke   (0, 1.55, -0.15)               — swivel drum on the plate
+ *     ↑
+ *   shoulder pivot Group  (0, 1.55, -0.05)  · rotation.y = shoulderYaw
+ *     ├── upper arm  cyl (0, 0, 0.5, axis→+z)   — 1.0 m out along +z
+ *     └── elbow pivot Group (0, 0, 1.0)  · rotation.x = -elbowPitch
+ *           ├── forearm cyl (0, 0, 0.45, axis→+z)  — 0.9 m out
+ *           └── gripper fingers  (0, 0, ~1.05)
+ *
+ * The shoulder + elbow sub-Groups are tagged in `userData` so docking.ts can
+ * find them by traversing the arm's furniture group and drive their rotations
+ * every frame while a pairing is pending on a door THIS arm covers. When idle
+ * the arm folds up (elbow.rotation.x = -π/2), so a station without an active
+ * pairing reads as "parked, waiting".
+ *
+ * Deliberately low-poly — one plate, one yoke, one shoulder ring, two joints,
+ * two arm segments, a wrist and two fingers — to match the game's palette
+ * (steel gray HULL, dark machinery, brass rings, safety-yellow stripe).
+ */
+function buildRobotArm(ctx: BuildCtx) {
+  const { m, flat, place, attach, itemId } = ctx;
+  const HULL = 0x8a93a0;   // steel gray (station family — matches engine-block)
+  const DARKM = 0x37474f;  // dark machinery
+  const BODY = 0x2a3444;   // gunmetal plate
+  const RING_C = 0xd4a84b; // brass accent (helm-family)
+  const CAB_Y = 0xf0c000;  // safety-yellow caution stripe
+  const GRIP_C = 0x6b7280; // gripper (cooler steel gray)
+  const LED_G = 0x30ff88;  // idle-status green LED
+
+  // Mounting plate flush against the hull (mirrors engine-block plate depth).
+  place(new THREE.BoxGeometry(1.6, 1.6, 0.1), m(BODY, 0.6, 0.4), 0, 0.8, -0.44);
+  place(new THREE.BoxGeometry(1.4, 1.4, 0.05), m(DARKM, 0.55, 0.45), 0, 0.8, -0.36);
+  // Corner bolts (short cylinders — reads as bolted-on hardware not decal).
+  for (const [bx, by] of [[-0.6, 0.15], [0.6, 0.15], [-0.6, 1.45], [0.6, 1.45]] as [number, number][]) {
+    const bolt = place(new THREE.CylinderGeometry(0.06, 0.06, 0.12, 8), m(HULL, 0.4, 0.7), bx, by, -0.32);
+    bolt.rotation.x = Math.PI / 2;
+  }
+  // Yellow caution stripe across the plate top — a visual cue to "keep clear".
+  place(new THREE.BoxGeometry(1.4, 0.06, 0.02), m(CAB_Y, 0.4, 0.4, CAB_Y, 0.4), 0, 1.55, -0.34);
+
+  // Shoulder yoke — a short cylindrical drum that houses the yaw joint.
+  place(new THREE.CylinderGeometry(0.28, 0.32, 0.35, 12), m(HULL, 0.4, 0.6), 0, 1.55, -0.15);
+
+  // ── Shoulder pivot: rotates about local Y (along-wall swing) ────────────
+  // Tag this Group so docking.ts can find it and drive .rotation.y per frame
+  // while pairing is pending. Same userData-tag pattern as world.holoSpinners.
+  const shoulder = new THREE.Group();
+  shoulder.position.set(0, 1.55, -0.05);
+  shoulder.userData.robotArmShoulder = true;
+  shoulder.userData.itemId = itemId;
+  attach(shoulder);
+
+  // Upper arm inside shoulder group: cylinder rotated so its axis points along
+  // local +Z (outward from the wall). Centred at z=0.5 → z=1.0 is the elbow.
+  const upperArm = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.11, 0.11, 1.0, 12),
+    m(HULL, 0.4, 0.65),
+  );
+  upperArm.position.set(0, 0, 0.5);
+  upperArm.rotation.x = Math.PI / 2;
+  shoulder.add(upperArm);
+
+  // Brass shoulder ring — a visual accent at the joint's outer face.
+  const shoulderRing = new THREE.Mesh(
+    new THREE.TorusGeometry(0.14, 0.03, 8, 20),
+    m(RING_C, 0.4, 0.6),
+  );
+  shoulderRing.position.set(0, 0, 0.03);
+  shoulder.add(shoulderRing);
+
+  // ── Elbow pivot: rotates about local X (fold vs extend) ─────────────────
+  // Position it at the far end of the upper arm. Tag it so docking.ts drives
+  // its .rotation.x = -elbowPitch (idle -π/2 = folded UP, reach ~-0.35 = out).
+  const elbow = new THREE.Group();
+  elbow.position.set(0, 0, 1.0);
+  elbow.userData.robotArmElbow = true;
+  elbow.userData.itemId = itemId;
+  shoulder.add(elbow);
+
+  // Elbow joint capsule (a small sphere at the pivot for visual continuity).
+  const elbowJoint = new THREE.Mesh(new THREE.SphereGeometry(0.13, 12, 8), m(DARKM, 0.5, 0.5));
+  elbow.add(elbowJoint);
+
+  // Forearm inside elbow group: cylinder along local +Z from the elbow.
+  const forearm = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.09, 0.09, 0.9, 12),
+    m(HULL, 0.4, 0.65),
+  );
+  forearm.position.set(0, 0, 0.45);
+  forearm.rotation.x = Math.PI / 2;
+  elbow.add(forearm);
+
+  // Yellow stripe collar (a hazard band mid-forearm — same paint job).
+  const stripe = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.093, 0.093, 0.12, 12),
+    m(CAB_Y, 0.4, 0.4, CAB_Y, 0.4),
+  );
+  stripe.position.set(0, 0, 0.75);
+  stripe.rotation.x = Math.PI / 2;
+  elbow.add(stripe);
+
+  // Wrist joint (small sphere between forearm and gripper).
+  const wrist = new THREE.Mesh(new THREE.SphereGeometry(0.1, 10, 8), m(DARKM, 0.5, 0.5));
+  wrist.position.set(0, 0, 0.95);
+  elbow.add(wrist);
+
+  // Gripper — two boxy fingers angled slightly inward, tip at z ≈ 1.2.
+  for (const sx of [-1, 1]) {
+    const finger = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.12, 0.25), m(GRIP_C, 0.5, 0.6));
+    finger.position.set(sx * 0.08, 0, 1.08);
+    finger.rotation.y = sx * -0.15;
+    elbow.add(finger);
+  }
+
+  // Idle pose: shoulder yaw 0, elbow folded up 90°. Per-frame animation
+  // overwrites these each tick; the idle values are what's rendered until the
+  // animator wakes on the first pairing-pending frame (safety default).
+  shoulder.rotation.y = 0;
+  elbow.rotation.x = -Math.PI / 2;
+
+  // Green idle LED on the plate — a tiny sprite that shows the arm is present
+  // and armed. Doesn't animate; the arm's MOTION is the "armed" signal itself.
+  place(new THREE.SphereGeometry(0.035, 8, 6), flat(LED_G), 0, 1.7, -0.15);
 }
 
 function buildHelmConsole({ m, flat, place }: BuildCtx) {
