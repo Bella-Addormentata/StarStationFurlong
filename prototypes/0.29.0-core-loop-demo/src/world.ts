@@ -18,7 +18,9 @@ import {
   POOL_PATROL,
   LOBBY_PATROL,
   CASINO_PATROL,
+  ROBOT_BUBBLE_Y,
 } from "./poolWaiter";
+import type { WorkoutPose } from "./voxelCharacter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
@@ -71,6 +73,7 @@ import {
   colToWorld,
   rowToWorld,
   findPath,
+  nearestWalkableCell,
 } from "./pathfinding";
 import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
@@ -163,7 +166,7 @@ import {
 } from "./windowLayout";
 import { computeOctagonProfile } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
-import { getCameraYaw, addStationBias, resetStationBias } from "./cameraRig";
+import { getCameraYaw, getCameraForwardYaw, addStationBias, resetStationBias } from "./cameraRig";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -262,6 +265,14 @@ export class World {
   private robots = new Map<string, PoolWaiter>();
   /** Route the live robots were built with — a change rebuilds them all. */
   private robotsPatrol: Array<[number, number]> | null = null;
+  /** 🏋️ Cooldown (s) between row-formation escort walks, so a blocked path
+   *  can't re-issue navigation every frame. */
+  private coachEscortCooldown = 0;
+  /** 🔇 Robot lines are held until this timestamp — stamped 1 s past every
+   *  room entry so nothing barks during the load/entry flash. */
+  private robotQuietUntil = 0;
+  /** Edge detector for the player-entered-the-room moment (see above). */
+  private hadActivePlayer = false;
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -3564,8 +3575,24 @@ export class World {
     this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
-    const activePlayer = this.isPlayerActive() ? this.player : null;
+    // To the robots a player is "there" only INSIDE the room (iso room view
+    // or first person, zoom ≤ 2): isPlayerActive() alone stays true in the
+    // level-3 exterior after the morph, which would arm the entry edge —
+    // and let call-outs / the class escort reach a fox still on the ENTER
+    // ROOM prompt — before anyone has actually entered.
+    const activePlayer =
+      this.isPlayerActive() && zoomLevel <= 2 ? this.player : null;
+    // 🔇 The moment the player actually ENTERS the room (boot flow's ENTER
+    // ROOM, a door transit, morph end) re-arms the robot quiet window — the
+    // world runs behind the welcome overlay, so "1 s after room build" alone
+    // would let a greeting bark while the player is still on the menu.
+    if (activePlayer && !this.hadActivePlayer) {
+      this.robotQuietUntil = performance.now() + 1000;
+    }
+    this.hadActivePlayer = !!activePlayer;
     for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
+
+    this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
 
     // 🎰🤖 #77B: post the robot at the roulette wheel-head, narrate the calls
     // (all clients), and drive the betting timer (the elected operator only).
@@ -4785,6 +4812,10 @@ export class World {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
       this.robotsPatrol = waiterPatrol;
+      // 🔇 Fresh room: hold every robot line for the first second (owner
+      // request — no greeting barked mid-load/entry; the class opens its
+      // mouth only once you're actually standing in the room).
+      this.robotQuietUntil = performance.now() + 1000;
     }
     if (!waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
@@ -4836,9 +4867,14 @@ export class World {
   /** 🤖💬 THE robot-speech seam: overhead bubble + speaker voice, together.
    *  Every robot line (script 'say', small talk, serve lines, croupier beats)
    *  must go through here so no source can get bubble-without-voice. */
-  private robotSay(anchorId: string, text: string, x: number, z: number): void {
-    spawnFixedBubble(anchorId, text, x, z);
+  private robotSay(anchorId: string, text: string, x: number, z: number): boolean {
+    // No one in the room (welcome overlay / exterior view) ⇒ no lines at all;
+    // then hold through the 1 s entry quiet window.
+    if (!this.hadActivePlayer) return false;
+    if (performance.now() < this.robotQuietUntil) return false; // entry quiet window
+    spawnFixedBubble(anchorId, text, x, z, ROBOT_BUBBLE_Y);
     speakRobotLine(text, x, z);
+    return true;
   }
 
   /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
@@ -4854,6 +4890,103 @@ export class World {
       // per robot, replaced each line) — local, like the croupier's narration.
       bot.setSayHandler((text, x, z) => this.robotSay(`robotsay:${key}`, text, x, z));
     }
+  }
+
+  /** 🏋️🎥 #77 follow-the-coach — the class is staged FOR THE SCREEN (P2P
+   *  hangout: the human at the computer follows along). A coaching bot
+   *  performs facing the CAMERA like a workout video; a fox that stands in
+   *  the 6 m circle is escorted to a side slot of the row, turns to the
+   *  camera too, and mirrors the demo in lockstep (the bot supplies the
+   *  chibi-scaled pose — getFollowerPose). The pose only applies while
+   *  idle, so walking away or sitting down breaks the follow. */
+  /** Can the local fox route to (x, z)? Start snapped to solid ground first
+   *  (the vat spawn cell is non-walkable, and findPath from there is empty);
+   *  standing next to the goal counts. Same test pickFreeStand applies. */
+  private playerCanReach(x: number, z: number): boolean {
+    const me = this.player.getPosition();
+    if (Math.hypot(x - me.x, z - me.z) < 0.6) return true;
+    const start = nearestWalkableCell(me.x, me.z, 3);
+    if (!start) return false;
+    return (
+      findPath(worldToRow(start.z), worldToCol(start.x), worldToRow(z), worldToCol(x))
+        .length > 0
+    );
+  }
+
+  private updateCoachFollow(
+    deltaTime: number,
+    activePlayer: Player | null,
+    firstPerson: boolean,
+  ): void {
+    // 🎥 "The screen" in the iso room view is the rig's forward on the
+    // ground; in FIRST PERSON (#49) the camera is a perspective camera on
+    // mouse-look — the player's own eyes — so the class faces the fox.
+    const rigYaw = getCameraForwardYaw();
+    this.coachEscortCooldown = Math.max(0, this.coachEscortCooldown - deltaTime);
+    let workout: WorkoutPose | null = null;
+    let inCircle = false;
+    for (const bot of this.robots.values()) {
+      const bp = bot.getPosition();
+      const pp = this.player.mesh.position;
+      const stageYaw = firstPerson
+        ? Math.atan2(pp.x - bp.x, pp.z - bp.z)
+        : rigYaw;
+      bot.setStageYaw(bot.isCoaching() ? stageYaw : null);
+      if (!activePlayer || !bot.isCoaching()) continue;
+      if (Math.hypot(bp.x - pp.x, bp.z - pp.z) > 6) continue; // the 6 m circle
+      // 🚪 Door-zone exemption: a fox walking out pauses BESIDE the door
+      // while it opens — never escort (or mirror) from there, or the class
+      // would kidnap anyone trying to leave the room.
+      let nearDoor = false;
+      for (const [, g] of this.dockingSystem?.getDoorGroups() ?? []) {
+        if (Math.hypot(g.position.x - pp.x, g.position.z - pp.z) < 2.2) {
+          nearDoor = true;
+          break;
+        }
+      }
+      if (nearDoor) continue;
+      inCircle = true;
+      if (!activePlayer.isStandingIdle()) continue; // acts only once standing
+      // 🚶 Row formation (owner rule): inside the circle the fox stands at
+      // the robot's SIDES only — never in front of or behind it. A fox that
+      // stops anywhere else is escorted to the nearest walkable side slot
+      // (retry on a short cooldown, so a failed path can't spam). With BOTH
+      // side slots blocked there is no row to join — no escort, no mirror —
+      // rather than letting a fox in front of / behind the coach follow.
+      const slots = bot
+        .getFollowerSlots()
+        .filter((c) => walkable[worldToRow(c.z)]?.[worldToCol(c.x)])
+        .map((c) => ({ ...c, d: Math.hypot(c.x - pp.x, c.z - pp.z) }));
+      const nearest = slots.length
+        ? slots.reduce((a, b) => (a.d <= b.d ? a : b))
+        : null;
+      if (!nearest) continue;
+      if (nearest.d >= 0.6) {
+        if (this.coachEscortCooldown <= 0) {
+          this.coachEscortCooldown = 2;
+          // Walkable ≠ reachable: a slot across a furniture partition would
+          // be re-issued forever (navigateTo drops the empty path). Route-
+          // check the candidates only here, per escort, never per frame.
+          const routed = slots
+            .filter((c) => this.playerCanReach(c.x, c.z))
+            .sort((a, b) => a.d - b.d);
+          if (routed.length) activePlayer.navigateTo(routed[0].x, routed[0].z);
+        }
+        continue;
+      }
+      // In the row: face the screen with the coach and mirror its rep.
+      activePlayer.faceToward(
+        pp.x + Math.sin(stageYaw),
+        pp.z + Math.cos(stageYaw),
+      );
+      workout = bot.getFollowerPose();
+      break;
+    }
+    if (!inCircle) this.coachEscortCooldown = 0; // fresh entry escorts at once
+    // Always write the LOCAL player's pose: with no activePlayer (exterior
+    // view, morph) `workout` is null and this is what clears a pose captured
+    // on the last interior frame — the mesh stays visible out there.
+    (activePlayer ?? this.player).setWorkoutPose(workout);
   }
 
   private updateCroupier(): void {
@@ -4906,6 +5039,7 @@ export class World {
       this.robots.has(k) &&
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
+      routineOf(k) !== "coach" && // a coach runs its class, never a table
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,
@@ -4970,10 +5104,13 @@ export class World {
         beat = s ? croupierBeatLine(s) : null;
       }
       if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;
-      this.croupierNarrated.set(t.id, beat.key);
       const head = standsForItem(t.id).find((x) => x.role != null);
-      if (head) {
-        this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
+      if (!head) continue;
+      // 🔇 Record the beat only once it is actually delivered — a beat first
+      // seen behind the overlay or inside the entry quiet window retries next
+      // frame instead of being lost (same contract as every other robot line).
+      if (this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z)) {
+        this.croupierNarrated.set(t.id, beat.key);
       }
     }
   }

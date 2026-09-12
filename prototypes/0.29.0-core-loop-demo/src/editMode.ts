@@ -119,11 +119,12 @@ import type { World } from './world';
 export type RoomEditPermission = { ok: true } | { ok: false; reason: string };
 
 /**
- * The isolated owner predicate. main.ts registers the real check at init —
- * today the plan-§1 permissive roomInfo.owner === 'Local-Clone' fallback;
- * swapping to S2's identity gate (isLocalPlayerRoomOwner) at integration is
- * a one-line change of that registration. Default: permissive (offline =
- * your room).
+ * The isolated owner predicate. main.ts registers the real check at init:
+ * S2's identity gate (isLocalPlayerRoomOwner). 🔒 #141 retired the plan-§1
+ * permissive `roomInfo.owner === 'Local-Clone'` fallback that used to sit
+ * there — it granted owner authority to every peer at once, and this
+ * predicate is the seam every edit-mode gate funnels through. Pre-S2 rooms
+ * are read-only as a result. Default: permissive (offline = your room).
  */
 let ownerPredicate: () => RoomEditPermission = () => ({ ok: true });
 

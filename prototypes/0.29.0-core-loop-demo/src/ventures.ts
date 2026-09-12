@@ -75,6 +75,13 @@ export interface VentureLedgerEntry {
 
 const LEDGER_KEY = 'ssf-venture-ledger';
 
+/** 🕒 How far ahead of OUR clock a peer's `snapshotAt` may sit before the record
+ *  is refused (#143). The comparison is against the reader's own clock and a
+ *  browser mesh has no NTP guarantee, so this must cover honest skew — but
+ *  whatever slack it allows is exactly the head start an attacker keeps, hence
+ *  hours rather than days. */
+const MAX_SNAPSHOT_SKEW_MS = 6 * 60 * 60 * 1000;
+
 let boundDoc: Y.Doc | null = null;
 let ventureMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
@@ -121,6 +128,21 @@ export function ventureRecord(): VentureRecord | null {
     if (count > 0 && typeof pub === 'string' && pub) { shares[pub] = count; sum += count; }
   }
   if (sum > raw.totalShares) return null; // over-issued record = invalid
+  // 🕒 A property link's `snapshotAt` is PEER-WRITTEN and drives the monotonic
+  // refresh rule below (refreshVentureLink only accepts a NEWER stamp). Left
+  // unbounded, a planted far-future stamp pins the link — and the cap table it
+  // carries — against every honest refresh forever, because no reachable
+  // Date.now() can beat it. Same failure treasuryDoc's putPolicyCache comment
+  // already names: "a local version-monotonicity rule over UNAUTHENTICATED
+  // entries would let a planted max-version record brick the cache."
+  // Reject the whole record rather than rewriting the stamp: this is the read
+  // boundary AND the ingest point (a hostile peer writes the map directly,
+  // bypassing writeVentureLink/refreshVentureLink), and a read-time rewrite
+  // would be re-persisted by the next refresh's `{...v}` spread.
+  const stamp = typeof raw.snapshotAt === 'number' && Number.isFinite(raw.snapshotAt)
+    ? raw.snapshotAt
+    : undefined;
+  if (stamp !== undefined && stamp > Date.now() + MAX_SNAPSHOT_SKEW_MS) return null;
   const holderNames: Record<string, string> = {};
   if (typeof raw.holderNames === 'object' && raw.holderNames !== null) {
     for (const [pub, name] of Object.entries(raw.holderNames)) {
@@ -137,7 +159,7 @@ export function ventureRecord(): VentureRecord | null {
     shares,
     holderNames,
     officeRoomId: typeof raw.officeRoomId === 'string' ? raw.officeRoomId : undefined,
-    snapshotAt: typeof raw.snapshotAt === 'number' && Number.isFinite(raw.snapshotAt) ? raw.snapshotAt : undefined,
+    snapshotAt: stamp,
   };
 }
 
@@ -237,6 +259,50 @@ export function removeVentureLink(): boolean {
 }
 
 /**
+ * 🩹 #142 repair path: drop an OFFICE record (`snapshotAt === undefined`)
+ * from the current room. `removeVentureLink` deliberately refuses these, so
+ * before this existed a fabricated office record was **unremovable through
+ * the UI** — additive, invisible to the real owner, and it froze the deed
+ * permanently.
+ *
+ * ⚠️ DELIBERATELY UNGATED, and that is a trade, not an oversight.
+ *
+ * Nothing authorizes a write to a room doc today — a modified client writes
+ * any Yjs record it likes — so an ownership gate here stops no attacker: the
+ * one who planted the record just plants it again. What a gate *would* stop
+ * is the victim cleaning up, which is the only thing the gate reliably
+ * achieves. So the gate comes off.
+ *
+ * The cost, stated plainly: anyone standing in a venture's LEGITIMATE
+ * registered office can now delete its registration, which was previously
+ * impossible through the UI. That is a real new griefing vector, accepted
+ * because the alternative leaves victims with no repair at all. It stops
+ * being a trade at all once writes are authorized — at that point this
+ * should take the same grant-set check as every other write, and the
+ * ungated path should go away with it.
+ */
+export function detachOfficeRecord(): boolean {
+  if (!docAlive()) return false;
+  const v = ventureRecord();
+  if (!v || v.snapshotAt !== undefined) return false; // links use removeVentureLink
+  boundDoc!.transact(() => { ventureMap!.delete('v'); });
+  // 🧹 The personal ledger is the OTHER half of the repair, and deleting only
+  // the doc record left it behind. `syncVentureLedgerFromCurrentRoom` cannot
+  // clean it up afterwards — its first line returns early once `ventureRecord()`
+  // is null — so the fabricated venture stayed in the victim's VENTURES list,
+  // still naming them a shareholder, and the stale entry still fed the
+  // `ADD THIS MODULE` path, which would re-propagate the forged cap table into
+  // a room they really do own. Deregistering has to mean both.
+  //
+  // This lives HERE rather than in the caller so it is covered by tests: the
+  // ledger is exactly the kind of second-order state that a UI-side call site
+  // forgets, and #143's own writeup already flagged `removeFromVentureLedger`
+  // as having no callers — the repair path was identified and then not wired.
+  removeFromVentureLedger(v.id);
+  return true;
+}
+
+/**
  * Transfer shares YOU hold to another player (self-authorized — you may only
  * move your own stake; the UI passes your own pub as `fromPub`). Whole-record
  * rewrite inside one transact (last-writer-wins on races — acceptable at V1
@@ -269,8 +335,22 @@ export function ventureLedger(): VentureLedgerEntry[] {
     if (!raw) return [];
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    return arr.filter((e): e is VentureLedgerEntry =>
-      !!e && typeof e.id === 'string' && typeof e.name === 'string' && typeof e.officeRoomId === 'string');
+    return arr
+      .filter((e): e is VentureLedgerEntry =>
+        !!e && typeof e.id === 'string' && typeof e.name === 'string' && typeof e.officeRoomId === 'string')
+      // 🕒 The stored `capSeenAt` came from a peer-written record and PERSISTS
+      // across upgrades, so the record-level bound in ventureRecord cannot
+      // reach a ledger that was already poisoned. Left alone it stays "fresher"
+      // than every office visit (syncVentureLedgerFromCurrentRoom's
+      // `ledgerFresher`), keeps the forged cap table, and gets handed back to
+      // refreshVentureLink — which would write a stamp ventureRecord then
+      // refuses, making the property record unreadable. Drop the impossible
+      // stamp rather than the whole entry: the venture is real, only its
+      // freshness claim is not, and a zeroed stamp loses to the next honest
+      // office visit, which is exactly the self-heal we want.
+      .map((e) => (typeof e.capSeenAt === 'number' && e.capSeenAt > Date.now() + MAX_SNAPSHOT_SKEW_MS
+        ? { ...e, capSeenAt: 0 }
+        : e));
   } catch { return []; }
 }
 
