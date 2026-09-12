@@ -1024,9 +1024,20 @@ export class Player {
     this.character.setWorkoutPose(pose);
   }
 
-  /** 🏋️ Simply standing (idle animation state) — the follow-the-coach gate. */
+  /** 🏋️ Simply standing — the follow-the-coach gate. The idle ANIMATION alone
+   *  isn't enough: seat turn/fine-approach, device engagement, door waits and
+   *  the vat exit all show it too, and an escort walk from any of those would
+   *  cancel the action. So: idle pose AND no interaction in flight. */
   public isStandingIdle(): boolean {
-    return this.character.getState() === "idle";
+    return (
+      this.character.getState() === "idle" &&
+      this.sitPhase === "NONE" &&
+      this.vatPhase === "NONE" &&
+      this.deviceTarget === null &&
+      this.doorTarget === null &&
+      this.adapterOutTarget === null &&
+      this.pendingDest === null
+    );
   }
 
   /** 🍹 Waiter-bot serve: drive the fox's drink-hold arm pose (0 = reach

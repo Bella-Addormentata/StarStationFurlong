@@ -248,6 +248,9 @@ export class PoolWaiter {
   private scriptIndex = 0;
   private scriptTimer = 0;
   private saidThisStep = false;
+  /** 🍹🔇 The OFFER line landed (false ⇒ dropped by the quiet window; the
+   *  exchange holds and retries until the bot has actually asked). */
+  private offerSaid = false;
   /** Returns whether the line was actually delivered (the world drops lines
    *  during its room-entry quiet window) — droppers must not burn cooldowns. */
   private sayHandler: ((text: string, x: number, z: number) => boolean) | null = null;
@@ -615,6 +618,17 @@ export class PoolWaiter {
     ) {
       return;
     }
+    // 🏋️ A coach's own call-outs outrank the invite (one bubble anchor per
+    // bot — a same-frame pair would clobber each other): invite only during
+    // REST, once the rest line has had ~1.5 s on screen; until then keep the
+    // edge armed so the invite lands in that window.
+    if (
+      this.routine === "coach" &&
+      !(this.coachPhase === "rest" && this.coachSaid && this.coachTimer >= 1.5)
+    ) {
+      this.foxWasNear = false;
+      return;
+    }
     // 🏋️ A coach invites you to the class; a server makes small talk.
     // 🔇 A line dropped by the room-entry quiet window burns nothing: re-arm
     // the edge so the greeting retries — it lands right as the window opens
@@ -631,9 +645,11 @@ export class PoolWaiter {
   }
 
   /** One line through the world's bubble+voice seam. Returns whether it was
-   *  actually delivered (false ⇒ the room-entry quiet window dropped it). */
+   *  actually delivered (false ⇒ the room-entry quiet window dropped it, and
+   *  the caller should retry). With no seam wired at all there is nothing to
+   *  wait for, so that counts as delivered — callers never stall on it. */
   private say(text: string): boolean {
-    if (!this.sayHandler) return false;
+    if (!this.sayHandler) return true;
     const p = this.group.position;
     return this.sayHandler(text, p.x, p.z);
   }
@@ -672,21 +688,32 @@ export class PoolWaiter {
     const face = this.stageYaw ?? this.dockTarget?.faceAngle;
     if (face !== undefined) this.turnToward(face, dt);
 
-    this.coachTimer += dt;
     const move = COACH_MOVES[this.coachMove];
+    // 🔇 Every phase opens with a line — the call, the rep's count ("One!" …
+    // "Eight!", owner request), the rest quip — and the class WAITS for it:
+    // the phase clock only runs once the line is delivered. So neither the
+    // entry quiet window nor an empty room can silently eat a step of the
+    // announce → eight counted reps → rest sequence; the class simply holds
+    // at its next line until someone is there to hear it.
+    if (!this.coachSaid) {
+      this.coachSaid =
+        this.coachPhase === "announce"
+          ? this.say(move.call)
+          : this.coachPhase === "reps"
+            ? this.say(COUNT_WORDS[Math.min(this.coachRep, COUNT_WORDS.length - 1)])
+            : this.sayRandom(COACH_REST_LINES);
+      if (!this.coachSaid) {
+        this.idlePose();
+        return;
+      }
+    }
+    this.coachTimer += dt;
     switch (this.coachPhase) {
       case "announce":
-        // 🔇 say() reports delivery; a line the entry quiet window drops
-        // leaves the latch open so it retries next frame (same as small talk).
-        if (!this.coachSaid) this.coachSaid = this.say(move.call);
         this.idlePose();
         if (this.coachTimer >= COACH_ANNOUNCE_SECS) this.setCoachPhase("reps");
         break;
       case "reps": {
-        // Count the rep as it begins — "One!" … "Eight!" (owner request).
-        if (!this.coachSaid) {
-          this.coachSaid = this.say(COUNT_WORDS[Math.min(this.coachRep, COUNT_WORDS.length - 1)]);
-        }
         const t = Math.min(1, this.coachTimer / move.repSecs);
         this.animateMove(move.name, t); // animateMove eases t itself
         if (t >= 1) {
@@ -698,7 +725,6 @@ export class PoolWaiter {
         break;
       }
       case "rest":
-        if (!this.coachSaid) this.coachSaid = this.sayRandom(COACH_REST_LINES);
         this.idlePose();
         if (this.coachTimer >= COACH_REST_SECS) {
           this.coachMove = (this.coachMove + 1) % COACH_MOVES.length;
@@ -717,7 +743,7 @@ export class PoolWaiter {
   /** 🏋️ Whether this bot is running the coach routine (drives stage facing
    *  and the follow-the-coach slot in the world). */
   public isCoaching(): boolean {
-    return this.routine === "coach";
+    return this.routine === "coach" && !this.parked; // STOP ⇒ class is off
   }
 
   /** 🏋️ The fox follower's mirror of the CURRENT rep (#77 follow-the-coach)
@@ -856,7 +882,15 @@ export class PoolWaiter {
   /** 🤖 STOP/START: park the bot on its dock (true) or release it to its routine
    *  (false). Parking heads it to the dock immediately. */
   public setParked(parked: boolean): void {
-    if (parked && !this.parked) this.activity = "DOCK";
+    if (parked && !this.parked) {
+      this.activity = "DOCK";
+      // 🏋️ STOP can land mid-rep: clear the exercise joints so the bot doesn't
+      // walk home with raised arms / splayed legs, and put the class back at
+      // the first move's announce so START opens a fresh class.
+      this.resetExercisePose();
+      this.setCoachPhase("announce");
+      this.coachMove = 0;
+    }
     this.parked = parked;
   }
 
@@ -895,17 +929,16 @@ export class PoolWaiter {
     if (step.kind === "goto") {
       if (this.walkTo(dt, step.x, step.z, 0.15)) advance();
     } else if (step.kind === "say") {
-      // 🔇 Retry until delivered (the entry quiet window can drop it); the
-      // readable-hold clock restarts on delivery. Never delivered (no handler)
-      // still advances after the hold, so a script can't stall here.
-      if (!this.saidThisStep && this.say(step.text)) {
-        this.saidThisStep = true;
-        this.scriptTimer = 0;
-      }
-      // Hold the pose briefly so the line is readable before the next step.
+      // 🔇 Retry until delivered (the entry quiet window drops lines; an empty
+      // room drops them all) — the step holds here until its line lands, then
+      // stays briefly so the line is readable before the next step. A bot
+      // with no say seam counts as delivered (see say()), so it can't stall.
+      if (!this.saidThisStep) this.saidThisStep = this.say(step.text);
       this.idlePose();
-      this.scriptTimer += dt;
-      if (this.scriptTimer >= 2.5) advance();
+      if (this.saidThisStep) {
+        this.scriptTimer += dt;
+        if (this.scriptTimer >= 2.5) advance();
+      }
     } else {
       // wait
       this.idlePose();
@@ -1068,8 +1101,8 @@ export class PoolWaiter {
     this.legR.rotation.x = 0;
     this.body.position.y = 0;
     // 🍹 One service line as the bot turns to offer (#77 "ask if a person
-    // would like a drink").
-    this.sayRandom(SERVE_LINES);
+    // would like a drink"). Retried from updateServe until delivered.
+    this.offerSaid = this.sayRandom(SERVE_LINES);
   }
 
   private updateServe(dt: number, player: Player | null): void {
@@ -1077,6 +1110,12 @@ export class PoolWaiter {
     if (!player || !drink) {
       this.finishServe(true);
       return;
+    }
+    // 🔇 No silent service: the OFFER clock only runs once the offer line
+    // has been delivered (retry each frame until it is).
+    if (this.servePhase === "OFFER" && !this.offerSaid) {
+      this.offerSaid = this.sayRandom(SERVE_LINES);
+      if (!this.offerSaid) return;
     }
     this.serveTimer += dt;
     const pp = player.mesh.position;
