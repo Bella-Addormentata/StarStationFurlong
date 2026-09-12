@@ -4919,8 +4919,9 @@ export class World {
       // 🚶 Row formation (owner rule): inside the circle the fox stands at
       // the robot's SIDES only — never in front of or behind it. A fox that
       // stops anywhere else is escorted to the nearest walkable side slot
-      // (retry on a short cooldown, so a failed path can't spam); with no
-      // walkable slot it simply follows in place.
+      // (retry on a short cooldown, so a failed path can't spam). With BOTH
+      // side slots blocked there is no row to join — no escort, no mirror —
+      // rather than letting a fox in front of / behind the coach follow.
       const slots = bot
         .getFollowerSlots()
         .filter((c) => walkable[worldToRow(c.z)]?.[worldToCol(c.x)])
@@ -4928,7 +4929,8 @@ export class World {
       const nearest = slots.length
         ? slots.reduce((a, b) => (a.d <= b.d ? a : b))
         : null;
-      if (nearest && nearest.d >= 0.6) {
+      if (!nearest) continue;
+      if (nearest.d >= 0.6) {
         if (this.coachEscortCooldown <= 0) {
           this.coachEscortCooldown = 2;
           activePlayer.navigateTo(nearest.x, nearest.z);
@@ -5062,10 +5064,13 @@ export class World {
         beat = s ? croupierBeatLine(s) : null;
       }
       if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;
-      this.croupierNarrated.set(t.id, beat.key);
       const head = standsForItem(t.id).find((x) => x.role != null);
-      if (head) {
-        this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
+      if (!head) continue;
+      // 🔇 Record the beat only once it is actually delivered — a beat first
+      // seen behind the overlay or inside the entry quiet window retries next
+      // frame instead of being lost (same contract as every other robot line).
+      if (this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z)) {
+        this.croupierNarrated.set(t.id, beat.key);
       }
     }
   }
