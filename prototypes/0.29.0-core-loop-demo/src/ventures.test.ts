@@ -10,8 +10,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindVentures,
+  detachOfficeRecord,
   isVentureShareholder,
   refreshVentureLink,
+  removeVentureLink,
   upsertVentureLedger,
   ventureLedger,
   ventureRecord,
@@ -119,6 +121,59 @@ describe('the refresh path is no longer pinnable (#143)', () => {
     plant(link(Date.now() - 60_000, { [ATTACKER]: 100 }));
     expect(refreshVentureLink(ledgerEntry(Date.now(), { [OWNER]: 100 }))).toBe(true);
     expect(ventureRecord()?.shares).toEqual({ [OWNER]: 100 });
+  });
+});
+
+describe('a planted office record has a repair path (#142)', () => {
+  /** The attack: an office record is a venture record with NO snapshotAt. */
+  function plantOffice(shares: Record<string, number>): void {
+    plant({
+      id: 'v1', name: 'Acme', foundedAt: 0, founderPub: ATTACKER,
+      founderName: 'attacker', totalShares: 100, shares, holderNames: {},
+      officeRoomId: 'module-office',
+    });
+  }
+
+  it('is exactly what removeVentureLink refuses — the hole #142 reported', () => {
+    plantOffice({ [ATTACKER]: 100 });
+    expect(ventureRecord()).not.toBeNull();
+    // This is the pre-fix state: the only detach path bails on an office
+    // record, so the planted one could not be removed through the UI at all.
+    expect(removeVentureLink()).toBe(false);
+    expect(ventureRecord()).not.toBeNull();
+  });
+
+  it('detachOfficeRecord removes it', () => {
+    plantOffice({ [ATTACKER]: 100 });
+    expect(detachOfficeRecord()).toBe(true);
+    expect(ventureRecord()).toBeNull();
+  });
+
+  it('clears the owner-equivalence the planted record was granting', () => {
+    plantOffice({ [ATTACKER]: 100 });
+    // The whole point of the attack: isLocalPlayerRoomOwner's venture branch.
+    expect(isVentureShareholder(ATTACKER)).toBe(true);
+    detachOfficeRecord();
+    expect(isVentureShareholder(ATTACKER)).toBe(false);
+  });
+
+  it('is ungated — any peer may call it, by design', () => {
+    // No identity is passed in and none is consulted. Stated as a test so the
+    // day someone adds a gate, this fails and they have to read why (#142).
+    plantOffice({ [OWNER]: 100 });
+    expect(detachOfficeRecord()).toBe(true);
+  });
+
+  it('refuses a property LINK — those keep removeVentureLink and its gate', () => {
+    plant(link(Date.now(), { [OWNER]: 100 }));
+    expect(detachOfficeRecord()).toBe(false);
+    expect(ventureRecord()).not.toBeNull();
+    expect(removeVentureLink()).toBe(true);   // ...the link path still works
+    expect(ventureRecord()).toBeNull();
+  });
+
+  it('is a no-op on an unchartered room', () => {
+    expect(detachOfficeRecord()).toBe(false);
   });
 });
 

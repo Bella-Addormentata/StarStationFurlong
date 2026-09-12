@@ -259,6 +259,37 @@ export function removeVentureLink(): boolean {
 }
 
 /**
+ * 🩹 #142 repair path: drop an OFFICE record (`snapshotAt === undefined`)
+ * from the current room. `removeVentureLink` deliberately refuses these, so
+ * before this existed a fabricated office record was **unremovable through
+ * the UI** — additive, invisible to the real owner, and it froze the deed
+ * permanently.
+ *
+ * ⚠️ DELIBERATELY UNGATED, and that is a trade, not an oversight.
+ *
+ * Nothing authorizes a write to a room doc today — a modified client writes
+ * any Yjs record it likes — so an ownership gate here stops no attacker: the
+ * one who planted the record just plants it again. What a gate *would* stop
+ * is the victim cleaning up, which is the only thing the gate reliably
+ * achieves. So the gate comes off.
+ *
+ * The cost, stated plainly: anyone standing in a venture's LEGITIMATE
+ * registered office can now delete its registration, which was previously
+ * impossible through the UI. That is a real new griefing vector, accepted
+ * because the alternative leaves victims with no repair at all. It stops
+ * being a trade at all once writes are authorized — at that point this
+ * should take the same grant-set check as every other write, and the
+ * ungated path should go away with it.
+ */
+export function detachOfficeRecord(): boolean {
+  if (!docAlive()) return false;
+  const v = ventureRecord();
+  if (!v || v.snapshotAt !== undefined) return false; // links use removeVentureLink
+  boundDoc!.transact(() => { ventureMap!.delete('v'); });
+  return true;
+}
+
+/**
  * Transfer shares YOU hold to another player (self-authorized — you may only
  * move your own stake; the UI passes your own pub as `fromPub`). Whole-record
  * rewrite inside one transact (last-writer-wins on races — acceptable at V1

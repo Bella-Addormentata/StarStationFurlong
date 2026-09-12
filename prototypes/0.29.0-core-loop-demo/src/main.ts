@@ -131,6 +131,7 @@ import {
   writeVentureLink,
   refreshVentureLink,
   removeVentureLink,
+  detachOfficeRecord,
   isOfficeHere,
 } from "./ventures";
 import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
@@ -3298,6 +3299,12 @@ function renderVenturesApp(): void {
       } else if (action === "detach-property") {
         // Personal owner of a property room casts it out of the venture.
         removeVentureLink();
+      } else if (action === "detach-office") {
+        // 🩹 #142: deregister an office record. Ungated — see detachOfficeRecord.
+        if (detachOfficeRecord()) {
+          syncVentureLedgerFromCurrentRoom();
+          ventureDetailId = "";
+        }
       } else if (action === "transfer") {
         const pubInput = document.getElementById(
           "venture-transfer-pub",
@@ -3701,6 +3708,7 @@ function renderVenturesApp(): void {
         .join("")}
       <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? " Cap table is a snapshot — trades happen at the office." : ""}</div>
       ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ""}
+      ${detail.snapshotAt === undefined ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-office" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DEREGISTER THIS OFFICE</button><div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:3px;">Ungated on purpose (#142): a planted office record is otherwise unremovable, and nothing authorizes room-doc writes yet, so a gate would only block the cleanup.</div></div>` : ""}
       ${
         mine > 0 && detail.snapshotAt === undefined
           ? `
