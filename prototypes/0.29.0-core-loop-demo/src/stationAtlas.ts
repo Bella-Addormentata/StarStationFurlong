@@ -135,11 +135,17 @@ export function readAtlas(): Record<string, AtlasEntry> {
     // unmergeable for everyone until the poison is cleared at its source.
     // Zeroing it is the self-heal: the entry survives, and the next honest
     // gossip outranks it (`prior.lastSeen >= value.updatedAt` no longer holds).
+    // The repair must be PERSISTED, not just applied to the value we return.
+    // The ceiling moves with the clock, so an in-memory-only fix is temporary:
+    // a stamp seven hours ahead reads as 0 now and, an hour later, is back
+    // under the ceiling and returns unrepaired — ready to be republished.
     const ceiling = Date.now() + MAX_GOSSIP_SKEW_MS;
+    let repaired = false;
     for (const e of Object.values(atlas)) {
-      if (typeof e?.lastSeen === 'number' && e.lastSeen > ceiling) e.lastSeen = 0;
-      if (typeof e?.localSeenAt === 'number' && e.localSeenAt > ceiling) e.localSeenAt = 0;
+      if (typeof e?.lastSeen === 'number' && e.lastSeen > ceiling) { e.lastSeen = 0; repaired = true; }
+      if (typeof e?.localSeenAt === 'number' && e.localSeenAt > ceiling) { e.localSeenAt = 0; repaired = true; }
     }
+    if (repaired) writeAtlas(atlas);
     return atlas;
   } catch { return {}; }
 }
@@ -660,7 +666,21 @@ export function pushAtlasToDoc(): void {
         // re-push with the same second's stamp would lose the LWW tie against
         // the poisoned entry it is correcting (pull skips on >=); bumping past
         // the known stamp guarantees a content change always propagates.
-        updatedAt: known ? Math.max(entry.lastSeen, known.updatedAt + 1) : entry.lastSeen,
+        // 🕒 Clamped to the SAME ceiling the ingest guard enforces. The `+1`
+        // monotonic bump (F5) exists so a corrective re-push always outranks
+        // the record it corrects, but unclamped it can land one millisecond
+        // past the bound — and then our own isSharedAtlasEntry, and every peer
+        // on a similar clock, refuses the record we just wrote. A writer must
+        // never emit what its own reader rejects.
+        //
+        // Accepted degradation: for a client whose clock already sits at the
+        // full skew allowance, a content change may not out-rank the existing
+        // record until the clock advances. That is strictly better than
+        // publishing an entry nobody can ingest, and it self-resolves.
+        updatedAt: Math.min(
+          known ? Math.max(entry.lastSeen, known.updatedAt + 1) : entry.lastSeen,
+          Date.now() + MAX_GOSSIP_SKEW_MS,
+        ),
       };
       if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = entry.seed;
       if (known

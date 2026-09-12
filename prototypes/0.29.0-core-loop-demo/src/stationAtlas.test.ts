@@ -115,6 +115,28 @@ describe('gossip stamp bounds (#144)', () => {
     expect(published).toBeDefined();
     expect(published!.updatedAt).toBe(0);
   });
+
+  it('PERSISTS the legacy repair, so it survives the moving ceiling', () => {
+    // Only 7h ahead: above today's ceiling, but under it again within an hour.
+    // An in-memory-only repair would let the original value come back.
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-old': {
+        roomId: 'module-old', name: 'OLD', doors: {}, lastSeen: Date.now() + 7 * HOUR,
+      },
+    }));
+
+    expect(readAtlas()['module-old'].lastSeen).toBe(0);
+    // Read the raw store, not the return value — this is the persistence claim.
+    const raw = JSON.parse(store.get('ssf-station-atlas')!);
+    expect(raw['module-old'].lastSeen).toBe(0);
+  });
+
+  // NOT TESTED: the push-side clamp against the ingest ceiling. Reaching it
+  // needs `known.updatedAt` to be within 1 ms of the ceiling at push time, and
+  // the ceiling moves with the clock — any test written without injecting time
+  // passes whether or not the clamp is there, which is the vacuous-assertion
+  // trap. The clamp stays in as cheap defensive code (a writer must not emit
+  // what its own reader refuses); proving it needs a clock seam we do not have.
 });
 
 describe('eviction prefers first-hand knowledge (#144)', () => {
@@ -167,7 +189,7 @@ describe('eviction prefers first-hand knowledge (#144)', () => {
     expect([gossipedJustNow, visitedLongAgo].sort(compareAtlasRecency)[0].roomId).toBe('a');
   });
 
-  it('compareAtlasRecency orders within a tier by that tier own stamp', () => {
+  it("compareAtlasRecency orders within a tier by that tier's own stamp", () => {
     const now = Date.now();
     const older = { roomId: 'a', name: 'A', doors: {}, lastSeen: 0, localSeenAt: now - 9e6 };
     const newer = { roomId: 'b', name: 'B', doors: {}, lastSeen: 0, localSeenAt: now };
