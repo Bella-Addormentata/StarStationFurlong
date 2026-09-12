@@ -5491,10 +5491,11 @@ function renderCoHostsSection(): void {
       if (!el) return;
       const pub = el.dataset.pub ?? "";
       const action = el.dataset.cohostAction;
-      const ownerVal =
-        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-        "";
-      const amOwner = isLocalPlayerRoomOwner(ownerVal);
+      // 🔒 #142: the RAW deed holder, not the shareholder-extended gate.
+      // Accept/deny/revoke decide who keeps the room alive, so they sit with
+      // the deed like the hand-over and the croupier election — see the note
+      // on currentRoomDeedIsMine.
+      const amOwner = currentRoomDeedIsMine();
       if (action === "volunteer") {
         writeCoHostRequest(getIdentityPub(), getPlayerName());
       } else if (action === "withdraw") {
@@ -5512,9 +5513,9 @@ function renderCoHostsSection(): void {
     });
   }
 
-  const ownerVal =
-    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
-  const amOwner = isLocalPlayerRoomOwner(ownerVal);
+  // 🔒 #142: matches the handler's gate above — the render must not offer a
+  // REVOKE button the click handler will refuse.
+  const amOwner = currentRoomDeedIsMine();
   const myPub = getIdentityPub();
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
@@ -6240,9 +6241,10 @@ function setupSpacePhoneOverlay() {
     }
   });
 
-  // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
-  // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
-  // owner-gated, so a non-owner click is inert).
+  // Room access mode selector (public-doors): the DEED HOLDER sets
+  // PUBLIC/PASS/KEYED; the roomInfo observer repaints it live for everyone
+  // (setRoomAccessMode is deed-holder-gated since #142, so anyone else's click
+  // is inert — a venture shareholder's included).
   const accessModeRow = document.getElementById("access-mode-row");
   if (accessModeRow) {
     accessModeRow.addEventListener("click", (e) => {
@@ -7020,24 +7022,27 @@ function getRoomAccessMode(): AccessMode {
   return m === "public" || m === "keyed" ? m : "pass";
 }
 
-function isLocalOwnerOfCurrentRoom(): boolean {
-  const owner = yjsSync?.doc.getMap("roomInfo").get("owner") as
-    | string
-    | undefined;
-  return !!owner && isLocalPlayerRoomOwner(owner);
-}
-
+/** 🔒 #142: access mode is the lock-out surface — set it to `keyed` and nobody
+ *  else gets in — so it belongs to the RAW deed holder, not to
+ *  `isLocalPlayerRoomOwner`'s shareholder-extended set. `isVentureShareholder`
+ *  reads the current room's own venture map entry, which is shape-checked and
+ *  peer-written with nothing tying it to this room or its owner, so a
+ *  fabricated office record used to carry the right to lock the room. It no
+ *  longer does. The deed, the croupier election and co-host management already
+ *  sit here for the same reason. Cost, accepted deliberately: on a venture
+ *  property only the deed holder sets access mode; shareholders keep room
+ *  edits, docking and door policy. */
 function setRoomAccessMode(mode: AccessMode): void {
-  if (!yjsSync || !isLocalOwnerOfCurrentRoom()) return; // owner-gated
+  if (!yjsSync || !currentRoomDeedIsMine()) return; // deed-holder-gated
   const rm = yjsSync.doc.getMap("roomInfo");
   yjsSync.doc.transact(() => rm.set("accessMode", mode));
 }
 
 /** Reflect the current access mode: tint the door LEDs + paint the ACCESS
- *  app's selector (owner-editable, everyone else read-only). */
+ *  app's selector (deed-holder-editable, everyone else read-only). */
 function applyAccessModeUI(mode: AccessMode): void {
   world.dockingSystem?.setAccessMode(mode);
-  const isOwner = isLocalOwnerOfCurrentRoom();
+  const isOwner = currentRoomDeedIsMine();
   const row = document.getElementById("access-mode-row");
   if (row) {
     for (const btn of row.querySelectorAll<HTMLButtonElement>(
@@ -7049,7 +7054,7 @@ function applyAccessModeUI(mode: AccessMode): void {
       btn.classList.toggle("is-disabled", !isOwner);
       btn.title = isOwner
         ? `Set room access to ${btnMode}`
-        : "Only the room owner can change access mode";
+        : "Only this module’s deed holder can change access mode";
     }
   }
   const note = document.getElementById("access-mode-note");

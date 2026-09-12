@@ -5,6 +5,9 @@
  * true for EVERY caller, and every owner-gated surface funnels through this
  * predicate. Each of those cases fails if the clause comes back.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { isRoomOwner, legacyOwnerMarker, ownerGateRefusal } from './roomOwner';
 
@@ -124,5 +127,59 @@ describe('ownerGateRefusal — a legacy room reads as legacy', () => {
     let called = false;
     ownerGateRefusal('Local-Clone', 'edit', (o) => { called = true; return o; });
     expect(called).toBe(false);
+  });
+});
+
+/**
+ * 🔒 #142 — the destructive room surfaces must gate on the DEED, not on the
+ * shareholder-extended predicate above.
+ *
+ * `isVentureShareholder` reads the current room's own venture map entry, which
+ * is shape-checked, peer-written, and tied to nothing about this room or its
+ * owner. So a fabricated office record passes `isRoomOwner` — and while that
+ * is intended for room edits, docking and door policy, it must not carry the
+ * right to lock the room out or to unseat its co-hosts. The deed hand-over and
+ * the croupier election already sit with the raw deed holder; #142 moved these
+ * two to join them.
+ *
+ * ⚠️ Read what this proves, and no more. Both gates live in `main.ts`, which
+ * runs the whole client on import and so cannot be loaded by vitest — this
+ * SCANS THE SOURCE for the predicate each one calls. It catches the regression
+ * that matters (someone widening the gate back to `isLocalPlayerRoomOwner`)
+ * and nothing else: it cannot tell you the gate is reached, that the UI agrees
+ * with it, or that `currentRoomDeedIsMine` is itself right. Extracting these
+ * paths so they can be tested properly is its own critical-path TODO item.
+ */
+describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
+  const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
+
+  /** The body of a named top-level function, up to the next one. */
+  const bodyOf = (name: string): string => {
+    const start = main.indexOf(`function ${name}(`);
+    expect(start, `${name} not found in main.ts`).toBeGreaterThan(-1);
+    const next = main.indexOf('\nfunction ', start + 1);
+    return main.slice(start, next === -1 ? main.length : next);
+  };
+
+  it('setRoomAccessMode refuses anyone but the deed holder', () => {
+    const body = bodyOf('setRoomAccessMode');
+    expect(body).toContain('currentRoomDeedIsMine()');
+    // The widening this exists to prevent.
+    expect(body).not.toContain('isLocalPlayerRoomOwner');
+    expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
+  });
+
+  it('the access-mode UI paints from the same predicate as the setter', () => {
+    // A selector enabled for someone the setter will refuse is a button that
+    // silently does nothing — the failure mode this pairing exists to avoid.
+    expect(bodyOf('applyAccessModeUI')).toContain('currentRoomDeedIsMine()');
+  });
+
+  it('co-host accept/deny/revoke gate on the deed, in handler and render alike', () => {
+    // Both sites are inside one render function rather than named functions of
+    // their own, so this checks the two `amOwner` bindings directly.
+    const bindings = main.match(/const amOwner = .*;/g) ?? [];
+    expect(bindings.length).toBeGreaterThan(0);
+    for (const b of bindings) expect(b).toContain('currentRoomDeedIsMine()');
   });
 });
