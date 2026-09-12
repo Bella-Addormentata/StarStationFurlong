@@ -6,7 +6,7 @@
  * (bindStationAtlasDoc -> pullSharedAtlas) with entries a hostile peer could
  * write, rather than calling internals.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas } from './stationAtlas';
 
@@ -131,12 +131,53 @@ describe('gossip stamp bounds (#144)', () => {
     expect(raw['module-old'].lastSeen).toBe(0);
   });
 
-  // NOT TESTED: the push-side clamp against the ingest ceiling. Reaching it
-  // needs `known.updatedAt` to be within 1 ms of the ceiling at push time, and
-  // the ceiling moves with the clock — any test written without injecting time
-  // passes whether or not the clamp is there, which is the vacuous-assertion
-  // trap. The clamp stays in as cheap defensive code (a writer must not emit
-  // what its own reader refuses); proving it needs a clock seam we do not have.
+  it('never publishes a stamp its own reader would refuse', () => {
+    // Needs a FROZEN clock and a SINGLE push. The ceiling moves in real time,
+    // and a later push overwrites the offending record, so a test that lets
+    // either happen passes with or without the clamp (mine did, first time).
+    vi.useFakeTimers();
+    try {
+      const t0 = new Date('2026-09-12T00:00:00Z').getTime();
+      vi.setSystemTime(t0);
+      const ceiling = t0 + 6 * HOUR;
+
+      // Local knowledge and the doc record agree on the stamp — exactly at the
+      // ceiling — but differ in content, so bind's push must re-publish. The F5
+      // monotonic bump wants `known.updatedAt + 1`, one millisecond past the
+      // bound, which is precisely what the clamp exists to stop.
+      store.set('ssf-station-atlas', JSON.stringify({
+        'module-self': {
+          roomId: 'module-self',
+          name: 'RENAMED',
+          doors: { n: { targetRoomId: 'module-nbr', targetSeed: 'seed' } },
+          lastSeen: ceiling,
+          localSeenAt: t0,
+        },
+      }));
+      doc.getMap('atlas').set('module-self', {
+        roomId: 'module-self',
+        name: 'SELF',
+        doors: { n: { targetRoomId: 'module-nbr' } },
+        updatedAt: ceiling,
+      });
+      bind('module-self');
+
+      const published = doc.getMap('atlas').get('module-self') as { name: string; updatedAt: number };
+      expect(published.name).toBe('RENAMED');                    // the push happened...
+      expect(published.updatedAt).toBeLessThanOrEqual(ceiling);  // ...inside the bound
+
+      // The claim is not arithmetic, it is round-trip: a peer on the same clock
+      // running OUR ingest guard has to accept what we just wrote. Unclamped
+      // this lands at ceiling + 1 and is refused — a record nobody can read.
+      store.clear();
+      const peer = new Y.Doc();
+      peer.getMap('atlas').set('module-self', published);
+      bindStationAtlasDoc(peer, { roomId: 'module-other', isPassagePublic: () => false });
+      expect(readAtlas()['module-self']).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('eviction prefers first-hand knowledge (#144)', () => {
