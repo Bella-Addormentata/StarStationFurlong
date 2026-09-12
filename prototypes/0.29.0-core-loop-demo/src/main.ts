@@ -136,6 +136,7 @@ import {
 } from "./ventures";
 import {
   isRoomOwner,
+  legacyOwnerMarker,
   ownerGateRefusal as ownerGateRefusalText,
 } from "./roomOwner";
 import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
@@ -2860,6 +2861,15 @@ function currentRoomDeedIsMine(): boolean {
   // 🔒 #141: no 'Local-Clone' clause. This is the RAW deed check (the right to
   // hand the module away), so the wildcard was strictly worse here than at the
   // owner-equivalent gate — it made every peer the deed holder.
+  //
+  // ⚠️ Rejected BEFORE the players lookup below, not merely as an equality
+  // test. `players` is peer-written, and the marker is used as a KEY into it:
+  // an attacker writes players['Local-Clone'] = { keyB64: <their own pub> },
+  // and their client then resolves the legacy owner to themselves and takes
+  // the deed to every legacy room. Dropping the `=== 'Local-Clone'` comparison
+  // alone left that path wide open — the marker must never be RESOLVED, not
+  // just never compared.
+  if (legacyOwnerMarker(ownerVal)) return false;
   if (ownerVal === getPlayerId()) return true;
   const entry = yjsSync?.doc.getMap("players").get(ownerVal) as
     | Partial<PlayerEntry>
@@ -6132,6 +6142,12 @@ function roomOwnerInfo(roomId: string): {
     const doc = yjsSync.doc;
     const ownerId = doc.getMap("roomInfo").get("owner");
     if (typeof ownerId !== "string" || !ownerId) return {};
+    // 🔒 #141 defence in depth: never RESOLVE the legacy marker through the
+    // peer-written `players` map. There is no honest entry to find — the
+    // marker names no player — so any hit is planted, and a resolved pub is
+    // exactly what lets a caller conclude the room is theirs. Callers still
+    // get `ownerId` for display; they just get no key to match against.
+    if (legacyOwnerMarker(ownerId)) return { ownerId };
     const entry = doc.getMap("players").get(ownerId) as
       | { keyB64?: string }
       | undefined;
@@ -6151,7 +6167,13 @@ function categorizeRoom(roomId: string, friendPubs: Set<string>): RoomCategory {
   if (!ownerId) return "unreached";
   // 🔒 #141: the legacy 'Local-Clone' marker no longer files a room as MINE —
   // it filed every legacy room into every player's "mine" list at once. Those
-  // rooms fall through to 'visited', which is what they honestly are.
+  // rooms are 'visited', which is what they honestly are.
+  //
+  // ⚠️ Returned BEFORE `ownerPub` is consulted. That value comes from
+  // resolving `ownerId` through the peer-written `players` map, so with the
+  // marker as the key an attacker plants their own `keyB64` there and files
+  // every legacy room as theirs. Same path as currentRoomDeedIsMine.
+  if (legacyOwnerMarker(ownerId)) return "visited";
   if (ownerId === getPlayerId() || (ownerPub && ownerPub === getIdentityPub())) {
     return "mine";
   }
