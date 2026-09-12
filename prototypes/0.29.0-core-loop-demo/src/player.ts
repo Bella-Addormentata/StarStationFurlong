@@ -66,6 +66,7 @@ import * as THREE from "three";
 import { InputManager } from "./input";
 import { updateDebugHUD, showHint } from "./hud";
 import { VoxelCharacter, POSE_ROOT_Y, STAND_ROOT_Y } from "./voxelCharacter";
+import type { WorkoutPose } from "./voxelCharacter";
 import { WaypointReticle } from "./waypoint";
 import { findPath, worldToCol, worldToRow } from "./pathfinding";
 import { roomWalkBounds } from "./floorPlanDoc";
@@ -1008,6 +1009,35 @@ export class Player {
    *  uses it to tell a fox walking UP TO the tray from one passing by. */
   public getFacing(): number {
     return this.logicalAngle;
+  }
+
+  /** 🏋️ Turn the standing fox to face a world point (follow-the-coach: the
+   *  class faces its coach) — snapped to the same 8-way facings walking uses.
+   *  The per-frame idle setState picks the new angle up immediately. */
+  public faceToward(x: number, z: number): void {
+    const p = this.mesh.position;
+    this.logicalAngle = snapTo8Ways(Math.atan2(x - p.x, z - p.z));
+  }
+
+  /** 🏋️ Follow-the-coach pose passthrough (see VoxelCharacter.setWorkoutPose). */
+  public setWorkoutPose(pose: WorkoutPose | null): void {
+    this.character.setWorkoutPose(pose);
+  }
+
+  /** 🏋️ Simply standing — the follow-the-coach gate. The idle ANIMATION alone
+   *  isn't enough: seat turn/fine-approach, device engagement, door waits and
+   *  the vat exit all show it too, and an escort walk from any of those would
+   *  cancel the action. So: idle pose AND no interaction in flight. */
+  public isStandingIdle(): boolean {
+    return (
+      this.character.getState() === "idle" &&
+      this.sitPhase === "NONE" &&
+      this.vatPhase === "NONE" &&
+      this.deviceTarget === null &&
+      this.doorTarget === null &&
+      this.adapterOutTarget === null &&
+      this.pendingDest === null
+    );
   }
 
   /** 🍹 Waiter-bot serve: drive the fox's drink-hold arm pose (0 = reach

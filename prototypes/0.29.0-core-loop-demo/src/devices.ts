@@ -35,6 +35,16 @@ import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
+import { readChainSyncStatus, readRoomBindingResult, treasuryDocBound } from './treasuryDoc';
+import { treasuryNetwork } from './treasuryNetwork';
+import {
+  type FundingReadAccess,
+  TREASURY_MUTED,
+  displayHeight,
+  formatHeight,
+  roomFundingView,
+  shortId,
+} from './treasuryView';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -54,7 +64,7 @@ import {
   B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
 } from './games/chess';
 import type { ChessState, ChessColor } from './games/chess';
-import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
@@ -445,6 +455,136 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         : 'NO ADJACENT MODULE DATA';
     }
 
+    // 🏦 FUNDING (plan §10.2): what the room's signed binding cache says
+    // about a company funding this room — or, just as often, that it says
+    // nothing. It never concludes the costs are therefore personal: no record
+    // is not evidence of no company, and this panel's whole job is to keep
+    // those apart.
+    // Read-only by design in this PR — the terminal never spends, never asks
+    // for a treasury key, and funding a room grants nobody edit rights (§9.4).
+    const fundEl = panel.querySelector<HTMLElement>('#device-terminal-funding-source');
+    const fundDetailEl = panel.querySelector<HTMLElement>('#device-terminal-funding-detail');
+    if (fundEl && fundDetailEl) {
+      const roomId =
+        (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+      // treasuryDocBound() only says a room document is attached: with no
+      // network pinned, every treasury read is disabled and returns null,
+      // which is NOT the same as there being no funding record. Gate on the
+      // network too so a disabled read is never reported as an absence.
+      // Three obstacles, not one. Collapsing them into a single boolean made
+      // this panel blame the room connection for an unconfigured build —
+      // which is every build with no VITE_SSF_TREASURY_GENESIS set, so a
+      // player in a perfectly healthy room read "cannot reach the room's
+      // records" while their own phone correctly said no network is
+      // configured. Two surfaces in one PR, contradicting each other.
+      const access: FundingReadAccess = !treasuryNetwork().configured
+        ? 'no-network'
+        : !roomId || !treasuryDocBound()
+          ? 'no-room'
+          : 'readable';
+      const connected = access === 'readable';
+      // Only a peer-reported height exists today. It is enough to flag a
+      // record whose end height looks passed (the conservative direction),
+      // but it can never establish that one is still live — the colour below
+      // treats every case that leans on it as unsettled.
+      const height = connected
+        ? displayHeight(readChainSyncStatus()).height
+        : null;
+      // Result form, so a record refused on size reads as a refusal rather
+      // than as an absence — the panel's whole job is keeping those apart.
+      const bindingResult = connected ? readRoomBindingResult(roomId) : null;
+      const funding = roomFundingView(
+        bindingResult?.status === 'ok' ? bindingResult.binding : null,
+        height,
+        // Every held-but-unusable state travels — see main.ts.
+        bindingResult && bindingResult.status !== 'ok' && bindingResult.status !== 'absent'
+          ? bindingResult.status
+          : access,
+        // Who the room's owner is, read live — the signer verdict rests on
+        // it, and this panel must agree with the phone about it. (Issue #138:
+        // readRoomOwnerKey is the seam an NFT-deed authority head replaces.)
+        readRoomOwnerKey(),
+      );
+      // No record is NOT the same fact as "funded personally", and an
+      // unreachable room document is a third state again — say which one.
+      // The trust status rides the headline: the read-only chain caveat says
+      // nothing about whether this record's signature was checked.
+      fundEl.textContent = connected
+        ? `${funding.headline.toUpperCase()} · ${funding.trust.label}`
+        : 'FUNDING RECORDS UNAVAILABLE · NO DATA';
+      // No green anywhere on this panel. Green reads as "funded, currently",
+      // and nothing available here establishes that: a valid signature shows
+      // who wrote the record, not that they were entitled to, that the chain
+      // confirmed it, or that it has not since been unbound. So a held record
+      // is neutral blue whatever its end height says, amber marks the two
+      // cases needing attention (no record, or one that looks ended), and grey
+      // means the lookup could not run. Green returns with a local chain
+      // verdict, not before.
+      fundEl.style.color = !connected
+        ? TREASURY_MUTED
+        : !funding.bound || funding.expiryStatus === 'passed'
+          ? '#F0C060'
+          : '#3E92B8';
+      const lines = !connected
+        ? [
+            // The model already worked out which obstacle this is and said so
+            // in the player's words. Substituting a hard-coded sentence here
+            // threw that away and named the wrong cause.
+            funding.detail,
+            funding.readOnlyNote,
+          ]
+        : funding.bound
+          ? [
+              `COMPANY ${shortId(funding.companyId ?? '')} · TREASURY ${shortId(funding.treasuryId ?? '')}`,
+              `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
+              `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+              // The signer, always: a record whose author is never shown is
+              // one a peer can forge without anyone noticing whose key it is.
+              // "BOUND BY" only when the signer is the room owner.
+              `${funding.signer === 'owner' ? 'BOUND BY' : 'SIGNED BY'} ${(funding.signerLabel ?? '—').toUpperCase()}`,
+              // And the half of §10.1 this device cannot check, said so.
+              `COMPANY APPROVAL ${(funding.companyApproval ?? '—').toUpperCase()}`,
+              funding.trust.detail,
+              // Only shown when the record names an end height at all. The
+              // note carries the verdict; the height it was judged against is
+              // named here so the player can see what the guess rests on.
+              ...(funding.expiryNote
+                ? [
+                    height === null
+                      ? funding.expiryNote.toUpperCase()
+                      : `${funding.expiryNote.toUpperCase()} REPORTED HEIGHT ${formatHeight(height)}.`,
+                  ]
+                : []),
+              funding.readOnlyNote,
+              funding.detail,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ]
+          : [
+              // A held record under someone else's key is still named by its
+              // signer, so "not the room owner" is a fact on screen and not a
+              // silence.
+              ...(funding.signerLabel ? [`SIGNED BY ${funding.signerLabel.toUpperCase()}`] : []),
+              funding.detail,
+              funding.readOnlyNote,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ];
+      fundDetailEl.textContent = lines.join('  ');
+
+      // §10.2's link to the phone Treasury app. A <button> so it answers the
+      // keyboard; the phone router only delegates inside the phone shell and
+      // this terminal is mounted elsewhere, so it goes through the same
+      // window seam other cross-module callers use.
+      const openBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-open-treasury');
+      if (openBtn && !openBtn.dataset.wired) {
+        openBtn.dataset.wired = '1';
+        openBtn.addEventListener('click', () => {
+          const open = (window as unknown as { __ssfOpenTreasury?: () => void })
+            .__ssfOpenTreasury;
+          if (open) open();
+        });
+      }
+    }
+
     // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
     // change (e.g. set via console for the non-owner test path) shows up live.
     const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
@@ -452,6 +592,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     const editNote = panel.querySelector<HTMLElement>('#device-terminal-edit-room-note');
     if (editBtn && deps.editRoom) {
       const perm = deps.editRoom.permission();
+      // Captured BEFORE anything is disabled. Browsers blur a focused button
+      // the moment it becomes disabled, so reading document.activeElement
+      // afterwards always found focus already outside the panel and the
+      // recovery below never ran at all.
+      const focusedBefore = document.activeElement as HTMLElement | null;
+      const hadFocusInPanel = Boolean(panel && focusedBefore && panel.contains(focusedBefore));
       for (const btn of [editBtn, hullBtn]) {
         if (!btn) continue;
         btn.disabled = !perm.ok;
@@ -465,6 +611,25 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           : perm.reason;
       }
       if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
+      // A permission change can disable the button that currently HAS focus.
+      // The browser then moves focus out of the panel, so the arrow-key
+      // listener bound to it never fires again and the enabled treasury link
+      // becomes unreachable — the traversal defeating itself. Catch that here,
+      // where the disabling happens, and land on a stop that still works.
+      //
+      // Tested against the SAVED reference and the state now: focus was ours,
+      // the element that held it is disabled, and focus has since left.
+      const lostFocus =
+        hadFocusInPanel &&
+        focusedBefore instanceof HTMLButtonElement &&
+        focusedBefore.disabled &&
+        !panel?.contains(document.activeElement);
+      if (lostFocus && panel) {
+        const stops = [
+          ...panel.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]'),
+        ].filter((el) => el.offsetParent !== null);
+        stops[0]?.focus({ preventScroll: true });
+      }
     }
 
     drawWireframe();
@@ -615,7 +780,27 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <div style="height:12px; border:1px solid rgba(212,168,75,0.22); border-radius:3px; background:repeating-linear-gradient(45deg, rgba(74,85,96,0.25) 0 6px, transparent 6px 12px);"></div>
         </div>
         <div id="device-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
-        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only</div>
+        <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+          <div style="font-size:10px; color:${TREASURY_MUTED}; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
+          <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:${TREASURY_MUTED};">READING FUNDING RECORDS…</div>
+          <div id="device-terminal-funding-detail" style="font-size:9px; color:${TREASURY_MUTED}; margin-top:3px; line-height:1.5;"></div>
+          <!-- Disabled controls leave the tab order, so the reason they are
+               disabled cannot live only in their title attributes. -->
+          <div id="device-terminal-command-note" style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:6px;">These actions are not available yet — they arrive with the treasury and node lanes. This terminal never spends.</div>
+          <div role="group" aria-label="Funding commands, all currently unavailable" aria-describedby="device-terminal-command-note" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">
+            <button type="button" disabled title="Arrives with the treasury lane — the terminal cannot spend."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">SELECT PROFILE</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">UNBIND</button>
+            <button type="button" disabled title="Asks this player's own node for chain state — that lane has not shipped."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REFRESH PROOF</button>
+          </div>
+          <button type="button" id="device-terminal-open-treasury"
+            style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>
+        </div>
+        <div style="font-size:9px; color:${TREASURY_MUTED}; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only · ↑↓ MOVE · ENTER SELECT · ESC STEP BACK</div>
       `;
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.
@@ -637,8 +822,45 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           editRoom.requestHull();
         });
       }
+      // Keyboard traversal for the panel's controls.
+      //
+      // Tab cannot do it: main.ts binds Tab globally as the phone's open/close
+      // toggle and preventDefaults EVERY press, so the browser never cycles
+      // focus. Without this the panel's buttons — EDIT ROOM, EDIT HULL and the
+      // treasury link — are reachable by pointer only. Escape is left alone;
+      // it belongs to the device-focus controller that steps the player back
+      // out of the terminal.
+      //
+      // Enter and Space need no handling: these are real <button> elements and
+      // answer both natively once they can be focused. Disabled controls are
+      // skipped, which is also why the reason they are disabled is written in
+      // the note beside them rather than in their title attributes.
+      // Bound once here rather than read from the module-level `panel`, which
+      // unmount() sets to null — a late keydown would otherwise throw.
+      const mounted = panel;
+      const focusStops = (): HTMLElement[] =>
+        [...mounted.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]')]
+          .filter((el) => el.offsetParent !== null);
+      mounted.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        const stops = focusStops();
+        if (stops.length === 0) return;
+        e.preventDefault();
+        const here = stops.indexOf(document.activeElement as HTMLElement);
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+      });
       deps.onEngagedChange?.(true);
+      // refresh() BEFORE choosing where focus lands. It applies the EDIT ROOM
+      // permission gate, so picking first would land a non-owner on EDIT ROOM
+      // and then disable the very button holding focus — dropping focus out of
+      // the panel and leaving the enabled treasury link unreachable by the
+      // arrow traversal.
       refresh();
+      // Somewhere to start from: arrow traversal is useless if nothing in the
+      // panel holds focus when it opens. preventScroll because the panel is
+      // positioned over the canvas and must not drag the page under it.
+      focusStops()[0]?.focus({ preventScroll: true });
     },
 
     unmount(): void {

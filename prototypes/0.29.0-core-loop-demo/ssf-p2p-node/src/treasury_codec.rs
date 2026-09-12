@@ -271,6 +271,27 @@ pub fn vote_id_of(unsigned: &Value) -> Result<String> {
     }))
 }
 
+/// Mirrors voteSignatureBytes(): the bytes the voter's game key signs.
+pub fn vote_signature_bytes(genesis: &str, vote_id: &str) -> Result<Vec<u8>> {
+    canonical_encode(&serde_json::json!({
+        "domain": "ssf-treasury-vote-signature:v1",
+        "networkGenesisChallenge": genesis,
+        "voteId": vote_id,
+    }))
+}
+
+/// Mirrors payloadHashOf(): content address of a proposal payload — raw
+/// sha256 over the bytes, which travel as non-empty lowercase hex text.
+pub fn payload_hash_of(payload_hex: &str) -> Result<String> {
+    if payload_hex.is_empty()
+        || payload_hex.len() % 2 != 0
+        || !payload_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("payload_hash_of: payload must be non-empty lowercase hex bytes");
+    }
+    Ok(sha256_hex(&hex::decode(payload_hex)?))
+}
+
 const CHECKPOINT_FIELDS: [&str; 7] = [
     "v",
     "networkGenesisChallenge",
@@ -515,9 +536,26 @@ mod treasury_codec_tests {
             v["vote"]["voteId"].as_str().unwrap()
         );
         assert_eq!(
+            hex::encode(
+                vote_signature_bytes(
+                    v["vote"]["unsigned"]["networkGenesisChallenge"].as_str().unwrap(),
+                    v["vote"]["voteId"].as_str().unwrap(),
+                )
+                .unwrap()
+            ),
+            v["vote"]["signatureBytesHex"].as_str().unwrap()
+        );
+        assert_eq!(
             checkpoint_id_of(&v["checkpoint"]["body"]).unwrap(),
             v["checkpoint"]["checkpointId"].as_str().unwrap()
         );
+        assert_eq!(
+            payload_hash_of(v["payload"]["payloadHex"].as_str().unwrap()).unwrap(),
+            v["payload"]["payloadHash"].as_str().unwrap()
+        );
+        assert!(payload_hash_of("").is_err());
+        assert!(payload_hash_of("abc").is_err());
+        assert!(payload_hash_of("AB").is_err());
     }
 
     #[test]

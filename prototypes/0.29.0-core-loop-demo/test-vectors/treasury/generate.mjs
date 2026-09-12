@@ -22,10 +22,12 @@ import {
   governanceRuleHashOf,
   policyHashOf,
   proposalIdOf,
+  payloadHashOf,
   proposalSignatureBytes,
   sortedSet,
   voteIdOf,
   voteRootOf,
+  voteSignatureBytes,
 } from '../../src/treasuryTypes.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -192,6 +194,7 @@ const contracts = {
   vote: {
     unsigned: vote,
     voteId,
+    signatureBytesHex: hex(voteSignatureBytes(GENESIS, voteId)),
   },
   voteTree: {
     voteIds: otherVoteIds,
@@ -211,6 +214,11 @@ const contracts = {
   sortedSet: {
     input: ['bb', 'a', 'ab', 'b'],
     output: sortedSet(['bb', 'a', 'ab', 'b']),
+  },
+  payload: {
+    // Content-addressed payload bytes (hex): "treasury payload" in ASCII.
+    payloadHex: '7472656173757279207061796c6f6164',
+    payloadHash: payloadHashOf('7472656173757279207061796c6f6164'),
   },
 };
 

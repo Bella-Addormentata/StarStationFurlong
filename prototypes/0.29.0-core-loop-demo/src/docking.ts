@@ -80,7 +80,7 @@ import {
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
-  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed,
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency,
 } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -2363,7 +2363,11 @@ export class DoorDockingPortSystem {
       (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     const entries = Object.values(readAtlas())
       .filter((e) => e.seed && e.roomId !== currentId)
-      .sort((a, b) => b.lastSeen - a.lastSeen)
+      // 🗄️ Same rule as atlas retention: first-hand rooms before gossip-only
+      // ones. This list is SLICED to 24, so sorting it by the peer-written
+      // `lastSeen` let a peer's fresh gossip crowd the player's own visited
+      // modules out of the picker entirely (#144).
+      .sort(compareAtlasRecency)
       .slice(0, 24);
     sel.innerHTML =
       '<option value="">🗺️ … or pick a KNOWN MODULE</option>' +
