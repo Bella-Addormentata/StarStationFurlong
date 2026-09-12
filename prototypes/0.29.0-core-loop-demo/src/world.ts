@@ -3574,7 +3574,13 @@ export class World {
     this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
-    const activePlayer = this.isPlayerActive() ? this.player : null;
+    // To the robots a player is "there" only INSIDE the room (iso room view
+    // or first person, zoom ≤ 2): isPlayerActive() alone stays true in the
+    // level-3 exterior after the morph, which would arm the entry edge —
+    // and let call-outs / the class escort reach a fox still on the ENTER
+    // ROOM prompt — before anyone has actually entered.
+    const activePlayer =
+      this.isPlayerActive() && zoomLevel <= 2 ? this.player : null;
     // 🔇 The moment the player actually ENTERS the room (boot flow's ENTER
     // ROOM, a door transit, morph end) re-arms the robot quiet window — the
     // world runs behind the welcome overlay, so "1 s after room build" alone

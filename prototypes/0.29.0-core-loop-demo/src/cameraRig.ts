@@ -155,14 +155,16 @@ export function getCameraYaw(): number {
 
 /**
  * Yaw of the camera-forward direction on the GROUND plane, from the snapped
- * detent yaw: the base iso offset (1,1)/√2 rotated by the rig's yaw reduces
- * to `yaw + π/4` (its XZ unit vector is `(sin, cos)` of this). Exported so
+ * yaw the camera is actually AT (detent + station bias, see getCameraYaw —
+ * an oriented door transit rotates the frame, and "face the screen" must
+ * follow it): the base iso offset (1,1)/√2 rotated by that yaw reduces to
+ * `yaw + π/4` (its XZ unit vector is `(sin, cos)` of this). Exported so
  * facing-the-camera consumers (🏋️ the coach's stage) stop hand-inlining the
  * `(cos±sin)·√½` transform — world.ts/docking.ts's fade math are older copies
  * that can adopt this too.
  */
 export function getCameraForwardYaw(): number {
-  return targetYaw + Math.PI / 4;
+  return getCameraYaw() + Math.PI / 4;
 }
 
 /**
