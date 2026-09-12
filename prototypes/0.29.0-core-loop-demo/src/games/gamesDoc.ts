@@ -26,13 +26,24 @@ import { initialState, legalMoves, applyMove, chooseBotMove, isCheckersState } f
 import type { CheckersState } from './checkers';
 import { isChessState } from './chess';
 import type { ChessState } from './chess';
+import { isWarState } from './war';
+import type { WarState } from './war';
+import { isSolitaireState } from './solitaire';
+import type { SolitaireState } from './solitaire';
+import { isPokerState } from './poker';
+import type { PokerState } from './poker';
 
-/** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`;
- *  legacy checkers states are kind-less (isCheckersState identifies them) —
- *  the additive discriminator keeps every pre-chess doc entry working. */
+/** A table hosts ONE game at a time. Chess/war/solitaire/poker states each
+ *  carry an explicit `kind` discriminator; legacy checkers states are kind-less
+ *  (isCheckersState identifies them) — the additive discriminator keeps every
+ *  pre-chess doc entry working. New card-felt games (#45) piggy-back on the
+ *  same shape-guarded whole-value LWW seam as the board games. */
 export type TableGame =
   | { kind: 'checkers'; state: CheckersState }
-  | { kind: 'chess'; state: ChessState };
+  | { kind: 'chess'; state: ChessState }
+  | { kind: 'war'; state: WarState }
+  | { kind: 'solitaire'; state: SolitaireState }
+  | { kind: 'poker'; state: PokerState };
 
 let boundDoc: Y.Doc | null = null;
 let gamesMap: Y.Map<unknown> | null = null;
@@ -93,16 +104,27 @@ export function readGame(tableId: string): CheckersState | null {
 }
 
 /** Kind-discriminated read: whichever game currently lives on the table.
- *  Chess carries `kind: 'chess'`; kind-less entries are legacy checkers. */
+ *  Chess/war/solitaire/poker carry an explicit `kind`; kind-less entries are
+ *  legacy checkers. Order matters: check tagged kinds BEFORE the tag-less
+ *  isCheckersState (a tagged object still passes checkers' shape check if a
+ *  hostile peer somehow crafted one). */
 export function readTable(tableId: string): TableGame | null {
   const value = ensureMap().get(tableId);
   if (isChessState(value)) return { kind: 'chess', state: value };
+  if (isWarState(value)) return { kind: 'war', state: value };
+  if (isSolitaireState(value)) return { kind: 'solitaire', state: value };
+  if (isPokerState(value)) return { kind: 'poker', state: value };
   if (isCheckersState(value)) return { kind: 'checkers', state: value };
   return null;
 }
 
-/** Transacted whole-value write of one table's state (LWW per table key). */
-export function writeGame(tableId: string, state: CheckersState | ChessState): void {
+/** Transacted whole-value write of one table's state (LWW per table key).
+ *  Accepts any TableGame state — the shape guards on read reject anything
+ *  malformed that a rogue peer might drop into the map. */
+export function writeGame(
+  tableId: string,
+  state: CheckersState | ChessState | WarState | SolitaireState | PokerState,
+): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(tableId, state);
@@ -140,6 +162,11 @@ export function readPlayerDisplayName(playerId: string): string {
 // state + engine legality from the console; the __players / __deviceFocus
 // precedent). See PR #45 evidence.
 (window as unknown as { __ssfGames: unknown }).__ssfGames = {
-  readGame, writeGame, subscribeGames,
+  readGame, readTable, writeGame, clearTable, subscribeGames,
   checkers: { initialState, legalMoves, applyMove, chooseBotMove },
+  // Card-felt engines (#45) — sanity-check state transitions from devtools.
+  // Kept intentionally lightweight; the games/ modules are the source of truth.
+  cards: {
+    isCheckersState, isChessState, isWarState, isSolitaireState, isPokerState,
+  },
 };
