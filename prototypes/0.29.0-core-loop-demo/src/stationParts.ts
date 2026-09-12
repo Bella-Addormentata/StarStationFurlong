@@ -13,13 +13,18 @@
 
 import type { ConnectorSegment } from './adapter';
 
-const PARTS_KEY = 'ssf-station-parts';       // { flex: n, ext: n, adapter: n }
+const PARTS_KEY = 'ssf-station-parts';       // { flex: n, ext: n, adapter: n, hull: n }
 const LEDGER_KEY = 'ssf-module-ledger';      // [{ roomId, seed, mintedAt }]
 const PRESET_KEY = 'ssf-armed-preset';       // 'ring' | 'spoke' | ''
 const AUTO_ACCEPT_KEY = 'ssf-auto-accept';   // '1' when on
 const NORTH_DOOR_KEY = 'ssf-north-door';     // '1' when unlocked
 
-export type PartKind = 'flex' | 'ext' | 'adapter';
+// PartKind — connector inventory ('flex', 'ext', 'adapter') PLUS 'hull', the
+// dev-phase room-expansion unit (#66 S3: growing a room by one square tile).
+// The consumption gate that requires 'hull' to be present when the STRUCTURE
+// UX enlarges a room lives in the follow-up ticket; this file merely admits
+// the kind so tests, dev-grants, and the ledger are already shaped for it.
+export type PartKind = 'flex' | 'ext' | 'adapter' | 'hull';
 export type PresetId = 'ring' | 'spoke';
 
 export interface LedgerEntry {
@@ -41,7 +46,7 @@ export function subscribeStationParts(listener: () => void): () => void {
 
 // ── Parts counts ─────────────────────────────────────────────────────────────
 
-function loadParts(): { flex: number; ext: number; adapter: number } {
+function loadParts(): { flex: number; ext: number; adapter: number; hull: number } {
   try {
     const raw = localStorage.getItem(PARTS_KEY);
     if (raw) {
@@ -50,13 +55,16 @@ function loadParts(): { flex: number; ext: number; adapter: number } {
         flex: Number.isFinite(p?.flex) ? Math.max(0, Math.floor(p.flex)) : 0,
         ext: Number.isFinite(p?.ext) ? Math.max(0, Math.floor(p.ext)) : 0,
         adapter: Number.isFinite(p?.adapter) ? Math.max(0, Math.floor(p.adapter)) : 0,
+        // Older installs won't have 'hull' in their PARTS_KEY blob; missing or
+        // non-finite reads to 0 rather than throwing, preserving upgrade-safety.
+        hull: Number.isFinite(p?.hull) ? Math.max(0, Math.floor(p.hull)) : 0,
       };
     }
   } catch { /* privacy mode / corrupt — start empty */ }
-  return { flex: 0, ext: 0, adapter: 0 };
+  return { flex: 0, ext: 0, adapter: 0, hull: 0 };
 }
 
-function saveParts(p: { flex: number; ext: number; adapter: number }): void {
+function saveParts(p: { flex: number; ext: number; adapter: number; hull: number }): void {
   try { localStorage.setItem(PARTS_KEY, JSON.stringify(p)); } catch { /* session-only */ }
   notify();
 }

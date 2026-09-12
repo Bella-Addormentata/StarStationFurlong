@@ -23,6 +23,7 @@
 
 import * as Y from 'yjs';
 import type { DoorId } from './doors';
+import { anyFurnitureOutsideBounds } from './furnitureDoc';
 
 export const DOOR_LATTICE = 0.5;
 /** |lateral| bound keeping opening+posts inside the 11.8 run for BOTH door
@@ -361,14 +362,49 @@ export function roomPlaceBounds(): { boundX: number; boundZ: number } {
   return { boundX: halfX - 1.0, boundZ: halfZ - 1.0 };
 }
 
+/** Outcome of `writeRoomDims`. The write can be refused for reasons the caller
+ *  needs to surface (a shrink stranding furniture, an out-of-envelope value,
+ *  the doc not being bound yet). A caller that does not want the extra detail
+ *  can still just check `.ok`. */
+export type WriteRoomDimsResult =
+  | { ok: true }
+  | { ok: false; reason: 'not-bound' | 'invalid-dims' | 'stranded-furniture' };
+
 /** Owner UI: set the room's rectangular size in 6 m tiles. Sanitized here as
  *  well as on read. Bumps meta.v→2 + minClient so a pre-rectangle client that
- *  loads a resized room is warned (it would render the legacy 2×2 walls). */
-export function writeRoomDims(cols: number, rows: number): void {
-  if (!docAlive()) return;
+ *  loads a resized room is warned (it would render the legacy 2×2 walls).
+ *
+ *  🧱 #66 S3 (audit remediation) — two guards on the write side:
+ *
+ *  1. A shrink that would strand placed furniture PAST the new wall is refused.
+ *     Growth and same-size writes never strand anything, so the check runs only
+ *     on a genuine shrink. The owner surfaces the refusal (see devMenu's
+ *     `applyDimDelta`) and moves the offenders inside the new bounds first —
+ *     silently clamping items would surprise-move the room; refusing tells the
+ *     truth about why a click did nothing.
+ *
+ *  2. On a shrink BACK to the default `DEFAULT_DIMS`, the S3 advisory stamps
+ *     (`meta.v=2`, `roomInfo.minClient='0.32.36'`) are reverted to the seeded
+ *     baseline (`meta.v=1`, `roomInfo.minClient='0.32.1'`). Without this a room
+ *     that visually returned to legacy shape would keep advertising a min-client
+ *     it no longer needs — cosmetic today, but the exact kind of stale peer gate
+ *     that would refuse an older joiner from a room that would in fact render
+ *     for them. */
+export function writeRoomDims(cols: number, rows: number): WriteRoomDimsResult {
+  if (!docAlive()) return { ok: false, reason: 'not-bound' };
   const c = sanitizeTileCount(cols);
   const r = sanitizeTileCount(rows);
-  if (c === null || r === null) return;
+  if (c === null || r === null) return { ok: false, reason: 'invalid-dims' };
+  const newHalfX = (c * TILE_SIZE) / 2;
+  const newHalfZ = (r * TILE_SIZE) / 2;
+  // Cheap same-frame comparison against the cached extents (kept fresh by
+  // recomputeRoomHalf). A grow-or-stay on BOTH axes needs no stranding check —
+  // the new box strictly contains the old one, so nothing that fit before can
+  // strand now. Only a strict shrink on either axis gates.
+  const shrinking = newHalfX < roomHalf.halfX || newHalfZ < roomHalf.halfZ;
+  if (shrinking && anyFurnitureOutsideBounds(newHalfX, newHalfZ)) {
+    return { ok: false, reason: 'stranded-furniture' };
+  }
   boundDoc!.transact(() => {
     planMap!.set('dims', { cols: c, rows: r });
     const nonDefault = c !== DEFAULT_DIMS.cols || r !== DEFAULT_DIMS.rows;
@@ -376,6 +412,19 @@ export function writeRoomDims(cols: number, rows: number): void {
       planMap!.set('meta', { v: 2 });
       const roomInfo = boundDoc!.getMap('roomInfo');
       roomInfo.set('minClient', '0.32.36');
+    } else {
+      // Shrunk BACK to the default 2×2 — the S3 advisory no longer applies.
+      // Downgrade ONLY the specific values THIS release wrote (meta.v=2, the
+      // '0.32.36' minClient): a future advisory (meta.v>2, a different
+      // minClient string) is not our raise to lower, and an untouched Case-C
+      // peer that never grew must not have an advisory fabricated for it.
+      // The downgrade rides the same transaction as the dims write, so under
+      // LWW every peer converges to the honest post-shrink advisory.
+      const priorMeta = planMap!.get('meta') as { v?: number } | undefined;
+      if (priorMeta?.v === 2) planMap!.set('meta', { v: 1 });
+      const roomInfo = boundDoc!.getMap('roomInfo');
+      if (roomInfo.get('minClient') === '0.32.36') roomInfo.set('minClient', '0.32.1');
     }
   });
+  return { ok: true };
 }

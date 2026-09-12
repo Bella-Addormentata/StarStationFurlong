@@ -171,6 +171,35 @@ export function seedFurnitureDefaults(): void {
 }
 
 /**
+ * 🧱 #66 S3 (audit remediation): would ANY placed furniture centre land OUTSIDE
+ * the given half-extents' placement box after a shrink? The write-side gate in
+ * `writeRoomDims` refuses a shrink that would strand items — the owner then
+ * moves the offenders inside the new bounds and retries. The check reads the
+ * SAME box `roomPlaceBounds()` computes (`half − 1.0` per axis; guarded ≥0 so a
+ * degenerate half doesn't underflow into a negative bound), so what the write
+ * gate refuses matches exactly what the placement editor would refuse itself.
+ * Every item is checked regardless of its `movable` flag — kinds overridden to
+ * movable at read time (see MOVABLE_KIND_OVERRIDE) still carry `false` in their
+ * stored record, and even the "immovable" wall-anchored fixtures can be
+ * stranded by a shrink that moves their wall inward, so ignoring the flag here
+ * is the honest behaviour.
+ */
+export function anyFurnitureOutsideBounds(halfX: number, halfZ: number): boolean {
+  if (!docAlive()) return false;
+  const boundX = Math.max(0, halfX - 1.0);
+  const boundZ = Math.max(0, halfZ - 1.0);
+  // 🚀 Fast path: readAllFurniture would sanitize AND clone every record. We
+  // only need x/z on the shape-valid ones, so iterate the map directly and
+  // let isFurnitureRecord skip hostile writes (a plant with junk coords
+  // shouldn't gate an honest owner's shrink).
+  for (const value of furnitureMap!.values()) {
+    if (!isFurnitureRecord(value)) continue;
+    if (Math.abs(value.x) > boundX || Math.abs(value.z) > boundZ) return true;
+  }
+  return false;
+}
+
+/**
  * 🏗️ Room templates (dev tool): atomically REPLACE the whole room layout with
  * `items` — clear every existing record then place the template — in ONE
  * transaction, so the furniture reconcile rebuilds the room exactly once (no
