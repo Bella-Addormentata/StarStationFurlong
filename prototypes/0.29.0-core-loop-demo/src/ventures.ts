@@ -286,6 +286,19 @@ export function detachOfficeRecord(): boolean {
   const v = ventureRecord();
   if (!v || v.snapshotAt !== undefined) return false; // links use removeVentureLink
   boundDoc!.transact(() => { ventureMap!.delete('v'); });
+  // 🧹 The personal ledger is the OTHER half of the repair, and deleting only
+  // the doc record left it behind. `syncVentureLedgerFromCurrentRoom` cannot
+  // clean it up afterwards — its first line returns early once `ventureRecord()`
+  // is null — so the fabricated venture stayed in the victim's VENTURES list,
+  // still naming them a shareholder, and the stale entry still fed the
+  // `ADD THIS MODULE` path, which would re-propagate the forged cap table into
+  // a room they really do own. Deregistering has to mean both.
+  //
+  // This lives HERE rather than in the caller so it is covered by tests: the
+  // ledger is exactly the kind of second-order state that a UI-side call site
+  // forgets, and #143's own writeup already flagged `removeFromVentureLedger`
+  // as having no callers — the repair path was identified and then not wired.
+  removeFromVentureLedger(v.id);
   return true;
 }
 
