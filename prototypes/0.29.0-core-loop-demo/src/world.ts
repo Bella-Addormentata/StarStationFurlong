@@ -3591,7 +3591,7 @@ export class World {
     this.hadActivePlayer = !!activePlayer;
     for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
 
-    this.updateCoachFollow(deltaTime, activePlayer);
+    this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
 
     // 🎰🤖 #77B: post the robot at the roulette wheel-head, narrate the calls
     // (all clients), and drive the betting timer (the elected operator only).
@@ -4898,16 +4898,26 @@ export class World {
    *  camera too, and mirrors the demo in lockstep (the bot supplies the
    *  chibi-scaled pose — getFollowerPose). The pose only applies while
    *  idle, so walking away or sitting down breaks the follow. */
-  private updateCoachFollow(deltaTime: number, activePlayer: Player | null): void {
-    const stageYaw = getCameraForwardYaw();
+  private updateCoachFollow(
+    deltaTime: number,
+    activePlayer: Player | null,
+    firstPerson: boolean,
+  ): void {
+    // 🎥 "The screen" in the iso room view is the rig's forward on the
+    // ground; in FIRST PERSON (#49) the camera is a perspective camera on
+    // mouse-look — the player's own eyes — so the class faces the fox.
+    const rigYaw = getCameraForwardYaw();
     this.coachEscortCooldown = Math.max(0, this.coachEscortCooldown - deltaTime);
     let workout: WorkoutPose | null = null;
     let inCircle = false;
     for (const bot of this.robots.values()) {
+      const bp = bot.getPosition();
+      const pp = this.player.mesh.position;
+      const stageYaw = firstPerson
+        ? Math.atan2(pp.x - bp.x, pp.z - bp.z)
+        : rigYaw;
       bot.setStageYaw(bot.isCoaching() ? stageYaw : null);
       if (!activePlayer || !bot.isCoaching()) continue;
-      const bp = bot.getPosition();
-      const pp = activePlayer.mesh.position;
       if (Math.hypot(bp.x - pp.x, bp.z - pp.z) > 6) continue; // the 6 m circle
       // 🚪 Door-zone exemption: a fox walking out pauses BESIDE the door
       // while it opens — never escort (or mirror) from there, or the class
@@ -4952,7 +4962,10 @@ export class World {
       break;
     }
     if (!inCircle) this.coachEscortCooldown = 0; // fresh entry escorts at once
-    activePlayer?.setWorkoutPose(workout);
+    // Always write the LOCAL player's pose: with no activePlayer (exterior
+    // view, morph) `workout` is null and this is what clears a pose captured
+    // on the last interior frame — the mesh stays visible out there.
+    (activePlayer ?? this.player).setWorkoutPose(workout);
   }
 
   private updateCroupier(): void {
