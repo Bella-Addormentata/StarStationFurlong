@@ -73,6 +73,12 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
+// 🚀 #30 SH3: the INITIATE handler refuses to start a new berthing while the
+// ship is not-docked (undocking / in-flight / redocking). A berth mid-hop
+// would leave the station side pointing at a moving target — the plan's
+// "the module IS the room; passengers travel with it" invariant relies on
+// the ship being at rest before a station lane latches on.
+import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -1226,6 +1232,25 @@ export class DoorDockingPortSystem {
         const pane = document.getElementById("docking-control-pane");
         const activeDoorId = pane ? (pane as any).activeDoorId : null;
         if (!activeDoorId) return;
+
+        // 🚀 #30 SH3: refuse a new berthing while THIS module is not docked.
+        // The doors doc key here is the LOCAL room — if we're in-flight/
+        // undocking/redocking, latching onto us would leave the station side
+        // pointing at a target that is moving out from under it. Fail LOUD
+        // (the same alert idiom the rest of this handler uses) so the player
+        // sees the refusal instead of a silent no-op. Belt-and-braces: the
+        // shared `completePairing` seam ALSO gates on the flight state (PR #134
+        // audit MAJOR — the ACCEPT handler used to bypass this check when a
+        // remote peer's request had already gone pending); this early UX check
+        // just moves the "why" copy to the player earlier in the flow.
+        const initiateFlightGate = pairingAllowedByFlight(readFlightRecord());
+        if (!initiateFlightGate.ok) {
+          alert(
+            `This module is ${initiateFlightGate.status.toUpperCase()} — new berths are refused until the flight completes and the ship redocks.`,
+          );
+          return;
+        }
+
         const state = this.doorState.get(activeDoorId);
         const addrInput = document.getElementById(
           "docking-addr-input",
@@ -1325,6 +1350,21 @@ export class DoorDockingPortSystem {
         if (!this.canConstruct(activeDoorId)) {
           alert(
             "No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).",
+          );
+          return;
+        }
+        // 🚀 #30 SH3 (PR #134 audit MAJOR): refuse an ACCEPT while THIS
+        // module is not docked. A remote peer's request may have gone
+        // PENDING before the commander DEPARTed; without this gate the
+        // ACCEPT click completes the pairing on an in-flight ship. The
+        // shared `completePairing` seam is the load-bearing invariant
+        // gate — every completion path funnels through it — but the
+        // early UX check here (mirroring the INITIATE handler) puts the
+        // "why" copy in front of the player instead of a silent no-op.
+        const acceptFlightGate = pairingAllowedByFlight(readFlightRecord());
+        if (!acceptFlightGate.ok) {
+          alert(
+            `This module is ${acceptFlightGate.status.toUpperCase()} — new berths are refused until the flight completes and the ship redocks.`,
           );
           return;
         }
@@ -2470,6 +2510,28 @@ export class DoorDockingPortSystem {
   ) {
     const state = this.doorState.get(doorId);
     if (!state) return;
+
+    // 🚀 #30 SH3 (PR #134 audit MAJOR): the LOAD-BEARING flight-state gate for
+    // every pairing completion. INITIATE and ACCEPT each carry an early UX
+    // check that surfaces the refusal reason in the user's face, but a REMOTE
+    // request may have gone PENDING before the commander DEPARTed — the
+    // ACCEPT click still funnels through here, and the auto-accept branch of
+    // INITIATE calls this too. Enforcing the invariant on the shared seam
+    // covers those and every future caller (a scripted accept, a background
+    // reconcile, a headless test) without requiring each one to re-derive the
+    // rule. Rejection is not a state advance: an accept refused here leaves
+    // the pending request intact so the far peer sees it time out /
+    // withdraw, matching today's "silent no-op" refusal shape for owner-gated
+    // paths. The pure predicate lives in shipDoc.ts (testable without a doc).
+    if (accept) {
+      const flightGate = pairingAllowedByFlight(readFlightRecord());
+      if (!flightGate.ok) {
+        console.warn(
+          `[docking] refused ACCEPTED pairing on ${doorId} — ship is ${flightGate.status} (SH3 gate)`,
+        );
+        return; // leave pairingPending alone; the request is not consumed
+      }
+    }
 
     state.pairingPending = false;
     state.pairedSuccessfully = accept;
