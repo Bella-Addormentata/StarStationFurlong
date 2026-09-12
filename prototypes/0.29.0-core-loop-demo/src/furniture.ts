@@ -35,7 +35,13 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  AirHockeyVisualHandle,
 } from "./devices";
+// 🏒 #115: the table sculpt is sized by the SAME playfield constants the pure
+// engine simulates — one source of truth for rails, goals, puck and mallets.
+import {
+  AH_SURFACE_Y, AH_HALF_W, AH_HALF_L, AH_GOAL_HALF_W, AH_PUCK_R, AH_MALLET_R,
+} from "./games/airHockey";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
@@ -105,7 +111,8 @@ export type FurnitureKind =
   | "classic-hot-tub"
   | "bunk-bed"
   | "clone-vat"
-  | "slot-machine";
+  | "slot-machine"
+  | "air-hockey-table";
 
 export interface FurnitureItem {
   id: string;
@@ -2926,6 +2933,236 @@ const gameTableStands: StandTemplate[] = [
   { stand: { x: 0.0, z: 1.5 }, faceAngle: Math.PI },
 ];
 
+// 🏒 Air hockey (#115): one stand at each END, 0.4 m beyond the 2×3 footprint
+// edge (the craps clearance rule — outside the obstacle AABB so the cell is
+// walkable). Side 'a' plays from -z facing +z; side 'b' mirrors.
+const airHockeyStands: StandTemplate[] = [
+  { stand: { x: 0.0, z: -1.9 }, faceAngle: 0 },
+  { stand: { x: 0.0, z: 1.9 }, faceAngle: Math.PI },
+];
+
+// ── 🏒 Air-hockey table builder (#115) ───────────────────────────────────────
+// A 1.7×2.7 m cabinet inside the 2×3 footprint, playfield sized exactly by the
+// engine constants, rails with real goal gaps, colour-keyed ends (side 'a'
+// cyan at -z, side 'b' orange at +z — matching the mallets), a pole-mounted
+// dual-face scoreboard OFF the long side (never occluding the iso camera's
+// view of the playfield), and the three animated pieces the
+// AirHockeyVisualHandle drives: two mallets and the puck.
+const AH_CYAN = 0x35c8e8;   // side 'a' (-z end + mallet)
+const AH_ORANGE = 0xe8933a; // side 'b' (+z end + mallet)
+/** Mallet hover height above the surface while RAISED (mouse released). */
+const AH_RAISE = 0.1;
+
+const buildAirHockeyTable = (ctx: BuildCtx): void => {
+  const { m, place, attach } = ctx;
+  const railTop = AH_SURFACE_Y + 0.06;
+
+  // Cabinet body (top face AT the playing surface) + legs + end colour bands.
+  place(new THREE.BoxGeometry(1.7, 0.22, 2.7), m(0x24303e, 0.5, 0.2), 0, AH_SURFACE_Y - 0.11, 0);
+  for (const [lx, lz] of [[-0.65, -1.15], [0.65, -1.15], [-0.65, 1.15], [0.65, 1.15]]) {
+    place(new THREE.BoxGeometry(0.12, 0.58, 0.12), m(0x1a2430, 0.55, 0.3), lx, 0.29, lz);
+  }
+  place(new THREE.BoxGeometry(1.6, 0.12, 0.05), m(AH_CYAN, 0.4, 0.25), 0, 0.72, -1.36);
+  place(new THREE.BoxGeometry(1.6, 0.12, 0.05), m(AH_ORANGE, 0.4, 0.25), 0, 0.72, 1.36);
+
+  // Playfield — CanvasTexture (NearestFilter, wall-screen idiom). The art is
+  // mirror-SYMMETRIC on purpose: no orientation to get wrong; sides are keyed
+  // by the coloured bands/mallets, not by the felt.
+  const feltCv = document.createElement("canvas");
+  feltCv.width = 512;
+  feltCv.height = 848; // ≈ the playfield's 1.52 : 2.52 aspect
+  const c2d = feltCv.getContext("2d")!;
+  c2d.fillStyle = "#0d1622";
+  c2d.fillRect(0, 0, 512, 848);
+  c2d.fillStyle = "#16283a"; // air-hole grid
+  for (let gy = 24; gy < 848; gy += 32) {
+    for (let gx = 24; gx < 512; gx += 32) c2d.fillRect(gx - 2, gy - 2, 4, 4);
+  }
+  c2d.strokeStyle = "#3a6a8a";
+  c2d.lineWidth = 6;
+  c2d.strokeRect(8, 8, 496, 832);          // boundary
+  c2d.beginPath();                          // centre line + circle
+  c2d.moveTo(8, 424);
+  c2d.lineTo(504, 424);
+  c2d.stroke();
+  c2d.beginPath();
+  c2d.arc(256, 424, 64, 0, Math.PI * 2);
+  c2d.stroke();
+  const mouthPx = (AH_GOAL_HALF_W / AH_HALF_W) * 256; // goal creases + lines
+  for (const [cy, sweep] of [[8, 1], [840, -1]] as const) {
+    c2d.beginPath();
+    c2d.arc(256, cy, 120, 0, Math.PI, sweep < 0);
+    c2d.stroke();
+    c2d.strokeStyle = "#d8e8f8";
+    c2d.lineWidth = 8;
+    c2d.beginPath();
+    c2d.moveTo(256 - mouthPx, cy);
+    c2d.lineTo(256 + mouthPx, cy);
+    c2d.stroke();
+    c2d.strokeStyle = "#3a6a8a";
+    c2d.lineWidth = 6;
+  }
+  const feltTex = new THREE.CanvasTexture(feltCv);
+  feltTex.minFilter = THREE.NearestFilter;
+  feltTex.magFilter = THREE.NearestFilter;
+  feltTex.generateMipmaps = false;
+  feltTex.colorSpace = THREE.SRGBColorSpace;
+  const feltGeo = new THREE.PlaneGeometry(AH_HALF_W * 2, AH_HALF_L * 2);
+  feltGeo.rotateX(-Math.PI / 2);
+  const felt = place(feltGeo, new THREE.MeshBasicMaterial({
+    map: feltTex,
+    transparent: true,
+    opacity: 0, // morph fade-in contract — World tweens it up
+  }), 0, AH_SURFACE_Y + 0.002, 0);
+
+  // Rails: full-length sides; END rails in two segments leaving the goal gap.
+  const railMat = () => m(0xb8c4d0, 0.35, 0.55);
+  const sideX = AH_HALF_W + 0.045;
+  place(new THREE.BoxGeometry(0.09, 0.06, 2.7), railMat(), -sideX, railTop - 0.03, 0);
+  place(new THREE.BoxGeometry(0.09, 0.06, 2.7), railMat(), sideX, railTop - 0.03, 0);
+  const endSegW = AH_HALF_W - AH_GOAL_HALF_W;             // 0.46 per segment
+  const endSegX = AH_GOAL_HALF_W + endSegW / 2;
+  const endZ = AH_HALF_L + 0.045;
+  for (const ez of [-endZ, endZ]) {
+    place(new THREE.BoxGeometry(endSegW, 0.06, 0.09), railMat(), -endSegX, railTop - 0.03, ez);
+    place(new THREE.BoxGeometry(endSegW, 0.06, 0.09), railMat(), endSegX, railTop - 0.03, ez);
+    // Dark catch slot under the gap so the mouth reads as an opening.
+    place(new THREE.BoxGeometry(AH_GOAL_HALF_W * 2, 0.05, 0.09), m(0x0a0e14, 0.7, 0.05), 0, AH_SURFACE_Y - 0.005, ez);
+  }
+
+  // Goal lamps — one over each mouth; flashGoal() strobes the breached end.
+  const lampMatA = m(0xe84a5a, 0.4, 0.1, 0xe84a5a, 0);
+  const lampMatB = m(0xe84a5a, 0.4, 0.1, 0xe84a5a, 0);
+  place(new THREE.BoxGeometry(0.16, 0.05, 0.06), lampMatA, 0, railTop + 0.02, -endZ);
+  place(new THREE.BoxGeometry(0.16, 0.05, 0.06), lampMatB, 0, railTop + 0.02, endZ);
+
+  // Scoreboard: pole off the +x LONG side (outside the 1.7 m cabinet, inside
+  // the 2 m footprint), dual-face panel high enough to read from both ends
+  // without ever hanging over the playfield.
+  place(new THREE.CylinderGeometry(0.03, 0.04, 1.5, 10), m(0x2a3644, 0.5, 0.4), 0.94, 0.75, 0);
+  const scoreCv = document.createElement("canvas");
+  scoreCv.width = 512;
+  scoreCv.height = 256;
+  const s2d = scoreCv.getContext("2d")!;
+  const drawScore = (a: number, b: number, statusLine: string): void => {
+    s2d.fillStyle = "#0a1018";
+    s2d.fillRect(0, 0, 512, 256);
+    s2d.strokeStyle = "#2a4a66";
+    s2d.lineWidth = 8;
+    s2d.strokeRect(6, 6, 500, 244);
+    s2d.textAlign = "center";
+    s2d.fillStyle = "#7a92aa";
+    s2d.font = "bold 34px monospace";
+    s2d.fillText("AIR HOCKEY", 256, 52);
+    // Scores are colour-keyed to the mallets/end bands — readable from both
+    // faces without any left/right side convention to misread.
+    s2d.font = "bold 108px monospace";
+    s2d.fillStyle = "#35c8e8";
+    s2d.fillText(String(a), 140, 158);
+    s2d.fillStyle = "#526a82";
+    s2d.fillText(":", 256, 152);
+    s2d.fillStyle = "#e8933a";
+    s2d.fillText(String(b), 372, 158);
+    s2d.fillStyle = "#d8e8f8";
+    s2d.font = "bold 30px monospace";
+    s2d.fillText(statusLine.slice(0, 26).toUpperCase(), 256, 222);
+  };
+  drawScore(0, 0, "walk up to play");
+  const mkScoreTex = (mirror: boolean): THREE.CanvasTexture => {
+    const t = new THREE.CanvasTexture(scoreCv);
+    t.minFilter = THREE.NearestFilter;
+    t.magFilter = THREE.NearestFilter;
+    t.generateMipmaps = false;
+    t.colorSpace = THREE.SRGBColorSpace;
+    if (mirror) {
+      // Back face: un-mirror the text for the -z viewer.
+      t.wrapS = THREE.RepeatWrapping;
+      t.repeat.x = -1;
+    }
+    return t;
+  };
+  const scoreTexFront = mkScoreTex(false);
+  const scoreTexBack = mkScoreTex(true);
+  const panelGeoFront = new THREE.PlaneGeometry(0.72, 0.36); // faces +z (side b)
+  const panelGeoBack = new THREE.PlaneGeometry(0.72, 0.36);
+  panelGeoBack.rotateY(Math.PI);                             // faces -z (side a)
+  place(panelGeoFront, new THREE.MeshBasicMaterial({ map: scoreTexFront, transparent: true, opacity: 0 }), 0.94, 1.58, 0.005);
+  place(panelGeoBack, new THREE.MeshBasicMaterial({ map: scoreTexBack, transparent: true, opacity: 0 }), 0.94, 1.58, -0.005);
+
+  // Animated pieces — hidden until a session shows them. All ctx.m materials
+  // so they ride the morph fade like every other mesh in the group.
+  const puck = place(
+    new THREE.CylinderGeometry(AH_PUCK_R, AH_PUCK_R, 0.024, 20),
+    m(0x141a22, 0.35, 0.15),
+    0, AH_SURFACE_Y + 0.014, 0,
+  );
+  puck.visible = false;
+  const mkMallet = (color: number): THREE.Group => {
+    const g = new THREE.Group();
+    const base = new THREE.Mesh(
+      new THREE.CylinderGeometry(AH_MALLET_R, AH_MALLET_R * 1.06, 0.04, 20),
+      m(color, 0.35, 0.15),
+    );
+    base.position.y = 0.02;
+    const knob = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.036, 0.05, 0.06, 14),
+      m(color, 0.3, 0.2),
+    );
+    knob.position.y = 0.07;
+    g.add(base, knob);
+    g.visible = false;
+    attach(g);
+    return g;
+  };
+  const mallets = { a: mkMallet(AH_CYAN), b: mkMallet(AH_ORANGE) };
+
+  // ── Handle state: net-driven positions snap; the hover height eases. ──
+  const hover = {
+    a: { y: AH_SURFACE_Y + AH_RAISE, target: AH_SURFACE_Y + AH_RAISE },
+    b: { y: AH_SURFACE_Y + AH_RAISE, target: AH_SURFACE_Y + AH_RAISE },
+  };
+  const flash = { a: 0, b: 0 };
+  let scoreKey = "";
+  const handle: AirHockeyVisualHandle = {
+    setMallet(side, x, z, down, visible): void {
+      const g = mallets[side];
+      g.visible = visible;
+      g.position.x = x;
+      g.position.z = z;
+      hover[side].target = AH_SURFACE_Y + (down ? 0 : AH_RAISE);
+    },
+    setPuck(x, z, visible): void {
+      puck.visible = visible;
+      puck.position.x = x;
+      puck.position.z = z;
+    },
+    setScore(a, b, statusLine): void {
+      const key = `${a}|${b}|${statusLine}`;
+      if (key === scoreKey) return; // dedupe — callers may repeat every frame
+      scoreKey = key;
+      drawScore(a, b, statusLine);
+      scoreTexFront.needsUpdate = true;
+      scoreTexBack.needsUpdate = true;
+    },
+    flashGoal(side): void {
+      flash[side] = 1;
+    },
+    update(dt: number): void {
+      const d = Math.max(0, dt);
+      for (const side of ["a", "b"] as const) {
+        const h = hover[side];
+        h.y += (h.target - h.y) * Math.min(1, d * 14);
+        mallets[side].position.y = h.y;
+        flash[side] = Math.max(0, flash[side] - d * 1.4);
+      }
+      // Strobe: 3 pulses over the ~0.7 s decay window.
+      lampMatA.emissiveIntensity = flash.a > 0 ? (Math.sin(flash.a * 19) * 0.5 + 0.5) * 2.4 : 0;
+      lampMatB.emissiveIntensity = flash.b > 0 ? (Math.sin(flash.b * 19) * 0.5 + 0.5) * 2.4 : 0;
+    },
+  };
+  felt.userData.airHockey = handle; // collected by World.registerFurnitureGroup
+};
+
 export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "fireplace-wall": {
     kind: "fireplace-wall",
@@ -3165,6 +3402,24 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.55, z: -0.95 },
       anchor: { x: 0, y: 0.82, z: 0 },
+    },
+  },
+  // 🏒 Air-hockey table (#115): footprint 2×3 — the issue's "room to stand at
+  // either end". The device template holds the SIDE-'a' (-z) values; World's
+  // requestDeviceFocus swaps in the mirrored front/eye per engaged end (both
+  // ends are play positions, unlike the single-front devices above).
+  "air-hockey-table": {
+    kind: "air-hockey-table",
+    build: buildAirHockeyTable,
+    footprint: { w: 2, d: 3 },
+    functions: ["airHockeyTable"],
+    stands: airHockeyStands,
+    device: {
+      kind: "airHockey",
+      front: { x: 0, z: -1.9 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.62, z: -1.85 },
+      anchor: { x: 0, y: AH_SURFACE_Y, z: 0 },
     },
   },
   // ── 🚀 Ship fittings (#30 SH1) — capability = the `functions` TAG, not the

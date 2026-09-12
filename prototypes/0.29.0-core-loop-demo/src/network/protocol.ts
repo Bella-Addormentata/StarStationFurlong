@@ -172,7 +172,9 @@ export interface ChatMessage {
 //                 'sleep' pose, bit3: elevated berth — top bunk [🛏️],
 //                 bit4: swimming — pool seat, 'swim' pose [🏊],
 //                 bit5: diving — mid dive arc, yaw = arc heading [🏊‍♂️],
-//                 rest reserved)
+//                 bits6–7: tick LANE KIND [#115] — 0 movement (all pre-#115
+//                 traffic), 1 air-hockey mallet, 2 air-hockey puck; bits 0–5
+//                 are kind-scoped for kinds ≠ 0. See tickKind() below.)
 //   [1..5)   f32  x
 //   [5..9)   f32  z
 //   [9..11)  u16  yaw    (radians × 10430.378 → 0..65535 wraps 2π)
@@ -213,6 +215,39 @@ export function unpackTick(buf: Uint8Array): MovementTick {
     yaw: dv.getUint16(9, true) / YAW_SCALE,
     seq: dv.getUint16(11, true),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Tick lane kinds — flags bits 6–7 (#115: air hockey).
+//
+// The 13-byte tick is the room's only unreliable datagram, and the node relays
+// it content-blind, so per-frame game entities (air-hockey mallet/puck) reuse
+// the same wire format instead of growing a second lane. Bits 6–7 of flags
+// discriminate: kind 0 is a movement tick exactly as before (all six pose bits
+// were assigned, so every pre-#115 sender already emits kind 0), and non-zero
+// kinds reinterpret flags bits 0–5 / x / z / yaw per their own codec (see
+// games/airHockey.ts). Receivers route on tickKind() BEFORE treating a tick as
+// avatar movement; x/z stay world-space in every kind so a stale pre-#115
+// client misparses a game tick as at worst an avatar standing on the table.
+// ---------------------------------------------------------------------------
+
+/** Bit position of the 2-bit lane-kind field inside flags. */
+export const TICK_KIND_SHIFT = 6;
+/** Kind 0: avatar movement — the original (and default) lane. */
+export const TICK_KIND_MOVEMENT = 0;
+/** Kind 1: air-hockey mallet (bit0 = down; yaw unused). */
+export const TICK_KIND_AH_MALLET = 1;
+/** Kind 2: air-hockey puck (bits0–4 speed, bit5 active; yaw = heading). */
+export const TICK_KIND_AH_PUCK = 2;
+
+/** Lane kind of a received tick (0–3). */
+export function tickKind(flags: number): number {
+  return (flags >> TICK_KIND_SHIFT) & 0b11;
+}
+
+/** Kind → its flags bit pattern, OR-able with the kind's payload bits. */
+export function packTickKind(kind: number): number {
+  return (kind & 0b11) << TICK_KIND_SHIFT;
 }
 
 // ---------------------------------------------------------------------------

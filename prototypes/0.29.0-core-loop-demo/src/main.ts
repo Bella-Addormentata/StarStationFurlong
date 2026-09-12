@@ -16,12 +16,20 @@ import {
   packTick,
   unpackTick,
   unpackAddressedTick,
+  tickKind,
+  TICK_KIND_MOVEMENT,
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
   type RoomBootstrap,
   type RoomMemberHint,
 } from "./network/protocol";
+// 🏒 #115: air-hockey game traffic shares the movement datagram lane,
+// discriminated by flags bits 6–7 — see the onTick dispatch + sender wiring.
+import {
+  routeAirHockeyTick,
+  setAirHockeySender,
+} from "./airHockeySession";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -315,6 +323,10 @@ const mouse = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+// 🏒 #115: give the air-hockey session its outbound datagram seam. The
+// provider is a boot-time singleton and sendTick self-gates on connection
+// state (clean no-op offline), so one wiring here covers every room join.
+setAirHockeySender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -1737,6 +1749,18 @@ async function joinRoomAtEpoch(
         tick = unpackTick(buf);
       } else {
         return; // unknown datagram framing — ignore
+      }
+      // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are
+      // game traffic for the air-hockey session, NOT avatar movement —
+      // dispatched BEFORE the avatar bookkeeping so a game tick can never
+      // mint a phantom avatar at the table. It still refreshes peer liveness
+      // (the sender is demonstrably alive; their avatar stands at the table).
+      if (tickKind(tick.flags) !== TICK_KIND_MOVEMENT) {
+        seenPeers.add(peerId);
+        receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
+        routeAirHockeyTick(peerId, tick);
+        return;
       }
       seenPeers.add(peerId);
       receivedTicks++;
