@@ -8,7 +8,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { bindStationAtlasDoc, harvestIntoAtlas, readAtlas } from './stationAtlas';
+import { bindStationAtlasDoc, harvestIntoAtlas, pushAtlasToDoc, readAtlas } from './stationAtlas';
 
 /** vitest runs in node here, so the atlas's localStorage needs a shim. */
 const store = new Map<string, string>();
@@ -68,11 +68,52 @@ describe('gossip stamp bounds (#144)', () => {
   });
 
   it('a refused entry cannot inflate local recency', () => {
-    doc.getMap('atlas').set('module-evil', shared('module-evil', 8.64e15));
+    // A valid entry alongside the poisoned one, so the assertion has something
+    // to check — without it readAtlas() is empty and the loop is vacuous.
+    const m = doc.getMap('atlas');
+    m.set('module-ok', shared('module-ok', Date.now() - 60_000));
+    m.set('module-evil', shared('module-evil', 8.64e15));
     bind();
-    for (const e of Object.values(readAtlas())) {
-      expect(e.lastSeen).toBeLessThanOrEqual(Date.now() + HOUR);
+
+    const atlas = readAtlas();
+    expect(atlas['module-ok']).toBeDefined();
+    expect(atlas['module-evil']).toBeUndefined();
+    expect(Object.keys(atlas).length).toBeGreaterThan(0);
+    for (const e of Object.values(atlas)) {
+      expect(e.lastSeen).toBeLessThanOrEqual(Date.now() + 6 * HOUR);
     }
+  });
+
+  it('repairs a legacy far-future lastSeen already in localStorage', () => {
+    // Poisoned before the ingest bound shipped — the guard cannot reach it.
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-old': {
+        roomId: 'module-old', name: 'OLD', doors: {}, lastSeen: 8.64e15,
+      },
+    }));
+
+    const entry = readAtlas()['module-old'];
+    expect(entry).toBeDefined();          // the room survives...
+    expect(entry.lastSeen).toBe(0);       // ...its impossible stamp does not
+  });
+
+  it('does not republish a legacy far-future stamp into a room doc', () => {
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-old': {
+        roomId: 'module-old',
+        name: 'OLD',
+        doors: { n: { targetRoomId: 'module-nbr', targetSeed: '' } },
+        lastSeen: 8.64e15,
+      },
+    }));
+    bind('module-old');
+    pushAtlasToDoc();
+
+    const published = doc.getMap('atlas').get('module-old') as { updatedAt: number } | undefined;
+    // Unconditional: the entry HAS a door, so pushAtlasToDoc does not skip it
+    // as a stub. Guarding this with `if (published)` would make it vacuous.
+    expect(published).toBeDefined();
+    expect(published!.updatedAt).toBe(0);
   });
 });
 

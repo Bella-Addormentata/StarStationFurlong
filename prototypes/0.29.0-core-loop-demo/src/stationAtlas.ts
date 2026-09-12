@@ -122,7 +122,23 @@ export function readAtlas(): Record<string, AtlasEntry> {
     const raw = localStorage.getItem(KEY);
     if (!raw) return {};
     const obj = JSON.parse(raw);
-    return typeof obj === 'object' && obj !== null ? obj as Record<string, AtlasEntry> : {};
+    if (typeof obj !== 'object' || obj === null) return {};
+    const atlas = obj as Record<string, AtlasEntry>;
+    // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
+    // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
+    // — and it does not just sit there: pushAtlasToDoc republishes it as
+    // `updatedAt` (`Math.max(entry.lastSeen, known.updatedAt + 1)`), so a
+    // legacy far-future value would be broadcast into every room doc we join,
+    // where the new validator then REFUSES the entry — leaving that room
+    // unmergeable for everyone until the poison is cleared at its source.
+    // Zeroing it is the self-heal: the entry survives, and the next honest
+    // gossip outranks it (`prior.lastSeen >= value.updatedAt` no longer holds).
+    const ceiling = Date.now() + MAX_GOSSIP_SKEW_MS;
+    for (const e of Object.values(atlas)) {
+      if (typeof e?.lastSeen === 'number' && e.lastSeen > ceiling) e.lastSeen = 0;
+      if (typeof e?.localSeenAt === 'number' && e.localSeenAt > ceiling) e.localSeenAt = 0;
+    }
+    return atlas;
   } catch { return {}; }
 }
 
