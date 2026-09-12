@@ -878,6 +878,14 @@ export function scanProposals(
   );
 }
 
+// 🚫 `listVotes` / `listCheckpoints` were removed deliberately. They verified
+// every peer-written record under a prefix synchronously and returned a bare
+// array, discarding truncation, size-refusal and invalid counts — the same
+// unbounded render foot-gun `listProposals` and `listSigningSessions` were
+// taken out to prevent, left behind on the two record classes that got their
+// paging last. Use `scanVotes` / `scanCheckpoints`: a caller must choose its
+// budgets and handle the partial flags, which is the point.
+
 export function scanVotes(
   proposalId: string,
   maxEntries: number,
@@ -988,20 +996,6 @@ export function readVote(proposalId: string, voterGamePub: string): TreasuryVote
   return value;
 }
 
-export function listVotes(proposalId: string): TreasuryVote[] {
-  const m = readMap();
-  if (!m) return [];
-  const out: TreasuryVote[] = [];
-  const prefix = `vote:${proposalId}:`;
-  for (const [key, value] of m.entries()) {
-    if (!key.startsWith(prefix)) continue;
-    if (validVote(value)
-      && key === `vote:${value.proposalId}:${value.voterGamePub}`) {
-      out.push(value);
-    }
-  }
-  return out;
-}
 
 // ---------------------------------------------------------------------------
 // Policy and allowance caches (chain-authoritative; cache conveys no authority)
@@ -1229,20 +1223,6 @@ export function putCheckpoint(checkpoint: TreasuryCheckpoint): boolean {
   return put(`checkpoint:${checkpoint.proposalId}:${checkpoint.checkpointId}`, checkpoint);
 }
 
-export function listCheckpoints(proposalId: string): TreasuryCheckpoint[] {
-  const m = readMap();
-  if (!m) return [];
-  const out: TreasuryCheckpoint[] = [];
-  const prefix = `checkpoint:${proposalId}:`;
-  for (const [key, value] of m.entries()) {
-    if (!key.startsWith(prefix)) continue;
-    if (validCheckpoint(value)
-      && key === `checkpoint:${value.proposalId}:${value.checkpointId}`) {
-      out.push(value);
-    }
-  }
-  return out;
-}
 
 // ---------------------------------------------------------------------------
 // Signing sessions (zero authority; CRDT-native signature union)

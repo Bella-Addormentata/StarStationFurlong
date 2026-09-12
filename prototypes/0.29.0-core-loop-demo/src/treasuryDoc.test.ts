@@ -27,8 +27,6 @@ import {
 } from './treasuryTypes';
 import {
   bindTreasuryDoc,
-  listCheckpoints,
-  listVotes,
   pickCanonicalVote,
   putAllowanceCache,
   putChainSyncStatus,
@@ -498,7 +496,7 @@ describe('votes', () => {
     expect(readVote(proposalId, slotPub)).toEqual(v1);
     expect(putVote(v2)).toBe(true); // higher sequence replaces
     expect(readVote(proposalId, slotPub)).toEqual(v2);
-    expect(listVotes(proposalId)).toEqual([v2]);
+    expect(scanVotes(proposalId, 50_000, 50_000).items).toEqual([v2]);
   });
 
   it('resolves equal sequences to the lexicographically smallest voteId', () => {
@@ -519,7 +517,7 @@ describe('votes', () => {
     expect(putVote(forged)).toBe(false); // signed by the wrong key
     doc.getMap('treasury').set(`vote:${proposalId}:${pub(seedB)}`, v);
     expect(readVote(proposalId, pub(seedB))).toBeNull(); // wrong slot
-    expect(listVotes(proposalId)).toEqual([]);
+    expect(scanVotes(proposalId, 50_000, 50_000).items).toEqual([]);
   });
 
   it('a squatter planted in another voter slot cannot lock the honest vote out', () => {
@@ -532,7 +530,7 @@ describe('votes', () => {
     const honest = makeVote(seedA, voter, 1, proposalId);
     expect(putVote(honest)).toBe(true);
     expect(readVote(proposalId, slotPub)).toEqual(honest);
-    expect(listVotes(proposalId)).toEqual([honest]);
+    expect(scanVotes(proposalId, 50_000, 50_000).items).toEqual([honest]);
   });
 
   it('lists one slot per voter across multiple voters', () => {
@@ -540,7 +538,7 @@ describe('votes', () => {
     const b = makeVote(seedB, '7'.repeat(64), 5, proposalId, 'no');
     expect(putVote(a)).toBe(true);
     expect(putVote(b)).toBe(true);
-    const listed = listVotes(proposalId);
+    const listed = scanVotes(proposalId, 50_000, 50_000).items;
     expect(listed).toHaveLength(2);
     expect(listed).toEqual(expect.arrayContaining([a, b]));
   });
@@ -701,7 +699,7 @@ describe('policy, allowance, registration, windows, checkpoints', () => {
     };
     expect(putCheckpoint(checkpoint)).toBe(true);
     expect(putCheckpoint({ ...checkpoint, voteCount: 4 })).toBe(false); // id mismatch
-    expect(listCheckpoints(checkpoint.proposalId)).toEqual([checkpoint]);
+    expect(scanCheckpoints(checkpoint.proposalId, 50_000, 50_000).items).toEqual([checkpoint]);
     expect(putAllowanceCache({ junk: true } as never)).toBe(false);
   });
 });
@@ -944,7 +942,7 @@ describe('verification caching', () => {
     const asVote = readProposal(p.proposalId) as unknown as TreasuryVote;
     doc.getMap('treasury').set(`vote:${p.proposalId}:${pub(seedA)}`, asVote);
     expect(readVote(p.proposalId, pub(seedA))).toBeNull();
-    expect(listVotes(p.proposalId)).toEqual([]);
+    expect(scanVotes(p.proposalId, 50_000, 50_000).items).toEqual([]);
     expect(scanVotes(p.proposalId, 99, 99).items).toEqual([]);
     // And the proposal still reads as a proposal — scoping did not break it.
     expect(readProposal(p.proposalId)).toEqual(p);
@@ -1681,6 +1679,6 @@ describe('bindings, receipts, sync status, and lifecycle', () => {
     expect(treasuryDocBound()).toBe(false);
     expect(putProposal(makeProposal())).toBe(false);
     expect(readProposal('f'.repeat(64))).toBeNull();
-    expect(listVotes('f'.repeat(64))).toEqual([]);
+    expect(scanVotes('f'.repeat(64), 50_000, 50_000).items).toEqual([]);
   });
 });

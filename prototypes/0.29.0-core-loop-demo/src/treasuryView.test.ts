@@ -28,6 +28,8 @@ import {
   approvalsView,
   balanceView,
   bindingSigner,
+  bindingExpiry,
+  bindingStanding,
   boardView,
   displayHeight,
   keyFingerprint,
@@ -1557,6 +1559,88 @@ describe('who signed the funding record (plan §10.1, room side)', () => {
     expect(bindingSigner(VOCAB_BINDING, legacy)).toBe('no-owner-key');
   });
 
+  describe('an ENDED record must not still name the company', () => {
+    // The regression: `standing` asked who signed the binding and never
+    // whether it had ended, so an owner-signed record past its own
+    // expiresAfterHeight kept standing === 'owner' and went on anchoring
+    // companyScope — the phone rendered that company's board and proposal
+    // list while the funding panel right below said the record had ended.
+    // Two surfaces disagreeing about one binding, which is the contradiction
+    // this screen produced once before (there about whether a record was
+    // THERE, here about whether it was still VALID).
+    const ending = (expiresAfterHeight: number): RoomTreasuryBinding => ({
+      ...VOCAB_BINDING,
+      expiresAfterHeight,
+    });
+
+    it('reads a consistently reported passed expiry as passed', () => {
+      // boundAtHeight is 100; the height is consistent and past the end.
+      expect(bindingExpiry(ending(200), 201)).toBe('passed');
+      expect(bindingExpiry(ending(200), 200)).toBe('passed'); // inclusive
+      expect(bindingExpiry(ending(200), 199)).toBe('not-passed');
+    });
+
+    it('never reads an INCONSISTENT height as passed', () => {
+      // Below the record's own boundAtHeight, the two peer-written numbers
+      // disagree — that is not evidence either way, so it stays unknown and
+      // the record keeps standing. Without this a peer could report a
+      // nonsense height and knock out a live binding.
+      expect(bindingExpiry(ending(200), 99)).toBe('unknown');
+      expect(bindingExpiry(ending(200), 0)).toBe('unknown');
+      expect(bindingExpiry(ending(200), null)).toBe('unknown');
+    });
+
+    it('a record with no end height never expires', () => {
+      expect(bindingExpiry(VOCAB_BINDING, 10_000_000)).toBe('none');
+    });
+
+    it('companyScope WITHHOLDS the company for an expired owner record', () => {
+      const scope = companyScope(ending(200), policy, 'owner-expired');
+      expect(scope.companyId).toBeNull();
+      expect(scope.anchored).toBe(false);
+      expect(scope.mismatch).toBe(true);
+      expect(scope.warning).toContain('end height');
+    });
+
+    it('…and still anchors it while the record is live', () => {
+      // The other half: demoting must not take a valid binding with it.
+      const scope = companyScope(
+        { ...ending(200), companyId: policy.companyId },
+        policy,
+        'owner',
+      );
+      expect(scope.anchored).toBe(true);
+      expect(scope.mismatch).toBe(false);
+    });
+
+    it('bindingStanding demotes the owner’s own ended record', () => {
+      const ok = (b: RoomTreasuryBinding) => ({ status: 'ok', binding: b }) as const;
+      expect(bindingStanding(ok(ending(200)), owner, 201)).toBe('owner-expired');
+      expect(bindingStanding(ok(ending(200)), owner, 199)).toBe('owner');
+      // Inconsistent height: not evidence, so the record keeps standing.
+      expect(bindingStanding(ok(ending(200)), owner, 99)).toBe('owner');
+      expect(bindingStanding(ok(ending(200)), owner, null)).toBe('owner');
+      // No end height at all.
+      expect(bindingStanding(ok(VOCAB_BINDING), owner, 10_000_000)).toBe('owner');
+    });
+
+    it('only the OWNER’s record is ever demoted for expiry', () => {
+      // 'owner-expired' asserts a signature check that a stranger's record
+      // never passed; those states withhold on their own grounds.
+      const ok = (b: RoomTreasuryBinding) => ({ status: 'ok', binding: b }) as const;
+      expect(bindingStanding(ok(ending(200)), stranger, 201)).toBe('not-owner');
+      expect(bindingStanding(ok(ending(200)), unknown, 201)).toBe('owner-unknown');
+      expect(bindingStanding(ok(ending(200)), legacy, 201)).toBe('no-owner-key');
+    });
+
+    it('reader states still win over both signer and expiry', () => {
+      expect(bindingStanding(null, owner, 201)).toBe('absent');
+      expect(bindingStanding({ status: 'absent' }, owner, 201)).toBe('absent');
+      expect(bindingStanding({ status: 'unreadable' }, owner, 201)).toBe('unreadable');
+      expect(bindingStanding({ status: 'too-large' }, owner, 201)).toBe('too-large');
+    });
+  });
+
   it('badges only the owner’s signature as signed, and says what the signature shows', () => {
     const v = roomFundingView(VOCAB_BINDING, null, 'readable', owner);
     expect(v.bound).toBe(true);
@@ -1708,7 +1792,13 @@ describe('who signed the funding record (plan §10.1, room side)', () => {
     const from = main.indexOf('function paintTreasuryBody(');
     const body = main.slice(from, main.indexOf('\nfunction ', from + 1));
     expect(body).toContain('const ownerKey = readRoomOwnerKey();');
-    expect(body).toContain('bindingSigner(bindingResult.binding, ownerKey)');
+    // The standing decision (reader state → signer → expiry) is derived by the
+    // shared `bindingStanding`, not re-implemented here. It used to call
+    // `bindingSigner` inline and stop there, which is how the expiry half came
+    // to be missing on this surface alone. What this pins is that the live
+    // owner key AND the display height both reach that one decision; the rule
+    // itself is unit-tested directly, since it is no longer trapped in main.ts.
+    expect(body).toContain('bindingStanding(bindingResult, ownerKey, height)');
     // Only the owner's binding reaches companyScope as an anchor.
     expect(body).toContain('standing === "owner" ? heldBinding : null');
     // The phone's funding view RECEIVES the live key. The parameter has an

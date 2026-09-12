@@ -900,13 +900,93 @@ export function bindingSigner(
 }
 
 /**
+ * Whether a binding's own end height has been reached.
+ *
+ * Three outcomes, not two. "Still live" and "no trustworthy height to decide
+ * with" are different statements, and collapsing them into a false `lapsed`
+ * made an ended record render as current funding — including when a peer
+ * supplies a stale low height. The signature covers the record and the end
+ * height it names, never the claim about where the chain has got to, so BOTH
+ * the passed and not-passed readings are qualified wherever they are shown.
+ *
+ * A height BELOW the record's own `boundAtHeight` contradicts the record: the
+ * binding says it started at a block the reported height has not reached. Two
+ * peer-written numbers disagreeing is not evidence the funding is current, so
+ * it is 'unknown' — the same treatment `proposalPhase` gives a height that
+ * precedes acceptance.
+ *
+ * ⚠️ Shared on purpose. This was computed inline in `roomFundingView` while
+ * the scope decision did not consider expiry at all, so the funding panel
+ * could say a record had ended while that same record still chose which
+ * company the whole screen presented. Two surfaces disagreeing about one
+ * binding is the contradiction this screen produced once already (there about
+ * whether a record was *there*, here about whether it was still *valid*), and
+ * one reader is what stops it recurring.
+ */
+export type BindingExpiry = 'none' | 'unknown' | 'passed' | 'not-passed';
+
+export function bindingExpiry(
+  binding: RoomTreasuryBinding,
+  currentHeight: number | null,
+): BindingExpiry {
+  const expires = binding.expiresAfterHeight ?? null;
+  if (expires === null) return 'none';
+  const heightIsConsistent =
+    currentHeight !== null && currentHeight >= binding.boundAtHeight;
+  if (currentHeight === null || !heightIsConsistent) return 'unknown';
+  return currentHeight >= expires ? 'passed' : 'not-passed';
+}
+
+/**
  * The standing of the room's binding slot, for deciding what the screen may
  * present. The three reader states, or — when a record was read — who signed
  * it. A typed union rather than the boolean that preceded it, so the next
  * state anyone adds is a compile error at every caller instead of a silent
  * fall-through to "no binding at all".
+ *
+ * `owner-expired` is the owner's own record whose end height has demonstrably
+ * passed. It is deliberately NOT `owner`: a binding that has ended must not go
+ * on naming the company for the board and proposal list. Only a *consistently*
+ * reported passed expiry demotes (see `bindingExpiry`) — an unknown height
+ * leaves the record standing, because a peer must not be able to neutralise a
+ * live binding by reporting a number. The reverse exposure is accepted and is
+ * the same trade the funding panel already takes: a peer reporting a large
+ * height makes the screen show LESS, which is the safe direction.
  */
-export type BindingStanding = 'absent' | 'unreadable' | 'too-large' | BindingSigner;
+export type BindingStanding =
+  | 'absent'
+  | 'unreadable'
+  | 'too-large'
+  | 'owner-expired'
+  | BindingSigner;
+
+/**
+ * The whole standing decision, as a pure function: reader state, then signer,
+ * then expiry.
+ *
+ * It lives here rather than inline at the call site because the call site is
+ * a render function in main.ts, which runs the entire client on import and so
+ * cannot be loaded by a unit test. The expiry half was originally missing
+ * precisely there, and a source-scanning test is the only kind that can reach
+ * a decision left in that file — which checks that a line exists, not that it
+ * is right. Passing the three inputs in makes the rule testable directly.
+ */
+export function bindingStanding(
+  result: { status: 'ok'; binding: RoomTreasuryBinding } | { status: 'absent' | 'unreadable' | 'too-large' } | null,
+  ownerKey: RoomOwnerKey,
+  currentHeight: number | null,
+): BindingStanding {
+  if (result === null || result.status === 'absent') return 'absent';
+  if (result.status !== 'ok') return result.status;
+  const signer = bindingSigner(result.binding, ownerKey);
+  if (signer !== 'owner') return signer;
+  // Only the owner's own record can be demoted for expiry — the other states
+  // already withhold, and saying 'owner-expired' about a stranger's record
+  // would imply a signature check it never passed.
+  return bindingExpiry(result.binding, currentHeight) === 'passed'
+    ? 'owner-expired'
+    : 'owner';
+}
 
 /** A player-safe fingerprint of a signing key. The raw key is never shown. */
 export function keyFingerprint(pub: string): string {
@@ -1109,27 +1189,7 @@ export function roomFundingView(
     };
   }
   const expires = binding.expiresAfterHeight ?? null;
-  // Three outcomes, not two. "Still live" and "no trustworthy height to
-  // decide with" are different statements, and collapsing them into a false
-  // `lapsed` made an ended record render as current funding — including when
-  // a peer supplies a stale low height. The signature covers the record and
-  // the end height it names, never the claim about where the chain has got
-  // to, so BOTH the passed and not-passed readings are qualified.
-  // A height BELOW the record's own boundAtHeight contradicts the record: the
-  // binding says it started at a block the reported height has not reached.
-  // Two peer-written numbers disagreeing is not evidence the funding is
-  // current, so it is 'unknown' — the same treatment proposalPhase gives a
-  // height that precedes acceptance.
-  const heightIsConsistent =
-    currentHeight !== null && currentHeight >= binding.boundAtHeight;
-  const expiryStatus: 'none' | 'unknown' | 'passed' | 'not-passed' =
-    expires === null
-      ? 'none'
-      : currentHeight === null || !heightIsConsistent
-        ? 'unknown'
-        : currentHeight >= expires
-          ? 'passed'
-          : 'not-passed';
+  const expiryStatus = bindingExpiry(binding, currentHeight);
   const expiryNote =
     expiryStatus === 'unknown'
       ? // Two ways to be unknown, and the terminal prints the reported height
@@ -1533,6 +1593,13 @@ export function companyScope(
   }
   if (standing === 'owner-unknown') {
     return withheld('A company funding record is held here, but this device does not yet know this room’s owner key, so it cannot tell whether the owner wrote it — the company details and proposal list are not shown until it can.');
+  }
+  if (standing === 'owner-expired') {
+    // The owner really did sign this one — it has simply ended. Withheld for
+    // the same reason as the others: an ended record must not choose which
+    // company the board and proposal list belong to. The funding panel keeps
+    // its own fuller explanation of the expiry; this is only the scope half.
+    return withheld('The company funding record in this room has passed its end height, so the company details and proposal list are not shown — an ended record no longer ties this room to that company.');
   }
   if (standing === 'no-owner-key') {
     return withheld('A company funding record is held here, but this room has no keyed owner on record, so there is no owner signature to check it against — the company details and proposal list are not shown.');

@@ -64,7 +64,7 @@ import { NO_NETWORK_PIN, treasuryNetwork } from "./treasuryNetwork";
 import {
   approvalsView,
   balanceView,
-  bindingSigner,
+  bindingStanding,
   type BindingStanding,
   boardThresholdFor,
   boardView,
@@ -3277,12 +3277,14 @@ function paintTreasuryBody(view: HTMLElement): void {
   // screen presents. (Issue #138: readRoomOwnerKey is where an NFT-deed
   // authority head would replace the players-map chain; nothing here moves.)
   const ownerKey = readRoomOwnerKey();
-  const standing: BindingStanding =
-    bindingResult === null || bindingResult.status === "absent"
-      ? "absent"
-      : bindingResult.status !== "ok"
-        ? bindingResult.status
-        : bindingSigner(bindingResult.binding, ownerKey);
+  // WHO signed it, and then WHETHER IT HAS ENDED — both, because either alone
+  // lets a record anchor the screen it should not. The signer check answered
+  // only the first: an owner-signed binding past its own `expiresAfterHeight`
+  // still returned 'owner', so the funding panel below said the record had
+  // ended while that same record went on choosing which company's board and
+  // proposal list the whole screen presented. `bindingExpiry` is shared with
+  // that panel so the two cannot part company again.
+  const standing: BindingStanding = bindingStanding(bindingResult, ownerKey, height);
   const scope = companyScope(
     standing === "owner" ? heldBinding : null,
     policyCache?.policy ?? null,
