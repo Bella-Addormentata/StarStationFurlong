@@ -50,6 +50,13 @@ import { bindTreasuryDoc } from "./treasuryDoc";
 // real network configuration arrives with PR C (plan §17.5).
 const TREASURY_DEV_GENESIS = "0".repeat(64);
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
+// 🖥️ #33 Stage B: register the desk-computer's room-management provider —
+// live seam the desk-computer UI (devices.ts createDeskComputerUI) reaches
+// through to rename the room, mint invites, change access mode, and read the
+// peer roster. Same setter-once idiom as setRoomEditPermission above.
+import { setRoomManagementProvider } from "./deskComputerProvider";
+import type { RawRosterRow } from "./deskComputerManagement";
+import { sanitizeRoomName as sanitizeRoomNameForDesk, normalizeAccessMode as normalizeAccessModeForDesk } from "./deskComputerManagement";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
@@ -6570,6 +6577,83 @@ async function init() {
     return isLocalPlayerRoomOwner(owner)
       ? { ok: true }
       : { ok: false, reason: ownerGateRefusal(owner, "edit") };
+  });
+
+  // 🖥️ #33 Stage B: register the desk-computer's room-management provider.
+  //     Same seam idiom as setRoomEditPermission above: main.ts is the sole
+  //     holder of the live network state (yjsSync + fingerprint), and the
+  //     desk-computer UI (devices.ts) reaches through this provider without
+  //     importing main. Getters return live values on every call (no cached
+  //     snapshots); writes RE-CHECK the owner gate at write time — a race
+  //     between UI open and an owner change must not let a stale UI submit.
+  //     mintInvite delegates to the same mintBootstrapLink helper the network
+  //     panel and Copy Invite button already use.
+  setRoomManagementProvider({
+    getLocalPlayerId: () => getPlayerId(),
+    // 🔒 #141: an absent owner is passed through as "", never substituted with
+    // the legacy marker. Manufacturing it is how an unset field became a grant
+    // — and `resolveOwnerLabel` would then render the literal to the player.
+    getOwnerId: () =>
+      (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "",
+    resolveOwnerLabel,
+    isLocalOwner: () => isLocalOwnerOfCurrentRoom(),
+    getRoomName: () =>
+      (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) ??
+      "Lobby",
+    getAccessMode: () => normalizeAccessModeForDesk(getRoomAccessMode()),
+    getRosterRaw: () => {
+      const rows: RawRosterRow[] = [];
+      const players = yjsSync?.doc.getMap("players");
+      if (!players) return rows;
+      players.forEach((entry, id) => {
+        rows.push({ id, entry });
+      });
+      return rows;
+    },
+    setRoomName: (name) => {
+      if (!yjsSync) {
+        return { ok: false, reason: "Offline — no room to rename." };
+      }
+      // Pure sanitiser catches empty / non-string BEFORE consulting the owner
+      // gate: identical to the UI's own guard, so a malicious caller bypassing
+      // the UI still gets the same rule.
+      const clean = sanitizeRoomNameForDesk(name);
+      if (clean === null) {
+        return { ok: false, reason: "Room name cannot be empty." };
+      }
+      if (!isLocalOwnerOfCurrentRoom()) {
+        const owner =
+          (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
+        // 🔒 #141: one refusal builder, so a legacy room reads as legacy
+        // instead of the baffling "Only the owner (Local-Clone) can …".
+        return { ok: false, reason: ownerGateRefusal(owner, "rename") };
+      }
+      const rm = yjsSync.doc.getMap("roomInfo");
+      yjsSync.doc.transact(() => rm.set("name", clean));
+      return { ok: true };
+    },
+    setAccessMode: (mode) => {
+      if (!yjsSync) {
+        return { ok: false, reason: "Offline — access mode is local only." };
+      }
+      if (!isLocalOwnerOfCurrentRoom()) {
+        const owner =
+          (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
+        // 🔒 #141: one refusal builder, so a legacy room reads as legacy
+        // instead of the baffling "Only the owner (Local-Clone) can …".
+        return { ok: false, reason: ownerGateRefusal(owner, "change the access mode of") };
+      }
+      // setRoomAccessMode already owner-gates internally, but we short-circuit
+      // above so the UI gets an explanatory verdict rather than a silent no-op.
+      setRoomAccessMode(mode);
+      return { ok: true };
+    },
+    mintInvite: async () => {
+      const result = await mintBootstrapLink();
+      // Trim the provider surface: the desk UI does not need `scope` or the
+      // full `boot` payload — just the link (or the error).
+      return { link: result.link, error: result.error };
+    },
   });
 
   // 🎰🤖 #77B: elect the SOLE auto-croupier operator. Unlike the edit gate above
