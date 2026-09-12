@@ -17,7 +17,7 @@
 import * as THREE from "three";
 import type { Player } from "./player";
 import {
-  CELL_SIZE, findPath, worldToCol, worldToRow, nearestWalkableCell,
+  CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell,
 } from "./pathfinding";
 import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
@@ -660,17 +660,15 @@ export class PoolWaiter {
   }
 
   /** 🏋️ The coach's stage: the open floor nearest the ROOM CENTRE (owner
-   *  request — the class happens mid-room, not beside the charger). Ring-
-   *  search the walkable grid outward from (0,0); computed once per class
-   *  (reset when the routine changes) so a furniture edit mid-class doesn't
-   *  teleport the stage. */
+   *  request — the class happens mid-room, not beside the charger) that the
+   *  bot can actually WALK to — a merely walkable centre can sit behind a
+   *  furniture partition, and walkTo's straight-line fallback would clip
+   *  through it to a stage nobody can join. No reachable cell ⇒ the class is
+   *  held right where the bot stands. Computed once per class (reset when
+   *  the routine changes) so a furniture edit mid-class doesn't teleport it. */
   private findCoachStage(): { x: number; z: number } {
-    return (
-      nearestWalkableCell(0, 0, 12) ?? {
-        x: this.group.position.x,
-        z: this.group.position.z,
-      }
-    );
+    const here = { x: this.group.position.x, z: this.group.position.z };
+    return nearestReachableCell(0, 0, 12, here) ?? here;
   }
 
   /** 🏋️ Walk to the stage (room centre), then loop the class: announce a

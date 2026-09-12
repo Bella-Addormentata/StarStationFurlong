@@ -120,6 +120,44 @@ export function nearestWalkableCell(
   return null;
 }
 
+/**
+ * Like nearestWalkableCell, but the cell must also be A*-REACHABLE from
+ * `from`: a walkable cell isn't necessarily reachable (a furniture partition
+ * can isolate an open patch), and a walker handed such a goal falls back to a
+ * straight line through the obstruction. The start is snapped to solid ground
+ * first — a bot on its dock or a fox in the vat stands on a non-walkable cell,
+ * and findPath from there is spuriously empty. The start cell itself counts
+ * as reachable. One A* per candidate ring cell: call it per decision, not per
+ * frame.
+ */
+export function nearestReachableCell(
+  wx: number,
+  wz: number,
+  maxRing: number,
+  from: { x: number; z: number },
+): { x: number; z: number } | null {
+  const start = nearestWalkableCell(from.x, from.z, 3);
+  if (!start) return null;
+  const sr = worldToRow(start.z);
+  const sc = worldToCol(start.x);
+  const r0 = worldToRow(wz);
+  const c0 = worldToCol(wx);
+  for (let ring = 0; ring <= maxRing; ring++) {
+    for (let dr = -ring; dr <= ring; dr++) {
+      for (let dc = -ring; dc <= ring; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue;
+        const r = r0 + dr;
+        const c = c0 + dc;
+        if (!walkable[r]?.[c]) continue;
+        if ((r === sr && c === sc) || findPath(sr, sc, r, c).length > 0) {
+          return { x: colToWorld(c), z: rowToWorld(r) };
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // ── A* implementation ─────────────────────────────────────────────────────────
 interface Node {
   row: number;

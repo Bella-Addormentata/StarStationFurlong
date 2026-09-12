@@ -73,6 +73,7 @@ import {
   colToWorld,
   rowToWorld,
   findPath,
+  nearestWalkableCell,
 } from "./pathfinding";
 import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
@@ -4898,6 +4899,20 @@ export class World {
    *  camera too, and mirrors the demo in lockstep (the bot supplies the
    *  chibi-scaled pose — getFollowerPose). The pose only applies while
    *  idle, so walking away or sitting down breaks the follow. */
+  /** Can the local fox route to (x, z)? Start snapped to solid ground first
+   *  (the vat spawn cell is non-walkable, and findPath from there is empty);
+   *  standing next to the goal counts. Same test pickFreeStand applies. */
+  private playerCanReach(x: number, z: number): boolean {
+    const me = this.player.getPosition();
+    if (Math.hypot(x - me.x, z - me.z) < 0.6) return true;
+    const start = nearestWalkableCell(me.x, me.z, 3);
+    if (!start) return false;
+    return (
+      findPath(worldToRow(start.z), worldToCol(start.x), worldToRow(z), worldToCol(x))
+        .length > 0
+    );
+  }
+
   private updateCoachFollow(
     deltaTime: number,
     activePlayer: Player | null,
@@ -4949,7 +4964,13 @@ export class World {
       if (nearest.d >= 0.6) {
         if (this.coachEscortCooldown <= 0) {
           this.coachEscortCooldown = 2;
-          activePlayer.navigateTo(nearest.x, nearest.z);
+          // Walkable ≠ reachable: a slot across a furniture partition would
+          // be re-issued forever (navigateTo drops the empty path). Route-
+          // check the candidates only here, per escort, never per frame.
+          const routed = slots
+            .filter((c) => this.playerCanReach(c.x, c.z))
+            .sort((a, b) => a.d - b.d);
+          if (routed.length) activePlayer.navigateTo(routed[0].x, routed[0].z);
         }
         continue;
       }
