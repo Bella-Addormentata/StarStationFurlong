@@ -53,6 +53,8 @@ import { findFreeExteriorSpot } from './hull';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
+// #45 board mirror: spawned game tables paint the doc's current game at once.
+import { readGame } from './games/gamesDoc';
 import { ROOM_TEMPLATES, applyRoomTemplate, exportCurrentRoomAsTemplate } from './roomTemplates';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
@@ -333,6 +335,13 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
     if (obj instanceof THREE.Mesh) {
       w.furnitureMeshes.push(obj);
       registerFurnitureHandles(sinks, item.id, obj);
+      // Mirror World.registerFurnitureGroup (#45): paint the CURRENT doc
+      // state so a spawned table shows any game already stored under this
+      // id — the world's games listener only fires on the NEXT map change.
+      // Read back the FILED handle, not obj.userData — see the note at the
+      // World call site on why this side must not keep its own key list.
+      const spawnedTop = sinks.gameTableTops.get(item.id);
+      if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;

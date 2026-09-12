@@ -384,6 +384,10 @@ export class World {
   private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
+  /** Unsubscribe for the #45 board-mirror games listener — held so a
+   *  createPlatform re-run (morph restart) swaps the listener instead of
+   *  stacking a duplicate. */
+  private unsubscribeGameBoards: (() => void) | null = null;
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -1455,15 +1459,20 @@ export class World {
     // from the doc-synced `games` map, so spectators see the live game
     // without focusing (the wall-screen hybrid idiom, §D0.4). The
     // subscription survives room rebinds — gamesDoc re-notifies on bind.
-    if (this.gameTableTops.size > 0) {
-      const repaintBoards = () => {
-        for (const [id, top] of this.gameTableTops) {
-          top.setBoard(readGame(id)?.board ?? null);
-        }
-      };
-      subscribeGames(repaintBoards);
-      repaintBoards();
-    }
+    // Subscribed UNCONDITIONALLY (not size-gated): the closure iterates the
+    // LIVE map, so a table added at runtime (DEV spawn, E4 reconcile) into a
+    // room built with zero game tables still repaints — a size>0 gate here
+    // left such rooms without any mirror until reload. Over an empty map the
+    // callback is a free no-op. A createPlatform re-run (morph restart) drops
+    // the previous listener first, so rebuilds never stack duplicates.
+    this.unsubscribeGameBoards?.();
+    const repaintBoards = () => {
+      for (const [id, top] of this.gameTableTops) {
+        top.setBoard(readGame(id)?.board ?? null);
+      }
+    };
+    this.unsubscribeGameBoards = subscribeGames(repaintBoards);
+    repaintBoards();
   }
 
   /**
@@ -1489,6 +1498,18 @@ export class World {
       if (obj instanceof THREE.Mesh) {
         this.furnitureMeshes.push(obj);
         registerFurnitureHandles(sinks, item.id, obj);
+        // Paint the CURRENT doc state now: a runtime-added table (E4
+        // reconcile on a joiner) must show a game already in progress —
+        // the games listener only fires on the NEXT map change.
+        //
+        // Read back the FILED handle instead of reaching into the mesh for
+        // the table key again: the helper owns that key list, and a second
+        // copy of it here is exactly what let the two spawn paths drift
+        // apart (furnitureHandles.test.ts pins this). Reading the sink also
+        // degrades correctly — if the helper ever stops filing this kind,
+        // the paint no-ops rather than driving a handle nothing tracks.
+        const spawnedTop = sinks.gameTableTops.get(item.id);
+        if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
