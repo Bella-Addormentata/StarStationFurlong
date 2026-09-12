@@ -291,8 +291,22 @@ export function ventureLedger(): VentureLedgerEntry[] {
     if (!raw) return [];
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    return arr.filter((e): e is VentureLedgerEntry =>
-      !!e && typeof e.id === 'string' && typeof e.name === 'string' && typeof e.officeRoomId === 'string');
+    return arr
+      .filter((e): e is VentureLedgerEntry =>
+        !!e && typeof e.id === 'string' && typeof e.name === 'string' && typeof e.officeRoomId === 'string')
+      // 🕒 The stored `capSeenAt` came from a peer-written record and PERSISTS
+      // across upgrades, so the record-level bound in ventureRecord cannot
+      // reach a ledger that was already poisoned. Left alone it stays "fresher"
+      // than every office visit (syncVentureLedgerFromCurrentRoom's
+      // `ledgerFresher`), keeps the forged cap table, and gets handed back to
+      // refreshVentureLink — which would write a stamp ventureRecord then
+      // refuses, making the property record unreadable. Drop the impossible
+      // stamp rather than the whole entry: the venture is real, only its
+      // freshness claim is not, and a zeroed stamp loses to the next honest
+      // office visit, which is exactly the self-heal we want.
+      .map((e) => (typeof e.capSeenAt === 'number' && e.capSeenAt > Date.now() + MAX_SNAPSHOT_SKEW_MS
+        ? { ...e, capSeenAt: 0 }
+        : e));
   } catch { return []; }
 }
 

@@ -2783,7 +2783,14 @@ function syncVentureLedgerFromCurrentRoom(): void {
   //  - the OFFICE (or a NEWER link) refreshes the ledger's cap-table snapshot;
   //  - a STALE link gets rewritten from the ledger (freshness travels with us).
   const seenAt = isOffice ? Date.now() : (v.snapshotAt ?? 0);
-  const ledgerFresher = (prior?.capSeenAt ?? 0) > seenAt;
+  // 🏢 At the REGISTERED OFFICE the doc is authoritative by definition
+  // (ventures.ts header: "the office is THE authoritative cap table"), so the
+  // ledger must never outrank it. Without the `!isOffice` guard a cached
+  // capSeenAt stamped ahead of our clock stayed "fresher" than every office
+  // visit, so a poisoned cap table survived standing in the very room that
+  // could correct it — and then rode onward to the venture's other property
+  // links. Now one office visit repairs the ledger. (#143)
+  const ledgerFresher = !isOffice && (prior?.capSeenAt ?? 0) > seenAt;
   const properties = new Set(prior?.properties ?? []);
   if (!isOffice) properties.add(roomId);
   const entry = {
