@@ -69,10 +69,12 @@ export interface AtlasEntry {
   dims?: { cols: number; rows: number };
   /** Keyed by DOOR ID — cardinal or free `d:`. */
   doors: Record<string, AtlasDoor>;
-  /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`) and
-   *  used only to arbitrate merges. Never use it to decide what to KEEP: it is
-   *  peer-settable, so ordering retention by it lets a peer evict rooms you
-   *  actually walked through (#144). */
+  /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
+   *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
+   *  ranking that decides what the player KEEPS or SEES must not read it:
+   *  sorting a capped list by this hands a peer control of which of your own
+   *  rooms survive the cap or reach the screen (#144). Use
+   *  `compareAtlasRecency` for every such ordering. */
   lastSeen: number;
   /** LOCAL recency — when THIS install last had first-hand contact with the
    *  room (a visit, or first learning of it). No peer can set it, which is what
@@ -142,6 +144,32 @@ export function readAtlas(): Record<string, AtlasEntry> {
   } catch { return {}; }
 }
 
+/**
+ * 🗄️ The ONE ordering for any capped or truncated view of the atlas — the
+ * eviction sort, and every UI that slices a "most recent" list.
+ *
+ * Two tiers, and never the gossip stamp:
+ *   1. FIRST-HAND — rooms we visited, or whose seed we were handed. They carry
+ *      `localSeenAt`, which only this install ever writes.
+ *   2. GOSSIP-ONLY — learned from a peer's shared atlas. No local stamp, so
+ *      they rank below any first-hand room however fresh a peer claims to be.
+ *
+ * Sorting such a list by `lastSeen` instead hands a peer the decision (#144),
+ * whether the cap is localStorage retention (64) or a picker's slice (24). A
+ * single join absorbs a whole station's atlas, so that is not a rare edge.
+ *
+ * Legacy entries predate `localSeenAt` and land in tier 2, ordered among
+ * themselves by `lastSeen` — an upgrade loses the distinction for old entries
+ * rather than mis-ranking them.
+ */
+export function compareAtlasRecency(a: AtlasEntry, b: AtlasEntry): number {
+  const rank = (e: AtlasEntry): [number, number] =>
+    e.localSeenAt === undefined ? [0, e.lastSeen] : [1, e.localSeenAt];
+  const [at, ar] = rank(a);
+  const [bt, br] = rank(b);
+  return bt !== at ? bt - at : br - ar;
+}
+
 function writeAtlas(atlas: Record<string, AtlasEntry>): void {
   try {
     // 🗄️ Evict in two tiers, and never on the gossip stamp. `lastSeen` is
@@ -160,15 +188,7 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     // Legacy entries written before the field existed have no stamp and so land
     // in tier 2, ordered among themselves by `lastSeen` — an upgrade loses the
     // visited/gossip distinction for old entries rather than mis-ranking them.
-    const rank = (e: AtlasEntry): [number, number] =>
-      e.localSeenAt === undefined ? [0, e.lastSeen] : [1, e.localSeenAt];
-    const entries = Object.values(atlas)
-      .sort((a, b) => {
-        const [at, ar] = rank(a);
-        const [bt, br] = rank(b);
-        return bt !== at ? bt - at : br - ar;
-      })
-      .slice(0, MAX_ENTRIES);
+    const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
     for (const e of entries) out[e.roomId] = e;
     localStorage.setItem(KEY, JSON.stringify(out));

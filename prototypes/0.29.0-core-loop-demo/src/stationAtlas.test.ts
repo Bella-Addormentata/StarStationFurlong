@@ -8,7 +8,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { bindStationAtlasDoc, harvestIntoAtlas, pushAtlasToDoc, readAtlas } from './stationAtlas';
+import { bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas } from './stationAtlas';
 
 /** vitest runs in node here, so the atlas's localStorage needs a shim. */
 const store = new Map<string, string>();
@@ -157,6 +157,25 @@ describe('eviction prefers first-hand knowledge (#144)', () => {
     expect(atlas['module-here'].localSeenAt).toBeGreaterThan(0); // we stood in it
     expect(atlas['module-nbr']).toBeDefined();                   // stub exists...
     expect(atlas['module-nbr'].localSeenAt).toBeUndefined();      // ...but is gossip-tier
+  });
+
+  it('compareAtlasRecency puts first-hand ahead of fresher gossip', () => {
+    const now = Date.now();
+    const visitedLongAgo = { roomId: 'a', name: 'A', doors: {}, lastSeen: 0, localSeenAt: now - 9e6 };
+    const gossipedJustNow = { roomId: 'b', name: 'B', doors: {}, lastSeen: now };
+    // Gossip is newer by every peer-visible measure and still sorts second.
+    expect([gossipedJustNow, visitedLongAgo].sort(compareAtlasRecency)[0].roomId).toBe('a');
+  });
+
+  it('compareAtlasRecency orders within a tier by that tier own stamp', () => {
+    const now = Date.now();
+    const older = { roomId: 'a', name: 'A', doors: {}, lastSeen: 0, localSeenAt: now - 9e6 };
+    const newer = { roomId: 'b', name: 'B', doors: {}, lastSeen: 0, localSeenAt: now };
+    expect([older, newer].sort(compareAtlasRecency)[0].roomId).toBe('b');
+
+    const gossipOld = { roomId: 'c', name: 'C', doors: {}, lastSeen: now - 9e6 };
+    const gossipNew = { roomId: 'd', name: 'D', doors: {}, lastSeen: now };
+    expect([gossipOld, gossipNew].sort(compareAtlasRecency)[0].roomId).toBe('d');
   });
 
   it('a peer filling the door map cannot evict visited rooms', () => {
