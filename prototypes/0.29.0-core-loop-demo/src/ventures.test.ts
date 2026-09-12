@@ -10,8 +10,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindVentures,
+  detachOfficeRecord,
   isVentureShareholder,
   refreshVentureLink,
+  removeVentureLink,
   upsertVentureLedger,
   ventureLedger,
   ventureRecord,
@@ -119,6 +121,104 @@ describe('the refresh path is no longer pinnable (#143)', () => {
     plant(link(Date.now() - 60_000, { [ATTACKER]: 100 }));
     expect(refreshVentureLink(ledgerEntry(Date.now(), { [OWNER]: 100 }))).toBe(true);
     expect(ventureRecord()?.shares).toEqual({ [OWNER]: 100 });
+  });
+});
+
+describe('a planted office record has a repair path (#142)', () => {
+  /** The attack: an office record is a venture record with NO snapshotAt. */
+  function plantOffice(shares: Record<string, number>): void {
+    plant({
+      id: 'v1', name: 'Acme', foundedAt: 0, founderPub: ATTACKER,
+      founderName: 'attacker', totalShares: 100, shares, holderNames: {},
+      officeRoomId: 'module-office',
+    });
+  }
+
+  it('is exactly what removeVentureLink refuses — the hole #142 reported', () => {
+    plantOffice({ [ATTACKER]: 100 });
+    expect(ventureRecord()).not.toBeNull();
+    // This is the pre-fix state: the only detach path bails on an office
+    // record, so the planted one could not be removed through the UI at all.
+    expect(removeVentureLink()).toBe(false);
+    expect(ventureRecord()).not.toBeNull();
+  });
+
+  it('detachOfficeRecord removes it', () => {
+    plantOffice({ [ATTACKER]: 100 });
+    expect(detachOfficeRecord()).toBe(true);
+    expect(ventureRecord()).toBeNull();
+  });
+
+  it('clears the owner-equivalence the planted record was granting', () => {
+    plantOffice({ [ATTACKER]: 100 });
+    // The whole point of the attack: isLocalPlayerRoomOwner's venture branch.
+    expect(isVentureShareholder(ATTACKER)).toBe(true);
+    detachOfficeRecord();
+    expect(isVentureShareholder(ATTACKER)).toBe(false);
+  });
+
+  it('is ungated — any peer may call it, by design', () => {
+    // No identity is passed in and none is consulted. Stated as a test so the
+    // day someone adds a gate, this fails and they have to read why (#142).
+    plantOffice({ [OWNER]: 100 });
+    expect(detachOfficeRecord()).toBe(true);
+  });
+
+  it('refuses a property LINK — those keep removeVentureLink and its gate', () => {
+    plant(link(Date.now(), { [OWNER]: 100 }));
+    expect(detachOfficeRecord()).toBe(false);
+    expect(ventureRecord()).not.toBeNull();
+    expect(removeVentureLink()).toBe(true);   // ...the link path still works
+    expect(ventureRecord()).toBeNull();
+  });
+
+  it('is a no-op on an unchartered room', () => {
+    expect(detachOfficeRecord()).toBe(false);
+  });
+
+  it('also drops the venture from the personal ledger', () => {
+    // Deleting only the doc record left the fabricated venture in the victim's
+    // VENTURES list. syncVentureLedgerFromCurrentRoom cannot clean up after the
+    // fact — it returns early once ventureRecord() is null (main.ts:2810).
+    upsertVentureLedger(ledgerEntry(Date.now(), { [OWNER]: 100 }));
+    expect(ventureLedger().some((e) => e.id === 'v1')).toBe(true);
+
+    plantOffice({ [OWNER]: 100 });
+    expect(detachOfficeRecord()).toBe(true);
+    expect(ventureLedger().some((e) => e.id === 'v1')).toBe(false);
+  });
+
+  it('kills the ADD THIS MODULE path that re-propagates a forged cap table', () => {
+    // The stale entry was not merely cosmetic: `add-property` reads it
+    // (main.ts: `ventureLedger().find(...)`) and writeVentureLink would stamp
+    // the forged cap table into a room the victim genuinely owns.
+    upsertVentureLedger(ledgerEntry(Date.now(), { [ATTACKER]: 100 }));
+    plantOffice({ [ATTACKER]: 100 });
+    detachOfficeRecord();
+
+    const stale = ventureLedger().find((e) => e.id === 'v1');
+    expect(stale).toBeUndefined();  // nothing left for add-property to find
+  });
+
+  it('leaves OTHER ventures in the ledger alone', () => {
+    upsertVentureLedger(ledgerEntry(Date.now(), { [OWNER]: 100 }));
+    upsertVentureLedger({ ...ledgerEntry(Date.now(), { [OWNER]: 50 }), id: 'v2', name: 'Other' });
+
+    plantOffice({ [OWNER]: 100 });
+    detachOfficeRecord();
+
+    const ids = ventureLedger().map((e) => e.id);
+    expect(ids).not.toContain('v1');
+    expect(ids).toContain('v2');
+  });
+
+  it('a property LINK detach does NOT touch the ledger', () => {
+    // removeVentureLink casts one module out of a venture you remain part of —
+    // dropping the ledger entry there would erase a venture you still hold.
+    upsertVentureLedger(ledgerEntry(Date.now(), { [OWNER]: 100 }));
+    plant(link(Date.now(), { [OWNER]: 100 }));
+    expect(removeVentureLink()).toBe(true);
+    expect(ventureLedger().some((e) => e.id === 'v1')).toBe(true);
   });
 });
 
