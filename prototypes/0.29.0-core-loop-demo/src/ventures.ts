@@ -6,18 +6,21 @@
  * property), issuing a fixed 100 SHARES to the founder. Shares move between
  * players; the OWNER RULE (v1, owner's ruling): holding ANY share grants
  * owner-equivalent access to venture property — main.ts folds shareholding
- * into the central owner gate, so docking, edit mode and door policies open
- * to shareholders with one seam.
+ * into the central owner gate, so those surfaces open to shareholders with
+ * one seam.
  *
- * 🔒 #142 NARROWED IT. "Full" owner-equivalence is no longer accurate and the
- * list above is exhaustive: the room's ACCESS MODE and co-host
- * accept/deny/revoke now take the raw deed holder, as the deed hand-over and
- * the croupier election always have. A shareholder cannot lock a venture
- * property out or unseat its co-hosts. The reason is in this module: the
- * record `isVentureShareholder` reads is shape-checked only, and nothing in
- * it is related to the room it sits in (see the note below on why no
- * client-side relation check can exist) — so a fabricated OFFICE record
- * carried those rights to whoever planted it.
+ * 🔒 #142 NARROWED IT — "full" owner-equivalence is no longer accurate. The
+ * room's ACCESS MODE and co-host accept/deny/revoke now take the raw deed
+ * holder, as the deed hand-over and the croupier election always have, so a
+ * shareholder cannot lock a venture property out or unseat its co-hosts. The
+ * reason is in THIS module: the record `isVentureShareholder` reads is
+ * shape-checked only, and nothing in it is related to the room it sits in
+ * (see the note below on why no client-side relation check can exist) — so a
+ * fabricated OFFICE record carried those rights to whoever planted it.
+ *
+ * Which surfaces fall on which side is documented ONCE, at main.ts's
+ * `isLocalPlayerRoomOwner`. Not restated here on purpose — this header
+ * previously carried its own list and went stale.
  *
  * V1 SCOPE — one room per venture (the office). Multi-room property arrives
  * with the signed authority-stamp pattern (chia-authority-architecture.md

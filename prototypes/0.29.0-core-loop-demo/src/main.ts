@@ -2553,23 +2553,35 @@ function resolveOwnerLabel(owner: string): string {
 
 /** True when WE hold owner authority here: owner is our player id, or —
  *  🚀 #68 V1 owner rule — the room belongs to a VENTURE and we hold ANY of
- *  its shares (joint owners are owner-equivalent for docking, edit mode and
- *  door policies).
+ *  its shares.
  *
- *  🔒 #142: NOT every gate funnels through this check any more, and the list
- *  above is exhaustive on purpose. The surfaces that can lock a room or
- *  unseat the people keeping it alive take `currentRoomDeedIsMine()` instead
- *  — the deed hand-over, the sole-croupier election, the room ACCESS MODE and
- *  co-host accept/deny/revoke. `isVentureShareholder` reads the current
- *  room's own venture map entry, which is peer-written and tied to nothing
- *  about this room or its owner, so a fabricated office record passes here;
- *  that is acceptable reach for edits and docking and was not for the four
- *  above.
+ *  📋 THE AUTHORITY SPLIT, and this docblock is the one place it is written
+ *  out — `roomOwner.ts` and `ventures.ts` point here rather than keeping
+ *  their own copies, because three hand-maintained lists is three chances to
+ *  describe a boundary that has moved.
+ *
+ *  Shareholder-extended (every caller of THIS predicate, as of #142):
+ *    · room edit mode ......... setRoomEditPermission
+ *    · docking + door policy .. dockingSystem.onOwnerCheck
+ *    · the room-NAME editor ... the roomInfo 'name' write
+ *    · the exterior view ...... setExteriorOwnerCheck
+ *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
+ *
+ *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
+ *    · the deed hand-over          · the sole-croupier election
+ *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *
+ *  The reason for the split: `isVentureShareholder` reads the current room's
+ *  own venture map entry, which is peer-written, shape-checked only, and tied
+ *  to nothing about this room or its owner — so a fabricated office record
+ *  passes this predicate. That is acceptable reach for editing and docking.
+ *  It was not acceptable for locking a room out or unseating the people
+ *  keeping it alive, which is what moved those four.
  *
  *  🔒 #141: the legacy `owner === 'Local-Clone'` clause is GONE. It granted
- *  owner authority over a room to EVERY peer at once, and every gate in the
- *  game funnels through here, so one string made pre-S2 rooms writable by
- *  anyone who walked in. It was a deliberate S2 convention, not an oversight
+ *  owner authority over a room to EVERY peer at once, across every gate in
+ *  the list above, so one string made pre-S2 rooms writable by anyone who
+ *  walked in. It was a deliberate S2 convention, not an oversight
  *  — which is why removing it is a BREAKING change and not a pure fix.
  *
  *  What breaks, said plainly: a room whose `roomInfo.owner` is the literal
