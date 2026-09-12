@@ -159,10 +159,22 @@ function notify(): void {
   }
 }
 
-/** Bind to the room's office doc at the join seam. Rebinding replaces state. */
+/**
+ * Bind to the room's office doc at the join seam. Rebinding replaces state.
+ *
+ * `networkGenesisChallenge` takes null for "this build has no network
+ * configured", which is a SUPPORTED state, not a fault: an unconfigured build
+ * is meant to show nothing, and treasuryNetwork returns null for exactly that
+ * reason. It used to be spelled with an invalid sentinel string instead, which
+ * meant the ordinary unconfigured path tripped the malformed-value warning
+ * below on every bind — telling the operator of a correctly-configured dev
+ * build that they had a local wiring bug, and making a genuinely malformed pin
+ * indistinguishable from the supported default. Both disable the cache; only
+ * one of them is worth saying out loud.
+ */
 export function bindTreasuryDoc(
   doc: Y.Doc,
-  opts: { verifySig: TreasurySigVerifier; networkGenesisChallenge: Hex32 },
+  opts: { verifySig: TreasurySigVerifier; networkGenesisChallenge: Hex32 | null },
 ): void {
   unobservePrevious?.();
   boundDoc = doc;
@@ -170,10 +182,14 @@ export function bindTreasuryDoc(
   if (isHex32(opts.networkGenesisChallenge)) {
     expectedGenesis = opts.networkGenesisChallenge;
   } else {
-    // Fail closed, but loudly: with no valid pin every genesis-bearing put
-    // and read refuses, which is a local wiring bug, not peer hostility.
+    // Fail closed either way — with no valid pin every genesis-bearing put and
+    // read refuses. Loudly only for a value that was supposed to be one: null
+    // is the caller saying "no network configured", already reported to the
+    // player by the UI's verification line.
     expectedGenesis = null;
-    console.warn('bindTreasuryDoc: invalid networkGenesisChallenge — treasury cache disabled');
+    if (opts.networkGenesisChallenge !== null) {
+      console.warn('bindTreasuryDoc: invalid networkGenesisChallenge — treasury cache disabled');
+    }
   }
   // The pin and the verifier are inputs to every cached verdict, and both may
   // have just changed — start again rather than trust answers computed under

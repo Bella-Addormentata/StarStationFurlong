@@ -60,7 +60,7 @@ import {
   subscribeTreasury,
   treasuryDocBound,
 } from "./treasuryDoc";
-import { NO_NETWORK_PIN, treasuryNetwork } from "./treasuryNetwork";
+import { treasuryNetwork } from "./treasuryNetwork";
 import {
   approvalsView,
   balanceView,
@@ -1268,11 +1268,12 @@ async function joinRoomAtEpoch(
   // genesis pin (§17.5) rejects records from any other network.
   bindTreasuryDoc(sync.doc, {
     verifySig: verifyIdentity,
-    // An unconfigured build pins to a value treasuryDoc must refuse, which
-    // closes the cache: no record can match, so none is displayed. Passing a
-    // plausible-looking hex placeholder here would instead make it the live
-    // network, and any peer could publish records under it.
-    networkGenesisChallenge: treasuryNetwork().genesisChallenge ?? NO_NETWORK_PIN,
+    // An unconfigured build passes null, which treasuryDoc reads as "no
+    // network configured" and closes the cache: no record can match, so none
+    // is displayed. Substituting a plausible-looking hex placeholder here
+    // would instead make it the live network, and any peer could publish
+    // records under it.
+    networkGenesisChallenge: treasuryNetwork().genesisChallenge,
   });
   // A new document means a new key space: every treasury cursor, offset and
   // open-detail id was minted against the previous room's map and is junk

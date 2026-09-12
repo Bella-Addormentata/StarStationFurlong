@@ -13,15 +13,26 @@
 // version used 64 zeros, which looks unusable but is perfectly valid Hex32:
 // treasuryDoc accepted it as the active network, so any peer could publish
 // records carrying that same all-zero genesis and an unconfigured build would
-// render them. Returning null instead lets the caller hand treasuryDoc a value
-// it must reject, which closes the cache entirely — nothing matches, so
+// render them. Null instead goes straight to treasuryDoc, which reads it as
+// "no network configured" and closes the cache entirely — nothing matches, so
 // nothing shows.
+//
+// Null, and not a deliberately-invalid sentinel string either. That was the
+// second spelling of this, and it worked, but it reached treasuryDoc as a
+// value that FAILED validation rather than one that declined to pin: every
+// bind on the supported unconfigured path logged "invalid
+// networkGenesisChallenge", which reads as a local wiring bug and hid the
+// case where the operator really had mistyped VITE_SSF_TREASURY_GENESIS.
+// The disabled state is now said in the type, once, and only a malformed
+// CONFIGURED value warns.
 
 export interface TreasuryNetwork {
   /**
    * The genesis challenge treasuryDoc pins its cache to, or null when this
-   * build has no network configured. Callers must NOT substitute a plausible
-   * hex value for null: pass something treasuryDoc will refuse.
+   * build has no network configured. Callers must NOT substitute anything for
+   * null — not a plausible hex value, and not an invalid placeholder either:
+   * pass the null straight through, which is how treasuryDoc is told the cache
+   * is deliberately closed rather than misconfigured.
    */
   genesisChallenge: string | null;
   /** Player-facing network name for the UI's verification line. */
@@ -29,12 +40,6 @@ export interface TreasuryNetwork {
   /** False when this build has no real network configured. */
   configured: boolean;
 }
-
-/**
- * What to pin with when unconfigured: deliberately not 64 hex characters, so
- * treasuryDoc's own guard refuses it and disables every treasury read.
- */
-export const NO_NETWORK_PIN = 'no-network-configured';
 
 /** The last malformed value warned about, so the warning is not repeated. */
 let lastWarnedValue: string | null = null;

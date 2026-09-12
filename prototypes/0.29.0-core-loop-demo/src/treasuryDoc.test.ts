@@ -3,7 +3,7 @@
 // ed25519 (same @noble stack as keypair.ts) with hex-encoded pubs/sigs — the
 // module is encoding-agnostic because the verifier is injected.
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import * as ed from '@noble/ed25519';
 import { sha512 } from '@noble/hashes/sha512';
@@ -908,6 +908,33 @@ describe('network pinning', () => {
     // against, so readMap() hands EVERY reader nothing before the map is
     // touched, this one included.
     expect(readChainSyncStatus()).toBeNull();
+  });
+
+  it('closes the cache for a null pin too, but WITHOUT the wiring-bug warning', () => {
+    // null is the supported unconfigured build (treasuryNetwork returns it),
+    // so it must close the cache exactly as a malformed value does while
+    // saying nothing: this path runs on every bind of every room in a dev
+    // build, and a warning here both floods the console and makes a genuinely
+    // mistyped VITE_SSF_TREASURY_GENESIS indistinguishable from the default.
+    const proposal = makeProposal();
+    expect(putProposal(proposal)).toBe(true);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: null });
+      expect(warn).not.toHaveBeenCalled();
+      // Closed all the same — the quiet is about the log, not the gate.
+      expect(treasuryDocBound()).toBe(true);
+      expect(readProposal(proposal.proposalId)).toBeNull();
+      expect(readPolicyCache()).toBeNull();
+      expect(readChainSyncStatus()).toBeNull();
+
+      // And the malformed case still speaks up, or the silence above would be
+      // indiscriminate rather than deliberate.
+      bindTreasuryDoc(doc, { verifySig: verifier, networkGenesisChallenge: 'not-hex' as never });
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

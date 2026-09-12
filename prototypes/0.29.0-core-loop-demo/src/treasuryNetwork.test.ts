@@ -3,7 +3,7 @@
 // a valid pin, and any peer could publish records carrying it.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { NO_NETWORK_PIN, treasuryNetwork } from './treasuryNetwork';
+import { treasuryNetwork } from './treasuryNetwork';
 
 const GENESIS = 'ae83525ba8d1dd3f09b277de18ca3e43fc0af20d20c4b3e92ef2a48bd291ccb2';
 
@@ -79,10 +79,13 @@ describe('unconfigured builds fail closed', () => {
     expect(treasuryNetwork().genesisChallenge).not.toBe('0'.repeat(64));
   });
 
-  it('offers a substitute pin that cannot be a genesis challenge', () => {
-    // What main.ts passes in place of null. treasuryDoc validates the pin as
-    // 64 lowercase hex, so this must not be that.
-    expect(NO_NETWORK_PIN).not.toMatch(/^[0-9a-f]{64}$/);
-    expect(NO_NETWORK_PIN.length).toBeGreaterThan(0);
+  it('offers NOTHING to pin with when unconfigured — null, not a substitute', () => {
+    // main.ts passes this value straight to bindTreasuryDoc, which reads null
+    // as "no network configured" and closes the cache without warning. A
+    // stand-in string would close it too, but as a validation FAILURE: the
+    // supported path would log a wiring-bug warning on every bind and a real
+    // mistyped genesis would be indistinguishable from it.
+    vi.stubEnv('VITE_SSF_TREASURY_GENESIS', '');
+    expect(treasuryNetwork().genesisChallenge).toBeNull();
   });
 });

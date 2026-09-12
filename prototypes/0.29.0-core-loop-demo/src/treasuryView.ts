@@ -1159,11 +1159,51 @@ export function roomFundingView(
   // record is this room's funding only when that key is the room owner's.
   const signer = bindingSigner(binding, ownerKey);
   const fingerprint = keyFingerprint(binding.boundByPub);
-  if (signer === 'not-owner') {
+  if (signer !== 'owner') {
     // Held, so never "no record" — but no company billboard either. The ids
     // a planted record names are the attacker's choice, and rendering them
     // under THIS ROOM would hand a forged binding exactly the display a real
     // one gets, with only the badge to tell them apart.
+    //
+    // ALL THREE non-owner states withhold, not just 'not-owner'. The other
+    // two are the ones a peer can MANUFACTURE: once a room has synced, the
+    // only action that produces an unknown or keyless owner is deleting or
+    // overwriting roomInfo.owner / players[owner].keyB64, and both are
+    // unauthenticated writes. Showing the company details whenever the owner
+    // merely cannot be established is what turns that deletion from
+    // censorship into forgery — knock out the owner entry, plant a
+    // self-signed binding, and the room advertises the attacker's company
+    // with nothing but a softer badge to tell. An honest deed hand-over never
+    // leaves a room in this state; it refuses a recipient with no key.
+    //
+    // Plan §10.1 (amended 2026-09-05) states this as the rule, and
+    // companyScope below already implements it for the company scope and
+    // proposal list. This reader disagreeing with it put the two surfaces
+    // back into exactly the split the module has had to fix once already.
+    const stateCopy =
+      signer === 'not-owner'
+        ? {
+            label: 'NOT OWNER-SIGNED',
+            signerLabel: `${fingerprint} · not the room owner`,
+            trustDetail: 'A record is held here, signed by a key that is not this room’s owner’s, so it is not shown as this room’s funding.',
+            headline: 'Funding record not signed by the room owner',
+            detail: 'This room holds a company funding record, but its signature is not the room owner’s. Anyone can write such a record into any room, so it says nothing about how this room is funded, and its company details are not shown.',
+          }
+        : signer === 'owner-unknown'
+          ? {
+              label: 'OWNER UNKNOWN',
+              signerLabel: `${fingerprint} · owner not yet known here`,
+              trustDetail: 'Signed, and the signature was checked here — but this device has not learned this room’s owner key yet, so whether the owner wrote it is not known and the company details are not shown.',
+              headline: 'Funding record · room owner not known here',
+              detail: 'This room holds a company funding record and its signature checked out, but this device does not yet know this room’s owner key, so it cannot tell whether the owner wrote it. Anyone can write such a record into any room, so its company details are not shown until the owner can be established.',
+            }
+          : {
+              label: 'NO OWNER KEY',
+              signerLabel: `${fingerprint} · room has no keyed owner`,
+              trustDetail: 'Signed, and the signature was checked here — but this room has no keyed owner on record, so no signature can count as the owner’s and the company details are not shown.',
+              headline: 'Funding record · room has no keyed owner',
+              detail: 'This room holds a company funding record and its signature checked out, but this room names no keyed owner, so there is no owner signature to check it against. Anyone can write such a record into any room, so its company details are not shown.',
+            };
     return {
       bound: false,
       expiryStatus: 'none',
@@ -1175,15 +1215,18 @@ export function roomFundingView(
       boundAtHeight: null,
       expiresAfterHeight: null,
       signer,
-      signerLabel: `${fingerprint} · not the room owner`,
+      // The fingerprint rides every one of these states — both surfaces print
+      // it outside their `bound` gate, so withholding the company details
+      // never costs the player the one fact that names who wrote the record.
+      signerLabel: stateCopy.signerLabel,
       companyApproval: null,
       trust: {
         ...trustTag('unverified'),
-        label: 'NOT OWNER-SIGNED',
-        detail: 'A record is held here, signed by a key that is not this room’s owner’s, so it is not shown as this room’s funding.',
+        label: stateCopy.label,
+        detail: stateCopy.trustDetail,
       },
-      headline: 'Funding record not signed by the room owner',
-      detail: 'This room holds a company funding record, but its signature is not the room owner’s. Anyone can write such a record into any room, so it says nothing about how this room is funded, and its company details are not shown.',
+      headline: stateCopy.headline,
+      detail: stateCopy.detail,
       readOnlyNote,
       unavailable,
     };
@@ -1214,44 +1257,27 @@ export function roomFundingView(
     boundAtHeight: binding.boundAtHeight,
     expiresAfterHeight: expires,
     signer,
-    signerLabel:
-      signer === 'owner'
-        ? `${fingerprint} · room owner`
-        : signer === 'owner-unknown'
-          ? `${fingerprint} · owner not yet known here`
-          : `${fingerprint} · room has no keyed owner`,
+    signerLabel: `${fingerprint} · room owner`,
     companyApproval: `Not checked here · receipt ${shortId(binding.policyReceiptId)}`,
-    // SIGNED only when the signer is the owner. The other two are signatures
-    // that checked out under a key this device cannot yet tie to anyone, and
-    // a badge that said otherwise would be the fail-open the door policy
-    // accepts for a door and this record cannot afford — see RoomOwnerKey.
-    trust:
-      signer === 'owner'
-        ? {
-            ...trustTag('signed'),
-            label: 'OWNER-SIGNED',
-            // The last clause is chosen by the owner key's PROVENANCE. Naming
-            // the owner in the room document is itself an unauthenticated
-            // write, so until a verified deed head supplies the key this
-            // badge says "as its records name them" and nothing stronger —
-            // a peer without chain access under issue #138's Phase 2 falls
-            // back to exactly that trust level and must read the same words.
-            detail:
-              ownerKey.status === 'known' && ownerKey.source === 'head-verified'
-                ? 'Signed by this room’s owner, confirmed against the room’s deed by your own node, and that signature was checked here — which shows the owner bound the room, not that the company agreed to fund it.'
-                : 'Signed by this room’s owner as its records currently name them — a name anyone in the room can write, not yet checked against a deed — and that signature was checked here, which shows the owner bound the room, not that the company agreed to fund it.',
-          }
-        : signer === 'owner-unknown'
-          ? {
-              ...trustTag('unverified'),
-              label: 'OWNER UNKNOWN',
-              detail: 'Signed, and the signature was checked here — but this device has not learned this room’s owner key yet, so whether the owner wrote it is not known.',
-            }
-          : {
-              ...trustTag('unverified'),
-              label: 'NO OWNER KEY',
-              detail: 'Signed, and the signature was checked here — but this room has no keyed owner on record, so no signature can count as the owner’s.',
-            },
+    // Only reachable with signer === 'owner': every other standing returned
+    // above. SIGNED is therefore the only badge this tail can produce, which
+    // is the point — a badge on company details the owner did not sign would
+    // be the fail-open the door policy accepts for a door and this record
+    // cannot afford. See RoomOwnerKey.
+    trust: {
+      ...trustTag('signed'),
+      label: 'OWNER-SIGNED',
+      // The last clause is chosen by the owner key's PROVENANCE. Naming the
+      // owner in the room document is itself an unauthenticated write, so
+      // until a verified deed head supplies the key this badge says "as its
+      // records name them" and nothing stronger — a peer without chain access
+      // under issue #138's Phase 2 falls back to exactly that trust level and
+      // must read the same words.
+      detail:
+        ownerKey.status === 'known' && ownerKey.source === 'head-verified'
+          ? 'Signed by this room’s owner, confirmed against the room’s deed by your own node, and that signature was checked here — which shows the owner bound the room, not that the company agreed to fund it.'
+          : 'Signed by this room’s owner as its records currently name them — a name anyone in the room can write, not yet checked against a deed — and that signature was checked here, which shows the owner bound the room, not that the company agreed to fund it.',
+    },
     // Always "record", never "Company funding" on its own — including when no
     // end height is named. A signature shows who wrote the statement; it does
     // not show the company agreed, that the chain ever confirmed it, or that

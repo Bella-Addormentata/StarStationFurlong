@@ -58,6 +58,7 @@ import {
   TREASURY_LABEL,
   TREASURY_MUTED,
   roomFundingView,
+  type RoomFundingView,
   scopeProposals,
   shareClassViews,
   shortId,
@@ -740,18 +741,30 @@ describe('policy, shares, and room funding', () => {
     sig: 'sig',
   });
 
+  /**
+   * The expiry cases below are all about a record's END HEIGHT, and only an
+   * OWNER-SIGNED record reports one: every other standing withholds the
+   * heights along with the company ids, so putting these through the default
+   * (owner-unknown) key would assert nothing about expiry at all.
+   */
+  const expiryOwner = { status: 'known', pub: 'pub', source: 'room-doc' } as const;
+  const fundingAsOwner = (
+    binding: RoomTreasuryBinding | null,
+    height: number | null = null,
+  ): RoomFundingView => roomFundingView(binding, height, 'readable', expiryOwner);
+
   it('keeps "no height to judge by" distinct from "has not ended"', () => {
     // The regression this guards: a boolean `lapsed` made both of these
     // false, so a record that had ended rendered as current funding.
     const base = expiring(200);
-    expect(roomFundingView(base, 250).expiryStatus).toBe('passed');
-    expect(roomFundingView(base, 150).expiryStatus).toBe('not-passed');
-    expect(roomFundingView(base, null).expiryStatus).toBe('unknown');
+    expect(fundingAsOwner(base, 250).expiryStatus).toBe('passed');
+    expect(fundingAsOwner(base, 150).expiryStatus).toBe('not-passed');
+    expect(fundingAsOwner(base, null).expiryStatus).toBe('unknown');
     // A record naming no end height is a fourth case again, and the only one
     // where the signature alone settles the question.
-    expect(roomFundingView(expiring(undefined), 150).expiryStatus).toBe('none');
+    expect(fundingAsOwner(expiring(undefined), 150).expiryStatus).toBe('none');
     // Boundary: the end height itself counts as reached.
-    expect(roomFundingView(base, 200).expiryStatus).toBe('passed');
+    expect(fundingAsOwner(base, 200).expiryStatus).toBe('passed');
   });
 
   it('treats a height that contradicts the record as no answer at all', () => {
@@ -761,26 +774,26 @@ describe('policy, shares, and room funding', () => {
     // current, so it is 'unknown' — the same treatment proposalPhase gives a
     // height that precedes acceptance.
     const base = expiring(200); // boundAtHeight is 100
-    expect(roomFundingView(base, 50).expiryStatus).toBe('unknown');
-    expect(roomFundingView(base, 99).expiryStatus).toBe('unknown');
+    expect(fundingAsOwner(base, 50).expiryStatus).toBe('unknown');
+    expect(fundingAsOwner(base, 99).expiryStatus).toBe('unknown');
     // At the bound height and above, the two agree and the question is
     // answerable again.
-    expect(roomFundingView(base, 100).expiryStatus).toBe('not-passed');
-    expect(roomFundingView(base, 250).expiryStatus).toBe('passed');
+    expect(fundingAsOwner(base, 100).expiryStatus).toBe('not-passed');
+    expect(fundingAsOwner(base, 250).expiryStatus).toBe('passed');
     // The note says it cannot tell, rather than asserting either way.
-    expect(roomFundingView(base, 50).expiryNote).toMatch(/cannot say whether/i);
+    expect(fundingAsOwner(base, 50).expiryNote).toMatch(/cannot say whether/i);
   });
 
   it('labels every expiry verdict apart from the record’s own signature', () => {
     const base = expiring(200);
     // The signature covers the record and the end height it names — never the
     // claim about where the chain has got to, so BOTH readings are qualified.
-    expect(roomFundingView(base, 250).expiryNote).toMatch(/not covered by the signature/i);
-    expect(roomFundingView(base, 150).expiryNote).toMatch(/not covered by the signature/i);
-    expect(roomFundingView(base, null).expiryNote).toMatch(/cannot say whether it has passed/i);
+    expect(fundingAsOwner(base, 250).expiryNote).toMatch(/not covered by the signature/i);
+    expect(fundingAsOwner(base, 150).expiryNote).toMatch(/not covered by the signature/i);
+    expect(fundingAsOwner(base, null).expiryNote).toMatch(/cannot say whether it has passed/i);
     // Nothing to qualify when no end height is named, or no record is held.
-    expect(roomFundingView(expiring(undefined), 150).expiryNote).toBeNull();
-    expect(roomFundingView(null).expiryNote).toBeNull();
+    expect(fundingAsOwner(expiring(undefined), 150).expiryNote).toBeNull();
+    expect(fundingAsOwner(null).expiryNote).toBeNull();
   });
 
   it('never claims live funding — every held record is headlined as a record', () => {
@@ -795,11 +808,11 @@ describe('policy, shares, and room funding', () => {
       [200, 150],
       [200, null],
     ] as const) {
-      const headline = roomFundingView(expiring(expires), height).headline;
+      const headline = fundingAsOwner(expiring(expires), height).headline;
       expect(headline).toBe('Company funding record');
       expect(headline).not.toMatch(/may have ended/i);
     }
-    expect(roomFundingView(expiring(200), 250).headline).toMatch(/may have ended/i);
+    expect(fundingAsOwner(expiring(200), 250).headline).toMatch(/may have ended/i);
   });
 
   it('withholds company details when the signed binding is held but unusable', () => {
@@ -1707,26 +1720,77 @@ describe('who signed the funding record (plan §10.1, room side)', () => {
     expect(v.companyApproval).toBeNull();
   });
 
-  it('never fails open when the owner is unknown or the room has no keyed owner', () => {
-    // Once synced, the only peer action that produces "owner unknown" is
-    // deleting or overwriting the owner's players entry — so a rule that
-    // trusted any signer then would turn censorship into forgery.
+  it('withholds the company details when the owner is unknown or the room has no keyed owner', () => {
+    // Once a room has synced, the only peer action that produces either state
+    // is deleting or overwriting roomInfo.owner / players[owner].keyB64 — both
+    // unauthenticated writes. So these are the two states an attacker can
+    // MANUFACTURE, and showing the record's company ids in them turns that
+    // deletion from censorship into forgery: knock out the owner entry, plant
+    // a self-signed binding, and the room advertises the attacker's company.
+    // Plan §10.1 (amended 2026-09-05) requires the withholding; companyScope
+    // has always done it for the proposal list, and this reader is the half
+    // that did not.
+    //
+    // `bound` is the gate BOTH surfaces render the company rows behind
+    // (devices.ts FUNDING panel, main.ts THIS ROOM), so it is the assertion
+    // that decides whether the ids reach a screen. An earlier version of this
+    // test asserted `bound === true` here, reading it as "shown as the claim
+    // it is" — but the claim is carried by the headline, the badge and the
+    // signer label, none of which are behind that gate.
     const u = roomFundingView(VOCAB_BINDING, null, 'readable', unknown);
     expect(u.signer).toBe('owner-unknown');
     expect(u.trust.level).toBe('unverified');
     expect(u.trust.label).toBe('OWNER UNKNOWN');
     expect(u.trust.detail).toMatch(/not learned this room’s owner key yet/i);
-    expect(u.bound).toBe(true); // shown as the claim it is
+    expect(u.bound).toBe(false);
+    expect(u.companyId).toBeNull();
+    expect(u.treasuryId).toBeNull();
+    expect(u.profileId).toBeNull();
+    expect(u.policyVersion).toBeNull();
+    expect(u.boundAtHeight).toBeNull();
+    expect(u.expiresAfterHeight).toBeNull();
+    expect(u.companyApproval).toBeNull();
+    // Still held, and still attributed: the record is reported, and the key
+    // that wrote it is named. Withholding the company is not silence.
+    expect(u.headline).toMatch(/funding record/i);
+    expect(u.headline).not.toMatch(/no company funding record/i);
     expect(u.signerLabel).toMatch(/owner not yet known/i);
+    expect(u.signerLabel).toContain(keyFingerprint('k'.repeat(43)));
+
     const l = roomFundingView(VOCAB_BINDING, null, 'readable', legacy);
     expect(l.signer).toBe('no-owner-key');
     expect(l.trust.level).toBe('unverified');
     expect(l.trust.label).toBe('NO OWNER KEY');
+    expect(l.bound).toBe(false);
+    expect(l.companyId).toBeNull();
+    expect(l.treasuryId).toBeNull();
+    expect(l.profileId).toBeNull();
+    expect(l.policyVersion).toBeNull();
+    expect(l.boundAtHeight).toBeNull();
+    expect(l.expiresAfterHeight).toBeNull();
+    expect(l.companyApproval).toBeNull();
+    expect(l.headline).toMatch(/funding record/i);
     expect(l.signerLabel).toMatch(/no keyed owner/i);
+    expect(l.signerLabel).toContain(keyFingerprint('k'.repeat(43)));
+
     // And a caller that forgets the owner key gets the honest default, never
-    // a SIGNED badge.
+    // a SIGNED badge and never the company ids.
     expect(roomFundingView(VOCAB_BINDING).trust.level).toBe('unverified');
     expect(roomFundingView(VOCAB_BINDING).signer).toBe('owner-unknown');
+    expect(roomFundingView(VOCAB_BINDING).companyId).toBeNull();
+  });
+
+  it('shows the company ids under exactly one standing — the owner’s', () => {
+    // The positive half, so the withholding above cannot be satisfied by a
+    // reader that withholds from everyone. One owner key, four verdicts.
+    const shown = roomFundingView(VOCAB_BINDING, null, 'readable', owner);
+    expect(shown.bound).toBe(true);
+    expect(shown.companyId).toBe('b'.repeat(64));
+    for (const ownerKey of [stranger, unknown, legacy]) {
+      const v = roomFundingView(VOCAB_BINDING, null, 'readable', ownerKey);
+      expect(v.bound).toBe(false);
+      expect(v.companyId).toBeNull();
+    }
   });
 
   it('never prints a raw signing key — fingerprints only', () => {
