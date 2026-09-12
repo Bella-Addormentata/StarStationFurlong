@@ -198,6 +198,25 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     expect(calls - declarations).toBe(5);
   });
 
+  it('the co-host section repaints when either map behind the deed check moves', () => {
+    // The gate change widened this section's live dependencies: the old
+    // shareholder predicate compared against our player id, while
+    // currentRoomDeedIsMine() reads roomInfo.owner AND players[owner].keyB64.
+    // updateRoomUI is what both map observers call, so the repaint has to
+    // happen there — otherwise a deed hand-over, or the owner's players entry
+    // landing late (the ordinary join order), leaves the new holder with no
+    // controls and the old holder with buttons the handler refuses.
+    const start = main.indexOf('const updateRoomUI = () => {');
+    const end = main.indexOf('roomMap.observe(', start);
+    expect(start, 'updateRoomUI not found in main.ts').toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const updateRoomUI = main.slice(start, end);
+    expect(updateRoomUI).toContain('renderCoHostsSection()');
+    // The access-mode selector's enabled state is the same check, repainted
+    // through refreshAccessRoomRow -> applyAccessModeUI.
+    expect(updateRoomUI).toContain('refreshAccessRoomRow()');
+  });
+
   it('co-host accept/deny/revoke gate on the deed, in handler and render alike', () => {
     // BOTH sites, pinned by count. They live inside one render function rather
     // than named functions of their own, and there are exactly two: the

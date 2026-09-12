@@ -1638,7 +1638,20 @@ async function joinRoomAtEpoch(
       ownerEl.textContent = resolveOwnerLabel(ownerVal);
     }
     // #52: the ACCESS app's MY PASS room row mirrors the same doc state.
+    // (This also repaints the access-mode selector, whose enabled state is the
+    // deed check — same live dependency as the co-host section below.)
     refreshAccessRoomRow();
+    // 🔒 #142: the co-host controls gate on `currentRoomDeedIsMine()`, which
+    // reads roomInfo.owner AND players[owner].keyB64 — so it now depends on
+    // BOTH maps this function observes, where the old shareholder gate
+    // compared against our player id alone and needed neither. Without this
+    // line the section repainted only on a roles-map change or on opening the
+    // app, so a deed hand-over — or the owner's players entry simply landing
+    // late, which is the ordinary join order — left the new holder with no
+    // controls and the old holder with REVOKE buttons the handler silently
+    // refuses. Exactly the treasury's OWNER UNKNOWN → OWNER-SIGNED flip noted
+    // on the players observer below, on a surface that had not needed it.
+    renderCoHostsSection();
     // Recategorise the room list: owner (roomInfo) and the owner's pubkey (its
     // players entry) can sync in after entry, moving the current room into its
     // correct section (My Rooms / Friends' / Visited) instead of Unreached.
