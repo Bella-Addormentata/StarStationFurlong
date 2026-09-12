@@ -15,7 +15,7 @@
 
 import * as Y from 'yjs';
 
-export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom';
+export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom' | 'coach';
 
 /** 🤖 #77C s4: one bounded step of an owner-authored routine (a chip list, NOT
  *  a DSL). The robot loops the list: walk to a spot, say a line, or pause. */
@@ -37,7 +37,7 @@ export interface RobotConfig {
   parked?: boolean;
 }
 
-export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom'];
+export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom', 'coach'];
 
 /** Human labels for the routine dropdown. */
 export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
@@ -45,6 +45,7 @@ export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
   croupier: 'Table croupier',
   idle: 'Idle at dock',
   custom: 'Custom script',
+  coach: '🏋️ Fitness coach',
 };
 
 let boundDoc: Y.Doc | null = null;
