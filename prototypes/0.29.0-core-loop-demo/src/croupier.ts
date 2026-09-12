@@ -21,8 +21,13 @@
  * the phase; everyone else renders `deadline − localNow` as a display-only
  * countdown (the offers.ts expiresAt precedent, single-writer for seconds-scale).
  *
- * FAIRNESS is dev-phase trust (the operator's client rolls the pocket), exactly
- * like the manual croupier — the G5 commit-reveal upgrade slots in unchanged.
+ * FAIRNESS (#69 G5 — DONE): the croupier publishes a SHA-256 COMMITMENT to a
+ * secret seed at OPEN, before bets close, and reveals the seed at SETTLE with
+ * the pocket. Every client re-derives the pocket from the revealed seed and
+ * refuses to render the round FAIR unless commit and derivation both check out.
+ * See games/fairness.ts. Legacy rounds (no pre-commit — a rare fallback when
+ * hashing fails at open, or a round opened before this slice) still settle via
+ * spinPocket() and render plainly as LEGACY on every client.
  */
 
 import {
@@ -36,6 +41,13 @@ import {
 } from './casinoDoc';
 import { pocketColor, resolveRound } from './games/roulette';
 import type { RouletteTableState } from './games/roulette';
+// 🔒 #69 G5 house commit-reveal: pre-commit-at-open + derive-at-settle.
+import {
+  clearFairnessForTable,
+  consumeRoundProof,
+  derivePocket,
+  prepareRoundFairness,
+} from './games/fairness';
 
 /** Betting window once the first chip lands (the clock arms on a real bet, so a
  *  quiet table never spins nothing). */
@@ -66,9 +78,13 @@ export function canRunCroupier(): boolean {
   return solePredicate();
 }
 
-// ── Random pocket (operator-side; dev-phase trust — G5 adds commit-reveal) ────
+// ── Random pocket (LEGACY fallback only; the G5 path derives from a pre-committed seed) ─
 
-/** Uniform pocket 0–36 via rejection sampling (no modulo bias). */
+/** Uniform pocket 0–36 via rejection sampling (no modulo bias). Retained as the
+ *  LEGACY fallback for when the G5 fairness prepare/settle path fails (missing
+ *  pre-commit at settle-time, unexpected hash error). A round resolved through
+ *  this path renders as LEGACY on every client so a player can tell it apart
+ *  from a G5-verified round. */
 function spinPocket(): number {
   const buf = new Uint32Array(1);
   for (;;) {
@@ -77,42 +93,134 @@ function spinPocket(): number {
   }
 }
 
+// ── Re-entry guards (async fairness path + sync 60-Hz operator tick) ─────────
+
+/** Rounds mid-settle — the async G5 derive+write pair takes a couple of ms and
+ *  the operator's tick would otherwise call rollAndSettle every frame while
+ *  the phase is still 'closing'. Skip re-entrant calls until the write lands. */
+const settling = new Set<string>();
+
+/** Rounds mid-open — same reasoning at OPEN (prepare+write takes a couple of
+ *  ms). Keyed by (tableId, round) so a table opening round N does not block
+ *  the next round's open call. */
+const opening = new Set<string>();
+
+function roundKey(tableId: string, round: number): string {
+  return `${tableId}\0${round}`;
+}
+
 // ── Phase transitions (the single settle/open implementation) ─────────────────
 
-/** Roll, resolve, publish the settled record, and credit winners. Called by the
- *  operator's timer (with `autoShowMs` so it auto-opens the next round) AND by
- *  the manual SPIN button (no `autoShowMs` — the house clicks NEW ROUND). */
+/** Roll, resolve, publish the settled record, and credit winners.
+ *  FIRE-AND-FORGET: hashing is async (SubtleCrypto); this kicks off the settle
+ *  and returns. The settled state lands when the derive completes and every
+ *  client re-renders on the doc change. Re-entrant calls (same table, still
+ *  settling) are ignored. Called by the operator's timer (with `autoShowMs`)
+ *  AND the manual SPIN button (no `autoShowMs` — the house clicks NEW ROUND). */
 export function rollAndSettle(
   tableId: string,
   round: number,
   autoShowMs?: number,
-): number {
-  const result = spinPocket();
-  const payouts = resolveRound(readAllBets(tableId, round), result);
-  const now = Date.now();
-  writeTableState(tableId, {
-    kind: 'roulette',
-    phase: 'settled',
-    round,
-    result,
-    resultAt: now,
-    payouts,
-    ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
-  });
-  for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
-  return result;
+): void {
+  if (settling.has(tableId)) return;
+  settling.add(tableId);
+  void (async () => {
+    try {
+      // G5 (default): the pocket comes from the seed the croupier committed at
+      // OPEN. That way the operator cannot re-spin after seeing the felt — the
+      // seed was fixed BEFORE bets closed, and every client can check that
+      // (a) the seed hashes to the published commit and (b) the pocket is
+      // exactly what derivePocket(tableId, round, seed) produces.
+      // LEGACY fallback: if there is no pre-committed proof for this round
+      // (fairness prepare failed at open, or an old round opened before G5
+      // rolled out), fall through to spinPocket — the round renders LEGACY on
+      // every client, deliberately visible so a player can tell it apart from
+      // a G5-verified spin.
+      const stored = consumeRoundProof('roulette', tableId, round);
+      let result: number;
+      let fairness: { commit: string; reveal: string } | undefined;
+      if (stored) {
+        result = await derivePocket(tableId, round, stored.seedHex);
+        fairness = { commit: stored.commit, reveal: stored.seedHex };
+      } else {
+        result = spinPocket();
+      }
+      const payouts = resolveRound(readAllBets(tableId, round), result);
+      const now = Date.now();
+      writeTableState(tableId, {
+        kind: 'roulette',
+        phase: 'settled',
+        round,
+        result,
+        resultAt: now,
+        payouts,
+        ...(fairness ? { fairness } : {}),
+        ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+      });
+      for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
+    } catch (err) {
+      // Fall through to a plain legacy spin — never freeze the felt on a
+      // fairness edge case. The resulting round renders LEGACY.
+      // eslint-disable-next-line no-console
+      console.warn('[croupier] rollAndSettle fairness failed, using legacy spin:', err);
+      const result = spinPocket();
+      const payouts = resolveRound(readAllBets(tableId, round), result);
+      const now = Date.now();
+      writeTableState(tableId, {
+        kind: 'roulette',
+        phase: 'settled',
+        round,
+        result,
+        resultAt: now,
+        payouts,
+        ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
+      });
+      for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
+    } finally {
+      settling.delete(tableId);
+    }
+  })();
 }
 
-/** Open a fresh betting round (idle — no timer until a first bet arms it). */
+/** Open a fresh betting round, publishing the G5 house commit-reveal COMMITMENT
+ *  before any bet lands. Fire-and-forget: the sync tick calls this on every
+ *  frame, and the `opening` guard makes redundant calls a no-op until the
+ *  prepare+write pair completes. On a fairness error the round still opens
+ *  (LEGACY posture — never freeze the felt on a proof edge case); it just
+ *  renders LEGACY. */
 export function openBetting(tableId: string, round: number): void {
-  writeTableState(tableId, {
-    kind: 'roulette',
-    phase: 'betting',
-    round,
-    result: null,
-    resultAt: 0,
-    payouts: null,
-  });
+  const key = roundKey(tableId, round);
+  if (opening.has(key)) return;
+  opening.add(key);
+  void (async () => {
+    try {
+      const { proof } = await prepareRoundFairness('roulette', tableId, round);
+      writeTableState(tableId, {
+        kind: 'roulette',
+        phase: 'betting',
+        round,
+        result: null,
+        resultAt: 0,
+        payouts: null,
+        fairness: proof,
+      });
+    } catch (err) {
+      // Fall through to a legacy open — better than freezing the felt on a
+      // fairness edge case. The resulting round renders LEGACY.
+      // eslint-disable-next-line no-console
+      console.warn('[croupier] openBetting fairness failed:', err);
+      writeTableState(tableId, {
+        kind: 'roulette',
+        phase: 'betting',
+        round,
+        result: null,
+        resultAt: 0,
+        payouts: null,
+      });
+    } finally {
+      opening.delete(key);
+    }
+  })();
 }
 
 /**
@@ -172,6 +280,9 @@ export function closeTable(tableId: string): void {
       }
     }
   }
+  // G5: drop any operator-held seeds for this table so a removed table leaves
+  // no secrets behind (mirrored in crapsCroupier.closeCrapsTable).
+  clearFairnessForTable(tableId);
   clearTableKeys(tableId);
 }
 

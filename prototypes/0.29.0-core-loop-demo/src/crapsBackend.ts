@@ -40,6 +40,10 @@ import { nextPoint, resolveCrapsRound, shooterHandOver } from './games/craps';
 // 🎲🔀 The dice-fairness mode drives HOW the roll is produced (rng / commit-reveal
 // / multiparty / block-beacon) — switchable per table; see games/diceFairness.ts.
 import { getCrapsFairnessMode, produceRoll } from './games/diceFairness';
+// 🔒 #69 G5 house commit-reveal: the operator's pre-committed seed for THIS
+// round produces the dice deterministically, so every client can verify the
+// roll wasn't rewritten after bets closed. See games/fairness.ts.
+import { consumeRoundProof, deriveDicePair } from './games/fairness';
 
 export type { CrapsBackendKind };
 
@@ -81,10 +85,31 @@ class LocalCrapsBackend implements CrapsBackend {
     pointBefore: number | null,
     autoShowMs?: number,
   ): Promise<[number, number]> {
-    // HOW the dice are produced is the table's fairness mode (rng / commit-reveal
-    // / multiparty / block-beacon), per-table override or the global default.
-    const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
-    const { dice, transcript } = await produceRoll(mode, tableId, round);
+    // G5 (default): the dice come from the pre-committed seed the stickman
+    // published at OPEN. That way the operator cannot re-roll after seeing
+    // the felt — the seed was fixed BEFORE bets closed, and every client can
+    // check that (a) the seed hashes to the published commit and (b) the
+    // dice are exactly what deriveDicePair(tableId, round, seed) produces.
+    // LEGACY fallback: if there is no pre-committed proof for this round
+    // (operator changed mid-round, or a round that opened before G5 rolled
+    // out on this table), settle via the multi-mode `produceRoll` path — the
+    // round renders LEGACY on every client, deliberately visible so a player
+    // can tell it apart from a G5-verified roll.
+    const stored = consumeRoundProof('craps', tableId, round);
+    let dice: [number, number];
+    let g5Fairness: { commit: string; reveal: string } | undefined;
+    // legacyTranscript remains undefined on the G5 path; produceRoll fills it
+    // on the fallback path. Typed as the CrapsTableState transcript shape.
+    let legacyTranscript: import('./games/craps').FairnessTranscript | undefined;
+    if (stored) {
+      dice = await deriveDicePair(tableId, round, stored.seedHex);
+      g5Fairness = { commit: stored.commit, reveal: stored.seedHex };
+    } else {
+      const mode = readCrapsFairnessPref(tableId) ?? getCrapsFairnessMode();
+      const produced = await produceRoll(mode, tableId, round);
+      dice = produced.dice;
+      legacyTranscript = produced.transcript;
+    }
     // The hashing yielded — the table may have been REMOVED meanwhile
     // (closeCrapsTable refunded every felt and wiped the table keys, #87
     // review). Writing now would resurrect the dead table's state and pay
@@ -109,7 +134,15 @@ class LocalCrapsBackend implements CrapsBackend {
       resultAt: now,
       payouts,
       sevenOut: shooterHandOver(pointBefore, sum),
-      ...(transcript ? { fairness: transcript } : {}),
+      // Multi-mode transcript survives ONLY on the legacy fallback path —
+      // when G5 is in effect, the G5 proof is the authoritative fairness
+      // record. Omitting the transcript in the G5 case keeps the settled
+      // state self-consistent (an old transcript with new G5-derived dice
+      // would verifyTranscript ⇒ false, which would misread as tampering).
+      ...(legacyTranscript ? { fairness: legacyTranscript } : {}),
+      // G5 house commit-reveal — always published when a pre-committed seed
+      // existed for this round; absent on the legacy fallback path.
+      ...(g5Fairness ? { houseFairness: g5Fairness } : {}),
       ...(autoShowMs != null ? { phaseDeadline: now + autoShowMs } : {}),
     });
     for (const [pid, amount] of Object.entries(payouts)) creditChips(pid, amount);
