@@ -69,11 +69,27 @@ export interface AtlasEntry {
   dims?: { cols: number; rows: number };
   /** Keyed by DOOR ID — cardinal or free `d:`. */
   doors: Record<string, AtlasDoor>;
+  /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`) and
+   *  used only to arbitrate merges. Never use it to decide what to KEEP: it is
+   *  peer-settable, so ordering retention by it lets a peer evict rooms you
+   *  actually walked through (#144). */
   lastSeen: number;
+  /** LOCAL recency — when THIS install last had first-hand contact with the
+   *  room (a visit, or first learning of it). No peer can set it, which is what
+   *  makes it safe for eviction ordering. Optional: entries persisted before
+   *  this field existed fall back to `lastSeen` in writeAtlas. */
+  localSeenAt?: number;
 }
 
 const KEY = 'ssf-station-atlas';
 const MAX_ENTRIES = 64;
+
+/** 🕒 How far ahead of OUR clock a peer's gossip stamp may sit before the whole
+ *  shared entry is refused (#144). The comparison is against the reader's own
+ *  clock and a browser mesh has no NTP guarantee, so this must cover honest
+ *  skew — but whatever slack it allows is the head start an attacker keeps.
+ *  Matches the venture-record bound in ventures.ts (#143). */
+const MAX_GOSSIP_SKEW_MS = 6 * 60 * 60 * 1000;
 
 export function roomIdFromSeed(seed: string): string {
   // REAL pass format (decodeBootstrapSeed): base64(JSON{ roomId, wtUrl, … }),
@@ -112,7 +128,31 @@ export function readAtlas(): Record<string, AtlasEntry> {
 
 function writeAtlas(atlas: Record<string, AtlasEntry>): void {
   try {
-    const entries = Object.values(atlas).sort((a, b) => b.lastSeen - a.lastSeen).slice(0, MAX_ENTRIES);
+    // 🗄️ Evict in two tiers, and never on the gossip stamp. `lastSeen` is
+    // derived from a peer's `updatedAt`, so ordering retention by it let a peer
+    // float its own entries to the top of a 64-deep list and push out rooms the
+    // player actually walked through (#144).
+    //
+    // Tier 1 — FIRST-HAND: rooms we visited, or whose seed we were handed.
+    // They carry `localSeenAt`, which only this install ever writes.
+    // Tier 2 — GOSSIP-ONLY: learned from a peer's shared atlas. No local stamp,
+    // so they are evicted before any visited room regardless of how fresh a
+    // peer claims they are. A single join absorbs a whole station's atlas, so
+    // without this tiering one hop into a busy station could evict the player's
+    // own history.
+    //
+    // Legacy entries written before the field existed have no stamp and so land
+    // in tier 2, ordered among themselves by `lastSeen` — an upgrade loses the
+    // visited/gossip distinction for old entries rather than mis-ranking them.
+    const rank = (e: AtlasEntry): [number, number] =>
+      e.localSeenAt === undefined ? [0, e.lastSeen] : [1, e.localSeenAt];
+    const entries = Object.values(atlas)
+      .sort((a, b) => {
+        const [at, ar] = rank(a);
+        const [bt, br] = rank(b);
+        return bt !== at ? bt - at : br - ar;
+      })
+      .slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
     for (const e of entries) out[e.roomId] = e;
     localStorage.setItem(KEY, JSON.stringify(out));
@@ -155,6 +195,8 @@ export function harvestIntoAtlas(entry: {
     dims: entry.dims ?? prior?.dims,
     doors,
     lastSeen: Date.now(),
+    // We are standing in it — the strongest possible local recency signal.
+    localSeenAt: Date.now(),
   };
   // Stub entries for neighbors we now know exist (their seed reaches them —
   // clicking them from space can connect even before we ever visit).
@@ -166,6 +208,8 @@ export function harvestIntoAtlas(entry: {
       seed: d.targetSeed,
       doors: {},
       lastSeen: Date.now(),
+      // First-hand: we learned this neighbour exists from a door we can see.
+      localSeenAt: Date.now(),
     };
   }
   writeAtlas(atlas);
@@ -182,6 +226,10 @@ export function noteRoomSeed(roomId: string, name: string, seed: string): void {
     seed,
     doors: prior?.doors ?? {},
     lastSeen: prior?.lastSeen ?? Date.now(),
+    // A seed we were handed is first-hand knowledge, but it says nothing new
+    // about a room we already knew — so keep the prior recency when there is
+    // one and only stamp on first learn.
+    localSeenAt: prior?.localSeenAt ?? Date.now(),
   };
   writeAtlas(atlas);
 }
@@ -396,7 +444,17 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
   return typeof e.roomId === 'string' && e.roomId.length > 0
     && typeof e.name === 'string'
     && typeof e.doors === 'object' && e.doors !== null
+    // 🕒 `updatedAt` is peer-written and drives merge arbitration (pullSharedAtlas
+    // skips on `prior.lastSeen >= value.updatedAt`). Unbounded, a planted
+    // far-future stamp wins every future comparison and — before the retention
+    // split below — pinned the top of the 64-deep eviction list too (#144).
+    // This is a real ingest boundary (the doc is not the store; pullSharedAtlas
+    // writes localStorage), so bounding here keeps the stored value stable
+    // rather than time-varying. Whatever slack is allowed is the head start an
+    // attacker keeps, hence hours rather than days.
     && typeof e.updatedAt === 'number'
+    && Number.isFinite(e.updatedAt)
+    && e.updatedAt <= Date.now() + MAX_GOSSIP_SKEW_MS
     && (e.seed === undefined || typeof e.seed === 'string')
     // 🛑📐 dims drives GEOMETRY straight into the exterior renderer, and this
     // value came off the wire from a peer. Bounded to the same envelope the
@@ -500,6 +558,12 @@ function pullSharedAtlas(): void {
       dims: value.dims ?? prior?.dims,
       doors,
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
+      // Gossip is SECOND-hand and must never mint local recency: stamping it
+      // here would let one peer's station sweep outrank every room the player
+      // actually walked through (#144). Carry a prior stamp forward when we
+      // have one — that room was visited — and otherwise leave it absent, which
+      // is what marks this entry gossip-only for eviction.
+      localSeenAt: prior?.localSeenAt,
     };
     changed = true;
   }
