@@ -208,8 +208,14 @@ export function harvestIntoAtlas(entry: {
       seed: d.targetSeed,
       doors: {},
       lastSeen: Date.now(),
-      // First-hand: we learned this neighbour exists from a door we can see.
-      localSeenAt: Date.now(),
+      // NO local stamp. These targets come from `readAllDoors()`, whose room-doc
+      // map is explicitly untrusted ("any value READ is untrusted — a peer could
+      // write junk", doorsDoc.ts:16-17) and accepts up to MAX_PAIRINGS = 64
+      // pairings — exactly MAX_ENTRIES. Stamping them first-hand would let one
+      // peer write 64 fake pairings, have us mint 64 tier-1 stubs on join, and
+      // evict every room we had actually visited: the precise attack this
+      // tiering exists to stop. A door we can see is still only a peer's claim
+      // that it leads somewhere, so the stub stays gossip-tier until we go.
     };
   }
   writeAtlas(atlas);

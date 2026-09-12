@@ -105,4 +105,36 @@ describe('eviction prefers first-hand knowledge (#144)', () => {
     harvestIntoAtlas({ roomId: 'module-visited', name: 'V', doors: [] });
     expect(readAtlas()['module-visited'].localSeenAt).toBeGreaterThan(0);
   });
+
+  it('does NOT stamp neighbour stubs — door records are peer-written', () => {
+    harvestIntoAtlas({
+      roomId: 'module-here',
+      name: 'HERE',
+      doors: [{ doorId: 'n', targetSeed: btoa(JSON.stringify({ roomId: 'module-nbr' })) }],
+    });
+    const atlas = readAtlas();
+    expect(atlas['module-here'].localSeenAt).toBeGreaterThan(0); // we stood in it
+    expect(atlas['module-nbr']).toBeDefined();                   // stub exists...
+    expect(atlas['module-nbr'].localSeenAt).toBeUndefined();      // ...but is gossip-tier
+  });
+
+  it('a peer filling the door map cannot evict visited rooms', () => {
+    // A real visit, recorded first.
+    harvestIntoAtlas({ roomId: 'module-mine', name: 'MINE', doors: [] });
+
+    // readAllDoors() is capped at MAX_PAIRINGS = 64 — exactly MAX_ENTRIES — so a
+    // hostile room doc can offer a full atlas's worth of fabricated targets.
+    harvestIntoAtlas({
+      roomId: 'module-trap',
+      name: 'TRAP',
+      doors: Array.from({ length: 64 }, (_, i) => ({
+        doorId: `d:${i}`,
+        targetSeed: btoa(JSON.stringify({ roomId: `module-fake${i}` })),
+      })),
+    });
+
+    const atlas = readAtlas();
+    expect(Object.keys(atlas).length).toBeLessThanOrEqual(64);
+    expect(atlas['module-mine']).toBeDefined();
+  });
 });
