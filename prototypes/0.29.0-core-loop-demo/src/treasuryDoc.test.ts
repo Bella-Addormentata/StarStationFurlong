@@ -903,8 +903,10 @@ describe('network pinning', () => {
       nextCursor: null,
     });
     expect(readPolicyCache()).toBeNull();
-    // The sync entry carries no genesis of its own, so this is the only place
-    // it can fail closed inside the cache layer.
+    // Not for want of a genesis — the sync entry carries one, and its reader
+    // compares it. The invalid pin leaves no expected genesis to compare
+    // against, so readMap() hands EVERY reader nothing before the map is
+    // touched, this one included.
     expect(readChainSyncStatus()).toBeNull();
   });
 });

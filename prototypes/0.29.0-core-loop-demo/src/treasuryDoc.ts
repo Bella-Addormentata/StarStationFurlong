@@ -1169,8 +1169,12 @@ export function putWindowsCache(windows: ProposalWindows): boolean {
 /**
  * A cached derivation, returned for display. To TRUST windows, recompute them:
  * deriveProposalWindows(readRegistration(id), rule) — sovereign §4.
+ *
+ * Cached clocks, or why there are none — THREE states, not the four its
+ * unbounded siblings carry. ProposalWindows is a fixed set of hashes and
+ * heights bounded by its own shape guard, so no record here can be refused
+ * as too large and there is no 'too-large' to report.
  */
-/** Cached clocks, or why there are none. Same four states as its siblings. */
 export type WindowsCacheResult =
   | { status: 'ok'; windows: ProposalWindows }
   | { status: 'absent' | 'unreadable' };
