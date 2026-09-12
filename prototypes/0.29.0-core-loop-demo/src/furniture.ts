@@ -105,7 +105,8 @@ export type FurnitureKind =
   | "classic-hot-tub"
   | "bunk-bed"
   | "clone-vat"
-  | "slot-machine";
+  | "slot-machine"
+  | "trading-screen";
 
 export interface FurnitureItem {
   id: string;
@@ -1767,6 +1768,145 @@ const buildWallComputer = (ctx: BuildCtx) => {
   screen.userData.wallScreen = handle; // collected by World.addLobbyFurniture
 };
 
+// ── 🏛️ Trading screen (#68 V4) — variant of wall-computer, trading floor UX ──
+// A wall-mounted panel dedicated to the venture's trading floor. Same shape
+// and mount kinematics as the room terminal (a wall-hung panel with a live
+// CanvasTexture screen) but a distinctly green LED-strip visual so the two
+// props are unambiguous in-world. The handle collected in userData.wallScreen
+// is the SAME WallScreenHandle contract — World.wallScreens updates status at
+// ~1 Hz and dims to IN USE around focus, no dispatch-side changes required.
+// The FOCUSED DOM UI is the offers-board + chart pane (devices.ts
+// createTradingScreenUI); this idle-frame just shows a peer-count / offer
+// count summary so people can spot the prop and know what it is.
+const buildTradingScreen = (ctx: BuildCtx) => {
+  const { m, place } = ctx;
+  const HOUSING = 0x1F2A24; // deep evergreen slate (reads as trading-floor)
+  const BEZEL = 0x2E3D34;
+  const ACCENT = 0x00E676;  // green LED strip — signals TRADING FLOOR
+
+  place(new THREE.BoxGeometry(WC_W, WC_H, WC_D - 0.04),
+    m(HOUSING, 0.6, 0.5), 0, WC_Y, -0.02); // housing (back)
+  place(new THREE.BoxGeometry(0.82, 0.6, 0.03),
+    m(BEZEL, 0.55, 0.45), 0, WC_Y + 0.02, WC_D / 2 - 0.015); // bezel
+  place(new THREE.BoxGeometry(WC_W, 0.05, 0.03),
+    m(ACCENT, 0.4, 0.5), 0, WC_Y - WC_H / 2 + 0.025, WC_D / 2 - 0.015); // green strip
+  place(new THREE.BoxGeometry(0.2, 0.06, 0.02),
+    m(HOUSING, 0.6, 0.5), 0, WC_Y - WC_H / 2 + 0.025, WC_D / 2 + 0.001); // strip badge
+
+  // Live canvas — same 256×192 dimensions as the room terminal so material
+  // sampling matches (nearest-filter pixelated screen, unlit = emissive read).
+  const cv = document.createElement("canvas");
+  cv.width = 256;
+  cv.height = 192;
+  const c2d = cv.getContext("2d")!;
+  const screenTex = new THREE.CanvasTexture(cv);
+  screenTex.minFilter = THREE.NearestFilter;
+  screenTex.magFilter = THREE.NearestFilter;
+  screenTex.generateMipmaps = false;
+  screenTex.colorSpace = THREE.SRGBColorSpace;
+  const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
+  const screen = place(new THREE.PlaneGeometry(0.72, 0.5),
+    screenMat, 0, WC_Y + 0.02, WC_D / 2 + 0.002);
+
+  // Idle frame: TRADING FLOOR heading + live peer count + a bare price-line
+  // motif so the prop reads as a market screen even before any trades exist.
+  // The peer count is the shared "how many clones on this doc" the room
+  // terminal already surfaces — reuse it here so the two panels don't lie to
+  // each other about the connection state.
+  const drawStatus = (status: WallComputerStatus) => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = "#050A08";
+    c2d.fillRect(0, 0, 256, 192);
+    c2d.strokeStyle = "#0F2A18";
+    c2d.strokeRect(3.5, 3.5, 249, 185);
+    // Header — venture name if we can, else generic TRADING FLOOR
+    c2d.font = "bold 16px monospace";
+    c2d.textAlign = "left";
+    c2d.textBaseline = "alphabetic";
+    c2d.fillStyle = "#00E676";
+    c2d.fillText("TRADING FLOOR", 14, 28);
+    c2d.strokeStyle = "#00E676";
+    c2d.beginPath();
+    c2d.moveTo(14, 38);
+    c2d.lineTo(242, 38);
+    c2d.stroke();
+    // Peer count (cyan — same idiom as room terminal)
+    c2d.font = "14px monospace";
+    c2d.fillStyle = "#00E5FF";
+    c2d.fillText(`PEERS: ${status.peers}`, 14, 62);
+    // Node LED — trading floor is offline-dead without the doc, so make the
+    // status honest: red when offline, green when online.
+    c2d.beginPath();
+    c2d.arc(21, 82, 5, 0, Math.PI * 2);
+    c2d.fillStyle = status.nodeOnline ? "#00E676" : "#FF1744";
+    c2d.fill();
+    c2d.fillStyle = "#8FA3B8";
+    c2d.fillText(`NODE ${status.nodeOnline ? "ONLINE" : "OFFLINE"}`, 34, 87);
+    // Bare price-line motif on the right so the prop reads as a chart
+    c2d.strokeStyle = "#00E676";
+    c2d.lineWidth = 1;
+    const graphX = 130, graphY = 100, graphW = 108, graphH = 60;
+    c2d.strokeRect(graphX + 0.5, graphY + 0.5, graphW, graphH);
+    // A gently-rising sample line (idle-frame decoration — the LIVE chart
+    // lives in the focused DOM UI where priceHistory() feeds real trades).
+    c2d.beginPath();
+    const samples = [45, 42, 44, 40, 36, 33, 30, 26, 24, 20, 18, 15];
+    samples.forEach((y, i) => {
+      const x = graphX + 4 + (i / (samples.length - 1)) * (graphW - 8);
+      const py = graphY + y;
+      if (i === 0) c2d.moveTo(x, py); else c2d.lineTo(x, py);
+    });
+    c2d.stroke();
+    c2d.fillStyle = "#4A8560";
+    c2d.font = "9px monospace";
+    c2d.fillText("PRICE", graphX + 4, graphY - 3);
+    // Plain-language marquee under the peer row (NO chain jargon).
+    c2d.fillStyle = "#4A8560";
+    c2d.font = "12px monospace";
+    c2d.fillText("OFFERS · SHARES · TAPE", 14, 120);
+    // Footer
+    c2d.fillStyle = "#1F3A28";
+    c2d.font = "10px monospace";
+    c2d.fillText("SSF TRADING FLOOR v1", 14, 178);
+    screenTex.needsUpdate = true;
+  };
+
+  const drawInUse = () => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = "#020604";
+    c2d.fillRect(0, 0, 256, 192);
+    c2d.strokeStyle = "#0F2A18";
+    c2d.strokeRect(3.5, 3.5, 249, 185);
+    c2d.font = "bold 14px monospace";
+    c2d.textAlign = "center";
+    c2d.textBaseline = "middle";
+    c2d.fillStyle = "rgba(0, 230, 118, 0.45)";
+    c2d.fillText("TERMINAL IN USE", 128, 96);
+    screenTex.needsUpdate = true;
+  };
+
+  let engaged = false;
+  let lastStatus: WallComputerStatus = {
+    roomName: "TRADING FLOOR",
+    peers: 0,
+    nodeOnline: false,
+  };
+  const handle: WallScreenHandle = {
+    updateStatus: (status) => {
+      lastStatus = status;
+      if (engaged) drawInUse();
+      else drawStatus(status);
+    },
+    setEngaged: (value) => {
+      engaged = value;
+      if (engaged) drawInUse();
+      else drawStatus(lastStatus);
+    },
+  };
+  drawStatus(lastStatus);
+  screen.userData.wallScreen = handle;
+};
+
 // ── Map table / holograph table (M4 of #33) ──────────────────────────────────
 // Sturdy dark 2×2 table (4 chunky legs + top) with a holographic disc floating
 // above it: emissive cyan plane + a slow-spinning broken emissive ring (the
@@ -3330,6 +3470,24 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.50, z: -1.45 },
       anchor: { x: 0, y: 1.35, z: 0.45 },
+    },
+  },
+  // 🏛️ Trading screen (#68 V4): wall-mounted market panel with a live in-world
+  // idle frame + a focused offers-board + price-chart UI. Same wall-mount
+  // kinematics as the room terminal (footprint null; not a walking obstacle);
+  // dispatch is by device.kind === "tradingScreen" (world.ts).
+  "trading-screen": {
+    kind: "trading-screen",
+    build: buildTradingScreen,
+    footprint: null,
+    wallMount: { halfW: WC_W / 2 },
+    functions: ["tradingScreen"],
+    device: {
+      kind: "tradingScreen",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.45, z: 0.85 },
+      anchor: { x: 0, y: 1.62, z: 0.06 },
     },
   },
 };
