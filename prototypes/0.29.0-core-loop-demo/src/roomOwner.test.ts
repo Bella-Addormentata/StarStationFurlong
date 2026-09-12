@@ -13,6 +13,8 @@ const THEM = 'player-them';
 
 /** The ordinary case: a real player, holding no shares anywhere. */
 const plain = { playerId: ME, isVentureShareholder: false };
+/** Same player, holding shares in the venture registered in THIS room. */
+const shareholder = { playerId: ME, isVentureShareholder: true };
 
 describe('isRoomOwner — the retired wildcard (#141)', () => {
   it('grants when the owner is my player id', () => {
@@ -43,7 +45,25 @@ describe('isRoomOwner — the retired wildcard (#141)', () => {
 
   it('still grants to a venture shareholder — #68’s V1 owner rule is intact', () => {
     // Retiring the wildcard must not take joint ownership down with it.
-    expect(isRoomOwner(THEM, { playerId: ME, isVentureShareholder: true })).toBe(true);
+    expect(isRoomOwner(THEM, shareholder)).toBe(true);
+  });
+
+  it('refuses a legacy owner EVEN FOR A SHAREHOLDER', () => {
+    // Review caught this: the venture branch never consults `owner`, so with
+    // the legacy check ordered last a legacy room merely CONTAINING a venture
+    // record stayed writable and the read-only guarantee was false.
+    expect(isRoomOwner('Local-Clone', shareholder)).toBe(false);
+    expect(isRoomOwner('', shareholder)).toBe(false);
+  });
+
+  it('a planted venture record cannot buy authority over a legacy room', () => {
+    // Why the ordering is security-relevant and not cosmetic. A venture office
+    // record is an unauthenticated peer write (#142), so if the shareholder
+    // branch were reachable here, planting one would hand the attacker every
+    // legacy room — moving the takeover from "walk in" to "plant one record"
+    // rather than removing it.
+    const attacker = { playerId: 'player-attacker', isVentureShareholder: true };
+    expect(isRoomOwner('Local-Clone', attacker)).toBe(false);
   });
 
   it('grants nothing to a shareholder of a DIFFERENT room’s venture', () => {
@@ -64,9 +84,14 @@ describe('legacyOwnerMarker — explains, never grants', () => {
   });
 
   it('agrees with isRoomOwner: everything it calls legacy is refused', () => {
+    // Both share contexts, so this holds for the shareholder branch too — the
+    // gap review found was exactly a legacy owner refused under one context
+    // and granted under the other.
     for (const owner of ['Local-Clone', '']) {
       expect(legacyOwnerMarker(owner)).toBe(true);
-      expect(isRoomOwner(owner, plain)).toBe(false);
+      for (const ctx of [plain, shareholder]) {
+        expect(isRoomOwner(owner, ctx)).toBe(false);
+      }
     }
   });
 });

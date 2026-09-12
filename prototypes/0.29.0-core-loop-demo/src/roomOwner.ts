@@ -48,8 +48,29 @@ export interface OwnerContext {
  * whoever raced there. A keyed room id gives these rooms a verifiable owner
  * again; until then the refusal is explained in the UI rather than left to
  * read as a bug (see `ownerGateRefusal`).
+ *
+ * ⚠️ THE LEGACY CHECK COMES FIRST, AHEAD OF BOTH GRANT BRANCHES.
+ *
+ * Ordering this after the shareholder branch looks equivalent and is not:
+ * the venture branch does not consult `owner` at all, so a legacy room that
+ * merely CONTAINS a venture record stayed writable, and the "read-only for
+ * everyone" guarantee above was false.
+ *
+ * Worse than a doc mismatch — it handed every legacy room to the #142
+ * attack. A venture office record is an unauthenticated peer write, so
+ * planting one in a legacy room makes the planter a shareholder, and the
+ * shareholder branch then returns owner authority over the very rooms this
+ * change was meant to close. Retiring the wildcard would have moved the
+ * takeover from "walk in" to "plant one record", not removed it.
+ *
+ * The cost of ordering it this way: a venture legitimately registered in a
+ * legacy room BEFORE this change loses shareholder access along with
+ * everyone else. Accepted — going forward that state is unreachable anyway,
+ * since founding a venture requires a room you own and nobody owns a legacy
+ * room now.
  */
 export function isRoomOwner(owner: string, ctx: OwnerContext): boolean {
+  if (legacyOwnerMarker(owner)) return false;
   return owner === ctx.playerId || ctx.isVentureShareholder;
 }
 
@@ -57,8 +78,9 @@ export function isRoomOwner(owner: string, ctx: OwnerContext): boolean {
  * True when `owner` names no verifiable owner: the legacy pre-S2 marker, or
  * a doc that never carried one.
  *
- * Used ONLY to explain a refusal. It must never appear in a condition that
- * grants something — that is precisely the shape of the bug #141 reported.
+ * Used to REFUSE (the first check in `isRoomOwner`) and to explain a refusal.
+ * It must never appear in a condition that GRANTS something — that is
+ * precisely the shape of the bug #141 reported.
  */
 export function legacyOwnerMarker(owner: string): boolean {
   return !owner || owner === "Local-Clone";
