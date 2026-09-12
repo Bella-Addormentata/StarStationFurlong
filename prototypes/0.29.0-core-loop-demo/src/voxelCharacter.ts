@@ -1897,7 +1897,9 @@ export class VoxelCharacter {
     // drink hold: a fox holding a drink does the one-armed version.
     if (this.workoutPose && this.currentState === 'idle') {
       const w = this.workoutPose;
-      this.torso.position.y += w.dip;
+      // ABSOLUTE root + dip: section 1's lerp only partially restores the base
+      // each frame, so an additive dip would compound (~6× at 60 fps).
+      this.torso.position.y = (state.rootY - 0.15) + w.dip;
       this.leftArm.rotation.x = w.armLX;
       this.rightArm.rotation.x = w.armRX;
       this.leftArm.rotation.z = -w.armZ;

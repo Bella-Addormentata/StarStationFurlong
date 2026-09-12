@@ -676,21 +676,19 @@ export class PoolWaiter {
     const move = COACH_MOVES[this.coachMove];
     switch (this.coachPhase) {
       case "announce":
-        if (!this.coachSaid) {
-          this.coachSaid = true;
-          this.say(move.call);
-        }
+        // 🔇 say() reports delivery; a line the entry quiet window drops
+        // leaves the latch open so it retries next frame (same as small talk).
+        if (!this.coachSaid) this.coachSaid = this.say(move.call);
         this.idlePose();
         if (this.coachTimer >= COACH_ANNOUNCE_SECS) this.setCoachPhase("reps");
         break;
       case "reps": {
         // Count the rep as it begins — "One!" … "Eight!" (owner request).
         if (!this.coachSaid) {
-          this.coachSaid = true;
-          this.say(COUNT_WORDS[Math.min(this.coachRep, COUNT_WORDS.length - 1)]);
+          this.coachSaid = this.say(COUNT_WORDS[Math.min(this.coachRep, COUNT_WORDS.length - 1)]);
         }
         const t = Math.min(1, this.coachTimer / move.repSecs);
-        this.animateMove(move.name, curveFor(move.name, t));
+        this.animateMove(move.name, t); // animateMove eases t itself
         if (t >= 1) {
           this.coachRep += 1;
           this.coachTimer = 0;
@@ -700,11 +698,7 @@ export class PoolWaiter {
         break;
       }
       case "rest":
-        if (!this.coachSaid) {
-          this.coachSaid = true;
-          this.resetExercisePose();
-          this.sayRandom(COACH_REST_LINES);
-        }
+        if (!this.coachSaid) this.coachSaid = this.sayRandom(COACH_REST_LINES);
         this.idlePose();
         if (this.coachTimer >= COACH_REST_SECS) {
           this.coachMove = (this.coachMove + 1) % COACH_MOVES.length;
@@ -773,17 +767,18 @@ export class PoolWaiter {
     this.coachTimer = 0;
     this.coachSaid = false;
     if (phase === "reps") this.coachRep = 0;
+    if (phase === "rest") this.resetExercisePose(); // once, on entry — not per frame
   }
 
   /** One rep of `move`, `t` ∈ [0,1] through it. Squat/lunge ride holdCurve
    *  (down–hold–up, like a real rep); jacks ride a bouncy half-sine. Every
    *  curve returns to 0, so each rep starts and ends at the neutral stance. */
   private animateMove(name: (typeof COACH_MOVES)[number]["name"], t: number): void {
+    const k = curveFor(name, t); // THE curve — shared with getFollowerPose
     if (name === "squat") {
       // 🦵 A HUMAN squat: thighs fold forward, shins counter-rotate to stay
       // upright, and hips + torso drop by the thigh-fold shortening so the
       // feet stay planted. Arms come straight out for counterbalance.
-      const k = holdCurve(t);
       const bend = 1.05 * k; // thigh fold angle
       const drop = 0.48 * (1 - Math.cos(bend)); // fold shortening ⇒ hip drop
       this.legL.rotation.x = -bend;
@@ -796,7 +791,6 @@ export class PoolWaiter {
       this.armL.rotation.x = -1.4 * k;
       this.armR.rotation.x = -1.4 * k;
     } else if (name === "jack") {
-      const k = Math.sin(Math.PI * t);
       this.body.position.y = 0.08 * k; // the hop
       this.legL.rotation.z = -0.4 * k; // legs splay outward
       this.legR.rotation.z = 0.4 * k;
@@ -805,7 +799,6 @@ export class PoolWaiter {
     } else {
       // lunge — alternate the leading leg each rep, held low at the bottom,
       // with a bent front knee and a runner's opposite-arm drive.
-      const k = holdCurve(t);
       const frontIsL = this.coachRep % 2 === 0;
       const front = frontIsL ? this.legL : this.legR;
       const back = frontIsL ? this.legR : this.legL;
@@ -902,10 +895,12 @@ export class PoolWaiter {
     if (step.kind === "goto") {
       if (this.walkTo(dt, step.x, step.z, 0.15)) advance();
     } else if (step.kind === "say") {
-      if (!this.saidThisStep) {
+      // 🔇 Retry until delivered (the entry quiet window can drop it); the
+      // readable-hold clock restarts on delivery. Never delivered (no handler)
+      // still advances after the hold, so a script can't stall here.
+      if (!this.saidThisStep && this.say(step.text)) {
         this.saidThisStep = true;
-        const p = this.group.position;
-        this.sayHandler?.(step.text, p.x, p.z);
+        this.scriptTimer = 0;
       }
       // Hold the pose briefly so the line is readable before the next step.
       this.idlePose();
