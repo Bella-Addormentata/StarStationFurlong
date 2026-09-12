@@ -1189,22 +1189,44 @@ async function joinRoomAtEpoch(
   // documented residual — a traveler cannot sign for a foreign room's owner,
   // so mirror pairings ride the legacy shape until a future slice carries a
   // departure-owner attestation. See doorsDoc.ts's TRUST BOUNDARY header.
+  /**
+   * The room owner's identity pub, read live from the doc — the expected
+   * verifying key for every signed door record.
+   *
+   * 🔒 ONE reader, shared by bindDoorsDoc and bindDoorPolicy below. It was two
+   * identical closures, which is how the guard below could have been added to
+   * one and not the other; door-side and pairing-side records must resolve
+   * their trust source identically or a record valid to one is forged to the
+   * other.
+   *
+   * ⚠️ The legacy marker is refused BEFORE the players lookup, not merely
+   * compared against. `players` is peer-written and the marker is used as a
+   * KEY into it, so `players['Local-Clone'] = { keyB64: <attacker's pub> }`
+   * would otherwise resolve the legacy owner to the attacker — and that key
+   * then becomes the expected signer for door policy, grants, requests and
+   * revocation tombstones, in the module that decides admission. The marker
+   * names no player, so any entry found under it is planted by definition
+   * (#141). Returning null here drops such a room to the accept-as-shape
+   * legacy path rather than granting it a forged verification.
+   *
+   * Nulling while un-synced keeps honest signed records surviving T0 (the
+   * verifier accepts when the expected pub is not yet known, but still
+   * refuses forgeries against a wrong pub).
+   */
+  const roomOwnerPub = (): string | null => {
+    const ownerId = sync.doc.getMap("roomInfo").get("owner");
+    if (typeof ownerId !== "string" || !ownerId) return null;
+    if (legacyOwnerMarker(ownerId)) return null;
+    const entry = sync.doc.getMap("players").get(ownerId) as
+      | { keyB64?: string }
+      | undefined;
+    return typeof entry?.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : null;
+  };
+
   bindDoorsDoc(sync.doc, {
     roomId: boot.roomId,
     verifySig: verifyIdentity,
-    // Live-read the room owner's identity pub through the doc — same live
-    // read used by bindDoorPolicy so signed door-side and pairing-side records
-    // share the same trust source. Nulling while un-synced keeps honest
-    // signed records surviving T0 (verifier accepts when the expected pub is
-    // not yet known, but still refuses forgeries against a wrong-pub).
-    roomOwnerPub: () => {
-      const ownerId = sync.doc.getMap("roomInfo").get("owner");
-      if (typeof ownerId !== "string" || !ownerId) return null;
-      const entry = sync.doc.getMap("players").get(ownerId) as
-        | { keyB64?: string }
-        | undefined;
-      return typeof entry?.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : null;
-    },
+    roomOwnerPub,
     localPub: () => getIdentityPub(),
     signOwner: (bytes) => {
       try { return signIdentity(bytes); } catch { return null; }
@@ -1225,18 +1247,8 @@ async function joinRoomAtEpoch(
   bindDoorPolicy(sync.doc, {
     roomId: boot.roomId,
     verifySig: verifyIdentity,
-    // Live-read the room owner's identity pub through the doc: roomInfo.owner
-    // holds a player id, players.get(id).keyB64 holds their Ed25519 pub. Both
-    // arrive async via sync; nulling while un-synced keeps the read side from
-    // rejecting honest signed records under a stale/missing expected pub.
-    roomOwnerPub: () => {
-      const ownerId = sync.doc.getMap("roomInfo").get("owner");
-      if (typeof ownerId !== "string" || !ownerId) return null;
-      const entry = sync.doc.getMap("players").get(ownerId) as
-        | { keyB64?: string }
-        | undefined;
-      return typeof entry?.keyB64 === "string" && entry.keyB64 ? entry.keyB64 : null;
-    },
+    // The SAME reader the doors doc uses — see its contract above.
+    roomOwnerPub,
     localPub: () => getIdentityPub(),
     signOwner: (bytes) => {
       try { return signIdentity(bytes); } catch { return null; }
