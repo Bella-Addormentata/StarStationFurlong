@@ -62,9 +62,11 @@ export interface RoomManagementProvider {
   /** Stable per-install id of the local player. Matches getPlayerId(). */
   getLocalPlayerId(): string;
 
-  /** Current owner id from roomInfo.owner (or the legacy 'Local-Clone'
-   *  literal on pre-S2 rooms). Never null — offline sessions publish a
-   *  sensible fallback so the pane always has something to show. */
+  /** Current owner id from roomInfo.owner, or "" when the room names none.
+   *  🔒 #141: an absent owner is NOT substituted with the legacy
+   *  'Local-Clone' marker — manufacturing it is how an unset field became a
+   *  grant. A pre-S2 room may still literally hold the marker; it simply
+   *  grants nothing now, and reads as a room with no verifiable owner. */
   getOwnerId(): string;
 
   /** Human display label for an owner id (main.ts §2468 resolver). */

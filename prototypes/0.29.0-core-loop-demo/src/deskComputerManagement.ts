@@ -129,8 +129,9 @@ export interface RosterEntry {
   outfitId: string;
   /** True when this row is the local player — the pane appends " (you)". */
   isMe: boolean;
-  /** True when this row holds owner authority (matches ownerId exactly,
-   *  or the legacy 'Local-Clone' owner rule). Legacy joint-ownership via
+  /** True when this row holds owner authority — an EXACT match on ownerId.
+   *  🔒 #141 retired the legacy 'Local-Clone' rule this once also named; that
+   *  marker now grants nothing anywhere. Joint ownership via
    *  venture shareholders is NOT computed here — that requires a signing
    *  key check the pure module cannot perform (main.ts owns the check). */
   isOwner: boolean;
@@ -184,9 +185,10 @@ function hasSelfCert(entry: Record<string, unknown>): boolean {
  * outcome the phone list settles on when a peer entry omits joinedAt).
  *
  * ownerId is the current roomInfo.owner value. This helper labels a row as
- * `isOwner: true` for an exact match OR for the pre-S2 'Local-Clone' owner
- * (those rooms are owner-equivalent for everyone — the ruling in main.ts
- * §2483 isLocalPlayerRoomOwner). Venture joint-ownership is NOT computed
+ * `isOwner: true` on an EXACT match and nothing else. It once also named the
+ * pre-S2 'Local-Clone' owner as owner-equivalent for everyone; 🔒 #141 retired
+ * that rule (the marker granted authority to every peer at once), so there is
+ * no second case left. Venture joint-ownership is NOT computed
  * here (needs a signing-key check the pure module cannot perform); the
  * write path stays owner-gated in the provider seam either way.
  *
@@ -209,9 +211,9 @@ export function orderedRoster(
         joinedAt: null,
         outfitId: "default",
         isMe: row.id === myId,
-        // Legacy 'Local-Clone' owner is owner-equivalent for every viewer
-        // (main.ts §2483) — but that is a viewer-side check, not a row
-        // attribute. isOwner is a strict per-row identity check.
+        // A strict per-row identity check. This was always strict — the note
+        // that used to sit here described the legacy owner-equivalence rule as
+        // live, which 🔒 #141 has since removed entirely.
         isOwner: row.id === ownerId,
         hasKeyCert: false,
         malformed: true,
@@ -303,9 +305,10 @@ function hasNonEmptySeedParam(queryString: string): boolean {
  * appends " (you)" ONLY when isMine is true, matching the phone roster's
  * convention (main.ts §2540 renderPhonePlayersList).
  *
- * `ownerName` should already be resolved through main.ts §2468
- * `resolveOwnerLabel` — that resolver handles the legacy 'Local-Clone'
- * literal and shortens a bare UUID; keeping the two concerns separate lets
+ * `ownerName` should already be resolved through main.ts `resolveOwnerLabel`
+ * — that resolver shortens a bare UUID, and a room with no verifiable owner
+ * is worded by `ownerGateRefusal` rather than by printing the marker at the
+ * player (🔒 #141). Keeping the two concerns separate lets
  * this helper stay pure (no doc reads) while the resolver stays a viewer
  * concern (needs live Y.Map state).
  */

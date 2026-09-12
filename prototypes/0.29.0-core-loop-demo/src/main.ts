@@ -6590,9 +6590,11 @@ async function init() {
   //     panel and Copy Invite button already use.
   setRoomManagementProvider({
     getLocalPlayerId: () => getPlayerId(),
+    // 🔒 #141: an absent owner is passed through as "", never substituted with
+    // the legacy marker. Manufacturing it is how an unset field became a grant
+    // — and `resolveOwnerLabel` would then render the literal to the player.
     getOwnerId: () =>
-      (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-      "Local-Clone",
+      (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "",
     resolveOwnerLabel,
     isLocalOwner: () => isLocalOwnerOfCurrentRoom(),
     getRoomName: () =>
@@ -6621,12 +6623,10 @@ async function init() {
       }
       if (!isLocalOwnerOfCurrentRoom()) {
         const owner =
-          (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-          "Local-Clone";
-        return {
-          ok: false,
-          reason: `Only the owner (${resolveOwnerLabel(owner)}) can rename this room.`,
-        };
+          (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
+        // 🔒 #141: one refusal builder, so a legacy room reads as legacy
+        // instead of the baffling "Only the owner (Local-Clone) can …".
+        return { ok: false, reason: ownerGateRefusal(owner, "rename") };
       }
       const rm = yjsSync.doc.getMap("roomInfo");
       yjsSync.doc.transact(() => rm.set("name", clean));
@@ -6638,12 +6638,10 @@ async function init() {
       }
       if (!isLocalOwnerOfCurrentRoom()) {
         const owner =
-          (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-          "Local-Clone";
-        return {
-          ok: false,
-          reason: `Only the owner (${resolveOwnerLabel(owner)}) can change access mode.`,
-        };
+          (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
+        // 🔒 #141: one refusal builder, so a legacy room reads as legacy
+        // instead of the baffling "Only the owner (Local-Clone) can …".
+        return { ok: false, reason: ownerGateRefusal(owner, "change the access mode of") };
       }
       // setRoomAccessMode already owner-gates internally, but we short-circuit
       // above so the UI gets an explanatory verdict rather than a silent no-op.
