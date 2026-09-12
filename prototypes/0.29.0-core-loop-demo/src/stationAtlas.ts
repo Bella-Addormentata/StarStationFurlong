@@ -263,7 +263,16 @@ export function harvestIntoAtlas(entry: {
   writeAtlas(atlas);
 }
 
-/** Record a reach-this-room seed learned elsewhere (ledger mints, passes). */
+/**
+ * Record a reach-this-room seed learned elsewhere (ledger mints, passes).
+ *
+ * ⚠️ NO PRODUCTION CALLERS as of this commit — it predates #144 and the seed
+ * paths (`addPass`, ledger mints) never wired up to it. So although a handed
+ * seed *would* count as first-hand below, in practice `harvestIntoAtlas` is
+ * the only thing that mints `localSeenAt` today: standing in a room is what
+ * earns tier 1. Left as-is rather than wired here, which would be a behaviour
+ * change beyond the retention fix.
+ */
 export function noteRoomSeed(roomId: string, name: string, seed: string): void {
   if (!roomId || !seed) return;
   const atlas = readAtlas();
@@ -673,10 +682,27 @@ export function pushAtlasToDoc(): void {
         // on a similar clock, refuses the record we just wrote. A writer must
         // never emit what its own reader rejects.
         //
-        // Accepted degradation: for a client whose clock already sits at the
-        // full skew allowance, a content change may not out-rank the existing
-        // record until the clock advances. That is strictly better than
-        // publishing an entry nobody can ingest, and it self-resolves.
+        // ⚠️ Accepted degradation, stated precisely — an earlier version of
+        // this comment claimed it "self-resolves", which is wrong.
+        //
+        // When `known.updatedAt` is AT the ceiling, the clamp returns that same
+        // value, so the record we publish ties instead of out-ranking. A peer
+        // already holding the boundary-stamped entry then skips it
+        // (`prior.lastSeen >= value.updatedAt`, same door count) and our
+        // correction does not reach them. It is not lost: once our clock passes
+        // the stamp, `known.updatedAt + 1` fits under the ceiling again and the
+        // correction propagates — but only at the NEXT push, and pushes are
+        // event-driven (join, door change), never on a timer. Time passing
+        // alone changes nothing.
+        //
+        // Reaching this needs an existing record stamped a full 6h into our
+        // future, which an honest clock does not produce; it is the adversarial
+        // and badly-skewed edge. Publishing a record no peer can ingest would
+        // be worse, and the ceiling cannot be beaten from below — bounding the
+        // stamp, out-ranking an adversary sitting at the bound, and having
+        // peers accept the result are not simultaneously satisfiable. A
+        // scheduled retry at the moment the ceiling clears would close it; that
+        // is a timer this module does not currently own.
         updatedAt: Math.min(
           known ? Math.max(entry.lastSeen, known.updatedAt + 1) : entry.lastSeen,
           Date.now() + MAX_GOSSIP_SKEW_MS,
