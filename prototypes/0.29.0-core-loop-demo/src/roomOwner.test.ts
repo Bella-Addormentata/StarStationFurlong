@@ -5,6 +5,9 @@
  * true for EVERY caller, and every owner-gated surface funnels through this
  * predicate. Each of those cases fails if the clause comes back.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { isRoomOwner, legacyOwnerMarker, ownerGateRefusal } from './roomOwner';
 
@@ -124,5 +127,110 @@ describe('ownerGateRefusal — a legacy room reads as legacy', () => {
     let called = false;
     ownerGateRefusal('Local-Clone', 'edit', (o) => { called = true; return o; });
     expect(called).toBe(false);
+  });
+});
+
+/**
+ * 🔒 #142 — the destructive room surfaces must gate on the DEED, not on the
+ * shareholder-extended predicate above.
+ *
+ * `isVentureShareholder` reads the current room's own venture map entry, which
+ * is shape-checked, peer-written, and tied to nothing about this room or its
+ * owner. So a fabricated office record passes `isRoomOwner` — and while that
+ * is intended for room edits, docking and door policy, it must not carry the
+ * right to lock the room out or to unseat its co-hosts. The deed hand-over and
+ * the croupier election already sit with the raw deed holder; #142 moved these
+ * two to join them.
+ *
+ * ⚠️ Read what this proves, and no more. Both gates live in `main.ts`, which
+ * runs the whole client on import and so cannot be loaded by vitest — this
+ * SCANS THE SOURCE for the predicate each one calls. It catches the regression
+ * that matters (someone widening the gate back to `isLocalPlayerRoomOwner`)
+ * and nothing else: it cannot tell you the gate is reached, that the UI agrees
+ * with it, or that `currentRoomDeedIsMine` is itself right. Extracting these
+ * paths so they can be tested properly is its own critical-path TODO item.
+ */
+describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
+  const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
+
+  /** The body of a named top-level function, up to the next one. */
+  const bodyOf = (name: string): string => {
+    const start = main.indexOf(`function ${name}(`);
+    expect(start, `${name} not found in main.ts`).toBeGreaterThan(-1);
+    const next = main.indexOf('\nfunction ', start + 1);
+    return main.slice(start, next === -1 ? main.length : next);
+  };
+
+  it('setRoomAccessMode refuses anyone but the deed holder', () => {
+    const body = bodyOf('setRoomAccessMode');
+    expect(body).toContain('currentRoomDeedIsMine()');
+    // The widening this exists to prevent.
+    expect(body).not.toContain('isLocalPlayerRoomOwner');
+    expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
+  });
+
+  it('the access-mode UI paints from the same predicate as the setter', () => {
+    // A selector enabled for someone the setter will refuse is a button that
+    // silently does nothing — the failure mode this pairing exists to avoid.
+    const body = bodyOf('applyAccessModeUI');
+    expect(body).toContain('currentRoomDeedIsMine()');
+    // Absence matters as much as presence: `currentRoomDeedIsMine() ||
+    // isLocalPlayerRoomOwner(...)` satisfies the line above while handing the
+    // selector straight back to shareholders.
+    expect(body).not.toContain('isLocalPlayerRoomOwner');
+    expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
+  });
+
+  it('the documented authority split still covers every shareholder surface', () => {
+    // WHY a bare count: main.ts's isLocalPlayerRoomOwner docblock lists the
+    // five surfaces shareholders reach, and that list is hand-maintained.
+    // Twice in review it was wrong — first claiming co-hosts after they left,
+    // then calling itself exhaustive while omitting the room-name editor. A
+    // count cannot check the prose, but it does catch the thing that makes the
+    // prose go stale: a SIXTH caller appearing with nobody revisiting it.
+    //
+    // If this fails you have added or removed a caller. Update the split in
+    // that docblock — it is the single source of truth, roomOwner.ts and
+    // ventures.ts both point at it — then change this number.
+    const calls = (main.match(/isLocalPlayerRoomOwner\(/g) ?? []).length;
+    const declarations = (main.match(/function isLocalPlayerRoomOwner\(/g) ?? []).length;
+    expect(declarations).toBe(1);
+    expect(calls - declarations).toBe(5);
+  });
+
+  it('the co-host section repaints when either map behind the deed check moves', () => {
+    // The gate change widened this section's live dependencies: the old
+    // shareholder predicate compared against our player id, while
+    // currentRoomDeedIsMine() reads roomInfo.owner AND players[owner].keyB64.
+    // updateRoomUI is what both map observers call, so the repaint has to
+    // happen there — otherwise a deed hand-over, or the owner's players entry
+    // landing late (the ordinary join order), leaves the new holder with no
+    // controls and the old holder with buttons the handler refuses.
+    const start = main.indexOf('const updateRoomUI = () => {');
+    const end = main.indexOf('roomMap.observe(', start);
+    expect(start, 'updateRoomUI not found in main.ts').toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const updateRoomUI = main.slice(start, end);
+    expect(updateRoomUI).toContain('renderCoHostsSection()');
+    // The access-mode selector's enabled state is the same check, repainted
+    // through refreshAccessRoomRow -> applyAccessModeUI.
+    expect(updateRoomUI).toContain('refreshAccessRoomRow()');
+  });
+
+  it('co-host accept/deny/revoke gate on the deed, in handler and render alike', () => {
+    // BOTH sites, pinned by count. They live inside one render function rather
+    // than named functions of their own, and there are exactly two: the
+    // delegated click handler and the markup that decides whether a REVOKE
+    // button is drawn at all. Scanning the whole file for "at least one"
+    // passed even if one of them was deleted or widened.
+    const body = bodyOf('renderCoHostsSection');
+    const bindings = body.match(/const amOwner = .*;/g) ?? [];
+    expect(bindings).toEqual([
+      'const amOwner = currentRoomDeedIsMine();',
+      'const amOwner = currentRoomDeedIsMine();',
+    ]);
+    // And nothing else in the section reaches for a wider gate.
+    expect(body).not.toContain('isLocalPlayerRoomOwner');
+    expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
   });
 });

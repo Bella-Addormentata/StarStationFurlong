@@ -1638,7 +1638,20 @@ async function joinRoomAtEpoch(
       ownerEl.textContent = resolveOwnerLabel(ownerVal);
     }
     // #52: the ACCESS app's MY PASS room row mirrors the same doc state.
+    // (This also repaints the access-mode selector, whose enabled state is the
+    // deed check — same live dependency as the co-host section below.)
     refreshAccessRoomRow();
+    // 🔒 #142: the co-host controls gate on `currentRoomDeedIsMine()`, which
+    // reads roomInfo.owner AND players[owner].keyB64 — so it now depends on
+    // BOTH maps this function observes, where the old shareholder gate
+    // compared against our player id alone and needed neither. Without this
+    // line the section repainted only on a roles-map change or on opening the
+    // app, so a deed hand-over — or the owner's players entry simply landing
+    // late, which is the ordinary join order — left the new holder with no
+    // controls and the old holder with REVOKE buttons the handler silently
+    // refuses. Exactly the treasury's OWNER UNKNOWN → OWNER-SIGNED flip noted
+    // on the players observer below, on a surface that had not needed it.
+    renderCoHostsSection();
     // Recategorise the room list: owner (roomInfo) and the owner's pubkey (its
     // players entry) can sync in after entry, moving the current room into its
     // correct section (My Rooms / Friends' / Visited) instead of Unreached.
@@ -2553,13 +2566,35 @@ function resolveOwnerLabel(owner: string): string {
 
 /** True when WE hold owner authority here: owner is our player id, or —
  *  🚀 #68 V1 owner rule — the room belongs to a VENTURE and we hold ANY of
- *  its shares (joint owners are owner-equivalent everywhere: docking, edit
- *  mode, policies, co-hosts — every gate funnels through this check).
+ *  its shares.
+ *
+ *  📋 THE AUTHORITY SPLIT, and this docblock is the one place it is written
+ *  out — `roomOwner.ts` and `ventures.ts` point here rather than keeping
+ *  their own copies, because three hand-maintained lists is three chances to
+ *  describe a boundary that has moved.
+ *
+ *  Shareholder-extended (every caller of THIS predicate, as of #142):
+ *    · room edit mode ......... setRoomEditPermission
+ *    · docking + door policy .. dockingSystem.onOwnerCheck
+ *    · the room-NAME editor ... the roomInfo 'name' write
+ *    · the exterior view ...... setExteriorOwnerCheck
+ *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
+ *
+ *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
+ *    · the deed hand-over          · the sole-croupier election
+ *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *
+ *  The reason for the split: `isVentureShareholder` reads the current room's
+ *  own venture map entry, which is peer-written, shape-checked only, and tied
+ *  to nothing about this room or its owner — so a fabricated office record
+ *  passes this predicate. That is acceptable reach for editing and docking.
+ *  It was not acceptable for locking a room out or unseating the people
+ *  keeping it alive, which is what moved those four.
  *
  *  🔒 #141: the legacy `owner === 'Local-Clone'` clause is GONE. It granted
- *  owner authority over a room to EVERY peer at once, and every gate in the
- *  game funnels through here, so one string made pre-S2 rooms writable by
- *  anyone who walked in. It was a deliberate S2 convention, not an oversight
+ *  owner authority over a room to EVERY peer at once, across every gate in
+ *  the list above, so one string made pre-S2 rooms writable by anyone who
+ *  walked in. It was a deliberate S2 convention, not an oversight
  *  — which is why removing it is a BREAKING change and not a pure fix.
  *
  *  What breaks, said plainly: a room whose `roomInfo.owner` is the literal
@@ -5491,10 +5526,11 @@ function renderCoHostsSection(): void {
       if (!el) return;
       const pub = el.dataset.pub ?? "";
       const action = el.dataset.cohostAction;
-      const ownerVal =
-        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-        "";
-      const amOwner = isLocalPlayerRoomOwner(ownerVal);
+      // 🔒 #142: the RAW deed holder, not the shareholder-extended gate.
+      // Accept/deny/revoke decide who keeps the room alive, so they sit with
+      // the deed like the hand-over and the croupier election — see the note
+      // on currentRoomDeedIsMine.
+      const amOwner = currentRoomDeedIsMine();
       if (action === "volunteer") {
         writeCoHostRequest(getIdentityPub(), getPlayerName());
       } else if (action === "withdraw") {
@@ -5512,9 +5548,9 @@ function renderCoHostsSection(): void {
     });
   }
 
-  const ownerVal =
-    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
-  const amOwner = isLocalPlayerRoomOwner(ownerVal);
+  // 🔒 #142: matches the handler's gate above — the render must not offer a
+  // REVOKE button the click handler will refuse.
+  const amOwner = currentRoomDeedIsMine();
   const myPub = getIdentityPub();
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
@@ -6240,9 +6276,10 @@ function setupSpacePhoneOverlay() {
     }
   });
 
-  // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
-  // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
-  // owner-gated, so a non-owner click is inert).
+  // Room access mode selector (public-doors): the DEED HOLDER sets
+  // PUBLIC/PASS/KEYED; the roomInfo observer repaints it live for everyone
+  // (setRoomAccessMode is deed-holder-gated since #142, so anyone else's click
+  // is inert — a venture shareholder's included).
   const accessModeRow = document.getElementById("access-mode-row");
   if (accessModeRow) {
     accessModeRow.addEventListener("click", (e) => {
@@ -7020,24 +7057,27 @@ function getRoomAccessMode(): AccessMode {
   return m === "public" || m === "keyed" ? m : "pass";
 }
 
-function isLocalOwnerOfCurrentRoom(): boolean {
-  const owner = yjsSync?.doc.getMap("roomInfo").get("owner") as
-    | string
-    | undefined;
-  return !!owner && isLocalPlayerRoomOwner(owner);
-}
-
+/** 🔒 #142: access mode is the lock-out surface — set it to `keyed` and nobody
+ *  else gets in — so it belongs to the RAW deed holder, not to
+ *  `isLocalPlayerRoomOwner`'s shareholder-extended set. `isVentureShareholder`
+ *  reads the current room's own venture map entry, which is shape-checked and
+ *  peer-written with nothing tying it to this room or its owner, so a
+ *  fabricated office record used to carry the right to lock the room. It no
+ *  longer does. The deed, the croupier election and co-host management already
+ *  sit here for the same reason. Cost, accepted deliberately: on a venture
+ *  property only the deed holder sets access mode; shareholders keep room
+ *  edits, docking and door policy. */
 function setRoomAccessMode(mode: AccessMode): void {
-  if (!yjsSync || !isLocalOwnerOfCurrentRoom()) return; // owner-gated
+  if (!yjsSync || !currentRoomDeedIsMine()) return; // deed-holder-gated
   const rm = yjsSync.doc.getMap("roomInfo");
   yjsSync.doc.transact(() => rm.set("accessMode", mode));
 }
 
 /** Reflect the current access mode: tint the door LEDs + paint the ACCESS
- *  app's selector (owner-editable, everyone else read-only). */
+ *  app's selector (deed-holder-editable, everyone else read-only). */
 function applyAccessModeUI(mode: AccessMode): void {
   world.dockingSystem?.setAccessMode(mode);
-  const isOwner = isLocalOwnerOfCurrentRoom();
+  const isOwner = currentRoomDeedIsMine();
   const row = document.getElementById("access-mode-row");
   if (row) {
     for (const btn of row.querySelectorAll<HTMLButtonElement>(
@@ -7049,7 +7089,7 @@ function applyAccessModeUI(mode: AccessMode): void {
       btn.classList.toggle("is-disabled", !isOwner);
       btn.title = isOwner
         ? `Set room access to ${btnMode}`
-        : "Only the room owner can change access mode";
+        : "Only this module’s deed holder can change access mode";
     }
   }
   const note = document.getElementById("access-mode-note");

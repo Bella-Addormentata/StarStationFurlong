@@ -1,11 +1,23 @@
 /**
  * 🔒 The room owner gate (#141) — extracted so it can be TESTED.
  *
- * Every owner-gated surface in the game funnels through `isRoomOwner`:
- * docking, edit mode, policies, co-hosts, the room-name editor. It lived
- * inside main.ts, which runs the whole client on import and so cannot be
- * loaded by a unit test — meaning the single most authority-bearing
+ * The SHAREHOLDER-EXTENDED owner surfaces funnel through `isRoomOwner`. It
+ * lived inside main.ts, which runs the whole client on import and so cannot
+ * be loaded by a unit test — meaning the single most authority-bearing
  * predicate in the codebase had no coverage at all. It does now.
+ *
+ * 🔒 #142: this predicate does NOT decide every owner-gated surface. The
+ * deed hand-over, the sole-croupier election, the room's access mode and
+ * co-host accept/deny/revoke all take main.ts's `currentRoomDeedIsMine()` —
+ * the RAW owner — because they can lock a room out or unseat the people
+ * keeping it alive, and the shareholder branch below rests on a peer-written
+ * record that names neither this room nor its owner.
+ *
+ * The authoritative split, surface by surface, is documented ONCE at
+ * main.ts's `isLocalPlayerRoomOwner` (the wrapper that supplies this
+ * predicate's live getters). Deliberately not repeated here: a second copy
+ * is a second thing to forget when a surface moves, which is exactly how
+ * this header came to claim co-hosts after they had left.
  *
  * Dependencies arrive as an argument rather than by import, so a test can
  * state "this player, holding these shares" directly. main.ts keeps a
@@ -24,8 +36,19 @@
 export interface OwnerContext {
   /** The local player id, as written into `roomInfo.owner` since S2. */
   playerId: string;
-  /** True when we hold ANY share of the venture registered in this room —
-   *  #68's V1 owner rule makes joint owners owner-equivalent everywhere. */
+  /** True when we hold ANY share of the venture registered in this room.
+   *
+   *  #68's V1 owner rule makes joint owners owner-equivalent on the surfaces
+   *  this predicate decides — NOT "everywhere", which is what this line said
+   *  before #142 narrowed it. The deed hand-over, the croupier election, the
+   *  room's access mode and co-host management take the raw deed holder
+   *  instead; see main.ts's `isLocalPlayerRoomOwner` for the full split.
+   *
+   *  ⚠️ Worth knowing at the point you SUPPLY this: whatever computes it
+   *  reads a peer-written record. main.ts's `isVentureShareholder` consults
+   *  the current room's own venture map entry, which is shape-checked only
+   *  and related to nothing about this room or its owner, so `true` here can
+   *  be a stranger's doing. That is why the split exists. */
   isVentureShareholder: boolean;
 }
 
