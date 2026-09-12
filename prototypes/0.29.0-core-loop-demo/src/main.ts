@@ -3013,17 +3013,41 @@ function renderTreasuryApp(): void {
  * thread with back-to-back scans. Bursts collapse into a single trailing
  * render on the next frame.
  */
+/**
+ * Minimum gap between PEER-DRIVEN repaints — the room terminal's own cadence
+ * (`devices.ts`, "4 Hz is plenty for status + wireframe").
+ *
+ * ⚠️ Coalescing alone was not enough, and the difference matters. A trailing
+ * timer collapses a BURST that lands inside one window; it does nothing about
+ * a SUSTAINED stream, because each window admits a fresh full scan. A peer
+ * writing once per window therefore bought a complete treasury render ~31
+ * times a second, and a cold repaint is budgeted at roughly 35 ms of
+ * signature work — more than the main thread has to give. The bounded scans
+ * cap the cost of ONE render; only a rate limit caps how many.
+ */
+const TREASURY_MIN_REPAINT_MS = 250;
 let treasuryRepaintQueued = false;
+let treasuryLastRepaintAt = 0;
 function queueTreasuryRepaint(): void {
   if (treasuryRepaintQueued) return;
   treasuryRepaintQueued = true;
+  // First write after a quiet spell still paints on the next frame; only a
+  // stream is held to the floor, so an arriving record (the OWNER UNKNOWN →
+  // OWNER-SIGNED flip, a vote landing) is never more than 250 ms late.
+  const wait = Math.max(
+    32,
+    TREASURY_MIN_REPAINT_MS - (Date.now() - treasuryLastRepaintAt),
+  );
   // A timer rather than requestAnimationFrame: rAF does not fire at all
   // while the tab is hidden, which would leave a queued repaint pending
   // indefinitely instead of merely deferred.
   setTimeout(() => {
     treasuryRepaintQueued = false;
+    // Stamped BEFORE the render, so a render that throws cannot leave the
+    // floor unset and let the next write start a hot loop.
+    treasuryLastRepaintAt = Date.now();
     renderTreasuryApp();
-  }, 32);
+  }, wait);
 }
 
 /**
@@ -3035,8 +3059,11 @@ function queueTreasuryRepaint(): void {
  * container is merely slid offscreen — it is never display:none, so the
  * subtree stays laid out. Checking only the view meant a player who opened
  * TREASURY, pressed Tab and walked away still paid a full rebuild, relayout
- * and a page of signature checks for every key any peer wrote, at up to 31 Hz,
- * with no treasury screen anywhere in sight.
+ * and a page of signature checks for every key any peer wrote, with no
+ * treasury screen anywhere in sight. (That was at up to 31 Hz when this was
+ * written; the repaint floor above now holds peer-driven renders to 4 Hz, so
+ * this check saves less than it did — and is still the difference between
+ * paying for an invisible screen and not.)
  */
 function treasuryViewOnScreen(view: HTMLElement): boolean {
   const phone = document.getElementById("spacephone-container");
