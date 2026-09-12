@@ -134,6 +134,10 @@ import {
   detachOfficeRecord,
   isOfficeHere,
 } from "./ventures";
+import {
+  isRoomOwner,
+  ownerGateRefusal as ownerGateRefusalText,
+} from "./roomOwner";
 import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
 import {
   refreshExteriorView,
@@ -1373,7 +1377,8 @@ async function joinRoomAtEpoch(
   if (claimRoomDefaults && !roomMap.has("owner")) {
     sync.doc.transact(() => {
       // S2: the owner is a player ID (stable across reloads), not a display
-      // name. Legacy rooms hold 'Local-Clone' here — see isLocalPlayerRoomOwner.
+      // name. Legacy rooms hold 'Local-Clone' here — a marker that records the
+      // ABSENCE of an owner and (since 🔒 #141) grants nothing.
       roomMap.set("owner", getPlayerId());
       roomMap.set("name", boot.roomId || "Lobby");
     });
@@ -2369,8 +2374,8 @@ function wireAdapterTransit(): void {
   // mints) or its own current room, and only while the DEV toggle is on.
   // Vestibule-findings fix: connection changes (request / approve / assembly)
   // are limited to the room's OWNER — the same gate the room-name editor and
-  // edit mode use. Legacy 'Local-Clone' rooms stay editable by everyone, per
-  // the S2 convention inside isLocalPlayerRoomOwner.
+  // edit mode use. 🔒 #141: legacy 'Local-Clone' rooms are NO LONGER editable
+  // by everyone — that S2 convention was the wildcard, and it is gone.
   world.dockingSystem?.onOwnerCheck(() => {
     const ownerVal =
       (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
@@ -2476,17 +2481,39 @@ function resolveOwnerLabel(owner: string): string {
   return owner.length > 16 ? `${owner.slice(0, 8)}…` : owner;
 }
 
-/** True when WE hold owner authority here: owner is our player id, the room
- *  predates S2 (legacy 'Local-Clone' owner — those rooms stay editable), or —
+/** True when WE hold owner authority here: owner is our player id, or —
  *  🚀 #68 V1 owner rule — the room belongs to a VENTURE and we hold ANY of
  *  its shares (joint owners are owner-equivalent everywhere: docking, edit
- *  mode, policies, co-hosts — every gate funnels through this check). */
+ *  mode, policies, co-hosts — every gate funnels through this check).
+ *
+ *  🔒 #141: the legacy `owner === 'Local-Clone'` clause is GONE. It granted
+ *  owner authority over a room to EVERY peer at once, and every gate in the
+ *  game funnels through here, so one string made pre-S2 rooms writable by
+ *  anyone who walked in. It was a deliberate S2 convention, not an oversight
+ *  — which is why removing it is a BREAKING change and not a pure fix.
+ *
+ *  What breaks, said plainly: a room whose `roomInfo.owner` is the literal
+ *  'Local-Clone' (or unset) now has NO ONE who passes this check, including
+ *  the person who built it. Those rooms become read-only. There is no
+ *  migration, because there is nothing to migrate FROM — the marker records
+ *  the absence of an owner, so no owner can be recovered from the doc. A
+ *  keyed room id (the ownership-root item on the critical path) is what gives
+ *  these rooms a verifiable owner again; until then the refusal is stated in
+ *  the UI rather than left to read as a bug.
+ *
+ *  The predicate itself lives in roomOwner.ts so it can be unit-tested — this
+ *  is a thin wrapper that supplies the live getters. */
 function isLocalPlayerRoomOwner(owner: string): boolean {
-  return (
-    owner === getPlayerId() ||
-    owner === "Local-Clone" ||
-    isVentureShareholder(getIdentityPub())
-  );
+  return isRoomOwner(owner, {
+    playerId: getPlayerId(),
+    isVentureShareholder: isVentureShareholder(getIdentityPub()),
+  });
+}
+
+/** The refusal text for an owner-gated action (roomOwner.ts), bound to this
+ *  module's label resolver. */
+function ownerGateRefusal(owner: string, action: string): string {
+  return ownerGateRefusalText(owner, action, resolveOwnerLabel);
 }
 
 /**
@@ -2816,14 +2843,18 @@ function syncVentureLedgerFromCurrentRoom(): void {
 /** Is the CURRENT room's `roomInfo.owner` value ME, personally? Deliberately
  *  the RAW owner — NOT the shareholder-extended `isLocalPlayerRoomOwner` gate:
  *  a deed belongs to the personal owner alone (venture co-owners get access,
- *  not the right to hand the module away). Legacy 'Local-Clone' rooms count
- *  as mine, matching `categorizeRoom`. */
+ *  not the right to hand the module away). 🔒 #141: legacy 'Local-Clone' rooms
+ *  no longer count as mine — they counted as EVERYONE's — matching
+ *  `categorizeRoom`, which now files them as 'visited'. */
 function currentRoomDeedIsMine(): boolean {
   const ownerVal = yjsSync?.doc.getMap("roomInfo").get("owner") as
     | string
     | undefined;
   if (typeof ownerVal !== "string" || !ownerVal) return false;
-  if (ownerVal === getPlayerId() || ownerVal === "Local-Clone") return true;
+  // 🔒 #141: no 'Local-Clone' clause. This is the RAW deed check (the right to
+  // hand the module away), so the wildcard was strictly worse here than at the
+  // owner-equivalent gate — it made every peer the deed holder.
+  if (ownerVal === getPlayerId()) return true;
   const entry = yjsSync?.doc.getMap("players").get(ownerVal) as
     | Partial<PlayerEntry>
     | undefined;
@@ -5214,16 +5245,16 @@ function setupNetworkDetailsPanel() {
         if (newVal) {
           if (yjsSync) {
             const rMap = yjsSync.doc.getMap("roomInfo");
-            const ownerVal = (rMap.get("owner") as string) || "Local-Clone";
-            // S2 gate: owner is our player id, or a legacy pre-S2 room
-            // ('Local-Clone' owner) — those stay editable by everyone.
+            // 🔒 #141: do NOT substitute 'Local-Clone' for an absent owner —
+            // manufacturing the marker is how an unset field became a grant.
+            const ownerVal = (rMap.get("owner") as string) || "";
             if (isLocalPlayerRoomOwner(ownerVal)) {
               yjsSync.doc.transact(() => {
                 rMap.set("name", newVal);
               });
             } else {
               if (feedback)
-                feedback.textContent = `Only the owner (${resolveOwnerLabel(ownerVal)}) can edit the room name.`;
+                feedback.textContent = ownerGateRefusal(ownerVal, "rename");
               setTimeout(() => {
                 if (feedback) feedback.textContent = "";
               }, 4000);
@@ -6102,12 +6133,10 @@ function roomOwnerInfo(roomId: string): {
 function categorizeRoom(roomId: string, friendPubs: Set<string>): RoomCategory {
   const { ownerId, ownerPub } = roomOwnerInfo(roomId);
   if (!ownerId) return "unreached";
-  // 'Local-Clone' is the legacy self-owned marker (pre-keyed-identity rooms).
-  if (
-    ownerId === getPlayerId() ||
-    ownerId === "Local-Clone" ||
-    (ownerPub && ownerPub === getIdentityPub())
-  ) {
+  // 🔒 #141: the legacy 'Local-Clone' marker no longer files a room as MINE —
+  // it filed every legacy room into every player's "mine" list at once. Those
+  // rooms fall through to 'visited', which is what they honestly are.
+  if (ownerId === getPlayerId() || (ownerPub && ownerPub === getIdentityPub())) {
     return "mine";
   }
   if (ownerPub && friendPubs.has(ownerPub)) return "friend";
@@ -6491,27 +6520,29 @@ async function init() {
   setEditWorldProvider(() => world);
 
   // ── Room-edit owner gate (E2 of #25, plan §1), on S2's identity:
-  // isLocalPlayerRoomOwner accepts the local playerId AND the legacy
-  // 'Local-Clone' owner (pre-S2 rooms stay editable). The reason string
+  // isLocalPlayerRoomOwner accepts the local playerId and venture
+  // shareholders only — 🔒 #141 removed the legacy 'Local-Clone' owner, so
+  // pre-S2 rooms are now READ-ONLY for everyone. The reason string
   // resolves the owner's display name through the players map.
   setRoomEditPermission(() => {
     if (!yjsSync) return { ok: true }; // offline: your room
+    // 🔒 #141: an absent owner is NOT the legacy marker and grants nothing.
     const owner =
-      (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-      "Local-Clone";
+      (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
     return isLocalPlayerRoomOwner(owner)
       ? { ok: true }
-      : {
-          ok: false,
-          reason: `Only the owner (${resolveOwnerLabel(owner)}) can edit this room.`,
-        };
+      : { ok: false, reason: ownerGateRefusal(owner, "edit") };
   });
 
   // 🎰🤖 #77B: elect the SOLE auto-croupier operator. Unlike the edit gate above
   // (owner-equivalent — every venture shareholder passes), this is the RAW deed
   // holder, so a personal/solo room has exactly ONE operator and no double-settle.
-  // Venture / legacy 'Local-Clone' rooms make everyone owner ⇒ NO auto-operator;
-  // they keep the manual SPIN button. Offline (no sync) ⇒ we are the only client.
+  // Venture rooms make every shareholder owner ⇒ NO auto-operator; they keep
+  // the manual SPIN button. Offline (no sync) ⇒ we are the only client.
+  // 🔒 #141: legacy rooms no longer make everyone owner (the wildcard is gone),
+  // so currentRoomDeedIsMine already returns false for them. The explicit check
+  // below is now redundant — kept because it states the intent directly and
+  // costs nothing, rather than relying on a second function to stay correct.
   setSoleCroupierPredicate(() => {
     if (!yjsSync) return true;
     const owner = yjsSync.doc.getMap("roomInfo").get("owner");
