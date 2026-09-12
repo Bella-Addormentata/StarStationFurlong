@@ -132,6 +132,24 @@ export function furnitureDocSize(): number {
   return docAlive() ? furnitureMap!.size : 0;
 }
 
+/**
+ * Raw doc values, UNSHAPED — every value the peer wrote, including entries
+ * `isFurnitureRecord` would drop for unknown `kind`. This is the seam for
+ * read-repair migrations (wallpaperDerivation.ts): a slice of legacy
+ * furniture kinds retired in df26789 (brick-wall / window-wall) survives in
+ * older room docs, and the wallpaper derivation needs to see them to map
+ * their design onto the hull wall.
+ *
+ * Callers MUST treat every element as untrusted (peer input, wire-shape not
+ * checked here) and shape-guard before dereferencing — same discipline as
+ * every other doc read on this side of the trust boundary. Returns an empty
+ * array when the doc is unbound (leaveRoom destroyed it).
+ */
+export function readRawFurnitureValues(): unknown[] {
+  if (!docAlive()) return [];
+  return [...furnitureMap!.values()];
+}
+
 function toRecord(item: FurnitureItem): FurnitureRecord {
   const rec: FurnitureRecord = {
     kind: item.kind, x: item.pos.x, z: item.pos.z, rot: item.rot, movable: item.movable,
