@@ -1275,6 +1275,28 @@ describe('pager visibility', () => {
     expect(pageRange({ matched: 0, startIndex: 0 }, 8)).toBe('none held');
   });
 
+  it('words the total as a FLOOR when discovery stopped early', () => {
+    // `matched` counts only what the walk reached. Rendering it as "of N"
+    // beside a note saying records may be unreachable asserted N was the
+    // room's total — the invented certainty this screen refuses elsewhere.
+    expect(pageRange({ matched: 20, startIndex: 8, discoveryCutShort: true }, 8))
+      .toBe('9–16 of at least 20');
+    expect(pageRange({ matched: 8, startIndex: 8, discoveryCutShort: true }, 8))
+      .toBe('past the end of at least 8');
+    // The starkest case: "none held" about a room whose records were simply
+    // never reached.
+    expect(pageRange({ matched: 0, startIndex: 0, discoveryCutShort: true }, 8))
+      .toBe('none in the part searched');
+  });
+
+  it('a completed search still reports an exact total', () => {
+    // The flag must not soften a count that IS complete.
+    expect(pageRange({ matched: 20, startIndex: 8, discoveryCutShort: false }, 8))
+      .toBe('9–16 of 20');
+    expect(pageRange({ matched: 0, startIndex: 0, discoveryCutShort: false }, 8))
+      .toBe('none held');
+  });
+
   it('rewinds every paged scan on the phone, the detail screen included', () => {
     // The list rewound on the right condition and the three detail scans did
     // not rewind at all, so records leaving behind their cursor left the

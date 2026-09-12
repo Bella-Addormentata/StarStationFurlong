@@ -1753,13 +1753,22 @@ export function cursorPastEnd(scan: { matched: number; startIndex: number }): bo
  * must not depend on each of them remembering to.
  */
 export function pageRange(
-  scan: { matched: number; startIndex: number },
+  scan: { matched: number; startIndex: number; discoveryCutShort?: boolean },
   size: number,
 ): string {
-  if (scan.matched === 0) return 'none held';
-  if (cursorPastEnd(scan)) return `past the end of ${scan.matched}`;
+  // ⚠️ `matched` is only every key DISCOVERY FOUND. When the walk that builds
+  // the pages stopped early, that is a floor and not the room's total, so the
+  // count is worded as one. The adjacent panel note already says records may
+  // be unreachable; a bare "of 37" beside it still asserted 37 was all there
+  // was, which is the same invented certainty this screen refuses everywhere
+  // else — and `matched: 0` was the starkest form, reading "none held" about
+  // a room whose records simply were not reached.
+  const cut = scan.discoveryCutShort === true;
+  if (scan.matched === 0) return cut ? 'none in the part searched' : 'none held';
+  const total = cut ? `at least ${scan.matched}` : `${scan.matched}`;
+  if (cursorPastEnd(scan)) return `past the end of ${total}`;
   const shown = Math.min(size, scan.matched - scan.startIndex);
-  return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${scan.matched}`;
+  return `${scan.startIndex + 1}–${scan.startIndex + shown} of ${total}`;
 }
 
 /**
