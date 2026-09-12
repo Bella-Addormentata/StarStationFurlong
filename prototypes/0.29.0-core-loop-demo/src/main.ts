@@ -2553,8 +2553,18 @@ function resolveOwnerLabel(owner: string): string {
 
 /** True when WE hold owner authority here: owner is our player id, or —
  *  🚀 #68 V1 owner rule — the room belongs to a VENTURE and we hold ANY of
- *  its shares (joint owners are owner-equivalent everywhere: docking, edit
- *  mode, policies, co-hosts — every gate funnels through this check).
+ *  its shares (joint owners are owner-equivalent for docking, edit mode and
+ *  door policies).
+ *
+ *  🔒 #142: NOT every gate funnels through this check any more, and the list
+ *  above is exhaustive on purpose. The surfaces that can lock a room or
+ *  unseat the people keeping it alive take `currentRoomDeedIsMine()` instead
+ *  — the deed hand-over, the sole-croupier election, the room ACCESS MODE and
+ *  co-host accept/deny/revoke. `isVentureShareholder` reads the current
+ *  room's own venture map entry, which is peer-written and tied to nothing
+ *  about this room or its owner, so a fabricated office record passes here;
+ *  that is acceptable reach for edits and docking and was not for the four
+ *  above.
  *
  *  🔒 #141: the legacy `owner === 'Local-Clone'` clause is GONE. It granted
  *  owner authority over a room to EVERY peer at once, and every gate in the

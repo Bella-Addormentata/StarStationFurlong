@@ -172,14 +172,29 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
   it('the access-mode UI paints from the same predicate as the setter', () => {
     // A selector enabled for someone the setter will refuse is a button that
     // silently does nothing — the failure mode this pairing exists to avoid.
-    expect(bodyOf('applyAccessModeUI')).toContain('currentRoomDeedIsMine()');
+    const body = bodyOf('applyAccessModeUI');
+    expect(body).toContain('currentRoomDeedIsMine()');
+    // Absence matters as much as presence: `currentRoomDeedIsMine() ||
+    // isLocalPlayerRoomOwner(...)` satisfies the line above while handing the
+    // selector straight back to shareholders.
+    expect(body).not.toContain('isLocalPlayerRoomOwner');
+    expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
   });
 
   it('co-host accept/deny/revoke gate on the deed, in handler and render alike', () => {
-    // Both sites are inside one render function rather than named functions of
-    // their own, so this checks the two `amOwner` bindings directly.
-    const bindings = main.match(/const amOwner = .*;/g) ?? [];
-    expect(bindings.length).toBeGreaterThan(0);
-    for (const b of bindings) expect(b).toContain('currentRoomDeedIsMine()');
+    // BOTH sites, pinned by count. They live inside one render function rather
+    // than named functions of their own, and there are exactly two: the
+    // delegated click handler and the markup that decides whether a REVOKE
+    // button is drawn at all. Scanning the whole file for "at least one"
+    // passed even if one of them was deleted or widened.
+    const body = bodyOf('renderCoHostsSection');
+    const bindings = body.match(/const amOwner = .*;/g) ?? [];
+    expect(bindings).toEqual([
+      'const amOwner = currentRoomDeedIsMine();',
+      'const amOwner = currentRoomDeedIsMine();',
+    ]);
+    // And nothing else in the section reaches for a wider gate.
+    expect(body).not.toContain('isLocalPlayerRoomOwner');
+    expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
   });
 });

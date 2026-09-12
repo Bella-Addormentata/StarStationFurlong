@@ -1,11 +1,18 @@
 /**
  * 🔒 The room owner gate (#141) — extracted so it can be TESTED.
  *
- * Every owner-gated surface in the game funnels through `isRoomOwner`:
- * docking, edit mode, policies, co-hosts, the room-name editor. It lived
- * inside main.ts, which runs the whole client on import and so cannot be
- * loaded by a unit test — meaning the single most authority-bearing
- * predicate in the codebase had no coverage at all. It does now.
+ * The shareholder-extended owner surfaces funnel through `isRoomOwner`:
+ * docking, edit mode, door policies, the room-name editor. It lived inside
+ * main.ts, which runs the whole client on import and so cannot be loaded by a
+ * unit test — meaning the single most authority-bearing predicate in the
+ * codebase had no coverage at all. It does now.
+ *
+ * 🔒 #142: co-hosts are NO LONGER on that list, and neither is the room's
+ * access mode. Those two joined the deed hand-over and the sole-croupier
+ * election on main.ts's `currentRoomDeedIsMine()` — the RAW owner — because
+ * they can lock a room out or unseat the people keeping it alive, and
+ * `isRoomOwner`'s shareholder branch rests on a peer-written record that
+ * names neither this room nor its owner.
  *
  * Dependencies arrive as an argument rather than by import, so a test can
  * state "this player, holding these shares" directly. main.ts keeps a
