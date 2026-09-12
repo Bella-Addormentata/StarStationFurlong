@@ -89,7 +89,7 @@ Two cons the code adds to the doc's list:
 
 **Gameplay-visible delta for existing tenants: zero.** New, additive affordances only: an opt-in "claim deed" moment ("Deed minting is opt-in and lazy — casual module creation stays chain-free exactly as today", :41), and the unexpected-owner-change warning (:103). The player vocabulary does not change — deed, hand over, offer — per the #68 language rule; the transfer-offers design already models the offer artifact as a game object ([transfer-offers-deeds-shares.md](transfer-offers-deeds-shares.md) §1).
 
-**Conditions the docs attach (not optional):**
+**Conditions (not optional) — items 1-4 are attached by the design docs; items 5-7 are THIS NOTE'S inferences and are not yet written into any design doc.** The split matters because this list will be cited later: items 5-7 each say so inline, but a heading reading "conditions the docs attach" would let the whole block be quoted as settled architecture. §6 items 5-6 are the asks that would make them real.
 1. The Rust node holds the BLS keys and does mint / transfer / resolve / head verification (:73-74); the browser consumes verified state (:75). A browser-only player can play but not claim or transfer a deed.
 2. Head verification lives in the node, never the browser (:59-64).
 3. Verified-head cache TTL bounded to minutes; re-resolve on authority-sensitive actions (:106).
