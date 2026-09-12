@@ -39,6 +39,7 @@ import {
   signNameCert,
   verifyNameCert,
   verifyIdentity,
+  signIdentity,
   exportRecoveryKey,
   importRecoveryKey,
   ysyncSigner,
@@ -53,6 +54,8 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMod
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+// 🎰 #76: CRDT-backed stand occupancy for multi-player tables.
+import { bindStandsDoc } from "./standsDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -1125,6 +1128,43 @@ async function joinRoomAtEpoch(
   // 🎰 Bind the shared casino map (#69 G1/G2): chips + cage ledger + roulette
   // table state. Rebinds per join like games/furniture (T0 seam).
   bindCasinoDoc(sync.doc);
+
+  // 🎰 #76: bind the shared stand-occupancy map — one CRDT claim per stand
+  // slot at multiplayer tables, so two simultaneous walk-ups can't collide on
+  // the same standing position. Rebinds per join like games/casino (T0 seam).
+  //
+  // SIGNED CLAIMS (PR #126 review): every claim is { pub, at, sig } — the
+  // local Ed25519 identity signs canonical bytes that include THIS room id
+  // and the slot key (no cross-room, no cross-slot lift; no naming a key you
+  // don't hold), and standsDoc verifies every record on read through the
+  // same verifyIdentity the door-policy and treasury bindings use. Unsigned
+  // records are refused outright — the map is new in the same PR, so there
+  // is nothing legacy to honour. See standsDoc.ts's header for the trust
+  // boundary (what signing does and does not prevent).
+  //
+  // The online provider hands the reap sweep identity PUBS — each `players`
+  // entry's keyB64, shape-guarded — because that is what a signed claim
+  // carries; a set of player-id keys would never match a claim. A
+  // live-but-quiet peer (present in `players`, past their claim TTL) keeps
+  // their slot; a crashed peer whose entry never reached this replica has
+  // theirs reaped. Iterating the map every reap is cheap — a few dozen
+  // entries at most — and keeps the plumbing local to standsDoc.
+  bindStandsDoc(sync.doc, {
+    roomId: boot.roomId,
+    verifySig: verifyIdentity,
+    localPub: () => getIdentityPub(),
+    sign: (bytes) => {
+      try { return signIdentity(bytes); } catch { return null; }
+    },
+    getOnlinePubs: () => {
+      const pubs = new Set<string>();
+      playersMap.forEach((v) => {
+        const keyB64 = (v as { keyB64?: unknown } | null)?.keyB64;
+        if (typeof keyB64 === "string" && keyB64) pubs.add(keyB64);
+      });
+      return pubs;
+    },
+  });
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
