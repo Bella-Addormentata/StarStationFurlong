@@ -2797,6 +2797,12 @@ let deedDetailRoomId = "";
  *  a second click on the SAME recipient executes. Any repaint keeps it — only
  *  back/open/select-change re-arm. */
 let deedHandoverArmed = "";
+/** 🩹 #142 two-step guard, same idiom as the hand-over above. Deregistering an
+ *  office destroys the venture's ONLY authoritative cap table and cannot be
+ *  undone, and the button is rendered for every visitor (the action is ungated
+ *  by design — see detachOfficeRecord). Ungated is about WHO may act; it does
+ *  not mean one stray tap should be able to do it. */
+let officeDetachArmed = false;
 
 function syncVentureLedgerFromCurrentRoom(): void {
   const v = ventureRecord();
@@ -3276,16 +3282,19 @@ function renderVenturesApp(): void {
         ventureDetailId = el.dataset.id ?? "";
         deedDetailRoomId = "";
         deedHandoverArmed = "";
+        officeDetachArmed = false;
         offerCutNote = "";
       } else if (action === "back") {
         ventureDetailId = "";
         deedDetailRoomId = "";
         deedHandoverArmed = "";
+        officeDetachArmed = false;
         offerCutNote = "";
       } else if (action === "deed-open") {
         deedDetailRoomId = el.dataset.id ?? "";
         ventureDetailId = "";
         deedHandoverArmed = "";
+        officeDetachArmed = false;
         offerCutNote = "";
       } else if (action === "deed-transfer") {
         const sel = document.getElementById(
@@ -3331,10 +3340,17 @@ function renderVenturesApp(): void {
         // Personal owner of a property room casts it out of the venture.
         removeVentureLink();
       } else if (action === "detach-office") {
-        // 🩹 #142: deregister an office record. Ungated — see detachOfficeRecord.
-        if (detachOfficeRecord()) {
-          syncVentureLedgerFromCurrentRoom();
-          ventureDetailId = "";
+        // 🩹 #142: deregister an office record. Ungated — see detachOfficeRecord
+        // — but two-step, because this destroys the venture's only
+        // authoritative cap table with no undo and no re-registration path.
+        if (!officeDetachArmed) {
+          officeDetachArmed = true; // first click ARMS; the repaint shows CONFIRM
+        } else {
+          officeDetachArmed = false;
+          if (detachOfficeRecord()) {
+            syncVentureLedgerFromCurrentRoom();
+            ventureDetailId = "";
+          }
         }
       } else if (action === "transfer") {
         const pubInput = document.getElementById(
@@ -3739,7 +3755,7 @@ function renderVenturesApp(): void {
         .join("")}
       <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? " Cap table is a snapshot — trades happen at the office." : ""}</div>
       ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ""}
-      ${detail.snapshotAt === undefined ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-office" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DEREGISTER THIS OFFICE</button><div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:3px;">Ungated on purpose (#142): a planted office record is otherwise unremovable, and nothing authorizes room-doc writes yet, so a gate would only block the cleanup.</div></div>` : ""}
+      ${detail.snapshotAt === undefined ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-office" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">${officeDetachArmed ? "⚠ CONFIRM DEREGISTER" : "⏏ DEREGISTER THIS OFFICE"}</button><div style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${officeDetachArmed ? `Deregister 🚀 ${esc(detail.name)}? This erases its cap table — all ${detail.totalShares} shares — from the only room that holds it. There is no undo and no way to re-register.` : ""}</div><div style="font-size:9px; color:rgba(212,168,75,0.65);">Ungated on purpose (#142): a planted office record is otherwise unremovable, and nothing authorizes room-doc writes yet, so a gate would only block the cleanup. Two taps, because it cannot be undone.</div></div>` : ""}
       ${
         mine > 0 && detail.snapshotAt === undefined
           ? `
