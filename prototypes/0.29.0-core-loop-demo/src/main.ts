@@ -102,6 +102,7 @@ import {
   doorSetIsMarkedEmpty,
   seedDoorLayoutEmpty,
   seedDoorLayoutDefaults,
+  subscribeDoorLayout,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -1315,6 +1316,16 @@ async function joinRoomAtEpoch(
     // 🪟 #80 S4: window changes recut the CURRENT room's exterior shell (holes +
     // glass) while at zoom 3 — refreshExteriorView early-returns off-level.
     subscribeWindowLayout(() => refreshExteriorView());
+    // 🚪 #92: door LAYOUT changes (add / move / remove a free door, or a
+    // reseeded default set) recut the CURRENT room's exterior shell so the
+    // hole follows the leaf — parity with windows above, and mirrors the
+    // interior-hull rebuild inside world.ts's `subscribeDoorLayout`. Kept
+    // separate from `subscribeDoors` (which is the docked-pairings map, not
+    // the door-layout map — different Yjs sub-doc, different observer) so a
+    // pairing-only change does not carry a redundant layout redraw and vice
+    // versa. `refreshExteriorView` early-returns off zoom 3, so an off-view
+    // layout change is a cheap no-op.
+    subscribeDoorLayout(() => refreshExteriorView());
     // 🗺️ #62 P5: door changes update the atlas + the whole-station render.
     subscribeDoors(() => {
       harvestStationAtlas();
