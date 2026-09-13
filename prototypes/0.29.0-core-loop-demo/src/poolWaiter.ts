@@ -1,13 +1,13 @@
 /**
  * 🤖 PoolWaiter — drink-service robot (here: the LOBBY's roaming waiter).
  *
- * A voxel-built waiter bot — monochrome chassis, black polo with a white
- * badge, black sunglasses visor — patrols a fixed ping-pong route through
- * the lobby aisles, carrying a wooden tray of cocktails. When the fox walks
- * up FACING it (close, heading roughly at the bot), the bot stops, turns to
- * the fox, and one drink flies from the tray into the fox's paw, is sipped
- * over five seconds, and drunk (shrinks away). Drinks refill on a timer and
- * a cooldown prevents back-to-back grabs.
+ * A humanoid waiter android — synthetic face and torso, medium-brown hair,
+ * white headset, red service outfit, and white-plated mechanical limbs —
+ * patrols a fixed ping-pong route through the lobby aisles, carrying a wooden
+ * tray of cocktails. When the fox walks up FACING it (close, heading roughly
+ * at the bot), the bot stops, turns to the fox, and one drink flies from the
+ * tray into the fox's paw, is sipped over five seconds, and drunk (shrinks
+ * away). Drinks refill on a timer and a cooldown prevents back-to-back grabs.
  *
  * Purely LOCAL ambience (like the room's other decor pieces) — not networked:
  * every client simulates its own waiter, and only the local fox is served.
@@ -31,8 +31,8 @@ const ROBOT_SCALE = 1.4;
  *  shortening so the feet stay planted while the knees bend. */
 const HIP_Y = 0.98;
 /** 🗨️ World-space anchor for the bot's overhead lines — just above the
- *  scaled antenna (≈3.1), co-owned with the geometry so a rebuild that
- *  changes the bot's height updates the bubbles with it. */
+ *  scaled hair and headset (≈2.9), co-owned with the geometry so a rebuild
+ *  that changes the bot's height updates the bubbles with it. */
 export const ROBOT_BUBBLE_Y = 3.3;
 const SERVE_RANGE = 1.6; // fox this close AND facing the bot → serve
 const FACING_DOT = 0.55; // min cos(angle fox-heading → bot) to count as 迎面
@@ -392,7 +392,7 @@ export class PoolWaiter {
 
   private build(): void {
     // 💃 Android livery (owner reference: a humanoid android with a human
-    // face and long dark hair under white headphones, fully mechanical
+    // face and long medium-brown hair under white headphones, fully mechanical
     // white-plated limbs with dark joint segments, bare skin torso — dressed
     // in a red bikini). Same rig as before: hip-pivoted legs with knee shins,
     // shoulder-pivoted arms, one bobbing body group, the tray at the hands —
@@ -492,7 +492,7 @@ export class PoolWaiter {
     this.box(this.body, 0.24, 0.2, 0.08, PLATE, 0, 1.32, -0.15);
     this.box(this.body, 0.02, 0.14, 0.012, GLOW, 0, 1.32, -0.195);
     // Head (lifted to sit on the neck): round skin face with eyes, brows,
-    // a small nose and lips; long dark hair (cap, a tapering fall down the
+    // a small nose and lips; long medium-brown hair (cap, a tapering fall down the
     // back, two front strands set beside — not over — the neck); white
     // headphones — ear cups on the sides, a band over the crown.
     this.ball(this.body, 0.15, SKIN, 0, 1.93, 0);
