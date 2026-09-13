@@ -109,6 +109,61 @@ export function legacyOwnerMarker(owner: string): boolean {
   return !owner || owner === "Local-Clone";
 }
 
+/** What the DEED predicate needs. Deliberately not `OwnerContext`: the deed
+ *  is a narrower question than owner authority and must not drift into
+ *  sharing a shape with it. */
+export interface DeedContext {
+  /** The local player id, as written into `roomInfo.owner` since S2. */
+  playerId: string;
+  /** The local identity public key, base64url — what a `players` entry's
+   *  `keyB64` is compared against when the owner id is not our player id
+   *  (an owner who returns on a new player id still holds their deed). */
+  identityPub: string;
+  /**
+   * `players[owner].keyB64`, looked up on demand.
+   *
+   * ⚠️ A FUNCTION, not a resolved value, and that is the security contract of
+   * this interface rather than a style choice. #141's invariant is that the
+   * legacy marker must never be RESOLVED, not merely never compared: the
+   * `players` map is peer-written and the marker is used as a KEY into it, so
+   * an attacker who writes `players['Local-Clone'] = { keyB64: <their pub> }`
+   * takes the deed to every legacy room the moment anything looks the marker
+   * up. Passing an already-resolved key would move that lookup into the
+   * CALLER, where the legacy check cannot guard it — the hole would reopen
+   * with this file still looking correct. `isDeedHolder` calls this only
+   * after `legacyOwnerMarker` has refused, and a test pins that it is not
+   * called at all for a legacy owner.
+   */
+  ownerKeyB64: (owner: string) => string | undefined;
+}
+
+/**
+ * Does the local player hold the DEED to a room whose `roomInfo.owner` is
+ * `owner` — the right to hand the module away?
+ *
+ * Deliberately the RAW owner, not the shareholder-extended `isRoomOwner`: a
+ * venture's co-owners get access to the property, not the right to sell it.
+ * Since #142 this also decides the room's access mode and co-host management,
+ * so it is the narrower of the two authority predicates and the one that
+ * governs everything irreversible.
+ *
+ * Two ways to hold it, and the second is why `ownerKeyB64` exists: the owner
+ * id may be our player id directly, or it may be an id whose `players` entry
+ * carries our identity key — an owner who comes back on a fresh player id
+ * still holds their deed.
+ *
+ * 🔒 #141: no `'Local-Clone'` clause, and the marker is refused BEFORE the key
+ * lookup. See `DeedContext.ownerKeyB64` for why that ordering is the whole
+ * point rather than an optimisation.
+ */
+export function isDeedHolder(owner: string | undefined, ctx: DeedContext): boolean {
+  if (typeof owner !== 'string' || !owner) return false;
+  if (legacyOwnerMarker(owner)) return false;
+  if (owner === ctx.playerId) return true;
+  const keyB64 = ctx.ownerKeyB64(owner);
+  return typeof keyB64 === 'string' && keyB64 === ctx.identityPub;
+}
+
 /**
  * The refusal text for an owner-gated action, so every gate says the same
  * thing and a legacy room reads as legacy rather than as the baffling

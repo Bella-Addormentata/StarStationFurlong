@@ -184,6 +184,7 @@ import {
   isOfficeHere,
 } from "./ventures";
 import {
+  isDeedHolder,
   isRoomOwner,
   legacyOwnerMarker,
   ownerGateRefusal as ownerGateRefusalText,
@@ -4283,27 +4284,24 @@ function syncVentureLedgerFromCurrentRoom(): void {
  *  no longer count as mine — they counted as EVERYONE's — matching
  *  `categorizeRoom`, which now files them as 'visited'. */
 function currentRoomDeedIsMine(): boolean {
-  const ownerVal = yjsSync?.doc.getMap("roomInfo").get("owner") as
-    | string
-    | undefined;
-  if (typeof ownerVal !== "string" || !ownerVal) return false;
-  // 🔒 #141: no 'Local-Clone' clause. This is the RAW deed check (the right to
-  // hand the module away), so the wildcard was strictly worse here than at the
-  // owner-equivalent gate — it made every peer the deed holder.
+  // The decision lives in roomOwner.ts so it can be unit-tested; this wrapper
+  // supplies the live getters, exactly as isLocalPlayerRoomOwner does.
   //
-  // ⚠️ Rejected BEFORE the players lookup below, not merely as an equality
-  // test. `players` is peer-written, and the marker is used as a KEY into it:
-  // an attacker writes players['Local-Clone'] = { keyB64: <their own pub> },
-  // and their client then resolves the legacy owner to themselves and takes
-  // the deed to every legacy room. Dropping the `=== 'Local-Clone'` comparison
-  // alone left that path wide open — the marker must never be RESOLVED, not
-  // just never compared.
-  if (legacyOwnerMarker(ownerVal)) return false;
-  if (ownerVal === getPlayerId()) return true;
-  const entry = yjsSync?.doc.getMap("players").get(ownerVal) as
-    | Partial<PlayerEntry>
-    | undefined;
-  return typeof entry?.keyB64 === "string" && entry.keyB64 === getIdentityPub();
+  // ⚠️ `ownerKeyB64` is passed as a LOOKUP, never as a resolved key. #141's
+  // invariant is that the legacy marker must never be RESOLVED — `players` is
+  // peer-written and the marker is used as a KEY into it, so resolving it here
+  // and handing the result over would reopen the hole with roomOwner.ts still
+  // looking correct. isDeedHolder calls this only after refusing the marker.
+  return isDeedHolder(
+    yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined,
+    {
+      playerId: getPlayerId(),
+      identityPub: getIdentityPub(),
+      ownerKeyB64: (owner) =>
+        (yjsSync?.doc.getMap("players").get(owner) as Partial<PlayerEntry> | undefined)
+          ?.keyB64,
+    },
+  );
 }
 
 /** Visitation harvest (the atlas/venture-ledger pattern): the room we're IN

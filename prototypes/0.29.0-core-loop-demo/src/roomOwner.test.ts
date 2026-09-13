@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { isRoomOwner, legacyOwnerMarker, ownerGateRefusal } from './roomOwner';
+import { isDeedHolder, isRoomOwner, legacyOwnerMarker, ownerGateRefusal } from './roomOwner';
 
 const ME = 'player-me';
 const THEM = 'player-them';
@@ -146,9 +146,16 @@ describe('ownerGateRefusal — a legacy room reads as legacy', () => {
  * runs the whole client on import and so cannot be loaded by vitest — this
  * SCANS THE SOURCE for the predicate each one calls. It catches the regression
  * that matters (someone widening the gate back to `isLocalPlayerRoomOwner`)
- * and nothing else: it cannot tell you the gate is reached, that the UI agrees
- * with it, or that `currentRoomDeedIsMine` is itself right. Extracting these
- * paths so they can be tested properly is its own critical-path TODO item.
+ * and nothing else: it cannot tell you the gate is reached, or that the UI
+ * agrees with it.
+ *
+ * What it no longer has to cover is whether the predicate itself is right.
+ * `currentRoomDeedIsMine` is now a thin wrapper over `isDeedHolder` above,
+ * which has real cases — including the one that matters most, that a legacy
+ * marker is never RESOLVED through the peer-written `players` map. The
+ * remaining owner paths (`categorizeRoom` / `roomOwnerInfo`,
+ * `resolveOwnerLabel`, and the two-step confirm guards) are still
+ * main.ts-only, and finishing them is its own critical-path TODO item.
  */
 describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
   const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
@@ -232,5 +239,88 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     // And nothing else in the section reaches for a wider gate.
     expect(body).not.toContain('isLocalPlayerRoomOwner');
     expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
+  });
+});
+
+/**
+ * 🏠 isDeedHolder (#141/#142) — the RAW deed check, extracted so it can be
+ * tested.
+ *
+ * This is the narrower of the two authority predicates and the one that
+ * governs everything irreversible: handing the module away, the sole-croupier
+ * election, and — since #142 — the room's access mode and co-host management.
+ * Until now it lived in main.ts and had no coverage at all, which is why #148
+ * could only pin those gates with a source scan.
+ */
+describe('isDeedHolder — the deed, not owner-equivalence', () => {
+  const ME = 'player-me';
+  const MY_PUB = 'pub-me';
+  /** No players entry for anyone — the common case. */
+  const noEntries = { playerId: ME, identityPub: MY_PUB, ownerKeyB64: () => undefined };
+
+  it('grants when the owner id is my player id', () => {
+    expect(isDeedHolder(ME, noEntries)).toBe(true);
+  });
+
+  it('refuses another player, when no players entry ties them to me', () => {
+    expect(isDeedHolder('player-them', noEntries)).toBe(false);
+  });
+
+  it('grants an owner id whose players entry carries MY identity key', () => {
+    // The returning-owner case: same person, new player id. This is the only
+    // reason the key lookup exists.
+    expect(isDeedHolder('player-old-me', {
+      playerId: ME, identityPub: MY_PUB, ownerKeyB64: () => MY_PUB,
+    })).toBe(true);
+  });
+
+  it('refuses when the players entry carries someone else’s key', () => {
+    expect(isDeedHolder('player-them', {
+      playerId: ME, identityPub: MY_PUB, ownerKeyB64: () => 'pub-them',
+    })).toBe(false);
+  });
+
+  it('REFUSES the legacy marker and an absent owner', () => {
+    for (const owner of ['Local-Clone', '', undefined]) {
+      expect(isDeedHolder(owner, noEntries)).toBe(false);
+    }
+  });
+
+  it('never RESOLVES the legacy marker — the lookup is not called at all', () => {
+    // #141's actual invariant, and the reason ownerKeyB64 is a function rather
+    // than a resolved value. `players` is peer-written and the marker is a KEY
+    // into it: an attacker writing players['Local-Clone'] = {keyB64: theirs}
+    // takes the deed to every legacy room the moment anything looks it up.
+    // Refusing by equality while still resolving would pass every test above
+    // and leave the hole wide open.
+    const looked: string[] = [];
+    for (const owner of ['Local-Clone', '']) {
+      expect(isDeedHolder(owner, {
+        playerId: ME,
+        identityPub: MY_PUB,
+        ownerKeyB64: (o) => { looked.push(o); return MY_PUB; },
+      })).toBe(false);
+    }
+    expect(looked).toEqual([]);
+  });
+
+  it('does not consult the lookup when the player id already matches', () => {
+    // Not security, just the contract: the cheap branch short-circuits.
+    let called = false;
+    isDeedHolder(ME, {
+      playerId: ME, identityPub: MY_PUB,
+      ownerKeyB64: () => { called = true; return undefined; },
+    });
+    expect(called).toBe(false);
+  });
+
+  it('is NARROWER than isRoomOwner — a shareholder holds no deed', () => {
+    // The #142 split, stated as a test: a venture shareholder passes the
+    // owner-equivalent gate and must not pass this one. A fabricated office
+    // record is an unauthenticated peer write, so if the deed followed
+    // shareholding, planting one would buy the right to sell the module.
+    const shareholder = { playerId: ME, isVentureShareholder: true };
+    expect(isRoomOwner('player-them', shareholder)).toBe(true);
+    expect(isDeedHolder('player-them', noEntries)).toBe(false);
   });
 });
