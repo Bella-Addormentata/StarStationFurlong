@@ -445,9 +445,11 @@ export class PoolWaiter {
     this.body = new THREE.Group();
     this.group.add(this.body);
     const ABS = this.mat(0xdfae8c, 0.6, 0.05); // ab shading (a shade under skin)
-    this.box(this.body, 0.32, 0.12, 0.2, RED, 0, 1.06, 0); // bikini bottom
+    this.box(this.body, 0.3, 0.12, 0.16, RED, 0, 1.06, 0.01); // bikini bottom
     for (const side of [-1, 1] as const) {
       this.ball(this.body, 0.08, SKIN, side * 0.15, 1.07, 0); // rounded hip
+      this.ball(this.body, 0.088, RED, side * 0.072, 1.04, -0.065); // glute (under the bikini)
+      this.ball(this.body, 0.05, SKIN, side * 0.085, 0.985, -0.06); // under-curve into the thigh
     }
     this.taper(this.body, 0.105, 0.165, 0.14, SKIN, 0, 1.19, 0); // hip flare
     this.taper(this.body, 0.14, 0.1, 0.2, SKIN, 0, 1.36, 0); // waist pinch
