@@ -369,38 +369,63 @@ export class PoolWaiter {
     return mesh;
   }
 
+  /** Tapered segment (waist / hips / ribcage) — top and bottom radii differ. */
+  private taper(
+    parent: THREE.Object3D,
+    rTop: number,
+    rBottom: number,
+    height: number,
+    mat: THREE.Material,
+    x: number,
+    y: number,
+    z: number,
+  ): THREE.Mesh {
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(rTop, rBottom, height, 16),
+      mat,
+    );
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+    parent.add(mesh);
+    return mesh;
+  }
+
   private build(): void {
-    // 💃 Android livery (owner reference: a sleek humanoid android — warm
-    // synthetic skin under pearl-white armour pieces, chrome joint rings,
-    // a white visor headset, sneaker-boots). Same rig as before: hip-pivoted
-    // legs with knee shins, shoulder-pivoted arms, one bobbing body group,
-    // the tray at the hands — so every routine animates unchanged.
+    // 💃 Android livery (owner reference: a humanoid android with a human
+    // face and long dark hair under white headphones, fully mechanical
+    // white-plated limbs with dark joint segments, bare skin torso — dressed
+    // in a red bikini). Same rig as before: hip-pivoted legs with knee shins,
+    // shoulder-pivoted arms, one bobbing body group, the tray at the hands —
+    // so every routine animates unchanged.
     const SKIN = this.mat(0xf0c2a2, 0.55, 0.05); // synthetic skin
-    const ARMOR = this.mat(0xf9fafc, 0.32, 0.2); // pearl-white armour (low metalness: no env map here)
-    const CHROME = this.mat(0xd6dde4, 0.25, 0.55); // satin-silver rings
+    const PLATE = this.mat(0xf9fafc, 0.32, 0.2); // white limb plating (low metalness: no env map here)
+    const MECH = this.mat(0x22262b, 0.55, 0.35); // dark joint mechanics
+    const RED = this.mat(0xe0243a, 0.45, 0.1); // red bikini
     const GLOW = this.mat(0x35e6ff, 0.4, 0.1, 0x35e6ff, 1.6); // cyan light strips
-    const HAIR = this.mat(0x2b2126, 0.7, 0.1); // dark hair
-    const LIPS = this.mat(0xd9746f, 0.5, 0.05);
-    const SOLE = this.mat(0x191c20, 0.6, 0.3); // boot soles / dark trim
+    const HAIR = this.mat(0x2b2126, 0.7, 0.1); // long dark hair
+    const EYE = this.mat(0xffffff, 0.3, 0.0);
+    const IRIS = this.mat(0x3d8fe0, 0.3, 0.1, 0x1e5fb0, 0.35); // blue eyes
+    const LIPS = this.mat(0xd9535e, 0.5, 0.05);
+    const SOLE = this.mat(0x191c20, 0.6, 0.3); // boot soles
     const WOODY = this.mat(0x8a5a2e, 0.8, 0.05); // tray timber
 
-    // Legs — hip-pivoted groups so they can swing while walking. Long and
-    // slim: skin thigh + shin, a white hip cuff (the high-cut armour line),
-    // a chrome knee ring and a white sneaker-boot on a dark sole.
+    // Legs — hip-pivoted groups so they can swing while walking. Mechanical:
+    // white plated thigh + shin, dark hip / knee / ankle joints, white
+    // sneaker-boot on a dark lit sole.
     for (const side of [-1, 1] as const) {
       const leg = new THREE.Group();
       leg.position.set(side * 0.13, HIP_Y, 0);
-      this.tube(leg, 0.082, 0.12, ARMOR, 0, -0.05, 0); // hip cuff
-      this.tube(leg, 0.062, 0.46, SKIN, 0, -0.23, 0); // thigh
-      this.tube(leg, 0.05, 0.05, CHROME, 0, -0.475, 0); // knee ring
+      this.tube(leg, 0.075, 0.1, MECH, 0, -0.05, 0); // hip joint
+      this.tube(leg, 0.066, 0.4, PLATE, 0, -0.29, 0); // thigh plate
+      this.tube(leg, 0.052, 0.06, MECH, 0, -0.475, 0); // knee joint
       // 🦵 Shin subgroup pivoted at the KNEE so a squat bends like a human
       // leg — thigh folds forward, shin counter-rotates to stay upright.
       const shin = new THREE.Group();
       shin.position.set(0, -0.48, 0);
       leg.add(shin);
-      this.tube(shin, 0.052, 0.3, SKIN, 0, -0.17, 0); // shin
-      this.tube(shin, 0.068, 0.12, ARMOR, 0, -0.36, 0); // boot cuff
-      this.box(shin, 0.15, 0.08, 0.27, ARMOR, 0, -0.44, 0.05); // sneaker
+      this.tube(shin, 0.056, 0.3, PLATE, 0, -0.17, 0); // shin plate
+      this.tube(shin, 0.045, 0.06, MECH, 0, -0.35, 0); // ankle joint
+      this.box(shin, 0.15, 0.08, 0.27, PLATE, 0, -0.44, 0.05); // sneaker
       this.box(shin, 0.155, 0.03, 0.28, SOLE, 0, -0.49, 0.05); // sole
       this.box(shin, 0.16, 0.012, 0.2, GLOW, 0, -0.478, 0.06); // sole light
       this.group.add(leg);
@@ -413,55 +438,75 @@ export class PoolWaiter {
       }
     }
 
-    // Body group (pelvis armour → waist → chest → head) — bobs as one while
-    // walking. Hourglass: wide pelvis plate, narrow round waist, a chest of
-    // two white armour domes over a strap, round shoulder caps.
+    // Body group (hips → bare waist → chest → head) — bobs as one while
+    // walking. The bare torso is an HOURGLASS of tapered segments: hips flare
+    // out under the bikini bottom, the waist pinches, the ribcage widens
+    // again under the bust — with a soft 2×3 ab grid on the midriff.
     this.body = new THREE.Group();
     this.group.add(this.body);
-    this.box(this.body, 0.34, 0.16, 0.2, ARMOR, 0, 1.06, 0); // pelvis armour
+    const ABS = this.mat(0xdfae8c, 0.6, 0.05); // ab shading (a shade under skin)
+    this.box(this.body, 0.32, 0.12, 0.2, RED, 0, 1.06, 0); // bikini bottom
     for (const side of [-1, 1] as const) {
-      this.ball(this.body, 0.075, ARMOR, side * 0.15, 1.07, 0); // rounded hip
+      this.ball(this.body, 0.08, SKIN, side * 0.15, 1.07, 0); // rounded hip
     }
-    this.box(this.body, 0.36, 0.025, 0.21, CHROME, 0, 1.145, 0); // belt line
-    this.tube(this.body, 0.105, 0.22, SKIN, 0, 1.27, 0); // waist
-    this.tube(this.body, 0.15, 0.16, SKIN, 0, 1.45, 0); // ribcage
-    this.box(this.body, 0.38, 0.07, 0.2, ARMOR, 0, 1.5, 0); // chest strap
+    this.taper(this.body, 0.105, 0.165, 0.14, SKIN, 0, 1.19, 0); // hip flare
+    this.taper(this.body, 0.14, 0.1, 0.2, SKIN, 0, 1.36, 0); // waist pinch
+    this.taper(this.body, 0.15, 0.14, 0.12, SKIN, 0, 1.52, 0); // ribcage
+    for (let row = 0; row < 3; row++) {
+      const y = 1.4 - row * 0.065;
+      const r = row === 0 ? 0.128 : row === 1 ? 0.112 : 0.108; // follow the pinch
+      for (const side of [-1, 1] as const) {
+        this.box(this.body, 0.048, 0.04, 0.02, ABS, side * 0.035, y, r); // ab pad
+      }
+    }
+    this.box(this.body, 0.34, 0.035, 0.17, RED, 0, 1.56, -0.02); // bikini back strap
     for (const side of [-1, 1] as const) {
-      this.ball(this.body, 0.078, ARMOR, side * 0.085, 1.5, 0.065); // chest plate
-      this.ball(this.body, 0.066, ARMOR, side * 0.225, 1.6, 0); // shoulder cap
+      this.ball(this.body, 0.085, RED, side * 0.088, 1.55, 0.075); // bikini cup
+      this.ball(this.body, 0.06, MECH, side * 0.225, 1.62, 0); // shoulder joint
     }
-    this.tube(this.body, 0.045, 0.1, SKIN, 0, 1.66, 0); // neck
-    // Shoulder-pivoted arms: skin upper arm, a white forearm gauntlet with a
-    // chrome elbow ring, skin hand. Group rotation (0,0,0) is the tray-carry
+    // A real neck: skin column on a dark mechanical collar, long enough to
+    // show between the shoulders and the jaw.
+    this.tube(this.body, 0.052, 0.03, MECH, 0, 1.6, 0); // collar
+    this.tube(this.body, 0.046, 0.18, SKIN, 0, 1.7, 0); // neck
+    // Shoulder-pivoted arms: white plated upper arm and forearm, dark elbow
+    // joint and mechanical hand. Group rotation (0,0,0) is the tray-carry
     // pose (same pivot geometry as before, so the coach's raises still read).
     for (const side of [-1, 1] as const) {
       const arm = new THREE.Group();
-      arm.position.set(side * 0.27, 1.58, 0);
+      arm.position.set(side * 0.27, 1.6, 0);
       this.body.add(arm);
-      const upper = this.tube(arm, 0.045, 0.3, SKIN, 0, -0.16, 0.1);
+      const upper = this.tube(arm, 0.05, 0.3, PLATE, 0, -0.16, 0.1);
       upper.rotation.x = -0.55; // upper arm angled forward-down
-      const elbow = this.tube(arm, 0.05, 0.04, CHROME, side * -0.02, -0.3, 0.2);
+      const elbow = this.tube(arm, 0.048, 0.05, MECH, side * -0.02, -0.3, 0.2);
       elbow.rotation.x = -1.35;
-      const fore = this.tube(arm, 0.056, 0.28, ARMOR, side * -0.04, -0.33, 0.28);
-      fore.rotation.x = -1.35; // gauntlet reaching level to the tray
-      this.tube(arm, 0.04, 0.08, SKIN, side * -0.07, -0.33, 0.4); // hand
+      const fore = this.tube(arm, 0.052, 0.28, PLATE, side * -0.04, -0.33, 0.28);
+      fore.rotation.x = -1.35; // forearm reaching level to the tray
+      this.tube(arm, 0.04, 0.08, MECH, side * -0.07, -0.33, 0.4); // hand
       if (side < 0) this.armL = arm;
       else this.armR = arm;
     }
-    // Slim power pack against the back, one light seam.
-    this.box(this.body, 0.26, 0.26, 0.08, ARMOR, 0, 1.42, -0.15);
-    this.box(this.body, 0.02, 0.18, 0.012, GLOW, 0, 1.42, -0.195);
-    // Head: round skin face, dark hair behind, a white visor headset across
-    // the eyes with a cyan light line and side pods, small lips.
-    this.ball(this.body, 0.15, SKIN, 0, 1.86, 0);
-    this.ball(this.body, 0.157, HAIR, 0, 1.895, -0.035); // hair
-    this.box(this.body, 0.33, 0.13, 0.15, ARMOR, 0, 1.88, 0.07); // visor
-    this.box(this.body, 0.29, 0.028, 0.012, GLOW, 0, 1.88, 0.148); // eye line
+    // Slim power pack low on the back (the hair falls over the upper back).
+    this.box(this.body, 0.24, 0.2, 0.08, PLATE, 0, 1.32, -0.15);
+    this.box(this.body, 0.02, 0.14, 0.012, GLOW, 0, 1.32, -0.195);
+    // Head (lifted to sit on the neck): round skin face with eyes, brows,
+    // a small nose and lips; long dark hair (cap, a tapering fall down the
+    // back, two front strands set beside — not over — the neck); white
+    // headphones — ear cups on the sides, a band over the crown.
+    this.ball(this.body, 0.15, SKIN, 0, 1.93, 0);
+    this.ball(this.body, 0.158, HAIR, 0, 1.97, -0.03); // hair cap
+    this.box(this.body, 0.3, 0.26, 0.1, HAIR, 0, 1.85, -0.14); // hair fall — upper
+    this.box(this.body, 0.22, 0.28, 0.08, HAIR, 0, 1.59, -0.15); // hair fall — tapering ends
     for (const side of [-1, 1] as const) {
-      this.tube(this.body, 0.055, 0.05, ARMOR, side * 0.175, 1.88, 0.05).rotation.z =
-        Math.PI / 2; // headset pods
+      this.box(this.body, 0.055, 0.3, 0.1, HAIR, side * 0.165, 1.8, -0.02); // front strands
+      this.ball(this.body, 0.024, EYE, side * 0.058, 1.95, 0.128); // eye
+      this.ball(this.body, 0.014, IRIS, side * 0.058, 1.95, 0.147); // iris
+      this.box(this.body, 0.06, 0.012, 0.02, HAIR, side * 0.058, 1.995, 0.14); // brow
+      const cup = this.tube(this.body, 0.07, 0.05, PLATE, side * 0.165, 1.94, 0.01); // ear cup
+      cup.rotation.z = Math.PI / 2;
     }
-    this.box(this.body, 0.07, 0.022, 0.02, LIPS, 0, 1.775, 0.14); // lips
+    this.box(this.body, 0.022, 0.05, 0.03, SKIN, 0, 1.905, 0.15); // nose
+    this.box(this.body, 0.35, 0.03, 0.07, PLATE, 0, 2.07, 0.0); // headband
+    this.box(this.body, 0.07, 0.024, 0.02, LIPS, 0, 1.86, 0.145); // lips
 
     // Tray held out front, with four cocktails.
     this.tray = new THREE.Group();
