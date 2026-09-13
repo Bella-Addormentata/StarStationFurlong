@@ -46,10 +46,12 @@ Read the version prefix as a start date, not a claim about what is current.
 
 ## Releasing a different demo as the app
 
-The packaged release always uses the Tauri shell from
-[`0.26.0-core-loop-demo/src-tauri`](0.26.0-core-loop-demo/src-tauri/) (window, Rust
-WebTransport node, icons, app version) — but the **frontend it renders is
-switchable**. The [release workflow](../.github/workflows/release.yml) builds
+The packaged release builds the Tauri project — shell and frontend together —
+from whichever folder `RELEASE_FRONTEND` names, so the shell (window, Rust
+WebTransport node, icons, app version) comes from **that folder's**
+`src-tauri/`, today [`0.29.0-core-loop-demo/src-tauri`](0.29.0-core-loop-demo/src-tauri/).
+The workflow passes `projectPath: ${{ env.RELEASE_FRONTEND }}` to `tauri-action`;
+there is no fixed shell path. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config
 overlay (`--config release-frontend.json`) so `frontendDist` targets that
 demo's `dist/`.

@@ -10,8 +10,9 @@ on:
 
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
-  # The Tauri shell (window, Rust node, icons, app version) always comes from
-  # prototypes/0.22.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # The Tauri PROJECT is built from this same folder — `projectPath` below is
+  # RELEASE_FRONTEND — so the shell (window, Rust node, icons, app version)
+  # comes from <this folder>/src-tauri, not from a fixed path.
   # To release a different demo:
   #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
   #   2. Make sure that folder has a committed package-lock.json and a

@@ -57,7 +57,7 @@ npm --version
 3. Enter the demo folder:
 
 ```bash
-cd /path/to/StarStationFurlong/prototypes/0.22.0-core-loop-demo
+cd /path/to/StarStationFurlong/prototypes/0.29.0-core-loop-demo
 ```
 
 Replace `/path/to/StarStationFurlong` with the folder where you cloned or copied the repository.
@@ -142,7 +142,7 @@ When you are done testing the demo:
 Key files and folders:
 
 ```text
-0.22.0-core-loop-demo/
+0.29.0-core-loop-demo/
 â”œâ”€â”€ public/              # Static assets such as textures
 â”œâ”€â”€ src/                 # Game source files
 â”‚   â”œâ”€â”€ main.ts          # Entry point, one-click entry flow, networking bootstrap
