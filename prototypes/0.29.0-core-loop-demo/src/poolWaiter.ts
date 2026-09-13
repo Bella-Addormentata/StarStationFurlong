@@ -303,11 +303,15 @@ export class PoolWaiter {
     color: number,
     rough = 0.7,
     metal = 0.25,
+    emissive = 0x000000,
+    emissiveIntensity = 0,
   ): THREE.MeshStandardMaterial {
     return new THREE.MeshStandardMaterial({
       color,
       roughness: rough,
       metalness: metal,
+      emissive,
+      emissiveIntensity,
     });
   }
 
@@ -349,33 +353,56 @@ export class PoolWaiter {
     return mesh;
   }
 
-  private build(): void {
-    // ⬛⬜ Monochrome livery: white chassis panels, black joints/servos,
-    // black polo with white collar + badge, white shorts, black visor.
-    const STEEL = this.mat(0xf1f3f5, 0.55, 0.35); // white chassis
-    const JOINT = this.mat(0x191c20, 0.6, 0.4); // black joints
-    const COLLAR = this.mat(0xf1f3f5, 0.85, 0.02); // white collar
-    const SHORTS = this.mat(0xe8ebee, 0.8, 0.08); // white shorts
-    const VISOR = this.mat(0x14181c, 0.35, 0.1); // sunglasses band
-    const WOODY = this.mat(0x8a5a2e, 0.8, 0.05); // tray timber
-    // 🏋️ High-contrast limb colours (owner request): coral arms, sky-blue
-    // legs — each limb reads at a glance mid-exercise.
-    const ARM = this.mat(0xff7043, 0.55, 0.15); // coral sleeves
-    const LEG = this.mat(0x36c6f0, 0.55, 0.15); // sky-blue tights
+  /** Rounded part (shoulder caps, chest plates, the head). Same contract. */
+  private ball(
+    parent: THREE.Object3D,
+    radius: number,
+    mat: THREE.Material,
+    x: number,
+    y: number,
+    z: number,
+  ): THREE.Mesh {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 14, 10), mat);
+    mesh.position.set(x, y, z);
+    mesh.castShadow = true;
+    parent.add(mesh);
+    return mesh;
+  }
 
-    // Legs — hip-pivoted groups so they can swing while walking.
+  private build(): void {
+    // 💃 Android livery (owner reference: a sleek humanoid android — warm
+    // synthetic skin under pearl-white armour pieces, chrome joint rings,
+    // a white visor headset, sneaker-boots). Same rig as before: hip-pivoted
+    // legs with knee shins, shoulder-pivoted arms, one bobbing body group,
+    // the tray at the hands — so every routine animates unchanged.
+    const SKIN = this.mat(0xf0c2a2, 0.55, 0.05); // synthetic skin
+    const ARMOR = this.mat(0xf9fafc, 0.32, 0.2); // pearl-white armour (low metalness: no env map here)
+    const CHROME = this.mat(0xd6dde4, 0.25, 0.55); // satin-silver rings
+    const GLOW = this.mat(0x35e6ff, 0.4, 0.1, 0x35e6ff, 1.6); // cyan light strips
+    const HAIR = this.mat(0x2b2126, 0.7, 0.1); // dark hair
+    const LIPS = this.mat(0xd9746f, 0.5, 0.05);
+    const SOLE = this.mat(0x191c20, 0.6, 0.3); // boot soles / dark trim
+    const WOODY = this.mat(0x8a5a2e, 0.8, 0.05); // tray timber
+
+    // Legs — hip-pivoted groups so they can swing while walking. Long and
+    // slim: skin thigh + shin, a white hip cuff (the high-cut armour line),
+    // a chrome knee ring and a white sneaker-boot on a dark sole.
     for (const side of [-1, 1] as const) {
       const leg = new THREE.Group();
-      leg.position.set(side * 0.15, HIP_Y, 0); // 🏋️ athletic legs — hip pivot
-      this.tube(leg, 0.075, 0.46, LEG, 0, -0.23, 0); // thigh
-      this.tube(leg, 0.05, 0.1, JOINT, 0, -0.47, 0); // knee servo
+      leg.position.set(side * 0.13, HIP_Y, 0);
+      this.tube(leg, 0.082, 0.12, ARMOR, 0, -0.05, 0); // hip cuff
+      this.tube(leg, 0.062, 0.46, SKIN, 0, -0.23, 0); // thigh
+      this.tube(leg, 0.05, 0.05, CHROME, 0, -0.475, 0); // knee ring
       // 🦵 Shin subgroup pivoted at the KNEE so a squat bends like a human
       // leg — thigh folds forward, shin counter-rotates to stay upright.
       const shin = new THREE.Group();
       shin.position.set(0, -0.48, 0);
       leg.add(shin);
-      this.tube(shin, 0.065, 0.36, LEG, 0, -0.24, 0); // shin
-      this.box(shin, 0.18, 0.09, 0.3, JOINT, 0, -0.455, 0.05); // foot
+      this.tube(shin, 0.052, 0.3, SKIN, 0, -0.17, 0); // shin
+      this.tube(shin, 0.068, 0.12, ARMOR, 0, -0.36, 0); // boot cuff
+      this.box(shin, 0.15, 0.08, 0.27, ARMOR, 0, -0.44, 0.05); // sneaker
+      this.box(shin, 0.155, 0.03, 0.28, SOLE, 0, -0.49, 0.05); // sole
+      this.box(shin, 0.16, 0.012, 0.2, GLOW, 0, -0.478, 0.06); // sole light
       this.group.add(leg);
       if (side < 0) {
         this.legL = leg;
@@ -386,79 +413,55 @@ export class PoolWaiter {
       }
     }
 
-    // Body group (shorts → abs chassis → head) — bobs as one while walking.
-    // 🏋️ Athletic rebuild (owner request): FLAT slab torso (not a barrel) in
-    // a V-taper — broad flat chest over a narrow waist — with a sculpted
-    // SIX-PACK front: two pec plates up top, a 2×3 grid of ab pads below.
-    // Slim waist, longer legs; limbs stay the coloured tubes.
+    // Body group (pelvis armour → waist → chest → head) — bobs as one while
+    // walking. Hourglass: wide pelvis plate, narrow round waist, a chest of
+    // two white armour domes over a strap, round shoulder caps.
     this.body = new THREE.Group();
     this.group.add(this.body);
-    this.box(this.body, 0.4, 0.18, 0.2, SHORTS, 0, 1.06, 0); // shorts
-    this.box(this.body, 0.38, 0.22, 0.17, STEEL, 0, 1.26, 0); // waist slab
-    this.box(this.body, 0.52, 0.24, 0.2, STEEL, 0, 1.49, 0); // chest slab (V-taper)
-    this.tube(this.body, 0.07, 0.1, COLLAR, 0, 1.65, 0); // neck
-    const ABS = this.mat(0xd8dee4, 0.5, 0.3); // sculpted muscle plating
+    this.box(this.body, 0.34, 0.16, 0.2, ARMOR, 0, 1.06, 0); // pelvis armour
     for (const side of [-1, 1] as const) {
-      this.box(this.body, 0.19, 0.12, 0.03, ABS, side * 0.11, 1.51, 0.105); // pec
+      this.ball(this.body, 0.075, ARMOR, side * 0.15, 1.07, 0); // rounded hip
     }
-    for (let row = 0; row < 3; row++) {
-      for (const side of [-1, 1] as const) {
-        this.box(
-          this.body,
-          0.09,
-          0.075,
-          0.03,
-          ABS,
-          side * 0.06,
-          1.36 - row * 0.085,
-          0.09,
-        ); // ab pad
-      }
-    }
-    // Shoulder caps + arms. 🏋️ The arm boxes live in a per-side GROUP pivoted
-    // at the shoulder so the coach routine can raise/swing them; group
-    // rotation (0,0,0) is the sculpted tray-carry pose (same offsets as the
-    // old body-attached boxes, rebased to the shoulder pivot).
+    this.box(this.body, 0.36, 0.025, 0.21, CHROME, 0, 1.145, 0); // belt line
+    this.tube(this.body, 0.105, 0.22, SKIN, 0, 1.27, 0); // waist
+    this.tube(this.body, 0.15, 0.16, SKIN, 0, 1.45, 0); // ribcage
+    this.box(this.body, 0.38, 0.07, 0.2, ARMOR, 0, 1.5, 0); // chest strap
     for (const side of [-1, 1] as const) {
-      this.box(this.body, 0.14, 0.14, 0.16, COLLAR, side * 0.3, 1.52, 0);
+      this.ball(this.body, 0.078, ARMOR, side * 0.085, 1.5, 0.065); // chest plate
+      this.ball(this.body, 0.066, ARMOR, side * 0.225, 1.6, 0); // shoulder cap
+    }
+    this.tube(this.body, 0.045, 0.1, SKIN, 0, 1.66, 0); // neck
+    // Shoulder-pivoted arms: skin upper arm, a white forearm gauntlet with a
+    // chrome elbow ring, skin hand. Group rotation (0,0,0) is the tray-carry
+    // pose (same pivot geometry as before, so the coach's raises still read).
+    for (const side of [-1, 1] as const) {
       const arm = new THREE.Group();
-      arm.position.set(side * 0.31, 1.5, 0);
+      arm.position.set(side * 0.27, 1.58, 0);
       this.body.add(arm);
-      const upper = this.tube(arm, 0.06, 0.3, ARM, 0, -0.16, 0.1);
+      const upper = this.tube(arm, 0.045, 0.3, SKIN, 0, -0.16, 0.1);
       upper.rotation.x = -0.55; // upper arm angled forward-down
-      const fore = this.tube(arm, 0.055, 0.28, ARM, side * -0.04, -0.33, 0.28);
-      fore.rotation.x = -1.35; // forearm reaching level to the tray
-      this.tube(arm, 0.05, 0.08, JOINT, side * -0.07, -0.33, 0.4); // hand
+      const elbow = this.tube(arm, 0.05, 0.04, CHROME, side * -0.02, -0.3, 0.2);
+      elbow.rotation.x = -1.35;
+      const fore = this.tube(arm, 0.056, 0.28, ARMOR, side * -0.04, -0.33, 0.28);
+      fore.rotation.x = -1.35; // gauntlet reaching level to the tray
+      this.tube(arm, 0.04, 0.08, SKIN, side * -0.07, -0.33, 0.4); // hand
       if (side < 0) this.armL = arm;
       else this.armR = arm;
     }
-    // Backpack power unit — snug against the flat back.
-    this.box(this.body, 0.34, 0.32, 0.12, JOINT, 0, 1.42, -0.16);
-    this.box(
-      this.body,
-      0.1,
-      0.14,
-      0.04,
-      this.mat(0xf5f7f9, 0.6, 0.1),
-      0.08,
-      1.46,
-      -0.24,
-    );
-    // Head: 🏋️ a clear, distinct head above the neck — compact flat-faced
-    // block (matches the slab torso), front sunglasses visor, side bolts and
-    // the antenna.
-    this.box(this.body, 0.3, 0.26, 0.26, STEEL, 0, 1.83, 0);
-    this.box(this.body, 0.28, 0.08, 0.05, VISOR, 0, 1.86, 0.13); // 😎 visor
-    this.box(this.body, 0.1, 0.03, 0.02, JOINT, 0, 1.76, 0.135); // mouth slit
+    // Slim power pack against the back, one light seam.
+    this.box(this.body, 0.26, 0.26, 0.08, ARMOR, 0, 1.42, -0.15);
+    this.box(this.body, 0.02, 0.18, 0.012, GLOW, 0, 1.42, -0.195);
+    // Head: round skin face, dark hair behind, a white visor headset across
+    // the eyes with a cyan light line and side pods, small lips.
+    this.ball(this.body, 0.15, SKIN, 0, 1.86, 0);
+    this.ball(this.body, 0.157, HAIR, 0, 1.895, -0.035); // hair
+    this.box(this.body, 0.33, 0.13, 0.15, ARMOR, 0, 1.88, 0.07); // visor
+    this.box(this.body, 0.29, 0.028, 0.012, GLOW, 0, 1.88, 0.148); // eye line
     for (const side of [-1, 1] as const) {
-      this.tube(this.body, 0.045, 0.06, JOINT, side * 0.17, 1.83, 0).rotation.z =
-        Math.PI / 2; // ear bolts
+      this.tube(this.body, 0.055, 0.05, ARMOR, side * 0.175, 1.88, 0.05).rotation.z =
+        Math.PI / 2; // headset pods
     }
-    this.tube(this.body, 0.015, 0.12, JOINT, 0.1, 2.02, -0.05); // antenna
-    const antennaTip = new THREE.Mesh(new THREE.SphereGeometry(0.03, 10, 8), STEEL);
-    antennaTip.position.set(0.1, 2.09, -0.05);
-    antennaTip.castShadow = true;
-    this.body.add(antennaTip);
+    this.box(this.body, 0.07, 0.022, 0.02, LIPS, 0, 1.775, 0.14); // lips
 
     // Tray held out front, with four cocktails.
     this.tray = new THREE.Group();
