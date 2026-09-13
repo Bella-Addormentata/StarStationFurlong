@@ -11,7 +11,7 @@ ships. `0.0.x` demos are frozen snapshots from before versioned releases began.
 **The live one is whichever folder `RELEASE_FRONTEND` names in
 [release.yml](../.github/workflows/release.yml)** — that is what a tagged release
 actually builds. Today that is `0.29.0-core-loop-demo`, which ships **v0.35.0**.
-Read the version prefix as a start date, not a claim about what is current.
+Read the version prefix as the starting release line, not a claim about what is current.
 
 | Demo | Description |
 |---|---|
