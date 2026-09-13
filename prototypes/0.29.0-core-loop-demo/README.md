@@ -168,7 +168,7 @@ Key files and folders:
 ### `npm run dev` fails
 
 Check the following:
-1. Make sure you are inside the `0.22.0-core-loop-demo` folder.
+1. Make sure you are inside the `0.29.0-core-loop-demo` folder.
 2. Make sure `node --version` shows Node.js 20 or newer.
 3. Run `npm install` again if `node_modules/` is missing.
 4. Make sure you are running the command inside the demo folder, not the repository root.

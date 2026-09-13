@@ -87,9 +87,16 @@ while getting them wrong:
 that edits them collides with whichever one merges first. With a deep PR queue that means
 one merge can leave twenty branches conflicting on documentation alone.
 
-So: **don't edit `CHANGELOG.md` or `TODO.md` in a feature branch.** Put the entry in the
-squash-merge commit message, or add it to `main` in a follow-up commit once the PR lands.
-The conflicts this avoids are pure overhead — nobody ever disagreed about the code.
+So: **don't edit `CHANGELOG.md` or `TODO.md` in a feature branch.** Once the PR lands, add
+the entry to `main` in a follow-up commit. The conflicts this avoids are pure overhead —
+nobody ever disagreed about the code.
+
+⚠️ **The follow-up commit is mandatory, not optional.** A squash-merge message is good
+context and belongs in the history, but it is **not** a substitute: `release.yml` reads
+`CHANGELOG.md` and nothing else — there is no step that imports commit messages. An entry
+that exists only in a merge message is absent from the release body, which is the exact
+failure this whole section exists to prevent. If you skip the follow-up, the change ships
+undocumented.
 
 *(If the queue grows enough that even this chafes, the standard fix is changelog
 fragments — one `changelog.d/<pr>.md` per PR, concatenated at release. That needs a step
