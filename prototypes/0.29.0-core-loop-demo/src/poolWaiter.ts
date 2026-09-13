@@ -428,7 +428,7 @@ export class PoolWaiter {
       this.tube(shin, 0.045, 0.06, MECH, 0, -0.35, 0); // ankle joint
       this.box(shin, 0.15, 0.08, 0.27, PLATE, 0, -0.44, 0.05); // sneaker
       this.box(shin, 0.155, 0.03, 0.28, SOLE, 0, -0.49, 0.05); // sole
-      this.box(shin, 0.16, 0.012, 0.2, GLOW, 0, -0.478, 0.06); // sole light
+      this.box(shin, 0.16, 0.012, 0.012, GLOW, 0, -0.478, 0.197); // toe light
       this.group.add(leg);
       if (side < 0) {
         this.legL = leg;
