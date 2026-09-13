@@ -508,7 +508,7 @@ export class PoolWaiter {
       cup.rotation.z = Math.PI / 2;
     }
     this.box(this.body, 0.022, 0.05, 0.03, SKIN, 0, 1.905, 0.15); // nose
-    this.box(this.body, 0.35, 0.03, 0.07, PLATE, 0, 2.07, 0.0); // headband
+    this.box(this.body, 0.35, 0.03, 0.03, PLATE, 0, 2.07, 0.12); // headband
     this.box(this.body, 0.07, 0.024, 0.02, LIPS, 0, 1.86, 0.145); // lips
 
     // Tray held out front, with four cocktails.
