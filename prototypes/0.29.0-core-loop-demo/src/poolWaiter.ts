@@ -402,7 +402,8 @@ export class PoolWaiter {
     const MECH = this.mat(0x22262b, 0.55, 0.35); // dark joint mechanics
     const RED = this.mat(0xe0243a, 0.45, 0.1); // red bikini
     const GLOW = this.mat(0x35e6ff, 0.4, 0.1, 0x35e6ff, 1.6); // cyan light strips
-    const HAIR = this.mat(0x2b2126, 0.7, 0.1); // long dark hair
+    const HAIR = this.mat(0x8a5a33, 0.6, 0.1); // long medium-brown hair
+    const BROW = this.mat(0x5a381e, 0.7, 0.05); // brows a shade darker than the hair
     const EYE = this.mat(0xffffff, 0.3, 0.0);
     const IRIS = this.mat(0x3d8fe0, 0.3, 0.1, 0x1e5fb0, 0.35); // blue eyes
     const LIPS = this.mat(0xd9535e, 0.5, 0.05);
@@ -502,7 +503,7 @@ export class PoolWaiter {
       this.box(this.body, 0.055, 0.3, 0.1, HAIR, side * 0.165, 1.8, -0.02); // front strands
       this.ball(this.body, 0.024, EYE, side * 0.058, 1.95, 0.128); // eye
       this.ball(this.body, 0.014, IRIS, side * 0.058, 1.95, 0.147); // iris
-      this.box(this.body, 0.06, 0.012, 0.02, HAIR, side * 0.058, 1.995, 0.14); // brow
+      this.box(this.body, 0.06, 0.012, 0.02, BROW, side * 0.058, 1.995, 0.14); // brow
       const cup = this.tube(this.body, 0.07, 0.05, PLATE, side * 0.165, 1.94, 0.01); // ear cup
       cup.rotation.z = Math.PI / 2;
     }
