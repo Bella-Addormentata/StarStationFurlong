@@ -34,12 +34,18 @@ earlier explorations (superseded by the studies in [brainstorming/](brainstormin
 The current playable prototype is the Phase 1 core loop demo.
 
 ```bash
-cd prototypes/0.26.0-core-loop-demo
+cd prototypes/0.29.0-core-loop-demo
 npm install
 npm run dev
 ```
 
-Full setup instructions: [prototypes/0.26.0-core-loop-demo/README.md](prototypes/0.26.0-core-loop-demo/README.md)
+Full setup instructions: [prototypes/0.29.0-core-loop-demo/README.md](prototypes/0.29.0-core-loop-demo/README.md)
+
+> **Which folder is current?** The one named by `RELEASE_FRONTEND` in
+> [release.yml](.github/workflows/release.yml) — that is the demo a tagged release
+> actually ships as the app. The folder's version prefix is the release line it was
+> *started* on, not the current version: `0.29.0-core-loop-demo` is what v0.35.0
+> ships. Earlier `0.2x` folders are frozen and kept for reference.
 
 ---
 
@@ -54,3 +60,44 @@ The project is structured according to game development industry standards to ma
 * **`brainstorming/`**: Unstructured ideation, AI notes, and raw concepts before they are formalized into the GDD or TDD.
 * **`src/`**: Source code for the actual game client and server (to be populated).
 * **`prototypes/`**: Quick throwaway code, proof-of-concepts, and playable demos to test game mechanics and technical feasibility.
+
+---
+
+## Cutting a release
+
+A `vX.Y.Z` tag triggers [release.yml](.github/workflows/release.yml), which builds the
+Tauri app from `RELEASE_FRONTEND` and uploads the `ssf-p2p-node` binaries. Two things
+have to be true **before** the tag is pushed, because the workflow will happily succeed
+while getting them wrong:
+
+1. **`## Unreleased` must already be renamed to `## vX.Y.Z — <date>`.** The release body
+   is extracted with `awk '/^## v/{n++; next} n==1{print}'` — the first `## v...`
+   section, deliberately skipping `Unreleased`. Tag without doing this and the release
+   ships the *previous* version's notes. Leave genuinely unshipped work under a fresh
+   `## Unreleased` above it.
+2. **The version is bumped in all NINE places.** `grep` for the old version finds seven
+   and misses both `Cargo.lock` crate entries.
+   [`src/version.ts`](prototypes/0.29.0-core-loop-demo/src/version.ts) carries the
+   authoritative list and is itself the ninth — follow the note there, not a blind
+   search-and-replace.
+
+### CHANGELOG and TODO entries: add them at merge time
+
+`CHANGELOG.md` and `TODO.md` are both prepend-at-the-top files, so **every** open branch
+that edits them collides with whichever one merges first. With a deep PR queue that means
+one merge can leave twenty branches conflicting on documentation alone.
+
+So: **don't edit `CHANGELOG.md` or `TODO.md` in a feature branch.** Once the PR lands, add
+the entry to `main` in a follow-up commit. The conflicts this avoids are pure overhead —
+nobody ever disagreed about the code.
+
+⚠️ **The follow-up commit is mandatory, not optional.** A squash-merge message is good
+context and belongs in the history, but it is **not** a substitute: `release.yml` reads
+`CHANGELOG.md` and nothing else — there is no step that imports commit messages. An entry
+that exists only in a merge message is absent from the release body, which is the exact
+failure this whole section exists to prevent. If you skip the follow-up, the change ships
+undocumented.
+
+*(If the queue grows enough that even this chafes, the standard fix is changelog
+fragments — one `changelog.d/<pr>.md` per PR, concatenated at release. That needs a step
+added to the release workflow, so it is a deliberate change rather than a convention.)*
