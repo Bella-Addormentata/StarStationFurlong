@@ -81,6 +81,24 @@ while getting them wrong:
    authoritative list and is itself the ninth — follow the note there, not a blind
    search-and-replace.
 
+Pushing the tag is the usual trigger, not the only one. When `refs/tags` pushes are
+refused from where you are (the environment that prepared v0.35.0 could push branches
+but 403'd on tags), start the same workflow by hand — **Actions → 🚀 Publish Sovereign
+Releases → Run workflow**, or
+
+```bash
+gh workflow run release.yml -f tag=vX.Y.Z -f target=<commit sha>
+```
+
+`target` is the commit to tag. Name it explicitly whenever `main` has moved past the
+commit you smoke-tested; blank means the head of the ref you dispatched from. The
+workflow creates the annotated tag itself and then runs the ordinary pipeline. A tag
+that already exists is reused exactly as it stands — never moved — which also makes
+this the way to re-run a release whose earlier run failed. Dispatch from `main` (the
+trigger lives there); the built tree still comes from the tag's commit. The two
+conditions above are properties of that commit, and the manual path checks nothing the
+tag push does not.
+
 ### CHANGELOG and TODO entries: add them at merge time
 
 `CHANGELOG.md` and `TODO.md` are both prepend-at-the-top files, so **every** open branch
