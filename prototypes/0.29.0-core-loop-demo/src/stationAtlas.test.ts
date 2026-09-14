@@ -42,6 +42,20 @@ function shared(roomId: string, updatedAt: number) {
   };
 }
 
+describe('door-set bound at ingest', () => {
+  it('keeps at most 64 doors of a peer entry — the cap doorsDoc reads a room back with', () => {
+    const doors: Record<string, { targetRoomId: string; targetSeed: string }> = {};
+    for (let i = 0; i < 300; i++) doors[`d:${i}`] = { targetRoomId: `nbr-${i}`, targetSeed: '' };
+    doc.getMap('atlas').set('module-fat', {
+      roomId: 'module-fat', name: 'FAT', doors, updatedAt: Date.now() - 60_000,
+    });
+    bind();
+    const entry = readAtlas()['module-fat'];
+    expect(entry).toBeDefined();
+    expect(Object.keys(entry.doors).length).toBe(64);
+  });
+});
+
 describe('gossip stamp bounds (#144)', () => {
   it('refuses an entry stamped far beyond our clock', () => {
     doc.getMap('atlas').set('module-evil', shared('module-evil', 8.64e15));

@@ -112,7 +112,10 @@ describe('candidateFarDoors — one vestibule per door', () => {
     const out = candidateFarDoors([{ id: 'west', wall: 'y-', lateral: 0, occupied: true }]);
     const westWall = out.find((d) => d.wall === 'x-');
     expect(westWall?.hypothetical).toBe(true);
-    expect(westWall?.id).toBe('west@centre');
+    // A shape doorsDoc.isAcceptableDoorKey admits, so the id survives the wire
+    // as the published farDoor instead of being stripped on the next read.
+    expect(westWall?.id).toBe('d:west-centre');
+    expect(westWall?.id.startsWith('d:')).toBe(true);
   });
 });
 

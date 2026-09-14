@@ -2257,7 +2257,24 @@ export class DoorDockingPortSystem {
       heading,
     };
     const atlas = readAtlas();
-    // 🚪 A module's candidate doors (doorMatch.candidateFarDoors). Its REAL
+    // 🚪 Every door some room's record already LANDS ON, indexed by the far
+    // room — ONE pass over the atlas per detection, not one per candidate
+    // module (review F1: the atlas is peer-writable and this runs on every
+    // chain edit). Entries are bounded at ingest — MAX_ENTRIES rooms of at most
+    // MAX_DOORS_PER_ENTRY doors — so this is a small, fixed cost.
+    const claimsByRoom = new Map<
+      string,
+      Array<{ id?: string; wall?: DoorWall; lateral?: number; from: string }>
+    >();
+    for (const [otherId, entry] of Object.entries(atlas)) {
+      for (const od of Object.values(entry?.doors ?? {})) {
+        if (!od?.targetRoomId) continue;
+        let list = claimsByRoom.get(od.targetRoomId);
+        if (!list) claimsByRoom.set(od.targetRoomId, (list = []));
+        list.push({ id: od.farDoor, wall: od.farWall, lateral: od.farLateral, from: otherId });
+      }
+    }
+    // A module's candidate doors (doorMatch.candidateFarDoors). Its REAL
     // gossiped doors, with a paired one KEPT and flagged occupied rather than
     // dropped — dropping it was the octagon bug: the wall-centre hypothetical
     // then re-offered the very wall the paired door sat on, and the closing
@@ -2275,19 +2292,16 @@ export class DoorDockingPortSystem {
         known.push({ id: did, wall: ad.wall, lateral: ad.lateral, occupied: !!ad.targetRoomId });
         if (ad.targetRoomId) claimedIds.add(did);
       }
-      for (const [otherId, entry] of Object.entries(atlas)) {
-        if (otherId === roomId) continue;
-        for (const [odid, od] of Object.entries(entry?.doors ?? {})) {
-          if (!od || od.targetRoomId !== roomId) continue;
-          if (od.farDoor) claimedIds.add(od.farDoor);
-          if (od.farWall) {
-            known.push({
-              id: od.farDoor ?? `${otherId}:${odid}`,
-              wall: od.farWall,
-              lateral: od.farLateral ?? 0,
-              occupied: true,
-            });
-          }
+      for (const claim of claimsByRoom.get(roomId) ?? []) {
+        if (claim.from === roomId) continue; // its own records are the loop above
+        if (claim.id) claimedIds.add(claim.id);
+        if (claim.wall) {
+          known.push({
+            id: claim.id ?? `${claim.from}->${roomId}`,
+            wall: claim.wall,
+            lateral: claim.lateral ?? 0,
+            occupied: true,
+          });
         }
       }
       const out = candidateFarDoors(known);

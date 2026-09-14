@@ -85,6 +85,12 @@ export interface AtlasEntry {
 
 const KEY = 'ssf-station-atlas';
 const MAX_ENTRIES = 64;
+/** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
+ *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
+ *  peer-written object that isSharedAtlasEntry does not size-check, and every
+ *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
+ *  scan), so without this one entry could carry an arbitrarily large set. */
+const MAX_DOORS_PER_ENTRY = 64;
 
 /** 🕒 How far ahead of OUR clock a peer's gossip stamp may sit before the whole
  *  shared entry is refused (#144). The comparison is against the reader's own
@@ -575,7 +581,12 @@ function pullSharedAtlas(): void {
       && prior.lastSeen >= value.updatedAt
       && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
     const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
     for (const [d, door] of Object.entries(value.doors)) {
+      // Bounded (MAX_DOORS_PER_ENTRY): a room cannot honestly have more
+      // pairings than doorsDoc reads back, so past the cap the rest is dropped,
+      // deterministically, in entry order.
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
       if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
       // 🧭 Wall/lateral drive GEOMETRY straight into the exterior renderer and
       // arrive from a peer — exact wall names and a finite lateral or they are
@@ -602,6 +613,7 @@ function pullSharedAtlas(): void {
           ? (door.lateral as number)
           : prior?.doors[d]?.lateral,
       };
+      kept++;
     }
     // ⚠️ This REBUILDS the entry rather than merging into it, so every field
     // must be named explicitly or it is destroyed. `dims` was not, which meant

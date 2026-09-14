@@ -138,9 +138,14 @@ export function candidateFarDoors(
     const crowded = out.some((d) => d.wall === wall && Math.abs(d.lateral) < minGap);
     if (crowded) continue;
     const id = WALL_LEGACY_ID[wall];
-    // A known door may already carry the compass id (a cardinal berth off its
-    // legacy wall); the hypothetical then needs a distinct key.
-    out.push({ id: seen.has(id) ? `${id}@centre` : id, wall, lateral: 0, hypothetical: true });
+    // A known door may already carry the compass id (a cardinal berth living
+    // off its legacy wall); the hypothetical then needs a distinct key — in a
+    // shape the pairing wire ACCEPTS. The pick's id is published as the
+    // record's farDoor, and doorsDoc.isAcceptableDoorKey admits only cardinal,
+    // axis and `d:` ids; anything else is silently stripped on the next read
+    // (review F2). The arrival never needs this id to EXIST: it prefers the
+    // record's wall, and a miss on the id falls through to that tier.
+    out.push({ id: seen.has(id) ? `d:${id}-centre` : id, wall, lateral: 0, hypothetical: true });
   }
   return out;
 }
