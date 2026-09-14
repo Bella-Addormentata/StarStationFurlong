@@ -33,12 +33,15 @@ on:
 # One release run at a time. The draft lifecycle is single-writer: create-release
 # sweeps stale drafts for the tag, so a second run for the same tag starting while
 # the first is still uploading would delete the live draft from under it, and two
-# runs could race to create duplicate drafts. Queue, never cancel — cancelling a
-# half-uploaded run is the worse failure. Releases are rare enough that a single
+# runs could race to create duplicate drafts. The running run is never cancelled
+# (cancel-in-progress keeps its default, false — a half-uploaded run is the worse
+# thing to lose), and further starts WAIT in FIFO order: `queue: max` holds up to
+# 100 pending runs, where the default `single` keeps one and silently cancels the
+# older pending run when another arrives. Releases are rare enough that a single
 # global lane costs nothing.
 concurrency:
   group: release
-  cancel-in-progress: false
+  queue: max
 
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
