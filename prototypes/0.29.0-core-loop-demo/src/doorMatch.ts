@@ -277,9 +277,22 @@ export function chooseArrivalDoor(doors: ArrivalDoor[], intent: ArrivalIntent): 
     const backs = doors.filter((d) => d.enabled && d.pairedTo === fromRoomId);
     if (backs.length === 1) return { id: backs[0].id, tier: 'back', conflict: false };
     if (backs.length > 1) {
-      const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
+      // Same two rooms docked more than once. Geometry first, the name last:
+      // the record's WALL (+ lateral) identifies the door even when its
+      // farDoor is the stale compass guess this module exists to distrust
+      // (review, round 2). Then the id — only where it agrees with a known
+      // wall — then the facing wall, then a stable first.
+      const want = intent.farLateral ?? 0;
+      const onFarWall = farWall
+        ? backs
+            .filter((b) => b.wall === farWall)
+            .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b))
+        : [];
+      const named = farDoor
+        ? backs.find((b) => b.id === farDoor && (!farWall || b.wall === farWall))
+        : undefined;
       const facing = facingWall ? backs.find((b) => b.wall === facingWall) : undefined;
-      return { id: (named ?? facing ?? backs[0]).id, tier: 'back', conflict: false };
+      return { id: (onFarWall[0] ?? named ?? facing ?? backs[0]).id, tier: 'back', conflict: false };
     }
   }
 

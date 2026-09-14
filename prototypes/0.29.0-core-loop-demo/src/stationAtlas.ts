@@ -150,6 +150,18 @@ export function readAtlas(): Record<string, AtlasEntry> {
     for (const e of Object.values(atlas)) {
       if (typeof e?.lastSeen === 'number' && e.lastSeen > ceiling) { e.lastSeen = 0; repaired = true; }
       if (typeof e?.localSeenAt === 'number' && e.localSeenAt > ceiling) { e.localSeenAt = 0; repaired = true; }
+      // 🚪 An oversized door set persisted by a build before the ingest cap
+      // (MAX_DOORS_PER_ENTRY) would otherwise stay oversized forever: the
+      // pull's `prior` guard can skip the entry, and writeAtlas caps rooms,
+      // not doors (review, round 2). Truncate in entry order and PERSIST, the
+      // same way as the stamp repair — every consumer walks this set.
+      if (e && typeof e.doors === 'object' && e.doors !== null) {
+        const ids = Object.keys(e.doors);
+        if (ids.length > MAX_DOORS_PER_ENTRY) {
+          for (const id of ids.slice(MAX_DOORS_PER_ENTRY)) delete e.doors[id];
+          repaired = true;
+        }
+      }
     }
     if (repaired) writeAtlas(atlas);
     return atlas;

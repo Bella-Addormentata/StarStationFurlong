@@ -153,6 +153,22 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     expect(pick).toMatchObject({ id: 'west', tier: 'back' });
   });
 
+  it('double-docked rooms: the tie breaks on the record\'s WALL before its (possibly stale) id', () => {
+    // Both back-pointing doors lead to room 8; the record says farDoor "west"
+    // (a compass guess) but farWall x- — and this room's "west" sits on y-.
+    const doors = [door('west', 'y-', 'room-8'), door('d:x', 'x-', 'room-8')];
+    const pick = chooseArrivalDoor(doors, {
+      departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-8',
+      farDoor: 'west', farWall: 'x-', farLateral: 0,
+    });
+    expect(pick).toMatchObject({ id: 'd:x', tier: 'back' });
+    // With no wall on the record the id still breaks the tie, as before.
+    const byId = chooseArrivalDoor(doors, {
+      departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-8', farDoor: 'west',
+    });
+    expect(byId?.id).toBe('west');
+  });
+
   it('a door paired to the room we came from is free for us', () => {
     const doors = [door('west', 'x-', 'room-8')];
     const pick = chooseArrivalDoor(doors, { departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-8' });

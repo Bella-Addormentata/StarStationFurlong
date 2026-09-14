@@ -54,6 +54,20 @@ describe('door-set bound at ingest', () => {
     expect(entry).toBeDefined();
     expect(Object.keys(entry.doors).length).toBe(64);
   });
+
+  it('repairs — and PERSISTS — an oversized door set persisted by an older build', () => {
+    // Seeded straight into localStorage: the ingest guard never sees it, and
+    // the pull's `prior` guard can skip the entry, so the read is the seam.
+    const doors: Record<string, { targetRoomId: string; targetSeed: string }> = {};
+    for (let i = 0; i < 300; i++) doors[`d:${i}`] = { targetRoomId: `nbr-${i}`, targetSeed: '' };
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-old': { roomId: 'module-old', name: 'OLD', doors, lastSeen: 1 },
+    }));
+    expect(Object.keys(readAtlas()['module-old'].doors).length).toBe(64);
+    // Read the raw store, not the return value — this is the persistence claim.
+    const raw = JSON.parse(store.get('ssf-station-atlas')!) as Record<string, { doors: object }>;
+    expect(Object.keys(raw['module-old'].doors).length).toBe(64);
+  });
 });
 
 describe('gossip stamp bounds (#144)', () => {

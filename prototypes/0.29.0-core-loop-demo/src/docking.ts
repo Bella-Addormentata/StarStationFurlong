@@ -2294,14 +2294,21 @@ export class DoorDockingPortSystem {
       }
       for (const claim of claimsByRoom.get(roomId) ?? []) {
         if (claim.from === roomId) continue; // its own records are the loop above
-        if (claim.id) claimedIds.add(claim.id);
         if (claim.wall) {
+          // A claim WITH geometry blocks by geometry, under a key of its own —
+          // never its farDoor id, which may be a stale compass guess that the
+          // target room hangs on another wall. Keyed by id it was deduplicated
+          // away against the room's real door of that name, and the wall it
+          // actually lands on came back as a free hypothetical (review, round 2).
           known.push({
-            id: claim.id ?? `${claim.from}->${roomId}`,
+            id: `claim:${claim.from}:${claim.wall}:${claim.lateral ?? 0}`,
             wall: claim.wall,
             lateral: claim.lateral ?? 0,
             occupied: true,
           });
+        } else if (claim.id) {
+          // No geometry — the id is all it knows, so it blocks by id.
+          claimedIds.add(claim.id);
         }
       }
       const out = candidateFarDoors(known);
@@ -2985,20 +2992,28 @@ export class DoorDockingPortSystem {
   ): string | null {
     const atlas = readAtlas();
     const farDoors = atlas[farRoomId]?.doors ?? {};
+    // Geometry decides whenever the wall is known; the id decides only when
+    // it is all we have. A farDoor id may be a wall-centre hypothetical's
+    // compass guess that the far room hangs on another wall — trusting it
+    // first would refuse a free wall because a DIFFERENT door carries the
+    // name, or clear a taken one (review, round 2).
     const nearOnWall = (wall?: DoorWall, lateral?: number) =>
-      !!farWall &&
-      wall === farWall &&
-      Math.abs((lateral ?? 0) - (farLateral ?? 0)) < MIN_DOOR_GAP;
-    if (farDoor && farDoors[farDoor]?.targetRoomId) return farDoors[farDoor].targetRoomId;
-    for (const d of Object.values(farDoors)) {
-      if (d?.targetRoomId && nearOnWall(d.wall, d.lateral)) return d.targetRoomId;
+      wall === farWall && Math.abs((lateral ?? 0) - (farLateral ?? 0)) < MIN_DOOR_GAP;
+    if (farWall) {
+      for (const d of Object.values(farDoors)) {
+        if (d?.targetRoomId && nearOnWall(d.wall, d.lateral)) return d.targetRoomId;
+      }
+    } else if (farDoor && farDoors[farDoor]?.targetRoomId) {
+      return farDoors[farDoor].targetRoomId;
     }
     for (const [otherId, entry] of Object.entries(atlas)) {
       if (otherId === farRoomId) continue;
       for (const od of Object.values(entry?.doors ?? {})) {
         if (!od || od.targetRoomId !== farRoomId) continue;
-        if ((farDoor && od.farDoor === farDoor) || nearOnWall(od.farWall, od.farLateral))
-          return otherId;
+        const taken = farWall
+          ? nearOnWall(od.farWall, od.farLateral)
+          : !!farDoor && od.farDoor === farDoor;
+        if (taken) return otherId;
       }
     }
     return null;
