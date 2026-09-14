@@ -183,6 +183,57 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     expect(noFree).toMatchObject({ id: 'west', tier: 'back' });
   });
 
+  it('same wall, different lateral: the back door 6 m along is another link, not this one', () => {
+    // A↔B already uses x- at −3; a second A→B link aims at x- +3 (free).
+    const doors = [door('d:m', 'x-', 'room-a', -3), door('d:n', 'x-', null, 3)];
+    const second = chooseArrivalDoor(doors, {
+      departureDoorId: 'd:a2', departureWall: 'x+', fromRoomId: 'room-a', farWall: 'x-', farLateral: 3,
+    });
+    expect(second).toMatchObject({ id: 'd:n', tier: 'far-wall' });
+    const first = chooseArrivalDoor(doors, {
+      departureDoorId: 'd:a1', departureWall: 'x+', fromRoomId: 'room-a', farWall: 'x-', farLateral: -3,
+    });
+    expect(first).toMatchObject({ id: 'd:m', tier: 'back' });
+  });
+
+  it('a back record whose COUNTERPART geometry is not our departure door is another link', () => {
+    // B's x-/−3 record points back at A, and says A's side is on y+ — but we
+    // left A through x+ (captured exactly). Our record's wall and lateral
+    // alone would not tell the two apart (both x-, 0 m apart).
+    const back: ArrivalDoor = { ...door('d:m', 'x-', 'room-a', -3), pairedFarWall: 'y+' };
+    const doors = [back, door('d:n', 'x-', null, -3)];
+    const pick = chooseArrivalDoor(doors, {
+      departureDoorId: 'd:a2', departureWall: 'x+', departureLateral: 0, fromRoomId: 'room-a',
+      farWall: 'x-', farLateral: -3,
+    });
+    expect(pick).toMatchObject({ id: 'd:n', tier: 'far-wall' });
+    // Counterpart on our wall but 6 m along it: also another door of ours.
+    const far: ArrivalDoor = { ...back, pairedFarWall: 'x+', pairedFarLateral: 6 };
+    expect(chooseArrivalDoor([far, doors[1]], {
+      departureDoorId: 'd:a2', departureWall: 'x+', departureLateral: 0, fromRoomId: 'room-a',
+      farWall: 'x-', farLateral: -3,
+    })?.id).toBe('d:n');
+    // Counterpart matching our departure door: it is this link.
+    const same: ArrivalDoor = { ...back, pairedFarWall: 'x+', pairedFarLateral: 0 };
+    expect(chooseArrivalDoor([same, doors[1]], {
+      departureDoorId: 'd:a2', departureWall: 'x+', departureLateral: 0, fromRoomId: 'room-a',
+      farWall: 'x-', farLateral: -3,
+    })).toMatchObject({ id: 'd:m', tier: 'back' });
+  });
+
+  it('counterpart ids tell links apart only when both are minted d: names', () => {
+    const byOther: ArrivalDoor = { ...door('d:m', 'x-', 'room-a'), pairedFarDoor: 'd:other' };
+    const open = door('d:n', 'x-', null, 4);
+    expect(chooseArrivalDoor([byOther, open], {
+      departureDoorId: 'd:mine', departureWall: 'x+', fromRoomId: 'room-a', farWall: 'x-',
+    })).toMatchObject({ id: 'd:n', tier: 'far-wall' });
+    // A compass name may be a hypothetical's guess: no evidence against.
+    const byCompass: ArrivalDoor = { ...door('d:m', 'x-', 'room-a'), pairedFarDoor: 'west' };
+    expect(chooseArrivalDoor([byCompass, open], {
+      departureDoorId: 'd:mine', departureWall: 'x+', fromRoomId: 'room-a', farWall: 'x-',
+    })).toMatchObject({ id: 'd:m', tier: 'back' });
+  });
+
   it('two back records and a THIRD link arriving: a free door on the record\'s wall, not an occupied back door', () => {
     const doors = [door('west', 'x-', 'room-a'), door('east', 'x+', 'room-a'), door('d:three', 'y+', null)];
     const third = chooseArrivalDoor(doors, {

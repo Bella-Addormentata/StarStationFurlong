@@ -2315,6 +2315,7 @@ async function transitTo(
         depWall,
         depFarWall,
         depFarLateral,
+        depLateral,
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
@@ -2334,6 +2335,7 @@ async function transitTo(
     depWall,
     depFarWall,
     depFarLateral,
+    depLateral,
   )?.id;
   if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
@@ -2396,7 +2398,21 @@ async function transitTo(
       (arrivalWall !== undefined && depFarWall !== arrivalWall) ||
       (arrivalLateral !== undefined &&
         Math.abs((depFarLateral ?? 0) - arrivalLateral) > 1e-6);
-    if (mismatch) {
+    // Never note a repair onto a door that belongs to ANOTHER connection: when
+    // every door here was paired elsewhere the chooser's last resort is such a
+    // door (it warns), the mirror rightly refuses it, and a repair pointing the
+    // departure record at it would manufacture the very duplicate this change
+    // exists to prevent (review, round 7).
+    const arrivalRec = readAllDoors().get(arrivalDoorId);
+    const arrivalIsAnothers =
+      !!arrivalRec?.paired &&
+      !!arrivalRec.connectedRoomAddress &&
+      roomIdFromSeed(arrivalRec.connectedRoomAddress) !== depRoomId;
+    if (mismatch && arrivalIsAnothers) {
+      console.warn(
+        `🩹 No far-door correction noted for ${departureDoorId}: arrived through ${arrivalDoorId}, which is paired to another room.`,
+      );
+    } else if (mismatch) {
       const key = `${depRoomId}:${departureDoorId}`;
       pendingFarDoorFixes.delete(key); // re-insert as the newest
       if (pendingFarDoorFixes.size >= MAX_PENDING_FAR_DOOR_FIXES) {

@@ -4478,27 +4478,32 @@ export class World {
     // name it guessed; these are the geometry it knew.
     farWall?: DoorWall,
     farLateral?: number,
+    // 🧭 …and the departure door's own lateral, so a back record's counterpart
+    // description can be matched against the door we actually left through.
+    departureLateral?: number,
   ): DoorTarget | null {
     const depWall = departureWall ?? this.wallOfDoor(departureDoorId);
     const records = readAllDoors();
     const doors: ArrivalDoor[] = DOORS.map((d) => {
       const pose = physicalDoorPoseOrNull(d.id);
       const rec = records.get(d.id);
+      const paired = rec?.paired && rec.connectedRoomAddress ? rec : null;
       return {
         id: d.id,
         wall: pose?.wall ?? this.wallOfDoor(d.id),
         lateral: pose ? (pose.tangent === "x" ? pose.x : pose.z) : 0,
         enabled: d.enabled,
         cardinal: isCardinalDoorId(d.id),
-        pairedTo:
-          rec?.paired && rec.connectedRoomAddress
-            ? roomIdFromSeed(rec.connectedRoomAddress)
-            : null,
+        pairedTo: paired ? roomIdFromSeed(paired.connectedRoomAddress) : null,
+        pairedFarDoor: paired?.farDoor,
+        pairedFarWall: paired?.farWall,
+        pairedFarLateral: paired?.farLateral,
       };
     });
     const pick = chooseArrivalDoor(doors, {
       departureDoorId,
       departureWall: depWall,
+      departureLateral,
       fromRoomId,
       farDoor,
       farWall,
@@ -4526,6 +4531,7 @@ export class World {
     departureWall?: DoorWall,
     farWall?: DoorWall,
     farLateral?: number,
+    departureLateral?: number,
   ): void {
     this.endTransitVestibule();
     // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
@@ -4544,6 +4550,7 @@ export class World {
       departureWall,
       farWall,
       farLateral,
+      departureLateral,
     );
     if (!arrival) {
       // Doorless arrival room: nothing to walk in through. Unreachable while

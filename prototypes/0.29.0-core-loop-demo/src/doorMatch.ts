@@ -62,15 +62,26 @@ const WALL_LEGACY_ID: Record<DoorWall, string> = (() => {
   return out;
 })();
 
-/** Uniform module half-extent used for door faces (a 2×2-tile room: walls at
- *  ±6). Matches the exterior's uniform shells; per-module dims are a later
- *  refinement, as before. */
+/** Default module half-extent (a 2×2-tile room: walls at ±6) — used when a
+ *  module's true size is not known. */
 export const MODULE_FACE_HALF = 6;
+
+/** A module's half-extents from its gossiped tile dims — TILE_SIZE / 2 per
+ *  tile, the same mapping exteriorView renders neighbours with (cols → x,
+ *  rows → z; unknown ⇒ the default 2×2). A 5×5 module's faces are at ±15, and
+ *  a matcher that assumed ±6 could neither reach nor aim at them (review,
+ *  round 7). */
+export function moduleHalves(dims?: { cols: number; rows: number }): { halfX: number; halfZ: number } {
+  return { halfX: (dims?.cols ?? 2) * 3, halfZ: (dims?.rows ?? 2) * 3 };
+}
 
 export interface ModulePose {
   x: number;
   z: number;
   rotY: number;
+  /** Half-extents along the module's own x / z; absent ⇒ MODULE_FACE_HALF. */
+  halfX?: number;
+  halfZ?: number;
 }
 
 /** A door of the far module as the matcher sees it. `occupied` = a vestibule
@@ -99,13 +110,14 @@ export function doorFaceWorld(
   mod: ModulePose,
   wall: DoorWall,
   lateral: number,
-  half = MODULE_FACE_HALF,
 ): { x: number; z: number; outwardYaw: number } {
+  const hx = mod.halfX ?? MODULE_FACE_HALF;
+  const hz = mod.halfZ ?? MODULE_FACE_HALF;
   const local =
-    wall === 'y-' ? { x: lateral, z: -half }
-    : wall === 'y+' ? { x: lateral, z: half }
-    : wall === 'x+' ? { x: half, z: lateral }
-    : { x: -half, z: lateral };
+    wall === 'y-' ? { x: lateral, z: -hz }
+    : wall === 'y+' ? { x: lateral, z: hz }
+    : wall === 'x+' ? { x: hx, z: lateral }
+    : { x: -hx, z: lateral };
   const c = Math.cos(mod.rotY), s = Math.sin(mod.rotY);
   return {
     x: mod.x + local.x * c + local.z * s,
@@ -173,9 +185,8 @@ export function pickFacingDoor(
   mod: ModulePose,
   candidates: FarDoorCandidate[],
   arrival: ChainArrival,
-  opts?: { moduleHalf?: number; maxPosErr?: number; maxAngErr?: number },
+  opts?: { maxPosErr?: number; maxAngErr?: number },
 ): FacingDoorPick | null {
-  const half = opts?.moduleHalf ?? MODULE_FACE_HALF;
   const maxPos = opts?.maxPosErr ?? 4.5; // the module match radius
   const maxAng = opts?.maxAngErr ?? Math.PI / 3;
   // Metres per radian for the tie-break: a full maxAng costs ~2 m.
@@ -185,7 +196,7 @@ export function pickFacingDoor(
   let bestScore = Infinity;
   let blocked: { door: FarDoorCandidate; score: number } | null = null;
   for (const d of candidates) {
-    const face = doorFaceWorld(mod, d.wall, d.lateral, half);
+    const face = doorFaceWorld(mod, d.wall, d.lateral);
     const posErr = Math.hypot(face.x - arrival.x, face.z - arrival.z);
     const angErr = angDiff(face.outwardYaw, into);
     if (posErr > maxPos || angErr > maxAng) continue;
@@ -214,12 +225,20 @@ export interface ArrivalDoor {
   enabled: boolean;
   cardinal: boolean;
   pairedTo: string | null;
+  /** The pairing record's description of ITS far door — for a back record,
+   *  that is a door of the room the traveler just left, which is how one
+   *  back record is told apart from another link to the same room. */
+  pairedFarDoor?: string;
+  pairedFarWall?: DoorWall;
+  pairedFarLateral?: number;
 }
 
 export interface ArrivalIntent {
   departureDoorId: string;
   /** The wall the traveler departed through (captured before the swap). */
   departureWall?: DoorWall;
+  /** …and where along it — the departure door's own lateral. */
+  departureLateral?: number;
   /** The room we came from — the arrival room's own back-pointing record. */
   fromRoomId?: string;
   /** The departure record's far-side description of THIS room's door. */
@@ -275,51 +294,66 @@ export function chooseArrivalDoor(doors: ArrivalDoor[], intent: ArrivalIntent): 
 
   if (fromRoomId) {
     const backs = doors.filter((d) => d.enabled && d.pairedTo === fromRoomId);
-    if (backs.length === 1) {
-      // One record points back — but is it THIS connection's? Two rooms may
-      // be linked twice with the second link's mirror not yet written; the
-      // lone back door then belongs to the OTHER link. The record's WALL is
-      // written by parties that knew (the matcher, the mirror, provision, the
-      // far room's own harvested pose), so a wall that disagrees with the back
-      // door means this is not its connection: take a free door on that wall
-      // instead when one exists (review, round 3). The id is not consulted —
-      // that is the stale compass guess this module distrusts.
-      const back = backs[0];
-      if (farWall && back.wall !== farWall) {
-        const want = intent.farLateral ?? 0;
-        const onWall = doors
-          .filter((d) => free(d) && d.wall === farWall)
-          .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b));
-        if (onWall.length > 0) return { id: onWall[0].id, tier: 'far-wall', conflict: false };
-      }
-      return { id: back.id, tier: 'back', conflict: false };
-    }
-    if (backs.length > 1) {
-      // Same two rooms docked more than once. Geometry first, the name last:
-      // the record's WALL (+ lateral) identifies the door even when its
-      // farDoor is the stale compass guess this module exists to distrust
-      // (review, round 2). Then the id — only where it agrees with a known
-      // wall — then the facing wall, then a stable first.
-      const want = intent.farLateral ?? 0;
-      const onFarWall = farWall
-        ? backs
-            .filter((b) => b.wall === farWall)
-            .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b))
-        : [];
-      if (onFarWall[0]) return { id: onFarWall[0].id, tier: 'back', conflict: false };
-      // No back door on the record's wall: as in the single-back case, this
-      // may be a FURTHER link between the same rooms whose mirror is not yet
-      // written — a free door on that wall is its door, not another link's
-      // (review, round 6).
-      if (farWall) {
-        const freeOnWall = doors
-          .filter((d) => free(d) && d.wall === farWall)
-          .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b));
-        if (freeOnWall.length > 0) return { id: freeOnWall[0].id, tier: 'far-wall', conflict: false };
-      }
+    // A back record identifies the ORIGIN ROOM, not this particular link: two
+    // rooms may be linked more than once, and a further link's mirror is not
+    // written until its first walk-through. Each back record is therefore
+    // tested for being THIS link before it is trusted (review, rounds 3, 6, 7):
+    //   · its counterpart geometry — the record's own farWall / farLateral
+    //     describe OUR departure door, which was captured exactly before the
+    //     swap; a different wall, or the same wall MIN_DOOR_GAP or more away,
+    //     is a different door of ours;
+    //   · its counterpart id, only when BOTH ids are minted `d:` names — a
+    //     compass name may be a hypothetical's guess for either door;
+    //   · our own record's description of the far door — its wall, then its
+    //     lateral (two doors on one wall are MIN_DOOR_GAP apart or more).
+    // A legacy record carrying none of that offers no evidence against, and
+    // is trusted exactly as before.
+    const isThisLink = (b: ArrivalDoor): boolean => {
+      if (b.pairedFarWall && departureWall && b.pairedFarWall !== departureWall) return false;
+      if (
+        b.pairedFarWall && departureWall && b.pairedFarWall === departureWall
+        && b.pairedFarLateral !== undefined && intent.departureLateral !== undefined
+        && Math.abs(b.pairedFarLateral - intent.departureLateral) >= MIN_DOOR_GAP
+      ) return false;
+      if (
+        b.pairedFarDoor && b.pairedFarDoor.startsWith('d:')
+        && intent.departureDoorId.startsWith('d:') && b.pairedFarDoor !== intent.departureDoorId
+      ) return false;
+      if (farWall && b.wall !== farWall) return false;
+      if (farWall && intent.farLateral !== undefined
+        && Math.abs(b.lateral - intent.farLateral) >= MIN_DOOR_GAP) return false;
+      return true;
+    };
+    const want = intent.farLateral ?? 0;
+    const byLateral = (a: ArrivalDoor, b: ArrivalDoor): number =>
+      Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b);
+    // Truly unpaired — a further link's door cannot be another link's back door.
+    const unpaired = (d: ArrivalDoor): boolean => d.enabled && d.pairedTo === null;
+
+    const mine = backs.filter(isThisLink);
+    if (mine.length === 1) return { id: mine[0].id, tier: 'back', conflict: false };
+    if (mine.length > 1) {
+      // Several back records could each be this link (legacy records without
+      // geometry): nearest to the record's lateral on its wall, then the id
+      // where its wall agrees, then the facing wall, then a stable first —
+      // never map order.
+      const onFarWall = farWall ? mine.filter((b) => b.wall === farWall).sort(byLateral) : [];
       const named = farDoor
-        ? backs.find((b) => b.id === farDoor && (!farWall || b.wall === farWall))
+        ? mine.find((b) => b.id === farDoor && (!farWall || b.wall === farWall))
         : undefined;
+      const facing = facingWall ? mine.find((b) => b.wall === facingWall) : undefined;
+      return { id: (onFarWall[0] ?? named ?? facing ?? mine[0]).id, tier: 'back', conflict: false };
+    }
+    if (backs.length > 0) {
+      // Back records exist but none is this link — a further link between the
+      // same rooms, mirror not yet written. Its door is an UNPAIRED one on the
+      // wall our record names; failing that, a back record still answers (the
+      // pre-existing behaviour, and never a door paired to a third room).
+      if (farWall) {
+        const openOnWall = doors.filter((d) => unpaired(d) && d.wall === farWall).sort(byLateral);
+        if (openOnWall.length > 0) return { id: openOnWall[0].id, tier: 'far-wall', conflict: false };
+      }
+      const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
       const facing = facingWall ? backs.find((b) => b.wall === facingWall) : undefined;
       return { id: (named ?? facing ?? backs[0]).id, tier: 'back', conflict: false };
     }

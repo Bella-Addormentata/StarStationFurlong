@@ -19,7 +19,7 @@ import {
   MIN_DOOR_GAP,
 } from "./doorLayout";
 // 🚪🧲 Which door of a KNOWN module a chain connects to — pure, tested.
-import { candidateFarDoors, pickFacingDoor, WALL_YAW, MODULE_FACE_HALF } from "./doorMatch";
+import { candidateFarDoors, pickFacingDoor, moduleHalves, WALL_YAW } from "./doorMatch";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import {
@@ -1330,6 +1330,10 @@ export class DoorDockingPortSystem {
                     activeDoorId,
                     state.segments,
                     this.farWallFor(state),
+                    // The lateral shifts the projected module sideways; the
+                    // final projection uses it, so the gate must too (review,
+                    // round 7).
+                    state.farLateral ?? 0,
                   ),
                 )
               : null;
@@ -2024,7 +2028,11 @@ export class DoorDockingPortSystem {
       const currentId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
       if (!currentId) return null;
-      const wouldBe = projectionPoseForDoor(doorId, segs, this.farWallFor(state));
+      // Same pose the final projection uses — far wall AND lateral — or the
+      // warning validates a module metres from where it will be drawn.
+      const wouldBe = projectionPoseForDoor(
+        doorId, segs, this.farWallFor(state), state.farLateral ?? 0,
+      );
       const hit = moduleOverlapAt(currentId, wouldBe);
       return hit ? hit.name : null;
     })();
@@ -2358,11 +2366,15 @@ export class DoorDockingPortSystem {
     // rejected a module whose matching door sits 5 m along its wall — and
     // ranked by centre distance, which can prefer a worse face (review,
     // round 6). Modules are ranked by the face error the matcher returns.
-    const REACH = MODULE_FACE_HALF * Math.SQRT2 + 1.5;
     const ANG_W = 2 / (Math.PI / 3); // pickFacingDoor's own tie-break weight
-    for (const mod of layout) {
+    for (const layoutMod of layout) {
+      // 🛑📐 The module's TRUE half-extents when the atlas learned them, else
+      // the default 2×2 — the same rule the exterior renders with. Reach and
+      // face positions both scale with it (review, round 7).
+      const mod = { ...layoutMod, ...moduleHalves(layoutMod.dims) };
+      const reach = Math.hypot(mod.halfX, mod.halfZ) + 1.5;
       const dist = Math.hypot(mod.x - arrival.x, mod.z - arrival.z);
-      if (dist > REACH) continue;
+      if (dist > reach) continue;
       const cands = candidateDoors(mod.roomId);
       // Position first, angle as the fence and tie-break; never an occupied
       // door (doorMatch.pickFacingDoor).
@@ -2409,14 +2421,15 @@ export class DoorDockingPortSystem {
     // slides). Target = the matched door's face, in this door's chain frame.
     const mod = layout.find((m) => m.roomId === best!.roomId)!;
     // The matched door's face in ITS module's local frame: on its wall, at its
-    // lateral. (Uniform module half — per-module dims are a later refinement,
-    // matching the exterior's uniform shells.)
+    // lateral, at the module's TRUE half-extent (the matcher aimed there; the
+    // solve must target the same face).
     const pick = best.door;
+    const mh = moduleHalves(mod.dims);
     const doorFaceLocal =
-      pick.wall === "y-" ? { x: pick.lateral, z: -6 }
-      : pick.wall === "y+" ? { x: pick.lateral, z: 6 }
-      : pick.wall === "x+" ? { x: 6, z: pick.lateral }
-      : { x: -6, z: pick.lateral };
+      pick.wall === "y-" ? { x: pick.lateral, z: -mh.halfZ }
+      : pick.wall === "y+" ? { x: pick.lateral, z: mh.halfZ }
+      : pick.wall === "x+" ? { x: mh.halfX, z: pick.lateral }
+      : { x: -mh.halfX, z: pick.lateral };
     const mc = Math.cos(mod.rotY),
       ms = Math.sin(mod.rotY);
     const faceWorld = {
