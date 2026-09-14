@@ -86,7 +86,7 @@ jobs:
       # reason rather than at createRelease: releases in this repo are immutable.
       - name: 🏷️ Resolve release tag and commit
         id: tag
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_TARGET: ${{ inputs.target }}
@@ -159,7 +159,7 @@ jobs:
             core.setOutput('create', String(create));
 
       - name: 📥 Checkout repository (the release commit)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ steps.tag.outputs.sha }}
 
@@ -227,7 +227,7 @@ jobs:
       # so there is no second run. A tag push already has its tag: skipped.
       - name: 🏷️ Create the tag (manual dispatch of a new tag only)
         if: steps.tag.outputs.create == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           RELEASE_SHA: ${{ steps.tag.outputs.sha }}
@@ -257,7 +257,7 @@ jobs:
 
       - name: 🎫 Create shared draft release
         id: create
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         with:
@@ -313,13 +313,13 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: 📥 Checkout repository (the release commit)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.create-release.outputs.sha }}
 
       # 1. Setup Node.js runtimes for Vite/Three.js frontend compilations
       - name: 🟢 Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: 'npm'
@@ -424,7 +424,7 @@ jobs:
     runs-on: windows-latest # MSVC — the GNU dev-profile linker wall does not apply
     steps:
       - name: 📥 Checkout repository (the release commit)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.create-release.outputs.sha }}
 
@@ -453,7 +453,7 @@ jobs:
           ls -la ssf-p2p-node*.exe
 
       - name: ⬆️ Upload node binaries to the shared draft release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -496,7 +496,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: 🚀 Publish release (all artifacts green)
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const release_id = Number('${{ needs.create-release.outputs.release_id }}');
