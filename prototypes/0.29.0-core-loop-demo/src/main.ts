@@ -124,6 +124,8 @@ import {
   readAllDoors,
   subscribeDoors,
 } from "./doorsDoc";
+// 🚪🩹 The far-door correction compares a record's target room by id.
+import { roomIdFromSeed } from "./stationAtlas";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -446,6 +448,25 @@ let sessionReturnRoute: {
   roomId: string;
   doorId: DoorId;
   seed: string;
+} | null = null;
+/**
+ * 🚪🩹 A near-side record correction owed to a room we just LEFT. When the
+ * arrival lands on a different door than the departure record named (the
+ * record carried a wall-centre hypothetical's compass id, and the room hangs
+ * that name elsewhere — or the named door was already taken), the record is
+ * wrong about its own far end, and the exterior draws the vestibule into the
+ * wrong door of the far room until it is fixed. Only one room doc is bound at
+ * a time, so the fix waits here until the traveler is back in that room, then
+ * rewrites farDoor/farWall/farLateral — and nothing else — if the record still
+ * points at the room they arrived in. Session-scoped, like sessionReturnRoute.
+ */
+let pendingFarDoorFix: {
+  roomId: string;
+  doorId: string;
+  targetRoomId: string;
+  farDoor: string;
+  farWall?: DoorWall;
+  farLateral?: number;
 } | null = null;
 /**
  * Room ids minted by THIS client THIS session via PROVISION NEW MODULE.
@@ -2205,6 +2226,13 @@ async function transitTo(
         farYawDeg: depState.farYawDeg,
       }
     : null;
+  // 🧭 The departure record's description of the FAR door — name, wall,
+  // lateral — passed whether or not a chain was assembled: a plain pairing
+  // minted at provision names its birth door too, and the WALL is what the
+  // arrival trusts (doorMatch.chooseArrivalDoor); the name is a hint.
+  const depFarDoor = depState?.farDoor;
+  const depFarWall = depState?.farWall;
+  const depFarLateral = depState?.farLateral;
   const depRoomId = activeBootstrap?.roomId ?? null;
   const returnRoute =
     sessionReturnRoute?.roomId === depRoomId &&
@@ -2270,9 +2298,11 @@ async function transitTo(
     arrive: () =>
       world.completeAdapterArrival(
         departureDoorId,
-        depGeometry?.farDoor,
+        depFarDoor,
         depRoomId ?? undefined,
         depWall,
+        depFarWall,
+        depFarLateral,
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
@@ -2287,12 +2317,56 @@ async function transitTo(
   // and skips its own walk-in for the same reason).
   const arrivalDoorId = world.resolveArrivalDoor(
     departureDoorId,
-    depGeometry?.farDoor,
+    depFarDoor,
     depRoomId ?? undefined,
     depWall,
+    depFarWall,
+    depFarLateral,
   )?.id;
   if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
+
+  // 🚪🩹 Back in a room that owes a far-door correction (see pendingFarDoorFix):
+  // apply it now that its doc is bound — only if the record still points at
+  // the room the traveler arrived in back then, and only the far-end fields.
+  if (pendingFarDoorFix && arrivalRoomId === pendingFarDoorFix.roomId) {
+    const fix = pendingFarDoorFix;
+    pendingFarDoorFix = null;
+    const rec = readAllDoors().get(fix.doorId);
+    if (
+      rec?.paired &&
+      roomIdFromSeed(rec.connectedRoomAddress) === fix.targetRoomId &&
+      (rec.farDoor !== fix.farDoor || rec.farWall !== fix.farWall)
+    ) {
+      writeDoorPairing(fix.doorId, rec.connectedRoomAddress, {
+        segments: rec.segments,
+        farDoor: fix.farDoor,
+        farWall: fix.farWall,
+        farLateral: fix.farLateral,
+        farYawDeg: rec.farYawDeg,
+        transient: rec.transient,
+      });
+      console.log(
+        `🩹 Far-door correction applied: ${fix.doorId} → ${fix.targetRoomId} now names ${fix.farDoor}${fix.farWall ? ` on ${fix.farWall}` : ""} (was ${rec.farDoor ?? "unnamed"}).`,
+      );
+    }
+  }
+  // …and note one for the room we just LEFT when the arrival did not land on
+  // the door its record named. Every reason it can differ is a reason the
+  // record is wrong about the far end: a compass id from a wall-centre
+  // hypothetical that this room hangs on another wall, a door that was
+  // already taken, or a plain pairing that never named one.
+  if (depPaired && depRoomId && arrivalRoomId && depFarDoor !== arrivalDoorId) {
+    const pose = physicalDoorPoseOrNull(arrivalDoorId);
+    pendingFarDoorFix = {
+      roomId: depRoomId,
+      doorId: departureDoorId,
+      targetRoomId: arrivalRoomId,
+      farDoor: arrivalDoorId,
+      farWall: pose?.wall,
+      farLateral: pose ? (pose.tangent === "x" ? pose.x : pose.z) : undefined,
+    };
+  }
   if (depPaired && depAddress && arrivalRoomId) {
     sessionReturnRoute = {
       roomId: arrivalRoomId,

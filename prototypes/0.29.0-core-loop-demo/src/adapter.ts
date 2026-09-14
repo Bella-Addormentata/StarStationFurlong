@@ -811,7 +811,7 @@ export const CHAIN_PORTAL_MARGIN = 0.3;
 
 /** Room half-width (11.8 / 2) — the projection box's centre sits this far past
  *  the chain exit along the arrival heading (+ the exit-portal margin). */
-const ROOM_HALF = 5.9;
+export const ROOM_HALF = 5.9;
 /** Legacy fixed projection offset (room centre → adjoining module centre). */
 const LEGACY_PROJECTION_OFFSET = 15.2;
 
