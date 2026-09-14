@@ -144,13 +144,20 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     expect(pick?.conflict).toBe(false);
   });
 
-  it('the arrival room\'s own back-pointing record is the highest truth', () => {
+  it('the arrival room\'s own back-pointing record outranks the record\'s id, and its wall when they agree', () => {
     const doors = [door('west', 'x-', 'room-8'), door('south', 'y+', null)];
-    const pick = chooseArrivalDoor(doors, {
-      departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-8',
-      farDoor: 'south', farWall: 'y+',
+    // A stale id naming another door never overrides the back record…
+    const byId = chooseArrivalDoor(doors, {
+      departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-8', farDoor: 'south',
     });
-    expect(pick).toMatchObject({ id: 'west', tier: 'back' });
+    expect(byId).toMatchObject({ id: 'west', tier: 'back' });
+    // …and a wall that agrees with it confirms it.
+    const byWall = chooseArrivalDoor(doors, {
+      departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-8', farDoor: 'south', farWall: 'x-',
+    });
+    expect(byWall).toMatchObject({ id: 'west', tier: 'back' });
+    // (A wall that DISAGREES, with a free door on it, means a second link
+    // between the same rooms — covered by its own case above.)
   });
 
   it('a lone back record is not this connection\'s when the record\'s wall says otherwise', () => {
