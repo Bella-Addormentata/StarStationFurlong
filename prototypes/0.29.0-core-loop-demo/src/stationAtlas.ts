@@ -91,6 +91,12 @@ const MAX_ENTRIES = 64;
  *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
  *  scan), so without this one entry could carry an arbitrarily large set. */
 const MAX_DOORS_PER_ENTRY = 64;
+/** Raw `doors` keys a shared entry may carry before the whole entry is refused
+ *  at ingest. An honest publisher never exceeds MAX_DOORS_PER_ENTRY (it pushes
+ *  what readAllDoors read); the slack tolerates junk keys among real ones
+ *  without letting one entry make every pull walk an unbounded object
+ *  (review, round 3 — the kept-count cap alone still scanned it all). */
+const MAX_RAW_DOORS_PER_ENTRY = 4 * MAX_DOORS_PER_ENTRY;
 
 /** 🕒 How far ahead of OUR clock a peer's gossip stamp may sit before the whole
  *  shared entry is refused (#144). The comparison is against the reader's own
@@ -519,6 +525,7 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
   return typeof e.roomId === 'string' && e.roomId.length > 0
     && typeof e.name === 'string'
     && typeof e.doors === 'object' && e.doors !== null
+    && Object.keys(e.doors).length <= MAX_RAW_DOORS_PER_ENTRY
     // 🕒 `updatedAt` is peer-written and drives merge arbitration (pullSharedAtlas
     // skips on `prior.lastSeen >= value.updatedAt`). Unbounded, a planted
     // far-future stamp wins every future comparison and — before the retention
@@ -589,9 +596,13 @@ function pullSharedAtlas(): void {
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
     const prior = atlas[rid];
+    // Compared against what the value NORMALIZES to, not its raw key count —
+    // a stored 64 against a raw 100 would re-process the same entry on every
+    // notification (review, round 3).
+    const incoming = Math.min(Object.keys(value.doors).length, MAX_DOORS_PER_ENTRY);
     if (prior
       && prior.lastSeen >= value.updatedAt
-      && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
+      && Object.keys(prior.doors).length >= incoming) continue;
     const doors: Record<string, AtlasDoor> = {};
     let kept = 0;
     for (const [d, door] of Object.entries(value.doors)) {

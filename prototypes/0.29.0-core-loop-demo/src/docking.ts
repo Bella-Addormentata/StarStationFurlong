@@ -1289,11 +1289,19 @@ export class DoorDockingPortSystem {
             const farRid = roomIdFromSeed(state.connectedRoomAddress);
             const currentRid =
               (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
-            const takenBy = farRid
+            const taken = farRid
               ? this.farDoorTakenBy(farRid, state.farDoor, state.farWall, state.farLateral)
               : null;
-            if (takenBy && takenBy !== currentRid) {
-              const name = readAtlas()[takenBy]?.name ?? "another module";
+            // Exempt only THIS door's own existing connection (re-initiating
+            // it). Another door of this same room counts as taken — otherwise
+            // two of our doors would share one far door (review, round 3).
+            const ours =
+              taken?.roomId === currentRid && taken.doorId === activeDoorId;
+            if (taken && !ours) {
+              const name =
+                taken.roomId === currentRid
+                  ? "another door of this module"
+                  : (readAtlas()[taken.roomId]?.name ?? "another module");
               alert(
                 `That door of the target module already has a vestibule (to ${name}). Pick a free door, or re-route the chain to another wall.`,
               );
@@ -1922,12 +1930,14 @@ export class DoorDockingPortSystem {
       (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     // 🚪 ONE VESTIBULE PER DOOR: the atlas lists a far room's doors BECAUSE
     // they are paired (that is how it learns them), so every entry here is an
-    // occupied berth unless its pairing points back at THIS room. Offered
-    // greyed-out and unselectable, never as a target — this list used to be
-    // exactly the set of doors that must not take a second vestibule.
+    // occupied berth unless its pairing points back at THIS very door (the
+    // connection being re-initiated) — another door of this room is a second
+    // vestibule too (review, round 3). Offered greyed-out and unselectable,
+    // never as a target — this list used to be exactly the set of doors that
+    // must not take a second vestibule.
     const entries = Object.entries(doors).map(([id, d]) => ({
       id, wall: d?.wall, lateral: d?.lateral,
-      inUse: !!d?.targetRoomId && d.targetRoomId !== currentId,
+      inUse: !!d?.targetRoomId && !(d.targetRoomId === currentId && d.farDoor === doorId),
     }));
     const ordinals = doorOrdinals(entries);
     const esc = (s: string) =>
@@ -2989,7 +2999,7 @@ export class DoorDockingPortSystem {
     farDoor?: string,
     farWall?: DoorWall,
     farLateral?: number,
-  ): string | null {
+  ): { roomId: string; doorId?: string } | null {
     const atlas = readAtlas();
     const farDoors = atlas[farRoomId]?.doors ?? {};
     // Geometry decides whenever the wall is known; the id decides only when
@@ -2997,23 +3007,28 @@ export class DoorDockingPortSystem {
     // compass guess that the far room hangs on another wall — trusting it
     // first would refuse a free wall because a DIFFERENT door carries the
     // name, or clear a taken one (review, round 2).
+    // The answer names the claimant's DOOR as well as its room, so the caller
+    // can exempt exactly this door's own existing connection and nothing
+    // else — another door of the same room is a second vestibule too
+    // (review, round 3).
     const nearOnWall = (wall?: DoorWall, lateral?: number) =>
       wall === farWall && Math.abs((lateral ?? 0) - (farLateral ?? 0)) < MIN_DOOR_GAP;
     if (farWall) {
       for (const d of Object.values(farDoors)) {
-        if (d?.targetRoomId && nearOnWall(d.wall, d.lateral)) return d.targetRoomId;
+        if (d?.targetRoomId && nearOnWall(d.wall, d.lateral))
+          return { roomId: d.targetRoomId, doorId: d.farDoor };
       }
     } else if (farDoor && farDoors[farDoor]?.targetRoomId) {
-      return farDoors[farDoor].targetRoomId;
+      return { roomId: farDoors[farDoor].targetRoomId, doorId: farDoors[farDoor].farDoor };
     }
     for (const [otherId, entry] of Object.entries(atlas)) {
       if (otherId === farRoomId) continue;
-      for (const od of Object.values(entry?.doors ?? {})) {
+      for (const [odid, od] of Object.entries(entry?.doors ?? {})) {
         if (!od || od.targetRoomId !== farRoomId) continue;
         const taken = farWall
           ? nearOnWall(od.farWall, od.farLateral)
           : !!farDoor && od.farDoor === farDoor;
-        if (taken) return otherId;
+        if (taken) return { roomId: otherId, doorId: odid };
       }
     }
     return null;

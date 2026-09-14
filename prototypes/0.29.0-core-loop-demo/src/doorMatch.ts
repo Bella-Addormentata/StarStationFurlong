@@ -275,7 +275,25 @@ export function chooseArrivalDoor(doors: ArrivalDoor[], intent: ArrivalIntent): 
 
   if (fromRoomId) {
     const backs = doors.filter((d) => d.enabled && d.pairedTo === fromRoomId);
-    if (backs.length === 1) return { id: backs[0].id, tier: 'back', conflict: false };
+    if (backs.length === 1) {
+      // One record points back — but is it THIS connection's? Two rooms may
+      // be linked twice with the second link's mirror not yet written; the
+      // lone back door then belongs to the OTHER link. The record's WALL is
+      // written by parties that knew (the matcher, the mirror, provision, the
+      // far room's own harvested pose), so a wall that disagrees with the back
+      // door means this is not its connection: take a free door on that wall
+      // instead when one exists (review, round 3). The id is not consulted —
+      // that is the stale compass guess this module distrusts.
+      const back = backs[0];
+      if (farWall && back.wall !== farWall) {
+        const want = intent.farLateral ?? 0;
+        const onWall = doors
+          .filter((d) => free(d) && d.wall === farWall)
+          .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b));
+        if (onWall.length > 0) return { id: onWall[0].id, tier: 'far-wall', conflict: false };
+      }
+      return { id: back.id, tier: 'back', conflict: false };
+    }
     if (backs.length > 1) {
       // Same two rooms docked more than once. Geometry first, the name last:
       // the record's WALL (+ lateral) identifies the door even when its

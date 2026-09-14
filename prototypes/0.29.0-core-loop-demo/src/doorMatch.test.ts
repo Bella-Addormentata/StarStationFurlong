@@ -153,6 +153,29 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     expect(pick).toMatchObject({ id: 'west', tier: 'back' });
   });
 
+  it('a lone back record is not this connection\'s when the record\'s wall says otherwise', () => {
+    // Rooms A and B already linked once (B's "west" on x- points back at A);
+    // a SECOND link from A arrives whose record names wall y+, mirror not yet
+    // written. The lone back door belongs to the first link.
+    const doors = [door('west', 'x-', 'room-a'), door('d:two', 'y+', null), door('east', 'x+', null)];
+    const second = chooseArrivalDoor(doors, {
+      departureDoorId: 'd:a2', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
+    });
+    expect(second).toMatchObject({ id: 'd:two', tier: 'far-wall' });
+    // Wall agrees (or is unknown): the back record is the connection.
+    const first = chooseArrivalDoor(doors, {
+      departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-a', farWall: 'x-',
+    });
+    expect(first).toMatchObject({ id: 'west', tier: 'back' });
+    const unknown = chooseArrivalDoor(doors, { departureDoorId: 'east', departureWall: 'x+', fromRoomId: 'room-a' });
+    expect(unknown).toMatchObject({ id: 'west', tier: 'back' });
+    // No free door on the named wall: the back record still answers.
+    const noFree = chooseArrivalDoor([door('west', 'x-', 'room-a'), door('south', 'y+', 'room-c')], {
+      departureDoorId: 'd:a2', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
+    });
+    expect(noFree).toMatchObject({ id: 'west', tier: 'back' });
+  });
+
   it('double-docked rooms: the tie breaks on the record\'s WALL before its (possibly stale) id', () => {
     // Both back-pointing doors lead to room 8; the record says farDoor "west"
     // (a compass guess) but farWall x- — and this room's "west" sits on y-.

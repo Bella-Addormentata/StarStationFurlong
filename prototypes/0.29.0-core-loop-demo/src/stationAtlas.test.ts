@@ -45,7 +45,7 @@ function shared(roomId: string, updatedAt: number) {
 describe('door-set bound at ingest', () => {
   it('keeps at most 64 doors of a peer entry — the cap doorsDoc reads a room back with', () => {
     const doors: Record<string, { targetRoomId: string; targetSeed: string }> = {};
-    for (let i = 0; i < 300; i++) doors[`d:${i}`] = { targetRoomId: `nbr-${i}`, targetSeed: '' };
+    for (let i = 0; i < 100; i++) doors[`d:${i}`] = { targetRoomId: `nbr-${i}`, targetSeed: '' };
     doc.getMap('atlas').set('module-fat', {
       roomId: 'module-fat', name: 'FAT', doors, updatedAt: Date.now() - 60_000,
     });
@@ -53,6 +53,22 @@ describe('door-set bound at ingest', () => {
     const entry = readAtlas()['module-fat'];
     expect(entry).toBeDefined();
     expect(Object.keys(entry.doors).length).toBe(64);
+    // …and the unchanged-entry guard compares against the NORMALIZED count, so
+    // a second notification of the same value is a no-op, not a rewrite.
+    const before = store.get('ssf-station-atlas');
+    doc.getMap('atlas').set('module-other', shared('module-other', Date.now() - 60_000));
+    const after = JSON.parse(store.get('ssf-station-atlas')!) as Record<string, { lastSeen: number }>;
+    expect(after['module-fat'].lastSeen).toBe((JSON.parse(before!) as Record<string, { lastSeen: number }>)['module-fat'].lastSeen);
+  });
+
+  it('refuses an entry whose raw door object is absurdly large, before walking it', () => {
+    const doors: Record<string, { targetRoomId: string; targetSeed: string }> = {};
+    for (let i = 0; i < 300; i++) doors[`d:${i}`] = { targetRoomId: `nbr-${i}`, targetSeed: '' };
+    doc.getMap('atlas').set('module-huge', {
+      roomId: 'module-huge', name: 'HUGE', doors, updatedAt: Date.now() - 60_000,
+    });
+    bind();
+    expect(readAtlas()['module-huge']).toBeUndefined();
   });
 
   it('repairs — and PERSISTS — an oversized door set persisted by an older build', () => {
