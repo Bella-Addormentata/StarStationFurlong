@@ -471,6 +471,12 @@ interface PendingFarDoorFix {
   farDoor: string;
   farWall?: DoorWall;
   farLateral?: number;
+  /** The far-end fields the record carried when this was queued. The repair
+   *  is a compare-and-swap on them: if the record has since been corrected by
+   *  anyone else — a peer's re-pair, another traveler's repair, the far side's
+   *  mirror — that newer geometry wins and this stale note is dropped
+   *  (review, round 5). */
+  expect: { farDoor?: string; farWall?: DoorWall; farLateral?: number };
 }
 const pendingFarDoorFixes = new Map<string, PendingFarDoorFix>();
 const MAX_PENDING_FAR_DOOR_FIXES = 32;
@@ -2342,9 +2348,19 @@ async function transitTo(
       if (fix.roomId !== arrivalRoomId) continue;
       pendingFarDoorFixes.delete(key);
       const rec = readAllDoors().get(fix.doorId);
+      // Still the same connection, still carrying the far end we saw when we
+      // queued this (compare-and-swap — a record someone else has corrected
+      // since is newer than this note and is left alone), and not already
+      // what we would write.
+      const unchangedSince =
+        rec?.paired &&
+        rec.farDoor === fix.expect.farDoor &&
+        rec.farWall === fix.expect.farWall &&
+        (rec.farLateral ?? 0) === (fix.expect.farLateral ?? 0);
       if (
         rec?.paired &&
         roomIdFromSeed(rec.connectedRoomAddress) === fix.targetRoomId &&
+        unchangedSince &&
         (rec.farDoor !== fix.farDoor ||
           rec.farWall !== fix.farWall ||
           (rec.farLateral ?? 0) !== (fix.farLateral ?? 0))
@@ -2394,6 +2410,7 @@ async function transitTo(
         farDoor: arrivalDoorId,
         farWall: arrivalWall,
         farLateral: arrivalLateral,
+        expect: { farDoor: depFarDoor, farWall: depFarWall, farLateral: depFarLateral },
       });
     }
   }

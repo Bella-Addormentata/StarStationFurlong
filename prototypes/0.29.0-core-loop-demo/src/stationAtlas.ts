@@ -525,7 +525,10 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
   return typeof e.roomId === 'string' && e.roomId.length > 0
     && typeof e.name === 'string'
     && typeof e.doors === 'object' && e.doors !== null
-    && Object.keys(e.doors).length <= MAX_RAW_DOORS_PER_ENTRY
+    // Counted with early exit, not Object.keys: that allocates an array of
+    // every raw key before the comparison, so a huge peer object still cost
+    // O(n) on every notification (review, round 5).
+    && !ownKeysExceed(e.doors, MAX_RAW_DOORS_PER_ENTRY)
     // 🕒 `updatedAt` is peer-written and drives merge arbitration (pullSharedAtlas
     // skips on `prior.lastSeen >= value.updatedAt`). Unbounded, a planted
     // far-future stamp wins every future comparison and — before the retention
@@ -544,6 +547,17 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     // know this module's size" (the renderer's existing fallback) instead of
     // asking Three.js for a 10-billion-tile hull.
     && (e.dims === undefined || isSaneDims(e.dims));
+}
+
+/** True once `obj` has more than `limit` own keys — stops counting there, so
+ *  an oversized peer object is never enumerated past the bound. */
+function ownKeysExceed(obj: object, limit: number): boolean {
+  let n = 0;
+  for (const k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    if (++n > limit) return true;
+  }
+  return false;
 }
 
 function isSaneDims(d: unknown): d is { cols: number; rows: number } {

@@ -2060,7 +2060,17 @@ export class DoorDockingPortSystem {
             : "· owner only on this port");
     }
     this.renderFarDoorOptions(doorId);
-    if (farSel) farSel.value = state.farDoor ?? "";
+    // Restore the state's far door onto the select only when its option is
+    // there AND enabled: a programmatic assignment selects a DISABLED option
+    // just as happily, which showed an in-use door as chosen after the
+    // options had marked it so (review, round 5). Otherwise the UI reads auto
+    // while the state keeps its precise id (the mirror may have written it).
+    if (farSel) {
+      const opt = state.farDoor
+        ? [...farSel.options].find((o) => o.value === state.farDoor)
+        : undefined;
+      farSel.value = opt && !opt.disabled ? state.farDoor! : "";
+    }
     if (yawBtn)
       yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? "—" : state.farYawDeg}`;
     // 🧲 Every chain edit re-tests whether the far end now reaches a known
