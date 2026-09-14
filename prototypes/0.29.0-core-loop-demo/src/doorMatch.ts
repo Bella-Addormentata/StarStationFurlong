@@ -306,11 +306,22 @@ export function chooseArrivalDoor(doors: ArrivalDoor[], intent: ArrivalIntent): 
             .filter((b) => b.wall === farWall)
             .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b))
         : [];
+      if (onFarWall[0]) return { id: onFarWall[0].id, tier: 'back', conflict: false };
+      // No back door on the record's wall: as in the single-back case, this
+      // may be a FURTHER link between the same rooms whose mirror is not yet
+      // written — a free door on that wall is its door, not another link's
+      // (review, round 6).
+      if (farWall) {
+        const freeOnWall = doors
+          .filter((d) => free(d) && d.wall === farWall)
+          .sort((a, b) => Math.abs(a.lateral - want) - Math.abs(b.lateral - want) || rank(a, b));
+        if (freeOnWall.length > 0) return { id: freeOnWall[0].id, tier: 'far-wall', conflict: false };
+      }
       const named = farDoor
         ? backs.find((b) => b.id === farDoor && (!farWall || b.wall === farWall))
         : undefined;
       const facing = facingWall ? backs.find((b) => b.wall === facingWall) : undefined;
-      return { id: (onFarWall[0] ?? named ?? facing ?? backs[0]).id, tier: 'back', conflict: false };
+      return { id: (named ?? facing ?? backs[0]).id, tier: 'back', conflict: false };
     }
   }
 

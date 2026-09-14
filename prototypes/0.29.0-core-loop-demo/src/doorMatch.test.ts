@@ -183,6 +183,19 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     expect(noFree).toMatchObject({ id: 'west', tier: 'back' });
   });
 
+  it('two back records and a THIRD link arriving: a free door on the record\'s wall, not an occupied back door', () => {
+    const doors = [door('west', 'x-', 'room-a'), door('east', 'x+', 'room-a'), door('d:three', 'y+', null)];
+    const third = chooseArrivalDoor(doors, {
+      departureDoorId: 'd:a3', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
+    });
+    expect(third).toMatchObject({ id: 'd:three', tier: 'far-wall' });
+    // No free door on that wall either: a back record still answers.
+    const stuck = chooseArrivalDoor(doors.slice(0, 2), {
+      departureDoorId: 'd:a3', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
+    });
+    expect(stuck?.tier).toBe('back');
+  });
+
   it('double-docked rooms: the tie breaks on the record\'s WALL before its (possibly stale) id', () => {
     // Both back-pointing doors lead to room 8; the record says farDoor "west"
     // (a compass guess) but farWall x- — and this room's "west" sits on y-.

@@ -19,7 +19,7 @@ import {
   MIN_DOOR_GAP,
 } from "./doorLayout";
 // 🚪🧲 Which door of a KNOWN module a chain connects to — pure, tested.
-import { candidateFarDoors, pickFacingDoor, WALL_YAW } from "./doorMatch";
+import { candidateFarDoors, pickFacingDoor, WALL_YAW, MODULE_FACE_HALF } from "./doorMatch";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import {
@@ -121,6 +121,12 @@ export interface DockingState {
   farYawDeg?: 0 | 45;
   /** #67 D2: this pairing is a TRANSIENT guest berth (docking adapter). */
   transient?: boolean;
+  /** 🚪 The pending request on this door came IN from a peer (as opposed to
+   *  our own INITIATE). An inbound request carries only an address — not
+   *  which of the far module's doors it is from — so it can never prove it is
+   *  the connection this door already has, and must not be allowed to touch a
+   *  live pairing (review, round 6). */
+  inboundRequest?: boolean;
 }
 
 export class DoorDockingPortSystem {
@@ -1336,6 +1342,7 @@ export class DoorDockingPortSystem {
           }
 
           state.pairingPending = true;
+          state.inboundRequest = false; // ours — INITIATE, not a peer's request
           this.syncLEDStatus(activeDoorId, state);
 
           if (this.onConnectionRequestCallback) {
@@ -2344,19 +2351,30 @@ export class DoorDockingPortSystem {
       for (const c of out) if (claimedIds.has(c.id)) c.occupied = true;
       return out;
     };
+    // Reach: any face of a module lies within its half-diagonal of its
+    // centre, so that (plus slack) is how far a module centre may sit from
+    // the chain's END and still own the door the chain meets. The old filter
+    // measured from `wouldBe`, which assumes a CENTRED far door, and so
+    // rejected a module whose matching door sits 5 m along its wall — and
+    // ranked by centre distance, which can prefer a worse face (review,
+    // round 6). Modules are ranked by the face error the matcher returns.
+    const REACH = MODULE_FACE_HALF * Math.SQRT2 + 1.5;
+    const ANG_W = 2 / (Math.PI / 3); // pickFacingDoor's own tie-break weight
     for (const mod of layout) {
-      const dist = Math.hypot(mod.x - wouldBe.x, mod.z - wouldBe.z);
-      if (dist > 4.5 || (best && dist >= best.dist)) continue;
+      const dist = Math.hypot(mod.x - arrival.x, mod.z - arrival.z);
+      if (dist > REACH) continue;
       const cands = candidateDoors(mod.roomId);
       // Position first, angle as the fence and tie-break; never an occupied
       // door (doorMatch.pickFacingDoor).
       const pick = pickFacingDoor(mod, cands, arrival);
       if (pick) {
+        const score = pick.posErr + pick.angErr * ANG_W;
+        if (best && score >= best.dist) continue;
         best = {
           roomId: mod.roomId,
           name: mod.name,
           seed: mod.seed,
-          dist,
+          dist: score,
           door: pick.door,
           blocked: pick.blockedBetter,
         };
@@ -2572,6 +2590,10 @@ export class DoorDockingPortSystem {
     if (state) {
       state.connectedRoomAddress = targetAddr;
       state.pairingPending = true;
+      // 🚪 A peer's request: only an address, never which of its doors — so it
+      // can never prove it is this door's existing connection. completePairing
+      // refuses it, accept or reject, while a live pairing sits on this door.
+      state.inboundRequest = true;
       this.syncLEDStatus(doorId, state);
 
       // Start Flash LED animation inside tick
@@ -2607,18 +2629,24 @@ export class DoorDockingPortSystem {
     if (!state) return;
 
     // 🚪 ONE VESTIBULE PER DOOR: a request that lands on a door with a LIVE
-    // pairing to a DIFFERENT module may neither be accepted (that would
-    // overwrite the record) nor rejected the ordinary way (the REJECTED
-    // publish deletes the door's record — i.e. the EXISTING connection, not
-    // the request; review, round 4). Either way the existing connection is
-    // untouched: the local state is restored from the record and the request
-    // simply cannot land here.
+    // pairing may neither be accepted (that would overwrite the record) nor
+    // rejected the ordinary way (the REJECTED publish deletes the door's
+    // record — i.e. the EXISTING connection, not the request; review, round
+    // 4). "Lands on a live pairing" means: a different module's address, OR
+    // any INBOUND request at all — a peer's request carries only an address,
+    // never which of its doors it is from, so a request from the same
+    // module's OTHER door is indistinguishable from a refresh of this very
+    // connection and must be refused too (review, round 6). Only our own
+    // INITIATE to the same address (re-publishing geometry) may proceed.
+    // Either way the existing connection is untouched: the local state is
+    // restored from the record and the request simply cannot land here.
     {
       const own = readAllDoors().get(doorId);
       if (
         own?.paired &&
         own.connectedRoomAddress &&
-        own.connectedRoomAddress !== state.connectedRoomAddress
+        (own.connectedRoomAddress !== state.connectedRoomAddress ||
+          state.inboundRequest === true)
       ) {
         if (accept) {
           alert(
