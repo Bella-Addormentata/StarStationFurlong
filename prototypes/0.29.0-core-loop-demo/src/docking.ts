@@ -1326,17 +1326,21 @@ export class DoorDockingPortSystem {
           if (state.segments && state.segments.length > 0) {
             const currentId =
               (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+            // The SAME pose the final projection and atlasLayout use — far
+            // wall, lateral AND the target's true half-extent — or the gate
+            // tests a centre metres from where the module will be drawn
+            // (reviews, rounds 7 and 9).
+            const gateWall = this.farWallFor(state);
+            const gateDims = readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims;
             const clash = currentId
               ? moduleOverlapAt(
                   currentId,
                   projectionPoseForDoor(
                     activeDoorId,
                     state.segments,
-                    this.farWallFor(state),
-                    // The lateral shifts the projected module sideways; the
-                    // final projection uses it, so the gate must too (review,
-                    // round 7).
+                    gateWall,
                     state.farLateral ?? 0,
+                    gateWall ? halfAlongWall(gateDims, gateWall) : undefined,
                   ),
                 )
               : null;
@@ -1953,14 +1957,29 @@ export class DoorDockingPortSystem {
       (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     // 🚪 ONE VESTIBULE PER DOOR: the atlas lists a far room's doors BECAUSE
     // they are paired (that is how it learns them), so every entry here is an
-    // occupied berth unless its pairing points back at THIS very door (the
-    // connection being re-initiated) — another door of this room is a second
-    // vestibule too (review, round 3). Offered greyed-out and unselectable,
-    // never as a target — this list used to be exactly the set of doors that
-    // must not take a second vestibule.
+    // occupied berth unless it is THIS door's own existing connection (being
+    // re-initiated) — another door of this room is a second vestibule too
+    // (review, round 3). That reciprocity is decided from THIS door's own
+    // live record — paired to that room, naming that door by id or by wall +
+    // lateral — never from the peer record's farDoor, which may be a stale
+    // compass guess that happens to name the open door (review, round 9).
+    // Offered greyed-out and unselectable, never as a target — this list used
+    // to be exactly the set of doors that must not take a second vestibule.
+    const ownRec = readAllDoors().get(doorId);
+    const ownTarget =
+      ownRec?.paired && ownRec.connectedRoomAddress
+        ? roomIdFromSeed(ownRec.connectedRoomAddress)
+        : "";
+    const reciprocal = (id: string, d: { wall?: DoorWall; lateral?: number } | undefined): boolean =>
+      !!ownRec?.paired &&
+      ownTarget === rid &&
+      (ownRec.farDoor === id ||
+        (!!ownRec.farWall &&
+          ownRec.farWall === d?.wall &&
+          Math.abs((ownRec.farLateral ?? 0) - (d?.lateral ?? 0)) < MIN_DOOR_GAP));
     const entries = Object.entries(doors).map(([id, d]) => ({
       id, wall: d?.wall, lateral: d?.lateral,
-      inUse: !!d?.targetRoomId && !(d.targetRoomId === currentId && d.farDoor === doorId),
+      inUse: !!d?.targetRoomId && !(d.targetRoomId === currentId && reciprocal(id, d)),
     }));
     const ordinals = doorOrdinals(entries);
     const esc = (s: string) =>
@@ -2031,10 +2050,16 @@ export class DoorDockingPortSystem {
       const currentId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
       if (!currentId) return null;
-      // Same pose the final projection uses — far wall AND lateral — or the
-      // warning validates a module metres from where it will be drawn.
+      // Same pose the final projection uses — far wall, lateral AND the
+      // target's true half-extent — or the warning validates a module metres
+      // from where it will be drawn (reviews, rounds 7 and 9).
+      const warnWall = this.farWallFor(state);
+      const warnDims = state.connectedRoomAddress
+        ? readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims
+        : undefined;
       const wouldBe = projectionPoseForDoor(
-        doorId, segs, this.farWallFor(state), state.farLateral ?? 0,
+        doorId, segs, warnWall, state.farLateral ?? 0,
+        warnWall ? halfAlongWall(warnDims, warnWall) : undefined,
       );
       const hit = moduleOverlapAt(currentId, wouldBe);
       return hit ? hit.name : null;
