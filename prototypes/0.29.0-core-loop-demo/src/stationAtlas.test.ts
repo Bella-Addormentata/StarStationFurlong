@@ -61,6 +61,24 @@ describe('door-set bound at ingest', () => {
     expect(after['module-fat'].lastSeen).toBe((JSON.parse(before!) as Record<string, { lastSeen: number }>)['module-fat'].lastSeen);
   });
 
+  it('malformed door records do not make the unchanged-entry guard re-process forever', () => {
+    // 100 junk records and ONE valid door: normalizes to one door, and the
+    // guard must compare against that one — not the 101 raw keys — or every
+    // unrelated notification rewrites this entry.
+    const doors: Record<string, unknown> = {};
+    for (let i = 0; i < 100; i++) doors[`junk-${i}`] = { targetRoomId: '' };
+    doors['d:real'] = { targetRoomId: 'nbr-real', targetSeed: '' };
+    doc.getMap('atlas').set('module-junky', {
+      roomId: 'module-junky', name: 'JUNKY', doors, updatedAt: Date.now() - 60_000,
+    });
+    bind();
+    expect(Object.keys(readAtlas()['module-junky'].doors)).toEqual(['d:real']);
+    const before = store.get('ssf-station-atlas');
+    doc.getMap('atlas').set('module-other', shared('module-other', Date.now() - 60_000));
+    const parse = (s: string) => (JSON.parse(s) as Record<string, { lastSeen: number }>)['module-junky'].lastSeen;
+    expect(parse(store.get('ssf-station-atlas')!)).toBe(parse(before!));
+  });
+
   it('refuses an entry whose raw door object is absurdly large, before walking it', () => {
     const doors: Record<string, { targetRoomId: string; targetSeed: string }> = {};
     for (let i = 0; i < 300; i++) doors[`d:${i}`] = { targetRoomId: `nbr-${i}`, targetSeed: '' };

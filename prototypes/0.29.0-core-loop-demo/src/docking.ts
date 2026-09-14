@@ -1426,6 +1426,15 @@ export class DoorDockingPortSystem {
       if (!st || st.pairedSuccessfully) return;
       st.farWall = undefined;
       st.farLateral = undefined;
+      // …the far door ID too: it named a door of the PREVIOUS target, and a
+      // stale id is exactly what the arrival must never be handed — left in
+      // place it would ride the published record to module B as if it had
+      // been chosen there (review, round 4). The select falls back to auto.
+      st.farDoor = undefined;
+      const farSel = document.getElementById(
+        "docking-far-door",
+      ) as HTMLSelectElement | null;
+      if (farSel) farSel.value = "";
       // …and the FAR options follow the new target's real door set.
       if (doorId) this.renderFarDoorOptions(doorId);
     });
@@ -2587,21 +2596,35 @@ export class DoorDockingPortSystem {
     const state = this.doorState.get(doorId);
     if (!state) return;
 
-    // 🚪 ONE VESTIBULE PER DOOR: an accept must never overwrite a LIVE pairing
-    // to a different module on this door — an inbound request landing on an
-    // occupied berth, or a pane that went stale while a peer paired it. The
-    // record stays as it is; the door keeps the connection it has.
-    if (accept) {
+    // 🚪 ONE VESTIBULE PER DOOR: a request that lands on a door with a LIVE
+    // pairing to a DIFFERENT module may neither be accepted (that would
+    // overwrite the record) nor rejected the ordinary way (the REJECTED
+    // publish deletes the door's record — i.e. the EXISTING connection, not
+    // the request; review, round 4). Either way the existing connection is
+    // untouched: the local state is restored from the record and the request
+    // simply cannot land here.
+    {
       const own = readAllDoors().get(doorId);
       if (
         own?.paired &&
         own.connectedRoomAddress &&
         own.connectedRoomAddress !== state.connectedRoomAddress
       ) {
+        if (accept) {
+          alert(
+            "This door already has a vestibule to another module — undock it before accepting a new connection.",
+          );
+        }
         state.pairingPending = false;
-        alert(
-          "This door already has a vestibule to another module — undock it before accepting a new connection.",
-        );
+        state.pairedSuccessfully = true;
+        state.connectedRoomAddress = own.connectedRoomAddress;
+        state.segments = own.segments;
+        state.farDoor = own.farDoor;
+        state.farWall = own.farWall;
+        state.farLateral = own.farLateral;
+        state.farYawDeg = own.farYawDeg;
+        state.transient = own.transient === true;
+        state.locked = false;
         this.syncLEDStatus(doorId, state);
         return;
       }

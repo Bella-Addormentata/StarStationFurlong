@@ -596,10 +596,16 @@ function pullSharedAtlas(): void {
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
     const prior = atlas[rid];
-    // Compared against what the value NORMALIZES to, not its raw key count —
-    // a stored 64 against a raw 100 would re-process the same entry on every
-    // notification (review, round 3).
-    const incoming = Math.min(Object.keys(value.doors).length, MAX_DOORS_PER_ENTRY);
+    // Compared against what the value NORMALIZES to — the count of VALID
+    // records, capped — never its raw key count: a stored 64 against a raw
+    // 100, or a stored 1 against 100 malformed keys plus one valid, would
+    // re-process the same entry on every notification (review, rounds 3–4).
+    // The raw object is bounded by isSharedAtlasEntry, so this pass is too.
+    let incoming = 0;
+    for (const door of Object.values(value.doors)) {
+      if (door && typeof door.targetRoomId === 'string' && door.targetRoomId) incoming++;
+      if (incoming >= MAX_DOORS_PER_ENTRY) break;
+    }
     if (prior
       && prior.lastSeen >= value.updatedAt
       && Object.keys(prior.doors).length >= incoming) continue;
