@@ -4481,6 +4481,9 @@ export class World {
     // 🧭 …and the departure door's own lateral, so a back record's counterpart
     // description can be matched against the door we actually left through.
     departureLateral?: number,
+    // Set to the chooser's conflict flag when given: the pick is another
+    // connection's door, so the caller must not record a repair onto it.
+    out?: { conflict: boolean },
   ): DoorTarget | null {
     const depWall = departureWall ?? this.wallOfDoor(departureDoorId);
     const records = readAllDoors();
@@ -4510,9 +4513,10 @@ export class World {
       farLateral,
     });
     if (!pick) return null;
+    if (out) out.conflict = pick.conflict;
     if (pick.conflict) {
       console.warn(
-        `[doors] every door here is paired elsewhere — arriving through ${pick.id}, which belongs to another connection.`,
+        `[doors] no door here is free for this connection — arriving through ${pick.id}, which belongs to another one.`,
       );
     }
     return findDoor(pick.id);

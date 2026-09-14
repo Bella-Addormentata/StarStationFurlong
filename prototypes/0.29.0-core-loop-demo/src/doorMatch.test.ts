@@ -180,7 +180,19 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     const noFree = chooseArrivalDoor([door('west', 'x-', 'room-a'), door('south', 'y+', 'room-c')], {
       departureDoorId: 'd:a2', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
     });
-    expect(noFree).toMatchObject({ id: 'west', tier: 'back' });
+    // …flagged: it is another link's door, so no repair may be recorded onto it.
+    expect(noFree).toMatchObject({ id: 'west', tier: 'back', conflict: true });
+  });
+
+  it('another link\'s back door is never reused while any door is unpaired', () => {
+    // The record's wall (y+) has no door at all; the unpaired east door is
+    // the honest answer, not the back door that belongs to the first link.
+    const doors = [door('west', 'x-', 'room-a'), door('east', 'x+', null)];
+    const pick = chooseArrivalDoor(doors, {
+      departureDoorId: 'd:a2', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
+    });
+    expect(pick).toMatchObject({ id: 'east', conflict: false });
+    expect(pick?.tier).not.toBe('back');
   });
 
   it('same wall, different lateral: the back door 6 m along is another link, not this one', () => {
@@ -244,7 +256,7 @@ describe('chooseArrivalDoor — the traveler comes in through the right door', (
     const stuck = chooseArrivalDoor(doors.slice(0, 2), {
       departureDoorId: 'd:a3', departureWall: 'y-', fromRoomId: 'room-a', farWall: 'y+',
     });
-    expect(stuck?.tier).toBe('back');
+    expect(stuck).toMatchObject({ tier: 'back', conflict: true });
   });
 
   it('double-docked rooms: the tie breaks on the record\'s WALL before its (possibly stale) id', () => {

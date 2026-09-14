@@ -2328,6 +2328,7 @@ async function transitTo(
   // write below is keyed on that door, so with none there is nothing to write
   // — and nothing to walk through either (world.completeAdapterArrival warns
   // and skips its own walk-in for the same reason).
+  const arrivalInfo = { conflict: false };
   const arrivalDoorId = world.resolveArrivalDoor(
     departureDoorId,
     depFarDoor,
@@ -2336,6 +2337,7 @@ async function transitTo(
     depFarWall,
     depFarLateral,
     depLateral,
+    arrivalInfo,
   )?.id;
   if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
@@ -2408,9 +2410,12 @@ async function transitTo(
       !!arrivalRec?.paired &&
       !!arrivalRec.connectedRoomAddress &&
       roomIdFromSeed(arrivalRec.connectedRoomAddress) !== depRoomId;
-    if (mismatch && arrivalIsAnothers) {
+    // …nor onto a door the chooser itself flagged as another connection's —
+    // that covers a back door of a DIFFERENT link to the same room, which the
+    // room-id test above cannot see (review, round 8).
+    if (mismatch && (arrivalIsAnothers || arrivalInfo.conflict)) {
       console.warn(
-        `🩹 No far-door correction noted for ${departureDoorId}: arrived through ${arrivalDoorId}, which is paired to another room.`,
+        `🩹 No far-door correction noted for ${departureDoorId}: arrived through ${arrivalDoorId}, which belongs to another connection.`,
       );
     } else if (mismatch) {
       const key = `${depRoomId}:${departureDoorId}`;

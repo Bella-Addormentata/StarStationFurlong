@@ -66,6 +66,24 @@ const WALL_LEGACY_ID: Record<DoorWall, string> = (() => {
  *  module's true size is not known. */
 export const MODULE_FACE_HALF = 6;
 
+/** How far a door face may sit from the chain's end and still be the door the
+ *  chain meets — the matcher's tolerance AND the module prefilter's slack, one
+ *  constant so the prefilter can never reject a module whose door the matcher
+ *  would have accepted (review, round 8). */
+export const FACE_MATCH_TOLERANCE = 4.5;
+
+/** The half-extent a wall's outward normal crosses — x± walls sit at ±halfX,
+ *  y± walls at ±halfZ. Unknown dims ⇒ undefined, so callers keep their own
+ *  default (the adapter's ROOM_HALF for the uniform 11.8 box). */
+export function halfAlongWall(
+  dims: { cols: number; rows: number } | undefined,
+  wall: DoorWall,
+): number | undefined {
+  if (!dims) return undefined;
+  const h = moduleHalves(dims);
+  return wall === 'x+' || wall === 'x-' ? h.halfX : h.halfZ;
+}
+
 /** A module's half-extents from its gossiped tile dims — TILE_SIZE / 2 per
  *  tile, the same mapping exteriorView renders neighbours with (cols → x,
  *  rows → z; unknown ⇒ the default 2×2). A 5×5 module's faces are at ±15, and
@@ -187,7 +205,7 @@ export function pickFacingDoor(
   arrival: ChainArrival,
   opts?: { maxPosErr?: number; maxAngErr?: number },
 ): FacingDoorPick | null {
-  const maxPos = opts?.maxPosErr ?? 4.5; // the module match radius
+  const maxPos = opts?.maxPosErr ?? FACE_MATCH_TOLERANCE;
   const maxAng = opts?.maxAngErr ?? Math.PI / 3;
   // Metres per radian for the tie-break: a full maxAng costs ~2 m.
   const ANG_WEIGHT = 2 / maxAng;
@@ -251,8 +269,10 @@ export interface ArrivalPick {
   id: string;
   /** Which rule chose it — for logs and tests. */
   tier: 'back' | 'far-wall' | 'far-door' | 'facing-wall' | 'id-opposite' | 'fallback';
-  /** True only when NO free door existed and the pick is paired elsewhere —
-   *  the last-resort legacy behaviour, surfaced so callers can warn. */
+  /** True when the pick is a door that belongs to ANOTHER connection — no
+   *  free door existed (the legacy last resort), or every back record was
+   *  proven to be a different link and nothing was unpaired. Callers warn,
+   *  and must not record a repair pointing at it. */
   conflict: boolean;
 }
 
@@ -346,16 +366,25 @@ export function chooseArrivalDoor(doors: ArrivalDoor[], intent: ArrivalIntent): 
     }
     if (backs.length > 0) {
       // Back records exist but none is this link — a further link between the
-      // same rooms, mirror not yet written. Its door is an UNPAIRED one on the
-      // wall our record names; failing that, a back record still answers (the
-      // pre-existing behaviour, and never a door paired to a third room).
+      // same rooms, mirror not yet written. Its door is an UNPAIRED one: on
+      // the wall our record names, else on the facing wall, else anywhere.
+      // Only when nothing is unpaired does a back door answer — and then
+      // FLAGGED, because it is proven to be another link's door: the mirror
+      // will refuse it and no repair may point the departure record at it
+      // (review, round 8).
       if (farWall) {
         const openOnWall = doors.filter((d) => unpaired(d) && d.wall === farWall).sort(byLateral);
         if (openOnWall.length > 0) return { id: openOnWall[0].id, tier: 'far-wall', conflict: false };
       }
+      const openFacing = facingWall
+        ? doors.filter((d) => unpaired(d) && d.wall === facingWall).sort(rank)
+        : [];
+      if (openFacing.length > 0) return { id: openFacing[0].id, tier: 'facing-wall', conflict: false };
+      const anyOpen = doors.filter(unpaired).sort(rank);
+      if (anyOpen.length > 0) return { id: anyOpen[0].id, tier: 'fallback', conflict: false };
       const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
       const facing = facingWall ? backs.find((b) => b.wall === facingWall) : undefined;
-      return { id: (named ?? facing ?? backs[0]).id, tier: 'back', conflict: false };
+      return { id: (named ?? facing ?? backs[0]).id, tier: 'back', conflict: true };
     }
   }
 

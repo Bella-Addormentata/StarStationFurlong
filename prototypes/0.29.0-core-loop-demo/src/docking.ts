@@ -19,7 +19,10 @@ import {
   MIN_DOOR_GAP,
 } from "./doorLayout";
 // 🚪🧲 Which door of a KNOWN module a chain connects to — pure, tested.
-import { candidateFarDoors, pickFacingDoor, moduleHalves, WALL_YAW } from "./doorMatch";
+import {
+  candidateFarDoors, pickFacingDoor, moduleHalves, halfAlongWall,
+  FACE_MATCH_TOLERANCE, WALL_YAW,
+} from "./doorMatch";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import {
@@ -2372,7 +2375,10 @@ export class DoorDockingPortSystem {
       // the default 2×2 — the same rule the exterior renders with. Reach and
       // face positions both scale with it (review, round 7).
       const mod = { ...layoutMod, ...moduleHalves(layoutMod.dims) };
-      const reach = Math.hypot(mod.halfX, mod.halfZ) + 1.5;
+      // Half-diagonal plus the matcher's own face tolerance — the same
+      // constant, so this coarse filter can never discard a module whose door
+      // the matcher would have accepted (review, round 8).
+      const reach = Math.hypot(mod.halfX, mod.halfZ) + FACE_MATCH_TOLERANCE;
       const dist = Math.hypot(mod.x - arrival.x, mod.z - arrival.z);
       if (dist > reach) continue;
       const cands = candidateDoors(mod.roomId);
@@ -3020,11 +3026,18 @@ export class DoorDockingPortSystem {
     });
 
     const adjRoom = new THREE.Mesh(roomGeo, roomMat);
+    // 🛑📐 The connected module's true half along the far wall when the atlas
+    // knows its size — the same offset atlasLayout composes with, so the
+    // gray box sits where the exterior will draw the module.
+    const farDims = state?.connectedRoomAddress
+      ? readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims
+      : undefined;
     const pose = projectionPoseForDoor(
       doorId,
       state?.segments,
       farWall, // resolved once above — the same value the poseKey hashed
       state?.farLateral ?? 0,
+      farWall ? halfAlongWall(farDims, farWall) : undefined,
     );
     adjRoom.position.set(pose.x, 2, pose.z);
     adjRoom.rotation.y = pose.rotY;

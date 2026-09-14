@@ -35,6 +35,7 @@ import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
 import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
+import { halfAlongWall } from './doorMatch';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -374,9 +375,14 @@ export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
       // NEIGHBOUR room's door poses from its harvested wall+lateral — this
       // client's snapshot knows nothing about it. Old gossip without geometry
       // falls back to the live-pose path, which is the pre-redo behaviour.
+      // 🛑📐 The far module's half-extent along its door's wall normal when its
+      // size is known: the chain meets its TRUE face, so its centre sits that
+      // far beyond the chain's end (review, round 8). Unknown ⇒ the adapter's
+      // uniform default, as before.
+      const farHalf = farWall ? halfAlongWall(atlas[door.targetRoomId]?.dims, farWall) : undefined;
       const local = fromId !== currentRoomId && door.wall !== undefined
-        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral)
-        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral);
+        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral, farHalf)
+        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral, farHalf);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
