@@ -67,8 +67,9 @@ The project is structured according to game development industry standards to ma
 
 A `vX.Y.Z` tag triggers [release.yml](.github/workflows/release.yml), which builds the
 Tauri app from `RELEASE_FRONTEND` and uploads the `ssf-p2p-node` binaries. Two things
-have to be true **before** the tag is pushed, because the workflow will happily succeed
-while getting them wrong:
+have to be true **before** the tag is pushed. The workflow checks both on the tagged tree
+(the *Release guard* step) and stops — no tag created on the manual path, no draft on
+either — if one is off; it names the mismatch but does not fix it for you:
 
 1. **`## Unreleased` must already be renamed to `## vX.Y.Z — <date>`.** The release body
    is extracted with `awk '/^## v/{n++; next} n==1{print}'` — the first `## v...`
@@ -80,6 +81,25 @@ while getting them wrong:
    [`src/version.ts`](prototypes/0.29.0-core-loop-demo/src/version.ts) carries the
    authoritative list and is itself the ninth — follow the note there, not a blind
    search-and-replace.
+
+Pushing the tag is the usual trigger, not the only one. When `refs/tags` pushes are
+refused from where you are (the environment that prepared v0.35.0 could push branches
+but 403'd on tags), start the same workflow by hand — **Actions → 🚀 Publish Sovereign
+Releases → Run workflow**, or
+
+```bash
+gh workflow run release.yml -f tag=vX.Y.Z -f target=<commit sha>
+```
+
+`target` is the commit to tag. Name it explicitly whenever `main` has moved past the
+commit you smoke-tested; blank means the head of the ref you dispatched from. The
+workflow runs the guard on that commit, creates the annotated tag itself, and then runs
+the ordinary pipeline. A tag that already exists is reused exactly as it stands — never
+moved — which also makes this the way to re-run a release whose earlier run failed.
+Dispatch from `main` (the trigger lives there); the built tree still comes from the
+tag's commit. The two conditions above are properties of that commit and are guarded
+the same way on both paths; release runs are serialized, so a second start for the same
+tag queues behind the first rather than disturbing its draft.
 
 ### CHANGELOG and TODO entries: add them at merge time
 
