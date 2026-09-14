@@ -811,7 +811,7 @@ export const CHAIN_PORTAL_MARGIN = 0.3;
 
 /** Room half-width (11.8 / 2) — the projection box's centre sits this far past
  *  the chain exit along the arrival heading (+ the exit-portal margin). */
-const ROOM_HALF = 5.9;
+export const ROOM_HALF = 5.9;
 /** Legacy fixed projection offset (room centre → adjoining module centre). */
 const LEGACY_PROJECTION_OFFSET = 15.2;
 
@@ -837,6 +837,7 @@ export function projectionPoseForDoor(
   segments?: ConnectorSegment[],
   farWall?: DoorWall | null,
   farLateral = 0,
+  farHalf = ROOM_HALF,
 ): { x: number; z: number; rotY: number } {
   const p = physicalDoorPose(doorId);
   return projectionPoseFromWall(
@@ -845,6 +846,7 @@ export function projectionPoseForDoor(
     segments,
     farWall,
     farLateral,
+    farHalf,
   );
 }
 
@@ -869,6 +871,13 @@ export function projectionPoseFromWall(
   segments?: ConnectorSegment[],
   farWall?: DoorWall | null,
   farLateral = 0,
+  // 🛑📐 The FAR module's half-extent along its door's wall normal: the chain
+  // meets that module's face, so its centre sits this far beyond the chain's
+  // end. Defaults to the uniform box the exterior fell back to for modules of
+  // unknown size; a known-size neighbour (atlas dims) passes its true half,
+  // or a 5×5 module would be drawn 9 m closer than the tube that reaches it
+  // (review, round 8). The straight-gangway pose keeps its legacy offset.
+  farHalf = ROOM_HALF,
 ): { x: number; z: number; rotY: number } {
   const doorPose = poseFromWall(nearWall, nearLateral, nearLateral);
   const dYaw = doorPose.outwardYaw;
@@ -896,8 +905,8 @@ export function projectionPoseFromWall(
   const zr = dPos.z - exit.x * Math.sin(dYaw) + exit.z * Math.cos(dYaw);
   const heading = dYaw + exit.yawRad; // world heading at the chain exit
   const centre = {
-    x: xr + Math.sin(heading) * ROOM_HALF,
-    z: zr + Math.cos(heading) * ROOM_HALF,
+    x: xr + Math.sin(heading) * farHalf,
+    z: zr + Math.cos(heading) * farHalf,
   };
   // Far room rotation: its far door faces BACK along the arrival heading.
   const rotY = farWall

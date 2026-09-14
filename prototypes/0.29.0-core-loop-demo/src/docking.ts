@@ -16,7 +16,13 @@ import {
   physicalDoorPose, portForDoor, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
   DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
+  MIN_DOOR_GAP,
 } from "./doorLayout";
+// 🚪🧲 Which door of a KNOWN module a chain connects to — pure, tested.
+import {
+  candidateFarDoors, pickFacingDoor, moduleHalves, halfAlongWall,
+  FACE_MATCH_TOLERANCE, WALL_YAW,
+} from "./doorMatch";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import {
@@ -38,6 +44,7 @@ import {
   projectionPoseForDoor,
   solveChain,
   foldChainEnd,
+  ROOM_HALF,
   type ConnectorSegment,
 } from "./adapter";
 // 🛰️ Hull space: built chains register their swept boxes so exterior mounts
@@ -72,7 +79,7 @@ import {
 } from "./doorPolicy";
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
-import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
+import { deleteDoorPairing, writeDoorTombstone, readAllDoors } from "./doorsDoc";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -117,6 +124,12 @@ export interface DockingState {
   farYawDeg?: 0 | 45;
   /** #67 D2: this pairing is a TRANSIENT guest berth (docking adapter). */
   transient?: boolean;
+  /** 🚪 The pending request on this door came IN from a peer (as opposed to
+   *  our own INITIATE). An inbound request carries only an address — not
+   *  which of the far module's doors it is from — so it can never prove it is
+   *  the connection this door already has, and must not be allowed to touch a
+   *  live pairing (review, round 6). */
+  inboundRequest?: boolean;
 }
 
 export class DoorDockingPortSystem {
@@ -1263,6 +1276,48 @@ export class DoorDockingPortSystem {
             return;
           }
 
+          // 🚪 ONE VESTIBULE PER DOOR — both ends, before the request goes out.
+          // THIS door: a live pairing to some other module must be UNDOCKED
+          // first. The DOC record, not the local state — a peer may have paired
+          // it while this pane sat open. The FAR door: whatever the atlas knows
+          // to be connected already, on the far room's own record or as another
+          // room's far end, is refused here (the arrival refuses it too, but by
+          // then the near record is published and the tube is drawn).
+          {
+            const own = readAllDoors().get(activeDoorId);
+            if (
+              own?.paired &&
+              own.connectedRoomAddress &&
+              own.connectedRoomAddress !== state.connectedRoomAddress
+            ) {
+              alert(
+                "This door already has a vestibule — UNDOCK it before connecting it somewhere else.",
+              );
+              return;
+            }
+            const farRid = roomIdFromSeed(state.connectedRoomAddress);
+            const currentRid =
+              (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+            const taken = farRid
+              ? this.farDoorTakenBy(farRid, state.farDoor, state.farWall, state.farLateral)
+              : null;
+            // Exempt only THIS door's own existing connection (re-initiating
+            // it). Another door of this same room counts as taken — otherwise
+            // two of our doors would share one far door (review, round 3).
+            const ours =
+              taken?.roomId === currentRid && taken.doorId === activeDoorId;
+            if (taken && !ours) {
+              const name =
+                taken.roomId === currentRid
+                  ? "another door of this module"
+                  : (readAtlas()[taken.roomId]?.name ?? "another module");
+              alert(
+                `That door of the target module already has a vestibule (to ${name}). Pick a free door, or re-route the chain to another wall.`,
+              );
+              return;
+            }
+          }
+
           // 🛰️ #28 S6a: BLOCK a pairing whose module would dock ON TOP of an
           // existing station module (the WARN's hard-stop half). Only when a
           // chain projects the module, and only for a cardinal berth (the pose
@@ -1271,13 +1326,21 @@ export class DoorDockingPortSystem {
           if (state.segments && state.segments.length > 0) {
             const currentId =
               (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+            // The SAME pose the final projection and atlasLayout use — far
+            // wall, lateral AND the target's true half-extent — or the gate
+            // tests a centre metres from where the module will be drawn
+            // (reviews, rounds 7 and 9).
+            const gateWall = this.farWallFor(state);
+            const gateDims = readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims;
             const clash = currentId
               ? moduleOverlapAt(
                   currentId,
                   projectionPoseForDoor(
                     activeDoorId,
                     state.segments,
-                    this.farWallFor(state),
+                    gateWall,
+                    state.farLateral ?? 0,
+                    gateWall ? halfAlongWall(gateDims, gateWall) : undefined,
                   ),
                 )
               : null;
@@ -1290,6 +1353,7 @@ export class DoorDockingPortSystem {
           }
 
           state.pairingPending = true;
+          state.inboundRequest = false; // ours — INITIATE, not a peer's request
           this.syncLEDStatus(activeDoorId, state);
 
           if (this.onConnectionRequestCallback) {
@@ -1380,6 +1444,15 @@ export class DoorDockingPortSystem {
       if (!st || st.pairedSuccessfully) return;
       st.farWall = undefined;
       st.farLateral = undefined;
+      // …the far door ID too: it named a door of the PREVIOUS target, and a
+      // stale id is exactly what the arrival must never be handed — left in
+      // place it would ride the published record to module B as if it had
+      // been chosen there (review, round 4). The select falls back to auto.
+      st.farDoor = undefined;
+      const farSel = document.getElementById(
+        "docking-far-door",
+      ) as HTMLSelectElement | null;
+      if (farSel) farSel.value = "";
       // …and the FAR options follow the new target's real door set.
       if (doorId) this.renderFarDoorOptions(doorId);
     });
@@ -1880,8 +1953,33 @@ export class DoorDockingPortSystem {
         ?.value || st?.connectedRoomAddress || "";
     const rid = addr ? roomIdFromSeed(addr) : "";
     const doors = rid ? readAtlas()[rid]?.doors ?? {} : {};
+    const currentId =
+      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+    // 🚪 ONE VESTIBULE PER DOOR: the atlas lists a far room's doors BECAUSE
+    // they are paired (that is how it learns them), so every entry here is an
+    // occupied berth unless it is THIS door's own existing connection (being
+    // re-initiated) — another door of this room is a second vestibule too
+    // (review, round 3). That reciprocity is decided from THIS door's own
+    // live record — paired to that room, naming that door by id or by wall +
+    // lateral — never from the peer record's farDoor, which may be a stale
+    // compass guess that happens to name the open door (review, round 9).
+    // Offered greyed-out and unselectable, never as a target — this list used
+    // to be exactly the set of doors that must not take a second vestibule.
+    const ownRec = readAllDoors().get(doorId);
+    const ownTarget =
+      ownRec?.paired && ownRec.connectedRoomAddress
+        ? roomIdFromSeed(ownRec.connectedRoomAddress)
+        : "";
+    const reciprocal = (id: string, d: { wall?: DoorWall; lateral?: number } | undefined): boolean =>
+      !!ownRec?.paired &&
+      ownTarget === rid &&
+      (ownRec.farDoor === id ||
+        (!!ownRec.farWall &&
+          ownRec.farWall === d?.wall &&
+          Math.abs((ownRec.farLateral ?? 0) - (d?.lateral ?? 0)) < MIN_DOOR_GAP));
     const entries = Object.entries(doors).map(([id, d]) => ({
       id, wall: d?.wall, lateral: d?.lateral,
+      inUse: !!d?.targetRoomId && !(d.targetRoomId === currentId && reciprocal(id, d)),
     }));
     const ordinals = doorOrdinals(entries);
     const esc = (s: string) =>
@@ -1891,13 +1989,16 @@ export class DoorDockingPortSystem {
       `<option value="">auto</option>` +
       entries
         .sort((a, b) => (ordinals.get(a.id) ?? 9) - (ordinals.get(b.id) ?? 9))
-        .map((e) => `<option value="${esc(e.id)}">DOOR ${ordinals.get(e.id)}</option>`)
+        .map((e) =>
+          `<option value="${esc(e.id)}"${e.inUse ? " disabled" : ""}>DOOR ${ordinals.get(e.id)}${e.inUse ? " · in use" : ""}</option>`)
         .join("");
     // Keep the current selection when it survives the repopulation; a farDoor
     // naming a door the atlas does not list yet degrades to auto IN THE UI
-    // while the state keeps the precise id (the mirror wrote it).
+    // while the state keeps the precise id (the mirror wrote it). A selection
+    // that turned out to be in use degrades to auto too.
     farSel.value = prev;
-    if (farSel.value !== prev) farSel.value = "";
+    if (farSel.value !== prev || entries.find((e) => e.id === prev)?.inUse)
+      farSel.value = "";
   }
 
   /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
@@ -1949,7 +2050,17 @@ export class DoorDockingPortSystem {
       const currentId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
       if (!currentId) return null;
-      const wouldBe = projectionPoseForDoor(doorId, segs, this.farWallFor(state));
+      // Same pose the final projection uses — far wall, lateral AND the
+      // target's true half-extent — or the warning validates a module metres
+      // from where it will be drawn (reviews, rounds 7 and 9).
+      const warnWall = this.farWallFor(state);
+      const warnDims = state.connectedRoomAddress
+        ? readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims
+        : undefined;
+      const wouldBe = projectionPoseForDoor(
+        doorId, segs, warnWall, state.farLateral ?? 0,
+        warnWall ? halfAlongWall(warnDims, warnWall) : undefined,
+      );
       const hit = moduleOverlapAt(currentId, wouldBe);
       return hit ? hit.name : null;
     })();
@@ -1992,7 +2103,17 @@ export class DoorDockingPortSystem {
             : "· owner only on this port");
     }
     this.renderFarDoorOptions(doorId);
-    if (farSel) farSel.value = state.farDoor ?? "";
+    // Restore the state's far door onto the select only when its option is
+    // there AND enabled: a programmatic assignment selects a DISABLED option
+    // just as happily, which showed an in-use door as chosen after the
+    // options had marked it so (review, round 5). Otherwise the UI reads auto
+    // while the state keeps its precise id (the mirror may have written it).
+    if (farSel) {
+      const opt = state.farDoor
+        ? [...farSel.options].find((o) => o.value === state.farDoor)
+        : undefined;
+      farSel.value = opt && !opt.disabled ? state.farDoor! : "";
+    }
     if (yawBtn)
       yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? "—" : state.farYawDeg}`;
     // 🧲 Every chain edit re-tests whether the far end now reaches a known
@@ -2192,73 +2313,137 @@ export class DoorDockingPortSystem {
       seed?: string;
       dist: number;
       door: { id: string; wall: DoorWall; lateral: number };
+      /** An OCCUPIED door that fit better than the pick — said in the prompt. */
+      blocked?: { id: string; wall: DoorWall };
     } | null = null;
-    // The outward yaw of each wall — poseFromWall's values, stated once.
-    const WALL_YAW: Record<DoorWall, number> = {
-      'y+': 0,
-      'x+': Math.PI / 2,
-      'y-': Math.PI,
-      'x-': -Math.PI / 2,
+    /** The nearest module whose ONLY fitting door is already taken — the
+     *  refusal the prompt explains instead of offering CONNECT. */
+    let blockedOnly: { name: string; wall: DoorWall } | null = null;
+    // The chain's END in this room's frame: the far module's centre sits
+    // ROOM_HALF past it along the arrival heading (projectionPoseFromWall),
+    // and with no far wall known the pose's rotY IS that heading.
+    const heading = wouldBe.rotY;
+    const arrival = {
+      x: wouldBe.x - Math.sin(heading) * ROOM_HALF,
+      z: wouldBe.z - Math.cos(heading) * ROOM_HALF,
+      heading,
     };
-    const angDiff = (a: number, b: number) => {
-      let d = (a - b) % (Math.PI * 2);
-      if (d > Math.PI) d -= Math.PI * 2;
-      if (d < -Math.PI) d += Math.PI * 2;
-      return Math.abs(d);
-    };
-    // 🧭 A module's candidate doors are its REAL gossiped door set — id, wall
-    // and lateral from the atlas, so a free `d:` door is as connectable as any
-    // cardinal. Only a module whose gossip predates door geometry falls back to
-    // the four hypothetical wall-centre doors the matcher used to assume.
-    const candidateDoors = (
-      roomId: string,
-    ): Array<{ id: string; wall: DoorWall; lateral: number }> => {
-      const out: Array<{ id: string; wall: DoorWall; lateral: number }> = [];
-      // Real doors the atlas knows about — but a door with a targetRoomId is
-      // PAIRED, i.e. an occupied berth, not a candidate for a NEW connection.
-      // (Today the atlas learns doors only FROM pairings, so this arm is empty
-      // until full-layout gossip ships; it is here so free unpaired doors
-      // become candidates the moment that lands. Redo review F1: an
-      // atlas-only candidate set could offer nothing but occupied doors and
-      // broke ring-closing entirely.)
-      for (const [did, ad] of Object.entries(readAtlas()[roomId]?.doors ?? {})) {
-        if (ad?.wall && !ad.targetRoomId)
-          out.push({ id: did, wall: ad.wall, lateral: ad.lateral ?? 0 });
+    const atlas = readAtlas();
+    // 🚪 Every door some room's record already LANDS ON, indexed by the far
+    // room — ONE pass over the atlas per detection, not one per candidate
+    // module (review F1: the atlas is peer-writable and this runs on every
+    // chain edit). Entries are bounded at ingest — MAX_ENTRIES rooms of at most
+    // MAX_DOORS_PER_ENTRY doors — so this is a small, fixed cost.
+    const claimsByRoom = new Map<
+      string,
+      Array<{ id?: string; wall?: DoorWall; lateral?: number; from: string }>
+    >();
+    for (const [otherId, entry] of Object.entries(atlas)) {
+      for (const od of Object.values(entry?.doors ?? {})) {
+        if (!od?.targetRoomId) continue;
+        let list = claimsByRoom.get(od.targetRoomId);
+        if (!list) claimsByRoom.set(od.targetRoomId, (list = []));
+        list.push({ id: od.farDoor, wall: od.farWall, lateral: od.farLateral, from: otherId });
       }
-      // The four wall-centre hypotheticals — the pre-redo candidate set. A
-      // room can grow a door anywhere, so CONNECT may aim at a wall centre;
-      // the far owner's seed/editor takes it from there.
-      for (const [id, wall] of Object.entries(LEGACY_ID_WALL)) {
-        out.push({ id, wall, lateral: 0 });
+    }
+    // A module's candidate doors (doorMatch.candidateFarDoors). Its REAL
+    // gossiped doors, with a paired one KEPT and flagged occupied rather than
+    // dropped — dropping it was the octagon bug: the wall-centre hypothetical
+    // then re-offered the very wall the paired door sat on, and the closing
+    // vestibule went onto a door that already had one. Plus every door some
+    // OTHER room's record already lands on (its far end, by wall + lateral,
+    // or by id when that is all it knows). Plus a wall-centre hypothetical for
+    // each wall with no known door near its centre. Today the atlas learns
+    // doors only FROM pairings, so the free real doors it will one day gossip
+    // are the empty arm here; hypotheticals carry ring-closing until then.
+    const candidateDoors = (roomId: string) => {
+      const known: Array<{ id: string; wall?: DoorWall; lateral?: number; occupied: boolean }> = [];
+      const claimedIds = new Set<string>();
+      for (const [did, ad] of Object.entries(atlas[roomId]?.doors ?? {})) {
+        if (!ad) continue;
+        known.push({ id: did, wall: ad.wall, lateral: ad.lateral, occupied: !!ad.targetRoomId });
+        if (ad.targetRoomId) claimedIds.add(did);
       }
-      return out;
-    };
-    for (const mod of layout) {
-      const dist = Math.hypot(mod.x - wouldBe.x, mod.z - wouldBe.z);
-      if (dist > 4.5 || (best && dist >= best.dist)) continue;
-      // The chain arrives heading wouldBe.rotY (no far wall ⇒ rotY = heading);
-      // the matching door of the module faces BACK along it.
-      const arrivalFacing = wouldBe.rotY + Math.PI;
-      let doorPick: { id: string; wall: DoorWall; lateral: number } | null = null;
-      let doorErr = Math.PI;
-      for (const d of candidateDoors(mod.roomId)) {
-        const err = angDiff(mod.rotY + WALL_YAW[d.wall], arrivalFacing);
-        if (err < doorErr) {
-          doorErr = err;
-          doorPick = d;
+      for (const claim of claimsByRoom.get(roomId) ?? []) {
+        if (claim.from === roomId) continue; // its own records are the loop above
+        if (claim.wall) {
+          // A claim WITH geometry blocks by geometry, under a key of its own —
+          // never its farDoor id, which may be a stale compass guess that the
+          // target room hangs on another wall. Keyed by id it was deduplicated
+          // away against the room's real door of that name, and the wall it
+          // actually lands on came back as a free hypothetical (review, round 2).
+          known.push({
+            id: `claim:${claim.from}:${claim.wall}:${claim.lateral ?? 0}`,
+            wall: claim.wall,
+            lateral: claim.lateral ?? 0,
+            occupied: true,
+          });
+        } else if (claim.id) {
+          // No geometry — the id is all it knows, so it blocks by id.
+          claimedIds.add(claim.id);
         }
       }
-      if (doorPick && doorErr < Math.PI / 3) {
+      const out = candidateFarDoors(known);
+      for (const c of out) if (claimedIds.has(c.id)) c.occupied = true;
+      return out;
+    };
+    // Reach: any face of a module lies within its half-diagonal of its
+    // centre, so that (plus slack) is how far a module centre may sit from
+    // the chain's END and still own the door the chain meets. The old filter
+    // measured from `wouldBe`, which assumes a CENTRED far door, and so
+    // rejected a module whose matching door sits 5 m along its wall — and
+    // ranked by centre distance, which can prefer a worse face (review,
+    // round 6). Modules are ranked by the face error the matcher returns.
+    const ANG_W = 2 / (Math.PI / 3); // pickFacingDoor's own tie-break weight
+    for (const layoutMod of layout) {
+      // 🛑📐 The module's TRUE half-extents when the atlas learned them, else
+      // the default 2×2 — the same rule the exterior renders with. Reach and
+      // face positions both scale with it (review, round 7).
+      const mod = { ...layoutMod, ...moduleHalves(layoutMod.dims) };
+      // Half-diagonal plus the matcher's own face tolerance — the same
+      // constant, so this coarse filter can never discard a module whose door
+      // the matcher would have accepted (review, round 8).
+      const reach = Math.hypot(mod.halfX, mod.halfZ) + FACE_MATCH_TOLERANCE;
+      const dist = Math.hypot(mod.x - arrival.x, mod.z - arrival.z);
+      if (dist > reach) continue;
+      const cands = candidateDoors(mod.roomId);
+      // Position first, angle as the fence and tie-break; never an occupied
+      // door (doorMatch.pickFacingDoor).
+      const pick = pickFacingDoor(mod, cands, arrival);
+      if (pick) {
+        const score = pick.posErr + pick.angErr * ANG_W;
+        if (best && score >= best.dist) continue;
         best = {
           roomId: mod.roomId,
           name: mod.name,
           seed: mod.seed,
-          dist,
-          door: doorPick,
+          dist: score,
+          door: pick.door,
+          blocked: pick.blockedBetter,
         };
+      } else if (!blockedOnly) {
+        // Would the chain have matched a door here if occupancy did not count?
+        const ifFree = pickFacingDoor(
+          mod,
+          cands.map((c) => ({ ...c, occupied: false })),
+          arrival,
+        );
+        if (ifFree) blockedOnly = { name: mod.name, wall: ifFree.door.wall };
       }
     }
-    if (!best || !best.seed) return;
+    if (!best) {
+      if (blockedOnly) {
+        const esc = (s: string) =>
+          s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+        slot.innerHTML = `
+          <div style="border:1px solid rgba(255,23,68,0.35); border-radius:6px; padding:6px 10px; background:rgba(255,23,68,0.06); font-size:9.5px; color:#ff8a80;">
+            🧲 CHAIN REACHES <b>${esc(blockedOnly.name)}</b>, but the door it lands on is already connected — one vestibule per door. Re-route the chain to a free wall.
+          </div>`;
+        slot.style.display = "block";
+      }
+      return;
+    }
+    if (!best.seed) return;
 
     // 🛬 JETBRIDGE FIT: solve the chain's free parameters (continuous bends,
     // flex + telescoping ext stretch) so the fold lands EXACTLY on the
@@ -2267,14 +2452,15 @@ export class DoorDockingPortSystem {
     // slides). Target = the matched door's face, in this door's chain frame.
     const mod = layout.find((m) => m.roomId === best!.roomId)!;
     // The matched door's face in ITS module's local frame: on its wall, at its
-    // lateral. (Uniform module half — per-module dims are a later refinement,
-    // matching the exterior's uniform shells.)
+    // lateral, at the module's TRUE half-extent (the matcher aimed there; the
+    // solve must target the same face).
     const pick = best.door;
+    const mh = moduleHalves(mod.dims);
     const doorFaceLocal =
-      pick.wall === "y-" ? { x: pick.lateral, z: -6 }
-      : pick.wall === "y+" ? { x: pick.lateral, z: 6 }
-      : pick.wall === "x+" ? { x: 6, z: pick.lateral }
-      : { x: -6, z: pick.lateral };
+      pick.wall === "y-" ? { x: pick.lateral, z: -mh.halfZ }
+      : pick.wall === "y+" ? { x: pick.lateral, z: mh.halfZ }
+      : pick.wall === "x+" ? { x: mh.halfX, z: pick.lateral }
+      : { x: -mh.halfX, z: pick.lateral };
     const mc = Math.cos(mod.rotY),
       ms = Math.sin(mod.rotY);
     const faceWorld = {
@@ -2314,9 +2500,14 @@ export class DoorDockingPortSystem {
           return ` · auto-fit ${bends}`;
         })()
       : " · rigid (fit out of range)";
+    // 🚪 Say when the natural door was skipped for being taken, so the owner
+    // is not surprised by which door the tube goes to.
+    const blockedNote = best.blocked
+      ? " · its nearest door is already connected, using the next free one"
+      : "";
     slot.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
-        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its facing door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
+        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its facing door?<span style="color:rgba(0,230,118,0.6);">${fitNote}${blockedNote}</span></span>
         <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
       </div>`;
     slot.style.display = "block";
@@ -2341,9 +2532,11 @@ export class DoorDockingPortSystem {
         if (st) {
           st.farDoor = best!.door.id;
           // 🧭 The matcher KNOWS the far wall — it just aimed the chain at it.
-          // Stashing it here is what makes the published pairing fully
-          // described before anyone ever walks through.
+          // Stashing it (and the lateral) is what makes the published pairing
+          // fully described before anyone ever walks through — and the WALL is
+          // what the arrival trusts; for a hypothetical the id is only a name.
           st.farWall = best!.door.wall;
+          st.farLateral = best!.door.lateral;
         }
         // Fire the normal INITIATE path (all its gates apply).
         document
@@ -2441,6 +2634,10 @@ export class DoorDockingPortSystem {
     if (state) {
       state.connectedRoomAddress = targetAddr;
       state.pairingPending = true;
+      // 🚪 A peer's request: only an address, never which of its doors — so it
+      // can never prove it is this door's existing connection. completePairing
+      // refuses it, accept or reject, while a live pairing sits on this door.
+      state.inboundRequest = true;
       this.syncLEDStatus(doorId, state);
 
       // Start Flash LED animation inside tick
@@ -2474,6 +2671,46 @@ export class DoorDockingPortSystem {
   ) {
     const state = this.doorState.get(doorId);
     if (!state) return;
+
+    // 🚪 ONE VESTIBULE PER DOOR: a request that lands on a door with a LIVE
+    // pairing may neither be accepted (that would overwrite the record) nor
+    // rejected the ordinary way (the REJECTED publish deletes the door's
+    // record — i.e. the EXISTING connection, not the request; review, round
+    // 4). "Lands on a live pairing" means: a different module's address, OR
+    // any INBOUND request at all — a peer's request carries only an address,
+    // never which of its doors it is from, so a request from the same
+    // module's OTHER door is indistinguishable from a refresh of this very
+    // connection and must be refused too (review, round 6). Only our own
+    // INITIATE to the same address (re-publishing geometry) may proceed.
+    // Either way the existing connection is untouched: the local state is
+    // restored from the record and the request simply cannot land here.
+    {
+      const own = readAllDoors().get(doorId);
+      if (
+        own?.paired &&
+        own.connectedRoomAddress &&
+        (own.connectedRoomAddress !== state.connectedRoomAddress ||
+          state.inboundRequest === true)
+      ) {
+        if (accept) {
+          alert(
+            "This door already has a vestibule to another module — undock it before accepting a new connection.",
+          );
+        }
+        state.pairingPending = false;
+        state.pairedSuccessfully = true;
+        state.connectedRoomAddress = own.connectedRoomAddress;
+        state.segments = own.segments;
+        state.farDoor = own.farDoor;
+        state.farWall = own.farWall;
+        state.farLateral = own.farLateral;
+        state.farYawDeg = own.farYawDeg;
+        state.transient = own.transient === true;
+        state.locked = false;
+        this.syncLEDStatus(doorId, state);
+        return;
+      }
+    }
 
     state.pairingPending = false;
     state.pairedSuccessfully = accept;
@@ -2814,11 +3051,18 @@ export class DoorDockingPortSystem {
     });
 
     const adjRoom = new THREE.Mesh(roomGeo, roomMat);
+    // 🛑📐 The connected module's true half along the far wall when the atlas
+    // knows its size — the same offset atlasLayout composes with, so the
+    // gray box sits where the exterior will draw the module.
+    const farDims = state?.connectedRoomAddress
+      ? readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims
+      : undefined;
     const pose = projectionPoseForDoor(
       doorId,
       state?.segments,
       farWall, // resolved once above — the same value the poseKey hashed
       state?.farLateral ?? 0,
+      farWall ? halfAlongWall(farDims, farWall) : undefined,
     );
     adjRoom.position.set(pose.x, 2, pose.z);
     adjRoom.rotation.y = pose.rotY;
@@ -2853,6 +3097,55 @@ export class DoorDockingPortSystem {
    * renders as no rotation. NEVER inferred from the far door's id: an id names
    * a door, it does not place one.
    */
+  /**
+   * 🚪 Who already has a vestibule on the far room's door this pairing is
+   * aimed at — the room id, or null when the atlas knows of none. Three
+   * places a claim can live: the far room's own record for that door id; a
+   * paired door of the far room within MIN_DOOR_GAP of the aimed wall +
+   * lateral (a hypothetical's compass id names no real door, its geometry
+   * does); and any OTHER room's record whose far end is that door. "auto"
+   * (no id, no wall) cannot be checked here — the arrival enforces it.
+   */
+  private farDoorTakenBy(
+    farRoomId: string,
+    farDoor?: string,
+    farWall?: DoorWall,
+    farLateral?: number,
+  ): { roomId: string; doorId?: string } | null {
+    const atlas = readAtlas();
+    const farDoors = atlas[farRoomId]?.doors ?? {};
+    // Geometry decides whenever the wall is known; the id decides only when
+    // it is all we have. A farDoor id may be a wall-centre hypothetical's
+    // compass guess that the far room hangs on another wall — trusting it
+    // first would refuse a free wall because a DIFFERENT door carries the
+    // name, or clear a taken one (review, round 2).
+    // The answer names the claimant's DOOR as well as its room, so the caller
+    // can exempt exactly this door's own existing connection and nothing
+    // else — another door of the same room is a second vestibule too
+    // (review, round 3).
+    const nearOnWall = (wall?: DoorWall, lateral?: number) =>
+      wall === farWall && Math.abs((lateral ?? 0) - (farLateral ?? 0)) < MIN_DOOR_GAP;
+    if (farWall) {
+      for (const d of Object.values(farDoors)) {
+        if (d?.targetRoomId && nearOnWall(d.wall, d.lateral))
+          return { roomId: d.targetRoomId, doorId: d.farDoor };
+      }
+    } else if (farDoor && farDoors[farDoor]?.targetRoomId) {
+      return { roomId: farDoors[farDoor].targetRoomId, doorId: farDoors[farDoor].farDoor };
+    }
+    for (const [otherId, entry] of Object.entries(atlas)) {
+      if (otherId === farRoomId) continue;
+      for (const [odid, od] of Object.entries(entry?.doors ?? {})) {
+        if (!od || od.targetRoomId !== farRoomId) continue;
+        const taken = farWall
+          ? nearOnWall(od.farWall, od.farLateral)
+          : !!farDoor && od.farDoor === farDoor;
+        if (taken) return { roomId: otherId, doorId: odid };
+      }
+    }
+    return null;
+  }
+
   private farWallFor(state: DockingState | undefined): DoorWall | null {
     if (!state) return null;
     if (state.farWall) return state.farWall;

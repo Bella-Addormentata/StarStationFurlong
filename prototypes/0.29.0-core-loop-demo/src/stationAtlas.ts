@@ -35,6 +35,7 @@ import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
 import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
+import { halfAlongWall } from './doorMatch';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -85,6 +86,18 @@ export interface AtlasEntry {
 
 const KEY = 'ssf-station-atlas';
 const MAX_ENTRIES = 64;
+/** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
+ *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
+ *  peer-written object that isSharedAtlasEntry does not size-check, and every
+ *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
+ *  scan), so without this one entry could carry an arbitrarily large set. */
+const MAX_DOORS_PER_ENTRY = 64;
+/** Raw `doors` keys a shared entry may carry before the whole entry is refused
+ *  at ingest. An honest publisher never exceeds MAX_DOORS_PER_ENTRY (it pushes
+ *  what readAllDoors read); the slack tolerates junk keys among real ones
+ *  without letting one entry make every pull walk an unbounded object
+ *  (review, round 3 — the kept-count cap alone still scanned it all). */
+const MAX_RAW_DOORS_PER_ENTRY = 4 * MAX_DOORS_PER_ENTRY;
 
 /** 🕒 How far ahead of OUR clock a peer's gossip stamp may sit before the whole
  *  shared entry is refused (#144). The comparison is against the reader's own
@@ -144,6 +157,18 @@ export function readAtlas(): Record<string, AtlasEntry> {
     for (const e of Object.values(atlas)) {
       if (typeof e?.lastSeen === 'number' && e.lastSeen > ceiling) { e.lastSeen = 0; repaired = true; }
       if (typeof e?.localSeenAt === 'number' && e.localSeenAt > ceiling) { e.localSeenAt = 0; repaired = true; }
+      // 🚪 An oversized door set persisted by a build before the ingest cap
+      // (MAX_DOORS_PER_ENTRY) would otherwise stay oversized forever: the
+      // pull's `prior` guard can skip the entry, and writeAtlas caps rooms,
+      // not doors (review, round 2). Truncate in entry order and PERSIST, the
+      // same way as the stamp repair — every consumer walks this set.
+      if (e && typeof e.doors === 'object' && e.doors !== null) {
+        const ids = Object.keys(e.doors);
+        if (ids.length > MAX_DOORS_PER_ENTRY) {
+          for (const id of ids.slice(MAX_DOORS_PER_ENTRY)) delete e.doors[id];
+          repaired = true;
+        }
+      }
     }
     if (repaired) writeAtlas(atlas);
     return atlas;
@@ -350,9 +375,14 @@ export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
       // NEIGHBOUR room's door poses from its harvested wall+lateral — this
       // client's snapshot knows nothing about it. Old gossip without geometry
       // falls back to the live-pose path, which is the pre-redo behaviour.
+      // 🛑📐 The far module's half-extent along its door's wall normal when its
+      // size is known: the chain meets its TRUE face, so its centre sits that
+      // far beyond the chain's end (review, round 8). Unknown ⇒ the adapter's
+      // uniform default, as before.
+      const farHalf = farWall ? halfAlongWall(atlas[door.targetRoomId]?.dims, farWall) : undefined;
       const local = fromId !== currentRoomId && door.wall !== undefined
-        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral)
-        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral);
+        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral, farHalf)
+        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral, farHalf);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
@@ -501,6 +531,10 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
   return typeof e.roomId === 'string' && e.roomId.length > 0
     && typeof e.name === 'string'
     && typeof e.doors === 'object' && e.doors !== null
+    // Counted with early exit, not Object.keys: that allocates an array of
+    // every raw key before the comparison, so a huge peer object still cost
+    // O(n) on every notification (review, round 5).
+    && !ownKeysExceed(e.doors, MAX_RAW_DOORS_PER_ENTRY)
     // 🕒 `updatedAt` is peer-written and drives merge arbitration (pullSharedAtlas
     // skips on `prior.lastSeen >= value.updatedAt`). Unbounded, a planted
     // far-future stamp wins every future comparison and — before the retention
@@ -519,6 +553,17 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     // know this module's size" (the renderer's existing fallback) instead of
     // asking Three.js for a 10-billion-tile hull.
     && (e.dims === undefined || isSaneDims(e.dims));
+}
+
+/** True once `obj` has more than `limit` own keys — stops counting there, so
+ *  an oversized peer object is never enumerated past the bound. */
+function ownKeysExceed(obj: object, limit: number): boolean {
+  let n = 0;
+  for (const k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    if (++n > limit) return true;
+  }
+  return false;
 }
 
 function isSaneDims(d: unknown): d is { cols: number; rows: number } {
@@ -571,11 +616,26 @@ function pullSharedAtlas(): void {
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
     const prior = atlas[rid];
+    // Compared against what the value NORMALIZES to — the count of VALID
+    // records, capped — never its raw key count: a stored 64 against a raw
+    // 100, or a stored 1 against 100 malformed keys plus one valid, would
+    // re-process the same entry on every notification (review, rounds 3–4).
+    // The raw object is bounded by isSharedAtlasEntry, so this pass is too.
+    let incoming = 0;
+    for (const door of Object.values(value.doors)) {
+      if (door && typeof door.targetRoomId === 'string' && door.targetRoomId) incoming++;
+      if (incoming >= MAX_DOORS_PER_ENTRY) break;
+    }
     if (prior
       && prior.lastSeen >= value.updatedAt
-      && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
+      && Object.keys(prior.doors).length >= incoming) continue;
     const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
     for (const [d, door] of Object.entries(value.doors)) {
+      // Bounded (MAX_DOORS_PER_ENTRY): a room cannot honestly have more
+      // pairings than doorsDoc reads back, so past the cap the rest is dropped,
+      // deterministically, in entry order.
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
       if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
       // 🧭 Wall/lateral drive GEOMETRY straight into the exterior renderer and
       // arrive from a peer — exact wall names and a finite lateral or they are
@@ -602,6 +662,7 @@ function pullSharedAtlas(): void {
           ? (door.lateral as number)
           : prior?.doors[d]?.lateral,
       };
+      kept++;
     }
     // ⚠️ This REBUILDS the entry rather than merging into it, so every field
     // must be named explicitly or it is destroyed. `dims` was not, which meant

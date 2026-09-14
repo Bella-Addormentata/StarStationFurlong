@@ -124,6 +124,8 @@ import {
   readAllDoors,
   subscribeDoors,
 } from "./doorsDoc";
+// 🚪🩹 The far-door correction compares a record's target room by id.
+import { roomIdFromSeed } from "./stationAtlas";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -447,6 +449,37 @@ let sessionReturnRoute: {
   doorId: DoorId;
   seed: string;
 } | null = null;
+/**
+ * 🚪🩹 A near-side record correction owed to a room we just LEFT. When the
+ * arrival lands on a different door than the departure record named (the
+ * record carried a wall-centre hypothetical's compass id, and the room hangs
+ * that name elsewhere — or the named door was already taken), the record is
+ * wrong about its own far end, and the exterior draws the vestibule into the
+ * wrong door of the far room until it is fixed. Only one room doc is bound at
+ * a time, so the fix waits here until the traveler is back in that room, then
+ * rewrites farDoor/farWall/farLateral — and nothing else — if the record still
+ * points at the room they arrived in. Session-scoped, like sessionReturnRoute.
+ *
+ * Keyed by `${roomId}:${doorId}`, never a single slot: a correction owed to
+ * room A must survive a later mismatched transit out of room B before the
+ * traveler is back in A (review F4). Bounded; the oldest entry goes first.
+ */
+interface PendingFarDoorFix {
+  roomId: string;
+  doorId: string;
+  targetRoomId: string;
+  farDoor: string;
+  farWall?: DoorWall;
+  farLateral?: number;
+  /** The far-end fields the record carried when this was queued. The repair
+   *  is a compare-and-swap on them: if the record has since been corrected by
+   *  anyone else — a peer's re-pair, another traveler's repair, the far side's
+   *  mirror — that newer geometry wins and this stale note is dropped
+   *  (review, round 5). */
+  expect: { farDoor?: string; farWall?: DoorWall; farLateral?: number };
+}
+const pendingFarDoorFixes = new Map<string, PendingFarDoorFix>();
+const MAX_PENDING_FAR_DOOR_FIXES = 32;
 /**
  * Room ids minted by THIS client THIS session via PROVISION NEW MODULE.
  * Transiting into one of them is a first-entry into a fresh room nobody
@@ -2205,6 +2238,13 @@ async function transitTo(
         farYawDeg: depState.farYawDeg,
       }
     : null;
+  // 🧭 The departure record's description of the FAR door — name, wall,
+  // lateral — passed whether or not a chain was assembled: a plain pairing
+  // minted at provision names its birth door too, and the WALL is what the
+  // arrival trusts (doorMatch.chooseArrivalDoor); the name is a hint.
+  const depFarDoor = depState?.farDoor;
+  const depFarWall = depState?.farWall;
+  const depFarLateral = depState?.farLateral;
   const depRoomId = activeBootstrap?.roomId ?? null;
   const returnRoute =
     sessionReturnRoute?.roomId === depRoomId &&
@@ -2270,9 +2310,12 @@ async function transitTo(
     arrive: () =>
       world.completeAdapterArrival(
         departureDoorId,
-        depGeometry?.farDoor,
+        depFarDoor,
         depRoomId ?? undefined,
         depWall,
+        depFarWall,
+        depFarLateral,
+        depLateral,
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
@@ -2285,14 +2328,113 @@ async function transitTo(
   // write below is keyed on that door, so with none there is nothing to write
   // — and nothing to walk through either (world.completeAdapterArrival warns
   // and skips its own walk-in for the same reason).
+  const arrivalInfo = { conflict: false };
   const arrivalDoorId = world.resolveArrivalDoor(
     departureDoorId,
-    depGeometry?.farDoor,
+    depFarDoor,
     depRoomId ?? undefined,
     depWall,
+    depFarWall,
+    depFarLateral,
+    depLateral,
+    arrivalInfo,
   )?.id;
   if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
+
+  // 🚪🩹 Back in a room that owes far-door corrections (see pendingFarDoorFixes):
+  // apply every one for THIS room now that its doc is bound — only where the
+  // record still points at the room the traveler arrived in back then, and
+  // only the far-end fields (id, wall, lateral — a lateral-only repair is a
+  // repair too, review F3).
+  if (arrivalRoomId) {
+    for (const [key, fix] of [...pendingFarDoorFixes]) {
+      if (fix.roomId !== arrivalRoomId) continue;
+      pendingFarDoorFixes.delete(key);
+      const rec = readAllDoors().get(fix.doorId);
+      // Still the same connection, still carrying the far end we saw when we
+      // queued this (compare-and-swap — a record someone else has corrected
+      // since is newer than this note and is left alone), and not already
+      // what we would write.
+      const unchangedSince =
+        rec?.paired &&
+        rec.farDoor === fix.expect.farDoor &&
+        rec.farWall === fix.expect.farWall &&
+        (rec.farLateral ?? 0) === (fix.expect.farLateral ?? 0);
+      if (
+        rec?.paired &&
+        roomIdFromSeed(rec.connectedRoomAddress) === fix.targetRoomId &&
+        unchangedSince &&
+        (rec.farDoor !== fix.farDoor ||
+          rec.farWall !== fix.farWall ||
+          (rec.farLateral ?? 0) !== (fix.farLateral ?? 0))
+      ) {
+        writeDoorPairing(fix.doorId, rec.connectedRoomAddress, {
+          segments: rec.segments,
+          farDoor: fix.farDoor,
+          farWall: fix.farWall,
+          farLateral: fix.farLateral,
+          farYawDeg: rec.farYawDeg,
+          transient: rec.transient,
+        });
+        console.log(
+          `🩹 Far-door correction applied: ${fix.doorId} → ${fix.targetRoomId} now names ${fix.farDoor}${fix.farWall ? ` on ${fix.farWall}` : ""} (was ${rec.farDoor ?? "unnamed"}${rec.farWall ? ` on ${rec.farWall}` : ""}).`,
+        );
+      }
+    }
+  }
+  // …and note one for the room we just LEFT when the arrival did not land
+  // where its record said: a different door, or the same door on a different
+  // wall or at a different lateral than the record claims. Every reason it
+  // can differ is a reason the record is wrong about its far end: a compass
+  // id from a wall-centre hypothetical that this room hangs on another wall,
+  // a door that was already taken, a plain pairing that never named one.
+  if (depPaired && depRoomId && arrivalRoomId) {
+    const pose = physicalDoorPoseOrNull(arrivalDoorId);
+    const arrivalWall = pose?.wall;
+    const arrivalLateral = pose
+      ? pose.tangent === "x" ? pose.x : pose.z
+      : undefined;
+    const mismatch =
+      depFarDoor !== arrivalDoorId ||
+      (arrivalWall !== undefined && depFarWall !== arrivalWall) ||
+      (arrivalLateral !== undefined &&
+        Math.abs((depFarLateral ?? 0) - arrivalLateral) > 1e-6);
+    // Never note a repair onto a door that belongs to ANOTHER connection: when
+    // every door here was paired elsewhere the chooser's last resort is such a
+    // door (it warns), the mirror rightly refuses it, and a repair pointing the
+    // departure record at it would manufacture the very duplicate this change
+    // exists to prevent (review, round 7).
+    const arrivalRec = readAllDoors().get(arrivalDoorId);
+    const arrivalIsAnothers =
+      !!arrivalRec?.paired &&
+      !!arrivalRec.connectedRoomAddress &&
+      roomIdFromSeed(arrivalRec.connectedRoomAddress) !== depRoomId;
+    // …nor onto a door the chooser itself flagged as another connection's —
+    // that covers a back door of a DIFFERENT link to the same room, which the
+    // room-id test above cannot see (review, round 8).
+    if (mismatch && (arrivalIsAnothers || arrivalInfo.conflict)) {
+      console.warn(
+        `🩹 No far-door correction noted for ${departureDoorId}: arrived through ${arrivalDoorId}, which belongs to another connection.`,
+      );
+    } else if (mismatch) {
+      const key = `${depRoomId}:${departureDoorId}`;
+      pendingFarDoorFixes.delete(key); // re-insert as the newest
+      if (pendingFarDoorFixes.size >= MAX_PENDING_FAR_DOOR_FIXES) {
+        const oldest = pendingFarDoorFixes.keys().next().value;
+        if (oldest !== undefined) pendingFarDoorFixes.delete(oldest);
+      }
+      pendingFarDoorFixes.set(key, {
+        roomId: depRoomId,
+        doorId: departureDoorId,
+        targetRoomId: arrivalRoomId,
+        farDoor: arrivalDoorId,
+        farWall: arrivalWall,
+        farLateral: arrivalLateral,
+        expect: { farDoor: depFarDoor, farWall: depFarWall, farLateral: depFarLateral },
+      });
+    }
+  }
   if (depPaired && depAddress && arrivalRoomId) {
     sessionReturnRoute = {
       roomId: arrivalRoomId,

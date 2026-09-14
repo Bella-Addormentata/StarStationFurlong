@@ -8,8 +8,7 @@ import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
 import {
-  physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
-  type PhysicalDoorId,
+  physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import { Player } from "./player";
@@ -88,6 +87,8 @@ import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
+// 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
+import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -225,18 +226,8 @@ function doorAnchor(door: {
     : undefined;
 }
 
-/** 🚪 #91: the wall physically facing a given wall — the same axis, the
- *  opposite sign. Walking out of a room's y− side must bring you in through
- *  the next room's y+ side. */
-function oppositeWall(wall: DoorWall): DoorWall {
-  return wall === "y-"
-    ? "y+"
-    : wall === "y+"
-      ? "y-"
-      : wall === "x+"
-        ? "x-"
-        : "x+";
-}
+// 🚪 #91: "the wall physically facing a given wall" now lives in
+// doorMatch.oppositeWallOf, beside the arrival chooser that is its only user.
 
 export class World {
   private scene: THREE.Scene;
@@ -4449,111 +4440,86 @@ export class World {
     return readAllDoorLayout().get(id)?.wall ?? "y-";
   }
 
-  /** The door a traveler arrives through, or NULL when the room has none — a
-   *  doorless station is now a real state, so this can no longer promise one. */
+  /**
+   * The door a traveler arrives through, or NULL when the room has none — a
+   * doorless station is now a real state, so this can no longer promise one.
+   *
+   * The choice itself is doorMatch.chooseArrivalDoor — pure, and pinned by
+   * doorMatch.test.ts. Its tiers, in order: the ARRIVAL room's own record
+   * pointing BACK at the room we came from (owner's octagon findings — the
+   * highest truth; a hub with four spokes routes each arrival to ITS door);
+   * the departure record's far WALL (+ lateral); its farDoor by id, but only
+   * when the record names no wall or the id's wall agrees — a compass id
+   * stamped by a wall-centre hypothetical is a guess about a NAME, and the far
+   * room may hang that name on another wall (that is how the closing vestibule
+   * reached the wrong side of room 1); the wall facing the departure wall
+   * (#91: walls always mirror, ids are logical slots); the cardinal
+   * id-opposite (the fireplace-blocked south departure under the pairs
+   * layouts); then east / any enabled door.
+   *
+   * ONE VESTIBULE PER DOOR: no tier below the back-pointing one ever picks a
+   * door that is paired to a DIFFERENT room while a free door exists, so the
+   * arrival — and the mirror main.ts writes onto the arrival door — lands on a
+   * door that can actually take it. This method only assembles the live room
+   * for the chooser: each door's wall, lateral, walkability, and whom its own
+   * pairing record points at.
+   */
   public resolveArrivalDoor(
     departureDoorId: string,
     farDoor?: string,
     fromRoomId?: string,
     // 🧭 The wall the traveler DEPARTED through, captured in the departure
-    // room before the swap. Without it this method inferred the wall from the
-    // id via the ARRIVAL room's records — wrong whenever the two rooms park
-    // the same id on different walls, and always wrong for a free door, whose
-    // id exists in no other room. Falls back to the old inference when the
-    // caller has nothing better (e.g. a stale session-restore route).
+    // room before the swap — an id says nothing about position, and the same
+    // id can sit on different walls in the two rooms. Falls back to the old
+    // inference when the caller has nothing better (a stale restore route).
     departureWall?: DoorWall,
+    // 🧭 The departure record's description of THIS room's door — the wall the
+    // connection was aimed at and where along it. The record's farDoor is the
+    // name it guessed; these are the geometry it knew.
+    farWall?: DoorWall,
+    farLateral?: number,
+    // 🧭 …and the departure door's own lateral, so a back record's counterpart
+    // description can be matched against the door we actually left through.
+    departureLateral?: number,
+    // Set to the chooser's conflict flag when given: the pick is another
+    // connection's door, so the caller must not record a repair onto it.
+    out?: { conflict: boolean },
   ): DoorTarget | null {
     const depWall = departureWall ?? this.wallOfDoor(departureDoorId);
-    // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
-    // records — the door whose pairing points BACK at the room we came from.
-    // This survives every other keypad/vestibule change on either side: a
-    // center hub with four spokes routes each arrival to ITS door, no matter
-    // which cardinal you departed from or what farDoor a stale record names.
-    // (Callable only after the arrival doc is bound — both call sites are.)
-    if (fromRoomId) {
-      const backs: DoorTarget[] = [];
-      for (const [doorId, rec] of readAllDoors()) {
-        if (!rec.paired || !rec.connectedRoomAddress) continue;
-        if (roomIdFromSeed(rec.connectedRoomAddress) !== fromRoomId) continue;
-        const d = findDoor(doorId);
-        if (d && d.enabled) backs.push(d);
-      }
-      if (backs.length === 1) return backs[0];
-      if (backs.length > 1) {
-        // Same room docked twice — let the record's farDoor break the tie, and
-        // failing that the door OPPOSITE the one we departed through. 🚪 #91:
-        // the old `?? backs[0]` fell back to doors-map iteration order, which
-        // always starts at 'north' — so both directions of a double-docked
-        // loop came out the same door.
-        const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
-        const facing = backs.find(
-          (b) => this.wallOfDoor(b.id) === oppositeWall(depWall),
-        );
-        return named ?? facing ?? backs[0];
-      }
+    const records = readAllDoors();
+    const doors: ArrivalDoor[] = DOORS.map((d) => {
+      const pose = physicalDoorPoseOrNull(d.id);
+      const rec = records.get(d.id);
+      const paired = rec?.paired && rec.connectedRoomAddress ? rec : null;
+      return {
+        id: d.id,
+        wall: pose?.wall ?? this.wallOfDoor(d.id),
+        lateral: pose ? (pose.tangent === "x" ? pose.x : pose.z) : 0,
+        enabled: d.enabled,
+        cardinal: isCardinalDoorId(d.id),
+        pairedTo: paired ? roomIdFromSeed(paired.connectedRoomAddress) : null,
+        pairedFarDoor: paired?.farDoor,
+        pairedFarWall: paired?.farWall,
+        pairedFarLateral: paired?.farLateral,
+      };
+    });
+    const pick = chooseArrivalDoor(doors, {
+      departureDoorId,
+      departureWall: depWall,
+      departureLateral,
+      fromRoomId,
+      farDoor,
+      farWall,
+      farLateral,
+    });
+    if (!pick) return null;
+    if (out) out.conflict = pick.conflict;
+    if (pick.conflict) {
+      console.warn(
+        `[doors] no door here is free for this connection — arriving through ${pick.id}, which belongs to another one.`,
+      );
     }
-    // #62 P2: an assembled connection knows exactly which far door it lands on
-    // (the record's farDoor) — prefer it when enabled. The angled octagon links
-    // routinely land on NON-opposite doors (e.g. depart east, arrive north).
-    if (farDoor) {
-      const preferred = findDoor(farDoor);
-      if (preferred && preferred.enabled) return preferred;
-    }
-    // 🚪 #91: come out the door on the OPPOSITE WALL — matched by physical
-    // wall, not by door id. Door ids are logical slots, and a layout can park
-    // them anywhere (the pairs layouts put logical 'south' on the NORTH wall),
-    // so the old id→id opposite table would send you in through the north door
-    // and straight back out of the next room's north door: "traveling into a
-    // north door … exiting out of the north door of the other room, instead of
-    // exiting the south door heading north" (#91). Walls always mirror.
-    // Any door on that wall, free or cardinal. The old cardinal restriction
-    // existed because a mirror could not be written for a free arrival door, so
-    // arriving at one stranded the return; readAllDoors now iterates the map
-    // and main.ts writes the mirror for any id, so the restriction is retired.
-    // Prefer a cardinal when several doors share the facing wall, purely so the
-    // choice does not depend on DOORS insertion order.
-    const want = oppositeWall(depWall);
-    const onWall = DOORS.filter(
-      (d) => d.enabled && this.wallOfDoor(d.id) === want,
-    );
-    const facing = onWall.find((d) => isCardinalDoorId(d.id)) ?? onWall[0];
-    if (facing) return facing;
-    // 🚪 #91: no door on the facing wall — which is the NORM under the paired
-    // layouts, where all four cardinals share the north and west walls. Fall
-    // back to the pre-#91 id-opposite pairing so each departure still resolves
-    // to its OWN door; without this tier every arrival collapses onto the one
-    // `east` fallback below, dropping the traveler at the same spot no matter
-    // where they came from (and, at PAIR_OFFSET 3.0, inside the casino's
-    // authored furniture).
-    // 🚪 A CARDINAL-only tier by construction: it maps an id to its opposite
-    // ID, which only means anything for the four berths. A free door has no
-    // id-opposite — it is matched by WALL in the tier above, which is the
-    // honest test and already ran. Left in place for cardinals rather than
-    // deleted, because it is what rescues the fireplace-blocked south
-    // departure when no door sits on the facing wall.
-    const oppositeId: Record<PhysicalDoorId, PhysicalDoorId> = {
-      north: "south",
-      south: "north",
-      east: "west",
-      west: "east",
-    };
-    if (isCardinalDoorId(departureDoorId)) {
-      const counterpart = findDoor(oppositeId[departureDoorId]);
-      if (counterpart && counterpart.enabled) return counterpart;
-    }
-    // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
-    // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
-    // south departure, but degrade to any enabled door / any door at all instead
-    // of throwing when east is absent. DOORS is always non-empty (≥1 door).
-    const east = findDoor("east");
-    // ...and only when it is actually walkable — an arrival scripted through a
-    // DISABLED door walks the avatar through whatever is blocking it (#91).
-    // 🚪 DOORS can now legitimately be EMPTY (a doorless station), so the old
-    // `DOORS[0]!` non-emptiness assumption would deref undefined. You cannot
-    // WALK into a doorless room — transit needs a paired door — so this is
-    // unreachable in practice; returning null rather than asserting means a
-    // future caller that finds a way here fails a check instead of crashing.
-    return (east?.enabled ? east : undefined) ?? DOORS.find((d) => d.enabled) ?? DOORS[0] ?? null;
+    return findDoor(pick.id);
   }
 
   /**
@@ -4567,6 +4533,9 @@ export class World {
     farDoor?: string,
     fromRoomId?: string,
     departureWall?: DoorWall,
+    farWall?: DoorWall,
+    farLateral?: number,
+    departureLateral?: number,
   ): void {
     this.endTransitVestibule();
     // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
@@ -4583,6 +4552,9 @@ export class World {
       farDoor,
       fromRoomId,
       departureWall,
+      farWall,
+      farLateral,
+      departureLateral,
     );
     if (!arrival) {
       // Doorless arrival room: nothing to walk in through. Unreachable while
