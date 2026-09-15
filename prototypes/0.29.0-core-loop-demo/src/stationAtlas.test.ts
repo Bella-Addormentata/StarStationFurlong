@@ -8,7 +8,8 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas } from './stationAtlas';
+import { bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas, seedAtlasDefaults } from './stationAtlas';
+import type { BundledAtlasEntry } from './stationAtlas';
 
 /** vitest runs in node here, so the atlas's localStorage needs a shim. */
 const store = new Map<string, string>();
@@ -321,5 +322,106 @@ describe('eviction prefers first-hand knowledge (#144)', () => {
     const atlas = readAtlas();
     expect(Object.keys(atlas).length).toBeLessThanOrEqual(64);
     expect(atlas['module-mine']).toBeDefined();
+  });
+});
+
+describe("seedAtlasDefaults — a build's bundled station (defaultStation.ts)", () => {
+  const bundle = (): BundledAtlasEntry[] => [
+    {
+      roomId: 'module-hub', name: 'HUB', dims: { cols: 2, rows: 2 },
+      doors: { 'd:1': { targetRoomId: 'module-welcome', wall: 'x+', lateral: 0, farDoor: 'north', farWall: 'y-', farLateral: 0 } },
+    },
+    {
+      roomId: 'module-welcome', name: 'WELCOME', seed: 'ssf://room?seed=welcome', dims: { cols: 2, rows: 2 },
+      doors: { north: { targetRoomId: 'module-hub', wall: 'y-', lateral: 0, farDoor: 'd:1', farWall: 'x+', farLateral: 0 } },
+    },
+  ];
+
+  it('fills an empty atlas at gossip tier — no local stamp, the weakest gossip stamp — and is idempotent', () => {
+    expect(seedAtlasDefaults(bundle())).toBe(2);
+    const atlas = readAtlas();
+    expect(atlas['module-welcome'].seed).toBe('ssf://room?seed=welcome');
+    expect(atlas['module-welcome'].dims).toEqual({ cols: 2, rows: 2 });
+    expect(atlas['module-hub'].doors['d:1'].targetRoomId).toBe('module-welcome');
+    expect(atlas['module-hub'].doors['d:1'].targetSeed).toBe('');
+    expect(atlas['module-hub'].seed).toBeUndefined();
+    for (const e of Object.values(atlas)) {
+      expect(e.lastSeen).toBe(0);
+      expect(e.localSeenAt).toBeUndefined();
+    }
+    // A second boot writes nothing.
+    expect(seedAtlasDefaults(bundle())).toBe(0);
+  });
+
+  it('never touches a visited room or one with real geometry, but fills a doorless stub', () => {
+    harvestIntoAtlas({ roomId: 'module-hub', name: 'MY HUB', dims: { cols: 3, rows: 2 }, doors: [] });
+    // A neighbour stub exactly as harvestIntoAtlas mints them: placeholder name, the door's seed, no doors.
+    harvestIntoAtlas({ roomId: 'module-x', name: 'X', doors: [{ doorId: 'd:9', targetSeed: '#room=module-welcome' }] });
+    expect(seedAtlasDefaults(bundle())).toBe(1);
+    const atlas = readAtlas();
+    expect(atlas['module-hub'].name).toBe('MY HUB');
+    expect(atlas['module-hub'].dims).toEqual({ cols: 3, rows: 2 });
+    expect(atlas['module-hub'].doors).toEqual({});
+    expect(atlas['module-welcome'].name).toBe('WELCOME'); // the placeholder yielded
+    expect(atlas['module-welcome'].seed).toBe('#room=module-welcome'); // the stub's own seed stays
+    expect(atlas['module-welcome'].doors.north.targetRoomId).toBe('module-hub');
+    expect(atlas['module-welcome'].localSeenAt).toBeUndefined();
+  });
+
+  it('is outranked by the first honest gossip, which keeps the bundled seed', () => {
+    seedAtlasDefaults(bundle());
+    doc.getMap('atlas').set('module-welcome', {
+      roomId: 'module-welcome', name: 'SSF-WELCOME', dims: { cols: 3, rows: 3 },
+      doors: { north: { targetRoomId: 'module-hub', wall: 'y-', lateral: 2 } },
+      updatedAt: Date.now() - 60_000,
+    });
+    bind('module-hub');
+    const e = readAtlas()['module-welcome'];
+    expect(e.name).toBe('SSF-WELCOME');
+    expect(e.dims).toEqual({ cols: 3, rows: 3 });
+    expect(e.doors.north.lateral).toBe(2);
+    expect(e.seed).toBe('ssf://room?seed=welcome');
+    expect(e.localSeenAt).toBeUndefined();
+  });
+
+  it('is never republished as gossip — only rooms this install observed reach the doc', () => {
+    seedAtlasDefaults(bundle());
+    harvestIntoAtlas({ roomId: 'module-mine', name: 'MINE', doors: [{ doorId: 'd:1', targetSeed: '#room=module-hub' }] });
+    bind('module-mine');
+    pushAtlasToDoc();
+    expect([...doc.getMap('atlas').keys()]).toEqual(['module-mine']);
+  });
+
+  it('is not pushed even as the room we stand in — until a harvest of the synced replica stamps it', () => {
+    seedAtlasDefaults(bundle());
+    bind('module-hub');
+    pushAtlasToDoc();
+    expect([...doc.getMap('atlas').keys()]).toEqual([]);
+    harvestIntoAtlas({ roomId: 'module-hub', name: 'HUB', doors: [] });
+    pushAtlasToDoc();
+    expect([...doc.getMap('atlas').keys()]).toEqual(['module-hub']);
+  });
+
+  it('yields even to a ZERO-stamped record with the same door count — the #144 repair republishes at 0', () => {
+    seedAtlasDefaults(bundle());
+    // A peer whose legacy far-future stamp was repaired republishes at updatedAt 0
+    // (see "does not republish a legacy far-future stamp"); same door count as the bundle.
+    doc.getMap('atlas').set('module-hub', {
+      roomId: 'module-hub', name: 'HUB (repaired)', dims: { cols: 2, rows: 2 },
+      doors: { 'd:1': { targetRoomId: 'module-welcome', wall: 'x+', lateral: 1 } },
+      updatedAt: 0,
+    });
+    bind('module-mine');
+    const e = readAtlas()['module-hub'];
+    expect(e.name).toBe('HUB (repaired)');
+    expect(e.doors['d:1'].lateral).toBe(1);
+    expect(e.bundled).toBeUndefined();
+    expect(e.lastSeen).toBe(0);
+    // …and once real, it travels again like any observed entry: a fresh room
+    // doc receives it (at 0, as #144 intends) while the still-bundled welcome
+    // entry stays home.
+    const other = new Y.Doc();
+    bindStationAtlasDoc(other, { roomId: 'module-other', isPassagePublic: () => false });
+    expect([...other.getMap('atlas').keys()]).toEqual(['module-hub']);
   });
 });

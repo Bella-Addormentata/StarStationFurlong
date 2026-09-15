@@ -359,6 +359,15 @@
             <button type="button" id="access-use-btn" aria-label="Add the pasted pass to your rooms and start loading it">🚪 ADD PASS</button>
             <div class="phone-access-note">Adds the room below and loads it in the background — enter once it's ready.</div>
           </div>
+          <!-- 🛰️ Default station (src/defaultStation.ts): one tap adds the
+               welcome room's pass and takes you there — the same path as ADD
+               PASS with the bundled link. main.ts hides the section when a
+               build ships without a default station. -->
+          <div class="phone-access-section" id="access-default-station-section">
+            <div class="phone-access-header">DEFAULT STATION</div>
+            <button type="button" id="access-default-station-btn" aria-label="Add the default station's welcome room to your rooms and go there">🛰️ GO TO THE WELCOME ROOM</button>
+            <div class="phone-access-note">Everyone starts here — the shared station's welcome room. Meet other players, then dock a module of your own.</div>
+          </div>
           <div class="phone-access-section">
             <div class="phone-access-header">ROOMS</div>
             <div id="access-rooms-list" role="list" aria-label="Your rooms, grouped by owner"></div>

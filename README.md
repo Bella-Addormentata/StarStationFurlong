@@ -47,6 +47,21 @@ Full setup instructions: [prototypes/0.29.0-core-loop-demo/README.md](prototypes
 > *started* on, not the current version: `0.29.0-core-loop-demo` is what v0.35.0
 > ships. Earlier `0.2x` folders are frozen and kept for reference.
 
+### Default station (where a first run docks)
+
+A brand-new install docks at the **default station's welcome room** instead of
+minting an empty home module, so a new player's first sight is a whole station
+with people in it. The room is one constant — `WELCOME_ROOM_LINK` in
+[`prototypes/0.29.0-core-loop-demo/src/defaultStation.ts`](prototypes/0.29.0-core-loop-demo/src/defaultStation.ts)
+— and the station's layout ships beside it as
+[`defaultStation.atlas.json`](prototypes/0.29.0-core-loop-demo/src/defaultStation.atlas.json),
+so the whole station renders from space before the room has even synced. The
+file header explains how to point a build at a new station (GENERATE PASS in the
+new welcome room, paste the link, re-export the atlas from the devtools console).
+Keep the host node running: if the station does not answer, a first run falls
+back to its own home module, and the station stays one tap away in
+SpacePhone → ACCESS → DEFAULT STATION.
+
 ---
 
 ## Repository Structure
