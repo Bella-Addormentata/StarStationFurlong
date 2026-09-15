@@ -391,4 +391,14 @@ describe("seedAtlasDefaults — a build's bundled station (defaultStation.ts)", 
     pushAtlasToDoc();
     expect([...doc.getMap('atlas').keys()]).toEqual(['module-mine']);
   });
+
+  it('is not pushed even as the room we stand in — until a harvest of the synced replica stamps it', () => {
+    seedAtlasDefaults(bundle());
+    bind('module-hub');
+    pushAtlasToDoc();
+    expect([...doc.getMap('atlas').keys()]).toEqual([]);
+    harvestIntoAtlas({ roomId: 'module-hub', name: 'HUB', doors: [] });
+    pushAtlasToDoc();
+    expect([...doc.getMap('atlas').keys()]).toEqual(['module-hub']);
+  });
 });

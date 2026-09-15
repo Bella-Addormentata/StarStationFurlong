@@ -22,7 +22,8 @@
  * inside the pass is harmless on other machines: the browser always dials its
  * OWN local node, and the node bridges to the pass's iroh member hints
  * (main.ts resolveBridgeBootstrap). An empty link ships without a default
- * station — first runs boot home, as before.
+ * station — first runs boot home, as before, and nothing is seeded whatever
+ * the atlas file holds.
  *
  * defaultStation.atlas.json beside this file is the station's LAYOUT —
  * geometry, names and the connection graph, never seeds — exported from a
@@ -31,11 +32,14 @@
  * station renders from space the moment the player is docked at the welcome
  * room, before its doc has synced; real gossip and visits outrank it, and it
  * is never republished as gossip. To refresh it after rebuilding the station:
- * stand in any room of it (the shared atlas fills the local one), open the
- * devtools console, run
+ * stand in the new welcome room (the shared atlas fills the local one), open
+ * the devtools console, run
  *     copy(window.__ssfMesh.exportDefaultStationAtlas())
- * and paste over the JSON file. defaultStation.test.ts checks that the link
- * and the file agree and that every pairing in the file is reciprocal.
+ * — it exports the CONNECTED COMPONENT of the room you are standing in and
+ * nothing else your atlas happens to hold (pass a room id to export another
+ * station's) — and paste over the JSON file. defaultStation.test.ts checks
+ * that the link and the file agree and that every pairing in the file is
+ * reciprocal.
  */
 
 import { normalizeWall } from './doorLayoutDoc';
@@ -158,25 +162,66 @@ function parseSegments(value: unknown): ConnectorSegment[] | null {
   return out;
 }
 
-/** The bundled station, validated, with the welcome room carrying its link —
- *  the one seed a bundle ever holds, attached here from the constant above and
- *  never read from the file. Empty when this build ships no default station. */
-export function defaultStationAtlas(): BundledAtlasEntry[] {
-  if (!DEFAULT_STATION.welcomeRoomId) return [];
-  const entries = parseBundledAtlas(bundledAtlasJson);
+/** The bundled station for a given link and file — pure, so the empty
+ *  configuration is testable: no link ⇒ no station, whatever the file holds.
+ *  The welcome room carries the link as its seed — the one seed a bundle ever
+ *  holds, attached here and never read from the file. */
+export function defaultStationAtlasFor(welcomeRoomLink: string, raw: unknown): BundledAtlasEntry[] {
+  const welcomeRoomId = roomIdFromSeed(welcomeRoomLink);
+  if (!welcomeRoomId) return [];
+  const entries = parseBundledAtlas(raw);
   for (const e of entries) {
-    if (e.roomId === DEFAULT_STATION.welcomeRoomId) e.seed = DEFAULT_STATION.welcomeRoomLink;
+    if (e.roomId === welcomeRoomId) e.seed = welcomeRoomLink;
   }
   return entries;
 }
 
-/** What a client exports for the bundle (the devtools helper in the header):
- *  its local atlas minus everything personal — seeds, door seeds and both
- *  recency stamps — and minus doorless stubs, which add no geometry. */
-export function atlasForBundle(atlas: Record<string, AtlasEntry>): Record<string, BundledAtlasEntry> {
+/** The shipped station: WELCOME_ROOM_LINK + defaultStation.atlas.json. */
+export function defaultStationAtlas(): BundledAtlasEntry[] {
+  return defaultStationAtlasFor(DEFAULT_STATION.welcomeRoomLink, bundledAtlasJson);
+}
+
+/**
+ * What a client exports for the bundle (the devtools helper in the header):
+ * the CONNECTED COMPONENT of `welcomeRoomId` in its local atlas — the station,
+ * not every module this install ever visited (review of #156) — minus
+ * everything personal: seeds, door seeds and both recency stamps. Edges are
+ * walked both ways (a pairing recorded on either side joins the two rooms),
+ * the component is capped at the atlas's own size, and doorless stubs add no
+ * geometry so they are left out. Empty when the room is unknown.
+ */
+export function atlasForBundle(
+  atlas: Record<string, AtlasEntry>,
+  welcomeRoomId: string,
+): Record<string, BundledAtlasEntry> {
   const out: Record<string, BundledAtlasEntry> = {};
+  if (!welcomeRoomId || !atlas[welcomeRoomId]) return out;
+  const adjacent = new Map<string, Set<string>>();
+  const link = (a: string, b: string) => {
+    if (!adjacent.has(a)) adjacent.set(a, new Set());
+    adjacent.get(a)!.add(b);
+  };
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || !e.doors) continue;
+    for (const d of Object.values(e.doors)) {
+      if (!d?.targetRoomId) continue;
+      link(e.roomId, d.targetRoomId);
+      link(d.targetRoomId, e.roomId);
+    }
+  }
+  const component = new Set<string>([welcomeRoomId]);
+  const queue = [welcomeRoomId];
+  while (queue.length > 0) {
+    const rid = queue.shift()!;
+    for (const next of adjacent.get(rid) ?? []) {
+      if (component.has(next) || component.size >= MAX_ENTRIES) continue;
+      component.add(next);
+      queue.push(next);
+    }
+  }
+  for (const rid of component) {
+    const e = atlas[rid];
+    if (!e?.doors) continue;
     const doors: BundledAtlasEntry['doors'] = {};
     for (const [id, d] of Object.entries(e.doors)) {
       if (!d?.targetRoomId) continue;
@@ -192,8 +237,8 @@ export function atlasForBundle(atlas: Record<string, AtlasEntry>): Record<string
       };
     }
     if (Object.keys(doors).length === 0) continue;
-    out[e.roomId] = {
-      roomId: e.roomId,
+    out[rid] = {
+      roomId: rid,
       name: e.name,
       ...(e.dims ? { dims: e.dims } : {}),
       doors,

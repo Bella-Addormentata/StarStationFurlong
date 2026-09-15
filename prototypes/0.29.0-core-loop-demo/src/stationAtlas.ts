@@ -82,6 +82,11 @@ export interface AtlasEntry {
    *  makes it safe for eviction ordering. Optional: entries persisted before
    *  this field existed fall back to `lastSeen` in writeAtlas. */
   localSeenAt?: number;
+  /** 🛰️ Set by seedAtlasDefaults: this entry's geometry came from the build's
+   *  bundled default station, not from anything this install observed. It is
+   *  what pushAtlasToDoc refuses to publish. Dropped the moment a harvest or a
+   *  gossip pull rebuilds the entry — both construct it afresh. */
+  bundled?: true;
 }
 
 const KEY = 'ssf-station-atlas';
@@ -350,8 +355,9 @@ export interface BundledAtlasEntry {
  *     nothing about and neighbour stubs (a name, no doors, no size);
  *   · a filled entry keeps whatever gossip stamp it had, else `lastSeen: 0`,
  *     and never gains a local stamp — so the first honest gossip about it wins
- *     the pull's `prior.lastSeen >= updatedAt` check, it evicts before any
- *     visited room, and pushAtlasToDoc never republishes it as observed.
+ *     the pull's `prior.lastSeen >= updatedAt` check and it evicts before any
+ *     visited room — and it is flagged `bundled`, which is what keeps
+ *     pushAtlasToDoc from ever publishing it as something we observed.
  * Returns the number of entries written.
  */
 export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
@@ -388,6 +394,7 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
       doors,
       lastSeen: prior?.lastSeen ?? 0,
       // Deliberately no localSeenAt: bundled knowledge is second-hand.
+      bundled: true,
     };
     written++;
   }
@@ -781,12 +788,14 @@ export function pushAtlasToDoc(): void {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
       if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
-      // 🛰️ Never republish what this install never observed: a bundled
-      // default-station entry (seedAtlasDefaults) sits at `lastSeen: 0` until
-      // real gossip or a visit re-stamps it — and so does a stamp the poison
-      // repair in readAtlas zeroed. Publishing either would hand every room we
-      // join a record that reads as observed, under the weakest stamp there is.
-      if (!isOwn && entry.lastSeen <= 0) continue;
+      // 🛰️ Never publish what this install never observed: an entry the
+      // build's bundled default station wrote (seedAtlasDefaults) would reach
+      // every room we join as if we had seen it. The room we are standing in
+      // included — until a harvest of its SYNCED replica rebuilds the entry,
+      // it is still second-hand. (A repaired legacy stamp is a different
+      // case: that entry WAS observed, and #144 republishes it at 0 so honest
+      // gossip outranks it.)
+      if (entry.bundled) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
       if (known && !isOwn

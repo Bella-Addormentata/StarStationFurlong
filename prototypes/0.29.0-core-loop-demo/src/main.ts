@@ -402,10 +402,18 @@ const networkProvider = new NetworkProvider();
   count: () => peerCount(),
   list: () => listPeers(),
   hintsFor,
-  // 🛰️ The default-station bundle, from this install's atlas — see the
-  // "Changing the default station" steps in defaultStation.ts.
-  exportDefaultStationAtlas: () =>
-    JSON.stringify(atlasForBundle(readAtlas()), null, 2),
+  // 🛰️ The default-station bundle: the connected component of the room you
+  // are standing in (or of `roomId`), stripped of everything personal — see
+  // the "Changing the default station" steps in defaultStation.ts.
+  exportDefaultStationAtlas: (roomId?: string) =>
+    JSON.stringify(
+      atlasForBundle(
+        readAtlas(),
+        roomId ?? activeBootstrap?.roomId ?? DEFAULT_STATION.welcomeRoomId,
+      ),
+      null,
+      2,
+    ),
 };
 let yjsSync: YjsSync | null = null;
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
@@ -437,6 +445,11 @@ const REMOTE_PEER_TIMEOUT_MS = 10_000;
 const REMOTE_REAPER_SWEEP_MS = 2_000;
 let lastReaperSweep = 0;
 let pendingBootstrapOverride: RoomBootstrap | null = null;
+/** 🔗 The in-flight ?seed= import (setupNetworkDetailsPanel): the raw pass is
+ *  registered as the override synchronously, and bootstrapNetworking awaits
+ *  this so it dials the BRIDGED form — an explicit link is never raced by the
+ *  last-room resume or the default station (review of #156). */
+let urlSeedImport: Promise<void> | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
 /** 🆕 #79 P4: guards a single home-fallback if resuming the last room fails. */
 let resumeRetried = false;
@@ -837,6 +850,11 @@ async function bootstrapNetworking() {
     // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
+    // 🔗 An explicit ?seed= link is registered synchronously and bridged
+    // asynchronously (setupNetworkDetailsPanel) — wait for the bridged form so
+    // the dial goes through the local node, and so the resume/default-station
+    // branches below see the override whatever the timing.
+    if (urlSeedImport) await urlSeedImport;
     // 🆕 #79 P4: resume the room the player last shut down in (persisted on
     // entry). Only when there's no explicit override — a ?seed=/Use-link import
     // always wins — and it becomes a normal JOIN into that room.
@@ -947,11 +965,7 @@ async function bootstrapNetworking() {
       await awaitInitialRoomState(DEFAULT_STATION_SYNC_GATE_MS);
       if (epochAtJoin !== sessionEpoch) return; // a newer session owns the state
       const sync = yjsSync;
-      const roomInfo = sync?.doc.getMap("roomInfo");
-      const reached =
-        !!sync &&
-        (sync.linkedSynced ||
-          (!!roomInfo?.has("owner") && !!roomInfo?.has("name")));
+      const reached = !!sync && initialRoomStateReady(sync);
       if (!reached) {
         throw new Error(
           `${DEFAULT_STATION.name} did not answer within ${DEFAULT_STATION_SYNC_GATE_MS / 1000}s`,
@@ -1399,6 +1413,16 @@ async function joinRoomAtEpoch(
   // the same room.
   setAtlasHarvestArmed(true);
   harvestStationAtlas();
+  // 🛰️ …and again once the host's state has actually landed: the call above
+  // is a no-op on an unsynced replica (see harvestStationAtlas), and a room
+  // with no door changes after the sync would otherwise never be harvested
+  // this visit. Epoch-guarded like every post-await write; a gate timeout
+  // leaves the room unharvested rather than recording an empty replica.
+  void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
+    if (epoch !== sessionEpoch || yjsSync !== sync) return;
+    harvestStationAtlas();
+    refreshExteriorView();
+  });
 
   // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
   // whenever it shows us as a shareholder, refresh the personal ledger that
@@ -2076,6 +2100,16 @@ const SYNC_GATE_MS = 8_000;
  *  the ACCESS app's own "up to ~30s". Nothing is held while it runs. */
 const DEFAULT_STATION_SYNC_GATE_MS = 30_000;
 
+/** 🛰️ The ONE rule for "has this room's shared state arrived": a post-link
+ *  SyncStep2 (`linkedSynced`), or the host's roomInfo owner+name — the
+ *  reasoning lives in awaitInitialRoomState below. It also gates the atlas
+ *  harvest: until this holds the replica is EMPTY, and an empty replica is not
+ *  knowledge about the room. */
+function initialRoomStateReady(sync: YjsSync): boolean {
+  const roomMap = sync.doc.getMap("roomInfo");
+  return sync.linkedSynced || (roomMap.has("owner") && roomMap.has("name"));
+}
+
 /**
  * Resolve once the freshly-joined room's shared state has converged, or after
  * `timeoutMs` as a fallback (issue #60 P1.3). Ready on EITHER the host's
@@ -2103,8 +2137,7 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
   // opens on a SyncStep2 received after the peer linked — i.e. real host state.
   // Keys present ⇒ we know the room; post-link sync ⇒ we know there are no keys
   // coming. The timeout covers a genuinely ownerless/never-linking room.
-  const ready = () =>
-    sync.linkedSynced || (roomMap.has("owner") && roomMap.has("name"));
+  const ready = () => initialRoomStateReady(sync);
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -3014,6 +3047,16 @@ function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
   const roomId = activeBootstrap?.roomId;
   if (!roomId) return;
+  // 🛰️ Never harvest an UNSYNCED replica. Before the host's state lands the
+  // doc is empty, and recording that as first-hand — "Module", no doors, a
+  // fresh local stamp — erased what the atlas already knew about this room (a
+  // bundled default station, or gossip) and published the placeholder into
+  // the room doc (review of #156). The join schedules a harvest for when the
+  // state arrives; door changes after that harvest as before. A room whose
+  // host never answers is simply not harvested this visit — the exterior draws
+  // the module we stand in from its live geometry, not from the atlas.
+  const sync = yjsSync;
+  if (!sync || !initialRoomStateReady(sync)) return;
   const name =
     (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) ||
     "Module";
@@ -7163,13 +7206,23 @@ function setupNetworkDetailsPanel() {
   if (urlSeed) {
     const imported = decodeBootstrapSeed(urlSeed);
     if (imported) {
-      resolveBridgeBootstrap(imported).then((resolved) => {
-        pendingBootstrapOverride = resolved;
-        if (feedback) {
-          feedback.textContent =
-            "Zero-config P2P Seed loaded from URL. Entering lobby...";
-        }
-      });
+      // Registered SYNCHRONOUSLY, then refined: the boot reads the override
+      // before this resolution can settle (it awaits the local node), so the
+      // raw pass claims the slot at once — an explicit link outranks the
+      // last-room resume and the default station whatever the timing — and
+      // bootstrapNetworking awaits `urlSeedImport` to dial the bridged form.
+      pendingBootstrapOverride = imported;
+      urlSeedImport = resolveBridgeBootstrap(imported)
+        .then((resolved) => {
+          pendingBootstrapOverride = resolved;
+          if (feedback) {
+            feedback.textContent =
+              "Zero-config P2P Seed loaded from URL. Entering lobby...";
+          }
+        })
+        .catch(() => {
+          /* the raw pass stays registered — the loopback guard refreshes its cert */
+        });
       const accessPassInput = document.getElementById(
         "access-pass-input",
       ) as HTMLInputElement | null;
