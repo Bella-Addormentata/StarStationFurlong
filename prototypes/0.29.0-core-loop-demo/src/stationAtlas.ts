@@ -712,7 +712,14 @@ function pullSharedAtlas(): void {
       if (door && typeof door.targetRoomId === 'string' && door.targetRoomId) incoming++;
       if (incoming >= MAX_DOORS_PER_ENTRY) break;
     }
+    // 🛰️ A BUNDLED prior (seedAtlasDefaults) never wins this comparison: it is
+    // second-hand build data at `lastSeen: 0`, and 0 is a legitimate gossip
+    // stamp — the #144 repair republishes a corrected legacy entry at
+    // `updatedAt: 0`, which the `>=` below would otherwise let the bundle
+    // outrank when the door counts tie, leaving the flag stuck forever
+    // (review of #156, round 3). Any valid shared record replaces it.
     if (prior
+      && !prior.bundled
       && prior.lastSeen >= value.updatedAt
       && Object.keys(prior.doors).length >= incoming) continue;
     const doors: Record<string, AtlasDoor> = {};

@@ -401,4 +401,27 @@ describe("seedAtlasDefaults — a build's bundled station (defaultStation.ts)", 
     pushAtlasToDoc();
     expect([...doc.getMap('atlas').keys()]).toEqual(['module-hub']);
   });
+
+  it('yields even to a ZERO-stamped record with the same door count — the #144 repair republishes at 0', () => {
+    seedAtlasDefaults(bundle());
+    // A peer whose legacy far-future stamp was repaired republishes at updatedAt 0
+    // (see "does not republish a legacy far-future stamp"); same door count as the bundle.
+    doc.getMap('atlas').set('module-hub', {
+      roomId: 'module-hub', name: 'HUB (repaired)', dims: { cols: 2, rows: 2 },
+      doors: { 'd:1': { targetRoomId: 'module-welcome', wall: 'x+', lateral: 1 } },
+      updatedAt: 0,
+    });
+    bind('module-mine');
+    const e = readAtlas()['module-hub'];
+    expect(e.name).toBe('HUB (repaired)');
+    expect(e.doors['d:1'].lateral).toBe(1);
+    expect(e.bundled).toBeUndefined();
+    expect(e.lastSeen).toBe(0);
+    // …and once real, it travels again like any observed entry: a fresh room
+    // doc receives it (at 0, as #144 intends) while the still-bundled welcome
+    // entry stays home.
+    const other = new Y.Doc();
+    bindStationAtlasDoc(other, { roomId: 'module-other', isPassagePublic: () => false });
+    expect([...other.getMap('atlas').keys()]).toEqual(['module-hub']);
+  });
 });
