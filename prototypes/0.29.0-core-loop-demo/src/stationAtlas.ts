@@ -85,13 +85,13 @@ export interface AtlasEntry {
 }
 
 const KEY = 'ssf-station-atlas';
-const MAX_ENTRIES = 64;
+export const MAX_ENTRIES = 64;
 /** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
  *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
  *  peer-written object that isSharedAtlasEntry does not size-check, and every
  *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
  *  scan), so without this one entry could carry an arbitrarily large set. */
-const MAX_DOORS_PER_ENTRY = 64;
+export const MAX_DOORS_PER_ENTRY = 64;
 /** Raw `doors` keys a shared entry may carry before the whole entry is refused
  *  at ingest. An honest publisher never exceeds MAX_DOORS_PER_ENTRY (it pushes
  *  what readAllDoors read); the slack tolerates junk keys among real ones
@@ -314,6 +314,85 @@ export function noteRoomSeed(roomId: string, name: string, seed: string): void {
     localSeenAt: prior?.localSeenAt ?? Date.now(),
   };
   writeAtlas(atlas);
+}
+
+/**
+ * 🛰️ A build-time atlas entry — the shape defaultStation.atlas.json ships
+ * (see defaultStation.ts). Geometry, names and the connection graph only: the
+ * ONE seed a bundle may carry is the welcome room's own link, attached by
+ * defaultStation.ts from its single link constant, never read from the file.
+ */
+export interface BundledAtlasEntry {
+  roomId: string;
+  name: string;
+  dims?: { cols: number; rows: number };
+  /** A reach-this-room link — the welcome room only (defaultStation.ts). */
+  seed?: string;
+  doors: Record<string, {
+    targetRoomId: string;
+    segments?: ConnectorSegment[];
+    farDoor?: string;
+    farWall?: DoorWall;
+    farLateral?: number;
+    farYawDeg?: 0 | 45;
+    wall?: DoorWall;
+    lateral?: number;
+  }>;
+}
+
+/**
+ * 🛰️ Merge a build's bundled station into the local atlas — at GOSSIP tier,
+ * below everything this install learned itself. Called once per boot, so a
+ * brand-new install renders the default station from space before the welcome
+ * room's doc has synced (defaultStation.ts). Who outranks whom:
+ *   · an entry with ANY first-hand recency (`localSeenAt`) or any door
+ *     geometry is left exactly as it is — the bundle only fills rooms we know
+ *     nothing about and neighbour stubs (a name, no doors, no size);
+ *   · a filled entry keeps whatever gossip stamp it had, else `lastSeen: 0`,
+ *     and never gains a local stamp — so the first honest gossip about it wins
+ *     the pull's `prior.lastSeen >= updatedAt` check, it evicts before any
+ *     visited room, and pushAtlasToDoc never republishes it as observed.
+ * Returns the number of entries written.
+ */
+export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
+  const atlas = readAtlas();
+  let written = 0;
+  for (const b of bundle) {
+    if (!b.roomId) continue;
+    const prior = atlas[b.roomId];
+    if (prior && (prior.localSeenAt !== undefined || Object.keys(prior.doors).length > 0)) continue;
+    const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
+    for (const [d, door] of Object.entries(b.doors)) {
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
+      if (!door || !door.targetRoomId) continue;
+      doors[d] = {
+        targetSeed: '',
+        targetRoomId: door.targetRoomId,
+        segments: door.segments,
+        farDoor: door.farDoor,
+        farWall: door.farWall,
+        farLateral: door.farLateral,
+        farYawDeg: door.farYawDeg,
+        wall: door.wall,
+        lateral: door.lateral,
+      };
+      kept++;
+    }
+    atlas[b.roomId] = {
+      roomId: b.roomId,
+      // A stub's placeholder name yields to the bundle's; a real one stays.
+      name: prior?.name && prior.name !== 'Module' ? prior.name : (b.name || 'Module'),
+      seed: prior?.seed || b.seed,
+      dims: prior?.dims ?? b.dims,
+      doors,
+      lastSeen: prior?.lastSeen ?? 0,
+      // Deliberately no localSeenAt: bundled knowledge is second-hand.
+    };
+    written++;
+  }
+  if (written) writeAtlas(atlas);
+  return written;
 }
 
 export interface AtlasPose {
@@ -566,7 +645,7 @@ function ownKeysExceed(obj: object, limit: number): boolean {
   return false;
 }
 
-function isSaneDims(d: unknown): d is { cols: number; rows: number } {
+export function isSaneDims(d: unknown): d is { cols: number; rows: number } {
   if (typeof d !== 'object' || d === null) return false;
   const v = d as { cols?: unknown; rows?: unknown };
   const ok = (n: unknown) =>
@@ -702,6 +781,12 @@ export function pushAtlasToDoc(): void {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
       if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
+      // 🛰️ Never republish what this install never observed: a bundled
+      // default-station entry (seedAtlasDefaults) sits at `lastSeen: 0` until
+      // real gossip or a visit re-stamps it — and so does a stamp the poison
+      // repair in readAtlas zeroed. Publishing either would hand every room we
+      // join a record that reads as observed, under the weakest stamp there is.
+      if (!isOwn && entry.lastSeen <= 0) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
       if (known && !isOwn
