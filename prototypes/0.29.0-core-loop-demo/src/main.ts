@@ -1003,6 +1003,13 @@ async function bootstrapNetworking() {
         /* privacy mode */
       }
       pendingBootstrapOverride = null;
+      // ⚠️ Forget the station as the ACTIVE room too. The connect succeeded
+      // before the gate gave up, so activeBootstrap names the station, and
+      // leaveRoom keeps it as last-room memory — fetchDefaultBootstrap would
+      // then mint the "home" boot from the station's id and key, rejoin a
+      // local replica of it with claimRoomDefaults=true, and CLAIM that fork
+      // (review of #156, round 2). Home is getDefaultRoomId(), nothing else.
+      activeBootstrap = null;
       logToPhoneSystem(
         `⚠️ ${DEFAULT_STATION.name} did not answer — booting your own module instead. It stays in ACCESS → ROOMS; enter it from there once it reads READY.`,
       );
@@ -1018,6 +1025,10 @@ async function bootstrapNetworking() {
       resumeRetried = true;
       localStorage.removeItem("ssf-last-room");
       pendingBootstrapOverride = null;
+      // Same fork-claim hazard as the default-station fallback above: a resume
+      // that failed AFTER its connect leaves activeBootstrap on the last room,
+      // and fetchDefaultBootstrap would rebuild "home" from it.
+      activeBootstrap = null;
       console.warn("Resume into last room failed — falling back to home.");
       return bootstrapNetworking();
     }
