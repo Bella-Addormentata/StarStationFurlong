@@ -35,7 +35,10 @@ describe("capDoorOpenings", () => {
       3,
       4,
     );
-    expect(out.neg).toEqual([{ lo: -1, hi: 1.8, top: 3 }]);
+    expect(out.neg).toEqual([
+      { lo: -1, hi: 1, top: 3 },
+      { lo: 1, hi: 1.8, top: 2.5 },
+    ]);
     expect(out.pos).toEqual([{ lo: 1.9, hi: 2.95, top: 3 }]);
   });
 
@@ -48,5 +51,21 @@ describe("capDoorOpenings", () => {
     );
     expect(out.neg).toEqual([{ lo: -1, hi: 1, top: 3.95 }]);
     expect(out.pos).toEqual([]);
+  });
+
+  it("keeps taller and shorter overlaps as separate-height spans", () => {
+    const out = capDoorOpenings(
+      "x",
+      [
+        { wall: "y-", lateral: -0.2, width: 2, height: 2.4 },
+        { wall: "y-", lateral: 0.6, width: 2, height: 3 },
+      ],
+      3,
+      4,
+    );
+    expect(out.neg).toEqual([
+      { lo: -1.2, hi: -0.4, top: 2.4 },
+      { lo: -0.4, hi: 1.6, top: 3 },
+    ]);
   });
 });

@@ -736,18 +736,27 @@ export function capDoorOpenings(
     }
   }
   const merge = (src: Array<{ lo: number; hi: number; top: number }>): CapOpening[] => {
-    const sorted = [...src].sort((a, b) => a.lo - b.lo);
-    const out: CapOpening[] = [];
-    for (const cur of sorted) {
-      const prev = out[out.length - 1];
-      if (!prev || cur.lo > prev.hi) {
-        out.push({ ...cur });
-        continue;
+    if (src.length === 0) return [];
+    const cuts = [...new Set(src.flatMap((o) => [o.lo, o.hi]))].sort((a, b) => a - b);
+    const spans: CapOpening[] = [];
+    for (let i = 0; i < cuts.length - 1; i++) {
+      const lo = cuts[i];
+      const hi = cuts[i + 1];
+      if (hi - lo <= 1e-6) continue;
+      const mid = (lo + hi) / 2;
+      let top = 0;
+      for (const o of src) {
+        if (mid >= o.lo && mid <= o.hi) top = Math.max(top, o.top);
       }
-      prev.hi = Math.max(prev.hi, cur.hi);
-      prev.top = Math.max(prev.top, cur.top);
+      if (top <= 0) continue;
+      const prev = spans[spans.length - 1];
+      if (prev && Math.abs(prev.top - top) < 1e-6 && Math.abs(prev.hi - lo) < 1e-6) {
+        prev.hi = hi;
+      } else {
+        spans.push({ lo, hi, top });
+      }
     }
-    return out;
+    return spans;
   };
   return { neg: merge(neg), pos: merge(pos) };
 }
