@@ -30,6 +30,8 @@ const ROBOT_SCALE = 1.4;
 /** 🦵 Hip pivot height — squats drop the hips (and torso) by the thigh-fold
  *  shortening so the feet stay planted while the knees bend. */
 const HIP_Y = 0.98;
+/** Shoulder pivot height of the arm groups. */
+const SHOULDER_Y = 1.6;
 /** 🗨️ World-space anchor for the bot's overhead lines — just above the
  *  scaled hair and headset (≈2.9), co-owned with the geometry so a rebuild
  *  that changes the bot's height updates the bubbles with it. */
@@ -124,6 +126,80 @@ const COACH_MOVES = [
   { name: 'jack', call: 'Jumping jacks! Arms up — eight!', reps: 8, repSecs: 0.9 },
   { name: 'lunge', call: 'Lunges — alternate legs, nice and low!', reps: 8, repSecs: 1.8 },
 ] as const;
+/** 💪 'arms' routine — the same class loop, ARMS ONLY, so a fox can follow
+ *  it standing OR seated. Each move opens with a short how-to (`cues`,
+ *  spoken one line at a time after the call) while the bot holds the
+ *  move's start position. */
+const ARM_MOVES = [
+  {
+    name: 'fly', call: 'First up: bent-arm chest fly!', reps: 8, repSecs: 2.4,
+    cues: [
+      'Elbows up at shoulder height, arms bent.',
+      'Hug a big tree — squeeze your chest, then open.',
+    ],
+  },
+  {
+    name: 'press', call: 'Next: overhead press!', reps: 8, repSecs: 2.2,
+    cues: [
+      'Hands at your shoulders, elbows under your wrists.',
+      'Push straight up, then bring them back down.',
+    ],
+  },
+  {
+    name: 'lateral', call: 'Next: lateral raises!', reps: 8, repSecs: 2.2,
+    cues: [
+      'Arms at your sides, elbows soft.',
+      'Lift out to shoulder height — no higher.',
+    ],
+  },
+  {
+    name: 'kickback', call: 'Next: triceps kickbacks!', reps: 8, repSecs: 2.0,
+    cues: [
+      'Elbows tucked back by your ribs.',
+      'Straighten your arms behind you and squeeze.',
+    ],
+  },
+  {
+    name: 'front', call: 'Last one: front raises!', reps: 8, repSecs: 2.2,
+    cues: [
+      'Arms straight down in front, core tight.',
+      'Lift to shoulder height, then lower.',
+    ],
+  },
+] as const;
+type ClassMove = (typeof COACH_MOVES)[number] | (typeof ARM_MOVES)[number];
+type MoveName = ClassMove['name'];
+/** Routines that run the staged class (walk to centre, face the camera). */
+function isClassRoutine(routine: RobotRoutine): boolean {
+  return routine === 'coach' || routine === 'arms';
+}
+/** The spoken intro of a move: its call, then any how-to cues. */
+function introLines(move: ClassMove): readonly string[] {
+  return 'cues' in move ? [move.call, ...move.cues] : [move.call];
+}
+/** 'done' = the arm class ran its single round and said goodbye (it doesn't
+ *  loop; STOP → START or a routine change runs it again). */
+type CoachPhase = 'welcome' | 'announce' | 'reps' | 'rest' | 'done';
+/** 💪 The arm class's upbeat opening, spoken line by line (waving, bouncing)
+ *  before the first move — 'welcome' phase. */
+const ARM_WELCOME: readonly string[] = [
+  'Hi everyone! Join me for a relaxing arm workout — under 3 minutes!',
+  'Stand or sit — standing is even better.',
+  'Five moves, eight reps each, nice and slow. Let’s go!',
+];
+/** Hold after each welcome line. */
+const ARM_WELCOME_SECS = 3.2;
+/** 💪 The arm class's closing line, spoken once after its last set. */
+const ARM_OUTRO = 'Thanks for joining me for this relaxing starter!';
+/** Hold after each intro line of a move WITH cues (its last cue too, so the
+ *  how-to stays readable before the count starts) — long enough to read. */
+const COACH_CUE_SECS = 2.8;
+/** 💪 The arm class's fixed facing off the camera (rad): 22.5° to the
+ *  performers' OWN right (screen lower-left; owner request). The fox follows
+ *  it exactly (Player.setFacing — not the 8-way snap). */
+const ARM_CLASS_TURN = -Math.PI / 8;
+/** 💪 Arm-move start position eases in over this long during the intro. */
+const ARM_START_EASE_SECS = 0.6;
 /** Rep count words, spoken as each rep begins ("One!" … "Eight!"). */
 const COUNT_WORDS: readonly string[] = [
   'One!', 'Two!', 'Three!', 'Four!', 'Five!', 'Six!', 'Seven!', 'Eight!',
@@ -138,7 +214,7 @@ function holdCurve(t: number): number {
 }
 /** THE per-move rep curve — one source for the robot's demo and the fox's
  *  mirror, so the two rigs can't fall out of step. */
-function curveFor(name: (typeof COACH_MOVES)[number]['name'], t: number): number {
+function curveFor(name: MoveName, t: number): number {
   return name === 'jack' ? Math.sin(Math.PI * t) : holdCurve(t);
 }
 const COACH_ANNOUNCE_SECS = 1.6; // beat between the call and the first rep
@@ -148,12 +224,68 @@ const COACH_REST_LINES: readonly string[] = [
   'Great set! Breathe…',
   'Nice form! Quick breather.',
 ];
+/** 💪 The arm class's rest lines, one per rest IN ORDER (after moves 1–4) —
+ *  never repeated, and the last one leads into the final move. */
+const ARM_REST_LINES: readonly string[] = [
+  'Nice work! Shake it out.',
+  'Great set! Breathe.',
+  'Good form! Quick rest.',
+  'Almost there — one more!',
+];
 /** Proximity invite (the coach's flavour of small talk). */
 const COACH_INVITES: readonly string[] = [
   'Join me for a set?',
   'Workout time — follow along if you like!',
   'A fit clone is a happy clone. Care to try?',
 ];
+/** 💪 The arm coach's invites. */
+const ARM_INVITES: readonly string[] = [
+  'Join in — stand or sit!',
+  'Arm workout — follow along!',
+];
+/** 💪 One arm-move pose on the robot rig, both sides mirrored: `a` swings the
+ *  whole arm about the shoulder (X; + = back), `f` bends the elbow (X, in the
+ *  arm's frame), `z` raises the arm out sideways (or, on a forward-held arm,
+ *  rolls the elbow bend inward), and `y` then swings it open horizontally
+ *  (the arm group's Euler order is YZX, so X → Z → Y apply in that order). Angles are measured from the
+ *  rig's tray-carry rest: a = +0.59 hangs the upper arm straight down, and
+ *  a + f = π/2 points the forearm straight down too. */
+interface ArmPose { a: number; f: number; z: number; y?: number }
+const ARM_HANG = 0.59;
+const FORE_HANG = Math.PI / 2 - ARM_HANG;
+function robotArmPose(name: MoveName, k: number): ArmPose | null {
+  switch (name) {
+    case 'fly': // "hug a tree": upper arms level, elbows bent 90° with the
+      // forearms rolled inward; the arms sweep from wide open (k = 0) to
+      // together in front of the chest (k = 1).
+      return { a: -0.98, f: -0.59, z: Math.PI / 2, y: 1.35 * (1 - k) };
+    case 'press': // upper arm forward-level → overhead; forearm stays vertical
+      return { a: -0.98 - 1.57 * k, f: -0.59 + 1.57 * k, z: -0.25 }; // (−z flares a RAISED arm out)
+    case 'lateral': // straight arms from the sides out to shoulder height
+      return { a: ARM_HANG, f: FORE_HANG, z: 1.5 * k };
+    case 'kickback': // upper arm back by the ribs; forearm extends behind
+      return { a: 1.62, f: -0.05 + 1.03 * k, z: 0.12 };
+    case 'front': // straight arms from hanging to forward-level
+      return { a: ARM_HANG - 1.57 * k, f: FORE_HANG, z: 0 };
+    default:
+      return null;
+  }
+}
+/** 💪 The chibi fox's mirror of an arm move (its arms have no elbow, so each
+ *  move is the closest one-joint read). Legs and torso untouched — the same
+ *  pose works standing or seated. */
+function foxArmPose(name: MoveName, k: number): WorkoutPose | null {
+  const arms = (x: number, z: number): WorkoutPose =>
+    ({ dip: 0, armLX: x, armRX: x, armZ: z, legZ: 0, armsOnly: true });
+  switch (name) {
+    case 'fly': return arms(-1.5 * k, 1.5 * (1 - k)); // out wide → forward
+    case 'press': return arms(0, 1.5 + 1.4 * k);
+    case 'lateral': return arms(0, 1.55 * k);
+    case 'kickback': return arms(0.45 + 0.55 * k, 0);
+    case 'front': return arms(-1.5 * k, 0);
+    default: return null;
+  }
+}
 
 /** 🍹 Spoken once as a serve begins (the OFFER turn-to-face) — the #77
  *  "stopping to ask if a person would like a drink" beat. One line per serve;
@@ -195,6 +327,9 @@ export class PoolWaiter {
   /** 🏋️ Shoulder-pivoted arm groups (rotation zero = tray-carry pose). */
   private armL!: THREE.Group;
   private armR!: THREE.Group;
+  /** 💪 Elbow-pivoted forearm subgroups (inside armL/armR) — chest flies/kickbacks. */
+  private foreL!: THREE.Group;
+  private foreR!: THREE.Group;
   /** 🦵 Knee-pivoted shin subgroups (inside legL/legR) — squat knee bend. */
   private shinL!: THREE.Group;
   private shinR!: THREE.Group;
@@ -260,10 +395,12 @@ export class PoolWaiter {
   /** 🏋️ coach-routine state: which move, where in its announce/reps/rest
    *  cycle, and the once-per-phase say latch. */
   private coachMove = 0;
-  private coachPhase: 'announce' | 'reps' | 'rest' = 'announce';
+  private coachPhase: CoachPhase = 'announce';
   private coachTimer = 0;
   private coachRep = 0;
   private coachSaid = false;
+  /** 💪 Which intro line (call, then cues) the announce phase is on. */
+  private coachIntroLine = 0;
   /** 🎥 Camera-facing yaw while coaching (world-provided; null = dock facing). */
   private stageYaw: number | null = null;
   /** 🏋️ The class stage — open floor nearest room centre (lazy, per class). */
@@ -393,14 +530,15 @@ export class PoolWaiter {
   private build(): void {
     // 💃 Android livery (owner reference: a humanoid android with a human
     // face and long medium-brown hair under white headphones, fully mechanical
-    // white-plated limbs with dark joint segments, bare skin torso — dressed
-    // in a red bikini). Same rig as before: hip-pivoted legs with knee shins,
+    // white-plated limbs with dark joint segments — dressed in a fitted red
+    // tennis dress with a short flared skirt). Same rig as before: hip-pivoted legs with knee shins,
     // shoulder-pivoted arms, one bobbing body group, the tray at the hands —
     // so every routine animates unchanged.
     const SKIN = this.mat(0xf0c2a2, 0.55, 0.05); // synthetic skin
     const PLATE = this.mat(0xf9fafc, 0.32, 0.2); // white limb plating (low metalness: no env map here)
     const MECH = this.mat(0x22262b, 0.55, 0.35); // dark joint mechanics
-    const RED = this.mat(0xe0243a, 0.45, 0.1); // red bikini
+    const RED = this.mat(0xe0243a, 0.45, 0.1); // red tennis dress
+    const TRIM = this.mat(0xffffff, 0.5, 0.05); // white tennis-dress piping
     const GLOW = this.mat(0x35e6ff, 0.4, 0.1, 0x35e6ff, 1.6); // cyan light strips
     const HAIR = this.mat(0x8a5a33, 0.6, 0.1); // long medium-brown hair
     const BROW = this.mat(0x5a381e, 0.7, 0.05); // brows a shade darker than the hair
@@ -439,34 +577,35 @@ export class PoolWaiter {
       }
     }
 
-    // Body group (hips → bare waist → chest → head) — bobs as one while
-    // walking. The bare torso is an HOURGLASS of tapered segments: hips flare
-    // out under the bikini bottom, the waist pinches, the ribcage widens
-    // again under the bust — with a soft 2×3 ab grid on the midriff.
+    // Body group (hips → waist → chest → head) — bobs as one while walking.
+    // 🎾 The torso keeps its HOURGLASS of tapered segments, now dressed in a
+    // fitted sleeveless red tennis dress: the bodice hugs the flare / pinch /
+    // ribcage, and a short flared skirt with a white hem hangs from the hips.
+    // The skirt is an open cone on the body group, so walking and squat legs
+    // swing inside it rather than dragging it along.
     this.body = new THREE.Group();
     this.group.add(this.body);
-    const ABS = this.mat(0xdfae8c, 0.6, 0.05); // ab shading (a shade under skin)
-    this.box(this.body, 0.3, 0.12, 0.16, RED, 0, 1.06, 0.01); // bikini bottom
     for (const side of [-1, 1] as const) {
-      this.ball(this.body, 0.08, SKIN, side * 0.15, 1.07, 0); // rounded hip
-      this.ball(this.body, 0.088, RED, side * 0.072, 1.04, -0.065); // glute (under the bikini)
-      this.ball(this.body, 0.05, SKIN, side * 0.085, 0.985, -0.06); // under-curve into the thigh
+      this.ball(this.body, 0.08, RED, side * 0.15, 1.07, 0); // rounded hip
+      this.ball(this.body, 0.088, RED, side * 0.072, 1.04, -0.065); // glute
     }
-    this.taper(this.body, 0.105, 0.165, 0.14, SKIN, 0, 1.19, 0); // hip flare
-    this.taper(this.body, 0.14, 0.1, 0.2, SKIN, 0, 1.36, 0); // waist pinch
-    this.taper(this.body, 0.15, 0.14, 0.12, SKIN, 0, 1.52, 0); // ribcage
-    for (let row = 0; row < 3; row++) {
-      const y = 1.4 - row * 0.065;
-      const r = row === 0 ? 0.128 : row === 1 ? 0.112 : 0.108; // follow the pinch
-      for (const side of [-1, 1] as const) {
-        this.box(this.body, 0.048, 0.04, 0.02, ABS, side * 0.035, y, r); // ab pad
-      }
-    }
-    this.box(this.body, 0.34, 0.035, 0.17, RED, 0, 1.56, -0.02); // bikini back strap
+    const SKIRT = this.mat(0xe0243a, 0.45, 0.1); // open cone: seen from inside too
+    SKIRT.side = THREE.DoubleSide;
+    const skirt = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.27, 0.24, 16, 1, true), SKIRT);
+    skirt.position.set(0, 1.0, 0); // flared skirt
+    skirt.castShadow = true;
+    this.body.add(skirt);
+    this.taper(this.body, 0.268, 0.272, 0.025, TRIM, 0, 0.885, 0); // white hem
+    this.taper(this.body, 0.105, 0.165, 0.14, RED, 0, 1.19, 0); // hip flare
+    this.taper(this.body, 0.14, 0.1, 0.2, RED, 0, 1.36, 0); // waist pinch
+    this.taper(this.body, 0.15, 0.14, 0.12, RED, 0, 1.52, 0); // ribcage
     for (const side of [-1, 1] as const) {
-      this.ball(this.body, 0.085, RED, side * 0.088, 1.55, 0.075); // bikini cup
+      this.ball(this.body, 0.085, RED, side * 0.088, 1.55, 0.075); // bust
+      this.box(this.body, 0.035, 0.08, 0.1, RED, side * 0.12, 1.6, 0.0); // shoulder strap
+      this.box(this.body, 0.01, 0.34, 0.012, TRIM, side * 0.145, 1.38, 0.0); // side piping
       this.ball(this.body, 0.06, MECH, side * 0.225, 1.62, 0); // shoulder joint
     }
+    this.taper(this.body, 0.152, 0.152, 0.012, TRIM, 0, 1.585, 0); // neckline trim
     // A real neck: skin column on a dark mechanical collar, long enough to
     // show between the shoulders and the jaw.
     this.tube(this.body, 0.052, 0.03, MECH, 0, 1.6, 0); // collar
@@ -476,17 +615,27 @@ export class PoolWaiter {
     // pose (same pivot geometry as before, so the coach's raises still read).
     for (const side of [-1, 1] as const) {
       const arm = new THREE.Group();
-      arm.position.set(side * 0.27, 1.6, 0);
+      arm.position.set(side * 0.27, SHOULDER_Y, 0);
       this.body.add(arm);
+      arm.rotation.order = "YZX"; // swing (X), raise/roll (Z), then open (Y)
       const upper = this.tube(arm, 0.05, 0.3, PLATE, 0, -0.16, 0.1);
       upper.rotation.x = -0.55; // upper arm angled forward-down
-      const elbow = this.tube(arm, 0.048, 0.05, MECH, side * -0.02, -0.3, 0.2);
+      // 💪 Forearm + hand ride an ELBOW pivot so chest flies and kickbacks bend.
+      const fore = new THREE.Group();
+      fore.position.set(side * -0.02, -0.3, 0.2);
+      arm.add(fore);
+      const elbow = this.tube(fore, 0.048, 0.05, MECH, 0, 0, 0);
       elbow.rotation.x = -1.35;
-      const fore = this.tube(arm, 0.052, 0.28, PLATE, side * -0.04, -0.33, 0.28);
-      fore.rotation.x = -1.35; // forearm reaching level to the tray
-      this.tube(arm, 0.04, 0.08, MECH, side * -0.07, -0.33, 0.4); // hand
-      if (side < 0) this.armL = arm;
-      else this.armR = arm;
+      const foreTube = this.tube(fore, 0.052, 0.28, PLATE, side * -0.02, -0.03, 0.08);
+      foreTube.rotation.x = -1.35; // forearm reaching level to the tray
+      this.tube(fore, 0.04, 0.08, MECH, side * -0.05, -0.03, 0.2); // hand
+      if (side < 0) {
+        this.armL = arm;
+        this.foreL = fore;
+      } else {
+        this.armR = arm;
+        this.foreR = fore;
+      }
     }
     // Slim power pack low on the back (the hair falls over the upper back).
     this.box(this.body, 0.24, 0.2, 0.08, PLATE, 0, 1.32, -0.15);
@@ -601,9 +750,9 @@ export class PoolWaiter {
       return;
     }
 
-    // 🏋️ #77: a 'coach' robot runs its class — never serves or croupiers
-    // (world's croupier eligibility skips it too).
-    if (this.routine === "coach") {
+    // 🏋️ #77: a 'coach' (or 💪 'arms') robot runs its class — never
+    // serves or croupiers (world's croupier eligibility skips it too).
+    if (isClassRoutine(this.routine)) {
       this.tray.visible = false;
       this.updateCoach(dt);
       return;
@@ -665,7 +814,7 @@ export class PoolWaiter {
       this.servePhase !== "NONE" ||
       this.parked ||
       this.croupierPost ||
-      (this.routine !== "serve" && this.routine !== "coach")
+      (this.routine !== "serve" && !isClassRoutine(this.routine))
     ) {
       return;
     }
@@ -674,7 +823,7 @@ export class PoolWaiter {
     // REST, once the rest line has had ~1.5 s on screen; until then keep the
     // edge armed so the invite lands in that window.
     if (
-      this.routine === "coach" &&
+      isClassRoutine(this.routine) &&
       !(this.coachPhase === "rest" && this.coachSaid && this.coachTimer >= 1.5)
     ) {
       this.foxWasNear = false;
@@ -685,7 +834,9 @@ export class PoolWaiter {
     // the edge so the greeting retries — it lands right as the window opens
     // (the "speak ~1 s after entering" behaviour, owner request).
     const delivered = this.sayRandom(
-      this.routine === "coach"
+      this.routine === "arms"
+        ? ARM_INVITES
+        : this.routine === "coach"
         ? COACH_INVITES
         : this.activity === "DOCK"
           ? SMALLTALK_CHARGING
@@ -734,10 +885,17 @@ export class PoolWaiter {
     // 🎥 The class is staged for the SCREEN: face the camera when the world
     // provides the stage yaw (workout-video framing), else fall back to the
     // dock's room-facing.
-    const face = this.stageYaw ?? this.dockTarget?.faceAngle;
-    if (face !== undefined) this.turnToward(face, dt);
+    const moves = this.classMoves();
+    const move = moves[this.coachMove % moves.length];
+    // 💪 One class facing for the whole class (owner: no turning between
+    // moves), shared with the fox so both look the same way — see
+    // getClassFacing. A finished class keeps its last facing rather than
+    // swinging back to the dock's.
+    if (this.coachPhase !== "done") {
+      const face = this.getClassFacing() ?? this.dockTarget?.faceAngle;
+      if (face !== undefined) this.turnToward(face, dt);
+    }
 
-    const move = COACH_MOVES[this.coachMove];
     // 🔇 Every phase opens with a line — the call, the rep's count ("One!" …
     // "Eight!", owner request), the rest quip — and the class WAITS for it:
     // the phase clock only runs once the line is delivered. So neither the
@@ -746,11 +904,17 @@ export class PoolWaiter {
     // at its next line until someone is there to hear it.
     if (!this.coachSaid) {
       this.coachSaid =
-        this.coachPhase === "announce"
-          ? this.say(move.call)
+        this.coachPhase === "welcome"
+          ? this.say(ARM_WELCOME[this.coachIntroLine] ?? ARM_WELCOME[0])
+          : this.coachPhase === "announce"
+          ? this.say(introLines(move)[this.coachIntroLine] ?? move.call)
           : this.coachPhase === "reps"
             ? this.say(COUNT_WORDS[Math.min(this.coachRep, COUNT_WORDS.length - 1)])
-            : this.sayRandom(COACH_REST_LINES);
+            : this.coachPhase === "done"
+              ? this.say(ARM_OUTRO)
+              : this.routine === "arms"
+                ? this.say(ARM_REST_LINES[this.coachMove % ARM_REST_LINES.length])
+                : this.sayRandom(COACH_REST_LINES);
       if (!this.coachSaid) {
         this.idlePose();
         return;
@@ -758,10 +922,45 @@ export class PoolWaiter {
     }
     this.coachTimer += dt;
     switch (this.coachPhase) {
-      case "announce":
-        this.idlePose();
-        if (this.coachTimer >= COACH_ANNOUNCE_SECS) this.setCoachPhase("reps");
+      case "welcome": {
+        // 💪 Happy, energetic hello: a big overhead wave with a bounce, and
+        // both arms thrown up for the final "Let's go!".
+        const cheer = this.coachIntroLine >= ARM_WELCOME.length - 1;
+        this.animateWelcome(this.coachTimer, cheer);
+        if (this.coachTimer >= ARM_WELCOME_SECS) {
+          if (cheer) {
+            this.setCoachPhase("announce");
+          } else {
+            this.coachIntroLine += 1;
+            this.coachTimer = 0;
+            this.coachSaid = false; // speak the next welcome line
+          }
+        }
         break;
+      }
+      case "announce": {
+        // 💪 Arm moves demonstrate their START position while the how-to
+        // plays (eased in, so the bot doesn't snap into it).
+        if (robotArmPose(move.name, 0)) {
+          const ease = Math.min(1, this.coachTimer / ARM_START_EASE_SECS);
+          this.applyArmPose(move.name, 0, this.coachIntroLine === 0 ? ease : 1);
+        } else {
+          this.idlePose();
+        }
+        const lines = introLines(move);
+        const last = this.coachIntroLine >= lines.length - 1;
+        const hold = last && lines.length === 1 ? COACH_ANNOUNCE_SECS : COACH_CUE_SECS;
+        if (this.coachTimer >= hold) {
+          if (last) {
+            this.setCoachPhase("reps");
+          } else {
+            this.coachIntroLine += 1;
+            this.coachTimer = 0;
+            this.coachSaid = false; // speak the next cue
+          }
+        }
+        break;
+      }
       case "reps": {
         const t = Math.min(1, this.coachTimer / move.repSecs);
         this.animateMove(move.name, t); // animateMove eases t itself
@@ -769,16 +968,24 @@ export class PoolWaiter {
           this.coachRep += 1;
           this.coachTimer = 0;
           this.coachSaid = false; // re-arm the count for the next rep
-          if (this.coachRep >= move.reps) this.setCoachPhase("rest");
+          if (this.coachRep >= move.reps) {
+            // 💪 The arm class is ONE round: after the last set, say goodbye
+            // and stop instead of looping back to the first move.
+            const finished = this.routine === "arms" && this.coachMove >= moves.length - 1;
+            this.setCoachPhase(finished ? "done" : "rest");
+          }
         }
         break;
       }
       case "rest":
         this.idlePose();
         if (this.coachTimer >= COACH_REST_SECS) {
-          this.coachMove = (this.coachMove + 1) % COACH_MOVES.length;
+          this.coachMove = (this.coachMove + 1) % moves.length;
           this.setCoachPhase("announce");
         }
+        break;
+      case "done":
+        this.idlePose(); // class over — stand on the stage, no more reps
         break;
     }
   }
@@ -789,10 +996,26 @@ export class PoolWaiter {
     this.stageYaw = yaw;
   }
 
-  /** 🏋️ Whether this bot is running the coach routine (drives stage facing
+  /** The move list of this bot's class routine. */
+  private classMoves(): readonly ClassMove[] {
+    return this.routine === "arms" ? ARM_MOVES : COACH_MOVES;
+  }
+
+  /** 🏋️ THE class facing — the bot and its followers both turn to it, so
+   *  they look the same way. The stage yaw (camera), plus the arm class's
+   *  slight turn (forward/back arm moves read flat from dead-on, since the
+   *  camera looks DOWN at the stage). null = no stage (not coaching). */
+  public getClassFacing(): number | null {
+    if (this.stageYaw === null) return null;
+    const turn = this.routine === "arms" ? ARM_CLASS_TURN : 0;
+    return this.stageYaw + turn;
+  }
+
+  /** 🏋️ Whether this bot is running a class routine (drives stage facing
    *  and the follow-the-coach slot in the world). */
   public isCoaching(): boolean {
-    return this.routine === "coach" && !this.parked; // STOP ⇒ class is off
+    // STOP ⇒ class is off; a finished arm class releases its followers too.
+    return isClassRoutine(this.routine) && !this.parked && this.coachPhase !== "done";
   }
 
   /** 🏋️ The fox follower's mirror of the CURRENT rep (#77 follow-the-coach)
@@ -800,10 +1023,16 @@ export class PoolWaiter {
    *  animateMove's robot numbers, so retuning a move can't desync the two
    *  rigs. The world adds only follower policy (who mirrors, when). */
   public getFollowerPose(): WorkoutPose | null {
-    if (this.routine !== "coach" || this.coachPhase !== "reps") return null;
-    const move = COACH_MOVES[this.coachMove];
+    if (!isClassRoutine(this.routine)) return null;
+    const moves = this.classMoves();
+    const move = moves[this.coachMove % moves.length];
+    // 💪 Arm moves: the fox takes the start position during the how-to too.
+    if (this.coachPhase === "announce") return foxArmPose(move.name, 0);
+    if (this.coachPhase !== "reps") return null;
     const t = Math.min(1, this.coachTimer / move.repSecs);
     const k = curveFor(move.name, t);
+    const arms = foxArmPose(move.name, k);
+    if (arms) return arms;
     if (move.name === "squat") {
       // Deep sink + arms straight out; no torso lean — on the big-headed
       // chibi fox a lean reads as a bow, not a rep (owner feedback).
@@ -837,20 +1066,26 @@ export class PoolWaiter {
     }));
   }
 
-  private setCoachPhase(phase: "announce" | "reps" | "rest"): void {
+  private setCoachPhase(phase: CoachPhase): void {
+    if (this.coachPhase === "welcome" && phase !== "welcome") {
+      this.resetExercisePose(); // drop the wave before the first move's ease-in
+    }
     this.coachPhase = phase;
     this.coachTimer = 0;
     this.coachSaid = false;
+    this.coachIntroLine = 0;
     if (phase === "reps") this.coachRep = 0;
-    if (phase === "rest") this.resetExercisePose(); // once, on entry — not per frame
+    if (phase === "rest" || phase === "done") this.resetExercisePose(); // once, on entry — not per frame
   }
 
   /** One rep of `move`, `t` ∈ [0,1] through it. Squat/lunge ride holdCurve
    *  (down–hold–up, like a real rep); jacks ride a bouncy half-sine. Every
    *  curve returns to 0, so each rep starts and ends at the neutral stance. */
-  private animateMove(name: (typeof COACH_MOVES)[number]["name"], t: number): void {
+  private animateMove(name: MoveName, t: number): void {
     const k = curveFor(name, t); // THE curve — shared with getFollowerPose
-    if (name === "squat") {
+    if (robotArmPose(name, k)) {
+      this.applyArmPose(name, k, 1);
+    } else if (name === "squat") {
       // 🦵 A HUMAN squat: thighs fold forward, shins counter-rotate to stay
       // upright, and hips + torso drop by the thigh-fold shortening so the
       // feet stay planted. Arms come straight out for counterbalance.
@@ -871,7 +1106,7 @@ export class PoolWaiter {
       this.legR.rotation.z = 0.4 * k;
       this.armL.rotation.z = -2.4 * k; // arms sweep sideways overhead
       this.armR.rotation.z = 2.4 * k;
-    } else {
+    } else if (name === "lunge") {
       // lunge — alternate the leading leg each rep, held low at the bottom,
       // with a bent front knee and a runner's opposite-arm drive.
       const frontIsL = this.coachRep % 2 === 0;
@@ -889,10 +1124,41 @@ export class PoolWaiter {
     }
   }
 
+  /** 💪 The welcome's body language at `secs` into a line: a bouncing,
+   *  waving right arm — or, when `cheer`, both straight arms pumping overhead. */
+  private animateWelcome(secs: number, cheer: boolean): void {
+    const bounce = Math.abs(Math.sin(secs * 5));
+    this.body.position.y = (cheer ? 0.06 : 0.03) * bounce;
+    const up = 2.6 + (cheer ? 0.15 * bounce : 0.3 * Math.sin(secs * 8));
+    this.armR.rotation.set(ARM_HANG, 0, up);
+    this.foreR.rotation.x = FORE_HANG;
+    if (cheer) {
+      this.armL.rotation.set(ARM_HANG, 0, -(2.6 + 0.15 * bounce));
+      this.foreL.rotation.x = FORE_HANG;
+    } else {
+      this.armL.rotation.set(0, 0, 0);
+      this.foreL.rotation.x = 0;
+    }
+  }
+
+  /** 💪 Put both arms in `name`'s pose at curve value `k`, scaled by `blend`
+   *  (0 = tray-carry rest, 1 = full pose) for the intro's ease-in. */
+  private applyArmPose(name: MoveName, k: number, blend: number): void {
+    const p = robotArmPose(name, k);
+    if (!p) return;
+    const y = p.y ?? 0;
+    this.armL.rotation.set(p.a * blend, -y * blend, -p.z * blend);
+    this.armR.rotation.set(p.a * blend, y * blend, p.z * blend);
+    this.foreL.rotation.x = p.f * blend;
+    this.foreR.rotation.x = p.f * blend;
+  }
+
   /** Clear every joint an exercise touches (walk/idle manage leg X). */
   private resetExercisePose(): void {
     this.armL.rotation.set(0, 0, 0);
     this.armR.rotation.set(0, 0, 0);
+    this.foreL.rotation.x = 0;
+    this.foreR.rotation.x = 0;
     this.legL.rotation.z = 0;
     this.legR.rotation.z = 0;
     this.shinL.rotation.x = 0;
@@ -918,10 +1184,11 @@ export class PoolWaiter {
   public setRoutine(routine: RobotRoutine): void {
     if (routine !== this.routine) {
       // 🏋️ Leaving coach mid-rep must not strand raised arms / splayed legs;
-      // entering restarts the class from the first move's announce, with the
+      // entering restarts the class from the top (💪 the arm class opens
+      // with its welcome; the others at the first move's announce), with the
       // stage re-picked (furniture may have moved since the last class).
       this.resetExercisePose();
-      this.setCoachPhase("announce");
+      this.setCoachPhase(routine === "arms" ? "welcome" : "announce");
       this.coachMove = 0;
       this.coachStage = null;
     }
@@ -937,7 +1204,7 @@ export class PoolWaiter {
       // walk home with raised arms / splayed legs, and put the class back at
       // the first move's announce so START opens a fresh class.
       this.resetExercisePose();
-      this.setCoachPhase("announce");
+      this.setCoachPhase(this.routine === "arms" ? "welcome" : "announce");
       this.coachMove = 0;
     }
     this.parked = parked;

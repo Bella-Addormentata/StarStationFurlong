@@ -1019,6 +1019,13 @@ export class Player {
     this.logicalAngle = snapTo8Ways(Math.atan2(x - p.x, z - p.z));
   }
 
+  /** 🏋️ Face an EXACT heading (atan2(nx,nz) convention), unsnapped — the
+   *  class facing, so the fox looks precisely the same way as its coach (the
+   *  seat and door poses already set unsnapped headings the same way). */
+  public setFacing(yaw: number): void {
+    this.logicalAngle = yaw;
+  }
+
   /** 🏋️ Follow-the-coach pose passthrough (see VoxelCharacter.setWorkoutPose). */
   public setWorkoutPose(pose: WorkoutPose | null): void {
     this.character.setWorkoutPose(pose);
