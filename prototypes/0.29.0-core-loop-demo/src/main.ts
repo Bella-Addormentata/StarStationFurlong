@@ -1433,6 +1433,7 @@ async function joinRoomAtEpoch(
     if (epoch !== sessionEpoch || yjsSync !== sync) return;
     harvestStationAtlas();
     refreshExteriorView();
+    world?.refreshFpNeighbourShells();
   });
 
   // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
@@ -8706,6 +8707,7 @@ function setupClickToEnter() {
   // tier) BEFORE the first exterior frame, so a first run docked at the welcome
   // room sees the whole station from space while its doc is still syncing.
   seedAtlasDefaults(defaultStationAtlas());
+  world?.refreshFpNeighbourShells();
   bootstrapNetworking();
 
   // 🛰️ #65 boot flow: once the intro morph settles, open IN the exterior —
