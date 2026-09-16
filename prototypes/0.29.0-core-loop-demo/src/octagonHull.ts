@@ -736,7 +736,7 @@ export function capDoorOpenings(
     }
   }
   const merge = (src: Array<{ lo: number; hi: number; top: number }>): CapOpening[] => {
-    const sorted = src.sort((a, b) => a.lo - b.lo);
+    const sorted = [...src].sort((a, b) => a.lo - b.lo);
     const out: CapOpening[] = [];
     for (const cur of sorted) {
       const prev = out[out.length - 1];
