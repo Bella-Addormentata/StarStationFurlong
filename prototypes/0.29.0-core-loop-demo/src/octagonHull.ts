@@ -96,6 +96,14 @@ export interface WindowOpening {
 /** Openings per hull surface (any of the 8 barrel strips). */
 export type HullWindows = Partial<Record<HullSurface, WindowOpening[]>>;
 
+/** 🚪 Door opening in room-wall coordinates (doorLayout wall + lateral). */
+export interface HullDoorOpening {
+  wall: 'x+' | 'x-' | 'y+' | 'y-';
+  lateral: number;
+  width: number;
+  height: number;
+}
+
 /** 🖼️ #80 S6: a wall-covering preset per hull surface (any of the 8 strips).
  *  Absent / `plain` → the bare hull colour. Painted on by the wallpaper editor. */
 export type HullWallpapers = Partial<Record<HullSurface, WallpaperPresetId>>;
@@ -110,6 +118,7 @@ export function buildOctagonHull(
   opts: HullSectionOpts,
   windows: HullWindows = {},
   wallpapers: HullWallpapers = {},
+  doors: HullDoorOpening[] = [],
 ): OctagonHull {
   const profile = computeOctagonProfile(opts);
   const {
@@ -152,6 +161,9 @@ export function buildOctagonHull(
     return mat;
   };
 
+  const doorSurfaces = doorOpeningsBySurface(profile.narrowAxis, doors);
+  const capDoorHoles = capDoorOpenings(profile.narrowAxis, doors, narrowHalf, wallHeight);
+
   // ── The 8 extruded strips (one per octagon edge), sorted into wall / roof /
   //    basement so the cutaway can treat each region differently. Every strip
   //    now takes the SAME hole-aware path (stripGeometry): a plain quad when it
@@ -163,7 +175,11 @@ export function buildOctagonHull(
     const wp = resolveWallpaper(wallpapers[surface] ?? 'plain');
     // Clamp openings to fit the strip ONCE (drops any too big to fit), so the
     // hole and its glass share identical, in-bounds coordinates.
-    const openings = clampedOpenings(windows[surface], strip, longHalf);
+    const openings = clampedOpenings(
+      [...(windows[surface] ?? []), ...(doorSurfaces[surface] ?? [])],
+      strip,
+      longHalf,
+    );
     const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
     geometries.push(geo);
 
@@ -229,13 +245,22 @@ export function buildOctagonHull(
     // wall band (vertical [0, wallHeight])
     {
       const mat = mkMat(HULL_COLOR.wall);
+      const capDoorGeo = capWallBandGeometry(
+        narrowAxis,
+        b,
+        narrowHalf,
+        wallHeight,
+        sign > 0 ? capDoorHoles.pos : capDoorHoles.neg,
+      );
+      if (capDoorGeo) geometries.push(capDoorGeo);
       const mesh = new THREE.Mesh(
-        capQuad(
-          { a: -narrowHalf, y: 0 },
-          { a: -narrowHalf, y: wallHeight },
-          { a: narrowHalf, y: wallHeight },
-          { a: narrowHalf, y: 0 },
-        ),
+        capDoorGeo ??
+          capQuad(
+            { a: -narrowHalf, y: 0 },
+            { a: -narrowHalf, y: wallHeight },
+            { a: narrowHalf, y: wallHeight },
+            { a: narrowHalf, y: 0 },
+          ),
         mat,
       );
       mesh.name = 'octagon-cap-wall';
@@ -607,6 +632,124 @@ function stripGeometry(
     shape.holes.push(roundedRectPath(o.along, o.across, o.w, o.h, o.r));
   }
   return remapStripToWorld(new THREE.ShapeGeometry(shape), narrowAxis, p0, dir);
+}
+
+function remapCapToWorld(
+  geo: THREE.BufferGeometry,
+  narrowAxis: NarrowAxis,
+  along: number,
+): THREE.BufferGeometry {
+  const pos = geo.attributes.position;
+  const world = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const a = pos.getX(i);
+    const y = pos.getY(i);
+    const w = sectionToWorld(narrowAxis, a, y, along);
+    world[i * 3] = w.x;
+    world[i * 3 + 1] = w.y;
+    world[i * 3 + 2] = w.z;
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(world, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+type CapOpening = { lo: number; hi: number; top: number };
+
+/** Rectangular doorway holes in an octagon end-cap wall band, if any. */
+function capWallBandGeometry(
+  narrowAxis: NarrowAxis,
+  along: number,
+  halfWidth: number,
+  wallHeight: number,
+  openings: CapOpening[],
+): THREE.BufferGeometry | null {
+  if (openings.length === 0) return null;
+  const shape = new THREE.Shape();
+  shape.moveTo(-halfWidth, 0);
+  shape.lineTo(halfWidth, 0);
+  shape.lineTo(halfWidth, wallHeight);
+  shape.lineTo(-halfWidth, wallHeight);
+  shape.closePath();
+  for (const o of openings) {
+    const hole = new THREE.Path();
+    hole.moveTo(o.lo, 0);
+    hole.lineTo(o.hi, 0);
+    hole.lineTo(o.hi, o.top);
+    hole.lineTo(o.lo, o.top);
+    hole.closePath();
+    shape.holes.push(hole);
+  }
+  return remapCapToWorld(new THREE.ShapeGeometry(shape), narrowAxis, along);
+}
+
+export function doorOpeningsBySurface(
+  narrowAxis: NarrowAxis,
+  doors: HullDoorOpening[],
+): HullWindows {
+  const out: HullWindows = {};
+  const push = (surface: 'wall-neg' | 'wall-pos', o: WindowOpening) =>
+    (out[surface] ??= []).push(o);
+  for (const door of doors) {
+    if (door.width <= 0 || door.height <= 0) continue;
+    const opening: WindowOpening = {
+      along: door.lateral,
+      across: door.height / 2,
+      w: door.width,
+      h: door.height,
+      r: 0,
+    };
+    if (narrowAxis === 'x') {
+      if (door.wall === 'x-') push('wall-neg', opening);
+      if (door.wall === 'x+') push('wall-pos', opening);
+    } else {
+      if (door.wall === 'y-') push('wall-neg', opening);
+      if (door.wall === 'y+') push('wall-pos', opening);
+    }
+  }
+  return out;
+}
+
+export function capDoorOpenings(
+  narrowAxis: NarrowAxis,
+  doors: HullDoorOpening[],
+  halfWidth: number,
+  wallHeight: number,
+): { neg: CapOpening[]; pos: CapOpening[] } {
+  const neg: Array<{ lo: number; hi: number; top: number }> = [];
+  const pos: Array<{ lo: number; hi: number; top: number }> = [];
+  const inset = 0.05;
+  const halfLimit = Math.max(0, halfWidth - inset);
+  for (const door of doors) {
+    if (door.width <= 0 || door.height <= 0) continue;
+    const top = Math.max(0, Math.min(wallHeight - inset, door.height));
+    if (top <= 0) continue;
+    const lo = Math.max(-halfLimit, door.lateral - door.width / 2);
+    const hi = Math.min(halfLimit, door.lateral + door.width / 2);
+    if (hi - lo <= 1e-6) continue;
+    if (narrowAxis === 'x') {
+      if (door.wall === 'y-') neg.push({ lo, hi, top });
+      if (door.wall === 'y+') pos.push({ lo, hi, top });
+    } else {
+      if (door.wall === 'x-') neg.push({ lo, hi, top });
+      if (door.wall === 'x+') pos.push({ lo, hi, top });
+    }
+  }
+  const merge = (src: Array<{ lo: number; hi: number; top: number }>): CapOpening[] => {
+    const sorted = src.sort((a, b) => a.lo - b.lo);
+    const out: CapOpening[] = [];
+    for (const cur of sorted) {
+      const prev = out[out.length - 1];
+      if (!prev || cur.lo > prev.hi) {
+        out.push({ ...cur });
+        continue;
+      }
+      prev.hi = Math.max(prev.hi, cur.hi);
+      prev.top = Math.max(prev.top, cur.top);
+    }
+    return out;
+  };
+  return { neg: merge(neg), pos: merge(pos) };
 }
 
 /** A double-sided quad (two triangles a-b-c / a-c-d) from four world corners.

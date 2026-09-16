@@ -152,7 +152,7 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
-import type { OctagonHull, HullWallpapers } from "./octagonHull";
+import type { OctagonHull, HullWallpapers, HullDoorOpening } from "./octagonHull";
 import {
   readAllWindowLayout,
   subscribeWindowLayout,
@@ -211,6 +211,7 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
+const DOOR_OPENING_HEIGHT = 3.0;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
  *  falls back to the id-based pose (old gossip without wall data). Anchoring a
@@ -1044,10 +1045,29 @@ export class World {
       { halfX, halfZ },
       collectWindowOpenings(),
       this.collectWallpaper(),
+      this.collectHullDoorOpenings(),
     );
     this.platformGroup.add(this.octagonHull.group);
     // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
     this.rebuildWindowClickBoxes();
+  }
+
+  /** 🚪 Door apertures cut from the octagon hull at each placed door. */
+  private collectHullDoorOpenings(): HullDoorOpening[] {
+    const records = readAllDoorLayout();
+    const doorSet = records.size || doorSetIsAuthoritative()
+      ? records
+      : defaultDoorLayoutRecords();
+    const out: HullDoorOpening[] = [];
+    for (const rec of doorSet.values()) {
+      out.push({
+        wall: rec.wall,
+        lateral: rec.lateral,
+        width: DOOR_OPENING_WIDTH,
+        height: DOOR_OPENING_HEIGHT,
+      });
+    }
+    return out;
   }
 
   /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
@@ -1631,6 +1651,7 @@ export class World {
     setDoorRecords(stored.size ? stored : defaultDoorLayoutRecords());
     reposeDoorTargets();
     this.dockingSystem?.repositionDoorGroups();
+    if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
