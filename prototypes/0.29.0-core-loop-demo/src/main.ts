@@ -1424,6 +1424,15 @@ async function joinRoomAtEpoch(
   // the same room.
   setAtlasHarvestArmed(true);
   harvestStationAtlas();
+  // 🛑🛰️ #157: the first-person shells are laid out AROUND THE CURRENT ROOM, so
+  // they are re-posed the moment that room changes — not only when a door or
+  // shared-atlas event happens to follow. On the first join of a launch neither
+  // does: the shells were built at boot in the HOME id's frame, the doors doc
+  // notified above before the listeners below exist, and a resume into a
+  // warm-cached room syncs nothing new. The window then showed the station
+  // laid out around the wrong room while the exterior (rebuilt on every
+  // activation) had it right.
+  world?.refreshFpNeighbourShells();
   // 🛰️ …and again once the host's state has actually landed: the call above
   // is a no-op on an unsynced replica (see harvestStationAtlas), and a room
   // with no door changes after the sync would otherwise never be harvested
@@ -1433,6 +1442,9 @@ async function joinRoomAtEpoch(
     if (epoch !== sessionEpoch || yjsSync !== sync) return;
     harvestStationAtlas();
     refreshExteriorView();
+    // #157: this harvest can rewrite the current room's own edges (hop 1 of
+    // every pose) without any doc event — the shells follow it like the
+    // exterior does.
     world?.refreshFpNeighbourShells();
   });
 
@@ -8707,6 +8719,8 @@ function setupClickToEnter() {
   // tier) BEFORE the first exterior frame, so a first run docked at the welcome
   // room sees the whole station from space while its doc is still syncing.
   seedAtlasDefaults(defaultStationAtlas());
+  // #157: startMorph above already built the first-person shells, from the
+  // atlas as it stood BEFORE this seed — every atlas write re-poses them.
   world?.refreshFpNeighbourShells();
   bootstrapNetworking();
 
