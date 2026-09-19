@@ -43,6 +43,17 @@ export class NetworkProvider implements NetworkProviderPort {
   #stats: NetworkStats = { rttMs: NaN, loss: NaN };
   
   #wt: any = null; // WebTransport instance
+  /**
+   * The ONE writer on the datagram lane, held for the life of the transport.
+   * Movement ticks (every frame) and the RTT probe (every 2 s) both send
+   * datagrams, and a WritableStream admits a single writer at a time. Taking
+   * and releasing one per send let a tick land while the probe still held the
+   * lock across its `await`: getWriter() threw straight out of main.ts's
+   * animate() — which calls sendTick BEFORE renderer.render — so that frame was
+   * never drawn and the tick was lost. write() calls on one writer just queue,
+   * in order, so sharing it needs no coordination at all.
+   */
+  #datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #tickHandler: ((buf: Uint8Array) => void) | null = null;
   #envelopeHandler: ((env: any) => void) | null = null;
   #isActive = false;
@@ -64,6 +75,10 @@ export class NetworkProvider implements NetworkProviderPort {
 
     console.log(`🔌 Securing connection link to sovereign node: ${boot.wtUrl}`);
 
+    // THIS dial's transport. Everything below that must not outlive the dial —
+    // the failure path, the probe loop — is tied to its identity, because
+    // `this.#wt` can be replaced while we are still awaiting the handshake.
+    let wt: any = null;
     try {
       // Convert base64 cert hashes to Uint8Array as required by WebTransport API
       const hashes = boot.certHashesB64.map(b64 => ({
@@ -80,16 +95,32 @@ export class NetworkProvider implements NetworkProviderPort {
       this.#openChannels = 0;
       // 1. Establish WebTransport (Chrome LNA prompt must be mainthread-bounded)
       // @ts-ignore
-      this.#wt = new WebTransport(boot.wtUrl, {
+      wt = new WebTransport(boot.wtUrl, {
         serverCertificateHashes: hashes
       });
+      this.#wt = wt;
 
       this.#isActive = true;
       this.#connectedAt = performance.now();
-      await this.#wt.ready;
+      await wt.ready;
+
+      // Superseded while dialing? disconnect() — and perhaps a newer connect() —
+      // ran during the handshake, and a handshake can still COMPLETE after that.
+      // This dial no longer owns the provider, so it must not touch anything
+      // shared: setting the mode, taking the datagram writer or starting the
+      // loops here would hijack the live session (its ticks would go out on
+      // this dead transport). Shut what we opened and say so.
+      if (this.#wt !== wt) {
+        try { wt.close(); } catch { /* disconnect() already closed it */ }
+        throw new Error('WebTransport dial superseded by a newer session');
+      }
       
       console.log(`⚡ handshake accepted dynamically by yrs Tauri node!`);
       this.#mode = 'direct-unreliable'; // UDP WT active
+
+      // The datagram lane's single writer (see #datagramWriter) — taken once,
+      // here, before anything can want to send.
+      this.#datagramWriter = wt.datagrams.writable.getWriter();
       
       // 2. Start UDP Datagram reading loop (Task 3.2)
       this.#listenDatagrams();
@@ -101,7 +132,7 @@ export class NetworkProvider implements NetworkProviderPort {
       this.#listenIncomingStreams();
 
       // 3. Start RTT Ping/Pong probe loop (Task 3.4 / v006 §3.8 Chrome fallback)
-      this.#startPingProbe();
+      this.#startPingProbe(wt);
 
       // 4. ChiaHub Slice 3: hand our LOCAL node this room's key + per-room
       // chia-mode flag over a one-shot `cap` stream, so it can derive the room's
@@ -116,9 +147,24 @@ export class NetworkProvider implements NetworkProviderPort {
       }
 
     } catch (err: any) {
-      console.error(`⚠️ WebTransport handshaking failed:`, err);
-      this.#mode = 'offline';
-      this.#isActive = false;
+      // Only the dial that still OWNS the session may take it offline. A dial
+      // abandoned by disconnect() ends up here later (its transport was closed
+      // under it, or it found itself superseded above) — possibly after a NEWER
+      // connect() has come up on this same provider, and resetting the shared
+      // state then would silently mute that live session (sendTick no-ops while
+      // the mode reads offline). An abandoned dial is not a failure to report
+      // either: whoever called disconnect() meant it. `wt` still null means the
+      // transport could not even be constructed — that one is ours.
+      const superseded = wt !== null && this.#wt !== wt;
+      if (!superseded) {
+        console.error(`⚠️ WebTransport handshaking failed:`, err);
+        this.#mode = 'offline';
+        this.#isActive = false;
+        this.#datagramWriter = null;
+        // Leave no half-open transport behind for openChannel to trip over.
+        try { wt?.close(); } catch { /* never opened, or already gone */ }
+        this.#wt = null;
+      }
       throw err;
     }
   }
@@ -128,6 +174,9 @@ export class NetworkProvider implements NetworkProviderPort {
     this.#mode = 'offline';
     this.#connectedAt = 0;
     this.#boot = null;
+    // Forget the writer FIRST: a tick sent from here on is a silent no-op, and
+    // a write still in flight knows its rejection is expected (see sendTick).
+    this.#datagramWriter = null;
     if (this.#wt) {
       try {
         this.#wt.close();
@@ -153,15 +202,19 @@ export class NetworkProvider implements NetworkProviderPort {
   }
 
   sendTick(buf: Uint8Array): void {
-    if (!this.#wt || this.#mode === 'offline') return;
+    const writer = this.#datagramWriter;
+    if (!writer || this.#mode === 'offline') return;
     this.#tickSent++;
-    
-    // Write raw 13-byte movement tick datagram instantly over UDP
-    const writer = this.#wt.datagrams.writable.getWriter();
+
+    // Write the raw 13-byte movement tick datagram over UDP. Fire-and-forget —
+    // this runs inside the render loop, so it is never awaited and must never
+    // throw. A rejection that arrives after the transport has gone (disconnect,
+    // room swap) is expected rather than news, so it is not logged.
     writer.write(buf).catch((e: any) => {
-      console.warn('Failed to send movement datagram tick:', e);
+      if (this.#datagramWriter === writer) {
+        console.warn('Failed to send movement datagram tick:', e);
+      }
     });
-    writer.releaseLock();
   }
 
   onTick(handler: (buf: Uint8Array) => void): void {
@@ -345,16 +398,19 @@ export class NetworkProvider implements NetworkProviderPort {
     }
   }
 
-  async #startPingProbe() {
-    while (this.#isActive) {
-      if (this.#wt) {
+  /** `wt` is the transport this loop belongs to: it ends with that transport,
+   *  so a quick disconnect → connect cannot leave the previous session's loop
+   *  alive and probing (and double-counting) on the new one. */
+  async #startPingProbe(wt: unknown) {
+    while (this.#isActive && this.#wt === wt) {
+      const writer = this.#datagramWriter;
+      if (writer) {
         try {
           this.#pingSent++;
           this.#pingTime = performance.now();
-          const pBytes = new TextEncoder().encode('ping');
-          const writer = this.#wt.datagrams.writable.getWriter();
-          await writer.write(pBytes);
-          writer.releaseLock();
+          // The shared writer: no lock is taken per send, so awaiting this
+          // write can no longer shut a movement tick out (see #datagramWriter).
+          await writer.write(new TextEncoder().encode('ping'));
         } catch {}
       }
       // Issue RTT probe once every 2 seconds
