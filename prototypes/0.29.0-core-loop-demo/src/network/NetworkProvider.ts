@@ -103,6 +103,17 @@ export class NetworkProvider implements NetworkProviderPort {
       this.#isActive = true;
       this.#connectedAt = performance.now();
       await wt.ready;
+
+      // Superseded while dialing? disconnect() — and perhaps a newer connect() —
+      // ran during the handshake, and a handshake can still COMPLETE after that.
+      // This dial no longer owns the provider, so it must not touch anything
+      // shared: setting the mode, taking the datagram writer or starting the
+      // loops here would hijack the live session (its ticks would go out on
+      // this dead transport). Shut what we opened and say so.
+      if (this.#wt !== wt) {
+        try { wt.close(); } catch { /* disconnect() already closed it */ }
+        throw new Error('WebTransport dial superseded by a newer session');
+      }
       
       console.log(`⚡ handshake accepted dynamically by yrs Tauri node!`);
       this.#mode = 'direct-unreliable'; // UDP WT active
@@ -136,16 +147,23 @@ export class NetworkProvider implements NetworkProviderPort {
       }
 
     } catch (err: any) {
-      console.error(`⚠️ WebTransport handshaking failed:`, err);
       // Only the dial that still OWNS the session may take it offline. A dial
-      // abandoned by disconnect() rejects here later (its transport was closed
-      // under it) — possibly after a NEWER connect() has come up on this same
-      // provider, and resetting the shared state then would silently mute that
-      // live session (sendTick no-ops while the mode reads offline).
-      if (this.#wt === wt) {
+      // abandoned by disconnect() ends up here later (its transport was closed
+      // under it, or it found itself superseded above) — possibly after a NEWER
+      // connect() has come up on this same provider, and resetting the shared
+      // state then would silently mute that live session (sendTick no-ops while
+      // the mode reads offline). An abandoned dial is not a failure to report
+      // either: whoever called disconnect() meant it. `wt` still null means the
+      // transport could not even be constructed — that one is ours.
+      const superseded = wt !== null && this.#wt !== wt;
+      if (!superseded) {
+        console.error(`⚠️ WebTransport handshaking failed:`, err);
         this.#mode = 'offline';
         this.#isActive = false;
         this.#datagramWriter = null;
+        // Leave no half-open transport behind for openChannel to trip over.
+        try { wt?.close(); } catch { /* never opened, or already gone */ }
+        this.#wt = null;
       }
       throw err;
     }
