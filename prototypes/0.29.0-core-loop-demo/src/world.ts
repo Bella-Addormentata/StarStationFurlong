@@ -290,9 +290,10 @@ export class World {
   /** 🚪 #159: what the live hull's door apertures were cut from (see
    *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
   private octagonHullDoorSig = "";
-  /** 🚪 #159: the apertures may be stale (a door moved, appeared, vanished,
-   *  began to open or finished closing). Settled once per frame in update(),
-   *  so a join that opens three doors in one tick re-cuts the hull once. */
+  /** 🚪 #159: the apertures may be stale — the docking system said a frame
+   *  moved or vanished, or a door began to open or finished closing
+   *  (onDoorApertureChange). Settled once per frame in update(), so a join
+   *  that opens three doors in one tick re-cuts the hull once. */
   private hullDoorsDirty = false;
   /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
    *  + their connector tubes, posed around the current room; shown ONLY in first
@@ -1064,27 +1065,16 @@ export class World {
    * 🚪 #159: the hull is cut open behind every door whose leaves are not shut —
    * so an open door shows its vestibule instead of the wall panel it used to
    * slide aside in front of. Behind a SHUT door the wall stays whole (see
-   * DoorDockingPortSystem.isDoorAjar for why), which also means nothing is cut
-   * at boot, before the docking ports exist. Read from the same things the
-   * frames are hung from — the DOORS registry for membership, the pose snapshot
-   * for position — so an aperture can only ever sit behind its own frame: a
-   * removed door heals the wall, a moved one takes its opening with it. A door
-   * this client cannot place (no pose) is left uncut rather than guessed at.
+   * DoorDockingPortSystem.ajarDoorFrames for why, and for why the list comes
+   * from the frames themselves), which also means nothing is cut at boot,
+   * before the docking ports exist. The size is the frame's clear opening.
    */
   private collectHullDoorOpenings(): HullDoorOpening[] {
-    const out: HullDoorOpening[] = [];
-    for (const door of DOORS) {
-      if (!this.dockingSystem?.isDoorAjar(door.id)) continue;
-      const pose = physicalDoorPoseOrNull(door.id);
-      if (!pose) continue;
-      out.push({
-        wall: pose.wall,
-        lateral: pose.tangent === "x" ? pose.x : pose.z,
-        width: DOOR_OPENING_WIDTH,
-        height: DOOR_OPENING_HEIGHT,
-      });
-    }
-    return out;
+    return (this.dockingSystem?.ajarDoorFrames() ?? []).map((frame) => ({
+      ...frame,
+      width: DOOR_OPENING_WIDTH,
+      height: DOOR_OPENING_HEIGHT,
+    }));
   }
 
   /** Everything the hull's door apertures depend on: the openings, and the
@@ -1094,8 +1084,8 @@ export class World {
   }
 
   /** 🚪 #159: settle a dirty hull — re-cut it only if its apertures really
-   *  changed. Most of what marks it dirty changes nothing: a floor-plan write
-   *  that moves no door, the two reconciles of every join, a slide landing OPEN. */
+   *  changed. Most of what marks it dirty changes nothing: a re-pose that moves
+   *  no door (the reconciles of every join), a slide landing OPEN. */
   private settleHullDoorOpenings(): void {
     if (!this.hullDoorsDirty) return;
     this.hullDoorsDirty = false;
@@ -1685,7 +1675,6 @@ export class World {
     setDoorRecords(stored.size ? stored : defaultDoorLayoutRecords());
     reposeDoorTargets();
     this.dockingSystem?.repositionDoorGroups();
-    this.hullDoorsDirty = true; // 🚪 #159: the apertures follow the frames
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
@@ -5509,9 +5498,10 @@ export class World {
   private initializeDockingPorts() {
     this.dockingSystem = new DoorDockingPortSystem(this.platformGroup);
     this.dockingSystem.buildPorts();
-    // 🚪 #159: the hull opens behind a door as its leaves part, and heals once
-    // they have shut — see collectHullDoorOpenings.
-    this.dockingSystem.onDoorAjarChange(() => {
+    // 🚪 #159: the hull opens behind a door as its leaves part, follows its
+    // frame when that moves, and heals once the leaves have shut or the door
+    // is gone — see collectHullDoorOpenings.
+    this.dockingSystem.onDoorApertureChange(() => {
       this.hullDoorsDirty = true;
     });
     // A morph restart lands here with a NEW system whose doors are all shut,

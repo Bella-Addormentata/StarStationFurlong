@@ -158,8 +158,9 @@ export class DoorDockingPortSystem {
   >();
   /** Leaf slide speed (metres/second). */
   private readonly SLIDE_SPEED = 2.2;
-  /** 🚪 #159: told whenever a door may have become ajar or shut (onDoorAjarChange). */
-  private doorAjarListener: (() => void) | null = null;
+  /** 🚪 #159: told whenever the hull's door apertures may have changed
+   *  (onDoorApertureChange). */
+  private doorApertureListener: (() => void) | null = null;
 
   // ── Camera-facing door fade (#51) ──────────────────────────────────────────
   /**
@@ -934,6 +935,7 @@ export class DoorDockingPortSystem {
     this.slideAnims.delete(id);
     this.removeAdjacentRoomProjection(id as DoorId); // tear down any projection
     this.untouchedPrefills.delete(id);
+    this.doorApertureListener?.(); // 🚪 #159: an open door just left the wall
   }
 
   /**
@@ -2874,13 +2876,32 @@ export class DoorDockingPortSystem {
   }
 
   /**
-   * 🚪 #159: are this door's leaves anywhere but fully shut — open, opening or
-   * closing? The hull is cut open behind exactly these doors (world.ts
-   * collectHullDoorOpenings). Behind SHUT leaves the wall stays whole: they
-   * meet at a deliberate 4 cm seam, and a cut wall shows through it as a bright
-   * hairline down the middle of every closed door.
+   * 🚪 #159: where the hull must stand open — one entry per door whose leaves
+   * are not shut, at the pose its FRAME is hung from (poseForDoor, the very
+   * call repositionDoorGroups places the group with). Membership is the frames
+   * that exist and position is where they are, so an aperture can only ever
+   * sit behind its own frame: a removed door heals the wall, a moved one takes
+   * its opening with it. `lateral` is the along-wall WORLD coordinate, which is
+   * what the hull's faces are measured in.
    */
-  public isDoorAjar(doorId: string): boolean {
+  public ajarDoorFrames(): Array<{ wall: DoorWall; lateral: number }> {
+    const out: Array<{ wall: DoorWall; lateral: number }> = [];
+    for (const id of this.doorObjects.keys()) {
+      if (!this.isDoorAjar(id)) continue;
+      const pose = this.poseForDoor(id);
+      out.push({ wall: pose.wall, lateral: pose.tangent === "x" ? pose.x : pose.z });
+    }
+    return out;
+  }
+
+  /**
+   * 🚪 #159: are this door's leaves anywhere but fully shut — open, opening or
+   * closing? The hull is cut open behind exactly these doors. Behind SHUT
+   * leaves the wall stays whole: they meet at a deliberate 4 cm seam, and a cut
+   * wall shows through it as a bright hairline down the middle of every closed
+   * door.
+   */
+  private isDoorAjar(doorId: string): boolean {
     // Opening counts from its first frame, so the wall parts WITH the leaves.
     if (this.slideAnims.get(doorId)?.openTarget === DOOR_LEAF_OPEN_OFFSET)
       return true;
@@ -2890,10 +2911,16 @@ export class DoorDockingPortSystem {
     return !!left && Math.abs(left.position.x + DOOR_LEAF_SHUT_OFFSET) >= 0.01;
   }
 
-  /** 🚪 #159: `cb` fires whenever isDoorAjar may have changed for some door — a
-   *  slide starting, a slide landing. One listener (the world's hull). */
-  public onDoorAjarChange(cb: () => void): void {
-    this.doorAjarListener = cb;
+  /**
+   * 🚪 #159: `cb` fires whenever ajarDoorFrames may have changed — a slide
+   * starting or landing (isDoorAjar), a frame re-posed or removed. This
+   * system owns the frames, so it is the one that says so: a caller that moves
+   * them (repositionDoorGroups has more than one) cannot forget to. One
+   * listener — the world's hull, which re-checks cheaply and only re-cuts on a
+   * real change.
+   */
+  public onDoorApertureChange(cb: () => void): void {
+    this.doorApertureListener = cb;
   }
 
   /**
@@ -2948,7 +2975,7 @@ export class DoorDockingPortSystem {
     }
 
     this.slideAnims.set(doorId, { openTarget, onComplete });
-    this.doorAjarListener?.(); // 🚪 #159: an opening door is ajar from now
+    this.doorApertureListener?.(); // 🚪 #159: an opening door is ajar from now
   }
 
   /**
@@ -2980,7 +3007,7 @@ export class DoorDockingPortSystem {
         if (anim.onComplete) anim.onComplete();
       }
     }
-    if (landed) this.doorAjarListener?.(); // 🚪 #159: a door that shut is no longer ajar
+    if (landed) this.doorApertureListener?.(); // 🚪 #159: a door that shut is no longer ajar
   }
 
   /**
@@ -3262,6 +3289,11 @@ export class DoorDockingPortSystem {
       group.position.set(pose.x, 2, pose.z);
       group.rotation.y = pose.frameYaw;
     }
+    // 🚪 #159: an open door's aperture is cut where its frame WAS. Every
+    // re-pose says so here, whoever asked for it — a door reconcile, a room
+    // resize, or applyRoomVisuals re-reading the records under a new legacy
+    // layout kind (review of #160).
+    this.doorApertureListener?.();
   }
 
   public refreshDoorInteractivity(): void {
