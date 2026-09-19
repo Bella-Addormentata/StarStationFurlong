@@ -1057,8 +1057,15 @@ export class World {
     );
     this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
-    // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
+    // 🪟 keep the window click-boxes in lock-step with the (re)built hull…
     this.rebuildWindowClickBoxes();
+    // …and a live edit session's raycast index in step with THEM. The boxes
+    // were just disposed and rebuilt fresh, whoever asked for the hull — a
+    // window or wallpaper change, or (#159) a door opening, closing or moving —
+    // so the re-index lives here, where no caller can forget it. A targeted
+    // window-slice rebuild that preserves the current selection by id (mirrors
+    // reconcileDoorLayout → onDoorLayoutChanged); a no-op outside edit mode.
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
   }
 
   /**
@@ -1383,11 +1390,9 @@ export class World {
    */
   private reconcileWindowLayout(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull(); // rebuilds hull holes + glass AND the click-boxes
-    // 🪟 keep a live edit session's raycast index in sync with the window
-    // boxes just rebuilt — a targeted window-slice rebuild that preserves the
-    // current selection by id (mirrors reconcileDoorLayout → onDoorLayoutChanged).
-    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+    // Rebuilds hull holes + glass, the click-boxes, AND a live edit session's
+    // window raycast index (addOctagonHull does all three).
+    this.addOctagonHull();
   }
 
   /**
@@ -1397,8 +1402,7 @@ export class World {
    */
   private reconcileWallpaper(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes
-    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes + edit index
   }
 
   /**
