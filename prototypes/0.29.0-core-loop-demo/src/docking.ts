@@ -14,7 +14,7 @@ import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
 import {
   physicalDoorPose, portForDoor, poseFromWall,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
   DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
   MIN_DOOR_GAP,
 } from "./doorLayout";
@@ -158,6 +158,8 @@ export class DoorDockingPortSystem {
   >();
   /** Leaf slide speed (metres/second). */
   private readonly SLIDE_SPEED = 2.2;
+  /** 🚪 #159: told whenever a door may have become ajar or shut (onDoorAjarChange). */
+  private doorAjarListener: (() => void) | null = null;
 
   // ── Camera-facing door fade (#51) ──────────────────────────────────────────
   /**
@@ -624,7 +626,7 @@ export class DoorDockingPortSystem {
       // again (they did: the old 2.4/1.4 openings matched no whole number of
       // cells while the validators assumed 2/1).
       const openingWidth = DOOR_OPENING_WIDTH;
-      const OPEN_H = 3.0; // opening height (local y -2 .. 1)
+      const OPEN_H = DOOR_OPENING_HEIGHT; // opening height (local y -2 .. 1)
       const POST_W = DOOR_POST_WIDTH; // side post width
       const FRAME_D = 0.5; // frame depth
       const FLOOR_Y = -2; // local floor level
@@ -2872,6 +2874,29 @@ export class DoorDockingPortSystem {
   }
 
   /**
+   * 🚪 #159: are this door's leaves anywhere but fully shut — open, opening or
+   * closing? The hull is cut open behind exactly these doors (world.ts
+   * collectHullDoorOpenings). Behind SHUT leaves the wall stays whole: they
+   * meet at a deliberate 4 cm seam, and a cut wall shows through it as a bright
+   * hairline down the middle of every closed door.
+   */
+  public isDoorAjar(doorId: string): boolean {
+    // Opening counts from its first frame, so the wall parts WITH the leaves.
+    if (this.slideAnims.get(doorId)?.openTarget === DOOR_LEAF_OPEN_OFFSET)
+      return true;
+    // Otherwise shut or closing, and the leaves say which — update() is the
+    // only writer of their position, and snaps it exactly on landing.
+    const left = this.doorObjects.get(doorId)?.getObjectByName("leftLeaf");
+    return !!left && Math.abs(left.position.x + DOOR_LEAF_SHUT_OFFSET) >= 0.01;
+  }
+
+  /** 🚪 #159: `cb` fires whenever isDoorAjar may have changed for some door — a
+   *  slide starting, a slide landing. One listener (the world's hull). */
+  public onDoorAjarChange(cb: () => void): void {
+    this.doorAjarListener = cb;
+  }
+
+  /**
    * Set the room's ENTRY access mode (public-doors feature) and tint every
    * door's status LED so a visitor reads the room's openness at any threshold:
    * green = PUBLIC (anyone enters), amber = PASS (anyone with the link —
@@ -2923,6 +2948,7 @@ export class DoorDockingPortSystem {
     }
 
     this.slideAnims.set(doorId, { openTarget, onComplete });
+    this.doorAjarListener?.(); // 🚪 #159: an opening door is ajar from now
   }
 
   /**
@@ -2931,6 +2957,7 @@ export class DoorDockingPortSystem {
    */
   public update(deltaTime: number): void {
     if (this.slideAnims.size === 0) return;
+    let landed = false;
     for (const [doorId, anim] of Array.from(this.slideAnims.entries())) {
       const group = this.doorObjects.get(doorId);
       const left = group?.getObjectByName("leftLeaf");
@@ -2949,9 +2976,11 @@ export class DoorDockingPortSystem {
         left.position.x = -anim.openTarget;
         right.position.x = anim.openTarget;
         this.slideAnims.delete(doorId);
+        landed = true;
         if (anim.onComplete) anim.onComplete();
       }
     }
+    if (landed) this.doorAjarListener?.(); // 🚪 #159: a door that shut is no longer ajar
   }
 
   /**

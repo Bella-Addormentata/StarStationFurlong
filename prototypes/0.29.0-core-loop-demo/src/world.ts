@@ -9,7 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import { Player } from "./player";
 import {
@@ -211,7 +211,6 @@ interface RemoteAvatar {
  *  no wire/protocol change, so it stays compatible with any peer. */
 const OCTAGON_HULL =
   new URLSearchParams(window.location.search).get("octagon") !== "0";
-const DOOR_OPENING_HEIGHT = 3.0;
 
 /** 🧭 A neighbour door's tube anchor from its gossiped geometry — undefined
  *  falls back to the id-based pose (old gossip without wall data). Anchoring a
@@ -288,6 +287,13 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
   private octagonHull: OctagonHull | null = null;
+  /** 🚪 #159: what the live hull's door apertures were cut from (see
+   *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
+  private octagonHullDoorSig = "";
+  /** 🚪 #159: the apertures may be stale (a door moved, appeared, vanished,
+   *  began to open or finished closing). Settled once per frame in update(),
+   *  so a join that opens three doors in one tick re-cuts the hull once. */
+  private hullDoorsDirty = false;
   /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
    *  + their connector tubes, posed around the current room; shown ONLY in first
    *  person (update() gate) so looking OUT a window shows the real station. */
@@ -1041,33 +1047,61 @@ export class World {
       this.octagonHull = null;
     }
     const { halfX, halfZ } = roomHalfExtents();
+    const doorOpenings = this.collectHullDoorOpenings();
     this.octagonHull = buildOctagonHull(
       { halfX, halfZ },
       collectWindowOpenings(),
       this.collectWallpaper(),
-      this.collectHullDoorOpenings(),
+      doorOpenings,
     );
+    this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
     // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
     this.rebuildWindowClickBoxes();
   }
 
-  /** 🚪 Door apertures cut from the octagon hull at each placed door. */
+  /**
+   * 🚪 #159: the hull is cut open behind every door whose leaves are not shut —
+   * so an open door shows its vestibule instead of the wall panel it used to
+   * slide aside in front of. Behind a SHUT door the wall stays whole (see
+   * DoorDockingPortSystem.isDoorAjar for why), which also means nothing is cut
+   * at boot, before the docking ports exist. Read from the same things the
+   * frames are hung from — the DOORS registry for membership, the pose snapshot
+   * for position — so an aperture can only ever sit behind its own frame: a
+   * removed door heals the wall, a moved one takes its opening with it. A door
+   * this client cannot place (no pose) is left uncut rather than guessed at.
+   */
   private collectHullDoorOpenings(): HullDoorOpening[] {
-    const records = readAllDoorLayout();
-    const doorSet = records.size || doorSetIsAuthoritative()
-      ? records
-      : defaultDoorLayoutRecords();
     const out: HullDoorOpening[] = [];
-    for (const rec of doorSet.values()) {
+    for (const door of DOORS) {
+      if (!this.dockingSystem?.isDoorAjar(door.id)) continue;
+      const pose = physicalDoorPoseOrNull(door.id);
+      if (!pose) continue;
       out.push({
-        wall: rec.wall,
-        lateral: rec.lateral,
+        wall: pose.wall,
+        lateral: pose.tangent === "x" ? pose.x : pose.z,
         width: DOOR_OPENING_WIDTH,
         height: DOOR_OPENING_HEIGHT,
       });
     }
     return out;
+  }
+
+  /** Everything the hull's door apertures depend on: the openings, and the
+   *  room size they are clamped to. */
+  private hullDoorSignature(openings: HullDoorOpening[]): string {
+    return JSON.stringify([roomHalfExtents(), openings]);
+  }
+
+  /** 🚪 #159: settle a dirty hull — re-cut it only if its apertures really
+   *  changed. Most of what marks it dirty changes nothing: a floor-plan write
+   *  that moves no door, the two reconciles of every join, a slide landing OPEN. */
+  private settleHullDoorOpenings(): void {
+    if (!this.hullDoorsDirty) return;
+    this.hullDoorsDirty = false;
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    const sig = this.hullDoorSignature(this.collectHullDoorOpenings());
+    if (sig !== this.octagonHullDoorSig) this.addOctagonHull();
   }
 
   /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
@@ -1651,7 +1685,7 @@ export class World {
     setDoorRecords(stored.size ? stored : defaultDoorLayoutRecords());
     reposeDoorTargets();
     this.dockingSystem?.repositionDoorGroups();
-    if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
+    this.hullDoorsDirty = true; // 🚪 #159: the apertures follow the frames
     this.updateNorthDoorForFireplace();
     this.refreshDoorSigns(); // 🚪 #91: signs follow (and outlive) their door
     // 🚪 #28 S6c (#86 review): the reposition above lands UNDER a live cardinal
@@ -3567,6 +3601,7 @@ export class World {
     // Advance door leaf slides (update-loop driven, completion-signalled)
     if (this.dockingSystem) {
       this.dockingSystem.update(deltaTime);
+      this.settleHullDoorOpenings(); // 🚪 #159: after the slides — a landing counts
       // #51 camera-facing door fade: only while the ortho room camera is
       // live (zoom 2–4 — visually it only matters at 2), never during the
       // morph, first person (level 1) or a device-focus camera.
@@ -5474,6 +5509,14 @@ export class World {
   private initializeDockingPorts() {
     this.dockingSystem = new DoorDockingPortSystem(this.platformGroup);
     this.dockingSystem.buildPorts();
+    // 🚪 #159: the hull opens behind a door as its leaves part, and heals once
+    // they have shut — see collectHullDoorOpenings.
+    this.dockingSystem.onDoorAjarChange(() => {
+      this.hullDoorsDirty = true;
+    });
+    // A morph restart lands here with a NEW system whose doors are all shut,
+    // after createPlatform cut the hull from the old one's — re-check it.
+    this.hullDoorsDirty = true;
 
     // Hook P2P sync routing events (Task: Room pairings over Yjs awareness)
     this.dockingSystem.onConnectionRequest((doorId, address) => {
