@@ -9,7 +9,7 @@ import * as THREE from "three";
 import { readDoorPolicy } from "./doorPolicy";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import { Player } from "./player";
 import {
@@ -152,7 +152,7 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
-import type { OctagonHull, HullWallpapers } from "./octagonHull";
+import type { OctagonHull, HullWallpapers, HullDoorOpening } from "./octagonHull";
 import {
   readAllWindowLayout,
   subscribeWindowLayout,
@@ -287,6 +287,14 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
   private octagonHull: OctagonHull | null = null;
+  /** 🚪 #159: what the live hull's door apertures were cut from (see
+   *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
+  private octagonHullDoorSig = "";
+  /** 🚪 #159: the apertures may be stale — the docking system said a frame
+   *  moved or vanished, or a door began to open or finished closing
+   *  (onDoorApertureChange). Settled once per frame in update(), so a join
+   *  that opens three doors in one tick re-cuts the hull once. */
+  private hullDoorsDirty = false;
   /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
    *  + their connector tubes, posed around the current room; shown ONLY in first
    *  person (update() gate) so looking OUT a window shows the real station. */
@@ -1040,14 +1048,57 @@ export class World {
       this.octagonHull = null;
     }
     const { halfX, halfZ } = roomHalfExtents();
+    const doorOpenings = this.collectHullDoorOpenings();
     this.octagonHull = buildOctagonHull(
       { halfX, halfZ },
       collectWindowOpenings(),
       this.collectWallpaper(),
+      doorOpenings,
     );
+    this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
-    // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
+    // 🪟 keep the window click-boxes in lock-step with the (re)built hull…
     this.rebuildWindowClickBoxes();
+    // …and a live edit session's raycast index in step with THEM. The boxes
+    // were just disposed and rebuilt fresh, whoever asked for the hull — a
+    // window or wallpaper change, or (#159) a door opening, closing or moving —
+    // so the re-index lives here, where no caller can forget it. A targeted
+    // window-slice rebuild that preserves the current selection by id (mirrors
+    // reconcileDoorLayout → onDoorLayoutChanged); a no-op outside edit mode.
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+  }
+
+  /**
+   * 🚪 #159: the hull is cut open behind every door whose leaves are not shut —
+   * so an open door shows its vestibule instead of the wall panel it used to
+   * slide aside in front of. Behind a SHUT door the wall stays whole (see
+   * DoorDockingPortSystem.ajarDoorFrames for why, and for why the list comes
+   * from the frames themselves), which also means nothing is cut at boot,
+   * before the docking ports exist. The size is the frame's clear opening.
+   */
+  private collectHullDoorOpenings(): HullDoorOpening[] {
+    return (this.dockingSystem?.ajarDoorFrames() ?? []).map((frame) => ({
+      ...frame,
+      width: DOOR_OPENING_WIDTH,
+      height: DOOR_OPENING_HEIGHT,
+    }));
+  }
+
+  /** Everything the hull's door apertures depend on: the openings, and the
+   *  room size they are clamped to. */
+  private hullDoorSignature(openings: HullDoorOpening[]): string {
+    return JSON.stringify([roomHalfExtents(), openings]);
+  }
+
+  /** 🚪 #159: settle a dirty hull — re-cut it only if its apertures really
+   *  changed. Most of what marks it dirty changes nothing: a re-pose that moves
+   *  no door (the reconciles of every join), a slide landing OPEN. */
+  private settleHullDoorOpenings(): void {
+    if (!this.hullDoorsDirty) return;
+    this.hullDoorsDirty = false;
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    const sig = this.hullDoorSignature(this.collectHullDoorOpenings());
+    if (sig !== this.octagonHullDoorSig) this.addOctagonHull();
   }
 
   /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
@@ -1339,11 +1390,9 @@ export class World {
    */
   private reconcileWindowLayout(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull(); // rebuilds hull holes + glass AND the click-boxes
-    // 🪟 keep a live edit session's raycast index in sync with the window
-    // boxes just rebuilt — a targeted window-slice rebuild that preserves the
-    // current selection by id (mirrors reconcileDoorLayout → onDoorLayoutChanged).
-    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+    // Rebuilds hull holes + glass, the click-boxes, AND a live edit session's
+    // window raycast index (addOctagonHull does all three).
+    this.addOctagonHull();
   }
 
   /**
@@ -1353,8 +1402,7 @@ export class World {
    */
   private reconcileWallpaper(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes
-    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes + edit index
   }
 
   /**
@@ -3546,6 +3594,7 @@ export class World {
     // Advance door leaf slides (update-loop driven, completion-signalled)
     if (this.dockingSystem) {
       this.dockingSystem.update(deltaTime);
+      this.settleHullDoorOpenings(); // 🚪 #159: after the slides — a landing counts
       // #51 camera-facing door fade: only while the ortho room camera is
       // live (zoom 2–4 — visually it only matters at 2), never during the
       // morph, first person (level 1) or a device-focus camera.
@@ -5453,6 +5502,15 @@ export class World {
   private initializeDockingPorts() {
     this.dockingSystem = new DoorDockingPortSystem(this.platformGroup);
     this.dockingSystem.buildPorts();
+    // 🚪 #159: the hull opens behind a door as its leaves part, follows its
+    // frame when that moves, and heals once the leaves have shut or the door
+    // is gone — see collectHullDoorOpenings.
+    this.dockingSystem.onDoorApertureChange(() => {
+      this.hullDoorsDirty = true;
+    });
+    // A morph restart lands here with a NEW system whose doors are all shut,
+    // after createPlatform cut the hull from the old one's — re-check it.
+    this.hullDoorsDirty = true;
 
     // Hook P2P sync routing events (Task: Room pairings over Yjs awareness)
     this.dockingSystem.onConnectionRequest((doorId, address) => {

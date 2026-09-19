@@ -82,7 +82,7 @@ import { DEVICES, rebuildDevices } from './devices';
 import { DOORS } from './doors';
 import {
   snapDoorLateral, wallAndLateralFromPoint, poseFromWall,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH, MIN_DOOR_GAP,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH, MIN_DOOR_GAP,
 } from './doorLayout';
 import type { PhysicalDoorPose } from './doorLayout';
 import {
@@ -2298,7 +2298,7 @@ class RoomEditController {
     if (this.doorGhost) return this.doorGhost;
     const parent = this.world?.getClickPlane()?.parent;
     if (!parent) return null;
-    const geo = new THREE.BoxGeometry(DOOR_OPENING_WIDTH, 3.0, 0.5);
+    const geo = new THREE.BoxGeometry(DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, 0.5);
     geo.translate(0, -0.5, 0); // mesh origin → door-group origin (world y=2)
     const mat = new THREE.MeshBasicMaterial({
       color: CARRY_VALID_EMISSIVE, // furniture carry's green; flipped red on invalid
