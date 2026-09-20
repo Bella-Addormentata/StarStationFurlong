@@ -850,15 +850,7 @@ function buildPanel(): HTMLDivElement {
         // not re-cut the station's connections (no room types).
         w.reconcileDoorPlacements();
         w.updateSideWallCoverage();
-        // 📐 A template with its own ENVELOPE resized the room in the doc, but
-        // the shell is built once and never torn down — say so rather than let
-        // the player wonder why the floor stops short of the new furniture.
-        showHint(
-          t.dims
-            ? `DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces. Room is now ${t.dims.cols}×${t.dims.rows}: leave and re-enter to rebuild the floor.`
-            : `DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces.`,
-          t.dims ? 6000 : undefined,
-        );
+        showHint(`DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces.`);
         break;
       }
       // ➕ Additive: the room keeps everything it has, and a template with a

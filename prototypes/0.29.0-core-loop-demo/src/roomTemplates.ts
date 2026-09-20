@@ -16,11 +16,13 @@
  * The lobby / casino / pool built-ins reuse the EXACT manifests the two
  * originally-authored rooms shipped, so provisioning one reproduces them.
  *
- * R2 room-size presets: a template MAY carry `dims`. Most do not — they were
- * authored for the default 2×2 envelope and resizing under a layout that fits
- * would be rude. A template whose furniture genuinely cannot fit (the beach
- * party: a river, a bar under a 7×4 pergola, a dance floor AND an empty middle)
- * declares the envelope it was drawn for, and applying it writes that too.
+ * THE ROOM'S STRUCTURE IS NEVER A TEMPLATE'S TO CHANGE (owner ruling
+ * 2026-09-20). A module's envelope, walls and doors are fixed when it is born;
+ * every room carries its own base furnishing (Alluxia's Home keeps its stock
+ * lounge, an Empty Room its one terminal), and a set is something you put ON
+ * TOP of that. So templates never write floorPlan, and the additive path —
+ * addRoomTemplateItems, fitted to the room's real extents — is the one to
+ * reach for. A resize-carrying `dims` field was tried and removed.
  */
 
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
@@ -28,7 +30,7 @@ import {
   FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
-import { writeRoomDims, roomHalfExtents, type RoomDims } from "./floorPlanDoc";
+import { roomHalfExtents } from "./floorPlanDoc";
 
 /** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
  *  room's theme into its own roomInfo doc, so "this module is a casino now"
@@ -38,27 +40,6 @@ export function setRoomThemeWriter(cb: (theme: RoomTheme) => void): void {
   roomThemeWriter = cb;
 }
 
-/**
- * 📐 Write a template's envelope into the room doc.
- *
- * ⚠️ THE SHELL DOES NOT REBUILD IN PLACE. The floor, the walls, the walkable
- * bounds and the octagon hull are all built ONCE by World.createPlatform from
- * roomHalfExtents(), and nothing in the engine tears a built platform down —
- * createPlatform only ADDS to platformGroup. Calling it again (via startMorph)
- * leaves the old floor and a duplicate of every furniture group behind, which
- * is exactly what it did when this was first wired that way.
- *
- * So: at room BIRTH (seedRoomTemplate) the dims land before the platform is
- * ever built and everything is correct. On an EXISTING room the dims are
- * written and persist, but the player has to leave and re-enter for the shell
- * to come back at the new size — applyRoomTemplate says so in its return value
- * and the dev menu passes that on.
- *
- * Doing better means a real platform teardown, which is its own change.
- */
-function writeEnvelope(dims: RoomDims): void {
-  writeRoomDims(dims.cols, dims.rows);
-}
 
 /** The room "type"; each can have multiple design variants (casino-1, -2, …).
  *  "blank" is the empty starting point (folds in empty-by-default); "deck" is
@@ -86,10 +67,6 @@ export interface RoomTemplate {
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
   theme: RoomTheme;
-  /** 📐 R2: the room envelope this layout was drawn for, in 6 m tiles. Present
-   *  ONLY where the furniture will not fit the 2×2 default — applying such a
-   *  template resizes the room, because half a beach is not the design. */
-  dims?: RoomDims;
   /**
    * 🧩 A layout GENERATED for the room it is going into, instead of the fixed
    * `items` list. A room's structure is fixed once it is built — you cannot
@@ -427,10 +404,8 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     name: "Beach Birthday Party",
     description:
       "A winding river across the front with a plank bridge to the far bank, palms along both banks, a tiki bar under a lantern-strung pergola, cake and gifts along the back, a lit dance floor — and an empty middle.",
-    // 📐 5×5 (30×30 m), the largest envelope there is, and this layout needs it:
-    // the river spans bank to bank, the pergola is 6.6×3.6, and the middle has
-    // to stay empty. At 4×4 the far bank disappears; at 2×2 so does everything.
-    dims: { cols: 5, rows: 5 },
+    // The fixed list below was DRAWN for a 5×5 module and is what PLACE
+    // uses; `layout` (ADD) is the version that fits whatever room it lands in.
     //
     // ── ZONES ──────────────────────────────────────────────────────────────
     //  z -15 ┌────────────────────────────────────────────────┐
@@ -573,10 +548,6 @@ export function findTemplate(id: string): RoomTemplate | null {
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
-  // 📐 Size FIRST: placement validity and the walk bounds are derived from the
-  // envelope, so growing the room before the furniture lands means nothing is
-  // ever briefly out of bounds.
-  if (t.dims) writeEnvelope(t.dims);
   replaceAllFurniture(cloneItems(t.items));
   // 🌌 …and the room IS this now: stamping the theme makes the change
   // persistent and shared, instead of a look that lasted until the next
@@ -621,7 +592,6 @@ export function addRoomTemplateItems(
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
-  if (t.dims) writeEnvelope(t.dims);
   replaceAllFurniture(cloneItems(t.items));
   return true;
 }
