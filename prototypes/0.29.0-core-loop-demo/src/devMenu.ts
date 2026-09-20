@@ -55,7 +55,9 @@ import type { PlacementContext } from './editMode';
 import { writeFurnitureItem } from './furnitureDoc';
 // #45 board mirror: spawned game tables paint the doc's current game at once.
 import { readGame } from './games/gamesDoc';
-import { ROOM_TEMPLATES, applyRoomTemplate, exportCurrentRoomAsTemplate } from './roomTemplates';
+import {
+  ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
+} from './roomTemplates';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
@@ -750,7 +752,10 @@ function buildPanel(): HTMLDivElement {
   const templateRows = ROOM_TEMPLATES.map((t) => `
     <div style="${ROW_STYLE}">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${t.description}">${t.name.toUpperCase()}</span>
-      <button type="button" data-dev-action="place-template" data-template="${t.id}" style="${BTN_STYLE}">PLACE</button>
+      <span style="display:flex; gap:4px; flex-shrink:0;">
+        <button type="button" data-dev-action="add-template" data-template="${t.id}" title="Add this set to the room — nothing is removed" style="${BTN_STYLE}">+ ADD</button>
+        <button type="button" data-dev-action="place-template" data-template="${t.id}" title="REPLACE every piece in the room with this template" style="${BTN_STYLE}">PLACE</button>
+      </span>
     </div>
   `);
   templateRows.push(`
@@ -853,6 +858,24 @@ function buildPanel(): HTMLDivElement {
             ? `DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces. Room is now ${t.dims.cols}×${t.dims.rows}: leave and re-enter to rebuild the floor.`
             : `DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces.`,
           t.dims ? 6000 : undefined,
+        );
+        break;
+      }
+      // ➕ Additive: the room keeps everything it has, and a template with a
+      // layout generator fits itself to the room's real size. Not destructive,
+      // so no arm/confirm — that gate is there for PLACE, which wipes the room.
+      case 'add-template': {
+        const w = getWorld();
+        if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        const r = addRoomTemplateItems(btn.dataset.template ?? '');
+        if (!r) break;
+        w.reconcileDoorPlacements();
+        w.updateSideWallCoverage();
+        showHint(
+          r.skipped > 0
+            ? `DEV: ➕ added ${r.placed} of "${r.name}" — ${r.skipped} didn't fit this room.`
+            : `DEV: ➕ added ${r.placed} pieces of "${r.name}".`,
+          5000,
         );
         break;
       }

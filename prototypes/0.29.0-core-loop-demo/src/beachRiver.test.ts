@@ -10,7 +10,9 @@
  * Break any one and the room is either a lake you cannot cross or a floor with
  * a river painted on it. These cases pin all three against the real functions.
  */
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
+import { bindFloorPlan, writeRoomDims } from './floorPlanDoc';
 import {
   buildObstacleList,
   isPoolKind,
@@ -21,6 +23,15 @@ import {
   type FurnitureItem,
 } from './furniture';
 
+// The river SIZES ITSELF FROM THE ROOM (furniture.ts riverMetrics), so these
+// cases have to say which room they are in. 5×5 is the biggest envelope and
+// the one the band's full 2.6 m half-width is reached in; the last block below
+// checks a 2×2 room instead.
+beforeAll(() => {
+  bindFloorPlan(new Y.Doc());
+  writeRoomDims(5, 5); // 30×30 m ⇒ halfX = halfZ = 15
+});
+
 /** The template's pose: river across the front, bridge crossing it at x 5.5. */
 const RIVER: FurnitureItem = {
   id: 'r', kind: 'beach-river', pos: { x: 0, z: 7.0 }, rot: 0, movable: false,
@@ -29,8 +40,10 @@ const BRIDGE: FurnitureItem = {
   id: 'b', kind: 'plank-bridge', pos: { x: 5.5, z: 7.8 }, rot: 0, movable: false,
 };
 
-/** The centre line the builder, the hole cutter and the strips all share. */
-const centreZ = (x: number): number => 7.0 + 1.8 * Math.sin(0.38 * x + 0.6);
+// The centre line the builder, the hole cutter and the strips all share. At
+// 5×5 the amplitude clamps to its maximum 1.8 and the water to 2.6.
+const AMP = 1.8;
+const centreZ = (x: number): number => 7.0 + AMP * Math.sin(0.38 * x + 0.6);
 
 const blockedBy = (boxes: Array<{ x0: number; z0: number; x1: number; z1: number }>) =>
   (x: number, z: number): boolean =>
@@ -78,8 +91,8 @@ describe('the water band', () => {
     const rect = poolHoleRect([RIVER])!;
     expect(rect).not.toBeNull();
     for (let x = -14; x <= 14; x += 1) {
-      expect(centreZ(x) - 2.6).toBeGreaterThanOrEqual(rect.z0 - 1e-6);
-      expect(centreZ(x) + 2.6).toBeLessThanOrEqual(rect.z1 + 1e-6);
+      expect(centreZ(x) - 3.4).toBeGreaterThanOrEqual(rect.z0 - 1e-6);
+      expect(centreZ(x) + 3.4).toBeLessThanOrEqual(rect.z1 + 1e-6);
     }
   });
 });
@@ -98,7 +111,10 @@ describe('the bridge', () => {
 });
 
 describe('what you can walk on', () => {
-  const blocked = blockedBy(buildObstacleList([RIVER, BRIDGE]));
+  // Lazily: a describe body runs BEFORE beforeAll, so building the obstacle
+  // list here would build it against the default room, not the 5×5 one.
+  const blocked = (x: number, z: number): boolean =>
+    blockedBy(buildObstacleList([RIVER, BRIDGE]))(x, z);
 
   it('blocks the water', () => {
     // Sampled at CELL CENTRES (i + 0.5) — what the walkable-grid bake asks.
@@ -160,11 +176,12 @@ describe('what you can walk on', () => {
 });
 
 describe('the floor hole', () => {
-  const cells = poolHoleCells([RIVER, BRIDGE]);
+  const cells = (): Set<string> => poolHoleCells([RIVER, BRIDGE]);
 
   it('cuts only cells that are actually excavated', () => {
-    expect(cells.size).toBeGreaterThan(80);
-    for (const key of cells) {
+    const cut = cells();
+    expect(cut.size).toBeGreaterThan(80);
+    for (const key of cut) {
       const [i, j] = key.split(',').map(Number);
       expect(poolCutContains([RIVER, BRIDGE], i + 0.5, j + 0.5)).toBe(true);
     }
@@ -180,13 +197,38 @@ describe('the floor hole', () => {
 
   it('leaves the bridge its floor — a hole under the planks is a hole', () => {
     for (let j = 4; j <= 11; j++) {
-      expect(cells.has(`5,${j}`)).toBe(false);
+      expect(cells().has(`5,${j}`)).toBe(false);
     }
   });
 
   it('cuts the channel where there is no bridge', () => {
     // Column x ∈ [-6,-5): the centre line is ≈ 7 + 1.8·sin(-1.49) ≈ 5.2.
     const j = Math.floor(centreZ(-5.5));
-    expect(cells.has(`-6,${j}`)).toBe(true);
+    expect(cells().has(`-6,${j}`)).toBe(true);
+  });
+});
+
+
+describe('it sizes itself to the room', () => {
+  // A 30 m channel authored for a 5×5 module hangs out through the walls of a
+  // 2×2 one, and the reference's own widths would leave a 12 m room with no
+  // bank at all. The river reaches wall to wall and narrows instead.
+  it('reaches the walls of a small room without overflowing them', () => {
+    bindFloorPlan(new Y.Doc());
+    writeRoomDims(2, 2); // 12×12 m ⇒ half = 6
+    try {
+      const small = { ...RIVER, pos: { x: 0, z: 2.5 } };
+      const rect = poolHoleRect([small])!;
+      expect(rect.x0).toBeGreaterThanOrEqual(-6);
+      expect(rect.x1).toBeLessThanOrEqual(6);
+      // …and it is narrower than the 5×5 channel, not the same band clipped.
+      expect(rect.z1 - rect.z0).toBeLessThan(6.8 + 2 * 1.8);
+      // Still a river: water down the middle, dry land on both banks.
+      expect(poolWaterContains([small], 0, 2.5)).toBe(true);
+      expect(poolWaterContains([small], 0, -4.5)).toBe(false);
+    } finally {
+      bindFloorPlan(new Y.Doc());
+      writeRoomDims(5, 5);
+    }
   });
 });

@@ -6297,13 +6297,39 @@ function buildSlotMachine({
  * −0.75 under the shallows, −1.25 down the channel — which is where the depth
  * actually comes from, since you see the bed THROUGH the water.
  */
-const RIVER_HALF_LEN = 15; // reaches bank to bank across a 5×5 room
-const RIVER_AMP = 1.8; // how far the centre line wanders
-const RIVER_K = 0.38; // and how tightly — two numbers, re-tunable
+const RIVER_K = 0.38; // how tightly the centre line wanders — re-tunable
 const RIVER_PHASE = 0.6;
-const RIVER_W_WET = 3.4; // half-widths, the reference's distance bands
-const RIVER_W_WATER = 2.6;
-const RIVER_W_DEEP = 1.0;
+
+/**
+ * 📐 The river is a ROOM-SPANNING feature, so its length and width come from
+ * the room, not from a constant. A 30 m channel authored for a 5×5 module
+ * hangs out through the walls of a 2×2 one; the reference's own widths (water
+ * 2.6, wet shelf 3.4) would leave a 12 m room with almost no bank.
+ *
+ * So: it reaches wall to wall, and the bands are a FRACTION of the room's
+ * depth, clamped so it never stops looking like a river — five or six tiles
+ * across in a big room, a stream in a small one, a bank on both sides either
+ * way. All four consumers (the builder, the floor-hole cutter, the obstacle
+ * strips and the swim test) read this one function, so what you see, what is
+ * missing from the floor and what you cannot walk on stay one shape.
+ */
+function riverMetrics(): {
+  halfLen: number;
+  amp: number;
+  wWet: number;
+  wWater: number;
+  wDeep: number;
+} {
+  const { halfX, halfZ } = roomHalfExtents();
+  const wWater = Math.min(2.6, Math.max(1.2, halfZ * 0.185));
+  return {
+    halfLen: halfX,
+    amp: Math.min(1.8, halfZ * 0.13),
+    wWet: wWater * 1.31, // the reference's 3.4 / 2.6
+    wWater,
+    wDeep: wWater * 0.385, // …and its 1.0 / 2.6
+  };
+}
 const RIVER_Y_WET = -0.3; // the bank's first step down
 const RIVER_Y_BED = -1.05; // bed under the shallows
 const RIVER_Y_DEEP = -1.85; // bed down the channel
@@ -6313,13 +6339,14 @@ const RIVER_SEGS = 120;
  *  the floor-hole cutter and the obstacle strips, so the water you see, the
  *  floor that is missing and the tiles you cannot walk on are one shape. */
 function riverCentreZ(lx: number): number {
-  return RIVER_AMP * Math.sin(RIVER_K * lx + RIVER_PHASE);
+  return riverMetrics().amp * Math.sin(RIVER_K * lx + RIVER_PHASE);
 }
 
 /** Is a LOCAL point inside the river's water? Analytic — no polygon sampling,
  *  because the band has a constant half-width about a known centre line. */
 function riverHasWaterAt(lx: number, lz: number): boolean {
-  return Math.abs(lx) <= RIVER_HALF_LEN && Math.abs(lz - riverCentreZ(lx)) <= RIVER_W_WATER;
+  const { halfLen, wWater } = riverMetrics();
+  return Math.abs(lx) <= halfLen && Math.abs(lz - riverCentreZ(lx)) <= wWater;
 }
 
 /**
@@ -6332,7 +6359,8 @@ function riverHasWaterAt(lx: number, lz: number): boolean {
  * follows the water — wading onto the bank is climbing out, not drowning.
  */
 function riverHasCutAt(lx: number, lz: number): boolean {
-  return Math.abs(lx) <= RIVER_HALF_LEN && Math.abs(lz - riverCentreZ(lx)) <= RIVER_W_WET;
+  const { halfLen, wWet } = riverMetrics();
+  return Math.abs(lx) <= halfLen && Math.abs(lz - riverCentreZ(lx)) <= wWet;
 }
 
 /**
@@ -6345,10 +6373,11 @@ function riverHasCutAt(lx: number, lz: number): boolean {
  * is never seen. Ask for the strip you mean.
  */
 function riverRibbonBand(hwInner: number, hwOuter: number, y: number): THREE.BufferGeometry {
+  const { halfLen } = riverMetrics();
   const pos: number[] = [];
   const idx: number[] = [];
   for (let i = 0; i <= RIVER_SEGS; i++) {
-    const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+    const lx = -halfLen + (i / RIVER_SEGS) * halfLen * 2;
     const zc = riverCentreZ(lx);
     // Four vertices per station: outer-near, inner-near, inner-far, outer-far.
     pos.push(lx, y, zc - hwOuter, lx, y, zc - hwInner, lx, y, zc + hwInner, lx, y, zc + hwOuter);
@@ -6369,10 +6398,11 @@ function riverRibbonBand(hwInner: number, hwOuter: number, y: number): THREE.Buf
 /** A flat ribbon following the centre line — one mesh per terrace instead of
  *  a hundred little slabs. */
 function riverRibbon(hw: number, y: number): THREE.BufferGeometry {
+  const { halfLen } = riverMetrics();
   const pos: number[] = [];
   const idx: number[] = [];
   for (let i = 0; i <= RIVER_SEGS; i++) {
-    const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+    const lx = -halfLen + (i / RIVER_SEGS) * halfLen * 2;
     const zc = riverCentreZ(lx);
     pos.push(lx, y, zc - hw, lx, y, zc + hw);
   }
@@ -6391,10 +6421,11 @@ function riverRibbon(hw: number, y: number): THREE.BufferGeometry {
  *  thing reads as a painted floor, which the checklist calls the single most
  *  common reason a beach room looks flat. */
 function riverBankFace(hw: number, side: 1 | -1, yTop: number, yBot: number): THREE.BufferGeometry {
+  const { halfLen } = riverMetrics();
   const pos: number[] = [];
   const idx: number[] = [];
   for (let i = 0; i <= RIVER_SEGS; i++) {
-    const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+    const lx = -halfLen + (i / RIVER_SEGS) * halfLen * 2;
     const z = riverCentreZ(lx) + side * hw;
     pos.push(lx, yTop, z, lx, yBot, z);
   }
@@ -6411,6 +6442,7 @@ function riverBankFace(hw: number, side: 1 | -1, yTop: number, yBot: number): TH
 
 function buildBeachRiver(ctx: BuildCtx) {
   const { m, place } = ctx;
+  const { halfLen, amp, wWet, wWater, wDeep } = riverMetrics();
   const WET = 0xd6cbb3;
   const BED = 0x3fb3c6;
   const BED_DEEP = 0x175f6e;
@@ -6430,29 +6462,29 @@ function buildBeachRiver(ctx: BuildCtx) {
   //    -0.35       ~~ water surface ......... plate      ±2.6
   //    -1.05       └──┐ shallow bed ......... band  1.0 → 2.6
   //    -1.85          └── deep channel bed .. plate      ±1.0
-  place(riverRibbonBand(RIVER_W_WATER, RIVER_W_WET, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
-  place(riverBankFace(RIVER_W_WET, 1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
-  place(riverBankFace(RIVER_W_WET, -1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverRibbonBand(wWater, wWet, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverBankFace(wWet, 1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverBankFace(wWet, -1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
 
-  place(riverRibbonBand(RIVER_W_DEEP, RIVER_W_WATER, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
-  place(riverBankFace(RIVER_W_WATER, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
-  place(riverBankFace(RIVER_W_WATER, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  place(riverRibbonBand(wDeep, wWater, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wWater, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wWater, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
 
   // The deep channel: one more terrace, and the biggest depth cue a river has.
-  place(riverRibbon(RIVER_W_DEEP, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
-  place(riverBankFace(RIVER_W_DEEP, 1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
-  place(riverBankFace(RIVER_W_DEEP, -1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverRibbon(wDeep, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wDeep, 1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wDeep, -1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
 
   // ── The water surface itself, translucent over the bed ──
   const waterMat = both(m(WATER, 0.25, 0.1));
   translucent(waterMat, 0.72);
-  place(riverRibbon(RIVER_W_WATER, POOL_WATER_Y), waterMat, 0, 0, 0);
+  place(riverRibbon(wWater, POOL_WATER_Y), waterMat, 0, 0, 0);
 
   // ── Foam where the water laps the bank, on BOTH banks ──
   for (const side of [1, -1] as const) {
     const foam = both(m(FOAM, 0.6, 0.0, FOAM, 0.35));
     translucent(foam, 0.8);
-    const g = riverRibbon(RIVER_W_WATER, POOL_WATER_Y + 0.008);
+    const g = riverRibbon(wWater, POOL_WATER_Y + 0.008);
     // Squeeze the ribbon to a thin strip hugging one edge by moving every
     // inner vertex out to meet the outer one.
     const arr = g.getAttribute("position") as THREE.BufferAttribute;
@@ -6479,22 +6511,22 @@ function buildBeachRiver(ctx: BuildCtx) {
   for (let i = 0; i < STREAKS; i++) {
     const mesh = place(new THREE.BoxGeometry(1.1, 0.01, 0.075), streakMat, 0, POOL_WATER_Y + 0.014, 0);
     streaks.push(mesh);
-    streakX.push(-RIVER_HALF_LEN + (i / STREAKS) * RIVER_HALF_LEN * 2);
+    streakX.push(-halfLen + (i / STREAKS) * halfLen * 2);
     // Spread across the channel, denser toward the middle where a real current
     // runs fastest.
-    streakOff.push((Math.random() * 2 - 1) ** 3 * RIVER_W_WATER * 0.8);
+    streakOff.push((Math.random() * 2 - 1) ** 3 * wWater * 0.8);
   }
   const anim: PropAnimHandle = {
     update(dt: number) {
       for (let i = 0; i < STREAKS; i++) {
         // Mid-channel water moves faster than the edges.
-        const speed = 1.15 - 0.5 * Math.abs(streakOff[i]) / RIVER_W_WATER;
+        const speed = 1.15 - 0.5 * Math.abs(streakOff[i]) / wWater;
         streakX[i] += speed * dt;
-        if (streakX[i] > RIVER_HALF_LEN) streakX[i] -= RIVER_HALF_LEN * 2;
+        if (streakX[i] > halfLen) streakX[i] -= halfLen * 2;
         const lx = streakX[i];
         streaks[i].position.set(lx, POOL_WATER_Y + 0.014, riverCentreZ(lx) + streakOff[i]);
         // Bank the streak along the flow so it follows the bend.
-        const slope = RIVER_AMP * RIVER_K * Math.cos(RIVER_K * lx + RIVER_PHASE);
+        const slope = amp * RIVER_K * Math.cos(RIVER_K * lx + RIVER_PHASE);
         streaks[i].rotation.y = -Math.atan(slope);
       }
     },
@@ -8461,8 +8493,9 @@ function riverObstacleBoxes(item: FurnitureItem, all: FurnitureItem[]): Box[] {
   // edge would otherwise belong to neither.
   const SEAM = 0.01;
 
-  for (let lx0 = -RIVER_HALF_LEN; lx0 < RIVER_HALF_LEN; lx0 += STRIP) {
-    const lx1 = Math.min(lx0 + STRIP, RIVER_HALF_LEN);
+  const { halfLen, wWet } = riverMetrics();
+  for (let lx0 = -halfLen; lx0 < halfLen; lx0 += STRIP) {
+    const lx1 = Math.min(lx0 + STRIP, halfLen);
 
     // Split the column in X at every bridge edge inside it FIRST. Cutting the
     // whole column whenever a bridge merely clipped its edge used to delete a
@@ -8483,7 +8516,7 @@ function riverObstacleBoxes(item: FurnitureItem, all: FurnitureItem[]): Box[] {
       // The cut spans the whole EXCAVATION here, widened to the centre line's
       // drift within this piece so no water leaks out between pieces.
       const zc = [riverCentreZ(sx0), riverCentreZ(mid), riverCentreZ(sx1)];
-      const spans = [{ z0: Math.min(...zc) - RIVER_W_WET, z1: Math.max(...zc) + RIVER_W_WET }];
+      const spans = [{ z0: Math.min(...zc) - wWet, z1: Math.max(...zc) + wWet }];
       // Only a bridge that actually covers THIS piece in x may cut it.
       for (const b of bridges) {
         if (mid <= b.x0 || mid >= b.x1) continue;
@@ -8572,11 +8605,12 @@ export function getPoolBasin(items: FurnitureItem[]): {
       // rectangle, and over-covering is safe here because ENTRY is gated by
       // poolWaterContains — you cannot start swimming on the dry sand at a
       // bend, you can only drift over it once already in the water.
-      const half = RIVER_AMP + RIVER_W_WATER - 0.2;
-      const a = rotXZ(-RIVER_HALF_LEN + 0.4, -half, item.rot);
-      const b = rotXZ(RIVER_HALF_LEN - 0.4, half, item.rot);
-      const e1 = rotXZ(-RIVER_HALF_LEN + 0.4, -(half + 0.9), item.rot);
-      const e2 = rotXZ(RIVER_HALF_LEN - 0.4, half + 0.9, item.rot);
+      const rm = riverMetrics();
+      const half = rm.amp + rm.wWater - 0.2;
+      const a = rotXZ(-rm.halfLen + 0.4, -half, item.rot);
+      const b = rotXZ(rm.halfLen - 0.4, half, item.rot);
+      const e1 = rotXZ(-rm.halfLen + 0.4, -(half + 0.9), item.rot);
+      const e2 = rotXZ(rm.halfLen - 0.4, half + 0.9, item.rot);
       return {
         x0: item.pos.x + Math.min(a.x, b.x),
         z0: item.pos.z + Math.min(a.z, b.z),
@@ -8758,14 +8792,15 @@ export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: n
   if (pool.kind === "beach-river") {
     // Down one bank and back along the other — the same centre line the water
     // ribbon is built from, so the cut edge and the water edge coincide.
+    const rm = riverMetrics();
     const ring: Array<{ x: number; z: number }> = [];
     for (let i = 0; i <= RIVER_SEGS; i++) {
-      const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
-      ring.push({ x: lx, z: riverCentreZ(lx) - RIVER_W_WET });
+      const lx = -rm.halfLen + (i / RIVER_SEGS) * rm.halfLen * 2;
+      ring.push({ x: lx, z: riverCentreZ(lx) - rm.wWet });
     }
     for (let i = RIVER_SEGS; i >= 0; i--) {
-      const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
-      ring.push({ x: lx, z: riverCentreZ(lx) + RIVER_W_WET });
+      const lx = -rm.halfLen + (i / RIVER_SEGS) * rm.halfLen * 2;
+      ring.push({ x: lx, z: riverCentreZ(lx) + rm.wWet });
     }
     local = ring;
   } else if (pool.kind === "classic-pool") {
@@ -8804,8 +8839,9 @@ export function poolHoleRect(
   for (const item of items) {
     if (!isPoolKind(item.kind)) continue;
     if (item.kind === "beach-river") {
-      const half = RIVER_AMP + RIVER_W_WET;
-      return localBoxToWorld(item, -RIVER_HALF_LEN, -half, RIVER_HALF_LEN, half);
+      const rm = riverMetrics();
+      const half = rm.amp + rm.wWet;
+      return localBoxToWorld(item, -rm.halfLen, -half, rm.halfLen, half);
     }
     const a = rotXZ(-POOL_WATER_WEST, -POOL_WATER_HALFZ, item.rot);
     const b = rotXZ(POOL_WATER_EAST, POOL_WATER_HALFZ, item.rot);

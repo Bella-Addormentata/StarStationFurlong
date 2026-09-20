@@ -177,6 +177,32 @@ export function seedFurnitureDefaults(): void {
  * per-item thrash) and every peer converges to the same layout. Owner-only in
  * practice, like the other writers.
  */
+/**
+ * ➕ ADD items to the room, keeping everything already in it.
+ *
+ * The additive sibling of replaceAllFurniture, and the one a template set
+ * should normally use: a room's structure is fixed once it is built, so what
+ * people actually do is put things IN the room they have, not swap the room
+ * for a different one. Ids are made unique against what is already there, so
+ * adding the same set twice gives two of everything rather than silently
+ * overwriting the first. Returns the ids written.
+ */
+export function addFurniture(items: FurnitureItem[]): string[] {
+  if (!docAlive()) return [];
+  const taken = new Set(furnitureMap!.keys());
+  const written: string[] = [];
+  boundDoc!.transact(() => {
+    for (const item of items) {
+      let id = item.id;
+      for (let n = 2; taken.has(id); n++) id = `${item.id}-${n}`;
+      taken.add(id);
+      written.push(id);
+      furnitureMap!.set(id, toRecord({ ...item, id }));
+    }
+  });
+  return written;
+}
+
 export function replaceAllFurniture(items: FurnitureItem[]): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {

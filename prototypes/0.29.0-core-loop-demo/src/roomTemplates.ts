@@ -23,10 +23,12 @@
  * declares the envelope it was drawn for, and applying it writes that too.
  */
 
-import type { FurnitureItem, RoomTheme } from "./furniture";
-import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
-import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
-import { writeRoomDims, type RoomDims } from "./floorPlanDoc";
+import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
+import {
+  FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
+} from "./furniture";
+import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
+import { writeRoomDims, roomHalfExtents, type RoomDims } from "./floorPlanDoc";
 
 /** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
  *  room's theme into its own roomInfo doc, so "this module is a casino now"
@@ -88,6 +90,176 @@ export interface RoomTemplate {
    *  ONLY where the furniture will not fit the 2×2 default — applying such a
    *  template resizes the room, because half a beach is not the design. */
   dims?: RoomDims;
+  /**
+   * 🧩 A layout GENERATED for the room it is going into, instead of the fixed
+   * `items` list. A room's structure is fixed once it is built — you cannot
+   * resize it, you can only put things in it — so a set that is worth adding
+   * to somebody's existing room has to fit the room they actually have. The
+   * generator is handed the real half-extents and places what fits, in
+   * priority order, skipping what does not. See layoutBeachParty.
+   */
+  layout?: (half: { halfX: number; halfZ: number }) => FurnitureItem[];
+}
+
+// ── 🧩 Fitted layouts ────────────────────────────────────────────────────────
+
+/** One thing to try to place, at a position given as a FRACTION of the room's
+ *  half-extents so the same recipe works in a 12 m room and a 30 m one. */
+interface PlacementSpec {
+  kind: FurnitureKind;
+  /** Target, in room-fractions: [-1, 1] on each axis. */
+  at: [number, number];
+  rot?: Rot;
+  /** Spans the room on purpose (the river) — skip the bounds check. */
+  spanning?: boolean;
+}
+
+function boxesOverlap(a: Box, b: Box): boolean {
+  return a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
+}
+
+function pointInAny(x: number, z: number, boxes: Box[]): boolean {
+  return boxes.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
+}
+
+/**
+ * Place a list of specs into a room of the given half-extents, in order,
+ * keeping only what fits. Later specs lose to earlier ones, so the list IS the
+ * priority order: the cake before the parasols, always.
+ *
+ * Each candidate gets a few tries — its target, then nudged toward the room's
+ * centre — because in a small room a target derived from fractions can land a
+ * little inside a wall while a metre in would have been fine.
+ */
+function placeFitting(
+  specs: PlacementSpec[],
+  halfX: number,
+  halfZ: number,
+  idPrefix: string,
+): FurnitureItem[] {
+  const out: FurnitureItem[] = [];
+  const occupied: Box[] = [];
+  const MARGIN = 0.6; // keep furniture off the walls
+  let n = 0;
+
+  for (const spec of specs) {
+    const tx = spec.at[0] * halfX;
+    const tz = spec.at[1] * halfZ;
+    // Nudges pull toward the centre, which is where the room is.
+    const tries: Array<[number, number]> = [
+      [tx, tz],
+      [tx * 0.88, tz * 0.88],
+      [tx * 0.76, tz * 0.92],
+      [tx * 0.92, tz * 0.76],
+      [tx * 0.62, tz * 0.82],
+    ];
+    for (const [x, z] of tries) {
+      const item: FurnitureItem = {
+        id: `${idPrefix}-${spec.kind}-${++n}`,
+        kind: spec.kind,
+        pos: { x: +x.toFixed(2), z: +z.toFixed(2) },
+        rot: spec.rot ?? 0,
+        movable: !spec.spanning,
+      };
+      const boxes = buildObstacleList([item]);
+      if (boxes.length > 0) {
+        const outside =
+          !spec.spanning &&
+          boxes.some(
+            (b) =>
+              b.x0 < -halfX + MARGIN || b.x1 > halfX - MARGIN ||
+              b.z0 < -halfZ + MARGIN || b.z1 > halfZ - MARGIN,
+          );
+        if (outside) continue;
+        if (boxes.some((b) => occupied.some((o) => boxesOverlap(b, o)))) continue;
+        occupied.push(...boxes);
+      } else {
+        // Decoration with no footprint (banner, balloons, towel, ball, the
+        // dance floor, the pergola roof). It cannot COLLIDE, but it must not
+        // be standing in the river either, and it still has to be in the room.
+        if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
+        if (pointInAny(x, z, occupied)) continue;
+      }
+      out.push(item);
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * 🏝️ The beach birthday party, fitted to whatever room it is going into.
+ *
+ * Zone fractions, not metres: water across the FRONT, the bar in the far
+ * corner, the cake cluster beside it along the back facing in, the dance floor
+ * off to one side, and the middle left alone because in a multiplayer room the
+ * crowd needs somewhere to stand.
+ *
+ * Priority order is the point. A small room gets the river, the cake and a
+ * couple of palms and stops; a big one keeps going all the way to the towels.
+ * Nothing is scaled — a bar counter is 4 m wide wherever it is — so the set
+ * thins out rather than shrinking.
+ */
+function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem[] {
+  const { halfX, halfZ } = half;
+  const specs: PlacementSpec[] = [
+    // 🌊 First, because everything else has to avoid it. It spans the room by
+    // design and sizes itself from the room (furniture.ts riverMetrics).
+    { kind: "beach-river", at: [0, 0.45], spanning: true },
+    { kind: "plank-bridge", at: [0.36, 0.45], spanning: true },
+
+    // 🎂 The anchor and its cluster, along the back.
+    { kind: "cake-table", at: [0.14, -0.78] },
+    { kind: "birthday-banner", at: [0.14, -0.9] },
+    { kind: "gift-box", at: [-0.05, -0.76] },
+    { kind: "gift-box", at: [-0.2, -0.84] },
+    { kind: "birthday-balloons", at: [0.36, -0.82] },
+    { kind: "birthday-balloons", at: [-0.34, -0.86] },
+
+    // 💃 Somewhere to dance, and the switch for it.
+    { kind: "dance-floor", at: [0.68, -0.34] },
+    { kind: "party-speaker", at: [0.68, -0.6] },
+
+    // 🍹 The bar, far corner: shelf at the back, counter in front of it,
+    // stools on the camera side. Never mirrored — see the checklist.
+    { kind: "tiki-back-bar", at: [-0.58, -0.86] },
+    { kind: "tiki-bar-counter", at: [-0.58, -0.72] },
+    { kind: "tiki-bar-stool", at: [-0.72, -0.6] },
+    { kind: "tiki-bar-stool", at: [-0.58, -0.6] },
+    { kind: "tiki-bar-stool", at: [-0.44, -0.6] },
+
+    // 🌴 The banks. Tall things at the back, in odd groups with gaps.
+    { kind: "palm-tree", at: [-0.84, 0.1] },
+    { kind: "palm-tree", at: [0.86, 0.06] },
+    { kind: "palm-tree", at: [-0.88, -0.44] },
+    { kind: "tiki-torch", at: [-0.2, -0.66] },
+    { kind: "tiki-torch", at: [-0.9, -0.66] },
+
+    // 🏝️ The far bank — the reason the bridge is worth walking.
+    { kind: "palm-tree", at: [-0.5, 0.9] },
+    { kind: "palm-tree", at: [0.74, 0.88] },
+    { kind: "sun-lounger", at: [-0.28, 0.9] },
+    { kind: "parasol", at: [-0.14, 0.88] },
+    { kind: "sun-lounger", at: [0.58, 0.9] },
+
+    // Everything past here is expansion — it lands only if there is room.
+    { kind: "party-standing-table", at: [-0.34, -0.3] },
+    { kind: "party-standing-table", at: [0.42, -0.62] },
+    { kind: "cooler", at: [-0.78, -0.86] },
+    { kind: "beach-crate", at: [-0.88, -0.78] },
+    { kind: "pergola-post", at: [-0.82, -0.92] },
+    { kind: "pergola-post", at: [-0.34, -0.92] },
+    { kind: "pergola-post", at: [-0.82, -0.52] },
+    { kind: "pergola-post", at: [-0.34, -0.52] },
+    { kind: "pergola-roof", at: [-0.58, -0.72] },
+    { kind: "gift-box", at: [0.3, -0.72] },
+    { kind: "surfboard", at: [-0.94, 0.3] },
+    { kind: "beach-ball", at: [-0.42, 0.14] },
+    { kind: "beach-ball", at: [0.3, 0.9] },
+    { kind: "beach-towel", at: [0.1, 0.92] },
+    { kind: "beach-towel", at: [-0.72, 0.9] },
+  ];
+  return placeFitting(specs, halfX, halfZ, "beach");
 }
 
 /** Clone so applying a template never aliases the shared manifest arrays. */
@@ -340,6 +512,10 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
       { id: "beach-towel-2", kind: "beach-towel", pos: { x: -11.0, z: 13.6 }, rot: 0, movable: true },
     ],
 
+    // 🧩 …and the version that FITS: ADD SET runs this against the room's real
+    // extents instead of the fixed list above, which was drawn for a 5×5.
+    layout: layoutBeachParty,
+
     // Open to the real space backdrop — a beach under a ceiling is a swimming hall.
     theme: "outdoor-deck",
   },
@@ -407,6 +583,33 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
   // reload re-resolved it from nothing.
   roomThemeWriter?.(t.theme);
   return t;
+}
+
+/**
+ * ➕ ADD a template's set to the CURRENT room without replacing anything.
+ *
+ * This is the one to reach for. A room's structure — its size, its walls, its
+ * doors — is fixed when the module is born and cannot be changed afterwards,
+ * so the useful operation on somebody's existing room is "put this set in it",
+ * not "make it a different room". Nothing is deleted, the envelope and the
+ * theme are left alone, and a template with a `layout` generator fits itself
+ * to the room's real extents: it places what fits in priority order and skips
+ * the rest, so the same set gives a small room its cake and a big room its
+ * whole beach.
+ *
+ * Returns what actually landed, and how much of the set did not.
+ */
+export function addRoomTemplateItems(
+  id: string,
+): { name: string; placed: number; skipped: number } | null {
+  const t = findTemplate(id);
+  if (!t) return null;
+  const wanted = t.layout
+    ? t.layout(roomHalfExtents())
+    : cloneItems(t.items).filter((i) => i.kind !== "wall-computer");
+  const written = addFurniture(wanted);
+  const total = t.layout ? t.layout({ halfX: 15, halfZ: 15 }).length : wanted.length;
+  return { name: t.name, placed: written.length, skipped: Math.max(0, total - written.length) };
 }
 
 /**
