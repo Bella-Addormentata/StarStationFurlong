@@ -6516,10 +6516,15 @@ function buildBeachRiver(ctx: BuildCtx) {
   const streakOff: number[] = [];
   const streakMat = both(m(FOAM, 0.4, 0.0, FOAM, 0.5));
   translucent(streakMat, 0.34);
+  // A streak is 1.1 m long and is positioned by its CENTRE, so it must turn
+  // round half a length before the river ends — recycled at halfLen, the last
+  // streak ran 0.55 m past the cut and out through the platform's edge.
+  const STREAK_LEN = 1.1;
+  const streakEnd = halfLen - STREAK_LEN / 2;
   for (let i = 0; i < STREAKS; i++) {
-    const mesh = place(new THREE.BoxGeometry(1.1, 0.01, 0.075), streakMat, 0, POOL_WATER_Y + 0.014, 0);
+    const mesh = place(new THREE.BoxGeometry(STREAK_LEN, 0.01, 0.075), streakMat, 0, POOL_WATER_Y + 0.014, 0);
     streaks.push(mesh);
-    streakX.push(-halfLen + (i / STREAKS) * halfLen * 2);
+    streakX.push(-streakEnd + (i / STREAKS) * streakEnd * 2);
     // Spread across the channel, denser toward the middle where a real current
     // runs fastest.
     streakOff.push((Math.random() * 2 - 1) ** 3 * wWater * 0.8);
@@ -6530,7 +6535,7 @@ function buildBeachRiver(ctx: BuildCtx) {
         // Mid-channel water moves faster than the edges.
         const speed = 1.15 - 0.5 * Math.abs(streakOff[i]) / wWater;
         streakX[i] += speed * dt;
-        if (streakX[i] > halfLen) streakX[i] -= halfLen * 2;
+        if (streakX[i] > streakEnd) streakX[i] -= streakEnd * 2;
         const lx = streakX[i];
         streaks[i].position.set(lx, POOL_WATER_Y + 0.014, riverCentreZ(lx) + streakOff[i]);
         // Bank the streak along the flow so it follows the bend.
