@@ -24,7 +24,7 @@ function freshSinks(): FurnitureHandleSinks {
     gameTableTops: new Map(),
     cloneVats: new Map(),
     slotMachineVisuals: new Map(),
-    partyPulses: new Map(),
+    propAnims: new Map(),
   };
 }
 
@@ -60,7 +60,7 @@ describe('registerFurnitureHandles — filing', () => {
     registerFurnitureHandles(sinks, ITEM, carrier({ gameTableTop: top }));
     registerFurnitureHandles(sinks, ITEM, carrier({ cloneVat: vat }));
     registerFurnitureHandles(sinks, ITEM, carrier({ slotMachineVisual: slot }));
-    registerFurnitureHandles(sinks, ITEM, carrier({ partyPulse: pulse }));
+    registerFurnitureHandles(sinks, ITEM, carrier({ propAnim: pulse }));
 
     expect(sinks.wallScreens.get(ITEM)).toBe(screen);
     expect(sinks.holoSpinners).toHaveLength(1);
@@ -70,7 +70,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.gameTableTops.get(ITEM)).toBe(top);
     expect(sinks.cloneVats.get(ITEM)).toBe(vat);
     expect(sinks.slotMachineVisuals.get(ITEM)).toBe(slot);
-    expect(sinks.partyPulses.get(ITEM)).toBe(pulse);
+    expect(sinks.propAnims.get(ITEM)).toBe(pulse);
     // Exactly one entry per sink — nothing filed twice or into a neighbour.
     expect([
       sinks.wallScreens.size,
@@ -79,7 +79,7 @@ describe('registerFurnitureHandles — filing', () => {
       sinks.gameTableTops.size,
       sinks.cloneVats.size,
       sinks.slotMachineVisuals.size,
-      sinks.partyPulses.size,
+      sinks.propAnims.size,
     ]).toEqual([1, 1, 1, 1, 1, 1, 1]);
   });
 
@@ -92,7 +92,7 @@ describe('registerFurnitureHandles — filing', () => {
       gameTableTop: handle('t'),
       cloneVat: handle('v'),
       slotMachineVisual: handle('m'),
-      partyPulse: handle('p'),
+      propAnim: handle('p'),
     });
     registerFurnitureHandles(sinks, ITEM, all);
     expect(sinks.wallScreens.get(ITEM)).toBe(all.userData.wallScreen);
@@ -102,7 +102,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.gameTableTops.get(ITEM)).toBe(all.userData.gameTableTop);
     expect(sinks.cloneVats.get(ITEM)).toBe(all.userData.cloneVat);
     expect(sinks.slotMachineVisuals.get(ITEM)).toBe(all.userData.slotMachineVisual);
-    expect(sinks.partyPulses.get(ITEM)).toBe(all.userData.partyPulse);
+    expect(sinks.propAnims.get(ITEM)).toBe(all.userData.propAnim);
   });
 
   it('files nothing for a mesh without handles (unrelated userData included)', () => {

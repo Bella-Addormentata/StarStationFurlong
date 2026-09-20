@@ -35,7 +35,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
-  PartyPulseHandle,
+  PropAnimHandle,
 } from "./devices";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
@@ -135,7 +135,9 @@ export type FurnitureKind =
   | "tiki-back-bar"
   | "tiki-bar-stool"
   | "pergola-post"
-  | "pergola-roof";
+  | "pergola-roof"
+  | "beach-river"
+  | "plank-bridge";
 
 export interface FurnitureItem {
   id: string;
@@ -321,6 +323,16 @@ export interface FurnitureDef {
    * further, is what would break this; mounting height has nothing to do with it.
    */
   wallMount?: { halfW: number };
+  /**
+   * 🌊 Obstacle override for kinds whose blocked area is NOT one rectangle.
+   * A winding river is the case that forced it: a single AABB around the band
+   * would also block the dry sand at every bend AND the far bank, and a bridge
+   * could never be walkable because its cells would sit inside the same box.
+   * Returning per-column strips (minus anything that bridges the water) keeps
+   * the banks walkable and the crossing real. Takes the whole layout because
+   * what cuts a hole in the river is another ITEM.
+   */
+  obstacleBoxes?: (item: FurnitureItem, all: FurnitureItem[]) => Box[];
 }
 
 // ── Warm frontier colour palette (moved from world.addLobbyFurniture) ─────────
@@ -2449,6 +2461,28 @@ const seatOn = (topY: number): number => +(topY + SIT_CONTACT_DROP).toFixed(3);
  *  built meshes in the running room, not just the source. */
 const SOFT_SEAT_TOP = 0.455;
 
+/** 🏊 River entry: two wading-in points, one per bank, at the places the
+ *  centre line runs closest to that bank. Water seats put the occupant in the
+ *  swim pose at the water plane — the pool idiom, reused. */
+const beachRiverSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -4.0, z0: -3.0, x1: -1.0, z1: 0.0 },
+    front: { x: -2.5, z: -4.4 },
+    sit: { x: -2.5, z: -1.6 },
+    faceAngle: 0,
+    sitY: -0.35, // keep == POOL_WATER_Y (declared below this block)
+    swim: true,
+  },
+  {
+    clickBox: { x0: 1.0, z0: 0.0, x1: 4.0, z1: 3.0 },
+    front: { x: 2.5, z: 4.4 },
+    sit: { x: 2.5, z: 1.6 },
+    faceAngle: Math.PI,
+    sitY: -0.35, // keep == POOL_WATER_Y (declared below this block)
+    swim: true,
+  },
+];
+
 /** 🛋️ Sun lounger: you LIE on it. faceAngle points at the FEET end (+z), so
  *  the recline tips the head toward -z — the head end the backrest is at. */
 const sunLoungerSeats: SeatTemplate[] = [
@@ -3249,6 +3283,19 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "pergola-post": { kind: "pergola-post", build: buildPergolaPost, footprint: { w: 1, d: 1 } },
   // Overhead and non-solid: it shades the bar, it does not wall it off.
   "pergola-roof": { kind: "pergola-roof", build: buildPergolaRoof, footprint: null },
+  // 🌊 The river. footprint null because a single AABB is exactly the wrong
+  // shape for it — obstacleBoxes returns per-column strips instead, so the dry
+  // sand at the bends and the far bank stay walkable.
+  "beach-river": {
+    kind: "beach-river",
+    build: buildBeachRiver,
+    footprint: null,
+    obstacleBoxes: riverObstacleBoxes,
+    seats: beachRiverSeats,
+  },
+  // 🌉 The crossing. footprint null and NOT an obstacle: it exists precisely to
+  // make cells walkable that the river took away.
+  "plank-bridge": { kind: "plank-bridge", build: buildPlankBridge, footprint: null },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
   // local rot-0 frame (screen faces +z):
@@ -6230,6 +6277,218 @@ function buildSlotMachine({
 }
 
 
+// ── 🌊 The beach river ──────────────────────────────────────────────────────
+/**
+ * The party skill's river, built the way it says to build one: a WIDE, WINDING
+ * channel across the FRONT of the room, generated from a sine centre line
+ * rather than drawn by hand, terraced so every bend shows a side face, with a
+ * darker deep channel down the middle and foam where the water meets the bank.
+ *
+ * WHY NOT lazy-pool: that is a ring around an island — a lazy river in the
+ * water-park sense. This is a river in the landscape sense: it crosses the
+ * scene, it has two banks, and you need a bridge.
+ *
+ * ONE DEVIATION FROM THE REFERENCE, and it is forced: the reference terraces
+ * sand 0 → wet −0.35 → water −0.75 → deep −1.1. Here the WATER SURFACE must
+ * stay at POOL_WATER_Y (−0.35) because the swim rig, the splash spawn and the
+ * head-bob are all calibrated to that plane. So the same four-terrace read is
+ * built AROUND that fixed surface instead: the bank steps down to a wet-sand
+ * shelf at −0.12, the water sits at −0.35, and the bed below it drops twice —
+ * −0.75 under the shallows, −1.25 down the channel — which is where the depth
+ * actually comes from, since you see the bed THROUGH the water.
+ */
+const RIVER_HALF_LEN = 15; // reaches bank to bank across a 5×5 room
+const RIVER_AMP = 1.8; // how far the centre line wanders
+const RIVER_K = 0.38; // and how tightly — two numbers, re-tunable
+const RIVER_PHASE = 0.6;
+const RIVER_W_WET = 3.4; // half-widths, the reference's distance bands
+const RIVER_W_WATER = 2.6;
+const RIVER_W_DEEP = 1.0;
+const RIVER_Y_WET = -0.12; // the bank's first step down
+const RIVER_Y_BED = -0.75; // bed under the shallows
+const RIVER_Y_DEEP = -1.25; // bed down the channel
+const RIVER_SEGS = 120;
+
+/** The centre line, in the river item's LOCAL frame. Shared by the builder,
+ *  the floor-hole cutter and the obstacle strips, so the water you see, the
+ *  floor that is missing and the tiles you cannot walk on are one shape. */
+function riverCentreZ(lx: number): number {
+  return RIVER_AMP * Math.sin(RIVER_K * lx + RIVER_PHASE);
+}
+
+/** Is a LOCAL point inside the river's water? Analytic — no polygon sampling,
+ *  because the band has a constant half-width about a known centre line. */
+function riverHasWaterAt(lx: number, lz: number): boolean {
+  return Math.abs(lx) <= RIVER_HALF_LEN && Math.abs(lz - riverCentreZ(lx)) <= RIVER_W_WATER;
+}
+
+/** A flat ribbon following the centre line — one mesh per terrace instead of
+ *  a hundred little slabs. */
+function riverRibbon(hw: number, y: number): THREE.BufferGeometry {
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= RIVER_SEGS; i++) {
+    const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+    const zc = riverCentreZ(lx);
+    pos.push(lx, y, zc - hw, lx, y, zc + hw);
+  }
+  for (let i = 0; i < RIVER_SEGS; i++) {
+    const a = i * 2;
+    idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** The vertical face at one bank edge — THE depth cue. Without these the whole
+ *  thing reads as a painted floor, which the checklist calls the single most
+ *  common reason a beach room looks flat. */
+function riverBankFace(hw: number, side: 1 | -1, yTop: number, yBot: number): THREE.BufferGeometry {
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= RIVER_SEGS; i++) {
+    const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+    const z = riverCentreZ(lx) + side * hw;
+    pos.push(lx, yTop, z, lx, yBot, z);
+  }
+  for (let i = 0; i < RIVER_SEGS; i++) {
+    const a = i * 2;
+    idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+function buildBeachRiver(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const WET = 0xd6cbb3;
+  const BED = 0x3fb3c6;
+  const BED_DEEP = 0x175f6e;
+  const WATER = 0x2b8fa2;
+  const FOAM = 0xeafaf9;
+  const both = (mat: THREE.MeshStandardMaterial) => {
+    mat.side = THREE.DoubleSide;
+    return mat;
+  };
+
+  // ── Terraces, deepest first so the water reads over them ──
+  place(riverRibbon(RIVER_W_WET, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverBankFace(RIVER_W_WET, 1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverBankFace(RIVER_W_WET, -1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+
+  place(riverRibbon(RIVER_W_WATER, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(RIVER_W_WATER, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(RIVER_W_WATER, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+
+  // The deep channel: one more terrace, and the biggest depth cue a river has.
+  place(riverRibbon(RIVER_W_DEEP, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(RIVER_W_DEEP, 1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(RIVER_W_DEEP, -1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+
+  // ── The water surface itself, translucent over the bed ──
+  const waterMat = both(m(WATER, 0.25, 0.1));
+  translucent(waterMat, 0.72);
+  place(riverRibbon(RIVER_W_WATER, POOL_WATER_Y), waterMat, 0, 0, 0);
+
+  // ── Foam where the water laps the bank, on BOTH banks ──
+  for (const side of [1, -1] as const) {
+    const foam = both(m(FOAM, 0.6, 0.0, FOAM, 0.35));
+    translucent(foam, 0.8);
+    const g = riverRibbon(RIVER_W_WATER, POOL_WATER_Y + 0.008);
+    // Squeeze the ribbon to a thin strip hugging one edge by moving every
+    // inner vertex out to meet the outer one.
+    const arr = g.getAttribute("position") as THREE.BufferAttribute;
+    for (let i = 0; i <= RIVER_SEGS; i++) {
+      const inner = side === 1 ? i * 2 : i * 2 + 1;
+      const outer = side === 1 ? i * 2 + 1 : i * 2;
+      const zOuter = arr.getZ(outer);
+      arr.setZ(inner, zOuter - side * 0.22);
+    }
+    arr.needsUpdate = true;
+    g.computeVertexNormals();
+    place(g, foam, 0, 0, 0);
+  }
+
+  // ── 🌊 The current. The checklist is specific: animate it as a CURRENT —
+  //    phase travelling downstream — not as a shimmer. Streaks drift along the
+  //    channel, following the centre line, and recycle at the far bank.
+  const STREAKS = 26;
+  const streaks: THREE.Mesh[] = [];
+  const streakX: number[] = [];
+  const streakOff: number[] = [];
+  const streakMat = both(m(FOAM, 0.4, 0.0, FOAM, 0.5));
+  translucent(streakMat, 0.34);
+  for (let i = 0; i < STREAKS; i++) {
+    const mesh = place(new THREE.BoxGeometry(1.1, 0.01, 0.075), streakMat, 0, POOL_WATER_Y + 0.014, 0);
+    streaks.push(mesh);
+    streakX.push(-RIVER_HALF_LEN + (i / STREAKS) * RIVER_HALF_LEN * 2);
+    // Spread across the channel, denser toward the middle where a real current
+    // runs fastest.
+    streakOff.push((Math.random() * 2 - 1) ** 3 * RIVER_W_WATER * 0.8);
+  }
+  const anim: PropAnimHandle = {
+    update(dt: number) {
+      for (let i = 0; i < STREAKS; i++) {
+        // Mid-channel water moves faster than the edges.
+        const speed = 1.15 - 0.5 * Math.abs(streakOff[i]) / RIVER_W_WATER;
+        streakX[i] += speed * dt;
+        if (streakX[i] > RIVER_HALF_LEN) streakX[i] -= RIVER_HALF_LEN * 2;
+        const lx = streakX[i];
+        streaks[i].position.set(lx, POOL_WATER_Y + 0.014, riverCentreZ(lx) + streakOff[i]);
+        // Bank the streak along the flow so it follows the bend.
+        const slope = RIVER_AMP * RIVER_K * Math.cos(RIVER_K * lx + RIVER_PHASE);
+        streaks[i].rotation.y = -Math.atan(slope);
+      }
+    },
+  };
+  streaks[0].userData.propAnim = anim;
+}
+
+/**
+ * 🌉 Plank bridge — the way across, and the reason the far bank is worth
+ * having. AXIS-ALIGNED on purpose: the pathfinder forbids corner-cutting, so a
+ * diagonal bridge is a bridge nobody can walk. Its cells are cut OUT of the
+ * river's floor hole and out of its obstacle strips, which is what makes it
+ * walkable over water.
+ */
+const BRIDGE_W = 1.8;
+const BRIDGE_LEN = 9.0;
+
+function buildPlankBridge({ m, place }: BuildCtx) {
+  const PLANKS = 18;
+  for (let i = 0; i < PLANKS; i++) {
+    const z = -BRIDGE_LEN / 2 + (i + 0.5) * (BRIDGE_LEN / PLANKS);
+    place(
+      new THREE.BoxGeometry(BRIDGE_W, 0.09, BRIDGE_LEN / PLANKS - 0.04),
+      m(i % 3 === 1 ? 0xa86f43 : 0xd9a46c, 0.92, 0.02),
+      0,
+      0.045,
+      z,
+    );
+  }
+  // Stringers under the planks, and pilings dropping to the bed — the bridge
+  // has to LOOK like it is standing in water, not floating over a hole.
+  for (const sx of [-BRIDGE_W / 2 + 0.12, BRIDGE_W / 2 - 0.12]) {
+    place(new THREE.BoxGeometry(0.14, 0.14, BRIDGE_LEN), m(0x7f5230, 0.92, 0.02), sx, -0.04, 0);
+    for (let i = 0; i < 5; i++) {
+      const z = -BRIDGE_LEN / 2 + 0.6 + i * ((BRIDGE_LEN - 1.2) / 4);
+      place(new THREE.CylinderGeometry(0.09, 0.09, 1.3, 7), m(0x7f5230, 0.95, 0.02), sx, -0.7, z);
+    }
+    // Rope handrail on posts.
+    for (let i = 0; i < 5; i++) {
+      const z = -BRIDGE_LEN / 2 + 0.6 + i * ((BRIDGE_LEN - 1.2) / 4);
+      place(new THREE.BoxGeometry(0.09, 0.62, 0.09), m(0x8a5731, 0.92, 0.02), sx, 0.4, z);
+    }
+    place(new THREE.BoxGeometry(0.05, 0.05, BRIDGE_LEN - 1.0), m(0xd9a46c, 0.9, 0.02), sx, 0.68, 0);
+  }
+}
+
 // ── 🏝️ Beach fixtures ───────────────────────────────────────────────────────
 // A voxel port of the beach set the party skill ships as a canvas-2D reference
 // room. The DRAW CODE does not transfer — that file paints iso diamonds, this
@@ -6766,7 +7025,7 @@ function buildCakeTable(ctx: BuildCtx) {
   };
   // Reuse the per-item pulse slot World already drives — a cake is never also
   // a dance floor, so one handle per item is enough.
-  const pulse: PartyPulseHandle = {
+  const pulse: PropAnimHandle = {
     update(dt: number) {
       if (burstT < 0) return;
       burstT += dt;
@@ -6806,7 +7065,7 @@ function buildCakeTable(ctx: BuildCtx) {
   flames.userData.disposePartySub = subscribePartyKey(cakeKey(itemId), applyPhase);
   const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(CLOTH, 1, 0), 0, 0.01, 0);
   carrier.visible = false;
-  carrier.userData.partyPulse = pulse;
+  carrier.userData.propAnim = pulse;
 }
 
 /**
@@ -6956,7 +7215,7 @@ function buildPartySpeaker(ctx: BuildCtx) {
  * while the same emote on a lit floor is a place.
  *
  * It pulses only while a speaker in the room is on. The pulse is driven by a
- * PartyPulseHandle that World ticks (the trunk-lid idiom) rather than a timer
+ * PropAnimHandle that World ticks (the trunk-lid idiom) rather than a timer
  * of its own, so it stops dead when the item is removed.
  */
 function buildDanceFloor(ctx: BuildCtx) {
@@ -6991,7 +7250,7 @@ function buildDanceFloor(ctx: BuildCtx) {
   let t = 0;
   let on = readSpeaker(itemId).on;
   // Per-frame handle — World drives update(dt) and drops it on removal.
-  const pulse: PartyPulseHandle = {
+  const pulse: PropAnimHandle = {
     update(dt: number) {
       if (!on) {
         for (const mat of pads) mat.emissiveIntensity = 0.06;
@@ -7006,7 +7265,7 @@ function buildDanceFloor(ctx: BuildCtx) {
       }
     },
   };
-  trim.userData.partyPulse = pulse;
+  trim.userData.propAnim = pulse;
 
   const applySpeaker = () => {
     on = readSpeaker(itemId).on;
@@ -8089,6 +8348,126 @@ function buildClassicHotTub({ m, flat, place, addLight }: BuildCtx) {
   addLight(new THREE.PointLight(0xcfe8f4, 0, 1.8), 1.1, 0.65, -0.55, 0.7);
 }
 
+/**
+ * 🏊 Which kinds ARE water — the one list every pool-shaped question asks.
+ *
+ * The floor hole, the hole outline, the water bbox, the swim basin and World's
+ * "hide the platform floor" test all used to spell this pair out inline, and a
+ * new water kind had to find all five. It is a predicate now, so adding one is
+ * adding it here.
+ */
+/** World point → a cardinally-posed item's LOCAL frame. */
+function toLocal(item: FurnitureItem, wx: number, wz: number): { x: number; z: number } {
+  const inv = ((4 - item.rot) % 4) as Rot;
+  return rotXZ(wx - item.pos.x, wz - item.pos.z, inv);
+}
+
+/** A local AABB → the world AABB it becomes under a CARDINAL rotation. */
+function localBoxToWorld(item: FurnitureItem, x0: number, z0: number, x1: number, z1: number): Box {
+  const a = rotXZ(x0, z0, item.rot);
+  const b = rotXZ(x1, z1, item.rot);
+  return {
+    x0: item.pos.x + Math.min(a.x, b.x),
+    z0: item.pos.z + Math.min(a.z, b.z),
+    x1: item.pos.x + Math.max(a.x, b.x),
+    z1: item.pos.z + Math.max(a.z, b.z),
+  };
+}
+
+/** A bridge's footprint in the RIVER's local frame (both are cardinal, so the
+ *  rotated box is still an AABB). */
+function bridgeLocalBox(river: FurnitureItem, bridge: FurnitureItem): Box {
+  const half = ((4 - river.rot) % 4) as Rot;
+  const c = rotXZ(BRIDGE_W / 2, BRIDGE_LEN / 2, bridge.rot);
+  const w0 = { x: bridge.pos.x - Math.abs(c.x), z: bridge.pos.z - Math.abs(c.z) };
+  const w1 = { x: bridge.pos.x + Math.abs(c.x), z: bridge.pos.z + Math.abs(c.z) };
+  const a = rotXZ(w0.x - river.pos.x, w0.z - river.pos.z, half);
+  const b = rotXZ(w1.x - river.pos.x, w1.z - river.pos.z, half);
+  return {
+    x0: Math.min(a.x, b.x),
+    z0: Math.min(a.z, b.z),
+    x1: Math.max(a.x, b.x),
+    z1: Math.max(a.z, b.z),
+  };
+}
+
+/**
+ * 🌊 The river's blocked area, as one strip per metre of its length rather
+ * than one box round the lot — see FurnitureDef.obstacleBoxes for why. Each
+ * strip spans the water at that column (widened to the drift WITHIN the
+ * column, so no water leaks out between strips) and is then cut by any bridge
+ * crossing it, which is what makes the crossing walkable.
+ */
+function riverObstacleBoxes(item: FurnitureItem, all: FurnitureItem[]): Box[] {
+  const boxes: Box[] = [];
+  const bridges = all
+    .filter((i) => i.kind === "plank-bridge")
+    .map((b) => bridgeLocalBox(item, b));
+  const STRIP = 1.0;
+  const SEAM = 0.01;
+  for (let lx0 = -RIVER_HALF_LEN; lx0 < RIVER_HALF_LEN; lx0 += STRIP) {
+    const lx1 = Math.min(lx0 + STRIP, RIVER_HALF_LEN);
+    const zs = [riverCentreZ(lx0), riverCentreZ((lx0 + lx1) / 2), riverCentreZ(lx1)];
+    const z0 = Math.min(...zs) - RIVER_W_WATER;
+    const z1 = Math.max(...zs) + RIVER_W_WATER;
+    // Cut this strip by every bridge that spans it. A bridge crosses the whole
+    // channel, so in practice it either removes the strip or misses it; the
+    // general split is here so a short jetty behaves too.
+    const spans = [{ z0, z1 }];
+    for (const b of bridges) {
+      if (b.x1 <= lx0 || b.x0 >= lx1) continue;
+      for (let i = spans.length - 1; i >= 0; i--) {
+        const sp = spans[i];
+        if (b.z1 <= sp.z0 || b.z0 >= sp.z1) continue;
+        spans.splice(i, 1);
+        if (b.z0 > sp.z0) spans.push({ z0: sp.z0, z1: b.z0 });
+        if (b.z1 < sp.z1) spans.push({ z0: b.z1, z1: sp.z1 });
+      }
+    }
+    for (const sp of spans) {
+      if (sp.z1 - sp.z0 < 0.05) continue;
+      // Overlap the seam between strips. Blocked-ness is tested with strict
+      // inequalities (pathfinding.ts, the collision resolver), so a point
+      // landing exactly on a shared edge would belong to neither strip. Cell
+      // centres sit at i + 0.5 and never do, but a seam that only holds
+      // because of where the grid happens to fall is not a seam.
+      boxes.push(localBoxToWorld(item, lx0 - SEAM, sp.z0, lx1 + SEAM, sp.z1));
+    }
+  }
+  return boxes;
+}
+
+/**
+ * 🏊 Is this WORLD point actually in a pool's water? Kind-aware, unlike the
+ * basin rectangle: the river's band bends away from its own bounding box, and
+ * auto-swimming someone standing on the dry sand at a bend is exactly the bug
+ * the rect test would cause.
+ */
+export function poolWaterContains(items: FurnitureItem[], wx: number, wz: number): boolean {
+  for (const item of items) {
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      const l = toLocal(item, wx, wz);
+      if (!riverHasWaterAt(l.x, l.z)) continue;
+      // Standing ON the bridge is standing over water, not in it.
+      const onBridge = items.some((b) => {
+        if (b.kind !== "plank-bridge") return false;
+        const bb = bridgeLocalBox(item, b);
+        return l.x > bb.x0 && l.x < bb.x1 && l.z > bb.z0 && l.z < bb.z1;
+      });
+      return !onBridge;
+    }
+    const basin = getPoolBasin(items);
+    if (!basin) return false;
+    return wx > basin.x0 && wx < basin.x1 && wz > basin.z0 && wz < basin.z1;
+  }
+  return false;
+}
+
+export function isPoolKind(kind: FurnitureKind): boolean {
+  return kind === "lazy-pool" || kind === "classic-pool" || kind === "beach-river";
+}
+
 export function getPoolBasin(items: FurnitureItem[]): {
   x0: number;
   z0: number;
@@ -8097,7 +8476,30 @@ export function getPoolBasin(items: FurnitureItem[]): {
   exit: { x0: number; z0: number; x1: number; z1: number };
 } | null {
   for (const item of items) {
-    if (item.kind !== "lazy-pool" && item.kind !== "classic-pool") continue;
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      // The band's bounding box. Swim CLAMPING and climb-out both want a
+      // rectangle, and over-covering is safe here because ENTRY is gated by
+      // poolWaterContains — you cannot start swimming on the dry sand at a
+      // bend, you can only drift over it once already in the water.
+      const half = RIVER_AMP + RIVER_W_WATER - 0.2;
+      const a = rotXZ(-RIVER_HALF_LEN + 0.4, -half, item.rot);
+      const b = rotXZ(RIVER_HALF_LEN - 0.4, half, item.rot);
+      const e1 = rotXZ(-RIVER_HALF_LEN + 0.4, -(half + 0.9), item.rot);
+      const e2 = rotXZ(RIVER_HALF_LEN - 0.4, half + 0.9, item.rot);
+      return {
+        x0: item.pos.x + Math.min(a.x, b.x),
+        z0: item.pos.z + Math.min(a.z, b.z),
+        x1: item.pos.x + Math.max(a.x, b.x),
+        z1: item.pos.z + Math.max(a.z, b.z),
+        exit: {
+          x0: item.pos.x + Math.min(e1.x, e2.x),
+          z0: item.pos.z + Math.min(e1.z, e2.z),
+          x1: item.pos.x + Math.max(e1.x, e2.x),
+          z1: item.pos.z + Math.max(e1.z, e2.z),
+        },
+      };
+    }
     // ASYMMETRIC water: local -x reaches the west infinity edge (the west
     // deck IS water — see buildLazyPool WX). Corners rotate with the item.
     // Margin keeps the avatar's bulk off walls/edges; a "west" climb-out
@@ -8171,9 +8573,21 @@ function pointInPoly(px: number, py: number, poly: Array<{ x: number; y: number 
  */
 export function poolHoleCells(items: FurnitureItem[]): Set<string> {
   const cells = new Set<string>();
-  const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+  const pool = items.find((i) => isPoolKind(i.kind));
   if (!pool) return cells;
   const rect = poolHoleRect(items)!; // world bbox of the water footprint
+
+  if (pool.kind === "beach-river") {
+    // Analytic band — no polygon sampling needed, the half-width is constant
+    // about a known centre line. Bridge cells keep their floor, which is what
+    // a bridge IS.
+    for (let i = Math.floor(rect.x0); i < Math.ceil(rect.x1); i++) {
+      for (let j = Math.floor(rect.z0); j < Math.ceil(rect.z1); j++) {
+        if (poolWaterContains(items, i + 0.5, j + 0.5)) cells.add(`${i},${j}`);
+      }
+    }
+    return cells;
+  }
 
   if (pool.kind === "classic-pool") {
     // Rectangular water ⇒ rectangular hole: cut cells whose CENTRE lies inside
@@ -8248,10 +8662,23 @@ export function mergeCellsToRects(cells: Set<string>): Box[] {
  * so an organic hole is safe for pathfinding. Null when there's no pool.
  */
 export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: number }> | null {
-  const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+  const pool = items.find((i) => isPoolKind(i.kind));
   if (!pool) return null;
   let local: Array<{ x: number; z: number }>;
-  if (pool.kind === "classic-pool") {
+  if (pool.kind === "beach-river") {
+    // Down one bank and back along the other — the same centre line the water
+    // ribbon is built from, so the cut edge and the water edge coincide.
+    const ring: Array<{ x: number; z: number }> = [];
+    for (let i = 0; i <= RIVER_SEGS; i++) {
+      const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+      ring.push({ x: lx, z: riverCentreZ(lx) - RIVER_W_WATER });
+    }
+    for (let i = RIVER_SEGS; i >= 0; i--) {
+      const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+      ring.push({ x: lx, z: riverCentreZ(lx) + RIVER_W_WATER });
+    }
+    local = ring;
+  } else if (pool.kind === "classic-pool") {
     // Rectangular water footprint.
     local = [
       { x: -POOL_WATER_WEST, z: -POOL_WATER_HALFZ },
@@ -8285,7 +8712,11 @@ export function poolHoleRect(
   items: FurnitureItem[],
 ): { x0: number; z0: number; x1: number; z1: number } | null {
   for (const item of items) {
-    if (item.kind !== "lazy-pool" && item.kind !== "classic-pool") continue;
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      const half = RIVER_AMP + RIVER_W_WATER;
+      return localBoxToWorld(item, -RIVER_HALF_LEN, -half, RIVER_HALF_LEN, half);
+    }
     const a = rotXZ(-POOL_WATER_WEST, -POOL_WATER_HALFZ, item.rot);
     const b = rotXZ(POOL_WATER_EAST, POOL_WATER_HALFZ, item.rot);
     return {
@@ -8460,6 +8891,11 @@ export function deviceFrontFor(
 export function buildObstacleList(items: FurnitureItem[]): Box[] {
   const boxes: Box[] = [];
   for (const item of items) {
+    const multi = FURNITURE_DEFS[item.kind].obstacleBoxes;
+    if (multi) {
+      boxes.push(...multi(item, items));
+      continue;
+    }
     const box = itemAabb(item);
     if (box) boxes.push(box);
   }

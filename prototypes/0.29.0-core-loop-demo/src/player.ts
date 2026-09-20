@@ -80,6 +80,7 @@ import {
   FURNITURE,
   getPoolBasin,
   getPoolIsland,
+  poolWaterContains,
 } from "./furniture";
 import type { Seat } from "./seats";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -350,14 +351,10 @@ export class Player {
     // 🏊 Free swim: in-basin targets are a straight swim; out-of-basin targets
     // climb out at the nearest edge first, then resume the walk.
     if (this.swimMode) {
-      const basin = getPoolBasin(FURNITURE);
-      if (
-        basin &&
-        targetX >= basin.x0 &&
-        targetX <= basin.x1 &&
-        targetZ >= basin.z0 &&
-        targetZ <= basin.z1
-      ) {
+      // 🏊 Shape-aware, not the basin RECTANGLE: the beach river's band bends
+      // away from its own bounding box, and a rect test would swim someone
+      // toward the dry sand at a bend.
+      if (poolWaterContains(FURNITURE, targetX, targetZ)) {
         this.swimTo(targetX, targetZ);
       } else {
         this.pendingDest = { x: targetX, z: targetZ };
@@ -1261,14 +1258,9 @@ export class Player {
     // restored session position, a pre-obstacle walk-in, any edge case —
     // converts to swimming on the spot. Nobody walks on water.
     if (!this.swimMode) {
-      const basin = getPoolBasin(FURNITURE);
       const island = getPoolIsland(FURNITURE);
       if (
-        basin &&
-        pos.x > basin.x0 &&
-        pos.x < basin.x1 &&
-        pos.z > basin.z0 &&
-        pos.z < basin.z1 &&
+        poolWaterContains(FURNITURE, pos.x, pos.z) &&
         (!island || !this._insidePoolIsland(pos.x, pos.z, island))
       ) {
         this.swimMode = true;

@@ -128,6 +128,8 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'tiki-bar-stool': '🪑 BAR STOOL',
   'pergola-post': '🏛 PERGOLA POST',
   'pergola-roof': '✨ PERGOLA ROOF (LANTERNS)',
+  'beach-river': '🌊 BEACH RIVER',
+  'plank-bridge': '🌉 PLANK BRIDGE',
 };
 
 type GetWorld = () => World | null;

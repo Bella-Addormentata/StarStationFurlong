@@ -56,6 +56,7 @@ import {
   rotXZ,
   POOL_SWIM_Y,
   POOL_WATER_Y,
+  isPoolKind,
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
@@ -139,7 +140,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
-  PartyPulseHandle,
+  PropAnimHandle,
   SlotMachineCabinetControl,
   DeviceUI,
   DeviceTarget,
@@ -393,7 +394,7 @@ export class World {
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
-  private partyPulses: Map<string, PartyPulseHandle> = new Map();
+  private propAnims: Map<string, PropAnimHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -1601,7 +1602,7 @@ export class World {
       gameTableTops: this.gameTableTops,
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
-      partyPulses: this.partyPulses,
+      propAnims: this.propAnims,
     };
   }
 
@@ -2616,7 +2617,7 @@ export class World {
   public refreshOutdoorFloor(): void {
     // A pool (either style) sinks its water below the floor.
     const hasPool = FURNITURE.some(
-      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+      (i) => isPoolKind(i.kind),
     );
     if (OCTAGON_HULL) {
       // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the pool water
@@ -2962,7 +2963,7 @@ export class World {
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
     this.slotMachineVisuals.delete(itemId);
-    this.partyPulses.delete(itemId);
+    this.propAnims.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3663,7 +3664,7 @@ export class World {
 
     // 💃 Dance floors run their travelling light wave (no-op while the room's
     // speaker is off — the handle reads that itself).
-    for (const pulse of this.partyPulses.values()) pulse.update(deltaTime);
+    for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
     this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
@@ -4868,7 +4869,7 @@ export class World {
    *  live, with no re-entry and no theme stamp required. */
   private computeRobotPatrol(): Array<[number, number]> {
     const hasPool = FURNITURE.some(
-      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+      (i) => isPoolKind(i.kind),
     );
     if (hasPool) return POOL_PATROL;
     // 🎰 A room is a casino because it HOLDS casino tables — the content-driven

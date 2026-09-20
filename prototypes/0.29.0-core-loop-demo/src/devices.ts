@@ -129,12 +129,14 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'cakeTable' | 'giftBox' | 'partySpeaker';
 
 /**
- * 💃 Handle onto a dance floor's travelling light wave. The builder
- * (furniture.ts) stows it in the pad group's userData.partyPulse; World
- * collects it and drives update(dt) every frame — the trunk-lid idiom, so the
- * animation dies with the item instead of outliving it on a timer.
+ * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
+ * wave, the cake's confetti burst, the river's current. The builder
+ * (furniture.ts) stows it on a MESH's userData.propAnim (registerFurnitureHandles
+ * only visits meshes); World collects it and drives update(dt) every frame —
+ * the trunk-lid idiom, so the animation dies with the item instead of
+ * outliving it on a timer.
  */
-export interface PartyPulseHandle {
+export interface PropAnimHandle {
   update(dt: number): void;
 }
 
