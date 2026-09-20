@@ -6304,9 +6304,9 @@ const RIVER_PHASE = 0.6;
 const RIVER_W_WET = 3.4; // half-widths, the reference's distance bands
 const RIVER_W_WATER = 2.6;
 const RIVER_W_DEEP = 1.0;
-const RIVER_Y_WET = -0.12; // the bank's first step down
-const RIVER_Y_BED = -0.75; // bed under the shallows
-const RIVER_Y_DEEP = -1.25; // bed down the channel
+const RIVER_Y_WET = -0.3; // the bank's first step down
+const RIVER_Y_BED = -1.05; // bed under the shallows
+const RIVER_Y_DEEP = -1.85; // bed down the channel
 const RIVER_SEGS = 120;
 
 /** The centre line, in the river item's LOCAL frame. Shared by the builder,
@@ -6320,6 +6320,50 @@ function riverCentreZ(lx: number): number {
  *  because the band has a constant half-width about a known centre line. */
 function riverHasWaterAt(lx: number, lz: number): boolean {
   return Math.abs(lx) <= RIVER_HALF_LEN && Math.abs(lz - riverCentreZ(lx)) <= RIVER_W_WATER;
+}
+
+/**
+ * Is a LOCAL point inside the EXCAVATION — the whole cut, wet shelf included?
+ *
+ * Wider than the water, and the distinction matters twice over: the floor hole
+ * and the obstacle strips follow THIS (you cannot stand on a shelf 30 cm below
+ * a floor the engine draws flat, and if the hole stopped at the waterline the
+ * shelf would be buried under solid floor and never seen), while SWIMMING
+ * follows the water — wading onto the bank is climbing out, not drowning.
+ */
+function riverHasCutAt(lx: number, lz: number): boolean {
+  return Math.abs(lx) <= RIVER_HALF_LEN && Math.abs(lz - riverCentreZ(lx)) <= RIVER_W_WET;
+}
+
+/**
+ * A flat ribbon BAND following the centre line, from hwInner out to hwOuter on
+ * BOTH sides — an annulus, not a plate.
+ *
+ * This distinction is the whole terracing. A full-width ribbon at the shelf
+ * height is a lid: it spans the channel it is supposed to border, and every
+ * deeper layer — the water, the bed, the channel — renders underneath it and
+ * is never seen. Ask for the strip you mean.
+ */
+function riverRibbonBand(hwInner: number, hwOuter: number, y: number): THREE.BufferGeometry {
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= RIVER_SEGS; i++) {
+    const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
+    const zc = riverCentreZ(lx);
+    // Four vertices per station: outer-near, inner-near, inner-far, outer-far.
+    pos.push(lx, y, zc - hwOuter, lx, y, zc - hwInner, lx, y, zc + hwInner, lx, y, zc + hwOuter);
+  }
+  for (let i = 0; i < RIVER_SEGS; i++) {
+    const a = i * 4;
+    const b = a + 4;
+    idx.push(a, b, a + 1, a + 1, b, b + 1); // near strip
+    idx.push(a + 2, b + 2, a + 3, a + 3, b + 2, b + 3); // far strip
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
 }
 
 /** A flat ribbon following the centre line — one mesh per terrace instead of
@@ -6377,12 +6421,20 @@ function buildBeachRiver(ctx: BuildCtx) {
     return mat;
   };
 
-  // ── Terraces, deepest first so the water reads over them ──
-  place(riverRibbon(RIVER_W_WET, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  // ── Terraces. Each is the STRIP between its own edge and the next one in,
+  //    so nothing is a lid over the layer below it. Every step down also draws
+  //    a vertical face, which is where the depth actually comes from.
+  //
+  //    0      ──┐ dry sand (the room's own floor)
+  //    -0.30    └──┐ wet shelf .............. band  2.6 → 3.4
+  //    -0.35       ~~ water surface ......... plate      ±2.6
+  //    -1.05       └──┐ shallow bed ......... band  1.0 → 2.6
+  //    -1.85          └── deep channel bed .. plate      ±1.0
+  place(riverRibbonBand(RIVER_W_WATER, RIVER_W_WET, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
   place(riverBankFace(RIVER_W_WET, 1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
   place(riverBankFace(RIVER_W_WET, -1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
 
-  place(riverRibbon(RIVER_W_WATER, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  place(riverRibbonBand(RIVER_W_DEEP, RIVER_W_WATER, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
   place(riverBankFace(RIVER_W_WATER, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
   place(riverBankFace(RIVER_W_WATER, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
 
@@ -8404,34 +8456,49 @@ function riverObstacleBoxes(item: FurnitureItem, all: FurnitureItem[]): Box[] {
     .filter((i) => i.kind === "plank-bridge")
     .map((b) => bridgeLocalBox(item, b));
   const STRIP = 1.0;
+  // Blocked-ness is a strict inequality (pathfinding.ts, the collision
+  // resolver), so strips overlap slightly: a point landing exactly on a shared
+  // edge would otherwise belong to neither.
   const SEAM = 0.01;
+
   for (let lx0 = -RIVER_HALF_LEN; lx0 < RIVER_HALF_LEN; lx0 += STRIP) {
     const lx1 = Math.min(lx0 + STRIP, RIVER_HALF_LEN);
-    const zs = [riverCentreZ(lx0), riverCentreZ((lx0 + lx1) / 2), riverCentreZ(lx1)];
-    const z0 = Math.min(...zs) - RIVER_W_WATER;
-    const z1 = Math.max(...zs) + RIVER_W_WATER;
-    // Cut this strip by every bridge that spans it. A bridge crosses the whole
-    // channel, so in practice it either removes the strip or misses it; the
-    // general split is here so a short jetty behaves too.
-    const spans = [{ z0, z1 }];
+
+    // Split the column in X at every bridge edge inside it FIRST. Cutting the
+    // whole column whenever a bridge merely clipped its edge used to delete a
+    // full metre of river for a few centimetres of bridge, leaving walkable
+    // water alongside the crossing.
+    const xEdges = new Set<number>([lx0, lx1]);
     for (const b of bridges) {
-      if (b.x1 <= lx0 || b.x0 >= lx1) continue;
-      for (let i = spans.length - 1; i >= 0; i--) {
-        const sp = spans[i];
-        if (b.z1 <= sp.z0 || b.z0 >= sp.z1) continue;
-        spans.splice(i, 1);
-        if (b.z0 > sp.z0) spans.push({ z0: sp.z0, z1: b.z0 });
-        if (b.z1 < sp.z1) spans.push({ z0: b.z1, z1: sp.z1 });
-      }
+      if (b.x0 > lx0 && b.x0 < lx1) xEdges.add(b.x0);
+      if (b.x1 > lx0 && b.x1 < lx1) xEdges.add(b.x1);
     }
-    for (const sp of spans) {
-      if (sp.z1 - sp.z0 < 0.05) continue;
-      // Overlap the seam between strips. Blocked-ness is tested with strict
-      // inequalities (pathfinding.ts, the collision resolver), so a point
-      // landing exactly on a shared edge would belong to neither strip. Cell
-      // centres sit at i + 0.5 and never do, but a seam that only holds
-      // because of where the grid happens to fall is not a seam.
-      boxes.push(localBoxToWorld(item, lx0 - SEAM, sp.z0, lx1 + SEAM, sp.z1));
+    const xs = [...xEdges].sort((a, b) => a - b);
+
+    for (let k = 0; k < xs.length - 1; k++) {
+      const sx0 = xs[k];
+      const sx1 = xs[k + 1];
+      if (sx1 - sx0 < 1e-6) continue;
+      const mid = (sx0 + sx1) / 2;
+      // The cut spans the whole EXCAVATION here, widened to the centre line's
+      // drift within this piece so no water leaks out between pieces.
+      const zc = [riverCentreZ(sx0), riverCentreZ(mid), riverCentreZ(sx1)];
+      const spans = [{ z0: Math.min(...zc) - RIVER_W_WET, z1: Math.max(...zc) + RIVER_W_WET }];
+      // Only a bridge that actually covers THIS piece in x may cut it.
+      for (const b of bridges) {
+        if (mid <= b.x0 || mid >= b.x1) continue;
+        for (let i = spans.length - 1; i >= 0; i--) {
+          const sp = spans[i];
+          if (b.z1 <= sp.z0 || b.z0 >= sp.z1) continue;
+          spans.splice(i, 1);
+          if (b.z0 > sp.z0) spans.push({ z0: sp.z0, z1: b.z0 });
+          if (b.z1 < sp.z1) spans.push({ z0: b.z1, z1: sp.z1 });
+        }
+      }
+      for (const sp of spans) {
+        if (sp.z1 - sp.z0 < 0.05) continue;
+        boxes.push(localBoxToWorld(item, sx0 - SEAM, sp.z0, sx1 + SEAM, sp.z1));
+      }
     }
   }
   return boxes;
@@ -8460,6 +8527,29 @@ export function poolWaterContains(items: FurnitureItem[], wx: number, wz: number
     const basin = getPoolBasin(items);
     if (!basin) return false;
     return wx > basin.x0 && wx < basin.x1 && wz > basin.z0 && wz < basin.z1;
+  }
+  return false;
+}
+
+/**
+ * 🕳️ Is this WORLD point inside a pool's EXCAVATION — what the floor hole and
+ * the obstacle strips follow? For every pool but the river this is the same as
+ * the water; the river also cuts its wet shelf, which is dry but 30 cm down.
+ */
+export function poolCutContains(items: FurnitureItem[], wx: number, wz: number): boolean {
+  for (const item of items) {
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      const l = toLocal(item, wx, wz);
+      if (!riverHasCutAt(l.x, l.z)) continue;
+      const onBridge = items.some((b) => {
+        if (b.kind !== "plank-bridge") return false;
+        const bb = bridgeLocalBox(item, b);
+        return l.x > bb.x0 && l.x < bb.x1 && l.z > bb.z0 && l.z < bb.z1;
+      });
+      return !onBridge;
+    }
+    return poolWaterContains(items, wx, wz);
   }
   return false;
 }
@@ -8583,7 +8673,7 @@ export function poolHoleCells(items: FurnitureItem[]): Set<string> {
     // a bridge IS.
     for (let i = Math.floor(rect.x0); i < Math.ceil(rect.x1); i++) {
       for (let j = Math.floor(rect.z0); j < Math.ceil(rect.z1); j++) {
-        if (poolWaterContains(items, i + 0.5, j + 0.5)) cells.add(`${i},${j}`);
+        if (poolCutContains(items, i + 0.5, j + 0.5)) cells.add(`${i},${j}`);
       }
     }
     return cells;
@@ -8671,11 +8761,11 @@ export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: n
     const ring: Array<{ x: number; z: number }> = [];
     for (let i = 0; i <= RIVER_SEGS; i++) {
       const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
-      ring.push({ x: lx, z: riverCentreZ(lx) - RIVER_W_WATER });
+      ring.push({ x: lx, z: riverCentreZ(lx) - RIVER_W_WET });
     }
     for (let i = RIVER_SEGS; i >= 0; i--) {
       const lx = -RIVER_HALF_LEN + (i / RIVER_SEGS) * RIVER_HALF_LEN * 2;
-      ring.push({ x: lx, z: riverCentreZ(lx) + RIVER_W_WATER });
+      ring.push({ x: lx, z: riverCentreZ(lx) + RIVER_W_WET });
     }
     local = ring;
   } else if (pool.kind === "classic-pool") {
@@ -8714,7 +8804,7 @@ export function poolHoleRect(
   for (const item of items) {
     if (!isPoolKind(item.kind)) continue;
     if (item.kind === "beach-river") {
-      const half = RIVER_AMP + RIVER_W_WATER;
+      const half = RIVER_AMP + RIVER_W_WET;
       return localBoxToWorld(item, -RIVER_HALF_LEN, -half, RIVER_HALF_LEN, half);
     }
     const a = rotXZ(-POOL_WATER_WEST, -POOL_WATER_HALFZ, item.rot);

@@ -36,6 +36,28 @@ export function setRoomThemeWriter(cb: (theme: RoomTheme) => void): void {
   roomThemeWriter = cb;
 }
 
+/**
+ * 📐 Write a template's envelope into the room doc.
+ *
+ * ⚠️ THE SHELL DOES NOT REBUILD IN PLACE. The floor, the walls, the walkable
+ * bounds and the octagon hull are all built ONCE by World.createPlatform from
+ * roomHalfExtents(), and nothing in the engine tears a built platform down —
+ * createPlatform only ADDS to platformGroup. Calling it again (via startMorph)
+ * leaves the old floor and a duplicate of every furniture group behind, which
+ * is exactly what it did when this was first wired that way.
+ *
+ * So: at room BIRTH (seedRoomTemplate) the dims land before the platform is
+ * ever built and everything is correct. On an EXISTING room the dims are
+ * written and persist, but the player has to leave and re-enter for the shell
+ * to come back at the new size — applyRoomTemplate says so in its return value
+ * and the dev menu passes that on.
+ *
+ * Doing better means a real platform teardown, which is its own change.
+ */
+function writeEnvelope(dims: RoomDims): void {
+  writeRoomDims(dims.cols, dims.rows);
+}
+
 /** The room "type"; each can have multiple design variants (casino-1, -2, …).
  *  "blank" is the empty starting point (folds in empty-by-default); "deck" is
  *  an open-air sky terrace (outdoor-deck theme without a pool). */
@@ -378,7 +400,7 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
   // 📐 Size FIRST: placement validity and the walk bounds are derived from the
   // envelope, so growing the room before the furniture lands means nothing is
   // ever briefly out of bounds.
-  if (t.dims) writeRoomDims(t.dims.cols, t.dims.rows);
+  if (t.dims) writeEnvelope(t.dims);
   replaceAllFurniture(cloneItems(t.items));
   // 🌌 …and the room IS this now: stamping the theme makes the change
   // persistent and shared, instead of a look that lasted until the next
@@ -396,7 +418,7 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
-  if (t.dims) writeRoomDims(t.dims.cols, t.dims.rows);
+  if (t.dims) writeEnvelope(t.dims);
   replaceAllFurniture(cloneItems(t.items));
   return true;
 }

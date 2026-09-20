@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildObstacleList,
   isPoolKind,
+  poolCutContains,
   poolHoleCells,
   poolHoleRect,
   poolWaterContains,
@@ -117,10 +118,19 @@ describe('what you can walk on', () => {
   });
 
   it('leaves the DRY SAND at the bends walkable', () => {
-    // 3.2 m off the centre line is past the water everywhere along the river.
+    // Past the EXCAVATION (3.4), not merely past the waterline: the wet shelf
+    // between them is 30 cm below a floor the engine draws flat, so it is
+    // scenery you look at, not ground you stand on.
     for (let x = -13.5; x <= 13.5; x += 1) {
-      expect(blocked(x, centreZ(x) - 3.2)).toBe(false);
-      expect(blocked(x, centreZ(x) + 3.2)).toBe(false);
+      expect(blocked(x, centreZ(x) - 4.0)).toBe(false);
+      expect(blocked(x, centreZ(x) + 4.0)).toBe(false);
+    }
+  });
+
+  it('blocks the wet shelf as well as the water', () => {
+    for (const x of [-10.5, -2.5, 6.5, 12.5]) {
+      expect(blocked(x, centreZ(x) + 3.0)).toBe(true); // shelf: cut, not water
+      expect(blocked(x, centreZ(x) - 3.0)).toBe(true);
     }
   });
 
@@ -152,12 +162,20 @@ describe('what you can walk on', () => {
 describe('the floor hole', () => {
   const cells = poolHoleCells([RIVER, BRIDGE]);
 
-  it('cuts only cells that are actually water', () => {
+  it('cuts only cells that are actually excavated', () => {
     expect(cells.size).toBeGreaterThan(80);
     for (const key of cells) {
       const [i, j] = key.split(',').map(Number);
-      expect(poolWaterContains([RIVER, BRIDGE], i + 0.5, j + 0.5)).toBe(true);
+      expect(poolCutContains([RIVER, BRIDGE], i + 0.5, j + 0.5)).toBe(true);
     }
+  });
+
+  it('cuts wider than the waterline, or the wet shelf would be buried', () => {
+    // The shelf renders 30 cm down; if the hole stopped at the waterline the
+    // solid floor would sit over it and the terracing would never be seen.
+    const x = 2.554; // the widest bend
+    expect(poolWaterContains([RIVER], x, centreZ(x) + 3.0)).toBe(false);
+    expect(poolCutContains([RIVER], x, centreZ(x) + 3.0)).toBe(true);
   });
 
   it('leaves the bridge its floor — a hole under the planks is a hole', () => {
