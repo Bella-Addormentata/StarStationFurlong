@@ -31,6 +31,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  PartyPulseHandle,
 } from './devices';
 
 /**
@@ -54,6 +55,8 @@ export interface FurnitureHandleSinks {
   cloneVats: Map<string, CloneVatHandle>;
   /** 🎰 Slot-machine cabinet visuals (reels/lamps), keyed by item id. */
   slotMachineVisuals: Map<string, SlotMachineVisualHandle>;
+  /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
+  partyPulses: Map<string, PartyPulseHandle>;
 }
 
 /**
@@ -81,4 +84,5 @@ export function registerFurnitureHandles(
   if (d.slotMachineVisual) {
     sinks.slotMachineVisuals.set(itemId, d.slotMachineVisual as SlotMachineVisualHandle);
   }
+  if (d.partyPulse) sinks.partyPulses.set(itemId, d.partyPulse as PartyPulseHandle);
 }

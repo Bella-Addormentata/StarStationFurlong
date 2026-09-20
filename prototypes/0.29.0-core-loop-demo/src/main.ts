@@ -102,6 +102,8 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMod
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+// 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
+import { bindPartyDoc } from "./partyDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -1349,6 +1351,11 @@ async function joinRoomAtEpoch(
 
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
+
+  // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
+  // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
+  // into a party that has already happened and see the candles already out.
+  bindPartyDoc(sync.doc);
 
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the

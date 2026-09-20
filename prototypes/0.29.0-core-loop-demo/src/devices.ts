@@ -126,7 +126,17 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+
+/**
+ * 💃 Handle onto a dance floor's travelling light wave. The builder
+ * (furniture.ts) stows it in the pad group's userData.partyPulse; World
+ * collects it and drives update(dt) every frame — the trunk-lid idiom, so the
+ * animation dies with the item instead of outliving it on a timer.
+ */
+export interface PartyPulseHandle {
+  update(dt: number): void;
+}
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus

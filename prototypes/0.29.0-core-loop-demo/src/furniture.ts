@@ -35,6 +35,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  PartyPulseHandle,
 } from "./devices";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
@@ -42,6 +43,13 @@ import { WHEEL_ORDER, pocketColor } from "./games/roulette";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
+// 🎉 Party props read their own per-instance state (candles, lids, the music)
+// straight from the room doc, the same way the slot machine reads the casino
+// map — the doc is the phase, a local click is never the phase.
+import {
+  readCake, readGift, readSpeaker, subscribePartyKey,
+  cakeKey, giftKey, speakerKey,
+} from "./partyDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
@@ -105,7 +113,14 @@ export type FurnitureKind =
   | "classic-hot-tub"
   | "bunk-bed"
   | "clone-vat"
-  | "slot-machine";
+  | "slot-machine"
+  // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
+  | "cake-table"
+  | "gift-box"
+  | "birthday-banner"
+  | "party-speaker"
+  | "dance-floor"
+  | "party-standing-table";
 
 export interface FurnitureItem {
   id: string;
@@ -3093,6 +3108,75 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     build: buildBirthdayBalloonsWall,
     footprint: null,
   },
+  // ── 🎉 Party fixtures ──────────────────────────────────────────────────────
+  // The three with a `device` are the room's VERBS; the three without are the
+  // dressing. Device fronts follow the map-table convention: the stand point
+  // sits just beyond the +z footprint edge and faceAngle π turns the avatar
+  // back TOWARD the prop.
+  //
+  // 🎂 Cake table: 2×1 and solid, with open floor wanted on at least two sides
+  // — it is the thing the whole room turns to face.
+  "cake-table": {
+    kind: "cake-table",
+    build: buildCakeTable,
+    footprint: { w: 2, d: 1 },
+    functions: ["partyCake"],
+    device: {
+      kind: "cakeTable",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.5, z: 1.0 },
+      anchor: { x: 0, y: 1.15, z: 0 },
+    },
+  },
+  // 🎁 Gift box: 1×1, solid, and deliberately CHEAP to place — guests pile
+  // them by the cake in edit mode, which is half the point of shipping the
+  // party cluster sparse.
+  "gift-box": {
+    kind: "gift-box",
+    build: buildGiftBox,
+    footprint: { w: 1, d: 1 },
+    functions: ["partyGift"],
+    device: {
+      kind: "giftBox",
+      front: { x: 0, z: 0.9 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.05, z: 0.8 },
+      anchor: { x: 0, y: 0.35, z: 0 },
+    },
+  },
+  // 🎊 Banner: footprint NULL — guests walk under it. See buildBirthdayBanner.
+  "birthday-banner": {
+    kind: "birthday-banner",
+    build: buildBirthdayBanner,
+    footprint: null,
+  },
+  // 🔊 Speaker: drives every dance floor in the room via `speaker:<itemId>`.
+  "party-speaker": {
+    kind: "party-speaker",
+    build: buildPartySpeaker,
+    footprint: { w: 1, d: 1 },
+    functions: ["partySpeaker"],
+    device: {
+      kind: "partySpeaker",
+      front: { x: 0, z: 0.9 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.35, z: 0.85 },
+      anchor: { x: 0, y: 0.7, z: 0 },
+    },
+  },
+  // 💃 Dance floor: footprint NULL because it IS floor — an obstacle here
+  // would make the one tile people are supposed to stand on unwalkable.
+  "dance-floor": {
+    kind: "dance-floor",
+    build: buildDanceFloor,
+    footprint: null,
+  },
+  "party-standing-table": {
+    kind: "party-standing-table",
+    build: buildPartyStandingTable,
+    footprint: { w: 1, d: 1 },
+  },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
   // local rot-0 frame (screen faces +z):
@@ -6073,6 +6157,390 @@ function buildSlotMachine({
   for (const mesh of chairMeshes) mesh.userData.skipDeviceHit = true;
 }
 
+
+// ── 🎉 Party fixtures ────────────────────────────────────────────────────────
+// The cake, the gifts, the banner, the speaker and the dance floor. Everything
+// here is ordinary registry furniture — what makes it a PARTY is that four of
+// the five carry per-instance state in the room doc (partyDoc.ts) instead of
+// being pure decoration, and that one of them is gated to a named person.
+//
+// Placement note (the element-checklist zoning rule): these want to live down
+// ONE SIDE of the room facing an empty middle, with the tallest (banner) at the
+// back. Nothing here should end up between the camera and the cake.
+
+const CAKE_SPONGE = 0xf2d9a8; // warm sponge
+const CAKE_FROST = 0xfff4e8; // buttercream
+const CAKE_BERRY = 0xff8fab; // the pink drip (PK2's sibling)
+const CANDLE_WAX = 0xfff0f4;
+const FLAME = 0xffb300;
+const CLOTH = 0xfdf6ec;
+
+/** Deterministic 0..1 from an item id — so a PILE of gifts isn't uniform.
+ *  (FNV-1a; the same id must give the same colour on every client.) */
+function idHash01(id: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return ((h >>> 0) % 1000) / 1000;
+}
+
+/**
+ * 🎂 THE ANCHOR OF THE ROOM. A clothed 2×1 table carrying a two-tier cake.
+ *
+ * Two phases, driven by `cake:<itemId>` in the room doc: candles LIT (only the
+ * guest of honour may blow them out) and candles OUT (the cake becomes a slice
+ * dispenser for everyone). The flames and their light are one group whose
+ * visibility follows the doc, so the moment lands on every screen at once.
+ *
+ * Tier proportions follow the reference set: a short wide tier under a taller
+ * narrow one, each finished with a frosting disc that overhangs very slightly.
+ */
+function buildCakeTable(ctx: BuildCtx) {
+  const { m, place, addLight, attach, itemId } = ctx;
+
+  // Table + cloth. The cloth overhangs the top on all four sides.
+  place(new THREE.BoxGeometry(1.62, 0.60, 0.74), m(WOOD, 0.8, 0.05), 0, 0.30, 0);
+  place(new THREE.BoxGeometry(1.86, 0.07, 0.96), m(CLOTH, 0.9, 0.02), 0, 0.635, 0);
+  // Skirt: a thin band under the cloth edge, so the table doesn't read as a slab.
+  place(new THREE.BoxGeometry(1.84, 0.16, 0.94), m(CLOTH, 0.95, 0.0), 0, 0.55, 0);
+
+  // ── Two-tier cake, centred on the table top (y 0.67 = cloth surface) ──
+  const TOP = 0.67;
+  place(new THREE.CylinderGeometry(0.30, 0.30, 0.22, 20), m(CAKE_SPONGE, 0.85, 0.02), 0, TOP + 0.11, 0);
+  place(new THREE.CylinderGeometry(0.315, 0.315, 0.06, 20), m(CAKE_FROST, 0.7, 0.03), 0, TOP + 0.25, 0);
+  place(new THREE.CylinderGeometry(0.19, 0.19, 0.18, 18), m(CAKE_SPONGE, 0.85, 0.02), 0, TOP + 0.37, 0);
+  place(new THREE.CylinderGeometry(0.20, 0.20, 0.05, 18), m(CAKE_FROST, 0.7, 0.03), 0, TOP + 0.485, 0);
+  // A pink drip band around the lower tier's frosting.
+  place(new THREE.CylinderGeometry(0.318, 0.318, 0.025, 20), m(CAKE_BERRY, 0.75, 0.04), 0, TOP + 0.225, 0);
+
+  // ── Candles. A ring on the top tier; the flames live in their own group. ──
+  const flames = new THREE.Group();
+  flames.name = "cakeFlames";
+  const { candles } = readCake(itemId);
+  const CANDLE_BASE = TOP + 0.51;
+  for (let i = 0; i < candles; i++) {
+    const a = (i / Math.max(1, candles)) * Math.PI * 2;
+    const cx = Math.cos(a) * 0.115;
+    const cz = Math.sin(a) * 0.115;
+    place(new THREE.CylinderGeometry(0.012, 0.012, 0.13, 6), m(CANDLE_WAX, 0.7, 0.02), cx, CANDLE_BASE + 0.065, cz);
+    // Flame: a small emissive teardrop. Parented to `flames`, not the item, so
+    // one visibility flip blows out every candle together.
+    const flame = new THREE.Mesh(
+      new THREE.ConeGeometry(0.018, 0.055, 7),
+      m(FLAME, 0.3, 0.0, FLAME, 2.2),
+    );
+    flame.position.set(cx, CANDLE_BASE + 0.16, cz);
+    flames.add(flame);
+  }
+  attach(flames);
+
+  // One warm light for the whole ring — 5 point lights would be a frame cost
+  // for no visible gain at this scale.
+  const glow = new THREE.PointLight(FLAME, 0, 1.6);
+  addLight(glow, 0, CANDLE_BASE + 0.22, 0, 0.9);
+
+  // ── 🎊 Confetti. The payoff of the moment, and the reason it reads as an
+  //    EVENT rather than a state flag. Pre-built and parked: a burst must not
+  //    allocate geometry at the instant everyone is looking.
+  const CONFETTI = [0xff8fab, 0xf2c14e, 0x7fd1c4, 0x9a7bd0, 0xffffff, 0x79c4e6] as const;
+  const COUNT = 48;
+  const bits: THREE.Mesh[] = [];
+  const vel: THREE.Vector3[] = [];
+  const spin: THREE.Vector3[] = [];
+  const confetti = new THREE.Group();
+  confetti.name = "cakeConfetti";
+  confetti.visible = false;
+  for (let i = 0; i < COUNT; i++) {
+    const bit = new THREE.Mesh(
+      new THREE.BoxGeometry(0.045, 0.006, 0.028),
+      m(CONFETTI[i % CONFETTI.length], 0.6, 0.05),
+    );
+    confetti.add(bit);
+    bits.push(bit);
+    vel.push(new THREE.Vector3());
+    spin.push(new THREE.Vector3());
+  }
+  attach(confetti);
+
+  let burstT = -1; // <0 ⇒ idle
+  const BURST_SECS = 2.6;
+  const fire = () => {
+    burstT = 0;
+    confetti.visible = true;
+    for (let i = 0; i < COUNT; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const speed = 0.7 + Math.random() * 1.1;
+      bits[i].position.set(0, CANDLE_BASE + 0.2, 0);
+      vel[i].set(Math.cos(a) * speed * 0.55, 1.5 + Math.random() * 1.2, Math.sin(a) * speed * 0.55);
+      spin[i].set(Math.random() * 8 - 4, Math.random() * 8 - 4, Math.random() * 8 - 4);
+    }
+  };
+  // Reuse the per-item pulse slot World already drives — a cake is never also
+  // a dance floor, so one handle per item is enough.
+  const pulse: PartyPulseHandle = {
+    update(dt: number) {
+      if (burstT < 0) return;
+      burstT += dt;
+      if (burstT > BURST_SECS) {
+        burstT = -1;
+        confetti.visible = false;
+        return;
+      }
+      for (let i = 0; i < COUNT; i++) {
+        vel[i].y -= 3.4 * dt; // gravity — paper falls slowly
+        vel[i].x *= 1 - 1.6 * dt; // and air-brakes sideways
+        vel[i].z *= 1 - 1.6 * dt;
+        bits[i].position.addScaledVector(vel[i], dt);
+        bits[i].rotation.x += spin[i].x * dt;
+        bits[i].rotation.y += spin[i].y * dt;
+        bits[i].rotation.z += spin[i].z * dt;
+      }
+    },
+  };
+
+  // ── Live state: the flames follow the doc, not the local click ──
+  // First paint must NOT fire confetti: a joiner walking into a party that
+  // already happened should find the candles quietly out, not re-run the
+  // moment. Only a lit → unlit TRANSITION is the event.
+  let known: boolean | null = null;
+  const applyPhase = () => {
+    const lit = readCake(itemId).lit;
+    flames.visible = lit;
+    glow.intensity = lit ? 0.9 : 0;
+    if (known === true && !lit) fire();
+    known = lit;
+  };
+  applyPhase();
+  // Both hooks ride the trim-style carrier rules: the subscription can live on
+  // a Group (the dispose scan traverses everything), the drive handle cannot
+  // (registerFurnitureHandles only visits meshes) — so it goes on a mesh.
+  flames.userData.disposePartySub = subscribePartyKey(cakeKey(itemId), applyPhase);
+  const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(CLOTH, 1, 0), 0, 0.01, 0);
+  carrier.visible = false;
+  carrier.userData.partyPulse = pulse;
+}
+
+/**
+ * 🎁 A stackable, openable gift box. Colour is derived from the item id so a
+ * pile reads as several presents rather than a repeated asset. Opening is the
+ * small, ungated echo of the cake moment: one doc write, and the lid tilts off
+ * on every client.
+ */
+function buildGiftBox(ctx: BuildCtx) {
+  const { m, place, attach, itemId } = ctx;
+  const WRAPS = [0xff8fab, 0x7fd1c4, 0xf2c14e, 0x9a7bd0, 0x6fbf6b, 0x79c4e6] as const;
+  const wrap = WRAPS[Math.floor(idHash01(itemId) * WRAPS.length) % WRAPS.length];
+  const RIBBON = 0xfff4e8;
+
+  const W = 0.62;
+  place(new THREE.BoxGeometry(W, 0.46, W), m(wrap, 0.78, 0.04), 0, 0.23, 0);
+  // Ribbon cross on the four sides, slightly proud of the wrapping.
+  place(new THREE.BoxGeometry(0.1, 0.47, W + 0.012), m(RIBBON, 0.6, 0.06), 0, 0.23, 0);
+  place(new THREE.BoxGeometry(W + 0.012, 0.47, 0.1), m(RIBBON, 0.6, 0.06), 0, 0.23, 0);
+
+  // Lid + bow ride in one group so opening tilts them together.
+  const lid = new THREE.Group();
+  lid.name = "giftLid";
+  const lidMesh = new THREE.Mesh(new THREE.BoxGeometry(W + 0.06, 0.1, W + 0.06), m(wrap, 0.75, 0.05));
+  lidMesh.position.y = 0.05;
+  lid.add(lidMesh);
+  for (const ry of [0, Math.PI / 2]) {
+    const band = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.11, W + 0.07), m(RIBBON, 0.6, 0.06));
+    band.position.y = 0.05;
+    band.rotation.y = ry;
+    lid.add(band);
+  }
+  // Bow: two squashed spheres either side of a knot.
+  for (const bx of [-0.07, 0.07]) {
+    const loop = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 8), m(RIBBON, 0.55, 0.08));
+    loop.position.set(bx, 0.13, 0);
+    loop.scale.set(1, 0.7, 0.55);
+    lid.add(loop);
+  }
+  lid.position.set(0, 0.46, 0);
+  attach(lid);
+
+  const applyPhase = () => {
+    const { opened } = readGift(itemId);
+    // Opened: the lid slides off one corner and tips, the way a lid actually
+    // lands. Closed: square on the box.
+    lid.position.set(opened ? 0.30 : 0, opened ? 0.50 : 0.46, opened ? 0.22 : 0);
+    lid.rotation.set(opened ? 0.42 : 0, opened ? 0.55 : 0, opened ? -0.30 : 0);
+  };
+  applyPhase();
+  lid.userData.disposePartySub = subscribePartyKey(giftKey(itemId), applyPhase);
+}
+
+/**
+ * 🎊 Birthday banner — 3×1 of bunting on two poles. footprint NULL on purpose:
+ * guests walk UNDER it, and a banner that blocks a corridor is the fastest way
+ * to make a party room unwalkable (the checklist's two-tile corridor rule).
+ */
+function buildBirthdayBanner(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const POLE = 0xd8d2c4;
+  const BUNTING = [0xff8fab, 0xf2c14e, 0x7fd1c4, 0x9a7bd0, 0xffffff] as const;
+  const SPAN = 2.6;
+  const POLE_H = 2.35;
+
+  for (const px of [-SPAN / 2, SPAN / 2]) {
+    place(new THREE.CylinderGeometry(0.035, 0.045, POLE_H, 8), m(POLE, 0.6, 0.35), px, POLE_H / 2, 0);
+    place(new THREE.CylinderGeometry(0.11, 0.13, 0.06, 10), m(POLE, 0.7, 0.3), px, 0.03, 0);
+  }
+
+  // The string sags: a catenary approximated by a cosine, drawn as short
+  // segments so it reads as a curve rather than a taut wire.
+  const SAG = 0.34;
+  const TOP = POLE_H - 0.1;
+  const yAt = (t: number) => TOP - SAG * Math.sin(t * Math.PI); // 0 at both poles
+  const STEPS = 14;
+  for (let i = 0; i < STEPS; i++) {
+    const t0 = i / STEPS;
+    const t1 = (i + 1) / STEPS;
+    const x0 = -SPAN / 2 + t0 * SPAN;
+    const x1 = -SPAN / 2 + t1 * SPAN;
+    const y0 = yAt(t0);
+    const y1 = yAt(t1);
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const seg = place(
+      new THREE.CylinderGeometry(0.012, 0.012, len, 5),
+      m(POLE, 0.8, 0.1),
+      (x0 + x1) / 2,
+      (y0 + y1) / 2,
+      0,
+    );
+    seg.rotation.z = Math.PI / 2 - Math.atan2(y1 - y0, x1 - x0);
+
+    // A bunting triangle hanging from the midpoint of every segment.
+    const flag = place(
+      new THREE.ConeGeometry(0.085, 0.2, 3),
+      m(BUNTING[i % BUNTING.length], 0.85, 0.02),
+      (x0 + x1) / 2,
+      (y0 + y1) / 2 - 0.115,
+      0,
+    );
+    flag.rotation.x = Math.PI; // point down
+    flag.rotation.y = Math.PI / 2;
+  }
+}
+
+/**
+ * 🔊 Party speaker — the dance floor's power switch. Toggling it is ungated
+ * (anyone may kill the music) and the state rides `speaker:<itemId>`, which the
+ * dance floor subscribes to as well.
+ */
+function buildPartySpeaker(ctx: BuildCtx) {
+  const { m, place, attach, itemId } = ctx;
+  const CAB = 0x23252e;
+  const CONE = 0x3d4a5e;
+  const LIT = 0x7fd1c4;
+
+  place(new THREE.BoxGeometry(0.52, 0.86, 0.42), m(CAB, 0.72, 0.18), 0, 0.43, 0);
+  place(new THREE.BoxGeometry(0.56, 0.05, 0.46), m(CAB, 0.55, 0.3), 0, 0.88, 0);
+  // Two drivers facing +z (the local "front" convention the devices use).
+  for (const [dy, r] of [[0.30, 0.17], [0.64, 0.10]] as const) {
+    place(new THREE.CylinderGeometry(r, r, 0.03, 16), m(CONE, 0.9, 0.05), 0, dy, 0.215).rotation.x = Math.PI / 2;
+    place(new THREE.CylinderGeometry(r * 0.35, r * 0.35, 0.05, 12), m(0x14181e, 0.6, 0.4), 0, dy, 0.228).rotation.x = Math.PI / 2;
+  }
+
+  // Status ring — the only part that changes with state.
+  const ring = new THREE.Group();
+  const ringMat = m(LIT, 0.3, 0.1, LIT, 1.8);
+  const ringMesh = new THREE.Mesh(new THREE.TorusGeometry(0.055, 0.012, 8, 20), ringMat);
+  ringMesh.position.set(0, 0.86, 0.14);
+  ringMesh.rotation.x = Math.PI / 2;
+  ring.add(ringMesh);
+  attach(ring);
+
+  const applyPhase = () => {
+    const { on } = readSpeaker(itemId);
+    ringMat.emissiveIntensity = on ? 1.8 : 0.05;
+    ringMat.needsUpdate = true;
+  };
+  applyPhase();
+  ring.userData.disposePartySub = subscribePartyKey(speakerKey(itemId), applyPhase);
+}
+
+/**
+ * 💃 Dance floor — a 4×4 checkered pad. footprint NULL: it is FLOOR, people
+ * must be able to stand on it, and a dance emote on plain deck is a gesture
+ * while the same emote on a lit floor is a place.
+ *
+ * It pulses only while a speaker in the room is on. The pulse is driven by a
+ * PartyPulseHandle that World ticks (the trunk-lid idiom) rather than a timer
+ * of its own, so it stops dead when the item is removed.
+ */
+function buildDanceFloor(ctx: BuildCtx) {
+  const { m, place, itemId } = ctx;
+  const A = 0xf7d9e6; // pastel pink
+  const B = 0xd6f0ee; // pastel mint
+  const N = 4;
+  const CELL = 1.0;
+  const pads: THREE.MeshStandardMaterial[] = [];
+
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      const col = (i + j) % 2 === 0 ? A : B;
+      const mat = m(col, 0.55, 0.06, col, 0.25);
+      const x = (i - (N - 1) / 2) * CELL;
+      const z = (j - (N - 1) / 2) * CELL;
+      place(new THREE.BoxGeometry(CELL * 0.97, 0.035, CELL * 0.97), mat, x, 0.018, z);
+      pads.push(mat);
+    }
+  }
+  // A dark trim so the floor reads as an inset panel, not a rug. It also
+  // CARRIES the handles: registerFurnitureHandles only visits meshes, so a
+  // Group would be collected by nothing and the floor would never pulse.
+  const trim = place(
+    new THREE.BoxGeometry(N * CELL + 0.1, 0.02, N * CELL + 0.1),
+    m(0x23252e, 0.8, 0.1),
+    0,
+    0.008,
+    0,
+  );
+
+  let t = 0;
+  let on = readSpeaker(itemId).on;
+  // Per-frame handle — World drives update(dt) and drops it on removal.
+  const pulse: PartyPulseHandle = {
+    update(dt: number) {
+      if (!on) {
+        for (const mat of pads) mat.emissiveIntensity = 0.06;
+        return;
+      }
+      t += dt;
+      // Travelling wave across the grid, not a uniform blink: each pad's phase
+      // is offset by its index so the floor reads as moving light.
+      for (let k = 0; k < pads.length; k++) {
+        const phase = t * 3.2 - k * 0.35;
+        pads[k].emissiveIntensity = 0.18 + 0.30 * (0.5 + 0.5 * Math.sin(phase));
+      }
+    },
+  };
+  trim.userData.partyPulse = pulse;
+
+  const applySpeaker = () => {
+    on = readSpeaker(itemId).on;
+  };
+  trim.userData.disposePartySub = subscribePartyKey(speakerKey(itemId), applySpeaker);
+}
+
+/**
+ * 🍸 Standing table — somewhere to put a drink down that isn't the cake table.
+ * The checklist is right that a party needs a second and third place to BE;
+ * this is the cheapest of them.
+ */
+function buildPartyStandingTable(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const H = 1.02;
+  place(new THREE.CylinderGeometry(0.30, 0.30, 0.05, 20), m(CLOTH, 0.7, 0.05), 0, H, 0);
+  place(new THREE.CylinderGeometry(0.055, 0.055, H, 10), m(0xd8d2c4, 0.5, 0.45), 0, H / 2, 0);
+  place(new THREE.CylinderGeometry(0.26, 0.30, 0.04, 16), m(0xd8d2c4, 0.6, 0.4), 0, 0.02, 0);
+  // A cloth sleeve down the post — bistro tables always have one.
+  place(new THREE.CylinderGeometry(0.085, 0.11, H - 0.1, 12), m(CLOTH, 0.95, 0.0), 0, (H - 0.1) / 2, 0);
+}
 
 // Obstacle-bearing items appear first, in the same order as the original
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and

@@ -139,6 +139,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  PartyPulseHandle,
   SlotMachineCabinetControl,
   DeviceUI,
   DeviceTarget,
@@ -147,6 +148,14 @@ import { subscribeGames, readGame } from "./games/gamesDoc";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom } from "./editMode";
 import { showHint } from "./hud";
+// 🎉 Party props: the focused panels and the doc the moment lives in.
+import {
+  createCakeTableUI, createGiftBoxUI, createPartySpeakerUI,
+  type PartyDeviceDeps,
+} from "./partyUI";
+import { getIdentityPub } from "./keypair";
+import { getPlayerName } from "./identity";
+import { listContacts, getContact } from "./contacts";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -383,6 +392,8 @@ export class World {
   private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
+  /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
+  private partyPulses: Map<string, PartyPulseHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -1590,6 +1601,7 @@ export class World {
       gameTableTops: this.gameTableTops,
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
+      partyPulses: this.partyPulses,
     };
   }
 
@@ -2950,6 +2962,7 @@ export class World {
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
     this.slotMachineVisuals.delete(itemId);
+    this.partyPulses.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -2974,8 +2987,16 @@ export class World {
     const groupLights = new Set<THREE.PointLight>();
     const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
     group.traverse((obj) => {
-      const disposeSlotPaytable = obj.userData.disposeSlotPaytable;
-      if (typeof disposeSlotPaytable === "function") disposeSlotPaytable();
+      // 🧹 Any `dispose*` entry on userData is a teardown hook (a doc
+      // subscription, a timer). Scanning by PREFIX instead of naming each one
+      // means a new prop that subscribes to the room doc cannot leak a live
+      // listener just because nobody remembered to add its key here — which is
+      // exactly the drift furnitureHandles.ts was written to stop.
+      for (const key of Object.keys(obj.userData)) {
+        if (!key.startsWith("dispose")) continue;
+        const hook = obj.userData[key];
+        if (typeof hook === "function") hook();
+      }
       if (obj instanceof THREE.PointLight) {
         groupLights.add(obj);
         obj.dispose();
@@ -3639,6 +3660,10 @@ export class World {
 
     // 🎰 Keep physical cabinet reels synchronized for nearby spectators.
     for (const slot of this.slotMachineVisuals.values()) slot.update(deltaTime);
+
+    // 💃 Dance floors run their travelling light wave (no-op while the room's
+    // speaker is off — the handle reads that itself).
+    for (const pulse of this.partyPulses.values()) pulse.update(deltaTime);
     this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
@@ -5366,6 +5391,48 @@ export class World {
           onMessage: (message) => visual?.showMessage(message),
         }),
       );
+      return;
+    }
+
+    // 🎉 Party props. The cake carries the gated moment; the other two are
+    // ungated (anyone may open a present or kill the music).
+    if (
+      device.kind === "cakeTable" ||
+      device.kind === "giftBox" ||
+      device.kind === "partySpeaker"
+    ) {
+      const deps: PartyDeviceDeps = {
+        itemId: deviceId,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        nameForPub: (pub) =>
+          pub === getIdentityPub()
+            ? getPlayerName()
+            : getContact(pub)?.name ?? "a clone",
+        canEdit: () => canEditRoom().ok,
+        // v1 scope: the host picks the guest of honour from CONTACTS (plus
+        // themselves) — the same source the share-offer recipient picker uses.
+        // Naming a stranger who is standing right here needs the room's keyed
+        // players map, which lives on the other side of the T0 seam.
+        honourees: () => [
+          { pub: getIdentityPub(), name: `${getPlayerName()} (me)` },
+          ...listContacts().map((c) => ({ pub: c.pub, name: c.name })),
+        ],
+        // 🍰 A slice is carried in the same paw the waiter-bot's drinks use.
+        // The slice MESH is still to come; the pose and the line are what make
+        // a crowd read as guests, and they are the cheap half.
+        onSlice: () => {
+          this.player.setDrinkHold(1);
+          showHint("🍰 A slice of birthday cake.");
+        },
+      };
+      const ui =
+        device.kind === "cakeTable"
+          ? createCakeTableUI(deps)
+          : device.kind === "giftBox"
+            ? createGiftBoxUI(deps)
+            : createPartySpeakerUI(deps);
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

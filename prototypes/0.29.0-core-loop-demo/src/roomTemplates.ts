@@ -39,7 +39,8 @@ export type TemplateCategory =
   | "lobby"
   | "casino"
   | "pool"
-  | "deck";
+  | "deck"
+  | "party";
 
 export interface RoomTemplate {
   /** Unique variant id, `${category}-${n}` (e.g. "casino-1", "pool-2"). */
@@ -153,6 +154,69 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     ],
 
     theme: "outdoor-deck",
+  },
+  {
+    id: "party-1",
+    category: "party",
+    name: "Birthday Party",
+    description:
+      "Cake table and gifts along the back wall under the bunting, a lit dance floor with its speaker, the bar in the corner — and an empty middle for the crowd.",
+    // ── LAYOUT NOTES (the element-checklist zoning rules, applied to a square
+    //    12×12 m module rather than a beach):
+    //
+    //  · THE MIDDLE IS EMPTY ON PURPOSE. x ∈ [-2.5, 2.5], z ∈ [-2, 3] carries
+    //    nothing. In a multiplayer room the crowd needs somewhere to be, and
+    //    that is the zone every decoration was pushed out of.
+    //  · THE PARTY CLUSTER IS AT THE BACK (north, z ≈ -4). Cake, gifts, banner
+    //    and balloons together, all rot 0 so their approach side (local +z)
+    //    faces the middle — guests turn toward the cake from the open floor
+    //    instead of standing inside the cluster.
+    //  · THE TALLEST THINGS FRAME THE SCENE. Banner (2.35 m) and the cherry
+    //    trees sit on the back wall where they never occlude the cake.
+    //  · TWO MORE PLACES TO BE. The dance floor east of centre and the bar in
+    //    the far corner, so the room has three social zones, not one.
+    //  · CORRIDORS. ≥ 2 m clear between the cluster (z ≤ -3.7) and the dance
+    //    floor (z ≥ -1.8), and the banner is footprint-null so people walk
+    //    under it rather than round it.
+    //
+    // Shipped DELIBERATELY SPARSE: more balloons, hats and tables are what
+    // guests add in edit mode, and a room that arrives finished leaves them
+    // nothing to do.
+    items: [
+      // Edit-mode entry. NOT the reserved id "wall-computer" (see "empty").
+      { id: "party-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
+
+      // 🎂 The anchor, and the cluster around it.
+      { id: "party-cake", kind: "cake-table", pos: { x: -1.0, z: -4.2 }, rot: 0, movable: true },
+      { id: "party-banner", kind: "birthday-banner", pos: { x: -1.0, z: -5.3 }, rot: 0, movable: true },
+      { id: "party-gift-1", kind: "gift-box", pos: { x: -2.7, z: -4.0 }, rot: 0, movable: true },
+      { id: "party-gift-2", kind: "gift-box", pos: { x: -3.5, z: -4.7 }, rot: 0, movable: true },
+      { id: "party-gift-3", kind: "gift-box", pos: { x: 0.7, z: -4.3 }, rot: 0, movable: true },
+      { id: "party-balloons-w", kind: "birthday-balloons", pos: { x: -4.6, z: -4.2 }, rot: 0, movable: true },
+      { id: "party-balloons-e", kind: "birthday-balloons", pos: { x: 2.2, z: -4.4 }, rot: 0, movable: true },
+
+      // 💃 The floor and its switch. The speaker sits on the floor's north
+      // edge so the walk to it is across the dance floor itself.
+      { id: "party-floor", kind: "dance-floor", pos: { x: 2.6, z: 0.2 }, rot: 0, movable: true },
+      { id: "party-speaker", kind: "party-speaker", pos: { x: 2.6, z: -2.2 }, rot: 0, movable: true },
+
+      // 🍸 Somewhere to put a drink down, out at the edges.
+      { id: "party-stand-1", kind: "party-standing-table", pos: { x: -4.4, z: 1.4 }, rot: 0, movable: true },
+      { id: "party-stand-2", kind: "party-standing-table", pos: { x: -3.1, z: 3.6 }, rot: 0, movable: true },
+
+      // 🍹 The second social zone — the lobby bar, in its usual corner.
+      { id: "party-bar", kind: "bar-corner", pos: { x: 5.24, z: 3.1 }, rot: 0, movable: true },
+
+      // 🌸 Back-wall greenery: tall, and therefore at the back.
+      { id: "party-tree-nw", kind: "cherry-tree", pos: { x: -5.2, z: -5.2 }, rot: 0, movable: true },
+      { id: "party-tree-ne", kind: "cherry-tree", pos: { x: 4.8, z: -5.2 }, rot: 0, movable: true },
+      { id: "party-pot-s", kind: "blossom-pot", pos: { x: -5.3, z: 4.6 }, rot: 0, movable: true },
+
+      // ✨ Light for the middle, so the empty floor still reads as a room.
+      { id: "party-chandelier", kind: "chandelier", pos: { x: 0, z: 0.5 }, rot: 0, movable: true },
+    ],
+
+    theme: "interior",
   },
   {
     id: "deck-1",
