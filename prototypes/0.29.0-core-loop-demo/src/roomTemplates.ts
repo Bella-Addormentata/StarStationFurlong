@@ -16,12 +16,17 @@
  * The lobby / casino / pool built-ins reuse the EXACT manifests the two
  * originally-authored rooms shipped, so provisioning one reproduces them.
  *
- * Not yet: R2 room-size presets.
+ * R2 room-size presets: a template MAY carry `dims`. Most do not — they were
+ * authored for the default 2×2 envelope and resizing under a layout that fits
+ * would be rude. A template whose furniture genuinely cannot fit (the beach
+ * party: a river, a bar under a 7×4 pergola, a dance floor AND an empty middle)
+ * declares the envelope it was drawn for, and applying it writes that too.
  */
 
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
 import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
+import { writeRoomDims, type RoomDims } from "./floorPlanDoc";
 
 /** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
  *  room's theme into its own roomInfo doc, so "this module is a casino now"
@@ -57,6 +62,10 @@ export interface RoomTemplate {
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
   theme: RoomTheme;
+  /** 📐 R2: the room envelope this layout was drawn for, in 6 m tiles. Present
+   *  ONLY where the furniture will not fit the 2×2 default — applying such a
+   *  template resizes the room, because half a beach is not the design. */
+  dims?: RoomDims;
 }
 
 /** Clone so applying a template never aliases the shared manifest arrays. */
@@ -219,6 +228,118 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     theme: "interior",
   },
   {
+    id: "party-2",
+    category: "party",
+    name: "Beach Birthday Party",
+    description:
+      "The lazy river down the front with palms along its banks, a tiki bar under a lantern-strung pergola in the far corner, cake and gifts along the back, a lit dance floor — and an empty middle.",
+    // 📐 4×4 (24×24 m). The 2×2 default cannot hold this: the river alone is
+    // ~10 m across and the pergola is 6.6×3.6, so at the default size the
+    // "empty middle" — the one zone that matters most in a multiplayer room —
+    // would be the only thing that did not fit.
+    dims: { cols: 4, rows: 4 },
+    //
+    // ── ZONES (element-checklist), mapped onto this engine's axes ──────────
+    //  +z is the camera side, so that is the FRONT and where the water goes;
+    //  -z is the back, where the tall things live. Four zones, tellable apart
+    //  at a glance:
+    //
+    //   z -12 ┌──────────────────────────────────────────────┐
+    //         │  BAR + PERGOLA        CAKE · GIFTS · BANNER   │  ← back
+    //         │  (far corner, lit)    (facing the middle)     │
+    //    z -4 │                                    DANCE ▓▓   │
+    //         │            ·  E M P T Y  ·                    │  ← the crowd
+    //    z  3 │                                               │
+    //         │   ~~~~~~  THE LAZY RIVER + BANKS  ~~~~~~      │  ← front
+    //    z 12 └──────────────────────────────────────────────┘
+    //
+    //  · THE MIDDLE IS EMPTY: x ∈ [-4, 5], z ∈ [-2.5, 2.5] carries nothing.
+    //    Every decoration was pushed outward; if something drifts back in,
+    //    the room was built centre-out and should be re-laid edges-in.
+    //  · THE BAR IS IN THE FAR CORNER and lit from its own pergola, so the
+    //    tallest cluster frames the scene instead of covering it. Back bar
+    //    against the back edge, then the counter, then stools on the camera
+    //    side — never mirrored, or the shelf ends up in front of the counter.
+    //  · PALMS AND SURFBOARDS string along the banks in odd groups with gaps,
+    //    never in a line, and never between the camera and the cake.
+    //  · CORRIDORS ≥ 2 m everywhere; the banner and the pergola roof are both
+    //    footprint-null, so people walk under them rather than around.
+    items: [
+      // Edit-mode entry, on the back wall in the gap between the two clusters.
+      { id: "beach-computer", kind: "wall-computer", pos: { x: -2.8, z: -11.9 }, rot: 0, movable: true },
+
+      // 🌊 THE RIVER. The station's lazy pool IS a winding bezier channel
+      // around a central island, sunk to -0.35 with basin walls to -0.95 and
+      // two infinity edges — so it plays the reference's river, and unlike the
+      // reference you can actually swim in it.
+      { id: "beach-river", kind: "lazy-pool", pos: { x: 0, z: 6.4 }, rot: 0, movable: false },
+
+      // 🍹 THE BAR — far corner, raised read via the pergola rather than a deck.
+      { id: "beach-backbar", kind: "tiki-back-bar", pos: { x: -7.0, z: -9.8 }, rot: 0, movable: true },
+      { id: "beach-counter", kind: "tiki-bar-counter", pos: { x: -7.0, z: -8.0 }, rot: 0, movable: true },
+      { id: "beach-stool-1", kind: "tiki-bar-stool", pos: { x: -8.6, z: -6.9 }, rot: 0, movable: true },
+      { id: "beach-stool-2", kind: "tiki-bar-stool", pos: { x: -7.0, z: -6.9 }, rot: 0, movable: true },
+      { id: "beach-stool-3", kind: "tiki-bar-stool", pos: { x: -5.4, z: -6.9 }, rot: 0, movable: true },
+      { id: "beach-post-nw", kind: "pergola-post", pos: { x: -10.4, z: -10.6 }, rot: 0, movable: true },
+      { id: "beach-post-ne", kind: "pergola-post", pos: { x: -3.6, z: -10.6 }, rot: 0, movable: true },
+      { id: "beach-post-sw", kind: "pergola-post", pos: { x: -10.4, z: -6.2 }, rot: 0, movable: true },
+      { id: "beach-post-se", kind: "pergola-post", pos: { x: -3.6, z: -6.2 }, rot: 0, movable: true },
+      { id: "beach-pergola", kind: "pergola-roof", pos: { x: -7.0, z: -8.4 }, rot: 0, movable: true },
+      // Leave the lane onto the bartender row clear — cooler and crate go in
+      // the corner BEHIND the shelf, not across the approach.
+      { id: "beach-cooler", kind: "cooler", pos: { x: -9.8, z: -9.9 }, rot: 0, movable: true },
+      { id: "beach-crate-1", kind: "beach-crate", pos: { x: -10.5, z: -9.0 }, rot: 0, movable: true },
+      // Torches on the sand just off the bar, not under the roof.
+      { id: "beach-torch-1", kind: "tiki-torch", pos: { x: -2.6, z: -10.2 }, rot: 0, movable: true },
+      { id: "beach-torch-2", kind: "tiki-torch", pos: { x: -2.6, z: -5.6 }, rot: 0, movable: true },
+
+      // 🎂 THE PARTY CLUSTER — beside the bar, along the back, facing the middle.
+      { id: "beach-cake", kind: "cake-table", pos: { x: 1.8, z: -8.8 }, rot: 0, movable: true },
+      { id: "beach-banner", kind: "birthday-banner", pos: { x: 1.8, z: -10.3 }, rot: 0, movable: true },
+      { id: "beach-gift-1", kind: "gift-box", pos: { x: 0.1, z: -8.6 }, rot: 0, movable: true },
+      { id: "beach-gift-2", kind: "gift-box", pos: { x: -0.7, z: -9.4 }, rot: 0, movable: true },
+      { id: "beach-gift-3", kind: "gift-box", pos: { x: 3.5, z: -9.0 }, rot: 0, movable: true },
+      { id: "beach-balloons-1", kind: "birthday-balloons", pos: { x: 5.0, z: -9.4 }, rot: 0, movable: true },
+      { id: "beach-balloons-2", kind: "birthday-balloons", pos: { x: -1.7, z: -10.0 }, rot: 0, movable: true },
+
+      // 💃 THE DANCE FLOOR — east side, speaker on its back edge.
+      { id: "beach-floor", kind: "dance-floor", pos: { x: 7.8, z: -3.2 }, rot: 0, movable: true },
+      { id: "beach-speaker", kind: "party-speaker", pos: { x: 7.8, z: -5.8 }, rot: 0, movable: true },
+
+      // 🍸 Two more places to stand, at the edges of the empty middle.
+      { id: "beach-stand-1", kind: "party-standing-table", pos: { x: -3.4, z: -3.0 }, rot: 0, movable: true },
+      { id: "beach-stand-2", kind: "party-standing-table", pos: { x: 4.6, z: -5.4 }, rot: 0, movable: true },
+
+      // 🌴 THE BANKS — palms and boards in odd groups with gaps between, the
+      // tall ones toward the back where they frame rather than occlude.
+      { id: "beach-palm-1", kind: "palm-tree", pos: { x: -10.2, z: 2.6 }, rot: 0, movable: true },
+      { id: "beach-palm-2", kind: "palm-tree", pos: { x: -8.6, z: 4.8 }, rot: 0, movable: true },
+      { id: "beach-palm-3", kind: "palm-tree", pos: { x: 9.8, z: 3.4 }, rot: 0, movable: true },
+      { id: "beach-palm-4", kind: "palm-tree", pos: { x: -9.4, z: -3.8 }, rot: 0, movable: true },
+      { id: "beach-palm-5", kind: "palm-tree", pos: { x: 10.4, z: -7.6 }, rot: 0, movable: true },
+      { id: "beach-board-1", kind: "surfboard", pos: { x: -11.0, z: 0.4 }, rot: 0, movable: true },
+      { id: "beach-board-2", kind: "surfboard", pos: { x: 10.8, z: 6.2 }, rot: 0, movable: true },
+
+      // ⛱️ Loungers and parasols in two small groups, clear of the water.
+      { id: "beach-parasol-1", kind: "parasol", pos: { x: -8.0, z: 8.2 }, rot: 0, movable: true },
+      { id: "beach-lounger-1", kind: "sun-lounger", pos: { x: -9.4, z: 8.4 }, rot: 0, movable: true },
+      { id: "beach-lounger-2", kind: "sun-lounger", pos: { x: -6.8, z: 8.6 }, rot: 0, movable: true },
+      { id: "beach-parasol-2", kind: "parasol", pos: { x: 8.6, z: 8.4 }, rot: 0, movable: true },
+      { id: "beach-lounger-3", kind: "sun-lounger", pos: { x: 9.8, z: 8.6 }, rot: 0, movable: true },
+      { id: "beach-towel-1", kind: "beach-towel", pos: { x: 7.0, z: 9.4 }, rot: 0, movable: true },
+      { id: "beach-towel-2", kind: "beach-towel", pos: { x: -10.6, z: 6.0 }, rot: 0, movable: true },
+
+      // 🏐 Two balls, because a beach with nothing loose on it looks staged.
+      { id: "beach-ball-1", kind: "beach-ball", pos: { x: -4.2, z: 4.4 }, rot: 0, movable: true },
+      { id: "beach-ball-2", kind: "beach-ball", pos: { x: 6.2, z: 1.6 }, rot: 0, movable: true },
+      { id: "beach-crate-2", kind: "beach-crate", pos: { x: 11.0, z: 0.8 }, rot: 0, movable: true },
+    ],
+
+    // Open to the real space backdrop, like the pool decks — a beach under a
+    // ceiling is a swimming hall.
+    theme: "outdoor-deck",
+  },
+  {
     id: "deck-1",
     category: "deck",
     name: "Sky Deck",
@@ -272,6 +393,10 @@ export function findTemplate(id: string): RoomTemplate | null {
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
+  // 📐 Size FIRST: placement validity and the walk bounds are derived from the
+  // envelope, so growing the room before the furniture lands means nothing is
+  // ever briefly out of bounds.
+  if (t.dims) writeRoomDims(t.dims.cols, t.dims.rows);
   replaceAllFurniture(cloneItems(t.items));
   // 🌌 …and the room IS this now: stamping the theme makes the change
   // persistent and shared, instead of a look that lasted until the next
@@ -289,6 +414,7 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
+  if (t.dims) writeRoomDims(t.dims.cols, t.dims.rows);
   replaceAllFurniture(cloneItems(t.items));
   return true;
 }

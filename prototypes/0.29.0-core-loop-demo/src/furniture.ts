@@ -120,7 +120,22 @@ export type FurnitureKind =
   | "birthday-banner"
   | "party-speaker"
   | "dance-floor"
-  | "party-standing-table";
+  | "party-standing-table"
+  // 🏝️ Beach fixtures — the party skill's set, ported to voxel.
+  | "palm-tree"
+  | "parasol"
+  | "sun-lounger"
+  | "surfboard"
+  | "beach-towel"
+  | "beach-ball"
+  | "beach-crate"
+  | "cooler"
+  | "tiki-torch"
+  | "tiki-bar-counter"
+  | "tiki-back-bar"
+  | "tiki-bar-stool"
+  | "pergola-post"
+  | "pergola-roof";
 
 export interface FurnitureItem {
   id: string;
@@ -2434,6 +2449,31 @@ const seatOn = (topY: number): number => +(topY + SIT_CONTACT_DROP).toFixed(3);
  *  built meshes in the running room, not just the source. */
 const SOFT_SEAT_TOP = 0.455;
 
+/** 🛋️ Sun lounger: you LIE on it. faceAngle points at the FEET end (+z), so
+ *  the recline tips the head toward -z — the head end the backrest is at. */
+const sunLoungerSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -0.5, z0: -1.0, x1: 0.5, z1: 1.0 },
+    front: { x: 1.2, z: 0 },
+    sit: { x: 0, z: 0.1 },
+    faceAngle: 0,
+    sitY: 0.47,
+    lie: true,
+  },
+];
+
+/** 🪑 Bar stool: seat top 0.865 to match the 1.28 m counter, and the occupant
+ *  faces -z — the counter side, so guests sit looking INTO the room's bar. */
+const tikiBarStoolSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -0.5, z0: -0.5, x1: 0.5, z1: 0.5 },
+    front: { x: 0, z: 1.0 },
+    sit: { x: 0, z: 0 },
+    faceAngle: Math.PI,
+    sitY: seatOn(0.865),
+  },
+];
+
 const armchairLeftSeats: SeatTemplate[] = [
   {
     clickBox: { x0: -0.5, z0: -0.5, x1: 0.5, z1: 0.5 },
@@ -3177,6 +3217,38 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     build: buildPartyStandingTable,
     footprint: { w: 1, d: 1 },
   },
+  // ── 🏝️ Beach fixtures — footprints and heights are the reference set's ────
+  "palm-tree": { kind: "palm-tree", build: buildPalmTree, footprint: { w: 1, d: 1 } },
+  "parasol": { kind: "parasol", build: buildParasol, footprint: { w: 1, d: 1 } },
+  "sun-lounger": {
+    kind: "sun-lounger",
+    build: buildSunLounger,
+    footprint: { w: 1, d: 2 },
+    seats: sunLoungerSeats,
+  },
+  "surfboard": { kind: "surfboard", build: buildSurfboard, footprint: { w: 1, d: 1 } },
+  "beach-towel": { kind: "beach-towel", build: buildBeachTowel, footprint: null },
+  // A ball you walk past — solid:false in the reference, and an obstacle here
+  // would strand anyone who kicked it into a doorway.
+  "beach-ball": { kind: "beach-ball", build: buildBeachBall, footprint: null },
+  "beach-crate": { kind: "beach-crate", build: buildBeachCrate, footprint: { w: 1, d: 1 } },
+  "cooler": { kind: "cooler", build: buildCooler, footprint: { w: 1, d: 1 } },
+  "tiki-torch": { kind: "tiki-torch", build: buildTikiTorch, footprint: { w: 1, d: 1 } },
+  "tiki-bar-counter": {
+    kind: "tiki-bar-counter",
+    build: buildTikiBarCounter,
+    footprint: { w: 4, d: 1 },
+  },
+  "tiki-back-bar": { kind: "tiki-back-bar", build: buildTikiBackBar, footprint: { w: 3, d: 1 } },
+  "tiki-bar-stool": {
+    kind: "tiki-bar-stool",
+    build: buildTikiBarStool,
+    footprint: { w: 1, d: 1 },
+    seats: tikiBarStoolSeats,
+  },
+  "pergola-post": { kind: "pergola-post", build: buildPergolaPost, footprint: { w: 1, d: 1 } },
+  // Overhead and non-solid: it shades the bar, it does not wall it off.
+  "pergola-roof": { kind: "pergola-roof", build: buildPergolaRoof, footprint: null },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
   // local rot-0 frame (screen faces +z):
@@ -6157,6 +6229,421 @@ function buildSlotMachine({
   for (const mesh of chairMeshes) mesh.userData.skipDeviceHit = true;
 }
 
+
+// ── 🏝️ Beach fixtures ───────────────────────────────────────────────────────
+// A voxel port of the beach set the party skill ships as a canvas-2D reference
+// room. The DRAW CODE does not transfer — that file paints iso diamonds, this
+// engine has a depth buffer — but the inventory, the footprints, the heights
+// and the palette do, and they are what make the room read as that beach. Sizes
+// below are the reference's `size`/`height` verbatim, in tiles and metres.
+//
+// The one substitution: the reference's winding RIVER is terrain, and terrain
+// here is flat. The station's own `lazy-pool` is already a sunken bezier river
+// with a central island, real swimming and infinity edges, so it plays the
+// river's part and these props dress the banks around it.
+
+const BCH_SAND = 0xfbf7ee; // white beach sand
+const BCH_CREAM = 0xfdf3e0;
+const BCH_SKY = 0x8fd3f4; // the bar counter's own colour
+const BCH_CORAL = 0xe8604c;
+const BCH_TEAK = 0xa8683f;
+const BCH_TRUNK = 0xa37a55;
+const BCH_TRUNK_D = 0x6d4d31;
+const BCH_FROND = 0x4fae76;
+const BCH_FROND_D = 0x37905d;
+const BCH_METAL = 0xdfe6e6;
+const BCH_TEAL = 0x4fb8c9;
+const BCH_MINT = 0x7fd1c4;
+
+/** Slats and canopies that should read as airy rather than solid. The reveal
+ *  machinery restores `baseOpacity`, so a translucent part must record it or
+ *  the morph-in snaps it back to fully opaque. */
+function translucent(mat: THREE.MeshStandardMaterial, opacity: number): THREE.MeshStandardMaterial {
+  mat.transparent = true;
+  mat.opacity = opacity;
+  mat.userData.baseOpacity = opacity;
+  return mat;
+}
+
+/**
+ * 🌴 Palm tree — 1×1, 3.2 m. The reference leans its trunk on a quadratic and
+ * fans SEVEN fronds of alternating green at the top; both are what stop a palm
+ * reading as a lamp post, so both are here as a stack of tapered segments and
+ * seven drooping blades.
+ */
+function buildPalmTree({ m, place }: BuildCtx) {
+  const H = 3.0;
+  const SEGS = 7;
+  const LEAN = 0.42; // total horizontal drift of the crown, on a quadratic
+  let prev = new THREE.Vector3(0, 0, 0);
+  for (let i = 1; i <= SEGS; i++) {
+    const t = i / SEGS;
+    const next = new THREE.Vector3(-LEAN * t * t, H * t, 0);
+    const mid = prev.clone().add(next).multiplyScalar(0.5);
+    const len = prev.distanceTo(next);
+    const seg = place(
+      new THREE.CylinderGeometry(0.085 - 0.04 * t, 0.10 - 0.04 * (t - 1 / SEGS), len, 9),
+      m(i % 2 ? BCH_TRUNK : BCH_TRUNK_D, 0.9, 0.02),
+      mid.x,
+      mid.y,
+      mid.z,
+    );
+    seg.rotation.z = Math.atan2(next.x - prev.x, next.y - prev.y) * -1;
+    prev = next;
+  }
+  const cx = -LEAN;
+  const cy = H;
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2 + 0.3;
+    const len = 0.78 + (i % 3) * 0.16;
+    // Each frond is a flattened, tapered blade tilted down from the crown.
+    const blade = place(
+      new THREE.ConeGeometry(0.17, len, 5),
+      m(i % 2 ? BCH_FROND : BCH_FROND_D, 0.88, 0.02),
+      cx + Math.cos(a) * len * 0.42,
+      cy + 0.06 - len * 0.16,
+      Math.sin(a) * len * 0.42,
+    );
+    blade.rotation.order = "YXZ";
+    blade.rotation.y = -a;
+    blade.rotation.z = Math.PI / 2 - 0.42; // droop
+    blade.scale.set(1, 1, 0.28); // flatten into a leaf
+  }
+  for (const [dx, dz, r] of [[0.07, 0.05, 0.055], [-0.05, 0.08, 0.047]] as const) {
+    place(new THREE.SphereGeometry(r, 8, 8), m(BCH_TRUNK_D, 0.9, 0.03), cx + dx, cy - 0.1, dz);
+  }
+}
+
+/**
+ * ⛱️ Parasol — 1×1, 2.4 m. Eight alternating canopy segments; the alternation
+ * is the whole silhouette, so the wedges are real geometry (ConeGeometry takes
+ * a thetaStart/thetaLength) rather than one cone in an averaged colour.
+ */
+function buildParasol({ m, place }: BuildCtx) {
+  place(new THREE.CylinderGeometry(0.035, 0.045, 2.3, 8), m(0x9a7350, 0.8, 0.05), 0, 1.15, 0);
+  const SEGS = 8;
+  for (let i = 0; i < SEGS; i++) {
+    const wedge = place(
+      new THREE.ConeGeometry(1.02, 0.44, 6, 1, false, (i / SEGS) * Math.PI * 2, (Math.PI * 2) / SEGS),
+      m(i % 2 ? BCH_CREAM : BCH_CORAL, 0.85, 0.02),
+      0,
+      2.16,
+      0,
+    );
+    wedge.castShadow = false;
+  }
+  // Ribs peeking past the hem, and the finial.
+  for (let i = 0; i < SEGS; i++) {
+    const a = ((i + 0.5) / SEGS) * Math.PI * 2;
+    place(
+      new THREE.BoxGeometry(0.02, 0.02, 0.1),
+      m(0x9a7350, 0.8, 0.05),
+      Math.cos(a) * 1.0,
+      1.96,
+      Math.sin(a) * 1.0,
+    );
+  }
+  place(new THREE.SphereGeometry(0.055, 8, 8), m(BCH_CORAL, 0.7, 0.05), 0, 2.42, 0);
+}
+
+/**
+ * 🛋️ Sun lounger — 1×2, 0.5 m, and you LIE on it. Striped mattress (five bands,
+ * cream against mint) and a raked backrest, both from the reference.
+ */
+function buildSunLounger({ m, place }: BuildCtx) {
+  place(new THREE.BoxGeometry(0.76, 0.3, 1.76), m(0xcfc0a6, 0.85, 0.04), 0, 0.15, 0);
+  place(new THREE.BoxGeometry(0.84, 0.1, 1.84), m(BCH_CREAM, 0.8, 0.03), 0, 0.35, 0);
+  const N = 5;
+  for (let i = 0; i < N; i++) {
+    const z = -0.78 + (i + 0.5) * (1.56 / N);
+    place(
+      new THREE.BoxGeometry(0.72, 0.07, 1.56 / N - 0.03),
+      m(i % 2 ? BCH_CREAM : BCH_MINT, 0.9, 0.02),
+      0,
+      0.435,
+      z,
+    );
+  }
+  // Raked backrest at the -z (head) end.
+  const back = place(new THREE.BoxGeometry(0.72, 0.62, 0.08), m(0xefe3d0, 0.85, 0.03), 0, 0.66, -0.82);
+  back.rotation.x = -0.42;
+  // Chrome feet.
+  for (const fx of [-0.3, 0.3]) {
+    for (const fz of [-0.7, 0.7]) {
+      place(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 6), m(BCH_METAL, 0.4, 0.6), fx, 0.07, fz);
+    }
+  }
+}
+
+/** 🏖️ Beach towel — 1×1 and NOT solid: it lies ON the sand and people walk
+ *  over it. Striped, with one corner turned up so it reads as cloth. */
+function buildBeachTowel({ m, place }: BuildCtx) {
+  const W = 0.86;
+  const D = 1.3;
+  const N = 6;
+  for (let i = 0; i < N; i++) {
+    place(
+      new THREE.BoxGeometry(W, 0.022, D / N - 0.01),
+      m(i % 2 ? BCH_CORAL : BCH_SAND, 0.95, 0.0),
+      0,
+      0.012,
+      -D / 2 + (i + 0.5) * (D / N),
+    );
+  }
+  const corner = place(new THREE.BoxGeometry(0.3, 0.02, 0.3), m(BCH_SAND, 0.95, 0.0), W / 2 - 0.15, 0.05, D / 2 - 0.15);
+  corner.rotation.x = -0.5;
+  corner.rotation.z = 0.3;
+}
+
+/** 🏄 Surfboard — 1×1, 2.1 m, stood on its tail against the sand. */
+function buildSurfboard({ m, place }: BuildCtx) {
+  const body = place(new THREE.CylinderGeometry(0.26, 0.20, 1.7, 12), m(BCH_CREAM, 0.6, 0.08), 0, 1.0, 0);
+  body.scale.set(1, 1, 0.26);
+  const nose = place(new THREE.ConeGeometry(0.26, 0.42, 12), m(BCH_CREAM, 0.6, 0.08), 0, 2.06, 0);
+  nose.scale.set(1, 1, 0.26);
+  const tail = place(new THREE.ConeGeometry(0.20, 0.22, 12), m(BCH_CREAM, 0.6, 0.08), 0, 0.04, 0);
+  tail.scale.set(1, 1, 0.26);
+  tail.rotation.x = Math.PI;
+  // The stripe down the deck — one band of colour is what makes it a surfboard.
+  const stripe = place(new THREE.BoxGeometry(0.1, 1.9, 0.015), m(BCH_CORAL, 0.55, 0.1), 0, 1.05, 0.035);
+  stripe.rotation.x = 0;
+  // A slight lean, as if propped.
+  for (const mesh of [body, nose, tail, stripe]) mesh.rotation.z += 0.09;
+}
+
+/** 🏐 Beach ball — 1×1, 0.4 m, NOT solid: it is a thing you walk past, and a
+ *  ball that blocks a tile is a bug report. Six alternating panels. */
+function buildBeachBall({ m, place }: BuildCtx) {
+  const R = 0.2;
+  const PANELS = 6;
+  const cols = [BCH_CORAL, BCH_CREAM, BCH_SKY, BCH_CREAM, 0xf2c14e, BCH_CREAM] as const;
+  for (let i = 0; i < PANELS; i++) {
+    place(
+      new THREE.SphereGeometry(R, 8, 10, (i / PANELS) * Math.PI * 2, (Math.PI * 2) / PANELS),
+      m(cols[i], 0.5, 0.06),
+      0,
+      R,
+      0,
+    );
+  }
+}
+
+/** 📦 Crate — 1×1, 0.7 m, stackable. Four posts and slats, not a solid cube. */
+function buildBeachCrate({ m, place }: BuildCtx) {
+  const W = 0.74;
+  const H = 0.66;
+  for (const px of [-W / 2 + 0.05, W / 2 - 0.05]) {
+    for (const pz of [-W / 2 + 0.05, W / 2 - 0.05]) {
+      place(new THREE.BoxGeometry(0.1, H, 0.1), m(BCH_TEAK, 0.9, 0.03), px, H / 2, pz);
+    }
+  }
+  for (const y of [0.1, 0.33, 0.58]) {
+    place(new THREE.BoxGeometry(W, 0.1, W - 0.12), m(0x8a4f2d, 0.9, 0.03), 0, y, 0);
+    place(new THREE.BoxGeometry(W - 0.12, 0.1, W), m(0x8a4f2d, 0.9, 0.03), 0, y, 0);
+  }
+  place(new THREE.BoxGeometry(W, 0.05, W), m(BCH_TEAK, 0.9, 0.03), 0, H, 0);
+}
+
+/** 🧊 Cooler — 1×1, 0.55 m. White body, teal lid, a wire handle. */
+function buildCooler({ m, place }: BuildCtx) {
+  place(new THREE.BoxGeometry(0.72, 0.42, 0.72), m(0xf2f6f6, 0.6, 0.06), 0, 0.21, 0);
+  place(new THREE.BoxGeometry(0.8, 0.12, 0.8), m(BCH_TEAL, 0.55, 0.1), 0, 0.48, 0);
+  const handle = place(new THREE.TorusGeometry(0.11, 0.016, 6, 14, Math.PI), m(0x2c8496, 0.5, 0.3), 0, 0.54, 0);
+  handle.rotation.y = Math.PI / 2;
+}
+
+/**
+ * 🔥 Tiki torch — 1×1, 1.9 m. The checklist calls torch flicker the LAST
+ * ambience to add, so the flame here is steady-lit geometry plus one small warm
+ * light: the read without the frame cost.
+ */
+function buildTikiTorch({ m, place, addLight }: BuildCtx) {
+  place(new THREE.CylinderGeometry(0.045, 0.06, 1.6, 8), m(BCH_TRUNK_D, 0.92, 0.02), 0, 0.8, 0);
+  // Bamboo nodes.
+  for (const y of [0.42, 0.86, 1.3]) {
+    place(new THREE.CylinderGeometry(0.055, 0.055, 0.045, 8), m(0x4b3a24, 0.9, 0.03), 0, y, 0);
+  }
+  place(new THREE.CylinderGeometry(0.13, 0.09, 0.14, 10), m(0x4b3a24, 0.85, 0.05), 0, 1.66, 0);
+  place(new THREE.ConeGeometry(0.075, 0.24, 8), m(0xff8a3d, 0.3, 0.0, 0xff8a3d, 2.0), 0, 1.85, 0);
+  place(new THREE.ConeGeometry(0.042, 0.15, 8), m(0xffd166, 0.3, 0.0, 0xffd166, 2.6), 0, 1.83, 0);
+  addLight(new THREE.PointLight(0xffbe5a, 0, 2.4), 0, 1.9, 0, 0.55);
+}
+
+/**
+ * 🍹 Tiki bar counter — 4×1, 1.28 m. Deliberately TALL: chest height on an
+ * avatar reads as a real bar, waist height reads as a desk. Its own sky-blue
+ * body, a cream top that overhangs by 0.1, and the LED strip under the lip on
+ * the customer side (local +z) that sells the whole prop.
+ */
+function buildTikiBarCounter({ m, place }: BuildCtx) {
+  const L = 3.8;
+  const H = 1.18;
+  place(new THREE.BoxGeometry(L, H, 0.8), m(BCH_SKY, 0.7, 0.08), 0, H / 2, 0);
+  place(new THREE.BoxGeometry(L + 0.2, 0.1, 1.0), m(BCH_CREAM, 0.5, 0.12), 0, H + 0.05, 0);
+  // LED strip under the overhang, customer side.
+  place(
+    new THREE.BoxGeometry(L - 0.1, 0.022, 0.02),
+    m(0xe6faff, 0.2, 0.0, 0xe6faff, 2.4),
+    0,
+    H - 0.035,
+    0.42,
+  );
+  // A bamboo skirt, so the sky-blue slab reads as a beach bar.
+  for (let i = 0; i < 14; i++) {
+    place(
+      new THREE.CylinderGeometry(0.038, 0.038, H - 0.06, 6),
+      m(i % 3 ? BCH_TRUNK : BCH_TRUNK_D, 0.9, 0.02),
+      -L / 2 + 0.16 + i * ((L - 0.32) / 13),
+      (H - 0.06) / 2,
+      0.41,
+    );
+  }
+}
+
+/**
+ * 🍾 Back bar — 3×1, 2.3 m: the tallest thing in the bar and its focal point.
+ * Low white cabinet, a backlit panel standing on it, two glass shelves of
+ * bottles, and a neon sign on top. It goes against the BACK edge, behind the
+ * bartender row — never mirrored in front of the counter.
+ */
+function buildTikiBackBar({ m, place, addLight }: BuildCtx) {
+  const L = 2.8;
+  place(new THREE.BoxGeometry(L, 0.9, 0.5), m(BCH_CREAM, 0.6, 0.08), 0, 0.45, 0);
+  // Backlit panel.
+  place(
+    new THREE.BoxGeometry(L - 0.24, 1.3, 0.08),
+    m(0xa0e1fa, 0.35, 0.05, 0x79c4e6, 1.1),
+    0,
+    1.55,
+    -0.18,
+  );
+  // Two glass shelves with bottles.
+  const BOTTLE = [0x7fd1c4, 0xe8604c, 0xf2c14e, 0x9a7bd0, 0x6fbf6b, 0xe88fb0, 0x4fb8c9] as const;
+  for (const [y, n] of [[1.22, 6], [1.72, 5]] as const) {
+    place(
+      new THREE.BoxGeometry(L - 0.3, 0.03, 0.28),
+      translucent(m(0xdcf0f7, 0.25, 0.3), 0.55),
+      0,
+      y,
+      -0.02,
+    );
+    for (let i = 0; i < n; i++) {
+      const bx = -(L - 0.5) / 2 + i * ((L - 0.5) / (n - 1));
+      const h = 0.2 + (i % 3) * 0.06;
+      place(new THREE.CylinderGeometry(0.04, 0.045, h, 8), m(BOTTLE[i % BOTTLE.length], 0.4, 0.15), bx, y + 0.02 + h / 2, -0.02);
+      place(new THREE.CylinderGeometry(0.014, 0.014, 0.07, 6), m(BOTTLE[i % BOTTLE.length], 0.4, 0.15), bx, y + 0.02 + h + 0.035, -0.02);
+    }
+  }
+  // Neon "BAR" — a CanvasTexture plate, the wall-computer screen idiom.
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 96;
+  const c2d = canvas.getContext("2d");
+  if (c2d) {
+    c2d.clearRect(0, 0, 256, 96);
+    c2d.font = "bold 58px ui-monospace, Menlo, monospace";
+    c2d.textAlign = "center";
+    c2d.textBaseline = "middle";
+    c2d.shadowColor = "#ff5fa2";
+    c2d.shadowBlur = 22;
+    c2d.fillStyle = "#ff8fc4";
+    c2d.fillText("B A R", 128, 52);
+    c2d.fillText("B A R", 128, 52);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  const sign = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.1, 0.41),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true }),
+  );
+  sign.position.set(0, 2.32, -0.13);
+  sign.userData.baseOpacity = 1;
+  place(new THREE.BoxGeometry(1.2, 0.05, 0.06), m(0x23252e, 0.8, 0.2), 0, 2.08, -0.13);
+  (place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(BCH_CREAM, 1, 0), 0, 0, 0)).add(sign);
+  addLight(new THREE.PointLight(0xff8fc4, 0, 2.2), 0, 2.3, 0.1, 0.35);
+}
+
+/** 🪑 Bar stool — 1×1, 0.82 m. Seat height matches the TALLER counter; a
+ *  chair-height stool at a 1.28 m bar looks like a mistake. */
+function buildTikiBarStool({ m, place }: BuildCtx) {
+  place(new THREE.CylinderGeometry(0.22, 0.24, 0.03, 14), m(0xb9c4c4, 0.4, 0.6), 0, 0.015, 0);
+  place(new THREE.CylinderGeometry(0.05, 0.05, 0.78, 10), m(BCH_METAL, 0.35, 0.65), 0, 0.39, 0);
+  place(new THREE.TorusGeometry(0.16, 0.014, 6, 16), m(BCH_METAL, 0.35, 0.65), 0, 0.2, 0).rotation.x = Math.PI / 2;
+  place(new THREE.CylinderGeometry(0.21, 0.19, 0.04, 16), m(0xb64b3a, 0.7, 0.05), 0, 0.80, 0);
+  place(new THREE.CylinderGeometry(0.22, 0.22, 0.06, 16), m(BCH_CORAL, 0.75, 0.04), 0, 0.835, 0);
+}
+
+/** 🏛 Pergola post — 1×1, 3.0 m. Four of these at the deck corners carry the
+ *  roof; the tiles BETWEEN them stay free. */
+function buildPergolaPost({ m, place }: BuildCtx) {
+  place(new THREE.BoxGeometry(0.14, 3.0, 0.14), m(BCH_TEAK, 0.88, 0.03), 0, 1.5, 0);
+  place(new THREE.BoxGeometry(0.24, 0.08, 0.24), m(0x6d3c21, 0.9, 0.03), 0, 0.04, 0);
+  place(new THREE.BoxGeometry(0.22, 0.08, 0.22), m(0x6d3c21, 0.9, 0.03), 0, 2.96, 0);
+}
+
+/**
+ * ✨ Pergola roof — 7×4, 3.2 m, OVERHEAD and non-solid. Airy slats (40% alpha,
+ * so the back bar and anyone under it stay readable), five strands of fairy
+ * lights, and five paper lanterns at different heights. The checklist is blunt
+ * about this one: the lights are what make the bar feel like an evening party
+ * rather than a kiosk, so they are not optional dressing.
+ */
+function buildPergolaRoof({ m, place, addLight }: BuildCtx) {
+  const W = 6.6;
+  const D = 3.6;
+  const Y = 3.06;
+  // Beams along the long axis, then slats across.
+  for (const z of [-D / 2 + 0.1, 0, D / 2 - 0.1]) {
+    place(new THREE.BoxGeometry(W, 0.14, 0.16), m(BCH_TEAK, 0.88, 0.03), 0, Y + 0.09, z);
+  }
+  const SLATS = 17;
+  for (let i = 0; i < SLATS; i++) {
+    place(
+      new THREE.BoxGeometry(0.1, 0.07, D),
+      translucent(m(0x8a4f2d, 0.9, 0.03), 0.4),
+      -W / 2 + 0.2 + i * ((W - 0.4) / (SLATS - 1)),
+      Y,
+      0,
+    );
+  }
+  // Fairy lights: two strands along the beams, two diagonals, one across the
+  // middle. Bulbs alternate warm white / blush / gold and hang slightly.
+  const BULB = [0xfff2d6, 0xffc9de, 0xffd98a] as const;
+  const strand = (x0: number, z0: number, x1: number, z1: number, n: number, seed: number) => {
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      const sag = 0.1 * Math.sin(t * Math.PI);
+      const col = BULB[(i + seed) % BULB.length];
+      place(
+        new THREE.SphereGeometry(0.032, 7, 7),
+        m(col, 0.25, 0.0, col, 1.9),
+        x0 + (x1 - x0) * t,
+        Y - 0.12 - sag,
+        z0 + (z1 - z0) * t,
+      );
+    }
+  };
+  strand(-W / 2 + 0.3, -D / 2 + 0.3, W / 2 - 0.3, -D / 2 + 0.3, 11, 0);
+  strand(-W / 2 + 0.3, D / 2 - 0.3, W / 2 - 0.3, D / 2 - 0.3, 11, 1);
+  strand(-W / 2 + 0.3, -D / 2 + 0.3, W / 2 - 0.3, D / 2 - 0.3, 13, 2);
+  strand(-W / 2 + 0.3, D / 2 - 0.3, W / 2 - 0.3, -D / 2 + 0.3, 13, 1);
+  strand(-W / 2 + 0.3, 0, W / 2 - 0.3, 0, 11, 0);
+  // Paper lanterns — pastel, at different heights, each with its own glow.
+  const LANTERN = [0xffc2d8, 0xd7bdf2, 0xffe08a, 0xa8ebd8, 0xffcfa8] as const;
+  const at = [-2.4, -1.1, 0.3, 1.6, 2.7];
+  at.forEach((lx, i) => {
+    const drop = 0.26 + (i % 3) * 0.14;
+    place(new THREE.CylinderGeometry(0.004, 0.004, drop, 4), m(0x8a4f2d, 0.9, 0.0), lx, Y - drop / 2, (i % 2 ? 0.7 : -0.7));
+    const ball = place(
+      new THREE.SphereGeometry(0.19, 12, 10),
+      m(LANTERN[i], 0.55, 0.0, LANTERN[i], 0.9),
+      lx,
+      Y - drop - 0.17,
+      i % 2 ? 0.7 : -0.7,
+    );
+    ball.scale.set(1, 0.84, 1);
+  });
+  addLight(new THREE.PointLight(0xffd9a8, 0, 7.0), 0, Y - 0.6, 0, 0.55);
+}
 
 // ── 🎉 Party fixtures ────────────────────────────────────────────────────────
 // The cake, the gifts, the banner, the speaker and the dance floor. Everything

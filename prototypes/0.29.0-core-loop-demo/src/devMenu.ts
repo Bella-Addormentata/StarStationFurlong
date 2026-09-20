@@ -114,6 +114,20 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'party-speaker': '🔊 PARTY SPEAKER',
   'dance-floor': '💃 DANCE FLOOR',
   'party-standing-table': '🍸 STANDING TABLE',
+  'palm-tree': '🌴 PALM TREE',
+  'parasol': '⛱️ PARASOL',
+  'sun-lounger': '🛋️ SUN LOUNGER',
+  'surfboard': '🏄 SURFBOARD',
+  'beach-towel': '🏖️ BEACH TOWEL',
+  'beach-ball': '🏐 BEACH BALL',
+  'beach-crate': '📦 CRATE',
+  'cooler': '🧊 COOLER',
+  'tiki-torch': '🔥 TIKI TORCH',
+  'tiki-bar-counter': '🍹 TIKI BAR COUNTER',
+  'tiki-back-bar': '🍾 BACK BAR',
+  'tiki-bar-stool': '🪑 BAR STOOL',
+  'pergola-post': '🏛 PERGOLA POST',
+  'pergola-roof': '✨ PERGOLA ROOF (LANTERNS)',
 };
 
 type GetWorld = () => World | null;
