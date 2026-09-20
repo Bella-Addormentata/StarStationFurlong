@@ -6298,6 +6298,8 @@ function buildSlotMachine({
  * actually comes from, since you see the bed THROUGH the water.
  */
 const RIVER_K = 0.38; // how tightly the centre line wanders — re-tunable
+/** How far short of each wall the river stops (see riverMetrics). */
+const RIVER_END_LIP = 0.35;
 const RIVER_PHASE = 0.6;
 
 /**
@@ -6323,7 +6325,13 @@ function riverMetrics(): {
   const { halfX, halfZ } = roomHalfExtents();
   const wWater = Math.min(2.6, Math.max(1.2, halfZ * 0.185));
   return {
-    halfLen: halfX,
+    // Stops RIVER_END_LIP short of each wall — for EVERYTHING, not just the
+    // floor cut. The platform has no skirt below floor level, so any terrace
+    // that ran on to ±halfX poked out past the floor's edge, visible from
+    // outside as a stack of teal steps; and a cut reaching the boundary is not
+    // a hole to the triangulator (see poolHoleOutline). Both fixed by one
+    // number; the lip reads as the bank meeting the wall, inside WALL_CLEARANCE.
+    halfLen: halfX - RIVER_END_LIP,
     amp: Math.min(1.8, halfZ * 0.13),
     wWet: wWater * 1.31, // the reference's 3.4 / 2.6
     wWater,
@@ -8792,6 +8800,11 @@ export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: n
   if (pool.kind === "beach-river") {
     // Down one bank and back along the other — the same centre line the water
     // ribbon is built from, so the cut edge and the water edge coincide.
+    // ⚠️ The hole must stay STRICTLY INSIDE the floor's outer ring: a hole
+    // touching the outer edge is not a hole to the triangulator
+    // (ShapeGeometry/earcut) — the floor comes back as bridging triangles that
+    // tilt down into the basin, a steep slope where there should be flat sand.
+    // riverMetrics().halfLen already stops RIVER_END_LIP short of the walls.
     const rm = riverMetrics();
     const ring: Array<{ x: number; z: number }> = [];
     for (let i = 0; i <= RIVER_SEGS; i++) {

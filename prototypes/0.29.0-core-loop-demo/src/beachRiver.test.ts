@@ -18,6 +18,7 @@ import {
   isPoolKind,
   poolCutContains,
   poolHoleCells,
+  poolHoleOutline,
   poolHoleRect,
   poolWaterContains,
   type FurnitureItem,
@@ -83,6 +84,7 @@ describe('the water band', () => {
   });
 
   it('ends at its own length', () => {
+    expect(poolWaterContains([RIVER], 14.9, centreZ(14.9))).toBe(false); // the wall lip
     expect(poolWaterContains([RIVER], 16, centreZ(16))).toBe(false);
     expect(poolWaterContains([RIVER], -16, centreZ(-16))).toBe(false);
   });
@@ -208,6 +210,18 @@ describe('the floor hole', () => {
   });
 });
 
+
+describe('the floor cut', () => {
+  it('stays strictly inside the floor — a hole touching the edge triangulates as a slope', () => {
+    const ring = poolHoleOutline([RIVER])!;
+    const xs = ring.map((p) => p.x);
+    expect(Math.min(...xs)).toBeGreaterThan(-15);
+    expect(Math.max(...xs)).toBeLessThan(15);
+    // …and it still runs to just inside the wall (the 0.35 m lip).
+    expect(poolWaterContains([RIVER], 14.5, centreZ(14.5))).toBe(true);
+    expect(poolWaterContains([RIVER], 14.9, centreZ(14.9))).toBe(false);
+  });
+});
 
 describe('it sizes itself to the room', () => {
   // A 30 m channel authored for a 5×5 module hangs out through the walls of a
