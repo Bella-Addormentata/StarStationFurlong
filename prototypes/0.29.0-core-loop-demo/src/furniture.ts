@@ -6837,8 +6837,9 @@ function buildTikiParasol({ m, place }: BuildCtx) {
 /**
  * 🌿 Jungle plant — the TALL, dark clump of tropical fronds the reference
  * build lines both back walls with until the beach is fenced in by greenery.
- * 1×1 and ~3.4 m: it has to tower over the parasols (2.4) the way it does in
- * the video, or the hedge reads as shrubbery. A bundle of stems rises from a
+ * 1×1 and 5.4 m (owner spec): it towers over the parasols (2.4) AND the room's
+ * walls, the way the video's does — under the beach theme's open sky that is
+ * the point; the hedge is the horizon. A bundle of stems rises from a
  * low knot, a skirt of long blades droops from waist height, and a crown of
  * blades fans out at the top — two greens, and a per-instance twist so a row
  * is not a row of clones. No trunk: it is a plant, not a tree.
@@ -6847,22 +6848,23 @@ function buildJunglePlant({ m, place, itemId }: BuildCtx) {
   const LEAF = 0x1f5e33;
   const LEAF_L = 0x2e7d45;
   const STEM = 0x3d5a2a;
-  const H = 3.4;
+  const H = 5.4;
+  const S = H / 3.4; // blades and stems scale with the height
   const twist = idHash01(itemId) * Math.PI * 2;
   const blade = (x: number, y: number, z: number, len: number, yaw: number, tilt: number, col: number) => {
-    const b = place(new THREE.ConeGeometry(0.17, len, 5), m(col, 0.9, 0.0), x, y, z);
+    const b = place(new THREE.ConeGeometry(0.17 * S, len, 5), m(col, 0.9, 0.0), x, y, z);
     b.rotation.order = "YXZ";
     b.rotation.y = -yaw;
     b.rotation.z = -tilt; // tip leans outward and down, base at the stem
     b.scale.set(1, 1, 0.22);
   };
   // Knot + a bundle of stems rising to the crown.
-  place(new THREE.CylinderGeometry(0.2, 0.26, 0.3, 8), m(STEM, 0.95, 0.0), 0, 0.15, 0);
+  place(new THREE.CylinderGeometry(0.2 * S, 0.26 * S, 0.3, 8), m(STEM, 0.95, 0.0), 0, 0.15, 0);
   for (let k = 0; k < 5; k++) {
     const a = twist + (k / 5) * Math.PI * 2;
     const lean = 0.06 + (k % 2) * 0.04;
     const stem = place(
-      new THREE.CylinderGeometry(0.035, 0.06, H * 0.78, 6),
+      new THREE.CylinderGeometry(0.035 * S, 0.06 * S, H * 0.78, 6),
       m(STEM, 0.9, 0.0),
       Math.cos(a) * 0.09 + Math.cos(a) * lean * 2,
       H * 0.39,
@@ -6875,7 +6877,7 @@ function buildJunglePlant({ m, place, itemId }: BuildCtx) {
   // Waist skirt: long blades drooping outward from about a third of the way up.
   for (let i = 0; i < 9; i++) {
     const a = twist + 0.3 + (i / 9) * Math.PI * 2;
-    const len = 1.6 + (i % 3) * 0.2;
+    const len = (1.6 + (i % 3) * 0.2) * S;
     const tilt = 1.05 + (i % 2) * 0.15; // well past horizontal — they hang
     const y0 = H * 0.36;
     blade(Math.cos(a) * Math.sin(tilt) * len * 0.42, y0 + Math.cos(tilt) * len * 0.42, Math.sin(a) * Math.sin(tilt) * len * 0.42, len, a, tilt, i % 2 ? LEAF : LEAF_L);
@@ -6883,7 +6885,7 @@ function buildJunglePlant({ m, place, itemId }: BuildCtx) {
   // Mid tier, a little higher and less droop.
   for (let i = 0; i < 8; i++) {
     const a = twist + 0.7 + (i / 8) * Math.PI * 2;
-    const len = 1.5 + (i % 2) * 0.25;
+    const len = (1.5 + (i % 2) * 0.25) * S;
     const tilt = 0.72;
     const y0 = H * 0.62;
     blade(Math.cos(a) * Math.sin(tilt) * len * 0.45, y0 + Math.cos(tilt) * len * 0.45, Math.sin(a) * Math.sin(tilt) * len * 0.45, len, a, tilt, i % 2 ? LEAF_L : LEAF);
@@ -6891,14 +6893,15 @@ function buildJunglePlant({ m, place, itemId }: BuildCtx) {
   // Crown: blades fanning up and out from the top of the stems.
   for (let i = 0; i < 10; i++) {
     const a = twist + (i / 10) * Math.PI * 2;
-    const len = 1.3 + (i % 3) * 0.2;
+    const len = (1.3 + (i % 3) * 0.2) * S;
     const tilt = 0.35 + (i % 2) * 0.2;
     const y0 = H * 0.78;
     blade(Math.cos(a) * Math.sin(tilt) * len * 0.45, y0 + Math.cos(tilt) * len * 0.45, Math.sin(a) * Math.sin(tilt) * len * 0.45, len, a, tilt, i % 2 ? LEAF : LEAF_L);
   }
   // Three spears straight up out of the crown — the silhouette's peak.
-  for (const [dx, dz, h] of [[0, 0, 1.0], [0.1, -0.05, 0.8], [-0.08, 0.08, 0.7]] as const) {
-    const spear = place(new THREE.ConeGeometry(0.12, h, 5), m(LEAF, 0.9, 0.0), dx, H * 0.78 + h / 2, dz);
+  for (const [dx, dz, h0] of [[0, 0, 1.0], [0.1, -0.05, 0.8], [-0.08, 0.08, 0.7]] as const) {
+    const h = h0 * S;
+    const spear = place(new THREE.ConeGeometry(0.12 * S, h, 5), m(LEAF, 0.9, 0.0), dx, H * 0.78 + h / 2, dz);
     spear.scale.set(1, 1, 0.3);
     spear.rotation.y = twist;
   }

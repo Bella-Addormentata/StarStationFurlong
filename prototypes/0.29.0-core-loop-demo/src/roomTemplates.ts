@@ -99,8 +99,9 @@ interface PlacementSpec {
   /** Rigid group: if any member fails to place, the whole group is dropped.
    *  A pergola roof with two of its four posts is not a pergola. */
   group?: string;
-  /** Stands AGAINST the wall (a hedge): its box may touch the wall line, and
-   *  it is never nudged toward the centre — off the wall it is not a hedge. */
+  /** Stands AGAINST the wall (a hedge): its box may run into the wall line
+   *  (the part beyond it is inside the wall, harmless), and it is never
+   *  nudged toward the centre — off the wall it is not a hedge. */
   hugWall?: boolean;
 }
 
@@ -168,7 +169,7 @@ function placeFitting(
         break;
       }
       if (boxes.length > 0) {
-        const margin = spec.hugWall ? -0.01 : MARGIN;
+        const margin = spec.hugWall ? -0.6 : MARGIN;
         const outside =
           !spec.spanning &&
           boxes.some(
@@ -295,7 +296,7 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
   const clearOfDoors = (x: number, z: number) =>
     doors.every((d) => Math.hypot(d.x - x, d.z - z) >= 1.6);
   const hedge: PlacementSpec[] = [];
-  const inset = 0.5;
+  const inset = 0.28; // stems right up against the wall (owner spec), fronds into it
   for (let x = -halfX + inset; x < halfX; x += 1) {
     if (clearOfDoors(x, -halfZ + inset)) hedge.push({ kind: "jungle-plant", at: [x / halfX, (-halfZ + inset) / halfZ], hugWall: true });
   }
