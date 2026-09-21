@@ -214,10 +214,9 @@ function placeFitting(
 function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem[] {
   const { halfX, halfZ } = half;
   const specs: PlacementSpec[] = [
-    // 🌊 First, because everything else has to avoid it. It spans the room by
-    // design and sizes itself from the room (furniture.ts riverMetrics).
-    { kind: "beach-river", at: [0, 0.45], spanning: true },
-    { kind: "plank-bridge", at: [0.36, 0.45], spanning: true },
+    // (No river. Owner ruling 2026-09-21: it never looked right inside a room.
+    // The kinds stay in the registry for the dev menu; the SET puts sand,
+    // loungers and parasols along the front instead.)
 
     // 🎂 The anchor and its cluster, along the back.
     // Right of centre along the back, clear of the bar's shelf in the corner.
@@ -244,19 +243,20 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     { kind: "tiki-bar-stool", at: [-1, -1], off: [4.6, 4.4] },
     { kind: "tiki-bar-stool", at: [-1, -1], off: [6.1, 4.4] },
 
-    // 🌴 The banks. Tall things at the back, in odd groups with gaps.
-    { kind: "palm-tree", at: [-0.84, 0.1] },
-    { kind: "palm-tree", at: [0.86, 0.06] },
+    // 🏖️ THE BEACH — the whole front of the room: loungers under parasols in
+    // two small groups, palms at the sides where they frame rather than
+    // occlude, and the middle still left for the crowd.
+    { kind: "sun-lounger", at: [-0.5, 0.62] },
+    { kind: "parasol", at: [-0.3, 0.52] },
+    { kind: "sun-lounger", at: [0.48, 0.64] },
+    { kind: "parasol", at: [0.66, 0.5] },
+    { kind: "palm-tree", at: [-0.86, 0.3] },
+    { kind: "palm-tree", at: [0.86, 0.26] },
     { kind: "palm-tree", at: [-0.88, -0.44] },
     { kind: "tiki-torch", at: [-0.2, -0.66] },
     { kind: "tiki-torch", at: [-0.9, -0.66] },
-
-    // 🏝️ The far bank — the reason the bridge is worth walking.
-    { kind: "palm-tree", at: [-0.5, 0.9] },
+    { kind: "sun-lounger", at: [-0.14, 0.86] },
     { kind: "palm-tree", at: [0.74, 0.88] },
-    { kind: "sun-lounger", at: [-0.28, 0.9] },
-    { kind: "parasol", at: [-0.14, 0.88] },
-    { kind: "sun-lounger", at: [0.58, 0.9] },
 
     // Everything past here is expansion — it lands only if there is room.
     { kind: "party-standing-table", at: [-0.34, -0.3] },
@@ -271,11 +271,11 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     { kind: "pergola-post", at: [-1, -1], off: [7.9, 5.3], group: "pergola" },
     { kind: "pergola-roof", at: [-1, -1], off: [4.6, 3.5], group: "pergola" },
     { kind: "gift-box", at: [0.86, -0.72] },
-    { kind: "surfboard", at: [-0.94, 0.3] },
-    { kind: "beach-ball", at: [-0.42, 0.14] },
-    { kind: "beach-ball", at: [0.3, 0.9] },
-    { kind: "beach-towel", at: [0.1, 0.92] },
-    { kind: "beach-towel", at: [-0.72, 0.9] },
+    { kind: "surfboard", at: [-0.94, 0.62] },
+    { kind: "beach-ball", at: [-0.42, 0.3] },
+    { kind: "beach-ball", at: [0.3, 0.86] },
+    { kind: "beach-towel", at: [0.1, 0.72] },
+    { kind: "beach-towel", at: [-0.72, 0.86] },
   ];
   return placeFitting(specs, halfX, halfZ, "beach");
 }
@@ -447,7 +447,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     category: "party",
     name: "Beach Birthday Party",
     description:
-      "A winding river across the front with a plank bridge to the far bank, palms along both banks, a tiki bar under a lantern-strung pergola, cake and gifts along the back, a lit dance floor — and an empty middle.",
+      "Loungers and parasols along the front, palms at the sides, a tiki bar under a lantern-strung pergola in the far corner, cake and gifts along the back, a lit dance floor — and an empty middle.",
     // PLACE and ADD share one source: the fitted layout, here at the DEFAULT
     // 2×2 envelope every room is born with. A hand-authored 5×5 list lived
     // here before and put every piece outside the walls of a real room.
