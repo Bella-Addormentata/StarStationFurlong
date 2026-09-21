@@ -152,7 +152,10 @@ function placeFitting(
         kind: spec.kind,
         pos: { x: +x.toFixed(2), z: +z.toFixed(2) },
         rot: spec.rot ?? 0,
-        movable: !spec.spanning,
+        // Everything a set puts in a room is the owner's to move or stow —
+        // the river and its bridge included, the same ruling that made the
+        // pool movable (furnitureDoc MOVABLE_KIND_OVERRIDE, 2026-07-20).
+        movable: true,
       };
       const boxes = buildObstacleList([item]);
       if (spec.spanning) {
