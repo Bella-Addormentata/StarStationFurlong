@@ -42,8 +42,11 @@ const BRIDGE: FurnitureItem = {
 };
 
 // The centre line the builder, the hole cutter and the strips all share. At
-// 5×5 the amplitude clamps to its maximum 1.8 and the water to 2.6.
+// 5×5 the amplitude clamps to its maximum 1.8, the water to 2.0 and the
+// excavation (wet shelf) to 2.7.
 const AMP = 1.8;
+const W_WATER = 2.0;
+const W_WET = 2.7;
 const centreZ = (x: number): number => 7.0 + AMP * Math.sin(0.38 * x + 0.6);
 
 const blockedBy = (boxes: Array<{ x0: number; z0: number; x1: number; z1: number }>) =>
@@ -64,10 +67,10 @@ describe('the water band', () => {
 
   it('stops at the bank, not at a straight line', () => {
     for (let x = -14; x <= 14; x += 2) {
-      expect(poolWaterContains([RIVER], x, centreZ(x) - 2.4)).toBe(true);
-      expect(poolWaterContains([RIVER], x, centreZ(x) + 2.4)).toBe(true);
-      expect(poolWaterContains([RIVER], x, centreZ(x) - 3.0)).toBe(false);
-      expect(poolWaterContains([RIVER], x, centreZ(x) + 3.0)).toBe(false);
+      expect(poolWaterContains([RIVER], x, centreZ(x) - (W_WATER - 0.1))).toBe(true);
+      expect(poolWaterContains([RIVER], x, centreZ(x) + (W_WATER - 0.1))).toBe(true);
+      expect(poolWaterContains([RIVER], x, centreZ(x) - (W_WATER + 0.2))).toBe(false);
+      expect(poolWaterContains([RIVER], x, centreZ(x) + (W_WATER + 0.2))).toBe(false);
     }
   });
 
@@ -78,7 +81,7 @@ describe('the water band', () => {
     // look is the OUTER edge of the widest bend.
     const xFar = 2.554; // where the centre line reaches its maximum
     const xNear = -1.58; // a quarter-period back, at its mean
-    const z = centreZ(xFar) + 2.4; // just inside the far bank there…
+    const z = centreZ(xFar) + W_WATER - 0.1; // just inside the far bank there…
     expect(poolWaterContains([RIVER], xFar, z)).toBe(true);
     expect(poolWaterContains([RIVER], xNear, z)).toBe(false); // …dry sand here
   });
@@ -93,8 +96,8 @@ describe('the water band', () => {
     const rect = poolHoleRect([RIVER])!;
     expect(rect).not.toBeNull();
     for (let x = -14; x <= 14; x += 1) {
-      expect(centreZ(x) - 3.4).toBeGreaterThanOrEqual(rect.z0 - 1e-6);
-      expect(centreZ(x) + 3.4).toBeLessThanOrEqual(rect.z1 + 1e-6);
+      expect(centreZ(x) - W_WET).toBeGreaterThanOrEqual(rect.z0 - 1e-6);
+      expect(centreZ(x) + W_WET).toBeLessThanOrEqual(rect.z1 + 1e-6);
     }
   });
 });
@@ -136,19 +139,19 @@ describe('what you can walk on', () => {
   });
 
   it('leaves the DRY SAND at the bends walkable', () => {
-    // Past the EXCAVATION (3.4), not merely past the waterline: the wet shelf
+    // Past the EXCAVATION (W_WET), not merely past the waterline: the wet shelf
     // between them is 30 cm below a floor the engine draws flat, so it is
     // scenery you look at, not ground you stand on.
     for (let x = -13.5; x <= 13.5; x += 1) {
-      expect(blocked(x, centreZ(x) - 4.0)).toBe(false);
-      expect(blocked(x, centreZ(x) + 4.0)).toBe(false);
+      expect(blocked(x, centreZ(x) - (W_WET + 0.6))).toBe(false);
+      expect(blocked(x, centreZ(x) + (W_WET + 0.6))).toBe(false);
     }
   });
 
   it('blocks the wet shelf as well as the water', () => {
     for (const x of [-10.5, -2.5, 6.5, 12.5]) {
-      expect(blocked(x, centreZ(x) + 3.0)).toBe(true); // shelf: cut, not water
-      expect(blocked(x, centreZ(x) - 3.0)).toBe(true);
+      expect(blocked(x, centreZ(x) + (W_WET - 0.3))).toBe(true); // shelf: cut, not water
+      expect(blocked(x, centreZ(x) - (W_WET - 0.3))).toBe(true);
     }
   });
 
@@ -193,8 +196,8 @@ describe('the floor hole', () => {
     // The shelf renders 30 cm down; if the hole stopped at the waterline the
     // solid floor would sit over it and the terracing would never be seen.
     const x = 2.554; // the widest bend
-    expect(poolWaterContains([RIVER], x, centreZ(x) + 3.0)).toBe(false);
-    expect(poolCutContains([RIVER], x, centreZ(x) + 3.0)).toBe(true);
+    expect(poolWaterContains([RIVER], x, centreZ(x) + (W_WATER + 0.2))).toBe(false);
+    expect(poolCutContains([RIVER], x, centreZ(x) + (W_WET - 0.3))).toBe(true);
   });
 
   it('leaves the bridge its floor — a hole under the planks is a hole', () => {

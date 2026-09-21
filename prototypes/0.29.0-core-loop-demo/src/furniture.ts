@@ -6323,7 +6323,9 @@ function riverMetrics(): {
   wDeep: number;
 } {
   const { halfX, halfZ } = roomHalfExtents();
-  const wWater = Math.min(2.6, Math.max(1.2, halfZ * 0.185));
+  // Narrow: a stream you step over on a bridge, not a bay. ~1.6 m of water in
+  // a 12 m room, 4 m in a 30 m one.
+  const wWater = Math.min(2.0, Math.max(0.8, halfZ * 0.135));
   return {
     // Stops RIVER_END_LIP short of each wall — for EVERYTHING, not just the
     // floor cut. The platform has no skirt below floor level, so any terrace
@@ -6332,15 +6334,21 @@ function riverMetrics(): {
     // a hole to the triangulator (see poolHoleOutline). Both fixed by one
     // number; the lip reads as the bank meeting the wall, inside WALL_CLEARANCE.
     halfLen: halfX - RIVER_END_LIP,
-    amp: Math.min(1.8, halfZ * 0.13),
-    wWet: wWater * 1.31, // the reference's 3.4 / 2.6
+    // A narrow band needs a visible wander or it reads as a straight ditch.
+    amp: Math.min(1.8, Math.max(0.6, halfZ * 0.17)),
+    wWet: wWater * 1.35,
     wWater,
-    wDeep: wWater * 0.385, // …and its 1.0 / 2.6
+    wDeep: wWater * 0.4,
   };
 }
-const RIVER_Y_WET = -0.3; // the bank's first step down
-const RIVER_Y_BED = -1.05; // bed under the shallows
-const RIVER_Y_DEEP = -1.85; // bed down the channel
+// SHALLOW on purpose (owner ruling 2026-09-21): the reference river is flat
+// bands of colour with the thinnest of side faces — a beach, not a canyon.
+// The water surface is pinned at POOL_WATER_Y (−0.35) for the swim rig, so
+// the bank is a 0.35 m drop whatever we do; everything else stays close under
+// it. Depth is read through the water as colour, not as walls.
+const RIVER_Y_WET = -0.12; // a lip, not a step
+const RIVER_Y_BED = -0.62; // bed under the shallows
+const RIVER_Y_DEEP = -0.85; // bed down the channel
 const RIVER_SEGS = 120;
 
 /** The centre line, in the river item's LOCAL frame. Shared by the builder,
@@ -6451,15 +6459,21 @@ function riverBankFace(hw: number, side: 1 | -1, yTop: number, yBot: number): TH
 function buildBeachRiver(ctx: BuildCtx) {
   const { m, place } = ctx;
   const { halfLen, amp, wWet, wWater, wDeep } = riverMetrics();
-  const WET = 0xd6cbb3;
-  const BED = 0x3fb3c6;
-  const BED_DEEP = 0x175f6e;
-  const WATER = 0x2b8fa2;
+  const SAND = 0xfbf7ee; // the reference's white beach sand
+  const WET = 0xe4dac4; // …a shade darker where it is damp
+  const BED = 0x7fd3df; // pale — the shallows read light through the water
+  const BED_DEEP = 0x2f97ab; // the channel, one band darker
+  const WATER = 0x5fc4d4;
   const FOAM = 0xeafaf9;
   const both = (mat: THREE.MeshStandardMaterial) => {
     mat.side = THREE.DoubleSide;
     return mat;
   };
+
+  // ── 🏖️ The beach itself: a flat sand apron on the floor either side of the
+  //    cut, so the room's tiles give way to sand before the water starts. It
+  //    is what makes this a beach in a room rather than a trench in a floor.
+  place(riverRibbonBand(wWet, wWet + 1.1, 0.006), both(m(SAND, 0.98, 0.0)), 0, 0, 0);
 
   // ── Terraces. Each is the STRIP between its own edge and the next one in,
   //    so nothing is a lid over the layer below it. Every step down also draws
@@ -6475,8 +6489,10 @@ function buildBeachRiver(ctx: BuildCtx) {
   place(riverBankFace(wWet, -1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
 
   place(riverRibbonBand(wDeep, wWater, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
-  place(riverBankFace(wWater, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
-  place(riverBankFace(wWater, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  // The face under the waterline is SAND-coloured: it is the bank continuing
+  // down, and a teal wall there is what made the old cut read as a canyon.
+  place(riverBankFace(wWater, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(WET, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wWater, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(WET, 0.9, 0.02)), 0, 0, 0);
 
   // The deep channel: one more terrace, and the biggest depth cue a river has.
   place(riverRibbon(wDeep, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
@@ -6504,7 +6520,7 @@ function buildBeachRiver(ctx: BuildCtx) {
 
   // ── The water surface itself, translucent over the bed ──
   const waterMat = both(m(WATER, 0.25, 0.1));
-  translucent(waterMat, 0.72);
+  translucent(waterMat, 0.62); // the bed's two bands must read through it
   place(riverRibbon(wWater, POOL_WATER_Y), waterMat, 0, 0, 0);
 
   // ── Foam where the water laps the bank, on BOTH banks ──
