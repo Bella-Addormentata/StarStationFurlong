@@ -27,7 +27,7 @@
 
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
-  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
+  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList, seaCorner,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -214,9 +214,13 @@ function placeFitting(
 function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem[] {
   const { halfX, halfZ } = half;
   const specs: PlacementSpec[] = [
-    // (No river. Owner ruling 2026-09-21: it never looked right inside a room.
-    // The kinds stay in the registry for the dev menu; the SET puts sand,
-    // loungers and parasols along the front instead.)
+    // 🌊 THE SEA first: flat water in the west-south corner of the sand, with
+    // a staircase shoreline (furniture.ts seaWaterTiles). Everything after
+    // avoids it. (The river was tried and never looked right inside a room.)
+    { kind: "beach-sea", at: [0, 0], spanning: true },
+    // 🛶 A raft ON the water — spanning so the occupancy check lets it float —
+    // in whichever front corner the sea chose (furniture.ts seaCorner).
+    { kind: "beach-raft", at: [seaCorner() === "SE" ? 0.72 : -0.72, 0.72], spanning: true },
 
     // 🎂 The anchor and its cluster, along the back.
     // Right of centre along the back, clear of the bar's shelf in the corner.
@@ -246,16 +250,16 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     // 🏖️ THE BEACH — the whole front of the room: loungers under parasols in
     // two small groups, palms at the sides where they frame rather than
     // occlude, and the middle still left for the crowd.
-    { kind: "sun-lounger", at: [-0.5, 0.62] },
-    { kind: "parasol", at: [-0.3, 0.52] },
+    { kind: "sun-lounger", at: [-0.28, 0.62] },
+    { kind: "tiki-parasol", at: [-0.1, 0.5] },
     { kind: "sun-lounger", at: [0.48, 0.64] },
-    { kind: "parasol", at: [0.66, 0.5] },
+    { kind: "tiki-parasol", at: [0.66, 0.5] },
     { kind: "palm-tree", at: [-0.86, 0.3] },
     { kind: "palm-tree", at: [0.86, 0.26] },
     { kind: "palm-tree", at: [-0.88, -0.44] },
     { kind: "tiki-torch", at: [-0.2, -0.66] },
     { kind: "tiki-torch", at: [-0.9, -0.66] },
-    { kind: "sun-lounger", at: [-0.14, 0.86] },
+    { kind: "tiki-parasol", at: [0.86, -0.86] },
     { kind: "palm-tree", at: [0.74, 0.88] },
 
     // Everything past here is expansion — it lands only if there is room.
@@ -447,7 +451,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     category: "party",
     name: "Beach Birthday Party",
     description:
-      "Loungers and parasols along the front, palms at the sides, a tiki bar under a lantern-strung pergola in the far corner, cake and gifts along the back, a lit dance floor — and an empty middle.",
+      "Sand underfoot and a flat sea in the corner, thatched parasols with party bulbs, a tiki bar in the far corner, cake and gifts along the back, a lit dance floor — and an empty middle.",
     // PLACE and ADD share one source: the fitted layout, here at the DEFAULT
     // 2×2 envelope every room is born with. A hand-authored 5×5 list lived
     // here before and put every piece outside the walls of a real room.
@@ -462,8 +466,10 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     // extents instead of the fixed list above, which was drawn for a 5×5.
     layout: layoutBeachParty,
 
-    // Open to the real space backdrop — a beach under a ceiling is a swimming hall.
-    theme: "outdoor-deck",
+    // 🏖️ The beach theme: the deck's open sky and sunward light over a SAND
+    // floor (world.ts applyRoomVisuals) — the reference build's whole look is
+    // sand under your feet and a flat sea in the corner.
+    theme: "beach",
   },
   {
     id: "deck-1",

@@ -54,6 +54,11 @@ import {
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+// 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
+// doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
+// this module.
+import { readAllDoorLayout, defaultDoorLayoutRecords } from "./doorLayoutDoc";
+import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
@@ -137,7 +142,11 @@ export type FurnitureKind =
   | "pergola-post"
   | "pergola-roof"
   | "beach-river"
-  | "plank-bridge";
+  | "plank-bridge"
+  // 🏖️ The Habbo beach: a flat sea in the front corner, thatched parasols, a raft.
+  | "beach-sea"
+  | "tiki-parasol"
+  | "beach-raft";
 
 export interface FurnitureItem {
   id: string;
@@ -3296,6 +3305,16 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   // 🌉 The crossing. footprint null and NOT an obstacle: it exists precisely to
   // make cells walkable that the river took away.
   "plank-bridge": { kind: "plank-bridge", build: buildPlankBridge, footprint: null },
+  // 🌊 Flat sea at floor level. footprint null; blocked per tile run.
+  "beach-sea": {
+    kind: "beach-sea",
+    build: buildBeachSea,
+    footprint: null,
+    obstacleBoxes: () => seaObstacleBoxes(),
+  },
+  "tiki-parasol": { kind: "tiki-parasol", build: buildTikiParasol, footprint: { w: 1, d: 1 } },
+  // Floats on the sea — a thing you look at, not a tile you stand on.
+  "beach-raft": { kind: "beach-raft", build: buildBeachRaft, footprint: null },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
   // local rot-0 frame (screen faces +z):
@@ -6628,6 +6647,187 @@ function buildPlankBridge({ m, place }: BuildCtx) {
   }
 }
 
+// ── 🌊 The beach SEA ────────────────────────────────────────────────────────
+/**
+ * The Habbo beach (owner reference: "How To Make a Habbo Beach", Aaron66734):
+ * the room's floor IS sand, and the front corner of it is simply WATER — flat,
+ * at floor level, blue, with a jagged staircase shoreline made of whole tiles.
+ * No trench, no depth, no swimming: it is a floor pattern you cannot walk on,
+ * and that is exactly why it looks right in a room where the river did not.
+ *
+ * Sized from the room like the river was. The water fills the WEST-SOUTH
+ * corner: deepest along the west wall, running out to nothing about 40% of
+ * the way along the south wall. Both wall CENTRES stay dry so the default
+ * doors there keep a lane (the shoreline never comes within DOOR_KEEP of them).
+ * Tiles are decided once per room by one pure function, so the geometry you
+ * see and the tiles you cannot walk on are one shape.
+ */
+const SEA_DOOR_KEEP = 1.6; // metres round a door kept dry
+
+/** World positions of the room's doors — the stored layout, or the four
+ *  defaults an unseeded room renders (the doorDisplayName rule). */
+function roomDoorPoints(): Array<{ x: number; z: number }> {
+  const stored = readAllDoorLayout();
+  const recs = stored.size > 0 ? stored : defaultDoorLayoutRecords();
+  const out: Array<{ x: number; z: number }> = [];
+  for (const r of recs.values()) {
+    const pose = poseFromWall(r.wall, r.lateral);
+    out.push({ x: pose.x, z: pose.z });
+  }
+  return out;
+}
+
+/**
+ * Which FRONT corner the sea fills: the one farther from the room's doors. A
+ * sea deepest against a wall that has a door in it would cut that door off
+ * (its dry lane ends up an island), so with the usual single door on the west
+ * wall the water goes south-EAST — the reference build mirrored, which reads
+ * exactly the same. Ties go west, like the reference.
+ */
+export function seaCorner(): "SW" | "SE" {
+  const { halfX, halfZ } = roomHalfExtents();
+  const doors = roomDoorPoints();
+  const clearance = (cx: number) =>
+    Math.min(...doors.map((d) => Math.hypot(d.x - cx, d.z - halfZ)), Infinity);
+  return clearance(halfX) > clearance(-halfX) + 0.01 ? "SE" : "SW";
+}
+
+/**
+ * World tile indices [i, j] (tile = [i, i+1) × [j, j+1)) that are water.
+ *
+ * The reference build's sea: a TRIANGLE in a front corner — deepest against
+ * the side wall, its straight diagonal shoreline running out along the front
+ * about 75% of the way across. One tile deeper per column: in isometric that
+ * pure diagonal IS the Habbo staircase (a random stagger was tried and only
+ * made islands and spikes). Any tile within SEA_DOOR_KEEP of a real door
+ * stays sand.
+ */
+export function seaWaterTiles(): Array<[number, number]> {
+  const { halfX, halfZ } = roomHalfExtents();
+  const cols = Math.round(halfX * 2);
+  const rows = Math.round(halfZ * 2);
+  const T = Math.min(rows - 1, Math.round(cols * 0.75)); // the diagonal's reach, in tiles
+  const east = seaCorner() === "SE";
+  const doors = roomDoorPoints();
+  const nearDoor = (cx: number, cz: number) =>
+    doors.some((d) => Math.hypot(d.x - cx, d.z - cz) < SEA_DOOR_KEEP);
+  const out: Array<[number, number]> = [];
+  for (let c = 0; c <= T; c++) {
+    // c counts columns in from the sea's own wall.
+    const i = east ? Math.round(halfX) - 1 - c : -Math.round(halfX) + c;
+    const depth = Math.max(0, Math.min(rows - 1, T - c));
+    for (let d = 0; d < depth; d++) {
+      const j = Math.round(halfZ) - 1 - d;
+      if (nearDoor(i + 0.5, j + 0.5)) continue;
+      out.push([i, j]);
+    }
+  }
+  return out;
+}
+
+/** The sea's blocked area: one box per horizontal RUN of water tiles. */
+function seaObstacleBoxes(): Box[] {
+  const rows = new Map<number, number[]>();
+  for (const [i, j] of seaWaterTiles()) rows.set(j, [...(rows.get(j) ?? []), i]);
+  const boxes: Box[] = [];
+  for (const [j, is] of rows) {
+    is.sort((a, b) => a - b);
+    let start = is[0];
+    let prev = is[0];
+    for (let k = 1; k <= is.length; k++) {
+      if (k < is.length && is[k] === prev + 1) { prev = is[k]; continue; }
+      boxes.push({ x0: start - 0.01, z0: j - 0.01, x1: prev + 1.01, z1: j + 1.01 });
+      if (k < is.length) { start = is[k]; prev = is[k]; }
+    }
+  }
+  return boxes;
+}
+
+function buildBeachSea(ctx: BuildCtx) {
+  const { m, place, itemId } = ctx;
+  const tiles = seaWaterTiles();
+  const set = new Set(tiles.map(([i, j]) => `${i},${j}`));
+  // The item sits wherever the layout put it; the sea is a ROOM feature, so
+  // subtract the item's own position to keep the tiles on the world grid.
+  const item = FURNITURE.find((f) => f.id === itemId);
+  const ox = item?.pos.x ?? 0;
+  const oz = item?.pos.z ?? 0;
+
+  // One flat mesh of tile quads, each its own shade — the pixel-noise the
+  // Habbo water tiles have, without a texture.
+  const pos: number[] = [];
+  const col: number[] = [];
+  const idx: number[] = [];
+  const SHADES = [[0.20, 0.55, 0.80], [0.24, 0.60, 0.85], [0.18, 0.52, 0.78], [0.27, 0.63, 0.88]];
+  let v = 0;
+  const quad = (x0: number, z0: number, x1: number, z1: number, y: number, c: number[]) => {
+    pos.push(x0 - ox, y, z0 - oz, x1 - ox, y, z0 - oz, x1 - ox, y, z1 - oz, x0 - ox, y, z1 - oz);
+    for (let k = 0; k < 4; k++) col.push(c[0], c[1], c[2]);
+    idx.push(v, v + 2, v + 1, v, v + 3, v + 2);
+    v += 4;
+  };
+  for (const [i, j] of tiles) {
+    const shade = SHADES[(((i * 7 + j * 13) % 4) + 4) % 4];
+    quad(i, j, i + 1, j + 1, 0.012, shade);
+    // Foam: a pale rim on every edge that meets sand.
+    const F = 0.16;
+    const foam = [0.87, 0.95, 0.98];
+    if (!set.has(`${i - 1},${j}`)) quad(i, j, i + F, j + 1, 0.016, foam);
+    if (!set.has(`${i + 1},${j}`)) quad(i + 1 - F, j, i + 1, j + 1, 0.016, foam);
+    if (!set.has(`${i},${j - 1}`)) quad(i, j, i + 1, j + F, 0.016, foam);
+    if (!set.has(`${i},${j + 1}`)) quad(i, j + 1 - F, i + 1, j + 1, 0.016, foam);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const mat = m(0xffffff, 0.35, 0.05);
+  mat.vertexColors = true;
+  mat.side = THREE.DoubleSide;
+  place(g, mat, 0, 0, 0);
+}
+
+/**
+ * 🏝️ Thatched tiki parasol with a string of party bulbs round the brim — the
+ * parasol the reference build uses at every corner. 1×1, 2.4 m.
+ */
+function buildTikiParasol({ m, place }: BuildCtx) {
+  const THATCH = 0xb9924a;
+  const THATCH_D = 0x8f6b30;
+  place(new THREE.CylinderGeometry(0.04, 0.05, 2.2, 8), m(0x6d4d31, 0.9, 0.05), 0, 1.1, 0);
+  place(new THREE.CylinderGeometry(0.16, 0.2, 0.08, 10), m(0x6d4d31, 0.9, 0.05), 0, 0.04, 0);
+  // Two stacked straw cones, the lower ragged at the hem.
+  place(new THREE.ConeGeometry(1.05, 0.55, 12), m(THATCH, 0.95, 0.0), 0, 2.02, 0);
+  place(new THREE.ConeGeometry(0.62, 0.42, 12), m(THATCH_D, 0.95, 0.0), 0, 2.36, 0);
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    place(new THREE.BoxGeometry(0.16, 0.14, 0.05), m(i % 2 ? THATCH : THATCH_D, 0.95, 0.0), Math.cos(a) * 1.0, 1.72, Math.sin(a) * 1.0).rotation.y = -a;
+  }
+  // The bulbs: alternating green / yellow / pink round the brim, each lit.
+  const BULB = [0x7cff5a, 0xffe14a, 0xff7ad9] as const;
+  for (let i = 0; i < 10; i++) {
+    const a = (i / 10) * Math.PI * 2 + 0.2;
+    const c = BULB[i % 3];
+    place(new THREE.SphereGeometry(0.045, 7, 7), m(c, 0.3, 0.0, c, 1.6), Math.cos(a) * 1.02, 1.64, Math.sin(a) * 1.02);
+  }
+}
+
+/** 🛶 Inflatable raft — yellow, non-solid, meant to sit ON the water. */
+function buildBeachRaft({ m, place }: BuildCtx) {
+  const RUB = 0xf2c94c;
+  const RUB_D = 0xd9a92e;
+  const ring = place(new THREE.TorusGeometry(0.62, 0.2, 8, 18), m(RUB, 0.6, 0.02), 0, 0.2, 0);
+  ring.scale.set(1, 1, 0.72);
+  ring.rotation.x = Math.PI / 2;
+  place(new THREE.BoxGeometry(0.95, 0.06, 0.62), m(RUB_D, 0.7, 0.02), 0, 0.1, 0);
+  for (const sx of [-0.55, 0.55]) {
+    const oar = place(new THREE.BoxGeometry(1.1, 0.04, 0.05), m(0x8a5731, 0.9, 0.02), sx, 0.42, 0.28);
+    oar.rotation.z = sx < 0 ? 0.35 : -0.35;
+    oar.rotation.y = 0.5;
+  }
+}
+
 // ── 🏝️ Beach fixtures ───────────────────────────────────────────────────────
 // A voxel port of the beach set the party skill ships as a canvas-2D reference
 // room. The DRAW CODE does not transfer — that file paints iso diamonds, this
@@ -8041,7 +8241,7 @@ for (const item of OUTDOOR_FURNITURE) {
  * warm bright light) or a 'casino' — there is no room whose id means either
  * (owner ruling 2026-08-13: no room types).
  */
-export type RoomTheme = "interior" | "casino" | "outdoor-deck";
+export type RoomTheme = "interior" | "casino" | "outdoor-deck" | "beach";
 
 /**
  * Default casino floor. The four door approach lanes stay open, and every

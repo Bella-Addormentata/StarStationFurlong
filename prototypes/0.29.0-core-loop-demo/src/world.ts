@@ -420,6 +420,7 @@ export class World {
   private woodTex: THREE.Texture | null = null;
   /** Lazy-created outdoor stone tile texture (created on first outdoor entry). */
   private outdoorFloorTex: THREE.Texture | null = null;
+  private sandFloorTex: THREE.Texture | null = null;
   /** Lazy-created casino carpet texture (created on first casino entry). */
   private casinoFloorTex: THREE.Texture | null = null;
   /** 🌌 Legacy mirror of isOutdoorDeck — kept in sync with the room's THEME so
@@ -2344,7 +2345,10 @@ export class World {
     // carries (stamped by a template or its owner); unstamped ⇒ plain
     // interior. `roomId` is now only ever logged from here.
     const resolvedTheme: RoomTheme = theme ?? "interior";
-    const deck = resolvedTheme === "outdoor-deck";
+    // 🏖️ "beach" is an outdoor deck whose floor is SAND — same sky, same
+    // sunward light, ghost doors; only the floor texture differs below.
+    const beach = resolvedTheme === "beach";
+    const deck = resolvedTheme === "outdoor-deck" || beach;
     const casinoTheme = resolvedTheme === "casino";
     this.isOutdoorDeck = deck;
     // Keep the legacy floor-visibility flag in lockstep with the theme: the
@@ -2506,7 +2510,13 @@ export class World {
     this.dockingSystem?.setGhostDoors(deck);
 
     if (this.floorMat) {
-      if (deck) {
+      if (beach) {
+        if (!this.sandFloorTex) this.sandFloorTex = this.makeSandFloorTex();
+        this.floorMat.map = this.sandFloorTex;
+        this.floorMat.color.setHex(0xffffff);
+        this.floorMat.roughness = 0.98;
+        this.floorMat.metalness = 0.0;
+      } else if (deck) {
         // Swap to a stone-tile texture (created once, cached).
         if (!this.outdoorFloorTex)
           this.outdoorFloorTex = this.makeOutdoorFloorTex();
@@ -2548,7 +2558,9 @@ export class World {
         mat.needsUpdate = true;
       }
     });
-    const themeLabel = deck
+    const themeLabel = beach
+      ? "sand floor"
+      : deck
       ? "stone deck floor"
       : casinoTheme
         ? "festival carpet"
@@ -2701,6 +2713,45 @@ export class World {
    * surface variation to distinguish from the lobby's herringbone wood.
    * Created lazily on first outdoor entry and cached for the session.
    */
+  /**
+   * 🏖️ Beach sand: a warm yellow ground with thousands of grains in four
+   * tones — the noisy Habbo sand tile, not a smooth colour. Deterministic
+   * PRNG so every client draws the same grain.
+   */
+  private makeSandFloorTex(): THREE.Texture {
+    const W = 512,
+      H = 512;
+    const cv = document.createElement("canvas");
+    cv.width = W;
+    cv.height = H;
+    const c = cv.getContext("2d")!;
+    c.fillStyle = "#E7C265";
+    c.fillRect(0, 0, W, H);
+    let seed = 0x9e3779b9;
+    const rnd = () => {
+      seed = (Math.imul(seed ^ (seed >>> 15), 0x2c1b3c6d) >>> 0);
+      seed = (Math.imul(seed ^ (seed >>> 12), 0x297a2d39) >>> 0);
+      return ((seed ^ (seed >>> 15)) >>> 0) / 4294967296;
+    };
+    const TONES = ["#D9AF4E", "#F2D27C", "#C99E3F", "#FBE39A"];
+    for (let n = 0; n < 26000; n++) {
+      c.fillStyle = TONES[n % 4];
+      c.globalAlpha = 0.35 + rnd() * 0.4;
+      const sz = rnd() < 0.8 ? 1 : 2;
+      c.fillRect(Math.floor(rnd() * W), Math.floor(rnd() * H), sz, sz);
+    }
+    c.globalAlpha = 1;
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(3.5, 3.5);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
   private makeOutdoorFloorTex(): THREE.Texture {
     const W = 512,
       H = 512;
