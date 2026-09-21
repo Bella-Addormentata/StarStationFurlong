@@ -6727,7 +6727,23 @@ export function seaWaterTiles(): Array<[number, number]> {
       out.push([i, j]);
     }
   }
-  return out;
+  // ONE body of water: keep only the tiles connected (edge to edge) to the
+  // corner tile. A door lane can cut the diagonal in two, and the tail beyond
+  // it was a puddle on the far side of a dry strip — not a sea.
+  const key = (i: number, j: number) => `${i},${j}`;
+  const all = new Map(out.map(([i, j]) => [key(i, j), [i, j] as [number, number]]));
+  const corner = key(east ? Math.round(halfX) - 1 : -Math.round(halfX), Math.round(halfZ) - 1);
+  if (!all.has(corner)) return [];
+  const seen = new Set<string>([corner]);
+  const queue = [corner];
+  while (queue.length) {
+    const [ci, cj] = all.get(queue.pop()!)!;
+    for (const [ni, nj] of [[ci + 1, cj], [ci - 1, cj], [ci, cj + 1], [ci, cj - 1]]) {
+      const k = key(ni, nj);
+      if (all.has(k) && !seen.has(k)) { seen.add(k); queue.push(k); }
+    }
+  }
+  return [...seen].map((k) => all.get(k)!);
 }
 
 /** The sea's blocked area: one box per horizontal RUN of water tiles. */
