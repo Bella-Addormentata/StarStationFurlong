@@ -243,8 +243,15 @@ export function updateCameraRig(deltaTime: number): void {
     currentYaw += drift;
     targetYaw += drift;
   } else if (wasDrifting) {
-    stepIndex = Math.round(targetYaw / STEP_RAD);
-    targetYaw = stepIndex * STEP_RAD;
+    // 🧭 Owner ruling (2026-09-21): entering a room ALWAYS lands on 0°. The
+    // drift left targetYaw somewhere between detents, and rounding to the
+    // nearest one meant the fox arrived at whatever angle the station happened
+    // to be turned to — usually 45°, and the chip beside DEV said so. Snap to
+    // the home detent instead; the tween below still carries the camera there
+    // smoothly, and the readout follows.
+    stepIndex = 0;
+    targetYaw = 0;
+    refreshAngleChip();
   }
   wasDrifting = drifting;
 
