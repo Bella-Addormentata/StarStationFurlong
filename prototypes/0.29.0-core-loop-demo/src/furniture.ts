@@ -146,7 +146,8 @@ export type FurnitureKind =
   // 🏖️ The Habbo beach: a flat sea in the front corner, thatched parasols, a raft.
   | "beach-sea"
   | "tiki-parasol"
-  | "beach-raft";
+  | "beach-raft"
+  | "jungle-plant";
 
 export interface FurnitureItem {
   id: string;
@@ -3315,6 +3316,7 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
   "tiki-parasol": { kind: "tiki-parasol", build: buildTikiParasol, footprint: { w: 1, d: 1 } },
   // Floats on the sea — a thing you look at, not a tile you stand on.
   "beach-raft": { kind: "beach-raft", build: buildBeachRaft, footprint: null },
+  "jungle-plant": { kind: "jungle-plant", build: buildJunglePlant, footprint: { w: 1, d: 1 } },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
   // local rot-0 frame (screen faces +z):
@@ -6666,7 +6668,7 @@ const SEA_DOOR_KEEP = 1.6; // metres round a door kept dry
 
 /** World positions of the room's doors — the stored layout, or the four
  *  defaults an unseeded room renders (the doorDisplayName rule). */
-function roomDoorPoints(): Array<{ x: number; z: number }> {
+export function roomDoorPoints(): Array<{ x: number; z: number }> {
   const stored = readAllDoorLayout();
   const recs = stored.size > 0 ? stored : defaultDoorLayoutRecords();
   const out: Array<{ x: number; z: number }> = [];
@@ -6718,7 +6720,10 @@ export function seaWaterTiles(): Array<[number, number]> {
     const depth = Math.max(0, Math.min(rows - 1, T - c));
     for (let d = 0; d < depth; d++) {
       const j = Math.round(halfZ) - 1 - d;
-      if (nearDoor(i + 0.5, j + 0.5)) continue;
+      // A door's dry lane ends the COLUMN, not just the tile: skipping one
+      // tile and continuing left the tiles behind it stranded as islands of
+      // water with sand on every side.
+      if (nearDoor(i + 0.5, j + 0.5)) break;
       out.push([i, j]);
     }
   }
@@ -6810,6 +6815,46 @@ function buildTikiParasol({ m, place }: BuildCtx) {
     const a = (i / 10) * Math.PI * 2 + 0.2;
     const c = BULB[i % 3];
     place(new THREE.SphereGeometry(0.045, 7, 7), m(c, 0.3, 0.0, c, 1.6), Math.cos(a) * 1.02, 1.64, Math.sin(a) * 1.02);
+  }
+}
+
+/**
+ * 🌿 Jungle plant — the tall, dark, trunkless clump of tropical fronds the
+ * reference build lines BOTH back walls with, one per tile, until the room is
+ * fenced in by greenery. 1×1, ~2 m: a low knot of stems and a fan of long
+ * leaves that droop outward, no visible trunk, two greens so the hedge is
+ * not one flat colour.
+ */
+function buildJunglePlant({ m, place, itemId }: BuildCtx) {
+  const LEAF = 0x1f5e33;
+  const LEAF_L = 0x2e7d45;
+  const STEM = 0x3d5a2a;
+  // Per-instance twist so a row of them is not a row of clones.
+  const twist = idHash01(itemId) * Math.PI * 2;
+  place(new THREE.CylinderGeometry(0.16, 0.22, 0.28, 8), m(STEM, 0.95, 0.0), 0, 0.14, 0);
+  const FRONDS = 11;
+  for (let i = 0; i < FRONDS; i++) {
+    const a = twist + (i / FRONDS) * Math.PI * 2;
+    const len = 1.35 + (i % 3) * 0.25; // three lengths, interleaved
+    const tilt = 0.55 + (i % 2) * 0.22; // outward lean
+    const base = 0.25 + (i % 3) * 0.12;
+    const leaf = place(
+      new THREE.ConeGeometry(0.15, len, 5),
+      m(i % 2 ? LEAF : LEAF_L, 0.9, 0.0),
+      Math.cos(a) * Math.sin(tilt) * len * 0.45,
+      base + Math.cos(tilt) * len * 0.5,
+      Math.sin(a) * Math.sin(tilt) * len * 0.45,
+    );
+    leaf.rotation.order = "YXZ";
+    leaf.rotation.y = -a;
+    leaf.rotation.z = -tilt; // tip leans outward, base at the knot
+    leaf.scale.set(1, 1, 0.22); // flatten into a blade
+  }
+  // Three upright spears in the middle give it the height the reference has.
+  for (const [dx, dz, h] of [[0, 0, 2.0], [0.08, -0.06, 1.75], [-0.07, 0.07, 1.6]] as const) {
+    const spear = place(new THREE.ConeGeometry(0.11, h, 5), m(LEAF, 0.9, 0.0), dx, 0.25 + h / 2, dz);
+    spear.scale.set(1, 1, 0.3);
+    spear.rotation.y = twist;
   }
 }
 

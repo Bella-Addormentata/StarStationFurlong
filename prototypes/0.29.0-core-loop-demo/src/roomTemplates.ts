@@ -27,7 +27,8 @@
 
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
-  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList, seaCorner,
+  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
+  seaCorner, roomDoorPoints,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -98,6 +99,9 @@ interface PlacementSpec {
   /** Rigid group: if any member fails to place, the whole group is dropped.
    *  A pergola roof with two of its four posts is not a pergola. */
   group?: string;
+  /** Stands AGAINST the wall (a hedge): its box may touch the wall line, and
+   *  it is never nudged toward the centre — off the wall it is not a hedge. */
+  hugWall?: boolean;
 }
 
 function boxesOverlap(a: Box, b: Box): boolean {
@@ -136,7 +140,7 @@ function placeFitting(
     // Nudges pull toward the centre, which is where the room is. A rigid
     // group gets no nudge — moving one member relative to the others is
     // exactly what `off` exists to prevent.
-    const tries: Array<[number, number]> = spec.group
+    const tries: Array<[number, number]> = spec.group || spec.hugWall
       ? [[tx, tz]]
       : [
           [tx, tz],
@@ -164,12 +168,13 @@ function placeFitting(
         break;
       }
       if (boxes.length > 0) {
+        const margin = spec.hugWall ? -0.01 : MARGIN;
         const outside =
           !spec.spanning &&
           boxes.some(
             (b) =>
-              b.x0 < -halfX + MARGIN || b.x1 > halfX - MARGIN ||
-              b.z0 < -halfZ + MARGIN || b.z1 > halfZ - MARGIN,
+              b.x0 < -halfX + margin || b.x1 > halfX - margin ||
+              b.z0 < -halfZ + margin || b.z1 > halfZ - margin,
           );
         if (outside) continue;
         if (boxes.some((b) => occupied.some((o) => boxesOverlap(b, o)))) continue;
@@ -281,7 +286,27 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     { kind: "beach-towel", at: [0.1, 0.72] },
     { kind: "beach-towel", at: [-0.72, 0.86] },
   ];
-  return placeFitting(specs, halfX, halfZ, "beach");
+  // 🌿 THE HEDGE: one jungle plant per tile along BOTH back walls (the −x and
+  // −z walls, the two the camera looks at), the way the reference fences its
+  // beach in with greenery in its last twelve seconds. Doors keep a lane;
+  // anything already standing against those walls (the bar, the cake) simply
+  // interrupts the row — placeFitting skips the collisions.
+  const doors = roomDoorPoints();
+  const clearOfDoors = (x: number, z: number) =>
+    doors.every((d) => Math.hypot(d.x - x, d.z - z) >= 1.6);
+  const hedge: PlacementSpec[] = [];
+  const inset = 0.5;
+  for (let x = -halfX + inset; x < halfX; x += 1) {
+    if (clearOfDoors(x, -halfZ + inset)) hedge.push({ kind: "jungle-plant", at: [x / halfX, (-halfZ + inset) / halfZ], hugWall: true });
+  }
+  for (let z = -halfZ + inset + 1; z < halfZ - 1; z += 1) {
+    if (clearOfDoors(-halfX + inset, z)) hedge.push({ kind: "jungle-plant", at: [(-halfX + inset) / halfX, z / halfZ], hugWall: true });
+  }
+  // The hedge goes AFTER the bar and the cake cluster (they win the wall) and
+  // BEFORE the beach dressing, which has the whole front to itself anyway.
+  const expansionAt = specs.findIndex((sp) => sp.kind === "party-standing-table");
+  const ordered = [...specs.slice(0, expansionAt), ...hedge, ...specs.slice(expansionAt)];
+  return placeFitting(ordered, halfX, halfZ, "beach");
 }
 
 /** Clone so applying a template never aliases the shared manifest arrays. */

@@ -135,6 +135,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'beach-sea': '🌊 BEACH SEA (corner)',
   'tiki-parasol': '🏝️ TIKI PARASOL',
   'beach-raft': '🛶 RAFT',
+  'jungle-plant': '🌿 JUNGLE PLANT',
 };
 
 type GetWorld = () => World | null;
