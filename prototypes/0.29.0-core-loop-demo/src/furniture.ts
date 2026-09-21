@@ -7743,6 +7743,26 @@ export const FURNITURE: FurnitureItem[] = [
     movable: true,
   },
 ];
+/**
+ * 🪑 The Grand Lobby manifest, FROZEN at module load.
+ *
+ * `FURNITURE` above is not a constant in practice: World.reconcileFurniture
+ * splices and pushes it so it always mirrors the room you are standing in.
+ * Two things that meant to read "the default lobby" were reading "the current
+ * room" instead — the Grand Lobby template (placing it in an empty room placed
+ * nothing; in a furnished one, a copy of that room) and the seeding of a brand
+ * new module (which could inherit whatever room you had just walked out of).
+ * Both read this snapshot now. Deep-copied so a later edit-mode drag on a live
+ * item can never reach into it.
+ */
+export const DEFAULT_LOBBY_FURNITURE: readonly FurnitureItem[] = Object.freeze(
+  FURNITURE.map((i) => ({
+    ...i,
+    pos: { ...i.pos },
+    ...(i.footprintOverride ? { footprintOverride: { ...i.footprintOverride } } : {}),
+  })),
+);
+
 
 /**
  * Module-load snapshot of the hand-authored footprintOverrides above, keyed

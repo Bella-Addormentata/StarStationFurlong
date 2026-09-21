@@ -27,7 +27,7 @@
 
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
-  FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
+  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
@@ -316,7 +316,10 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     name: "Grand Lobby",
     description:
       "Clone-vat lounge — centre sofa cluster, map table, bunk, storage, paired doors.",
-    items: FURNITURE,
+    // The FROZEN manifest. `FURNITURE` itself mirrors the live room (World
+    // splices it on every reconcile), so `items: FURNITURE` placed "whatever
+    // is here already" — nothing, in an empty room.
+    items: [...DEFAULT_LOBBY_FURNITURE],
 
     theme: "interior",
   },

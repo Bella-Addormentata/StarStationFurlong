@@ -20,7 +20,7 @@
  */
 
 import * as Y from 'yjs';
-import { FURNITURE, FURNITURE_DEFS } from './furniture';
+import { DEFAULT_LOBBY_FURNITURE, FURNITURE_DEFS } from './furniture';
 import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
 
 /** Serializable placement — one per furniture item id. Plain JSON (no nested
@@ -164,7 +164,9 @@ export function deleteFurnitureItem(id: string): void {
 export function seedFurnitureDefaults(): void {
   if (!docAlive() || furnitureMap!.size > 0) return;
   boundDoc!.transact(() => {
-    for (const item of FURNITURE) {
+    // The frozen manifest — NOT the live FURNITURE array, which mirrors the
+    // room you came from (see DEFAULT_LOBBY_FURNITURE).
+    for (const item of DEFAULT_LOBBY_FURNITURE) {
       furnitureMap!.set(item.id, toRecord(item));
     }
   });
@@ -211,13 +213,10 @@ export function replaceAllFurniture(items: FurnitureItem[]): void {
   });
 }
 
-/** Pristine copy of the default layout, captured at module load — the live
- *  FURNITURE array is reconciled to doc state afterwards, so it can't serve
- *  as the reference once a room is joined. */
-const DEFAULT_LAYOUT: FurnitureItem[] = FURNITURE.map((item) => ({
-  ...item,
-  pos: { ...item.pos },
-}));
+// The pristine default layout lives in furniture.ts as DEFAULT_LOBBY_FURNITURE
+// (one frozen snapshot for every reader — the migration below, the new-room
+// seed above, and the Grand Lobby template — rather than a private copy here
+// and a live alias elsewhere).
 
 /**
  * 🛋️ One-time floor-plan migration (owner request: nothing parked in front
@@ -232,7 +231,7 @@ const DEFAULT_LAYOUT: FurnitureItem[] = FURNITURE.map((item) => ({
 export function migrateDefaultLayout(): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
-    for (const item of DEFAULT_LAYOUT) {
+    for (const item of DEFAULT_LOBBY_FURNITURE) {
       furnitureMap!.set(item.id, toRecord(item));
     }
   });
