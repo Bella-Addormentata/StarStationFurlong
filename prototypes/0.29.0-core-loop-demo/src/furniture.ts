@@ -6835,76 +6835,75 @@ function buildTikiParasol({ m, place }: BuildCtx) {
 }
 
 /**
- * 🌿 Jungle plant — the TALL, dark clump of tropical fronds the reference
- * build lines both back walls with until the beach is fenced in by greenery.
- * 1×1 and 5.4 m (owner spec): it towers over the parasols (2.4) AND the room's
- * walls, the way the video's does — under the beach theme's open sky that is
- * the point; the hedge is the horizon. A bundle of stems rises from a
- * low knot, a skirt of long blades droops from waist height, and a crown of
- * blades fans out at the top — two greens, and a per-instance twist so a row
- * is not a row of clones. No trunk: it is a plant, not a tree.
+ * 🌿 Jungle plant — the reference build's hedge plant: a TALL, DENSE mass of
+ * dark tropical foliage. In the video it reads as one solid dark-green shape
+ * with a ragged, frond-tipped outline — never as stems and separate blades
+ * (a spiky, see-through version was tried and looked like agave). So this is
+ * built as VOLUME first: three tiers of overlapping leaf pads make a solid
+ * silhouette, and only then do fronds fan out of the crown for the ragged
+ * top. 1×1, 5.4 m (owner spec), a per-instance twist so a row is not clones.
  */
 function buildJunglePlant({ m, place, itemId }: BuildCtx) {
-  const LEAF = 0x1f5e33;
-  const LEAF_L = 0x2e7d45;
-  const STEM = 0x3d5a2a;
   const H = 5.4;
-  const S = H / 3.4; // blades and stems scale with the height
+  const DARK = 0x184a2b; // the mass
+  const MID = 0x1f5e33; // pads catching light
+  const LIGHT = 0x2a7040; // frond tips
   const twist = idHash01(itemId) * Math.PI * 2;
-  const blade = (x: number, y: number, z: number, len: number, yaw: number, tilt: number, col: number) => {
-    const b = place(new THREE.ConeGeometry(0.17 * S, len, 5), m(col, 0.9, 0.0), x, y, z);
-    b.rotation.order = "YXZ";
-    b.rotation.y = -yaw;
-    b.rotation.z = -tilt; // tip leans outward and down, base at the stem
-    b.scale.set(1, 1, 0.22);
+
+  // A short dark base so the mass sits on the ground rather than floating.
+  place(new THREE.CylinderGeometry(0.22, 0.3, 0.9, 8), m(0x2b3d1f, 0.95, 0.0), 0, 0.45, 0);
+
+  // ── The mass: tiers of squashed spheres, each tier a ring of pads round a
+  //    core, tiers wider toward the middle and narrower at the top — the
+  //    bushy pear silhouette the reference has.
+  const tiers: Array<[number, number, number]> = [
+    // [height, ring radius, pad radius]
+    [1.5, 0.42, 0.62],
+    [2.5, 0.5, 0.66],
+    [3.5, 0.46, 0.62],
+    [4.4, 0.34, 0.54],
+    [5.0, 0.18, 0.42],
+  ];
+  tiers.forEach(([y, ring, r], t) => {
+    const n = t === tiers.length - 1 ? 4 : 6;
+    const core = place(new THREE.SphereGeometry(r * 1.05, 9, 7), m(DARK, 0.95, 0.0), 0, y, 0);
+    core.scale.set(1, 0.7, 1);
+    for (let i = 0; i < n; i++) {
+      const a = twist + t * 0.5 + (i / n) * Math.PI * 2;
+      const pad = place(
+        new THREE.SphereGeometry(r, 8, 6),
+        m(i % 2 ? DARK : MID, 0.95, 0.0),
+        Math.cos(a) * ring,
+        y + (i % 2 ? -0.08 : 0.08),
+        Math.sin(a) * ring,
+      );
+      pad.scale.set(1, 0.62, 1);
+    }
+  });
+
+  // ── The ragged outline: wide fronds fanning out of every tier's rim, up and
+  //    outward, longest at the crown — this is what stops the mass reading as
+  //    a topiary ball.
+  const frond = (y: number, ring: number, len: number, tilt: number, count: number, phase: number) => {
+    for (let i = 0; i < count; i++) {
+      const a = twist + phase + (i / count) * Math.PI * 2;
+      const f = place(
+        new THREE.ConeGeometry(0.26, len, 4),
+        m(i % 3 === 0 ? LIGHT : MID, 0.9, 0.0),
+        Math.cos(a) * (ring + Math.sin(tilt) * len * 0.45),
+        y + Math.cos(tilt) * len * 0.45,
+        Math.sin(a) * (ring + Math.sin(tilt) * len * 0.45),
+      );
+      f.rotation.order = "YXZ";
+      f.rotation.y = -a;
+      f.rotation.z = -tilt;
+      f.scale.set(1, 1, 0.18); // a wide flat blade
+    }
   };
-  // Knot + a bundle of stems rising to the crown.
-  place(new THREE.CylinderGeometry(0.2 * S, 0.26 * S, 0.3, 8), m(STEM, 0.95, 0.0), 0, 0.15, 0);
-  for (let k = 0; k < 5; k++) {
-    const a = twist + (k / 5) * Math.PI * 2;
-    const lean = 0.06 + (k % 2) * 0.04;
-    const stem = place(
-      new THREE.CylinderGeometry(0.035 * S, 0.06 * S, H * 0.78, 6),
-      m(STEM, 0.9, 0.0),
-      Math.cos(a) * 0.09 + Math.cos(a) * lean * 2,
-      H * 0.39,
-      Math.sin(a) * 0.09 + Math.sin(a) * lean * 2,
-    );
-    stem.rotation.order = "YXZ";
-    stem.rotation.y = -a;
-    stem.rotation.z = -lean;
-  }
-  // Waist skirt: long blades drooping outward from about a third of the way up.
-  for (let i = 0; i < 9; i++) {
-    const a = twist + 0.3 + (i / 9) * Math.PI * 2;
-    const len = (1.6 + (i % 3) * 0.2) * S;
-    const tilt = 1.05 + (i % 2) * 0.15; // well past horizontal — they hang
-    const y0 = H * 0.36;
-    blade(Math.cos(a) * Math.sin(tilt) * len * 0.42, y0 + Math.cos(tilt) * len * 0.42, Math.sin(a) * Math.sin(tilt) * len * 0.42, len, a, tilt, i % 2 ? LEAF : LEAF_L);
-  }
-  // Mid tier, a little higher and less droop.
-  for (let i = 0; i < 8; i++) {
-    const a = twist + 0.7 + (i / 8) * Math.PI * 2;
-    const len = (1.5 + (i % 2) * 0.25) * S;
-    const tilt = 0.72;
-    const y0 = H * 0.62;
-    blade(Math.cos(a) * Math.sin(tilt) * len * 0.45, y0 + Math.cos(tilt) * len * 0.45, Math.sin(a) * Math.sin(tilt) * len * 0.45, len, a, tilt, i % 2 ? LEAF_L : LEAF);
-  }
-  // Crown: blades fanning up and out from the top of the stems.
-  for (let i = 0; i < 10; i++) {
-    const a = twist + (i / 10) * Math.PI * 2;
-    const len = (1.3 + (i % 3) * 0.2) * S;
-    const tilt = 0.35 + (i % 2) * 0.2;
-    const y0 = H * 0.78;
-    blade(Math.cos(a) * Math.sin(tilt) * len * 0.45, y0 + Math.cos(tilt) * len * 0.45, Math.sin(a) * Math.sin(tilt) * len * 0.45, len, a, tilt, i % 2 ? LEAF : LEAF_L);
-  }
-  // Three spears straight up out of the crown — the silhouette's peak.
-  for (const [dx, dz, h0] of [[0, 0, 1.0], [0.1, -0.05, 0.8], [-0.08, 0.08, 0.7]] as const) {
-    const h = h0 * S;
-    const spear = place(new THREE.ConeGeometry(0.12 * S, h, 5), m(LEAF, 0.9, 0.0), dx, H * 0.78 + h / 2, dz);
-    spear.scale.set(1, 1, 0.3);
-    spear.rotation.y = twist;
-  }
+  frond(2.2, 0.9, 1.5, 1.25, 7, 0.2); // low skirt, hanging outward
+  frond(3.4, 0.9, 1.6, 0.95, 8, 0.6);
+  frond(4.4, 0.75, 1.7, 0.6, 8, 1.0);
+  frond(H - 0.4, 0.45, 1.6, 0.28, 7, 1.4); // crown, reaching up: the H tips
 }
 
 /** 🛶 Inflatable raft — yellow, non-solid, meant to sit ON the water. */
