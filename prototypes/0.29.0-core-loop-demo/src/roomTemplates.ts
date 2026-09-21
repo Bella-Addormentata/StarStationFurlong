@@ -86,9 +86,18 @@ interface PlacementSpec {
   kind: FurnitureKind;
   /** Target, in room-fractions: [-1, 1] on each axis. */
   at: [number, number];
+  /** Metres added AFTER the fraction — for rigid clusters. A bar counter and
+   *  the shelf behind it are a fixed distance apart in any room; fractions
+   *  would squeeze them together in a small one and tear them apart in a big
+   *  one. Anchor the cluster with `at`, lay it out with `off`. */
+  off?: [number, number];
   rot?: Rot;
-  /** Spans the room on purpose (the river) — skip the bounds check. */
+  /** Spans the room on purpose (the river, the bridge over it) — skip the
+   *  bounds check AND the occupancy check: crossing what is there is the point. */
   spanning?: boolean;
+  /** Rigid group: if any member fails to place, the whole group is dropped.
+   *  A pergola roof with two of its four posts is not a pergola. */
+  group?: string;
 }
 
 function boxesOverlap(a: Box, b: Box): boolean {
@@ -119,17 +128,24 @@ function placeFitting(
   const MARGIN = 0.6; // keep furniture off the walls
   let n = 0;
 
+  const groupMembers = new Map<string, FurnitureItem[]>();
+  const groupFailed = new Set<string>();
   for (const spec of specs) {
-    const tx = spec.at[0] * halfX;
-    const tz = spec.at[1] * halfZ;
-    // Nudges pull toward the centre, which is where the room is.
-    const tries: Array<[number, number]> = [
-      [tx, tz],
-      [tx * 0.88, tz * 0.88],
-      [tx * 0.76, tz * 0.92],
-      [tx * 0.92, tz * 0.76],
-      [tx * 0.62, tz * 0.82],
-    ];
+    const tx = spec.at[0] * halfX + (spec.off?.[0] ?? 0);
+    const tz = spec.at[1] * halfZ + (spec.off?.[1] ?? 0);
+    // Nudges pull toward the centre, which is where the room is. A rigid
+    // group gets no nudge — moving one member relative to the others is
+    // exactly what `off` exists to prevent.
+    const tries: Array<[number, number]> = spec.group
+      ? [[tx, tz]]
+      : [
+          [tx, tz],
+          [tx * 0.88, tz * 0.88],
+          [tx * 0.76, tz * 0.92],
+          [tx * 0.92, tz * 0.76],
+          [tx * 0.62, tz * 0.82],
+        ];
+    let placed: FurnitureItem | null = null;
     for (const [x, z] of tries) {
       const item: FurnitureItem = {
         id: `${idPrefix}-${spec.kind}-${++n}`,
@@ -139,6 +155,11 @@ function placeFitting(
         movable: !spec.spanning,
       };
       const boxes = buildObstacleList([item]);
+      if (spec.spanning) {
+        occupied.push(...boxes);
+        placed = item;
+        break;
+      }
       if (boxes.length > 0) {
         const outside =
           !spec.spanning &&
@@ -157,9 +178,19 @@ function placeFitting(
         if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
         if (pointInAny(x, z, occupied)) continue;
       }
-      out.push(item);
+      placed = item;
       break;
     }
+    if (spec.group) {
+      if (!placed) groupFailed.add(spec.group);
+      else groupMembers.set(spec.group, [...(groupMembers.get(spec.group) ?? []), placed]);
+      continue;
+    }
+    if (placed) out.push(placed);
+  }
+  // Rigid groups land whole or not at all.
+  for (const [g, members] of groupMembers) {
+    if (!groupFailed.has(g)) out.push(...members);
   }
   return out;
 }
@@ -186,24 +217,29 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     { kind: "plank-bridge", at: [0.36, 0.45], spanning: true },
 
     // 🎂 The anchor and its cluster, along the back.
-    { kind: "cake-table", at: [0.14, -0.78] },
-    { kind: "birthday-banner", at: [0.14, -0.9] },
-    { kind: "gift-box", at: [-0.05, -0.76] },
-    { kind: "gift-box", at: [-0.2, -0.84] },
-    { kind: "birthday-balloons", at: [0.36, -0.82] },
-    { kind: "birthday-balloons", at: [-0.34, -0.86] },
+    // Right of centre along the back, clear of the bar's shelf in the corner.
+    { kind: "cake-table", at: [0.42, -0.78] },
+    { kind: "birthday-banner", at: [0.42, -0.9] },
+    // Gifts in METRES from the cake — one each side — so they sit beside it
+    // in any room instead of drifting into the bar in a small one.
+    { kind: "gift-box", at: [0.42, -0.78], off: [-1.6, 0.3] },
+    { kind: "gift-box", at: [0.42, -0.78], off: [1.6, 0.3] },
+    { kind: "birthday-balloons", at: [0.72, -0.82] },
+    { kind: "birthday-balloons", at: [0.06, -0.86] },
 
     // 💃 Somewhere to dance, and the switch for it.
     { kind: "dance-floor", at: [0.68, -0.34] },
-    { kind: "party-speaker", at: [0.68, -0.6] },
+    // On the floor's near edge: its back edge is where the cake cluster ends.
+    { kind: "party-speaker", at: [0.68, -0.05] },
 
-    // 🍹 The bar, far corner: shelf at the back, counter in front of it,
-    // stools on the camera side. Never mirrored — see the checklist.
-    { kind: "tiki-back-bar", at: [-0.58, -0.86] },
-    { kind: "tiki-bar-counter", at: [-0.58, -0.72] },
-    { kind: "tiki-bar-stool", at: [-0.72, -0.6] },
-    { kind: "tiki-bar-stool", at: [-0.58, -0.6] },
-    { kind: "tiki-bar-stool", at: [-0.44, -0.6] },
+    // 🍹 The bar, anchored in the FAR CORNER and laid out in metres from it so
+    // the shelf, counter and stools keep their spacing in any room: shelf at
+    // the back, counter in front, stools on the camera side. Never mirrored.
+    { kind: "tiki-back-bar", at: [-1, -1], off: [4.6, 1.7] },
+    { kind: "tiki-bar-counter", at: [-1, -1], off: [4.6, 3.3] },
+    { kind: "tiki-bar-stool", at: [-1, -1], off: [3.1, 4.4] },
+    { kind: "tiki-bar-stool", at: [-1, -1], off: [4.6, 4.4] },
+    { kind: "tiki-bar-stool", at: [-1, -1], off: [6.1, 4.4] },
 
     // 🌴 The banks. Tall things at the back, in odd groups with gaps.
     { kind: "palm-tree", at: [-0.84, 0.1] },
@@ -222,14 +258,16 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     // Everything past here is expansion — it lands only if there is room.
     { kind: "party-standing-table", at: [-0.34, -0.3] },
     { kind: "party-standing-table", at: [0.42, -0.62] },
-    { kind: "cooler", at: [-0.78, -0.86] },
-    { kind: "beach-crate", at: [-0.88, -0.78] },
-    { kind: "pergola-post", at: [-0.82, -0.92] },
-    { kind: "pergola-post", at: [-0.34, -0.92] },
-    { kind: "pergola-post", at: [-0.82, -0.52] },
-    { kind: "pergola-post", at: [-0.34, -0.52] },
-    { kind: "pergola-roof", at: [-0.58, -0.72] },
-    { kind: "gift-box", at: [0.3, -0.72] },
+    { kind: "cooler", at: [-1, -1], off: [1.3, 3.4] },
+    { kind: "beach-crate", at: [-1, -1], off: [2.3, 0.9] },
+    // The pergola is a RIGID GROUP: four posts 6.6 × 3.6 apart (the roof's
+    // size) or nothing — a roof floating over two posts is worse than no roof.
+    { kind: "pergola-post", at: [-1, -1], off: [1.3, 1.7], group: "pergola" },
+    { kind: "pergola-post", at: [-1, -1], off: [7.9, 1.7], group: "pergola" },
+    { kind: "pergola-post", at: [-1, -1], off: [1.3, 5.3], group: "pergola" },
+    { kind: "pergola-post", at: [-1, -1], off: [7.9, 5.3], group: "pergola" },
+    { kind: "pergola-roof", at: [-1, -1], off: [4.6, 3.5], group: "pergola" },
+    { kind: "gift-box", at: [0.86, -0.72] },
     { kind: "surfboard", at: [-0.94, 0.3] },
     { kind: "beach-ball", at: [-0.42, 0.14] },
     { kind: "beach-ball", at: [0.3, 0.9] },
@@ -404,87 +442,14 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     name: "Beach Birthday Party",
     description:
       "A winding river across the front with a plank bridge to the far bank, palms along both banks, a tiki bar under a lantern-strung pergola, cake and gifts along the back, a lit dance floor — and an empty middle.",
-    // The fixed list below was DRAWN for a 5×5 module and is what PLACE
-    // uses; `layout` (ADD) is the version that fits whatever room it lands in.
-    //
-    // ── ZONES ──────────────────────────────────────────────────────────────
-    //  z -15 ┌────────────────────────────────────────────────┐
-    //        │ BAR + PERGOLA      CAKE · GIFTS · BANNER        │ ← back, tallest
-    //   z -5 │                                      DANCE ▓▓   │
-    //        │              ·  E M P T Y  ·                     │ ← the crowd
-    //    z 2 │ ~~~~~~~~~~~~~ THE RIVER ~~~~~╫~~~~~~~~~~~~~~~~~ │ ← front, winding
-    //   z 12 │        far bank: loungers, parasol, towel   ╫    │   ╫ = the bridge
-    //   z 15 └────────────────────────────────────────────────┘
-    //
-    //  The river's centre line runs z = 7 + 1.8·sin(0.38x + 0.6), so the water
-    //  spans roughly z 2.6 → 11.4 and wanders by ±1.8 along the way. Its banks
-    //  are walkable — the obstacle is per-column strips, not one box — and the
-    //  bridge at x 5.5 cuts a walkable lane straight through them.
+    // PLACE and ADD share one source: the fitted layout, here at the DEFAULT
+    // 2×2 envelope every room is born with. A hand-authored 5×5 list lived
+    // here before and put every piece outside the walls of a real room.
+    // The Empty Room's own terminal rides along so PLACE never strands a room
+    // without its edit-mode entry (id ≠ the reserved "wall-computer").
     items: [
-      { id: "beach-computer", kind: "wall-computer", pos: { x: -2.8, z: -14.9 }, rot: 0, movable: true },
-
-      // 🌊 THE RIVER, and the way across. The bridge is axis-aligned because
-      // the pathfinder forbids corner-cutting — a diagonal bridge is a bridge
-      // nobody can walk.
-      { id: "beach-river", kind: "beach-river", pos: { x: 0, z: 7.0 }, rot: 0, movable: false },
-      { id: "beach-bridge", kind: "plank-bridge", pos: { x: 5.5, z: 7.8 }, rot: 0, movable: false },
-
-      // 🍹 THE BAR — far corner, under its own lanterns.
-      { id: "beach-backbar", kind: "tiki-back-bar", pos: { x: -9.0, z: -12.8 }, rot: 0, movable: true },
-      { id: "beach-counter", kind: "tiki-bar-counter", pos: { x: -9.0, z: -11.0 }, rot: 0, movable: true },
-      { id: "beach-stool-1", kind: "tiki-bar-stool", pos: { x: -10.6, z: -9.9 }, rot: 0, movable: true },
-      { id: "beach-stool-2", kind: "tiki-bar-stool", pos: { x: -9.0, z: -9.9 }, rot: 0, movable: true },
-      { id: "beach-stool-3", kind: "tiki-bar-stool", pos: { x: -7.4, z: -9.9 }, rot: 0, movable: true },
-      { id: "beach-post-nw", kind: "pergola-post", pos: { x: -12.4, z: -13.6 }, rot: 0, movable: true },
-      { id: "beach-post-ne", kind: "pergola-post", pos: { x: -5.6, z: -13.6 }, rot: 0, movable: true },
-      { id: "beach-post-sw", kind: "pergola-post", pos: { x: -12.4, z: -9.2 }, rot: 0, movable: true },
-      { id: "beach-post-se", kind: "pergola-post", pos: { x: -5.6, z: -9.2 }, rot: 0, movable: true },
-      { id: "beach-pergola", kind: "pergola-roof", pos: { x: -9.0, z: -11.4 }, rot: 0, movable: true },
-      // Behind the shelf, not across the approach — the bartender row stays open.
-      { id: "beach-cooler", kind: "cooler", pos: { x: -11.8, z: -12.9 }, rot: 0, movable: true },
-      { id: "beach-crate-1", kind: "beach-crate", pos: { x: -12.5, z: -12.0 }, rot: 0, movable: true },
-      { id: "beach-torch-1", kind: "tiki-torch", pos: { x: -4.6, z: -13.2 }, rot: 0, movable: true },
-      { id: "beach-torch-2", kind: "tiki-torch", pos: { x: -4.6, z: -8.6 }, rot: 0, movable: true },
-
-      // 🎂 THE PARTY CLUSTER — beside the bar, facing the empty middle.
-      { id: "beach-cake", kind: "cake-table", pos: { x: 2.2, z: -11.8 }, rot: 0, movable: true },
-      { id: "beach-banner", kind: "birthday-banner", pos: { x: 2.2, z: -13.3 }, rot: 0, movable: true },
-      { id: "beach-gift-1", kind: "gift-box", pos: { x: 0.5, z: -11.6 }, rot: 0, movable: true },
-      { id: "beach-gift-2", kind: "gift-box", pos: { x: -0.3, z: -12.4 }, rot: 0, movable: true },
-      { id: "beach-gift-3", kind: "gift-box", pos: { x: 3.9, z: -12.0 }, rot: 0, movable: true },
-      { id: "beach-balloons-1", kind: "birthday-balloons", pos: { x: 5.4, z: -12.4 }, rot: 0, movable: true },
-      { id: "beach-balloons-2", kind: "birthday-balloons", pos: { x: -1.3, z: -13.0 }, rot: 0, movable: true },
-
-      // 💃 THE DANCE FLOOR — east, speaker on its back edge.
-      { id: "beach-floor", kind: "dance-floor", pos: { x: 10.4, z: -5.6 }, rot: 0, movable: true },
-      { id: "beach-speaker", kind: "party-speaker", pos: { x: 10.4, z: -8.2 }, rot: 0, movable: true },
-
-      { id: "beach-stand-1", kind: "party-standing-table", pos: { x: -5.4, z: -5.2 }, rot: 0, movable: true },
-      { id: "beach-stand-2", kind: "party-standing-table", pos: { x: 6.6, z: -8.4 }, rot: 0, movable: true },
-
-      // 🌴 THE NEAR BANK — palms and boards in odd groups, gaps between, never
-      // in a line and never between the camera and the cake.
-      { id: "beach-palm-1", kind: "palm-tree", pos: { x: -12.6, z: 1.0 }, rot: 0, movable: true },
-      { id: "beach-palm-2", kind: "palm-tree", pos: { x: -10.8, z: -1.4 }, rot: 0, movable: true },
-      { id: "beach-palm-3", kind: "palm-tree", pos: { x: 12.8, z: 0.4 }, rot: 0, movable: true },
-      { id: "beach-palm-4", kind: "palm-tree", pos: { x: -13.2, z: -7.0 }, rot: 0, movable: true },
-      { id: "beach-board-1", kind: "surfboard", pos: { x: -13.6, z: 2.4 }, rot: 0, movable: true },
-      { id: "beach-ball-1", kind: "beach-ball", pos: { x: -6.4, z: 1.2 }, rot: 0, movable: true },
-      { id: "beach-crate-2", kind: "beach-crate", pos: { x: 13.4, z: -2.2 }, rot: 0, movable: true },
-
-      // 🏝️ THE FAR BANK — the cheapest way to make a room feel bigger than it
-      // is, and the reason the bridge is worth walking.
-      { id: "beach-palm-5", kind: "palm-tree", pos: { x: -8.0, z: 13.4 }, rot: 0, movable: true },
-      { id: "beach-palm-6", kind: "palm-tree", pos: { x: 11.6, z: 13.2 }, rot: 0, movable: true },
-      { id: "beach-parasol-1", kind: "parasol", pos: { x: -3.2, z: 13.4 }, rot: 0, movable: true },
-      { id: "beach-lounger-1", kind: "sun-lounger", pos: { x: -4.6, z: 13.5 }, rot: 0, movable: true },
-      { id: "beach-lounger-2", kind: "sun-lounger", pos: { x: -1.8, z: 13.6 }, rot: 0, movable: true },
-      { id: "beach-towel-1", kind: "beach-towel", pos: { x: 1.6, z: 13.8 }, rot: 0, movable: true },
-      { id: "beach-parasol-2", kind: "parasol", pos: { x: 8.4, z: 13.5 }, rot: 0, movable: true },
-      { id: "beach-lounger-3", kind: "sun-lounger", pos: { x: 9.6, z: 13.6 }, rot: 0, movable: true },
-      { id: "beach-board-2", kind: "surfboard", pos: { x: 13.6, z: 12.6 }, rot: 0, movable: true },
-      { id: "beach-ball-2", kind: "beach-ball", pos: { x: 3.4, z: 13.2 }, rot: 0, movable: true },
-      { id: "beach-towel-2", kind: "beach-towel", pos: { x: -11.0, z: 13.6 }, rot: 0, movable: true },
+      { id: "beach-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
+      ...layoutBeachParty({ halfX: 6, halfZ: 6 }),
     ],
 
     // 🧩 …and the version that FITS: ADD SET runs this against the room's real

@@ -6483,6 +6483,25 @@ function buildBeachRiver(ctx: BuildCtx) {
   place(riverBankFace(wDeep, 1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
   place(riverBankFace(wDeep, -1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
 
+  // ── End caps. The cut stops short of the wall, so each end of the trench is
+  //    an open cross-section — and the platform has no skirt below floor
+  //    level, so from outside the room you looked straight into it: a stack
+  //    of teal steps under the floor's edge. A wall closes each end — in the
+  //    platform's own dark, so it reads as the underside of the room rather
+  //    than as a pale block hung off its edge (a sand-coloured cap did).
+  for (const side of [1, -1] as const) {
+    const lx = side * halfLen;
+    const zc = riverCentreZ(lx);
+    const depth = -RIVER_Y_DEEP;
+    place(
+      new THREE.BoxGeometry(0.06, depth, wWet * 2),
+      m(0x141a26, 0.95, 0.0),
+      lx - side * 0.03,
+      -depth / 2,
+      zc,
+    );
+  }
+
   // ── The water surface itself, translucent over the bed ──
   const waterMat = both(m(WATER, 0.25, 0.1));
   translucent(waterMat, 0.72);
@@ -6555,10 +6574,17 @@ function buildBeachRiver(ctx: BuildCtx) {
  * walkable over water.
  */
 const BRIDGE_W = 1.8;
-const BRIDGE_LEN = 9.0;
+/** Bridge length follows the RIVER (which follows the room): the excavation's
+ *  full width at its widest bend, plus a 0.7 m landing on each bank. A fixed
+ *  9 m span authored for a 5×5 module ran through the wall of a 2×2 one. */
+function bridgeLen(): number {
+  const rm = riverMetrics();
+  return 2 * (rm.wWet + rm.amp) + 1.4;
+}
 
 function buildPlankBridge({ m, place }: BuildCtx) {
-  const PLANKS = 18;
+  const BRIDGE_LEN = bridgeLen();
+  const PLANKS = Math.max(8, Math.round(BRIDGE_LEN * 2));
   for (let i = 0; i < PLANKS; i++) {
     const z = -BRIDGE_LEN / 2 + (i + 0.5) * (BRIDGE_LEN / PLANKS);
     place(
@@ -8475,7 +8501,7 @@ function localBoxToWorld(item: FurnitureItem, x0: number, z0: number, x1: number
  *  rotated box is still an AABB). */
 function bridgeLocalBox(river: FurnitureItem, bridge: FurnitureItem): Box {
   const half = ((4 - river.rot) % 4) as Rot;
-  const c = rotXZ(BRIDGE_W / 2, BRIDGE_LEN / 2, bridge.rot);
+  const c = rotXZ(BRIDGE_W / 2, bridgeLen() / 2, bridge.rot);
   const w0 = { x: bridge.pos.x - Math.abs(c.x), z: bridge.pos.z - Math.abs(c.z) };
   const w1 = { x: bridge.pos.x + Math.abs(c.x), z: bridge.pos.z + Math.abs(c.z) };
   const a = rotXZ(w0.x - river.pos.x, w0.z - river.pos.z, half);
