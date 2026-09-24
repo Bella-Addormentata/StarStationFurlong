@@ -30,7 +30,9 @@ import { FURNITURE, FURNITURE_DEFS, buildDeviceList, itemAabb } from './furnitur
 import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
-import type { DoorDockingPortSystem, DockingState } from './docking';
+import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
+// ⚓ #163: the helm's docking computer draws the ship atlas in room metres.
+import { roomHalfExtents } from './floorPlanDoc';
 import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
@@ -1829,21 +1831,71 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   };
 }
 
-// ── 🚀 #30 SH1: the HELM console — ship status, no flight yet ────────────────
+// ── 🚀 #30 SH1: the HELM console — ship status + ⚓ #163 docking computer ────
+
+/**
+ * ⚓ #163: what the helm's DOCKING COMPUTER reads and does. world.ts wires it
+ * to the room's docking system — the same DOCK / UNDOCK the door panel runs,
+ * so the two surfaces can never disagree about a port.
+ */
+export interface HelmDockingDeps {
+  /** Every dock port of this module, in door order. */
+  ports: () => DockPortView[];
+  /** Every module connected to this one, posed in this room's frame. */
+  connected: () => ReturnType<DoorDockingPortSystem['connectedModules']>;
+  /** Subscribe to port changes; returns the unsubscribe. */
+  subscribe: (cb: () => void) => () => void;
+  undock: (doorId: string) => void;
+  dock: (doorId: string) => void;
+}
+
+/** Port marker colours on the ship atlas (and the status words beside them). */
+const PORT_TONE: Record<DockPortView['state']['kind'], string> = {
+  docked: '#00E676',
+  undocked: '#FFB300',
+  free: '#80D8FF',
+  gangway: 'rgba(212,168,75,0.6)',
+};
+
+function portStatusText(p: DockPortView): string {
+  const who = p.partnerName ?? 'the other module';
+  switch (p.state.kind) {
+    case 'docked': return `DOCKED → ${who}`;
+    case 'undocked': return `UNDOCKED · last berth ${who}`;
+    case 'gangway': return 'connected by a gangway';
+    default: return 'FREE · no berth on record';
+  }
+}
 
 /**
  * The helm's focused UI: a SHIP STATUS checklist derived LIVE from the room's
  * furniture (the fittings ARE the requirements — #62's physical-item ruling
- * applied to ships). No doc state of its own in SH1: presence of fittings is
- * already shared truth via the furniture map. Flight controls arrive with the
- * flight slices (spaceship-conversion-plan.md); the panel says so honestly.
+ * applied to ships), and — ⚓ #163 — a DOCKING COMPUTER: DOCK / UNDOCK for
+ * the module's docking-adapter ports. One port gets a plain button; several
+ * get the SHIP ATLAS, a top-down map of this module, its ports and what they
+ * are docked to, to choose from. Flight itself (destinations, travel) still
+ * arrives with the flight slices (spaceship-conversion-plan.md SH3).
  */
-export function createHelmUI(): DeviceUI {
+export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
+  let unsubscribeDocks: (() => void) | null = null;
+  /** The port the docking computer acts on (several ports ⇒ picked on the map). */
+  let selected: string | null = null;
+  /** Port marker hit areas on the atlas canvas, CSS px — rebuilt every draw. */
+  let markers: Array<{ doorId: string; x: number; y: number }> = [];
+
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
   const render = (): void => {
     if (!panel) return;
+    // Every render swaps the whole panel (a dock landing re-renders it too):
+    // remember which docking control had keyboard focus, and give it back.
+    const focused = document.activeElement as HTMLElement | null;
+    const refocus = focused && panel.contains(focused)
+      ? { pick: focused.dataset.helmPick, dock: focused.dataset.helmDock !== undefined }
+      : null;
     const engines = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('engine')).length;
     const tanks = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank')).length;
     const check = (ok: boolean) => ok
@@ -1854,6 +1906,26 @@ export function createHelmUI(): DeviceUI {
         <span style="color:rgba(212,168,75,0.75);">${label}</span><span>${value}</span>
       </div>`;
     const ready = engines >= 1 && tanks >= 1;
+    const ports = docking?.ports() ?? [];
+    if (!ports.some((p) => p.doorId === selected)) {
+      selected = (ports.find((p) => p.state.kind === 'docked') ?? ports[0])?.doorId ?? null;
+    }
+    const docked = ports.filter((p) => p.state.kind === 'docked');
+    const dockingRow = ports.length === 0
+      ? '— <span style="color:rgba(212,168,75,0.45);">no dock port</span>'
+      : `${check(true)} ${ports.length} port${ports.length === 1 ? '' : 's'} · ${
+          docked.length ? `docked to ${esc(docked.map((p) => p.partnerName ?? 'module').join(', '))}` : 'undocked'
+        }`;
+    // A GANGWAY holds a module as surely as a dock does — it is structure,
+    // and UNDOCK does not release it. "Free" means neither.
+    const bolted = [...new Set((docking?.connected() ?? []).filter((m) => !m.dock).map((m) => m.name))];
+    const message = !ready
+      ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
+      : bolted.length
+        ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
+        : docked.length
+          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. UNDOCK below and it is free to fly away; flight itself (destinations, travel) arrives with the flight update.'
+          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Flight itself arrives with the flight update; DOCK brings it back to a berth.';
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — SHIP STATUS</span>
@@ -1862,17 +1934,212 @@ export function createHelmUI(): DeviceUI {
       ${row('ENGINES', `${check(engines >= 1)} ${engines} mounted`)}
       ${row('FUEL', `${check(tanks >= 1)} ${tanks} tank${tanks === 1 ? '' : 's'}${tanks > 0 ? ' · FULL' : ' — install a fuel tank'}`)}
       ${row('HELM', `${check(true)} online`)}
+      ${row('DOCKING', dockingRow)}
       ${row('PROVISIONS', '— <span style="color:rgba(212,168,75,0.45);">galley update coming</span>')}
       ${row('HULL', `${check(true)} sealed`)}
       <div style="margin-top:10px; padding:10px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.6; color:${ready ? '#00E676' : 'rgba(212,168,75,0.7)'};">
-        ${ready
-          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. Undocking and flight arrive with the flight update; the station keeps you safely berthed until then.'
-          : 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'}
+        ${message}
       </div>
+      ${docking ? renderDockingComputer(ports) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
-        SSF FLIGHT SYSTEMS v0 · status only — controls arrive with the flight update
+        SSF FLIGHT SYSTEMS v0 · docking live — flight controls arrive with the flight update
       </div>
     `;
+    const canvas = panel.querySelector<HTMLCanvasElement>('#helm-ship-atlas');
+    if (canvas && docking) drawShipAtlas(canvas, ports, docking.connected());
+    if (refocus) {
+      const target = refocus.pick !== undefined
+        ? [...panel.querySelectorAll<HTMLElement>('[data-helm-pick]')].find((b) => b.dataset.helmPick === refocus.pick)
+        : refocus.dock
+          ? panel.querySelector<HTMLElement>('[data-helm-dock]')
+          : null;
+      target?.focus();
+    }
+  };
+
+  /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
+   *  atlas + a port list for several. */
+  const renderDockingComputer = (ports: DockPortView[]): string => {
+    const screen = (inner: string) => `
+      <div style="margin-top:10px; border:1px solid #1E88A8; border-radius:8px; background:#06121C; padding:10px 12px; color:#80D8FF; font-size:10px; line-height:1.5; box-shadow: inset 0 0 18px rgba(0,229,255,0.08);">
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:#00E5FF; margin-bottom:6px;">⚓ DOCKING COMPUTER${ports.length > 1 ? ' · SHIP ATLAS' : ''}</div>
+        ${inner}
+      </div>`;
+    if (ports.length === 0) {
+      return screen(`NO DOCK PORT on this module. Fit one at any door — door panel › CONNECTION ASSEMBLY › <b>+DOCK</b>. A dock has two halves: one on your door, one on the berth's.`);
+    }
+    const sel = ports.find((p) => p.doorId === selected) ?? ports[0];
+    const action = (p: DockPortView): string => {
+      const canAct = p.canOperate && !p.busy;
+      const btn = (verb: 'undock' | 'dock', label: string, color: string) =>
+        `<button type="button" data-helm-dock="${verb}" data-door="${esc(p.doorId)}" ${canAct ? '' : 'disabled'} style="width:100%; margin-top:8px; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.3); color:${color}; font-size:11px; font-weight:800; padding:8px; cursor:${canAct ? 'pointer' : 'not-allowed'}; opacity:${canAct ? '1' : '0.45'}; letter-spacing:1px;">${label}</button>`;
+      const who = esc(p.partnerName ?? 'the other module');
+      const verb = p.state.kind === 'docked'
+        ? btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80')
+        : p.state.kind === 'undocked'
+          ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
+          : p.state.kind === 'free'
+            ? `<div style="margin-top:6px; color:rgba(128,216,255,0.7);">No berth on record — dock this port from its door panel: pick a station and INITIATE.</div>`
+            : '';
+      const note = p.note
+        ? `<div style="margin-top:6px; color:${p.busy ? '#FFB300' : p.tone === 'ok' ? '#00E676' : p.tone === 'bad' ? '#FF8A80' : '#FFB300'};">${p.busy ? '⏳ ' : ''}${esc(p.note)}</div>`
+        : '';
+      const rights = !p.canOperate && (p.state.kind === 'docked' || p.state.kind === 'undocked')
+        ? `<div style="margin-top:6px; color:rgba(128,216,255,0.55);">Only the owner — or a builder at that door — can dock and undock it.</div>`
+        : '';
+      return verb + note + rights;
+    };
+    if (ports.length === 1) {
+      const p = ports[0];
+      return screen(`
+        <div><b style="color:#F2EFE6;">${esc(p.label)}</b> · <span style="color:${PORT_TONE[p.state.kind]};">${esc(portStatusText(p))}</span></div>
+        ${action(p)}`);
+    }
+    // Real buttons, so every port is reachable and selectable from the
+    // keyboard (Tab, then Enter / Space) — the atlas canvas is pointer-only.
+    const list = ports.map((p, i) => `
+        <button type="button" data-helm-pick="${esc(p.doorId)}" aria-pressed="${p.doorId === sel.doorId}" aria-label="Port ${i + 1}: ${esc(p.label)}, ${esc(portStatusText(p))}" style="display:flex; width:100%; gap:8px; align-items:center; padding:3px 6px; margin-top:2px; border:none; border-radius:5px; background:${p.doorId === sel.doorId ? 'rgba(0,229,255,0.12)' : 'transparent'}; box-shadow:${p.doorId === sel.doorId ? 'inset 0 0 0 1px rgba(0,229,255,0.4)' : 'none'}; color:inherit; font:inherit; text-align:left; cursor:pointer;">
+          <span style="display:inline-block; flex-shrink:0; width:16px; height:16px; line-height:16px; text-align:center; border-radius:50%; background:${PORT_TONE[p.state.kind]}; color:#06121C; font-weight:800; font-size:9px;">${i + 1}</span>
+          <span style="color:#F2EFE6;">${esc(p.label)}</span>
+          <span style="color:${PORT_TONE[p.state.kind]}; margin-left:auto; text-align:right;">${esc(portStatusText(p))}</span>
+        </button>`).join('');
+    return screen(`
+      <canvas id="helm-ship-atlas" width="652" height="400" style="width:326px; height:200px; display:block; border-radius:6px; background:#030A10; cursor:pointer;" title="Pick a port on the ship atlas"></canvas>
+      ${list}
+      <div style="margin-top:6px; color:#F2EFE6;">SELECTED: <b>${esc(sel.label)}</b></div>
+      ${action(sel)}`);
+  };
+
+  /** ⚓ The SHIP ATLAS: this module top-down, every module connected to it
+   *  (docked berths dashed white, bolted-on gangway modules gold), and the
+   *  ports as numbered round markers — green docked, amber undocked with a
+   *  berth on record, blue free. North (−z) is up, like the wall computer. */
+  const drawShipAtlas = (
+    canvas: HTMLCanvasElement,
+    ports: DockPortView[],
+    connected: ReturnType<DoorDockingPortSystem['connectedModules']>,
+  ): void => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const W = canvas.width, H = canvas.height;
+    const cssScale = canvas.clientWidth ? canvas.width / canvas.clientWidth : 2;
+    const { halfX, halfZ } = roomHalfExtents();
+    // Module outline corners, rotated into this room's frame (three.js
+    // rotation.y: x' = x·cos + z·sin, z' = −x·sin + z·cos).
+    const corners = (m: { x: number; z: number; rotY: number; halfX: number; halfZ: number }) => {
+      const c = Math.cos(m.rotY), s = Math.sin(m.rotY);
+      return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => {
+        const lx = sx * m.halfX, lz = sz * m.halfZ;
+        return { x: m.x + lx * c + lz * s, z: m.z - lx * s + lz * c };
+      });
+    };
+    // Where each port's round half sits: just outside its door (the stub's
+    // middle), so the marker lands on the adapter itself.
+    const portAt = (doorId: string) => {
+      const p = physicalDoorPose(doorId);
+      const out = 1.6;
+      return { x: p.x + Math.sin(p.outwardYaw) * out, z: p.z + Math.cos(p.outwardYaw) * out };
+    };
+    const pts: Array<{ x: number; z: number }> = [
+      { x: -halfX, z: -halfZ }, { x: halfX, z: halfZ },
+      ...connected.flatMap((m) => corners(m)),
+      ...ports.map((p) => portAt(p.doorId)),
+    ];
+    const minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
+    const minZ = Math.min(...pts.map((p) => p.z)), maxZ = Math.max(...pts.map((p) => p.z));
+    const PAD = 36;
+    const scale = Math.min((W - PAD * 2) / Math.max(1, maxX - minX), (H - PAD * 2) / Math.max(1, maxZ - minZ));
+    const ox = W / 2 - ((minX + maxX) / 2) * scale;
+    const oz = H / 2 - ((minZ + maxZ) / 2) * scale;
+    const px = (x: number) => ox + x * scale;
+    const pz = (z: number) => oz + z * scale;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#030A10';
+    ctx.fillRect(0, 0, W, H);
+    const poly = (cs: Array<{ x: number; z: number }>) => {
+      ctx.beginPath();
+      cs.forEach((c, i) => (i ? ctx.lineTo(px(c.x), pz(c.z)) : ctx.moveTo(px(c.x), pz(c.z))));
+      ctx.closePath();
+    };
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // Connected modules first (under the ports).
+    for (const m of connected) {
+      const door = physicalDoorPose(m.doorId);
+      ctx.strokeStyle = m.dock ? 'rgba(242,239,230,0.55)' : 'rgba(212,168,75,0.45)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(px(door.x), pz(door.z));
+      ctx.lineTo(px(m.x), pz(m.z));
+      ctx.stroke();
+      poly(corners(m));
+      ctx.fillStyle = m.dock ? 'rgba(242,239,230,0.07)' : 'rgba(212,168,75,0.10)';
+      ctx.fill();
+      ctx.setLineDash(m.dock ? [10, 8] : []);
+      ctx.strokeStyle = m.dock ? '#F2EFE6' : '#D4A84B';
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = m.dock ? '#F2EFE6' : '#D4A84B';
+      ctx.fillText(m.name.slice(0, 18).toUpperCase(), px(m.x), pz(m.z));
+    }
+    // This module.
+    poly(corners({ x: 0, z: 0, rotY: 0, halfX, halfZ }));
+    ctx.fillStyle = 'rgba(62,146,184,0.16)';
+    ctx.fill();
+    ctx.strokeStyle = '#3E92B8';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.fillStyle = '#80D8FF';
+    ctx.fillText('THIS MODULE', px(0), pz(0));
+    // Ports.
+    markers = [];
+    ports.forEach((p, i) => {
+      const at = portAt(p.doorId);
+      const cx = px(at.x), cy = pz(at.z);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+      ctx.fillStyle = PORT_TONE[p.state.kind];
+      ctx.fill();
+      ctx.lineWidth = p.doorId === selected ? 5 : 2;
+      ctx.strokeStyle = p.doorId === selected ? '#FFFFFF' : '#06121C';
+      ctx.stroke();
+      ctx.fillStyle = '#06121C';
+      ctx.fillText(String(i + 1), cx, cy + 1);
+      markers.push({ doorId: p.doorId, x: cx / cssScale, y: cy / cssScale });
+    });
+  };
+
+  const onClick = (e: MouseEvent): void => {
+    if (!panel || !docking) return;
+    const target = e.target as HTMLElement;
+    const act = target.closest<HTMLElement>('[data-helm-dock]');
+    if (act && !(act as HTMLButtonElement).disabled) {
+      const doorId = act.dataset.door ?? '';
+      if (act.dataset.helmDock === 'undock') docking.undock(doorId);
+      else docking.dock(doorId);
+      return;
+    }
+    const pick = target.closest<HTMLElement>('[data-helm-pick]');
+    if (pick) {
+      selected = pick.dataset.helmPick ?? selected;
+      render();
+      return;
+    }
+    if (target.id === 'helm-ship-atlas') {
+      const r = target.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      let best: { doorId: string; d: number } | null = null;
+      for (const m of markers) {
+        const d = Math.hypot(m.x - x, m.y - y);
+        if (d < 18 && (!best || d < best.d)) best = { doorId: m.doorId, d };
+      }
+      if (best) {
+        selected = best.doorId;
+        render();
+      }
+    }
   };
 
   return {
@@ -1888,16 +2155,23 @@ export function createHelmUI(): DeviceUI {
         color: #d4a84b; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         box-sizing: border-box; pointer-events: auto;
       `;
-      panel.addEventListener('click', (e) => e.stopPropagation());
+      panel.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onClick(e);
+      });
       host.appendChild(panel);
       unsubscribe = subscribeFurnitureForHelm(() => render());
+      unsubscribeDocks = docking?.subscribe(() => render()) ?? null;
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      unsubscribeDocks?.();
+      unsubscribeDocks = null;
       panel?.remove();
       panel = null;
+      markers = [];
     },
 
     update(): void { /* status is observer-driven; nothing per-frame */ },

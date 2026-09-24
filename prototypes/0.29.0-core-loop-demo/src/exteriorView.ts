@@ -25,11 +25,7 @@ import {
   nextFreeExteriorSlot,
   writeExteriorSlot,
 } from "./exteriorDoc";
-import { readDoorPolicy } from "./doorPolicy";
-import { physicalDoorPose } from "./doorLayout";
-import {
-  readAllDoorLayout, doorSetIsAuthoritative, doorDisplayName,
-} from "./doorLayoutDoc";
+import { doorDisplayName } from "./doorLayoutDoc";
 import type { DoorWall } from "./doorLayoutDoc";
 import { FURNITURE, buildItemGroup } from "./furniture";
 // 🛰️ Hull unification: the space view renders REAL exterior items (see the
@@ -169,8 +165,8 @@ function buildGroup(): THREE.Group {
 
   // 🛑📐 #80: FROM SPACE the current module reads as an OCTAGON shell when the
   // preview flag is on. We skip the flat roof plating + dome/antennas/solar
-  // dress (all authored for a flat 4.14 roof); dock collars + real exterior
-  // items below stay put.
+  // dress (all authored for a flat 4.14 roof); the real exterior items below
+  // stay put (dock ports are the world's own vestibules now — ⚓ #163).
   if (OCTAGON_HULL) {
     const { halfX, halfZ } = roomHalfExtents();
     // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
@@ -269,113 +265,13 @@ function buildGroup(): THREE.Group {
   }
   } // end !OCTAGON_HULL current-module dress
 
-  // 🔌 IDA-style docking collars at adapter doors (#67 D2 — built to the
-  // owner's pixel-art reference): white soft-goods torus, black capture
-  // latches around the rim, concentric silver guide rings with an X brace,
-  // a flank equipment box, and BLUE truss struts back to the hull.
-  // 🔌 Iterate the room's REAL door set, not the four cardinal names: an
-  // adapter can now be installed on a free `d:` door, and it has to grow a
-  // collar out on the hull like any other.
-  //
-  // The unseeded fallback matters (same convention as editMode's door-opening
-  // enumeration): readAllDoorLayout is empty for any room whose owner never
-  // touched the door editor, and iterating it bare would silently delete the
-  // collar from every such room — a regression with no error to notice.
-  const layout = readAllDoorLayout();
-  const doorIds: string[] = doorSetIsAuthoritative()
-    ? [...layout.keys()]
-    : ["north", "south", "east", "west"];
-  for (const doorId of doorIds) {
-    if (!readDoorPolicy(doorId).adapter) continue;
-    const pose = physicalDoorPose(doorId);
-    const collar = new THREE.Group();
-    collar.name = `dockAdapter-${doorId}`;
-    const softGoods = new THREE.MeshStandardMaterial({
-      color: 0xf2efe6,
-      roughness: 0.85,
-      metalness: 0.08,
-    });
-    const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(1.35, 0.42, 12, 28),
-      softGoods,
-    );
-    collar.add(ring);
-    // Capture latches: 6 black blocks around the rim face.
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2 + Math.PI / 6;
-      const latch = new THREE.Mesh(
-        new THREE.BoxGeometry(0.34, 0.34, 0.22),
-        new THREE.MeshStandardMaterial({
-          color: 0x14161c,
-          roughness: 0.6,
-          metalness: 0.4,
-        }),
-      );
-      latch.position.set(Math.cos(a) * 1.35, Math.sin(a) * 1.35, 0.42);
-      collar.add(latch);
-    }
-    // Concentric guide rings + X cross-brace (silver).
-    const silver = new THREE.MeshStandardMaterial({
-      color: 0xb8bfcc,
-      roughness: 0.4,
-      metalness: 0.7,
-    });
-    for (const r of [0.85, 0.6]) {
-      const guide = new THREE.Mesh(
-        new THREE.TorusGeometry(r, 0.05, 8, 24),
-        silver,
-      );
-      guide.position.z = 0.18;
-      collar.add(guide);
-    }
-    for (const rz of [Math.PI / 4, -Math.PI / 4]) {
-      const brace = new THREE.Mesh(
-        new THREE.BoxGeometry(1.6, 0.06, 0.06),
-        silver,
-      );
-      brace.position.z = 0.14;
-      brace.rotation.z = rz;
-      collar.add(brace);
-    }
-    // Flank equipment box with a dark label plate (the IDA2 crate).
-    const crate = new THREE.Mesh(
-      new THREE.BoxGeometry(0.62, 0.62, 0.62),
-      softGoods,
-    );
-    crate.position.set(1.55, -0.55, 0.1);
-    collar.add(crate);
-    const plate = new THREE.Mesh(
-      new THREE.BoxGeometry(0.5, 0.34, 0.02),
-      new THREE.MeshStandardMaterial({ color: 0x1c2230, roughness: 0.5 }),
-    );
-    plate.position.set(1.55, -0.5, 0.42);
-    collar.add(plate);
-    // Blue truss struts bracing back to the hull (keep the art's blue).
-    const trussBlue = new THREE.MeshStandardMaterial({
-      color: 0x2a6bd4,
-      roughness: 0.55,
-      metalness: 0.5,
-    });
-    for (const [sx, sy] of [
-      [-1, 1],
-      [1, 1],
-      [0, -1],
-    ] as const) {
-      const strut = new THREE.Mesh(
-        new THREE.BoxGeometry(0.09, 0.09, 0.9),
-        trussBlue,
-      );
-      strut.position.set(sx * 0.95, sy * 0.95, -0.55);
-      strut.rotation.y = sx * 0.35;
-      strut.rotation.x = -sy * 0.3;
-      collar.add(strut);
-    }
-    collar.position.set(pose.x, 2.0, pose.z);
-    collar.rotation.y = pose.outwardYaw;
-    // Push the collar outward along the wall normal so it hangs OFF the hull.
-    collar.translateZ(0.85);
-    g.add(collar);
-  }
+  // ⚓ #163: the IDA-style docking collar that used to hang here — on the
+  // current room's adapter doors, from space only — is RETIRED. A door's dock
+  // port is now drawn by the world as its own round half-adapter (adapter.ts
+  // buildDockHalf, in the same white soft-goods / black latch / blue truss
+  // language), so it reads identically in the room, in first person and from
+  // space, and a docked port shows the two halves mated instead of a collar
+  // with a gangway pushed through it.
 
   // 🛰️ REAL hull equipment (hull unification, retires the old fittings
   // dress): every exterior-placed item — engines, hull tanks, whole stacks —

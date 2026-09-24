@@ -118,13 +118,52 @@ function docAlive(): boolean {
 /** Sanitized read; unknown/missing values fall back to the defaults. */
 export function readDoorPolicy(doorId: string): DoorPolicyRecord {
   if (!docAlive() || !isKnownDoorId(doorId)) return { ...DEFAULT_DOOR_POLICY };
-  const raw = policyMap!.get(doorId) as Partial<DoorPolicyRecord> | undefined;
+  return sanitizePolicy(policyMap!.get(doorId));
+}
+
+/** The read boundary for one stored policy value (peer-written, untrusted). */
+function sanitizePolicy(value: unknown): DoorPolicyRecord {
+  const raw = value as Partial<DoorPolicyRecord> | undefined;
   return {
     passage: raw?.passage === 'owner' ? 'owner' : 'public',
     ...(raw?.oneWay === 'in' || raw?.oneWay === 'out' ? { oneWay: raw.oneWay } : {}),
     construction: raw?.construction === 'request' || raw?.construction === 'public' ? raw.construction : 'owner',
     adapter: raw?.adapter === true,
   };
+}
+
+/** The one stored shape every policy writer produces. */
+function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
+  return {
+    passage: policy.passage,
+    ...(policy.oneWay === 'in' || policy.oneWay === 'out' ? { oneWay: policy.oneWay } : {}),
+    construction: policy.construction,
+    adapter: policy.adapter === true,
+  };
+}
+
+/** ⚓ #163: does this door of ANY doc wear a docking-adapter port? (The far
+ *  room's end of a DOCK reads it — dockRules.farDockPatch refuses a berth
+ *  whose port was removed.) Sanitized exactly like readDoorPolicy. */
+export function dockPortFlagIn(doc: Y.Doc, doorId: string): boolean {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return false;
+  return sanitizePolicy(doc.getMap('doorPolicy').get(doorId)).adapter === true;
+}
+
+/**
+ * ⚓ #163: fit a docking-adapter PORT on a door of ANY doc — the far room's
+ * end of a DOCK (farDoorWrite.ts holds that doc for a moment; it is not the
+ * bound one). Its other policy fields are kept exactly as stored; the caller
+ * has already checked the door exists in that room's layout.
+ */
+export function fitDockPortIn(doc: Y.Doc, doorId: string): void {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return;
+  const map = doc.getMap('doorPolicy');
+  const current = sanitizePolicy(map.get(doorId));
+  if (current.adapter) return;
+  doc.transact(() => {
+    map.set(doorId, policyShape({ ...current, adapter: true }));
+  });
 }
 
 /** Player-facing passage label (plain language, one string everywhere). */
@@ -139,12 +178,7 @@ export function passageLabel(policy: DoorPolicyRecord): string {
 export function writeDoorPolicy(doorId: string, policy: DoorPolicyRecord): void {
   if (!docAlive() || !isKnownDoorId(doorId)) return;
   boundDoc!.transact(() => {
-    policyMap!.set(doorId, {
-      passage: policy.passage,
-      ...(policy.oneWay === 'in' || policy.oneWay === 'out' ? { oneWay: policy.oneWay } : {}),
-      construction: policy.construction,
-      adapter: policy.adapter === true,
-    });
+    policyMap!.set(doorId, policyShape(policy));
   });
 }
 
