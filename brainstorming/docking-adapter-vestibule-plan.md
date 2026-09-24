@@ -181,6 +181,9 @@ factored out).
 - A dock arrival fits the arrival door with its port if it has none — in the same transaction as the
   pairing, so no peer ever holds the dock without its port (which would vanish at UNDOCK) — and the
   mirror carries `dockedAt`.
+- …but only a door with **no record** takes that first half. A tombstoned door without its port had
+  the port removed, whichever module the tombstone names, and a dock never re-fits it: the far DOCK's
+  *closed* rule, applied by the mirror too.
 
 ## 9. Slices (one PR, reviewable in this order)
 

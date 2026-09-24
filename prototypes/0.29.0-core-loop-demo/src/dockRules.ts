@@ -181,14 +181,22 @@ export function holdsOurRedock(
  * made after that door's own undock is a deliberate re-dock, so it may.
  * Compared by room id, never by seed string: two passes to the same module
  * are different strings and used to slip straight past a tombstone.
+ *
+ * A DOCK also brings the arrival door its half, so it answers to
+ * farDockPatch's CLOSED rule: a tombstoned door that no longer wears a port
+ * (`arrival.portFlag`, its doorPolicy `adapter` flag) had that port removed,
+ * whichever module the tombstone names, and a dock must never re-fit it. Only
+ * a door with no record at all takes the half a dock brings.
  */
 export function mirrorMayWrite(
   existing: DoorRecord | undefined,
   departureRoomId: string,
   departure: { isDock: boolean; dockedAt?: number },
+  arrival: { portFlag: boolean },
 ): boolean {
   if (!existing) return true;
   if (existing.paired) return false;
+  if (departure.isDock && !arrival.portFlag) return false;
   const retiredRoom = roomIdFromSeed(existing.retiredAddress);
   if (!retiredRoom || retiredRoom !== departureRoomId) return true;
   return (

@@ -342,9 +342,9 @@ describe('dockRules — undock memory and re-dock', () => {
     expect(farUndockPatch(dock, near, undockedAt).action).toBe('write'); // not "newer-dock"
     // …and the released dock's own stamp can no longer re-dock through the mirror.
     const t = buildDoorTombstone(seedFor(SHIP), { undockedAt });
-    expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: 900 })).toBe(false);
+    expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: 900 }, { portFlag: true })).toBe(false);
     // A DOCK after it, stamped by the same trailing clock, still re-docks.
-    expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: stampAfter(undockedAt, 500) })).toBe(true);
+    expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: stampAfter(undockedAt, 500) }, { portFlag: true })).toBe(true);
   });
 
   it('holdsOurRedock: a port that changed mid-DOCK holds our dock only under our own stamp', () => {
@@ -369,30 +369,69 @@ describe('dockRules — undock memory and re-dock', () => {
 
 describe('dockRules — the transit mirror', () => {
   const dep = { isDock: true, dockedAt: 50 };
+  // The arrival door wears its port, or no longer does.
+  const PORT = { portFlag: true };
+  const NO_PORT = { portFlag: false };
 
   it('never over a live pairing; freely onto an empty door', () => {
-    expect(mirrorMayWrite(buildDoorPairing(seedFor('elsewhere')), STATION, dep)).toBe(false);
-    expect(mirrorMayWrite(undefined, STATION, dep)).toBe(true);
+    expect(mirrorMayWrite(buildDoorPairing(seedFor('elsewhere')), STATION, dep, PORT)).toBe(false);
+    expect(mirrorMayWrite(undefined, STATION, dep, PORT)).toBe(true);
   });
 
   it('refuses a tombstone naming the departure room — matched by ROOM, not by seed string', () => {
     const t = buildDoorTombstone(seedFor(STATION, 'pass-A'));
-    expect(mirrorMayWrite(t, STATION, { isDock: false })).toBe(false);
+    expect(mirrorMayWrite(t, STATION, { isDock: false }, PORT)).toBe(false);
     // A different pass to the same module used to slip past the string check.
     const t2 = buildDoorTombstone(seedFor(STATION, 'pass-B'));
-    expect(mirrorMayWrite(t2, STATION, { isDock: false })).toBe(false);
+    expect(mirrorMayWrite(t2, STATION, { isDock: false }, PORT)).toBe(false);
     // A tombstone for some other module does not block this one.
-    expect(mirrorMayWrite(buildDoorTombstone(seedFor('other')), STATION, { isDock: false })).toBe(true);
+    expect(mirrorMayWrite(buildDoorTombstone(seedFor('other')), STATION, { isDock: false }, PORT)).toBe(true);
   });
 
   it('a dock made after the undock re-docks; an older one is a stale berth', () => {
     const t = buildDoorTombstone(seedFor(STATION), { undockedAt: 40 });
-    expect(mirrorMayWrite(t, STATION, { isDock: true, dockedAt: 50 })).toBe(true);
-    expect(mirrorMayWrite(t, STATION, { isDock: true, dockedAt: 30 })).toBe(false);
-    expect(mirrorMayWrite(t, STATION, { isDock: true })).toBe(false); // unstamped: stale
-    expect(mirrorMayWrite(t, STATION, { isDock: false, dockedAt: 50 })).toBe(false); // not a dock
+    expect(mirrorMayWrite(t, STATION, { isDock: true, dockedAt: 50 }, PORT)).toBe(true);
+    expect(mirrorMayWrite(t, STATION, { isDock: true, dockedAt: 30 }, PORT)).toBe(false);
+    expect(mirrorMayWrite(t, STATION, { isDock: true }, PORT)).toBe(false); // unstamped: stale
+    expect(mirrorMayWrite(t, STATION, { isDock: false, dockedAt: 50 }, PORT)).toBe(false); // not a dock
     // A plain tombstone (no memory — a closed berth) is never overridden.
-    expect(mirrorMayWrite(buildDoorTombstone(seedFor(STATION)), STATION, { isDock: true, dockedAt: 99 })).toBe(false);
+    expect(mirrorMayWrite(buildDoorTombstone(seedFor(STATION)), STATION, { isDock: true, dockedAt: 99 }, PORT)).toBe(false);
+  });
+
+  it('a dock never re-fits a port its owner removed — only a door with no record takes its first half', () => {
+    // Undocked from another module, then the port was removed: a plain
+    // tombstone naming that module, and no port flag.
+    const removed = buildDoorTombstone(seedFor('module-other'));
+    expect(mirrorMayWrite(removed, STATION, dep, NO_PORT)).toBe(false);
+    expect(mirrorMayWrite(removed, STATION, dep, PORT)).toBe(true); // still a port: a free berth
+    // A dock's own tombstone whose port is gone is closed too.
+    expect(mirrorMayWrite(buildDoorTombstone(seedFor(STATION), { undockedAt: 40 }), STATION, dep, NO_PORT)).toBe(false);
+    // A door that never had a connection takes the half the dock brings.
+    expect(mirrorMayWrite(undefined, STATION, dep, NO_PORT)).toBe(true);
+    // A gangway fits no port, so the flag is none of its business.
+    expect(mirrorMayWrite(removed, STATION, { isDock: false }, NO_PORT)).toBe(true);
+  });
+
+  it('refuses every berth the far DOCK would call closed — both ends judge a berth alike', () => {
+    const departure: NearEnd = { roomId: STATION, address: seedFor(STATION), doorId: 'd:dep' };
+    const records = [
+      undefined,
+      buildDoorTombstone(seedFor(STATION)),
+      buildDoorTombstone(seedFor(STATION), { undockedAt: 40 }),
+      buildDoorTombstone(seedFor('module-other')),
+      buildDoorTombstone(seedFor('module-other'), { undockedAt: 40 }),
+    ];
+    let closed = 0;
+    for (const record of records) {
+      for (const portFlag of [true, false]) {
+        const far = farDockPatch(record, { exists: true, portFlag }, departure, dep.dockedAt);
+        if (far.action === 'refuse' && far.reason === 'closed') {
+          closed++;
+          expect(mirrorMayWrite(record, STATION, dep, { portFlag })).toBe(false);
+        }
+      }
+    }
+    expect(closed).toBe(5); // every tombstone without its port, and the plain one naming the departure
   });
 });
 

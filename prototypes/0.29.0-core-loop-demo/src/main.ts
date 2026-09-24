@@ -2728,8 +2728,15 @@ async function transitTo(
     // ⚓ #163 (dockRules.mirrorMayWrite): the tombstone is matched by ROOM, not
     // by seed string — two different passes to one module used to slip past
     // it — and a DOCK made after that door's own undock is a deliberate
-    // re-dock the mirror completes, while an older one is a stale berth.
-    if (depRoomId && mirrorMayWrite(existing, depRoomId, depDock)) {
+    // re-dock the mirror completes, while an older one is a stale berth. A
+    // DOCK never lands on a tombstoned door whose port was removed: it would
+    // re-fit the port below.
+    if (
+      depRoomId &&
+      mirrorMayWrite(existing, depRoomId, depDock, {
+        portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
+      })
+    ) {
       // ⚓ ONE transaction for the pairing and, for a dock, its port: were the
       // pairing to land alone (a session cut between two updates), the port
       // would exist only while docked — isPortDoor infers it from the live
