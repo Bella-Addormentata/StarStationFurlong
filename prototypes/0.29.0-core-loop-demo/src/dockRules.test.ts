@@ -22,7 +22,7 @@ import {
 import { mirrorSegments, partForSegment } from './stationParts';
 import {
   berthMemoryFrom, classifyDockPort, farDockPatch, farUndockPatch, findFarDoor,
-  gangwayPartRefusal, isPortDoor, mirrorMayWrite, nextDockStep, redockRecord,
+  gangwayPartRefusal, holdsDockTo, isPortDoor, mirrorMayWrite, nextDockStep, redockRecord,
   stampAfter, type NearEnd,
 } from './dockRules';
 
@@ -357,6 +357,16 @@ describe('dockRules — the far end', () => {
     expect(farDockPatch(buildDoorPairing(seedFor(SHIP), { farDoor: 'd:shipport2' }), port, near, 40)).toEqual(occupied);
     expect(farDockPatch(buildDoorTombstone(seedFor(SHIP)), port, near, 40)).toEqual(closed);
     expect(farDockPatch(undefined, { exists: false, portFlag: true }, near, 40)).toEqual({ action: 'refuse', reason: 'gone' });
+  });
+
+  it('holdsDockTo: a dock to exactly this near end — our room, through our door', () => {
+    const mine = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, dockedAt: 40 });
+    expect(holdsDockTo(mine, near)).toBe(true);
+    expect(holdsDockTo(buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: 'd:shipport2' }), near)).toBe(false);
+    expect(holdsDockTo(buildDoorPairing(seedFor('someone'), { segments: dockChain(), farDoor: near.doorId }), near)).toBe(false);
+    expect(holdsDockTo(buildDoorPairing(seedFor(SHIP), { farDoor: near.doorId }), near)).toBe(false); // a gangway
+    expect(holdsDockTo(buildDoorTombstone(seedFor(SHIP), { undockedAt: 5 }), near)).toBe(false);
+    expect(holdsDockTo(undefined, near)).toBe(false);
   });
 
   it('DOCK never re-fits a port someone removed — even mid-removal', () => {

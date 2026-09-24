@@ -144,10 +144,16 @@ Architecture facts that bind the design:
 
 `writeFarDock(request, near)` — the roomPasses prefetch pattern: its own `NetworkProvider` + `YjsSync`
 on the local node → wait until the far replica is populated (read-before-write, so the write is
-causally after the record it replaces and wins) → one `transact` → `YjsSync.confirmOwnWrites()` (new:
-flushes the signed sends in flight — `stop()` alone can drop them — then a SyncStep1 with the
-pre-write state vector; the node's answer holds our structs only once it applied them) → teardown.
-Serialized per far room; bounded by timeouts. The decisions are pure (`dockRules.ts`, unit-tested):
+causally after the record it replaces and wins; for a room hosted *elsewhere* only a fresh, verified
+frame from its live host counts — the local node may hold a stale cached copy) → one `transact`,
+deciding on the named door read directly (never through the 64-record snapshot cap) →
+`YjsSync.confirmOwnWrites()` (new: flushes the signed sends in flight — `stop()` alone can drop them —
+then a SyncStep1 with the pre-write state vector; the node's answer holds our structs only once it
+applied them) → for a DOCK, a settle window for concurrent claims on the same berth, after which only
+the claim the CRDT kept has docked (a DOCK is not a lock) → teardown. Serialized per far room; bounded
+by timeouts. A claim that arrives only after the settle window is the residual no client can close
+alone: exactly-once arbitration needs an authority for the berth (the room host). The decisions are
+pure (`dockRules.ts`, unit-tested):
 
 - **UNDOCK far patch:** the far door's record is paired to us — our room, and our door or none named
   — and is not a newer dock (a take-back also requires our exact stamp) → dock tombstone naming us,

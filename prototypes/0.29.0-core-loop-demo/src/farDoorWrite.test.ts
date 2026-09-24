@@ -12,8 +12,8 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
-import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom } from './doorsDoc';
-import { applyFarDockRequest } from './farDoorWrite';
+import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom, readDoorFrom } from './doorsDoc';
+import { applyFarDockRequest, berthAfterSettle, roomStateReady } from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
 import type { NearEnd } from './dockRules';
 
@@ -113,6 +113,23 @@ describe('applyFarDockRequest — DOCK', () => {
     expect((doc.getMap('doorPolicy').get('d:bay') as { adapter?: boolean }).adapter).toBe(true);
   });
 
+  it('reads the named berth itself — never through the 64-record snapshot that could hide it', () => {
+    // A crowded far room: 70 other records land BEFORE the berth, so the
+    // capped snapshot never reaches it — and it is occupied.
+    const doc = new Y.Doc();
+    for (let i = 0; i < 70; i++) {
+      doc.getMap('doors').set(`d:r${i}`, buildDoorPairing(seedFor(`room-${i}`)));
+    }
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: true });
+    doc.getMap('doors').set('d:bay', buildDoorPairing(seedFor('someone-else'), { segments: dockChain() }));
+    expect(readAllDoorsFrom(doc).has('d:bay')).toBe(false); // the cap hides it…
+    expect(dockAt(doc)).toEqual({ result: { ok: false, reason: 'occupied' }, wrote: false }); // …not from the decision
+    expect(readDoorFrom(doc, 'd:bay')).toEqual(
+      buildDoorPairing(seedFor('someone-else'), { segments: dockChain() }),
+    ); // the occupant is untouched
+  });
+
   it('never re-fits a port its owner removed — even while the old berth memory still stands', () => {
     const doc = stationDoc();
     // The removal's policy write has landed; its tombstone write has not (or
@@ -141,6 +158,55 @@ describe('applyFarDockRequest — DOCK', () => {
     );
     expect(gone).toEqual({ result: { ok: false, reason: 'gone' }, wrote: false });
     expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+});
+
+describe('berthAfterSettle — two modules claiming one berth', () => {
+  const other: NearEnd = {
+    roomId: 'module-other', address: seedFor('module-other'), doorId: 'd:otherport', wall: 'x+', lateral: 0,
+  };
+  const dockReq = (nearDoorId: string, dockedAt: number) => ({
+    kind: 'dock' as const, farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId, dockedAt,
+  });
+
+  it('the CRDT keeps exactly one of two concurrent claims — and only its writer has docked', () => {
+    // A free berth on a port, replicated to two clients' sessions.
+    const base = stationDoc();
+    base.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(base));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(base));
+    // Both read it free, both write, both would be acknowledged.
+    expect(applyFarDockRequest(a, dockReq(near.doorId, 300), near).wrote).toBe(true);
+    expect(applyFarDockRequest(b, dockReq(other.doorId, 301), other).wrote).toBe(true);
+    // The settle window: each replica receives the other's claim.
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    expect(readDoorFrom(a, 'd:bay')).toEqual(readDoorFrom(b, 'd:bay')); // one berth, one answer
+    const aOut = berthAfterSettle(a, dockReq(near.doorId, 300), near);
+    const bOut = berthAfterSettle(b, dockReq(other.doorId, 301), other);
+    expect([aOut, bOut].filter((o) => o === null)).toHaveLength(1);
+    expect([aOut, bOut].find((o) => o !== null)).toEqual({ ok: false, reason: 'occupied' });
+  });
+
+  it('a berth closed under the claim reports closed', () => {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP)));
+    doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
+    expect(berthAfterSettle(doc, dockReq(near.doorId, 300), near)).toEqual({ ok: false, reason: 'closed' });
+  });
+});
+
+describe('roomStateReady — whose copy of the far room counts', () => {
+  it('a room hosted here: the owner + name on our node will do', () => {
+    expect(roomStateReady({ linkedSynced: false, hasOwnerAndName: true, hostedHere: true })).toBe(true);
+    expect(roomStateReady({ linkedSynced: false, hasOwnerAndName: false, hostedHere: true })).toBe(false);
+  });
+
+  it('a room hosted elsewhere: only a fresh answer from its live host — never the cached copy', () => {
+    expect(roomStateReady({ linkedSynced: false, hasOwnerAndName: true, hostedHere: false })).toBe(false);
+    expect(roomStateReady({ linkedSynced: true, hasOwnerAndName: false, hostedHere: false })).toBe(true);
   });
 });
 

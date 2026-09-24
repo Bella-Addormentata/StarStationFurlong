@@ -317,6 +317,25 @@ export function readAllDoorsFrom(doc: Y.Doc): Map<string, DoorRecord> {
   return readDoorsMap(doc.getMap('doors'));
 }
 
+/**
+ * ⚓ #163: ONE door's record from ANY doc, through the same guard and sanitizer
+ * as the snapshots — but never their MAX_PAIRINGS cap. The cap bounds a SCAN
+ * of a peer-written map; it could hide the very door a decision is about and
+ * make an occupied berth read as one that was never used. Every decision about
+ * a named door (the far write, DOCK / UNDOCK, the port chips) reads it here.
+ */
+export function readDoorFrom(doc: Y.Doc, doorId: string): DoorRecord | undefined {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return undefined;
+  if (!isAcceptableDoorKey(doorId)) return undefined;
+  const value = doc.getMap('doors').get(doorId);
+  return isDoorRecord(value) ? sanitizeDoorGeometry(value) : undefined;
+}
+
+/** ⚓ #163: readDoorFrom on the bound room doc. */
+export function readDoor(doorId: string): DoorRecord | undefined {
+  return docAlive() ? readDoorFrom(boundDoc!, doorId) : undefined;
+}
+
 /** ⚓ #163: write one door record into ANY doc (see readAllDoorsFrom) — the
  *  record must come from buildDoorPairing / buildDoorTombstone, so the far
  *  side is written in exactly the shape the near side is. */

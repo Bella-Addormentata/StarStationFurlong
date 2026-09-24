@@ -2853,6 +2853,11 @@ function wireAdapterTransit(): void {
   initFarDoorWrite({
     decode: decodeBootstrapInput,
     resolve: resolveBridgeBootstrap,
+    // Our home and every module we minted live on this machine's node: its
+    // replica is the room's own copy. Any other room has a host elsewhere.
+    hostedHere: (roomId) =>
+      roomId === getDefaultRoomId() ||
+      moduleLedger().some((e) => e.roomId === roomId),
   });
   world.dockingSystem?.onFarDockWrite(farDockWrite);
   // #62 P4: auto-accept decider — a pairing may complete without a far-side

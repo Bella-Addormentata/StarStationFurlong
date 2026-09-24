@@ -98,6 +98,7 @@ import {
   writeDoorTombstone,
   writeDoorPairing,
   readAllDoors,
+  readDoor,
   transactDoorWrites,
 } from "./doorsDoc";
 import {
@@ -1473,7 +1474,7 @@ export class DoorDockingPortSystem {
             state.transient = true;
             // Causally after this port's own last undock (a re-dock by
             // INITIATE must not read as a stale berth to the far mirror).
-            const prior = classifyDockPort(readAllDoors().get(activeDoorId));
+            const prior = classifyDockPort(readDoor(activeDoorId));
             state.dockedAt = stampAfter(
               prior.kind === "undocked" ? prior.memory.undockedAt : undefined,
             );
@@ -1760,7 +1761,7 @@ export class DoorDockingPortSystem {
         }
         const step = nextDockStep({
           hasPort: this.doorHasPort(doorId),
-          record: readAllDoors().get(doorId),
+          record: readDoor(doorId),
           staged: state.segments,
         });
         if (step.kind === "refuse") {
@@ -1844,7 +1845,7 @@ export class DoorDockingPortSystem {
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.canConstruct(doorId)) return;
       if (this.dockOps.get(doorId)?.busy) return; // a dock/undock is running
-      const record = readAllDoors().get(doorId);
+      const record = readDoor(doorId);
       if (el.dataset.dockChip === "unstage-mate") {
         if (state.pairedSuccessfully || !isDockChain(state.segments)) return;
         this.refundWorkingChain(state);
@@ -2429,7 +2430,7 @@ export class DoorDockingPortSystem {
     if (dockBtn) {
       const step = nextDockStep({
         hasPort,
-        record: readAllDoors().get(doorId),
+        record: readDoor(doorId),
         staged: state.segments,
       });
       dockBtn.style.opacity = step.kind === "refuse" || !mayEdit ? "0.35" : "1";
@@ -2453,7 +2454,7 @@ export class DoorDockingPortSystem {
   /** Does this door wear a dock port? Its policy flag — or a live dock, which
    *  always has both halves whatever a lagging policy map says. */
   public doorHasPort(doorId: string): boolean {
-    return isPortDoor(readDoorPolicy(doorId).adapter === true, readAllDoors().get(doorId));
+    return isPortDoor(readDoorPolicy(doorId).adapter === true, readDoor(doorId));
   }
 
   /** May the local player dock / undock at this door? The door's own
@@ -2533,10 +2534,9 @@ export class DoorDockingPortSystem {
     const ordinals = doorOrdinals([
       ...(layout.size ? layout : defaultDoorLayoutRecords()).values(),
     ]);
-    const records = readAllDoors();
     const out: DockPortView[] = [];
     for (const id of ids) {
-      const record = records.get(id);
+      const record = readDoor(id);
       if (!isPortDoor(readDoorPolicy(id).adapter === true, record)) continue;
       const state = classifyDockPort(record);
       const partnerRoom =
@@ -2609,7 +2609,7 @@ export class DoorDockingPortSystem {
    */
   public async undockPort(doorId: string): Promise<boolean> {
     if (this.dockOps.get(doorId)?.busy) return false;
-    const port = classifyDockPort(readAllDoors().get(doorId));
+    const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
     if (!this.canConstruct(doorId)) {
       this.setDockOp(doorId, {
@@ -2671,7 +2671,7 @@ export class DoorDockingPortSystem {
    */
   public async redockPort(doorId: string): Promise<boolean> {
     if (this.dockOps.get(doorId)?.busy) return false;
-    const port = classifyDockPort(readAllDoors().get(doorId));
+    const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "undocked" || !readDoorPolicy(doorId).adapter) return false;
     if (!this.canConstruct(doorId)) {
       this.setDockOp(doorId, {
@@ -2720,7 +2720,7 @@ export class DoorDockingPortSystem {
     // strip this port meanwhile: this side is only ever written over the very
     // tombstone read above.
     const unchanged = () => {
-      const now = classifyDockPort(readAllDoors().get(doorId));
+      const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
     let far: FarDockResult | null = null;
@@ -2790,7 +2790,7 @@ export class DoorDockingPortSystem {
       name: string;
     },
   ): Promise<boolean> {
-    const now = classifyDockPort(readAllDoors().get(doorId));
+    const now = classifyDockPort(readDoor(doorId));
     if (
       now.kind === "docked" &&
       now.roomId === port.roomId &&
@@ -2842,7 +2842,7 @@ export class DoorDockingPortSystem {
   private renderDockRow(doorId: string): void {
     const rowEl = document.getElementById("docking-dock-row");
     if (!rowEl) return;
-    const record = readAllDoors().get(doorId);
+    const record = readDoor(doorId);
     if (!isPortDoor(readDoorPolicy(doorId).adapter === true, record)) {
       rowEl.style.display = "none";
       rowEl.innerHTML = "";

@@ -257,6 +257,18 @@ export function farUndockPatch(
   };
 }
 
+/** Does this far record hold a DOCK to exactly this near end — our room,
+ *  through our door? (What a DOCK's far write must still find once concurrent
+ *  writes have had time to arrive: the CRDT keeps one claim per berth.) */
+export function holdsDockTo(record: DoorRecord | undefined, near: NearEnd): boolean {
+  return (
+    !!record?.paired &&
+    isDockChain(record.segments) &&
+    roomIdFromSeed(record.connectedRoomAddress) === near.roomId &&
+    record.farDoor === near.doorId
+  );
+}
+
 export type FarDock =
   | { action: 'write'; record: DoorPairing }
   | { action: 'refuse'; reason: 'gone' | 'occupied' | 'closed' };
