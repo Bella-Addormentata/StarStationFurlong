@@ -132,6 +132,17 @@ describe('applyFarDockRequest — DOCK', () => {
     ); // the occupant is untouched
   });
 
+  it('a malformed or mismatched layout entry is no berth — never a phantom door to dock at', () => {
+    const doc = stationDoc();
+    doc.getMap('doors').delete('d:bay');
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'sideways', lateral: 0 }); // bad wall
+    expect(dockAt(doc)).toEqual({ result: { ok: false, reason: 'gone' }, wrote: false });
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:other', wall: 'y+', lateral: 0 }); // wrong id
+    expect(dockAt(doc)).toEqual({ result: { ok: false, reason: 'gone' }, wrote: false });
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    expect(dockAt(doc).wrote).toBe(true); // a real door is a berth again
+  });
+
   it('never re-fits a port its owner removed — even while the old berth memory still stands', () => {
     const doc = stationDoc();
     // The removal's policy write has landed; its tombstone write has not (or

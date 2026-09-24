@@ -1367,10 +1367,15 @@ export class DoorDockingPortSystem {
               : undefined,
           );
           if (!seed && mateForModule && parentState) {
-            // Not spent after all: back on the door — or back in stock if it
-            // was unstaged meanwhile.
-            if (isDockChain(parentState.segments)) parentState.dockMatePaid = true;
-            else refundPart("adapter");
+            // Not spent after all. Back on the door while it still stages an
+            // UNPAID mate (the one reserved); otherwise — unstaged meanwhile,
+            // or re-staged with a freshly paid half — back in stock, so a
+            // reserved half is never lost.
+            if (isDockChain(parentState.segments) && !parentState.dockMatePaid) {
+              parentState.dockMatePaid = true;
+            } else {
+              refundPart("adapter");
+            }
           }
           // 🧭 The pairing this address is about to INITIATE already knows the
           // far side exactly — it is the door we just chose. Stash it so the

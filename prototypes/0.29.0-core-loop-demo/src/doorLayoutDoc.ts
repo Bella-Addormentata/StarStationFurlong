@@ -481,15 +481,18 @@ export function hasDoorLayout(id: string): boolean {
 
 /**
  * ⚓ #163: does door `id` exist in ANY doc's room — the far room a DOCK is
- * about to write into (farDoorWrite.ts), which is not the bound doc. The same
- * two meanings of "no records" as everywhere else: an AUTHORITATIVE set (any
- * record, or the marker) is the whole truth; an un-migrated room still has its
- * four legacy cardinals.
+ * about to write into (farDoorWrite.ts), which is not the bound doc. A door
+ * exists exactly when readAllDoorLayout would list it — a valid record under
+ * its own id; a malformed or mismatched entry (peer-written) is no door, never
+ * a phantom one. And the same two meanings of "no records" as everywhere
+ * else: an AUTHORITATIVE set (any entry, or the marker) is the whole truth; an
+ * un-migrated room still has its four legacy cardinals.
  */
 export function doorExistsIn(doc: Y.Doc, id: string): boolean {
   if (id === META_KEY) return false;
   const map = doc.getMap('doorLayout');
-  if (map.has(id)) return true;
+  const value = map.get(id);
+  if (isDoorLayoutRecord(value) && value.id === id) return true;
   const records = map.size - (map.has(META_KEY) ? 1 : 0);
   const marker = map.get(META_KEY);
   const marked =
