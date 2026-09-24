@@ -36,6 +36,7 @@ import {
   isCoinPusherState,
   isPusherEmptyRequest,
   isPusherInsertRequest,
+  isPusherResult,
   MACHINE_MAX_CHIPS,
   MAX_DROP_LAG_MS,
   MAX_DROP_LEAD_MS,
@@ -203,7 +204,7 @@ describe('shape guards', () => {
     expect(isCoinPusherState({ ...s, totalEmptied: s.totalEmptied + 1 })).toBe(false);
   });
 
-  it('checks lastDrop / lastRefusal when present', () => {
+  it('checks lastDrop when present', () => {
     const s = initialCoinPusherState(OWNER);
     const drop = {
       requestId: 'r1', player: PLAYER1, hole: 1, chipId: 1, landedX: 0.3,
@@ -213,9 +214,20 @@ describe('shape guards', () => {
     expect(isCoinPusherState({ ...s, lastDrop: { ...drop, phase: 1 } })).toBe(false);
     expect(isCoinPusherState({ ...s, lastDrop: { ...drop, honored: 'yes' } })).toBe(false);
     expect(isCoinPusherState({ ...s, lastDrop: { ...drop, paid: MACHINE_MAX_CHIPS + 1 } })).toBe(false);
-    const refusal = { requestId: 'r2', player: PLAYER1, reason: 'no-chips', atMs: 5 };
-    expect(isCoinPusherState({ ...s, lastRefusal: refusal })).toBe(true);
-    expect(isCoinPusherState({ ...s, lastRefusal: { ...refusal, reason: 'bored' } })).toBe(false);
+  });
+
+  it('result guard accepts a drop or a refusal answer and rejects junk', () => {
+    const drop = { kind: 'drop', requestId: 'r1', paid: 2, honored: true, atMs: 5 };
+    const refused = { kind: 'refused', requestId: 'r2', reason: 'no-chips', atMs: 5 };
+    expect(isPusherResult(drop)).toBe(true);
+    expect(isPusherResult(refused)).toBe(true);
+    expect(isPusherResult({ ...drop, paid: -1 })).toBe(false);
+    expect(isPusherResult({ ...drop, paid: MACHINE_MAX_CHIPS + 1 })).toBe(false);
+    expect(isPusherResult({ ...drop, honored: 'yes' })).toBe(false);
+    expect(isPusherResult({ ...refused, reason: 'bored' })).toBe(false);
+    expect(isPusherResult({ ...refused, kind: 'other' })).toBe(false);
+    expect(isPusherResult({ ...drop, requestId: '' })).toBe(false);
+    expect(isPusherResult(null)).toBe(false);
   });
 
   it('accepts a plausibly-large legitimate state (round-trip after JSON)', () => {

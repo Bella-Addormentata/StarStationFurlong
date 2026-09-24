@@ -100,6 +100,7 @@ Records in the room's `casino` map:
 |---|---|---|
 | `pusher:<mid>` | the operator only | the machine (`CoinPusherState`) |
 | `pusher-req:<mid>:<pid>` | the player (own key) | hole + the phase they saw — **no chips** |
+| `pusher-result:<mid>:<pid>` | the operator | its answer to that player's latest request |
 | `pusher-empty:<mid>` | the owner | a door request |
 | `pusher-operator:<mid>` | the operator | its lease |
 
@@ -125,11 +126,19 @@ Records in the room's `casino` map:
   owner). The chips inside stay put and go with the room, like its furniture.
   Nothing is paid on a takeover, so a forged owner earns nothing.
 - **A drop.** The player's request is a wish, not a payment. The operator
-  refuses it (records `lastRefusal`, clears the request, moves nothing) when it
-  is more than 2 minutes old, the player has no chip, or the machine is full.
-  Otherwise `processInsert` runs, and `settleCoinPusherInsert` debits the one
-  chip, credits exactly what the drop paid, publishes the machine and clears
-  the request in **one transaction**. Before writing, it re-reads the stored
+  refuses it (answers the player, clears the request, moves nothing and leaves
+  the machine alone) when it is more than 2 minutes old, the player has no
+  chip, or the machine is full. Otherwise `processInsert` runs, and
+  `settleCoinPusherInsert` debits the one chip, credits exactly what the drop
+  paid, publishes the machine, answers the player and clears the request in
+  **one transaction**. Each poll works through at most 4 requests (oldest
+  first), so a flood of requests can't stall the operator's frame.
+- **Answers.** Each player's answer lives under their own
+  `pusher-result:<mid>:<pid>` until their next request is answered. The
+  machine's `lastDrop` only lights the cabinet: the next player's drop
+  overwrites it, so a panel that missed updates would misread it. A panel that
+  withdraws an unanswered request keeps watching for an answer that raced the
+  withdrawal. Before writing, it re-reads the stored
   machine and refuses if it is not the state the drop was computed from, if
   the request is gone or replaced, or if the transition is not a one-chip drop
   whose payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read

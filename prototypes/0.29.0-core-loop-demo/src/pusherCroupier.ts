@@ -30,12 +30,15 @@
  * nothing.
  *
  * WORK (at most every REQUEST_POLL_MS): the owner's door request first, then
- * every pending insert, oldest first. An insert is refused — no chips move —
- * when it is stale, the player has no chip, or the machine is full. Otherwise
+ * the MAX_REQUESTS_PER_POLL oldest inserts — a fixed cost per poll however
+ * many requests peers write (the slot operator likewise takes one head
+ * request per poll). An insert is refused — no chips move — when it is
+ * stale, the player has no chip, or the machine is full. Otherwise
  * resolveDropTiming keeps the phase the player saw (inside the timing
  * window), processInsert runs with a seed the operator draws itself, and
  * casinoDoc.settleCoinPusherInsert debits the chip, credits the payout,
- * publishes the machine and clears the request in one transaction.
+ * publishes the machine, answers the player and clears the request in one
+ * transaction.
  */
 import {
   cancelCoinPusherRequest,
@@ -83,6 +86,8 @@ const operators = new Map<string, PusherOperatorSession>();
 const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
 /** Short: a drop's timing window (MAX_DROP_LAG_MS) has to cover this wait. */
 const REQUEST_POLL_MS = 100;
+/** Inserts settled or refused per poll (≤ 40 a second per machine). */
+export const MAX_REQUESTS_PER_POLL = 4;
 const OPERATOR_LEASE_MS = 8_000;
 const OPERATOR_LEASE_SETTLE_MS = 2_000;
 const OPERATOR_LEASE_RENEW_MS = 3_000;
@@ -233,7 +238,7 @@ export function operateCoinPusher(
     if (!state) return;
   }
 
-  for (const request of readCoinPusherRequests(machineId)) {
+  for (const request of readCoinPusherRequests(machineId, MAX_REQUESTS_PER_POLL)) {
     state = settleOneInsert(machineId, state, request, now, drawSeed);
     if (!state) return;
   }
@@ -248,7 +253,7 @@ function settleOneInsert(
   drawSeed: () => number,
 ): CoinPusherState | null {
   const refuse = (reason: PusherRefusalReason): CoinPusherState | null => {
-    refuseCoinPusherInsert(machineId, state, request, reason, now);
+    refuseCoinPusherInsert(machineId, request, reason, now);
     return readCoinPusherState(machineId);
   };
   if (now - request.requestedAt > PUSHER_STALE_REQUEST_MS) return refuse('expired');

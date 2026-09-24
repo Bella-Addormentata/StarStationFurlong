@@ -85,7 +85,8 @@ import {
   // 🪙 Coin pusher (#135) — the player's and owner's request keys; the
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
-  cancelCoinPusherRequest, readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest,
+  cancelCoinPusherRequest, readCoinPusherResult,
+  readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
   subscribeCasinoKey,
 } from './casinoDoc';
@@ -4243,8 +4244,11 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let selectedHole: PusherHole = 1;
   let flash = '';
   let timingNote = '';
-  /** The request id of my latest drop, until its result is read back. */
-  let awaiting: string | null = null;
+  /** My request in flight (DROP is disabled while it is set). */
+  let pending: string | null = null;
+  /** My latest request whose answer is still to be shown — kept after a
+   *  withdrawal, in case an answer that raced it still arrives. */
+  let watching: string | null = null;
   let expiryTimer = 0;
   /** My latest settled drop's payout (drawn in the tray). */
   let lastPaid: number | null = null;
@@ -4259,12 +4263,13 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     expiryTimer = 0;
   };
 
-  /** Withdraw my unanswered request (it carries no chips, so nothing is lost). */
+  /** Withdraw my unanswered request (it carries no chips; if the operator
+   *  settled it meanwhile, that answer still shows when it arrives). */
   const withdraw = (message: string): void => {
-    if (!awaiting) return;
+    if (!pending) return;
     stopExpiry();
-    cancelCoinPusherRequest(deps.itemId, myId, awaiting);
-    awaiting = null;
+    cancelCoinPusherRequest(deps.itemId, myId, pending);
+    pending = null;
     flash = message;
     render();
   };
@@ -4279,7 +4284,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const state = readCoinPusherState(deps.itemId);
     if (!state || !coinPusherOperatorOnline(deps.itemId)) {
       flash = 'MACHINE OFFLINE — ITS OWNER RUNS IT';
-    } else if (awaiting || readCoinPusherRequest(deps.itemId, myId)) {
+    } else if (pending || readCoinPusherRequest(deps.itemId, myId)) {
       flash = 'YOUR LAST CHIP IS STILL DROPPING';
     } else if (readChips(myId) < PUSHER_ANTE) {
       flash = 'NO CHIPS — VISIT THE CASHIER';
@@ -4296,10 +4301,11 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       if (writeCoinPusherRequest(deps.itemId, {
         requestId, player: myId, hole: selectedHole, phase, requestedAt,
       })) {
-        awaiting = requestId;
+        pending = requestId;
+        watching = requestId;
         stopExpiry();
         expiryTimer = window.setTimeout(
-          () => withdraw('NO ANSWER FROM THE MACHINE — NOTHING WAS TAKEN'),
+          () => withdraw('NO ANSWER FROM THE MACHINE — YOUR DROP WAS WITHDRAWN'),
           PUSHER_REQUEST_TTL_MS,
         );
         lastPaid = null;
@@ -4332,32 +4338,31 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     render();
   };
 
-  /** Read my results back off the machine: a settled drop, a refusal, a
-   *  withdrawn request, or a finished door. */
+  /** Read my answers back: my own result record (durable — another player's
+   *  drop can't overwrite it), a withdrawn request, or a finished door. */
   const readResults = (state: CoinPusherState | null): void => {
-    if (awaiting) {
-      const drop = state?.lastDrop;
-      const refusal = state?.lastRefusal;
-      if (drop?.requestId === awaiting && drop.player === myId) {
-        stopExpiry();
-        awaiting = null;
-        lastPaid = drop.paid;
-        flash = drop.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME';
-        timingNote = drop.honored
+    const result = watching ? readCoinPusherResult(deps.itemId, myId) : null;
+    if (watching && result?.requestId === watching) {
+      stopExpiry();
+      pending = null;
+      watching = null;
+      if (result.kind === 'drop') {
+        lastPaid = result.paid;
+        flash = result.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME';
+        timingNote = result.honored
           ? 'YOUR TIMING WAS KEPT'
           : 'IT ARRIVED LATE — THE CHIP DROPPED WHERE THE PUSHER WAS';
-        deps.onMessage?.(drop.paid > 0 ? 'WINNER' : 'DROP');
-      } else if (refusal?.requestId === awaiting && refusal.player === myId) {
-        stopExpiry();
-        awaiting = null;
-        flash = PUSHER_REFUSAL_TEXT[refusal.reason];
-      } else if (readCoinPusherRequest(deps.itemId, myId)?.requestId !== awaiting) {
-        // Gone without a result: withdrawn (here, in another tab, or by the
-        // operator). The request carried no chips.
-        stopExpiry();
-        awaiting = null;
-        flash = 'YOUR DROP WAS WITHDRAWN — NOTHING WAS TAKEN';
+        deps.onMessage?.(result.paid > 0 ? 'WINNER' : 'DROP');
+      } else {
+        flash = PUSHER_REFUSAL_TEXT[result.reason];
       }
+    } else if (pending && readCoinPusherRequest(deps.itemId, myId)?.requestId !== pending) {
+      // Gone without an answer: withdrawn here, in another tab, or by the
+      // operator. `watching` stays set, so an answer that raced the
+      // withdrawal still shows.
+      stopExpiry();
+      pending = null;
+      flash = 'YOUR DROP WAS WITHDRAWN';
     }
     if (door && readCoinPusherEmptyRequest(deps.itemId)?.requestId !== door.requestId) {
       const emptied = (state?.totalEmptied ?? door.emptiedBefore) - door.emptiedBefore;
@@ -4372,9 +4377,11 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const cv = panel?.querySelector<HTMLCanvasElement>(`#${id}`);
     const c2 = cv?.getContext('2d');
     if (!cv || !c2) return;
+    const w = cv.width / 2;
+    const h = cv.height / 2;
     c2.setTransform(2, 0, 0, 2, 0, 0);
-    c2.clearRect(0, 0, 190, 56);
-    drawChips(c2, chips, 0, 0, 190, 56, { emptyText });
+    c2.clearRect(0, 0, w, h);
+    drawChips(c2, chips, 0, 0, w, h, { emptyText });
   };
 
   const drawGauge = (): void => {
@@ -4412,9 +4419,9 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const insertBtn = panel.querySelector<HTMLButtonElement>('#cp-insert')!;
     const chips = readChips(myId);
     const full = state !== null && chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS;
-    insertBtn.disabled = !online || awaiting !== null || chips < PUSHER_ANTE || full;
+    insertBtn.disabled = !online || pending !== null || chips < PUSHER_ANTE || full;
     insertBtn.textContent = !online ? 'MACHINE OFFLINE'
-      : awaiting ? 'DROPPING…'
+      : pending ? 'DROPPING…'
         : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
           : full ? 'MACHINE FULL'
             : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
@@ -4430,8 +4437,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const isOwner = state?.ownerId === myId;
     owner.style.display = isOwner ? 'flex' : 'none';
     if (isOwner && state) {
-      panel.querySelector<HTMLElement>('#cp-inside')!.textContent =
-        `CHIPS INSIDE: ${chipsInMachine(state)} · OPENING THE DOOR PUTS THEM ON YOUR RACK`;
+      // Chips, never a total, outside the cashier (the physical-chip rule).
+      paintTray('cp-inside', chipsFor(chipsInMachine(state)), 'THE MACHINE IS EMPTY');
       const emptyBtn = panel.querySelector<HTMLButtonElement>('#cp-empty')!;
       emptyBtn.disabled = !online || door !== null;
     }
@@ -4500,7 +4507,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         <div id="cp-meter" style="font-size:8px;text-align:center;"></div>
         <div id="cp-owner" style="display:none;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid rgba(212,168,75,.20);">
           <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
-          <div id="cp-inside" style="font-size:9px;color:#E8ECF2;"></div>
+          <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">IN THE MACHINE · OPENING THE DOOR PUTS THEM ON YOUR RACK</span>
+          <canvas id="cp-inside" width="760" height="112" style="width:380px;height:56px;"></canvas>
           <button id="cp-empty" style="padding:8px;background:rgba(230,80,60,0.10);border:1px solid #A03020;color:#FF9070;font:800 10px inherit;cursor:pointer;">OPEN THE DOOR &amp; EMPTY THE MACHINE</button>
         </div>
         <div style="font-size:8px;color:${GT_DIM};text-align:center;line-height:1.6;">← / → PICK A HOLE · SPACE DROPS ONE CHIP · CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS · THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE</div>
@@ -4518,6 +4526,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       for (const key of [
         `pusher:${deps.itemId}`,
         `pusher-req:${deps.itemId}:${myId}`,
+        `pusher-result:${deps.itemId}:${myId}`,
         `pusher-empty:${deps.itemId}`,
         `pusher-operator:${deps.itemId}`,
         `bal:${myId}`,
@@ -4529,9 +4538,10 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     unmount(): void {
       // Walking away withdraws an unanswered drop (the slot-machine rule); a
       // drop the operator already settled is unaffected.
-      if (awaiting) cancelCoinPusherRequest(deps.itemId, myId, awaiting);
+      if (pending) cancelCoinPusherRequest(deps.itemId, myId, pending);
       stopExpiry();
-      awaiting = null;
+      pending = null;
+      watching = null;
       for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
       window.removeEventListener('keydown', onKeyDown);
       panel?.remove();

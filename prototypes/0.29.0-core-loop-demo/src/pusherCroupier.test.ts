@@ -13,6 +13,8 @@ import {
   readCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
   readCoinPusherRequest,
+  readCoinPusherRequests,
+  readCoinPusherResult,
   readCoinPusherState,
   writeCoinPusherEmptyRequest,
   writeCoinPusherOperatorLease,
@@ -38,6 +40,7 @@ import {
   closeCoinPusher,
   coinPusherOperatorSession,
   isCoinPusherOperator,
+  MAX_REQUESTS_PER_POLL,
   OPERATOR_UNCLEAN_TAKEOVER_MS,
   operateCoinPusher,
   tickCoinPusherMachine,
@@ -162,7 +165,10 @@ describe('operateCoinPusher', () => {
     doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, request(ATTACKER, 'forged', 0.5));
     operateCoinPusher(MACHINE, OPERATOR, NOW);
     const after = readCoinPusherState(MACHINE)!;
-    expect(after.lastRefusal).toMatchObject({ requestId: 'forged', player: ATTACKER, reason: 'no-chips' });
+    expect(readCoinPusherResult(MACHINE, ATTACKER)).toMatchObject({
+      kind: 'refused', requestId: 'forged', reason: 'no-chips',
+    });
+    expect(after).toEqual(base);
     expect(after.totalInserted).toBe(base.totalInserted);
     expect(after.upper).toEqual(base.upper);
     expect(after.lower).toEqual(base.lower);
@@ -175,7 +181,7 @@ describe('operateCoinPusher', () => {
     buyInChips(PLAYER, 3);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'old', 0.5, NOW - PUSHER_STALE_REQUEST_MS - 1));
     operateCoinPusher(MACHINE, OPERATOR, NOW);
-    expect(readCoinPusherState(MACHINE)!.lastRefusal?.reason).toBe('expired');
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toMatchObject({ kind: 'refused', reason: 'expired' });
     expect(readChips(PLAYER)).toBe(3);
   });
 
@@ -195,8 +201,25 @@ describe('operateCoinPusher', () => {
     buyInChips(PLAYER, 3);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', 0.5));
     operateCoinPusher(MACHINE, OPERATOR, NOW);
-    expect(readCoinPusherState(MACHINE)!.lastRefusal?.reason).toBe('machine-full');
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toMatchObject({ kind: 'refused', reason: 'machine-full' });
     expect(readChips(PLAYER)).toBe(3);
+  });
+
+  it('works through a bounded batch per pass however many requests are queued', () => {
+    writeCoinPusherState(MACHINE, machineWith(20));
+    const queued = 3 * MAX_REQUESTS_PER_POLL + 1;
+    for (let i = 0; i < queued; i++) {
+      const pid = `flood-${i}`; // no chips: each is refused
+      doc.getMap('casino').set(`pusher-req:${MACHINE}:${pid}`,
+        request(pid, `r-${String(i).padStart(3, '0')}`, 0.5));
+    }
+    operateCoinPusher(MACHINE, OPERATOR, NOW);
+    expect(readCoinPusherRequests(MACHINE)).toHaveLength(queued - MAX_REQUESTS_PER_POLL);
+    // Oldest first: the first batch was answered.
+    expect(readCoinPusherResult(MACHINE, 'flood-0')?.requestId).toBe('r-000');
+    expect(readCoinPusherResult(MACHINE, `flood-${MAX_REQUESTS_PER_POLL}`)).toBeNull();
+    for (let pass = 0; pass < 3; pass++) operateCoinPusher(MACHINE, OPERATOR, NOW);
+    expect(readCoinPusherRequests(MACHINE)).toHaveLength(0);
   });
 
   it('opens the door for the owner and ignores a door request from anyone else', () => {

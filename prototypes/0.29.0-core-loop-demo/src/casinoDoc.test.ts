@@ -23,6 +23,7 @@ import {
   readCoinPusherOperatorLease,
   readCoinPusherRequest,
   readCoinPusherRequests,
+  readCoinPusherResult,
   readCoinPusherState,
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
@@ -144,6 +145,16 @@ describe('coin-pusher requests', () => {
     doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, request(PLAYER, 'a-0'));
     expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['a-1', 'b-2']);
   });
+
+  it('a bounded read keeps only the oldest, whatever order they were written in', () => {
+    const ids = ['m-5', 'm-2', 'm-9', 'm-1', 'm-7', 'm-3'];
+    ids.forEach((id, i) => writeCoinPusherRequest(MACHINE, request(`p${i}`, id)));
+    expect(readCoinPusherRequests(MACHINE, 3).map((r) => r.requestId)).toEqual(['m-1', 'm-2', 'm-3']);
+    expect(readCoinPusherRequests(MACHINE, 1).map((r) => r.requestId)).toEqual(['m-1']);
+    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(
+      ['m-1', 'm-2', 'm-3', 'm-5', 'm-7', 'm-9'],
+    );
+  });
 });
 
 // ── settleCoinPusherInsert: the only way a drop moves chips ──────────────────
@@ -160,6 +171,24 @@ describe('settleCoinPusherInsert', () => {
     expect(readChips(PLAYER)).toBe(3 - 1 + paid);
     expect(readCoinPusherState(MACHINE)).toEqual(next);
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toEqual({
+      kind: 'drop', requestId: req.requestId, paid, honored: true, atMs: 2_000,
+    });
+  });
+
+  it('a player\'s answer survives the next player\'s drop (lastDrop does not)', () => {
+    const { base, req, next } = payingSetup();
+    buyInChips(PLAYER, 3);
+    buyInChips(OTHER, 3);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('ok');
+    // OTHER drops right after; the machine's lastDrop is now theirs.
+    const other = request(OTHER, 'zz-other');
+    writeCoinPusherRequest(MACHINE, other);
+    const stored = readCoinPusherState(MACHINE)!;
+    expect(settleCoinPusherInsert(MACHINE, stored, dropFor(stored, other, 7), other)).toBe('ok');
+    expect(readCoinPusherState(MACHINE)!.lastDrop!.requestId).toBe('zz-other');
+    // PLAYER's panel, catching up late, still finds its own answer.
+    expect(readCoinPusherResult(MACHINE, PLAYER)?.requestId).toBe(req.requestId);
   });
 
   it('a request from a player with no chip gets nothing — and nothing is written', () => {
@@ -229,29 +258,30 @@ describe('settleCoinPusherInsert', () => {
 // ── refuseCoinPusherInsert ───────────────────────────────────────────────────
 
 describe('refuseCoinPusherInsert', () => {
-  it('records why, clears the request and moves no chips', () => {
+  it('answers the player with why, clears the request, and leaves the machine and chips alone', () => {
     const base = machineWith(10);
     writeCoinPusherState(MACHINE, base);
     buyInChips(PLAYER, 2);
     const req = request(PLAYER, 'req-1');
     writeCoinPusherRequest(MACHINE, req);
-    expect(refuseCoinPusherInsert(MACHINE, readCoinPusherState(MACHINE)!, req, 'machine-full', 9)).toBe(true);
-    const after = readCoinPusherState(MACHINE)!;
-    expect(after.lastRefusal).toEqual({ requestId: 'req-1', player: PLAYER, reason: 'machine-full', atMs: 9 });
-    expect(after.tick).toBe(base.tick + 1);
-    expect(chipsInMachine(after)).toBe(chipsInMachine(base));
-    expect(after.totalInserted).toBe(base.totalInserted);
+    const transactions = countTransactions(doc);
+    expect(refuseCoinPusherInsert(MACHINE, req, 'machine-full', 9)).toBe(true);
+    expect(transactions()).toBe(1);
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toEqual({
+      kind: 'refused', requestId: 'req-1', reason: 'machine-full', atMs: 9,
+    });
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
     expect(readChips(PLAYER)).toBe(2);
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
   });
 
-  it('writes nothing over a newer machine', () => {
-    const base = machineWith(10);
-    writeCoinPusherState(MACHINE, { ...base, tick: base.tick + 5 });
+  it('writes nothing once the request is gone or replaced', () => {
     const req = request(PLAYER, 'req-1');
-    writeCoinPusherRequest(MACHINE, req);
-    expect(refuseCoinPusherInsert(MACHINE, base, req, 'no-chips', 9)).toBe(false);
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toEqual(req);
+    expect(refuseCoinPusherInsert(MACHINE, req, 'no-chips', 9)).toBe(false);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2'));
+    expect(refuseCoinPusherInsert(MACHINE, req, 'no-chips', 9)).toBe(false);
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toBeNull();
+    expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('req-2');
   });
 });
 
@@ -319,7 +349,11 @@ describe('drainAndClearCoinPusher', () => {
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
     writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd', requester: OWNER, requestedAt: 0 });
     writeCoinPusherOperatorLease(MACHINE, { playerId: OWNER, sessionId: 's', expiresAt: 99 });
+    refuseCoinPusherInsert(MACHINE, request(PLAYER, 'req-1'), 'expired', 1);
+    expect(readCoinPusherResult(MACHINE, PLAYER)).not.toBeNull();
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2'));
     expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(chipsInMachine(base));
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toBeNull();
     expect(readChips(OWNER)).toBe(chipsInMachine(base));
     expect(readCoinPusherState(MACHINE)).toBeNull();
     expect(readCoinPusherRequests(MACHINE)).toEqual([]);

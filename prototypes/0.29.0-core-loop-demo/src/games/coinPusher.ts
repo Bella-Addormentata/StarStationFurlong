@@ -80,7 +80,10 @@
  *     pusher phase they saw when they pressed INSERT); no chips move;
  *   • the operator validates it (chips on hand, room in the machine, the
  *     claimed phase inside the timing window — resolveDropTiming), runs
- *     processInsert with a seed it draws itself, and settles;
+ *     processInsert with a seed it draws itself, and settles — or refuses,
+ *     moving nothing. Either way it answers under the player's own
+ *     `pusher-result:<mid>:<pid>` (PusherResult), which stays until that
+ *     player's next request is answered;
  *   • only the machine OWNER may empty it, and that too goes through the
  *     operator (`pusher-empty:<mid>`), so an empty never races an insert.
  * Every doc read shape-guards (isCoinPusherState etc.): a hostile peer that
@@ -228,15 +231,16 @@ export interface PusherLastDrop {
 /** Why the operator turned an insert down. No chip moves on a refusal. */
 export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired';
 
-/** The most recent refused insert, so the requesting player's panel can say
- *  why nothing happened. */
-export interface PusherRefusal {
-  requestId: string;
-  player: string;
-  reason: PusherRefusalReason;
-  /** Operator clock when the request was turned down. */
-  atMs: number;
-}
+/**
+ * The operator's answer to one player's request, written in the same
+ * transaction as the drop or refusal under `pusher-result:<mid>:<pid>` and
+ * kept until that player's next request is answered. Unlike the machine-wide
+ * `lastDrop` (which the next player's drop overwrites), a panel that missed
+ * intermediate updates still finds its own answer here.
+ */
+export type PusherResult =
+  | { kind: 'drop'; requestId: string; paid: number; honored: boolean; atMs: number }
+  | { kind: 'refused'; requestId: string; reason: PusherRefusalReason; atMs: number };
 
 /**
  * The full doc-synced machine state — plain JSON, whole-value LWW write per
@@ -267,10 +271,9 @@ export interface CoinPusherState {
   totalPaid: number;
   /** Lifetime chips removed by an owner-triggered door-open. */
   totalEmptied: number;
-  /** The last settled drop (absent until the first one). */
+  /** The last settled drop (absent until the first one) — the cabinet's
+   *  drop light; each player's own answer is their PusherResult. */
   lastDrop?: PusherLastDrop;
-  /** The last refused insert (absent until the first one). */
-  lastRefusal?: PusherRefusal;
 }
 
 /** Insert request a player writes under `pusher-req:<machineId>:<playerId>`.
@@ -350,12 +353,14 @@ function isLastDrop(v: unknown): v is PusherLastDrop {
 
 const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired'];
 
-function isRefusal(v: unknown): v is PusherRefusal {
+export function isPusherResult(v: unknown): v is PusherResult {
   if (typeof v !== 'object' || v === null) return false;
-  const r = v as Partial<PusherRefusal>;
-  return isBoundedId(r.requestId) && isBoundedId(r.player)
-    && REFUSAL_REASONS.includes(r.reason as PusherRefusalReason)
-    && typeof r.atMs === 'number' && Number.isFinite(r.atMs);
+  const r = v as { kind?: unknown; requestId?: unknown; atMs?: unknown; paid?: unknown; honored?: unknown; reason?: unknown };
+  if (!isBoundedId(r.requestId) || typeof r.atMs !== 'number' || !Number.isFinite(r.atMs)) return false;
+  if (r.kind === 'drop') {
+    return isCountInt(r.paid) && (r.paid as number) <= MACHINE_MAX_CHIPS && typeof r.honored === 'boolean';
+  }
+  return r.kind === 'refused' && REFUSAL_REASONS.includes(r.reason as PusherRefusalReason);
 }
 
 /** Shape guard for a peer-written coin-pusher state. Everything the engine
@@ -378,8 +383,7 @@ export function isCoinPusherState(v: unknown): v is CoinPusherState {
     && isCountInt(s.totalInserted)
     && isCountInt(s.totalPaid)
     && isCountInt(s.totalEmptied)
-    && (s.lastDrop === undefined || isLastDrop(s.lastDrop))
-    && (s.lastRefusal === undefined || isRefusal(s.lastRefusal)))) return false;
+    && (s.lastDrop === undefined || isLastDrop(s.lastDrop)))) return false;
   let chips = 0;
   for (const p of s.upper as Pile[]) chips += p.count;
   for (const p of s.lower as Pile[]) chips += p.count;
@@ -410,10 +414,6 @@ export function normalizeCoinPusherState(v: unknown): CoinPusherState | null {
       requestId: d.requestId, player: d.player, hole: d.hole, chipId: d.chipId,
       landedX: d.landedX, paid: d.paid, phase: d.phase, honored: d.honored, atMs: d.atMs,
     };
-  }
-  if (v.lastRefusal) {
-    const r = v.lastRefusal;
-    out.lastRefusal = { requestId: r.requestId, player: r.player, reason: r.reason, atMs: r.atMs };
   }
   return out;
 }
