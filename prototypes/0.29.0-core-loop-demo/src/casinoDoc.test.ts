@@ -268,7 +268,7 @@ describe('commitCoinPusherEmpty', () => {
     const inside = chipsInMachine(base);
     const transactions = countTransactions(doc);
     const emptied = emptyMachine(base, OWNER).state;
-    expect(commitCoinPusherEmpty(MACHINE, readCoinPusherState(MACHINE)!, emptied, door(OWNER))).toBe(inside);
+    expect(commitCoinPusherEmpty(MACHINE, readCoinPusherState(MACHINE)!, emptied, door(OWNER), OWNER)).toBe(inside);
     expect(transactions()).toBe(1);
     expect(readChips(OWNER)).toBe(7 + inside);
     expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(0);
@@ -280,10 +280,22 @@ describe('commitCoinPusherEmpty', () => {
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherEmptyRequest(MACHINE, door(ATTACKER));
     const emptied = { ...emptyMachine(base, OWNER).state };
-    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER))).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER), OWNER)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER), ATTACKER)).toBeNull();
     expect(readChips(ATTACKER)).toBe(0);
     expect(readChips(OWNER)).toBe(0);
     expect(readCoinPusherState(MACHINE)).toEqual(base);
+  });
+
+  it('pays only an operator who owns the machine — a machine naming someone else pays nobody', () => {
+    // A peer-written machine that names the attacker as owner, with the
+    // attacker's own door request: the operator (OWNER) is not its owner.
+    const forged = machineWith(40, ATTACKER);
+    writeCoinPusherState(MACHINE, forged);
+    writeCoinPusherEmptyRequest(MACHINE, door(ATTACKER));
+    const emptied = emptyMachine(forged, ATTACKER).state;
+    expect(commitCoinPusherEmpty(MACHINE, forged, emptied, door(ATTACKER), OWNER)).toBeNull();
+    expect(readChips(ATTACKER)).toBe(0);
   });
 
   it('refuses a next that is not the empty of the stored machine', () => {
@@ -291,9 +303,9 @@ describe('commitCoinPusherEmpty', () => {
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherEmptyRequest(MACHINE, door(OWNER));
     const emptied = emptyMachine(base, OWNER).state;
-    expect(commitCoinPusherEmpty(MACHINE, base, { ...emptied, totalEmptied: emptied.totalEmptied + 10 }, door(OWNER))).toBeNull();
-    expect(commitCoinPusherEmpty(MACHINE, { ...base, tick: base.tick - 1 }, emptied, door(OWNER))).toBeNull();
-    expect(commitCoinPusherEmpty(MACHINE, base, base, door(OWNER))).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, { ...emptied, totalEmptied: emptied.totalEmptied + 10 }, door(OWNER), OWNER)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, { ...base, tick: base.tick - 1 }, emptied, door(OWNER), OWNER)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, base, door(OWNER), OWNER)).toBeNull();
     expect(readChips(OWNER)).toBe(0);
   });
 });
@@ -301,13 +313,13 @@ describe('commitCoinPusherEmpty', () => {
 // ── drainAndClearCoinPusher (cabinet removed) ────────────────────────────────
 
 describe('drainAndClearCoinPusher', () => {
-  it('pays the chips inside to the owner and deletes every key the machine used', () => {
+  it('pays the chips inside to the caller (the deed holder) and deletes every key the machine used', () => {
     const base = machineWith(30);
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
     writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd', requester: OWNER, requestedAt: 0 });
     writeCoinPusherOperatorLease(MACHINE, { playerId: OWNER, sessionId: 's', expiresAt: 99 });
-    expect(drainAndClearCoinPusher(MACHINE)).toBe(chipsInMachine(base));
+    expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(chipsInMachine(base));
     expect(readChips(OWNER)).toBe(chipsInMachine(base));
     expect(readCoinPusherState(MACHINE)).toBeNull();
     expect(readCoinPusherRequests(MACHINE)).toEqual([]);
@@ -324,15 +336,25 @@ describe('drainAndClearCoinPusher', () => {
       map.set(`pusher-req:${MACHINE}:${ATTACKER}`, request(ATTACKER, `forged-${i}`));
       map.set(`pusher-esc:${MACHINE}:${ATTACKER}:forged-${i}`, { requestId: `forged-${i}`, player: ATTACKER, ante: 100, escrowedAt: 0 });
     }
-    drainAndClearCoinPusher(MACHINE);
+    drainAndClearCoinPusher(MACHINE, OWNER);
     expect(readChips(PLAYER)).toBe(4);
     expect(readChips(ATTACKER)).toBe(0);
+  });
+
+  it('never pays the owner a peer-written machine names', () => {
+    // A forged, well-formed machine full of invented chips that names the
+    // attacker as its owner, raced against the cabinet's removal.
+    const forged = machineWith(30, ATTACKER);
+    writeCoinPusherState(MACHINE, forged);
+    expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(chipsInMachine(forged));
+    expect(readChips(ATTACKER)).toBe(0);
+    expect(readChips(OWNER)).toBe(chipsInMachine(forged));
   });
 
   it('credits nothing when there is no machine (or junk), and still clears its keys', () => {
     doc.getMap('casino').set(`pusher:${MACHINE}`, { kind: 'coin-pusher', junk: true });
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
-    expect(drainAndClearCoinPusher(MACHINE)).toBe(0);
+    expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(0);
     expect(doc.getMap('casino').has(`pusher:${MACHINE}`)).toBe(false);
     expect(readCoinPusherRequests(MACHINE)).toEqual([]);
   });

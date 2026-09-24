@@ -359,9 +359,11 @@ function isRefusal(v: unknown): v is PusherRefusal {
 }
 
 /** Shape guard for a peer-written coin-pusher state. Everything the engine
- *  and UI dereference is checked, including the aggregate chip ceiling; a
- *  rejection means readers see no machine. Unknown extra fields are ignored
- *  (normalizeCoinPusherState drops them). */
+ *  and UI dereference is checked, including the aggregate chip ceiling and
+ *  the machine's own ledger (an operator never writes a state that doesn't
+ *  balance, so one that doesn't is not a machine); a rejection means readers
+ *  see no machine. Unknown extra fields are ignored (normalizeCoinPusherState
+ *  drops them). */
 export function isCoinPusherState(v: unknown): v is CoinPusherState {
   if (typeof v !== 'object' || v === null) return false;
   const s = v as Partial<CoinPusherState>;
@@ -381,7 +383,8 @@ export function isCoinPusherState(v: unknown): v is CoinPusherState {
   let chips = 0;
   for (const p of s.upper as Pile[]) chips += p.count;
   for (const p of s.lower as Pile[]) chips += p.count;
-  return chips <= MACHINE_MAX_CHIPS;
+  return chips <= MACHINE_MAX_CHIPS
+    && s.totalInserted === chips + (s.totalPaid as number) + (s.totalEmptied as number);
 }
 
 /** A guarded state with only the known fields — what the operator publishes

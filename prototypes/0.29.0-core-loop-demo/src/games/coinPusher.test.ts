@@ -195,6 +195,14 @@ describe('shape guards', () => {
     expect(isCoinPusherState(atCap)).toBe(true);
   });
 
+  it('rejects a state whose own ledger does not balance (an operator never writes one)', () => {
+    const s = fill(20);
+    expect(isCoinPusherState(s)).toBe(true);
+    expect(isCoinPusherState({ ...s, totalInserted: s.totalInserted + 1 })).toBe(false);
+    expect(isCoinPusherState({ ...s, totalPaid: s.totalPaid + 1 })).toBe(false);
+    expect(isCoinPusherState({ ...s, totalEmptied: s.totalEmptied + 1 })).toBe(false);
+  });
+
   it('checks lastDrop / lastRefusal when present', () => {
     const s = initialCoinPusherState(OWNER);
     const drop = {

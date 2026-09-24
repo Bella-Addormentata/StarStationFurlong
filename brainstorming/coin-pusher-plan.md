@@ -108,6 +108,18 @@ Records in the room's `casino` map:
   browser sessions: the lease is written, the session waits 2 s for the doc to
   converge, renews every 3 s, and lapses after 8 s. World ticks the election
   every frame, so there is no start/stop control.
+- **Splits.** A Y.Map lease is not a mutex. Two operator sessions cut off from
+  each other could each settle a drop from the same machine; when the docs
+  merge only one machine value survives while both players' balance writes
+  do. Settling can't be made partition-safe without an authoritative ledger
+  (the Registry-anchored chips), and reconciling afterwards from receipts
+  would only move the problem (a forged receipt would pay its writer). So the
+  rule is to never start a second operator while the first may only be cut
+  off: another *device* of the same deed holder takes over a lapsed lease only
+  after a further 60 s; tabs on one device share its local node and take over
+  as soon as the lease lapses; a session that stops operating releases its
+  lease. Only a split outlasting that window can still put two operators on
+  one machine.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). The chips inside stay put and go with the room, like its furniture.
@@ -130,14 +142,18 @@ Records in the room's `casino` map:
   through the operator (`pusher-empty:<mid>` → `commitCoinPusherEmpty`: the
   emptied machine, the owner's credit for exactly the chips that were inside,
   and the cleared request, in one transaction), so an empty never races a
-  drop.
-- **Removal.** When the cabinet is removed, a managing client (the deed
-  holder or a room editor — the slot machine's rule) pays the chips still
-  inside to the machine's owner and deletes every key, in one transaction
-  (`drainAndClearCoinPusher`).
+  drop. The operator must itself be the machine's owner and the one who
+  asked.
+- **Removal.** When the cabinet is removed, the deed holder's client pays the
+  chips still inside to the deed holder and deletes every key, in one
+  transaction (`drainAndClearCoinPusher`). The recipient is the caller's own
+  identity, never the owner named in the peer-writable machine, so chips only
+  ever leave the machine to the player whose drop pushed them or to the
+  operator itself — forging the machine can't pay the forger.
 - **Trust.** The same dev-phase honest-client model as the rest of the
   casino map: the operator is trusted to run the physics honestly, and every
-  read shape-guards so junk in these keys reads as "no machine".
+  read shape-guards so junk in these keys reads as "no machine" (including a
+  machine whose own ledger doesn't balance).
 
 ## Conservation invariant
 
@@ -184,7 +200,9 @@ model as it is.
 - No robot at the cabinet, and no leaderboard across cabinets.
 - When the deed holder is away the machine is offline: the panel says so and
   DROP is disabled; nothing is lost.
-- A cabinet removed while no managing client is online leaves its records
-  behind (the same as a slot machine).
+- A cabinet removed while the deed holder is offline leaves its records
+  behind (the same as a slot machine removed with no managing client online).
+- A network split between two of the deed holder's devices that outlasts the
+  takeover window can still settle drops on both sides (see *Splits*).
 - The operator is trusted. Verifying drops (publishing the seed and letting
   clients replay the transition) is possible with this engine but not built.

@@ -10,6 +10,19 @@
  * OPERATOR_LEASE_MS). World ticks every cabinet every frame; there is no
  * start/stop control to fight the tick.
  *
+ * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
+ * could each take it and settle drops from the same machine; when the docs
+ * merge only one machine value survives while both players' balance writes
+ * do. Settling can't be made partition-safe without an authoritative ledger
+ * (the Registry-anchored chips), so the rule here keeps a second operator from
+ * ever starting while the first may only be cut off: a session of the SAME
+ * deed holder on ANOTHER device may take over a lapsed lease only after
+ * OPERATOR_UNCLEAN_TAKEOVER_MS more. Tabs on one device share its local node,
+ * so they take over as soon as the lease lapses (a reload, a closed tab); a
+ * session that stops operating releases its lease so a successor needn't
+ * wait. Only a split outlasting that window can still put two operators on
+ * one machine.
+ *
  * OWNERSHIP: the operator creates a missing machine with itself as owner and
  * re-owns one whose owner is anyone else (a deed transfer, or a peer-written
  * owner). The chips inside stay where they are and go with the room, like its
@@ -73,7 +86,40 @@ const REQUEST_POLL_MS = 100;
 const OPERATOR_LEASE_MS = 8_000;
 const OPERATOR_LEASE_SETTLE_MS = 2_000;
 const OPERATOR_LEASE_RENEW_MS = 3_000;
-const operatorSessionId = crypto.randomUUID();
+/** How much longer than a lapse another device of the same deed holder waits
+ *  before taking over (see SPLITS above). */
+export const OPERATOR_UNCLEAN_TAKEOVER_MS = 60_000;
+const DEVICE_KEY = 'ssf-pusher-operator-device';
+
+/** One id per browser profile (localStorage), shared by its tabs. */
+function loadDeviceId(): string {
+  try {
+    const stored = localStorage.getItem(DEVICE_KEY);
+    if (stored && /^[0-9a-f-]{36}$/.test(stored)) return stored;
+    const fresh = crypto.randomUUID();
+    localStorage.setItem(DEVICE_KEY, fresh);
+    return fresh;
+  } catch {
+    return crypto.randomUUID(); // private mode: this page is its own device
+  }
+}
+
+const deviceId = loadDeviceId();
+/** `<device>:<page load>` — the lease record's sessionId. */
+const operatorSessionId = `${deviceId}:${crypto.randomUUID()}`;
+
+/** This page's operator session id (`<device>:<page load>`). */
+export function coinPusherOperatorSession(): string {
+  return operatorSessionId;
+}
+
+/** Earliest time this session may take `lease` over. */
+function takeoverAt(lease: { playerId: string; sessionId: string; expiresAt: number }, playerId: string): number {
+  const sameDevice = lease.sessionId.startsWith(`${deviceId}:`);
+  return lease.playerId === playerId && !sameDevice
+    ? lease.expiresAt + OPERATOR_UNCLEAN_TAKEOVER_MS
+    : lease.expiresAt;
+}
 
 /** A fresh 32-bit peg-field seed from the platform CSPRNG. The operator
  *  draws it when it settles the drop, so the player can neither choose nor
@@ -117,7 +163,7 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
   if (!operator
     || operator.docEpoch !== casinoDocEpoch()
     || operator.playerId !== playerId) {
-    if (lease && lease.expiresAt > now && lease.sessionId !== operatorSessionId) return;
+    if (lease && lease.sessionId !== operatorSessionId && now < takeoverAt(lease, playerId)) return;
     writeCoinPusherOperatorLease(machineId, {
       playerId,
       sessionId: operatorSessionId,
@@ -179,7 +225,7 @@ export function operateCoinPusher(
   if (door) {
     if (door.requester === state.ownerId) {
       const emptied = emptyMachine(state, door.requester);
-      commitCoinPusherEmpty(machineId, state, emptied.state, door);
+      commitCoinPusherEmpty(machineId, state, emptied.state, door, operatorId);
     } else {
       clearCoinPusherEmptyRequest(machineId, door.requestId);
     }
@@ -243,9 +289,11 @@ function settleOneInsert(
 }
 
 /**
- * A removed cabinet: stop operating it here and, on a managing client (the
- * closeSlotMachine rule — the deed holder or a room editor), pay the chips
- * still inside to the machine's owner and delete every key it used.
+ * A removed cabinet: stop operating it here and, on the deed holder's client,
+ * pay the chips still inside to the deed holder (the machine's owner — the
+ * operator re-owns every machine it runs) and delete every key it used. Other
+ * clients only stop; the recipient is never read from the peer-writable
+ * machine.
  */
 export function closeCoinPusher(machineId: string, canManage = canRunCroupier()): void {
   operators.delete(machineId);
@@ -254,5 +302,13 @@ export function closeCoinPusher(machineId: string, canManage = canRunCroupier())
     clearCoinPusherOperatorLease(machineId);
   }
   if (!canManage) return;
-  drainAndClearCoinPusher(machineId);
+  drainAndClearCoinPusher(machineId, getPlayerId());
+}
+
+// Leaving the page releases every lease this session holds, so another tab
+// or device needn't wait out the lapse (best effort: the write may not flush).
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    for (const machineId of [...operators.keys()]) stopCoinPusherOperator(machineId);
+  });
 }

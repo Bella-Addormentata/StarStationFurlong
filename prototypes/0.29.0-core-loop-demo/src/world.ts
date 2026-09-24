@@ -2980,9 +2980,9 @@ export class World {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
     } else if (removedKind === "coin-pusher") {
-      // 🪙 Stop operating it here; a managing client pays the chips still
-      // inside to the machine's owner and wipes its keys (the slot rule).
-      closeCoinPusher(itemId, canRunCroupier() || canEditRoom().ok);
+      // 🪙 Stop operating it here; the deed holder's client pays the chips
+      // still inside to the deed holder and wipes its keys.
+      closeCoinPusher(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).

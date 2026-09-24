@@ -835,7 +835,14 @@ export function clearSlotMachineKeys(machineId: string): void {
 //
 // TRUST: the same dev-phase honest-client model as the rest of this map — the
 // operator (the room's deed holder) is trusted to run the physics honestly;
-// every read shape-guards so junk in these keys reads as "no machine".
+// every read shape-guards so junk in these keys reads as "no machine". Chips
+// only ever leave the machine to the player whose drop pushed them or to the
+// operator itself (the door, a removed cabinet) — never to a party named in a
+// peer-writable record, so forging the machine can't pay the forger.
+//
+// PARTITIONS: the operator lease is a Y.Map record, not a mutex; see
+// pusherCroupier.ts for how a second session of the same deed holder is kept
+// from operating while the first may only be cut off.
 
 /** Same field-for-field record the slot operator uses. */
 export type CoinPusherOperatorLease = SlotOperatorLease;
@@ -1054,20 +1061,23 @@ export function refuseCoinPusherInsert(
 /**
  * Operator: carry out the owner's door request in ONE transaction — publish
  * the emptied `next`, credit the owner exactly the chips that were inside
- * `base`, clear the request. `next` must be emptyMachine's result on `base`
- * for the owner who asked. Returns the chips credited, or null when nothing
- * was written.
+ * `base`, clear the request. The operator must be the machine's owner and the
+ * one who asked (the operator re-owns every machine it runs, so this is the
+ * deed holder emptying their own machine), and `next` must be emptyMachine's
+ * result on `base`. Returns the chips credited, or null when nothing was
+ * written.
  */
 export function commitCoinPusherEmpty(
   machineId: string,
   base: CoinPusherState,
   next: CoinPusherState,
   request: PusherEmptyRequest,
+  operatorId: string,
 ): number | null {
   const stored = readCoinPusherState(machineId);
   if (!stored || !sameCoinPusherRevision(stored, base)) return null;
   if (readCoinPusherEmptyRequest(machineId)?.requestId !== request.requestId) return null;
-  if (request.requester !== base.ownerId) return null;
+  if (base.ownerId !== operatorId || request.requester !== operatorId) return null;
   const normalized = normalizeCoinPusherState(next);
   if (!normalized) return null;
   const emptied = chipsInMachine(base);
@@ -1093,19 +1103,23 @@ export function commitCoinPusherEmpty(
 }
 
 /**
- * Teardown for a removed cabinet: credit the chips still inside to the
- * machine's owner (the slot-bankroll drain precedent — the contents are the
- * owner's, exactly what an empty would have paid) and delete every key the
- * machine used, in ONE transaction. Pending requests carry no chips, so they
- * are simply dropped. Returns the chips credited.
+ * Teardown for a removed cabinet, run by the operator side (the room's deed
+ * holder — pusherCroupier.closeCoinPusher): credit the chips still inside to
+ * `recipientId`, the deed holder running it, and delete every key the machine
+ * used, in ONE transaction. The recipient is the caller's own identity, never
+ * the `ownerId` stored in the peer-writable machine, so a forged machine can
+ * only ever pay the deed holder (the operator re-owns every machine it runs,
+ * so in honest play they are the same). Pending requests carry no chips, so
+ * they are simply dropped. Returns the chips credited.
  */
-export function drainAndClearCoinPusher(machineId: string): number {
+export function drainAndClearCoinPusher(machineId: string, recipientId: string): number {
   const map = ensureMap();
   const state = readCoinPusherState(machineId);
   const inside = state ? chipsInMachine(state) : 0;
-  const ownerKey = state ? `bal:${state.ownerId}` : '';
-  const ownerBalance = state ? safeCount(map, ownerKey) : 0;
-  const credit = inside > 0 && Number.isSafeInteger(ownerBalance + inside) ? inside : 0;
+  const ownerKey = `bal:${recipientId}`;
+  const ownerBalance = safeCount(map, ownerKey);
+  const credit = inside > 0 && recipientId.length > 0 && recipientId.length <= 128
+    && Number.isSafeInteger(ownerBalance + inside) ? inside : 0;
   const requestPrefix = `pusher-req:${machineId}:`;
   boundDoc!.transact(() => {
     if (credit > 0) map.set(ownerKey, ownerBalance + credit);
