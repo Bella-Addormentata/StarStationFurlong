@@ -136,6 +136,7 @@ import {
   closeCoinPusher,
   stopCoinPusherOperator,
   tickCoinPusherMachine,
+  tickCoinPusherTeardowns,
 } from "./pusherCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import { registerFurnitureHandles } from "./furnitureHandles";
@@ -2980,8 +2981,8 @@ export class World {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
     } else if (removedKind === "coin-pusher") {
-      // 🪙 Stop operating it here; the deed holder's client pays the chips
-      // still inside to the deed holder and wipes its keys.
+      // 🪙 Stop operating it here. The deed holder's session that operates it
+      // pays the chips still inside to the deed holder and wipes its keys.
       closeCoinPusher(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
@@ -5126,6 +5127,9 @@ export class World {
       if (autoCroupier) tickCoinPusherMachine(machine.id);
       else stopCoinPusherOperator(machine.id);
     }
+    // …and finish any removed cabinet's teardown left to a session that has
+    // since gone away (closeCoinPusher).
+    tickCoinPusherTeardowns();
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's
     // reserved operator slot (roulette wheel-head / craps stickman). The owner

@@ -111,6 +111,9 @@ export function bindCasinoDoc(doc: Y.Doc): void {
   bindingEpoch += 1;
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
+  // 🪙 Index the coin pushers' requests now, outside any operator poll, and
+  // observe ahead of notify() so listeners never see a stale index.
+  pusherRequestIndex(casinoMap);
   casinoMap.observe((event) => notify(event.keysChanged));
   notify(); // repaint subscribers from the fresh doc
 }
@@ -876,47 +879,69 @@ export const PUSHER_REQUEST_SCAN = 64;
 
 // The operator polls a machine's requests ten times a second, so it reads them
 // through an index rather than walking the casino map, which any peer can
-// grow. Per bound map: machineId → the keys holding its well-formed requests,
-// in arrival order. A machine's entry is built by one walk the first time it
-// is read; from then on an observer keeps it current by looking only at the
-// keys each transaction changed, local or remote.
-const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, Map<string, Set<string>>>();
-
-/** A request filed under its own player's key (the cross-key guard). */
-function isFiledRequest(map: Y.Map<unknown>, key: string, prefix: string): boolean {
-  const value = map.get(key);
-  return isPusherInsertRequest(value) && value.player === key.slice(prefix.length);
+// grow. Each bound map gets one index, built by a single pass when the map is
+// bound (bindCasinoDoc — a join, where the doc is usually still empty, or the
+// offline fallback) and from then on kept current by an observer that looks
+// only at the keys each transaction changed, local or remote. No poll, and no
+// machine's first poll, ever walks the map.
+interface PusherRequestIndex {
+  /** machineId → the keys holding its filed requests, in arrival order. */
+  byMachine: Map<string, Set<string>>;
+  /** key → the machine it is filed under (to unfile it when it changes). */
+  machineOf: Map<string, string>;
 }
 
-function pusherRequestKeys(machineId: string): Set<string> {
-  const map = ensureMap();
-  let machines = pusherRequestIndexes.get(map);
-  if (!machines) {
-    const index = new Map<string, Set<string>>();
-    machines = index;
-    pusherRequestIndexes.set(map, index);
-    map.observe((event) => {
-      for (const key of event.keysChanged) {
-        if (!key.startsWith('pusher-req:')) continue;
-        for (const [id, keys] of index) {
-          const prefix = `pusher-req:${id}:`;
-          if (!key.startsWith(prefix)) continue;
-          if (isFiledRequest(map, key, prefix)) keys.add(key);
-          else keys.delete(key);
-        }
-      }
-    });
+const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, PusherRequestIndex>();
+const PUSHER_REQUEST_PREFIX = 'pusher-req:';
+
+/** The machine a value under `key` is a request for, or null when it is not
+ *  a well-formed request filed under its own player's key
+ *  (`pusher-req:<mid>:<pid>` with `<pid>` its player — the cross-key guard).
+ *  The player fixes where `<mid>` ends, so a colon in either id can't file a
+ *  request under the wrong machine. */
+function filedRequestMachine(key: string, value: unknown): string | null {
+  if (!key.startsWith(PUSHER_REQUEST_PREFIX) || !isPusherInsertRequest(value)) return null;
+  const tail = `:${value.player}`;
+  const end = key.length - tail.length;
+  if (end <= PUSHER_REQUEST_PREFIX.length || !key.endsWith(tail)) return null;
+  return key.slice(PUSHER_REQUEST_PREFIX.length, end);
+}
+
+/** File `key` afresh: any change is a new arrival, so it goes to the back. */
+function reindexPusherRequest(index: PusherRequestIndex, key: string, value: unknown): void {
+  const was = index.machineOf.get(key);
+  if (was !== undefined) {
+    const keys = index.byMachine.get(was);
+    keys?.delete(key);
+    if (keys?.size === 0) index.byMachine.delete(was);
+    index.machineOf.delete(key);
   }
-  let keys = machines.get(machineId);
+  const machineId = filedRequestMachine(key, value);
+  if (machineId === null) return;
+  let keys = index.byMachine.get(machineId);
   if (!keys) {
-    const prefix = `pusher-req:${machineId}:`;
     keys = new Set();
-    for (const key of map.keys()) {
-      if (key.startsWith(prefix) && isFiledRequest(map, key, prefix)) keys.add(key);
-    }
-    machines.set(machineId, keys);
+    index.byMachine.set(machineId, keys);
   }
-  return keys;
+  keys.add(key);
+  index.machineOf.set(key, machineId);
+}
+
+/** The bound map's request index (built by bindCasinoDoc). */
+function pusherRequestIndex(map: Y.Map<unknown>): PusherRequestIndex {
+  const existing = pusherRequestIndexes.get(map);
+  if (existing) return existing;
+  const index: PusherRequestIndex = { byMachine: new Map(), machineOf: new Map() };
+  for (const [key, value] of map.entries()) {
+    if (key.startsWith(PUSHER_REQUEST_PREFIX)) reindexPusherRequest(index, key, value);
+  }
+  map.observe((event) => {
+    for (const key of event.keysChanged) {
+      if (key.startsWith(PUSHER_REQUEST_PREFIX)) reindexPusherRequest(index, key, map.get(key));
+    }
+  });
+  pusherRequestIndexes.set(map, index);
+  return index;
 }
 
 /** Up to `limit` of this machine's insert requests, oldest first (the
@@ -931,9 +956,10 @@ export function readCoinPusherRequests(
   limit = PUSHER_REQUEST_SCAN,
 ): PusherInsertRequest[] {
   const map = ensureMap();
+  const keys = pusherRequestIndex(map).byMachine.get(machineId);
   const out: PusherInsertRequest[] = [];
   let looked = 0;
-  for (const key of pusherRequestKeys(machineId)) {
+  for (const key of keys ?? []) {
     if (looked++ === PUSHER_REQUEST_SCAN) break;
     const value = map.get(key);
     if (isPusherInsertRequest(value)) out.push(value);
@@ -1194,10 +1220,12 @@ export function commitCoinPusherEmpty(
 }
 
 /**
- * Teardown for a removed cabinet, run by the operator side (the room's deed
- * holder — pusherCroupier.closeCoinPusher): credit the chips still inside to
- * `recipientId`, the deed holder running it, and delete every key the machine
- * used, in ONE transaction. The recipient is the caller's own identity, never
+ * Teardown for a removed cabinet, run only by the deed holder's session that
+ * operates the machine, or could take it over by the election's rule
+ * (pusherCroupier.closeCoinPusher), so it never merges with a drop another
+ * session is still settling: credit the chips still inside to `recipientId`,
+ * the deed holder running it, and delete every key the machine used, in ONE
+ * transaction. The recipient is the caller's own identity, never
  * the `ownerId` stored in the peer-writable machine, so a forged machine can
  * only ever pay the deed holder (the operator re-owns every machine it runs,
  * so in honest play they are the same). Pending requests carry no chips, so
@@ -1227,7 +1255,6 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
       if (prefixes.some((prefix) => key.startsWith(prefix))) map.delete(key);
     }
   });
-  pusherRequestIndexes.get(map)?.delete(machineId);
   return credit;
 }
 

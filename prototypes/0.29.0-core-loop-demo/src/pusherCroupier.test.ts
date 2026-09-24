@@ -9,6 +9,7 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  drainAndClearCoinPusher,
   readChips,
   readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
@@ -45,6 +46,7 @@ import {
   OPERATOR_UNCLEAN_TAKEOVER_MS,
   operateCoinPusher,
   tickCoinPusherMachine,
+  tickCoinPusherTeardowns,
 } from './pusherCroupier';
 
 const OPERATOR = getPlayerId();
@@ -64,6 +66,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setSoleCroupierPredicate(() => true);
+  closeCoinPusher(MACHINE, false); // reset this session's state for MACHINE
 });
 
 /** A machine owned by `owner` that has taken `n` drops from OTHER. */
@@ -83,6 +86,13 @@ function request(
   hole: PusherHole = 1,
 ): PusherInsertRequest {
   return { requestId, player, hole, phase, requestedAt };
+}
+
+function sync(a: Y.Doc, b: Y.Doc): void {
+  const toB = Y.encodeStateAsUpdate(a, Y.encodeStateVector(b));
+  const toA = Y.encodeStateAsUpdate(b, Y.encodeStateVector(a));
+  Y.applyUpdate(b, toB);
+  Y.applyUpdate(a, toA);
 }
 
 // ── One pass of work ─────────────────────────────────────────────────────────
@@ -367,6 +377,91 @@ describe('closeCoinPusher', () => {
     writeCoinPusherState(MACHINE, base);
     closeCoinPusher(MACHINE, false);
     expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readChips(OPERATOR)).toBe(0);
+  });
+
+  it('the session operating the machine drains it at once', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    tickCoinPusherMachine(MACHINE, NOW); // takes the lease
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
+    closeCoinPusher(MACHINE, true, NOW + 10);
+    expect(readChips(OPERATOR)).toBe(chipsInMachine(base));
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+  });
+
+  it('another tab leaves the drain to the tab operating the machine, finishing it only if that tab goes away', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    const device = coinPusherOperatorSession().split(':')[0];
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: `${device}:operator-tab`, expiresAt: NOW + 5_000 });
+    closeCoinPusher(MACHINE, true, NOW);
+    tickCoinPusherTeardowns(NOW + 4_999);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readChips(OPERATOR)).toBe(0);
+    // The operating tab closed without draining; its lease lapses.
+    tickCoinPusherTeardowns(NOW + 5_000);
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(readChips(OPERATOR)).toBe(chipsInMachine(base));
+  });
+
+  it('another device waits out the split window before draining in the operator\'s place', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: 'another-device:tab', expiresAt: NOW + 5_000 });
+    closeCoinPusher(MACHINE, true, NOW);
+    tickCoinPusherTeardowns(NOW + 5_000 + OPERATOR_UNCLEAN_TAKEOVER_MS - 1);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    tickCoinPusherTeardowns(NOW + 5_000 + OPERATOR_UNCLEAN_TAKEOVER_MS);
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(readChips(OPERATOR)).toBe(chipsInMachine(base));
+  });
+
+  it('never races a drop the operating tab is settling: the merged room pays every chip once', () => {
+    // Doc A is the operating tab (another session of this deed holder); doc B
+    // is this one.
+    const base = machineWith(60);
+    writeCoinPusherState(MACHINE, base);
+    const device = coinPusherOperatorSession().split(':')[0];
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: `${device}:operator-tab`, expiresAt: NOW + 8_000 });
+    buyInChips(PLAYER, 3);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', currentPusherPhase(base, NOW - 100)));
+    const docA = doc;
+    const docB = new Y.Doc();
+    sync(docA, docB);
+    // A settles the drop, while B, not yet synced, sees the cabinet removed.
+    operateCoinPusher(MACHINE, OPERATOR, NOW, () => 1234);
+    const settled = readCoinPusherState(MACHINE)!;
+    expect(settled.totalInserted).toBe(base.totalInserted + 1);
+    bindCasinoDoc(docB);
+    closeCoinPusher(MACHINE, true, NOW);
+    expect(readCoinPusherState(MACHINE)).toEqual(base); // left to A
+    sync(docA, docB);
+    // A sees the removal too and, holding the lease, drains what it settled.
+    bindCasinoDoc(docA);
+    drainAndClearCoinPusher(MACHINE, OPERATOR);
+    sync(docA, docB);
+    bindCasinoDoc(docB);
+    tickCoinPusherTeardowns(NOW + 100); // the lease is gone: nothing left to pay
+    sync(docA, docB);
+    for (const d of [docA, docB]) {
+      bindCasinoDoc(d);
+      expect(readCoinPusherState(MACHINE)).toBeNull();
+      expect(readChips(PLAYER)).toBe(3 - 1 + settled.lastDrop!.paid);
+      expect(readChips(PLAYER) + readChips(OPERATOR)).toBe(3 + chipsInMachine(base));
+    }
+  });
+
+  it('a cabinet put back before its teardown ran is left alone', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    const device = coinPusherOperatorSession().split(':')[0];
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: `${device}:operator-tab`, expiresAt: NOW + 5_000 });
+    closeCoinPusher(MACHINE, true, NOW);
+    tickCoinPusherMachine(MACHINE, NOW + 100); // World ticks it again: it is back
+    tickCoinPusherTeardowns(NOW + 6_000);
+    expect(readCoinPusherState(MACHINE)?.upper).toEqual(base.upper);
     expect(readChips(OPERATOR)).toBe(0);
   });
 });

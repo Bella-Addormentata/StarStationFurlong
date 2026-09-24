@@ -159,29 +159,58 @@ describe('coin-pusher requests', () => {
     );
   });
 
-  it('reads a machine\'s requests from its index, never by walking the casino map', () => {
-    const map = doc.getMap('casino');
-    for (let i = 0; i < 2_000; i++) map.set(`noise:${i}`, i);
-    writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
-    expect(readCoinPusherRequests(MACHINE)).toHaveLength(1); // builds the index
-    for (let i = 0; i < 2_000; i++) {
-      map.set(`pusher-req:another-machine:p${i}`, request(`p${i}`, `x-${i}`));
-    }
-    writeCoinPusherRequest(MACHINE, request(OTHER, 'b-2'));
+  /** Spy on every Y.Map walk while `read` runs; returns what it returned. */
+  function withoutWalking<T>(read: () => T): T {
     const walks = (['keys', 'entries', 'values', 'forEach'] as const)
       .map((method) => vi.spyOn(Y.Map.prototype, method));
     try {
-      expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['a-1', 'b-2']);
+      const out = read();
       for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+      return out;
     } finally {
       for (const walk of walks) walk.mockRestore();
     }
+  }
+
+  it('reads a machine\'s requests from its index, never by walking the casino map — not even the first time', () => {
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2_000; i++) map.set(`noise:${i}`, i);
+    for (let i = 0; i < 2_000; i++) {
+      map.set(`pusher-req:another-machine:p${i}`, request(`p${i}`, `x-${i}`));
+    }
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
+    writeCoinPusherRequest(MACHINE, request(OTHER, 'b-2'));
+    expect(withoutWalking(() => readCoinPusherRequests(MACHINE).map((r) => r.requestId)))
+      .toEqual(['a-1', 'b-2']);
+  });
+
+  it('a doc that already holds requests is indexed when it is bound, never by a read', () => {
+    const loaded = new Y.Doc();
+    const map = loaded.getMap('casino');
+    for (let i = 0; i < 2_000; i++) map.set(`noise:${i}`, i);
+    map.set(`pusher-req:${MACHINE}:${PLAYER}`, request(PLAYER, 'a-1'));
+    map.set(`pusher-req:${MACHINE}:${ATTACKER}`, request(PLAYER, 'filed-under-someone-else'));
+    bindCasinoDoc(loaded);
+    expect(withoutWalking(() => readCoinPusherRequests(MACHINE).map((r) => r.requestId)))
+      .toEqual(['a-1']);
+  });
+
+  it('files a request by its own player, so a colon in an id never files it under another machine', () => {
+    const map = doc.getMap('casino');
+    // One key, two readings: machine 'a' with player 'b:p', or machine 'a:b'
+    // with player 'p'. The request's player decides which.
+    map.set('pusher-req:a:b:p', request('p', 'for-a:b'));
+    expect(readCoinPusherRequests('a:b').map((r) => r.requestId)).toEqual(['for-a:b']);
+    expect(readCoinPusherRequests('a')).toEqual([]);
+    map.set('pusher-req:a:b:p', request('b:p', 'for-a'));
+    expect(readCoinPusherRequests('a').map((r) => r.requestId)).toEqual(['for-a']);
+    expect(readCoinPusherRequests('a:b')).toEqual([]);
   });
 
   it('keeps the index current as requests come, change and go — from this peer or another', () => {
     const map = doc.getMap('casino');
     const ids = () => readCoinPusherRequests(MACHINE).map((r) => r.requestId);
-    expect(ids()).toEqual([]); // builds the index
+    expect(ids()).toEqual([]);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
     expect(ids()).toEqual(['a-1']);
     map.set(`pusher-req:${MACHINE}:${PLAYER}`, { junk: true });
@@ -206,7 +235,6 @@ describe('coin-pusher requests', () => {
   it('works through a flood PUSHER_REQUEST_SCAN at a time, in arrival order, reaching every request once', () => {
     const id = (i: number) => `r-${String(i).padStart(4, '0')}`;
     const total = 3 * PUSHER_REQUEST_SCAN + 5;
-    expect(readCoinPusherRequests(MACHINE)).toEqual([]); // builds the index
     // Written newest first, so arrival order and age disagree.
     for (let i = total - 1; i >= 0; i--) writeCoinPusherRequest(MACHINE, request(`p${i}`, id(i)));
     const gets = vi.spyOn(Y.Map.prototype, 'get');

@@ -141,10 +141,14 @@ Records in the room's `casino` map:
   payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read off
   that transition; it is never a separate argument. Each poll works through
   at most 4 requests (oldest first), so a flood of requests can't stall the
-  operator's frame. It reads them from a per-machine index that an observer
-  keeps current from the keys each transaction changed, never by walking the
-  casino map, and a read looks at no more than 64 of them (in arrival order).
-  A poll therefore costs the same however many keys peers write.
+  operator's frame. It reads them from an index of the requests by machine.
+  The index is built by one pass when the casino map is bound (a join, where
+  the doc is usually still empty) and then kept current by an observer, from
+  the keys each transaction changed. No poll, not even a machine's first,
+  walks the map, and a read looks at no more than 64 requests (in arrival
+  order), so a poll costs the same however many keys peers write. A request
+  is filed by its own player: the `<pid>` at the end of its key must be its
+  player, which also fixes where `<mid>` ends if either id contains a colon.
 - **Answers.** Each player's answer lives under their own
   `pusher-result:<mid>:<pid>` until their next request is answered. The
   machine's `lastDrop` only lights the cabinet: the next player's drop
@@ -164,10 +168,18 @@ Records in the room's `casino` map:
   since changed hands) is turned down with an answer too
   (`refuseCoinPusherEmpty`). The panel goes by `pusher-door:<mid>`, since a
   request that merely vanished says nothing about whether the door opened.
-- **Removal.** When the cabinet is removed, the deed holder's client pays the
-  chips still inside to the deed holder and deletes every key (including any
-  `pusher-esc:` records an earlier revision left, which credit nothing), in
-  one transaction (`drainAndClearCoinPusher`). The recipient is the caller's own
+- **Removal.** Every client sees the cabinet go and stops operating it. The
+  records are cleared only by a deed-holder session that may operate the
+  machine by the election's rule: the one holding its lease, or one that
+  could take it over. That session pays the chips still inside to the deed
+  holder and deletes every key (including any `pusher-esc:` records an
+  earlier revision left, which credit nothing), in one transaction
+  (`drainAndClearCoinPusher`). Every settle happens on the lease holder, so
+  the drain never merges with a drop another tab is still settling (that
+  would bring the machine back and pay its chips twice). Another
+  deed-holder session keeps the teardown pending, and finishes it only if the
+  operator goes away still holding the lease (after the same wait as a
+  takeover). A cabinet put back first is left alone. The recipient is the caller's own
   identity, never the owner named in the peer-writable machine, so chips only
   ever leave the machine to the player whose drop pushed them or to the
   operator itself — forging the machine can't pay the forger.
@@ -226,6 +238,7 @@ model as it is.
 - A cabinet removed while the deed holder is offline leaves its records
   behind (the same as a slot machine removed with no managing client online).
 - A network split between two of the deed holder's devices that outlasts the
-  takeover window can still settle drops on both sides (see *Splits*).
+  takeover window can still settle drops, or drain a removed cabinet, on both
+  sides (see *Splits*).
 - The operator is trusted. Verifying drops (publishing the seed and letting
   clients replay the transition) is possible with this engine but not built.

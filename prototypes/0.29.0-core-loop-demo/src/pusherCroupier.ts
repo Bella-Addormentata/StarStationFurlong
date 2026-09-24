@@ -29,6 +29,11 @@
  * furniture — nothing is paid out on a takeover, so a forged owner earns
  * nothing.
  *
+ * TEARDOWN: a removed cabinet is drained by the same rule. Only a session that
+ * may operate the machine (it holds the lease, or could take it over) pays
+ * out the chips inside and deletes its keys, so the drain never merges with a
+ * settle still in flight on another tab (see closeCoinPusher).
+ *
  * WORK (at most every REQUEST_POLL_MS): the owner's door request first
  * (carried out, or answered with a refusal when its requester doesn't own the
  * machine), then the MAX_REQUESTS_PER_POLL oldest inserts. The requests come
@@ -87,6 +92,9 @@ interface PusherOperatorSession {
 
 const operators = new Map<string, PusherOperatorSession>();
 const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
+/** Removed cabinets this session is to clear once no other session may be
+ *  operating them (closeCoinPusher). */
+const pendingTeardowns = new Set<string>();
 /** Short: a drop's timing window (MAX_DROP_LAG_MS) has to cover this wait. */
 const REQUEST_POLL_MS = 100;
 /** Inserts settled or refused per poll (≤ 40 a second per machine). */
@@ -183,6 +191,9 @@ export function isCoinPusherOperator(machineId: string, now = Date.now()): boole
  * session (or not), keeps the lease, and runs the operator's work when due.
  */
 export function tickCoinPusherMachine(machineId: string, now = Date.now()): void {
+  // World ticks only cabinets in the room, so one put back before its
+  // teardown ran is no longer to be torn down.
+  pendingTeardowns.delete(machineId);
   if (!canRunCroupier()) {
     stopCoinPusherOperator(machineId);
     return;
@@ -320,21 +331,58 @@ function settleOneInsert(
 }
 
 /**
- * A removed cabinet: stop operating it here and, on the deed holder's client,
- * pay the chips still inside to the deed holder (the machine's owner — the
- * operator re-owns every machine it runs) and delete every key it used. Other
- * clients only stop; the recipient is never read from the peer-writable
+ * A removed cabinet. Every client that sees the removal stops operating it
+ * here. Its records are cleared (the chips still inside paid to the deed
+ * holder, every key deleted) only by a session that may operate the machine
+ * by the election's own rule: the one holding its lease, or one that could
+ * take the lease over. Every settle happens on the lease holder, so the drain
+ * is never merged with a drop another session is still settling, which would
+ * bring the machine back and pay its chips twice. A deed-holder session that
+ * has to wait keeps the teardown pending. The operator normally drains first,
+ * and tickCoinPusherTeardowns finishes the job if that session goes away still
+ * holding the lease. The recipient is never read from the peer-writable
  * machine.
  */
-export function closeCoinPusher(machineId: string, canManage = canRunCroupier()): void {
+export function closeCoinPusher(
+  machineId: string,
+  canManage = canRunCroupier(),
+  now = Date.now(),
+): void {
   operators.delete(machineId);
   lastPolls.delete(machineId);
-  leaseFirstSeen.delete(machineId);
-  if (readCoinPusherOperatorLease(machineId)?.sessionId === operatorSessionId) {
-    clearCoinPusherOperatorLease(machineId);
+  if (!canManage) {
+    pendingTeardowns.delete(machineId);
+    leaseFirstSeen.delete(machineId);
+    if (readCoinPusherOperatorLease(machineId)?.sessionId === operatorSessionId) {
+      clearCoinPusherOperatorLease(machineId);
+    }
+    return;
   }
-  if (!canManage) return;
-  drainAndClearCoinPusher(machineId, getPlayerId());
+  pendingTeardowns.add(machineId);
+  tearDownIfFree(machineId, now);
+}
+
+/** Drain a removed cabinet unless another session may still be operating it. */
+function tearDownIfFree(machineId: string, now: number): void {
+  const playerId = getPlayerId();
+  const lease = readCoinPusherOperatorLease(machineId);
+  if (lease && lease.sessionId !== operatorSessionId
+    && now < takeoverAt(machineId, lease, playerId, now)) return;
+  pendingTeardowns.delete(machineId);
+  leaseFirstSeen.delete(machineId);
+  drainAndClearCoinPusher(machineId, playerId);
+}
+
+/** World calls this every frame. It finishes the teardowns this session left
+ *  to another session that has since gone away still holding the lease. */
+export function tickCoinPusherTeardowns(now = Date.now()): void {
+  if (pendingTeardowns.size === 0) return;
+  if (!canRunCroupier()) {
+    for (const machineId of pendingTeardowns) leaseFirstSeen.delete(machineId);
+    pendingTeardowns.clear();
+    return;
+  }
+  for (const machineId of [...pendingTeardowns]) tearDownIfFree(machineId, now);
 }
 
 // Leaving the page releases every lease this session holds, so another tab
