@@ -93,8 +93,9 @@ interface PusherOperatorSession {
 const operators = new Map<string, PusherOperatorSession>();
 const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
 /** Removed cabinets this session is to clear once no other session may be
- *  operating them (closeCoinPusher). */
-const pendingTeardowns = new Set<string>();
+ *  operating them (closeCoinPusher), with the doc epoch each was removed in:
+ *  one never reads or writes a different room's doc. */
+const pendingTeardowns = new Map<string, number>();
 /** Short: a drop's timing window (MAX_DROP_LAG_MS) has to cover this wait. */
 const REQUEST_POLL_MS = 100;
 /** Inserts settled or refused per poll (≤ 40 a second per machine). */
@@ -297,7 +298,7 @@ function settleOneInsert(
   if (readChips(request.player) < PUSHER_ANTE) return refuse('no-chips');
   if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) return refuse('machine-full');
 
-  const timing = resolveDropTiming(state, request.phase, now);
+  const timing = resolveDropTiming(state, request.phase, request.requestedAt, now);
   let drop: ReturnType<typeof processInsert>;
   try {
     drop = processInsert(state, request.player, request.hole, timing.dropPhase, drawSeed());
@@ -338,10 +339,10 @@ function settleOneInsert(
  * take the lease over. Every settle happens on the lease holder, so the drain
  * is never merged with a drop another session is still settling, which would
  * bring the machine back and pay its chips twice. A deed-holder session that
- * has to wait keeps the teardown pending. The operator normally drains first,
- * and tickCoinPusherTeardowns finishes the job if that session goes away still
- * holding the lease. The recipient is never read from the peer-writable
- * machine.
+ * has to wait keeps the teardown pending, for this room's doc only. The
+ * operator normally drains first, and tickCoinPusherTeardowns finishes the job
+ * if that session goes away still holding the lease. The recipient is never
+ * read from the peer-writable machine.
  */
 export function closeCoinPusher(
   machineId: string,
@@ -358,12 +359,19 @@ export function closeCoinPusher(
     }
     return;
   }
-  pendingTeardowns.add(machineId);
+  pendingTeardowns.set(machineId, casinoDocEpoch());
   tearDownIfFree(machineId, now);
 }
 
-/** Drain a removed cabinet unless another session may still be operating it. */
+/** Drain a removed cabinet unless another session may still be operating it.
+ *  A teardown left over from another room's doc (a room switch since) is
+ *  dropped without touching this one. */
 function tearDownIfFree(machineId: string, now: number): void {
+  if (pendingTeardowns.get(machineId) !== casinoDocEpoch()) {
+    pendingTeardowns.delete(machineId);
+    leaseFirstSeen.delete(machineId);
+    return;
+  }
   const playerId = getPlayerId();
   const lease = readCoinPusherOperatorLease(machineId);
   if (lease && lease.sessionId !== operatorSessionId
@@ -378,11 +386,11 @@ function tearDownIfFree(machineId: string, now: number): void {
 export function tickCoinPusherTeardowns(now = Date.now()): void {
   if (pendingTeardowns.size === 0) return;
   if (!canRunCroupier()) {
-    for (const machineId of pendingTeardowns) leaseFirstSeen.delete(machineId);
+    for (const machineId of pendingTeardowns.keys()) leaseFirstSeen.delete(machineId);
     pendingTeardowns.clear();
     return;
   }
-  for (const machineId of [...pendingTeardowns]) tearDownIfFree(machineId, now);
+  for (const machineId of [...pendingTeardowns.keys()]) tearDownIfFree(machineId, now);
 }
 
 // Leaving the page releases every lease this session holds, so another tab

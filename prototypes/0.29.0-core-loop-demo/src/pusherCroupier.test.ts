@@ -31,6 +31,7 @@ import {
   MACHINE_MAX_CHIPS,
   MAX_DROP_LAG_MS,
   processInsert,
+  PUSHER_PERIOD_MS,
   PUSHER_STALE_REQUEST_MS,
   type CoinPusherState,
   type Pile,
@@ -123,7 +124,7 @@ describe('operateCoinPusher', () => {
     writeCoinPusherState(MACHINE, base);
     buyInChips(PLAYER, 3);
     const seen = currentPusherPhase(base, NOW - 300); // pressed 300 ms ago
-    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', seen));
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', seen, NOW - 300));
     operateCoinPusher(MACHINE, OPERATOR, NOW, () => 1234);
     const after = readCoinPusherState(MACHINE)!;
     const drop = after.lastDrop!;
@@ -144,13 +145,27 @@ describe('operateCoinPusher', () => {
     const base = machineWith(20);
     writeCoinPusherState(MACHINE, base);
     buyInChips(PLAYER, 3);
-    const stale = currentPusherPhase(base, NOW - MAX_DROP_LAG_MS - 200);
-    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', stale));
+    const pressedAt = NOW - MAX_DROP_LAG_MS - 200;
+    writeCoinPusherRequest(MACHINE,
+      request(PLAYER, 'req-1', currentPusherPhase(base, pressedAt), pressedAt));
     operateCoinPusher(MACHINE, OPERATOR, NOW, () => 1);
     const drop = readCoinPusherState(MACHINE)!.lastDrop!;
     expect(drop.honored).toBe(false);
     expect(drop.phase).toBeCloseTo(currentPusherPhase(base, NOW), 12);
     expect(readChips(PLAYER)).toBe(2 + drop.paid);
+  });
+
+  it('a drop pressed a whole cycle ago is late too, though the pusher is back where it was', () => {
+    const base = machineWith(20);
+    writeCoinPusherState(MACHINE, base);
+    buyInChips(PLAYER, 3);
+    const pressedAt = NOW - PUSHER_PERIOD_MS - 100;
+    writeCoinPusherRequest(MACHINE,
+      request(PLAYER, 'req-1', currentPusherPhase(base, pressedAt), pressedAt));
+    operateCoinPusher(MACHINE, OPERATOR, NOW, () => 1);
+    const drop = readCoinPusherState(MACHINE)!.lastDrop!;
+    expect(drop.honored).toBe(false);
+    expect(drop.phase).toBeCloseTo(currentPusherPhase(base, NOW), 12);
   });
 
   it('draws the seed itself, once per drop', () => {
@@ -451,6 +466,26 @@ describe('closeCoinPusher', () => {
       expect(readChips(PLAYER)).toBe(3 - 1 + settled.lastDrop!.paid);
       expect(readChips(PLAYER) + readChips(OPERATOR)).toBe(3 + chipsInMachine(base));
     }
+  });
+
+  it('a teardown left pending when the room changes never touches the new room\'s doc', () => {
+    const device = coinPusherOperatorSession().split(':')[0];
+    writeCoinPusherState(MACHINE, machineWith(30));
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: `${device}:operator-tab`, expiresAt: NOW + 5_000 });
+    closeCoinPusher(MACHINE, true, NOW); // pending: another tab operates it
+    // Join another room whose cabinet happens to share the id, no lease on it.
+    const nextRoom = new Y.Doc();
+    bindCasinoDoc(nextRoom);
+    const theirs = machineWith(12);
+    writeCoinPusherState(MACHINE, theirs);
+    tickCoinPusherTeardowns(NOW + 10_000);
+    expect(readCoinPusherState(MACHINE)).toEqual(theirs);
+    expect(readChips(OPERATOR)).toBe(0);
+    // Nor is it waiting to: back in the first room, nothing is drained either.
+    bindCasinoDoc(doc);
+    tickCoinPusherTeardowns(NOW + 10_000);
+    expect(readCoinPusherState(MACHINE)).not.toBeNull();
+    expect(readChips(OPERATOR)).toBe(0);
   });
 
   it('a cabinet put back before its teardown ran is left alone', () => {

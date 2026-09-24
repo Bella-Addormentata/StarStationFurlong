@@ -877,22 +877,52 @@ export function writeCoinPusherState(machineId: string, state: CoinPusherState):
  *  order, so none is starved. */
 export const PUSHER_REQUEST_SCAN = 64;
 
-// The operator polls a machine's requests ten times a second, so it reads them
-// through an index rather than walking the casino map, which any peer can
-// grow. Each bound map gets one index, built by a single pass when the map is
-// bound (bindCasinoDoc — a join, where the doc is usually still empty, or the
-// offline fallback) and from then on kept current by an observer that looks
-// only at the keys each transaction changed, local or remote. No poll, and no
-// machine's first poll, ever walks the map.
+// The operator polls a machine's requests ten times a second, and removing a
+// cabinet deletes all of its per-player keys, so both go through an index
+// rather than walking the casino map, which any peer can grow. Each bound map
+// gets one index, built by a single pass when the map is bound (bindCasinoDoc
+// — a join, where the doc is usually still empty, or the offline fallback)
+// and from then on kept current by an observer that looks only at the keys
+// each transaction changed, local or remote. No poll, and no removal, ever
+// walks the map.
 interface PusherRequestIndex {
   /** machineId → the keys holding its filed requests, in arrival order. */
   byMachine: Map<string, Set<string>>;
   /** key → the machine it is filed under (to unfile it when it changes). */
   machineOf: Map<string, string>;
+  /** `<family><first segment of mid>` → every key of the per-player families
+   *  that begins so, filed by name alone whatever it holds (a removal deletes
+   *  a machine's keys from here — see pusherKeysOf). */
+  byBucket: Map<string, Set<string>>;
 }
 
 const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, PusherRequestIndex>();
 const PUSHER_REQUEST_PREFIX = 'pusher-req:';
+/** The per-player key families under `<family><mid>:` (`pusher-esc:` is an
+ *  earlier revision's escrow, still cleared with its machine). */
+const PUSHER_PLAYER_FAMILIES = [PUSHER_REQUEST_PREFIX, 'pusher-result:', 'pusher-esc:'] as const;
+
+/** `<family><first segment of the rest>`: the bucket a per-player key is filed
+ *  in. Machine ids never need to be told apart here — pusherKeysOf keeps only
+ *  the keys that start with the machine's full prefix. */
+function pusherBucketOf(family: string, key: string): string | null {
+  const cut = key.indexOf(':', family.length);
+  return cut < 0 ? null : key.slice(0, cut);
+}
+
+/** Every key of `machineId`'s per-player families (`<family><mid>:…`), found
+ *  through the index. */
+function pusherKeysOf(index: PusherRequestIndex, machineId: string): string[] {
+  const out: string[] = [];
+  for (const family of PUSHER_PLAYER_FAMILIES) {
+    const prefix = `${family}${machineId}:`;
+    const bucket = pusherBucketOf(family, prefix);
+    for (const key of (bucket === null ? null : index.byBucket.get(bucket)) ?? []) {
+      if (key.startsWith(prefix)) out.push(key);
+    }
+  }
+  return out;
+}
 
 /** The machine a value under `key` is a request for, or null when it is not
  *  a well-formed request filed under its own player's key
@@ -927,18 +957,36 @@ function reindexPusherRequest(index: PusherRequestIndex, key: string, value: unk
   index.machineOf.set(key, machineId);
 }
 
+/** Re-file one changed key of the casino map (a no-op for other keys). */
+function reindexPusherKey(index: PusherRequestIndex, map: Y.Map<unknown>, key: string): void {
+  const family = PUSHER_PLAYER_FAMILIES.find((f) => key.startsWith(f));
+  if (family === undefined) return;
+  if (family === PUSHER_REQUEST_PREFIX) reindexPusherRequest(index, key, map.get(key));
+  const bucket = pusherBucketOf(family, key);
+  if (bucket === null) return;
+  let keys = index.byBucket.get(bucket);
+  if (map.has(key)) {
+    if (!keys) {
+      keys = new Set();
+      index.byBucket.set(bucket, keys);
+    }
+    keys.add(key);
+  } else if (keys) {
+    keys.delete(key);
+    if (keys.size === 0) index.byBucket.delete(bucket);
+  }
+}
+
 /** The bound map's request index (built by bindCasinoDoc). */
 function pusherRequestIndex(map: Y.Map<unknown>): PusherRequestIndex {
   const existing = pusherRequestIndexes.get(map);
   if (existing) return existing;
-  const index: PusherRequestIndex = { byMachine: new Map(), machineOf: new Map() };
-  for (const [key, value] of map.entries()) {
-    if (key.startsWith(PUSHER_REQUEST_PREFIX)) reindexPusherRequest(index, key, value);
-  }
+  const index: PusherRequestIndex = {
+    byMachine: new Map(), machineOf: new Map(), byBucket: new Map(),
+  };
+  for (const key of map.keys()) reindexPusherKey(index, map, key);
   map.observe((event) => {
-    for (const key of event.keysChanged) {
-      if (key.startsWith(PUSHER_REQUEST_PREFIX)) reindexPusherRequest(index, key, map.get(key));
-    }
+    for (const key of event.keysChanged) reindexPusherKey(index, map, key);
   });
   pusherRequestIndexes.set(map, index);
   return index;
@@ -1229,7 +1277,9 @@ export function commitCoinPusherEmpty(
  * the `ownerId` stored in the peer-writable machine, so a forged machine can
  * only ever pay the deed holder (the operator re-owns every machine it runs,
  * so in honest play they are the same). Pending requests carry no chips, so
- * they are simply dropped. Returns the chips credited.
+ * they are simply dropped. The machine's per-player keys come from the index,
+ * so a removal costs what the machine holds, never a walk of the map. Returns
+ * the chips credited.
  */
 export function drainAndClearCoinPusher(machineId: string, recipientId: string): number {
   const map = ensureMap();
@@ -1239,21 +1289,17 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
   const ownerBalance = safeCount(map, ownerKey);
   const credit = inside > 0 && recipientId.length > 0 && recipientId.length <= 128
     && Number.isSafeInteger(ownerBalance + inside) ? inside : 0;
-  // `pusher-esc:` held escrows in an earlier revision; any left in a room's
-  // doc are removed with the machine and, like every record here, credit
+  // Its requests, answers, and any `pusher-esc:` escrows an earlier revision
+  // left — removed with the machine and, like every record here, crediting
   // nothing.
-  const prefixes = [
-    `pusher-req:${machineId}:`, `pusher-result:${machineId}:`, `pusher-esc:${machineId}:`,
-  ];
+  const playerKeys = pusherKeysOf(pusherRequestIndex(map), machineId);
   boundDoc!.transact(() => {
     if (credit > 0) map.set(ownerKey, ownerBalance + credit);
     map.delete(`pusher:${machineId}`);
     map.delete(`pusher-empty:${machineId}`);
     map.delete(`pusher-door:${machineId}`);
     map.delete(`pusher-operator:${machineId}`);
-    for (const key of [...map.keys()]) {
-      if (prefixes.some((prefix) => key.startsWith(prefix))) map.delete(key);
-    }
+    for (const key of playerKeys) map.delete(key);
   });
   return credit;
 }

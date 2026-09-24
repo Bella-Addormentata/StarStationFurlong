@@ -109,6 +109,19 @@ function countTransactions(d: Y.Doc): () => number {
   return () => n;
 }
 
+/** Run `work` asserting it never walks a Y.Map; returns what it returned. */
+function withoutWalking<T>(work: () => T): T {
+  const walks = (['keys', 'entries', 'values', 'forEach'] as const)
+    .map((method) => vi.spyOn(Y.Map.prototype, method));
+  try {
+    const out = work();
+    for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+    return out;
+  } finally {
+    for (const walk of walks) walk.mockRestore();
+  }
+}
+
 // ── Requests: a wish, not a payment ──────────────────────────────────────────
 
 describe('coin-pusher requests', () => {
@@ -158,19 +171,6 @@ describe('coin-pusher requests', () => {
       ['m-1', 'm-2', 'm-3', 'm-5', 'm-7', 'm-9'],
     );
   });
-
-  /** Spy on every Y.Map walk while `read` runs; returns what it returned. */
-  function withoutWalking<T>(read: () => T): T {
-    const walks = (['keys', 'entries', 'values', 'forEach'] as const)
-      .map((method) => vi.spyOn(Y.Map.prototype, method));
-    try {
-      const out = read();
-      for (const walk of walks) expect(walk).not.toHaveBeenCalled();
-      return out;
-    } finally {
-      for (const walk of walks) walk.mockRestore();
-    }
-  }
 
   it('reads a machine\'s requests from its index, never by walking the casino map — not even the first time', () => {
     const map = doc.getMap('casino');
@@ -544,6 +544,27 @@ describe('drainAndClearCoinPusher', () => {
     expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(chipsInMachine(forged));
     expect(readChips(ATTACKER)).toBe(0);
     expect(readChips(OWNER)).toBe(chipsInMachine(forged));
+  });
+
+  it('finds the machine\'s keys through the index, never by walking the casino map', () => {
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2_000; i++) map.set(`noise:${i}`, i);
+    const base = machineWith(10);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    refuseCoinPusherInsert(MACHINE, request(PLAYER, 'req-1'), 'expired', 1); // an answer
+    writeCoinPusherRequest(MACHINE, request(OTHER, 'req-2'));
+    map.set(`pusher-result:${MACHINE}:${OTHER}`, 'junk'); // any value under the prefix goes
+    map.set(`pusher-esc:${MACHINE}:${ATTACKER}:old`, { requestId: 'old', player: ATTACKER, ante: 5 });
+    // A machine whose id starts with this one's keeps its keys.
+    const neighbour = `${MACHINE}0`;
+    writeCoinPusherRequest(neighbour, request(PLAYER, 'n-1'));
+    map.set(`pusher-result:${neighbour}:${PLAYER}`, { kind: 'refused', requestId: 'n-0', reason: 'expired', atMs: 1 });
+    expect(withoutWalking(() => drainAndClearCoinPusher(MACHINE, OWNER))).toBe(chipsInMachine(base));
+    expect([...map.keys()].filter((k) => k.includes(MACHINE)).sort()).toEqual([
+      `pusher-req:${neighbour}:${PLAYER}`, `pusher-result:${neighbour}:${PLAYER}`,
+    ]);
+    expect(readChips(ATTACKER)).toBe(0);
   });
 
   it('credits nothing when there is no machine (or junk), and still clears its keys', () => {

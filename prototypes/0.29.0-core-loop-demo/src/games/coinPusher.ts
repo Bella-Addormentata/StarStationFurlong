@@ -77,9 +77,9 @@
  * The shared record is `pusher:<machineId>` in the casino map (whole-value
  * LWW), written only by the elected operator — the slot-croupier pattern:
  *   • a player writes an insert REQUEST (`pusher-req:<mid>:<pid>`: hole + the
- *     pusher phase they saw when they pressed INSERT); no chips move;
+ *     pusher phase they saw, and when, as they pressed DROP); no chips move;
  *   • the operator validates it (chips on hand, room in the machine, the
- *     claimed phase inside the timing window — resolveDropTiming), runs
+ *     claim inside the timing window — resolveDropTiming), runs
  *     processInsert with a seed it draws itself, and settles — or refuses,
  *     moving nothing. Either way it answers under the player's own
  *     `pusher-result:<mid>:<pid>` (PusherResult), which stays until that
@@ -166,16 +166,16 @@ export const PUSHER_ANTE = 1;
  *  fall together, or off the front of a group". */
 export const MAX_STACK_HEIGHT = 4;
 
-/** How late an insert may reach the operator and still drop at the phase the
- *  player saw (network + drain delay). An older claim — or a phase that was
- *  never on screen within the window — drops at the operator's current phase
- *  instead (resolveDropTiming). */
+/** How late an insert may reach the operator (its clock less the request's
+ *  own timestamp: network + drain delay) and still drop at the phase the
+ *  player saw. An older claim — or a phase that wasn't on screen at the
+ *  claimed moment — drops at the operator's current phase instead
+ *  (resolveDropTiming). */
 export const MAX_DROP_LAG_MS = 1000;
-/** How far AHEAD of the operator's pusher a claimed phase may be and still be
- *  kept. Every client derives the pusher from its own wall clock (there is no
- *  shared clock on the mesh), so a player whose clock runs a little ahead of
- *  the operator's sees the pusher slightly ahead. Both bounds sum to well
- *  under one PUSHER_PERIOD_MS, so the window is unambiguous. */
+/** How far AHEAD of the operator's clock a request's timestamp may be and its
+ *  timing still be kept. Every client derives the pusher from its own wall
+ *  clock (there is no shared clock on the mesh), so a player whose clock runs
+ *  a little ahead of the operator's sees the pusher slightly ahead. */
 export const MAX_DROP_LEAD_MS = 250;
 
 /** How long a player's panel waits for the operator before withdrawing its
@@ -296,9 +296,12 @@ export interface PusherInsertRequest {
   player: string;
   hole: PusherHole;
   /** The pusher phase ∈ [0, 1) on the player's screen when they pressed
-   *  INSERT — the timing the drop is made at (resolveDropTiming). */
+   *  DROP — the timing the drop is made at (resolveDropTiming). */
   phase: number;
-  /** Client-side ms timestamp; display / ordering only, never authoritative. */
+  /** When they pressed it, by their clock (ms). The operator keeps their
+   *  timing only when `phase` is the pusher's phase at this moment and it is
+   *  inside the timing window of the operator's own clock; it never moves
+   *  chips. */
   requestedAt: number;
 }
 
@@ -774,34 +777,48 @@ export function advanceSim(
   return { state: cur, paidChipIds: allPaid };
 }
 
+/** How far (ms of pusher travel) a claimed phase may sit from the pusher's
+ *  phase at the claimed time and still be that phase — rounding room only: an
+ *  honest panel computes it with this same function from the same anchor. */
+export const DROP_PHASE_MATCH_MS = 1;
+
 /**
  * The drop's timing: which pusher phase the chip falls at.
  *
  * The player's request carries the phase that was on their screen when they
- * pressed INSERT. It reaches the operator a little later (sync + drain), by
- * which time the pusher has moved on. `lagMs` is how far the operator's
- * pusher at `receivedAtMs` is past the claimed phase (negative when the claim
- * is ahead — a player clock running fast). A claim inside
- * [−maxLeadMs, maxLagMs] is kept: the chip falls at exactly the phase the
- * player saw. Anything else (a stale request, a phase that was never on
- * screen in that window, junk) falls at the operator's current phase, so an
- * out-of-window claim never gains anything.
+ * pressed DROP and the time they pressed it, by their clock
+ * (`claimedAtMs`). It reaches the operator a little later (sync + drain), by
+ * which time the pusher has moved on. `lagMs` is that delay measured
+ * absolutely: the operator's clock at `receivedAtMs` less the claimed time
+ * (negative when the claim is ahead — a player clock running fast). The claim
+ * is kept, and the chip falls at exactly the phase the player saw, when:
+ *   • the claimed phase is the pusher's phase at the claimed time (so the
+ *     claim names one moment, not a phase that recurs every cycle), and
+ *   • `lagMs` is inside [−maxLeadMs, maxLagMs].
+ * Comparing phases alone would take a request one or more whole cycles old for
+ * a fresh one. Anything else (a stale request, a phase that wasn't on screen
+ * at that moment, junk) falls at the operator's current phase, so it gains
+ * nothing. Browser clocks aren't synchronised: a device whose clock is off by
+ * more than the window never has its timing kept, and is told so.
  */
 export function resolveDropTiming(
   state: CoinPusherState,
   claimedPhase: number,
+  claimedAtMs: number,
   receivedAtMs: number,
   maxLagMs: number = MAX_DROP_LAG_MS,
   maxLeadMs: number = MAX_DROP_LEAD_MS,
 ): { dropPhase: number; honored: boolean; lagMs: number } {
   const nowPhase = currentPusherPhase(state, receivedAtMs);
-  if (!isPhase(claimedPhase) || !Number.isFinite(receivedAtMs)) {
+  if (!isPhase(claimedPhase) || !Number.isFinite(claimedAtMs) || !Number.isFinite(receivedAtMs)) {
     return { dropPhase: nowPhase, honored: false, lagMs: NaN };
   }
-  // Signed distance in (−½, ½] of a cycle: the nearer of "behind" and "ahead".
-  const lagMs = (mod1(nowPhase - claimedPhase + 0.5) - 0.5) * PUSHER_PERIOD_MS;
-  if (lagMs <= Math.min(maxLagMs, PUSHER_PERIOD_MS / 2)
-    && -lagMs <= Math.min(maxLeadMs, PUSHER_PERIOD_MS / 2)) {
+  const lagMs = receivedAtMs - claimedAtMs;
+  // Signed distance in (−½, ½] of a cycle between the claim and the pusher's
+  // phase at the claimed time.
+  const mismatch = mod1(claimedPhase - currentPusherPhase(state, claimedAtMs) + 0.5) - 0.5;
+  if (Math.abs(mismatch) * PUSHER_PERIOD_MS <= DROP_PHASE_MATCH_MS
+    && lagMs <= maxLagMs && -lagMs <= maxLeadMs) {
     return { dropPhase: claimedPhase, honored: true, lagMs };
   }
   return { dropPhase: nowPhase, honored: false, lagMs };

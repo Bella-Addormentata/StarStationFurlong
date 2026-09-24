@@ -12,7 +12,8 @@
  *   • only chips off the LAST platform pay out (never off the upper front)
  *   • only the owner can empty the machine
  *   • one chip per drop, and the machine comes to rest after every drop
- *   • drop timing keeps the player's phase only inside the window
+ *   • drop timing keeps the player's phase only inside the window, measured
+ *     absolutely (a claim a whole cycle old never passes for a fresh one)
  *   • the sweep anchor never moves, so every client draws the same pusher
  *   • conservation `inserted = inMachine + paid + emptied` holds through
  *     hundreds of randomised operations
@@ -28,6 +29,7 @@ import {
   CHIP_R,
   computeConservation,
   currentPusherPhase,
+  DROP_PHASE_MATCH_MS,
   emptyMachine,
   hashInts,
   HOLE_XS,
@@ -744,46 +746,64 @@ describe('resolveDropTiming', () => {
   const s = initialCoinPusherState(OWNER, 0); // phase 0 at t=0
   const phaseAt = (ms: number) => currentPusherPhase(s, ms);
 
+  /** A claim as an honest panel makes it: the phase on screen at `at`. */
+  const claim = (at: number, receivedAt: number) =>
+    resolveDropTiming(s, phaseAt(at), at, receivedAt);
+
   it('keeps the phase the player saw when it arrives inside the lag window', () => {
-    const seen = phaseAt(10_000);
-    const r = resolveDropTiming(s, seen, 10_000 + MAX_DROP_LAG_MS - 1);
+    const r = claim(10_000, 10_000 + MAX_DROP_LAG_MS - 1);
     expect(r.honored).toBe(true);
-    expect(r.dropPhase).toBe(seen);
-    expect(r.lagMs).toBeCloseTo(MAX_DROP_LAG_MS - 1, 6);
+    expect(r.dropPhase).toBe(phaseAt(10_000));
+    expect(r.lagMs).toBe(MAX_DROP_LAG_MS - 1);
   });
 
-  it('keeps a phase slightly ahead of the operator (a player clock running fast)', () => {
-    const r = resolveDropTiming(s, phaseAt(10_000 + MAX_DROP_LEAD_MS - 1), 10_000);
+  it('keeps a claim slightly ahead of the operator (a player clock running fast)', () => {
+    const r = claim(10_000 + MAX_DROP_LEAD_MS - 1, 10_000);
     expect(r.honored).toBe(true);
-    expect(r.lagMs).toBeCloseTo(-(MAX_DROP_LEAD_MS - 1), 6);
+    expect(r.lagMs).toBe(-(MAX_DROP_LEAD_MS - 1));
   });
 
   it('drops a stale or far-ahead claim at the operator\'s current phase', () => {
     for (const claimedAt of [10_000 - MAX_DROP_LAG_MS - 50, 10_000 + MAX_DROP_LEAD_MS + 50]) {
-      const r = resolveDropTiming(s, phaseAt(claimedAt), 10_000);
+      const r = claim(claimedAt, 10_000);
       expect(r.honored).toBe(false);
       expect(r.dropPhase).toBeCloseTo(phaseAt(10_000), 12);
     }
   });
 
+  it('never takes a claim a whole cycle (or more) old for a fresh one', () => {
+    // Same phase on the pusher as 100 ms ago, but a cycle or two later.
+    for (const receivedAt of [10_000 + PUSHER_PERIOD_MS + 100, 10_000 + 2 * PUSHER_PERIOD_MS + 50]) {
+      const r = claim(10_000, receivedAt);
+      expect(r.honored).toBe(false);
+      expect(r.lagMs).toBe(receivedAt - 10_000);
+      expect(r.dropPhase).toBeCloseTo(phaseAt(receivedAt), 12);
+    }
+  });
+
+  it('keeps no phase that wasn\'t on screen at the claimed moment', () => {
+    for (const off of [0.3, -0.1, 0.5]) {
+      const phase = (phaseAt(10_000) + off + 1) % 1;
+      expect(resolveDropTiming(s, phase, 10_000, 10_100).honored).toBe(false);
+    }
+    // Rounding room only.
+    const nudged = phaseAt(10_000) + DROP_PHASE_MATCH_MS / PUSHER_PERIOD_MS / 2;
+    expect(resolveDropTiming(s, nudged, 10_000, 10_100).honored).toBe(true);
+  });
+
   it('measures the lag across the end of a cycle', () => {
     // Claimed just before the wrap (0.98), received just after it (0.02).
-    const t0 = PUSHER_PERIOD_MS * 0.98;
-    const r = resolveDropTiming(s, phaseAt(t0), PUSHER_PERIOD_MS * 1.02);
+    const r = claim(PUSHER_PERIOD_MS * 0.98, PUSHER_PERIOD_MS * 1.02);
     expect(r.honored).toBe(true);
     expect(r.lagMs).toBeCloseTo(PUSHER_PERIOD_MS * 0.04, 6);
   });
 
   it('never honours junk (out-of-range phase, NaN time)', () => {
-    expect(resolveDropTiming(s, 1, 5_000).honored).toBe(false);
-    expect(resolveDropTiming(s, -0.2, 5_000).honored).toBe(false);
-    expect(resolveDropTiming(s, Number.NaN, 5_000).honored).toBe(false);
-    expect(resolveDropTiming(s, 0.5, Number.NaN).honored).toBe(false);
-  });
-
-  it('the window is under half a cycle each way, so a claim is never ambiguous', () => {
-    expect(MAX_DROP_LAG_MS).toBeLessThan(PUSHER_PERIOD_MS / 2);
-    expect(MAX_DROP_LEAD_MS).toBeLessThan(PUSHER_PERIOD_MS / 2);
+    expect(resolveDropTiming(s, 1, 5_000, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, -0.2, 5_000, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, Number.NaN, 5_000, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, phaseAt(5_000), Number.NaN, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, phaseAt(5_000), 5_000, Number.NaN).honored).toBe(false);
   });
 });
 

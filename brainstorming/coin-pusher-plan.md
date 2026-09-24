@@ -79,15 +79,21 @@ past `1.20` falls into the tray and is paid out.
 The pusher is a free-running clock: `(pusherPhase, pusherAtMs)` anchor it when
 the machine is created and drops never move it, so every client draws the same
 pusher from its own wall clock (`currentPusherPhase`). When the player presses
-DROP, the panel records the phase on their screen in the request.
+DROP, the panel records in the request the phase on their screen and the time
+they pressed it (`requestedAt`, their clock).
 
 The operator reaches the request a little later. `resolveDropTiming` keeps the
-player's phase if it is at most `MAX_DROP_LAG_MS` (1 s) behind the operator's
-pusher, or at most `MAX_DROP_LEAD_MS` (250 ms) ahead of it (browser clocks
-are not synchronised; a fast clock shows the pusher slightly ahead). Anything
-else drops at the operator's current phase, so a claim outside the window
-gains nothing. The result says which happened (`lastDrop.honored`), and the
-panel tells the player.
+player's phase when that phase is the pusher's phase at `requestedAt` (so the
+claim names one moment, not a phase that comes round every cycle) and the
+operator's clock is at most `MAX_DROP_LAG_MS` (1 s) past `requestedAt`, or at
+most `MAX_DROP_LEAD_MS` (250 ms) before it (a player clock running a little
+fast). Comparing phases alone would take a request one or more whole cycles
+old for a fresh one. Anything else drops at the operator's current phase, so a
+claim outside the window gains nothing. The result says which happened
+(`lastDrop.honored`), and the panel tells the player. Browser clocks aren't
+synchronised: a device whose clock is off by more than the window never has
+its timing kept (it still plays, dropping where the pusher is), and the panel
+says the drop was late or the device's clock is off.
 
 The peg-field seed is drawn by the operator from `crypto.getRandomValues`
 when it settles the drop, so the player can neither choose nor predict it.
@@ -149,6 +155,9 @@ Records in the room's `casino` map:
   order), so a poll costs the same however many keys peers write. A request
   is filed by its own player: the `<pid>` at the end of its key must be its
   player, which also fixes where `<mid>` ends if either id contains a colon.
+  The same index files every key of the per-player families (`pusher-req:`,
+  `pusher-result:`, `pusher-esc:`) by name, so a removal finds a machine's
+  keys without walking the map either.
 - **Answers.** Each player's answer lives under their own
   `pusher-result:<mid>:<pid>` until their next request is answered. The
   machine's `lastDrop` only lights the cabinet: the next player's drop
@@ -179,7 +188,9 @@ Records in the room's `casino` map:
   would bring the machine back and pay its chips twice). Another
   deed-holder session keeps the teardown pending, and finishes it only if the
   operator goes away still holding the lease (after the same wait as a
-  takeover). A cabinet put back first is left alone. The recipient is the caller's own
+  takeover). A cabinet put back first is left alone, and a pending teardown
+  is dropped if the session moves to another room's doc, so it never touches
+  a cabinet there. The recipient is the caller's own
   identity, never the owner named in the peer-writable machine, so chips only
   ever leave the machine to the player whose drop pushed them or to the
   operator itself — forging the machine can't pay the forger.
@@ -201,8 +212,8 @@ cashier, chips are shown as chips, never as numbers).
 ## Data flow at a drop
 
 1. The player presses DROP ONE CHIP. The panel writes
-   `pusher-req:<mid>:<me>` = `{ requestId, player, hole, phase, requestedAt }`.
-   No chips move.
+   `pusher-req:<mid>:<me>` = `{ requestId, player, hole, phase, requestedAt }`
+   (the phase on screen, and when). No chips move.
 2. The operator's next pass (at most 100 ms later) reads the requests oldest
    first from the machine's index, refuses or resolves each one's timing,
    runs `processInsert` with its own seed, and settles it (step *A drop*

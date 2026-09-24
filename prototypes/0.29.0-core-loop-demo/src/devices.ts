@@ -4352,7 +4352,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         flash = result.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME';
         timingNote = result.honored
           ? 'YOUR TIMING WAS KEPT'
-          : 'IT ARRIVED LATE — THE CHIP DROPPED WHERE THE PUSHER WAS';
+          : 'TOO LATE, OR THIS DEVICE\'S CLOCK IS OFF — IT DROPPED WHERE THE PUSHER WAS';
         deps.onMessage?.(result.paid > 0 ? 'WINNER' : 'DROP');
       } else {
         flash = PUSHER_REFUSAL_TEXT[result.reason];
