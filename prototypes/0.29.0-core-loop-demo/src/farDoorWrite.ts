@@ -125,6 +125,9 @@ export interface FarDoorWriteDeps {
    *  minted)? Then our node's replica is the room's own copy; otherwise only
    *  a fresh frame from the live host counts (roomStateReady). */
   hostedHere: (roomId: string) => boolean;
+  /** The bound doc when `roomId` is the room this client stands in — where
+   *  a dock between two doors of ONE module keeps its far end. */
+  activeRoomDoc: (roomId: string) => Y.Doc | null;
 }
 
 let deps: FarDoorWriteDeps | null = null;
@@ -157,9 +160,13 @@ export function writeFarDock(req: FarDockRequest, near: NearEnd): Promise<FarDoc
   if (!d) return Promise.resolve({ ok: false, reason: 'unreachable' });
   const imported = d.decode(req.farAddress);
   if (!imported) return Promise.resolve({ ok: false, reason: 'no-address' });
-  // A dock between two doors of ONE module has no far room to tell.
+  // A dock between two doors of ONE module: its far end is the OTHER door of
+  // the room this client stands in. Same decision, applied to the bound doc —
+  // no session to open, and no other replica of that door to wait for.
   if (imported.roomId === near.roomId) {
-    return Promise.resolve({ ok: true, detail: 'nothing-to-undo' });
+    const doc = d.activeRoomDoc(near.roomId);
+    if (!doc) return Promise.resolve({ ok: false, reason: 'unreachable' });
+    return Promise.resolve(applyFarDockRequest(doc, req, near).result);
   }
   const key = imported.roomId;
   const prior = queues.get(key) ?? Promise.resolve();

@@ -36,6 +36,7 @@ import {
   LEGACY_ID_WALL,
   writeDoorLayout,
   defaultDoorLayoutRecords,
+  doorSetIsAuthoritative,
 } from "./doorLayoutDoc";
 import { validateDoorPlacement } from "./editMode";
 import { ROOM_TEMPLATES } from "./roomTemplates";
@@ -170,6 +171,9 @@ export interface DockingState {
 export type FarDockRequest =
   | {
       kind: "undock";
+      /** The room THIS end is in — the room the operation started in, which
+       *  an awaited far write may have outlived (absent: the active room). */
+      nearRoomId?: string;
       farAddress: string;
       /** The far door, when this side's record names it. */
       farDoor?: string;
@@ -184,6 +188,7 @@ export type FarDockRequest =
     }
   | {
       kind: "dock";
+      nearRoomId?: string;
       farAddress: string;
       farDoor: string;
       nearDoorId: string;
@@ -246,7 +251,8 @@ export class DoorDockingPortSystem {
   private farDockWriter:
     | ((req: FarDockRequest) => Promise<FarDockResult>)
     | null = null;
-  /** Per-door dock operation: in flight, and the last outcome to show. */
+  /** Per-port dock operation, keyed `${roomId}|${doorId}` (see dockOp): in
+   *  flight, and the last outcome to show. */
   private dockOps = new Map<
     string,
     { busy: boolean; note?: string; tone?: "ok" | "warn" | "bad" }
@@ -1844,7 +1850,7 @@ export class DoorDockingPortSystem {
       const doorId = activeDoor();
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.canConstruct(doorId)) return;
-      if (this.dockOps.get(doorId)?.busy) return; // a dock/undock is running
+      if (this.dockOp(doorId)?.busy) return; // a dock/undock is running
       const record = readDoor(doorId);
       if (el.dataset.dockChip === "unstage-mate") {
         if (state.pairedSuccessfully || !isDockChain(state.segments)) return;
@@ -2498,13 +2504,30 @@ export class DoorDockingPortSystem {
     }
   }
 
+  /** The room this client stands in. */
+  private roomNow(): string {
+    return (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+  }
+
+  /** This room's operation on `doorId`. Operations are keyed by room AND door:
+   *  this system outlives room swaps, and door ids repeat from room to room —
+   *  a note (or a busy flag) from `north` in one room must never show on, or
+   *  lock, `north` in the next. */
+  private dockOp(doorId: string) {
+    return this.dockOps.get(`${this.roomNow()}|${doorId}`);
+  }
+
+  /** Record an operation's state for `doorId` in `roomId` — the room the
+   *  operation STARTED in, which an await may since have left. */
   private setDockOp(
     doorId: string,
     op: { busy?: boolean; note?: string; tone?: "ok" | "warn" | "bad" },
+    roomId = this.roomNow(),
   ): void {
-    this.dockOps.set(doorId, { busy: op.busy ?? false, note: op.note, tone: op.tone });
+    this.dockOps.set(`${roomId}|${doorId}`, { busy: op.busy ?? false, note: op.note, tone: op.tone });
     const pane = document.getElementById("docking-control-pane");
     if (
+      roomId === this.roomNow() &&
       pane &&
       pane.style.display !== "none" &&
       (pane as unknown as { activeDoorId?: string }).activeDoorId === doorId
@@ -2529,11 +2552,15 @@ export class DoorDockingPortSystem {
 
   /** Every dock port of the room, in door order — the helm's list and map. */
   public listDockPorts(): DockPortView[] {
-    const layout = readAllDoorLayout();
-    const ids = [...(layout.size ? layout : defaultDoorLayoutRecords()).keys()];
-    const ordinals = doorOrdinals([
-      ...(layout.size ? layout : defaultDoorLayoutRecords()).values(),
-    ]);
+    // An AUTHORITATIVE door set is the whole truth, even when it is empty
+    // ("this room has no doors"); only an un-migrated room stands on the four
+    // defaults. (Removing a door leaves its policy behind, so resurrecting the
+    // cardinals here would list a removed port as a phantom one.)
+    const doors = doorSetIsAuthoritative()
+      ? readAllDoorLayout()
+      : defaultDoorLayoutRecords();
+    const ids = [...doors.keys()];
+    const ordinals = doorOrdinals([...doors.values()]);
     const out: DockPortView[] = [];
     for (const id of ids) {
       const record = readDoor(id);
@@ -2541,7 +2568,7 @@ export class DoorDockingPortSystem {
       const state = classifyDockPort(record);
       const partnerRoom =
         state.kind === "docked" || state.kind === "undocked" ? state.roomId : "";
-      const op = this.dockOps.get(id);
+      const op = this.dockOp(id);
       out.push({
         doorId: id,
         label: doorDisplayName(id),
@@ -2608,7 +2635,10 @@ export class DoorDockingPortSystem {
    * an unreachable far room is said, not hidden.
    */
   public async undockPort(doorId: string): Promise<boolean> {
-    if (this.dockOps.get(doorId)?.busy) return false;
+    if (this.dockOp(doorId)?.busy) return false;
+    // Every status this call reports belongs to the room it started in — the
+    // far write is awaited, and the player may walk on meanwhile.
+    const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
     if (!this.canConstruct(doorId)) {
@@ -2630,12 +2660,13 @@ export class DoorDockingPortSystem {
       });
       return true;
     }
-    this.setDockOp(doorId, { busy: true, note: `Undocked — telling ${name}…` });
+    this.setDockOp(doorId, { busy: true, note: `Undocked — telling ${name}…` }, roomId);
     const near = this.doorLateral(doorId);
     let result: FarDockResult;
     try {
       result = await this.farDockWriter({
         kind: "undock",
+        nearRoomId: roomId,
         farAddress: port.address,
         farDoor: port.record.farDoor,
         nearDoorId: doorId,
@@ -2655,6 +2686,7 @@ export class DoorDockingPortSystem {
             note: `Undocked. ${name} could not be reached — its side shows the dock until it undocks too.`,
             tone: "warn",
           },
+      roomId,
     );
     return true;
   }
@@ -2670,7 +2702,10 @@ export class DoorDockingPortSystem {
    * (settleChangedRedock).
    */
   public async redockPort(doorId: string): Promise<boolean> {
-    if (this.dockOps.get(doorId)?.busy) return false;
+    if (this.dockOp(doorId)?.busy) return false;
+    // The room this DOCK belongs to: its status is reported there, and this
+    // side is written only while the player still stands in it.
+    const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "undocked" || !readDoorPolicy(doorId).adapter) return false;
     if (!this.canConstruct(doorId)) {
@@ -2684,17 +2719,15 @@ export class DoorDockingPortSystem {
     const { farDoor, farWall, farLateral } = port.memory;
     // The same near-side gates INITIATE applies: the far door must not be
     // known to be taken, and the module must not land on another.
-    const currentRid =
-      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     const taken = this.farDoorTakenBy(port.roomId, farDoor, farWall, farLateral);
-    if (taken && !(taken.roomId === currentRid && taken.doorId === doorId)) {
+    if (taken && !(taken.roomId === roomId && taken.doorId === doorId)) {
       this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL.occupied, tone: "bad" });
       return false;
     }
-    if (currentRid) {
+    if (roomId) {
       const dims = readAtlas()[port.roomId]?.dims;
       const clash = moduleOverlapAt(
-        currentRid,
+        roomId,
         projectionPoseForDoor(
           doorId,
           dockChain(),
@@ -2717,18 +2750,21 @@ export class DoorDockingPortSystem {
     const dockedAt = stampAfter(port.memory.undockedAt);
     const near = this.doorLateral(doorId);
     // The far berth is asked over an await, and a peer may dock, re-connect or
-    // strip this port meanwhile: this side is only ever written over the very
-    // tombstone read above.
+    // strip this port meanwhile — or the player may walk into another room,
+    // whose doc is the bound one now: this side is only ever written over the
+    // very tombstone read above, in the room it was read in.
     const unchanged = () => {
+      if (this.roomNow() !== roomId) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
     let far: FarDockResult | null = null;
     if (this.farDockWriter && farDoor) {
-      this.setDockOp(doorId, { busy: true, note: `Requesting the berth at ${name}…` });
+      this.setDockOp(doorId, { busy: true, note: `Requesting the berth at ${name}…` }, roomId);
       try {
         far = await this.farDockWriter({
           kind: "dock",
+          nearRoomId: roomId,
           farAddress: port.address,
           farDoor,
           nearDoorId: doorId,
@@ -2744,11 +2780,12 @@ export class DoorDockingPortSystem {
         // A closed or vanished berth is not coming back: drop the memory so
         // this port stops offering it. An occupied one may free up.
         if (far.reason !== "occupied" && unchanged()) writeDoorTombstone(doorId, port.address);
-        this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" });
+        this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" }, roomId);
         return false;
       }
       if (!unchanged()) {
         return this.settleChangedRedock(doorId, port, far, {
+          roomId,
           farDoor,
           dockedAt,
           near,
@@ -2766,13 +2803,15 @@ export class DoorDockingPortSystem {
             note: `Docked to ${name} on this side — it could not be told now; walking through completes it.`,
             tone: "warn",
           },
+      roomId,
     );
     return true;
   }
 
   /**
    * ⚓ redockPort's far berth answered, but THIS port changed while it was
-   * asked (a peer docked, re-connected or stripped it). Docked meanwhile to
+   * asked (a peer docked, re-connected or stripped it — or the player left
+   * the room, so this side can no longer be written). Docked meanwhile to
    * this very berth — another crew member's DOCK, or the far side's own — both
    * sides hold a dock and nothing is taken back. Anything else would leave the
    * berth holding a dock this port no longer has: take back exactly the far
@@ -2784,33 +2823,42 @@ export class DoorDockingPortSystem {
     port: Extract<DockPortState, { kind: "undocked" }>,
     far: FarDockResult,
     ask: {
+      roomId: string;
       farDoor: string;
       dockedAt: number;
       near: { wall: DoorWall; lateral: number };
       name: string;
     },
   ): Promise<boolean> {
-    const now = classifyDockPort(readDoor(doorId));
+    // Only the room this DOCK started in can say what its port holds now.
+    const now =
+      this.roomNow() === ask.roomId ? classifyDockPort(readDoor(doorId)) : null;
     if (
-      now.kind === "docked" &&
+      now?.kind === "docked" &&
       now.roomId === port.roomId &&
       (!now.record.farDoor || now.record.farDoor === ask.farDoor)
     ) {
-      this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" });
+      this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" }, ask.roomId);
       return true;
     }
     if (!far.ok || far.detail !== "written" || !this.farDockWriter) {
-      this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" });
+      this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" }, ask.roomId);
       return false;
     }
-    this.setDockOp(doorId, {
-      busy: true,
-      note: `This port changed while docking — releasing the berth at ${ask.name}…`,
-    });
+    this.setDockOp(
+      doorId,
+      {
+        busy: true,
+        note: `This port changed while docking — releasing the berth at ${ask.name}…`,
+      },
+      ask.roomId,
+    );
     let undone: FarDockResult;
     try {
       undone = await this.farDockWriter({
         kind: "undock",
+        // The room the DOCK was made from — possibly not the one we stand in.
+        nearRoomId: ask.roomId,
         farAddress: port.address,
         farDoor: ask.farDoor,
         nearDoorId: doorId,
@@ -2834,6 +2882,7 @@ export class DoorDockingPortSystem {
             note: `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`,
             tone: "bad",
           },
+      ask.roomId,
     );
     return false;
   }
@@ -2851,7 +2900,7 @@ export class DoorDockingPortSystem {
     const esc = (s: string) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
     const port = classifyDockPort(record);
-    const op = this.dockOps.get(doorId);
+    const op = this.dockOp(doorId);
     const may = this.canConstruct(doorId);
     const btn = (action: "dock" | "undock", label: string, color: string) =>
       `<button type="button" data-dock-action="${action}" ${op?.busy ? "disabled" : ""} style="flex-shrink:0; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.25); color:${color}; font-size:10px; font-weight:800; padding:5px 12px; cursor:${op?.busy ? "wait" : "pointer"}; opacity:${op?.busy ? "0.5" : "1"};">${label}</button>`;

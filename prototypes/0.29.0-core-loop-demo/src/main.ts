@@ -122,6 +122,7 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readDoor,
   subscribeDoors,
 } from "./doorsDoc";
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
@@ -2424,7 +2425,8 @@ async function resolveOwnRoomAddress(roomId: string): Promise<string | null> {
  * THIS end, captured now: a transit mid-write must not re-aim it.
  */
 async function farDockWrite(req: FarDockRequest): Promise<FarDockResult> {
-  const roomId = activeBootstrap?.roomId;
+  // The request's own room: a take-back can run after the player walked on.
+  const roomId = req.nearRoomId || activeBootstrap?.roomId;
   if (!roomId) return { ok: false, reason: "no-address" };
   const address = await resolveOwnRoomAddress(roomId);
   if (!address) return { ok: false, reason: "no-address" };
@@ -2610,6 +2612,9 @@ async function transitTo(
           farLateral: fix.farLateral,
           farYawDeg: rec.farYawDeg,
           transient: rec.transient,
+          // ⚓ #163: a dock's stamp survives the rewrite — dropped, an UNDOCK
+          // from a trailing clock could read as older than the far end's dock.
+          dockedAt: rec.dockedAt,
         });
         console.log(
           `🩹 Far-door correction applied: ${fix.doorId} → ${fix.targetRoomId} now names ${fix.farDoor}${fix.farWall ? ` on ${fix.farWall}` : ""} (was ${rec.farDoor ?? "unnamed"}${rec.farWall ? ` on ${rec.farWall}` : ""}).`,
@@ -2703,7 +2708,9 @@ async function transitTo(
   // Never clobbers an existing pairing on the arrival door.
   if (depPaired && depAddress) {
     // 🔗 Mirror onto the SAME door the player actually arrived through.
-    const existing = readAllDoors().get(arrivalDoorId);
+    // ⚓ #163: read that one door itself — the capped snapshot could hide it
+    // and make a live pairing (or a tombstone) look absent.
+    const existing = readDoor(arrivalDoorId);
     // ⏏ #91: an UNDOCKED door leaves a tombstone (a present, unpaired record
     // naming the module that was cast off), and re-pairing it here would undo
     // the owner's undock on the next walk-through. Refuse the mirror only for
@@ -2858,6 +2865,9 @@ function wireAdapterTransit(): void {
     hostedHere: (roomId) =>
       roomId === getDefaultRoomId() ||
       moduleLedger().some((e) => e.roomId === roomId),
+    // A dock between two doors of the room we stand in: the bound doc.
+    activeRoomDoc: (roomId) =>
+      roomId === activeBootstrap?.roomId && yjsSync ? yjsSync.doc : null,
   });
   world.dockingSystem?.onFarDockWrite(farDockWrite);
   // #62 P4: auto-accept decider — a pairing may complete without a far-side

@@ -13,7 +13,9 @@ import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom, readDoorFrom } from './doorsDoc';
-import { applyFarDockRequest, berthAfterSettle, roomStateReady } from './farDoorWrite';
+import {
+  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, writeFarDock,
+} from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
 import type { NearEnd } from './dockRules';
 
@@ -195,6 +197,68 @@ describe('berthAfterSettle — two modules claiming one berth', () => {
     doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP)));
     doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
     expect(berthAfterSettle(doc, dockReq(near.doorId, 300), near)).toEqual({ ok: false, reason: 'closed' });
+  });
+});
+
+describe('writeFarDock — a dock between two doors of ONE module', () => {
+  const boot = { roomId: SHIP, wtUrl: '', certHashesB64: [] };
+  const nearA: NearEnd = { roomId: SHIP, address: seedFor(SHIP), doorId: 'd:a', wall: 'x-', lateral: 0 };
+
+  /** The ship: two port doors docked to each other. */
+  function shipDoc(): Y.Doc {
+    const doc = new Y.Doc();
+    doc.getMap('doorLayout').set('d:a', { id: 'd:a', wall: 'x-', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('d:b', { id: 'd:b', wall: 'x+', lateral: 0, placed: true });
+    for (const id of ['d:a', 'd:b']) {
+      doc.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner', adapter: true });
+    }
+    const dock = (farDoor: string) =>
+      buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor, transient: true, dockedAt: 100 });
+    doc.getMap('doors').set('d:a', dock('d:b'));
+    doc.getMap('doors').set('d:b', dock('d:a'));
+    return doc;
+  }
+
+  it('writes the OTHER door in the bound doc — UNDOCK and DOCK alike', async () => {
+    const ship = shipDoc();
+    initFarDoorWrite({
+      decode: () => boot,
+      resolve: async (b) => b,
+      hostedHere: () => true,
+      activeRoomDoc: (roomId) => (roomId === SHIP ? ship : null),
+    });
+    // UNDOCK at d:a (its own tombstone is the caller's): d:b lets go too.
+    ship.getMap('doors').set('d:a', buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:b', undockedAt: 101 }));
+    expect(
+      await writeFarDock(
+        { kind: 'undock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', undockedAt: 101 },
+        nearA,
+      ),
+    ).toEqual({ ok: true, detail: 'written' });
+    expect(readDoorFrom(ship, 'd:b')).toEqual(
+      buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:a', farWall: 'x-', farLateral: 0, undockedAt: 101 }),
+    );
+    // DOCK again from d:a: d:b is re-made in the same doc.
+    expect(
+      await writeFarDock(
+        { kind: 'dock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', dockedAt: 102 },
+        nearA,
+      ),
+    ).toEqual({ ok: true, detail: 'written' });
+    expect(readDoorFrom(ship, 'd:b')).toMatchObject({ paired: true, farDoor: 'd:a', dockedAt: 102 });
+  });
+
+  it('says unreachable — and writes nothing — once this client stands elsewhere', async () => {
+    const ship = shipDoc();
+    initFarDoorWrite({ decode: () => boot, resolve: async (b) => b, hostedHere: () => true, activeRoomDoc: () => null });
+    const before = Y.encodeStateVector(ship);
+    expect(
+      await writeFarDock(
+        { kind: 'undock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', undockedAt: 101 },
+        nearA,
+      ),
+    ).toEqual({ ok: false, reason: 'unreachable' });
+    expect(Y.encodeStateVector(ship)).toEqual(before);
   });
 });
 

@@ -1916,11 +1916,16 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       : `${check(true)} ${ports.length} port${ports.length === 1 ? '' : 's'} · ${
           docked.length ? `docked to ${esc(docked.map((p) => p.partnerName ?? 'module').join(', '))}` : 'undocked'
         }`;
+    // A GANGWAY holds a module as surely as a dock does — it is structure,
+    // and UNDOCK does not release it. "Free" means neither.
+    const bolted = [...new Set((docking?.connected() ?? []).filter((m) => !m.dock).map((m) => m.name))];
     const message = !ready
       ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
-      : docked.length
-        ? 'ALL SYSTEMS FITTED — this module is spaceworthy. UNDOCK below and it is free to fly away; flight itself (destinations, travel) arrives with the flight update.'
-        : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Flight itself arrives with the flight update; DOCK brings it back to a berth.';
+      : bolted.length
+        ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
+        : docked.length
+          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. UNDOCK below and it is free to fly away; flight itself (destinations, travel) arrives with the flight update.'
+          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Flight itself arrives with the flight update; DOCK brings it back to a berth.';
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — SHIP STATUS</span>
