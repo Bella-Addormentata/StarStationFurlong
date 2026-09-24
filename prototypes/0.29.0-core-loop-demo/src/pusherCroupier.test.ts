@@ -191,13 +191,15 @@ describe('operateCoinPusher', () => {
       const chipIds = Array.from({ length: 8 }, () => n.id++);
       return { x, count: 8, chipIds };
     };
+    // 8 piles of 8 on each platform, spaced one pile apart: 128 chips.
     const full: CoinPusherState = {
       ...initialCoinPusherState(OPERATOR, 0),
-      upper: Array.from({ length: 16 }, (_, i) => pile(i * 0.06)),
+      upper: Array.from({ length: 8 }, (_, i) => pile(0.03 + i * 0.06)),
+      lower: Array.from({ length: 8 }, (_, i) => pile(0.63 + i * 0.06)),
       totalInserted: MACHINE_MAX_CHIPS,
     };
     full.nextChipId = n.id;
-    writeCoinPusherState(MACHINE, full);
+    expect(writeCoinPusherState(MACHINE, full)).toBe(true);
     buyInChips(PLAYER, 3);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', 0.5));
     operateCoinPusher(MACHINE, OPERATOR, NOW);
@@ -285,6 +287,25 @@ describe('tickCoinPusherMachine', () => {
     expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
     tickCoinPusherMachine(MACHINE, NOW + 7_000 + OPERATOR_UNCLEAN_TAKEOVER_MS);
     expect(readCoinPusherState(MACHINE)?.ownerId).toBe(OPERATOR);
+  });
+
+  it('honors a lease record for one lease term at most, however far ahead it claims to run', () => {
+    // A peer-written lease with a far-future expiry, from someone else…
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OTHER, sessionId: 'rogue:tab', expiresAt: Number.MAX_VALUE });
+    tickCoinPusherMachine(MACHINE, NOW);
+    tickCoinPusherMachine(MACHINE, NOW + 7_999);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe('rogue:tab');
+    tickCoinPusherMachine(MACHINE, NOW + 8_000);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
+  });
+
+  it('a far-future lease claiming another of our devices holds one term plus the split window', () => {
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: 'rogue:tab2', expiresAt: Number.MAX_VALUE });
+    tickCoinPusherMachine(MACHINE, NOW);
+    tickCoinPusherMachine(MACHINE, NOW + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS - 1);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe('rogue:tab2');
+    tickCoinPusherMachine(MACHINE, NOW + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
   });
 
   it('a lapsed lease of someone else (a previous deed holder) is taken as soon as it lapses', () => {

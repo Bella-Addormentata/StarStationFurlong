@@ -1141,15 +1141,19 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
   const ownerBalance = safeCount(map, ownerKey);
   const credit = inside > 0 && recipientId.length > 0 && recipientId.length <= 128
     && Number.isSafeInteger(ownerBalance + inside) ? inside : 0;
-  const requestPrefix = `pusher-req:${machineId}:`;
-  const resultPrefix = `pusher-result:${machineId}:`;
+  // `pusher-esc:` held escrows in an earlier revision; any left in a room's
+  // doc are removed with the machine and, like every record here, credit
+  // nothing.
+  const prefixes = [
+    `pusher-req:${machineId}:`, `pusher-result:${machineId}:`, `pusher-esc:${machineId}:`,
+  ];
   boundDoc!.transact(() => {
     if (credit > 0) map.set(ownerKey, ownerBalance + credit);
     map.delete(`pusher:${machineId}`);
     map.delete(`pusher-empty:${machineId}`);
     map.delete(`pusher-operator:${machineId}`);
     for (const key of [...map.keys()]) {
-      if (key.startsWith(requestPrefix) || key.startsWith(resultPrefix)) map.delete(key);
+      if (prefixes.some((prefix) => key.startsWith(prefix))) map.delete(key);
     }
   });
   return credit;

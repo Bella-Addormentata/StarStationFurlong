@@ -108,7 +108,10 @@ Records in the room's `casino` map:
   rule every casino operator follows since #141/#142), and only one of their
   browser sessions: the lease is written, the session waits 2 s for the doc to
   converge, renews every 3 s, and lapses after 8 s. World ticks the election
-  every frame, so there is no start/stop control.
+  every frame, so there is no start/stop control. The lease record is
+  peer-writable, so a session honors any one record for at most one lease
+  term (8 s) after it first sees it: a record claiming a far-future expiry
+  can't hold a machine forever.
 - **Splits.** A Y.Map lease is not a mutex. Two operator sessions cut off from
   each other could each settle a drop from the same machine; when the docs
   merge only one machine value survives while both players' balance writes
@@ -131,18 +134,19 @@ Records in the room's `casino` map:
   chip, or the machine is full. Otherwise `processInsert` runs, and
   `settleCoinPusherInsert` debits the one chip, credits exactly what the drop
   paid, publishes the machine, answers the player and clears the request in
-  **one transaction**. Each poll works through at most 4 requests (oldest
-  first), so a flood of requests can't stall the operator's frame.
+  **one transaction**. Before writing, it re-reads the stored machine and
+  refuses if it is not the state the drop was computed from, if the request
+  is gone or replaced, or if the transition is not a one-chip drop whose
+  payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read off
+  that transition; it is never a separate argument. Each poll works through
+  at most 4 requests (oldest first), so a flood of requests can't stall the
+  operator's frame.
 - **Answers.** Each player's answer lives under their own
   `pusher-result:<mid>:<pid>` until their next request is answered. The
   machine's `lastDrop` only lights the cabinet: the next player's drop
   overwrites it, so a panel that missed updates would misread it. A panel that
   withdraws an unanswered request keeps watching for an answer that raced the
-  withdrawal. Before writing, it re-reads the stored
-  machine and refuses if it is not the state the drop was computed from, if
-  the request is gone or replaced, or if the transition is not a one-chip drop
-  whose payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read
-  off that transition; it is never a separate argument.
+  withdrawal.
 - **Nothing to claim, nothing to refund.** There is no escrow and no pending
   credit. A cancelled, abandoned or withdrawn request costs nothing (the panel
   withdraws its own after 15 s without an answer, and when the player walks
@@ -154,15 +158,16 @@ Records in the room's `casino` map:
   drop. The operator must itself be the machine's owner and the one who
   asked.
 - **Removal.** When the cabinet is removed, the deed holder's client pays the
-  chips still inside to the deed holder and deletes every key, in one
-  transaction (`drainAndClearCoinPusher`). The recipient is the caller's own
+  chips still inside to the deed holder and deletes every key (including any
+  `pusher-esc:` records an earlier revision left, which credit nothing), in
+  one transaction (`drainAndClearCoinPusher`). The recipient is the caller's own
   identity, never the owner named in the peer-writable machine, so chips only
   ever leave the machine to the player whose drop pushed them or to the
   operator itself — forging the machine can't pay the forger.
 - **Trust.** The same dev-phase honest-client model as the rest of the
   casino map: the operator is trusted to run the physics honestly, and every
   read shape-guards so junk in these keys reads as "no machine" (including a
-  machine whose own ledger doesn't balance).
+  machine whose own ledger doesn't balance, or with a pile off its platform).
 
 ## Conservation invariant
 

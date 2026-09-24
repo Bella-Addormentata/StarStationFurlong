@@ -315,10 +315,13 @@ function isBoundedId(v: unknown): v is string {
 const PILE_MAX_CHIPS = 2 * MAX_STACK_HEIGHT;
 const PLATFORM_MAX_PILES = 24;
 
-function isPile(v: unknown): v is Pile {
+/** A pile on a platform spanning [lo, hi] — a settled machine never holds a
+ *  pile anywhere else (anything pushed past a front edge has fallen), and the
+ *  renderer maps x linearly, so an unbounded x would reach it as Infinity. */
+function isPile(v: unknown, lo: number, hi: number): v is Pile {
   if (typeof v !== 'object' || v === null) return false;
   const p = v as Partial<Pile>;
-  if (typeof p.x !== 'number' || !Number.isFinite(p.x)) return false;
+  if (typeof p.x !== 'number' || !Number.isFinite(p.x) || p.x < lo || p.x > hi) return false;
   if (!isCountInt(p.count) || (p.count as number) > PILE_MAX_CHIPS) return false;
   if (!Array.isArray(p.chipIds)) return false;
   if ((p.chipIds as unknown[]).length !== p.count) return false;
@@ -328,8 +331,9 @@ function isPile(v: unknown): v is Pile {
   return true;
 }
 
-function isPileArray(v: unknown): v is Pile[] {
-  return Array.isArray(v) && v.length <= PLATFORM_MAX_PILES && v.every(isPile);
+function isPileArray(v: unknown, lo: number, hi: number): v is Pile[] {
+  return Array.isArray(v) && v.length <= PLATFORM_MAX_PILES
+    && v.every((p) => isPile(p, lo, hi));
 }
 
 function isHole(v: unknown): v is PusherHole {
@@ -374,8 +378,8 @@ export function isCoinPusherState(v: unknown): v is CoinPusherState {
   const s = v as Partial<CoinPusherState>;
   if (!(s.kind === 'coin-pusher'
     && isBoundedId(s.ownerId)
-    && isPileArray(s.upper)
-    && isPileArray(s.lower)
+    && isPileArray(s.upper, PLAT_UP_BACK, PLAT_UP_FRONT)
+    && isPileArray(s.lower, PLAT_LOW_BACK, PLAT_LOW_FRONT)
     && isCountInt(s.nextChipId)
     && isPhase(s.pusherPhase)
     && typeof s.pusherAtMs === 'number' && Number.isFinite(s.pusherAtMs)

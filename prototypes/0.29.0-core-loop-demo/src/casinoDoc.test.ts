@@ -373,6 +373,8 @@ describe('drainAndClearCoinPusher', () => {
     drainAndClearCoinPusher(MACHINE, OWNER);
     expect(readChips(PLAYER)).toBe(4);
     expect(readChips(ATTACKER)).toBe(0);
+    // The escrow-shaped records an earlier revision used go with the machine.
+    expect([...map.keys()].filter((k) => k.startsWith(`pusher-esc:${MACHINE}:`))).toEqual([]);
   });
 
   it('never pays the owner a peer-written machine names', () => {

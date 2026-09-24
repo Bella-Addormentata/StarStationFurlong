@@ -118,12 +118,34 @@ export function coinPusherOperatorSession(): string {
   return operatorSessionId;
 }
 
-/** Earliest time this session may take `lease` over. */
-function takeoverAt(lease: { playerId: string; sessionId: string; expiresAt: number }, playerId: string): number {
+/** When this page first saw each machine's current lease record. */
+const leaseFirstSeen = new Map<string, { id: string; at: number }>();
+
+/**
+ * Earliest time this session may take `lease` over. The record is
+ * peer-writable, so its `expiresAt` is honored for at most OPERATOR_LEASE_MS
+ * after this page first saw that exact record — what a live operator's lease
+ * is worth anyway, since it rewrites it every OPERATOR_LEASE_RENEW_MS. A
+ * record written with a far-future expiry can therefore hold a machine for
+ * one lease term, not forever.
+ */
+function takeoverAt(
+  machineId: string,
+  lease: { playerId: string; sessionId: string; expiresAt: number },
+  playerId: string,
+  now: number,
+): number {
+  const id = `${lease.playerId}|${lease.sessionId}|${lease.expiresAt}`;
+  let seen = leaseFirstSeen.get(machineId);
+  if (seen?.id !== id) {
+    seen = { id, at: now };
+    leaseFirstSeen.set(machineId, seen);
+  }
+  const expiresAt = Math.min(lease.expiresAt, seen.at + OPERATOR_LEASE_MS);
   const sameDevice = lease.sessionId.startsWith(`${deviceId}:`);
   return lease.playerId === playerId && !sameDevice
-    ? lease.expiresAt + OPERATOR_UNCLEAN_TAKEOVER_MS
-    : lease.expiresAt;
+    ? expiresAt + OPERATOR_UNCLEAN_TAKEOVER_MS
+    : expiresAt;
 }
 
 /** A fresh 32-bit peg-field seed from the platform CSPRNG. The operator
@@ -168,7 +190,8 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
   if (!operator
     || operator.docEpoch !== casinoDocEpoch()
     || operator.playerId !== playerId) {
-    if (lease && lease.sessionId !== operatorSessionId && now < takeoverAt(lease, playerId)) return;
+    if (lease && lease.sessionId !== operatorSessionId
+      && now < takeoverAt(machineId, lease, playerId, now)) return;
     writeCoinPusherOperatorLease(machineId, {
       playerId,
       sessionId: operatorSessionId,
@@ -303,6 +326,7 @@ function settleOneInsert(
 export function closeCoinPusher(machineId: string, canManage = canRunCroupier()): void {
   operators.delete(machineId);
   lastPolls.delete(machineId);
+  leaseFirstSeen.delete(machineId);
   if (readCoinPusherOperatorLease(machineId)?.sessionId === operatorSessionId) {
     clearCoinPusherOperatorLease(machineId);
   }

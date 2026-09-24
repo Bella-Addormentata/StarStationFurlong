@@ -45,6 +45,7 @@ import {
   PEG_ROWS,
   PILE_STEP,
   PLAT_LOW_BACK,
+  PLAT_LOW_FRONT,
   PLAT_UP_FRONT,
   processInsert,
   PUSHER_ANTE,
@@ -102,6 +103,23 @@ function assertConserved(state: CoinPusherState, label = 'invariant') {
   const c = computeConservation(state);
   expect(c.balanced, `${label}: ${JSON.stringify(c)}`).toBe(true);
   expect(c.chipsInMachine).toBeGreaterThanOrEqual(0);
+}
+
+/** `perPlatform` piles of 8 chips on each platform, spaced one pile apart
+ *  from each platform's back edge, with a balanced ledger. */
+function fullMachine(perPlatform: number): CoinPusherState {
+  const next = { id: 1 };
+  const row = (from: number): Pile[] =>
+    Array.from({ length: perPlatform }, (_, i) => pileN(from + CHIP_R + i * PILE_STEP, 8, next));
+  const upper = row(0);
+  const lower = row(PLAT_LOW_BACK);
+  return {
+    ...initialCoinPusherState(OWNER),
+    upper,
+    lower,
+    nextChipId: next.id,
+    totalInserted: 16 * perPlatform,
+  };
 }
 
 /** A tiny deterministic PRNG for randomised runs (no Math.random). */
@@ -179,21 +197,28 @@ describe('shape guards', () => {
   });
 
   it('rejects a state holding more chips than the cabinet can (aggregate cap)', () => {
-    // Every pile and platform is within its own limit, but the total is not:
-    // 2 platforms × 24 piles × 8 chips = 384 > MACHINE_MAX_CHIPS.
-    const next = { id: 1 };
-    const platform = (): Pile[] => Array.from({ length: 24 }, (_, i) => pileN(i * 0.05, 8, next));
-    const bad: CoinPusherState = { ...initialCoinPusherState(OWNER), upper: platform(), lower: platform() };
-    expect(isCoinPusherState(bad)).toBe(false);
-    // …while a state at exactly the cap is accepted.
-    const n2 = { id: 1 };
-    const atCap: CoinPusherState = {
-      ...initialCoinPusherState(OWNER),
-      upper: Array.from({ length: 16 }, (_, i) => pileN(i * 0.06, 8, n2)),
-      totalInserted: MACHINE_MAX_CHIPS,
-    };
+    // Every pile sits on its platform and within its own limit, and the
+    // ledger balances, but the total does not fit: 20 piles × 8 = 160.
+    const over = fullMachine(10);
+    expect(chipsInMachine(over)).toBe(160);
+    expect(isCoinPusherState(over)).toBe(false);
+    // …while a machine at exactly the cap is accepted.
+    const atCap = fullMachine(8);
     expect(chipsInMachine(atCap)).toBe(MACHINE_MAX_CHIPS);
     expect(isCoinPusherState(atCap)).toBe(true);
+  });
+
+  it('rejects a pile off its own platform (the renderer maps x linearly)', () => {
+    const s = fill(30);
+    const off = (upper: Pile[], lower: Pile[]) => ({ ...s, upper, lower });
+    const pile = (x: number): Pile => ({ ...s.upper.concat(s.lower)[0], x });
+    expect(isCoinPusherState(s)).toBe(true);
+    for (const x of [PLAT_UP_FRONT + 0.01, -0.01, Number.MAX_VALUE, -Number.MAX_VALUE]) {
+      expect(isCoinPusherState(off([pile(x)], s.lower)), `upper at ${x}`).toBe(false);
+    }
+    for (const x of [PLAT_LOW_BACK - 0.01, PLAT_LOW_FRONT + 0.01, Number.MAX_VALUE]) {
+      expect(isCoinPusherState(off(s.upper, [pile(x)])), `lower at ${x}`).toBe(false);
+    }
   });
 
   it('rejects a state whose own ledger does not balance (an operator never writes one)', () => {
@@ -790,13 +815,8 @@ describe('processInsert', () => {
   });
 
   it('refuses a drop into a full machine', () => {
-    const n = { id: 1 };
-    const full: CoinPusherState = {
-      ...initialCoinPusherState(OWNER),
-      upper: Array.from({ length: 16 }, (_, i) => pileN(i * 0.06, 8, n)),
-      nextChipId: n.id,
-      totalInserted: MACHINE_MAX_CHIPS,
-    };
+    const full = fullMachine(8);
+    expect(chipsInMachine(full)).toBe(MACHINE_MAX_CHIPS);
     expect(() => processInsert(full, PLAYER1, 1, 0.5, 42)).toThrow(/full/);
   });
 

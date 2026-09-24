@@ -139,7 +139,7 @@ import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
-import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
+import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -4373,7 +4373,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     }
   };
 
-  const paintTray = (id: string, chips: number[], emptyText?: string): void => {
+  const paintTray = (id: string, chips: number[], label: string, emptyText?: string): void => {
     const cv = panel?.querySelector<HTMLCanvasElement>(`#${id}`);
     const c2 = cv?.getContext('2d');
     if (!cv || !c2) return;
@@ -4382,6 +4382,10 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     c2.setTransform(2, 0, 0, 2, 0, 0);
     c2.clearRect(0, 0, w, h);
     drawChips(c2, chips, 0, 0, w, h, { emptyText });
+    // The same chips for a screen reader, counted per denomination like the
+    // drawing — never as a total (the physical-chip rule).
+    const groups = groupChips(chips).map((g) => `${g.count} of ${g.denom}`);
+    cv.setAttribute('aria-label', `${label}: ${groups.length ? groups.join(', ') : (emptyText || 'none')}`);
   };
 
   const drawGauge = (): void => {
@@ -4425,8 +4429,9 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
           : full ? 'MACHINE FULL'
             : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
-    paintTray('cp-rack', chipsFor(chips), 'NO CHIPS — VISIT THE CASHIER');
-    paintTray('cp-won', chipsFor(lastPaid ?? 0), lastPaid === 0 ? 'NOTHING FELL' : '');
+    paintTray('cp-rack', chipsFor(chips), 'Your chips', 'NO CHIPS — VISIT THE CASHIER');
+    paintTray('cp-won', chipsFor(lastPaid ?? 0), 'Your last drop paid',
+      lastPaid === 0 ? 'NOTHING FELL' : '');
     const meter = panel.querySelector<HTMLElement>('#cp-meter')!;
     const balanced = state ? computeConservation(state).balanced : true;
     meter.textContent = balanced
@@ -4438,7 +4443,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     owner.style.display = isOwner ? 'flex' : 'none';
     if (isOwner && state) {
       // Chips, never a total, outside the cashier (the physical-chip rule).
-      paintTray('cp-inside', chipsFor(chipsInMachine(state)), 'THE MACHINE IS EMPTY');
+      paintTray('cp-inside', chipsFor(chipsInMachine(state)), 'In the machine', 'THE MACHINE IS EMPTY');
       const emptyBtn = panel.querySelector<HTMLButtonElement>('#cp-empty')!;
       emptyBtn.disabled = !online || door !== null;
     }
@@ -4477,8 +4482,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       `;
       panel.innerHTML = `
         <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🪙 COIN PUSHER</div>
-        <div id="cp-status" style="min-height:14px;text-align:center;font-size:9px;color:${GT_GOLD_BRIGHT};font-weight:800;"></div>
-        <div id="cp-timing-note" style="min-height:11px;text-align:center;font-size:8px;color:#E8ECF2;"></div>
+        <div id="cp-status" role="status" aria-live="polite" style="min-height:14px;text-align:center;font-size:9px;color:${GT_GOLD_BRIGHT};font-weight:800;"></div>
+        <div id="cp-timing-note" aria-live="polite" style="min-height:11px;text-align:center;font-size:8px;color:#E8ECF2;"></div>
         <div style="display:flex;flex-direction:column;gap:3px;">
           <div style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">THE PUSHER — DROP AS IT SWEEPS PAST YOUR HOLE</div>
           <div style="position:relative;height:24px;background:#0A0E1F;border:1px solid #3A424C;border-radius:4px;overflow:hidden;">
@@ -4497,18 +4502,18 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         <div style="display:flex;gap:10px;justify-content:space-between;">
           <div style="display:flex;flex-direction:column;gap:2px;">
             <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">YOUR CHIPS</span>
-            <canvas id="cp-rack" width="380" height="112" style="width:190px;height:56px;"></canvas>
+            <canvas id="cp-rack" role="img" width="380" height="112" style="width:190px;height:56px;"></canvas>
           </div>
           <div style="display:flex;flex-direction:column;gap:2px;">
             <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">YOUR LAST DROP PAID</span>
-            <canvas id="cp-won" width="380" height="112" style="width:190px;height:56px;"></canvas>
+            <canvas id="cp-won" role="img" width="380" height="112" style="width:190px;height:56px;"></canvas>
           </div>
         </div>
         <div id="cp-meter" style="font-size:8px;text-align:center;"></div>
         <div id="cp-owner" style="display:none;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid rgba(212,168,75,.20);">
           <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
           <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">IN THE MACHINE · OPENING THE DOOR PUTS THEM ON YOUR RACK</span>
-          <canvas id="cp-inside" width="760" height="112" style="width:380px;height:56px;"></canvas>
+          <canvas id="cp-inside" role="img" width="760" height="112" style="width:380px;height:56px;"></canvas>
           <button id="cp-empty" style="padding:8px;background:rgba(230,80,60,0.10);border:1px solid #A03020;color:#FF9070;font:800 10px inherit;cursor:pointer;">OPEN THE DOOR &amp; EMPTY THE MACHINE</button>
         </div>
         <div style="font-size:8px;color:${GT_DIM};text-align:center;line-height:1.6;">← / → PICK A HOLE · SPACE DROPS ONE CHIP · CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS · THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE</div>
