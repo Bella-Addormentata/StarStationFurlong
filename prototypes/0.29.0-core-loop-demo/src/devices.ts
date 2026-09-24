@@ -86,7 +86,7 @@ import {
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
   cancelCoinPusherRequest, readCoinPusherResult,
-  readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest,
+  readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
   readCoinPusherOperatorLease,
   subscribeCasinoKey,
 } from './casinoDoc';
@@ -4209,7 +4209,8 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
 // The player's panel. The machine is run by its operator (pusherCroupier.ts);
 // this panel writes only the player's own drop request (hole + the pusher
 // phase on screen when they pressed DROP) and the owner's door request, and
-// reads every result back off the machine record. No chips move here.
+// reads the operator's answers back (the player's own result record, the
+// door's answer). No chips move here.
 
 export interface CoinPusherUIDeps {
   /** Furniture item id — keys the machine's records in the casino map. */
@@ -4252,8 +4253,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let expiryTimer = 0;
   /** My latest settled drop's payout (drawn in the tray). */
   let lastPaid: number | null = null;
-  /** My door request in flight, with the emptied total it started from. */
-  let door: { requestId: string; emptiedBefore: number } | null = null;
+  /** My door request in flight (its requestId). */
+  let door: string | null = null;
   /** The machine as last read — the per-frame gauge draws from this. */
   let cached: CoinPusherState | null = null;
   const myId = getPlayerId();
@@ -4331,7 +4332,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       const requestedAt = Date.now();
       const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
       if (writeCoinPusherEmptyRequest(deps.itemId, { requestId, requester: myId, requestedAt })) {
-        door = { requestId, emptiedBefore: state.totalEmptied };
+        door = requestId;
         flash = 'OPENING THE DOOR…';
       }
     }
@@ -4339,8 +4340,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   };
 
   /** Read my answers back: my own result record (durable — another player's
-   *  drop can't overwrite it), a withdrawn request, or a finished door. */
-  const readResults = (state: CoinPusherState | null): void => {
+   *  drop can't overwrite it), a withdrawn request, or the door's answer. */
+  const readResults = (): void => {
     const result = watching ? readCoinPusherResult(deps.itemId, myId) : null;
     if (watching && result?.requestId === watching) {
       stopExpiry();
@@ -4364,12 +4365,19 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       pending = null;
       flash = 'YOUR DROP WAS WITHDRAWN';
     }
-    if (door && readCoinPusherEmptyRequest(deps.itemId)?.requestId !== door.requestId) {
-      const emptied = (state?.totalEmptied ?? door.emptiedBefore) - door.emptiedBefore;
-      flash = emptied > 0
-        ? 'DOOR OPENED — THE CHIPS ARE ON YOUR RACK'
-        : 'THE DOOR OPENED ON AN EMPTY MACHINE';
-      door = null;
+    if (door) {
+      // The operator answers in the transaction that clears the request, so
+      // a request gone without this answer tells us nothing about the door.
+      const answer = readCoinPusherDoorResult(deps.itemId);
+      if (answer?.requestId === door) {
+        flash = answer.kind === 'refused' ? 'THE DOOR STAYED SHUT — ONLY THE OWNER HAS THE KEY'
+          : answer.emptied > 0 ? 'DOOR OPENED — THE CHIPS ARE ON YOUR RACK'
+            : 'THE DOOR OPENED ON AN EMPTY MACHINE';
+        door = null;
+      } else if (readCoinPusherEmptyRequest(deps.itemId)?.requestId !== door) {
+        flash = 'NO ANSWER FROM THE DOOR — TRY AGAIN';
+        door = null;
+      }
     }
   };
 
@@ -4404,7 +4412,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     if (!panel) return;
     const state = readCoinPusherState(deps.itemId);
     cached = state;
-    readResults(state);
+    readResults();
     const online = state !== null && coinPusherOperatorOnline(deps.itemId);
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
     status.textContent = flash || (online
@@ -4414,6 +4422,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     for (let i = 0; i < HOLE_COUNT; i++) {
       const btn = panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`);
       if (!btn) continue;
+      btn.setAttribute('aria-pressed', String(i === selectedHole));
       btn.style.borderColor = i === selectedHole ? '#D4A84B' : '#3A424C';
       btn.style.background = i === selectedHole
         ? 'rgba(212,168,75,0.18)' : 'rgba(212,168,75,0.05)';
@@ -4533,6 +4542,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         `pusher-req:${deps.itemId}:${myId}`,
         `pusher-result:${deps.itemId}:${myId}`,
         `pusher-empty:${deps.itemId}`,
+        `pusher-door:${deps.itemId}`,
         `pusher-operator:${deps.itemId}`,
         `bal:${myId}`,
       ]) {

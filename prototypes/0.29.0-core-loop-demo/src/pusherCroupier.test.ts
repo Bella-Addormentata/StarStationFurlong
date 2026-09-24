@@ -10,6 +10,7 @@ import {
   bindCasinoDoc,
   buyInChips,
   readChips,
+  readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
   readCoinPusherRequest,
@@ -224,20 +225,37 @@ describe('operateCoinPusher', () => {
     expect(readCoinPusherRequests(MACHINE)).toHaveLength(0);
   });
 
-  it('opens the door for the owner and ignores a door request from anyone else', () => {
+  it('opens the door for the owner and turns anyone else down — answering each', () => {
     const base = machineWith(40);
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd1', requester: ATTACKER, requestedAt: NOW });
     operateCoinPusher(MACHINE, OPERATOR, NOW);
     expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+    expect(readCoinPusherDoorResult(MACHINE)).toEqual({ kind: 'refused', requestId: 'd1', atMs: NOW });
     expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(chipsInMachine(base));
     expect(readChips(ATTACKER)).toBe(0);
 
     writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd2', requester: OPERATOR, requestedAt: NOW });
-    operateCoinPusher(MACHINE, OPERATOR, NOW);
+    operateCoinPusher(MACHINE, OPERATOR, NOW + 1);
     expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+    expect(readCoinPusherDoorResult(MACHINE)).toEqual({
+      kind: 'opened', requestId: 'd2', emptied: chipsInMachine(base), atMs: NOW + 1,
+    });
     expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(0);
     expect(readChips(OPERATOR)).toBe(chipsInMachine(base));
+  });
+
+  it('a door request left by a previous owner is answered as refused, not as an empty machine', () => {
+    // The deed changed hands while the old owner's door request was pending:
+    // the new operator re-owns the machine, then turns the request down.
+    const base = machineWith(40, OTHER);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd-old', requester: OTHER, requestedAt: NOW });
+    operateCoinPusher(MACHINE, OPERATOR, NOW); // re-owns
+    operateCoinPusher(MACHINE, OPERATOR, NOW + 100);
+    expect(readCoinPusherDoorResult(MACHINE)).toEqual({ kind: 'refused', requestId: 'd-old', atMs: NOW + 100 });
+    expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(chipsInMachine(base));
+    expect(readChips(OTHER)).toBe(0);
   });
 });
 

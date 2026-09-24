@@ -50,12 +50,13 @@ import type {
   SlotFundingConfig,
 } from './games/slots';
 import {
-  chipsInMachine, computeConservation, isCoinPusherState, isPusherEmptyRequest,
-  isPusherInsertRequest, isPusherResult, normalizeCoinPusherState, PUSHER_ANTE,
+  chipsInMachine, computeConservation, isCoinPusherState, isPusherDoorResult,
+  isPusherEmptyRequest, isPusherInsertRequest, isPusherResult, normalizeCoinPusherState,
+  PUSHER_ANTE,
 } from './games/coinPusher';
 import type {
-  CoinPusherState, PusherEmptyRequest, PusherInsertRequest, PusherRefusalReason,
-  PusherResult,
+  CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
+  PusherRefusalReason, PusherResult,
 } from './games/coinPusher';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
@@ -826,6 +827,7 @@ export function clearSlotMachineKeys(machineId: string): void {
 //                             player's latest request — durable, unlike the
 //                             machine-wide lastDrop the next drop overwrites)
 //   pusher-empty:<mid>      → PusherEmptyRequest (the owner's door request)
+//   pusher-door:<mid>       → PusherDoorResult  (the operator's answer to it)
 //   pusher-operator:<mid>   → operator lease     (one browser session operates)
 //
 // MONEY: a request is a wish, not a payment. The operator debits the player's
@@ -866,33 +868,78 @@ export function writeCoinPusherState(machineId: string, state: CoinPusherState):
   return true;
 }
 
-/** The `limit` oldest insert requests for this machine, oldest first (the
+/** How many of a machine's requests one read looks at. A player files one
+ *  request per machine, so honest play stays far below it and is read exactly
+ *  oldest first; a flood is worked through this many at a time, in arrival
+ *  order, so none is starved. */
+export const PUSHER_REQUEST_SCAN = 64;
+
+// The operator polls a machine's requests ten times a second, so it reads them
+// through an index rather than walking the casino map, which any peer can
+// grow. Per bound map: machineId → the keys holding its well-formed requests,
+// in arrival order. A machine's entry is built by one walk the first time it
+// is read; from then on an observer keeps it current by looking only at the
+// keys each transaction changed, local or remote.
+const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, Map<string, Set<string>>>();
+
+/** A request filed under its own player's key (the cross-key guard). */
+function isFiledRequest(map: Y.Map<unknown>, key: string, prefix: string): boolean {
+  const value = map.get(key);
+  return isPusherInsertRequest(value) && value.player === key.slice(prefix.length);
+}
+
+function pusherRequestKeys(machineId: string): Set<string> {
+  const map = ensureMap();
+  let machines = pusherRequestIndexes.get(map);
+  if (!machines) {
+    const index = new Map<string, Set<string>>();
+    machines = index;
+    pusherRequestIndexes.set(map, index);
+    map.observe((event) => {
+      for (const key of event.keysChanged) {
+        if (!key.startsWith('pusher-req:')) continue;
+        for (const [id, keys] of index) {
+          const prefix = `pusher-req:${id}:`;
+          if (!key.startsWith(prefix)) continue;
+          if (isFiledRequest(map, key, prefix)) keys.add(key);
+          else keys.delete(key);
+        }
+      }
+    });
+  }
+  let keys = machines.get(machineId);
+  if (!keys) {
+    const prefix = `pusher-req:${machineId}:`;
+    keys = new Set();
+    for (const key of map.keys()) {
+      if (key.startsWith(prefix) && isFiledRequest(map, key, prefix)) keys.add(key);
+    }
+    machines.set(machineId, keys);
+  }
+  return keys;
+}
+
+/** Up to `limit` of this machine's insert requests, oldest first (the
  *  requestId leads with the base-36 request time — the slot-request
- *  precedent). Shape- and cross-key-guarded: a request whose `player`
- *  disagrees with the `<pid>` in its key is ignored. A finite `limit` keeps
- *  the work to one pass with a `limit`-long buffer however many requests
- *  peers have written (the operator reads a bounded batch per poll). */
+ *  precedent), from the first PUSHER_REQUEST_SCAN in arrival order. It reads
+ *  the machine's index, never the whole map, so its cost grows neither with
+ *  what peers write elsewhere nor with a flood of requests. Shape- and
+ *  cross-key-guarded: a request whose `player` disagrees with the `<pid>` in
+ *  its key is ignored. */
 export function readCoinPusherRequests(
   machineId: string,
-  limit = Number.POSITIVE_INFINITY,
+  limit = PUSHER_REQUEST_SCAN,
 ): PusherInsertRequest[] {
-  const prefix = `pusher-req:${machineId}:`;
+  const map = ensureMap();
   const out: PusherInsertRequest[] = [];
-  const bounded = Number.isFinite(limit);
-  for (const [key, value] of ensureMap().entries()) {
-    if (!key.startsWith(prefix) || !isPusherInsertRequest(value)) continue;
-    if (value.player !== key.slice(prefix.length)) continue;
-    if (!bounded) {
-      out.push(value);
-      continue;
-    }
-    let at = out.length;
-    while (at > 0 && out[at - 1].requestId.localeCompare(value.requestId) > 0) at -= 1;
-    if (at >= limit) continue;
-    out.splice(at, 0, value);
-    if (out.length > limit) out.pop();
+  let looked = 0;
+  for (const key of pusherRequestKeys(machineId)) {
+    if (looked++ === PUSHER_REQUEST_SCAN) break;
+    const value = map.get(key);
+    if (isPusherInsertRequest(value)) out.push(value);
   }
-  return bounded ? out : out.sort((a, b) => a.requestId.localeCompare(b.requestId));
+  out.sort((a, b) => a.requestId.localeCompare(b.requestId));
+  return out.slice(0, Math.max(0, limit));
 }
 
 /** One player's pending request on this machine (null when none). */
@@ -955,10 +1002,30 @@ export function writeCoinPusherEmptyRequest(
   return true;
 }
 
-/** Remove the door request if it is still `requestId`. */
-export function clearCoinPusherEmptyRequest(machineId: string, requestId: string): void {
-  if (readCoinPusherEmptyRequest(machineId)?.requestId !== requestId) return;
-  ensureMap().delete(`pusher-empty:${machineId}`);
+/** The operator's answer to the latest door request (null before the first). */
+export function readCoinPusherDoorResult(machineId: string): PusherDoorResult | null {
+  const value = ensureMap().get(`pusher-door:${machineId}`);
+  return isPusherDoorResult(value) ? value : null;
+}
+
+/**
+ * Operator: turn a door request down (its requester does not own the
+ * machine) — answer it and clear it in one transaction, moving nothing.
+ * False when the request is no longer pending.
+ */
+export function refuseCoinPusherEmpty(
+  machineId: string,
+  request: PusherEmptyRequest,
+  atMs: number,
+): boolean {
+  if (readCoinPusherEmptyRequest(machineId)?.requestId !== request.requestId) return false;
+  const answer: PusherDoorResult = { kind: 'refused', requestId: request.requestId, atMs };
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`pusher-door:${machineId}`, answer);
+    map.delete(`pusher-empty:${machineId}`);
+  });
+  return true;
 }
 
 export function readCoinPusherOperatorLease(machineId: string): CoinPusherOperatorLease | null {
@@ -1082,11 +1149,11 @@ export function refuseCoinPusherInsert(
 /**
  * Operator: carry out the owner's door request in ONE transaction — publish
  * the emptied `next`, credit the owner exactly the chips that were inside
- * `base`, clear the request. The operator must be the machine's owner and the
- * one who asked (the operator re-owns every machine it runs, so this is the
- * deed holder emptying their own machine), and `next` must be emptyMachine's
- * result on `base`. Returns the chips credited, or null when nothing was
- * written.
+ * `base`, answer the request (its PusherDoorResult) and clear it. The
+ * operator must be the machine's owner and the one who asked (the operator
+ * re-owns every machine it runs, so this is the deed holder emptying their
+ * own machine), and `next` must be emptyMachine's result on `base`. Returns
+ * the chips credited, or null when nothing was written.
  */
 export function commitCoinPusherEmpty(
   machineId: string,
@@ -1094,6 +1161,7 @@ export function commitCoinPusherEmpty(
   next: CoinPusherState,
   request: PusherEmptyRequest,
   operatorId: string,
+  atMs: number,
 ): number | null {
   const stored = readCoinPusherState(machineId);
   if (!stored || !sameCoinPusherRevision(stored, base)) return null;
@@ -1115,9 +1183,11 @@ export function commitCoinPusherEmpty(
   const ownerKey = `bal:${base.ownerId}`;
   const ownerBalance = safeCount(map, ownerKey);
   if (!Number.isSafeInteger(ownerBalance + emptied)) return null;
+  const answer: PusherDoorResult = { kind: 'opened', requestId: request.requestId, emptied, atMs };
   boundDoc!.transact(() => {
     map.set(`pusher:${machineId}`, normalized);
     if (emptied > 0) map.set(ownerKey, ownerBalance + emptied);
+    map.set(`pusher-door:${machineId}`, answer);
     map.delete(`pusher-empty:${machineId}`);
   });
   return emptied;
@@ -1151,11 +1221,13 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
     if (credit > 0) map.set(ownerKey, ownerBalance + credit);
     map.delete(`pusher:${machineId}`);
     map.delete(`pusher-empty:${machineId}`);
+    map.delete(`pusher-door:${machineId}`);
     map.delete(`pusher-operator:${machineId}`);
     for (const key of [...map.keys()]) {
       if (prefixes.some((prefix) => key.startsWith(prefix))) map.delete(key);
     }
   });
+  pusherRequestIndexes.get(map)?.delete(machineId);
   return credit;
 }
 
@@ -1179,6 +1251,7 @@ if (typeof window !== 'undefined') {
     readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
     releaseSlotSharedBankrollLease,
     readCoinPusherState, readCoinPusherRequests, readCoinPusherRequest,
-    readCoinPusherResult, readCoinPusherEmptyRequest, readCoinPusherOperatorLease,
+    readCoinPusherResult, readCoinPusherEmptyRequest, readCoinPusherDoorResult,
+    readCoinPusherOperatorLease,
   };
 }

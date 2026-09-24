@@ -29,11 +29,14 @@
  * furniture — nothing is paid out on a takeover, so a forged owner earns
  * nothing.
  *
- * WORK (at most every REQUEST_POLL_MS): the owner's door request first, then
- * the MAX_REQUESTS_PER_POLL oldest inserts — a fixed cost per poll however
- * many requests peers write (the slot operator likewise takes one head
- * request per poll). An insert is refused — no chips move — when it is
- * stale, the player has no chip, or the machine is full. Otherwise
+ * WORK (at most every REQUEST_POLL_MS): the owner's door request first
+ * (carried out, or answered with a refusal when its requester doesn't own the
+ * machine), then the MAX_REQUESTS_PER_POLL oldest inserts. The requests come
+ * from casinoDoc's per-machine index, which looks at no more than
+ * PUSHER_REQUEST_SCAN of them, so a poll costs the same however many keys
+ * peers write (the slot operator likewise takes one head request per poll).
+ * An insert is refused — no chips move — when it is stale, the player has no
+ * chip, or the machine is full. Otherwise
  * resolveDropTiming keeps the phase the player saw (inside the timing
  * window), processInsert runs with a seed the operator draws itself, and
  * casinoDoc.settleCoinPusherInsert debits the chip, credits the payout,
@@ -43,7 +46,6 @@
 import {
   cancelCoinPusherRequest,
   casinoDocEpoch,
-  clearCoinPusherEmptyRequest,
   clearCoinPusherOperatorLease,
   commitCoinPusherEmpty,
   drainAndClearCoinPusher,
@@ -52,6 +54,7 @@ import {
   readCoinPusherOperatorLease,
   readCoinPusherRequests,
   readCoinPusherState,
+  refuseCoinPusherEmpty,
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
   writeCoinPusherOperatorLease,
@@ -228,10 +231,10 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
 }
 
 /**
- * One pass of the operator's work on a machine: create or re-own it, carry
- * out the owner's door request, then settle every pending insert. Exported
- * for tests (with an injectable seed source); World reaches it only through
- * tickCoinPusherMachine's election.
+ * One pass of the operator's work on a machine: create or re-own it, answer
+ * the door request, then settle or refuse a bounded batch of pending inserts.
+ * Exported for tests (with an injectable seed source); World reaches it only
+ * through tickCoinPusherMachine's election.
  */
 export function operateCoinPusher(
   machineId: string,
@@ -253,9 +256,9 @@ export function operateCoinPusher(
   if (door) {
     if (door.requester === state.ownerId) {
       const emptied = emptyMachine(state, door.requester);
-      commitCoinPusherEmpty(machineId, state, emptied.state, door, operatorId);
+      commitCoinPusherEmpty(machineId, state, emptied.state, door, operatorId, now);
     } else {
-      clearCoinPusherEmptyRequest(machineId, door.requestId);
+      refuseCoinPusherEmpty(machineId, door, now);
     }
     state = readCoinPusherState(machineId);
     if (!state) return;

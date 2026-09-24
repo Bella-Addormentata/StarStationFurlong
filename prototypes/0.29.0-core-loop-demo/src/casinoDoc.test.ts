@@ -10,7 +10,7 @@
  * player's cancel converges to one drop paid once.
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindCasinoDoc,
@@ -18,13 +18,16 @@ import {
   cancelCoinPusherRequest,
   commitCoinPusherEmpty,
   drainAndClearCoinPusher,
+  PUSHER_REQUEST_SCAN,
   readChips,
+  readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
   readCoinPusherRequest,
   readCoinPusherRequests,
   readCoinPusherResult,
   readCoinPusherState,
+  refuseCoinPusherEmpty,
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
   writeCoinPusherEmptyRequest,
@@ -154,6 +157,82 @@ describe('coin-pusher requests', () => {
     expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(
       ['m-1', 'm-2', 'm-3', 'm-5', 'm-7', 'm-9'],
     );
+  });
+
+  it('reads a machine\'s requests from its index, never by walking the casino map', () => {
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2_000; i++) map.set(`noise:${i}`, i);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
+    expect(readCoinPusherRequests(MACHINE)).toHaveLength(1); // builds the index
+    for (let i = 0; i < 2_000; i++) {
+      map.set(`pusher-req:another-machine:p${i}`, request(`p${i}`, `x-${i}`));
+    }
+    writeCoinPusherRequest(MACHINE, request(OTHER, 'b-2'));
+    const walks = (['keys', 'entries', 'values', 'forEach'] as const)
+      .map((method) => vi.spyOn(Y.Map.prototype, method));
+    try {
+      expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['a-1', 'b-2']);
+      for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+    } finally {
+      for (const walk of walks) walk.mockRestore();
+    }
+  });
+
+  it('keeps the index current as requests come, change and go — from this peer or another', () => {
+    const map = doc.getMap('casino');
+    const ids = () => readCoinPusherRequests(MACHINE).map((r) => r.requestId);
+    expect(ids()).toEqual([]); // builds the index
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
+    expect(ids()).toEqual(['a-1']);
+    map.set(`pusher-req:${MACHINE}:${PLAYER}`, { junk: true });
+    expect(ids()).toEqual([]);
+    map.set(`pusher-req:${MACHINE}:${PLAYER}`, request(PLAYER, 'a-2'));
+    expect(ids()).toEqual(['a-2']);
+    cancelCoinPusherRequest(MACHINE, PLAYER, 'a-2');
+    expect(ids()).toEqual([]);
+    // A request written on another peer arrives as a remote update.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    peer.getMap('casino').set(`pusher-req:${MACHINE}:${OTHER}`, request(OTHER, 'b-1'));
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, Y.encodeStateVector(doc)));
+    expect(ids()).toEqual(['b-1']);
+    // Each bound doc has its own index.
+    bindCasinoDoc(new Y.Doc());
+    expect(ids()).toEqual([]);
+    bindCasinoDoc(doc);
+    expect(ids()).toEqual(['b-1']);
+  });
+
+  it('works through a flood PUSHER_REQUEST_SCAN at a time, in arrival order, reaching every request once', () => {
+    const id = (i: number) => `r-${String(i).padStart(4, '0')}`;
+    const total = 3 * PUSHER_REQUEST_SCAN + 5;
+    expect(readCoinPusherRequests(MACHINE)).toEqual([]); // builds the index
+    // Written newest first, so arrival order and age disagree.
+    for (let i = total - 1; i >= 0; i--) writeCoinPusherRequest(MACHINE, request(`p${i}`, id(i)));
+    const gets = vi.spyOn(Y.Map.prototype, 'get');
+    let first: string[];
+    try {
+      first = readCoinPusherRequests(MACHINE, 4).map((r) => r.requestId);
+      expect(gets.mock.calls.length).toBeLessThanOrEqual(PUSHER_REQUEST_SCAN);
+    } finally {
+      gets.mockRestore();
+    }
+    // The oldest of the first PUSHER_REQUEST_SCAN to arrive.
+    expect(first).toEqual([0, 1, 2, 3].map((k) => id(total - PUSHER_REQUEST_SCAN + k)));
+    // Answering four a pass (the operator's batch) reaches each exactly once.
+    const answered = new Set<string>();
+    let passes = 0;
+    for (let batch = readCoinPusherRequests(MACHINE, 4); batch.length > 0 && passes <= total;
+      batch = readCoinPusherRequests(MACHINE, 4)) {
+      passes += 1;
+      for (const r of batch) {
+        expect(answered.has(r.requestId)).toBe(false);
+        answered.add(r.requestId);
+        cancelCoinPusherRequest(MACHINE, r.player, r.requestId);
+      }
+    }
+    expect(answered.size).toBe(total);
+    expect(passes).toBe(Math.ceil(total / 4));
   });
 });
 
@@ -290,7 +369,7 @@ describe('refuseCoinPusherInsert', () => {
 describe('commitCoinPusherEmpty', () => {
   const door = (requester: string) => ({ requestId: 'door-1', requester, requestedAt: 5 });
 
-  it('credits the owner exactly the chips inside, empties the machine and clears the door — in one transaction', () => {
+  it('credits the owner exactly the chips inside, empties the machine, answers and clears the door — in one transaction', () => {
     const base = machineWith(40);
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherEmptyRequest(MACHINE, door(OWNER));
@@ -298,11 +377,14 @@ describe('commitCoinPusherEmpty', () => {
     const inside = chipsInMachine(base);
     const transactions = countTransactions(doc);
     const emptied = emptyMachine(base, OWNER).state;
-    expect(commitCoinPusherEmpty(MACHINE, readCoinPusherState(MACHINE)!, emptied, door(OWNER), OWNER)).toBe(inside);
+    expect(commitCoinPusherEmpty(MACHINE, readCoinPusherState(MACHINE)!, emptied, door(OWNER), OWNER, 11)).toBe(inside);
     expect(transactions()).toBe(1);
     expect(readChips(OWNER)).toBe(7 + inside);
     expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(0);
     expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+    expect(readCoinPusherDoorResult(MACHINE)).toEqual({
+      kind: 'opened', requestId: 'door-1', emptied: inside, atMs: 11,
+    });
   });
 
   it('refuses a door request from anyone but the owner', () => {
@@ -310,11 +392,12 @@ describe('commitCoinPusherEmpty', () => {
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherEmptyRequest(MACHINE, door(ATTACKER));
     const emptied = { ...emptyMachine(base, OWNER).state };
-    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER), OWNER)).toBeNull();
-    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER), ATTACKER)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER), OWNER, 11)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER), ATTACKER, 11)).toBeNull();
     expect(readChips(ATTACKER)).toBe(0);
     expect(readChips(OWNER)).toBe(0);
     expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readCoinPusherDoorResult(MACHINE)).toBeNull();
   });
 
   it('pays only an operator who owns the machine — a machine naming someone else pays nobody', () => {
@@ -324,7 +407,7 @@ describe('commitCoinPusherEmpty', () => {
     writeCoinPusherState(MACHINE, forged);
     writeCoinPusherEmptyRequest(MACHINE, door(ATTACKER));
     const emptied = emptyMachine(forged, ATTACKER).state;
-    expect(commitCoinPusherEmpty(MACHINE, forged, emptied, door(ATTACKER), OWNER)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, forged, emptied, door(ATTACKER), OWNER, 11)).toBeNull();
     expect(readChips(ATTACKER)).toBe(0);
   });
 
@@ -333,10 +416,53 @@ describe('commitCoinPusherEmpty', () => {
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherEmptyRequest(MACHINE, door(OWNER));
     const emptied = emptyMachine(base, OWNER).state;
-    expect(commitCoinPusherEmpty(MACHINE, base, { ...emptied, totalEmptied: emptied.totalEmptied + 10 }, door(OWNER), OWNER)).toBeNull();
-    expect(commitCoinPusherEmpty(MACHINE, { ...base, tick: base.tick - 1 }, emptied, door(OWNER), OWNER)).toBeNull();
-    expect(commitCoinPusherEmpty(MACHINE, base, base, door(OWNER), OWNER)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, { ...emptied, totalEmptied: emptied.totalEmptied + 10 }, door(OWNER), OWNER, 11)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, { ...base, tick: base.tick - 1 }, emptied, door(OWNER), OWNER, 11)).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, base, door(OWNER), OWNER, 11)).toBeNull();
     expect(readChips(OWNER)).toBe(0);
+    expect(readCoinPusherDoorResult(MACHINE)).toBeNull();
+  });
+});
+
+// ── refuseCoinPusherEmpty ────────────────────────────────────────────────────
+
+describe('refuseCoinPusherEmpty', () => {
+  const door = (requestId: string) => ({ requestId, requester: ATTACKER, requestedAt: 5 });
+
+  it('answers the door request with a refusal and clears it — the machine and chips stay put', () => {
+    const base = machineWith(40);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherEmptyRequest(MACHINE, door('door-1'));
+    const transactions = countTransactions(doc);
+    expect(refuseCoinPusherEmpty(MACHINE, door('door-1'), 12)).toBe(true);
+    expect(transactions()).toBe(1);
+    expect(readCoinPusherDoorResult(MACHINE)).toEqual({ kind: 'refused', requestId: 'door-1', atMs: 12 });
+    expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readChips(ATTACKER)).toBe(0);
+  });
+
+  it('writes nothing once the request is gone or replaced', () => {
+    expect(refuseCoinPusherEmpty(MACHINE, door('door-1'), 12)).toBe(false);
+    writeCoinPusherEmptyRequest(MACHINE, door('door-2'));
+    expect(refuseCoinPusherEmpty(MACHINE, door('door-1'), 12)).toBe(false);
+    expect(readCoinPusherDoorResult(MACHINE)).toBeNull();
+    expect(readCoinPusherEmptyRequest(MACHINE)?.requestId).toBe('door-2');
+  });
+
+  it('a door answer that is not well formed reads as none', () => {
+    const map = doc.getMap('casino');
+    for (const junk of [
+      { kind: 'opened', requestId: 'd', emptied: -1, atMs: 1 },
+      { kind: 'opened', requestId: 'd', emptied: 10_000, atMs: 1 },
+      { kind: 'opened', requestId: 'd', atMs: 1 },
+      { kind: 'refused', requestId: '', atMs: 1 },
+      { kind: 'shut', requestId: 'd', atMs: 1 },
+      'opened',
+    ]) {
+      map.set(`pusher-door:${MACHINE}`, junk);
+      expect(readCoinPusherDoorResult(MACHINE)).toBeNull();
+    }
   });
 });
 
@@ -347,6 +473,10 @@ describe('drainAndClearCoinPusher', () => {
     const base = machineWith(30);
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    const refused = { requestId: 'd0', requester: ATTACKER, requestedAt: 0 };
+    writeCoinPusherEmptyRequest(MACHINE, refused);
+    refuseCoinPusherEmpty(MACHINE, refused, 1);
+    expect(readCoinPusherDoorResult(MACHINE)).not.toBeNull();
     writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd', requester: OWNER, requestedAt: 0 });
     writeCoinPusherOperatorLease(MACHINE, { playerId: OWNER, sessionId: 's', expiresAt: 99 });
     refuseCoinPusherInsert(MACHINE, request(PLAYER, 'req-1'), 'expired', 1);
@@ -358,6 +488,7 @@ describe('drainAndClearCoinPusher', () => {
     expect(readCoinPusherState(MACHINE)).toBeNull();
     expect(readCoinPusherRequests(MACHINE)).toEqual([]);
     expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+    expect(doc.getMap('casino').has(`pusher-door:${MACHINE}`)).toBe(false);
     expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
   });
 

@@ -102,6 +102,7 @@ Records in the room's `casino` map:
 | `pusher-req:<mid>:<pid>` | the player (own key) | hole + the phase they saw — **no chips** |
 | `pusher-result:<mid>:<pid>` | the operator | its answer to that player's latest request |
 | `pusher-empty:<mid>` | the owner | a door request |
+| `pusher-door:<mid>` | the operator | its answer to the latest door request |
 | `pusher-operator:<mid>` | the operator | its lease |
 
 - **Election.** Only the room's deed holder operates (`canRunCroupier`, the
@@ -140,7 +141,10 @@ Records in the room's `casino` map:
   payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read off
   that transition; it is never a separate argument. Each poll works through
   at most 4 requests (oldest first), so a flood of requests can't stall the
-  operator's frame.
+  operator's frame. It reads them from a per-machine index that an observer
+  keeps current from the keys each transaction changed, never by walking the
+  casino map, and a read looks at no more than 64 of them (in arrival order).
+  A poll therefore costs the same however many keys peers write.
 - **Answers.** Each player's answer lives under their own
   `pusher-result:<mid>:<pid>` until their next request is answered. The
   machine's `lastDrop` only lights the cabinet: the next player's drop
@@ -154,9 +158,12 @@ Records in the room's `casino` map:
 - **The door.** Only the owner may empty the machine, and that too goes
   through the operator (`pusher-empty:<mid>` → `commitCoinPusherEmpty`: the
   emptied machine, the owner's credit for exactly the chips that were inside,
-  and the cleared request, in one transaction), so an empty never races a
-  drop. The operator must itself be the machine's owner and the one who
-  asked.
+  the door's answer and the cleared request, in one transaction), so an empty
+  never races a drop. The operator must itself be the machine's owner and the
+  one who asked. A request from anyone else (say, an owner whose deed has
+  since changed hands) is turned down with an answer too
+  (`refuseCoinPusherEmpty`). The panel goes by `pusher-door:<mid>`, since a
+  request that merely vanished says nothing about whether the door opened.
 - **Removal.** When the cabinet is removed, the deed holder's client pays the
   chips still inside to the deed holder and deletes every key (including any
   `pusher-esc:` records an earlier revision left, which credit nothing), in
@@ -185,13 +192,15 @@ cashier, chips are shown as chips, never as numbers).
    `pusher-req:<mid>:<me>` = `{ requestId, player, hole, phase, requestedAt }`.
    No chips move.
 2. The operator's next pass (at most 100 ms later) reads the requests oldest
-   first, refuses or resolves each one's timing, runs `processInsert` with its
-   own seed, and settles it (step *A drop* above).
+   first from the machine's index, refuses or resolves each one's timing,
+   runs `processInsert` with its own seed, and settles it (step *A drop*
+   above).
 3. Every client sees `pusher:<mid>` change: the cabinet redraws the piles and
    flashes the hole of the new `lastDrop`; the player's panel reads its result
    (paid chips into the tray, timing kept or not) or its refusal.
 4. The owner presses OPEN THE DOOR → `pusher-empty:<mid>` → the operator
-   empties the machine onto the owner's rack.
+   empties the machine onto the owner's rack and answers under
+   `pusher-door:<mid>`.
 
 ## Review history
 

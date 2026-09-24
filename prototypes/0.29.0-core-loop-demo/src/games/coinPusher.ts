@@ -85,7 +85,8 @@
  *     `pusher-result:<mid>:<pid>` (PusherResult), which stays until that
  *     player's next request is answered;
  *   • only the machine OWNER may empty it, and that too goes through the
- *     operator (`pusher-empty:<mid>`), so an empty never races an insert.
+ *     operator (`pusher-empty:<mid>`), so an empty never races an insert. The
+ *     operator answers under `pusher-door:<mid>` (PusherDoorResult).
  * Every doc read shape-guards (isCoinPusherState etc.): a hostile peer that
  * writes junk into these keys makes other clients see no machine, never a
  * corrupt one.
@@ -243,6 +244,18 @@ export type PusherResult =
   | { kind: 'refused'; requestId: string; reason: PusherRefusalReason; atMs: number };
 
 /**
+ * The operator's answer to the latest door request, under
+ * `pusher-door:<mid>`, written in the same transaction that empties the
+ * machine or turns the request down (its requester doesn't own the machine —
+ * say, an owner whose deed has since changed hands). A door request that
+ * merely vanished proves nothing, so the panel reads this. `emptied` is how
+ * many chips went to the owner.
+ */
+export type PusherDoorResult =
+  | { kind: 'opened'; requestId: string; emptied: number; atMs: number }
+  | { kind: 'refused'; requestId: string; atMs: number };
+
+/**
  * The full doc-synced machine state — plain JSON, whole-value LWW write per
  * machine key. `kind` discriminates it inside the shared casino map (the
  * slot-machine / roulette / craps precedent).
@@ -365,6 +378,14 @@ export function isPusherResult(v: unknown): v is PusherResult {
     return isCountInt(r.paid) && (r.paid as number) <= MACHINE_MAX_CHIPS && typeof r.honored === 'boolean';
   }
   return r.kind === 'refused' && REFUSAL_REASONS.includes(r.reason as PusherRefusalReason);
+}
+
+export function isPusherDoorResult(v: unknown): v is PusherDoorResult {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as { kind?: unknown; requestId?: unknown; emptied?: unknown; atMs?: unknown };
+  if (!isBoundedId(r.requestId) || typeof r.atMs !== 'number' || !Number.isFinite(r.atMs)) return false;
+  if (r.kind === 'opened') return isCountInt(r.emptied) && (r.emptied as number) <= MACHINE_MAX_CHIPS;
+  return r.kind === 'refused';
 }
 
 /** Shape guard for a peer-written coin-pusher state. Everything the engine
