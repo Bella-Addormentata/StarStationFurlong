@@ -229,9 +229,13 @@ async function sameRoomWrite(
 /**
  * A far session under one overall deadline. Each step inside is bounded, but a
  * transport can still wedge where no step expects it (a channel that never
- * opens, a write that never completes). Past the deadline the caller hears
- * `unreachable`, this room's queue moves on — and the session, should it ever
- * wake, is barred from writing (it checks `late` right before its decision).
+ * opens, a start that never finishes). Past the deadline, BEFORE the write,
+ * the caller hears `unreachable`, this room's queue moves on — and the
+ * session, should it ever wake, is barred from writing (`mayWrite`). Once the
+ * write has begun, the deadline no longer cuts it short: the write's own steps
+ * (the acknowledgment, the settle) are bounded, and only they can say what
+ * happened — an `unreachable` over a write that may still land would hide it
+ * from the caller's take-back while the next request ran.
  */
 function boundedSession(
   d: FarDoorWriteDeps,
@@ -239,19 +243,48 @@ function boundedSession(
   req: FarDockRequest,
   near: NearEnd,
 ): Promise<FarDockResult> {
-  let late = false;
-  return new Promise<FarDockResult>((resolve) => {
-    const timer = setTimeout(() => {
-      late = true;
+  return underWriteDeadline<FarDockResult>(
+    (mayWrite) => session(d, imported, req, near, mayWrite),
+    SESSION_DEADLINE_MS,
+    () => {
       console.warn(
         `[farDoorWrite] ${imported.roomId}: no outcome within ${SESSION_DEADLINE_MS} ms — abandoned`,
       );
-      resolve({ ok: false, reason: 'unreachable' });
-    }, SESSION_DEADLINE_MS);
-    void session(d, imported, req, near, () => late).then((result) => {
+      return { ok: false, reason: 'unreachable' };
+    },
+  );
+}
+
+/**
+ * The deadline boundedSession runs under, on its own (exported for its test):
+ * until `run` claims its write (`mayWrite()` → true), the deadline may end it
+ * with `onLate()` — and a claim after that is refused. Once the write is
+ * claimed, only `run`'s own result counts. The claim is checked and made in
+ * one synchronous step, so the timer can never fire in between.
+ */
+export function underWriteDeadline<T>(
+  run: (mayWrite: () => boolean) => Promise<T>,
+  deadlineMs: number,
+  onLate: () => T,
+): Promise<T> {
+  let late = false;
+  let writing = false;
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => {
+      if (writing) return;
+      late = true;
+      resolve(onLate());
+    }, deadlineMs);
+    const mayWrite = () => {
+      if (late) return false;
+      writing = true;
+      return true;
+    };
+    const settle = (result: T) => {
       clearTimeout(timer);
       resolve(result);
-    });
+    };
+    run(mayWrite).then(settle, () => settle(onLate()));
   });
 }
 
@@ -260,10 +293,12 @@ async function session(
   imported: RoomBootstrap,
   req: FarDockRequest,
   near: NearEnd,
-  abandoned: () => boolean,
+  mayWrite: () => boolean,
 ): Promise<FarDockResult> {
   let provider: NetworkProvider | null = null;
   let sync: YjsSync | null = null;
+  // Once a write is made, an `unreachable` may hide it: say so.
+  let written = false;
   try {
     const boot = await d.resolve(imported);
     provider = new NetworkProvider();
@@ -312,16 +347,19 @@ async function session(
       );
       return { ok: false, reason: 'unreachable' };
     }
-    // The caller has already been told `unreachable`: it must not now find a
-    // write it was never told about.
-    if (abandoned()) return { ok: false, reason: 'unreachable' };
+    // Past the overall deadline the caller has already been told `unreachable`:
+    // it must not now find a write it was never told about. Otherwise the
+    // write begins, and its outcome is this session's to report.
+    if (!mayWrite()) return { ok: false, reason: 'unreachable' };
     // Read-before-write: the decision sees the far room's real state, so the
     // write is causally AFTER the record it replaces and wins everywhere.
     const since = Y.encodeStateVector(s.doc);
     const { result, wrote } = applyFarDockRequest(s.doc, req, near);
+    written = wrote;
     if (wrote && !(await s.confirmOwnWrites(since, ACK_TIMEOUT_MS))) {
       console.warn(`[farDoorWrite] ${boot.roomId}: the node did not acknowledge the write`);
-      return { ok: false, reason: 'unreachable' };
+      // Unacknowledged is not unwritten: the write may still land.
+      return { ok: false, reason: 'unreachable', unconfirmed: true };
     }
     if (wrote && req.kind === 'dock') {
       // Concurrent claims on the same berth get a moment to arrive (they are
@@ -342,7 +380,7 @@ async function session(
     return result;
   } catch (err) {
     console.warn('[farDoorWrite] far room session failed:', err);
-    return { ok: false, reason: 'unreachable' };
+    return { ok: false, reason: 'unreachable', ...(written ? { unconfirmed: true } : {}) };
   } finally {
     // Hang up WITHOUT holding the result: it is decided, and a transport that
     // wedges on close must not keep the caller (or this room's queue) waiting.

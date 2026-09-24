@@ -20,6 +20,7 @@ import {
 } from './doorsDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { roomIdFromSeed } from './stationAtlas';
+import type { FarDockResult } from './docking';
 
 // ── What a door is, as far as docking goes ───────────────────────────────────
 
@@ -106,6 +107,25 @@ export function gangwayPartRefusal(hasPort: boolean): string | null {
     : null;
 }
 
+/**
+ * May INITIATE send out the chain staged at this door? A port door connects
+ * only by docking (gangwayPartRefusal). And a dock needs its port: a mating
+ * half staged on a door whose port was removed meanwhile — by a peer, while
+ * this pane sat open — would go out as a dock with no port behind it, one
+ * whose "port" vanishes at UNDOCK and can never DOCK again.
+ */
+export function initiateChainRefusal(
+  hasPort: boolean,
+  staged: readonly ConnectorSegment[] | undefined,
+): string | null {
+  if (hasPort) {
+    return staged?.some((seg) => seg.kind !== 'dock') ? gangwayPartRefusal(true) : null;
+  }
+  return staged?.some((seg) => seg.kind === 'dock')
+    ? 'This door no longer wears its dock port — +DOCK fits it again, or ✕ the mating half to connect another way.'
+    : null;
+}
+
 // ── Dock and undock, near side ───────────────────────────────────────────────
 
 /**
@@ -168,6 +188,17 @@ export function holdsOurRedock(
     (!now.record.farDoor || now.record.farDoor === berth.farDoor) &&
     now.record.dockedAt === dockedAt
   );
+}
+
+/**
+ * …and when it does not: may the berth still hold the far write that DOCK
+ * made, so it must be taken back? When the write was acknowledged — and also
+ * when it was made but its acknowledgment never came (`unconfirmed`): an
+ * unacknowledged write may still land. The take-back undoes only a dock
+ * carrying that DOCK's stamp, so asking for one that never landed is harmless.
+ */
+export function farWriteMayStand(far: FarDockResult): boolean {
+  return far.ok ? far.detail === 'written' : far.reason === 'unreachable' && far.unconfirmed === true;
 }
 
 // ── The transit mirror ───────────────────────────────────────────────────────

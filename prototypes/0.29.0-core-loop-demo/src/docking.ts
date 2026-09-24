@@ -60,6 +60,8 @@ import {
   berthMemoryFrom,
   redockRecord,
   holdsOurRedock,
+  farWriteMayStand,
+  initiateChainRefusal,
   stampAfter,
   FAR_DOCK_REFUSAL,
   type DockPortState,
@@ -220,6 +222,9 @@ export type FarDockResult =
         | "superseded";
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
+      /** With `unreachable`: the far write WAS made, but its acknowledgment
+       *  never came — it may still land (redockPort takes it back anyway). */
+      unconfirmed?: boolean;
     };
 
 /** ⚓ One dock port as the helm's docking computer and the pane list it. */
@@ -1442,19 +1447,25 @@ export class DoorDockingPortSystem {
         // The dock chain itself is assigned only after the gates below pass —
         // a refused INITIATE must not leave a ghost tunnel on the door.
         const willDock = this.doorHasPort(activeDoorId);
-        if (willDock) {
-          if (state?.segments?.some((s) => s.kind !== "dock")) {
-            alert(gangwayPartRefusal(true));
+        // A port door connects only by docking — and a staged mating half on
+        // a door whose port was removed meanwhile (by a peer, while this pane
+        // sat open) must not go out as a dock with no port behind it.
+        const chainRefusal = initiateChainRefusal(willDock, state?.segments);
+        if (chainRefusal) {
+          alert(chainRefusal);
+          return;
+        }
+        if (!willDock) {
+          if (!this.canConstruct(activeDoorId)) {
+            alert(
+              "No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).",
+            );
             return;
           }
-        } else if (!this.canConstruct(activeDoorId)) {
-          alert(
-            "No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).",
-          );
-          return;
-        } else if (state) {
-          state.transient = false; // rights-holder pairing = permanent structure
-          state.dockedAt = undefined;
+          if (state) {
+            state.transient = false; // rights-holder pairing = permanent structure
+            state.dockedAt = undefined;
+          }
         }
         if (activeDoorId) this.untouchedPrefills.delete(activeDoorId); // INITIATE = intentional
         if (state && addrInput && pinInput) {
@@ -2907,7 +2918,9 @@ export class DoorDockingPortSystem {
       this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" }, ask.roomId);
       return true;
     }
-    if (!far.ok || far.detail !== "written" || !this.farDockWriter) {
+    // Acknowledged, or made but never acknowledged (it may still land): either
+    // way the berth may hold our write, and it is taken back.
+    if (!farWriteMayStand(far) || !this.farDockWriter) {
       this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" }, ask.roomId);
       return false;
     }
@@ -2945,7 +2958,9 @@ export class DoorDockingPortSystem {
             tone: "warn",
           }
         : {
-            note: `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`,
+            note: far.ok
+              ? `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`
+              : `This port changed while docking, and ${ask.name} could not be reached to let go — its side may show the dock until it undocks.`,
             tone: "bad",
           },
       ask.roomId,

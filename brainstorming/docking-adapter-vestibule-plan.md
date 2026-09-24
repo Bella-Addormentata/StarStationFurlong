@@ -122,6 +122,8 @@ Architecture facts that bind the design:
     (✕ unstages — refund).
 - **PROVISION NEW MODULE** with a staged dock: the module is born with its door wearing the other half
   (fitted at its first claim), and the connection is a dock → "a new independent ship or station".
+- **INITIATE** at a port door always sends a dock; a mating half staged on a door whose port was
+  removed meanwhile (by a peer, while the pane sat open) is refused until the port is fitted again.
 - A **DOCK row** at the top of the pane (not hidden in the collapsed policy section):
   `⚓ DOCKED → <name>  [⏏ UNDOCK]` · `⚓ UNDOCKED · last berth <name>  [⚓ DOCK]` ·
   `⚓ DOCK PORT · free — +DOCK stages the mating half, or pick a target and INITIATE`.
@@ -151,7 +153,10 @@ deciding on the named door read directly (never through the 64-record snapshot c
 then a SyncStep1 with the pre-write state vector; the node's answer holds our structs only once it
 applied them) → for a DOCK, a settle window for concurrent claims on the same berth, after which only
 the claim the CRDT kept has docked (a DOCK is not a lock) → teardown. Serialized per far room; bounded
-by timeouts. A claim that arrives only after the settle window — or a DOCK's own near-side write
+by timeouts. An overall deadline ends a session that has not yet written; once it writes, only its
+own bounded acknowledgment and settle report the outcome — and a write made but never acknowledged
+comes back `unconfirmed`, so a DOCK that must take its write back still does. A claim that arrives
+only after the settle window — or a DOCK's own near-side write
 racing the far end's claim on that same door — is the residual no client can close alone:
 exactly-once arbitration needs an authority for the berth (the room host). The decisions are pure
 (`dockRules.ts`, unit-tested):

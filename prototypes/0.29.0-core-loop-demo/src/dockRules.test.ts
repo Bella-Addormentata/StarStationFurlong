@@ -22,9 +22,9 @@ import {
 import { bindDoorPolicy, dockPortFlagIn, readDoorPolicy, writeDoorPolicy } from './doorPolicy';
 import { mirrorSegments, partForSegment } from './stationParts';
 import {
-  berthMemoryFrom, classifyDockPort, farDockPatch, farUndockPatch, findFarDoor,
-  gangwayPartRefusal, holdsDockTo, holdsOurRedock, isPortDoor, mirrorMayWrite, nextDockStep,
-  redockRecord, stampAfter, type NearEnd,
+  berthMemoryFrom, classifyDockPort, farDockPatch, farUndockPatch, farWriteMayStand, findFarDoor,
+  gangwayPartRefusal, holdsDockTo, holdsOurRedock, initiateChainRefusal, isPortDoor, mirrorMayWrite,
+  nextDockStep, redockRecord, stampAfter, type NearEnd,
 } from './dockRules';
 
 /** A pass in the real format roomIdFromSeed parses: base64(JSON{roomId}). */
@@ -273,6 +273,19 @@ describe('dockRules — the +DOCK vestibule option', () => {
     expect(nextDockStep({ hasPort: true, record: undefined, staged: dockChain() }).kind).toBe('refuse');
   });
 
+  it('INITIATE sends a dock only from a port — never a staged mating half whose port was removed', () => {
+    // A port door: a dock (or nothing staged) goes out; a gangway part does not.
+    expect(initiateChainRefusal(true, dockChain())).toBeNull();
+    expect(initiateChainRefusal(true, undefined)).toBeNull();
+    expect(initiateChainRefusal(true, [{ kind: 'ext', bays: 4 }])).toBe(gangwayPartRefusal(true));
+    // A peer removed the port after this pane staged the mating half.
+    expect(initiateChainRefusal(false, dockChain())).toMatch(/no longer wears its dock port/);
+    expect(initiateChainRefusal(false, [{ kind: 'dock' }])).not.toBeNull();
+    // A door without a port connects by gangway, as ever.
+    expect(initiateChainRefusal(false, [{ kind: 'ext', bays: 4 }])).toBeNull();
+    expect(initiateChainRefusal(false, undefined)).toBeNull();
+  });
+
   it('refuses over a gangway chain, a live gangway, and a live dock', () => {
     const ext: ConnectorSegment[] = [{ kind: 'ext', bays: 4 }];
     expect(nextDockStep({ hasPort: false, record: undefined, staged: ext }).kind).toBe('refuse');
@@ -364,6 +377,17 @@ describe('dockRules — undock memory and re-dock', () => {
     expect(holdsOurRedock(classifyDockPort(buildDoorPairing(seedFor(STATION), { farDoor: 'd:bay' })), berth, 300)).toBe(false);
     expect(holdsOurRedock(classifyDockPort(buildDoorTombstone(seedFor(STATION), { undockedAt: 299 })), berth, 300)).toBe(false);
     expect(holdsOurRedock(null, berth, 300)).toBe(false);
+  });
+
+  it('farWriteMayStand: the far write is taken back when acknowledged — or made and never acknowledged', () => {
+    expect(farWriteMayStand({ ok: true, detail: 'written' })).toBe(true);
+    // Unacknowledged is not unwritten: it may still land.
+    expect(farWriteMayStand({ ok: false, reason: 'unreachable', unconfirmed: true })).toBe(true);
+    // Nothing written, or refused: nothing of ours can stand there.
+    expect(farWriteMayStand({ ok: true, detail: 'nothing-to-undo' })).toBe(false);
+    expect(farWriteMayStand({ ok: false, reason: 'unreachable' })).toBe(false);
+    expect(farWriteMayStand({ ok: false, reason: 'occupied' })).toBe(false);
+    expect(farWriteMayStand({ ok: false, reason: 'superseded', stamp: 9 })).toBe(false);
   });
 });
 

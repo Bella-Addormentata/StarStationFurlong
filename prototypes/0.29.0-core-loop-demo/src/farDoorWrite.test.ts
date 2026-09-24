@@ -14,7 +14,7 @@ import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom, readDoorFrom } from './doorsDoc';
 import {
-  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, writeFarDock,
+  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, underWriteDeadline, writeFarDock,
 } from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
 import { classifyDockPort, holdsOurRedock, type NearEnd } from './dockRules';
@@ -411,6 +411,58 @@ describe('writeFarDock — a dock between two doors of ONE module', () => {
       ),
     ).toEqual({ ok: false, reason: 'unreachable' });
     expect(Y.encodeStateVector(ship)).toEqual(before);
+  });
+});
+
+describe('underWriteDeadline — the far session\'s overall deadline', () => {
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  it('ends a session that never began its write — and refuses that write should the session wake', async () => {
+    vi.useFakeTimers();
+    try {
+      let claimed: boolean | null = null;
+      const out = underWriteDeadline(
+        async (mayWrite) => {
+          await sleep(70_000); // wedged past the deadline, before its write
+          claimed = mayWrite();
+          return 'written';
+        },
+        60_000,
+        () => 'unreachable',
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(out).resolves.toBe('unreachable');
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(claimed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('once the write has begun, waits for its outcome — never unreachable over a write that may still land', async () => {
+    vi.useFakeTimers();
+    try {
+      let settled: string | null = null;
+      const out = underWriteDeadline(
+        async (mayWrite) => {
+          await sleep(59_000);
+          if (!mayWrite()) return 'refused';
+          await sleep(6_000); // the acknowledgment and the settle run past the deadline
+          return 'written';
+        },
+        60_000,
+        () => 'unreachable',
+      );
+      void out.then((v) => {
+        settled = v;
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled).toBeNull(); // the deadline passed without cutting the write short
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(settled).toBe('written');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
