@@ -327,6 +327,19 @@ export function writeDoorRecordTo(doc: Y.Doc, doorId: string, record: DoorRecord
   });
 }
 
+/**
+ * ⚓ #163: run several door writes as ONE transaction on the bound room doc.
+ * Every door store (doors, doorPolicy, doorLayout) is bound to that same doc,
+ * so their own transact() calls nest into this one and peers — including a
+ * far room's background DOCK session reading this room — see the writes land
+ * together or not at all. Runs `fn` bare when no doc is bound (the writes
+ * inside no-op on their own).
+ */
+export function transactDoorWrites(fn: () => void): void {
+  if (docAlive()) boundDoc!.transact(fn);
+  else fn();
+}
+
 /** Optional connection geometry a publisher attaches to a pairing (#62 P2). */
 export interface DoorGeometry {
   segments?: ConnectorSegment[];

@@ -1890,6 +1890,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
 
   const render = (): void => {
     if (!panel) return;
+    // Every render swaps the whole panel (a dock landing re-renders it too):
+    // remember which docking control had keyboard focus, and give it back.
+    const focused = document.activeElement as HTMLElement | null;
+    const refocus = focused && panel.contains(focused)
+      ? { pick: focused.dataset.helmPick, dock: focused.dataset.helmDock !== undefined }
+      : null;
     const engines = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('engine')).length;
     const tanks = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank')).length;
     const check = (ok: boolean) => ok
@@ -1936,6 +1942,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     `;
     const canvas = panel.querySelector<HTMLCanvasElement>('#helm-ship-atlas');
     if (canvas && docking) drawShipAtlas(canvas, ports, docking.connected());
+    if (refocus) {
+      const target = refocus.pick !== undefined
+        ? [...panel.querySelectorAll<HTMLElement>('[data-helm-pick]')].find((b) => b.dataset.helmPick === refocus.pick)
+        : refocus.dock
+          ? panel.querySelector<HTMLElement>('[data-helm-dock]')
+          : null;
+      target?.focus();
+    }
   };
 
   /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
@@ -1976,12 +1990,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         <div><b style="color:#F2EFE6;">${esc(p.label)}</b> · <span style="color:${PORT_TONE[p.state.kind]};">${esc(portStatusText(p))}</span></div>
         ${action(p)}`);
     }
+    // Real buttons, so every port is reachable and selectable from the
+    // keyboard (Tab, then Enter / Space) — the atlas canvas is pointer-only.
     const list = ports.map((p, i) => `
-        <div data-helm-pick="${esc(p.doorId)}" style="display:flex; gap:8px; align-items:center; padding:3px 6px; margin-top:2px; border-radius:5px; cursor:pointer; ${p.doorId === sel.doorId ? 'background:rgba(0,229,255,0.12); outline:1px solid rgba(0,229,255,0.4);' : ''}">
-          <span style="display:inline-block; width:16px; height:16px; line-height:16px; text-align:center; border-radius:50%; background:${PORT_TONE[p.state.kind]}; color:#06121C; font-weight:800; font-size:9px;">${i + 1}</span>
+        <button type="button" data-helm-pick="${esc(p.doorId)}" aria-pressed="${p.doorId === sel.doorId}" aria-label="Port ${i + 1}: ${esc(p.label)}, ${esc(portStatusText(p))}" style="display:flex; width:100%; gap:8px; align-items:center; padding:3px 6px; margin-top:2px; border:none; border-radius:5px; background:${p.doorId === sel.doorId ? 'rgba(0,229,255,0.12)' : 'transparent'}; box-shadow:${p.doorId === sel.doorId ? 'inset 0 0 0 1px rgba(0,229,255,0.4)' : 'none'}; color:inherit; font:inherit; text-align:left; cursor:pointer;">
+          <span style="display:inline-block; flex-shrink:0; width:16px; height:16px; line-height:16px; text-align:center; border-radius:50%; background:${PORT_TONE[p.state.kind]}; color:#06121C; font-weight:800; font-size:9px;">${i + 1}</span>
           <span style="color:#F2EFE6;">${esc(p.label)}</span>
           <span style="color:${PORT_TONE[p.state.kind]}; margin-left:auto; text-align:right;">${esc(portStatusText(p))}</span>
-        </div>`).join('');
+        </button>`).join('');
     return screen(`
       <canvas id="helm-ship-atlas" width="652" height="400" style="width:326px; height:200px; display:block; border-radius:6px; background:#030A10; cursor:pointer;" title="Pick a port on the ship atlas"></canvas>
       ${list}

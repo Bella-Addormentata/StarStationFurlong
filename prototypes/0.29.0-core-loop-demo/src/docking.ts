@@ -57,6 +57,7 @@ import {
   gangwayPartRefusal,
   berthMemoryFrom,
   redockRecord,
+  stampAfter,
   FAR_DOCK_REFUSAL,
   type DockPortState,
 } from "./dockRules";
@@ -97,6 +98,7 @@ import {
   writeDoorTombstone,
   writeDoorPairing,
   readAllDoors,
+  transactDoorWrites,
 } from "./doorsDoc";
 import {
   doorLateralLimitForWall,
@@ -174,6 +176,10 @@ export type FarDockRequest =
       nearWall?: DoorWall;
       nearLateral?: number;
       undockedAt: number;
+      /** Take back exactly ONE far dock — the one this client wrote with this
+       *  stamp — and nothing else (redockPort's compensation when its own
+       *  side changed under it). */
+      onlyDockedAt?: number;
     }
   | {
       kind: "dock";
@@ -1465,7 +1471,12 @@ export class DoorDockingPortSystem {
           if (willDock) {
             state.segments = dockChain();
             state.transient = true;
-            state.dockedAt = Date.now();
+            // Causally after this port's own last undock (a re-dock by
+            // INITIATE must not read as a stale berth to the far mirror).
+            const prior = classifyDockPort(readAllDoors().get(activeDoorId));
+            state.dockedAt = stampAfter(
+              prior.kind === "undocked" ? prior.memory.undockedAt : undefined,
+            );
           }
 
           // 🛰️ #28 S6a: BLOCK a pairing whose module would dock ON TOP of an
@@ -1850,12 +1861,17 @@ export class DoorDockingPortSystem {
           state.segments = undefined;
         }
         if (readDoorPolicy(doorId).adapter) refundPart("adapter");
-        writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
         // Removing the port CLOSES the berth: the tombstone keeps refusing
         // the old dock's mirror, but loses its memory, so neither this door's
         // DOCK nor the far side's may re-make the connection (dockRules
-        // farDockPatch reads a plain tombstone naming it as "closed").
-        if (port.kind === "undocked") writeDoorTombstone(doorId, port.address);
+        // farDockPatch reads a plain tombstone naming it — or any tombstone
+        // on a door without a port — as "closed"). ONE transaction: a far
+        // room's DOCK session reading this room never sees the port gone
+        // while the old berth memory still stands.
+        transactDoorWrites(() => {
+          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
+          if (port.kind === "undocked") writeDoorTombstone(doorId, port.address);
+        });
       }
       this.assemblyNotice = null;
       this.renderAssemblyStrip(doorId);
@@ -2602,7 +2618,9 @@ export class DoorDockingPortSystem {
       });
       return false;
     }
-    const undockedAt = Date.now();
+    // Causally after the dock it releases, whatever this client's clock says
+    // (the far side's newer-dock guard and the mirror compare these stamps).
+    const undockedAt = stampAfter(port.record.dockedAt);
     writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt));
     const name = this.partnerLabel(port.roomId);
     if (!this.farDockWriter) {
@@ -2647,7 +2665,9 @@ export class DoorDockingPortSystem {
    * refused dock never flickers into existence; then this side. A far room
    * that cannot be reached docks this side alone — the first walk-through's
    * mirror completes it (dockRules.mirrorMayWrite: a dock newer than the
-   * berth's undock re-docks).
+   * berth's undock re-docks). If this port changes while the berth is asked,
+   * this side is left alone and the far write is taken back
+   * (settleChangedRedock).
    */
   public async redockPort(doorId: string): Promise<boolean> {
     if (this.dockOps.get(doorId)?.busy) return false;
@@ -2691,8 +2711,18 @@ export class DoorDockingPortSystem {
         return false;
       }
     }
-    const dockedAt = Date.now();
+    // Causally after the undock it replaces, whatever this client's clock
+    // says — or the far side's walk-through mirror would read this deliberate
+    // re-dock as a stale berth (dockRules.mirrorMayWrite) and never heal it.
+    const dockedAt = stampAfter(port.memory.undockedAt);
     const near = this.doorLateral(doorId);
+    // The far berth is asked over an await, and a peer may dock, re-connect or
+    // strip this port meanwhile: this side is only ever written over the very
+    // tombstone read above.
+    const unchanged = () => {
+      const now = classifyDockPort(readAllDoors().get(doorId));
+      return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
+    };
     let far: FarDockResult | null = null;
     if (this.farDockWriter && farDoor) {
       this.setDockOp(doorId, { busy: true, note: `Requesting the berth at ${name}…` });
@@ -2713,16 +2743,17 @@ export class DoorDockingPortSystem {
       if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone")) {
         // A closed or vanished berth is not coming back: drop the memory so
         // this port stops offering it. An occupied one may free up.
-        if (far.reason !== "occupied") writeDoorTombstone(doorId, port.address);
+        if (far.reason !== "occupied" && unchanged()) writeDoorTombstone(doorId, port.address);
         this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" });
         return false;
       }
-      // The berth may have changed while we asked — only dock over the very
-      // tombstone we read.
-      const now = classifyDockPort(readAllDoors().get(doorId));
-      if (now.kind !== "undocked" || now.memory.undockedAt !== port.memory.undockedAt) {
-        this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" });
-        return false;
+      if (!unchanged()) {
+        return this.settleChangedRedock(doorId, port, far, {
+          farDoor,
+          dockedAt,
+          near,
+          name,
+        });
       }
     }
     const next = redockRecord(port, dockedAt);
@@ -2737,6 +2768,74 @@ export class DoorDockingPortSystem {
           },
     );
     return true;
+  }
+
+  /**
+   * ⚓ redockPort's far berth answered, but THIS port changed while it was
+   * asked (a peer docked, re-connected or stripped it). Docked meanwhile to
+   * this very berth — another crew member's DOCK, or the far side's own — both
+   * sides hold a dock and nothing is taken back. Anything else would leave the
+   * berth holding a dock this port no longer has: take back exactly the far
+   * write this call made (the far side undoes only a dock carrying our stamp,
+   * never anyone else's), and say so.
+   */
+  private async settleChangedRedock(
+    doorId: string,
+    port: Extract<DockPortState, { kind: "undocked" }>,
+    far: FarDockResult,
+    ask: {
+      farDoor: string;
+      dockedAt: number;
+      near: { wall: DoorWall; lateral: number };
+      name: string;
+    },
+  ): Promise<boolean> {
+    const now = classifyDockPort(readAllDoors().get(doorId));
+    if (
+      now.kind === "docked" &&
+      now.roomId === port.roomId &&
+      (!now.record.farDoor || now.record.farDoor === ask.farDoor)
+    ) {
+      this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" });
+      return true;
+    }
+    if (!far.ok || far.detail !== "written" || !this.farDockWriter) {
+      this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" });
+      return false;
+    }
+    this.setDockOp(doorId, {
+      busy: true,
+      note: `This port changed while docking — releasing the berth at ${ask.name}…`,
+    });
+    let undone: FarDockResult;
+    try {
+      undone = await this.farDockWriter({
+        kind: "undock",
+        farAddress: port.address,
+        farDoor: ask.farDoor,
+        nearDoorId: doorId,
+        nearWall: ask.near.wall,
+        nearLateral: ask.near.lateral,
+        undockedAt: stampAfter(ask.dockedAt),
+        onlyDockedAt: ask.dockedAt,
+      });
+    } catch (err) {
+      console.warn("[dock] far take-back threw:", err);
+      undone = { ok: false, reason: "unreachable" };
+    }
+    this.setDockOp(
+      doorId,
+      undone.ok
+        ? {
+            note: `This port changed while docking — the berth at ${ask.name} was released again. Try again.`,
+            tone: "warn",
+          }
+        : {
+            note: `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`,
+            tone: "bad",
+          },
+    );
+    return false;
   }
 
   /** ⚓ The DOCK row at the top of the pane (see its markup). */

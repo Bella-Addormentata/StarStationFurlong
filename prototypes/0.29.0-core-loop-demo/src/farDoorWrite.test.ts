@@ -66,26 +66,62 @@ describe('applyFarDockRequest — UNDOCK', () => {
     expect(out).toEqual({ result: { ok: true, detail: 'nothing-to-undo' }, wrote: false });
     expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
   });
+
+  it('a take-back undoes only the dock carrying its own stamp', () => {
+    const doc = stationDoc(); // d:bay docked to the ship at 100
+    const takeBack = (onlyDockedAt: number) => applyFarDockRequest(
+      doc,
+      {
+        kind: 'undock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId,
+        undockedAt: 101, onlyDockedAt,
+      },
+      near,
+    );
+    expect(takeBack(99)).toEqual({ result: { ok: true, detail: 'nothing-to-undo' }, wrote: false });
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
+    expect(takeBack(100).wrote).toBe(true);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(false);
+  });
 });
 
 describe('applyFarDockRequest — DOCK', () => {
-  it('re-docks a remembered berth and fits its port in the same transaction', () => {
+  const dockAt = (doc: Y.Doc) => applyFarDockRequest(
+    doc,
+    { kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 },
+    near,
+  );
+
+  it('re-docks a remembered berth on its port', () => {
     const doc = stationDoc();
     doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
-    doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
-    let transactions = 0;
-    doc.on('afterTransaction', () => transactions++);
-    const out = applyFarDockRequest(
-      doc,
-      { kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 },
-      near,
-    );
-    expect(out.wrote).toBe(true);
-    expect(transactions).toBe(1);
+    const out = dockAt(doc);
+    expect(out).toEqual({ result: { ok: true, detail: 'written' }, wrote: true });
     const rec = readAllDoorsFrom(doc).get('d:bay');
     expect(rec?.paired && rec.dockedAt).toBe(300);
     expect(rec?.paired && rec.connectedRoomAddress).toBe(near.address);
+  });
+
+  it('fits the half on a door that never had a connection — in the same transaction', () => {
+    const doc = stationDoc();
+    doc.getMap('doors').delete('d:bay');
+    doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
+    let transactions = 0;
+    doc.on('afterTransaction', () => transactions++);
+    expect(dockAt(doc).wrote).toBe(true);
+    expect(transactions).toBe(1);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
     expect((doc.getMap('doorPolicy').get('d:bay') as { adapter?: boolean }).adapter).toBe(true);
+  });
+
+  it('never re-fits a port its owner removed — even while the old berth memory still stands', () => {
+    const doc = stationDoc();
+    // The removal's policy write has landed; its tombstone write has not (or
+    // never will — any tombstoned door without a port is closed).
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc)).toEqual({ result: { ok: false, reason: 'closed' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
   });
 
   it('refuses an occupied berth and a door that no longer exists — and writes nothing', () => {

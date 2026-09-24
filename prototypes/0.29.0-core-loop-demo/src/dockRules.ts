@@ -108,6 +108,18 @@ export function gangwayPartRefusal(hasPort: boolean): string | null {
 
 // ── Dock and undock, near side ───────────────────────────────────────────────
 
+/**
+ * A stamp for a new DOCK or UNDOCK that is causally AFTER the event it
+ * replaces (`after`: the dock being undocked, or the undock being re-docked):
+ * the local clock, or one past `after` when this clock trails the client that
+ * wrote it. Every stamp comparison (the mirror's re-dock rule, the far
+ * undock's newer-dock guard) then agrees with the order things happened in,
+ * whatever the two clients' clocks say.
+ */
+export function stampAfter(after: number | undefined, now = Date.now()): number {
+  return typeof after === 'number' && Number.isFinite(after) && after >= now ? after + 1 : now;
+}
+
 /** What an UNDOCK remembers of the berth it releases. */
 export function berthMemoryFrom(record: DoorPairing, undockedAt: number): DockBerthMemory {
   const memory: DockBerthMemory = { undockedAt };
@@ -196,23 +208,43 @@ export interface NearEnd {
 
 export type FarUndock =
   | { action: 'write'; record: DoorTombstone }
-  | { action: 'skip'; reason: 'absent' | 'already' | 'not-ours' | 'newer-dock' };
+  | {
+      action: 'skip';
+      reason: 'absent' | 'already' | 'not-ours' | 'newer-dock' | 'not-this-dock';
+    };
+
+/** Does a far record that points at our room name ANOTHER of our doors? Then
+ *  it is that other connection's end (two modules may dock more than once),
+ *  and nothing done through `nearDoorId` may touch it. An unnamed record is
+ *  taken as ours, as findFarDoor does. */
+function namesAnotherNearDoor(record: DoorPairing, nearDoorId: string): boolean {
+  return !!record.farDoor && record.farDoor !== nearDoorId;
+}
 
 /** UNDOCK's far end: tombstone the far record only while it still describes
- *  THIS dock — ours, and not a dock made after this undock (a late write from
- *  a quick undock→dock must never undo the newer dock). */
+ *  THIS dock — ours (our room AND our door), and not a dock made after this
+ *  undock (a late write from a quick undock→dock must never undo the newer
+ *  dock). `onlyDockedAt` narrows it to exactly one dock: the take-back of a
+ *  far DOCK this client wrote, which must never undo anyone else's. */
 export function farUndockPatch(
   farRecord: DoorRecord | undefined,
   near: NearEnd,
   undockedAt: number,
+  onlyDockedAt?: number,
 ): FarUndock {
   if (!farRecord) return { action: 'skip', reason: 'absent' };
   if (!farRecord.paired) return { action: 'skip', reason: 'already' };
-  if (roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId) {
+  if (
+    roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId ||
+    namesAnotherNearDoor(farRecord, near.doorId)
+  ) {
     return { action: 'skip', reason: 'not-ours' };
   }
   if (typeof farRecord.dockedAt === 'number' && farRecord.dockedAt > undockedAt) {
     return { action: 'skip', reason: 'newer-dock' };
+  }
+  if (onlyDockedAt !== undefined && farRecord.dockedAt !== onlyDockedAt) {
+    return { action: 'skip', reason: 'not-this-dock' };
   }
   return {
     action: 'write',
@@ -237,26 +269,37 @@ export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['re
 };
 
 /**
- * DOCK's far end: the berth must still exist and be free — no record, a dock
- * tombstone (anyone's), a plain tombstone for another module, or already us.
- * Paired to someone else is OCCUPIED; a plain tombstone naming US is CLOSED
- * (removing a port drops its berth memory precisely to say so).
+ * DOCK's far end: the berth must still exist and be free.
+ *  - Paired to another module, or to ANOTHER of our doors: OCCUPIED.
+ *  - A tombstone on a door that no longer wears a port: CLOSED — its port was
+ *    removed (the removal's policy write can even land before its tombstone),
+ *    and a dock must never re-fit a port someone took off. A plain tombstone
+ *    naming US is closed too: removing a port drops its berth memory
+ *    precisely to say so.
+ *  - Otherwise free: a dock tombstone (anyone's) on a port, a plain tombstone
+ *    for another module on a port, already us — or no record at all, a door
+ *    that never had a connection, which the dock brings its half to.
+ * `far.portFlag` is the far door's own doorPolicy `adapter` flag.
  */
 export function farDockPatch(
   farRecord: DoorRecord | undefined,
-  farDoorExists: boolean,
+  far: { exists: boolean; portFlag: boolean },
   near: NearEnd,
   dockedAt: number,
 ): FarDock {
-  if (!farDoorExists) return { action: 'refuse', reason: 'gone' };
-  if (farRecord?.paired && roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId) {
+  if (!far.exists) return { action: 'refuse', reason: 'gone' };
+  if (
+    farRecord?.paired &&
+    (roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId ||
+      namesAnotherNearDoor(farRecord, near.doorId))
+  ) {
     return { action: 'refuse', reason: 'occupied' };
   }
   if (
     farRecord &&
     !farRecord.paired &&
-    !farRecord.dock &&
-    roomIdFromSeed(farRecord.retiredAddress) === near.roomId
+    (!far.portFlag ||
+      (!farRecord.dock && roomIdFromSeed(farRecord.retiredAddress) === near.roomId))
   ) {
     return { action: 'refuse', reason: 'closed' };
   }

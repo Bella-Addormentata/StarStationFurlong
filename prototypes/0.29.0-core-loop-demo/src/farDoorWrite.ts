@@ -24,7 +24,7 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, writeDoorRecordTo } from './doorsDoc';
-import { fitDockPortIn } from './doorPolicy';
+import { dockPortFlagIn, fitDockPortIn } from './doorPolicy';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
   farDockPatch, farUndockPatch, findFarDoor, type NearEnd,
@@ -46,7 +46,7 @@ export function applyFarDockRequest(
   if (req.kind === 'undock') {
     const farDoor = findFarDoor(doors, near.roomId, near.doorId, req.farDoor);
     if (!farDoor) return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
-    const patch = farUndockPatch(doors.get(farDoor), near, req.undockedAt);
+    const patch = farUndockPatch(doors.get(farDoor), near, req.undockedAt, req.onlyDockedAt);
     if (patch.action === 'skip') {
       return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
     }
@@ -55,7 +55,7 @@ export function applyFarDockRequest(
   }
   const patch = farDockPatch(
     doors.get(req.farDoor),
-    doorExistsIn(doc, req.farDoor),
+    { exists: doorExistsIn(doc, req.farDoor), portFlag: dockPortFlagIn(doc, req.farDoor) },
     near,
     req.dockedAt,
   );

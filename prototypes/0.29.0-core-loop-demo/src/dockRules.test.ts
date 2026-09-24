@@ -23,7 +23,7 @@ import { mirrorSegments, partForSegment } from './stationParts';
 import {
   berthMemoryFrom, classifyDockPort, farDockPatch, farUndockPatch, findFarDoor,
   gangwayPartRefusal, isPortDoor, mirrorMayWrite, nextDockStep, redockRecord,
-  type NearEnd,
+  stampAfter, type NearEnd,
 } from './dockRules';
 
 /** A pass in the real format roomIdFromSeed parses: base64(JSON{roomId}). */
@@ -238,6 +238,25 @@ describe('dockRules — undock memory and re-dock', () => {
       farDoor: 'd:bay', farWall: 'y+', farLateral: -2, transient: true, dockedAt: 30,
     });
   });
+
+  it('stampAfter: the local clock — or one past a stamp this clock trails', () => {
+    expect(stampAfter(undefined, 500)).toBe(500);
+    expect(stampAfter(100, 500)).toBe(500);
+    expect(stampAfter(900, 500)).toBe(901); // this client's clock trails the other's
+    expect(stampAfter(500, 500)).toBe(501); // equal is not after
+    expect(stampAfter(Number.NaN, 500)).toBe(500);
+  });
+
+  it('an UNDOCK stamped by a trailing clock still releases the far end, and bars the mirror', () => {
+    const dock = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, dockedAt: 900 });
+    const undockedAt = stampAfter(dock.dockedAt, 500); // this clock reads 500
+    expect(farUndockPatch(dock, near, undockedAt).action).toBe('write'); // not "newer-dock"
+    // …and the released dock's own stamp can no longer re-dock through the mirror.
+    const t = buildDoorTombstone(seedFor(SHIP), { undockedAt });
+    expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: 900 })).toBe(false);
+    // A DOCK after it, stamped by the same trailing clock, still re-docks.
+    expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: stampAfter(undockedAt, 500) })).toBe(true);
+  });
 });
 
 describe('dockRules — the transit mirror', () => {
@@ -302,18 +321,52 @@ describe('dockRules — the far end', () => {
     expect(farUndockPatch(newer, near, 20)).toEqual({ action: 'skip', reason: 'newer-dock' });
   });
 
+  it('UNDOCK leaves the OTHER connection between the same two modules alone', () => {
+    // Two docks between the ship and the station: this far record names
+    // another of the ship's doors — a delayed UNDOCK of ours must not touch it.
+    const other = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: 'd:shipport2', dockedAt: 10 });
+    expect(farUndockPatch(other, near, 20)).toEqual({ action: 'skip', reason: 'not-ours' });
+    const named = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, dockedAt: 10 });
+    expect(farUndockPatch(named, near, 20).action).toBe('write');
+  });
+
+  it('a take-back (onlyDockedAt) undoes exactly our own far dock, never anyone else\'s', () => {
+    const mine = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, dockedAt: 40 });
+    expect(farUndockPatch(mine, near, 41, 40).action).toBe('write');
+    const theirs = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, dockedAt: 35 });
+    expect(farUndockPatch(theirs, near, 41, 40)).toEqual({ action: 'skip', reason: 'not-this-dock' });
+  });
+
+  const port = { exists: true, portFlag: true };
+  const occupied = { action: 'refuse', reason: 'occupied' };
+  const closed = { action: 'refuse', reason: 'closed' };
+
   it('DOCK writes a free or remembered berth, refuses occupied, closed and gone ones', () => {
     const want = {
       paired: true, connectedRoomAddress: near.address, segments: dockChain(), farDoor: near.doorId,
       farWall: near.wall, farLateral: near.lateral, transient: true, dockedAt: 40,
     };
-    expect(farDockPatch(undefined, true, near, 40)).toEqual({ action: 'write', record: want });
-    expect(farDockPatch(buildDoorTombstone(seedFor(SHIP), { undockedAt: 5 }), true, near, 40)).toEqual({ action: 'write', record: want });
-    expect(farDockPatch(buildDoorTombstone(seedFor('someone'), { undockedAt: 5 }), true, near, 40).action).toBe('write');
-    expect(farDockPatch(buildDoorTombstone(seedFor('someone')), true, near, 40).action).toBe('write');
-    expect(farDockPatch(buildDoorPairing(seedFor(SHIP)), true, near, 40).action).toBe('write'); // already us
-    expect(farDockPatch(buildDoorPairing(seedFor('someone')), true, near, 40)).toEqual({ action: 'refuse', reason: 'occupied' });
-    expect(farDockPatch(buildDoorTombstone(seedFor(SHIP)), true, near, 40)).toEqual({ action: 'refuse', reason: 'closed' });
-    expect(farDockPatch(undefined, false, near, 40)).toEqual({ action: 'refuse', reason: 'gone' });
+    expect(farDockPatch(undefined, port, near, 40)).toEqual({ action: 'write', record: want });
+    expect(farDockPatch(buildDoorTombstone(seedFor(SHIP), { undockedAt: 5 }), port, near, 40)).toEqual({ action: 'write', record: want });
+    expect(farDockPatch(buildDoorTombstone(seedFor('someone'), { undockedAt: 5 }), port, near, 40).action).toBe('write');
+    expect(farDockPatch(buildDoorTombstone(seedFor('someone')), port, near, 40).action).toBe('write');
+    expect(farDockPatch(buildDoorPairing(seedFor(SHIP)), port, near, 40).action).toBe('write'); // already us
+    expect(farDockPatch(buildDoorPairing(seedFor(SHIP), { farDoor: near.doorId }), port, near, 40).action).toBe('write');
+    expect(farDockPatch(buildDoorPairing(seedFor('someone')), port, near, 40)).toEqual(occupied);
+    // Paired to our room, but through ANOTHER of our doors: that connection's berth.
+    expect(farDockPatch(buildDoorPairing(seedFor(SHIP), { farDoor: 'd:shipport2' }), port, near, 40)).toEqual(occupied);
+    expect(farDockPatch(buildDoorTombstone(seedFor(SHIP)), port, near, 40)).toEqual(closed);
+    expect(farDockPatch(undefined, { exists: false, portFlag: true }, near, 40)).toEqual({ action: 'refuse', reason: 'gone' });
+  });
+
+  it('DOCK never re-fits a port someone removed — even mid-removal', () => {
+    const noPort = { exists: true, portFlag: false };
+    // The removal's policy write landed first; the old berth memory still stands.
+    expect(farDockPatch(buildDoorTombstone(seedFor(SHIP), { undockedAt: 5 }), noPort, near, 40)).toEqual(closed);
+    // Any door that has had a connection and wears no port is not a berth.
+    expect(farDockPatch(buildDoorTombstone(seedFor('someone'), { undockedAt: 5 }), noPort, near, 40)).toEqual(closed);
+    expect(farDockPatch(buildDoorTombstone(seedFor('someone')), noPort, near, 40)).toEqual(closed);
+    // A door that never had a connection takes the half the dock brings.
+    expect(farDockPatch(undefined, noPort, near, 40).action).toBe('write');
   });
 });

@@ -76,18 +76,27 @@ Architecture facts that bind the design:
    ship brings its own half).
 3. **UNDOCK leaves a tombstone with memory, never a plain delete** — so the lazy mirror cannot quietly
    re-pair it. A re-dock overrides a dock tombstone only when it is *newer*
-   (`dockedAt > undockedAt`); an older record walking in is a stale berth and is refused.
-4. **Both ends, best effort.** DOCK/UNDOCK write the near record at once, then open a short
-   background session to the far room and write its end — compare-and-swap: only if the far record
-   still describes *this* connection (UNDOCK), or the berth is free/ours (DOCK). An occupied or closed
-   berth refuses the DOCK and the near write is rolled back. Unreachable → the near side stands, and
-   the far side heals on the next walk-through (re-dock rule) or by its own UNDOCK.
+   (`dockedAt > undockedAt`); an older record walking in is a stale berth and is refused. Every stamp
+   is *causal* (`stampAfter`): the local clock, or one past the stamp it replaces when this client's
+   clock trails the one that wrote it — so clock skew can never make an undock look older than its
+   dock, or a re-dock older than its undock.
+4. **Both ends, best effort.** UNDOCK writes the near tombstone at once, then opens a short
+   background session to the far room and writes its end. DOCK asks the far berth *first* (so a
+   refused dock never flickers into existence), then writes the near side — only over the very
+   tombstone it read; if a peer changed the port meanwhile, the far write is taken back (an undock
+   that undoes only the dock carrying our stamp). Every far write is compare-and-swap: only if the far
+   record still describes *this* connection — our room **and our door**; a record naming another of
+   our doors is that other connection's end (UNDOCK), or the berth is free/ours (DOCK). Unreachable →
+   the near side stands, and the far side heals on the next walk-through (re-dock rule) or by its
+   own UNDOCK.
 5. **Who may dock/undock:** whoever may *build* at that door (`canConstruct`: the owner, a venture
    shareholder, or a door whose construction policy is public/granted) — on the panel and at the helm
    alike (the helm operates a specific port door, so it asks that door). Legacy transient berths
    without a dock chain keep today's everyone-`⏏ DETACH`.
 6. **Removing a port closes the berth**: allowed only while undocked; it rewrites a dock tombstone as
-   a plain one (memory dropped), so no one can re-dock into a door that no longer has a port.
+   a plain one (memory dropped) in the same transaction as the policy flag, and a far DOCK refuses
+   any tombstoned door without a port — so no one can re-dock into, or re-fit, a port its owner took
+   off.
 
 ## 4. Rendering — round, recognisable, one representation
 
@@ -133,16 +142,20 @@ Architecture facts that bind the design:
 
 ## 7. Two-sided writes — `farDoorWrite.ts`
 
-`writeFarDoor(seed, plan)` — the roomPasses prefetch pattern: its own `NetworkProvider` + `YjsSync`
+`writeFarDock(request, near)` — the roomPasses prefetch pattern: its own `NetworkProvider` + `YjsSync`
 on the local node → wait until the far replica is populated (read-before-write, so the write is
-causally after the record it replaces and wins) → one `transact` → `YjsSync.flush()` (new: awaits the
-signed sends in flight — `stop()` alone can drop them) → short grace → teardown. Serialized per far
-room; bounded by a timeout. The decisions are pure (`dockRules.ts`, unit-tested):
+causally after the record it replaces and wins) → one `transact` → `YjsSync.confirmOwnWrites()` (new:
+flushes the signed sends in flight — `stop()` alone can drop them — then a SyncStep1 with the
+pre-write state vector; the node's answer holds our structs only once it applied them) → teardown.
+Serialized per far room; bounded by timeouts. The decisions are pure (`dockRules.ts`, unit-tested):
 
-- **UNDOCK far patch:** the far door's record is paired to us (and not a newer dock) → dock tombstone
-  naming us, with our door as its memory.
-- **DOCK far patch:** far door exists; its record is absent / a dock tombstone / paired to us →
-  dock pairing to us (+ its port); paired elsewhere → *occupied*; plain tombstone → *closed*.
+- **UNDOCK far patch:** the far door's record is paired to us — our room, and our door or none named
+  — and is not a newer dock (a take-back also requires our exact stamp) → dock tombstone naming us,
+  with our door as its memory.
+- **DOCK far patch:** far door exists; its record is absent / a tombstone on a port / paired to us
+  through this door → dock pairing to us (+ its port when the door never had a connection); paired
+  elsewhere, or to another of our doors → *occupied*; a plain tombstone naming us, or any tombstone
+  on a door without a port → *closed*.
 
 Our own address for the far record: pass → minted-module ledger → mint (the transit's ladder,
 factored out).

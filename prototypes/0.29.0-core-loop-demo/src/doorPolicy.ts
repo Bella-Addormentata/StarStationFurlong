@@ -142,6 +142,14 @@ function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
   };
 }
 
+/** ⚓ #163: does this door of ANY doc wear a docking-adapter port? (The far
+ *  room's end of a DOCK reads it — dockRules.farDockPatch refuses a berth
+ *  whose port was removed.) Sanitized exactly like readDoorPolicy. */
+export function dockPortFlagIn(doc: Y.Doc, doorId: string): boolean {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return false;
+  return sanitizePolicy(doc.getMap('doorPolicy').get(doorId)).adapter === true;
+}
+
 /**
  * ⚓ #163: fit a docking-adapter PORT on a door of ANY doc — the far room's
  * end of a DOCK (farDoorWrite.ts holds that doc for a moment; it is not the
