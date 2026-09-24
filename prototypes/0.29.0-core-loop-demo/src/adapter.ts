@@ -836,11 +836,15 @@ export function buildDockHalf(opts: {
     boxInto(group, 0.12, 0.025, L - 0.1, glowMat, side * 0.55, 0.095, L / 2, "vestibuleGlow");
   }
 
-  // Soft-capture ring + six black capture latches at the mating face.
+  // Soft-capture ring + six black capture latches at the mating face. The
+  // ring sits one tube radius inside its OWN half, so two mated halves' rings
+  // meet face to face at the mating plane — centred on it, they were two
+  // identical tori in one place (depth fighting; doubled under a fade).
   const ring = add(
     new THREE.Mesh(new THREE.TorusGeometry(DOCK_R_OUT, DOCK_RING_TUBE, 10, 40), mats.soft),
+    "dockCaptureRing",
   );
-  ring.position.set(0, DOCK_CY, zMate);
+  ring.position.set(0, DOCK_CY, zMate - outward * DOCK_RING_TUBE);
   const phase = opts.latchPhase ?? 0;
   for (let i = 0; i < 6; i++) {
     const a = phase + (i / 6) * Math.PI * 2 + Math.PI / 6;

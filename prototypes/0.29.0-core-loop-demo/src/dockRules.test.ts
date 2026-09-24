@@ -132,6 +132,31 @@ describe('dock segment — the round tunnel', () => {
     }
   });
 
+  it('the two capture rings meet face to face at the mating plane — never one on top of the other', () => {
+    // Chain-local z of each capture ring's centre (rings sit in their half,
+    // halves sit in the tunnel), and the ring's tube radius.
+    const rings = (g: THREE.Group) => {
+      const out: { z: number; tube: number }[] = [];
+      g.traverse((o) => {
+        if (o.name !== 'dockCaptureRing') return;
+        out.push({
+          z: (o.parent?.position.z ?? 0) + o.position.z,
+          tube: ((o as THREE.Mesh).geometry as THREE.TorusGeometry).parameters.tube,
+        });
+      });
+      return out.sort((a, b) => a.z - b.z);
+    };
+    const plane = CHAIN_PORTAL_MARGIN + DOCK_HALF_LEN; // where the two halves meet
+    const [near, far] = rings(buildConnectorChain('d:a', dockChain(), at));
+    // Each ring lies inside its own half, one tube radius from the plane, so
+    // the two surfaces touch there instead of coinciding (depth fighting).
+    expect(near.z).toBeCloseTo(plane - near.tube, 9);
+    expect(far.z).toBeCloseTo(plane + far.tube, 9);
+    // A lone port's ring sits the same way, behind its hatch.
+    const [lone] = rings(buildDockPortStub('d:a', at));
+    expect(lone.z).toBeCloseTo(plane - lone.tube, 9);
+  });
+
   it('a gangway chain still builds with its portals', () => {
     const g = buildConnectorChain('d:a', [{ kind: 'ext', bays: 4, skin: 'solid' }], at);
     expect(g.userData.isDockAdapter).toBeUndefined();
