@@ -11,6 +11,9 @@
  *   • a chip landing on a full lower stack overflows to the front (spill)
  *   • only chips off the LAST platform pay out (never off the upper front)
  *   • only the owner can empty the machine
+ *   • one chip per drop, and the machine comes to rest after every drop
+ *   • drop timing keeps the player's phase only inside the window
+ *   • the sweep anchor never moves, so every client draws the same pusher
  *   • conservation `inserted = inMachine + paid + emptied` holds through
  *     hundreds of randomised operations
  *
@@ -23,7 +26,6 @@ import {
   advanceSim,
   chipsInMachine,
   CHIP_R,
-  claimPendingCredit,
   computeConservation,
   currentPusherPhase,
   emptyMachine,
@@ -32,19 +34,24 @@ import {
   initialCoinPusherState,
   insertOnPlatform,
   isCoinPusherState,
-  isPusherEscrow,
+  isPusherEmptyRequest,
   isPusherInsertRequest,
+  MACHINE_MAX_CHIPS,
+  MAX_DROP_LAG_MS,
+  MAX_DROP_LEAD_MS,
   MAX_STACK_HEIGHT,
+  normalizeCoinPusherState,
   PEG_ROWS,
   PILE_STEP,
   PLAT_LOW_BACK,
   PLAT_UP_FRONT,
   processInsert,
-  PUSHER_MAX_ANTE,
+  PUSHER_ANTE,
   PUSHER_MAX_X,
   PUSHER_MIN_X,
   PUSHER_PERIOD_MS,
   pusherFaceX,
+  resolveDropTiming,
   SETTLE_MS,
   settlePiles,
   simulatePeg,
@@ -94,7 +101,25 @@ function assertConserved(state: CoinPusherState, label = 'invariant') {
   const c = computeConservation(state);
   expect(c.balanced, `${label}: ${JSON.stringify(c)}`).toBe(true);
   expect(c.chipsInMachine).toBeGreaterThanOrEqual(0);
-  expect(c.pendingCredit).toBeGreaterThanOrEqual(0);
+}
+
+/** A tiny deterministic PRNG for randomised runs (no Math.random). */
+function lcg(seed: number): () => number {
+  let x = seed >>> 0;
+  return () => {
+    x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+    return x / 2 ** 32;
+  };
+}
+
+/** Drop `n` chips with varied holes / phases / seeds; returns the machine. */
+function fill(n: number, player = PLAYER1, seed = 7, s0 = initialCoinPusherState(OWNER, 0)): CoinPusherState {
+  const rand = lcg(seed);
+  let s = s0;
+  for (let i = 0; i < n; i++) {
+    s = processInsert(s, player, Math.floor(rand() * 3) as PusherHole, rand() * 0.999, (rand() * 2 ** 32) >>> 0).state;
+  }
+  return s;
 }
 
 // ── Guards ───────────────────────────────────────────────────────────────────
@@ -152,11 +177,37 @@ describe('shape guards', () => {
     expect(isCoinPusherState(bad)).toBe(false);
   });
 
-  it('rejects hostile pending-credit with bad keys / values', () => {
+  it('rejects a state holding more chips than the cabinet can (aggregate cap)', () => {
+    // Every pile and platform is within its own limit, but the total is not:
+    // 2 platforms × 24 piles × 8 chips = 384 > MACHINE_MAX_CHIPS.
+    const next = { id: 1 };
+    const platform = (): Pile[] => Array.from({ length: 24 }, (_, i) => pileN(i * 0.05, 8, next));
+    const bad: CoinPusherState = { ...initialCoinPusherState(OWNER), upper: platform(), lower: platform() };
+    expect(isCoinPusherState(bad)).toBe(false);
+    // …while a state at exactly the cap is accepted.
+    const n2 = { id: 1 };
+    const atCap: CoinPusherState = {
+      ...initialCoinPusherState(OWNER),
+      upper: Array.from({ length: 16 }, (_, i) => pileN(i * 0.06, 8, n2)),
+      totalInserted: MACHINE_MAX_CHIPS,
+    };
+    expect(chipsInMachine(atCap)).toBe(MACHINE_MAX_CHIPS);
+    expect(isCoinPusherState(atCap)).toBe(true);
+  });
+
+  it('checks lastDrop / lastRefusal when present', () => {
     const s = initialCoinPusherState(OWNER);
-    expect(isCoinPusherState({ ...s, pendingCredit: { '': 3 } })).toBe(false);
-    expect(isCoinPusherState({ ...s, pendingCredit: { p: -3 } })).toBe(false);
-    expect(isCoinPusherState({ ...s, pendingCredit: { p: 'nope' as never } })).toBe(false);
+    const drop = {
+      requestId: 'r1', player: PLAYER1, hole: 1, chipId: 1, landedX: 0.3,
+      paid: 0, phase: 0.25, honored: true, atMs: 5,
+    };
+    expect(isCoinPusherState({ ...s, lastDrop: drop })).toBe(true);
+    expect(isCoinPusherState({ ...s, lastDrop: { ...drop, phase: 1 } })).toBe(false);
+    expect(isCoinPusherState({ ...s, lastDrop: { ...drop, honored: 'yes' } })).toBe(false);
+    expect(isCoinPusherState({ ...s, lastDrop: { ...drop, paid: MACHINE_MAX_CHIPS + 1 } })).toBe(false);
+    const refusal = { requestId: 'r2', player: PLAYER1, reason: 'no-chips', atMs: 5 };
+    expect(isCoinPusherState({ ...s, lastRefusal: refusal })).toBe(true);
+    expect(isCoinPusherState({ ...s, lastRefusal: { ...refusal, reason: 'bored' } })).toBe(false);
   });
 
   it('accepts a plausibly-large legitimate state (round-trip after JSON)', () => {
@@ -168,23 +219,39 @@ describe('shape guards', () => {
     expect(isCoinPusherState(JSON.parse(JSON.stringify(populated)))).toBe(true);
   });
 
-  it('insert-request and escrow guards reject junk', () => {
+  it('insert-request and door-request guards reject junk', () => {
+    const ok = { requestId: 'r1', player: PLAYER1, hole: 1, phase: 0.5, requestedAt: 0 };
+    expect(isPusherInsertRequest(ok)).toBe(true);
     expect(isPusherInsertRequest(null)).toBe(false);
-    expect(isPusherInsertRequest({
-      requestId: 'r1', player: PLAYER1, hole: 3 as never, timing: 0.5, ante: 1, requestedAt: 0,
-    })).toBe(false);
-    expect(isPusherInsertRequest({
-      requestId: 'r1', player: PLAYER1, hole: 1, timing: 0.5, ante: PUSHER_MAX_ANTE + 1, requestedAt: 0,
-    })).toBe(false);
-    expect(isPusherInsertRequest({
-      requestId: 'r1', player: PLAYER1, hole: 1, timing: 0.5, ante: 1, requestedAt: 0,
-    })).toBe(true);
-    expect(isPusherEscrow({
-      requestId: 'r1', player: PLAYER1, ante: 1, escrowedAt: 0,
-    })).toBe(true);
-    expect(isPusherEscrow({
-      requestId: 'r1', player: PLAYER1, ante: 0, escrowedAt: 0,
-    })).toBe(false);
+    expect(isPusherInsertRequest({ ...ok, hole: 3 })).toBe(false);
+    expect(isPusherInsertRequest({ ...ok, phase: 1 })).toBe(false);
+    expect(isPusherInsertRequest({ ...ok, phase: -0.1 })).toBe(false);
+    expect(isPusherInsertRequest({ ...ok, player: '' })).toBe(false);
+    expect(isPusherInsertRequest({ ...ok, requestedAt: Number.NaN })).toBe(false);
+    const door = { requestId: 'd1', requester: OWNER, requestedAt: 0 };
+    expect(isPusherEmptyRequest(door)).toBe(true);
+    expect(isPusherEmptyRequest({ ...door, requester: '' })).toBe(false);
+    expect(isPusherEmptyRequest({ ...door, requestedAt: 'now' })).toBe(false);
+  });
+});
+
+describe('normalizeCoinPusherState', () => {
+  it('drops fields an older revision or a peer added, and copies the piles', () => {
+    const s = fill(20);
+    const withJunk = { ...s, pendingCredit: { [PLAYER1]: 5 }, extra: 'x' } as unknown;
+    const n = normalizeCoinPusherState(withJunk)!;
+    expect(n).not.toBeNull();
+    expect('pendingCredit' in n).toBe(false);
+    expect('extra' in n).toBe(false);
+    expect(n.upper).toEqual(s.upper);
+    expect(n.upper).not.toBe(s.upper);
+    expect(n.lastDrop).toBeUndefined();
+    expect(isCoinPusherState(n)).toBe(true);
+  });
+
+  it('returns null for a state the guard rejects', () => {
+    expect(normalizeCoinPusherState({ ...initialCoinPusherState(OWNER), tick: -1 })).toBeNull();
+    expect(normalizeCoinPusherState('junk')).toBeNull();
   });
 });
 
@@ -260,6 +327,14 @@ describe('currentPusherPhase', () => {
       expect(p).toBeGreaterThanOrEqual(0);
       expect(p).toBeLessThan(1);
     }
+  });
+
+  it('is one line through the anchor in both directions (a clock behind the anchor still gets its phase)', () => {
+    const s = { ...initialCoinPusherState(OWNER, 10_000), pusherPhase: 0.25 };
+    expect(currentPusherPhase(s, 10_000)).toBeCloseTo(0.25, 12);
+    expect(currentPusherPhase(s, 10_000 + PUSHER_PERIOD_MS / 4)).toBeCloseTo(0.5, 12);
+    expect(currentPusherPhase(s, 10_000 - PUSHER_PERIOD_MS / 4)).toBeCloseTo(0, 12);
+    expect(currentPusherPhase(s, 10_000 - PUSHER_PERIOD_MS / 2)).toBeCloseTo(0.75, 12);
   });
 });
 
@@ -561,6 +636,17 @@ describe('stepMachine', () => {
     assertConserved(r.state, 'after lower payout');
   });
 
+  it('pushes to the furthest reach within a substep, even between its end points', () => {
+    // A substep straddling full extension (phase ½) without landing on it:
+    // both end points fall short of PUSHER_MAX_X, the sweep in between does not.
+    const x0 = PUSHER_MAX_X + CHIP_R - 0.0005;
+    const s = buildState((next) => [pileN(x0, 1, next)], () => [], { pusherPhase: 0.49 });
+    const r = stepMachine(s, PUSHER_PERIOD_MS * 0.02); // phase 0.49 → 0.51
+    expect(pusherFaceX(0.49)).toBeLessThan(PUSHER_MAX_X);
+    expect(pusherFaceX(0.51)).toBeLessThan(PUSHER_MAX_X);
+    expect(r.state.upper[0].x).toBeCloseTo(PUSHER_MAX_X + CHIP_R, 12);
+  });
+
   it('never overlaps two piles horizontally after a step', () => {
     const s = buildState(
       (next) => [
@@ -584,123 +670,160 @@ describe('stepMachine', () => {
 // ── advanceSim ───────────────────────────────────────────────────────────────
 
 describe('advanceSim', () => {
-  it('attributes payouts to payoutTo (pendingCredit)', () => {
+  it('counts every chip that falls off the lower front in totalPaid', () => {
     const s = buildState(
       (next) => [pileN(PLAT_UP_FRONT + 0.005, 3, next)],
       (next) => {
         const piles: Pile[] = [];
         const start = PLAT_LOW_BACK + CHIP_R;
-        for (let i = 0; i < 10; i++) {
-          piles.push(pileN(start + i * PILE_STEP, 1, next));
-        }
+        for (let i = 0; i < 10; i++) piles.push(pileN(start + i * PILE_STEP, 1, next));
         return piles;
       },
     );
-    const r = advanceSim(s, 500, PLAYER1);
-    expect(r.state.pendingCredit[PLAYER1]).toBeGreaterThan(0);
-    assertConserved(r.state, 'advanceSim credit');
+    const r = advanceSim(s, 500);
+    expect(r.paidChipIds.length).toBeGreaterThan(0);
+    expect(r.state.totalPaid).toBe(r.paidChipIds.length);
+    assertConserved(r.state, 'advanceSim');
   });
 
   it('no-ops on zero / NaN elapsed', () => {
     const s = initialCoinPusherState(OWNER, 0);
-    expect(advanceSim(s, 0, PLAYER1).state).toBe(s);
-    expect(advanceSim(s, Number.NaN, PLAYER1).state).toBe(s);
+    expect(advanceSim(s, 0).state).toBe(s);
+    expect(advanceSim(s, Number.NaN).state).toBe(s);
+  });
+});
+
+// ── resolveDropTiming ────────────────────────────────────────────────────────
+
+describe('resolveDropTiming', () => {
+  const s = initialCoinPusherState(OWNER, 0); // phase 0 at t=0
+  const phaseAt = (ms: number) => currentPusherPhase(s, ms);
+
+  it('keeps the phase the player saw when it arrives inside the lag window', () => {
+    const seen = phaseAt(10_000);
+    const r = resolveDropTiming(s, seen, 10_000 + MAX_DROP_LAG_MS - 1);
+    expect(r.honored).toBe(true);
+    expect(r.dropPhase).toBe(seen);
+    expect(r.lagMs).toBeCloseTo(MAX_DROP_LAG_MS - 1, 6);
   });
 
-  it('leaves pendingCredit empty when payoutTo is null (still counts totalPaid)', () => {
-    const s = buildState(
-      (next) => [pileN(PLAT_UP_FRONT + 0.005, 3, next)],
-      (next) => {
-        const piles: Pile[] = [];
-        const start = PLAT_LOW_BACK + CHIP_R;
-        for (let i = 0; i < 10; i++) {
-          piles.push(pileN(start + i * PILE_STEP, 1, next));
-        }
-        return piles;
-      },
-    );
-    const r = advanceSim(s, 500, null);
-    expect(Object.keys(r.state.pendingCredit)).toHaveLength(0);
-    expect(r.state.totalPaid).toBeGreaterThan(0);
-    assertConserved(r.state, 'advanceSim null payoutTo');
+  it('keeps a phase slightly ahead of the operator (a player clock running fast)', () => {
+    const r = resolveDropTiming(s, phaseAt(10_000 + MAX_DROP_LEAD_MS - 1), 10_000);
+    expect(r.honored).toBe(true);
+    expect(r.lagMs).toBeCloseTo(-(MAX_DROP_LEAD_MS - 1), 6);
+  });
+
+  it('drops a stale or far-ahead claim at the operator\'s current phase', () => {
+    for (const claimedAt of [10_000 - MAX_DROP_LAG_MS - 50, 10_000 + MAX_DROP_LEAD_MS + 50]) {
+      const r = resolveDropTiming(s, phaseAt(claimedAt), 10_000);
+      expect(r.honored).toBe(false);
+      expect(r.dropPhase).toBeCloseTo(phaseAt(10_000), 12);
+    }
+  });
+
+  it('measures the lag across the end of a cycle', () => {
+    // Claimed just before the wrap (0.98), received just after it (0.02).
+    const t0 = PUSHER_PERIOD_MS * 0.98;
+    const r = resolveDropTiming(s, phaseAt(t0), PUSHER_PERIOD_MS * 1.02);
+    expect(r.honored).toBe(true);
+    expect(r.lagMs).toBeCloseTo(PUSHER_PERIOD_MS * 0.04, 6);
+  });
+
+  it('never honours junk (out-of-range phase, NaN time)', () => {
+    expect(resolveDropTiming(s, 1, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, -0.2, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, Number.NaN, 5_000).honored).toBe(false);
+    expect(resolveDropTiming(s, 0.5, Number.NaN).honored).toBe(false);
+  });
+
+  it('the window is under half a cycle each way, so a claim is never ambiguous', () => {
+    expect(MAX_DROP_LAG_MS).toBeLessThan(PUSHER_PERIOD_MS / 2);
+    expect(MAX_DROP_LEAD_MS).toBeLessThan(PUSHER_PERIOD_MS / 2);
   });
 });
 
 // ── processInsert ────────────────────────────────────────────────────────────
 
 describe('processInsert', () => {
-  it('adds one chip to the upper platform and bumps totalInserted', () => {
-    const s0 = initialCoinPusherState(OWNER, 0);
-    const r = processInsert(s0, PLAYER1, 1, 0.5, 1, 42, 0);
-    expect(r.state.totalInserted).toBe(1);
-    // Chip ended up either in machine, paid out, or (impossible here) emptied.
-    const total = chipsInMachine(r.state) + r.state.totalPaid + r.state.totalEmptied;
-    expect(total).toBe(1);
-    assertConserved(r.state, 'processInsert first');
+  it('drops exactly one chip: one new id, totalInserted and nextChipId +1', () => {
+    const s0 = fill(30);
+    const r = processInsert(s0, PLAYER1, 1, 0.5, 42);
+    expect(PUSHER_ANTE).toBe(1);
+    expect(r.chipId).toBe(s0.nextChipId);
+    expect(r.state.nextChipId).toBe(s0.nextChipId + 1);
+    expect(r.state.totalInserted).toBe(s0.totalInserted + 1);
+    expect(r.paid).toBe(r.paidChipIds.length);
+    expect(r.state.totalPaid).toBe(s0.totalPaid + r.paid);
+    const ids = [...r.state.upper, ...r.state.lower].flatMap((p) => p.chipIds).concat(r.paidChipIds);
+    expect(new Set(ids).size).toBe(ids.length); // no duplicates
+    expect(ids).toContain(r.chipId);
+    assertConserved(r.state, 'one chip');
   });
 
-  it('rejects out-of-range ante', () => {
+  it('rejects a bad player id, hole or phase', () => {
     const s0 = initialCoinPusherState(OWNER, 0);
-    expect(() => processInsert(s0, PLAYER1, 1, 0.5, 0, 42, 0)).toThrow(RangeError);
-    expect(() => processInsert(s0, PLAYER1, 1, 0.5, PUSHER_MAX_ANTE + 1, 42, 0)).toThrow(RangeError);
-    expect(() => processInsert(s0, PLAYER1, 1, 0.5, 1.5, 42, 0)).toThrow(RangeError);
+    expect(() => processInsert(s0, '', 1, 0.5, 42)).toThrow(RangeError);
+    expect(() => processInsert(s0, 'x'.repeat(200), 1, 0.5, 42)).toThrow(RangeError);
+    expect(() => processInsert(s0, PLAYER1, 3 as PusherHole, 0.5, 42)).toThrow(RangeError);
+    expect(() => processInsert(s0, PLAYER1, 1, 1, 42)).toThrow(RangeError);
+    expect(() => processInsert(s0, PLAYER1, 1, Number.NaN, 42)).toThrow(RangeError);
   });
 
-  it('rejects bad playerId', () => {
-    const s0 = initialCoinPusherState(OWNER, 0);
-    expect(() => processInsert(s0, '', 1, 0.5, 1, 42, 0)).toThrow(RangeError);
-    expect(() => processInsert(s0, 'x'.repeat(200), 1, 0.5, 1, 42, 0)).toThrow(RangeError);
+  it('refuses a drop into a full machine', () => {
+    const n = { id: 1 };
+    const full: CoinPusherState = {
+      ...initialCoinPusherState(OWNER),
+      upper: Array.from({ length: 16 }, (_, i) => pileN(i * 0.06, 8, n)),
+      nextChipId: n.id,
+      totalInserted: MACHINE_MAX_CHIPS,
+    };
+    expect(() => processInsert(full, PLAYER1, 1, 0.5, 42)).toThrow(/full/);
   });
 
-  it('same seed + timing + hole produces same trajectory', () => {
-    const s0 = initialCoinPusherState(OWNER, 0);
-    const a = processInsert(s0, PLAYER1, 0, 0.3, 1, 777, 0);
-    const b = processInsert(s0, PLAYER1, 0, 0.3, 1, 777, 0);
+  it('same seed + phase + hole produces the same result', () => {
+    const s0 = fill(25);
+    const a = processInsert(s0, PLAYER1, 0, 0.3, 777);
+    const b = processInsert(s0, PLAYER1, 0, 0.3, 777);
     expect(a.landedX).toBe(b.landedX);
-    // Same state (chips landing at same spot; deterministic settle).
-    expect(JSON.stringify(a.state.upper)).toBe(JSON.stringify(b.state.upper));
+    expect(a.state).toEqual(b.state);
   });
 
-  it('cascades and pays out over many inserts (a full run must produce SOME payout)', () => {
-    // Repeatedly insert with varied hole+timing — eventually the pusher
-    // shoves piles off the upper front, they cascade onto lower, lower
-    // overflows to payouts.
-    let s = initialCoinPusherState(OWNER, 0);
-    for (let i = 0; i < 200; i++) {
-      const hole = ((i % 3) as PusherHole);
-      const t = (i * 0.017) % 1;
-      const r = processInsert(s, PLAYER1, hole, t, 1, 4242 + i, i * 100);
-      s = r.state;
-      assertConserved(s, `insert ${i}`);
+  it('never moves the sweep anchor, so the pusher every client draws never jumps', () => {
+    let s = { ...initialCoinPusherState(OWNER, 1234), pusherPhase: 0.4 };
+    const rand = lcg(3);
+    for (let i = 0; i < 50; i++) {
+      s = processInsert(s, PLAYER1, (i % 3) as PusherHole, rand() * 0.999, i).state;
+      expect(s.pusherPhase).toBe(0.4);
+      expect(s.pusherAtMs).toBe(1234);
     }
-    expect(s.totalInserted).toBe(200);
-    expect(s.totalPaid).toBeGreaterThan(0);
-    expect(s.pendingCredit[PLAYER1] ?? 0).toBeGreaterThan(0);
   });
 
-  it('credits payouts only to the current inserter (not to earlier depositors)', () => {
-    // PLAYER1 fills the machine, PLAYER2 triggers cascade. Payouts on
-    // PLAYER2's insert accrue to PLAYER2 alone.
+  it('leaves the machine at rest: another full cycle moves and pays nothing', () => {
+    const rand = lcg(11);
     let s = initialCoinPusherState(OWNER, 0);
-    for (let i = 0; i < 100; i++) {
-      s = processInsert(s, PLAYER1, ((i % 3) as PusherHole), (i * 0.19) % 1, 1, 1000 + i, i * 50).state;
+    for (let i = 0; i < 120; i++) {
+      s = processInsert(s, PLAYER1, Math.floor(rand() * 3) as PusherHole, rand() * 0.999, i * 97).state;
+      const idle = advanceSim(s, SETTLE_MS);
+      expect(idle.paidChipIds, `drop ${i}`).toEqual([]);
+      expect(idle.state.upper, `drop ${i}`).toEqual(s.upper);
+      expect(idle.state.lower, `drop ${i}`).toEqual(s.lower);
     }
-    const paidToP1Before = s.pendingCredit[PLAYER1] ?? 0;
-    const paidToP2Before = s.pendingCredit[PLAYER2] ?? 0;
-    // Now flood with P2 inserts.
-    let paidP2 = 0;
-    for (let i = 0; i < 40; i++) {
-      const r = processInsert(s, PLAYER2, ((i % 3) as PusherHole), (i * 0.23) % 1, 1, 5000 + i, (100 + i) * 50);
-      paidP2 += r.paidChipIds.length;
-      s = r.state;
+  });
+
+  it('pays out over a long run, and the machine settles far below its cap', () => {
+    const rand = lcg(99);
+    let s = initialCoinPusherState(OWNER, 0);
+    let most = 0;
+    for (let i = 0; i < 2000; i++) {
+      s = processInsert(s, PLAYER1, Math.floor(rand() * 3) as PusherHole, rand() * 0.999, (rand() * 2 ** 32) >>> 0).state;
+      most = Math.max(most, chipsInMachine(s));
     }
-    if (paidP2 > 0) {
-      // Any payout across P2's inserts must accumulate in P2's ledger,
-      // not P1's — P1's balance is unchanged by P2's cycles.
-      expect(s.pendingCredit[PLAYER2] ?? 0).toBeGreaterThan(paidToP2Before);
-      expect(s.pendingCredit[PLAYER1] ?? 0).toBe(paidToP1Before);
-    }
-    assertConserved(s, 'mixed players');
+    expect(s.totalInserted).toBe(2000);
+    expect(s.totalPaid).toBeGreaterThan(1500);
+    // The pile reaches a steady state (~40 chips); the cap is headroom, not a
+    // limit honest play runs into.
+    expect(most).toBeLessThan(MACHINE_MAX_CHIPS / 2);
+    assertConserved(s, 'long run');
   });
 });
 
@@ -708,8 +831,7 @@ describe('processInsert', () => {
 
 describe('emptyMachine', () => {
   it('refuses a non-owner (ok=false, state unchanged, no ledger change)', () => {
-    let s = initialCoinPusherState(OWNER, 0);
-    for (let i = 0; i < 10; i++) s = processInsert(s, PLAYER1, 1, 0.5, 1, i, 0).state;
+    const s = fill(10);
     const snapshot = JSON.stringify(s);
     const r = emptyMachine(s, PLAYER1);
     expect(r.ok).toBe(false);
@@ -718,81 +840,50 @@ describe('emptyMachine', () => {
   });
 
   it('empties every pile and grows totalEmptied by the count', () => {
-    let s = initialCoinPusherState(OWNER, 0);
-    for (let i = 0; i < 12; i++) s = processInsert(s, PLAYER1, ((i % 3) as PusherHole), 0.5, 1, i * 7, 0).state;
+    const s = fill(12);
     const before = chipsInMachine(s);
     const r = emptyMachine(s, OWNER);
     expect(r.ok).toBe(true);
     expect(r.emptied).toBe(before);
     expect(chipsInMachine(r.state)).toBe(0);
     expect(r.state.totalEmptied).toBe(before);
+    expect(r.state.tick).toBe(s.tick + 1);
     assertConserved(r.state, 'after empty');
   });
 
-  it('is a no-op when the machine is already empty', () => {
-    const s = initialCoinPusherState(OWNER, 0);
-    const r = emptyMachine(s, OWNER);
+  it('is a no-op on the chips when the machine is already empty', () => {
+    const r = emptyMachine(initialCoinPusherState(OWNER, 0), OWNER);
     expect(r.ok).toBe(true);
     expect(r.emptied).toBe(0);
     assertConserved(r.state, 'empty-when-empty');
   });
 });
 
-// ── claimPendingCredit ───────────────────────────────────────────────────────
-
-describe('claimPendingCredit', () => {
-  it('returns 0 and does not modify state when nothing owed', () => {
-    const s = initialCoinPusherState(OWNER, 0);
-    const r = claimPendingCredit(s, PLAYER1);
-    expect(r.amount).toBe(0);
-    expect(r.state).toBe(s);
-  });
-
-  it('zeros exactly one player credit and returns the amount', () => {
-    const s0 = initialCoinPusherState(OWNER, 0);
-    const s: CoinPusherState = {
-      ...s0,
-      pendingCredit: { [PLAYER1]: 3, [PLAYER2]: 2 },
-    };
-    const r = claimPendingCredit(s, PLAYER1);
-    expect(r.amount).toBe(3);
-    expect(r.state.pendingCredit[PLAYER1]).toBeUndefined();
-    expect(r.state.pendingCredit[PLAYER2]).toBe(2);
-  });
-});
-
 // ── Conservation invariant across a long randomised run ──────────────────────
 
 describe('conservation invariant', () => {
-  it('holds through hundreds of inserts and periodic owner empties', () => {
+  it('holds through hundreds of drops by two players and periodic owner empties', () => {
+    const rand = lcg(5);
     let s = initialCoinPusherState(OWNER, 0);
-    let now = 0;
     for (let i = 0; i < 500; i++) {
-      const hole = (i % 3) as PusherHole;
-      const t = (Math.sin(i) * 0.5 + 0.5); // deterministic pseudo-timing
-      now += 137;
-      s = processInsert(s, i % 2 === 0 ? PLAYER1 : PLAYER2, hole, t, 1, i * 31 + 1, now).state;
-      assertConserved(s, `insert-${i}`);
-      // Owner empties every 100 inserts.
+      const player = i % 2 === 0 ? PLAYER1 : PLAYER2;
+      s = processInsert(s, player, (i % 3) as PusherHole, rand() * 0.999, i * 31 + 1).state;
+      assertConserved(s, `drop-${i}`);
       if (i > 0 && i % 100 === 0) {
-        const r = emptyMachine(s, OWNER);
-        s = r.state;
+        s = emptyMachine(s, OWNER).state;
         assertConserved(s, `after-empty-${i}`);
       }
     }
-    // Final: chipsInMachine + totalPaid + totalEmptied == totalInserted.
     const c = computeConservation(s);
     expect(c.balanced).toBe(true);
     expect(c.totalInserted).toBe(500);
   });
 
-  it('is preserved even when a hostile timing produces edge cases', () => {
-    // Every insert with timing=0 and consecutive seeds — corner cases like
-    // early wall-hit, flat pile stacks, etc.
+  it('holds at the phase edges (every drop at phase 0)', () => {
     let s = initialCoinPusherState(OWNER, 0);
     for (let i = 0; i < 200; i++) {
-      s = processInsert(s, PLAYER1, ((i % 3) as PusherHole), 0, 1, i, i * 10).state;
-      assertConserved(s, `hostile-timing-${i}`);
+      s = processInsert(s, PLAYER1, (i % 3) as PusherHole, 0, i).state;
+      assertConserved(s, `phase-0-${i}`);
     }
   });
 });
@@ -806,338 +897,5 @@ describe('chipsInMachine', () => {
       (n) => [pileN(0.70, 3, n)],
     );
     expect(chipsInMachine(s)).toBe(5);
-  });
-});
-
-// ── Audit-remediation regression tests ────────────────────────────────────────
-//
-// The following two suites nail down the specific bugs called out in the
-// remediation-pass audit. Both were passing latent through the original
-// suites because the exact conditions never arose in the vitest scenarios —
-// the fixes plus these tests together close both leaks.
-
-describe('processInsert — audit #1: no double-credit of between-insert fallouts', () => {
-  // AUDIT FINDING #1 (coinPusher.ts, prior processInsert step 6):
-  //   Step 1's advanceSim() already credited its own fallouts to
-  //   `pendingCredit[player]` AND `totalPaid` on the state it returned.
-  //   The `paid` accumulator was seeded with those same chip IDs, and
-  //   step 6 unconditionally re-applied `paid.length` to BOTH counters —
-  //   incrementing `pendingCredit[player]` a SECOND time (fabricating chips)
-  //   AND inflating `totalPaid` beyond the number of chips actually paid.
-  //   The conservation identity totalInserted === chipsInMachine + totalPaid
-  //   + totalEmptied fails as -N (where N = step-1 fallout count), which
-  //   is what `assertConserved` catches below.
-  //
-  // Setup — how the scenario forces N > 0 in step 1:
-  //   • Upper: single pile at x=0.66, `MAX_STACK_HEIGHT` chips. Because
-  //     0.66 > PLAT_UP_FRONT (0.60), the very first stepMachine substep's
-  //     settlePiles() evicts the pile — 4 upper chips head down to the
-  //     lower platform.
-  //   • Lower: nine contiguous piles at x=0.67, 0.73, …, 1.15, each with
-  //     MAX_STACK_HEIGHT chips. The evicted upper pile lands within CHIP_R
-  //     of the leftmost lower pile, so insertOnPlatform() MERGES (not just
-  //     stacks). The merge triggers the CONTACT IMPULSE: with 4 landing
-  //     chips, shove = 4*CHIP_R*0.5 = 0.06 = PILE_STEP, propagating through
-  //     the entire contiguous chain (no gap > PILE_STEP breaks it). Every
-  //     pile shifts one step forward — including the front pile 1.15 → 1.21.
-  //     The final settle pass evicts 1.21 (past PLAT_LOW_FRONT = 1.20)
-  //     → 4 chips paid in step 1.
-  //
-  // Post-conditions (fixed code): totalPaid == 4, pendingCredit[player] == 4,
-  // conservation holds. Buggy code: totalPaid == 8, pendingCredit[player] == 8,
-  // conservation broken by -4 (unbalanced).
-
-  it('credits between-insert fallouts exactly once (not twice)', () => {
-    const s0 = buildState(
-      // Upper pile past PLAT_UP_FRONT — evicts on first stepMachine substep.
-      (next) => [pileN(0.66, MAX_STACK_HEIGHT, next)],
-      // Full contiguous lower chain — contact impulse propagates end to end.
-      (next) => {
-        const piles: Pile[] = [];
-        for (let i = 0; i < 9; i++) piles.push(pileN(0.67 + i * PILE_STEP, MAX_STACK_HEIGHT, next));
-        return piles;
-      },
-    );
-    // Sanity: 4 (upper) + 9*4 (lower) = 40 chips in fixture.
-    expect(chipsInMachine(s0)).toBe(MAX_STACK_HEIGHT + 9 * MAX_STACK_HEIGHT);
-
-    // 100 ms > PHYSICS_SUBSTEP_MS is plenty to run the eviction + cascade.
-    // (Longer times don't change the outcome — after the first substep
-    // upper is empty and lower is stable, so no further step-1 payouts
-    // occur — but 100 ms keeps the scenario minimal and readable.)
-    const r = processInsert(s0, PLAYER1, 1, 0.5, 1, 42, 100);
-
-    // Conservation is the audit's primary invariant. The buggy code inflates
-    // totalPaid by the between-insert fallout count (4) but does NOT remove
-    // any additional chips from the machine, so totalInserted !==
-    // chipsInMachine + totalPaid + totalEmptied under the bug.
-    assertConserved(r.state, 'step-1 cascade — no double credit');
-
-    // Direct proof that step 1 actually produced fallouts (setup validity):
-    // if this ever regressed to 0, the test would silently pass on buggy
-    // code even though the conservation assertion would too — because no
-    // step-1 chips would exist to be double-credited. We expect ≥ 4 from
-    // the step-1 cascade (the front pile at 1.15, shoved to 1.21, evicted).
-    expect(r.state.totalPaid).toBeGreaterThanOrEqual(4);
-
-    // The reported paidChipIds return value must equal the delta on totalPaid.
-    // Under the bug, paidChipIds correctly aggregates each fallout once, but
-    // totalPaid gets inflated by 4 (step-1 double-credit), so this identity
-    // ALSO breaks — a second, independent check on the bug.
-    expect(r.paidChipIds.length).toBe(r.state.totalPaid - s0.totalPaid);
-  });
-
-  it('paidChipIds report has NO duplicate chip ids across the return', () => {
-    // A duplicate id in `paidChipIds` would be the audit's smoking gun:
-    // a UI/log would render the same chip twice, and a wiring layer could
-    // mint a real casino chip on the strength of it. Under the bug the
-    // step-1 IDs appear once in advanceSim's return AND again threaded into
-    // `paid`, then handed back to the caller — a phantom chip in the log.
-    const s0 = buildState(
-      (next) => [pileN(0.66, MAX_STACK_HEIGHT, next)],
-      (next) => {
-        const piles: Pile[] = [];
-        for (let i = 0; i < 9; i++) piles.push(pileN(0.67 + i * PILE_STEP, MAX_STACK_HEIGHT, next));
-        return piles;
-      },
-    );
-    const r = processInsert(s0, PLAYER1, 1, 0.4, 1, 137, 100);
-    const seen = new Set<number>();
-    for (const id of r.paidChipIds) {
-      expect(seen.has(id), `duplicate chip id ${id} in paidChipIds`).toBe(false);
-      seen.add(id);
-    }
-    // The count returned MUST equal the delta the state records.
-    expect(r.paidChipIds.length).toBe(r.state.totalPaid - s0.totalPaid);
-  });
-
-  it('long-idle operator gap: a single insert crediting massive elapsed time still balances', () => {
-    // Simulates the exact scenario the audit called out: an operator that
-    // has been offline for many pusher periods, then a player inserts. The
-    // between-insert advance runs many substeps; without the fix, the
-    // step-1 fallouts get credited a SECOND time in step 6.
-    const s0 = buildState(
-      (next) => [pileN(0.66, MAX_STACK_HEIGHT, next)],
-      (next) => {
-        const piles: Pile[] = [];
-        for (let i = 0; i < 9; i++) piles.push(pileN(0.67 + i * PILE_STEP, MAX_STACK_HEIGHT, next));
-        return piles;
-      },
-      { pusherAtMs: 0 },
-    );
-    const nowMs = PUSHER_PERIOD_MS * 20; // twenty full sweeps offline
-    const r = processInsert(s0, PLAYER1, 2, 0.5, 1, 424242, nowMs);
-
-    // Conservation invariant is the primary check — the bug breaks it.
-    assertConserved(r.state, 'long-idle-then-insert');
-
-    // Same identity as above.
-    expect(r.paidChipIds.length).toBe(r.state.totalPaid - s0.totalPaid);
-  });
-});
-
-describe('advanceSim — audit #2: idle physics attribution semantics', () => {
-  // AUDIT FINDING #2 (devices.ts tickCoinPusherOperator):
-  //   The operator's idle physics call used `payoutTo=null` (documented in
-  //   the engine header as "dev inspection only"), so any chip that
-  //   tipped between inserts left `chipsInMachine` and landed in
-  //   `totalPaid` with no player credited. Owner-empty only credits piles
-  //   still on the platforms, so those chips vanished.
-  //
-  // The engine already exposed this hazard clearly (see the passing
-  // 'leaves pendingCredit empty when payoutTo is null' test above); the
-  // fix lives in the OPERATOR, which now passes `state.ownerId` so idle
-  // payouts accrue to the machine owner. That routing is exercised
-  // directly here so a future refactor cannot silently break it.
-
-  it('when payoutTo is state.ownerId, idle-tipped chips accrue to the owner', () => {
-    const s = buildState(
-      (next) => [pileN(PLAT_UP_FRONT + 0.005, 3, next)],
-      (next) => {
-        const piles: Pile[] = [];
-        const start = PLAT_LOW_BACK + CHIP_R;
-        for (let i = 0; i < 10; i++) piles.push(pileN(start + i * PILE_STEP, 1, next));
-        return piles;
-      },
-    );
-    // The operator's actual call shape: pass the owner id as payoutTo so
-    // the owner earns what the machine sheds while idle.
-    const r = advanceSim(s, 500, s.ownerId);
-    expect(r.paidChipIds.length).toBeGreaterThan(0);
-    // Every paid chip lands in the OWNER's pendingCredit, nowhere else.
-    const ownerCredit = r.state.pendingCredit[s.ownerId] ?? 0;
-    expect(ownerCredit).toBe(r.paidChipIds.length);
-    const otherCredit = Object.entries(r.state.pendingCredit)
-      .filter(([k]) => k !== s.ownerId)
-      .reduce((a, [, v]) => a + v, 0);
-    expect(otherCredit).toBe(0);
-    // Conservation: chips left the platforms, they went into pendingCredit,
-    // totalPaid tracks the same number.
-    assertConserved(r.state, 'idle physics -> owner');
-    expect(r.state.totalPaid - s.totalPaid).toBe(r.paidChipIds.length);
-  });
-});
-
-describe('processInsert — audit r5: pusherAtMs is re-anchored so the render interpolates', () => {
-  // AUDIT r5 MINOR (coinPusher.ts processInsert step 5 + currentPusherPhase):
-  //   Step 5 always ran `advanceSim(cur, SETTLE_MS, playerId)`, whose
-  //   substeps accumulate `dtMs` into `pusherAtMs`. On return, pusherAtMs
-  //   sat at `caller-nowMs + SETTLE_MS`. Step 1 then SKIPPED the between-
-  //   advance on the next insert (because that nowMs' <= pusherAtMs), so
-  //   the SETTLE_MS offset never got consumed — every insert stacked ANOTHER
-  //   SETTLE_MS on top, drifting pusherAtMs many periods into the future.
-  //
-  //   The renderer (currentPusherPhase(state, Date.now()) → coinPusherPhaseNow
-  //   in devices.ts → pusher.position.z in furniture.ts) does
-  //     dt = Math.max(0, nowMs - state.pusherAtMs)
-  //   and returns bare state.pusherPhase whenever dt clamps to 0. With
-  //   pusherAtMs many seconds ahead of wall clock, the pusher visual
-  //   froze between operator 4Hz republishes instead of interpolating
-  //   at the render frame rate — the whole point of currentPusherPhase.
-  //
-  //   The fix re-anchors pusherAtMs to `nowMs` after the SETTLE_MS advance
-  //   in processInsert. pusherPhase is left at its post-settle value so
-  //   physics continuity is preserved; only the wall-clock timestamp is
-  //   corrected. Conservation, determinism, and tick monotonicity all hold.
-
-  it('after a burst of inserts at rising nowMs, pusherAtMs equals the last nowMs (no drift)', () => {
-    // The finding cited: after 10 processInsert calls with rising nowMs
-    // 100..1000, pusherAtMs was 24400 ms ahead of the wall clock (each
-    // insert added SETTLE_MS). Under the fix, pusherAtMs must never
-    // exceed the caller's `nowMs` on return.
-    let s = initialCoinPusherState(OWNER, 0);
-    let lastNow = 0;
-    for (let i = 0; i < 10; i++) {
-      lastNow = 100 * (i + 1);
-      s = processInsert(s, PLAYER1, 1, 0.5, 1, i + 1, lastNow).state;
-      // Anchor invariant: the returned pusherAtMs must sit AT nowMs. It
-      // may not exceed it (would freeze render) and may not fall behind
-      // by more than a rounding tick (would leak physics work to callers).
-      expect(s.pusherAtMs).toBe(lastNow);
-    }
-    // Bare-phase equality check the finding measured directly: at wall time
-    // == last insert's nowMs, currentPusherPhase returns state.pusherPhase
-    // (dt=0). One PUSHER_PERIOD_MS later it must have advanced by exactly
-    // one full cycle back to the same phase — proving interpolation works.
-    expect(currentPusherPhase(s, lastNow)).toBe(s.pusherPhase);
-    const oneLater = currentPusherPhase(s, lastNow + PUSHER_PERIOD_MS);
-    expect(oneLater).toBeCloseTo(s.pusherPhase, 9);
-  });
-
-  it('currentPusherPhase interpolates forward for wall-clock times AFTER the anchor', () => {
-    // The renderer runs at ~60 Hz. Between operator republishes it uses
-    // currentPusherPhase(state, Date.now()) to advance the pusher. This
-    // test walks a wall clock forward from the anchor across a full
-    // sweep period and confirms the phase advances monotonically off
-    // the bare state.pusherPhase.
-    let s = initialCoinPusherState(OWNER, 0);
-    const nowAtInsert = 5000;
-    s = processInsert(s, PLAYER1, 1, 0.5, 1, 99, nowAtInsert).state;
-    expect(s.pusherAtMs).toBe(nowAtInsert);
-
-    const basePhase = currentPusherPhase(s, nowAtInsert);
-    expect(basePhase).toBe(s.pusherPhase);
-
-    // Walk wall clock forward in 40 ms frames (one physics substep) up to
-    // one full period. The phase must move OFF basePhase (never stuck).
-    let sawDistinctPhase = false;
-    let prevAdvance = 0;
-    for (let ahead = 40; ahead <= PUSHER_PERIOD_MS - 40; ahead += 40) {
-      const p = currentPusherPhase(s, nowAtInsert + ahead);
-      // Compute the same "distance from basePhase" formula the render sees.
-      const advance = (ahead / PUSHER_PERIOD_MS);
-      const expected = (basePhase + advance) % 1;
-      expect(p).toBeCloseTo(expected, 9);
-      if (p !== basePhase) sawDistinctPhase = true;
-      // Monotonic advance within the same cycle (mod 1 with no wrap).
-      if (ahead < PUSHER_PERIOD_MS && basePhase + advance < 1) {
-        expect(advance).toBeGreaterThanOrEqual(prevAdvance - 1e-12);
-        prevAdvance = advance;
-      }
-    }
-    expect(sawDistinctPhase).toBe(true);
-  });
-
-  it('phase continuity across the settle: the state phase and the anchored render phase agree', () => {
-    // Physics continuity: the pusherPhase AFTER step 5 is the fast-forwarded
-    // phase; re-anchoring pusherAtMs must NOT touch pusherPhase, so
-    // currentPusherPhase(state, nowMs) === state.pusherPhase.
-    // If the fix ever regressed to also rewriting pusherPhase to some
-    // "pre-settle" value the visual would jump backwards on every insert.
-    const s0 = initialCoinPusherState(OWNER, 0);
-    // Prime the state with some phase so 0.0 is not a coincidence.
-    const primed = stepMachine(s0, PUSHER_PERIOD_MS * 0.37).state;
-    const nowAtInsert = 12345;
-    const r = processInsert(primed, PLAYER1, 2, 0.4, 1, 777, nowAtInsert);
-    // Anchor invariant.
-    expect(r.state.pusherAtMs).toBe(nowAtInsert);
-    // Continuity invariant: bare-phase read matches the state field.
-    expect(currentPusherPhase(r.state, nowAtInsert)).toBe(r.state.pusherPhase);
-    // The post-settle phase corresponds to a positive number of SETTLE_MS
-    // advances — it can't be equal to the pre-settle phase (would prove
-    // step 5 didn't actually run). SETTLE_MS = PUSHER_PERIOD_MS + one
-    // substep so phase advances by ~1.0167 cycles net.
-    expect(r.state.pusherPhase).not.toBe(primed.pusherPhase);
-  });
-
-  it('re-anchor preserves the conservation invariant (unchanged money counters)', () => {
-    // The re-anchor touches ONLY pusherAtMs — not upper/lower piles, not
-    // pendingCredit, not totalInserted/totalPaid/totalEmptied. This test
-    // pins that: run a long burst and check conservation holds AND
-    // pusherAtMs stays at each caller nowMs.
-    let s = initialCoinPusherState(OWNER, 0);
-    let now = 0;
-    for (let i = 0; i < 50; i++) {
-      const hole = ((i % 3) as PusherHole);
-      now += 60; // wall clock advances between inserts
-      s = processInsert(s, PLAYER1, hole, (i * 0.11) % 1, 1, 4000 + i, now).state;
-      expect(s.pusherAtMs).toBe(now);
-      assertConserved(s, `re-anchor-insert-${i}`);
-    }
-    expect(s.totalInserted).toBe(50);
-  });
-
-  it('nowMs === null (test/dev inspection escape hatch) leaves pusherAtMs alone', () => {
-    // The engine's contract: nowMs === null skips step 1's between-advance
-    // AND the step-5b re-anchor. Existing callers (dev tools, tests) that
-    // opt out of wall-clock semantics must still get the legacy behaviour.
-    const s0 = initialCoinPusherState(OWNER, 500);
-    const r = processInsert(s0, PLAYER1, 1, 0.5, 1, 42, null);
-    // Legacy: pusherAtMs = pre-existing pusherAtMs + SETTLE_MS.
-    expect(r.state.pusherAtMs).toBe(500 + SETTLE_MS);
-  });
-
-  it('long-idle then insert: pusherAtMs snaps to the caller nowMs (no future drift)', () => {
-    // The audit finding's key example: peer inserts after a very long
-    // idle gap. Under the bug, pusherAtMs would be ~24s ahead of wall
-    // clock after the first insert (SETTLE_MS + the between-advance).
-    // Under the fix, it must sit AT nowMs.
-    const s0 = initialCoinPusherState(OWNER, 0);
-    const nowMs = PUSHER_PERIOD_MS * 20; // 48s
-    const r = processInsert(s0, PLAYER1, 2, 0.5, 1, 424242, nowMs);
-    expect(r.state.pusherAtMs).toBe(nowMs);
-    // Render at wall-clock nowMs must equal the stored phase.
-    expect(currentPusherPhase(r.state, nowMs)).toBe(r.state.pusherPhase);
-    // Render at nowMs + 250 ms (one operator tick later) must have moved.
-    const laterPhase = currentPusherPhase(r.state, nowMs + 250);
-    expect(laterPhase).not.toBe(r.state.pusherPhase);
-    assertConserved(r.state, 'long-idle-anchor');
-  });
-
-  it('multiple inserts in the same operator tick (same nowMs) all end at pusherAtMs === nowMs', () => {
-    // A burst drain: the operator captures `now` once and calls processInsert
-    // with the same nowMs across every queued request. Every insert must
-    // finish with pusherAtMs === nowMs so the free-running dt (now -
-    // state.pusherAtMs) is zero and no double-simulation happens.
-    let s = initialCoinPusherState(OWNER, 0);
-    const now = 1000;
-    for (let i = 0; i < 5; i++) {
-      s = processInsert(s, PLAYER1, ((i % 3) as PusherHole), 0.5, 1, 300 + i, now).state;
-      expect(s.pusherAtMs).toBe(now);
-    }
-    // At wall-clock `now`, phase = bare pusherPhase. One period later, the
-    // interpolated phase must match state.pusherPhase again (full cycle).
-    expect(currentPusherPhase(s, now)).toBe(s.pusherPhase);
-    expect(currentPusherPhase(s, now + PUSHER_PERIOD_MS)).toBeCloseTo(s.pusherPhase, 9);
   });
 });

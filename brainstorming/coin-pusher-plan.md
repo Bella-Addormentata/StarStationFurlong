@@ -8,224 +8,183 @@ tipping. A chip that falls off the LAST platform pays out to the dropper.
 Chips STAY IN THE MACHINE until they physically fall out — the owner has a
 manual "open door" to empty. Never auto-siphoned.
 
-The build sits inside the pure-engine-plus-Yjs pattern already carrying slot
-machines (`games/slots.ts` + `slotCroupier.ts` + `casinoDoc.ts`) and the
-game-table games (`games/gamesDoc.ts`) — an engine module with no DOM/three/Yjs
-dependencies, DeviceUI/visual glue in `devices.ts` / `furniture.ts`, and one
-sole operator client (the machine's owner) publishing the reduced state.
+The build follows the slot machine on main: a pure engine
+(`games/coinPusher.ts`, like `games/slots.ts`), money and records in
+`casinoDoc.ts`, a lease-elected operator (`pusherCroupier.ts`, like
+`slotCroupier.ts`), and the panel and cabinet in `devices.ts` /
+`furniture.ts`.
 
 ## Files touched
 
-- **`src/games/coinPusher.ts`** — pure deterministic dt-driven engine. Guards
-  (`isCoinPusherState`, `isPusherInsertRequest`, `isPusherEscrow`), seeded
-  RNG (FNV-1a 32-bit, high-bit sampled to sidestep LSB bias), constants
-  (`CHIP_R=0.030`, `PILE_STEP=0.06`, `PUSHER_PERIOD_MS=2400`,
-  `PHYSICS_SUBSTEP_MS=40`, `MAX_STACK_HEIGHT=4`, `HOLE_COUNT=3`,
-  `PUSHER_MAX_ANTE=100`), and reducers: `settlePiles`, `insertOnPlatform`,
-  `simulatePeg`, `stepMachine`, `advanceSim`, `processInsert`, `emptyMachine`,
-  `claimPendingCredit`, `computeConservation`. Two-layer geometry model (upper
-  and lower platforms, upper spills forward to lower, lower spills forward to
-  the tray = pay-out). Column model per platform: piles are indexed by chip
-  column; `MAX_STACK_HEIGHT` bounds tower growth and shoves forward on overflow.
-- **`src/games/coinPusher.test.ts`** — 59 vitest cases. Guard tables,
-  conservation invariant (`totalInserted == chipsInMachine + totalPaid +
-  totalEmptied`) held across long play traces, peg deterministic under fixed
-  seed, `emptyMachine` owner-only + zero-effect otherwise, TTL refund path,
-  bounded RNG, hostile-value degradation, pusher sweep in-range for all `t`.
-- **`src/casinoDoc.ts`** — thin CRDT layer over the room doc: `pusher:<mid>`
-  for state (whole-value LWW), `pusher-req:<mid>:<player>` for one queued
-  request per player (single-writer-per-key, purged by the operator after
-  processing), `pusher-escrow:<mid>:<player>:<requestId>` for the debited
-  chips awaiting resolve, `pusher-pending:<mid>:<player>` for the payout
-  entries the engine hands over on tip-off. All shape-guarded on read; every
-  balance move goes through a single `transact()`. `PUSHER_REQUEST_TTL_MS =
-  90_000` bounds refund latency if the operator is offline.
-- **`src/devices.ts`** — `createCoinPusherUI()` DeviceUI (three big hole
-  buttons, timing slider, ante input, INSERT / CLAIM / OPEN DOOR / OPERATOR
-  TOGGLE / REFUND, keyboard shortcuts arrows/space). Operator loop
-  (`startCoinPusherOperator` / `tickCoinPusherOperator`) drains the request
-  queue via `processInsert`, then `advanceSim` progresses free-running physics
-  between inserts. `ensureCoinPusherInitialized` seeds a fresh cabinet's state
-  once so the operator can start without demanding the panel be opened.
-  `clearPendingCoinPusherPlays` refunds outstanding requests + shuts the loop
-  when the cabinet is removed.
-- **`src/furniture.ts`** — `buildCoinPusher(ctx)`: plinth + cabinet body +
-  marquee (COIN PUSHER canvas display), three drop holes with gold rim
-  meshes (`coinPusherControl='hole'` userData for click routing), a two-tier
-  playfield (upper platform → lower platform → pay-out tray with glass front
-  + side walls), an animated pusher bar, and a chip pool that mirrors the
-  engine's `piles` back onto the scene. Registers a `CoinPusherVisualHandle`
-  on the upper-platform mesh (setSelectedHole / showMessage / triggerDropFx /
-  update) so the panel can drive the cabinet's feedback. `FURNITURE_DEFS
-  ["coin-pusher"]` gives it a 1×1 footprint with a `device: {kind:
-  "coinPusher", …}` entry so the device-focus pipeline picks it up.
-- **`src/world.ts`** — the reconciler mirrors the slot-machine pattern:
-  registers/removes `coinPusherVisuals` in scene traversal, calls
-  `clearPendingCoinPusherPlays` + `clearCoinPusherKeys` on furniture removal,
-  ticks the visual handle each frame, autostarts the operator loop for every
-  spawned cabinet the local player owns, and wires the coin-pusher branch
-  of `requestDeviceFocus` (`createCoinPusherUI` + visual callbacks).
-- **`src/devMenu.ts`** — 🪙 COIN PUSHER label; the item picks up the
-  spawnable list automatically off `FURNITURE_DEFS`.
-- **`CHANGELOG.md`** — Unreleased bullet.
-- **`TODO.md`** — dated Done entry.
+- **`src/games/coinPusher.ts`** — the pure, deterministic engine (no Yjs /
+  DOM / three / clock / `Math.random`). Guards (`isCoinPusherState` with an
+  aggregate `MACHINE_MAX_CHIPS` cap, `isPusherInsertRequest`,
+  `isPusherEmptyRequest`, `normalizeCoinPusherState`), the physics
+  (`settlePiles`, `insertOnPlatform`, `simulatePeg`, `stepMachine`,
+  `advanceSim`), and the reducers the operator runs: `resolveDropTiming`,
+  `processInsert` (one chip per drop), `emptyMachine`, `computeConservation`.
+- **`src/casinoDoc.ts`** — the machine's records and every chip movement (see
+  *Money and authority*).
+- **`src/pusherCroupier.ts`** — the operator: election, ownership, and the
+  settle / refuse / empty work.
+- **`src/devices.ts`** — `createCoinPusherUI()`: a live pusher gauge, three
+  hole buttons, DROP ONE CHIP, the player's chips as a physical rack and their
+  last drop's payout as a tray (the casino's physical-chip rule), and the
+  owner's OPEN THE DOOR. Keyboard: ← / → pick a hole, Space drops.
+- **`src/furniture.ts`** — `buildCoinPusher(ctx)`: cabinet, marquee (shows the
+  panel's short messages), three holes, the two platforms, the pusher bar and
+  a chip pool, all drawn as the engine's cross-section (below). Registers a
+  `CoinPusherVisualHandle` on the upper platform.
+- **`src/world.ts`** — files the visual handle, ticks the operator election
+  for every cabinet, opens the panel on focus, and closes the machine when the
+  cabinet is removed.
+- **`src/furnitureHandles.ts`** — the `coinPusherVisual` handle kind in the
+  shared registration list.
+- **`src/devMenu.ts`** — 🪙 COIN PUSHER spawn label.
+- Tests: `games/coinPusher.test.ts` (engine), `casinoDoc.test.ts` (records
+  and money, including a two-doc merge), `pusherCroupier.test.ts` (operator).
 
-## Authority + trust model (single-authority per cabinet)
+## Physics model — a 1-D cross-section
 
-- **Owner as sole operator.** Whoever first opens the panel on a machine that
-  has no state seeds `initialCoinPusherState(myId, now)`; their id is
-  latched into `state.ownerId`. Their client is thereafter the only one that
-  publishes new engine state (mirrors the slot-machine "elected croupier"
-  pattern). Non-owner clients read state read-only and submit insert requests
-  via the queue key.
-- **Owner absence is bounded.** Insert-request records carry `requestedAt`;
-  the pure engine reads a wall-clock `nowMs` and any client can call
-  `refundExpiredCoinPusherRequest(...)` after `PUSHER_REQUEST_TTL_MS`. The
-  player's own client is entitled to refund their OWN outstanding request
-  regardless of who is offline (single-writer-per-key holds: the request
-  record belongs to the player and no one else writes it).
-- **Payouts atomic.** When physics tips a chip off the lower platform,
-  the reducer appends to `state.pendingCredit[player]`. The player's own
-  client calls `claimCoinPusherPayout(machineId, nextState, playerId, amount)`
-  which does the credit + state-write in one `transact()` — the pattern the
-  slot machine uses for its own settle.
-- **Empty is owner-only.** `emptyMachine(state, callerId)` returns the same
-  state unchanged when `callerId !== state.ownerId`. `commitCoinPusherEmpty`
-  in `casinoDoc.ts` re-checks ownerId before writing.
-- **Deserialization boundary.** Every read call uses the shape guards; a
-  hostile peer that scribbles garbage into a coin-pusher key is dropped at
-  the seam. Same discipline as the treasury policy fields.
+The engine models ONE back-to-front axis. Every pile of chips has a single
+position `x`; there is no side-to-side coordinate and no side drain. The
+three holes differ only in where along that axis a chip enters. Upper
+platform `x ∈ [0, 0.60]`, lower platform `x ∈ [0.60, 1.20]`; a chip pushed
+past `1.20` falls into the tray and is paid out.
+
+- The pusher sweeps the upper platform on a cosine (period 2.4 s). Only its
+  forward stroke pushes; it never drags chips back.
+- A drop falls through five peg rows (a seeded left/right hash per row),
+  lands on the upper platform, stacks (at most `MAX_STACK_HEIGHT` per column,
+  the excess spills forward) and nudges the contact chain ahead of it.
+- After every drop the engine runs one full pusher cycle. Each substep uses
+  the pusher's true furthest reach within it, so that cycle compresses the
+  piles all the way: **the machine is at rest between drops**, and the
+  operator never runs physics on its own. Nothing leaves the machine except
+  through a drop or the owner's door.
+- The cabinet draws exactly this cross-section: the holes sit in a
+  back-to-front row at the engine's hole positions, every pile is drawn on the
+  centre line at its engine position, and the bar's front face follows
+  `pusherFaceX`.
+- Honest limits: no rotation, no side-to-side wobble, no lateral outcomes. A
+  2-D playfield would be a new engine, not a tweak to this one.
+- Measured: the machine fills to a steady ~41 chips, after which a drop
+  returns about one chip on average (87% of drops pay 1, 7% pay 0, 6% pay 2,
+  rarely 3–4). There is no built-in house edge; the owner's take is what sits
+  inside when they open the door. `MACHINE_MAX_CHIPS = 128` is headroom that
+  honest play does not reach.
+
+## Timing
+
+The pusher is a free-running clock: `(pusherPhase, pusherAtMs)` anchor it when
+the machine is created and drops never move it, so every client draws the same
+pusher from its own wall clock (`currentPusherPhase`). When the player presses
+DROP, the panel records the phase on their screen in the request.
+
+The operator reaches the request a little later. `resolveDropTiming` keeps the
+player's phase if it is at most `MAX_DROP_LAG_MS` (1 s) behind the operator's
+pusher, or at most `MAX_DROP_LEAD_MS` (250 ms) ahead of it (browser clocks
+are not synchronised; a fast clock shows the pusher slightly ahead). Anything
+else drops at the operator's current phase, so a claim outside the window
+gains nothing. The result says which happened (`lastDrop.honored`), and the
+panel tells the player.
+
+The peg-field seed is drawn by the operator from `crypto.getRandomValues`
+when it settles the drop, so the player can neither choose nor predict it.
+
+## Money and authority
+
+Records in the room's `casino` map:
+
+| Key | Written by | Holds |
+|---|---|---|
+| `pusher:<mid>` | the operator only | the machine (`CoinPusherState`) |
+| `pusher-req:<mid>:<pid>` | the player (own key) | hole + the phase they saw — **no chips** |
+| `pusher-empty:<mid>` | the owner | a door request |
+| `pusher-operator:<mid>` | the operator | its lease |
+
+- **Election.** Only the room's deed holder operates (`canRunCroupier`, the
+  rule every casino operator follows since #141/#142), and only one of their
+  browser sessions: the lease is written, the session waits 2 s for the doc to
+  converge, renews every 3 s, and lapses after 8 s. World ticks the election
+  every frame, so there is no start/stop control.
+- **Ownership.** The operator creates a missing machine with itself as owner,
+  and re-owns one owned by anyone else (a deed transfer, or a peer-written
+  owner). The chips inside stay put and go with the room, like its furniture.
+  Nothing is paid on a takeover, so a forged owner earns nothing.
+- **A drop.** The player's request is a wish, not a payment. The operator
+  refuses it (records `lastRefusal`, clears the request, moves nothing) when it
+  is more than 2 minutes old, the player has no chip, or the machine is full.
+  Otherwise `processInsert` runs, and `settleCoinPusherInsert` debits the one
+  chip, credits exactly what the drop paid, publishes the machine and clears
+  the request in **one transaction**. Before writing, it re-reads the stored
+  machine and refuses if it is not the state the drop was computed from, if
+  the request is gone or replaced, or if the transition is not a one-chip drop
+  whose payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read
+  off that transition; it is never a separate argument.
+- **Nothing to claim, nothing to refund.** There is no escrow and no pending
+  credit. A cancelled, abandoned or withdrawn request costs nothing (the panel
+  withdraws its own after 15 s without an answer, and when the player walks
+  away), so no peer-written record is ever taken as proof that chips moved.
+- **The door.** Only the owner may empty the machine, and that too goes
+  through the operator (`pusher-empty:<mid>` → `commitCoinPusherEmpty`: the
+  emptied machine, the owner's credit for exactly the chips that were inside,
+  and the cleared request, in one transaction), so an empty never races a
+  drop.
+- **Removal.** When the cabinet is removed, a managing client (the deed
+  holder or a room editor — the slot machine's rule) pays the chips still
+  inside to the machine's owner and deletes every key, in one transaction
+  (`drainAndClearCoinPusher`).
+- **Trust.** The same dev-phase honest-client model as the rest of the
+  casino map: the operator is trusted to run the physics honestly, and every
+  read shape-guards so junk in these keys reads as "no machine".
 
 ## Conservation invariant
-
-At every reduce step the pure engine maintains:
 
 ```
 totalInserted = chipsInMachine + totalPaid + totalEmptied
 ```
 
-Where `chipsInMachine` sums the two platform piles + the pusher-column strip;
-`totalPaid` is the chips already credited to players; `totalEmptied` is the
-amount the owner has removed via OPEN DOOR. `computeConservation` returns the
-delta so the DeviceUI can display "OK / OFF-BY N" and the tests can assert
-zero drift across long random traces.
+Every reducer keeps it; the settle and empty helpers refuse a transition that
+breaks it; the panel's meter shows it as a check mark (no totals — outside the
+cashier, chips are shown as chips, never as numbers).
 
-## Physics model — honest limits
+## Data flow at a drop
 
-- Discrete substep `PHYSICS_SUBSTEP_MS = 40ms`. Each substep advances the
-  pusher, then processes any pending chip drops with `simulatePeg` (five peg
-  rows, deterministic left/right per seeded FNV bit), then calls
-  `stepMachine` which:
-  1. Slides the pusher bar forward/back by its cosine phase.
-  2. If the pusher's front face has passed a column's chip stack, spills
-     the topmost chip forward (upper→lower or lower→tray = pay-out).
-  3. Runs a `settlePiles` pass — a chip landing on a peg pile that's already
-     at `MAX_STACK_HEIGHT` cascades one column forward.
-  4. Resolves per-frame contact impulses (a fresh drop nudges the column it
-     lands on; if that column is full, the shove propagates forward).
-- **What we deliberately don't model:** rotation (chips are treated as
-  flat discs settling on their pile column, not tumbling), lateral wobble
-  (a chip lands in the column its `x` maps to and stays there until it's
-  spilled forward), non-integer chip fractions (all values are chip counts).
-  These simplifications keep the engine deterministic and cheap enough to
-  publish at 4 Hz without eating room-doc bandwidth.
-- **Peg deflection RNG bias.** `simulatePeg` hashes `hashInts(seed,
-  chipId, rowIndex)` and samples the high bit (`h >>> 24) & 1`) instead of
-  the LSB — FNV-1a's low bit shows measurable non-uniformity on small
-  inputs. Tests cover both bits' distribution across many seeds.
+1. The player presses DROP ONE CHIP. The panel writes
+   `pusher-req:<mid>:<me>` = `{ requestId, player, hole, phase, requestedAt }`.
+   No chips move.
+2. The operator's next pass (at most 100 ms later) reads the requests oldest
+   first, refuses or resolves each one's timing, runs `processInsert` with its
+   own seed, and settles it (step *A drop* above).
+3. Every client sees `pusher:<mid>` change: the cabinet redraws the piles and
+   flashes the hole of the new `lastDrop`; the player's panel reads its result
+   (paid chips into the tray, timing kept or not) or its refusal.
+4. The owner presses OPEN THE DOOR → `pusher-empty:<mid>` → the operator
+   empties the machine onto the owner's rack.
 
-## Data-flow at insert
+## Review history
 
-1. Player clicks INSERT → `requestCoinPusherInsert(machineId, hole, timing,
-   ante)` reads `chipsForPlayer(myId)`, refuses if short, else
-   `submitCoinPusherInsert()` does ONE `transact()`:
-   - Debits `chips:<myId>` by `ante`.
-   - Writes `pusher-req:<mid>:<myId>` with the request record.
-   - Writes `pusher-escrow:<mid>:<myId>:<requestId>` = `ante` for
-     later refund on TTL.
-2. Owner's operator tick reads all queued requests (sorted by
-   `requestedAt`), calls `processInsert(state, ..., seed = timestamp ^
-   requestedAt)` on the pure engine — the returned state has the chip
-   dropped and `state.totalInserted += ante`.
-3. Operator's `writeCoinPusherState()` publishes new state; the operator's
-   `clearCoinPusherInsert()` removes the request + escrow record.
-4. Every peer sees the state change via `subscribeCasinoKey('pusher:<mid>')`
-   and the visual handle mirrors the piles.
-5. When a chip tips off the lower platform, the reducer credits
-   `state.pendingCredit[player]` (an object keyed by player id). Any client
-   whose id has a positive credit calls `claimCoinPusherPayout` — atomic
-   `chips:<player> += credit; state.pendingCredit[player] = 0`.
-6. Owner clicks OPEN DOOR → `commitCoinPusherEmpty(machineId, nextState,
-   ownerId, emptied)` — atomic `chips:<ownerId> += emptied; state cleared`.
-
-## Audit remediation history (r3 + r4)
-
-Independent audits caught a few WIRING-LAYER defects (the engine surface is
-covered by 63 stable vitest cases; the money side lives in the CRDT + operator
-loop). Fixes here are enumerated so the record and the tests line up.
-
-**r3 audit (previous pass — landed in commit `d60d7be`):**
-- BLOCKER #1 — an unbacked `pusher-req:<mid>:<attacker>` written directly
-  into the map would have been drained by the operator, minting into
-  `pendingCredit`. Fixed by adding an ESCROW gate in the operator's loop:
-  every request is checked for a matching `pusher-esc:<mid>:<pid>:<reqId>`
-  whose `ante` and `player` agree; anything else is torn down without a mint.
-- BLOCKER #2 — `clearCoinPusherKeys` (called when a room owner removes the
-  cabinet) only cleared the local peer's refund; remote-peer escrows were
-  silently destroyed. Fixed by refunding EVERY outstanding escrow atomically
-  with the delete.
-- #6 — TTL age gate used `request.requestedAt` (client-provided, forgeable),
-  so a hostile submitter could stamp a far-future date and permanently lock
-  their own escrow OR bypass the TTL entirely. Fixed by adding
-  `escrow.escrowedAt` and gating the refund on it (the r3 comment CLAIMED
-  server-side stamping but the code still copied requestedAt — r4 completed
-  the fix, see below).
-
-**r4 audit (this pass):**
-- MINOR — `submitCoinPusherInsert` copied `request.requestedAt` verbatim
-  into `escrow.escrowedAt` (comment claim inaccurate). Now the function
-  accepts a `nowMs` parameter that defaults to `Date.now()`, and stamps
-  `escrowedAt = nowMs` inside the same transact that debits balance and
-  writes the request. Tests demonstrate:
-  - `requestedAt = MAX_SAFE_INTEGER` no longer locks the escrow — a refund
-    at `nowMs + PUSHER_REQUEST_TTL_MS + ε` succeeds.
-  - `requestedAt = 0` no longer bypasses the TTL — the age is measured
-    from the server-stamped `escrowedAt`, not the client's field.
-  - non-finite `nowMs` is rejected before any map mutation.
-- NOTE (atomic settle) — the operator's per-insert settle previously ran
-  `publishCoinPusherState` and `clearCoinPusherInsert` as TWO separate
-  transacts. An interleaving failure between them would leave the request
-  live while the chip was already in machine state, so a next-tick re-drain
-  would mint the chip AGAIN. The new `publishAndClearCoinPusherInsert`
-  wraps all three writes (state set, request delete, escrow delete) in
-  ONE Yjs transact — a single `update` event covers both effects, and a
-  bad `nextState` shape or bad ids reject without any partial write.
-- NOTE (ownership self-heal) — `state.ownerId` was peer-writable, so a
-  hostile peer could overwrite it and permanently lock out the true room
-  owner's operator loop. `ensureCoinPusherInitialized(mid, isHouse=true)`
-  now HEALS on foreign-ownerId observation, transferring ownership while
-  preserving piles, `pendingCredit`, and every counter (money conservation
-  intact across the heal). Same code path also serves the legitimate
-  "new room owner takes over from an offline predecessor" case.
-- NOTE (real operator try/catch test) — the r3 test roster included a
-  placeholder that admitted it did not exercise the operator's try/catch.
-  Added an end-to-end integration test that faithfully emulates the drain
-  loop and forces `processInsert` to throw on one request — asserting the
-  escrow is refunded, the poison request is dropped, and later requests
-  in the same drain still settle cleanly. No chips are minted from the
-  failed insert.
+The first revision escrowed each insert's chips under `pusher-esc:` keys and
+left payouts in a `pendingCredit` map inside the machine for players to claim.
+The PR #137 review showed that both treated peer-written records as proof of
+a debit: a forged request + escrow pair could be drained into real value, a
+claim could publish any state with any amount, and teardown refunded any
+escrow-shaped record. It also found an ante that debited more chips than the
+one chip it dropped, drop timing taken from the operator's drain time instead
+of the player's press, no aggregate chip cap, an owner STOP button the
+per-frame autostart undid, a hole light that never faded, stale plan text,
+and documentation that described a 2-D lane. This revision replaces the money
+path with operator settlement (above), keeps the player's timing, adds the
+cap, removes the operator toggle, fades the light, and describes the 1-D
+model as it is.
 
 ## What still isn't done here
 
-- No robot at the cabinet (the slot machine has no dealer either — a
-  coin pusher plays without one). If we later want an idle-robot pose, add
-  it as a separate PR against the robot routine module.
-- No leaderboard / high-score across cabinets. State is per-machine.
-- No hostile-owner protection beyond conservation display — the owner
-  is the operator, so a griefer can withhold physics ticks by not opening
-  the panel. Autostart from `updateCroupier` mitigates in practice (the
-  loop starts as soon as the owner is in the room and hits it 4x/second),
-  and the TTL refund covers the "owner disappears mid-play" case.
-- Physics doesn't model chip-on-chip spin or angled slopes. If we ever want
-  the visual sag of a leaning stack, that's a rendering polish separate
-  from the deterministic reducer.
+- No robot at the cabinet, and no leaderboard across cabinets.
+- When the deed holder is away the machine is offline: the panel says so and
+  DROP is disabled; nothing is lost.
+- A cabinet removed while no managing client is online leaves its records
+  behind (the same as a slot machine).
+- The operator is trusted. Verifying drops (publishing the seed and letting
+  clients replay the transition) is possible with this engine but not built.

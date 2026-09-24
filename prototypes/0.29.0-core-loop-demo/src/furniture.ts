@@ -37,9 +37,12 @@ import type {
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
 } from "./devices";
-// 🪙 Coin pusher visual driver: the furniture builder animates the pusher
-// bar + rebuilds pile visuals from the shared `pusher:<mid>` state each frame.
-import { coinPusherPhaseNow } from "./devices";
+// 🪙 Coin pusher visual driver: the cabinet draws the engine's cross-section —
+// the pusher bar from the sweep clock, the piles from the shared state.
+import {
+  CHIP_R, HOLE_XS, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT,
+  currentPusherPhase, pusherFaceX,
+} from "./games/coinPusher";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
@@ -6173,23 +6176,27 @@ function buildSlotMachine({
 }
 
 // ── 🪙 Coin pusher (issue #135) ──────────────────────────────────────────────
-// A stand-up arcade cabinet with a glass-fronted box: three drop holes across
-// the top, a stepped upper/lower platform inside, a swinging pusher bar behind
-// the upper platform, and a coin tray at the front. Chips stay INSIDE the
-// machine until they fall off the front of the LOWER platform (paid to the
-// player who inserted them) or the owner opens the door to empty the box
-// (owner-only). No auto-siphon.
+// A stand-up arcade cabinet with a glass-fronted box: three drop holes in the
+// top, a stepped upper/lower platform inside, a sweeping pusher bar at the
+// back of the upper platform, and a coin tray at the front. Chips stay INSIDE
+// the machine until a drop pushes them off the front of the LOWER platform
+// (paid to that drop's player) or the owner opens the door to empty it. No
+// auto-siphon.
+//
+// The engine (games/coinPusher.ts) models ONE back-to-front axis, and the
+// cabinet draws exactly that cross-section: the holes sit in a back-to-front
+// row over the upper platform at the engine's hole positions, every pile is
+// drawn on the centre line at its engine position, and the pusher bar's front
+// face follows the engine's pusherFaceX(phase) through the same mapping.
 //
 // The cabinet occupies the rear ~1 m of the 1×1 footprint. Standing-only
 // device (no seat); the player walks up, focuses, times a drop, and inserts.
 //
 // Coordinate scheme (metres, item origin at rot 0):
-//   +z points AWAY from the player standing at front (x=0, z=-1.5).
-//   The three holes are along the machine's top at z ≈ +0.32.
-//   Upper platform:  z ∈ [+0.10, +0.32], y ≈ 0.90  (rear-half sits behind holes)
-//   Lower platform:  z ∈ [-0.14, +0.10], y ≈ 0.70  (front-half in front of upper)
-//   Pusher bar:      x ∈ (-0.28, +0.28), z_bar oscillates on cosine over
-//                    [PUSHER_MIN_X..PUSHER_MAX_X] mapped to z_min..z_max.
+//   +z points AWAY from the player standing at the front (x=0, z=-1.0).
+//   Upper platform:  z ∈ [+0.10, +0.32], y ≈ 0.90   engine x ∈ [0, 0.60]
+//   Lower platform:  z ∈ [-0.14, +0.10], y ≈ 0.70   engine x ∈ [0.60, 1.20]
+//   Payout tray:     z ≈ -0.20 (chips paid out leave the model)
 function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, attach }: BuildCtx) {
   // Palette (matches slot machine gunmetal + gold family so machines read as
   // a coherent arcade set on the floor).
@@ -6200,6 +6207,17 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   const CHIP_G  = 0xd4a84b; // pusher chip gold (matches cage chip color)
   const CHIP_C  = 0xe8e2d2; // ivory chip alt
   const LIGHT   = 0xfff0c8; // warm top light
+
+  // Engine axis → cabinet z. Upper platform back edge sits 5 mm in front of
+  // the rear wall so the retracted bar never z-fights it.
+  const UPPER_Z_BACK = 0.315, UPPER_Z_FRONT = 0.10;
+  const LOWER_Z_BACK = 0.10, LOWER_Z_FRONT = -0.14;
+  const Z_SCALE = (UPPER_Z_BACK - UPPER_Z_FRONT) / (PLAT_UP_FRONT - 0);
+  const upperZ = (x: number): number =>
+    UPPER_Z_BACK - (x / PLAT_UP_FRONT) * (UPPER_Z_BACK - UPPER_Z_FRONT);
+  const lowerZ = (x: number): number =>
+    LOWER_Z_BACK - ((x - PLAT_LOW_BACK) / (PLAT_LOW_FRONT - PLAT_LOW_BACK))
+      * (LOWER_Z_BACK - LOWER_Z_FRONT);
 
   const cabinet = new THREE.Group();
   attach(cabinet);
@@ -6221,8 +6239,15 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
     place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
   }
-  // Machine body — a box that houses the piles.
-  place(new THREE.BoxGeometry(0.72, 0.60, 0.72), m(BODY, 0.55, 0.45), 0, 0.84, 0.10);
+  // Machine body — an open-fronted shell (back, floor, low skirts), so the
+  // playfield shows through the glass. (A solid body box here would hide the
+  // platforms, the pusher and every chip from outside the cabinet.)
+  place(new THREE.BoxGeometry(0.72, 0.60, 0.02), m(BODY, 0.55, 0.45), 0, 0.84, 0.45);
+  place(new THREE.BoxGeometry(0.72, 0.02, 0.72), m(BODY, 0.55, 0.45), 0, 0.55, 0.10);
+  for (const sx of [-0.35, 0.35]) {
+    place(new THREE.BoxGeometry(0.02, 0.16, 0.72), m(BODY, 0.55, 0.45), sx, 0.62, 0.10);
+  }
+  place(new THREE.BoxGeometry(0.72, 0.12, 0.02), m(BODY, 0.55, 0.45), 0, 0.60, -0.26);
   // Chrome corner posts front-facing
   for (const sx of [-0.36, 0.36]) {
     place(new THREE.BoxGeometry(0.03, 0.62, 0.03), m(CHROME, 0.35, 0.7), sx, 0.84, -0.25);
@@ -6233,68 +6258,48 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   // Top warm light
   addLight(new THREE.PointLight(LIGHT, 0, 2.2), 0, 1.60, 0.10, 0.40);
 
-  // ── Marquee display (device kind + machine id chip icon) ──────────────────
+  // ── Marquee display: the title, or a short message from the panel ─────────
+  const marqueeCanvas = document.createElement('canvas');
+  marqueeCanvas.width = 512; marqueeCanvas.height = 96;
+  const marqueeCtx = marqueeCanvas.getContext('2d')!;
+  const marqueeTex = new THREE.CanvasTexture(marqueeCanvas);
+  marqueeTex.minFilter = THREE.LinearMipmapLinearFilter;
+  marqueeTex.magFilter = THREE.LinearFilter;
+  marqueeTex.generateMipmaps = true;
+  marqueeTex.anisotropy =
+    window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+  marqueeTex.colorSpace = THREE.SRGBColorSpace;
+  const paintMarquee = (text: string): void => {
+    marqueeCtx.fillStyle = '#04140B';
+    marqueeCtx.fillRect(0, 0, 512, 96);
+    marqueeCtx.strokeStyle = '#00C060';
+    marqueeCtx.lineWidth = 4;
+    marqueeCtx.strokeRect(3, 3, 506, 90);
+    marqueeCtx.fillStyle = '#73FFAA';
+    marqueeCtx.font = "bold 44px 'SF Mono','Consolas',monospace";
+    marqueeCtx.textAlign = 'center';
+    marqueeCtx.textBaseline = 'middle';
+    marqueeCtx.fillText(text, 256, 50, 480);
+    marqueeTex.needsUpdate = true;
+  };
+  paintMarquee('COIN PUSHER');
   {
-    const cv = document.createElement('canvas');
-    cv.width = 512; cv.height = 96;
-    const cx = cv.getContext('2d')!;
-    cx.fillStyle = '#04140B';
-    cx.fillRect(0, 0, 512, 96);
-    cx.strokeStyle = '#00C060';
-    cx.lineWidth = 4;
-    cx.strokeRect(3, 3, 506, 90);
-    cx.fillStyle = '#73FFAA';
-    cx.font = "bold 44px 'SF Mono','Consolas',monospace";
-    cx.textAlign = 'center';
-    cx.textBaseline = 'middle';
-    cx.fillText('COIN PUSHER', 256, 50);
-    const tex = new THREE.CanvasTexture(cv);
-    tex.minFilter = THREE.LinearMipmapLinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-    tex.generateMipmaps = true;
-    tex.anisotropy =
-      window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
-    tex.colorSpace = THREE.SRGBColorSpace;
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+    const mat = new THREE.MeshBasicMaterial({ map: marqueeTex, transparent: true, opacity: 0 });
     mat.userData.baseOpacity = 0.96;
     place(new THREE.PlaneGeometry(0.60, 0.18), mat, 0, 1.30, -0.28);
   }
 
-  // ── Three drop holes across the top face ───────────────────────────────────
-  // Two per-hole arrays: the RIM mesh (gold torus, receives the highlight
-  // emissive) and the DISC mesh (dark opening; carries click userData). The
-  // handle needs them tracked separately — an earlier revision stored only
-  // the disc and walked `disc.parent?.children[0]` to reach the rim, but
-  // `children[0]` is the cabinet's base plinth (the first mesh added by
-  // `place`), so setSelectedHole/triggerDropFx were painting the plinth
-  // instead of any hole rim (audit finding #3).
-  const holeXs = [-0.20, 0.00, 0.20];
+  // ── Three drop holes in a back-to-front row over the upper platform ───────
+  // At the engine's HOLE_XS, so a chip lands under the hole it went into.
+  // The RIM (gold torus) takes the highlight; the DISC is the dark opening.
   const holeRimMeshes: THREE.Mesh[] = [];
-  const holeDiscMeshes: THREE.Mesh[] = [];
-  for (let i = 0; i < 3; i++) {
-    // Hole rim (gold torus)
-    const rim = place(
-      new THREE.TorusGeometry(0.045, 0.010, 8, 20),
-      m(GOLD, 0.35, 0.6),
-      holeXs[i], 1.485, 0.32,
-    );
+  for (let i = 0; i < HOLE_XS.length; i++) {
+    const z = upperZ(HOLE_XS[i]);
+    const rim = place(new THREE.TorusGeometry(0.022, 0.005, 8, 20), m(GOLD, 0.35, 0.6), 0, 1.485, z);
     rim.rotation.x = -Math.PI / 2;
-    // Hole disc (dark opening)
-    const disc = place(
-      new THREE.CircleGeometry(0.038, 20),
-      m(0x040814, 0.9, 0.05),
-      holeXs[i], 1.484, 0.32,
-    );
+    const disc = place(new THREE.CircleGeometry(0.018, 20), m(0x040814, 0.9, 0.05), 0, 1.484, z);
     disc.rotation.x = -Math.PI / 2;
-    // Both meshes route the "click a hole" affordance back through the same
-    // device focus flow as the cabinet body — the panel picks up the hole.
-    for (const mesh of [rim, disc]) {
-      mesh.userData.coinPusherControl = 'hole';
-      mesh.userData.coinPusherHole = i;
-      mesh.userData.coinPusherMachineId = itemId;
-    }
     holeRimMeshes.push(rim);
-    holeDiscMeshes.push(disc);
   }
 
   // ── Interior stepped platforms (upper is BEHIND lower, one step down) ──────
@@ -6304,14 +6309,12 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     m(0xc0c8d0, 0.35, 0.55),
     0, 0.90, 0.21,
   );
-  upperPlatform.userData.skipDeviceHit = false;
   // Lower platform (front half, lower). z ∈ [-0.14, +0.10]
-  const lowerPlatform = place(
+  place(
     new THREE.BoxGeometry(0.68, 0.02, 0.24),
     m(0xc0c8d0, 0.35, 0.55),
     0, 0.70, -0.02,
   );
-  lowerPlatform.userData.skipDeviceHit = false;
   // Rear wall of upper platform (pusher hides behind)
   place(new THREE.BoxGeometry(0.72, 0.20, 0.02), m(BODY, 0.55, 0.4), 0, 1.00, 0.33);
   // Step riser between upper and lower
@@ -6330,129 +6333,117 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   place(new THREE.BoxGeometry(0.008, 0.60, 0.70), glassMat, -0.34, 0.84, 0.10);
   place(new THREE.BoxGeometry(0.008, 0.60, 0.70), glassMat, 0.34, 0.84, 0.10);
 
-  // ── Pusher bar (animated in update loop; slides across upper platform) ─────
+  // ── Pusher bar (its front face tracks the engine's pusherFaceX) ────────────
+  const BAR_DEPTH = 0.08;
   const pusher = new THREE.Group();
-  pusher.position.set(0, 0.93, 0.32); // sits above upper platform, back wall
+  pusher.position.set(0, 0.93, UPPER_Z_BACK + BAR_DEPTH / 2);
   cabinet.add(pusher);
-  const pusherBar = new THREE.Mesh(
-    new THREE.BoxGeometry(0.68, 0.05, 0.08),
-    m(CHROME, 0.35, 0.7),
-  );
-  pusher.add(pusherBar);
+  const barMat = m(CHROME, 0.35, 0.7);
+  pusher.add(new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.05, BAR_DEPTH), barMat));
 
   // ── Chip pile visuals (rebuilt from state each frame) ──────────────────────
-  const chipGeometry = new THREE.CylinderGeometry(0.030, 0.030, 0.008, 14);
-  const chipMaterials = [
-    m(CHIP_G, 0.4, 0.35),
-    m(CHIP_C, 0.4, 0.15),
-  ];
+  // Chips are drawn at the engine's scale, so neighbouring piles touch but
+  // never overlap, exactly as the engine keeps them.
+  const CHIP_H = 0.006;
+  const chipGeometry = new THREE.CylinderGeometry(CHIP_R * Z_SCALE, CHIP_R * Z_SCALE, CHIP_H, 14);
+  // Built after the registration traversal, so the fade-in never reaches
+  // these materials: update() copies the bar's revealed opacity onto them.
+  const chipMaterials = [m(CHIP_G, 0.4, 0.35), m(CHIP_C, 0.4, 0.15)];
   const chipPool: THREE.Mesh[] = [];
-  const platformGroup = new THREE.Group();
-  cabinet.add(platformGroup);
-
+  const pileGroup = new THREE.Group();
+  cabinet.add(pileGroup);
   const acquireChip = (index: number): THREE.Mesh => {
     if (index >= chipPool.length) {
-      const mesh = new THREE.Mesh(chipGeometry, chipMaterials[index % 2]);
+      const mesh = new THREE.Mesh(chipGeometry, chipMaterials[0]);
       chipPool.push(mesh);
-      platformGroup.add(mesh);
+      pileGroup.add(mesh);
     }
-    const m2 = chipPool[index];
-    m2.visible = true;
-    return m2;
-  };
-  const releaseFrom = (index: number): void => {
-    for (let i = index; i < chipPool.length; i++) chipPool[i].visible = false;
+    const chip = chipPool[index];
+    chip.visible = true;
+    return chip;
   };
 
-  // Chip-column layout on either platform: piles are rendered as vertical
-  // stacks. Upper platform x=0..0.60 in engine → mapped to z ∈ [+0.32..-0.28]
-  // (back of upper to front of lower). Both platforms live at same cabinet x
-  // (engine's x is our cabinet z; engine's y always maps to world y).
-  const engineToScene = (xEngine: number, platform: 'upper' | 'lower'): { x: number; z: number; y: number } => {
-    // Engine upper: [0, 0.60] → cabinet z: [+0.32, -0.10] (upper platform)
-    // Engine lower: [0.60, 1.20] → cabinet z: [-0.10, -0.24] (lower platform)
-    // Note: fewer chip columns render than max; we still map linearly for clarity.
-    const rangeSrc = platform === 'upper' ? [0.00, 0.60] : [0.60, 1.20];
-    const rangeDst = platform === 'upper' ? [0.32, -0.10] : [-0.10, -0.24];
-    const t = (xEngine - rangeSrc[0]) / (rangeSrc[1] - rangeSrc[0]);
-    return {
-      x: 0, // one column deep — piles vary in cabinet z, not cabinet x
-      z: rangeDst[0] + (rangeDst[1] - rangeDst[0]) * t,
-      y: platform === 'upper' ? 0.915 : 0.715,
-    };
+  // ── Hole lighting: the selected hole glows; a drop flashes and fades ──────
+  const DROP_FX_S = 0.6;
+  let selected: 0 | 1 | 2 = 1;
+  let fx: { hole: 0 | 1 | 2; left: number } | null = null;
+  const paintHoles = (): void => {
+    for (let i = 0; i < holeRimMeshes.length; i++) {
+      const std = holeRimMeshes[i].material as THREE.MeshStandardMaterial;
+      let intensity = i === selected ? 0.4 : 0;
+      if (fx && fx.hole === i) intensity = Math.max(intensity, 0.9 * (fx.left / DROP_FX_S));
+      std.emissive.setHex(intensity > 0 ? GOLD : 0x000000);
+      std.emissiveIntensity = intensity;
+    }
   };
+  paintHoles();
+
+  let messageLeft = 0;
+  /** The last drop this cabinet has shown; undefined until the first read, so
+   *  the drop already on the record when the cabinet loads doesn't flash. */
+  let seenDropId: string | null | undefined;
 
   const handle: CoinPusherVisualHandle = {
     update(dt: number): void {
+      const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
       const state = readCoinPusherState(itemId);
-      // Animate pusher: base pose z=0.32, extended pose z=+0.15 (into the
-      // upper platform from the back wall). Cosine profile matches engine.
-      let phase = 0;
-      if (state) phase = coinPusherPhaseNow(state);
-      const extend = 0.5 - 0.5 * Math.cos(2 * Math.PI * phase);
-      pusher.position.z = 0.32 - extend * 0.17;
 
-      // Rebuild chip visuals from state piles.
+      const dropId = state?.lastDrop?.requestId ?? null;
+      if (seenDropId !== undefined && dropId !== null && dropId !== seenDropId) {
+        handle.triggerDropFx(state!.lastDrop!.hole);
+      }
+      seenDropId = dropId;
+
+      if (state) {
+        const face = pusherFaceX(currentPusherPhase(state, Date.now()));
+        pusher.position.z = upperZ(face) + BAR_DEPTH / 2;
+      }
+
+      for (const mat of chipMaterials) mat.opacity = barMat.opacity;
       let idx = 0;
       if (state) {
-        for (const pile of state.upper) {
-          const scene = engineToScene(pile.x, 'upper');
-          for (let ci = 0; ci < pile.count; ci++) {
-            const mesh = acquireChip(idx++);
-            mesh.position.set(scene.x, scene.y + ci * 0.010, scene.z);
-            mesh.material = chipMaterials[ci % 2];
-          }
-        }
-        for (const pile of state.lower) {
-          const scene = engineToScene(pile.x, 'lower');
-          for (let ci = 0; ci < pile.count; ci++) {
-            const mesh = acquireChip(idx++);
-            mesh.position.set(scene.x, scene.y + ci * 0.010, scene.z);
-            mesh.material = chipMaterials[ci % 2];
+        for (const [piles, toZ, baseY] of [
+          [state.upper, upperZ, 0.91 + CHIP_H / 2],
+          [state.lower, lowerZ, 0.71 + CHIP_H / 2],
+        ] as const) {
+          for (const pile of piles) {
+            const z = toZ(pile.x);
+            for (let ci = 0; ci < pile.count; ci++) {
+              const chip = acquireChip(idx++);
+              chip.position.set(0, baseY + ci * (CHIP_H + 0.0005), z);
+              chip.material = chipMaterials[pile.chipIds[ci] % 2];
+            }
           }
         }
       }
-      releaseFrom(idx);
-      // Sanity — nudge the pusher bar height so it does not clip through the
-      // upper platform even if a peer edits state at 30fps between rebuilds.
-      void dt;
+      for (let i = idx; i < chipPool.length; i++) chipPool[i].visible = false;
+
+      if (fx) {
+        fx.left -= step;
+        if (fx.left <= 0) fx = null;
+        paintHoles();
+      }
+      if (messageLeft > 0) {
+        messageLeft -= step;
+        if (messageLeft <= 0) paintMarquee('COIN PUSHER');
+      }
     },
     setSelectedHole(hole: 0 | 1 | 2): void {
-      // Emphasise the selected hole rim in gold and cool the other two —
-      // paints ONLY the rim meshes so the plinth / disc / other cabinet
-      // parts never accidentally light up (audit finding #3 fix).
-      for (let i = 0; i < 3; i++) {
-        const rim = holeRimMeshes[i];
-        if (!rim || !(rim.material as THREE.MeshStandardMaterial).emissive) continue;
-        const isSel = i === hole;
-        const std = rim.material as THREE.MeshStandardMaterial;
-        std.emissive = new THREE.Color(isSel ? GOLD : 0x000000);
-        std.emissiveIntensity = isSel ? 0.4 : 0.0;
-      }
+      selected = hole;
+      paintHoles();
     },
-    showMessage(_message: string): void {
-      // The marquee canvas repaints from the DOM UI's flash; a full swap would
-      // require another canvas; for now this is a hook stub so the UI's
-      // deps.onMessage never throws when called.
+    showMessage(message: string): void {
+      paintMarquee(message.slice(0, 16).toUpperCase());
+      messageLeft = 2;
     },
     triggerDropFx(hole: 0 | 1 | 2): void {
-      // A short warm pulse of light at the selected hole — enough to catch
-      // the eye. Non-latching; setSelectedHole re-applies the calmer
-      // emissive on the next selection change. Targets the RIM mesh (a
-      // prior revision indexed into `holeMeshes` which held the DARK disc,
-      // leaving the disc glowing gold indefinitely — audit finding #3).
-      const rim = holeRimMeshes[hole];
-      if (!rim || !rim.material || !(rim.material as THREE.MeshStandardMaterial).emissive) return;
-      const std = rim.material as THREE.MeshStandardMaterial;
-      std.emissive = new THREE.Color(GOLD);
-      std.emissiveIntensity = 0.9;
+      fx = { hole, left: DROP_FX_S };
+      paintHoles();
     },
   };
   // The upper platform mesh carries the handle so world.ts collects it the
-  // same way it collects SlotMachineVisualHandle — the userData key naming
-  // stays symmetric.
+  // same way it collects SlotMachineVisualHandle.
   upperPlatform.userData.coinPusherVisual = handle;
-  upperPlatform.userData.coinPusherMachineId = itemId;
 }
 
 

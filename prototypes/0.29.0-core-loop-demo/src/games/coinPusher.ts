@@ -1,15 +1,15 @@
 /**
  * 🪙 Coin pusher — the pure engine (issue #135).
  *
- * A single-machine arcade coin-pusher: the player selects one of three DROP
- * HOLES at the top of the cabinet and TIMES the release relative to a moving
- * pusher on the upper stepped platform. The chip falls through a pin field
+ * A single-machine arcade coin pusher: the player picks one of three DROP
+ * HOLES at the top of the cabinet and TIMES the drop against the sweeping
+ * pusher on the upper platform. The chip falls through a pin field
  * (deterministic left/right deflection per row from a seed hash), lands on the
- * upper platform, and, over the next few seconds of pusher motion, is shoved
- * toward the front edge. Chips can stack, cascade, tip off the upper edge onto
- * the LOWER platform, and, if pushed hard enough by additional falling chips,
- * finally tip off the front of the LOWER platform into the payout tray. Only
- * chips that fall off the FRONT of the LAST PLATFORM are paid out.
+ * upper platform, and is shoved toward the front edge by the pusher. Chips
+ * stack, cascade, tip off the upper edge onto the LOWER platform, and — pushed
+ * by the chips behind them — finally tip off the front of the lower platform
+ * into the payout tray. Only chips that fall off the FRONT of the LAST
+ * PLATFORM are paid out.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * MODULE DISCIPLINE
@@ -17,96 +17,92 @@
  * This file is PURE (no Yjs / DOM / THREE / wall-clock / Math.random), the
  * same layering contract as games/checkers.ts, games/craps.ts, games/slots.ts.
  * All randomness is derived by a stable non-cryptographic hash from a caller-
- * provided seed + (hole, timing quantum, peg row), so a peer with the same
- * seed reproduces the exact chip trajectory. All time enters as an explicit
- * dt in milliseconds — the wiring layer is responsible for reading Date.now().
- * Doc I/O is in casinoDoc.ts; UI/scene wiring is in devices.ts/furniture.ts.
+ * provided seed + (hole, drop phase, peg row), so a peer with the same seed
+ * reproduces the exact chip trajectory. All time enters as explicit
+ * milliseconds — the wiring layer reads the clock. Doc I/O is in casinoDoc.ts,
+ * the operator in pusherCroupier.ts, UI/scene wiring in devices.ts and
+ * furniture.ts.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * PHYSICS MODEL
+ * PHYSICS MODEL — a 1-D cross-section
  * ─────────────────────────────────────────────────────────────────────────────
- * A 1-D horizontal cross-section keeps the engine test-friendly and
- * deterministic. Two stepped platforms sit inside the cabinet:
+ * The playfield is modelled as ONE back-to-front axis: every chip position is
+ * a single x. There is no lateral coordinate and no side drain; the three drop
+ * holes differ only in where along that axis a chip enters. Two stepped
+ * platforms sit on the axis:
  *
  *      UPPER PLATFORM ────  x ∈ [PLAT_UP_BACK, PLAT_UP_FRONT]
- *      LOWER PLATFORM ──────  x ∈ [PLAT_LOW_BACK, PLAT_LOW_FRONT]  (wider, in front)
+ *      LOWER PLATFORM ──────  x ∈ [PLAT_LOW_BACK, PLAT_LOW_FRONT]  (in front)
  *
- * A "pile" is a vertical stack of chips at the same x-column. Piles are
- * kept sorted by x (back → front) and separated by ≥ 2·CHIP_R (chip
- * diameter): a settlement pass enforces both constraints on every mutation,
- * so peer-written states that arrive with overlap are re-settled before
- * a physics step, which keeps the engine total (never diverges).
+ * A "pile" is a vertical stack of chips at one x. Piles are kept sorted by x
+ * (back → front) and separated by ≥ 2·CHIP_R (one chip diameter): a
+ * settlement pass enforces both on every mutation, so a peer-written state
+ * that arrives with overlap is re-settled before a physics step, which keeps
+ * the engine total (it never diverges).
  *
  * Only the UPPER platform has an active pusher (the sweep bar); the LOWER
- * platform is driven purely by the WEIGHT of chips landing onto it from
- * above (each falling pile shoves the underlying lower-platform pile
- * forward by one chip diameter, and the shove propagates through any
- * abutting piles ahead — this is the CASCADE mechanic in the spec).
+ * platform is driven by the weight of chips landing on it from above (each
+ * falling pile shoves the pile under it forward, and the shove propagates
+ * through any abutting piles ahead — the CASCADE mechanic of the issue).
  *
- * Sweep pusher motion: a cosine oscillation with period PUSHER_PERIOD_MS.
- * Only the FORWARD half of the cycle imparts push force (a retracting
- * pusher does not drag chips backward — chips advance monotonically, which
- * is the whole game). The pusher front-face position is a strict lower
- * bound on the leftmost upper pile; any upper pile pushed past PLAT_UP_FRONT
- * FALLS onto the lower platform.
+ * Sweep pusher: a cosine oscillation with period PUSHER_PERIOD_MS. Only the
+ * FORWARD half imparts force (a retracting pusher does not drag chips back).
+ * One full cycle compresses the piles as far as the pusher can reach, so a
+ * second cycle moves nothing: the machine is at rest between inserts, and the
+ * physics only runs when a chip is dropped (processInsert settles a full cycle
+ * after every drop). Nothing leaves the machine on its own.
+ *
+ * The sweep itself is a free-running clock: (pusherPhase, pusherAtMs) anchor
+ * it when the machine is created and drops never move it, so every client
+ * draws the same pusher from its own wall clock (currentPusherPhase) and the
+ * player times the drop against that. The drop's physics starts from the
+ * phase the player saw (resolveDropTiming), not from the anchor.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * CONSERVATION INVARIANT (essential — dev, playtest, and vitest all check)
+ * CONSERVATION INVARIANT (dev, playtest and vitest all check it)
  * ─────────────────────────────────────────────────────────────────────────────
  *
  *      totalInserted === chipsInMachine + totalPaid + totalEmptied
  *
- * Every path that adds or removes chips updates exactly one counter on
- * each side of this identity. Peer-written state that violates the guard's
- * numeric range is rejected wholesale (see isCoinPusherState). Peer-written
- * state that satisfies the guard but breaks conservation is REPAIRED by
- * settlePiles + re-checked at every physics step: piles are only ever
- * reordered/merged, never counted twice or dropped.
- *
- * The money side (casino chip balances) is enforced by the wiring layer
- * in casinoDoc.ts: an insert debits the player's `bal:<pid>` in the SAME
- * transaction as writing the escrow record, and a pending-credit claim
- * transfers value in the SAME transaction as zeroing the credit. See the
- * casinoDoc header for the LWW / whole-value / one-writer-per-key rules.
+ * Every path that adds or removes chips updates exactly one counter on each
+ * side. The MONEY side is the operator's (pusherCroupier.ts): one settle
+ * transaction debits the inserting player's one chip, credits exactly the
+ * chips this insert paid out, publishes the new machine state and clears the
+ * request (casinoDoc.settleCoinPusherInsert). Players never write money for
+ * the machine and never claim payouts — there is nothing to forge.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * AUTHORITY / CONVERGENCE MODEL (see brainstorming/coin-pusher-plan.md)
+ * AUTHORITY
  * ─────────────────────────────────────────────────────────────────────────────
- * The machine's shared record is stored under the casino map key
- * `pusher:<machineId>` and follows the SLOTS.ts precedent:
- *
- *   • Insert requests are per-player records (`pusher-req:<mid>:<pid>`).
- *   • The MACHINE OWNER's client is the sole operator that drains the queue,
- *     advances physics, and publishes the whole-value LWW state.
- *   • Per-insert ESCROW records (`pusher-esc:<mid>:<pid>:<reqId>`) hold the
- *     debited chip until the operator settles or a reconciler refunds after
- *     the request's TTL — no operator, no chip loss.
- *   • Owner-empty is a same-transaction pair: state write with `upper/lower`
- *     cleared + `totalEmptied` incremented, and `creditChips(ownerId, N)`.
- *   • A hostile peer writing junk into the coinpusher key is REJECTED by
- *     isCoinPusherState() on every read; the wiring layer degrades to the
- *     last known-good state or falls back to `initialCoinPusherState`.
- *
- * Owner-offline: no one can operate the machine (documented limitation in
- * the plan doc + CHANGELOG). This matches the room-editor / slot-croupier
- * precedent and mint/burn safety is worth the loss of anonymous play.
+ * The shared record is `pusher:<machineId>` in the casino map (whole-value
+ * LWW), written only by the elected operator — the slot-croupier pattern:
+ *   • a player writes an insert REQUEST (`pusher-req:<mid>:<pid>`: hole + the
+ *     pusher phase they saw when they pressed INSERT); no chips move;
+ *   • the operator validates it (chips on hand, room in the machine, the
+ *     claimed phase inside the timing window — resolveDropTiming), runs
+ *     processInsert with a seed it draws itself, and settles;
+ *   • only the machine OWNER may empty it, and that too goes through the
+ *     operator (`pusher-empty:<mid>`), so an empty never races an insert.
+ * Every doc read shape-guards (isCoinPusherState etc.): a hostile peer that
+ * writes junk into these keys makes other clients see no machine, never a
+ * corrupt one.
  */
 
 // ── Physical constants (metres, millis) ──────────────────────────────────────
 //
 // The x-axis runs BACK → FRONT of the cabinet. Origin (x=0) is the back wall
 // of the upper platform; positive x goes towards the payout tray. Both
-// platforms live on the same x-axis, side-by-side (the lower is IN FRONT of
-// the upper, one geometric step down in y that the pure engine ignores):
+// platforms live on the same x-axis (the lower one is IN FRONT of the upper,
+// one geometric step down in y that the pure engine ignores):
 //
 //     x=0.00                  0.60                  1.20
 //       ├──── UPPER ─────────┼──── LOWER ──────────┤
 //       ▓ pusher                                     ▐ payout
-//       ▓  rest  →  extends to 0.50    ...           ▐  tray
+//       ▓  rest  →  extends to 0.51    ...           ▐  tray
 //
-// A chip pushed past x=0.60 tips off the upper front and lands on the back
-// of the lower (near x=0.63 after clamping). Chips pushed past x=1.20 tip
-// off the front of the lower and become PAYOUT to the current inserter.
+// A chip pushed past x=0.60 tips off the upper front and lands on the back of
+// the lower (near x=0.63 after clamping). Chips pushed past x=1.20 tip off
+// the front of the lower and are paid out to the player whose drop moved them.
 
 /** One chip's radius on the horizontal axis (also its diameter/2 for stacking). */
 export const CHIP_R = 0.030;
@@ -128,19 +124,20 @@ export const PUSHER_MAX_X = PLAT_UP_FRONT - PILE_STEP * 1.5; // 0.51
 /** One complete forward-and-back cycle of the sweep bar (ms). */
 export const PUSHER_PERIOD_MS = 2400;
 
-/** Horizontal positions of the three drop holes across the top of the cabinet.
- *  Spread evenly over the upper platform so each hole has a distinct landing
- *  zone even after the ±(TIMING_OFFSET + PEG rows·PEG_DEFLECTION) drift. */
+/** Positions of the three drop holes along the axis (over the upper
+ *  platform), spread so each hole has a distinct landing zone even after the
+ *  ±(TIMING_OFFSET + PEG_ROWS·PEG_DEFLECTION) drift. */
 export const HOLE_XS: readonly number[] = [0.15, 0.30, 0.45] as const;
 export const HOLE_COUNT = HOLE_XS.length;
 
 /** Fixed substep for the pusher-driven physics — small enough that the front
  *  face moves ≪ CHIP_R per substep at peak velocity, so cascades resolve
- *  without tunnelling through piles. Independent of the settle-step count. */
+ *  without tunnelling through piles. */
 export const PHYSICS_SUBSTEP_MS = 40;
 
-/** Simulate this many ms of pusher motion after each insert so the chip has
- *  a chance to interact with existing piles (one full period + one substep). */
+/** Pusher motion simulated after each drop (one full period + one substep),
+ *  so the drop interacts with every pile the pusher can reach and the machine
+ *  comes back to rest. */
 export const SETTLE_MS = PUSHER_PERIOD_MS + PHYSICS_SUBSTEP_MS;
 
 /** Peg field: rows of pins the chip deflects off between the hole and the
@@ -148,27 +145,49 @@ export const SETTLE_MS = PUSHER_PERIOD_MS + PHYSICS_SUBSTEP_MS;
  *  for real skill+luck but still small enough to test exhaustively. */
 export const PEG_ROWS = 5;
 /** Sideways displacement per peg row (metres). Tuned so a full ±5-bit walk
- *  spans about one hole spacing (a well-timed drop stays under its hole,
- *  a poorly-timed one wanders one hole over). */
+ *  spans about one hole spacing. */
 export const PEG_DEFLECTION = 0.020;
 
-/** Timing offset scale — a maximally miss-timed drop biases the entry x by
- *  ±CHIP_R (about one chip diameter), so timing matters but never enough to
- *  bypass the peg field entirely. */
+/** How far the drop phase shifts the entry point: ±CHIP_R over a full cycle,
+ *  so timing matters but never enough to bypass the peg field entirely. */
 export const TIMING_OFFSET = CHIP_R;
 
-/** Owner-set per-insert fee ceiling (chips). One chip per insert is the
- *  classical price — but a room owner may configure their machine's ANTE
- *  higher in the wiring layer if they wish. */
-export const PUSHER_MAX_ANTE = 100;
+/** Chips per insert. A coin pusher takes one coin per drop; the money side
+ *  (casinoDoc.settleCoinPusherInsert) debits exactly this. */
+export const PUSHER_ANTE = 1;
 
-/** Physical stability cap on a chip column. When a landing pushes a
- *  column's count past this, the excess chips SPILL forward to the pile
- *  ahead (which may itself spill, chain-cascading toward the front). This
- *  matches the spec's cascade language: "groups of chips can fall together,
- *  or off the front of a group". Beyond ~4 chips a stack becomes unstable
- *  and the top chip slides off the front toward the next pile. */
+/** Physical stability cap on a chip column. When a landing pushes a column
+ *  past this, the excess SPILLS forward to the pile ahead (which may itself
+ *  spill, chain-cascading toward the front) — the issue's "groups of chips
+ *  fall together, or off the front of a group". */
 export const MAX_STACK_HEIGHT = 4;
+
+/** How late an insert may reach the operator and still drop at the phase the
+ *  player saw (network + drain delay). An older claim — or a phase that was
+ *  never on screen within the window — drops at the operator's current phase
+ *  instead (resolveDropTiming). */
+export const MAX_DROP_LAG_MS = 1000;
+/** How far AHEAD of the operator's pusher a claimed phase may be and still be
+ *  kept. Every client derives the pusher from its own wall clock (there is no
+ *  shared clock on the mesh), so a player whose clock runs a little ahead of
+ *  the operator's sees the pusher slightly ahead. Both bounds sum to well
+ *  under one PUSHER_PERIOD_MS, so the window is unambiguous. */
+export const MAX_DROP_LEAD_MS = 250;
+
+/** How long a player's panel waits for the operator before withdrawing its
+ *  own request. A request carries no chips, so a withdrawn one needs no
+ *  refund. */
+export const PUSHER_REQUEST_TTL_MS = 15_000;
+/** The operator refuses (moving nothing) a request older than this by its own
+ *  clock — one left behind by a closed tab while no operator was online.
+ *  Generous, so clock skew between browsers never trips it. */
+export const PUSHER_STALE_REQUEST_MS = 120_000;
+
+/** Most chips the cabinet can physically hold. The platforms fit ~11 piles
+ *  each at MAX_STACK_HEIGHT, i.e. ≤ 88 chips; this is the guard's aggregate
+ *  ceiling (a peer state above it is rejected, so the renderer's per-chip
+ *  meshes stay bounded) and the point at which processInsert refuses a drop. */
+export const MACHINE_MAX_CHIPS = 128;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -183,6 +202,42 @@ export interface Pile {
   chipIds: number[];
 }
 
+/** Which drop hole a chip goes through (0 = left, 1 = centre, 2 = right). */
+export type PusherHole = 0 | 1 | 2;
+
+/** The most recent settled drop — every client animates it on the cabinet,
+ *  and the dropping player's panel reads its result. */
+export interface PusherLastDrop {
+  requestId: string;
+  player: string;
+  hole: PusherHole;
+  chipId: number;
+  landedX: number;
+  /** Chips this drop paid out to `player`. */
+  paid: number;
+  /** The pusher phase the chip fell at. */
+  phase: number;
+  /** True when that is the phase the player saw (their timing was kept);
+   *  false when the claim fell outside the window and the chip dropped at
+   *  the operator's current phase. */
+  honored: boolean;
+  /** Operator clock when the drop settled. */
+  atMs: number;
+}
+
+/** Why the operator turned an insert down. No chip moves on a refusal. */
+export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired';
+
+/** The most recent refused insert, so the requesting player's panel can say
+ *  why nothing happened. */
+export interface PusherRefusal {
+  requestId: string;
+  player: string;
+  reason: PusherRefusalReason;
+  /** Operator clock when the request was turned down. */
+  atMs: number;
+}
+
 /**
  * The full doc-synced machine state — plain JSON, whole-value LWW write per
  * machine key. `kind` discriminates it inside the shared casino map (the
@@ -190,7 +245,7 @@ export interface Pile {
  */
 export interface CoinPusherState {
   kind: 'coin-pusher';
-  /** Machine owner (fixed at spawn). Only the owner may empty the machine. */
+  /** Machine owner — the only player who may open the door and empty it. */
   ownerId: string;
   /** Upper platform piles, back-to-front (sorted by x ascending). */
   upper: Pile[];
@@ -198,76 +253,64 @@ export interface CoinPusherState {
   lower: Pile[];
   /** Monotonic chip identity for conservation checks + rendering continuity. */
   nextChipId: number;
-  /** Pusher animation phase [0, 1) at `pusherAtMs`. */
+  /** Pusher phase [0, 1) at `pusherAtMs`: the anchor of the free-running
+   *  sweep. Its phase at any time is currentPusherPhase(state, t). */
   pusherPhase: number;
-  /** Wall-clock ms at which the current `pusherPhase` should be rendered —
-   *  the anchor point for `currentPusherPhase(state, Date.now())`'s per-frame
-   *  interpolation. The renderer at furniture.ts computes
-   *  `dt = max(0, Date.now() - pusherAtMs)` and advances the phase by
-   *  `dt / PUSHER_PERIOD_MS`, so pusherAtMs MUST stay <= wall clock or the
-   *  visual freezes (audit r5 fix: pusherAtMs is re-anchored to the caller's
-   *  `nowMs` after processInsert's SETTLE_MS advance, and the operator's
-   *  free-running physics catches up from `state.pusherAtMs` rather than a
-   *  private lastTickAt cursor — see the tickCoinPusherOperator comment).
-   *  Substep-level accumulation inside a single advanceSim() run is fine —
-   *  what matters is that when control returns to the caller, pusherAtMs
-   *  reflects the wall-clock time the CALLER associates with the new phase.
-   *  The pure engine never reads Date.now(); the wiring layer stamps this. */
+  /** Wall-clock ms the phase is anchored at (set when the machine is created;
+   *  drops never move it). */
   pusherAtMs: number;
-  /** Monotonic write counter — every mutating helper bumps it. Peer readers
-   *  can use it to detect stale updates; whole-value LWW resolves ties. */
+  /** Monotonic write counter — every mutating helper bumps it. */
   tick: number;
-  /** playerId → chips owed for chips that fell off the LOWER FRONT. Cleared
-   *  by the wiring layer's claim path in the same transaction as
-   *  `creditChips`, so conservation across doc + casino is atomic. */
-  pendingCredit: Record<string, number>;
   /** Lifetime chips inserted into THIS machine. */
   totalInserted: number;
   /** Lifetime chips that fell off the FRONT of the LOWER platform (paid out). */
   totalPaid: number;
   /** Lifetime chips removed by an owner-triggered door-open. */
   totalEmptied: number;
+  /** The last settled drop (absent until the first one). */
+  lastDrop?: PusherLastDrop;
+  /** The last refused insert (absent until the first one). */
+  lastRefusal?: PusherRefusal;
 }
 
-/** Which drop hole a chip goes through (0 = left, 1 = centre, 2 = right). */
-export type PusherHole = 0 | 1 | 2;
-
-/** Insert-request record placed by a would-be player under
- *  `pusher-req:<machineId>:<playerId>`, drained by the machine owner. */
+/** Insert request a player writes under `pusher-req:<machineId>:<playerId>`.
+ *  It carries no money: the operator debits the chip when it settles. */
 export interface PusherInsertRequest {
   requestId: string;
   player: string;
   hole: PusherHole;
-  /** Timing offset in [0, 1) selected by the player at insert time. */
-  timing: number;
-  /** Chip stake paid at insert (typically 1). Bounded by PUSHER_MAX_ANTE. */
-  ante: number;
-  /** Client-side ms timestamp for TTL / recency; not authoritative. */
+  /** The pusher phase ∈ [0, 1) on the player's screen when they pressed
+   *  INSERT — the timing the drop is made at (resolveDropTiming). */
+  phase: number;
+  /** Client-side ms timestamp; display / ordering only, never authoritative. */
   requestedAt: number;
 }
 
-/** Escrow record parked under `pusher-esc:<machineId>:<playerId>:<requestId>`
- *  while a request is waiting on the operator. The reconciler refunds this
- *  after the TTL if the operator never processed it. */
-export interface PusherEscrow {
+/** The owner's door-open request under `pusher-empty:<machineId>`, executed
+ *  by the operator so it is ordered with the inserts. */
+export interface PusherEmptyRequest {
   requestId: string;
-  player: string;
-  ante: number;
-  escrowedAt: number;
+  requester: string;
+  requestedAt: number;
 }
 
 // ── Guards (peer trust boundary) ─────────────────────────────────────────────
 
-/** A safe non-negative integer in the allowed chip-count range (0..MAX_SAFE). */
+/** A safe non-negative integer. */
 function isCountInt(v: unknown): v is number {
   return Number.isSafeInteger(v) && (v as number) >= 0;
 }
 
-/** Peer state MUST NOT ship an insanely large chip list — a hostile peer could
- *  otherwise stall render/settle loops with a length-2^30 pile. This ceiling
- *  is well above any realistic filled cabinet. */
-const PILE_MAX_CHIPS = 4096;
-const PLATFORM_MAX_PILES = 256;
+function isBoundedId(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && v.length <= 128;
+}
+
+/** Per-pile and per-platform ceilings. The engine never builds a column above
+ *  MAX_STACK_HEIGHT or more than ~11 piles on a platform; these leave headroom
+ *  for a state mid-settle while keeping a hostile peer from shipping giant
+ *  arrays. MACHINE_MAX_CHIPS bounds the total across both platforms. */
+const PILE_MAX_CHIPS = 2 * MAX_STACK_HEIGHT;
+const PLATFORM_MAX_PILES = 24;
 
 function isPile(v: unknown): v is Pile {
   if (typeof v !== 'object' || v === null) return false;
@@ -286,64 +329,111 @@ function isPileArray(v: unknown): v is Pile[] {
   return Array.isArray(v) && v.length <= PLATFORM_MAX_PILES && v.every(isPile);
 }
 
-function isPendingCredit(v: unknown): v is Record<string, number> {
+function isHole(v: unknown): v is PusherHole {
+  return v === 0 || v === 1 || v === 2;
+}
+
+function isPhase(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1;
+}
+
+function isLastDrop(v: unknown): v is PusherLastDrop {
   if (typeof v !== 'object' || v === null) return false;
-  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-    if (typeof k !== 'string' || k.length === 0 || k.length > 128) return false;
-    if (!isCountInt(val)) return false;
-  }
-  return true;
+  const d = v as Partial<PusherLastDrop>;
+  return isBoundedId(d.requestId) && isBoundedId(d.player) && isHole(d.hole)
+    && isCountInt(d.chipId)
+    && typeof d.landedX === 'number' && Number.isFinite(d.landedX)
+    && isCountInt(d.paid) && (d.paid as number) <= MACHINE_MAX_CHIPS
+    && isPhase(d.phase) && typeof d.honored === 'boolean'
+    && typeof d.atMs === 'number' && Number.isFinite(d.atMs);
+}
+
+const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired'];
+
+function isRefusal(v: unknown): v is PusherRefusal {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<PusherRefusal>;
+  return isBoundedId(r.requestId) && isBoundedId(r.player)
+    && REFUSAL_REASONS.includes(r.reason as PusherRefusalReason)
+    && typeof r.atMs === 'number' && Number.isFinite(r.atMs);
 }
 
 /** Shape guard for a peer-written coin-pusher state. Everything the engine
- *  and UI dereference is checked; a rejection means the reader falls back to
- *  the last known-good state or the initial state. See module header. */
+ *  and UI dereference is checked, including the aggregate chip ceiling; a
+ *  rejection means readers see no machine. Unknown extra fields are ignored
+ *  (normalizeCoinPusherState drops them). */
 export function isCoinPusherState(v: unknown): v is CoinPusherState {
   if (typeof v !== 'object' || v === null) return false;
   const s = v as Partial<CoinPusherState>;
-  return s.kind === 'coin-pusher'
-    && typeof s.ownerId === 'string'
-    && (s.ownerId as string).length > 0
-    && (s.ownerId as string).length <= 128
+  if (!(s.kind === 'coin-pusher'
+    && isBoundedId(s.ownerId)
     && isPileArray(s.upper)
     && isPileArray(s.lower)
     && isCountInt(s.nextChipId)
-    && typeof s.pusherPhase === 'number'
-    && Number.isFinite(s.pusherPhase)
-    && (s.pusherPhase as number) >= 0 && (s.pusherPhase as number) < 1
+    && isPhase(s.pusherPhase)
     && typeof s.pusherAtMs === 'number' && Number.isFinite(s.pusherAtMs)
     && isCountInt(s.tick)
-    && isPendingCredit(s.pendingCredit)
     && isCountInt(s.totalInserted)
     && isCountInt(s.totalPaid)
-    && isCountInt(s.totalEmptied);
+    && isCountInt(s.totalEmptied)
+    && (s.lastDrop === undefined || isLastDrop(s.lastDrop))
+    && (s.lastRefusal === undefined || isRefusal(s.lastRefusal)))) return false;
+  let chips = 0;
+  for (const p of s.upper as Pile[]) chips += p.count;
+  for (const p of s.lower as Pile[]) chips += p.count;
+  return chips <= MACHINE_MAX_CHIPS;
+}
+
+/** A guarded state with only the known fields — what the operator publishes
+ *  (a field an earlier revision wrote, or a peer smuggled in, is dropped). */
+export function normalizeCoinPusherState(v: unknown): CoinPusherState | null {
+  if (!isCoinPusherState(v)) return null;
+  const out: CoinPusherState = {
+    kind: 'coin-pusher',
+    ownerId: v.ownerId,
+    upper: copyPiles(v.upper),
+    lower: copyPiles(v.lower),
+    nextChipId: v.nextChipId,
+    pusherPhase: v.pusherPhase,
+    pusherAtMs: v.pusherAtMs,
+    tick: v.tick,
+    totalInserted: v.totalInserted,
+    totalPaid: v.totalPaid,
+    totalEmptied: v.totalEmptied,
+  };
+  if (v.lastDrop) {
+    const d = v.lastDrop;
+    out.lastDrop = {
+      requestId: d.requestId, player: d.player, hole: d.hole, chipId: d.chipId,
+      landedX: d.landedX, paid: d.paid, phase: d.phase, honored: d.honored, atMs: d.atMs,
+    };
+  }
+  if (v.lastRefusal) {
+    const r = v.lastRefusal;
+    out.lastRefusal = { requestId: r.requestId, player: r.player, reason: r.reason, atMs: r.atMs };
+  }
+  return out;
 }
 
 export function isPusherInsertRequest(v: unknown): v is PusherInsertRequest {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<PusherInsertRequest>;
-  return typeof r.requestId === 'string' && (r.requestId as string).length > 0 && (r.requestId as string).length <= 128
-    && typeof r.player === 'string' && (r.player as string).length > 0 && (r.player as string).length <= 128
-    && (r.hole === 0 || r.hole === 1 || r.hole === 2)
-    && typeof r.timing === 'number' && Number.isFinite(r.timing)
-    && (r.timing as number) >= 0 && (r.timing as number) <= 1
-    && isCountInt(r.ante) && (r.ante as number) > 0 && (r.ante as number) <= PUSHER_MAX_ANTE
+  return isBoundedId(r.requestId) && isBoundedId(r.player) && isHole(r.hole)
+    && isPhase(r.phase)
     && typeof r.requestedAt === 'number' && Number.isFinite(r.requestedAt);
 }
 
-export function isPusherEscrow(v: unknown): v is PusherEscrow {
+export function isPusherEmptyRequest(v: unknown): v is PusherEmptyRequest {
   if (typeof v !== 'object' || v === null) return false;
-  const e = v as Partial<PusherEscrow>;
-  return typeof e.requestId === 'string' && (e.requestId as string).length > 0 && (e.requestId as string).length <= 128
-    && typeof e.player === 'string' && (e.player as string).length > 0 && (e.player as string).length <= 128
-    && isCountInt(e.ante) && (e.ante as number) > 0 && (e.ante as number) <= PUSHER_MAX_ANTE
-    && typeof e.escrowedAt === 'number' && Number.isFinite(e.escrowedAt);
+  const r = v as Partial<PusherEmptyRequest>;
+  return isBoundedId(r.requestId) && isBoundedId(r.requester)
+    && typeof r.requestedAt === 'number' && Number.isFinite(r.requestedAt);
 }
 
-// ── Initial state factories ──────────────────────────────────────────────────
+// ── Initial state factory ────────────────────────────────────────────────────
 
 export function initialCoinPusherState(ownerId: string, nowMs = 0): CoinPusherState {
-  if (typeof ownerId !== 'string' || ownerId.length === 0 || ownerId.length > 128) {
+  if (!isBoundedId(ownerId)) {
     throw new RangeError('initialCoinPusherState: ownerId must be a bounded non-empty string');
   }
   return {
@@ -355,7 +445,6 @@ export function initialCoinPusherState(ownerId: string, nowMs = 0): CoinPusherSt
     pusherPhase: 0,
     pusherAtMs: Number.isFinite(nowMs) ? nowMs : 0,
     tick: 0,
-    pendingCredit: {},
     totalInserted: 0,
     totalPaid: 0,
     totalEmptied: 0,
@@ -370,8 +459,7 @@ function clamp(v: number, lo: number, hi: number): number {
 
 function mod1(v: number): number {
   const r = v - Math.floor(v);
-  // Guard the exact-1.0 float-rounding edge (Math.floor(0.999...) === 0 but
-  // 1 - Math.floor(1) === 0 already; belt-and-braces for negative dt too).
+  // Guard the exact-1.0 float-rounding edge (belt-and-braces for negative dt too).
   return r < 0 ? r + 1 : r >= 1 ? 0 : r;
 }
 
@@ -541,10 +629,11 @@ export function insertOnPlatform(
 // ── Peg deflection ───────────────────────────────────────────────────────────
 
 /**
- * Deterministic peg deflection: given a hole index, a timing offset ∈ [0, 1),
- * and a seed, walk the chip through PEG_ROWS binary left/right choices to
- * arrive at a landing x on the upper platform. This is the ONLY randomness
- * in chip motion — everything downstream is a rigid-body slide.
+ * Deterministic peg deflection: given a hole index, the pusher PHASE at the
+ * drop ∈ [0, 1) (the player's timing — see resolveDropTiming), and a seed,
+ * walk the chip through PEG_ROWS binary left/right choices to arrive at a
+ * landing x on the upper platform. This is the ONLY randomness in chip motion
+ * — everything downstream is a rigid-body slide.
  */
 export function simulatePeg(hole: PusherHole, timing: number, seed: number): number {
   const t = Number.isFinite(timing) ? clamp(timing, 0, 1) : 0.5;
@@ -590,14 +679,18 @@ export function stepMachine(
     return { state, paidChipIds: [], upperFallen: 0 };
   }
 
-  const newPhase = mod1(state.pusherPhase + dtMs / PUSHER_PERIOD_MS);
-  const newFace = pusherFaceX(newPhase);
-  const prevFace = pusherFaceX(state.pusherPhase);
-
-  // Pusher's front face constrains the leftmost upper pile's x. If the
-  // pusher is retracting (newFace < prevFace) it does not DRAG piles
-  // backward: pass the previous (higher) constraint so piles stay put.
-  const constraint = Math.max(newFace, prevFace) + CHIP_R;
+  const span = dtMs / PUSHER_PERIOD_MS;
+  const newPhase = mod1(state.pusherPhase + span);
+  // The furthest the front face reached during this substep: the full
+  // extension if the substep swept through phase ½, else the further end.
+  // (A retracting pusher does not DRAG piles backward, so the constraint is
+  // this maximum, never the current face.) Taking the true maximum rather
+  // than the substep endpoints means one full cycle compresses the piles all
+  // the way, so the machine is exactly at rest afterwards.
+  const reach = mod1(0.5 - state.pusherPhase) <= span
+    ? PUSHER_MAX_X
+    : Math.max(pusherFaceX(newPhase), pusherFaceX(state.pusherPhase));
+  const constraint = reach + CHIP_R;
 
   const upperResult = settlePiles(state.upper, constraint, PLAT_UP_FRONT);
   let upper = upperResult.piles;
@@ -629,21 +722,15 @@ export function stepMachine(
 
 /**
  * Advance the machine by `elapsedMs` in fixed PHYSICS_SUBSTEP_MS substeps.
- * Payout attribution: the pending-credit is credited to `payoutTo` (usually
- * the current insert's player). Callers may pass `null` to leave payouts
- * UNATTRIBUTED — `totalPaid` is still bumped for conservation, but the
- * chips are NOT written to any `pendingCredit[]` entry and therefore
- * NEVER reach a real player balance. The wiring layer MUST NOT pass
- * `null` during idle physics ticks (audit finding #2): use `state.ownerId`
- * for ambient sweep — the machine owner earns what tips off between
- * inserts. `null` is reserved for dev-tool inspection where the caller
- * wants to see the pile settle without a ledger entry.
+ * Returns the chips that fell off the lower front (`totalPaid` is bumped for
+ * them); whoever caused the run decides who they are paid to. Used by
+ * processInsert's settle and by tests / dev inspection — the operator never
+ * runs physics on its own (the machine is at rest between drops).
  */
 export function advanceSim(
   state: CoinPusherState,
   elapsedMs: number,
-  payoutTo: string | null,
-): { state: CoinPusherState; paidChipIds: number[]; } {
+): { state: CoinPusherState; paidChipIds: number[] } {
   if (!(elapsedMs > 0) || !Number.isFinite(elapsedMs)) {
     return { state, paidChipIds: [] };
   }
@@ -656,89 +743,96 @@ export function advanceSim(
     cur = r.state;
     allPaid.push(...r.paidChipIds);
   }
-  if (payoutTo && allPaid.length > 0) {
-    const next: CoinPusherState = {
-      ...cur,
-      pendingCredit: {
-        ...cur.pendingCredit,
-        [payoutTo]: (cur.pendingCredit[payoutTo] ?? 0) + allPaid.length,
-      },
-    };
-    return { state: next, paidChipIds: allPaid };
-  }
   return { state: cur, paidChipIds: allPaid };
 }
 
 /**
- * Drop one chip through hole `hole` with player-chosen `timing`, then run
- * SETTLE_MS of pusher motion so the drop has time to interact. Returns the
- * new state plus a report so the caller can:
- *   1. Debit `ante` chips from the player's balance (one whole tx).
- *   2. Publish the new state to the doc.
- *   3. Credit `paidChipIds.length` chips to the player, and clear their
- *      pending-credit entry in the SAME transaction.
+ * The drop's timing: which pusher phase the chip falls at.
  *
- * The engine does NOT touch player balances — the wiring layer owns that
- * (see casinoDoc header for the LWW/whole-value/one-writer-per-key rules).
- * `ante` is only recorded as `totalInserted` so the conservation invariant
- * holds; the money side is the wiring layer's job.
+ * The player's request carries the phase that was on their screen when they
+ * pressed INSERT. It reaches the operator a little later (sync + drain), by
+ * which time the pusher has moved on. `lagMs` is how far the operator's
+ * pusher at `receivedAtMs` is past the claimed phase (negative when the claim
+ * is ahead — a player clock running fast). A claim inside
+ * [−maxLeadMs, maxLagMs] is kept: the chip falls at exactly the phase the
+ * player saw. Anything else (a stale request, a phase that was never on
+ * screen in that window, junk) falls at the operator's current phase, so an
+ * out-of-window claim never gains anything.
+ */
+export function resolveDropTiming(
+  state: CoinPusherState,
+  claimedPhase: number,
+  receivedAtMs: number,
+  maxLagMs: number = MAX_DROP_LAG_MS,
+  maxLeadMs: number = MAX_DROP_LEAD_MS,
+): { dropPhase: number; honored: boolean; lagMs: number } {
+  const nowPhase = currentPusherPhase(state, receivedAtMs);
+  if (!isPhase(claimedPhase) || !Number.isFinite(receivedAtMs)) {
+    return { dropPhase: nowPhase, honored: false, lagMs: NaN };
+  }
+  // Signed distance in (−½, ½] of a cycle: the nearer of "behind" and "ahead".
+  const lagMs = (mod1(nowPhase - claimedPhase + 0.5) - 0.5) * PUSHER_PERIOD_MS;
+  if (lagMs <= Math.min(maxLagMs, PUSHER_PERIOD_MS / 2)
+    && -lagMs <= Math.min(maxLeadMs, PUSHER_PERIOD_MS / 2)) {
+    return { dropPhase: claimedPhase, honored: true, lagMs };
+  }
+  return { dropPhase: nowPhase, honored: false, lagMs };
+}
+
+/**
+ * Drop one chip through `hole` at pusher phase `dropPhase` (see
+ * resolveDropTiming), then run SETTLE_MS of pusher motion so the drop plays
+ * out and the machine comes back to rest. Returns the new state and `paid`:
+ * the chips this drop knocked into the payout tray, which the operator
+ * credits to `playerId` in the same transaction that debits their
+ * PUSHER_ANTE chip (casinoDoc.settleCoinPusherInsert).
  *
- * `nowMs` may be `null` to skip the between-insert pusher advance (rarely
- * useful — dev inspection or tests only). When non-null it is ALSO used
- * to re-anchor the returned state's `pusherAtMs` after the SETTLE_MS
- * physics advance (audit r5 fix): pusherAtMs sits at `nowMs`, NOT at
- * `nowMs + SETTLE_MS`. This keeps the per-frame render interpolation in
- * currentPusherPhase() live — see the pusherAtMs field doc for the full
- * rationale.
+ * The published sweep anchor (pusherPhase, pusherAtMs) comes back unchanged:
+ * the physics runs from `dropPhase` internally, and the free-running pusher
+ * every client draws never jumps.
+ *
+ * Throws RangeError on a bad player id / hole / phase, and when the machine
+ * is already holding MACHINE_MAX_CHIPS (the operator refuses the request
+ * without moving money).
  */
 export function processInsert(
   state: CoinPusherState,
   playerId: string,
   hole: PusherHole,
-  timing: number,
-  ante: number,
+  dropPhase: number,
   seed: number,
-  nowMs: number | null,
 ): {
   state: CoinPusherState;
+  paid: number;
   paidChipIds: number[];
   landedX: number;
   chipId: number;
 } {
-  if (!Number.isSafeInteger(ante) || ante <= 0 || ante > PUSHER_MAX_ANTE) {
-    throw new RangeError(`processInsert: ante must be a safe integer 1..${PUSHER_MAX_ANTE}`);
-  }
-  if (typeof playerId !== 'string' || playerId.length === 0 || playerId.length > 128) {
+  if (!isBoundedId(playerId)) {
     throw new RangeError('processInsert: playerId must be a bounded non-empty string');
   }
-
-  // 1. Advance to now (pusher may have swept while no one was inserting).
-  //    advanceSim() already credits any resulting payouts to the passed
-  //    `playerId` — both `state.pendingCredit[playerId]` and `state.totalPaid`
-  //    are updated on the returned state. Keep `betweenPaid` SEPARATE from
-  //    `instantPaid` (below) so step 6 re-applies ONLY the step-3 fallouts,
-  //    never the step-1 ones (audit finding #1: prior code double-credited
-  //    step-1 fallouts, silently minting chips into `pendingCredit`).
-  let cur = state;
-  const betweenPaid: number[] = [];
-  if (nowMs !== null && nowMs > state.pusherAtMs) {
-    const between = advanceSim(cur, nowMs - state.pusherAtMs, playerId);
-    cur = between.state;
-    betweenPaid.push(...between.paidChipIds);
+  if (!isHole(hole)) throw new RangeError('processInsert: hole must be 0, 1 or 2');
+  if (!isPhase(dropPhase)) throw new RangeError('processInsert: dropPhase must be in [0, 1)');
+  if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) {
+    throw new RangeError('processInsert: the machine is full');
   }
 
-  // 2. Compute the chip's landing x from the peg field (deterministic).
-  const rawLandX = simulatePeg(hole, timing, seed);
+  // 1. The pusher stands at the player's phase when the chip lands. The
+  //    machine is at rest (a full cycle settled after the last drop), so any
+  //    phase is consistent with the piles: none sits inside the pusher's
+  //    reach, whatever its position.
+  let cur: CoinPusherState = { ...state, pusherPhase: dropPhase };
+
+  // 2. The chip falls through the peg field (deterministic) onto the upper
+  //    platform.
+  const rawLandX = simulatePeg(hole, dropPhase, seed);
   const landedX = clamp(rawLandX, PLAT_UP_BACK + CHIP_R, PLAT_UP_FRONT - CHIP_R);
   const chipId = cur.nextChipId;
   const inserted = insertOnPlatform(cur.upper, landedX, [chipId], PLAT_UP_FRONT);
 
-  // 3. Any INSTANT fall-off from the drop itself lands on the lower and
-  //    may cascade off (rare — needs a full front row). Route the same way
-  //    stepMachine does. These chips are NOT tracked by any state field
-  //    yet (the drop wrote only to the local `upper`/`lower` copies), so
-  //    step 6 owns the accounting for them.
-  let upper = inserted.piles;
+  // 3. Anything the landing itself tips off the upper front lands on the
+  //    lower platform and may cascade off its front (rare — needs a full
+  //    front row). Route the same way stepMachine does.
   let lower = copyPiles(cur.lower);
   const instantPaid: number[] = [];
   for (const fallenPile of inserted.fallen) {
@@ -748,78 +842,25 @@ export function processInsert(
     for (const p of landing.fallen) instantPaid.push(...p.chipIds);
   }
 
-  // 4. Bank the insert in the state — the ante is inserted CHIPS-wise
-  //    (conservation), and the physics step later attributes payouts.
   cur = {
     ...cur,
-    upper,
+    upper: inserted.piles,
     lower,
     nextChipId: cur.nextChipId + 1,
-    totalInserted: cur.totalInserted + ante,
+    totalInserted: cur.totalInserted + PUSHER_ANTE,
+    totalPaid: cur.totalPaid + instantPaid.length,
     tick: cur.tick + 1,
   };
 
-  // 5. Simulate SETTLE_MS of pusher motion so the freshly-inserted chip
-  //    can be pushed. This is what makes an insert feel like an action:
-  //    the chip lands, the pusher advances, chips cascade off the edges.
-  //    advanceSim() attributes any settle-time payouts to `playerId` on
-  //    the returned state (both `pendingCredit` and `totalPaid`).
-  const settled = advanceSim(cur, SETTLE_MS, playerId);
-  cur = settled.state;
-  const settlePaid = settled.paidChipIds;
+  // 4. One full pusher cycle: the drop plays out and the machine comes to
+  //    rest. stepMachine bumps totalPaid for everything that falls.
+  const settled = advanceSim(cur, SETTLE_MS);
+  const paidChipIds = [...instantPaid, ...settled.paidChipIds];
 
-  // 5b. RE-ANCHOR `pusherAtMs` to the caller's `nowMs` (audit r5 MINOR fix).
-  //
-  //    advanceSim's substeps accumulate `dtMs` into pusherAtMs so, on return,
-  //    pusherAtMs sits at `pre-settle + SETTLE_MS` — i.e., 2440 ms AHEAD of
-  //    the wall clock the caller supplied. If left as-is, the RENDERER
-  //    (furniture.ts's coin-pusher visual, driven by currentPusherPhase(state,
-  //    Date.now())) sees `dt = Date.now() - pusherAtMs < 0`, clamps it to 0,
-  //    and returns bare state.pusherPhase — the visual freezes until wall
-  //    clock catches up SETTLE_MS later. Under a burst of inserts pusherAtMs
-  //    stacks N·SETTLE_MS ahead and the pusher only redraws on the operator's
-  //    4Hz publish, defeating the whole point of per-frame interpolation.
-  //
-  //    The fix pins pusherAtMs BACK to nowMs while KEEPING pusherPhase at
-  //    its post-settle value. The physics has been fast-forwarded — the new
-  //    phase is the correct phase — and re-anchoring the timestamp lets the
-  //    renderer resume smooth per-frame interpolation from that phase.
-  //
-  //    Conservation: the money-side counters (totalInserted, totalPaid,
-  //    pendingCredit, totalEmptied) live on the returned state and are
-  //    UNTOUCHED by this re-anchor. Determinism: pusherPhase is unchanged,
-  //    so any subsequent physics step from the same (state, dt) is identical.
-  //    `nowMs === null` is the tests / dev-inspection escape hatch that opts
-  //    out of the between-advance in step 1; the re-anchor is skipped for
-  //    parity so those callers still see the legacy SETTLE_MS advance.
-  if (nowMs !== null) {
-    cur = { ...cur, pusherAtMs: nowMs };
-  }
+  // 5. Hand back the untouched sweep anchor (see the doc comment).
+  cur = { ...settled.state, pusherPhase: state.pusherPhase, pusherAtMs: state.pusherAtMs };
 
-  // 6. Credit chips that fell during STEP 3 ONLY (the instant cascade off
-  //    the freshly-inserted chip). Step 1 and step 5 already bumped both
-  //    `pendingCredit[playerId]` and `totalPaid` inside advanceSim; only
-  //    step 3 wrote directly into `upper`/`lower` without touching either
-  //    counter, so exactly `instantPaid.length` chips need a manual credit
-  //    to keep the conservation invariant balanced.
-  if (instantPaid.length > 0) {
-    cur = {
-      ...cur,
-      pendingCredit: {
-        ...cur.pendingCredit,
-        [playerId]: (cur.pendingCredit[playerId] ?? 0) + instantPaid.length,
-      },
-      totalPaid: cur.totalPaid + instantPaid.length,
-      tick: cur.tick + 1,
-    };
-  }
-
-  return {
-    state: cur,
-    paidChipIds: [...betweenPaid, ...instantPaid, ...settlePaid],
-    landedX,
-    chipId,
-  };
+  return { state: cur, paid: paidChipIds.length, paidChipIds, landedX, chipId };
 }
 
 // ── Owner-only door: empty the machine ───────────────────────────────────────
@@ -827,16 +868,12 @@ export function processInsert(
 /**
  * The owner opens the machine door and takes all chips inside. This is the
  * ONLY path that removes chips from the machine besides paying them out to
- * players; per the spec, there is NO auto-siphon. A non-owner call returns
- * `ok: false` and leaves state UNCHANGED so the wiring layer can refuse
- * cleanly.
+ * the player whose drop pushed them; per the issue there is NO auto-siphon.
+ * A non-owner call returns `ok: false` and leaves state UNCHANGED.
  *
- * The wiring layer is responsible for the money side:
- *   1. Call `emptyMachine(state, ownerId)`. If `ok`, get `emptied` count.
- *   2. In the SAME transaction: publish the new state AND
- *      `creditChips(ownerId, emptied)`.
- * Conservation holds: chips left the machine (chipsInMachine → 0) and
- * `totalEmptied` grew by exactly the same amount.
+ * The operator commits the money side: publish the new state AND credit the
+ * owner `emptied` chips in ONE transaction (casinoDoc.commitCoinPusherEmpty).
+ * Conservation holds: chipsInMachine → 0 and totalEmptied grows by the same.
  */
 export function emptyMachine(
   state: CoinPusherState,
@@ -845,9 +882,7 @@ export function emptyMachine(
   if (requesterId !== state.ownerId) {
     return { state, emptied: 0, ok: false };
   }
-  let emptied = 0;
-  for (const p of state.upper) emptied += p.count;
-  for (const p of state.lower) emptied += p.count;
+  const emptied = chipsInMachine(state);
   const next: CoinPusherState = {
     ...state,
     upper: [],
@@ -858,28 +893,6 @@ export function emptyMachine(
   return { state: next, emptied, ok: true };
 }
 
-// ── Pending credit claim (money-side handoff) ────────────────────────────────
-
-/**
- * Zero-out one player's pending credit and return the amount. The wiring
- * layer calls `creditChips(playerId, amount)` in the SAME transaction as
- * publishing this new state, so conservation across doc + casino stays
- * atomic. Idempotent when nothing is owed.
- */
-export function claimPendingCredit(
-  state: CoinPusherState,
-  playerId: string,
-): { state: CoinPusherState; amount: number } {
-  const amount = state.pendingCredit[playerId] ?? 0;
-  if (amount <= 0) return { state, amount: 0 };
-  const nextCredit = { ...state.pendingCredit };
-  delete nextCredit[playerId];
-  return {
-    state: { ...state, pendingCredit: nextCredit, tick: state.tick + 1 },
-    amount,
-  };
-}
-
 // ── Conservation invariant (public — dev tools + tests both use this) ────────
 
 export interface Conservation {
@@ -887,25 +900,19 @@ export interface Conservation {
   totalInserted: number;
   totalPaid: number;
   totalEmptied: number;
-  pendingCredit: number;
   /** True iff totalInserted === chipsInMachine + totalPaid + totalEmptied. */
   balanced: boolean;
 }
 
 /** Compute the conservation snapshot. Every mutating helper preserves this. */
 export function computeConservation(state: CoinPusherState): Conservation {
-  let chipsInMachine = 0;
-  for (const p of state.upper) chipsInMachine += p.count;
-  for (const p of state.lower) chipsInMachine += p.count;
-  let pendingCredit = 0;
-  for (const n of Object.values(state.pendingCredit)) pendingCredit += n;
+  const inMachine = chipsInMachine(state);
   return {
-    chipsInMachine,
+    chipsInMachine: inMachine,
     totalInserted: state.totalInserted,
     totalPaid: state.totalPaid,
     totalEmptied: state.totalEmptied,
-    pendingCredit,
-    balanced: state.totalInserted === chipsInMachine + state.totalPaid + state.totalEmptied,
+    balanced: state.totalInserted === inMachine + state.totalPaid + state.totalEmptied,
   };
 }
 
@@ -919,11 +926,11 @@ export function chipsInMachine(state: CoinPusherState): number {
   return n;
 }
 
-/** Compute the pusher's current phase from a stored (phase, atMs) snapshot
- *  and a new wall-clock time. The engine never calls Date.now(); the UI
- *  passes `nowMs` in. */
+/** The pusher's phase at `nowMs` from the stored sweep anchor. The sweep is
+ *  a line through (pusherAtMs, pusherPhase) in both directions, so a time
+ *  before the anchor (another client's clock running behind) still gets its
+ *  true phase. The engine never calls Date.now(); callers pass the time in. */
 export function currentPusherPhase(state: CoinPusherState, nowMs: number): number {
   if (!Number.isFinite(nowMs)) return state.pusherPhase;
-  const dt = Math.max(0, nowMs - state.pusherAtMs);
-  return mod1(state.pusherPhase + dt / PUSHER_PERIOD_MS);
+  return mod1(state.pusherPhase + (nowMs - state.pusherAtMs) / PUSHER_PERIOD_MS);
 }

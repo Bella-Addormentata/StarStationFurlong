@@ -1,38 +1,13 @@
 /**
- * 🪙 casinoDoc coin-pusher wiring tests (audit remediation r3 + r4, issue #135).
+ * 🪙 casinoDoc coin-pusher record tests (issue #135).
  *
- * The pure engine at src/games/coinPusher.ts has 63 stable tests, but those
- * exercise only the engine surface. Every mint / burn / lock defect the audit
- * flagged lives in the WIRING LAYER — the map-level helpers in casinoDoc.ts,
- * the operator loop and teardown paths in devices.ts / world.ts — which are
- * what talks to Yjs, to `bal:<pid>` and to the peer trust boundary.
- *
- * Test roster (r3):
- *   • submitCoinPusherInsert atomically debits + writes request + escrow
- *   • an unbacked pusher-req record (no matching escrow) has no chip effect
- *     even after the operator loop drains the queue (audit BLOCKER #1)
- *   • clearCoinPusherKeys refunds EVERY outstanding escrow (from every peer),
- *     not just the local peer's (audit BLOCKER #2)
- *   • operatorRefundCoinPusherRequest never mints when the escrow is missing
- *   • clearCoinPusherKeys is idempotent when nothing is outstanding
- *
- * Test roster (r4 — this pass):
- *   • submitCoinPusherInsert now stamps escrowedAt from the SERVER clock, not
- *     from the client-provided request.requestedAt (audit r4 MINOR):
- *       – hostile requestedAt=MAX_SAFE_INTEGER cannot lock the escrow
- *       – hostile requestedAt=0 cannot bypass the TTL from server-stamp
- *       – a non-finite nowMs is rejected without any map mutation
- *   • publishAndClearCoinPusherInsert wraps state-publish AND request-clear
- *     in ONE transact — a single 'update' event covers both effects; a bad
- *     nextState or bad ids reject without touching the map (audit r4 NOTE)
- *   • operator try/catch path exercised end-to-end: a processInsert throw
- *     is caught, escrow refunded, request cleared, drain continues past the
- *     poison request to later valid ones (audit r4 NOTE)
- *   • ownership self-heal preserves piles/pendingCredit/counters while
- *     transferring ownerId (audit r4 NOTE)
- *
- *   • end-to-end conservation: every code path enforces
- *       Σ bal + Σ chipsInMachine + Σ pendingCredit === Σ buyIn
+ * The pusher's money side lives in casinoDoc: a player's request carries no
+ * chips, and only the operator's settle / refuse / empty / teardown helpers
+ * move them — each in ONE transaction, each re-checking the stored machine
+ * first. These specs pin that no peer-written record is ever taken as proof
+ * that chips moved (the PR #137 review), that a credit is always read off the
+ * machine's own transition, and — with two docs — that a settle racing the
+ * player's cancel converges to one drop paid once.
  */
 
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -40,19 +15,20 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
-  casinoPrefixWriteGeneration,
-  readChips,
-  clearCoinPusherInsert,
-  clearCoinPusherKeys,
+  cancelCoinPusherRequest,
   commitCoinPusherEmpty,
-  operatorRefundCoinPusherRequest,
-  publishAndClearCoinPusherInsert,
-  readCoinPusherEscrow,
+  drainAndClearCoinPusher,
+  readChips,
+  readCoinPusherEmptyRequest,
+  readCoinPusherOperatorLease,
   readCoinPusherRequest,
   readCoinPusherRequests,
   readCoinPusherState,
-  refundExpiredCoinPusherRequest,
-  submitCoinPusherInsert,
+  refuseCoinPusherInsert,
+  settleCoinPusherInsert,
+  writeCoinPusherEmptyRequest,
+  writeCoinPusherOperatorLease,
+  writeCoinPusherRequest,
   writeCoinPusherState,
 } from './casinoDoc';
 import {
@@ -60,18 +36,17 @@ import {
   emptyMachine,
   initialCoinPusherState,
   processInsert,
-  PUSHER_MAX_ANTE,
+  type CoinPusherState,
   type PusherHole,
   type PusherInsertRequest,
 } from './games/coinPusher';
 
 const OWNER = 'owner-Alice';
 const PLAYER = 'player-Bob';
+const OTHER = 'player-Carol';
 const ATTACKER = 'attacker-Mallory';
 const MACHINE = 'pusher-1';
 
-/** Freshly-bound doc for every test — casinoDoc's module-level `casinoMap`
- *  cache is refreshed by bindCasinoDoc, so tests do not leak state. */
 let doc: Y.Doc;
 
 beforeEach(() => {
@@ -79,737 +54,341 @@ beforeEach(() => {
   bindCasinoDoc(doc);
 });
 
-function initMachine(now = 0): void {
-  writeCoinPusherState(MACHINE, initialCoinPusherState(OWNER, now));
+function request(
+  player: string,
+  requestId: string,
+  hole: PusherHole = 1,
+  phase = 0.5,
+): PusherInsertRequest {
+  return { requestId, player, hole, phase, requestedAt: 1_000 };
 }
 
-function makeRequest(
-  player: string,
-  reqId: string,
-  ante: number,
-  requestedAt: number,
-  hole: PusherHole = 1,
-): PusherInsertRequest {
+/** The operator's drop exactly as pusherCroupier builds it. */
+function dropFor(base: CoinPusherState, req: PusherInsertRequest, seed = 42): CoinPusherState {
+  const drop = processInsert(base, req.player, req.hole, req.phase, seed);
   return {
-    requestId: reqId,
-    player,
-    hole,
-    timing: 0.5,
-    ante,
-    requestedAt,
+    ...drop.state,
+    lastDrop: {
+      requestId: req.requestId, player: req.player, hole: req.hole, chipId: drop.chipId,
+      landedX: drop.landedX, paid: drop.paid, phase: req.phase, honored: true, atMs: 2_000,
+    },
   };
 }
 
-describe('submitCoinPusherInsert', () => {
-  it('debits balance, writes request, writes escrow — atomically', () => {
+/** A machine that has taken `n` drops from OTHER (full enough to pay out). */
+function machineWith(n: number, owner = OWNER): CoinPusherState {
+  let s = initialCoinPusherState(owner, 0);
+  for (let i = 0; i < n; i++) {
+    s = processInsert(s, OTHER, (i % 3) as PusherHole, (i * 0.37) % 1, i * 7919).state;
+  }
+  return s;
+}
+
+/** A published machine plus a pending request whose drop pays out. */
+function payingSetup(): { base: CoinPusherState; req: PusherInsertRequest; next: CoinPusherState } {
+  const base = machineWith(60);
+  for (let seed = 0; seed < 500; seed++) {
+    const req = request(PLAYER, `req-${seed}`);
+    const next = dropFor(base, req, seed);
+    if (next.lastDrop!.paid > 0) {
+      writeCoinPusherState(MACHINE, base);
+      writeCoinPusherRequest(MACHINE, req);
+      return { base: readCoinPusherState(MACHINE)!, req, next };
+    }
+  }
+  throw new Error('no paying drop in the seed sweep');
+}
+
+function countTransactions(d: Y.Doc): () => number {
+  let n = 0;
+  d.on('afterTransaction', () => { n += 1; });
+  return () => n;
+}
+
+// ── Requests: a wish, not a payment ──────────────────────────────────────────
+
+describe('coin-pusher requests', () => {
+  it('writing a request moves no chips', () => {
     buyInChips(PLAYER, 5);
-    initMachine();
-    const req = makeRequest(PLAYER, 'req-1', 2, 100);
-    expect(submitCoinPusherInsert(MACHINE, req)).toBe(true);
-    expect(readChips(PLAYER)).toBe(3); // 5 − 2
+    const req = request(PLAYER, 'req-1');
+    expect(writeCoinPusherRequest(MACHINE, req)).toBe(true);
+    expect(readChips(PLAYER)).toBe(5);
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toEqual(req);
-    const esc = readCoinPusherEscrow(MACHINE, PLAYER, 'req-1');
-    expect(esc).not.toBeNull();
-    expect(esc!.ante).toBe(2);
-    expect(esc!.player).toBe(PLAYER);
   });
 
-  it('refuses when the player is short of chips (no side effects)', () => {
-    buyInChips(PLAYER, 1);
-    initMachine();
-    const req = makeRequest(PLAYER, 'req-1', 5, 100);
-    expect(submitCoinPusherInsert(MACHINE, req)).toBe(false);
-    expect(readChips(PLAYER)).toBe(1);
+  it('one pending request per player; junk under the key does not lock them out', () => {
+    expect(writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'))).toBe(true);
+    expect(writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2'))).toBe(false);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('req-1');
+    doc.getMap('casino').set(`pusher-req:${MACHINE}:${OTHER}`, { junk: true });
+    expect(writeCoinPusherRequest(MACHINE, request(OTHER, 'req-3'))).toBe(true);
+  });
+
+  it('rejects a malformed request', () => {
+    expect(writeCoinPusherRequest(MACHINE, { ...request(PLAYER, 'r'), phase: 1 })).toBe(false);
+    expect(writeCoinPusherRequest(MACHINE, { ...request(PLAYER, 'r'), hole: 5 as PusherHole })).toBe(false);
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'req-1')).toBeNull();
   });
 
-  it('refuses a second concurrent submit from the same player', () => {
-    buyInChips(PLAYER, 10);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'req-1', 1, 100))).toBe(true);
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'req-2', 1, 101))).toBe(false);
-    expect(readChips(PLAYER)).toBe(9); // second submit did not debit
+  it('a cancel withdraws only the same request', () => {
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    expect(cancelCoinPusherRequest(MACHINE, PLAYER, 'req-0')).toBe(false);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).not.toBeNull();
+    expect(cancelCoinPusherRequest(MACHINE, PLAYER, 'req-1')).toBe(true);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
   });
 
-  it('rejects a shape-invalid request without side effects', () => {
-    buyInChips(PLAYER, 10);
-    initMachine();
-    // ante above PUSHER_MAX_ANTE — rejected by guard.
-    const bad: PusherInsertRequest = { ...makeRequest(PLAYER, 'req-1', 1, 100), ante: PUSHER_MAX_ANTE + 1 };
-    expect(submitCoinPusherInsert(MACHINE, bad)).toBe(false);
-    expect(readChips(PLAYER)).toBe(10);
+  it('lists requests oldest first and ignores one filed under another player\'s key', () => {
+    writeCoinPusherRequest(MACHINE, request(OTHER, 'b-2'));
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
+    doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, request(PLAYER, 'a-0'));
+    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['a-1', 'b-2']);
   });
 });
 
-describe('operator mint safety (audit BLOCKER #1)', () => {
-  it('an unbacked pusher-req record NEVER pays out even after processInsert', () => {
-    // Attacker writes a well-shaped pusher-req record DIRECTLY into the map
-    // without going through submitCoinPusherInsert — no bal:<attacker> debit,
-    // no matching escrow. The operator must not process it into pendingCredit.
-    initMachine();
-    const forged: PusherInsertRequest = {
-      requestId: 'evil-1',
-      player: ATTACKER,
-      hole: 1,
-      timing: 0.5,
-      ante: PUSHER_MAX_ANTE,
-      requestedAt: 100,
-    };
-    // Write directly into the Y.Map (simulate a hostile peer).
-    doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, forged);
+// ── settleCoinPusherInsert: the only way a drop moves chips ──────────────────
 
-    // Attacker has NO balance and NO escrow.
-    expect(readChips(ATTACKER)).toBe(0);
-    expect(readCoinPusherEscrow(MACHINE, ATTACKER, 'evil-1')).toBeNull();
-
-    // The queue-drain scan sees the record.
-    const scanned = readCoinPusherRequests(MACHINE);
-    expect(scanned.map((r) => r.requestId)).toContain('evil-1');
-
-    // Verify the operator's mint-guard: readCoinPusherEscrow must return null
-    // for this record, so tickCoinPusherOperator's escrow gate rejects it.
-    for (const req of scanned) {
-      const esc = readCoinPusherEscrow(MACHINE, req.player, req.requestId);
-      // Attacker's request has no matching escrow — the operator MUST skip.
-      if (req.player === ATTACKER) expect(esc).toBeNull();
-    }
-  });
-
-  it('an escrow that disagrees with the request ante is treated as unbacked', () => {
-    initMachine();
-    // Attacker writes a request for 5 chips but an escrow for 0-ish chips
-    // (invalid) — the ante mismatch means the escrow does NOT back the
-    // request. The operator gate compares esc.ante === req.ante.
-    const req = makeRequest(ATTACKER, 'evil-2', 5, 100);
-    doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, req);
-    doc.getMap('casino').set(`pusher-esc:${MACHINE}:${ATTACKER}:evil-2`, {
-      requestId: 'evil-2', player: ATTACKER, ante: 1, escrowedAt: 100,
-    });
-    const esc = readCoinPusherEscrow(MACHINE, ATTACKER, 'evil-2');
-    // The escrow exists but with a mismatched ante — the operator gate
-    // rejects: `esc.ante !== req.ante` → unbacked.
-    expect(esc?.ante).toBe(1);
-    expect(esc?.ante).not.toBe(req.ante);
-  });
-
-  it('a legitimate submit → operator processInsert → clear round-trips', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    // Player submits properly (bal debited, req + esc written).
-    const req = makeRequest(PLAYER, 'req-legit', 1, 100);
-    expect(submitCoinPusherInsert(MACHINE, req)).toBe(true);
-    expect(readChips(PLAYER)).toBe(4);
-    // Operator: verify escrow, run processInsert, publish, clear req+esc.
-    const s0 = readCoinPusherState(MACHINE)!;
-    const esc = readCoinPusherEscrow(MACHINE, PLAYER, 'req-legit');
-    expect(esc).not.toBeNull();
-    expect(esc!.ante).toBe(req.ante);
-    const result = processInsert(s0, req.player, req.hole, req.timing, req.ante, 0xdeadbeef, 200);
-    writeCoinPusherState(MACHINE, result.state);
-    clearCoinPusherInsert(MACHINE, PLAYER, 'req-legit');
-    // Records cleared, state advanced, no chips minted from thin air.
+describe('settleCoinPusherInsert', () => {
+  it('debits one chip, credits exactly the drop\'s payout, publishes and clears — in one transaction', () => {
+    const { base, req, next } = payingSetup();
+    buyInChips(PLAYER, 3);
+    const transactions = countTransactions(doc);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('ok');
+    expect(transactions()).toBe(1);
+    const paid = next.lastDrop!.paid;
+    expect(paid).toBeGreaterThan(0);
+    expect(readChips(PLAYER)).toBe(3 - 1 + paid);
+    expect(readCoinPusherState(MACHINE)).toEqual(next);
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'req-legit')).toBeNull();
-    const s1 = readCoinPusherState(MACHINE)!;
-    expect(s1.totalInserted).toBe(1);
   });
-});
 
-describe('clearCoinPusherKeys — atomic refund on teardown (audit BLOCKER #2)', () => {
-  it('refunds EVERY outstanding escrow (all peers) atomically with the delete', () => {
-    // Three players have live escrows on this machine. The room owner
-    // removes the cabinet — clearCoinPusherKeys must credit all three.
-    buyInChips(PLAYER, 5);
-    buyInChips('player-Carol', 5);
-    buyInChips(ATTACKER, 5); // an ordinary peer (not the attacker for this test)
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 2, 100))).toBe(true);
-    expect(submitCoinPusherInsert(MACHINE, makeRequest('player-Carol', 'r2', 3, 100))).toBe(true);
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(ATTACKER, 'r3', 1, 100))).toBe(true);
+  it('a request from a player with no chip gets nothing — and nothing is written', () => {
+    const { base, req, next } = payingSetup(); // PLAYER never bought in
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('no-chips');
+    expect(readChips(PLAYER)).toBe(0);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toEqual(req);
+  });
+
+  it('refuses a stale base: a second settle of the same drop pays nothing', () => {
+    const { base, req, next } = payingSetup();
+    buyInChips(PLAYER, 3);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('ok');
+    const after = readChips(PLAYER);
+    writeCoinPusherRequest(MACHINE, req); // even with the request back
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('stale-state');
+    expect(readChips(PLAYER)).toBe(after);
+  });
+
+  it('refuses when the request was withdrawn or replaced', () => {
+    const { base, req, next } = payingSetup();
+    buyInChips(PLAYER, 3);
+    cancelCoinPusherRequest(MACHINE, PLAYER, req.requestId);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('stale-request');
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'someone-else'));
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('stale-request');
     expect(readChips(PLAYER)).toBe(3);
-    expect(readChips('player-Carol')).toBe(2);
-    expect(readChips(ATTACKER)).toBe(4);
-
-    clearCoinPusherKeys(MACHINE);
-
-    // Every player has been credited back exactly their escrow.
-    expect(readChips(PLAYER)).toBe(5);
-    expect(readChips('player-Carol')).toBe(5);
-    expect(readChips(ATTACKER)).toBe(5);
-    // All keys wiped.
-    expect(readCoinPusherState(MACHINE)).toBeNull();
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, 'player-Carol', 'r2')).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, ATTACKER, 'r3')).toBeNull();
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
   });
 
-  it('is idempotent when there are no outstanding escrows', () => {
-    initMachine();
-    clearCoinPusherKeys(MACHINE);
-    expect(readCoinPusherState(MACHINE)).toBeNull();
-    // A second call is a no-op.
-    clearCoinPusherKeys(MACHINE);
-    expect(readCoinPusherState(MACHINE)).toBeNull();
-  });
-
-  it('does not touch other machines\' escrows', () => {
-    // Request records are keyed per-machine (`pusher-req:<mid>:<pid>`), so
-    // the same player may have simultaneous requests on distinct machines.
-    // Tearing down MACHINE must refund only MACHINE's escrows.
-    buyInChips(PLAYER, 10);
-    buyInChips('player-Carol', 5);
-    initMachine();
-    writeCoinPusherState('pusher-2', initialCoinPusherState(OWNER, 0));
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'a', 2, 100))).toBe(true);
-    expect(submitCoinPusherInsert('pusher-2', makeRequest('player-Carol', 'c', 3, 100))).toBe(true);
-    expect(readChips(PLAYER)).toBe(8); // debited 2 on MACHINE
-    expect(readChips('player-Carol')).toBe(2); // debited 3 on pusher-2
-
-    // Tearing down MACHINE must refund PLAYER but leave 'player-Carol' alone.
-    clearCoinPusherKeys(MACHINE);
-    expect(readChips(PLAYER)).toBe(10); // full refund of the MACHINE escrow
-    expect(readChips('player-Carol')).toBe(2); // untouched on pusher-2
-    expect(readCoinPusherEscrow('pusher-2', 'player-Carol', 'c')).not.toBeNull();
-  });
-
-  it('drops hostile escrow entries whose key/value <pid> disagree (no refund)', () => {
-    initMachine();
-    // Hostile: value.player is Alice, but the key is under Bob's slot.
-    doc.getMap('casino').set(`pusher-esc:${MACHINE}:${PLAYER}:xx`, {
-      requestId: 'xx', player: 'someone-else', ante: 99, escrowedAt: 100,
-    });
-    expect(readChips(PLAYER)).toBe(0);
-    expect(readChips('someone-else')).toBe(0);
-    clearCoinPusherKeys(MACHINE);
-    // Neither player is credited — the mismatched entry is discarded.
-    expect(readChips(PLAYER)).toBe(0);
-    expect(readChips('someone-else')).toBe(0);
-  });
-});
-
-describe('refundExpiredCoinPusherRequest — TTL from escrowedAt (audit MINOR #6 + r4)', () => {
-  it('refunds after TTL (based on escrowedAt, not requestedAt)', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    // The escrow's escrowedAt is what submitCoinPusherInsert stamped — the
-    // SAFE server-side timestamp (audit r4 MINOR: prior code copied
-    // request.requestedAt verbatim; the fix injects nowMs at submit time).
-    // We stamp escrowedAt at t=0 by passing nowMs=0.
-    const req = makeRequest(PLAYER, 'r1', 2, 0);
-    expect(submitCoinPusherInsert(MACHINE, req, 0)).toBe(true);
-    // Verify the escrow really was stamped at t=0 (server clock), not from
-    // requestedAt (which happens to also be 0 here).
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')!.escrowedAt).toBe(0);
-    // Now the attacker overwrites the request record with requestedAt set
-    // to MAX_SAFE_INTEGER — this cannot affect escrowedAt (the escrow key
-    // is peer-writable too, but the refund gates on the escrow record we
-    // originally stamped at t=0).
-    const forgedReq: PusherInsertRequest = { ...req, requestedAt: Number.MAX_SAFE_INTEGER };
-    doc.getMap('casino').set(`pusher-req:${MACHINE}:${PLAYER}`, forgedReq);
-
-    // Under the fixed code, refund gates on escrowedAt (=0), so a "now" past
-    // TTL is enough — regardless of requestedAt.
-    expect(refundExpiredCoinPusherRequest(MACHINE, PLAYER, 100_000)).toBe(2);
-    expect(readChips(PLAYER)).toBe(5); // refunded fully
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')).toBeNull();
-  });
-
-  it('refuses to refund inside the TTL window', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 2, 0), 0)).toBe(true);
-    // 5 seconds later — well inside the 90s TTL.
-    expect(refundExpiredCoinPusherRequest(MACHINE, PLAYER, 5_000)).toBe(0);
-    expect(readChips(PLAYER)).toBe(3); // still debited
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).not.toBeNull();
-  });
-
-  it('is a no-op when there is no matching request/escrow', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    // No submit at all.
-    expect(refundExpiredCoinPusherRequest(MACHINE, PLAYER, 100_000)).toBe(0);
-    expect(readChips(PLAYER)).toBe(5);
-  });
-
-  // ── AUDIT r4 MINOR: hostile requestedAt cannot lock or unlock escrow ──────
-  // The audit called out that the r3 code copied `request.requestedAt`
-  // verbatim into `escrow.escrowedAt` — so a submitter with a hostile client
-  // could (a) stamp escrowedAt=MAX_SAFE_INTEGER and permanently lock their
-  // own escrow, or (b) stamp escrowedAt=0 and race-refund inside the TTL.
-  // Both scenarios rely on the submitter controlling escrowedAt via
-  // requestedAt; the r4 fix injects `nowMs` at write time so the submitter's
-  // requestedAt only lands in the request record (read-only hint), never in
-  // the escrow. Verify BOTH forgery attempts fail.
-  it('r4 MINOR: submit with requestedAt=MAX_SAFE_INTEGER cannot lock escrow — refund succeeds past TTL', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    // Hostile submitter: requestedAt in the far future, hoping to poison
-    // escrowedAt so their own chips are never refundable. We inject
-    // nowMs=1_000 to represent the honest server clock at submit time.
-    const req: PusherInsertRequest = {
-      requestId: 'r-max', player: PLAYER, hole: 1, timing: 0.5, ante: 2,
-      requestedAt: Number.MAX_SAFE_INTEGER,
-    };
-    expect(submitCoinPusherInsert(MACHINE, req, 1_000)).toBe(true);
-    // Verify escrowedAt is the SERVER stamp (1_000), NOT the hostile
-    // requestedAt (MAX_SAFE_INTEGER).
-    const esc = readCoinPusherEscrow(MACHINE, PLAYER, 'r-max');
-    expect(esc).not.toBeNull();
-    expect(esc!.escrowedAt).toBe(1_000);
-    // Fast-forward past the TTL: refund succeeds (audit r4 fix).
-    expect(refundExpiredCoinPusherRequest(MACHINE, PLAYER, 1_000 + 100_000)).toBe(2);
-    expect(readChips(PLAYER)).toBe(5); // fully restored
-  });
-
-  it('r4 MINOR: submit with requestedAt=0 cannot bypass TTL — refund refused within TTL from server-stamp', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    // Hostile submitter: requestedAt=0, hoping to poison escrowedAt so a
-    // refund right after submit thinks the escrow is 90s old already.
-    // Server clock is 60_000 at submit time — that's what escrowedAt should
-    // be stamped with, so a refund at 60_010 is 10 ms into the TTL.
-    const req: PusherInsertRequest = {
-      requestId: 'r-zero', player: PLAYER, hole: 1, timing: 0.5, ante: 2,
-      requestedAt: 0,
-    };
-    expect(submitCoinPusherInsert(MACHINE, req, 60_000)).toBe(true);
-    // Verify escrowedAt is the SERVER stamp (60_000), NOT the hostile
-    // requestedAt (0).
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r-zero')!.escrowedAt).toBe(60_000);
-    // A refund attempt 10 ms after submit is still inside the TTL — refused.
-    expect(refundExpiredCoinPusherRequest(MACHINE, PLAYER, 60_010)).toBe(0);
-    expect(readChips(PLAYER)).toBe(3); // still debited
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).not.toBeNull();
-  });
-
-  it('r4 MINOR: non-finite nowMs is rejected before any map write', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    const req = makeRequest(PLAYER, 'r-nan', 2, 100);
-    expect(submitCoinPusherInsert(MACHINE, req, Number.NaN)).toBe(false);
-    expect(submitCoinPusherInsert(MACHINE, req, Number.POSITIVE_INFINITY)).toBe(false);
-    // No side effects — balance untouched, no request or escrow written.
-    expect(readChips(PLAYER)).toBe(5);
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r-nan')).toBeNull();
-  });
-});
-
-describe('operatorRefundCoinPusherRequest — safe teardown for unbacked / poison', () => {
-  it('deletes an unbacked request record without minting chips', () => {
-    initMachine();
-    // Attacker writes a lone request record with no escrow.
-    const forged = makeRequest(ATTACKER, 'evil', 5, 100);
-    doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, forged);
-    expect(readChips(ATTACKER)).toBe(0);
-    // Operator tears it down: no escrow, no mint.
-    const refunded = operatorRefundCoinPusherRequest(MACHINE, ATTACKER, 'evil');
-    expect(refunded).toBe(0);
-    expect(readChips(ATTACKER)).toBe(0);
-    // Request is cleared so the queue drain moves on.
-    expect(readCoinPusherRequest(MACHINE, ATTACKER)).toBeNull();
-  });
-
-  it('refunds when a legitimate escrow exists (poison-request cleanup path)', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 3, 100))).toBe(true);
-    expect(readChips(PLAYER)).toBe(2);
-    const refunded = operatorRefundCoinPusherRequest(MACHINE, PLAYER, 'r1');
-    expect(refunded).toBe(3);
-    expect(readChips(PLAYER)).toBe(5);
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')).toBeNull();
-  });
-});
-
-describe('commitCoinPusherEmpty — owner-only door-open', () => {
-  it('credits the owner exactly what was in the machine', () => {
-    initMachine();
-    // Seed the machine with 4 chips via a legitimate insert path — the
-    // engine's processInsert bumps totalInserted and puts a chip on the
-    // upper platform.
-    let state = readCoinPusherState(MACHINE)!;
-    for (let i = 0; i < 4; i++) {
-      const r = processInsert(state, PLAYER, 1, 0.5, 1, 0xdead + i, i * 100);
-      state = r.state;
+  it('reads the credit off the machine\'s transition — a payout that did not leave the machine is invalid', () => {
+    const { base, req, next } = payingSetup();
+    buyInChips(PLAYER, 3);
+    const d = next.lastDrop!;
+    // A chip lifted out of the machine and counted as paid — the machine still
+    // balances, but this drop's record does not say it paid that chip.
+    const lifted = structuredClone(next);
+    const pile = [...lifted.upper, ...lifted.lower].find((p) => p.count > 0)!;
+    pile.chipIds.pop();
+    pile.count -= 1;
+    lifted.totalPaid += 1;
+    const forged: CoinPusherState[] = [
+      lifted,
+      // Counter inflated alone: does not balance.
+      { ...next, totalPaid: next.totalPaid + 50 },
+      // Counter AND the drop's paid inflated: still does not balance.
+      { ...next, totalPaid: next.totalPaid + 50, lastDrop: { ...d, paid: d.paid + 50 } },
+      // A drop record for someone else's request.
+      { ...next, lastDrop: { ...d, requestId: 'other-request' } },
+      { ...next, lastDrop: { ...d, player: ATTACKER } },
+      // Two chips in, owner moved, emptied counter touched.
+      { ...next, totalInserted: next.totalInserted + 1 },
+      { ...next, ownerId: ATTACKER },
+      { ...next, totalEmptied: next.totalEmptied + 1 },
+    ];
+    for (const bad of forged) {
+      expect(settleCoinPusherInsert(MACHINE, base, bad, req)).toBe('invalid');
     }
-    writeCoinPusherState(MACHINE, state);
-    const chipsBefore = chipsInMachine(state);
-    expect(chipsBefore).toBeGreaterThan(0);
-
-    // Owner empties the machine.
-    const engineResult = emptyMachine(state, OWNER);
-    expect(engineResult.ok).toBe(true);
-    expect(commitCoinPusherEmpty(MACHINE, engineResult.state, OWNER, engineResult.emptied)).toBe(true);
-    expect(readChips(OWNER)).toBe(engineResult.emptied);
-    // Verify no chips are left in the machine.
-    expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(0);
-  });
-
-  it('refuses to commit when a non-owner is claimed as the caller', () => {
-    initMachine();
-    const state = readCoinPusherState(MACHINE)!;
-    // Set ownerId mismatch — commitCoinPusherEmpty must refuse.
-    expect(commitCoinPusherEmpty(MACHINE, state, ATTACKER, 0)).toBe(false);
-    expect(readChips(ATTACKER)).toBe(0);
+    const { lastDrop: _dropped, ...noDrop } = next;
+    expect(settleCoinPusherInsert(MACHINE, base, noDrop, req)).toBe('invalid');
+    expect(readChips(PLAYER)).toBe(3);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
   });
 });
 
-describe('simulated operator drain — mint-attack PoC (audit BLOCKER #1)', () => {
-  /**
-   * The `tickCoinPusherOperator` function itself uses window.setInterval and
-   * `crypto.randomUUID`, which aren't available in Node — but its drain
-   * logic is a straightforward composition of the primitives we can test:
-   *   1) readCoinPusherRequests(mid) → oldest-first list
-   *   2) readCoinPusherEscrow(mid, req.player, req.requestId) → mint gate
-   *   3) processInsert(...) + writeCoinPusherState + clearCoinPusherInsert
-   *   4) on missing/mismatched escrow: operatorRefundCoinPusherRequest cleans up
-   * This test emulates one drain tick faithfully and asserts:
-   *   • the ATTACKER's unbacked request adds ZERO chips to their balance,
-   *     ZERO chips to pendingCredit, and does NOT increment totalInserted
-   *   • the poison request is cleared so it never re-blocks the queue
-   *   • the legitimate concurrent request from PLAYER still settles cleanly
-   */
-  it('unbacked attacker request does not mint chips through the operator drain', () => {
-    // Give the honest player some chips + a proper insert; attacker forges.
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'good-1', 1, 100))).toBe(true);
-    const forged: PusherInsertRequest = {
-      requestId: 'evil-9', player: ATTACKER, hole: 1, timing: 0.5,
-      ante: PUSHER_MAX_ANTE, requestedAt: 100,
-    };
-    doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, forged);
-    // Verify pre-conditions.
-    expect(readChips(ATTACKER)).toBe(0);
-    expect(readChips(PLAYER)).toBe(4);
-    const inserted0 = readCoinPusherState(MACHINE)!.totalInserted;
-    expect(inserted0).toBe(0);
+// ── refuseCoinPusherInsert ───────────────────────────────────────────────────
 
-    // Emulate one operator tick — same order as tickCoinPusherOperator.
-    const requests = readCoinPusherRequests(MACHINE);
-    // Requests are sorted by requestId — 'evil-9' > 'good-1', so honest first.
-    expect(requests.map((r) => r.requestId)).toEqual(['evil-9', 'good-1'].sort());
-    for (const req of requests) {
-      const esc = readCoinPusherEscrow(MACHINE, req.player, req.requestId);
-      if (!esc || esc.player !== req.player || esc.ante !== req.ante) {
-        operatorRefundCoinPusherRequest(MACHINE, req.player, req.requestId);
-        continue;
-      }
-      try {
-        const s = readCoinPusherState(MACHINE)!;
-        const r = processInsert(s, req.player, req.hole, req.timing, req.ante, 0xf00d, 300);
-        writeCoinPusherState(MACHINE, r.state);
-        clearCoinPusherInsert(MACHINE, req.player, req.requestId);
-      } catch (err) {
-        operatorRefundCoinPusherRequest(MACHINE, req.player, req.requestId);
-      }
-    }
-
-    // ATTACKER's balance stays ZERO — no mint.
-    expect(readChips(ATTACKER)).toBe(0);
-    // Poison request is cleared.
-    expect(readCoinPusherRequest(MACHINE, ATTACKER)).toBeNull();
-    // Honest PLAYER's request was processed — request cleared, insert counted.
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    const state1 = readCoinPusherState(MACHINE)!;
-    expect(state1.totalInserted).toBe(1); // just the honest 1-chip insert
-    // The ATTACKER has NO pendingCredit entry (would be the mint's smoking gun).
-    expect(state1.pendingCredit[ATTACKER] ?? 0).toBe(0);
-  });
-
-  it('poison shape (unbacked request) is refunded, drain continues (integration is covered end-to-end in the operator-throw suite below)', () => {
-    // The full end-to-end throw scenario is exercised in the
-    // "operator try/catch path" describe block below (audit r4 NOTE);
-    // this smaller case checks the escrow-mismatch branch specifically:
-    // when a request record has a legitimate escrow but ante disagreement
-    // is detected on read, operatorRefundCoinPusherRequest tears both down
-    // without minting from the mismatched escrow's ante.
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'good-1', 1, 100), 0)).toBe(true);
-    const refunded = operatorRefundCoinPusherRequest(MACHINE, PLAYER, 'good-1');
-    expect(refunded).toBe(1);
-    expect(readChips(PLAYER)).toBe(5); // full refund
-  });
-});
-
-describe('casinoPrefixWriteGeneration — cheap poll gate (audit MAJOR #5)', () => {
-  it('bumps only when a matching-prefix key is written', () => {
-    buyInChips(PLAYER, 10);
-    initMachine();
-    const prefix = `pusher-req:${MACHINE}:`;
-    // Registers the counter at its current value (whatever it is after
-    // bindCasinoDoc + init writes).
-    const g0 = casinoPrefixWriteGeneration(prefix);
-    // A write to an UNRELATED key must NOT bump this prefix's generation.
-    buyInChips('someone-else', 1);
-    const g1 = casinoPrefixWriteGeneration(prefix);
-    expect(g1).toBe(g0);
-    // A write to a MATCHING key bumps it.
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 1, 100))).toBe(true);
-    const g2 = casinoPrefixWriteGeneration(prefix);
-    expect(g2).toBeGreaterThan(g1);
-    // Clearing the request also matches the prefix and bumps.
-    clearCoinPusherInsert(MACHINE, PLAYER, 'r1');
-    const g3 = casinoPrefixWriteGeneration(prefix);
-    expect(g3).toBeGreaterThan(g2);
-  });
-});
-
-describe('publishAndClearCoinPusherInsert — atomic settle (audit r4 NOTE)', () => {
-  // Audit r4 NOTE: the previous operator-tick code called publishCoinPusherState
-  // (transact 1) and clearCoinPusherInsert (transact 2) as separate atomic units.
-  // A failure between them would leave the request record live while its chip
-  // was already in machine state — a next-tick re-drain would mint the chip
-  // AGAIN. publishAndClearCoinPusherInsert wraps all three writes (state set,
-  // request delete, escrow delete) in ONE transact.
-  it('publishes state AND deletes both request and escrow in one atomic step', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 1, 100), 0)).toBe(true);
-
-    const state = readCoinPusherState(MACHINE)!;
-    const result = processInsert(state, PLAYER, 1, 0.5, 1, 0xdead, 200);
-
-    // Subscribe to observer to count how many update batches this fires.
-    let observedUpdates = 0;
-    const observer = () => { observedUpdates++; };
-    doc.on('update', observer);
-
-    const ok = publishAndClearCoinPusherInsert(MACHINE, result.state, PLAYER, 'r1');
-    expect(ok).toBe(true);
-
-    doc.off('update', observer);
-
-    // All three writes must land in ONE update event — proves the transact
-    // boundary held. Yjs coalesces writes inside a single transact into a
-    // single 'update' emission.
-    expect(observedUpdates).toBe(1);
-
-    // Every effect is visible: state advanced, request cleared, escrow cleared.
-    const finalState = readCoinPusherState(MACHINE)!;
-    expect(finalState.totalInserted).toBe(1);
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')).toBeNull();
-  });
-
-  it('rejects a shape-invalid nextState without any map mutation', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 1, 100), 0)).toBe(true);
-    const stateBefore = readCoinPusherState(MACHINE)!;
-
-    // Feed a shape-invalid state (missing kind field).
-    const badState = { ...stateBefore } as any;
-    delete badState.kind;
-    const ok = publishAndClearCoinPusherInsert(MACHINE, badState, PLAYER, 'r1');
-    expect(ok).toBe(false);
-
-    // No mutation happened — request + escrow still live, state unchanged.
-    expect(readCoinPusherState(MACHINE)).toEqual(stateBefore);
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).not.toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')).not.toBeNull();
-  });
-
-  it('rejects malformed playerId or requestId without any map mutation', () => {
-    buyInChips(PLAYER, 5);
-    initMachine();
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'r1', 1, 100), 0)).toBe(true);
-    const stateBefore = readCoinPusherState(MACHINE)!;
-
-    expect(publishAndClearCoinPusherInsert(MACHINE, stateBefore, '', 'r1')).toBe(false);
-    expect(publishAndClearCoinPusherInsert(MACHINE, stateBefore, PLAYER, '')).toBe(false);
-    // Records still present — no partial mutation.
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).not.toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'r1')).not.toBeNull();
-  });
-});
-
-describe('operator try/catch path — real end-to-end throw handling (audit r4 NOTE)', () => {
-  // Audit r4 NOTE: the r3 placeholder "poison shape" test explicitly skipped
-  // constructing a payload that flows through the operator's try/catch,
-  // instead calling operatorRefundCoinPusherRequest directly. This test
-  // faithfully emulates the tickCoinPusherOperator drain loop and forces
-  // processInsert to THROW on one request — asserting the try/catch:
-  //   (a) refunds the throwing request's escrow
-  //   (b) drops the poison request record so the drain continues
-  //   (c) does NOT block later requests behind it
-  //   (d) never mints chips from the failed insert
-  it('a processInsert throw is caught: escrow refunded, request cleared, drain continues', () => {
-    buyInChips(PLAYER, 5);
-    buyInChips('player-Carol', 5);
-    initMachine();
-    // PLAYER's request is 'bad-1' (throws); Carol's is 'zgood-2' (settles).
-    // Sort order: 'bad-1' < 'zgood-2', so PLAYER's runs first — the throw
-    // must NOT stop Carol's from being processed on the same tick.
-    expect(submitCoinPusherInsert(MACHINE, makeRequest(PLAYER, 'bad-1', 1, 100), 0)).toBe(true);
-    expect(submitCoinPusherInsert(MACHINE, makeRequest('player-Carol', 'zgood-2', 1, 100), 0)).toBe(true);
-
-    // A processInsert stand-in that THROWS the first time it's called with
-    // PLAYER's id and returns a valid result otherwise. Mirrors what a real
-    // engine-side regression could look like at the operator boundary.
-    let throwsRemaining = 1;
-    const processInsertOrThrow = (
-      state: any, player: string, hole: any, timing: number, ante: number, seed: number, nowMs: number,
-    ) => {
-      if (throwsRemaining > 0 && player === PLAYER) {
-        throwsRemaining--;
-        throw new Error('simulated engine throw — poison-shape scenario');
-      }
-      return processInsert(state, player, hole, timing, ante, seed, nowMs);
-    };
-
-    // Faithful drain loop — same structure as tickCoinPusherOperator:
-    // 1) scan requests, 2) escrow-gate, 3) try/catch around processInsert,
-    // 4) on throw: operatorRefundCoinPusherRequest tears down request+escrow.
-    let state = readCoinPusherState(MACHINE)!;
-    const requests = readCoinPusherRequests(MACHINE);
-    for (const req of requests) {
-      const esc = readCoinPusherEscrow(MACHINE, req.player, req.requestId);
-      if (!esc || esc.player !== req.player || esc.ante !== req.ante) {
-        operatorRefundCoinPusherRequest(MACHINE, req.player, req.requestId);
-        continue;
-      }
-      try {
-        const r = processInsertOrThrow(state, req.player, req.hole, req.timing, req.ante, 0xbeef, 300);
-        state = r.state;
-        // In the real operator this is publishAndClearCoinPusherInsert — same effect.
-        expect(publishAndClearCoinPusherInsert(MACHINE, state, req.player, req.requestId)).toBe(true);
-      } catch (err) {
-        // Real operator's fallback: refund escrow and clear the request.
-        operatorRefundCoinPusherRequest(MACHINE, req.player, req.requestId);
-      }
-    }
-
-    // PLAYER (whose request threw): escrow refunded, request cleared.
-    expect(readChips(PLAYER)).toBe(5); // fully restored — no chip destroyed
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    expect(readCoinPusherEscrow(MACHINE, PLAYER, 'bad-1')).toBeNull();
-
-    // Carol (drain continued past the throw): request settled.
-    expect(readChips('player-Carol')).toBe(4); // 5 − 1 (still consumed)
-    expect(readCoinPusherRequest(MACHINE, 'player-Carol')).toBeNull();
-
-    // Machine state: only Carol's insert was actually processed.
-    const finalState = readCoinPusherState(MACHINE)!;
-    expect(finalState.totalInserted).toBe(1);
-    // The throwing request contributed NOTHING to pendingCredit — no mint.
-    expect(finalState.pendingCredit[PLAYER] ?? 0).toBe(0);
-  });
-});
-
-describe('ownership self-heal (audit r4 NOTE)', () => {
-  // Audit r4 NOTE: state.ownerId is peer-writable, so a hostile peer could
-  // overwrite it to lock the true owner's operator loop out. The r4 self-heal
-  // path in ensureCoinPusherInitialized takes ownership when the caller has
-  // room-edit permission (isHouse) and observes a foreign ownerId, preserving
-  // every chip already in the machine.
-  //
-  // We test the PURE HEAL EFFECT (the writeCoinPusherState transformation)
-  // without touching devices.ts's window/interval-bound machinery. The heal
-  // logic itself is: read state, if ownerId != myId, write { ...state,
-  // ownerId: myId, tick: tick+1 }.
-  it('heal preserves piles, pendingCredit, and totalInserted while transferring ownerId', () => {
-    initMachine();
-    // Simulate an established machine: seed with a couple of chips via
-    // legit inserts by the true owner, then add pending credit + counters.
-    let state = readCoinPusherState(MACHINE)!;
-    for (let i = 0; i < 3; i++) {
-      const r = processInsert(state, OWNER, 1, 0.5, 1, 0xdead + i, i * 100);
-      state = r.state;
-    }
-    state = { ...state, pendingCredit: { ...state.pendingCredit, [OWNER]: 2 } };
-    writeCoinPusherState(MACHINE, state);
-    const before = readCoinPusherState(MACHINE)!;
-    expect(before.totalInserted).toBe(3);
-    const chipsBefore = chipsInMachine(before);
-
-    // A hostile peer stamps state.ownerId = ATTACKER (keeps everything else).
-    writeCoinPusherState(MACHINE, { ...before, ownerId: ATTACKER });
-    const hostile = readCoinPusherState(MACHINE)!;
-    expect(hostile.ownerId).toBe(ATTACKER);
-    expect(hostile.totalInserted).toBe(3); // hostile keeps counters
-
-    // TRUE room owner heals: emulates ensureCoinPusherInitialized's take-over
-    // branch (same one-line effect: writeCoinPusherState with ownerId=myId).
-    const NEW_OWNER = 'owner-Alice-newSession';
-    const healed = { ...hostile, ownerId: NEW_OWNER, tick: (hostile.tick >>> 0) + 1 };
-    writeCoinPusherState(MACHINE, healed);
+describe('refuseCoinPusherInsert', () => {
+  it('records why, clears the request and moves no chips', () => {
+    const base = machineWith(10);
+    writeCoinPusherState(MACHINE, base);
+    buyInChips(PLAYER, 2);
+    const req = request(PLAYER, 'req-1');
+    writeCoinPusherRequest(MACHINE, req);
+    expect(refuseCoinPusherInsert(MACHINE, readCoinPusherState(MACHINE)!, req, 'machine-full', 9)).toBe(true);
     const after = readCoinPusherState(MACHINE)!;
-
-    // Ownership transferred, but EVERY chip is preserved.
-    expect(after.ownerId).toBe(NEW_OWNER);
-    expect(after.totalInserted).toBe(before.totalInserted);
-    expect(after.totalPaid).toBe(before.totalPaid);
-    expect(after.totalEmptied).toBe(before.totalEmptied);
-    expect(after.pendingCredit[OWNER]).toBe(before.pendingCredit[OWNER]);
-    expect(chipsInMachine(after)).toBe(chipsBefore);
-    // Tick advanced (monotonicity across the heal).
-    expect(after.tick).toBeGreaterThan(before.tick);
+    expect(after.lastRefusal).toEqual({ requestId: 'req-1', player: PLAYER, reason: 'machine-full', atMs: 9 });
+    expect(after.tick).toBe(base.tick + 1);
+    expect(chipsInMachine(after)).toBe(chipsInMachine(base));
+    expect(after.totalInserted).toBe(base.totalInserted);
+    expect(readChips(PLAYER)).toBe(2);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
   });
 
-  it('a non-house peer cannot heal — the guard rejects (writeCoinPusherState is peer-writable but ensureCoinPusherInitialized gates on isHouse)', () => {
-    initMachine();
-    // NOTE: writeCoinPusherState itself is peer-writable — the trust boundary
-    // is enforced by callers (ensureCoinPusherInitialized checks isHouse).
-    // This test asserts the CALL contract: a non-house caller path must be a
-    // no-op. We simulate the guard directly since devices.ts binds getPlayerId
-    // via a browser seam. If isHouse=false and we bail early, the state is
-    // NOT healed.
-    const isHouse = false;
-    if (!isHouse) {
-      // Guard hit — the heal path did not run. Nothing to do.
-    } else {
-      // Would call: writeCoinPusherState(MACHINE, { ...existing, ownerId: myId });
-    }
-    // State remains at initial (OWNER).
-    expect(readCoinPusherState(MACHINE)!.ownerId).toBe(OWNER);
+  it('writes nothing over a newer machine', () => {
+    const base = machineWith(10);
+    writeCoinPusherState(MACHINE, { ...base, tick: base.tick + 5 });
+    const req = request(PLAYER, 'req-1');
+    writeCoinPusherRequest(MACHINE, req);
+    expect(refuseCoinPusherInsert(MACHINE, base, req, 'no-chips', 9)).toBe(false);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toEqual(req);
   });
 });
 
-describe('end-to-end conservation across the wiring layer', () => {
-  it('total chips conserved through submit → process → claim → empty', () => {
-    // Cage buys chips for the player. Player inserts. Operator processes.
-    // Chips end up either in-machine, paid out (pendingCredit), or emptied
-    // by the owner. At every step: Σ (bal + inMachine + pendingCredit) is
-    // preserved (up to owner credit from emptied chips).
-    const boughtPlayer = 10;
-    buyInChips(PLAYER, boughtPlayer);
-    initMachine();
-    let state = readCoinPusherState(MACHINE)!;
+// ── commitCoinPusherEmpty ────────────────────────────────────────────────────
 
-    // Player submits + operator drains for N inserts.
-    for (let i = 0; i < 5; i++) {
-      const req = makeRequest(PLAYER, `r${i}`, 1, i * 100);
-      expect(submitCoinPusherInsert(MACHINE, req)).toBe(true);
-      const s = readCoinPusherState(MACHINE)!;
-      const r = processInsert(s, req.player, req.hole, req.timing, req.ante, 0xbeef + i, i * 100);
-      writeCoinPusherState(MACHINE, r.state);
-      clearCoinPusherInsert(MACHINE, req.player, req.requestId);
+describe('commitCoinPusherEmpty', () => {
+  const door = (requester: string) => ({ requestId: 'door-1', requester, requestedAt: 5 });
+
+  it('credits the owner exactly the chips inside, empties the machine and clears the door — in one transaction', () => {
+    const base = machineWith(40);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherEmptyRequest(MACHINE, door(OWNER));
+    buyInChips(OWNER, 7);
+    const inside = chipsInMachine(base);
+    const transactions = countTransactions(doc);
+    const emptied = emptyMachine(base, OWNER).state;
+    expect(commitCoinPusherEmpty(MACHINE, readCoinPusherState(MACHINE)!, emptied, door(OWNER))).toBe(inside);
+    expect(transactions()).toBe(1);
+    expect(readChips(OWNER)).toBe(7 + inside);
+    expect(chipsInMachine(readCoinPusherState(MACHINE)!)).toBe(0);
+    expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+  });
+
+  it('refuses a door request from anyone but the owner', () => {
+    const base = machineWith(40);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherEmptyRequest(MACHINE, door(ATTACKER));
+    const emptied = { ...emptyMachine(base, OWNER).state };
+    expect(commitCoinPusherEmpty(MACHINE, base, emptied, door(ATTACKER))).toBeNull();
+    expect(readChips(ATTACKER)).toBe(0);
+    expect(readChips(OWNER)).toBe(0);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+  });
+
+  it('refuses a next that is not the empty of the stored machine', () => {
+    const base = machineWith(40);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherEmptyRequest(MACHINE, door(OWNER));
+    const emptied = emptyMachine(base, OWNER).state;
+    expect(commitCoinPusherEmpty(MACHINE, base, { ...emptied, totalEmptied: emptied.totalEmptied + 10 }, door(OWNER))).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, { ...base, tick: base.tick - 1 }, emptied, door(OWNER))).toBeNull();
+    expect(commitCoinPusherEmpty(MACHINE, base, base, door(OWNER))).toBeNull();
+    expect(readChips(OWNER)).toBe(0);
+  });
+});
+
+// ── drainAndClearCoinPusher (cabinet removed) ────────────────────────────────
+
+describe('drainAndClearCoinPusher', () => {
+  it('pays the chips inside to the owner and deletes every key the machine used', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd', requester: OWNER, requestedAt: 0 });
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OWNER, sessionId: 's', expiresAt: 99 });
+    expect(drainAndClearCoinPusher(MACHINE)).toBe(chipsInMachine(base));
+    expect(readChips(OWNER)).toBe(chipsInMachine(base));
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(readCoinPusherRequests(MACHINE)).toEqual([]);
+    expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
+    expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+  });
+
+  it('refunds nothing for pending or forged requests — they never held chips', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    buyInChips(PLAYER, 4);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 20; i++) {
+      map.set(`pusher-req:${MACHINE}:${ATTACKER}`, request(ATTACKER, `forged-${i}`));
+      map.set(`pusher-esc:${MACHINE}:${ATTACKER}:forged-${i}`, { requestId: `forged-${i}`, player: ATTACKER, ante: 100, escrowedAt: 0 });
     }
-    state = readCoinPusherState(MACHINE)!;
-    const inMachine = chipsInMachine(state);
-    const pendingPlayer = state.pendingCredit[PLAYER] ?? 0;
-    const balPlayer = readChips(PLAYER);
-    // Player bought N=10, inserted 5, so bal is 5 + pendingCredit + inMachine
-    // should equal 10 (the totalInserted equals chipsInMachine + totalPaid
-    // by the engine invariant, and pendingPlayer === totalPaid because we
-    // only ever attributed to PLAYER).
-    expect(balPlayer + pendingPlayer + inMachine).toBe(boughtPlayer);
+    drainAndClearCoinPusher(MACHINE);
+    expect(readChips(PLAYER)).toBe(4);
+    expect(readChips(ATTACKER)).toBe(0);
+  });
 
-    // Owner empties — chips move from machine to owner bal.
-    const engineResult = emptyMachine(state, OWNER);
-    expect(commitCoinPusherEmpty(MACHINE, engineResult.state, OWNER, engineResult.emptied)).toBe(true);
-    const finalState = readCoinPusherState(MACHINE)!;
-    const balOwner = readChips(OWNER);
-    // Total system = player bal + player pending + owner bal + emptied-out
-    // must still equal boughtPlayer (owner never bought chips).
-    expect(readChips(PLAYER) + (finalState.pendingCredit[PLAYER] ?? 0) + balOwner + chipsInMachine(finalState)).toBe(boughtPlayer);
+  it('credits nothing when there is no machine (or junk), and still clears its keys', () => {
+    doc.getMap('casino').set(`pusher:${MACHINE}`, { kind: 'coin-pusher', junk: true });
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    expect(drainAndClearCoinPusher(MACHINE)).toBe(0);
+    expect(doc.getMap('casino').has(`pusher:${MACHINE}`)).toBe(false);
+    expect(readCoinPusherRequests(MACHINE)).toEqual([]);
+  });
+});
+
+// ── Two peers ────────────────────────────────────────────────────────────────
+
+describe('coin pusher across two peers', () => {
+  function sync(a: Y.Doc, b: Y.Doc): void {
+    const toB = Y.encodeStateAsUpdate(a, Y.encodeStateVector(b));
+    const toA = Y.encodeStateAsUpdate(b, Y.encodeStateVector(a));
+    Y.applyUpdate(b, toB);
+    Y.applyUpdate(a, toA);
+  }
+
+  /** Operator doc + player doc, synced, with a paying request pending. */
+  function twoPeers() {
+    const operatorDoc = new Y.Doc();
+    const playerDoc = new Y.Doc();
+    bindCasinoDoc(operatorDoc);
+    const { base, req, next } = payingSetup();
+    sync(operatorDoc, playerDoc);
+    bindCasinoDoc(playerDoc);
+    buyInChips(PLAYER, 5);
+    sync(operatorDoc, playerDoc);
+    return { operatorDoc, playerDoc, base, req, next };
+  }
+
+  it('a settle racing the player\'s cancel converges to one drop, paid once', () => {
+    const { operatorDoc, playerDoc, base, req, next } = twoPeers();
+    bindCasinoDoc(operatorDoc);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('ok');
+    bindCasinoDoc(playerDoc);
+    expect(cancelCoinPusherRequest(MACHINE, PLAYER, req.requestId)).toBe(true);
+    sync(operatorDoc, playerDoc);
+    for (const d of [operatorDoc, playerDoc]) {
+      bindCasinoDoc(d);
+      expect(readChips(PLAYER)).toBe(5 - 1 + next.lastDrop!.paid);
+      expect(readCoinPusherState(MACHINE)).toEqual(next);
+      expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
+    }
+  });
+
+  it('a new request the player writes while the operator settles the last one survives the merge', () => {
+    const { operatorDoc, playerDoc, base, req, next } = twoPeers();
+    bindCasinoDoc(operatorDoc);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('ok');
+    bindCasinoDoc(playerDoc);
+    cancelCoinPusherRequest(MACHINE, PLAYER, req.requestId);
+    const again = request(PLAYER, 'req-again', 2, 0.1);
+    expect(writeCoinPusherRequest(MACHINE, again)).toBe(true);
+    sync(operatorDoc, playerDoc);
+    for (const d of [operatorDoc, playerDoc]) {
+      bindCasinoDoc(d);
+      expect(readCoinPusherRequest(MACHINE, PLAYER)).toEqual(again);
+      expect(readChips(PLAYER)).toBe(5 - 1 + next.lastDrop!.paid);
+    }
   });
 });
