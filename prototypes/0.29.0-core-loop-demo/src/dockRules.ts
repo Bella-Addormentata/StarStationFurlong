@@ -1,0 +1,274 @@
+/**
+ * ⚓ Docking-adapter rules (#163) — pure, no DOM, no Three, no bound doc.
+ *
+ * A DOCK PORT is one half of a round docking adapter fitted to a door (stored
+ * as the door's `doorPolicy.adapter` flag, which outlives any connection). A
+ * DOCK is two halves mated: a pairing whose chain is exactly two `dock`
+ * segments, always transient. UNDOCK leaves a tombstone that remembers the
+ * berth; DOCK makes the same connection again.
+ *
+ * Every surface that touches a dock — the door panel, the helm's docking
+ * computer, the transit mirror, and the far-room write — decides through
+ * here, so the two ends of one connection are always judged by one set of
+ * rules. Pinned by dockRules.test.ts.
+ */
+
+import { dockChain, isDockChain, type ConnectorSegment } from './adapter';
+import {
+  buildDoorPairing, buildDoorTombstone,
+  type DockBerthMemory, type DoorPairing, type DoorRecord, type DoorTombstone,
+} from './doorsDoc';
+import type { DoorWall } from './doorLayoutDoc';
+import { roomIdFromSeed } from './stationAtlas';
+
+// ── What a door is, as far as docking goes ───────────────────────────────────
+
+export type DockPortState =
+  /** Two halves mated — the connection is live. */
+  | { kind: 'docked'; address: string; roomId: string; record: DoorPairing }
+  /** Released, with a berth on record: DOCK re-makes it. */
+  | { kind: 'undocked'; address: string; roomId: string; memory: DockBerthMemory }
+  /** A port with nothing on the other side and no berth to return to. */
+  | { kind: 'free' }
+  /** Connected, but by a GANGWAY (a legacy connection on a door that also
+   *  wears a port): not a dock, so neither DOCK nor UNDOCK applies. */
+  | { kind: 'gangway' };
+
+/** Classify one door from its (sanitized) record. */
+export function classifyDockPort(record: DoorRecord | undefined): DockPortState {
+  if (!record) return { kind: 'free' };
+  if (record.paired) {
+    if (!record.connectedRoomAddress) return { kind: 'free' };
+    return isDockChain(record.segments)
+      ? {
+          kind: 'docked',
+          address: record.connectedRoomAddress,
+          roomId: roomIdFromSeed(record.connectedRoomAddress),
+          record,
+        }
+      : { kind: 'gangway' };
+  }
+  return record.dock && record.retiredAddress
+    ? {
+        kind: 'undocked',
+        address: record.retiredAddress,
+        roomId: roomIdFromSeed(record.retiredAddress),
+        memory: record.dock,
+      }
+    : { kind: 'free' };
+}
+
+/** A door wears a port when its policy says so — or when it is docked right
+ *  now (a dock always has both halves, whatever a lagging policy map says). */
+export function isPortDoor(adapterFlag: boolean, record: DoorRecord | undefined): boolean {
+  return adapterFlag || (!!record?.paired && isDockChain(record.segments));
+}
+
+// ── The +DOCK vestibule option ───────────────────────────────────────────────
+
+export type DockStep =
+  | { kind: 'fit-port' }
+  | { kind: 'stage-mate' }
+  | { kind: 'refuse'; reason: string };
+
+/**
+ * What the next `+DOCK` press does at a door: the first fits THIS door's port,
+ * the second stages the MATING half the connection brings to the far door.
+ */
+export function nextDockStep(s: {
+  hasPort: boolean;
+  record: DoorRecord | undefined;
+  staged: readonly ConnectorSegment[] | undefined;
+}): DockStep {
+  if (s.record?.paired && s.record.connectedRoomAddress) {
+    return isDockChain(s.record.segments)
+      ? { kind: 'refuse', reason: 'Docked — both halves are already fitted. UNDOCK first to change anything.' }
+      : { kind: 'refuse', reason: 'This door already has a vestibule — UNDOCK it before fitting a dock port.' };
+  }
+  const staged = s.staged ?? [];
+  if (staged.some((seg) => seg.kind !== 'dock')) {
+    return { kind: 'refuse', reason: 'A dock port connects directly — CLEAR the gangway chain first.' };
+  }
+  if (!s.hasPort) return { kind: 'fit-port' };
+  if (isDockChain(staged)) {
+    return {
+      kind: 'refuse',
+      reason: 'Both halves are staged — PROVISION NEW MODULE, or pick a target and INITIATE.',
+    };
+  }
+  return { kind: 'stage-mate' };
+}
+
+/** A chain may take a gangway part (FLEX/EXT) only on a door without a port. */
+export function gangwayPartRefusal(hasPort: boolean): string | null {
+  return hasPort
+    ? 'This door wears a dock port — it connects by docking. Remove the port (✕ on its chip) to build a gangway.'
+    : null;
+}
+
+// ── Dock and undock, near side ───────────────────────────────────────────────
+
+/** What an UNDOCK remembers of the berth it releases. */
+export function berthMemoryFrom(record: DoorPairing, undockedAt: number): DockBerthMemory {
+  const memory: DockBerthMemory = { undockedAt };
+  if (record.farDoor) memory.farDoor = record.farDoor;
+  if (record.farWall) memory.farWall = record.farWall;
+  if (record.farLateral !== undefined) memory.farLateral = record.farLateral;
+  return memory;
+}
+
+/** The near record a DOCK (re-)writes toward a remembered berth. */
+export function redockRecord(
+  state: Extract<DockPortState, { kind: 'undocked' }>,
+  dockedAt: number,
+): DoorPairing {
+  return buildDoorPairing(state.address, {
+    segments: dockChain(),
+    farDoor: state.memory.farDoor,
+    farWall: state.memory.farWall,
+    farLateral: state.memory.farLateral,
+    transient: true,
+    dockedAt,
+  });
+}
+
+// ── The transit mirror ───────────────────────────────────────────────────────
+
+/**
+ * May the first walk-through write the arrival door's mirror record?
+ *
+ * Never over a live pairing (one vestibule per door). A tombstone naming the
+ * departure ROOM refuses — that connection was deliberately taken down, and
+ * re-creating it would undo someone's undock — with one exception: a DOCK
+ * made after that door's own undock is a deliberate re-dock, so it may.
+ * Compared by room id, never by seed string: two passes to the same module
+ * are different strings and used to slip straight past a tombstone.
+ */
+export function mirrorMayWrite(
+  existing: DoorRecord | undefined,
+  departureRoomId: string,
+  departure: { isDock: boolean; dockedAt?: number },
+): boolean {
+  if (!existing) return true;
+  if (existing.paired) return false;
+  const retiredRoom = roomIdFromSeed(existing.retiredAddress);
+  if (!retiredRoom || retiredRoom !== departureRoomId) return true;
+  return (
+    departure.isDock &&
+    existing.dock !== undefined &&
+    typeof departure.dockedAt === 'number' &&
+    departure.dockedAt > existing.dock.undockedAt
+  );
+}
+
+// ── The far side ─────────────────────────────────────────────────────────────
+
+/** Which of the far room's doors holds its end of OUR connection. The near
+ *  record's `farDoor` when it names one; otherwise the far door whose own
+ *  record points back at us through our door (the mirror writes exactly
+ *  that), else the only far door pointing at our room without naming one of
+ *  our OTHER doors — a record that names another door of ours is that other
+ *  connection's end, never this one's. */
+export function findFarDoor(
+  farDoors: ReadonlyMap<string, DoorRecord>,
+  nearRoomId: string,
+  nearDoorId: string,
+  hint?: string,
+): string | null {
+  if (hint) return hint;
+  const ours = [...farDoors.entries()].filter(
+    ([, r]) => r.paired && roomIdFromSeed(r.connectedRoomAddress) === nearRoomId,
+  );
+  const exact = ours.find(([, r]) => r.paired && r.farDoor === nearDoorId);
+  if (exact) return exact[0];
+  const unnamed = ours.filter(([, r]) => r.paired && !r.farDoor);
+  return unnamed.length === 1 ? unnamed[0][0] : null;
+}
+
+export interface NearEnd {
+  roomId: string;
+  /** An address the far room can reach us by (pass / ledger / minted). */
+  address: string;
+  doorId: string;
+  wall?: DoorWall;
+  lateral?: number;
+}
+
+export type FarUndock =
+  | { action: 'write'; record: DoorTombstone }
+  | { action: 'skip'; reason: 'absent' | 'already' | 'not-ours' | 'newer-dock' };
+
+/** UNDOCK's far end: tombstone the far record only while it still describes
+ *  THIS dock — ours, and not a dock made after this undock (a late write from
+ *  a quick undock→dock must never undo the newer dock). */
+export function farUndockPatch(
+  farRecord: DoorRecord | undefined,
+  near: NearEnd,
+  undockedAt: number,
+): FarUndock {
+  if (!farRecord) return { action: 'skip', reason: 'absent' };
+  if (!farRecord.paired) return { action: 'skip', reason: 'already' };
+  if (roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId) {
+    return { action: 'skip', reason: 'not-ours' };
+  }
+  if (typeof farRecord.dockedAt === 'number' && farRecord.dockedAt > undockedAt) {
+    return { action: 'skip', reason: 'newer-dock' };
+  }
+  return {
+    action: 'write',
+    record: buildDoorTombstone(near.address, {
+      farDoor: near.doorId,
+      farWall: near.wall,
+      farLateral: near.lateral,
+      undockedAt,
+    }),
+  };
+}
+
+export type FarDock =
+  | { action: 'write'; record: DoorPairing }
+  | { action: 'refuse'; reason: 'gone' | 'occupied' | 'closed' };
+
+/** Player-facing words for a refused far berth. */
+export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['reason'], string> = {
+  gone: 'That berth no longer exists — its door was removed.',
+  occupied: 'That berth is occupied by another module now.',
+  closed: 'That berth was closed — its dock port was removed.',
+};
+
+/**
+ * DOCK's far end: the berth must still exist and be free — no record, a dock
+ * tombstone (anyone's), a plain tombstone for another module, or already us.
+ * Paired to someone else is OCCUPIED; a plain tombstone naming US is CLOSED
+ * (removing a port drops its berth memory precisely to say so).
+ */
+export function farDockPatch(
+  farRecord: DoorRecord | undefined,
+  farDoorExists: boolean,
+  near: NearEnd,
+  dockedAt: number,
+): FarDock {
+  if (!farDoorExists) return { action: 'refuse', reason: 'gone' };
+  if (farRecord?.paired && roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId) {
+    return { action: 'refuse', reason: 'occupied' };
+  }
+  if (
+    farRecord &&
+    !farRecord.paired &&
+    !farRecord.dock &&
+    roomIdFromSeed(farRecord.retiredAddress) === near.roomId
+  ) {
+    return { action: 'refuse', reason: 'closed' };
+  }
+  return {
+    action: 'write',
+    record: buildDoorPairing(near.address, {
+      segments: dockChain(),
+      farDoor: near.doorId,
+      farWall: near.wall,
+      farLateral: near.lateral,
+      transient: true,
+      dockedAt,
+    }),
+  };
+}

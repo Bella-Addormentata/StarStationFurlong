@@ -3595,6 +3595,83 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
     0.78,
     -0.05,
   );
+  // ⚓ #163: the DOCKING COMPUTER — a small monitor on the desk's right end,
+  // turned to the pilot (the stand-point is on −z), showing the round-port
+  // glyph. Its live face is the helm's focused UI; this is the diegetic hint
+  // that the console docks and undocks the module.
+  const tilt = 0.35; // lean back toward the standing pilot's eyes
+  const bezelZ = 0.02;
+  const bezel = place(
+    new THREE.BoxGeometry(0.36, 0.26, 0.04),
+    m(0x1c262e, 0.6, 0.4),
+    0.66,
+    1.0,
+    bezelZ,
+  );
+  bezel.rotation.x = tilt; // a box is 180°-symmetric: same lean as the screen
+  place(
+    new THREE.BoxGeometry(0.04, 0.2, 0.04),
+    m(0x37474f, 0.6, 0.4),
+    0.66,
+    0.86,
+    0.06,
+  );
+  const dockScreenMat = new THREE.MeshBasicMaterial({
+    map: makeDockScreenTexture(),
+    transparent: true,
+    opacity: 0,
+  });
+  // On the bezel's pilot-facing face: its centre plus half its depth (and a
+  // hair) along the tilted outward normal (0, sin t, −cos t).
+  const out = 0.021;
+  const dockScreen = place(
+    new THREE.PlaneGeometry(0.31, 0.21),
+    dockScreenMat,
+    0.66,
+    1.0 + out * Math.sin(tilt),
+    bezelZ - out * Math.cos(tilt),
+    Math.PI, // face −z, toward the pilot's stand-point
+  );
+  dockScreen.rotation.x = tilt;
+}
+
+/** ⚓ #163: the helm's docking-computer face — a round port glyph (the
+ *  adapter's own silhouette) over "DOCK", drawn once. */
+function makeDockScreenTexture(): THREE.CanvasTexture {
+  const cv = document.createElement("canvas");
+  cv.width = 128;
+  cv.height = 88;
+  const ctx = cv.getContext("2d")!;
+  ctx.fillStyle = "#06121C";
+  ctx.fillRect(0, 0, 128, 88);
+  ctx.strokeStyle = "#1E88A8";
+  ctx.strokeRect(2.5, 2.5, 123, 83);
+  ctx.strokeStyle = "#F2EFE6";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(64, 36, 22, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.strokeStyle = "#00E5FF";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(64, 36, 12, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(52, 24);
+  ctx.lineTo(76, 48);
+  ctx.moveTo(76, 24);
+  ctx.lineTo(52, 48);
+  ctx.stroke();
+  ctx.fillStyle = "#00E5FF";
+  ctx.font = "bold 15px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("DOCK", 64, 74);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  return tex;
 }
 
 // ── 🧱🪟 Modular wall sections (owner request) ────────────────────────────────

@@ -854,7 +854,7 @@ function buildPanel(): HTMLDivElement {
       // ── #62 P4 PARTS actions ──
       case 'add-flex': addParts('flex', 4); refreshPartsRows(); break;
       case 'add-ext': addParts('ext', 2); refreshPartsRows(); break;
-      case 'add-adapter': addParts('adapter', 1); refreshPartsRows(); break;
+      case 'add-adapter': addParts('adapter', 2); refreshPartsRows(); break; // ⚓ #163: a dock is two halves
       case 'arm-preset': {
         const p = btn.dataset.preset as PresetId;
         setArmedPreset(armedPreset() === p ? null : p); // toggle
@@ -946,8 +946,8 @@ function refreshPartsRows(): void {
       <button type="button" data-dev-action="add-ext" style="${BTN_STYLE}">+2</button>
     </div>
     <div style="${ROW_STYLE}">
-      <span>🔌 DOCK ADAPTER <span style="color:rgba(255,179,0,0.5);">× ${partsCount('adapter')}</span></span>
-      <button type="button" data-dev-action="add-adapter" style="${BTN_STYLE}">+1</button>
+      <span>⚓ DOCK ADAPTER HALF <span style="color:rgba(255,179,0,0.5);">× ${partsCount('adapter')}</span></span>
+      <button type="button" data-dev-action="add-adapter" style="${BTN_STYLE}">+2</button>
     </div>
     <div style="${ROW_STYLE}">
       <span>⭕ RING LINK <span style="color:rgba(255,179,0,0.4);">· flex+22.5 / ext×4 / flex+22.5</span></span>

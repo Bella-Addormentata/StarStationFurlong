@@ -102,6 +102,7 @@ import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
   buildVestibule,
   buildConnectorChain,
+  buildDockPortStub,
   setVestibuleLightState,
   setVestibuleOpacity,
 } from "./adapter";
@@ -1649,6 +1650,7 @@ export class World {
             farLateral: rec.farLateral,
             farYawDeg: rec.farYawDeg,
             transient: rec.transient, // #67 D2
+            dockedAt: rec.dockedAt, // ⚓ #163
           },
         );
       } else {
@@ -4191,8 +4193,15 @@ export class World {
    */
   /** #62 P3: build the door's connector from its pairing RECORD — an
    *  assembled chain when segments exist, the legacy straight gangway
-   *  otherwise. The geometry key on userData drives rebuild-on-diff. */
-  private buildDoorConnector(doorId: DoorId): THREE.Group {
+   *  otherwise. The geometry key on userData drives rebuild-on-diff.
+   *  ⚓ #163: `portStub` builds an UNPAIRED port door's own sealed half
+   *  instead (a dock chain itself comes through buildConnectorChain). */
+  private buildDoorConnector(doorId: DoorId, portStub = false): THREE.Group {
+    if (portStub) {
+      const stub = buildDockPortStub(doorId);
+      stub.userData.segmentsKey = this.portStubKey(doorId);
+      return stub;
+    }
     const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
     const group =
       segments && segments.length > 0
@@ -4200,6 +4209,18 @@ export class World {
         : buildVestibule(doorId);
     group.userData.segmentsKey = JSON.stringify(segments ?? null);
     return group;
+  }
+
+  /** ⚓ #163: rebuild key for a lone port stub — never equal to a chain's
+   *  JSON key, so docking/undocking swaps stub ⇄ tunnel through the same
+   *  rebuild-on-diff path a chain edit uses. It carries the door's POSE too:
+   *  an unpaired door may still slide along its wall (paired ones may not),
+   *  and the stub it wears must follow instead of hanging where it was. */
+  private portStubKey(doorId: string): string {
+    const p = physicalDoorPoseOrNull(doorId);
+    return p
+      ? `⚓port-stub@${p.wall}:${p.x.toFixed(2)},${p.z.toFixed(2)}`
+      : "⚓port-stub";
   }
 
   private spawnTransitVestibule(doorId: DoorId): void {
@@ -4386,9 +4407,13 @@ export class World {
       // (fixed light translucency) so the builder sees the connection curve
       // before pairing — the plan's live-preview affordance.
       const ghost = !paired && (state?.segments?.length ?? 0) > 0;
+      // ⚓ #163: an UNPAIRED door wearing a dock port shows its own half of the
+      // adapter, hatch sealed — a real fitting, so it is solid like any
+      // vestibule (same proximity fade), not a ghost.
+      const portStub = !paired && !ghost && readDoorPolicy(door.id).adapter;
       let vestibule = this.pairedVestibules.get(door.id);
 
-      if (!paired && !ghost) {
+      if (!paired && !ghost && !portStub) {
         // Defer disposal while EITHER a transit or a plain walk-through is on
         // this door — mid-PEEK the avatar physically stands in the gangway,
         // and an unpair must not pop the tube out around them (review L1;
@@ -4407,7 +4432,9 @@ export class World {
       // rebuild this door's connector to match — but never mid-transit or
       // mid-walk-through (same deferral rule as unpair; the next frame after
       // the door sequence ends picks the rebuild up).
-      const wantKey = JSON.stringify(state?.segments ?? null);
+      const wantKey = portStub
+        ? this.portStubKey(door.id)
+        : JSON.stringify(state?.segments ?? null);
       if (
         vestibule &&
         vestibule.userData.segmentsKey !== wantKey &&
@@ -4419,7 +4446,7 @@ export class World {
       }
 
       if (!vestibule) {
-        vestibule = this.buildDoorConnector(door.id);
+        vestibule = this.buildDoorConnector(door.id, portStub);
         setVestibuleOpacity(vestibule, 0); // fades up to the resting level
         this.platformGroup.add(vestibule);
         this.pairedVestibules.set(door.id, vestibule);
@@ -5313,8 +5340,25 @@ export class World {
 
     if (device.kind === "helm") {
       // 🚀 #30 SH1: ship-status readout (flight controls come with the
-      // flight slices — the panel says so).
-      deviceFocus.beginFocus(this.player, device, createHelmUI());
+      // flight slices — the panel says so). ⚓ #163: plus the DOCKING
+      // COMPUTER — the very DOCK / UNDOCK the door panel runs, so the two
+      // surfaces can never disagree about a port.
+      const ds = this.dockingSystem;
+      deviceFocus.beginFocus(
+        this.player,
+        device,
+        createHelmUI(
+          ds
+            ? {
+                ports: () => ds.listDockPorts(),
+                connected: () => ds.connectedModules(),
+                subscribe: (cb) => ds.onDockChange(cb),
+                undock: (doorId) => void ds.undockPort(doorId),
+                dock: (doorId) => void ds.redockPort(doorId),
+              }
+            : undefined,
+        ),
+      );
       return;
     }
 
@@ -5539,6 +5583,7 @@ export class World {
             farLateral: st.farLateral,
             farYawDeg: st.farYawDeg,
             transient: st.transient, // #67 D2: guest berths carry the flag
+            dockedAt: st.dockedAt, // ⚓ #163: a dock's stamp (re-dock rule)
           });
         }
       } else if (status === "REJECTED") {

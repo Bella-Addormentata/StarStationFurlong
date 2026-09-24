@@ -1,0 +1,206 @@
+/**
+ * ⚓ #163 — the far room's end of a DOCK / UNDOCK.
+ *
+ * Two halves, pinned separately:
+ *  - applyFarDockRequest: the decision over the far room's doc — which door,
+ *    compare-and-swap on its record, and the port fitted in the same
+ *    transaction as a dock;
+ *  - YjsSync.confirmOwnWrites: the acknowledgment the short-lived session
+ *    waits for before it hangs up — driven against an in-memory node that
+ *    answers SyncStep1 from its own replica, exactly as the real one does.
+ */
+import { describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
+import { dockChain } from './adapter';
+import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom } from './doorsDoc';
+import { applyFarDockRequest } from './farDoorWrite';
+import { YjsSync } from './network/YjsSync';
+import type { NearEnd } from './dockRules';
+
+const seedFor = (roomId: string): string => btoa(JSON.stringify({ roomId }));
+const SHIP = 'module-ship';
+const STATION = 'home-station';
+
+const near: NearEnd = {
+  roomId: SHIP,
+  address: seedFor(SHIP),
+  doorId: 'd:shipport',
+  wall: 'x-',
+  lateral: 0,
+};
+
+/** The station's doc: one port door `d:bay`, docked to the ship. */
+function stationDoc(): Y.Doc {
+  const doc = new Y.Doc();
+  doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+  doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: true });
+  doc.getMap('doors').set(
+    'd:bay',
+    buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, transient: true, dockedAt: 100 }),
+  );
+  return doc;
+}
+
+describe('applyFarDockRequest — UNDOCK', () => {
+  it('tombstones the far door that points back at us, keeping the berth memory', () => {
+    const doc = stationDoc();
+    const out = applyFarDockRequest(
+      doc,
+      { kind: 'undock', farAddress: seedFor(STATION), nearDoorId: near.doorId, undockedAt: 200 },
+      near,
+    );
+    expect(out).toEqual({ result: { ok: true, detail: 'written' }, wrote: true });
+    const rec = readAllDoorsFrom(doc).get('d:bay');
+    expect(rec?.paired).toBe(false);
+    expect(rec && !rec.paired && rec.dock).toEqual({ farDoor: near.doorId, farWall: 'x-', farLateral: 0, undockedAt: 200 });
+  });
+
+  it('writes nothing when the far side no longer holds our dock', () => {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorPairing(seedFor('someone-else'), { segments: dockChain() }));
+    const out = applyFarDockRequest(
+      doc,
+      { kind: 'undock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId, undockedAt: 200 },
+      near,
+    );
+    expect(out).toEqual({ result: { ok: true, detail: 'nothing-to-undo' }, wrote: false });
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
+  });
+});
+
+describe('applyFarDockRequest — DOCK', () => {
+  it('re-docks a remembered berth and fits its port in the same transaction', () => {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
+    let transactions = 0;
+    doc.on('afterTransaction', () => transactions++);
+    const out = applyFarDockRequest(
+      doc,
+      { kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 },
+      near,
+    );
+    expect(out.wrote).toBe(true);
+    expect(transactions).toBe(1);
+    const rec = readAllDoorsFrom(doc).get('d:bay');
+    expect(rec?.paired && rec.dockedAt).toBe(300);
+    expect(rec?.paired && rec.connectedRoomAddress).toBe(near.address);
+    expect((doc.getMap('doorPolicy').get('d:bay') as { adapter?: boolean }).adapter).toBe(true);
+  });
+
+  it('refuses an occupied berth and a door that no longer exists — and writes nothing', () => {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorPairing(seedFor('someone-else'), { segments: dockChain() }));
+    const before = Y.encodeStateVector(doc);
+    const occupied = applyFarDockRequest(
+      doc,
+      { kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 },
+      near,
+    );
+    expect(occupied).toEqual({ result: { ok: false, reason: 'occupied' }, wrote: false });
+    const gone = applyFarDockRequest(
+      doc,
+      { kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:removed', nearDoorId: near.doorId, dockedAt: 300 },
+      near,
+    );
+    expect(gone).toEqual({ result: { ok: false, reason: 'gone' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+});
+
+// ── YjsSync.confirmOwnWrites against an in-memory node ───────────────────────
+
+/** Minimal y-sync framing, mirroring YjsSync's own (varuint type, subtype,
+ *  length, bytes) inside a JSON envelope behind a u32 LE length prefix. */
+function readVarUint(buf: Uint8Array, at: { i: number }): number {
+  let value = 0;
+  let shift = 0;
+  while (at.i < buf.length) {
+    const b = buf[at.i++];
+    value |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+  }
+  return value;
+}
+function varUint(n: number): number[] {
+  const out: number[] = [];
+  while (n >= 0x80) {
+    out.push((n & 0x7f) | 0x80);
+    n >>>= 7;
+  }
+  out.push(n);
+  return out;
+}
+const b64 = (u: Uint8Array) => btoa(String.fromCharCode(...u));
+const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+/** A node holding `nodeDoc`: applies Updates (unless `dropUpdates`), answers
+ *  every SyncStep1 with a SyncStep2 from its replica, in stream order. */
+function fakeNode(nodeDoc: Y.Doc, opts: { dropUpdates?: boolean } = {}) {
+  let toClient!: ReadableStreamDefaultController<Uint8Array>;
+  const readable = new ReadableStream<Uint8Array>({ start: (c) => { toClient = c; } });
+  let pending = new Uint8Array(0);
+  const reply = (subtype: number, data: Uint8Array) => {
+    const payload = new Uint8Array([...varUint(0), ...varUint(subtype), ...varUint(data.length), ...data]);
+    const json = new TextEncoder().encode(JSON.stringify({ v: 1, room: 'r', kind: 'ysync', seq: 0, payload: b64(payload) }));
+    const frame = new Uint8Array(4 + json.length);
+    new DataView(frame.buffer).setUint32(0, json.length, true);
+    frame.set(json, 4);
+    toClient.enqueue(frame);
+  };
+  const writable = new WritableStream<Uint8Array>({
+    write: (chunk) => {
+      const merged = new Uint8Array(pending.length + chunk.length);
+      merged.set(pending);
+      merged.set(chunk, pending.length);
+      pending = merged;
+      while (pending.length >= 4) {
+        const len = new DataView(pending.buffer, pending.byteOffset, 4).getUint32(0, true);
+        if (pending.length < 4 + len) break;
+        const env = JSON.parse(new TextDecoder().decode(pending.subarray(4, 4 + len)));
+        pending = pending.subarray(4 + len);
+        const msg = unb64(env.payload);
+        const at = { i: 0 };
+        readVarUint(msg, at); // type
+        const subtype = readVarUint(msg, at);
+        const dlen = readVarUint(msg, at);
+        const data = msg.subarray(at.i, at.i + dlen);
+        if (subtype === 0) reply(1, Y.encodeStateAsUpdate(nodeDoc, data));
+        else if (!opts.dropUpdates) Y.applyUpdate(nodeDoc, data);
+      }
+    },
+  });
+  return { readable, writable };
+}
+
+describe('YjsSync.confirmOwnWrites — the far write\'s acknowledgment', () => {
+  const connected = async (nodeDoc: Y.Doc, opts?: { dropUpdates?: boolean }) => {
+    // bootRecord supplied, so the envelope builder never reaches for `window`.
+    const sync = new YjsSync({ roomId: 'r', channel: fakeNode(nodeDoc, opts), bootRecord: () => ({}) });
+    await sync.start();
+    await sync.whenServerSynced;
+    return sync;
+  };
+
+  it('resolves true once the node has APPLIED our write', async () => {
+    const nodeDoc = stationDoc();
+    const sync = await connected(nodeDoc);
+    expect(readAllDoorsFrom(sync.doc).get('d:bay')?.paired).toBe(true); // real state first
+    const since = Y.encodeStateVector(sync.doc);
+    sync.doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 1 }));
+    expect(await sync.confirmOwnWrites(since, 2000)).toBe(true);
+    expect(readAllDoorsFrom(nodeDoc).get('d:bay')?.paired).toBe(false);
+    await sync.stop();
+  });
+
+  it('times out false when the node never applies it', async () => {
+    const nodeDoc = stationDoc();
+    const sync = await connected(nodeDoc, { dropUpdates: true });
+    const since = Y.encodeStateVector(sync.doc);
+    sync.doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 1 }));
+    expect(await sync.confirmOwnWrites(since, 150)).toBe(false);
+    expect(readAllDoorsFrom(nodeDoc).get('d:bay')?.paired).toBe(true);
+    await sync.stop();
+  });
+});

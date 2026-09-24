@@ -124,6 +124,12 @@ import {
   readAllDoors,
   subscribeDoors,
 } from "./doorsDoc";
+// ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
+// and the far room's end of every DOCK / UNDOCK.
+import { isDockChain } from "./adapter";
+import { mirrorMayWrite } from "./dockRules";
+import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
+import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
 import type { RoomTheme } from "./furniture";
@@ -138,6 +144,7 @@ import {
   bindDoorPolicy,
   subscribeDoorPolicy,
   readDoorPolicy,
+  writeDoorPolicy,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
@@ -533,6 +540,9 @@ interface MintedModule {
   /** The birth door's ID, minted at provision time so the near room's pairing
    *  names the exact far door before anyone has walked through. */
   birthDoorId?: string;
+  /** ⚓ #163: the module was provisioned through a staged DOCK — its birth door
+   *  is fitted with the mating half of the docking adapter at first claim. */
+  birthPort?: boolean;
 }
 const mintedRoomTemplates = new Map<string, MintedModule>();
 
@@ -1532,7 +1542,8 @@ async function joinRoomAtEpoch(
     subscribeContacts(() => renderPhonePlayersList());
     // #67 D1b: policy/request/grant changes repaint an OPEN keypad live — a
     // grant landing while the guest stares at the pane unlocks it in place.
-    // D2: adapter installs also re-dress the hull (the IDA collar in space).
+    // ⚓ #163: a port fitted or removed re-dresses the space view too (the world
+    // draws the port itself; the exterior's atlas links follow the doors doc).
     subscribeDoorPolicy(() => {
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
@@ -1558,7 +1569,7 @@ async function joinRoomAtEpoch(
     subscribeOffers(() => renderVenturesApp());
     // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
     // the door slide), refresh an open keypad's POSITION row, and re-dress
-    // the exterior (a slid door carries its adapter collar).
+    // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       world?.reconcileDoorPlacements();
       world?.dockingSystem?.refreshPolicyUI();
@@ -1577,6 +1588,10 @@ async function joinRoomAtEpoch(
       // 🛑🛰️ #80 S5: the local room's own edges just changed the atlas → re-pose
       // the station-through-the-window shells (they depend only on the atlas).
       world?.refreshFpNeighbourShells();
+      // ⚓ #163: a dock made or released — here, by a peer, or by the far
+      // room's write landing — repaints an open door pane's DOCK row and the
+      // helm's docking computer.
+      world?.dockingSystem?.refreshPolicyUI();
     });
     // The exterior's atlas walk starts from the CURRENT room.
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
@@ -1655,6 +1670,15 @@ async function joinRoomAtEpoch(
         mintedHere.birthLateral ?? 0,
         mintedHere.birthDoorId,
       );
+      // ⚓ #163: docked into being — the birth door wears the other half of
+      // the adapter from its first moment (the staged mating half), so the
+      // new ship or station can UNDOCK and fly free. The layout record is
+      // written first: doorPolicy only accepts doors the room knows. (The id
+      // defaults to the wall label exactly as seedDoorLayoutSingle's does.)
+      if (mintedHere.birthPort) {
+        const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
+        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true });
+      }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
       // so the door sits centred on `birthWall` whatever the room is called.
       // This stamp used to be load-bearing — a single door only landed centred
@@ -2374,6 +2398,46 @@ async function performRoomSwap(
 }
 
 /**
+ * An address OTHER rooms can reach `roomId` by — what a mirror record, or a
+ * far room's end of a dock, must point back at. The walker's own rooms are
+ * exactly the rooms never in their own pass list, so: pass list → minted-
+ * module ledger → mint a fresh link against the local node. Null only when
+ * all three fail (no node).
+ */
+async function resolveOwnRoomAddress(roomId: string): Promise<string | null> {
+  const known =
+    passSeed(roomId) ??
+    moduleLedger().find((e) => e.roomId === roomId)?.seed ??
+    null;
+  if (known) return known;
+  try {
+    return (await mintBootstrapLink(undefined, roomId)).link ?? null;
+  } catch (e) {
+    console.warn(`🪞 Could not mint a link for ${roomId}:`, e);
+    return null;
+  }
+}
+
+/**
+ * ⚓ #163: DOCK / UNDOCK's far end — the docking system asks, we answer with a
+ * short background session to the far room's doc (farDoorWrite.ts). `near` is
+ * THIS end, captured now: a transit mid-write must not re-aim it.
+ */
+async function farDockWrite(req: FarDockRequest): Promise<FarDockResult> {
+  const roomId = activeBootstrap?.roomId;
+  if (!roomId) return { ok: false, reason: "no-address" };
+  const address = await resolveOwnRoomAddress(roomId);
+  if (!address) return { ok: false, reason: "no-address" };
+  return writeFarDock(req, {
+    roomId,
+    address,
+    doorId: req.nearDoorId,
+    wall: req.nearWall,
+    lateral: req.nearLateral,
+  });
+}
+
+/**
  * The adapter transit (T1 of #30), invoked by the World when the avatar
  * reaches the vestibule hold point (mid ADAPTER_HOLD): the shared room swap
  * with door choreography on both ends — reposition at the arrival door and
@@ -2414,6 +2478,14 @@ async function transitTo(
   const depFarDoor = depState?.farDoor;
   const depFarWall = depState?.farWall;
   const depFarLateral = depState?.farLateral;
+  // ⚓ #163: the connection's dock facts, captured NOW like depGeometry — the
+  // door-state object is shared across rooms by id, so after the swap it may
+  // already describe the ARRIVAL room's door of the same name.
+  const depTransient = depState?.transient;
+  const depDock = {
+    isDock: isDockChain(depState?.segments),
+    dockedAt: depState?.dockedAt,
+  };
   const depRoomId = activeBootstrap?.roomId ?? null;
   const returnRoute =
     sessionReturnRoute?.roomId === depRoomId &&
@@ -2423,21 +2495,14 @@ async function transitTo(
 
   // Vestibule-findings fix (root cause 2): the walker's own rooms are exactly
   // the rooms NEVER in their own pass list, so passSeed alone silently killed
-  // most mirrors. Resolution ladder: pass list → minted-module ledger → mint a
-  // fresh link (local node op; done PRE-swap while the departure room's state
-  // is definitely alive).
-  let depAddress = depRoomId ? (passSeed(depRoomId) ?? null) : null;
-  if (depPaired && depRoomId && !depAddress) {
-    depAddress =
-      moduleLedger().find((e) => e.roomId === depRoomId)?.seed ?? null;
-  }
-  if (depPaired && depRoomId && !depAddress) {
-    try {
-      depAddress = (await mintBootstrapLink(undefined, depRoomId)).link ?? null;
-    } catch (e) {
-      console.warn("🪞 Mirror: could not mint a departure-room link:", e);
-    }
-  }
+  // most mirrors. Resolution ladder (resolveOwnRoomAddress): pass list →
+  // minted-module ledger → mint a fresh link (local node op; done PRE-swap
+  // while the departure room's state is definitely alive).
+  const depAddress = depRoomId
+    ? depPaired
+      ? await resolveOwnRoomAddress(depRoomId)
+      : (passSeed(depRoomId) ?? null)
+    : null;
 
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
     // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
@@ -2652,9 +2717,11 @@ async function transitTo(
     // room's doc — a doc this client does not own. That cross-room write is an
     // existing property of the lazy-mirror design, not something introduced
     // here, but free doors make it fire on many more doors.
-    const retired =
-      existing && !existing.paired && existing.retiredAddress === depAddress;
-    if (!existing?.paired && !retired) {
+    // ⚓ #163 (dockRules.mirrorMayWrite): the tombstone is matched by ROOM, not
+    // by seed string — two different passes to one module used to slip past
+    // it — and a DOCK made after that door's own undock is a deliberate
+    // re-dock the mirror completes, while an older one is a stale berth.
+    if (depRoomId && mirrorMayWrite(existing, depRoomId, depDock)) {
       writeDoorPairing(arrivalDoorId, depAddress, {
         segments: depGeometry
           ? mirrorSegments(depGeometry.segments)
@@ -2670,8 +2737,19 @@ async function transitTo(
         farYawDeg: depGeometry?.farYawDeg,
         // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
         // detaching either side casts the whole connection off.
-        transient: depState?.transient,
+        transient: depTransient,
+        // ⚓ …and a dock's mirror carries the dock's stamp.
+        dockedAt: depDock.isDock ? depDock.dockedAt : undefined,
       });
+      // ⚓ A dock has a half on BOTH doors: the arrival door wears the mating
+      // half the connection brought (staged on the far side, or the visiting
+      // ship's own), so it can UNDOCK and DOCK from this side too.
+      if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+        writeDoorPolicy(arrivalDoorId, {
+          ...readDoorPolicy(arrivalDoorId),
+          adapter: true,
+        });
+      }
       console.log(
         `🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`,
       );
@@ -2723,7 +2801,12 @@ function wireAdapterTransit(): void {
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,
-    placement?: { wall: DoorWall; lateral: number; doorId?: string },
+    placement?: {
+      wall: DoorWall;
+      lateral: number;
+      doorId?: string;
+      port?: boolean;
+    },
   ): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
@@ -2757,6 +2840,7 @@ function wireAdapterTransit(): void {
       birthWall,
       birthLateral: placement?.lateral ?? 0,
       birthDoorId: placement?.doorId,
+      birthPort: birthWall !== undefined && placement?.port === true,
     });
     // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
     // than a clipboard that holds one) and powers auto-accept.
@@ -2764,6 +2848,13 @@ function wireAdapterTransit(): void {
     return minted.link;
   };
   world.dockingSystem?.onProvisionModule(provisionModuleSeed);
+  // ⚓ #163: DOCK / UNDOCK tell the far room (farDoorWrite.ts) — its own
+  // background session on the local node, like a pass prefetch.
+  initFarDoorWrite({
+    decode: decodeBootstrapInput,
+    resolve: resolveBridgeBootstrap,
+  });
+  world.dockingSystem?.onFarDockWrite(farDockWrite);
   // #62 P4: auto-accept decider — a pairing may complete without a far-side
   // human only for rooms THIS client minted (the ledger / this session's
   // mints) or its own current room, and only while the DEV toggle is on.

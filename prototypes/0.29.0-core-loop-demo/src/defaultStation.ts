@@ -147,6 +147,8 @@ function parseSegments(value: unknown): ConnectorSegment[] | null {
   for (const s of value) {
     if (typeof s !== 'object' || s === null) return null;
     const seg = s as Record<string, unknown>;
+    // ⚓ #163: a docking-adapter half carries no parameters.
+    if (seg.kind === 'dock') { out.push({ kind: 'dock' }); continue; }
     if (seg.kind !== 'flex' && seg.kind !== 'ext') return null;
     const finite = (n: unknown) => n === undefined || (typeof n === 'number' && Number.isFinite(n));
     if (!finite(seg.bendDeg) || !finite(seg.stretch) || !finite(seg.bays)) return null;

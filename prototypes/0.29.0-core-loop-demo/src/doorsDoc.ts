@@ -68,6 +68,22 @@ export interface DoorPairing {
   /** #67 D2: TRANSIENT guest berth (docking-adapter pairing) — no chains, no
    *  station-graph permanence, either side may detach. */
   transient?: boolean;
+  /** ⚓ #163: when this DOCK was made (writer clock, epoch ms) — docks only.
+   *  Compared against a dock tombstone's `undockedAt`: a dock newer than the
+   *  undock is a deliberate re-dock the mirror may apply; an older one is a
+   *  stale berth it must refuse. */
+  dockedAt?: number;
+}
+
+/** ⚓ #163: what an undocked PORT remembers of its last berth, so DOCK can
+ *  make the same connection again (and the far side can be told it ended). */
+export interface DockBerthMemory {
+  /** The far door the dock landed on, when known. */
+  farDoor?: string;
+  farWall?: DoorWall;
+  farLateral?: number;
+  /** When the dock was released (writer clock, epoch ms). */
+  undockedAt: number;
 }
 
 /** ⏏ An UNDOCK leaves this rather than deleting the entry: only one room doc
@@ -78,6 +94,10 @@ export interface DoorPairing {
 export interface DoorTombstone {
   paired: false;
   retiredAddress: string;
+  /** ⚓ #163: present when the retired connection was a DOCK — the berth
+   *  memory DOCK re-docks to. Absent on a plain undock, and dropped when the
+   *  door's port is removed (the berth is closed, nothing may re-dock). */
+  dock?: DockBerthMemory;
 }
 
 export type DoorRecord = DoorPairing | DoorTombstone;
@@ -136,16 +156,24 @@ export function isDoorRecord(value: unknown): value is DoorRecord {
  *  never a crash, identical on every client), and farDoor/farYawDeg must be
  *  exact enum values or they vanish. */
 function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
-  // Tombstones carry no geometry — pass through as-is (the guard already
-  // proved the shape).
-  if (!r.paired) return { paired: false, retiredAddress: r.retiredAddress };
+  // Tombstones carry no chain — only the ⚓ dock berth memory, bounded the
+  // same way as a pairing's far geometry (it is fed back into one by DOCK).
+  if (!r.paired) {
+    const out: DoorTombstone = { paired: false, retiredAddress: r.retiredAddress };
+    const memory = sanitizeBerthMemory(r.dock);
+    if (memory) out.dock = memory;
+    return out;
+  }
   const out: DoorPairing = { paired: true, connectedRoomAddress: r.connectedRoomAddress };
   if (Array.isArray(r.segments) && r.segments.length > 0 && r.segments.length <= 8) {
     const clean: ConnectorSegment[] = [];
     let ok = true;
     for (const s of r.segments) {
       if (!s || typeof s !== 'object') { ok = false; break; }
-      if (s.kind === 'flex') {
+      if (s.kind === 'dock') {
+        // ⚓ #163: a docking-adapter half has no parameters to clamp.
+        clean.push({ kind: 'dock' });
+      } else if (s.kind === 'flex') {
         clean.push({
           kind: 'flex',
           // 🛬 FINE clamp (range only, no detent snap): solved jetbridge
@@ -190,6 +218,33 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
   }
   if (r.farYawDeg === 0 || r.farYawDeg === 45) out.farYawDeg = r.farYawDeg;
   if (r.transient === true) out.transient = true;
+  if (isSaneStamp(r.dockedAt)) out.dockedAt = r.dockedAt;
+  return out;
+}
+
+/** A writer-clock stamp we will compare: finite and positive. (No future
+ *  bound: a peer inflating its own stamp only makes its OWN dock look newer
+ *  than an undock of that same door — the posture of every honest-client
+ *  record here, #67 D3.) */
+function isSaneStamp(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0;
+}
+
+/** ⚓ Shape-check a tombstone's berth memory: the stamp is required (it is what
+ *  the re-dock rule compares), the geometry is optional and bounded exactly
+ *  like a pairing's far fields. Anything else ⇒ no memory (a plain tombstone). */
+function sanitizeBerthMemory(v: unknown): DockBerthMemory | undefined {
+  if (typeof v !== 'object' || v === null) return undefined;
+  const m = v as Partial<DockBerthMemory>;
+  if (!isSaneStamp(m.undockedAt)) return undefined;
+  const out: DockBerthMemory = { undockedAt: m.undockedAt };
+  if (typeof m.farDoor === 'string' && isAcceptableDoorKey(m.farDoor)) out.farDoor = m.farDoor;
+  const fw = normalizeWall(m.farWall);
+  if (fw) out.farWall = fw;
+  if (typeof m.farLateral === 'number' && Number.isFinite(m.farLateral)
+      && Math.abs(m.farLateral) <= 32) {
+    out.farLateral = m.farLateral;
+  }
   return out;
 }
 
@@ -237,14 +292,39 @@ const MAX_PAIRINGS = 64;
  * (reconcileDoors, the arrival mirror, the atlas harvest) reads through here.
  */
 export function readAllDoors(): Map<string, DoorRecord> {
+  if (!docAlive()) return new Map<string, DoorRecord>();
+  return readDoorsMap(doorsMap!);
+}
+
+function readDoorsMap(map: Y.Map<unknown>): Map<string, DoorRecord> {
   const out = new Map<string, DoorRecord>();
-  if (!docAlive()) return out;
-  for (const [id, value] of doorsMap!.entries()) {
+  for (const [id, value] of map.entries()) {
     if (out.size >= MAX_PAIRINGS) break;
     if (!isAcceptableDoorKey(id)) continue;
     if (isDoorRecord(value)) out.set(id, sanitizeDoorGeometry(value));
   }
   return out;
+}
+
+/**
+ * ⚓ #163: the same sanitized snapshot, read from ANY doc — the far-room dock
+ * write (farDoorWrite.ts) holds a second, short-lived doc that is not the
+ * bound one. Same guard and sanitizer, so both ends of a dock are judged by
+ * one set of rules.
+ */
+export function readAllDoorsFrom(doc: Y.Doc): Map<string, DoorRecord> {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return new Map<string, DoorRecord>();
+  return readDoorsMap(doc.getMap('doors'));
+}
+
+/** ⚓ #163: write one door record into ANY doc (see readAllDoorsFrom) — the
+ *  record must come from buildDoorPairing / buildDoorTombstone, so the far
+ *  side is written in exactly the shape the near side is. */
+export function writeDoorRecordTo(doc: Y.Doc, doorId: string, record: DoorRecord): void {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return;
+  doc.transact(() => {
+    doc.getMap('doors').set(doorId, record);
+  });
 }
 
 /** Optional connection geometry a publisher attaches to a pairing (#62 P2). */
@@ -255,12 +335,12 @@ export interface DoorGeometry {
   farLateral?: DoorPairing['farLateral'];
   farYawDeg?: DoorPairing['farYawDeg'];
   transient?: boolean;
+  dockedAt?: DoorPairing['dockedAt'];
 }
 
-/** Publish one door's pairing (whoever docked a module); geometry rides along
- *  when the connection was assembled from parts or the far side is known. */
-export function writeDoorPairing(doorId: string, address: string, geometry?: DoorGeometry): void {
-  if (!docAlive()) return;
+/** The one pairing-record shape every writer produces (near side, mirror,
+ *  and the far-room dock write). */
+export function buildDoorPairing(address: string, geometry?: DoorGeometry): DoorPairing {
   const record: DoorPairing = { paired: true, connectedRoomAddress: address };
   if (geometry?.segments && geometry.segments.length > 0) record.segments = geometry.segments;
   if (geometry?.farDoor) record.farDoor = geometry.farDoor;
@@ -268,6 +348,15 @@ export function writeDoorPairing(doorId: string, address: string, geometry?: Doo
   if (geometry?.farLateral !== undefined) record.farLateral = geometry.farLateral;
   if (geometry?.farYawDeg !== undefined) record.farYawDeg = geometry.farYawDeg;
   if (geometry?.transient === true) record.transient = true;
+  if (geometry?.dockedAt !== undefined) record.dockedAt = geometry.dockedAt;
+  return record;
+}
+
+/** Publish one door's pairing (whoever docked a module); geometry rides along
+ *  when the connection was assembled from parts or the far side is known. */
+export function writeDoorPairing(doorId: string, address: string, geometry?: DoorGeometry): void {
+  if (!docAlive()) return;
+  const record = buildDoorPairing(address, geometry);
   boundDoc!.transact(() => {
     doorsMap!.set(doorId, record);
   });
@@ -332,11 +421,31 @@ export function deleteDoorPairing(doorId: string): void {
  * It keeps the RETIRED ADDRESS so it can refuse precisely that module and no
  * other: an address-less tombstone would suppress the mirror on this door
  * forever, stranding any future connection built from the far side.
+ *
+ * ⚓ #163: an undocked DOCK also keeps its berth memory (`dock`) — see
+ * DockBerthMemory.
  */
-export function writeDoorTombstone(doorId: string, retiredAddress = ''): void {
+export function writeDoorTombstone(
+  doorId: string,
+  retiredAddress = '',
+  dock?: DockBerthMemory,
+): void {
   if (!docAlive()) return;
-  const record: DoorTombstone = { paired: false, retiredAddress };
+  const record = buildDoorTombstone(retiredAddress, dock);
   boundDoc!.transact(() => {
     doorsMap!.set(doorId, record);
   });
+}
+
+/** The one tombstone shape every writer produces (see buildDoorPairing). */
+export function buildDoorTombstone(retiredAddress: string, dock?: DockBerthMemory): DoorTombstone {
+  const record: DoorTombstone = { paired: false, retiredAddress };
+  if (dock) {
+    const memory: DockBerthMemory = { undockedAt: dock.undockedAt };
+    if (dock.farDoor) memory.farDoor = dock.farDoor;
+    if (dock.farWall) memory.farWall = dock.farWall;
+    if (dock.farLateral !== undefined) memory.farLateral = dock.farLateral;
+    record.dock = memory;
+  }
+  return record;
 }
